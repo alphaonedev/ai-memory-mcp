@@ -1592,9 +1592,10 @@ class Issue8045(Fixture):
         body = ("let v0 = move || { %s };\n    %sstd::thread::spawn(v%d).join().unwrap();" % (self.OPEN, lets, hops))
         self.assertEqual(self.flagged(WRITER + self.LOCKED % body), FLAGGED)
 
-    def test_a_rebound_closure_variable_that_is_only_called_keeps_the_lock(self):
+    def test_a_rebound_closure_variable_is_flagged_by_the_general_rule(self):
+        # #8056: `f` appears inside another expression (`let g = f`), so it is no longer canonical: detached.
         body = "let f = move || { %s };\n    let g = f;\n    g();" % self.OPEN
-        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), set())
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), FLAGGED)
 
 
 class Issue8051(Fixture):
@@ -1638,8 +1639,9 @@ class Issue8051(Fixture):
     def test_canonical_rebind_is_still_flagged(self):
         self.check("let g = f0;\n    " + self.SP % "g")
 
-    def test_carrier_that_is_only_called_keeps_the_lock(self):
-        self.check("let g = Box::new(f0);\n    g();", set())
+    def test_boxed_carrier_is_flagged_even_when_only_called(self):
+        # #8056: a closure name inside Box::new is not a canonical use, so it is detached (fail closed).
+        self.check("let g = Box::new(f0);\n    g();")
 
 
 class Issue8052(Fixture):
@@ -1704,9 +1706,79 @@ class Issue8052(Fixture):
         text = '#[path = "support/spawn.rs"]\nmod sp;\n' + WRITER + self.LOCKED % ("sp::bg(move || { %s });" % self.OPEN)
         self.assertEqual(self.flagged(text), set())
 
-    def test_an_unresolvable_call_stays_as_before(self):
+    def test_an_unresolvable_call_is_flagged(self):
+        # #8056 #8059: an identifier the gate cannot resolve at a parameter position is detached.
         text = WRITER + self.LOCKED % ("elsewhere::bg(move || { %s });" % self.OPEN)
-        self.assertEqual(self.flagged(text), set())
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+
+class Issue8056(Fixture):
+    """#8056: a closure literal written directly inside a carrier expression runs detached; only an
+    immediate call or a plain `let name = <closure>;` that is only ever called is on the same thread."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def check(self, body, expect=FLAGGED):
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), expect)
+
+    def test_box_new_literal_handed_to_spawn(self):
+        self.check("let f0 = Box::new(move || { %s });\n    std::thread::spawn(f0).join().unwrap();" % self.OPEN)
+
+    def test_some_literal_unwrapped_into_spawn(self):
+        self.check("let g = Some(move || { %s });\n    std::thread::spawn(g.unwrap()).join().unwrap();" % self.OPEN)
+
+    def test_struct_field_literal(self):
+        self.check("let s = S { f: move || { %s } };\n    std::thread::spawn(s.f).join().unwrap();" % self.OPEN)
+
+    def test_vec_macro_literal_in_a_for_loop(self):
+        self.check("for g in vec![move || { %s }] {\n        std::thread::spawn(g).join().unwrap();\n    }" % self.OPEN)
+
+    def test_control_immediately_invoked_literal_keeps_the_lock(self):
+        self.check("(move || { %s })();" % self.OPEN, set())
+
+    def test_control_plain_let_only_called_keeps_the_lock(self):
+        self.check("let f = move || { %s };\n    f();" % self.OPEN, set())
+
+
+class Issue8057(Fixture):
+    """#8057: spawn passed as a fn value hands whatever it is mapped over to another thread."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def check(self, body, head="", expect=FLAGGED):
+        self.assertEqual(self.flagged(head + WRITER + self.LOCKED % body), expect)
+
+    def test_thread_spawn_as_a_value(self):
+        self.check("let f0 = move || { %s };\n    Some(f0).map(std::thread::spawn).unwrap().join().unwrap();" % self.OPEN)
+
+    def test_bare_spawn_as_a_value(self):
+        self.check("let f0 = move || { %s };\n    Some(f0).map(spawn).unwrap().join().unwrap();" % self.OPEN,
+                   "use std::thread::spawn;\n")
+
+    def test_tokio_spawn_as_a_value(self):
+        self.check("let f0 = move || { %s };\n    Some(f0).map(tokio::spawn);" % self.OPEN)
+
+    def test_control_map_with_a_plain_closure_keeps_the_lock(self):
+        self.check("let n = Some(1).map(|x| x + 1);\n    %s\n    drop(n);" % self.OPEN, expect=set())
+
+
+class Issue8058(Fixture):
+    """#8058: a carrier re-assigned after the spawn inside a loop must not credit the later binding."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def check(self, body, expect=FLAGGED):
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), expect)
+
+    def test_reassigned_carrier_in_a_loop(self):
+        self.check("let f0 = move || {};\n    let f1 = move || { %s };\n    let mut g = f0;\n    loop {\n"
+                   "        std::thread::spawn(g).join().unwrap();\n        g = f1;\n        break;\n    }" % self.OPEN)
+
+    def test_control_closure_only_called_in_a_loop_keeps_the_lock(self):
+        self.check("let f0 = move || { %s };\n    for _ in 0..2 {\n        f0();\n    }" % self.OPEN, set())
 
 
 class Issue8046(Fixture):

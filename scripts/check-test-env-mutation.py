@@ -94,7 +94,22 @@ bindings; a name that holds a closure makes that initialiser detached, and a car
 traced (or more than MAX_CARRIER_NAMES) flags every closure of the fn, never credits it.
 A detaching helper in tests/common (#8052), reached as `common::f`, through a `use common::f` or glob
 import, or as `Type::f`, and one in a `#[path = ".."] mod m;` or `mod m;` file of the test (`m::f` or a
-`use m::f` name) detaches the argument of every call of it; an unresolvable call is judged as before.
+`use m::f` name) detaches the argument of every call of it. #8059 `use common::bg as detach;` is
+resolved to the helper it names; #8060 a nested `common::a::b::f` path reaches the fn of a submodule
+file, and one fixpoint runs over every tests/common file together, so a common helper that calls a
+detacher of another common file detaches too.
+General rule (#8056 #8057 #8058; fail closed, decision 27ef27dc): every closure or async-block literal
+in a fn body is DETACHED unless one of these same-thread shapes is proven: (1) it is invoked in place,
+`(|| ..)()`; (2) it is bound by a plain `let name = <closure>;` and every use of `name` in its scope is
+a direct call `name(..)` outside any other closure literal; (3) it is the value a same-thread closure
+returns (an `async move { .. }` tail of a closure that is itself on the thread); (4) it is the whole
+argument of a known callee that does not spawn that parameter (a same-file fn, a tests/common or module
+fn, alias and nested path resolved) or of an inline runner named in SAME_THREAD_CALLEES (iterator,
+Option, Once and block_on adaptors), unless a rayon-style parallel iterator is in the fn
+(PARALLEL_ITER). Anything else (inside Box::new, Some, a struct field, vec!, a tuple, a method receiver,
+an assignment, a return, a loop, another closure, an unresolved callee) is detached. A spawn used as a
+fn value (`.map(std::thread::spawn)`, VALUE_DETACH) detaches every closure of the fn, and a carrier
+re-assigned later in an enclosing loop is followed through that later binding (loop_end).
 A macro_rules! whose body invokes a spawning macro, or a detaching helper, detaches too (#8046): the
 forwarding is closed transitively.
 In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
@@ -109,6 +124,8 @@ host is a placeholder without a `local_addr()` in the file. Anything unresolved 
 Known limits, stated plainly:
   * resolution is by name, same file only (free fns, `Type::method`, `.method()` on any same-file
     impl), plus the tests/common reader census; code in src/ is judged only by the tokens above;
+  * two tests/common files that define a fn of the same name share one detacher entry (their
+    parameter indices are unioned), which can only flag more, never credit;
   * the reader check is a token heuristic; a fn that reaches a C getenv only through code the
     tokens do not name is treated as pure;
   * a held-but-flagged shape stays flagged by design (#7628): a lock the test mentions again is not
@@ -179,8 +196,11 @@ MUTATION_ALIAS = r"\b(?:%s)\s+as\s+([A-Za-z_]\w*)"
 DIRECT_MUTATION = mutation_re()
 # #7994: a call that hands its argument to another thread or task. The closure or async block it takes
 # runs outside the spawner's guard scope (the handle may outlive the guard), so it never inherits a lock.
-DETACH = re.compile(r"(?<![\w])(?<!fn )(?:spawn|spawn_blocking|spawn_local|spawn_on|spawn_pinned|"
-                    r"spawn_unchecked|spawn_scoped)\s*(?:::\s*<[^;{}]*?>\s*)?\(")
+DETACH_WORDS = ("spawn|spawn_blocking|spawn_local|spawn_on|spawn_pinned|"
+                "spawn_unchecked|spawn_scoped")
+DETACH = re.compile(r"(?<![\w])(?<!fn )(?:%s)\s*(?:::\s*<[^;{}]*?>\s*)?\(" % DETACH_WORDS)
+# #8057: a spawn name that is NOT called (`.map(std::thread::spawn)`, `let s = spawn;`) is a fn value
+VALUE_DETACH = re.compile(r"(?<![\w])(?<!fn )(?:%s)\b(?!\s*::(?!\s*<))(?!\s*(?:::\s*<[^;{}]*?>\s*)?\()" % DETACH_WORDS)
 ONCE_SETTERS = ("ensure_no_config_env", "permissive_attestation_for_tests")
 # tests/common guards: each takes tests/common/mod.rs ENV_LOCK and holds it for its lifetime.
 COMMON_GUARD_METHODS = {"EnvVarGuard": ("set", "remove"), "MultiEnvVarGuard": ("apply",)}
@@ -248,6 +268,28 @@ LOOP_BIND = r"\bfor\b[^{};]*\b%s\b[^{};]*\bin\b"  # `for g in <expr> {`
 ARM_BIND = r"(?<![\w.])%s\b\s*(?:[,)|]\s*)*=>"  # a match-arm pattern naming the variable
 PARAM_BIND = r"\|[^|;{}]*\b%s\b[^|;{}]*\|"  # a closure parameter list naming the variable
 ANY_CLOSURE_LET = CLOSURE_LET % r"[A-Za-z_]\w*"  # every closure or async-block `let` initialiser of a fn
+# #8056: a closure or async-block LITERAL: `[async] [move] |params|` / `||` or `async [move] {`. A bare `|` opens
+# a closure only after one of CLOSURE_PREV (or `=>` / `return`); after an operand it is a bit-or or an or-pattern.
+CLOSURE_OPEN = re.compile(r"(?<![\w$])(?:async\s+(?:move\s+)?\{|(?:(?:async\s+)?move\s+|async\s+)?\|\|?)")
+CLOSURE_PREV = "(,={;[:"
+# #8056: library calls that run their closure argument inline on the calling thread (Option / Result / Iterator /
+# slice adaptors, the rusqlite row mappers, a runtime's block_on, timeout, catch_unwind). A same-file or tests/common
+# fn of the same name is judged by its own body first; with rayon in the fn none of these is trusted.
+SAME_THREAD_CALLEES = frozenset((
+    "map", "and_then", "or_else", "unwrap_or_else", "map_or", "map_or_else", "map_err", "ok_or_else", "is_some_and",
+    "is_none_or", "is_ok_and", "is_err_and", "filter", "filter_map", "flat_map", "find", "find_map", "any", "all",
+    "position", "rposition", "take_while", "skip_while", "map_while", "inspect", "fold", "try_fold", "for_each",
+    "sort_by", "sort_by_key", "sort_unstable_by", "sort_unstable_by_key", "retain", "max_by", "max_by_key", "min_by",
+    "min_by_key", "get_or_insert_with", "or_insert_with", "query_row", "query_map", "query_and_then", "block_on",
+    "timeout", "catch_unwind", "AssertUnwindSafe", "with_default", "call_once", "call_once_force", "get_or_init",
+    "get_or_try_init", "force"))
+PARALLEL_ITER = re.compile(r"\brayon\b|\bpar_iter\b|\binto_par_iter\b|\bpar_bridge\b")
+CLOSURE_LET_HEAD = re.compile(r"\s*let\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*)?=\s*")
+CALLEE_TAIL = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*$")
+LOOP_HEADER = re.compile(r"\b(?:for|while|loop)\b")
+CLOSURE_TAIL_HEAD = re.compile(r"(?:async\s+)?(?:move\s+)?\|[^|]*\|")  # a closure head: its tail value is what it returns
+CALL_OPENER = re.compile(r"\s*\)\s*\(")
+USE_ALIAS = re.compile(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)")
 # #7623-#7627: the canonical guard binding (see the module docstring). Nothing models moves or drops.
 LET_PAIR = re.compile(r"^\s*let\s+\(\s*(?:mut\s+)?([A-Za-z_]\w*)\s*,\s*(?:mut\s+)?([A-Za-z_]\w*)\s*\)\s*(?::[^=]*)?=(?!=)")
 # The ONE tuple helper shape the tree uses: `let (<key>, <guard>) = install_test_operator_key();`
@@ -475,6 +517,68 @@ def expr_end(body, pos):
         elif ch in ",;" and depth == 0:
             return j
     return len(body)
+
+
+def closure_literals(body):
+    """[(start, end)] of every closure or async-block literal of body (#8056), start at its `move` / `async` /
+    `|`, end past its last token. A bare `|` after an operand is a bit-or or an or-pattern, not a closure."""
+    out = []
+    for m in CLOSURE_OPEN.finditer(body):
+        tok = m.group(0)
+        if tok.endswith("{"):
+            bstart = m.end() - 1
+        else:
+            if tok in ("|", "||"):
+                prev = body[:m.start()].rstrip()
+                if prev and (prev[-1] not in CLOSURE_PREV or prev[-2:] in ("==", "!=", "<=", ">=")) \
+                        and not prev.endswith("=>") and not re.search(r"\breturn$", prev):
+                    continue
+            pend = m.end() if tok.endswith("||") else body.find("|", m.end()) + 1
+            if pend <= 0:
+                continue
+            bstart = body.find("{", pend) if re.match(r"\s*->", body[pend:]) else pend
+            while 0 <= bstart < len(body) and body[bstart].isspace():
+                bstart += 1
+        if bstart < 0:
+            continue
+        end = match_brace(body, bstart) if body[bstart:bstart + 1] == "{" else expr_end(body, bstart)
+        out.append((m.start(), end))
+    return out
+
+
+def loop_end(body, pos):
+    """End of the outermost `for` / `while` / `loop` body that encloses pos, else pos (#8058): a binding made
+    later in that loop body reaches the next iteration, so it is a binding of the carrier at pos."""
+    end, brace = pos, innermost_open(body, pos)
+    while brace > 0:
+        if LOOP_HEADER.search(stmt_prefix(body, brace)):
+            end = match_brace(body, brace)
+        brace = innermost_open(body, brace)
+    return end
+
+
+def arg_slot(body, a, b):
+    """(open paren index, argument index) when body[a:b] is exactly one whole argument of a call, else None."""
+    depth, commas, sep = 0, 0, None
+    for j in range(a - 1, -1, -1):
+        ch = body[j]
+        if ch in ")]}":
+            depth += 1
+        elif ch in "([{":
+            if depth == 0:
+                if ch != "(":
+                    return None
+                sep = j if sep is None else sep
+                if body[sep + 1:a].strip() or body[b:].lstrip()[:1] not in (",", ")"):
+                    return None
+                return j, commas
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return None
+        elif ch == "," and depth == 0:
+            sep = j if sep is None else sep
+            commas += 1
+    return None
 
 
 def has_lock_word(ident):
@@ -1087,21 +1191,31 @@ class CommonModel:
     def __init__(self, root=None):
         self.fns = {}
         self.sources = {}
-        self.detachers = {}  # #8052: key -> (parameter indices handed to a spawn, has_self) for tests/common fns
+        self.detachers = {}  # #8052: key -> (parameter indices handed to a spawn, has_self) for EVERY tests/common fn
+        self.mod_names = set()  # #8060: module names of tests/common (files, directories, inline mods)
         self._mods = {}
         self._strong, self._vars = {}, {}
         self.src_consts = self._src_consts(root)
         base = pathlib.Path(root) / COMMON_REL if root is not None else None
         if base is None or not base.is_dir():
             return
+        texts = []
         for path in sorted(base.rglob("*.rs")):
             src = Source(path.read_text(encoding="utf-8", errors="replace"), self.src_consts)
             for f in parse_fns(src.scrubbed):
+                self.mod_names.update(f.mods)
                 if not f.is_test:
                     self.fns.setdefault(f.key, f)
                     self.sources[id(f)] = src
-            for key, hit in detaching_fns(src.scrubbed).items():
-                self.detachers.setdefault(key, hit)
+            parts = list(path.relative_to(base).with_suffix("").parts)
+            self.mod_names.update(parts)
+            text = src.scrubbed
+            for part in reversed(parts[:-1] if parts[-1] == "mod" else parts):
+                text = "mod %s {\n%s\n}" % (part, text)
+            texts.append(text)
+        # #8060: one fixpoint over every tests/common file, each file wrapped in its module path, so a helper
+        # that calls a detaching helper of another common file (`super::spawn::bg(f)`) detaches too.
+        self.detachers = detaching_fns("mod common {\n%s\n}" % "\n".join(texts))
 
     @staticmethod
     def _src_consts(root):
@@ -1192,6 +1306,10 @@ class FileModel:
                 if re.search(r"\b%s\s*::" % re.escape(mod), um.group(0)):
                     for n in IDENT.findall(um.group(0).split(mod, 1)[1]):
                         self.mod_imported.setdefault(n, mod)
+        self.aliases = {}  # #8059: `use path::name as alias;` -> alias: name
+        for um in USE_ITEM.finditer(scrubbed):
+            for orig, alias in USE_ALIAS.findall(um.group(0)):
+                self.aliases.setdefault(alias, orig)
         self.dm = mutation_re(use_aliases(scrubbed))
         scrubbed = blank_use_items(scrubbed)
         self.src = (Source(raw, self.common.src_consts) if raw is not None and len(raw) == len(scrubbed)
@@ -1215,7 +1333,7 @@ class FileModel:
         self.once_fns = {id(f) for f in self.fns
                          if not f.is_test and ONCE_BODY.search(f.body) and self.dm.search(f.body)}
         self._calls, self._acq, self._summary, self._ctx, self._live = {}, {}, {}, {}, {}
-        self._detached = {}
+        self._detached, self._lits = {}, {}
         self._encl, self._viol, self._ip_only = {}, {}, {}
         self._close_detachers(macro_bodies)
         self.blamed = set()
@@ -1380,6 +1498,10 @@ class FileModel:
             for hit in hits:
                 if hit is not None and hit is not fn:
                     out.append((v.start(2), hit, b, False))
+        for m in VALUE_DETACH.finditer(body):
+            # #8057: spawn used as a fn value may run any same-file fn item detached; every one is reached
+            # from the (detached) position of the name, with an empty context.
+            out.extend((m.start(), hit, m.end(), False) for hit in self.by_key.values() if hit is not fn)
         self._calls[id(fn)] = out
         return out
 
@@ -1527,22 +1649,97 @@ class FileModel:
         """[(parameter indices, has_self)] of the detaching fns outside this file that a call may reach (#8052):
         `common::f`, a `use`-imported or glob-imported tests/common name, `Type::f` of an imported common type,
         `m::f` of a declared module file, or a `use`-imported name of one; a method call matches any common
-        method of that name. An unresolvable call is none."""
-        segs, table = path_segments(prefix), self.common.detachers
+        method of that name. An unresolvable call is none. #8059: a `use .. as alias` name or module is resolved to
+        the name it stands for. #8060: a nested path (`common::a::b::f`) reaches the fn of a submodule file, and
+        the table (see CommonModel) lists every known fn, a non-detaching one with no indices, so a hit means
+        the callee is known."""
+        segs, table = [self.aliases.get(s, s) for s in path_segments(prefix)], self.common.detachers
+        real = name if method else self.aliases.get(name, name)
         if method:
-            return [hit for key, hit in table.items() if key.endswith("::" + name) and hit[1]]
+            return [hit for key, hit in table.items() if key.endswith("::" + real) and hit[1]]
         if not segs:
-            if name in self.mod_imported:
-                return [h] if (h := self.modules[self.mod_imported[name]].get(name)) else []
-            return [h] if (name in self.imports or self.glob) and (h := table.get(name)) else []
+            if real in self.mod_imported:
+                return [h for h in [self.modules[self.mod_imported[real]].get(real)] if h]
+            return [h for h in [table.get(real)] if h] if (real in self.imports or self.glob) else []
         if segs[-1] in self.modules:
-            return [h] if (h := self.modules[segs[-1]].get(name)) else []
-        if "common" in segs:
-            key = name if segs[-1] == "common" else "%s::%s" % (segs[-1], name)
-            return [h] if (h := table.get(key)) else []
-        if segs[-1] in self.imports or self.glob:
-            return [h] if (h := table.get("%s::%s" % (segs[-1], name))) else []
+            return [h for h in [self.modules[segs[-1]].get(real)] if h]
+        if "common" in segs or segs[-1] in self.imports or self.glob:
+            keys = ["%s::%s" % (segs[-1], real), real] if "common" in segs or segs[-1] in self.common.mod_names \
+                else ["%s::%s" % (segs[-1], real)]
+            return [h for h in [table.get(k) for k in keys] if h]
         return []
+
+    def literal_spans(self, fn):
+        """[(start, end)] of every closure or async-block literal of fn that runs detached (#8056): ALL of them
+        unless one is provably on the same thread, which only two canonical shapes (plus a known callee that
+        does not spawn that argument) prove. Never credits."""
+        if id(fn) in self._lits:
+            return self._lits[id(fn)]
+        body = fn.body
+        lits = closure_literals(body)
+        if VALUE_DETACH.search(body):  # #8057: spawn used as a fn value hands anything it is mapped over away
+            out = list(lits) + [(lm.end(), stmt_end(body, lm.end())) for lm in re.finditer(ANY_CLOSURE_LET, body)]
+            out += [(m.start(), m.end()) for m in VALUE_DETACH.finditer(body)]
+        else:
+            out = [lit for n, lit in enumerate(lits) if not self.same_thread(fn, lits, n)]
+        self._lits[id(fn)] = out
+        return out
+
+    def same_thread(self, fn, lits, n):
+        """True when literal lits[n] of fn is a canonical same-thread closure (#8056): (1) invoked in place,
+        `(|| ..)()`; (2) `let name = <literal>;` whose every later use in its scope is a direct call `name(..)`
+        outside every other closure literal; (3) the whole argument of a known callee (same-file fn,
+        tests/common fn or module fn, alias or nested path resolved) that does not hand that argument to a
+        spawn. Anything else (Box::new, Some, a struct field, vec!, a method call, an unknown callee, an
+        assignment, a loop, a return, another closure) is detached."""
+        body, (s, e) = fn.body, lits[n]
+        if body[:s].rstrip().endswith("(") and CALL_OPENER.match(body, e):
+            return True
+        prefix = stmt_prefix(body, s)
+        head = CLOSURE_LET_HEAD.fullmatch(prefix)
+        if head and body[e:].lstrip().startswith(";"):
+            name, esc = head.group(1), re.escape(head.group(1))
+            limit = match_brace(body, scope_open(body, s))
+            shadow = re.compile(r"\blet\s+(?:mut\s+)?%s\b" % esc).search(body, e, limit)
+            if shadow:
+                limit = stmt_end(body, shadow.end())
+            for um in re.finditer(r"(?<![\w.:])%s\b(?!\s*::)" % esc, body[:limit]):
+                if um.start() < e or (shadow and um.start() == shadow.end() - len(name)):
+                    continue
+                if not re.match(r"\s*\(", body[um.end():]):
+                    return False
+                if any(x <= um.start() < y for k, (x, y) in enumerate(lits) if k != n and not (x <= s and e <= y)):
+                    return False
+            return True
+        for k, (ks, ke) in enumerate(lits):
+            if k != n and ks < s and e <= ke and body[e:ke].strip() in ("", "}") and CLOSURE_TAIL_HEAD.match(body, ks):
+                return self.same_thread(fn, lits, k)  # #8056: the value a same-thread closure returns
+        return self.known_callee_arg(fn, s, e)
+
+    def known_callee_arg(self, fn, a, b):
+        """True when body[a:b] is a whole argument of a call whose callee is known and does not spawn it (#8056,
+        #8059, #8060): a same-file fn, or one in tests/common or a module file, found by name, alias or path."""
+        slot = arg_slot(fn.body, a, b)
+        tail = CALLEE_TAIL.search(fn.body, 0, slot[0]) if slot else None
+        if tail is None or tail.group(2) in ("if", "while", "match", "for", "return"):
+            return False
+        before = fn.body[:tail.start()].rstrip()
+        if re.search(r"\bfn$", before) or before.endswith("!"):
+            return False
+        method = before.endswith(".")
+        if method:
+            cands = self.by_method.get(tail.group(2), [])
+        else:
+            hit = self.resolve(fn.owner, tail.group(1), tail.group(2))
+            cands = [hit] if hit is not None else []
+        hits = [(self.helpers.get(id(c), ()), c.has_self) for c in cands]
+        if not cands:
+            hits = self.external_helpers(tail.group(1), tail.group(2), method)
+        if not hits:
+            return tail.group(2) in SAME_THREAD_CALLEES and not PARALLEL_ITER.search(fn.body)
+        return all(
+            slot[1] - (0 if method or not has_self else 1) >= 0
+            and slot[1] - (0 if method or not has_self else 1) not in idxs for idxs, has_self in hits)
 
     def carried(self, body, a, b):
         """(spans, texts, over) for the spawn argument body[a:b] (#8051): every identifier in the argument,
@@ -1552,6 +1749,7 @@ class FileModel:
         cannot be traced, and more than MAX_CARRIER_NAMES names is too many: both set over, and every
         closure initialiser of the fn is then a span. texts are the initialisers followed. Never credits."""
         spans, texts, seen, over = [], [], set(), False
+        lim = loop_end(body, a)  # #8058: a binding later in an enclosing loop body reaches the next iteration
         literal = re.match(r"\s*(?:async\b\s*)?(?:move\b\s*)?[|{]", body[a:b]) is not None
         queue = [(n, not literal) for n in LOCAL_NAME.findall(body[a:b])]
         while queue:
@@ -1560,19 +1758,22 @@ class FileModel:
                 continue
             seen.add(name)
             esc, found = re.escape(name), []
-            for lm in re.finditer(CLOSURE_LET % esc, body[:a]):
+            for lm in re.finditer(CLOSURE_LET % esc, body[:lim]):
                 spans.append((lm.end(), stmt_end(body, lm.end())))
                 found.append(spans[-1])
             for pat in (r"\blet\b[^=;]*\b%s\b[^=;]*=(?!=)\s*" % esc, ASSIGN % esc):
-                found += [(lm.end(), stmt_end(body, lm.end())) for lm in re.finditer(pat, body[:a])]
-            for lm in re.finditer(LOOP_BIND % esc, body[:a]):
+                found += [(lm.end(), stmt_end(body, lm.end())) for lm in re.finditer(pat, body[:lim])]
+            for lm in re.finditer(LOOP_BIND % esc, body[:lim]):
                 brace = body.find("{", lm.end())
                 found.append((lm.end(), len(body) if brace < 0 else brace))
             called = bare or re.search(r"\b%s\s*\(" % esc, body[a:b]) is not None
-            over = over or (called and any(re.search(pat % esc, body[:a]) for pat in (ARM_BIND, PARAM_BIND)))
+            over = over or (called and any(re.search(pat % esc, body[:lim]) for pat in (ARM_BIND, PARAM_BIND)))
             if len(texts) > MAX_CARRIER_NAMES:
                 return spans, texts, True
             for x, y in found:
+                # #8056: a closure literal written inside a followed initialiser (`Box::new(move || ..)`) is the
+                # closure that reaches the spawn, so it is a span; the variable is not the only holder.
+                spans += [(x + s, x + e) for s, e in closure_literals(body[x:y])]
                 texts.append(body[x:y])
                 queue += [(n, False) for n in LOCAL_NAME.findall(body[x:y])]
         return spans, texts, over
@@ -1589,10 +1790,11 @@ class FileModel:
         if not v:
             return (spans + every if cover else spans), [], cover
         chain, frontier = [(v.group(1), v.group(2))], ([v.group(2)] if not v.group(1) else [])
+        lim = loop_end(body, a)
         for _ in range(MAX_REBIND_HOPS):
             nxt = []
             for name in frontier:
-                for lm in re.compile(REBIND_LET % re.escape(name)).finditer(body, 0, a):
+                for lm in re.compile(REBIND_LET % re.escape(name)).finditer(body, 0, lim):
                     tgt = (lm.group(1), lm.group(2))
                     if tgt not in chain:
                         chain.append(tgt)
@@ -1608,7 +1810,7 @@ class FileModel:
             for prefix, name in chain:
                 if not prefix:
                     spans += [(lm.end(), stmt_end(body, lm.end()))
-                              for lm in re.compile(CLOSURE_LET % re.escape(name)).finditer(body, 0, a)]
+                              for lm in re.compile(CLOSURE_LET % re.escape(name)).finditer(body, 0, lim)]
         return spans, chain, over
 
     def spawn_spans(self, fn):
@@ -1617,11 +1819,13 @@ class FileModel:
         spans = self.spawn_roots(fn)
         for a, b in list(spans):
             spans += self.expand(fn.body, a, b)[0]
-        return spans
+        return spans + self.literal_spans(fn)  # #8056: and every closure literal not provably same-thread
 
     def _spawned_params(self, fn):
         """Indices of the parameters of fn that reach a spawn: named in a spawn argument, in a closure a spawn
         argument variable holds, or in the argument of a call to another detaching helper (#8044)."""
+        if VALUE_DETACH.search(fn.body):  # #8057: spawn as a fn value can take any parameter: all of them
+            return set(range(len(fn.params)))
         roots = self.spawn_roots(fn)
         if not roots:
             return set()
@@ -1991,7 +2195,12 @@ def detaching_fns(scrubbed):
     """{fn key: (parameter indices handed to a spawn, has_self)} of one scrubbed file (#8052): the same-file
     #8044 fixpoint, run on a tests/common or module file so a call of its fns from a test file detaches."""
     model = FileModel(scrubbed)
-    return {f.key: (frozenset(model.helpers[id(f)]), f.has_self) for f in model.fns if model.helpers.get(id(f))}
+    out = {}
+    for f in model.fns:
+        if not f.is_test:
+            idxs, has_self = out.get(f.key, (frozenset(), False))
+            out[f.key] = (idxs | frozenset(model.helpers.get(id(f), ())), has_self or f.has_self)
+    return out
 
 
 def violating_fns(scrubbed, raw=None, common=None, modules=None):
