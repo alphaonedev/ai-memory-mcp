@@ -23,6 +23,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 SCRATCH = REPO / ".local-runs" / "prune-7188"
+# A real directory that resolves to one path component on Linux and macOS.
+SINGLE_COMPONENT_ROOT = "/usr"
 sys.path.insert(0, str(REPO / "scripts" / "ci"))
 import prune_runner_artifacts as prune  # noqa: E402
 
@@ -181,7 +183,7 @@ class Arguments(Fixture):
         self.assert_refused(rc)
 
     def test_work_root_with_fewer_than_two_components_is_refused(self):
-        rc, _ = self.run_with(work="/home", workspace="/home/x", shared="/opt/ci-cargo-target")
+        rc, _ = self.run_with(work=SINGLE_COMPONENT_ROOT, workspace=SINGLE_COMPONENT_ROOT + "/x", shared="/opt/ci-cargo-target")
         self.assertEqual(rc, prune.EXIT_USAGE)
         self.assertTrue(self.old_tmp.exists())
 
