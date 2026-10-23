@@ -1182,6 +1182,38 @@ mod tests {
         assert_eq!(s4, "", "no duplicate: {s4:?}");
     }
 
+    /// #8097 - the sink sees lines while the read is still going: the first
+    /// sink call truncates the file, so a reader that streams stops once its
+    /// buffered chunk is used up, while one that collected every line first
+    /// and replayed them afterwards would still deliver all of them.
+    #[test]
+    fn read_lines_from_handle_sink_sees_lines_before_loop_ends_8097() {
+        const LINES: usize = 2_000;
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{}\n", "x".repeat(63)).repeat(LINES);
+        let path = make_log(dir.path(), "ai-memory.log", &body);
+        let mut file = fs::File::open(&path).unwrap();
+        let mut calls = 0_usize;
+        read_lines_from_handle(&mut file, 0, false, &mut |_| {
+            calls += 1;
+            if calls == 1 {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(calls >= 1, "the sink ran");
+        assert!(
+            calls < LINES,
+            "lines streamed to the sink while reading, not replayed after: {calls}"
+        );
+    }
+
     /// #8006 - a fragment that ends inside a multi-byte character is held,
     /// not an error; once its newline arrives the line prints whole. A
     /// complete line of invalid UTF-8 prints lossily.
