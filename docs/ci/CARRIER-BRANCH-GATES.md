@@ -151,3 +151,13 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
 - **Operational cap.** Run at most 2 concurrent cargo lanes per host (f1 had 9
   cargo / 17 rustc processes during the failing run). This is a fleet rule for
   Modules, not enforced by the workflow.
+
+### Manifest-inventoried paths (#8050)
+
+- **Owning pin test.** SDK source files inventoried by a `tests/fixtures/*.json`
+  manifest (for example `sdk/typescript/src/wake.ts`) are gated by that
+  manifest's `tests/qual_*.rs` test, even when the diff contains no Rust. A lane
+  and a reviewer must run `python3 scripts/ci/manifest_owned_paths.py
+  --diff-file <changed files>` and then run and quote every `cargo test --test
+  <qual>` it names before claiming gates green. Unit tests:
+  `scripts/ci/tests/test_manifest_owned_paths_8050.py`.
