@@ -31,6 +31,19 @@ RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
 OK_RE = re.compile(r"^OK(?: \(.*\))?$", re.MULTILINE)
 
 
+TEARDOWN_RE = re.compile(r"^def tearDownModule\(", re.MULTILINE)
+
+
+class PatternsComplete8024(unittest.TestCase):
+    """PATTERNS must name exactly the suites that own a per-run module scratch."""
+
+    def test_patterns_match_every_suite_with_a_tear_down_module(self):
+        found = {p.name for p in TESTS_DIR.glob("test_*.py")
+                 if TEARDOWN_RE.search(p.read_text(encoding="utf-8"))}
+        self.assertGreater(len(PATTERNS), 0, "PATTERNS is empty")
+        self.assertEqual(set(PATTERNS), found)
+
+
 class PerRunScratch8024(unittest.TestCase):
     """Deterministic guard: each suite's setUpModule must mint a fresh scratch dir (F1 of r2).
 
@@ -42,6 +55,7 @@ class PerRunScratch8024(unittest.TestCase):
         sys.path.insert(0, str(TESTS_DIR))
         self.addCleanup(sys.path.remove, str(TESTS_DIR))
         parent = (REPO / ".local-runs").resolve()
+        self.assertGreater(len(PATTERNS), 0, "PATTERNS is empty")
         for pattern in PATTERNS:
             with self.subTest(pattern=pattern):
                 mod = importlib.import_module(pattern[:-len(".py")])
@@ -87,6 +101,7 @@ class ConcurrentScratch8024(unittest.TestCase):
                     proc.communicate(timeout=KILL_WAIT_SECS)
                 except subprocess.TimeoutExpired:
                     pass
+        self.assertGreater(len(PATTERNS), 0, "PATTERNS is empty")
         self.assertEqual(len(results), CHILD_COUNT * len(PATTERNS))
         for pattern, returncode, out in results:
             with self.subTest(pattern=pattern):
