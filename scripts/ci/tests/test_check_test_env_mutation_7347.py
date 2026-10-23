@@ -2041,6 +2041,97 @@ class Issue8069(Positive):
         self.check("items().into_iter().for_each(|_| { %s });" % self.OPEN, set(), head=head)
 
 
+class Issue8089(Positive):
+    """#8089: a method chain rooted in a local binding inherits the classification of the binding's initialiser, so one
+    `let` cannot launder a parallel or unresolved receiver."""
+
+    PAR = "fn par() -> impl Sized { (0..3u32).into_par_iter() }\n"
+
+    def test_let_bound_same_file_parallel_helper(self):
+        self.check("let it = par();\n    it.for_each(|_| { %s });" % self.OPEN, head=self.PAR)
+
+    def test_let_mut_bound_parallel_helper(self):
+        self.check("let mut it = par();\n    it.for_each(|_| { %s });" % self.OPEN, head=self.PAR)
+
+    def test_let_bound_unresolved_path_constructor(self):
+        self.check("let pool = ai_memory::pool::Pool::new();\n    pool.for_each(|_| { %s });" % self.OPEN)
+
+    def test_two_hop_binding(self):
+        body = "let a = par();\n    let b = a.filter(|_| true);\n    b.for_each(|_| { %s });" % self.OPEN
+        self.check(body, head=self.PAR)
+
+    def test_binding_passed_by_reference(self):
+        self.check("let a = par();\n    (&a).for_each(|_| { %s });" % self.OPEN, head=self.PAR)
+
+    def test_binding_through_iter(self):
+        self.check("let a = par();\n    a.iter().for_each(|_| { %s });" % self.OPEN, head=self.PAR)
+
+    def test_shadowing_latest_binding_wins(self):
+        body = "let it = vec![1].into_iter();\n    let it = par();\n    it.for_each(|_| { %s });" % self.OPEN
+        self.check(body, head=self.PAR)
+
+    def test_control_shadowed_back_to_literal(self):
+        body = "let it = par();\n    let it = vec![1].into_iter();\n    it.for_each(|_| { %s });" % self.OPEN
+        self.check(body, set(), head=self.PAR)
+
+    def test_control_vec_binding(self):
+        self.check("let v = vec![1, 2];\n    v.iter().for_each(|_| { %s });" % self.OPEN, set())
+
+    def test_control_array_literal_binding(self):
+        self.check("let keys = [1, 2];\n    keys.map(|_| { %s });" % self.OPEN, set())
+
+    def test_control_std_repeat_binding(self):
+        body = "let it = std::iter::repeat(1).take(2);\n    it.for_each(|_| { %s });" % self.OPEN
+        self.check(body, set())
+
+    def test_control_non_parallel_helper_binding(self):
+        head = "fn items() -> Vec<u32> { vec![1] }\n"
+        self.check("let v = items();\n    v.iter().for_each(|_| { %s });" % self.OPEN, set(), head=head)
+
+
+class Issue8090(Positive):
+    """#8090: every rayon parallel-iterator entry point taints, not only par_iter / into_par_iter / par_bridge."""
+
+    def test_each_parallel_method_taints_a_helper(self):
+        for name in ("par_iter", "par_iter_mut", "into_par_iter", "par_chunks", "par_chunks_mut", "par_lines",
+                     "par_bridge", "par_split", "par_windows", "par_extend", "par_sort", "par_sort_by", "par_drain"):
+            head = "fn par() -> u8 {\n    let v = Vec::<u8>::new();\n    let _p = v.%s();\n    1\n}\n" % name
+            with self.subTest(name=name):
+                self.check("par().to_string().chars().for_each(|_| { %s });" % self.OPEN, head=head)
+
+    def test_control_lookalike_name_is_not_parallel(self):
+        head = "fn items() -> Vec<u32> {\n    let par_iterations = 3;\n    vec![par_iterations]\n}\n"
+        self.check("items().into_iter().for_each(|_| { %s });" % self.OPEN, set(), head=head)
+
+
+class Issue8091(Positive):
+    """#8091: a `{` inside a const block of a fn signature is not the body, so a helper that spawns its closure
+    parameter is seen as one."""
+
+    def spawner(self, sig, tail):
+        return ("fn spin<F: FnOnce() + Send + 'static>(f: F) %s {\n    std::thread::spawn(f).join().unwrap();\n"
+                "    %s\n}\n") % (sig, tail)
+
+    def test_const_block_return_type(self):
+        head = "struct A<const N: usize>;\n" + self.spawner("-> A<{ 3 }>", "A")
+        self.check("let _a = spin(move || { %s });" % self.OPEN, head=head)
+
+    def test_const_block_array_length(self):
+        head = self.spawner("-> [u8; { 2 * 2 }]", "[0; 4]")
+        self.check("let _a = spin(move || { %s });" % self.OPEN, head=head)
+
+    def test_const_block_where_clause(self):
+        self.check("spin(move || { %s });" % self.OPEN, head=self.spawner("where [(); { 2 }]: Sized", ""))
+
+    def test_control_semicolon_array_signature_still_parses(self):
+        head = "fn keys() -> [&'static str; 2] {\n    [\"A\", \"B\"]\n}\n"
+        self.check("let _v: Vec<_> = keys().into_iter().map(|k| { %s }).collect();" % self.OPEN, set(), head=head)
+
+    def test_control_inline_helper_with_generic_signature(self):
+        head = "fn run<F: FnOnce()>(f: F) -> Vec<Option<u8>> {\n    f();\n    Vec::new()\n}\n"
+        self.check("let _a = run(move || { %s });" % self.OPEN, set(), head=head)
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

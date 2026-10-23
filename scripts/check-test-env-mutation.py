@@ -112,8 +112,10 @@ that is inline-only in turn; a store, a return, a use inside another closure or 
 never a callee that merely does not spawn it (#8065); or an unresolved runner named by its FULL path
 (INLINE_ROOTS: std, core, alloc, tokio, futures; WRAPPER_CALLEES such as AssertUnwindSafe recurse), or an
 iterator/Option/Once adaptor of SAME_THREAD_CALLEES whose receiver chain roots in a local, a literal, a
-std type or a callee that builds no parallel iterator (#8068, #8069). PARALLEL_ITER is judged through a
-fixpoint over callee bodies, so a helper that builds a rayon-style iterator taints its callers (#8069).
+std type or a callee that builds no parallel iterator (#8068, #8069); a root that is a local `let` binding
+inherits the classification of its initialiser, the latest binding winning (#8089). PARALLEL_ITER (every
+rayon par_* adapter, PARALLEL_METHODS, #8090) is judged through a fixpoint over callee bodies, so a helper
+that builds a rayon-style iterator taints its callers (#8069).
 `&|| ..` and `&mut || ..` are closure literals (#8067). Anything else (inside Box::new, Some, a struct
 field, vec!, a tuple, a method receiver, an assignment, a return, a loop, another closure, an unresolved
 free function or crate path) is detached. A spawn used as a fn value (`.map(std::thread::spawn)`,
@@ -303,7 +305,16 @@ SAME_THREAD_CALLEES = frozenset((
     "min_by_key", "get_or_insert_with", "or_insert_with", "query_row", "query_map", "query_and_then", "block_on",
     "timeout", "catch_unwind", "AssertUnwindSafe", "with_default", "call_once", "call_once_force", "get_or_init",
     "get_or_try_init", "force"))
-PARALLEL_ITER = re.compile(r"\brayon\b|\bpar_iter\b|\binto_par_iter\b|\bpar_bridge\b")
+# #8090: every rayon parallel-iterator entry point, matched as a WHOLE method name (the `par_sort*` family by prefix).
+PARALLEL_METHODS = (
+    "par_iter", "par_iter_mut", "into_par_iter", "par_bridge", "par_chunks", "par_chunks_mut", "par_chunks_exact",
+    "par_chunks_exact_mut", "par_rchunks", "par_rchunks_mut", "par_lines", "par_split", "par_split_mut",
+    "par_split_terminator", "par_split_whitespace", "par_windows", "par_extend", "par_drain", "par_chars",
+    "par_bytes", "par_char_indices", "par_matches", "par_encode_utf16",
+)
+PARALLEL_ITER = re.compile(r"\brayon\b|\b(?:%s|par_sort\w*)\b" % "|".join(PARALLEL_METHODS))
+LET_SIMPLE = r"\blet\s+(?:mut\s+)?%s\s*(?::[^=;]*)?=(?!=)"  # #8089: `let [mut] name [: T] =` (any other pattern is opaque)
+BINDING_ROOT_PREFIX = re.compile(r"[&*\s]*(?:mut\s+)?")  # #8089: what may sit between a `let` initialiser's `=` and its root
 CLOSURE_LET_HEAD = re.compile(r"\s*let\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*)?=\s*")
 CALLEE_TAIL = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*$")
 LOOP_HEADER = re.compile(r"\b(?:for|while|loop)\b")
@@ -712,19 +723,62 @@ def impl_type(header):
 def fn_body_open(text, pos):
     """Index of the `{` that opens the body of the fn whose name ends at pos, or -1 for a declaration without a body
     (a trait item ending in `;`). A `;` inside `[..]` / `(..)`, as in a `-> [T; 5]` return type, does not end the
-    signature (#8065: such a helper was invisible to the gate, so its callers' closures could not be proven inline)."""
-    depth = 0
-    for j in range(pos, len(text)):
+    signature (#8078), and a `{` inside `[..]`, `(..)` or a generic argument list `<..>` is a const block of the
+    signature (`-> A<{ 3 }>`, `[u8; { N * 2 }]`, `where [(); { N }]: Sized`), skipped whole (#8091). The `>` of `->`
+    is not a bracket; angle depth is counted outside `(..)` / `[..]` only, where a `<` is a comparison."""
+    depth = angle = 0
+    j = pos
+    while j < len(text):
         ch = text[j]
+        if ch == "-" and text[j + 1:j + 2] == ">":
+            j += 2
+            continue
         if ch in "([":
             depth += 1
         elif ch in ")]":
             depth -= 1
-        elif depth <= 0 and ch == "{":
+        elif ch == "<" and depth <= 0:
+            angle += 1
+        elif ch == ">" and depth <= 0:
+            angle = max(0, angle - 1)
+        elif ch == "{":
+            if depth > 0 or angle > 0:
+                j = match_brace(text, j)
+                continue
             return j
-        elif depth <= 0 and ch == ";":
+        elif ch == ";" and depth <= 0 and angle == 0:
             return -1
+        j += 1
     return -1
+
+
+def strip_turbofish(text):
+    """text without a trailing `::<..>` generic-argument list (`x.collect::<Vec<_>>`), else text unchanged (#8089)."""
+    s = text.rstrip()
+    if not s.endswith(">"):
+        return text
+    depth = 0
+    for j in range(len(s) - 1, -1, -1):
+        if s[j] == ">":
+            depth += 1
+        elif s[j] == "<":
+            depth -= 1
+            if depth == 0:
+                return s[:j].rstrip()[:-2].rstrip() if s[:j].rstrip().endswith("::") else text
+    return text
+
+
+def has_top_range(text):
+    """True when text holds a `..` / `..=` range operator at bracket depth 0 (a range is never a parallel iterator)."""
+    depth = 0
+    for j, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "." and depth == 0 and text[j + 1:j + 2] == "." and text[j - 1:j] != ".":
+            return True
+    return False
 
 
 def parse_fns(scrubbed):
@@ -1858,7 +1912,7 @@ class FileModel:
             return all(
                 slot[1] - (0 if method or not has_self else 1) >= 0
                 and slot[1] - (0 if method or not has_self else 1) in idxs for idxs, has_self in facts)
-        if PARALLEL_ITER.search(body):
+        if id(fn) in self.parallel or PARALLEL_ITER.search(body):  # a test fn is outside the fixpoint (#8089)
             return False
         segs = path_segments(prefix)
         if name in WRAPPER_CALLEES and not method:
@@ -1867,45 +1921,89 @@ class FileModel:
             return False
         return self.receiver_ok(fn, len(before) - 1) if method else self.rooted(segs, name)
 
-    def receiver_ok(self, fn, dot):
-        """True when the method chain that ends at the `.` at index dot roots in a local binding, a literal, a
-        macro, a std path or a callee that builds no parallel iterator (#8069). The chain is walked back link by
-        link (MAX_CHAIN_STEPS); a root call to an unresolved callee, or to one that reaches rayon, is not ok."""
+    def receiver_ok(self, fn, dot, floor=None, hops=0):
+        """True when the method chain that ends at the `.` at index dot roots in a literal, a macro, a std path, a
+        callee that builds no parallel iterator, or a LOCAL BINDING whose initialiser is itself ok (#8069, #8089). The
+        chain is walked back link by link (MAX_CHAIN_STEPS); a root call to an unresolved callee, or to one that
+        reaches rayon, is not ok, and a `let`-bound root inherits the classification of its initialiser (binding_ok).
+        With floor set the walk judges a whole `let` initialiser that starts at floor: it must reach a root there
+        (`&`, `&mut`, `*` allowed before it), and a block, a tuple or any other shape is not ok (doubt: detached)."""
         body, end = fn.body, dot
+        strict = floor is not None
+
+        def at_root(pos):
+            return not strict or bool(BINDING_ROOT_PREFIX.fullmatch(body[floor:pos]))
+
         for _ in range(MAX_CHAIN_STEPS):
             head = body[:end].rstrip()
-            if not head:
-                return True
+            if not head or (strict and len(head) <= floor):
+                return not strict
             ch = head[-1]
             if ch == "?":
                 end = len(head) - 1
                 continue
             if ch in ")]":
                 op = open_group(head, len(head) - 1)
-                if op < 0:
+                if op < 0 or (strict and op < floor):
                     return False
                 before = head[:op].rstrip()
+                if before.endswith("!"):  # a macro call or `vec![..]`: a literal root
+                    mt = CALLEE_TAIL.search(before[:-1])
+                    return at_root(mt.start() if mt else op)
                 if ch == "]":
-                    if before.endswith("!"):
-                        return True
+                    if not before or (before[-1] not in "_)]?" and not before[-1].isalnum()):
+                        return at_root(op)  # an array literal root
                     end = len(before)
                     continue
-                tail = CALLEE_TAIL.search(before)
-                if tail is None:
-                    return True
-                pre = before[:tail.start()].rstrip()
+                stripped = strip_turbofish(before)
+                tail = CALLEE_TAIL.search(stripped)
+                if tail is None:  # a parenthesised expression: a range, else judged inside
+                    if has_top_range(head[op + 1:-1]):
+                        return at_root(op)
+                    return at_root(op) and self.receiver_ok(fn, len(head) - 1, op + 1, hops)
+                pre = stripped[:tail.start()].rstrip()
                 if pre.endswith("."):
+                    if any(id(c) in self.parallel for c in self.by_method.get(tail.group(2), [])):
+                        return False
                     end = len(pre) - 1
                     continue
-                return self.root_call_ok(fn, tail.group(1), tail.group(2))
+                return at_root(tail.start()) and self.root_call_ok(fn, tail.group(1), tail.group(2))
             if ch == "}":
-                return True
+                return not strict
             tail = CALLEE_TAIL.search(head)
-            pre = head[:tail.start()].rstrip() if tail else ""
-            if not pre.endswith("."):
-                return True
-            end = len(pre) - 1
+            if tail is None:
+                return True  # a numeric or string literal
+            pre = head[:tail.start()].rstrip()
+            if pre.endswith("."):
+                end = len(pre) - 1
+                continue
+            if not at_root(tail.start()):
+                return False
+            if tail.group(1):  # a path constant `Type::NAME`
+                return not strict or self.rooted(path_segments(tail.group(1)), tail.group(2))
+            return self.binding_ok(fn, tail.group(2), tail.start(), hops)
         return False
+
+    def binding_ok(self, fn, name, use, hops):
+        """True when the local `name` used at index use inherits an ok classification (#8089): the LATEST `let` of it
+        before use wins (shadowing); its initialiser is judged by receiver_ok, so a `let it = par(..);`, a
+        `let pool = ai_memory::pool::Pool::new();` or a chain rooted in one stays detached through any number of
+        hops (`let b = a.filter(..);`, `&a`, `a.iter()`). A pattern binding (`let (a, b) = ..`) is opaque and not
+        ok. A name no `let` binds (a parameter, a loop variable, a field) keeps the plain-local treatment."""
+        if hops >= MAX_REBIND_HOPS:
+            return False
+        body, esc = fn.body, re.escape(name)
+        last = None
+        for lm in re.finditer(SHADOW_BINDS[0] % esc, body[:use]):
+            last = lm
+        if last is None:
+            return True
+        simple = re.compile(LET_SIMPLE % esc).match(body, last.start())
+        if simple is None:
+            return False
+        if any(re.search(pat % esc, body[simple.end():use]) for pat in SHADOW_BINDS[1:]):
+            return True  # a later `for` / match-arm binding of the name is the one in force
+        return self.receiver_ok(fn, stmt_end(body, simple.end()), simple.end(), hops + 1)
 
     def root_call_ok(self, fn, prefix, name):
         """True when a call `prefix::name(..)` that roots a receiver chain is known to build no parallel iterator (#8069)."""
