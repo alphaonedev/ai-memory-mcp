@@ -1948,6 +1948,99 @@ class Issue8066(Positive):
         self.check("let mk = || move || { %s };\n    let v = mk();\n    v();" % self.OPEN, set())
 
 
+class Issue8067(Positive):
+    """#8067: a borrowed closure literal (`&|| ..`, `&mut || ..`) is a closure literal and is classified like any other."""
+
+    def test_shared_borrow_sent_over_a_channel(self):
+        self.check("let (tx, rx) = std::sync::mpsc::channel();\n    tx.send(&|| { %s }).unwrap();\n"
+                   "    std::thread::spawn(rx.recv().unwrap()).join().unwrap();" % self.OPEN)
+
+    def test_mutable_borrow_pushed_then_drained(self):
+        self.check("let mut q = Vec::new();\n    q.push(&mut || { %s });\n    %s" % (self.OPEN, self.DRAIN))
+
+    def test_borrowed_literal_is_seen_as_a_closure(self):
+        self.assertEqual(len(gate.closure_literals("q.push(&|| { x });\n q.push(&mut || { y });")), 2)
+
+    def test_control_plain_let_only_called(self):
+        self.check("let f = || { %s };\n    f();" % self.OPEN, set())
+
+    def test_control_bit_and_is_not_a_closure(self):
+        self.assertEqual(gate.closure_literals("let m = a & b | c;"), [])
+
+
+class Issue8068(Positive):
+    """#8068: an inline runner is matched by its FULL resolved path, never by the last segment of an unresolved
+    crate path."""
+
+    def test_unresolved_crate_path_ending_in_an_inline_name(self):
+        self.check("ai_memory::pool::map(|| { %s });" % self.OPEN)
+
+    def test_unresolved_free_function_with_an_inline_name(self):
+        self.check("pool::for_each(move || { %s });" % self.OPEN)
+
+    def test_control_std_qualified_inline_runner(self):
+        self.check("let n = std::iter::once(1).map(|_| { %s 1 }).count();" % self.OPEN, set())
+
+    def test_control_catch_unwind_with_its_wrapper(self):
+        self.check("let _r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { %s }));" % self.OPEN, set())
+
+    def test_control_imported_catch_unwind(self):
+        head = "use std::panic::{catch_unwind, AssertUnwindSafe};\n"
+        self.check("let _r = catch_unwind(AssertUnwindSafe(|| { %s }));" % self.OPEN, set(), head=head)
+
+    def test_wrapper_pushed_instead_of_run_is_detached(self):
+        head = "use std::panic::AssertUnwindSafe;\n"
+        self.check("let mut q = Vec::new();\n    q.push(Box::new(AssertUnwindSafe(|| { %s })));\n    %s"
+                   % (self.OPEN, self.DRAIN), head=head)
+
+    def test_control_method_inline_runner(self):
+        self.check("let r = Some(1).map(|_| { %s 1 });" % self.OPEN, set())
+
+
+class Issue8078(Positive):
+    """#8078: a fn whose signature holds a `;` (an array return type) is parsed, so it resolves as a receiver root."""
+
+    KEYS = "fn keys() -> [&'static str; 2] {\n    [\"A\", \"B\"]\n}\n"
+
+    def test_control_array_returning_helper_roots_an_inline_chain(self):
+        self.check("let _v: Vec<_> = keys().into_iter().map(|k| { %s }).collect();" % self.OPEN, set(), head=self.KEYS)
+
+    def test_array_helper_that_builds_a_parallel_iterator_taints_its_caller(self):
+        head = "fn keys() -> [u8; 2] {\n    let _p = (0u8..2).into_par_iter();\n    [1, 2]\n}\n"
+        self.check("let _v: Vec<_> = keys().into_iter().map(|k| { %s }).collect();" % self.OPEN, head=head)
+
+
+class Issue8069(Positive):
+    """#8069: a parallel iterator built in a helper (or by an unresolved callee) makes every closure passed to its
+    adapters detached; a local, literal or std-rooted receiver keeps the inline treatment."""
+
+    PAR = "fn par() -> impl Sized { (0..3u32).into_par_iter() }\n"
+
+    def test_same_file_helper_builds_a_rayon_iterator(self):
+        self.check("par().for_each(|_| { %s });" % self.OPEN, head=self.PAR)
+
+    def test_helper_reaches_the_parallel_iterator_through_another_helper(self):
+        head = self.PAR + "fn outer() -> impl Sized { par() }\n"
+        self.check("outer().for_each(|_| { %s });" % self.OPEN, head=head)
+
+    def test_tests_common_helper_builds_a_rayon_iterator(self):
+        self.put_cf("mod.rs", "pub fn par() -> impl Sized { (0..3u32).into_par_iter() }\n")
+        self.check("common::par().for_each(|_| { %s });" % self.OPEN)
+
+    def test_unresolved_callee_roots_the_chain(self):
+        self.check("pool::items().into_iter().for_each(|_| { %s });" % self.OPEN)
+
+    def test_control_literal_receiver(self):
+        self.check("vec![1].into_iter().for_each(|_| { %s });" % self.OPEN, set())
+
+    def test_control_local_receiver(self):
+        self.check("let it = vec![1].into_iter();\n    it.for_each(|_| { %s });" % self.OPEN, set())
+
+    def test_control_non_parallel_same_file_helper(self):
+        head = "fn items() -> Vec<u32> { vec![1] }\n"
+        self.check("items().into_iter().for_each(|_| { %s });" % self.OPEN, set(), head=head)
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)
