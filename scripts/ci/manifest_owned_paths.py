@@ -6,12 +6,20 @@
 A tests/fixtures/**/*.json manifest inventories repo paths (for example SDK
 sources fingerprinted by sha256). Its owning tests/qual_*.rs test references
 the manifest through include_str!/include_bytes!. A diff that touches an
-inventoried path must run that test; this gate names it. Every path-shaped
-string in a manifest counts as inventoried whether or not the file exists
-today (a deleted or renamed pinned file must still name its test), a directory
-string covers everything beneath it, and the manifest file itself is
-inventoried by its own owning test. Strings that are not path-shaped are
-ignored (see PATH_SHAPED_RE), so a new manifest key cannot bypass the gate.
+inventoried path must run that test; this gate names it.
+
+decision: inventory every manifest string over a path-shape filter because r1
+and r2 each found paths the filter let through (52e10527).
+
+Every string value found anywhere in a manifest is inventoried, normalised (a
+leading ./ or / and a trailing / are stripped, // collapses), whether or not the
+path exists today. A changed path matches an inventoried string when it equals
+it or starts with it plus "/" (so a folder entry covers its children, with or
+without a trailing slash and even after the folder is deleted). Matching is
+exact string equality or folder prefix, so an over-inventoried string such as a
+sha256 or a word cannot match a real diff path. A manifest file is inventoried
+by its own owning test. Manifests are enumerated with os.walk and a raising
+onerror, so an unreadable fixtures folder is a gate defect, never "ok".
 Exit 0: no inventoried path changed; 1: matches (run the named tests);
 2: gate defect (unparseable manifest, manifest without owner, bad root, any
 internal error), printed as one line `gate defect: <reason>`.
@@ -19,6 +27,7 @@ internal error), printed as one line `gate defect: <reason>`.
 
 import argparse
 import json
+import os
 from pathlib import Path
 import posixpath
 import re
@@ -29,30 +38,12 @@ EXIT_MATCH = 1  # a changed path is inventoried; run the owning test
 EXIT_DEFECT = 2  # gate defect: fail closed
 INCLUDE_RE = re.compile(r'include_(?:str|bytes)!\(\s*"fixtures/([^"]+)"\s*\)')
 FIXTURES_DIR = "tests/fixtures"  # include_str!("fixtures/<key>") is relative to tests/
-SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
-EXTENSION_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,7}$")
-PATH_SHAPED_RULE = "no URL scheme, not absolute, contains '/' or ends in a file extension"
-"""Name of the path-shaped heuristic applied by is_path_shaped.
-
-A manifest string is treated as a repo path when it has no URL scheme, is not
-absolute, has no NUL, and either contains a '/' or ends in a file extension (a
-dot then a letter). Bare words and hex digests are not paths. The rule errs
-towards inventorying: an extra entry costs one extra test run, a missing entry
-lets a pinned file change unguarded.
-"""
+GLOB_CHARS = "*?["
 
 
 def norm(path):
-    """Normalise a repo-relative path ('./a//b' -> 'a/b')."""
+    """Normalise a repo-relative path ('./a//b/' -> 'a/b', '/a' -> 'a')."""
     return posixpath.normpath(path.strip().replace("\\", "/")).lstrip("/")
-
-
-def is_path_shaped(value):
-    """Return True when a manifest string looks like a repo-relative path (fail closed)."""
-    text = value.strip().replace("\\", "/")
-    if not text or "\x00" in text or text.startswith("/") or SCHEME_RE.match(text):
-        return False
-    return "/" in text or EXTENSION_RE.search(text) is not None
 
 
 def walk_strings(node):
@@ -67,23 +58,66 @@ def walk_strings(node):
             yield from walk_strings(item)
 
 
-def add_entry(inventory, rel, is_dir, owner):
-    """Record that `rel` (a directory when is_dir) is owned by (manifest, test)."""
-    entry = inventory.setdefault(rel, {"dir": False, "owners": []})
-    entry["dir"] = entry["dir"] or is_dir
-    if owner not in entry["owners"]:
-        entry["owners"].append(owner)
+def add_entry(inventory, rel, owner):
+    """Record that `rel` is owned by (manifest, test stem)."""
+    owners = inventory.setdefault(rel, [])
+    if owner not in owners:
+        owners.append(owner)
+
+
+def raise_walk_error(err):
+    """os.walk onerror hook: an unreadable folder is a gate defect."""
+    raise err
+
+
+def glob_regex(pattern):
+    """Translate a repo-relative glob ('**/' spans folders; '*' and '?' stay in one segment)."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out += "(?:.*/)?"
+            i += 3
+        elif pattern[i] == "*":
+            out += "[^/]*"
+            i += 1
+        elif pattern[i] == "?":
+            out += "[^/]"
+            i += 1
+        else:
+            out += re.escape(pattern[i])
+            i += 1
+    return re.compile("^" + out + "$")
+
+
+def find_files(root, pattern):
+    """Return sorted files under root matching the glob; read errors raise (fail closed)."""
+    fixed = []
+    for part in pattern.split("/")[:-1]:
+        if any(ch in part for ch in GLOB_CHARS):
+            break
+        fixed.append(part)
+    base = root.joinpath(*fixed)
+    if not base.is_dir():
+        return []
+    regex = glob_regex(pattern)
+    found = []
+    for folder, _dirs, names in os.walk(str(base), onerror=raise_walk_error):
+        for name in names:
+            path = Path(folder) / name
+            if regex.match(path.relative_to(root).as_posix()):
+                found.append(path)
+    return sorted(found)
 
 
 def load_inventory(root, manifests_glob, tests_glob):
-    """Return {path: {"dir": bool, "owners": [(manifest, test stem)]}}; ValueError on defects."""
+    """Return {path: [(manifest, test stem)]}; raise ValueError on defects."""
     owners = {}
-    for test in sorted(root.glob(tests_glob)):
+    for test in find_files(root, tests_glob):
         for name in INCLUDE_RE.findall(test.read_text(encoding="utf-8", errors="replace")):
             owners.setdefault(name, []).append(test.stem)
     fixtures = root / FIXTURES_DIR
     inventory = {}
-    for manifest in sorted(root.glob(manifests_glob)):
+    for manifest in find_files(root, manifests_glob):
         try:
             key = manifest.relative_to(fixtures).as_posix()
         except ValueError:
@@ -95,13 +129,12 @@ def load_inventory(root, manifests_glob, tests_glob):
         if key not in owners:
             raise ValueError("manifest %s has no owning qual test" % key)
         for stem in owners[key]:
-            add_entry(inventory, manifest.relative_to(root).as_posix(), False, (key, stem))
+            add_entry(inventory, manifest.relative_to(root).as_posix(), (key, stem))
         for value in walk_strings(doc):
-            rel = norm(value) if is_path_shaped(value) else ""
+            rel = norm(value)
             if rel and rel != "." and not rel.startswith(".."):
-                is_dir = value.strip().endswith(("/", "\\")) or (root / rel).is_dir()
                 for stem in owners[key]:
-                    add_entry(inventory, rel, is_dir, (key, stem))
+                    add_entry(inventory, rel, (key, stem))
     return inventory
 
 
@@ -112,11 +145,11 @@ def read_diff(path):
 
 
 def owners_of(inventory, path):
-    """Return the owners whose entry equals `path` or, for a directory, contains it."""
+    """Return the owners of every inventoried string equal to `path` or a folder prefix of it."""
     found = []
     for rel, entry in inventory.items():
-        if path == rel or (entry["dir"] and path.startswith(rel + "/")):
-            found.extend(o for o in entry["owners"] if o not in found)
+        if path == rel or path.startswith(rel + "/"):
+            found.extend(o for o in entry if o not in found)
     return found
 
 

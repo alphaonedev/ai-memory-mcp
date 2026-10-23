@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for the manifest-owned paths gate (#8050)."""
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,7 +11,8 @@ import tempfile
 import unittest
 
 GATE = Path(__file__).resolve().parents[1] / "manifest_owned_paths.py"
-SCRATCH = Path(__file__).resolve().parents[3] / ".local-runs"
+REPO = Path(__file__).resolve().parents[3]
+SCRATCH =Path(__file__).resolve().parents[3] / ".local-runs"
 SDK_PATH = "sdk/typescript/src/wake.ts"
 OTHER_PATH = "sdk/python/ai_memory/wake.py"
 EXIT_OK = 0
@@ -121,15 +123,56 @@ class ManifestOwnedPathsTest(unittest.TestCase):
         self.assertEqual(res.returncode, EXIT_MATCH, res.stderr)
         self.assertIn("qual_m1", res.stdout)
 
-    def test_non_path_strings_are_not_inventoried_8071(self):
+    def test_over_inventoried_strings_never_false_match_8071(self):
         write(
             self.root / "tests/fixtures/m4.json",
-            '["https://example.com/a/b", "/etc/passwd", "sha256", "0"]',
+            '["https://example.com/a/b", "sha256", "0", "deadbeef0123"]',
         )
         write(self.root / "tests/qual_m4.rs", 'include_str!("fixtures/m4.json");\n')
-        for diff in ("sha256\n", "etc/passwd\n", "example.com/a/b\n"):
+        for diff in ("example.com/a/b\n", "sha256sum.txt\n", "src/0\n", "deadbeef\n"):
             res = self.run_gate(diff)
             self.assertEqual(res.returncode, EXIT_OK, (diff, res.stdout))
+
+    def test_every_string_is_inventoried_8079(self):
+        write(
+            self.root / "tests/fixtures/m6.json",
+            '{"a": "LICENSE", "b": "Makefile", "c": "pkg.7z", "d": "/lead/slash.ts", "e": "./dot//x.ts"}',
+        )
+        write(self.root / "tests/qual_m6.rs", 'include_str!("fixtures/m6.json");\n')
+        for diff in ("LICENSE\n", "Makefile\n", "pkg.7z\n", "lead/slash.ts\n", "dot/x.ts\n"):
+            res = self.run_gate(diff)
+            self.assertEqual(res.returncode, EXIT_MATCH, (diff, res.stdout, res.stderr))
+            self.assertIn("qual_m6", res.stdout)
+
+    def test_deleted_folder_without_slash_is_covered_8080(self):
+        write(self.root / "tests/fixtures/m7.json", '["some/dir", "other/dir/"]')
+        write(self.root / "tests/qual_m7.rs", 'include_str!("fixtures/m7.json");\n')
+        for diff in ("some/dir/file.ts\n", "some/dir\n", "other/dir/x/y.ts\n"):
+            res = self.run_gate(diff)
+            self.assertEqual(res.returncode, EXIT_MATCH, (diff, res.stdout, res.stderr))
+        res = self.run_gate("some/dir2/file.ts\n")
+        self.assertEqual(res.returncode, EXIT_OK, res.stdout)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores mode 000 folders")
+    def test_unreadable_fixtures_folder_fails_closed_8081(self):
+        locked = self.root / "tests/fixtures/locked"
+        locked.mkdir()
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        res = self.run_gate("README.md\n")
+        self.assertEqual(res.returncode, EXIT_DEFECT, (res.stdout, res.stderr))
+        self.assertTrue(res.stderr.startswith("gate defect: "), res.stderr)
+
+    def test_doc_bullet_states_current_rule_8082(self):
+        doc = (REPO / "docs/ci/CARRIER-BRANCH-GATES.md").read_text(encoding="utf-8")
+        section = doc[doc.index("### Manifest-inventoried paths"):]
+        for needle in ("tests/fixtures/**/*.json", "every string", "directory", "deleted", "exit 2"):
+            self.assertIn(needle, section)
+
+    def test_no_stale_path_shape_names_8083(self):
+        source = GATE.read_text(encoding="utf-8")
+        self.assertNotIn("PATH_SHAPED", source)
+        self.assertNotIn("is_path_shaped", source)
 
     def test_bom_and_crlf_diff_list_8073(self):
         data = b"\xef\xbb\xbf" + SDK_PATH.encode() + b"\r\n"
