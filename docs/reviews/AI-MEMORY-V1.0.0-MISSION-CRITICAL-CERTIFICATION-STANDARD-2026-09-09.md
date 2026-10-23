@@ -1,7 +1,11 @@
 # ai-memory v1.0.0 — Mission-Critical Certification Standard (v1)
 
 **Author:** Claude Fable 5.1 (Conductor, sole merger of `release/v1.0.0`)
-**Date:** 2026-09-09 (revision 4.2: freeze line recorded in §6 and §7)
+**Date:** 2026-09-09 (revision 4.3: pgvector 0.8.7 in §0.1, 2026-10-23; revision 4.2: freeze line recorded in §6 and §7)
+**Revision 4.3 (2026-10-23):** the certified backend is advanced from pgvector 0.8.6 to
+pgvector 0.8.7 (PostgreSQL 18.6 and Apache AGE 1.8.0 unchanged). Reason: operator-set
+certified stack, "certified PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.7 => ai-memory
+v1.0.0 GA release" (tracked in #8228). Revision 4.2 named pgvector 0.8.6 in §0.1.
 **Status:** NORMATIVE for the v1.0.0 certification decision. Supersedes Phase 6
 ("release and adoption decision") of `GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md` and
 prepends a scope-and-envelope section that plan lacked. Phases 1–5 of that plan remain
@@ -33,7 +37,7 @@ A certificate is void outside its envelope. The envelope enumerates:
 
 | Axis | Declared values (v1.0.0 candidate) |
 |---|---|
-| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` (`src/storage/connection.rs:558`, the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 18.6 + Apache AGE 1.8.0 (apt package `1.8.0~rc0`, extension version 1.8.0) + pgvector 0.8.6; pins are the package SHA-256s mirrored in the bundle, the apt strings are informational |
+| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` (`src/storage/connection.rs:558`, the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 18.6 + Apache AGE 1.8.0 (apt package `1.8.0~rc0`, extension version 1.8.0) + pgvector 0.8.7; pins are the package SHA-256s mirrored in the bundle, the apt strings are informational |
 | Feature builds | exactly the Cargo feature sets certified: `default` (sqlite-bundled) · `sal` · `sal-postgres` (implies `sal`) · `vectorlite`. The CI lane named `enterprise-fed` is `sal-postgres` run against the certified PG/AGE/pgvector pins; it is not a Cargo feature |
 | Transports and principals | HTTP with per-agent enrolled keys is the only **multi-principal** transport. MCP over stdio resolves its caller from the launcher's `AI_MEMORY_AGENT_ID` environment (`src/identity/mod.rs:470-497`; absent → single-tenant trust-all) and is certified as a **single trust domain**: one launcher, one principal. A swarm of N agents is certifiable only over HTTP, or over stdio when an orchestrator provably controls each child's environment and is itself the certified principal |
 | Hosts / adapters | an adapter contract with a tested version **range** per host, recorded in the N4 matrix; `ai-memory doctor --host <name>` (new, item 21) runs the wrapper self-test on the installed node; a node outside the range is NOT CERTIFIED for that host |
