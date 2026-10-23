@@ -3041,7 +3041,7 @@ R18_MUTANTS = (  # (issue, FileModel method, original text, mutated text): the m
     (8136, "await_macro_arg", "self.callee_origin(path_segments(m.group(1)), m.group(2), CALLEE_MACRO) == STD",
      'm.group(2) in ("join", "try_join", "select")'),
     (8137, "callee_origin", "full = self.method_path(name)", "full = (STD_METHOD_ROOT, name)"),
-    (8138, "_provider", "self.type_use(name, text)", "re.search(r\"(?<![\\w$'])%s\\b\" % re.escape(name), text)"),
+    (8138, "provider", "self.type_use(name, text)", "re.search(r\"(?<![\\w$'])%s\\b\" % re.escape(name), text)"),
     (8139, "same_thread", "if ASYNC_CLOSURE.match(body, s):", "if False:"),
 )
 
@@ -3862,6 +3862,7 @@ def r24_reason_rows():
         "include_missing": r24_clean('include!("gone.rs");\n', {}),
         "file_unreadable": r24_clean("", {"Cargo.toml": R20_CARGO, "src/lib.rs": "", "src/weird.rs/keep.txt": "x"}),
         "use_item": r24_clean("use ;\n", {}),
+        "extern_shadow": r24_clean("mod w { pub mod ai_memory {} }\n", {"Cargo.toml": R20_CARGO, "src/lib.rs": ""}),
     }
 
 
@@ -3941,8 +3942,7 @@ R24_MUTANTS = (  # (name, original text, mutated text): each must turn a probe o
     ("attr_scan_first_only", "            pos = j - 1\n            continue\n", "            return out[::-1]\n"),
     ("inline_path_ignored", "            if e.rel is not None:\n                children = pbase = pbase / e.rel",
      "            if False:\n                children = pbase = pbase / e.rel"),
-    ("local_mods_off", "if path[0] in FILE_ROOTS or (path[0] in self.local_mods and not extern):",
-     "if path[0] in FILE_ROOTS:"),
+    ("local_mods_off", "if path[0] in FILE_ROOTS or path[0] in self.local_mods:", "if path[0] in FILE_ROOTS:"),
     ("mod_catch_all_off", 'problems.append(REASONS["mod_unclassified"] % snippet(text, m.start()))\n            continue',
      "continue"),
     ("unparsable_attribute_off", 'bad.append(REASONS["attr_unparsable"] % name)\n            attrs = []', "attrs = []"),
@@ -4093,6 +4093,7 @@ R25_MUTANTS = (  # (name, original text, mutated text): each must turn a row of 
     ("alias_closure_off", "alias_closure([scrubbed] + self.module_texts, self.local_mods) - {\"common\"}", "self.local_mods"),
     ("alias_single_pass", "        if found <= mods:\n            return mods\n", "        return mods | found\n"),
     ("alias_prefix_kept", "        while p and p[0] in FILE_ROOTS:", "        while False:"),
+    ("std_root_shadow_off", "if path[0] in STD_ROOTS and path[0] not in self.local_mods:", "if path[0] in STD_ROOTS:"),
     ("alias_any_segment", "and all(seg in mods for seg in p)", "and any(seg in mods for seg in p)"),
 )
 
@@ -4122,136 +4123,143 @@ class ReviewR25Mutants(unittest.TestCase):
                     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
-# REVIEW-7349 code r25 (umbrella #8168, R25-1, R25-2). R25-1: a `use` alias is scoped to its block, so the name may
-# mean the extern crate of that name anywhere else; the gate answers for both meanings. R25-2: a module aliased
-# `as std` / `core` / `alloc` is no std path.
-R26_LIB_TRAIT = "pub trait Fan { fn map(self, f: u8); }\n"
-R26_LIB_STRUCT = "pub struct Fan;\n"
-R26_ALIAS_SCOPES = (  # (name, head with {A} for the alias item, the import that reads it)
-    ("same_block_before", "mod m;\n{A}\n", "use ai_memory::Fan;\n"),
-    ("sibling_mod", "mod m;\nmod w { {A} }\n", "use ai_memory::Fan;\n"),
-    ("sibling_mod_import_in_mod", "mod m;\nmod w { {A} }\nmod v { use ai_memory::Fan; }\n", ""),
-    ("fn_body_block", "mod m;\nfn g() { {A} }\n", "use ai_memory::Fan;\n"),
-    ("nested_mod", "mod m;\nmod w { mod x { {A} } }\n", "use ai_memory::Fan;\n"),
-    ("block_in_mod_fn", "mod m;\nmod w { fn g() { if true { {A} } } }\n", "use ai_memory::Fan;\n"),
+# REVIEW-7349 code r25 and r26 (umbrella #8168, R25-1, R25-2, R26-1, R26-2). The scope of a `use` alias or of an inner
+# `mod` is a block the gate does not track, so three rounds of partial scope tracking each left a bypass (R24-1, R25-1,
+# R26-1): a file that rebinds std, core, alloc or an extern crate name below the crate root is untrusted as a whole
+# (REASONS["extern_shadow"]) and fails the run in every mode.
+R27_LIB_TRAIT = "pub trait Fan { fn map(self, f: u8); }\n"
+R27_LIB_STRUCT = "pub struct Fan;\n"
+R27_CARGO_RENAMED = R20_CARGO + '[dependencies]\nfoo = { version = "1", package = "bar" }\n'
+R27_UNWIND_FILES = {"tests/m/mod.rs": "pub mod panic;\n",
+                    "tests/m/panic.rs": "pub fn catch_unwind<F: FnOnce() + Send + 'static>(f: F) { "
+                                        "let _ = ::std::thread::spawn(f); }\n"}
+R27_UNWIND_BODY = "let _ = catch_unwind(move || { %s });" % Positive.OPEN
+
+
+def r27_row(head, local="", lib=R27_LIB_TRAIT, cargo=R20_CARGO, body=R20_MAP, extra=None):
+    """(head, body, flagged, files): a crate `ai_memory` whose src/lib.rs holds `lib`; tests/m/mod.rs holds `local`."""
+    return (head, body, True, dict({"Cargo.toml": cargo, "src/lib.rs": lib, "tests/m/mod.rs": local}, **(extra or {})))
+
+
+R27_SHADOWED = (  # (name, row): each one rebinds a recognised name below the crate root, whatever the library holds
+    ("S2", r27_row("mod m;\nmod w { use crate::m as ai_memory; }\nuse ai_memory::Fan;\n", R27_LIB_STRUCT)),
+    ("S2b", r27_row("mod m;\nmod w { use crate::m as ai_memory; }\nuse ai_memory::fan;\n",
+                    lib=R27_LIB_TRAIT.replace("Fan", "fan"))),
+    ("S2d", r27_row("mod m;\nmod w { use super::m as ai_memory; }\nmod v { use ai_memory::Fan; }\n", R27_LIB_STRUCT)),
+    ("F3", (  # R25-2: the module is aliased to std
+        "mod m;\nuse m as std;\nuse std::panic::catch_unwind;\n", R27_UNWIND_BODY, True, R27_UNWIND_FILES)),
+    ("R26-1", r27_row("mod w { pub mod ai_memory { pub struct Fan; } }\nuse ai_memory::Fan;\n")),
+    ("R26-1b", r27_row("mod w { pub mod ai_memory {} }\nuse ai_memory::fan;\n", lib=R27_LIB_TRAIT.replace("Fan", "fan"))),
+    ("R26-2a", r27_row("mod w { pub mod std { pub mod panic {} } }\nuse std::panic::catch_unwind;\n", body=R27_UNWIND_BODY)),
+    ("R26-2b-sibling-alias", r27_row("mod m;\nmod w { use crate::m as ai_memory; }\nuse ai_memory::Pool;\n",
+                                     lib="pub struct Pool;\n")),
+    ("R26-2b-fn-alias", r27_row("mod m;\nfn g() { use crate::m as ai_memory; }\nuse ai_memory::Pool;\n",
+                                lib="pub struct Pool;\n")),
+    # own probes of the rule
+    ("dependency-alias-in-fn-body", r27_row("mod m;\nfn g() { use crate::m as tokio; }\n")),
+    ("inner-mod-named-like-a-dependency", r27_row("mod w { pub mod tokio {} }\n")),
+    ("inner-mod-futures", r27_row("fn g() { mod futures { pub fn f() {} } }\n")),
+    ("self-as-std", r27_row("mod m;\nuse m::{self as std};\n")),
+    ("self-as-core-in-mod", r27_row("mod m;\nmod w { use crate::m::{self as core}; }\n")),
+    ("item-named-core-imported", r27_row("mod m;\nuse m::core;\n")),
+    ("alias-of-alias-to-alloc", r27_row("mod m;\nuse m as n;\nuse n as alloc;\n")),
+    ("pub-use-alias", r27_row("mod m;\nmod w { pub use super::m as ai_memory; }\n")),
+    ("cargo-rename-key", r27_row("mod m;\nmod w { use crate::m as foo; }\n", cargo=R27_CARGO_RENAMED)),
+    ("cargo-rename-package", r27_row("mod m;\nmod w { use crate::m as bar; }\n", cargo=R27_CARGO_RENAMED)),
+    ("mod-in-a-module-file", r27_row("mod m;\n", "pub mod ai_memory {}\n")),
+    ("alias-in-a-module-file", r27_row("mod m;\n", "mod k {}\nuse k as std;\n")),
+    ("root-alias-to-the-crate-name", r27_row("mod m;\nuse m as ai_memory;\n")),
 )
-R26_ALIAS_ITEMS = ("use crate::m as ai_memory;", "use super::m as ai_memory;", "pub use crate::m as ai_memory;",
-                   "use crate::m::{self as ai_memory};")
-
-
-def r26_src_rows():
-    """Probes of R25-1 plus the scope sweep: the extern crate has a trait `Fan`; the local module a struct of that
-    name (or nothing): the real import must be found. Controls: the crate has no trait."""
-    rows = []
-    for _name, head, last in R26_ALIAS_SCOPES:
-        for alias in R26_ALIAS_ITEMS:
-            if "super" in alias and head.startswith("mod m;\n{A}"):
-                continue  # `super` from the crate root names no module
-            # the local module holds a struct of that name or nothing (an unresolved leaf stays open); the control is
-            # a crate without the trait and a local struct: both meanings are structs, nothing may flag
-            for local, lib, flagged in ((R26_LIB_STRUCT, R26_LIB_TRAIT, True), ("", R26_LIB_TRAIT, True),
-                                        (R26_LIB_STRUCT, R26_LIB_STRUCT, False)):
-                files = {"Cargo.toml": R20_CARGO, "src/lib.rs": lib, "tests/m/mod.rs": local}
-                rows.append((head.replace("{A}", alias) + last, R20_MAP, flagged, files))
-    return rows
-
-
-R26_REVIEWER_PROBES = (  # the three probes of REVIEW-7349-code-r25 (S2, S2b, S2d)
-    ("S2", "mod m;\nmod w { use crate::m as ai_memory; }\nuse ai_memory::Fan;\n", R26_LIB_STRUCT, R26_LIB_TRAIT),
-    ("S2b", "mod m;\nmod w { use crate::m as ai_memory; }\nuse ai_memory::fan;\n", "", R26_LIB_TRAIT.replace("Fan", "fan")),
-    ("S2d", "mod m;\nmod w { use super::m as ai_memory; }\nmod v { use ai_memory::Fan; }\n", R26_LIB_STRUCT,
-     R26_LIB_TRAIT),
+R27_CLEAN = (  # (name, row): no diagnostic, the verdict of the file is the gate's own
+    ("false-positive-helpers-mod", r27_row("mod w { pub mod helpers {} }\nuse ai_memory::Fan;\n", lib=R27_LIB_STRUCT)),
+    ("alias-not-an-extern-name", r27_row("mod m;\nmod w { use crate::m as n; }\nuse ai_memory::Fan;\n", lib=R27_LIB_STRUCT)),
+    ("alias-of-a-std-item", r27_row("use std::fmt as f;\nuse std::{self};\nuse tokio::{self};\n")),
+    ("plain-import-of-the-extern-name", r27_row("use ai_memory::Fan;\nuse std::panic;\nuse tokio::time;\n", lib=R27_LIB_STRUCT)),
+    ("root-mod-core-with-its-file", r27_row("mod core;\n", lib=R27_LIB_STRUCT, extra={"tests/core/mod.rs": "pub fn f() {}\n"})),
+    ("cargo-rename-unrelated-alias", r27_row("mod m;\nuse m as other;\n", cargo=R27_CARGO_RENAMED)),
 )
-R26_FAKE_UNWIND = ("pub fn catch_unwind<F: FnOnce() + Send + 'static>(f: F) { let _ = ::std::thread::spawn(f); }\n")
-R26_UNWIND_BODY = "let _ = catch_unwind(move || { %s });" % Positive.OPEN
-R26_UNWIND_FILES = {"tests/m/mod.rs": "pub mod panic;\n", "tests/m/panic.rs": R26_FAKE_UNWIND}
 
 
-def r26_std_rows():
-    """R25-2: `mod m;` with a fake catch_unwind, aliased to std / core / alloc at any scope, is the fake, not std."""
-    rows = []
-    for root in ("std", "core", "alloc"):
-        for alias in ("use m as %s;", "use m::{self as %s};", "pub use m as %s;", "use crate::m as %s;",
-                      "use self::m as %s;"):
-            rows.append(("mod m;\n" + alias % root + "\nuse %s::panic::catch_unwind;\n" % root, R26_UNWIND_BODY, True,
-                         R26_UNWIND_FILES))
-    # nested: the alias and the import in an inline module, the function re-exported to the crate root
-    rows += [
-        ("mod m;\nmod w { use super::m as std; pub use std::panic::catch_unwind; }\nuse w::catch_unwind;\n",
-         R26_UNWIND_BODY, True, R26_UNWIND_FILES),
-        ("mod m;\nmod w { mod x { use crate::m as core; pub use core::panic::catch_unwind; } pub use x::catch_unwind; }\n"
-         "use w::catch_unwind;\n", R26_UNWIND_BODY, True, R26_UNWIND_FILES),
-        ("mod m;\nuse m as std;\nuse std::panic;\n", "let _ = panic::catch_unwind(move || { %s });" % Positive.OPEN,
-         True, R26_UNWIND_FILES),
-        # controls: the real std stays std, with or without the module, and an unrelated alias
-        ("mod m;\nuse std::panic::catch_unwind;\n", R26_UNWIND_BODY, False, R26_UNWIND_FILES),
-        ("use std::panic::catch_unwind;\n", R26_UNWIND_BODY, False, {}),
-        ("mod m;\nuse m as n;\nuse std::panic::catch_unwind;\n", R26_UNWIND_BODY, False, R26_UNWIND_FILES),
-    ]
-    return rows
+class ReviewR27(Positive):
+    """REVIEW-7349 code r25 and r26 (umbrella #8168): the fail-closed rule on extern-name shadowing."""
 
+    def verdict(self, row):
+        r20_write(row)
+        diags = []
+        gate.scan_tree(SCRATCH, diags)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rcs = [gate.main(["--root", str(SCRATCH)] + list(args)) for args in ((), ("--list",), ("--update-baseline",))]
+        return [d for d in diags if "shadowed-extern-name" in d], rcs
 
-class ReviewR26(Positive):
-    """REVIEW-7349 code r25 (umbrella #8168, R25-1, R25-2)."""
-
-    def run_rows(self, rows):
-        self.assertTrue(rows)
-        for row in rows:
-            with self.subTest(head=row[0], body=row[1][:40], files=dict(sorted(row[3].items()))):
-                r20_write(row)
-                self.assertEqual(self.scan(), FLAGGED if row[2] else set())
-
-    def test_the_three_reviewer_probes_of_r25_1(self):
-        for name, head, local, lib in R26_REVIEWER_PROBES:
+    def test_every_shadowing_row_is_an_untrusted_file_with_its_own_diagnostic(self):
+        self.assertGreaterEqual(len(R27_SHADOWED), 20)
+        for name, row in R27_SHADOWED:
             with self.subTest(probe=name):
-                r20_write((head, R20_MAP, True, {"Cargo.toml": R20_CARGO, "src/lib.rs": lib, "tests/m/mod.rs": local}))
-                self.assertEqual(self.scan(), FLAGGED)
-                self.assertEqual(gate.main(["--root", str(SCRATCH)]), 1)
+                shadow, rcs = self.verdict(row)
+                self.assertTrue(shadow, "no shadowed-extern-name diagnostic")
+                self.assertEqual(rcs, [1, 1, 1])
 
-    def test_an_alias_is_scoped_to_its_block_so_the_real_crate_import_is_still_found(self):
-        rows = r26_src_rows()
-        self.assertGreater(len(rows), 60)
-        self.run_rows(rows)
+    def test_the_diagnostic_names_the_file_line_and_name(self):
+        shadow, _rcs = self.verdict(dict(R27_SHADOWED)["S2"])
+        self.assertEqual(shadow, ["tests/a.rs: shadowed-extern-name: line %d `ai_memory` (rename the alias or module)"
+                                  % (len(WRITER.split("\n")) + 1)])
+        shadow, _rcs = self.verdict(dict(R27_SHADOWED)["mod-in-a-module-file"])
+        self.assertEqual(shadow, ["tests/m/mod.rs: shadowed-extern-name: line 1 `ai_memory` (rename the alias or module)"])
 
-    def test_a_module_aliased_as_std_core_or_alloc_is_no_std_path(self):
-        self.run_rows(r26_std_rows())
+    def test_a_file_without_shadowing_has_no_such_diagnostic(self):
+        for name, row in R27_CLEAN:
+            with self.subTest(probe=name):
+                shadow, rcs = self.verdict(row)
+                self.assertEqual((shadow, rcs), ([], [0, 0, 0]))
 
-    def test_the_reviewer_probe_of_r25_2(self):
-        r20_write(("mod m;\nuse m as std;\nuse std::panic::catch_unwind;\n", R26_UNWIND_BODY, True, R26_UNWIND_FILES))
-        self.assertEqual(self.scan(), FLAGGED)
-        self.assertEqual(gate.main(["--root", str(SCRATCH)]), 1)
+    def test_the_real_tree_shape_stays_trusted(self):
+        # tests/atomisation.rs declares `mod core;` at the crate root with tests/core/mod.rs: neither shadows below root
+        r20_write(r27_row("mod core;\n"))
+        (SCRATCH / "tests" / "core").mkdir()
+        (SCRATCH / "tests" / "core" / "mod.rs").write_text("pub fn helper() {}\n")
+        diags = []
+        gate.scan_tree(SCRATCH, diags)
+        self.assertEqual(diags, [])
 
 
-R26_MUTANTS = (  # (name, original text, mutated text): each must turn a row of ReviewR26 RED
-    ("alias_union_off", "        return ANY_METHOD if local is ANY_METHOD or other is ANY_METHOD else local | other\n",
-     "        return local\n"),
-    ("alias_roots_empty", "        self.alias_roots = self.local_mods - declared\n", "        self.alias_roots = set()\n"),
-    ("extern_meaning_local", "(path[0] in self.local_mods and not extern)", "(path[0] in self.local_mods)"),
-    ("std_head_rewrite_off", '                    path = ("crate",) + tuple(path)  # r26 (R25-2): a module aliased `as std` is no std path\n',
-     "                    pass\n"),
+R27_MUTANTS = (  # (name, original text, mutated text): each must turn a row of ReviewR27 RED
+    ("use_alias_branch_off", "            if name in names and tuple(path) != (name,):\n                out.append((item.start(), name))\n",
+     "            pass\n"),
+    ("use_same_path_not_exempt", "if name in names and tuple(path) != (name,):", "if name in names:"),
+    ("mod_branch_off", "        if not head or head.group(1) not in names:\n            continue\n",
+     "        continue\n"),
+    ("mod_root_level_flagged", "        if nested or scrubbed.count(\"{\", 0, at) > scrubbed.count(\"}\", 0, at):\n", "        if True:\n"),
+    ("module_file_not_nested", "shadowed_names(scrubbed, names, index > 0)", "shadowed_names(scrubbed, names, False)"),
+    ("dependency_names_dropped", "names = set(SHADOW_NAMES) | set(self.dep_roots)",
+     "names = set(SHADOW_NAMES)"),
+    ("crate_name_dropped", "        if self.crate_name:\n            names.add(self.crate_name)\n", ""),
+    ("renamed_package_dropped", "        names |= {real for real in self.dep_roots.values() if real != DEP_AMBIGUOUS}\n", ""),
+    ("diagnostic_dropped", "        self._diagnose(shadowed)\n", ""),
 )
 
 
-class ReviewR26Mutants(unittest.TestCase):
-    """Each named mutant of the round 26 rules is applied to the whole gate source and turns a row of ReviewR26 RED."""
+class ReviewR27Mutants(unittest.TestCase):
+    """Each named mutant of the round 27 rule is applied to the whole gate source and turns a row of ReviewR27 RED."""
 
     def test_each_named_mutant_turns_a_row_red(self):
         src = GATE.read_text()
-        rows = r26_src_rows() + r26_std_rows()
-        for name, old, new in R26_MUTANTS:
+        for name, old, new in R27_MUTANTS:
             with self.subTest(mutant=name):
                 self.assertEqual(src.count(old), 1, old)
-                mod = types.ModuleType("r26_mutant_" + name)
+                mod = types.ModuleType("r27_mutant_" + name)
                 mod.__file__ = str(GATE)
                 sys.modules[mod.__name__] = mod
                 exec(compile(src.replace(old, new), str(GATE), "exec"), mod.__dict__)
                 try:
                     red = False
-                    for row in rows:
-                        r20_write(row)
-                        if bool(mod.scan_tree(SCRATCH)) != row[2]:
-                            red = True
-                            break
+                    for rows, want in ((R27_SHADOWED, True), (R27_CLEAN, False)):
+                        for _name, row in rows:
+                            r20_write(row)
+                            diags = []
+                            mod.scan_tree(SCRATCH, diags)
+                            if any("shadowed-extern-name" in d for d in diags) != want:
+                                red = True
                     self.assertTrue(red, "the %s mutant stays GREEN" % name)
                 finally:
                     shutil.rmtree(SCRATCH, ignore_errors=True)

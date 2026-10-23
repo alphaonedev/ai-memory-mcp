@@ -2062,6 +2062,7 @@ REASONS = {  # r24: every reason the module walk gives for a target it cannot tr
     "include_missing": "include! file %s not found",
     "file_unreadable": "file cannot be read",
     "use_item": "`use` item cannot be classified (%s)",
+    "extern_shadow": "shadowed-extern-name: line %d `%s` (rename the alias or module)",
 }
 ModItem = collections.namedtuple("ModItem", "name inline start brace close rel problems")
 
@@ -2183,6 +2184,30 @@ def alias_closure(texts, mods):
         if found <= mods:
             return mods
         mods |= found
+
+
+SHADOW_NAMES = STD_ROOTS | INLINE_ROOTS  # r27: the roots a binding of a test file must never take
+
+
+def shadowed_names(scrubbed, names, nested):
+    """[(offset, name)] of every item of a scrubbed text that rebinds a name of `names` (std, core, alloc and the extern
+    crates the gate recognises) to something else (r27, R26-1, R26-2): a `use` leaf that binds the name to another path
+    (`use m as ai_memory;`, `use m::{self as std};`, `use a::core;`) at any depth, and a `mod <name>` below the crate
+    root (inside a block, or anywhere in a module file, which is itself below the root). The scope of such a binding
+    is a block the gate does not track, so the whole file is untrusted rather than guessed."""
+    out = []
+    for item in USE_ITEM.finditer(scrubbed):
+        for path, name in use_leaves(item.group(0)):
+            if name in names and tuple(path) != (name,):
+                out.append((item.start(), name))
+    for token in MOD_TOKEN.finditer(scrubbed):
+        head = MOD_HEAD.match(scrubbed, token.end())
+        if not head or head.group(1) not in names:
+            continue
+        at = token.start()
+        if nested or scrubbed.count("{", 0, at) > scrubbed.count("}", 0, at):
+            out.append((at, head.group(1)))
+    return sorted(out)
 
 
 class ModuleSet(set):
@@ -2451,10 +2476,26 @@ class CommonModel:
         out.texts = [scrub(text) for _file, text in walk.files[1:]]
         for text in out.texts:
             out.update(MACRO_RULES_NAME.findall(text))
+        names = self.extern_names()
+        shadowed = []  # r27: a diagnostic of its own; the verdict of the file's reader is not widened by it
+        for index, (file, text) in enumerate(walk.files):
+            scrubbed = scrub(text)
+            for at, name in shadowed_names(scrubbed, names, index > 0):  # r27: a module file is below the crate root
+                shadowed.append((file, REASONS["extern_shadow"] % (text.count("\n", 0, at) + 1, name)))
+        self._diagnose(shadowed)
         if walk.problems:
             out.add(MACRO_OPEN)
             self._diagnose(walk.problems)
         return out
+
+    def extern_names(self):
+        """The names a binding of the test file must not take (r27): std, core, alloc, the roots INLINE_ROOTS knows, the
+        crate under test and every dependency name and rename of Cargo.toml."""
+        names = set(SHADOW_NAMES) | set(self.dep_roots)
+        names |= {real for real in self.dep_roots.values() if real != DEP_AMBIGUOUS}
+        if self.crate_name:
+            names.add(self.crate_name)
+        return names
 
     def path_modules(self, path, raw):
         """{module name: detaching_fns} for the `#[path = ".."] mod m;` and `mod m;` files a test file declares
@@ -2540,11 +2581,7 @@ class FileModel:
         # import from the test crate (tests/common is a census of its own)
         self.local_mods = (module_names(scrubbed).union(*[module_names(t) for t in self.module_texts])) - {"common"}
         # r25 (R24-1): a `use` alias of such a module is a root of the test crate too, transitively
-        declared = self.local_mods
         self.local_mods = alias_closure([scrubbed] + self.module_texts, self.local_mods) - {"common"}
-        # r26 (R25-1): the names only a `use` alias binds; the alias is scoped to its block, so the same name may
-        # mean an extern crate elsewhere in the file: provider() answers for both meanings
-        self.alias_roots = self.local_mods - declared
         self.imports, self.glob = common_imports(scrubbed)
         self.modules = modules or {}  # #8052: module name -> detaching_fns of its file
         self.mod_imported = {}  # name -> module it is `use`-imported from
@@ -3350,12 +3387,10 @@ class FileModel:
         self.import_paths, common_glob = {}, False  # r11: name -> the full path it is imported from
         for um in USE_ITEM.finditer(with_uses):
             for path, name in use_leaves(um.group(0)):
-                if path[0] in STD_ROOTS and path[0] in self.local_mods:
-                    path = ("crate",) + tuple(path)  # r26 (R25-2): a module aliased `as std` is no std path
                 common = "common" in path
                 if name is not None and name != "_":
                     self.import_paths[name] = path
-                if path[0] in STD_ROOTS:
+                if path[0] in STD_ROOTS and path[0] not in self.local_mods:  # r25: a module aliased `as std` is no std path
                     if name is not None:
                         self.std_names[name] = path
                 elif name is None:
@@ -3408,17 +3443,6 @@ class FileModel:
         return self.rename_root(path)
 
     def provider(self, path, name, text, traits):
-        """The method names the import `path` may supply (see _provider). r26 (R25-1): a head only a `use` alias binds
-        is scoped to the block of that alias and means the extern crate of that name anywhere else, so the answer
-        is the union of the local and the extern meaning (ANY_METHOD absorbs): the gate never trusts the one
-        meaning that hides a trait."""
-        local = self._provider(path, name, text, traits, False)
-        if path[0] not in self.alias_roots:
-            return local
-        other = self._provider(path, name, text, traits, True)
-        return ANY_METHOD if local is ANY_METHOD or other is ANY_METHOD else local | other
-
-    def _provider(self, path, name, text, traits, extern):
         """The method names the non-std import `path` (bound as name) may supply on a receiver of another crate
         (r13, #8155, #8157; r14, G1): frozenset() when it supplies none, ANY_METHOD when it may supply any. A trait of
         KNOWN_TRAIT_METHODS supplies its listed methods. A path into the test crate or into this crate's src/ is
@@ -3433,7 +3457,7 @@ class FileModel:
             return KNOWN_TRAIT_METHODS[path]
         leaf, common = path[-1], self.common
         unread = False  # r23: the tree this path points into has a module / include! target the gate could not read
-        if path[0] in FILE_ROOTS or (path[0] in self.local_mods and not extern):  # an item of the test crate: a trait of the file supplies the fns it declares
+        if path[0] in FILE_ROOTS or path[0] in self.local_mods:  # an item of the test crate: a trait of the file supplies the fns it declares
             own, unread = self.local_index(), self.module_open
         elif common.crate_name is not None and path[0] == common.crate_name:
             own, unread = None, common.src_open
