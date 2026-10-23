@@ -2458,7 +2458,6 @@ class FormInventory(Positive):
             ("turbofish_std", True, "", "Vec::<u8>::new().iter().for_each(%s);" % cl, None),
             ("turbofish_other", False, "", "vec![1u8].iter().collect::<ai_memory::pool::Pool>().for_each(%s);" % cl, None),
             ("block_root", False, "", "let _r = { vec![1u8] }.iter().for_each(%s);" % cl, None),
-            ("container_trait", False, "use ai_memory::pool::Fan;\n", "vec![1u8].for_each(%s);" % cl, None),
         ]
 
     def run_probe(self, form, ok, head, body, template):
@@ -2816,7 +2815,8 @@ class Issue8120(Positive):
 
     def test_control_a_name_used_as_a_value_or_type_is_a_real_use(self):
         for head, body in (
-            ("use ai_memory::Thing;\n", "let _t = Thing::new();\n    vec![1u8].iter().for_each(%s);"),
+            # a value use (not a path root: `Thing::f` may be a trait fn, r13 #8157) makes the import a type
+            ("use ai_memory::Thing;\n", "let _t = Thing;\n    vec![1u8].iter().for_each(%s);"),
             ("use ai_memory::pool::Pool;\nfn _p(_p: Pool) {}\n", "vec![1u8].iter().for_each(%s);"),
             ("use ai_memory::pool::Pool;\n", "let _p: Option<Pool> = None;\n    vec![1u8].iter().for_each(%s);"),
         ):
@@ -2993,8 +2993,12 @@ R18_PROBES = {
         ("use ai_memory::pool::PoolExt;\n", "let _n = PoolExt::name(&0u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
         ("use ai_memory::pool::PoolExt;\n", "let _n = PoolExt::name::<u8>(&0u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
         ("use ai_memory::pool::PoolExt;\n", "let _n = <u8 as PoolExt>::name(&0u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
-        ("use ai_memory::pool::Pool;\n", "let _p = Pool::new();\n    vec![1u8].iter().for_each(%s);" % R18_CL, False),
-        ("use ai_memory::pool::Pool;\n", "let _p = Pool::from_parts(&1u8, 2u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, False),
+        # r13 (#8157): `Pool::new()` is spelled exactly as a UFCS trait call, and the scratch tree has no src/ that
+        # declares Pool a struct, so Pool stays a possible trait: flagged (fail closed). The real tree resolves its
+        # own-crate imports through src/ (CommonModel.src_traits / src_types).
+        ("use ai_memory::pool::Pool;\n", "let _p = Pool::new();\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
+        ("use ai_memory::pool::Pool;\n", "let _p = Pool::from_parts(&1u8, 2u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
+        ("use ai_memory::pool::PoolExt;\n", "let _p = PoolExt { n: 0 };\n    vec![1u8].iter().for_each(%s);" % R18_CL, False),
     ],
     8139: [
         ("", "let f = async || { %s };\n    futures::executor::block_on(f());" % Positive.OPEN, False),
@@ -3033,8 +3037,8 @@ class ReviewR18(Positive):
 R18_MUTANTS = (  # (issue, FileModel method, original text, mutated text): the mutant must turn a probe of its issue RED
     (8136, "await_macro_arg", "self.callee_origin(path_segments(m.group(1)), m.group(2), CALLEE_MACRO) == STD",
      'm.group(2) in ("join", "try_join", "select")'),
-    (8137, "span_safe", "if lit and self.trait_risk and direct and", "if False and"),
-    (8138, "_index_imports", "not self.type_use(n, text)", "not re.search(r\"(?<![\\w$'])%s\\b\" % re.escape(n), text)"),
+    (8137, "callee_origin", "full = self.method_path(name)", "full = (STD_METHOD_ROOT, name)"),
+    (8138, "provider", "self.type_use(name, text)", "re.search(r\"(?<![\\w$'])%s\\b\" % re.escape(name), text)"),
     (8139, "same_thread", "if ASYNC_CLOSURE.match(body, s):", "if False:"),
 )
 
@@ -3102,6 +3106,10 @@ R19_PROBES = {
         (R19_GLOB, "let s = vec![1u8].into_iter();\n    s.inspect(%s);" % R18_CL, True),
         ("", "Some(1u8).map(%s);" % R18_CL, False),
         ("", "let o = Some(1u8);\n    o.map(%s);" % R18_CL, False),
+        # a vetted trait (KNOWN_TRAIT_METHODS) supplies exactly its listed methods: tower's ServiceExt has and_then
+        ("use tower::ServiceExt as _;\n", "Some(1u8).and_then(%s);" % R18_CL, True),
+        ("use tower::ServiceExt as _;\n", "Some(1u8).map(%s);" % R18_CL, False),
+        ("extern crate tower as tw;\nuse tw::ServiceExt as _;\n", "Some(1u8).and_then(%s);" % R18_CL, True),
     ],
     8156: [
         ("extern crate ai_memory as futures;\n", R18_BLOCK_ON % Positive.OPEN, True),
@@ -3125,6 +3133,14 @@ R19_PROBES = {
         (R19_UFCS, "let _n = PoolExt::name(&mk());" + R19_ITER, True),
         (R19_UFCS, "let _n = <u8 as PoolExt>::name(&0u8);" + R19_ITER, True),
         (R19_UFCS, "let _p = PoolExt { n: 0 };" + R19_ITER, False),
+        # a path-root-only import is a type only when its resolved path is a vetted type (KNOWN_FOREIGN_TYPES) or a
+        # struct of the test crate itself; a trait of the test crate supplies the fns it declares
+        ("use chrono::Utc;\n", "let _t = Utc::now();" + R19_ITER, False),
+        ("use chrono::Local;\n", "let _t = Local::now();" + R19_ITER, True),
+        ("mod m { pub struct Posture; impl Posture { pub fn mk() -> Self { Posture } } }\nuse self::m::Posture;\n",
+         "let _p = Posture::mk();" + R19_ITER, False),
+        ("mod m { pub trait Fan { fn for_each(self, f: u8); } }\nuse self::m::Fan;\n", "let _f = Fan::for_each;" + R19_ITER,
+         True),
     ],
     8158: [
         ("", "ai_memory::pool::run_elsewhere(%s);" % R19_FUT_MAP, True),
@@ -3260,10 +3276,57 @@ class CalleeTrustInvariant(unittest.TestCase):
         self.assertTrue(sites)
 
 
+R19_MUTANTS = (  # (name, issue, FileModel method, original text, mutated text): each must turn a probe of its issue RED
+    ("n_macro_shadow_off", 8154, "callee_origin",
+     "if kind == CALLEE_MACRO and not segs and name in self.macro_names:", "if False:"),
+    ("n_module_macros_off", 8154, "_index_imports",
+     "self.macro_names = self.macro_defs | self.module_macros", "self.macro_names = self.macro_defs"),
+    ("n_method_callee_by_name", 8155, "callee_origin", "return STD if full in TRUSTED_METHOD_PATHS else UNKNOWN",
+     "return STD if name in SAME_THREAD_CALLEES and not PARALLEL_ITER.search(name) else UNKNOWN"),
+    ("n_extern_crate_alias_off", 8156, "_index_imports",
+     "for crate, alias in EXTERN_CRATE.findall(with_uses):", "for crate, alias in ():"),
+    ("n_path_root_type_use", 8157, "type_use",
+     "return any(not PATH_ROOT_USE.match(text, m.end()) for m in uses)", "return any(True for m in uses)"),
+    ("n_fn_callee_by_name", 8158, "callee_origin", "return STD if full in TRUSTED_FN_PATHS else CRATE",
+     "return STD if full[-1] in SAME_THREAD_CALLEES else CRATE"),
+)
+
+
+class ReviewR19Mutants(unittest.TestCase):
+    """REVIEW-7349-r19: one named mutant per new decision (bare-name trust of a method or a free fn, the macro_rules!
+    shadow of the file and of a module file, the extern crate index, the path-root type use); each turns RED."""
+
+    def test_each_named_mutant_turns_a_probe_red(self):
+        src = GATE.read_text()
+        methods = {}
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.ClassDef) and node.name == "FileModel":
+                for fn in node.body:
+                    if isinstance(fn, ast.FunctionDef):
+                        methods[fn.name] = ast.get_source_segment(src, fn)
+        for name, issue, rule, old, new in R19_MUTANTS:
+            with self.subTest(mutant=name):
+                seg = methods[rule]
+                self.assertEqual(seg.count(old), 1, old)
+                mod = types.ModuleType("r19_mutant_" + name)
+                mod.__file__ = str(GATE)
+                sys.modules[mod.__name__] = mod
+                exec(compile(src.replace(seg, seg.replace(old, new)), str(GATE), "exec"), mod.__dict__)
+                red = []
+                for row in R19_PROBES[issue]:
+                    head, body, flagged = r19_write(row)
+                    if bool(mod.scan_tree(SCRATCH)) != flagged:
+                        red.append(body)
+                shutil.rmtree(SCRATCH, ignore_errors=True)
+                self.assertTrue(red, "the %s mutant stays GREEN" % name)
+
+
 # r11 (#8125): per classifying rule, the probes that must be flagged (RED when the rule is loosened). A probe is
 # (head, body); %s is the closure `|_| { db::open(..) }` or, for the runtime rule, the async block.
 RULE_CL = "|_| { %s }" % Positive.OPEN
-RULE_TRAIT = "use ai_memory::pool::PoolExt;\nfn _b<T: PoolExt>(_t: T) {}\n"  # trait_risk without a use of the trait
+# trait_risk from a vetted trait (KNOWN_TRAIT_METHODS) that supplies neither iter, map nor for_each (r13, #8155): the
+# for_each callee stays trusted, so only the rule under test can veto the closure argument
+RULE_TRAIT = "use tower::ServiceExt as _;\n"
 RULE_MAPPER = (  # same-file methods: member_ok resolves them, so only closure_form can veto the closure argument
     "struct S;\nimpl S {\n    fn it(&self) -> Vec<u8> { vec![1u8] }\n"
     "    fn map<F>(&self, _f: F) -> Vec<u8> { vec![1u8] }\n}\n"
@@ -3283,7 +3346,7 @@ RULE_PROBES = {
                  ("const K: Foo = vec![1u8];\n", "K.for_each(%s);")],
     "macro_ok": [("fn g<T>(_t: T) {}\n", "T::vec![1u8].iter().for_each(%s);"),
                  ("macro_rules! vec { () => {} }\n", "vec![1u8].iter().for_each(%s);")],
-    "member_ok": [("use ai_memory::pool::PoolExt;\nfn _b<T: PoolExt>(_t: T) {}\n", "let v = vec![1u8];\n    v.iter().for_each(%s);")],
+    "member_ok": [(RULE_TRAIT, "let v = vec![1u8];\n    v.iter().for_each(%s);")],
     "name_ok": [("fn drive(p: ai_memory::pool::Pool) { p.for_each(%s); }\n", "drive(ai_memory::pool::mk());"),
                 ("fn drive<T>(p: T) { p.for_each(%s); }\n", "drive(ai_memory::pool::mk());")],
     "path_ok": [("", "ai_memory::pool::K.for_each(%s);"), ("fn g<T>(_t: T) {}\n", "T::K.for_each(%s);")],

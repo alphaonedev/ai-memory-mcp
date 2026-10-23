@@ -110,9 +110,9 @@ argument of a callee that PROVABLY runs that parameter inline: a same-file, test
 parameter is a direct call, a `let q = p;` alias that is itself inline-only, or an argument of a callee
 that is inline-only in turn; a store, a return, a use inside another closure or a re-binding is not),
 never a callee that merely does not spawn it (#8065); or an unresolved runner named by its FULL path
-(INLINE_ROOTS: std, core, alloc, tokio, futures; WRAPPER_CALLEES such as AssertUnwindSafe recurse; that list
-only names INLINE RUNNERS for the inline-runner rule and NEVER proves a type or a receiver std, #8103), or an
-iterator/Option/Once adaptor of SAME_THREAD_CALLEES whose receiver chain roots in a local, a literal, a
+(TRUSTED_FN_PATHS, a crate-qualified allowlist; WRAPPER_CALLEES such as std::panic::AssertUnwindSafe recurse;
+that list only names INLINE RUNNERS for the inline-runner rule and NEVER proves a type or a receiver std, #8103), or
+a std iterator/Option/Once adaptor (TRUSTED_METHOD_PATHS) whose receiver chain roots in a local, a literal, a
 std type or a callee that builds no parallel iterator (#8068, #8069); a receiver is credited only when
 the gate can positively PROVE its provenance (#8093): every token of the chain, of each `let` initialiser it leads
 to and of each wrapper or aggregate (Some, Box::new, vec!, an array, a tuple, a struct literal) must be a literal, a
@@ -156,12 +156,22 @@ Callee origin (r12, #8136 #8137 #8138 #8139). The credit side has ONE predicate 
 STD | CRATE | UNKNOWN, used by the rules arg_inline and await_macro_arg. A macro or a free fn is trusted by its
 RESOLVED path (resolve_path: `use` items, renames, an unshadowed crate root), never by its last name segment: a join!
 or select! counts only as tokio:: / futures:: (AWAIT_MACROS holds resolved paths), a crate macro of the same name, a
-`macro_rules!` of the file and an unresolvable name are detached. A closure-taking method called directly on a root
-literal container (`vec![..].for_each(..)`, `let v = vec![..]; v.for_each(..)`) is detached while an imported non-std
-trait or glob could supply it (the container has no such inherent method). An UpperCamel name imported from a crate
-that is only ever called as a UFCS path root with one borrowed argument (`PoolExt::name(&x)`) is still a possible
-trait, so it keeps trait_risk. An async closure (`async || ..`, `|| async ..`) yields a future per CALL: it is credited
+`macro_rules!` of the file and an unresolvable name are detached. An async closure (`async || ..`, `|| async ..`) yields a future per CALL: it is credited
 only when every call is awaited in place or handed whole to a resolved runner (future_credited), as for an async fn.
+
+Callee trust invariant (r13, #8154 #8155 #8156 #8157 #8158): a callee that does not resolve to an allowlisted
+crate-qualified path is never trusted; there is no bare-name trust anywhere in this module. callee_origin resolves
+first and compares the WHOLE resolved path with an allowlist (AWAIT_MACROS, TRUSTED_FN_PATHS, TRUSTED_METHOD_PATHS,
+WRAPPER_CALLEES); a CalleeTrustInvariant unit test walks the module AST and fails on any membership test of a trust
+table whose left operand is not a path bound from resolve_path or method_path. A bare macro name that a
+`macro_rules!` of the file, of a declared module file or of tests/common defines resolves to nothing (textual macro
+scope beats a `use`, #8154). A method resolves to (std, name) only when no in-scope method provider may supply that
+name (#8155): every non-std import is a provider of the methods it may supply (FileModel.provider: a vetted trait of
+KNOWN_TRAIT_METHODS its listed methods, a vetted type of KNOWN_FOREIGN_TYPES, a module, a fn or a src/ type none, a
+src/ trait its declared fns, any other name everything unless the file uses it as a value or a plain type), and a
+glob supplies everything. `extern crate X as A;` binds A to X before any root is trusted (#8156). A `Name::f(..)`
+path root never proves that Name is a type, whatever the arguments, because a UFCS trait call is spelled the same
+(#8157). A free fn is trusted only by its whole resolved path, never by its last segment (#8158).
 
 Form inventory (#8098, #8099, #8100). span_safe is a CLOSED whitelist and the ONLY decision point for a receiver:
 each expression form the tokenizer can yield has exactly one rule, a form with no rule is DETACHED, and every
@@ -206,8 +216,6 @@ branches and one probe per form). Doubt is detached.
   `async_block`        an `async` block: DETACHED
   `turbofish_std`      every turbofish type is STD by type_origin (`_` allowed inside a std type)
   `turbofish_other`    a turbofish type of another crate or file (`collect::<Pool>()`): DETACHED
-  `container_trait`    a trusted closure-taking method called on a root literal container itself while an imported
-                       non-std trait or glob could supply it (`vec![1u8].for_each(..)`, r12 #8137): DETACHED
   `block_root`         a chain rooted in a block or a struct literal: DETACHED
 `&|| ..` and `&mut || ..` are closure literals (#8067). Anything else (inside Box::new, Some, a struct
 field, vec!, a tuple, a method receiver, an assignment, a return, a loop, another closure, an unresolved
@@ -380,7 +388,8 @@ CLOSURE_PREV = "(,={;[:&"  # #8067: `&` and `&mut` borrow a closure literal; a b
 BORROW_MUT = re.compile(r"&\s*mut$")
 INLINE_ROOTS = frozenset(("std", "core", "alloc", "tokio", "futures"))  # #8068: path roots of the known inline runners
 # (rayon is left out on purpose: its pool runs a closure on another thread, so a rayon-qualified path is detached)
-WRAPPER_CALLEES = frozenset(("AssertUnwindSafe",))  # #8065: a pass-through wrapper, judged by where its value goes
+# #8065, r13 (#8158): a pass-through wrapper, judged by where its value goes; RESOLVED paths, never a last segment
+WRAPPER_CALLEES = frozenset((("std", "panic", "AssertUnwindSafe"), ("core", "panic", "AssertUnwindSafe")))
 RECEIVER_CTORS = frozenset(("Some", "Ok", "Err"))  # #8069: prelude constructors that root an iterator chain
 # r10 (#8102-#8107): ONE predicate, FileModel.type_origin, decides whether a type, a path or a name is std. Its three
 # results; CRATE and UNKNOWN are both DETACHED. Spelling never proves std: only a binding does.
@@ -413,9 +422,53 @@ CALLEE_MACRO, CALLEE_FN, CALLEE_METHOD = "macro", "fn", "method"
 # r11 (#8123): library fns that return a future built around their argument; a future argument is credited when
 # the wrapper call is itself driven in place. Resolved path -> index of the future argument.
 FUTURE_WRAPPERS = {("tokio", "time", "timeout"): 1}
-# r12 (#8138): `Name::lower_snake(` / `Name::lower_snake::<T>(`: a path root that calls a function. For an UpperCamel
-# imported name this is a UFCS trait call (`PoolExt::name(&x)`) as much as an associated fn, so it proves no type use.
-UFCS_ROOT = re.compile(r"\s*::\s*[a-z_]\w*\s*(?:::\s*<[^<>]*>\s*)?\(\s*&\s*(?:mut\s+)?[^(),]*\)")
+# r13 (#8158): the free fns that run their closure argument on the calling thread, as RESOLVED paths. A free fn is
+# trusted only when its path resolves to one of these; a fn that merely ends in a trusted name is not.
+TRUSTED_FN_PATHS = frozenset((
+    ("std", "panic", "catch_unwind"), ("tokio", "time", "timeout"))) | WRAPPER_CALLEES
+# r13 (#8157): `Name::..` after an imported name: a path-root use, which proves no type use of an UpperCamel name
+PATH_ROOT_USE = re.compile(r"\s*::")
+# r13 (#8156): `extern crate NAME;` / `extern crate NAME as ALIAS;`; an alias is a crate root bound by the file.
+EXTERN_CRATE = re.compile(r"(?<![\w$])extern\s+crate\s+([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s*;")
+EXTERN_SELF = "self"  # `extern crate self as NAME;` binds NAME to the crate being compiled
+CRATE_ROOT = ("crate",)  # the path `extern crate self as NAME;` stands for
+# r13 (#8155): the trait-method sets of the non-std traits whose import the tests use, read from the locked crate
+# sources (tower 0.5.3 util/mod.rs, http-body-util 0.1.3 lib.rs, digest 0.10.7 digest.rs and mac.rs), keyed by every
+# path the trait is imported through. A trait in this table supplies exactly these methods; any other imported
+# non-std trait (or one this file cannot tell from a type) may supply ANY method.
+TOWER_SERVICE_EXT = frozenset((
+    "and_then", "boxed", "boxed_clone", "call_all", "filter", "filter_async", "map_err", "map_future", "map_request",
+    "map_response", "map_result", "oneshot", "ready", "ready_oneshot", "then"))
+HTTP_BODY_EXT = frozenset((
+    "boxed", "boxed_unsync", "collect", "frame", "into_data_stream", "map_err", "map_frame", "with_trailers"))
+DIGEST_TRAIT = frozenset((
+    "chain_update", "digest", "finalize", "finalize_into", "finalize_into_reset", "finalize_reset", "new",
+    "new_with_prefix", "output_size", "reset", "update"))
+MAC_TRAIT = frozenset((
+    "chain_update", "finalize", "finalize_reset", "generate_key", "new", "new_from_slice", "reset", "update", "verify",
+    "verify_reset", "verify_slice", "verify_slice_reset", "verify_truncated_left", "verify_truncated_right"))
+KNOWN_TRAIT_METHODS = {
+    ("tower", "ServiceExt"): TOWER_SERVICE_EXT, ("tower", "util", "ServiceExt"): TOWER_SERVICE_EXT,
+    ("http_body_util", "BodyExt"): HTTP_BODY_EXT,
+    ("sha2", "Digest"): DIGEST_TRAIT, ("digest", "Digest"): DIGEST_TRAIT,
+    ("hmac", "Mac"): MAC_TRAIT, ("digest", "Mac"): MAC_TRAIT,
+}
+# r13 (#8155, #8157): non-std import paths that name a struct or a type alias (never a trait) in the locked crate
+# sources (chrono 0.4.44, axum 0.8.9 / axum-core 0.5.6, http 1.4.0, tokio 1.53.1, wiremock 0.6.5, sha2 0.10.9,
+# hmac 0.12.1); such an import supplies no method even when the file only calls `Name::f(..)` through it.
+KNOWN_FOREIGN_TYPES = frozenset((
+    ("chrono", "Utc"), ("axum", "body", "Body"), ("axum_core", "body", "Body"), ("axum", "http", "Request"),
+    ("http", "Request"), ("axum", "http", "StatusCode"), ("http", "StatusCode"), ("tokio", "sync", "Mutex"),
+    ("tokio", "sync", "RwLock"), ("wiremock", "Mock"), ("wiremock", "MockServer"), ("wiremock", "ResponseTemplate"),
+    ("sha2", "Sha256"), ("hmac", "Hmac")))
+FILE_ROOTS = frozenset(("crate", "self", "super"))  # import roots inside the test crate itself (the file, its mods)
+ANY_METHOD = None  # a method provider whose method set is unknown: it may supply any method name
+CARGO_MANIFEST = "Cargo.toml"  # the manifest whose [package] name is the crate the tests import as a path root
+PACKAGE_NAME = re.compile(r'(?ms)^\[package\][^\[]*?^name\s*=\s*"([^"]+)"')
+SRC_TRAIT = re.compile(r"(?<![\w$])trait\s+([A-Za-z_]\w*)[^{;]*\{")  # a trait declaration of src/ and its body
+SRC_TYPE = re.compile(r"(?<![\w$])(?:struct|enum|union|type)\s+([A-Za-z_]\w*)")  # a src/ type that is not a trait
+FN_NAME = re.compile(r"(?<![\w$])fn\s+([A-Za-z_]\w*)")  # every fn a trait body declares (nested ones included)
+MACRO_RULES_NAME = re.compile(r"(?<![\w$])macro_rules\s*!\s*([A-Za-z_]\w*)")  # a macro_rules! definition
 # r12 (#8139): `async [move] |..|`: an async closure, whose call yields a future that runs the body when polled.
 ASYNC_CLOSURE = re.compile(r"async\s+(?:move\s+)?\|")
 FUTURE_RET = re.compile(r"Future")  # a declared return type that names a future (impl Future, BoxFuture, Pin<Box<dyn Future>>)
@@ -456,6 +509,12 @@ PARALLEL_METHODS = (
     "par_split_inclusive_mut", "par_split_mut", "par_split_terminator", "par_split_whitespace", "par_windows",
 )
 PARALLEL_ITER = re.compile(r"\brayon\b|\b(?:%s|par_sort\w*)\b" % "|".join(PARALLEL_METHODS))
+# r13 (#8155): a method call resolves to (STD_METHOD_ROOT, name) only when no non-std provider in scope (an imported
+# trait, an `as _` import, a glob) can supply a method of that name (FileModel.method_path); a method is trusted only
+# when that resolved path is in TRUSTED_METHOD_PATHS. Its bare name never suffices.
+STD_METHOD_ROOT = "std"
+TRUSTED_METHOD_PATHS = frozenset(
+    (STD_METHOD_ROOT, name) for name in SAME_THREAD_CALLEES if not PARALLEL_ITER.search(name))
 KEYWORDS = frozenset((
     "as", "async", "await", "break", "continue", "const", "crate", "dyn", "else", "false", "fn", "for", "if", "impl",
     "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "static", "struct", "super", "true",
@@ -496,7 +555,7 @@ SPAN_FORMS = (
     "method_resolved", "method_other", "label_binder", "call_std", "call_resolved", "call_adt", "call_other",
     "name_local", "name_closure_param", "name_opaque", "name_param", "name_std", "name_const", "name_fn_item",
     "name_adt", "name_other", "path_std", "path_const", "path_variant", "path_other", "closure_iife", "closure_arg",
-    "closure_other", "async_block", "turbofish_std", "turbofish_other", "block_root", "container_trait")
+    "closure_other", "async_block", "turbofish_std", "turbofish_other", "block_root")
 FORM_TRACE = None  # a list while a test records the (form, ok) of every decision, else None
 
 
@@ -1915,6 +1974,11 @@ class CommonModel:
         self._mods = {}
         self._strong, self._vars = {}, {}
         self.src_consts = self._src_consts(root)
+        self.macro_names = set()  # r13 (#8154): every macro_rules! name tests/common defines
+        self._mod_macros = {}  # r13 (#8154): module file -> the macro_rules! names it defines (None: unreadable)
+        # r13 (#8155, #8157): the crate the tests import (its [package] name), and per src/ trait name the methods it
+        # declares; src_types holds the struct / enum / union / type names, which never supply a method
+        self.crate_name, self.src_traits, self.src_types = self._src_items(root)
         base = pathlib.Path(root) / COMMON_REL if root is not None else None
         if base is None or not base.is_dir():
             return
@@ -1930,6 +1994,7 @@ class CommonModel:
             self.mod_names.update(parts)
             text = src.scrubbed
             self.items.update(m.group(1) or m.group(2) for m in ITEM_NAME.finditer(text))
+            self.macro_names.update(MACRO_RULES_NAME.findall(text))
             for part in reversed(parts[:-1] if parts[-1] == "mod" else parts):
                 text = "mod %s {\n%s\n}" % (part, text)
             texts.append(text)
@@ -1948,6 +2013,54 @@ class CommonModel:
             for name, value in CONST_STR.findall(path.read_text(encoding="utf-8", errors="replace")):
                 values.setdefault(name, set()).add(value)
         return {name: vals.pop() for name, vals in values.items() if len(vals) == 1}
+
+    @staticmethod
+    def _src_items(root):
+        """(crate name, {trait name: method names}, type names) of the crate under root (r13, #8155, #8157). The
+        crate name is the Cargo.toml [package] name with `-` read as `_` (None without a manifest); a trait name
+        declared twice keeps the union of the method names, which only widens what it may supply."""
+        if root is None:
+            return None, {}, set()
+        root = pathlib.Path(root)
+        crate_name = None
+        try:
+            m = PACKAGE_NAME.search((root / CARGO_MANIFEST).read_text(encoding="utf-8", errors="replace"))
+            crate_name = m.group(1).replace("-", "_") if m else None
+        except OSError:
+            crate_name = None
+        traits, types = {}, set()
+        base = root / SRC_REL
+        if not base.is_dir():
+            return crate_name, traits, types
+        for path in sorted(base.rglob("*.rs")):
+            text = scrub(path.read_text(encoding="utf-8", errors="replace"))
+            for m in SRC_TRAIT.finditer(text):
+                body = text[m.end():match_brace(text, m.end() - 1)]
+                traits.setdefault(m.group(1), set()).update(FN_NAME.findall(body))
+            types.update(SRC_TYPE.findall(text))
+        return crate_name, {name: frozenset(names) for name, names in traits.items()}, types
+
+    def module_macros(self, path, raw):
+        """The macro_rules! names that the `#[path = ".."] mod m;` / `mod m;` files a test file declares define, plus
+        those of tests/common (r13, #8154). A `#[macro_use]` module puts them in textual scope ahead of a `use`d
+        macro of the same name; the gate does not track which module carries the attribute, so every one counts."""
+        out, here = set(self.macro_names), pathlib.Path(path).parent
+        for m in MOD_DECL.finditer(raw):
+            if m.group(2) == "common":
+                continue
+            name = m.group(2)
+            cands = [here / m.group(1)] if m.group(1) else [here / (name + ".rs"), here / name / "mod.rs"]
+            for cand in cands:
+                if cand not in self._mod_macros:
+                    try:
+                        text = scrub(cand.read_text(encoding="utf-8", errors="replace"))
+                        self._mod_macros[cand] = set(MACRO_RULES_NAME.findall(text))
+                    except OSError:
+                        self._mod_macros[cand] = None
+                if self._mod_macros[cand] is not None:
+                    out |= self._mod_macros[cand]
+                    break
+        return out
 
     def path_modules(self, path, raw):
         """{module name: detaching_fns} for the `#[path = ".."] mod m;` and `mod m;` files a test file declares
@@ -2027,8 +2140,10 @@ def origin_rule(method):
 class FileModel:
     """Write sites, their protection sets, lock acquisitions and readers of one tests/*.rs."""
 
-    def __init__(self, scrubbed, raw=None, common=None, modules=None):
+    def __init__(self, scrubbed, raw=None, common=None, modules=None, macros=None):
         self.common = common if common is not None else CommonModel()
+        # r13 (#8154): macro_rules! names of the declared module files and tests/common (CommonModel.module_macros)
+        self.module_macros = set(macros or ()) | self.common.macro_names
         self.imports, self.glob = common_imports(scrubbed)
         self.modules = modules or {}  # #8052: module name -> detaching_fns of its file
         self.mod_imported = {}  # name -> module it is `use`-imported from
@@ -2531,23 +2646,37 @@ class FileModel:
 
     def callee_origin(self, segs, name, kind):
         """STD, CRATE or UNKNOWN for a callee that the gate would trust to run its argument on this thread (r12, #8136,
-        #8137): the ONE predicate of the credit side, as type_origin is of the classification side. A macro or a free
-        fn is judged by its RESOLVED path (resolve_path: a `use` item, a rename or an unshadowed crate root): STD when
-        it resolves into AWAIT_MACROS (macro) or under an INLINE_ROOTS crate with a SAME_THREAD_CALLEES name (fn), CRATE
-        when it resolves anywhere else, UNKNOWN when nothing resolves (a glob, a `macro_rules!` or item of the file, a
-        generic). A method is STD only when it is a SAME_THREAD_CALLEES method and no imported non-std trait or glob
-        can supply a method of that name (trait_risk, as method_origin); else UNKNOWN. Both CRATE and UNKNOWN are
-        DETACHED, so a shadow of a trusted name is never trusted."""
+        #8137; r13, #8154-#8158): the ONE predicate of the credit side, as type_origin is of the classification side.
+        Every callee is first RESOLVED to a crate-qualified path and trusted only when that whole path is on an
+        allowlist: a macro when it resolves into AWAIT_MACROS, a free fn when it resolves into TRUSTED_FN_PATHS, a
+        method when method_path resolves it into TRUSTED_METHOD_PATHS (no in-scope non-std trait, `as _` import or
+        glob may supply a method of that name). A bare macro name that a `macro_rules!` of the file, of a declared
+        module file or of tests/common defines resolves to nothing, because textual macro scope wins over a `use`
+        (#8154). CRATE when the path resolves anywhere else, UNKNOWN when nothing resolves (a glob, an item of the
+        file, a generic, a shadowing macro_rules!). Both CRATE and UNKNOWN are DETACHED: no name is trusted for how it
+        is spelled, so a shadow of a trusted name is never trusted."""
         if kind == CALLEE_METHOD:
-            if name in SAME_THREAD_CALLEES and not PARALLEL_ITER.search(name):
-                return STD
+            full = self.method_path(name)
+            return STD if full in TRUSTED_METHOD_PATHS else UNKNOWN
+        if kind == CALLEE_MACRO and not segs and name in self.macro_names:
             return UNKNOWN
         full = self.resolve_path(list(segs) + [name])
         if full is None:
             return UNKNOWN
         if kind == CALLEE_MACRO:
             return STD if full in AWAIT_MACROS else CRATE
-        return STD if full[0] in INLINE_ROOTS and full[-1] in SAME_THREAD_CALLEES else CRATE
+        return STD if full in TRUSTED_FN_PATHS else CRATE
+
+    def method_path(self, name):
+        """The resolved path of a method call `.name(..)` on a receiver whose type the gate cannot name (r13, #8155):
+        (STD_METHOD_ROOT, name) when no in-scope non-std method provider (FileModel.providers: an imported trait, an
+        `as _` import, a glob) may supply a method of that name, so only a std inherent or std trait method can be
+        called; else None. The resolver never looks at whether the name is trusted, only at who may supply it."""
+        for supplied in self.providers:
+            if supplied is ANY_METHOD or name in supplied:
+                return None
+        full = (STD_METHOD_ROOT, name)
+        return full
 
     @origin_rule
     def arg_inline(self, fn, a, b, future=False):
@@ -2590,22 +2719,25 @@ class FileModel:
         if method:
             return self.receiver_ok(fn, len(before) - 1, elements=False, direct=True)
         full = self.resolve_path(segs + [name])
-        if full and full[-1] in WRAPPER_CALLEES:
+        if full in WRAPPER_CALLEES:
             return self.arg_inline(fn, tail.start(), match_paren(body, slot[0]))
         return True
 
     def resolve_path(self, segs):
-        """The full path that the path segs stands for (r11, #8124): a first segment imported by a `use` item
-        (std or not, renames included) is replaced by the path it is imported from; a first segment that nothing in
-        the file shadows and that names an inline-runner crate (INLINE_ROOTS) is itself the full path; else None."""
+        """The full path that the path segs stands for (r11, #8124; r13, #8156): a first segment imported by a `use`
+        item (std or not, renames included) or bound by `extern crate X as A;` is replaced by the path it is imported
+        from, and an `extern crate` alias at the head of that import path by its crate; a first segment that nothing
+        in the file binds (no `use`, item, generic or extern crate alias) and that names an inline-runner crate
+        (INLINE_ROOTS) is itself the full path; else None."""
         if not segs:
             return None
         first, kind = segs[0], self.symbols.get(segs[0])
         if kind in (SYM_STD, SYM_FOREIGN) and first in self.import_paths:
-            return tuple(self.import_paths[first]) + tuple(segs[1:])
-        if kind is None and first in INLINE_ROOTS:
-            return tuple(segs)
-        return None
+            return self.resolve_extern(tuple(self.import_paths[first]) + tuple(segs[1:]))
+        if kind is not None:
+            return None
+        full = tuple(segs)
+        return full if full[0] in INLINE_ROOTS else None
 
     @origin_rule
     def type_runtime(self, text):
@@ -2822,11 +2954,22 @@ class FileModel:
                 else:
                     self.foreign_names.add(name)
                     if not common:
-                        imported.append(name)
+                        imported.append((path, name))
+        self.extern_paths = {}  # r13 (#8156): `extern crate X as A;` -> A: (X,); a crate root the file binds
+        for crate, alias in EXTERN_CRATE.findall(with_uses):
+            if alias and alias != "_":
+                self.extern_paths[alias] = CRATE_ROOT if crate == EXTERN_SELF else (crate,)
+        for alias, path in self.extern_paths.items():
+            self.import_paths[alias] = path
+            if path[0] in STD_ROOTS:
+                self.std_names[alias] = path
+            else:
+                self.foreign_names.add(alias)
         for name in self.foreign_names:
             self.std_names.pop(name, None)
         self.items = {m.group(1) or m.group(2) for m in ITEM_NAME.finditer(text)}
         self.macro_defs = {m.group(2) for m in ITEM_NAME.finditer(text) if m.group(2)}
+        self.macro_names = self.macro_defs | self.module_macros  # r13 (#8154): every macro_rules! in textual scope
         self.generics = set(declared_generics(text)[0])
         # r11 (#8120-#8122): the ONE file-scope symbol table. Every name the file binds, in the order of weakest to
         # strongest; a name the table holds is never taken for the std name it is spelled like.
@@ -2835,20 +2978,62 @@ class FileModel:
         self.symbols.update({n: SYM_FOREIGN for n in self.foreign_names})
         self.symbols.update({n: SYM_GENERIC for n in self.generics})
         traits = trait_positions(text)  # an imported name used as a bound / impl target keeps its methods in scope
-        self.trait_risk = bool(self.foreign_globs) or any(
-            n == "_" or n in traits or not self.type_use(n, text) for n in imported)
+        # r13 (#8155): every in-scope non-std method provider: a glob (ANY_METHOD) or an import that may be a trait,
+        # with the method names it may supply (method_path); trait_risk is "some provider exists"
+        self.providers = [ANY_METHOD] * len(self.foreign_globs)
+        for path, name in imported:
+            supplied = self.provider(self.resolve_extern(path), name, text, traits)
+            if supplied != frozenset():
+                self.providers.append(supplied)
+        self.trait_risk = bool(self.providers)
+
+    def resolve_extern(self, path):
+        """path with an `extern crate X as A;` alias at its head replaced by X (r13, #8156)."""
+        path = tuple(path)
+        if path and path[0] in self.extern_paths:
+            return tuple(self.extern_paths[path[0]]) + path[1:]
+        return path
+
+    def provider(self, path, name, text, traits):
+        """The method names the non-std import `path` (bound as name) may supply on a receiver of another crate
+        (r13, #8155, #8157): frozenset() when it supplies none, ANY_METHOD when it may supply any. A trait of
+        KNOWN_TRAIT_METHODS supplies its listed methods; a lowercase leaf is a module or a fn (rustc's
+        non_camel_case_types, denied by -D warnings) and supplies none; a trait of this crate's src/ supplies the
+        methods it declares, a src/ type that is no trait supplies none; any other name supplies none only when the
+        file uses it as a value, a plain type or a constructor, never names it as a bound or an impl target, and did
+        not import it `as _`. A `Name::f` path root proves no type use (a UFCS trait call is spelled the same)."""
+        if path in KNOWN_TRAIT_METHODS:
+            return KNOWN_TRAIT_METHODS[path]
+        leaf = path[-1]
+        if leaf[:1].islower() or path in KNOWN_FOREIGN_TYPES:
+            return frozenset()
+        common = self.common
+        if path[0] in FILE_ROOTS:  # an item of the test crate: a trait of the file supplies the fns it declares
+            own = [m for m in SRC_TRAIT.finditer(text) if m.group(1) == leaf]
+            if own:
+                return frozenset(n for m in own for n in FN_NAME.findall(text[m.end():match_brace(text, m.end() - 1)]))
+            if leaf in SRC_TYPE.findall(text):
+                return frozenset()
+        elif common.crate_name is not None and path[0] == common.crate_name:
+            if leaf in common.src_traits:
+                return common.src_traits[leaf]
+            if leaf in common.src_types:
+                return frozenset()
+        if name != "_" and name not in traits and self.type_use(name, text):
+            return frozenset()
+        return ANY_METHOD
 
     @staticmethod
     def type_use(name, text):
-        """True when the imported name is used in text as a value, a plain type or a constructor (r12, #8138). A use
-        that only calls a function through the name as a path root (`Name::lower_snake(..)`) proves nothing for an
-        UpperCamel name: it is a UFCS call of a trait as much as an associated fn of a type, and the trait stays in scope
-        as a method provider. A lowercase name (a module, a fn) is never a trait (rustc's non_camel_case_types, denied
+        """True when the imported name is used in text as a value, a plain type or a constructor (r12, #8138; r13,
+        #8157). A use as a path root (`Name::f(..)` with any arguments, `Name::f::<T>(..)`, `Name::f` as a fn value)
+        proves nothing for an UpperCamel name: it is a UFCS call of a trait as much as an associated item of a type, and
+        the trait stays in scope as a method provider. A lowercase name (a module, a fn) is never a trait (rustc's non_camel_case_types, denied
         by -D warnings), so any use of it is a use."""
         uses = [m for m in re.finditer(r"(?<![\w$'])%s\b" % re.escape(name), text)]
         if name[:1].islower():
             return bool(uses)
-        return any(not UFCS_ROOT.match(text, m.end()) for m in uses)
+        return any(not PATH_ROOT_USE.match(text, m.end()) for m in uses)
 
     def path_origin(self, segs, name=None):
         """STD, CRATE or UNKNOWN for the path segs + name, decided by its FIRST segment (r10, #8103): a name the
@@ -2980,11 +3165,6 @@ class FileModel:
         if not elements:  # #8107: the caller needs the container only; its elements matter once the chain extracts one
             if self.container_links(text):
                 lit = self.literal_span(text)
-                if lit and self.trait_risk and direct and not re.search(r"\.\s*[A-Za-z_]", text[lit[1] + 1:]):
-                    # r12 (#8137): the callee is a method on the CONTAINER itself (`vec![..].for_each(..)`, or a plain
-                    # local that holds one), which has no such inherent method, so an imported crate trait could be the
-                    # one that runs: detached.
-                    return form("container_trait", False)
                 if lit:
                     text = text[:lit[0] + 1] + " " * (lit[1] - lit[0] - 1) + text[lit[1]:]
             else:
@@ -3761,9 +3941,9 @@ def detaching_fns(scrubbed):
     return out
 
 
-def violating_fns(scrubbed, raw=None, common=None, modules=None):
+def violating_fns(scrubbed, raw=None, common=None, modules=None, macros=None):
     """Names (qualified) of violating test fns in one scrubbed file, or [] when the file is exempt."""
-    model = FileModel(scrubbed, raw, common, modules)
+    model = FileModel(scrubbed, raw, common, modules, macros)
     if not model.required or len(model.tests) < 2:
         return []
     out = []
@@ -3781,7 +3961,9 @@ def scan_file(path, common=None):
     scrubbed = scrub(raw, comments)
     if process_isolated(raw, comments):
         return []
-    return violating_fns(scrubbed, raw, common, common.path_modules(path, raw) if common is not None else None)
+    if common is None:
+        return violating_fns(scrubbed, raw)
+    return violating_fns(scrubbed, raw, common, common.path_modules(path, raw), common.module_macros(path, raw))
 
 
 def process_isolated(raw, comments):
