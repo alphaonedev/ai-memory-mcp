@@ -123,8 +123,11 @@ def git_environment() -> dict:
 
 def git_limits() -> None:
     """Bound child address space and each pack/output file; used only in this single-threaded CLI."""
-    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_GIT_FILE_BYTES, MAX_GIT_FILE_BYTES))
-    resource.setrlimit(resource.RLIMIT_AS, (MAX_GIT_MEMORY_BYTES, MAX_GIT_MEMORY_BYTES))
+    for which, limit in ((resource.RLIMIT_FSIZE, MAX_GIT_FILE_BYTES), (resource.RLIMIT_AS, MAX_GIT_MEMORY_BYTES)):
+        try:
+            resource.setrlimit(which, (limit, limit))
+        except (ValueError, OSError):
+            continue  # the kernel refuses this bound (macOS RLIMIT_AS); the others still apply
 
 
 def git(repo: Path, *args: str, network: bool = False) -> bytes:
