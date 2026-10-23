@@ -3069,6 +3069,197 @@ class ReviewR18Mutants(unittest.TestCase):
                 self.assertTrue(red, "the #%d mutant stays GREEN" % issue)
 
 
+# r13 (REVIEW-7349-r19, #8154-#8158): a callee that does not resolve to an allowlisted crate-qualified path is never
+# trusted; there is no bare-name trust. Each row is (head, body, flagged) or (head, body, flagged, files): files maps a
+# path under tests/ to the text of a module file the row declares (an included module, tests/common).
+R19_SHADOW = "macro_rules! %s { ($f:expr) => { ai_memory::pool::run_elsewhere($f) }; }\n"
+R19_PATH_MOD = '#[macro_use]\n#[path = "support/rt.rs"]\nmod rt;\n'
+R19_UFCS = "use ai_memory::pool::PoolExt;\n"
+R19_ITER = "\n    vec![1u8].iter().for_each(%s);" % R18_CL
+R19_GLOB = "use ai_memory::pool::*;\n"
+R19_FUT_MAP = "futures::future::FutureExt::map(async {}, |_| { %s })" % Positive.OPEN
+R19_PROBES = {
+    8154: [
+        (R18_BODY + "use tokio::join;\n" + R19_SHADOW % "join", R18_BLOCK_ON % "join!(body());", True),
+        (R18_BODY + "use futures::select;\n", (R19_SHADOW % "select") + "    " + R18_BLOCK_ON % "select!(body());", True),
+        (R19_PATH_MOD + R18_BODY + "use tokio::join;\n", R18_BLOCK_ON % "join!(body());", True,
+         {"support/rt.rs": R19_SHADOW % "join"}),
+        ("#[macro_use]\nmod common;\n" + R18_BODY + "use tokio::join;\n", R18_BLOCK_ON % "join!(body());", True,
+         {"common/mod.rs": R19_SHADOW % "join"}),
+        (R18_BODY + "use tokio::join;\n", R18_BLOCK_ON % "join!(body());", False),
+        (R18_BODY + R19_SHADOW % "join", R18_BLOCK_ON % "tokio::join!(body());", False),
+    ],
+    8155: [
+        (R18_FAN, "let o = Some(1u8);\n    o.for_each(%s);" % R18_CL, True),
+        (R18_FAN, "let _x = 1u8.map(%s);" % R18_CL, True),
+        (R18_FAN, "Some(1u8).map(%s);" % R18_CL, True),
+        (R18_FAN, "String::new().map(%s);" % R18_CL, True),
+        (R18_FAN, "vec![1u8].clone().for_each(%s);" % R18_CL, True),
+        (R19_GLOB, "Some(1u8).for_each(%s);" % R18_CL, True),
+        (R19_GLOB, "Vec::<u8>::new().for_each(%s);" % R18_CL, True),
+        (R19_GLOB, "vec![1u8].clone().for_each(%s);" % R18_CL, True),
+        (R19_GLOB, "let v: Vec<u8> = vec![1u8];\n    v.for_each(%s);" % R18_CL, True),
+        (R19_GLOB, "let s = vec![1u8].into_iter();\n    s.inspect(%s);" % R18_CL, True),
+        ("", "Some(1u8).map(%s);" % R18_CL, False),
+        ("", "let o = Some(1u8);\n    o.map(%s);" % R18_CL, False),
+    ],
+    8156: [
+        ("extern crate ai_memory as futures;\n", R18_BLOCK_ON % Positive.OPEN, True),
+        ("extern crate ai_memory as tokio;\n" + R18_BODY, R18_BLOCK_ON % "tokio::join!(body());", True),
+        ("extern crate ai_memory as tokio;\nuse tokio::join;\n" + R18_BODY, R18_BLOCK_ON % "join!(body());", True),
+        ("use ai_memory::pool as tokio;\n" + R18_BODY, R18_BLOCK_ON % "tokio::join!(body());", True),
+        ("mod rt { pub use ai_memory::pool::run_elsewhere as block_on; }\n", "rt::block_on(async { %s });" % Positive.OPEN,
+         True),
+        ("mod futures { pub mod executor { pub use ai_memory::pool::run_elsewhere as block_on; } }\n",
+         R18_BLOCK_ON % Positive.OPEN, True),
+        ("use ai_memory::shim::fx;\n", "fx::executor::block_on(async { %s });" % Positive.OPEN, True),
+        ("extern crate futures as fx;\n", "fx::executor::block_on(async { %s });" % Positive.OPEN, False),
+        ("extern crate futures;\n", R18_BLOCK_ON % Positive.OPEN, False),
+    ],
+    8157: [
+        (R19_UFCS, "let _n = PoolExt::name(0u8);" + R19_ITER, True),
+        (R19_UFCS, "let _n = PoolExt::name(&0u8, &1u8);" + R19_ITER, True),
+        (R19_UFCS, "let x = 0u8;\n    let _n = PoolExt::name(x);" + R19_ITER, True),
+        (R19_UFCS, "let _f = PoolExt::name;" + R19_ITER, True),
+        (R19_UFCS, "let _n = PoolExt::default_name();" + R19_ITER, True),
+        (R19_UFCS, "let _n = PoolExt::name(&mk());" + R19_ITER, True),
+        (R19_UFCS, "let _n = <u8 as PoolExt>::name(&0u8);" + R19_ITER, True),
+        (R19_UFCS, "let _p = PoolExt { n: 0 };" + R19_ITER, False),
+    ],
+    8158: [
+        ("", "ai_memory::pool::run_elsewhere(%s);" % R19_FUT_MAP, True),
+        ("", "ai_memory::pool::map(%s);" % R18_CL, True),
+        ("use ai_memory::pool::spawn_each as for_each;\n", "for_each(%s);" % R18_CL, True),
+        ("", "ai_memory::pool::run_elsewhere(futures::stream::StreamExt::for_each(ai_memory::pool::mk(), %s));"
+         % R18_CL, True),
+        ("", "let _ = ai_memory::pool::catch_unwind(|| { %s });" % Positive.OPEN, True),
+        ("", "let _ = futures::future::FutureExt::map(async {}, |_| { %s });" % Positive.OPEN, True),
+        ("", "let _ = std::panic::catch_unwind(|| { %s });" % Positive.OPEN, False),
+        ("use std::panic;\n", "let _ = panic::catch_unwind(|| { %s });" % Positive.OPEN, False),
+        ("", "let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { %s }));" % Positive.OPEN, False),
+    ],
+}
+
+
+def r19_write(row):
+    """Write the fixture tree of one R19_PROBES row under SCRATCH; returns (head, body, flagged)."""
+    head, body, flagged = row[:3]
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    (SCRATCH / "tests").mkdir(parents=True)
+    for rel, text in (row[3] if len(row) > 3 else {}).items():
+        (SCRATCH / "tests" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (SCRATCH / "tests" / rel).write_text(text)
+    (SCRATCH / "tests" / "a.rs").write_text(WRITER + head + Positive.LOCKED % body)
+    return head, body, flagged
+
+
+class ReviewR19(Positive):
+    """REVIEW-7349-r19: every row of R19_PROBES is decided as its flag says."""
+
+    def run_rows(self, issue):
+        for row in R19_PROBES[issue]:
+            with self.subTest(head=row[0], body=row[1]):
+                head, body, flagged = r19_write(row)
+                self.assertEqual(self.scan(), FLAGGED if flagged else set())
+
+    def test_8154_a_macro_rules_shadow_beats_an_imported_trusted_macro(self):
+        self.run_rows(8154)
+
+    def test_8155_a_method_is_never_trusted_by_its_bare_name(self):
+        self.run_rows(8155)
+
+    def test_8156_an_extern_crate_alias_is_resolved_before_a_root_is_trusted(self):
+        self.run_rows(8156)
+
+    def test_8157_every_ufcs_shape_keeps_the_trait_in_scope(self):
+        self.run_rows(8157)
+
+    def test_8158_a_free_fn_is_never_trusted_by_its_last_segment(self):
+        self.run_rows(8158)
+
+
+class CalleeTrustInvariant(unittest.TestCase):
+    """REVIEW-7349-r19: a callee that does not resolve to an allowlisted crate-qualified path is never trusted; there
+    is no bare-name trust anywhere in callee_origin. Proven by behaviour (every trusted name under an untrusted path)
+    and by structure (every membership test against a trust table sits behind a resolved path)."""
+
+    TRUST_TABLES = ("SAME_THREAD_CALLEES", "INLINE_ROOTS", "AWAIT_MACROS", "WRAPPER_CALLEES", "TRUSTED_FN_PATHS",
+                    "TRUSTED_METHOD_PATHS")
+    GONE = ("UFCS_ROOT",)  # the borrowed-one-argument UFCS special case (#8157)
+    RESOLVERS = ("resolve_path", "method_path")  # the only functions that build a resolved path
+
+    def test_no_name_resolves_to_trust_under_an_untrusted_path(self):
+        model = gate.FileModel("use ai_memory::pool::Fan;\nuse tokio::join;\n" + R19_SHADOW % "join")
+        for name in sorted(gate.SAME_THREAD_CALLEES):
+            for segs in ([], ["ai_memory", "pool"], ["futures", "future", "FutureExt"], ["tokio", "stream"]):
+                with self.subTest(name=name, segs=segs):
+                    self.assertNotEqual(model.callee_origin(segs, name, gate.CALLEE_FN), gate.STD)
+            with self.subTest(method=name):
+                self.assertNotEqual(model.callee_origin([], name, gate.CALLEE_METHOD), gate.STD)
+        self.assertNotEqual(model.callee_origin([], "join", gate.CALLEE_MACRO), gate.STD)
+
+    def test_every_allowlisted_path_is_trusted_in_a_clean_file(self):
+        model = gate.FileModel("")
+        paths = getattr(gate, "TRUSTED_FN_PATHS", frozenset())
+        self.assertTrue(paths, "the free-fn allowlist is a table of resolved paths")
+        for path in sorted(paths):
+            with self.subTest(path=path):
+                self.assertEqual(model.callee_origin(list(path[:-1]), path[-1], gate.CALLEE_FN), gate.STD)
+        for path in sorted(gate.AWAIT_MACROS):
+            with self.subTest(path=path):
+                self.assertEqual(model.callee_origin(list(path[:-1]), path[-1], gate.CALLEE_MACRO), gate.STD)
+
+    def test_every_trust_membership_test_sits_behind_a_resolved_path(self):
+        src = GATE.read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                self.assertNotIn(node.id, self.GONE, "line %d" % node.lineno)
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        def enclosing(node):
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.FunctionDef):
+                    return node
+            return None
+
+        def resolved_from(fn):
+            """The names fn binds from a call of a resolver (self.resolve_path / self.method_path)."""
+            out = set()
+            for sub in ast.walk(fn):
+                if isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call):
+                    func = sub.value.func
+                    if isinstance(func, ast.Attribute) and func.attr in self.RESOLVERS:
+                        out.update(t.id for t in sub.targets if isinstance(t, ast.Name))
+            return out
+
+        sites = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Name) or node.id not in self.TRUST_TABLES:
+                continue
+            fn = enclosing(node)
+            if fn is None:
+                continue  # a module-level table definition
+            cmp_ = parents.get(node)
+            line = "%s line %d" % (fn.name, node.lineno)
+            self.assertIsInstance(cmp_, ast.Compare, line)
+            self.assertTrue(all(isinstance(op, (ast.In, ast.NotIn)) for op in cmp_.ops), line)
+            left = cmp_.left
+            if fn.name in self.RESOLVERS and isinstance(left, ast.Subscript):
+                left = left.value  # a resolver checks the root of the path it builds
+            self.assertIsInstance(left, ast.Name, "%s: only a whole resolved path is tested" % line)
+            if fn.name in self.RESOLVERS:
+                self.assertEqual(left.id, "full", line)
+            else:
+                self.assertIn(left.id, resolved_from(fn), "%s: a bare name is tested against %s" % (line, node.id))
+            sites += 1
+        self.assertTrue(sites)
+
+
 # r11 (#8125): per classifying rule, the probes that must be flagged (RED when the rule is loosened). A probe is
 # (head, body); %s is the closure `|_| { db::open(..) }` or, for the runtime rule, the async block.
 RULE_CL = "|_| { %s }" % Positive.OPEN
