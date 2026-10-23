@@ -29,12 +29,11 @@ const ENV_KEYS: [&str; 3] = [
 struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
 impl EnvGuard {
     fn new() -> Self {
-        Self(
-            ENV_KEYS
-                .into_iter()
-                .map(|key| (key, std::env::var_os(key)))
-                .collect(),
-        )
+        let mut saved = Vec::new();
+        for key in ENV_KEYS {
+            saved.push((key, std::env::var_os(key)));
+        }
+        Self(saved)
     }
 }
 impl Drop for EnvGuard {

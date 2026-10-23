@@ -6,9 +6,12 @@ Run: python3 -m unittest scripts/ci/tests/test_check_test_env_mutation_7347.py
 Each rule is proven twice: a clean fixture passes and a mutant that breaks exactly that rule
 fails. Fixtures are built in a scratch dir under .local-runs/ (never a tmp dir).
 """
+import ast
 import importlib.util
+import re
 import shutil
 import sys
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -2792,14 +2795,322 @@ fn second() {
         self.assertEqual(self.flagged(self.POSTURE), set())
 
 
+class Issue8120(Positive):
+    """#8120: an imported non-std trait keeps trait_risk set while it is only NAMED in a bound, an `impl X for`, a
+    `dyn X` or an `impl X`; a name used as a value or in a plain type position is a real use and clears nothing."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_a_trait_named_only_in_a_trait_position_still_shadows_std_methods(self):
+        for head in (
+            "use ai_memory::pool::PoolExt;\nfn _b<T: PoolExt>(_t: T) {}\n",
+            "use ai_memory::pool::PoolExt;\nstruct S;\nimpl PoolExt for S {}\n",
+            "use ai_memory::pool::PoolExt;\nfn _d(_t: &dyn PoolExt) {}\n",
+            "use ai_memory::pool::PoolExt;\nfn _i(_t: impl PoolExt) {}\n",
+            "use ai_memory::pool::PoolExt;\nfn _w<T>(_t: T) where T: PoolExt {}\n",
+            "use ai_memory::pool::PoolExt;\nfn _c<T>(_t: T) -> u8 { <T as PoolExt>::ID }\n",
+        ):
+            with self.subTest(head=head):
+                self.check("vec![1u8].iter().for_each(%s);" % self.CL, head=head)
+
+    def test_control_a_name_used_as_a_value_or_type_is_a_real_use(self):
+        for head, body in (
+            ("use ai_memory::Thing;\n", "let _t = Thing::new();\n    vec![1u8].iter().for_each(%s);"),
+            ("use ai_memory::pool::Pool;\nfn _p(_p: Pool) {}\n", "vec![1u8].iter().for_each(%s);"),
+            ("use ai_memory::pool::Pool;\n", "let _p: Option<Pool> = None;\n    vec![1u8].iter().for_each(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.CL, set(), head=head)
+
+
+class Issue8121(Positive):
+    """#8121: a generic parameter shadows every std name of the same spelling, in a fn or an impl, in the bound
+    list or the where clause, and a `use std::..` of the name does not make it std again."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+    PAR = "rayon::iter::ParallelIterator"
+
+    def test_a_generic_named_like_a_std_type_is_not_std(self):
+        for head, body in (
+            ("fn drive<Vec: %s>(it: Vec) { it.for_each(%%s); }\n" % self.PAR, "drive(vec![1u8].into_par_iter());"),
+            ("fn drive<Vec>(it: Vec) where Vec: %s { it.for_each(%%s); }\n" % self.PAR,
+             "drive(vec![1u8].into_par_iter());"),
+            ("struct W<O>(O);\nimpl<Option: %s<Item = u8>> W<Option> { fn go(it: Option) { it.for_each(%%s); } }\n"
+             % self.PAR, "W::go(vec![1u8].into_par_iter());"),
+            ("use std::collections::HashMap;\nfn drive<HashMap: %s>(it: HashMap) { it.for_each(%%s); }\n" % self.PAR,
+             "drive(vec![1u8].into_par_iter());"),
+            ("fn drive<String: %s>(it: String) { it.for_each(%%s); }\n" % self.PAR, "drive(vec![1u8].into_par_iter());"),
+            ("fn drive<I: %s>(it: I) { it.for_each(%%s); }\n" % self.PAR, "drive(vec![1u8].into_par_iter());"),
+        ):
+            with self.subTest(head=head):
+                self.check(body, head=head.replace("%s", self.CL))
+
+    def test_control_a_generic_that_is_not_used_as_the_type_stays_std(self):
+        for head, body in (
+            ("fn f<T>(v: Vec<u8>) { v.iter().for_each(%s); }\n", "f::<u8>(vec![1u8]);"),
+            ("struct W<O>(O);\nimpl<O> W<O> { fn go(v: Vec<u8>) { v.iter().for_each(%s); } }\n", "W::<u8>::go(vec![1u8]);"),
+        ):
+            with self.subTest(head=head):
+                self.check(body, set(), head=head.replace("%s", self.CL))
+
+
+class Issue8122(Positive):
+    """#8122: a same-file const is neutral only as an array length (`[u8; N]`); the name of a type that a const of the
+    same spelling shadows is still the imported type."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_a_const_named_like_an_imported_type_does_not_make_the_type_neutral(self):
+        head = "use ai_memory::pool::Pool;\nconst Pool: u8 = 0;\n"
+        for head, body in (
+            (head, "let p: Pool = ai_memory::pool::mk();\n    p.for_each(%s);"),
+            (head + "fn drive(p: Pool) { p.for_each(%s); }\n", "drive(ai_memory::pool::mk());"),
+        ):
+            with self.subTest(body=body):
+                self.check(body.replace("%s", self.CL), head=head.replace("%s", self.CL))
+
+    def test_control_a_const_array_length_stays_neutral(self):
+        for head, body in (
+            ("const N: usize = 2;\n", "let a: [u8; N] = [1; N];\n    a.iter().for_each(%s);"),
+            ("const N: usize = 2;\nfn f(a: [u8; N]) { a.iter().for_each(%s); }\n", "f([1; N]);"),
+        ):
+            with self.subTest(body=body):
+                self.check(body.replace("%s", self.CL), set(), head=head.replace("%s", self.CL))
+
+
+class Issue8123(Positive):
+    """#8123: the result of an async fn is a closure VALUE under the two-canonical-shape rule: credited only when it is
+    awaited in place or handed whole to a known runner, never when it is handed to anything else."""
+
+    BODY = 'async fn body() { let _c = db::open(":memory:"); }\n'
+    MK = "fn mk() -> impl FnOnce() { || {} }\n"
+
+    def test_an_async_fn_result_handed_to_a_foreign_call_is_detached(self):
+        for body in (
+            "ai_memory::pool::Pool::new().run_elsewhere(body());",
+            "ai_memory::pool::run_elsewhere(body());",
+            "let f = body();\n    ai_memory::pool::run_elsewhere(f);",
+            "ai_memory::pool::Pool::new().run_elsewhere(async { body().await });",
+        ):
+            with self.subTest(body=body):
+                self.check(body, head=self.BODY)
+
+    def test_a_fn_returning_a_future_is_a_future_too(self):
+        head = 'fn fut() -> impl std::future::Future<Output = ()> { async { let _c = db::open(":memory:"); } }\n'
+        self.check("ai_memory::pool::run_elsewhere(fut());", head=head)
+
+    def test_control_futures_driven_in_place_stay_clean(self):
+        for body in (
+            "futures::executor::block_on(body());",
+            "tokio::runtime::Runtime::new().unwrap().block_on(body());",
+            "futures::executor::block_on(async { body().await });",
+            "futures::executor::block_on(async { tokio::join!(body(), body()); });",
+        ):
+            with self.subTest(body=body):
+                self.check(body, set(), head=self.BODY)
+
+    def test_control_closure_values_consumed_in_place_stay_clean(self):
+        for call in ("mk()();", "let v = mk();\n    v();"):
+            body = call + "\n    " + self.OPEN
+            with self.subTest(body=body):
+                self.check(body, set(), head=self.MK)
+
+
+class Issue8124(Positive):
+    """#8124: block_on is a runner by its RESOLVED path (tokio Runtime / Handle, futures executor); a receiver that
+    provably is a tokio runtime, however it was built, credits both an async block and an async fn argument."""
+
+    BODY = 'async fn body() { let _c = db::open(":memory:"); }\n'
+    OPEN_BLOCK = "async { %s }" % Positive.OPEN
+    RT = "fn runtime() -> tokio::runtime::Runtime { tokio::runtime::Runtime::new().unwrap() }\n"
+
+    def test_runtime_receivers_credit_an_async_block(self):
+        for head, body in (
+            ("", "tokio::runtime::Runtime::new().unwrap().block_on(%s);"),
+            (self.RT, "runtime().block_on(%s);"),
+            ("", "let rt = tokio::runtime::Runtime::new().unwrap();\n    rt.block_on(%s);"),
+            ("use tokio::runtime::Runtime;\n", "Runtime::new().unwrap().block_on(%s);"),
+            ("use tokio::runtime::Runtime as Rt;\n", "Rt::new().unwrap().block_on(%s);"),
+            ("", "tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(%s);"),
+            ("", "tokio::runtime::Handle::current().block_on(%s);"),
+            ("", "futures::executor::block_on(%s);"),
+            ("use futures::executor::block_on;\n", "block_on(%s);"),
+            ("use futures::executor as ex;\n", "ex::block_on(%s);"),
+            ("fn drive(rt: &tokio::runtime::Runtime) { rt.block_on(%s); }\n", "drive(&tokio::runtime::Runtime::new().unwrap());"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body.replace("%s", self.OPEN_BLOCK), set(), head=head.replace("%s", self.OPEN_BLOCK))
+
+    def test_runtime_receivers_credit_an_async_fn(self):
+        for head, body in (
+            (self.RT, "runtime().block_on(body());"),
+            ("", "let rt = tokio::runtime::Runtime::new().unwrap();\n    rt.block_on(body());"),
+        ):
+            with self.subTest(body=body):
+                self.check(body, set(), head=self.BODY + head)
+
+    def test_an_unresolved_receiver_is_not_a_runner(self):
+        for head, body in (
+            ("", "let x = ai_memory::pool::Pool::new();\n    x.block_on(%s);"),
+            ("fn runtime() -> ai_memory::pool::Rt { ai_memory::pool::Rt::new() }\n", "runtime().block_on(%s);"),
+            ("struct Runtime;\nimpl Runtime { fn block_on<F>(&self, f: F) { ai_memory::pool::stash(f) } }\n",
+             "Runtime.block_on(%s);"),
+            ("", "ai_memory::pool::block_on(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.OPEN_BLOCK, head=head)
+
+
+# r11 (#8125): per classifying rule, the probes that must be flagged (RED when the rule is loosened). A probe is
+# (head, body); %s is the closure `|_| { db::open(..) }` or, for the runtime rule, the async block.
+RULE_CL = "|_| { %s }" % Positive.OPEN
+RULE_TRAIT = "use ai_memory::pool::PoolExt;\nfn _b<T: PoolExt>(_t: T) {}\n"  # trait_risk without a use of the trait
+RULE_MAPPER = (  # same-file methods: member_ok resolves them, so only closure_form can veto the closure argument
+    "struct S;\nimpl S {\n    fn it(&self) -> Vec<u8> { vec![1u8] }\n"
+    "    fn map<F>(&self, _f: F) -> Vec<u8> { vec![1u8] }\n}\n"
+)
+RULE_PROBES = {
+    "annotation": [("", "let p: Foo = ai_memory::pool::mk();\n    p.for_each(%s);"),
+                   ("", "let p: ai_memory::pool::Pool = ai_memory::pool::mk();\n    p.for_each(%s);")],
+    "call_ok": [("", "ai_memory::pool::mk().for_each(%s);"),
+                ("use ai_memory::pool::Pool;\n", "Pool::new().for_each(%s);"),
+                ("fn g<T>(_t: T) {}\n", "T::new().for_each(%s);")],
+    "closure_form": [(RULE_TRAIT + RULE_MAPPER, "S.it().map(|_| 1u8).for_each(%s);")],
+    "const_ok": [("const K: ai_memory::pool::Pool = ai_memory::pool::K;\n", "K.for_each(%s);"),
+                 ("const K: Foo = vec![1u8];\n", "K.for_each(%s);")],
+    "macro_ok": [("fn g<T>(_t: T) {}\n", "T::vec![1u8].iter().for_each(%s);"),
+                 ("macro_rules! vec { () => {} }\n", "vec![1u8].iter().for_each(%s);")],
+    "member_ok": [("use ai_memory::pool::PoolExt;\nfn _b<T: PoolExt>(_t: T) {}\n", "let v = vec![1u8];\n    v.iter().for_each(%s);")],
+    "name_ok": [("fn drive(p: ai_memory::pool::Pool) { p.for_each(%s); }\n", "drive(ai_memory::pool::mk());"),
+                ("fn drive<T>(p: T) { p.for_each(%s); }\n", "drive(ai_memory::pool::mk());")],
+    "path_ok": [("", "ai_memory::pool::K.for_each(%s);"), ("fn g<T>(_t: T) {}\n", "T::K.for_each(%s);")],
+    "returns_safe": [("fn mk() -> Opaque { ai_memory::pool::Pool::new() }\n", "let p = mk();\n    p.for_each(%s);"),
+                     ("fn mk() -> impl ai_memory::pool::Tr { ai_memory::pool::Pool::new() }\n",
+                      "let p = mk();\n    p.for_each(%s);")],
+    "span_safe": [("", "vec![1u8].iter().collect::<ai_memory::pool::Pool>().for_each(%s);"),
+                  ("fn g<T>(_t: T) {}\n", "vec![1u8].iter().collect::<T>().for_each(%s);")],
+    "type_runtime": [("fn runtime() -> Pair<tokio::runtime::Runtime> { mk_pair() }\n", "runtime().block_on(async { %s });")],
+}
+
+
+class RuleProbes(Positive):
+    """#8125: one test per classifying rule; each asserts that every probe of the rule is flagged. A loosened rule (the
+    gate with its origin predicate replaced) turns one of them RED: see RuleInventory."""
+
+    def probe(self, rule):
+        for head, body in RULE_PROBES[rule]:
+            with self.subTest(head=head, body=body):
+                body = body.replace("%s", RULE_CL if "block_on" not in body else Positive.OPEN)
+                self.check(body, head=head.replace("%s", RULE_CL))
+
+
+for _rule in RULE_PROBES:
+    setattr(RuleProbes, "test_rule_%s_is_flagged" % _rule, lambda self, rule=_rule: self.probe(rule))
+
+
+class RuleInventory(unittest.TestCase):
+    """#8125: the inventory of classifying rules is DERIVED, never hand-kept. Every FileModel method that calls an
+    origin predicate is registered with @origin_rule, every registered rule has probes, and loosening the rule turns
+    its probes RED (two mutants per rule: the rule always credits, and the rule credits UNKNOWN as well as STD)."""
+
+    PREDICATES = ("type_origin", "path_origin", "method_origin")
+    SITE = re.compile(r"self\.(?:type_origin|path_origin|method_origin)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)\s*(==|!=)\s*STD")
+
+    def setUp(self):
+        self.src = GATE.read_text()
+        self.methods = {}
+        for node in ast.walk(ast.parse(self.src)):
+            if isinstance(node, ast.ClassDef) and node.name == "FileModel":
+                for fn in node.body:
+                    if isinstance(fn, ast.FunctionDef):
+                        self.methods[fn.name] = ast.get_source_segment(self.src, fn)
+
+    def derived(self):
+        return {name for name, text in self.methods.items() if name not in self.PREDICATES
+                and re.search(r"self\.(?:%s)\(" % "|".join(self.PREDICATES), text)}
+
+    def test_every_method_that_calls_an_origin_predicate_is_a_registered_rule(self):
+        got = self.derived()
+        # the indexers and predicates' own helpers are not classifiers: they feed the predicate, they do not use it
+        self.assertEqual(got - set(gate.ORIGIN_RULES), set(), "a classifier that is not registered with @origin_rule")
+        self.assertEqual(set(gate.ORIGIN_RULES) - got, set(), "a registered rule that calls no origin predicate")
+
+    def test_every_registered_rule_has_probes(self):
+        self.assertEqual(set(gate.ORIGIN_RULES), set(RULE_PROBES))
+        for rule, probes in RULE_PROBES.items():
+            self.assertTrue(probes, rule)
+
+    def mutate(self, rule, kind):
+        seg = self.methods[rule]
+        sites = list(self.SITE.finditer(seg))
+        self.assertTrue(sites, "%s has no origin comparison to mutate" % rule)
+
+        def swap(m):
+            if kind == "always":
+                return "False" if m.group(1) == "!=" else "True"
+            return m.group(0)[:m.start(1) - m.start(0)] + ("== CRATE" if m.group(1) == "!=" else "!= CRATE")
+
+        def weak(m):
+            text = m.group(0)
+            head = text[:m.start(1) - m.start(0)]
+            return head + ("== CRATE" if m.group(1) == "!=" else "!= CRATE")
+
+        new = self.SITE.sub(swap if kind == "always" else weak, seg)
+        self.assertNotEqual(new, seg)
+        self.assertEqual(self.src.count(seg), 1)
+        mod = types.ModuleType("mutant_%s_%s" % (rule, kind))
+        mod.__file__ = str(GATE)
+        sys.modules[mod.__name__] = mod
+        exec(compile(self.src.replace(seg, new), str(GATE), "exec"), mod.__dict__)
+        return mod
+
+    NAMED_MUTANTS = (  # the two mutants REVIEW-7349-r17 #8125 reported GREEN: (rule, original text, mutated text)
+        ("closure_form", "self.method_origin(tail.group(2)) == STD", "tail.group(2) in INLINE_METHODS"),
+        ("returns_safe", "self.type_origin(fn.ret) == STD", "self.type_origin(fn.ret) != CRATE"),
+    )
+
+    def test_the_reported_mutants_turn_their_probes_red(self):
+        for rule, old, new in self.NAMED_MUTANTS:
+            with self.subTest(rule=rule):
+                seg = self.methods[rule]
+                self.assertEqual(seg.count(old), 1, old)
+                mod = types.ModuleType("named_mutant_" + rule)
+                mod.__file__ = str(GATE)
+                sys.modules[mod.__name__] = mod
+                exec(compile(self.src.replace(seg, seg.replace(old, new)), str(GATE), "exec"), mod.__dict__)
+                red = 0
+                for head, body in RULE_PROBES[rule]:
+                    text = WRITER + head.replace("%s", RULE_CL) + Positive.LOCKED % body.replace("%s", RULE_CL)
+                    shutil.rmtree(SCRATCH, ignore_errors=True)
+                    (SCRATCH / "tests").mkdir(parents=True)
+                    (SCRATCH / "tests" / "a.rs").write_text(text)
+                    red += mod.scan_tree(SCRATCH) != FLAGGED
+                shutil.rmtree(SCRATCH, ignore_errors=True)
+                self.assertTrue(red, "the reported %s mutant stays GREEN" % rule)
+
+    def test_loosening_a_rule_turns_its_probes_red(self):
+        for rule in sorted(RULE_PROBES):
+            for kind in ("always", "weak"):
+                with self.subTest(rule=rule, mutant=kind):
+                    mutant = self.mutate(rule, kind)
+                    red = []
+                    for head, body in RULE_PROBES[rule]:
+                        body = body.replace("%s", RULE_CL if "block_on" not in body else Positive.OPEN)
+                        text = WRITER + head.replace("%s", RULE_CL) + Positive.LOCKED % body
+                        shutil.rmtree(SCRATCH, ignore_errors=True)
+                        (SCRATCH / "tests").mkdir(parents=True)
+                        (SCRATCH / "tests" / "a.rs").write_text(text)
+                        if mutant.scan_tree(SCRATCH) != FLAGGED:
+                            red.append(body)
+                    shutil.rmtree(SCRATCH, ignore_errors=True)
+                    self.assertTrue(red, "no probe of %s goes RED under the %s mutant" % (rule, kind))
+
+
 class TypeOriginInventory(unittest.TestCase):
     """r10: every rule that classifies a type or a value calls the ONE predicate type_origin; the spelling-based
     helpers (a hard-coded std type set, an inline-runner name set standing in for std) cannot come back."""
 
-    RULES = ("macro_ok", "annotation", "const_ok", "name_ok", "span_safe", "member_ok", "returns_safe", "path_ok", "call_ok")
-
     def setUp(self):
-        import ast
         self.src = (REPO / "scripts" / "check-test-env-mutation.py").read_text()
         tree = ast.parse(self.src)
         self.methods = {}
@@ -2817,7 +3128,7 @@ class TypeOriginInventory(unittest.TestCase):
         self.assertTrue(self.methods["type_origin"].count('"""') >= 2, "type_origin carries a docstring")
 
     def test_every_classifying_rule_calls_the_predicate(self):
-        for name in self.RULES:
+        for name in sorted(gate.ORIGIN_RULES):
             with self.subTest(rule=name):
                 self.assertRegex(self.methods[name], r"\b(?:type_origin|path_origin|name_origin|method_origin)\(")
 

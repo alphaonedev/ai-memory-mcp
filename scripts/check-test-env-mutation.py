@@ -136,6 +136,22 @@ trusted only when the file imports no non-std trait (`use x::Trait;` never used 
 non-std glob other than `super::*` / `common::*` (#8105). A container is judged apart from its elements
 (container_links, #8107): the literal root of a receiver that is only iterated or measured is not an element.
 
+File-scope symbol table (r11, #8120 #8121 #8122). Names are resolved through ONE table built before any
+classification (FileModel.symbols: name -> SYM_STD | SYM_ITEM | SYM_FOREIGN | SYM_GENERIC), never by spelling a
+std name: a later kind wins (a std import < an item the file defines < a non-std import < a generic parameter of
+a fn or an impl, in the bound list or the where clause), and a name is STD only when the table says SYM_STD or the
+name is absent from the table and on the named std list. A trait imported by a non-std `use` keeps trait_risk set
+while it is only NAMED in a bound, `impl X for`, `dyn X`, `impl X` or a `<T as X>` cast (trait_positions): only a
+value or plain type use clears it. A const is neutral only as an array length (`[u8; N]`, array_len_spans), never
+as the name of a type. Futures are closure VALUES (r11, #8123 #8124): a call to a same-file async fn, to a fn that
+returns an `impl Future`, an `async` block and an `async move` block run on this thread only when awaited in place,
+let-bound and only awaited, or handed whole to a known runner resolved by its FULL path (RUNTIME_ROOTS and
+RUNTIME_RUNNERS: a tokio Runtime, Handle or Builder chain that reaches `build`, however it was reached through a
+same-file fn, parameter or local; futures::executor::block_on); everything else is detached, so `x.block_on(async
+{..})` on an unresolved receiver flags. Rule inventory (r11, #8125): every FileModel method that classifies by an
+origin predicate is registered with @origin_rule (ORIGIN_RULES); the unit tests derive the rule set from the
+module's own AST, require a RED probe for each, and run a mutant of each rule (always credits, credits UNKNOWN too).
+
 Form inventory (#8098, #8099, #8100). span_safe is a CLOSED whitelist and the ONLY decision point for a receiver:
 each expression form the tokenizer can yield has exactly one rule, a form with no rule is DETACHED, and every
 branch records its form through form() (SPAN_FORMS; the FormInventory test pins this table, the tuple, the
@@ -356,6 +372,34 @@ RECEIVER_CTORS = frozenset(("Some", "Ok", "Err"))  # #8069: prelude constructors
 # r10 (#8102-#8107): ONE predicate, FileModel.type_origin, decides whether a type, a path or a name is std. Its three
 # results; CRATE and UNKNOWN are both DETACHED. Spelling never proves std: only a binding does.
 STD, CRATE, UNKNOWN = "std", "crate", "unknown"
+# r11 (#8120-#8122): the kinds of the ONE file-scope symbol table (FileModel.symbols). A name the table holds is bound by
+# the file and shadows the std name; precedence is generic > foreign import > file item > std import.
+SYM_STD, SYM_ITEM, SYM_FOREIGN, SYM_GENERIC = "std-import", "item", "foreign-import", "generic"
+# r11 (#8123, #8124): the runners that run a future to completion on the calling thread, as RESOLVED paths. A future
+# (an async block, the result of an async fn or of a fn returning impl Future) is credited only when awaited in
+# place or when it is the whole argument of one of these. Keyed by the type path of the receiver + the method.
+RUNTIME_RUNNERS = frozenset((
+    ("tokio", "runtime", "Runtime", "block_on"), ("tokio", "runtime", "Handle", "block_on"),
+    ("futures", "executor", "block_on")))
+RUNNER_NAME = "block_on"  # the method / fn name RUNTIME_RUNNERS is looked up for
+# r11: the resolved paths a runtime value can be rooted at (`Runtime::new()`, `Handle::current()`, a Builder chain).
+RUNTIME_ROOTS = frozenset((
+    ("tokio", "runtime", "Runtime"), ("tokio", "runtime", "Handle"), ("tokio", "runtime", "Builder")))
+# r11: the links of a runtime chain that hand the runtime (or its handle) on unchanged.
+RUNTIME_LINKS = frozenset((
+    "new", "new_current_thread", "new_multi_thread", "build", "unwrap", "expect", "enable_all", "enable_io",
+    "enable_time", "worker_threads", "thread_name", "current", "try_current", "handle", "clone"))
+RUNTIME_CRATES = frozenset(("tokio", "futures"))  # crate roots a runner path may start at when nothing shadows them
+# r11: macros that poll their future arguments on the calling task; their arguments run in place.
+AWAIT_MACROS = frozenset(("join", "try_join", "select"))
+# r11 (#8123): library fns that return a future built around their argument; a future argument is credited when
+# the wrapper call is itself driven in place. Resolved path -> index of the future argument.
+FUTURE_WRAPPERS = {("tokio", "time", "timeout"): 1}
+FUTURE_RET = re.compile(r"Future")  # a declared return type that names a future (impl Future, BoxFuture, Pin<Box<dyn Future>>)
+GENERIC_OWNER = re.compile(r"\b(?:(?:fn|trait|struct|enum|union|type)\s+[A-Za-z_]\w*|impl)\s*<")  # an item that declares generics
+TRAIT_RUN = re.compile(r"\b(?:impl|dyn)\b([^{};,=)]*)")  # text after impl / dyn that can name a trait
+WHERE_RUN = re.compile(r"\bwhere\b([^{};]*)")  # a where clause: every name in it is in a bound position
+TRAIT_CAST = re.compile(r"\bas\s+([A-Za-z_][\w:]*)\s*>")  # `<T as Trait>`
 PRELUDE_TYPES = frozenset(("String", "Vec", "Option", "Result", "Box"))  # the std prelude's types (shadowable)
 PRELUDE_VALUES = RECEIVER_CTORS | frozenset(("None",))  # the std prelude's value names (shadowable)
 TYPE_NEUTRAL = frozenset(("mut", "const", "ref"))  # words of a type text that name nothing
@@ -914,6 +958,65 @@ def blank_generics(text):
     for a, b in generic_groups(text):
         out[a:b] = " " * (b - a)
     return "".join(out)
+
+
+def declared_generics(text):
+    """([generic parameter names], [text of every generics list]) of the items text declares (r11, #8121): the `<..>`
+    after `fn name`, `trait Name`, `struct Name`, `enum Name`, `union Name`, `type Name` and `impl`. A lifetime is not
+    a name; `const N: usize` declares N; a bound (`T: Bound`) is part of the list text."""
+    names, lists = [], []
+    for m in GENERIC_OWNER.finditer(text):
+        depth, end = 0, -1
+        for j in range(m.end() - 1, len(text)):
+            ch = text[j]
+            if ch == "<":
+                depth += 1
+            elif ch == ">" and text[j - 1:j] != "-":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+            elif ch in ";{}":
+                break
+        if end < 0:
+            continue
+        lists.append(text[m.end():end])
+        for a, b in split_top_level(text, m.end(), end):
+            piece = text[a:b].strip()
+            if piece.startswith("'"):
+                continue
+            pm = re.match(r"(?:const\s+)?([A-Za-z_]\w*)", piece)
+            if pm:
+                names.append(pm.group(1))
+    return names, lists
+
+
+def trait_positions(text):
+    """Every identifier of text that stands where a TRAIT can be named (r11, #8120): a generics list or where clause
+    (bounds), the text after `impl` / `dyn` (`impl X for S`, `impl X`, `dyn X`) and `<T as X>`. An imported name found
+    here keeps its methods in scope on every receiver, whether or not the file also calls it by name."""
+    out = set()
+    runs = list(declared_generics(text)[1]) + [m.group(1) for m in TRAIT_RUN.finditer(text)]
+    runs += [m.group(1) for m in WHERE_RUN.finditer(text)] + [m.group(1) for m in TRAIT_CAST.finditer(text)]
+    for run in runs:
+        out.update(IDENT.findall(run))
+    return out
+
+
+def array_len_spans(text):
+    """[(start, end)] of the length expression of every array type `[T; N]` of text (r11, #8122): the only place a
+    same-file const is neutral in a type text."""
+    out, stack = [], []
+    for j, ch in enumerate(text):
+        if ch == "[":
+            stack.append([j, -1])
+        elif ch == ";" and stack and stack[-1][1] < 0:
+            stack[-1][1] = j + 1
+        elif ch == "]" and stack:
+            _, semi = stack.pop()
+            if semi >= 0:
+                out.append((semi, j))
+    return out
 
 
 def return_exprs(body):
@@ -1785,6 +1888,7 @@ class CommonModel:
         self.sources = {}
         self.detachers = {}  # #8052: key -> (parameter indices handed to a spawn, has_self) for EVERY tests/common fn
         self.mod_names = set()  # #8060: module names of tests/common (files, directories, inline mods)
+        self.items = set()  # r11: every item name tests/common declares (a glob import of it binds them all)
         self._mods = {}
         self._strong, self._vars = {}, {}
         self.src_consts = self._src_consts(root)
@@ -1802,6 +1906,7 @@ class CommonModel:
             parts = list(path.relative_to(base).with_suffix("").parts)
             self.mod_names.update(parts)
             text = src.scrubbed
+            self.items.update(m.group(1) or m.group(2) for m in ITEM_NAME.finditer(text))
             for part in reversed(parts[:-1] if parts[-1] == "mod" else parts):
                 text = "mod %s {\n%s\n}" % (part, text)
             texts.append(text)
@@ -1883,6 +1988,17 @@ class CommonModel:
                     out |= self.written_vars(callee.key, stack + (id(fn),))
             self._vars[id(fn)] = out
         return self._vars[id(fn)] or {ANY_VAR}
+
+
+ORIGIN_RULES = {}  # r11 (#8125): rule name -> FileModel method; every method that classifies by an origin predicate
+
+
+def origin_rule(method):
+    """Register a FileModel method as a classifying rule in ORIGIN_RULES. The unit tests derive their rule inventory
+    from this mapping and from the AST (every method that calls an origin predicate must be registered), so a rule
+    cannot be added without a RED probe: a hand-kept list of rule names cannot go stale."""
+    ORIGIN_RULES[method.__name__] = method
+    return method
 
 
 class FileModel:
@@ -2290,6 +2406,7 @@ class FileModel:
             out += [(m.start(), m.end()) for m in VALUE_DETACH.finditer(body)]
         else:
             out = [lit for n, lit in enumerate(lits) if not self.same_thread(fn, lits, n)]
+        out += self.future_spans(fn)  # r11 (#8123): a future-valued call is a closure value too
         self._lits[id(fn)] = out
         return out
 
@@ -2307,15 +2424,18 @@ class FileModel:
         called; an async block only when awaited); (4) the whole argument of a callee that provably runs it inline
         (arg_inline). Anything else is detached."""
         body, (s, e) = fn.body, lits[n]
+        is_async = bool(re.match(r"async\b", body[s:]))
         if body[:s].rstrip().endswith("(") and CALL_OPENER.match(body, e):
+            return True
+        if is_async and AWAITED.match(body, e):  # r11: an async block awaited in place
             return True
         head = CLOSURE_LET_HEAD.fullmatch(stmt_prefix(body, s))
         if head and body[e:].lstrip().startswith(";"):
-            return self.only_called(body, lits, head.group(1), e, (s, e))
+            return self.only_called(body, lits, head.group(1), e, (s, e), is_async)
         for k, (ks, ke) in enumerate(lits):
             if k != n and ks < s and e <= ke and body[e:ke].strip() in ("", "}") and CLOSURE_TAIL_HEAD.match(body, ks):
                 return self.same_thread(fn, lits, k) and self.value_inline(fn, lits, k, body.startswith("async", s))
-        return self.arg_inline(fn, s, e)
+        return self.arg_inline(fn, s, e, is_async)
 
     @staticmethod
     def only_called(body, lits, name, start, anchor, awaited=False):
@@ -2365,7 +2485,7 @@ class FileModel:
             return first in INLINE_ROOTS or first in self.inline_imports
         return name in self.inline_imports
 
-    def arg_inline(self, fn, a, b):
+    def arg_inline(self, fn, a, b, future=False):
         """True when body[a:b] is a whole call argument that the callee PROVABLY runs on this thread (#8065, #8068,
         #8069). A resolved callee (same file, tests/common, module, alias or nested path) must have that parameter
         in its inline-only set (see param_inline); an unresolved one is trusted only as a known inline runner named
@@ -2389,6 +2509,10 @@ class FileModel:
         facts = [(self.inline.get(id(c), EMPTY), c.has_self) for c in cands]
         if not cands:
             facts = [(h.inline, h.has_self) for h in self.external_helpers(prefix, name, method)]
+        if future:  # r11 (#8123): a future is a closure VALUE, credited only by a known runner at the first slot
+            return not facts and self.future_arg_inline(fn, tail, slot, before, method)
+        if not facts and self.aliases.get(name, name) == RUNNER_NAME:  # a runner is judged by its resolved path
+            return self.future_arg_inline(fn, tail, slot, before, method)
         if facts:
             return all(
                 slot[1] - (0 if method or not has_self else 1) >= 0
@@ -2401,6 +2525,157 @@ class FileModel:
         if self.aliases.get(name, name) not in SAME_THREAD_CALLEES:
             return False
         return self.receiver_ok(fn, len(before) - 1, elements=False) if method else self.rooted(segs, name)
+
+    def resolve_path(self, segs):
+        """The full path that the path segs stands for (r11, #8124): a first segment imported by a `use` item
+        (std or not, renames included) is replaced by the path it is imported from; a first segment that nothing in
+        the file shadows and that names a runtime crate (RUNTIME_CRATES) is itself the full path; else None."""
+        if not segs:
+            return None
+        first, kind = segs[0], self.symbols.get(segs[0])
+        if kind in (SYM_STD, SYM_FOREIGN) and first in self.import_paths:
+            return tuple(self.import_paths[first]) + tuple(segs[1:])
+        if kind is None and first in RUNTIME_CRATES:
+            return tuple(segs)
+        return None
+
+    @origin_rule
+    def type_runtime(self, text):
+        """The resolved runtime root (RUNTIME_ROOTS) a type text names, else None (r11, #8124): exactly one path of
+        the text resolves to a runtime root and every other path is std (a Result of one, a borrow of one)."""
+        roots = []
+        for m in IDPATH.finditer(text or ""):
+            segs = re.split(r"\s*::\s*", m.group(0))
+            full = self.resolve_path(segs)
+            if full in RUNTIME_ROOTS:
+                roots.append(full)
+            elif self.path_origin(segs) != STD:
+                return None
+        return roots[0] if len(roots) == 1 else None
+
+    def runtime_value(self, fn, start, end, hops=0):
+        """The runtime root (RUNTIME_ROOTS) that the value expression body[start:end] of fn provably is, else None
+        (r11, #8124): a root call (`Runtime::new()`, `Handle::current()`, a `Builder` chain that reaches `build`)
+        followed only by RUNTIME_LINKS, a same-file fn whose declared return type names the runtime, a parameter or
+        const whose declared type does, or a local bound once to one of these (at most MAX_REBIND_HOPS names)."""
+        body, links = fn.body, set()
+        if hops > MAX_REBIND_HOPS:
+            return None
+        text = body[start:end].strip()
+        while True:
+            text = text.rstrip("? \t\r\n").lstrip("& \t\r\n")
+            if not text.endswith(")"):
+                break
+            op = open_group(text, len(text) - 1)
+            s = strip_turbofish(text[:op].rstrip()) if op > 0 else ""
+            cp = callee_path(s) if s else None
+            if cp is None:
+                return None
+            cstart, prefix, name = cp
+            pre = s[:cstart].rstrip()
+            if pre.endswith(".") and not prefix:
+                if name not in RUNTIME_LINKS:
+                    return None
+                links.add(name)
+                text = pre[:-1]
+                continue
+            if prefix:
+                full = self.resolve_path(path_segments(prefix) + [name])
+                root = full[:-1] if full else None
+                if root not in RUNTIME_ROOTS or (root[-1] == "Builder" and "build" not in links):
+                    return None
+                return ("tokio", "runtime", "Runtime") if root[-1] == "Builder" else root
+            hit = self.by_key.get(name)
+            return self.type_runtime(hit.ret) if hit is not None and not hit.is_async else None
+        m = re.fullmatch(r"(?:mut\s+)?([A-Za-z_]\w*)", text)
+        if m is None or links - {"clone", "handle", "unwrap", "expect"}:
+            return None
+        name = m.group(1)
+        bound = self.scopes(fn).visible(name, start)
+        if bound is not None:
+            if bound.init is None:
+                return None
+            typed = self.let_type(body, bound.init[0])
+            if typed is not None:
+                return self.type_runtime(typed)
+            return self.runtime_value(fn, bound.init[0], bound.init[1], hops + 1)
+        if name in fn.params:
+            return self.type_runtime(fn.param_types.get(name))
+        if self.consts.get(name) is not None:
+            return self.type_runtime(self.consts[name][2])
+        return None
+
+    @staticmethod
+    def let_type(body, init_start):
+        """The declared type text of the `let` whose initialiser starts at init_start, else None."""
+        heads = [h.start() for h in re.finditer(r"\blet\b", body[:init_start])]
+        m = re.match(r"let\b[^:=]*?:(?!:)(.*)=$", body[heads[-1]:init_start].rstrip(), re.S) if heads else None
+        return m.group(1) if m else None
+
+    def runtime_runner(self, fn, prefix, name, method, dot):
+        """True when the call `prefix + name` (a method whose receiver chain ends at body[dot] when method) is a
+        known runtime runner (RUNTIME_RUNNERS) by its RESOLVED path (r11, #8124): `futures::executor::block_on`
+        however imported, or `block_on` on a receiver that provably is a tokio `Runtime` or `Handle`."""
+        if method:
+            start = chain_start(fn.body, dot)
+            root = self.runtime_value(fn, start, dot) if start is not None else None
+            return root is not None and root + (RUNNER_NAME,) in RUNTIME_RUNNERS
+        return self.resolve_path(path_segments(prefix) + [name]) in RUNTIME_RUNNERS
+
+    def future_arg_inline(self, fn, tail, slot, before, method):
+        """True when the future that is the whole argument of the call at `tail` runs to completion on this thread,
+        in place (r11, #8123, #8124): the callee is a runner (runtime_runner) given the future as its first
+        argument, or a FUTURE_WRAPPERS call (`tokio::time::timeout`) at the right slot whose own result is consumed
+        in place. Anything else, an unresolved callee included, hands the future away: detached."""
+        body, prefix, name = fn.body, tail.group(1), tail.group(2)
+        if id(fn) in self.parallel or PARALLEL_ITER.search(body):
+            return False
+        if self.aliases.get(name, name) == RUNNER_NAME:
+            return slot[1] == 0 and self.runtime_runner(fn, prefix, name, method, len(before) - 1)
+        full = None if method else self.resolve_path(path_segments(prefix) + [name])
+        if full in FUTURE_WRAPPERS and slot[1] == FUTURE_WRAPPERS[full]:
+            call = (tail.start(), match_paren(body, slot[0]))
+            return self.value_consumed(fn, self.lits(fn), call, True) or self.arg_inline(fn, call[0], call[1], True)
+        return False
+
+    def future_spans(self, fn):
+        """[(start, end)] of every call in fn that yields a future and is not PROVEN to be driven in place (r11,
+        #8123): a call of a same-file async fn or of a fn declared to return a future, or of an async fn of
+        tests/common. Credited like an async block: awaited in place, bound by a `let` that is only awaited, the
+        whole argument of a runner or wrapper (arg_inline), or an argument of a join / select macro. A call of that
+        kind handed to anything else runs wherever the callee decides, so the span detaches it."""
+        body, out = fn.body, []
+        for m in CALL.finditer(body):
+            head = body[:m.start()].rstrip()
+            name, method = m.group(2), head.endswith(".") and not head.endswith("..")
+            if re.search(r"\bfn$", head) or name in KEYWORDS:
+                continue
+            if method:
+                cands = self.by_method.get(name, [])
+            else:
+                hit = self.resolve(fn.owner, m.group(1), name)
+                cands = [hit] if hit is not None else []
+            if cands:
+                fut = any(c.is_async or FUTURE_RET.search(c.ret or "") for c in cands)
+            else:
+                fut = (not method and not m.group(1).strip() and name in self.async_names
+                       and (name in self.imports or bool(self.glob)))  # a bare tests/common async fn
+            if not fut:
+                continue
+            start = chain_start(body, len(head) - 1) if method else m.start()
+            call = (m.start() if start is None else start, match_paren(body, m.end() - 1))
+            if not (self.value_consumed(fn, self.lits(fn), call, True)
+                    or self.arg_inline(fn, call[0], call[1], True) or self.await_macro_arg(fn, call)):
+                out.append(call)
+        return out
+
+    def await_macro_arg(self, fn, call):
+        """True when body[call[0]:call[1]] is a whole argument of an AWAIT_MACROS macro (`tokio::join!`), which polls
+        it on the calling task (r11, #8123); a macro the file defines itself is not trusted."""
+        slot = arg_slot(fn.body, call[0], call[1])
+        before = fn.body[:slot[0]].rstrip() if slot else ""
+        m = IDENT_END.search(before[:-1]) if before.endswith("!") else None
+        return bool(m and m.group(1) in AWAIT_MACROS and m.group(1) not in self.macro_defs)
 
     def scopes(self, fn):
         """ScopeMap of fn, cached."""
@@ -2456,16 +2731,22 @@ class FileModel:
         `use std::|core::|alloc::` items, foreign_names from every other import (a non-std import of a name wins
         over a std one), foreign_globs (non-std globs other than `super::*` / tests/common), items (every type,
         struct, enum, union, trait, const, static, fn, mod and macro_rules name the file defines) and trait_risk:
-        a non-std glob exists, or a non-std import whose name nothing in the file uses (an imported trait, whose
-        methods can shadow a std method) exists."""
+        a non-std glob exists, or a non-std import that nothing in the file uses as a value or a plain type (an
+        imported trait, whose methods can shadow a std method, even when it is named in a bound, `impl X for`, `dyn X`,
+        `impl X` or a cast) exists. r11 (#8120-#8122): also import_paths (name -> full import path), generics and
+        symbols, the one file-scope table that path_origin and type_origin consult before any std naming."""
         self.std_names, self.foreign_names, self.foreign_globs, imported = {}, set(), [], []
+        self.import_paths, common_glob = {}, False  # r11: name -> the full path it is imported from
         for um in USE_ITEM.finditer(with_uses):
             for path, name in use_leaves(um.group(0)):
                 common = "common" in path
+                if name is not None and name != "_":
+                    self.import_paths[name] = path
                 if path[0] in STD_ROOTS:
                     if name is not None:
                         self.std_names[name] = path
                 elif name is None:
+                    common_glob = common_glob or common
                     if path != ("super",) and not common:
                         self.foreign_globs.append(path)
                 else:
@@ -2476,8 +2757,16 @@ class FileModel:
             self.std_names.pop(name, None)
         self.items = {m.group(1) or m.group(2) for m in ITEM_NAME.finditer(text)}
         self.macro_defs = {m.group(2) for m in ITEM_NAME.finditer(text) if m.group(2)}
+        self.generics = set(declared_generics(text)[0])
+        # r11 (#8120-#8122): the ONE file-scope symbol table. Every name the file binds, in the order of weakest to
+        # strongest; a name the table holds is never taken for the std name it is spelled like.
+        self.symbols = {n: SYM_STD for n in self.std_names}
+        self.symbols.update({n: SYM_ITEM for n in self.items | (self.common.items if common_glob else set())})
+        self.symbols.update({n: SYM_FOREIGN for n in self.foreign_names})
+        self.symbols.update({n: SYM_GENERIC for n in self.generics})
+        traits = trait_positions(text)  # an imported name used as a bound / impl target keeps its methods in scope
         self.trait_risk = bool(self.foreign_globs) or any(
-            n == "_" or not re.search(r"(?<![\w$'])%s\b" % re.escape(n), text) for n in imported)
+            n == "_" or n in traits or not re.search(r"(?<![\w$'])%s\b" % re.escape(n), text) for n in imported)
 
     def path_origin(self, segs, name=None):
         """STD, CRATE or UNKNOWN for the path segs + name, decided by its FIRST segment (r10, #8103): a name the
@@ -2489,9 +2778,12 @@ class FileModel:
         if not full:
             return UNKNOWN
         first = full[0]
-        if first in self.items or first in self.foreign_names:
+        kind = self.symbols.get(first)
+        if kind == SYM_GENERIC:
+            return UNKNOWN  # r11 (#8121): a generic parameter is whatever the caller instantiates it with
+        if kind in (SYM_ITEM, SYM_FOREIGN):
             return CRATE
-        if first in STD_ROOTS or first in self.std_names or first in PRIMS:
+        if first in STD_ROOTS or kind == SYM_STD or first in PRIMS:
             return STD
         if first in PRELUDE_TYPES or first in PRELUDE_VALUES:
             return UNKNOWN if self.foreign_globs else STD
@@ -2511,6 +2803,7 @@ class FileModel:
         neutral. CRATE and UNKNOWN are both DETACHED; a text that names nothing is STD."""
         worst = STD
         adts = (self.adts | set(self.variants)) if adts_ok else ()
+        lens = array_len_spans(text)  # r11 (#8122): a const is neutral only as an array length
         for m in IDPATH.finditer(text):
             segs = re.split(r"\s*::\s*", m.group(0))
             first = segs[0]
@@ -2519,7 +2812,10 @@ class FileModel:
                     continue
                 if first in TYPE_OPAQUE:
                     return UNKNOWN
-                if first in self.consts or (first in adts and first not in self.foreign_names):
+                if first in self.consts and self.symbols.get(first) == SYM_ITEM and any(
+                        a <= m.start() < b for a, b in lens):
+                    continue
+                if first in adts and self.symbols.get(first) == SYM_ITEM:
                     continue
             got = self.path_origin(segs)
             if got == UNKNOWN:
@@ -2574,6 +2870,7 @@ class FileModel:
             return form("block_root", False)
         return self.span_safe(fn, start, dot, hops, elements)
 
+    @origin_rule
     def span_safe(self, fn, a, b, hops, elements=True):
         """True when EVERY expression form of fn.body[a:b] is whitelisted (#8093, #8098, #8099, #8100). Each token
         the tokenizer yields gets exactly one rule (a SPAN_FORMS label, recorded through form()); a form with no
@@ -2631,6 +2928,7 @@ class FileModel:
                 return False
         return True
 
+    @origin_rule
     def macro_ok(self, prefix, name):
         """`vec!` and the VALUE_MACROS (a std path prefix allowed) are whitelisted; every other macro is detached."""
         if name in self.macro_defs or name in self.foreign_names:
@@ -2641,6 +2939,7 @@ class FileModel:
             return form("macro_vec", True)
         return form("macro_value", True) if name in VALUE_MACROS else form("macro_other", False)
 
+    @origin_rule
     def member_ok(self, name, call):
         """A field of a safe value is safe. A method is safe when a same-file or tests/common method of that name
         exists and EVERY candidate builds no parallel iterator and returns only safe values, else only when it is on
@@ -2657,6 +2956,7 @@ class FileModel:
             return form("method_inline", True)
         return form("method_other", False)
 
+    @origin_rule
     def call_ok(self, fn, prefix, name):
         """A call `prefix::name(..)` is safe when it is a prelude ctor or a std path, a resolved same-file or
         tests/common fn that builds no parallel iterator and returns only safe values, or a ctor of a same-file struct
@@ -2675,6 +2975,7 @@ class FileModel:
             return form("call_adt", True)
         return form("call_other", False)
 
+    @origin_rule
     def path_ok(self, fn, prefix, name):
         """A prefixed path that is not a call: std, an enum variant of the same file, or a same-file const reached as
         `self::` / `crate::` / `super::` / `module::`, judged by its initialiser; anything else is detached (#8098)."""
@@ -2688,6 +2989,7 @@ class FileModel:
             return form("path_const", self.const_ok(name))
         return form("path_other", False)
 
+    @origin_rule
     def name_ok(self, fn, name, use, hops, elements=True):
         """A bare name is PROVEN safe or detached, whatever its casing (#8094, #8095, #8098): the innermost binding
         in a block still open at use wins (ScopeMap). A plain `let` is judged by its initialiser (receiver_ok, through
@@ -2750,6 +3052,7 @@ class FileModel:
             self._closure_memo[key] = ok
         return ok
 
+    @origin_rule
     def closure_form(self, fn, s, e, hops, elements=True):
         body = fn.body
         if re.match(r"async\s+(?:move\s+)?\{", body[s:]):
@@ -2766,6 +3069,7 @@ class FileModel:
                 return form("closure_arg", self.receiver_ok(fn, len(pre) - 1, hops=hops + 1, elements=elements))
         return form("closure_other", False)
 
+    @origin_rule
     def annotation(self, body, init_start):
         """What the type annotation of the `let` whose initialiser starts at init_start proves (#8100, #8102): None
         when there is none, or when it is std except for `_` / `impl` / `dyn` placeholders (an inferred type proves
@@ -2788,6 +3092,7 @@ class FileModel:
             cache[name] = Fn(name, (), None, "", self.text[a:b], a)
         return cache[name]
 
+    @origin_rule
     def const_ok(self, name):
         """True when the same-file const or static `name` (declared once) is classified by its DECLARED type
         (#8098, #8104): a std-only type is the proof (`const KEYS: [&str; 2] = [crate::A, "B"]`); a type of the same
@@ -2810,6 +3115,7 @@ class FileModel:
         finally:
             stack.discard(name)
 
+    @origin_rule
     def returns_safe(self, fn):
         """True when every return expression of fn (its tail and each `return ..`) is safe (#8098, fixpoint through
         the callees, MAX_RETURN_DEPTH deep; a cycle or the limit is detached)."""
