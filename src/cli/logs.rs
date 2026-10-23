@@ -361,13 +361,19 @@ fn read_fingerprint(file: &fs::File, offset: u64) -> Vec<u8> {
 
 /// True when the file now at `state.path` has other bytes before the cursor
 /// than the ones last seen there (a fresh open, not the held handle).
+///
+/// decision: a path that exists but cannot be opened counts as replaced over
+/// "unchanged", because without an inode this is the only signal a recreated
+/// file that is not readable yet gives; `follow_poll` then takes the #8062
+/// open-first retry (one note, old handle kept draining) instead of the
+/// truncate branch re-reading the old file on every poll (#8092).
 fn path_fingerprint_differs(state: &FollowState) -> bool {
     if state.fingerprint.is_empty() {
         return false;
     }
     match fs::File::open(&state.path) {
         Ok(file) => read_fingerprint(&file, state.offset) != state.fingerprint,
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -376,7 +382,18 @@ fn path_fingerprint_differs(state: &FollowState) -> bool {
 #[cfg(unix)]
 fn file_id(meta: &fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
+    #[cfg(test)]
+    if NO_INODE_FOR_TEST.get() {
+        return None;
+    }
     Some(meta.ino())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make [`file_id`] report no identity on a unix host, to drive
+    /// the path a host without inodes takes (#8092).
+    static NO_INODE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(not(unix))]
@@ -1125,6 +1142,44 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:#}").contains("sink closed"), "{err:#}");
         assert_eq!(calls, 2, "no line is read after the sink failed");
+    }
+
+    /// #8092 - with no inode to compare (non-unix hosts; modelled by the test
+    /// hook), a same-name recreate that cannot be opened yet is reported once,
+    /// the old lines are never reprinted, and the new file prints once readable.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_recreated_unopenable_prints_once_8092() {
+        use std::os::unix::fs::PermissionsExt as _;
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\nold-2\n");
+        let mut state = open_state(&a, 12);
+        assert_eq!(state.id, None, "hook models a host without inodes");
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        append(&dir.path().join("old.zst"), "late-old\n");
+        fs::write(&a, "n1\n").unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&a).is_ok() {
+            return; // privileged user: the permission bits do not bite.
+        }
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "late-old\n", "old tail drained once: {s1:?}");
+        assert_eq!(e1.matches("cannot open").count(), 1, "reported: {e1:?}");
+        for _ in 0..4 {
+            let (s, e) = poll_once(dir.path(), &mut state);
+            assert_eq!((s.as_str(), e.as_str()), ("", ""), "no reprint, no repeat");
+        }
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
+        let (s3, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "n1\n", "new file once readable: {s3:?}");
+        assert_eq!(
+            e3.matches("rotated or truncated").count(),
+            1,
+            "note: {e3:?}"
+        );
+        let (s4, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s4, "", "no duplicate: {s4:?}");
     }
 
     /// #8006 - a fragment that ends inside a multi-byte character is held,
