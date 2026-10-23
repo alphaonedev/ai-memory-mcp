@@ -4130,6 +4130,7 @@ class ReviewR25Mutants(unittest.TestCase):
 R27_LIB_TRAIT = "pub trait Fan { fn map(self, f: u8); }\n"
 R27_LIB_STRUCT = "pub struct Fan;\n"
 R27_CARGO_RENAMED = R20_CARGO + '[dependencies]\nfoo = { version = "1", package = "bar" }\n'
+R28_CARGO_PLAIN = R20_CARGO + '[dependencies]\nserde = "1"\nmy-dep = "1"\n'
 R27_UNWIND_FILES = {"tests/m/mod.rs": "pub mod panic;\n",
                     "tests/m/panic.rs": "pub fn catch_unwind<F: FnOnce() + Send + 'static>(f: F) { "
                                         "let _ = ::std::thread::spawn(f); }\n"}
@@ -4169,6 +4170,24 @@ R27_SHADOWED = (  # (name, row): each one rebinds a recognised name below the cr
     ("mod-in-a-module-file", r27_row("mod m;\n", "pub mod ai_memory {}\n")),
     ("alias-in-a-module-file", r27_row("mod m;\n", "mod k {}\nuse k as std;\n")),
     ("root-alias-to-the-crate-name", r27_row("mod m;\nuse m as ai_memory;\n")),
+    # round 28 (REVIEW-7349 code r27): a plain dependency key is a protected name; `extern crate .. as N;` rebinds a root
+    ("R27-1-N9d-plain-dependency-inner-mod", r27_row("mod w { pub mod serde { pub struct Fan; } }\nuse serde::Fan;\n",
+                                                    cargo=R28_CARGO_PLAIN)),
+    ("R27-1-N9e-plain-dependency-alias-in-fn", r27_row("mod m;\nfn g() { use crate::m as serde; }\nuse serde::Fan;\n",
+                                                      "pub struct Fan;\n", cargo=R28_CARGO_PLAIN)),
+    ("R27-1-N9c-hyphen-dependency-inner-mod", r27_row("mod w { pub mod my_dep {} }\n", cargo=R28_CARGO_PLAIN)),
+    ("R27-1-dev-dependency-table", r27_row("mod w { pub mod quux {} }\n",
+                                          cargo=R20_CARGO + '[dev-dependencies]\nquux = "1"\n')),
+    ("R27-1-dependency-subtable", r27_row("mod w { pub mod quux {} }\n",
+                                         cargo=R20_CARGO + '[dependencies.quux]\nversion = "1"\n')),
+    ("R27-2-N10c-extern-crate-self-in-mod",
+     r27_row("mod w { extern crate self as ai_memory; }\nmod k { pub struct Fan; }\nuse ai_memory::k::Fan;\n")),
+    ("R27-2-N10b-extern-crate-core-as-tokio", r27_row("mod w { extern crate core as tokio; }\n")),
+    ("R27-2-extern-crate-as-dependency-in-fn", r27_row("fn g() { extern crate core as serde; }\n", cargo=R28_CARGO_PLAIN)),
+    ("R27-2-root-extern-crate-as-protected-name", r27_row("extern crate core as tokio;\n")),
+    ("R27-2-root-extern-crate-self-as-std", r27_row("extern crate self as std;\n")),
+    ("R27-2-extern-crate-self-as-other-name-in-mod", r27_row("mod w { extern crate self as zed; }\n")),
+    ("R27-2-extern-crate-in-a-module-file", r27_row("mod m;\n", "extern crate self as ai_memory;\n")),
 )
 R27_CLEAN = (  # (name, row): no diagnostic, the verdict of the file is the gate's own
     ("false-positive-helpers-mod", r27_row("mod w { pub mod helpers {} }\nuse ai_memory::Fan;\n", lib=R27_LIB_STRUCT)),
@@ -4177,6 +4196,15 @@ R27_CLEAN = (  # (name, row): no diagnostic, the verdict of the file is the gate
     ("plain-import-of-the-extern-name", r27_row("use ai_memory::Fan;\nuse std::panic;\nuse tokio::time;\n", lib=R27_LIB_STRUCT)),
     ("root-mod-core-with-its-file", r27_row("mod core;\n", lib=R27_LIB_STRUCT, extra={"tests/core/mod.rs": "pub fn f() {}\n"})),
     ("cargo-rename-unrelated-alias", r27_row("mod m;\nuse m as other;\n", cargo=R27_CARGO_RENAMED)),
+    ("R27-FP3-inner-mod-not-a-dependency", r27_row("mod w { pub mod widgets {} }\nuse ai_memory::Fan;\n",
+                                                  lib=R27_LIB_STRUCT, cargo=R28_CARGO_PLAIN)),
+    ("root-extern-crate-self-as-the-crate", r27_row("extern crate self as ai_memory;\n", lib=R27_LIB_STRUCT)),
+    ("item-of-the-extern-crate-named-like-it", r27_row("use async_trait::async_trait;\nuse serde::serde;\n", lib=R27_LIB_STRUCT,
+                                                      cargo=R20_CARGO + '[dependencies]\nasync-trait = "0.1"\nserde = "1"\n')),
+    ("extern-crate-same-name", r27_row("extern crate std as std;\nmod w { extern crate core as core; }\n")),
+    ("extern-crate-to-an-unrelated-name", r27_row("mod w { extern crate core as unrelated; }\n")),
+    ("plain-dependency-root-mod-and-import", r27_row("mod serde;\n", lib=R27_LIB_STRUCT,
+                                                    cargo=R28_CARGO_PLAIN, extra={"tests/serde/mod.rs": "pub fn f() {}\n"})),
 )
 
 
@@ -4224,15 +4252,23 @@ class ReviewR27(Positive):
 
 
 R27_MUTANTS = (  # (name, original text, mutated text): each must turn a row of ReviewR27 RED
-    ("use_alias_branch_off", "            if name in names and tuple(path) != (name,):\n                out.append((item.start(), name))\n",
-     "            pass\n"),
-    ("use_same_path_not_exempt", "if name in names and tuple(path) != (name,):", "if name in names:"),
+    ("use_alias_branch_off", "            if name in names and tuple(path[:1]) != (name,):", "            if False:"),
+    ("use_same_path_not_exempt", "if name in names and tuple(path[:1]) != (name,):", "if name in names:"),
     ("mod_branch_off", "        if not head or head.group(1) not in names:\n            continue\n",
      "        continue\n"),
     ("mod_root_level_flagged", "        if nested or scrubbed.count(\"{\", 0, at) > scrubbed.count(\"}\", 0, at):\n", "        if True:\n"),
-    ("module_file_not_nested", "shadowed_names(scrubbed, names, index > 0)", "shadowed_names(scrubbed, names, False)"),
-    ("dependency_names_dropped", "names = set(SHADOW_NAMES) | set(self.dep_roots)",
+    ("module_file_not_nested", "shadowed_names(scrubbed, names, index > 0, self.crate_name)",
+     "shadowed_names(scrubbed, names, False, self.crate_name)"),
+    ("dependency_names_dropped", "names = set(SHADOW_NAMES) | set(self.dep_roots) | set(self.dep_names)",
      "names = set(SHADOW_NAMES)"),
+    ("plain_dependency_names_dropped", " | set(self.dep_names)", ""),
+    ("extern_crate_branch_off", "    for item in EXTERN_CRATE.finditer(scrubbed):\n", "    for item in ():\n"),
+    ("extern_self_below_root_dropped",
+     "        elif crate == EXTERN_SELF and below:\n            out.append((item.start(), alias))\n", ""),
+    ("extern_self_root_form_not_trusted", " and not (crate == EXTERN_SELF and alias == crate_name)", ""),
+    ("crate_name_not_passed", "shadowed_names(scrubbed, names, index > 0, self.crate_name)",
+     "shadowed_names(scrubbed, names, index > 0, None)"),
+    ("extern_same_name_not_exempt", "if alias is None or alias == crate:", "if alias is None:"),
     ("crate_name_dropped", "        if self.crate_name:\n            names.add(self.crate_name)\n", ""),
     ("renamed_package_dropped", "        names |= {real for real in self.dep_roots.values() if real != DEP_AMBIGUOUS}\n", ""),
     ("diagnostic_dropped", "        self._diagnose(shadowed)\n", ""),

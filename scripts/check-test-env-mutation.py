@@ -2189,16 +2189,27 @@ def alias_closure(texts, mods):
 SHADOW_NAMES = STD_ROOTS | INLINE_ROOTS  # r27: the roots a binding of a test file must never take
 
 
-def shadowed_names(scrubbed, names, nested):
+def shadowed_names(scrubbed, names, nested, crate_name=None):
     """[(offset, name)] of every item of a scrubbed text that rebinds a name of `names` (std, core, alloc and the extern
     crates the gate recognises) to something else (r27, R26-1, R26-2): a `use` leaf that binds the name to another path
     (`use m as ai_memory;`, `use m::{self as std};`, `use a::core;`) at any depth, and a `mod <name>` below the crate
     root (inside a block, or anywhere in a module file, which is itself below the root). The scope of such a binding
-    is a block the gate does not track, so the whole file is untrusted rather than guessed."""
+    is a block the gate does not track, so the whole file is untrusted rather than guessed. An `extern crate X as N;`
+    that binds a name of `names` (r28, R27-2), and an `extern crate self as N;` below the crate root, rebinds the
+    root the same way; the one trusted form is the root-level `extern crate self as <crate_name>;`."""
     out = []
+    for item in EXTERN_CRATE.finditer(scrubbed):
+        crate, alias = item.group(1), item.group(2)
+        if alias is None or alias == crate:
+            continue
+        below = nested or scrubbed.count("{", 0, item.start()) > scrubbed.count("}", 0, item.start())
+        if alias in names and not (crate == EXTERN_SELF and alias == crate_name):
+            out.append((item.start(), alias))
+        elif crate == EXTERN_SELF and below:
+            out.append((item.start(), alias))
     for item in USE_ITEM.finditer(scrubbed):
         for path, name in use_leaves(item.group(0)):
-            if name in names and tuple(path) != (name,):
+            if name in names and tuple(path[:1]) != (name,):  # r28: an item of the extern crate itself is no rebinding
                 out.append((item.start(), name))
     for token in MOD_TOKEN.finditer(scrubbed):
         head = MOD_HEAD.match(scrubbed, token.end())
@@ -2316,6 +2327,7 @@ class CommonModel:
         # r13 (#8155, #8157): the crate the tests import (its [package] name), and per src/ trait name the methods it
         # declares; src_types holds the struct / enum / union / type names, which never supply a method
         self.crate_name, self.src_traits, self.src_types = self._src_items(root)
+        self.dep_names = self._dep_names(root)  # r28 (R27-1): every dependency key of Cargo.toml, renamed or not
         self.dep_roots = self._dep_roots(root)  # r14 (G2): Cargo.toml `package =` renames: dependency name -> crate
         base = pathlib.Path(root) / COMMON_REL if root is not None else None
         if base is None or not base.is_dir():
@@ -2420,7 +2432,19 @@ class CommonModel:
         return crate_name, dict(index.traits), index.types
 
     @staticmethod
+    def _dep_names(root):
+        """Every dependency key of Cargo.toml (r28, R27-1), `-` read as `_`: the same tables as _dep_roots, renamed or
+        not, so a plain `serde = "1"` is a protected name like a `package =` rename."""
+        return set(CommonModel._dep_seen(root))
+
+    @staticmethod
     def _dep_roots(root):
+        seen = CommonModel._dep_seen(root)
+        return {name: (next(iter(real)) if len(real) == 1 else DEP_AMBIGUOUS)
+                for name, real in seen.items() if real != {name}}
+
+    @staticmethod
+    def _dep_seen(root):
         """{dependency name: the crate it really is} for the renamed dependencies of Cargo.toml (r14, G2). Stdlib
         `tomllib` is not in Python 3.9, so this reads the manifest line by line: a `[dependencies]`,
         `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]` or `[target.<cfg>.dependencies]` table
@@ -2459,8 +2483,7 @@ class CommonModel:
                     name = m.group(1).replace("-", "_")
                     pkg = DEP_PACKAGE.search(m.group(2))
                     seen.setdefault(name, set()).add(pkg.group(1).replace("-", "_") if pkg else name)
-        return {name: (next(iter(real)) if len(real) == 1 else DEP_AMBIGUOUS)
-                for name, real in seen.items() if real != {name}}
+        return seen
 
     def module_macros(self, path, raw):
         """The macro_rules! names in textual scope of a test file: those of tests/common and those of every module
@@ -2480,7 +2503,7 @@ class CommonModel:
         shadowed = []  # r27: a diagnostic of its own; the verdict of the file's reader is not widened by it
         for index, (file, text) in enumerate(walk.files):
             scrubbed = scrub(text)
-            for at, name in shadowed_names(scrubbed, names, index > 0):  # r27: a module file is below the crate root
+            for at, name in shadowed_names(scrubbed, names, index > 0, self.crate_name):  # r27: a module file is below the crate root
                 shadowed.append((file, REASONS["extern_shadow"] % (text.count("\n", 0, at) + 1, name)))
         self._diagnose(shadowed)
         if walk.problems:
@@ -2491,7 +2514,7 @@ class CommonModel:
     def extern_names(self):
         """The names a binding of the test file must not take (r27): std, core, alloc, the roots INLINE_ROOTS knows, the
         crate under test and every dependency name and rename of Cargo.toml."""
-        names = set(SHADOW_NAMES) | set(self.dep_roots)
+        names = set(SHADOW_NAMES) | set(self.dep_roots) | set(self.dep_names)
         names |= {real for real in self.dep_roots.values() if real != DEP_AMBIGUOUS}
         if self.crate_name:
             names.add(self.crate_name)
