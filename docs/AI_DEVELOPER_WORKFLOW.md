@@ -382,7 +382,7 @@ disk on `/` or the lane volume is below `min_free_gb`, or the running lanes (lan
 sentinel) reach `max_lanes`; an ssh failure is exit 2. `dispatch` repeats the check, copies the prompt and a launcher
 to the peer, and starts the launcher detached so the lane outlives the ssh session; `status` prints `EXIT <code>` or
 `running` plus the log tail; `pull` copies back `LANE-*-READY.md`, `LANE-*-BLOCKED.md` and `REVIEW-*.md`. The
-supervisor records the peer in the optional row column `host`. Never bind-mount a peer worktree volume
+supervisor records the peer in the optional row column `host`. The peer has no `cargo-slot.py`; a lane there runs `cargo` directly, one cargo call at a time. Never bind-mount a peer worktree volume
 into Docker.
 
 ---
