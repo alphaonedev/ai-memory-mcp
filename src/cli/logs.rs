@@ -1356,6 +1356,139 @@ mod tests {
         assert_eq!(e.matches("rotated or truncated").count(), 1, "note: {e:?}");
     }
 
+    /// The production half of this file (everything before the test module),
+    /// for the structural guards below.
+    fn prod_source() -> &'static str {
+        let all = include_str!("logs.rs");
+        all.split("#[cfg(test)]\nmod tests").next().unwrap_or(all)
+    }
+
+    /// The text of `all` from `from` up to the next `to`.
+    fn between<'a>(all: &'a str, from: &str, to: &str) -> &'a str {
+        let start = all.find(from).unwrap();
+        let rest = &all[start..];
+        &rest[..rest.find(to).unwrap_or(rest.len())]
+    }
+
+    /// Opens of a file by path in the production half: the two one-shot reads
+    /// of the tail pass plus the single `open_followed`.
+    const PROD_PATH_OPENS: usize = 3;
+
+    /// #8140 #8141 - the poll path takes the identity and the length from the
+    /// OPENED handle: no `fs::metadata` of the path before the open.
+    #[test]
+    fn logs_tail_follow_poll_has_no_path_stat_before_open_8141() {
+        let poll = between(prod_source(), "fn follow_poll(", "/// Poll loop of");
+        assert!(!poll.contains("fs::metadata("), "path stat in follow_poll");
+        let probe = between(prod_source(), "fn probe_path(", "/// Stable identity");
+        assert!(!probe.contains("fs::metadata("), "path stat in probe_path");
+        assert!(
+            !probe.contains("id: Option<u64>"),
+            "probe_path must not take a pre-open identity"
+        );
+    }
+
+    /// #8141 - a removed followed path is no evidence of anything: quiet poll,
+    /// the held handle keeps draining.
+    #[test]
+    fn logs_tail_follow_removed_path_is_quiet_8141() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let mut state = open_state(&a, 4);
+        fs::remove_file(&a).unwrap();
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!((s.as_str(), e.as_str()), ("", ""), "quiet: {s:?} {e:?}");
+        assert_eq!(state.offset, 4, "cursor kept");
+    }
+
+    /// #8142 - the cannot-open latch has ONE writer and its field doc says
+    /// what it holds.
+    #[test]
+    fn logs_tail_follow_unreadable_latch_has_one_writer_8142() {
+        let src = prod_source();
+        assert_eq!(
+            src.matches("unreadable = Some(").count(),
+            1,
+            "one set site for the latch"
+        );
+        let doc = between(src, "struct FollowState", "unreadable: Option<PathBuf>");
+        assert!(
+            !doc.contains("Newer log file that could not be opened"),
+            "stale field doc: {doc}"
+        );
+    }
+
+    /// #8143 - no reopen fallbacks: the followed handle is always present, so
+    /// neither `switch_to` nor `drain_followed` opens a path.
+    #[test]
+    fn logs_tail_follow_has_no_dead_reopen_8143() {
+        let src = prod_source();
+        assert!(!src.contains("opened.or_else"), "switch_to reopen");
+        assert!(
+            !src.contains("state.file.is_none()"),
+            "drain_followed reopen"
+        );
+        assert!(!src.contains("Option<fs::File>"), "optional handle");
+    }
+
+    /// #8144 - the rotation note text lives in one named constant.
+    #[test]
+    fn logs_tail_follow_rotation_note_is_one_constant_8144() {
+        let src = prod_source();
+        assert_eq!(
+            src.matches("was rotated or truncated; following from the start")
+                .count(),
+            1,
+            "one literal"
+        );
+    }
+
+    /// #8145 - one open per poll: any extra raw open of a path in the
+    /// production half (invisible to the `open_followed` counter) fails this.
+    #[test]
+    fn logs_tail_follow_no_raw_open_besides_open_followed_8145() {
+        let src = prod_source();
+        assert_eq!(src.matches("File::open(").count(), PROD_PATH_OPENS);
+        assert_eq!(src.matches("OpenOptions").count(), 0, "no other open path");
+        assert_eq!(src.matches("open_followed(").count(), 3, "def + 2 uses");
+    }
+
+    /// #8148 - the note tail on a failed open: with an inode an unopenable
+    /// replacement keeps the open handle draining and says exactly that; a
+    /// failed open proves no rename, so the tail never claims one.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_inode_unopenable_replacement_note_tail_8148() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\nold-2\n");
+        let mut state = open_state(&a, 12);
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        append(&dir.path().join("old.zst"), "late\n");
+        fs::write(&a, "n1\n").unwrap();
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "late\n", "old handle drained: {s:?}");
+        assert!(e.ends_with(&format!("; {NOTE_KEEPING_HANDLE}\n")), "{e:?}");
+        assert!(!e.contains("renamed"), "no unproven rename claim: {e:?}");
+    }
+
+    /// #8148 - the same exact tail without an inode.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_unopenable_note_tail_8148() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (_, e) = poll_once(dir.path(), &mut state);
+        assert!(e.ends_with(&format!("; {NOTE_KEEPING_HANDLE}\n")), "{e:?}");
+    }
+
     /// #8097 - the sink sees lines while the read is still going: the first
     /// sink call truncates the file, so a reader that streams stops once its
     /// buffered chunk is used up, while one that collected every line first
