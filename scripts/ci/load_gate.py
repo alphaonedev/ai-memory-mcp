@@ -12,6 +12,7 @@ Usage: python3 scripts/ci/load_gate.py --label "<os>/<tier>" [--max-ratio 1.5]
 Python 3.9+, standard library only.
 """
 import argparse
+import math
 import os
 import sys
 import time
@@ -70,8 +71,8 @@ def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
 
 def _positive_float(text):
     value = float(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError('must be > 0')
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError('must be finite and > 0')
     return value
 
 
