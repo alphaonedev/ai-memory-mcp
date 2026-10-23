@@ -188,13 +188,13 @@ BATMAN_CURATOR_MAX_OPS="${BATMAN_CURATOR_MAX_OPS:-100}"
 CURATOR_HEALTH_MAX_RESTARTS="${CURATOR_HEALTH_MAX_RESTARTS:-3}"
 
 # ---------------------------------------------------------------------------
-# Pinned PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 substrate — NATIVE
+# Pinned PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7 substrate — NATIVE
 # (NO Docker anywhere on the DO fleet, per operator decision). Installed from
 # the official PostgreSQL apt repository (pgdg) on the droplet's own distro.
 # Assessment (verified against the live pgdg noble repo): apt is a complete,
 # pinned install vector for all three —
 #   * postgresql-18         18.6   (exact)
-#   * postgresql-18-pgvector 0.8.6 (exact, unchanged — already current-stable)
+#   * postgresql-18-pgvector 0.8.7 (exact, unchanged — already current-stable)
 #   * postgresql-18-age      ships age.control default_version='1.8.0' and
 #     age--1.8.0.sql. AGE 1.8.0 is the NEWEST released AGE for PostgreSQL 18
 #     per github.com/apache/age/releases (PG18/v1.8.0-rc0, 2026-07-09).
@@ -212,25 +212,25 @@ PG_MAJOR="${PG_MAJOR:-18}"                                          # server maj
 PGDG_CODENAME="${PGDG_CODENAME:-noble}"                            # droplet distro codename (Ubuntu 24.04)
 PG_APT_VERSION="${PG_APT_VERSION:-18.6-1.pgdg24.04+2}"             # pinned exact pgdg server .deb
 # pgvector patch is UNIFIED with the docker-1461 lane (#2872): both certified
-# provisioning SSOTs pin pgvector 0.8.6 — the canonical v1.0.0 GA stack
+# provisioning SSOTs pin pgvector 0.8.7 — the canonical v1.0.0 GA stack
 # (docs/v1.0.0/release-notes.md). Only the pgdg distro suffix differs by lane
 # (this NATIVE lane is Ubuntu 24.04 = noble = pgdg24.04; the docker-1461
-# container lane is Debian 13 = pgdg13). Both `0.8.6-1.pgdg24.04+1` (noble) and
-# `0.8.6-1.pgdg13+1` (trixie) exist in the live pgdg apt repo, so the patch is
+# container lane is Debian 13 = pgdg13). Both `0.8.7-1.pgdg24.04+1` (noble) and
+# `0.8.7-1.pgdg13+1` (trixie) exist in the live pgdg apt repo, so the patch is
 # genuinely common across the two distros. The prior 0.8.2 pin here was
 # accidental drift AND no longer resolvable: pgdg keeps only a rolling window
-# (0.8.4/0.8.5/0.8.6 for postgresql-18) so `0.8.2-1.pgdg24.04+1` is absent from
+# (0.8.4 through 0.8.7 for postgresql-18) so `0.8.2-1.pgdg24.04+1` is absent from
 # noble-pgdg — an apt install of it would fail (the #2658 nonexistent-pin class).
 # Cross-lane parity is asserted by tests/provisioning_pgvector_pin_parity.rs.
-PGVECTOR_APT_VERSION="${PGVECTOR_APT_VERSION:-0.8.6-1.pgdg24.04+1}" # pinned pgvector 0.8.6
+PGVECTOR_APT_VERSION="${PGVECTOR_APT_VERSION:-0.8.7-1.pgdg24.04+1}" # pinned pgvector 0.8.7
 AGE_APT_VERSION="${AGE_APT_VERSION:-1.8.0~rc0-2.pgdg24.04+1}"      # AGE 1.8.0 (extversion 1.8.0)
 # Reproducibility assertion anchors — the validate harness asserts these exact
 # upstream-reported versions (directive: results must reflect the data tier
 # PG 18.6 (current stable) + AGE 1.8.0 (newest released AGE for PG18) +
-# pgvector 0.8.6 (current stable)).
+# pgvector 0.8.7 (current stable)).
 EXPECTED_PG_VERSION="${EXPECTED_PG_VERSION:-18.6}"
 EXPECTED_AGE_VERSION="${EXPECTED_AGE_VERSION:-1.8.0}"
-EXPECTED_PGVECTOR_VERSION="${EXPECTED_PGVECTOR_VERSION:-0.8.6}"
+EXPECTED_PGVECTOR_VERSION="${EXPECTED_PGVECTOR_VERSION:-0.8.7}"
 
 # Native cluster identity (Debian/Ubuntu postgresql-common layout). Applied
 # identically on EACH region's pg droplet; the daemon-owned TLS material is
