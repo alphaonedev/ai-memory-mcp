@@ -3462,6 +3462,82 @@ class ReviewR20(Positive):
         self.run_rows("G3")
 
 
+R21_PROBES = {
+    "N1": [
+        # a TOML literal string ('x') is as good a package value as a basic string, in every table form
+        ("", R18_BLOCK_ON % Positive.OPEN, True,
+         {"Cargo.toml": R20_CARGO + "[dependencies]\nfutures = { package = 'ai_memory_shim', version = '1' }\n"}),
+        ("", R18_BLOCK_ON % Positive.OPEN, True,
+         {"Cargo.toml": R20_CARGO + "[dev-dependencies.futures]\nversion = '0.3'\npackage = 'ai_memory_shim'\n"}),
+        ("", R18_BLOCK_ON % Positive.OPEN, True,
+         {"Cargo.toml": R20_CARGO + "[dependencies]\nfutures.package = 'ai_memory_shim'\n"}),
+        (R18_BODY + "use tokio::join;\n", R20_JOIN, True,
+         {"Cargo.toml": R20_CARGO + "[dependencies]\ntokio = { package = 'other-crate' }\n"}),
+        # a single-quoted rename onto a trusted crate maps back to it
+        (R18_BODY + "use tk::join;\n", R20_JOIN, False,
+         {"Cargo.toml": R20_CARGO + "[dependencies]\ntk = { package = 'tokio', version = '1' }\n"}),
+        # a single-quoted [package] name is the crate root of the tests
+        ("use ai_memory::fan::fan;\n", R20_MAP, True,
+         {"Cargo.toml": "[package]\nname = 'ai_memory'\nversion = '0.0.0'\n",
+          "src/fan.rs": "pub trait fan { fn map(self, f: u8); }\n"}),
+    ],
+    "N2": [
+        # a lowercase trait in a `#[path]` module file outside src/ is still a trait
+        ("use ai_memory::fan::fan;\n", R20_MAP, True,
+         {"Cargo.toml": R20_CARGO, "src/lib.rs": '#[path = "../gen/fan.rs"]\npub mod fan;\n',
+          "gen/fan.rs": "pub trait fan { fn map(self, f: u8); }\n"}),
+        # ... also one level down, through a module file of src/, and through an include!
+        ("use ai_memory::a::fan::fan;\n", R20_MAP, True,
+         {"Cargo.toml": R20_CARGO, "src/lib.rs": "pub mod a;\n", "src/a.rs": '#[path = "../gen/fan.rs"]\npub mod fan;\n',
+          "gen/fan.rs": "pub trait fan { fn map(self, f: u8); }\n"}),
+        ("use ai_memory::fan;\n", R20_MAP, True,
+         {"Cargo.toml": R20_CARGO, "src/lib.rs": 'include!("../gen/fan.rs");\n',
+          "gen/fan.rs": "pub trait fan { fn map(self, f: u8); }\n"}),
+        # controls: the outside file declares a struct, or declares other methods
+        ("use ai_memory::fan::fan;\n", R20_MAP, False,
+         {"Cargo.toml": R20_CARGO, "src/lib.rs": '#[path = "../gen/fan.rs"]\npub mod fan;\n',
+          "gen/fan.rs": "pub struct fan;\n"}),
+        ("use ai_memory::fan::fan;\n", R20_MAP, False,
+         {"Cargo.toml": R20_CARGO, "src/lib.rs": '#[path = "../gen/fan.rs"]\npub mod fan;\n',
+          "gen/fan.rs": "pub trait fan { fn other(self); }\n"}),
+    ],
+    "N3": [
+        # a macro_rules! shadow that an include!d file defines is in textual scope
+        (R18_BODY + "use tokio::join;\n" + 'include!("shadow.rs");\n', R20_JOIN, True,
+         {"tests/shadow.rs": R19_SHADOW % "join"}),
+        (R20_NEST, R20_JOIN, True,
+         {"tests/rt.rs": '#[macro_use]\ninclude!("shadow.rs");\n', "tests/shadow.rs": R19_SHADOW % "join"}),
+        (R20_NEST, R20_JOIN, True,
+         {"tests/rt.rs": '#[macro_use]\nmod inner;\n', "tests/rt/inner.rs": 'include!("shadow.rs");\n',
+          "tests/rt/shadow.rs": R19_SHADOW % "join"}),
+        # controls: an include!d file without a shadow, and one that includes itself (a cycle that terminates)
+        (R18_BODY + "use tokio::join;\n" + 'include!("shadow.rs");\n', R20_JOIN, False,
+         {"tests/shadow.rs": "pub fn f() {}\n"}),
+        (R18_BODY + "use tokio::join;\n" + 'include!("shadow.rs");\n', R20_JOIN, False,
+         {"tests/shadow.rs": 'include!("shadow.rs");\n'}),
+    ],
+}
+
+
+class ReviewR21(Positive):
+    """REVIEW-7349-r21 (umbrella #8168 N1-N3): every row of R21_PROBES is decided as its flag says."""
+
+    def run_rows(self, group):
+        for row in R21_PROBES[group]:
+            with self.subTest(head=row[0], body=row[1], files=sorted(row[3])):
+                r20_write(row)
+                self.assertEqual(self.scan(), FLAGGED if row[2] else set())
+
+    def test_n1_a_single_quoted_cargo_package_value_is_a_rename(self):
+        self.run_rows("N1")
+
+    def test_n2_a_trait_in_a_path_file_outside_src_is_indexed(self):
+        self.run_rows("N2")
+
+    def test_n3_a_macro_rules_shadow_in_an_included_file_wins(self):
+        self.run_rows("N3")
+
+
 # G4 (REVIEW-7349-r20): the exact trust tables, as literals; they are the whole of the credit side of callee_origin.
 PINNED_FN_PATHS = frozenset((
     ("std", "panic", "catch_unwind"), ("std", "panic", "AssertUnwindSafe"), ("core", "panic", "AssertUnwindSafe"),
