@@ -292,14 +292,16 @@ struct FollowState {
     offset: u64,
     id: Option<u64>,
     /// Open handle on the followed inode (kept so a renamed file can be drained).
-    file: Option<fs::File>,
+    file: fs::File,
     /// Up to [`FOLLOW_FINGERPRINT_LEN`] bytes that ended at `offset` when it was
     /// last advanced; empty means unknown. A same-inode truncate that regrows
     /// past `offset` between two polls leaves the length looking like growth,
     /// but these bytes no longer match (#7965).
     fingerprint: Vec<u8>,
-    /// Newer log file that could not be opened (reported once, retried on
-    /// every poll while the old file keeps being followed, #8005).
+    /// Path that could not be opened (newer log file or the followed path
+    /// itself): reported once per episode, retried on every poll while the
+    /// open handle keeps being followed, and cleared by a successful open
+    /// that shows no replacement (#8005, #8108). Only `note_cannot_open` sets it.
     unreadable: Option<PathBuf>,
 }
 
@@ -317,7 +319,7 @@ impl FollowState {
             path,
             offset,
             id,
-            file: Some(file),
+            file,
             fingerprint,
             unreadable: None,
         }
@@ -325,12 +327,7 @@ impl FollowState {
 
     /// True while the bytes before the cursor are the ones last seen there.
     fn fingerprint_holds(&self) -> bool {
-        match self.file.as_ref() {
-            Some(file) if !self.fingerprint.is_empty() => {
-                read_fingerprint(file, self.offset) == self.fingerprint
-            }
-            _ => true,
-        }
+        self.fingerprint.is_empty() || read_fingerprint(&self.file, self.offset) == self.fingerprint
     }
 }
 
@@ -361,18 +358,26 @@ fn read_fingerprint(file: &fs::File, offset: u64) -> Vec<u8> {
 
 /// What one open attempt of the followed path showed.
 enum PathProbe {
-    /// The path still holds the followed file (or no evidence says otherwise).
-    Same,
+    /// The path still holds the followed file (or no evidence says otherwise);
+    /// carries the length of the file that was opened.
+    Same(u64),
     /// The path holds another file; the fresh handle is ready to be adopted.
     Replaced(fs::File),
     /// The path could not be opened; no evidence about its identity.
     Unopenable,
 }
 
-/// Note tail when an inode proved the path was renamed away and recreated.
-const NOTE_DRAINING_RENAMED: &str = "still draining the renamed file";
-/// Note tail when an open failed without any evidence of a replacement.
+/// Note tail when an open failed: a failed open proves neither a rename nor
+/// a replacement, so the note only says the open handle keeps being followed.
 const NOTE_KEEPING_HANDLE: &str = "still following the open file";
+/// Note text written when the cursor moves to the start of a file.
+const NOTE_ROTATED: &str = "was rotated or truncated; following from the start";
+
+/// Write the rotation note for `path`.
+fn write_rotation_note(out: &mut CliOutput<'_>, path: &Path) -> Result<()> {
+    writeln!(out.stderr, "logs: {} {NOTE_ROTATED}", path.display())?;
+    Ok(())
+}
 
 /// Write the cannot-open note once per episode (`state.unreadable` latch,
 /// the #8005 shape); a later successful open clears the latch.
@@ -394,36 +399,45 @@ fn note_cannot_open(
     Ok(())
 }
 
-/// Open `state.path` ONCE and classify it. With inodes the inode decides;
-/// without, the bytes before the cursor in the OPENED handle are compared with
-/// the ones last seen (#8027).
+/// True when `err` is a missing path (renamed away or removed).
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Open `state.path` ONCE and classify it from the OPENED handle: its
+/// identity (inode) and length come from `fstat` on that handle, never from a
+/// stat of the path taken before the open. With inodes the inode decides;
+/// without, the bytes before the cursor in the handle are compared with the
+/// ones last seen (#8027).
 ///
-/// decision: a failed open is never evidence of replacement, and the
-/// fingerprint is read from the handle that was opened (one open per poll)
-/// over a second path-based open, because a transient error on an unchanged
-/// file would otherwise print a false note, reset the cursor to 0 and reprint
-/// the file (#8117, #8109); a successful identical open clears every latch
-/// (#8108, #8118).
-fn probe_path(
-    state: &mut FollowState,
-    id: Option<u64>,
-    out: &mut CliOutput<'_>,
-) -> Result<PathProbe> {
+/// decision: a failed open is never evidence of replacement, one open per
+/// poll, and identity plus fingerprint come from the opened handle over a
+/// path stat before the open, because a stat followed by an open of the same
+/// path only narrows the swap window and can describe a different file than
+/// the one adopted (#8117, #8109, #8140, #8141); a successful identical open
+/// clears the latch (#8108, #8118). A missing path is quiet: the held handle
+/// keeps draining. The failed-open note never claims a rename, since an open
+/// error shows none (#8148).
+fn probe_path(state: &mut FollowState, out: &mut CliOutput<'_>) -> Result<PathProbe> {
     let path = state.path.clone();
-    let inode_known = state.id.is_some() && id.is_some();
-    let file = match open_followed(&path) {
-        Ok(file) => file,
+    let opened = open_followed(&path).and_then(|file| {
+        let meta = file
+            .metadata()
+            .with_context(|| crate::errors::msg::opening(path.display()))?;
+        Ok((file, meta))
+    });
+    let (file, meta) = match opened {
+        Ok(pair) => pair,
         Err(err) => {
-            let tail = if inode_known && state.id != id {
-                NOTE_DRAINING_RENAMED
-            } else {
-                NOTE_KEEPING_HANDLE
-            };
-            note_cannot_open(state, out, &path, &err, tail)?;
+            if !is_not_found(&err) {
+                note_cannot_open(state, out, &path, &err, NOTE_KEEPING_HANDLE)?;
+            }
             return Ok(PathProbe::Unopenable);
         }
     };
-    let replaced = if inode_known {
+    let id = file_id(&meta);
+    let replaced = if state.id.is_some() && id.is_some() {
         state.id != id
     } else {
         !state.fingerprint.is_empty()
@@ -434,7 +448,10 @@ fn probe_path(
         return Ok(PathProbe::Replaced(file));
     }
     state.unreadable = None;
-    Ok(PathProbe::Same)
+    if state.id.is_none() {
+        state.id = id;
+    }
+    Ok(PathProbe::Same(meta.len()))
 }
 
 /// Stable identity of the file behind `meta`: the inode on unix, `None` where
@@ -577,43 +594,27 @@ fn drain_followed(
     out: &mut CliOutput<'_>,
     flush_tail: bool,
 ) -> Result<()> {
-    if state.file.is_none() {
-        let Ok(file) = open_followed(&state.path) else {
-            return Ok(());
-        };
-        state.file = Some(file);
-    }
-    let Some(file) = state.file.as_mut() else {
-        return Ok(());
-    };
-    let Ok(meta) = file.metadata() else {
+    let Ok(meta) = state.file.metadata() else {
         return Ok(());
     };
     if meta.len() <= state.offset {
         return Ok(());
     }
-    let end = read_lines_from_handle(file, state.offset, flush_tail, &mut |line| {
+    let end = read_lines_from_handle(&mut state.file, state.offset, flush_tail, &mut |line| {
         if line_matches(line, filters) {
             emit_line(line, filters, out)?;
         }
         Ok(())
     })?;
     state.offset = end;
-    if let Some(file) = state.file.as_ref() {
-        state.fingerprint = read_fingerprint(file, end);
-    }
+    state.fingerprint = read_fingerprint(&state.file, end);
     Ok(())
 }
 
-/// Switch the cursor to `path` at offset 0 with a fresh handle (`opened` when
-/// the caller already holds one).
-fn switch_to(state: &mut FollowState, path: PathBuf, opened: Option<fs::File>) {
-    let file = opened.or_else(|| open_followed(&path).ok());
-    state.id = file
-        .as_ref()
-        .and_then(|f| f.metadata().ok())
-        .as_ref()
-        .and_then(file_id);
+/// Switch the cursor to `path` at offset 0 with the handle `file` the caller
+/// already opened.
+fn switch_to(state: &mut FollowState, path: PathBuf, file: fs::File) {
+    state.id = file.metadata().ok().as_ref().and_then(file_id);
     state.file = file;
     state.path = path;
     state.offset = 0;
@@ -648,40 +649,28 @@ fn follow_poll(
         match open_followed(&newest) {
             Ok(file) => {
                 drain_followed(state, filters, out, true)?;
-                switch_to(state, newest, Some(file));
+                switch_to(state, newest, file);
             }
             Err(err) => {
-                if state.unreadable.as_ref() != Some(&newest) {
-                    writeln!(
-                        out.stderr,
-                        "logs: cannot open {}: {err:#}; still following {}",
-                        newest.display(),
-                        state.path.display()
-                    )?;
-                    state.unreadable = Some(newest);
-                }
+                let tail = format!("still following {}", state.path.display());
+                note_cannot_open(state, out, &newest, &err, &tail)?;
             }
         }
-    } else if let Ok(meta) = fs::metadata(&state.path) {
-        let id = file_id(&meta);
+    } else {
         // Rename-and-recreate: the writer may still have appended to the
         // renamed file, which only the old handle can reach.
         // decision: open the path BEFORE leaving the old handle (#8062,
-        // #8063, ERRORS-02) and treat a failed open as no evidence (#8117).
-        match probe_path(state, id, out)? {
+        // #8063, ERRORS-02) and read identity and length from that handle.
+        match probe_path(state, out)? {
             PathProbe::Replaced(file) => {
                 let path = state.path.clone();
                 drain_followed(state, filters, out, true)?;
-                writeln!(
-                    out.stderr,
-                    "logs: {} was rotated or truncated; following from the start",
-                    path.display()
-                )?;
-                switch_to(state, path, Some(file));
+                write_rotation_note(out, &path)?;
+                switch_to(state, path, file);
             }
             PathProbe::Unopenable => {}
-            PathProbe::Same => {
-                if meta.len() < state.offset || !state.fingerprint_holds() {
+            PathProbe::Same(len) => {
+                if len < state.offset || !state.fingerprint_holds() {
                     // decision: a short prefix fingerprint of the bytes before
                     // the cursor over mtime+len or a content hash, because it
                     // costs one 64-byte read per poll, needs no clock, and
@@ -689,18 +678,11 @@ fn follow_poll(
                     // offset within one poll (#7965). It misses only a
                     // rewrite whose last 64 bytes before the cursor are
                     // byte-identical to the old ones.
-                    writeln!(
-                        out.stderr,
-                        "logs: {} was rotated or truncated; following from the start",
-                        state.path.display()
-                    )?;
+                    write_rotation_note(out, &state.path)?;
                     state.offset = 0;
                     state.fingerprint.clear();
                 }
             }
-        }
-        if state.id.is_none() {
-            state.id = id;
         }
     }
     drain_followed(state, filters, out, false)
@@ -1470,7 +1452,7 @@ mod tests {
         }
         let (s, e) = poll_once(dir.path(), &mut state);
         assert_eq!(s, "late\n", "old handle drained: {s:?}");
-        assert!(e.ends_with(&format!("; {NOTE_KEEPING_HANDLE}\n")), "{e:?}");
+        assert!(e.ends_with("; still following the open file\n"), "{e:?}");
         assert!(!e.contains("renamed"), "no unproven rename claim: {e:?}");
     }
 
@@ -1486,7 +1468,7 @@ mod tests {
             return;
         }
         let (_, e) = poll_once(dir.path(), &mut state);
-        assert!(e.ends_with(&format!("; {NOTE_KEEPING_HANDLE}\n")), "{e:?}");
+        assert!(e.ends_with("; still following the open file\n"), "{e:?}");
     }
 
     /// #8097 - the sink sees lines while the read is still going: the first
@@ -1614,7 +1596,7 @@ mod tests {
             path: path.clone(),
             offset,
             id,
-            file: Some(file),
+            file,
             fingerprint: Vec::new(),
             unreadable: None,
         };
@@ -1643,7 +1625,7 @@ mod tests {
             path: newest.clone(),
             offset: 2,
             id: file.metadata().ok().as_ref().and_then(file_id),
-            file: Some(file),
+            file,
             fingerprint: Vec::new(),
             unreadable: None,
         };
