@@ -71,7 +71,7 @@ once and runs three concurrent shards inside the same `Run tests
 
 | Shard | Holds | Threads |
 |---|---|---|
-| serial | class (a): Postgres, `#[serial]`, `federat*` names, binaries with unknown source, the lib tests matching `scripts/ci/lib_pg_prefixes.txt`, doc tests | 1 |
+| serial | class (a): Postgres, `#[serial]`, binaries with unknown source (a `federat*` name alone is not evidence, #7343), the lib tests matching `scripts/ci/lib_pg_prefixes.txt`, doc tests | 1 |
 | parallel_1 | lib tests with `--skip` of those prefixes, plus a balanced share of self-contained binaries | 3 |
 | parallel_2 | the remaining self-contained binaries | 3 |
 
@@ -100,13 +100,15 @@ PID separately and fails if any shard failed. Each shard's log, list file and
 the partition `manifest.json` are uploaded as the `shard-logs-<node>-<tier>`
 artifact on every outcome, including a cancel or the job cap.
 
-Estimated wall time (from the measured weights, 1,006 executables): serial
-3,913 s (lib Postgres prefixes 84 s, doc tests 16 s, 388 class-(a) binaries),
-parallel about 1,620 s and 1,812 s. The parallel figures divide each binary's
-seconds by min(its test count, 3) threads; the ideal at a flat
-`--test-threads=3` is 1,620 s and 1,515 s, and a single-test binary gets no
-speedup, so the true figure lies between the two. The federation-name rule keeps
-47 binaries (about 437 s) in the serial shard on purpose.
+Estimated wall time (from the measured weights, 1,007 executables, the output of
+`scripts/ci/partition_test_binaries.py` at this commit): serial 3,511 s (lib
+Postgres prefixes 84 s, doc tests 16 s, 349 class-(a) binaries), parallel about
+1,673 s and 1,973 s. The parallel figures divide each binary's seconds by
+min(its test count, 3) threads; the ideal at a flat `--test-threads=3` is
+1,665 s and 1,665 s, and a single-test binary gets no speedup, so the true
+figure lies between the two. A binary is serial only for evidence (Postgres,
+`#[serial]`, unknown source); neither a `federat*` name (#7343) nor a
+helper whose name merely matches a word in the binary (#7352) is evidence.
 
 Budget: `WATCHDOG_SECS` = 7800 s (130 min) per shard and job `timeout-minutes` =
 160 min on both `enterprise-fed` legs (the watchdog plus 28 min of pre-watchdog
