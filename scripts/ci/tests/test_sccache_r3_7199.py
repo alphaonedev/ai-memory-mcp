@@ -11,12 +11,25 @@ import os
 import shutil
 import stat
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-SCRATCH = REPO / ".local-runs" / "sccache-r3-7199"
+SCRATCH_PARENT = REPO / ".local-runs"
+SCRATCH = None  # per-run mkdtemp dir, set by setUpModule (#8024)
+
+
+def setUpModule():
+    global SCRATCH
+    SCRATCH_PARENT.mkdir(parents=True, exist_ok=True)
+    SCRATCH = Path(tempfile.mkdtemp(prefix="sccache-r3-7199-", dir=str(SCRATCH_PARENT)))
+
+
+def tearDownModule():
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
 sys.path.insert(0, str(REPO / "scripts" / "ci"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sccache_env  # noqa: E402
