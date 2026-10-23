@@ -3359,6 +3359,140 @@ RULE_PROBES = {
 }
 
 
+# r14 (REVIEW-7349-r20, #8168 G1-G3): a callee is trusted only when it RESOLVES to an allowlisted crate-qualified path.
+# Each row is (head, body, flagged, files); files maps a path under the scratch ROOT (Cargo.toml, src/.., tests/..) to its text.
+R20_CARGO = '[package]\nname = "ai_memory"\nversion = "0.0.0"\n'
+R20_MAP = "Some(1u8).map(%s);" % R18_CL
+R20_JOIN = R18_BLOCK_ON % "join!(body());"
+R20_NEST = "#[macro_use]\nmod rt;\n" + R18_BODY + "use tokio::join;\n"
+R20_PROBES = {
+    "G1": [
+        # src_lowercase_trait: a lowercase name is a trait when the src/ definition says so
+        ("use ai_memory::fan::fan;\n", R20_MAP, True,
+         {"Cargo.toml": R20_CARGO, "src/fan.rs": "pub trait fan { fn map(self, f: u8); }\n"}),
+        # src_reexport_alias_over_struct_name: the name is a struct in one module and a trait alias in another
+        ("use ai_memory::b::Fan;\n", R20_MAP, True,
+         {"Cargo.toml": R20_CARGO, "src/a.rs": "pub struct Fan;\n",
+          "src/b.rs": "pub trait Real { fn map(self, f: u8); }\npub use self::Real as Fan;\n"}),
+        # src_trait_fns_from_macro: a trait whose fns a macro generates supplies any method
+        ("use ai_memory::Fan;\n", R20_MAP, True,
+         {"Cargo.toml": R20_CARGO,
+          "src/lib.rs": "macro_rules! mk_fn { () => { fn map(self, f: u8); }; }\npub trait Fan { mk_fn!(); }\n"}),
+        # a trait that a macro generates under a name that is also a struct
+        ("use ai_memory::Fan;\n", R20_MAP, True,
+         {"Cargo.toml": R20_CARGO, "src/a.rs": "pub struct Fan;\n",
+          "src/lib.rs": "macro_rules! mk { ($n:ident) => { pub trait $n { fn map(self, f: u8); } }; }\nmk!(Fan);\n"}),
+        # controls: a struct, a plain fn and a trait that declares other methods supply no `map`
+        ("use ai_memory::a::Fan;\n", R20_MAP, False, {"Cargo.toml": R20_CARGO, "src/a.rs": "pub struct Fan;\n"}),
+        ("use ai_memory::util::helper;\n", R20_MAP, False,
+         {"Cargo.toml": R20_CARGO, "src/util.rs": "pub fn helper() {}\n"}),
+        ("use ai_memory::fan::fan;\n", R20_MAP, False,
+         {"Cargo.toml": R20_CARGO, "src/fan.rs": "pub trait fan { fn other(self); }\n"}),
+    ],
+    "G2": [
+        # cargo_renamed_futures / cargo_renamed_tokio_join: a root name that Cargo.toml points at another crate
+        ("", R18_BLOCK_ON % Positive.OPEN, True,
+         {"Cargo.toml": R20_CARGO + '[dependencies]\nfutures = { package = "ai_memory_shim", version = "1" }\n'}),
+        (R18_BODY + "use tokio::join;\n", R20_JOIN, True,
+         {"Cargo.toml": R20_CARGO + '[dependencies]\ntokio = { version = "1", package = "ai_memory_shim" }\n'}),
+        ("", R18_BLOCK_ON % Positive.OPEN, True,
+         {"Cargo.toml": R20_CARGO + '[dev-dependencies.futures]\nversion = "0.3"\npackage = "ai_memory_shim"\n'}),
+        (R18_BODY, R18_BLOCK_ON % "tokio::join!(body());", True,
+         {"Cargo.toml": R20_CARGO + '[target.\'cfg(unix)\'.dependencies]\ntokio = { package = "other-crate" }\n'}),
+        # a rename that points at a trusted crate maps back to it before the allowlist
+        (R18_BODY + "use tk::join;\n", R20_JOIN, False,
+         {"Cargo.toml": R20_CARGO + '[dependencies]\ntk = { package = "tokio", version = "1" }\n'}),
+        (R18_BODY, R18_BLOCK_ON % "tk::join!(body());", False,
+         {"Cargo.toml": R20_CARGO + '[dependencies]\ntk = { package = "tokio" }\n'}),
+        ("", "fut::executor::block_on(async { %s });" % Positive.OPEN, False,
+         {"Cargo.toml": R20_CARGO + '[dependencies.fut]\npackage = "futures"\n'}),
+        # controls: no rename, or a rename onto itself
+        ("", R18_BLOCK_ON % Positive.OPEN, False,
+         {"Cargo.toml": R20_CARGO + '[dependencies]\nfutures = { version = "0.3" }\n'}),
+        ("", R18_BLOCK_ON % Positive.OPEN, False,
+         {"Cargo.toml": R20_CARGO + '[dependencies]\nfutures = { package = "futures" }\n'}),
+    ],
+    "G3": [
+        # macro_rules_shadow_via_nested_mod_file: the shadow sits two module files below the test file
+        (R20_NEST, R20_JOIN, True,
+         {"tests/rt.rs": "#[macro_use]\nmod inner;\n", "tests/rt/inner.rs": R19_SHADOW % "join"}),
+        (R20_NEST, R20_JOIN, True,
+         {"tests/rt/mod.rs": "#[macro_use]\nmod inner;\n", "tests/rt/inner.rs": R19_SHADOW % "join"}),
+        (R20_NEST, R20_JOIN, True,
+         {"tests/rt.rs": "#[macro_use]\nmod a;\n", "tests/rt/a.rs": "#[macro_use]\nmod b;\n",
+          "tests/rt/a/b.rs": R19_SHADOW % "join"}),
+        (R20_NEST, R20_JOIN, True,
+         {"tests/rt.rs": "#[macro_use]\nmod x { #[macro_use] mod inner; }\n", "tests/rt/inner.rs": R19_SHADOW % "join"}),
+        # controls: a nested module without a shadow, and a module file that declares itself (a cycle that terminates)
+        (R20_NEST, R20_JOIN, False,
+         {"tests/rt.rs": "#[macro_use]\nmod inner;\n", "tests/rt/inner.rs": "pub fn f() {}\n"}),
+        (R20_NEST, R20_JOIN, False, {"tests/rt.rs": "#[macro_use]\nmod rt;\n"}),
+    ],
+}
+
+
+def r20_write(row):
+    """Write the fixture tree of one R20_PROBES row under SCRATCH; returns (head, body, flagged)."""
+    head, body, flagged, files = row
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    (SCRATCH / "tests").mkdir(parents=True)
+    for rel, text in files.items():
+        (SCRATCH / rel).parent.mkdir(parents=True, exist_ok=True)
+        (SCRATCH / rel).write_text(text)
+    (SCRATCH / "tests" / "a.rs").write_text(WRITER + head + Positive.LOCKED % body)
+    return head, body, flagged
+
+
+class ReviewR20(Positive):
+    """REVIEW-7349-r20 (umbrella #8168 G1-G3): every row of R20_PROBES is decided as its flag says."""
+
+    def run_rows(self, group):
+        for row in R20_PROBES[group]:
+            with self.subTest(head=row[0], body=row[1], files=sorted(row[3])):
+                head, body, flagged = r20_write(row)
+                self.assertEqual(self.scan(), FLAGGED if flagged else set())
+
+    def test_g1_a_method_provider_is_decided_from_the_resolved_definition(self):
+        self.run_rows("G1")
+
+    def test_g2_a_cargo_package_rename_is_resolved_before_a_root_is_trusted(self):
+        self.run_rows("G2")
+
+    def test_g3_a_macro_rules_shadow_in_a_nested_module_file_wins(self):
+        self.run_rows("G3")
+
+
+# G4 (REVIEW-7349-r20): the exact trust tables, as literals; they are the whole of the credit side of callee_origin.
+PINNED_FN_PATHS = frozenset((
+    ("std", "panic", "catch_unwind"), ("std", "panic", "AssertUnwindSafe"), ("core", "panic", "AssertUnwindSafe"),
+    ("tokio", "time", "timeout")))
+PINNED_METHOD_NAMES = (
+    "map", "and_then", "or_else", "unwrap_or_else", "map_or", "map_or_else", "map_err", "ok_or_else", "is_some_and",
+    "is_none_or", "is_ok_and", "is_err_and", "filter", "filter_map", "flat_map", "find", "find_map", "any", "all",
+    "position", "rposition", "take_while", "skip_while", "map_while", "inspect", "fold", "try_fold", "for_each",
+    "sort_by", "sort_by_key", "sort_unstable_by", "sort_unstable_by_key", "retain", "max_by", "max_by_key", "min_by",
+    "min_by_key", "get_or_insert_with", "or_insert_with", "query_row", "query_map", "query_and_then", "block_on",
+    "timeout", "catch_unwind", "AssertUnwindSafe", "with_default", "call_once", "call_once_force", "get_or_init",
+    "get_or_try_init", "force")
+PINNED_METHOD_PATHS = frozenset(("std", name) for name in PINNED_METHOD_NAMES)
+
+
+class TrustTablePins(unittest.TestCase):
+    """REVIEW-7349-r20 G4: the allowlists are pinned by literal sets, so dropping or adding an entry fails here."""
+
+    def test_trusted_fn_paths_are_exactly_the_pinned_set(self):
+        self.assertEqual(gate.TRUSTED_FN_PATHS, PINNED_FN_PATHS)
+
+    def test_trusted_method_paths_are_exactly_the_pinned_set(self):
+        self.assertEqual(gate.TRUSTED_METHOD_PATHS, PINNED_METHOD_PATHS)
+
+    def test_the_pinned_sets_name_the_runner_wrappers(self):
+        for path in (("std", "panic", "catch_unwind"), ("std", "panic", "AssertUnwindSafe"), ("tokio", "time", "timeout")):
+            with self.subTest(path=path):
+                self.assertIn(path, PINNED_FN_PATHS)
+                self.assertIn(path, gate.TRUSTED_FN_PATHS)
+
+
 class RuleProbes(Positive):
     """#8125: one test per classifying rule; each asserts that every probe of the rule is flagged. A loosened rule (the
     gate with its origin predicate replaced) turns one of them RED: see RuleInventory."""
