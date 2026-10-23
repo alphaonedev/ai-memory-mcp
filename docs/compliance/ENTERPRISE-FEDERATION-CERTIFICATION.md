@@ -1058,7 +1058,7 @@ release binary is deliberately NOT enterprise-federation-compliant.
 
 ---
 
-## 3. §5.4(3) — Postgres + AGE + pgvector evidence (current triple 18.6 / 1.8.0 / 0.8.6 executed GREEN — run 33182767671)
+## 3. §5.4(3) — Postgres + AGE + pgvector evidence (18.6 / 1.8.0 / pgvector at 0.8.6, then current, executed GREEN — run 33182767671; current pin 0.8.7)
 
 The certified stack is **executed in-PR** by `.github/workflows/cert-postgres-age.yml`
 (#2548), which BUILDS and runs the exact certified triple and hard-fails on any
@@ -1092,8 +1092,8 @@ stack. (Those specific dated runs executed the historical **18.4 / 1.7.0 /
 0.8.7** — is the tier this same workflow asserts in-PR on `release/**` from
 the SSOT pins, per the STANDARD data-tier note below.)
 
-> **Evidence status, stated plainly (2026-08-28 Wave-1 C3).** Current
-> triple **PG 18.6 / AGE 1.8.0 / pgvector at 0.8.6** (then current) is executed GREEN:
+> **Evidence status, stated plainly (2026-08-28 Wave-1 C3).** The
+> then-current triple **PG 18.6 / AGE 1.8.0 / pgvector at 0.8.6** is executed GREEN:
 > run [`33182767671`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33182767671)
 > (`Certified Postgres + AGE + pgvector tier (#2548)`, push of
 > `release/v1.0.0` head `00dd0162`, conclusion `success`,
