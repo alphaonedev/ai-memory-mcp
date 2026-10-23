@@ -46,6 +46,9 @@ const SRC: &str = "11111111-1111-4111-8111-111111111111";
 const TGT: &str = "22222222-2222-4222-8222-222222222222";
 const VALID_FROM: &str = "2026-01-01T00:00:00+00:00";
 const VALID_UNTIL: &str = "2027-01-01T00:00:00+00:00";
+/// #3809 - the stored (non-canonical) input above is read back in the canonical
+/// `Z` form on both backends; the fixture stays `+00:00` so the pin proves it.
+const VALID_UNTIL_CANONICAL: &str = "2027-01-01T00:00:00Z";
 
 /// The nine fields `docs/API_REFERENCE.md` documents for a `memories[]` row.
 const DOCUMENTED_ROW_KEYS: [&str; 9] = [
@@ -258,7 +261,11 @@ async fn kg_query_row_shape_is_identical_on_both_backends_3424() {
     assert_eq!(row["target_namespace"].as_str(), Some(NS), "{row}");
     assert_eq!(row["relation"].as_str(), Some("depends_on"), "{row}");
     assert_eq!(row["valid_from"].as_str(), Some(VALID_FROM), "{row}");
-    assert_eq!(row["valid_until"].as_str(), Some(VALID_UNTIL), "{row}");
+    assert_eq!(
+        row["valid_until"].as_str(),
+        Some(VALID_UNTIL_CANONICAL),
+        "{row}"
+    );
     assert_eq!(row["observed_by"].as_str(), Some(CALLER), "{row}");
     assert_eq!(row["depth"].as_u64(), Some(1), "{row}");
     assert_eq!(

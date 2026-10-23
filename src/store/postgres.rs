@@ -9923,7 +9923,7 @@ impl PostgresStore {
                     // every existing caller would have to ignore.
                     signature: None,
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(crate::storage::render_valid_until_stamp),
                     observed_by,
                     attest_level: Some(attest_level),
                     source_cid: None,
@@ -11424,7 +11424,11 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("read edge observed_by (#3424)", e))?;
             edges.insert(
                 (src, tgt, relation),
-                (vf.map(|t| t.to_rfc3339()), vu.map(|t| t.to_rfc3339()), ob),
+                (
+                    vf.map(|t| t.to_rfc3339()),
+                    vu.map(crate::storage::render_valid_until_stamp),
+                    ob,
+                ),
             );
         }
 
@@ -11731,14 +11735,17 @@ impl PostgresStore {
             .collect();
         decoded.retain(|r| visible.contains(&r.target_id));
         // v1.0.0 batch-2 parity — mirror the CTE branch's deterministic order
-        // and row cap so the two postgres branches (and the sqlite SSOT) return
-        // the SAME bounded page for the same traversal. Sorting BEFORE
-        // truncating is what makes the cap a stable prefix rather than an
-        // arbitrary subset: DEGRADE (fewer rows), never WRONG rows.
+        // (`depth, target_id, relation, path`, byte order, #3810) and row cap
+        // so the two postgres branches return the SAME bounded page for the
+        // same traversal. Sorting BEFORE truncating is what makes the cap a
+        // stable prefix rather than an arbitrary subset: DEGRADE (fewer rows),
+        // never WRONG rows. SQLite keeps its own temporal key (#3893).
         decoded.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
                 .then_with(|| a.target_id.cmp(&b.target_id))
+                .then_with(|| a.relation.cmp(&b.relation))
+                .then_with(|| a.path.cmp(&b.path))
         });
         decoded.truncate(kg_query_row_cap(None));
         // #3424 — hydrate the five display fields on the FINAL, capped set.
@@ -11753,9 +11760,11 @@ impl PostgresStore {
 
     /// Recursive-CTE fallback for `kg_query` on Postgres.
     ///
-    /// Mirrors the SQLite recursive-CTE in `db::kg_query` so deployments
-    /// running vanilla Postgres (no AGE extension) still get the same
-    /// traversal semantics. Returns the shared [`KgQueryRow`] shape —
+    /// Mirrors the traversal semantics of the SQLite recursive-CTE in
+    /// `db::kg_query` so deployments running vanilla Postgres (no AGE
+    /// extension) reach the same rows; the ORDER of the page is per backend
+    /// (here `depth, target_id, relation, path` in byte order; SQLite orders
+    /// by its temporal key first, #3893). Returns the shared [`KgQueryRow`] shape —
     /// the dispatcher in [`Self::kg_query`] doesn't have to care which
     /// branch ran.
     ///
@@ -11825,7 +11834,10 @@ impl PostgresStore {
                    array_to_string(nodes, '->') AS path
             FROM traversal
             WHERE EXISTS (SELECT 1 FROM memories m WHERE m.id = traversal.target_id {lifecycle_vis})
-            ORDER BY depth ASC, target_id ASC
+            ORDER BY depth ASC,
+                     target_id COLLATE \"C\" ASC,
+                     relation COLLATE \"C\" ASC,
+                     array_to_string(nodes, '->') COLLATE \"C\" ASC
             LIMIT $3",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
             // general KG graph traversal, matching the SQLite `kg_query`
@@ -11839,7 +11851,7 @@ impl PostgresStore {
         // v1.0.0 batch-2 parity — bound the result set exactly as the sqlite
         // SSOT does (`crate::storage::kg_query` clamps to
         // KG_QUERY_DEFAULT_LIMIT/KG_QUERY_MAX_LIMIT). Applied AFTER the
-        // deterministic `ORDER BY depth ASC, target_id ASC`, so the capped page
+        // total `ORDER BY depth, target_id, relation, path` (#3810; byte order via COLLATE "C"), so the capped page
         // is a stable prefix, never a random subset. PERF-07 — `TryFrom`,
         // never `as`.
         let row_cap = i64::try_from(kg_query_row_cap(None)).unwrap_or(i64::MAX);
@@ -12033,14 +12045,33 @@ impl PostgresStore {
         let cypher = format!(
             "MATCH (a)-[r]->(b) \
              WHERE {where_sql} \
-             RETURN b.id AS target_id, \
+             RETURN a.id AS source_id, \
+                    b.id AS target_id, \
                     r.relation AS relation, \
                     r.valid_from AS valid_from, \
                     r.valid_until AS valid_until, \
-                    r.observed_by AS observed_by \
-             ORDER BY r.valid_from ASC, r.created_at ASC \
-             LIMIT {cap}"
+                    r.observed_by AS observed_by"
         );
+        // #3810 F8 - no ORDER BY / LIMIT inside cypher: AGE sorts agtype
+        // strings by the database locale, the CTE twin and sqlite sort by
+        // bytes. #3810 F11 - the fetch is still bounded: the outer SQL below
+        // orders on the CTE twin's key (`valid_from` instant, the relational
+        // `created_at`, then `target_id` / `relation` `COLLATE "C"`) and
+        // applies `LIMIT cap`, so at most `cap` rows leave the query layer and
+        // the survivors are the twin's. The Rust sort after it only fixes the
+        // final order. decision: outer SQL ORDER BY ... COLLATE "C" LIMIT over
+        // an unbounded fetch because kg_query at the :11743 sort fetches whole
+        // (a traversal) and has no cap to push down, while the CTE twin at
+        // kg_timeline_cte already orders and caps in SQL.
+        // #3810 F12 - AGE edges carry no `created_at` (project_link_into_age
+        // SETs only valid_from / valid_until), so the tie-break stamp is joined
+        // from `memory_links` on (source, target, relation), the primary key
+        // the CTE twin reads it from. decision: memory_links join over a new
+        // AGE edge property because that keeps the stored graph shape
+        // unchanged and project_link_into_age projects no other column.
+        // Bound caveat: ids / relations are compared in agtype text form, so an
+        // id holding a quote or backslash orders by its escaped spelling in the
+        // pre-cap fetch (uuid-shaped ids never do).
 
         // #2511 — bind the params dict as a bare `agtype`-typed `$1`
         // Param (see [`Agtype`]); the pre-#2511 inlined
@@ -12054,11 +12085,22 @@ impl PostgresStore {
             pairs.push(("until", u));
         }
         let params = age_params_jsonb(&pairs);
+        let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
         let sql = format!(
-            "SELECT target_id, relation, valid_from, valid_until, observed_by \
+            "SELECT c.target_id, c.relation, c.valid_from, c.valid_until, c.observed_by, \
+                    ml.created_at AS link_created_at \
              FROM cypher('memory_graph', $$ {cypher} $$, $1) AS \
-             (target_id agtype, relation agtype, valid_from agtype, \
-              valid_until agtype, observed_by agtype)"
+             c(source_id agtype, target_id agtype, relation agtype, valid_from agtype, \
+               valid_until agtype, observed_by agtype) \
+             LEFT JOIN memory_links ml \
+               ON ml.source_id = btrim(c.source_id::text, '\"') \
+              AND ml.target_id = btrim(c.target_id::text, '\"') \
+              AND ml.relation = btrim(c.relation::text, '\"') \
+             ORDER BY btrim(c.valid_from::text, '\"')::timestamptz ASC, \
+                      ml.created_at ASC, \
+                      btrim(c.target_id::text, '\"') COLLATE \"C\" ASC, \
+                      btrim(c.relation::text, '\"') COLLATE \"C\" ASC \
+             LIMIT $2"
         );
 
         // #1482 — per-call-unique cypher text (since/until predicate +
@@ -12066,6 +12108,7 @@ impl PostgresStore {
         // cache and evicts reusable hot statements.
         let rows = sqlx::query(&sql)
             .bind(Agtype(params))
+            .bind(cap_i64)
             .persistent(false)
             .fetch_all(&mut *tx)
             .await
@@ -12077,7 +12120,7 @@ impl PostgresStore {
         // the display fields from the relational store avoids a
         // class of drift bugs where the AGE projection lags behind
         // a `memories` rename.
-        let mut decoded: Vec<KgTimelineRow> = Vec::with_capacity(rows.len());
+        let mut keyed: Vec<(TimelineSortKey, KgTimelineRow)> = Vec::with_capacity(rows.len());
         for r in &rows {
             // #2511 — every agtype cell reads through `age_cell_text_*`
             // (see that helper: a `String` decode of AGE's BINARY wire
@@ -12099,6 +12142,9 @@ impl PostgresStore {
                 age_cell_text_required(r, field_names::VALID_FROM, READ_VALID_FROM)?;
             let valid_until_raw = age_cell_text_opt(r, field_names::VALID_UNTIL, READ_VALID_UNTIL)?;
             let observed_by_raw = age_cell_text_opt(r, field_names::OBSERVED_BY, READ_OBSERVED_BY)?;
+            let link_created_at: Option<DateTime<Utc>> = r
+                .try_get::<Option<DateTime<Utc>>, _>("link_created_at")
+                .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
 
             let relation = strip_agtype_quotes(&relation_raw).to_string();
             // #2792 sibling — fail-CLOSED membership guard: the untyped
@@ -12111,20 +12157,48 @@ impl PostgresStore {
                 continue;
             }
 
-            decoded.push(KgTimelineRow {
+            let valid_from = strip_agtype_quotes(&valid_from_raw).to_string();
+            let key = TimelineSortKey {
+                valid_from: timeline_stamp_key(
+                    DateTime::parse_from_rfc3339(&valid_from)
+                        .ok()
+                        .map(|t| t.with_timezone(&Utc)),
+                ),
+                created_at: timeline_stamp_key(link_created_at),
                 target_id: strip_agtype_quotes(&target_id_raw).to_string(),
-                relation,
-                valid_from: strip_agtype_quotes(&valid_from_raw).to_string(),
-                // SQL NULL (absent property) and the agtype scalar `null`
-                // both collapse to `None` — the wire shape the CTE twin
-                // returns for a never-invalidated / unobserved edge.
-                valid_until: valid_until_raw.as_deref().and_then(agtype_optional_string),
-                observed_by: observed_by_raw.as_deref().and_then(agtype_optional_string),
-                // Filled in below by the `memories` join.
-                title: String::new(),
-                target_namespace: String::new(),
-            });
+                relation: relation.clone(),
+            };
+            keyed.push((
+                key,
+                KgTimelineRow {
+                    target_id: strip_agtype_quotes(&target_id_raw).to_string(),
+                    relation,
+                    valid_from,
+                    // SQL NULL (absent property) and the agtype scalar `null`
+                    // both collapse to `None` — the wire shape the CTE twin
+                    // returns for a never-invalidated / unobserved edge.
+                    // #3809 - canonical `Z` stamp, the byte-identical twin of the
+                    // CTE render; an AGE edge written with `+00:00` converges here.
+                    valid_until: valid_until_raw
+                        .as_deref()
+                        .and_then(agtype_optional_string)
+                        .map(|raw| crate::storage::canonicalize_valid_until_stamp(Some(&raw))),
+                    observed_by: observed_by_raw.as_deref().and_then(agtype_optional_string),
+                    // Filled in below by the `memories` join.
+                    title: String::new(),
+                    target_namespace: String::new(),
+                },
+            ));
         }
+
+        // #3810 F8 - final byte-order total key (`valid_from`, relational
+        // `created_at`, then `target_id`, `relation` via `String::cmp`). The
+        // SQL above already chose the survivors on the same key as the CTE
+        // twin (`COLLATE "C"`) and sqlite (BINARY); this sort fixes the order
+        // and the truncate is a belt-and-braces cap.
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.truncate(cap);
+        let mut decoded: Vec<KgTimelineRow> = keyed.into_iter().map(|(_, row)| row).collect();
 
         // Backfill title + namespace in a single round-trip by
         // pulling the unique target ids and joining server-side.
@@ -12225,7 +12299,7 @@ impl PostgresStore {
             next_placeholder += 1;
         }
         sql.push_str(&format!(
-            " ORDER BY ml.valid_from ASC, ml.created_at ASC LIMIT ${next_placeholder}"
+            " ORDER BY ml.valid_from ASC, ml.created_at ASC, ml.target_id COLLATE \"C\" ASC, ml.relation COLLATE \"C\" ASC LIMIT ${next_placeholder}"
         ));
 
         let mut q = sqlx::query(&sql).bind(source_id);
@@ -12269,7 +12343,7 @@ impl PostgresStore {
                     target_id,
                     relation,
                     valid_from: valid_from.to_rfc3339(),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(crate::storage::render_valid_until_stamp),
                     observed_by,
                     title,
                     target_namespace,
@@ -12639,7 +12713,9 @@ impl PostgresStore {
         Ok(KgInvalidateRow {
             found: true,
             valid_until: stamp,
-            previous_valid_until: prior.map(|t| t.to_rfc3339()),
+            // #3809 F10 - canonical `Z` wire stamp, the twin of the AGE
+            // branch's stored graph string.
+            previous_valid_until: prior.map(crate::storage::render_valid_until_stamp),
         })
     }
 
@@ -18941,9 +19017,11 @@ const KG_QUERY_MAX_LIMIT_SAL: usize = 1000;
 /// row cap at all, so a dense graph could materialize every simple path up to
 /// depth 5 (combinatorial) into memory and onto the wire, AND returned a
 /// different result set than sqlite for an identical call. DEGRADE (fewer
-/// rows, deterministic order), never CORRUPT: both branches order by
-/// `(depth ASC, target_id ASC)` before truncating, so the capped page is a
-/// stable prefix of the full result — identical to what sqlite returns.
+/// rows, deterministic order), never CORRUPT: both postgres branches order by
+/// `(depth, target_id, relation, path)` in byte order before truncating, so
+/// the capped page is a stable prefix of the full result. SQLite truncates
+/// after its own temporal key plus the same tie-break (#3893), so the row
+/// COUNT matches and the order is per backend.
 fn kg_query_row_cap(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(KG_QUERY_DEFAULT_LIMIT_SAL)
@@ -18984,6 +19062,24 @@ const LIST_ARCHIVED_SURFACE: &str = "list_archived";
 /// Page size used by [`PostgresStore::recall_hybrid`] when the caller
 /// passes `limit == 0` (also the conversion fallback on the same path).
 const RECALL_FALLBACK_LIMIT_I64: i64 = 10;
+
+/// #3810 F8 - total sort key of one AGE timeline row. Derived `Ord` compares
+/// the fields in declaration order; the strings use byte order, matching the
+/// CTE twin (`COLLATE "C"`) and sqlite (BINARY), never the database locale.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TimelineSortKey {
+    valid_from: (bool, Option<DateTime<Utc>>),
+    created_at: (bool, Option<DateTime<Utc>>),
+    target_id: String,
+    relation: String,
+}
+
+/// One instant of a [`TimelineSortKey`]: an absent one sorts last (the CTE's
+/// default `NULLS LAST`). Two spellings of one instant compare equal, exactly
+/// as the CTE twin compares `TIMESTAMPTZ` values, so no raw-bytes sub-key.
+fn timeline_stamp_key(instant: Option<DateTime<Utc>>) -> (bool, Option<DateTime<Utc>>) {
+    (instant.is_none(), instant)
+}
 
 /// Apply the published timeline page-size policy: default to
 /// [`KG_TIMELINE_DEFAULT_LIMIT_SAL`] when the caller didn't pass a
@@ -24671,7 +24767,7 @@ impl MemoryStore for PostgresStore {
                     signature: None,
                     observed_by,
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(crate::storage::render_valid_until_stamp),
                     attest_level: Some(attest_level),
                     source_cid: None,
                     target_cid: None,
@@ -38216,10 +38312,8 @@ mod tests {
             .find(|l| l.source_id == a_id && l.target_id == b_id)
             .expect("just-inserted edge");
         assert_eq!(row.valid_from.as_deref(), Some("2026-01-01T00:00:00+00:00"));
-        assert_eq!(
-            row.valid_until.as_deref(),
-            Some("2026-12-31T23:59:59+00:00")
-        );
+        // #3809: valid_until is rendered in the canonical `Z` form on read.
+        assert_eq!(row.valid_until.as_deref(), Some("2026-12-31T23:59:59Z"));
         assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
         assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
 
