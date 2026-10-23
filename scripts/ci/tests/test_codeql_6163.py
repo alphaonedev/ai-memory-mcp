@@ -399,6 +399,24 @@ class ComparisonTests(unittest.TestCase):
             self.assertNotIn(CANARY, output)
 
 
+class GitLimitsTests(unittest.TestCase):
+    """#8146: a kernel-refused rlimit must not abort the git child hook."""
+
+    def test_refused_address_space_limit_is_skipped_and_file_limit_still_applied(self):
+        compare = module('compare_8146', 'scripts/claude-md-rule-compare.py')
+        calls = []
+
+        def fake_setrlimit(which, limits):
+            calls.append(which)
+            if which == compare.resource.RLIMIT_AS:
+                raise ValueError('current limit exceeds maximum limit')
+
+        with unittest.mock.patch.object(compare.resource, 'setrlimit', fake_setrlimit):
+            compare.git_limits()
+        self.assertIn(compare.resource.RLIMIT_FSIZE, calls)
+        self.assertIn(compare.resource.RLIMIT_AS, calls)
+
+
 class ResourceTests(unittest.TestCase):
     """Close every descriptor and restore exact fixture permissions."""
 
