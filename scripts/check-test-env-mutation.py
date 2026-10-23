@@ -92,6 +92,9 @@ Any other carrier of a closure into a spawn (#8051: `Box::new(f)`, `f.clone()`, 
 a `for` or match-arm binding, a wrapping closure) is followed through its `let`, assignment and `for`
 bindings; a name that holds a closure makes that initialiser detached, and a carrier that cannot be
 traced (or more than MAX_CARRIER_NAMES) flags every closure of the fn, never credits it.
+A detaching helper in tests/common (#8052), reached as `common::f`, through a `use common::f` or glob
+import, or as `Type::f`, and one in a `#[path = ".."] mod m;` or `mod m;` file of the test (`m::f` or a
+`use m::f` name) detaches the argument of every call of it; an unresolvable call is judged as before.
 A macro_rules! whose body invokes a spawning macro, or a detaching helper, detaches too (#8046): the
 forwarding is closed transitively.
 In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
@@ -240,6 +243,7 @@ MAX_REBIND_HOPS = 8  # #8045: rebinding steps followed from a spawn argument; a 
 MAX_CARRIER_NAMES = 32  # #8051: distinct local names followed from a spawn argument; more flags the whole fn
 ASSIGN = r"(?<![\w.])%s\s*=(?![=>])"  # `g = <init>;` (a re-assignment of a carrier variable)
 LOCAL_NAME = re.compile(r"(?<![\w.:])([A-Za-z_]\w*)\b(?!\s*::)")  # an identifier that is not a path segment or field
+MOD_DECL = re.compile(r'(?:#\[\s*path\s*=\s*"([^"]+)"\s*\]\s*)?(?:pub(?:\([^)]*\))?\s+)?\bmod\s+([A-Za-z_]\w*)\s*;')
 LOOP_BIND = r"\bfor\b[^{};]*\b%s\b[^{};]*\bin\b"  # `for g in <expr> {`
 ARM_BIND = r"(?<![\w.])%s\b\s*(?:[,)|]\s*)*=>"  # a match-arm pattern naming the variable
 PARAM_BIND = r"\|[^|;{}]*\b%s\b[^|;{}]*\|"  # a closure parameter list naming the variable
@@ -1083,6 +1087,8 @@ class CommonModel:
     def __init__(self, root=None):
         self.fns = {}
         self.sources = {}
+        self.detachers = {}  # #8052: key -> (parameter indices handed to a spawn, has_self) for tests/common fns
+        self._mods = {}
         self._strong, self._vars = {}, {}
         self.src_consts = self._src_consts(root)
         base = pathlib.Path(root) / COMMON_REL if root is not None else None
@@ -1094,6 +1100,8 @@ class CommonModel:
                 if not f.is_test:
                     self.fns.setdefault(f.key, f)
                     self.sources[id(f)] = src
+            for key, hit in detaching_fns(src.scrubbed).items():
+                self.detachers.setdefault(key, hit)
 
     @staticmethod
     def _src_consts(root):
@@ -1106,6 +1114,27 @@ class CommonModel:
             for name, value in CONST_STR.findall(path.read_text(encoding="utf-8", errors="replace")):
                 values.setdefault(name, set()).add(value)
         return {name: vals.pop() for name, vals in values.items() if len(vals) == 1}
+
+    def path_modules(self, path, raw):
+        """{module name: detaching_fns} for the `#[path = ".."] mod m;` and `mod m;` files a test file declares
+        (#8052). A file that is missing is skipped; tests/common is the common census, not a module."""
+        out, here = {}, pathlib.Path(path).parent
+        for m in MOD_DECL.finditer(raw):
+            name = m.group(2)
+            if name == "common":
+                continue
+            cands = [here / m.group(1)] if m.group(1) else [here / (name + ".rs"), here / name / "mod.rs"]
+            for cand in cands:
+                if cand not in self._mods:
+                    try:
+                        text = cand.read_text(encoding="utf-8", errors="replace")
+                        self._mods[cand] = detaching_fns(blank_use_items(scrub(text)))
+                    except OSError:
+                        self._mods[cand] = None
+                if self._mods[cand] is not None:
+                    out[name] = self._mods[cand]
+                    break
+        return out
 
     @property
     def free_names(self):
@@ -1153,9 +1182,16 @@ class CommonModel:
 class FileModel:
     """Write sites, their protection sets, lock acquisitions and readers of one tests/*.rs."""
 
-    def __init__(self, scrubbed, raw=None, common=None):
+    def __init__(self, scrubbed, raw=None, common=None, modules=None):
         self.common = common if common is not None else CommonModel()
         self.imports, self.glob = common_imports(scrubbed)
+        self.modules = modules or {}  # #8052: module name -> detaching_fns of its file
+        self.mod_imported = {}  # name -> module it is `use`-imported from
+        for um in USE_ITEM.finditer(scrubbed):
+            for mod in self.modules:
+                if re.search(r"\b%s\s*::" % re.escape(mod), um.group(0)):
+                    for n in IDENT.findall(um.group(0).split(mod, 1)[1]):
+                        self.mod_imported.setdefault(n, mod)
         self.dm = mutation_re(use_aliases(scrubbed))
         scrubbed = blank_use_items(scrubbed)
         self.src = (Source(raw, self.common.src_consts) if raw is not None and len(raw) == len(scrubbed)
@@ -1476,13 +1512,37 @@ class FileModel:
                 hit = self.resolve(fn.owner, m.group(1), m.group(2))
                 cands = [hit] if hit is not None else []
             args = None
-            for c in cands:
-                for i in self.helpers.get(id(c), ()):
+            hits = [(self.helpers.get(id(c), ()), c.has_self) for c in cands]
+            if not cands:
+                hits += self.external_helpers(m.group(1), m.group(2), method)
+            for idxs, has_self in hits:
+                for i in idxs:
                     args = split_top_level(body, m.end(), match_paren(body, m.end() - 1) - 1) if args is None else args
-                    j = i + (0 if method or not c.has_self else 1)
+                    j = i + (0 if method or not has_self else 1)
                     if j < len(args):
                         out.append(args[j])
         return out
+
+    def external_helpers(self, prefix, name, method):
+        """[(parameter indices, has_self)] of the detaching fns outside this file that a call may reach (#8052):
+        `common::f`, a `use`-imported or glob-imported tests/common name, `Type::f` of an imported common type,
+        `m::f` of a declared module file, or a `use`-imported name of one; a method call matches any common
+        method of that name. An unresolvable call is none."""
+        segs, table = path_segments(prefix), self.common.detachers
+        if method:
+            return [hit for key, hit in table.items() if key.endswith("::" + name) and hit[1]]
+        if not segs:
+            if name in self.mod_imported:
+                return [h] if (h := self.modules[self.mod_imported[name]].get(name)) else []
+            return [h] if (name in self.imports or self.glob) and (h := table.get(name)) else []
+        if segs[-1] in self.modules:
+            return [h] if (h := self.modules[segs[-1]].get(name)) else []
+        if "common" in segs:
+            key = name if segs[-1] == "common" else "%s::%s" % (segs[-1], name)
+            return [h] if (h := table.get(key)) else []
+        if segs[-1] in self.imports or self.glob:
+            return [h] if (h := table.get("%s::%s" % (segs[-1], name))) else []
+        return []
 
     def carried(self, body, a, b):
         """(spans, texts, over) for the spawn argument body[a:b] (#8051): every identifier in the argument,
@@ -1927,9 +1987,16 @@ class FileModel:
         return res
 
 
-def violating_fns(scrubbed, raw=None, common=None):
+def detaching_fns(scrubbed):
+    """{fn key: (parameter indices handed to a spawn, has_self)} of one scrubbed file (#8052): the same-file
+    #8044 fixpoint, run on a tests/common or module file so a call of its fns from a test file detaches."""
+    model = FileModel(scrubbed)
+    return {f.key: (frozenset(model.helpers[id(f)]), f.has_self) for f in model.fns if model.helpers.get(id(f))}
+
+
+def violating_fns(scrubbed, raw=None, common=None, modules=None):
     """Names (qualified) of violating test fns in one scrubbed file, or [] when the file is exempt."""
-    model = FileModel(scrubbed, raw, common)
+    model = FileModel(scrubbed, raw, common, modules)
     if not model.required or len(model.tests) < 2:
         return []
     out = []
@@ -1947,7 +2014,7 @@ def scan_file(path, common=None):
     scrubbed = scrub(raw, comments)
     if process_isolated(raw, comments):
         return []
-    return violating_fns(scrubbed, raw, common)
+    return violating_fns(scrubbed, raw, common, common.path_modules(path, raw) if common is not None else None)
 
 
 def process_isolated(raw, comments):

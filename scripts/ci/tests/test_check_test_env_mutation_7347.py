@@ -1642,6 +1642,73 @@ class Issue8051(Fixture):
         self.check("let g = Box::new(f0);\n    g();", set())
 
 
+class Issue8052(Fixture):
+    """#8052: a detaching helper outside the file (tests/common, a use-imported name, a `#[path]` or `mod` file)
+    detaches the argument of every call of it; a helper that runs its parameter inline does not."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    BG = "pub fn bg<F: FnOnce() + Send + 'static>(f: F) { std::thread::spawn(f); }\n"
+    INLINE = "pub fn bg<F: FnOnce()>(f: F) { f() }\n"
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def put_common(self, text):
+        (SCRATCH / "tests" / "common").mkdir(exist_ok=True)
+        (SCRATCH / "tests" / "common" / "mod.rs").write_text(text)
+
+    def test_a_qualified_common_helper_detaches(self):
+        self.put_common(self.BG)
+        text = WRITER + self.LOCKED % ("common::bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_use_imported_common_helper_detaches(self):
+        self.put_common(self.BG)
+        text = "use common::bg;\n" + WRITER + self.LOCKED % ("bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_glob_imported_common_helper_detaches(self):
+        self.put_common(self.BG)
+        text = "use common::*;\n" + WRITER + self.LOCKED % ("bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_closure_variable_handed_to_a_common_helper_detaches(self):
+        self.put_common(self.BG)
+        text = WRITER + self.LOCKED % ("let work = move || { %s };\n    common::bg(work);" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_common_helper_that_forwards_to_another_detaches(self):
+        self.put_common(self.BG + "pub fn outer<F: FnOnce() + Send + 'static>(g: F) { bg(g); }\n")
+        text = WRITER + self.LOCKED % ("common::outer(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_path_module_helper_detaches(self):
+        (SCRATCH / "tests" / "support").mkdir()
+        (SCRATCH / "tests" / "support" / "spawn.rs").write_text(self.BG)
+        text = '#[path = "support/spawn.rs"]\nmod sp;\n' + WRITER + self.LOCKED % ("sp::bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_use_imported_path_module_helper_detaches(self):
+        (SCRATCH / "tests" / "support").mkdir()
+        (SCRATCH / "tests" / "support" / "spawn.rs").write_text(self.BG)
+        text = ('#[path = "support/spawn.rs"]\nmod sp;\nuse sp::bg;\n' + WRITER
+                + self.LOCKED % ("bg(move || { %s });" % self.OPEN))
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_common_helper_that_runs_its_parameter_inline_keeps_the_lock(self):
+        self.put_common(self.INLINE)
+        text = WRITER + self.LOCKED % ("common::bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+    def test_a_path_module_helper_that_runs_inline_keeps_the_lock(self):
+        (SCRATCH / "tests" / "support").mkdir()
+        (SCRATCH / "tests" / "support" / "spawn.rs").write_text(self.INLINE)
+        text = '#[path = "support/spawn.rs"]\nmod sp;\n' + WRITER + self.LOCKED % ("sp::bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+    def test_an_unresolvable_call_stays_as_before(self):
+        text = WRITER + self.LOCKED % ("elsewhere::bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+
 class Issue8046(Fixture):
     """#8046: a macro whose body invokes a detaching macro detaches the arguments of its own invocations."""
 
