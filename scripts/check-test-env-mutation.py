@@ -2165,6 +2165,26 @@ def module_names(scrubbed):
             if m and m.group(1)[0] != "$"}
 
 
+def alias_closure(texts, mods):
+    """r25 (R24-1): the module names `mods` plus every name a `use` item binds to a module of the test crate:
+    `use m as n;`, `use crate::m as n;`, `use self::m as n;`, `use super::m as n;`, `use m::{self as n};`, `pub use`,
+    and an alias of an alias (`use n as o;`) in any order of the items. An import rooted at such a name is an import
+    from the test crate, whatever its spelling; the set grows until no `use` item adds a name."""
+    mods = set(mods)
+    leaves = [leaf for text in texts for item in USE_ITEM.finditer(text) for leaf in use_leaves(item.group(0))]
+    while True:
+        found = set()
+        for path, name in leaves:
+            p = list(path)
+            while p and p[0] in FILE_ROOTS:
+                p = p[1:]
+            if name not in (None, "_") and p and all(seg in mods for seg in p):
+                found.add(name)
+        if found <= mods:
+            return mods
+        mods |= found
+
+
 class ModuleSet(set):
     """The macro_rules! names in textual scope of one test file (r23); `texts` holds the scrubbed text of every module
     or include! file its walk read, and MACRO_OPEN is a member when the walk could not read or parse some target."""
@@ -2519,6 +2539,8 @@ class FileModel:
         # r24: the modules the file declares, itself or in its module / include! files; an import rooted at one is an
         # import from the test crate (tests/common is a census of its own)
         self.local_mods = (module_names(scrubbed).union(*[module_names(t) for t in self.module_texts])) - {"common"}
+        # r25 (R24-1): a `use` alias of such a module is a root of the test crate too, transitively
+        self.local_mods = alias_closure([scrubbed] + self.module_texts, self.local_mods) - {"common"}
         self.imports, self.glob = common_imports(scrubbed)
         self.modules = modules or {}  # #8052: module name -> detaching_fns of its file
         self.mod_imported = {}  # name -> module it is `use`-imported from
@@ -3327,7 +3349,7 @@ class FileModel:
                 common = "common" in path
                 if name is not None and name != "_":
                     self.import_paths[name] = path
-                if path[0] in STD_ROOTS:
+                if path[0] in STD_ROOTS and path[0] not in self.local_mods:  # r25: a module aliased `as std` is no std path
                     if name is not None:
                         self.std_names[name] = path
                 elif name is None:

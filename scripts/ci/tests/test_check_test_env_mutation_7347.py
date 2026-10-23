@@ -4005,6 +4005,123 @@ class ReviewR24Mutants(unittest.TestCase):
             shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
+# REVIEW-7349 code r24 (umbrella #8168, R24-1): a `use` alias of a module the test declares is a root of the test
+# crate too, transitively (`use m as n; use n as o; use o::fan;`), whatever the spelling of the aliased path.
+R25_ALIASES = (  # (alias items, the last import: the trait is looked up behind it)
+    ("use m as n;", "use n::fan;"),
+    ("use crate::m as n;", "use n::fan;"),
+    ("use self::m as n;", "use n::fan;"),
+    ("use m::{self as n};", "use n::fan;"),
+    ("use {m as n};", "use n::fan;"),
+    ("pub use m as n;", "use n::fan;"),
+    ("pub(crate) use m as n;", "use n::{fan};"),
+    ("use m as n;\nuse n as o;", "use o::fan;"),
+    ("use m as n;\nuse n as o;\nuse o as p;", "use p::fan;"),
+    ("use n as o;\nuse m as n;", "use o::fan;"),  # the order of the `use` items does not matter
+    ("use m as tokio;", "use tokio::fan;"),  # an alias that shadows the name of a crate
+    ("use m as std;", "use std::fan;"),
+    ("use m as n;", "use crate::n::fan;"),
+)
+
+
+def r25_alias_rows():
+    """Every alias shape over a file module and an inline module: a trait behind the alias is found, a struct is
+    not; `use n::*;` through the alias is a glob (any method); an alias of something that is no local module is
+    none."""
+    rows = []
+    decls = [("mod m;", {"tests/m.rs": "{I}"}), ("pub mod m;", {"tests/m.rs": "{I}"}), ("mod m { {I} }", {}),
+             ("mod m;", {"tests/m/mod.rs": "{I}"})]
+    for decl, files in decls:
+        for aliases, last in R25_ALIASES:
+            for item, flagged in (R23_FAN, True), (R23_STRUCT, False):
+                put = {k: v.replace("{I}", item) for k, v in files.items()}
+                rows.append((decl.replace("{I}", item) + "\n" + aliases + "\n" + last + "\n", R20_MAP, flagged, put))
+    inline = "mod w { %s\nuse n::fan; }\n"  # the alias and the import in an inline module, the path through super
+    for alias in ("use super::m as n;", "use crate::m as n;", "use self::inner as n;"):
+        for item, flagged in (R23_FAN, True), (R23_STRUCT, False):
+            put = {"tests/m.rs": item}
+            if "inner" in alias:
+                rows.append(("mod w { mod inner { %s }\n%s\nuse n::fan; }\n" % (item, alias), R20_MAP, flagged, {}))
+            else:
+                rows.append(("mod m;\n" + inline % alias, R20_MAP, flagged, put))
+    nested = "mod m { pub mod inner { %s } }\n"
+    for aliases in ("use m::inner as n;", "use m::{inner as n};", "use crate::m::inner as n;"):
+        for item, flagged in (R23_FAN, True), (R23_STRUCT, False):
+            rows.append((nested % item + aliases + "\nuse n::fan;\n", R20_MAP, flagged, {}))
+    for item in (R23_FAN, R23_STRUCT):  # a glob through the alias supplies any method, a trait or not
+        rows.append(("mod m;\nuse m as n;\nuse n::*;\n", R20_MAP, True, {"tests/m.rs": item}))
+    # controls: an alias of an item that is no local module stays what it was
+    rows += [
+        ("use other::m as n;\nuse n::fan;\n", R20_MAP, False, {}),
+        ("mod m;\nuse other::m as n;\nuse n::fan;\n", R20_MAP, False, {"tests/m.rs": R23_FAN}),
+        ("mod m;\nuse m as _;\nuse n::fan;\n", R20_MAP, False, {"tests/m.rs": R23_FAN}),
+        ("mod m;\nuse m::fan as n;\nuse n::g;\n", R20_MAP, False, {"tests/m.rs": R23_STRUCT}),
+    ]
+    return rows
+
+
+class ReviewR25(Positive):
+    """REVIEW-7349 code r24 (umbrella #8168, R24-1): an alias of a local module enters local_mods, transitively."""
+
+    def test_the_three_reviewer_probes(self):
+        for head in ("mod m;\nuse m as n;\nuse n::fan;\n", "mod m;\nuse crate::m as n;\nuse n::fan;\n",
+                     "mod m;\nuse m::{self as n};\nuse n::fan;\n"):
+            with self.subTest(head=head):
+                r20_write((head, R20_MAP, True, {"tests/m.rs": R23_FAN}))
+                self.assertEqual(self.scan(), FLAGGED)
+                rc = gate.main(["--root", str(SCRATCH)])
+                self.assertEqual(rc, 1)
+
+    def test_every_alias_shape_is_decided_from_the_definition(self):
+        rows = r25_alias_rows()
+        self.assertGreater(len(rows), 100)
+        for row in rows:
+            with self.subTest(head=row[0], files=dict(sorted(row[3].items()))):
+                r20_write(row)
+                self.assertEqual(self.scan(), FLAGGED if row[2] else set())
+
+    def test_the_alias_closure_is_a_fixpoint_of_the_use_items(self):
+        mods = gate.alias_closure(["use c as d;\nuse b as c;\nuse a as b;\nuse x as y;"], {"a"})
+        self.assertEqual(mods, {"a", "b", "c", "d"})
+        self.assertEqual(gate.alias_closure(["use crate::a::{self as b, c as d};\nuse super::b as e;"], {"a"}),
+                         {"a", "b", "e"})
+        self.assertEqual(gate.alias_closure(["use a as _;\nuse a::*;"], {"a"}), {"a"})
+
+
+R25_MUTANTS = (  # (name, original text, mutated text): each must turn a row of ReviewR25 RED
+    ("alias_closure_off", "alias_closure([scrubbed] + self.module_texts, self.local_mods) - {\"common\"}", "self.local_mods"),
+    ("alias_single_pass", "        if found <= mods:\n            return mods\n", "        return mods | found\n"),
+    ("alias_prefix_kept", "        while p and p[0] in FILE_ROOTS:", "        while False:"),
+    ("std_root_shadow_off", "if path[0] in STD_ROOTS and path[0] not in self.local_mods:", "if path[0] in STD_ROOTS:"),
+    ("alias_any_segment", "and all(seg in mods for seg in p)", "and any(seg in mods for seg in p)"),
+)
+
+
+class ReviewR25Mutants(unittest.TestCase):
+    """Each named mutant of the alias closure is applied to the whole gate source and turns a row of ReviewR25 RED."""
+
+    def test_each_named_mutant_turns_a_row_red(self):
+        src = GATE.read_text()
+        rows = r25_alias_rows()
+        for name, old, new in R25_MUTANTS:
+            with self.subTest(mutant=name):
+                self.assertEqual(src.count(old), 1, old)
+                mod = types.ModuleType("r25_mutant_" + name)
+                mod.__file__ = str(GATE)
+                sys.modules[mod.__name__] = mod
+                exec(compile(src.replace(old, new), str(GATE), "exec"), mod.__dict__)
+                try:
+                    red = False
+                    for row in rows:
+                        r20_write(row)
+                        if bool(mod.scan_tree(SCRATCH)) != row[2]:
+                            red = True
+                            break
+                    self.assertTrue(red, "the %s mutant stays GREEN" % name)
+                finally:
+                    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+
 # G4 (REVIEW-7349-r20): the exact trust tables, as literals; they are the whole of the credit side of callee_origin.
 PINNED_FN_PATHS = frozenset((
     ("std", "panic", "catch_unwind"), ("std", "panic", "AssertUnwindSafe"), ("core", "panic", "AssertUnwindSafe"),
