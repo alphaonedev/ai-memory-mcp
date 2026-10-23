@@ -3538,6 +3538,183 @@ class ReviewR21(Positive):
         self.run_rows("N3")
 
 
+# REVIEW-7349 code r22 (umbrella #8168, R22-1 and R22-2), the CLASS fix: the gate fails closed on every module or
+# include! target it cannot resolve, read or fully parse. The sweep below crosses attribute orderings, include!
+# argument spellings and trait locations; each row is correctly indexed (decided from the definition it reads) or
+# the tree is open (a lowercase leaf may be a trait, no bare macro name is trusted). A row is (head, body, flagged,
+# files) as in R20_PROBES.
+R23_FAN = "pub trait fan { fn map(self, f: u8); }\n"
+R23_STRUCT = "pub struct fan;\n"
+R23_PATH = '#[path = "../gen/fan.rs"]'
+R23_PATH_FORMS = ['#[path = "../gen/fan.rs"]', '#[path = r"../gen/fan.rs"]', '#[path = r#"../gen/fan.rs"#]',
+                  '#[path="../gen/fan.rs"]']
+R23_ORDERS = ["{P}", "#[cfg(unix)]\n{P}", "{P}\n#[cfg(unix)]", "#[cfg(unix)]\n{P}\n#[allow(dead_code)]",
+              "#[macro_use]\n{P}", "{P}\n#[macro_use]", '#[doc = "x"]\n{P}\n#[macro_use]\n#[cfg(all(unix, not(windows)))]',
+              "#[macro_use]\n#[cfg(feature = \"a\")]\n{P}\n#[cfg(unix)]"]
+R23_INCLUDES_OK = ['include!("{F}");', 'include!(r"{F}");', 'include!(r#"{F}"#);', 'include!["{F}"];',
+                   'include!("{F}",);', 'include ! ( "{F}" ) ;', 'std::include!("{F}");']
+R23_INCLUDES_OPEN = ['include!(concat!(env!("OUT_DIR"), "/{F}"));', 'include!(env!("OUT_DIR"));', "include!(PATH);",
+                     'include!("{F}" );include!(concat!("a", "b"));', 'include!("a\\\\b.rs");',
+                     'include!(r"{F}" "x");', "include!();"]
+
+
+def r23_src(lib, files, use, flagged):
+    """A src/ row: the tests import `use` (a lowercase leaf) from a crate whose src/lib.rs and files are given."""
+    return ("use ai_memory::%s;\n" % use, R20_MAP, flagged, dict(files, **{"Cargo.toml": R20_CARGO, "src/lib.rs": lib}))
+
+
+def r23_macro(head, files, flagged, body=R20_JOIN):
+    """A test-file row: a bare `join!` is shadowed (flagged) or not by the module files the head declares."""
+    return (R18_BODY + "use tokio::join;\n" + head, body, flagged, files)
+
+
+def r23_src_rows():
+    rows = []
+    for form in R23_PATH_FORMS:  # attribute orderings x path literal spellings: indexed, so a trait is found, a struct is not
+        for order in R23_ORDERS:
+            lib = order.replace("{P}", form) + "\npub mod fan;\n"
+            rows.append(r23_src(lib, {"gen/fan.rs": R23_FAN}, "fan::fan", True))
+            rows.append(r23_src(lib, {"gen/fan.rs": R23_STRUCT}, "fan::fan", False))
+    for inc in R23_INCLUDES_OK:  # include! spellings that name a file: indexed
+        lib = inc.replace("{F}", "../gen/fan.rs") + "\n"
+        rows.append(r23_src(lib, {"gen/fan.rs": R23_FAN}, "fan", True))
+        rows.append(r23_src(lib, {"gen/fan.rs": R23_STRUCT}, "fan", False))
+    for inc in R23_INCLUDES_OPEN:  # include! spellings the gate cannot read: open, so the lowercase leaf is no proof
+        for lib in (inc.replace("{F}", "x.rs") + "\n", "pub mod a;\n", "pub mod a { %s }\n" % inc.replace("{F}", "x.rs")):
+            files = {"src/a.rs": inc.replace("{F}", "x.rs") + "\n"} if lib == "pub mod a;\n" else {}
+            rows.append(r23_src(lib, files, "a::fan", True))
+            rows.append(r23_src(lib, files, "fan", True))
+    # trait locations: inline, a submodule of a #[path] file (R22-1 m1), nested modules, an include!d file
+    rows += [
+        r23_src("pub mod m { pub trait fan { fn map(self, f: u8); } }\n", {}, "m::fan", True),
+        r23_src("pub mod m { pub struct fan; }\n", {}, "m::fan", False),
+        r23_src('#[path = "../gen/mod.rs"]\npub mod g;\n', {"gen/mod.rs": "pub mod fan;\n", "gen/fan.rs": R23_FAN}, "g::fan::fan", True),
+        r23_src('#[path = "../gen/mod.rs"]\npub mod g;\n', {"gen/mod.rs": "pub mod fan;\n", "gen/fan.rs": R23_STRUCT}, "g::fan::fan", False),
+        r23_src('#[path = "../gen/g.rs"]\npub mod g;\n', {"gen/g.rs": "pub mod fan;\n", "gen/fan.rs": R23_FAN}, "g::fan::fan", True),
+        r23_src('#[macro_use]\n#[path = "../gen/g.rs"]\npub mod g;\n', {"gen/g.rs": "pub mod fan;\n", "gen/fan.rs": R23_FAN}, "g::fan::fan", True),
+        r23_src("pub mod a;\n", {"src/a.rs": "pub mod b;\n", "src/a/b.rs": R23_FAN}, "a::b::fan", True),
+        r23_src("pub mod a;\n", {"src/a.rs": "pub mod b;\n", "src/a/b.rs": R23_STRUCT}, "a::b::fan", False),
+        r23_src("pub mod a;\n", {"src/a/mod.rs": "pub mod b;\n", "src/a/b/mod.rs": R23_FAN}, "a::b::fan", True),
+        r23_src("pub mod a { pub mod b; }\n", {"src/a/b.rs": R23_FAN}, "a::b::fan", True),
+        r23_src('include!("../gen/inc.rs");\n', {"gen/inc.rs": "pub mod fan;\n", "src/fan.rs": R23_FAN}, "fan::fan", True),
+        r23_src('pub mod a;\n', {"src/a.rs": 'include!("../../gen/fan.rs");\n', "gen/fan.rs": R23_FAN}, "a::fan", True),
+    ]
+    # unresolvable targets, wherever they sit: the tree is open
+    for lib, files in (
+        ('#[path = "nope.rs"]\npub mod nope;\n', {}),
+        ("pub mod nope;\n", {}),
+        ('#[cfg_attr(unix, path = "../gen/fan.rs")]\npub mod fan;\n', {"gen/fan.rs": R23_STRUCT}),
+        ('#[path = concat!("../gen/", "fan.rs")]\npub mod fan;\n', {"gen/fan.rs": R23_STRUCT}),
+        ('#[path = "../gen/g.rs"]\npub mod g;\n', {"gen/g.rs": "pub mod missing;\n"}),
+        ('#[path = "../gen/g.rs"]\npub mod g;\n', {"gen/g.rs": 'include!(concat!(env!("OUT_DIR"), "/x.rs"));\n'}),
+        ("pub mod a;\n", {"src/a.rs": "pub mod b;\n", "src/a/b.rs": "pub mod gone;\n"}),
+        ('#[path = "x.rs"]\n#[path = "y.rs"]\npub mod fan;\n', {"src/x.rs": "pub struct other;\n"}),
+    ):
+        rows.append(r23_src(lib, files, "nope::fan", True))
+        rows.append(r23_src(lib, files, "fan", True))
+    return rows
+
+
+def r23_macro_rows():
+    rows, shadow, plain = [], R19_SHADOW % "join", "pub fn f() {}\n"
+    for form in ('#[path = "support/rt.rs"]', '#[path = r"support/rt.rs"]', '#[path = r#"support/rt.rs"#]'):
+        for order in R23_ORDERS:
+            head = order.replace("{P}", form) + "\nmod rt;\n"
+            rows.append(r23_macro(head, {"tests/support/rt.rs": shadow}, True))
+            rows.append(r23_macro(head, {"tests/support/rt.rs": plain}, False))
+    for inc in R23_INCLUDES_OK:
+        head = inc.replace("{F}", "shadow.rs") + "\n"
+        rows.append(r23_macro(head, {"tests/shadow.rs": shadow}, True))
+        rows.append(r23_macro(head, {"tests/shadow.rs": plain}, False))
+    for inc in R23_INCLUDES_OPEN:  # unreadable: a bare macro is untrusted, a qualified one is still trusted
+        head = inc.replace("{F}", "shadow.rs") + "\n"
+        rows.append(r23_macro(head, {}, True))
+        rows.append(r23_macro(head, {}, False, R18_BLOCK_ON % "tokio::join!(body());"))
+    rows += [
+        r23_macro("mod rt;\n", {"tests/rt.rs": "pub mod b;\n", "tests/rt/b.rs": shadow}, True),
+        r23_macro("mod rt;\n", {"tests/rt/mod.rs": "pub mod b;\n", "tests/rt/b/mod.rs": shadow}, True),
+        r23_macro('#[path = "g/mod.rs"]\nmod rt;\n', {"tests/g/mod.rs": "mod b;\n", "tests/g/b.rs": shadow}, True),
+        r23_macro('#[path = "g/mod.rs"]\nmod rt;\n', {"tests/g/mod.rs": "mod b;\n", "tests/g/b.rs": plain}, False),
+        r23_macro("mod gone;\n", {}, True),
+        r23_macro("mod gone;\n", {}, False, R18_BLOCK_ON % "tokio::join!(body());"),
+        r23_macro("mod rt { mod inner; }\n", {"tests/rt/inner.rs": shadow}, True),
+        r23_macro("mod rt;\n", {"tests/rt.rs": 'include!(concat!(env!("OUT_DIR"), "/x.rs"));\n'}, True),
+        r23_macro("mod rt;\n", {"tests/rt.rs": '#[path = "rt.rs"]\nmod rt;\n'}, False),
+    ]
+    return rows
+
+
+def r23_test_crate_rows():
+    """A trait of a module file of the test crate is read from that file; an unreadable target opens the crate."""
+    head = "mod fan;\nuse crate::fan::fan;\n"
+    return [
+        ("mod fan;\nuse crate::fan::fan;\n", R20_MAP, True, {"tests/fan.rs": R23_FAN}),
+        ("mod fan;\nuse crate::fan::fan;\n", R20_MAP, False, {"tests/fan.rs": R23_STRUCT}),
+        ('#[path = "x/y.rs"]\nmod fan;\nuse crate::fan::fan;\n', R20_MAP, True, {"tests/x/y.rs": R23_FAN}),
+        ('#[macro_use]\n#[path = "x/y.rs"]\nmod fan;\nuse crate::fan::fan;\n', R20_MAP, True, {"tests/x/y.rs": R23_FAN}),
+        ("mod fan;\nuse self::fan::fan;\n", R20_MAP, True, {"tests/fan.rs": R23_FAN}),
+        (head + 'include!(concat!(env!("OUT_DIR"), "/x.rs"));\n', R20_MAP, True, {"tests/fan.rs": "pub struct other;\n"}),
+        ("mod gone;\nuse crate::gone::fan;\n", R20_MAP, True, {}),
+        ('include!("inc.rs");\nuse crate::fan;\n', R20_MAP, True, {"tests/inc.rs": R23_FAN}),
+        ('include!("inc.rs");\nuse crate::fan;\n', R20_MAP, False, {"tests/inc.rs": R23_STRUCT}),
+    ]
+
+
+class ReviewR23(Positive):
+    """REVIEW-7349 code r22 (umbrella #8168, R22-1 and R22-2): the class sweep. Every row is decided as its flag says:
+    a target the gate reads is indexed, a target it cannot read or parse leaves the tree open (fails closed)."""
+
+    def run_rows(self, rows):
+        self.assertTrue(rows)
+        for row in rows:
+            with self.subTest(head=row[0], body=row[1], files=dict(sorted(row[3].items()))):
+                r20_write(row)
+                self.assertEqual(self.scan(), FLAGGED if row[2] else set())
+
+    def test_src_trait_locations_attribute_orders_and_include_spellings(self):
+        self.run_rows(r23_src_rows())
+
+    def test_macro_shadow_locations_attribute_orders_and_include_spellings(self):
+        self.run_rows(r23_macro_rows())
+
+    def test_the_test_crate_module_files_are_indexed_or_fail_closed(self):
+        self.run_rows(r23_test_crate_rows())
+
+    def test_reviewer_probes_m1_m3_m4_m5(self):
+        shadow = R19_SHADOW % "join"
+        self.run_rows([
+            # m1: a plain `mod fan;` under a #[path]-reached gen/mod.rs
+            r23_src('#[path = "../gen/mod.rs"]\npub mod g;\n', {"gen/mod.rs": "pub mod fan;\n", "gen/fan.rs": R23_FAN}, "g::fan::fan", True),
+            # m3: a raw string include!
+            r23_macro('include!(r"shadow.rs");\n', {"tests/shadow.rs": shadow}, True),
+            # m4: #[path] before #[macro_use]
+            r23_macro('#[path = "support/rt.rs"]\n#[macro_use]\nmod rt;\n', {"tests/support/rt.rs": shadow}, True),
+            # m5: an OUT_DIR include!
+            r23_src('include!(concat!(env!("OUT_DIR"), "/fan.rs"));\n', {}, "fan", True),
+        ])
+
+    def test_an_unresolved_target_is_named_in_the_diagnostics(self):
+        r20_write(r23_src("pub mod nope;\n", {}, "fan", True))
+        found = []
+        gate.scan_tree(SCRATCH, found)
+        self.assertEqual(len(found), 1)
+        self.assertIn("src/lib.rs", found[0])
+        self.assertIn("nope", found[0])
+        r20_write(r23_macro('include!(concat!(env!("OUT_DIR"), "/x.rs"));\n', {}, True))
+        found = []
+        gate.scan_tree(SCRATCH, found)
+        self.assertEqual(len(found), 1)
+        self.assertIn("tests/a.rs", found[0])
+        self.assertIn("include!", found[0])
+
+    def test_a_fully_resolved_tree_has_no_diagnostics(self):
+        for row in (r23_src_rows()[0], r23_macro_rows()[0], r23_test_crate_rows()[0]):
+            r20_write(row)
+            found = []
+            gate.scan_tree(SCRATCH, found)
+            self.assertEqual(found, [])
+
+
 # G4 (REVIEW-7349-r20): the exact trust tables, as literals; they are the whole of the credit side of callee_origin.
 PINNED_FN_PATHS = frozenset((
     ("std", "panic", "catch_unwind"), ("std", "panic", "AssertUnwindSafe"), ("core", "panic", "AssertUnwindSafe"),
