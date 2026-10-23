@@ -2458,6 +2458,7 @@ class FormInventory(Positive):
             ("turbofish_std", True, "", "Vec::<u8>::new().iter().for_each(%s);" % cl, None),
             ("turbofish_other", False, "", "vec![1u8].iter().collect::<ai_memory::pool::Pool>().for_each(%s);" % cl, None),
             ("block_root", False, "", "let _r = { vec![1u8] }.iter().for_each(%s);" % cl, None),
+            ("container_trait", False, "use ai_memory::pool::Fan;\n", "vec![1u8].for_each(%s);" % cl, None),
         ]
 
     def run_probe(self, form, ok, head, body, template):
@@ -2961,6 +2962,113 @@ class Issue8124(Positive):
                 self.check(body % self.OPEN_BLOCK, head=head)
 
 
+# r12 (REVIEW-7349-r18, #8136-#8139): the credit side trusts a callee by its RESOLVED path, never by its name. Each row
+# is (head, body, flagged); the ONE table feeds the issue classes and the issue mutants below.
+R18_CL = "move || { %s }" % Positive.OPEN
+R18_BODY = 'async fn body() { let _c = db::open(":memory:"); }\n'
+R18_BLOCK_ON = "futures::executor::block_on(async { %s });"
+R18_FAN = "use ai_memory::pool::Fan;\n"
+R18_PROBES = {
+    8136: [
+        (R18_BODY, R18_BLOCK_ON % "ai_memory::pool::join!(body());", True),
+        (R18_BODY + "use ai_memory::pool::join;\n", R18_BLOCK_ON % "join!(body());", True),
+        (R18_BODY, R18_BLOCK_ON % "ai_memory::pool::select!(body());", True),
+        (R18_BODY, R18_BLOCK_ON % "ai_memory::pool::detach!(body());", True),
+        (R18_BODY + "macro_rules! join { ($e:expr) => { $e }; }\n", R18_BLOCK_ON % "join!(body());", True),
+        (R18_BODY, R18_BLOCK_ON % "tokio::join!(body());", False),
+        (R18_BODY + "use futures::join;\n", R18_BLOCK_ON % "join!(body());", False),
+        (R18_BODY + "use tokio::join as j;\n", R18_BLOCK_ON % "j!(body());", False),
+    ],
+    8137: [
+        (R18_FAN, "vec![1u8].for_each(%s);" % R18_CL, True),
+        (R18_FAN, "let v = vec![1u8];\n    v.for_each(%s);" % R18_CL, True),
+        (R18_FAN, "[1u8].for_each(%s);" % R18_CL, True),
+        (R18_FAN, "let _x: Vec<u8> = vec![1u8].map(%s);" % R18_CL, True),
+        (R18_FAN, "vec![1u8].iter().for_each(%s);" % R18_CL, True),
+        ("", "vec![1u8].iter().for_each(%s);" % R18_CL, False),
+        ("", "let v = vec![1u8];\n    v.iter().for_each(%s);" % R18_CL, False),
+        ("use tower::ServiceExt as _;\n", "Some(1u8).map(%s);" % R18_CL, False),
+    ],
+    8138: [
+        ("use ai_memory::pool::PoolExt;\n", "let _n = PoolExt::name(&0u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
+        ("use ai_memory::pool::PoolExt;\n", "let _n = PoolExt::name::<u8>(&0u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
+        ("use ai_memory::pool::PoolExt;\n", "let _n = <u8 as PoolExt>::name(&0u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, True),
+        ("use ai_memory::pool::Pool;\n", "let _p = Pool::new();\n    vec![1u8].iter().for_each(%s);" % R18_CL, False),
+        ("use ai_memory::pool::Pool;\n", "let _p = Pool::from_parts(&1u8, 2u8);\n    vec![1u8].iter().for_each(%s);" % R18_CL, False),
+    ],
+    8139: [
+        ("", "let f = async || { %s };\n    futures::executor::block_on(f());" % Positive.OPEN, False),
+        ("", "let f = || async { %s };\n    futures::executor::block_on(f());" % Positive.OPEN, False),
+        ("", "let f = async move || { %s };\n    futures::executor::block_on(f());" % Positive.OPEN, False),
+        ("", "let f = async || { %s };\n    ai_memory::pool::run_elsewhere(f());" % Positive.OPEN, True),
+        ("", "let f = || async { %s };\n    ai_memory::pool::run_elsewhere(f());" % Positive.OPEN, True),
+        ("", "let f = async || { %s };\n    let g = f();\n    ai_memory::pool::run_elsewhere(g);" % Positive.OPEN, True),
+        ("", "let f = async || { %s };\n    ai_memory::pool::run_elsewhere(f);" % Positive.OPEN, True),
+        ("", "ai_memory::pool::run_elsewhere((async || { %s })());" % Positive.OPEN, True),
+    ],
+}
+
+
+class ReviewR18(Positive):
+    """REVIEW-7349-r18: every row of R18_PROBES is decided as its flag says."""
+
+    def run_rows(self, issue):
+        for head, body, flagged in R18_PROBES[issue]:
+            with self.subTest(head=head, body=body):
+                self.check(body, FLAGGED if flagged else set(), head=head)
+
+    def test_8136_a_macro_is_trusted_by_its_resolved_path_only(self):
+        self.run_rows(8136)
+
+    def test_8137_a_container_method_is_not_trusted_while_a_crate_trait_may_supply_it(self):
+        self.run_rows(8137)
+
+    def test_8138_a_trait_called_through_its_path_still_provides_methods(self):
+        self.run_rows(8138)
+
+    def test_8139_an_async_closure_run_by_a_resolved_runner_is_clean(self):
+        self.run_rows(8139)
+
+
+R18_MUTANTS = (  # (issue, FileModel method, original text, mutated text): the mutant must turn a probe of its issue RED
+    (8136, "await_macro_arg", "self.callee_origin(path_segments(m.group(1)), m.group(2), CALLEE_MACRO) == STD",
+     'm.group(2) in ("join", "try_join", "select")'),
+    (8137, "span_safe", "if lit and self.trait_risk and direct and", "if False and"),
+    (8138, "_index_imports", "not self.type_use(n, text)", "not re.search(r\"(?<![\\w$'])%s\\b\" % re.escape(n), text)"),
+    (8139, "same_thread", "if ASYNC_CLOSURE.match(body, s):", "if False:"),
+)
+
+
+class ReviewR18Mutants(unittest.TestCase):
+    """REVIEW-7349-r18: one named mutant per issue, each reverting exactly the new decision; each turns RED."""
+
+    def test_each_issue_mutant_turns_a_probe_red(self):
+        src = GATE.read_text()
+        methods = {}
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.ClassDef) and node.name == "FileModel":
+                for fn in node.body:
+                    if isinstance(fn, ast.FunctionDef):
+                        methods[fn.name] = ast.get_source_segment(src, fn)
+        for issue, rule, old, new in R18_MUTANTS:
+            with self.subTest(issue=issue, rule=rule):
+                seg = methods[rule]
+                self.assertEqual(seg.count(old), 1, old)
+                mod = types.ModuleType("r18_mutant_%d" % issue)
+                mod.__file__ = str(GATE)
+                sys.modules[mod.__name__] = mod
+                exec(compile(src.replace(seg, seg.replace(old, new)), str(GATE), "exec"), mod.__dict__)
+                red = []
+                for head, body, flagged in R18_PROBES[issue]:
+                    shutil.rmtree(SCRATCH, ignore_errors=True)
+                    (SCRATCH / "tests").mkdir(parents=True)
+                    (SCRATCH / "tests" / "a.rs").write_text(WRITER + head + Positive.LOCKED % body)
+                    if bool(mod.scan_tree(SCRATCH)) != flagged:
+                        red.append(body)
+                shutil.rmtree(SCRATCH, ignore_errors=True)
+                self.assertTrue(red, "the #%d mutant stays GREEN" % issue)
+
+
 # r11 (#8125): per classifying rule, the probes that must be flagged (RED when the rule is loosened). A probe is
 # (head, body); %s is the closure `|_| { db::open(..) }` or, for the runtime rule, the async block.
 RULE_CL = "|_| { %s }" % Positive.OPEN
@@ -2970,6 +3078,10 @@ RULE_MAPPER = (  # same-file methods: member_ok resolves them, so only closure_f
     "    fn map<F>(&self, _f: F) -> Vec<u8> { vec![1u8] }\n}\n"
 )
 RULE_PROBES = {
+    "arg_inline": [("", "ai_memory::pool::run_elsewhere(%s);"), ("use ai_memory::pool::*;\n", "run_elsewhere(%s);"),
+                   ("", "vec![1u8].run_elsewhere(%s);"), ("use ai_memory::pool::{self, run_elsewhere};\n", "run_elsewhere(%s);")],
+    "await_macro_arg": [(R18_BODY, R18_BLOCK_ON % "ai_memory::pool::join!(body());"),
+                        (R18_BODY + "use ai_memory::pool::select;\n", R18_BLOCK_ON % "select!(body());")],
     "annotation": [("", "let p: Foo = ai_memory::pool::mk();\n    p.for_each(%s);"),
                    ("", "let p: ai_memory::pool::Pool = ai_memory::pool::mk();\n    p.for_each(%s);")],
     "call_ok": [("", "ai_memory::pool::mk().for_each(%s);"),
@@ -3013,8 +3125,8 @@ class RuleInventory(unittest.TestCase):
     origin predicate is registered with @origin_rule, every registered rule has probes, and loosening the rule turns
     its probes RED (two mutants per rule: the rule always credits, and the rule credits UNKNOWN as well as STD)."""
 
-    PREDICATES = ("type_origin", "path_origin", "method_origin")
-    SITE = re.compile(r"self\.(?:type_origin|path_origin|method_origin)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)\s*(==|!=)\s*STD")
+    PREDICATES = ("type_origin", "path_origin", "method_origin", "callee_origin")
+    SITE = re.compile(r"self\.(?:type_origin|path_origin|method_origin|callee_origin)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)\s*(==|!=)\s*STD")
 
     def setUp(self):
         self.src = GATE.read_text()
@@ -3130,7 +3242,7 @@ class TypeOriginInventory(unittest.TestCase):
     def test_every_classifying_rule_calls_the_predicate(self):
         for name in sorted(gate.ORIGIN_RULES):
             with self.subTest(rule=name):
-                self.assertRegex(self.methods[name], r"\b(?:type_origin|path_origin|name_origin|method_origin)\(")
+                self.assertRegex(self.methods[name], r"\b(?:type_origin|path_origin|name_origin|method_origin|callee_origin)\(")
 
     def test_spelling_based_helpers_are_gone(self):
         for old in ("RECEIVER_STD_TYPES", "def types_ok", "self.types_ok("):
