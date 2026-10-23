@@ -2257,6 +2257,24 @@ class Issue8095(Positive):
         self.check(body, set(), head=self.PAR)
 
 
+class Issue8096(Positive):
+    """#8096: PARALLEL_METHODS covers rayon's full par_* adapter set."""
+
+    def test_missing_adapters_taint_a_helper(self):
+        for name in ("par_chunk_by", "par_chunk_by_mut", "par_rchunks_exact", "par_rchunks_exact_mut",
+                     "par_split_inclusive", "par_split_inclusive_mut", "par_match_indices"):
+            head = "fn par() -> u8 {\n    let v = Vec::<u8>::new();\n    let _p = v.%s();\n    1\n}\n" % name
+            with self.subTest(name=name):
+                self.check("par().to_string().chars().for_each(|_| { %s });" % self.OPEN, head=head)
+
+    def test_list_is_sorted(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("gate8096", str(GATE))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(list(mod.PARALLEL_METHODS), sorted(mod.PARALLEL_METHODS))
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

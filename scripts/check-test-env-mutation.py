@@ -310,12 +310,15 @@ SAME_THREAD_CALLEES = frozenset((
     "min_by_key", "get_or_insert_with", "or_insert_with", "query_row", "query_map", "query_and_then", "block_on",
     "timeout", "catch_unwind", "AssertUnwindSafe", "with_default", "call_once", "call_once_force", "get_or_init",
     "get_or_try_init", "force"))
-# #8090: every rayon parallel-iterator entry point, matched as a WHOLE method name (the `par_sort*` family by prefix).
+# #8090, #8096: every rayon parallel-iterator entry point, matched as a WHOLE method name (the `par_sort*` family
+# by prefix). The source is rayon's full `par_*` adapter set (ParallelSlice, ParallelSliceMut, ParallelString,
+# IntoParallelIterator, ParallelBridge, ParallelExtend, ParallelDrain); the tuple is kept sorted.
 PARALLEL_METHODS = (
-    "par_iter", "par_iter_mut", "into_par_iter", "par_bridge", "par_chunks", "par_chunks_mut", "par_chunks_exact",
-    "par_chunks_exact_mut", "par_rchunks", "par_rchunks_mut", "par_lines", "par_split", "par_split_mut",
-    "par_split_terminator", "par_split_whitespace", "par_windows", "par_extend", "par_drain", "par_chars",
-    "par_bytes", "par_char_indices", "par_matches", "par_encode_utf16",
+    "into_par_iter", "par_bridge", "par_bytes", "par_char_indices", "par_chars", "par_chunk_by", "par_chunk_by_mut",
+    "par_chunks", "par_chunks_exact", "par_chunks_exact_mut", "par_chunks_mut", "par_drain", "par_encode_utf16",
+    "par_extend", "par_iter", "par_iter_mut", "par_lines", "par_match_indices", "par_matches", "par_rchunks",
+    "par_rchunks_exact", "par_rchunks_exact_mut", "par_rchunks_mut", "par_split", "par_split_inclusive",
+    "par_split_inclusive_mut", "par_split_mut", "par_split_terminator", "par_split_whitespace", "par_windows",
 )
 PARALLEL_ITER = re.compile(r"\brayon\b|\b(?:%s|par_sort\w*)\b" % "|".join(PARALLEL_METHODS))
 KEYWORDS = frozenset((
