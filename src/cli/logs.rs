@@ -465,7 +465,12 @@ fn probe_path(state: &mut FollowState, out: &mut CliOutput<'_>) -> Result<PathPr
     if replaced {
         return Ok(PathProbe::Replaced(file));
     }
-    state.unreadable = None;
+    // decision: clear the latch only when it names the followed path over
+    // clearing it unconditionally, because the latch may hold a failed newer
+    // candidate whose note must stay once per episode (#8220).
+    if state.unreadable.as_deref() == Some(state.path.as_path()) {
+        state.unreadable = None;
+    }
     if state.id.is_none() {
         state.id = id;
     }
@@ -683,6 +688,7 @@ fn follow_poll(
         .into_iter()
         .filter(|p| *p > state.path)
         .collect();
+    let mut switched = false;
     if !newer.is_empty() {
         // Rotation by name: finish the old file, then follow the new one from 0.
         // decision: open the newer file BEFORE leaving the old one over
@@ -713,8 +719,15 @@ fn follow_poll(
         if let Some((path, file)) = adopted {
             drain_followed(state, filters, out, true)?;
             switch_to(state, path, file);
+            switched = true;
         }
-    } else {
+    }
+    if !switched {
+        // decision: run the followed file's checks whenever no newer candidate
+        // was adopted over only when none exists, because a candidate that
+        // fails to open (a dangling symlink, an unreadable file) would
+        // otherwise skip the truncation and replacement checks on every
+        // poll and the drain would resume at a stale offset (#8220).
         // Rename-and-recreate: the writer may still have appended to the
         // renamed file, which only the old handle can reach.
         // decision: open the path BEFORE leaving the old handle (#8062,
@@ -1745,6 +1758,53 @@ mod tests {
     #[test]
     fn logs_tail_follow_fifo_sorting_last_keeps_truncation_check_8222() {
         shadowed_truncation(true);
+    }
+
+    /// Plant a dangling `ai-memory.log.old` symlink: it sorts above the
+    /// followed `ai-memory.log`, passes the entry-type filter (a symlink is
+    /// kept) and fails to open.
+    #[cfg(unix)]
+    fn plant_dangling(dir: &Path) {
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("ai-memory.log.old")).unwrap();
+    }
+
+    /// #8220 - a newer candidate that fails to open must not skip the
+    /// truncation check of the followed file: the rewritten lines print whole,
+    /// from offset 0, with the rotation note, and the failed candidate is
+    /// reported once.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_dangling_newer_symlink_keeps_truncation_check_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "n-before-one\nn-before-two\n");
+        let mut state = open_state(&a, 26);
+        plant_dangling(dir.path());
+        fs::write(&a, "fresh-1\n").unwrap();
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "fresh-1\n", "whole new line: {s1:?} {e1:?}");
+        assert!(e1.contains("rotated or truncated"), "{e1:?}");
+        assert_eq!(e1.matches("cannot open").count(), 1, "{e1:?}");
+        append(&a, "fresh-2\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "fresh-2\n", "no torn or dropped line: {s2:?}");
+        assert_eq!(e2, "", "failed candidate reported once: {e2:?}");
+    }
+
+    /// #8220 - the same shadow must not skip the replacement check: a followed
+    /// file renamed away and recreated is read from its start.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_dangling_newer_symlink_keeps_replacement_check_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\n");
+        let mut state = open_state(&a, 6);
+        plant_dangling(dir.path());
+        append(&a, "old-2\n");
+        fs::rename(&a, dir.path().join("renamed.zst")).unwrap();
+        make_log(dir.path(), "ai-memory.log", "new-1\nnew-2\n");
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "old-2\nnew-1\nnew-2\n", "{s:?} {e:?}");
+        assert!(e.contains("rotated or truncated"), "{e:?}");
     }
 
     /// #8148 - the note tail on a failed open: with an inode an unopenable
