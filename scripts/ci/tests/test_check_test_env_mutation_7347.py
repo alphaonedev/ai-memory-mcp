@@ -2275,6 +2275,243 @@ class Issue8096(Positive):
         self.assertEqual(list(mod.PARALLEL_METHODS), sorted(mod.PARALLEL_METHODS))
 
 
+class Issue8098(Positive):
+    """#8098: a name is safe only when it is PROVEN: a capitalised name is judged like any other (a binding, a const or
+    static by its initialiser, a variant, a struct), never trusted for its first letter."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+    PAR = "fn par() -> impl Sized { (0..3u32).into_par_iter() }\n"
+    POOL_STATIC = "static POOL: std::sync::LazyLock<ai_memory::pool::Pool> = std::sync::LazyLock::new(ai_memory::pool::Pool::new);\n"
+
+    def test_capitalised_let_binding_is_judged_by_its_initialiser(self):
+        self.check("#[allow(non_snake_case)]\n    let P = par();\n    P.for_each(%s);" % self.CL, head=self.PAR)
+
+    def test_capitalised_parallel_fn_call_is_detached(self):
+        head = "fn Par() -> impl Sized { (0..3u32).into_par_iter() }\n"
+        self.check("Par().for_each(%s);" % self.CL, head=head)
+
+    def test_static_holding_an_unresolved_crate_value_is_detached(self):
+        self.check("POOL.for_each(%s);" % self.CL, head=self.POOL_STATIC)
+
+    def test_qualified_crate_constant_is_detached(self):
+        self.check("ai_memory::pool::GLOBAL.for_each(%s);" % self.CL)
+
+    def test_imported_crate_constant_is_detached(self):
+        self.check("GLOBAL.for_each(%s);" % self.CL, head="use ai_memory::pool::GLOBAL;\n")
+
+    def test_controls_stay_clean(self):
+        for head, body in (
+            ("", "None.map(%s);" % self.CL),
+            ("use std::cmp::Ordering;\n", "Some(Ordering::Less).map(%s);" % self.CL),
+            ("", "Some(std::cmp::Ordering::Less).map(%s);" % self.CL),
+            ('const KEYS: [&str; 2] = ["A", "B"];\n', "KEYS.map(%s);" % self.CL),
+            ("enum E { A, B }\n", "Some(E::A).map(%s);" % self.CL),
+            ("struct U;\n", "Some(U).map(%s);" % self.CL),
+            ("struct T(u8);\n", "Some(T(1)).map(%s);" % self.CL),
+        ):
+            with self.subTest(body=body):
+                self.check(body, set(), head=head)
+
+
+class Issue8099(Positive):
+    """#8099: a closure literal is a whitelisted form only when it is invoked in place or is the argument of an inline
+    adapter, and everything it returns is proven; an unresolved value it returns is never blanked away."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+    POOL = "ai_memory::pool::Pool::new()"
+
+    def test_iife_returning_an_unresolved_value_is_detached(self):
+        self.check("Some((|| %s)()).unwrap().for_each(%s);" % (self.POOL, self.CL))
+
+    def test_iife_through_a_let_is_detached(self):
+        self.check("let p = (|| %s)();\n    p.for_each(%s);" % (self.POOL, self.CL))
+
+    def test_map_closure_returning_an_unresolved_value_is_detached(self):
+        self.check("std::iter::once(()).map(|_| %s).next().unwrap().for_each(%s);" % (self.POOL, self.CL))
+
+    def test_controls_stay_clean(self):
+        for body in (
+            "vec![1u8].iter().map(|x| x + 1).for_each(%s);" % self.CL,
+            "let f = vec![1u8].into_iter().map(|x| x + 1);\n    f.for_each(%s);" % self.CL,
+            "(|| vec![1u8])().iter().for_each(%s);" % self.CL,
+        ):
+            with self.subTest(body=body):
+                self.check(body, set())
+
+
+class Issue8100(Positive):
+    """#8100: a method on a safe receiver is trusted only when it is on the INLINE_METHODS allowlist, and a turbofish
+    or `let` type is trusted only when it names std types."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+    EXT = "use ai_memory::pool::PoolExt;\n"
+
+    def test_extension_trait_method_inline_is_detached(self):
+        self.check("vec![1u8].into_pool().for_each(%s);" % self.CL, head=self.EXT)
+
+    def test_extension_trait_method_through_a_let_is_detached(self):
+        self.check("let p = vec![1u8].into_pool();\n    p.for_each(%s);" % self.CL, head=self.EXT)
+
+    def test_non_std_collect_turbofish_is_detached(self):
+        self.check("vec![1u8].iter().collect::<ai_memory::pool::Pool>().for_each(%s);" % self.CL)
+
+    def test_non_std_let_annotation_is_detached(self):
+        self.check("let p: ai_memory::pool::Pool = vec![1u8].into_iter().collect();\n    p.for_each(%s);" % self.CL)
+
+    def test_declared_std_types_are_the_proof(self):
+        """A declared std-only type proves a value whatever its initialiser names (const, static, let, fn return)."""
+        crate = "use ai_memory::federation::KEY_A;\n"
+        for head, body in (
+            (crate + "const KS: [&str; 1] = [KEY_A];\n", "KS.map(%s);" % self.CL),
+            (crate + "static KS: [&str; 1] = [KEY_A];\n", "KS.map(%s);" % self.CL),
+            (crate, "let ks: [&str; 1] = [KEY_A];\n    ks.map(%s);" % self.CL),
+            (crate, "let ks: [(&'static str, Option<&str>); 1] = [(KEY_A, None)];\n    ks.map(%s);" % self.CL),
+            (crate + "fn ks() -> [&'static str; 1] { [KEY_A] }\n", "ks().map(%s);" % self.CL),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body, set(), head=head)
+
+    def test_declared_non_std_types_stay_detached(self):
+        crate = "use ai_memory::federation::KEY_A;\n"
+        self.check("let ks = [KEY_A];\n    ks.map(%s);" % self.CL, head=crate)
+        self.check("let ks: [ai_memory::Key; 1] = [KEY_A];\n    ks.map(%s);" % self.CL, head=crate)
+        self.check("ks().map(%s);" % self.CL, head=crate + "fn ks() -> [ai_memory::Key; 1] { [KEY_A] }\n")
+
+    def test_controls_stay_clean(self):
+        for head, body in (
+            ("", 'let keys = ["A", "B"];\n    keys.map(%s);' % self.CL),
+            ("", "vec![1u8].iter().for_each(%s);" % self.CL),
+            ("", '"a\\nb".lines().for_each(%s);' % self.CL),
+            ("", "vec![1u8].into_iter().collect::<Vec<u8>>().iter().for_each(%s);" % self.CL),
+            ("", "let v: Vec<u8> = vec![1u8].into_iter().collect();\n    v.iter().for_each(%s);" % self.CL),
+            ("use std::vec::Vec as V;\n", "V::<u8>::new().iter().for_each(%s);" % self.CL),
+        ):
+            with self.subTest(body=body):
+                self.check(body, set(), head=head)
+
+
+class FormInventory(Positive):
+    """#8098-#8100: the module docstring's form table, SPAN_FORMS and the span_safe branches are one set. Every form
+    has a probe whose recorded decision is the one its rule gives; a form with no probe, or a branch with no entry,
+    fails here."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+    POOL = "ai_memory::pool::Pool::new()"
+    POOL_FN = "fn f() -> ai_memory::pool::Pool { ai_memory::pool::Pool::new() }\n"
+    POOL_STATIC = "static POOL: std::sync::LazyLock<ai_memory::pool::Pool> = std::sync::LazyLock::new(ai_memory::pool::Pool::new);\n"
+    PARAM = "#[test]\nfn reader(p: Vec<u8>) {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def probes(self):
+        cl = self.CL
+        w_ok = "struct W;\nimpl W { fn m(&self) -> u8 { 1 } }\n"
+        w_bad = "struct W;\nimpl W { fn m(&self) -> ai_memory::pool::Pool { ai_memory::pool::Pool::new() } }\n"
+        keys = 'const KEYS: [&str; 2] = ["A", "B"];\n'
+        return [
+            # (form, ok, head, body, template)
+            ("literal", True, "", "[1u8].iter().for_each(%s);" % cl, None),
+            ("keyword", True, "", "Some(true).iter().for_each(%s);" % cl, None),
+            ("primitive", True, "", "Some(1 as u8).iter().for_each(%s);" % cl, None),
+            ("macro_vec", True, "", "vec![1u8].iter().for_each(%s);" % cl, None),
+            ("macro_value", True, "", 'format!("{}", 1).chars().for_each(%s);' % cl, None),
+            ("macro_other", False, "", "my_macro!(1).iter().for_each(%s);" % cl, None),
+            ("field", True, "struct S { it: u8 }\n", "let s = S { it: 1 };\n    s.it.to_string().chars().for_each(%s);" % cl, None),
+            ("label_binder", True, "struct S { it: u8 }\n", "let s = S { it: 1 };\n    s.it.to_string().chars().for_each(%s);" % cl, None),
+            ("method_inline", True, "", "vec![1u8].iter().for_each(%s);" % cl, None),
+            ("method_resolved", True, w_ok, "let w = W;\n    w.m().to_string().chars().for_each(%s);" % cl, None),
+            ("method_resolved", False, w_bad, "let w = W;\n    w.m().for_each(%s);" % cl, None),
+            ("method_other", False, "", "vec![1u8].into_pool().for_each(%s);" % cl, None),
+            ("call_std", True, "", "Some(1u8).iter().for_each(%s);" % cl, None),
+            ("call_resolved", True, "fn f() -> u8 { 1 }\n", "f().to_string().chars().for_each(%s);" % cl, None),
+            ("call_resolved", False, self.POOL_FN, "f().for_each(%s);" % cl, None),
+            ("call_adt", True, "struct T(u8);\n", "T(1).0.to_string().chars().for_each(%s);" % cl, None),
+            ("call_other", False, "", "%s.for_each(%s);" % (self.POOL, cl), None),
+            ("name_local", True, "", "let v = vec![1u8];\n    v.iter().for_each(%s);" % cl, None),
+            ("name_local", False, "", "let p = %s;\n    p.for_each(%s);" % (self.POOL, cl), None),
+            ("name_closure_param", True, "", "Some(vec![1u8]).map(|k| k.iter().for_each(%s));" % cl, None),
+            ("name_closure_param", False, "", "let f = |k: Vec<u8>| k.iter().for_each(%s);" % cl, None),
+            ("name_opaque", False, "", "if let Some(k) = Some(vec![1u8]) {\n        k.iter().for_each(%s);\n    }" % cl, None),
+            ("name_param", True, "", "p.iter().for_each(%s);" % cl, self.PARAM),
+            ("name_std", True, "", "None.map(%s);" % cl, None),
+            ("name_const", True, keys, "KEYS.iter().for_each(%s);" % cl, None),
+            ("name_const", False, self.POOL_STATIC, "POOL.for_each(%s);" % cl, None),
+            ("name_fn_item", True, "fn k() -> u8 { 1 }\n", "Some(k).iter().for_each(%s);" % cl, None),
+            ("name_fn_item", False, self.POOL_FN.replace("fn f", "fn k"), "Some(k).iter().for_each(%s);" % cl, None),
+            ("name_adt", True, "struct U;\n", "Some(U).iter().for_each(%s);" % cl, None),
+            ("name_other", False, "use ai_memory::pool::GLOBAL;\n", "GLOBAL.for_each(%s);" % cl, None),
+            ("path_std", True, "", "Some(u8::MAX).iter().for_each(%s);" % cl, None),
+            ("path_const", True, keys, "self::KEYS.iter().for_each(%s);" % cl, None),
+            ("path_const", False, self.POOL_STATIC, "self::POOL.for_each(%s);" % cl, None),
+            ("path_variant", True, "enum E { A, B }\n", "Some(E::A).iter().for_each(%s);" % cl, None),
+            ("path_other", False, "", "ai_memory::pool::GLOBAL.for_each(%s);" % cl, None),
+            ("closure_iife", True, "", "(|| vec![1u8])().iter().for_each(%s);" % cl, None),
+            ("closure_iife", False, "", "(|x| x)(%s).for_each(%s);" % (self.POOL, cl), None),
+            ("closure_arg", True, "", "Some(1u8).map(|x| x + 1).iter().for_each(%s);" % cl, None),
+            ("closure_arg", False, "", "%s.map(|x| x).for_each(%s);" % (self.POOL, cl), None),
+            ("closure_other", False, "", "let f = |x: u8| x;\n    Some(f).iter().for_each(%s);" % cl, None),
+            ("async_block", False, "", "let a = async { 1u8 };\n    Some(a).iter().for_each(%s);" % cl, None),
+            ("turbofish_std", True, "", "Vec::<u8>::new().iter().for_each(%s);" % cl, None),
+            ("turbofish_other", False, "", "vec![1u8].iter().collect::<ai_memory::pool::Pool>().for_each(%s);" % cl, None),
+            ("block_root", False, "", "let _r = { vec![1u8] }.iter().for_each(%s);" % cl, None),
+        ]
+
+    def run_probe(self, form, ok, head, body, template):
+        text = WRITER + head + (template or self.LOCKED) % body
+        gate.FORM_TRACE = []
+        try:
+            flagged = self.flagged(text)
+            trace = list(gate.FORM_TRACE)
+        finally:
+            gate.FORM_TRACE = None
+        self.assertIn((form, ok), trace, "no %s=%s decision for %r" % (form, ok, body))
+        self.assertEqual(flagged, set() if ok else FLAGGED, body)
+
+    def test_each_form_decides_as_its_rule_says(self):
+        for probe in self.probes():
+            with self.subTest(form=probe[0], ok=probe[1]):
+                self.run_probe(*probe)
+
+    def test_every_form_has_a_probe(self):
+        probed = {p[0] for p in self.probes()}
+        self.assertEqual(probed, set(gate.SPAN_FORMS))
+        self.assertEqual(len(gate.SPAN_FORMS), len(set(gate.SPAN_FORMS)))
+
+    def test_every_form_has_a_detached_probe_unless_always_safe(self):
+        always_safe = {"literal", "keyword", "primitive", "macro_vec", "macro_value", "field", "method_inline",
+                       "label_binder", "call_std", "call_adt", "name_param", "name_std", "name_adt", "path_std",
+                       "path_variant", "turbofish_std"}
+        detached = {p[0] for p in self.probes() if not p[1]}
+        safe = {p[0] for p in self.probes() if p[1]}
+        for label in gate.SPAN_FORMS:
+            with self.subTest(form=label):
+                if label in always_safe:
+                    self.assertIn(label, safe)
+                else:
+                    self.assertIn(label, detached)
+
+    def test_branch_labels_in_the_source_are_the_inventory(self):
+        import re
+        labels = set(re.findall(r'\bform\(\s*"(\w+)"', GATE.read_text()))
+        self.assertEqual(labels, set(gate.SPAN_FORMS))
+
+    def test_docstring_table_lists_every_form(self):
+        doc = gate.__doc__ or GATE.read_text()
+        for label in gate.SPAN_FORMS:
+            with self.subTest(form=label):
+                self.assertIn("`%s`" % label, doc)
+
+    def test_allowlist_is_disjoint_from_the_parallel_adapters(self):
+        self.assertFalse(set(gate.INLINE_METHODS) & set(gate.PARALLEL_METHODS))
+        for name in gate.INLINE_METHODS:
+            with self.subTest(name=name):
+                self.assertIsNone(gate.PARALLEL_ITER.search(name))
+
+    def test_default_is_detached(self):
+        for body in ("vec![1u8].some_new_adapter().for_each(%s);" % self.CL,
+                     "Unknown::new().for_each(%s);" % self.CL, "unknown_name.for_each(%s);" % self.CL):
+            with self.subTest(body=body):
+                self.check(body)
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

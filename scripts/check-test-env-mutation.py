@@ -121,6 +121,48 @@ use (ScopeMap, #8095), and a name bound by a `for` pattern, a match arm, `if let
 or a destructuring `let` is DETACHED (#8094). PARALLEL_ITER (every
 rayon par_* adapter, PARALLEL_METHODS, #8090) is judged through a fixpoint over callee bodies, so a helper
 that builds a rayon-style iterator taints its callers (#8069).
+
+Form inventory (#8098, #8099, #8100). span_safe is a CLOSED whitelist and the ONLY decision point for a receiver:
+each expression form the tokenizer can yield has exactly one rule, a form with no rule is DETACHED, and every
+branch records its form through form() (SPAN_FORMS; the FormInventory test pins this table, the tuple, the
+branches and one probe per form). Doubt is detached.
+  form                 rule
+  `literal`            a literal, array, tuple or borrow root: its elements are decided token by token
+  `keyword`            a keyword (`true`, `as`, `mut`, ..) is never a value
+  `primitive`          a primitive type name (`u8` in a cast)
+  `macro_vec`          `vec![..]` (std path prefix allowed); its elements are decided token by token
+  `macro_value`        VALUE_MACROS (`format!`, `concat!`, ..); every other macro is `macro_other`: DETACHED
+  `field`              a field of a safe value
+  `method_inline`      a method on the INLINE_METHODS allowlist (disjoint from PARALLEL_METHODS)
+  `method_resolved`    a same-file or tests/common method: no candidate parallel and every return value safe
+  `method_other`       any other method (an unknown or extension-trait one, `into_pool`): DETACHED
+  `label_binder`       a struct-literal label or a name `let` / `ref` introduces
+  `call_std`           `Some` / `Ok` / `Err`, a std path, a prelude std type, a name imported from std
+  `call_resolved`      a same-file or tests/common fn: not parallel and every return value safe (MAX_RETURN_DEPTH)
+  `call_adt`           a same-file tuple struct or enum variant constructor
+  `call_other`         any other call (an unresolved crate fn, an uppercase fn): DETACHED
+  `name_local`         a `let` whose declared type names only std types (the type is the proof), or, with no type, whose
+                       initialiser is proven; a non-std declared type is DETACHED; a rebinding is followed
+  `name_closure_param` a parameter of a `closure_iife` / `closure_arg` closure
+  `name_opaque`        every other binder (`for`, match arm, `if let`, destructuring): DETACHED
+  `name_param`         `self` or a fn parameter
+  `name_std`           `None`, a name imported from std
+  `name_const`         a same-file `const` / `static` whose declared type names only std types, or whose initialiser is
+                       safe (an unsafe one: DETACHED)
+  `name_fn_item`       a same-file fn used as a value: not parallel and every return value safe
+  `name_adt`           a same-file struct or `Self`
+  `name_other`         an unresolvable name of ANY casing (`GLOBAL`, `P`): DETACHED
+  `path_std`           `std::` / `core::` / `alloc::` path, a primitive's item, a one-segment std type's item
+  `path_const`         `self::` / `crate::` / `module::` const, judged by its initialiser
+  `path_variant`       a variant of a same-file enum
+  `path_other`         any other path (`ai_memory::pool::GLOBAL`): DETACHED
+  `closure_iife`       a closure invoked in place `(|..| ..)(args)`, args safe; its body tokens are decided in turn
+  `closure_arg`        the argument of an INLINE_METHODS method whose receiver is safe; body decided in turn
+  `closure_other`      a closure in any other position (`let f = |..|`, a path-call argument): DETACHED
+  `async_block`        an `async` block: DETACHED
+  `turbofish_std`      every turbofish type is a primitive or a std path (so is a `let` annotation)
+  `turbofish_other`    a turbofish type of another crate or file (`collect::<Pool>()`): DETACHED
+  `block_root`         a chain rooted in a block or a struct literal: DETACHED
 `&|| ..` and `&mut || ..` are closure literals (#8067). Anything else (inside Box::new, Some, a struct
 field, vec!, a tuple, a method receiver, an assignment, a return, a loop, another closure, an unresolved
 free function or crate path) is detached. A spawn used as a fn value (`.map(std::thread::spawn)`,
@@ -298,7 +340,7 @@ RECEIVER_STD_TYPES = frozenset((
     "String", "Vec", "VecDeque", "Option", "Result", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Box", "Arc",
     "Rc", "Cell", "RefCell", "Mutex", "RwLock", "Path", "PathBuf", "Duration", "Instant"))  # #8069: std value types
 MAX_CHAIN_STEPS = 64  # #8069: method-chain links followed from a closure's receiver back to its root; more is unresolved
-Detacher = collections.namedtuple("Detacher", "idxs has_self inline parallel")  # one fn of a file outside the test file
+Detacher = collections.namedtuple("Detacher", "idxs has_self inline parallel value_safe")  # one fn of a file outside the test file
 # #8056: library calls that run their closure argument inline on the calling thread (Option / Result / Iterator /
 # slice adaptors, the rusqlite row mappers, a runtime's block_on, timeout, catch_unwind). A same-file or tests/common
 # fn of the same name is judged by its own body first; with rayon in the fn none of these is trusted.
@@ -331,6 +373,48 @@ PRIMS = frozenset((
 VALUE_MACROS = frozenset((
     "format", "concat", "stringify", "matches", "json", "include_str", "include_bytes", "env", "option_env", "line",
     "file", "column", "module_path"))  # #8093: macros that build a plain value on the calling thread (vec! is judged inside)
+STD_ROOTS = frozenset(("std", "core", "alloc"))  # #8098: the roots of a fully qualified std path
+MAX_RETURN_DEPTH = 4  # #8098: callee levels a fn's return values are followed through; the limit is detached
+CLOSURE_HEAD = re.compile(r"(?:async\s+)?(?:move\s+)?(?:\|\||\|[^|]*\|)\s*(?:->\s*[^{]+?(?=\s*\{))?")
+BINDER = re.compile(r"\b(?:let|ref)(?:\s+mut)?$")  # text that ends right before a name a pattern introduces
+# #8100: the closed allowlist of std methods that run on the calling thread and hand back a value of the receiver's
+# own provenance (iterator, collection, string, Option and Result adapters). A method that is not here is detached.
+# It never holds a rayon method (a test asserts INLINE_METHODS and PARALLEL_METHODS are disjoint).
+INLINE_METHODS = frozenset((
+    "all", "and", "and_then", "any", "as_bytes", "as_deref", "as_mut", "as_ref", "as_slice", "as_str", "borrow",
+    "borrow_mut", "build", "by_ref", "bytes", "chain", "char_indices", "chars", "chunks", "chunks_exact", "clone",
+    "cloned", "collect", "column_count", "concat", "contains", "copied", "count", "cycle", "drain", "enable_all",
+    "enumerate",
+    "eq", "err", "expect", "expect_err", "filter", "filter_map", "find", "find_map", "first", "flat_map", "flatten",
+    "fold", "fuse", "get", "get_mut", "inspect", "into", "into_boxed_slice", "into_iter", "into_keys",
+    "into_values", "is_empty", "is_none", "is_some", "iter", "iter_mut", "join", "keys", "last", "len", "lines",
+    "lock", "map", "map_err", "map_or", "map_or_else", "map_while", "max", "max_by", "max_by_key", "min", "min_by",
+    "min_by_key", "next", "next_back", "nth", "ok", "ok_or", "ok_or_else", "or", "or_else", "parse", "peekable",
+    "position", "prepare", "product", "read", "reduce", "repeat", "rev", "rposition", "skip", "skip_while", "split", "split_terminator",
+    "split_whitespace", "step_by", "strip_prefix", "strip_suffix", "sum", "take", "take_while", "to_lowercase",
+    "to_owned", "to_string", "to_uppercase", "to_vec", "trim", "trim_end", "trim_start", "try_into", "unwrap",
+    "unwrap_err", "unwrap_or", "unwrap_or_default", "unwrap_or_else", "values", "values_mut", "windows", "worker_threads", "write",
+    "zip"))
+# #8098-#8100: every expression form span_safe can decide. Each branch of the predicate names its form through
+# form(); a label outside this tuple cannot be recorded. The module docstring tabulates form -> rule, and the
+# FormInventory test pins this tuple to the source and to one probe per form.
+SPAN_FORMS = (
+    "literal", "keyword", "primitive", "macro_vec", "macro_value", "macro_other", "field", "method_inline",
+    "method_resolved", "method_other", "label_binder", "call_std", "call_resolved", "call_adt", "call_other",
+    "name_local", "name_closure_param", "name_opaque", "name_param", "name_std", "name_const", "name_fn_item",
+    "name_adt", "name_other", "path_std", "path_const", "path_variant", "path_other", "closure_iife", "closure_arg",
+    "closure_other", "async_block", "turbofish_std", "turbofish_other", "block_root")
+FORM_TRACE = None  # a list while a test records the (form, ok) of every decision, else None
+
+
+def form(label, ok):
+    """Record that the branch `label` decided `ok` (see SPAN_FORMS) and return ok. A label with no inventory entry is a bug."""
+    assert label in SPAN_FORMS, label
+    if FORM_TRACE is not None:
+        FORM_TRACE.append((label, bool(ok)))
+    return ok
+
+
 CLOSURE_LET_HEAD = re.compile(r"\s*let\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*)?=\s*")
 CALLEE_TAIL = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*$")
 LOOP_HEADER = re.compile(r"\b(?:for|while|loop)\b")
@@ -723,9 +807,9 @@ def chain_start(body, end):
     return None
 
 
-def blank_generics(text):
-    """text with every turbofish generic-argument list `::<..>` replaced by spaces of the same length (#8093)."""
-    out = list(text)
+def generic_groups(text):
+    """[(start, end)] of every turbofish generic-argument list `::<..>` of text, `::` through the closing `>` (#8093, #8100)."""
+    out = []
     for m in re.finditer(r"::\s*<", text):
         depth = 0
         for j in range(m.end() - 1, len(text)):
@@ -735,11 +819,41 @@ def blank_generics(text):
             elif ch == ">" and text[j - 1:j] != "-":
                 depth -= 1
                 if depth == 0:
-                    out[m.start():j + 1] = " " * (j + 1 - m.start())
+                    out.append((m.start(), j + 1))
                     break
             elif ch in ";{}":
                 break
+    return out
+
+
+def blank_generics(text):
+    """text with every turbofish generic-argument list `::<..>` replaced by spaces of the same length (#8093)."""
+    out = list(text)
+    for a, b in generic_groups(text):
+        out[a:b] = " " * (b - a)
     return "".join(out)
+
+
+def return_exprs(body):
+    """[(start, end)] of the value expressions a fn body (starting at its `{`) returns (#8098): the tail after the last
+    depth-0 `;` of the block, and every `return <expr>`. A unit block has no tail."""
+    inner_end = body.rfind("}")
+    out, depth, last = [], 0, 1
+    for j in range(1, inner_end):
+        ch = body[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            last = j + 1
+    if body[last:inner_end].strip() and not body[last:inner_end].lstrip().startswith("}"):
+        out.append((last, inner_end))
+    for m in re.finditer(r"\breturn\b", body):
+        end = expr_end(body, m.end())
+        if body[m.end():end].strip():
+            out.append((m.end(), end))
+    return out
 
 
 def pattern_names(text):
@@ -929,6 +1043,7 @@ class Fn:
         self.is_async = is_async
         self.offset = offset
         self.params, self.has_self = (), False  # #8044: parameter names (None = pattern), receiver apart
+        self.ret = None  # #8098: the declared return type text, None when the fn declares none
         self.is_test = self._is_test(attrs)
         self.serial_tokens = self._serial_tokens(attrs)
         self.serial = bool(self.serial_tokens)
@@ -1055,8 +1170,35 @@ def parse_fns(scrubbed):
         fn = Fn(m.group(1), mods, owners[-1] if owners else None, attrs,
                 scrubbed[brace:match_brace(scrubbed, brace)], brace, m.group(0).startswith("async"))
         fn.params, fn.has_self = fn_params(scrubbed, m.end(), brace)
+        fn.ret = fn_return_type(scrubbed, m.end(), brace)
         fns.append(fn)
     return fns
+
+
+def fn_return_type(text, name_end, brace):
+    """The declared return type of the fn whose name ends at name_end and whose body opens at brace (#8098), else None."""
+    k = name_end
+    while k < brace and text[k].isspace():
+        k += 1
+    if text[k:k + 1] == "<":
+        depth = 0
+        while k < brace:
+            if text[k] == "-" and text[k + 1:k + 2] == ">":
+                k += 1
+            elif text[k] == "<":
+                depth += 1
+            elif text[k] == ">":
+                depth -= 1
+                if not depth:
+                    k += 1
+                    break
+            k += 1
+    while k < brace and text[k].isspace():
+        k += 1
+    if text[k:k + 1] != "(":
+        return None
+    m = re.match(r"\s*->\s*(.*?)\s*(?:\bwhere\b.*)?$", text[match_paren(text, k):brace], re.S)
+    return m.group(1) if m else None
 
 
 def split_top_level(text, start, end):
@@ -1709,7 +1851,12 @@ class FileModel:
         self.inline = {}  # #8065: id(fn) -> indices of the parameters the fn PROVABLY only calls on its own thread
         self.parallel = set()  # #8069: id(fn) of the fns whose body (or a callee's) builds a parallel iterator
         self._fn_lits = {}
+        self.text = scrubbed
+        self._index_items(scrubbed)  # #8098: the same-file consts, statics, structs and enum variants span_safe resolves
+        self._ret_ok, self._ret_stack, self._closure_memo, self._closure_stack = set(), [], {}, set()
+        self._closed = False  # the verdicts are cached only once the parallel set stops growing
         self._close_inline()
+        self._closed = True
         self.blamed = set()
         self.callers = {id(f): [] for f in self.fns}
         for f in self.fns:
@@ -2175,85 +2322,309 @@ class FileModel:
             cache[id(fn)] = ScopeMap(fn.body)
         return cache[id(fn)]
 
+    def _index_items(self, text):
+        """The same-file items span_safe needs to resolve a name (#8098): struct / union names, enum variants and
+        const / static initialisers as (start, end) in text (None when the name is declared twice)."""
+        self.adts, self.variants, self.consts = set(), {}, {}
+        for m in re.finditer(r"\b(?:struct|union)\s+([A-Za-z_]\w*)", text):
+            self.adts.add(m.group(1))
+        for m in re.finditer(r"\benum\s+([A-Za-z_]\w*)[^{;]*\{", text):
+            end, depth, names, item = match_brace(text, m.end() - 1) - 1, 0, set(), ""
+            for j in range(m.end(), end + 1):
+                ch = text[j] if j < end else ","
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    depth -= 1
+                if ch == "," and depth == 0:
+                    first = IDENT.findall(re.sub(r"#\s*\[.*?\]", "", item, flags=re.S))
+                    if first:
+                        names.add(first[0])
+                    item = ""
+                else:
+                    item += ch
+            self.variants.setdefault(m.group(1), set()).update(names)
+        for m in re.finditer(r"\b(?:const|static)\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:(?!:)", text):
+            if text[:m.start()].rstrip()[-1:] in ("<", ",", "*"):
+                continue  # a const generic parameter or a raw pointer type
+            depth, eq = 0, -1
+            for j in range(m.end(), len(text)):
+                ch = text[j]
+                if ch in "<([":
+                    depth += 1
+                elif ch in ")]" or (ch == ">" and text[j - 1:j] != "-"):
+                    depth -= 1
+                elif ch in "{}" or (ch == ";" and depth <= 0):
+                    break
+                elif ch == "=" and depth <= 0 and text[j + 1:j + 2] not in ("=", ">"):
+                    eq = j + 1
+                    break
+            if eq < 0:
+                continue
+            span = (eq, stmt_end(text, eq), text[m.end():eq - 1])
+            self.consts[m.group(1)] = None if m.group(1) in self.consts else span
+
     def receiver_ok(self, fn, dot, floor=None, hops=0):
         """True when the receiver whose method chain ends at index dot has a PROVEN provenance (#8069, #8089,
-        #8093). The chain's start is found by walking it back (chain_start; with floor set it is floor, a whole
-        `let` initialiser). Then EVERY token of the span must be safe (span_safe): a literal, a std path, a callee
-        that builds no parallel iterator, a local whose initialiser is proven in turn (binding_ok), or a wrapper
-        (Some, Box::new, vec!, an array, a tuple, a struct literal) whose contents are all safe. A block or a
-        struct literal as the chain root, or anything unclassifiable, is not ok (doubt: detached)."""
+        #8093, #8098-#8100). The chain's start is found by walking it back (chain_start; with floor set it is floor,
+        a whole `let` initialiser). A block or a struct literal as the chain root is detached (block_root). Every
+        token of the span is then decided by span_safe, the ONLY decision point: a closed whitelist whose default
+        is DETACHED (see SPAN_FORMS and the form table in the module docstring)."""
         start = floor if floor is not None else chain_start(fn.body, dot)
-        return start is not None and self.span_safe(fn, start, dot, hops)
+        if start is None:
+            return form("block_root", False)
+        return self.span_safe(fn, start, dot, hops)
 
     def span_safe(self, fn, a, b, hops):
-        """True when every value token of fn.body[a:b] is safe (#8093): a call is a ctor (`Some(..)`, a tuple
-        struct), a root_call_ok callee, or a method that is no parallel adapter; a bare name is a literal,
-        a constant, a fn item that builds no parallel iterator, or a local that binding_ok proves; a closure
-        literal must build no parallel iterator; a macro is vec! or a known value macro."""
+        """True when EVERY expression form of fn.body[a:b] is whitelisted (#8093, #8098, #8099, #8100). Each token
+        the tokenizer yields gets exactly one rule (a SPAN_FORMS label, recorded through form()); a form with no
+        rule cannot exist, because form() refuses a label outside SPAN_FORMS. A closure literal inside the span is
+        decided by closure_ok first; its parameter list is blanked and its body is scanned like any other text. A
+        turbofish type argument must be a std path or a primitive (generics_ok) and is blanked afterwards."""
         body = fn.body
         text = list(body[a:b])
         for s, e in self.lits(fn):
-            if s >= a and e <= b and "".join(text[s - a:e - a]).strip():
-                if self.builds_parallel(fn, body[s:e]):
+            if s >= a and e <= b and body[s:e].strip():
+                if not self.closure_ok(fn, s, e, hops):
                     return False
-                text[s - a:e - a] = " " * (e - s)
-        text = blank_generics("".join(text))
+                hm = CLOSURE_HEAD.match(body, s)
+                if hm:
+                    text[s - a:hm.end() - a] = " " * (hm.end() - s)
+        text = "".join(text)
+        root = text.lstrip()[:1]
+        if not (root.isalpha() or root == "_"):
+            form("literal", True)  # a literal, array, tuple or borrow root: its elements are decided token by token
+        for g0, g1 in generic_groups(text):
+            if not self.types_ok(text[g0:g1]):
+                return form("turbofish_other", False)
+            form("turbofish_std", True)
+        text = blank_generics(text)
         for m in IDPATH.finditer(text):
             segs = re.split(r"\s*::\s*", m.group(0))
             name, prefix = segs[-1], "".join(g + "::" for g in segs[:-1])
             pre, rest = text[:m.start()].rstrip(), text[m.end():]
             call = rest.lstrip().startswith("(")
             if re.match(r"\s*!(?!=)", rest):
-                if name != "vec" and name not in VALUE_MACROS:
-                    return False
-            elif pre.endswith(".") and not pre.endswith(".."):  # a method or a field
-                if call and (PARALLEL_ITER.search(name)
-                             or any(id(c) in self.parallel for c in self.by_method.get(name, []))):
-                    return False
-            elif name in KEYWORDS or name in PRIMS:
-                continue
+                ok = self.macro_ok(prefix, name)
+            elif pre.endswith(".") and not pre.endswith(".."):  # a method or a field of the value before it
+                ok = self.member_ok(name, call)
+            elif not prefix and name in KEYWORDS:
+                ok = form("keyword", True)
+            elif not prefix and name in PRIMS:
+                ok = form("primitive", True)
+            elif (re.match(r"\s*:(?!:)", rest) and not prefix) or BINDER.search(pre):
+                ok = form("label_binder", True)  # a struct-literal label or a name a `let` / `ref` introduces
             elif call:
-                if not (not prefix and name[:1].isupper()) and not self.root_call_ok(fn, prefix, name):
-                    return False
-            elif (re.match(r"\s*:(?!:)", rest) and not prefix) or re.search(r"\b(?:let|mut|ref)$", pre) \
-                    or (name[:1].isupper() and not prefix):
-                continue  # a struct-literal label, a binder, a constant or a variant
+                ok = self.call_ok(fn, prefix, name)
             elif prefix:
-                if not name[:1].isupper() and not self.root_call_ok(fn, prefix, name):
-                    return False
-            elif not self.binding_ok(fn, name, a + m.start(), hops):
+                ok = self.path_ok(fn, prefix, name)
+            else:
+                ok = self.name_ok(fn, name, a + m.start(), hops)
+            if not ok:
                 return False
         return True
 
-    def binding_ok(self, fn, name, use, hops):
-        """True when the name used at index use is PROVEN safe (#8089, #8094, #8095): the innermost binding in a
-        block still open at use wins (ScopeMap); a plain `let` is judged by its initialiser (receiver_ok, through at
-        most MAX_REBIND_HOPS names), and every other binder (a `for` pattern, a match arm, `if let`, `while let`,
-        a closure parameter, a destructuring `let`) is opaque and not ok. A name nothing binds is ok only as a
-        parameter, `self`, a constant or a fn item that builds no parallel iterator."""
-        if hops >= MAX_REBIND_HOPS:
-            return False
-        bound = self.scopes(fn).visible(name, use)
-        if bound is None:
-            if name == "self" or name in fn.params or name in self.inline_imports:
-                return True
-            hit = self.resolve(fn.owner, "", name)
-            return hit is not None and id(hit) not in self.parallel
-        if bound.init is None:
-            return False
-        return self.receiver_ok(fn, bound.init[1], floor=bound.init[0], hops=hops + 1)
+    def macro_ok(self, prefix, name):
+        """`vec!` and the VALUE_MACROS (a std path prefix allowed) are whitelisted; every other macro is detached."""
+        if prefix and not self.rooted(path_segments(prefix), name):
+            return form("macro_other", False)
+        if name == "vec":
+            return form("macro_vec", True)
+        return form("macro_value", True) if name in VALUE_MACROS else form("macro_other", False)
 
-    def root_call_ok(self, fn, prefix, name):
-        """True when a call `prefix::name(..)` that roots a receiver chain is known to build no parallel iterator (#8069)."""
+    def member_ok(self, name, call):
+        """A field of a safe value is safe. A method is safe when a same-file or tests/common method of that name
+        exists and EVERY candidate builds no parallel iterator and returns only safe values, else only when it is on
+        the explicit INLINE_METHODS allowlist; an unknown or extension-trait method is detached (#8100)."""
+        if not call:
+            return form("field", True)
+        cands = self.by_method.get(name, [])
+        ext = self.external_helpers("", name, True)
+        if cands or ext:
+            return form("method_resolved", all(id(c) not in self.parallel and self.returns_safe(c) for c in cands)
+                        and all(not h.parallel and h.value_safe for h in ext))
+        if name in INLINE_METHODS and not PARALLEL_ITER.search(name):
+            return form("method_inline", True)
+        return form("method_other", False)
+
+    def std_path(self, segs, name):
+        """True when the path segs + name is std/core/alloc (or an inline-runner crate), a name imported from one, a
+        prelude std type (`Vec`, `Box`, ..) written bare, or a primitive's associated item (`u8::MAX`)."""
+        return bool((segs and self.rooted(segs, name)) or (not segs and name in self.inline_imports)
+                    or (len(segs) == 1 and segs[0] in RECEIVER_STD_TYPES) or (segs and segs[0] in PRIMS))
+
+    def call_ok(self, fn, prefix, name):
+        """A call `prefix::name(..)` is safe when it is a prelude ctor or a std path, a resolved same-file or
+        tests/common fn that builds no parallel iterator and returns only safe values, or a ctor of a same-file struct
+        or enum variant; every other call (an uppercase fn too, an unresolved crate fn) is detached (#8098)."""
         segs = path_segments(prefix)
-        if (not segs and name in RECEIVER_CTORS) or (segs and segs[-1] in RECEIVER_STD_TYPES) \
-                or (segs and self.rooted(segs, name)) or (not segs and name in self.inline_imports):
-            return True
+        if (not segs and name in RECEIVER_CTORS) or self.std_path(segs, name):
+            return form("call_std", True)
         hit = self.resolve(fn.owner, prefix, name)
         if hit is not None:
-            return id(hit) not in self.parallel
+            return form("call_resolved", id(hit) not in self.parallel and self.returns_safe(hit))
         ext = self.external_helpers(prefix, name, False)
-        return bool(ext) and not any(h.parallel for h in ext)
+        if ext:
+            return form("call_resolved", all(not h.parallel and h.value_safe for h in ext))
+        ty = (fn.owner if segs and segs[-1] == "Self" else segs[-1]) if segs else None
+        if (not segs and (name in self.adts or name == "Self")) or (segs and name in self.variants.get(ty, ())):
+            return form("call_adt", True)
+        return form("call_other", False)
+
+    def path_ok(self, fn, prefix, name):
+        """A prefixed path that is not a call: std, an enum variant of the same file, or a same-file const reached as
+        `self::` / `crate::` / `super::` / `module::`, judged by its initialiser; anything else is detached (#8098)."""
+        segs = path_segments(prefix)
+        if self.std_path(segs, name):
+            return form("path_std", True)
+        ty = fn.owner if segs and segs[-1] == "Self" else (segs[-1] if segs else None)
+        if name in self.variants.get(ty, ()):
+            return form("path_variant", True)
+        if name in self.consts and segs and (segs[-1] in PATH_SELF or segs[-1] in self.mod_names):
+            return form("path_const", self.const_ok(name))
+        return form("path_other", False)
+
+    def name_ok(self, fn, name, use, hops):
+        """A bare name is PROVEN safe or detached, whatever its casing (#8094, #8095, #8098): the innermost binding
+        in a block still open at use wins (ScopeMap). A plain `let` is judged by its initialiser (receiver_ok, through
+        at most MAX_REBIND_HOPS names); a closure parameter is safe when its closure is a whitelisted form; every other
+        binder (a `for` pattern, a match arm, `if let`, `while let`, a destructuring `let`) is opaque. A name nothing
+        binds is safe as `self`, a parameter, a name imported from std, a same-file const or static whose initialiser
+        is safe, a same-file fn item that returns only safe values, or a same-file struct; else it is detached."""
+        if hops >= MAX_REBIND_HOPS:
+            return form("name_local", False)
+        bound = self.scopes(fn).visible(name, use)
+        if bound is not None:
+            if bound.init is not None:
+                typed = self.annotation(fn.body, bound.init[0])
+                if typed is not None:  # a declared type decides: std only is the proof, anything else is detached
+                    return form("name_local", typed)
+                return form("name_local", self.receiver_ok(fn, bound.init[1], floor=bound.init[0], hops=hops + 1))
+            if (bound.lo, bound.hi) in self.lit_set(fn):
+                return form("name_closure_param", self.closure_ok(fn, bound.lo, bound.hi, hops))
+            return form("name_opaque", False)
+        if name == "self" or name in fn.params:
+            return form("name_param", True)
+        if name in self.inline_imports or name == "None":
+            return form("name_std", True)
+        if name in self.consts:
+            return form("name_const", self.const_ok(name))
+        hit = self.resolve(fn.owner, "", name)
+        if hit is not None:
+            return form("name_fn_item", id(hit) not in self.parallel and self.returns_safe(hit))
+        if name in self.adts or name == "Self":
+            return form("name_adt", True)
+        return form("name_other", False)
+
+    def lit_set(self, fn):
+        """The closure and async-block literal spans of fn as a set, cached."""
+        cache = self.__dict__.setdefault("_lit_sets", {})
+        if id(fn) not in cache:
+            cache[id(fn)] = set(self.lits(fn))
+        return cache[id(fn)]
+
+    def closure_ok(self, fn, s, e, hops):
+        """True when the closure literal body[s:e] is a whitelisted form (#8099): invoked in place `(|..| ..)(args)`
+        with safe arguments, or the whole argument of an INLINE_METHODS method whose receiver is safe in turn. Its
+        value is then derived from safe values; its body tokens are scanned by the span that holds it. A closure in any
+        other position (a `let`, a path-call argument, an element, a return) and an async block are detached."""
+        key = (id(fn), s, e)
+        if key in self._closure_memo:
+            return self._closure_memo[key]
+        if key in self._closure_stack:
+            return False  # a cycle is detached
+        self._closure_stack.add(key)
+        try:
+            ok = self.closure_form(fn, s, e, hops)
+        finally:
+            self._closure_stack.discard(key)
+        if self._closed and (ok or not self._ret_stack):  # the parallel set grows until the fixpoint ends
+            self._closure_memo[key] = ok
+        return ok
+
+    def closure_form(self, fn, s, e, hops):
+        body = fn.body
+        if re.match(r"async\s+(?:move\s+)?\{", body[s:]):
+            return form("async_block", False)
+        before, opener = body[:s].rstrip(), CALL_OPENER.match(body, e)
+        if before.endswith("(") and opener and not re.search(r"[\w)\]?>]$", before[:-1].rstrip()):
+            op = opener.end() - 1
+            return form("closure_iife", self.span_safe(fn, op + 1, match_paren(body, op) - 1, hops + 1))
+        slot = arg_slot(body, s, e)
+        tail = CALLEE_TAIL.search(body, 0, slot[0]) if slot else None
+        if tail is not None:
+            pre = body[:tail.start()].rstrip()
+            if pre.endswith(".") and not pre.endswith("..") and tail.group(2) in INLINE_METHODS:
+                return form("closure_arg", self.receiver_ok(fn, len(pre) - 1, hops=hops + 1))
+        return form("closure_other", False)
+
+    def annotation(self, body, init_start):
+        """None when the `let` whose initialiser starts at init_start has no type annotation, else whether the
+        annotation names only std types (#8100): `let p: ai_memory::pool::Pool = it.collect();` is detached and
+        `let k: [&str; 2] = [crate::A, "B"];` is a value of a std type."""
+        heads = [h.start() for h in re.finditer(r"\blet\b", body[:init_start])]
+        m = re.match(r"let\b[^:=]*?:(?!:)(.*)=$", body[heads[-1]:init_start].rstrip(), re.S) if heads else None
+        return None if m is None else self.types_ok(m.group(1))
+
+    def types_ok(self, text):
+        """True when every type named in text (a turbofish group `::<..>` or a `let` type annotation) is a primitive,
+        a prelude std type, a std/core/alloc path or a name imported from std; a type of any other crate or file is
+        not (#8100)."""
+        for m in IDPATH.finditer(text):
+            segs = re.split(r"\s*::\s*", m.group(0))
+            first = self.aliases.get(segs[0], segs[0])
+            if len(segs) == 1:
+                good = (first in PRIMS or first in RECEIVER_STD_TYPES or first in KEYWORDS or first == "_"
+                        or first in self.inline_imports)
+            else:
+                good = first in INLINE_ROOTS or first in PRIMS or first in self.inline_imports
+            if not good:
+                return False
+        return True
+
+    def const_fn(self, name):
+        """A pseudo fn whose body is the initialiser of the same-file const or static `name`, cached."""
+        cache = self.__dict__.setdefault("_const_fns", {})
+        if name not in cache:
+            a, b, _ = self.consts[name]
+            cache[name] = Fn(name, (), None, "", self.text[a:b], a)
+        return cache[name]
+
+    def const_ok(self, name):
+        """True when the same-file const or static `name` (declared once) has a std-only declared type or a safe
+        initialiser (#8098)."""
+        if self.consts.get(name) is None:
+            return False
+        if self.types_ok(self.consts[name][2]):
+            return True  # a declared std type is the proof (`const KEYS: [&str; 2] = [crate::A, "B"]`)
+        stack = self.__dict__.setdefault("_const_stack", set())
+        if name in stack:
+            return False
+        stack.add(name)
+        try:
+            fn = self.const_fn(name)
+            return self.span_safe(fn, 0, len(fn.body), 0)
+        finally:
+            stack.discard(name)
+
+    def returns_safe(self, fn):
+        """True when every return expression of fn (its tail and each `return ..`) is safe (#8098, fixpoint through
+        the callees, MAX_RETURN_DEPTH deep; a cycle or the limit is detached)."""
+        key = id(fn)
+        if key in self._ret_ok:
+            return True
+        if fn.ret is not None and self.types_ok(fn.ret):
+            return True  # a declared std return type is the proof (`fn keys() -> [&'static str; 2]`)
+        if key in self._ret_stack or len(self._ret_stack) >= MAX_RETURN_DEPTH:
+            return False
+        self._ret_stack.append(key)
+        try:
+            ok = all(self.span_safe(fn, x, y, 0) for x, y in return_exprs(fn.body))
+        finally:
+            self._ret_stack.pop()
+        if ok and self._closed:
+            self._ret_ok.add(key)
+        return ok
 
     def param_inline(self, fn, name, depth=0):
         """True when EVERY use of parameter `name` in fn is a direct call `name(..)` / `(name)(..)`, a plain
@@ -2781,11 +3152,14 @@ def detaching_fns(scrubbed):
         if not f.is_test:
             inline = frozenset(model.inline.get(id(f), ()))
             prev = out.get(f.key)
+            safe = model.returns_safe(f)
             if prev is None:
-                out[f.key] = Detacher(frozenset(model.helpers.get(id(f), ())), f.has_self, inline, id(f) in model.parallel)
+                out[f.key] = Detacher(frozenset(model.helpers.get(id(f), ())), f.has_self, inline, id(f) in model.parallel,
+                                      safe)
             else:  # same name twice: detach if either does, credit inline only if both prove it (fail closed)
                 out[f.key] = Detacher(prev.idxs | frozenset(model.helpers.get(id(f), ())), prev.has_self or f.has_self,
-                                      prev.inline & inline, prev.parallel or id(f) in model.parallel)
+                                      prev.inline & inline, prev.parallel or id(f) in model.parallel,
+                                      prev.value_safe and safe)
     return out
 
 
