@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# PostgreSQL + Apache AGE operator guide (ai-memory v0.9.0)
+# PostgreSQL + Apache AGE operator guide (ai-memory v1.0.0)
 
 > **Audience.** Operators running `ai-memory` who want PostgreSQL as the
 > live storage backend, with Apache AGE for graph queries and pgvector
@@ -73,7 +73,7 @@ inventory, which is frozen against regression by
 | PostgreSQL | **18.6** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.6`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.8.0** (canonical extversion) | Targets PG 18. Installed via the pinned pgdg apt package (`postgresql-18-age=1.8.0~rc0-2.pgdg13+1`, SSOT `EXPECTED_AGE_VERSION=1.8.0`) overlaid on the `apache/age:release_PG18_1.7.0` base — `CREATE EXTENSION age` reports extversion 1.8.0. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` or the pgdg apt package (see below). |
 | pgvector | **0.8.6** (canonical) | Faster HNSW; 0.8.3 fixed HNSW-vacuuming index corruption. SSOT: `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
-| ai-memory | v0.9.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
+| ai-memory | v1.0.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
 > **CI evidence (#2548 / #2512).** The **one true certified triple** —
 > PostgreSQL **18.6** + Apache AGE **1.8.0** + pgvector **0.8.6** — is
@@ -1398,7 +1398,7 @@ bootstrap.
 
 If you're pointing at a v0.7-alpha postgres database (schema v15),
 run `ai-memory schema-init --store-url postgres://…` with a current
-(v0.9.0) binary — opening the store applies the upgrade ladder to v78
+binary — opening the store applies the upgrade ladder to v78
 idempotently. (See `migration-v0.7.0-postgres.md` for the full
 migration guide.)
 

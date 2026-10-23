@@ -3174,6 +3174,9 @@ mod tests {
             ("goal", MemoryKind::Goal),
             ("plan", MemoryKind::Plan),
             ("step", MemoryKind::Step),
+            ("told", MemoryKind::Told),
+            ("instruction", MemoryKind::Instruction),
+            ("intervention", MemoryKind::Intervention),
         ] {
             assert_eq!(MemoryKind::from_str(s), Some(v));
             assert_eq!(v.as_str(), s);

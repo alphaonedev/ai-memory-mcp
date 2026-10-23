@@ -13,12 +13,16 @@
 //!    [`SameUidAuthorizer`] admits only peers whose uid equals this process's
 //!    effective uid, which is what makes the 0600 socket a real boundary rather
 //!    than a hint.
-//! 2. [`HelloVerifier`] — the cryptographic half. The default shipped by this
-//!    issue is [`DenyAllVerifier`]: until #3468 lands the scoped
-//!    `a2a-hub/join/v1` delegation, EVERY hello is refused. That is deliberate.
-//!    A hub that admitted unauthenticated peers "until identity lands" would be
-//!    exactly the fail-open default the North Star forbids; refusing loudly
-//!    costs a wake hint, and the `<=60 s` backstop poll still delivers.
+//! 2. [`HelloVerifier`] — the cryptographic half. The live verifier wired by
+//!    the `ai-memory wake-hub` subcommand is
+//!    [`ScopedDelegationVerifier`](super::delegation_verifier::ScopedDelegationVerifier)
+//!    when an allowlist is configured; it checks the scoped `a2a-hub/join/v1`
+//!    delegation (#3468) against a reloading allowlist. [`DenyAllVerifier`] is
+//!    the fallback otherwise (posture `deny-all`) and in tests: it refuses
+//!    EVERY hello. That is deliberate. A hub that admitted unauthenticated
+//!    peers "until identity lands" would be exactly the fail-open default the
+//!    North Star forbids; refusing loudly costs a wake hint, and the `<=60 s`
+//!    backstop poll still delivers (#7272).
 //!
 //! # Why a transcript, not a bare nonce
 //!
@@ -89,7 +93,9 @@ pub enum DenyReason {
     },
     /// The platform did not supply a peer pid on an established connection.
     PeerPidUnavailable,
-    /// No identity verifier is wired yet (the shipped default until #3468).
+    /// No identity verifier is wired: returned by the [`DenyAllVerifier`]
+    /// fallback (no allowlist configured, and tests) and the default
+    /// [`HelloVerifier::verify_membership`].
     IdentityNotConfigured,
     /// The agent id is not in the derived allowlist cache.
     UnknownAgent,
@@ -144,9 +150,9 @@ impl fmt::Display for DenyReason {
             }
             Self::PeerPidUnavailable => f.write_str("platform supplied no peer pid"),
             Self::IdentityNotConfigured => f.write_str(
-                "no wake-hub identity verifier is configured — the scoped \
-                 a2a-hub/join/v1 delegation lands in #3468; every hello is refused \
-                 until then",
+                "no wake-hub identity verifier is configured (no allowlist: posture deny-all); \
+                 every hello is refused until an allowlist arms the scoped \
+                 a2a-hub/join/v1 delegation verifier (#3468)",
             ),
             Self::UnknownAgent => f.write_str("agent id is not in the allowlist cache"),
             Self::BadSignature => f.write_str("hello transcript signature did not verify"),
@@ -372,7 +378,9 @@ pub trait HelloVerifier: Send + Sync + 'static {
     }
 }
 
-/// The verifier the `ai-memory wake-hub` subcommand ships with until #3468.
+/// The fallback verifier: the hub runs it when no allowlist is configured
+/// (posture `deny-all`) and tests inject it; with an allowlist the hub uses
+/// [`ScopedDelegationVerifier`](super::delegation_verifier::ScopedDelegationVerifier).
 ///
 /// Refuses every hello. The hub still binds its socket, still asserts its
 /// start-up invariants and still serves metrics, so an operator can verify the
