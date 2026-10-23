@@ -359,22 +359,81 @@ fn read_fingerprint(file: &fs::File, offset: u64) -> Vec<u8> {
     buf
 }
 
-/// True when the file now at `state.path` has other bytes before the cursor
-/// than the ones last seen there (a fresh open, not the held handle).
+/// What one open attempt of the followed path showed.
+enum PathProbe {
+    /// The path still holds the followed file (or no evidence says otherwise).
+    Same,
+    /// The path holds another file; the fresh handle is ready to be adopted.
+    Replaced(fs::File),
+    /// The path could not be opened; no evidence about its identity.
+    Unopenable,
+}
+
+/// Note tail when an inode proved the path was renamed away and recreated.
+const NOTE_DRAINING_RENAMED: &str = "still draining the renamed file";
+/// Note tail when an open failed without any evidence of a replacement.
+const NOTE_KEEPING_HANDLE: &str = "still following the open file";
+
+/// Write the cannot-open note once per episode (`state.unreadable` latch,
+/// the #8005 shape); a later successful open clears the latch.
+fn note_cannot_open(
+    state: &mut FollowState,
+    out: &mut CliOutput<'_>,
+    path: &Path,
+    err: &anyhow::Error,
+    tail: &str,
+) -> Result<()> {
+    if state.unreadable.as_deref() != Some(path) {
+        writeln!(
+            out.stderr,
+            "logs: cannot open {}: {err:#}; {tail}",
+            path.display()
+        )?;
+        state.unreadable = Some(path.to_path_buf());
+    }
+    Ok(())
+}
+
+/// Open `state.path` ONCE and classify it. With inodes the inode decides;
+/// without, the bytes before the cursor in the OPENED handle are compared with
+/// the ones last seen (#8027).
 ///
-/// decision: a path that exists but cannot be opened counts as replaced over
-/// "unchanged", because without an inode this is the only signal a recreated
-/// file that is not readable yet gives; `follow_poll` then takes the #8062
-/// open-first retry (one note, old handle kept draining) instead of the
-/// truncate branch re-reading the old file on every poll (#8092).
-fn path_fingerprint_differs(state: &FollowState) -> bool {
-    if state.fingerprint.is_empty() {
-        return false;
+/// decision: a failed open is never evidence of replacement, and the
+/// fingerprint is read from the handle that was opened (one open per poll)
+/// over a second path-based open, because a transient error on an unchanged
+/// file would otherwise print a false note, reset the cursor to 0 and reprint
+/// the file (#8117, #8109); a successful identical open clears every latch
+/// (#8108, #8118).
+fn probe_path(
+    state: &mut FollowState,
+    id: Option<u64>,
+    out: &mut CliOutput<'_>,
+) -> Result<PathProbe> {
+    let path = state.path.clone();
+    let inode_known = state.id.is_some() && id.is_some();
+    let file = match open_followed(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            let tail = if inode_known && state.id != id {
+                NOTE_DRAINING_RENAMED
+            } else {
+                NOTE_KEEPING_HANDLE
+            };
+            note_cannot_open(state, out, &path, &err, tail)?;
+            return Ok(PathProbe::Unopenable);
+        }
+    };
+    let replaced = if inode_known {
+        state.id != id
+    } else {
+        !state.fingerprint.is_empty()
+            && state.fingerprint_holds()
+            && read_fingerprint(&file, state.offset) != state.fingerprint
+    };
+    if replaced {
+        return Ok(PathProbe::Replaced(file));
     }
-    match fs::File::open(&state.path) {
-        Ok(file) => read_fingerprint(&file, state.offset) != state.fingerprint,
-        Err(_) => true,
-    }
+    Ok(PathProbe::Same)
 }
 
 /// Stable identity of the file behind `meta`: the inode on unix, `None` where
@@ -394,6 +453,12 @@ thread_local! {
     /// Test hook: make [`file_id`] report no identity on a unix host, to drive
     /// the path a host without inodes takes (#8092).
     static NO_INODE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: how many times [`open_followed`] ran on this thread (#8109).
+    static OPEN_FOLLOWED_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(not(unix))]
@@ -497,6 +562,8 @@ fn read_lines_from_handle(
 
 /// Open `path` as the followed handle.
 fn open_followed(path: &Path) -> Result<fs::File> {
+    #[cfg(test)]
+    OPEN_FOLLOWED_CALLS.set(OPEN_FOLLOWED_CALLS.get() + 1);
     fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))
 }
 
@@ -596,60 +663,40 @@ fn follow_poll(
         }
     } else if let Ok(meta) = fs::metadata(&state.path) {
         let id = file_id(&meta);
-        let replaced = if state.id.is_some() && id.is_some() {
-            state.id != id
-        } else {
-            // decision: without inode identity compare the bytes the path
-            // holds NOW before the cursor with the ones the open handle still
-            // holds over trusting the handle alone, because the handle keeps
-            // the renamed-away inode and so can never see a replacement
-            // (#8027). A replacement identical in those bytes is missed.
-            state.fingerprint_holds() && path_fingerprint_differs(state)
-        };
-        if replaced {
-            // Rename-and-recreate: the writer may still have appended to the
-            // renamed file, which only the old handle can reach.
-            // decision: open the recreated path BEFORE leaving the old handle,
-            // reusing the #8005 bounded retry shape (one stderr note through
-            // `state.unreadable`, retried every poll while the replacement is
-            // still detected) over a new retry state, because a precedent
-            // exists (#8062, #8063, ERRORS-02).
-            let path = state.path.clone();
-            match open_followed(&path) {
-                Ok(file) => {
-                    drain_followed(state, filters, out, true)?;
+        // Rename-and-recreate: the writer may still have appended to the
+        // renamed file, which only the old handle can reach.
+        // decision: open the path BEFORE leaving the old handle (#8062,
+        // #8063, ERRORS-02) and treat a failed open as no evidence (#8117).
+        match probe_path(state, id, out)? {
+            PathProbe::Replaced(file) => {
+                let path = state.path.clone();
+                drain_followed(state, filters, out, true)?;
+                writeln!(
+                    out.stderr,
+                    "logs: {} was rotated or truncated; following from the start",
+                    path.display()
+                )?;
+                switch_to(state, path, Some(file));
+            }
+            PathProbe::Unopenable => {}
+            PathProbe::Same => {
+                if meta.len() < state.offset || !state.fingerprint_holds() {
+                    // decision: a short prefix fingerprint of the bytes before
+                    // the cursor over mtime+len or a content hash, because it
+                    // costs one 64-byte read per poll, needs no clock, and
+                    // sees a same-inode truncate that regrows past the old
+                    // offset within one poll (#7965). It misses only a
+                    // rewrite whose last 64 bytes before the cursor are
+                    // byte-identical to the old ones.
                     writeln!(
                         out.stderr,
                         "logs: {} was rotated or truncated; following from the start",
-                        path.display()
+                        state.path.display()
                     )?;
-                    switch_to(state, path, Some(file));
-                }
-                Err(err) => {
-                    if state.unreadable.as_ref() != Some(&path) {
-                        writeln!(
-                            out.stderr,
-                            "logs: cannot open {}: {err:#}; still draining the renamed file",
-                            path.display()
-                        )?;
-                        state.unreadable = Some(path);
-                    }
+                    state.offset = 0;
+                    state.fingerprint.clear();
                 }
             }
-        } else if meta.len() < state.offset || !state.fingerprint_holds() {
-            // decision: a short prefix fingerprint of the bytes before the
-            // cursor over mtime+len or a content hash, because it costs one
-            // 64-byte read per poll, needs no clock, and sees a same-inode
-            // truncate that regrows past the old offset within one poll
-            // (#7965). It misses only a rewrite whose last 64 bytes before
-            // the cursor are byte-identical to the old ones.
-            writeln!(
-                out.stderr,
-                "logs: {} was rotated or truncated; following from the start",
-                state.path.display()
-            )?;
-            state.offset = 0;
-            state.fingerprint.clear();
         }
         if state.id.is_none() {
             state.id = id;
@@ -1180,6 +1227,67 @@ mod tests {
         );
         let (s4, _) = poll_once(dir.path(), &mut state);
         assert_eq!(s4, "", "no duplicate: {s4:?}");
+    }
+
+    /// Drop the read bit so the path cannot be opened; false when the bits do
+    /// not bite (privileged user).
+    #[cfg(unix)]
+    fn make_unopenable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::File::open(path).is_err()
+    }
+
+    #[cfg(unix)]
+    fn make_openable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// #8117 - with no inode, a transient open failure on an UNCHANGED file is
+    /// no evidence of replacement: no rename/rotation claim, no reprint, and
+    /// the cursor survives the failure.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_transient_open_failure_is_not_replacement_8117() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "", "no reprint: {s1:?}");
+        assert!(!e1.contains("renamed"), "false rename claim: {e1:?}");
+        assert!(!e1.contains("rotated"), "false rotation claim: {e1:?}");
+        assert_eq!(state.offset, 8, "cursor untouched by the failure");
+        make_openable(&a);
+        append(&a, "three\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "three\n", "only the new line, no reprint: {s2:?}");
+        assert!(!e2.contains("rotated"), "no rotation note: {e2:?}");
+    }
+
+    /// #8109 - exactly one open of the followed path per poll, and a
+    /// replacement is adopted from that same handle (printed once).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_one_open_per_poll_8109() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\nold-2\n");
+        let mut state = open_state(&a, 12);
+        OPEN_FOLLOWED_CALLS.set(0);
+        let _ = poll_once(dir.path(), &mut state);
+        assert_eq!(OPEN_FOLLOWED_CALLS.get(), 1, "unchanged file: one open");
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        fs::write(&a, "new-1\n").unwrap();
+        OPEN_FOLLOWED_CALLS.set(0);
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(OPEN_FOLLOWED_CALLS.get(), 1, "replacement: one open");
+        assert_eq!(s, "new-1\n", "printed once: {s:?}");
+        assert_eq!(e.matches("rotated or truncated").count(), 1, "note: {e:?}");
     }
 
     /// #8097 - the sink sees lines while the read is still going: the first
