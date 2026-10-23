@@ -26,10 +26,12 @@
 //!   `SO_PEERCRED` (Linux) / `LOCAL_PEERPID` + `getpeereid` (macOS); agent
 //!   admission is a scoped `a2a-hub/join/v1` delegation from the enrolled
 //!   ai-memory key, verified behind [`identity::HelloVerifier`]. The verifier
-//!   shipped by THIS issue is [`identity::DenyAllVerifier`] — it refuses every
-//!   hello, because the delegation lands in
-//!   [#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468) and a
-//!   hub that admitted unauthenticated peers "until identity lands" would be
+//!   shipped by THIS issue (#3467) was [`identity::DenyAllVerifier`], which
+//!   refuses every hello; the live hub wires
+//!   [`delegation_verifier::ScopedDelegationVerifier`]
+//!   ([#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)) when
+//!   an allowlist is configured and stays deny-all otherwise, because a hub
+//!   that admitted unauthenticated peers "until identity lands" would be
 //!   exactly the fail-open default the North Star forbids.
 //! * **It never touches the store.** No `db::open`, no SQL, no Postgres path,
 //!   no filesystem state beyond its own socket — so the `postgres://`
@@ -205,8 +207,9 @@ impl HubConfig {
 
 /// The injected admission gates.
 ///
-/// Both default to the production choice: same-uid peers only, and NO hello
-/// accepted until the scoped delegation lands in #3468.
+/// Both default to the fail-closed choice: same-uid peers only, and the
+/// `DenyAllVerifier` fallback (the live hub injects the scoped delegation
+/// verifier when an allowlist is configured, #3468).
 #[derive(Clone)]
 pub struct HubDeps {
     /// Kernel-attested peer-credential gate.
@@ -366,7 +369,7 @@ mod tests {
         assert_eq!(
             deps.verifier.verify(&req),
             Err(DenyReason::IdentityNotConfigured),
-            "the shipped hub must not admit anyone until #3468 lands"
+            "HubDeps::default() must stay deny-all: it is the fail-closed fallback (the live hub injects ScopedDelegationVerifier when an allowlist is configured, #3468)"
         );
     }
 
