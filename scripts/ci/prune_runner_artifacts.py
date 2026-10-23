@@ -79,7 +79,41 @@ EXIT_USAGE = 2
 EXIT_BAD_ARGS = EXIT_USAGE
 
 
+MAX_SYMLINK_HOPS = 40  # Linux MAXSYMLINKS (macOS caps at 32)
+
+
+def _raise_on_symlink_loop(path):
+    """Python 3.13+ no longer raises on a loop in non-strict resolve() (#7326)."""
+    current = Path(path)
+    if not current.is_absolute():
+        current = Path(os.getcwd()) / current  # an absolute path never touches the cwd
+    todo = list(reversed(current.parts[1:]))
+    current = Path(current.anchor)
+    hops = 0
+    while todo:
+        part = todo.pop()
+        if part == "..":
+            current = current.parent
+            continue
+        nxt = current / part
+        try:
+            target = os.readlink(nxt)
+        except OSError:
+            current = nxt  # not a link, missing or unreadable: resolve() decides
+            continue
+        hops += 1
+        if hops > MAX_SYMLINK_HOPS:
+            # A protected-root entry reaching a directory through more links than the cap
+            # protects only its own lexical path; the kernel refuses such a chain too.
+            raise RuntimeError("Symlink loop from %r" % os.fspath(path))
+        parts = Path(target).parts
+        if Path(target).is_absolute():
+            current, parts = Path(parts[0]), parts[1:]
+        todo.extend(reversed(parts))
+
+
 def resolve(path):
+    _raise_on_symlink_loop(path)
     return Path(path).resolve()
 
 
