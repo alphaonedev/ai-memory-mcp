@@ -13,6 +13,11 @@
 #[path = "cli/export_reflections.rs"]
 mod export_reflections;
 
+// #2415 — shared `AI_MEMORY_TEST_TIMING_BUDGET_MULT` parse for the
+// load-scaled bound in the export_reflections non-blocking test.
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
+
 // v0.7.0 WT-1-F — `ai-memory atomise` CLI tests.
 #[path = "cli/atomise.rs"]
 mod atomise;
