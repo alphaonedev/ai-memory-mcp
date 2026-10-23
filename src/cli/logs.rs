@@ -247,9 +247,18 @@ fn list_log_candidates(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in fs::read_dir(dir).with_context(|| crate::errors::msg::reading(dir.display()))? {
         let entry = entry?;
         let p = entry.path();
-        if p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains("ai-memory") && !n.ends_with(".zst"))
+        // decision: filter on the directory entry's own type (no stat and no
+        // open of the entry) over listing every name, because a directory,
+        // FIFO or socket sorting last would otherwise shadow the real newest
+        // log and stop both the switch and the truncation check (#8222).
+        // A symlink is kept: the opened handle's `fstat` decides it.
+        let listable = entry
+            .file_type()
+            .is_ok_and(|t| t.is_file() || t.is_symlink());
+        if listable
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("ai-memory") && !n.ends_with(".zst"))
         {
             files.push(p);
         }
@@ -665,30 +674,45 @@ fn follow_poll(
     filters: &Filters,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let newest = list_log_candidates(dir)?.pop();
-    // decision: compare newest against the followed path with the module's own
-    // ordering (`enumerate_log_files` sorts by path, the rolling appender's
-    // date suffix) over keeping a set of seen paths, because `>` needs no
-    // extra state and an older file can never win once the followed newest
-    // file is renamed away or removed (#7964).
-    if let Some(newest) = newest
-        && newest > state.path
-    {
+    // decision: compare each candidate against the followed path with the
+    // module's own ordering (`list_log_candidates` sorts by path, the rolling
+    // appender's date suffix) over keeping a set of seen paths, because `>`
+    // needs no extra state and an older file can never win once the followed
+    // newest file is renamed away or removed (#7964).
+    let newer: Vec<PathBuf> = list_log_candidates(dir)?
+        .into_iter()
+        .filter(|p| *p > state.path)
+        .collect();
+    if !newer.is_empty() {
         // Rotation by name: finish the old file, then follow the new one from 0.
         // decision: open the newer file BEFORE leaving the old one over
         // switching blind, because an unreadable newer file would otherwise
-        // blind the follower for good (`newest > state.path` never moves
-        // back); the failure is reported once and the old file keeps being
-        // followed while the open is retried each poll (#8005, ERRORS-02).
-        match open_followed(&newest) {
-            Ok(file) => {
-                drain_followed(state, filters, out, true)?;
-                switch_to(state, newest, file);
+        // blind the follower for good (a larger name never moves back); walk
+        // the candidates from the newest down and adopt the first that opens
+        // as a regular file, because one non-regular entry sorting above the
+        // real rotated log (a directory, a FIFO) would otherwise shadow it on
+        // every poll (#8222). The highest failure is reported once and the old
+        // file keeps being followed while no candidate opens (#8005, ERRORS-02).
+        let mut skipped: Option<(PathBuf, anyhow::Error)> = None;
+        let mut adopted: Option<(PathBuf, fs::File)> = None;
+        for candidate in newer.into_iter().rev() {
+            match open_followed(&candidate) {
+                Ok(file) => {
+                    adopted = Some((candidate, file));
+                    break;
+                }
+                Err(err) => {
+                    skipped.get_or_insert((candidate, err));
+                }
             }
-            Err(err) => {
-                let tail = format!("still following {}", state.path.display());
-                note_cannot_open(state, out, &newest, &err, &tail)?;
-            }
+        }
+        if let Some((path, err)) = skipped {
+            let tail = format!("still following {}", state.path.display());
+            note_cannot_open(state, out, &path, &err, &tail)?;
+        }
+        if let Some((path, file)) = adopted {
+            drain_followed(state, filters, out, true)?;
+            switch_to(state, path, file);
         }
     } else {
         // Rename-and-recreate: the writer may still have appended to the
@@ -1638,8 +1662,7 @@ mod tests {
         append(&a, "two\n");
         let (s, e) = bounded_poll(dir.path(), state).expect("poll hung on a FIFO");
         assert_eq!(s, "two\n", "old file still followed: {s:?}");
-        assert_eq!(e.matches("cannot open").count(), 1, "one note: {e:?}");
-        assert!(e.contains("still following"), "{e:?}");
+        assert_eq!(e, "", "FIFO skipped by entry type, quietly: {e:?}");
     }
 
     /// Plant a non-regular `ai-memory.log.old` that sorts above the dated
