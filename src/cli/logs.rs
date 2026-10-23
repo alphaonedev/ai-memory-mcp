@@ -433,6 +433,7 @@ fn probe_path(
     if replaced {
         return Ok(PathProbe::Replaced(file));
     }
+    state.unreadable = None;
     Ok(PathProbe::Same)
 }
 
@@ -1267,6 +1268,71 @@ mod tests {
         let (s2, e2) = poll_once(dir.path(), &mut state);
         assert_eq!(s2, "three\n", "only the new line, no reprint: {s2:?}");
         assert!(!e2.contains("rotated"), "no rotation note: {e2:?}");
+    }
+
+    /// #8118 - after a transient episode on the same file, a real rename plus
+    /// an unreadable recreate still prints the note once and resumes when the
+    /// new file turns readable.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_note_after_transient_episode_8118() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (_, e1) = poll_once(dir.path(), &mut state);
+        assert!(e1.matches("cannot open").count() <= 1, "episode 1: {e1:?}");
+        make_openable(&a);
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s2.as_str(), e2.as_str()),
+            ("", ""),
+            "healed: {s2:?} {e2:?}"
+        );
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        fs::write(&a, "n1\n").unwrap();
+        assert!(make_unopenable(&a));
+        let (_, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            e3.matches("cannot open").count(),
+            1,
+            "episode 2 note: {e3:?}"
+        );
+        let (s4, e4) = poll_once(dir.path(), &mut state);
+        assert_eq!((s4.as_str(), e4.as_str()), ("", ""), "once only");
+        make_openable(&a);
+        let (s5, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s5, "n1\n", "resumes on the new file: {s5:?}");
+    }
+
+    /// #8108 - the cannot-open latch clears after a transient episode: a second
+    /// episode on the same file prints its own note once.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_cannot_open_latch_clears_8108() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (_, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(e1.matches("cannot open").count(), 1, "episode 1: {e1:?}");
+        let (_, e1b) = poll_once(dir.path(), &mut state);
+        assert_eq!(e1b, "", "deduped within the episode");
+        make_openable(&a);
+        let _ = poll_once(dir.path(), &mut state);
+        assert!(
+            state.unreadable.is_none(),
+            "latch cleared after the episode"
+        );
+        assert!(make_unopenable(&a));
+        let (_, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(e2.matches("cannot open").count(), 1, "episode 2: {e2:?}");
     }
 
     /// #8109 - exactly one open of the followed path per poll, and a
