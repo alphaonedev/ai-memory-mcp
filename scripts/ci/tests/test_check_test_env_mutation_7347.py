@@ -3278,7 +3278,8 @@ class CalleeTrustInvariant(unittest.TestCase):
 
 R19_MUTANTS = (  # (name, issue, FileModel method, original text, mutated text): each must turn a probe of its issue RED
     ("n_macro_shadow_off", 8154, "callee_origin",
-     "if kind == CALLEE_MACRO and not segs and name in self.macro_names:", "if False:"),
+     "if kind == CALLEE_MACRO and not segs and (name in self.macro_names or MACRO_OPEN in self.macro_names):",
+     "if False:"),
     ("n_module_macros_off", 8154, "_index_imports",
      "self.macro_names = self.macro_defs | self.module_macros", "self.macro_names = self.macro_defs"),
     ("n_method_callee_by_name", 8155, "callee_origin", "return STD if full in TRUSTED_METHOD_PATHS else UNKNOWN",
@@ -3423,10 +3424,11 @@ R20_PROBES = {
           "tests/rt/a/b.rs": R19_SHADOW % "join"}),
         (R20_NEST, R20_JOIN, True,
          {"tests/rt.rs": "#[macro_use]\nmod x { #[macro_use] mod inner; }\n", "tests/rt/x/inner.rs": R19_SHADOW % "join"}),
-        # controls: a nested module without a shadow, and a module file that declares itself (a cycle that terminates)
+        # controls: a nested module without a shadow, and a module file that declares itself through #[path] (a cycle
+        # that terminates; a plain `mod rt;` in tests/rt.rs would name tests/rt/rt.rs, which the gate fails closed on)
         (R20_NEST, R20_JOIN, False,
          {"tests/rt.rs": "#[macro_use]\nmod inner;\n", "tests/rt/inner.rs": "pub fn f() {}\n"}),
-        (R20_NEST, R20_JOIN, False, {"tests/rt.rs": "#[macro_use]\nmod rt;\n"}),
+        (R20_NEST, R20_JOIN, False, {"tests/rt.rs": '#[macro_use]\n#[path = "rt.rs"]\nmod rt;\n'}),
     ],
 }
 

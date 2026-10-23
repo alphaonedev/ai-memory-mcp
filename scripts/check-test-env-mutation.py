@@ -376,7 +376,14 @@ MAX_REBIND_HOPS = 8  # #8045: rebinding steps followed from a spawn argument; a 
 MAX_CARRIER_NAMES = 32  # #8051: distinct local names followed from a spawn argument; more flags the whole fn
 ASSIGN = r"(?<![\w.])%s\s*=(?![=>])"  # `g = <init>;` (a re-assignment of a carrier variable)
 LOCAL_NAME = re.compile(r"(?<![\w.:])([A-Za-z_]\w*)\b(?!\s*::)")  # an identifier that is not a path segment or field
-MOD_DECL = re.compile(r'(?:#\[\s*path\s*=\s*"([^"]+)"\s*\]\s*)?(?:pub(?:\([^)]*\))?\s+)?\bmod\s+([A-Za-z_]\w*)\s*;')
+ATTR_RUN = r"(?:#\s*!?\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\]\s*)*"  # r23: any run of attributes, in any order
+MOD_ITEM = re.compile(r"(" + ATTR_RUN + r")(?:pub(?:\s*\([^)]*\))?\s+)?\bmod\s+([A-Za-z_]\w*)\s*;")  # r23: `[attrs] mod m;`
+ATTR_ONE = re.compile(r"#\s*!?\s*\[((?:[^\[\]]|\[[^\[\]]*\])*)\]")  # r23: one attribute and its body
+RUST_LITERAL = r'(?:"((?:[^"\\]|\\.)*)"|r(#*)"(.*?)"\2)'  # r23: a plain or a raw string literal (groups: plain, hashes, raw)
+PATH_ATTR = re.compile(r"\s*path\s*=\s*" + RUST_LITERAL + r"\s*\Z", re.S)  # r23: a whole `path = ".."` attribute body
+INCLUDE_CALL = re.compile(r"(?<![\w$])include\s*!\s*[(\[{]")  # r23: the start of an `include!(..)` call
+INCLUDE_ARG = re.compile(r"\s*" + RUST_LITERAL + r"\s*,?\s*[)\]}]", re.S)  # r23: its argument: one literal and nothing else
+MACRO_OPEN = "*"  # r23: the entry that marks a module walk as incomplete: no bare macro name is then trusted
 LOOP_BIND = r"\bfor\b[^{};]*\b%s\b[^{};]*\bin\b"  # `for g in <expr> {`
 ARM_BIND = r"(?<![\w.])%s\b\s*(?:[,)|]\s*)*=>"  # a match-arm pattern naming the variable
 PARAM_BIND = r"\|[^|;{}]*\b%s\b[^|;{}]*\|"  # a closure parameter list naming the variable
@@ -476,7 +483,6 @@ INLINE_MOD = re.compile(r"(?<![\w$])mod\s+([A-Za-z_]\w*)\s*\{")  # r14 (G3): an 
 SRC_TRAIT = re.compile(r"(?<![\w$])trait\s+([A-Za-z_]\w*)[^{;]*\{")  # a trait declaration of src/ and its body
 SRC_TYPE = re.compile(r"(?<![\w$])(?:struct|enum|union|type)\s+([A-Za-z_]\w*)")  # a src/ type that is not a trait
 FN_NAME = re.compile(r"(?<![\w$])fn\s+([A-Za-z_]\w*)")  # every fn a trait body declares (nested ones included)
-INCLUDE_MACRO = re.compile(r'(?<![\w$])include\s*!\s*\(\s*"([^"]+)"\s*\)')  # r15 (N2, N3): `include!("file.rs")`, a file read as if pasted here
 MACRO_RULES_NAME = re.compile(r"(?<![\w$])macro_rules\s*!\s*([A-Za-z_]\w*)")  # a macro_rules! definition
 # r12 (#8139): `async [move] |..|`: an async closure, whose call yields a future that runs the body when polled.
 ASYNC_CLOSURE = re.compile(r"async\s+(?:move\s+)?\|")
@@ -2037,10 +2043,100 @@ class ItemIndex:
         return self
 
 
+class ModuleSet(set):
+    """The macro_rules! names in textual scope of one test file (r23); `texts` holds the scrubbed text of every module
+    or include! file its walk read, and MACRO_OPEN is a member when the walk could not read or parse some target."""
+
+    texts = ()
+
+
+class ModuleWalk:
+    """The module tree below one file (r23): every `mod m;` (its attributes in any order, a `#[path]` file wherever it
+    lives) and every `include!("..")` is resolved and read once. Whatever the walk cannot resolve, read or fully parse
+    (a missing module file, a `#[path]` or `include!` argument that is not one plain or raw string literal, a path
+    attribute inside `cfg_attr`, an attribute run it cannot split) is recorded in `problems` with the file and the
+    reason, never skipped: the callers treat such a tree as OPEN and trust nothing the unread text might change."""
+
+    def __init__(self, read):
+        self.read = read  # path -> the file's text, or None when it cannot be read
+        self.files = []  # [(path, raw text)] in the order they were read
+        self.problems = []  # [(path, reason)]
+        self._seen = set()
+
+    def visit(self, path, below, skip=()):
+        """Read path (once) and expand it; below is the directory its plain `mod m;` items resolve under. False when
+        the file cannot be read."""
+        path = pathlib.Path(os.path.normpath(path))
+        if path in self._seen:
+            return True
+        text = self.read(path)
+        if text is None:
+            return False
+        self.add(path, text, below, skip)
+        return True
+
+    def add(self, path, text, below, skip=()):
+        """Expand the already read text of path; `skip` names the plain modules not to follow (tests/common)."""
+        path = pathlib.Path(os.path.normpath(path))
+        self._seen.add(path)
+        self.files.append((path, text))
+        scrubbed = scrub(text)
+        for m in MOD_ITEM.finditer(scrubbed):
+            name, cands, problem = self.decl(path, text, scrubbed, m, below)
+            if problem:
+                self.problems.append((path, problem))
+            elif name not in skip or len(cands) != 2:
+                if not any(self.visit(cand, cbelow) for cand, cbelow in cands):
+                    self.problems.append((path, "module file for `mod %s;` not found (tried %s)" % (
+                        name, ", ".join(c.as_posix() for c, _ in cands))))
+        for m in INCLUDE_CALL.finditer(scrubbed):
+            arg = INCLUDE_ARG.match(text, m.end())
+            if arg is None or (arg.group(1) is not None and "\\" in arg.group(1)):
+                self.problems.append((path, "include! argument is not one plain or raw string literal (%s)" % (
+                    text[m.start():m.end() + 40].split("\n")[0].strip())))
+                continue
+            target = path.parent / (arg.group(1) if arg.group(1) is not None else arg.group(3))
+            if not self.visit(target, self.inline_dir(scrubbed, m.start(), below)):
+                self.problems.append((path, "include! file %s not found" % target.as_posix()))
+
+    @staticmethod
+    def inline_dir(scrubbed, at, below):
+        """below plus the name of every inline `mod y { .. }` of scrubbed that encloses offset at."""
+        names = [i.group(1) for i in INLINE_MOD.finditer(scrubbed, 0, at) if match_brace(scrubbed, i.end() - 1) > at]
+        return below.joinpath(*names) if names else below
+
+    @staticmethod
+    def decl(path, text, scrubbed, m, below):
+        """(module name, [(candidate file, directory its own `mod` items resolve under)], problem or None) for the
+        `[attrs] mod name;` item matched by MOD_ITEM in the file path. The attribute run is read in any order; a
+        `#[path = ".."]` (plain or raw literal) names the file, relative to the directory of path (below, plus the
+        inline modules, inside an inline `mod`), and that file is a mod-rs file (its own modules sit beside it)."""
+        name, run, rel = m.group(2), m.group(1), None
+        if not run.strip() and scrubbed[:m.start()].rstrip().endswith("]"):
+            return name, [], "an attribute before `mod %s;` cannot be parsed" % name
+        for a in ATTR_ONE.finditer(run):
+            body = a.group(1)
+            if not (re.match(r"\s*path\b", body) or ("cfg_attr" in body and re.search(r"\bpath\b", body))):
+                continue
+            lit = PATH_ATTR.match(text[m.start(1) + a.start(1):m.start(1) + a.end(1)])
+            if lit is None or rel is not None or (lit.group(1) is not None and "\\" in lit.group(1)):
+                return name, [], "the path attribute of `mod %s;` is not one plain or raw string literal" % name
+            rel = lit.group(1) if lit.group(1) is not None else lit.group(3)
+        inside = ModuleWalk.inline_dir(scrubbed, m.start(), below)
+        if rel is not None:
+            target = (inside if inside != below else path.parent) / rel
+            return name, [(target, target.parent)], None
+        return name, [(inside / (name + ".rs"), inside / name), (inside / name / "mod.rs", inside / name)], None
+
+
 class CommonModel:
     """tests/common census: free fns that reach a strong reader, and the vars each helper writes."""
 
     def __init__(self, root=None):
+        self.root = root
+        self.diagnostics = set()  # r23: "<file>: <reason>" for each module / include! target the gate could not resolve
+        self._reads = {}  # path -> text (None: unreadable)
+        self.src_open = False  # r23: some module / include! target of src/ could not be resolved or parsed
         self.fns = {}
         self.sources = {}
         self.detachers = {}  # #8052: key -> (parameter indices handed to a spawn, has_self) for EVERY tests/common fn
@@ -2050,7 +2146,6 @@ class CommonModel:
         self._strong, self._vars = {}, {}
         self.src_consts = self._src_consts(root)
         self.macro_names = set()  # r13 (#8154): every macro_rules! name tests/common defines
-        self._mod_macros = {}  # r13 (#8154): module file -> the macro_rules! names it defines (None: unreadable)
         # r13 (#8155, #8157): the crate the tests import (its [package] name), and per src/ trait name the methods it
         # declares; src_types holds the struct / enum / union / type names, which never supply a method
         self.crate_name, self.src_traits, self.src_types = self._src_items(root)
@@ -2077,6 +2172,32 @@ class CommonModel:
         # #8060: one fixpoint over every tests/common file, each file wrapped in its module path, so a helper
         # that calls a detaching helper of another common file (`super::spawn::bg(f)`) detaches too.
         self.detachers = detaching_fns("mod common {\n%s\n}" % "\n".join(texts))
+        # r23: the module and include! targets of tests/common are walked too; one that cannot be resolved opens the
+        # macro scope of every test file (a macro_rules! of the unread file could shadow any name)
+        walk = ModuleWalk(self._read)
+        for path in sorted(base.rglob("*.rs")):
+            walk.visit(path, path.parent if path.name == "mod.rs" else path.parent / path.stem)
+        if walk.problems:
+            self.macro_names.add(MACRO_OPEN)
+            self._diagnose(walk.problems)
+
+    def _read(self, path):
+        """The text of path, or None when it cannot be read (cached)."""
+        if path not in self._reads:
+            try:
+                self._reads[path] = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                self._reads[path] = None
+        return self._reads[path]
+
+    def _diagnose(self, problems):
+        """Record each (file, reason) of a walk as a diagnostic naming the file relative to the root."""
+        for path, reason in problems:
+            try:
+                shown = pathlib.Path(path).relative_to(self.root).as_posix()
+            except (ValueError, TypeError):
+                shown = pathlib.Path(path).as_posix()
+            self.diagnostics.add("%s: %s" % (shown, reason))
 
     @staticmethod
     def _src_consts(root):
@@ -2090,11 +2211,12 @@ class CommonModel:
                 values.setdefault(name, set()).add(value)
         return {name: vals.pop() for name, vals in values.items() if len(vals) == 1}
 
-    @staticmethod
-    def _src_items(root):
+    def _src_items(self, root):
         """(crate name, {trait name: method names}, type names) of the crate under root (r13, #8155, #8157). The
         crate name is the Cargo.toml [package] name with `-` read as `_` (None without a manifest); a trait name
-        declared twice keeps the union of the method names, which only widens what it may supply."""
+        declared twice keeps the union of the method names, which only widens what it may supply. The module tree
+        is read by ModuleWalk from the crate roots, then every other src/**/*.rs; a target it cannot resolve or parse
+        sets src_open (r23) and is named in the diagnostics."""
         if root is None:
             return None, {}, set()
         root = pathlib.Path(root)
@@ -2107,48 +2229,24 @@ class CommonModel:
         base = root / SRC_REL
         if not base.is_dir():
             return crate_name, {}, set()
-        files = CommonModel._src_files(base)
+        walk = ModuleWalk(self._read)
+        roots = [base / "lib.rs", base / "main.rs"] + sorted(base.glob("bin/*.rs")) + sorted(base.glob("bin/*/main.rs"))
+        for path in roots:  # a crate root first, so the files it reaches are read with the right module directory
+            walk.visit(path, path.parent)
+        for path in sorted(base.rglob("*.rs")):
+            if not walk.visit(path, path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem):
+                walk.problems.append((path, "file cannot be read"))
+        self.src_open = bool(walk.problems)
+        self._diagnose(walk.problems)
         generators = set()  # first pass: every macro_rules! of the crate that declares a trait
-        for path in files:
-            raw = path.read_text(encoding="utf-8", errors="replace")
+        for _path, raw in walk.files:
             if "macro_rules" in raw and "trait" in raw:
                 generators |= trait_generators(scrub(raw))
         index = ItemIndex(generators)
-        for path in files:
-            index.add(scrub(path.read_text(encoding="utf-8", errors="replace")))
+        for _path, raw in walk.files:
+            index.add(scrub(raw))
         index.close()
         return crate_name, dict(index.traits), index.types
-
-    @staticmethod
-    def _src_files(base):
-        """Every file of the crate's module tree (r15, N2): src/**/*.rs plus each file that a `#[path = ".."] mod m;`
-        or an `include!("..")` of one of them names, wherever it lives (`../gen/fan.rs` is outside src/), read once."""
-        files, seen, work = [], set(), sorted(base.rglob("*.rs"))
-        while work:
-            path = pathlib.Path(os.path.normpath(work.pop()))
-            if path in seen:
-                continue
-            seen.add(path)
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            files.append(path)
-            for follow in CommonModel._src_follow(text, path):
-                work.append(follow)
-        return files
-
-    @staticmethod
-    def _src_follow(text, path):
-        """The files that path pulls into the module tree with `#[path]` modules and `include!` (r15, N2)."""
-        below = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem
-        out = [here / rel for rel, _name, here in CommonModel._mod_decls(text, below, path.parent) if rel]
-        return out + [path.parent / rel for rel in CommonModel._includes(text)]
-
-    @staticmethod
-    def _includes(text):
-        """The file names of the `include!("..")` calls of text (r15, N2, N3)."""
-        return INCLUDE_MACRO.findall(text) if "include" in text else []
 
     @staticmethod
     def _dep_roots(root):
@@ -2194,73 +2292,36 @@ class CommonModel:
                 for name, real in seen.items() if real != {name}}
 
     def module_macros(self, path, raw):
-        """The macro_rules! names that the `#[path = ".."] mod m;` / `mod m;` files a test file declares define, plus
-        those of tests/common (r13, #8154). A `#[macro_use]` module puts them in textual scope ahead of a `use`d
-        macro of the same name; the gate does not track which module carries the attribute, so every one counts. The
-        walk is transitive (r14, G3): every `mod x;` that a module file declares, at any depth and inside any inline
-        `mod y { .. }`, is read in turn; a file read once is not read again, so a cycle ends."""
-        out, seen = set(self.macro_names), set()
-        for rel, name, base in self._mod_decls(raw, pathlib.Path(path).parent, pathlib.Path(path).parent):
-            if name != "common":
-                out |= self._mod_file_macros(rel, name, base, seen)
-        for irel in self._includes(raw):  # r15 (N3): an include!d file defines its macros in this file's textual scope
-            out |= self._mod_file_macros(irel, None, pathlib.Path(path).parent, seen)
+        """The macro_rules! names in textual scope of a test file: those of tests/common and those of every module
+        and include! file its ModuleWalk reads (r13, #8154; r14, G3; r15, N3; r23). A `#[macro_use]` module puts them
+        in textual scope ahead of a `use`d macro of the same name; the gate does not track which module carries the
+        attribute, so every one counts. A target the walk cannot resolve or parse adds MACRO_OPEN, so no bare macro
+        name is trusted for that file, and is named in the diagnostics. The result carries the scrubbed text of the
+        files read (ModuleSet.texts), which the file's own item index covers."""
+        path = pathlib.Path(path)
+        walk = ModuleWalk(self._read)
+        walk.add(path, raw, path.parent, skip=("common",))
+        out = ModuleSet(self.macro_names)
+        out.texts = [scrub(text) for _file, text in walk.files[1:]]
+        for text in out.texts:
+            out.update(MACRO_RULES_NAME.findall(text))
+        if walk.problems:
+            out.add(MACRO_OPEN)
+            self._diagnose(walk.problems)
         return out
-
-    @staticmethod
-    def _mod_decls(raw, base, path_base):
-        """[(path attribute or None, module name, directory it is declared relative to)] for each `mod m;` of raw. The
-        directory is base (or path_base for a `#[path]` attribute) plus the name of every inline `mod y { .. }` that
-        encloses the declaration (r14, G3)."""
-        scrubbed, out = scrub(raw), []
-        for m in MOD_DECL.finditer(raw):
-            here = path_base if m.group(1) else base
-            for inline in INLINE_MOD.finditer(scrubbed, 0, m.start()):
-                if match_brace(scrubbed, inline.end() - 1) > m.start():
-                    here = here / inline.group(1)
-            out.append((m.group(1), m.group(2), here))
-        return out
-
-    def _mod_file_macros(self, rel, name, base, seen):
-        """The macro_rules! names of the module file that `mod name;` declares and of every module file below it."""
-        cands = [base / rel] if rel else [base / (name + ".rs"), base / name / "mod.rs"]
-        for cand in cands:
-            if cand not in self._mod_macros:
-                try:
-                    text = cand.read_text(encoding="utf-8", errors="replace")
-                    self._mod_macros[cand] = (set(MACRO_RULES_NAME.findall(scrub(text))), text)
-                except OSError:
-                    self._mod_macros[cand] = None
-            if self._mod_macros[cand] is None:
-                continue
-            if cand in seen:
-                return set()
-            seen.add(cand)
-            out, text = set(self._mod_macros[cand][0]), self._mod_macros[cand][1]
-            below = cand.parent if cand.name == "mod.rs" else cand.parent / cand.stem
-            for crel, cname, cbase in self._mod_decls(text, below, cand.parent):
-                out |= self._mod_file_macros(crel, cname, cbase, seen)
-            for irel in self._includes(text):
-                out |= self._mod_file_macros(irel, None, cand.parent, seen)
-            return out
-        return set()
 
     def path_modules(self, path, raw):
         """{module name: detaching_fns} for the `#[path = ".."] mod m;` and `mod m;` files a test file declares
         (#8052). A file that is missing is skipped; tests/common is the common census, not a module."""
-        out, here = {}, pathlib.Path(path).parent
-        for m in MOD_DECL.finditer(raw):
-            name = m.group(2)
-            if name == "common":
+        out, scrubbed, path = {}, scrub(raw), pathlib.Path(path)
+        for m in MOD_ITEM.finditer(scrubbed):
+            name, cands, problem = ModuleWalk.decl(path, raw, scrubbed, m, path.parent)
+            if name == "common" or problem:
                 continue
-            cands = [here / m.group(1)] if m.group(1) else [here / (name + ".rs"), here / name / "mod.rs"]
-            for cand in cands:
+            for cand, _below in cands:
                 if cand not in self._mods:
-                    try:
-                        text = cand.read_text(encoding="utf-8", errors="replace")
-                        self._mods[cand] = detaching_fns(blank_use_items(scrub(text)))
-                    except OSError:
-                        self._mods[cand] = None
+                    text = self._read(cand)
+                    self._mods[cand] = None if text is None else detaching_fns(blank_use_items(scrub(text)))
                 if self._mods[cand] is not None:
                     out[name] = self._mods[cand]
                     break
@@ -2326,7 +2387,9 @@ class FileModel:
     def __init__(self, scrubbed, raw=None, common=None, modules=None, macros=None):
         self.common = common if common is not None else CommonModel()
         # r13 (#8154): macro_rules! names of the declared module files and tests/common (CommonModel.module_macros)
+        self.module_texts = list(getattr(macros, "texts", ()))  # r23: scrubbed text of the module / include! files read
         self.module_macros = set(macros or ()) | self.common.macro_names
+        self.module_open = MACRO_OPEN in self.module_macros  # r23: a module / include! target could not be read or parsed
         self.imports, self.glob = common_imports(scrubbed)
         self.modules = modules or {}  # #8052: module name -> detaching_fns of its file
         self.mod_imported = {}  # name -> module it is `use`-imported from
@@ -2841,7 +2904,7 @@ class FileModel:
         if kind == CALLEE_METHOD:
             full = self.method_path(name)
             return STD if full in TRUSTED_METHOD_PATHS else UNKNOWN
-        if kind == CALLEE_MACRO and not segs and name in self.macro_names:
+        if kind == CALLEE_MACRO and not segs and (name in self.macro_names or MACRO_OPEN in self.macro_names):
             return UNKNOWN
         full = self.resolve_path(list(segs) + [name])
         if full is None:
@@ -3201,10 +3264,11 @@ class FileModel:
         if path in KNOWN_TRAIT_METHODS:
             return KNOWN_TRAIT_METHODS[path]
         leaf, common = path[-1], self.common
+        unread = False  # r23: the tree this path points into has a module / include! target the gate could not read
         if path[0] in FILE_ROOTS:  # an item of the test crate: a trait of the file supplies the fns it declares
-            own = self.local_index()
+            own, unread = self.local_index(), self.module_open
         elif common.crate_name is not None and path[0] == common.crate_name:
-            own = None
+            own, unread = None, common.src_open
             if leaf in common.src_traits:
                 return common.src_traits[leaf]
             if leaf in common.src_types:
@@ -3216,6 +3280,8 @@ class FileModel:
                 return own.traits[leaf]
             if leaf in own.types:
                 return frozenset()
+        if unread:  # fail closed: an unresolved leaf of a tree with an unread file may be a trait, whatever its spelling
+            return ANY_METHOD
         if leaf[:1].islower() or path in KNOWN_FOREIGN_TYPES:
             return frozenset()
         if name != "_" and name not in traits and self.type_use(name, text):
@@ -3225,8 +3291,13 @@ class FileModel:
     def local_index(self):
         """The ItemIndex of this file's own text, its `use` items included (r14, G1), built once."""
         if self._local_index is None:
-            index = ItemIndex(trait_generators(self._with_uses))
+            generators = set(trait_generators(self._with_uses))
+            for text in self.module_texts:  # r23: the module and include! files of the test are part of its crate
+                generators |= trait_generators(text)
+            index = ItemIndex(generators)
             index.add(self._with_uses)
+            for text in self.module_texts:
+                index.add(text)
             self._local_index = index.close()
         return self._local_index
 
@@ -4183,14 +4254,18 @@ def process_isolated(raw, comments):
     return False
 
 
-def scan_tree(root):
-    """Return the set of `<path>::<fn>` keys that violate the rule."""
+def scan_tree(root, diagnostics=None):
+    """Return the set of `<path>::<fn>` keys that violate the rule. Each module / include! target that the gate
+    could not resolve, read or parse (so its traits and macros were treated as untrusted) is appended to
+    `diagnostics` as `<file>: <reason>` (r23)."""
     root = pathlib.Path(root)
     common = CommonModel(root)
     found = set()
     for path in sorted((root / TESTS_REL).glob("*.rs")):
         rel = path.relative_to(root).as_posix()
         found.update("%s::%s" % (rel, name) for name in scan_file(path, common))
+    if diagnostics is not None:
+        diagnostics.extend(sorted(common.diagnostics))
     return found
 
 
@@ -4254,7 +4329,10 @@ def main(argv=None):
     ap.add_argument("--update-baseline", action="store_true", help="rewrite the baseline file")
     args = ap.parse_args(argv)
     root = pathlib.Path(args.root) if args.root else pathlib.Path(__file__).resolve().parents[1]
-    found = scan_tree(root)
+    diagnostics = []
+    found = scan_tree(root, diagnostics)
+    for line in diagnostics:
+        print("check-test-env-mutation: untrusted %s" % line, file=sys.stderr)
     baseline_path = root / BASELINE_REL
     if args.list:
         sys.stdout.write("".join("%s\n" % key for key in sorted(found)))
