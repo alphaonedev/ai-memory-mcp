@@ -5008,15 +5008,25 @@ mod tests {
         let path_for_poll = db_path.clone();
         let sub_for_poll = sub_id.clone();
         let dlq_row = tokio::task::spawn_blocking(move || {
-            let mut last_rows = 0_usize;
+            let mut last_status = String::from("<no row>");
             poll_until(K6_ACK_DEADLINE, DISPATCH_POLL_INTERVAL, || {
                 let conn = Connection::open(&path_for_poll).unwrap();
                 let entries = list_dlq(&conn, Some(&sub_for_poll)).unwrap();
-                last_rows = entries.len();
-                Some(entries).filter(|e| !e.is_empty())
+                if !entries.is_empty() {
+                    return Some(entries);
+                }
+                if let Ok(status) = conn.query_row(
+                    "SELECT delivery_status FROM subscription_events \
+                     WHERE subscription_id = ?1",
+                    params![sub_for_poll],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    last_status = status;
+                }
+                None
             })
             .map_err(|elapsed| {
-                format!("no DLQ row after {elapsed:?}; last dlq row count = {last_rows}")
+                format!("no DLQ row after {elapsed:?}; last delivery_status = {last_status}")
             })
         })
         .await
