@@ -110,7 +110,8 @@ argument of a callee that PROVABLY runs that parameter inline: a same-file, test
 parameter is a direct call, a `let q = p;` alias that is itself inline-only, or an argument of a callee
 that is inline-only in turn; a store, a return, a use inside another closure or a re-binding is not),
 never a callee that merely does not spawn it (#8065); or an unresolved runner named by its FULL path
-(INLINE_ROOTS: std, core, alloc, tokio, futures; WRAPPER_CALLEES such as AssertUnwindSafe recurse), or an
+(INLINE_ROOTS: std, core, alloc, tokio, futures; WRAPPER_CALLEES such as AssertUnwindSafe recurse; that list
+only names INLINE RUNNERS for the inline-runner rule and NEVER proves a type or a receiver std, #8103), or an
 iterator/Option/Once adaptor of SAME_THREAD_CALLEES whose receiver chain roots in a local, a literal, a
 std type or a callee that builds no parallel iterator (#8068, #8069); a receiver is credited only when
 the gate can positively PROVE its provenance (#8093): every token of the chain, of each `let` initialiser it leads
@@ -121,6 +122,19 @@ use (ScopeMap, #8095), and a name bound by a `for` pattern, a match arm, `if let
 or a destructuring `let` is DETACHED (#8094). PARALLEL_ITER (every
 rayon par_* adapter, PARALLEL_METHODS, #8090) is judged through a fixpoint over callee bodies, so a helper
 that builds a rayon-style iterator taints its callers (#8069).
+
+Type origin (#8102 .. #8107). ONE predicate, type_origin(text) -> STD | CRATE | UNKNOWN, judges every type the
+gate reasons about (let annotation, const / static type, fn parameter, return type, turbofish, a method's
+trust); SPELLING NEVER PROVES STD. A name is STD only when it resolves through a same-file `use std::` /
+`core::` / `alloc::` import (nested braces and `as` aliases followed) or a fully qualified std / core / alloc
+path, and the file defines no item of that name and imports no non-std item of that name (tokio, futures,
+rayon and every other crate are CRATE). `_`, an absent or partly inferred annotation, `impl`, `dyn` and a
+generic are UNKNOWN. CRATE and UNKNOWN are DETACHED (doubt is detached); an annotation is a proof only when
+it is std-only without placeholders, otherwise the initialiser is judged (`let v: Vec<_> = vec![1u8]` stays
+clean). A const / static is judged by its DECLARED type, a fn parameter by its declared type, a method call is
+trusted only when the file imports no non-std trait (`use x::Trait;` never used by name, `as _`) and no
+non-std glob other than `super::*` / `common::*` (#8105). A container is judged apart from its elements
+(container_links, #8107): the literal root of a receiver that is only iterated or measured is not an element.
 
 Form inventory (#8098, #8099, #8100). span_safe is a CLOSED whitelist and the ONLY decision point for a receiver:
 each expression form the tokenizer can yield has exactly one rule, a form with no rule is DETACHED, and every
@@ -137,22 +151,25 @@ branches and one probe per form). Doubt is detached.
   `method_resolved`    a same-file or tests/common method: no candidate parallel and every return value safe
   `method_other`       any other method (an unknown or extension-trait one, `into_pool`): DETACHED
   `label_binder`       a struct-literal label or a name `let` / `ref` introduces
-  `call_std`           `Some` / `Ok` / `Err`, a std path, a prelude std type, a name imported from std
+  `call_std`           `Some` / `Ok` / `Err`, a std-origin path or name (type_origin STD: a `use std::` import
+                       or a fully qualified std path; a locally defined or non-std name never qualifies)
   `call_resolved`      a same-file or tests/common fn: not parallel and every return value safe (MAX_RETURN_DEPTH)
   `call_adt`           a same-file tuple struct or enum variant constructor
   `call_other`         any other call (an unresolved crate fn, an uppercase fn): DETACHED
-  `name_local`         a `let` whose declared type names only std types (the type is the proof), or, with no type, whose
-                       initialiser is proven; a non-std declared type is DETACHED; a rebinding is followed
+  `name_local`         a `let` whose declared type is STD without `_` / impl / dyn (the type is the proof), or, with
+                       no or a partly inferred type, whose initialiser is proven; a CRATE / UNKNOWN declared type
+                       is DETACHED; a rebinding is followed
   `name_closure_param` a parameter of a `closure_iife` / `closure_arg` closure
   `name_opaque`        every other binder (`for`, match arm, `if let`, destructuring): DETACHED
-  `name_param`         `self` or a fn parameter
-  `name_std`           `None`, a name imported from std
-  `name_const`         a same-file `const` / `static` whose declared type names only std types, or whose initialiser is
-                       safe (an unsafe one: DETACHED)
+  `name_param`         `self`, or a fn parameter whose declared type is STD (impl / dyn / generic / crate: DETACHED)
+  `name_std`           `None`, a name whose type_origin is STD (imported from std, not shadowed)
+  `name_const`         a same-file `const` / `static` by its DECLARED type: STD is a proof; a same-file ADT type with
+                       a safe initialiser is safe; any other (crate / unknown) is DETACHED
   `name_fn_item`       a same-file fn used as a value: not parallel and every return value safe
   `name_adt`           a same-file struct or `Self`
   `name_other`         an unresolvable name of ANY casing (`GLOBAL`, `P`): DETACHED
-  `path_std`           `std::` / `core::` / `alloc::` path, a primitive's item, a one-segment std type's item
+  `path_std`           a path whose type_origin is STD: `std::` / `core::` / `alloc::`, a primitive's item, an item of
+                       a type imported from std
   `path_const`         `self::` / `crate::` / `module::` const, judged by its initialiser
   `path_variant`       a variant of a same-file enum
   `path_other`         any other path (`ai_memory::pool::GLOBAL`): DETACHED
@@ -160,7 +177,7 @@ branches and one probe per form). Doubt is detached.
   `closure_arg`        the argument of an INLINE_METHODS method whose receiver is safe; body decided in turn
   `closure_other`      a closure in any other position (`let f = |..|`, a path-call argument): DETACHED
   `async_block`        an `async` block: DETACHED
-  `turbofish_std`      every turbofish type is a primitive or a std path (so is a `let` annotation)
+  `turbofish_std`      every turbofish type is STD by type_origin (`_` allowed inside a std type)
   `turbofish_other`    a turbofish type of another crate or file (`collect::<Pool>()`): DETACHED
   `block_root`         a chain rooted in a block or a struct literal: DETACHED
 `&|| ..` and `&mut || ..` are closure literals (#8067). Anything else (inside Box::new, Some, a struct
@@ -336,9 +353,18 @@ INLINE_ROOTS = frozenset(("std", "core", "alloc", "tokio", "futures"))  # #8068:
 # (rayon is left out on purpose: its pool runs a closure on another thread, so a rayon-qualified path is detached)
 WRAPPER_CALLEES = frozenset(("AssertUnwindSafe",))  # #8065: a pass-through wrapper, judged by where its value goes
 RECEIVER_CTORS = frozenset(("Some", "Ok", "Err"))  # #8069: prelude constructors that root an iterator chain
-RECEIVER_STD_TYPES = frozenset((
-    "String", "Vec", "VecDeque", "Option", "Result", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Box", "Arc",
-    "Rc", "Cell", "RefCell", "Mutex", "RwLock", "Path", "PathBuf", "Duration", "Instant"))  # #8069: std value types
+# r10 (#8102-#8107): ONE predicate, FileModel.type_origin, decides whether a type, a path or a name is std. Its three
+# results; CRATE and UNKNOWN are both DETACHED. Spelling never proves std: only a binding does.
+STD, CRATE, UNKNOWN = "std", "crate", "unknown"
+PRELUDE_TYPES = frozenset(("String", "Vec", "Option", "Result", "Box"))  # the std prelude's types (shadowable)
+PRELUDE_VALUES = RECEIVER_CTORS | frozenset(("None",))  # the std prelude's value names (shadowable)
+TYPE_NEUTRAL = frozenset(("mut", "const", "ref"))  # words of a type text that name nothing
+TYPE_OPAQUE = frozenset(("_", "impl", "dyn", "fn", "for", "where", "unsafe", "extern", "Self"))  # name no type: UNKNOWN
+# r10 (#8107): the methods that act on a container (array, Vec, iterator over it) without handing an element back as a
+# receiver; a chain made only of these is judged without the elements of its root literal.
+CONTAINER_METHODS = frozenset((
+    "chain", "clone", "cloned", "collect", "copied", "enumerate", "filter", "for_each", "into_iter", "is_empty", "iter",
+    "iter_mut", "len", "map", "rev", "skip", "take", "to_vec", "zip"))
 MAX_CHAIN_STEPS = 64  # #8069: method-chain links followed from a closure's receiver back to its root; more is unresolved
 Detacher = collections.namedtuple("Detacher", "idxs has_self inline parallel value_safe")  # one fn of a file outside the test file
 # #8056: library calls that run their closure argument inline on the calling thread (Option / Result / Iterator /
@@ -534,6 +560,61 @@ def blank_use_items(scrubbed):
     return USE_ITEM.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), scrubbed)
 
 
+LITERAL_ROOT = re.compile(r"\s*(?:&\s*(?:mut\s+)?)*(?:vec\s*!\s*)?\[")  # r10: a root array / vec![..] literal
+USE_TOKEN = re.compile(r"::|[{},*]|[A-Za-z_]\w*")
+ITEM_NAME = re.compile(r"(?<![\w$'])(?:struct|enum|union|trait|type|const|static|fn|mod)\s+(?:mut\s+)?([A-Za-z_]\w*)"
+                       r"|\bmacro_rules\s*!\s*([A-Za-z_]\w*)")
+
+
+def use_leaves(item):
+    """[(path segments, bound name)] of one `use` item (#8103): nested braces, `as` aliases and `self` leaves are
+    resolved; a glob leaf has the bound name None and an `as _` leaf the name `_`."""
+    toks = USE_TOKEN.findall(item)
+    pos, out = [1 if toks[:1] == ["use"] else 0], []
+
+    def emit(path, name):
+        if path and path[-1] == "self":
+            path = path[:-1]
+        if path and name == "self":
+            name = path[-1]
+        if path and name:
+            out.append((tuple(path), name))
+
+    def tree(prefix):
+        path = list(prefix)
+        while pos[0] < len(toks):
+            tok = toks[pos[0]]
+            if tok == "::":
+                pos[0] += 1
+            elif tok == "{":
+                pos[0] += 1
+                while pos[0] < len(toks) and toks[pos[0]] != "}":
+                    tree(tuple(path))
+                    if pos[0] < len(toks) and toks[pos[0]] == ",":
+                        pos[0] += 1
+                pos[0] += 1
+                return
+            elif tok == "*":
+                pos[0] += 1
+                out.append((tuple(path), None))
+                return
+            elif tok in (",", "}"):
+                break
+            elif tok == "as" and len(path) > len(prefix):
+                alias = toks[pos[0] + 1] if pos[0] + 1 < len(toks) else "_"
+                pos[0] += 2
+                emit(path, alias)
+                return
+            else:
+                path.append(tok)
+                pos[0] += 1
+        if len(path) > len(prefix):
+            emit(path, path[-1])
+
+    tree(())
+    return out
+
+
 def common_imports(scrubbed):
     """(names, glob): names a file imports from tests/common, and whether it glob-imports it."""
     names, glob = set(), False
@@ -722,7 +803,8 @@ COND_LET = re.compile(r"(?:\bif|\bwhile|&&|\|\|)$")
 PATTERN_NAME = re.compile(r"(?<![\w:.$'])([a-z_]\w*)\b(?!\s*(?:::|\(|!))")
 PATTERN_SKIP = frozenset(("mut", "ref", "box", "in", "if", "as", "true", "false", "let", "else", "move", "dyn", "impl",
                           "for", "_"))
-Binding = collections.namedtuple("Binding", "name lo hi init")  # init: (start, end) of a plain `let` initialiser, else None
+# init: (start, end) of a plain `let` initialiser or a `for` iterable, else None; per_item: a `for` name is ONE ITEM of its iterable
+Binding = collections.namedtuple("Binding", "name lo hi init per_item", defaults=(False,))
 
 
 def callee_path(text):
@@ -914,7 +996,7 @@ class ScopeMap:
             hi = match_brace(body, brace)
             sm = re.fullmatch(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*", m.group(1))
             if sm and sm.group(1) != "_":  # `for name in <iterable>`: an item is as safe as the iterable it comes from
-                self.items.append(Binding(sm.group(1), brace, hi, (m.end(), brace)))
+                self.items.append(Binding(sm.group(1), brace, hi, (m.end(), brace), True))
             else:
                 self._opaque(pattern_names(m.group(1)), brace, hi)
         for m in re.finditer(r"\bmatch\b", body):
@@ -1043,6 +1125,7 @@ class Fn:
         self.is_async = is_async
         self.offset = offset
         self.params, self.has_self = (), False  # #8044: parameter names (None = pattern), receiver apart
+        self.param_types = {}  # #8106: parameter name -> declared type text (a pattern parameter has none)
         self.ret = None  # #8098: the declared return type text, None when the fn declares none
         self.is_test = self._is_test(attrs)
         self.serial_tokens = self._serial_tokens(attrs)
@@ -1169,7 +1252,7 @@ def parse_fns(scrubbed):
         owners = [b[3] for b in blocks if b[2] == "impl" and b[0] < m.start() < b[1]]
         fn = Fn(m.group(1), mods, owners[-1] if owners else None, attrs,
                 scrubbed[brace:match_brace(scrubbed, brace)], brace, m.group(0).startswith("async"))
-        fn.params, fn.has_self = fn_params(scrubbed, m.end(), brace)
+        fn.params, fn.has_self, fn.param_types = fn_params(scrubbed, m.end(), brace)
         fn.ret = fn_return_type(scrubbed, m.end(), brace)
         fns.append(fn)
     return fns
@@ -1247,16 +1330,18 @@ def fn_params(text, name_end, brace):
     while k < brace and text[k].isspace():
         k += 1
     if text[k:k + 1] != "(":
-        return (), False
-    names, has_self = [], False
+        return (), False, {}
+    names, has_self, types = [], False, {}
     for a, b in split_top_level(text, k + 1, match_paren(text, k) - 1):
         piece = text[a:b]
         if re.match(r"\s*(?:&\s*(?:'\w+\s*)?)?(?:mut\s+)?self\b", piece):
             has_self = True
             continue
-        m = re.match(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*:", piece)
+        m = re.match(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*:(?!:)", piece)
         names.append(m.group(1) if m else None)
-    return tuple(names), has_self
+        if m:
+            types[m.group(1)] = piece[m.end():].strip()  # r10 (#8106): the declared type, judged by type_origin
+    return tuple(names), has_self, types
 
 
 def let_names(prefix):
@@ -1823,6 +1908,7 @@ class FileModel:
             if len(words) > 1 and words[1] in INLINE_ROOTS:
                 self.inline_imports.update(words[1:])
         self.dm = mutation_re(use_aliases(scrubbed))
+        with_uses = scrubbed  # r10: the import table is read from the text that still holds the `use` items
         scrubbed = blank_use_items(scrubbed)
         self.src = (Source(raw, self.common.src_consts) if raw is not None and len(raw) == len(scrubbed)
                     else Source(None))
@@ -1853,6 +1939,7 @@ class FileModel:
         self._fn_lits = {}
         self.text = scrubbed
         self._index_items(scrubbed)  # #8098: the same-file consts, statics, structs and enum variants span_safe resolves
+        self._index_imports(with_uses, scrubbed)  # r10: what every name of the file is bound to (type_origin)
         self._ret_ok, self._ret_stack, self._closure_memo, self._closure_stack = set(), [], {}, set()
         self._closed = False  # the verdicts are cached only once the parallel set stops growing
         self._close_inline()
@@ -2313,7 +2400,7 @@ class FileModel:
             return self.rooted(segs, name) and self.arg_inline(fn, tail.start(), match_paren(body, slot[0]))
         if self.aliases.get(name, name) not in SAME_THREAD_CALLEES:
             return False
-        return self.receiver_ok(fn, len(before) - 1) if method else self.rooted(segs, name)
+        return self.receiver_ok(fn, len(before) - 1, elements=False) if method else self.rooted(segs, name)
 
     def scopes(self, fn):
         """ScopeMap of fn, cached."""
@@ -2364,18 +2451,130 @@ class FileModel:
             span = (eq, stmt_end(text, eq), text[m.end():eq - 1])
             self.consts[m.group(1)] = None if m.group(1) in self.consts else span
 
-    def receiver_ok(self, fn, dot, floor=None, hops=0):
+    def _index_imports(self, with_uses, text):
+        """What every name of the file is bound to (r10, #8103, #8105): std_names (name -> std path) from
+        `use std::|core::|alloc::` items, foreign_names from every other import (a non-std import of a name wins
+        over a std one), foreign_globs (non-std globs other than `super::*` / tests/common), items (every type,
+        struct, enum, union, trait, const, static, fn, mod and macro_rules name the file defines) and trait_risk:
+        a non-std glob exists, or a non-std import whose name nothing in the file uses (an imported trait, whose
+        methods can shadow a std method) exists."""
+        self.std_names, self.foreign_names, self.foreign_globs, imported = {}, set(), [], []
+        for um in USE_ITEM.finditer(with_uses):
+            for path, name in use_leaves(um.group(0)):
+                common = "common" in path
+                if path[0] in STD_ROOTS:
+                    if name is not None:
+                        self.std_names[name] = path
+                elif name is None:
+                    if path != ("super",) and not common:
+                        self.foreign_globs.append(path)
+                else:
+                    self.foreign_names.add(name)
+                    if not common:
+                        imported.append(name)
+        for name in self.foreign_names:
+            self.std_names.pop(name, None)
+        self.items = {m.group(1) or m.group(2) for m in ITEM_NAME.finditer(text)}
+        self.macro_defs = {m.group(2) for m in ITEM_NAME.finditer(text) if m.group(2)}
+        self.trait_risk = bool(self.foreign_globs) or any(
+            n == "_" or not re.search(r"(?<![\w$'])%s\b" % re.escape(n), text) for n in imported)
+
+    def path_origin(self, segs, name=None):
+        """STD, CRATE or UNKNOWN for the path segs + name, decided by its FIRST segment (r10, #8103): a name the
+        file defines or imports from a non-std path is CRATE whatever it is spelled like; std / core / alloc, a name
+        imported from one, a primitive, and a prelude std type or value (unless a non-std glob could shadow it) are
+        STD; `crate` / `self` / `super` and any other multi-segment path are CRATE; a bare unresolved name,
+        `Self` and anything else is UNKNOWN."""
+        full = list(segs) + ([name] if name else [])
+        if not full:
+            return UNKNOWN
+        first = full[0]
+        if first in self.items or first in self.foreign_names:
+            return CRATE
+        if first in STD_ROOTS or first in self.std_names or first in PRIMS:
+            return STD
+        if first in PRELUDE_TYPES or first in PRELUDE_VALUES:
+            return UNKNOWN if self.foreign_globs else STD
+        if first in PATH_SELF:
+            return CRATE
+        return CRATE if len(full) > 1 and first != "Self" else UNKNOWN
+
+    def type_origin(self, text, infer_ok=False, adts_ok=False):
+        """THE std predicate (r10, #8102-#8106): STD, CRATE or UNKNOWN for a type text (a `let` or parameter or
+        const type, a return type, a turbofish group). STD only when EVERY path the text names resolves to std
+        through path_origin: a name counts as std because the file binds it to std (a `use std::..` import,
+        possibly aliased or nested, or a fully qualified std / core / alloc path), never because of how it is
+        spelled; tokio, futures, rayon and every other crate are CRATE, as is anything the file defines or imports
+        from a non-std path. `_`, `impl`, `dyn`, `fn`, `Self`, a bare generic `T` and any unresolved bare name are
+        UNKNOWN. With infer_ok a `_` / `impl` / `dyn` placeholder is neutral (an inferred type proves nothing but
+        names nothing); with adts_ok a same-file struct, enum or union and a same-file const (an array length) are
+        neutral. CRATE and UNKNOWN are both DETACHED; a text that names nothing is STD."""
+        worst = STD
+        adts = (self.adts | set(self.variants)) if adts_ok else ()
+        for m in IDPATH.finditer(text):
+            segs = re.split(r"\s*::\s*", m.group(0))
+            first = segs[0]
+            if len(segs) == 1:
+                if first in TYPE_NEUTRAL or (infer_ok and first in ("_", "impl", "dyn")):
+                    continue
+                if first in TYPE_OPAQUE:
+                    return UNKNOWN
+                if first in self.consts or (first in adts and first not in self.foreign_names):
+                    continue
+            got = self.path_origin(segs)
+            if got == UNKNOWN:
+                return UNKNOWN
+            if got == CRATE:
+                worst = CRATE
+        return worst
+
+    def method_origin(self, name):
+        """STD when the method `name` is a std method (r10, #8105): it is on the INLINE_METHODS allowlist and no
+        imported non-std trait or non-std glob can supply a method of that name ahead of the std one (trait_risk);
+        else UNKNOWN (detached)."""
+        if name in INLINE_METHODS and not PARALLEL_ITER.search(name) and not self.trait_risk:
+            return STD
+        return UNKNOWN
+
+    @staticmethod
+    def literal_span(text):
+        """(open, close) indexes of the root array / `vec![..]` literal of text (a borrow of it too), else None."""
+        m = LITERAL_ROOT.match(text)
+        if m is None:
+            return None
+        depth = 0
+        for j in range(m.end() - 1, len(text)):
+            if text[j] == "[":
+                depth += 1
+            elif text[j] == "]":
+                depth -= 1
+                if not depth:
+                    return m.end() - 1, j
+        return None
+
+    def container_links(self, text):
+        """True when every link after the root literal of text is a container-level method (CONTAINER_METHODS) and
+        nothing indexes it (r10, #8107): such a chain never hands an element back as a receiver."""
+        lit = self.literal_span(text)
+        tail = text[lit[1] + 1:] if lit else text
+        if re.search(r"[\w)\]]\s*\[", tail):
+            return False
+        return all(n in CONTAINER_METHODS for n in re.findall(r"\.\s*([A-Za-z_]\w*)", tail))
+
+    def receiver_ok(self, fn, dot, floor=None, hops=0, elements=True):
         """True when the receiver whose method chain ends at index dot has a PROVEN provenance (#8069, #8089,
         #8093, #8098-#8100). The chain's start is found by walking it back (chain_start; with floor set it is floor,
         a whole `let` initialiser). A block or a struct literal as the chain root is detached (block_root). Every
         token of the span is then decided by span_safe, the ONLY decision point: a closed whitelist whose default
-        is DETACHED (see SPAN_FORMS and the form table in the module docstring)."""
+        is DETACHED (see SPAN_FORMS and the form table in the module docstring). With elements False the caller
+        only needs the CONTAINER (a callee that runs its closure inline); the elements of a root literal are then
+        judged only when the chain extracts one (#8107)."""
         start = floor if floor is not None else chain_start(fn.body, dot)
         if start is None:
             return form("block_root", False)
-        return self.span_safe(fn, start, dot, hops)
+        return self.span_safe(fn, start, dot, hops, elements)
 
-    def span_safe(self, fn, a, b, hops):
+    def span_safe(self, fn, a, b, hops, elements=True):
         """True when EVERY expression form of fn.body[a:b] is whitelisted (#8093, #8098, #8099, #8100). Each token
         the tokenizer yields gets exactly one rule (a SPAN_FORMS label, recorded through form()); a form with no
         rule cannot exist, because form() refuses a label outside SPAN_FORMS. A closure literal inside the span is
@@ -2385,7 +2584,7 @@ class FileModel:
         text = list(body[a:b])
         for s, e in self.lits(fn):
             if s >= a and e <= b and body[s:e].strip():
-                if not self.closure_ok(fn, s, e, hops):
+                if not self.closure_ok(fn, s, e, hops, elements):
                     return False
                 hm = CLOSURE_HEAD.match(body, s)
                 if hm:
@@ -2395,10 +2594,18 @@ class FileModel:
         if not (root.isalpha() or root == "_"):
             form("literal", True)  # a literal, array, tuple or borrow root: its elements are decided token by token
         for g0, g1 in generic_groups(text):
-            if not self.types_ok(text[g0:g1]):
+            if self.type_origin(text[g0:g1], infer_ok=True) != STD:
                 return form("turbofish_other", False)
             form("turbofish_std", True)
         text = blank_generics(text)
+        if not elements:  # #8107: the caller needs the container only; its elements matter once the chain extracts one
+            if self.container_links(text):
+                lit = self.literal_span(text)
+                if lit:
+                    text = text[:lit[0] + 1] + " " * (lit[1] - lit[0] - 1) + text[lit[1]:]
+            else:
+                elements = True
+        root_pos = len(text) - len(text.lstrip())
         for m in IDPATH.finditer(text):
             segs = re.split(r"\s*::\s*", m.group(0))
             name, prefix = segs[-1], "".join(g + "::" for g in segs[:-1])
@@ -2419,14 +2626,16 @@ class FileModel:
             elif prefix:
                 ok = self.path_ok(fn, prefix, name)
             else:
-                ok = self.name_ok(fn, name, a + m.start(), hops)
+                ok = self.name_ok(fn, name, a + m.start(), hops, elements or m.start() != root_pos)
             if not ok:
                 return False
         return True
 
     def macro_ok(self, prefix, name):
         """`vec!` and the VALUE_MACROS (a std path prefix allowed) are whitelisted; every other macro is detached."""
-        if prefix and not self.rooted(path_segments(prefix), name):
+        if name in self.macro_defs or name in self.foreign_names:
+            return form("macro_other", False)  # a macro the file defines or imports shadows the std one
+        if prefix and self.path_origin(path_segments(prefix), name) != STD:
             return form("macro_other", False)
         if name == "vec":
             return form("macro_vec", True)
@@ -2435,7 +2644,8 @@ class FileModel:
     def member_ok(self, name, call):
         """A field of a safe value is safe. A method is safe when a same-file or tests/common method of that name
         exists and EVERY candidate builds no parallel iterator and returns only safe values, else only when it is on
-        the explicit INLINE_METHODS allowlist; an unknown or extension-trait method is detached (#8100)."""
+        the explicit INLINE_METHODS allowlist and no imported non-std trait can shadow it (method_origin, #8105); an
+        unknown or extension-trait method is detached (#8100)."""
         if not call:
             return form("field", True)
         cands = self.by_method.get(name, [])
@@ -2443,22 +2653,16 @@ class FileModel:
         if cands or ext:
             return form("method_resolved", all(id(c) not in self.parallel and self.returns_safe(c) for c in cands)
                         and all(not h.parallel and h.value_safe for h in ext))
-        if name in INLINE_METHODS and not PARALLEL_ITER.search(name):
+        if self.method_origin(name) == STD:
             return form("method_inline", True)
         return form("method_other", False)
-
-    def std_path(self, segs, name):
-        """True when the path segs + name is std/core/alloc (or an inline-runner crate), a name imported from one, a
-        prelude std type (`Vec`, `Box`, ..) written bare, or a primitive's associated item (`u8::MAX`)."""
-        return bool((segs and self.rooted(segs, name)) or (not segs and name in self.inline_imports)
-                    or (len(segs) == 1 and segs[0] in RECEIVER_STD_TYPES) or (segs and segs[0] in PRIMS))
 
     def call_ok(self, fn, prefix, name):
         """A call `prefix::name(..)` is safe when it is a prelude ctor or a std path, a resolved same-file or
         tests/common fn that builds no parallel iterator and returns only safe values, or a ctor of a same-file struct
         or enum variant; every other call (an uppercase fn too, an unresolved crate fn) is detached (#8098)."""
         segs = path_segments(prefix)
-        if (not segs and name in RECEIVER_CTORS) or self.std_path(segs, name):
+        if self.path_origin(segs, name) == STD:
             return form("call_std", True)
         hit = self.resolve(fn.owner, prefix, name)
         if hit is not None:
@@ -2475,7 +2679,7 @@ class FileModel:
         """A prefixed path that is not a call: std, an enum variant of the same file, or a same-file const reached as
         `self::` / `crate::` / `super::` / `module::`, judged by its initialiser; anything else is detached (#8098)."""
         segs = path_segments(prefix)
-        if self.std_path(segs, name):
+        if self.path_origin(segs, name) == STD:
             return form("path_std", True)
         ty = fn.owner if segs and segs[-1] == "Self" else (segs[-1] if segs else None)
         if name in self.variants.get(ty, ()):
@@ -2484,13 +2688,14 @@ class FileModel:
             return form("path_const", self.const_ok(name))
         return form("path_other", False)
 
-    def name_ok(self, fn, name, use, hops):
+    def name_ok(self, fn, name, use, hops, elements=True):
         """A bare name is PROVEN safe or detached, whatever its casing (#8094, #8095, #8098): the innermost binding
         in a block still open at use wins (ScopeMap). A plain `let` is judged by its initialiser (receiver_ok, through
         at most MAX_REBIND_HOPS names); a closure parameter is safe when its closure is a whitelisted form; every other
         binder (a `for` pattern, a match arm, `if let`, `while let`, a destructuring `let`) is opaque. A name nothing
-        binds is safe as `self`, a parameter, a name imported from std, a same-file const or static whose initialiser
-        is safe, a same-file fn item that returns only safe values, or a same-file struct; else it is detached."""
+        binds is safe as `self`, a parameter whose declared type is std (type_origin), a name that resolves to std,
+        a same-file const or static whose declared type is std (or a same-file type with a safe initialiser), a
+        same-file fn item that returns only safe values, or a same-file struct; else it is detached."""
         if hops >= MAX_REBIND_HOPS:
             return form("name_local", False)
         bound = self.scopes(fn).visible(name, use)
@@ -2499,13 +2704,16 @@ class FileModel:
                 typed = self.annotation(fn.body, bound.init[0])
                 if typed is not None:  # a declared type decides: std only is the proof, anything else is detached
                     return form("name_local", typed)
-                return form("name_local", self.receiver_ok(fn, bound.init[1], floor=bound.init[0], hops=hops + 1))
+                return form("name_local", self.receiver_ok(
+                    fn, bound.init[1], floor=bound.init[0], hops=hops + 1, elements=elements or bound.per_item))
             if (bound.lo, bound.hi) in self.lit_set(fn):
-                return form("name_closure_param", self.closure_ok(fn, bound.lo, bound.hi, hops))
+                return form("name_closure_param", self.closure_ok(fn, bound.lo, bound.hi, hops, True))
             return form("name_opaque", False)
-        if name == "self" or name in fn.params:
+        if name == "self":
             return form("name_param", True)
-        if name in self.inline_imports or name == "None":
+        if name in fn.params:  # #8106: a parameter is judged by its DECLARED type, never by being a parameter
+            return form("name_param", self.type_origin(fn.param_types.get(name, "Self")) == STD)
+        if self.path_origin([], name) == STD:
             return form("name_std", True)
         if name in self.consts:
             return form("name_const", self.const_ok(name))
@@ -2523,26 +2731,26 @@ class FileModel:
             cache[id(fn)] = set(self.lits(fn))
         return cache[id(fn)]
 
-    def closure_ok(self, fn, s, e, hops):
+    def closure_ok(self, fn, s, e, hops, elements=True):
         """True when the closure literal body[s:e] is a whitelisted form (#8099): invoked in place `(|..| ..)(args)`
         with safe arguments, or the whole argument of an INLINE_METHODS method whose receiver is safe in turn. Its
         value is then derived from safe values; its body tokens are scanned by the span that holds it. A closure in any
         other position (a `let`, a path-call argument, an element, a return) and an async block are detached."""
-        key = (id(fn), s, e)
+        key = (id(fn), s, e, elements)
         if key in self._closure_memo:
             return self._closure_memo[key]
         if key in self._closure_stack:
             return False  # a cycle is detached
         self._closure_stack.add(key)
         try:
-            ok = self.closure_form(fn, s, e, hops)
+            ok = self.closure_form(fn, s, e, hops, elements)
         finally:
             self._closure_stack.discard(key)
         if self._closed and (ok or not self._ret_stack):  # the parallel set grows until the fixpoint ends
             self._closure_memo[key] = ok
         return ok
 
-    def closure_form(self, fn, s, e, hops):
+    def closure_form(self, fn, s, e, hops, elements=True):
         body = fn.body
         if re.match(r"async\s+(?:move\s+)?\{", body[s:]):
             return form("async_block", False)
@@ -2554,33 +2762,23 @@ class FileModel:
         tail = CALLEE_TAIL.search(body, 0, slot[0]) if slot else None
         if tail is not None:
             pre = body[:tail.start()].rstrip()
-            if pre.endswith(".") and not pre.endswith("..") and tail.group(2) in INLINE_METHODS:
-                return form("closure_arg", self.receiver_ok(fn, len(pre) - 1, hops=hops + 1))
+            if pre.endswith(".") and not pre.endswith("..") and self.method_origin(tail.group(2)) == STD:
+                return form("closure_arg", self.receiver_ok(fn, len(pre) - 1, hops=hops + 1, elements=elements))
         return form("closure_other", False)
 
     def annotation(self, body, init_start):
-        """None when the `let` whose initialiser starts at init_start has no type annotation, else whether the
-        annotation names only std types (#8100): `let p: ai_memory::pool::Pool = it.collect();` is detached and
-        `let k: [&str; 2] = [crate::A, "B"];` is a value of a std type."""
+        """What the type annotation of the `let` whose initialiser starts at init_start proves (#8100, #8102): None
+        when there is none, or when it is std except for `_` / `impl` / `dyn` placeholders (an inferred type proves
+        nothing, so the initialiser decides: `let v: Vec<_> = vec![1u8];` stays clean); True when type_origin is STD
+        (`let k: [&str; 2] = [crate::A, "B"];` is a value of a std type); False when it names a crate or an
+        unresolved type (`let p: ai_memory::pool::Pool = it.collect();` is detached)."""
         heads = [h.start() for h in re.finditer(r"\blet\b", body[:init_start])]
         m = re.match(r"let\b[^:=]*?:(?!:)(.*)=$", body[heads[-1]:init_start].rstrip(), re.S) if heads else None
-        return None if m is None else self.types_ok(m.group(1))
-
-    def types_ok(self, text):
-        """True when every type named in text (a turbofish group `::<..>` or a `let` type annotation) is a primitive,
-        a prelude std type, a std/core/alloc path or a name imported from std; a type of any other crate or file is
-        not (#8100)."""
-        for m in IDPATH.finditer(text):
-            segs = re.split(r"\s*::\s*", m.group(0))
-            first = self.aliases.get(segs[0], segs[0])
-            if len(segs) == 1:
-                good = (first in PRIMS or first in RECEIVER_STD_TYPES or first in KEYWORDS or first == "_"
-                        or first in self.inline_imports)
-            else:
-                good = first in INLINE_ROOTS or first in PRIMS or first in self.inline_imports
-            if not good:
-                return False
-        return True
+        if m is None:
+            return None
+        if self.type_origin(m.group(1)) == STD:
+            return True
+        return None if self.type_origin(m.group(1), infer_ok=True) == STD else False
 
     def const_fn(self, name):
         """A pseudo fn whose body is the initialiser of the same-file const or static `name`, cached."""
@@ -2591,12 +2789,17 @@ class FileModel:
         return cache[name]
 
     def const_ok(self, name):
-        """True when the same-file const or static `name` (declared once) has a std-only declared type or a safe
-        initialiser (#8098)."""
+        """True when the same-file const or static `name` (declared once) is classified by its DECLARED type
+        (#8098, #8104): a std-only type is the proof (`const KEYS: [&str; 2] = [crate::A, "B"]`); a type of the same
+        file's own structs and enums is safe when the initialiser is; a crate type
+        (`static P: OnceLock<crate::Pool> = OnceLock::new()`), an unresolved or an inferred one is detached
+        whatever the initialiser is."""
         if self.consts.get(name) is None:
             return False
-        if self.types_ok(self.consts[name][2]):
-            return True  # a declared std type is the proof (`const KEYS: [&str; 2] = [crate::A, "B"]`)
+        if self.type_origin(self.consts[name][2]) == STD:
+            return True
+        if self.type_origin(self.consts[name][2], adts_ok=True) != STD:
+            return False
         stack = self.__dict__.setdefault("_const_stack", set())
         if name in stack:
             return False
@@ -2613,7 +2816,7 @@ class FileModel:
         key = id(fn)
         if key in self._ret_ok:
             return True
-        if fn.ret is not None and self.types_ok(fn.ret):
+        if fn.ret is not None and self.type_origin(fn.ret) == STD:
             return True  # a declared std return type is the proof (`fn keys() -> [&'static str; 2]`)
         if key in self._ret_stack or len(self._ret_stack) >= MAX_RETURN_DEPTH:
             return False

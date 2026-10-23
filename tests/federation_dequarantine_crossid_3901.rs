@@ -72,7 +72,11 @@ impl Posture {
             ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", None),
             (FED_QUARANTINE_UNATTRIBUTED_ENV, None),
         ];
-        let guard = Self(set.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect());
+        let mut saved = Vec::new();
+        for (k, _) in &set {
+            saved.push((*k, std::env::var_os(k)));
+        }
+        let guard = Self(saved);
         for (key, value) in set {
             // SAFETY: every caller holds FED_ENV_LOCK; Drop restores before release.
             unsafe {

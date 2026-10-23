@@ -126,18 +126,7 @@ mod sal {
         drop(conn);
         let before_u = ai_memory::metrics::unstamped_mutation_allowed_count("sqlite", "update");
         let before_d = ai_memory::metrics::unstamped_mutation_allowed_count("sqlite", "delete");
-        runtime().block_on(async {
-            let store = SqliteStore::open(&path).expect("store");
-            let bob = CallerContext::for_agent("ai:bob");
-            store
-                .update(&bob, &upd, patch("edited under warn"))
-                .await
-                .expect("ALLOWED: warn keeps the pre-#3124 sqlite outcome");
-            store
-                .delete(&bob, &del)
-                .await
-                .expect("ALLOWED: warn keeps the pre-#3124 sqlite outcome");
-        });
+        runtime().block_on(warn_admits_body(&path, &upd, &del));
         assert!(
             ai_memory::metrics::unstamped_mutation_allowed_count("sqlite", "update") > before_u,
             "a warn admission must be COUNTED"
@@ -162,37 +151,7 @@ mod sal {
         let null = seed(&conn, "refuse-null", &json!({"agent_id": null}));
         let owned = seed(&conn, "refuse-owned", &json!({"agent_id": "ai:bob"}));
         drop(conn);
-        runtime().block_on(async {
-            let store = SqliteStore::open(&path).expect("store");
-            let bob = CallerContext::for_agent("ai:bob");
-            for id in [&missing, &null] {
-                let err = store
-                    .update(&bob, id, patch("must not land"))
-                    .await
-                    .expect_err("DENIED: refuse refuses an unstamped row");
-                match err {
-                    StoreError::PermissionDenied { reason, .. } => {
-                        assert_eq!(reason, REASON_UNSTAMPED_REFUSED);
-                    }
-                    other => panic!("expected PermissionDenied, got {other:?}"),
-                }
-                let err = store.delete(&bob, id).await.expect_err("DENIED delete");
-                assert!(
-                    matches!(err, StoreError::PermissionDenied { .. }),
-                    "{err:?}"
-                );
-            }
-            // ALLOWED control: the caller's OWN row is untouched by the posture.
-            store
-                .update(&bob, &owned, patch("owner edit"))
-                .await
-                .expect("ALLOWED: an owned row stays mutable under refuse");
-            // Operator lane: bypass contexts never reach the gate.
-            store
-                .delete(&CallerContext::for_admin("ai:operator"), &missing)
-                .await
-                .expect("ALLOWED: admin bypass is unaffected");
-        });
+        runtime().block_on(refuse_denies_body(&path, &missing, &null, &owned));
         let conn = db::open(&path).expect("reopen");
         assert_eq!(
             content_of(&conn, &null).as_deref(),
@@ -217,19 +176,66 @@ mod sal {
         let conn = db::open(&path).expect("open");
         let id = seed(&conn, "malformed", &json!({"agent_id": 123}));
         drop(conn);
-        runtime().block_on(async {
-            let store = SqliteStore::open(&path).expect("store");
-            // A caller spelled like the malformed value must not match it.
-            let caller = CallerContext::for_agent("123");
+        runtime().block_on(malformed_owner_body(&path, &id, mode));
+    }
+
+    async fn warn_admits_body(path: &std::path::Path, upd: &str, del: &str) {
+        let store = SqliteStore::open(path).expect("store");
+        let bob = CallerContext::for_agent("ai:bob");
+        store
+            .update(&bob, upd, patch("edited under warn"))
+            .await
+            .expect("ALLOWED: warn keeps the pre-#3124 sqlite outcome");
+        store
+            .delete(&bob, del)
+            .await
+            .expect("ALLOWED: warn keeps the pre-#3124 sqlite outcome");
+    }
+
+    async fn refuse_denies_body(path: &std::path::Path, missing: &str, null: &str, owned: &str) {
+        let store = SqliteStore::open(path).expect("store");
+        let bob = CallerContext::for_agent("ai:bob");
+        for id in [missing, null] {
             let err = store
-                .update(&caller, &id, patch("x"))
+                .update(&bob, id, patch("must not land"))
                 .await
-                .expect_err("DENIED: a malformed owner is never matched");
+                .expect_err("DENIED: refuse refuses an unstamped row");
+            match err {
+                StoreError::PermissionDenied { reason, .. } => {
+                    assert_eq!(reason, REASON_UNSTAMPED_REFUSED);
+                }
+                other => panic!("expected PermissionDenied, got {other:?}"),
+            }
+            let err = store.delete(&bob, id).await.expect_err("DENIED delete");
             assert!(
                 matches!(err, StoreError::PermissionDenied { .. }),
-                "{mode}: {err:?}"
+                "{err:?}"
             );
-        });
+        }
+        // ALLOWED control: the caller's OWN row is untouched by the posture.
+        store
+            .update(&bob, owned, patch("owner edit"))
+            .await
+            .expect("ALLOWED: an owned row stays mutable under refuse");
+        // Operator lane: bypass contexts never reach the gate.
+        store
+            .delete(&CallerContext::for_admin("ai:operator"), missing)
+            .await
+            .expect("ALLOWED: admin bypass is unaffected");
+    }
+
+    async fn malformed_owner_body(path: &std::path::Path, id: &str, mode: &str) {
+        let store = SqliteStore::open(path).expect("store");
+        // A caller spelled like the malformed value must not match it.
+        let caller = CallerContext::for_agent("123");
+        let err = store
+            .update(&caller, id, patch("x"))
+            .await
+            .expect_err("DENIED: a malformed owner is never matched");
+        assert!(
+            matches!(err, StoreError::PermissionDenied { .. }),
+            "{mode}: {err:?}"
+        );
     }
 }
 

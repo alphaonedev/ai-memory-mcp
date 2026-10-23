@@ -136,11 +136,9 @@ fn pg_app(store: Arc<ai_memory::store::postgres::PostgresStore>) -> AppState {
 
 fn router(mut app: AppState, token: &str, caller: &str) -> axum::Router {
     use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
-    let enrolled = Arc::new(EnrolledAgentKeys::from_map(
-        [(api_key_sha256_hex(token), caller.to_owned())]
-            .into_iter()
-            .collect(),
-    ));
+    let mut keys = std::collections::HashMap::new();
+    keys.insert(api_key_sha256_hex(token), caller.to_owned());
+    let enrolled = Arc::new(EnrolledAgentKeys::from_map(keys));
     app.enrolled_agent_keys = Arc::clone(&enrolled);
     app.http_identity_mode = ai_memory::config::HttpIdentityMode::Enforce;
     ai_memory::build_router(
@@ -484,10 +482,10 @@ impl FedEnv {
     /// `federation_receive_coord_screen_3049`).
     async fn relaxed() -> Self {
         let lock = ENV_LOCK.lock().await;
-        let saved = fed_env_keys()
-            .into_iter()
-            .map(|k| (k, std::env::var_os(k)))
-            .collect();
+        let mut saved = Vec::new();
+        for k in fed_env_keys() {
+            saved.push((k, std::env::var_os(k)));
+        }
         // SAFETY: every cell in this binary that reads or writes the process
         // environment holds `ENV_LOCK` for its whole body (all async cells take
         // `FedEnv::plain()` or `relaxed()`), so no other test thread touches the

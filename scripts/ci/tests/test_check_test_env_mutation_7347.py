@@ -2373,7 +2373,10 @@ class Issue8100(Positive):
 
     def test_declared_non_std_types_stay_detached(self):
         crate = "use ai_memory::federation::KEY_A;\n"
-        self.check("let ks = [KEY_A];\n    ks.map(%s);" % self.CL, head=crate)
+        # r10 (#8107): an untyped array of crate constants is a container; `map` / `iter` on it are inline, but an
+        # element extracted from it is judged element by element
+        self.check("let ks = [KEY_A];\n    ks.map(%s);" % self.CL, set(), head=crate)
+        self.check("let ks = [KEY_A];\n    ks.iter().next().unwrap().for_each(%s);" % self.CL, head=crate)
         self.check("let ks: [ai_memory::Key; 1] = [KEY_A];\n    ks.map(%s);" % self.CL, head=crate)
         self.check("ks().map(%s);" % self.CL, head=crate + "fn ks() -> [ai_memory::Key; 1] { [KEY_A] }\n")
 
@@ -2510,6 +2513,333 @@ class FormInventory(Positive):
                      "Unknown::new().for_each(%s);" % self.CL, "unknown_name.for_each(%s);" % self.CL):
             with self.subTest(body=body):
                 self.check(body)
+
+
+PAR_FN = "fn par(v: &[u8]) -> rayon::slice::Iter<'_, u8> { v.par_iter() }\n"
+
+
+class Issue8102(Positive):
+    """#8102: an annotation with an inferred `_` (or an `impl` / `dyn`) proves nothing about the value, so the
+    initialiser decides; a std-only annotation without a placeholder is still the proof."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_inferred_annotations_are_judged_by_the_initialiser(self):
+        for body in (
+            "let it: _ = par(&[1u8]);\n    it.for_each(%s);",
+            "let o: Option<_> = Some(par(&[1u8]));\n    o.unwrap().for_each(%s);",
+            "let v: Vec<_> = vec![par(&[1u8])];\n    v.into_iter().next().unwrap().for_each(%s);",
+            "let b: Box<_> = Box::new(ai_memory::pool::Pool::new());\n    (*b).for_each(%s);",
+        ):
+            with self.subTest(body=body):
+                self.check(body % self.CL, head=PAR_FN)
+
+    def test_inferred_annotations_over_safe_initialisers_stay_clean(self):
+        for body in (
+            "let v: Vec<_> = vec![1u8];\n    v.iter().for_each(%s);",
+            "let o: Option<_> = Some(1u8);\n    o.iter().for_each(%s);",
+            "let it: _ = vec![1u8].into_iter();\n    it.for_each(%s);",
+            "vec![1u8].iter().collect::<Vec<_>>().iter().for_each(%s);",
+            "let v: Vec<u8> = vec![1u8];\n    v.iter().for_each(%s);",
+        ):
+            with self.subTest(body=body):
+                self.check(body % self.CL, set())
+
+
+class Issue8103(Positive):
+    """#8103: std is decided by what the file binds the name to, never by its spelling; tokio and futures are not std."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_non_std_imports_and_same_file_types_shadow_std_names(self):
+        for head, body in (
+            ("use ai_memory::pool::Mutex;\n", "Mutex::new(1u8).for_each(%s);"),
+            ("use ai_memory::pool::Arc;\n", "let p: Arc<u8> = ai_memory::pool::mk();\n    p.for_each(%s);"),
+            ("type Duration = ai_memory::pool::Pool;\n", "Duration::new().for_each(%s);"),
+            ("use ai_memory::pool::{Vec, Pool};\n", "let _p: Option<Pool> = None;\n    Vec::new().for_each(%s);"),
+            ("use ai_memory::pool::X as Arc;\n", "Arc::new(1u8).for_each(%s);"),
+            ("struct Path;\nimpl Path { fn new() -> ai_memory::pool::Pool { ai_memory::pool::Pool::new() } }\n",
+             "Path::new().for_each(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.CL, head=head)
+
+    def test_tokio_and_futures_are_not_std(self):
+        for body in (
+            "tokio::runtime::Handle::current().for_each(%s);",
+            "futures::stream::iter(vec![1u8]).for_each(%s);",
+            "Some(tokio::task::spawn_blocking(|| 1u8)).iter().for_each(%s);",
+        ):
+            with self.subTest(body=body):
+                self.check(body % self.CL)
+
+    def test_std_bindings_stay_clean(self):
+        for head, body in (
+            ("use std::sync::Arc;\n", "Arc::new(vec![1u8]).iter().for_each(%s);"),
+            ("use std::sync::{Arc, Mutex as M};\n", "Arc::new(M::new(vec![1u8])).lock().unwrap().iter().for_each(%s);"),
+            ("use std::time::Duration as D;\n", "Some(D::from_secs(1)).iter().for_each(%s);"),
+            ("use std::collections::HashMap;\n", "let m: HashMap<u8, u8> = HashMap::new();\n    m.iter().for_each(%s);"),
+            ("", "std::sync::Mutex::new(vec![1u8]).lock().unwrap().iter().for_each(%s);"),
+            ("", "Vec::<u8>::new().iter().for_each(%s);"),
+            ("use std::sync::*;\n", "Some(1u8).iter().for_each(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.CL, set(), head=head)
+
+
+class Issue8104(Positive):
+    """#8104: a const or static is classified by its DECLARED type through the predicate, never by its initialiser;
+    a same-file ADT type is safe only with a safe initialiser."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_generic_std_wrapper_of_a_crate_type_is_detached(self):
+        for head, body in (
+            ("static POOL: std::sync::OnceLock<ai_memory::pool::Pool> = std::sync::OnceLock::new();\n",
+             "POOL.get().unwrap().for_each(%s);"),
+            ("static P: std::sync::Mutex<Option<ai_memory::pool::Pool>> = std::sync::Mutex::new(None);\n",
+             "P.lock().unwrap().for_each(%s);"),
+            ("static P: std::sync::Mutex<Vec<ai_memory::pool::Pool>> = std::sync::Mutex::new(Vec::new());\n",
+             "P.lock().unwrap().iter().next().unwrap().for_each(%s);"),
+            ("const C: Option<ai_memory::pool::Pool> = None;\n", "C.for_each(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.CL, head=head)
+
+    def test_std_and_same_file_declared_types_stay_clean(self):
+        for head, body in (
+            ("static P: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());\n",
+             "P.lock().unwrap().iter().for_each(%s);"),
+            ("struct S(u8);\nconst K: S = S(1);\n", "Some(K).iter().for_each(%s);"),
+            ("static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());\n", "Some(LOCK.lock()).iter().for_each(%s);"),
+            ("const KEYS: [&str; 2] = [\"A\", \"B\"];\n", "KEYS.map(%s);"),
+            ("use std::sync::OnceLock;\nstatic P: OnceLock<Vec<u8>> = OnceLock::new();\n",
+             "P.get().unwrap().iter().for_each(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.CL, set(), head=head)
+
+    def test_same_file_adt_with_an_unsafe_initialiser_is_detached(self):
+        head = "struct S(ai_memory::pool::Pool);\nconst K: S = S(ai_memory::pool::Pool::new());\n"
+        self.check("Some(K).iter().for_each(%s);" % self.CL, head=head)
+
+
+class Issue8105(Positive):
+    """#8105: an imported non-std trait (or a non-std glob) can supply a method named like an INLINE_METHODS entry,
+    so while one exists a method is trusted only when it is provably std."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_imported_trait_methods_are_detached(self):
+        for head, body in (
+            ("use ai_memory::pool::PoolExt;\n", "vec![1u8].iter().for_each(%s);"),
+            ("use ai_memory::pool::PoolExt;\n", "vec![1u8].lines().for_each(%s);"),
+            ("use ai_memory::pool::PoolExt as _;\n", "vec![1u8].iter().for_each(%s);"),
+            ("use ai_memory::pool::prelude::*;\n", "vec![1u8].iter().for_each(%s);"),
+            ("use ai_memory::pool::{Pool, PoolExt};\n", "let _p: Option<Pool> = None;\n    vec![1u8].iter().for_each(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.CL, head=head)
+
+    def test_std_traits_and_used_imports_stay_clean(self):
+        for head, body in (
+            ("use std::io::BufRead;\n", '"a".lines().for_each(%s);'),
+            ("use ai_memory::pool::Pool;\n", "let _p: Option<Pool> = None;\n    vec![1u8].iter().for_each(%s);"),
+            ("use super::*;\n", "vec![1u8].iter().for_each(%s);"),
+            ("use ai_memory::db;\n", "vec![1u8].iter().for_each(%s);"),
+            ("", "vec![1u8].iter().for_each(%s);"),
+        ):
+            with self.subTest(head=head, body=body):
+                self.check(body % self.CL, set(), head=head)
+
+
+class Issue8106(Positive):
+    """#8106: a fn parameter is classified by its declared type through the predicate; a generic, an `impl Trait`, a
+    `dyn` and a type of another crate are detached, a std-only type and `self` are safe."""
+
+    CL = "|_| { %s }" % Positive.OPEN
+    CALL = "#[test]\nfn reader() {\n    let _g = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def run_case(self, helper, call, expect):
+        self.assertEqual(self.flagged(WRITER + helper + self.CALL % call), expect)
+
+    def test_untrusted_parameter_types_are_detached(self):
+        for helper in (
+            "fn drive<I: ParallelIterator<Item = u8>>(it: I) { it.for_each(%s); }\n",
+            "fn drive(it: impl ParallelIterator<Item = u8>) { it.for_each(%s); }\n",
+            "fn drive(it: &mut dyn Iterator<Item = u8>) { it.for_each(%s); }\n",
+            "fn drive(it: ai_memory::pool::Pool) { it.for_each(%s); }\n",
+            "fn drive<I>(it: &I) where I: ParallelIterator { it.for_each(%s); }\n",
+        ):
+            with self.subTest(helper=helper):
+                self.run_case(helper % self.CL, "drive(vec![1u8].into_par_iter());", FLAGGED)
+
+    def test_rstest_parameter_of_another_crate_is_detached(self):
+        text = WRITER + ("#[rstest::rstest]\nfn reader(p: ai_memory::pool::Pool) {\n"
+                         "    let _g = ENV_LOCK.blocking_lock();\n    p.for_each(%s);\n}\n" % self.CL)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_std_typed_parameters_stay_clean(self):
+        for helper in (
+            "fn drive(it: Vec<u8>) { it.iter().for_each(%s); }\n",
+            "fn drive(it: &[u8]) { it.iter().for_each(%s); }\n",
+            "fn drive(it: &str) { it.chars().for_each(%s); }\n",
+            "fn drive(mut it: Vec<u8>) { it.drain(..).for_each(%s); }\n",
+            "fn drive(m: &std::sync::Mutex<Vec<u8>>) { m.lock().unwrap().iter().for_each(%s); }\n",
+        ):
+            with self.subTest(helper=helper):
+                self.run_case(helper % self.CL, "drive(vec![1u8]);", set())
+        text = WRITER + ("#[rstest::rstest]\nfn reader(p: Vec<u8>) {\n"
+                         "    let _g = ENV_LOCK.blocking_lock();\n    p.iter().for_each(%s);\n}\n" % self.CL)
+        self.assertEqual(self.flagged(text), set())
+
+    def test_self_stays_safe(self):
+        head = "struct S;\nimpl S { fn run(&self) { self.m().iter().for_each(%s); }\n    fn m(&self) -> Vec<u8> { vec![1u8] } }\n"
+        self.run_case(head % self.CL, "S.run();", set())
+
+
+class Issue8107(Positive):
+    """#8107: a chain rooted in an array / vec! literal whose links are container-level methods is judged without its
+    elements; the closure parameter and an element-extracting link still judge the elements."""
+
+    CLK = "|k| { %s k }" % Positive.OPEN
+    CL = "|_| { %s }" % Positive.OPEN
+    ENVS = "use ai_memory::envs::{A_ENV, B_ENV};\n"
+
+    def test_container_level_chains_over_crate_constants_are_clean(self):
+        for body in (
+            "let keys = [A_ENV, B_ENV];\n    let _v = keys.map(%s);",
+            "let keys = [A_ENV, B_ENV];\n    keys.iter().for_each(%s);",
+            "let _v = [A_ENV, B_ENV].map(%s);",
+            "let keys = vec![A_ENV, B_ENV];\n    keys.into_iter().for_each(%s);",
+            "let keys = &[A_ENV, B_ENV];\n    keys.iter().for_each(%s);",
+        ):
+            with self.subTest(body=body):
+                self.check(body % self.CLK, set(), head=self.ENVS)
+
+    def test_element_extraction_still_judges_the_elements(self):
+        for body in (
+            "[par(&[1u8])].iter().next().unwrap().for_each(%s);" % self.CL,
+            "[par(&[1u8])].map(|k| k.for_each(%s));" % self.CL,
+            "let ks = [par(&[1u8])];\n    ks.into_iter().next().unwrap().for_each(%s);" % self.CL,
+            "let ks = [par(&[1u8])];\n    ks[0].for_each(%s);" % self.CL,
+            "let ks = [A_ENV, B_ENV];\n    ks.iter().next().unwrap().for_each(%s);" % self.CL,
+        ):
+            with self.subTest(body=body):
+                self.check(body, head=PAR_FN + self.ENVS)
+
+    POSTURE = """
+use std::sync::Mutex;
+static FED_ENV_LOCK: Mutex<()> = Mutex::new(());
+struct Posture([(&'static str, Option<std::ffi::OsString>); 5]);
+impl Posture {
+    fn new(peer: &str, namespace: &str) -> Self {
+        use ai_memory::federation::peer_attestation::{
+            PEER_ATTESTATION_ENV, TRUST_BODY_AGENT_ID_ENV,
+        };
+        use ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+        use ai_memory::federation::signing::REQUIRE_SIG_ENV;
+        const REQUIRE_ATTEST_ENV: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTATION";
+        let keys = [
+            PEER_ATTESTATION_ENV,
+            REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            REQUIRE_SIG_ENV,
+            TRUST_BODY_AGENT_ID_ENV,
+            REQUIRE_ATTEST_ENV,
+        ];
+        let guard = Self(keys.map(|k| (k, std::env::var_os(k))));
+        let allowlist = json!({peer: {"allowed_namespaces": [namespace]}});
+        // SAFETY: every caller holds FED_ENV_LOCK; Drop restores before release.
+        unsafe {
+            std::env::set_var(PEER_ATTESTATION_ENV, allowlist.to_string());
+            std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+            std::env::set_var(REQUIRE_SIG_ENV, "0");
+        }
+        guard
+    }
+}
+
+impl Drop for Posture {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            unsafe {
+                match previous {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn first() {
+    let _l = FED_ENV_LOCK.lock().unwrap();
+    let _p = Posture::new("p", "n");
+    let _c = db::open(":memory:");
+}
+
+#[test]
+fn second() {
+    let _l = FED_ENV_LOCK.lock().unwrap();
+    let _p = Posture::new("p", "n");
+    let _c = db::open(":memory:");
+}
+"""
+
+    def test_untyped_posture_shape_of_3699_passes(self):
+        """The text of tests/federation_causal_order_3699.rs at 96abf24ac (the untyped `let keys = [..]`)."""
+        self.assertEqual(self.flagged(self.POSTURE), set())
+
+
+class TypeOriginInventory(unittest.TestCase):
+    """r10: every rule that classifies a type or a value calls the ONE predicate type_origin; the spelling-based
+    helpers (a hard-coded std type set, an inline-runner name set standing in for std) cannot come back."""
+
+    RULES = ("macro_ok", "annotation", "const_ok", "name_ok", "span_safe", "member_ok", "returns_safe", "path_ok", "call_ok")
+
+    def setUp(self):
+        import ast
+        self.src = (REPO / "scripts" / "check-test-env-mutation.py").read_text()
+        tree = ast.parse(self.src)
+        self.methods = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "FileModel":
+                for fn in node.body:
+                    if isinstance(fn, ast.FunctionDef):
+                        self.methods[fn.name] = ast.get_source_segment(self.src, fn)
+
+    def test_the_predicate_and_its_three_results_exist(self):
+        for const in ("STD", "CRATE", "UNKNOWN"):
+            self.assertTrue(hasattr(gate, const), const)
+        self.assertEqual(len({gate.STD, gate.CRATE, gate.UNKNOWN}), 3)
+        self.assertIn("type_origin", self.methods)
+        self.assertTrue(self.methods["type_origin"].count('"""') >= 2, "type_origin carries a docstring")
+
+    def test_every_classifying_rule_calls_the_predicate(self):
+        for name in self.RULES:
+            with self.subTest(rule=name):
+                self.assertRegex(self.methods[name], r"\b(?:type_origin|path_origin|name_origin|method_origin)\(")
+
+    def test_spelling_based_helpers_are_gone(self):
+        for old in ("RECEIVER_STD_TYPES", "def types_ok", "self.types_ok("):
+            with self.subTest(old=old):
+                self.assertNotIn(old, self.src)
+        for name in ("macro_ok", "annotation", "const_ok", "name_ok", "span_safe"):
+            self.assertNotIn("inline_imports", self.methods[name], name)
+            self.assertNotIn("INLINE_ROOTS", self.methods[name], name)
+
+    def test_origin_of_type_text(self):
+        model = gate.FileModel("use std::sync::Arc;\nuse ai_memory::pool::Pool;\nstruct S;\n")
+        for text, want in (
+            ("Vec<u8>", gate.STD), ("Arc<Vec<u8>>", gate.STD), ("&'static str", gate.STD), ("[&str; 2]", gate.STD),
+            ("std::sync::Mutex<()>", gate.STD), ("Pool", gate.CRATE), ("Arc<Pool>", gate.CRATE), ("S", gate.CRATE),
+            ("Vec<_>", gate.UNKNOWN), ("_", gate.UNKNOWN), ("impl Iterator<Item = u8>", gate.UNKNOWN),
+            ("dyn Iterator<Item = u8>", gate.UNKNOWN), ("T", gate.UNKNOWN), ("tokio::sync::Mutex<()>", gate.CRATE),
+            ("Mutex<()>", gate.UNKNOWN),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(model.type_origin(text), want)
 
 
 class RealTree(unittest.TestCase):

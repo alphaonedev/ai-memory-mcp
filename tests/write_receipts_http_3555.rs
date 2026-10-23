@@ -296,16 +296,21 @@ fn postgres_http_write_receipts_3555() {
         ),
     ]);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    runtime.block_on(async {
-        exercise_local(postgres_app_state(&url).await, "per-commit").await;
-        let separator = if url.contains('?') { '&' } else { '?' };
-        let asynchronous = format!("{url}{separator}options=-c%20synchronous_commit%3Doff");
-        exercise_local(
-            postgres_app_state(&asynchronous).await,
-            "asynchronous WAL flush",
-        )
-        .await;
-    });
+    runtime.block_on(exercise_postgres_local(url.clone()));
+}
+
+/// Both WAL-flush modes of `postgres_http_write_receipts_3555` (an `async fn`, so the
+/// env gate sees a named call, not a detached async block).
+#[cfg(feature = "sal-postgres")]
+async fn exercise_postgres_local(url: String) {
+    exercise_local(postgres_app_state(&url).await, "per-commit").await;
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let asynchronous = format!("{url}{separator}options=-c%20synchronous_commit%3Doff");
+    exercise_local(
+        postgres_app_state(&asynchronous).await,
+        "asynchronous WAL flush",
+    )
+    .await;
 }
 
 async fn exercise_quorum(mut app: AppState) {
@@ -445,7 +450,11 @@ fn postgres_quorum_cell(runtime: &tokio::runtime::Runtime, url: &str, backup: Op
         ),
         ("AI_MEMORY_BACKUP_POSTURE_ATTESTATION", backup),
     ]);
-    runtime.block_on(async {
-        exercise_quorum(postgres_app_state(url).await).await;
-    });
+    runtime.block_on(exercise_postgres_quorum(url.to_owned()));
+}
+
+/// One quorum cell against PostgreSQL (an `async fn`, see `exercise_postgres_local`).
+#[cfg(feature = "sal-postgres")]
+async fn exercise_postgres_quorum(url: String) {
+    exercise_quorum(postgres_app_state(&url).await).await;
 }
