@@ -230,6 +230,16 @@ fn extract_timestamp(line: &str) -> Option<DateTime<Utc>> {
 /// (which sorts by date because the rolling appender's suffix is
 /// `YYYY-MM-DD[-HH[-MM]]`).
 fn enumerate_log_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = list_log_candidates(dir)?;
+    files.retain(|p| p.is_file());
+    Ok(files)
+}
+
+/// Every `ai-memory.log*` NAME in `dir`, sorted, with no stat of the entries.
+/// The follow loop uses this so the file type is decided once, by `fstat` on
+/// the opened handle (`open_followed`), never by a path stat taken before the
+/// open (#8221).
+fn list_log_candidates(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -237,10 +247,9 @@ fn enumerate_log_files(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in fs::read_dir(dir).with_context(|| crate::errors::msg::reading(dir.display()))? {
         let entry = entry?;
         let p = entry.path();
-        if p.is_file()
-            && p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("ai-memory") && !n.ends_with(".zst"))
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("ai-memory") && !n.ends_with(".zst"))
         {
             files.push(p);
         }
@@ -578,11 +587,36 @@ fn read_lines_from_handle(
     Ok(end)
 }
 
-/// Open `path` as the followed handle.
+/// Open `path` as the followed handle: with `O_NONBLOCK`, and only a regular file.
+///
+/// decision: `O_NONBLOCK` plus `fstat` on the opened handle over a path stat
+/// before a blocking open, because a FIFO at the name would otherwise hang the
+/// poll loop in `open(2)` and a stat then an open of the same path leaves a
+/// swap window; any non-regular file is the same unopenable posture as a
+/// failed open (#8221, ERRORS-02).
 fn open_followed(path: &Path) -> Result<fs::File> {
     #[cfg(test)]
     OPEN_FOLLOWED_CALLS.set(OPEN_FOLLOWED_CALLS.get() + 1);
-    fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| crate::errors::msg::opening(path.display()))?;
+    let is_regular = file
+        .metadata()
+        .with_context(|| crate::errors::msg::opening(path.display()))?
+        .file_type()
+        .is_file();
+    if !is_regular {
+        return Err(anyhow!("not a regular file"))
+            .with_context(|| crate::errors::msg::opening(path.display()));
+    }
+    Ok(file)
 }
 
 /// Print every line the followed file gained since `state.offset`, reading the
@@ -631,7 +665,7 @@ fn follow_poll(
     filters: &Filters,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let newest = enumerate_log_files(dir)?.pop();
+    let newest = list_log_candidates(dir)?.pop();
     // decision: compare newest against the followed path with the module's own
     // ordering (`enumerate_log_files` sorts by path, the rolling appender's
     // date suffix) over keeping a set of seen paths, because `>` needs no
@@ -1419,9 +1453,15 @@ mod tests {
                 bad.push(format!("receiver `{recv}` at {at}"));
             }
         }
-        for banned in [".exists()", ".is_file()", ".is_dir()", ".try_exists()"] {
+        for banned in [".exists()", ".is_dir()", ".try_exists()"] {
             if body.contains(banned) {
                 bad.push(format!("path predicate {banned}"));
+            }
+        }
+        // `.is_file()` is allowed only on the handle's `file_type()`.
+        for (at, _) in body.match_indices(".is_file()") {
+            if !body[..at].trim_end().ends_with("file_type()") {
+                bad.push(format!("path predicate .is_file() at {at}"));
             }
         }
         bad
@@ -1448,6 +1488,8 @@ mod tests {
         assert!(!path_stat_calls("path.metadata().ok().as_ref()").is_empty());
         assert!(!path_stat_calls("fs::metadata(&path)").is_empty());
         assert!(!path_stat_calls("std::fs::symlink_metadata(&p)").is_empty());
+        assert!(!path_stat_calls("if p.is_file() {}").is_empty());
+        assert!(path_stat_calls("file.metadata()?.file_type().is_file()").is_empty());
     }
 
     /// #8141 - a removed followed path is no evidence of anything: quiet poll,
