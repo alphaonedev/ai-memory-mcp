@@ -17,6 +17,7 @@ import io
 import os
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -25,7 +26,8 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
-SCRATCH = REPO / ".local-runs" / "evict-r5-7219"
+SCRATCH_PARENT = REPO / ".local-runs"
+SCRATCH = None  # per-run mkdtemp dir, set by setUpModule (#8024)
 sys.path.insert(0, str(REPO / "scripts" / "ci"))
 import prune_runner_artifacts as prune  # noqa: E402
 import shared_cargo_target as shared  # noqa: E402
@@ -55,6 +57,16 @@ def make_target(root, name, age_days, files=1):
 
 def starved(_path):
     return STARVED_GIB * GIB
+
+
+def setUpModule():
+    global SCRATCH
+    SCRATCH_PARENT.mkdir(parents=True, exist_ok=True)
+    SCRATCH = Path(tempfile.mkdtemp(prefix="evict-r5-7219-", dir=str(SCRATCH_PARENT)))
+
+
+def tearDownModule():
+    shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
 class Fixture(unittest.TestCase):

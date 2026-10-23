@@ -22,7 +22,7 @@ import partition_test_binaries as pt  # noqa: E402
 import test_partition_test_binaries as TB  # noqa: E402
 
 REPO = TB.REPO
-SCRATCH = TB.SCRATCH
+from test_partition_test_binaries import setUpModule, tearDownModule  # noqa: E402,F401  (per-run TB.SCRATCH, #8024)
 fx = TB.fx
 
 
@@ -87,7 +87,7 @@ class SupersetGate:
 
     def gate(self, *args, **kwargs):
         result = super().gate(*args, **kwargs)
-        self.assertEqual(lost_base_sites(SCRATCH / 'src'), [], 'a base-matcher site was dropped (fail open)')
+        self.assertEqual(lost_base_sites(TB.SCRATCH / 'src'), [], 'a base-matcher site was dropped (fail open)')
         return result
 
 
@@ -197,7 +197,7 @@ OUT_OF_SCOPE = {'N9c', 'N16'}
 
 
 def write_case(files, support):
-    """Lay a fixture crate out under SCRATCH/src and return its src root."""
+    """Lay a fixture crate out under TB.SCRATCH/src and return its src root."""
     fx('src/support.rs', support)
     if 'lib.rs' not in files:
         tops = sorted({k.split('/')[0][:-3] if k.endswith('.rs') and '/' not in k else k.split('/')[0]
@@ -205,7 +205,7 @@ def write_case(files, support):
         fx('src/lib.rs', ''.join('mod %s;\n' % m for m in tops))
     for k, v in files.items():
         fx('src/' + k, v)
-    return SCRATCH / 'src'
+    return TB.SCRATCH / 'src'
 
 
 class CorpusUnion6412(TB.Base):
@@ -312,7 +312,7 @@ class ResolverFailureIsRed6412(TB.Base):
         pt.helper_callers = boom
         try:
             with self.assertRaises(RuntimeError):
-                pt.lib_pg_sites(SCRATCH / 'src')
+                pt.lib_pg_sites(TB.SCRATCH / 'src')
         finally:
             pt.helper_callers = original
 
@@ -322,7 +322,7 @@ class LexicalExclusions6412(TB.Base):
 
     def sites(self, a_rs):
         write_case({'a.rs': a_rs}, SUP)
-        return sorted({p for p, _w in pt.lib_pg_sites(SCRATCH / 'src') if p.startswith('a')})
+        return sorted({p for p, _w in pt.lib_pg_sites(TB.SCRATCH / 'src') if p.startswith('a')})
 
     def test_comment_string_char_method_field_are_not_sites_6412(self):
         wt = TB.LibCallerTransitive6412.with_tests
