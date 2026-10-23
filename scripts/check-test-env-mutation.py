@@ -88,6 +88,10 @@ A same-file fn that hands one of its parameters to a spawn (#8044), directly, th
 through another such fn, is a detaching helper: the argument of every call of it runs detached.
 A closure variable or fn item rebound with `let g = f;` before the spawn is followed to a fixpoint (#8045),
 bounded by MAX_REBIND_HOPS; a longer chain is flagged, never cleared.
+Any other carrier of a closure into a spawn (#8051: `Box::new(f)`, `f.clone()`, `Some(f)`, a struct field,
+a `for` or match-arm binding, a wrapping closure) is followed through its `let`, assignment and `for`
+bindings; a name that holds a closure makes that initialiser detached, and a carrier that cannot be
+traced (or more than MAX_CARRIER_NAMES) flags every closure of the fn, never credits it.
 A macro_rules! whose body invokes a spawning macro, or a detaching helper, detaches too (#8046): the
 forwarding is closed transitively.
 In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
@@ -233,6 +237,12 @@ META_CALL = re.compile(r"\$([A-Za-z_]\w*)\s*\(")
 # #8045: `let [mut] <name> [: T] = [&] [path::]<ident>;` -- a plain rebinding of a closure variable or fn item
 REBIND_LET = r"\blet\s+(?:mut\s+)?%s\b\s*(?::[^=;]*)?=\s*(?:&\s*)?((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*;"
 MAX_REBIND_HOPS = 8  # #8045: rebinding steps followed from a spawn argument; a longer chain flags the whole fn
+MAX_CARRIER_NAMES = 32  # #8051: distinct local names followed from a spawn argument; more flags the whole fn
+ASSIGN = r"(?<![\w.])%s\s*=(?![=>])"  # `g = <init>;` (a re-assignment of a carrier variable)
+LOCAL_NAME = re.compile(r"(?<![\w.:])([A-Za-z_]\w*)\b(?!\s*::)")  # an identifier that is not a path segment or field
+LOOP_BIND = r"\bfor\b[^{};]*\b%s\b[^{};]*\bin\b"  # `for g in <expr> {`
+ARM_BIND = r"(?<![\w.])%s\b\s*(?:[,)|]\s*)*=>"  # a match-arm pattern naming the variable
+PARAM_BIND = r"\|[^|;{}]*\b%s\b[^|;{}]*\|"  # a closure parameter list naming the variable
 ANY_CLOSURE_LET = CLOSURE_LET % r"[A-Za-z_]\w*"  # every closure or async-block `let` initialiser of a fn
 # #7623-#7627: the canonical guard binding (see the module docstring). Nothing models moves or drops.
 LET_PAIR = re.compile(r"^\s*let\s+\(\s*(?:mut\s+)?([A-Za-z_]\w*)\s*,\s*(?:mut\s+)?([A-Za-z_]\w*)\s*\)\s*(?::[^=]*)?=(?!=)")
@@ -1474,14 +1484,50 @@ class FileModel:
                         out.append(args[j])
         return out
 
+    def carried(self, body, a, b):
+        """(spans, texts, over) for the spawn argument body[a:b] (#8051): every identifier in the argument,
+        and in each initialiser it leads to, is followed through its `let`, assignment and `for` bindings
+        (a boxed, cloned, optional, field-held or looped carrier included). A name that holds a closure or
+        async-block `let` makes that initialiser a span. A name bound by a match arm or a closure parameter
+        cannot be traced, and more than MAX_CARRIER_NAMES names is too many: both set over, and every
+        closure initialiser of the fn is then a span. texts are the initialisers followed. Never credits."""
+        spans, texts, seen, over = [], [], set(), False
+        literal = re.match(r"\s*(?:async\b\s*)?(?:move\b\s*)?[|{]", body[a:b]) is not None
+        queue = [(n, not literal) for n in LOCAL_NAME.findall(body[a:b])]
+        while queue:
+            name, bare = queue.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            esc, found = re.escape(name), []
+            for lm in re.finditer(CLOSURE_LET % esc, body[:a]):
+                spans.append((lm.end(), stmt_end(body, lm.end())))
+                found.append(spans[-1])
+            for pat in (r"\blet\b[^=;]*\b%s\b[^=;]*=(?!=)\s*" % esc, ASSIGN % esc):
+                found += [(lm.end(), stmt_end(body, lm.end())) for lm in re.finditer(pat, body[:a])]
+            for lm in re.finditer(LOOP_BIND % esc, body[:a]):
+                brace = body.find("{", lm.end())
+                found.append((lm.end(), len(body) if brace < 0 else brace))
+            called = bare or re.search(r"\b%s\s*\(" % esc, body[a:b]) is not None
+            over = over or (called and any(re.search(pat % esc, body[:a]) for pat in (ARM_BIND, PARAM_BIND)))
+            if len(texts) > MAX_CARRIER_NAMES:
+                return spans, texts, True
+            for x, y in found:
+                texts.append(body[x:y])
+                queue += [(n, False) for n in LOCAL_NAME.findall(body[x:y])]
+        return spans, texts, over
+
     def expand(self, body, a, b):
-        """(spans, chain, overflow) for the spawn argument body[a:b] (#8033, #8045): spans are the closure or
-        async-block initialisers of the variables the argument resolves to through `let g = f;` rebindings,
-        chain is every (path prefix, name) reached, overflow says MAX_REBIND_HOPS was hit. On overflow every
-        closure initialiser of the fn is a span: a long chain is flagged, never cleared."""
+        """(spans, chain, overflow) for the spawn argument body[a:b] (#8033, #8045, #8051): spans are the
+        closure or async-block initialisers of the variables the argument resolves to through `let g = f;`
+        rebindings or any other carrier (see carried), chain is every (path prefix, name) reached by the
+        rebindings, overflow says MAX_REBIND_HOPS was hit or a carrier could not be traced. On overflow every
+        closure initialiser of the fn is a span: a long chain or an unknown carrier is flagged, never cleared."""
+        spans, _, cover = self.carried(body, a, b)
+        every = [(lm.end(), stmt_end(body, lm.end())) for lm in re.compile(ANY_CLOSURE_LET).finditer(body)]
         v = FN_VALUE.fullmatch(body, a, b)
         if not v:
-            return [], [], False
+            return (spans + every if cover else spans), [], cover
         chain, frontier = [(v.group(1), v.group(2))], ([v.group(2)] if not v.group(1) else [])
         for _ in range(MAX_REBIND_HOPS):
             nxt = []
@@ -1495,10 +1541,9 @@ class FileModel:
             frontier = nxt
             if not frontier:
                 break
-        over = bool(frontier)
-        spans = []
+        over = bool(frontier) or cover
         if over:
-            spans = [(lm.end(), stmt_end(body, lm.end())) for lm in re.compile(ANY_CLOSURE_LET).finditer(body)]
+            spans += every
         else:
             for prefix, name in chain:
                 if not prefix:
@@ -1523,7 +1568,7 @@ class FileModel:
         texts, names, over = [], set(), False
         for a, b in roots:
             spans, chain, ov = self.expand(fn.body, a, b)
-            texts += [fn.body[x:y] for x, y in [(a, b)] + spans]
+            texts += [fn.body[x:y] for x, y in [(a, b)] + spans] + self.carried(fn.body, a, b)[1]
             names |= {n for prefix, n in chain if not prefix}
             over = over or ov
         return {i for i, pn in enumerate(fn.params)

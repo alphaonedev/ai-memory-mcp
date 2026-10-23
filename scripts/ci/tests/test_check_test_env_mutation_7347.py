@@ -1597,6 +1597,51 @@ class Issue8045(Fixture):
         self.assertEqual(self.flagged(WRITER + self.LOCKED % body), set())
 
 
+class Issue8051(Fixture):
+    """#8051: a closure carried into a spawn by any non-canonical expression is detached, never credited."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+    F0 = "let f0 = move || { %s };\n    " % OPEN
+    SP = "std::thread::spawn(%s).join().unwrap();"
+
+    def check(self, tail, expect=FLAGGED):
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % (self.F0 + tail)), expect)
+
+    def test_boxed_closure(self):
+        self.check("let g = Box::new(f0);\n    " + self.SP % "g")
+
+    def test_typed_boxed_closure(self):
+        self.check("let g: Box<dyn FnOnce() + Send> = Box::new(f0);\n    " + self.SP % "g")
+
+    def test_cloned_closure(self):
+        self.check("let g = f0.clone();\n    " + self.SP % "g")
+
+    def test_closure_assigned_through_option(self):
+        self.check("let mut g = None;\n    g = Some(f0);\n    " + self.SP % "g.unwrap()")
+
+    def test_closure_in_struct_field(self):
+        self.check("let s = S { f: f0 };\n    " + self.SP % "s.f")
+
+    def test_closure_from_loop_pattern(self):
+        self.check("for g in vec![f0] {\n        " + self.SP % "g" + "\n    }")
+
+    def test_wrapping_closure(self):
+        self.check(self.SP % "move || f0()")
+
+    def test_match_arm_binding(self):
+        self.check("let o = Some(f0);\n    match o {\n        Some(g) => { " + self.SP % "g" + " }\n        None => {}\n    }")
+
+    def test_same_thread_call_keeps_the_lock(self):
+        self.check("f0();", set())
+
+    def test_canonical_rebind_is_still_flagged(self):
+        self.check("let g = f0;\n    " + self.SP % "g")
+
+    def test_carrier_that_is_only_called_keeps_the_lock(self):
+        self.check("let g = Box::new(f0);\n    g();", set())
+
+
 class Issue8046(Fixture):
     """#8046: a macro whose body invokes a detaching macro detaches the arguments of its own invocations."""
 
