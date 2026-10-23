@@ -1642,6 +1642,88 @@ mod tests {
         assert!(e.contains("still following"), "{e:?}");
     }
 
+    /// Plant a non-regular `ai-memory.log.old` that sorts above the dated
+    /// logs: a directory, or (`fifo`) a FIFO.
+    #[cfg(unix)]
+    fn plant_shadow(dir: &Path, fifo: bool) {
+        let shadow = dir.join("ai-memory.log.old");
+        if fifo {
+            make_fifo(&shadow);
+        } else {
+            fs::create_dir(&shadow).unwrap();
+        }
+    }
+
+    /// #8222 - a non-regular entry sorting above the followed file must not
+    /// shadow the next rotated log: the list skips it by its entry type, the
+    /// follow switches to the newest regular file, quietly, within the bound.
+    #[cfg(unix)]
+    fn shadowed_switch(fifo: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "one\n");
+        let state = open_state(&a, 4);
+        plant_shadow(dir.path(), fifo);
+        make_log(dir.path(), "ai-memory.log.2026-10-24", "next\n");
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung");
+        assert_eq!((s.as_str(), e.as_str()), ("next\n", ""), "{s:?} {e:?}");
+    }
+
+    /// #8222 - the same shadow must not stop the truncation check: a shrunk
+    /// followed file is noticed and re-read from the start.
+    #[cfg(unix)]
+    fn shadowed_truncation(fifo: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let state = open_state(&a, 8);
+        plant_shadow(dir.path(), fifo);
+        fs::write(&a, "x\n").unwrap();
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung");
+        assert_eq!(s, "x\n", "truncation seen: {s:?} {e:?}");
+        assert!(e.contains("rotated or truncated"), "{e:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_directory_sorting_last_does_not_shadow_next_log_8222() {
+        shadowed_switch(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_sorting_last_does_not_shadow_next_log_8222() {
+        shadowed_switch(true);
+    }
+
+    /// #8222 - a symlink to a directory passes the entry-type filter (a
+    /// symlink is kept so the handle decides), so the walk down the
+    /// candidates is what skips it and reaches the real newest log.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_symlinked_directory_sorting_last_is_walked_past_8222() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "one\n");
+        let state = open_state(&a, 4);
+        let target = dir.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("ai-memory.log.old")).unwrap();
+        make_log(dir.path(), "ai-memory.log.2026-10-24", "next\n");
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung");
+        assert_eq!(s, "next\n", "{s:?} {e:?}");
+        assert_eq!(e.matches("not a regular file").count(), 1, "{e:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_directory_sorting_last_keeps_truncation_check_8222() {
+        shadowed_truncation(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_sorting_last_keeps_truncation_check_8222() {
+        shadowed_truncation(true);
+    }
+
     /// #8148 - the note tail on a failed open: with an inode an unopenable
     /// replacement keeps the open handle draining and says exactly that; a
     /// failed open proves no rename, so the tail never claims one.
