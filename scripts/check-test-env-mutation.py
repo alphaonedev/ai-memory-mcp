@@ -277,6 +277,10 @@ SRC_REL = "src"
 ISOLATED_MARKER = re.compile(r"//[ \t]*env-mutation-gate:[ \t]*process-isolated[ \t]*--[ \t]*\S")
 # #7383: a raw string, raw byte string (`br`) or raw C string (`cr`) opener.
 RAW_STR_OPEN = re.compile(r'(?:[bc]?r)(#*)"')
+# r24: a raw identifier (`r#name`); the keywords stay as they are (`r#mod` is not a `mod` item)
+RAW_IDENT = re.compile(r"r#(?!(?:as|async|await|box|break|const|continue|crate|do|dyn|else|enum|extern|false|final|fn|for"
+                       r"|gen|if|impl|in|let|loop|macro|match|mod|move|mut|override|priv|pub|ref|return|self|static|struct"
+                       r"|super|trait|true|try|type|typeof|unsafe|unsized|use|virtual|where|while|yield)\b)[^\W\d]")
 # Direct writers: env::set_var / remove_var, qualified or imported bare (not `fn set_var`, not `.set_var`).
 # #7996: also the libc writers, a turbofish (`set_var::<&str, &str>(..)`) and a bare mention of the fn as a
 # value (`let f = set_var;`, no call parenthesis): such a pointer can be called anywhere, so it is a write of
@@ -376,13 +380,16 @@ MAX_REBIND_HOPS = 8  # #8045: rebinding steps followed from a spawn argument; a 
 MAX_CARRIER_NAMES = 32  # #8051: distinct local names followed from a spawn argument; more flags the whole fn
 ASSIGN = r"(?<![\w.])%s\s*=(?![=>])"  # `g = <init>;` (a re-assignment of a carrier variable)
 LOCAL_NAME = re.compile(r"(?<![\w.:])([A-Za-z_]\w*)\b(?!\s*::)")  # an identifier that is not a path segment or field
-ATTR_RUN = r"(?:#\s*!?\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\]\s*)*"  # r23: any run of attributes, in any order
-MOD_ITEM = re.compile(r"(" + ATTR_RUN + r")(?:pub(?:\s*\([^)]*\))?\s+)?\bmod\s+([A-Za-z_]\w*)\s*;")  # r23: `[attrs] mod m;`
-ATTR_ONE = re.compile(r"#\s*!?\s*\[((?:[^\[\]]|\[[^\[\]]*\])*)\]")  # r23: one attribute and its body
+MOD_TOKEN = re.compile(r"(?<![\w$#])mod\b")  # r24: every `mod` keyword; the head after it is classified or reported
+MOD_HEAD = re.compile(r"\s*(\$?[^\W\d]\w*)\s*([;{])")  # r24: `name;` or `name {` (any identifier, raw ones are scrubbed to plain; a macro `$name` only inline)
+MOD_VIS = re.compile(r"(?<![\w$])pub(?:\s*\([^()]*\)\s*|\s+)\Z")  # r24: a visibility directly before `mod`
+ATTR_OPEN = re.compile(r"#\s*!?\s*\[")  # r24: the start of an attribute
 RUST_LITERAL = r'(?:"((?:[^"\\]|\\.)*)"|r(#*)"(.*?)"\2)'  # r23: a plain or a raw string literal (groups: plain, hashes, raw)
 PATH_ATTR = re.compile(r"\s*path\s*=\s*" + RUST_LITERAL + r"\s*\Z", re.S)  # r23: a whole `path = ".."` attribute body
-INCLUDE_CALL = re.compile(r"(?<![\w$])include\s*!\s*[(\[{]")  # r23: the start of an `include!(..)` call
+INCLUDE_TOKEN = re.compile(r"(?<![\w$])include\s*!")  # r24: every `include!`; its argument is classified or reported
+INCLUDE_OPEN = re.compile(r"\s*[(\[{]")  # r24: the bracket that opens its argument
 INCLUDE_ARG = re.compile(r"\s*" + RUST_LITERAL + r"\s*,?\s*[)\]}]", re.S)  # r23: its argument: one literal and nothing else
+USE_TOKEN_START = re.compile(r"(?<![\w$#])use\b(?!\s*<)")  # r24: every `use` item (not the `use<..>` capture list)
 MACRO_OPEN = "*"  # r23: the entry that marks a module walk as incomplete: no bare macro name is then trusted
 LOOP_BIND = r"\bfor\b[^{};]*\b%s\b[^{};]*\bin\b"  # `for g in <expr> {`
 ARM_BIND = r"(?<![\w.])%s\b\s*(?:[,)|]\s*)*=>"  # a match-arm pattern naming the variable
@@ -479,7 +486,6 @@ DEP_DOTTED_PACKAGE = re.compile(r"""^["']?([\w-]+)["']?\.package\s*=\s*["']([^"'
 DEP_PACKAGE = re.compile(r"""\bpackage\s*=\s*["']([^"']+)["']""")  # r15 (N1): basic or literal string; the `package = "x"` key of an inline table or a [dependencies.name] table
 DEP_QUOTES = "'\""  # the quote characters TOML allows around a dependency name
 DEP_AMBIGUOUS = "?"  # r14 (G2): the real crate of a dependency name that two tables point at different crates; trusted by no table
-INLINE_MOD = re.compile(r"(?<![\w$])mod\s+([A-Za-z_]\w*)\s*\{")  # r14 (G3): an inline module and its opening brace
 SRC_TRAIT = re.compile(r"(?<![\w$])trait\s+([A-Za-z_]\w*)[^{;]*\{")  # a trait declaration of src/ and its body
 SRC_TYPE = re.compile(r"(?<![\w$])(?:struct|enum|union|type)\s+([A-Za-z_]\w*)")  # a src/ type that is not a trait
 FN_NAME = re.compile(r"(?<![\w$])fn\s+([A-Za-z_]\w*)")  # every fn a trait body declares (nested ones included)
@@ -671,6 +677,9 @@ def scrub(src, line_comments=None):
             j = n if j < 0 else j + len(end)
             out.append(re.sub(r"[^\n]", " ", src[i:j]))
             i = j
+        elif c == "r" and RAW_IDENT.match(src, i) and (i == 0 or not src[i - 1].isalnum() and src[i - 1] != "_"):
+            out.append("  ")  # r24: `r#name` reads as `name` (a raw identifier names the same item); the length is kept
+            i += 2
         elif (c == "c" and src[i + 1:i + 2] == '"' or c == "b" and src[i + 1:i + 2] in ('"', "'")) and (
                 i == 0 or not src[i - 1].isalnum() and src[i - 1] != "_"):
             out.append(" ")  # the b / c prefix of a byte or C literal; the literal scrubs next
@@ -2043,6 +2052,119 @@ class ItemIndex:
         return self
 
 
+REASONS = {  # r24: every reason the module walk gives for a target it cannot trust; a diagnostic of any of them fails the run
+    "module_missing": "module file for `mod %s;` not found (tried %s)",
+    "mod_unclassified": "`mod` item cannot be classified (%s)",
+    "path_not_literal": "the path attribute of `mod %s` is not one plain or raw string literal",
+    "path_stray": "path attribute is not on a module item (%s)",
+    "attr_unparsable": "an attribute before `mod %s` cannot be parsed",
+    "include_arg": "include! argument is not one plain or raw string literal (%s)",
+    "include_missing": "include! file %s not found",
+    "file_unreadable": "file cannot be read",
+    "use_item": "`use` item cannot be classified (%s)",
+}
+ModItem = collections.namedtuple("ModItem", "name inline start brace close rel problems")
+
+
+def snippet(text, at):
+    """The first line of text from offset at (at most 40 characters), for a diagnostic."""
+    return text[at:at + 40].split("\n")[0].strip()
+
+
+def is_path_attr(body):
+    """True for an attribute body that sets a module path: `path = ..` or any `cfg_attr` naming `path`."""
+    return bool(re.match(r"\s*path\b", body) or ("cfg_attr" in body and re.search(r"\bpath\b", body)))
+
+
+def attrs_before(scrubbed, at):
+    """[(offset of `#`, offset of the body, offset of the closing `]`)] of the outer attributes that end directly
+    before offset at, in source order; an inner `#![..]` ends the run. None when a `]` before at closes no
+    attribute (its bracket is not preceded by `#`), so the run cannot be split (r24)."""
+    out, pos = [], at
+    while True:
+        end = pos
+        while end > 0 and scrubbed[end - 1].isspace():
+            end -= 1
+        if end == 0 or scrubbed[end - 1] != "]":
+            return out[::-1]
+        depth, k = 0, end - 1
+        while k >= 0:
+            if scrubbed[k] == "]":
+                depth += 1
+            elif scrubbed[k] == "[":
+                depth -= 1
+                if depth == 0:
+                    break
+            k -= 1
+        if k < 0:
+            return None
+        j = k
+        while j > 0 and scrubbed[j - 1].isspace():
+            j -= 1
+        if j > 0 and scrubbed[j - 1] == "#":
+            out.append((j - 1, k + 1, end - 1))
+            pos = j - 1
+            continue
+        if j > 0 and scrubbed[j - 1] == "!":
+            h = j - 1
+            while h > 0 and scrubbed[h - 1].isspace():
+                h -= 1
+            if h > 0 and scrubbed[h - 1] == "#":
+                return out[::-1]  # an inner attribute: it belongs to the enclosing item
+        return None
+
+
+def classify_mods(text, scrubbed):
+    """(items, problems) for every `mod` token of a file (r24). Each `mod name;` and `mod name { .. }` is a ModItem
+    with the literal of its `#[path]` attribute, whatever order the attributes come in and whatever visibility the
+    item has; any other `mod`, an attribute run that cannot be split, a path attribute that is not one plain or raw
+    string literal and a path attribute on something that is not a module all give a reason of REASONS. Nothing is
+    skipped silently."""
+    items, problems, claimed = [], [], set()
+    for m in MOD_TOKEN.finditer(scrubbed):
+        head = MOD_HEAD.match(scrubbed, m.end())
+        if head is None or (head.group(1)[0] == "$" and head.group(2) == ";"):  # a macro-named file module is unknown
+            problems.append(REASONS["mod_unclassified"] % snippet(text, m.start()))
+            continue
+        name, inline, bad, rel = head.group(1), head.group(2) == "{", [], None
+        vis = MOD_VIS.search(scrubbed, max(0, m.start() - 512), m.start())
+        attrs = attrs_before(scrubbed, vis.start() if vis else m.start())
+        if attrs is None:
+            bad.append(REASONS["attr_unparsable"] % name)
+            attrs = []
+        pathish = [a for a in attrs if is_path_attr(scrubbed[a[1]:a[2]])]
+        claimed.update(a[0] for a in pathish)
+        if len(pathish) > 1:
+            bad.append(REASONS["path_not_literal"] % name)
+        elif pathish:
+            lit = PATH_ATTR.match(text[pathish[0][1]:pathish[0][2]])
+            if lit is None or (lit.group(1) is not None and "\\" in lit.group(1)):
+                bad.append(REASONS["path_not_literal"] % name)
+            else:
+                rel = lit.group(1) if lit.group(1) is not None else lit.group(3)
+        brace = head.end() - 1
+        items.append(ModItem(name, inline, m.start(), brace, match_brace(scrubbed, brace) if inline else -1, rel,
+                             tuple(bad)))
+        problems.extend(bad)
+    for a in ATTR_OPEN.finditer(scrubbed):  # a path attribute that no module item claimed does nothing, and is untrusted
+        depth, k = 0, a.end() - 1
+        while k < len(scrubbed):
+            depth += scrubbed[k] == "["
+            depth -= scrubbed[k] == "]"
+            if depth == 0:
+                break
+            k += 1
+        if a.start() not in claimed and is_path_attr(scrubbed[a.end():k]):
+            problems.append(REASONS["path_stray"] % snippet(text, a.start()))
+    return items, problems
+
+
+def module_names(scrubbed):
+    """The names of the modules a scrubbed text declares, file or inline (r24)."""
+    return {m.group(1) for t in MOD_TOKEN.finditer(scrubbed) for m in [MOD_HEAD.match(scrubbed, t.end())]
+            if m and m.group(1)[0] != "$"}
+
+
 class ModuleSet(set):
     """The macro_rules! names in textual scope of one test file (r23); `texts` holds the scrubbed text of every module
     or include! file its walk read, and MACRO_OPEN is a member when the walk could not read or parse some target."""
@@ -2051,11 +2173,11 @@ class ModuleSet(set):
 
 
 class ModuleWalk:
-    """The module tree below one file (r23): every `mod m;` (its attributes in any order, a `#[path]` file wherever it
-    lives) and every `include!("..")` is resolved and read once. Whatever the walk cannot resolve, read or fully parse
-    (a missing module file, a `#[path]` or `include!` argument that is not one plain or raw string literal, a path
-    attribute inside `cfg_attr`, an attribute run it cannot split) is recorded in `problems` with the file and the
-    reason, never skipped: the callers treat such a tree as OPEN and trust nothing the unread text might change."""
+    """The module tree below one file (r23, r24): every `mod m;` (its attributes in any order, a `#[path]` file
+    wherever it lives, inline modules with or without a path) and every `include!("..")` is resolved and read once.
+    Every `mod`, `use`, path attribute and `include!` token of a file is classified; whatever the walk cannot
+    resolve, read or fully parse is recorded in `problems` with the file and a reason of REASONS, never skipped: the
+    callers treat such a tree as OPEN, trust nothing the unread text might change, and fail the run."""
 
     def __init__(self, read):
         self.read = read  # path -> the file's text, or None when it cannot be read
@@ -2081,52 +2203,52 @@ class ModuleWalk:
         self._seen.add(path)
         self.files.append((path, text))
         scrubbed = scrub(text)
-        for m in MOD_ITEM.finditer(scrubbed):
-            name, cands, problem = self.decl(path, text, scrubbed, m, below)
-            if problem:
-                self.problems.append((path, problem))
-            elif name not in skip or len(cands) != 2:
-                if not any(self.visit(cand, cbelow) for cand, cbelow in cands):
-                    self.problems.append((path, "module file for `mod %s;` not found (tried %s)" % (
-                        name, ", ".join(c.as_posix() for c, _ in cands))))
-        for m in INCLUDE_CALL.finditer(scrubbed):
-            arg = INCLUDE_ARG.match(text, m.end())
+        items, problems = classify_mods(text, scrubbed)
+        self.problems.extend((path, p) for p in problems)
+        for it in items:
+            if it.inline or it.problems:
+                continue  # an inline module has nothing to read; a bad one is already in the problems
+            cands = self.candidates(it, *self.scope(path, items, it.start, below))
+            if it.name in skip and len(cands) == 2:
+                continue
+            if not any(self.visit(cand, cbelow) for cand, cbelow in cands):
+                self.problems.append((path, REASONS["module_missing"] % (
+                    it.name, ", ".join(c.as_posix() for c, _ in cands))))
+        for m in INCLUDE_TOKEN.finditer(scrubbed):
+            opener = INCLUDE_OPEN.match(scrubbed, m.end())
+            arg = INCLUDE_ARG.match(text, opener.end()) if opener else None
             if arg is None or (arg.group(1) is not None and "\\" in arg.group(1)):
-                self.problems.append((path, "include! argument is not one plain or raw string literal (%s)" % (
-                    text[m.start():m.end() + 40].split("\n")[0].strip())))
+                self.problems.append((path, REASONS["include_arg"] % snippet(text, m.start())))
                 continue
             target = path.parent / (arg.group(1) if arg.group(1) is not None else arg.group(3))
-            if not self.visit(target, self.inline_dir(scrubbed, m.start(), below)):
-                self.problems.append((path, "include! file %s not found" % target.as_posix()))
+            if not self.visit(target, self.scope(path, items, m.start(), below)[0]):
+                self.problems.append((path, REASONS["include_missing"] % target.as_posix()))
+        for m in USE_TOKEN_START.finditer(scrubbed):
+            if not scrubbed[m.end():].lstrip().startswith("$") and USE_ITEM.match(scrubbed, m.start()) is None:
+                self.problems.append((path, REASONS["use_item"] % snippet(text, m.start())))
 
     @staticmethod
-    def inline_dir(scrubbed, at, below):
-        """below plus the name of every inline `mod y { .. }` of scrubbed that encloses offset at."""
-        names = [i.group(1) for i in INLINE_MOD.finditer(scrubbed, 0, at) if match_brace(scrubbed, i.end() - 1) > at]
-        return below.joinpath(*names) if names else below
+    def scope(path, items, at, below):
+        """(children, pbase) at offset at of the file path: the directory the plain `mod x;` items there resolve
+        under, and the directory a `#[path]` attribute there is relative to. Outside an inline module they are
+        below and the directory of path; an inline `mod y { }` moves both to children/y, and an inline module with a
+        `#[path = "p"]` moves both to pbase/p (r24, checked against rustc 1.98)."""
+        children, pbase = below, path.parent
+        for e in sorted((e for e in items if e.inline and e.brace < at < e.close), key=lambda e: e.brace):
+            if e.rel is not None:
+                children = pbase = pbase / e.rel
+            else:
+                children = pbase = children / e.name
+        return children, pbase
 
     @staticmethod
-    def decl(path, text, scrubbed, m, below):
-        """(module name, [(candidate file, directory its own `mod` items resolve under)], problem or None) for the
-        `[attrs] mod name;` item matched by MOD_ITEM in the file path. The attribute run is read in any order; a
-        `#[path = ".."]` (plain or raw literal) names the file, relative to the directory of path (below, plus the
-        inline modules, inside an inline `mod`), and that file is a mod-rs file (its own modules sit beside it)."""
-        name, run, rel = m.group(2), m.group(1), None
-        if not run.strip() and scrubbed[:m.start()].rstrip().endswith("]"):
-            return name, [], "an attribute before `mod %s;` cannot be parsed" % name
-        for a in ATTR_ONE.finditer(run):
-            body = a.group(1)
-            if not (re.match(r"\s*path\b", body) or ("cfg_attr" in body and re.search(r"\bpath\b", body))):
-                continue
-            lit = PATH_ATTR.match(text[m.start(1) + a.start(1):m.start(1) + a.end(1)])
-            if lit is None or rel is not None or (lit.group(1) is not None and "\\" in lit.group(1)):
-                return name, [], "the path attribute of `mod %s;` is not one plain or raw string literal" % name
-            rel = lit.group(1) if lit.group(1) is not None else lit.group(3)
-        inside = ModuleWalk.inline_dir(scrubbed, m.start(), below)
-        if rel is not None:
-            target = (inside if inside != below else path.parent) / rel
-            return name, [(target, target.parent)], None
-        return name, [(inside / (name + ".rs"), inside / name), (inside / name / "mod.rs", inside / name)], None
+    def candidates(it, children, pbase):
+        """[(candidate file, directory its own `mod` items resolve under)] of the file module `it`: the `#[path]`
+        file (a mod-rs file, its own modules sit beside it) or `name.rs` and `name/mod.rs`."""
+        if it.rel is not None:
+            target = pbase / it.rel
+            return [(target, target.parent)]
+        return [(children / (it.name + ".rs"), children / it.name), (children / it.name / "mod.rs", children / it.name)]
 
 
 class CommonModel:
@@ -2207,7 +2329,11 @@ class CommonModel:
         if base is None or not base.is_dir():
             return {}
         for path in sorted(base.rglob("*.rs")):
-            for name, value in CONST_STR.findall(path.read_text(encoding="utf-8", errors="replace")):
+            try:
+                src = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue  # r24: the module walk of _src_items names this file as unreadable and fails the run
+            for name, value in CONST_STR.findall(src):
                 values.setdefault(name, set()).add(value)
         return {name: vals.pop() for name, vals in values.items() if len(vals) == 1}
 
@@ -2235,7 +2361,7 @@ class CommonModel:
             walk.visit(path, path.parent)
         for path in sorted(base.rglob("*.rs")):
             if not walk.visit(path, path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem):
-                walk.problems.append((path, "file cannot be read"))
+                walk.problems.append((path, REASONS["file_unreadable"]))
         self.src_open = bool(walk.problems)
         self._diagnose(walk.problems)
         generators = set()  # first pass: every macro_rules! of the crate that declares a trait
@@ -2314,16 +2440,16 @@ class CommonModel:
         """{module name: detaching_fns} for the `#[path = ".."] mod m;` and `mod m;` files a test file declares
         (#8052). A file that is missing is skipped; tests/common is the common census, not a module."""
         out, scrubbed, path = {}, scrub(raw), pathlib.Path(path)
-        for m in MOD_ITEM.finditer(scrubbed):
-            name, cands, problem = ModuleWalk.decl(path, raw, scrubbed, m, path.parent)
-            if name == "common" or problem:
+        items, _problems = classify_mods(raw, scrubbed)  # the problems are the module_macros walk's of the same file
+        for it in items:
+            if it.name == "common" or it.inline or it.problems:
                 continue
-            for cand, _below in cands:
+            for cand, _below in ModuleWalk.candidates(it, *ModuleWalk.scope(path, items, it.start, path.parent)):
                 if cand not in self._mods:
                     text = self._read(cand)
                     self._mods[cand] = None if text is None else detaching_fns(blank_use_items(scrub(text)))
                 if self._mods[cand] is not None:
-                    out[name] = self._mods[cand]
+                    out[it.name] = self._mods[cand]
                     break
         return out
 
@@ -2390,6 +2516,9 @@ class FileModel:
         self.module_texts = list(getattr(macros, "texts", ()))  # r23: scrubbed text of the module / include! files read
         self.module_macros = set(macros or ()) | self.common.macro_names
         self.module_open = MACRO_OPEN in self.module_macros  # r23: a module / include! target could not be read or parsed
+        # r24: the modules the file declares, itself or in its module / include! files; an import rooted at one is an
+        # import from the test crate (tests/common is a census of its own)
+        self.local_mods = (module_names(scrubbed).union(*[module_names(t) for t in self.module_texts])) - {"common"}
         self.imports, self.glob = common_imports(scrubbed)
         self.modules = modules or {}  # #8052: module name -> detaching_fns of its file
         self.mod_imported = {}  # name -> module it is `use`-imported from
@@ -3265,7 +3394,7 @@ class FileModel:
             return KNOWN_TRAIT_METHODS[path]
         leaf, common = path[-1], self.common
         unread = False  # r23: the tree this path points into has a module / include! target the gate could not read
-        if path[0] in FILE_ROOTS:  # an item of the test crate: a trait of the file supplies the fns it declares
+        if path[0] in FILE_ROOTS or path[0] in self.local_mods:  # an item of the test crate: a trait of the file supplies the fns it declares
             own, unread = self.local_index(), self.module_open
         elif common.crate_name is not None and path[0] == common.crate_name:
             own, unread = None, common.src_open
@@ -4333,11 +4462,16 @@ def main(argv=None):
     found = scan_tree(root, diagnostics)
     for line in diagnostics:
         print("check-test-env-mutation: untrusted %s" % line, file=sys.stderr)
+    untrusted = len(diagnostics)  # r24: a diagnostic of any REASONS class fails every mode, never just prints
     baseline_path = root / BASELINE_REL
     if args.list:
         sys.stdout.write("".join("%s\n" % key for key in sorted(found)))
-        return 0
+        return 1 if untrusted else 0
     if args.update_baseline:
+        if untrusted:
+            print("check-test-env-mutation: FAIL (%d untrusted target(s)); the baseline is not rewritten from a tree "
+                  "the gate could not fully read (#7347)" % untrusted, file=sys.stderr)
+            return 1
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
         baseline_path.write_text(render(found), encoding="utf-8")
         print("wrote %s (%d entries)" % (BASELINE_REL, len(found)))
@@ -4348,6 +4482,10 @@ def main(argv=None):
     if problems:
         print("check-test-env-mutation: FAIL (%d problem(s)); a racing test fn of an env-mutating "
               "tests/*.rs must hold the writers' env lock (#7347)" % len(problems), file=sys.stderr)
+        return 1
+    if untrusted:
+        print("check-test-env-mutation: FAIL (%d untrusted target(s)); the gate could not resolve, read or parse "
+              "every module, include! and use item it met, so no verdict is trusted (#7347)" % untrusted, file=sys.stderr)
         return 1
     files = len({key.split("::", 1)[0] for key in found})
     print("check-test-env-mutation: ok (%d baselined fn(s) in %d file(s))" % (len(found), files))

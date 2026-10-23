@@ -7,7 +7,10 @@ Each rule is proven twice: a clean fixture passes and a mutant that breaks exact
 fails. Fixtures are built in a scratch dir under .local-runs/ (never a tmp dir).
 """
 import ast
+import contextlib
 import importlib.util
+import io
+import itertools
 import re
 import shutil
 import sys
@@ -3715,6 +3718,291 @@ class ReviewR23(Positive):
             found = []
             gate.scan_tree(SCRATCH, found)
             self.assertEqual(found, [])
+
+
+# REVIEW-7349 code r23 (umbrella #8168, R23-1 .. R23-5), the tokenizer rule: the gate classifies every `mod`, `use`,
+# `#[path]` and `include!` token it meets or emits a fail-closed diagnostic; it never skips one silently, and any
+# diagnostic fails the run (rc != 0). R24_PROBES holds the sixteen probes of the reviewer (N1-N16), each with the
+# control that must stay quiet; the sweeps cross the shapes the probes came from.
+R24_CLEAN_BODY = R18_BLOCK_ON % "tokio::join!(body());"
+R24_PLAIN = "pub fn f() {}\n"
+R24_FAN_BODY = "pub trait fan { fn map(self, f: u8); }"
+
+
+def r24_clean(head, files):
+    """A row whose own verdict is empty (a qualified macro, no foreign provider): only a diagnostic can fail the run."""
+    return (R18_BODY + head, R24_CLEAN_BODY, False, files)
+
+
+def r24_shadow(name="join"):
+    return R19_SHADOW % name
+
+
+def r24_probes():
+    shadow, fan = r24_shadow(), R23_FAN
+    other = "pub struct other;\n"
+    return [
+        # N1 (R23-1): a raw-identifier module name
+        ("N1", r23_macro("#[macro_use]\nmod r#rt;\n", {"tests/rt.rs": shadow}, True)),
+        ("N1_plain", r23_macro("#[macro_use]\nmod r#rt;\n", {"tests/rt.rs": R24_PLAIN}, False)),
+        # N2: a raw-identifier module and trait in src/
+        ("N2", r23_src("pub mod r#fan;\n", {"src/fan.rs": fan}, "fan::fan", True)),
+        ("N2_struct", r23_src("pub mod r#fan;\n", {"src/fan.rs": R23_STRUCT}, "fan::fan", False)),
+        # N3 (R23-2): an unparsable attribute between the path and a splittable one
+        ("N3", r23_macro('#[path = "support/rt.rs"]\n#[rustfmt::skip([[x]])]\n#[cfg(unix)]\nmod rt;\n',
+                         {"tests/support/rt.rs": shadow, "tests/rt.rs": R24_PLAIN}, True)),
+        ("N3_plain", r23_macro('#[path = "support/rt.rs"]\n#[rustfmt::skip([[x]])]\n#[cfg(unix)]\nmod rt;\n',
+                               {"tests/support/rt.rs": R24_PLAIN, "tests/rt.rs": shadow}, False)),
+        # N4 (R23-3): #[path] on an inline module names the directory of the modules below it
+        ("N4", r23_macro('#[macro_use]\n#[path = "dir"]\nmod a { #[macro_use] pub mod b; }\n',
+                         {"tests/dir/b.rs": shadow, "tests/a/b.rs": R24_PLAIN}, True)),
+        ("N4_plain", r23_macro('#[macro_use]\n#[path = "dir"]\nmod a { #[macro_use] pub mod b; }\n',
+                               {"tests/dir/b.rs": R24_PLAIN, "tests/a/b.rs": shadow}, False)),
+        # N5 (R23-4): an import from a local `mod m;`
+        ("N5", ("mod m;\nuse m::fan;\n", R20_MAP, True, {"tests/m.rs": fan})),
+        ("N5_struct", ("mod m;\nuse m::fan;\n", R20_MAP, False, {"tests/m.rs": R23_STRUCT})),
+        # N6: an import from an inline local module
+        ("N6", ("mod inner { pub trait fan { fn map(self, f: u8); } }\nuse inner::fan;\n", R20_MAP, True, {})),
+        ("N6_struct", ("mod inner { pub struct fan; }\nuse inner::fan;\n", R20_MAP, False, {})),
+        # N7 (R23-5): the diagnostic fires and the verdict must not stay clean
+        ("N7", ('mod inner { include!(concat!(env!("OUT_DIR"), "/x.rs")); }\nuse inner::fan;\n', R20_MAP, True, {})),
+        # N8-N16: shapes the gate already closed; they stay closed
+        ("N8", r23_src('#[cfg(feature = "x")]\npub mod gen;\n', {}, "fan", True)),
+        ("N9", r23_src("pub mod a;\n", {"src/a.rs": 'include!("inc.rs");\n', "src/inc.rs": fan}, "a::fan", True)),
+        ("N10", r23_macro('#[path =\n    "support/rt.rs"]\n#[macro_use]\nmod rt;\n',
+                          {"tests/support/rt.rs": shadow, "tests/rt.rs": R24_PLAIN}, True)),
+        ("N11", r23_macro('#[path = "support/rt.rs"]\nmod rté;\n', {"tests/support/rt.rs": shadow}, True)),
+        ("N12", r23_macro('#[cfg(unix)]\nmod gone;\n', {}, True)),
+        ("N13", r23_macro("#[macro_use]\npub(in crate) mod rt;\n", {"tests/rt.rs": shadow}, True)),
+        ("N14", r23_macro('#[rustfmt::skip([[x]])]\n#[path = "support/rt.rs"]\nmod rt;\n',
+                          {"tests/support/rt.rs": shadow, "tests/rt.rs": R24_PLAIN}, True)),
+        ("N15", r23_macro("", {"tests/common/mod.rs": "pub mod gone;\n"}, True)),
+        ("N16", r23_macro("", {"tests/common/mod.rs": 'include!(concat!(env!("OUT_DIR"), "/x.rs"));\n'}, True)),
+        ("N15_clean", r23_macro("", {"tests/common/mod.rs": R24_PLAIN}, False)),
+    ]
+
+
+def r24_attr_rows():
+    """Attribute runs: the path attribute, a cfg and an attribute the splitter cannot read, in every order, on
+    `mod`, `pub mod`, `pub(crate) mod`, `pub(in crate) mod` and on raw-identifier names; shadow found, plain not."""
+    shadow, rows = r24_shadow(), []
+    path = '#[path = "support/rt.rs"]'
+    awkward = ["#[rustfmt::skip([[x]])]", '#[doc = "a]b"]', "#[cfg_attr(unix, allow(dead_code))]"]
+    for perm in itertools.permutations(["{P}", "#[cfg(unix)]", "{D}"]):
+        for d in awkward:
+            for vis in ("mod", "pub mod", "pub(crate) mod", "pub(in crate) mod"):
+                for ident in ("rt", "r#rt"):
+                    head = "\n".join(perm).replace("{P}", path).replace("{D}", d) + "\n%s %s;\n" % (vis, ident)
+                    rows.append(r23_macro(head, {"tests/support/rt.rs": shadow, "tests/rt.rs": R24_PLAIN}, True))
+                    rows.append(r23_macro(head, {"tests/support/rt.rs": R24_PLAIN, "tests/rt.rs": shadow}, False))
+    return rows
+
+
+def r24_inline_rows():
+    """`#[path]` on an inline module and a `mod x;` below it, nested and in a module file."""
+    shadow, rows = r24_shadow(), []
+    for p in ('#[path = "dir"]', '#[path = r"dir"]', '#[path = r#"dir"#]'):
+        for pre in ("", "#[macro_use]\n", "#[cfg(unix)]\n#[macro_use]\n"):
+            for post in ("", "\n#[macro_use]", "\n#[cfg(unix)]"):
+                head = "%s%s%s\nmod a { #[macro_use] pub mod b; }\n" % (pre, p, post)
+                rows.append(r23_macro(head, {"tests/dir/b.rs": shadow, "tests/a/b.rs": R24_PLAIN}, True))
+                rows.append(r23_macro(head, {"tests/dir/b.rs": R24_PLAIN, "tests/a/b.rs": shadow}, False))
+    rows += [
+        # an inline module without a path below one with a path; a path attribute inside an inline module
+        r23_macro('#[path = "dir"]\nmod a { mod c { pub mod b; } }\n', {"tests/dir/c/b.rs": shadow, "tests/a/c/b.rs": R24_PLAIN}, True),
+        r23_macro('mod o { #[path = "dir"] mod a { pub mod b; } }\n', {"tests/o/dir/b.rs": shadow, "tests/dir/b.rs": R24_PLAIN}, True),
+        r23_macro('mod o { #[path = "p.rs"] mod z; }\n', {"tests/o/p.rs": shadow, "tests/p.rs": R24_PLAIN}, True),
+        # a non-mod-rs module file: the path of an inline module is relative to the file's directory
+        r23_macro("mod x;\n", {"tests/x.rs": '#[path = "d"]\nmod a { pub mod b; }\n', "tests/d/b.rs": shadow,
+                               "tests/x/d/b.rs": R24_PLAIN, "tests/x/a/b.rs": R24_PLAIN}, True),
+        r23_macro("mod x;\n", {"tests/x.rs": 'mod i { #[path = "p.rs"] mod z; }\n', "tests/x/i/p.rs": shadow,
+                               "tests/i/p.rs": R24_PLAIN, "tests/p.rs": R24_PLAIN}, True),
+        # the same inside src/ for a trait
+        r23_src('#[path = "dir"]\npub mod a { pub mod b; }\n', {"src/dir/b.rs": R23_FAN, "src/a/b.rs": R23_STRUCT}, "a::b::fan", True),
+        r23_src('#[path = "dir"]\npub mod a { pub mod b; }\n', {"src/dir/b.rs": R23_STRUCT, "src/a/b.rs": R23_STRUCT}, "a::b::fan", False),
+    ]
+    return rows
+
+
+def r24_import_rows():
+    """`use` roots: a module the test file declares (file, inline, raw identifier, visibility) or a module of an
+    included or path file; a trait is found, a struct is not, an unreadable tree is open."""
+    rows = []
+    decls = [("mod m;", {"tests/m.rs": "{I}"}), ("pub mod m;", {"tests/m.rs": "{I}"}), ("mod r#m;", {"tests/m.rs": "{I}"}),
+             ('#[path = "x/y.rs"]\nmod m;', {"tests/x/y.rs": "{I}"}), ("mod m { {I} }", {}),
+             ("mod m;", {"tests/m/mod.rs": "{I}"}),
+             ('include!("inc.rs");', {"tests/inc.rs": "mod m { {I} }"})]
+    uses = ["use m::fan;", "use m::{fan};", "use self::m::fan;", "use crate::m::fan;", "use m::fan as _;"]
+    for decl, files in decls:
+        for use in uses:
+            for item, flagged in (R23_FAN, True), (R23_STRUCT, False):
+                put = {k: v.replace("{I}", item) for k, v in files.items()}
+                head = decl.replace("{I}", item) + "\n" + use + "\n"
+                rows.append((head, R20_MAP, flagged, put))
+    # an unreadable target below the local module opens the import
+    rows += [
+        ("mod m;\nuse m::fan;\n", R20_MAP, True, {"tests/m.rs": 'include!(concat!(env!("OUT_DIR"), "/x.rs"));\n'}),
+        ("mod m;\nuse m::fan;\n", R20_MAP, True, {"tests/m.rs": "pub mod gone;\n"}),
+        ("mod m { mod n; }\nuse m::fan;\n", R20_MAP, True, {}),
+        ("mod m;\nuse m::n::fan;\n", R20_MAP, True, {"tests/m.rs": "pub mod n;\n"}),
+    ]
+    return rows
+
+
+# The reasons the gate gives for an untrusted target, one row each: a tree that holds exactly that shape. The test
+# derives the inventory from gate.REASONS, so a reason without a row (or a row without a reason) fails.
+def r24_reason_rows():
+    return {
+        "module_missing": r24_clean("mod gone;\n", {}),
+        "mod_unclassified": r24_clean("macro_rules! mk { ($n:ident) => { mod $n; }; }\n", {}),
+        "path_not_literal": r24_clean('#[path = concat!("a", "b.rs")]\nmod rt;\n', {"tests/rt.rs": R24_PLAIN}),
+        "path_stray": r24_clean('#[path = "x.rs"]\nfn stray() {}\n', {}),
+        "attr_unparsable": r24_clean("m![]\nmod rt;\n", {"tests/rt.rs": R24_PLAIN}),
+        "include_arg": r24_clean('include!(concat!(env!("OUT_DIR"), "/x.rs"));\n', {}),
+        "include_missing": r24_clean('include!("gone.rs");\n', {}),
+        "file_unreadable": r24_clean("", {"Cargo.toml": R20_CARGO, "src/lib.rs": "", "src/weird.rs/keep.txt": "x"}),
+        "use_item": r24_clean("use ;\n", {}),
+    }
+
+
+class ReviewR24(Positive):
+    """REVIEW-7349 code r23 (umbrella #8168, R23-1 .. R23-5): the sixteen probes, the sweeps they came from, and the
+    rc contract: a tree with any untrusted target fails the run."""
+
+    def run_rows(self, rows):
+        self.assertTrue(rows)
+        for row in rows:
+            with self.subTest(head=row[0], body=row[1], files=dict(sorted(row[3].items()))):
+                r20_write(row)
+                self.assertEqual(self.scan(), FLAGGED if row[2] else set())
+
+    def run_main(self, args=()):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = gate.main(["--root", str(SCRATCH)] + list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_sixteen_reviewer_probes_and_their_controls(self):
+        rows = r24_probes()
+        self.assertEqual(len({name.split("_")[0] for name, _ in rows}), 16)
+        for name, row in rows:
+            with self.subTest(probe=name):
+                r20_write(row)
+                self.assertEqual(self.scan(), FLAGGED if row[2] else set())
+
+    def test_attribute_runs_in_every_order_on_every_module_form(self):
+        self.run_rows(r24_attr_rows())
+
+    def test_a_path_attribute_on_an_inline_module_names_the_directory_below_it(self):
+        self.run_rows(r24_inline_rows())
+
+    def test_an_import_from_a_local_module_is_decided_from_the_definition_or_fails_closed(self):
+        self.run_rows(r24_import_rows())
+
+    def test_every_reason_has_a_row_and_every_row_fails_the_run(self):
+        rows = r24_reason_rows()
+        self.assertEqual(set(rows), set(gate.REASONS))
+        for reason, row in rows.items():
+            for args in ((), ("--list",), ("--update-baseline",)):
+                with self.subTest(reason=reason, args=args):
+                    r20_write(row)
+                    self.assertEqual(self.scan(), set(), "the row must be clean but for its diagnostic")
+                    rc, _out, err = self.run_main(args)
+                    self.assertNotEqual(rc, 0)
+                    self.assertIn("untrusted", err)
+                    self.assertIn(gate.REASONS[reason].split("%")[0], err)
+
+    def test_a_resolved_tree_passes_and_says_nothing(self):
+        r20_write(r24_clean("mod rt;\n", {"tests/rt.rs": R24_PLAIN}))
+        rc, out, err = self.run_main()
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("ok", out)
+
+    def test_the_untrusted_import_of_a_local_module_fails_the_run(self):
+        r20_write(("mod inner { include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\")); }\nuse inner::fan;\n", R20_MAP, True, {}))
+        rc, _out, err = self.run_main()
+        self.assertEqual(rc, 1)
+        self.assertIn("untrusted tests/a.rs", err)
+
+    def test_the_two_fail_closed_branches_that_had_no_test(self):
+        # a tests/common target the gate cannot read opens the macro scope of every test file (N15, N16)
+        for files in ({"tests/common/mod.rs": "pub mod gone;\n"}, {"tests/common/mod.rs": 'include!("gone.rs");\n'}):
+            r20_write(r23_macro("", files, True))
+            self.assertEqual(self.scan(), FLAGGED, files)
+        # a `]` that closes no attribute before a module cannot be split: the decoy file is not trusted
+        r20_write(r23_macro("m![]\nmod rt;\n", {"tests/rt.rs": R24_PLAIN}, True))
+        self.assertEqual(self.scan(), FLAGGED)
+        r20_write(r23_macro("mod rt;\n", {"tests/rt.rs": R24_PLAIN}, False))
+        self.assertEqual(self.scan(), set())
+
+
+R24_MUTANTS = (  # (name, original text, mutated text): each must turn a probe or a reason row of ReviewR24 RED
+    ("raw_ident_off", 'elif c == "r" and RAW_IDENT.match(src, i)', 'elif False and RAW_IDENT.match(src, i)'),
+    ("attr_scan_first_only", "            pos = j - 1\n            continue\n", "            return out[::-1]\n"),
+    ("inline_path_ignored", "            if e.rel is not None:\n                children = pbase = pbase / e.rel",
+     "            if False:\n                children = pbase = pbase / e.rel"),
+    ("local_mods_off", "if path[0] in FILE_ROOTS or path[0] in self.local_mods:", "if path[0] in FILE_ROOTS:"),
+    ("mod_catch_all_off", 'problems.append(REASONS["mod_unclassified"] % snippet(text, m.start()))\n            continue',
+     "continue"),
+    ("unparsable_attribute_off", 'bad.append(REASONS["attr_unparsable"] % name)\n            attrs = []', "attrs = []"),
+    ("path_stray_off", 'problems.append(REASONS["path_stray"] % snippet(text, a.start()))', "pass"),
+    ("include_catch_all_off", 'self.problems.append((path, REASONS["include_arg"] % snippet(text, m.start())))\n                continue',
+     "continue"),
+    ("use_catch_all_off", 'self.problems.append((path, REASONS["use_item"] % snippet(text, m.start())))', "pass"),
+    ("tests_common_open_off", "self.macro_names.add(MACRO_OPEN)\n            self._diagnose(walk.problems)",
+     "self._diagnose(walk.problems)"),
+    ("rc_list_off", "        return 1 if untrusted else 0\n", "        return 0\n"),
+    ("rc_normal_off", "    if untrusted:\n        print(\"check-test-env-mutation: FAIL (%d untrusted target(s)); the gate could not",
+     "    if False:\n        print(\"check-test-env-mutation: FAIL (%d untrusted target(s)); the gate could not"),
+    ("rc_update_off", "        if untrusted:\n            print(\"check-test-env-mutation: FAIL (%d untrusted target(s)); the baseline",
+     "        if False:\n            print(\"check-test-env-mutation: FAIL (%d untrusted target(s)); the baseline"),
+)
+
+
+class ReviewR24Mutants(unittest.TestCase):
+    """REVIEW-7349 code r23: one named mutant per new decision of the tokenizer rule (raw identifiers, the attribute
+    scanner, the inline path scope, local module roots, the catch-alls, the rc contract and the two branches that
+    survived round 23); each is applied to the whole gate source and turns RED."""
+
+    @staticmethod
+    def red(mod, probes, reasons):
+        for name, row in probes:
+            r20_write(row)
+            if bool(mod.scan_tree(SCRATCH)) != row[2]:
+                return "probe " + name
+        for reason, row in reasons.items():
+            for args in ((), ("--list",), ("--update-baseline",)):
+                r20_write(row)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = mod.main(["--root", str(SCRATCH)] + list(args))
+                if rc == 0:
+                    return "reason %s %s" % (reason, args)
+        return None
+
+    def test_each_named_mutant_turns_a_row_red(self):
+        src = GATE.read_text()
+        probes, reasons = r24_probes(), r24_reason_rows()
+        for name, old, new in R24_MUTANTS:
+            with self.subTest(mutant=name):
+                self.assertEqual(src.count(old), 1, old)
+                mod = types.ModuleType("r24_mutant_" + name)
+                mod.__file__ = str(GATE)
+                sys.modules[mod.__name__] = mod
+                exec(compile(src.replace(old, new), str(GATE), "exec"), mod.__dict__)
+                try:
+                    self.assertIsNotNone(self.red(mod, probes, reasons), "the %s mutant stays GREEN" % name)
+                finally:
+                    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+    def test_the_unmutated_gate_is_green_on_the_same_rows(self):
+        mod = types.ModuleType("r24_mutant_none")
+        mod.__file__ = str(GATE)
+        sys.modules[mod.__name__] = mod
+        exec(compile(GATE.read_text(), str(GATE), "exec"), mod.__dict__)
+        try:
+            self.assertIsNone(self.red(mod, r24_probes(), r24_reason_rows()))
+        finally:
+            shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
 # G4 (REVIEW-7349-r20): the exact trust tables, as literals; they are the whole of the credit side of callee_origin.
