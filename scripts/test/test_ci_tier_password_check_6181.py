@@ -222,6 +222,10 @@ def url_leaks(text):
                 found.append(f"{name}: a line dumps the environment: {s[:60]}")
             if XTRACE.search(s):
                 found.append(f"{name}: a line traces the shell: {s[:60]}")
+        # r6: scan again with backslash continuations joined, so a word split across lines is one word
+        for joined in joined_lines([ln for ln in step or () if not ln.strip().startswith("#")]):
+            if dumps_environment(joined) or XTRACE.search(joined):
+                found.append(f"{name}: a continued line dumps the environment or traces the shell: {joined[:60]}")
     return found
 
 
@@ -486,6 +490,9 @@ def workflow_problems(text):
             problems.append("psql line carries a URL variable: " + line[:60])
         if re.search(r"\b(?:base_url|new_url)\s*=", line) or re.search(r"\bcat\s+\"?\$\{?url_file", line):
             problems.append("URL read into a shell variable: " + line[:60])
+    for joined in joined_lines(lines):
+        if dumps_environment(joined) or XTRACE.search(joined):
+            problems.append("a continued line dumps the environment or traces the shell: " + joined[:60])
     if not any(ln.startswith(GITHUB_ENV_LINE) and "--age-url" in ln for ln in lines):
         problems.append("the masked github-env hand-off (with --age-url) is missing")
     return problems
@@ -555,20 +562,80 @@ def post_export_steps(workflow, text):
     return result
 
 
+def pin_entry(body):
+    """The pin of one step body: the SHA-256 of its exact text and a short hash of every line (for the line number).
+
+    Hashes, not the text: the table stays small, and the data file never repeats workflow prose that the repository
+    phrase scans read.  Equality of the full SHA-256 is exact-text equality.
+    """
+    import hashlib
+    return {"sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "lines": [hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in body.split("\n")]}
+
+
 def load_pins():
-    """The pinned post-export step bodies, ``{workflow:job:step-name: exact body text}``."""
+    """The pinned post-export steps, ``{workflow:job:step-name: pin_entry(exact body text)}``."""
     import json
     return json.loads(PINS_FILE.read_text(encoding="utf-8"))
 
 
+def first_difference(pinned, found):
+    """(line number, found line) of the first line of ``found`` that differs from the pinned line hashes."""
+    new = found.split("\n")
+    old = pinned["lines"]
+    for number in range(max(len(old), len(new))):
+        if number >= len(new):
+            return number + 1, "<the step ends here; pinned lines are missing>"
+        if number >= len(old) or pin_entry(new[number])["lines"][0] != old[number]:
+            return number + 1, new[number].strip()[:120]
+    return 0, ""
+
+
 def pin_problems(workflow, text, pins=None):
-    """STUB (red commit): the real check follows in the fix commit."""
-    return []
+    """Problems of the post-export steps of one workflow against the exact-text pins (r6 F10).
+
+    Fails when no step exports the URL, when a post-export step is not pinned (new or renamed), when a pinned step is
+    gone, when a body differs from its pin, or when the order changed.  Messages carry the workflow, job, step name
+    and the first differing line; workflow bodies hold no secret.
+    """
+    pins = load_pins() if pins is None else pins
+    found = post_export_steps(workflow, text)
+    if not found:
+        return [f"{workflow}: no step exports the tier URL to GITHUB_ENV, so the post-export pin cannot be placed"]
+    pinned = {key: body for key, body in pins.items() if key.startswith(workflow + ":")}
+    problems = []
+    for key, body in found:
+        _wf, job, name = key.split(":", 2)
+        if key not in pinned:
+            problems.append(f"{workflow} job {job} step '{name}': post-export step is not in the pin (new or renamed)")
+        elif pinned[key]["sha256"] != pin_entry(body)["sha256"]:
+            number, new = first_difference(pinned[key], body)
+            problems.append(f"{workflow} job {job} step '{name}': body differs from the pin at line {number}: "
+                            f"found '{new}'")
+    present = {key for key, _ in found}
+    for key in pinned:
+        if key not in present:
+            _wf, job, name = key.split(":", 2)
+            problems.append(f"{workflow} job {job} step '{name}': pinned post-export step is missing")
+    if not problems and [key for key, _ in found] != list(pinned):
+        problems.append(f"{workflow}: the post-export steps changed order")
+    return problems
 
 
 def joined_lines(lines):
-    """STUB (red commit)."""
-    return [ln.strip() for ln in lines]
+    """Stripped lines with each backslash continuation joined, as the shell joins it (``prin\\`` + ``tenv``)."""
+    joined = []
+    pending = None
+    for raw in lines:
+        piece = raw.strip() if pending is None else pending + raw.lstrip()
+        pending = None
+        if piece.endswith("\\"):
+            pending = piece[:-1]
+        else:
+            joined.append(piece)
+    if pending is not None:
+        joined.append(pending)
+    return joined
 
 
 PROC = "/proc/"
@@ -841,7 +908,7 @@ class TestPostExportStepsArePinned8187(unittest.TestCase):
         self.assertEqual(list(self.pins), list(expected))
         for key, body in self.pins.items():
             with self.subTest(step=key):
-                self.assertEqual(body, expected[key])
+                self.assertEqual(body, pin_entry(expected[key]))
                 self.assertTrue(key.split(":", 1)[0] in PIN_WORKFLOWS)
 
     def test_every_dump_form_in_a_post_export_step_fails_the_pin(self):
@@ -940,7 +1007,8 @@ if __name__ == "__main__":
         import json
         table = {}
         for workflow in PIN_WORKFLOWS:
-            table.update(dict(post_export_steps(workflow, (WORKFLOWS / workflow).read_text(encoding="utf-8"))))
+            for key, body in post_export_steps(workflow, (WORKFLOWS / workflow).read_text(encoding="utf-8")):
+                table[key] = pin_entry(body)
         PINS_FILE.write_text(json.dumps(table, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         sys.exit(0)
     sys.exit(unittest.main())
