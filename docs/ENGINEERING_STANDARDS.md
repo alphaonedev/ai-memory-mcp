@@ -640,6 +640,14 @@ its check.
   discovered defects, never from regressions of a locked class. A regression of
   a locked class is a HIGH, reopens the umbrella and blocks the carrier until
   the guard is strengthened. Check: the umbrella state after each landing.
+- **`Base:` line convention.** The `Base: <full SHA>` line on every lane
+  commit names the chain tip the conductor passed to the lane at dispatch time
+  (the parent's HEAD at spawn, per the worktree-discipline rule), not the
+  commit's own git parent. On a multi-round PR every round carries the chain
+  tip current at its dispatch. A `Base:` SHA that is not an ancestor of the
+  head is therefore expected and is not a finding; reviewers check that the
+  lane's base is not stale, not that it matches the parent commit. The line is
+  never rewritten after push (no force-push).
 
 **Done definition for a release.** Every milestone issue is closed with a URL,
 every required check is green on the release tip, and the dashboard gates are
