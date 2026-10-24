@@ -102,10 +102,8 @@ def write_in_use_marker(target, runner_name, now=None):
 
 def clear_in_use_marker(target):
     """Remove the in-use marker of ``target``; a missing marker is fine."""
-    try:
+    with contextlib.suppress(FileNotFoundError):
         (Path(target) / IN_USE_MARKER_NAME).unlink()
-    except FileNotFoundError:
-        pass
 
 
 def marker_is_fresh(target, now, max_age_secs=IN_USE_MARKER_MAX_AGE_SECS):
