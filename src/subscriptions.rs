@@ -3516,6 +3516,42 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
+    /// #8119 — wall-clock deadline for a detached dispatcher thread to reach
+    /// its observable effect (ack row, receiver POST, DLQ row). The bound is
+    /// the dispatcher never acting, not a tight timing guess: a load-starved
+    /// runner can take many seconds for the thread, TLS round trip and
+    /// sqlite write.
+    const K6_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// #8119 — interval between polls of the dispatcher's observable effect.
+    const DISPATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// #8133, #8134 — observe-then-check-deadline poll shared by every
+    /// dispatcher test. Order per round: observe, return on success, break
+    /// once `deadline` has elapsed, then sleep. The final observation is
+    /// therefore never skipped by the deadline check. `Err` carries the
+    /// elapsed time; the caller's `observe` closure owns the last observed
+    /// state and reports it in the failure message.
+    ///
+    /// Blocks the calling thread: call it from `spawn_blocking` or wrap it
+    /// in `tokio::task::block_in_place` on a multi-thread runtime.
+    fn poll_until<T>(
+        deadline: std::time::Duration,
+        poll: std::time::Duration,
+        mut observe: impl FnMut() -> Option<T>,
+    ) -> Result<T, std::time::Duration> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(found) = observe() {
+                return Ok(found);
+            }
+            if started.elapsed() >= deadline {
+                return Err(started.elapsed());
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
     /// Stand up a fresh on-disk SQLite at a tempfile path with the
     /// production schema applied. Returns the path and keeps the file
     /// alive via the returned `NamedTempFile` (drop deletes it).
@@ -4540,23 +4576,23 @@ mod tests {
         // Wait for the dispatch thread to fire & the receiver to record.
         // We poll the receiver instead of the DB so the assertion stays
         // specific to "signature header present".
-        for _ in 0..50 {
-            let received = receiver.received();
-            if !received.is_empty() {
-                let req = &received[0];
-                assert!(
-                    req.headers.get("x-ai-memory-signature").is_some(),
-                    "signature header must be present when secret set"
-                );
-                assert!(
-                    req.headers.get("x-ai-memory-timestamp").is_some(),
-                    "timestamp header must be present"
-                );
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        panic!("dispatch thread never reached the TLS receiver");
+        let received = tokio::task::block_in_place(|| {
+            poll_until(K6_ACK_DEADLINE, DISPATCH_POLL_INTERVAL, || {
+                Some(receiver.received()).filter(|r| !r.is_empty())
+            })
+        })
+        .unwrap_or_else(|elapsed| {
+            panic!("dispatch thread never reached the TLS receiver after {elapsed:?}")
+        });
+        let req = &received[0];
+        assert!(
+            req.headers.get("x-ai-memory-signature").is_some(),
+            "signature header must be present when secret set"
+        );
+        assert!(
+            req.headers.get("x-ai-memory-timestamp").is_some(),
+            "timestamp header must be present"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -4699,16 +4735,20 @@ mod tests {
         }
 
         // Poll the receiver for the dispatch — std::thread::spawn is
-        // detached so we cannot join. ~5s budget mirrors the existing
-        // dispatch_event_e2e_* tests.
-        let mut received = Vec::new();
-        for _ in 0..50 {
-            received = receiver.received();
-            if !received.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        // detached so we cannot join. Polls to K6_ACK_DEADLINE (#8128).
+        let mut last_count = 0_usize;
+        let polled = tokio::task::block_in_place(|| {
+            poll_until(K6_ACK_DEADLINE, DISPATCH_POLL_INTERVAL, || {
+                let seen = receiver.received();
+                last_count = seen.len();
+                Some(seen).filter(|r| !r.is_empty())
+            })
+        });
+        let received = polled.unwrap_or_else(|elapsed| {
+            panic!(
+                "K4: no approval_requested POST after {elapsed:?}; last received count = {last_count}"
+            )
+        });
         assert_eq!(
             received.len(),
             1,
@@ -4893,7 +4933,8 @@ mod tests {
         let path_for_poll = db_path.clone();
         let sub_for_poll = sub_id.clone();
         let row = tokio::task::spawn_blocking(move || {
-            for _ in 0..50 {
+            let mut last_status = String::from("<no row>");
+            poll_until(K6_ACK_DEADLINE, DISPATCH_POLL_INTERVAL, || {
                 let conn = Connection::open(&path_for_poll).unwrap();
                 let r: Option<(String, String, String)> = conn
                     .query_row(
@@ -4903,18 +4944,21 @@ mod tests {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .ok();
-                if let Some(r) = r
-                    && r.2 == "ack"
-                {
+                let r = r?;
+                if r.2 == "ack" {
                     return Some(r);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            None
+                last_status = r.2;
+                None
+            })
+            .map_err(|elapsed| {
+                format!("no ack after {elapsed:?}; last delivery_status = {last_status}")
+            })
         })
         .await
         .unwrap();
-        let (corr, body, status) = row.expect("audit row must reach ack status");
+        let (corr, body, status) =
+            row.unwrap_or_else(|e| panic!("audit row must reach ack status: {e}"));
         assert_eq!(status, "ack");
         // UUIDv7 — parses + version 7.
         let parsed = uuid::Uuid::parse_str(&corr).expect("UUIDv7 string");
@@ -4960,23 +5004,34 @@ mod tests {
         }
 
         // Backoff ladder is 200ms + 1s + 5s ≈ 6.2s of sleeps + per-
-        // attempt network time. Poll for up to 12s for the DLQ row.
+        // attempt network time. Poll to K6_ACK_DEADLINE (#8130) for the DLQ row.
         let path_for_poll = db_path.clone();
         let sub_for_poll = sub_id.clone();
         let dlq_row = tokio::task::spawn_blocking(move || {
-            for _ in 0..120 {
+            let mut last_status = String::from("<no row>");
+            poll_until(K6_ACK_DEADLINE, DISPATCH_POLL_INTERVAL, || {
                 let conn = Connection::open(&path_for_poll).unwrap();
                 let entries = list_dlq(&conn, Some(&sub_for_poll)).unwrap();
                 if !entries.is_empty() {
                     return Some(entries);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            None
+                if let Ok(status) = conn.query_row(
+                    "SELECT delivery_status FROM subscription_events \
+                     WHERE subscription_id = ?1",
+                    params![sub_for_poll],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    last_status = status;
+                }
+                None
+            })
+            .map_err(|elapsed| {
+                format!("no DLQ row after {elapsed:?}; last delivery_status = {last_status}")
+            })
         })
         .await
         .unwrap()
-        .expect("DLQ row must appear after retry ladder exhaustion");
+        .unwrap_or_else(|e| panic!("DLQ row must appear after retry ladder exhaustion: {e}"));
 
         assert_eq!(dlq_row.len(), 1, "exactly one DLQ row per failed delivery");
         let row = &dlq_row[0];
