@@ -50,9 +50,14 @@ FED_LEGS = ('leg: linux-fed,enterprise-fed', 'leg: macos-fed,enterprise-fed')
 KILL_BRANCH_RE = re.compile(r'elif \[ "\$\{CI_PG_ISOLATE_OFF:-\}" = "1" \]; then\n\s+'
                             r'echo "%s=0" >> "\$GITHUB_ENV"' % FLAG)
 
-_ASSIGN_RE = re.compile(r'\b%s=(?!0\b)' % FLAG)
-_YAML_KEY_RE = re.compile(r'^\s*%s\s*:\s*(.*?)\s*$' % FLAG)
-_ZERO_VALUES = ('0', '"0"', "'0'")
+RUN_GUARD = ('if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ] && [ "${CI_PG_ISOLATE_OFF:-}" != "1" ] '
+             '&& [ "${TIER:-}" = "enterprise-fed" ]; then')
+
+# The flag name followed by ``:`` (YAML, block or flow) or ``=`` (shell), searched on a code line
+# with quotes removed so a quoted key or a quote-split name cannot hide it. ``:-`` ``:=`` ``:+``
+# ``:?`` are shell parameter expansions (reads), not assignments.
+_FLAG_ASSIGN_RE = re.compile(r'%s(?:\s*:(?![-=+?])|=(?!=))(.*)$' % FLAG)
+_ZERO_RE = re.compile(r'\s*0(?![A-Za-z0-9_.])')
 _JOB_RE = re.compile(r'^  [A-Za-z0-9_-]+:\s*$', re.M)
 _STEP_RE = re.compile(r'^\s*- name:', re.M)
 
@@ -66,6 +71,27 @@ def _code_lines(text: str) -> List[str]:
 def _steps(text: str) -> List[str]:
     starts = [m.start() for m in _STEP_RE.finditer(text)] + [len(text)]
     return [text[a:b] for a, b in zip(starts, starts[1:])]
+
+
+def _unquote(line: str) -> str:
+    return line.replace('"', '').replace("'", '').replace('\\', '')
+
+
+FED_EXPR_PLAIN = _unquote(FED_EXPR)
+
+
+def flag_assignments(line: str) -> List[str]:
+    """The value text of every flag assignment on a code line (quotes ignored)."""
+    plain = _unquote(line)
+    return [m.group(1) for m in _FLAG_ASSIGN_RE.finditer(plain)]
+
+
+def is_fed_value(rest: str) -> bool:
+    """True when the assigned value is exactly the enterprise-fed tier expression."""
+    if not rest.strip().startswith(FED_EXPR_PLAIN):
+        return False
+    after = rest.strip()[len(FED_EXPR_PLAIN):].strip()
+    return not after or after[0] in ',}#'
 
 
 def _check_job_head(text: str) -> str:
@@ -82,21 +108,20 @@ def _check_job_head(text: str) -> str:
 def default_on_failures(ci_text: str, code: List[str]) -> List[str]:
     """Reasons the G1 default-on posture does not hold; empty when it does."""
     problems: List[str] = []
-    bad = [ln.strip() for ln in code if _ASSIGN_RE.search(ln)]
-    if bad:
-        problems.append('shell assignment other than 0: %s' % bad[:3])
     for ln in code:
-        found = _YAML_KEY_RE.match(ln)
-        if found and found.group(1) not in _ZERO_VALUES and found.group(1) != FED_EXPR:
-            problems.append('env key value is neither 0 nor the enterprise-fed expression: %s' % ln.strip())
+        for rest in flag_assignments(ln):
+            if not (_ZERO_RE.match(rest) or is_fed_value(rest)):
+                problems.append('flag assignment is neither 0 nor the enterprise-fed expression: %s' % ln.strip()[:120])
     head = _check_job_head(ci_text)
-    keyed = [ln for ln in code if _YAML_KEY_RE.match(ln) and FED_EXPR in ln]
-    in_head = [ln for ln in head.splitlines() if _YAML_KEY_RE.match(ln) and FED_EXPR in ln]
+    keyed = [ln for ln in code if any(is_fed_value(r) for r in flag_assignments(ln))]
+    in_head = [ln for ln in _code_lines(head) if any(is_fed_value(r) for r in flag_assignments(ln))]
     if len(keyed) != 1 or len(in_head) != 1:
         problems.append('the enterprise-fed expression must be set exactly once, in the check job env (found %d)'
                         % len(keyed))
     if not all(leg in head for leg in FED_LEGS):
         problems.append('the check matrix lost an enterprise-fed fed leg')
+    if RUN_GUARD not in ci_text:
+        problems.append('the run step lost its own guard (flag 1, CI_PG_ISOLATE_OFF not 1, tier enterprise-fed)')
     if not KILL_BRANCH_RE.search(ci_text):
         problems.append('the CI_PG_ISOLATE_OFF kill-switch branch no longer forces the flag to 0')
     return problems

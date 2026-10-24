@@ -1917,7 +1917,7 @@ jobs:
 
       # #6383 / #6386 review r1 M3 — one log file per isolated binary, written
       # by scripts/test/pg_isolated_binary.py under the shard directory. Only
-      # present when the opt-in lane ran; uploaded on success AND failure.
+      # present when the isolated lane ran (default for enterprise-fed); uploaded on success AND failure.
       - name: Upload isolated-lane per-binary logs (#6383)
         if: needs.classify.outputs.docs_only != 'true' && always() && matrix.tier == 'enterprise-fed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
