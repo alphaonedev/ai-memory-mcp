@@ -461,6 +461,36 @@ def tier_workflows(directory=WORKFLOWS):
     return sorted(p.name for p in paths if TIER_MARKERS.search(p.read_text(encoding="utf-8")))
 
 
+PROC = "/proc/"
+DUMP_MUTANTS = {
+    "proc self read": "cat " + PROC + "self/environ",
+    "proc self piped": "cat " + PROC + "self/environ | base64",
+    "base64 of proc": "base64 " + PROC + "self/environ",
+    "xxd of proc": "xxd " + PROC + "self/environ",
+    "proc pid read": "tr '\\0' '\\n' < " + PROC + "1234/environ",
+    "env -0 piped": "env -0 | base64",
+    "printenv -0": "printenv -0",
+    "absolute env": "/usr/bin/env",
+    "absolute printenv": "/usr/bin/printenv",
+    "env with flags": "env -i",
+    "printenv with a name": "printenv HOME",
+    "if env": "if env | base64; then",
+    "while printenv": "while printenv; do",
+    "test of substitution": '[ -n "$(env)" ]',
+    "substitution": 'x=$(env)',
+    "backtick": "x=`env`",
+    "after then": "then printenv",
+    "after bang": "! env",
+    "after exec": "exec env",
+    "after time": "time printenv",
+    "python dump": "python3 -c 'import os; print(os.environ)'",
+    "python dict": 'python3 -c "print(dict(os.environ))"',
+    "perl dump": "perl -e 'print %ENV'",
+    "node dump": "node -e 'console.log(process.env)'",
+    "ruby dump": "ruby -e 'p ENV'",
+}
+
+
 class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
     def test_no_workflow_that_names_the_tier_secret_escapes_the_pins(self):
         covered = {"ci.yml", *SHARED_TIER, *LOCAL_ONLY}
@@ -577,6 +607,29 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
                         edited = text.replace("      - name:", "      - run: " + line + "\n      - name:", 1)
                     self.assertNotEqual(edited, text, "the mutation did not apply")
                     self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
+
+    def test_environment_dump_forms_are_all_rejected_8187(self):
+        # r5 F9: process-environment reads, absolute paths, dumps in conditions, one-line steps, interpreters
+        ci_text = CI_YML.read_text(encoding="utf-8")
+        ci_anchor = 'echo "::notice::[enterprise-fed] created'
+        anchor = '          if [ ! -f "$url_file" ]; then'
+        for label, line in DUMP_MUTANTS.items():
+            with self.subTest(workflow="ci.yml", mutant=label):
+                edited = sub_once(ci_text, ci_anchor, line + "\n          " + ci_anchor)
+                self.assertTrue(url_leaks(edited), f"mutant not caught: {label}")
+            for name in SHARED_TIER:
+                text = (WORKFLOWS / name).read_text(encoding="utf-8")
+                with self.subTest(workflow=name, mutant=label):
+                    edited = text.replace(anchor, "          " + line + "\n" + anchor, 1)
+                    self.assertNotEqual(edited, text, "the mutation did not apply")
+                    self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
+                with self.subTest(workflow=name, mutant=label, form="one-line step"):
+                    edited = text.replace("      - name:", "      - run: " + line + "\n      - name:", 1)
+                    self.assertNotEqual(edited, text, "the mutation did not apply")
+                    self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
+        for name in SHARED_TIER:
+            self.assertEqual(workflow_problems((WORKFLOWS / name).read_text(encoding="utf-8")), [])
+        self.assertEqual(url_leaks(ci_text), [])
 
     def test_a_yaml_workflow_naming_the_tier_secret_is_checked_8187(self):
         scratch = ROOT / ".local-runs" / "r3"
