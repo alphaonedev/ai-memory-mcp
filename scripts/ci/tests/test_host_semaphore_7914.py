@@ -182,6 +182,15 @@ class Semaphore(unittest.TestCase):
         p.communicate(timeout=30)
         self.assertEqual(p.returncode, 2)
 
+    def test_name_with_newline_rejected_7914(self):
+        """A trailing or embedded newline is not a valid name and creates nothing (fullmatch, not match)."""
+        for bad in ('x\n', 'x\ny'):
+            before = sorted(q.name for q in self.root.iterdir())
+            p = start(self.root, ['--name', bad, '--slots', '1'], ['true'])
+            p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 2, repr(bad))
+            self.assertEqual(sorted(q.name for q in self.root.iterdir()), before, repr(bad))
+
 
 if __name__ == '__main__':
     unittest.main()
