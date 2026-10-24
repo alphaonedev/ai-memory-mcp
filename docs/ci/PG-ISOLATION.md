@@ -28,15 +28,23 @@ database, so the class (a) binaries (Postgres, `#[serial]`, `federat*`) ran one
 after another. With the lane on (flag `1`, kill switch not `1`, tier
 `enterprise-fed`):
 
-1. **Configure** runs `pg_isolated_binary.py setup --emit-env`. It checks the
-   live connection budget: `max_connections` minus the reserved slots minus the
-   sessions open right now (`pg_stat_activity`) must cover
-   `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. It builds
+1. **Configure** runs `pg_isolated_binary.py setup --jobs 8 --emit-env`. It reads
+   the live connection budget: `max_connections` minus the reserved slots minus
+   the sessions open right now (`pg_stat_activity`). Each binary needs 19
+   slots (18 pool + 1 hold) and 20 stay as headroom, so setup CLAMPS the job
+   count to the largest N with `N * 19 + 20 <= free slots` (87 free -> 3, a
+   fresh 100-connection tier -> 4) and prints one
+   `::notice::[#6383] per-binary isolation clamped jobs 8 -> N (free slots F,
+   per-binary need P)` line. It exits 2 only when not even one binary fits (39
+   free slots), or with `--no-clamp`, which keeps the old refusal below
+   `jobs * 19 + 20` (172 for 8). It builds
    `<CI_FED_DB>_tpl` with the `age` and `vector` extensions and marks it
    `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so `CREATE DATABASE ... TEMPLATE`
    only hits SQLSTATE 55006 under a stray session, which the mint retries. It
-   exports `AI_MEMORY_TEST_PG_TEMPLATE` and `AI_MEMORY_TEST_PG_RUN_ID` to
-   `$GITHUB_ENV`.
+   exports `AI_MEMORY_TEST_PG_TEMPLATE`, `AI_MEMORY_TEST_PG_RUN_ID` and
+   `AI_MEMORY_TEST_PG_JOBS` (the effective job count) to `$GITHUB_ENV`. A
+   malformed `AI_MEMORY_TEST_PG_JOBS` (anything but an ASCII positive integer)
+   makes `run` exit 2.
 2. **Run.** The test step fails with `::error::` when the lane is on but the
    template or run id is missing; it never skips. `run_isolated_lane` prebuilds
    only the targets in `iso_targets.txt`, then calls
@@ -45,8 +53,8 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    holds a keepalive session on it, points `AI_MEMORY_TEST_POSTGRES_URL` (and
    `AI_MEMORY_TEST_AGE_URL` when set) at it, runs
    `cargo test --no-fail-fast --test <bin> -- --test-threads=1`, then releases
-   the hold and drops the clone. The width is 8, reduced to what the live
-   budget allows. Each binary writes its own log under
+   the hold and drops the clone. The width is `$AI_MEMORY_TEST_PG_JOBS` from
+   setup (or `--jobs`), reduced again to what the live budget allows. Each binary writes its own log under
    `$RUNNER_TEMP/ci-shard/iso-logs/<bin>.log`. A failing binary's last 200
    lines are echoed in a `::group::`, and the step
    `Upload isolated-lane per-binary logs (#6383)` uploads the directory with

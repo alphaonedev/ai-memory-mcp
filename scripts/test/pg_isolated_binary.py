@@ -791,9 +791,10 @@ def connection_budget(url: str) -> Tuple[int, int, int, int]:
            "(SELECT count(*) FROM pg_stat_activity)")
     raw = psql(url, sql, tuples=True).strip()
     fields = raw.split('|')
-    if len(fields) != 4 or not all(f.strip().isdigit() for f in fields):
+    counts = [ascii_count(f) for f in fields]
+    if len(fields) != 4 or any(c is None for c in counts):
         raise WrapperError('could not read the connection budget (got %r)' % raw)
-    most, su_reserved, reserved, now = (int(f) for f in fields)
+    most, su_reserved, reserved, now = (int(c) for c in counts if c is not None)
     reserved_total = su_reserved + reserved
     return most, reserved_total, now, most - reserved_total - now
 
@@ -837,7 +838,12 @@ def drop(admin_url: str, name: str, run_id: Optional[str], attempts: int = DROP_
 def session_count(admin_url: str, name: str) -> int:
     raw = psql(admin_url, "SELECT count(*) FROM pg_stat_activity WHERE datname = '%s'"
                % _checked_ident(name), tuples=True).strip()
-    return int(raw) if raw.isdigit() else 0
+    if raw == '':
+        return 0
+    count = ascii_count(raw)
+    if count is None:
+        raise WrapperError('could not read the session count (got %r)' % raw)
+    return count
 
 
 def open_hold(clone_url: str) -> 'subprocess.Popen[str]':
@@ -894,9 +900,17 @@ def effective_run_jobs(cli_jobs: Optional[int]) -> int:
     if cli_jobs is not None:
         return cli_jobs
     emitted = os.environ.get(JOBS_VAR, '')
-    if _DIGITS_RE.fullmatch(emitted):
-        return int(emitted)
-    return MAX_JOBS
+    if emitted == '':
+        return MAX_JOBS
+    if not _DIGITS_RE.fullmatch(emitted) or int(emitted) < 1:
+        raise WrapperError('$%s must be an ASCII positive integer, got %r' % (JOBS_VAR, emitted))
+    return int(emitted)
+
+
+def ascii_count(text: str) -> Optional[int]:
+    """Value of an ASCII-digits-only reply (surrounding blanks ignored), else None."""
+    cleaned = text.strip()
+    return int(cleaned) if _DIGITS_RE.fullmatch(cleaned) else None
 
 
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
@@ -1009,9 +1023,10 @@ def sweep(url: str, older_than: int) -> List[str]:
     if older_than < MIN_SWEEP_AGE_SECS:
         raise WrapperError('--older-than must be at least %d seconds' % MIN_SWEEP_AGE_SECS)
     now_raw = psql(url, 'SELECT extract(epoch FROM now())::bigint', tuples=True).strip()
-    if not now_raw.isdigit():
+    clock = ascii_count(now_raw)
+    if clock is None:
         raise WrapperError('could not read the server clock (got %r)' % now_raw)
-    now = int(now_raw)
+    now = clock
     listing = ("SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, '%s_') "
                "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
                % ISOLATED_PREFIX)
@@ -1221,7 +1236,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help='fail closed when --jobs does not fit the live budget (default: clamp with a notice)')
     setup_p.add_argument('--run-id', help='run id for the clone names (default: generated)')
     setup_p.add_argument('--emit-env', action='store_true',
-                         help='print %s= and %s= lines for $GITHUB_ENV' % (TEMPLATE_VAR, RUN_ID_VAR))
+                         help='print %s=, %s= and %s= (effective jobs) lines for $GITHUB_ENV'
+                         % (TEMPLATE_VAR, RUN_ID_VAR, JOBS_VAR))
 
     down = sub.add_parser('teardown', help="drop this run's clones and the template")
     down.add_argument('--url', help=url_help)
