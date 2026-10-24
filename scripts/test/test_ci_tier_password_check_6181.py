@@ -310,17 +310,45 @@ def code_lines(text):
     return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
 
 
+# a line that names the URL file, its path, or the tier secret (#8187 r3): only the reviewed forms below may do so
+URL_FILE_MENTION = re.compile(r"url_file|ai-memory-ci-fed-url|AI_MEMORY_CI_FED_URL|AI_MEMORY_TEST_(?:POSTGRES|AGE)_URL")
+URL_FILE_ASSIGN = 'url_file="$HOME/.ai-memory-ci-fed-url"'
+URL_FILE_TEST = re.compile(r'^if \[ !? ?-f "\$url_file" \]; then$')
+# `echo "::error::... $url_file ..."` prints the PATH of the file; the only expansions allowed are plain names
+MESSAGE_ECHO = re.compile(r'^echo "::(?:error|warning|notice)::[^"`$\\]*(?:\$\{?(?:url_file|RUNNER_NAME|CI_FED_DB)\}?[^"`$\\]*)*"$')
+# the loader: `[if ! |if |PSQL=(]python3 -I <helper> run|github-env --url-file "$url_file" ...`
+LOADER_CALL = re.compile(
+    r'^(?:if ! |if |PSQL=\()?python3 -I ' + re.escape(HELPER) + r' (?:'
+    r'run --url-file "\$url_file"(?: --database "\$CI_FED_DB")? -- psql\b(?P<run_tail>.*)'
+    r'|github-env --url-file "\$url_file" --database "\$CI_FED_DB"(?: --age-url)?(?P<env_tail>)$)')
+# nothing after the loader call may read, copy, pipe or substitute anything
+TAIL_FORBIDDEN = re.compile(r'\$\(|`|<|\||url_file|ai-memory-ci-fed-url|\btee\b|\bcat\b')
+
+
+def allowed_url_file_line(line):
+    """True when a line that names the URL file or tier secret is one of the reviewed, non-echoing forms."""
+    if line == URL_FILE_ASSIGN or URL_FILE_TEST.match(line) or MESSAGE_ECHO.match(line):
+        return True
+    call = LOADER_CALL.match(line)
+    return bool(call) and not TAIL_FORBIDDEN.search(call.group("run_tail") or "")
+
+
 def workflow_problems(text):
-    """Problems of a workflow that reads the tier URL file other than ci.yml: argv, shell variables, GITHUB_ENV."""
+    """Problems of a workflow that reads the tier URL file other than ci.yml: argv, shell variables, GITHUB_ENV.
+
+    An allowlist (#8187 r3): wherever a line names the URL file, its path or the tier secret it must be an assignment
+    of the path, an existence test, a message that prints the path, or a call of the loader; anything else fails.
+    """
     problems = []
     lines = code_lines(text)
     for line in lines:
         if re.search(r"AI_MEMORY_TEST_(?:POSTGRES|AGE)_URL=", line):
             problems.append("URL written to GITHUB_ENV by hand: " + line[:60])
-        if line.startswith("echo "):
-            continue
+        if URL_FILE_MENTION.search(line) and not allowed_url_file_line(line):
+            problems.append("tier credential line is not an allowed form: " + line[:60])
         if re.search(r"\bpsql\b", line) and ("tier_credential.py run" not in line or "--url-file" not in line):
-            problems.append("psql without the loader: " + line[:60])
+            if not MESSAGE_ECHO.match(line):
+                problems.append("psql without the loader: " + line[:60])
         if re.search(r"\bpsql\b", line) and URL_VARS.search(line):
             problems.append("psql line carries a URL variable: " + line[:60])
         if re.search(r"\b(?:base_url|new_url)\s*=", line) or re.search(r"\bcat\s+\"?\$\{?url_file", line):
@@ -330,9 +358,10 @@ def workflow_problems(text):
     return problems
 
 
-def tier_workflows():
-    """Names of the workflows whose text matches the discovery list."""
-    return sorted(p.name for p in WORKFLOWS.glob("*.yml") if TIER_MARKERS.search(p.read_text(encoding="utf-8")))
+def tier_workflows(directory=WORKFLOWS):
+    """Names of the workflows (``*.yml`` and ``*.yaml``) whose text matches the discovery list."""
+    paths = [*Path(directory).glob("*.yml"), *Path(directory).glob("*.yaml")]
+    return sorted(p.name for p in paths if TIER_MARKERS.search(p.read_text(encoding="utf-8")))
 
 
 class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
