@@ -344,6 +344,7 @@ def owned_paths_gate(repo_root, changed, timeout=OWNED_TIMEOUT_SECONDS):
         try:
             diff_file.unlink()
         except OSError:
+            # Best-effort cleanup of the scratch diff file; the gate result is already in hand.
             pass
     if proc.returncode not in (OWNED_EXIT_OK, OWNED_EXIT_MATCH):
         err_text = proc.stderr.decode("utf-8", errors="replace")

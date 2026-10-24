@@ -9,8 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unittest
-from unittest import mock
+import unittest.mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRATCH = REPO / ".local-runs"
@@ -244,7 +243,8 @@ class OwnedPathsSelectionTest(unittest.TestCase):
             foundational = self.three_arg_fixture({name: "x\n"})
         except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
             self.skipTest("filesystem refused a non-UTF-8 name: %r" % exc)
-        self.assert_pr_wide_defect(foundational, "UTF-8")
+        else:
+            self.assert_pr_wide_defect(foundational, "UTF-8")
 
     def test_pr_wide_listing_clean_path_matches_two_argument_selection_8077_s6(self):
         foundational = self.three_arg_fixture({"docs/notes.md": "x\n"})
@@ -313,7 +313,7 @@ class GateRunnerBranchTest(unittest.TestCase):
 
     def test_oserror_fails_closed(self):
         (self.repo / GATE_REL).write_text("pass\n", encoding="utf-8")
-        with mock.patch.object(self.module.subprocess, "run", side_effect=OSError("boom")):
+        with unittest.mock.patch.object(self.module.subprocess, "run", side_effect=OSError("boom")):
             stems, defect = self.module.owned_paths_gate(self.repo, [SDK_PATH])
         self.assertEqual(stems, [])
         self.assertIn("gate did not run", defect)
