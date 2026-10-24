@@ -5,8 +5,10 @@ Input is the stdout of ``cargo test --no-run --message-format=json`` (or
 ``json-render-diagnostics``), read from ``--build-json`` or stdin, plus the
 repository sources. Output is written to ``--out-dir``:
 
-* ``serial.txt``      class (a): Postgres / ``#[serial]`` / ``federat`` in the name /
-                      unknown source. Run at ``--test-threads=1`` in ONE process.
+* ``serial.txt``      class (a): Postgres use (the per-job database URL variables or a
+                      tests/common helper reading them) / ``#[serial]`` / unknown source.
+                      A binary that only names Postgres, or only has ``federat`` in its
+                      name, is class (b) and listed in the manifest ``moved`` field (#7343). Run at ``--test-threads=1`` in ONE process.
                       Also carries ``--lib`` (the lib unittests filtered to the
                       Postgres test-name prefixes).
 * ``parallel_1.txt``  class (b), first half, carries ``--lib`` (the lib unittests
@@ -57,6 +59,14 @@ PG_RE = re.compile(
     r'|sqlx::|PostgresStore|pg_test_client|feature\s*=\s*"sal-postgres"|postgres://'
     r'|pg_barrier|lane_db|pg_sources|pg_blocking_pids'
 )
+# Of the PG_RE markers, the ones that reach the per-job database: the CI-exported
+# URL variables and the tests/common helpers that read them. A source that
+# only names a Postgres type, a cfg gate or a ``postgres://`` literal cannot
+# touch the shared database (#7343), so it is a mention, not use.
+PG_USE_RE = re.compile(
+    r'AI_MEMORY_TEST_POSTGRES_URL|AI_MEMORY_TEST_AGE_URL|postgres_url\(|postgres_env|PostgresEnv'
+    r'|pg_test_client|pg_barrier|pg_isolate|lane_db|pg_sources|pg_blocking_pids'
+)
 SERIAL_RE = re.compile(r'serial_test|#\[serial')
 FEDERAT_RE = re.compile(r'federat', re.IGNORECASE)
 # Class (b) binaries carrying these run in the SAME half so two of them never
@@ -85,6 +95,7 @@ class Exe:
         self.cls = None
         self.reasons = []
         self.shared = []
+        self.moved = []  # why a former class (a) binary is class (b) now (#7343)
         self.test_count = None  # test fns in the sources it compiles; None = unknown
 
     @property
@@ -625,7 +636,7 @@ def classify(exe, index=None):
         exe.cls, exe.reasons = 'a', ['unknown-source']
         return
     reasons = []
-    m = PG_RE.search(text)
+    m = PG_USE_RE.search(text)
     if m:
         reasons.append('pg:' + m.group(0)[:32])
     elif 'pg' in inherited:
@@ -634,14 +645,16 @@ def classify(exe, index=None):
         reasons.append('serial')
     elif 'serial' in inherited:
         reasons.append('serial-helper:' + inherited['serial'])
-    if FEDERAT_RE.search(exe.name):
-        reasons.append('name:federat')
     if unresolved:
         reasons.append('unresolved-mod')
     if reasons:
         exe.cls, exe.reasons = 'a', reasons
         return
     exe.cls = 'b'
+    if FEDERAT_RE.search(exe.name):
+        exe.moved.append('name-federat-only')
+    if PG_RE.search(text):
+        exe.moved.append('pg-mention-only')
     if ENV_RE.search(text):
         exe.reasons.append('env')
     if PORT_RE.search(text) or 'port' in inherited:
@@ -1281,6 +1294,11 @@ def run(args):
                                  % (args.lib_pg_prefixes, ', '.join(missing)))
     weights = load_weights(args.weights)
     serial, h1, h2, has_lib, totals, means = partition(exes, weights, prefixes, args.with_doc == '1')
+    if args.print_moves:
+        for e in sorted(exes, key=lambda x: x.key):
+            if e.kind != 'lib' and e.cls == 'b' and e.moved:
+                print('%s\t%s' % (e.key, '+'.join(e.moved)))
+        return 0
     out_dir = Path(args.out_dir)
     write_lists(out_dir, serial, h1, h2, has_lib)
     (out_dir / 'lib_pg_filters.txt').write_text(''.join(p + '\n' for p in prefixes))
@@ -1300,7 +1318,7 @@ def run(args):
             'parallel_1_est_min_tests_threads': round(totals['parallel_1_est'], 1),
             'parallel_2_est_min_tests_threads': round(totals['parallel_2_est'], 1),
         },
-        'targets': {e.key: {'class': e.cls, 'reasons': e.reasons, 'shared': e.shared}
+        'targets': {e.key: {'class': e.cls, 'reasons': e.reasons, 'shared': e.shared, 'moved': e.moved}
                     for e in exes if e.kind != 'lib'},
     }
     (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=1, sort_keys=True) + '\n')
@@ -1317,7 +1335,9 @@ def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--build-json', default='-', help="cargo --message-format=json output file ('-' = stdin)")
     ap.add_argument('--repo-root', default='.', help='repository root (for src/ scanning)')
-    ap.add_argument('--out-dir', required=True, help='directory for the list files and manifest')
+    ap.add_argument('--out-dir', help='directory for the list files and manifest (required unless --print-moves)')
+    ap.add_argument('--print-moves', action='store_true',
+                    help='print the sorted "<key><TAB><reason>" list of binaries moved out of the serial shard (#7343)')
     ap.add_argument('--weights', default=str(here / 'test_binary_weights.json'))
     ap.add_argument('--lib-pg-prefixes', default=str(here / 'lib_pg_prefixes.txt'))
     ap.add_argument('--with-doc', choices=('0', '1'), default='0',
@@ -1326,7 +1346,10 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not args.print_moves and not args.out_dir:
+        ap.error('--out-dir is required')
     try:
         return run(args)
     except PartitionError as exc:
