@@ -166,9 +166,44 @@ fn line_is_cfg_gated(source: &str, needle: &str) -> Option<bool> {
 /// is deliberately NOT one — that is the seam's own gate, compiled into
 /// every `cargo test` binary including the `ai-memory` BIN (the #3516
 /// lesson), which is precisely the build these scans exist to police.
+/// The whole-file inner form `#![cfg(test)]` (leading position only, exactly
+/// that spelling) is recognised too: see [`has_leading_inner_cfg_test`] (#8249).
 const CFG_TEST_ATTR: &str = "#[cfg(test)]";
 
+/// The whole-file form of the same exclusion: the inner attribute
+/// `#![cfg(test)]`, exactly (#8249).
+const INNER_CFG_TEST_ATTR: &str = "#![cfg(test)]";
+
+/// Does `source` open with the inner attribute `#![cfg(test)]`?
+///
+/// Only the LEADING position counts: blank lines, comments (including `//!`
+/// docs) and other inner attributes (`#![allow(..)]`) may precede it, but the
+/// first line of anything else (a `use`, an item) ends the leading block,
+/// because the compiler rejects an inner attribute after an item and this
+/// detector must not be more generous than the compiler. The recognised form
+/// is exactly `#![cfg(test)]`; `#![cfg(any(test, feature = "test-support"))]`
+/// is compiled into the `test-support`-unified BIN (#3516) and is not one.
+fn has_leading_inner_cfg_test(source: &str) -> bool {
+    for line in source.lines() {
+        let t = line.trim();
+        if t.is_empty() || is_comment_line(t) {
+            continue;
+        }
+        if t == INNER_CFG_TEST_ATTR {
+            return true;
+        }
+        if !t.starts_with("#![") {
+            return false;
+        }
+    }
+    false
+}
+
 /// Per line of `source`: is the line inside a `#[cfg(test)]` region?
+///
+/// A file whose leading inner attribute is `#![cfg(test)]` (see
+/// [`has_leading_inner_cfg_test`]) is one region end to end: the compiler
+/// excludes the whole file from production, so every line is in the region.
 ///
 /// A region is the brace-balanced body of the item that FOLLOWS a
 /// `#[cfg(test)]` attribute (skipping blank lines, comments and further
@@ -189,6 +224,9 @@ const CFG_TEST_ATTR: &str = "#[cfg(test)]";
 /// counting, so a brace in a `//` line never opens or closes a region.
 fn cfg_test_region_lines(source: &str) -> Vec<bool> {
     let lines: Vec<&str> = source.lines().collect();
+    if has_leading_inner_cfg_test(source) {
+        return vec![true; lines.len()];
+    }
     let mut in_region = vec![false; lines.len()];
     let mut i = 0;
     while i < lines.len() {
@@ -645,6 +683,70 @@ pub fn other() {
         arming_call_sites("src/contrived.rs", src).len(),
         2,
         "a feature-gated or test-support-gated site is compiled into a shipped test binary"
+    );
+}
+
+/// #8249 (a): a file whose LEADING inner attribute is exactly
+/// `#![cfg(test)]` is wholly excluded from production by the compiler, so
+/// arming the seam anywhere in it is not a production site. Leading doc
+/// comments, blank lines and other inner attributes may precede it.
+#[test]
+fn detector_exempts_a_whole_file_inner_cfg_test_8249() {
+    let src = r#"// Copyright 2026 AlphaOne LLC
+//! module docs
+
+#![allow(clippy::unwrap_used)]
+#![cfg(test)]
+
+fn t() {
+    let _g = crate::identity::test_agent_id::AgentIdOverride::unset();
+    let _h = crate::identity::test_agent_id::AgentIdOverride::set("ai:in-test");
+}
+"#;
+    assert!(
+        arming_call_sites("src/contrived.rs", src).is_empty(),
+        "a file gated by a leading #![cfg(test)] is not compiled into production"
+    );
+    assert!(
+        probe_free_call_sites("src/contrived.rs", src).is_empty(),
+        "nor are its probe-free constructor calls production sites"
+    );
+}
+
+/// #8249 (b): only the exact form `#![cfg(test)]` exempts a file. The seam's
+/// own `any(test, feature = "test-support")` gate is compiled into the
+/// `test-support`-unified BIN (#3516), so it is NOT an exemption.
+#[test]
+fn detector_does_not_exempt_an_inner_any_test_support_cfg_8249() {
+    let src = r#"#![cfg(any(test, feature = "test-support"))]
+
+fn arm() {
+    let _g = crate::identity::test_agent_id::AgentIdOverride::set("ai:bin");
+}
+"#;
+    assert_eq!(
+        arming_call_sites("src/contrived.rs", src).len(),
+        1,
+        "only the exact #![cfg(test)] form is a whole-file test exemption"
+    );
+}
+
+/// #8249 (c): the compiler rejects an inner attribute after an item, so a
+/// `#![cfg(test)]` that follows a `use` (or any item) is not a region
+/// opener; the detector must not be more generous than the compiler.
+#[test]
+fn detector_ignores_an_inner_cfg_test_after_an_item_8249() {
+    let src = r#"use std::fmt;
+#![cfg(test)]
+
+fn arm() {
+    let _g = crate::identity::test_agent_id::AgentIdOverride::set("ai:late");
+}
+"#;
+    assert_eq!(
+        arming_call_sites("src/contrived.rs", src).len(),
+        1,
+        "an inner attribute after an item is not a leading attribute"
     );
 }
 
