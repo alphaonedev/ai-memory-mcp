@@ -26,8 +26,8 @@ use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, MemoryLink, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore};
+use common::tmp_retain;
 
-#[cfg(feature = "sal-postgres")]
 mod common;
 
 fn ctx() -> CallerContext {
@@ -173,8 +173,8 @@ async fn seed_corpus(store: &dyn MemoryStore) {
 async fn migrate_links_sqlite_to_sqlite_roundtrip() {
     // Baseline: SQLite -> SQLite preserves the link set byte-for-byte.
     // This branch always runs (no live PG required).
-    let src_tmp = tempfile::NamedTempFile::new().unwrap();
-    let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+    let src_tmp = tmp_retain::SidecarTempFile::new().unwrap();
+    let dst_tmp = tmp_retain::SidecarTempFile::new().unwrap();
     let src = SqliteStore::open(src_tmp.path()).unwrap();
     let dst = SqliteStore::open(dst_tmp.path()).unwrap();
 
@@ -219,8 +219,8 @@ async fn migrate_links_idempotent_replay_reports_skipped() {
     // Re-running the migration must surface every link as
     // `links_skipped` rather than `links_written`, matching the
     // `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` semantics.
-    let src_tmp = tempfile::NamedTempFile::new().unwrap();
-    let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+    let src_tmp = tmp_retain::SidecarTempFile::new().unwrap();
+    let dst_tmp = tmp_retain::SidecarTempFile::new().unwrap();
     let src = SqliteStore::open(src_tmp.path()).unwrap();
     let dst = SqliteStore::open(dst_tmp.path()).unwrap();
     seed_corpus(&src).await;
@@ -247,8 +247,8 @@ async fn migrate_links_idempotent_replay_reports_skipped() {
 async fn migrate_links_dry_run_skips_writes_but_reports_reads() {
     // Dry-run still tallies `links_read` so operators can size the
     // migration before committing — but no destination side-effect.
-    let src_tmp = tempfile::NamedTempFile::new().unwrap();
-    let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+    let src_tmp = tmp_retain::SidecarTempFile::new().unwrap();
+    let dst_tmp = tmp_retain::SidecarTempFile::new().unwrap();
     let src = SqliteStore::open(src_tmp.path()).unwrap();
     let dst = SqliteStore::open(dst_tmp.path()).unwrap();
     seed_corpus(&src).await;
@@ -287,8 +287,8 @@ async fn migrate_links_sqlite_to_postgres_to_sqlite_roundtrip() {
     };
     let pg_url = env.url().to_string();
 
-    let src_tmp = tempfile::NamedTempFile::new().unwrap();
-    let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+    let src_tmp = tmp_retain::SidecarTempFile::new().unwrap();
+    let dst_tmp = tmp_retain::SidecarTempFile::new().unwrap();
     let src = SqliteStore::open(src_tmp.path()).unwrap();
     let dst_sqlite = SqliteStore::open(dst_tmp.path()).unwrap();
     let pg = PostgresStore::connect(&pg_url).await.expect("connect pg");

@@ -56,7 +56,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 // ---------------------------------------------------------------------------
 
 static FLAG_LOCK: Mutex<()> = Mutex::new(());
-static AUDIT_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+static AUDIT_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 
 fn flag_guard() -> std::sync::MutexGuard<'static, ()> {
     FLAG_LOCK
@@ -75,7 +77,9 @@ fn ensure_audit_key() {
         let signing = SigningKey::generate(&mut rand_core::OsRng);
         ai_memory::governance::audit::init(dir.path(), Some(signing))
             .expect("install daemon audit key");
-        dir
+        let path = dir.path().to_path_buf();
+        tmp_retain::retain(dir);
+        path
     });
 }
 

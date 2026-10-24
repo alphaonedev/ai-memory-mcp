@@ -365,10 +365,10 @@ pub(crate) fn tls_fixture_paths() -> (PathBuf, PathBuf) {
 /// a leaf it signed whose SANs are the loopback names (`127.0.0.1`, `::1`,
 /// `localhost`), so a VERIFYING client accepts the mock exactly the way a
 /// production peer would — no `danger_accept_invalid_certs` anywhere.
-/// Generated once with rcgen under `TMPDIR` (the `TempDir` lives for the
-/// process; it is dropped with the static, never leaked).
+/// Generated once with rcgen under `TMPDIR`; the `TempDir` is parked with
+/// `test_tmp_retain::retain` and removed at process exit (a `static` is never
+/// dropped, #6122).
 pub(crate) struct TlsTestPki {
-    _dir: tempfile::TempDir,
     /// The CA certificate (PEM) a client adds as its root.
     pub(crate) ca_pem: PathBuf,
     /// The leaf certificate (PEM) a mock listener presents.
@@ -418,8 +418,8 @@ fn generate_tls_test_pki() -> TlsTestPki {
         std::fs::set_permissions(&leaf_key_pem, std::fs::Permissions::from_mode(0o600))
             .expect("chmod 0600 test leaf key");
     }
+    crate::test_tmp_retain::retain(dir);
     TlsTestPki {
-        _dir: dir,
         ca_pem,
         leaf_pem,
         leaf_key_pem,

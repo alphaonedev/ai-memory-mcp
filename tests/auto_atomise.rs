@@ -9,3 +9,5 @@
 
 #[path = "auto_atomise/core.rs"]
 mod core;
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;

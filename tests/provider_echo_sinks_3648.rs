@@ -12,12 +12,14 @@
 //! `tests/round2_f10_embed_status.rs::http_provider_echo_is_redacted_3648`;
 //! the MCP chat sinks are pinned in `src/mcp/provider_echo_sinks_3648_tests.rs`.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 use wiremock::matchers::{method, path};
@@ -49,9 +51,9 @@ impl std::io::Write for CapturedLog {
     }
 }
 
-fn build_router_with_llm(llm: OllamaClient) -> (axum::Router, NamedTempFile) {
+fn build_router_with_llm(llm: OllamaClient) -> (axum::Router, SidecarTempFile) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

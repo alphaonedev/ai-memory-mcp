@@ -46,6 +46,8 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -118,7 +120,7 @@ fn enrolled_key_dir() -> (&'static std::path::Path, kp_mod::AgentKeypair) {
     let (p, kp) = DIR.get_or_init(|| {
         let tmp = tempfile::TempDir::new().expect("key tempdir");
         let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         let kp = kp_mod::generate(RESOLVER_ENROLLED).expect("generate resolver");
         let pub_only = kp_mod::AgentKeypair {
             agent_id: RESOLVER_ENROLLED.to_string(),

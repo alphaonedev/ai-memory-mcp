@@ -20,6 +20,8 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -42,9 +44,9 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn setup_router() -> axum::Router {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
-    std::mem::forget(db_tmp);
+    tmp_retain::retain(db_tmp);
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((
@@ -393,7 +395,7 @@ fn binding_map_parses_and_supports_rotation() {
          sha256:{fp_b} peer-one\n\
          \n"
     );
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::tmp_retain::SidecarTempFile::new().unwrap();
     std::fs::write(tmp.path(), body).unwrap();
     let map = ai_memory::tls::load_cert_peer_binding_map(tmp.path()).unwrap();
     // Two distinct fingerprints, both bound to the same peer-id (rotation).
@@ -405,7 +407,7 @@ fn binding_map_parses_and_supports_rotation() {
 fn binding_map_rejects_conflicting_peer_id_for_one_fingerprint() {
     let fp = "c".repeat(64);
     let body = format!("{fp} peer-one\n{fp} peer-two\n");
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::tmp_retain::SidecarTempFile::new().unwrap();
     std::fs::write(tmp.path(), body).unwrap();
     let err = ai_memory::tls::load_cert_peer_binding_map(tmp.path()).unwrap_err();
     assert!(
@@ -417,7 +419,7 @@ fn binding_map_rejects_conflicting_peer_id_for_one_fingerprint() {
 #[test]
 fn binding_map_rejects_missing_peer_id_field() {
     let fp = "d".repeat(64);
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::tmp_retain::SidecarTempFile::new().unwrap();
     std::fs::write(tmp.path(), format!("{fp}\n")).unwrap();
     let err = ai_memory::tls::load_cert_peer_binding_map(tmp.path()).unwrap_err();
     assert!(err.to_string().contains("expected"), "got: {err}");
@@ -426,7 +428,7 @@ fn binding_map_rejects_missing_peer_id_field() {
 #[test]
 fn binding_map_rejects_malformed_peer_id() {
     let fp = "e".repeat(64);
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::tmp_retain::SidecarTempFile::new().unwrap();
     // A space-free but control-char-bearing peer-id fails the agent-id shape.
     std::fs::write(tmp.path(), format!("{fp} bad$peer\n")).unwrap();
     let err = ai_memory::tls::load_cert_peer_binding_map(tmp.path()).unwrap_err();

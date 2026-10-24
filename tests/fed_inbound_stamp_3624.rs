@@ -22,6 +22,8 @@
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
 mod common;
+#[cfg(feature = "sal")]
+use common::tmp_retain;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -51,9 +53,9 @@ fn build_router_in_memory() -> (axum::Router, ai_memory::handlers::Db) {
     // OWN tempfile so there is no second writer on the receive db.
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
         let sp = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&sp).expect("open SqliteStore"),
         )

@@ -36,15 +36,17 @@
 //!    the recipient even though the sender stamps `metadata.agent_id`
 //!    (mirrors the `is_visible_to_caller` carve-out).
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -202,7 +204,7 @@ async fn restore_as(router: &axum::Router, caller: &str, id: &str) -> (StatusCod
 
 #[tokio::test]
 async fn bob_cannot_restore_alice_archived_row_940() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let id = seed_archived(db_path, "alice", "shared-940/a", &json!({}));
     assert_eq!(archive_row_count(db_path), 1);
@@ -229,7 +231,7 @@ async fn bob_cannot_restore_alice_archived_row_940() {
 
 #[tokio::test]
 async fn owner_can_restore_own_archived_row_940() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let id = seed_archived(db_path, "alice", "shared-940/b", &json!({}));
     assert_eq!(archive_row_count(db_path), 1);
@@ -256,7 +258,7 @@ async fn owner_can_restore_own_archived_row_940() {
 
 #[tokio::test]
 async fn inbox_target_can_restore_inbox_row_940() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     // Carol sent alice an inbox message; the row carries
     // `metadata.agent_id = "carol"` (the sender) and

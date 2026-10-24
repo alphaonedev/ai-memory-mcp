@@ -32,9 +32,10 @@ use ai_memory::forensic::bundle::{self, ExportForensicBundleArgs, read_ustar};
 use ai_memory::models::{Memory, MemoryKind, Tier};
 use ai_memory::storage;
 
+use crate::tmp_retain::SidecarTempFile;
 use rusqlite::Connection;
 use serde_json::json;
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Shared scaffolding (mirrors tests/atomisation/core.rs).
@@ -93,8 +94,8 @@ fn fresh_db_in(dir: &std::path::Path) -> (std::path::PathBuf, Connection) {
     (p, conn)
 }
 
-fn fresh_db_tempfile() -> (NamedTempFile, Connection) {
-    let tmp = NamedTempFile::new().expect("tempfile");
+fn fresh_db_tempfile() -> (SidecarTempFile, Connection) {
+    let tmp = SidecarTempFile::new().expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
     (tmp, conn)
 }

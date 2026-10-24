@@ -45,6 +45,8 @@
 //!   (title, content, tags). This is the structural pin against
 //!   future regressions that revert the v53 DDL.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use rusqlite::Connection;
 
 /// Bring a fresh in-memory DB up to the substrate's
@@ -71,7 +73,7 @@ fn fresh_v53_db() -> Connection {
     // (Without leaking, `tmpdir` would drop and remove the DB file
     // before `query_row` runs because the Connection holds a separate
     // handle to the file.)
-    std::mem::forget(tmpdir);
+    tmp_retain::retain(tmpdir);
     ai_memory::storage::open(&db_path).expect("open fresh v53 db")
 }
 

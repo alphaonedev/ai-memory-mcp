@@ -24,9 +24,11 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::identity::attest::attested_write_fingerprint;
 use ai_memory::store::record_stop::SCOPE_RECORD_PLANE;
-use tempfile::NamedTempFile;
 
 const AGENT: &str = "ai:alice@node";
 const CREATED_AT: &str = "2026-01-01T00:00:00+00:00";
@@ -46,7 +48,7 @@ fn ledger_rows(conn: &rusqlite::Connection) -> i64 {
 /// ledger row, and the envelope is still admissible once the stop is lifted.
 #[test]
 fn sqlite_record_stop_refuses_admission_without_consuming_the_envelope_3481() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("open");
     let fp = attested_write_fingerprint(AGENT, CREATED_AT, &[7u8; 64]);
 
@@ -94,7 +96,7 @@ fn sqlite_record_stop_refuses_admission_without_consuming_the_envelope_3481() {
 /// first sighting Fresh, second Replay.
 #[test]
 fn sqlite_admission_unchanged_without_a_record_stop_3481() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("open");
     let fp = attested_write_fingerprint(AGENT, CREATED_AT, &[9u8; 64]);
 

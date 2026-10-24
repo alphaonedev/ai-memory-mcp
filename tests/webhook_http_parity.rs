@@ -28,7 +28,7 @@
 //! connection. `:memory:` databases are connection-private — the
 //! spawned thread would be unable to find any subscriptions and the
 //! tests would silently pass without exercising the HTTP path. We use
-//! a `NamedTempFile` so the spawned dispatch thread shares the same
+//! a `SidecarTempFile` so the spawned dispatch thread shares the same
 //! WAL-mode `SQLite` file the foreground request used.
 //!
 //! ## Why a tiny `tokio::time::sleep`
@@ -39,15 +39,16 @@
 //! than picking an arbitrary fixed sleep — keeps the suite fast while
 //! tolerating slow CI.
 
+use common::tmp_retain;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -83,12 +84,12 @@ const WEBHOOK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 struct HttpHarness {
     router: axum::Router,
     db_path: std::path::PathBuf,
-    _tempfile: NamedTempFile,
+    _tempfile: SidecarTempFile,
 }
 
 impl HttpHarness {
     fn new() -> Self {
-        let f = NamedTempFile::new().expect("tempfile");
+        let f = SidecarTempFile::new().expect("tempfile");
         let db_path = f.path().to_path_buf();
         // Open + run all migrations.
         let _ = ai_memory::db::open(&db_path).expect("db::open");

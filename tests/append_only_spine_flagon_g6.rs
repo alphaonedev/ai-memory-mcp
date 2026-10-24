@@ -76,7 +76,9 @@ static FLAG_LOCK: Mutex<()> = Mutex::new(());
 /// Keeps the audit sink's temp dir alive for the whole process so the
 /// installed `DAEMON_AUDIT_KEY` (an `OnceLock`, first-install-wins) stays
 /// valid for signature verification across every test.
-static AUDIT_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+static AUDIT_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 
 fn flag_guard() -> std::sync::MutexGuard<'static, ()> {
     // Recover from a poisoned lock so one failing test does not cascade-mask
@@ -98,7 +100,9 @@ fn ensure_audit_key() {
         let signing = SigningKey::generate(&mut OsRng);
         ai_memory::governance::audit::init(dir.path(), Some(signing))
             .expect("install daemon audit key");
-        dir
+        let path = dir.path().to_path_buf();
+        tmp_retain::retain(dir);
+        path
     });
 }
 

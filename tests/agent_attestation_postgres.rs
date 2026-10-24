@@ -33,13 +33,15 @@
 //! env-mutating case additionally serialises on [`ENV_LOCK`];
 //! edition-2024 requires the `unsafe` env mutators.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -53,8 +55,8 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Build a router with `storage_backend = Postgres` but backed by an
 /// `SqliteStore`, so the postgres attestation gate fires while the
 /// bound-key lookup + write land on the sqlite adapter.
-fn build_fake_pg_router() -> (axum::Router, NamedTempFile, std::path::PathBuf) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_fake_pg_router() -> (axum::Router, SidecarTempFile, std::path::PathBuf) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

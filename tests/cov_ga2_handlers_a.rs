@@ -29,12 +29,14 @@
 #![allow(clippy::await_holding_lock)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
@@ -47,13 +49,13 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 /// selects the `storage_backend` field: passing `Postgres` while the
 /// store handle stays sqlite drives the `#[cfg(feature = "sal")]`
 /// SAL-trait arms without a live postgres.
-fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, Db) {
+fn build_router(backend: StorageBackend) -> (axum::Router, SidecarTempFile, Db) {
     // The admin gate (#1570) trusts a self-asserted `X-Agent-Id` naming
     // an admin id only when the daemon has request authentication
     // configured. Mark authn configured so the explicit `admin_agent_ids`
     // below admit the matching caller.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("db tempfile");
+    let f = SidecarTempFile::new().expect("db tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

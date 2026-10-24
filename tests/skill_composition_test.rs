@@ -26,6 +26,8 @@
 //! These tests don't depend on the MCP JSON-RPC envelope — they exercise
 //! the handler directly, mirroring the pattern in `tests/skill_test.rs`.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::models::ConfidenceSource;
 use std::path::PathBuf;
 
@@ -47,7 +49,7 @@ fn open_test_db() -> (rusqlite::Connection, PathBuf) {
     // Leak the tempdir for the lifetime of the test by retaining its
     // path inside the returned tuple — the caller's binding extends
     // through end-of-test scope so the file isn't deleted under us.
-    std::mem::forget(dir);
+    tmp_retain::retain(dir);
     (conn, db_path)
 }
 

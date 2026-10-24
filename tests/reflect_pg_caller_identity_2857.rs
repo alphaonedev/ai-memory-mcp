@@ -48,6 +48,7 @@
 #![cfg(feature = "sal-postgres")]
 
 mod common;
+use common::tmp_retain;
 
 use std::sync::Arc;
 
@@ -101,7 +102,7 @@ fn build_pg_router(url_store: Arc<dyn MemoryStore>) -> axum::Router {
     let sqlite_dir = tempfile::tempdir().expect("tempdir");
     let sqlite_path = sqlite_dir.path().join("reflect-2857-http.db");
     // Keep the dir alive for the process lifetime (leak is fine in a test).
-    std::mem::forget(sqlite_dir);
+    tmp_retain::retain(sqlite_dir);
     let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
         ai_memory::db::open(&sqlite_path).expect("sqlite open"),
         sqlite_path.clone(),

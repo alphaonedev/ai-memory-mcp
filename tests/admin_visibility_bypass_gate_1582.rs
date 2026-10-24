@@ -25,14 +25,16 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::admin_role::{
     ENV_ADMIN_HEADER_TRUST, is_admin_caller, is_admin_caller_trusted, mark_request_authn_configured,
 };
 use ai_memory::handlers::{AppState, Db};
-use tempfile::NamedTempFile;
 
 const ADMIN_ID: &str = "ai:operator-alice";
 const NON_ADMIN_ID: &str = "ai:tenant-bob";
@@ -40,8 +42,8 @@ const NON_ADMIN_ID: &str = "ai:tenant-bob";
 /// Build an `AppState` with `ADMIN_ID` allowlisted and NO `api_key`
 /// (the unauthenticated default install) — same shape as the #1570
 /// fixture.
-fn build_state() -> (AppState, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_state() -> (AppState, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

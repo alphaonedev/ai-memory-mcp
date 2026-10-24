@@ -30,6 +30,8 @@
 
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -59,7 +61,7 @@ fn fresh_db_path(tag: &str) -> PathBuf {
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     drop(ai_memory::db::open(&path).expect("init db"));
-    std::mem::forget(dir); // keep the file alive for the test's connections
+    tmp_retain::retain(dir); // keep the file alive for the test's connections
     path
 }
 

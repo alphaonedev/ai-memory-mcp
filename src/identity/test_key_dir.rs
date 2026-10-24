@@ -126,6 +126,7 @@ pub fn install() -> &'static Path {
             }
             assert_isolated(dir.path());
             bind_key_dir_env(dir.path());
+            register_exit_cleanup();
             dir
         })
         .path();
@@ -165,6 +166,29 @@ pub fn private_tempdir() -> tempfile::TempDir {
 pub(crate) fn armed_sandbox() -> Option<&'static Path> {
     armed().then(install)
 }
+
+/// #6122 — a `static` is never dropped, so the sandbox below `$TMPDIR` used to
+/// outlive every test process. Remove it from a libc `atexit` hook instead.
+#[cfg(unix)]
+extern "C" fn remove_directory_at_exit() {
+    if let Some(dir) = DIRECTORY.get() {
+        // Best effort at process exit: nothing useful can be done with a failure.
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+}
+
+#[cfg(unix)]
+fn register_exit_cleanup() {
+    // SAFETY: `remove_directory_at_exit` is an `extern "C"` fn that takes no
+    // arguments and does not unwind (`remove_dir_all` returns a `Result`, and
+    // `OnceLock::get` never panics); `atexit` only stores the fn pointer.
+    unsafe {
+        libc::atexit(remove_directory_at_exit);
+    }
+}
+
+#[cfg(not(unix))]
+fn register_exit_cleanup() {}
 
 // Runs exactly once per process, inside `DIRECTORY`'s `OnceLock` initializer.
 fn arm() {

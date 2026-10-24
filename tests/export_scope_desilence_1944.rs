@@ -27,8 +27,11 @@
 //! exercises the admin export handler through the real router and asserts the
 //! markers ride the response alongside the unchanged corpus shape.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::export_scope;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
@@ -37,7 +40,6 @@ use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -267,7 +269,7 @@ fn build_router_fixture(db_path: &std::path::Path, admin_ids: Vec<String>) -> ax
 
 #[tokio::test]
 async fn http_export_carries_scope_markers_without_changing_shape_1944() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_memory(db_path, "alice", "ns-1944/a");
     seed_memory(db_path, "carol", "ns-1944/c");

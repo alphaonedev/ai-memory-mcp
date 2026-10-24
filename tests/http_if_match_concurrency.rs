@@ -14,12 +14,14 @@
 //! absent (legacy v0.6.x callers) the mutation lands without any
 //! gate, preserving back-compat.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -31,8 +33,8 @@ use ai_memory::models::{Memory, Tier};
 /// test (e.g. `tests/round2_f9_http_400.rs`). Stands up a router with
 /// the keyword tier (no embedder, no federation) so the only moving
 /// parts are the JSON extractor + storage layer.
-fn build_test_router() -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_test_router() -> (axum::Router, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

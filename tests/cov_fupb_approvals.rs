@@ -20,6 +20,7 @@
 #![allow(clippy::await_holding_lock)]
 #![allow(clippy::redundant_closure_for_method_calls)]
 
+use common::tmp_retain;
 use std::sync::{Arc, Mutex};
 
 use ai_memory::approvals::ApprovalEvent;
@@ -40,10 +41,10 @@ static APPROVALS_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 const TEST_SECRET: &str = "cov-fupb-approvals-secret";
 
 fn build_sqlite_router() -> (axum::Router, std::path::PathBuf) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
+    tmp_retain::retain(f);
     let conn = ai_memory::db::open(&db_path).expect("reopen");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,

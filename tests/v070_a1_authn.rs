@@ -28,6 +28,7 @@
 use ai_memory::config::set_active_hooks_hmac_secret;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::tmp_retain;
 use serde_json::json;
 use std::sync::Mutex;
 use tower::ServiceExt as _;
@@ -102,9 +103,9 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )
@@ -444,9 +445,9 @@ async fn r3_s1_subscribe_succeeds_with_server_wide_secret() {
 async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
     // The daemon's bootstrap must fail-fast when the operator tries
     // to bind to a routable address with no API key configured.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for db");
     let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    tmp_retain::retain(tmp);
     let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
     let args = ai_memory::daemon_runtime::ServeArgs {
@@ -492,9 +493,9 @@ async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
 async fn s5c1_pattern_a_loopback_bind_without_api_key_succeeds_with_warn() {
     // Loopback bind with no api_key must still boot (single-tenant
     // dev convention). The startup just logs a WARN.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for db");
     let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    tmp_retain::retain(tmp);
     let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
     let args = ai_memory::daemon_runtime::ServeArgs {

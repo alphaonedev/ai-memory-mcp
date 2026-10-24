@@ -37,6 +37,8 @@
 //! 2. Reserved name — `X-Agent-Id: daemon` (rejected by #977's
 //!    reserved-name set, sibling to TB1).
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt as _;
@@ -61,9 +63,9 @@ mod common_admin {
         )));
         #[cfg(feature = "sal")]
         let store: Arc<dyn ai_memory::store::MemoryStore> = {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
             let p = tmp.path().to_path_buf();
-            std::mem::forget(tmp);
+            crate::tmp_retain::retain(tmp);
             Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
         };
         let app_state = ai_memory::handlers::AppState {

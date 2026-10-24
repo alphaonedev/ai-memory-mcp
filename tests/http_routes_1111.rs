@@ -25,14 +25,17 @@
     clippy::similar_names
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 fn local_runs_root() -> PathBuf {
@@ -48,14 +51,14 @@ fn fresh_dir() -> TempDir {
     tempfile::tempdir_in(&root).expect("tempdir under .local-runs")
 }
 
-fn build_router_fixture() -> (axum::Router, NamedTempFile) {
+fn build_router_fixture() -> (axum::Router, SidecarTempFile) {
     // #1570 — these tests model an AUTHENTICATED deployment (api_key
     // configured at boot), the pre-#1570 implicit posture, so the admin
     // header role-claims they assert keep working. The #1570 secure
     // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
     // is pinned by tests/admin_header_trust_1570.rs in its own process.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

@@ -47,6 +47,8 @@
 //! (resolver enrollment), `AI_MEMORY_FED_PEER_ATTESTATION` (the peer scope), and
 //! the sig/enrollment knobs from the process-global environment.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,7 +89,7 @@ fn enrolled_key_dir() -> (&'static std::path::Path, kp_mod::AgentKeypair) {
     let (p, kp) = DIR.get_or_init(|| {
         let tmp = tempfile::TempDir::new().expect("key tempdir");
         let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp); // leak: keep the dir for the whole test binary
+        tmp_retain::retain(tmp); // leak: keep the dir for the whole test binary
         let kp = kp_mod::generate(PEER_ID).expect("generate resolver");
         let pub_only = kp_mod::AgentKeypair {
             agent_id: PEER_ID.to_string(),
@@ -156,9 +158,9 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         true,
     )));
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
     };
     let app_state = ai_memory::handlers::AppState {

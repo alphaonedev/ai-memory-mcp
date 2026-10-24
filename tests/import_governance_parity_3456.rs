@@ -37,13 +37,15 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -62,7 +64,7 @@ const ADMIN: &str = "ops:admin";
 const STANDARD_OWNER: &str = "ops:standards";
 const GOVERNED_NS: &str = "gov3456";
 
-fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::path::PathBuf) {
+fn build_router(backend: StorageBackend) -> (axum::Router, SidecarTempFile, std::path::PathBuf) {
     // #1570 — model an AUTHENTICATED deployment so the admin `X-Agent-Id`
     // role-claim is honoured; the #1570 secure default is pinned by
     // `tests/admin_header_trust_1570.rs` in its own process.
@@ -72,7 +74,7 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::p
     // `Advisory`. Production boot resolves `enforce` by default, so pin it.
     ai_memory::config::set_active_permissions_mode(PermissionsMode::Enforce);
 
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

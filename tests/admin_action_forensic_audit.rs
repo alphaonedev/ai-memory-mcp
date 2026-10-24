@@ -38,9 +38,12 @@
 // load-bearing serialisation.
 #![allow(clippy::missing_panics_doc, clippy::await_holding_lock)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::governance::audit as forensic;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
@@ -48,7 +51,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 /// Forensic sink is process-global; serialise across the two tests in
@@ -76,8 +79,8 @@ fn fresh_dir() -> TempDir {
 /// over a fresh `SQLite` tempfile. Mirrors the pattern used by the
 /// `handler_postgres_branches_fake_pg` family of tests for the
 /// in-process Axum dispatch.
-fn build_router_fixture() -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_router_fixture() -> (axum::Router, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

@@ -23,18 +23,20 @@
 //! query errs — the (persisted-stop + failing-read) state a `DROP TABLE` cannot
 //! give, because a drop removes the stop event too.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::storage::record_stop::{
     SCOPE_RECORD_PLANE, actuate_sqlite, append_attestation_sqlite, gate_storage_conn,
     read_state_sqlite, status_sqlite,
 };
-use tempfile::NamedTempFile;
 
 const OP: &str = "ai:operator";
 
 /// A fresh migrated database opened as a bare `Connection` — the funnel the MCP
 /// stdio write path uses.
-fn fresh_db() -> (NamedTempFile, rusqlite::Connection) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn fresh_db() -> (SidecarTempFile, rusqlite::Connection) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("open");
     (f, conn)
 }

@@ -13,8 +13,11 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::doc_markdown)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -23,7 +26,6 @@ use ai_memory::store::MemoryStore;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
 const ADMIN: &str = "ai:rewind-route-admin";
@@ -142,8 +144,8 @@ fn router_from(app_state: AppState) -> axum::Router {
     ai_memory::build_router(api_key_state, app_state)
 }
 
-fn sqlite_router() -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn sqlite_router() -> (axum::Router, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -450,8 +452,8 @@ fn enforce_state(db: Db, store: Arc<dyn MemoryStore>, backend: StorageBackend) -
     )
 }
 
-fn sqlite_enforce_router() -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn sqlite_enforce_router() -> (axum::Router, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen");

@@ -24,6 +24,8 @@
 //! to unwired, this returns `503 under-replicated` instead — the assertion is
 //! load-bearing on the fanout, not merely on the handler existing.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -95,10 +97,10 @@ fn federation_config(push_url: &str) -> ai_memory::federation::FederationConfig 
 fn build_router_with_pending_checkpoint(
     federation: Option<ai_memory::federation::FederationConfig>,
 ) -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
+    tmp_retain::retain(f);
 
     let cp = ai_memory::models::Checkpoint {
         id: CHECKPOINT_ID.to_string(),
