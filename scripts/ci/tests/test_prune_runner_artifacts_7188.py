@@ -15,6 +15,7 @@ import io
 import os
 import shutil
 import sys
+import tempfile
 import time
 import unittest
 import unittest.mock as mock
@@ -22,7 +23,19 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-SCRATCH = REPO / ".local-runs" / "prune-7188"
+SCRATCH_PARENT = REPO / ".local-runs"
+SCRATCH = None  # per-run mkdtemp dir, set by setUpModule (#8024)
+
+
+def setUpModule():
+    global SCRATCH
+    SCRATCH_PARENT.mkdir(parents=True, exist_ok=True)
+    SCRATCH = Path(tempfile.mkdtemp(prefix="prune-7188-", dir=str(SCRATCH_PARENT)))
+
+
+def tearDownModule():
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
 sys.path.insert(0, str(REPO / "scripts" / "ci"))
 import prune_runner_artifacts as prune  # noqa: E402
 
