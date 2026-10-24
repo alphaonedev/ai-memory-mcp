@@ -17,7 +17,7 @@ REPO_ROOT = SCRIPTS_CI.parents[1]
 SCRATCH_PARENT = REPO_ROOT / ".local-runs" / "impact-tests"
 IMPACT_DIR = SCRIPTS_CI / "impact"
 RULES_JSON = IMPACT_DIR / "rules.json"
-GIT_IDENT = ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+GIT_IDENT = ["-c", "user.name=fixture", "-c", "user.email=fixture-ident",
              "-c", "commit.gpgsign=false"]
 CREATE_CRATES = ("core", "store", "app")
 DEPENDS_ON = {"core": [], "store": ["core"], "app": ["store"]}
