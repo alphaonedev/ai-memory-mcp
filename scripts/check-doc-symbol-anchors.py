@@ -23,9 +23,12 @@ identifier in prose is never guessed at:
 
 A line that deliberately names a path as absent (a "test ! -f" assertion,
 "no longer exists", "pre-modularisation" and similar, over a three-line
-window) is not a stale anchor. Frozen doc trees are out of scope. The
-burn-down allowlist scripts/qc-allowlists/doc-symbol-anchors-allow.txt
-fails on a STALE entry.
+window) is not a stale anchor for the src/ rules. The FILEPATH rule has its
+own, narrower exemption: a "(planned)" or "(PENDING-RUN" marker on the SAME
+line directly after the cited path. FILEPATH also rejects a path with a ".."
+segment, an absolute path, and any symlink on the path (treated as missing).
+Frozen doc trees are not scanned. The burn-down allowlist
+scripts/qc-allowlists/doc-symbol-anchors-allow.txt fails on a STALE entry.
 
 Exit codes: 0 pass, 1 violations, 2 analysis-engine error (fails closed).
 
@@ -69,8 +72,8 @@ IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # lookahead rejects globs, placeholders and directory prefixes; src/*.rs
 # paths stay with the PATH/LINE/QUAL rules above.
 FILEPATH_RE = re.compile(
-    r"`(?:\.\./)*((?:scripts|tests|docs|\.github|src)/[A-Za-z0-9_./-]*"
-    r"[A-Za-z0-9_-]\.[A-Za-z0-9]+)(?=[`:#]|$)")
+    r"`(/?)(?:\.\./)*((?:scripts|tests|docs|\.github|src)/[A-Za-z0-9_./-]*"
+    r"[A-Za-z0-9_-]\.[A-Za-z0-9]+)(?=[`:#\s]|$)")
 LADDER_CLAIM_RE = re.compile(
     r"(?:ladder (?:ends|end) at|ladder tip(?: is)?|tip is)\s*`?"
     r"(?:[A-Za-z0-9_/.]*::)?migrate_v(\d+)", re.IGNORECASE)
@@ -79,9 +82,12 @@ SCHEMA_RE = re.compile(r"CURRENT_SCHEMA_VERSION: i(?:32|64) = ([0-9]+)")
 ABSENT_ASSERTION = re.compile(
     r"test ! -f|no longer exists?|pre-?modularisation|pre-?modularization|"
     r"modularisation|modularization|monolithic|formerly|\bsplit\b|renamed to|"
-    r"removed in|deleted in|STALE BASE|does not exist|\(planned\)|PENDING-RUN|"
-    r"(?:->|→)\s*`?src/",
+    r"removed in|deleted in|STALE BASE|does not exist|(?:->|→)\s*`?src/",
     re.IGNORECASE)
+# Forward marker for the FILEPATH rule only: on the SAME line, directly after
+# the cited path (optionally after the closing backtick).
+PLANNED_AFTER = re.compile(r"^`?\s?\((?:planned\)|PENDING-RUN\b)")
+CLASS_ROOTS = ("scripts", "tests", "docs", ".github", "src")
 
 DETAIL = {
     "PATH": "cited src/ path does not exist",
@@ -136,6 +142,29 @@ def scoped_docs(root):
         if (root / rel).exists():
             seen.append(rel)
     return seen
+
+
+def cited_file_exists(root, rel):
+    """True only for a regular file strictly inside the repo root.
+
+    A path with a ``..`` segment, an absolute path, a first component outside
+    the cited classes, or any symlink along the path counts as missing
+    (fails closed), so the check cannot be satisfied by a file outside the
+    tree or by a link pointing out of it.
+    """
+    parts = rel.split("/")
+    if rel.startswith("/") or ".." in parts or parts[0] not in CLASS_ROOTS:
+        return False
+    cur = root
+    for part in parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return False
+    try:
+        cur.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return cur.is_file()
 
 
 def analyse(root):
@@ -210,12 +239,14 @@ def analyse(root):
                         out.append(("LADDER_TIP", doc, ln,
                                     "migrate_v%s!=migrate_v%s" % (m.group(1), tip), ctx))
             for m in FILEPATH_RE.finditer(line):
-                f = m.group(1)
-                if f.endswith(".rs") and f.startswith("src/"):
+                f = m.group(2)
+                if f.endswith(".rs") and f.startswith("src/") and not m.group(1):
                     continue  # PATH / LINE / QUAL own src/*.rs
-                if absent_ok or (root / f).is_file():
+                if not m.group(1) and cited_file_exists(root, f):
                     continue
-                out.append(("FILEPATH", doc, ln, f, ctx))
+                if PLANNED_AFTER.match(line[m.end():]):
+                    continue
+                out.append(("FILEPATH", doc, ln, "/" + f if m.group(1) else f, ctx))
     return out
 
 
@@ -364,6 +395,20 @@ def self_test():
         expect("glob, placeholder and directory scripts/ citations are not guessed at",
                "\nSee `scripts/*.sh` and `scripts/<name>.py` and `scripts/ci/`.\n",
                must_pass=True)
+        expect("same-line (planned) after a missing scripts/ path PASSES (#8171)",
+               "\nNeeds `scripts/not_yet.py` (planned) later.\n", must_pass=True)
+        expect("(planned) on the line ABOVE a missing scripts/ path is REJECTED (#8171)",
+               "\nWork is (planned).\nRun `scripts/not_yet.py` now.\n", "FILEPATH")
+        expect("an unrelated (planned) does not exempt a missing src/ path (#8171)",
+               "\nFeature X is (planned).\nHandlers live in `src/handlers.rs`.\n")
+        expect("a .. segment in a cited path is REJECTED (#8171)",
+               "\nSee `scripts/../README.md`.\n", "FILEPATH")
+        expect("an absolute cited path is REJECTED (#8171)",
+               "\nSee `/scripts/real_tool.py`.\n", "FILEPATH")
+        expect("a command-form citation of a missing path is REJECTED (#8171)",
+               "\nRun `scripts/no_such.py --flag` now.\n", "FILEPATH")
+        expect("a command-form citation of an existing path PASSES (#8171)",
+               "\nRun `scripts/real_tool.py --flag` now.\n", must_pass=True)
         expect("an allowlisted anchor PASSES",
                "\nThe decorator is `src/mcp/tools/recall.rs::decorate_memory`.\n",
                allow_text="README.md src/mcp/tools/recall.rs::decorate_memory #1\n",

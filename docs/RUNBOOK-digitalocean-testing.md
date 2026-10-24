@@ -293,7 +293,7 @@ v0.6.0.0 tags **only** when:
 - [ ] All per-phase JSON reports are attached to the release PR.
 
 On pass: cut the tag, archive the droplets, publish the aggregated
-report as `docs/CAMPAIGN-v0.6.0.0.md` (planned) on the release.
+report on the release (the report is not published in this repository).
 
 ## Not included (deliberate)
 

@@ -176,7 +176,7 @@ R = (reversed actions / sampled actions) * 100
 
 ## Publication
 
-On pass, the soak report lands as `docs/CURATOR-SOAK-v0.7.0.md` (planned)
+On pass, the soak report is written up (it is not published in this repository)
 with:
 
 - Date, commit SHA, corpus stats (N memories, N namespaces, total

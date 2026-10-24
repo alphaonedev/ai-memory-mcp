@@ -68,6 +68,50 @@ class DocAnchors8171Tests(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("src/handlers.rs", out)
 
+    def test_8171_src_missing_path_not_exempted_by_unrelated_planned(self):
+        rc, out = self.run_gate("Feature X is (planned).\nHandlers live in `src/handlers.rs`.\n")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("src/handlers.rs", out)
+
+    def test_8171_same_line_planned_marker_after_scripts_path_passes(self):
+        rc, out = self.run_gate("Needs `scripts/ci/not_yet.py` (planned) later.\n")
+        self.assertEqual(rc, 0, out)
+
+    def test_8171_planned_on_line_above_does_not_exempt(self):
+        rc, out = self.run_gate("Work is (planned).\nRun `scripts/ci/not_yet.py` now.\n")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("scripts/ci/not_yet.py", out)
+
+    def test_8171_broad_absent_word_does_not_exempt_new_rule(self):
+        rc, out = self.run_gate("Run `scripts/ci/not_yet.py` now.\nThe list is split below.\n")
+        self.assertNotEqual(rc, 0, out)
+
+    def test_8171_dotdot_segment_rejected_even_if_target_exists(self):
+        (self.fix / "Cargo.toml").write_text("[package]\n")
+        rc, out = self.run_gate("See `scripts/../Cargo.toml`.\n")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("scripts/../Cargo.toml", out)
+
+    def test_8171_absolute_path_rejected(self):
+        rc, out = self.run_gate("See `/scripts/ci/real_tool.py`.\n")
+        self.assertNotEqual(rc, 0, out)
+
+    def test_8171_symlink_treated_as_missing(self):
+        outside = self.fix.parent / (self.fix.name + "-outside.py")
+        outside.write_text("# outside\n")
+        self.addCleanup(outside.unlink)
+        (self.fix / "scripts/ci/link.py").symlink_to(outside)
+        rc, out = self.run_gate("See `scripts/ci/link.py`.\n")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("scripts/ci/link.py", out)
+
+    def test_8171_command_form_citation_checks_the_path(self):
+        rc, out = self.run_gate("Run `scripts/ci/no_such.py --flag` now.\n")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("scripts/ci/no_such.py", out)
+        rc, out = self.run_gate("Run `scripts/ci/real_tool.py --flag` now.\n")
+        self.assertEqual(rc, 0, out)
+
 
 if __name__ == "__main__":
     unittest.main()
