@@ -35,8 +35,8 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    count to the largest N with `N * 19 + 20 <= free slots` (87 free -> 3, a
    fresh 100-connection tier -> 4) and prints one
    `::notice::[#6383] per-binary isolation clamped jobs 8 -> N (free slots F,
-   per-binary need P)` line. It exits 2 only when not even one binary fits (39
-   free slots), or with `--no-clamp`, which keeps the old refusal below
+   per-binary need P)` line. It exits 2 only with fewer than 39 free slots (not even one binary fits),
+   or with `--no-clamp`, which keeps the old refusal below
    `jobs * 19 + 20` (172 for 8). It builds
    `<CI_FED_DB>_tpl` with the `age` and `vector` extensions and marks it
    `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so `CREATE DATABASE ... TEMPLATE`

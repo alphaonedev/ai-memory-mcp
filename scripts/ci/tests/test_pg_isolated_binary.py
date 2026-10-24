@@ -756,6 +756,30 @@ class Budget(unittest.TestCase):
             with self.assertRaises(pib.WrapperError):
                 pib.session_count(BASE, 'ai_memory_t_r6386_1700000000_0123abcd')
 
+    def test_overlong_digit_strings_exit_two_not_a_traceback_7866_6383_r6(self):
+        long_digits = '9' * 5000
+        with unittest.mock.patch.dict(os.environ, {pib.JOBS_VAR: long_digits}, clear=False):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.effective_run_jobs(None)
+        self.assertIn(pib.JOBS_VAR, str(ctx.exception))
+        self.assertLess(len(str(ctx.exception)), 300, 'the error does not echo the whole string')
+        rec = Recorder(lambda a, k: Result(0, '100|3|0|%s\n' % long_digits))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            with self.assertRaises(pib.WrapperError):
+                pib.connection_budget(BASE)
+        rec = Recorder(lambda a, k: Result(0, long_digits + '\n'))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            with self.assertRaises(pib.WrapperError):
+                pib.sweep(BASE, pib.MIN_SWEEP_AGE_SECS)
+        err = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE, pib.JOBS_VAR: long_digits,
+                                                   pib.FLAG_VAR: '1', pib.TEMPLATE_VAR: TPL,
+                                                   pib.RUN_ID_VAR: RUN}, clear=False), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: (100, 3, 10, 87)), \
+                contextlib.redirect_stderr(err):
+            rc = pib.main(['run', '--targets-file', os.devnull, '--', 'cargo', 'test'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+
     def test_setup_help_lists_the_jobs_key_6383_r5(self):
         parser = pib.build_parser()
         sub = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)][0]

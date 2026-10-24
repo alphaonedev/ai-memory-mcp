@@ -70,6 +70,7 @@ AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
 TEMPLATE_VAR = 'AI_MEMORY_TEST_PG_TEMPLATE'
 RUN_ID_VAR = 'AI_MEMORY_TEST_PG_RUN_ID'
+MAX_PARSED_DIGITS = 18  # longest digit string int() is asked to read: below Python's 4300-digit limit (#7866)
 JOBS_VAR = 'AI_MEMORY_TEST_PG_JOBS'  # effective job count setup emitted for `run`
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
@@ -902,15 +903,26 @@ def effective_run_jobs(cli_jobs: Optional[int]) -> int:
     emitted = os.environ.get(JOBS_VAR, '')
     if emitted == '':
         return MAX_JOBS
-    if not _DIGITS_RE.fullmatch(emitted) or int(emitted) < 1:
-        raise WrapperError('$%s must be an ASCII positive integer, got %r' % (JOBS_VAR, emitted))
-    return int(emitted)
+    jobs = ascii_int(emitted)
+    if jobs is None or jobs < 1:
+        raise WrapperError('$%s must be an ASCII positive integer of at most %d digits, got %r'
+                           % (JOBS_VAR, MAX_PARSED_DIGITS, emitted[:MAX_PARSED_DIGITS + 1]))
+    return jobs
+
+
+def ascii_int(text: str) -> Optional[int]:
+    """Value of an ASCII-digits-only string of at most MAX_PARSED_DIGITS digits, else None.
+
+    The length is checked before int() runs, so a long digit string cannot raise ValueError (#7866).
+    """
+    if len(text) > MAX_PARSED_DIGITS or not _DIGITS_RE.fullmatch(text):
+        return None
+    return int(text)
 
 
 def ascii_count(text: str) -> Optional[int]:
-    """Value of an ASCII-digits-only reply (surrounding blanks ignored), else None."""
-    cleaned = text.strip()
-    return int(cleaned) if _DIGITS_RE.fullmatch(cleaned) else None
+    """``ascii_int`` of a server reply, surrounding blanks ignored."""
+    return ascii_int(text.strip())
 
 
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
