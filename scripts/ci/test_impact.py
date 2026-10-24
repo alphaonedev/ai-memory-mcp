@@ -10,6 +10,10 @@ compute the minimum integration-test set that proves the diff.
 
 Ported from the retired shell selector (#8077, fleet rule Python-not-shell).
 
+Changed paths are listed NUL-separated with core.quotePath=false and decoded strictly as UTF-8, so git
+never quotes a name (#8077 O1). A decode error, an empty path or a path with a control character is a
+`changed-path listing defect` and forces __ALL__.
+
 The consumer (CI yaml) ALWAYS runs `cargo test --lib` regardless of
 this script's output - that catches every inline `#[cfg(test)]` mod
 tests under src/ in a single compile-once / link-once pass. This
@@ -84,6 +88,8 @@ OWNED_EXIT_MATCH = 1
 OWNED_TIMEOUT_SECONDS = 120
 OWNED_RUN_MARKER = "run: cargo test --test"
 # Always applied with fullmatch: `$` would also pass a trailing newline.
+LIST_ARGS = ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", "-z")
+LISTING_DEFECT_PREFIX = "changed-path listing defect: "
 TEST_STEM_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 CONTROL_LOW = 0x20
 CONTROL_DEL = 0x7F
@@ -251,6 +257,35 @@ def run_git(*args):
         ["git"] + list(args), check=False, capture_output=True, text=True)
 
 
+def run_git_raw(*args):
+    """Run git and return raw bytes (no text decoding, no newline translation)."""
+    return subprocess.run(["git"] + list(args), check=False, capture_output=True)
+
+
+def parse_path_listing(raw):
+    """Parse NUL-separated git name-only output (bytes) into (paths, defect).
+
+    Paths are unquoted (core.quotePath=false) so the stem validation sees the real name (#8077 O1).
+    A decode error, an empty path, or any path holding a control character (LF, CR, NUL and the rest) is a defect.
+    """
+    if not raw:
+        return [], None
+    if not raw.endswith(b"\0"):
+        return [], "listing is not NUL-terminated"
+    paths = []
+    for chunk in raw[:-1].split(b"\0"):
+        try:
+            path = chunk.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            return [], "path is not valid UTF-8 (%s)" % exc.reason
+        if not path:
+            return [], "empty path in listing"
+        if any(_is_control(char) for char in path):
+            return [], "path with a control character: %r" % path
+        paths.append(path)
+    return paths, None
+
+
 def _is_control(char):
     code = ord(char)
     return code < CONTROL_LOW or CONTROL_DEL <= code <= CONTROL_C1_HIGH
@@ -378,10 +413,6 @@ def run_self_test():
     return EXIT_OK if counts["fail"] == 0 else EXIT_FAIL
 
 
-def split_lines(text):
-    return [line for line in text.split("\n") if line]
-
-
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="test_impact.py",
@@ -413,24 +444,31 @@ def main(argv):
     # #1611 - a git FAILURE must fall back to the FULL suite, not masquerade
     # as an empty diff. Both paths of renames are shown (--no-renames) so a
     # security file moved into docs cannot hide behind the docs-only rule.
-    diff = run_git("diff", "--no-renames", "--name-only", base, head)
+    diff = run_git_raw(*LIST_ARGS, base, head)
     if diff.returncode != 0:
         note("git diff %s..%s FAILED - running FULL suite" % (base, head))
         emit_all("git-diff-failed")
         return EXIT_OK
-    diff_out = diff.stdout.rstrip("\n")
-    foundational_diff = diff_out
+    changed, defect = parse_path_listing(diff.stdout)
+    if defect is not None:
+        note("changed-path listing defect - running FULL suite: %s" % defect)
+        emit_all(LISTING_DEFECT_PREFIX + defect)
+        return EXIT_OK
+    foundational_paths = list(changed)
     if foundational_base != base:
-        pr_diff = run_git("diff", "--no-renames", "--name-only", foundational_base, head)
+        pr_diff = run_git_raw(*LIST_ARGS, foundational_base, head)
         if pr_diff.returncode != 0:
             note("foundational diff failed - running FULL suite")
             emit_all("foundational-diff-failed")
             return EXIT_OK
         # Retain incremental paths too: reverting a security change still
         # needs full validation even if it vanishes from the net PR diff.
-        foundational_diff = diff_out + "\n" + pr_diff.stdout.rstrip("\n")
-
-    changed = split_lines(diff_out)
+        pr_paths, defect = parse_path_listing(pr_diff.stdout)
+        if defect is not None:
+            note("foundational changed-path listing defect - running FULL suite: %s" % defect)
+            emit_all(LISTING_DEFECT_PREFIX + defect)
+            return EXIT_OK
+        foundational_paths = foundational_paths + pr_paths
     if not changed:
         note("no diff vs base - treating as docs-only no-op")
         emit(KEY_IMPACT, VALUE_SKIP)
@@ -446,7 +484,7 @@ def main(argv):
         emit(KEY_REASON, "docs-only")
         return EXIT_OK
 
-    for path in foundational_diff.split("\n"):
+    for path in foundational_paths:
         if is_foundational(path):
             note("foundational change detected (%s) - running FULL suite" % path)
             emit_all("foundational:%s" % path)

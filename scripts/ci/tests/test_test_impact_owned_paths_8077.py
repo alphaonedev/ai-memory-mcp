@@ -23,6 +23,8 @@ STUB_PRINT = 'import sys\nprint("p  m  run: cargo test --test %s")\nsys.exit(1)\
 STUB_SLEEP = "import time\ntime.sleep(30)\n"
 SHORT_TIMEOUT = 1
 STUB_RAW = "import sys\nsys.stdout.buffer.write(%r)\nsys.exit(1)\n"
+STUB_PIN_BODY = 'const M: &str = include_str!("fixtures/wake_manifest.json");\n'
+LISTING_DEFECT = "changed-path listing defect: "
 DEFECT_GATE ='import sys\nprint("gate defect: forced by test", file=sys.stderr)\nsys.exit(2)\n'
 
 
@@ -159,6 +161,64 @@ class OwnedPathsSelectionTest(unittest.TestCase):
             self.assertRegex(line, r"\A[a-z_]+=[^\r\n]*\Z")
         result = dict(line.split("=", 1) for line in raw.splitlines())
         self.assertTrue(result["test_impact_reason"].startswith("test-impact stem defect: "), result)
+
+    def select_raw(self):
+        subprocess.run([sys.executable, "-I", str(SELECTOR), self.base, "HEAD"], cwd=str(self.repo),
+                       env=self.env, check=True, capture_output=True, text=True)
+        raw = (self.repo / "output").read_bytes().decode("utf-8")
+        for line in raw.split("\n")[:-1]:
+            self.assertRegex(line, r"\A[a-z_]+=[^\r\n]*\Z")
+        return raw, dict(line.split("=", 1) for line in raw.splitlines())
+
+    def test_direct_change_of_newline_test_path_fails_closed_8077_o1(self):
+        # O1 (a): git quotes this path; the raw NUL-separated listing must reach the fail-closed checks.
+        self.add_test_file("qual_nl\n.rs")
+        self.commit({"tests/qual_nl\n.rs": "// changed\n"})
+        raw, result = self.select_raw()
+        self.assertEqual(result["test_impact"], "__ALL__")
+        self.assertIn("qual_nl", result["test_impact_reason"])
+        self.assertTrue(result["test_impact_reason"].startswith(LISTING_DEFECT), result)
+        self.assertNotIn("\r", raw)
+
+    def test_direct_change_of_carriage_return_test_path_fails_closed_8077_o1(self):
+        # O1 (b)
+        self.add_test_file("x\ry.rs")
+        self.commit({"tests/x\ry.rs": "// changed\n"})
+        _raw, result = self.select_raw()
+        self.assertEqual(result["test_impact"], "__ALL__")
+        self.assertIn("x", result["test_impact_reason"])
+
+    def test_direct_change_of_normal_test_still_selects_exactly_that_stem(self):
+        # O1 (c): the fix must not widen the normal case.
+        self.commit({"tests/%s.rs" % PIN: STUB_PIN_BODY + "// changed\n"})
+        _raw, result = self.select_raw()
+        self.assertIn(PIN, result["test_impact"].split(), result)
+        self.assertNotEqual(result["test_impact"], "__ALL__")
+        self.assertNotIn("listing defect", result["test_impact_reason"])
+
+    def test_control_character_in_non_test_path_fails_closed_8077_o1(self):
+        # O1 (d)
+        self.commit({"src/a\x0bb.rs": "// x\n"})
+        _raw, result = self.select_raw()
+        self.assertEqual(result["test_impact"], "__ALL__")
+        self.assertTrue(result["test_impact_reason"].startswith(LISTING_DEFECT), result)
+
+    def test_non_ascii_utf8_path_is_listed_raw_8077_o1(self):
+        # O1 (e): core.quotePath=false keeps the name readable; it is not rejected and does not widen.
+        self.commit({"docs/r\u00e9sum\u00e9.md": "x\n"})
+        _raw, result = self.select_raw()
+        self.assertNotEqual(result["test_impact"], "__ALL__")
+        self.assertNotIn("listing defect", result["test_impact_reason"])
+
+    def test_parse_path_listing_defects_8077_o1(self):
+        spec = importlib.util.spec_from_file_location("test_impact_under_test", str(SELECTOR))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(mod.parse_path_listing(b""), ([], None))
+        self.assertEqual(mod.parse_path_listing(b"a/b.rs\0c.md\0"), (["a/b.rs", "c.md"], None))
+        for raw in (b"a\0\0", b"\xff\0", b"a\nb\0", b"a\rb\0", b"a"):
+            with self.subTest(raw=raw):
+                self.assertIsNotNone(mod.parse_path_listing(raw)[1])
 
     def test_rust_derived_invalid_stem_fails_closed(self):
         # S5: the validation of stems derived from tests/*.rs is live (names the stem).

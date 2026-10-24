@@ -108,6 +108,14 @@ class ParityTest(unittest.TestCase):
                 for key in KEYS:
                     self.assertEqual(shell[key], py[key], key)
 
+    def test_no_case_has_control_character_path(self):
+        # O1: the retired shell copy quotes a control-character path and fails open (narrow selection); the
+        # Python selector lists raw NUL-separated paths and fails closed, so those paths are not parity cases.
+        for name, commits in CASES.items():
+            for files in commits:
+                for path in files:
+                    self.assertFalse(any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path), name)
+
     def test_no_case_touches_selector_paths(self):
         for name, commits in CASES.items():
             for files in commits:
