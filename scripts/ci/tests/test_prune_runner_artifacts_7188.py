@@ -25,6 +25,7 @@ REPO = Path(__file__).resolve().parents[3]
 SCRATCH = REPO / ".local-runs" / "prune-7188"
 # A real directory that resolves to one path component on Linux and macOS.
 SINGLE_COMPONENT_ROOT = "/usr"
+MIN_COMPONENT_ROOT = "/usr/bin"
 sys.path.insert(0, str(REPO / "scripts" / "ci"))
 import prune_runner_artifacts as prune  # noqa: E402
 
@@ -187,6 +188,14 @@ class Arguments(Fixture):
         self.assertEqual(rc, prune.EXIT_USAGE)
         self.assertIn("fewer than %d path components" % prune.MIN_WORK_ROOT_COMPONENTS, err)
         self.assertTrue(self.old_tmp.exists())
+
+    def test_work_root_with_exactly_the_minimum_components_is_accepted(self):
+        """#8213: the floor is inclusive; `<` turned into `<=` would refuse a root of exactly two components."""
+        self.assertEqual(len(Path(MIN_COMPONENT_ROOT).parts) - 1, prune.MIN_WORK_ROOT_COMPONENTS)
+        reason = prune.validate_arguments(MIN_COMPONENT_ROOT, MIN_COMPONENT_ROOT + "/x", "/opt/ci-cargo-target")
+        self.assertIsNone(reason)
+        reason = prune.validate_arguments(SINGLE_COMPONENT_ROOT, SINGLE_COMPONENT_ROOT + "/x", "/opt/ci-cargo-target")
+        self.assertIn("fewer than", reason)
 
     def test_relative_shared_target_is_refused(self):
         rc, _ = self.run_with(shared="cargo-target")
