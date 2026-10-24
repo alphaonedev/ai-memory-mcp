@@ -343,6 +343,11 @@ artifact itself. The PG 16 / AGE 1.6.0 combination in
 > v1.0.0 GA is certified on PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.7
 > (operator directive). Both fleet nodes serve this triple; the SSOT pins below
 > were advanced from the 0.8.6 patch.
+>
+> The hash-pinned v1.0.0 declaration (docs/compliance/v1.0.0-DECLARATION.md,
+> registered revision 1) keeps its pgvector 0.8.6 label: its acceptance targets
+> apply unchanged to pgvector 0.8.7, a patch-level upgrade that revises no target,
+> so the declaration is not re-registered.
 
 > **Cross-lane pgvector pin — reconciled ([#2872](https://github.com/alphaonedev/ai-memory-mcp/issues/2872)).**
 > Both certified provisioning SSOTs now pin pgvector **0.8.7**:

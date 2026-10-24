@@ -6,6 +6,10 @@
 pgvector 0.8.7 (PostgreSQL 18.6 and Apache AGE 1.8.0 unchanged). Reason: operator-set
 certified stack, "certified PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.7 => ai-memory
 v1.0.0 GA release" (tracked in #8228). Revision 4.2 named pgvector 0.8.6 in §0.1.
+The hash-pinned v1.0.0 declaration (docs/compliance/v1.0.0-DECLARATION.md, registered
+revision 1) keeps its pgvector 0.8.6 label: its acceptance targets apply unchanged to
+pgvector 0.8.7, a patch-level upgrade that revises no target, so the declaration is not
+re-registered.
 **Status:** NORMATIVE for the v1.0.0 certification decision. Supersedes Phase 6
 ("release and adoption decision") of `GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md` and
 prepends a scope-and-envelope section that plan lacked. Phases 1–5 of that plan remain
