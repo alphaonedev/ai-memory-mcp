@@ -43,7 +43,43 @@ URL_REF = re.compile(r"\$\{?(?:url_file|base_url|new_url|head|q|AI_MEMORY_TEST_P
                      r"|\b(?:base_url|new_url)\s*=")
 EXPORTS = re.compile(r"^(?:export|declare\s+-\S*x|typeset\s+-\S*x|readonly)\b(.*)$")
 URL_NAMES = re.compile(r"\b(?:url_file|base_url|new_url|head|q)\b")
-ENV_DUMP = re.compile(r"(?:^|[;&|(]\s*)(?:env|printenv|compgen\s+-[vA]|(?:export|declare|typeset)\s+-p|set)\s*(?:$|[;&|)])")
+ENV_COMMANDS = frozenset(("env", "printenv", "typeset", "declare", "export", "set", "compgen"))
+PREFIX_WORDS = frozenset(("if", "elif", "while", "until", "then", "do", "else", "!", "exec", "command", "time",
+                          "nohup", "sudo", "builtin", "{", "[", "[["))
+SEPARATORS = re.compile(r"\$\(|`|;;|&&|\|\||[;&|()\n]")
+STEP_PREFIX = re.compile(r"^(?:-\s+)?run:\s*")
+INTERPRETER = re.compile(r"^(?:python[\d.]*|perl|node|nodejs|ruby|php|lua)$")
+INTERPRETER_ENV = re.compile(r"os\.environ|os\.getenv|\bENV\b|process\.env|getenv|\$_ENV")
+PROC_ENVIRON = re.compile(r"/proc/.*environ")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def command_words(line):
+    """The first real word of every simple command in one shell line (quotes dropped, prefixes skipped)."""
+    stripped = STEP_PREFIX.sub("", line.strip()).replace("'", " ").replace('"', " ")
+    found = []
+    for part in SEPARATORS.split(stripped):
+        words = part.split()
+        while words and (words[0] in PREFIX_WORDS or ASSIGNMENT.match(words[0])):
+            words = words[1:]
+        if words:
+            found.append(words)
+    return found
+
+
+def dumps_environment(line):
+    """True when one shell line can print the process environment: env tools, /proc environ, interpreter dumps."""
+    if PROC_ENVIRON.search(line):
+        return True
+    for words in command_words(line):
+        name = words[0].rsplit("/", 1)[-1]
+        if name in ("env", "printenv", "compgen"):
+            return True
+        if name in ENV_COMMANDS and (len(words) == 1 or words[1] == "-p" or "-p" in words[1:2]):
+            return True
+        if INTERPRETER.match(name) and INTERPRETER_ENV.search(line):
+            return True
+    return False
 XTRACE = re.compile(r"\bset\s+-\S*x|\bset\s+-o\s+xtrace\b|\bBASH_XTRACEFD\b|\bPS4\b")
 # The reviewed lines (configure step, then cleanup step) that name the URL file or the tier URL.
 URL_LINES = frozenset((
@@ -182,7 +218,7 @@ def url_leaks(text):
             exported = EXPORTS.match(s)
             if exported and URL_NAMES.search(exported.group(1)):
                 found.append(f"{name}: a line exports the tier URL: {s[:60]}")
-            if ENV_DUMP.search(s):
+            if dumps_environment(s):
                 found.append(f"{name}: a line dumps the environment: {s[:60]}")
             if XTRACE.search(s):
                 found.append(f"{name}: a line traces the shell: {s[:60]}")
@@ -437,7 +473,7 @@ def workflow_problems(text):
     for line in lines:
         if re.search(r"AI_MEMORY_TEST_(?:POSTGRES|AGE)_URL=", line):
             problems.append("URL written to GITHUB_ENV by hand: " + line[:60])
-        if ENV_DUMP.search(line):
+        if dumps_environment(line):
             problems.append("a line dumps the environment: " + line[:60])
         if XTRACE.search(line):
             problems.append("a line traces the shell: " + line[:60])
