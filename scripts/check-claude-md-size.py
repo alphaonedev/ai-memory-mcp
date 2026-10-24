@@ -2186,7 +2186,7 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
         if old:
             target.write_text(good.replace(old, new, 1), encoding="utf-8")
         try:
-            res = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(live)], capture_output=True,
+            res = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), str(live)], capture_output=True,
                                  text=True, check=False, timeout=300)
             rc, stream = res.returncode, (res.stdout if want_rc == 0 else res.stderr)
         except (OSError, subprocess.SubprocessError) as exc:
