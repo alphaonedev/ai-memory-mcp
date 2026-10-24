@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tier_yaml_8187 as ty  # noqa: E402  (an ImportError here names scripts/test/requirements-ci.txt)
@@ -1915,6 +1916,30 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         self.assertEqual(sorted(entry["workflow_keys"]), sorted(k for k in data if k != "jobs"))
         self.assertEqual(entry["workflow_keys"], ty.build_pins(data)["workflow_keys"])
         self.assertEqual(sorted(entry["jobs"]), ["lifetime-tests"])
+
+    def test_the_pin_loader_and_module_docstrings_name_every_section_8187_f23(self):
+        keys = json.loads(JOB_PINS_FILE.read_text(encoding="utf-8")).keys()
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertIn(key, load_job_pins.__doc__)
+        for label, text in (("test module", " ".join((__doc__ or "").split())),
+                            ("tier_yaml_8187", " ".join(
+                                Path(ty.__file__).read_text(encoding="utf-8").replace("# ", " ").split()))):
+            with self.subTest(text=label):
+                self.assertIn("the exempt job and every workflow-level key except ``jobs`` of its workflow", text)
+
+    def test_both_workflow_key_comparisons_use_one_shared_helper_8187_f23(self):
+        module = sys.modules[__name__]
+        self.assertTrue(callable(getattr(module, "workflow_key_problems", None)))
+        sentinel = ["SHARED-HELPER-CALLED"]
+        exempt_name = "session-boot-lifetime.yml"
+        exempt_text = (WORKFLOWS / exempt_name).read_text(encoding="utf-8")
+        text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        with unittest.mock.patch.object(module, "workflow_key_problems", return_value=sentinel):
+            exempt = exempt_workflow_key_problems(exempt_name, exempt_text, self.pins)
+            primary = primary_pin_problems("ci.yml", text, self.pins[PRIMARY])
+        self.assertIn(sentinel[0], exempt)
+        self.assertIn(sentinel[0], primary)
 
     def test_hosted_labels_and_non_tier_edits_are_not_flagged(self):
         text = self.texts["ci.yml"]
