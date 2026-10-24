@@ -422,6 +422,8 @@ for input/output or usage errors. The exact assignment
 other numbers on the same line still count. Review evidence may legitimately
 include IDs, so this is not a blanket requirement for all PR bodies.
 
+Every PR must also satisfy the Zero Shipped Defects policy in [ENGINEERING_STANDARDS.md section 8](ENGINEERING_STANDARDS.html).
+
 ### 8.3 Draft vs. ready
 
 - **Trivial / Standard:** open as ready for review.

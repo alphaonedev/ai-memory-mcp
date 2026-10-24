@@ -448,6 +448,7 @@ Before tagging a release:
 | Contributing guide | `CONTRIBUTING.md` |
 | AI Developer Workflow | `docs/AI_DEVELOPER_WORKFLOW.md` |
 | AI Developer Governance Standard | `docs/AI_DEVELOPER_GOVERNANCE.md` |
+| Zero Shipped Defects policy | section 8 of this document |
 | CLA | `CLA.md` |
 | LICENSE | `LICENSE` |
 | NOTICE | `NOTICE` |
@@ -596,3 +597,50 @@ LaunchAgent plist toggles the daemon's run-state automatically.
 Full operator guide:
 [`alphaonedev/agentic-mem-labs/tools/campaign/README.md`](https://github.com/alphaonedev/agentic-mem-labs/blob/main/tools/campaign/README.md)
 (Apache 2.0 © AlphaOne LLC).
+
+---
+
+## 8. Zero Shipped Defects (operator policy, 2026-10-24)
+
+Zero defects on first write is not a promise anyone can keep. Zero defects
+SHIPPED is a process property, and this section is that process. It binds
+every agent and every PR into the chain and release branches. Each rule names
+its check.
+
+- **R1. Prove before claiming.** Every fix lands with a red-first regression
+  test that fails on the pre-fix code and passes on the fix. The PR body quotes
+  the red result line at base and the green line at tip. No proof, no landing
+  (ties to C4). Check: both result lines present in the PR body.
+- **R2. Two independent reviews before landing.** A change to `src/`
+  (non-test), the SDKs, Dockerfiles, `deploy/`, migrations or
+  `.github/workflows` needs an exact-head code review and a separate
+  exact-head security review, both LAND. Test-only, docs-only and
+  Python-tooling PRs take one code review with the security lens folded in.
+  Every finding is filed (umbrella-aware) and fixed, or explicitly waived in
+  writing, before merge. Check: the verdict files name the PR head SHA.
+- **R3. Fix by class, then lock the class.** A finding that shares a root cause
+  or fix surface with others is tracked as an umbrella. The umbrella closes
+  only when a root-cause fix AND a ratchet guard (a checker, invariant test or
+  gate that fails if the class returns) have landed. Existing examples:
+  `scripts/ci/check_test_env_mutation.py` (#8168 class) and
+  `scripts/ci/check_pg_isolate_invariants.py` (#8167 / #6383 class). Check: the
+  umbrella close comment links both the fix and the guard.
+- **R4. Honest CI.** A red check is never rerun to pass without first
+  classifying it: PR-caused, known class with an umbrella item, or new class
+  with a new item filed. A rerun is allowed only for a superseded run, a
+  queued-job expiry, or a classified known class whose fix PR is named in the
+  rerun note. Shared-state test infrastructure runs isolated by default
+  (per-binary Postgres isolation on the enterprise-fed tier; kill switch
+  `CI_PG_ISOLATE_OFF`). Check: every rerun carries a classification note.
+- **R5. Land on evidence, close with a URL.** A PR lands only on green required
+  checks plus LAND verdicts. Every linked issue is closed with a comment that
+  cites the merge SHA, the retest evidence line and the review verdict file,
+  and the close-comment URL is reported (C2). Check: the URL resolves.
+- **R6. Hold the line.** The open-defect count may rise only from newly
+  discovered defects, never from regressions of a locked class. A regression of
+  a locked class is a HIGH, reopens the umbrella and blocks the carrier until
+  the guard is strengthened. Check: the umbrella state after each landing.
+
+**Done definition for a release.** Every milestone issue is closed with a URL,
+every required check is green on the release tip, and the dashboard gates are
+all green. The operator alone cuts the tag.
