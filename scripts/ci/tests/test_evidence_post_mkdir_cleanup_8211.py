@@ -31,17 +31,19 @@ class PostMkdirCleanup8211(ScratchCase):
 
     def run_cert_failure(self, plant):
         run_cert = load("run_cert")
-        scratch_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
-        self.addCleanup(os.close, scratch_fd)
 
         def failing(name, *, dir_fd=None):
             if plant:
                 self.swap_for_symlink(name, dir_fd)
             raise OSError(errno.EMFILE, "injected descriptor exhaustion")
 
-        with mock.patch.object(run_cert, "open_scratch", side_effect=failing):
-            with self.assertRaises((OSError, run_cert.ConfigError)):
-                run_cert.Run.private_directory(scratch_fd, "child-")
+        scratch_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with mock.patch.object(run_cert, "open_scratch", side_effect=failing):
+                with self.assertRaises((OSError, run_cert.ConfigError)):
+                    run_cert.Run.private_directory(scratch_fd, "child-")
+        finally:
+            os.close(scratch_fd)
 
     def test_run_cert_removes_the_empty_directory_after_a_post_mkdir_failure_8211(self):
         self.run_cert_failure(plant=False)
@@ -63,13 +65,14 @@ class PostMkdirCleanup8211(ScratchCase):
         real_open = os.open
         fired = []
 
-        def failing(path, flags, mode=0o777, *, dir_fd=None):
+        def failing(path, *args, **kw):
+            dir_fd = kw.get("dir_fd")
             if not fired and dir_fd is not None and str(path).startswith(wanted):
                 fired.append(path)
                 if plant:
                     self.swap_for_symlink(str(path), dir_fd)
                 raise OSError(errno.EMFILE, "injected descriptor exhaustion")
-            return real_open(path, flags, mode, dir_fd=dir_fd)
+            return real_open(path, *args, **kw)
 
         with mock.patch.object(os, "open", side_effect=failing):
             with self.assertRaises(bb.Fatal):
