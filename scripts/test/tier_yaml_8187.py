@@ -42,7 +42,6 @@ EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
 EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
 URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]*@")
 HOSTED_LABEL = re.compile(r"^(?:ubuntu|macos|windows)-(?:latest|\d+(?:\.\d+)?)(?:-(?:arm|arm64|xlarge|large|intel))*$")
-MATRIX_REF = re.compile(r"^\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$")
 LOCAL_USES = re.compile(r"^\./")
 
 
@@ -246,54 +245,176 @@ def first_difference(pinned, job):
     return None, "job"
 
 
-def runs_on_labels(job, matrix_lookup=True):
-    """The labels in a job's ``runs-on`` as a list, or None when the value is an expression that cannot be resolved.
+EXPRESSION = "${{"
 
-    A ``${{ matrix.KEY }}`` reference is resolved from the job's ``strategy.matrix.KEY`` list; any other expression,
-    a ``group`` or ``labels`` mapping with expressions, or a missing key returns None (fail closed).
+
+def runs_on_labels(job):
+    """The labels in a job's ``runs-on`` as a list, or None when they cannot be read as plain strings (r10 option C).
+
+    No expression is resolved: ``${{`` anywhere in ``runs-on`` (scalar, list element or mapping value) returns None,
+    a mapping with any key other than ``labels`` (a ``group``) returns None, a non-string element returns None, and so
+    does an empty list.  A job whose label is chosen from a matrix is green only through an exact ``RUNS_ON_EXEMPT`` row.
     """
     value = job.get("runs-on") if isinstance(job, dict) else None
     if isinstance(value, dict):
-        value = value.get("labels", value.get("group"))
+        if set(value) != {"labels"}:
+            return None
+        value = value["labels"]
     items = value if isinstance(value, list) else [value]
     labels = []
     for item in items:
-        if not isinstance(item, str):
+        if not isinstance(item, str) or EXPRESSION in item:
             return None
-        ref = MATRIX_REF.match(item.strip())
-        if ref and matrix_lookup:
-            matrix = ((job.get("strategy") or {}).get("matrix") or {}) if isinstance(job.get("strategy"), dict) else {}
-            options = []
-            if isinstance(matrix, dict):
-                listed = matrix.get(ref.group(1))
-                options.extend(listed if isinstance(listed, list) else [])
-                include = matrix.get("include")
-                options.extend(entry.get(ref.group(1)) for entry in (include if isinstance(include, list) else [])
-                               if isinstance(entry, dict) and ref.group(1) in entry)
-            if not options or not all(isinstance(o, str) for o in options):
-                return None
-            labels.extend(options)
-        elif "${{" in item:
-            return None
+        labels.append(item.strip())
+    return labels or None
+
+
+# (workflow, job) -> (reason, the exact ``runs-on`` string, the set of label tuples the matrix may imply).  The key is
+# the pair, never the job name alone.  Rows read from the real files: session-boot-lifetime.yml (lifetime-tests) lists
+# `os: ubuntu-latest / runner: '["ubuntu-latest"]'` and `os: macos-fed / runner: '["self-hosted","macos-fed"]'`;
+# ci.yml (mobile-cross-compile) lists `os: macos-latest` and `os: ubuntu-latest`; release.yml (release) lists
+# `os: ubuntu-latest`, `ubuntu-24.04-arm`, `macos-15-intel` and `macos-latest`.  lifetime-tests is the only row that
+# may name a self-hosted tuple: the macOS fleet runner holds the at-rest tier URL file like linux-fed does, so that
+# job's steps are pinned in the exempt_jobs section of tier_export_job_pins_8187.json (F20); the residual is #6181.
+RUNS_ON_EXEMPT = {
+    ("session-boot-lifetime.yml", "lifetime-tests"): (
+        "matrix leg on the macOS fleet runner; no tier credential, steps pinned (F20)",
+        "${{ fromJSON(matrix.runner) }}",
+        frozenset({("ubuntu-latest",), ("self-hosted", "macos-fed")}),
+    ),
+    ("ci.yml", "mobile-cross-compile"): (
+        "iOS and Android cross-compile on GitHub-hosted images",
+        "${{ matrix.os }}",
+        frozenset({("macos-latest",), ("ubuntu-latest",)}),
+    ),
+    ("release.yml", "release"): (
+        "release builds on GitHub-hosted images",
+        "${{ matrix.os }}",
+        frozenset({("ubuntu-latest",), ("ubuntu-24.04-arm",), ("macos-15-intel",), ("macos-latest",)}),
+    ),
+}
+# the matrix field each pinned ``runs-on`` string reads, and whether its values are JSON label lists
+RUNS_ON_FORMS = {"${{ matrix.os }}": ("os", False), "${{ fromJSON(matrix.runner) }}": ("runner", True)}
+
+
+def plain_scalar(value):
+    """True for a string without an expression, a number or a bool (a nested list, a mapping or null is not)."""
+    if isinstance(value, str):
+        return EXPRESSION not in value
+    return isinstance(value, (int, float))
+
+
+def matrix_values(matrix, field):
+    """``(values of FIELD over every leg, None)`` for a strictly parsed matrix, or ``(None, why)``.
+
+    The matrix is a mapping of keys to non-empty lists of plain scalars, with an optional ``include`` list of flat
+    mappings of plain scalars and no ``exclude``.  An expression, a nested list or mapping, a non-mapping include
+    entry, or an include leg that cannot take FIELD from the top level is refused.
+    """
+    if not isinstance(matrix, dict) or not matrix:
+        return None, "strategy.matrix is not a mapping"
+    if "exclude" in matrix:
+        return None, "strategy.matrix.exclude is present"
+    for key, value in matrix.items():
+        if not isinstance(key, str) or EXPRESSION in key:
+            return None, "a matrix key is not a plain string"
+        if key == "include":
+            continue
+        if not isinstance(value, list) or not value or not all(plain_scalar(item) for item in value):
+            return None, "matrix.%s is not a list of plain scalars" % key
+    include = matrix.get("include", [])
+    if not isinstance(include, list):
+        return None, "matrix.include is not a list"
+    values = list(matrix.get(field, []))
+    for entry in include:
+        if not isinstance(entry, dict) or not entry:
+            return None, "a matrix.include entry is not a flat mapping"
+        if not all(isinstance(key, str) and EXPRESSION not in key and plain_scalar(value) for key, value in entry.items()):
+            return None, "a matrix.include entry holds an expression, a nested value or a non-string key"
+        if field in entry:
+            values.append(entry[field])
+        elif field not in matrix:
+            return None, "a matrix.include leg has no %s" % field
+    return (values, None) if values else (None, "the matrix has no legs")
+
+
+def label_tuples(values, as_json):
+    """``(set of label tuples, None)`` from the matrix values (plain strings, or JSON label lists), else ``(None, why)``."""
+    found = set()
+    for value in values:
+        if not isinstance(value, str):
+            return None, "a runner value is not a string"
+        if as_json:
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return None, "a runner value is not JSON"
+            if not isinstance(parsed, list) or not parsed or not all(isinstance(item, str) for item in parsed):
+                return None, "a runner value is not a non-empty JSON list of strings"
+            found.add(tuple(parsed))
         else:
-            labels.append(item.strip())
-    return labels
+            found.add((value,))
+    return found, None
+
+
+def exemption_problem(row, job):
+    """Why a job no longer fits its ``RUNS_ON_EXEMPT`` row, or None.
+
+    ``runs-on`` must equal the pinned string exactly, the matrix must pass the strict parse, and the label tuples the
+    matrix implies must EQUAL the row's set (a missing, extra or reordered label set is a problem).
+    """
+    reason, pinned, expected = row
+    if not isinstance(job, dict) or job.get("runs-on") != pinned:
+        return "runs-on is not the pinned string"
+    form = RUNS_ON_FORMS.get(pinned)
+    if form is None:
+        return "the row names a runs-on form this check does not read"
+    strategy = job.get("strategy")
+    values, why = matrix_values(strategy.get("matrix") if isinstance(strategy, dict) else None, form[0])
+    if why:
+        return why
+    found, why = label_tuples(values, form[1])
+    if why:
+        return why
+    if found != expected:
+        return "the label sets the matrix implies differ from the pinned sets"
+    return None
+
+
+def runner_problem(workflow, name, job):
+    """None, or why the job's runner is not provably GitHub-hosted: only a plain hosted label or an exact row passes."""
+    row = RUNS_ON_EXEMPT.get((workflow, name))
+    if row is not None:
+        why = exemption_problem(row, job)
+        return None if why is None else "the runs-on exemption no longer fits (%s)" % why
+    labels = runs_on_labels(job)
+    if labels is None:
+        return ("runs-on cannot be read as plain labels (an expression, a group or a non-string); only an exact "
+                "exemption row may use one")
+    if any(not HOSTED_LABEL.match(label) for label in labels):
+        return "runs-on names a label that is not GitHub-hosted; only a pinned tier job or an exemption row may"
+    return None
+
+
+def stale_row_problems(workflow, data):
+    """Problems for the ``RUNS_ON_EXEMPT`` rows of ``workflow`` whose job is not in the loaded workflow."""
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    return ["%s job %s: stale exemption row (the job is gone from the workflow)" % (workflow, name)
+            for (wf, name) in sorted(RUNS_ON_EXEMPT)
+            if wf == workflow and not (isinstance(jobs, dict) and name in jobs)]
 
 
 def non_tier_runner_problems(workflow, data, tier):
-    """A non-tier job must run on a GitHub-hosted label: ``self-hosted`` or any unresolved label is a problem (F16)."""
+    """A non-tier job must run on a GitHub-hosted label or sit in an exact ``RUNS_ON_EXEMPT`` row (F16, F19)."""
     found = []
     for name, job in data["jobs"].items():
         if name in tier:
             continue
         if isinstance(job, dict) and "uses" in job and "runs-on" not in job:
             continue  # a reusable workflow call: its called file is scanned separately
-        labels = runs_on_labels(job)
-        if labels is None:
-            found.append("%s job %s: runs-on is an expression this check cannot resolve to hosted labels" % (workflow, name))
-        elif any(not HOSTED_LABEL.match(label) for label in labels):
-            found.append("%s job %s: a job that is not a tier job names a runner label that is not GitHub-hosted"
-                         % (workflow, name))
+        why = runner_problem(workflow, name, job)
+        if why:
+            found.append("%s job %s: %s" % (workflow, name, why))
     return found
 
 

@@ -25,19 +25,25 @@ Pins over the "Configure enterprise-fed tier" step and the always() cleanup step
   or reusable workflow call in a tier workflow is refused, and a job of the three workflows that is not a tier job
   must run on a GitHub-hosted label.  Every other workflow file gets the same rule: one that PyYAML refuses, one
   whose ``jobs`` is missing or not a mapping, and any job-level ``uses:`` (local or remote reusable call, which is
-  not followed) is a problem, and the one self-hosted exemption (session-boot-lifetime ``lifetime-tests``) is bound
-  to its job name AND its exact runner label sets.
+  not followed) is a problem.  ``runs_on_labels`` resolves NO expression (3-agent vote (6def5ab6), option C): ``${{``
+  anywhere in ``runs-on``, a mapping with a key other than ``labels`` or a non-string element yields None, which both
+  consumers treat as a problem.  The only green path for a matrix job is an exact row of ``RUNS_ON_EXEMPT``, keyed by
+  ``(workflow, job)``: the pinned ``runs-on`` string, a strict matrix parse (lists of plain scalars, an optional flat
+  ``include``, no ``exclude``, no expression) and label tuples EQUAL to the row's set.  A row whose job is gone is stale.
+  The one row that may name a self-hosted tuple (session-boot-lifetime ``lifetime-tests``) also has its whole job pinned
+  as canonical JSON in the ``exempt_jobs`` section, so a step edit needs ``--write-pins``.
 
 The job ``tier-credential-pins`` in ci.yml runs this module and the two other tier modules on every PR (before r8
 no CI job ran them).  Obligation: any edit of a tier job or of a workflow-level key of the three workflows, and any
 added or removed job, needs ``python3 scripts/test/test_ci_tier_password_check_6181.py --write-pins`` in the same
-PR (it regenerates both sections; the diff of the data file is what a reviewer reads).  Failure messages name the
+PR (it regenerates all three sections, primary, secondary_text and exempt_jobs;the diff of the data file is what a reviewer reads).  Failure messages name the
 workflow, job, step index, step name or id and the first differing key path, and mask ``scheme://user:pass@``.
 
 Residual (documented, #8187 umbrella item): the URL file is provisioned by the operator in the runner user's home
-and stays there between jobs.  No check in this repository can stop another job of that runner, which runs as the
-same user, from reading it; the checks here keep this repository's own jobs from doing so.  Rotating the password
-is the operator item #6181.
+and stays there between jobs, on both self-hosted runner classes (linux-fed and macos-fed).  Code run there by the
+pinned tier jobs or by the pinned exempt job ``lifetime-tests`` can read it, and no check in this repository can stop
+that: the checks here pin which jobs, steps and labels this repository's workflows may use on those runners, they do
+not isolate the file.  Closing it needs a per-job credential at the operator's runner, the operator item #6181.
 
 Needs PyYAML (``python3 -m pip install --require-hashes --no-deps -r scripts/test/requirements-ci.txt``); a missing
 module is an import error of this module, never a skip.
@@ -823,33 +829,51 @@ def job_pin_problems(workflow, text, pins=None):
 
 
 
-# Jobs outside the pinned tier jobs that legitimately run on a self-hosted label.  Each entry needs a reason: it does
-# not name the tier credential (checked on the loaded job), and it runs on the other fleet node's macOS runner.
-SELF_HOSTED_ALLOWED = {
-    ("session-boot-lifetime.yml", "lifetime-tests"): (
-        "matrix leg on the macOS fleet runner; no tier credential",
-        frozenset({("ubuntu-latest",), ("self-hosted", "macos-fed")}),
-    ),
-}
-MATRIX_LOOKUP = "${{ fromJSON(matrix.runner) }}"
+# The runs-on exemption table lives in tier_yaml_8187.py (the non-tier runner rule of the pinned workflows reads it too):
+# (workflow, job) -> (reason, pinned runs-on string, frozenset of label tuples).  No expression is resolved anywhere else.
+RUNS_ON_EXEMPT = ty.RUNS_ON_EXEMPT
+exemption_problem = ty.exemption_problem
+EXEMPT = "exempt_jobs"
 
 
-def exemption_problem(allowed, job):
-    """Why a listed self-hosted job no longer fits its exemption, or None: ``runs-on`` must be the matrix lookup and
-    every ``strategy.matrix.include[].runner`` a JSON label list in the allowed set (no other matrix key adds legs)."""
-    if job.get("runs-on") != MATRIX_LOOKUP:
-        return "runs-on is not the pinned matrix lookup"
-    matrix = (job.get("strategy") or {}).get("matrix") if isinstance(job.get("strategy"), dict) else None
-    if not isinstance(matrix, dict) or set(matrix) - {"include"} or not isinstance(matrix.get("include"), list):
-        return "the matrix is not a bare include list"
-    for entry in matrix["include"]:
-        try:
-            labels = tuple(json.loads(entry["runner"]))
-        except (KeyError, TypeError, ValueError):
-            return "a matrix leg has no JSON runner label list"
-        if labels not in allowed:
-            return "a matrix leg uses a label set outside the exemption"
-    return None
+def self_hosted_rows():
+    """The table rows that may name a label that is not GitHub-hosted: their jobs are pinned step by step (F20)."""
+    return sorted(key for key, (_why, _pinned, label_sets) in RUNS_ON_EXEMPT.items()
+                  if any(not ty.HOSTED_LABEL.match(label) for labels in label_sets for label in labels))
+
+
+def exempt_pins(root=None):
+    """The ``exempt_jobs`` pin section built from the real workflows: ``{workflow: {job: ty.pin_job(job)}}``."""
+    directory = (ROOT if root is None else Path(root)) / ".github" / "workflows"
+    table = {}
+    for workflow, name in self_hosted_rows():
+        data, bad = ty.parse_workflow((directory / workflow).read_text(encoding="utf-8"))
+        if bad or name not in data["jobs"]:
+            sys.exit(f"{workflow}: cannot pin exempt job {name}")
+        table.setdefault(workflow, {})[name] = ty.pin_job(data["jobs"][name])
+    return table
+
+
+def exempt_pin_problems(workflow, name, job, pins):
+    """Problems of one self-hosted exempt job against its canonical-JSON pin (F20): any step or key edit needs
+    ``--write-pins``.  The message names the workflow, job, step index and name and the first differing key path."""
+    entry = ((pins.get(EXEMPT) or {}).get(workflow) or {}).get(name)
+    if entry is None:
+        return [f"{workflow} job {name}: a self-hosted exempt job has no job pin"]
+    if ty.digest(job) == entry["sha256"]:
+        return []
+    index, path = ty.first_difference(entry, job)
+    return [f"{workflow} job {name} {where_differs(job, index)}: differs from the pin at {path}"]
+
+
+def where_differs(job, index):
+    """``job-level keys`` or ``step N (label)`` for a first-difference index of a loaded job."""
+    steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    if index is None:
+        return "job-level keys"
+    if index < len(steps):
+        return f"step {index} ({ty.step_label(steps[index], index)})"
+    return f"step {index} (removed)"
 
 
 def primary_pin_problems(workflow, text, primary):
@@ -882,14 +906,7 @@ def primary_pin_problems(workflow, text, primary):
             problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
         elif ty.digest(jobs[name]) != pinned["sha256"]:
             index, path = ty.first_difference(pinned, jobs[name])
-            steps = jobs[name].get("steps") if isinstance(jobs[name].get("steps"), list) else []
-            if index is None:
-                where = "job-level keys"
-            elif index < len(steps):
-                where = f"step {index} ({ty.step_label(steps[index], index)})"
-            else:
-                where = f"step {index} (removed)"
-            problems.append(f"{workflow} job {name} {where}: differs from the pin at {path}")
+            problems.append(f"{workflow} job {name} {where_differs(jobs[name], index)}: differs from the pin at {path}")
     pinned_keys = entry["workflow_keys"]
     level = {key: ty.digest(value) for key, value in data.items() if key != "jobs"}
     for key in sorted(set(level) | set(pinned_keys)):
@@ -949,16 +966,20 @@ def repo_problems(root=None, pins=None):
                 found.append(f"{name} job {job_name}: a job-level uses (reusable workflow call) is not allowed; "
                              "the called workflow chooses its own runner")
                 continue
-            allowed = SELF_HOSTED_ALLOWED.get((name, job_name))
-            if allowed is not None:
-                why = exemption_problem(allowed[1], job)
-                if why:
-                    found.append(f"{name} job {job_name}: the self-hosted exemption no longer fits ({why})")
-                continue
-            labels = ty.runs_on_labels(job)
-            if labels is None or any(not ty.HOSTED_LABEL.match(label) for label in labels):
-                found.append(f"{name} job {job_name}: runs on a label that is not GitHub-hosted; only a pinned "
-                             "tier job may")
+            why = ty.runner_problem(name, job_name, job)
+            if why:
+                found.append(f"{name} job {job_name}: {why}")
+            if (name, job_name) in self_hosted_rows():
+                found += exempt_pin_problems(name, job_name, job, pins)
+    for workflow in sorted({wf for wf, _job in RUNS_ON_EXEMPT}):
+        target = directory / workflow
+        if not target.is_file():
+            found.append(f"{workflow}: stale exemption rows (the workflow file is gone)")
+            continue
+        try:
+            found += ty.stale_row_problems(workflow, ty.load_lenient(target.read_text(encoding="utf-8")))
+        except ty.yaml.YAMLError:
+            pass  # reported above as an unparsable workflow
     actions = root / ".github" / "actions"
     for path in sorted([*actions.rglob("action.yml"), *actions.rglob("action.yaml")]) if actions.is_dir() else []:
         if names_the_tier(path.read_text(encoding="utf-8")):
@@ -1910,7 +1931,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
 
     def test_the_pin_data_file_is_regenerated_byte_identically(self):
         built = json.dumps({PRIMARY: {wf: ty.build_pins(ty.parse_workflow(t)[0]) for wf, t in self.texts.items()},
-                            SECONDARY: self.pins[SECONDARY]}, indent=1, sort_keys=True) + "\n"
+                            SECONDARY: self.pins[SECONDARY], EXEMPT: exempt_pins()}, indent=1, sort_keys=True) + "\n"
         self.assertEqual(JOB_PINS_FILE.read_text(encoding="utf-8"), built, "run --write-pins and commit the data file")
         outputs = []
         for number in range(2):
@@ -1993,6 +2014,7 @@ def write_pins(out=None):
                                       "pinned": {name: pin_entry(block) for name, block in tier_blocks(found)},
                                       "workflow": {key: pin_entry(block) for key, block in sorted(
                                           workflow_level_blocks(raw).items())}}
+    table[EXEMPT] = exempt_pins()
     target = JOB_PINS_FILE if out is None else Path(out)
     target.write_text(json.dumps(table, indent=1, sort_keys=True) + "\n", encoding="utf-8")
 

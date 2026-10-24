@@ -1,4 +1,46 @@
 {
+ "exempt_jobs": {
+  "session-boot-lifetime.yml": {
+   "lifetime-tests": {
+    "keys": {
+     "name": "b7dce397d1ff1774adede15d63ba5e7fe34bd7238b047de18bc3f4931e18a692",
+     "runs-on": "76d0788ab5fdc4b53e074a0ef0293f49f83b5af110017708e33b1f1ca6b6e576",
+     "steps": "6dc2fc94772bca0658d702fefffbf9cc773646a486c690be3b38ec4e925fc9ef",
+     "strategy": "988f9e5ec3991e2dae8369d742457f4059253d445d632ddf53e7f60c595876a1"
+    },
+    "sha256": "645440142b26541f97a15b1a1efe90115bf56b7a35a2e68724666df8d66e260f",
+    "steps": [
+     {
+      "keys": {
+       "uses": "57215ce366b17a1cadf9c7f20f310eed07fbfdf32c568399c7620a23718feda5"
+      },
+      "sha256": "24360d2db7e779fca88a5e42fee2aac27d3e8c94cc5e745dbecb3dee1ba9ae21"
+     },
+     {
+      "keys": {
+       "uses": "d22b38dd0bb42704674295a2afab9f250a1b0e887f948789ff530e20fcd1fc40"
+      },
+      "sha256": "7e3679b5bcfb715b0a61b6d67d31dce82db2764494b5969151248de69c4e135d"
+     },
+     {
+      "keys": {
+       "if": "ef45d333fc00eb55393706405d4822fe8f31122225f84e3f3dc284d8ffb5eb20",
+       "uses": "b8185b7f84bfad67351b6a10132a045a8136b9ce54aac52bbf379f420ca63756"
+      },
+      "sha256": "26d8746cfeb4c4003bfc1f345479647b73c27ef6c0d6be53856bc49feb716215"
+     },
+     {
+      "keys": {
+       "env": "c2ba482f7dbf659a1cfd92b13a59c4038657c69565f1476650056ff4ba198a57",
+       "name": "1cfd25e6d356a630fb832c82d86b30cce188dce9f71741ec1fcc39bbfd37f5c3",
+       "run": "d66f27a1530ba0be32ec72b29d2634069fc48eb894cb2d2d3d50ce6c126a8662"
+      },
+      "sha256": "72717d09bddaa306809fc44076e40ced0a5ca013e200f2340dc003c404f57fc3"
+     }
+    ]
+   }
+  }
+ },
  "primary": {
   "cert-postgres-age.yml": {
    "job_names": [
