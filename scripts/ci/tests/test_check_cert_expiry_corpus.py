@@ -1558,7 +1558,6 @@ WORKFLOW_COPY_TIMEOUT_S = 600
 
 REASON_LEXER = ("the 6560 lexer is not on the chain tip; the finished design (compiled liveness, "
                 "#6911) rejects a patch that makes the id dead while it stays named once")
-REASON_GENERATOR = "the vendored cert generator exists only on draft PR 7393, not on the chain tip"
 
 
 def repo_text(rel):
@@ -1627,7 +1626,7 @@ GENERATOR_NEEDLES = {
     (r"run_cert.py", r"the gate copy runs under python3 -I"):
         ('\\[sys\\.executable, "-I"',),
     (r"run_cert.py", r"the sweep goes through the directory fd"):
-        (r"def remove_tree\(dfd, name\)", r"dir_fd=dfd",),
+        (r"def remove_tree\(dfd, name\b", r"dir_fd=dfd",),
     (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the AST guard checks tempfile and folds join"):
         (r"TEMPFILE_ALWAYS", r"TMP_ROOTS subscript", r"PATH_JOINS", r"without dir=",),
     (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the posture OSError widening is pinned"):
@@ -2495,7 +2494,7 @@ class Corpus(CorpusBase):
     def case_7581_copy_isolated_mode(self):
         self.generator_file("run_cert.py", "the gate copy runs under python3 -I")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7582_sweep_after_fd_open(self):
         self.generator_file("run_cert.py", "the sweep goes through the directory fd")
 

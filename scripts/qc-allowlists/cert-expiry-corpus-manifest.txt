@@ -67,7 +67,7 @@ case_7532_killed_run_cleanup_flags GREEN
 case_7534_tmp_root_spellings GREEN
 case_7535_ignored_leg_flags GREEN
 case_7581_copy_isolated_mode GREEN
-case_7582_sweep_after_fd_open RED
+case_7582_sweep_after_fd_open GREEN
 case_7583_ast_guard_tempfile_join GREEN
 case_7584_posture_oserror_pin GREEN
 case_7585_realpath_pin GREEN
