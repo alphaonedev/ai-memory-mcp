@@ -22,6 +22,17 @@
 //! anti-vacuity CONTROL — it EXPLAINs the OLD statement on the same corpus and
 //! asserts the old shape really was O(corpus), so cell B cannot pass because
 //! the corpus happened to be empty.
+//!
+//! **Self-provisioning (#8167, #6383 r7).** Cells B and C used to read
+//! `memories` straight off whatever database `AI_MEMORY_TEST_POSTGRES_URL`
+//! named and demanded someone else had already migrated and populated it. A
+//! per-binary isolated clone holds only the `age` and `vector` extensions, so
+//! under isolation the relation does not exist (`42P01`); in shared mode the
+//! test passed only by ordering accident. Each live cell now creates its own
+//! scratch database (never the shared `public` schema, #7101), opens
+//! `PostgresStore` on it so the schema comes from the real migrations, and
+//! seeds the corpus through `MemoryStore::store_batch`. The scratch database
+//! is dropped when the cell ends, so the binary is idempotent.
 
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 
@@ -75,9 +86,16 @@ fn a_pg_health_check_issues_no_corpus_count_2617() {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "sal-postgres")]
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
+#[cfg(feature = "sal-postgres")]
 mod pg {
+    use super::pg_barrier::ScratchDb;
+    use ai_memory::models::{Memory, Tier};
+    use ai_memory::store::postgres::PostgresStore;
+    use ai_memory::store::{CallerContext, MemoryStore};
     use sqlx::Row;
-    use sqlx::postgres::PgPoolOptions;
 
     /// The statement the fixed probe issues (mirrors
     /// `src/store/postgres.rs::health_check`).
@@ -93,15 +111,70 @@ mod pg {
     /// says so instead of passing vacuously.
     const MIN_MEANINGFUL_CORPUS: i64 = 2;
 
-    async fn probe_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
-        match PgPoolOptions::new().max_connections(1).connect(&url).await {
-            Ok(p) => Some(p),
-            Err(e) => {
-                eprintln!("skip: connect failed: {e}");
-                None
-            }
+    /// Name prefix of the per-cell scratch database.
+    const SCRATCH_PREFIX: &str = "ai_memory_2617hp";
+
+    /// Agent id the seed rows are written under.
+    const SEED_AGENT: &str = "ai:pg-health-probe-2617";
+
+    /// Namespace of the seed rows.
+    const SEED_NAMESPACE: &str = "pg-health-probe-2617";
+
+    /// A live cell's private, migrated, seeded database. `store` is declared
+    /// first so its pool closes before the scratch database is dropped.
+    struct Fixture {
+        store: PostgresStore,
+        _scratch: ScratchDb,
+    }
+
+    impl Fixture {
+        fn pool(&self) -> &sqlx::PgPool {
+            self.store.pool()
         }
+    }
+
+    /// One deterministic seed row, unique by index.
+    fn seed_row(index: i64) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: SEED_NAMESPACE.to_string(),
+            title: format!("health probe seed {index}"),
+            content: format!("deterministic seed payload {index}"),
+            source: "pg-health-probe-2617".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Memory::default()
+        }
+    }
+
+    /// Create a scratch database, migrate it through `PostgresStore::connect`
+    /// and, when the corpus is below [`MIN_MEANINGFUL_CORPUS`], seed exactly
+    /// the missing rows in one `store_batch`. `None` when the URL is unset.
+    async fn provision() -> Option<Fixture> {
+        let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
+        let scratch = ScratchDb::create(&url, SCRATCH_PREFIX)
+            .await
+            .expect("create scratch database");
+        let store = PostgresStore::connect(&scratch.url())
+            .await
+            .expect("open PostgresStore on the scratch database (runs the real migrations)");
+        let fixture = Fixture {
+            store,
+            _scratch: scratch,
+        };
+        let have = corpus_size(fixture.pool()).await;
+        if have < MIN_MEANINGFUL_CORPUS {
+            let rows: Vec<Memory> = (have..MIN_MEANINGFUL_CORPUS).map(seed_row).collect();
+            let ctx = CallerContext::for_agent(SEED_AGENT);
+            fixture
+                .store
+                .store_batch(&ctx, &rows)
+                .await
+                .expect("seed the corpus through the store API");
+        }
+        Some(fixture)
     }
 
     /// `EXPLAIN (ANALYZE, FORMAT TEXT)` `sql`, returning the plan text.
@@ -159,18 +232,19 @@ mod pg {
     /// CELL B — the fixed probe touches at most one row, whatever the corpus.
     #[tokio::test]
     async fn b_pg_health_probe_touches_at_most_one_row_2617() {
-        let Some(pool) = probe_pool().await else {
+        let Some(fixture) = provision().await else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        let corpus = corpus_size(&pool).await;
+        let pool = fixture.pool();
+        let corpus = corpus_size(pool).await;
         assert!(
             corpus >= MIN_MEANINGFUL_CORPUS,
             "corpus is {corpus} row(s) — too small for an O(1)-vs-O(corpus) comparison to \
-             mean anything; point AI_MEMORY_TEST_POSTGRES_URL at a populated database"
+             mean anything; the fixture failed to seed the scratch database"
         );
 
-        let plan = explain_analyze(&pool, PROBE_SQL).await;
+        let plan = explain_analyze(pool, PROBE_SQL).await;
         let touched = max_actual_rows(&plan);
         assert!(
             touched <= CONSTANT_COST_ROW_CEILING,
@@ -184,7 +258,7 @@ mod pg {
 
         // The probe still answers, and still answers TRUE about a live store.
         let alive: bool = sqlx::query_scalar(PROBE_SQL)
-            .fetch_one(&pool)
+            .fetch_one(pool)
             .await
             .expect("probe executes");
         assert!(alive, "a populated corpus must satisfy the EXISTS probe");
@@ -195,16 +269,17 @@ mod pg {
     /// cheap for everyone.
     #[tokio::test]
     async fn c_control_legacy_count_scanned_the_whole_corpus_2617() {
-        let Some(pool) = probe_pool().await else {
+        let Some(fixture) = provision().await else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        let corpus = corpus_size(&pool).await;
+        let pool = fixture.pool();
+        let corpus = corpus_size(pool).await;
         assert!(
             corpus >= MIN_MEANINGFUL_CORPUS,
             "corpus is {corpus} row(s) — the control cannot demonstrate O(corpus) cost"
         );
-        let plan = explain_analyze(&pool, LEGACY_SQL).await;
+        let plan = explain_analyze(pool, LEGACY_SQL).await;
         let touched = max_actual_rows(&plan);
         assert!(
             touched >= u64::try_from(corpus).unwrap_or(u64::MAX),
