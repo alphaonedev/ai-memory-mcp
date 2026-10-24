@@ -251,7 +251,7 @@ class TestGithubEnv(TierCredentialCase):
         self.write_url(f"postgres://{USER}:ab%2Bcd{CANARY}@192.0.2.7:5445/ai_memory_test")
         r = self.github_env_run()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual([m[len("::add-mask::"):] for m in self.masked(r)[1:]],
+        self.assertEqual([runner_unescape_data(m[len("::add-mask::"):]) for m in self.masked(r)[1:]],
                          [f"ab+cd{CANARY}", f"ab%2Bcd{CANARY}"])
 
     def test_the_age_url_is_the_same_masked_string_8187(self):

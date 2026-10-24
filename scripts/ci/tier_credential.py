@@ -62,9 +62,18 @@ class CredentialError(Exception):
         self.code = code
 
 
+def escape_workflow_command_data(value):
+    """Escape the data of a workflow command exactly as ``escapeData`` in ``@actions/core`` does.
+
+    The runner decodes ``%25``, ``%0D`` and ``%0A`` in command data, so ``%`` is escaped first, then CR, then LF;
+    every ``::add-mask::``, ``::error::`` and ``::notice::`` line this helper prints goes through here (#8187).
+    """
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def report(message):
     """Print one fixed ``::error::`` line (the only output of a refusal)."""
-    print("::error::tier_credential: " + message, file=sys.stderr)
+    print("::error::" + escape_workflow_command_data("tier_credential: " + message), file=sys.stderr)
 
 
 def mode_check(path):
@@ -201,7 +210,7 @@ def cmd_github_env(args):
     raw_password = split_url(url)[0].partition(":")[2]
     masks = [url, password] + ([raw_password] if raw_password != password else [])
     for value in masks:
-        print("::add-mask::" + value, flush=True)
+        print("::add-mask::" + escape_workflow_command_data(value), flush=True)
     names = [URL_VAR] + ([AGE_URL_VAR] if args.age_url else [])
     try:
         with open(target, "a", encoding="utf-8") as handle:
