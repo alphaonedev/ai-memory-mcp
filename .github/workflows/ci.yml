@@ -1171,7 +1171,15 @@ jobs:
             echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not provisioned on this node"
             exit 1
           fi
-          base_url="$(cat "$url_file")"
+          # #6181 / #8187: refuse a tier password that is not a secret in practice (empty, short, or equal to or
+          # inside the user, host or database name), a URL file that is group- or world-accessible (#6180), and a
+          # malformed file, BEFORE the URL is used. The helpers print fixed ::error:: sentences and no value.
+          if ! python3 -I scripts/ci/check-tier-password.py --url-file "$url_file"; then
+            exit 1
+          fi
+          # #6172 / #8187: the credential never reaches argv or a shell variable. scripts/ci/tier_credential.py
+          # reads the URL file (mode-checked) and hands the connection to its command through the libpq
+          # environment variables (PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE PGSSLMODE PGSSLROOTCERT).
           # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=59
           # bytes: 63 minus the `_tpl` suffix, i.e. IDENT_MAX - len(TEMPLATE_SUFFIX)
           # in scripts/test/pg_isolated_binary.py, which refuses longer names).
@@ -1184,24 +1192,18 @@ jobs:
           # and drop use the byte-identical name.
           echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
           # Create the ephemeral db on the base tier (connected to ai_memory_test).
-          if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
+          if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" -- psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
             echo "::error::enterprise-fed leg on $RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native tier"
             exit 1
           fi
-          # Rewrite the base URL's db-name path segment (the last path segment,
-          # before any '?') to the ephemeral db, preserving every query param
-          # (sslmode/sslrootcert). The db name is [a-z0-9_] so needs no encoding.
-          case "$base_url" in
-            *\?*) q="?${base_url#*\?}"; head="${base_url%%\?*}" ;;
-            *)    q=""; head="$base_url" ;;
-          esac
-          new_url="${head%/*}/${CI_FED_DB}${q}"
+          # The helper rewrites the base URL's db-name path segment to the ephemeral db (--database), preserving
+          # every query param (sslmode/sslrootcert). The db name is [a-z0-9_] so needs no encoding.
           # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
-          if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
+          if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" -- psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::enterprise-fed leg on $RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
             exit 1
           fi
-          echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
+          python3 -I scripts/ci/tier_credential.py github-env --url-file "$url_file" --database "$CI_FED_DB"
           echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
           # #6383 / #6386 — per-binary Postgres isolation, OPT-IN (decided by
           # GOD, review r1 M4): it runs only when AI_MEMORY_TEST_PG_ISOLATE is 1
@@ -1219,7 +1221,7 @@ jobs:
             echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1"
           else
-            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
+            python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" --export-url -- python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
           fi
 
@@ -2003,7 +2005,6 @@ jobs:
             echo "::warning::cannot drop $CI_FED_DB — $url_file missing on $RUNNER_NAME (leaked ephemeral db)"
             exit 0
           fi
-          base_url="$(cat "$url_file")"
           # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
           # terminates any lingering backend so the drop cannot wedge on a
           # still-connected test process.
@@ -2011,12 +2012,12 @@ jobs:
           # leftover clones and the locked template first (no FORCE; another
           # run's clones are never touched). Anything left behind is reclaimed
           # by the admin-only `pg_isolated_binary.py sweep --older-than N`,
-          # which CI never runs. The URL travels in the environment, not argv.
+          # which CI never runs. The URL travels in the environment, not argv (#6172).
           if [ -n "${AI_MEMORY_TEST_PG_RUN_ID:-}" ]; then
-            AI_MEMORY_TEST_POSTGRES_URL="$base_url" python3 scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
+            python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --export-url -- python3 scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
               || echo "::warning::[#6383] isolation teardown failed on $RUNNER_NAME (admin sweep reclaims it)"
           fi
-          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
+          if python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" -- psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
             echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
