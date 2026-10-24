@@ -295,6 +295,7 @@ class TestTierPasswordWiring6181(unittest.TestCase):
 
 
 WORKFLOWS = ROOT / ".github/workflows"
+BANG = chr(92) + "!"  # a psql shell escape: backslash then bang
 # the discovery list: every workflow that names the tier secret or its environment variable (#8187 security F2)
 TIER_MARKERS = re.compile(r"AI_MEMORY_CI_FED_URL|AI_MEMORY_TEST_POSTGRES_URL|pg_ci_url_file|ai-memory-ci-fed-url")
 # workflows that read the tier URL file: pinned by wiring_problems above (ci.yml) or workflow_problems below
@@ -421,6 +422,65 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
                 edited = text.replace(anchor, add + "\n" + anchor, 1)
                 self.assertNotEqual(edited, text, "the mutation did not apply")
                 self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
+
+    def test_message_echo_check_is_linear_on_pathological_input_8187(self):
+        # F6a: the old regex backtracked exponentially (0.36 s at 20 repetitions); 30 repetitions must stay fast
+        import time
+        bad = 'echo "::error::' + "}}$url_file" * 30 + '`'
+        good = 'echo "::error::${RUNNER_NAME} is missing $url_file and ${CI_FED_DB}"'
+        started = time.perf_counter()
+        self.assertFalse(allowed_url_file_line(bad))
+        self.assertLess(time.perf_counter() - started, 0.05)
+        self.assertTrue(allowed_url_file_line(good))
+        for line in ('echo "::notice::$(cat $url_file)"', 'echo "::error::`id` $url_file"',
+                     'echo "::error::$HOME $url_file"', 'echo "::error::x" ; printenv',
+                     'echo "::error::' + BANG + ' env $url_file"'):
+            with self.subTest(line=line):
+                self.assertFalse(allowed_url_file_line(line))
+
+    def test_loader_tails_and_array_calls_are_pinned_8187(self):
+        # F7: psql meta-commands reaching a shell, chained commands, and the "${PSQL[@]}" array calls
+        text = (WORKFLOWS / "cert-postgres-age.yml").read_text(encoding="utf-8")
+        run = "python3 -I " + HELPER + ' run --url-file "$url_file" --database "$CI_FED_DB" -- psql'
+        anchor = '          if [ ! -f "$url_file" ]; then'
+        arr = '"${PSQL[@]}"'
+        mutants = {
+            "meta shell escape env": "          if " + run + " -c '" + BANG + " env'; then",
+            "meta shell escape printenv": "          if " + run + ' -c "' + BANG + ' printenv"; then',
+            "chained printenv": "          if " + run + " -c x; printenv",
+            "chained and": "          " + run + ' -c x && cat "$HOME/.ai-memory-ci-fed-url"',
+            "chained or": "          " + run + " -c x || printenv",
+            "piped on": "          " + run + " -c x | sh",
+            "psql lookalike": "          if " + run + ".py -c x; then",
+            "array meta shell escape": "          " + arr + " -c '" + BANG + " env'",
+            "array chained printenv": "          " + arr + " -c x; printenv",
+            "array piped to sh": "          " + arr + " -c x | sh",
+            "array rewrapped": "          P2=(" + arr + ")",
+            "array output on a file": "          " + arr + ' -c x > "$RUNNER_TEMP/o"',
+            "server side program": "          " + arr + ' -c "COPY t TO PROGRAM \'printenv\'"',
+        }
+        for name, add in mutants.items():
+            with self.subTest(mutant=name):
+                edited = text.replace(anchor, add + "\n" + anchor, 1)
+                self.assertNotEqual(edited, text, "the mutation did not apply")
+                self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
+
+    def test_environment_dumps_are_rejected_in_every_shared_workflow_8187(self):
+        # F8: ci.yml already rejects these; the shared workflows must too
+        anchor = '          if [ ! -f "$url_file" ]; then'
+        extra = {"env piped to base64": "env | base64", "printenv piped to base64": "printenv | base64",
+                 "xtrace": "set -x", "xtrace by option": "set -o xtrace", "printenv chain": "true; printenv",
+                 "bare env": "env", "export -p": "export -p"}
+        for name in SHARED_TIER:
+            text = (WORKFLOWS / name).read_text(encoding="utf-8")
+            self.assertEqual(workflow_problems(text), [])
+            for label, line in extra.items():
+                with self.subTest(workflow=name, mutant=label):
+                    edited = text.replace(anchor, "          " + line + "\n" + anchor, 1)
+                    if edited == text:
+                        edited = text.replace("      - name:", "      - run: " + line + "\n      - name:", 1)
+                    self.assertNotEqual(edited, text, "the mutation did not apply")
+                    self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
 
     def test_a_yaml_workflow_naming_the_tier_secret_is_checked_8187(self):
         scratch = ROOT / ".local-runs" / "r3"
