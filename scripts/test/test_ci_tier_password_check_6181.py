@@ -638,9 +638,48 @@ def tier_blocks(jobs):
     """``[(name, block)]`` of the jobs whose code names the tier credential, its loader or its gate."""
     found = []
     for name, _first, _end, block in jobs:
-        if any(TIER_JOB_MARK.search(ln) for ln in block.split("\n") if not comment_or_blank(ln)):
+        if TIER_JOB_MARK.search(normalised_code(block)) or TIER_VERBS.search(normalised_code(block)):
             found.append((name, block))
     return found
+
+
+TIER_VERBS = re.compile(r"github-env|export-url")
+EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
+
+
+def normalised_code(block):
+    """The code lines of a block with continuations joined and the disguises that keep a name intact removed.
+
+    Comment lines go; a backslash before a newline or before any character goes; empty quote pairs and empty
+    ``${NAME}`` expansions go.  The tier markers are then searched in this text (F12a), so a name split over a
+    continuation, escaped or padded with empty expansions is still found.
+    """
+    code = "\n".join(ln for ln in block.split("\n") if not comment_or_blank(ln))
+    code = re.sub(r"\\\n\s*", "", code)
+    code = re.sub(r"\\(.)", r"\1", code)
+    for _ in range(3):
+        code = EMPTY_EXPANSION.sub("", code)
+    return code
+
+
+def workflow_level_blocks(text):
+    """``{key: block text}`` for the workflow-level ``env`` and ``defaults`` keys (F12b); absent keys are left out.
+
+    A block runs from its column-0 key to the next column-0 code line; trailing comment and blank lines are dropped.
+    """
+    lines = text.split("\n")
+    found = {}
+    for i, line in enumerate(lines):
+        match = re.match(r"^(env|defaults):", line)
+        if not match:
+            continue
+        end = i + 1
+        while end < len(lines) and (comment_or_blank(lines[end]) or lines[end].startswith(" ")):
+            end += 1
+        while end > i + 1 and comment_or_blank(lines[end - 1]):
+            end -= 1
+        found.setdefault(match.group(1), []).extend(lines[i:end])
+    return {key: "\n".join(rows) for key, rows in found.items()}
 
 
 def load_job_pins():
@@ -717,10 +756,22 @@ def job_pin_problems(workflow, text, pins=None):
             problems.append(f"{workflow} job {name} {where}: differs from the pin at line {first + offset + 1}: "
                             f"found '{found}'")
     outside = [i + 1 for i, ln in enumerate(text.split("\n"))
-               if EXPORT_CALL.search(ln) and not any(j[1] <= i < j[2] and j[0] in entry["pinned"] for j in jobs)]
+               if EXPORT_CALL.search(normalised_code(ln)) and not any(j[1] <= i < j[2] and j[0] in entry["pinned"]
+                                                                      for j in jobs)]
     if outside:
         problems.append(f"{workflow}: the tier export call at line {outside[0]} sits outside a pinned job")
-    if not any(EXPORT_CALL.search(ln) for name in entry["pinned"] for ln in tiered.get(name, "").split("\n")):
+    level = workflow_level_blocks(text)
+    pinned_level = entry.get("workflow", {})
+    for key in sorted(set(level) | set(pinned_level)):
+        if key not in level:
+            problems.append(f"{workflow}: the pinned workflow-level {key}: block is missing")
+        elif key not in pinned_level:
+            problems.append(f"{workflow}: a workflow-level {key}: block was added and is not pinned")
+        elif hashlib.sha256(level[key].encode("utf-8")).hexdigest() != pinned_level[key]["sha256"]:
+            offset, found = first_difference(pinned_level[key], level[key])
+            problems.append(f"{workflow}: the workflow-level {key}: block differs from the pin at its line "
+                            f"{offset + 1}: found '{found}'")
+    if not any(EXPORT_CALL.search(normalised_code(tiered.get(name, ""))) for name in entry["pinned"]):
         problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
     return problems
 
@@ -1221,7 +1272,9 @@ if __name__ == "__main__":
             if bad:
                 sys.exit(f"{workflow}: {bad[0]}")
             table[workflow] = {"jobs": [j[0] for j in found],
-                               "pinned": {name: pin_entry(block) for name, block in tier_blocks(found)}}
+                               "pinned": {name: pin_entry(block) for name, block in tier_blocks(found)},
+                               "workflow": {key: pin_entry(block) for key, block in sorted(
+                                   workflow_level_blocks((WORKFLOWS / workflow).read_text(encoding="utf-8")).items())}}
         JOB_PINS_FILE.write_text(json.dumps(table, indent=1) + "\n", encoding="utf-8")
         sys.exit(0)
     sys.exit(unittest.main())
