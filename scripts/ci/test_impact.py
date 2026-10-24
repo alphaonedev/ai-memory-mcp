@@ -87,9 +87,9 @@ OWNED_EXIT_OK = 0
 OWNED_EXIT_MATCH = 1
 OWNED_TIMEOUT_SECONDS = 120
 OWNED_RUN_MARKER = "run: cargo test --test"
-# Always applied with fullmatch: `$` would also pass a trailing newline.
 LIST_ARGS = ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", "-z")
 LISTING_DEFECT_PREFIX = "changed-path listing defect: "
+# Always applied with fullmatch: `$` would also pass a trailing newline.
 TEST_STEM_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 CONTROL_LOW = 0x20
 CONTROL_DEL = 0x7F

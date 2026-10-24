@@ -210,6 +210,51 @@ class OwnedPathsSelectionTest(unittest.TestCase):
         self.assertNotEqual(result["test_impact"], "__ALL__")
         self.assertNotIn("listing defect", result["test_impact_reason"])
 
+    def select3_raw(self, foundational):
+        subprocess.run([sys.executable, "-I", str(SELECTOR), self.base, "HEAD", foundational],
+                       cwd=str(self.repo), env=self.env, check=True, capture_output=True, text=True)
+        raw = (self.repo / "output").read_bytes().decode("utf-8")
+        for line in raw.split("\n")[:-1]:
+            self.assertRegex(line, r"\A[a-z_]+=[^\r\n]*\Z")
+        return raw, dict(line.split("=", 1) for line in raw.splitlines())
+
+    def three_arg_fixture(self, early_files):
+        """Commit early_files between foundational_base and base; then change the normal pin."""
+        foundational = self.git("rev-parse", "HEAD").strip()
+        self.commit(early_files)
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.commit({"tests/%s.rs" % PIN: STUB_PIN_BODY + "// changed\n"})
+        return foundational
+
+    def assert_pr_wide_defect(self, foundational, needle):
+        raw, result = self.select3_raw(foundational)
+        self.assertEqual(result["test_impact"], "__ALL__", result)
+        self.assertTrue(result["test_impact_reason"].startswith(LISTING_DEFECT), result)
+        self.assertIn(needle, result["test_impact_reason"])
+        self.assertEqual(raw.count("test_impact="), 1, raw)
+        self.assertNotIn("\r", result["test_impact"])
+
+    def test_pr_wide_listing_control_character_fails_closed_8077_s6(self):
+        foundational = self.three_arg_fixture({".cargo/x\ny.toml": "x\n"})
+        self.assert_pr_wide_defect(foundational, "control character")
+
+    def test_pr_wide_listing_non_utf8_path_fails_closed_8077_s6(self):
+        name = os.fsdecode(b".cargo/q\xff.toml")
+        try:
+            foundational = self.three_arg_fixture({name: "x\n"})
+        except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
+            self.skipTest("filesystem refused a non-UTF-8 name: %r" % exc)
+        self.assert_pr_wide_defect(foundational, "UTF-8")
+
+    def test_pr_wide_listing_clean_path_matches_two_argument_selection_8077_s6(self):
+        foundational = self.three_arg_fixture({"docs/notes.md": "x\n"})
+        _raw2, two = self.select_raw()
+        _raw3, three = self.select3_raw(foundational)
+        self.assertEqual(three["test_impact"], two["test_impact"])
+        self.assertNotEqual(three["test_impact"], "__ALL__")
+        self.assertIn(PIN, three["test_impact"].split(), three)
+        self.assertNotIn("listing defect", three["test_impact_reason"])
+
     def test_parse_path_listing_defects_8077_o1(self):
         spec = importlib.util.spec_from_file_location("test_impact_under_test", str(SELECTOR))
         mod = importlib.util.module_from_spec(spec)
