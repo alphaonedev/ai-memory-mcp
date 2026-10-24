@@ -1,0 +1,41 @@
+# Nightly full run (#8240). Impact selection narrows pull-request CI; this
+# workflow keeps the full matrix honest by dispatching ci.yml on the chain
+# branch every night. A dispatch is not a pull_request event, so the selector
+# in ci.yml always chooses the full matrix for it.
+#
+# GitHub fires `schedule` only from the default branch's copy of this file, so
+# the cron below becomes active once the file is on the default branch. Until
+# then `workflow_dispatch` runs it by hand.
+name: CI full (nightly)
+
+on:
+  schedule:
+    # 03:17 UTC, off the hour to avoid the scheduler's top-of-hour queue.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-full-nightly
+  cancel-in-progress: false
+
+env:
+  # The chain branch whose tip receives the nightly full run.
+  FULL_RUN_REF: chain/promo6-ssh-r2
+
+jobs:
+  dispatch-full-ci:
+    name: Dispatch full CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch ci.yml on the chain branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run ci.yml --ref "$FULL_RUN_REF"

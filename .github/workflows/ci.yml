@@ -97,6 +97,9 @@ on:
   # group must exercise the FULL gate, never short-circuit to a docs-only skip.
   merge_group:
     types: [checks_requested]
+  # #8240: the nightly full run (ci-full.yml) dispatches this workflow. A
+  # non-pull_request event always selects the full matrix.
+  workflow_dispatch:
 
 # #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
 # Every job here is checkout + cargo/scripts; none posts PR comments, uploads
@@ -158,6 +161,54 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # #8240 - impact selection. Maps the diff to job keys (scripts/ci/impact) and
+  # exposes them to the heavy jobs. Fails closed to the full matrix: any error,
+  # an empty diff, a non-pull_request event, a release/main/develop base or an
+  # unclassified path selects everything. The steps are continue-on-error so an
+  # unusable selector can only widen the run, never narrow it.
+  select:
+    name: Impact selection
+    # RUNNER PLACEMENT - GitHub-hosted: it only runs git and python.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    outputs:
+      jobs: ${{ steps.select.outputs.jobs }}
+      all: ${{ steps.select.outputs.all }}
+      crates: ${{ steps.select.outputs.crates }}
+      enforce: ${{ steps.mode.outputs.enforce }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      # Skipping is off until the repository variable CI_IMPACT_ENFORCE is
+      # "true"; until then every heavy job still runs and only the report differs.
+      - name: Selection mode
+        id: mode
+        env:
+          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}
+        run: echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build impact index
+        continue-on-error: true
+        run: python3 -I scripts/ci/impact/build_index.py --repo . --db "$RUNNER_TEMP/impact.db"
+
+      - name: Select jobs
+        id: select
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          python3 -I scripts/ci/impact/select.py --db "$RUNNER_TEMP/impact.db" \
+            --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --event "$EVENT" \
+            --base-ref "$BASE_REF" --out "$RUNNER_TEMP/selection.json" \
+            --github-output "$GITHUB_OUTPUT"
+
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
   # matrix instead of waiting on the full per-OS test build. Required status
   # checks are still satisfied because the matrix jobs keep their names AND
@@ -464,8 +515,8 @@ jobs:
   # `scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt`.
   lint:
     name: Lint (fmt + clippy)
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,'))
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # Two full pedantic clippy passes (default + `--all-targets --features
@@ -572,8 +623,8 @@ jobs:
   # burn-down allowlist entry.
   actionlint:
     name: actionlint (workflow-injection guard)
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',actionlint,'))
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). A single
     # container-action step over `.github/workflows/`: no cargo, no Postgres.
     runs-on: ubuntu-latest
@@ -603,8 +654,8 @@ jobs:
   # scripts/qc-allowlists/ + scripts/test/fixtures/) in lockstep.
   msrv:
     name: MSRV (Rust 1.98)
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,'))
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # `cargo check --all-targets` over the whole crate.
@@ -2095,8 +2146,8 @@ jobs:
   # tracked in required-contexts-joblevel-if-allow.txt like the other gates.
   postgres-feature:
     name: Postgres feature gate
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',cells,'))
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     #
@@ -2278,8 +2329,8 @@ jobs:
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # clippy + `cargo build --release --features sal` + `cargo test`.
     name: SAL-only feature gate
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',cells,'))
     # NOTE the `Free disk` step that #3109 removed (it recursively deleted
     # system paths such as the bundled dotnet SDK to make headroom on the
     # ephemeral hosted image) is deliberately NOT restored. This job has since
@@ -2344,8 +2395,8 @@ jobs:
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # `--all-targets --features vectorlite` clippy + two test binaries.
     name: vectorlite feature gate
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,'))
     runs-on: ubuntu-latest
     # #1487 — bound the job so a wedged test can't pin the runner. 30 is the
     # pre-#3109 value measured on this runner class and is unchanged by #3109.
@@ -2401,7 +2452,7 @@ jobs:
   # when only /docs/ or *.md changed.
   dockerfile-validate:
     name: Dockerfile build (no push)
-    needs: classify
+    needs: [classify, select]
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). The
     # build happens inside a Docker layer cache backed by `type=gha` (the
     # GitHub Actions cache service), NOT by the self-hosted nodes' `target/`
@@ -2411,7 +2462,7 @@ jobs:
     # hosts.
     runs-on: ubuntu-latest
     # Skip on tag pushes — the docker job below handles those (with push).
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' }}
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,')) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -2443,3 +2494,31 @@ jobs:
   # AND every per-module floor and now also posts the sticky coverage PR
   # comment. Coverage is owned end-to-end by `coverage.yml`; running the
   # full instrumented sweep twice per PR was pure waste.
+
+  # #8240 - the single aggregate check. Passes when every job either succeeded
+  # or was skipped because the selection excluded it. Not a required check yet.
+  # Rule (b4) of scripts/check-required-contexts.sh forbids a job from needing a
+  # required job that carries a job-level `if:`, so this aggregate lists only the
+  # jobs without one; the seven job-level-`if:` jobs join it when that rule
+  # exempts an `if: always()` aggregate (tracked as an open item on #8240).
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs:
+      - select
+      - classify
+      - check
+      - mobile-cross-compile
+    # RUNNER PLACEMENT - GitHub-hosted: it only reads the needs context.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Fold job results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          SELECTED_JOBS: ${{ needs.select.outputs.jobs }}
+          SELECTED_ALL: ${{ needs.select.outputs.all }}
+        run: |
+          python3 -I scripts/ci/impact/gate.py --needs "$NEEDS_JSON" \
+            --jobs "$SELECTED_JOBS" --all "$SELECTED_ALL"
