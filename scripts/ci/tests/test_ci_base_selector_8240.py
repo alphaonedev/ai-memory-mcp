@@ -49,9 +49,15 @@ PR_WORKFLOWS = ("ci.yml", "ci-full.yml", "c8-precheck.yml")
 BASE_SHA_MENTION_RE = re.compile(r"base\.sha|BASE_SHA", re.I)
 ENV_LINE_RE = re.compile(r"^(?P<indent>\s+)(?P<key>[A-Z][A-Z0-9_]*):\s+(?P<value>\S.*?)\s*$")
 EXPRESSION_RE = re.compile(r"^\$\{\{ .+ \}\}$")
-SINGLE_BRACE_RE = re.compile(r"\$\{\s")
+SINGLE_BRACE_RE = re.compile(
+    r"\$\{(?!\{)\s*(github|env|vars|secrets|inputs|needs|steps|matrix|runner)\.")
+LEGACY_SINGLE_BRACE_RE = re.compile(r"\$\{\s")
 BASE_EVENT_RE = re.compile(
     r"^\$\{\{ github\.event\.pull_request\.base\.sha( \|\| .+)? \}\}$")
+LIVE_BASE_STEP = "Resolve the live base (#8240)"
+LIVE_SUMMARY_STEP = "Name the live base in the summary"
+LIVE_BASE_EXPR ="${{ steps.live.outputs.sha }}"
+HELPER = IMPACT_REL + "/base_sha.py"
 BOOTSTRAP_STEP = "Fold job results (bootstrap, PR-tree gate)"
 BASE_GATE_STEP = "Fold job results (base gate)"
 FAIL_STEP = "Fail the gate (base gate unreadable)"
@@ -205,13 +211,28 @@ class WorkflowExpressions(unittest.TestCase):
                 with self.subTest(file=name, line=number):
                     self.assertIsNone(SINGLE_BRACE_RE.search(line),
                                       "%s:%d has a single-brace ${ expression" % (name, number))
+                    self.assertIsNone(LEGACY_SINGLE_BRACE_RE.search(line),
+                                      "%s:%d has a single-brace ${ expression" % (name, number))
 
-    def test_both_materialise_steps_take_the_base_sha_from_the_event_expression(self):
+    def test_both_materialise_steps_take_the_base_sha_from_the_live_base_step(self):
         for job, step_name in ((SELECT_JOB, MATERIALISE_STEP),
                                (GATE_JOB, GATE_MATERIALISE_STEP)):
             with self.subTest(job=job):
                 value = step_named(job, step_name)["env"]["BASE_SHA"]
-                self.assertRegex(value, BASE_EVENT_RE)
+                self.assertEqual(value, LIVE_BASE_EXPR)
+
+    def test_the_no_space_single_brace_form_is_flagged(self):
+        for text in ("X: ${github.event.pull_request.head.sha || github.sha}",
+                     "X: ${ github.event.before }", "X: ${env.FOO}",
+                     "X: ${secrets.TOKEN}", "X: ${steps.base.outputs.ok}"):
+            with self.subTest(text=text):
+                self.assertTrue(SINGLE_BRACE_RE.search(text) or
+                                LEGACY_SINGLE_BRACE_RE.search(text))
+        for text in ("echo ${HOME}", 'echo "${GITHUB_ENV}"', "x=${y:-1}",
+                     "X: ${{ github.sha }}"):
+            with self.subTest(text=text):
+                self.assertIsNone(SINGLE_BRACE_RE.search(text))
+                self.assertIsNone(LEGACY_SINGLE_BRACE_RE.search(text))
 
 
 class GateBaseRead(BaseCase):
@@ -235,7 +256,8 @@ class GateBaseRead(BaseCase):
         context = {"steps": {"base": {"outputs": lines}}}
         ran = []
         for step in workflow_text.read_steps(CI_YML, GATE_JOB):
-            if step["uses"] or step["name"] == GATE_MATERIALISE_STEP:
+            if step["uses"] or step["name"] in (GATE_MATERIALISE_STEP, LIVE_BASE_STEP,
+                                                 LIVE_SUMMARY_STEP):
                 continue
             if step["if"] is None or gha_expr.evaluate_job_if(step["if"], context):
                 ran.append(step["name"])
@@ -342,7 +364,21 @@ class BaseSelectorIgnoresPrHelpers(BaseCase):
         words = shlex.split(re.sub(r"\$(\w+)", lambda m: env[m.group(1)], run))
         self.assertEqual(words[0], "python3")
         words[0] = sys.executable
+        self.assertIn("-I", words[1:3], "%s must run with python3 -I" % step_name)
         return words
+
+    def env_of(self, step_name, base_env, step_env):
+        """Return the process env the runner builds: the step's REAL `env:` block applied.
+
+        Literal values are used as written; `${{ ... }}` values come from `step_env`
+        (the test's stand-in for the expression context, keyed by variable name).
+        """
+        env = dict(base_env)
+        for key, value in step_named(SELECT_JOB, step_name)["env"].items():
+            self.assertFalse(key.upper().startswith("PYTHON"),
+                             "step %r sets %s, which redirects imports" % (step_name, key))
+            env[key] = step_env[key] if value.startswith("${{") else value
+        return env
 
     def test_the_base_selector_never_imports_a_pr_tree_helper(self):
         base = self.commit_selector()
@@ -370,8 +406,9 @@ class BaseSelectorIgnoresPrHelpers(BaseCase):
                     "ENFORCE": ENFORCE, "GITHUB_OUTPUT": str(out)}
         build = self.argv_of("Build impact index", step_env) + ["--metadata-file", str(metadata)]
         select = self.argv_of("Select jobs", step_env)
-        for argv in (build, select):
-            done = subprocess.run(argv, cwd=str(self.repo), env=env, capture_output=True,
+        for name, argv in (("Build impact index", build), ("Select jobs", select)):
+            done = subprocess.run(argv, cwd=str(self.repo), capture_output=True,
+                                  env=self.env_of(name, env, step_env),
                                   text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr)
         self.assertFalse(marker.exists(), "the base selector imported a PR-tree helper")
@@ -560,6 +597,147 @@ class FallbackStep(unittest.TestCase):
             with self.subTest(domain=domain):
                 self.assertEqual(lines[domain], "true")
         self.assertNotIn("false", lines.values())
+
+
+class LiveBase(BaseCase):
+    """R3-F10: the base is the live one, never the frozen pull_request.base.sha.
+
+    decision: the live base is the first parent of the pull_request merge ref
+    and merge_group.base_sha over pull_request.base.sha because base.sha is
+    frozen at PR-open time and github.sha on merge_group contains the PR
+    """
+
+    def build(self):
+        """main: c0 -> c1 (later base); pr: c0 -> p1; merge M = c1 + p1 on HEAD."""
+        c0 = self.base
+        git = lambda *a: fx.git(self.repo, *a)
+        git("checkout", "-q", "-b", "pr")
+        p1 = fx.commit_change(self.repo, {"pr.txt": "pr\n"})
+        git("checkout", "-q", "main")
+        c1 = fx.commit_change(self.repo, {"later.txt": "later\n"})
+        git("checkout", "-q", "-b", "merge-ref")
+        git("merge", "-q", "--no-ff", "-m", "merge", "pr")
+        merge = git("rev-parse", "HEAD")
+        git("update-ref", "refs/remotes/origin/main", c1)
+        return c0, c1, p1, merge
+
+    def run_helper(self, env_extra):
+        out_path = self.tmp / "gh_out.txt"
+        out_path.write_text("")
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.tmp)}
+        env.update(env_extra)
+        res = subprocess.run([sys.executable, "-I", str(fx.IMPACT_DIR / "base_sha.py"),
+                              "--repo", str(self.repo), "--github-output", str(out_path)],
+                             env=env, capture_output=True, text=True, timeout=120)
+        out = dict(i.split("=", 1) for i in out_path.read_text().split("\n") if "=" in i)
+        return res.returncode, out, res
+
+    def test_pull_request_uses_the_first_parent_not_the_frozen_base_sha(self):
+        c0, c1, p1, merge = self.build()
+        rc, out, res = self.run_helper({
+            "EVENT_NAME": "pull_request", "HEAD_SHA": p1, "BASE_REF": "main",
+            "PR_BASE_SHA": c0, "GITHUB_SHA": merge})
+        self.assertEqual(rc, 0, res.stderr)
+        self.assertEqual(out["sha"], c1)
+        self.assertNotEqual(out["sha"], c0)
+        self.assertEqual(out["reason"], "live-base-first-parent")
+        self.assertEqual(res.stdout.split()[0], "sha=" + c1)
+
+    def test_merge_group_uses_the_event_base_sha_never_github_sha(self):
+        c0, c1, p1, merge = self.build()
+        rc, out, res = self.run_helper({
+            "EVENT_NAME": "merge_group", "MERGE_GROUP_BASE_SHA": c1,
+            "HEAD_SHA": merge, "BASE_REF": "refs/heads/main", "GITHUB_SHA": merge})
+        self.assertEqual(rc, 0, res.stderr)
+        self.assertEqual(out["sha"], c1)
+        self.assertNotEqual(out["sha"], merge)
+        self.assertEqual(out["reason"], "live-base-merge-group")
+
+    def test_a_base_that_contains_the_head_is_refused(self):
+        c0, c1, p1, merge = self.build()
+        rc, out, res = self.run_helper({
+            "EVENT_NAME": "merge_group", "MERGE_GROUP_BASE_SHA": merge,
+            "HEAD_SHA": p1, "BASE_REF": "main"})
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out["reason"], "base-contains-head")
+        self.assertEqual(out["sha"], "")
+
+    def test_a_base_not_on_the_base_ref_is_refused(self):
+        c0, c1, p1, merge = self.build()
+        rc, out, res = self.run_helper({
+            "EVENT_NAME": "merge_group", "MERGE_GROUP_BASE_SHA": p1,
+            "HEAD_SHA": merge, "BASE_REF": "main"})
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out["reason"], "base-not-on-base-ref")
+        self.assertEqual(out["sha"], "")
+
+    def test_an_unsupported_event_fails_closed(self):
+        c0, c1, p1, merge = self.build()
+        for event in ("push", "workflow_dispatch", "schedule", ""):
+            with self.subTest(event=event):
+                rc, out, res = self.run_helper({
+                    "EVENT_NAME": event, "HEAD_SHA": merge, "BASE_REF": "main",
+                    "MERGE_GROUP_BASE_SHA": c1, "GITHUB_SHA": merge})
+                self.assertNotEqual(rc, 0)
+                self.assertEqual(out["reason"], "base-event-unsupported")
+                self.assertEqual(out["sha"], "")
+
+    def test_malformed_inputs_fail_closed(self):
+        c0, c1, p1, merge = self.build()
+        cases = (
+            ({"EVENT_NAME": "merge_group", "MERGE_GROUP_BASE_SHA": "--oops",
+              "HEAD_SHA": merge, "BASE_REF": "main"}, "base-sha-invalid"),
+            ({"EVENT_NAME": "merge_group", "MERGE_GROUP_BASE_SHA": c1,
+              "HEAD_SHA": "zz", "BASE_REF": "main"}, "head-sha-invalid"),
+            ({"EVENT_NAME": "merge_group", "MERGE_GROUP_BASE_SHA": c1,
+              "HEAD_SHA": merge, "BASE_REF": "../x"}, "base-ref-invalid"),
+            ({"EVENT_NAME": "pull_request", "HEAD_SHA": c0, "BASE_REF": "main"},
+             "merge-ref-unexpected"),
+        )
+        for env, reason in cases:
+            with self.subTest(reason=reason):
+                rc, out, res = self.run_helper(env)
+                self.assertNotEqual(rc, 0)
+                self.assertEqual(out["reason"], reason)
+                self.assertEqual(out["sha"], "")
+
+
+class LiveBaseWorkflow(unittest.TestCase):
+    """R3-F10 (f): select and ci-gate resolve the base through one helper."""
+
+    def test_both_jobs_run_the_same_helper_step(self):
+        steps = {}
+        for job in (SELECT_JOB, GATE_JOB):
+            step = step_named(job, LIVE_BASE_STEP)
+            self.assertEqual(step["id"], "live")
+            self.assertIn(HELPER, step["run"])
+            steps[job] = step
+        self.assertEqual(steps[SELECT_JOB]["run"], steps[GATE_JOB]["run"])
+        self.assertEqual(steps[SELECT_JOB]["env"], steps[GATE_JOB]["env"])
+
+    def test_the_helper_step_precedes_materialise_in_both_jobs(self):
+        for job, name in ((SELECT_JOB, MATERIALISE_STEP), (GATE_JOB, GATE_MATERIALISE_STEP)):
+            names = [s["name"] for s in workflow_text.read_steps(CI_YML, job)]
+            self.assertLess(names.index(LIVE_BASE_STEP), names.index(name))
+
+    def test_no_base_step_reads_the_frozen_base_sha(self):
+        for job, name in ((SELECT_JOB, MATERIALISE_STEP), (GATE_JOB, GATE_MATERIALISE_STEP),
+                          (SELECT_JOB, LIVE_BASE_STEP), (GATE_JOB, LIVE_BASE_STEP)):
+            step = step_named(job, name)
+            with self.subTest(job=job, step=name):
+                for value in step["env"].values():
+                    self.assertNotIn("pull_request.base.sha", value)
+                    self.assertNotIn("github.sha", value)
+
+    def test_the_helper_receives_only_the_event_name_and_raw_candidates(self):
+        env = step_named(SELECT_JOB, LIVE_BASE_STEP)["env"]
+        self.assertEqual(sorted(env), ["BASE_REF", "EVENT_NAME", "HEAD_SHA",
+                                       "MERGE_GROUP_BASE_SHA"])
+
+    def test_the_gate_failure_step_names_the_live_base_reason(self):
+        step = step_named(GATE_JOB, FAIL_STEP)
+        self.assertIn("steps.live.outputs.reason", " ".join(step["env"].values()))
+
 
 
 if __name__ == "__main__":
