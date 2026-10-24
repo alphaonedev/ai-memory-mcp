@@ -1863,6 +1863,31 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         problems = repo_problems(self.tree(replace={name: edited}), self.pins)
         self.assertTrue(any(name in p and "lifetime-tests" in p for p in problems), problems)
 
+    def test_the_exempt_workflow_level_keys_are_pinned_8187_f21(self):
+        name = "session-boot-lifetime.yml"
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        self.assertEqual(repo_problems(self.tree(), self.pins), [])
+        mutants = {
+            "env entry added": (text.replace("\nenv:\n", "\nenv:\n  BASH_ENV: ./hook\n", 1), "env"),
+            "defaults.run.shell added": (text.replace("\nenv:\n", "\ndefaults:\n  run:\n    shell: bash -x\nenv:\n", 1),
+                                         "defaults"),
+            "env value edited": (text.replace('CARGO_INCREMENTAL: "0"', 'CARGO_INCREMENTAL: "1"', 1), "env"),
+            "on gains an event": (text.replace("\non:\n", "\non:\n  pull_request:\n", 1), "on"),
+        }
+        for label, (body, key) in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(body, text)
+                problems = repo_problems(self.tree(replace={name: body}), self.pins)
+                self.assertTrue(any(name in p and "workflow-level" in p and key in p for p in problems), problems)
+                self.assertFalse(any("bash -x" in p or "./hook" in p for p in problems), problems)
+
+    def test_the_exempt_pin_section_carries_the_workflow_keys_8187_f21(self):
+        entry = self.pins[EXEMPT]["session-boot-lifetime.yml"]
+        data, _ = ty.parse_workflow((WORKFLOWS / "session-boot-lifetime.yml").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(entry["workflow_keys"]), sorted(k for k in data if k != "jobs"))
+        self.assertEqual(entry["workflow_keys"], ty.build_pins(data)["workflow_keys"])
+        self.assertEqual(sorted(entry["jobs"]), ["lifetime-tests"])
+
     def test_hosted_labels_and_non_tier_edits_are_not_flagged(self):
         text = self.texts["ci.yml"]
         for value in ("ubuntu-latest", "ubuntu-22.04", "macos-14", "windows-latest", "ubuntu-24.04-arm"):
