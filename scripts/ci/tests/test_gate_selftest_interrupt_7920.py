@@ -89,6 +89,8 @@ class GateSelfTestInterrupt7920(unittest.TestCase):
             ["bash", str(ROOT / "scripts" / gate), "--self-test"],
             cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
+        rc = None
+        elapsed = 0.0
         try:
             deadline = time.monotonic() + POLL_CEILING_SECS
             while time.monotonic() < deadline:
@@ -103,14 +105,16 @@ class GateSelfTestInterrupt7920(unittest.TestCase):
             try:
                 rc = proc.wait(timeout=SIGNAL_TO_EXIT_CEILING_SECS)
             except subprocess.TimeoutExpired:
-                self.fail("%s still running %ss after %s with the gate child held"
-                          % (gate, SIGNAL_TO_EXIT_CEILING_SECS, sig.name))
+                rc = None
             elapsed = time.monotonic() - sent_at
         finally:
             release.touch()
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+        self.assertIsNotNone(
+            rc, "%s still running %ss after %s with the gate child held"
+            % (gate, SIGNAL_TO_EXIT_CEILING_SECS, sig.name))
         self.assertEqual(rc, -int(sig),
                          "%s exited %d after %s; must die of the signal" % (gate, rc, sig.name))
         self.assertLess(elapsed, SIGNAL_TO_EXIT_CEILING_SECS)
