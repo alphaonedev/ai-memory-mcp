@@ -23,6 +23,10 @@ run-help               ``pg_isolated_binary.py run --help`` EXECUTES and
 source                 neither the wrapper nor the Rust helper drops WITH
                        FORCE, and the wrapper checks pg_stat_activity.
 
+Scanner limits: the G1 line scanner matches the flag key as text on one code line, so two forms
+are out of its scope and are covered by the run-step guard check instead: a name built by
+``printf '%s=1' <name>`` and the YAML explicit ``? key`` form.
+
 Usage: check_pg_isolate_invariants.py --root REPO [--ci-yml PATH]
 Exit 0 and ``ok`` lines when every check holds, 1 otherwise.
 """
@@ -56,8 +60,9 @@ RUN_GUARD = ('if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ] && [ "${CI_PG_ISOLA
 # The flag name followed by ``:`` (YAML, block or flow) or ``=`` (shell), searched on a code line
 # with quotes removed so a quoted key or a quote-split name cannot hide it. ``:-`` ``:=`` ``:+``
 # ``:?`` are shell parameter expansions (reads), not assignments.
-_FLAG_ASSIGN_RE = re.compile(r'%s(?:\s*:(?![-=+?])|=(?!=))(.*)$' % FLAG)
-_ZERO_RE = re.compile(r'\s*0(?![A-Za-z0-9_.])')
+_FLAG_KEY_RE = re.compile(r'%s(?:\s*:(?![-=+?])|=(?!=))' % FLAG)
+# A literal 0 only: followed by end of line, whitespace or one of , } # ; & | (so ``0${{ x }}`` is not 0).
+_ZERO_RE = re.compile(r'\s*0(?=$|[\s,}#;&|])')
 _JOB_RE = re.compile(r'^  [A-Za-z0-9_-]+:\s*$', re.M)
 _STEP_RE = re.compile(r'^\s*- name:', re.M)
 
@@ -81,9 +86,13 @@ FED_EXPR_PLAIN = _unquote(FED_EXPR)
 
 
 def flag_assignments(line: str) -> List[str]:
-    """The value text of every flag assignment on a code line (quotes ignored)."""
+    """The value text of every flag assignment on a code line (quotes ignored).
+
+    The line is split at every occurrence of the flag key, so ``X=0; X=1`` yields both values."""
     plain = _unquote(line)
-    return [m.group(1) for m in _FLAG_ASSIGN_RE.finditer(plain)]
+    keys = list(_FLAG_KEY_RE.finditer(plain))
+    ends = [m.start() for m in keys[1:]] + [len(plain)]
+    return [plain[m.end():end] for m, end in zip(keys, ends)]
 
 
 def is_fed_value(rest: str) -> bool:
@@ -91,7 +100,7 @@ def is_fed_value(rest: str) -> bool:
     if not rest.strip().startswith(FED_EXPR_PLAIN):
         return False
     after = rest.strip()[len(FED_EXPR_PLAIN):].strip()
-    return not after or after[0] in ',}#'
+    return not after or after[0] in ',}#;&|'
 
 
 def _check_job_head(text: str) -> str:
@@ -120,7 +129,7 @@ def default_on_failures(ci_text: str, code: List[str]) -> List[str]:
                         % len(keyed))
     if not all(leg in head for leg in FED_LEGS):
         problems.append('the check matrix lost an enterprise-fed fed leg')
-    if RUN_GUARD not in ci_text:
+    if not any(RUN_GUARD in ln for ln in code):
         problems.append('the run step lost its own guard (flag 1, CI_PG_ISOLATE_OFF not 1, tier enterprise-fed)')
     if not KILL_BRANCH_RE.search(ci_text):
         problems.append('the CI_PG_ISOLATE_OFF kill-switch branch no longer forces the flag to 0')
