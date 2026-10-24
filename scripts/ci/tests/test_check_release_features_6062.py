@@ -939,6 +939,73 @@ class Round6(unittest.TestCase):
         self.assertEqual(errs, [])
 
 
+class Round7(unittest.TestCase):
+    """PR 8003 round 7: the r6 holes N1-N6 and F1-F5, each proven by the corpus cases of its group and, for the
+    symlink loop, by a tree on disk. A case that wants 0 messages is the control of its group."""
+
+    def run_group(self, prefix):
+        cases = {n: c for n, c in G.R7_CASES.items() if n.startswith(prefix)}
+        self.assertGreaterEqual(len(cases), 2, prefix)
+        tree = Path(scratch()) / "r7"
+        for name, (doc, files, count, needle) in cases.items():
+            errs = G.r5_errors(doc, files, tree)
+            self.assertEqual(len(errs), count, (name, errs))
+            if needle:
+                self.assertIn(needle, " | ".join(errs), name)
+
+    def test_n1_arithmetic_expansion_is_scanned(self):
+        self.run_group("r7 N1")
+
+    def test_n2_braced_env_and_path_writes(self):
+        self.run_group("r7 N2")
+
+    def test_n3_wget_options(self):
+        self.run_group("r7 N3")
+
+    def test_n4_shell_of_step_job_and_workflow(self):
+        self.run_group("r7 N4")
+
+    def test_f4_windows_runner_needs_a_shell(self):
+        self.run_group("r7 F4")
+
+    def test_n5_taint_through_env_and_relays(self):
+        self.run_group("r7 N5")
+
+    def test_f1_taint_through_workflow_env_files_and_with(self):
+        self.run_group("r7 F1")
+
+    def test_f2_matrix_values_of_every_job(self):
+        self.run_group("r7 F2")
+
+    def test_f3_downloads_are_checked_before_use(self):
+        self.run_group("r7 F3")
+
+    def test_f5_downloads_no_fetch_word_names(self):
+        self.run_group("r7 F5")
+
+    def test_n6_depth_counts_on_the_resolved_path(self):
+        self.run_group("r7 N6")
+
+    def test_n6_symlink_loop_is_refused_not_raised(self):
+        """A local action directory that is a symlink to itself is refused with a message, never an exception."""
+        tree = Path(scratch()) / "r7loop"
+        if tree.exists():
+            import shutil
+            shutil.rmtree(tree)
+        tree.mkdir(parents=True)
+        (tree / "act").symlink_to("act")
+        doc = G._r5_job(steps="    steps:\n" + G.R5_LOCAL)
+        rep = G.Report()
+        rep.root = tree
+        parsed = G.parse_yaml(doc, "w.yml", rep)
+        G.check_uses_pinned(parsed, "w.yml", rep)
+        self.assertTrue(any("cannot be resolved" in e or "cycle" in e for e in rep.errors), rep.errors)
+
+    def test_every_round7_case_has_a_group_test(self):
+        groups = {n.split(":")[0] for n in G.R7_CASES}
+        self.assertEqual(groups, {"r7 N1", "r7 N2", "r7 N3", "r7 N4", "r7 F4", "r7 N5", "r7 F1", "r7 F2", "r7 F3", "r7 F5", "r7 N6"})
+
+
 class SelfTest8023(unittest.TestCase):
     """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
 

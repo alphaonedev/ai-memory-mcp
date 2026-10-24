@@ -3392,6 +3392,101 @@ R5_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
 }
 
 
+R7_FETCH = "curl -fsSL -o f https://x.example/f"
+R7_VERIFY = 'echo "${SUM}  f" | sha256sum -c -'
+
+
+def _r7(*lines: str) -> str:
+    """A one-step job whose run text is the given lines."""
+    return _r5_run("\n          ".join(lines))
+
+
+def _r7_steps(*blocks: str, head: str = "") -> str:
+    """A job from whole step blocks (each a `      - ...` text ending in a newline)."""
+    return _r5_job(head=head, steps="    steps:\n" + "".join(blocks))
+
+
+R7_DIRTY_ENV = "        env:\n          T: ${{ github.event.pull_request.title }}\n"
+
+R7_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    # --- N1: commands inside an arithmetic expansion are scanned.
+    "r7 N1: a command substitution inside $(( )) of a fetch step is refused": (_r7(R7_FETCH, ": $(( $(sh f) ))"), None, 1, "fetch step"),
+    "r7 N1: a backtick command inside $(( )) of a fetch step is refused": (_r7(R7_FETCH, ": $(( `sh f` ))"), None, 1, "fetch step"),
+    "r7 N1: a subshell written as $((cmd) ) of a fetch step is refused": (_r7(R7_FETCH, "$((sh f) )"), None, 1, "fetch step"),
+    "r7 N1: plain arithmetic in a fetch step passes the scan": (_r7(R7_FETCH, "echo $(( 1 + 2 ))"), None, 0, ""),
+    # --- N2: a braced GITHUB_ENV / GITHUB_PATH write is a write.
+    "r7 N2: a braced GITHUB_ENV write in a fetch step is refused": (_r7(R7_FETCH, 'echo "X=1" >> "${GITHUB_ENV}"'), None, 1, "fetch step"),
+    "r7 N2: a braced GITHUB_PATH write in a fetch step is refused": (_r7(R7_FETCH, 'echo "$PWD" >> ${GITHUB_PATH}'), None, 1, "fetch step"),
+    # --- N3: wget options are an allow-list.
+    "r7 N3: wget --use-askpass in a fetch step is refused": (_r7("wget --use-askpass=./x -O f https://x.example/f"), None, 1, "wget"),
+    "r7 N3: wget -e use_askpass in a fetch step is refused": (_r7("wget -e use_askpass=./x -O f https://x.example/f"), None, 1, "wget"),
+    "r7 N3: wget --execute in a fetch step is refused": (_r7("wget --execute=use_askpass=./x -O f https://x.example/f"), None, 1, "wget"),
+    "r7 N3: a plain wget -q -O passes the option check": (_r7("wget -q -O f https://x.example/f", R7_VERIFY), None, 0, ""),
+    # --- N4 / F4: the shell of a step, a job and a workflow.
+    "r7 N4: a step shell of pwsh is refused": (_r7_steps("      - run: echo ok\n        shell: pwsh\n"), None, 1, "`shell: pwsh`"),
+    "r7 N4: a step shell of python is refused": (_r7_steps("      - run: echo ok\n        shell: python\n"), None, 1, "`shell: python`"),
+    "r7 N4: a step shell with a custom template is refused": (_r7_steps("      - run: echo ok\n        shell: bash {0}\n"), None, 1, "not allowed"),
+    "r7 N4: a step shell of bash passes": (_r7_steps("      - run: echo ok\n        shell: bash\n"), None, 0, ""),
+    "r7 N4: a job defaults.run.shell of pwsh is refused": (_r7_steps(R5_OK_RUN, head="    defaults:\n      run:\n        shell: pwsh\n"), None, 1, "defaults.run.shell"),
+    "r7 N4: a workflow defaults.run.shell of pwsh is refused": ("defaults:\n  run:\n    shell: pwsh\n" + _r5_job(), None, 1, "defaults.run.shell"),
+    "r7 F4: a run on a Windows runner with no shell is refused": (_r7_steps(R5_OK_RUN, head="    runs-on: windows-latest\n"), None, 1, "no `shell:`"),
+    "r7 F4: a run on a Windows runner with shell bash passes": (_r7_steps("      - run: echo ok\n        shell: bash\n", head="    runs-on: windows-latest\n"), None, 0, ""),
+    # --- N5 / F1: taint through job env, workflow env, set-output, GITHUB_ENV, files and `with:`.
+    "r7 N5: a job env value feeding a GITHUB_OUTPUT writer taints it": (
+        _r7_steps("      - id: x\n        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n",
+                  head="    env:\n      T: ${{ github.event.pull_request.title }}\n"), None, 1, "interpolates"),
+    "r7 F1: a workflow env value feeding a GITHUB_OUTPUT writer taints it": (
+        "env:\n  T: ${{ github.event.pull_request.title }}\n" + _r7_steps(
+            "      - id: x\n        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 N5: a value relayed through GITHUB_ENV taints a later writer": (
+        _r7_steps("      - run: echo \"V=$T\" >> \"$GITHUB_ENV\"\n" + R7_DIRTY_ENV,
+                  "      - id: x\n        run: echo \"y=$V\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 F1: a legacy ::set-output writer with an untrusted env is tainted": (
+        _r7_steps("      - id: x\n        run: echo \"::set-output name=y::$T\"\n" + R7_DIRTY_ENV, "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 F1: a value relayed through a file taints a later writer": (
+        _r7_steps("      - run: echo \"$T\" > val.txt\n" + R7_DIRTY_ENV,
+                  "      - id: x\n        run: echo \"y=$(cat val.txt)\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 F1: a uses step with an untrusted with value has tainted outputs": (
+        _r7_steps("      - id: u\n        uses: " + CHECKOUT_USES + "\n        with:\n          ref: ${{ github.event.pull_request.head.ref }}\n",
+                  "      - run: echo ${{ steps.u.outputs.ref }}\n"), None, 1, "interpolates"),
+    "r7 F1: a uses step with a literal with value keeps clean outputs": (
+        _r7_steps("      - id: u\n        uses: " + CHECKOUT_USES + "\n        with:\n          ref: main\n", "      - run: echo ${{ steps.u.outputs.ref }}\n"), None, 0, ""),
+    # --- F2: a matrix value of any job but release.yml's release job is a literal.
+    "r7 F2: an expression matrix value in a job is refused": (
+        _r7_steps("      - run: echo ${{ matrix.os }}\n", head="    strategy:\n      matrix:\n        os: ${{ fromJSON(github.event.pull_request.title) }}\n"), None, 1, "strategy.matrix"),
+    "r7 F2: an expression inside a matrix list is refused": (
+        _r7_steps("      - run: echo ${{ matrix.os }}\n", head="    strategy:\n      matrix:\n        os: [\"${{ github.head_ref }}\"]\n"), None, 1, "strategy.matrix"),
+    # --- F3: a downloaded file is checked before it is unpacked, moved or run.
+    "r7 F3: a tar of a download with no checksum is refused": (_r7(R7_FETCH, "tar xzf f"), None, 1, "checksum"),
+    "r7 F3: a curl piped to tar with no checksum is refused": (_r7("curl -fsSL https://x.example/f | tar xz"), None, 1, "tar"),
+    "r7 F3: a tar after a checksum check passes": (_r7(R7_FETCH, R7_VERIFY, "tar xzf f"), None, 0, ""),
+    "r7 F3: a checksum check inside an if does not count": (_r7(R7_FETCH, "if " + R7_VERIFY.split(" | ")[0] + " | sha256sum -c -; then :; fi", "tar xzf f"), None, 1, "checksum"),
+    "r7 F3: a checksum check ended by || true does not count": (_r7(R7_FETCH, R7_VERIFY + " || true", "tar xzf f"), None, 1, "checksum"),
+    "r7 F3: set +e in a fetch step is refused": (_r7("set +e", R7_FETCH, R7_VERIFY, "tar xzf f"), None, 1, "fetch step"),
+    "r7 F3: a download written over a command name is refused": (_r7("curl -fsSL -o sha256sum https://x.example/f", R7_VERIFY), None, 1, "command name"),
+    "r7 F3: a download written to the system bin directory is refused": (_r7("curl -fsSL -o /usr/local/bin/tool https://x.example/f"), None, 1, "bin directory"),
+    "r7 F3: a later step that runs a downloaded file with no checksum is refused": (
+        _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: chmod +x f && ./f\n"), None, 1, "downloaded"),
+    "r7 F3: a later step that checks the downloaded file passes": (
+        _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: |\n          " + R7_VERIFY + "\n          tar xzf f\n"), None, 0, ""),
+    # --- F5: a download that no fetch word names.
+    "r7 F5: a /dev/tcp redirect is refused": (_r7("exec 3<>/dev/tcp/x.example/80", "echo ok"), None, 1, "/dev/tcp"),
+    "r7 F5: a /dev/tcp read is refused": (_r7("cat < /dev/tcp/x.example/80 > f"), None, 1, "/dev/tcp"),
+    "r7 F5: python urllib in -c is refused": (_r7("python3 -c 'import urllib.request as u; u.urlretrieve(\"https://x.example/f\", \"f\")'", "sh f"), None, 1, "fetch step"),
+    "r7 F5: python -m urllib.request is refused": (_r7("python3 -m urllib.request https://x.example/f", "sh f"), None, 1, "fetch step"),
+    "r7 F5: gh release download then a run is refused": (_r7("gh release download v1 -p f", "sh f"), None, 1, "fetch step"),
+    "r7 F5: docker run of a tag-only image is refused": (_r7("docker run --rm alpine:3 sh -c ls"), None, 1, "fetch step"),
+    "r7 F5: docker pull is refused": (_r7("docker pull alpine:3"), None, 1, "fetch step"),
+    "r7 F5: docker run of a digest-pinned image passes": (_r7("docker run --rm alpine@" + R5_DIGEST + " ls"), None, 0, ""),
+    "r7 F5: gh attestation verify is not a fetch": (_r7("gh attestation verify f --repo o/r", "sh f"), None, 0, ""),
+    # --- N6: depth counts on the resolved path; a walked action is still depth-checked; a loop is refused.
+    "r7 N6: a deep chain reached after a shallow visit is still refused": (
+        _r5_job(steps="    steps:\n      - uses: ./n2\n      - uses: ./n0\n"), {**{"n%d/action.yml" % k: _r5_comp(("    - uses: ./n%d\n" % (k + 1)) if k < 9 else "    - run: echo ok\n      shell: bash\n") for k in range(10)}}, 1, "nests more than"),
+    "r7 N6: the same shallow action used twice passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL + R5_LOCAL), _r5_act(_r5_comp("    - run: echo ok\n      shell: bash\n")), 0, ""),
+}
+
+
 def r5_errors(doc_text: str, files: Optional[Dict[str, str]], tree: Path) -> List[str]:
     """Run the Round-5 checks on one document (and, for ``files`` not None, a tree holding those files)."""
     if tree.exists():
@@ -3531,6 +3626,13 @@ def self_test(root: Path) -> int:
                       file=sys.stderr)
                 failures += 1
 
+        for name, (doc_text, files, count, needle) in R7_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r7")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+
         # --- through the real entry point: exit codes for unreadable input.
         for name, (setup, want_rc) in ENTRY_CASES.items():
             case_root = tmp / "entry"
@@ -3547,7 +3649,7 @@ def self_test(root: Path) -> int:
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
         f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
-        f"{len(R5_CASES)} round-5/6 cases, {len(JOINED_CASES)} joined cases)"
+        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 
