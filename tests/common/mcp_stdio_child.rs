@@ -112,7 +112,10 @@ impl Mcp {
             output,
             next_id: 1,
         };
-        let response = mcp.request(&json!({"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fit4059","version":"1"}}}));
+        // #6157 — the handshake asks for the server's own newest supported
+        // revision (SSOT), not a hand-copied literal that drifts.
+        let revision = ai_memory::mcp::jsonrpc::NEWEST_PROTOCOL_REVISION;
+        let response = mcp.request(&json!({"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"fit4059","version":"1"}}}));
         assert!(response.get("error").is_none(), "initialize: {response}");
         mcp
     }
