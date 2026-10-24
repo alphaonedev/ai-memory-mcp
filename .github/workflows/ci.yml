@@ -709,6 +709,10 @@ jobs:
       # they are set, so the pair can never drift apart.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # #7795 admission reserves, not guaranteed minima. Evidence is in
+      # docs/ci/CARRIER-BRANCH-GATES.md; targeted subsets reserve no full suite.
+      LOAD_GATE_SELF_HOSTED: ${{ contains(matrix.runner, 'self-hosted') }}
+      LOAD_GATE_MIN_SUITE_SECS: ${{ (needs.classify.outputs.test_impact == '__ALL__' || needs.classify.outputs.test_impact == '') && (matrix.tier == 'enterprise-fed' && 3913 || 1500) || 0 }}
     strategy:
       fail-fast: false
       # #7188 - concurrency cap: at most 3 of this job's 4 legs run at once per
@@ -1285,7 +1289,7 @@ jobs:
       # Self-hosted legs only: hosted runners are dedicated VMs.
       - name: Load gate (#6795)
         if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
-        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}" --job-timeout-minutes "${{ matrix.timeout }}" --min-suite-secs "$LOAD_GATE_MIN_SUITE_SECS"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
@@ -1521,6 +1525,13 @@ jobs:
           else
             echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} — no coreutils gtimeout/timeout found (job-level timeout-minutes still applies)"
           fi
+          # #7795 compile can consume the budget after the initial load gate.
+          # Recheck immediately before test execution, without another wait.
+          check_suite_budget() {
+            if [ "${LOAD_GATE_SELF_HOSTED:-false}" = "true" ]; then
+              python3 -I scripts/ci/load_gate.py --label "$CI_NODE/$TIER pre-test" --max-wait-secs 0 --job-timeout-minutes "$JOB_TIMEOUT_MIN" --min-suite-secs "$LOAD_GATE_MIN_SUITE_SECS" || return "$?"
+            fi
+          }
           # #6795 — seconds left under the job timeout-minutes, minus 300 s for
           # teardown/upload, so a watchdog always fires (named) before GitHub's
           # nameless job cancel. Floor 60 s: `timeout 0` would mean no limit.
@@ -1558,6 +1569,10 @@ jobs:
             # still bounds the build. A genuine runtime hang still trips the
             # $WATCHDOG_SECS cap below.
             cargo test --no-run "$@" || return "$?"
+            # Sharded enterprise runs check once before the whole shard group.
+            if [ "${TIER:-sqlite}" != "enterprise-fed" ]; then
+              check_suite_budget || return "$?"
+            fi
             # `--no-fail-fast` (#2500) — see the identical rationale on
             # `pg_test` in the postgres-feature job below. Cargo otherwise
             # exits after the FIRST failing test executable, so on the
@@ -1770,6 +1785,7 @@ jobs:
             if [ "$PG_ISO_LANE" = "1" ]; then
               python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
             fi
+            check_suite_budget || return "$?"
             # #6795: the serial shard cannot be split further, so it gets the
             # whole job time left (job cap - time since the job started, which
             # includes the load-gate wait, setup, compile and partition - 300 s
