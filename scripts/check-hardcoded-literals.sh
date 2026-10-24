@@ -197,20 +197,18 @@ if [[ "${1:-}" == "--self-test" ]]; then
     probe_dup="${ROOT}/src/.hardcoded_literal_gate_probe.rs"
     probe_mb="${ROOT}/src/.hardcoded_literal_gate_probe_mb.rs"
     for probe in "$probe_dup" "$probe_mb"; do
-        if [[ -e "$probe" ]]; then
+        if [[ -e "$probe" || -L "$probe" ]]; then
             echo "ERROR: self-test scratch already exists: $probe" >&2
             exit 2
         fi
     done
     # Always remove the planted files, including on a kill: a leftover
-    # contrived .rs under src/ would break the build for everyone.
-    self_test_cleanup () { rm -f "$probe_dup" "$probe_mb"; }
-    # #7920: INT/TERM clean up then re-raise so the run dies of the signal
-    # instead of resuming (an EXIT INT TERM handler that returns lets the
-    # interrupted self-test finish).
-    trap self_test_cleanup EXIT
-    trap 'self_test_cleanup; trap - INT; kill -INT $$' INT
-    trap 'self_test_cleanup; trap - TERM; kill -TERM $$' TERM
+    # contrived .rs under src/ would break the build for everyone. The shared
+    # helper runs the gate child in the background in its own process group,
+    # so INT/TERM stop it at once, remove the probes and re-raise (#7920,
+    # #8244); see scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$probe_dup" "$probe_mb"
 
     # Probe A — a brand-new magic string on 3 production sites (absent from baseline).
     cat > "$probe_dup" <<'EOF'
@@ -276,14 +274,16 @@ EOF
     ref_violations=""
     ref_awk=""
     for awk_bin in "${awk_bins[@]}"; do
-        set +e
         # Re-enter through the INTERPRETER WE ARE RUNNING UNDER, never the
         # shebang: `#!/usr/bin/env bash` resolves to whatever bash is first on
         # PATH, which on macOS with /usr/bin ahead of the homebrew prefix is
         # stock bash 3.2 — the child would then die on the bash>=4 guard and
         # the self-test would report a phantom failure (#3537).
-        gate_output="$(AWK_BIN="$awk_bin" "${BASH:-bash}" "$0" 2>&1)"
-        gate_exit=$?
+        # errexit stays off across the run: the helper's INT/TERM cleanup
+        # `wait`s the killed child, and a non-zero wait status under set -e
+        # would end the trap before it re-raises the signal (#7920, #8244).
+        set +e
+        AWK_BIN="$awk_bin" selftest_run gate_output gate_exit "${BASH:-bash}" "$0"
         set -e
         violations="$(printf '%s\n' "$gate_output" | grep -E '^[[:space:]]*\+[0-9]+ \(baseline ' || true)"
 
@@ -324,8 +324,7 @@ EOF
         fi
     done
 
-    self_test_cleanup
-    trap - EXIT INT TERM
+    selftest_probes_disarm
 
     echo ""
     if (( st_status == 0 )); then
