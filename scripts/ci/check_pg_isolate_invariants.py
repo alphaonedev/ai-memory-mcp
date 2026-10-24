@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Invariants of the opt-in per-binary Postgres isolation lane (#6383 / #6386).
+"""Invariants of the per-binary Postgres isolation lane (#6383 / #6386).
 
 Replaces the r1 shell Section G of scripts/test/test-ci-workflow-invariants.sh
 (review r1 L1). Checks, each with an id that names its review finding:
 
-G1-opt-in              ci.yml never turns AI_MEMORY_TEST_PG_ISOLATE on (no
-                       ``=`` assignment other than 0, no YAML env key). M4.
+G1-default-on          AI_MEMORY_TEST_PG_ISOLATE is 1 ONLY through the
+                       enterprise-fed tier expression in the ``check`` job env
+                       (both fed legs), every other assignment is 0, and the
+                       CI_PG_ISOLATE_OFF kill-switch branch still forces 0.
+                       Decision 919f1943, 3-agent vote (6def5ab6), 2026-10-24,
+                       supersedes the r1 M4 opt-in rule (vote 4d3ea1c5).
 G2-no-ci-sweep         ci.yml never runs the admin-only cross-run sweep. H2.
 G3-no-url-argv         no wrapper call in ci.yml passes ``--url``. L3.
 G4-setup-teardown      ci.yml runs both ``setup`` and ``teardown``.
@@ -41,8 +45,15 @@ RUN_FLAGS = ('--url', '--run-id', '--template', '--log-dir', '--targets-file', '
              '--residual-file', '--test-arg')
 FORCE = 'WITH (FORCE)'
 
+FED_EXPR = "${{ matrix.tier == 'enterprise-fed' && '1' || '0' }}"
+FED_LEGS = ('leg: linux-fed,enterprise-fed', 'leg: macos-fed,enterprise-fed')
+KILL_BRANCH_RE = re.compile(r'elif \[ "\$\{CI_PG_ISOLATE_OFF:-\}" = "1" \]; then\n\s+'
+                            r'echo "%s=0" >> "\$GITHUB_ENV"' % FLAG)
+
 _ASSIGN_RE = re.compile(r'\b%s=(?!0\b)' % FLAG)
-_YAML_KEY_RE = re.compile(r'^\s*%s\s*:' % FLAG, re.M)
+_YAML_KEY_RE = re.compile(r'^\s*%s\s*:\s*(.*?)\s*$' % FLAG)
+_ZERO_VALUES = ('0', '"0"', "'0'")
+_JOB_RE = re.compile(r'^  [A-Za-z0-9_-]+:\s*$', re.M)
 _STEP_RE = re.compile(r'^\s*- name:', re.M)
 
 Failure = Tuple[str, str]
@@ -57,15 +68,49 @@ def _steps(text: str) -> List[str]:
     return [text[a:b] for a, b in zip(starts, starts[1:])]
 
 
+def _check_job_head(text: str) -> str:
+    """The ``check`` job from its header to its ``steps:`` key (the job-level env lives there)."""
+    start = re.search(r'^  check:\s*$', text, re.M)
+    if not start:
+        return ''
+    rest = text[start.end():]
+    nxt = _JOB_RE.search(rest)
+    body = rest[:nxt.start()] if nxt else rest
+    return body.split('\n    steps:', 1)[0]
+
+
+def default_on_failures(ci_text: str, code: List[str]) -> List[str]:
+    """Reasons the G1 default-on posture does not hold; empty when it does."""
+    problems: List[str] = []
+    bad = [ln.strip() for ln in code if _ASSIGN_RE.search(ln)]
+    if bad:
+        problems.append('shell assignment other than 0: %s' % bad[:3])
+    for ln in code:
+        found = _YAML_KEY_RE.match(ln)
+        if found and found.group(1) not in _ZERO_VALUES and found.group(1) != FED_EXPR:
+            problems.append('env key value is neither 0 nor the enterprise-fed expression: %s' % ln.strip())
+    head = _check_job_head(ci_text)
+    keyed = [ln for ln in code if _YAML_KEY_RE.match(ln) and FED_EXPR in ln]
+    in_head = [ln for ln in head.splitlines() if _YAML_KEY_RE.match(ln) and FED_EXPR in ln]
+    if len(keyed) != 1 or len(in_head) != 1:
+        problems.append('the enterprise-fed expression must be set exactly once, in the check job env (found %d)'
+                        % len(keyed))
+    if not all(leg in head for leg in FED_LEGS):
+        problems.append('the check matrix lost an enterprise-fed fed leg')
+    if not KILL_BRANCH_RE.search(ci_text):
+        problems.append('the CI_PG_ISOLATE_OFF kill-switch branch no longer forces the flag to 0')
+    return problems
+
+
 def static_failures(ci_text: str, repo: Path) -> List[Failure]:
     """Every failed ci.yml invariant as ``(id, message)``; empty when all hold."""
     del repo  # kept for a stable signature; ci.yml checks are text-only
     out: List[Failure] = []
     code = _code_lines(ci_text)
-    assigns = [ln.strip() for ln in code if _ASSIGN_RE.search(ln)]
-    if assigns or _YAML_KEY_RE.search(ci_text):
-        out.append(('G1-opt-in', 'ci.yml turns %s on (opt-in; vote 4d3ea1c5): %s'
-                    % (FLAG, assigns[:3] or 'YAML env key')))
+    default_on = default_on_failures(ci_text, code)
+    if default_on:
+        out.append(('G1-default-on', '%s must be 1 only for the enterprise-fed tier of the fed legs '
+                    '(decision 919f1943, 3-agent vote (6def5ab6)): %s' % (FLAG, '; '.join(default_on))))
     calls = [ln for ln in code if WRAPPER in ln]
     if any(WRAPPER + ' sweep' in ln for ln in calls):
         out.append(('G2-no-ci-sweep', 'ci.yml runs the admin-only cross-run sweep'))

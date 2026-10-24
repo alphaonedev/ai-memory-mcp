@@ -685,6 +685,17 @@ jobs:
     # for the gate.
     timeout-minutes: ${{ matrix.timeout }}
     env:
+      # #6383 / #6386 - per-binary Postgres isolation is ON by default for the
+      # enterprise-fed tier, i.e. BOTH fed legs (linux-fed,enterprise-fed and
+      # macos-fed,enterprise-fed), and for no other cell: every other leg gets
+      # 0. Decision 919f1943 (3-agent vote (6def5ab6), 2026-10-24, supersedes
+      # the opt-in posture of 4d3ea1c5); the enabling PR's own two green
+      # full-suite sharded runs are the two qualifying runs. The hard kill
+      # switch is the repository variable CI_PG_ISOLATE_OFF=1 (the configure
+      # step forces the flag to 0 and the run step falls back to the shared
+      # database); it is the ONLY way to turn the lane off on a fed leg.
+      # In-binary --test-threads is unchanged (a separate decision).
+      AI_MEMORY_TEST_PG_ISOLATE: ${{ matrix.tier == 'enterprise-fed' && '1' || '0' }}
       # Debuginfo budget for this job — the heaviest compile in CI (~600
       # integration test binaries per leg).
       #
@@ -1183,24 +1194,27 @@ jobs:
           fi
           echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
           echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
-          # #6383 / #6386 — per-binary Postgres isolation, OPT-IN (decided by
-          # GOD, review r1 M4): it runs only when AI_MEMORY_TEST_PG_ISOLATE is 1
-          # already in the job environment, and this workflow sets it on NO leg.
-          # Default-on (and --test-threads>1) waits for two green sharded
-          # carrier runs and a 5-agent vote (4d3ea1c5). CI_PG_ISOLATE_OFF=1
-          # (repo variable) is an extra hard kill switch. When on: assert the
-          # LIVE connection budget (fails closed), build the locked age+vector
-          # template, and export the template and this run's id (clone names
-          # carry it, so teardown touches only this run's clones). The URL
-          # reaches the wrapper through the environment, never argv.
+          # #6383 / #6386 — per-binary Postgres isolation is ON by default for
+          # the enterprise-fed tier on both fed legs: the job env sets
+          # AI_MEMORY_TEST_PG_ISOLATE to 1 for matrix.tier enterprise-fed and 0
+          # elsewhere (decision 919f1943, 3-agent vote (6def5ab6), 2026-10-24,
+          # supersedes 4d3ea1c5). CI_PG_ISOLATE_OFF=1 (repo variable) is the
+          # hard kill switch and the only way to turn it off; --test-threads is
+          # unchanged. When on: assert the LIVE connection budget (fails
+          # closed), build the locked age+vector template, and export the
+          # template and this run's id (clone names carry it, so teardown
+          # touches only this run's clones). The URL reaches the wrapper
+          # through the environment, never argv.
           if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" != "1" ]; then
-            echo "::notice::[#6383] per-binary Postgres isolation is off (opt-in; not enabled for this leg)"
+            echo "::notice::[#6383] per-binary Postgres isolation OFF: the flag is not 1 in the job environment (this tier is not enterprise-fed)"
           elif [ "${CI_PG_ISOLATE_OFF:-}" = "1" ]; then
             echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"
-            echo "::notice::[#6383] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1"
+            echo "::notice::[#6383] per-binary Postgres isolation OFF: disabled by the CI_PG_ISOLATE_OFF=1 kill switch"
           else
-            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
-            echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
+            iso_env="$(AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env)"
+            printf '%s\n' "$iso_env" >> "$GITHUB_ENV"
+            iso_run_id="$(printf '%s\n' "$iso_env" | sed -n 's/^AI_MEMORY_TEST_PG_RUN_ID=//p')"
+            echo "::notice::[#6383] per-binary Postgres isolation ON (default for enterprise-fed): template ${CI_FED_DB}_tpl, run id ${iso_run_id}"
           fi
 
       # #7485 / #7457 — the LiveEndToEnd cells of the Postgres isolation wrapper need a real server, and
@@ -1318,9 +1332,10 @@ jobs:
               ;;
             *) JOB_T0_VALID=1 ;;
           esac
-          # #6383 / #6386 — the per-binary isolated lane is OPT-IN (review r1
-          # M4): it runs only with AI_MEMORY_TEST_PG_ISOLATE at 1 (set by no leg of
-          # this workflow), never with CI_PG_ISOLATE_OFF=1, and only on the
+          # #6383 / #6386 — the per-binary isolated lane is ON by default for the
+          # enterprise-fed tier (decision 919f1943, 3-agent vote (6def5ab6)): it runs
+          # with AI_MEMORY_TEST_PG_ISOLATE at 1 (the job env sets it for that tier
+          # only), never with CI_PG_ISOLATE_OFF=1, and only on the
           # enterprise-fed tier. With it on, the template and run id exported by
           # the configure step are REQUIRED (review r1 M6: fail, never skip),
           # so a residual binary can never clone the shared database. With it
@@ -1334,6 +1349,11 @@ jobs:
             PG_ISO_LANE=1
           else
             export AI_MEMORY_TEST_PG_ISOLATE=0
+            if [ "${CI_PG_ISOLATE_OFF:-}" = "1" ]; then
+              echo "::notice::[#6383] isolated lane OFF: CI_PG_ISOLATE_OFF=1 kill switch (shared database, serial binaries)"
+            else
+              echo "::notice::[#6383] isolated lane OFF: this tier (${TIER:-sqlite}) is not enterprise-fed"
+            fi
           fi
           # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
           # `enterprise-fed` legs add `--features sal-postgres` and serialise
@@ -1637,7 +1657,7 @@ jobs:
             fi
             return "$rc"
           }
-          # #6383 / #6386 — class (a) binaries when the opt-in lane is on:
+          # #6383 / #6386 — class (a) binaries when the isolated lane is on:
           # each binary runs `cargo test --no-fail-fast --test <bin>` against its
           # OWN database cloned from the template, 8 at a time, in-binary
           # --test-threads=1 unchanged (raising it is a T3/T6 vote item). The
@@ -1987,7 +2007,7 @@ jobs:
           # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
           # terminates any lingering backend so the drop cannot wedge on a
           # still-connected test process.
-          # #6383: when the opt-in lane exported a run id, drop THIS run's
+          # #6383: when the isolated lane exported a run id, drop THIS run's
           # leftover clones and the locked template first (no FORCE; another
           # run's clones are never touched). Anything left behind is reclaimed
           # by the admin-only `pg_isolated_binary.py sweep --older-than N`,
