@@ -400,9 +400,10 @@ class ComparisonTests(unittest.TestCase):
 
 
 class GitLimitsTests(unittest.TestCase):
-    """#8146: a kernel-refused rlimit must not abort the git child hook."""
+    """#8146 / #8213: a refused rlimit is tolerated only while a finite stricter bound is already in force."""
 
-    def run_git_limits(self, refused, error=ValueError):
+    def run_git_limits(self, refused, error=ValueError, current=None, platform='linux'):
+        """Refuse one resource; `current(compare)` is the soft limit getrlimit then reports for it."""
         compare = module('compare_8146', 'scripts/claude-md-rule-compare.py')
         calls = []
 
@@ -411,7 +412,13 @@ class GitLimitsTests(unittest.TestCase):
             if which == refused(compare):
                 raise error('current limit exceeds maximum limit')
 
-        with unittest.mock.patch.object(compare.resource, 'setrlimit', fake_setrlimit):
+        def fake_getrlimit(which):
+            soft = current(compare) if current is not None else compare.resource.RLIM_INFINITY
+            return (soft, compare.resource.RLIM_INFINITY)
+
+        with unittest.mock.patch.object(compare.resource, 'setrlimit', fake_setrlimit), \
+                unittest.mock.patch.object(compare.resource, 'getrlimit', fake_getrlimit), \
+                unittest.mock.patch.object(compare.sys, 'platform', platform):
             compare.git_limits()
         return compare, calls
 
@@ -420,12 +427,34 @@ class GitLimitsTests(unittest.TestCase):
         self.assertEqual(calls, [(compare.resource.RLIMIT_FSIZE, (fsize, fsize)),
                                  (compare.resource.RLIMIT_AS, (mem, mem))])
 
-    def test_refused_leading_limit_is_skipped_and_later_limit_still_applied(self):
+    def test_refused_leading_limit_with_stricter_bound_is_tolerated_and_later_limit_applied(self):
         """A break instead of continue would drop the address-space bound; the OSError arm is covered here."""
-        self.assert_full_sequence(*self.run_git_limits(lambda c: c.resource.RLIMIT_FSIZE, OSError))
+        self.assert_full_sequence(*self.run_git_limits(
+            lambda c: c.resource.RLIMIT_FSIZE, OSError, current=lambda c: c.MAX_GIT_FILE_BYTES - 1))
 
-    def test_refused_address_space_limit_is_skipped_and_file_limit_applied_exactly(self):
-        self.assert_full_sequence(*self.run_git_limits(lambda c: c.resource.RLIMIT_AS))
+    def test_refused_address_space_limit_with_equal_bound_is_tolerated(self):
+        self.assert_full_sequence(*self.run_git_limits(
+            lambda c: c.resource.RLIMIT_AS, current=lambda c: c.MAX_GIT_MEMORY_BYTES))
+
+    def test_refused_limit_with_unlimited_bound_in_force_fails_closed(self):
+        for resource_name, error in (('RLIMIT_FSIZE', OSError), ('RLIMIT_AS', ValueError)):
+            with self.subTest(resource=resource_name):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.run_git_limits(lambda c, n=resource_name: getattr(c.resource, n), error)
+                self.assertIn(resource_name, str(caught.exception))
+
+    def test_refused_limit_with_looser_finite_bound_in_force_fails_closed(self):
+        with self.assertRaises(RuntimeError):
+            self.run_git_limits(lambda c: c.resource.RLIMIT_FSIZE, OSError,
+                                current=lambda c: c.MAX_GIT_FILE_BYTES + 1)
+
+    def test_darwin_refused_memory_limit_is_tolerated_without_a_bound(self):
+        self.assert_full_sequence(*self.run_git_limits(
+            lambda c: c.resource.RLIMIT_AS, platform='darwin'))
+
+    def test_darwin_refused_file_limit_still_fails_closed(self):
+        with self.assertRaises(RuntimeError):
+            self.run_git_limits(lambda c: c.resource.RLIMIT_FSIZE, OSError, platform='darwin')
 
 
 class ResourceTests(unittest.TestCase):
