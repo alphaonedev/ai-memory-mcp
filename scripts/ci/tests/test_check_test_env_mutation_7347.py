@@ -4201,7 +4201,7 @@ R27_SHADOWED = (  # (name, row): each one rebinds a recognised name below the cr
     ("R29-1-crate-name-name-colon-prefix", r27_row("use ::ai_memory::ai_memory;\n", "", "pub mod ai_memory {}\n")),
     ("R29-1-crate-name-name-in-mod", r27_row("mod w { use ai_memory::ai_memory; }\n", "", "pub mod ai_memory {}\n")),
     ("R29-1-crate-name-name-in-fn", r27_row("fn g() { use ai_memory::ai_memory; }\n", "", "pub mod ai_memory {}\n")),
-    ("R28-1-serde-fan-as-serde",r27_row("use serde::Fan as serde;\n", cargo=R28_CARGO_PLAIN)),
+    ("R28-1-serde-fan-as-serde", r27_row("use serde::Fan as serde;\n", cargo=R28_CARGO_PLAIN)),
 )
 R27_CLEAN = (  # (name, row): no diagnostic, the verdict of the file is the gate's own
     ("false-positive-helpers-mod", r27_row("mod w { pub mod helpers {} }\nuse ai_memory::Fan;\n", lib=R27_LIB_STRUCT)),
