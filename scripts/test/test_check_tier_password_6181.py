@@ -174,7 +174,7 @@ class TestCheckTierPassword6181(unittest.TestCase):
                     f"postgres://u:{pw}@[::1]:5445,{host}:5446/db",
                     f"postgres://u:{pw}@h1:5445,[::1]:5446,{host}/db",
                     f"postgres://u:{pw}@h1/db?host=h1,{host}",
-                    f"postgres://u:{pw}@/db?hostaddr=10.0.0.1,{host}"):
+                    f"postgres://u:{pw}@/db?hostaddr=192.0.2.1,{host}"):
             with self.subTest(url=url.split("@", 1)[1]):
                 self.assert_refused(url, "contains the host component", [pw, host])
         # control: the same rule for a single host, and a distinct password with a host list still passes

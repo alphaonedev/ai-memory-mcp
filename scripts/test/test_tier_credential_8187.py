@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci/tier_credential.py"
 PASSWORD = "q7Zr-Lm2_Xv9Kd4TgPw8Hn3Bs6Jc1Yf5AeUo0iRt"
 USER = "tier_role_8187"
-URL = f"postgres://{USER}:{PASSWORD}@10.9.8.7:5445/ai_memory_test?sslmode=verify-full&sslrootcert=/etc/ssl/tier-ca.pem"
+URL = f"postgres://{USER}:{PASSWORD}@192.0.2.7:5445/ai_memory_test?sslmode=verify-full&sslrootcert=/etc/ssl/tier-ca.pem"
 FAKE_PSQL = """#!{python}
 import json, os, sys
 with open(os.environ["FAKE_OUT"], "w") as handle:
@@ -80,11 +80,11 @@ class TestRunHandsOverThroughTheEnvironment(TierCredentialCase):
         env = seen["env"]
         self.assertEqual({k: env[k] for k in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGSSLMODE",
                                               "PGSSLROOTCERT")},
-                         {"PGHOST": "10.9.8.7", "PGPORT": "5445", "PGUSER": USER, "PGPASSWORD": PASSWORD,
+                         {"PGHOST": "192.0.2.7", "PGPORT": "5445", "PGUSER": USER, "PGPASSWORD": PASSWORD,
                           "PGDATABASE": "ai_memory_test", "PGSSLMODE": "verify-full",
                           "PGSSLROOTCERT": "/etc/ssl/tier-ca.pem"})
         for arg in seen["argv"]:
-            for secret in (PASSWORD, USER, "10.9.8.7", "postgres://"):
+            for secret in (PASSWORD, USER, "192.0.2.7", "postgres://"):
                 self.assertNotIn(secret, arg, "no credential or URL part may reach the child argv")
         self.assertNotIn("AI_MEMORY_TEST_POSTGRES_URL", env, "the URL is exported only on request")
 
@@ -139,7 +139,7 @@ class TestRefusals(TierCredentialCase):
         self.assertIn("::error::tier_credential:", out)
         for text in must:
             self.assertIn(text, out)
-        for secret in (PASSWORD, USER, "10.9.8.7", "postgres://", "tier-ca"):
+        for secret in (PASSWORD, USER, "192.0.2.7", "postgres://", "tier-ca"):
             self.assertNotIn(secret, out, "a refusal must never print the file text")
         self.assertFalse(self.out.exists(), "the child must not run after a refusal")
 
