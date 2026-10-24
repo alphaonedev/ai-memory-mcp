@@ -574,52 +574,22 @@ def pin_entry(body):
             "lines": [hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in body.split("\n")]}
 
 
-def load_pins():
-    """The pinned post-export steps, ``{workflow:job:step-name: pin_entry(exact body text)}``."""
-    return json.loads(PINS_FILE.read_text(encoding="utf-8"))
+def job_pin_problems(workflow, text, pins=None):
+    """Placeholder for the red commit: no job pin check yet."""
+    return []
 
 
-def first_difference(pinned, found):
-    """(line number, found line) of the first line of ``found`` that differs from the pinned line hashes."""
-    new = found.split("\n")
-    old = pinned["lines"]
-    for number in range(max(len(old), len(new))):
-        if number >= len(new):
-            return number + 1, "<the step ends here; pinned lines are missing>"
-        if number >= len(old) or pin_entry(new[number])["lines"][0] != old[number]:
-            return number + 1, new[number].strip()[:120]
-    return 0, ""
+def load_job_pins():
+    return {}
 
 
-def pin_problems(workflow, text, pins=None):
-    """Problems of the post-export steps of one workflow against the exact-text pins (r6 F10).
+def job_layout(text):
+    return [], []
 
-    Fails when no step exports the URL, when a post-export step is not pinned (new or renamed), when a pinned step is
-    gone, when a body differs from its pin, or when the order changed.  Messages carry the workflow, job, step name
-    and the first differing line; workflow bodies hold no secret.
-    """
-    pins = load_pins() if pins is None else pins
-    found = post_export_steps(workflow, text)
-    if not found:
-        return [f"{workflow}: no step exports the tier URL to GITHUB_ENV, so the post-export pin cannot be placed"]
-    pinned = {key: body for key, body in pins.items() if key.startswith(workflow + ":")}
-    problems = []
-    for key, body in found:
-        _wf, job, name = key.split(":", 2)
-        if key not in pinned:
-            problems.append(f"{workflow} job {job} step '{name}': post-export step is not in the pin (new or renamed)")
-        elif pinned[key]["sha256"] != pin_entry(body)["sha256"]:
-            number, new = first_difference(pinned[key], body)
-            problems.append(f"{workflow} job {job} step '{name}': body differs from the pin at line {number}: "
-                            f"found '{new}'")
-    present = {key for key, _ in found}
-    for key in pinned:
-        if key not in present:
-            _wf, job, name = key.split(":", 2)
-            problems.append(f"{workflow} job {job} step '{name}': pinned post-export step is missing")
-    if not problems and [key for key, _ in found] != list(pinned):
-        problems.append(f"{workflow}: the post-export steps changed order")
-    return problems
+
+def tier_blocks(jobs):
+    return []
+
 
 
 def joined_lines(lines):
@@ -887,31 +857,67 @@ def pin_targets(workflow, text):
     return chosen
 
 
-class TestPostExportStepsArePinned8187(unittest.TestCase):
-    """r6 F10: every step that runs with the exported tier URL in its environment is pinned as exact text."""
+def section_end(text):
+    """Index (in ``text.split("\\n")``) just past the last line of the ``jobs:`` section."""
+    lines = text.split("\n")
+    head = next(i for i, ln in enumerate(lines) if re.match(r"^jobs:\s*$", ln))
+    for i in range(head + 1, len(lines)):
+        if lines[i].strip() and not lines[i].startswith((" ", "#")):
+            return i
+    return len(lines)
+
+
+def tier_job(workflow, text):
+    """Name of the one job of the workflow that exports the tier URL (found on the real text)."""
+    return post_export_steps(workflow, text)[0][0].split(":")[1]
+
+
+def job_steps(workflow, text):
+    return [s for s in workflow_steps(text) if s[0] == tier_job(workflow, text)]
+
+
+def splice(text, at, new_lines):
+    lines = text.split("\n")
+    return "\n".join(lines[:at] + new_lines + lines[at:])
+
+
+EXPORT_LINE = 'python3 -I ' + HELPER + ' github-env --url-file "$url_file" --database "$CI_FED_DB"'
+PRE_EXPORT_HOOKS = {
+    "BASH_ENV": 'echo "BASH_ENV=$RUNNER_TEMP/hook.sh" >> "$GITHUB_ENV"',
+    "LD_PRELOAD": 'echo "LD_PRELOAD=$RUNNER_TEMP/hook.so" >> "$GITHUB_ENV"',
+    "NODE_OPTIONS": 'echo "NODE_OPTIONS=--require $RUNNER_TEMP/hook.js" >> "$GITHUB_ENV"',
+    "PATH file": 'echo "$RUNNER_TEMP/shim" >> "$GITHUB_PATH"',
+}
+
+
+class TestExportJobIsPinned8187(unittest.TestCase):
+    """r7 F11: the complete job that exports the tier URL is pinned, every line of it, and so is the set of jobs."""
 
     @classmethod
     def setUpClass(cls):
         cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
-        cls.pins = load_pins()
+        cls.pins = load_job_pins()
+
+    def caught(self, workflow, edited, label):
+        self.assertTrue(job_pin_problems(workflow, edited, self.pins), f"{workflow}: mutant not caught: {label}")
 
     def test_the_real_workflows_match_their_pins(self):
         for wf, text in self.texts.items():
             with self.subTest(workflow=wf):
-                self.assertEqual(pin_problems(wf, text, self.pins), [])
-                self.assertTrue(post_export_steps(wf, text), "no post-export step found: the export call moved")
+                self.assertEqual(job_pin_problems(wf, text, self.pins), [])
+                self.assertTrue(self.pins.get(wf, {}).get("pinned"), "no job is pinned for this workflow")
 
-    def test_the_pin_table_holds_exactly_the_post_export_steps(self):
-        expected = {}
+    def test_the_pin_table_holds_exactly_the_jobs_that_name_the_tier(self):
+        self.assertEqual(sorted(self.pins), sorted(PIN_WORKFLOWS))
         for wf, text in self.texts.items():
-            expected.update(dict(post_export_steps(wf, text)))
-        self.assertEqual(list(self.pins), list(expected))
-        for key, body in self.pins.items():
-            with self.subTest(step=key):
-                self.assertEqual(body, pin_entry(expected[key]))
-                self.assertIn(key.split(":", 1)[0], PIN_WORKFLOWS)
+            jobs, problems = job_layout(text)
+            self.assertEqual(problems, [])
+            self.assertEqual(self.pins[wf]["jobs"], [j[0] for j in jobs])
+            for name, block in tier_blocks(jobs):
+                self.assertEqual(self.pins[wf]["pinned"][name], pin_entry(block), f"{wf}:{name}")
+            self.assertEqual(sorted(self.pins[wf]["pinned"]), sorted(n for n, _ in tier_blocks(jobs)))
 
-    def test_every_dump_form_in_a_post_export_step_fails_the_pin(self):
+    def test_every_dump_form_after_the_export_fails_the_pin(self):
         forms = {**DUMP_MUTANTS, **F10_MUTANTS}
         self.assertGreaterEqual(len(forms), 57)
         for wf, text in self.texts.items():
@@ -923,60 +929,99 @@ class TestPostExportStepsArePinned8187(unittest.TestCase):
                         edited = inject_run_line(text, step, line)
                         self.assertIsNotNone(edited)
                         self.assertNotEqual(edited, text, "the mutation did not apply")
-                        self.assertTrue(pin_problems(wf, edited, self.pins), f"mutant not caught: {label}")
+                        self.caught(wf, edited, label)
 
-    def test_a_new_post_export_step_fails_the_pin(self):
-        new_step = ["      - name: Harmless looking addition", "        run: echo hello"]
+    def test_a_second_job_with_four_space_steps_that_exports_and_dumps_fails_8187_f11a(self):
         for wf, text in self.texts.items():
-            steps_found = workflow_steps(text)
-            posts = [s for s in steps_found if f"{wf}:{s[0]}:{s[1]}" in self.pins]
-            self.assertTrue(posts)
-            lines = text.split("\n")
-            for label, at in (("after the first post-export step", posts[0][4]),
-                              ("after the last post-export step", posts[-1][4])):
-                with self.subTest(workflow=wf, where=label):
-                    edited = "\n".join(lines[:at] + new_step + lines[at:])
-                    problems = pin_problems(wf, edited, self.pins)
-                    self.assertTrue(any("Harmless looking addition" in p and "not in the pin" in p for p in problems),
-                                    problems)
+            at = section_end(text)
+            steps_four = ["  second:", "    runs-on: ubuntu-latest", "    steps:", "    - name: Export",
+                          "      run: |", "        " + EXPORT_LINE, "    - name: Dump", "      run: printenv | base64"]
+            nested_job = ["    nested:", "      runs-on: ubuntu-latest", "      steps:", "      - run: |",
+                          "          " + EXPORT_LINE, "      - run: busybox env | base64"]
+            for label, new in (("four-space steps", steps_four), ("job key at four spaces", nested_job),
+                               ("six-space steps", [ln.replace("    ", "      ", 1) if i else ln
+                                                    for i, ln in enumerate(steps_four)])):
+                with self.subTest(workflow=wf, shape=label):
+                    self.caught(wf, splice(text, at, new), label)
 
-    def test_a_removed_or_renamed_post_export_step_fails_the_pin(self):
+    def test_keys_after_a_column_zero_comment_stay_pinned_8187_f11b(self):
         for wf, text in self.texts.items():
-            steps_found = workflow_steps(text)
-            posts = [s for s in steps_found if f"{wf}:{s[0]}:{s[1]}" in self.pins]
-            victim = posts[-1]
-            lines = text.split("\n")
-            with self.subTest(workflow=wf, edit="removed"):
-                edited = "\n".join(lines[:victim[3]] + lines[victim[4]:])
-                self.assertTrue(pin_problems(wf, edited, self.pins))
-            if victim[2].lstrip().startswith("- name:"):
-                with self.subTest(workflow=wf, edit="renamed"):
-                    edited = text.replace("- name: " + victim[1], "- name: " + victim[1] + " v2", 1)
-                    self.assertTrue(pin_problems(wf, edited, self.pins))
+            for step in pin_targets(wf, text):
+                pad = " " * (indent_of(step[2].split("\n")[0]) + 2)
+                for label, keys in (("env", [pad + "env:", pad + "  BASH_ENV: x"]),
+                                    ("shell", [pad + "shell: bash -x {0}"]),
+                                    ("with", [pad + "with:", pad + "  key: value"])):
+                    with self.subTest(workflow=wf, step=step[1], keys=label):
+                        self.caught(wf, splice(text, step[4], ["# a comment at column zero"] + keys), label)
 
-    def test_a_pre_export_step_is_not_rejected_by_the_pin(self):
+    def test_a_pre_export_step_cannot_plant_a_hook_8187_f11c(self):
+        for wf, text in self.texts.items():
+            first = job_steps(wf, text)[0]
+            pad = " " * indent_of(first[2].split("\n")[0])
+            for label, line in PRE_EXPORT_HOOKS.items():
+                with self.subTest(workflow=wf, hook=label):
+                    step = [pad + "- name: Prepare", pad + "  run: " + line]
+                    self.caught(wf, splice(text, first[3], step), label)
+
+    def test_job_level_keys_steps_names_and_jobs_are_all_pinned(self):
+        for wf, text in self.texts.items():
+            name = tier_job(wf, text)
+            lines = text.split("\n")
+            key = next(i for i, ln in enumerate(lines) if ln.rstrip() == f"  {name}:")
+            steps_found = job_steps(wf, text)
+            with self.subTest(workflow=wf, edit="job env"):
+                self.caught(wf, splice(text, key + 1, ["    env:", "      PLANTED: value"]), "job env")
+            with self.subTest(workflow=wf, edit="job container"):
+                self.caught(wf, splice(text, key + 1, ["    container: ubuntu:latest"]), "container")
+            with self.subTest(workflow=wf, edit="job services"):
+                self.caught(wf, splice(text, key + 1, ["    services: {}"]), "services")
+            with self.subTest(workflow=wf, edit="job defaults"):
+                self.caught(wf, splice(text, key + 1, ["    defaults:", "      run:", "        shell: sh"]), "defaults")
+            with self.subTest(workflow=wf, edit="runs-on"):
+                at = next(i for i in range(key, len(lines)) if lines[i].startswith("    runs-on:"))
+                self.caught(wf, "\n".join(lines[:at] + [lines[at] + " # edited"] + lines[at + 1:]), "runs-on")
+            with self.subTest(workflow=wf, edit="step reordered"):
+                a, b = steps_found[0], steps_found[1]
+                swapped = lines[:a[3]] + lines[b[3]:b[4]] + lines[a[3]:a[4]] + lines[b[4]:]
+                self.assertNotEqual(swapped, lines)
+                self.caught(wf, "\n".join(swapped), "reordered")
+            for where, step in (("first", steps_found[0]), ("last", steps_found[-1])):
+                if step[2].lstrip().startswith("- name:"):
+                    with self.subTest(workflow=wf, edit=f"renamed {where} step, same body"):
+                        self.caught(wf, text.replace("- name: " + step[1], "- name: " + step[1] + " v2", 1), "renamed")
+            with self.subTest(workflow=wf, edit="job renamed"):
+                renamed = lines[:key] + [lines[key].replace(name, name + "-renamed")] + lines[key + 1:]
+                self.caught(wf, "\n".join(renamed), "job renamed")
+            with self.subTest(workflow=wf, edit="job added"):
+                added = ["  extra:", "    runs-on: ubuntu-latest", "    steps:", "      - run: echo hello"]
+                self.caught(wf, splice(text, section_end(text), added), "job added")
+            with self.subTest(workflow=wf, edit="step removed"):
+                victim = steps_found[-1]
+                self.caught(wf, "\n".join(lines[:victim[3]] + lines[victim[4]:]), "removed")
+
+    def test_a_job_that_does_not_name_the_tier_can_be_edited_freely(self):
         checked = 0
         for wf, text in self.texts.items():
-            steps_found = workflow_steps(text)
-            export_job = post_export_steps(wf, text)[0][0].split(":")[1]
-            pinned = {s[3] for s in steps_found if f"{wf}:{s[0]}:{s[1]}" in self.pins}
-            pre = [s for s in steps_found if s[0] == export_job and s[3] not in pinned
-                   and s[3] < min(pinned) and s[2].lstrip().startswith("- name:")]
-            for step in pre:
-                with self.subTest(workflow=wf, step=step[1]):
-                    edited = text.replace("- name: " + step[1], "- name: " + step[1] + " (edited)", 1)
-                    self.assertNotEqual(edited, text)
-                    self.assertEqual(pin_problems(wf, edited, self.pins), [])
+            jobs, _ = job_layout(text)
+            tier = {n for n, _ in tier_blocks(jobs)}
+            lines = text.split("\n")
+            for name, first, _end, _block in jobs:
+                if name in tier:
+                    continue
+                with self.subTest(workflow=wf, job=name):
+                    edited = "\n".join(lines[:first + 1] + ["    # edited freely"] + lines[first + 1:])
+                    self.assertEqual(job_pin_problems(wf, edited, self.pins), [])
                     checked += 1
-        self.assertGreater(checked, 0, "no pre-export step in any tier workflow to exercise")
+        self.assertGreater(checked, 0, "no job outside the tier job to edit")
 
     def test_the_failure_message_names_the_workflow_job_step_and_first_differing_line(self):
         wf = "cert-postgres-age.yml"
         text = self.texts[wf]
         step = next(s for s in pin_targets(wf, text) if "Cleanup" in s[1])
         edited = inject_run_line(text, step, "printenv | base64")
-        message = "\n".join(pin_problems(wf, edited, self.pins))
-        for part in (wf, step[0], step[1], "printenv | base64", "line "):
+        message = "\n".join(job_pin_problems(wf, edited, self.pins))
+        index = [s[3] for s in job_steps(wf, text)].index(step[3])
+        for part in (wf, step[0], step[1], "printenv | base64", "line ", f"step {index}"):
             self.assertIn(part, message)
 
     def test_continuations_are_joined_before_the_environment_scan(self):
