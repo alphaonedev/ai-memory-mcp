@@ -10,8 +10,11 @@ connection:
   environment variables (``PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE PGSSLMODE PGSSLROOTCERT``), so no
   credential reaches argv or the process table (#6172).  ``--export-url`` also sets
   ``AI_MEMORY_TEST_POSTGRES_URL`` for CMD (the Postgres isolation wrapper reads it from the environment).
-* ``github-env --url-file F --database DB`` appends ``AI_MEMORY_TEST_POSTGRES_URL=<url for DB>`` to the file
-  named by ``$GITHUB_ENV``; nothing is written to stdout or stderr.
+* ``github-env --url-file F --database DB [--age-url]`` prints ``::add-mask::`` lines for the URL and the
+  password (decoded, and as encoded when that differs) and only then appends
+  ``AI_MEMORY_TEST_POSTGRES_URL=<url for DB>`` (and ``AI_MEMORY_TEST_AGE_URL`` with ``--age-url``) to the file named
+  by ``$GITHUB_ENV``; a URL that decodes to a line break or NUL is refused before anything is printed.  The mask
+  lines are the only output that carries the credential, and the workflow log masks them.
 
 Both refuse a URL file that is not a regular file or that is group- or world-accessible (#6180).  Every
 message is a fixed sentence: it never carries the URL, a URL component, an exception text or the file text,
@@ -35,6 +38,7 @@ EXIT_NO_COMMAND = 127
 FORBIDDEN_MODE_BITS = 0o077
 URL_SCHEMES = ("postgres://", "postgresql://")
 URL_VAR = "AI_MEMORY_TEST_POSTGRES_URL"
+AGE_URL_VAR = "AI_MEMORY_TEST_AGE_URL"
 GITHUB_ENV_VAR = "GITHUB_ENV"
 DATABASE_RE = re.compile(r"^[a-z0-9_]{1,63}$")
 # URL query keys and the libpq variable each maps to; any other key is refused, never dropped
@@ -189,9 +193,20 @@ def cmd_github_env(args):
     if not target:
         raise CredentialError("%s is not set" % GITHUB_ENV_VAR)
     url = with_database(load_url(args.url_file), args.database)
+    if any(ch in unquote(url) for ch in "\r\n\x00"):
+        raise CredentialError("the tier URL carries an encoded line break or NUL byte")
+    password = libpq_env(url)["PGPASSWORD"]
+    # Mask first, then write (#8187): the workflow log masks a value from the line after the command prints it.
+    # Each mask is one line: the written URL, the decoded password, and the password as encoded in the URL.
+    raw_password = split_url(url)[0].partition(":")[2]
+    masks = [url, password] + ([raw_password] if raw_password != password else [])
+    for value in masks:
+        print("::add-mask::" + value, flush=True)
+    names = [URL_VAR] + ([AGE_URL_VAR] if args.age_url else [])
     try:
         with open(target, "a", encoding="utf-8") as handle:
-            handle.write("%s=%s\n" % (URL_VAR, url))
+            for name in names:
+                handle.write("%s=%s\n" % (name, url))
     except OSError as exc:
         raise CredentialError("cannot append to %s (%s)" % (GITHUB_ENV_VAR, read_error_name(exc)))
     return EXIT_OK
@@ -208,6 +223,7 @@ def build_parser():
     env = sub.add_parser("github-env", help="append the tier URL for a database to $GITHUB_ENV")
     env.add_argument("--url-file", required=True)
     env.add_argument("--database", required=True)
+    env.add_argument("--age-url", action="store_true", help="also set AI_MEMORY_TEST_AGE_URL to the same URL")
     return parser
 
 
