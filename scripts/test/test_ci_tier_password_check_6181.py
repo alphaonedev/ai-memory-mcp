@@ -784,7 +784,7 @@ def job_pin_problems(workflow, text, pins=None):
     The whole job that names the tier credential is pinned, every line from its key to its last code line, so no step
     before or after the export can change unseen; the set of jobs is pinned too, so a new or renamed job cannot appear
     unpinned.  The export call must sit inside a pinned job.  Messages carry the workflow, job, step index and name,
-    and the first differing line; workflow text holds no secret.
+    and the first differing line number; the changed line itself is never echoed (F24).
     """
     pins = load_job_pins()[SECONDARY] if pins is None else pins
     jobs, problems = job_layout(text)
@@ -806,12 +806,11 @@ def job_pin_problems(workflow, text, pins=None):
         if name not in tiered:
             problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
         elif hashlib.sha256(tiered[name].encode("utf-8")).hexdigest() != pinned["sha256"]:
-            offset, found = first_difference(pinned, tiered[name])
+            offset, _changed = first_difference(pinned, tiered[name])
             index, label = step_label(tiered[name], offset)
             where = "job-level keys" if index is None else f"step {index} ({label})"
             first = next(j[1] for j in jobs if j[0] == name)
-            problems.append(f"{workflow} job {name} {where}: differs from the pin at line {first + offset + 1}: "
-                            f"found '{found}'")
+            problems.append(f"{workflow} job {name} {where}: differs from the pin at line {first + offset + 1}")
     outside = [i + 1 for i, ln in enumerate(text.split("\n"))
                if EXPORT_CALL.search(normalised_code(ln)) and not any(j[1] <= i < j[2] and j[0] in entry["pinned"]
                                                                       for j in jobs)]
@@ -825,9 +824,8 @@ def job_pin_problems(workflow, text, pins=None):
         elif key not in pinned_level:
             problems.append(f"{workflow}: a workflow-level {key}: block was added and is not pinned")
         elif hashlib.sha256(level[key].encode("utf-8")).hexdigest() != pinned_level[key]["sha256"]:
-            offset, found = first_difference(pinned_level[key], level[key])
-            problems.append(f"{workflow}: the workflow-level {key}: block differs from the pin at its line "
-                            f"{offset + 1}: found '{found}'")
+            offset, _changed = first_difference(pinned_level[key], level[key])
+            problems.append(f"{workflow}: the workflow-level {key}: block differs from the pin at its line {offset + 1}")
     if not any(EXPORT_CALL.search(normalised_code(tiered.get(name, ""))) for name in entry["pinned"]):
         problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
     return problems
@@ -1505,8 +1503,9 @@ class TestExportJobIsPinned8187(unittest.TestCase):
         edited = inject_run_line(text, step, "printenv | base64")
         message = "\n".join(tier_pin_problems(wf, edited, self.pins))
         index = [s[3] for s in job_steps(wf, text)].index(step[3])
-        for part in (wf, step[0], step[1], "printenv | base64", "line ", f"step {index}"):
+        for part in (wf, step[0], step[1], "line ", f"step {index}"):
             self.assertIn(part, message)
+        self.assertNotIn("printenv | base64", message)  # r13 F24: the changed line is never echoed
 
     def test_continuations_are_joined_before_the_environment_scan(self):
         extra = {"word split": "prin\\\ntenv | base64", "interpreter continued": "python3 -c \\\n'print(os.environ)'",
