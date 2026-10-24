@@ -2054,19 +2054,25 @@ mod tests {
     /// Upper bound on waiting for the birth-time clock to tick.
     const BIRTH_TICK_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
+    /// Poll step while waiting for the birth-time clock to tick.
+    const BIRTH_TICK_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// File name of the birth-tick probe; removed before the helper returns.
+    const BIRTH_TICK_PROBE_NAME: &str = "birth-tick-probe";
+
     /// Wait until a fresh scratch file's birth time differs from `old`, so the
     /// next log cannot share the deleted log's birth time on a coarse clock.
     /// Skipped when `created()` is unavailable or `old` is `None`.
     fn wait_for_birth_tick(dir: &Path, old: Option<std::time::SystemTime>) {
         let Some(old) = old else { return };
         let deadline = std::time::Instant::now() + BIRTH_TICK_WAIT_MAX;
-        let probe = dir.join("birth-tick-probe");
+        let probe = dir.join(BIRTH_TICK_PROBE_NAME);
         while std::time::Instant::now() < deadline {
             let born = fs::write(&probe, b"").and_then(|()| fs::metadata(&probe)?.created());
             let _ = fs::remove_file(&probe);
             match born {
                 Ok(t) if t != old => return,
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Ok(_) => std::thread::sleep(BIRTH_TICK_POLL_STEP),
                 Err(_) => return,
             }
         }
@@ -2103,11 +2109,17 @@ mod tests {
         assert_eq!(s1, "b-1\n", "rotated to b: {s1:?}");
         assert_eq!(state.path, b);
         let a_born = fs::metadata(&a).and_then(|m| m.created()).ok();
-        // Created before `a` is deleted, in its own directory, so the probe
-        // files never take the freed inode.
+        // The probe files live in a separate directory only so they never
+        // appear among the logs `poll_once` scans. They may briefly take the
+        // freed inode of `a`; the probe is removed before `c` is created, so
+        // `c` can reuse that inode. The assertion below guards that ordering.
         let scratch = tempfile::tempdir().unwrap();
         fs::remove_file(&a).unwrap();
         wait_for_birth_tick(scratch.path(), a_born);
+        assert!(
+            fs::symlink_metadata(scratch.path().join(BIRTH_TICK_PROBE_NAME)).is_err(),
+            "birth-tick probe must be removed before c is created so c can reuse a's inode"
+        );
         let c = make_log(dir.path(), "ai-memory.log.2026-10-25", "c-1\nc-2\n");
         let (s2, e2) = poll_once(dir.path(), &mut state);
         assert_eq!(s2, "c-1\nc-2\n", "c printed: {s2:?} {e2:?}");
