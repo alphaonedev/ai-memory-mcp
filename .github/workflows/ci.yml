@@ -2434,6 +2434,30 @@ jobs:
           docker run --rm ai-memory:ci-validate --version
           docker run --rm ai-memory:ci-validate --help | head -20
 
+  # #8187 — the tier-credential pins run on every PR. Without this job the three test modules that pin the tier
+  # workflows (which jobs hold the tier URL, what they run, the loader-call allowlist) ran nowhere, so an edit of a
+  # tier job passed CI. Not a tier job and not a dependency of one: `check` does not need it and it needs nothing.
+  tier-credential-pins:
+    name: Tier credential pins (#8187)
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). It holds no secret, reads only the checked-out
+    # workflow files and installs one hash-pinned Python package, so it never needs the tier node.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the pinned PyYAML
+        run: python3 -m pip install --require-hashes --no-deps -r scripts/test/requirements-ci.txt
+
+      - name: Run the tier credential pin tests
+        run: python3 -I -m unittest discover -s scripts/test -p 'test_*tier*.py'
+
   # NOTE (#1993): the former `Code Coverage` job (full `cargo llvm-cov`
   # sweep + sticky PR comment) was REMOVED here to stop it spuriously
   # failing on every substantial PR — the heavy instrumented build died

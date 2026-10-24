@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Pin how ci.yml handles the enterprise-fed tier credential (#6181, #6671, #6672, #6172, #8187).
+"""Pin how the tier workflows handle the enterprise-fed tier credential (#6181, #6671, #6672, #6172, #8187).
 
-Three pins over the "Configure enterprise-fed tier" step and the always() cleanup step that drops the ephemeral db:
+Pins over the "Configure enterprise-fed tier" step and the always() cleanup step that drops the ephemeral db
+(ci.yml), and over the two workflows that share the tier (cert-postgres-age.yml, postgres-ignored.yml):
 
 * reachability (#6671, the #6508 class): the step runs ``scripts/ci/check-tier-password.py`` as ``python3 -I`` on the
   URL file, at the top level of the step script, before the first use of the credential, and a failure ``exit 1``s
@@ -12,18 +13,44 @@ Three pins over the "Configure enterprise-fed tier" step and the always() cleanu
 * argv and variables (#6172): no ``psql`` line carries a URL, and no step line reads the URL into a shell variable;
   every ``psql`` and every ``pg_isolated_binary.py`` call goes through ``scripts/ci/tier_credential.py run``;
 * every line that names the URL file or the tier URL must be one of the exact reviewed lines (#6672), so a new
-  ``printf``, ``cat``, ``tee`` or ``$GITHUB_STEP_SUMMARY`` use of it fails here until it is reviewed.
+  ``printf``, ``cat``, ``tee`` or ``$GITHUB_STEP_SUMMARY`` use of it fails here until it is reviewed;
+* the whole of every tier job and of every workflow-level key (r8, #8187): the workflows are read by
+  ``tier_yaml_8187.StrictLoader`` (PyYAML, hash-pinned in ``scripts/test/requirements-ci.txt``), which refuses
+  duplicate keys (after the key scalar is normalised), anchors, aliases, merge keys, non-string keys and top-level
+  keys outside ``{name, run-name, on, permissions, env, defaults, concurrency, jobs}``.  The SHA-256 of the canonical
+  JSON of every tier job (every step and key), of every workflow-level key except ``jobs`` and of the sorted job
+  names is the ``primary`` section of ``tier_export_job_pins_8187.json``.  The ``secondary_text`` section keeps the
+  whole-job text pin of r7, so a difference between the loader and what GitHub runs cannot pass silently.  Tier
+  workflows and tier jobs are found from normalised loader output, ``.github/actions`` is scanned, a local action
+  or reusable workflow call in a tier workflow is refused, and a job of the three workflows that is not a tier job
+  must run on a GitHub-hosted label.
 
-Stdlib only.
+The job ``tier-credential-pins`` in ci.yml runs this module and the two other tier modules on every PR (before r8
+no CI job ran them).  Obligation: any edit of a tier job or of a workflow-level key of the three workflows, and any
+added or removed job, needs ``python3 scripts/test/test_ci_tier_password_check_6181.py --write-pins`` in the same
+PR (it regenerates both sections; the diff of the data file is what a reviewer reads).  Failure messages name the
+workflow, job, step index, step name or id and the first differing key path, and mask ``scheme://user:pass@``.
+
+Residual (documented, #8187 umbrella item): the URL file is provisioned by the operator in the runner user's home
+and stays there between jobs.  No check in this repository can stop another job of that runner, which runs as the
+same user, from reading it; the checks here keep this repository's own jobs from doing so.  Rotating the password
+is the operator item #6181.
+
+Needs PyYAML (``python3 -m pip install --require-hashes --no-deps -r scripts/test/requirements-ci.txt``); a missing
+module is an import error of this module, never a skip.
 """
 
 import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tier_yaml_8187 as ty  # noqa: E402  (an ImportError here names scripts/test/requirements-ci.txt)
 
 ROOT = Path(__file__).resolve().parents[2]
 CI_YML = ROOT / ".github/workflows/ci.yml"
@@ -339,7 +366,7 @@ class TestTierPasswordWiring6181(unittest.TestCase):
 WORKFLOWS = ROOT / ".github/workflows"
 BANG = chr(92) + "!"  # a psql shell escape: backslash then bang
 # the discovery list: every workflow that names the tier secret or its environment variable (#8187 security F2)
-TIER_MARKERS = re.compile(r"AI_MEMORY_CI_FED_URL|AI_MEMORY_TEST_POSTGRES_URL|pg_ci_url_file|ai-memory-ci-fed-url")
+TIER_MARKERS = ty.TIER_MARKERS
 # workflows that read the tier URL file: pinned by wiring_problems above (ci.yml) or workflow_problems below
 SHARED_TIER = ("cert-postgres-age.yml", "postgres-ignored.yml")
 # coverage.yml names the variable only for its own throwaway local database (a literal localhost test credential)
@@ -500,10 +527,22 @@ def workflow_problems(text):
     return problems
 
 
+def names_the_tier(text):
+    """True when a workflow file names the tier secret in its normalised text or in any normalised loader leaf (r8)."""
+    if ty.matches_markers(text):
+        return True
+    try:
+        data = ty.load_lenient(text)
+    except ty.yaml.YAMLError:
+        return False
+    return data is not None and ty.matches_markers(data)
+
+
 def tier_workflows(directory=WORKFLOWS):
-    """Names of the workflows (``*.yml`` and ``*.yaml``) whose text matches the discovery list."""
+    """Names of the workflows (``*.yml`` and ``*.yaml``) that name the tier secret, found on normalised loader output
+    (an escaped, split or empty-quote padded name is found; r7 searched the raw text)."""
     paths = [*Path(directory).glob("*.yml"), *Path(directory).glob("*.yaml")]
-    return sorted(p.name for p in paths if TIER_MARKERS.search(p.read_text(encoding="utf-8")))
+    return sorted(p.name for p in paths if names_the_tier(p.read_text(encoding="utf-8")))
 
 
 # r7 F11: the complete job that exports the tier URL is pinned line by line, with the set of jobs (the loader-call
@@ -514,7 +553,7 @@ JOB_PINS_FILE = Path(__file__).with_name("tier_export_job_pins_8187.json")
 PIN_WORKFLOWS = ("ci.yml", *SHARED_TIER)
 JOB_KEY = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 STEP_LINE = re.compile(r"^      - ")
-EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
+EXPORT_CALL = ty.EXPORT_CALL
 
 
 def workflow_steps(text):
@@ -578,7 +617,7 @@ def pin_entry(body):
 
 JOB_HEAD = re.compile(r"^jobs:\s*(?:#.*)?$")
 JOB_KEY_LINE = re.compile(r"^( *)([A-Za-z0-9_-]+):\s*(?:#.*)?$")
-TIER_JOB_MARK = re.compile(TIER_MARKERS.pattern + r"|tier_credential\.py|check-tier-password")
+TIER_JOB_MARK = ty.TIER_JOB_MARK
 
 
 def comment_or_blank(line):
@@ -643,8 +682,8 @@ def tier_blocks(jobs):
     return found
 
 
-TIER_VERBS = re.compile(r"github-env|export-url")
-EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
+TIER_VERBS = ty.TIER_VERBS
+EMPTY_EXPANSION = ty.EMPTY_EXPANSION
 
 
 def normalised_code(block):
@@ -682,8 +721,12 @@ def workflow_level_blocks(text):
     return {key: "\n".join(rows) for key, rows in found.items()}
 
 
+PRIMARY = "primary"
+SECONDARY = "secondary_text"
+
+
 def load_job_pins():
-    """``{workflow: {"jobs": [job names], "pinned": {job: pin_entry(exact job text)}}}``."""
+    """``{"primary": {workflow: ty.build_pins(...)}, "secondary_text": {workflow: {"jobs", "pinned", "workflow"}}}``."""
     return json.loads(JOB_PINS_FILE.read_text(encoding="utf-8"))
 
 
@@ -729,7 +772,7 @@ def job_pin_problems(workflow, text, pins=None):
     unpinned.  The export call must sit inside a pinned job.  Messages carry the workflow, job, step index and name,
     and the first differing line; workflow text holds no secret.
     """
-    pins = load_job_pins() if pins is None else pins
+    pins = load_job_pins()[SECONDARY] if pins is None else pins
     jobs, problems = job_layout(text)
     problems = [f"{workflow}: {p}" for p in problems]
     entry = pins.get(workflow)
@@ -775,6 +818,33 @@ def job_pin_problems(workflow, text, pins=None):
         problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
     return problems
 
+
+
+def primary_pin_problems(workflow, text, primary):
+    """RED stub: the r7 text pins are the only gate at this commit."""
+    return []
+
+
+def tier_pin_problems(workflow, text, pins=None):
+    """RED stub: the r7 text pin alone."""
+    pins = load_job_pins() if pins is None else pins
+    return job_pin_problems(workflow, text, pins[SECONDARY])
+
+
+def repo_problems(root=None, pins=None):
+    """RED stub: the r7 discovery (raw markers) and the r7 pins."""
+    root = ROOT if root is None else Path(root)
+    pins = load_job_pins() if pins is None else pins
+    found = []
+    directory = root / ".github" / "workflows"
+    covered = {*PIN_WORKFLOWS, *LOCAL_ONLY}
+    for path in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):
+        text = path.read_text(encoding="utf-8")
+        if path.name in PIN_WORKFLOWS:
+            found += tier_pin_problems(path.name, text, pins)
+        elif TIER_MARKERS.search(text) and path.name not in covered:
+            found.append(f"{path.name}: names the tier secret but no pin covers it")
+    return found
 
 
 def joined_lines(lines):
@@ -1084,23 +1154,23 @@ class TestExportJobIsPinned8187(unittest.TestCase):
         cls.pins = load_job_pins()
 
     def caught(self, workflow, edited, label):
-        self.assertTrue(job_pin_problems(workflow, edited, self.pins), f"{workflow}: mutant not caught: {label}")
+        self.assertTrue(tier_pin_problems(workflow, edited, self.pins), f"{workflow}: mutant not caught: {label}")
 
     def test_the_real_workflows_match_their_pins(self):
         for wf, text in self.texts.items():
             with self.subTest(workflow=wf):
-                self.assertEqual(job_pin_problems(wf, text, self.pins), [])
-                self.assertTrue(self.pins.get(wf, {}).get("pinned"), "no job is pinned for this workflow")
+                self.assertEqual(tier_pin_problems(wf, text, self.pins), [])
+                self.assertTrue(self.pins[SECONDARY].get(wf, {}).get("pinned"), "no job is pinned for this workflow")
 
     def test_the_pin_table_holds_exactly_the_jobs_that_name_the_tier(self):
-        self.assertEqual(sorted(self.pins), sorted(PIN_WORKFLOWS))
+        self.assertEqual(sorted(self.pins[SECONDARY]), sorted(PIN_WORKFLOWS))
         for wf, text in self.texts.items():
             jobs, problems = job_layout(text)
             self.assertEqual(problems, [])
-            self.assertEqual(self.pins[wf]["jobs"], [j[0] for j in jobs])
+            self.assertEqual(self.pins[SECONDARY][wf]["jobs"], [j[0] for j in jobs])
             for name, block in tier_blocks(jobs):
-                self.assertEqual(self.pins[wf]["pinned"][name], pin_entry(block), f"{wf}:{name}")
-            self.assertEqual(sorted(self.pins[wf]["pinned"]), sorted(n for n, _ in tier_blocks(jobs)))
+                self.assertEqual(self.pins[SECONDARY][wf]["pinned"][name], pin_entry(block), f"{wf}:{name}")
+            self.assertEqual(sorted(self.pins[SECONDARY][wf]["pinned"]), sorted(n for n, _ in tier_blocks(jobs)))
 
     def test_every_dump_form_after_the_export_fails_the_pin(self):
         forms = {**DUMP_MUTANTS, **F10_MUTANTS}
@@ -1144,7 +1214,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                 new = ["  second:", "    runs-on: ubuntu-latest", "    steps:", "      - name: Export", "        run: |",
                        *["          " + part for part in call], "      - name: Dump", "        run: printenv | base64"]
                 with self.subTest(workflow=wf, form=label):
-                    problems = job_pin_problems(wf, splice(text, at, new), self.pins)
+                    problems = tier_pin_problems(wf, splice(text, at, new), self.pins)
                     self.assertTrue(any("second" in p and "not pinned" in p for p in problems), problems)
 
     def test_workflow_level_env_and_defaults_are_pinned_8187_f12b(self):
@@ -1227,7 +1297,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                     continue
                 with self.subTest(workflow=wf, job=name):
                     edited = "\n".join(lines[:first + 1] + ["    # edited freely"] + lines[first + 1:])
-                    self.assertEqual(job_pin_problems(wf, edited, self.pins), [])
+                    self.assertEqual(tier_pin_problems(wf, edited, self.pins), [])
                     checked += 1
         self.assertGreater(checked, 0, "no job outside the tier job to edit")
 
@@ -1236,7 +1306,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
         text = self.texts[wf]
         step = next(s for s in pin_targets(wf, text) if "Cleanup" in s[1])
         edited = inject_run_line(text, step, "printenv | base64")
-        message = "\n".join(job_pin_problems(wf, edited, self.pins))
+        message = "\n".join(tier_pin_problems(wf, edited, self.pins))
         index = [s[3] for s in job_steps(wf, text)].index(step[3])
         for part in (wf, step[0], step[1], "printenv | base64", "line ", f"step {index}"):
             self.assertIn(part, message)
@@ -1263,18 +1333,404 @@ class TestExportJobIsPinned8187(unittest.TestCase):
         self.assertEqual(joined_lines(["prin\\", "  tenv x", "echo ok"]), ["printenv x", "echo ok"])
 
 
+SCRATCH_ROOT = ROOT / ".local-runs" / "r8-tests"
+LINT_RUNS_ON = "    runs-on: ubuntu-latest\n    steps:\n"
+USERINFO_SAMPLE = "post" + "gres://" + "someuser" + ":" + "somepass" + "@host.invalid/db"
+
+
+def before_jobs(text, lines):
+    """``text`` with ``lines`` inserted as workflow-level lines just above ``jobs:``."""
+    rows = text.split("\n")
+    at = next(i for i, ln in enumerate(rows) if ln.rstrip() == "jobs:")
+    return "\n".join(rows[:at] + lines + rows[at:])
+
+
+def set_runs_on(text, job, value):
+    """``text`` with the ``runs-on`` line of ``job`` replaced by the YAML ``value``."""
+    rows = text.split("\n")
+    key = next(i for i, ln in enumerate(rows) if ln.rstrip() == f"  {job}:")
+    at = next(i for i in range(key, len(rows)) if rows[i].startswith("    runs-on:"))
+    return "\n".join(rows[:at] + ["    runs-on: " + value] + rows[at + 1:])
+
+
+def add_step(text, job, step_lines):
+    """``text`` with ``step_lines`` (already indented as list items) appended to the steps of ``job``."""
+    rows = text.split("\n")
+    key = next(i for i, ln in enumerate(rows) if ln.rstrip() == f"  {job}:")
+    end = next((i for i in range(key + 1, len(rows)) if re.match(r"^  [A-Za-z0-9_-]+:\s*(?:#.*)?$", rows[i])), len(rows))
+    while end > key and not rows[end - 1].strip():
+        end -= 1
+    return "\n".join(rows[:end] + step_lines + rows[end:])
+
+
+class TestStrictLoaderPins8187(unittest.TestCase):
+    """r8: the tier workflows are read by a strict YAML loader and pinned as canonical JSON (security F13-F17, code F13-F15)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+        cls.pins = load_job_pins()
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def caught(self, workflow, edited, label):
+        self.assertTrue(tier_pin_problems(workflow, edited, self.pins), f"{workflow}: mutant not caught: {label}")
+
+    def tree(self, extra=None, replace=None):
+        """A scratch repository root holding the three real workflows, ``replace`` edits and ``extra`` files."""
+        holder = tempfile.TemporaryDirectory(dir=SCRATCH_ROOT, prefix="root-")
+        self.addCleanup(holder.cleanup)
+        root = Path(holder.name)
+        (root / ".github" / "workflows").mkdir(parents=True)
+        for path in WORKFLOWS.glob("*.y*ml"):
+            body = (replace or {}).get(path.name, path.read_text(encoding="utf-8"))
+            (root / ".github" / "workflows" / path.name).write_text(body, encoding="utf-8")
+        for rel, body in (extra or {}).items():
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+        return root
+
+    # --- the loader -------------------------------------------------------------------------------------------
+
+    def test_the_real_workflows_load_strictly_and_match_both_pin_sections(self):
+        for wf, text in self.texts.items():
+            with self.subTest(workflow=wf):
+                data, problems = ty.parse_workflow(text)
+                self.assertEqual(problems, [])
+                self.assertEqual(primary_pin_problems(wf, text, self.pins[PRIMARY]), [])
+                self.assertEqual(tier_pin_problems(wf, text, self.pins), [])
+                self.assertEqual(self.pins[PRIMARY][wf], ty.build_pins(data))
+        self.assertEqual(repo_problems(ROOT, self.pins), [])
+
+    def test_the_loader_refuses_duplicate_keys_after_normalisation(self):
+        base = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n"
+        forms = {
+            "plain repeat": base + "name: y\n",
+            "quoted repeat": base + "'name': y\n",
+            "double quoted repeat": base + '"jobs":\n  b:\n    runs-on: ubuntu-latest\n    steps: []\n',
+            "space before the colon": "defaults:\n  run:\n    shell: sh\n" + base + "defaults :\n  run:\n    shell: bash\n",
+            "defaults repeat": "defaults:\n  run:\n    shell: bash\n'defaults':\n  run:\n    shell: sh\n" + base,
+            "on spelled twice": base + "'on': pull_request\n",
+            "env repeat": 'env:\n  A: "1"\n"env":\n  A: "2"\n' + base,
+            "job repeat": base + "  a:\n    runs-on: ubuntu-latest\n    steps: []\n",
+            "step key repeat": base.replace("steps: []", "steps:\n      - run: a\n        run: b"),
+        }
+        for label, text in forms.items():
+            with self.subTest(form=label):
+                data, problems = ty.parse_workflow(text)
+                self.assertIsNone(data, f"duplicate key accepted: {label}")
+                self.assertTrue(problems)
+
+    def test_the_loader_refuses_anchors_aliases_merge_keys_and_odd_keys(self):
+        base = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n"
+        forms = {
+            "anchor on run-name": "run-name: &rn lint\n" + base,
+            "alias of run-name": "run-name: &rn lint\n" + base.replace("name: x", "name: *rn"),
+            "anchor only on a step": base.replace("steps: []", "steps:\n      - &s\n        run: a"),
+            "merge key": base.replace("steps: []", "steps: []\n    <<:\n      timeout-minutes: 5"),
+            "merge key with alias": "x: &m\n  a: 1\n" + base.replace("steps: []", "steps: []\n    <<: *m"),
+            "integer key": base + "1: x\n",
+            "boolean key": base + "true: x\n",
+            "null key": base + "~: x\n",
+            "list key": base + "? [a, b]\n: x\n",
+        }
+        for label, text in forms.items():
+            with self.subTest(form=label):
+                data, problems = ty.parse_workflow(text)
+                self.assertIsNone(data, f"accepted: {label}")
+                self.assertTrue(problems)
+
+    def test_on_is_read_as_a_string_and_the_top_level_key_set_is_closed(self):
+        data, problems = ty.parse_workflow("name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n")
+        self.assertEqual(problems, [])
+        self.assertIn("on", data)
+        self.assertNotIn(True, data)
+        for key in ("x-anchors", "extra", "Jobs", "env2"):
+            with self.subTest(key=key):
+                text = f"name: x\non: push\n{key}: 1\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n"
+                data, problems = ty.parse_workflow(text)
+                self.assertTrue(any("closed set" in p for p in problems), problems)
+
+    # --- the r7 PASS cases: workflow-level keys and the jobs mapping --------------------------------------------
+
+    def test_a_quoted_or_padded_workflow_level_key_is_caught_8187_f13(self):
+        forms = {
+            "single-quoted defaults": ["'defaults':", "  run:", "    shell: bash -x {0}"],
+            "space before the colon": ["defaults :", "  run:", "    shell: bash -x {0}"],
+            "double-quoted env repeat": ['"env":', "  BASH_ENV: /dev/null/hook"],
+            "env hook": ["env:", "  BASH_ENV: /dev/null/hook"],
+            "quoted run-name": ["'run-name': renamed"],
+            "padded permissions": ["permissions :", "  contents: write"],
+        }
+        for wf, text in self.texts.items():
+            for label, lines in forms.items():
+                with self.subTest(workflow=wf, form=label):
+                    edited = before_jobs(text, lines)
+                    self.assertNotEqual(edited, text)
+                    self.caught(wf, edited, label)
+
+    def test_a_repeated_jobs_key_with_a_split_export_and_dump_is_caught_8187_f13(self):
+        tail = ['"jobs":', "  second:", "    runs-on: ubuntu-latest", "    steps:", "      - run: |",
+                "          python3 -I scripts/ci/tier_cred\\", "          ential.py github-env --url-file \"$url_file\"",
+                "      - run: printenv | base64"]
+        for wf, text in self.texts.items():
+            with self.subTest(workflow=wf):
+                edited = text.rstrip("\n") + "\n" + "\n".join(tail) + "\n"
+                self.caught(wf, edited, "repeated jobs key")
+                self.assertTrue(any("does not load strictly" in p or "duplicate" in p.lower()
+                                    for p in tier_pin_problems(wf, edited, self.pins)))
+
+    def test_an_anchor_alias_or_merge_key_is_caught_8187_f15(self):
+        for wf, text in self.texts.items():
+            lint = "lint" if wf == "ci.yml" else tier_job_of(text)
+            forms = {
+                "run-name anchored": before_jobs(text, ["run-name: &rn dump"]),
+                "run-name aliased from a job": add_step(before_jobs(text, ["run-name: &rn dump"]), lint,
+                                                        ["      - name: *rn", "        run: echo ok"]),
+                "merge key at the workflow level": before_jobs(text, ["<<:", "  name: x"]),
+                "merge key in a job": add_step(text, lint, ["      - run: echo ok", "        <<:", "          name: x"]),
+                "alias in a step": add_step(text, lint, ["      - &s", "        run: echo ok"]),
+            }
+            for label, edited in forms.items():
+                with self.subTest(workflow=wf, form=label):
+                    self.assertNotEqual(edited, text)
+                    self.caught(wf, edited, label)
+
+    # --- discovery on normalised loader output (security F14) -------------------------------------------------
+
+    def test_a_new_workflow_that_names_the_tier_file_in_disguise_is_found_8187_f14(self):
+        back = chr(92)
+        names = {
+            "escaped": "cat ~/.ai-memory-ci-" + back + "fed-url",
+            "empty single quotes": "cat ~/.ai-memory-ci-fed''-url",
+            "empty double quotes": 'cat ~/.ai-memory-ci-fed""-url',
+            "empty expansion": "cat ~/.ai-memory-ci-fed${E}-url",
+            "split over a continuation": "cat ~/.ai-memory-ci-" + back + "\n          fed-url",
+            "escaped variable name": "echo $AI_MEMORY_CI_" + back + "FED_URL",
+            "plain": "cat ~/.ai-memory-ci-fed-url",
+        }
+        for label, line in names.items():
+            body = "name: new\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          " + line + "\n"
+            with self.subTest(form=label):
+                root = self.tree(extra={".github/workflows/new.yml": body})
+                self.assertEqual(tier_workflows(root / ".github" / "workflows").count("new.yml"), 1)
+                self.assertTrue(any("new.yml" in p for p in repo_problems(root, self.pins)), label)
+
+    def test_a_composite_action_that_names_the_tier_file_is_caught_8187_f14(self):
+        body = "name: a\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: cat ~/.ai-memory-ci-fed-url\n"
+        padded = body.replace("ci-fed-url", "ci-fed''-url")
+        for label, text in (("plain", body), ("padded", padded)):
+            for where in (".github/actions/read/action.yml", ".github/actions/deep/nest/action.yaml"):
+                with self.subTest(form=label, path=where):
+                    root = self.tree(extra={where: text})
+                    self.assertTrue(any("action" in p for p in repo_problems(root, self.pins)), (label, where))
+
+    def test_a_local_action_or_reusable_workflow_call_in_a_tier_workflow_is_refused_8187_f16(self):
+        for wf, text in self.texts.items():
+            lint = "lint" if wf == "ci.yml" else tier_job_of(text)
+            for label, step in (("composite action", ["      - uses: ./.github/actions/read"]),
+                                ("composite action, quoted", ["      - uses: './.github/actions/read'"])):
+                with self.subTest(workflow=wf, form=label):
+                    self.caught(wf, add_step(text, lint, step), label)
+            reusable = text.rstrip("\n") + "\n  called:\n    uses: ./.github/workflows/other.yml\n"
+            with self.subTest(workflow=wf, form="reusable workflow"):
+                self.caught(wf, reusable, "reusable")
+
+    # --- a non-tier job on the tier runner (security F16) ---------------------------------------------------
+
+    def test_a_non_tier_job_on_a_self_hosted_label_is_caught_8187_f16(self):
+        body_forms = {
+            "runtime-built name": ['      - run: |', '          p="$HOME/.ai-memory-"; cat "${p}ci-fed-url"'],
+            "runtime-built variable": ['      - run: |', '          v="AI_MEMORY_CI_FED"; printf %s "${!v}_URL"'],
+            "sourced script": ['      - run: . ./scripts/some-script.sh'],
+            "glob": ['      - run: cat ~/.ai-memory-ci-f*'],
+            "reusable workflow": [],
+            "composite action": ['      - uses: ./.github/actions/read'],
+            "no body at all": [],
+        }
+        labels = ["[self-hosted]", "self-hosted", "[self-hosted, linux-fed]", "[linux-fed]", "[Self-Hosted]",
+                  "${{ fromJSON('[\"self-hosted\"]') }}", "${{ inputs.runner }}", "{ group: fleet }"]
+        text = self.texts["ci.yml"]
+        for label, step in body_forms.items():
+            edited = set_runs_on(text, "lint", "[self-hosted]")
+            if step:
+                edited = add_step(edited, "lint", step)
+            with self.subTest(form=label):
+                self.caught("ci.yml", edited, label)
+        for value in labels:
+            with self.subTest(runs_on=value):
+                self.caught("ci.yml", set_runs_on(text, "lint", value), value)
+
+    def test_a_job_that_calls_a_reusable_workflow_is_refused(self):
+        text = self.texts["ci.yml"].rstrip("\n") + "\n  reuse:\n    uses: owner/repo/.github/workflows/x.yml@v1\n"
+        self.caught("ci.yml", text, "external reusable workflow job")
+
+    def test_a_self_hosted_job_in_another_workflow_is_refused_unless_listed_8187_f16(self):
+        body = "name: o\non: push\njobs:\n  j:\n    runs-on: [self-hosted, linux-fed]\n    steps:\n      - run: echo hi\n"
+        root = self.tree(extra={".github/workflows/other.yml": body})
+        self.assertTrue(any("other.yml" in p and "j" in p for p in repo_problems(root, self.pins)))
+        root = self.tree(extra={".github/workflows/other.yml": body.replace("[self-hosted, linux-fed]", "ubuntu-latest")})
+        self.assertEqual(repo_problems(root, self.pins), [])
+
+    def test_hosted_labels_and_non_tier_edits_are_not_flagged(self):
+        text = self.texts["ci.yml"]
+        for value in ("ubuntu-latest", "ubuntu-22.04", "macos-14", "windows-latest", "ubuntu-24.04-arm"):
+            with self.subTest(runs_on=value):
+                self.assertEqual(tier_pin_problems("ci.yml", set_runs_on(text, "lint", value), self.pins), [])
+        edited = add_step(text, "lint", ["      - run: echo a freely edited non-tier step"])
+        self.assertEqual(tier_pin_problems("ci.yml", edited, self.pins), [])
+        self.assertEqual(tier_pin_problems("ci.yml", before_jobs(text, ["# a comment above jobs"]), self.pins), [])
+
+    # --- pins: structure, failure messages, determinism ------------------------------------------------------
+
+    def test_the_primary_pins_cover_every_tier_job_workflow_key_and_the_job_list(self):
+        for wf, text in self.texts.items():
+            data, _ = ty.parse_workflow(text)
+            entry = self.pins[PRIMARY][wf]
+            self.assertEqual(entry["job_names"], sorted(data["jobs"]))
+            self.assertEqual(sorted(entry["tier_jobs"]), ty.tier_job_names(data))
+            self.assertEqual(sorted(entry["workflow_keys"]), sorted(k for k in data if k != "jobs"))
+            self.assertTrue(entry["tier_jobs"])
+            for name, pinned in entry["tier_jobs"].items():
+                self.assertEqual(len(pinned["steps"]), len(data["jobs"][name]["steps"]))
+        self.assertEqual(sorted(self.pins[PRIMARY]), sorted(PIN_WORKFLOWS))
+
+    def test_the_failure_message_names_workflow_job_step_and_first_differing_key_path_8187_f17(self):
+        wf = "cert-postgres-age.yml"
+        text = self.texts[wf]
+        data, _ = ty.parse_workflow(text)
+        job = ty.tier_job_names(data)[0]
+        steps = data["jobs"][job]["steps"]
+        index = next(i for i, s in enumerate(steps) if isinstance(s.get("run"), str) and "Cleanup" in str(s.get("name", "")))
+        step = steps[index]
+        edited = add_step_run(text, step["run"], "printenv | base64 # " + USERINFO_SAMPLE)
+        message = "\n".join(primary_pin_problems(wf, edited, self.pins[PRIMARY]))
+        for part in (wf, job, f"step {index}", f"steps[{index}].run", step["name"][:20]):
+            self.assertIn(part, message)
+        self.assertNotIn("somepass", message)
+        self.assertNotIn("printenv", message, "the message names the key path, not the changed line")
+        again = "\n".join(tier_pin_problems(wf, edited, self.pins))
+        self.assertNotIn("somepass", again)
+        self.assertNotIn("someuser", again)
+
+    def test_a_job_level_key_difference_names_the_job_key(self):
+        wf = "postgres-ignored.yml"
+        data, _ = ty.parse_workflow(self.texts[wf])
+        job = ty.tier_job_names(data)[0]
+        rows = self.texts[wf].split("\n")
+        key = next(i for i, ln in enumerate(rows) if ln.rstrip() == f"  {job}:")
+        edited = "\n".join(rows[:key + 1] + ["    container: ubuntu:latest"] + rows[key + 1:])
+        message = "\n".join(primary_pin_problems(wf, edited, self.pins[PRIMARY]))
+        self.assertIn(job, message)
+        self.assertIn("job.container", message)
+
+    def test_job_names_and_workflow_keys_are_pinned(self):
+        for wf, text in self.texts.items():
+            data, _ = ty.parse_workflow(text)
+            with self.subTest(workflow=wf, edit="job added"):
+                added = text.rstrip("\n") + "\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                self.assertTrue(any("set of jobs" in p for p in primary_pin_problems(wf, added, self.pins[PRIMARY])))
+            with self.subTest(workflow=wf, edit="permissions changed"):
+                self.caught(wf, text.replace("permissions:\n", "permissions:\n  id-token: write\n", 1), "permissions")
+            with self.subTest(workflow=wf, edit="trigger changed"):
+                self.caught(wf, text.replace("\non:\n", "\non:\n  workflow_dispatch:\n", 1), "on")
+            with self.subTest(workflow=wf, edit="concurrency removed"):
+                self.assertTrue(any("concurrency" in p for p in primary_pin_problems(
+                    wf, re.sub(r"(?ms)^concurrency:.*?(?=^[a-z])", "", text, count=1), self.pins[PRIMARY])))
+
+    def test_the_pin_data_file_is_regenerated_byte_identically(self):
+        built = json.dumps({PRIMARY: {wf: ty.build_pins(ty.parse_workflow(t)[0]) for wf, t in self.texts.items()},
+                            SECONDARY: self.pins[SECONDARY]}, indent=1, sort_keys=True) + "\n"
+        self.assertEqual(JOB_PINS_FILE.read_text(encoding="utf-8"), built, "run --write-pins and commit the data file")
+        outputs = []
+        for number in range(2):
+            out = SCRATCH_ROOT / f"pins-{number}.json"
+            result = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--write-pins", "--out", str(out)],
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr[-300:])
+            outputs.append(out.read_bytes())
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], JOB_PINS_FILE.read_bytes())
+
+    # --- the dependency and the CI job ----------------------------------------------------------------------
+
+    def test_a_missing_yaml_module_fails_and_never_skips(self):
+        code = ("import sys; sys.modules['yaml'] = None; sys.path.insert(0, %r); import %s"
+                % (str(Path(__file__).resolve().parent), "%s"))
+        for module in ("tier_yaml_8187", "test_ci_tier_password_check_6181"):
+            with self.subTest(module=module):
+                result = subprocess.run([sys.executable, "-I", "-c", code % module], capture_output=True, text=True,
+                                        check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requirements-ci.txt", result.stderr)
+        source = Path(__file__).read_text(encoding="utf-8") + (Path(__file__).parent / "tier_yaml_8187.py").read_text(encoding="utf-8")
+        for needle in ("skip" + "Unless", "Skip" + "Test", "importor" + "skip", "self.skip" + "Test"):
+            self.assertNotIn(needle, source)
+
+    def test_requirements_pin_one_package_with_hashes_only(self):
+        rows = [ln.rstrip() for ln in (Path(__file__).parent / "requirements-ci.txt").read_text(encoding="utf-8").split("\n")
+                if ln.strip() and not ln.startswith("#")]
+        self.assertTrue(rows[0].startswith("PyYAML==") and rows[0].endswith("\\"), rows[0])
+        hashes = [r.strip() for r in rows[1:]]
+        self.assertGreaterEqual(len(hashes), 10)
+        for row in hashes:
+            self.assertRegex(row, r"^--hash=sha256:[0-9a-f]{64}( \\)?$")
+        self.assertFalse(hashes[-1].endswith("\\"))
+        self.assertEqual(len(set(hashes)), len(hashes))
+
+    def test_ci_runs_the_tier_modules_in_a_github_hosted_job_8187_f13(self):
+        data, problems = ty.parse_workflow(self.texts["ci.yml"])
+        self.assertEqual(problems, [])
+        job = data["jobs"]["tier-credential-pins"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertNotIn("needs", job, "the pins must run on a docs-only PR as well")
+        self.assertNotIn("if", job)
+        runs = [s["run"] for s in job["steps"] if isinstance(s.get("run"), str)]
+        self.assertTrue(any("pip install --require-hashes --no-deps -r scripts/test/requirements-ci.txt" in r for r in runs))
+        self.assertTrue(any("python3 -I -m unittest discover -s scripts/test -p 'test_*tier*.py'" in r for r in runs))
+        found = sorted(p.name for p in (Path(__file__).parent).glob("test_*tier*.py"))
+        self.assertEqual(found, ["test_check_tier_password_6181.py", "test_ci_tier_password_check_6181.py",
+                                 "test_tier_credential_8187.py"], "the CI glob must match exactly the tier modules")
+
+
+def tier_job_of(text):
+    data, _ = ty.parse_workflow(text)
+    return ty.tier_job_names(data)[0]
+
+
+def add_step_run(text, run_text, extra_line):
+    """``text`` with ``extra_line`` appended as the last line of the ``run`` block whose text is ``run_text``."""
+    first = run_text.rstrip("\n").split("\n")[-1]
+    rows = text.split("\n")
+    at = max(i for i, ln in enumerate(rows) if ln.strip() == first.strip())
+    pad = rows[at][:len(rows[at]) - len(rows[at].lstrip())]
+    return "\n".join(rows[:at + 1] + [pad + extra_line] + rows[at + 1:])
+
+
+def write_pins(out=None):
+    """Regenerate both sections of the pin data file from the real workflows (deterministic, sorted)."""
+    table = {PRIMARY: {}, SECONDARY: {}}
+    for workflow in PIN_WORKFLOWS:
+        raw = (WORKFLOWS / workflow).read_text(encoding="utf-8")
+        data, bad = ty.parse_workflow(raw)
+        if bad:
+            sys.exit(f"{workflow}: {bad[0]}")
+        found, layout_bad = job_layout(raw)
+        if layout_bad:
+            sys.exit(f"{workflow}: {layout_bad[0]}")
+        table[PRIMARY][workflow] = ty.build_pins(data)
+        table[SECONDARY][workflow] = {"jobs": [j[0] for j in found],
+                                      "pinned": {name: pin_entry(block) for name, block in tier_blocks(found)},
+                                      "workflow": {key: pin_entry(block) for key, block in sorted(
+                                          workflow_level_blocks(raw).items())}}
+    target = JOB_PINS_FILE if out is None else Path(out)
+    target.write_text(json.dumps(table, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+
+
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
-        # regenerate the pin table from the workflows; the diff of the data file is what a reviewer reads
-        table = {}
-        for workflow in PIN_WORKFLOWS:
-            found, bad = job_layout((WORKFLOWS / workflow).read_text(encoding="utf-8"))
-            if bad:
-                sys.exit(f"{workflow}: {bad[0]}")
-            table[workflow] = {"jobs": [j[0] for j in found],
-                               "pinned": {name: pin_entry(block) for name, block in tier_blocks(found)},
-                               "workflow": {key: pin_entry(block) for key, block in sorted(
-                                   workflow_level_blocks((WORKFLOWS / workflow).read_text(encoding="utf-8")).items())}}
-        JOB_PINS_FILE.write_text(json.dumps(table, indent=1) + "\n", encoding="utf-8")
+        # regenerate both pin sections from the workflows; the diff of the data file is what a reviewer reads
+        flags = sys.argv[1:]
+        write_pins(flags[flags.index("--out") + 1] if "--out" in flags else None)
         sys.exit(0)
     sys.exit(unittest.main())
