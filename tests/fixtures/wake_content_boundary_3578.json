@@ -171,6 +171,6 @@
     "path": "sdk/typescript/src/wake.ts",
     "role": "TypeScript decoder/state machine -> metadata WakeSignal -> operator-provided onSignal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "de28c5a4f2315a1b150437d8714db79a01c41c654beebb9c52753db693630a3d"
+    "sha256": "b376eff3c28438d76fdaed84d4053148aacd7b88fa95c60c80ef0952c6416bcb"
   }
 ]

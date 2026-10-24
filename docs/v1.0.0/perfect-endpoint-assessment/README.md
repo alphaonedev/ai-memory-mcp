@@ -17,7 +17,7 @@
 >
 > This includes `w7-a3-claims-discipline.md`: the replacement wordings that register
 > *prescribes* are themselves now stale in both directions. For the current defaults use
-> CLAUDE.md §"Environment Variables", `docs/federation.md`, and
+> docs/reference/ARCHITECTURE_REFERENCE.md §"Environment Variables", `docs/federation.md`, and
 > `docs/compliance/nsa-csi-mcp-security-mapping.md` — never this tree.
 >
 > Preserved unedited: these are the ballots that drove the v1.0.0 decisions, and re-pointing

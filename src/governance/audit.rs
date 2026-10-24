@@ -546,7 +546,122 @@ fn register_exit_drain() {
 
 #[cfg(unix)]
 extern "C" fn drain_forensic_writer_at_exit() {
-    let _ = std::panic::catch_unwind(|| drain_bounded(EXIT_DRAIN_BUDGET));
+    // The outcome is already logged inside the hook; only a panic is left.
+    if std::panic::catch_unwind(exit_drain_hook).is_err() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "ai-memory: the forensic exit drain panicked; rows may be missing (#4347)"
+        );
+    }
+}
+
+/// #4347 — what the `atexit` hook runs (unix) and what the non-unix
+/// signal-exit path in `main` calls before `process::exit`: the once-only
+/// drain, plus ONE more barrier when that drain already ran earlier in this
+/// process (the `mcp` signal path). A request acknowledged after the first
+/// drain began can have queued its row behind it; a barrier on an empty queue
+/// costs microseconds. Skipped when the first drain timed out (the writer is
+/// stuck: bounded shutdown wins). Returns the outcome of the last drain that
+/// ran. Every case where rows may be missing is reported (per ERRORS-19) on
+/// BOTH `tracing` and raw stderr: on the unix signal path this runs from
+/// `atexit`, after the log guard was dropped, so `tracing` alone is lost
+/// (#4347 L-1). Reported cases: a timeout; a writer that vanished after a
+/// successful first drain; and `NoWriter` when a writer WAS started (its
+/// thread died, rows are lost, #4347 L-3). `NoWriter` with no
+/// writer ever started is the normal case for a process that never queued a
+/// forensic row, so it is silent.
+pub fn exit_drain_hook() -> DrainOutcome {
+    let ran_before = exit_drain_runs() > 0;
+    let first = drain_at_exit_once();
+    exit_drain_follow_up(
+        first,
+        ran_before,
+        WRITER.get().is_some(),
+        || drain_bounded(EXIT_DRAIN_BUDGET),
+        &mut std::io::stderr(),
+    )
+}
+
+/// The decision body of [`exit_drain_hook`], with the barrier and the raw
+/// stderr sink injected so the warning policy is testable without a real
+/// signal exit. `writer_started` is whether the background writer was ever
+/// spawned in this process.
+fn exit_drain_follow_up<W: Write>(
+    first: DrainOutcome,
+    ran_before: bool,
+    writer_started: bool,
+    run_barrier: impl FnOnce() -> DrainOutcome,
+    raw: &mut W,
+) -> DrainOutcome {
+    if first == DrainOutcome::TimedOut {
+        return first;
+    }
+    if !ran_before {
+        // This hook ran the first drain itself: `NoWriter` with a writer
+        // started means the writer thread died and its rows are lost (L-3).
+        if first == DrainOutcome::NoWriter && writer_started {
+            warn_exit_rows_may_be_missing(raw, WRITER_GONE_MSG);
+        }
+        return first;
+    }
+    let barrier = run_barrier();
+    if barrier == DrainOutcome::TimedOut {
+        // `drain_writer` already wrote its own raw stderr line for a timeout.
+        tracing::warn!(
+            target: AUDIT_TRACE_TARGET,
+            outcome = ?barrier,
+            "forensic: the exit barrier after the first drain did not complete; \
+             rows queued after the first drain may not be on disk (#4347)"
+        );
+    } else if barrier == DrainOutcome::NoWriter
+        && (first == DrainOutcome::Drained || writer_started)
+    {
+        // A writer that was started (before or after the first drain) is
+        // gone now. A writer started only AFTER a `NoWriter` first drain and
+        // still alive answers the barrier `Drained`, so it never lands here.
+        warn_exit_rows_may_be_missing(raw, WRITER_GONE_MSG);
+    }
+    barrier
+}
+
+const WRITER_GONE_MSG: &str = "the forensic audit writer thread is gone; rows queued at \
+                               exit may not be on disk (#4347)";
+
+/// Report that rows may be missing at exit on `tracing` AND the raw stream
+/// (tracing may already be torn down at exit). A failed raw write is a
+/// deliberate discard: there is nowhere left to report it (ERRORS-19).
+fn warn_exit_rows_may_be_missing<W: Write>(raw: &mut W, msg: &str) {
+    tracing::warn!(target: AUDIT_TRACE_TARGET, "forensic: {msg}");
+    let _ = writeln!(raw, "ai-memory: {msg}");
+}
+
+/// #4347 — the bounded exit drain, run AT MOST ONCE per process. The `atexit`
+/// hook and the `mcp` signal-stop path both call it; whichever arrives first
+/// drains, the other waits for that drain and gets its outcome, so a signal
+/// racing a normal exit is one drain, not two. A timeout is logged at WARN by
+/// the one caller that ran the drain.
+pub fn drain_at_exit_once() -> DrainOutcome {
+    static OUTCOME: OnceLock<DrainOutcome> = OnceLock::new();
+    *OUTCOME.get_or_init(|| {
+        EXIT_DRAIN_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let outcome = drain_bounded(EXIT_DRAIN_BUDGET);
+        if outcome == DrainOutcome::TimedOut {
+            tracing::warn!(
+                target: AUDIT_TRACE_TARGET,
+                "forensic: the exit drain timed out; rows still queued were not \
+                 written (#4347)"
+            );
+        }
+        outcome
+    })
+}
+
+static EXIT_DRAIN_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #4347 — how many times the once-only exit drain actually ran (0 or 1).
+#[must_use]
+pub fn exit_drain_runs() -> u64 {
+    EXIT_DRAIN_RUNS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// #4319 — test seam: sleep this many ms in the background writer before
@@ -2851,11 +2966,7 @@ pub fn watermark_emission_due(head_sequence: i64) -> bool {
 /// Lock-free throttle via a compare-and-swap on [`LAST_WATERMARKED_SEQ`];
 /// concurrent callers crossing the same interval boundary collapse to a
 /// single emission.
-pub fn maybe_record_audit_watermark(
-    head_sequence: i64,
-    head_canonical_hash: &str,
-    db_id: Option<&str>,
-) {
+pub fn maybe_record_audit_watermark(head_sequence: i64, head_canonical_hash: &str, db_id: &str) {
     if head_sequence <= 0 {
         return;
     }
@@ -2871,7 +2982,133 @@ pub fn maybe_record_audit_watermark(
     {
         return;
     }
-    record_audit_watermark(head_sequence, head_canonical_hash, db_id);
+    record_audit_watermark(head_sequence, head_canonical_hash, Some(db_id));
+}
+
+/// #7241 - one off-table audit watermark that a signed-events append computed
+/// in its transaction, waiting for that transaction to commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingWatermark {
+    head_sequence: i64,
+    head_canonical_hash: String,
+    db_id: String,
+}
+
+/// #7241 - the OFF-TABLE audit anchors a signed-events append produced, held
+/// until the appending transaction COMMITS.
+///
+/// Both append chokepoints (the sqlite `append_signed_event_no_tx` and the
+/// postgres `pg_append_signed_event_with_chain_in_tx`) run inside a caller's
+/// transaction they do not commit. Writing the #1850 forensic watermark (and
+/// claiming its process-wide throttle) or the #1946 head-anchor mirror there
+/// recorded a head that a later ROLLBACK discards: the verifier then saw an
+/// anchor above the surviving head (a false truncation verdict), and the next
+/// append reused the sequence with a different row whose anchor the burned
+/// throttle suppressed (a false head-hash mismatch). The chokepoints therefore
+/// RETURN this value and the committing owner calls
+/// [`emit_after_commit`](Self::emit_after_commit) only once `COMMIT` succeeded,
+/// mirroring the `run_bulk_post_commit` (#2724) post-commit side-effect pattern.
+///
+/// `#[must_use]`: dropping it silently leaves that write path un-anchored (fail
+/// open), so every commit site either emits it after commit, folds it into an
+/// outer pending anchor with [`merge`](Self::merge), or states a rollback with
+/// [`discard`](Self::discard).
+#[must_use = "emit the pending audit anchor after the appending transaction commits (#7241)"]
+#[derive(Debug, Clone, Default)]
+pub struct PendingAuditAnchor {
+    watermark: Option<PendingWatermark>,
+    head_anchors: Vec<crate::models::Checkpoint>,
+}
+
+impl PendingAuditAnchor {
+    /// No anchor is due (the common 63-of-64 append).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A watermark for `head_sequence` / `head_canonical_hash` of the database
+    /// identified by `db_id`, to be recorded after commit.
+    pub fn watermark(head_sequence: i64, head_canonical_hash: &str, db_id: &str) -> Self {
+        Self {
+            watermark: Some(PendingWatermark {
+                head_sequence,
+                head_canonical_hash: head_canonical_hash.to_string(),
+                db_id: db_id.to_string(),
+            }),
+            head_anchors: Vec::new(),
+        }
+    }
+
+    /// Add a signed witness checkpoint whose OFF-TABLE head-anchor mirror
+    /// (#1946 B) is written after commit. The checkpoint row itself is
+    /// inserted in the transaction, so a rollback discards both.
+    pub fn with_head_anchor(mut self, cp: crate::models::Checkpoint) -> Self {
+        self.head_anchors.push(cp);
+        self
+    }
+
+    /// Fold the anchor of a LATER append in the same transaction into this one.
+    /// The watermark keeps the highest head (the latest committed state); the
+    /// head-anchor mirrors keep their emission order.
+    pub fn merge(mut self, later: Self) -> Self {
+        self.watermark = match (self.watermark.take(), later.watermark) {
+            (Some(a), Some(b)) => Some(if b.head_sequence >= a.head_sequence {
+                b
+            } else {
+                a
+            }),
+            (a, b) => b.or(a),
+        };
+        self.head_anchors.extend(later.head_anchors);
+        self
+    }
+
+    /// `true` when nothing is pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.watermark.is_none() && self.head_anchors.is_empty()
+    }
+
+    /// Head sequence of the pending watermark, if one is pending.
+    #[must_use]
+    pub fn watermark_head(&self) -> Option<i64> {
+        self.watermark.as_ref().map(|w| w.head_sequence)
+    }
+
+    /// Record the pending anchors. Call ONLY after the appending transaction
+    /// committed: the watermark claims the throttle here (never in the
+    /// transaction), so a rolled-back append neither anchors nor burns it.
+    pub fn emit_after_commit(self) {
+        if let Some(w) = self.watermark {
+            maybe_record_audit_watermark(w.head_sequence, &w.head_canonical_hash, &w.db_id);
+        }
+        for cp in &self.head_anchors {
+            append_head_anchor(cp);
+        }
+    }
+
+    /// The appending transaction rolled back (or never committed): the anchors
+    /// describe rows that do not exist, so they are dropped unrecorded.
+    pub fn discard(self) {
+        drop(self);
+    }
+}
+
+/// Set once the "no genesis row, watermark skipped" warning has been logged.
+static WATERMARK_SKIP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// #7228 - a store with no genesis row has no `db_id`, and a db_id-less
+/// (legacy) watermark is counted against EVERY opener of the shared sink, so
+/// the writers skip the emission instead of anchoring an unattributable head.
+/// Logs a single WARN per process (the skip repeats on every append past the
+/// interval until the genesis row exists).
+pub fn warn_watermark_skipped_no_genesis() {
+    if !WATERMARK_SKIP_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "audit watermark skipped: this database has no genesis row, so the anchor would \
+             carry no db_id (#7228)"
+        );
+    }
 }
 
 /// Forensic directory of the live sink, if [`init`] has run.
@@ -6539,6 +6776,138 @@ mod tests {
         let body = std::fs::read_to_string(&today).expect("written inline, no flush");
         assert_eq!(body.lines().count(), 1, "{body}");
         shutdown();
+    }
+
+    /// #4347 — the exit drain runs once however often it is requested, and
+    /// every caller gets the same outcome (signal path + `atexit` race).
+    #[test]
+    fn the_exit_drain_runs_once_however_often_it_is_asked_4347() {
+        let first = drain_at_exit_once();
+        let handles: Vec<_> = (0..4)
+            .map(|_| std::thread::spawn(drain_at_exit_once))
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().expect("drain thread"), first);
+        }
+        assert_eq!(drain_at_exit_once(), first);
+        assert_eq!(exit_drain_runs(), 1, "one drain, not one per caller");
+    }
+
+    /// #4347 — a row queued after the once-only drain is still written by the
+    /// exit hook's follow-up barrier (a request acknowledged late).
+    #[test]
+    fn a_row_queued_after_the_first_drain_is_written_by_the_exit_hook_4347() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _ = drain_at_exit_once();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("forensic-2026-10-01.jsonl");
+        enqueue_append_for_test(path.clone(), "{\"late\":1}".to_string());
+        let outcome = exit_drain_hook();
+        assert_ne!(
+            outcome,
+            DrainOutcome::TimedOut,
+            "the follow-up barrier completes (F-2/F-3, platform-neutral)"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"late\":1}\n");
+    }
+
+    /// #4347 L-1 — the barrier warning reaches RAW stderr (the unix atexit
+    /// hook runs after the tracing guard is dropped), not only `tracing`.
+    #[test]
+    fn a_vanished_writer_after_a_drained_first_drain_warns_on_raw_stderr_4347() {
+        let mut raw: Vec<u8> = Vec::new();
+        let out = exit_drain_follow_up(
+            DrainOutcome::Drained,
+            true,
+            true,
+            || DrainOutcome::NoWriter,
+            &mut raw,
+        );
+        assert_eq!(out, DrainOutcome::NoWriter);
+        let text = String::from_utf8(raw).expect("utf8");
+        assert!(text.contains("writer thread is gone"), "{text}");
+        assert!(text.contains("#4347"), "{text}");
+    }
+
+    /// #4347 L-3 — `NoWriter` with a writer that WAS started (its thread
+    /// died, rows lost) is reported once; with no writer ever started it is
+    /// silent; a writer started only after a `NoWriter` first drain and still
+    /// alive (barrier `Drained`) is silent too.
+    #[test]
+    fn a_no_writer_drain_warns_only_when_a_started_writer_is_gone_4347() {
+        for ran_before in [false, true] {
+            let mut died: Vec<u8> = Vec::new();
+            let out = exit_drain_follow_up(
+                DrainOutcome::NoWriter,
+                ran_before,
+                true,
+                || DrainOutcome::NoWriter,
+                &mut died,
+            );
+            assert_eq!(out, DrainOutcome::NoWriter);
+            let text = String::from_utf8(died).expect("utf8");
+            assert!(
+                text.contains("writer thread is gone"),
+                "ran_before={ran_before}: {text}"
+            );
+            let mut lines = text.lines();
+            assert!(
+                lines.next().is_some() && lines.next().is_none(),
+                "one warning, not one per drain: {text}"
+            );
+
+            let mut never: Vec<u8> = Vec::new();
+            let out = exit_drain_follow_up(
+                DrainOutcome::NoWriter,
+                ran_before,
+                false,
+                || DrainOutcome::NoWriter,
+                &mut never,
+            );
+            assert_eq!(out, DrainOutcome::NoWriter);
+            assert!(
+                never.is_empty(),
+                "no writer ever started is silent: {never:?}"
+            );
+        }
+        let mut late: Vec<u8> = Vec::new();
+        let out = exit_drain_follow_up(
+            DrainOutcome::NoWriter,
+            true,
+            true,
+            || DrainOutcome::Drained,
+            &mut late,
+        );
+        assert_eq!(out, DrainOutcome::Drained);
+        assert!(
+            late.is_empty(),
+            "a live late-started writer is silent: {late:?}"
+        );
+    }
+
+    /// #4347 — the healthy and timeout paths add no raw line of their own
+    /// (`drain_writer` owns the timeout line); a timed-out first drain skips
+    /// the barrier.
+    #[test]
+    fn healthy_and_timed_out_exit_drains_add_no_extra_raw_line_4347() {
+        let mut raw: Vec<u8> = Vec::new();
+        let out = exit_drain_follow_up(
+            DrainOutcome::Drained,
+            true,
+            true,
+            || DrainOutcome::Drained,
+            &mut raw,
+        );
+        assert_eq!(out, DrainOutcome::Drained);
+        let out = exit_drain_follow_up(
+            DrainOutcome::TimedOut,
+            true,
+            true,
+            || unreachable!("a timed-out first drain skips the barrier"),
+            &mut raw,
+        );
+        assert_eq!(out, DrainOutcome::TimedOut);
+        assert!(raw.is_empty(), "{raw:?}");
     }
 
     /// #4304 — a row and its newline go out in ONE write call.

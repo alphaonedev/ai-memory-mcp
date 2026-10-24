@@ -57,9 +57,9 @@ Categorisation:
 | Capabilities envelope `schema_version` | **"3"** | `src/mcp/tools/capabilities.rs` (post-A5); v1/v2 still negotiable via `accept=` / `Accept-Capabilities`. |
 | V-4 signed-events cross-row hash chain | **Live** at sqlite v34 (issue #698); chain holds through v49 | `src/signed_events.rs`, migration `0028_v07_signed_events_chain.sql`. |
 | mTLS fingerprint allowlist | **Live** at v0.7.0 (governance + federation) | `src/federation/` peer-attestation marker `AI_MEMORY_FED_PEER_ATTESTATION`. |
-| X-Memory-Sig / X-Memory-Nonce wire signing | **Required by default** (`AI_MEMORY_FED_REQUIRE_SIG=1`, `AI_MEMORY_FED_REQUIRE_NONCE=1`) | CLAUDE.md env-var table entries #29 + #30; #791 + #922. |
+| X-Memory-Sig / X-Memory-Nonce wire signing | **Required by default** (`AI_MEMORY_FED_REQUIRE_SIG=1`, `AI_MEMORY_FED_REQUIRE_NONCE=1`) | docs/reference/ARCHITECTURE_REFERENCE.md env-var table entries #29 + #30; #791 + #922. |
 | Governance L1-L6 rules engine | **Live**; `memory_check_agent_action` + `memory_rule_list` MCP tools | Migration `0024_v07_governance_rules.sql`; `src/governance/`. |
-| HNSW double-buffer async rebuild | **Live** at v0.7.x post-#968 | `src/hnsw.rs::VectorIndex::try_swap_warming`; CLAUDE.md "Recall Pipeline" §2. |
+| HNSW double-buffer async rebuild | **Live** at v0.7.x post-#968 | `src/hnsw.rs::VectorIndex::try_swap_warming`; docs/reference/ARCHITECTURE_REFERENCE.md "Recall Pipeline" §2. |
 | Persona + atomisation + multistep ingest | **Live** at v0.7.0 | `src/persona/`, `src/atomisation/`, `src/multistep_ingest/`; MCP tools `memory_persona*` / `memory_atomise` / `memory_ingest_multistep`. |
 
 **Tool-count nomenclature.** The codebase consistently uses two paired numbers

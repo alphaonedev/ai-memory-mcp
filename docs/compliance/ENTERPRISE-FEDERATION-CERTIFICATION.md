@@ -12,7 +12,7 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
+Last LIVE bind (historical, no live bind while EXPIRED): `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
 re-issued 2026-10-02 after **3 §7-watched federation-wire files changed** since the prior bind
 `eba96b307` — 74 changed lines, **49 of them code**, from five commits — §5.4(2)–(5) re-run at the
 new SHA per §7). The 2026-09-26 re-issue at `eba96b307`, the 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
@@ -37,6 +37,18 @@ certification and triggers re-cert** (see §7).
 > package WP-B1 ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)),
 > run after code freeze. Re-binding to a newer SHA without that re-measurement is
 > forbidden (#3899).
+>
+> **Amendment (2026-10-08, #6116 - second §7 record for the #4507 doc-comment retargets).**
+> Two §7-watched federation-wire files changed again after the 2026-10-07
+> expiry record above, through the #4507 citation-retarget chain
+> (`6c6634d66`, `015b44777`, `2a18bffe2`, merged at `cd3cb6140`):
+> `src/federation/mod.rs` and `src/handlers/federation_receive.rs`, +1/-1
+> lines each. Both edits are Rust doc-comment path retargets only; no code,
+> no `AI_MEMORY_FED_*` identifier and no wire behaviour changed. This record
+> does **not** re-measure anything and does **not** re-bind. The certification
+> stays EXPIRED, and the re-measurement and re-issue stay under WP-B1
+> ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)); re-binding
+> without that re-measurement is forbidden (#3899).
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
@@ -281,7 +293,7 @@ certification and triggers re-cert** (see §7).
 > certify. Every figure below was measured on this SHA.
 >
 > **§5.4(2) posture legs** (evidence: `docs/compliance/evidence/cert-eae99be43/`;
-> reproducible with `scripts/recapture-cert-3607-posture.sh`, whose header
+> reproducible with `scripts/recapture-cert-3607-posture.py`, whose header
 > declares the 22 checks): leg 1 bare — exit **2**, 12 PASS /
 > 10 FAIL; leg 2 hardened, gate unarmed — exit **2**, 20 /
 > 2; leg 3 hardened, gate ARMED — exit **1**, refuses boot; leg 4
@@ -1489,8 +1501,8 @@ outside the watched paths does not trip the mechanized gate and is
 covered by review plus the posture/removal proofs, not by CI. (Mechanized
 as Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915),
 merged 2026-08-13: the `cert-expiry-gate` job in
-`.github/workflows/c8-precheck.yml` runs `scripts/check-cert-expiry.sh`
-on every PR diff — a watched-surface change without a same-change edit
+`.github/workflows/c8-precheck.yml` runs `scripts/check_cert_expiry.py`
+(ported from `check-cert-expiry.sh` by #6137) on every PR diff — a watched-surface change without a same-change edit
 to this document goes RED. Since [**#3556**](https://github.com/alphaonedev/ai-memory-mcp/issues/3556)
 (2026-09-21) the gate also READS this banner: a same-change edit satisfies
 it only if the STATUS line or the Binds-to line changed (an incidental
@@ -1882,7 +1894,19 @@ captures in `docs/compliance/evidence/cert-3607/`. Cargo `--no-fail-fast`.
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.sh`.
+recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
+own fresh empty cwd, so two consecutive runs of the script give byte-identical
+captures, and the run refuses to publish over a bundle that does not match its
+`MANIFEST.sha256` as committed in git HEAD (read with `git show HEAD:<path>`, never the file
+on disk): the manifest must be in HEAD, the working-tree manifest must be byte-identical to it,
+the files and directories under the bundle must equal the manifest set exactly (an extra,
+missing or unlisted file or subdirectory, or any symlink, refuses) and every listed digest
+must match. A recapture prints `live pragma not observed` where the committed captures
+(`posture-bare-env.out:75`, `posture-hardened-env.out:68`) print `agrees`: the old shared cwd
+held the store that `rules keygen` made (#7648), while every child now runs in its own empty
+cwd and legs 1 and 2 see no store (#7697). The recapture also refuses to publish a capture in
+which a sensitive path survives redaction in any decoded view (#7698). The committed bundle
+stays bound to the build that produced it (not recaptured here).
 
 **Re-cert trigger — FIRED by #3204 (`src/handlers/federation_receive.rs`,
 `src/handlers/federation_signing_check.rs`, `src/identity/sign.rs` — the far-endpoint
@@ -1923,7 +1947,12 @@ pg database created for the run; raw named-test listing and the posture captures
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.sh`.
+recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
+own fresh empty cwd, so two consecutive runs of the script give byte-identical
+captures, and the run refuses to publish over a bundle that does not match its
+`MANIFEST.sha256` as committed in git HEAD (the committed file, not the one on disk; see the
+recapture note above). The committed bundle stays bound to the build that
+produced it (not recaptured here).
 
 ---
 

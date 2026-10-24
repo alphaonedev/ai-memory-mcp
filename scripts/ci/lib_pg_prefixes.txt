@@ -1,0 +1,6 @@
+store::postgres
+store::update_atomicity_3152_tests
+background::auto_tag_worker
+cli::schema_init
+curator::compaction
+daemon_runtime::cov_boot_degrade_arms_3521::curator_store_handle_connects_postgres_without_an_embedder

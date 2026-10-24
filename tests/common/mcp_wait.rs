@@ -39,7 +39,7 @@
 //!
 //! 1. **The budget is no longer a constant.** It is
 //!    `MCP_RESPONSE_BASE_TIMEOUT × AI_MEMORY_TEST_TIMING_BUDGET_MULT`
-//!    (env row #68 in `CLAUDE.md` — the repo's existing knob for slow
+//!    (env row #68 in `docs/reference/ARCHITECTURE_REFERENCE.md` — the repo's existing knob for slow
 //!    CI hosts). A host that needs more headroom sets one env var in
 //!    its job definition; it does not need a code change and a fresh
 //!    round of constant-negotiation.
@@ -81,7 +81,7 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-/// Test-only timing-budget multiplier env var (`CLAUDE.md` env row #68).
+/// Test-only timing-budget multiplier env var (`docs/reference/ARCHITECTURE_REFERENCE.md` env row #68).
 ///
 /// Mirrors the production SSOT `src/hooks/timeouts.rs::
 /// test_timing_budget_mult`, which is private to that module and so
@@ -109,7 +109,7 @@ pub const MCP_RESPONSE_BASE_TIMEOUT: Duration = Duration::from_mins(1);
 /// testable WITHOUT mutating process-global env (`std::env::set_var`
 /// is unsound under concurrent test threads — see the `#1998 → #2115 →
 /// #2127 → #2146` lineage and `scripts/check-test-env-lock.sh`).
-fn budget_mult_from(raw: Option<&str>) -> u64 {
+pub fn budget_mult_from(raw: Option<&str>) -> u64 {
     raw.and_then(|s| s.parse::<u64>().ok())
         .filter(|n| (BUDGET_MULT_MIN..=BUDGET_MULT_MAX).contains(n))
         .unwrap_or(BUDGET_MULT_MIN)
@@ -170,7 +170,7 @@ pub fn recv_mcp_response(rx: &Receiver<String>, ctx: &str) -> String {
              {base:?} x {mult}). The child was still alive and holding stdout \
              open the whole time — either it is genuinely wedged (see #1713), \
              or this host needs a wider budget: set \
-             {ENV_TEST_TIMING_BUDGET_MULT}=<2..=100> (CLAUDE.md env row #68).",
+             {ENV_TEST_TIMING_BUDGET_MULT}=<2..=100> (docs/reference/ARCHITECTURE_REFERENCE.md env row #68).",
             elapsed = started.elapsed(),
             base = MCP_RESPONSE_BASE_TIMEOUT,
             mult = timing_budget_mult(),

@@ -160,7 +160,7 @@ tiers.
 | FTS | FTS5 virtual table (built-in) |
 | Vector index | In-memory HNSW (rebuilt asynchronously past `REBUILD_THRESHOLD`; see `src/hnsw.rs`) |
 | Embeddings | Optional MiniLM (cross-platform); CPU-only path used on mobile and headless servers |
-| Encryption-at-rest | Off by default; opt-in via `AI_MEMORY_ENCRYPT_AT_REST=1` + sqlcipher build (env #37 in `CLAUDE.md`) |
+| Encryption-at-rest | Off by default; opt-in via `AI_MEMORY_ENCRYPT_AT_REST=1` + sqlcipher build (env #37 in `docs/reference/ARCHITECTURE_REFERENCE.md`) |
 
 ### 2.3 Process model
 
@@ -1237,7 +1237,7 @@ Concurrent writes from different agents are merged via the substrate's
 CRDT-lite vector-clock merge (`src/federation/vector_clock.rs`). The
 v0.7.0 schema also carries a `version` column on the Memory struct
 (schema v45, Gap-1 optimistic concurrency for `memory_update`; field
-26 of the current 30-field struct, `CLAUDE.md §"Data Model"`).
+26 of the current 30-field struct, `docs/reference/ARCHITECTURE_REFERENCE.md §"Data Model"`).
 
 For the swarm topology:
 
@@ -1971,7 +1971,7 @@ auditing against it does not conclude they are unset:
 - [ ] `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — **defaults ON** for a *detected*-stale peer policy epoch (absent/undeterminable is fail-open by design).
 
 Each has a documented staged-rollout escape hatch; see the env-var table
-in `CLAUDE.md` for the exact grammar and the per-knob caveats. Setting
+in `docs/reference/ARCHITECTURE_REFERENCE.md` for the exact grammar and the per-knob caveats. Setting
 any of them falsy is a deliberate, time-boxed rollout decision — record
 it, and flip it back.
 

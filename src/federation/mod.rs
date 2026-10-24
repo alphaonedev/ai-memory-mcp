@@ -3094,7 +3094,7 @@ mod tests {
     ///      "ai:alice@plan-c" — not openclaw-2's daemon identity, not the
     ///      receiver-side anonymous fallback.
     ///
-    /// The contract is documented in CLAUDE.md §Agent Identity (NHI):
+    /// The contract is documented in `docs/reference/ARCHITECTURE_REFERENCE.md` §Agent Identity (NHI):
     /// > Once a memory is stored, `metadata.agent_id` is preserved across
     /// > update, dedup (UPSERT), MCP `memory_update`, HTTP `PUT /memories/{id}`,
     /// > import, sync, and consolidate.

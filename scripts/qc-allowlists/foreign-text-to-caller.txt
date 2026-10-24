@@ -74,7 +74,6 @@ src/handlers/route_1111.rs:handle_verify_http:http-body:db=pending:#3707
 src/handlers/share.rs:share_memory:http-body:db=pending:#3707
 src/handlers/skills.rs:skill_compose_route:http-body:db=pending:#3707
 src/handlers/skills.rs:skill_export_route:http-body:path=pending:#3707
-src/handlers/skills.rs:skill_promote_route:http-body:db=pending:#3707
 # (#3760) src/handlers/skills.rs:skill_register_route re-keyed :http-body:db -> :http-body:path once the walk
 # saw the resolved import root first (deterministic first-taint-by-name); held under #3762 below.
 

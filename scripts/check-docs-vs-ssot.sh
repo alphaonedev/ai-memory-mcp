@@ -96,12 +96,28 @@ set -euo pipefail
 # stages a contrived fixture tree in a tmpdir and needs the gate to
 # resolve canonical SSOTs + doc files against the fixture rather than
 # the real checkout.
+# The self-test re-invokes THIS file (not a path under the checkout), so a
+# scratch copy with a check deleted is what the fixture runs (mutation proofs, #4856).
+GATE_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 if [[ -n "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
     REPO_ROOT="$AI_MEMORY_DOCS_GATE_ROOT"
 else
     REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 cd "$REPO_ROOT"
+
+# #4507 R3-6 - FAIL CLOSED on a missing reference file. The Architecture and
+# Code Style bodies moved out of CLAUDE.md into these two files; the DOC_FILES
+# loop below skips an absent file (`[[ -f ]] || continue`) and the env-var
+# census greps one of them, so deleting either made this gate exit 0 (or fail
+# only by accident). Unconditional, fixture included: a check waived under the
+# --self-test is a check the self-test cannot prove.
+# R3-F7: the shared reference check refuses a symlink at EVERY level of each path
+# (docs, docs/reference, the file), not only the leaf.
+if ! python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
+    printf 'FAIL: check-docs-vs-ssot: reference file check failed (#4507 fail-closed)\n' >&2
+    exit 1
+fi
 
 # --------------------------------------------------------------------
 # Resolve canonical SSOT values from Rust source
@@ -236,6 +252,11 @@ CANONICAL_HOOK_EVENTS=$(
 
 DOC_FILES=(
     CLAUDE.md
+    # #4507 — the Architecture / Code Style bodies moved out of CLAUDE.md
+    # (eager-loaded into every agent session) into these two files, verbatim.
+    # They are walked here so the narrative-count rules still see that content.
+    docs/reference/ARCHITECTURE_REFERENCE.md
+    docs/reference/CODE_STYLE.md
     README.md
     ROADMAP.md
     docs/spec/PORTABILITY-V2.md
@@ -292,6 +313,7 @@ for _wf in \
     docs/install-quickstart.md \
     docs/integration-guide.md \
     docs/postgres-age-guide.md \
+    docs/compliance/honest-limitations.md \
     docs/hook-pipeline.md \
     docs/agent-skills.md \
     docs/batman-active-mode.md \
@@ -416,6 +438,24 @@ do
     [[ "$_dup" == 0 ]] && HOOK_DOC_FILES+=("$_hd")
 done
 
+# Additional surfaces walked ONLY by the boot-banner `schema=vNN` check
+# (#3248 item 4): the integration pages and the quickstart that render the
+# `ai-memory boot` status block as sample output. Like HOOK_DOC_FILES this is
+# a SEPARATE list, not an extension of DOC_FILES (their other counts belong
+# to other lanes). Files already in DOC_FILES / HTML_DOC_FILES are skipped
+# here because the generalised scanner already runs the banner check on them
+# (a duplicate would report the same drift twice). Dated records
+# (docs/releases/, docs/audit/, docs/reviews/) are deliberately NOT globbed:
+# they quote the `schema=v19` banner of the release they describe.
+BANNER_DOC_FILES=()
+while IFS= read -r _bd; do
+    [[ -z "$_bd" ]] && continue
+    _bd="${_bd#./}"
+    _dup=0
+    for _e in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]}"; do [[ "$_e" == "$_bd" ]] && { _dup=1; break; }; done
+    [[ "$_dup" == 0 ]] && BANNER_DOC_FILES+=("$_bd")
+done < <({ find docs/integrations -maxdepth 1 -name '*.md' -type f 2>/dev/null; [[ -f docs/QUICKSTART.md ]] && echo docs/QUICKSTART.md; } | LC_ALL=C sort)
+
 # Doc surfaces the pgvector-certified-patch rule walks. Its own EXPLICIT
 # allowlist (the "one rule, one scan set" discipline the HookEvent /
 # HTML rules follow), NOT a shared list — the current-cert docs that cite
@@ -431,30 +471,6 @@ PGVECTOR_DOC_FILES=(
     docs/enterprise-deployment.md
     docs/postgres-age-guide.md
     docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
-)
-
-# Doc surfaces the asi-hard KNOBS-count rule walks. Its OWN scan set
-# ("one rule, one scan set"): the surfaces that narrate the pinned-knob
-# count as a PRESENT fact. Three of them (SECURITY.md, docs/deploy/*)
-# are in no other scan set at all, which is exactly why the post-#3033
-# 17-vs-21 drift was invisible.
-#
-# DELIBERATELY EXCLUDES:
-#   * CHANGELOG.md — every entry is a landing-time snapshot; "the
-#     existing 17-knob asi-hard hardened set" was TRUE when written.
-#   * docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md — it
-#     already says 21 in its current-state row AND carries a signed
-#     `17`-knob EVIDENCE note recording what the captured `.out`
-#     artifacts rendered PRE-#3033. Re-pointing an evidence note at the
-#     canonical would falsify the record the cert rests on.
-#   * infra/federation-lab/README.md — a campaign log, same class.
-KNOB_DOC_FILES=(
-    SECURITY.md
-    README.md
-    docs/deploy/README.md
-    docs/deploy/asi-hard.env
-    docs/deploy/enterprise-federation.env
-    docs/enterprise-deployment.md
 )
 
 # Doc surface the enterprise-federation posture check-count rule walks.
@@ -493,74 +509,278 @@ emit_fail() {
     fail_count=$((fail_count + 1))
 }
 
-# CURRENT_SCHEMA_VERSION rule.
-# Patterns (current-state claims):
-#   - "Current schema = v<N>"
-#   - "current `CURRENT_SCHEMA_VERSION = <N>"
-#   - "CURRENT_SCHEMA_VERSION = <N>"
-#   - "schema_version=<N> — ladder complete"
-#   - "schema **v<N>** sqlite + postgres lockstep"
-#   - "logical schema **v<N>** — `CURRENT_SCHEMA_VERSION = <N>"
-#   - "backends sit at **schema_version=<N>"
-# Patterns INTENTIONALLY EXCLUDED (historical, not current-state):
-#   - "v52 added X" / "schema v52 (added X)"
-#   - changelog headers like "### schema v52 — table"
-#   - RFC doc references like "schema v52, see #1389"
+# CURRENT_SCHEMA_VERSION rule (fail-closed; #3248 items 3-4, review rounds 2-3).
+#
+# THE CLAIM SUBJECT. A schema-ladder position is claimed wherever a doc names
+# the ladder constant or the ladder table together with a number. The rule is
+# therefore CLOSED-WORLD on the subject, not a list of recognised wordings:
+# every enrolled line (DOC_FILES + HTML_DOC_FILES; html is tag-stripped and a
+# card under a `PRIOR RELEASE` eyebrow is history) that mentions the identifier
+# `CURRENT_SCHEMA_VERSION` or `schema_version` is checked, and every ladder
+# number (two or three digits) within SUBJECT_WINDOW characters of it, before
+# or after, is a claim that must equal the canonical constant. Typed constants
+# (`: i64 =`), quotes, backticks, bold, `=`/`:` separators and the schema-init
+# --json form are all just text between the identifier and the number. Round 2
+# found five wordings the old pattern list let through; the precedent for
+# replacing a recogniser with a closed-world check is ai-memory decision
+# 19497ef6-14f9-4482-86f0-a8a92219c930 (copying a recorded precedent, so no
+# crossroads vote).
+#   * A value below 10 is not a ladder claim: the capabilities envelope
+#     (`schema_version: 2|3`) and the config-file marker are different SSOTs
+#     and the ladder has been above 10 for the whole documented life of the
+#     product. This replaces the old whole-line pin-word skip, which a stale
+#     claim could hide behind by saying "pinned" (#4724).
+#   * The ONLY other exemption is the explicit history ledger
+#     scripts/qc-allowlists/schema-claim-history.txt (tab-separated `file`,
+#     `needle`, `#issue note`). A hit whose matched span (identifier, the gap
+#     and the number) contains the needle is true history; the exemption is
+#     per hit, so it never shields a real claim sharing the line. A version
+#     transition (`CURRENT_SCHEMA_VERSION 71→72`) is history by construction.
+#     A malformed entry FAILS, a STALE entry (file or needle no longer
+#     present) FAILS, a missing ledger FAILS, and a scan that reads zero files
+#     FAILS outside --self-test.
+# Ident-less phrasings (prose that says "schema" and a number without naming
+# the identifier) cannot be swept closed-world, because the ladder history is
+# narrated everywhere; they are covered by the explicit ANCHORS list in the
+# engine below. That residual gap is stated, not hidden.
 check_schema_version_rule() {
     local rule_name="CURRENT_SCHEMA_VERSION"
-    for f in "${DOC_FILES[@]}"; do
-        [[ -f "$f" ]] || continue
-        # Capture-then-check rather than `done < <(python3 …)`: under
-        # `set -euo pipefail` a process-substitution's exit status is NOT
-        # observed, so a crashing engine (a non-UTF-8 byte → the unguarded
-        # `open('$f')` raises UnicodeDecodeError) yielded an EMPTY row set
-        # and the rule silently passed — the #2713 swallowed-error shape.
-        local schema_rows
-        schema_rows="$(
-            python3 -c "
-import re
-patterns = [
-    re.compile(r'Current schema = v([0-9]+)'),
-    re.compile(r'CURRENT_SCHEMA_VERSION *= *([0-9]+)'),
-    re.compile(r'schema_version=([0-9]+) — ladder complete'),
-    re.compile(r'schema \*\*v([0-9]+)\*\* sqlite'),
-    re.compile(r'backends sit at \*\*schema_version=([0-9]+)'),
-    re.compile(r'logical schema \*\*v([0-9]+)\*\*'),
-    # Markdown table form (release-notes.md Surface-at-vX.Y.Z table row):
-    #   | Schema | **v86** (CURRENT_SCHEMA_VERSION, both adapters) |
-    # \x60 is the backtick code-span delimiter, spelled as a hex escape
-    # rather than a literal backtick character -- this whole block is
-    # interpolated inside a double-quoted python3 -c string, and a
-    # literal backtick there would trigger bash command substitution.
-    re.compile(r'\| *Schema *\| *\*\*v([0-9]+)\*\* *\(\x60CURRENT_SCHEMA_VERSION'),
-    # ROADMAPs plain-prose current-state phrasing. Scoped to the exact
-    # phrase the current substrate has advanced to schema N (issue
-    # #2282) rather than a bare schema-([0-9]+) pattern -- a generic
-    # word-boundary pattern false-positives on legitimate HISTORICAL
-    # narrative mentions elsewhere in ROADMAP.md, e.g. advanced to
-    # schema 78 anchored to a past release, or schema 45 in ladder
-    # history, which are correct historical state, not drift.
-    re.compile(r'the current substrate has advanced to schema ([0-9]+)'),
-]
-for ln, line in enumerate(open('$f').read().splitlines(), 1):
-    for p in patterns:
-        m = p.search(line)
-        if m:
-            ctx = line.strip()[:160]
-            print(f'{ln}\t{m.group(1)}\t{ctx}')
-            break
-"
-        )" || {
-            printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION analysis engine errored on %s (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$f" >&2
-            exit 2
-        }
-        while IFS=$'\t' read -r ln val context; do
-            [[ -z "$val" ]] && continue
-            if [[ "$val" != "$CANONICAL_SCHEMA_VERSION" ]]; then
-                emit_fail "$rule_name" "$f" "$ln" "$val" "$CANONICAL_SCHEMA_VERSION" "$context"
-            fi
-        done <<< "$schema_rows"
+    local ledger="$REPO_ROOT/scripts/qc-allowlists/schema-claim-history.txt"
+    if [[ ! -f "$ledger" ]]; then
+        printf 'FAIL: check-docs-vs-ssot: missing %s — refusing to run the closed-world schema-claim sweep without its history ledger (#3248 fail-closed)\n' \
+            "$ledger" >&2
+        exit 1
+    fi
+    local scan_files=() f
+    for f in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]:-}"; do
+        [[ -n "$f" && -f "$f" ]] && scan_files+=("$f")
     done
+    if [[ ${#scan_files[@]} -eq 0 && -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
+        printf 'FAIL: check-docs-vs-ssot: the CURRENT_SCHEMA_VERSION sweep resolved ZERO files — refusing to report PASS (#2444 fail-closed)\n' >&2
+        exit 2
+    fi
+    # Capture-then-check rather than `done < <(python3 …)`: under
+    # `set -euo pipefail` a process-substitution's exit status is NOT
+    # observed, so a crashing engine (a non-UTF-8 byte → the unguarded
+    # `open()` raises UnicodeDecodeError) yielded an EMPTY row set and the
+    # rule silently passed — the #2713 swallowed-error shape. The engine
+    # reads its inputs from the environment through a QUOTED heredoc, so no
+    # bash interpolation can reach the python source.
+    local schema_rows
+    schema_rows="$(
+        GATE_SCHEMA_FILES="${scan_files[*]:-}" GATE_SCHEMA_LEDGER="$ledger" \
+            GATE_SCHEMA_CANON="$CANONICAL_SCHEMA_VERSION" python3 - <<'SCHEMAPY'
+import html as htmlmod
+import os
+import re
+
+# Characters either side of the identifier in which a number still belongs to
+# the claim (the longest real wording, the schema.html version row, is ~35).
+SUBJECT_WINDOW = 60
+IDENT = r'\b(?:CURRENT_SCHEMA_VERSION|schema_version)\b'
+# A ladder number: two or three digits, not part of a path, a line ref, an
+# issue ref, a version triple or a longer number. A leading `v` is skipped.
+NUM = r'(?<![\w.:#/-])v?([0-9]{2,3})(?![\w:/]|\.[0-9]|[0-9])'
+# An issue ref (`#2555`) or a release triple (`v1.0.0`) between the identifier
+# and its value is one gap token, never a value.
+GAP = r'(?:#[0-9]+|[0-9]+(?:\.[0-9]+){2}|[^0-9\n]){0,%d}?' % SUBJECT_WINDOW
+SWEEP = [re.compile(IDENT + GAP + NUM), re.compile(NUM + GAP + IDENT)]
+# The identifier glued to its value by `:`/`=` (compact json `"schema_version":99`).
+ADJ_SEP = r'["\x60\'*]*[ \t]*[:=][ \t]*["\x60\'*]*'
+SWEEP.append(re.compile(IDENT + ADJ_SEP + r'v?([0-9]{2,3})(?![\w:/]|\.[0-9]|[0-9])'))
+# A transition (`CURRENT_SCHEMA_VERSION 71→72`): the FROM side is history, the
+# TO side is a claim (a stale `98 → 99` is stale); true past bumps are ledgered.
+SWEEP.append(re.compile(IDENT + GAP + r'v?[0-9]{2,3}[ \t]*(?:→|->)[ \t]*' + NUM))
+# `CURRENT_SCHEMA_VERSION: i64 = 90` -> the width suffix is not a claim.
+TYPED = re.compile(r'(?<=[A-Za-z_]): *[iu](?:16|32|64|size)\b')
+
+# Explicit ident-less anchors (the residual, stated in the header). \x60 is
+# the backtick, spelled as an escape so the source stays readable in a heredoc.
+ANCHORS = [
+    re.compile(r'Current schema = v([0-9]+)'),
+    re.compile(r'schema \*\*v([0-9]+)\*\* sqlite'),
+    re.compile(r'logical schema \*\*v([0-9]+)\*\*'),
+    # release-notes.md table row: | Schema | **v86** (CURRENT_SCHEMA_VERSION ...
+    re.compile(r'\| *Schema *\| *\*\*v([0-9]+)\*\* *\(\x60CURRENT_SCHEMA_VERSION'),
+    # ROADMAP plain-prose current-state phrasing (#2282); scoped to the exact
+    # phrase because a bare schema-N pattern false-positives on history.
+    re.compile(r'the current (?:v[0-9]+\.[0-9]+\.[0-9]+ )?substrate has advanced to schema \**([0-9]+)'),
+    # Ident-less table row: | Schema version | v99 |
+    re.compile(r'\| *Schema version *\| *\**v?([0-9]{2,3})\** *\|'),
+    # at-a-glance schema card (applied to the tag-stripped line).
+    re.compile(r'\bSchema v([0-9]+) \(was v'),
+    re.compile(r'\bv([0-9]+) current \(v[0-9]+–v[0-9]+ add'),  # #4845 second wording on the same card
+    # compliance index tagline: re-stamped to v1.0.0 (schema v100)
+    re.compile(r'\bre-stamped to v[0-9.]+ \(schema v([0-9]+)\)'),
+    # ROADMAP header parenthetical: (schema v100 on `release/v1.0.0` ...
+    re.compile(r'\(schema v([0-9]+) on \x60release/v1\.0\.0\x60'),
+    # at-a-glance stat tile: <span class="stat-num">v100</span> Schema version (v1.0.0)
+    re.compile(r'\bv([0-9]+) Schema version \(v[0-9.]+\)'),
+    # index.html upgrade paragraph: "steps up to v100 on the first ..." and
+    # "a v0.8.x DB steps v70 -> v100" (tag-stripped, entity-decoded).
+    re.compile(r'\bv([0-9]+) on the first ai-memory serve after the upgrade'),
+    re.compile(r'\bsteps\s+v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
+    # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
+    re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
+    # schema.html phrasings.
+    re.compile(r'\bCurrent version: ([0-9]+) at v[0-9]'),
+    re.compile(r'\bCurrently ([0-9]+) \(v[0-9]+\.[0-9]+\.[0-9]+\)'),
+    re.compile(r'\bSchema version \([^)]*\) v([0-9]+) Constant'),
+    re.compile(r'\bSchema version: v([0-9]+) at v[0-9]'),
+    re.compile(r'\bversion = ([0-9]+) \(v[0-9]+\.[0-9]+\.[0-9]+\)'),
+]
+# The html pill chip (`<span class="pill">v98 schema</span>`) is matched on the
+# RAW line: scoped to the chip so ladder prose never matches.
+PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
+
+TAG = re.compile(r'<[^>]+>')
+WS = re.compile(r'\s+')
+PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
+# A block that ends a claim's paragraph. Not `br` (a break inside the paragraph)
+# and not `td`/`th` (a subject cell and its value cell are one row's claim; #5195).
+BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
+
+
+def plain(s):
+    return WS.sub(' ', htmlmod.unescape(TAG.sub(' ', s))).strip()
+
+
+canon = os.environ['GATE_SCHEMA_CANON']
+# A version TRANSITION (`CURRENT_SCHEMA_VERSION 71→72`) narrates a past bump:
+# the number before the arrow is history by construction, never a claim of the
+# current position.
+ARROW = re.compile(r'\s*(?:→|->)')
+
+rows = []
+# ---- the history ledger -------------------------------------------------
+ledger = {}
+for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8').read().splitlines(), 1):
+    if not raw.strip() or raw.lstrip().startswith('#'):
+        continue
+    parts = raw.split('\t')
+    if len(parts) != 3 or not parts[0].strip() or not parts[1].strip() \
+            or not re.search(r'#[0-9]+', parts[2]):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', raw.strip()[:160]))
+        continue
+    if parts[1] in ledger.get(parts[0].strip(), {}):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', 'duplicate entry: ' + raw.strip()[:140]))
+        continue
+    ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, False]
+
+files = os.environ.get('GATE_SCHEMA_FILES', '').split()
+for path in files:
+    is_html = path.endswith('.html')
+    lines = open(path, encoding='utf-8').read().splitlines()
+    entries = ledger.get(path, {})
+    for ln, raw in enumerate(lines, 1):
+        line = plain(raw) if is_html else raw
+        if is_html:
+            # Release-card guard (mirrors html_window_historical in the
+            # numeric scanner): a card under `PRIOR RELEASE` is history.
+            window = ' '.join(plain(w) for w in lines[max(0, ln - 4):ln])
+            if PRIOR.search(window):
+                continue
+        probe = TYPED.sub('', line)
+        hits = []  # (value, matched span)
+        for rx in SWEEP:
+            for m in rx.finditer(probe):
+                if ARROW.match(probe, m.end(1)):
+                    continue
+                hits.append((m.group(1), m.group(0)))
+        # A claim wrapped across two source lines: the subject ends the previous
+        # line, the value opens this one. Only values on THIS line count.
+        if ln > 1:
+            # The nearest previous line with text: an html line that is only a
+            # tag (`<strong>`) is empty once plain()ed and must not break the join.
+            # At most 3 such lines are skipped, and only in html: a blank
+            # markdown line is a paragraph break (#4511-R6 pins both).
+            back = ln - 2
+            prev = plain(lines[back]) if is_html else lines[back]
+            # A block-boundary line (`</div>`, `<p>`, `<li>`) ends the claim's
+            # paragraph: the walk stops there (#5154).
+            while is_html and not prev and back > 0 and ln - 2 - back < 3 \
+                    and not BLOCK_TAG.search(lines[back]):
+                back -= 1
+                prev = plain(lines[back])
+            # Whitespace at the wrap point is not part of the claim: markdown
+            # hard-break spaces, list-continuation indents and tabs are folded.
+            prev = WS.sub(' ', TYPED.sub('', prev)).strip()
+            body = WS.sub(' ', probe).strip()
+            # Identifier form (#4850, window per #5080): the last identifier on
+            # the previous line stands alone and the SUBJECT_WINDOW is counted
+            # from the START of this line, so the previous line's tail (a
+            # trailing word or two, never more than one window) does not eat
+            # the window of the value it introduces.
+            idents = list(re.finditer(IDENT, prev))
+            # A tail that already carries a number is a claim of its own (flagged
+            # on that line), not a subject waiting for a value.
+            # An issue ref (#2555) or a release triple (v1.0.0) in the tail is a
+            # GAP token, not a value, so only a ladder NUM disqualifies the tail.
+            if idents and len(prev) - idents[-1].end() <= SUBJECT_WINDOW \
+                    and not re.search(NUM, prev[idents[-1].end():]):
+                stub = idents[-1].group(0) + ' '
+                for m in SWEEP[0].finditer(stub + body):
+                    if m.start() == 0 and m.start(1) >= len(stub) \
+                            and not ARROW.match(stub + body, m.end(1)):
+                        hits.append((m.group(1), m.group(0)))
+            # Anchor form (#5026): an anchor whose subject words end the previous
+            # line and whose value opens this one (docs/index.html "a v0.8.x DB
+            # steps" / "v70 -> v100"). The match must start on the previous line
+            # and its value on this one; same-line matches are counted below.
+            joined = prev + ' ' + body
+            for rx in ANCHORS:
+                for m in rx.finditer(joined):
+                    if m.start() < len(prev) < m.start(1):
+                        hits.append((m.group(1), m.group(0)))
+        for rx in ANCHORS:
+            hits.extend((m.group(1), m.group(0)) for m in rx.finditer(line))
+        if is_html:
+            hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(htmlmod.unescape(raw)))
+        seen = set()
+        for val, span in hits:
+            if val == canon or val in seen:
+                continue
+            # The ledger exempts ONE hit: the needle must sit inside the
+            # matched span, so a history phrase never shields a real claim
+            # that shares its line (schema.html carries both on one line).
+            hit_entry = [st for nd, st in entries.items() if nd in span]
+            if hit_entry:
+                for st in hit_entry:
+                    st[1] = True
+                continue
+            seen.add(val)
+            rows.append(('CLAIM', path, ln, val, line.strip()[:160]))
+
+for path, entries in ledger.items():
+    for needle, (n, used) in entries.items():
+        if not used:
+            rows.append(('LEDGER_STALE', path, n, '-', needle[:160]))
+for r in rows:
+    print('\t'.join(str(c) for c in r))
+SCHEMAPY
+    )" || {
+        printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION analysis engine errored (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' >&2
+        exit 2
+    }
+    local kind file ln val context
+    while IFS=$'\t' read -r kind file ln val context; do
+        [[ -z "$kind" ]] && continue
+        case "$kind" in
+            CLAIM)
+                if [[ "$val" != "$CANONICAL_SCHEMA_VERSION" ]]; then
+                    emit_fail "$rule_name" "$file" "$ln" "$val" "$CANONICAL_SCHEMA_VERSION" "$context"
+                fi
+                ;;
+            LEDGER_BAD)
+                printf 'FAIL: schema-claim-history ledger: malformed entry at line %s "%s" (expected: <file><TAB><needle><TAB>#<issue> <note>)\n' "$ln" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            LEDGER_STALE)
+                printf 'FAIL: schema-claim-history ledger: STALE entry at line %s (%s no longer carries "%s") — delete it\n' "$ln" "$file" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+        esac
+    done <<< "$schema_rows"
 }
 
 # Generic narrative-count rule.
@@ -953,9 +1173,11 @@ PY
 
 # Env-var census rule (#836 3B / 2026-06-09 GA drive). Every
 # AI_MEMORY_* env var READ by production code must appear somewhere in
-# CLAUDE.md (the env-var table is the operator-facing contract; 13
+# docs/reference/ARCHITECTURE_REFERENCE.md (the env-var table moved there from
+# CLAUDE.md in #4507; it is the operator-facing contract; 13
 # missing rows were found by hand on 2026-06-09 — this makes the class
-# mechanical). Intentionally one-directional — extra rows in CLAUDE.md
+# mechanical). Intentionally one-directional — extra rows in
+# docs/reference/ARCHITECTURE_REFERENCE.md
 # for removed vars are caught by the symbol census, and vars only set
 # (not read) by code are not operator knobs.
 #
@@ -1020,8 +1242,8 @@ check_env_var_census_rule() {
         # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
         # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
         # by `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS`).
-        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/CLAUDE.md"; then
-            printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \
+        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/docs/reference/ARCHITECTURE_REFERENCE.md"; then
+            printf 'FAIL: %s: src reads %s but docs/reference/ARCHITECTURE_REFERENCE.md never mentions it (env-var table drift)\n' \
                 "$rule_name" "$var" >&2
             fail_count=$((fail_count + 1))
         fi
@@ -1085,6 +1307,7 @@ check_generalised_numeric_claims() {
     if ! out="$(
         GATE_DOC_FILES="${DOC_FILES[*]}" \
         GATE_HTML_FILES="${HTML_DOC_FILES[*]:-}" \
+        GATE_BANNER_FILES="${BANNER_DOC_FILES[*]:-}" \
         C_ROUTES="$CANONICAL_ROUTES_COUNT" \
         C_PATHS="$CANONICAL_UNIQUE_PATHS_COUNT" \
         C_SCHEMA="$CANONICAL_SCHEMA_VERSION" \
@@ -1205,16 +1428,21 @@ CURRENT_RELEASE = re.compile(
 # Release-narrative paragraph lead: `**v0.8.0 (`x`) — prior release.**`
 PARA_LEAD = re.compile(r"^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)")
 # Unconditionally past-tense phrasings.
+# The version atom takes 3 OR 4 numeric parts: a 4-part patch release
+# (`v0.6.3.1`) is a real release and a real past-tense record (#3248 F6).
 PAST_TENSE = [
-    re.compile(r"\bAt the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
+    re.compile(r"\bAt the v[0-9]+(?:\.[0-9]+){2,3} release\b"),
     re.compile(r"\brelease, surface was\b"),
-    re.compile(r"\bat the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
+    re.compile(r"\bat the v[0-9]+(?:\.[0-9]+){2,3} release\b"),
 ]
 # Pre-existing historical-claim exclusions, preserved verbatim in intent
 # from the CURRENT_SCHEMA_VERSION rule above: `v52 added X`,
 # changelog-style headers, RFC back-references.
-HISTORICAL = [
-    re.compile(r"^\s*#{1,6}\s"),
+# The markdown-heading guard is a NAMED constant, not list element 0, so a
+# reorder of the lists below cannot silently swap which guard the boot-banner
+# check drops (#3248 F7).
+MD_HEADING_GUARD = re.compile(r"^\s*#{1,6}\s")
+NON_HEADING_HISTORICAL = [
     re.compile(r"\bv[0-9]+ added\b"),
     re.compile(r"\bwas [0-9]+ at v[0-9]"),
     re.compile(r"\bwas (?:four|five|six|seven|eight|nine|ten) at v[0-9]"),
@@ -1225,15 +1453,19 @@ HISTORICAL = [
     re.compile(r"\bShip state at v[0-9]+\.[0-9]+"),
     re.compile(r"\bFrozen v[0-9]+\.[0-9]+[^ ]* baseline\b"),
 ]
+HISTORICAL = [MD_HEADING_GUARD, *NON_HEADING_HISTORICAL]
 
 
-def is_historical(line):
+def is_historical(line, heading=True):
+    # heading=False drops ONLY the markdown-heading guard (see the boot-banner
+    # note below); every other guard still applies.
     m = PARA_LEAD.match(line)
     if m and m.group(1) != release:
         return True
     if any(p.search(line) for p in PAST_TENSE):
         return True
-    return any(p.search(line) for p in HISTORICAL)
+    guards = HISTORICAL if heading else NON_HEADING_HISTORICAL
+    return any(p.search(line) for p in guards)
 
 
 # ---- HTML HISTORICAL GUARD (#2977) ----------------------------------
@@ -1285,6 +1517,60 @@ def html_window_historical(window):
                for m in HTML_HIST_WHATSNEW.finditer(joined))
 
 
+# BOOT-BANNER SAMPLE OUTPUT (#3248 item 4). The integration docs show the
+# `ai-memory boot` status block as a `#`-prefixed transcript, e.g.
+# `#   db: ~/.claude/ai-memory.db (schema=v90, 161 memories)`. The shared
+# markdown-heading guard treats that `#` as a heading and skips the line (and
+# after tag-stripping so does an html `<pre># db: ...` line), so a stale
+# `schema=vNN` went unpoliced. The `schema=vNN` spelling is a present-tense
+# statement about what the current binary prints, so it is matched with every
+# historical guard EXCEPT the heading one.
+#   * Spacing, case, a code-span around the number and emphasis / escape
+#     markup are tolerated (`schema = V90`, `SCHEMA=v90`, `schema=`v90``,
+#     `schema\=v90`, `schema=**v90**`; see MD_MARKUP); the `v` stays MANDATORY
+#     because `schema_version = 2` (a config-file marker, a different SSOT)
+#     would otherwise be flagged 17 times.
+#   * The `=` form IS used in dated records (docs/releases/v0.6.3.1.md,
+#     docs/audit/e2e-smoke-report-v0631-issue-487.md,
+#     docs/reviews/v1.0.0-3x7-GROK-4.5-DOGFOOD-FULL-SPECTRUM.md), which carry
+#     TRUE history. They are safe ONLY because they are not enrolled; in an
+#     enrolled file a banner under a past release must say so on its own line
+#     (`At the vX.Y.Z[.W] release ...` or a `**vX.Y.Z` lead) to be spared.
+#   * Beyond DOC_FILES/HTML_DOC_FILES, the check also walks the pages that
+#     render the banner (GATE_BANNER_FILES, resolved at the top of the
+#     script), so a stale sample there cannot ship green.
+BOOT_BANNER_SCHEMA = re.compile(r"(?i)\bschema\s*=\s*v([0-9]+)\b(?!\.[0-9])")
+# Markdown markup that renders away (#4723): a backslash escape before
+# punctuation, emphasis (`*`, `_`) and code-span backticks of any width. The
+# matcher runs on the markup-stripped copy so `schema\=v90`, `schema=**v90**`,
+# `schema=_v90_` and a double-backtick span all read as the `schema=v90` they
+# render to. The original line stays the reported context.
+MD_MARKUP = re.compile(r"\\(?=[^\w\s])|[*_\x60]")
+banner_docs = os.environ.get("GATE_BANNER_FILES", "").split()
+
+
+def banner_scan(f, ln, text, hist_window):
+    if hist_window or is_historical(text, heading=False):
+        return
+    ctx = text.strip()[:160].replace("\t", " ")
+    for hit in BOOT_BANNER_SCHEMA.finditer(MD_MARKUP.sub("", text)):
+        if hit.group(1) != canon["CURRENT_SCHEMA_VERSION"]:
+            print(
+                "CURRENT_SCHEMA_VERSION\t"
+                f"{f}\t{ln}\t{hit.group(1)}\t"
+                f"{canon['CURRENT_SCHEMA_VERSION']}\t{ctx}"
+            )
+
+
+def scan_banner_only(f):
+    try:
+        text = open(f, encoding="utf-8").read()
+    except OSError:
+        return
+    for ln, line in enumerate(text.splitlines(), 1):
+        banner_scan(f, ln, line, False)
+
+
 def scan(f, is_html):
     try:
         text = open(f, encoding="utf-8").read()
@@ -1294,9 +1580,13 @@ def scan(f, is_html):
     for ln, line in enumerate(lines, 1):
         ctx = line.strip()[:160].replace("\t", " ")
         if is_html:
-            if is_historical(plain(line)):
-                continue
-            if html_window_historical(lines[max(0, ln - 1 - HTML_WINDOW):ln]):
+            pl = plain(line)
+            window_hist = html_window_historical(
+                lines[max(0, ln - 1 - HTML_WINDOW):ln])
+            # The banner is checked BEFORE the numeric guards below: the
+            # heading guard would swallow a `<pre># db: ...` transcript line.
+            banner_scan(f, ln, pl, window_hist)
+            if is_historical(pl) or window_hist:
                 continue
         else:
             # RULE N1 is a MARKDOWN paragraph-lead rule; the html surface
@@ -1308,6 +1598,7 @@ def scan(f, is_html):
                     "CURRENT_RELEASE_ATTRIBUTION\t"
                     f"{f}\t{ln}\tv{m.group(1)}\tv{release}\t{ctx}"
                 )
+            banner_scan(f, ln, line, False)
             if is_historical(line):
                 continue
         for key, pats in RULES:
@@ -1322,6 +1613,8 @@ for f in docs:
     scan(f, False)
 for f in html_docs:
     scan(f, True)
+for f in banner_docs:
+    scan_banner_only(f)
 PY
     )"; then
         # FAIL CLOSED (#2713): the numeric-claim analysis engine exited
@@ -1405,16 +1698,27 @@ run_all_rules() {
     # Known limitation (stated, not hidden): a NEW phrasing that none of these
     # alternatives match would evade the rule. Add its shape here in the same
     # commit that introduces it.
-    # CANONICAL RULE for this SSOT. PR #3169 proposes a second, overlapping
-    # asi-hard knob-count rule with its own scan set; this one supersedes it
-    # (it walks a strict superset of those surfaces) and the duplicate is to be
-    # collapsed into this rule at #3169's rebase — one rule, one SSOT, one
-    # scan set.
+    # CANONICAL AND ONLY RULE for this SSOT (#3248 item 3). A second,
+    # overlapping rule over a 6-file subset (five of this
+    # rule's thirteen anchors) used to report every drift twice; it was removed
+    # because this rule walks a strict superset of its surfaces and anchors.
+    # One rule, one SSOT, one scan set.
+    # DELIBERATELY NOT WALKED (the rationale the removed rule documented, kept):
+    #   * CHANGELOG.md - every entry is a landing-time snapshot; "the existing
+    #     17-knob asi-hard hardened set" was TRUE when written.
+    #   * infra/federation-lab/README.md - a campaign log, same class. Its one
+    #     live-looking prose claims (the "all of them" knob walk) carry no
+    #     number, so they cannot go stale; its captured run transcript prints a
+    #     count as OUTPUT, which is a record, not a claim (#5123).
+    # The certification doc IS walked: its signed 17-knob EVIDENCE note records
+    # what the captured artifacts rendered pre-#3033 and is spared by the
+    # historical guards (is_historical), not by omission from the scan set.
     # Coverage as verified at this commit (a rule whose regex matches nothing
     # in a listed file is a no-op that still reports PASS, so this is stated
     # rather than assumed, and re-verified whenever a file is enrolled):
     # 17 anchored citations across 11 of the 12 surfaces, all reading the
-    # canonical — CLAUDE.md 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
+    # canonical — CLAUDE.md + docs/reference/ARCHITECTURE_REFERENCE.md (the
+    # citations moved there in #4507) 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
     # docs/deploy/README.md 1, docs/deploy/enterprise-federation.env 1, the
     # certification doc 2, docs/enterprise-deployment.md 1,
     # src/security_profile.rs 2, src/enterprise_federation_posture.rs 2,
@@ -1435,6 +1739,7 @@ run_all_rules() {
         "$CANONICAL_ASI_HARD_KNOBS" \
         '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)|is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries|All \*\*([0-9]+)\*\* of them' \
         CLAUDE.md \
+        docs/reference/ARCHITECTURE_REFERENCE.md \
         README.md \
         SECURITY.md \
         PERFORMANCE.md \
@@ -1555,17 +1860,6 @@ run_all_rules() {
         "$CANONICAL_CLI_SAL" \
         'default build / ([0-9]+) under' \
         "${HTML_DOC_FILES[@]}"
-    # asi-hard pinned-knob count (src/security_profile.rs::KNOBS).
-    # FIVE anchors, all BOLD- or hyphen-delimited so a bare integer next
-    # to the word "knobs" can never match. The bold delimiter on the
-    # `is **N** knobs` form is load-bearing: docs/deploy/README.md says
-    # "the config-backed PE-1 knobs and", and a bare `([0-9]+) knobs`
-    # anchor captures the `1` out of `PE-1` and reports phantom drift.
-    check_narrative_count_rule \
-        "asi-hard KNOBS count (src/security_profile.rs::KNOBS)" \
-        "$CANONICAL_ASI_HARD_KNOBS" \
-        'is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-knob\b|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries' \
-        "${KNOB_DOC_FILES[@]}"
     # enterprise-federation posture check count
     # (enterprise_federation_posture::ENTERPRISE_FEDERATION_CHECK_COUNT).
     # ONE anchor: the cert doc's NORMATIVE exit contract. Scoped that
@@ -1640,11 +1934,22 @@ run_self_test() {
     # #2977 — the frozen-page exemption SSOT the html scan set resolves
     # against. A REAL one (not an empty stub) so the html legs below can
     # prove BOTH directions of the boundary.
+    # #4507 R3-6 - the gate refuses a tree without the two reference files, so
+    # the fixture carries real (stub) ones; the missing/symlink cases below
+    # remove or replace them one at a time.
+    mkdir -p docs/reference
+    printf '# Architecture reference (fixture)\nFixture body line.\n' > docs/reference/ARCHITECTURE_REFERENCE.md
+    printf '# Code style reference (fixture)\nFixture body line.\n' > docs/reference/CODE_STYLE.md
     mkdir -p scripts/qc-allowlists
     cat > scripts/qc-allowlists/html-doc-frozen-exempt.txt <<'FROZENEOF'
 # fixture exemption SSOT
 docs/whats-new-v
 FROZENEOF
+    # #3248 (r3): the schema-claim history ledger the CURRENT_SCHEMA_VERSION
+    # sweep resolves against. One real entry so the allowlist direction is
+    # proven; the tabs are literal (file, needle, #issue note).
+    printf '# fixture ledger (comment-only; the schema phase seeds one real entry)\n' \
+        > scripts/qc-allowlists/schema-claim-history.txt
     # Minimal canonical fixture: CURRENT_SCHEMA_VERSION = 53
     cat > src/storage/migrations.rs <<EOF
 const CURRENT_SCHEMA_VERSION: i64 = 53;
@@ -1740,7 +2045,7 @@ EOF
     # resolves SSOTs + doc files against the fixture (not the real
     # checkout).
     local gate_output
-    if gate_output=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if gate_output=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the contrived drift"
         cd "$REPO_ROOT"
         exit 1
@@ -1806,7 +2111,7 @@ STALEEOF
     fi
     echo "PASS: self-test R-203 — frozen pre-fix gate ACCEPTS all five stale README shapes (the #2492 defect, reproduced)"
 
-    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — the WIDENED gate accepted the stale README shapes" >&2
         cd "$REPO_ROOT"
         exit 1
@@ -1850,9 +2155,9 @@ STALEEOF
 schema v41 added the widget table; v40 added the gadget table.
 ### schema v39 — historical heading
 HISTEOF
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — the widened gate fired on LEGITIMATE HISTORICAL mentions." >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"
         exit 1
     fi
@@ -1865,7 +2170,7 @@ HISTEOF
     cat > README.md <<'ATTREOF'
 **v9.8.7 — current release.** A perfectly ordinary paragraph.
 ATTREOF
-    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate accepted a stale '— current release' attribution" >&2
         cd "$REPO_ROOT"
         exit 1
@@ -1883,7 +2188,7 @@ Surface: **92** HTTP route registrations (73 unique URL paths).
 a **28-field** `Memory`.
 LEDEOF
     printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT 92 #1\n' > "$led"
-    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test — ledger suppressed an UNLEDGERED claim (28-field Memory)" >&2
         cd "$REPO_ROOT"; exit 1; }
     grep -q 'FAIL: EXPECTED_PRODUCTION_ROUTES_COUNT:' <<<"$new_out" && {
@@ -1902,7 +2207,7 @@ LEDEOF
 Nothing to see here.
 CLEANDOC
     printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT 92 #1\n' > "$led"
-    if ! new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if ! new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — a STALE ledger entry FAILED the gate (must be a NOTICE)" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -1913,7 +2218,7 @@ CLEANDOC
 
     # MALFORMED entry => HARD FAIL (the ledger cannot rot into prose).
     printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT\n' > "$led"
-    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test — a MALFORMED ledger entry did not fail the gate" >&2
         cd "$REPO_ROOT"; exit 1; }
     grep -q 'malformed entry' <<<"$new_out" || {
@@ -1937,7 +2242,7 @@ CLEANDOC
         echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2
         cd "$REPO_ROOT"; exit 1; }
     fault_rc=0
-    fault_out="$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_SELFTEST_FAULT=1 "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1)" || fault_rc=$?
+    fault_out="$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_SELFTEST_FAULT=1 "$GATE_SELF" 2>&1)" || fault_rc=$?
     [[ "$fault_rc" -ne 0 ]] || {
         echo "FAIL: self-test #2713 — the gate exited 0 on an injected analysis-engine fault (fail-OPEN)" >&2
         printf '%s\n' "$fault_out" | sed 's/^/       /' >&2; cd "$REPO_ROOT"; exit 1; }
@@ -1968,7 +2273,7 @@ HTMLCLEANREADME
 <td>RequestValidator surface (94 production HTTP route registrations over 80 unique paths + 103 advertised MCP entries at <code>--profile full</code> + 89 CLI subcommands in the default build / 91 under <code>sal</code>)</td>
 <span class="com"># Expected: 89 CLI subcommands in the default build / 91 under `sal`</span>
 HTMLSTALEEOF
-    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale HTML CLI counts (89/91 vs fixture 78/80)" >&2
         printf '%s\n' "$new_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -1989,9 +2294,9 @@ HTMLSTALEEOF
     cat > "$tmpdir/docs/compliance/nsa-csi-mcp.html" <<'HTMLGOODEOF'
 <td>RequestValidator surface (78 CLI subcommands in the default build / 80 under <code>sal</code>)</td>
 HTMLGOODEOF
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — html rule fired on CORRECT HTML CLI counts (78/80)" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — correct HTML CLI counts (78/80) still PASS"
@@ -2022,7 +2327,7 @@ HOOKSTALEDEV
     cat > "$tmpdir/docs/essays/brass-tacks-3-why.html" <<'HOOKSTALEBT'
   <p>The hook pipeline fires on 27 named substrate events.</p>
 HOOKSTALEBT
-    if hook_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if hook_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — widened HookEvent rule did NOT catch the five planted 27-vs-25 claims" >&2
         printf '%s\n' "$hook_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2053,9 +2358,9 @@ HOOKHISTPD
     rm -f "$tmpdir/docs/strategy/coala-mapping.md" \
           "$tmpdir/docs/audience/developer.html" \
           "$tmpdir/docs/essays/brass-tacks-3-why.html"
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — widened HookEvent rule fired on LEGITIMATE HISTORICAL hook mentions" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — historical hook mentions (prior-release lead, 'ships N', frozen baseline) still PASS"
@@ -2088,7 +2393,7 @@ PGVECCLEANREADME
 The image layers pgvector 0.8.5 onto the AGE base.
 > Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
 PGVECSTALE
-    if pgv_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if pgv_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale pgvector patch (0.8.5 vs SSOT 0.8.6)" >&2
         printf '%s\n' "$pgv_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2115,9 +2420,9 @@ PGVECSTALE
 The image layers pgvector 0.8.6 onto the AGE base.
 > Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
 PGVECGOOD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — pgvector rule fired on the CORRECT patch (0.8.6)" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the certified pgvector patch (0.8.6) still PASSES"
@@ -2167,7 +2472,7 @@ KNOBSTALESH
 
 Fixture CLAUDE.md — deliberately carries no CURRENT narrative counts.
 KNOBHEADINGMD
-    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale knob count in a SHELL COMMENT (9 vs SSOT 3)" >&2
         printf '%s\n' "$knob_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2191,9 +2496,9 @@ KNOBHEADINGMD
 # Shared certified env for a pg backend. asi-hard auto-pins the 3 knobs in
 # the binary's pre-runtime phase.
 KNOBGOODSH
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — the asi-hard knob-count rule fired on the CORRECT count (3)" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #3113 — the correct asi-hard knob count still PASSES"
@@ -2238,15 +2543,15 @@ KNOBSTALEDEPLOY
 `run_posture` returns **0 iff all 6 checks pass, else 2**.
 > Evidence note: the captures below PREDATE the last two checks and reflect the 4-check posture.
 EFSTALE
-    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale asi-hard knob / EF check counts" >&2
         printf '%s\n' "$knob_out" >&2
         cd "$REPO_ROOT"; exit 1
     fi
     for _want in \
-        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): SECURITY.md:1 claims "4"' \
-        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): SECURITY.md:2 claims "4"' \
-        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): docs/deploy/README.md:2 claims "4"' \
+        'ASI_HARD_PINNED_KNOB_COUNT: SECURITY.md:1 claims "4"' \
+        'ASI_HARD_PINNED_KNOB_COUNT: SECURITY.md:2 claims "4"' \
+        'ASI_HARD_PINNED_KNOB_COUNT: docs/deploy/README.md:2 claims "4"' \
         'ENTERPRISE_FEDERATION_CHECK_COUNT: docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:1 claims "6"'
     do
         grep -qF "$_want" <<<"$knob_out" || {
@@ -2256,7 +2561,9 @@ EFSTALE
     done
     # The `PE-1 knobs` prose must NOT match: a bare `([0-9]+) knobs`
     # anchor would capture the `1` out of `PE-1` and report phantom drift.
-    if grep -qF 'KNOBS): docs/deploy/README.md:1' <<<"$knob_out"; then
+    # (Anchored on the SINGLE surviving rule name; #3248 item 3 collapsed the
+    # pair, and the old `KNOBS): ...` suffix literal went dead with it.)
+    if grep -qF 'ASI_HARD_PINNED_KNOB_COUNT: docs/deploy/README.md:1 claims' <<<"$knob_out"; then
         echo "FAIL: self-test — the knob rule falsely matched 'PE-1 knobs' prose" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2280,12 +2587,387 @@ KNOBGOODDEPLOY
     cat > "$tmpdir/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md" <<'EFGOOD'
 `run_posture` returns **0 iff all 5 checks pass, else 2**.
 EFGOOD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — the knob / EF check rules fired on the CANONICAL counts" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the canonical asi-hard knob (3) + EF check (5) counts PASS"
+
+    # ---- #3248 item 4: boot-banner `schema=vNN` in a `#`-prefixed transcript.
+    # Fixture canonical: schema 53. The `#   db:` transcript line opens with
+    # a `#` that the markdown-heading guard would treat as a heading, so the
+    # banner check must run past that guard (and past html `<pre>` markup),
+    # tolerate spacing / case / code-span variants, and still spare dated
+    # history. Lines 1,2,6 (md), the html line and the cursor.md line are
+    # STALE and must be flagged; lines 3,4,5 must NOT be.
+    mkdir -p "$tmpdir/docs/integrations"
+    cat > "$tmpdir/docs/integrations/README.md" <<'BOOTBANNER'
+#   db:         /home/u/.claude/ai-memory.db (schema=v52, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema = V52, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=v53, 161 memories)
+**v0.6.3** boot sample: (schema=v19, 3 memories)
+At the v0.6.3.1 release the banner showed (schema=v19, 3 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=`v52`, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema\=v52, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=**v52**, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=_v52_, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=``v52``, 161 memories)
+BOOTBANNER
+    printf '<pre># db: /x.db (schema=v52, 1 memories)</pre>\n' > "$tmpdir/docs/banner-fixture.html"
+    # An integration page that is NOT in DOC_FILES: enrolled for this check only.
+    printf '#   db:         /home/u/.claude/ai-memory.db (schema=v52, 161 memories)\n' > "$tmpdir/docs/integrations/cursor.md"
+    bb_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #3248 - stale boot-banner schema=vNN not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:2 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:6 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:7 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:8 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:9 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:10 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/banner-fixture.html:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/cursor.md:1 claims "52"'
+    do grep -qF "$_want" <<<"$bb_out" || { echo "FAIL: self-test #3248 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _not in 'docs/integrations/README.md:3 ' 'docs/integrations/README.md:4 ' 'docs/integrations/README.md:5 '; do
+        grep -qF "$_not" <<<"$bb_out" && { echo "FAIL: self-test #3248 - canonical/historical banner flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #3248 - boot-banner schema=vNN: stale REJECTED (md, html, spacing/case/code-span, escaped-equals/bold/italic/double-backtick markup, banner-only page), canonical and dated history ACCEPTED"
+    rm -f "$tmpdir/docs/integrations/README.md" "$tmpdir/docs/integrations/cursor.md" "$tmpdir/docs/banner-fixture.html"
+
+    # ---- #3248 item 4: the schema-version rule reads the .html surface and the
+    # `schema_version: N` / `postgres schema | **vN**` / `Currently N (vX)`
+    # anchors. Fixture canonical: schema 53. Stale lines must be flagged, the
+    # canonical value, a capabilities-envelope pin and a PRIOR RELEASE card
+    # must not be.
+    mkdir -p "$tmpdir/docs"
+    printf '# fixture ledger\ndocs/postgres-age-guide.md\tv52 rewrote the schema_version\t#3248 fixture history line\n' \
+        > scripts/qc-allowlists/schema-claim-history.txt
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'SCHEMAMD'
+   `schema_version: 52`) or the `--json` report.
+   `schema_version: 53`) or the `--json` report.
+Clients that pin `schema_version: 2` keep receiving the v2 shape.
+the server pinned the ladder at schema_version: 52 today
+{"schema_version": 52, "tables": 35}
+doctor reports schema_version=52 for this db
+Tracks migration state. Current version: **52** (`CURRENT_SCHEMA_VERSION` in src/x.rs).
+the in-process upgrade ladder up to schema v52 (the current `CURRENT_SCHEMA_VERSION`) as a side effect
+# Expected: const CURRENT_SCHEMA_VERSION: i64 = 52;   (sqlite)
+# Expected: const CURRENT_SCHEMA_VERSION: i32 = 53;   (postgres)
+an unlisted wording: the ladder identifier schema_version sits at 52 on this host
+history: v52 rewrote the schema_version table
+{"schema_version": "3", "tier": "smart"}
+SCHEMAMD
+    cat > "$tmpdir/docs/CONFIG_SCHEMA.md" <<'SCHEMACFG'
+| ai-memory postgres schema | **v52** | postgres ladder pinned in lockstep |
+| ai-memory postgres schema | **v53** | postgres ladder pinned in lockstep |
+SCHEMACFG
+    cat > "$tmpdir/docs/schema-fixture.html" <<'SCHEMAHTML'
+<td class="note"><strong>Currently 52 (v1.0.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 53</code></td>
+<tr><td>Schema version (sqlite + postgres)</td><td class="num">v52</td><td class="src">Constant <code>CURRENT_SCHEMA_VERSION = 53</code> in x</td></tr>
+<p><strong>Current version: 52 at v1.0.0</strong> (was 40 at v0.9.0)</p>
+<p>Canonical: <code>CURRENT_SCHEMA_VERSION = 53</code></p>
+<div class="eyebrow">&#9656; PRIOR RELEASE</div>
+<div class="title">What's New in v0.5.0</div>
+<p>Then <code>CURRENT_SCHEMA_VERSION = 40</code></p>
+<p>filler line so the earlier release card has closed</p>
+<p>filler line so the earlier release card has closed</p>
+<p><strong>Schema version: v52 at v1.0.0</strong> (was v40 at v0.9.0)</p>
+<span class="pill">v52 schema</span>
+<text x="1" y="2">version = 52 (v1.0.0)</text>
+<p><strong>Schema version: v53 at v1.0.0</strong></p>
+<span class="pill">v53 schema</span>
+<text x="1" y="2">version = 53 (v1.0.0)</text>
+SCHEMAHTML
+    sch_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #3248 - stale schema claims (md anchors + html) not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/CONFIG_SCHEMA.md:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:2 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:3 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:10 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:11 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:12 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:4 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:5 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:6 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:7 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:8 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:9 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:11 claims "52"'
+    do grep -qF "$_want" <<<"$sch_out" || { echo "FAIL: self-test #3248 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _not in \
+        'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:3 ' \
+        'docs/CONFIG_SCHEMA.md:2 ' \
+        'docs/schema-fixture.html:4 ' 'docs/schema-fixture.html:7 ' \
+        'docs/schema-fixture.html:13 ' 'docs/schema-fixture.html:14 ' 'docs/schema-fixture.html:15 ' \
+        'docs/postgres-age-guide.md:10 ' 'docs/postgres-age-guide.md:12 ' 'docs/postgres-age-guide.md:13 '
+    do grep -qF "$_not" <<<"$sch_out" && { echo "FAIL: self-test #3248 - canonical/pin/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #3248 - schema-version rule: stale md anchors + html + json/bare/typed/pinned/unlisted wordings REJECTED; canonical, capability pin (value < 10), ledger history line and PRIOR RELEASE card ACCEPTED"
+    # Ledger fail-closed controls: malformed, stale and missing ledgers go red.
+    _led=scripts/qc-allowlists/schema-claim-history.txt
+    cp "$_led" "$_led.keep"
+    printf 'docs/postgres-age-guide.md\tneedle-without-issue-or-note\n' >> "$_led"
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
+    grep -qF 'malformed entry' <<<"$_led_out" \
+        || { echo "FAIL: self-test #3248 - malformed ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    cp "$_led.keep" "$_led"
+    printf 'docs/postgres-age-guide.md\tno such span anywhere\t#3248 stale on purpose\n' >> "$_led"
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
+    grep -qF 'STALE entry' <<<"$_led_out" \
+        || { echo "FAIL: self-test #3248 - stale ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    rm -f "$_led"
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #3248 - missing ledger not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    # The fixture tree already carries planted claims, so a non-zero exit alone
+    # would pass with the missing-ledger check deleted (#4856): require the
+    # ledger check's own message.
+    grep -qF 'without its history ledger' <<<"$_led_out" \
+        || { echo "FAIL: self-test #3248 - missing ledger rejected for another reason, not by the ledger check" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$_led.keep" "$_led"
+    # A duplicate file+needle entry must FAIL, never silently overwrite (#4858).
+    cp "$_led" "$_led.keep"
+    tail -n 1 "$_led" >> "$_led"
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #4858 - duplicate ledger entry not rejected (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'duplicate entry' <<<"$_led_out" \
+        || { echo "FAIL: self-test #4858 - duplicate ledger entry rejected for another reason" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$_led.keep" "$_led"
+    echo "PASS: self-test #4858 - duplicate ledger entry (same file + needle) REJECTED with 'duplicate entry'"
+    echo "PASS: self-test #3248 - schema sweep closed-world: planted wrong wordings (md, json, bare, typed-const, html tagline/pill/svg) REJECTED; ledger history and canonical ACCEPTED; malformed, stale and missing ledger REJECTED"
+
+    # ---- #3248 round 4 (#4849-#4855, #4845, #4846, #4844): wordings the sweep
+    # missed. Fixture canonical: schema 53. Every line below marked REJECT
+    # carries a stale 52 (or 51 in a transition) and must be flagged by line
+    # number; every line marked ACCEPT must not. Red without the round-4 gate
+    # changes: each REJECT line passed green before them.
+    printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 49→50\t#3248 fixture past bump\n' \
+        > scripts/qc-allowlists/schema-claim-history.txt
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R4MD'
+The current `CURRENT_SCHEMA_VERSION` is
+52 on both backends.
+The current `CURRENT_SCHEMA_VERSION` is
+53 on both backends.
+{"schema_version":52,"ok":true}
+{"schema_version":53,"ok":true}
+the `CURRENT_SCHEMA_VERSION` constant (#2555) is 52
+the `CURRENT_SCHEMA_VERSION` constant (#2555) is 53
+schema_version at v1.0.0: 52
+schema_version at v1.0.0: 53
+bumps `CURRENT_SCHEMA_VERSION` 51 → 52 on both
+bumps `CURRENT_SCHEMA_VERSION` 52 -> 53 on both
+past CURRENT_SCHEMA_VERSION 49→50 is ledgered history
+| Schema version | v52 |
+| Schema version | **v53** |
+the current v1.0.0 substrate has advanced to schema **52**
+the current v1.0.0 substrate has advanced to schema **53**
+> **Current release:** v1.0.0 (schema v52 on `release/v1.0.0`, 104 tools)
+> **Current release:** v1.0.0 (schema v53 on `release/v1.0.0`, 104 tools)
+the value is read from `CURRENT_SCHEMA_VERSION` in
+`src/storage/migrations.rs`); an older DB is brought up to v52
+the value is read from `CURRENT_SCHEMA_VERSION` in
+`src/storage/migrations.rs`); an older DB is brought up to v53
+probe: `CURRENT_SCHEMA_VERSION` (#2555) at v1.0.0 is
+v52 on this build.
+probe: `CURRENT_SCHEMA_VERSION` (#2555) at v1.0.0 is
+v53 on this build.
+a v0.8.x DB steps  
+	v40 → v52 on boot.
+a v0.8.x DB steps  
+	v40 → v53 on boot.
+a v0.8.x DB steps v40->v52 on boot.
+a v0.8.x DB steps v40->v53 on boot.
+probe: `CURRENT_SCHEMA_VERSION` is
+
+v52 was the schema before #2555.
+a v0.8.x DB steps  v40 → v52 on boot.
+a v0.8.x DB steps  v40 → v53 on boot.
+a v0.8.x DB steps	v40 → v52 on boot.
+a v0.8.x DB steps	v40 → v53 on boot.
+R4MD
+    cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
+<span class="pill">v52&nbsp;schema</span>
+<span class="pill">v53&nbsp;schema</span>
+<p><strong>Schema v52</strong> (was v33 at v0.6.4)</p>
+<p><strong>Schema v53</strong> (was v33 at v0.6.4)</p>
+<p><strong>The pair is re-stamped to v1.0.0 (schema v52);</strong></p>
+<p><strong>The pair is re-stamped to v1.0.0 (schema v53);</strong></p>
+<div class="stat-item"><span class="stat-num">v52</span><span class="stat-label">Schema version (v1.0.0)</span></div>
+<div class="stat-item"><span class="stat-num">v53</span><span class="stat-label">Schema version (v1.0.0)</span></div>
+<p>steps <strong>v40&nbsp;&rarr;&nbsp;v52</strong> on the first</p>
+<p>steps <strong>v40&nbsp;&rarr;&nbsp;v53</strong> on the first</p>
+<p>v52 current (v58–v71 add the typed-cognition layer)</p>
+<p>v53 current (v58–v71 add the typed-cognition layer)</p>
+<p>an older DB steps to <strong>v52</strong> on the first ai-memory serve after the upgrade</p>
+<p>an older DB steps to <strong>v53</strong> on the first ai-memory serve after the upgrade</p>
+<p>(a v0.8.x DB steps
+<strong>v40&nbsp;&rarr;&nbsp;v52</strong>; a v0.7.x DB)</p>
+<p>(a v0.8.x DB steps
+<strong>v40&nbsp;&rarr;&nbsp;v53</strong>; a v0.7.x DB)</p>
+<p>(a v0.8.x DB steps
+<strong>
+v40&nbsp;&rarr;&nbsp;v52</strong>)</p>
+<p>(a v0.8.x DB steps
+<strong>
+v40&nbsp;&rarr;&nbsp;v53</strong>)</p>
+<p>(a v0.8.x DB steps <strong>v40&rarr;v52</strong>)</p>
+<p>(a v0.8.x DB steps <strong>v40&rarr;v53</strong>)</p>
+<p>(a v0.8.x DB steps
+<strong>
+<em>
+<span>
+v40&nbsp;&rarr;&nbsp;v52</span></em></strong>)</p>
+<p>(a v0.8.x DB steps
+<strong>
+<em>
+<span>
+v40&nbsp;&rarr;&nbsp;v53</span></em></strong>)</p>
+<h3><code>CURRENT_SCHEMA_VERSION</code></h3>
+<div>
+<ul>
+<li>
+<p>
+v52 added the audit table.</p>
+<p>See CURRENT_SCHEMA_VERSION</p>
+</div>
+<div>
+<p>52 tools ship today.</p>
+<p>The live CURRENT_SCHEMA_VERSION is
+<br>
+52 on both backends.</p>
+<p>The live CURRENT_SCHEMA_VERSION is
+<br>
+53 on both backends.</p>
+<td>
+<code>CURRENT_SCHEMA_VERSION</code>
+</td>
+<td>
+52</td>
+<td>
+<code>CURRENT_SCHEMA_VERSION</code>
+</td>
+<td>
+53</td>
+<p>(a v0.8.x DB steps
+<br>
+v40&nbsp;&rarr;&nbsp;v52 on boot.)</p>
+<p>(a v0.8.x DB steps
+<br>
+v40&nbsp;&rarr;&nbsp;v53 on boot.)</p>
+<p>(CURRENT_SCHEMA_VERSION is
+<strong>
+<em>
+<span>
+<a>
+v52</a></span></em></strong>)</p>
+<p>(CURRENT_SCHEMA_VERSION is
+<strong>
+<em>
+<span>
+v52</span></em></strong>)</p>
+R4HTML
+    # #5196: every block tag, opening and closing, stops the look-back; every inline or
+    # in-row tag does not. One triple per tag (subject, tag-only line, value). block-fixture.html
+    # must raise nothing; block-control.html (same triples, inline tags) must flag every value.
+    : > "$tmpdir/docs/block-fixture.html"; : > "$tmpdir/docs/block-control.html"
+    for _bt in p div li ul ol tr table h1 h2 h3 h4 h5 h6 section P 'div class="x"' \
+               /p /div /li /ul /ol /tr /table /h1 /h2 /h3 /h4 /h5 /h6 /section /DIV; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-fixture.html"
+    done
+    for _bt in em span strong a code b br td th /td /th /em /span /strong /br; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
+    done
+    r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'docs/postgres-age-guide.md:2 claims "52"' \
+        'docs/postgres-age-guide.md:5 claims "52"' \
+        'docs/postgres-age-guide.md:7 claims "52"' \
+        'docs/postgres-age-guide.md:9 claims "52"' \
+        'docs/postgres-age-guide.md:11 claims "52"' \
+        'docs/postgres-age-guide.md:14 claims "52"' \
+        'docs/postgres-age-guide.md:16 claims "52"' \
+        'docs/postgres-age-guide.md:18 claims "52"' \
+        'docs/schema-fixture.html:1 claims "52"' \
+        'docs/schema-fixture.html:3 claims "52"' \
+        'docs/schema-fixture.html:5 claims "52"' \
+        'docs/schema-fixture.html:7 claims "52"' \
+        'docs/schema-fixture.html:9 claims "52"' \
+        'docs/schema-fixture.html:11 claims "52"' \
+        'docs/schema-fixture.html:13 claims "52"' \
+        'docs/schema-fixture.html:16 claims "52"' \
+        'docs/postgres-age-guide.md:21 claims "52"' \
+        'docs/postgres-age-guide.md:25 claims "52"' \
+        'docs/postgres-age-guide.md:29 claims "52"' \
+        'docs/schema-fixture.html:21 claims "52"' \
+        'docs/postgres-age-guide.md:32 claims "52"' \
+        'docs/postgres-age-guide.md:37 claims "52"' \
+        'docs/postgres-age-guide.md:39 claims "52"' \
+        'docs/schema-fixture.html:25 claims "52"' \
+        'docs/schema-fixture.html:31 claims "52"' \
+        'docs/schema-fixture.html:49 claims "52"' \
+        'docs/schema-fixture.html:57 claims "52"' \
+        'docs/schema-fixture.html:65 claims "52"' \
+        'docs/block-control.html:3 claims "52"' \
+        'docs/block-control.html:6 claims "52"' \
+        'docs/block-control.html:9 claims "52"' \
+        'docs/block-control.html:12 claims "52"' \
+        'docs/block-control.html:15 claims "52"' \
+        'docs/block-control.html:18 claims "52"' \
+        'docs/block-control.html:21 claims "52"' \
+        'docs/block-control.html:24 claims "52"' \
+        'docs/block-control.html:27 claims "52"' \
+        'docs/block-control.html:30 claims "52"' \
+        'docs/block-control.html:33 claims "52"' \
+        'docs/block-control.html:36 claims "52"' \
+        'docs/block-control.html:39 claims "52"' \
+        'docs/block-control.html:42 claims "52"' \
+        'docs/block-control.html:45 claims "52"' \
+        'docs/schema-fixture.html:79 claims "52"'
+    do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _not in \
+        'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
+        'docs/postgres-age-guide.md:6 ' 'docs/postgres-age-guide.md:8 ' \
+        'docs/postgres-age-guide.md:10 ' 'docs/postgres-age-guide.md:12 ' \
+        'docs/postgres-age-guide.md:13 ' 'docs/postgres-age-guide.md:15 ' \
+        'docs/postgres-age-guide.md:17 ' 'docs/postgres-age-guide.md:19 ' \
+        'docs/schema-fixture.html:2 ' 'docs/schema-fixture.html:4 ' \
+        'docs/schema-fixture.html:6 ' 'docs/schema-fixture.html:8 ' \
+        'docs/schema-fixture.html:10 ' 'docs/schema-fixture.html:12 ' 'docs/schema-fixture.html:14 ' \
+        'docs/schema-fixture.html:15 ' 'docs/schema-fixture.html:17 ' 'docs/schema-fixture.html:18 ' \
+        'docs/postgres-age-guide.md:20 ' 'docs/postgres-age-guide.md:22 ' 'docs/postgres-age-guide.md:23 ' \
+        'docs/postgres-age-guide.md:27 ' 'docs/postgres-age-guide.md:31 ' 'docs/schema-fixture.html:24 ' \
+        'docs/postgres-age-guide.md:33 ' 'docs/schema-fixture.html:26 ' \
+        'docs/postgres-age-guide.md:36 ' 'docs/schema-fixture.html:36 ' \
+        'docs/schema-fixture.html:42 ' \
+        'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
+        'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
+        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:'
+    do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
+    echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
+    echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
+    echo "PASS: self-test #4851 - compact json schema_version:52 REJECTED, :53 ACCEPTED"
+    echo "PASS: self-test #4852 - issue ref / release triple between identifier and value: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #4853 - transition 51 -> 52 REJECTED (TO side), 52 -> 53 ACCEPTED, ledgered 49→50 history ACCEPTED"
+    echo "PASS: self-test #4854 - html pill with a non-breaking space REJECTED, canonical ACCEPTED"
+    echo "PASS: self-test #4855 - ident-less table row | Schema version | v52 | REJECTED, **v53** ACCEPTED"
+    echo "PASS: self-test #4849 - drifted current-state wording (v1.0.0 substrate, bold value) REJECTED, canonical ACCEPTED"
+    echo "PASS: self-test #4844/#4845/#4846 - ROADMAP header parenthetical, at-a-glance card + stat tile, compliance tagline, index upgrade paragraph: stale REJECTED, canonical ACCEPTED"
+    rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
+    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html"
+    rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
+    printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
     # narrates NO count has nothing to validate and must stay green;
@@ -2293,14 +2975,14 @@ EFGOOD
     rm -f "$tmpdir/src/security_profile.rs" "$tmpdir/src/enterprise_federation_posture.rs"
     rm -f "$tmpdir/SECURITY.md" "$tmpdir/docs/deploy/README.md"
     rm -f "$tmpdir/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — an ABSENT knob/EF SSOT with no claim to validate did not stay green" >&2
         cd "$REPO_ROOT"; exit 1
     fi
     cat > "$tmpdir/SECURITY.md" <<'KNOBORPHAN'
 - The pinned SSOT (`src/security_profile.rs::KNOBS`) is **3 knobs** — see the deploy template.
 KNOBORPHAN
-    if orphan_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if orphan_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — a knob claim with an UNRESOLVABLE SSOT passed silently (fail-open)" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2341,7 +3023,7 @@ HTML2977README
 <p>The record is a <strong>28-field</strong> <code>Memory</code>.</p>
 <p>The CLI ships <strong>89</strong> subcommands under <code>--features sal</code>.</p>
 HTMLSTALECLAIMS
-    if html_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if html_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — the widened gate ACCEPTED html-dialect stale SSOT claims" >&2
         printf '%s\n' "$html_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2373,9 +3055,9 @@ HTMLSTALECLAIMS
 <p>The record is a <strong>26-field</strong> <code>Memory</code>.</p>
 <p>The CLI ships <strong>80</strong> subcommands under <code>--features sal</code>.</p>
 HTMLGOODCLAIMS
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 GREEN — the CORRECTED html page was still rejected" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 GREEN — the same html page carrying the canonical values PASSES"
@@ -2388,9 +3070,9 @@ HTMLGOODCLAIMS
     cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLLADDER'
 <p>Backing this, schema <strong>v67</strong> added the <code>target_agent_id_idx</code> column.</p>
 HTMLLADDER
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — the html guard fired on a LEGITIMATE tag-split ladder mention" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — a tag-split 'schema <strong>vNN</strong> added' ladder mention still PASSES"
@@ -2405,9 +3087,9 @@ HTMLLADDER
 <div class="card-title">What's New in v0.7.0 — attested-cortex</div>
 <p class="card-body"><strong>74</strong> MCP tools at <code>--profile full</code>, 27-event hook pipeline.</p>
 HTMLCARD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — the window guard did NOT spare an html PRIOR-RELEASE card" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — an html release CARD (eyebrow + title in the divs above) is spared"
@@ -2415,7 +3097,7 @@ HTMLCARD
     cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLCARDLESS'
 <p class="card-body"><strong>74</strong> MCP tools at <code>--profile full</code>, 27-event hook pipeline.</p>
 HTMLCARDLESS
-    if card_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if card_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — the SAME numbers WITHOUT the release-card markers were accepted." >&2
         echo "       The window guard would then be a blanket exemption, not a guard." >&2
         cd "$REPO_ROOT"; exit 1
@@ -2438,9 +3120,9 @@ HTMLCARDLESS
     cat > "$tmpdir/docs/whats-new-v09.html" <<'HTMLFROZEN'
 <p>Surface: schema <strong>v78</strong>, <strong>101</strong> MCP tools at <code>--profile full</code>.</p>
 HTMLFROZEN
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — a FROZEN page (html-doc-frozen-exempt.txt) was scanned" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — a page named in html-doc-frozen-exempt.txt is EXEMPT (the same claims pass there)"
@@ -2452,7 +3134,7 @@ HTMLFROZEN
     # than waived under --self-test, because a check the self-test cannot
     # reach is a check nobody has proven.
     mv "$tmpdir/scripts/qc-allowlists/html-doc-frozen-exempt.txt" "$tmpdir/exempt.bak"
-    if ex_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if ex_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — a MISSING frozen-exemption SSOT did not fail the gate" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2471,7 +3153,7 @@ HTMLFROZEN
   <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — source on GitHub</p>
 </footer>
 HTMLSTAMPBAD
-    if stamp_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if stamp_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — a stale sitewide chrome version stamp was ACCEPTED" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2502,9 +3184,9 @@ HTMLSTAMPBAD
   <p>Install the published build: <code>cargo install ai-memory v0.9.0</code></p>
 </footer>
 HTMLSTAMPGOOD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 GREEN — a current chrome stamp + a published-install reference were rejected" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 GREEN — a current chrome stamp PASSES and a published-install reference is SKIPPED"
@@ -2514,11 +3196,78 @@ HTMLSTAMPGOOD
     cat > "$tmpdir/docs/whats-new-v09.html" <<'HTMLSTAMPFROZEN'
 <footer><p>ai-memory v0.9.0 — what shipped in v0.9.0</p></footer>
 HTMLSTAMPFROZEN
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — the chrome rule fired on a FROZEN per-release page" >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — a frozen per-release page keeps its own historical chrome stamp"
+
+    # ---- #4507 R3-6: a missing or symlinked reference file FAILS CLOSED.
+    local _rf _out _rc
+    for _rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        mv "$tmpdir/docs/reference/$_rf.md" "$tmpdir/docs/reference/$_rf.md.aside"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "docs/reference/$_rf.md" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-6 — a MISSING $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        echo "PASS: self-test #4507 R3-6 — a missing $_rf.md FAILS CLOSED (rc=$_rc, names the file)"
+        ln -s "$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "docs/reference/$_rf.md" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-6 — a SYMLINKED $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        echo "PASS: self-test #4507 R3-6 — a symlinked $_rf.md FAILS CLOSED (rc=$_rc)"
+        rm -f "$tmpdir/docs/reference/$_rf.md"
+        mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+    done
+
+    # ---- #4507 R3-F8: an empty, heading-only or unreadable reference file FAILS CLOSED (clean FAIL, no traceback).
+    for _rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        cp "$tmpdir/docs/reference/$_rf.md" "$tmpdir/docs/reference/$_rf.md.aside"
+        : > "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "$_rf.md is empty" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-F8 — an EMPTY $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        printf '# Heading only\n\n## Sub\n' > "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "$_rf.md has only headings" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-F8 — a HEADING-ONLY $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        if [[ "$(id -u)" != 0 ]]; then
+            chmod 000 "$tmpdir/docs/reference/$_rf.md"
+            _rc=0
+            _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+            chmod 644 "$tmpdir/docs/reference/$_rf.md"
+            if [[ "$_rc" == 0 ]] || grep -q "Traceback" <<<"$_out" || ! grep -q "cannot read docs/reference/$_rf.md" <<<"$_out"; then
+                echo "FAIL: self-test #4507 R3-F8 — an UNREADABLE $_rf.md did not fail cleanly (rc=$_rc)" >&2
+                cd "$REPO_ROOT"; exit 1
+            fi
+        fi
+        mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+        echo "PASS: self-test #4507 R3-F8 — an empty, heading-only and unreadable $_rf.md FAIL CLOSED with a clean message"
+    done
+
+    # ---- #4507 R3-F7: a symlink ABOVE the file (docs/reference -> elsewhere) FAILS CLOSED.
+    mv "$tmpdir/docs/reference" "$tmpdir/docs/reference.aside"
+    ln -s reference.aside "$tmpdir/docs/reference"
+    _rc=0
+    _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+    if [[ "$_rc" == 0 ]] || ! grep -q "is a symlink" <<<"$_out"; then
+        echo "FAIL: self-test #4507 R3-F7 — a SYMLINKED docs/reference did not fail closed (rc=$_rc)" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #4507 R3-F7 — a symlinked docs/reference FAILS CLOSED (rc=$_rc)"
+    rm -f "$tmpdir/docs/reference"
+    mv "$tmpdir/docs/reference.aside" "$tmpdir/docs/reference"
 
     cd "$REPO_ROOT"
 }

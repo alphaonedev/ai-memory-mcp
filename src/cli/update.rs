@@ -192,7 +192,7 @@ pub fn run(
                 ));
             }
             // #1635 — preserve existing metadata.agent_id: provenance
-            // is immutable across update (CLAUDE.md Agent Identity
+            // is immutable across update (docs/reference/ARCHITECTURE_REFERENCE.md Agent Identity
             // contract). Mirrors the MCP memory_update caller layer
             // (src/mcp/tools/update.rs); without this a bare
             // `--metadata '{...}'` rewrote/stripped the author of any
@@ -620,7 +620,7 @@ mod tests {
     fn test_update_metadata_preserves_agent_id_1635() {
         // #1635 — a bare `--metadata '{...}'` used to replace metadata
         // wholesale, stripping/rewriting metadata.agent_id (immutable
-        // provenance per the CLAUDE.md Agent Identity contract; the
+        // provenance per the docs/reference/ARCHITECTURE_REFERENCE.md Agent Identity contract; the
         // MCP caller layer already preserved it).
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();

@@ -186,6 +186,11 @@ const SECTION_UNSTAMPED_OWNERS: &str = "Unstamped owners (#3124)";
 /// #4285 — corrupt governance standards (resolved as SEVERED, Owner floor).
 const SECTION_CORRUPT_GOVERNANCE: &str = "Corrupt governance standards (#4285)";
 
+/// #4715 — the over-depth governance chain finding. A child module (private
+/// items of this file are visible to it) kept in its own file beside `keys.rs`.
+#[path = "over_depth_4715.rs"]
+mod over_depth_4715;
+
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
 const MSG_PG_PROBE_RUNTIME: &str = "build ephemeral runtime for the postgres extension probe";
@@ -981,8 +986,7 @@ pub fn run_repair_schema_version(
         return Ok(2);
     }
 
-    let mut conn =
-        db::open_unmigrated(&resolved).context("open database for schema-version repair")?;
+    let conn = db::open_unmigrated(&resolved).context("open database for schema-version repair")?;
 
     let observed: i64 = conn
         .query_row(
@@ -1002,12 +1006,13 @@ pub fn run_repair_schema_version(
     // version, in ONE transaction so a mid-failure leaves the ledger exactly as
     // found.
     {
-        let tx = conn
-            .transaction()
+        // BEGIN IMMEDIATE (#5084): write-first, but one rule for every write
+        // path (a DEFERRED upgrade can fail with SQLITE_BUSY_SNAPSHOT).
+        let tx = crate::storage::connection::WriteTxn::begin(&conn)
             .context("begin schema-version restamp transaction")?;
-        tx.execute("DELETE FROM schema_version", [])
+        conn.execute("DELETE FROM schema_version", [])
             .context("clear schema_version")?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             rusqlite::params![target],
         )
@@ -1668,6 +1673,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     }
     #[cfg(feature = "sal-postgres")]
     if let Some(pg) = section_postgres_corrupt_governance_4285() {
+        sections.push(pg);
+    }
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = over_depth_4715::section_postgres() {
         sections.push(pg);
     }
 
@@ -3952,9 +3961,35 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     facts.push(("capabilities_enabled".into(), cap.enabled.to_string()));
     facts.push(("capability_issuers".into(), cap.issuer_count().to_string()));
 
-    let (with, without) = db::doctor_governance_coverage(conn).unwrap_or((0, 0));
-    facts.push(("namespaces_with_policy".into(), with.to_string()));
-    facts.push(("namespaces_without_policy".into(), without.to_string()));
+    // #4715 — surface a coverage read fault instead of reporting 0/0.
+    // The fault is reported as `unreadable`, never a healthy-looking 0 (ERRORS-19).
+    let coverage = match db::doctor_governance_coverage(conn) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            severity = Severity::Critical;
+            facts.push(("governance_coverage_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the namespace governance coverage could not be read (#4715)",
+            );
+            None
+        }
+    };
+    let count_fact = |n: Option<usize>| {
+        n.map_or_else(
+            || over_depth_4715::UNREADABLE.to_string(),
+            |n| n.to_string(),
+        )
+    };
+    facts.push((
+        "namespaces_with_policy".into(),
+        count_fact(coverage.map(|c| c.0)),
+    ));
+    facts.push((
+        "namespaces_without_policy".into(),
+        count_fact(coverage.map(|c| c.1)),
+    ));
+    let without = coverage.map_or(0, |c| c.1);
 
     // v1.0.0 fail-open remediation — the OPT-IN strict admission posture
     // (`AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE`). Reported right
@@ -3983,20 +4018,39 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
         );
     }
 
-    let dist = db::doctor_governance_depth_distribution(conn).unwrap_or_default();
-    let depth_summary: String = dist
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| **n > 0)
-        .map(|(d, n)| format!("d{d}={n}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    // #4715 — a read fault is a Critical finding, never an empty histogram.
+    let dist = match db::doctor_governance_depth_distribution(conn) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            severity = Severity::Critical;
+            facts.push(("inheritance_depth_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the namespace inheritance depth histogram could not be read (#4715)",
+            );
+            None
+        }
+    };
+    over_depth_4715::apply(
+        db::doctor_over_depth_chains(conn),
+        &mut facts,
+        &mut severity,
+        &mut note,
+    );
+    let depth_summary = dist.map(|dist| {
+        dist.iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(d, n)| format!("d{d}={n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
     facts.push((
         "inheritance_depth".into(),
-        if depth_summary.is_empty() {
-            "empty".into()
-        } else {
-            depth_summary
+        match depth_summary {
+            None => over_depth_4715::UNREADABLE.into(),
+            Some(summary) if summary.is_empty() => "empty".into(),
+            Some(summary) => summary,
         },
     ));
 
