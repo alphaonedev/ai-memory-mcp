@@ -522,9 +522,9 @@ async fn concurrent_callers_no_event_loss() {
     let mut tasks = Vec::new();
     for i in 0..8 {
         let queue_clone = queue.clone();
-        let db_path_clone = db_path.clone();
+        // #7994: open under the env lock held by this fn; the detached blocking task only uses it.
+        let conn = db::open(&db_path).expect("open consult conn");
         let task = tokio::task::spawn_blocking(move || {
-            let conn = db::open(&db_path_clone).expect("open consult conn");
             let action = refusal_action();
             for _ in 0..20 {
                 let agent = format!("agent:c-{i}");

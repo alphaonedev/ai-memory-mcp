@@ -832,8 +832,9 @@ async fn no_allowlist_namespace_meta_posture_matrix_3582() {
 /// rather than hard-coding a verdict.
 #[tokio::test]
 async fn enrolled_unscoped_peer_honours_knob_147_2479() {
+    // Canonical lock binding (#7347): taken once at the top of the fn, held across both knob cells.
+    let _lock = ENV_LOCK.lock().await;
     for (knob, expect_applied) in [("1", 0u64), ("0", 1u64)] {
-        let _lock = ENV_LOCK.lock().await;
         let _guard = PostureGuard;
         set_posture(Some(ENROLLED_UNSCOPED_ALLOWLIST), Some(knob));
         let (router, db) = build_router_with_db();

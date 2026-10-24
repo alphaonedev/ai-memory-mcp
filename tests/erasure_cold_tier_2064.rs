@@ -648,10 +648,11 @@ fn one_store_lock_serializes_sweep_publication_and_purge() {
     // completes successfully immediately after the held guard is dropped.
     let held = archive_sync::coordination_lock_for_tests(&f.conn).expect("hold store lock");
     archive_sync::reset_lock_attempts_for_tests();
-    let purge_db = f.db_path.clone();
+    // #7994: the connection opens here, under the env lock held by this fn; the detached worker
+    // only uses it, so no env read happens inside the spawned closure.
+    let conn = db::open(&f.db_path).expect("open purge connection");
     let (purge_tx, purge_rx) = std::sync::mpsc::channel();
     let purge_thread = std::thread::spawn(move || {
-        let conn = db::open(&purge_db).expect("open purge connection");
         purge_tx
             .send(db::purge_archive(&conn, None))
             .expect("send purge result");
@@ -681,10 +682,9 @@ fn one_store_lock_serializes_sweep_publication_and_purge() {
     seed_archived(&f.conn, "row-lock-sweep-2", "fresh sweep candidate", None);
     let held = archive_sync::coordination_lock_for_tests(&f.conn).expect("hold store lock");
     archive_sync::reset_lock_attempts_for_tests();
-    let sweep_db = f.db_path.clone();
+    let conn = db::open(&f.db_path).expect("open sweep connection");
     let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
     let sweep_thread = std::thread::spawn(move || {
-        let conn = db::open(&sweep_db).expect("open sweep connection");
         let store = archive_sync::store_for_conn(&conn)
             .expect("store")
             .expect("enabled");
@@ -730,10 +730,9 @@ fn prepared_stale_snapshot_cannot_publish_after_purge_and_compaction() {
     let f = fixture();
     seed_archived(&f.conn, "row-aba", "must never resurrect", None);
     archive_sync::set_pause_before_publish_lock_for_tests(true);
-    let sweep_db = f.db_path.clone();
+    let conn = db::open(&f.db_path).expect("open stale sweep connection");
     let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
     let sweep_thread = std::thread::spawn(move || {
-        let conn = db::open(&sweep_db).expect("open stale sweep connection");
         let store = archive_sync::store_for_conn(&conn)
             .expect("store")
             .expect("enabled");

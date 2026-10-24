@@ -41,6 +41,15 @@ use common::tls::{
     TestTls, local_ca_client,
 };
 
+/// #7469: `doctor_reports_transit_encryption_section_3705` writes the process
+/// environment (the `common::permissive_attestation_for_tests` `Once`) and then
+/// opens SQLite, whose first open calls C `getenv`; the tests that build a
+/// reqwest client or spawn the daemon read the environment too. All of them
+/// run as threads of one test binary, so each of them holds this lock for its
+/// whole body (the same file-lock shape as `mcp_driver_text_closed_3761`;
+/// nothing here takes the `tests/common` `ENV_LOCK`, so there is one lock order).
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The doctor section the #3705 fix adds to the DEFAULT report.
 const SECTION_TRANSIT: &str = "Transit encryption (#3705)";
 
@@ -51,19 +60,26 @@ const BIND_GUARD_MARKER: &str = "without an API key";
 /// A valid, EMPTY peer allowlist so the #3582 gate is satisfied.
 const EMPTY_ALLOWLIST: &str = "{}";
 
-/// Base boot budget, aligned to the 60 s `tests/integration.rs` ceiling
-/// (#3615); [`boot_budget`] scales it on loaded hosts.
-const BOOT_DEADLINE: Duration = Duration::from_secs(60);
-const PROBE_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Base budget once the listen line is on stderr (#7341), load-scaled like
-/// [`BOOT_DEADLINE`]. The daemon logs that line just BEFORE it binds
+/// The ONE named boot budget (#7647), in seconds. Readiness is polled against
+/// it, so a healthy boot returns at once and only a hung one waits it out. A
+/// host at load 60 on 14 cores took more than the old 60 s to bring up TLS
+/// (CA and leaf generation, key load, bind), so the default is 180 s;
+/// [`boot_budget`] still scales it by the shared timing multiplier.
+const BOOT_BASE_SECS_DEFAULT: u64 = 180;
+/// Floor and ceiling of the override: below 30 s no loaded host boots, above
+/// 900 s a hung boot would stall the lane for a quarter hour.
+const BOOT_BASE_SECS_MIN: u64 = 30;
+const BOOT_BASE_SECS_MAX: u64 = 900;
+/// Env override of [`BOOT_BASE_SECS_DEFAULT`], clamped to
+/// `BOOT_BASE_SECS_MIN..=BOOT_BASE_SECS_MAX`; unparsable means the default.
+const ENV_BOOT_BASE_SECS: &str = "AI_MEMORY_TEST_BOOT_BASE_SECS";
+/// Share of the base that remains once the listen line is on stderr (#7341):
+/// 75 %, the old 45 s of 60 s. The daemon logs that line just BEFORE it binds
 /// (`src/daemon_runtime.rs:8307`, the bind follows), so this phase still
 /// covers bind, first accept, the TLS handshake and the health handler on
-/// the loaded host. It equals the old fixed 45 s boot budget: for a line
-/// seen at any `t` in `0..=60 s` the total worst case is `t + 45 s >= 45 s`,
-/// never shorter than before; with no line the pre-listen 60 s applies.
-const POST_LISTEN_BUDGET: Duration = Duration::from_secs(45);
+/// the loaded host.
+const POST_LISTEN_PERCENT: u64 = 75;
+const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// The stderr line the daemon logs just before it binds the TLS listener
 /// (`src/daemon_runtime.rs:8307`).
 const LISTEN_SIGNAL: &str = "ai-memory listening on https://";
@@ -206,18 +222,42 @@ fn scaled_boot_budget(base: Duration, raw_mult: Option<&str>) -> Duration {
     base.saturating_mul(mult)
 }
 
+/// The base boot budget from the raw [`ENV_BOOT_BASE_SECS`] value (#7647): an
+/// integer of seconds clamped to `BOOT_BASE_SECS_MIN..=BOOT_BASE_SECS_MAX`,
+/// the default when absent or unparsable. The value is a parameter so tests
+/// never mutate the process environment shared with parallel tests.
+fn boot_base_from(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(BOOT_BASE_SECS_DEFAULT, |s| {
+            s.clamp(BOOT_BASE_SECS_MIN, BOOT_BASE_SECS_MAX)
+        });
+    Duration::from_secs(secs)
+}
+
+/// The post-listen share of `base` ([`POST_LISTEN_PERCENT`]).
+fn post_listen_of(base: Duration) -> Duration {
+    base.saturating_mul(u32::try_from(POST_LISTEN_PERCENT).unwrap_or(75)) / 100
+}
+
+/// The base boot budget with the one production read of the environment.
+fn boot_base() -> Duration {
+    boot_base_from(std::env::var(ENV_BOOT_BASE_SECS).ok().as_deref())
+}
+
 /// [`scaled_boot_budget`] with the one production read of the environment.
 fn boot_budget() -> Duration {
     let raw = std::env::var(mcp_wait::ENV_TEST_TIMING_BUDGET_MULT).ok();
-    scaled_boot_budget(BOOT_DEADLINE, raw.as_deref())
+    scaled_boot_budget(boot_base(), raw.as_deref())
 }
 
 /// Both boot-wait budgets from one read of the environment.
 fn boot_budgets() -> BootBudget {
     let raw = std::env::var(mcp_wait::ENV_TEST_TIMING_BUDGET_MULT).ok();
+    let base = boot_base();
     BootBudget {
-        before_listen: scaled_boot_budget(BOOT_DEADLINE, raw.as_deref()),
-        after_listen: scaled_boot_budget(POST_LISTEN_BUDGET, raw.as_deref()),
+        before_listen: scaled_boot_budget(base, raw.as_deref()),
+        after_listen: scaled_boot_budget(post_listen_of(base), raw.as_deref()),
     }
 }
 
@@ -413,6 +453,7 @@ fn fresh_install_serves_tls_with_zero_config_3709() {
 /// (`boot_until_exit` times out).
 #[test]
 fn fleet_shape_without_certs_refuses_never_mints_3709() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let port = free_port();
     let mut cmd = command_with_config(root.path(), Some("[deployment]\nshape = \"team\"\n"));
@@ -514,6 +555,7 @@ fn provision_daemon_signing_key(root: &Path) {
 #[test]
 fn unwritable_key_dir_refuses_never_plaintext_3709() {
     use std::os::unix::fs::PermissionsExt as _;
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let port = free_port();
     // #3354 generates the daemon SIGNING key before #3705 generates the TLS
@@ -564,6 +606,7 @@ fn unwritable_key_dir_refuses_never_plaintext_3709() {
 /// kept as the explicit-pair twin of the zero-config test.
 #[test]
 fn explicit_pair_serves_health_over_https_3705() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let tls = TestTls::generate(&root.path().join("tls-3705"));
     let port = free_port();
@@ -777,6 +820,7 @@ fn plaintext_mcp_forward_url_refused_3705() {
 /// FAILS ON THE PARENT: the section is absent.
 #[test]
 fn doctor_reports_transit_encryption_section_3705() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     common::permissive_attestation_for_tests();
     let _ = ai_memory::db::open(&root.path().join("store.db")).expect("open store");
@@ -821,14 +865,43 @@ fn boot_budget_scales_with_the_timing_multiplier_7341() {
     }
     // The post-listen budget scales with the same multiplier (the listen
     // line precedes the bind) and is never shorter than the old fixed 45 s.
-    assert!(POST_LISTEN_BUDGET >= Duration::from_secs(45));
+    let post = post_listen_of(boot_base_from(None));
+    assert!(post >= Duration::from_secs(45));
+    assert_eq!(scaled_boot_budget(post, Some("3")), post * 3);
+    assert_eq!(scaled_boot_budget(post, Some("101")), post);
+}
+
+/// #7647: the boot budget comes from ONE named constant, an env override is
+/// clamped to a sane range, and the default outlasts a host at load 60 on 14
+/// cores (the r5 run that timed out at the old 60 s).
+#[test]
+fn boot_base_budget_is_one_clamped_constant_7647() {
+    let default = Duration::from_secs(BOOT_BASE_SECS_DEFAULT);
+    assert_eq!(boot_base_from(None), default);
+    assert!(
+        default >= Duration::from_secs(120),
+        "the default must outlast a loaded host: {default:?}"
+    );
+    assert_eq!(boot_base_from(Some("240")), Duration::from_secs(240));
+    assert_eq!(boot_base_from(Some(" 240 ")), Duration::from_secs(240));
     assert_eq!(
-        scaled_boot_budget(POST_LISTEN_BUDGET, Some("3")),
-        POST_LISTEN_BUDGET * 3
+        boot_base_from(Some("1")),
+        Duration::from_secs(BOOT_BASE_SECS_MIN)
     );
     assert_eq!(
-        scaled_boot_budget(POST_LISTEN_BUDGET, Some("101")),
-        POST_LISTEN_BUDGET
+        boot_base_from(Some("0")),
+        Duration::from_secs(BOOT_BASE_SECS_MIN)
+    );
+    assert_eq!(
+        boot_base_from(Some("999999")),
+        Duration::from_secs(BOOT_BASE_SECS_MAX)
+    );
+    for bad in ["", "abc", "-5", "1.5"] {
+        assert_eq!(boot_base_from(Some(bad)), default, "raw {bad:?}");
+    }
+    assert_eq!(
+        post_listen_of(Duration::from_secs(60)),
+        Duration::from_secs(45)
     );
 }
 
@@ -836,6 +909,7 @@ fn boot_budget_scales_with_the_timing_multiplier_7341() {
 /// (status and stderr), not after the boot budget.
 #[test]
 fn ca_wait_reports_a_dead_child_immediately_7341() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let mut cmd = command(root.path());
     cmd.arg("--definitely-not-a-flag-7341");

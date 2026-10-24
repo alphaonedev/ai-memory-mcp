@@ -213,7 +213,7 @@ fn set_peer1_allowlist(ns_glob: &str) {
 ///    issue closes.
 #[tokio::test]
 async fn legacy_unauthored_row_excluded_978() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("legacy/*");
     let (router, db) = build_router_with_db();
@@ -228,7 +228,6 @@ async fn legacy_unauthored_row_excluded_978() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -248,7 +247,7 @@ async fn legacy_unauthored_row_excluded_978() {
 ///    Operator-explicit consent overrides the default-deny.
 #[tokio::test]
 async fn federation_share_opt_in_projects_legacy_row_978() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("legacy/*");
     let (router, db) = build_router_with_db();
@@ -264,7 +263,6 @@ async fn federation_share_opt_in_projects_legacy_row_978() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -279,7 +277,7 @@ async fn federation_share_opt_in_projects_legacy_row_978() {
 ///    via a templating layer that emits stringified booleans.
 #[tokio::test]
 async fn federation_share_is_strict_bool_only_978() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("legacy/*");
     let (router, db) = build_router_with_db();
@@ -305,7 +303,6 @@ async fn federation_share_is_strict_bool_only_978() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -319,7 +316,7 @@ async fn federation_share_is_strict_bool_only_978() {
 ///    canonical owner-match path.
 #[tokio::test]
 async fn owner_signed_private_row_projects_to_owner_peer_978() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("ops/*");
     let (router, db) = build_router_with_db();
@@ -332,7 +329,6 @@ async fn owner_signed_private_row_projects_to_owner_peer_978() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -348,7 +344,7 @@ async fn owner_signed_private_row_projects_to_owner_peer_978() {
 ///    post-#978.
 #[tokio::test]
 async fn inbox_target_row_projects_to_target_peer_978() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("_inbox/*");
     let (router, db) = build_router_with_db();
@@ -362,7 +358,6 @@ async fn inbox_target_row_projects_to_target_peer_978() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -376,7 +371,7 @@ async fn inbox_target_row_projects_to_target_peer_978() {
 ///    scope continues to satisfy the visibility predicate.
 #[tokio::test]
 async fn shared_scope_row_projects_to_any_peer_978() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("shared/*");
     let (router, db) = build_router_with_db();
@@ -386,7 +381,6 @@ async fn shared_scope_row_projects_to_any_peer_978() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -400,7 +394,7 @@ async fn shared_scope_row_projects_to_any_peer_978() {
 ///    Pin the canonical cross-tenant deny.
 #[tokio::test]
 async fn private_row_owned_by_other_does_not_project_978() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     set_peer1_allowlist("alice/*");
     let (router, db) = build_router_with_db();
@@ -413,7 +407,6 @@ async fn private_row_owned_by_other_does_not_project_978() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -450,7 +443,7 @@ async fn private_row_owned_by_other_does_not_project_978() {
 ///    `federation_share=true`. Every row MUST be excluded.
 #[tokio::test]
 async fn audit_1028_mtls_peer_cannot_enumerate_other_agents_private_rows() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     // peer-1 is mTLS-attested into the `tenants/*` namespace — the
     // exact posture the audit warned about (valid wire identity,
@@ -486,7 +479,6 @@ async fn audit_1028_mtls_peer_cannot_enumerate_other_agents_private_rows() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
 
     let mems = body["memories"].as_array().unwrap();
     // The audit-pass invariant: exactly one row visible (the shared

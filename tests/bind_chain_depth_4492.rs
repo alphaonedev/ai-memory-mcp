@@ -86,10 +86,10 @@ impl Drop for PostureGuard {
 }
 
 fn set_peer_posture() -> PostureGuard {
-    let saved = POSTURE_VARS
-        .iter()
-        .map(|k| (*k, std::env::var(k).ok()))
-        .collect();
+    let mut saved = Vec::new();
+    for k in POSTURE_VARS {
+        saved.push((k, std::env::var(k).ok()));
+    }
     let allow = json!({PEER: {"allowed_namespaces": ["**"], "allowed_sender_agent_ids": [PEER]}});
     // SAFETY: serialised by SERIAL; test-only env mutation.
     unsafe {

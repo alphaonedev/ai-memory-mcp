@@ -210,7 +210,7 @@ async fn post_push(router: &axum::Router, body: &Value) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn stale_policy_version_is_refused_before_apply() {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     advance_policy(&db, 5).await; // local committed policy seq = 5
@@ -221,7 +221,6 @@ async fn stale_policy_version_is_refused_before_apply() {
         &push_body("11111111-1111-4111-8111-111111111111", Some(3)),
     )
     .await;
-    drop(guard);
 
     assert_eq!(
         status,
@@ -279,7 +278,7 @@ async fn break_policy_read(db: &ai_memory::handlers::Db) {
 /// transient and the peer SHOULD retry.
 #[tokio::test]
 async fn policy_read_fault_refuses_503_and_does_not_apply() {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     advance_policy(&db, 5).await;
@@ -292,7 +291,6 @@ async fn policy_read_fault_refuses_503_and_does_not_apply() {
         &push_body("44444444-4444-4444-8444-444444444444", Some(5)),
     )
     .await;
-    drop(guard);
 
     assert_eq!(
         status,
@@ -333,7 +331,7 @@ async fn policy_read_fault_refuses_503_and_does_not_apply() {
 /// the gate disabled, a policy-read fault still ACCEPTS exactly as before.
 #[tokio::test]
 async fn policy_read_fault_still_accepts_when_gate_disabled() {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     unsafe {
         std::env::set_var(
@@ -353,7 +351,6 @@ async fn policy_read_fault_still_accepts_when_gate_disabled() {
     unsafe {
         std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV);
     }
-    drop(guard);
 
     assert_ne!(
         status,
@@ -374,7 +371,7 @@ async fn policy_read_fault_still_accepts_when_gate_disabled() {
 
 #[tokio::test]
 async fn fresh_policy_version_is_accepted() {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     advance_policy(&db, 5).await;
@@ -391,7 +388,6 @@ async fn fresh_policy_version_is_accepted() {
         &push_body("33333333-3333-4333-8333-333333333333", Some(9)),
     )
     .await;
-    drop(guard);
 
     assert_eq!(
         status,
@@ -408,7 +404,7 @@ async fn fresh_policy_version_is_accepted() {
 
 #[tokio::test]
 async fn absent_policy_version_is_accepted_failopen() {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     advance_policy(&db, 5).await;
@@ -419,7 +415,6 @@ async fn absent_policy_version_is_accepted_failopen() {
         &push_body("44444444-4444-4444-8444-444444444444", None),
     )
     .await;
-    drop(guard);
 
     assert_eq!(
         status,
@@ -431,7 +426,7 @@ async fn absent_policy_version_is_accepted_failopen() {
 
 #[tokio::test]
 async fn opt_out_accepts_even_stale() {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     // Operator opt-out for a deliberate heterogeneous-policy rollout window.
     unsafe {
@@ -451,7 +446,6 @@ async fn opt_out_accepts_even_stale() {
     unsafe {
         std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV);
     }
-    drop(guard);
 
     assert_eq!(
         status,
@@ -480,7 +474,7 @@ async fn stale_policy_version_refused_on_postgres_backend() {
         return;
     };
 
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
 
     // Scratch sqlite carries the governance policy surface even on a pg node
@@ -562,7 +556,6 @@ async fn stale_policy_version_refused_on_postgres_backend() {
         &push_body(&uuid::Uuid::new_v4().to_string(), Some(4)),
     )
     .await;
-    drop(guard);
 
     assert_eq!(
         stale_status,

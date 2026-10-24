@@ -573,6 +573,9 @@ fn delivered_ids_must_equal_committed_ids_7395() {
 /// the old fixed window; every committed row must still be dispatched.
 #[tokio::test]
 async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
+    // #7347: run the Once-gated env writer first so no later C-level getenv
+    // (SQLite open, DNS, reqwest) of this test can race its one-time write.
+    permissive_attestation_for_tests();
     pin_serial_dispatch();
     let _cell = DISPATCH_CELL_LOCK.lock().await;
     set_allow_loopback_webhooks(true);
