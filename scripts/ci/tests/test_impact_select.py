@@ -128,8 +128,13 @@ class CellGlobs(ImpactCase):
         out = self.select(["src/store/sqlite.rs"])
         self.assertIn("cells", out["jobs"])
 
-    def test_cli_path_does_not_add_cells(self):
+    def test_cli_path_adds_cells(self):
+        # 8240 F3: sal and sal-postgres cfgs are spread across all of src/.
         out = self.select(["src/cli/args.rs"])
+        self.assertIn("cells", out["jobs"])
+
+    def test_docs_path_does_not_add_cells(self):
+        out = self.select(["docs/a.txt"])
         self.assertNotIn("cells", out["jobs"])
 
 
@@ -213,7 +218,8 @@ class CommandLine(ImpactCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         lines = gh.read_text().splitlines()
         keys = [ln.split("=", 1)[0] for ln in lines]
-        self.assertEqual(keys, ["jobs", "all", "crates"])
+        self.assertEqual(keys[:3], ["jobs", "all", "crates"])
+        self.assertEqual(keys[3:], sorted(keys[3:]))
         values = dict(ln.split("=", 1) for ln in lines)
         self.assertEqual(values["all"], "false")
         self.assertIn("python", values["jobs"].split(","))
