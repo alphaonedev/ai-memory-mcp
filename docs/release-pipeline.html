@@ -461,7 +461,7 @@ cargo install ai-memory --features sqlcipher</pre>
       <ul>
         <li><code>cargo fmt --check</code> — formatting must be exact</li>
         <li><code>cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic</code> — pedantic linting</li>
-        <li><code>cargo test</code> — test suite on all platforms (impact-scoped on PRs via <code>scripts/ci-test-impact.sh</code>; full suite otherwise)</li>
+        <li><code>cargo test</code> — test suite on all platforms (impact-scoped on PRs via <code>scripts/ci/test_impact.py</code>; full suite otherwise)</li>
         <li><code>cargo audit</code> — dependency vulnerability check (Linux only)</li>
         <li><code>cargo build --release</code> — release-mode compile must succeed</li>
       </ul>
