@@ -5,7 +5,7 @@
 
 Covers #6172 (no credential on the argv of a child, libpq variables instead), #6180 (a group- or world-accessible
 URL file is refused, naming path and mode and never the content), #6672 / #7971 (no output carries the URL, a URL
-component or an exception text) and the ``github-env`` hand-off.  A fake ``psql`` records its argv and environment.
+component or an exception text) and the ``github-env`` hand-off (masked before it is written, #8187).  A fake ``psql`` records its argv and environment.
 Stdlib only.
 """
 
@@ -206,25 +206,81 @@ class TestRefusals(TierCredentialCase):
             with self.subTest(name=name[:12]):
                 r = self.run_psql("--database", name)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("::error::tier_credential: the database name is not a lowercase", r.stderr)
                 self.assertFalse(self.out.exists())
 
 
 class TestGithubEnv(TierCredentialCase):
-    def test_the_url_for_the_database_is_appended_to_github_env_and_nothing_is_printed(self):
+    def masked(self, r):
+        return [line for line in r.stdout.splitlines() if line.startswith("::add-mask::")]
+
+    def github_env_run(self, *tail, env=None):
+        return subprocess.run([sys.executable, "-I", str(SCRIPT), "github-env", "--url-file", str(self.url_file),
+                               "--database", "ai_memory_test_ci_9", *tail], capture_output=True, text=True,
+                              check=False, env=env or self.env())
+
+    def test_the_url_is_masked_then_appended_to_github_env_8187(self):
         self.write_url()
         self.github_env.write_text("EXISTING=1\n")
-        r = self.helper("github-env", "--url-file", str(self.url_file), "--database", "ai_memory_test_ci_9")
-        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        r = self.github_env_run()
+        written = URL.replace("/ai_memory_test?", "/ai_memory_test_ci_9?")
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        # the full URL, then the decoded password, each on its own line, both before the write
+        self.assertEqual(r.stdout, f"::add-mask::{written}\n::add-mask::{CANARY}\n")
+        self.assertEqual(self.github_env.read_text(), f"EXISTING=1\nAI_MEMORY_TEST_POSTGRES_URL={written}\n")
+        self.assertEqual(r.stdout.splitlines()[0][len("::add-mask::"):], written, "the mask is the written string")
+
+    def test_the_masks_are_printed_before_the_github_env_write_8187(self):
+        # the write fails (no such directory); stdout still carries both masks, so they precede the write
+        self.write_url()
+        r = self.github_env_run(env=self.env(GITHUB_ENV=str(self.dir / "absent-dir" / "env")))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("::error::tier_credential: cannot append to GITHUB_ENV", r.stderr)
+        self.assertEqual(len(self.masked(r)), 2, "both masks are printed before the write is attempted")
+
+    def test_an_encoded_password_is_masked_in_both_forms_8187(self):
+        self.write_url(f"postgres://{USER}:ab%2Bcd{CANARY}@192.0.2.7:5445/ai_memory_test")
+        r = self.github_env_run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([m[len("::add-mask::"):] for m in self.masked(r)[1:]],
+                         [f"ab+cd{CANARY}", f"ab%2Bcd{CANARY}"])
+
+    def test_the_age_url_is_the_same_masked_string_8187(self):
+        self.write_url()
+        r = self.github_env_run("--age-url")
+        written = URL.replace("/ai_memory_test?", "/ai_memory_test_ci_9?")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.masked(r)), 2)
         self.assertEqual(self.github_env.read_text(),
-                         "EXISTING=1\nAI_MEMORY_TEST_POSTGRES_URL="
-                         + URL.replace("/ai_memory_test?", "/ai_memory_test_ci_9?") + "\n")
+                         f"AI_MEMORY_TEST_POSTGRES_URL={written}\nAI_MEMORY_TEST_AGE_URL={written}\n")
+
+    def test_a_line_break_in_the_url_is_refused_before_any_mask_or_write_8187(self):
+        cases = {"encoded LF in the password": f"postgres://{USER}:ab%0A{CANARY}@h:5445/db",
+                 "encoded CR in the password": f"postgres://{USER}:ab%0d{CANARY}@h:5445/db",
+                 "encoded NUL in the query": f"postgres://{USER}:{CANARY}@h:5445/db?sslmode=a%00b"}
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.write_url(text)
+                r = self.github_env_run()
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("::error::tier_credential: the tier URL carries an encoded line break", r.stderr)
+                self.assertEqual(r.stdout, "", "no mask line is printed for a refused URL")
+                self.assertFalse(self.github_env.exists())
+                self.assertNotIn(CANARY, r.stdout + r.stderr)
+
+    def test_every_mask_line_is_one_nonempty_line_8187(self):
+        self.write_url()
+        r = self.github_env_run()
+        self.assertEqual(len(r.stdout.split("\n")), 3, r.stdout)
+        for line in r.stdout.split("\n")[:-1]:
+            self.assertTrue(line.startswith("::add-mask::") and len(line) > len("::add-mask::"))
 
     def test_a_missing_github_env_is_refused(self):
         self.write_url()
-        env = {k: v for k, v in self.env().items() if k != "GITHUB_ENV"}
-        r = subprocess.run([sys.executable, "-I", str(SCRIPT), "github-env", "--url-file", str(self.url_file),
-                            "--database", "ai_memory_test_ci_9"], capture_output=True, text=True, check=False, env=env)
+        r = self.github_env_run(env={k: v for k, v in self.env().items() if k != "GITHUB_ENV"})
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("::error::tier_credential: GITHUB_ENV is not set", r.stderr)
+        self.assertEqual(r.stdout, "", "no mask line before the target is known")
         self.assertNotIn(CANARY, r.stdout + r.stderr)
 
 
