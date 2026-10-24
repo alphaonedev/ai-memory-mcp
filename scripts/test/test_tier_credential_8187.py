@@ -19,9 +19,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci/tier_credential.py"
-PASSWORD = "q7Zr-Lm2_Xv9Kd4TgPw8Hn3Bs6Jc1Yf5AeUo0iRt"
+CANARY = "q7Zr-Lm2_Xv9Kd4TgPw8Hn3Bs6Jc1Yf5AeUo0iRt"
 USER = "tier_role_8187"
-URL = f"postgres://{USER}:{PASSWORD}@192.0.2.7:5445/ai_memory_test?sslmode=verify-full&sslrootcert=/etc/ssl/tier-ca.pem"
+URL = f"postgres://{USER}:{CANARY}@192.0.2.7:5445/ai_memory_test?sslmode=verify-full&sslrootcert=/etc/ssl/tier-ca.pem"
 FAKE_PSQL = """#!{python}
 import json, os, sys
 with open(os.environ["FAKE_OUT"], "w") as handle:
@@ -80,11 +80,11 @@ class TestRunHandsOverThroughTheEnvironment(TierCredentialCase):
         env = seen["env"]
         self.assertEqual({k: env[k] for k in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGSSLMODE",
                                               "PGSSLROOTCERT")},
-                         {"PGHOST": "192.0.2.7", "PGPORT": "5445", "PGUSER": USER, "PGPASSWORD": PASSWORD,
+                         {"PGHOST": "192.0.2.7", "PGPORT": "5445", "PGUSER": USER, "PGPASSWORD": CANARY,
                           "PGDATABASE": "ai_memory_test", "PGSSLMODE": "verify-full",
                           "PGSSLROOTCERT": "/etc/ssl/tier-ca.pem"})
         for arg in seen["argv"]:
-            for secret in (PASSWORD, USER, "192.0.2.7", "postgres://"):
+            for secret in (CANARY, USER, "192.0.2.7", "postgres://"):
                 self.assertNotIn(secret, arg, "no credential or URL part may reach the child argv")
         self.assertNotIn("AI_MEMORY_TEST_POSTGRES_URL", env, "the URL is exported only on request")
 
@@ -98,7 +98,7 @@ class TestRunHandsOverThroughTheEnvironment(TierCredentialCase):
         self.assertEqual(self.run_psql("--database", "ai_memory_test_ci_7_1_linux").returncode, 0)
         env = self.recorded()["env"]
         self.assertEqual((env["PGDATABASE"], env["PGSSLMODE"], env["PGPASSWORD"]),
-                         ("ai_memory_test_ci_7_1_linux", "verify-full", PASSWORD))
+                         ("ai_memory_test_ci_7_1_linux", "verify-full", CANARY))
 
     def test_export_url_sets_the_url_variable_for_the_child_only(self):
         self.write_url()
@@ -126,7 +126,7 @@ class TestRunHandsOverThroughTheEnvironment(TierCredentialCase):
         self.assertNotIn("no-such-command-8187", r.stderr)
 
     def test_a_multi_host_url_maps_to_host_and_port_lists(self):
-        self.write_url(f"postgres://{USER}:{PASSWORD}@h1:5445,[::1]:5446,h3/db")
+        self.write_url(f"postgres://{USER}:{CANARY}@h1:5445,[::1]:5446,h3/db")
         self.assertEqual(self.run_psql().returncode, 0)
         env = self.recorded()["env"]
         self.assertEqual((env["PGHOST"], env["PGPORT"]), ("h1,::1,h3", "5445,5446,"))
@@ -139,7 +139,7 @@ class TestRefusals(TierCredentialCase):
         self.assertIn("::error::tier_credential:", out)
         for text in must:
             self.assertIn(text, out)
-        for secret in (PASSWORD, USER, "192.0.2.7", "postgres://", "tier-ca"):
+        for secret in (CANARY, USER, "192.0.2.7", "postgres://", "tier-ca"):
             self.assertNotIn(secret, out, "a refusal must never print the file text")
         self.assertFalse(self.out.exists(), "the child must not run after a refusal")
 
@@ -176,11 +176,11 @@ class TestRefusals(TierCredentialCase):
 
     def test_a_malformed_or_unsupported_url_is_refused_without_its_text(self):
         cases = {
-            "not a url": "something-else://u:" + PASSWORD + "@h/db",
+            "not a url": "something-else://u:" + CANARY + "@h/db",
             "two lines": URL + "\nsecond",
-            "unknown query key": f"postgres://{USER}:{PASSWORD}@h:5445/db?evil_key=1",
+            "unknown query key": f"postgres://{USER}:{CANARY}@h:5445/db?evil_key=1",
             "no password": f"postgres://{USER}@h:5445/db",
-            "unbalanced brackets": f"postgres://{USER}:{PASSWORD}@[::1:5445/db",
+            "unbalanced brackets": f"postgres://{USER}:{CANARY}@[::1:5445/db",
         }
         for name, text in cases.items():
             with self.subTest(case=name):
@@ -188,7 +188,7 @@ class TestRefusals(TierCredentialCase):
                 r = self.run_psql()
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertIn("::error::tier_credential:", r.stderr)
-                for secret in (PASSWORD, USER, "evil_key", "something-else"):
+                for secret in (CANARY, USER, "evil_key", "something-else"):
                     self.assertNotIn(secret, r.stdout + r.stderr)
 
     def test_a_non_utf8_file_names_only_the_exception_class(self):
@@ -225,7 +225,7 @@ class TestGithubEnv(TierCredentialCase):
         r = subprocess.run([sys.executable, "-I", str(SCRIPT), "github-env", "--url-file", str(self.url_file),
                             "--database", "ai_memory_test_ci_9"], capture_output=True, text=True, check=False, env=env)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertNotIn(PASSWORD, r.stdout + r.stderr)
+        self.assertNotIn(CANARY, r.stdout + r.stderr)
 
 
 class TestSource(unittest.TestCase):
