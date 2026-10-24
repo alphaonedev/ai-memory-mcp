@@ -1265,12 +1265,21 @@ def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
         # #8030 (the #6904 acceptance): where a *_USES constant exists for the action, the ref must
         # equal it exactly; another 40-hex sha is an unreviewed commit. release.yml's docker job is
         # pinned whole by DOCKER_STEPS, which already names the constant, so it is not reported twice.
-        action = ref.split("@", 1)[0]
-        want = USES_BY_ACTION.get(action)
-        if want is not None and ref != want and not (name == "release.yml" and path[:2] == ("jobs", "docker")):
-            rep.bad(f"{name}: {uses_where(doc, path)}: line {node.line + 1}: `uses: {ref[:70]}` differs from "
-                    f"{USES_CONSTANTS[want]} (`{want}`; #6904: a per-action constant comparison)"
-                    + pin_hint(USES_CONSTANTS[want]))
+        # Round 5 (F1): GitHub resolves owner and repository case-insensitively and runs a subpath of the
+        # repository, so the action is keyed on the lower-cased first two path components and the pinned
+        # sha must be the allowlisted one for that key whatever spelling or subpath the ref uses.
+        spec, _, sha = ref.partition("@")
+        if not spec.startswith(("./", "docker://")):
+            segs = spec.split("/")
+            if any(seg in ("", ".", "..") for seg in segs):
+                rep.bad(f"{name}: {uses_where(doc, path)}: line {node.line + 1}: `uses: {ref[:70]}` has an empty, `.` or "
+                        "`..` path segment (a normalised path can name another action than the one reviewed)")
+                continue
+            want = USES_BY_ACTION.get("/".join(seg.lower() for seg in segs[:2]))
+            if want is not None and sha != want.partition("@")[2] and not (name == "release.yml" and path[:2] == ("jobs", "docker")):
+                rep.bad(f"{name}: {uses_where(doc, path)}: line {node.line + 1}: `uses: {ref[:70]}` differs from "
+                        f"{USES_CONSTANTS[want]} (`{want}`; #6904: a per-action constant comparison on the "
+                        "case-folded owner/repo, any subpath kept)" + pin_hint(USES_CONSTANTS[want]))
 
 
 def check_release_yml(text: str, rep: Report) -> None:
@@ -1810,6 +1819,13 @@ def _first_checkout_to_other_sha(text: str) -> str:
     return re.sub(r"(uses:\s*actions/checkout@)[0-9a-f]{40}", r"\g<1>" + "0" * 40, text, count=1)
 
 
+def _checkout_spelled(spelling: str, sha: str = "0" * 40) -> Callable[[str], str]:
+    """Respell the first actions/checkout of a job text as ``spelling@sha`` (Round 5 F1)."""
+    def go(text: str) -> str:
+        return text.replace(CHECKOUT_USES, spelling + "@" + sha, 1)
+    return go
+
+
 def _shape_scalar_step(text: str) -> str:
     return text.rstrip("\n") + "\n      - just-a-scalar\n"
 
@@ -2083,6 +2099,15 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         (PUBLISH, "", _first_checkout_to_other_sha, False)]),
     "N17 c8-precheck.yml holds a value outside the subset grammar is refused": ("fail", [
         (C8, "", lambda x: x.rstrip("\n") + '\n\nx-extra: "abc\n', False)]),
+    # Round-5 cells (F1): the per-action comparison is on the case-folded owner/repo with any subpath kept.
+    "N18 crates-io checkout spelled with another case and another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("Actions/Checkout")))]),
+    "N19 crates-io checkout with a subpath and another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("actions/checkout/sub")))]),
+    "N20 crates-io checkout with a dot segment is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("actions/checkout/..", CHECKOUT_USES.partition("@")[2])))]),
+    "N21 crates-io checkout spelled with another case and the pinned sha passes": ("pass", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("ACTIONS/Checkout", CHECKOUT_USES.partition("@")[2])))]),
     # --- control characters: Python and bash disagree on what a line is
     "control character: CR line ends in release.yml": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\r")]),
     "control character: form feed in the Dockerfile": ("fail", [(DOCKER, DOCKER_ASSERT, DOCKER_ASSERT + "\x0c# x", False)]),
@@ -2708,6 +2733,11 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("BuildKit join strips the next line's indent", "            piece = raw\n", '            piece = raw.lstrip(" \\t")\n'),
     ("BuildKit continuation needs a bare backslash", r'BK_CONT_RE = re.compile(r"(^|[^\\])\\[ \t]*$")', r'BK_CONT_RE = re.compile(r"(^|[^\\])\\$")'),
     ("BuildKit continuation on an escaped backslash", r'(^|[^\\])\\[ \t]*$', r'\\[ \t]*$'),
+    ("per-action key not case-folded", 'USES_BY_ACTION.get("/".join(seg.lower() for seg in segs[:2]))',
+     'USES_BY_ACTION.get("/".join(seg for seg in segs[:2]))'),
+    ("per-action key includes the subpath", 'for seg in segs[:2]))', 'for seg in segs[:3]))'),
+    ("per-action sha not compared", 'if want is not None and sha != want.partition("@")[2] and not', 'if False and not'),
+    ("dot segment not refused", 'if any(seg in ("", ".", "..") for seg in segs):', 'if any(seg in ("",) for seg in segs):'),
 )
 
 
