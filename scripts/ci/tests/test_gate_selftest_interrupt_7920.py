@@ -37,6 +37,7 @@ POLL_STEP_SECS = 0.05
 SIGNAL_TO_EXIT_CEILING_SECS = 5.0
 REFUSE_CEILING_SECS = 120.0
 REFUSE_EXIT_CODE = 2
+VICTIM_TEXT = "victim-original\n"
 
 # gate script -> probe paths the self-test plants (relative to ROOT)
 GATES = {
@@ -153,6 +154,49 @@ class GateSelfTestInterrupt7920(unittest.TestCase):
         for index, p in enumerate(probes):
             if index != probe_index:
                 self.assertFalse(p.exists() or p.is_symlink(), "probe written: " + str(p))
+
+    def run_race_link(self, gate, probe_index):
+        """A link that appears AFTER the guard and BEFORE the write (8243).
+
+        The guard is run for real. The race is simulated in a copy of the
+        scripts tree under .local-runs: the copied selftest_probes_arm, which
+        the gate calls between the guard and the first write, also plants a
+        symlink at the probe path. The link points at a victim file in the
+        work dir; a write that follows it changes the victim.
+        """
+        LOCAL_RUNS.mkdir(exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="selftest-8243r-", dir=str(LOCAL_RUNS)))
+        self.addCleanup(shutil.rmtree, str(work), True)
+        tree = work / "tree"
+        shutil.copytree(str(ROOT / "scripts"), str(tree / "scripts"),
+                        ignore=shutil.ignore_patterns(".local-runs"))
+        (tree / "src").mkdir()
+        (tree / "tools").mkdir()
+        link = tree / GATES[gate][probe_index]
+        victim = work / "victim"
+        victim.write_text(VICTIM_TEXT)
+        lib = tree / "scripts" / "lib" / "selftest-probes.sh"
+        text = lib.read_text()
+        anchor = '    _selftest_probes+=("$@")\n'
+        self.assertIn(anchor, text, "hook anchor missing from selftest-probes.sh")
+        lib.write_text(text.replace(
+            anchor, anchor + '    ln -s "%s" "%s"\n' % (victim, link), 1))
+        env = dict(os.environ, TMPDIR=str(work), LC_ALL="C")
+        done = subprocess.run(
+            ["bash", str(tree / "scripts" / gate), "--self-test"],
+            cwd=str(tree), env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=REFUSE_CEILING_SECS)
+        err = done.stderr.decode("utf-8", "replace")
+        self.assertNotEqual(done.returncode, 0, "write through a late link must fail")
+        self.assertIn("cannot overwrite existing file", err)
+        self.assertEqual(victim.read_text(), VICTIM_TEXT,
+                         "write went through a link created after the guard")
+        self.assertFalse(link.is_symlink(), "late link left behind")
+
+    def test_late_symlink_not_followed_8243(self):
+        for gate in GATES:
+            for index in range(len(GATES[gate])):
+                self.run_race_link(gate, index)
 
     def test_dangling_symlink_refused_8243(self):
         for gate in GATES:
