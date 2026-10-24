@@ -755,28 +755,12 @@ def load_job_pins():
     return json.loads(JOB_PINS_FILE.read_text(encoding="utf-8"))
 
 
-def step_value(raw):
-    """The scalar after a ``name:``/``id:`` key, as the loader reads it: a quoted scalar without its quotes, a plain one
-    without its trailing `` #`` comment, cut to 60 characters like ``tier_yaml_8187.step_label``."""
-    raw = raw.strip()
-    if raw[:1] in ("'", '"'):
-        quote = raw[0]
-        at = 1
-        while at < len(raw):
-            if raw[at] == "\\" and quote == '"':
-                at += 2
-            elif raw[at] == quote and raw[at + 1:at + 2] == quote:
-                at += 2
-            elif raw[at] == quote:
-                return raw[1:at][:60]
-            else:
-                at += 1
-        return ""
-    return re.split(r"\s#", raw, maxsplit=1)[0].strip()[:60]
+def step_label(block, offset, steps=None):
+    """``(step index, step label)`` of the step that holds line ``offset`` of a job block, for the failure message.
 
-
-def step_label(block, offset):
-    """``(step index, step name)`` of the step that holds line ``offset`` of a job block, for the failure message."""
+    The index is a position counted from the ``- `` heads of the block; the label comes from the LOADED document
+    (``ty.step_label(steps[index], index)``, ``steps`` is the loaded step list of the job), else ``step[<index>]`` when
+    the document did not load.  No source row is ever read for a label (F30): every source row is author text."""
     rows = block.split("\n")
     steps_at = next((i for i, ln in enumerate(rows) if ln.strip() == "steps:"), None)
     if steps_at is None or offset <= steps_at:
@@ -787,22 +771,9 @@ def step_label(block, offset):
     owner = max((n for n, i in enumerate(heads) if i <= offset), default=None)
     if owner is None:
         return None, "job-level keys"
-    end = heads[owner + 1] if owner + 1 < len(heads) else len(rows)
-    head = rows[heads[owner]]
-    after = head.lstrip()[1:]
-    key_column = indent_of(head) + 1 + (len(after) - len(after.lstrip()))
-    own = {}
-    for number in range(heads[owner], end):
-        row = rows[number]
-        text = row.lstrip()[1:].lstrip() if number == heads[owner] else row.strip()
-        column = key_column if number == heads[owner] else indent_of(row)
-        if column != key_column:
-            continue
-        for key in ("name", "id"):
-            if text.startswith(key + ":"):
-                own.setdefault(key, step_value(text[len(key) + 1:]))
-    label = own.get("name") or own.get("id") or f"step[{owner}]"
-    return owner, ty.mask_userinfo(label)
+    if isinstance(steps, list) and owner < len(steps):
+        return owner, ty.step_label(steps[owner], owner)
+    return owner, f"step[{owner}]"
 
 
 def first_difference(pinned, block):
@@ -847,7 +818,9 @@ def job_pin_problems(workflow, text, pins=None):
             problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
         elif hashlib.sha256(tiered[name].encode("utf-8")).hexdigest() != pinned["sha256"]:
             offset, _changed = first_difference(pinned, tiered[name])
-            index, label = step_label(tiered[name], offset)
+            loaded, _found = ty.parse_workflow(text)
+            job = ((loaded or {}).get("jobs") or {}).get(name)
+            index, label = step_label(tiered[name], offset, job.get("steps") if isinstance(job, dict) else None)
             where = "job-level keys" if index is None else f"step {index} ({label})"
             first = next(j[1] for j in jobs if j[0] == name)
             problems.append(f"{workflow} job {name} {where}: differs from the pin at line {first + offset + 1}")
@@ -2267,9 +2240,10 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
     def test_the_checker_sources_slice_no_workflow_line_8187_f26(self):
         wide = {path.name: [int(n) for n in re.findall(r"\[:(\d+)\]", path.read_text(encoding="utf-8")) if int(n) >= 40]
                 for path in (Path(__file__), Path(__file__).with_name("tier_yaml_8187.py"))}
-        # the only wide slices left cut a step NAME (a label the author chose) to 60 characters in both views, never a line
+        # the only wide slice left cuts a step NAME (a label the author chose) to 60 characters, in the loaded view only;
+        # the checker reads no source row for a label (F30), so it holds none
         self.assertEqual(wide["tier_yaml_8187.py"], [60])
-        self.assertEqual(wide[Path(__file__).name], [60, 60])
+        self.assertEqual(wide[Path(__file__).name], [])
 
 
 def step_head_rows(block):
@@ -2343,7 +2317,7 @@ class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
                 with self.subTest(workflow=path.name, job=name):
                     self.assertEqual(len(heads), len(steps))
                     for index, row in enumerate(heads):
-                        self.assertEqual(step_label(block, row)[1], ty.step_label(steps[index], index), (index,))
+                        self.assertEqual(step_label(block, row, steps)[1], ty.step_label(steps[index], index), (index,))
                         compared += 1
         self.assertGreater(compared, 100)
 
@@ -2351,9 +2325,17 @@ class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
         block = "\n".join(["  job:", "    steps:", "      - uses: x", "        name: \"Quoted # name\"  # tail",
                            "        with:", "          name: deep", "      - id: build", "        run: |",
                            "          name: nope", "      - run: echo", "        env:", "          id: nope"])
+        steps = ty.load_strict(block)["job"]["steps"]
         heads = step_head_rows(block)
-        self.assertEqual([step_label(block, h) for h in heads],
+        self.assertEqual([step_label(block, h, steps) for h in heads],
                          [(0, "Quoted # name"), (1, "build"), (2, "step[2]")])
+
+    def test_a_document_that_does_not_load_labels_a_step_by_position_8187_f30(self):
+        block = "\n".join(["  job:", "    steps:", "      - run: \"x", "        name: SENTINEL-F30-none\"", "      - id: b"])
+        for steps in (None, "not a list", []):
+            with self.subTest(steps=steps):
+                self.assertEqual([step_label(block, h, steps) for h in step_head_rows(block)],
+                                 [(0, "step[0]"), (1, "step[1]")])
 
     def test_a_local_tag_or_tab_does_not_put_author_text_in_the_load_failure_8187_f28(self):
         sentinel = "SENTINEL-F28"
@@ -2385,6 +2367,72 @@ class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
                 message = ty.load_failure(caught.exception)
                 self.assertNotIn(sentinel, message)
                 self.assertRegex(message, r"^\w+ at line \d+$")
+
+
+class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
+    """r16 F30: a row at the step key column that continues a quoted scalar or a flow collection is value text; the text
+    view takes its label from the loaded document, so no source row can become a label."""
+
+    S1, S2, S3, S4 = "SENTINEL-F30-dq", "SENTINEL-F30-sq", "SENTINEL-F30-flow", "SENTINEL-F30-after"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+        cls.pins = load_job_pins()
+
+    def cases(self):
+        return {
+            "double-quoted run": ([f'      - run: "echo one', f'        name: {self.S1}"'], None),
+            "single-quoted run": (["      - run: 'echo one", f"        name: {self.S2}'"], None),
+            "flow mapping with": (["      - uses: actions/checkout@v4", "        with: {a: 1,", f"        name: {self.S3}}}"],
+                                  None),
+            "named step after a continuation": ([f'      - run: "echo one', f'        name: {self.S4}"',
+                                                 "        name: real label"], "real label"),
+        }
+
+    def test_a_continuation_row_at_the_key_column_never_reaches_a_message_8187_f30(self):
+        sentinels = (self.S1, self.S2, self.S3, self.S4)
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            for variant, (planted, real) in self.cases().items():
+                edited = splice(text, target[3], planted)
+                job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+                index = next(i for i, step in enumerate(job_steps)
+                             if any(x in json.dumps(step) for x in sentinels))
+                want = real or f"step[{index}]"
+                problems = tier_pin_problems(wf, edited, self.pins) + job_pin_problems(wf, edited, self.pins[SECONDARY])
+                with self.subTest(workflow=wf, step=variant):
+                    checked += 1
+                    self.assertTrue(problems)
+                    for sentinel in sentinels:
+                        self.assertEqual([p for p in problems if sentinel in p], [], sentinel)
+                    self.assertTrue([p for p in problems if f"step {index} ({want})" in p], (index, want))
+        self.assertGreater(checked, 0)
+
+
+    def test_a_userinfo_shaped_step_name_is_masked_in_both_views_8187_f31(self):
+        sentinel = "SENTINEL-F31-pw"
+        planted = [f"      - name: https://user:{sentinel}@host.example/db", "        run: echo one"]
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            edited = splice(text, target[3], planted)
+            job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+            index = next(i for i, step in enumerate(job_steps) if sentinel in json.dumps(step))
+            views = {"loaded": tier_pin_problems(wf, edited, self.pins),
+                     "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
+            for view, problems in views.items():
+                with self.subTest(workflow=wf, view=view):
+                    checked += 1
+                    self.assertEqual([p for p in problems if sentinel in p], [])
+                    self.assertTrue([p for p in problems if f"step {index} (https://***@host.example/db)" in p],
+                                    (view, index))
+        self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":
