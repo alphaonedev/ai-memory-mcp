@@ -17,6 +17,8 @@ Three pins over the "Configure enterprise-fed tier" step and the always() cleanu
 Stdlib only.
 """
 
+import hashlib
+import json
 from pathlib import Path
 import re
 import sys
@@ -568,14 +570,12 @@ def pin_entry(body):
     Hashes, not the text: the table stays small, and the data file never repeats workflow prose that the repository
     phrase scans read.  Equality of the full SHA-256 is exact-text equality.
     """
-    import hashlib
     return {"sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
             "lines": [hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in body.split("\n")]}
 
 
 def load_pins():
     """The pinned post-export steps, ``{workflow:job:step-name: pin_entry(exact body text)}``."""
-    import json
     return json.loads(PINS_FILE.read_text(encoding="utf-8"))
 
 
@@ -909,7 +909,7 @@ class TestPostExportStepsArePinned8187(unittest.TestCase):
         for key, body in self.pins.items():
             with self.subTest(step=key):
                 self.assertEqual(body, pin_entry(expected[key]))
-                self.assertTrue(key.split(":", 1)[0] in PIN_WORKFLOWS)
+                self.assertIn(key.split(":", 1)[0], PIN_WORKFLOWS)
 
     def test_every_dump_form_in_a_post_export_step_fails_the_pin(self):
         forms = {**DUMP_MUTANTS, **F10_MUTANTS}
@@ -1004,7 +1004,6 @@ class TestPostExportStepsArePinned8187(unittest.TestCase):
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
         # regenerate the pin table from the workflows; the diff of the data file is what a reviewer reads
-        import json
         table = {}
         for workflow in PIN_WORKFLOWS:
             for key, body in post_export_steps(workflow, (WORKFLOWS / workflow).read_text(encoding="utf-8")):
