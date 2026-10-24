@@ -20,6 +20,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci/check-tier-password.py"
+FIXED_MATCH = "tier password matches a public URL component; rotate it (#6181)"
 GOOD = "q7Zr-Lm2_Xv9Kd4TgPw8Hn3Bs6Jc1Yf5AeUo0iRt"  # 40 chars, distinct from every component below
 
 
@@ -42,7 +43,13 @@ class TestCheckTierPassword6181(unittest.TestCase):
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 1, out)
         self.assertIn("::error::", out)
-        self.assertIn(rule, out)
+        if rule in ("empty", "shorter than 16"):
+            self.assertIn(rule, out)
+        else:
+            # #6181 / security F3: a password that equals, hides in or holds a URL component gets ONE fixed message
+            # that names no component (user, host, database or query), so the log never says which one matched.
+            self.assertIn(FIXED_MATCH, out)
+            self.assertIsNone(re.search(r"\b(?:user|host|database|query)\b", out), out)
         for secret in secrets:
             self.assertNotIn(secret, out, "the diagnostic must never print a URL value")
         return out
