@@ -2109,15 +2109,14 @@ mod tests {
         assert_eq!(s1, "b-1\n", "rotated to b: {s1:?}");
         assert_eq!(state.path, b);
         let a_born = fs::metadata(&a).and_then(|m| m.created()).ok();
-        // The probe files live in a separate directory only so they never
-        // appear among the logs `poll_once` scans. They may briefly take the
-        // freed inode of `a`; the probe is removed before `c` is created, so
-        // `c` can reuse that inode. The assertion below guards that ordering.
-        let scratch = tempfile::tempdir().unwrap();
+        // The probe lives in the log directory; `poll_once` cannot adopt it
+        // because its name lacks the `ai-memory` marker the scan filters on
+        // (logs.rs:262-263), and it is removed before `c` is created so `c`
+        // can reuse the freed inode of `a`.
         fs::remove_file(&a).unwrap();
-        wait_for_birth_tick(scratch.path(), a_born);
+        wait_for_birth_tick(dir.path(), a_born);
         assert!(
-            fs::symlink_metadata(scratch.path().join(BIRTH_TICK_PROBE_NAME)).is_err(),
+            fs::symlink_metadata(dir.path().join(BIRTH_TICK_PROBE_NAME)).is_err(),
             "birth-tick probe must be removed before c is created so c can reuse a's inode"
         );
         let c = make_log(dir.path(), "ai-memory.log.2026-10-25", "c-1\nc-2\n");
