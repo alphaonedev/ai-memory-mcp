@@ -1652,6 +1652,43 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         root = self.tree(extra={".github/workflows/other.yml": body.replace("[self-hosted, linux-fed]", "ubuntu-latest")})
         self.assertEqual(repo_problems(root, self.pins), [])
 
+    def test_an_unparsable_workflow_is_a_problem_not_skipped_8187_f18(self):
+        body = "name: o\non: push\njobs:\n  j:\n    runs-on:\t[self-hosted]\n    steps:\n      - run: echo hi\n"
+        root = self.tree(extra={".github/workflows/broken.yml": body})
+        problems = repo_problems(root, self.pins)
+        self.assertTrue(any("broken.yml" in p and "Error" in p for p in problems), problems)
+        self.assertFalse(any("echo hi" in p for p in problems), problems)
+
+    def test_a_job_level_uses_is_a_problem_in_every_other_workflow_8187_f18(self):
+        for value in ("owner/repo/.github/workflows/x.yml@v1", "./other/x.yml", "./.github/workflows/x.yml"):
+            body = "name: o\non: push\njobs:\n  j:\n    uses: %s\n" % value
+            root = self.tree(extra={".github/workflows/reuse.yml": body})
+            with self.subTest(uses=value):
+                self.assertTrue(any("reuse.yml job j" in p and "uses" in p for p in repo_problems(root, self.pins)))
+
+    def test_a_workflow_without_a_jobs_mapping_is_a_problem_8187_f18(self):
+        for label, body in (("missing", "name: o\non: push\n"), ("list", "name: o\non: push\njobs:\n  - a\n"),
+                            ("scalar", "name: o\non: push\njobs: none\n")):
+            root = self.tree(extra={".github/workflows/nojobs.yml": body})
+            with self.subTest(jobs=label):
+                self.assertTrue(any("nojobs.yml" in p and "jobs" in p for p in repo_problems(root, self.pins)))
+
+    def test_the_self_hosted_exemption_is_bound_to_its_label_sets_8187_f18a(self):
+        name = "session-boot-lifetime.yml"
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        self.assertEqual(repo_problems(self.tree(), self.pins), [])
+        mutants = {
+            "macos-fed moved to the tier label": text.replace('["self-hosted","macos-fed"]', '["self-hosted","linux-fed"]'),
+            "extra self-hosted leg": text.replace("          - os: macos-fed\n",
+                '          - os: other\n            runner: \'["self-hosted","linux-fed"]\'\n          - os: macos-fed\n'),
+            "runs-on no longer the matrix lookup": text.replace("${{ fromJSON(matrix.runner) }}", "[self-hosted, linux-fed]"),
+        }
+        for label, body in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(body, text)
+                problems = repo_problems(self.tree(replace={name: body}), self.pins)
+                self.assertTrue(any(name in p and "lifetime-tests" in p for p in problems), problems)
+
     def test_hosted_labels_and_non_tier_edits_are_not_flagged(self):
         text = self.texts["ci.yml"]
         for value in ("ubuntu-latest", "ubuntu-22.04", "macos-14", "windows-latest", "ubuntu-24.04-arm"):
