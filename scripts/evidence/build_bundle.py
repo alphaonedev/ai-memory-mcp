@@ -450,6 +450,15 @@ def directory_check(fd, expected=None, private=False, shared=False):
     return identity(info)
 
 
+def created_identity(name, parent_fd):
+    """Identity of the directory just created at `name`, from a no-follow stat, so the cleanup guard covers every
+    failure after the mkdir (#8211). Fatal when the entry is not a directory of this user (it is left in place)."""
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise Fatal("not the staged directory: unsafe directory identity or owner")
+    return identity(info)
+
+
 def entry_matches(parent_fd, name, expected):
     try:
         info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -613,11 +622,13 @@ def publish_bundle(wt, dest, files, manifest):
         if dest.exists() or dest.is_symlink():
             raise Fatal(f"{dest} already exists; refusing to overwrite")
         os.mkdir(private_name, mode=PRIVATE_MODE, dir_fd=scratch_fd)
+        private_id = created_identity(private_name, scratch_fd)  # #8211: recorded before anything else can fail
         private_fd = HeldDirectory(held, private_name, dir_fd=scratch_fd).fd
-        private_id = directory_check(private_fd, private=True)
+        directory_check(private_fd, expected=private_id, private=True)
         os.mkdir(STAGE_NAME, mode=PRIVATE_MODE, dir_fd=private_fd)
+        stage_id = created_identity(STAGE_NAME, private_fd)
         stage_fd = HeldDirectory(held, STAGE_NAME, dir_fd=private_fd).fd
-        stage_id = directory_check(stage_fd, private=True)
+        directory_check(stage_fd, expected=stage_id, private=True)
         output_fd, output_id = stage_fd, stage_id
         stage = scratch / private_name / STAGE_NAME
         # Walk from the held checkout, refusing symlinks in every component. Keep

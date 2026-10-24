@@ -492,6 +492,20 @@ class Run:
         return fd
 
     @staticmethod
+    def remove_empty_private(scratch_fd, name):
+        """Best-effort removal of the empty directory `name` this run just created (#8211). The entry is checked with a
+        no-follow stat (a directory owned by this user) and removed with rmdir, so a symlink or a replacement planted
+        at the path is left alone; rmdir fails on a non-empty directory."""
+        try:
+            info = os.stat(name, dir_fd=scratch_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                return False
+            os.rmdir(name, dir_fd=scratch_fd)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
     def private_directory(scratch_fd, prefix):
         """Create a collision-safe private child relative to the checked parent, returning its name and held fd."""
         for _attempt in range(PRIVATE_DIRECTORY_ATTEMPTS):
@@ -501,14 +515,21 @@ class Run:
             except FileExistsError:
                 continue
             try:
-                fd = open_scratch(name, dir_fd=scratch_fd)
-            except ValueError as e:
-                raise ConfigError(str(e)) from e
-            if fd is None:
-                raise ConfigError(f"{name}: private directory disappeared")
-            if stat.S_IMODE(os.fstat(fd).st_mode) != PRIVATE_DIRECTORY_MODE:
-                os.close(fd)
-                raise ConfigError(f"{name}: private directory mode changed")
+                try:
+                    fd = open_scratch(name, dir_fd=scratch_fd)
+                except ValueError as e:
+                    raise ConfigError(str(e)) from e
+                if fd is None:
+                    raise ConfigError(f"{name}: private directory disappeared")
+                try:
+                    if stat.S_IMODE(os.fstat(fd).st_mode) != PRIVATE_DIRECTORY_MODE:
+                        raise ConfigError(f"{name}: private directory mode changed")
+                except BaseException:
+                    os.close(fd)
+                    raise
+            except BaseException:
+                Run.remove_empty_private(scratch_fd, name)
+                raise
             return name, fd
         raise ConfigError("cannot allocate a unique private scratch directory")
 

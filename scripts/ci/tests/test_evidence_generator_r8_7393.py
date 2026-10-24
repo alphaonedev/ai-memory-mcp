@@ -511,6 +511,16 @@ class HookEvents7670(ScratchCase):
         self.fake = self.dir / "fakeroot"
         self.fake.mkdir()
 
+    @contextlib.contextmanager
+    def in_directory(self, path):
+        """chdir into `path`, restoring the previous cwd in `finally` (#8213)."""
+        previous = os.getcwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
     def raises(self, call):
         with guard.captured(self.fake) as sink:
             with self.assertRaises(guard.TmpRootViolation):
@@ -543,7 +553,8 @@ class HookEvents7670(ScratchCase):
     def test_a_unix_socket_bound_under_the_root_is_caught_7670(self):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(sock.close)
-        self.raises(lambda: sock.bind(str(self.fake / "s.sock")))
+        with self.in_directory(self.fake):  # a relative name keeps the AF_UNIX path short on a deep checkout (#8213)
+            self.raises(lambda: sock.bind("s.sock"))
         self.assertEqual(list(self.fake.iterdir()), [])
 
     def test_a_child_started_with_its_cwd_under_the_root_is_caught_7670(self):
@@ -554,8 +565,8 @@ class HookEvents7670(ScratchCase):
             os.symlink(self.dir / "t", self.dir / "ok-link")
             sqlite3.connect(str(self.dir / "ok.sqlite")).close()
             subprocess.run(["true"], cwd=str(self.dir), stdin=subprocess.DEVNULL)
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.bind(str(self.dir / "ok.sock"))
+            with self.in_directory(self.dir), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.bind("ok.sock")
             (self.dir / "ok.sock").unlink()
         self.assertEqual(sink, [])
 
