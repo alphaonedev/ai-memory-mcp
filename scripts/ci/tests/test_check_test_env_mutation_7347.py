@@ -4188,6 +4188,15 @@ R27_SHADOWED = (  # (name, row): each one rebinds a recognised name below the cr
     ("R27-2-root-extern-crate-self-as-std", r27_row("extern crate self as std;\n")),
     ("R27-2-extern-crate-self-as-other-name-in-mod", r27_row("mod w { extern crate self as zed; }\n")),
     ("R27-2-extern-crate-in-a-module-file", r27_row("mod m;\n", "extern crate self as ai_memory;\n")),
+    # round 29 (REVIEW-7349 code r28, R28-1): `use X::sub as X;` rebinds the protected name to a sub-item
+    ("R28-1-tokio-sync-as-tokio-root", r27_row("use tokio::sync as tokio;\n")),
+    ("R28-1-ai-memory-k-as-ai-memory-root", r27_row("mod k { pub struct Fan; }\nuse ai_memory::k as ai_memory;\n")),
+    ("R28-1-ai-memory-k-as-ai-memory-colon-prefix", r27_row("mod k { pub struct Fan; }\nuse ::ai_memory::k as ai_memory;\n")),
+    ("R28-1-ai-memory-k-as-ai-memory-in-fn", r27_row("fn g() { use ai_memory::k as ai_memory; }\n")),
+    ("R28-1-ai-memory-k-as-ai-memory-in-mod", r27_row("mod w { use ai_memory::k as ai_memory; }\n")),
+    ("R28-1-std-thread-as-std-fn", r27_row("fn g() { use std::thread as std; }\n")),
+    ("R28-1-std-thread-as-std-root", r27_row("use std::thread as std;\n")),
+    ("R28-1-serde-fan-as-serde", r27_row("use serde::Fan as serde;\n", cargo=R28_CARGO_PLAIN)),
 )
 R27_CLEAN = (  # (name, row): no diagnostic, the verdict of the file is the gate's own
     ("false-positive-helpers-mod", r27_row("mod w { pub mod helpers {} }\nuse ai_memory::Fan;\n", lib=R27_LIB_STRUCT)),
@@ -4201,6 +4210,8 @@ R27_CLEAN = (  # (name, row): no diagnostic, the verdict of the file is the gate
     ("root-extern-crate-self-as-the-crate", r27_row("extern crate self as ai_memory;\n", lib=R27_LIB_STRUCT)),
     ("item-of-the-extern-crate-named-like-it", r27_row("use async_trait::async_trait;\nuse serde::serde;\n", lib=R27_LIB_STRUCT,
                                                       cargo=R20_CARGO + '[dependencies]\nasync-trait = "0.1"\nserde = "1"\n')),
+    ("R28-1-clean-serde-fan-import", r27_row("use serde::Fan;\n", lib=R27_LIB_STRUCT, cargo=R28_CARGO_PLAIN, body="let _ = 1u8;")),
+    ("R28-1-clean-name-name-leaf", r27_row("use tokio::tokio;\nuse serde::serde;\n", cargo=R28_CARGO_PLAIN)),
     ("extern-crate-same-name", r27_row("extern crate std as std;\nmod w { extern crate core as core; }\n")),
     ("extern-crate-to-an-unrelated-name", r27_row("mod w { extern crate core as unrelated; }\n")),
     ("plain-dependency-root-mod-and-import", r27_row("mod serde;\n", lib=R27_LIB_STRUCT,
@@ -4252,8 +4263,9 @@ class ReviewR27(Positive):
 
 
 R27_MUTANTS = (  # (name, original text, mutated text): each must turn a row of ReviewR27 RED
-    ("use_alias_branch_off", "            if name in names and tuple(path[:1]) != (name,):", "            if False:"),
-    ("use_same_path_not_exempt", "if name in names and tuple(path[:1]) != (name,):", "if name in names:"),
+    ("use_alias_branch_off", "            if name in names and tuple(path) not in ((name,), (name, name)):", "            if False:"),
+    ("use_same_path_not_exempt", "if name in names and tuple(path) not in ((name,), (name, name)):", "if name in names:"),
+    ("use_exempt_widened", "tuple(path) not in ((name,), (name, name))", "tuple(path[:1]) != (name,)"),
     ("mod_branch_off", "        if not head or head.group(1) not in names:\n            continue\n",
      "        continue\n"),
     ("mod_root_level_flagged", "        if nested or scrubbed.count(\"{\", 0, at) > scrubbed.count(\"}\", 0, at):\n", "        if True:\n"),
