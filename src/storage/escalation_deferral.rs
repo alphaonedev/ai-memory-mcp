@@ -48,10 +48,13 @@
 //! the same thread and database, a settle of an unknown frame, and frames
 //! still holding intents when the thread exits (a `mem::forget`-ed
 //! `WriteTxn`) are all reported at ERROR. The first two go through `tracing`
-//! and also trip a `debug_assert!`; the thread-exit case is written directly
-//! to stderr (an `ERROR #4116: ...` line), because the `tracing` fmt layer's
-//! own thread-local buffer may already be destroyed at thread exit and
-//! logging through it would abort the process.
+//! and also trip a `debug_assert!`; the open-time report is ALSO written to
+//! stderr (#7606: a lossy or absent sink cannot drop the only report), and the
+//! thread-exit case is written directly to stderr (an `ERROR #4116: ...`
+//! line), because the `tracing` fmt layer's own thread-local buffer may
+//! already be destroyed at thread exit and logging through it would abort the
+//! process. The open-time report covers the intents the frame held then; an
+//! intent routed into the frame afterwards is named at thread exit (#7605).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,6 +132,11 @@ struct TxnFrame {
     /// stable and unique for the frame's whole life.
     conn_addr: usize,
     deferred: Vec<DeferredEscalation>,
+    /// #6132 / #7605 - how many of this frame's `deferred` intents the
+    /// open-time stale-frame report already covered; the thread-exit report
+    /// names only the intents beyond that count, so one lost write is reported
+    /// once and an intent routed in AFTER the open-time report is still named.
+    reported: usize,
     /// #7241 - the off-table audit anchors of signed-event appends made by
     /// nested funnels inside this transaction: emitted when it COMMITS,
     /// dropped unrecorded when it rolls back.
@@ -141,7 +149,17 @@ struct Frames(Vec<TxnFrame>);
 
 impl Drop for Frames {
     fn drop(&mut self) {
-        let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
+        // #7605 - per frame, the intents the open-time report did not cover.
+        let unreported = || {
+            self.0
+                .iter()
+                .map(|f| f.deferred.len().saturating_sub(f.reported))
+                .filter(|n| *n > 0)
+        };
+        // #6449 - frames and deferred intents are different counts: one frame
+        // can hold several intents, so the line names each with its own label.
+        let frames = unreported().count();
+        let lost: usize = unreported().sum();
         if lost > 0 {
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
@@ -159,8 +177,8 @@ impl Drop for Frames {
             let _ = std::io::Write::write_fmt(
                 &mut std::io::stderr(),
                 format_args!(
-                    "ERROR #4116: thread exited with {lost} unsettled escalation frame(s) \
-                     (a leaked WriteTxn); those escalated writes stay REFUSED but were NOT queued\n"
+                    "ERROR #4116: thread exited with {frames} unsettled escalation frame(s) \
+                     holding {lost} deferred intent(s) (a leaked WriteTxn); those escalated writes stay REFUSED but were NOT queued\n"
                 ),
             );
         }
@@ -194,28 +212,71 @@ fn forced_failure() -> bool {
     false
 }
 
+/// Report an older frame on `conn`'s database that still holds deferred
+/// escalations (#4116), BEFORE the caller issues `BEGIN`.
+///
+/// #6541: the debug-build `debug_assert!` below unwinds. Run after `BEGIN` and
+/// before any guard exists, that unwind stranded the connection inside an open
+/// write transaction holding the SQLite write lock. Reporting first means an
+/// unwind leaves the connection in autocommit (ERRORS-08, OWNERSHIP-24).
+pub(super) fn report_stale_frames(conn: &Connection) {
+    let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
+    // #7606 (#6540 Option 1) - the report is also written on the raw stderr
+    // channel, which no subscriber, filter or lossy appender can drop, and an
+    // intent counts as reported only after that write.
+    let (stale, newly_reported) = TXN_FRAMES.with(|frames| {
+        let mut stale = false;
+        let mut newly = 0usize;
+        for f in &mut frames.borrow_mut().0 {
+            if f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty() {
+                newly += f.deferred.len().saturating_sub(f.reported);
+                stale = true;
+            }
+        }
+        (stale, newly)
+    });
+    if newly_reported > 0 {
+        // A failed write is discarded on purpose (nothing left to report to;
+        // ERRORS-19); the intents then still count as reported, as at thread exit.
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "ERROR #4116: an older escalation frame still holds {newly_reported} deferred \
+                 intent(s) on this database while a new WriteTxn opened (a leaked or unsettled \
+                 transaction); those escalated writes stay REFUSED but were NOT queued\n"
+            ),
+        );
+        // #6132 / #7605 - covered intents are skipped at thread exit; one routed
+        // into the frame later is not covered and is still named there.
+        TXN_FRAMES.with(|frames| {
+            for f in &mut frames.borrow_mut().0 {
+                if f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty() {
+                    f.reported = f.deferred.len();
+                }
+            }
+        });
+    }
+    if stale {
+        tracing::error!(
+            "#4116: a WriteTxn opened while an older frame on the same database still \
+             holds deferred escalations (leaked or unsettled transaction)"
+        );
+        debug_assert!(false, "#4116: stale escalation frame on this database");
+    }
+}
+
 /// Register a frame for a write transaction just opened on `conn`.
 pub(super) fn open_frame(conn: &Connection) -> u64 {
     let id = NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed);
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
     TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
-        let stale = frames
-            .0
-            .iter()
-            .any(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty());
-        if stale {
-            tracing::error!(
-                "#4116: a WriteTxn opened while an older frame on the same database still \
-                 holds deferred escalations (leaked or unsettled transaction)"
-            );
-            debug_assert!(false, "#4116: stale escalation frame on this database");
-        }
         frames.0.push(TxnFrame {
             id,
             db_path,
             conn_addr: std::ptr::from_ref(conn).addr(),
             deferred: Vec::new(),
+            reported: 0,
             anchor: crate::governance::audit::PendingAuditAnchor::none(),
         });
     });
@@ -639,5 +700,264 @@ mod tests {
         })
         .join()
         .expect("leaking thread must not abort or panic");
+    }
+
+    /// Leak one write transaction on `leaker` that still holds one deferred
+    /// escalation (`mem::forget`), then release `leaker`'s write lock by the
+    /// caller dropping it; the frame stays on this thread's stack.
+    fn leak_one_intent(leaker: &rusqlite::Connection, pending_id: &str) {
+        let leaked = super::super::connection::WriteTxn::begin(leaker).expect("begin leaker");
+        let intent = super::DeferredEscalation {
+            pending_id: pending_id.to_string(),
+            action: crate::models::GovernedAction::Store,
+            namespace: "gov4116/leak-helper".to_string(),
+            memory_id: None,
+            requested_by: "ai:worker".to_string(),
+            rule_id: "R-leak-helper".to_string(),
+            payload: serde_json::json!({}),
+        };
+        assert!(super::defer_to_open_txn(leaker.path(), intent).is_ok());
+        std::mem::forget(leaked);
+    }
+
+    /// #6541 - a stale-frame report that unwinds (debug builds) must not leave
+    /// the connection inside the `BEGIN IMMEDIATE` it had just issued. The
+    /// connection must be in autocommit afterwards, and a second `WriteTxn`
+    /// opened on the SAME connection must commit.
+    #[test]
+    fn issue_6541_failed_open_leaves_connection_outside_a_transaction() {
+        std::thread::spawn(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-6541-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let leaker = crate::db::open(&path).expect("open leaker");
+            let conn = crate::db::open(&path).expect("open conn");
+            leak_one_intent(&leaker, "begin-6541");
+            drop(leaker);
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::connection::WriteTxn::begin(&conn).map(drop)
+            }));
+            drop(first);
+            assert!(
+                conn.is_autocommit(),
+                "a failed WriteTxn::begin must leave the connection outside any transaction"
+            );
+            // The second open must not fail with "cannot start a transaction
+            // within a transaction": the stale frame may unwind again (debug
+            // builds), but the BEGIN is never reached or is rolled back.
+            let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::connection::WriteTxn::begin(&conn)
+                    .map(|txn| txn.commit().expect("second WriteTxn commits"))
+            }));
+            if let Ok(opened) = second {
+                opened.expect("a second WriteTxn must open on the same connection");
+            }
+            assert!(
+                conn.is_autocommit(),
+                "the second open must also leave the connection outside any transaction"
+            );
+        })
+        .join()
+        .expect("test thread must not abort or panic");
+    }
+
+    /// Env var naming the child scenario a re-executed test binary runs.
+    const CHILD_ROLE_VAR: &str = "AI_MEMORY_TEST_4116_REPORT_CHILD";
+    /// Value of [`CHILD_ROLE_VAR`] in the re-executed child.
+    const CHILD_ROLE: &str = "child";
+    /// Fully-qualified test path prefix for `--exact` child runs.
+    const TEST_PATH_PREFIX: &str = "storage::escalation_deferral::tests::";
+
+    /// Re-execute this test binary on `test_name` as the child, returning its
+    /// (stdout, stderr); the child must exit 0 and have run exactly that test.
+    fn run_child(test_name: &str) -> (String, String) {
+        let path = format!("{TEST_PATH_PREFIX}{test_name}");
+        let out = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("current_exe"),
+            "escalation_deferral::report_child",
+        )
+        .args(["--exact", path.as_str(), "--nocapture", "--test-threads=1"])
+        .env(CHILD_ROLE_VAR, CHILD_ROLE)
+        .output()
+        .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "child must exit 0, got {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "child did not run:\n{stdout}"
+        );
+        (stdout, stderr)
+    }
+
+    /// True inside the re-executed child.
+    fn is_child() -> bool {
+        std::env::var(CHILD_ROLE_VAR).as_deref() == Ok(CHILD_ROLE)
+    }
+
+    /// Leak a frame holding `intents` deferred escalations on a thread, then
+    /// (when `open_second`) open a second `WriteTxn` on the same database so
+    /// the open-time stale-frame report fires; the thread then exits.
+    /// `late_intents` more intents are routed into the leaked frame AFTER that
+    /// open-time report (#7605).
+    fn leak_and_exit(intents: usize, open_second: bool, late_intents: usize) {
+        std::thread::spawn(move || {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-4116-report-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let leaker = crate::db::open(&path).expect("open leaker");
+            let leaked = super::super::connection::WriteTxn::begin(&leaker).expect("begin");
+            for n in 0..intents {
+                let intent = super::DeferredEscalation {
+                    pending_id: format!("report-{n}"),
+                    action: crate::models::GovernedAction::Store,
+                    namespace: "gov4116/report".to_string(),
+                    memory_id: None,
+                    requested_by: "ai:worker".to_string(),
+                    rule_id: "R-report".to_string(),
+                    payload: serde_json::json!({}),
+                };
+                assert!(super::defer_to_open_txn(leaker.path(), intent).is_ok());
+            }
+            std::mem::forget(leaked);
+            if open_second {
+                drop(leaker);
+                let conn = crate::db::open(&path).expect("open conn");
+                let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::super::connection::WriteTxn::begin(&conn).map(drop)
+                }));
+                drop(opened);
+                for n in 0..late_intents {
+                    let intent = super::DeferredEscalation {
+                        pending_id: format!("late-{n}"),
+                        action: crate::models::GovernedAction::Store,
+                        namespace: "gov4116/report".to_string(),
+                        memory_id: None,
+                        requested_by: "ai:worker".to_string(),
+                        rule_id: "R-late".to_string(),
+                        payload: serde_json::json!({}),
+                    };
+                    assert!(super::defer_to_open_txn(conn.path(), intent).is_ok());
+                }
+            }
+        })
+        .join()
+        .expect("leaking thread must not abort or panic");
+    }
+
+    /// Marker of the open-time stale-frame report (a `tracing` ERROR event).
+    const OPEN_TIME_REPORT: &str = "#4116: a WriteTxn opened while an older frame";
+    /// Marker of the open-time report on the raw stderr channel (#7606).
+    const OPEN_TIME_RAW_REPORT: &str = "ERROR #4116: an older escalation frame still holds";
+    /// Marker of the thread-exit leak report (raw stderr).
+    const THREAD_EXIT_REPORT: &str = "ERROR #4116: thread exited with";
+
+    /// #6132 - a lost-write that the open-time report already surfaced through
+    /// a live tracing sink must not be reported a second time at thread exit.
+    #[test]
+    fn issue_6132_stale_frame_is_reported_once() {
+        if !is_child() {
+            let (_stdout, stderr) = run_child("issue_6132_stale_frame_is_reported_once");
+            assert_eq!(
+                stderr.matches(OPEN_TIME_REPORT).count(),
+                1,
+                "the open-time report must reach the sink once:\n{stderr}"
+            );
+            assert_eq!(
+                stderr.matches(OPEN_TIME_RAW_REPORT).count(),
+                1,
+                "the raw open-time line must be written once:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains(THREAD_EXIT_REPORT),
+                "the thread-exit report repeats the open-time one:\n{stderr}"
+            );
+            return;
+        }
+        crate::logging::init_console_tracing(&[]);
+        leak_and_exit(1, true, 0);
+    }
+
+    /// #6540 - with NO tracing sink the tracing event reaches nobody, so the
+    /// raw stderr line (#7606) must carry the report.
+    #[test]
+    fn issue_6540_untraced_loss_is_still_reported_at_thread_exit() {
+        if !is_child() {
+            let (_stdout, stderr) =
+                run_child("issue_6540_untraced_loss_is_still_reported_at_thread_exit");
+            assert!(
+                stderr.contains(OPEN_TIME_RAW_REPORT),
+                "a loss no sink received must still be reported on stderr:\n{stderr}"
+            );
+            return;
+        }
+        // Deliberately no tracing subscriber in this child.
+        leak_and_exit(1, true, 0);
+    }
+
+    /// #7606 (#6540 case 3) - an installed sink that DROPS the event (the lossy
+    /// non-blocking pipeline) must not suppress the report: the open-time report
+    /// is also written on the raw stderr channel.
+    #[test]
+    fn issue_7606_dropped_tracing_event_is_still_reported_on_stderr() {
+        if !is_child() {
+            let (_stdout, stderr) =
+                run_child("issue_7606_dropped_tracing_event_is_still_reported_on_stderr");
+            assert!(
+                stderr.contains(OPEN_TIME_RAW_REPORT) || stderr.contains(THREAD_EXIT_REPORT),
+                "a tracing event the sink dropped must still reach stderr:\n{stderr}"
+            );
+            return;
+        }
+        // An ERROR-enabled subscriber whose writer discards every line.
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .with_max_level(tracing::Level::ERROR)
+            .try_init();
+        leak_and_exit(1, true, 0);
+    }
+
+    /// #7605 - an intent routed into a leaked frame AFTER the open-time report
+    /// was never reported by that report, so thread exit must name it.
+    #[test]
+    fn issue_7605_intent_deferred_after_the_open_time_report_is_reported_at_exit() {
+        if !is_child() {
+            let (_stdout, stderr) = run_child(
+                "issue_7605_intent_deferred_after_the_open_time_report_is_reported_at_exit",
+            );
+            assert!(
+                stderr.contains(
+                    "thread exited with 1 unsettled escalation frame(s) holding 1 deferred intent(s)"
+                ),
+                "the late intent must be named at thread exit:\n{stderr}"
+            );
+            return;
+        }
+        crate::logging::init_console_tracing(&[]);
+        leak_and_exit(1, true, 1);
+    }
+
+    /// #6449 - the thread-exit line counts frames and deferred intents
+    /// separately: one frame holding two intents is "1 frame(s)", not "2".
+    #[test]
+    fn issue_6449_thread_exit_line_labels_frames_and_intents_apart() {
+        if !is_child() {
+            let (_stdout, stderr) =
+                run_child("issue_6449_thread_exit_line_labels_frames_and_intents_apart");
+            assert!(
+                stderr.contains("thread exited with 1 unsettled escalation frame(s) holding 2 deferred intent(s)"),
+                "the exit line must name frames and intents separately:\n{stderr}"
+            );
+            return;
+        }
+        leak_and_exit(2, false, 0);
     }
 }
