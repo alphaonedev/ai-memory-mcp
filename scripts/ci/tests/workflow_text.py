@@ -62,3 +62,59 @@ def read_jobs(path: Path) -> Dict[str, dict]:
             if out:
                 jobs[current]["outputs"][out.group(1)] = out.group(2).strip()
     return jobs
+
+
+STEP_START_RE = re.compile(r"^      - (?:([A-Za-z0-9_-]+):\s*(.*))?$")
+STEP_KEY_RE = re.compile(r"^        ([A-Za-z0-9_-]+):\s*(.*)$")
+STEP_INDENT = 10
+
+
+def read_steps(path: Path, job: str) -> List[dict]:
+    """Return the steps of `job` as [{"name","id","if","run","uses"}] in order.
+
+    `run` is the block scalar text with its 10-space indent removed (a one-line
+    `run:` value is returned as is); keys a step does not carry are None.
+    """
+    steps: List[dict] = []
+    in_job = in_steps = False
+    run_lines: Optional[List[str]] = None
+    for line in Path(path).read_text().split("\n"):
+        job_match = JOB_ID_RE.match(line)
+        if job_match:
+            in_job = job_match.group(1) == job
+            in_steps = False
+            run_lines = None
+            continue
+        if not in_job:
+            continue
+        if line == "    steps:":
+            in_steps = True
+            continue
+        if not in_steps:
+            continue
+        if run_lines is not None:
+            if not line.strip() or line.startswith(" " * STEP_INDENT):
+                run_lines.append(line[STEP_INDENT:])
+                continue
+            steps[-1]["run"] = "\n".join(run_lines).rstrip("\n") + "\n"
+            run_lines = None
+        start = STEP_START_RE.match(line)
+        if start:
+            steps.append({"name": None, "id": None, "if": None, "run": None,
+                          "uses": None})
+            key, value = start.group(1), start.group(2)
+        else:
+            key_match = STEP_KEY_RE.match(line)
+            if not key_match or not steps:
+                continue
+            key, value = key_match.group(1), key_match.group(2)
+        if key in ("name", "id", "if", "uses"):
+            steps[-1][key] = (value or "").strip()
+        elif key == "run":
+            if (value or "").strip() in ("|", "|-", ">"):
+                run_lines = []
+            else:
+                steps[-1]["run"] = (value or "").strip()
+    if run_lines is not None:
+        steps[-1]["run"] = "\n".join(run_lines).rstrip("\n") + "\n"
+    return steps
