@@ -21,8 +21,8 @@ import re
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 import impact_fixture as fx
 import workflow_text
@@ -257,7 +257,7 @@ class FailClosed(BaseCase):
                 self.assertIn("base-sha-invalid", summary)
 
     def test_symlinked_base_file_is_refused(self):
-        base = self.commit_selector()
+        self.commit_selector()
         target = self.repo / IMPACT_REL / "select.py"
         target.unlink()
         target.symlink_to("common.py")
@@ -308,8 +308,8 @@ class FailClosed(BaseCase):
         cwd = os.getcwd()
         os.chdir(str(self.repo))
         try:
-            with mock.patch.dict(os.environ, env), \
-                    mock.patch.object(Path, "write_bytes", flaky), \
+            with unittest.mock.patch.dict(os.environ, env), \
+                    unittest.mock.patch.object(Path, "write_bytes", flaky), \
                     contextlib.redirect_stdout(io.StringIO()):
                 namespace["main"]()
         finally:
