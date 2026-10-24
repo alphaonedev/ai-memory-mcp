@@ -76,7 +76,7 @@ class SerialBudget(unittest.TestCase):
         self.assertIn('echo $(( SHARD_BUDGET - ($(date +%s) - $1) ))', function_body(CI, 'shard_left'))
 
     def test_timeout_comment_table_matches_matrix(self):
-        for row in ('ubuntu-latest,sqlite      95', 'linux-fed,enterprise-fed 160',
+        for row in ('ubuntu-latest,sqlite      95', 'linux-fed,enterprise-fed 300',
                     'macos-fed,sqlite          80', 'macos-fed,enterprise-fed 160'):
             self.assertIn(row, CI)
 
