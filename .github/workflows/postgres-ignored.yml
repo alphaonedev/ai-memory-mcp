@@ -84,26 +84,17 @@ jobs:
             echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"
             exit 1
           fi
-          base_url="$(cat "$url_file")"
           CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_ignored" | cut -c1-63)"
           echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
-          if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
+          if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" -- psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
             echo "::error::$RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native cert tier"
             exit 1
           fi
-          case "$base_url" in
-            *\?*) q="?${base_url#*\?}"; head="${base_url%%\?*}" ;;
-            *)    q=""; head="$base_url" ;;
-          esac
-          new_url="${head%/*}/${CI_FED_DB}${q}"
-          if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
+          if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" -- psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
             exit 1
           fi
-          {
-            echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url"
-            echo "AI_MEMORY_TEST_AGE_URL=$new_url"
-          } >> "$GITHUB_ENV"
+          python3 -I scripts/ci/tier_credential.py github-env --url-file "$url_file" --database "$CI_FED_DB" --age-url
           echo "::notice::[#3274] ignored pg tests pointed at ephemeral db $CI_FED_DB on $RUNNER_NAME"
 
       - name: cargo test --features sal-postgres -- --ignored
@@ -142,8 +133,7 @@ jobs:
             echo "::warning::cannot drop $CI_FED_DB — $url_file missing on $RUNNER_NAME (leaked ephemeral db)"
             exit 0
           fi
-          base_url="$(cat "$url_file")"
-          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
+          if python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" -- psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
             echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
