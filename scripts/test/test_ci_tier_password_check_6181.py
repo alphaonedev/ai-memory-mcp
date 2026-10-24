@@ -23,7 +23,10 @@ Pins over the "Configure enterprise-fed tier" step and the always() cleanup step
   whole-job text pin of r7, so a difference between the loader and what GitHub runs cannot pass silently.  Tier
   workflows and tier jobs are found from normalised loader output, ``.github/actions`` is scanned, a local action
   or reusable workflow call in a tier workflow is refused, and a job of the three workflows that is not a tier job
-  must run on a GitHub-hosted label.
+  must run on a GitHub-hosted label.  Every other workflow file gets the same rule: one that PyYAML refuses, one
+  whose ``jobs`` is missing or not a mapping, and any job-level ``uses:`` (local or remote reusable call, which is
+  not followed) is a problem, and the one self-hosted exemption (session-boot-lifetime ``lifetime-tests``) is bound
+  to its job name AND its exact runner label sets.
 
 The job ``tier-credential-pins`` in ci.yml runs this module and the two other tier modules on every PR (before r8
 no CI job ran them).  Obligation: any edit of a tier job or of a workflow-level key of the three workflows, and any
@@ -823,8 +826,30 @@ def job_pin_problems(workflow, text, pins=None):
 # Jobs outside the pinned tier jobs that legitimately run on a self-hosted label.  Each entry needs a reason: it does
 # not name the tier credential (checked on the loaded job), and it runs on the other fleet node's macOS runner.
 SELF_HOSTED_ALLOWED = {
-    ("session-boot-lifetime.yml", "lifetime-tests"): "matrix leg on the macOS fleet runner; no tier credential",
+    ("session-boot-lifetime.yml", "lifetime-tests"): (
+        "matrix leg on the macOS fleet runner; no tier credential",
+        frozenset({("ubuntu-latest",), ("self-hosted", "macos-fed")}),
+    ),
 }
+MATRIX_LOOKUP = "${{ fromJSON(matrix.runner) }}"
+
+
+def exemption_problem(allowed, job):
+    """Why a listed self-hosted job no longer fits its exemption, or None: ``runs-on`` must be the matrix lookup and
+    every ``strategy.matrix.include[].runner`` a JSON label list in the allowed set (no other matrix key adds legs)."""
+    if job.get("runs-on") != MATRIX_LOOKUP:
+        return "runs-on is not the pinned matrix lookup"
+    matrix = (job.get("strategy") or {}).get("matrix") if isinstance(job.get("strategy"), dict) else None
+    if not isinstance(matrix, dict) or set(matrix) - {"include"} or not isinstance(matrix.get("include"), list):
+        return "the matrix is not a bare include list"
+    for entry in matrix["include"]:
+        try:
+            labels = tuple(json.loads(entry["runner"]))
+        except (KeyError, TypeError, ValueError):
+            return "a matrix leg has no JSON runner label list"
+        if labels not in allowed:
+            return "a matrix leg uses a label set outside the exemption"
+    return None
 
 
 def primary_pin_problems(workflow, text, primary):
@@ -909,13 +934,26 @@ def repo_problems(root=None, pins=None):
             found.append(f"{name}: names the tier secret but no pin covers it")
         try:
             data = ty.load_lenient(raw)
-        except ty.yaml.YAMLError:
+        except ty.yaml.YAMLError as exc:
+            found.append(f"{name}: the workflow does not load ({type(exc).__name__}); an unparsable workflow is refused")
             continue
         jobs = data.get("jobs") if isinstance(data, dict) else None
-        for job_name, job in (jobs.items() if isinstance(jobs, dict) else []):
-            if not isinstance(job, dict) or (name, job_name) in SELF_HOSTED_ALLOWED:
+        if not isinstance(jobs, dict):
+            found.append(f"{name}: jobs is missing or not a mapping")
+            continue
+        for job_name, job in jobs.items():
+            if not isinstance(job, dict):
+                found.append(f"{name} job {job_name}: the job is not a mapping")
                 continue
-            if "uses" in job and "runs-on" not in job:
+            if "uses" in job:
+                found.append(f"{name} job {job_name}: a job-level uses (reusable workflow call) is not allowed; "
+                             "the called workflow chooses its own runner")
+                continue
+            allowed = SELF_HOSTED_ALLOWED.get((name, job_name))
+            if allowed is not None:
+                why = exemption_problem(allowed[1], job)
+                if why:
+                    found.append(f"{name} job {job_name}: the self-hosted exemption no longer fits ({why})")
                 continue
             labels = ty.runs_on_labels(job)
             if labels is None or any(not ty.HOSTED_LABEL.match(label) for label in labels):
