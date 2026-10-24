@@ -10,10 +10,9 @@ import subprocess
 import sys
 import textwrap
 import unittest
-from pathlib import Path
 
 import impact_fixture as fx
-from impact_fixture import ImpactCase
+ImpactCase = fx.ImpactCase
 
 EXIT_USAGE = 2
 SELECT_SCRIPT = fx.IMPACT_DIR / "select.py"
@@ -46,8 +45,8 @@ class RuleTable(ImpactCase):
     def test_python_rule(self):
         out = self.select(["scripts/tool.py"])
         self.assertFalse(out["all"])
-        self.assertTrue({"python", "actionlint", "isolation-smoke"}
-                        <= set(out["jobs"]))
+        self.assertLessEqual({"python", "actionlint", "isolation-smoke"},
+                             set(out["jobs"]))
         self.assertNotIn("rust", out["jobs"])
 
     def test_docs_rule(self):
@@ -61,7 +60,7 @@ class RuleTable(ImpactCase):
 
     def test_always_on_keys_present(self):
         out = self.select(["README.md"])
-        self.assertTrue(ALWAYS_ON <= set(out["jobs"]))
+        self.assertLessEqual(ALWAYS_ON, set(out["jobs"]))
 
     def test_reasons_name_the_rule(self):
         out = self.select(["README.md", "crates/core/src/lib.rs"])
@@ -76,7 +75,7 @@ class RuleTable(ImpactCase):
 class Union(ImpactCase):
     def test_union_of_python_and_docs(self):
         out = self.select(["scripts/tool.py", "docs/a.txt"])
-        self.assertTrue({"python", "docs", "actionlint"} <= set(out["jobs"]))
+        self.assertLessEqual({"python", "docs", "actionlint"}, set(out["jobs"]))
         self.assertFalse(out["all"])
 
     def test_one_all_path_makes_all(self):
@@ -145,7 +144,7 @@ class Advice(ImpactCase):
         base = self.select(["scripts/tool.py"])
         advised = self.select(["scripts/tool.py"], advice=[
             {"job_key": "docs", "reason": "x"}])
-        self.assertTrue(set(base["jobs"]) <= set(advised["jobs"]))
+        self.assertLessEqual(set(base["jobs"]), set(advised["jobs"]))
 
     def test_unknown_key_is_rejected(self):
         from impact import select
@@ -275,9 +274,9 @@ class BuildIndex(ImpactCase):
         return names
 
     def test_schema_tables(self):
-        self.assertTrue({"schema_version", "crates", "crate_deps",
-                         "test_targets", "path_rules", "history",
-                         "file_symbols", "symbol_edges"} <= self.tables())
+        self.assertLessEqual({"schema_version", "crates", "crate_deps",
+                             "test_targets", "path_rules", "history",
+                             "file_symbols", "symbol_edges"}, self.tables())
 
     def test_wal_mode(self):
         con = sqlite3.connect(str(self.db))
@@ -386,9 +385,9 @@ class RulesFile(unittest.TestCase):
     def test_rules_are_valid(self):
         rules = json.loads(fx.RULES_JSON.read_text())
         known = set(rules["known_jobs"])
-        self.assertTrue(ALWAYS_ON <= known)
+        self.assertLessEqual(ALWAYS_ON, known)
         for rule in rules["rules"]:
-            self.assertTrue(set(rule["jobs"]) <= known | {"ALL"}, rule)
+            self.assertLessEqual(set(rule["jobs"]), known | {"ALL"}, rule)
         for key in rules["job_map"].values():
             self.assertIn(key, known)
         priorities = [r["priority"] for r in rules["rules"]]
