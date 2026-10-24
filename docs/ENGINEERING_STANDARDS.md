@@ -621,9 +621,11 @@ its check.
 - **R3. Fix by class, then lock the class.** A finding that shares a root cause
   or fix surface with others is tracked as an umbrella. The umbrella closes
   only when a root-cause fix AND a ratchet guard (a checker, invariant test or
-  gate that fails if the class returns) have landed. Existing examples:
-  `scripts/ci/check_test_env_mutation.py` (#8168 class) and
-  `scripts/ci/check_pg_isolate_invariants.py` (#8167 / #6383 class). Check: the
+  gate that fails if the class returns) have landed. Landed example:
+  `scripts/ci/check_pg_isolate_invariants.py` (#8167 / #6383 class). For the
+  #8168 env-mutation class the landed guard today is arm (d) of
+  `scripts/check-test-env-lock.sh`, and the ratchet checker lands with PR
+  #7349, so that class is not yet locked while #8168 is open. Check: the
   umbrella close comment links both the fix and the guard.
 - **R4. Honest CI.** A red check is never rerun to pass without first
   classifying it: PR-caused, known class with an umbrella item, or new class
