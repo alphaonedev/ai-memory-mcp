@@ -24,7 +24,7 @@
 //! (#3714 without the detector).
 
 use std::io::{BufRead as _, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -53,23 +53,21 @@ const BOOT_DEADLINE: Duration = Duration::from_secs(45);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/tls")
-        .join(name)
+/// A per-binary TLS leaf minted by the shared helper (SANs `localhost`,
+/// `127.0.0.1`, `::1`); the daemon serves it and the probe client pins it as
+/// its only root, so certificate verification stays ON (#8179).
+fn leaf() -> &'static common::tls::TestTls {
+    static LEAF: std::sync::OnceLock<common::tls::TestTls> = std::sync::OnceLock::new();
+    LEAF.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tls scratch dir").keep();
+        common::tls::TestTls::generate(&dir)
+    })
 }
 
-/// The checked-in TLS fixture pair, passed to every `serve` child so the
-/// tests stay valid once transit encryption becomes a floor (#3705).
-fn tls_args() -> [String; 4] {
-    [
-        "--tls-cert".to_string(),
-        fixture("valid_cert.pem").to_string_lossy().into_owned(),
-        "--tls-key".to_string(),
-        fixture("valid_key_pkcs8.pem")
-            .to_string_lossy()
-            .into_owned(),
-    ]
+/// The `--tls-cert` / `--tls-key` argv for every `serve` child so the tests
+/// stay valid once transit encryption becomes a floor (#3705).
+fn tls_args() -> Vec<String> {
+    leaf().serve_args()
 }
 
 /// A child with `config.toml` loading ENABLED (no `AI_MEMORY_NO_CONFIG`);
@@ -128,13 +126,9 @@ fn seed_store(root: &Path, agent_ids: &[&str]) {
     }
 }
 
-/// `/api/v1/health` over the TLS listener (fixture cert: verification off).
+/// `/api/v1/health` over the TLS listener (pinned fixture root: verification on).
 fn health_is_200(port: u16) -> bool {
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .expect("client");
+    let client = leaf().client_with_timeout(PROBE_TIMEOUT);
     client
         .get(format!("https://127.0.0.1:{port}/api/v1/health"))
         .send()

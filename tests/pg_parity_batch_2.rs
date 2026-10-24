@@ -59,7 +59,7 @@ use ai_memory::store::Filter;
 // fixtures
 // ─────────────────────────────────────────────────────────────────────
 
-fn uid(prefix: &str) -> String {
+fn fresh_name(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
@@ -83,7 +83,7 @@ fn sqlite_store(dir: &tempfile::TempDir) -> ai_memory::store::sqlite::SqliteStor
 
 fn signal(ns: &str, to: Option<&str>, subject: &str, expires_at: Option<i64>) -> Signal {
     Signal {
-        id: uid("sig"),
+        id: fresh_name("sig"),
         namespace: ns.to_string(),
         from_agent: "ai:sender".to_string(),
         to_agent: to.map(str::to_string),
@@ -91,7 +91,7 @@ fn signal(ns: &str, to: Option<&str>, subject: &str, expires_at: Option<i64>) ->
         body: serde_json::json!({"k": "v"}),
         signal_type: SignalType::Notify,
         in_reply_to: None,
-        correlation_id: Some(uid("corr")),
+        correlation_id: Some(fresh_name("corr")),
         reference_ids: serde_json::json!([]),
         created_at: chrono::Utc::now().timestamp(),
         expires_at,
@@ -193,8 +193,8 @@ async fn live_pg() -> Option<ai_memory::store::postgres::PostgresStore> {
 /// Shared assertion body, driven against whichever adapter is handed in.
 async fn verify_inbox_excludes_acked(store: &dyn MemoryStore, backend: &str) {
     let ctx = CallerContext::for_agent("ai:parity-inbox");
-    let ns = uid("parity-inbox");
-    let to = uid("ai:recipient");
+    let ns = fresh_name("parity-inbox");
+    let to = fresh_name("ai:recipient");
     let sig = signal(&ns, Some(&to), "please-do-work", None);
     let sig_id = sig.id.clone();
     store
@@ -261,8 +261,8 @@ async fn pg_signal_inbox_excludes_acked_3011() {
 
 async fn verify_gc_reaps_expired_signals(store: &dyn MemoryStore, backend: &str) {
     let ctx = CallerContext::for_agent("ai:parity-gc");
-    let ns = uid("parity-gc");
-    let to = uid("ai:recipient");
+    let ns = fresh_name("parity-gc");
+    let to = fresh_name("ai:recipient");
     let now = chrono::Utc::now().timestamp();
 
     // One EXPIRED ephemeral + one DURABLE (no expires_at) signal.
@@ -326,9 +326,9 @@ async fn pg_gc_reaps_expired_signals_3011() {
 
 async fn verify_add_edge_refuses_self_and_cycle(store: &dyn MemoryStore, backend: &str) {
     let ctx = CallerContext::for_agent("ai:parity-edge");
-    let ns = uid("parity-edge");
-    let a = uid("act-a");
-    let b = uid("act-b");
+    let ns = fresh_name("parity-edge");
+    let a = fresh_name("act-a");
+    let b = fresh_name("act-b");
     let now = chrono::Utc::now().timestamp();
     for id in [&a, &b] {
         store
@@ -395,9 +395,9 @@ async fn pg_action_add_edge_concurrent_opposing_arcs_cannot_both_land_3008() {
 
     // Repeat the race so a single lucky serialization cannot mask a regression.
     for round in 0..12 {
-        let ns = uid("parity-edge-race");
-        let a = uid("race-a");
-        let b = uid("race-b");
+        let ns = fresh_name("parity-edge-race");
+        let a = fresh_name("race-a");
+        let b = fresh_name("race-b");
         for id in [&a, &b] {
             store
                 .action_create(&ctx, &action(&ns, id))
@@ -458,7 +458,7 @@ async fn pg_action_add_edge_concurrent_opposing_arcs_cannot_both_land_3008() {
 async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
     let Some(store) = live_pg().await else { return };
     let ctx = CallerContext::for_agent("ai:parity-uri");
-    let ns = uid("parity-uri");
+    let ns = fresh_name("parity-uri");
     let token = format!("prtytok{}", uuid::Uuid::new_v4().simple());
     let uri = format!("doc:parity/{}", uuid::Uuid::new_v4().simple());
 
@@ -472,8 +472,13 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
     // gate — stamp `collective` (world-readable) so the unfiltered
     // FTS+source_uri sanity query can observe both fixtures. Same
     // class as the #2384 stale-assert (fixture vs later posture).
-    let keep_id = uid("uri-keep");
-    let mut keep = mem(&keep_id, &ns, &uid("keep-title"), &format!("{token} keep"));
+    let keep_id = fresh_name("uri-keep");
+    let mut keep = mem(
+        &keep_id,
+        &ns,
+        &fresh_name("keep-title"),
+        &format!("{token} keep"),
+    );
     keep.tags = vec!["parity-keep".to_string()];
     keep.metadata = serde_json::json!({
         "agent_id": "ai:owner-keep",
@@ -481,8 +486,13 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
     });
     keep.source_uri = Some(uri.clone());
 
-    let drop_id = uid("uri-drop");
-    let mut dropped = mem(&drop_id, &ns, &uid("drop-title"), &format!("{token} drop"));
+    let drop_id = fresh_name("uri-drop");
+    let mut dropped = mem(
+        &drop_id,
+        &ns,
+        &fresh_name("drop-title"),
+        &format!("{token} drop"),
+    );
     dropped.tags = vec!["parity-drop".to_string()];
     dropped.metadata = serde_json::json!({
         "agent_id": "ai:owner-drop",
@@ -561,7 +571,7 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
             &token,
             &{
                 let mut __f = Filter::new();
-                __f.tags_any = vec![uid("no-such-tag")];
+                __f.tags_any = vec![fresh_name("no-such-tag")];
                 __f
             },
             Some(uri.as_str()),
@@ -587,18 +597,18 @@ const KG_QUERY_SAL_DEFAULT_CAP: usize = 200;
 
 async fn verify_kg_query_row_cap(store: &dyn MemoryStore, backend: &str) {
     let ctx = CallerContext::for_agent("ai:parity-kg");
-    let ns = uid("parity-kg");
-    let root = uid("kg-root");
+    let ns = fresh_name("parity-kg");
+    let root = fresh_name("kg-root");
     store
-        .store(&ctx, &mem(&root, &ns, &uid("kg-root-title"), "root"))
+        .store(&ctx, &mem(&root, &ns, &fresh_name("kg-root-title"), "root"))
         .await
         .unwrap_or_else(|e| panic!("[{backend}] store root: {e}"));
 
     let fanout = KG_QUERY_SAL_DEFAULT_CAP + 25;
     for i in 0..fanout {
-        let leaf = uid(&format!("kg-leaf-{i}"));
+        let leaf = fresh_name(&format!("kg-leaf-{i}"));
         store
-            .store(&ctx, &mem(&leaf, &ns, &uid("kg-leaf-title"), "leaf"))
+            .store(&ctx, &mem(&leaf, &ns, &fresh_name("kg-leaf-title"), "leaf"))
             .await
             .unwrap_or_else(|e| panic!("[{backend}] store leaf {i}: {e}"));
         store
@@ -647,10 +657,13 @@ async fn pg_kg_query_is_row_capped() {
 async fn pg_list_by_namespace_prefix_saturates_a_huge_limit() {
     let Some(store) = live_pg().await else { return };
     let ctx = CallerContext::for_agent("ai:parity-prefix");
-    let ns_root = uid("parity-prefix");
+    let ns_root = fresh_name("parity-prefix");
     let child = format!("{ns_root}/child");
     store
-        .store(&ctx, &mem(&uid("pfx"), &child, &uid("pfx-title"), "row"))
+        .store(
+            &ctx,
+            &mem(&fresh_name("pfx"), &child, &fresh_name("pfx-title"), "row"),
+        )
         .await
         .expect("store prefixed row");
 
@@ -750,14 +763,20 @@ async fn seed_ghost_age_node(
     ns: &str,
 ) -> String {
     let ctx = CallerContext::for_agent("ai:parity-unproject");
-    let root = uid("ghost-root");
-    let leaf = uid("ghost-leaf");
+    let root = fresh_name("ghost-root");
+    let leaf = fresh_name("ghost-leaf");
     store
-        .store(&ctx, &mem(&root, ns, &uid("ghost-root-title"), "root"))
+        .store(
+            &ctx,
+            &mem(&root, ns, &fresh_name("ghost-root-title"), "root"),
+        )
         .await
         .expect("store root");
     store
-        .store(&ctx, &mem(&leaf, ns, &uid("ghost-leaf-title"), "leaf"))
+        .store(
+            &ctx,
+            &mem(&leaf, ns, &fresh_name("ghost-leaf-title"), "leaf"),
+        )
         .await
         .expect("store leaf");
     store
@@ -803,7 +822,7 @@ async fn pg_age_unprojection_marker_records_dedupes_and_reconciles() {
         return;
     }
     let pool = store.pool().clone();
-    let ns = uid("parity-unproject");
+    let ns = fresh_name("parity-unproject");
     let root = seed_ghost_age_node(&store, &pool, &ns).await;
 
     // (1) RECORD — the real production recording path.
@@ -881,7 +900,7 @@ async fn pg_age_unprojection_marker_never_detaches_a_recreated_id() {
     }
     let pool = store.pool().clone();
     let ctx = CallerContext::for_agent("ai:parity-unproject");
-    let ns = uid("parity-unproject-recreate");
+    let ns = fresh_name("parity-unproject-recreate");
     let root = seed_ghost_age_node(&store, &pool, &ns).await;
 
     store
@@ -891,7 +910,10 @@ async fn pg_age_unprojection_marker_never_detaches_a_recreated_id() {
 
     // The id comes BACK before the drainer runs.
     store
-        .store(&ctx, &mem(&root, &ns, &uid("recreated-title"), "recreated"))
+        .store(
+            &ctx,
+            &mem(&root, &ns, &fresh_name("recreated-title"), "recreated"),
+        )
         .await
         .expect("re-create the memory under the same id");
 
@@ -938,10 +960,10 @@ async fn pg_age_quarantined_marker_does_not_block_the_drain() {
         return;
     }
     let pool = store.pool().clone();
-    let ns = uid("parity-unproject-quarantine");
+    let ns = fresh_name("parity-unproject-quarantine");
 
     // Poison marker: at the ceiling, so the take-query must skip it.
-    let poison = uid("quarantined-ghost");
+    let poison = fresh_name("quarantined-ghost");
     sqlx::query(
         "INSERT INTO kg_projection_outbox (source_id, target_id, relation, attempt_count) \
          VALUES ($1, $1, '__ai_memory_unproject__', $2)",
