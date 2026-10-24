@@ -2209,7 +2209,9 @@ def shadowed_names(scrubbed, names, nested, crate_name=None):
             out.append((item.start(), alias))
     for item in USE_ITEM.finditer(scrubbed):
         for path, name in use_leaves(item.group(0)):
-            if name in names and tuple(path) not in ((name,), (name, name)):  # r29: only `use N;` and `use N::N;`
+            # r29, r30: only `use N;` and `use N::N;` are no rebinding; the crate under test may be a module of its own
+            exempt = ((name,),) if name == crate_name else ((name,), (name, name))
+            if name in names and tuple(path) not in exempt:
                 out.append((item.start(), name))
     for token in MOD_TOKEN.finditer(scrubbed):
         head = MOD_HEAD.match(scrubbed, token.end())

@@ -4196,7 +4196,12 @@ R27_SHADOWED = (  # (name, row): each one rebinds a recognised name below the cr
     ("R28-1-ai-memory-k-as-ai-memory-in-mod", r27_row("mod w { use ai_memory::k as ai_memory; }\n")),
     ("R28-1-std-thread-as-std-fn", r27_row("fn g() { use std::thread as std; }\n")),
     ("R28-1-std-thread-as-std-root", r27_row("use std::thread as std;\n")),
-    ("R28-1-serde-fan-as-serde", r27_row("use serde::Fan as serde;\n", cargo=R28_CARGO_PLAIN)),
+    # round 30 (REVIEW-7349 code r29, R29-1): the crate under test is exempt only as the bare `use ai_memory;`
+    ("R29-1-crate-name-name-root", r27_row("use ai_memory::ai_memory;\n", "", "pub mod ai_memory {}\n")),
+    ("R29-1-crate-name-name-colon-prefix", r27_row("use ::ai_memory::ai_memory;\n", "", "pub mod ai_memory {}\n")),
+    ("R29-1-crate-name-name-in-mod", r27_row("mod w { use ai_memory::ai_memory; }\n", "", "pub mod ai_memory {}\n")),
+    ("R29-1-crate-name-name-in-fn", r27_row("fn g() { use ai_memory::ai_memory; }\n", "", "pub mod ai_memory {}\n")),
+    ("R28-1-serde-fan-as-serde",r27_row("use serde::Fan as serde;\n", cargo=R28_CARGO_PLAIN)),
 )
 R27_CLEAN = (  # (name, row): no diagnostic, the verdict of the file is the gate's own
     ("false-positive-helpers-mod", r27_row("mod w { pub mod helpers {} }\nuse ai_memory::Fan;\n", lib=R27_LIB_STRUCT)),
@@ -4263,9 +4268,10 @@ class ReviewR27(Positive):
 
 
 R27_MUTANTS = (  # (name, original text, mutated text): each must turn a row of ReviewR27 RED
-    ("use_alias_branch_off", "            if name in names and tuple(path) not in ((name,), (name, name)):", "            if False:"),
-    ("use_same_path_not_exempt", "if name in names and tuple(path) not in ((name,), (name, name)):", "if name in names:"),
-    ("use_exempt_widened", "tuple(path) not in ((name,), (name, name))", "tuple(path[:1]) != (name,)"),
+    ("use_alias_branch_off", "            if name in names and tuple(path) not in exempt:", "            if False:"),
+    ("use_same_path_not_exempt", "if name in names and tuple(path) not in exempt:", "if name in names:"),
+    ("use_exempt_widened", "tuple(path) not in exempt", "tuple(path[:1]) != (name,)"),
+    ("crate_name_name_name_exempt", "((name,),) if name == crate_name else ((name,), (name, name))", "((name,), (name, name))"),
     ("mod_branch_off", "        if not head or head.group(1) not in names:\n            continue\n",
      "        continue\n"),
     ("mod_root_level_flagged", "        if nested or scrubbed.count(\"{\", 0, at) > scrubbed.count(\"}\", 0, at):\n", "        if True:\n"),
