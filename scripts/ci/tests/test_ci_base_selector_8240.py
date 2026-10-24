@@ -18,12 +18,16 @@ import io
 import json
 import os
 import re
+import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import unittest
 import unittest.mock
 from pathlib import Path
 
+import gha_expr
 import impact_fixture as fx
 import workflow_text
 
@@ -40,6 +44,18 @@ SELECTOR_FILES = ("__init__.py", "common.py", "select.py", "build_index.py",
 HEREDOC_RE = re.compile(r"^python3 -I - <<'PY'\n(?P<body>.*)^PY\n\Z", re.S | re.M)
 DECLARED_NON_DOMAIN_OUTPUTS = {"jobs", "all", "crates", "enforce"}
 ENFORCE = "true"
+WORKFLOW_DIR = fx.REPO_ROOT / ".github" / "workflows"
+PR_WORKFLOWS = ("ci.yml", "ci-full.yml", "c8-precheck.yml")
+BASE_SHA_MENTION_RE = re.compile(r"base\.sha|BASE_SHA", re.I)
+ENV_LINE_RE = re.compile(r"^(?P<indent>\s+)(?P<key>[A-Z][A-Z0-9_]*):\s+(?P<value>\S.*?)\s*$")
+EXPRESSION_RE = re.compile(r"^\$\{\{ .+ \}\}$")
+SINGLE_BRACE_RE = re.compile(r"\$\{\s")
+BASE_EVENT_RE = re.compile(
+    r"^\$\{\{ github\.event\.pull_request\.base\.sha( \|\| .+)? \}\}$")
+BOOTSTRAP_STEP = "Fold job results (bootstrap, PR-tree gate)"
+BASE_GATE_STEP = "Fold job results (base gate)"
+FAIL_STEP = "Fail the gate (base gate unreadable)"
+GATE_SCRIPT = IMPACT_REL + "/gate.py"
 FAKE_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -154,13 +170,213 @@ class WorkflowShape(unittest.TestCase):
         self.assertEqual(len(pr_run), 1)
         self.assertIn("steps.base.outputs.ok == 'true'", base_run[0]["if"])
         self.assertEqual(pr_run[0]["if"],
-                         "${{ !cancelled() && steps.base.outputs.ok != 'true' }}")
+                         "${{ !cancelled() && steps.base.outputs.ok != 'true' "
+                         "&& steps.base.outputs.bootstrap == 'true' }}")
         self.assertTrue(base_run[0]["if"].startswith("${{ !cancelled() &&"))
 
     def test_the_two_materialise_steps_share_one_source(self):
         select_src = snippet_of(step_named(SELECT_JOB, MATERIALISE_STEP))
         gate_src = snippet_of(step_named(GATE_JOB, GATE_MATERIALISE_STEP))
         self.assertEqual(select_src, gate_src)
+
+
+class WorkflowExpressions(unittest.TestCase):
+    """S7: a one-brace `${ ... }` is literal text, so the selector never saw its base sha."""
+
+    def test_every_base_sha_env_value_is_a_well_formed_expression(self):
+        for name in PR_WORKFLOWS:
+            path = WORKFLOW_DIR / name
+            for number, line in enumerate(path.read_text().split("\n"), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                match = ENV_LINE_RE.match(line)
+                if match is None or not BASE_SHA_MENTION_RE.search(match.group("value")):
+                    continue
+                with self.subTest(file=name, line=number):
+                    self.assertRegex(
+                        match.group("value"), EXPRESSION_RE,
+                        "%s:%d %s is not a well-formed ${{ ... }} expression"
+                        % (name, number, match.group("key")))
+
+    def test_no_single_brace_expression_in_the_workflow_files_the_pr_touches(self):
+        for name in PR_WORKFLOWS:
+            path = WORKFLOW_DIR / name
+            for number, line in enumerate(path.read_text().split("\n"), 1):
+                with self.subTest(file=name, line=number):
+                    self.assertIsNone(SINGLE_BRACE_RE.search(line),
+                                      "%s:%d has a single-brace ${ expression" % (name, number))
+
+    def test_both_materialise_steps_take_the_base_sha_from_the_event_expression(self):
+        for job, step_name in ((SELECT_JOB, MATERIALISE_STEP),
+                               (GATE_JOB, GATE_MATERIALISE_STEP)):
+            with self.subTest(job=job):
+                value = step_named(job, step_name)["env"]["BASE_SHA"]
+                self.assertRegex(value, BASE_EVENT_RE)
+
+
+class GateBaseRead(BaseCase):
+    """S8: the PR-tree gate runs only when the base has no gate.py; any other read failure fails.
+
+    decision: fail the gate on a non-bootstrap base read failure over falling
+    back to the PR tree because a fallback the PR can trigger is self-judging;
+    the select job already fails safe to the full matrix, the gate must fail
+    closed
+    """
+
+    def gate_materialise(self, base, path=None):
+        step = step_named(GATE_JOB, GATE_MATERIALISE_STEP)
+        env = {"BASE_SHA": base, "IMPACT_FILES": step["env"]["IMPACT_FILES"]}
+        if path is not None:
+            env["PATH"] = path
+        return run_snippet(snippet_of(step), self.repo, env)
+
+    def plan(self, lines):
+        """Return the names of the gate steps whose `if:` holds after the materialise step."""
+        context = {"steps": {"base": {"outputs": lines}}}
+        ran = []
+        for step in workflow_text.read_steps(CI_YML, GATE_JOB):
+            if step["uses"] or step["name"] == GATE_MATERIALISE_STEP:
+                continue
+            if step["if"] is None or gha_expr.evaluate_job_if(step["if"], context):
+                ran.append(step["name"])
+        return ran
+
+    def failing_git(self, subcommand):
+        """Return a PATH whose `git <subcommand>` exits 128 and whose other calls pass through."""
+        real = shutil.which("git")
+        wrapper_dir = self.tmp / "wrapbin"
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / "git"
+        wrapper.write_text("#!%s\nimport os\nimport sys\nif %r in sys.argv[1:2]:\n"
+                           "    sys.exit(128)\nos.execv(%r, [%r] + sys.argv[1:])\n"
+                           % (sys.executable, subcommand, real, real))
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+        return str(wrapper_dir) + os.pathsep + os.environ["PATH"]
+
+    def run_fail_step(self, reason):
+        step = step_named(GATE_JOB, FAIL_STEP)
+        summary = self.tmp / "fail_summary.md"
+        summary.write_text("")
+        env = {"PATH": os.environ["PATH"], "IMPACT_REASON": reason,
+               "GITHUB_STEP_SUMMARY": str(summary)}
+        res = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=str(self.repo), env=env,
+                             capture_output=True, text=True, timeout=60)
+        return res.returncode, summary.read_text()
+
+    def assert_fails_closed(self, lines, summary):
+        self.assertEqual(lines.get("ok"), "false", summary)
+        self.assertNotEqual(lines.get("bootstrap"), "true", summary)
+        ran = self.plan(lines)
+        self.assertEqual(ran, [FAIL_STEP])
+        self.assertNotIn(BOOTSTRAP_STEP, ran)
+        code, text = self.run_fail_step(lines.get("reason", ""))
+        self.assertNotEqual(code, 0)
+        self.assertIn(lines["reason"], text)
+        self.assertNotIn("full matrix", text)
+
+    def test_a_base_without_gate_py_is_the_bootstrap_and_runs_the_pr_tree_gate(self):
+        rc, lines, summary, res = self.gate_materialise(self.base)
+        self.assertEqual(lines.get("ok"), "false", summary)
+        self.assertEqual(lines.get("bootstrap"), "true", summary)
+        self.assertEqual(self.plan(lines), [BOOTSTRAP_STEP])
+        self.assertIn("bootstrap", summary)
+        self.assertNotIn("full matrix", summary)
+        run = step_named(GATE_JOB, BOOTSTRAP_STEP)["run"]
+        self.assertIn(GATE_SCRIPT, run)
+        self.assertNotIn(BASE_DIR, run)
+
+    def test_a_base_with_other_files_but_no_gate_py_is_still_the_bootstrap(self):
+        base = self.commit_selector(skip=("gate.py",))
+        rc, lines, summary, res = self.gate_materialise(base)
+        self.assertEqual(lines.get("bootstrap"), "true", summary)
+        self.assertEqual(self.plan(lines), [BOOTSTRAP_STEP])
+
+    def test_a_readable_base_runs_only_the_base_gate(self):
+        base = self.commit_selector()
+        rc, lines, summary, res = self.gate_materialise(base)
+        self.assertEqual(lines.get("ok"), "true", summary)
+        self.assertEqual(self.plan(lines), [BASE_GATE_STEP])
+
+    def test_a_failing_git_show_of_a_present_gate_py_fails_the_gate(self):
+        base = self.commit_selector()
+        rc, lines, summary, res = self.gate_materialise(base, self.failing_git("show"))
+        self.assert_fails_closed(lines, summary)
+
+    def test_a_failing_ls_tree_fails_the_gate(self):
+        base = self.commit_selector()
+        rc, lines, summary, res = self.gate_materialise(base, self.failing_git("ls-tree"))
+        self.assert_fails_closed(lines, summary)
+
+    def test_a_missing_non_gate_file_with_gate_py_present_fails_the_gate(self):
+        base = self.commit_selector(skip=("rules.json",))
+        rc, lines, summary, res = self.gate_materialise(base)
+        self.assert_fails_closed(lines, summary)
+
+    def test_an_unfetchable_base_sha_fails_the_gate(self):
+        self.commit_selector()
+        rc, lines, summary, res = self.gate_materialise(FAKE_SHA)
+        self.assert_fails_closed(lines, summary)
+
+    def test_an_invalid_base_sha_fails_the_gate(self):
+        self.commit_selector()
+        for bad in ("", "--upload-pack=x", "main", FAKE_SHA.upper()):
+            with self.subTest(sha=bad):
+                rc, lines, summary, res = self.gate_materialise(bad)
+                self.assert_fails_closed(lines, summary)
+                self.assertEqual(lines["reason"], "base-sha-invalid")
+
+    def test_the_pr_tree_gate_step_runs_only_on_the_bootstrap_output(self):
+        step = step_named(GATE_JOB, BOOTSTRAP_STEP)
+        self.assertIn("steps.base.outputs.bootstrap == 'true'", step["if"])
+        self.assertTrue(step["if"].startswith("${{ !cancelled() &&"))
+
+
+class BaseSelectorIgnoresPrHelpers(BaseCase):
+    """S9: a base selector must not import helpers from the PR tree it is judging."""
+
+    MARKER = "PR_TREE_HELPER_IMPORTED"
+
+    def argv_of(self, step_name, env):
+        """Return the step's command exactly as ci.yml writes it, variables expanded."""
+        run = step_named(SELECT_JOB, step_name)["run"].replace("\\\n", " ")
+        words = shlex.split(re.sub(r"\$(\w+)", lambda m: env[m.group(1)], run))
+        self.assertEqual(words[0], "python3")
+        words[0] = sys.executable
+        return words
+
+    def test_the_base_selector_never_imports_a_pr_tree_helper(self):
+        base = self.commit_selector()
+        sentinel = ((fx.IMPACT_DIR / "common.py").read_text()
+                    + "\nopen(%r, 'w').write('imported')\n" % self.MARKER)
+        head = fx.commit_change(self.repo, {"%s/common.py" % IMPACT_REL: sentinel,
+                                            "crates/core/src/lib.rs": "// changed\n"})
+        rc, lines, summary, res = self.materialise(base)
+        self.assertEqual(lines.get("ok"), "true", summary)
+        marker = self.repo / self.MARKER
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.tmp)}
+        pr_run = subprocess.run(
+            [sys.executable, "-I", str(self.repo / IMPACT_REL / "select.py"),
+             "--db", str(self.tmp / "none.db"), "--repo", ".", "--base", base, "--head", head],
+            cwd=str(self.repo), env=env, capture_output=True, text=True, timeout=120)
+        self.assertTrue(marker.exists(), "control: the PR-tree helper was not imported\n"
+                        + pr_run.stderr)
+        marker.unlink()
+        out = self.tmp / "selected.txt"
+        out.write_text("")
+        metadata = self.tmp / "metadata.json"
+        metadata.write_text(json.dumps(fx.make_metadata(self.repo)))
+        step_env = {"RUNNER_TEMP": str(self.tmp / "runner-temp"), "BASE_SHA": base,
+                    "HEAD_SHA": head, "EVENT": "pull_request", "BASE_REF": "main",
+                    "ENFORCE": ENFORCE, "GITHUB_OUTPUT": str(out)}
+        build = self.argv_of("Build impact index", step_env) + ["--metadata-file", str(metadata)]
+        select = self.argv_of("Select jobs", step_env)
+        for argv in (build, select):
+            done = subprocess.run(argv, cwd=str(self.repo), env=env, capture_output=True,
+                                  text=True, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(marker.exists(), "the base selector imported a PR-tree helper")
+        selected = dict(item.split("=", 1) for item in out.read_text().split("\n") if "=" in item)
+        self.assertEqual(selected["all"], "true")
 
 
 class BaseSelectorBeatsPrSelector(BaseCase):
@@ -227,8 +443,8 @@ class FailClosed(BaseCase):
         rc, lines, summary, res = self.materialise(base, files, source)
         self.assertEqual(rc, 0, res.stderr)
         self.assertEqual(lines.get("ok"), "false", summary)
-        self.assertIn("impact: base selector unavailable", summary)
-        self.assertIn("selecting the full matrix", summary)
+        self.assertIn("impact: base files unavailable", summary)
+        self.assertNotIn("full matrix", summary)
         self.assertFalse(self.dest.exists(), "partial base copy left behind")
         return summary
 
@@ -336,7 +552,8 @@ class FallbackStep(unittest.TestCase):
         self.assertEqual(rc, 0, res.stderr)
         self.assertEqual(step["id"], "fallback")
         self.assertEqual(lines["all"], "true")
-        outputs = workflow_text.read_jobs(CI_YML)[SELECT_JOB]["outputs"]
+        self.assertIn("selecting the full matrix", summary)
+        outputs =workflow_text.read_jobs(CI_YML)[SELECT_JOB]["outputs"]
         domains = set(outputs) - DECLARED_NON_DOMAIN_OUTPUTS
         self.assertEqual(domains, {"rust", "cells", "actionlint"})
         for domain in domains:

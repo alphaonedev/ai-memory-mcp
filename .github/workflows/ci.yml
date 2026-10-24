@@ -208,7 +208,7 @@ jobs:
       - name: Materialise the base selector (#8240)
         id: base
         env:
-          BASE_SHA: ${ github.event.pull_request.base.sha || github.sha }
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
           IMPACT_FILES: __init__.py common.py select.py build_index.py gate.py rules.json
         run: |
           python3 -I - <<'PY'
@@ -244,15 +244,29 @@ jobs:
           def fetch_blob(base, name):
               path = IMPACT_PREFIX + name
               tree = git("ls-tree", base, "--", path)
+              if tree.returncode != 0:
+                  raise BaseUnavailable("base-read-failed:" + name)
               fields = tree.stdout.decode("utf-8", "replace").split()
-              if tree.returncode != 0 or len(fields) < 4:
+              if len(fields) < 4:
                   raise BaseUnavailable("base-file-missing:" + name)
               if fields[1] != "blob" or fields[0] not in REGULAR_MODES:
                   raise BaseUnavailable("base-file-not-regular:" + name)
               blob = git("show", "%s:%s" % (base, path))
               if blob.returncode != 0 or not blob.stdout:
-                  raise BaseUnavailable("base-file-missing:" + name)
+                  raise BaseUnavailable("base-read-failed:" + name)
               return blob.stdout
+
+
+          def gate_absent(base):
+              # Bootstrap is exactly: the base tree lists no gate.py. A failed
+              # read (bad sha, missing commit, git error) is never bootstrap.
+              try:
+                  if not SHA_RE.match(base) or not have_commit(base):
+                      return False
+                  tree = git("ls-tree", base, "--", IMPACT_PREFIX + "gate.py")
+              except BaseUnavailable:
+                  return False
+              return tree.returncode == 0 and not tree.stdout.strip()
 
 
           def materialise(base, dest, names):
@@ -280,14 +294,17 @@ jobs:
                   raise
 
 
-          def report(ok, reason):
+          def report(ok, reason, bootstrap=False):
               with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
                   handle.write("ok=%s\n" % ("true" if ok else "false"))
+                  handle.write("bootstrap=%s\n" % ("true" if bootstrap else "false"))
+                  handle.write("reason=%s\n" % reason)
               if ok:
                   print("impact: selector files loaded from the base sha")
                   return
-              line = ("impact: base selector unavailable (%s); selecting the full matrix"
-                      % reason)
+              line = "impact: base files unavailable (%s)" % reason
+              if bootstrap:
+                  line += "; bootstrap: the base sha has no scripts/ci/impact/gate.py"
               print(line)
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary:
@@ -303,7 +320,7 @@ jobs:
                       raise BaseUnavailable("no-files-listed")
                   materialise(os.environ.get("BASE_SHA", ""), dest, names)
               except BaseUnavailable as exc:
-                  report(False, str(exc))
+                  report(False, str(exc), gate_absent(os.environ.get("BASE_SHA", "")))
                   return 0
               except (OSError, KeyError):
                   report(False, "environment-unusable")
@@ -350,6 +367,11 @@ jobs:
                    "actionlint=true")
           with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
               handle.write("\n".join(LINES) + "\n")
+          NOTICE = "impact: selecting the full matrix (fail closed)"
+          print(NOTICE)
+          if os.environ.get("GITHUB_STEP_SUMMARY"):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+                  handle.write(NOTICE + "\n")
           PY
 
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
@@ -2664,9 +2686,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # decision: base-sha selector over PR-tree selector because a PR must not
-      # judge itself. gate.py and rules.json come from the base sha. Bootstrap
-      # (the base has no gate.py yet, this very PR adds it) or a read failure
-      # runs the PR tree's gate and says so in the step summary.
+      # judge itself. gate.py and rules.json come from the base sha. Only the
+      # bootstrap (the base tree has no scripts/ci/impact/gate.py, this very
+      # PR adds it) runs the PR tree's gate, and says so in the step summary.
+      # decision: fail the gate on a non-bootstrap base read failure over
+      # falling back to the PR tree because a fallback the PR can trigger is
+      # self-judging; the select job already fails safe to the full matrix,
+      # the gate must fail closed. Any other failure to read a base file
+      # (fetch failure, timeout, invalid sha) fails this job.
       - name: Materialise the base gate (#8240)
         id: base
         env:
@@ -2706,15 +2733,29 @@ jobs:
           def fetch_blob(base, name):
               path = IMPACT_PREFIX + name
               tree = git("ls-tree", base, "--", path)
+              if tree.returncode != 0:
+                  raise BaseUnavailable("base-read-failed:" + name)
               fields = tree.stdout.decode("utf-8", "replace").split()
-              if tree.returncode != 0 or len(fields) < 4:
+              if len(fields) < 4:
                   raise BaseUnavailable("base-file-missing:" + name)
               if fields[1] != "blob" or fields[0] not in REGULAR_MODES:
                   raise BaseUnavailable("base-file-not-regular:" + name)
               blob = git("show", "%s:%s" % (base, path))
               if blob.returncode != 0 or not blob.stdout:
-                  raise BaseUnavailable("base-file-missing:" + name)
+                  raise BaseUnavailable("base-read-failed:" + name)
               return blob.stdout
+
+
+          def gate_absent(base):
+              # Bootstrap is exactly: the base tree lists no gate.py. A failed
+              # read (bad sha, missing commit, git error) is never bootstrap.
+              try:
+                  if not SHA_RE.match(base) or not have_commit(base):
+                      return False
+                  tree = git("ls-tree", base, "--", IMPACT_PREFIX + "gate.py")
+              except BaseUnavailable:
+                  return False
+              return tree.returncode == 0 and not tree.stdout.strip()
 
 
           def materialise(base, dest, names):
@@ -2742,14 +2783,17 @@ jobs:
                   raise
 
 
-          def report(ok, reason):
+          def report(ok, reason, bootstrap=False):
               with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
                   handle.write("ok=%s\n" % ("true" if ok else "false"))
+                  handle.write("bootstrap=%s\n" % ("true" if bootstrap else "false"))
+                  handle.write("reason=%s\n" % reason)
               if ok:
                   print("impact: selector files loaded from the base sha")
                   return
-              line = ("impact: base selector unavailable (%s); selecting the full matrix"
-                      % reason)
+              line = "impact: base files unavailable (%s)" % reason
+              if bootstrap:
+                  line += "; bootstrap: the base sha has no scripts/ci/impact/gate.py"
               print(line)
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary:
@@ -2765,7 +2809,7 @@ jobs:
                       raise BaseUnavailable("no-files-listed")
                   materialise(os.environ.get("BASE_SHA", ""), dest, names)
               except BaseUnavailable as exc:
-                  report(False, str(exc))
+                  report(False, str(exc), gate_absent(os.environ.get("BASE_SHA", "")))
                   return 0
               except (OSError, KeyError):
                   report(False, "environment-unusable")
@@ -2788,10 +2832,18 @@ jobs:
           python3 -I "$RUNNER_TEMP/impact-base/impact/gate.py" --needs "$NEEDS_JSON" \
             --github-ref "$GITHUB_REF_NAME_FULL"
       - name: Fold job results (bootstrap, PR-tree gate)
-        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' }}
+        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap == 'true' }}
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           GITHUB_REF_NAME_FULL: ${{ github.ref }}
         run: |
+          echo "ci-gate: bootstrap, the base sha has no scripts/ci/impact/gate.py; the PR-tree gate runs once" >> "$GITHUB_STEP_SUMMARY"
           python3 -I scripts/ci/impact/gate.py --needs "$NEEDS_JSON" \
             --github-ref "$GITHUB_REF_NAME_FULL"
+      - name: Fail the gate (base gate unreadable)
+        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap != 'true' }}
+        env:
+          IMPACT_REASON: ${{ steps.base.outputs.reason }}
+        run: |
+          echo "ci-gate: FAIL, the base gate could not be read (${IMPACT_REASON}); the PR-tree gate is never run" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1
