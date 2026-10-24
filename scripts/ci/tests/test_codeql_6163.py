@@ -399,10 +399,14 @@ class ComparisonTests(unittest.TestCase):
             self.assertNotIn(CANARY, output)
 
 
+LINUX_RLIM_INFINITY = -1
+DARWIN_RLIM_INFINITY = 2**63 - 1
+
+
 class GitLimitsTests(unittest.TestCase):
     """#8146 / #8213: a refused rlimit is tolerated only while a finite stricter bound is already in force."""
 
-    def run_git_limits(self, refused, error=ValueError, current=None, platform='linux'):
+    def run_git_limits(self, refused, error=ValueError, current=None, platform='linux', infinity=LINUX_RLIM_INFINITY):
         """Refuse one resource; `current(compare)` is the soft limit getrlimit then reports for it."""
         compare = module('compare_8146', 'scripts/claude-md-rule-compare.py')
         calls = []
@@ -413,10 +417,11 @@ class GitLimitsTests(unittest.TestCase):
                 raise error('current limit exceeds maximum limit')
 
         def fake_getrlimit(which):
-            soft = current(compare) if current is not None else compare.resource.RLIM_INFINITY
-            return (soft, compare.resource.RLIM_INFINITY)
+            soft = current(compare) if current is not None else infinity
+            return (soft, infinity)
 
-        with unittest.mock.patch.object(compare.resource, 'setrlimit', fake_setrlimit), \
+        with unittest.mock.patch.object(compare.resource, 'RLIM_INFINITY', infinity), \
+                unittest.mock.patch.object(compare.resource, 'setrlimit', fake_setrlimit), \
                 unittest.mock.patch.object(compare.resource, 'getrlimit', fake_getrlimit), \
                 unittest.mock.patch.object(compare.sys, 'platform', platform):
             compare.git_limits()
@@ -433,26 +438,33 @@ class GitLimitsTests(unittest.TestCase):
             lambda c: c.resource.RLIMIT_FSIZE, OSError, current=lambda c: c.MAX_GIT_FILE_BYTES - 1))
 
     def test_refused_address_space_limit_with_equal_bound_is_tolerated(self):
+        """A refused address-space limit is tolerated when the finite limit in force equals the request."""
         self.assert_full_sequence(*self.run_git_limits(
             lambda c: c.resource.RLIMIT_AS, current=lambda c: c.MAX_GIT_MEMORY_BYTES))
 
     def test_refused_limit_with_unlimited_bound_in_force_fails_closed(self):
-        for resource_name, error in (('RLIMIT_FSIZE', OSError), ('RLIMIT_AS', ValueError)):
-            with self.subTest(resource=resource_name):
-                with self.assertRaises(RuntimeError) as caught:
-                    self.run_git_limits(lambda c, n=resource_name: getattr(c.resource, n), error)
-                self.assertIn(resource_name, str(caught.exception))
+        """An unlimited bound (Linux -1 or macOS 2**63-1) in force never excuses a refusal."""
+        for infinity in (LINUX_RLIM_INFINITY, DARWIN_RLIM_INFINITY):
+            for resource_name, error in (('RLIMIT_FSIZE', OSError), ('RLIMIT_AS', ValueError)):
+                with self.subTest(resource=resource_name, infinity=infinity):
+                    with self.assertRaises(RuntimeError) as caught:
+                        self.run_git_limits(lambda c, n=resource_name: getattr(c.resource, n), error,
+                                            infinity=infinity)
+                    self.assertIn(resource_name, str(caught.exception))
 
     def test_refused_limit_with_looser_finite_bound_in_force_fails_closed(self):
+        """A finite limit looser than the request in force still fails closed."""
         with self.assertRaises(RuntimeError):
             self.run_git_limits(lambda c: c.resource.RLIMIT_FSIZE, OSError,
                                 current=lambda c: c.MAX_GIT_FILE_BYTES + 1)
 
     def test_darwin_refused_memory_limit_is_tolerated_without_a_bound(self):
+        """On macOS a refused memory limit is tolerated with nothing in force and the sequence completes."""
         self.assert_full_sequence(*self.run_git_limits(
             lambda c: c.resource.RLIMIT_AS, platform='darwin'))
 
     def test_darwin_refused_file_limit_still_fails_closed(self):
+        """The macOS exemption covers only the memory limit; a refused file-size limit fails closed."""
         with self.assertRaises(RuntimeError):
             self.run_git_limits(lambda c: c.resource.RLIMIT_FSIZE, OSError, platform='darwin')
 
