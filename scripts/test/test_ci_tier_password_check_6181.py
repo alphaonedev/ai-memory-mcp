@@ -820,32 +820,112 @@ def job_pin_problems(workflow, text, pins=None):
 
 
 
+# Jobs outside the pinned tier jobs that legitimately run on a self-hosted label.  Each entry needs a reason: it does
+# not name the tier credential (checked on the loaded job), and it runs on the other fleet node's macOS runner.
+SELF_HOSTED_ALLOWED = {
+    ("session-boot-lifetime.yml", "lifetime-tests"): "matrix leg on the macOS fleet runner; no tier credential",
+}
+
+
 def primary_pin_problems(workflow, text, primary):
-    """RED stub: the r7 text pins are the only gate at this commit."""
-    return []
+    """Problems of one tier workflow against the canonical-JSON pins (r8).
+
+    The text is read by ``StrictLoader``; every tier job, every workflow-level key except ``jobs`` and the sorted job
+    names are compared with their SHA-256 pin.  A difference names the workflow, the job, the step index and
+    name, and the first differing key path (``steps[3].run``), never the changed value; every message is masked.
+    A non-tier job must run on a GitHub-hosted label, and no local action or reusable workflow may be called.
+    """
+    data, found = ty.parse_workflow(text)
+    problems = [f"{workflow}: {p}" for p in found]
+    if data is None or not isinstance(data.get("jobs"), dict):
+        return [ty.mask_userinfo(p) for p in problems]
+    entry = primary.get(workflow)
+    if entry is None:
+        return problems + [f"{workflow}: no primary pin exists for this workflow"]
+    jobs = data["jobs"]
+    names = sorted(jobs)
+    if ty.digest(names) != entry["job_names_sha256"]:
+        added = sorted(set(names) - set(entry["job_names"]))
+        gone = sorted(set(entry["job_names"]) - set(names))
+        problems.append(f"{workflow}: the set of jobs changed (added {added}, missing {gone})")
+    tier = ty.tier_job_names(data)
+    for name in tier:
+        if name not in entry["tier_jobs"]:
+            problems.append(f"{workflow} job {name}: names the tier credential but is not pinned")
+    for name, pinned in entry["tier_jobs"].items():
+        if name not in tier:
+            problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
+        elif ty.digest(jobs[name]) != pinned["sha256"]:
+            index, path = ty.first_difference(pinned, jobs[name])
+            steps = jobs[name].get("steps") if isinstance(jobs[name].get("steps"), list) else []
+            if index is None:
+                where = "job-level keys"
+            elif index < len(steps):
+                where = f"step {index} ({ty.step_label(steps[index], index)})"
+            else:
+                where = f"step {index} (removed)"
+            problems.append(f"{workflow} job {name} {where}: differs from the pin at {path}")
+    pinned_keys = entry["workflow_keys"]
+    level = {key: ty.digest(value) for key, value in data.items() if key != "jobs"}
+    for key in sorted(set(level) | set(pinned_keys)):
+        if key not in level:
+            problems.append(f"{workflow}: the pinned workflow-level key {key} is missing")
+        elif key not in pinned_keys:
+            problems.append(f"{workflow}: a workflow-level key {key} was added and is not pinned")
+        elif level[key] != pinned_keys[key]:
+            problems.append(f"{workflow}: the workflow-level key {key} differs from the pin")
+    for name, job in jobs.items():
+        if name not in entry["tier_jobs"] and EXPORT_CALL.search(ty.normalised_leaves(job)):
+            problems.append(f"{workflow} job {name}: the tier export call sits outside a pinned job")
+    if not any(EXPORT_CALL.search(ty.normalised_leaves(jobs[name])) for name in entry["tier_jobs"] if name in jobs):
+        problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
+    problems += ty.non_tier_runner_problems(workflow, data, set(tier))
+    for job, where, value in ty.uses_references(data):
+        if where == "job" or value.startswith("./"):
+            problems.append(f"{workflow} job {job} {where}: a local action or reusable workflow call is not allowed here")
+    return [ty.mask_userinfo(p) for p in problems]
 
 
 def tier_pin_problems(workflow, text, pins=None):
-    """RED stub: the r7 text pin alone."""
+    """Primary (loader, canonical JSON) problems first, then the secondary whole-job text pin of r7."""
     pins = load_job_pins() if pins is None else pins
-    return job_pin_problems(workflow, text, pins[SECONDARY])
+    return primary_pin_problems(workflow, text, pins[PRIMARY]) + [
+        ty.mask_userinfo(p) for p in job_pin_problems(workflow, text, pins[SECONDARY])]
 
 
 def repo_problems(root=None, pins=None):
-    """RED stub: the r7 discovery (raw markers) and the r7 pins."""
+    """Every problem of a repository root: the three pinned workflows, discovery, runners and local actions."""
     root = ROOT if root is None else Path(root)
     pins = load_job_pins() if pins is None else pins
     found = []
     directory = root / ".github" / "workflows"
-    covered = {*PIN_WORKFLOWS, *LOCAL_ONLY}
     for path in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):
-        text = path.read_text(encoding="utf-8")
-        if path.name in PIN_WORKFLOWS:
-            found += tier_pin_problems(path.name, text, pins)
-        elif TIER_MARKERS.search(text) and path.name not in covered:
-            found.append(f"{path.name}: names the tier secret but no pin covers it")
-    return found
-
+        raw = path.read_text(encoding="utf-8")
+        name = path.name
+        if name in PIN_WORKFLOWS:
+            found += tier_pin_problems(name, raw, pins)
+            continue
+        if names_the_tier(raw) and name not in LOCAL_ONLY:
+            found.append(f"{name}: names the tier secret but no pin covers it")
+        try:
+            data = ty.load_lenient(raw)
+        except ty.yaml.YAMLError:
+            continue
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        for job_name, job in (jobs.items() if isinstance(jobs, dict) else []):
+            if not isinstance(job, dict) or (name, job_name) in SELF_HOSTED_ALLOWED:
+                continue
+            if "uses" in job and "runs-on" not in job:
+                continue
+            labels = ty.runs_on_labels(job)
+            if labels is None or any(not ty.HOSTED_LABEL.match(label) for label in labels):
+                found.append(f"{name} job {job_name}: runs on a label that is not GitHub-hosted; only a pinned "
+                             "tier job may")
+    actions = root / ".github" / "actions"
+    for path in sorted([*actions.rglob("action.yml"), *actions.rglob("action.yaml")]) if actions.is_dir() else []:
+        if names_the_tier(path.read_text(encoding="utf-8")):
+            found.append(f"{path.relative_to(root)}: a local action names the tier secret")
+    return [ty.mask_userinfo(p) for p in found]
 
 def joined_lines(lines):
     """Stripped lines with each backslash continuation joined, as the shell joins it (``prin\\`` + ``tenv``)."""
