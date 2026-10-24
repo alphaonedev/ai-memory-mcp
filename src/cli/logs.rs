@@ -545,7 +545,7 @@ fn same_file(_a: &fs::File, _b: &fs::File) -> bool {
     false
 }
 
-/// (device, inode) of the open handle; `None` where the platform exposes none.
+/// (device, inode, birth time) of the open handle; `None` where the platform exposes none.
 #[cfg(unix)]
 fn file_identity(file: &fs::File) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt as _;
@@ -564,7 +564,9 @@ fn file_identity(_file: &fs::File) -> Option<FileIdentity> {
 /// Identity of a followed log: device, inode and birth time. A filesystem
 /// hands a deleted file's inode to the next file created, so the pair alone
 /// cannot tell an old log from a new one; the birth time can. `born` is `None`
-/// where the platform or filesystem reports none (#8220).
+/// where the platform or filesystem reports none (#8220). Birth times differ
+/// at clock-tick resolution, so two files created within one tick can share
+/// one; the inode breaks ties between files alive at the same time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
 struct FileIdentity {
@@ -577,15 +579,21 @@ struct FileIdentity {
 /// time the whole identity must match. Without one a reused inode cannot be
 /// told from the old file, so the set applies only when `is_symlink` says the
 /// candidate is an alias; a plain file is never skipped on (device, inode)
-/// alone (#8220).
-fn seen_contains(seen: &VecDeque<FileIdentity>, id: &FileIdentity, is_symlink: bool) -> bool {
+/// alone (#8220). `is_symlink` is lazy: it runs only on the no-birth-time
+/// path, so a filesystem that reports birth times pays no extra syscall.
+fn seen_contains(
+    seen: &VecDeque<FileIdentity>,
+    id: &FileIdentity,
+    is_symlink: impl FnOnce() -> bool,
+) -> bool {
     if id.born.is_some() {
         return seen.contains(id);
     }
-    is_symlink && seen.iter().any(|s| s.dev == id.dev && s.ino == id.ino)
+    is_symlink() && seen.iter().any(|s| s.dev == id.dev && s.ino == id.ino)
 }
 
-/// True when `path` itself (not its target) is a symlink.
+/// True when `path` itself (not its target) is a symlink. A missing or
+/// unreadable path is not a symlink (false).
 fn candidate_is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
@@ -829,7 +837,7 @@ fn follow_poll(
                 Ok(file)
                     if same_file(&state.file, &file)
                         || file_identity(&file).is_some_and(|id| {
-                            seen_contains(&state.seen, &id, candidate_is_symlink(&candidate))
+                            seen_contains(&state.seen, &id, || candidate_is_symlink(&candidate))
                         }) => {}
                 Ok(file) => {
                     adopted = Some((candidate, file));
@@ -2043,6 +2051,43 @@ mod tests {
         assert_eq!(s3, "b-2\n");
     }
 
+    /// Upper bound on waiting for the birth-time clock to tick.
+    const BIRTH_TICK_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Wait until a fresh scratch file's birth time differs from `old`, so the
+    /// next log cannot share the deleted log's birth time on a coarse clock.
+    /// Skipped when `created()` is unavailable or `old` is `None`.
+    fn wait_for_birth_tick(dir: &Path, old: Option<std::time::SystemTime>) {
+        let Some(old) = old else { return };
+        let deadline = std::time::Instant::now() + BIRTH_TICK_WAIT_MAX;
+        let probe = dir.join("birth-tick-probe");
+        while std::time::Instant::now() < deadline {
+            let born = fs::write(&probe, b"").and_then(|()| fs::metadata(&probe)?.created());
+            let _ = fs::remove_file(&probe);
+            match born {
+                Ok(t) if t != old => return,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// #8220 r15 - the symlink probe tells a link from a file and a missing path.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_candidate_is_symlink_distinguishes_link_file_and_missing_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = make_log(dir.path(), "ai-memory.log.2026-10-23", "a\n");
+        let link = dir.path().join("ai-memory.log.latest");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(candidate_is_symlink(&link), "symlink");
+        assert!(!candidate_is_symlink(&file), "regular file");
+        assert!(
+            !candidate_is_symlink(&dir.path().join("missing")),
+            "missing"
+        );
+    }
+
     /// #8220 r14 - a new log that inherited a deleted log's inode is a new
     /// file, not an alias: follow a, rotate to b, delete a, create c. On a
     /// filesystem that reuses the inode (ext4) c matches a's (device, inode);
@@ -2057,7 +2102,12 @@ mod tests {
         let (s1, _) = poll_once(dir.path(), &mut state);
         assert_eq!(s1, "b-1\n", "rotated to b: {s1:?}");
         assert_eq!(state.path, b);
+        let a_born = fs::metadata(&a).and_then(|m| m.created()).ok();
+        // Created before `a` is deleted, in its own directory, so the probe
+        // files never take the freed inode.
+        let scratch = tempfile::tempdir().unwrap();
         fs::remove_file(&a).unwrap();
+        wait_for_birth_tick(scratch.path(), a_born);
         let c = make_log(dir.path(), "ai-memory.log.2026-10-25", "c-1\nc-2\n");
         let (s2, e2) = poll_once(dir.path(), &mut state);
         assert_eq!(s2, "c-1\nc-2\n", "c printed: {s2:?} {e2:?}");
@@ -2116,16 +2166,16 @@ mod tests {
         };
         assert_ne!(old, reused, "same inode, different birth");
         let seen: VecDeque<FileIdentity> = VecDeque::from([old]);
-        assert!(seen_contains(&seen, &old, false));
-        assert!(!seen_contains(&seen, &reused, false));
-        assert!(!seen_contains(&seen, &reused, true));
+        assert!(seen_contains(&seen, &old, || false));
+        assert!(!seen_contains(&seen, &reused, || false));
+        assert!(!seen_contains(&seen, &reused, || true));
         let unknown = FileIdentity {
             dev: 1,
             ino: 7,
             born: None,
         };
-        assert!(!seen_contains(&seen, &unknown, false), "plain file kept");
-        assert!(seen_contains(&seen, &unknown, true), "symlink skipped");
+        assert!(!seen_contains(&seen, &unknown, || false), "plain file kept");
+        assert!(seen_contains(&seen, &unknown, || true), "symlink skipped");
     }
 
     /// #8220 - after the follower switches past a failing newer entry, the
