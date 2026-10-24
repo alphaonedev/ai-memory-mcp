@@ -121,13 +121,26 @@ def git_environment() -> dict:
             "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1"}
 
 
+def limit_already_bounded(which: int, limit: int) -> bool:
+    """True when the limit in force for `which` is finite and no looser than `limit`."""
+    soft = resource.getrlimit(which)[0]
+    return soft != resource.RLIM_INFINITY and soft <= limit
+
+
 def git_limits() -> None:
-    """Bound child address space and each pack/output file; used only in this single-threaded CLI."""
-    for which, limit in ((resource.RLIMIT_FSIZE, MAX_GIT_FILE_BYTES), (resource.RLIMIT_AS, MAX_GIT_MEMORY_BYTES)):
+    """Bound child address space and each pack/output file; used only in this single-threaded CLI.
+
+    A refused limit is tolerated only when a finite bound at least as strict is already in force, or for the
+    address-space limit on macOS, which the kernel refuses; any other refusal fails closed (#8213)."""
+    for name, which, limit in (("RLIMIT_FSIZE", resource.RLIMIT_FSIZE, MAX_GIT_FILE_BYTES),
+                               ("RLIMIT_AS", resource.RLIMIT_AS, MAX_GIT_MEMORY_BYTES)):
         try:
             resource.setrlimit(which, (limit, limit))
-        except (ValueError, OSError):
-            continue  # the kernel refuses this bound (macOS RLIMIT_AS); the others still apply
+        except (ValueError, OSError) as refusal:
+            macos_memory = sys.platform == "darwin" and which == resource.RLIMIT_AS
+            if macos_memory or limit_already_bounded(which, limit):
+                continue
+            raise RuntimeError(f"cannot bound the git child {name}") from refusal
 
 
 def git(repo: Path, *args: str, network: bool = False) -> bytes:
