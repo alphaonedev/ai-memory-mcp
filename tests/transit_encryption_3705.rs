@@ -892,7 +892,7 @@ fn listen_signal_switches_to_the_short_budget_7341() {
     let started = Instant::now();
     let why = try_wait_healthy(&mut spawned, || false, &budget)
         .expect_err("a listener that never answers must fail");
-    assert!(why.contains("listening"), "{why}");
+    assert!(why.contains("after logging its TLS listener"), "{why}");
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "post-listen budget ignored: {:?}",
