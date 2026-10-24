@@ -110,7 +110,7 @@ jobs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with: { fetch-depth: 2 }
+        with: { persist-credentials: false, fetch-depth: 2 }
       - id: cls
         shell: bash
         run: |
@@ -240,6 +240,8 @@ jobs:
       CARGO_PROFILE_DEV_LTO: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Free disk + add swap (#1148 belt-and-suspenders, aggressive)
         run: |

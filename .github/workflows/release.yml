@@ -89,6 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           # The workflow's own commit, NOT the tag: this checkout supplies
           # the trusted tooling. Full history so the tag object and the
           # ancestry check below are available.
@@ -198,6 +199,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ github.sha }}
 
       - name: Qualify the tagged SHA
@@ -229,6 +231,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
@@ -304,6 +307,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + target std
@@ -546,6 +550,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0
@@ -663,6 +668,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + iOS targets
@@ -807,6 +813,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + Android targets
@@ -957,6 +964,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
@@ -1169,6 +1177,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Set up Docker Buildx
@@ -1233,6 +1242,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Extract version from tag
