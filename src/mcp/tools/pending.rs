@@ -160,6 +160,31 @@ pub fn handle_subscription_dlq_list(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    handle_subscription_dlq_list_for(conn, params, &caller, &crate::identity::admin_agent_ids())
+        .map_err(String::from)
+}
+
+/// Caller-facing failure text of [`handle_subscription_dlq_list_for`]; the
+/// message is already the redacted MCP error text.
+#[derive(Debug)]
+pub struct DlqListError(String);
+
+impl From<DlqListError> for String {
+    fn from(e: DlqListError) -> Self {
+        e.0
+    }
+}
+
+/// [`handle_subscription_dlq_list`] for an already-resolved `caller` and an
+/// explicit operator allowlist. The HTTP surface passes its header-bound
+/// caller and `AppState.admin_agent_ids` (#7501).
+pub fn handle_subscription_dlq_list_for(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: &str,
+    admin_ids: &[String],
+) -> Result<Value, DlqListError> {
     let subscription_id = params[param_names::SUBSCRIPTION_ID].as_str();
     let limit = params["limit"]
         .as_u64()
@@ -185,14 +210,23 @@ pub fn handle_subscription_dlq_list(
     //     to only those whose subscription owner == caller. This
     //     preserves the per-tenant operator inventory use-case while
     //     refusing to leak cross-tenant payloads.
-    let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-
     let rows_all = crate::subscriptions::list_dlq(conn, subscription_id)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_agent_id", e))?;
-    let rows: Vec<_> = if let Some(sid) = subscription_id {
+        .map_err(|e| DlqListError(crate::mcp::error_text::mcp_foreign_err("list_dlq", e)))?;
+    let rows: Vec<_> = if subscription_id
+        .is_some_and(crate::subscriptions::scan_failure::is_scan_failure_sub_id)
+    {
+        // v1.0.0 #7366: failed-lookup records belong to no subscription, so
+        // the owner gate cannot apply; they are attributed to the writer.
+        rows_all
+            .into_iter()
+            .filter(|r| {
+                crate::subscriptions::scan_failure::scan_failure_visible(r, caller, admin_ids)
+            })
+            .collect()
+    } else if let Some(sid) = subscription_id {
         let owner = crate::subscriptions::get_owner(conn, sid)
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_dlq", e))?;
-        if owner.as_deref() != Some(caller.as_str()) {
+            .map_err(|e| DlqListError(crate::mcp::error_text::mcp_foreign_err("get_owner", e)))?;
+        if owner.as_deref() != Some(caller) {
             // Identical wire shape to "no DLQ entries since the
             // subscription rolled over". Cannot distinguish from
             // not-found.
@@ -214,17 +248,23 @@ pub fn handle_subscription_dlq_list(
             std::collections::HashMap::new();
         let mut out = Vec::with_capacity(rows_all.len());
         for row in rows_all {
+            if crate::subscriptions::scan_failure::scan_failure_visible(&row, caller, admin_ids) {
+                // v1.0.0 #7366: a failed-lookup record, shown to its writer.
+                out.push(row);
+                continue;
+            }
             let sid = row.subscription_id.clone();
             let owner = match owners.get(&sid) {
                 Some(o) => o.clone(),
                 None => {
-                    let o = crate::subscriptions::get_owner(conn, &sid)
-                        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get_owner", e))?;
+                    let o = crate::subscriptions::get_owner(conn, &sid).map_err(|e| {
+                        DlqListError(crate::mcp::error_text::mcp_foreign_err("get_owner", e))
+                    })?;
                     owners.insert(sid.clone(), o.clone());
                     o
                 }
             };
-            if owner.as_deref() == Some(caller.as_str()) {
+            if owner.as_deref() == Some(caller) {
                 out.push(row);
             }
         }
