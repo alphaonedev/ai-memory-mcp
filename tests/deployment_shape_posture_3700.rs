@@ -53,21 +53,16 @@ const BOOT_DEADLINE: Duration = Duration::from_secs(45);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// A per-binary TLS leaf minted by the shared helper (SANs `localhost`,
-/// `127.0.0.1`, `::1`); the daemon serves it and the probe client pins it as
-/// its only root, so certificate verification stays ON (#8179).
-fn leaf() -> &'static common::tls::TestTls {
-    static LEAF: std::sync::OnceLock<common::tls::TestTls> = std::sync::OnceLock::new();
-    LEAF.get_or_init(|| {
-        let dir = tempfile::tempdir().expect("tls scratch dir").keep();
-        common::tls::TestTls::generate(&dir)
-    })
-}
+/// Subdirectory of the per-test root that holds the TLS leaf (cert and 0600
+/// key); it is removed with the root when the test's `TempDir` drops (#8179).
+const TLS_SUBDIR: &str = "tls";
 
-/// The `--tls-cert` / `--tls-key` argv for every `serve` child so the tests
-/// stay valid once transit encryption becomes a floor (#3705).
-fn tls_args() -> Vec<String> {
-    leaf().serve_args()
+/// A TLS leaf minted by the shared helper (SANs `localhost`, `127.0.0.1`,
+/// `::1`) under the per-test `root`; the daemon serves it and the probe client
+/// pins it as its only root, so certificate verification stays ON (#8179). The
+/// key never leaves `root`, so dropping the test's `TempDir` deletes it.
+fn leaf(root: &Path) -> common::tls::TestTls {
+    common::tls::TestTls::generate(&root.join(TLS_SUBDIR))
 }
 
 /// A child with `config.toml` loading ENABLED (no `AI_MEMORY_NO_CONFIG`);
@@ -127,8 +122,8 @@ fn seed_store(root: &Path, agent_ids: &[&str]) {
 }
 
 /// `/api/v1/health` over the TLS listener (pinned fixture root: verification on).
-fn health_is_200(port: u16) -> bool {
-    let client = leaf().client_with_timeout(PROBE_TIMEOUT);
+fn health_is_200(port: u16, tls: &common::tls::TestTls) -> bool {
+    let client = tls.client_with_timeout(PROBE_TIMEOUT);
     client
         .get(format!("https://127.0.0.1:{port}/api/v1/health"))
         .send()
@@ -146,11 +141,12 @@ enum BootOutcome {
 
 /// Spawn `serve --port <free>` (loopback, TLS fixture) from `cmd` and drive
 /// it to an exit or a healthy `/health`, capturing stderr either way.
-fn boot_on_loopback(mut cmd: Command) -> BootOutcome {
+fn boot_on_loopback(mut cmd: Command, root: &Path) -> BootOutcome {
+    let tls = leaf(root);
     let port = free_port();
     let mut child: Child = cmd
         .args(["serve", "--port", &port.to_string()])
-        .args(tls_args())
+        .args(tls.serve_args())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -175,7 +171,7 @@ fn boot_on_loopback(mut cmd: Command) -> BootOutcome {
             let stderr = buf.lock().unwrap().clone();
             return BootOutcome::Exited { status, stderr };
         }
-        if health_is_200(port) {
+        if health_is_200(port, &tls) {
             // Let the boot-time record settle before the kill.
             std::thread::sleep(Duration::from_secs(1));
             let _ = child.kill();
@@ -197,9 +193,9 @@ fn boot_on_loopback(mut cmd: Command) -> BootOutcome {
 
 /// A keyless `--host 0.0.0.0` boot: refused at the bind guard when every
 /// earlier gate let it through. Returns stderr.
-fn boot_to_bind_guard(mut cmd: Command) -> Output {
+fn boot_to_bind_guard(mut cmd: Command, root: &Path) -> Output {
     cmd.args(["serve", "--host", "0.0.0.0"])
-        .args(tls_args())
+        .args(leaf(root).serve_args())
         .output()
         .expect("run serve")
 }
@@ -251,7 +247,7 @@ fn hardened_declared_shape_with_loosened_knobs_refuses_naming_every_knob_3700() 
     let mut cmd = command_with_config(root.path(), Some("[deployment]\nshape = \"federated\"\n"));
     cmd.env("AI_MEMORY_REQUIRE_WITNESS", "0")
         .env("AI_MEMORY_CID_ENFORCE", "0");
-    let out = boot_to_bind_guard(cmd);
+    let out = boot_to_bind_guard(cmd, root.path());
     let err = stderr(&out);
     assert!(!out.status.success(), "must refuse; stderr:\n{err}");
     assert!(err.contains("#3700"), "{err}");
@@ -286,7 +282,7 @@ fn undeclared_federation_signals_warn_and_never_repose_3700() {
     let root = tempfile::tempdir().unwrap();
     let mut cmd = command(root.path());
     cmd.env("AI_MEMORY_FED_PEER_ATTESTATION", EMPTY_ALLOWLIST);
-    let out = boot_to_bind_guard(cmd);
+    let out = boot_to_bind_guard(cmd, root.path());
     let err = stderr(&out);
     assert!(!out.status.success(), "{err}");
     assert!(err.contains(BIND_GUARD_MARKER), "{err}");
@@ -310,7 +306,7 @@ fn undeclared_federation_signals_warn_and_never_repose_3700() {
 #[test]
 fn singleton_without_signals_boots_quiet_and_doctor_reports_detector_3700() {
     let root = tempfile::tempdir().unwrap();
-    let out = boot_to_bind_guard(command(root.path()));
+    let out = boot_to_bind_guard(command(root.path()), root.path());
     let err = stderr(&out);
     assert!(!out.status.success(), "{err}");
     assert!(err.contains(BIND_GUARD_MARKER), "{err}");
@@ -346,7 +342,7 @@ fn singleton_without_signals_boots_quiet_and_doctor_reports_detector_3700() {
 fn registry_raised_floor_warns_but_boots_unchanged_3700() {
     let root = tempfile::tempdir().unwrap();
     seed_store(root.path(), &["ai:shape-alpha", "ai:shape-bravo"]);
-    let err = match boot_on_loopback(command(root.path())) {
+    let err = match boot_on_loopback(command(root.path()), root.path()) {
         BootOutcome::Healthy { stderr } => stderr,
         BootOutcome::Exited { status, stderr } => {
             panic!("a registry-raised floor must not refuse; exited {status}; stderr:\n{stderr}")
@@ -381,7 +377,7 @@ fn declared_federated_with_matching_signals_is_quiet_3700() {
     let root = tempfile::tempdir().unwrap();
     let mut cmd = command_with_config(root.path(), Some("[deployment]\nshape = \"federated\"\n"));
     cmd.env("AI_MEMORY_FED_PEER_ATTESTATION", EMPTY_ALLOWLIST);
-    let out = boot_to_bind_guard(cmd);
+    let out = boot_to_bind_guard(cmd, root.path());
     let err = stderr(&out);
     assert!(!out.status.success(), "{err}");
     assert!(
@@ -424,5 +420,26 @@ fn doctor_reports_unprotected_fleet_as_critical_3700() {
     assert!(
         det["note"].as_str().unwrap_or("").contains("#3700"),
         "{det}"
+    );
+}
+
+/// #8179: the key directory lives inside the test's `TempDir`; once the test
+/// body drops it, no key material is left behind (the old `tempdir().keep()`
+/// leaked one `0600` key directory per run).
+#[test]
+fn tls_leaf_is_removed_with_its_test_dir_8179() {
+    let root = tempfile::tempdir().unwrap();
+    let tls = leaf(root.path());
+    let key_path = tls.key_path.clone();
+    assert!(
+        key_path.starts_with(root.path()),
+        "key written outside the TempDir"
+    );
+    assert!(key_path.exists());
+    drop(root);
+    assert!(!key_path.exists(), "TLS key survived its TempDir");
+    assert!(
+        !key_path.parent().unwrap().exists(),
+        "TLS dir survived its TempDir"
     );
 }

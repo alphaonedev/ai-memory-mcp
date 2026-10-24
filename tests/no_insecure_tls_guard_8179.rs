@@ -5,17 +5,31 @@
 //!
 //! `CodeQL` flags `danger_accept_invalid_certs`, but `CodeQL` is not a required
 //! check, so a re-added bypass would otherwise survive every test. This guard
-//! walks `tests/` and `src/` and fails with every `file:line` that calls
-//! `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` outside
-//! a `//` or `//!` comment.
+//! scans every compiled `.rs` file (`src/`, `tests/`, `benches/`, `examples/`,
+//! `build.rs`, plus every `include!` / `#[path]` target resolved from them; a
+//! missing target is a failure) with comments (line and block) stripped, and
+//! fails with every `file:line` that
 //!
-//! Exactly ONE site is permitted: `src/cli/sync.rs`, the operator opt-in
-//! `--insecure-skip-server-verify`. It is pinned by file AND by enclosing match
-//! arm: the matching line must sit inside the `SyncTlsMode::AcceptAny` arm (one
-//! of the 8 preceding non-blank lines names it) and may occur only once in that
-//! file. A second occurrence anywhere, or that one moved out of the arm, fails.
-//! Tests use the pinned-root helper in `tests/common/tls.rs` instead.
+//! - calls `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames`;
+//! - calls a rustls `danger()` / `dangerous()` config builder or
+//!   `set_certificate_verifier`;
+//! - implements `ServerCertVerifier` with a `verify_server_cert` that returns
+//!   `Ok` unconditionally; or
+//! - names an accept-any verifier type (`DangerousAnyServerVerifier`,
+//!   `NoCertificateVerification`, and similar).
+//!
+//! The reqwest bypass has exactly ONE permitted site: `src/cli/sync.rs`, the
+//! operator opt-in `--insecure-skip-server-verify`. It is pinned by file AND by
+//! enclosing match arm: the matching code line must sit inside the
+//! `SyncTlsMode::AcceptAny` arm (one of the 8 preceding non-blank CODE lines
+//! opens it; comments are stripped first, so a comment naming the arm neither
+//! satisfies nor shifts the window) and may occur only once in that file.
+//!
+//! The rustls patterns are legitimate in a small explicit allow-list (file plus
+//! reason, [`RUSTLS_ALLOW`]); every row must name a file that exists, so a stale
+//! row fails the guard. Tests use the pinned-root helper in `tests/common/tls.rs`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const BYPASS_CALLS: [&str; 2] = [
@@ -26,9 +40,50 @@ const BYPASS_CALLS: [&str; 2] = [
 const PERMITTED_FILE: &str = "src/cli/sync.rs";
 /// The match arm that must enclose the permitted call.
 const PERMITTED_ARM: &str = "SyncTlsMode::AcceptAny";
-/// How many preceding non-blank lines may separate the arm from the call.
+/// How many preceding non-blank code lines may separate the arm from the call.
 const ARM_LOOKBACK_LINES: usize = 8;
-const SCANNED_DIRS: [&str; 2] = ["tests", "src"];
+/// Directories whose `.rs` files are compiled (recursively).
+const SCANNED_DIRS: [&str; 4] = ["src", "tests", "benches", "examples"];
+/// Single compiled files at the crate root.
+const SCANNED_FILES: [&str; 1] = ["build.rs"];
+/// This guard holds the patterns as fixtures, so it does not scan itself.
+const GUARD_FILE: &str = "tests/no_insecure_tls_guard_8179.rs";
+
+/// Method names that open a rustls dangerous-configuration builder.
+const DANGER_CALLS: [&str; 3] = ["danger", "dangerous", "set_certificate_verifier"];
+/// Identifier fragments that name an accept-any verifier type.
+const VERIFIER_TYPE_FRAGMENTS: [&str; 6] = [
+    "DangerousAny",
+    "NoCertificateVerification",
+    "NoServerVerifier",
+    "AnyServerVerifier",
+    "InsecureVerifier",
+    "SkipServerVerif",
+];
+/// Control-flow tokens whose presence means a verifier body can reject.
+const CONTROL_TOKENS: [&str; 8] = [
+    "Err", "?", "if ", "match ", "else", "while ", "for ", "loop",
+];
+
+/// One allow-list row: a file where the rustls patterns are legitimate.
+struct AllowRow {
+    file: &'static str,
+    reason: &'static str,
+}
+
+/// Files allowed to use the rustls verifier-override patterns.
+const RUSTLS_ALLOW: [AllowRow; 2] = [
+    AllowRow {
+        file: "src/tls.rs",
+        reason: "defines the fingerprint-pinning verifier builder and the accept-any \
+                 DangerousAnyServerVerifier (no production caller) with their unit tests",
+    },
+    AllowRow {
+        file: "tests/mtls_nodelay_acceptor.rs",
+        reason: "test-only acceptor clients that drive the TLS acceptor with the accept-any \
+                 verifier; no production path",
+    },
+];
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -45,20 +100,260 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn is_comment(line: &str) -> bool {
-    line.trim_start().starts_with("//")
+/// Copy a (possibly raw) string literal starting at `i`, returning the index
+/// after it.
+fn copy_string(c: &[char], mut i: usize, out: &mut String, blank: bool) -> usize {
+    let push = |out: &mut String, ch: char| {
+        if blank && ch != '\n' {
+            // same UTF-8 width, so byte offsets match the unblanked text
+            out.extend(std::iter::repeat_n(' ', ch.len_utf8()));
+        } else {
+            out.push(ch);
+        }
+    };
+    let mut hashes = 0;
+    let raw = c[i] == 'r';
+    if raw {
+        out.push('r');
+        i += 1;
+        while c.get(i) == Some(&'#') {
+            hashes += 1;
+            out.push('#');
+            i += 1;
+        }
+    }
+    // c[i] is the opening quote.
+    out.push('"');
+    i += 1;
+    while i < c.len() {
+        let ch = c[i];
+        i += 1;
+        if !raw && ch == '\\' {
+            push(out, ch);
+            if let Some(&esc) = c.get(i) {
+                push(out, esc);
+                i += 1;
+            }
+        } else if ch == '"' {
+            out.push(ch);
+            let closes = (0..hashes).all(|k| c.get(i + k) == Some(&'#'));
+            if closes {
+                for _ in 0..hashes {
+                    out.push('#');
+                }
+                return i + hashes;
+            }
+        } else {
+            push(out, ch);
+        }
+    }
+    i
+}
+
+/// Does a raw string literal (`r"`, `r#"`) start at `i`?
+fn raw_string_at(c: &[char], i: usize) -> bool {
+    if c[i] != 'r' {
+        return false;
+    }
+    if i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_') && c[i - 1] != 'b' {
+        return false;
+    }
+    let mut k = i + 1;
+    while c.get(k) == Some(&'#') {
+        k += 1;
+    }
+    c.get(k) == Some(&'"')
+}
+
+/// Replace every line comment (`//`, `///`, `//!`) and block comment (nested)
+/// with blanks, keeping newlines so line numbers survive. String and char
+/// literals are copied verbatim, so `"https://x"` is not a comment.
+fn strip_comments(src: &str) -> String {
+    lex(src, false)
+}
+
+/// Like [`strip_comments`] but with string-literal CONTENT blanked (delimiters
+/// and byte offsets kept), so a marker named inside a string is not code.
+fn mask_strings(src: &str) -> String {
+    lex(src, true)
+}
+
+fn lex(src: &str, blank: bool) -> String {
+    let c: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < c.len() {
+        let next = c.get(i + 1).copied();
+        match c[i] {
+            '/' if next == Some('/') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                let mut depth = 0usize;
+                while i < c.len() {
+                    if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        depth = depth.saturating_sub(1);
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if c[i] == '\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+                out.push(' ');
+            }
+            '"' => i = copy_string(&c, i, &mut out, blank),
+            'r' if raw_string_at(&c, i) => i = copy_string(&c, i, &mut out, blank),
+            '\'' => {
+                if next == Some('\\') {
+                    // escaped char literal: copy through the closing quote
+                    out.push('\'');
+                    i += 1;
+                    // the backslash and the escaped char, then any `u{..}` / `x41` tail
+                    out.extend(c.iter().skip(i).take(2));
+                    i = (i + 2).min(c.len());
+                    while i < c.len() && c[i] != '\'' {
+                        out.push(c[i]);
+                        i += 1;
+                    }
+                    if i < c.len() {
+                        out.push('\'');
+                        i += 1;
+                    }
+                } else if c.get(i + 2) == Some(&'\'') {
+                    out.extend(&c[i..i + 3]);
+                    i += 3;
+                } else {
+                    // a lifetime
+                    out.push('\'');
+                    i += 1;
+                }
+            }
+            ch => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// Does `line` call `name` (preceded by a non-identifier char, followed by an
+/// optional `(`)? `needs_paren` demands the `(`.
+fn has_call(line: &str, name: &str, needs_paren: bool) -> bool {
+    let mut from = 0;
+    while let Some(pos) = line[from..].find(name) {
+        let start = from + pos;
+        let end = start + name.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|b| !is_ident_char(b));
+        let rest = line[end..].trim_start();
+        let after_ok = if needs_paren {
+            rest.starts_with('(')
+        } else {
+            !rest.chars().next().is_some_and(is_ident_char)
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 fn has_bypass(line: &str) -> bool {
-    !is_comment(line) && BYPASS_CALLS.iter().any(|c| line.contains(c))
+    BYPASS_CALLS.iter().any(|c| line.contains(c))
+}
+
+/// Does any identifier on `line` look like an accept-any verifier type?
+fn names_accept_any_verifier(line: &str) -> bool {
+    line.split(|ch: char| !is_ident_char(ch))
+        .any(|ident| VERIFIER_TYPE_FRAGMENTS.iter().any(|f| ident.contains(f)))
+}
+
+/// Index of the `}` matching the `{` at `open` in `code` (byte offsets).
+fn matching_brace(code: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (off, ch) in code[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + off);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn line_of(code: &str, byte: usize) -> usize {
+    code[..byte].matches('\n').count() + 1
+}
+
+/// `file:line` strings for every `ServerCertVerifier` impl in `code` whose
+/// `verify_server_cert` returns `Ok` with no way to reject.
+fn unconditional_verifier_lines(code: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = code[from..].find("ServerCertVerifier") {
+        let at = from + pos;
+        from = at + "ServerCertVerifier".len();
+        let header_start = code[..at].rfind('\n').map_or(0, |n| n + 1);
+        let tail = code[from..].trim_start();
+        if !code[header_start..at].contains("impl") || !tail.starts_with("for") {
+            continue;
+        }
+        let Some(open) = code[from..].find('{').map(|o| from + o) else {
+            continue;
+        };
+        let Some(close) = matching_brace(code, open) else {
+            continue;
+        };
+        let body = &code[open..close];
+        let Some(fpos) = body.find("fn verify_server_cert") else {
+            continue;
+        };
+        let Some(fopen) = body[fpos..].find('{').map(|o| open + fpos + o) else {
+            continue;
+        };
+        let fclose = matching_brace(code, fopen).unwrap_or(close);
+        let fbody = &code[fopen + 1..fclose];
+        if fbody.contains("Ok(") && !CONTROL_TOKENS.iter().any(|t| fbody.contains(t)) {
+            out.push(line_of(code, open + fpos));
+        }
+    }
+    out
+}
+
+fn rustls_allowed(rel: &str) -> bool {
+    RUSTLS_ALLOW.iter().any(|r| r.file == rel)
 }
 
 /// Offending `file:line` strings for one file's text; `rel` is the
 /// repo-relative path with `/` separators.
 fn violations_in(rel: &str, text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let hits: Vec<usize> = (0..lines.len()).filter(|&i| has_bypass(lines[i])).collect();
+    let code = strip_comments(text);
+    let lines: Vec<&str> = code.lines().collect();
     let mut out = Vec::new();
+    let hits: Vec<usize> = (0..lines.len()).filter(|&i| has_bypass(lines[i])).collect();
     for (n, &i) in hits.iter().enumerate() {
         let in_arm = rel == PERMITTED_FILE
             && n == 0
@@ -67,49 +362,141 @@ fn violations_in(rel: &str, text: &str) -> Vec<String> {
                 .rev()
                 .filter(|l| !l.trim().is_empty())
                 .take(ARM_LOOKBACK_LINES)
-                .any(|l| l.contains(PERMITTED_ARM));
+                .any(|l| l.contains(PERMITTED_ARM) && l.contains("=>"));
         if !in_arm {
-            out.push(format!("{rel}:{}", i + 1));
+            out.push(format!(
+                "{rel}:{}: reqwest certificate-verification bypass",
+                i + 1
+            ));
+        }
+    }
+    if !rustls_allowed(rel) {
+        for (i, line) in lines.iter().enumerate() {
+            let danger = DANGER_CALLS
+                .iter()
+                .any(|n| has_call(line, n, *n != "set_certificate_verifier"));
+            if danger {
+                out.push(format!("{rel}:{}: rustls verifier override", i + 1));
+            }
+            if names_accept_any_verifier(line) {
+                out.push(format!("{rel}:{}: accept-any verifier type", i + 1));
+            }
+        }
+        for line in unconditional_verifier_lines(&code) {
+            out.push(format!(
+                "{rel}:{line}: ServerCertVerifier::verify_server_cert returns Ok unconditionally"
+            ));
         }
     }
     out
 }
 
-
-struct AllowRow {
-    file: &'static str,
-    reason: &'static str,
+/// The quoted target following `marker` (`include!(` or `#[path =`), if the
+/// text after the marker is a string literal.
+fn literal_after(code: &str, marker_end: usize, open: Option<char>) -> Option<String> {
+    let mut rest = code[marker_end..].trim_start();
+    if let Some(o) = open {
+        rest = rest.strip_prefix(o)?.trim_start();
+    }
+    let rest = rest.strip_prefix('"')?;
+    rest.find('"').map(|e| rest[..e].to_string())
 }
 
-const RUSTLS_ALLOW: [AllowRow; 0] = [];
+/// Every `include!("..")` and `#[path = ".."]` target in comment-stripped
+/// `code` (markers are located in `masked`, where string contents are blank);
+/// `Err(line)` for one whose argument is not a plain literal.
+fn include_targets(code: &str, masked: &str) -> Vec<Result<String, usize>> {
+    let mut out = Vec::new();
+    for (marker, open, eq) in [("include!", Some('('), false), ("#[path", None, true)] {
+        let mut from = 0;
+        while let Some(pos) = masked[from..].find(marker) {
+            let at = from + pos;
+            from = at + marker.len();
+            let mut end = from;
+            if eq {
+                let after = code[end..].trim_start();
+                let Some(stripped) = after.strip_prefix('=') else {
+                    continue;
+                };
+                end = code.len() - stripped.len();
+            }
+            out.push(literal_after(code, end, open).ok_or_else(|| line_of(code, at)));
+        }
+    }
+    out
+}
 
-/// RED stub: the old walk (tests and src only).
+/// Scan every compiled `.rs` under `root` (and each include target).
 fn scan_tree(root: &Path) -> Vec<String> {
-    let mut files = Vec::new();
+    let root_c = root.canonicalize().expect("canonical root");
+    let mut queue: Vec<PathBuf> = Vec::new();
     for d in SCANNED_DIRS {
         if root.join(d).is_dir() {
-            collect_rs(&root.join(d), &mut files);
+            collect_rs(&root.join(d), &mut queue);
         }
     }
-    let mut bad = Vec::new();
-    for f in &files {
-        let rel = f
-            .strip_prefix(root)
-            .expect("under root")
-            .to_string_lossy()
-            .replace('\\', "/");
-        if rel == "tests/no_insecure_tls_guard_8179.rs" {
+    for f in SCANNED_FILES {
+        if root.join(f).is_file() {
+            queue.push(root.join(f));
+        }
+    }
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut out = Vec::new();
+    while let Some(p) = queue.pop() {
+        let Ok(canon) = p.canonicalize() else {
+            out.push(format!("{}: unreadable scan target", p.display()));
+            continue;
+        };
+        if !seen.insert(canon.clone()) {
             continue;
         }
-        let text = std::fs::read_to_string(f).expect("read");
-        bad.extend(violations_in(&rel, &text));
+        let rel = canon
+            .strip_prefix(&root_c)
+            .unwrap_or(&canon)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == GUARD_FILE {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&canon) {
+            Ok(t) => t,
+            Err(e) => {
+                out.push(format!("{rel}: unreadable: {e}"));
+                continue;
+            }
+        };
+        out.extend(violations_in(&rel, &text));
+        let dir = canon.parent().unwrap_or(&root_c).to_path_buf();
+        for target in include_targets(&strip_comments(&text), &mask_strings(&text)) {
+            match target {
+                Ok(t) if dir.join(&t).is_file() => queue.push(dir.join(&t)),
+                Ok(t) => out.push(format!("{rel}: include target missing: {t}")),
+                Err(line) => out.push(format!(
+                    "{rel}:{line}: include!/#[path] argument is not a string literal \
+                     (cannot resolve, fail closed)"
+                )),
+            }
+        }
     }
-    bad
+    out.sort();
+    out
 }
 
-/// RED stub: no allow-list checking yet.
-fn allow_list_problems(_root: &Path, _rows: &[AllowRow]) -> Vec<String> {
-    Vec::new()
+/// Stale or empty allow-list rows (each must name an existing file and a reason).
+fn allow_list_problems(root: &Path, rows: &[AllowRow]) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in rows {
+        if !root.join(r.file).is_file() {
+            out.push(format!(
+                "allow-list row {}: file does not exist (stale row)",
+                r.file
+            ));
+        }
+        if r.reason.trim().is_empty() {
+            out.push(format!("allow-list row {}: reason is empty", r.file));
+        }
+    }
+    out
 }
 
 /// A scratch crate tree under `CARGO_TARGET_TMPDIR` (never the system temp).
@@ -189,9 +576,7 @@ fn comment_naming_the_arm_does_not_excuse_or_hide_8179() {
 #[test]
 fn comment_lines_inside_the_arm_are_not_counted_8179() {
     let mut text = String::from("match m {\n    SyncTlsMode::AcceptAny => {\n");
-    for n in 0..(ARM_LOOKBACK_LINES + 4) {
-        text.push_str(&format!("        // rationale line {n}\n"));
-    }
+    text.push_str(&"        // rationale line\n".repeat(ARM_LOOKBACK_LINES + 4));
     text.push_str("        /* block\n           comment */\n");
     text.push_str("        b.danger_accept_invalid_certs(true);\n    }\n}\n");
     assert!(
@@ -207,7 +592,9 @@ fn rustls_accept_any_shapes_are_flagged_8179() {
     assert_eq!(violations_in("src/other.rs", named).len(), 1);
     let unconditional = violations_in("src/other.rs", ACCEPT_ANY_VERIFIER);
     assert!(
-        unconditional.iter().any(|v| v.contains("returns Ok unconditionally")),
+        unconditional
+            .iter()
+            .any(|v| v.contains("returns Ok unconditionally")),
         "an innocuously named accept-any verifier slipped through: {unconditional:?}"
     );
     let builder = "let c = rustls::ClientConfig::builder()\n    .dangerous()\n    .with_custom_certificate_verifier(v)\n    .with_no_client_auth();\n";
@@ -249,7 +636,10 @@ fn examples_benches_and_build_rs_are_scanned_8179() {
 fn include_targets_are_followed_and_must_exist_8179() {
     let tree = fixture_tree(&[
         ("src/lib.rs", "include!(\"../extra/hidden.rs\");\n"),
-        ("extra/hidden.rs", "static V: DangerousAnyServerVerifier = X;\n"),
+        (
+            "extra/hidden.rs",
+            "static V: DangerousAnyServerVerifier = X;\n",
+        ),
     ]);
     let bad = scan_tree(tree.path());
     assert!(
@@ -267,7 +657,16 @@ fn include_targets_are_followed_and_must_exist_8179() {
         ("benchmarks/m.rs", "cfg.dangerous();\n"),
     ]);
     let bad = scan_tree(path_attr.path());
-    assert!(bad.iter().any(|v| v.starts_with("benchmarks/m.rs:1")), "{bad:?}");
+    assert!(
+        bad.iter().any(|v| v.starts_with("benchmarks/m.rs:1")),
+        "{bad:?}"
+    );
+    // a marker named inside a string literal is not an include
+    let in_string = fixture_tree(&[(
+        "src/lib.rs",
+        "const S: &str = \"include!(\\\"nope.rs\\\") and #[path = \\\"nope.rs\\\"]\";\n",
+    )]);
+    assert!(scan_tree(in_string.path()).is_empty());
     // a clean include passes
     let clean = fixture_tree(&[
         ("src/lib.rs", "include!(\"gen.rs\");\n"),
