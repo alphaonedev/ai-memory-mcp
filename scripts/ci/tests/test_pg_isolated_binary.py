@@ -9,6 +9,7 @@ SQL order, child environments and exit codes. ``LiveEndToEnd`` additionally
 runs the real script against the Postgres named by
 ``AI_MEMORY_TEST_POSTGRES_URL`` and skips when that is unset.
 """
+import argparse
 import ast
 import contextlib
 import io
@@ -651,6 +652,140 @@ class Budget(unittest.TestCase):
         self.assertIn('connection', str(ctx.exception))
         self.assertFalse([s for s in rec.sql() if s.startswith('CREATE DATABASE')])
 
+    def _setup_with_free_slots(self, free, jobs, **kwargs):
+        rec = Recorder()
+        err = io.StringIO()
+        budget = (100, 3, 100 - 3 - free, free)
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: budget), \
+                contextlib.redirect_stderr(err):
+            got = pib.setup_effective(BASE, 'ai_memory_test_ci_9_1_x', jobs, **kwargs)
+        return got, rec, err.getvalue()
+
+    def test_setup_clamps_jobs_to_the_live_budget_and_says_so_6383_r4(self):
+        per = pib.PER_BINARY_CONNECTIONS + pib.HOLD_CONNECTIONS
+        fit = (87 - pib.CONNECTION_HEADROOM) // per
+        (tpl, effective), rec, err = self._setup_with_free_slots(87, 8)
+        self.assertEqual((tpl, effective), (TPL, fit))
+        self.assertLess(fit, 8)
+        notice = ('::notice::[#6383] per-binary isolation clamped jobs 8 -> %d '
+                  '(free slots 87, per-binary need %d)' % (fit, per))
+        self.assertIn(notice, err.splitlines())
+        self.assertIn('CREATE DATABASE "%s"' % TPL, rec.sql())
+
+    def test_setup_without_pressure_keeps_the_requested_jobs_6383_r4(self):
+        (_tpl, effective), _rec, err = self._setup_with_free_slots(10_000, 8)
+        self.assertEqual(effective, 8)
+        self.assertNotIn('clamped', err)
+
+    def test_setup_still_fails_closed_when_not_one_binary_fits_6383_r4(self):
+        free = pib.required_connections(1) - 1
+        with self.assertRaises(pib.WrapperError) as ctx:
+            self._setup_with_free_slots(free, 8)
+        self.assertIn('free connection slots', str(ctx.exception))
+
+    def test_no_clamp_keeps_the_fail_closed_behaviour_6383_r4(self):
+        with self.assertRaises(pib.WrapperError) as ctx:
+            self._setup_with_free_slots(87, 8, clamp=False)
+        self.assertIn('172 needed for 8 parallel binaries', str(ctx.exception))
+        rec = Recorder()
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: (100, 3, 10, 87)), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--no-clamp'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+
+    def test_emit_env_carries_the_effective_jobs_and_run_reads_it_6383_r4(self):
+        rec = Recorder()
+        out = []
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: (100, 3, 10, 87)), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                unittest.mock.patch.object(pib, '_emit', out.append), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--run-id', RUN,
+                           '--emit-env'])
+        self.assertEqual(rc, 0)
+        self.assertIn('%s=3' % pib.JOBS_VAR, out)
+        args = pib.build_parser().parse_args(['run', '--targets-file', 'x'])
+        with unittest.mock.patch.dict(os.environ, {pib.JOBS_VAR: '3'}, clear=False):
+            self.assertEqual(pib.effective_run_jobs(args.jobs), 3)
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pib.JOBS_VAR, None)
+            self.assertEqual(pib.effective_run_jobs(args.jobs), pib.MAX_JOBS)
+        self.assertEqual(pib.effective_run_jobs(5), 5)
+
+    def test_malformed_jobs_env_fails_closed_naming_the_variable_6383_r5(self):
+        for bad in ('-1', 'abc', '1e9', ' 3', '0', '\u0663'):
+            with unittest.mock.patch.dict(os.environ, {pib.JOBS_VAR: bad}, clear=False):
+                with self.assertRaises(pib.WrapperError) as ctx:
+                    pib.effective_run_jobs(None)
+            self.assertIn(pib.JOBS_VAR, str(ctx.exception), bad)
+        for fine in ('', None):
+            env = {} if fine is None else {pib.JOBS_VAR: fine}
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                if fine is None:
+                    os.environ.pop(pib.JOBS_VAR, None)
+                self.assertEqual(pib.effective_run_jobs(None), pib.MAX_JOBS)
+
+    def test_malformed_jobs_env_makes_run_exit_two_6383_r5(self):
+        err = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE, pib.JOBS_VAR: 'abc', pib.FLAG_VAR: '1',
+                                                   pib.TEMPLATE_VAR: TPL, pib.RUN_ID_VAR: RUN}, clear=False), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: (100, 3, 10, 87)), \
+                contextlib.redirect_stderr(err):
+            rc = pib.main(['run', '--targets-file', os.devnull, '--', 'cargo', 'test'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertIn(pib.JOBS_VAR, err.getvalue())
+
+    def test_non_ascii_digit_replies_exit_two_at_every_parse_site_6383_r5(self):
+        for reply in ('\u00b2|3|0|5', '\u0661\u0660\u0660|3|0|5', '100|3|0|\u0665'):
+            rec = Recorder(lambda a, k, r=reply: Result(0, r + '\n'))
+            with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+                with self.assertRaises(pib.WrapperError):
+                    pib.connection_budget(BASE)
+        for fn, args in ((pib.session_count, (BASE, 'ai_memory_t_r6386_1700000000_0123abcd')),
+                         (pib.sweep, (BASE, pib.MIN_SWEEP_AGE_SECS))):
+            rec = Recorder(lambda a, k: Result(0, '\u00b2\n'))
+            with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+                with self.assertRaises(pib.WrapperError):
+                    fn(*args)
+        rec = Recorder(lambda a, k: Result(0, '\u0663\u0660\n'))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            with self.assertRaises(pib.WrapperError):
+                pib.session_count(BASE, 'ai_memory_t_r6386_1700000000_0123abcd')
+
+    def test_overlong_digit_strings_exit_two_not_a_traceback_7866_6383_r6(self):
+        long_digits = '9' * 5000
+        with unittest.mock.patch.dict(os.environ, {pib.JOBS_VAR: long_digits}, clear=False):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.effective_run_jobs(None)
+        self.assertIn(pib.JOBS_VAR, str(ctx.exception))
+        self.assertLess(len(str(ctx.exception)), 300, 'the error does not echo the whole string')
+        rec = Recorder(lambda a, k: Result(0, '100|3|0|%s\n' % long_digits))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            with self.assertRaises(pib.WrapperError):
+                pib.connection_budget(BASE)
+        rec = Recorder(lambda a, k: Result(0, long_digits + '\n'))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            with self.assertRaises(pib.WrapperError):
+                pib.sweep(BASE, pib.MIN_SWEEP_AGE_SECS)
+        err = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE, pib.JOBS_VAR: long_digits,
+                                                   pib.FLAG_VAR: '1', pib.TEMPLATE_VAR: TPL,
+                                                   pib.RUN_ID_VAR: RUN}, clear=False), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: (100, 3, 10, 87)), \
+                contextlib.redirect_stderr(err):
+            rc = pib.main(['run', '--targets-file', os.devnull, '--', 'cargo', 'test'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+
+    def test_setup_help_lists_the_jobs_key_6383_r5(self):
+        parser = pib.build_parser()
+        sub = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)][0]
+        text = sub.choices['setup'].format_help()
+        self.assertIn(pib.JOBS_VAR, text.replace('\n', ' ').replace('  ', ' '))
+
     def test_required_connections_formula(self):
         self.assertEqual(pib.required_connections(8),
                          8 * (pib.PER_BINARY_CONNECTIONS + pib.HOLD_CONNECTIONS) + pib.CONNECTION_HEADROOM)
@@ -680,7 +815,8 @@ class TierSteps(unittest.TestCase):
             rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--run-id', RUN,
                            '--emit-env'])
         self.assertEqual(rc, 0)
-        self.assertEqual(out, ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN)])
+        self.assertEqual(out[:2], ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN)])
+        self.assertEqual(out[2], '%s=8' % pib.JOBS_VAR)
 
     def test_teardown_drops_only_this_runs_clones_without_force(self):
         def answer(argv, kw):
