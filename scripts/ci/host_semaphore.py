@@ -160,7 +160,7 @@ def main(argv=None):
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         p.error('a command is required after --')
-    if not NAME_RE.match(args.name):
+    if not NAME_RE.fullmatch(args.name):
         p.error('--name must match %s' % NAME_RE.pattern)
     root = Path(args.root) if args.root else default_root()
     slot_dir = root / args.name
