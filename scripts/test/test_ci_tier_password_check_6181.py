@@ -293,5 +293,84 @@ class TestTierPasswordWiring6181(unittest.TestCase):
         self.assertEqual(sorted(URL_LINES - present), [])
 
 
+WORKFLOWS = ROOT / ".github/workflows"
+# the discovery list: every workflow that names the tier secret or its environment variable (#8187 security F2)
+TIER_MARKERS = re.compile(r"AI_MEMORY_CI_FED_URL|AI_MEMORY_TEST_POSTGRES_URL|pg_ci_url_file|ai-memory-ci-fed-url")
+# workflows that read the tier URL file: pinned by wiring_problems above (ci.yml) or workflow_problems below
+SHARED_TIER = ("cert-postgres-age.yml", "postgres-ignored.yml")
+# coverage.yml names the variable only for its own throwaway local database (a literal localhost test credential)
+LOCAL_ONLY = {"coverage.yml": "postgres://ai_memory:ai_memory_test@localhost:5432/"}
+URL_VARS = re.compile(r"\$\{?(?:base_url|new_url|head|q|AI_MEMORY_TEST_POSTGRES_URL|AI_MEMORY_TEST_AGE_URL)\b")
+GITHUB_ENV_LINE = 'python3 -I ' + HELPER + ' github-env --url-file "$url_file" --database "$CI_FED_DB"'
+
+
+def code_lines(text):
+    """The non-comment lines of a workflow, stripped."""
+    return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def workflow_problems(text):
+    """Problems of a workflow that reads the tier URL file other than ci.yml: argv, shell variables, GITHUB_ENV."""
+    problems = []
+    lines = code_lines(text)
+    for line in lines:
+        if re.search(r"AI_MEMORY_TEST_(?:POSTGRES|AGE)_URL=", line):
+            problems.append("URL written to GITHUB_ENV by hand: " + line[:60])
+        if line.startswith("echo "):
+            continue
+        if re.search(r"\bpsql\b", line) and ("tier_credential.py run" not in line or "--url-file" not in line):
+            problems.append("psql without the loader: " + line[:60])
+        if re.search(r"\bpsql\b", line) and URL_VARS.search(line):
+            problems.append("psql line carries a URL variable: " + line[:60])
+        if re.search(r"\b(?:base_url|new_url)\s*=", line) or re.search(r"\bcat\s+\"?\$\{?url_file", line):
+            problems.append("URL read into a shell variable: " + line[:60])
+    if not any(ln.startswith(GITHUB_ENV_LINE) and "--age-url" in ln for ln in lines):
+        problems.append("the masked github-env hand-off (with --age-url) is missing")
+    return problems
+
+
+def tier_workflows():
+    """Names of the workflows whose text matches the discovery list."""
+    return sorted(p.name for p in WORKFLOWS.glob("*.yml") if TIER_MARKERS.search(p.read_text(encoding="utf-8")))
+
+
+class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
+    def test_no_workflow_that_names_the_tier_secret_escapes_the_pins(self):
+        covered = {"ci.yml", *SHARED_TIER, *LOCAL_ONLY}
+        self.assertEqual(sorted(set(tier_workflows()) - covered), [],
+                         "a workflow names the tier secret but no pin covers it: route it through tier_credential.py")
+        self.assertEqual(sorted(covered - set(tier_workflows())), [], "a covered workflow no longer names the tier")
+
+    def test_the_shared_tier_workflows_never_put_the_url_on_argv_or_in_github_env(self):
+        for name in SHARED_TIER:
+            with self.subTest(workflow=name):
+                self.assertEqual(workflow_problems((WORKFLOWS / name).read_text(encoding="utf-8")), [])
+
+    def test_the_local_only_workflows_hold_no_tier_url(self):
+        for name, literal in LOCAL_ONLY.items():
+            text = (WORKFLOWS / name).read_text(encoding="utf-8")
+            self.assertNotIn("ai-memory-ci-fed-url", text)
+            for line in code_lines(text):
+                if TIER_MARKERS.search(line):
+                    self.assertIn(literal, line, "only a literal throwaway local database may name the variable")
+
+    def test_each_mutant_of_a_shared_workflow_is_caught(self):
+        text = (WORKFLOWS / "cert-postgres-age.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow_problems(text), [])
+        run = "python3 -I " + HELPER + ' run --url-file "$url_file" --database "$CI_FED_DB" -- psql'
+        mutants = {
+            "psql on argv": text.replace(run + " -v ON_ERROR_STOP=1 -tAc", 'psql "$AI_MEMORY_TEST_POSTGRES_URL" -tAc', 1),
+            "url read by cat": text.replace('          if [ ! -f "$url_file" ]; then',
+                                            '          base_url="$(cat "$url_file")"\n          if [ ! -f "$url_file" ]; then', 1),
+            "hand-written GITHUB_ENV": text.replace(GITHUB_ENV_LINE, 'echo "AI_MEMORY_TEST_POSTGRES_URL=$x" >> "$GITHUB_ENV"', 1),
+            "github-env removed": text.replace(GITHUB_ENV_LINE, "true", 1),
+            "age url dropped": text.replace(" --age-url", "", 1),
+        }
+        for name, edited in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertNotEqual(edited, text, "the mutation did not apply")
+                self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())
