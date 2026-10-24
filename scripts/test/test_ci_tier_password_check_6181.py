@@ -1078,6 +1078,38 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                 with self.subTest(workflow=wf, shape=label):
                     self.caught(wf, splice(text, at, new), label)
 
+    def test_a_split_or_disguised_export_in_a_new_job_is_still_found_8187_f12a(self):
+        splits = {
+            "split inside the file name": ["python3 -I scripts/ci/tier_cred\\", "ential.py github-env --url-file \"$url_file\""],
+            "split inside the verb": ["python3 -I " + HELPER + " github-\\", "env --url-file \"$url_file\""],
+            "empty expansion": ["python3 -I scripts/ci/tier_credential${E}.py github-env --url-file \"$url_file\""],
+            "backslash inside the name": ["python3 -I scripts/ci/tier_cre\\dential.py github-env --url-file \"$url_file\""],
+            "empty quotes": ["python3 -I scripts/ci/tier_cred''ential.py github-env --url-file \"$url_file\""],
+            "here-doc": ["bash <<'EOS'", EXPORT_LINE, "EOS"],
+        }
+        for wf, text in self.texts.items():
+            at = section_end(text)
+            for label, call in splits.items():
+                new = ["  second:", "    runs-on: ubuntu-latest", "    steps:", "      - name: Export", "        run: |",
+                       *["          " + part for part in call], "      - name: Dump", "        run: printenv | base64"]
+                with self.subTest(workflow=wf, form=label):
+                    problems = job_pin_problems(wf, splice(text, at, new), self.pins)
+                    self.assertTrue(any("second" in p and "not pinned" in p for p in problems), problems)
+
+    def test_workflow_level_env_and_defaults_are_pinned_8187_f12b(self):
+        for wf, text in self.texts.items():
+            lines = text.split("\n")
+            head = next(i for i, ln in enumerate(lines) if ln.rstrip() == "jobs:")
+            for label, new in (("env hook", ["env:", "  BASH_ENV: /dev/null/hook"]),
+                               ("env hook, other var", ["env:", "  LD_PRELOAD: /dev/null/hook.so"]),
+                               ("defaults shell", ["defaults:", "  run:", "    shell: bash -x {0}"])):
+                with self.subTest(workflow=wf, edit=label):
+                    self.caught(wf, splice(text, head, new), label)
+            top = next((i for i, ln in enumerate(lines) if ln.rstrip() in ("env:", "defaults:")), None)
+            if top is not None:
+                with self.subTest(workflow=wf, edit="added key to the existing top-level block"):
+                    self.caught(wf, splice(text, top + 1, ["  BASH_ENV: /dev/null/hook"]), "existing block")
+
     def test_keys_after_a_column_zero_comment_stay_pinned_8187_f11b(self):
         for wf, text in self.texts.items():
             for step in pin_targets(wf, text):
