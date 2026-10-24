@@ -3,7 +3,11 @@
 Usage:
     python3 -I scripts/ci/impact/select.py --db <file> --base <sha> --head <sha> \
         [--repo .] [--advice <json>] [--event pull_request] [--base-ref <name>] \
-        --out <json> [--github-output <file>]
+        [--enforce <CI_IMPACT_ENFORCE>] --out <json> [--github-output <file>]
+
+The GitHub output carries one `<job key>=true|false` line per known job. A key
+is `false` only when `--enforce` is the literal `true` and the selection left
+that job out; otherwise (and for any full-matrix selection) it is `true`.
 
 Per changed path the first matching rule (lowest priority number) wins and
 the selections are unioned. `ALL`, an unclassified path, an empty diff, an
@@ -121,6 +125,9 @@ def _select(con: sqlite3.Connection, changed: List[str], force_all: Optional[str
     known = set(settings["known_jobs"])
     entries = validate_advice(advice, known)
     rules = load_path_rules(con)
+    include_files = set(settings.get(common.INCLUDE_FILES_KEY) or [])
+    # A missing key means an index from before the scan existed: fail closed.
+    include_unresolved = bool(settings.get(common.INCLUDE_UNRESOLVED_KEY, True))
     crates = dict(con.execute("select name, src_root from crates"))
     edges = list(con.execute("select crate, dep from crate_deps"))
     jobs: Set[str] = set(settings["always_on"])
@@ -130,7 +137,17 @@ def _select(con: sqlite3.Connection, changed: List[str], force_all: Optional[str
     full = False
     cell_hit = False
     for path in changed:
-        rule = next((r for r in rules if common.match_glob(r["glob"], path)), None)
+        if path in include_files:
+            # Compiled in by include_str!/include_bytes!: a Rust change (S3).
+            rule = {"glob": common.REASON_INCLUDE, "jobs": [common.RUST_KEY]}
+        else:
+            rule = next((r for r in rules if common.match_glob(r["glob"], path)), None)
+        if (rule is not None and include_unresolved and rule["jobs"] == [common.DOCS_KEY]
+                and path.endswith(".md")):
+            # An include the scan could not resolve might read this file.
+            reasons[path] = common.REASON_INCLUDE_UNRESOLVED
+            full = True
+            continue
         if rule is None:
             reasons[path] = common.REASON_UNCLASSIFIED
             full = True
@@ -170,11 +187,13 @@ def _select(con: sqlite3.Connection, changed: List[str], force_all: Optional[str
 def git_changed_paths(repo: Path, base: str, head: str) -> List[str]:
     """Return changed paths between base and head (renames list both sides)."""
     res = subprocess.run(
-        ["git", "diff", "--name-only", "--no-renames", base, head],
-        cwd=str(repo), capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
+        ["git", "diff", "--name-only", "-z", "--no-renames", base, head],
+        cwd=str(repo), capture_output=True, timeout=GIT_TIMEOUT_S)
     if res.returncode != 0:
-        raise RuntimeError("git diff failed: %s" % res.stderr.strip()[-300:])
-    return [line for line in res.stdout.splitlines() if line]
+        raise RuntimeError("git diff failed: %s"
+                           % res.stderr.decode("utf-8", "replace").strip()[-300:])
+    return [item.decode("utf-8", "surrogateescape")
+            for item in res.stdout.split(common.NUL.encode()) if item]
 
 
 def force_reason(event: str, base_ref: str, rules: dict) -> Optional[str]:
@@ -195,7 +214,21 @@ def fail_closed(rules: dict, reason: str) -> dict:
             "tests": [], "reasons": {common.REASON_KEY: reason}, "advice": []}
 
 
-def write_outputs(result: dict, out: Optional[Path], github_output: Optional[Path]) -> None:
+def domain_outputs(result: dict, known_jobs: List[str], enforce: str) -> Dict[str, str]:
+    """Return {domain: 'true'|'false'} for the step outputs.
+
+    Every gated job reads its own domain and may be skipped ONLY on an explicit
+    'false'. While enforcement is off (anything but the literal 'true') every
+    domain is 'true'; a full-matrix selection is 'true' for every domain.
+    """
+    enforced = enforce == common.ENFORCE_VALUE
+    selected = set(result["jobs"])
+    return {job: "true" if (not enforced or result["all"] or job in selected) else "false"
+            for job in sorted(known_jobs)}
+
+
+def write_outputs(result: dict, out: Optional[Path], github_output: Optional[Path],
+                  known_jobs: Optional[List[str]] = None, enforce: str = "") -> None:
     """Write the JSON result and the GitHub step-output lines."""
     if out is not None:
         Path(out).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -203,6 +236,8 @@ def write_outputs(result: dict, out: Optional[Path], github_output: Optional[Pat
         lines = ["jobs=%s" % ",".join(result["jobs"]),
                  "all=%s" % ("true" if result["all"] else "false"),
                  "crates=%s" % ",".join(result["crates"])]
+        domains = domain_outputs(result, known_jobs or result["jobs"], enforce)
+        lines += ["%s=%s" % (job, value) for job, value in domains.items()]
         with open(str(github_output), "a") as handle:
             handle.write("\n".join(lines) + "\n")
 
@@ -220,6 +255,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--out", help="write the selection JSON here")
     parser.add_argument("--github-output", help="append jobs=, all=, crates= lines here")
     parser.add_argument("--rules", help="alternative rules.json (fail-closed fallback)")
+    parser.add_argument("--enforce", default="",
+                        help="the CI_IMPACT_ENFORCE value; only 'true' lets a domain say false")
     args = parser.parse_args(argv)
     rules = common.load_rules(Path(args.rules) if args.rules else None)
     advice = None
@@ -237,7 +274,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         common.log("impact: %s; selecting the full matrix" % exc)
         write_outputs(fail_closed(rules, common.FAIL_CLOSED_DIFF),
                       Path(args.out) if args.out else None,
-                      Path(args.github_output) if args.github_output else None)
+                      Path(args.github_output) if args.github_output else None,
+                      rules["known_jobs"], args.enforce)
         return common.EXIT_OK
     try:
         result = compute_selection(Path(args.db), changed, forced, advice)
@@ -245,7 +283,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         common.log("impact: index unusable (%s); selecting the full matrix" % exc)
         result = fail_closed(rules, common.FAIL_CLOSED_INDEX)
     write_outputs(result, Path(args.out) if args.out else None,
-                  Path(args.github_output) if args.github_output else None)
+                  Path(args.github_output) if args.github_output else None,
+                  rules["known_jobs"], args.enforce)
     print("impact selection: all=%s jobs=%s crates=%s"
           % (result["all"], ",".join(result["jobs"]), ",".join(result["crates"])))
     return common.EXIT_OK

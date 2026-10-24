@@ -13,6 +13,7 @@ rows; history is kept across runs.
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -25,6 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from impact import common  # noqa: E402
 
+INCLUDE_SCAN_TOPS = ("src", "tests", "benches")
+INCLUDE_RE = re.compile(r"include_(?:str|bytes)!\s*\(")
+LITERAL_RE = re.compile(r'^"([^"\\]*)"$')
+MANIFEST_CONCAT_RE = re.compile(
+    r'^concat!\(\s*env!\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"\\]*)"\s*,?\s*\)$')
 CARGO_TIMEOUT_S = 300
 RESOLVE_TIMEOUT_S = 60
 MAX_JUNIT_BYTES = 64 * 1024 * 1024
@@ -130,6 +136,79 @@ def write_rules(con: sqlite3.Connection, rules: dict) -> None:
         con.execute("insert into settings values (?,?)", (key, json.dumps(rules[key])))
 
 
+def strip_comment_lines(text: str) -> str:
+    """Drop whole-line `//` comments (doc comments included) from Rust text."""
+    return "\n".join(ln for ln in text.split("\n") if not ln.lstrip().startswith("//"))
+
+
+def in_string_literal(text: str, index: int) -> bool:
+    """True when `index` sits inside a string literal on its own line."""
+    line_start = text.rfind("\n", 0, index) + 1
+    return len(re.findall(r'(?<!\\)"', text[line_start:index])) % 2 == 1
+
+
+def balanced_argument(text: str, start: int) -> str:
+    """Return the macro argument text from `start` to its matching `)` (stripped)."""
+    depth = 1
+    pos = start
+    while pos < len(text) and depth:
+        char = text[pos]
+        depth += (char == "(") - (char == ")")
+        pos += 1
+    return " ".join(text[start:pos - 1].split()) if depth == 0 else text[start:start + 80]
+
+
+def scan_includes(repo: Path) -> Tuple[Set[str], List[str]]:
+    """Return (resolved include targets, unresolved include descriptions).
+
+    Every `include_str!(...)` and `include_bytes!(...)` under src/, tests/ and
+    benches/ names a file the compiler reads, so a change to it is a Rust
+    change (S3). Targets resolve relative to the including file. A non-literal
+    argument, a target that is not a file, or one outside the repository is
+    unresolved, which makes the selector treat markdown changes as ALL.
+    """
+    root = Path(repo).resolve()
+    files: Set[str] = set()
+    unresolved: List[str] = []
+    for top in INCLUDE_SCAN_TOPS:
+        for source in sorted((root / top).rglob("*.rs")):
+            text = strip_comment_lines(source.read_text(errors="replace"))
+            for match in INCLUDE_RE.finditer(text):
+                if in_string_literal(text, match.start()):
+                    continue
+                arg = balanced_argument(text, match.end())
+                where = source.relative_to(root).as_posix()
+                literal = LITERAL_RE.match(arg)
+                manifest = MANIFEST_CONCAT_RE.match(arg)
+                if manifest is not None:
+                    # CARGO_MANIFEST_DIR of the root package is the repository root.
+                    target = (root / manifest.group(1).lstrip("/")).resolve()
+                elif literal is not None:
+                    target = (source.parent / literal.group(1)).resolve()
+                else:
+                    unresolved.append("%s: %s" % (where, arg[:80]))
+                    continue
+                try:
+                    rel = target.relative_to(root).as_posix()
+                except ValueError:
+                    unresolved.append("%s: outside repo %s" % (where, literal.group(1)))
+                    continue
+                if target.is_file():
+                    files.add(rel)
+                else:
+                    unresolved.append("%s: missing %s" % (where, rel))
+    return files, unresolved
+
+
+def write_includes(con: sqlite3.Connection, repo: Path) -> None:
+    """Record the include scan in the settings table."""
+    files, unresolved = scan_includes(repo)
+    con.execute("insert into settings values (?,?)",
+                (common.INCLUDE_FILES_KEY, json.dumps(sorted(files))))
+    con.execute("insert into settings values (?,?)",
+                (common.INCLUDE_UNRESOLVED_KEY, json.dumps(unresolved)))
+
+
 def testcase_status(case: ET.Element) -> Tuple[bool, int]:
     """Return (failed, flaky_count) for one JUnit testcase element."""
     failed = any(case.find(tag) is not None for tag in FAILURE_TAGS)
@@ -212,6 +291,7 @@ def build_index(repo: Path, db: Path, metadata: Optional[dict] = None,
         con.execute("insert into schema_version values (?)", (common.SCHEMA_VERSION,))
         write_crates(con, metadata, repo)
         write_rules(con, rules)
+        write_includes(con, repo)
         if junit is not None:
             summary["junit_targets"] = ingest_junit(con, Path(junit))
         if codegraph is not None:

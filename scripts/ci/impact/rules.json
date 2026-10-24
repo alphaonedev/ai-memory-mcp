@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "First matching rule (lowest priority number) wins per path; selections are unioned over paths. Job key ALL forces the full matrix. A rust key also resolves the owning crate and its reverse-dependency closure. cell_crates names workspace crates whose change adds the cells key; this workspace has one crate (ai-memory), so the SAL and storage code is selected by cell_globs instead.",
+  "_comment": "First matching rule (lowest priority number) wins per path; selections are unioned over paths. Job key ALL forces the full matrix. A rust key also resolves the owning crate and its reverse-dependency closure. cell_crates names workspace crates whose change adds the cells key; this workspace has one crate (ai-memory), so the SAL and storage code is selected by cell_globs instead. The sal, sal-postgres and vectorlite cfgs are spread across 587 src/ and tests/ files (8240 F3), so every Rust source tree maps to cells; no file is excepted. scripts/ci/** and the check scripts judge CI itself, so they select ALL. Markdown compiled in by include_str!/include_bytes! is found by build_index and selects rust.",
   "known_jobs": [
     "rust", "cells", "python", "actionlint", "isolation-smoke", "docs",
     "codeql", "signatures", "leakscan", "banned-phrases"
@@ -10,10 +10,9 @@
   "force_all_base_names": ["main", "develop"],
   "cell_crates": [],
   "cell_globs": [
-    "src/store/**", "src/storage/**", "src/migrate*", "migrations/**",
-    "src/handlers/**", "src/federation/**", "src/sal/**",
-    "tests/*postgres*", "tests/*_pg_*", "tests/*sal_*"
+    "src/**", "tests/**", "benches/**", "crates/**", "migrations/**"
   ],
+  "tag_skip_jobs": ["dockerfile-validate"],
   "job_map": {
     "lint": "rust",
     "msrv": "rust",
@@ -26,6 +25,10 @@
     "actionlint": "actionlint"
   },
   "rules": [
+    {"priority": 4, "glob": "scripts/ci/impact/rules.json", "jobs": ["ALL"]},
+    {"priority": 5, "glob": "scripts/ci/**", "jobs": ["ALL"]},
+    {"priority": 6, "glob": "scripts/check_*.py", "jobs": ["ALL"]},
+    {"priority": 7, "glob": "scripts/check-*.py", "jobs": ["ALL"]},
     {"priority": 10, "glob": ".github/**", "jobs": ["ALL"]},
     {"priority": 11, "glob": "scripts/ci/isolation*", "jobs": ["ALL"]},
     {"priority": 12, "glob": "**/Cargo.toml", "jobs": ["ALL"]},

@@ -178,6 +178,12 @@ jobs:
       all: ${{ steps.select.outputs.all }}
       crates: ${{ steps.select.outputs.crates }}
       enforce: ${{ steps.mode.outputs.enforce }}
+      # One output per gated domain: 'false' ONLY when this job succeeded, the
+      # repo var CI_IMPACT_ENFORCE is 'true' and the selection left it out.
+      # A gated job is skipped only on an explicit 'false' (fail closed).
+      rust: ${{ steps.select.outputs.rust }}
+      cells: ${{ steps.select.outputs.cells }}
+      actionlint: ${{ steps.select.outputs.actionlint }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -203,10 +209,12 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}
         run: |
           python3 -I scripts/ci/impact/select.py --db "$RUNNER_TEMP/impact.db" \
             --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --event "$EVENT" \
-            --base-ref "$BASE_REF" --out "$RUNNER_TEMP/selection.json" \
+            --base-ref "$BASE_REF" --enforce "$ENFORCE" \
+            --out "$RUNNER_TEMP/selection.json" \
             --github-output "$GITHUB_OUTPUT"
 
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
@@ -516,7 +524,7 @@ jobs:
   lint:
     name: Lint (fmt + clippy)
     needs: [classify, select]
-    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,'))
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # Two full pedantic clippy passes (default + `--all-targets --features
@@ -624,7 +632,7 @@ jobs:
   actionlint:
     name: actionlint (workflow-injection guard)
     needs: [classify, select]
-    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',actionlint,'))
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.actionlint != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). A single
     # container-action step over `.github/workflows/`: no cargo, no Postgres.
     runs-on: ubuntu-latest
@@ -655,7 +663,7 @@ jobs:
   msrv:
     name: MSRV (Rust 1.98)
     needs: [classify, select]
-    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,'))
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # `cargo check --all-targets` over the whole crate.
@@ -2147,7 +2155,7 @@ jobs:
   postgres-feature:
     name: Postgres feature gate
     needs: [classify, select]
-    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',cells,'))
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.cells != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     #
@@ -2330,7 +2338,7 @@ jobs:
     # clippy + `cargo build --release --features sal` + `cargo test`.
     name: SAL-only feature gate
     needs: [classify, select]
-    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',cells,'))
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.cells != 'false') }}
     # NOTE the `Free disk` step that #3109 removed (it recursively deleted
     # system paths such as the bundled dotnet SDK to make headroom on the
     # ephemeral hosted image) is deliberately NOT restored. This job has since
@@ -2396,7 +2404,7 @@ jobs:
     # `--all-targets --features vectorlite` clippy + two test binaries.
     name: vectorlite feature gate
     needs: [classify, select]
-    if: needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,'))
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     runs-on: ubuntu-latest
     # #1487 — bound the job so a wedged test can't pin the runner. 30 is the
     # pre-#3109 value measured on this runner class and is unchanged by #3109.
@@ -2462,7 +2470,7 @@ jobs:
     # hosts.
     runs-on: ubuntu-latest
     # Skip on tag pushes — the docker job below handles those (with push).
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' && (needs.select.outputs.enforce != 'true' || needs.select.outputs.all != 'false' || contains(format(',{0},', needs.select.outputs.jobs), ',rust,')) }}
+    if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -2496,17 +2504,23 @@ jobs:
   # full instrumented sweep twice per PR was pure waste.
 
   # #8240 - the single aggregate check. Passes when every job either succeeded
-  # or was skipped because the selection excluded it. Not a required check yet.
-  # Rule (b4) of scripts/check-required-contexts.sh forbids a job from needing a
-  # required job that carries a job-level `if:`, so this aggregate lists only the
-  # jobs without one; the seven job-level-`if:` jobs join it when that rule
-  # exempts an `if: always()` aggregate (tracked as an open item on #8240).
+  # or was skipped for a recorded reason (docs-only, or select succeeded and said
+  # 'false' for the job's domain). Not a required check yet. It lists every job
+  # except the seven that carry a job-level `if:` (lint, actionlint, msrv,
+  # postgres-feature, sal-feature, vectorlite-feature, dockerfile-validate):
+  # rule (b4) of scripts/check-required-contexts.sh hard-fails any required job
+  # that another job `needs` and that has a job-level `if:`, and is not
+  # allowlistable. scripts/ci/tests/test_ci_select_gating_8240.py asserts the
+  # list equals every job minus exactly that set, so a new job cannot be left
+  # out. The seven join this list when (b4) exempts an `if: always()` aggregate
+  # (open item on #8240); the ruleset switch waits for that.
   ci-gate:
     name: ci-gate
     if: always()
     needs:
       - select
       - classify
+      - build-script-vetting
       - check
       - mobile-cross-compile
     # RUNNER PLACEMENT - GitHub-hosted: it only reads the needs context.
@@ -2517,8 +2531,7 @@ jobs:
       - name: Fold job results
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-          SELECTED_JOBS: ${{ needs.select.outputs.jobs }}
-          SELECTED_ALL: ${{ needs.select.outputs.all }}
+          GITHUB_REF_NAME_FULL: ${{ github.ref }}
         run: |
           python3 -I scripts/ci/impact/gate.py --needs "$NEEDS_JSON" \
-            --jobs "$SELECTED_JOBS" --all "$SELECTED_ALL"
+            --github-ref "$GITHUB_REF_NAME_FULL"

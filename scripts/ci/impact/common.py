@@ -25,6 +25,14 @@ TARGET_KINDS = ("test", "bench", "bin", "lib")
 LIB_KINDS = ("lib", "rlib", "cdylib", "dylib", "staticlib", "proc-macro")
 SETTING_KEYS = ("known_jobs", "always_on", "force_all_base_prefixes",
                 "force_all_base_names", "cell_crates", "cell_globs")
+# Written by build_index from a scan of the tree, not read from rules.json.
+INCLUDE_FILES_KEY = "include_files"
+INCLUDE_UNRESOLVED_KEY = "include_unresolved"
+REASON_INCLUDE = "include_str!"
+REASON_INCLUDE_UNRESOLVED = "include-unresolved"
+ENFORCE_VALUE = "true"
+DOCS_KEY = "docs"
+NUL = "\0"
 
 SCHEMA_SQL = """
 create table if not exists schema_version (version integer not null);
