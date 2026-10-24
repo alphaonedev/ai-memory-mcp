@@ -3,7 +3,7 @@
 
 //! #8179 source guard: no certificate-verification bypass may be (re)introduced.
 //!
-//! CodeQL flags `danger_accept_invalid_certs`, but CodeQL is not a required
+//! `CodeQL` flags `danger_accept_invalid_certs`, but `CodeQL` is not a required
 //! check, so a re-added bypass would otherwise survive every test. This guard
 //! walks `tests/` and `src/` and fails with every `file:line` that calls
 //! `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` outside
@@ -110,12 +110,21 @@ fn guard_pins_the_single_sync_arm_8179() {
     assert!(violations_in(PERMITTED_FILE, arm).is_empty());
     // moved out of the arm
     let moved = "fn f() {\n    b.danger_accept_invalid_certs(true);\n}\n";
-    assert_eq!(violations_in(PERMITTED_FILE, moved), [format!("{PERMITTED_FILE}:2")]);
+    assert_eq!(
+        violations_in(PERMITTED_FILE, moved),
+        [format!("{PERMITTED_FILE}:2")]
+    );
     // a second occurrence in the permitted file
     let twice = format!("{arm}{arm}");
     assert_eq!(violations_in(PERMITTED_FILE, &twice).len(), 1);
     // the arm text in any other file does not excuse it
     assert_eq!(violations_in("src/other.rs", arm).len(), 1);
     // comments are ignored
-    assert!(violations_in("tests/x.rs", "// danger_accept_invalid_certs(true)\n//! danger_accept_invalid_hostnames\n").is_empty());
+    assert!(
+        violations_in(
+            "tests/x.rs",
+            "// danger_accept_invalid_certs(true)\n//! danger_accept_invalid_hostnames\n"
+        )
+        .is_empty()
+    );
 }
