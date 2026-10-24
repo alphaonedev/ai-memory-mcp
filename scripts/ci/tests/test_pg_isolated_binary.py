@@ -651,6 +651,70 @@ class Budget(unittest.TestCase):
         self.assertIn('connection', str(ctx.exception))
         self.assertFalse([s for s in rec.sql() if s.startswith('CREATE DATABASE')])
 
+    def _setup_with_free_slots(self, free, jobs, **kwargs):
+        rec = Recorder()
+        err = io.StringIO()
+        budget = (100, 3, 100 - 3 - free, free)
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: budget), \
+                contextlib.redirect_stderr(err):
+            got = pib.setup_effective(BASE, 'ai_memory_test_ci_9_1_x', jobs, **kwargs)
+        return got, rec, err.getvalue()
+
+    def test_setup_clamps_jobs_to_the_live_budget_and_says_so_6383_r4(self):
+        per = pib.PER_BINARY_CONNECTIONS + pib.HOLD_CONNECTIONS
+        fit = (87 - pib.CONNECTION_HEADROOM) // per
+        (tpl, effective), rec, err = self._setup_with_free_slots(87, 8)
+        self.assertEqual((tpl, effective), (TPL, fit))
+        self.assertLess(fit, 8)
+        notice = ('::notice::[#6383] per-binary isolation clamped jobs 8 -> %d '
+                  '(free slots 87, per-binary need %d)' % (fit, per))
+        self.assertIn(notice, err.splitlines())
+        self.assertIn('CREATE DATABASE "%s"' % TPL, rec.sql())
+
+    def test_setup_without_pressure_keeps_the_requested_jobs_6383_r4(self):
+        (_tpl, effective), _rec, err = self._setup_with_free_slots(10_000, 8)
+        self.assertEqual(effective, 8)
+        self.assertNotIn('clamped', err)
+
+    def test_setup_still_fails_closed_when_not_one_binary_fits_6383_r4(self):
+        free = pib.required_connections(1) - 1
+        with self.assertRaises(pib.WrapperError) as ctx:
+            self._setup_with_free_slots(free, 8)
+        self.assertIn('free connection slots', str(ctx.exception))
+
+    def test_no_clamp_keeps_the_fail_closed_behaviour_6383_r4(self):
+        with self.assertRaises(pib.WrapperError) as ctx:
+            self._setup_with_free_slots(87, 8, clamp=False)
+        self.assertIn('172 needed for 8 parallel binaries', str(ctx.exception))
+        rec = Recorder()
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: (100, 3, 10, 87)), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--no-clamp'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+
+    def test_emit_env_carries_the_effective_jobs_and_run_reads_it_6383_r4(self):
+        rec = Recorder()
+        out = []
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.object(pib, 'connection_budget', lambda _u: (100, 3, 10, 87)), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                unittest.mock.patch.object(pib, '_emit', out.append), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--run-id', RUN,
+                           '--emit-env'])
+        self.assertEqual(rc, 0)
+        self.assertIn('%s=3' % pib.JOBS_VAR, out)
+        args = pib.build_parser().parse_args(['run', '--targets-file', 'x'])
+        with unittest.mock.patch.dict(os.environ, {pib.JOBS_VAR: '3'}, clear=False):
+            self.assertEqual(pib.effective_run_jobs(args.jobs), 3)
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pib.JOBS_VAR, None)
+            self.assertEqual(pib.effective_run_jobs(args.jobs), pib.MAX_JOBS)
+        self.assertEqual(pib.effective_run_jobs(5), 5)
+
     def test_required_connections_formula(self):
         self.assertEqual(pib.required_connections(8),
                          8 * (pib.PER_BINARY_CONNECTIONS + pib.HOLD_CONNECTIONS) + pib.CONNECTION_HEADROOM)
@@ -680,7 +744,8 @@ class TierSteps(unittest.TestCase):
             rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--run-id', RUN,
                            '--emit-env'])
         self.assertEqual(rc, 0)
-        self.assertEqual(out, ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN)])
+        self.assertEqual(out[:2], ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN)])
+        self.assertEqual(out[2], '%s=8' % pib.JOBS_VAR)
 
     def test_teardown_drops_only_this_runs_clones_without_force(self):
         def answer(argv, kw):

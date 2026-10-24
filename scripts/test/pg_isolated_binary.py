@@ -17,10 +17,14 @@ Sub-commands (``-h`` on each):
               ``<db>_tpl`` (age + vector, ``IS_TEMPLATE true
               ALLOW_CONNECTIONS false``). ``--emit-env`` prints
               ``AI_MEMORY_TEST_PG_TEMPLATE=`` and ``AI_MEMORY_TEST_PG_RUN_ID=``
-              lines for ``$GITHUB_ENV``. Fails closed.
+              and ``AI_MEMORY_TEST_PG_JOBS=`` lines for ``$GITHUB_ENV``. ``--jobs`` is CLAMPED to what the live
+              budget fits (one ``::notice::`` line); ``--no-clamp`` and "not even one binary fits" fail closed.
+              Ceiling: one binary needs 18 pool + 1 hold connections and 20 are kept as headroom, so a
+              100-connection tier runs 4 binaries at once (3 with 87 free slots). The pool size is not
+              configurable through an environment variable the tests honour, so the estimate stays.
 ``run``       run ``cargo test --no-fail-fast --test <bin>`` once per binary,
               each against its own clone (held by a keepalive session while in
-              use), ``--jobs`` at a time (degraded to what the live budget
+              use), ``--jobs`` (default: the count setup emitted) at a time (degraded to what the live budget
               allows), then the residual list one at a time on the shared
               database with the flag stripped. Output goes to one log file per
               binary under ``--log-dir``; a failing binary's tail is echoed.
@@ -66,6 +70,7 @@ AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
 TEMPLATE_VAR = 'AI_MEMORY_TEST_PG_TEMPLATE'
 RUN_ID_VAR = 'AI_MEMORY_TEST_PG_RUN_ID'
+JOBS_VAR = 'AI_MEMORY_TEST_PG_JOBS'  # effective job count setup emitted for `run`
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
@@ -884,12 +889,39 @@ def _proved_absent(url: str, check: str) -> Tuple[bool, str]:
     return True, ''
 
 
+def effective_run_jobs(cli_jobs: Optional[int]) -> int:
+    """``run`` width: an explicit ``--jobs``, else the count ``setup`` emitted, else MAX_JOBS."""
+    if cli_jobs is not None:
+        return cli_jobs
+    emitted = os.environ.get(JOBS_VAR, '')
+    if _DIGITS_RE.fullmatch(emitted):
+        return int(emitted)
+    return MAX_JOBS
+
+
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
-    """Check the live budget, then create the locked template. Returns its name."""
+    """Fail-closed setup (no clamp). Returns the template name."""
+    return setup_effective(url, db_name, jobs, clamp=False)[0]
+
+
+def setup_effective(url: str, db_name: str, jobs: int = MAX_JOBS, clamp: bool = True) -> Tuple[str, int]:
+    """Check the live budget, then create the locked template. Returns (template, effective jobs).
+
+    With ``clamp`` the job count drops to what the live budget fits (#6383 r4) and a notice says so; it still
+    fails closed when not even one binary fits. Without it a short budget is a refusal.
+    """
     _checked_ident(db_name)
     tpl = _checked_ident(template_name(db_name))
-    need = required_connections(clamp_jobs(jobs))
+    requested = clamp_jobs(jobs)
+    need = required_connections(requested)
     most, reserved, now, available = connection_budget(url)
+    effective = requested
+    if clamp and available < need and available >= required_connections(1):
+        effective = width_for(available, requested)
+        need = required_connections(effective)
+        print('::notice::[#6383] per-binary isolation clamped jobs %d -> %d (free slots %d, per-binary need %d)'
+              % (requested, effective, available, PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS),
+              file=sys.stderr, flush=True)
     if available < need:
         raise WrapperError('only %d free connection slots (max_connections=%d, reserved=%d, open now=%d); '
                            '%d needed for %d parallel binaries' % (available, most, reserved, now, need, jobs))
@@ -937,7 +969,7 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
             log('WARN could not drop the half-built template %s: %s' % (tpl, cleanup))
         raise
     log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
-    return tpl
+    return tpl, effective
 
 
 def _names(url: str, sql: str) -> List[str]:
@@ -1185,6 +1217,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument('--url', help=url_help)
     setup_p.add_argument('--db', help='base database (default: the URL database)')
     setup_p.add_argument('--jobs', type=int, default=MAX_JOBS)
+    setup_p.add_argument('--no-clamp', action='store_true',
+                         help='fail closed when --jobs does not fit the live budget (default: clamp with a notice)')
     setup_p.add_argument('--run-id', help='run id for the clone names (default: generated)')
     setup_p.add_argument('--emit-env', action='store_true',
                          help='print %s= and %s= lines for $GITHUB_ENV' % (TEMPLATE_VAR, RUN_ID_VAR))
@@ -1205,7 +1239,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument('--template', help='template database (default: $%s)' % TEMPLATE_VAR)
     run.add_argument('--log-dir', help='per-binary log files (default: $RUNNER_TEMP/pg-isolate-logs '
                                        'or .local-runs/pg-isolate-logs)')
-    run.add_argument('--jobs', type=int, default=MAX_JOBS)
+    run.add_argument('--jobs', type=int, default=None,
+                     help='parallel binaries (default: $%s from setup, else %d)' % (JOBS_VAR, MAX_JOBS))
     run.add_argument('--targets-file', required=True, help='one "--test NAME" / "--bin NAME" per line')
     run.add_argument('--residual-file', help='names that stay serial on the shared database')
     run.add_argument('--test-arg', action='append', default=[], help='forwarded after "--" to libtest')
@@ -1226,8 +1261,9 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     targets = [parse_target_line(ln) for ln in read_lines(args.targets_file)]
     residual = set(read_lines(args.residual_file)) if args.residual_file else set()
     available = connection_budget(url)[3]
-    width = width_for(available, args.jobs)
-    if width < clamp_jobs(args.jobs):
+    jobs = effective_run_jobs(args.jobs)
+    width = width_for(available, jobs)
+    if width < clamp_jobs(jobs):
         log('::warning::only %d free connection slots: width degraded to %d' % (available, width))
     env = dict(os.environ)
     env[URL_VAR] = url
@@ -1251,10 +1287,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.cmd == 'setup':
             db = args.db or database_name(url)
             run_id = checked_run_id(args.run_id or new_run_id())
-            tpl = setup(url, db, args.jobs)
+            tpl, effective = setup_effective(url, db, args.jobs, clamp=not args.no_clamp)
             if args.emit_env:
                 _emit('%s=%s' % (TEMPLATE_VAR, tpl))
                 _emit('%s=%s' % (RUN_ID_VAR, run_id))
+                _emit('%s=%d' % (JOBS_VAR, effective))
             return 0
         if args.cmd == 'teardown':
             db = args.db or database_name(url)
