@@ -20,6 +20,7 @@ Stdlib only.
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -370,6 +371,36 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
             with self.subTest(mutant=name):
                 self.assertNotEqual(edited, text, "the mutation did not apply")
                 self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
+
+    def test_the_allowlist_catches_the_round_2_bypasses_8187(self):
+        # F5: a deny-list skipped `echo` lines and a redirection read fed to a client other than psql
+        text = (WORKFLOWS / "cert-postgres-age.yml").read_text(encoding="utf-8")
+        anchor = '          if [ ! -f "$url_file" ]; then'
+        mutants = {
+            "echo piped to psql with cat": '          echo "SELECT 1" | psql "$(cat "$url_file")"',
+            "redirect read into pg_isready": '          tier="$(< "$url_file")"\n          pg_isready -d "$tier"',
+            "read builtin into psql": '          read -r tier < "$url_file"\n          psql "$tier" -c "SELECT 1"',
+            "echo of the file": '          echo "$(cat "$url_file")"',
+            "redirect read into another client": '          pg_dump "$(< "$url_file")" > dump.sql',
+            "file copied": '          cp "$url_file" "$RUNNER_TEMP/x"',
+            "file by its path": '          cat "$HOME/.ai-memory-ci-fed-url"',
+            "helper output piped on": '          python3 -I ' + HELPER + ' run --url-file "$url_file" -- psql -c x | tee out',
+            "helper with substitution": '          python3 -I ' + HELPER + ' run --url-file "$url_file" -- psql -c "$(< "$url_file")"',
+        }
+        for name, add in mutants.items():
+            with self.subTest(mutant=name):
+                edited = text.replace(anchor, add + "\n" + anchor, 1)
+                self.assertNotEqual(edited, text, "the mutation did not apply")
+                self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
+
+    def test_a_yaml_workflow_naming_the_tier_secret_is_checked_8187(self):
+        scratch = ROOT / ".local-runs" / "r3"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch, prefix="wf-") as raw:
+            directory = Path(raw)
+            (directory / "scratch-tier.yaml").write_text("steps:\n  - run: cat ~/.ai-memory-ci-fed-url\n", encoding="utf-8")
+            (directory / "other.yml").write_text("steps:\n  - run: echo hi\n", encoding="utf-8")
+            self.assertEqual(tier_workflows(directory), ["scratch-tier.yaml"])
 
 
 if __name__ == "__main__":
