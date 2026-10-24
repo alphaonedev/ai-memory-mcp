@@ -32,7 +32,7 @@
     clippy::uninlined_format_args
 )]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ai_memory::models::Memory;
 use ai_memory::store::postgres::{PostgresStore, RECORD_STOP_REFRESH_TTL_MS};
@@ -43,6 +43,58 @@ const TTL_SLACK_MS: u64 = 400;
 
 fn past_ttl() -> Duration {
     Duration::from_millis(RECORD_STOP_REFRESH_TTL_MS + TTL_SLACK_MS)
+}
+
+/// The within-TTL branch only asserts the cache contract when the write was
+/// issued with at least this much of the window left; a host stall that eats
+/// the margin is retried, not asserted (#6796).
+const WITHIN_TTL_BUDGET_MS: u64 = RECORD_STOP_REFRESH_TTL_MS - TTL_SLACK_MS;
+
+/// Upper bound on within-TTL attempts. Each attempt re-primes and re-measures;
+/// the within-TTL claim is asserted only when the final attempt was measured
+/// inside [`WITHIN_TTL_BUDGET_MS`]. A bounded count keeps a permanently stalled
+/// host from looping forever; when every attempt overran, the claim is
+/// unmeasurable and is logged instead of asserted (#8042).
+const WITHIN_TTL_ATTEMPTS: usize = 3;
+
+/// One within-TTL attempt: connect a fresh `store_a`, run one warm-up write so
+/// the cold first write (statement prepare, pool warm-up) is paid before the
+/// measured window, let its seed clock go stale, then prime the cache with ONE write (the gate
+/// re-checks the chain and CAS-advances the cache clock), engage the stop from `store_b`, and write
+/// immediately. The window is timed from just BEFORE the priming write, so the
+/// measured elapsed is an upper bound on the cache age even when `connect`
+/// tail work or a host stall ran before it (#6796). Returns the store, whether
+/// the gate stayed out of the way, the debug form of the write result, and the
+/// milliseconds elapsed since the prime when the write was issued.
+async fn within_ttl_attempt(
+    url: &str,
+    store_b: &PostgresStore,
+    ctx: &CallerContext,
+    id: &str,
+) -> (PostgresStore, bool, String, u128) {
+    let store_a = PostgresStore::connect(url).await.expect("connect store_a");
+    let warm_id = format!("{id}-warm");
+    store_a
+        .store(ctx, &mem("ns-3276-warm", &warm_id))
+        .await
+        .expect("warm-up write while the plane is running");
+    purge(store_b, &warm_id).await;
+    tokio::time::sleep(past_ttl()).await;
+    let primed_at = Instant::now();
+    let prime_id = format!("{id}-prime");
+    store_a
+        .store(ctx, &mem("ns-3276-prime", &prime_id))
+        .await
+        .expect("priming write while the plane is running");
+    store_b
+        .record_stop(ctx, true, "ai:3276", "record-plane")
+        .await
+        .expect("engage record-stop from store_b");
+    let elapsed_ms = primed_at.elapsed().as_millis();
+    let early = store_a.store(ctx, &mem("ns-3276-early", id)).await;
+    purge(store_b, &prime_id).await;
+    let not_gated = !matches!(early, Err(StoreError::Stopped { .. }));
+    (store_a, not_gated, format!("{early:?}"), elapsed_ms)
 }
 
 fn mem(namespace: &str, id: &str) -> Memory {
@@ -84,7 +136,6 @@ async fn pg_write_gate_honors_cross_pool_stop_within_ttl_3276() {
     // `store_a` connects while the plane is RUNNING, so its cache is seeded
     // RUNNING and ONLY a durable re-check can correct it (no reconnect, no
     // `record_stop_status` call, in this test).
-    let store_a = PostgresStore::connect(&url).await.expect("connect store_a");
     let store_b = PostgresStore::connect(&url).await.expect("connect store_b");
     let ctx = CallerContext::for_admin("ai:3276");
 
@@ -95,24 +146,45 @@ async fn pg_write_gate_honors_cross_pool_stop_within_ttl_3276() {
     // ============================================================
     // PHASE A — the durable re-check + the bounded fast-path window.
     // ============================================================
-    store_b
-        .record_stop(&ctx, true, "ai:3276", "record-plane")
-        .await
-        .expect("engage record-stop from store_b");
-
     // (2) STEADY-STATE FAST PATH: within the TTL window, `store_a`'s write
     //     gate rides its (still-RUNNING) process-local cache and does NOT do
     //     a per-write DB read — so it does not yet observe the cross-pool
     //     stop and the write LANDS. This is the deliberate, bounded fail-open
-    //     window (≤ RECORD_STOP_REFRESH_TTL_MS) that is the accepted cost of
+    //     window (<= RECORD_STOP_REFRESH_TTL_MS) that is the accepted cost of
     //     NOT paying a DB round-trip on every write; a per-write read is what
     //     #3276 explicitly must avoid. Same-process stops remain instant (the
-    //     shared cache flips synchronously) — this window is cross-pool only.
-    let early = store_a.store(&ctx, &mem("ns-3276-early", &early_id)).await;
+    //     shared cache flips synchronously) - this window is cross-pool only.
+    //
+    //     #6796 / #8042: the claim only holds when the write really was issued
+    //     inside the window, so measure it. If a loaded host spent the margin
+    //     on the engage round-trips, release, re-prime and retry, up to
+    //     WITHIN_TTL_ATTEMPTS times, and assert only on a measured window.
+    let budget_ms = u128::from(WITHIN_TTL_BUDGET_MS);
+    let (mut store_a, mut early_not_gated, mut early, mut elapsed_ms) =
+        within_ttl_attempt(&url, &store_b, &ctx, &early_id).await;
+    let mut measured_ms = vec![elapsed_ms];
+    while elapsed_ms >= budget_ms && measured_ms.len() < WITHIN_TTL_ATTEMPTS {
+        store_b
+            .record_stop(&ctx, false, "ai:3276", "record-plane")
+            .await
+            .expect("release record-stop (within-TTL retry)");
+        purge(&store_b, &early_id).await;
+        (store_a, early_not_gated, early, elapsed_ms) =
+            within_ttl_attempt(&url, &store_b, &ctx, &early_id).await;
+        measured_ms.push(elapsed_ms);
+    }
+    let attempts = measured_ms.len();
+    let within_ttl_measured = elapsed_ms < budget_ms;
+    if !within_ttl_measured {
+        println!(
+            "#8042: every within-TTL attempt overran the {WITHIN_TTL_BUDGET_MS} ms budget \
+             (measured elapsed ms per attempt: {measured_ms:?}, attempts={attempts}); \
+             the within-TTL claim is unmeasurable on this host, skipping that assertion"
+        );
+    }
     // The precise steady-state claim: the gate did NOT refuse (it rode the
     // cache and did not re-read the chain). A per-write DB read would have
     // surfaced the just-engaged cross-pool stop as `Stopped` here.
-    let early_not_gated = !matches!(early, Err(StoreError::Stopped { .. }));
     let early_landed = row_exists(&store_b, &early_id).await;
 
     // Let the shared re-check clock go stale.
@@ -169,10 +241,13 @@ async fn pg_write_gate_honors_cross_pool_stop_within_ttl_3276() {
 
     // -------------------- assertions --------------------
     assert!(
-        early_not_gated,
+        early_not_gated || !within_ttl_measured,
         "#3276: within the TTL window the write gate must ride the local cache \
          (no per-write DB read), so a just-engaged cross-pool stop is not yet \
-         seen and the gate does NOT refuse; got {early:?}, landed={early_landed}"
+         seen and the gate does NOT refuse; got {early}, landed={early_landed}, \
+         write issued {elapsed_ms} ms after the cache primed (budget \
+         {WITHIN_TTL_BUDGET_MS} ms of the {RECORD_STOP_REFRESH_TTL_MS} ms TTL), \
+         attempts={attempts}"
     );
     assert!(
         late_stopped && !late_landed,
