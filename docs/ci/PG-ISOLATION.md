@@ -1,14 +1,25 @@
 # Per-binary Postgres isolation (#6383 / #6386)
 
-Status: **opt-in, off on every CI leg.** The lane runs only when
-`AI_MEMORY_TEST_PG_ISOLATE` is `1` in the job environment, and
-`.github/workflows/ci.yml` sets it on no leg (the invariant
-`G1-opt-in` in `scripts/ci/check_pg_isolate_invariants.py` fails the build if
-it ever does). This was decided by GOD in review r1 (M4): the first sharded
-carrier run goes with isolation off. Making it the default, and raising
-in-binary `--test-threads` above 1, wait for two green sharded carrier runs and
-a 5-agent vote (`4d3ea1c5`). The repository variable `CI_PG_ISOLATE_OFF=1` is
-an extra hard kill switch that wins over the flag.
+Status: **on by default for the enterprise-fed tier, i.e. both fed legs**
+(`Check (linux-fed,enterprise-fed)` and `Check (macos-fed,enterprise-fed)`),
+**and off on every other leg.** The `check` job env in
+`.github/workflows/ci.yml` sets `AI_MEMORY_TEST_PG_ISOLATE` to
+`${{ matrix.tier == 'enterprise-fed' && '1' || '0' }}`. The invariant
+`G1-default-on` in `scripts/ci/check_pg_isolate_invariants.py` fails the build
+if the flag is 1 anywhere else, or if the kill switch stops forcing it to 0.
+
+Decision: ai-memory `919f1943`, `3-agent vote (6def5ab6)` (1x3 crossroads,
+2026-10-24, three votes for Option A). It supersedes the opt-in posture that
+GOD set in review r1 (M4) and the 5-agent vote shape `4d3ea1c5`; the enabling
+PR's own two green full-suite sharded runs are the two qualifying runs.
+In-binary `--test-threads` stays at 1 (a separate decision).
+
+The repository variable `CI_PG_ISOLATE_OFF=1` is the hard kill switch. It wins
+over the flag and is the only way to turn the lane off on a fed leg: the
+configure step then writes `AI_MEMORY_TEST_PG_ISOLATE=0` to `$GITHUB_ENV`, runs
+no setup, and the test step runs the binaries on the shared database as before.
+The configure step logs which path it took (ON with template and run id, OFF by
+the kill switch, or OFF because the tier is not enterprise-fed).
 
 ## What changes when it is on
 
