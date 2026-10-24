@@ -506,9 +506,11 @@ def tier_workflows(directory=WORKFLOWS):
     return sorted(p.name for p in paths if TIER_MARKERS.search(p.read_text(encoding="utf-8")))
 
 
-# r6 F10: the post-export steps are pinned as exact text (the loader-call allowlist and dumps_environment stay as the
-# second and third gates).  The pins live in a data file next to this module: ci.yml alone has ~90 KB of such steps.
-PINS_FILE = Path(__file__).with_name("tier_post_export_pins_8187.json")
+# r7 F11: the complete job that exports the tier URL is pinned line by line, with the set of jobs (the loader-call
+# allowlist and dumps_environment stay as the second and third gates).  PyYAML is not a dependency of this
+# repository's CI scripts, so the pin reads the text; see job_layout.  The pins are in a data file next to this
+# module.
+JOB_PINS_FILE = Path(__file__).with_name("tier_export_job_pins_8187.json")
 PIN_WORKFLOWS = ("ci.yml", *SHARED_TIER)
 JOB_KEY = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 STEP_LINE = re.compile(r"^      - ")
@@ -565,30 +567,162 @@ def post_export_steps(workflow, text):
 
 
 def pin_entry(body):
-    """The pin of one step body: the SHA-256 of its exact text and a short hash of every line (for the line number).
+    """The pin of one job block: the SHA-256 of its exact text and a 12-hex hash of every line, joined (line numbers).
 
     Hashes, not the text: the table stays small, and the data file never repeats workflow prose that the repository
     phrase scans read.  Equality of the full SHA-256 is exact-text equality.
     """
     return {"sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "lines": [hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in body.split("\n")]}
+            "lines": "".join(hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in body.split("\n"))}
 
 
-def job_pin_problems(workflow, text, pins=None):
-    """Placeholder for the red commit: no job pin check yet."""
-    return []
+JOB_HEAD = re.compile(r"^jobs:\s*(?:#.*)?$")
+JOB_KEY_LINE = re.compile(r"^( *)([A-Za-z0-9_-]+):\s*(?:#.*)?$")
+TIER_JOB_MARK = re.compile(TIER_MARKERS.pattern + r"|tier_credential\.py|check-tier-password")
 
 
-def load_job_pins():
-    return {}
+def comment_or_blank(line):
+    return not line.strip() or line.lstrip().startswith("#")
 
 
 def job_layout(text):
-    return [], []
+    """``(jobs, problems)``: every job of the single top-level ``jobs:`` section of a workflow.
+
+    A job is ``(name, first, end, block)``: line indexes into ``text.split("\\n")`` and the exact text of the job from
+    its key line to its last code line (trailing comment and blank lines belong to no job).  Fails closed, with a
+    problem, when ``jobs:`` is missing or repeated, when a line of the section sits left of the job keys or at the job
+    indentation without being a plain ``name:`` key, or when a job name repeats.  Comment lines never end a job: the
+    keys that follow a column-0 comment belong to the job above it (F11b).  The job key indentation is read from the
+    file, not assumed (F11a).
+    """
+    lines = text.split("\n")
+    heads = [i for i, ln in enumerate(lines) if JOB_HEAD.match(ln)]
+    if len(heads) != 1:
+        return [], [f"expected exactly one top-level jobs: key, found {len(heads)}"]
+    start = heads[0] + 1
+    stop = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].strip() and not lines[i].startswith((" ", "#")):
+            stop = i
+            break
+    code = [i for i in range(start, stop) if not comment_or_blank(lines[i])]
+    if not code:
+        return [], ["the jobs: section holds no job"]
+    unit = indent_of(lines[code[0]])
+    problems = []
+    keys = []
+    for i in code:
+        width = indent_of(lines[i])
+        if width < unit:
+            problems.append(f"line {i + 1}: indentation left of the job keys in the jobs: section")
+        elif width == unit:
+            match = JOB_KEY_LINE.match(lines[i])
+            if match:
+                keys.append((match.group(2), i))
+            else:
+                problems.append(f"line {i + 1}: unrecognised job key at the job indentation")
+    jobs = []
+    names = set()
+    for number, (name, first) in enumerate(keys):
+        end = keys[number + 1][1] if number + 1 < len(keys) else stop
+        while end > first + 1 and comment_or_blank(lines[end - 1]):
+            end -= 1
+        if name in names:
+            problems.append(f"job {name} appears twice")
+        names.add(name)
+        jobs.append((name, first, end, "\n".join(lines[first:end])))
+    return jobs, problems
 
 
 def tier_blocks(jobs):
-    return []
+    """``[(name, block)]`` of the jobs whose code names the tier credential, its loader or its gate."""
+    found = []
+    for name, _first, _end, block in jobs:
+        if any(TIER_JOB_MARK.search(ln) for ln in block.split("\n") if not comment_or_blank(ln)):
+            found.append((name, block))
+    return found
+
+
+def load_job_pins():
+    """``{workflow: {"jobs": [job names], "pinned": {job: pin_entry(exact job text)}}}``."""
+    return json.loads(JOB_PINS_FILE.read_text(encoding="utf-8"))
+
+
+def step_label(block, offset):
+    """``(step index, step name)`` of the step that holds line ``offset`` of a job block, for the failure message."""
+    rows = block.split("\n")
+    steps_at = next((i for i, ln in enumerate(rows) if ln.strip() == "steps:"), None)
+    if steps_at is None or offset <= steps_at:
+        return None, "job-level keys"
+    item = next((indent_of(ln) for ln in rows[steps_at + 1:] if not comment_or_blank(ln)), 0)
+    heads = [i for i in range(steps_at + 1, len(rows))
+             if indent_of(rows[i]) == item and rows[i].lstrip().startswith("- ")]
+    owner = max((n for n, i in enumerate(heads) if i <= offset), default=None)
+    if owner is None:
+        return None, "job-level keys"
+    end = heads[owner + 1] if owner + 1 < len(heads) else len(rows)
+    name = rows[heads[owner]].lstrip()[2:].strip()
+    for ln in rows[heads[owner]:end]:
+        words = ln.strip().lstrip("- ").strip()
+        if words.startswith(("name:", "id:")):
+            name = words
+            break
+    return owner, name[:80]
+
+
+def first_difference(pinned, block):
+    """``(line offset, found line)`` of the first line of ``block`` that differs from the pinned line hashes."""
+    new = block.split("\n")
+    old = [pinned["lines"][k:k + 12] for k in range(0, len(pinned["lines"]), 12)]
+    for number in range(max(len(old), len(new))):
+        if number >= len(new):
+            return number, "<the job ends here; pinned lines are missing>"
+        if number >= len(old) or hashlib.sha256(new[number].encode("utf-8")).hexdigest()[:12] != old[number]:
+            return number, new[number].strip()[:120]
+    return 0, ""
+
+
+def job_pin_problems(workflow, text, pins=None):
+    """Problems of the complete tier jobs of one workflow against the pins (r7 F11).
+
+    The whole job that names the tier credential is pinned, every line from its key to its last code line, so no step
+    before or after the export can change unseen; the set of jobs is pinned too, so a new or renamed job cannot appear
+    unpinned.  The export call must sit inside a pinned job.  Messages carry the workflow, job, step index and name,
+    and the first differing line; workflow text holds no secret.
+    """
+    pins = load_job_pins() if pins is None else pins
+    jobs, problems = job_layout(text)
+    problems = [f"{workflow}: {p}" for p in problems]
+    entry = pins.get(workflow)
+    if entry is None:
+        return problems + [f"{workflow}: no job pin exists for this workflow"]
+    names = [j[0] for j in jobs]
+    if names != entry["jobs"]:
+        added = sorted(set(names) - set(entry["jobs"]))
+        gone = sorted(set(entry["jobs"]) - set(names))
+        problems.append(f"{workflow}: the set of jobs changed (added {added}, missing {gone}"
+                        f"{'' if set(names) != set(entry['jobs']) else ', order changed'})")
+    tiered = dict(tier_blocks(jobs))
+    for name in tiered:
+        if name not in entry["pinned"]:
+            problems.append(f"{workflow} job {name}: names the tier credential but is not pinned")
+    for name, pinned in entry["pinned"].items():
+        if name not in tiered:
+            problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
+        elif hashlib.sha256(tiered[name].encode("utf-8")).hexdigest() != pinned["sha256"]:
+            offset, found = first_difference(pinned, tiered[name])
+            index, label = step_label(tiered[name], offset)
+            where = "job-level keys" if index is None else f"step {index} ({label})"
+            first = next(j[1] for j in jobs if j[0] == name)
+            problems.append(f"{workflow} job {name} {where}: differs from the pin at line {first + offset + 1}: "
+                            f"found '{found}'")
+    outside = [i + 1 for i, ln in enumerate(text.split("\n"))
+               if EXPORT_CALL.search(ln) and not any(j[1] <= i < j[2] and j[0] in entry["pinned"] for j in jobs)]
+    if outside:
+        problems.append(f"{workflow}: the tier export call at line {outside[0]} sits outside a pinned job")
+    if not any(EXPORT_CALL.search(ln) for name in entry["pinned"] for ln in tiered.get(name, "").split("\n")):
+        problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
+    return problems
 
 
 
@@ -1051,8 +1185,11 @@ if __name__ == "__main__":
         # regenerate the pin table from the workflows; the diff of the data file is what a reviewer reads
         table = {}
         for workflow in PIN_WORKFLOWS:
-            for key, body in post_export_steps(workflow, (WORKFLOWS / workflow).read_text(encoding="utf-8")):
-                table[key] = pin_entry(body)
-        PINS_FILE.write_text(json.dumps(table, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+            found, bad = job_layout((WORKFLOWS / workflow).read_text(encoding="utf-8"))
+            if bad:
+                sys.exit(f"{workflow}: {bad[0]}")
+            table[workflow] = {"jobs": [j[0] for j in found],
+                               "pinned": {name: pin_entry(block) for name, block in tier_blocks(found)}}
+        JOB_PINS_FILE.write_text(json.dumps(table, indent=1) + "\n", encoding="utf-8")
         sys.exit(0)
     sys.exit(unittest.main())
