@@ -275,7 +275,8 @@ def runs_on_labels(job):
 # ci.yml (mobile-cross-compile) lists `os: macos-latest` and `os: ubuntu-latest`; release.yml (release) lists
 # `os: ubuntu-latest`, `ubuntu-24.04-arm`, `macos-15-intel` and `macos-latest`.  lifetime-tests is the only row that
 # may name a self-hosted tuple: the macOS fleet runner holds the at-rest tier URL file like linux-fed does, so that
-# job's steps are pinned in the exempt_jobs section of tier_export_job_pins_8187.json (F20); the residual is #6181.
+# job and its workflow are pinned in the exempt_jobs section of tier_export_job_pins_8187.json (F20, F21): the exempt
+# job and every workflow-level key except ``jobs`` of its workflow; the residual is #6181.
 RUNS_ON_EXEMPT = {
     ("session-boot-lifetime.yml", "lifetime-tests"): (
         "matrix leg on the macOS fleet runner; no tier credential, steps pinned (F20)",
