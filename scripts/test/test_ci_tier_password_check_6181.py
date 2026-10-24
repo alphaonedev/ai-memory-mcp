@@ -755,6 +755,26 @@ def load_job_pins():
     return json.loads(JOB_PINS_FILE.read_text(encoding="utf-8"))
 
 
+def step_value(raw):
+    """The scalar after a ``name:``/``id:`` key, as the loader reads it: a quoted scalar without its quotes, a plain one
+    without its trailing `` #`` comment, cut to 60 characters like ``tier_yaml_8187.step_label``."""
+    raw = raw.strip()
+    if raw[:1] in ("'", '"'):
+        quote = raw[0]
+        at = 1
+        while at < len(raw):
+            if raw[at] == "\\" and quote == '"':
+                at += 2
+            elif raw[at] == quote and raw[at + 1:at + 2] == quote:
+                at += 2
+            elif raw[at] == quote:
+                return raw[1:at][:60]
+            else:
+                at += 1
+        return ""
+    return re.split(r"\s#", raw, maxsplit=1)[0].strip()[:60]
+
+
 def step_label(block, offset):
     """``(step index, step name)`` of the step that holds line ``offset`` of a job block, for the failure message."""
     rows = block.split("\n")
@@ -768,13 +788,21 @@ def step_label(block, offset):
     if owner is None:
         return None, "job-level keys"
     end = heads[owner + 1] if owner + 1 < len(heads) else len(rows)
-    name = f"step[{owner}]"
-    for ln in rows[heads[owner]:end]:
-        words = ln.strip().lstrip("- ").strip()
-        if words.startswith(("name:", "id:")):
-            name = words
-            break
-    return owner, name[:80]
+    head = rows[heads[owner]]
+    after = head.lstrip()[1:]
+    key_column = indent_of(head) + 1 + (len(after) - len(after.lstrip()))
+    own = {}
+    for number in range(heads[owner], end):
+        row = rows[number]
+        text = row.lstrip()[1:].lstrip() if number == heads[owner] else row.strip()
+        column = key_column if number == heads[owner] else indent_of(row)
+        if column != key_column:
+            continue
+        for key in ("name", "id"):
+            if text.startswith(key + ":"):
+                own.setdefault(key, step_value(text[len(key) + 1:]))
+    label = own.get("name") or own.get("id") or f"step[{owner}]"
+    return owner, ty.mask_userinfo(label)
 
 
 def first_difference(pinned, block):
@@ -2239,9 +2267,124 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
     def test_the_checker_sources_slice_no_workflow_line_8187_f26(self):
         wide = {path.name: [int(n) for n in re.findall(r"\[:(\d+)\]", path.read_text(encoding="utf-8")) if int(n) >= 40]
                 for path in (Path(__file__), Path(__file__).with_name("tier_yaml_8187.py"))}
-        # the only wide slices left cut a step NAME (a label the author chose) to 60 and 80 characters, never a line
+        # the only wide slices left cut a step NAME (a label the author chose) to 60 characters in both views, never a line
         self.assertEqual(wide["tier_yaml_8187.py"], [60])
-        self.assertEqual(wide[Path(__file__).name], [80])
+        self.assertEqual(wide[Path(__file__).name], [60, 60])
+
+
+def step_head_rows(block):
+    """Row indexes of the ``- `` heads of the steps of a job block, read independently of ``step_label`` (r15 oracle)."""
+    rows = block.split("\n")
+    at = next((i for i, ln in enumerate(rows) if ln.strip() == "steps:"), None)
+    if at is None:
+        return []
+    item = next((indent_of(ln) for ln in rows[at + 1:] if not comment_or_blank(ln)), 0)
+    return [i for i in range(at + 1, len(rows)) if indent_of(rows[i]) == item and rows[i].lstrip().startswith("- ")]
+
+
+class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
+    """r15 F27, F28: the text view labels a step by the value of its own top-level ``name:``/``id:`` key only, and the
+    loader-failure message carries the rule and the line, never author text."""
+
+    SENTINELS = ("SENTINEL-F27-with", "SENTINEL-F27-env", "SENTINEL-F27-run", "SENTINEL-F27-comment")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+        cls.pins = load_job_pins()
+
+    def planted_step(self, named, env_first=False):
+        head = ["      - name: real  # SENTINEL-F27-comment"] if named else ["      - uses: actions/checkout@v4"]
+        body = ["        with:", "          name: SENTINEL-F27-with", "        env:", "          id: SENTINEL-F27-env",
+                "        run: |", "          name: SENTINEL-F27-run"]
+        if env_first and named:
+            return ["      - env:", "          id: SENTINEL-F27-env", "        name: real  # SENTINEL-F27-comment",
+                    "        with:", "          name: SENTINEL-F27-with", "        run: |", "          name: SENTINEL-F27-run"]
+        return head + body
+
+    def test_only_the_steps_own_name_key_reaches_a_message_8187_f27(self):
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            for variant, named, env_first in (("named", True, False), ("named env first", True, True),
+                                              ("unnamed", False, False)):
+                edited = splice(text, target[3], self.planted_step(named, env_first))
+                data = ty.load_strict(edited)
+                job_steps = data["jobs"][target[0]]["steps"]
+                index = next(i for i, s in enumerate(job_steps) if "SENTINEL-F27-env" in json.dumps(s))
+                want = "real" if named else f"step[{index}]"
+                problems = tier_pin_problems(wf, edited, self.pins) + job_pin_problems(wf, edited, self.pins[SECONDARY])
+                with self.subTest(workflow=wf, step=variant):
+                    checked += 1
+                    self.assertTrue(problems)
+                    for sentinel in self.SENTINELS:
+                        self.assertEqual([p for p in problems if sentinel in p], [], sentinel)
+                    self.assertTrue([p for p in problems if f"step {index} ({want})" in p], problems)
+        self.assertGreater(checked, 0)
+
+    def test_the_text_view_labels_agree_with_the_loaded_view_on_every_workflow_8187_f27(self):
+        compared = 0
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            jobs, problems = job_layout(text)
+            if problems:
+                continue
+            try:
+                data = ty.load_lenient(text)
+            except Exception:  # noqa: BLE001  (a workflow the loader cannot read has no loaded labels to compare)
+                continue
+            for name, _first, _end, block in jobs:
+                steps = ((data.get("jobs") or {}).get(name) or {}).get("steps")
+                heads = step_head_rows(block)
+                if not isinstance(steps, list):
+                    continue
+                with self.subTest(workflow=path.name, job=name):
+                    self.assertEqual(len(heads), len(steps))
+                    for index, row in enumerate(heads):
+                        self.assertEqual(step_label(block, row)[1], ty.step_label(steps[index], index), (index,))
+                        compared += 1
+        self.assertGreater(compared, 100)
+
+    def test_the_label_is_the_value_of_the_top_level_key_only_8187_f27(self):
+        block = "\n".join(["  job:", "    steps:", "      - uses: x", "        name: \"Quoted # name\"  # tail",
+                           "        with:", "          name: deep", "      - id: build", "        run: |",
+                           "          name: nope", "      - run: echo", "        env:", "          id: nope"])
+        heads = step_head_rows(block)
+        self.assertEqual([step_label(block, h) for h in heads],
+                         [(0, "Quoted # name"), (1, "build"), (2, "step[2]")])
+
+    def test_a_local_tag_or_tab_does_not_put_author_text_in_the_load_failure_8187_f28(self):
+        sentinel = "SENTINEL-F28"
+        docs = {"local tag": f"key: !<{sentinel}> x\n", "local tag in a list": f"a:\n  - !<{sentinel}> x\n",
+                "tab": f"key: x\n\t{sentinel}: 1\n"}
+        for label, doc in docs.items():
+            with self.subTest(document=label):
+                with self.assertRaises(Exception) as caught:
+                    ty.load_strict(doc)
+                if label.startswith("local tag"):
+                    self.assertIn(sentinel, str(caught.exception), "the parser message carries the author text here")
+                message = ty.load_failure(caught.exception)
+                self.assertNotIn(sentinel, message)
+                self.assertRegex(message, r"^\w+ at line \d+$")
+                data, problems = ty.parse_workflow(doc)
+                self.assertIsNone(data)
+                self.assertEqual([p for p in problems if sentinel in p], [])
+
+    def test_the_pure_python_fallback_loader_failure_carries_no_author_text_8187_f28(self):
+        # the loader the code falls back to when libyaml is absent prints the offending source line in str(exc)
+        sentinel = "SENTINEL-F28"
+        docs = {"local tag": f"key: !<{sentinel}> x\n", "tab": f"key: x\n\t{sentinel}: 1\n",
+                "unterminated": f'key: "{sentinel}\n'}
+        for label, doc in docs.items():
+            with self.subTest(document=label):
+                with self.assertRaises(ty.yaml.YAMLError) as caught:
+                    ty.yaml.load(doc, Loader=ty.yaml.SafeLoader)
+                self.assertIn(sentinel, str(caught.exception), "the pure-Python message carries the author text")
+                message = ty.load_failure(caught.exception)
+                self.assertNotIn(sentinel, message)
+                self.assertRegex(message, r"^\w+ at line \d+$")
 
 
 if __name__ == "__main__":
