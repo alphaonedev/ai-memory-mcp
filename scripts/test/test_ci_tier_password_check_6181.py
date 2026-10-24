@@ -315,23 +315,115 @@ def code_lines(text):
 URL_FILE_MENTION = re.compile(r"url_file|ai-memory-ci-fed-url|AI_MEMORY_CI_FED_URL|AI_MEMORY_TEST_(?:POSTGRES|AGE)_URL")
 URL_FILE_ASSIGN = 'url_file="$HOME/.ai-memory-ci-fed-url"'
 URL_FILE_TEST = re.compile(r'^if \[ !? ?-f "\$url_file" \]; then$')
-# `echo "::error::... $url_file ..."` prints the PATH of the file; the only expansions allowed are plain names
-MESSAGE_ECHO = re.compile(r'^echo "::(?:error|warning|notice)::[^"`$\\]*(?:\$\{?(?:url_file|RUNNER_NAME|CI_FED_DB)\}?[^"`$\\]*)*"$')
-# the loader: `[if ! |if |PSQL=(]python3 -I <helper> run|github-env --url-file "$url_file" ...`
-LOADER_CALL = re.compile(
-    r'^(?:if ! |if |PSQL=\()?python3 -I ' + re.escape(HELPER) + r' (?:'
-    r'run --url-file "\$url_file"(?: --database "\$CI_FED_DB")? -- psql\b(?P<run_tail>.*)'
-    r'|github-env --url-file "\$url_file" --database "\$CI_FED_DB"(?: --age-url)?(?P<env_tail>)$)')
-# nothing after the loader call may read, copy, pipe or substitute anything
-TAIL_FORBIDDEN = re.compile(r'\$\(|`|<|\||url_file|ai-memory-ci-fed-url|\btee\b|\bcat\b')
+# the expansions a reviewed message or psql argument may carry: plain names only, never a substitution
+MESSAGE_NAMES = r"(?:url_file|RUNNER_NAME|CI_FED_DB)"
+ARG_NAMES = r"(?:CI_FED_DB)"
+MESSAGE_PREFIX = re.compile(r'echo "::(?:error|warning|notice)::')
+LOADER_RUN = re.compile(
+    r'^(?P<pre>if ! |if |PSQL=\()python3 -I ' + re.escape(HELPER)
+    + r' run --url-file "\$url_file"(?: --database "\$CI_FED_DB")? -- psql(?P<tail>.*)$')
+LOADER_ENV = re.compile(
+    r'^python3 -I ' + re.escape(HELPER) + r' github-env --url-file "\$url_file" --database "\$CI_FED_DB"(?: --age-url)?$')
+# the reviewed arguments after `psql`, with every quoted word masked to Q by quote_masked
+PSQL_ARGS = r'(?: -v ON_ERROR_STOP=[01])?(?: -tAX| -tAc Q| -c Q)?'
+PSQL_ARRAY_MENTION = re.compile(r"PSQL")
+ARRAY_TOKEN = '"${PSQL[@]}"'
+
+
+def quote_masked(text, names):
+    """Return ``text`` with each quoted word replaced by ``Q``, or None when it is not a reviewed plain form.
+
+    One left-to-right pass (no regex backtracking).  Refused: an unquoted ``$``, backtick, backslash or ``<``; inside
+    double quotes a backtick, a backslash that does not escape ``"`` or ``$``, and a ``$`` not followed by one of
+    ``names``; inside single quotes a backslash (a psql shell escape needs one); a quoted word naming ``PROGRAM``.
+    """
+    expansion = re.compile(r"\$(?:\{" + names + r"\}|" + names + r"(?![A-Za-z0-9_]))")
+    out = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while True:
+                if j >= len(text):
+                    return None
+                ch = text[j]
+                if ch == '"':
+                    break
+                if ch == "\\":
+                    if text[j + 1:j + 2] not in ('"', "$"):
+                        return None
+                    j += 2
+                elif ch == "`":
+                    return None
+                elif ch == "$":
+                    m = expansion.match(text, j)
+                    if not m:
+                        return None
+                    j = m.end()
+                else:
+                    j += 1
+            word = text[i + 1:j]
+            i = j + 1
+        elif c == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                return None
+            word = text[i + 1:j]
+            if "\\" in word:
+                return None
+            i = j + 1
+        elif c in "`$\\<":
+            return None
+        else:
+            out.append(c)
+            i += 1
+            continue
+        if "program" in word.lower():
+            return None
+        out.append("Q")
+    return "".join(out)
+
+
+def message_echo(line):
+    """True for ``echo "::error|warning|notice::..."`` whose only expansions are plain reviewed names."""
+    return bool(MESSAGE_PREFIX.match(line)) and quote_masked(line, MESSAGE_NAMES) == "echo Q"
+
+
+def loader_line(line):
+    """True for a whole `run:` line that is exactly one reviewed loader call and nothing chained after it."""
+    if LOADER_ENV.match(line):
+        return True
+    call = LOADER_RUN.match(line)
+    if not call:
+        return False
+    masked = quote_masked(call.group("tail"), ARG_NAMES)
+    if masked is None:
+        return False
+    if call.group("pre") == "PSQL=(":
+        return bool(re.fullmatch(PSQL_ARGS + r"\)", masked))
+    return bool(re.fullmatch(PSQL_ARGS + r"(?: >/dev/null 2>&1)?; then", masked))
+
+
+def array_call(line):
+    """True for a reviewed use of the loader array: ``"${PSQL[@]}" -c Q [|| echo Q]`` or a captured `` | tr -d Q``."""
+    if ARRAY_TOKEN not in line:
+        return False
+    sub = re.fullmatch(r"[A-Za-z_]+=\$\((.*)\)", line)
+    command = (sub.group(1) if sub else line).replace(ARRAY_TOKEN, "PSQLARR")
+    masked = quote_masked(command, ARG_NAMES)
+    if masked is None:
+        return False
+    if sub:
+        return bool(re.fullmatch(r"PSQLARR -c Q \| tr -d Q", masked))
+    return bool(re.fullmatch(r"PSQLARR -c Q(?: \|\| echo Q)?", masked))
 
 
 def allowed_url_file_line(line):
-    """True when a line that names the URL file or tier secret is one of the reviewed, non-echoing forms."""
-    if line == URL_FILE_ASSIGN or URL_FILE_TEST.match(line) or MESSAGE_ECHO.match(line):
+    """True when a line that names the URL file, tier secret or loader array is one of the reviewed, non-echoing forms."""
+    if line == URL_FILE_ASSIGN or URL_FILE_TEST.match(line):
         return True
-    call = LOADER_CALL.match(line)
-    return bool(call) and not TAIL_FORBIDDEN.search(call.group("run_tail") or "")
+    return message_echo(line) or loader_line(line) or array_call(line)
 
 
 def workflow_problems(text):
@@ -345,10 +437,14 @@ def workflow_problems(text):
     for line in lines:
         if re.search(r"AI_MEMORY_TEST_(?:POSTGRES|AGE)_URL=", line):
             problems.append("URL written to GITHUB_ENV by hand: " + line[:60])
-        if URL_FILE_MENTION.search(line) and not allowed_url_file_line(line):
+        if ENV_DUMP.search(line):
+            problems.append("a line dumps the environment: " + line[:60])
+        if XTRACE.search(line):
+            problems.append("a line traces the shell: " + line[:60])
+        if (URL_FILE_MENTION.search(line) or PSQL_ARRAY_MENTION.search(line)) and not allowed_url_file_line(line):
             problems.append("tier credential line is not an allowed form: " + line[:60])
         if re.search(r"\bpsql\b", line) and ("tier_credential.py run" not in line or "--url-file" not in line):
-            if not MESSAGE_ECHO.match(line):
+            if not message_echo(line):
                 problems.append("psql without the loader: " + line[:60])
         if re.search(r"\bpsql\b", line) and URL_VARS.search(line):
             problems.append("psql line carries a URL variable: " + line[:60])
