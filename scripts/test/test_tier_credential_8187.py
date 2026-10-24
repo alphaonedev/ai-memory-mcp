@@ -16,8 +16,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts/ci"))
+import tier_credential  # noqa: E402
 SCRIPT = ROOT / "scripts/ci/tier_credential.py"
 CANARY = "q7Zr-Lm2_Xv9Kd4TgPw8Hn3Bs6Jc1Yf5AeUo0iRt"
 USER = "tier_role_8187"
@@ -28,6 +31,12 @@ with open(os.environ["FAKE_OUT"], "w") as handle:
     json.dump({{"argv": sys.argv[1:], "env": dict(os.environ)}}, handle)
 sys.exit(int(os.environ.get("FAKE_RC", "0")))
 """
+
+
+def runner_unescape_data(text):
+    """What the Actions runner does to the data of a workflow command (the inverse of ``escapeData`` in
+    ``@actions/core``, which escapes ``%`` first, then CR, then LF): ``%0D`` and ``%0A`` first, ``%25`` LAST."""
+    return text.replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%")
 
 
 class TierCredentialCase(unittest.TestCase):
@@ -267,6 +276,27 @@ class TestGithubEnv(TierCredentialCase):
                 self.assertEqual(r.stdout, "", "no mask line is printed for a refused URL")
                 self.assertFalse(self.github_env.exists())
                 self.assertNotIn(CANARY, r.stdout + r.stderr)
+
+    def test_mask_data_is_escaped_so_the_runner_decodes_the_written_value_8187(self):
+        # F4: the runner decodes %25/%0D/%0A in command data, so a '%' in a mask must be escaped
+        for password in ("p%25w", "p%zz", "p%250Aq", "p%0Zq"):
+            with self.subTest(password=password):
+                url = f"postgres://{USER}:{password}@192.0.2.7:5445/ai_memory_test"
+                self.write_url(url)
+                self.github_env.unlink(missing_ok=True)
+                r = self.github_env_run()
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                written = self.github_env.read_text().splitlines()[0].partition("=")[2]
+                decoded = [runner_unescape_data(m[len("::add-mask::"):]) for m in self.masked(r)]
+                self.assertIn(written, decoded, "the full URL mask decodes to the written URL")
+                self.assertIn(unquote(password), decoded, "the bare password mask decodes to the password")
+                self.assertIn(password, decoded, "the encoded password mask decodes to the encoded form")
+
+    def test_escape_workflow_command_data_matches_actions_core_8187(self):
+        self.assertEqual(tier_credential.escape_workflow_command_data("a%b\r\nc"), "a%25b%0D%0Ac")
+        self.assertEqual(tier_credential.escape_workflow_command_data("%0A"), "%250A")
+        for text in ("plain", "p%25w", "%", "a\rb\nc%0Dd"):
+            self.assertEqual(runner_unescape_data(tier_credential.escape_workflow_command_data(text)), text)
 
     def test_every_mask_line_is_one_nonempty_line_8187(self):
         self.write_url()
