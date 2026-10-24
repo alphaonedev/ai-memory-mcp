@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Test-impact selection honours manifest-owned qual_* pins (#8077)."""
 
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRATCH = REPO / ".local-runs"
@@ -17,7 +19,10 @@ GATE = REPO / "scripts/ci/manifest_owned_paths.py"
 GATE_REL = "scripts/ci/manifest_owned_paths.py"
 SDK_PATH = "sdk/typescript/src/wake.ts"
 PIN = "qual_wake_content_boundary_3578"
-DEFECT_GATE = 'import sys\nprint("gate defect: forced by test", file=sys.stderr)\nsys.exit(2)\n'
+STUB_PRINT = 'import sys\nprint("p  m  run: cargo test --test %s")\nsys.exit(1)\n'
+STUB_SLEEP = "import time\ntime.sleep(30)\n"
+SHORT_TIMEOUT = 1
+DEFECT_GATE ='import sys\nprint("gate defect: forced by test", file=sys.stderr)\nsys.exit(2)\n'
 
 
 class OwnedPathsSelectionTest(unittest.TestCase):
@@ -41,6 +46,7 @@ class OwnedPathsSelectionTest(unittest.TestCase):
         })
         self.base = self.git("rev-parse", "HEAD").strip()
         self.commit({SDK_PATH: "b\n"})
+        self.round = 0
 
     def git(self, *args):
         return subprocess.run(["git"] + list(args), cwd=str(self.repo), env=self.env, check=True,
@@ -74,6 +80,80 @@ class OwnedPathsSelectionTest(unittest.TestCase):
         result = self.select()
         self.assertEqual(result["test_impact"], "__ALL__")
         self.assertIn("manifest-owned-paths gate defect", result["test_impact_reason"])
+
+    def break_gate(self, text):
+        """Replace the gate in the fixture repo (None removes it) and re-base."""
+        if text is None:
+            self.git("rm", "-q", "--", GATE_REL)
+        else:
+            (self.repo / GATE_REL).write_text(text, encoding="utf-8")
+            self.git("add", "-f", "--", GATE_REL)
+        self.git("-c", "commit.gpgsign=false", "commit", "-qm", "break gate")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.round += 1
+        self.commit({SDK_PATH: "round %d\n" % self.round})
+
+    def assert_closed(self, result, text):
+        self.assertEqual(result["test_impact"], "__ALL__")
+        reason = result["test_impact_reason"]
+        self.assertTrue(reason.startswith("manifest-owned-paths gate defect: "), reason)
+        self.assertIn(text, reason)
+
+    def test_unexpected_exit_code_fails_closed(self):
+        self.break_gate("import sys\nsys.exit(3)\n")
+        self.assert_closed(self.select(), "exit 3")
+
+    def test_missing_gate_fails_closed(self):
+        self.break_gate(None)
+        self.assert_closed(self.select(), "script missing")
+
+    def test_exit_one_without_stem_line_fails_closed(self):
+        self.break_gate("import sys\nsys.exit(1)\n")
+        self.assert_closed(self.select(), "no stem line")
+
+    def test_invalid_stems_fail_closed(self):
+        for stem in ("qual_a*b", "qual_--nocapture", "qual_x y", "--help", ""):
+            with self.subTest(stem=stem):
+                self.break_gate(STUB_PRINT % stem)
+                self.assert_closed(self.select(), "invalid stem")
+
+    def test_valid_stem_from_stub_is_selected(self):
+        self.break_gate(STUB_PRINT % "qual_stub_ok")
+        self.assertIn("qual_stub_ok", self.select()["test_impact"].split())
+
+    def test_gate_change_forces_full_suite(self):
+        # S2: a diff touching only the gate must force __ALL__.
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.commit({GATE_REL: GATE.read_text(encoding="utf-8") + "\n# edit\n"})
+        result = self.select()
+        self.assertEqual(result["test_impact"], "__ALL__")
+        self.assertIn("foundational:" + GATE_REL, result["test_impact_reason"])
+
+
+class GateRunnerBranchTest(unittest.TestCase):
+    """Direct calls of owned_paths_gate for the crash and timeout branches."""
+
+    def setUp(self):
+        SCRATCH.mkdir(exist_ok=True)
+        self.repo = Path(tempfile.mkdtemp(dir=str(SCRATCH)))
+        self.addCleanup(shutil.rmtree, str(self.repo), True)
+        spec = importlib.util.spec_from_file_location("test_impact_under_test", str(SELECTOR))
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        (self.repo / GATE_REL).parent.mkdir(parents=True)
+
+    def test_timeout_fails_closed(self):
+        (self.repo / GATE_REL).write_text(STUB_SLEEP, encoding="utf-8")
+        stems, defect = self.module.owned_paths_gate(self.repo, [SDK_PATH], timeout=SHORT_TIMEOUT)
+        self.assertEqual(stems, [])
+        self.assertIn("gate did not run", defect)
+
+    def test_oserror_fails_closed(self):
+        (self.repo / GATE_REL).write_text("pass\n", encoding="utf-8")
+        with mock.patch.object(self.module.subprocess, "run", side_effect=OSError("boom")):
+            stems, defect = self.module.owned_paths_gate(self.repo, [SDK_PATH])
+        self.assertEqual(stems, [])
+        self.assertIn("gate did not run", defect)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ Self-test:
     committed fixture diffs, including incremental PR pushes)
 """
 
+import argparse
 import fnmatch
 import os
 from pathlib import Path
@@ -81,7 +82,9 @@ OWNED_SCRATCH_DIR = ".local-runs"
 OWNED_EXIT_OK = 0
 OWNED_EXIT_MATCH = 1
 OWNED_TIMEOUT_SECONDS = 120
-OWNED_RUN_RE = re.compile(r"run: cargo test --test (\S+)")
+OWNED_RUN_MARKER = "run: cargo test --test"
+TEST_STEM_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+STEM_DEFECT_PREFIX = "test-impact stem defect: "
 OWNED_DEFECT_PREFIX = "manifest-owned-paths gate defect: "
 
 DOCS_ONLY_PATTERNS = ("docs/*", "*.md")
@@ -132,6 +135,9 @@ FOUNDATIONAL_PATTERNS = (
     ".github/workflows/ci.yml", ".github/workflows/c8-precheck.yml",
     "scripts/check-vendor-literals.sh", "scripts/qc-codegraph-precheck.sh",
     "scripts/ci/test_impact.py",
+    # #8077 S2: the owned-paths gate decides which pin tests run; a change to
+    # it must not be able to drop its own pins.
+    "scripts/ci/manifest_owned_paths.py",
     # Authorization bypass approvals need the same full-suite validation
     # as the gate that reads them.
     "scripts/qc-codegraph-allowlists/*",
@@ -241,7 +247,27 @@ def run_git(*args):
         ["git"] + list(args), check=False, capture_output=True, text=True)
 
 
-def owned_paths_gate(repo_root, changed):
+def parse_gate_stems(stdout):
+    """Strictly parse the gate's `run: cargo test --test <stem>` lines.
+
+    Returns (stems, defect). The stem is the LAST token of a line carrying
+    the marker (nothing may sit between marker and stem) and must match TEST_STEM_PATTERN; nothing is truncated or
+    dropped, any malformed claim is a defect (fail closed).
+    """
+    stems = []
+    for line in stdout.splitlines():
+        if OWNED_RUN_MARKER not in line:
+            continue
+        # Everything after the marker is the stem: a space inside it is a defect.
+        stem = line.split(OWNED_RUN_MARKER, 1)[1].strip()
+        if not TEST_STEM_PATTERN.match(stem):
+            return [], "invalid stem %r in gate output line %r" % (stem, line)
+        if stem not in stems:
+            stems.append(stem)
+    return stems, None
+
+
+def owned_paths_gate(repo_root, changed, timeout=OWNED_TIMEOUT_SECONDS):
     """Run the manifest-owned paths gate (#8077).
 
     Returns (stems, defect): defect is None on exit 0/1, else the reason; any
@@ -262,7 +288,7 @@ def owned_paths_gate(repo_root, changed):
     try:
         proc = subprocess.run(
             [sys.executable, "-I", str(gate), "--root", str(repo_root), "--diff-file", str(diff_file)],
-            check=False, capture_output=True, text=True, timeout=OWNED_TIMEOUT_SECONDS)
+            check=False, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as err:
         return [], "gate did not run: %s" % err
     finally:
@@ -273,12 +299,10 @@ def owned_paths_gate(repo_root, changed):
     if proc.returncode not in (OWNED_EXIT_OK, OWNED_EXIT_MATCH):
         first = (proc.stderr.strip().splitlines() or ["exit %d" % proc.returncode])[0]
         return [], first
-    stems = []
-    for line in proc.stdout.splitlines():
-        found = OWNED_RUN_RE.search(line)
-        if found and found.group(1) not in stems:
-            stems.append(found.group(1))
-    return stems, None
+    stems, defect = parse_gate_stems(proc.stdout)
+    if defect is None and proc.returncode == OWNED_EXIT_MATCH and not stems:
+        return [], "gate exit 1 (match) but no stem line in its output"
+    return stems, defect
 
 
 def run_self_test():
@@ -317,6 +341,15 @@ def run_self_test():
         check("compute_impact always includes route_count_invariant", "yes",
               yes_no("route_count_invariant" in out))
 
+    check("parse_gate_stems accepts a plain stem", "qual_a",
+          " ".join(parse_gate_stems("p  m  run: cargo test --test qual_a\n")[0]))
+    check("parse_gate_stems rejects a glob stem", "yes",
+          yes_no(parse_gate_stems("p  m  run: cargo test --test qual_a*b\n")[1]))
+    check("parse_gate_stems rejects a spaced stem", "yes",
+          yes_no(parse_gate_stems("p  m  run: cargo test --test qual_x y\n")[1]))
+    check("parse_gate_stems rejects a flag stem", "yes",
+          yes_no(parse_gate_stems("p  m  run: cargo test --test --help\n")[1]))
+
     print("\n[self-test] %d passed / %d failed" % (counts["pass"], counts["fail"]))
     return EXIT_OK if counts["fail"] == 0 else EXIT_FAIL
 
@@ -325,12 +358,24 @@ def split_lines(text):
     return [line for line in text.split("\n") if line]
 
 
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="test_impact.py",
+        usage="test_impact.py <base-sha> [head-sha] [foundational-base-sha] | --self-test")
+    parser.add_argument(SELF_TEST_FLAG, action="store_true", dest="self_test")
+    parser.add_argument("base_sha", nargs="?", default="")
+    parser.add_argument("head_sha", nargs="?", default="")
+    parser.add_argument("foundational_base_sha", nargs="?", default="")
+    return parser
+
+
 def main(argv):
-    if argv and argv[0] == SELF_TEST_FLAG:
+    args = build_parser().parse_args(argv)
+    if args.self_test:
         return run_self_test()
-    base = argv[0] if len(argv) > 0 else ""
-    head = argv[1] if len(argv) > 1 and argv[1] else DEFAULT_HEAD
-    foundational_base = argv[2] if len(argv) > 2 and argv[2] else base
+    base = args.base_sha
+    head = args.head_sha or DEFAULT_HEAD
+    foundational_base = args.foundational_base_sha or base
 
     if not base:
         note("no base SHA supplied - running FULL suite")
@@ -393,6 +438,11 @@ def main(argv):
         emit_all("empty-impact-fallback", total=str(total))
         return EXIT_OK
 
+    bad_stems = [n for n in impacted if not TEST_STEM_PATTERN.match(n)]
+    if bad_stems:
+        note("invalid test stem %r - running FULL suite" % bad_stems[0])
+        emit_all(STEM_DEFECT_PREFIX + "invalid stem %r under tests/" % bad_stems[0], total=str(total))
+        return EXIT_OK
     owned, defect = owned_paths_gate(repo_root, changed)
     if defect is not None:
         note("manifest-owned-paths gate defect - running FULL suite: %s" % defect)
