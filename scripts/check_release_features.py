@@ -2553,6 +2553,20 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                                  "update WF_BUILD in scripts/check_release_features.py"),
 }
 
+# Round 5 (#8003): the new job-shape checks refuse these inputs too, so the older, more specific refusals are
+# proven by their own message appearing anywhere in the refusal list (a neutralised refusal drops the needle).
+JOINED_CASES: Dict[str, Tuple[List[Edit], str]] = {
+    "joined: a docker job that is not a mapping names the GHCR push": (
+        [_rel("", _job_edit("docker", lambda body: "  docker: nope\n"))],
+        "the `docker:` job is missing or not a mapping"),
+    "joined: docker steps that are not a sequence name DOCKER_STEPS": (
+        [_rel("", _job_edit("docker", lambda body: re.sub(r"(?s)    steps:\n.*\Z", "    steps: nope\n", body)))],
+        "`jobs.docker.steps` must be a sequence"),
+    "joined: a pinned job calling a reusable workflow is named": (
+        [_rel(COPR_HDR, COPR_HDR + "    uses: ./.github/workflows/x.yml\n")],
+        "calls a reusable workflow"),
+}
+
 
 def _entry_dir(rel: str) -> Callable[[Path], None]:
     def go(root: Path) -> None:
@@ -2854,6 +2868,16 @@ def self_test(root: Path) -> int:
                       file=sys.stderr)
                 failures += 1
 
+        for name, (edits, needle) in JOINED_CASES.items():
+            case_root = tmp / "case"
+            mk_root(root, case_root)
+            for rel, old, new, every in edits:
+                mutate_file(case_root / rel, old, new, every)
+            errs, _ = run_guard(case_root)
+            if needle not in " | ".join(errs):
+                print(f"self-test FAIL: '{name}' wanted a message containing {needle!r}: {errs[:3]}", file=sys.stderr)
+                failures += 1
+
         for name, (doc_text, files, count, needle) in R5_CASES.items():
             errs = r5_errors(doc_text, files, tmp / "r5")
             if len(errs) != count or (needle and needle not in " | ".join(errs)):
@@ -2877,7 +2901,7 @@ def self_test(root: Path) -> int:
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
         f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
-        f"{len(R5_CASES)} round-5 cases)"
+        f"{len(R5_CASES)} round-5 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 
