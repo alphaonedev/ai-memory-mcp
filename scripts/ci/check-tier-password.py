@@ -106,18 +106,33 @@ def holds(password, values):
 
 
 def problems(password, named):
-    """The rule violations: fixed sentences picked by a boolean per component kind, never built from a value."""
+    """The rule violations as ``(code, kind)`` pairs: a code from CODES and a kind from KINDS, never text."""
     if not password:
-        return ["the tier password is empty"]
+        return [("empty", "")]
     found = []
     if len(password) < MIN_PASSWORD_LENGTH:
-        found.append(f"the tier password is shorter than {MIN_PASSWORD_LENGTH} characters")
+        found.append(("short", ""))
     for kind in KINDS:
         if hides(password, named.get(kind, [])):
-            found.append(f"the tier password equals or is contained in the {kind} component of the URL")
+            found.append(("inside", kind))
         elif holds(password, named.get(kind, [])):
-            found.append(f"the tier password contains the {kind} component of the URL")
+            found.append(("holds", kind))
     return found
+
+
+# Every printed sentence is a constant of this table (#7971): nothing printed is derived from the password or the URL.
+MESSAGES = {
+    ("empty", ""): "the tier password is empty",
+    ("short", ""): f"the tier password is shorter than {MIN_PASSWORD_LENGTH} characters",
+    **{("inside", kind): f"the tier password equals or is contained in the {kind} component of the URL"
+       for kind in KINDS},
+    **{("holds", kind): f"the tier password contains the {kind} component of the URL" for kind in KINDS},
+}
+
+
+def describe(code, kind):
+    """The constant sentence for a ``(code, kind)`` violation."""
+    return MESSAGES[(code, kind)]
 
 
 def credential_module():
@@ -150,7 +165,7 @@ def main(argv=None):
         return EXIT_BAD_INPUT
     found = problems(password, named)
     if found:
-        print("::error::check-tier-password: " + "; ".join(found)
+        print("::error::check-tier-password: " + "; ".join(describe(code, kind) for code, kind in found)
               + " (#6181; rotate it to a random value of at least 32 bytes)")
         return EXIT_WEAK
     return EXIT_OK
