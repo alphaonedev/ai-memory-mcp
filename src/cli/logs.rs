@@ -321,6 +321,10 @@ struct FollowState {
     /// open handle keeps being followed, and cleared by a successful open
     /// that shows no replacement (#8005, #8108). Only `note_cannot_open` sets it.
     unreadable: Option<PathBuf>,
+    /// The same latch for the newest newer-sorting candidate that failed to
+    /// open, kept apart from `unreadable` so two failing sources report once
+    /// each; cleared when no candidate fails or one is adopted (#8220).
+    candidate_unreadable: Option<PathBuf>,
 }
 
 /// How many bytes before the cursor are kept to tell a truncate-then-regrow
@@ -340,6 +344,7 @@ impl FollowState {
             file,
             fingerprint,
             unreadable: None,
+            candidate_unreadable: None,
         }
     }
 
@@ -397,22 +402,40 @@ fn write_rotation_note(out: &mut CliOutput<'_>, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write the cannot-open note once per episode (`state.unreadable` latch,
-/// the #8005 shape); a later successful open clears the latch.
+/// Which source a cannot-open note is about; each has its own latch.
+#[derive(Clone, Copy)]
+enum NoteSource {
+    /// The followed path itself (`state.unreadable`).
+    Followed,
+    /// A newer-sorting candidate (`state.candidate_unreadable`).
+    Candidate,
+}
+
+/// Write the cannot-open note once per episode and source (the #8005 shape);
+/// a later successful open of the source clears its latch.
+///
+/// decision: one latch per source over one shared slot, because a failing
+/// newer entry and a failing followed file overwrote each other's latch and
+/// both notes came back on every poll (#8220).
 fn note_cannot_open(
     state: &mut FollowState,
     out: &mut CliOutput<'_>,
+    source: NoteSource,
     path: &Path,
     err: &anyhow::Error,
     tail: &str,
 ) -> Result<()> {
-    if state.unreadable.as_deref() != Some(path) {
+    let slot = match source {
+        NoteSource::Followed => &mut state.unreadable,
+        NoteSource::Candidate => &mut state.candidate_unreadable,
+    };
+    if slot.as_deref() != Some(path) {
         writeln!(
             out.stderr,
             "logs: cannot open {}: {err:#}; {tail}",
             path.display()
         )?;
-        state.unreadable = Some(path.to_path_buf());
+        *slot = Some(path.to_path_buf());
     }
     Ok(())
 }
@@ -449,7 +472,14 @@ fn probe_path(state: &mut FollowState, out: &mut CliOutput<'_>) -> Result<PathPr
         Ok(pair) => pair,
         Err(err) => {
             if !is_not_found(&err) {
-                note_cannot_open(state, out, &path, &err, NOTE_KEEPING_HANDLE)?;
+                note_cannot_open(
+                    state,
+                    out,
+                    NoteSource::Followed,
+                    &path,
+                    &err,
+                    NOTE_KEEPING_HANDLE,
+                )?;
             }
             return Ok(PathProbe::Unopenable);
         }
@@ -465,12 +495,7 @@ fn probe_path(state: &mut FollowState, out: &mut CliOutput<'_>) -> Result<PathPr
     if replaced {
         return Ok(PathProbe::Replaced(file));
     }
-    // decision: clear the latch only when it names the followed path over
-    // clearing it unconditionally, because the latch may hold a failed newer
-    // candidate whose note must stay once per episode (#8220).
-    if state.unreadable.as_deref() == Some(state.path.as_path()) {
-        state.unreadable = None;
-    }
+    state.unreadable = None;
     if state.id.is_none() {
         state.id = id;
     }
@@ -487,6 +512,23 @@ fn file_id(meta: &fs::Metadata) -> Option<u64> {
         return None;
     }
     Some(meta.ino())
+}
+
+/// True when the two open handles are the same file (device and inode), so a
+/// symlink alias of the followed file is not mistaken for a newer log. Decided
+/// on the opened handles, never on paths (#8220).
+#[cfg(unix)]
+fn same_file(a: &fs::File, b: &fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (a.metadata(), b.metadata()) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &fs::File, _b: &fs::File) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -703,6 +745,8 @@ fn follow_poll(
         let mut adopted: Option<(PathBuf, fs::File)> = None;
         for candidate in newer.into_iter().rev() {
             match open_followed(&candidate) {
+                // An alias of the followed file (a symlink to it) is not newer.
+                Ok(file) if same_file(&state.file, &file) => {}
                 Ok(file) => {
                     adopted = Some((candidate, file));
                     break;
@@ -712,15 +756,29 @@ fn follow_poll(
                 }
             }
         }
-        if let Some((path, err)) = skipped {
-            let tail = format!("still following {}", state.path.display());
-            note_cannot_open(state, out, &path, &err, &tail)?;
-        }
         if let Some((path, file)) = adopted {
             drain_followed(state, filters, out, true)?;
             switch_to(state, path, file);
             switched = true;
         }
+        // decision: write the skip note after the adoption, naming the file
+        // actually followed, over before it with the old name, and keep the
+        // candidate latch across a switch, because the skipped entry still
+        // sorts above the new file and would otherwise be re-reported on
+        // every later poll under a stale "still following" name (#8220).
+        if let Some((path, err)) = skipped {
+            let verb = if switched {
+                "following"
+            } else {
+                "still following"
+            };
+            let tail = format!("{verb} {}", state.path.display());
+            note_cannot_open(state, out, NoteSource::Candidate, &path, &err, &tail)?;
+        } else {
+            state.candidate_unreadable = None;
+        }
+    } else {
+        state.candidate_unreadable = None;
     }
     if !switched {
         // decision: run the followed file's checks whenever no newer candidate
@@ -1548,9 +1606,14 @@ mod tests {
     fn logs_tail_follow_unreadable_latch_has_one_writer_8142() {
         let src = prod_source();
         assert_eq!(
-            src.matches("unreadable = Some(").count(),
+            src.matches("*slot = Some(").count(),
             1,
-            "one set site for the latch"
+            "one set site for the latches"
+        );
+        assert_eq!(
+            src.matches("unreadable = Some(").count(),
+            0,
+            "no direct latch write outside note_cannot_open"
         );
         let doc = between(src, "struct FollowState", "unreadable: Option<PathBuf>");
         assert!(
@@ -1807,6 +1870,88 @@ mod tests {
         assert!(e.contains("rotated or truncated"), "{e:?}");
     }
 
+    /// Count the cannot-open notes of one poll.
+    #[cfg(unix)]
+    fn notes_of(dir: &Path, state: &mut FollowState) -> usize {
+        let (_, e) = poll_once(dir, state);
+        e.matches("cannot open").count()
+    }
+
+    /// #8220 - a failing newer entry and a failing followed path each keep
+    /// their own latch: both are reported once, then silence for as long as
+    /// both failures last (not the pair again on every poll).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_two_failing_sources_report_once_each_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let mut state = open_state(&a, 4);
+        plant_dangling(dir.path());
+        fs::remove_file(&a).unwrap();
+        make_fifo(&a);
+        let counts: Vec<usize> = (0..6).map(|_| notes_of(dir.path(), &mut state)).collect();
+        assert_eq!(counts, [2, 0, 0, 0, 0, 0], "per-poll notes: {counts:?}");
+    }
+
+    /// #8220 - a newer entry that disappears and later fails again is a new
+    /// episode and is reported again.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_candidate_that_vanishes_and_fails_again_is_reported_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let mut state = open_state(&a, 4);
+        plant_dangling(dir.path());
+        let first = notes_of(dir.path(), &mut state);
+        let again = notes_of(dir.path(), &mut state);
+        fs::remove_file(dir.path().join("ai-memory.log.old")).unwrap();
+        let gone = notes_of(dir.path(), &mut state);
+        plant_dangling(dir.path());
+        let replanted = notes_of(dir.path(), &mut state);
+        assert_eq!([first, again, gone, replanted], [1, 0, 0, 1]);
+    }
+
+    /// #8220 - a symlink that sorts above the followed file and points at it
+    /// is the same file (device and inode of the opened handles), so it is
+    /// not adopted: nothing is reprinted and the followed name is kept.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_alias_of_the_followed_file_is_not_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "line-1\nline-2\n");
+        let mut state = open_state(&a, 14);
+        std::os::unix::fs::symlink(&a, dir.path().join("ai-memory.log.latest")).unwrap();
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s1.as_str(), e1.as_str()),
+            ("", ""),
+            "no reprint: {s1:?} {e1:?}"
+        );
+        assert_eq!(state.path, a, "alias name not followed");
+        append(&a, "line-3\n");
+        let (s2, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "line-3\n");
+    }
+
+    /// #8220 - after the follower switches past a failing newer entry, the
+    /// skip note names the file now followed and is not repeated on later polls.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_skip_note_names_followed_file_once_per_switch_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "one\n");
+        let mut state = open_state(&a, 4);
+        plant_dangling(dir.path());
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "next\n");
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "next\n");
+        assert_eq!(e1.matches("cannot open").count(), 1, "{e1:?}");
+        assert!(e1.contains(&format!("following {}", b.display())), "{e1:?}");
+        assert!(!e1.contains("still following"), "stale name: {e1:?}");
+        let later: Vec<usize> = (0..3).map(|_| notes_of(dir.path(), &mut state)).collect();
+        assert_eq!(later, [0, 0, 0], "no repeat after the switch");
+    }
+
     /// #8148 - the note tail on a failed open: with an inode an unopenable
     /// replacement keeps the open handle draining and says exactly that; a
     /// failed open proves no rename, so the tail never claims one.
@@ -1971,6 +2116,7 @@ mod tests {
             file,
             fingerprint: Vec::new(),
             unreadable: None,
+            candidate_unreadable: None,
         };
         append(&path, "ial\n");
         let (s, _) = poll_once(dir.path(), &mut state);
@@ -2000,6 +2146,7 @@ mod tests {
             file,
             fingerprint: Vec::new(),
             unreadable: None,
+            candidate_unreadable: None,
         };
         let moved = dir.path().join("ai-memory.log.2026-04-30.zst");
         fs::rename(&newest, &moved).unwrap();
