@@ -1945,10 +1945,17 @@ jobs:
           # #3138: named pin for the cargo-audit version this job installs.
           CARGO_AUDIT_VERSION: "0.22.2"
         run: |
-          # #3138: install only when missing, so a warm self-hosted runner
-          # does not rewrite ~/.cargo/bin on every run.
-          if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --locked --version "${CARGO_AUDIT_VERSION}"
+          # #3138: install when cargo-audit is missing OR its version differs
+          # from the pin (a stale preinstalled one on a warm self-hosted runner
+          # must not run). A matching install is left alone. The job fails when
+          # the pinned version is still not what runs; the audit is never skipped.
+          if ! command -v cargo-audit >/dev/null 2>&1 \
+             || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
+            cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
+          fi
+          if ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
+            echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the installed version"
+            exit 1
           fi
           python3 scripts/check-zip-extract-unreachable.py
           cargo audit
