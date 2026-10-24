@@ -143,6 +143,36 @@ class WorkflowPermissions8172(unittest.TestCase):
         for l in install:
             self.assertIn("--version", l, "cargo install must pin the version")
 
+    def test_3138_stale_installed_cargo_audit_is_replaced_or_fails(self):
+        step = security_audit_step(read(CI_YML))
+        self.assertTrue(step, "Security audit step not found in ci.yml")
+        # The installed version is compared with the pin, not just presence.
+        self.assertIn('cargo audit --version', step)
+        self.assertIn('grep -Fqw -- "${CARGO_AUDIT_VERSION}"', step)
+        # A mismatch reinstalls the pinned version over the stale one.
+        install = [l for l in step.splitlines() if "cargo install cargo-audit" in l]
+        self.assertTrue(install)
+        for l in install:
+            self.assertIn("--force", l)
+            self.assertIn('--version "${CARGO_AUDIT_VERSION}"', l)
+        # After the install the job fails unless the pinned version is what runs.
+        self.assertIn("exit 1", step)
+        self.assertLess(step.index("exit 1"), step.index("cargo audit\n") if "cargo audit\n" in step else len(step))
+        # The pin bites: the old presence-only guard is rejected.
+        presence_only = step.replace(
+            ' \\\n             || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"', "", 1)
+        self.assertNotEqual(presence_only, step)
+        self.assertNotIn("|| ! cargo audit --version", presence_only)
+
+    def test_8172_release_yml_has_no_top_level_contents_write(self):
+        text = read("release.yml")
+        self.assertEqual(top_level_block(text, "permissions"), {"contents": "read"})
+        # The pin bites: a regained top-level write is detected.
+        regained = text.replace("\npermissions:\n  contents: read\n", "\npermissions:\n  contents: write\n", 1)
+        self.assertNotEqual(top_level_block(regained, "permissions"), {"contents": "read"})
+        # Jobs that publish release assets keep their own job-level write.
+        self.assertIn("      contents: write\n", text)
+
     def test_6453_c8_precheck_never_uses_privileged_triggers(self):
         text = read(C8_YML)
         self.assertEqual(trigger_problems(text), [])
