@@ -22,6 +22,7 @@ PIN = "qual_wake_content_boundary_3578"
 STUB_PRINT = 'import sys\nprint("p  m  run: cargo test --test %s")\nsys.exit(1)\n'
 STUB_SLEEP = "import time\ntime.sleep(30)\n"
 SHORT_TIMEOUT = 1
+STUB_RAW = "import sys\nsys.stdout.buffer.write(%r)\nsys.exit(1)\n"
 DEFECT_GATE ='import sys\nprint("gate defect: forced by test", file=sys.stderr)\nsys.exit(2)\n'
 
 
@@ -116,6 +117,63 @@ class OwnedPathsSelectionTest(unittest.TestCase):
             with self.subTest(stem=stem):
                 self.break_gate(STUB_PRINT % stem)
                 self.assert_closed(self.select(), "invalid stem")
+
+    def raw_stub(self, payload):
+        self.break_gate(STUB_RAW % payload)
+
+    def test_carriage_return_inside_stem_fails_closed(self):
+        # R4/S4: `qual_a\rqual_b` must not be cut to `qual_a`.
+        self.raw_stub(b"p  m  run: cargo test --test qual_a\rqual_b\n")
+        self.assert_closed(self.select(), "control character")
+
+    def test_trailing_carriage_return_fails_closed(self):
+        # R4/S4: `qual_cr\r` must not be cleaned to `qual_cr`.
+        self.raw_stub(b"p  m  run: cargo test --test qual_cr\r\n")
+        self.assert_closed(self.select(), "control character")
+
+    def test_hidden_separator_between_two_stems_fails_closed(self):
+        # Two stems on one gate line, split by separators str.splitlines would hide.
+        for sep in (b"\x0b", b"\x0c", b"\x1c", b"\r", b"\xc2\x85", b"\xe2\x80\xa8"):
+            with self.subTest(sep=sep):
+                self.raw_stub(b"p  m  run: cargo test --test qual_a" + sep + b"qual_b\n")
+                self.assert_closed(self.select(), "")
+
+    def test_invalid_utf8_gate_output_fails_closed(self):
+        self.raw_stub(b"p  m  run: cargo test --test qual_\xff\n")
+        self.assert_closed(self.select(), "UTF-8")
+
+    def add_test_file(self, name):
+        self.commit({"tests/" + name: "// fixture\n"})
+        self.base = self.git("rev-parse", "HEAD").strip()
+
+    def test_newline_test_file_name_fails_closed_and_output_is_clean(self):
+        # R4/S4: a trailing newline in a Rust test file stem passed `$`; fullmatch rejects it.
+        self.add_test_file("qual_nl\n.rs")
+        self.commit({"src/qual_nl.rs": "// x\n"})
+        subprocess.run([sys.executable, "-I", str(SELECTOR), self.base, "HEAD"], cwd=str(self.repo),
+                       env=self.env, check=True, capture_output=True, text=True)
+        raw = (self.repo / "output").read_bytes().decode("utf-8")
+        self.assertNotIn("\r", raw)
+        self.assertIn("test_impact=__ALL__\n", raw)
+        for line in raw.split("\n")[:-1]:
+            self.assertRegex(line, r"\A[a-z_]+=[^\r\n]*\Z")
+        result = dict(line.split("=", 1) for line in raw.splitlines())
+        self.assertTrue(result["test_impact_reason"].startswith("test-impact stem defect: "), result)
+
+    def test_rust_derived_invalid_stem_fails_closed(self):
+        # S5: the validation of stems derived from tests/*.rs is live (names the stem).
+        for name in ("evil stem.rs", "x*y.rs"):
+            with self.subTest(name=name):
+                self.add_test_file(name)
+                self.commit({"tests/" + name: "// changed %s\n" % self.round})
+                self.round += 1
+                result = self.select()
+                self.assertEqual(result["test_impact"], "__ALL__")
+                reason = result["test_impact_reason"]
+                self.assertTrue(reason.startswith("test-impact stem defect: "), reason)
+                self.assertIn(name[:-3], reason)
+                self.base = self.git("rev-parse", "HEAD").strip()
+                self.commit({SDK_PATH: "next %d\n" % self.round})
 
     def test_valid_stem_from_stub_is_selected(self):
         self.break_gate(STUB_PRINT % "qual_stub_ok")

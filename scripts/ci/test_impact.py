@@ -83,7 +83,11 @@ OWNED_EXIT_OK = 0
 OWNED_EXIT_MATCH = 1
 OWNED_TIMEOUT_SECONDS = 120
 OWNED_RUN_MARKER = "run: cargo test --test"
-TEST_STEM_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+# Always applied with fullmatch: `$` would also pass a trailing newline.
+TEST_STEM_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+CONTROL_LOW = 0x20
+CONTROL_DEL = 0x7F
+CONTROL_C1_HIGH = 0x9F
 STEM_DEFECT_PREFIX = "test-impact stem defect: "
 OWNED_DEFECT_PREFIX = "manifest-owned-paths gate defect: "
 
@@ -247,20 +251,30 @@ def run_git(*args):
         ["git"] + list(args), check=False, capture_output=True, text=True)
 
 
+def _is_control(char):
+    code = ord(char)
+    return code < CONTROL_LOW or CONTROL_DEL <= code <= CONTROL_C1_HIGH
+
+
 def parse_gate_stems(stdout):
     """Strictly parse the gate's `run: cargo test --test <stem>` lines.
 
     Returns (stems, defect). The stem is the LAST token of a line carrying
-    the marker (nothing may sit between marker and stem) and must match TEST_STEM_PATTERN; nothing is truncated or
-    dropped, any malformed claim is a defect (fail closed).
+    the marker (nothing may sit between marker and stem) and must fullmatch TEST_STEM_PATTERN. Lines split on
+    a line feed only (never on a carriage return, vertical tab or any other separator str.splitlines honours),
+    and a line claiming a stem while carrying any control character is a defect, so nothing is truncated,
+    normalised or dropped: any malformed claim is a defect (fail closed).
     """
     stems = []
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         if OWNED_RUN_MARKER not in line:
             continue
+        bad = [c for c in line if _is_control(c)]
+        if bad:
+            return [], "control character %r in gate output line %r" % (bad[0], line)
         # Everything after the marker is the stem: a space inside it is a defect.
-        stem = line.split(OWNED_RUN_MARKER, 1)[1].strip()
-        if not TEST_STEM_PATTERN.match(stem):
+        stem = line.split(OWNED_RUN_MARKER, 1)[1].strip(" ")
+        if not TEST_STEM_PATTERN.fullmatch(stem):
             return [], "invalid stem %r in gate output line %r" % (stem, line)
         if stem not in stems:
             stems.append(stem)
@@ -288,7 +302,7 @@ def owned_paths_gate(repo_root, changed, timeout=OWNED_TIMEOUT_SECONDS):
     try:
         proc = subprocess.run(
             [sys.executable, "-I", str(gate), "--root", str(repo_root), "--diff-file", str(diff_file)],
-            check=False, capture_output=True, text=True, timeout=timeout)
+            check=False, capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as err:
         return [], "gate did not run: %s" % err
     finally:
@@ -297,9 +311,15 @@ def owned_paths_gate(repo_root, changed, timeout=OWNED_TIMEOUT_SECONDS):
         except OSError:
             pass
     if proc.returncode not in (OWNED_EXIT_OK, OWNED_EXIT_MATCH):
-        first = (proc.stderr.strip().splitlines() or ["exit %d" % proc.returncode])[0]
+        err_text = proc.stderr.decode("utf-8", errors="replace")
+        first = (err_text.strip().splitlines() or ["exit %d" % proc.returncode])[0]
         return [], first
-    stems, defect = parse_gate_stems(proc.stdout)
+    # Bytes, not text mode: universal newlines would turn a lone carriage return into a line break.
+    try:
+        out_text = proc.stdout.decode("utf-8")
+    except UnicodeDecodeError as err:
+        return [], "gate output is not valid UTF-8: %s" % err
+    stems, defect = parse_gate_stems(out_text)
     if defect is None and proc.returncode == OWNED_EXIT_MATCH and not stems:
         return [], "gate exit 1 (match) but no stem line in its output"
     return stems, defect
@@ -349,6 +369,10 @@ def run_self_test():
           yes_no(parse_gate_stems("p  m  run: cargo test --test qual_x y\n")[1]))
     check("parse_gate_stems rejects a flag stem", "yes",
           yes_no(parse_gate_stems("p  m  run: cargo test --test --help\n")[1]))
+    check("parse_gate_stems rejects a carriage return", "yes",
+          yes_no(parse_gate_stems("p  m  run: cargo test --test qual_a\r\n")[1]))
+    check("parse_gate_stems rejects an embedded vertical tab", "yes",
+          yes_no(parse_gate_stems("p  m  run: cargo test --test qual_a\x0bqual_b\n")[1]))
 
     print("\n[self-test] %d passed / %d failed" % (counts["pass"], counts["fail"]))
     return EXIT_OK if counts["fail"] == 0 else EXIT_FAIL
@@ -438,7 +462,7 @@ def main(argv):
         emit_all("empty-impact-fallback", total=str(total))
         return EXIT_OK
 
-    bad_stems = [n for n in impacted if not TEST_STEM_PATTERN.match(n)]
+    bad_stems = [n for n in impacted if not TEST_STEM_PATTERN.fullmatch(n)]
     if bad_stems:
         note("invalid test stem %r - running FULL suite" % bad_stems[0])
         emit_all(STEM_DEFECT_PREFIX + "invalid stem %r under tests/" % bad_stems[0], total=str(total))

@@ -50,6 +50,9 @@ CASES = {
 }
 for _path in SECURITY_PATHS:
     CASES["security:" + _path] = [{_path: "// s\n"}]
+# S2: the selector and the gate force __ALL__ (foundational), which the retired shell copy predates;
+# no parity case may touch them (see test_no_case_touches_selector_paths).
+NON_PARITY_PATHS = frozenset(("scripts/ci/manifest_owned_paths.py", "scripts/ci/test_impact.py"))
 
 
 class ParityTest(unittest.TestCase):
@@ -104,6 +107,11 @@ class ParityTest(unittest.TestCase):
                 shell, py = self.select(repo, [base, "HEAD"])
                 for key in KEYS:
                     self.assertEqual(shell[key], py[key], key)
+
+    def test_no_case_touches_selector_paths(self):
+        for name, commits in CASES.items():
+            for files in commits:
+                self.assertFalse(NON_PARITY_PATHS.intersection(files), name)
 
     def test_edge_arguments_match_shell(self):
         repo, base = self.build("edge", [{"src/handlers/memories.rs": "// x\n"}])
