@@ -526,15 +526,8 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
             "lease conflict: {action_id} held by another holder"
         )),
         crate::actions::LeaseAcquire::Acquired(l) => {
-            // #1722 — coordination observability: best-effort audit row for the
-            // acquire, attributed to the lease `holder`. Identity = action id /
-            // holder.
-            crate::coordination_audit::emit(
-                conn,
-                crate::coordination_audit::LEASE_ACQUIRE,
-                holder,
-                &[action_id, holder],
-            );
+            // #7098 - the acquire audit row is appended by
+            // `crate::actions::lease_acquire` inside its own transaction.
             Ok(json!({
                 "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
             }))
@@ -575,15 +568,8 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
     {
         None => Err(format!("no lease held by {holder} on {action_id}")),
         Some(l) => {
-            // #1722 — coordination observability: best-effort audit row for the
-            // renew, attributed to the lease `holder`. Identity = action id /
-            // holder.
-            crate::coordination_audit::emit(
-                conn,
-                crate::coordination_audit::LEASE_RENEW,
-                holder,
-                &[action_id, holder],
-            );
+            // #7098 - the renew audit row is appended by
+            // `crate::actions::lease_renew` inside its own transaction.
             Ok(json!({
                 "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
             }))
@@ -610,19 +596,8 @@ pub fn handle_lease_release(conn: &rusqlite::Connection, params: &Value) -> Resu
     let released = crate::actions::lease_release(conn, action_id, holder)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lease_release", e))?;
 
-    // #1722 — coordination observability: best-effort audit row for the
-    // release, attributed to the lease `holder`. Only emit when a row was
-    // actually removed (a no-op release by a non-owner writes nothing).
-    // Identity = action id / holder.
-    if released {
-        crate::coordination_audit::emit(
-            conn,
-            crate::coordination_audit::LEASE_RELEASE,
-            holder,
-            &[action_id, holder],
-        );
-    }
-
+    // #7098 - the release audit row (written only when a row was removed) is
+    // appended by `crate::actions::lease_release` inside its own transaction.
     Ok(json!({ "released": released }))
 }
 

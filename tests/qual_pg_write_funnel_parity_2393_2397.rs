@@ -73,7 +73,10 @@ const AGE_UNPROJECT_CALL: &str = "unproject_memory_from_age(";
 /// leave-symmetric, 0 of 6 for postgres-only).
 const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     // Already correct before #2393 — pinned so they cannot regress.
-    "store",
+    // #7093 — `store` is a thin delegator to the inherent `store_inner`, which
+    // owns the INSERT + column binds; the guard follows it, as for
+    // `store_with_embedding_inner` (#2771) and `archive_restore_inner` (#4447).
+    "store_inner",
     "store_batch", // #2289
     // #4447 — `archive_restore` is now a thin delegator to the inherent
     // `archive_restore_inner` (moved verbatim to
