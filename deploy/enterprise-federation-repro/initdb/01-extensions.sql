@@ -8,7 +8,7 @@
 -- the two server extensions the ai-memory sal-postgres adapter needs:
 --
 --   * age    — Apache AGE 1.8.0 (property-graph over PostgreSQL).
---   * vector — pgvector 0.8.6 (the server-side `vector` column type the
+--   * vector — pgvector 0.8.7 (the server-side `vector` column type the
 --              sal-postgres adapter maps Rust embedding vectors to).
 --
 -- Both are IF NOT EXISTS so a re-run (or a warm data volume) is a no-op.
