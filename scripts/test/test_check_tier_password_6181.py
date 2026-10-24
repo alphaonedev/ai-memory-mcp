@@ -303,7 +303,7 @@ class TestCheckTierPassword6181(unittest.TestCase):
         # f-string whose interpolations are fixed names, or a name bound from fixed sentences; none may interpolate
         # a variable that holds URL text.  The behavioural half is test_no_value_is_ever_printed.
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-        allowed = {"refusal", "credential", "exc", "found", "describe", "code", "kind"}
+        allowed = {"refusal", "credential", "exc", "found", "describe", "code", "kind", "sentences"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
                 for part in ast.walk(node):

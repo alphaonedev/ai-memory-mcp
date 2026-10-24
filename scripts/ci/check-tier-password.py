@@ -15,7 +15,7 @@ Reads the tier URL from ``--url-file`` and refuses (exit 1, one ``::error::`` li
   random password by chance).
 
 Those components appear on psql argv and in process listings; a password that equals or hides in one of them
-is exposed with them.  Messages name the rule and the component KIND, never a value: every message is a fixed
+is exposed with them.  A component match prints one fixed sentence that names no component, and no message carries a value: every message is a fixed
 sentence, and a read error prints only an exception class name taken from a fixed list (#6899, #7971).  Exit 2
 (also with an ``::error::`` line) when the file is missing, is group- or world-accessible (#6180, the mode rule
 of ``tier_credential.py``) or does not hold one ``postgres://`` URL.  ci.yml runs it as ``python3 -I`` before
@@ -120,13 +120,13 @@ def problems(password, named):
     return found
 
 
+MATCHES_PUBLIC_COMPONENT = "tier password matches a public URL component; rotate it (#6181)"
 # Every printed sentence is a constant of this table (#7971): nothing printed is derived from the password or the URL.
 MESSAGES = {
     ("empty", ""): "the tier password is empty",
     ("short", ""): f"the tier password is shorter than {MIN_PASSWORD_LENGTH} characters",
-    **{("inside", kind): f"the tier password equals or is contained in the {kind} component of the URL"
-       for kind in KINDS},
-    **{("holds", kind): f"the tier password contains the {kind} component of the URL" for kind in KINDS},
+    # one sentence for every component match: the log never says which component the password equals or hides in
+    **{(code, kind): MATCHES_PUBLIC_COMPONENT for code in ("inside", "holds") for kind in KINDS},
 }
 
 
@@ -165,7 +165,8 @@ def main(argv=None):
         return EXIT_BAD_INPUT
     found = problems(password, named)
     if found:
-        print("::error::check-tier-password: " + "; ".join(describe(code, kind) for code, kind in found)
+        sentences = list(dict.fromkeys(describe(code, kind) for code, kind in found))
+        print("::error::check-tier-password: " + "; ".join(sentences)
               + " (#6181; rotate it to a random value of at least 32 bytes)")
         return EXIT_WEAK
     return EXIT_OK
