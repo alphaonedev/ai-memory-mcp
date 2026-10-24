@@ -315,6 +315,63 @@ logs, CORS).
 For documentation-only PRs the ten gates are still required (they should pass without
 changes), but the security checklist may be skipped if no source files changed.
 
+### CodeQL clearance for coder and reviewer lanes (#7337)
+
+Every coder/reviewer prompt naming CodeQL as a gate must require the aggregate
+check output title **`No new alerts` and 0 annotations** (GitHub's exact expanded
+title `No new alerts in code changed by this pull request` is also accepted).
+A workflow or check
+conclusion of `success` alone does not establish clearance. Record the exact head
+and the result of this read-only helper in lane evidence:
+
+```text
+python3 /absolute/worktree/scripts/ci/check_codeql_alerts.py CHECK_RUN_ID --repo OWNER/REPO --pr PR_NUMBER --head FULL_HEAD_SHA
+```
+
+Use the latest aggregate check named `CodeQL` from `github-advanced-security`,
+not a `CodeQL analysis (language)` Actions job. The helper needs Python 3.9+,
+authenticated `gh` with repository Actions, checks and code-scanning read access, and an
+explicit working directory when invoked by an orchestrator. Its `gh` subprocesses
+inherit that directory. Exit 0 means a complete clearance snapshot; exit 1 means
+refused (including API failure), and exit 2 means invalid CLI arguments.
+
+The helper requires the current open PR head, a merge commit whose parents match
+the current base and exact head, completed successful jobs, and current merge
+analyses for all four categories in `.github/workflows/codeql-rust.yml`. Each
+analysis must fall within its language job's execution interval. It checks both
+`refs/pull/PR_NUMBER/head` and `refs/pull/PR_NUMBER/merge` for open CodeQL alerts.
+Normal PR runs upload analyses only to the merge ref: an empty head analysis list
+is allowed, but an empty merge list, missing category, stale analysis or pending
+job is not clearance. Any head analyses present must also be current. Historical
+alert instances do not prove that a fixed head was analyzed. Unexpected workflows
+or categories require reconciling the helper's configured coverage; they fail
+closed. Pagination uses explicit page requests, without `gh --slurp`.
+
+After a reopen, the commit may retain successful language checks from historical
+suites. The helper resolves the configured workflow's ID and selects its greatest
+`run_number` for the exact PR/head. It verifies that run's current `run_attempt`
+through the run and attempt endpoints, requires completion with success, and
+correlates each configured language's attempt job with its exact check ID and
+check-suite ID. Check IDs and timestamps do not select between workflow runs.
+A queued current attempt with no jobs, a failed attempt, missing attempt coverage,
+or ambiguous ownership refuses clearance; historical green jobs cannot substitute.
+The aggregate may be reused by GitHub, but must still be the sole latest aggregate
+and satisfy the title, annotations, app and head checks above.
+
+The helper rechecks the PR, workflow attempt and jobs before returning. GitHub APIs are not an
+atomic snapshot: rerun immediately before landing and after any head/base change
+or CodeQL rerun. This result does not replace independent review, the conductor's
+separate full workflow/attempt gate or the remaining CI gates. External
+lane-dispatch coder and reviewer templates must carry this
+same requirement; the product documentation does not modify installed templates.
+
+Offline regression command (synthetic API fixtures and a mock `gh` executable):
+
+```text
+python3 /absolute/worktree/scripts/ci/tests/test_check_codeql_alerts_7337.py
+python3 /absolute/worktree/scripts/ci/tests/test_check_codeql_alerts_7833.py
+```
+
 ---
 
 ## 8. Pull Request Submission
@@ -352,6 +409,18 @@ PRs target `develop`. **Never** target `main`.
 ## Linked issues
 Closes #<n>  (or "Refs #<n>")
 ```
+
+When a task requires a PR body or READY report to make a no-ID claim, save the
+final body as UTF-8 and run `python3 scripts/ci/check_pr_body_ids.py --file BODY`.
+Omit `--file` to read stdin. Quote the command and its exact
+`suspected_ids=N offending_lines=M` output in READY. This opt-in suspicion check
+flags ASCII decimal tokens of 11 or more digits outside alphanumeric/underscore
+identifiers; it does not verify GitHub IDs. It prints each offending line once,
+counts every unallowlisted occurrence, and exits 1 for suspects, 0 for zero, or 2
+for input/output or usage errors. The exact assignment
+`SELF_HOSTED_TARGET_CAP_BYTES: 42949672960` allows only that value occurrence;
+other numbers on the same line still count. Review evidence may legitimately
+include IDs, so this is not a blanket requirement for all PR bodies.
 
 ### 8.3 Draft vs. ready
 
