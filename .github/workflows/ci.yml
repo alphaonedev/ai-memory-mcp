@@ -384,20 +384,19 @@ jobs:
 
           # v0.7.0 Task #12 (#1399) — compute test-impact set.
           # Always runs; the consumer steps decide whether to honor
-          # the output based on docs_only. The script is self-contained
-          # POSIX-compatible bash; full discipline + foundational list
-          # documented inline in scripts/ci-test-impact.sh.
+          # the output based on docs_only. The script is a self-contained
+          # Python 3 program; full discipline + foundational list
+          # documented inline in scripts/ci/test_impact.py.
           # Token SELECTION uses $impact_base (may be the incremental
           # previous head). The foundational safety check uses $cls_base
           # so a follow-up commit cannot hide an earlier security change.
-          chmod +x scripts/ci-test-impact.sh
           # SECOND-ORDER FAIL-OPEN, closed here (#2496). Splitting the two
           # bases is NECESSARY BUT NOT SUFFICIENT, and this was caught by
           # probing the fix's own CI run rather than by reading it. The
           # `__SKIP__` sentinel is a DOCS-ONLY VERDICT — the consumer steps
           # (`Run tests (impact-aware)` in `check`, `pg_test` in
           # `postgres-feature`) treat it as "no-op the test step". But
-          # `ci-test-impact.sh` derives it from the INCREMENTAL base, so on a
+          # `test_impact.py` derives it from the INCREMENTAL base, so on a
           # code PR whose last push is docs-only it still emitted `__SKIP__`
           # even with `docs_only=false`. Measured on this very fix's first
           # run (head 13f0b53d, a CHANGELOG-only last commit over 9 non-docs
@@ -414,9 +413,9 @@ jobs:
           # so its emission is inspected BEFORE it can reach the real outputs
           # — the guard is structural, not a hope that a later duplicate key
           # wins.
-          impact_out="${RUNNER_TEMP:-.}/ci-test-impact.out"
+          impact_out="${RUNNER_TEMP:-.}/test-impact.out"
           : > "$impact_out"
-          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$impact_base" "HEAD" "$cls_base"
+          GITHUB_OUTPUT="$impact_out" python3 -I scripts/ci/test_impact.py "$impact_base" "HEAD" "$cls_base"
           if [ "$docs_only" != "true" ] && grep -q '^test_impact=__SKIP__$' "$impact_out"; then
             echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
             echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
@@ -1098,7 +1097,7 @@ jobs:
       #   __SKIP__  → no-op (docs-only diff)
       #   <names>   → `cargo test --lib --test t1 --test t2 ...`
       # The `classify` job's foundational-fallback list (in
-      # scripts/ci-test-impact.sh) HARD-FORCES __ALL__ on any change
+      # scripts/ci/test_impact.py) HARD-FORCES __ALL__ on any change
       # to a cross-cutting surface (Cargo.toml, src/lib.rs, schema
       # migrations, SAL trait, MCP dispatch, etc.) — false-positive
       # is always preferred over false-negative per discipline rule.

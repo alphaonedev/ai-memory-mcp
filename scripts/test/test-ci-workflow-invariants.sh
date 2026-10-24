@@ -26,7 +26,7 @@
 # WHAT THIS TEST DOES. It EXTRACTS the classifier shell block verbatim from
 # `.github/workflows/ci.yml` and executes it against throwaway git fixtures, so
 # the assertions cannot drift from the workflow the way a hand-copied snippet
-# would. `scripts/ci-test-impact.sh` is stubbed with a passthrough that records
+# would. `scripts/ci/test_impact.py` is stubbed with a passthrough that records
 # the base it was handed — that is what lets scenario 1 assert BOTH halves of
 # the fix at once: classification widened to the PR base WHILE selection stayed
 # incremental.
@@ -107,20 +107,20 @@ build_fixture() {
         # script did exactly this on the live run and no-op'd `cargo test` on a
         # 9-non-docs-file PR. It also records the base it was handed, which is
         # how we prove SELECTION stayed incremental while CLASSIFICATION widened.
-        cat > scripts/ci-test-impact.sh <<'STUB'
-#!/usr/bin/env bash
-echo "impact_base_received=$1"
-echo "impact_base_received=$1" >> "$GITHUB_OUTPUT"
-inc="$(git diff --name-only "$1" HEAD)"
-if [ -n "$inc" ] && ! printf '%s\n' "$inc" | grep -qvE '^(docs/|.*\.md$)'; then
-  echo "test_impact=__SKIP__" >> "$GITHUB_OUTPUT"
-  echo "test_impact_reason=docs-only" >> "$GITHUB_OUTPUT"
-else
-  echo "test_impact=__STUB__" >> "$GITHUB_OUTPUT"
-  echo "test_impact_reason=stub" >> "$GITHUB_OUTPUT"
-fi
+        mkdir -p scripts/ci
+        cat > scripts/ci/test_impact.py <<'STUB'
+import os, re, subprocess, sys
+base = sys.argv[1]
+out = open(os.environ["GITHUB_OUTPUT"], "a")
+print("impact_base_received=" + base)
+out.write("impact_base_received=" + base + "\n")
+inc = subprocess.run(["git", "diff", "--name-only", base, "HEAD"], capture_output=True, text=True).stdout.split()
+if inc and all(re.match(r"(docs/|.*\.md$)", p) for p in inc):
+    out.write("test_impact=__SKIP__\ntest_impact_reason=docs-only\n")
+else:
+    out.write("test_impact=__STUB__\ntest_impact_reason=stub\n")
+out.close()
 STUB
-        chmod +x scripts/ci-test-impact.sh
         git add -A && git commit -qm base
 
         case "$c1_kind" in

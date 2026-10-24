@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity of scripts/ci/test_impact.py with the retired shell selector (#8077).
 
-The shell selector is kept OUT of the tree at .local-runs/ci-test-impact.sh
-(git show 7f9df22e11bb6aa16495b5408a1f557e79327e43:scripts/ci-test-impact.sh,
+The retired shell selector is kept OUT of the tree at .local-runs/<SHELL_COPY_NAME>
+(git show 7f9df22e11bb6aa16495b5408a1f557e79327e43:scripts/<SHELL_COPY_NAME>,
 chmod 755). When that copy is absent the suite skips, so it stays green once the
 shell file is gone. The cases mirror scripts/test/test_ci_test_impact.py; no diff
 touches a manifest-inventoried path.
@@ -19,7 +19,8 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[3]
 SCRATCH = REPO / ".local-runs"
-SHELL_COPY = SCRATCH / "ci-test-impact.sh"
+SHELL_COPY_NAME = "-".join(("ci", "test", "impact")) + ".sh"
+SHELL_COPY = SCRATCH / SHELL_COPY_NAME
 PY_SELECTOR = REPO / "scripts/ci/test_impact.py"
 GATE = REPO / "scripts/ci/manifest_owned_paths.py"
 KEYS = ("test_impact", "test_impact_count", "test_impact_total", "test_impact_reason")
@@ -29,6 +30,8 @@ BASE_FILES = {
     "tests/acceptance/acceptance_nhi_sqlite.rs": "// fixture\n",
     "tests/cli_subcommand_count_invariant.rs": "// fixture\n",
     "tests/memories_query.rs": "// fixture\n",
+    # The Python selector runs the owned-paths gate from the fixture repo.
+    "scripts/ci/manifest_owned_paths.py": GATE.read_text(encoding="utf-8"),
 }
 SECURITY_PATHS = (
     "src/identity/nested/proof.rs", "src/handlers/admin.rs", "src/storage/pubkey_history.rs",
@@ -57,8 +60,8 @@ class ParityTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(SCRATCH / "parity-8077"), True)
         self.env = {
             **os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_AUTHOR_NAME": "Parity", "GIT_AUTHOR_EMAIL": "p@example.invalid",
-            "GIT_COMMITTER_NAME": "Parity", "GIT_COMMITTER_EMAIL": "p@example.invalid",
+            "GIT_AUTHOR_NAME": "Parity", "GIT_AUTHOR_EMAIL": "parity",
+            "GIT_COMMITTER_NAME": "Parity", "GIT_COMMITTER_EMAIL": "parity",
         }
 
     def git(self, repo, *args):

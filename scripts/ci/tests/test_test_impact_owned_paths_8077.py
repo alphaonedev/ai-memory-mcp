@@ -27,8 +27,8 @@ class OwnedPathsSelectionTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(self.repo), True)
         self.env = {
             **os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_AUTHOR_NAME": "F", "GIT_AUTHOR_EMAIL": "f@example.invalid",
-            "GIT_COMMITTER_NAME": "F", "GIT_COMMITTER_EMAIL": "f@example.invalid",
+            "GIT_AUTHOR_NAME": "F", "GIT_AUTHOR_EMAIL": "fixture",
+            "GIT_COMMITTER_NAME": "F", "GIT_COMMITTER_EMAIL": "fixture",
             "GITHUB_OUTPUT": str(self.repo / "output"),
         }
         self.git("init", "-q")

@@ -8,7 +8,7 @@ runtime dep in CI. Uses `git diff` + a static foundational-fallback
 list + token-overlap matching against `tests/*.rs` binary names to
 compute the minimum integration-test set that proves the diff.
 
-Ported from scripts/ci-test-impact.sh (#8077, fleet rule Python-not-shell).
+Ported from the retired shell selector (#8077, fleet rule Python-not-shell).
 
 The consumer (CI yaml) ALWAYS runs `cargo test --lib` regardless of
 this script's output - that catches every inline `#[cfg(test)]` mod
@@ -48,14 +48,16 @@ Self-test:
     (exercises foundational predicates and token overlap)
   python3 scripts/test/test_ci_test_impact.py
     (exercises SKIP/ALL/IMPACT and the actual workflow classifier against
-    committed fixture diffs, including incremental PR follow-ups)
+    committed fixture diffs, including incremental PR pushes)
 """
 
 import fnmatch
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 
 KEY_IMPACT = "test_impact"
 KEY_COUNT = "test_impact_count"
@@ -74,6 +76,13 @@ PERCENT = 100
 EXIT_OK = 0
 EXIT_FAIL = 1
 REPO_ROOT_DEPTH = 2
+OWNED_GATE_REL = "scripts/ci/manifest_owned_paths.py"
+OWNED_SCRATCH_DIR = ".local-runs"
+OWNED_EXIT_OK = 0
+OWNED_EXIT_MATCH = 1
+OWNED_TIMEOUT_SECONDS = 120
+OWNED_RUN_RE = re.compile(r"run: cargo test --test (\S+)")
+OWNED_DEFECT_PREFIX = "manifest-owned-paths gate defect: "
 
 DOCS_ONLY_PATTERNS = ("docs/*", "*.md")
 
@@ -232,6 +241,46 @@ def run_git(*args):
         ["git"] + list(args), check=False, capture_output=True, text=True)
 
 
+def owned_paths_gate(repo_root, changed):
+    """Run the manifest-owned paths gate (#8077).
+
+    Returns (stems, defect): defect is None on exit 0/1, else the reason; any
+    unexpected outcome fails closed (Discipline item 1).
+    """
+    gate = Path(repo_root) / OWNED_GATE_REL
+    if not gate.is_file():
+        return [], "script missing: %s" % OWNED_GATE_REL
+    try:
+        scratch = Path(repo_root) / OWNED_SCRATCH_DIR
+        scratch.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+                "w", dir=str(scratch), suffix=".diff", delete=False, encoding="utf-8") as handle:
+            handle.write("\n".join(changed) + "\n")
+            diff_file = Path(handle.name)
+    except OSError as err:
+        return [], "cannot write diff file: %s" % err
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", str(gate), "--root", str(repo_root), "--diff-file", str(diff_file)],
+            check=False, capture_output=True, text=True, timeout=OWNED_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as err:
+        return [], "gate did not run: %s" % err
+    finally:
+        try:
+            diff_file.unlink()
+        except OSError:
+            pass
+    if proc.returncode not in (OWNED_EXIT_OK, OWNED_EXIT_MATCH):
+        first = (proc.stderr.strip().splitlines() or ["exit %d" % proc.returncode])[0]
+        return [], first
+    stems = []
+    for line in proc.stdout.splitlines():
+        found = OWNED_RUN_RE.search(line)
+        if found and found.group(1) not in stems:
+            stems.append(found.group(1))
+    return stems, None
+
+
 def run_self_test():
     repo_root = Path(__file__).resolve().parents[REPO_ROOT_DEPTH]
     counts = {"pass": 0, "fail": 0}
@@ -344,12 +393,23 @@ def main(argv):
         emit_all("empty-impact-fallback", total=str(total))
         return EXIT_OK
 
+    owned, defect = owned_paths_gate(repo_root, changed)
+    if defect is not None:
+        note("manifest-owned-paths gate defect - running FULL suite: %s" % defect)
+        emit_all(OWNED_DEFECT_PREFIX + defect, total=str(total))
+        return EXIT_OK
+    added = [stem for stem in owned if stem not in impacted]
+    impacted = sorted(impacted + added)
+
     count = len(impacted)
     reduction = int((total - count) * PERCENT / max(total, 1))
     emit(KEY_IMPACT, " ".join(impacted))
     emit(KEY_COUNT, str(count))
     emit(KEY_TOTAL, str(total))
-    emit(KEY_REASON, "impact-selected:%d/%d (%d%%-skip)" % (count, total, reduction))
+    reason = "impact-selected:%d/%d (%d%%-skip)" % (count, total, reduction)
+    if added:
+        reason += "; +%d manifest-owned" % len(added)
+    emit(KEY_REASON, reason)
     note("test-impact: %d/%d integration binaries (%d%% skip)" % (count, total, reduction))
     return EXIT_OK
 

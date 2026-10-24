@@ -6,12 +6,16 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SELECTOR = ROOT / "scripts/ci-test-impact.sh"
+SELECTOR_REL = "scripts/ci/test_impact.py"
+GATE_REL = "scripts/ci/manifest_owned_paths.py"
+SELECTOR = ROOT / SELECTOR_REL
+GATE = ROOT / GATE_REL
 
 
 class TestCiTestImpact(unittest.TestCase):
@@ -32,12 +36,13 @@ class TestCiTestImpact(unittest.TestCase):
         self.run_command("git", "init", "-q")
         # Token overlap would miss this explicitly named acceptance target.
         self.commit({
-            ".gitignore": "output\nci-test-impact.out\n",
+            ".gitignore": "output\ntest-impact.out\n.local-runs\n",
             "Cargo.toml": '[[test]]\nname = "acceptance_nhi_sqlite"\n'
                           'path = "tests/acceptance/acceptance_nhi_sqlite.rs"\n',
             "tests/acceptance/acceptance_nhi_sqlite.rs": "// fixture\n",
             "tests/cli_subcommand_count_invariant.rs": "// fixture\n",
-            "scripts/ci-test-impact.sh": SELECTOR.read_text(),
+            SELECTOR_REL: SELECTOR.read_text(),
+            GATE_REL: GATE.read_text(),
         })
         self.base = self.run_command("git", "rev-parse", "HEAD").strip()
 
@@ -58,7 +63,7 @@ class TestCiTestImpact(unittest.TestCase):
     def select(self, *args):
         output = self.repo / "output"
         output.unlink(missing_ok=True)
-        self.run_command("bash", str(SELECTOR), *args)
+        self.run_command(sys.executable, "-I", str(self.repo / SELECTOR_REL), *args)
         return dict(line.split("=", 1) for line in output.read_text().splitlines())
 
     def test_pubkey_bind_diff_runs_full_suite_including_acceptance(self):
