@@ -25,8 +25,10 @@ A line that deliberately names a path as absent (a "test ! -f" assertion,
 "no longer exists", "pre-modularisation" and similar, over a three-line
 window) is not a stale anchor for the src/ rules. The FILEPATH rule has its
 own, narrower exemption: a "(planned)" or "(PENDING-RUN" marker on the SAME
-line directly after the cited path. FILEPATH also rejects a path with a ".."
-segment, an absolute path, and any symlink on the path (treated as missing).
+line directly after the cited path. FILEPATH resolves a leading "../" run
+against the directory of the citing doc (a citation that climbs above the
+repo root counts as missing); any other ".." segment, an absolute path, and
+any symlink on the path are rejected (treated as missing).
 Frozen doc trees are not scanned. The burn-down allowlist
 scripts/qc-allowlists/doc-symbol-anchors-allow.txt fails on a STALE entry.
 
@@ -72,7 +74,7 @@ IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # lookahead rejects globs, placeholders and directory prefixes; src/*.rs
 # paths stay with the PATH/LINE/QUAL rules above.
 FILEPATH_RE = re.compile(
-    r"`(/?)(?:\.\./)*((?:scripts|tests|docs|\.github|src)/[A-Za-z0-9_./-]*"
+    r"`(/?)((?:\.\./)*)((?:scripts|tests|docs|\.github|src)/[A-Za-z0-9_./-]*"
     r"[A-Za-z0-9_-]\.[A-Za-z0-9]+)(?=[`:#\s]|$)")
 LADDER_CLAIM_RE = re.compile(
     r"(?:ladder (?:ends|end) at|ladder tip(?: is)?|tip is)\s*`?"
@@ -142,6 +144,22 @@ def scoped_docs(root):
         if (root / rel).exists():
             seen.append(rel)
     return seen
+
+
+def resolve_cited(doc, prefix, rel):
+    """Join a leading ``../`` run onto the citing doc's directory.
+
+    Returns the root-relative path, or None when the citation climbs above
+    the repo root.
+    """
+    if not prefix:
+        return rel
+    base = doc.split("/")[:-1]
+    for _ in range(len(prefix) // 3):
+        if not base:
+            return None
+        base.pop()
+    return "/".join(base + [rel])
 
 
 def cited_file_exists(root, rel):
@@ -239,14 +257,18 @@ def analyse(root):
                         out.append(("LADDER_TIP", doc, ln,
                                     "migrate_v%s!=migrate_v%s" % (m.group(1), tip), ctx))
             for m in FILEPATH_RE.finditer(line):
-                f = m.group(2)
-                if f.endswith(".rs") and f.startswith("src/") and not m.group(1):
+                f = m.group(3)
+                if f.endswith(".rs") and f.startswith("src/") and not m.group(1) \
+                        and not m.group(2):
                     continue  # PATH / LINE / QUAL own src/*.rs
-                if not m.group(1) and cited_file_exists(root, f):
-                    continue
+                if not m.group(1):
+                    target = resolve_cited(doc, m.group(2), f)
+                    if target is not None and cited_file_exists(root, target):
+                        continue
                 if PLANNED_AFTER.match(line[m.end():]):
                     continue
-                out.append(("FILEPATH", doc, ln, "/" + f if m.group(1) else f, ctx))
+                out.append(("FILEPATH", doc, ln,
+                            ("/" if m.group(1) else "") + m.group(2) + f, ctx))
     return out
 
 
@@ -403,6 +425,17 @@ def self_test():
                "\nFeature X is (planned).\nHandlers live in `src/handlers.rs`.\n")
         expect("a .. segment in a cited path is REJECTED (#8171)",
                "\nSee `scripts/../README.md`.\n", "FILEPATH")
+        expect("a leading ../ from the root README (above the repo root) is REJECTED (#8171)",
+               "\nSee `../scripts/real_tool.py`.\n", "FILEPATH")
+        (fix / "docs").mkdir(exist_ok=True)
+        docs_note = fix / "docs" / "note.md"
+        docs_note.write_text("See `../scripts/real_tool.py`.\n")
+        expect("a leading ../ from docs/ resolves against the citing doc and PASSES (#8171)",
+               "", must_pass=True)
+        docs_note.write_text("See `../../scripts/real_tool.py`.\n")
+        expect("a double ../ from docs/ climbing above the root is REJECTED (#8171)",
+               "", "FILEPATH")
+        docs_note.unlink()
         expect("an absolute cited path is REJECTED (#8171)",
                "\nSee `/scripts/real_tool.py`.\n", "FILEPATH")
         expect("a command-form citation of a missing path is REJECTED (#8171)",

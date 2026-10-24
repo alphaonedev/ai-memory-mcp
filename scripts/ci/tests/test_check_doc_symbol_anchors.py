@@ -112,6 +112,26 @@ class DocAnchors8171Tests(unittest.TestCase):
         rc, out = self.run_gate("Run `scripts/ci/real_tool.py --flag` now.\n")
         self.assertEqual(rc, 0, out)
 
+    def test_8171_root_readme_leading_dotdot_is_missing(self):
+        rc, out = self.run_gate("See `../scripts/ci/real_tool.py`.\n")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("../scripts/ci/real_tool.py", out)
+
+    def test_8171_docs_leading_dotdot_resolves_against_citing_doc(self):
+        (self.fix / "docs" / "foo.md").write_text("See `../scripts/ci/real_tool.py`.\n")
+        rc, out = self.run_gate("")
+        self.assertEqual(rc, 0, out)
+        (self.fix / "docs" / "foo.md").write_text("See `../scripts/ci/no_such.py`.\n")
+        rc, out = self.run_gate("")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("docs/foo.md:1", out)
+
+    def test_8171_docs_double_dotdot_climbs_above_root(self):
+        (self.fix / "docs" / "foo.md").write_text("See `../../scripts/ci/real_tool.py`.\n")
+        rc, out = self.run_gate("")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("../../scripts/ci/real_tool.py", out)
+
 
 if __name__ == "__main__":
     unittest.main()
