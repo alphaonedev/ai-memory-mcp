@@ -29,6 +29,8 @@ CI_YML = (REPO / '.github' / 'workflows' / 'ci.yml').read_text()
 FED_EXPR = "${{ matrix.tier == 'enterprise-fed' && '1' || '0' }}"
 FED_LINE = '      AI_MEMORY_TEST_PG_ISOLATE: ' + FED_EXPR + '\n'
 KILL_ECHO = 'echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"'
+RUN_GUARD = ('if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ] && [ "${CI_PG_ISOLATE_OFF:-}" != "1" ] '
+             '&& [ "${TIER:-}" = "enterprise-fed" ]; then')
 
 
 def failed_ids(text):
@@ -78,6 +80,28 @@ class DefaultOn(unittest.TestCase):
     def test_flag_enabled_outside_the_check_job_is_caught(self):
         self.assert_caught(CI_YML.replace(FED_LINE, '') + '\n' + FED_LINE, 'G1-default-on')
 
+    def test_r1_1a_quoted_yaml_key_is_caught(self):
+        # Review r2 R1-1 (a): a quoted YAML key is still the flag.
+        self.assert_caught(CI_YML.replace('          AI_MEMORY_NO_CONFIG: "1"\n',
+                                          '          AI_MEMORY_NO_CONFIG: "1"\n'
+                                          "          \"AI_MEMORY_TEST_PG_ISOLATE\": '1'\n", 1),
+                           'G1-default-on')
+
+    def test_r1_1b_flow_style_env_map_is_caught(self):
+        # R1-1 (b): a flow-style env map on a step.
+        self.assert_caught(CI_YML + '\n        env: {AI_MEMORY_TEST_PG_ISOLATE: 1, OTHER: x}\n', 'G1-default-on')
+
+    def test_r1_1c_quote_split_github_env_write_is_caught(self):
+        # R1-1 (c): the flag name split across adjacent quotes.
+        self.assert_caught(CI_YML + '\n          echo "AI_MEMORY_TEST_PG_""ISOLATE=1" >> "$GITHUB_ENV"\n',
+                           'G1-default-on')
+
+    def test_r1_1d_removed_run_step_guard_is_caught(self):
+        # R1-1 (d): the run step must keep its own kill-switch and tier guard.
+        self.assertIn(RUN_GUARD, CI_YML)
+        self.assert_caught(CI_YML.replace(RUN_GUARD, 'if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ]; then'),
+                           'G1-default-on')
+
     def test_removed_kill_switch_force_zero_is_caught(self):
         self.assert_caught(CI_YML.replace(KILL_ECHO, 'true', 1), 'G1-default-on')
 
@@ -90,7 +114,7 @@ class Mutants(unittest.TestCase):
         self.assertIn(cid, failed_ids(mutant))
 
     def test_flag_exported_to_github_env_is_caught(self):
-        # Review r1 M4: isolation is opt-in; ci.yml never turns it on.
+        # Review r1 M4: a non-default assignment of the flag is rejected (G1-default-on).
         self.assert_caught(CI_YML + '\n          echo "AI_MEMORY_TEST_PG_ISOLATE=1" >> "$GITHUB_ENV"\n',
                            'G1-default-on')
 
