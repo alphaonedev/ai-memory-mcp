@@ -10,6 +10,7 @@
 //! exit 0 — the CLI is a no-op rather than a hard error so a fresh
 //! install isn't surprised.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -325,7 +326,15 @@ struct FollowState {
     /// open, kept apart from `unreadable` so two failing sources report once
     /// each; cleared when no candidate fails or one is adopted (#8220).
     candidate_unreadable: Option<PathBuf>,
+    /// (device, inode) of every log followed in this session, oldest first and
+    /// capped at [`FOLLOW_SEEN_IDENTITIES_MAX`]: a symlink that points at an
+    /// earlier log is an alias, never a newer file (#8220).
+    seen: VecDeque<(u64, u64)>,
 }
+
+/// How many followed-file identities are remembered; the oldest is dropped
+/// first, so a long session stays bounded.
+const FOLLOW_SEEN_IDENTITIES_MAX: usize = 64;
 
 /// How many bytes before the cursor are kept to tell a truncate-then-regrow
 /// from plain growth. A log line is longer than this in practice, so a
@@ -337,6 +346,8 @@ impl FollowState {
     /// the bytes just before the cursor.
     fn new(path: PathBuf, offset: u64, id: Option<u64>, file: fs::File) -> Self {
         let fingerprint = read_fingerprint(&file, offset);
+        let mut seen = VecDeque::new();
+        remember_identity(&mut seen, &file);
         Self {
             path,
             offset,
@@ -345,6 +356,7 @@ impl FollowState {
             fingerprint,
             unreadable: None,
             candidate_unreadable: None,
+            seen,
         }
     }
 
@@ -531,6 +543,33 @@ fn same_file(_a: &fs::File, _b: &fs::File) -> bool {
     false
 }
 
+/// (device, inode) of the open handle; `None` where the platform exposes none.
+#[cfg(unix)]
+fn file_identity(file: &fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    file.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_file: &fs::File) -> Option<(u64, u64)> {
+    None
+}
+
+/// Record the identity of `file` in `seen`, dropping the oldest entry beyond
+/// [`FOLLOW_SEEN_IDENTITIES_MAX`]. A repeat is not stored twice.
+fn remember_identity(seen: &mut VecDeque<(u64, u64)>, file: &fs::File) {
+    let Some(id) = file_identity(file) else {
+        return;
+    };
+    if seen.contains(&id) {
+        return;
+    }
+    if seen.len() >= FOLLOW_SEEN_IDENTITIES_MAX {
+        seen.pop_front();
+    }
+    seen.push_back(id);
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test hook: make [`file_id`] report no identity on a unix host, to drive
@@ -705,6 +744,7 @@ fn drain_followed(
 /// already opened.
 fn switch_to(state: &mut FollowState, path: PathBuf, file: fs::File) {
     state.id = file.metadata().ok().as_ref().and_then(file_id);
+    remember_identity(&mut state.seen, &file);
     state.file = file;
     state.path = path;
     state.offset = 0;
@@ -745,8 +785,14 @@ fn follow_poll(
         let mut adopted: Option<(PathBuf, fs::File)> = None;
         for candidate in newer.into_iter().rev() {
             match open_followed(&candidate) {
-                // An alias of the followed file (a symlink to it) is not newer.
-                Ok(file) if same_file(&state.file, &file) => {}
+                // An alias of the followed file, or of any log followed earlier
+                // in this session (a symlink to it), is not newer.
+                // decision: bounded set of followed identities over a path
+                // blacklist because identities survive renames and the probe
+                // is identity-based (#8220).
+                Ok(file)
+                    if same_file(&state.file, &file)
+                        || file_identity(&file).is_some_and(|id| state.seen.contains(&id)) => {}
                 Ok(file) => {
                     adopted = Some((candidate, file));
                     break;
@@ -1933,6 +1979,32 @@ mod tests {
         assert_eq!(s2, "line-3\n");
     }
 
+    /// #8220 r13 - a symlink that points at an EARLIER log of this session
+    /// (not the one followed now) is not adopted after a rotation either:
+    /// nothing is reprinted, the followed name stays, and new lines show.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_alias_of_an_earlier_log_is_not_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "a-1\na-2\n");
+        let mut state = open_state(&a, 8);
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "b-1\n");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "b-1\n", "rotated to b: {s1:?}");
+        assert_eq!(state.path, b);
+        std::os::unix::fs::symlink(&a, dir.path().join("ai-memory.log.latest")).unwrap();
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s2.as_str(), e2.as_str()),
+            ("", ""),
+            "no reprint of a: {s2:?} {e2:?}"
+        );
+        assert_eq!(state.path, b, "alias of an earlier log not followed");
+        append(&b, "b-2\n");
+        let (s3, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "b-2\n");
+    }
+
     /// #8220 - after the follower switches past a failing newer entry, the
     /// skip note names the file now followed and is not repeated on later polls.
     #[cfg(unix)]
@@ -2117,6 +2189,7 @@ mod tests {
             fingerprint: Vec::new(),
             unreadable: None,
             candidate_unreadable: None,
+            seen: VecDeque::new(),
         };
         append(&path, "ial\n");
         let (s, _) = poll_once(dir.path(), &mut state);
@@ -2147,6 +2220,7 @@ mod tests {
             fingerprint: Vec::new(),
             unreadable: None,
             candidate_unreadable: None,
+            seen: VecDeque::new(),
         };
         let moved = dir.path().join("ai-memory.log.2026-04-30.zst");
         fs::rename(&newest, &moved).unwrap();
