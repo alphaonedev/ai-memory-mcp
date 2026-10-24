@@ -36,7 +36,7 @@ Pins over the "Configure enterprise-fed tier" step and the always() cleanup step
 The job ``tier-credential-pins`` in ci.yml runs this module and the two other tier modules on every PR (before r8
 no CI job ran them).  Obligation: any edit of a tier job or of a workflow-level key of the three workflows, and any
 added or removed job, needs ``python3 scripts/test/test_ci_tier_password_check_6181.py --write-pins`` in the same
-PR (it regenerates all three sections, primary, secondary_text and exempt_jobs;the diff of the data file is what a reviewer reads).  Failure messages name the
+PR (it regenerates all three sections, primary, secondary_text and exempt_jobs; the diff of the data file is what a reviewer reads).  Failure messages name the
 workflow, job, step index, step name or id and the first differing key path, and mask ``scheme://user:pass@``.
 
 Residual (documented, #8187 umbrella item): the URL file is provisioned by the operator in the runner user's home
@@ -843,27 +843,53 @@ def self_hosted_rows():
 
 
 def exempt_pins(root=None):
-    """The ``exempt_jobs`` pin section built from the real workflows: ``{workflow: {job: ty.pin_job(job)}}``."""
+    """The ``exempt_jobs`` pin section built from the real workflows (F20, F21):
+    ``{workflow: {"jobs": {job: ty.pin_job(job)}, "workflow_keys": {key: digest}}}``.  The workflow-level digest is
+    the one ``ty.build_pins`` writes for the tier workflows (decision: reuse the primary workflow_keys digest for
+    exempt workflows over a new exempt-only shape because one comparison path keeps one problem-line format and
+    --write-pins stays one generator)."""
     directory = (ROOT if root is None else Path(root)) / ".github" / "workflows"
     table = {}
     for workflow, name in self_hosted_rows():
         data, bad = ty.parse_workflow((directory / workflow).read_text(encoding="utf-8"))
         if bad or name not in data["jobs"]:
             sys.exit(f"{workflow}: cannot pin exempt job {name}")
-        table.setdefault(workflow, {})[name] = ty.pin_job(data["jobs"][name])
+        entry = table.setdefault(workflow, {"jobs": {}, "workflow_keys": ty.build_pins(data)["workflow_keys"]})
+        entry["jobs"][name] = ty.pin_job(data["jobs"][name])
     return table
 
 
 def exempt_pin_problems(workflow, name, job, pins):
     """Problems of one self-hosted exempt job against its canonical-JSON pin (F20): any step or key edit needs
     ``--write-pins``.  The message names the workflow, job, step index and name and the first differing key path."""
-    entry = ((pins.get(EXEMPT) or {}).get(workflow) or {}).get(name)
+    entry = (((pins.get(EXEMPT) or {}).get(workflow) or {}).get("jobs") or {}).get(name)
     if entry is None:
         return [f"{workflow} job {name}: a self-hosted exempt job has no job pin"]
     if ty.digest(job) == entry["sha256"]:
         return []
     index, path = ty.first_difference(entry, job)
     return [f"{workflow} job {name} {where_differs(job, index)}: differs from the pin at {path}"]
+
+
+def exempt_workflow_key_problems(workflow, raw, pins):
+    """Problems of the workflow-level keys (everything except ``jobs``) of a workflow that holds a self-hosted exempt
+    row (F21): the per-key digest comparison and wording of ``primary_pin_problems``; never any document text."""
+    pinned_keys = ((pins.get(EXEMPT) or {}).get(workflow) or {}).get("workflow_keys")
+    if pinned_keys is None:
+        return [f"{workflow}: a self-hosted exempt workflow has no workflow-level pin"]
+    data, found = ty.parse_workflow(raw)
+    if data is None:
+        return [f"{workflow}: {p}" for p in found]
+    level = {key: ty.digest(value) for key, value in data.items() if key != "jobs"}
+    problems = []
+    for key in sorted(set(level) | set(pinned_keys)):
+        if key not in level:
+            problems.append(f"{workflow}: the pinned workflow-level key {key} is missing")
+        elif key not in pinned_keys:
+            problems.append(f"{workflow}: a workflow-level key {key} was added and is not pinned")
+        elif level[key] != pinned_keys[key]:
+            problems.append(f"{workflow}: the workflow-level key {key} differs from the pin")
+    return problems
 
 
 def where_differs(job, index):
@@ -971,6 +997,8 @@ def repo_problems(root=None, pins=None):
                 found.append(f"{name} job {job_name}: {why}")
             if (name, job_name) in self_hosted_rows():
                 found += exempt_pin_problems(name, job_name, job, pins)
+        if any(wf == name for wf, _job in self_hosted_rows()):
+            found += exempt_workflow_key_problems(name, raw, pins)
     for workflow in sorted({wf for wf, _job in RUNS_ON_EXEMPT}):
         target = directory / workflow
         if not target.is_file():
@@ -2024,7 +2052,7 @@ def add_step_run(text, run_text, extra_line):
 
 
 def write_pins(out=None):
-    """Regenerate both sections of the pin data file from the real workflows (deterministic, sorted)."""
+    """Regenerate all three sections (primary, secondary_text, exempt_jobs) of the pin data file from the real workflows (deterministic, sorted)."""
     table = {PRIMARY: {}, SECONDARY: {}}
     for workflow in PIN_WORKFLOWS:
         raw = (WORKFLOWS / workflow).read_text(encoding="utf-8")
@@ -2046,7 +2074,7 @@ def write_pins(out=None):
 
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
-        # regenerate both pin sections from the workflows; the diff of the data file is what a reviewer reads
+        # regenerate all three pin sections from the workflows; the diff of the data file is what a reviewer reads
         flags = sys.argv[1:]
         write_pins(flags[flags.index("--out") + 1] if "--out" in flags else None)
         sys.exit(0)
