@@ -64,8 +64,9 @@ pub fn injected_login_delay() -> Duration {
     Duration::from_secs(PoolConfig::default().acquire_timeout_secs).saturating_sub(INJECTION_MARGIN)
 }
 
-/// Age past which a prefixed scratch database is an orphan of a killed run.
-/// Far above any cell's runtime, so a concurrent live run is never swept.
+/// Age past which a run-scoped clone may be reclaimed by `pg_isolate`'s
+/// run-scoped sweep (its `STALE_AFTER`). [`ScratchDb`] never reclaims by age:
+/// an age is not proof of ownership (#7125).
 pub const STALE_SCRATCH_AGE: Duration = Duration::from_secs(600);
 
 /// Swap the database name in a postgres URL, preserving the query string (this
@@ -89,7 +90,8 @@ const SCRATCH_TS_DIGITS: usize = 10;
 const SCRATCH_ID_HEX: usize = 8;
 
 /// A scratch database name: `<prefix>_<unix-seconds, 10 digits>_<8 lowercase hex>`.
-/// The embedded creation time is what lets a later run recognise an orphan.
+/// The embedded creation time is informational only (an operator reading a
+/// leftover name); nothing here drops a database because of it (#7125).
 #[must_use]
 pub fn scratch_db_name(prefix: &str, now_unix: u64) -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
@@ -128,8 +130,8 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// The SERVER clock in Unix seconds, so naming and the sweep age never depend on
-/// the (possibly skewed) clock of the host running the test.
+/// The SERVER clock in Unix seconds, so a scratch name never depends on the
+/// (possibly skewed) clock of the host running the test.
 ///
 /// # Errors
 ///
@@ -141,85 +143,64 @@ pub async fn server_unix(admin: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
     Ok(u64::try_from(secs).unwrap_or(0))
 }
 
-/// Drop every `<prefix>_<ts>_<id>` database (EXACT shape, see
-/// [`parse_scratch_name`]) whose timestamp is older than [`STALE_SCRATCH_AGE`]
-/// relative to `now_unix`. A fresh one (a concurrent live run) and every name
-/// that does not match the shape are left alone. Returns the dropped names. A
-/// killed run leaves its scratch database, and its login-delay trigger, behind
-/// (#4489). Each drop is ONE statement with a properly quoted identifier.
-///
-/// # Errors
-///
-/// The catalog listing failed. A single failed drop is reported on stderr and
-/// skipped, never fatal.
-pub async fn sweep_stale_scratch_dbs(
-    admin: &sqlx::PgPool,
-    prefix: &str,
-    now_unix: u64,
-) -> Result<Vec<String>, sqlx::Error> {
-    let names: Vec<String> =
-        sqlx::query_scalar("SELECT datname::text FROM pg_database WHERE starts_with(datname, $1)")
-            .bind(format!("{prefix}_"))
-            .fetch_all(admin)
-            .await?;
-    let mut dropped = Vec::new();
-    for name in names {
-        let Some(created) = parse_scratch_name(prefix, &name) else {
-            continue;
-        };
-        if now_unix.saturating_sub(created) <= STALE_SCRATCH_AGE.as_secs() {
-            continue;
-        }
-        match sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-            quote_ident(&name)
-        ))
-        .execute(admin)
-        .await
-        {
-            Ok(_) => dropped.push(name),
-            Err(e) => eprintln!("WARN: could not sweep stale scratch database {name}: {e}"),
-        }
-    }
-    Ok(dropped)
-}
-
 /// Bound on the guard's own connect and drop, so an unreachable host cannot hang
 /// a panicking test for the OS TCP timeout.
 const GUARD_IO_BOUND: Duration = Duration::from_secs(20);
 
-/// A cluster-level scratch database that is dropped when the guard goes out of
-/// scope, INCLUDING on a panic unwind (`Drop` runs, and the drop is driven on its
-/// own thread and runtime so it works while the test runtime is unwinding).
-/// `SIGKILL` cannot be caught, so a killed run still leaves its database behind;
-/// the sweep in [`Self::create`] is the backstop for that case (#4489).
+/// Plain `DROP DATABASE` attempts the guard makes before it gives up and
+/// reports the database as left over. PostgreSQL itself waits up to five
+/// seconds for exiting backends inside each attempt.
+const DROP_ATTEMPTS: u32 = 3;
+
+/// Pause between two plain drop attempts.
+const DROP_RETRY_PAUSE: Duration = Duration::from_secs(1);
+
+/// SQLSTATE `55006` (`object_in_use`): the database still has a session.
+const OBJECT_IN_USE: &str = "55006";
+
+/// A cluster-level scratch database owned by exactly this guard. It is dropped
+/// when the guard goes out of scope, INCLUDING on a panic unwind (`Drop` runs,
+/// and the drop is driven on its own thread and runtime so it works while the
+/// test runtime is unwinding).
+///
+/// Ownership is exact (#7125): the guard only ever drops the one database its
+/// own `CREATE DATABASE` made, with a plain `DROP DATABASE` that never
+/// terminates a session (no `FORCE`). Nothing here lists databases by prefix or
+/// reclaims one by age, so another invocation's database, idle or live, is never
+/// touched. A database that still has a session when the guard drops (or one a
+/// `SIGKILL`ed run left behind) is KEPT and named on stderr for manual cleanup.
 pub struct ScratchDb {
     admin_url: String,
     name: String,
 }
 
 impl ScratchDb {
-    /// Sweep stale orphans of `prefix`, then create a fresh scratch database.
-    /// Both the name and the sweep age use the server clock.
+    /// Create a fresh scratch database named from the server clock. The admin
+    /// pool is closed on every path; a refused `CREATE` yields no guard, so it
+    /// carries no drop authority.
     ///
     /// # Errors
     ///
-    /// Connecting to `admin_url`, the sweep listing, or `CREATE DATABASE` failed.
+    /// Connecting to `admin_url`, reading the server clock, or `CREATE DATABASE`
+    /// failed.
     pub async fn create(admin_url: &str, prefix: &str) -> Result<Self, sqlx::Error> {
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect(admin_url)
             .await?;
-        let now = server_unix(&admin).await?;
-        sweep_stale_scratch_dbs(&admin, prefix, now).await?;
-        let name = scratch_db_name(prefix, now);
-        sqlx::query(&format!("CREATE DATABASE {}", quote_ident(&name)))
-            .execute(&admin)
-            .await?;
+        let created = async {
+            let now = server_unix(&admin).await?;
+            let name = scratch_db_name(prefix, now);
+            sqlx::query(&format!("CREATE DATABASE {}", quote_ident(&name)))
+                .execute(&admin)
+                .await?;
+            Ok::<_, sqlx::Error>(name)
+        }
+        .await;
         admin.close().await;
         Ok(Self {
             admin_url: admin_url.to_string(),
-            name,
+            name: created?,
         })
     }
 
@@ -241,7 +222,7 @@ impl Drop for ScratchDb {
         let (url, name) = (self.admin_url.clone(), self.name.clone());
         // OWNERSHIP-25: nothing here may panic (a panic during an unwind aborts).
         // `Builder::spawn` returns an error instead of panicking when a thread
-        // cannot be created; log it and leave the sweep to clean up.
+        // cannot be created; log it and name the leftover database.
         let log_name = name.clone();
         let spawned = std::thread::Builder::new()
             .name("scratch-db-drop".to_string())
@@ -254,19 +235,22 @@ impl Drop for ScratchDb {
             }
             Err(e) => eprintln!(
                 "WARN: could not spawn a thread to drop scratch database {log_name}: {e}; \
-                 the next run's sweep will remove it"
+                 it is LEFT OVER, drop it manually once no session uses it"
             ),
         }
     }
 }
 
-/// Drop `name` on a private runtime. Every step is bounded and none can panic.
+/// Drop `name` on a private runtime with a plain `DROP DATABASE` (never
+/// `FORCE`), retried up to [`DROP_ATTEMPTS`] times while a session still uses
+/// it. Every step is bounded, none can panic, the connection is closed on every
+/// path, and a database that could not be dropped is reported as LEFT OVER.
 fn drop_scratch_blocking(url: &str, name: &str) {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     else {
-        eprintln!("WARN: could not build a runtime to drop scratch database {name}");
+        report_leftover(name, "could not build a runtime");
         return;
     };
     rt.block_on(async {
@@ -276,29 +260,63 @@ fn drop_scratch_blocking(url: &str, name: &str) {
         let mut conn = match connected {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
-                eprintln!("WARN: could not connect to drop scratch database {name}: {e}");
+                report_leftover(name, &format!("could not connect: {e}"));
                 return;
             }
             Err(_) => {
-                eprintln!("WARN: timed out connecting to drop scratch database {name}");
+                report_leftover(name, "timed out connecting");
                 return;
             }
         };
-        let dropped = tokio::time::timeout(
-            GUARD_IO_BOUND,
-            sqlx::query(&format!(
-                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-                quote_ident(name)
-            ))
-            .execute(&mut conn),
-        )
-        .await;
-        match dropped {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => eprintln!("WARN: could not drop scratch database {name}: {e}"),
-            Err(_) => eprintln!("WARN: timed out dropping scratch database {name}"),
+        let sql = format!("DROP DATABASE IF EXISTS {}", quote_ident(name));
+        let mut why = String::new();
+        for attempt in 1..=DROP_ATTEMPTS {
+            let dropped =
+                tokio::time::timeout(GUARD_IO_BOUND, sqlx::query(&sql).execute(&mut conn)).await;
+            match dropped {
+                Ok(Ok(_)) => {
+                    why.clear();
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let in_use = e
+                        .as_database_error()
+                        .and_then(sqlx::error::DatabaseError::code)
+                        .is_some_and(|code| code == OBJECT_IN_USE);
+                    why = format!("attempt {attempt}/{DROP_ATTEMPTS}: {e}");
+                    if !in_use {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    why = format!("attempt {attempt}/{DROP_ATTEMPTS}: timed out");
+                    break;
+                }
+            }
+            if attempt < DROP_ATTEMPTS {
+                tokio::time::sleep(DROP_RETRY_PAUSE).await;
+            }
+        }
+        if tokio::time::timeout(GUARD_IO_BOUND, conn.close())
+            .await
+            .is_err()
+        {
+            eprintln!("WARN: timed out closing the admin connection for scratch database {name}");
+        }
+        if !why.is_empty() {
+            report_leftover(name, &why);
         }
     });
+}
+
+/// Name a scratch database the guard could not drop, so it is cleaned up by
+/// hand (a plain `DROP DATABASE` once no session uses it), never by a later
+/// run's guess about who owns it.
+fn report_leftover(name: &str, why: &str) {
+    eprintln!(
+        "WARN: scratch database {name} is LEFT OVER ({why}); drop it manually with a plain \
+         DROP DATABASE once no session uses it (#7125)"
+    );
 }
 
 /// SQL installing a login event trigger that makes a new connection to the
