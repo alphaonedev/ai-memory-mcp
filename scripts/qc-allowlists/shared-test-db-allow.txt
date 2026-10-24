@@ -1,0 +1,36 @@
+# Shared ai_memory_test references allowed at the baseline (#7031 H4).
+# Ratchet: an entry that no longer matches a hit (or names a missing file) makes the gate exit 2,
+# so this file may only shrink (docs/reference/CODE_STYLE.md:103-105).  Line-pinned only:
+#   path:line   # citation
+tests/common/lane_db.rs:123   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:127   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:138   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:152   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:183   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:187   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:190   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/export_import_false_success_2490.rs:78   # refusal probe constant (never connected); rename later
+tests/http_notify_caller_binding_3579.rs:347   # asserts the lane URL is NOT the shared database
+tests/pg_isolate_helper_6383.rs:81   # negative case: helper must refuse the shared name
+tests/pg_isolate_helper_6383.rs:417   # negative case: helper must refuse the shared name
+tests/wake_hub_write_authority_3578.rs:635   # asserts the lane URL is NOT the shared database
+infra/lan-parity-test/docker-compose.yml:87   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+infra/lan-parity-test/docker-compose.yml:99   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+infra/lan-parity-test/docker-compose.yml:161   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+infra/lan-parity-test/docker-compose.yml:253   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+src/store/postgres/tx_retry.rs:464   # URL-redaction fixture string
+src/store/postgres_inbox_tests.rs:126   # classify_create_failure / port_of probe URLs (negative cases)
+src/store/postgres_inbox_tests.rs:127   # classify_create_failure / port_of probe URLs (negative cases)
+src/store/postgres_inbox_tests.rs:159   # classify_create_failure / port_of probe URLs (negative cases)
+src/store/postgres_inbox_tests.rs:161   # classify_create_failure / port_of probe URLs (negative cases)
+packaging/docker-compose.postgres.yml:28   # dev compose fixture, not a CI lane
+packaging/docker-compose.postgres.yml:37   # dev compose fixture, not a CI lane
+infra/lan-parity-test/run-parity-tests.sh:68   # PG_MAINT_DB: maintenance connection used only to CREATE/DROP the minted Pass-1 database (#7031 lane A)
+tests/pg_isolate_helper_6383.rs:121   # negative case: helper must refuse the shared name (quoted literal, R6)
+tests/postgres_ladder_replay.rs:930   # assert: the ladder replay never creates the shared database (quoted literal, R6)
+tests/common/lane_db.rs:65   # SHARED_LIVE_STORE_DATABASE: the name the lane_db refusal predicate rejects (quoted literal, R6)
+tests/common/lane_db.rs:153   # refusal predicate case (lane_database_predicate_cases_3777) names the shared database on purpose (R6)
+scripts/bench/wake_bench_env.sh:199   # refusal guard: the bench harness rejects the shared database name (quoted literal, R6)
+infra/lan-parity-test/init-age.sql:41   # LAN parity dev compose init GRANT on the shared database (parity Pass 1 rework burns this down, R7)
+infra/lan-parity-test/run-parity-tests.sh:67   # PG_PASS: the dev compose password value equals the database name, not a database reference (R6)
+docs/v0.7.0/regression-runs/2026-05-31-final-baseline/README.md:80  # historical regression-run record of the 2026-05-31 baseline URL; the record is not rewritten (R1)

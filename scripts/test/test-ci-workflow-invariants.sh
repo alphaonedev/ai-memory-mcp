@@ -808,6 +808,9 @@ fi
 # ===========================================================================
 if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
 
+# H4 (#7031): no new shared-database references; the gate is wired into the classify job.
+if python3 "$ROOT/scripts/ci/check_shared_test_db_refs.py" --root "$ROOT" && grep -q 'check_shared_test_db_refs.py --root' "$CI_YML"; then ok "G: #7031 shared test database reference gate (clean, wired in ci.yml)"; else bad "G: #7031 shared test database reference gate failed" "see output above"; fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"
