@@ -91,7 +91,6 @@ class GateSelfTestInterrupt7920(unittest.TestCase):
             cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         rc = None
-        elapsed = 0.0
         try:
             deadline = time.monotonic() + POLL_CEILING_SECS
             while time.monotonic() < deadline:

@@ -210,6 +210,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
     source "${ROOT}/scripts/lib/selftest-probes.sh"
     selftest_probes_arm "$probe_dup" "$probe_mb"
 
+    # noclobber for the two probe writes: the guard above is check-then-use, so
+    # a path (symlink or file) that appears after it makes the write fail
+    # instead of being followed (#8243).
+    set -C
     # Probe A — a brand-new magic string on 3 production sites (absent from baseline).
     cat > "$probe_dup" <<'EOF'
 // CONTRIVED VIOLATION for scripts/check-hardcoded-literals.sh --self-test.
@@ -238,6 +242,7 @@ EOF
         echo "pub fn m2() -> &'static str { \"${mb_short}\" }"
         echo "pub fn m3() -> &'static str { \"${mb_short}\" }"
     } > "$probe_mb"
+    set +C
 
     # Enumerate the awks present, de-duplicating by resolved path.
     awk_bins=()
