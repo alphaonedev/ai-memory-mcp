@@ -10,6 +10,7 @@
 //! exit 0 — the CLI is a no-op rather than a hard error so a fresh
 //! install isn't surprised.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -230,6 +231,16 @@ fn extract_timestamp(line: &str) -> Option<DateTime<Utc>> {
 /// (which sorts by date because the rolling appender's suffix is
 /// `YYYY-MM-DD[-HH[-MM]]`).
 fn enumerate_log_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = list_log_candidates(dir)?;
+    files.retain(|p| p.is_file());
+    Ok(files)
+}
+
+/// Every `ai-memory.log*` NAME in `dir`, sorted, with no stat of the entries.
+/// The follow loop uses this so the file type is decided once, by `fstat` on
+/// the opened handle (`open_followed`), never by a path stat taken before the
+/// open (#8221).
+fn list_log_candidates(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -237,7 +248,15 @@ fn enumerate_log_files(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in fs::read_dir(dir).with_context(|| crate::errors::msg::reading(dir.display()))? {
         let entry = entry?;
         let p = entry.path();
-        if p.is_file()
+        // decision: filter on the directory entry's own type (no stat and no
+        // open of the entry) over listing every name, because a directory,
+        // FIFO or socket sorting last would otherwise shadow the real newest
+        // log and stop both the switch and the truncation check (#8222).
+        // A symlink is kept: the opened handle's `fstat` decides it.
+        let listable = entry
+            .file_type()
+            .is_ok_and(|t| t.is_file() || t.is_symlink());
+        if listable
             && p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.contains("ai-memory") && !n.ends_with(".zst"))
@@ -284,69 +303,659 @@ fn emit_line(line: &str, filters: &Filters, out: &mut CliOutput<'_>) -> Result<(
     Ok(())
 }
 
-fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<'_>) -> Result<()> {
-    let files = enumerate_log_files(dir)?;
-    let Some(latest) = files.last().cloned() else {
+/// Followed-file cursor: the path being followed, the byte offset up to which
+/// every line has been printed, and (unix) the inode seen at that offset, so a
+/// rename-and-recreate of the same path is told apart from plain growth.
+struct FollowState {
+    path: PathBuf,
+    offset: u64,
+    id: Option<u64>,
+    /// Open handle on the followed inode (kept so a renamed file can be drained).
+    file: fs::File,
+    /// Up to [`FOLLOW_FINGERPRINT_LEN`] bytes that ended at `offset` when it was
+    /// last advanced; empty means unknown. A same-inode truncate that regrows
+    /// past `offset` between two polls leaves the length looking like growth,
+    /// but these bytes no longer match (#7965).
+    fingerprint: Vec<u8>,
+    /// Path that could not be opened (newer log file or the followed path
+    /// itself): reported once per episode, retried on every poll while the
+    /// open handle keeps being followed, and cleared by a successful open
+    /// that shows no replacement (#8005, #8108). Only `note_cannot_open` sets it.
+    unreadable: Option<PathBuf>,
+    /// The same latch for the newest newer-sorting candidate that failed to
+    /// open, kept apart from `unreadable` so two failing sources report once
+    /// each; cleared when no candidate fails or one is adopted (#8220).
+    candidate_unreadable: Option<PathBuf>,
+    /// (device, inode, birth time) of every log followed in this session,
+    /// oldest first and capped at [`FOLLOW_SEEN_IDENTITIES_MAX`]: a symlink
+    /// that points at an earlier log is an alias, never a newer file. The birth
+    /// time keeps a new log that inherited a deleted log's inode from being
+    /// taken for that log (#8220).
+    seen: VecDeque<FileIdentity>,
+}
+
+/// How many followed-file identities are remembered; the oldest is dropped
+/// first, so a long session stays bounded.
+const FOLLOW_SEEN_IDENTITIES_MAX: usize = 64;
+
+/// How many bytes before the cursor are kept to tell a truncate-then-regrow
+/// from plain growth. A log line is longer than this in practice, so a
+/// rewritten file differs inside the window.
+const FOLLOW_FINGERPRINT_LEN: u64 = 64;
+
+impl FollowState {
+    /// Cursor at `offset` of the open handle `file`, with the fingerprint of
+    /// the bytes just before the cursor.
+    fn new(path: PathBuf, offset: u64, id: Option<u64>, file: fs::File) -> Self {
+        let fingerprint = read_fingerprint(&file, offset);
+        let mut seen = VecDeque::new();
+        remember_identity(&mut seen, &file);
+        Self {
+            path,
+            offset,
+            id,
+            file,
+            fingerprint,
+            unreadable: None,
+            candidate_unreadable: None,
+            seen,
+        }
+    }
+
+    /// True while the bytes before the cursor are the ones last seen there.
+    fn fingerprint_holds(&self) -> bool {
+        self.fingerprint.is_empty() || read_fingerprint(&self.file, self.offset) == self.fingerprint
+    }
+}
+
+/// The up-to-[`FOLLOW_FINGERPRINT_LEN`] bytes of `file` that end at `offset`;
+/// empty when the cursor is at the start or the read fails (a short read then
+/// compares unequal to a stored fingerprint, which reads as truncation).
+fn read_fingerprint(file: &fs::File, offset: u64) -> Vec<u8> {
+    use std::io::Read as _;
+    use std::io::Seek as _;
+    use std::io::SeekFrom;
+    let len = offset.min(FOLLOW_FINGERPRINT_LEN);
+    let mut buf = Vec::new();
+    if len == 0 {
+        return buf;
+    }
+    let mut handle = file;
+    if handle
+        .seek(SeekFrom::Start(offset.saturating_sub(len)))
+        .is_err()
+    {
+        return buf;
+    }
+    if (&mut handle).take(len).read_to_end(&mut buf).is_err() {
+        buf.clear();
+    }
+    buf
+}
+
+/// What one open attempt of the followed path showed.
+enum PathProbe {
+    /// The path still holds the followed file (or no evidence says otherwise);
+    /// carries the length of the file that was opened.
+    Same(u64),
+    /// The path holds another file; the fresh handle is ready to be adopted.
+    Replaced(fs::File),
+    /// The path could not be opened; no evidence about its identity.
+    Unopenable,
+}
+
+/// Note tail when an open failed: a failed open proves neither a rename nor
+/// a replacement, so the note only says the open handle keeps being followed.
+const NOTE_KEEPING_HANDLE: &str = "still following the open file";
+/// Note text written when the cursor moves to the start of a file.
+const NOTE_ROTATED: &str = "was rotated or truncated; following from the start";
+
+/// Write the rotation note for `path`.
+fn write_rotation_note(out: &mut CliOutput<'_>, path: &Path) -> Result<()> {
+    writeln!(out.stderr, "logs: {} {NOTE_ROTATED}", path.display())?;
+    Ok(())
+}
+
+/// Which source a cannot-open note is about; each has its own latch.
+#[derive(Clone, Copy)]
+enum NoteSource {
+    /// The followed path itself (`state.unreadable`).
+    Followed,
+    /// A newer-sorting candidate (`state.candidate_unreadable`).
+    Candidate,
+}
+
+/// Write the cannot-open note once per episode and source (the #8005 shape);
+/// a later successful open of the source clears its latch.
+///
+/// decision: one latch per source over one shared slot, because a failing
+/// newer entry and a failing followed file overwrote each other's latch and
+/// both notes came back on every poll (#8220).
+fn note_cannot_open(
+    state: &mut FollowState,
+    out: &mut CliOutput<'_>,
+    source: NoteSource,
+    path: &Path,
+    err: &anyhow::Error,
+    tail: &str,
+) -> Result<()> {
+    let slot = match source {
+        NoteSource::Followed => &mut state.unreadable,
+        NoteSource::Candidate => &mut state.candidate_unreadable,
+    };
+    if slot.as_deref() != Some(path) {
+        writeln!(
+            out.stderr,
+            "logs: cannot open {}: {err:#}; {tail}",
+            path.display()
+        )?;
+        *slot = Some(path.to_path_buf());
+    }
+    Ok(())
+}
+
+/// True when `err` is a missing path (renamed away or removed).
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Open `state.path` ONCE and classify it from the OPENED handle: its
+/// identity (inode) and length come from `fstat` on that handle, never from a
+/// stat of the path taken before the open. With inodes the inode decides;
+/// without, the bytes before the cursor in the handle are compared with the
+/// ones last seen (#8027).
+///
+/// decision: a failed open is never evidence of replacement, one open per
+/// poll, and identity plus fingerprint come from the opened handle over a
+/// path stat before the open, because a stat followed by an open of the same
+/// path only narrows the swap window and can describe a different file than
+/// the one adopted (#8117, #8109, #8140, #8141); a successful identical open
+/// clears the latch (#8108, #8118). A missing path is quiet: the held handle
+/// keeps draining. The failed-open note never claims a rename, since an open
+/// error shows none (#8148).
+fn probe_path(state: &mut FollowState, out: &mut CliOutput<'_>) -> Result<PathProbe> {
+    let path = state.path.clone();
+    let opened = open_followed(&path).and_then(|file| {
+        let meta = file
+            .metadata()
+            .with_context(|| crate::errors::msg::opening(path.display()))?;
+        Ok((file, meta))
+    });
+    let (file, meta) = match opened {
+        Ok(pair) => pair,
+        Err(err) => {
+            if !is_not_found(&err) {
+                note_cannot_open(
+                    state,
+                    out,
+                    NoteSource::Followed,
+                    &path,
+                    &err,
+                    NOTE_KEEPING_HANDLE,
+                )?;
+            }
+            return Ok(PathProbe::Unopenable);
+        }
+    };
+    let id = file_id(&meta);
+    let replaced = if state.id.is_some() && id.is_some() {
+        state.id != id
+    } else {
+        !state.fingerprint.is_empty()
+            && state.fingerprint_holds()
+            && read_fingerprint(&file, state.offset) != state.fingerprint
+    };
+    if replaced {
+        return Ok(PathProbe::Replaced(file));
+    }
+    state.unreadable = None;
+    if state.id.is_none() {
+        state.id = id;
+    }
+    Ok(PathProbe::Same(meta.len()))
+}
+
+/// Stable identity of the file behind `meta`: the inode on unix, `None` where
+/// the platform exposes none (size shrink still detects truncation there).
+#[cfg(unix)]
+fn file_id(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(test)]
+    if NO_INODE_FOR_TEST.get() {
+        return None;
+    }
+    Some(meta.ino())
+}
+
+/// True when the two open handles are the same file (device and inode), so a
+/// symlink alias of the followed file is not mistaken for a newer log. Decided
+/// on the opened handles, never on paths (#8220).
+#[cfg(unix)]
+fn same_file(a: &fs::File, b: &fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (a.metadata(), b.metadata()) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &fs::File, _b: &fs::File) -> bool {
+    false
+}
+
+/// (device, inode, birth time) of the open handle; `None` where the platform exposes none.
+#[cfg(unix)]
+fn file_identity(file: &fs::File) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    file.metadata().ok().map(|m| FileIdentity {
+        dev: m.dev(),
+        ino: m.ino(),
+        born: m.created().ok(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_file: &fs::File) -> Option<FileIdentity> {
+    None
+}
+
+/// Identity of a followed log: device, inode and birth time. A filesystem
+/// hands a deleted file's inode to the next file created, so the pair alone
+/// cannot tell an old log from a new one; the birth time can. `born` is `None`
+/// where the platform or filesystem reports none (#8220). Birth times differ
+/// at clock-tick resolution, so two files created within one tick can share
+/// one; the inode breaks ties between files alive at the same time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    born: Option<std::time::SystemTime>,
+}
+
+/// True when `id` names a log followed earlier in this session. With a birth
+/// time the whole identity must match. Without one a reused inode cannot be
+/// told from the old file, so the set applies only when `is_symlink` says the
+/// candidate is an alias; a plain file is never skipped on (device, inode)
+/// alone (#8220). `is_symlink` is lazy: it runs only on the no-birth-time
+/// path, so a filesystem that reports birth times pays no extra syscall.
+fn seen_contains(
+    seen: &VecDeque<FileIdentity>,
+    id: &FileIdentity,
+    is_symlink: impl FnOnce() -> bool,
+) -> bool {
+    if id.born.is_some() {
+        return seen.contains(id);
+    }
+    is_symlink() && seen.iter().any(|s| s.dev == id.dev && s.ino == id.ino)
+}
+
+/// True when `path` itself (not its target) is a symlink. A missing or
+/// unreadable path is not a symlink (false).
+fn candidate_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Record the identity of `file` in `seen`, dropping the oldest entry beyond
+/// [`FOLLOW_SEEN_IDENTITIES_MAX`]. A repeat is not stored twice.
+fn remember_identity(seen: &mut VecDeque<FileIdentity>, file: &fs::File) {
+    let Some(id) = file_identity(file) else {
+        return;
+    };
+    if seen.contains(&id) {
+        return;
+    }
+    if seen.len() >= FOLLOW_SEEN_IDENTITIES_MAX {
+        seen.pop_front();
+    }
+    seen.push_back(id);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make [`file_id`] report no identity on a unix host, to drive
+    /// the path a host without inodes takes (#8092).
+    static NO_INODE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: how many times [`open_followed`] ran on this thread (#8109).
+    static OPEN_FOLLOWED_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Strip one trailing `\n` and one preceding `\r`, the same framing
+/// `BufRead::lines` applies.
+fn strip_line_end(raw: &str) -> &str {
+    let line = raw.strip_suffix('\n').unwrap_or(raw);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// Add `read` bytes to `offset` with a checked conversion (PERF-02, PERF-07).
+fn advance_offset(offset: u64, read: usize) -> Result<u64> {
+    u64::try_from(read)
+        .ok()
+        .and_then(|r| offset.checked_add(r))
+        .ok_or_else(|| anyhow!("log offset overflow"))
+}
+
+/// Tail pass: read the last `n` matching lines of `path` and return them with
+/// the byte offset the follow phase must start from. The offset is the number
+/// of bytes this very read consumed (not a later `metadata` length), so every
+/// byte after it is printed by the follow phase exactly once (#7945).
+/// With `hold_tail` an unterminated final fragment is neither returned nor
+/// counted in the offset: the follow phase reads it whole once its newline
+/// arrives, so a line is never printed in two halves (#7963). Without it (a
+/// plain tail, nothing follows) the fragment is returned as a line.
+/// `after_read` runs after the read (a no-op in production; tests append there
+/// to inject the race deterministically).
+fn tail_then_offset_with(
+    path: &Path,
+    n: usize,
+    filters: &Filters,
+    hold_tail: bool,
+    after_read: impl FnOnce(),
+) -> Result<(Vec<String>, u64, Option<u64>, fs::File)> {
+    let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
+    let id = f.metadata().ok().as_ref().and_then(file_id);
+    let mut reader = BufReader::new(f);
+    let mut keep: Vec<String> = Vec::with_capacity(n);
+    let mut offset: u64 = 0;
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 || (hold_tail && raw.last() != Some(&b'\n')) {
+            break;
+        }
+        offset = advance_offset(offset, read)?;
+        let decoded = String::from_utf8_lossy(&raw);
+        let line = strip_line_end(&decoded);
+        if !line_matches(line, filters) {
+            continue;
+        }
+        keep.push(line.to_string());
+        if keep.len() > n {
+            keep.remove(0);
+        }
+    }
+    after_read();
+    Ok((keep, offset, id, reader.into_inner()))
+}
+
+/// Read the lines at or after `offset` from an open handle. A trailing
+/// fragment without its newline is left for the next poll so no line is printed
+/// in two halves, unless `flush_tail` is set (the file is being abandoned, so
+/// no newline will ever follow). Each decoded line goes to `sink` as it is
+/// read, so memory stays constant however much is unread (#8064); a sink error
+/// ends the read and is returned. Returns the offset just past the last byte
+/// consumed.
+fn read_lines_from_handle(
+    file: &mut fs::File,
+    offset: u64,
+    flush_tail: bool,
+    sink: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<u64> {
+    use std::io::Seek as _;
+    use std::io::SeekFrom;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file);
+    let mut end = offset;
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 || (raw.last() != Some(&b'\n') && !flush_tail) {
+            break;
+        }
+        end = advance_offset(end, read)?;
+        // decision: lossy decode of a COMPLETE line over `read_line`, because
+        // `read_line` validates UTF-8 before the held-fragment check and a
+        // fragment ending inside a multi-byte character would abort the
+        // command (#8006); bytes are decoded only once the newline is in.
+        sink(strip_line_end(&String::from_utf8_lossy(&raw)))?;
+    }
+    Ok(end)
+}
+
+/// Open `path` as the followed handle: with `O_NONBLOCK`, and only a regular file.
+///
+/// decision: `O_NONBLOCK` plus `fstat` on the opened handle over a path stat
+/// before a blocking open, because a FIFO at the name would otherwise hang the
+/// poll loop in `open(2)` and a stat then an open of the same path leaves a
+/// swap window; any non-regular file is the same unopenable posture as a
+/// failed open (#8221, ERRORS-02).
+fn open_followed(path: &Path) -> Result<fs::File> {
+    #[cfg(test)]
+    OPEN_FOLLOWED_CALLS.set(OPEN_FOLLOWED_CALLS.get() + 1);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| crate::errors::msg::opening(path.display()))?;
+    let is_regular = file
+        .metadata()
+        .with_context(|| crate::errors::msg::opening(path.display()))?
+        .file_type()
+        .is_file();
+    if !is_regular {
+        return Err(anyhow!("not a regular file"))
+            .with_context(|| crate::errors::msg::opening(path.display()));
+    }
+    Ok(file)
+}
+
+/// Print every line the followed file gained since `state.offset`, reading the
+/// OPEN handle (it stays valid after the path is renamed away, #7950). With
+/// `flush_tail` an unterminated final fragment is printed too.
+fn drain_followed(
+    state: &mut FollowState,
+    filters: &Filters,
+    out: &mut CliOutput<'_>,
+    flush_tail: bool,
+) -> Result<()> {
+    let Ok(meta) = state.file.metadata() else {
         return Ok(());
     };
-    // Read the tail-N matching lines.
-    let initial = read_tail_n(&latest, args.lines, filters)?;
-    for line in &initial {
-        emit_line(line, filters, out)?;
-    }
-    if !args.follow {
+    if meta.len() <= state.offset {
         return Ok(());
     }
-    let mut last_size = fs::metadata(&latest).map(|m| m.len()).unwrap_or(0);
+    let end = read_lines_from_handle(&mut state.file, state.offset, flush_tail, &mut |line| {
+        if line_matches(line, filters) {
+            emit_line(line, filters, out)?;
+        }
+        Ok(())
+    })?;
+    state.offset = end;
+    state.fingerprint = read_fingerprint(&state.file, end);
+    Ok(())
+}
+
+/// Switch the cursor to `path` at offset 0 with the handle `file` the caller
+/// already opened.
+fn switch_to(state: &mut FollowState, path: PathBuf, file: fs::File) {
+    state.id = file.metadata().ok().as_ref().and_then(file_id);
+    remember_identity(&mut state.seen, &file);
+    state.file = file;
+    state.path = path;
+    state.offset = 0;
+    state.fingerprint.clear();
+    state.unreadable = None;
+}
+
+/// One poll of `logs tail --follow`: handle rotation (a newer-named file, a
+/// new inode under the same name, or a shrunk file), then print new lines. The
+/// old handle is always read to EOF before the cursor moves to a new file.
+fn follow_poll(
+    dir: &Path,
+    state: &mut FollowState,
+    filters: &Filters,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    // decision: compare each candidate against the followed path with the
+    // module's own ordering (`list_log_candidates` sorts by path, the rolling
+    // appender's date suffix) over keeping a set of seen paths, because `>`
+    // needs no extra state and an older file can never win once the followed
+    // newest file is renamed away or removed (#7964).
+    let newer: Vec<PathBuf> = list_log_candidates(dir)?
+        .into_iter()
+        .filter(|p| *p > state.path)
+        .collect();
+    let mut switched = false;
+    if !newer.is_empty() {
+        // Rotation by name: finish the old file, then follow the new one from 0.
+        // decision: open the newer file BEFORE leaving the old one over
+        // switching blind, because an unreadable newer file would otherwise
+        // blind the follower for good (a larger name never moves back); walk
+        // the candidates from the newest down and adopt the first that opens
+        // as a regular file, because one non-regular entry sorting above the
+        // real rotated log (a directory, a FIFO) would otherwise shadow it on
+        // every poll (#8222). The highest failure is reported once and the old
+        // file keeps being followed while no candidate opens (#8005, ERRORS-02).
+        let mut skipped: Option<(PathBuf, anyhow::Error)> = None;
+        let mut adopted: Option<(PathBuf, fs::File)> = None;
+        for candidate in newer.into_iter().rev() {
+            match open_followed(&candidate) {
+                // An alias of the followed file, or of any log followed earlier
+                // in this session (a symlink to it), is not newer.
+                // decision: bounded set of followed identities over a path
+                // blacklist because identities survive renames and the probe
+                // is identity-based; the birth time is part of the identity
+                // because a deleted log's inode is reused (#8220).
+                Ok(file)
+                    if same_file(&state.file, &file)
+                        || file_identity(&file).is_some_and(|id| {
+                            seen_contains(&state.seen, &id, || candidate_is_symlink(&candidate))
+                        }) => {}
+                Ok(file) => {
+                    adopted = Some((candidate, file));
+                    break;
+                }
+                Err(err) => {
+                    skipped.get_or_insert((candidate, err));
+                }
+            }
+        }
+        if let Some((path, file)) = adopted {
+            drain_followed(state, filters, out, true)?;
+            switch_to(state, path, file);
+            switched = true;
+        }
+        // decision: write the skip note after the adoption, naming the file
+        // actually followed, over before it with the old name, and keep the
+        // candidate latch across a switch, because the skipped entry still
+        // sorts above the new file and would otherwise be re-reported on
+        // every later poll under a stale "still following" name (#8220).
+        if let Some((path, err)) = skipped {
+            let verb = if switched {
+                "following"
+            } else {
+                "still following"
+            };
+            let tail = format!("{verb} {}", state.path.display());
+            note_cannot_open(state, out, NoteSource::Candidate, &path, &err, &tail)?;
+        } else {
+            state.candidate_unreadable = None;
+        }
+    } else {
+        state.candidate_unreadable = None;
+    }
+    if !switched {
+        // decision: run the followed file's checks whenever no newer candidate
+        // was adopted over only when none exists, because a candidate that
+        // fails to open (a dangling symlink, an unreadable file) would
+        // otherwise skip the truncation and replacement checks on every
+        // poll and the drain would resume at a stale offset (#8220).
+        // Rename-and-recreate: the writer may still have appended to the
+        // renamed file, which only the old handle can reach.
+        // decision: open the path BEFORE leaving the old handle (#8062,
+        // #8063, ERRORS-02) and read identity and length from that handle.
+        match probe_path(state, out)? {
+            PathProbe::Replaced(file) => {
+                let path = state.path.clone();
+                drain_followed(state, filters, out, true)?;
+                write_rotation_note(out, &path)?;
+                switch_to(state, path, file);
+            }
+            PathProbe::Unopenable => {}
+            PathProbe::Same(len) => {
+                if len < state.offset || !state.fingerprint_holds() {
+                    // decision: a short prefix fingerprint of the bytes before
+                    // the cursor over mtime+len or a content hash, because it
+                    // costs one 64-byte read per poll, needs no clock, and
+                    // sees a same-inode truncate that regrows past the old
+                    // offset within one poll (#7965). It misses only a
+                    // rewrite whose last 64 bytes before the cursor are
+                    // byte-identical to the old ones.
+                    write_rotation_note(out, &state.path)?;
+                    state.offset = 0;
+                    state.fingerprint.clear();
+                }
+            }
+        }
+    }
+    drain_followed(state, filters, out, false)
+}
+
+/// Poll loop of `logs tail --follow`, resuming at `state.offset`.
+fn follow_from(
+    dir: &Path,
+    state: &mut FollowState,
+    filters: &Filters,
+    args: &TailArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
     let mut polls: u64 = 0;
     loop {
         std::thread::sleep(Duration::from_millis(args.follow_interval_ms));
         polls += 1;
-        let cur_size = fs::metadata(&latest).map(|m| m.len()).unwrap_or(last_size);
-        if cur_size > last_size {
-            let new_lines = read_lines_after_offset(&latest, last_size)?;
-            for line in new_lines {
-                if line_matches(&line, filters) {
-                    emit_line(&line, filters, out)?;
-                }
-            }
-            last_size = cur_size;
-        }
+        follow_poll(dir, state, filters, out)?;
         if args.max_polls > 0 && polls >= args.max_polls {
             return Ok(());
         }
     }
 }
 
-fn read_tail_n(path: &Path, n: usize, filters: &Filters) -> Result<Vec<String>> {
-    let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
-    let buf = BufReader::new(f);
-    let mut keep: Vec<String> = Vec::with_capacity(n);
-    for line in buf.lines() {
-        let line = line?;
-        if !line_matches(&line, filters) {
-            continue;
-        }
-        keep.push(line);
-        if keep.len() > n {
-            keep.remove(0);
-        }
-    }
-    Ok(keep)
+fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<'_>) -> Result<()> {
+    run_tail_with(dir, filters, args, out, || {})
 }
 
-fn read_lines_after_offset(path: &Path, offset: u64) -> Result<Vec<String>> {
-    use std::io::Seek as _;
-    use std::io::SeekFrom;
-    let mut f =
-        fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
-    f.seek(SeekFrom::Start(offset))?;
-    let buf = BufReader::new(f);
-    let mut out = Vec::new();
-    for line in buf.lines() {
-        out.push(line?);
+/// `run_tail` with a hook that runs right after the tail pass read the file
+/// (a no-op in production; tests append there to inject the #7945 race through
+/// the whole hand-off, not just the seam).
+fn run_tail_with(
+    dir: &Path,
+    filters: &Filters,
+    args: &TailArgs,
+    out: &mut CliOutput<'_>,
+    after_read: impl FnOnce(),
+) -> Result<()> {
+    let files = enumerate_log_files(dir)?;
+    let Some(latest) = files.last().cloned() else {
+        return Ok(());
+    };
+    let (initial, offset, id, file) =
+        tail_then_offset_with(&latest, args.lines, filters, args.follow, after_read)?;
+    for line in &initial {
+        emit_line(line, filters, out)?;
     }
-    Ok(out)
+    if !args.follow {
+        return Ok(());
+    }
+    let mut state = FollowState::new(latest, offset, id, file);
+    follow_from(dir, &mut state, filters, args, out)
 }
 
 /// Convert a file's mtime into a `DateTime<Utc>`, degrading to `None`
@@ -546,44 +1155,1283 @@ mod tests {
         assert_eq!(lines.last().unwrap(), &"line 100");
     }
 
-    /// Writer delay before the appended lines land (#7934).
-    const FOLLOW_WRITER_DELAY_MS: u64 = 60;
-    /// Follow poll interval for the appended-lines test (#7934).
-    const FOLLOW_POLL_INTERVAL_MS: u64 = 30;
-    /// Follow poll cap: 100 polls x 30 ms is a 3 s ceiling, 50x the writer
-    /// delay, so a loaded host cannot starve the writer past the window (#7934).
-    const FOLLOW_MAX_POLLS: u64 = 100;
-
+    /// `run_tail --follow` prints lines appended after the tail pass. The
+    /// append happens in the `after_read` hook (a deterministic handshake: no
+    /// thread, no sleep), so the follow phase must pick both lines up.
     #[test]
     fn logs_tail_follows_appended_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
-        let path_clone = path.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(FOLLOW_WRITER_DELAY_MS));
-            let mut f = fs::OpenOptions::new()
-                .append(true)
-                .open(&path_clone)
-                .unwrap();
-            writeln!(f, "second").unwrap();
-            writeln!(f, "third").unwrap();
-        });
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         {
             let mut out = output(&mut stdout, &mut stderr);
-            let filters = Filters::default();
-            let args = TailArgs {
-                lines: 10,
-                follow: true,
-                follow_interval_ms: FOLLOW_POLL_INTERVAL_MS,
-                max_polls: FOLLOW_MAX_POLLS,
-            };
-            run_tail(dir.path(), &filters, &args, &mut out).unwrap();
+            run_tail_with(
+                dir.path(),
+                &Filters::default(),
+                &follow_args(2),
+                &mut out,
+                || {
+                    append(&path, "second\n");
+                    append(&path, "third\n");
+                },
+            )
+            .unwrap();
         }
-        let s = std::str::from_utf8(&stdout).unwrap();
-        assert!(s.contains("first"), "got: {s}");
-        assert!(s.contains("second"), "expected appended line: {s}");
+        let s = String::from_utf8(stdout).unwrap();
+        assert_eq!(s, "first\nsecond\nthird\n", "got: {s:?}");
+    }
+
+    fn follow_args(max_polls: u64) -> TailArgs {
+        TailArgs {
+            lines: 10,
+            follow: true,
+            follow_interval_ms: 0,
+            max_polls,
+        }
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        write!(f, "{text}").unwrap();
+    }
+
+    /// Cursor on `path` at `offset` with a real open handle and inode, as
+    /// `run_tail` builds it after the tail pass.
+    fn open_state(path: &Path, offset: u64) -> FollowState {
+        let file = fs::File::open(path).unwrap();
+        let id = file.metadata().ok().as_ref().and_then(file_id);
+        FollowState::new(path.to_path_buf(), offset, id, file)
+    }
+
+    /// #7945 - a line appended after the tail pass read the file but before the
+    /// follow offset was captured must still be printed, exactly once.
+    #[test]
+    fn logs_tail_follow_prints_line_appended_before_baseline_7945() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let filters = Filters::default();
+        let (initial, offset, id, file) = tail_then_offset_with(&path, 10, &filters, true, || {
+            append(&path, "second\n");
+        })
+        .unwrap();
+        assert_eq!(initial, vec!["first".to_string()]);
+        let mut state = FollowState::new(path.clone(), offset, id, file);
+        let (s, _) = poll_once(dir.path(), &mut state);
+        let (again, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "second\n", "got: {s:?}");
+        assert_eq!(again, "", "no duplicate on the next poll: {again:?}");
+    }
+
+    /// #7949 review r1 (#7967) - the same race through `run_tail`, so a
+    /// baseline recomputed from `metadata().len()` in the hand-off (the
+    /// original #7945 bug) is caught, not just a broken seam.
+    #[test]
+    fn logs_tail_run_tail_follow_prints_line_appended_before_baseline_7967() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        {
+            let mut out = output(&mut stdout, &mut stderr);
+            run_tail_with(
+                dir.path(),
+                &Filters::default(),
+                &follow_args(2),
+                &mut out,
+                || append(&path, "second\n"),
+            )
+            .unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert_eq!(s, "first\nsecond\n", "each line exactly once: {s:?}");
+    }
+
+    /// #7946 - rotation by name: a newer-named file appears; the old file's
+    /// remaining tail is drained first, then the new file prints from offset 0.
+    #[test]
+    fn logs_tail_follow_survives_name_rotation_7946() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let mut state = open_state(&a, 6);
+        append(&a, "late-a\n");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        make_log(dir.path(), "ai-memory.log.2026-05-01", "new-b\n");
+        let (s2, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "late-a\n", "got: {s1:?}");
+        assert_eq!(s2, "new-b\n", "got: {s2:?}");
+    }
+
+    /// #8028 - name rotation flushes the old file's unterminated final
+    /// fragment as a line (contract of changelog.d/7950.fixed.md), before the
+    /// new file's first line.
+    #[test]
+    fn logs_tail_follow_rotation_flushes_unterminated_old_fragment_8028() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let mut state = open_state(&a, 6);
+        append(&a, "frag");
+        let (held, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            held, "",
+            "fragment held while the file is current: {held:?}"
+        );
+        make_log(dir.path(), "ai-memory.log.2026-05-01", "new-b\n");
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            s, "frag\nnew-b\n",
+            "fragment flushed before new file: {s:?}"
+        );
+    }
+
+    /// #8027 - with no inode identity, a rename-and-recreate larger than the
+    /// read position is still seen (bytes now at the path differ from the ones
+    /// before the cursor), and the renamed file's late append is drained first.
+    #[test]
+    fn logs_tail_follow_detects_replace_without_inode_8027() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "old-one\nold-two\n");
+        let mut state = open_state(&a, 16);
+        state.id = None;
+        fs::rename(&a, dir.path().join("ai-memory.log.2026-04-30.zst")).unwrap();
+        make_log(
+            dir.path(),
+            "ai-memory.log.2026-04-30",
+            "new-one\nnew-two\nnew-three\nnew-four\n",
+        );
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "new-one\nnew-two\nnew-three\nnew-four\n", "got: {s:?}");
+        assert!(e.contains("rotated or truncated"), "note: {e:?}");
+    }
+
+    /// #8005 - a newer file that cannot be opened is reported once and the
+    /// old file keeps being followed; once readable the follower switches.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_survives_unreadable_newer_file_8005() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let mut state = open_state(&a, 6);
+        let b = make_log(dir.path(), "ai-memory.log.2026-05-01", "new-b\n");
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&b).is_ok() {
+            return; // privileged user: the permission bits do not bite.
+        }
+        append(&a, "a2\n");
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "a2\n", "old file still followed: {s1:?}");
+        assert!(e1.contains("cannot open"), "reported: {e1:?}");
+        append(&a, "a3\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "a3\n", "{s2:?}");
+        assert_eq!(e2, "", "reported once: {e2:?}");
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o644)).unwrap();
+        append(&a, "a4\n");
+        let (s3, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "a4\nnew-b\n", "drained old, switched: {s3:?}");
+        assert_eq!(state.path, b);
+    }
+
+    /// #8062 (= #8063) - a rename-and-recreate whose new file cannot be opened
+    /// yet is reported once, the renamed-away file keeps being drained, and the
+    /// new file prints from its start exactly once when it becomes readable.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_resumes_after_recreated_unopenable_file_8062() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "first\n");
+        let mut state = open_state(&a, 6);
+        let old = dir.path().join("old.zst");
+        fs::rename(&a, &old).unwrap();
+        append(&old, "late-old\n");
+        fs::write(&a, "new-1\nnew-2\n").unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&a).is_ok() {
+            return; // privileged user: the permission bits do not bite.
+        }
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "late-old\n", "renamed file still drained: {s1:?}");
+        assert!(e1.contains("cannot open"), "reported: {e1:?}");
+        assert!(
+            !e1.contains("following from the start"),
+            "no false note: {e1:?}"
+        );
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!((s2.as_str(), e2.as_str()), ("", ""), "quiet and once");
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
+        let (s3, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "new-1\nnew-2\n", "resumed from the start: {s3:?}");
+        assert!(e3.contains("rotated or truncated"), "note: {e3:?}");
+        let (s4, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s4, "", "no duplicate: {s4:?}");
+    }
+
+    /// #8064 - `read_lines_from_handle` hands each decoded line to the sink as
+    /// it is read (constant memory), returns only the end offset, and stops at
+    /// the first sink error without reading on.
+    #[test]
+    fn read_lines_from_handle_streams_each_line_to_sink_8064() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log", "l1\nl2\nl3\nl4\nfrag");
+        let mut file = fs::File::open(&path).unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        let end = read_lines_from_handle(&mut file, 0, false, &mut |line| {
+            seen.push(line.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["l1", "l2", "l3", "l4"]);
+        assert_eq!(end, 12, "fragment held, offset past the last newline");
+        let mut calls = 0_u32;
+        let err = read_lines_from_handle(&mut file, 0, false, &mut |_| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("sink closed");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("sink closed"), "{err:#}");
+        assert_eq!(calls, 2, "no line is read after the sink failed");
+    }
+
+    /// #8092 - with no inode to compare (non-unix hosts; modelled by the test
+    /// hook), a same-name recreate that cannot be opened yet is reported once,
+    /// the old lines are never reprinted, and the new file prints once readable.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_recreated_unopenable_prints_once_8092() {
+        use std::os::unix::fs::PermissionsExt as _;
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\nold-2\n");
+        let mut state = open_state(&a, 12);
+        assert_eq!(state.id, None, "hook models a host without inodes");
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        append(&dir.path().join("old.zst"), "late-old\n");
+        fs::write(&a, "n1\n").unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&a).is_ok() {
+            return; // privileged user: the permission bits do not bite.
+        }
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "late-old\n", "old tail drained once: {s1:?}");
+        assert_eq!(e1.matches("cannot open").count(), 1, "reported: {e1:?}");
+        for _ in 0..4 {
+            let (s, e) = poll_once(dir.path(), &mut state);
+            assert_eq!((s.as_str(), e.as_str()), ("", ""), "no reprint, no repeat");
+        }
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
+        let (s3, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "n1\n", "new file once readable: {s3:?}");
+        assert_eq!(
+            e3.matches("rotated or truncated").count(),
+            1,
+            "note: {e3:?}"
+        );
+        let (s4, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s4, "", "no duplicate: {s4:?}");
+    }
+
+    /// Drop the read bit so the path cannot be opened; false when the bits do
+    /// not bite (privileged user).
+    #[cfg(unix)]
+    fn make_unopenable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::File::open(path).is_err()
+    }
+
+    #[cfg(unix)]
+    fn make_openable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// #8117 - with no inode, a transient open failure on an UNCHANGED file is
+    /// no evidence of replacement: no rename/rotation claim, no reprint, and
+    /// the cursor survives the failure.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_transient_open_failure_is_not_replacement_8117() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "", "no reprint: {s1:?}");
+        assert!(!e1.contains("renamed"), "false rename claim: {e1:?}");
+        assert!(!e1.contains("rotated"), "false rotation claim: {e1:?}");
+        assert_eq!(state.offset, 8, "cursor untouched by the failure");
+        make_openable(&a);
+        append(&a, "three\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "three\n", "only the new line, no reprint: {s2:?}");
+        assert!(!e2.contains("rotated"), "no rotation note: {e2:?}");
+    }
+
+    /// #8118 - after a transient episode on the same file, a real rename plus
+    /// an unreadable recreate still prints the note once and resumes when the
+    /// new file turns readable.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_note_after_transient_episode_8118() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (_, e1) = poll_once(dir.path(), &mut state);
+        assert!(e1.matches("cannot open").count() <= 1, "episode 1: {e1:?}");
+        make_openable(&a);
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s2.as_str(), e2.as_str()),
+            ("", ""),
+            "healed: {s2:?} {e2:?}"
+        );
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        fs::write(&a, "n1\n").unwrap();
+        assert!(make_unopenable(&a));
+        let (_, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            e3.matches("cannot open").count(),
+            1,
+            "episode 2 note: {e3:?}"
+        );
+        let (s4, e4) = poll_once(dir.path(), &mut state);
+        assert_eq!((s4.as_str(), e4.as_str()), ("", ""), "once only");
+        make_openable(&a);
+        let (s5, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s5, "n1\n", "resumes on the new file: {s5:?}");
+    }
+
+    /// #8108 - the cannot-open latch clears after a transient episode: a second
+    /// episode on the same file prints its own note once.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_cannot_open_latch_clears_8108() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (_, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(e1.matches("cannot open").count(), 1, "episode 1: {e1:?}");
+        let (_, e1b) = poll_once(dir.path(), &mut state);
+        assert_eq!(e1b, "", "deduped within the episode");
+        make_openable(&a);
+        let _ = poll_once(dir.path(), &mut state);
+        assert!(
+            state.unreadable.is_none(),
+            "latch cleared after the episode"
+        );
+        assert!(make_unopenable(&a));
+        let (_, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(e2.matches("cannot open").count(), 1, "episode 2: {e2:?}");
+    }
+
+    /// #8109 - exactly one open of the followed path per poll, and a
+    /// replacement is adopted from that same handle (printed once).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_one_open_per_poll_8109() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\nold-2\n");
+        let mut state = open_state(&a, 12);
+        OPEN_FOLLOWED_CALLS.set(0);
+        let _ = poll_once(dir.path(), &mut state);
+        assert_eq!(OPEN_FOLLOWED_CALLS.get(), 1, "unchanged file: one open");
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        fs::write(&a, "new-1\n").unwrap();
+        OPEN_FOLLOWED_CALLS.set(0);
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(OPEN_FOLLOWED_CALLS.get(), 1, "replacement: one open");
+        assert_eq!(s, "new-1\n", "printed once: {s:?}");
+        assert_eq!(e.matches("rotated or truncated").count(), 1, "note: {e:?}");
+    }
+
+    /// The production half of this file (everything before the test module),
+    /// for the structural guards below.
+    fn prod_source() -> &'static str {
+        let all = include_str!("logs.rs");
+        all.split("#[cfg(test)]\nmod tests").next().unwrap_or(all)
+    }
+
+    /// The text of `all` from `from` up to the next `to`.
+    fn between<'a>(all: &'a str, from: &str, to: &str) -> &'a str {
+        let start = all.find(from).unwrap();
+        let rest = &all[start..];
+        &rest[..rest.find(to).unwrap_or(rest.len())]
+    }
+
+    /// The production half with `//` comments removed, so a guard never
+    /// matches prose.
+    fn prod_code() -> String {
+        prod_source()
+            .lines()
+            .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of `fn name(` in `code`, brace-matched.
+    fn fn_body(code: &str, name: &str) -> String {
+        let start = code.find(&format!("fn {name}(")).unwrap();
+        let rest = &code[start..];
+        let open = rest.find('{').unwrap();
+        let mut depth = 0usize;
+        for (i, c) in rest[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return rest[..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced fn {name}");
+    }
+
+    /// The functions on the poll and switch path: none may stat or open a
+    /// path itself.
+    const POLL_PATH_FNS: [&str; 5] = [
+        "follow_poll",
+        "probe_path",
+        "switch_to",
+        "drain_followed",
+        "open_followed",
+    ];
+
+    /// Every `metadata(` call in `body` whose receiver is not a held handle
+    /// (`file`, `state.file`): a path method (`path.metadata()`), a free
+    /// function (`fs::metadata(`, `fs::symlink_metadata(`, `metadata(`) or a
+    /// path predicate. Semantic over spelling: any receiver but the handle
+    /// fails.
+    fn path_stat_calls(body: &str) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (at, _) in body.match_indices("metadata(") {
+            let before = body[..at].trim_end();
+            let Some(head) = before.strip_suffix('.') else {
+                bad.push(format!("free call at {at}"));
+                continue;
+            };
+            let recv: String = head
+                .trim_end()
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if recv.rsplit('.').next() != Some("file") {
+                bad.push(format!("receiver `{recv}` at {at}"));
+            }
+        }
+        for banned in [".exists()", ".is_dir()", ".try_exists()"] {
+            if body.contains(banned) {
+                bad.push(format!("path predicate {banned}"));
+            }
+        }
+        // `.is_file()` is allowed only on the handle's `file_type()`.
+        for (at, _) in body.match_indices(".is_file()") {
+            if !body[..at].trim_end().ends_with("file_type()") {
+                bad.push(format!("path predicate .is_file() at {at}"));
+            }
+        }
+        bad
+    }
+
+    /// #8140 #8141 - the poll path takes the identity and the length from the
+    /// OPENED handle: no stat of a path anywhere on it, whatever the spelling.
+    #[test]
+    fn logs_tail_follow_poll_has_no_path_stat_before_open_8141() {
+        let code = prod_code();
+        for name in POLL_PATH_FNS {
+            let bad = path_stat_calls(&fn_body(&code, name));
+            assert!(bad.is_empty(), "path stat in {name}: {bad:?}");
+        }
+        let probe = fn_body(&code, "probe_path");
+        assert!(
+            !probe.contains("id: Option<u64>"),
+            "probe_path must not take a pre-open identity"
+        );
+        // The scan itself: handle receivers pass, path receivers and free
+        // calls fail (the m4 and original #8141 shapes).
+        assert!(path_stat_calls("let m = state.file.metadata();").is_empty());
+        assert!(path_stat_calls("file\n  .metadata()").is_empty());
+        assert!(!path_stat_calls("path.metadata().ok().as_ref()").is_empty());
+        assert!(!path_stat_calls("fs::metadata(&path)").is_empty());
+        assert!(!path_stat_calls("std::fs::symlink_metadata(&p)").is_empty());
+        assert!(!path_stat_calls("if p.is_file() {}").is_empty());
+        assert!(path_stat_calls("file.metadata()?.file_type().is_file()").is_empty());
+    }
+
+    /// #8141 - a removed followed path is no evidence of anything: quiet poll,
+    /// the held handle keeps draining.
+    #[test]
+    fn logs_tail_follow_removed_path_is_quiet_8141() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let mut state = open_state(&a, 4);
+        fs::remove_file(&a).unwrap();
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!((s.as_str(), e.as_str()), ("", ""), "quiet: {s:?} {e:?}");
+        assert_eq!(state.offset, 4, "cursor kept");
+    }
+
+    /// #8142 - the cannot-open latch has ONE writer and its field doc says
+    /// what it holds.
+    #[test]
+    fn logs_tail_follow_unreadable_latch_has_one_writer_8142() {
+        let src = prod_source();
+        assert_eq!(
+            src.matches("*slot = Some(").count(),
+            1,
+            "one set site for the latches"
+        );
+        assert_eq!(
+            src.matches("unreadable = Some(").count(),
+            0,
+            "no direct latch write outside note_cannot_open"
+        );
+        let doc = between(src, "struct FollowState", "unreadable: Option<PathBuf>");
+        assert!(
+            !doc.contains("Newer log file that could not be opened"),
+            "stale field doc: {doc}"
+        );
+    }
+
+    /// #8143 - no reopen fallbacks: the followed handle is always present, so
+    /// neither `switch_to` nor `drain_followed` opens a path.
+    #[test]
+    fn logs_tail_follow_has_no_dead_reopen_8143() {
+        let src = prod_source();
+        assert!(!src.contains("opened.or_else"), "switch_to reopen");
+        assert!(
+            !src.contains("state.file.is_none()"),
+            "drain_followed reopen"
+        );
+        assert!(!src.contains("Option<fs::File>"), "optional handle");
+    }
+
+    /// #8144 - the rotation note text lives in one named constant.
+    #[test]
+    fn logs_tail_follow_rotation_note_is_one_constant_8144() {
+        let src = prod_source();
+        assert_eq!(
+            src.matches("was rotated or truncated; following from the start")
+                .count(),
+            1,
+            "one literal"
+        );
+    }
+
+    /// Opens of a path in the production half: the two one-shot reads of the
+    /// tail pass plus the single `open_followed`, counted over EVERY spelling
+    /// (`File::open`, `OpenOptions::new()...open`, `File::options()...open`,
+    /// `fs::OpenOptions`).
+    const PROD_PATH_OPENS: usize = 3;
+
+    /// Count of path-open spellings in `code`.
+    fn open_spellings(code: &str) -> usize {
+        code.matches("File::open(").count() + code.matches(".open(").count()
+    }
+
+    /// #8145 - one open per poll: any extra raw open of a path in the
+    /// production half, in any spelling (invisible to the `open_followed`
+    /// counter), fails this.
+    #[test]
+    fn logs_tail_follow_no_raw_open_besides_open_followed_8145() {
+        let code = prod_code();
+        assert_eq!(open_spellings(&code), PROD_PATH_OPENS, "open sites");
+        assert_eq!(open_spellings(&fn_body(&code, "open_followed")), 1);
+        for name in ["follow_poll", "probe_path", "switch_to", "drain_followed"] {
+            assert_eq!(open_spellings(&fn_body(&code, name)), 0, "open in {name}");
+            let body = fn_body(&code, name);
+            assert!(
+                !body.contains("fs::read(") && !body.contains("read_to_string("),
+                "whole-file read in {name}"
+            );
+        }
+        assert_eq!(code.matches("open_followed(").count(), 3, "def + 2 uses");
+        // The count sees every spelling (the m3 and original second-open
+        // shapes).
+        assert_eq!(open_spellings("fs::File::options().read(true).open(&p)"), 1);
+        assert_eq!(
+            open_spellings("fs::OpenOptions::new().read(true).open(&p)"),
+            1
+        );
+        assert_eq!(open_spellings("let f = fs::File::open(&p)?;"), 1);
+    }
+
+    /// Make a FIFO at `path` (no shell, no subprocess).
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed");
+    }
+
+    /// One poll on a worker thread, bounded: `None` when it did not return in
+    /// time (a blocking open of a FIFO).
+    #[cfg(unix)]
+    fn bounded_poll(dir: &Path, mut state: FollowState) -> Option<(String, String)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(poll_once(&dir, &mut state));
+        });
+        rx.recv_timeout(Duration::from_secs(3)).ok()
+    }
+
+    /// #8221 - a FIFO at the followed path must not hang the poll: the open uses
+    /// O_NONBLOCK and the handle's type is checked, so it is the same
+    /// unopenable posture as a failed open (one note, the held handle keeps
+    /// draining).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_at_followed_path_does_not_hang_8221() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let state = open_state(&a, 4);
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        append(&dir.path().join("old.zst"), "late\n");
+        make_fifo(&a);
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung on a FIFO");
+        assert_eq!(s, "late\n", "held handle drained: {s:?}");
+        assert_eq!(e.matches("cannot open").count(), 1, "one note: {e:?}");
+        assert!(e.ends_with("; still following the open file\n"), "{e:?}");
+    }
+
+    /// #8221 - a FIFO that appears as the newer file is not adopted and does
+    /// not hang the poll; the old file keeps being followed.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_as_newer_file_is_not_adopted_8221() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "one\n");
+        let state = open_state(&a, 4);
+        make_fifo(&dir.path().join("ai-memory.log.2026-05-01"));
+        append(&a, "two\n");
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung on a FIFO");
+        assert_eq!(s, "two\n", "old file still followed: {s:?}");
+        assert_eq!(e, "", "FIFO skipped by entry type, quietly: {e:?}");
+    }
+
+    /// Plant a non-regular `ai-memory.log.old` that sorts above the dated
+    /// logs: a directory, or (`fifo`) a FIFO.
+    #[cfg(unix)]
+    fn plant_shadow(dir: &Path, fifo: bool) {
+        let shadow = dir.join("ai-memory.log.old");
+        if fifo {
+            make_fifo(&shadow);
+        } else {
+            fs::create_dir(&shadow).unwrap();
+        }
+    }
+
+    /// #8222 - a non-regular entry sorting above the followed file must not
+    /// shadow the next rotated log: the list skips it by its entry type, the
+    /// follow switches to the newest regular file, quietly, within the bound.
+    #[cfg(unix)]
+    fn shadowed_switch(fifo: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "one\n");
+        let state = open_state(&a, 4);
+        plant_shadow(dir.path(), fifo);
+        make_log(dir.path(), "ai-memory.log.2026-10-24", "next\n");
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung");
+        assert_eq!((s.as_str(), e.as_str()), ("next\n", ""), "{s:?} {e:?}");
+    }
+
+    /// #8222 - the same shadow must not stop the truncation check: a shrunk
+    /// followed file is noticed and re-read from the start.
+    #[cfg(unix)]
+    fn shadowed_truncation(fifo: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let state = open_state(&a, 8);
+        plant_shadow(dir.path(), fifo);
+        fs::write(&a, "x\n").unwrap();
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung");
+        assert_eq!(s, "x\n", "truncation seen: {s:?} {e:?}");
+        assert!(e.contains("rotated or truncated"), "{e:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_directory_sorting_last_does_not_shadow_next_log_8222() {
+        shadowed_switch(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_sorting_last_does_not_shadow_next_log_8222() {
+        shadowed_switch(true);
+    }
+
+    /// #8222 - a symlink to a directory passes the entry-type filter (a
+    /// symlink is kept so the handle decides), so the walk down the
+    /// candidates is what skips it and reaches the real newest log.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_symlinked_directory_sorting_last_is_walked_past_8222() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "one\n");
+        let state = open_state(&a, 4);
+        let target = dir.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("ai-memory.log.old")).unwrap();
+        make_log(dir.path(), "ai-memory.log.2026-10-24", "next\n");
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung");
+        assert_eq!(s, "next\n", "{s:?} {e:?}");
+        assert_eq!(e.matches("not a regular file").count(), 1, "{e:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_directory_sorting_last_keeps_truncation_check_8222() {
+        shadowed_truncation(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_sorting_last_keeps_truncation_check_8222() {
+        shadowed_truncation(true);
+    }
+
+    /// Plant a dangling `ai-memory.log.old` symlink: it sorts above the
+    /// followed `ai-memory.log`, passes the entry-type filter (a symlink is
+    /// kept) and fails to open.
+    #[cfg(unix)]
+    fn plant_dangling(dir: &Path) {
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("ai-memory.log.old")).unwrap();
+    }
+
+    /// #8220 - a newer candidate that fails to open must not skip the
+    /// truncation check of the followed file: the rewritten lines print whole,
+    /// from offset 0, with the rotation note, and the failed candidate is
+    /// reported once.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_dangling_newer_symlink_keeps_truncation_check_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "n-before-one\nn-before-two\n");
+        let mut state = open_state(&a, 26);
+        plant_dangling(dir.path());
+        fs::write(&a, "fresh-1\n").unwrap();
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "fresh-1\n", "whole new line: {s1:?} {e1:?}");
+        assert!(e1.contains("rotated or truncated"), "{e1:?}");
+        assert_eq!(e1.matches("cannot open").count(), 1, "{e1:?}");
+        append(&a, "fresh-2\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "fresh-2\n", "no torn or dropped line: {s2:?}");
+        assert_eq!(e2, "", "failed candidate reported once: {e2:?}");
+    }
+
+    /// #8220 - the same shadow must not skip the replacement check: a followed
+    /// file renamed away and recreated is read from its start.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_dangling_newer_symlink_keeps_replacement_check_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\n");
+        let mut state = open_state(&a, 6);
+        plant_dangling(dir.path());
+        append(&a, "old-2\n");
+        fs::rename(&a, dir.path().join("renamed.zst")).unwrap();
+        make_log(dir.path(), "ai-memory.log", "new-1\nnew-2\n");
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "old-2\nnew-1\nnew-2\n", "{s:?} {e:?}");
+        assert!(e.contains("rotated or truncated"), "{e:?}");
+    }
+
+    /// Count the cannot-open notes of one poll.
+    #[cfg(unix)]
+    fn notes_of(dir: &Path, state: &mut FollowState) -> usize {
+        let (_, e) = poll_once(dir, state);
+        e.matches("cannot open").count()
+    }
+
+    /// #8220 - a failing newer entry and a failing followed path each keep
+    /// their own latch: both are reported once, then silence for as long as
+    /// both failures last (not the pair again on every poll).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_two_failing_sources_report_once_each_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let mut state = open_state(&a, 4);
+        plant_dangling(dir.path());
+        fs::remove_file(&a).unwrap();
+        make_fifo(&a);
+        let counts: Vec<usize> = (0..6).map(|_| notes_of(dir.path(), &mut state)).collect();
+        assert_eq!(counts, [2, 0, 0, 0, 0, 0], "per-poll notes: {counts:?}");
+    }
+
+    /// #8220 - a newer entry that disappears and later fails again is a new
+    /// episode and is reported again.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_candidate_that_vanishes_and_fails_again_is_reported_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let mut state = open_state(&a, 4);
+        plant_dangling(dir.path());
+        let first = notes_of(dir.path(), &mut state);
+        let again = notes_of(dir.path(), &mut state);
+        fs::remove_file(dir.path().join("ai-memory.log.old")).unwrap();
+        let gone = notes_of(dir.path(), &mut state);
+        plant_dangling(dir.path());
+        let replanted = notes_of(dir.path(), &mut state);
+        assert_eq!([first, again, gone, replanted], [1, 0, 0, 1]);
+    }
+
+    /// #8220 - a symlink that sorts above the followed file and points at it
+    /// is the same file (device and inode of the opened handles), so it is
+    /// not adopted: nothing is reprinted and the followed name is kept.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_alias_of_the_followed_file_is_not_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "line-1\nline-2\n");
+        let mut state = open_state(&a, 14);
+        std::os::unix::fs::symlink(&a, dir.path().join("ai-memory.log.latest")).unwrap();
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s1.as_str(), e1.as_str()),
+            ("", ""),
+            "no reprint: {s1:?} {e1:?}"
+        );
+        assert_eq!(state.path, a, "alias name not followed");
+        append(&a, "line-3\n");
+        let (s2, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "line-3\n");
+    }
+
+    /// #8220 r13 - a symlink that points at an EARLIER log of this session
+    /// (not the one followed now) is not adopted after a rotation either:
+    /// nothing is reprinted, the followed name stays, and new lines show.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_alias_of_an_earlier_log_is_not_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "a-1\na-2\n");
+        let mut state = open_state(&a, 8);
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "b-1\n");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "b-1\n", "rotated to b: {s1:?}");
+        assert_eq!(state.path, b);
+        std::os::unix::fs::symlink(&a, dir.path().join("ai-memory.log.latest")).unwrap();
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s2.as_str(), e2.as_str()),
+            ("", ""),
+            "no reprint of a: {s2:?} {e2:?}"
+        );
+        assert_eq!(state.path, b, "alias of an earlier log not followed");
+        append(&b, "b-2\n");
+        let (s3, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "b-2\n");
+    }
+
+    /// Upper bound on waiting for the birth-time clock to tick.
+    const BIRTH_TICK_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Poll step while waiting for the birth-time clock to tick.
+    const BIRTH_TICK_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// File name of the birth-tick probe; removed before the helper returns.
+    const BIRTH_TICK_PROBE_NAME: &str = "birth-tick-probe";
+
+    /// Wait until a fresh scratch file's birth time differs from `old`, so the
+    /// next log cannot share the deleted log's birth time on a coarse clock.
+    /// Skipped when `created()` is unavailable or `old` is `None`.
+    fn wait_for_birth_tick(dir: &Path, old: Option<std::time::SystemTime>) {
+        let Some(old) = old else { return };
+        let deadline = std::time::Instant::now() + BIRTH_TICK_WAIT_MAX;
+        let probe = dir.join(BIRTH_TICK_PROBE_NAME);
+        while std::time::Instant::now() < deadline {
+            let born = fs::write(&probe, b"").and_then(|()| fs::metadata(&probe)?.created());
+            let _ = fs::remove_file(&probe);
+            match born {
+                Ok(t) if t != old => return,
+                Ok(_) => std::thread::sleep(BIRTH_TICK_POLL_STEP),
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// #8220 r15 - the symlink probe tells a link from a file and a missing path.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_candidate_is_symlink_distinguishes_link_file_and_missing_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = make_log(dir.path(), "ai-memory.log.2026-10-23", "a\n");
+        let link = dir.path().join("ai-memory.log.latest");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(candidate_is_symlink(&link), "symlink");
+        assert!(!candidate_is_symlink(&file), "regular file");
+        assert!(
+            !candidate_is_symlink(&dir.path().join("missing")),
+            "missing"
+        );
+    }
+
+    /// #8220 r14 - a new log that inherited a deleted log's inode is a new
+    /// file, not an alias: follow a, rotate to b, delete a, create c. On a
+    /// filesystem that reuses the inode (ext4) c matches a's (device, inode);
+    /// the birth time tells them apart. The test asserts adoption only.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_new_log_reusing_a_deleted_logs_inode_is_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "a-1\n");
+        let mut state = open_state(&a, 4);
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "b-1\n");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "b-1\n", "rotated to b: {s1:?}");
+        assert_eq!(state.path, b);
+        let a_born = fs::metadata(&a).and_then(|m| m.created()).ok();
+        // The probe lives in the log directory; `poll_once` cannot adopt it
+        // because its name lacks the `ai-memory` marker the scan filters on
+        // (logs.rs:262-263), and it is removed before `c` is created so `c`
+        // can reuse the freed inode of `a`.
+        fs::remove_file(&a).unwrap();
+        wait_for_birth_tick(dir.path(), a_born);
+        assert!(
+            fs::symlink_metadata(dir.path().join(BIRTH_TICK_PROBE_NAME)).is_err(),
+            "birth-tick probe must be removed before c is created so c can reuse a's inode"
+        );
+        let c = make_log(dir.path(), "ai-memory.log.2026-10-25", "c-1\nc-2\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "c-1\nc-2\n", "c printed: {s2:?} {e2:?}");
+        assert_eq!(state.path, c, "follower is on c");
+    }
+
+    /// #8220 r14 - a symlink to a MIDDLE log (neither the first nor the one
+    /// followed now) is an alias too: follow a, rotate to b, rotate to c, then
+    /// a newer-looking symlink to b is not adopted and nothing is reprinted.
+    /// Green at the r13 head; it fails when `switch_to` stops recording the
+    /// log it adopts, because b is recorded nowhere else.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_alias_of_a_middle_log_is_not_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "a-1\n");
+        let mut state = open_state(&a, 4);
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "b-1\n");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "b-1\n");
+        assert_eq!(state.path, b);
+        let c = make_log(dir.path(), "ai-memory.log.2026-10-25", "c-1\n");
+        let (s2, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "c-1\n");
+        assert_eq!(state.path, c);
+        std::os::unix::fs::symlink(&b, dir.path().join("ai-memory.log.latest")).unwrap();
+        let (s3, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s3.as_str(), e3.as_str()),
+            ("", ""),
+            "no reprint of b: {s3:?} {e3:?}"
+        );
+        assert_eq!(state.path, c, "alias of a middle log not followed");
+        append(&c, "c-2\n");
+        let (s4, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s4, "c-2\n");
+    }
+
+    /// #8220 r14 - the identity helper: same device and inode with a
+    /// different birth time are not the same log, and without a birth time a
+    /// plain file is never matched while a symlink is.
+    #[test]
+    fn logs_tail_follow_identity_birth_time_decides_reuse_8220() {
+        use std::time::{Duration, SystemTime};
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_secs(1);
+        let old = FileIdentity {
+            dev: 1,
+            ino: 7,
+            born: Some(t0),
+        };
+        let reused = FileIdentity {
+            dev: 1,
+            ino: 7,
+            born: Some(t1),
+        };
+        assert_ne!(old, reused, "same inode, different birth");
+        let seen: VecDeque<FileIdentity> = VecDeque::from([old]);
+        assert!(seen_contains(&seen, &old, || false));
+        assert!(!seen_contains(&seen, &reused, || false));
+        assert!(!seen_contains(&seen, &reused, || true));
+        let unknown = FileIdentity {
+            dev: 1,
+            ino: 7,
+            born: None,
+        };
+        assert!(!seen_contains(&seen, &unknown, || false), "plain file kept");
+        assert!(seen_contains(&seen, &unknown, || true), "symlink skipped");
+    }
+
+    /// #8220 - after the follower switches past a failing newer entry, the
+    /// skip note names the file now followed and is not repeated on later polls.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_skip_note_names_followed_file_once_per_switch_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "one\n");
+        let mut state = open_state(&a, 4);
+        plant_dangling(dir.path());
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "next\n");
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "next\n");
+        assert_eq!(e1.matches("cannot open").count(), 1, "{e1:?}");
+        assert!(e1.contains(&format!("following {}", b.display())), "{e1:?}");
+        assert!(!e1.contains("still following"), "stale name: {e1:?}");
+        let later: Vec<usize> = (0..3).map(|_| notes_of(dir.path(), &mut state)).collect();
+        assert_eq!(later, [0, 0, 0], "no repeat after the switch");
+    }
+
+    /// #8148 - the note tail on a failed open: with an inode an unopenable
+    /// replacement keeps the open handle draining and says exactly that; a
+    /// failed open proves no rename, so the tail never claims one.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_inode_unopenable_replacement_note_tail_8148() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-1\nold-2\n");
+        let mut state = open_state(&a, 12);
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        append(&dir.path().join("old.zst"), "late\n");
+        fs::write(&a, "n1\n").unwrap();
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "late\n", "old handle drained: {s:?}");
+        assert!(e.ends_with("; still following the open file\n"), "{e:?}");
+        assert!(!e.contains("renamed"), "no unproven rename claim: {e:?}");
+    }
+
+    /// #8148 - the same exact tail without an inode.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_no_inode_unopenable_note_tail_8148() {
+        NO_INODE_FOR_TEST.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\ntwo\n");
+        let mut state = open_state(&a, 8);
+        if !make_unopenable(&a) {
+            return;
+        }
+        let (_, e) = poll_once(dir.path(), &mut state);
+        assert!(e.ends_with("; still following the open file\n"), "{e:?}");
+    }
+
+    /// #8097 - the sink sees lines while the read is still going: the first
+    /// sink call truncates the file, so a reader that streams stops once its
+    /// buffered chunk is used up, while one that collected every line first
+    /// and replayed them afterwards would still deliver all of them.
+    #[test]
+    fn read_lines_from_handle_sink_sees_lines_before_loop_ends_8097() {
+        const LINES: usize = 2_000;
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{}\n", "x".repeat(63)).repeat(LINES);
+        let path = make_log(dir.path(), "ai-memory.log", &body);
+        let mut file = fs::File::open(&path).unwrap();
+        let mut calls = 0_usize;
+        read_lines_from_handle(&mut file, 0, false, &mut |_| {
+            calls += 1;
+            if calls == 1 {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(calls >= 1, "the sink ran");
+        assert!(
+            calls < LINES,
+            "lines streamed to the sink while reading, not replayed after: {calls}"
+        );
+    }
+
+    /// #8006 - a fragment that ends inside a multi-byte character is held,
+    /// not an error; once its newline arrives the line prints whole. A
+    /// complete line of invalid UTF-8 prints lossily.
+    #[test]
+    fn logs_tail_follow_holds_partial_utf8_8006() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ai-memory.log.2026-04-30");
+        fs::write(&path, b"caf\xC3").unwrap();
+        let mut state = open_state(&path, 0);
+        let (held, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(held, "", "fragment held: {held:?}");
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"\xA9\nbad\xFF\n").unwrap();
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "caf\u{e9}\nbad\u{fffd}\n", "got: {s:?}");
+        let (initial, offset, _, _) =
+            tail_then_offset_with(&path, 10, &Filters::default(), true, || {}).unwrap();
+        assert_eq!(initial.len(), 2);
+        assert_eq!(offset, 11);
+    }
+
+    /// #7946 - truncation of the followed file restarts from offset 0.
+    #[test]
+    fn logs_tail_follow_survives_truncation_7946() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "aaaa\nbbbb\n");
+        let mut state = open_state(&a, 10);
+        fs::write(&a, "c\n").unwrap();
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "c\n", "got: {s:?}");
+        assert!(e.contains("rotated or truncated"), "stderr note: {e:?}");
+    }
+
+    /// #7946 - rename-and-recreate under the same name (new inode, larger file).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_survives_rename_recreate_7946() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-line-one\n");
+        let mut state = open_state(&a, 13);
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        fs::write(&a, "longer-new-line\nz\n").unwrap();
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "longer-new-line\nz\n", "got: {s:?}");
+    }
+
+    /// #7950 - the writer appends to the RENAMED old file before it reopens the
+    /// path; those bytes must be printed before the new file's first line.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_drains_renamed_old_file_before_switch_7950() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "first\n");
+        let mut state = open_state(&a, 6);
+        let old = dir.path().join("old.zst");
+        fs::rename(&a, &old).unwrap();
+        append(&old, "late-old\n");
+        fs::write(&a, "fresh-new\n").unwrap();
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            s, "late-old\nfresh-new\n",
+            "old tail precedes new file: {s:?}"
+        );
+    }
+
+    /// One `follow_poll` against `dir`, returning (stdout, stderr). No sleeps,
+    /// no threads: every test drives the poll seam directly.
+    fn poll_once(dir: &Path, state: &mut FollowState) -> (String, String) {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        {
+            let mut out = output(&mut stdout, &mut stderr);
+            follow_poll(dir, state, &Filters::default(), &mut out).unwrap();
+        }
+        (
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// #7963 - an unterminated final fragment at the tail pass is not printed
+    /// as a line; the follow phase prints it whole once its newline arrives.
+    #[test]
+    fn logs_tail_follow_holds_partial_last_line_7963() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\npart");
+        let (initial, offset, id, file) =
+            tail_then_offset_with(&path, 10, &Filters::default(), true, || {}).unwrap();
+        assert_eq!(initial, vec!["first".to_string()], "fragment must be held");
+        assert_eq!(offset, 6, "offset stops before the fragment");
+        let mut state = FollowState {
+            path: path.clone(),
+            offset,
+            id,
+            file,
+            fingerprint: Vec::new(),
+            unreadable: None,
+            candidate_unreadable: None,
+            seen: VecDeque::new(),
+        };
+        append(&path, "ial\n");
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "partial\n", "line printed whole, once: {s:?}");
+        // A plain tail (nothing follows) still prints the unterminated line.
+        let (plain, _, _, _) =
+            tail_then_offset_with(&path, 10, &Filters::default(), false, || {}).unwrap();
+        assert_eq!(plain, vec!["first".to_string(), "partial".to_string()]);
+        let plain_frag = make_log(dir.path(), "ai-memory.log.2026-05-01", "only\nfrag");
+        let (plain, _, _, _) =
+            tail_then_offset_with(&plain_frag, 10, &Filters::default(), false, || {}).unwrap();
+        assert_eq!(plain, vec!["only".to_string(), "frag".to_string()]);
+    }
+
+    /// #7964 - the followed newest file is renamed away while an older log
+    /// exists: keep the old handle, never go back to the older file.
+    #[test]
+    fn logs_tail_follow_keeps_handle_when_newest_renamed_away_7964() {
+        let dir = tempfile::tempdir().unwrap();
+        make_log(dir.path(), "ai-memory.log.2026-04-29", "older-line\n");
+        let newest = make_log(dir.path(), "ai-memory.log.2026-04-30", "x\n");
+        let file = fs::File::open(&newest).unwrap();
+        let mut state = FollowState {
+            path: newest.clone(),
+            offset: 2,
+            id: file.metadata().ok().as_ref().and_then(file_id),
+            file,
+            fingerprint: Vec::new(),
+            unreadable: None,
+            candidate_unreadable: None,
+            seen: VecDeque::new(),
+        };
+        let moved = dir.path().join("ai-memory.log.2026-04-30.zst");
+        fs::rename(&newest, &moved).unwrap();
+        append(&moved, "late\n");
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "late\n", "old handle drained, older file not reprinted");
+        assert_eq!(state.path, newest, "still following the renamed file");
+    }
+
+    /// #7965 - truncate then regrow past the old offset between two polls on
+    /// the same inode: the new head must not be lost.
+    #[test]
+    fn logs_tail_follow_detects_truncate_then_regrow_7965() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "aaaa\nbbbb\n");
+        let file = fs::File::open(&a).unwrap();
+        let id = file.metadata().ok().as_ref().and_then(file_id);
+        let mut state = FollowState::new(a.clone(), 10, id, file);
+        fs::write(&a, "cc\ndd\nee\nffffff\n").unwrap();
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "cc\ndd\nee\nffffff\n", "re-read from the start: {s:?}");
+        assert!(e.contains("rotated or truncated"), "stderr note: {e:?}");
+        // Plain growth keeps the fingerprint valid: no note, no re-read.
+        append(&a, "gg\n");
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "gg\n", "growth printed once: {s:?}");
+        assert!(e.is_empty(), "no truncation note on growth: {e:?}");
     }
 
     #[test]
