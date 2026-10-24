@@ -1727,6 +1727,121 @@ class TestStrictLoaderPins8187(unittest.TestCase):
                 problems = repo_problems(self.tree(replace={name: body}), self.pins)
                 self.assertTrue(any(name in p and "lifetime-tests" in p for p in problems), problems)
 
+    # --- r10: runs-on resolves no expression at all; exemptions are rows keyed by (workflow, job) ------------
+
+    @staticmethod
+    def matrix_workflow(matrix, runs_on="${{ matrix.os }}", job="j"):
+        """A one-job workflow whose ``runs-on`` is ``runs_on`` and whose matrix lines (8-space indent) are ``matrix``."""
+        return ("name: m\non: push\njobs:\n  %s:\n    runs-on: %s\n    strategy:\n      matrix:\n%s"
+                "    steps:\n      - run: echo hi\n" % (job, runs_on, matrix))
+
+    R10_MATRICES = {
+        "key is an expression, include hosted": "        os: ${{ fromJSON(needs.a.outputs.os) }}\n"
+                                                "        include:\n          - os: ubuntu-latest\n",
+        "include is an expression, key hosted": "        os: [ubuntu-latest]\n"
+                                                "        include: ${{ fromJSON(needs.a.outputs.inc) }}\n",
+        "exclude present": "        os: [ubuntu-latest]\n        exclude:\n          - os: ubuntu-latest\n",
+        "fromJSON of a variable": "        os: ${{ fromJSON(vars.OSES) }}\n",
+        "nested list in os": "        os: [[ubuntu-latest, self-hosted]]\n",
+        "mapping in the os list": "        os:\n          - {group: fleet}\n",
+        "include entry is not a mapping": "        os: [ubuntu-latest]\n        include:\n          - ubuntu-latest\n",
+        "expression inside an include value": "        os: [ubuntu-latest]\n        include:\n"
+                                              "          - os: ubuntu-latest\n            extra: ${{ inputs.x }}\n",
+        "plain hosted matrix, but no exemption row": "        os: [ubuntu-latest]\n",
+    }
+
+    def test_a_matrix_runs_on_resolves_nothing_outside_an_exemption_row_8187_f19(self):
+        for label, matrix in self.R10_MATRICES.items():
+            with self.subTest(matrix=label):
+                root = self.tree(extra={".github/workflows/m.yml": self.matrix_workflow(matrix)})
+                self.assertTrue(any("m.yml" in p and "job j" in p for p in repo_problems(root, self.pins)), label)
+
+    def test_runs_on_with_an_expression_or_a_group_is_refused_8187_f19(self):
+        hosted = "        os: [ubuntu-latest]\n"
+        for runs_on in ("${{ inputs.runner }}", "${{ fromJSON(vars.X) }}", "{group: fleet}",
+                        "{group: fleet, labels: [ubuntu-latest]}", "{labels: ['${{ inputs.runner }}']}",
+                        "[ubuntu-latest, '${{ inputs.runner }}']", "[ubuntu-latest, {a: b}]", "[ubuntu-latest, 1]"):
+            with self.subTest(runs_on=runs_on):
+                root = self.tree(extra={".github/workflows/m.yml": self.matrix_workflow(hosted, runs_on=runs_on)})
+                self.assertTrue(any("m.yml" in p and "job j" in p for p in repo_problems(root, self.pins)), runs_on)
+
+    def test_a_pinned_workflow_non_tier_job_with_a_matrix_expression_is_caught_8187_f19(self):
+        text = self.texts["ci.yml"]
+        for label in ("key is an expression, include hosted", "include is an expression, key hosted", "exclude present"):
+            matrix = self.R10_MATRICES[label]
+            value = "${{ matrix.os }}\n    strategy:\n      matrix:\n" + matrix.rstrip("\n")
+            with self.subTest(matrix=label):
+                self.caught("ci.yml", set_runs_on(text, "lint", value), label)
+        self.caught("ci.yml", set_runs_on(text, "lint", "${{ inputs.runner }}"), "expression")
+
+    def test_the_exemption_key_is_the_workflow_and_job_pair_8187_f19(self):
+        body = ("name: copy\non: push\njobs:\n  mobile-cross-compile:\n    runs-on: ${{ matrix.os }}\n    strategy:\n"
+                "      matrix:\n        include:\n          - target: aarch64-apple-ios\n            os: macos-latest\n"
+                "          - target: aarch64-linux-android\n            os: ubuntu-latest\n    steps:\n      - run: echo hi\n")
+        root = self.tree(extra={".github/workflows/copy.yml": body})
+        self.assertTrue(any("copy.yml job mobile-cross-compile" in p for p in repo_problems(root, self.pins)))
+        life = (WORKFLOWS / "session-boot-lifetime.yml").read_text(encoding="utf-8")
+        root = self.tree(extra={".github/workflows/copy2.yml": life})
+        self.assertTrue(any("copy2.yml job lifetime-tests" in p for p in repo_problems(root, self.pins)))
+
+    def test_a_row_whose_job_is_gone_is_a_stale_problem_8187_f19(self):
+        for name, job in (("release.yml", "release"), ("session-boot-lifetime.yml", "lifetime-tests")):
+            text = (WORKFLOWS / name).read_text(encoding="utf-8")
+            renamed = text.replace("\n  %s:\n" % job, "\n  %s-renamed:\n" % job, 1)
+            with self.subTest(workflow=name):
+                self.assertNotEqual(renamed, text)
+                problems = repo_problems(self.tree(replace={name: renamed}), self.pins)
+                self.assertTrue(any(name in p and job in p and "stale" in p for p in problems), problems)
+
+    def test_the_exempt_label_sets_must_equal_the_pinned_sets_8187_f19(self):
+        release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+        leg = "          - target: x86_64-unknown-linux-gnu\n"
+        drift = release.replace(leg, "          - target: x86_64-pc-windows-msvc\n            os: windows-latest\n" + leg, 1)
+        self.assertNotEqual(drift, release)
+        problems = repo_problems(self.tree(replace={"release.yml": drift}), self.pins)
+        self.assertTrue(any("release.yml job release" in p for p in problems), problems)
+        ci = self.texts["ci.yml"]
+        leg = "          - target: aarch64-apple-ios\n"
+        drift = ci.replace(leg, "          - target: t\n            os: windows-latest\n" + leg, 1)
+        self.assertNotEqual(drift, ci)
+        self.caught("ci.yml", drift, "mobile-cross-compile gains a windows leg")
+        removed = ci.replace(leg + "            os: macos-latest\n", "", 1)
+        self.assertNotEqual(removed, ci)
+        self.caught("ci.yml", removed, "mobile-cross-compile loses a leg")
+        life = (WORKFLOWS / "session-boot-lifetime.yml").read_text(encoding="utf-8")
+        reordered = life.replace('\'["self-hosted","macos-fed"]\'', '\'["macos-fed","self-hosted"]\'')
+        self.assertNotEqual(reordered, life)
+        problems = repo_problems(self.tree(replace={"session-boot-lifetime.yml": reordered}), self.pins)
+        self.assertTrue(any("lifetime-tests" in p for p in problems), problems)
+
+    def test_the_exemption_table_has_exactly_the_three_real_rows_8187_f19(self):
+        table = globals().get("RUNS_ON_EXEMPT", {})
+        self.assertEqual(sorted(table), [("ci.yml", "mobile-cross-compile"), ("release.yml", "release"),
+                                         ("session-boot-lifetime.yml", "lifetime-tests")])
+        for key, (reason, pinned, label_sets) in table.items():
+            self.assertTrue(reason and pinned.startswith("${{"), key)
+            for labels in label_sets:
+                if key[1] != "lifetime-tests":
+                    self.assertTrue(all(ty.HOSTED_LABEL.match(label) for label in labels), (key, labels))
+        self.assertEqual(repo_problems(ROOT, self.pins), [])
+        self.assertFalse(hasattr(ty, "MATRIX_REF"), "the matrix lookup branch is deleted")
+
+    def test_a_step_added_to_the_pinned_exempt_job_is_caught_8187_f20(self):
+        name = "session-boot-lifetime.yml"
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        steps = {
+            "glob over home dotfiles": ["      - run: cat \"$HOME\"/.ai-*"],
+            "third-party action": ["      - uses: someone/their-action@v1"],
+        }
+        for label, step in steps.items():
+            with self.subTest(step=label):
+                problems = repo_problems(self.tree(replace={name: add_step(text, "lifetime-tests", step)}), self.pins)
+                self.assertTrue(any(name in p and "lifetime-tests" in p and "step" in p for p in problems), problems)
+        edited = text.replace("AI_MEMORY_NO_CONFIG: '1'", "AI_MEMORY_NO_CONFIG: '0'", 1)
+        self.assertNotEqual(edited, text)
+        problems = repo_problems(self.tree(replace={name: edited}), self.pins)
+        self.assertTrue(any(name in p and "lifetime-tests" in p for p in problems), problems)
+
     def test_hosted_labels_and_non_tier_edits_are_not_flagged(self):
         text = self.texts["ci.yml"]
         for value in ("ubuntu-latest", "ubuntu-22.04", "macos-14", "windows-latest", "ubuntu-24.04-arm"):
