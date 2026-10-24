@@ -550,6 +550,101 @@ pub fn check_memory_quota(
     Ok(())
 }
 
+/// #7561 — the single storage charge for one memory: the UTF-8 byte length of
+/// its title plus its content (tags and metadata are not charged), clamped to
+/// `i64::MAX` instead of wrapping (per PERF-03, PERF-07). Every backend's batch
+/// charge calls this so the sqlite and postgres byte accounting cannot drift.
+#[must_use]
+pub fn memory_charge_bytes(memory: &crate::models::Memory) -> i64 {
+    i64::try_from(memory.title.len().saturating_add(memory.content.len())).unwrap_or(i64::MAX)
+}
+
+/// #7090 — in-transaction, multi-row sibling of [`check_and_record`]: the
+/// sqlite twin of `PostgresStore::record_memory_quota_batch_in_tx`, backing
+/// [`crate::store::MemoryStore::store_batch`] on the sqlite adapter.
+///
+/// `store_batch` writes N rows under ONE `WriteTxn`, so this function must
+/// NOT open its own transaction (no nesting): it runs inside the caller's
+/// frame, and the caller's commit or rollback decides whether the counter
+/// increment lands. It increments `current_memories_today` by `count` and
+/// `current_storage_bytes` by `bytes` in one UPDATE, rolling the daily
+/// counters at the UTC day boundary exactly like [`check_and_record`].
+///
+/// `enforce_ceilings` mirrors postgres `!ctx.bypass_visibility`: a TENANT
+/// caller is refused (typed [`QuotaError`], the caller rolls the batch back)
+/// when the projected totals pass `max_memories_per_day` or
+/// `max_storage_bytes`; an admin / curator context stays record-only. The
+/// check and the UPDATE share the caller's `BEGIN IMMEDIATE` write lock, so
+/// concurrent batches cannot both pass the check and overrun the cap
+/// (#628 H12 posture).
+///
+/// # Errors
+///
+/// [`QuotaCheckError::Quota`] when `enforce_ceilings` and a limit would be
+/// exceeded; [`QuotaCheckError::Sql`] when the quota row cannot be read or
+/// written.
+pub fn record_memory_batch_in_tx(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    count: i64,
+    bytes: i64,
+    enforce_ceilings: bool,
+) -> std::result::Result<(), QuotaCheckError> {
+    let row = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let day_rolled = day_bucket(&row.day_started_at) != day_bucket(&now);
+    let memories_today = if day_rolled {
+        0
+    } else {
+        row.current_memories_today
+    };
+    if enforce_ceilings {
+        if memories_today.saturating_add(count) > row.max_memories_per_day {
+            return Err(QuotaCheckError::Quota(QuotaError {
+                agent_id: agent_id.to_string(),
+                namespace: namespace.to_string(),
+                limit: QuotaLimit::MemoriesPerDay,
+                current: memories_today,
+                max: row.max_memories_per_day,
+            }));
+        }
+        if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
+            return Err(QuotaCheckError::Quota(QuotaError {
+                agent_id: agent_id.to_string(),
+                namespace: namespace.to_string(),
+                limit: QuotaLimit::StorageBytes,
+                current: row.current_storage_bytes,
+                max: row.max_storage_bytes,
+            }));
+        }
+    }
+    if day_rolled {
+        conn.execute(
+            "UPDATE agent_quotas SET
+               current_memories_today = ?1,
+               current_links_today = 0,
+               current_storage_bytes = current_storage_bytes + ?2,
+               day_started_at = ?3,
+               updated_at = ?3
+             WHERE agent_id = ?4 AND namespace = ?5",
+            params![count, bytes, now, agent_id, namespace],
+        )
+        .map_err(quota_update_failed)?;
+    } else {
+        conn.execute(
+            "UPDATE agent_quotas SET
+               current_memories_today = current_memories_today + ?1,
+               current_storage_bytes = current_storage_bytes + ?2,
+               updated_at = ?3
+             WHERE agent_id = ?4 AND namespace = ?5",
+            params![count, bytes, now, agent_id, namespace],
+        )
+        .map_err(quota_update_failed)?;
+    }
+    Ok(())
+}
+
 /// v0.7 K8 / H12 (#628 blocker) — atomic check + record. Combines the
 /// quota check with the counter increment under a single
 /// `BEGIN IMMEDIATE` SQLite transaction so concurrent writers cannot
@@ -1359,6 +1454,20 @@ mod tests {
         ))
         .expect("apply v50 per-namespace migration");
         conn
+    }
+
+    // #7561 — the shared batch charge is title + content UTF-8 bytes only.
+    #[test]
+    fn memory_charge_bytes_counts_title_and_content_only_7561() {
+        let memory: crate::models::Memory = serde_json::from_value(serde_json::json!({
+            "id": "m", "tier": "mid", "namespace": "ns", "title": "héllo",
+            "content": "abc", "tags": ["a-long-tag-not-charged"], "priority": 5,
+            "confidence": 1.0, "source": "t", "access_count": 0,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("minimal memory");
+        // "héllo" is 6 UTF-8 bytes, "abc" is 3.
+        assert_eq!(memory_charge_bytes(&memory), 9);
     }
 
     // FBL-12 (v1.0.0 pre-ship 3x7) — charge_update_growth charges only the

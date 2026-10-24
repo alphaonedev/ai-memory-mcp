@@ -144,6 +144,36 @@ pub fn now_attestable_rfc3339() -> String {
     canonical_created_at_stamp(chrono::Utc::now())
 }
 
+/// #7565 / #7658 — payload hash of the `memory_link.created` audit row for a
+/// consolidate tombstone `derived_from` edge written at `edge_instant`.
+///
+/// The edge column keeps microseconds, so the pre-image commits to the
+/// microsecond-truncated stamp (for `created_at` and `valid_from`); a hash over
+/// the untruncated `to_rfc3339()` could not be re-derived from the stored edge.
+/// Pure, so a test can feed a fixed instant with sub-microsecond nanoseconds.
+///
+/// # Errors
+///
+/// Returns the CBOR encode error.
+pub fn consolidate_edge_audit_payload_hash(
+    src_id: &str,
+    dst_id: &str,
+    edge_instant: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>> {
+    let stamp = canonical_created_at_stamp(edge_instant);
+    let signable = crate::identity::sign::SignableLink {
+        src_id,
+        dst_id,
+        relation: crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+        observed_by: None,
+        created_at: Some(stamp.as_str()),
+        valid_from: Some(stamp.as_str()),
+        valid_until: None,
+    };
+    let cbor = crate::identity::sign::canonical_cbor(&signable)?;
+    Ok(crate::signed_events::payload_hash(&cbor))
+}
+
 /// The API surface a store-path write arrived on (#1985).
 ///
 /// The compiled default for `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is
