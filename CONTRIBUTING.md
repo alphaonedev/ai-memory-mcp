@@ -182,6 +182,8 @@ the standing thresholds-rise-NEVER-fall discipline.
 6. Fill out the PR description with what changed and why.
 7. Address any review feedback.
 
+Every PR is also bound by the Zero Shipped Defects policy (red-first proof, two independent reviews for production changes, honest CI): see [ENGINEERING_STANDARDS.md section 8](docs/ENGINEERING_STANDARDS.md).
+
 **Note:** All PRs target the `develop` branch. The `main` branch is for production releases only — `develop` → `main` merges are done by maintainers when cutting a release.
 
 See the 8-step feature checklist in [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for end-to-end guidance on adding new features.
