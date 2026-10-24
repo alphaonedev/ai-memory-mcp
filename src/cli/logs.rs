@@ -326,10 +326,12 @@ struct FollowState {
     /// open, kept apart from `unreadable` so two failing sources report once
     /// each; cleared when no candidate fails or one is adopted (#8220).
     candidate_unreadable: Option<PathBuf>,
-    /// (device, inode) of every log followed in this session, oldest first and
-    /// capped at [`FOLLOW_SEEN_IDENTITIES_MAX`]: a symlink that points at an
-    /// earlier log is an alias, never a newer file (#8220).
-    seen: VecDeque<(u64, u64)>,
+    /// (device, inode, birth time) of every log followed in this session,
+    /// oldest first and capped at [`FOLLOW_SEEN_IDENTITIES_MAX`]: a symlink
+    /// that points at an earlier log is an alias, never a newer file. The birth
+    /// time keeps a new log that inherited a deleted log's inode from being
+    /// taken for that log (#8220).
+    seen: VecDeque<FileIdentity>,
 }
 
 /// How many followed-file identities are remembered; the oldest is dropped
@@ -545,19 +547,52 @@ fn same_file(_a: &fs::File, _b: &fs::File) -> bool {
 
 /// (device, inode) of the open handle; `None` where the platform exposes none.
 #[cfg(unix)]
-fn file_identity(file: &fs::File) -> Option<(u64, u64)> {
+fn file_identity(file: &fs::File) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt as _;
-    file.metadata().ok().map(|m| (m.dev(), m.ino()))
+    file.metadata().ok().map(|m| FileIdentity {
+        dev: m.dev(),
+        ino: m.ino(),
+        born: m.created().ok(),
+    })
 }
 
 #[cfg(not(unix))]
-fn file_identity(_file: &fs::File) -> Option<(u64, u64)> {
+fn file_identity(_file: &fs::File) -> Option<FileIdentity> {
     None
+}
+
+/// Identity of a followed log: device, inode and birth time. A filesystem
+/// hands a deleted file's inode to the next file created, so the pair alone
+/// cannot tell an old log from a new one; the birth time can. `born` is `None`
+/// where the platform or filesystem reports none (#8220).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    born: Option<std::time::SystemTime>,
+}
+
+/// True when `id` names a log followed earlier in this session. With a birth
+/// time the whole identity must match. Without one a reused inode cannot be
+/// told from the old file, so the set applies only when `is_symlink` says the
+/// candidate is an alias; a plain file is never skipped on (device, inode)
+/// alone (#8220).
+fn seen_contains(seen: &VecDeque<FileIdentity>, id: &FileIdentity, is_symlink: bool) -> bool {
+    if id.born.is_some() {
+        return seen.contains(id);
+    }
+    is_symlink && seen.iter().any(|s| s.dev == id.dev && s.ino == id.ino)
+}
+
+/// True when `path` itself (not its target) is a symlink.
+fn candidate_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Record the identity of `file` in `seen`, dropping the oldest entry beyond
 /// [`FOLLOW_SEEN_IDENTITIES_MAX`]. A repeat is not stored twice.
-fn remember_identity(seen: &mut VecDeque<(u64, u64)>, file: &fs::File) {
+fn remember_identity(seen: &mut VecDeque<FileIdentity>, file: &fs::File) {
     let Some(id) = file_identity(file) else {
         return;
     };
@@ -789,10 +824,13 @@ fn follow_poll(
                 // in this session (a symlink to it), is not newer.
                 // decision: bounded set of followed identities over a path
                 // blacklist because identities survive renames and the probe
-                // is identity-based (#8220).
+                // is identity-based; the birth time is part of the identity
+                // because a deleted log's inode is reused (#8220).
                 Ok(file)
                     if same_file(&state.file, &file)
-                        || file_identity(&file).is_some_and(|id| state.seen.contains(&id)) => {}
+                        || file_identity(&file).is_some_and(|id| {
+                            seen_contains(&state.seen, &id, candidate_is_symlink(&candidate))
+                        }) => {}
                 Ok(file) => {
                     adopted = Some((candidate, file));
                     break;
@@ -2003,6 +2041,91 @@ mod tests {
         append(&b, "b-2\n");
         let (s3, _) = poll_once(dir.path(), &mut state);
         assert_eq!(s3, "b-2\n");
+    }
+
+    /// #8220 r14 - a new log that inherited a deleted log's inode is a new
+    /// file, not an alias: follow a, rotate to b, delete a, create c. On a
+    /// filesystem that reuses the inode (ext4) c matches a's (device, inode);
+    /// the birth time tells them apart. The test asserts adoption only.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_new_log_reusing_a_deleted_logs_inode_is_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "a-1\n");
+        let mut state = open_state(&a, 4);
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "b-1\n");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "b-1\n", "rotated to b: {s1:?}");
+        assert_eq!(state.path, b);
+        fs::remove_file(&a).unwrap();
+        let c = make_log(dir.path(), "ai-memory.log.2026-10-25", "c-1\nc-2\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "c-1\nc-2\n", "c printed: {s2:?} {e2:?}");
+        assert_eq!(state.path, c, "follower is on c");
+    }
+
+    /// #8220 r14 - a symlink to a MIDDLE log (neither the first nor the one
+    /// followed now) is an alias too: follow a, rotate to b, rotate to c, then
+    /// a newer-looking symlink to b is not adopted and nothing is reprinted.
+    /// Green at the r13 head; it fails when `switch_to` stops recording the
+    /// log it adopts, because b is recorded nowhere else.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_alias_of_a_middle_log_is_not_adopted_8220() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-10-23", "a-1\n");
+        let mut state = open_state(&a, 4);
+        let b = make_log(dir.path(), "ai-memory.log.2026-10-24", "b-1\n");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "b-1\n");
+        assert_eq!(state.path, b);
+        let c = make_log(dir.path(), "ai-memory.log.2026-10-25", "c-1\n");
+        let (s2, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "c-1\n");
+        assert_eq!(state.path, c);
+        std::os::unix::fs::symlink(&b, dir.path().join("ai-memory.log.latest")).unwrap();
+        let (s3, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            (s3.as_str(), e3.as_str()),
+            ("", ""),
+            "no reprint of b: {s3:?} {e3:?}"
+        );
+        assert_eq!(state.path, c, "alias of a middle log not followed");
+        append(&c, "c-2\n");
+        let (s4, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s4, "c-2\n");
+    }
+
+    /// #8220 r14 - the identity helper: same device and inode with a
+    /// different birth time are not the same log, and without a birth time a
+    /// plain file is never matched while a symlink is.
+    #[test]
+    fn logs_tail_follow_identity_birth_time_decides_reuse_8220() {
+        use std::time::{Duration, SystemTime};
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_secs(1);
+        let old = FileIdentity {
+            dev: 1,
+            ino: 7,
+            born: Some(t0),
+        };
+        let reused = FileIdentity {
+            dev: 1,
+            ino: 7,
+            born: Some(t1),
+        };
+        assert_ne!(old, reused, "same inode, different birth");
+        let seen: VecDeque<FileIdentity> = VecDeque::from([old]);
+        assert!(seen_contains(&seen, &old, false));
+        assert!(!seen_contains(&seen, &reused, false));
+        assert!(!seen_contains(&seen, &reused, true));
+        let unknown = FileIdentity {
+            dev: 1,
+            ino: 7,
+            born: None,
+        };
+        assert!(!seen_contains(&seen, &unknown, false), "plain file kept");
+        assert!(seen_contains(&seen, &unknown, true), "symlink skipped");
     }
 
     /// #8220 - after the follower switches past a failing newer entry, the
