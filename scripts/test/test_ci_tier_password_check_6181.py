@@ -497,6 +497,80 @@ def tier_workflows(directory=WORKFLOWS):
     return sorted(p.name for p in paths if TIER_MARKERS.search(p.read_text(encoding="utf-8")))
 
 
+# r6 F10: the post-export steps are pinned as exact text (the loader-call allowlist and dumps_environment stay as the
+# second and third gates).  The pins live in a data file next to this module: ci.yml alone has ~90 KB of such steps.
+PINS_FILE = Path(__file__).with_name("tier_post_export_pins_8187.json")
+PIN_WORKFLOWS = ("ci.yml", *SHARED_TIER)
+JOB_KEY = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+STEP_LINE = re.compile(r"^      - ")
+EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
+
+
+def workflow_steps(text):
+    """Every step of every job as ``(job, name, body, first_line_index, end_line_index)``; body is the exact text."""
+    lines = text.splitlines()
+    found = []
+    job = None
+    in_jobs = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^jobs:\s*$", line):
+            in_jobs = True
+        elif in_jobs and JOB_KEY.match(line):
+            job = JOB_KEY.match(line).group(1)
+        if in_jobs and job is not None and STEP_LINE.match(line):
+            end = i + 1
+            while end < len(lines) and not (lines[end].strip() and indent_of(lines[end]) <= 6):
+                end += 1
+            while end > i + 1 and not lines[end - 1].strip():
+                end -= 1
+            first = line.strip()[2:].strip()
+            name = first[len("name:"):].strip() if first.startswith("name:") else first
+            found.append((job, name, "\n".join(lines[i:end]), i, end))
+            i = end
+            continue
+        i += 1
+    return found
+
+
+def post_export_steps(workflow, text):
+    """``[(key, body)]`` for the step that writes the tier URL to ``$GITHUB_ENV`` and every later step of its job.
+
+    The key is ``workflow:job:step-name`` (``#2`` and so on for a repeated name).  Empty when no step exports.
+    """
+    steps_found = workflow_steps(text)
+    start = {}
+    for index, (job, _name, body, _a, _b) in enumerate(steps_found):
+        code = [ln.strip() for ln in body.splitlines() if not ln.strip().startswith("#")]
+        if job not in start and any(EXPORT_CALL.search(ln) for ln in code):
+            start[job] = index
+    result = []
+    seen = {}
+    for index, (job, name, body, _a, _b) in enumerate(steps_found):
+        if job in start and index >= start[job]:
+            key = f"{workflow}:{job}:{name}"
+            seen[key] = seen.get(key, 0) + 1
+            result.append((key if seen[key] == 1 else f"{key}#{seen[key]}", body))
+    return result
+
+
+def load_pins():
+    """The pinned post-export step bodies, ``{workflow:job:step-name: exact body text}``."""
+    import json
+    return json.loads(PINS_FILE.read_text(encoding="utf-8"))
+
+
+def pin_problems(workflow, text, pins=None):
+    """STUB (red commit): the real check follows in the fix commit."""
+    return []
+
+
+def joined_lines(lines):
+    """STUB (red commit)."""
+    return [ln.strip() for ln in lines]
+
+
 PROC = "/proc/"
 DUMP_MUTANTS = {
     "proc self read": "cat " + PROC + "self/environ",
@@ -677,5 +751,196 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
             self.assertEqual(tier_workflows(directory), ["scratch-tier.yaml"])
 
 
+# r6 F10: the reviewers' dump forms that the command-word detector passes.  Each is placed in a post-export step.
+F10_MUTANTS = {
+    "busybox env": "busybox env",
+    "sh -c env": "sh -c env",
+    "bash -c printenv": "bash -c 'printenv'",
+    "env redirect then cat": "env>out; cat out",
+    "printenv redirect": "printenv>log",
+    "variable holds the command": 'e=env; $e',
+    "timeout env": "timeout 5 env",
+    "nice printenv": "nice -n 1 printenv",
+    "xargs env": "echo | xargs env",
+    "eval printenv": "eval printenv",
+    "eval concatenated": 'eval "print""env"',
+    "proc environ through a variable": "f=environ; cat " + PROC + "self/$f",
+    "python here-doc": "python3 - <<'PYEOF'\nimport os\nprint(os.environ)\nPYEOF",
+    "perl here-doc": "perl <<'PLEOF'\nprint %ENV;\nPLEOF",
+    "awk ENVIRON": "awk 'BEGIN{for(k in ENVIRON)print k\"=\"ENVIRON[k]}'",
+    "jq env": "jq -n env",
+    "jq dollar ENV": "jq -n '$ENV'",
+    "busybox env piped": "busybox env | base64",
+    "sh -c env piped": "sh -c env | base64",
+    "bash -c printenv piped": "bash -c 'printenv' | base64",
+    "env redirect then base64": "env>out; base64 out",
+    "printenv short redirect": "printenv>o",
+    "declare -xp": "declare -xp | base64",
+    "typeset -px": "typeset -px | base64",
+    "xargs after a pipe": "true | xargs env | base64",
+    "timeout env piped": "timeout 5 env | base64",
+    "nice printenv piped": "nice printenv | base64",
+    "sudo -E env": "sudo -E env | base64",
+    "find exec env": "find . -maxdepth 0 -exec env \\; | base64",
+    "eval env piped": "eval env | base64",
+    "quoted letters": "p''rintenv | base64",
+    "word split on a continuation": "prin\\\ntenv | base64",
+    "interpreter continued": "python3 -c \\\n'import os; print(os.environ)'",
+    "proc split on a continuation": "cat " + PROC + "self/env\\\niron",
+}
+
+
+def inject_run_line(text, step, mutant):
+    """``text`` with ``mutant`` (may span lines) as the first line of the step's ``run: |`` block, or None."""
+    _job, _name, _body, first, end = step
+    lines = text.split("\n")
+    for k in range(first, end):
+        if re.match(r"^\s+(?:- )?run:\s*[|>][-+]?\s*$", lines[k]) and k + 1 < end:
+            pad = " " * indent_of(lines[k + 1])
+            lines[k + 1:k + 1] = [pad + part for part in mutant.split("\n")]
+            return "\n".join(lines)
+    return None
+
+
+def pin_targets(workflow, text):
+    """The post-export steps (with a ``run: |`` block) that the mutation tests edit: all of the two shared workflows,
+    and the four that matter most in ci.yml."""
+    keys = [k for k, _ in post_export_steps(workflow, text)]
+    wanted = ("Configure enterprise-fed tier", "pg_isolated_binary live cells", "Run tests (impact-aware)",
+              "Cleanup enterprise-fed ephemeral db")
+    chosen = []
+    for step in workflow_steps(text):
+        key_name = f"{workflow}:{step[0]}:{step[1]}"
+        if not any(key == key_name or key.startswith(key_name + "#") for key in keys):
+            continue
+        if workflow == "ci.yml" and not any(w in step[1] for w in wanted):
+            continue
+        if inject_run_line(text, step, "true") is not None:
+            chosen.append(step)
+    return chosen
+
+
+class TestPostExportStepsArePinned8187(unittest.TestCase):
+    """r6 F10: every step that runs with the exported tier URL in its environment is pinned as exact text."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+        cls.pins = load_pins()
+
+    def test_the_real_workflows_match_their_pins(self):
+        for wf, text in self.texts.items():
+            with self.subTest(workflow=wf):
+                self.assertEqual(pin_problems(wf, text, self.pins), [])
+                self.assertTrue(post_export_steps(wf, text), "no post-export step found: the export call moved")
+
+    def test_the_pin_table_holds_exactly_the_post_export_steps(self):
+        expected = {}
+        for wf, text in self.texts.items():
+            expected.update(dict(post_export_steps(wf, text)))
+        self.assertEqual(list(self.pins), list(expected))
+        for key, body in self.pins.items():
+            with self.subTest(step=key):
+                self.assertEqual(body, expected[key])
+                self.assertTrue(key.split(":", 1)[0] in PIN_WORKFLOWS)
+
+    def test_every_dump_form_in_a_post_export_step_fails_the_pin(self):
+        forms = {**DUMP_MUTANTS, **F10_MUTANTS}
+        self.assertGreaterEqual(len(forms), 57)
+        for wf, text in self.texts.items():
+            targets = pin_targets(wf, text)
+            self.assertTrue(targets, f"{wf}: no post-export step with a run block to mutate")
+            for step in targets:
+                for label, line in forms.items():
+                    with self.subTest(workflow=wf, step=step[1], mutant=label):
+                        edited = inject_run_line(text, step, line)
+                        self.assertIsNotNone(edited)
+                        self.assertNotEqual(edited, text, "the mutation did not apply")
+                        self.assertTrue(pin_problems(wf, edited, self.pins), f"mutant not caught: {label}")
+
+    def test_a_new_post_export_step_fails_the_pin(self):
+        new_step = ["      - name: Harmless looking addition", "        run: echo hello"]
+        for wf, text in self.texts.items():
+            steps_found = workflow_steps(text)
+            posts = [s for s in steps_found if f"{wf}:{s[0]}:{s[1]}" in self.pins]
+            self.assertTrue(posts)
+            lines = text.split("\n")
+            for label, at in (("after the first post-export step", posts[0][4]),
+                              ("after the last post-export step", posts[-1][4])):
+                with self.subTest(workflow=wf, where=label):
+                    edited = "\n".join(lines[:at] + new_step + lines[at:])
+                    problems = pin_problems(wf, edited, self.pins)
+                    self.assertTrue(any("Harmless looking addition" in p and "not in the pin" in p for p in problems),
+                                    problems)
+
+    def test_a_removed_or_renamed_post_export_step_fails_the_pin(self):
+        for wf, text in self.texts.items():
+            steps_found = workflow_steps(text)
+            posts = [s for s in steps_found if f"{wf}:{s[0]}:{s[1]}" in self.pins]
+            victim = posts[-1]
+            lines = text.split("\n")
+            with self.subTest(workflow=wf, edit="removed"):
+                edited = "\n".join(lines[:victim[3]] + lines[victim[4]:])
+                self.assertTrue(pin_problems(wf, edited, self.pins))
+            if victim[2].lstrip().startswith("- name:"):
+                with self.subTest(workflow=wf, edit="renamed"):
+                    edited = text.replace("- name: " + victim[1], "- name: " + victim[1] + " v2", 1)
+                    self.assertTrue(pin_problems(wf, edited, self.pins))
+
+    def test_a_pre_export_step_is_not_rejected_by_the_pin(self):
+        checked = 0
+        for wf, text in self.texts.items():
+            steps_found = workflow_steps(text)
+            export_job = post_export_steps(wf, text)[0][0].split(":")[1]
+            pinned = {s[3] for s in steps_found if f"{wf}:{s[0]}:{s[1]}" in self.pins}
+            pre = [s for s in steps_found if s[0] == export_job and s[3] not in pinned
+                   and s[3] < min(pinned) and s[2].lstrip().startswith("- name:")]
+            for step in pre:
+                with self.subTest(workflow=wf, step=step[1]):
+                    edited = text.replace("- name: " + step[1], "- name: " + step[1] + " (edited)", 1)
+                    self.assertNotEqual(edited, text)
+                    self.assertEqual(pin_problems(wf, edited, self.pins), [])
+                    checked += 1
+        self.assertGreater(checked, 0, "no pre-export step in any tier workflow to exercise")
+
+    def test_the_failure_message_names_the_workflow_job_step_and_first_differing_line(self):
+        wf = "cert-postgres-age.yml"
+        text = self.texts[wf]
+        step = next(s for s in pin_targets(wf, text) if "Cleanup" in s[1])
+        edited = inject_run_line(text, step, "printenv | base64")
+        message = "\n".join(pin_problems(wf, edited, self.pins))
+        for part in (wf, step[0], step[1], "printenv | base64", "line "):
+            self.assertIn(part, message)
+
+    def test_continuations_are_joined_before_the_environment_scan(self):
+        extra = {"word split": "prin\\\ntenv | base64", "interpreter continued": "python3 -c \\\n'print(os.environ)'",
+                 "path split": "cat " + PROC + "self/env\\\niron", "plain still caught": "cat \\\n" + PROC + "self/environ"}
+        anchor = '          if [ ! -f "$url_file" ]; then'
+        for name in SHARED_TIER:
+            text = self.texts[name]
+            for label, line in extra.items():
+                with self.subTest(workflow=name, mutant=label):
+                    pad = "          "
+                    edited = text.replace(anchor, pad + line.replace("\n", "\n" + pad) + "\n" + anchor, 1)
+                    self.assertNotEqual(edited, text)
+                    self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
+        ci_anchor = 'echo "::notice::[enterprise-fed] created'
+        ci_text = self.texts["ci.yml"]
+        for label, line in extra.items():
+            with self.subTest(workflow="ci.yml", mutant=label):
+                pad = "          "
+                edited = sub_once(ci_text, ci_anchor, pad + line.replace("\n", "\n" + pad) + "\n" + pad + ci_anchor)
+                self.assertTrue(url_leaks(edited), f"mutant not caught: {label}")
+        self.assertEqual(joined_lines(["prin\\", "  tenv x", "echo ok"]), ["printenv x", "echo ok"])
+
+
 if __name__ == "__main__":
+    if "--write-pins" in sys.argv[1:]:
+        # regenerate the pin table from the workflows; the diff of the data file is what a reviewer reads
+        import json
+        table = {}
+        for workflow in PIN_WORKFLOWS:
+            table.update(dict(post_export_steps(workflow, (WORKFLOWS / workflow).read_text(encoding="utf-8"))))
+        PINS_FILE.write_text(json.dumps(table, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+        sys.exit(0)
     sys.exit(unittest.main())
