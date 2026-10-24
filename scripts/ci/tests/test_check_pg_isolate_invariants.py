@@ -102,6 +102,24 @@ class DefaultOn(unittest.TestCase):
         self.assert_caught(CI_YML.replace(RUN_GUARD, 'if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ]; then'),
                            'G1-default-on')
 
+    def test_r2_1a_commented_guard_does_not_satisfy_g1(self):
+        # Review r2 R2-1 (a): a commented-out copy of the guard must not count; the live
+        # `if` here has lost the kill-switch and tier conditions.
+        weak = 'if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ]; then'
+        self.assert_caught(CI_YML.replace(RUN_GUARD, weak) + '\n          # ' + RUN_GUARD + '\n',
+                           'G1-default-on')
+
+    def test_r2_1b_second_assignment_on_one_line_is_caught(self):
+        # R2-1 (b): every assignment on a line is checked, not only the first.
+        self.assert_caught(CI_YML + '\n          AI_MEMORY_TEST_PG_ISOLATE=0; AI_MEMORY_TEST_PG_ISOLATE=1\n',
+                           'G1-default-on')
+        self.assert_caught(CI_YML + '\n          AI_MEMORY_TEST_PG_ISOLATE=0 || AI_MEMORY_TEST_PG_ISOLATE=1\n',
+                           'G1-default-on')
+
+    def test_r2_1c_zero_prefix_expression_is_not_zero(self):
+        # R2-1 (c): `0${...}` is an expression that can expand to 10, not the literal 0.
+        self.assert_caught(CI_YML + '\n          AI_MEMORY_TEST_PG_ISOLATE=0${{ matrix.x }}\n', 'G1-default-on')
+
     def test_removed_kill_switch_force_zero_is_caught(self):
         self.assert_caught(CI_YML.replace(KILL_ECHO, 'true', 1), 'G1-default-on')
 
