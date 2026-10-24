@@ -539,7 +539,7 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
         text = (WORKFLOWS / "cert-postgres-age.yml").read_text(encoding="utf-8")
         run = "python3 -I " + HELPER + ' run --url-file "$url_file" --database "$CI_FED_DB" -- psql'
         anchor = '          if [ ! -f "$url_file" ]; then'
-        arr = '"${PSQL[@]}"'
+        psql_array = '"${PSQL[@]}"'
         mutants = {
             "meta shell escape env": "          if " + run + " -c '" + BANG + " env'; then",
             "meta shell escape printenv": "          if " + run + ' -c "' + BANG + ' printenv"; then',
@@ -548,12 +548,12 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
             "chained or": "          " + run + " -c x || printenv",
             "piped on": "          " + run + " -c x | sh",
             "psql lookalike": "          if " + run + ".py -c x; then",
-            "array meta shell escape": "          " + arr + " -c '" + BANG + " env'",
-            "array chained printenv": "          " + arr + " -c x; printenv",
-            "array piped to sh": "          " + arr + " -c x | sh",
-            "array rewrapped": "          P2=(" + arr + ")",
-            "array output on a file": "          " + arr + ' -c x > "$RUNNER_TEMP/o"',
-            "server side program": "          " + arr + ' -c "COPY t TO PROGRAM \'printenv\'"',
+            "array meta shell escape": "          " + psql_array + " -c '" + BANG + " env'",
+            "array chained printenv": "          " + psql_array + " -c x; printenv",
+            "array piped to sh": "          " + psql_array + " -c x | sh",
+            "array rewrapped": "          P2=(" + psql_array + ")",
+            "array output on a file": "          " + psql_array + ' -c x > "$RUNNER_TEMP/o"',
+            "server side program": "          " + psql_array + ' -c "COPY t TO PROGRAM \'printenv\'"',
         }
         for name, add in mutants.items():
             with self.subTest(mutant=name):
