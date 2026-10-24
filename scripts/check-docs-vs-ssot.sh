@@ -865,7 +865,7 @@ HIST = [
 #      `PRIOR RELEASE` and `What's New in v0.7.0` in the two divs ABOVE
 #      the card body carrying the numbers. So the two card markers are
 #      evaluated over a SMALL PRECEDING WINDOW — the same shape
-#      scripts/check-doc-symbol-anchors.sh uses for its hard-wrapped
+#      scripts/check-doc-symbol-anchors.py uses for its hard-wrapped
 #      absent-path disclaimers. Three lines: enough for eyebrow + title,
 #      too short to reach into an unrelated block.
 TAG = re.compile(r"<[^>]+>")
@@ -1487,7 +1487,7 @@ def is_historical(line, heading=True):
 #      divs ABOVE the card body that carries the numbers, so nothing on
 #      the number-bearing line says which release it describes. The two
 #      card markers are therefore evaluated over a SMALL PRECEDING WINDOW
-#      — the same shape scripts/check-doc-symbol-anchors.sh uses for its
+#      — the same shape scripts/check-doc-symbol-anchors.py uses for its
 #      hard-wrapped absent-path disclaimers. THREE lines: enough for
 #      eyebrow + title, too short to reach into an unrelated block.
 #

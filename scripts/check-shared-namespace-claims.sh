@@ -244,7 +244,7 @@ if [ "$SELF_TEST" -eq 1 ]; then
   # not go stale as the migration ladder advances (it hardcoded v99/v100 and
   # went red the moment CURRENT_SCHEMA_VERSION reached 100). Reuse
   # check-migration-ladder.sh::read_current_schema_version — the
-  # check-doc-symbol-anchors.sh precedent — so there is no third reader and no
+  # check-doc-symbol-anchors.py precedent — so there is no third reader and no
   # hardcoded version literal. Self-test content only; bare gate behaviour is
   # unchanged.
   _RR="$(git rev-parse --show-toplevel)"

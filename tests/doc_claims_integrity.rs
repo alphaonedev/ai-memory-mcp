@@ -7,7 +7,7 @@
 //!
 //! WHY A TWIN EXISTS. The four shell gates
 //! (`scripts/check-docs-vs-ssot.sh`,
-//! `scripts/check-doc-symbol-anchors.sh`,
+//! `scripts/check-doc-symbol-anchors.py`,
 //! `scripts/check-sdk-route-paths.sh`,
 //! `scripts/check-ci-job-claims.sh`) all live in ONE workflow. A
 //! deleted job, a renamed script, or a `paths:` filter would make every
@@ -508,7 +508,6 @@ fn claims_gates_are_wired_into_ci_with_self_tests_2629() {
     let workflow = read(&root.join(".github/workflows/c8-precheck.yml")).replace("\r\n", "\n");
     for script in [
         "scripts/check-docs-vs-ssot.sh",
-        "scripts/check-doc-symbol-anchors.sh",
         "scripts/check-sdk-route-paths.sh",
         "scripts/check-ci-job-claims.sh",
         // #2839 — the COMPLETENESS gate (the accuracy gates above pin
@@ -534,6 +533,22 @@ fn claims_gates_are_wired_into_ci_with_self_tests_2629() {
              logic silently stops detecting reports success while doing nothing"
         );
     }
+
+    // #8171: the doc-symbol-anchors gate is Python (fleet rule), so it is
+    // invoked as `python3 <script>` rather than `bash <script>`.
+    let anchors = "scripts/check-doc-symbol-anchors.py";
+    assert!(
+        root.join(anchors).exists(),
+        "claims gate missing from the tree: {anchors}"
+    );
+    assert!(
+        workflow.contains(&format!("python3 {anchors}\n")),
+        "{anchors} is not invoked by c8-precheck.yml — the gate would never run in CI"
+    );
+    assert!(
+        workflow.contains(&format!("python3 {anchors} --self-test")),
+        "{anchors} has no --self-test step in c8-precheck.yml"
+    );
 
     // R-203 for the normalisation itself: prove a CRLF checkout really
     // WOULD have failed the un-normalised predicate, so this is a live
