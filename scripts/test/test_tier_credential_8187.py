@@ -279,9 +279,9 @@ class TestGithubEnv(TierCredentialCase):
 
     def test_mask_data_is_escaped_so_the_runner_decodes_the_written_value_8187(self):
         # F4: the runner decodes %25/%0D/%0A in command data, so a '%' in a mask must be escaped
-        for password in ("p%25w", "p%zz", "p%250Aq", "p%0Zq"):
-            with self.subTest(password=password):
-                url = f"postgres://{USER}:{password}@192.0.2.7:5445/ai_memory_test"
+        for fake_pct_value in ("p%25w", "p%zz", "p%250Aq", "p%0Zq"):
+            with self.subTest(fake_pct_value=fake_pct_value):
+                url = f"postgres://{USER}:{fake_pct_value}@192.0.2.7:5445/ai_memory_test"
                 self.write_url(url)
                 self.github_env.unlink(missing_ok=True)
                 r = self.github_env_run()
@@ -289,8 +289,8 @@ class TestGithubEnv(TierCredentialCase):
                 written = self.github_env.read_text().splitlines()[0].partition("=")[2]
                 decoded = [runner_unescape_data(m[len("::add-mask::"):]) for m in self.masked(r)]
                 self.assertIn(written, decoded, "the full URL mask decodes to the written URL")
-                self.assertIn(unquote(password), decoded, "the bare password mask decodes to the password")
-                self.assertIn(password, decoded, "the encoded password mask decodes to the encoded form")
+                self.assertIn(unquote(fake_pct_value), decoded, "the bare value mask decodes to the value")
+                self.assertIn(fake_pct_value, decoded, "the encoded value mask decodes to the encoded form")
 
     def test_escape_workflow_command_data_matches_actions_core_8187(self):
         self.assertEqual(tier_credential.escape_workflow_command_data("a%b\r\nc"), "a%25b%0D%0Ac")
