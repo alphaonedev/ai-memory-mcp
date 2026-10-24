@@ -231,18 +231,19 @@ def argv_problems(text):
         if step is None:
             found.append(f"the {name} step is missing")
             continue
-        for ln in step:
+        for number, ln in enumerate(step, 1):
             s = ln.strip()
             if s.startswith("#"):
                 continue
+            where = f"{name} step line {number}"
             if re.search(r"\bpsql\b", s) and (HELPER not in s or " -- psql " not in s):
-                found.append(f"{name}: a psql call bypasses the helper: {s[:60]}")
+                found.append(f"{where}: a psql call bypasses the helper")
             if "pg_isolated_binary.py" in s and "python3 scripts/test/pg_isolated_binary.py" in s and HELPER not in s:
-                found.append(f"{name}: the isolation wrapper runs without the helper: {s[:60]}")
+                found.append(f"{where}: the isolation wrapper runs without the helper")
             if re.search(r"\b(?:base_url|new_url)\b|\$\(cat\b|`cat\b", s):
-                found.append(f"{name}: the URL is read into a shell variable: {s[:60]}")
+                found.append(f"{where}: the URL is read into a shell variable")
             if re.search(r"\bpsql\s+[\"']?\$", s) or re.search(r"postgres(?:ql)?://", s):
-                found.append(f"{name}: a URL is on a command line: {s[:60]}")
+                found.append(f"{where}: psql argv carries a credential (a URL is on a command line)")
     return found
 
 
@@ -250,23 +251,25 @@ def url_leaks(text):
     """#6672: step lines that use the URL outside the allowlist, export it, trace the shell or dump the env."""
     found = []
     for name, step in zip(("configure", "cleanup"), steps(text)):
-        for ln in step or ():
+        for number, ln in enumerate(step or (), 1):
             s = ln.strip()
             if s.startswith("#"):
                 continue
+            where = f"{name} step line {number}"
             if URL_REF.search(s) and s not in URL_LINES:
-                found.append(f"{name}: a line uses the tier URL outside the reviewed lines: {s[:60]}")
+                found.append(f"{where}: the tier URL is used outside the reviewed lines")
             exported = EXPORTS.match(s)
             if exported and URL_NAMES.search(exported.group(1)):
-                found.append(f"{name}: a line exports the tier URL: {s[:60]}")
+                found.append(f"{where}: a line exports the tier URL")
             if dumps_environment(s):
-                found.append(f"{name}: a line dumps the environment: {s[:60]}")
+                found.append(f"{where}: a line dumps the environment")
             if XTRACE.search(s):
-                found.append(f"{name}: a line traces the shell: {s[:60]}")
+                found.append(f"{where}: a line traces the shell")
         # r6: scan again with backslash continuations joined, so a word split across lines is one word
-        for joined in joined_lines([ln for ln in step or () if not ln.strip().startswith("#")]):
+        numbered = [(number, ln) for number, ln in enumerate(step or (), 1) if not ln.strip().startswith("#")]
+        for number, joined in joined_numbered(numbered):
             if dumps_environment(joined) or XTRACE.search(joined):
-                found.append(f"{name}: a continued line dumps the environment or traces the shell: {joined[:60]}")
+                found.append(f"{name} step line {number}: a continued line dumps the environment or traces the shell")
     return found
 
 
@@ -274,7 +277,7 @@ HEADER = "      - name: Configure enterprise-fed tier (per-job ephemeral db, ent
 
 
 def sub_once(text, old, new):
-    assert text.count(old) == 1, f"ci.yml no longer holds exactly one copy of the mutated text: {old[:50]!r}"
+    assert text.count(old) == 1, f"ci.yml no longer holds exactly one copy of the {len(old)}-character mutated text"
     return text.replace(old, new, 1)
 
 
@@ -387,9 +390,15 @@ URL_VARS = re.compile(r"\$\{?(?:base_url|new_url|head|q|AI_MEMORY_TEST_POSTGRES_
 GITHUB_ENV_LINE = 'python3 -I ' + HELPER + ' github-env --url-file "$url_file" --database "$CI_FED_DB"'
 
 
+def numbered_code_lines(text):
+    """``(line number, stripped line)`` of the non-comment lines of a workflow; the number is 1-based in the file."""
+    return [(number, ln.strip()) for number, ln in enumerate(text.splitlines(), 1)
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
 def code_lines(text):
     """The non-comment lines of a workflow, stripped."""
-    return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    return [ln for _number, ln in numbered_code_lines(text)]
 
 
 # a line that names the URL file, its path, or the tier secret (#8187 r3): only the reviewed forms below may do so
@@ -514,26 +523,28 @@ def workflow_problems(text):
     of the path, an existence test, a message that prints the path, or a call of the loader; anything else fails.
     """
     problems = []
-    lines = code_lines(text)
-    for line in lines:
+    numbered = numbered_code_lines(text)
+    lines = [line for _number, line in numbered]
+    for number, line in numbered:
+        at = f"line {number}: "
         if re.search(r"AI_MEMORY_TEST_(?:POSTGRES|AGE)_URL=", line):
-            problems.append("URL written to GITHUB_ENV by hand: " + line[:60])
+            problems.append(at + "URL written to GITHUB_ENV by hand")
         if dumps_environment(line):
-            problems.append("a line dumps the environment: " + line[:60])
+            problems.append(at + "a line dumps the environment")
         if XTRACE.search(line):
-            problems.append("a line traces the shell: " + line[:60])
+            problems.append(at + "a line traces the shell")
         if (URL_FILE_MENTION.search(line) or PSQL_ARRAY_MENTION.search(line)) and not allowed_url_file_line(line):
-            problems.append("tier credential line is not an allowed form: " + line[:60])
+            problems.append(at + "tier credential line is not an allowed form")
         if re.search(r"\bpsql\b", line) and ("tier_credential.py run" not in line or "--url-file" not in line):
             if not message_echo(line):
-                problems.append("psql without the loader: " + line[:60])
+                problems.append(at + "psql without the loader")
         if re.search(r"\bpsql\b", line) and URL_VARS.search(line):
-            problems.append("psql line carries a URL variable: " + line[:60])
+            problems.append(at + "psql line carries a URL variable")
         if re.search(r"\b(?:base_url|new_url)\s*=", line) or re.search(r"\bcat\s+\"?\$\{?url_file", line):
-            problems.append("URL read into a shell variable: " + line[:60])
-    for joined in joined_lines(lines):
+            problems.append(at + "URL read into a shell variable")
+    for number, joined in joined_numbered(numbered):
         if dumps_environment(joined) or XTRACE.search(joined):
-            problems.append("a continued line dumps the environment or traces the shell: " + joined[:60])
+            problems.append(f"line {number}: a continued line dumps the environment or traces the shell")
     if not any(ln.startswith(GITHUB_ENV_LINE) and "--age-url" in ln for ln in lines):
         problems.append("the masked github-env hand-off (with --age-url) is missing")
     return problems
@@ -757,7 +768,7 @@ def step_label(block, offset):
     if owner is None:
         return None, "job-level keys"
     end = heads[owner + 1] if owner + 1 < len(heads) else len(rows)
-    name = rows[heads[owner]].lstrip()[2:].strip()
+    name = f"step[{owner}]"
     for ln in rows[heads[owner]:end]:
         words = ln.strip().lstrip("- ").strip()
         if words.startswith(("name:", "id:")):
@@ -767,14 +778,15 @@ def step_label(block, offset):
 
 
 def first_difference(pinned, block):
-    """``(line offset, found line)`` of the first line of ``block`` that differs from the pinned line hashes."""
+    """``(line offset, "")`` of the first line of ``block`` that differs from the pinned line hashes; the line itself is
+    never returned (F26), so no caller can echo it."""
     new = block.split("\n")
     old = [pinned["lines"][k:k + 12] for k in range(0, len(pinned["lines"]), 12)]
     for number in range(max(len(old), len(new))):
         if number >= len(new):
             return number, "<the job ends here; pinned lines are missing>"
         if number >= len(old) or hashlib.sha256(new[number].encode("utf-8")).hexdigest()[:12] != old[number]:
-            return number, new[number].strip()[:120]
+            return number, ""
     return 0, ""
 
 
@@ -1016,20 +1028,29 @@ def repo_problems(root=None, pins=None):
             found.append(f"{path.relative_to(root)}: a local action names the tier secret")
     return [ty.mask_userinfo(p) for p in found]
 
-def joined_lines(lines):
-    """Stripped lines with each backslash continuation joined, as the shell joins it (``prin\\`` + ``tenv``)."""
+def joined_numbered(rows):
+    """``(first line number, joined line)`` of ``(number, line)`` rows with each backslash continuation joined, as the
+    shell joins it (``prin\\`` + ``tenv``); the number is that of the first physical line of the joined one."""
     joined = []
     pending = None
-    for raw in lines:
+    start = 0
+    for number, raw in rows:
+        if pending is None:
+            start = number
         piece = raw.strip() if pending is None else pending + raw.lstrip()
         pending = None
         if piece.endswith("\\"):
             pending = piece[:-1]
         else:
-            joined.append(piece)
+            joined.append((start, piece))
     if pending is not None:
-        joined.append(pending)
+        joined.append((start, pending))
     return joined
+
+
+def joined_lines(lines):
+    """Stripped lines with each backslash continuation joined, as the shell joins it (``prin\\`` + ``tenv``)."""
+    return [piece for _number, piece in joined_numbered(list(enumerate(lines, 1)))]
 
 
 PROC = "/proc/"
@@ -2123,6 +2144,104 @@ def write_pins(out=None):
     table[EXEMPT] = exempt_pins()
     target = JOB_PINS_FILE if out is None else Path(out)
     target.write_text(json.dumps(table, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+
+
+class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
+    """r14 F25, F26: a problem line names the workflow, job, step label, line number, key path and rule, never text of the
+    workflow (the module docstring promises no value echo)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+        cls.pins = load_job_pins()
+
+    def unnamed_edit(self, workflow, text, sentinel):
+        """``text`` with the head of a named post-export step replaced by an unnamed one whose first line and run block
+        carry the sentinel, and the step index, or ``(None, None)`` when no step fits."""
+        for step in pin_targets(workflow, text):
+            lines = text.split("\n")
+            if not lines[step[3]].lstrip().startswith("- name:"):
+                continue
+            edited = inject_run_line(text, step, f"echo {sentinel}")
+            lines = edited.split("\n")
+            pad = lines[step[3]][:indent_of(lines[step[3]])]
+            lines[step[3]] = f"{pad}- x-note: {sentinel}"
+            data = ty.load_strict("\n".join(lines))
+            job = data["jobs"][step[0]]
+            index = next(i for i, s in enumerate(job["steps"]) if s.get("x-note") == sentinel)
+            return "\n".join(lines), index
+        return None, None
+
+    def test_an_unnamed_step_is_labelled_by_position_never_by_its_text_8187_f25(self):
+        sentinel = "SENTINEL-F25-7c1d"
+        checked = 0
+        for wf, text in self.texts.items():
+            edited, index = self.unnamed_edit(wf, text, sentinel)
+            if edited is None:
+                continue
+            checked += 1
+            problems = tier_pin_problems(wf, edited, self.pins)
+            with self.subTest(workflow=wf):
+                self.assertTrue(problems, "the edited step must differ from its pins")
+                self.assertEqual([p for p in problems if sentinel in p], [])
+                primary = [p for p in problems if f"step {index} (step[{index}])" in p and "differs from the pin at" in p]
+                self.assertTrue([p for p in primary if re.search(rf"steps\[{index}\]\.", p)], problems)
+                self.assertTrue([p for p in job_pin_problems(wf, edited, self.pins[SECONDARY])
+                                 if f"step {index} (step[{index}])" in p and "differs from the pin at line" in p])
+        self.assertGreater(checked, 0)
+
+    def test_a_named_step_keeps_its_name_as_label_8187_f25(self):
+        self.assertEqual(ty.step_label({"name": "Build the thing", "run": "echo x"}, 3), "Build the thing")
+        self.assertEqual(ty.step_label({"id": "build", "run": "echo x"}, 3), "build")
+        self.assertEqual(ty.step_label({"run": "echo x"}, 3), "step[3]")
+        self.assertEqual(ty.step_label({"uses": "actions/checkout@v4"}, 0), "step[0]")
+        self.assertEqual(ty.step_label("not a mapping", 2), "step[2]")
+
+    def planted(self, template):
+        return template % "postgres://u:SENTINEL-F26-2b9e@h/db"
+
+    def test_argv_and_url_leak_messages_name_the_rule_and_the_line_never_the_line_8187_f26(self):
+        sentinel = "SENTINEL-F26-2b9e"
+        text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        at = next(i for i, ln in enumerate(text.splitlines()) if CONFIGURE in ln)
+        cases = {
+            "argv": (argv_problems, "psql %s -c 'select 1'", "configure step line 2: psql argv carries a credential"),
+            "url leak": (url_leaks, "echo $url_file %s", "configure step line 2: the tier URL is used outside the reviewed lines"),
+            "continued": (url_leaks, "printenv \\\n          %s", "configure step line 2: a continued line dumps"),
+        }
+        for label, (function, template, expected) in cases.items():
+            edited = splice(text, at + 1, ["          " + part for part in self.planted(template).split("\n")])
+            with self.subTest(site=label):
+                problems = function(edited)
+                self.assertEqual([p for p in problems if sentinel in p or "postgres://" in p], [])
+                self.assertTrue([p for p in problems if p.startswith(expected)], problems)
+
+    def test_workflow_problems_name_the_line_number_and_rule_only_8187_f26(self):
+        sentinel = "SENTINEL-F26-2b9e"
+        text = self.texts[SHARED_TIER[0]]
+        lines = text.split("\n")
+        lines.insert(section_end(text), "      run: psql postgres://u:%s@h/db -c 'select 1'" % sentinel)
+        problems = workflow_problems("\n".join(lines))
+        self.assertEqual([p for p in problems if sentinel in p or "postgres://" in p], [])
+        self.assertTrue([p for p in problems if re.match(r"line \d+: psql without the loader$", p)], problems)
+
+    def test_a_workflow_that_does_not_load_names_the_rule_never_its_text_8187_f26(self):
+        sentinel = "SENTINEL-F26-2b9e"
+        for label, doc in {"unterminated": f'key: "{sentinel}\n', "tab": f"key:\n\t{sentinel}: 1\n",
+                           "tag": f"key: !!python/object:os.system {sentinel}\n",
+                           "non-string key": f"? [{sentinel}]\n: 1\n", "duplicate": "a: 1\na: 2\n"}.items():
+            data, problems = ty.parse_workflow(doc)
+            with self.subTest(document=label):
+                self.assertIsNone(data)
+                self.assertEqual([p for p in problems if sentinel in p], [])
+                self.assertTrue(problems and problems[0].startswith("the workflow does not load strictly: "), problems)
+
+    def test_the_checker_sources_slice_no_workflow_line_8187_f26(self):
+        wide = {path.name: [int(n) for n in re.findall(r"\[:(\d+)\]", path.read_text(encoding="utf-8")) if int(n) >= 40]
+                for path in (Path(__file__), Path(__file__).with_name("tier_yaml_8187.py"))}
+        # the only wide slices left cut a step NAME (a label the author chose) to 60 and 80 characters, never a line
+        self.assertEqual(wide["tier_yaml_8187.py"], [60])
+        self.assertEqual(wide[Path(__file__).name], [80])
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ class StrictLoader(BASE_LOADER):
             elif key_node.tag == STR_TAG:
                 key = self.construct_scalar(key_node)
             else:
-                raise StrictYamlError("a mapping key that is not a string is not allowed: %r" % key_node.value)
+                raise StrictYamlError("a mapping key that is not a string is not allowed")
             if key in mapping:
                 raise StrictYamlError("the mapping key %r appears twice" % key)
             mapping[key] = self.construct_object(value_node, deep=deep)
@@ -89,6 +89,16 @@ class StrictLoader(BASE_LOADER):
 def mask_userinfo(text):
     """``text`` with the user:password of every ``scheme://user:pass@`` replaced (a failure message never echoes it)."""
     return URL_USERINFO.sub(r"\1***@", text)
+
+
+def load_failure(exc):
+    """The rule that refused a document, never a fragment of it (F26): our own rule text for a ``StrictYamlError``, else
+    the parser error class and the line of its mark."""
+    if isinstance(exc, StrictYamlError):
+        return mask_userinfo(str(exc.args[0]))
+    mark = getattr(exc, "problem_mark", None)
+    where = " at line %d" % (mark.line + 1) if mark is not None else ""
+    return "%s%s" % (type(exc).__name__, where)
 
 
 def load_strict(text):
@@ -111,7 +121,7 @@ def parse_workflow(text):
     try:
         data = load_strict(text)
     except (StrictYamlError, yaml.YAMLError) as exc:
-        return None, ["the workflow does not load strictly: " + mask_userinfo(str(exc).splitlines()[0][:160])]
+        return None, ["the workflow does not load strictly: " + load_failure(exc)]
     if not isinstance(data, dict):
         return None, ["the workflow is not a mapping"]
     problems = []
@@ -208,12 +218,13 @@ def build_pins(data):
 
 
 def step_label(step, index):
-    """``name`` or ``id`` of a step for a message, masked."""
+    """``name`` or ``id`` of a step for a message, masked; a step with neither is ``step[<index>]``, never its content (F25)."""
     if isinstance(step, dict):
-        for key in ("name", "id", "uses", "run"):
-            if isinstance(step.get(key), str):
-                return mask_userinfo(step[key].strip().splitlines()[0][:60]) if step[key].strip() else key
-    return "step %d" % index
+        for key in ("name", "id"):
+            value = step.get(key)
+            if isinstance(value, str) and value.strip():
+                return mask_userinfo(value.strip().splitlines()[0][:60])
+    return "step[%d]" % index
 
 
 def first_difference(pinned, job):
