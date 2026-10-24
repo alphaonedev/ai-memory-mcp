@@ -1333,6 +1333,32 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                 self.assertEqual(tier_pin_problems(wf, text, self.pins), [])
                 self.assertTrue(self.pins[SECONDARY].get(wf, {}).get("pinned"), "no job is pinned for this workflow")
 
+    def test_a_changed_line_is_never_echoed_into_a_problem_8187_f24(self):
+        sentinel = "SENTINEL-F24-9f3a"
+        echo = "found " + chr(39)
+        seen = {"job": 0, "workflow-level": 0}
+        for wf, text in self.texts.items():
+            for step in pin_targets(wf, text)[:1]:
+                edited = inject_run_line(text, step, f"echo {sentinel}")
+                problems = job_pin_problems(wf, edited, self.pins[SECONDARY])
+                hits = [p for p in problems if f"{wf} job {step[0]} " in p and "differs from the pin" in p]
+                with self.subTest(workflow=wf, site="job"):
+                    self.assertTrue(hits, "the job-level difference is reported with its key path")
+                    seen["job"] += 1
+                    self.assertFalse([p for p in problems if sentinel in p or echo in p])
+            lines = text.split("\n")
+            at = next((i for i, ln in enumerate(lines) if ln.startswith("env:")), None)
+            if at is None:
+                continue
+            lines.insert(at + 1, f"  F24_KEY: {sentinel}")
+            problems = job_pin_problems(wf, "\n".join(lines), self.pins[SECONDARY])
+            with self.subTest(workflow=wf, site="workflow-level"):
+                self.assertTrue([p for p in problems if f"{wf}: the workflow-level env: block differs" in p])
+                seen["workflow-level"] += 1
+                self.assertFalse([p for p in problems if sentinel in p or echo in p])
+        self.assertGreater(seen["job"], 0)
+        self.assertGreater(seen["workflow-level"], 0)
+
     def test_the_pin_table_holds_exactly_the_jobs_that_name_the_tier(self):
         self.assertEqual(sorted(self.pins[SECONDARY]), sorted(PIN_WORKFLOWS))
         for wf, text in self.texts.items():
