@@ -1102,29 +1102,31 @@ mod tests {
                 code, expected_code,
                 "{layout} dry_run={dry_run}: unexpected exit\nstderr: {stderr}"
             );
-            for secret in secrets {
-                if !body.contains(secret) {
+            // #6583 — a failing leak check names the fixture by index and
+            // never echoes the fixture or the stream that carries it.
+            for (fixture_idx, fixture) in secrets.iter().enumerate() {
+                if !body.contains(fixture) {
                     continue;
                 }
                 assert!(
-                    !stdout.contains(secret),
-                    "{layout} dry_run={dry_run}: {secret} leaked on STDOUT:\n{stdout}"
+                    !stdout.contains(fixture),
+                    "{layout} dry_run={dry_run}: credential fixture #{fixture_idx} leaked on STDOUT"
                 );
                 assert!(
-                    !stderr.contains(secret),
-                    "{layout} dry_run={dry_run}: {secret} leaked on STDERR:\n{stderr}"
+                    !stderr.contains(fixture),
+                    "{layout} dry_run={dry_run}: credential fixture #{fixture_idx} leaked on STDERR"
                 );
             }
             // Data integrity: the redaction is DISPLAY-ONLY. Whatever ends
             // up on disk must still hold the real credentials — a masked
             // value written back would be silent credential destruction.
             if code == 0 {
-                for secret in secrets {
-                    if body.contains(secret) {
+                for (fixture_idx, fixture) in secrets.iter().enumerate() {
+                    if body.contains(fixture) {
                         assert!(
-                            on_disk.contains(secret),
-                            "{layout}: migrate MASKED {secret} in the written file — \
-                             redaction must never touch the durable artifact\n{on_disk}"
+                            on_disk.contains(fixture),
+                            "{layout}: migrate MASKED credential fixture #{fixture_idx} in the \
+                             written file — redaction must never touch the durable artifact"
                         );
                     }
                 }

@@ -306,8 +306,8 @@ fn resolve_namespace_standard_caller(
     params: &Value,
     trusted_caller: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(trusted) = trusted_caller {
-        return Ok(trusted.to_string());
+    if let Some(oob_caller) = trusted_caller {
+        return Ok(oob_caller.to_string());
     }
     let wire = params.get(param_names::AGENT_ID).and_then(|v| v.as_str());
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {

@@ -14267,7 +14267,10 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("alias-fallback-key"));
         match &resolved.api_key_source {
             KeySource::AliasFallback(name) => assert_eq!(name, "XAI_API_KEY"),
-            other => panic!("expected AliasFallback(XAI_API_KEY), got {other:?}"),
+            other => panic!(
+                "expected AliasFallback(XAI_API_KEY), got {}",
+                other.as_str()
+            ),
         }
         scrub_llm_env();
     }
@@ -14394,7 +14397,10 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("via-config-env-var"));
         match &resolved.api_key_source {
             KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_LLM_KEY"),
-            other => panic!("expected ConfigEnvVar(MY_CUSTOM_LLM_KEY), got {other:?}"),
+            other => panic!(
+                "expected ConfigEnvVar(MY_CUSTOM_LLM_KEY), got {}",
+                other.as_str()
+            ),
         }
         unsafe {
             std::env::remove_var("MY_CUSTOM_LLM_KEY");
@@ -14431,7 +14437,10 @@ max_page_size = 1000000
                     "error must name the perm policy: {reason}"
                 );
             }
-            other => panic!("expected KeySource::Error(lax perms), got {other:?}"),
+            other => panic!(
+                "expected KeySource::Error(lax perms), got {}",
+                other.as_str()
+            ),
         }
         // Cleanup.
         let _ = std::fs::remove_file(&key_path);
@@ -14747,7 +14756,10 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("alias-fallback-embed-key"));
         match &resolved.key_source {
             KeySource::AliasFallback(name) => assert_eq!(name, "OPENROUTER_API_KEY"),
-            other => panic!("expected AliasFallback(OPENROUTER_API_KEY), got {other:?}"),
+            other => panic!(
+                "expected AliasFallback(OPENROUTER_API_KEY), got {}",
+                other.as_str()
+            ),
         }
         scrub_embed_env();
     }
@@ -14770,7 +14782,10 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("via-embed-config-env-var"));
         match &resolved.key_source {
             KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_EMBED_KEY"),
-            other => panic!("expected ConfigEnvVar(MY_CUSTOM_EMBED_KEY), got {other:?}"),
+            other => panic!(
+                "expected ConfigEnvVar(MY_CUSTOM_EMBED_KEY), got {}",
+                other.as_str()
+            ),
         }
         unsafe {
             std::env::remove_var("MY_CUSTOM_EMBED_KEY");
@@ -14807,7 +14822,7 @@ max_page_size = 1000000
                     "error must attribute the embeddings field: {reason}"
                 );
             }
-            other => panic!("expected KeySource::Error, got {other:?}"),
+            other => panic!("expected KeySource::Error, got {}", other.as_str()),
         }
 
         let _ = std::fs::remove_file(&key_path);
