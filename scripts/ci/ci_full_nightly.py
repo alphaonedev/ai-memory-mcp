@@ -22,7 +22,6 @@ import re
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 WORKFLOW_FILE = "ci.yml"

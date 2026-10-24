@@ -13,7 +13,6 @@ import re
 import subprocess
 import sys
 import unittest
-from pathlib import Path
 
 import impact_fixture as fx
 from impact import build_index, common

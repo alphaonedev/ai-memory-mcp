@@ -13,6 +13,8 @@ build_index.py and select.py from that copy against the PR tree's diff.
 These tests pull the inline python out of ci.yml, run it against fixture
 repositories, then run the materialised selector. No network, no cargo.
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -122,9 +124,8 @@ class WorkflowShape(unittest.TestCase):
 
     def test_materialise_step_lists_the_selector_files(self):
         step = step_named(SELECT_JOB, MATERIALISE_STEP)
-        for name in SELECTOR_FILES:
-            with self.subTest(file=name):
-                self.assertIn(name, step["run"])
+        listed = step["env"]["IMPACT_FILES"].split()
+        self.assertEqual(sorted(listed), sorted(SELECTOR_FILES))
         self.assertEqual(step["id"], "base")
 
     def test_fallback_step_runs_when_the_base_copy_is_not_ok(self):
@@ -240,6 +241,12 @@ class FailClosed(BaseCase):
         summary = self.assert_closed(base)
         self.assertIn("base-file-missing:gate.py", summary)
 
+    def test_empty_file_list_selects_all(self):
+        base = self.commit_selector()
+        rc, lines, summary, res = self.materialise(base, files="")
+        self.assertEqual(lines.get("ok"), "false", summary)
+        self.assertIn("no-files-listed", summary)
+
     def test_unknown_sha_selects_all(self):
         self.assert_closed(FAKE_SHA)
 
@@ -302,7 +309,8 @@ class FailClosed(BaseCase):
         os.chdir(str(self.repo))
         try:
             with mock.patch.dict(os.environ, env), \
-                    mock.patch.object(Path, "write_bytes", flaky):
+                    mock.patch.object(Path, "write_bytes", flaky), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 namespace["main"]()
         finally:
             os.chdir(cwd)

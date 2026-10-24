@@ -13,7 +13,6 @@ import itertools
 import json
 import re
 import unittest
-from pathlib import Path
 
 import impact_fixture as fx
 import gha_expr

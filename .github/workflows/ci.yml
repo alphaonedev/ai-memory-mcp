@@ -174,16 +174,16 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     outputs:
-      jobs: ${{ steps.select.outputs.jobs }}
-      all: ${{ steps.select.outputs.all }}
-      crates: ${{ steps.select.outputs.crates }}
+      jobs: ${{ steps.select.outputs.jobs || steps.fallback.outputs.jobs }}
+      all: ${{ steps.select.outputs.all || steps.fallback.outputs.all }}
+      crates: ${{ steps.select.outputs.crates || steps.fallback.outputs.crates }}
       enforce: ${{ steps.mode.outputs.enforce }}
       # One output per gated domain: 'false' ONLY when this job succeeded, the
       # repo var CI_IMPACT_ENFORCE is 'true' and the selection left it out.
       # A gated job is skipped only on an explicit 'false' (fail closed).
-      rust: ${{ steps.select.outputs.rust }}
-      cells: ${{ steps.select.outputs.cells }}
-      actionlint: ${{ steps.select.outputs.actionlint }}
+      rust: ${{ steps.select.outputs.rust || steps.fallback.outputs.rust }}
+      cells: ${{ steps.select.outputs.cells || steps.fallback.outputs.cells }}
+      actionlint: ${{ steps.select.outputs.actionlint || steps.fallback.outputs.actionlint }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -197,12 +197,133 @@ jobs:
           ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}
         run: echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"
 
+      # The selector that judges a PR is the BASE sha's: a PR must not judge
+      # itself. decision: base-sha selector over PR-tree selector because a PR
+      # must not judge itself; bootstrap and read failure select ALL (fail
+      # closed). The files below come from `git show <base>:<path>` into
+      # $RUNNER_TEMP/impact-base/; build_index.py and select.py run from that
+      # copy against the PR tree. When any file is missing at the base (this
+      # very PR adds them) or unreadable, the `fallback` step selects the full
+      # matrix and the reason lands in the step summary.
+      - name: Materialise the base selector (#8240)
+        id: base
+        env:
+          BASE_SHA: ${ github.event.pull_request.base.sha || github.sha }
+          IMPACT_FILES: __init__.py common.py select.py build_index.py gate.py rules.json
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+          REGULAR_MODES = ("100644", "100755")
+          IMPACT_PREFIX = "scripts/ci/impact/"
+          GIT_TIMEOUT_S = 120
+
+
+          class BaseUnavailable(Exception):
+              """The base copy cannot be built; the reason is a fixed token."""
+
+
+          def git(*args):
+              try:
+                  return subprocess.run(["git"] + list(args), capture_output=True,
+                                        timeout=GIT_TIMEOUT_S)
+              except (OSError, subprocess.TimeoutExpired):
+                  raise BaseUnavailable("git-failed")
+
+
+          def have_commit(base):
+              return git("cat-file", "-e", base + "^{commit}").returncode == 0
+
+
+          def fetch_blob(base, name):
+              path = IMPACT_PREFIX + name
+              tree = git("ls-tree", base, "--", path)
+              fields = tree.stdout.decode("utf-8", "replace").split()
+              if tree.returncode != 0 or len(fields) < 4:
+                  raise BaseUnavailable("base-file-missing:" + name)
+              if fields[1] != "blob" or fields[0] not in REGULAR_MODES:
+                  raise BaseUnavailable("base-file-not-regular:" + name)
+              blob = git("show", "%s:%s" % (base, path))
+              if blob.returncode != 0 or not blob.stdout:
+                  raise BaseUnavailable("base-file-missing:" + name)
+              return blob.stdout
+
+
+          def materialise(base, dest, names):
+              if not SHA_RE.match(base):
+                  raise BaseUnavailable("base-sha-invalid")
+              if not have_commit(base):
+                  git("fetch", "--no-tags", "--depth=1", "origin", base)
+                  if not have_commit(base):
+                      raise BaseUnavailable("base-fetch-failed")
+              if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+                  raise BaseUnavailable("dest-unsafe")
+              if dest.exists():
+                  shutil.rmtree(str(dest))
+              try:
+                  for name in names:
+                      blob = fetch_blob(base, name)
+                      target = dest / "impact" / name
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(blob)
+              except OSError:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise BaseUnavailable("write-failed")
+              except BaseException:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise
+
+
+          def report(ok, reason):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+                  handle.write("ok=%s\n" % ("true" if ok else "false"))
+              if ok:
+                  print("impact: selector files loaded from the base sha")
+                  return
+              line = ("impact: base selector unavailable (%s); selecting the full matrix"
+                      % reason)
+              print(line)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as handle:
+                      handle.write(line + "\n")
+
+
+          def main():
+              try:
+                  dest = Path(os.environ["RUNNER_TEMP"]) / "impact-base"
+                  names = os.environ.get("IMPACT_FILES", "").split()
+                  if not names:
+                      raise BaseUnavailable("no-files-listed")
+                  materialise(os.environ.get("BASE_SHA", ""), dest, names)
+              except BaseUnavailable as exc:
+                  report(False, str(exc))
+                  return 0
+              except (OSError, KeyError):
+                  report(False, "environment-unusable")
+                  return 0
+              report(True, "")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+
       - name: Build impact index
+        if: ${{ steps.base.outputs.ok == 'true' }}
         continue-on-error: true
-        run: python3 -I scripts/ci/impact/build_index.py --repo . --db "$RUNNER_TEMP/impact.db"
+        run: python3 -I "$RUNNER_TEMP/impact-base/impact/build_index.py" --repo . --db "$RUNNER_TEMP/impact.db"
 
       - name: Select jobs
         id: select
+        if: ${{ steps.base.outputs.ok == 'true' }}
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
@@ -211,11 +332,25 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}
         run: |
-          python3 -I scripts/ci/impact/select.py --db "$RUNNER_TEMP/impact.db" \
+          python3 -I "$RUNNER_TEMP/impact-base/impact/select.py" --db "$RUNNER_TEMP/impact.db" \
             --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --event "$EVENT" \
             --base-ref "$BASE_REF" --enforce "$ENFORCE" \
             --out "$RUNNER_TEMP/selection.json" \
             --github-output "$GITHUB_OUTPUT"
+
+      # Fail closed: no usable base copy means every gated job runs.
+      - name: Select the full matrix (base selector unavailable)
+        id: fallback
+        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' }}
+        run: |
+          python3 -I - <<'PY'
+          import os
+
+          LINES = ("all=true", "jobs=", "crates=", "rust=true", "cells=true",
+                   "actionlint=true")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+              handle.write("\n".join(LINES) + "\n")
+          PY
 
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
   # matrix instead of waiting on the full per-OS test build. Required status
@@ -2528,7 +2663,132 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Fold job results
+      # decision: base-sha selector over PR-tree selector because a PR must not
+      # judge itself. gate.py and rules.json come from the base sha. Bootstrap
+      # (the base has no gate.py yet, this very PR adds it) or a read failure
+      # runs the PR tree's gate and says so in the step summary.
+      - name: Materialise the base gate (#8240)
+        id: base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+          IMPACT_FILES: __init__.py common.py gate.py rules.json
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+          REGULAR_MODES = ("100644", "100755")
+          IMPACT_PREFIX = "scripts/ci/impact/"
+          GIT_TIMEOUT_S = 120
+
+
+          class BaseUnavailable(Exception):
+              """The base copy cannot be built; the reason is a fixed token."""
+
+
+          def git(*args):
+              try:
+                  return subprocess.run(["git"] + list(args), capture_output=True,
+                                        timeout=GIT_TIMEOUT_S)
+              except (OSError, subprocess.TimeoutExpired):
+                  raise BaseUnavailable("git-failed")
+
+
+          def have_commit(base):
+              return git("cat-file", "-e", base + "^{commit}").returncode == 0
+
+
+          def fetch_blob(base, name):
+              path = IMPACT_PREFIX + name
+              tree = git("ls-tree", base, "--", path)
+              fields = tree.stdout.decode("utf-8", "replace").split()
+              if tree.returncode != 0 or len(fields) < 4:
+                  raise BaseUnavailable("base-file-missing:" + name)
+              if fields[1] != "blob" or fields[0] not in REGULAR_MODES:
+                  raise BaseUnavailable("base-file-not-regular:" + name)
+              blob = git("show", "%s:%s" % (base, path))
+              if blob.returncode != 0 or not blob.stdout:
+                  raise BaseUnavailable("base-file-missing:" + name)
+              return blob.stdout
+
+
+          def materialise(base, dest, names):
+              if not SHA_RE.match(base):
+                  raise BaseUnavailable("base-sha-invalid")
+              if not have_commit(base):
+                  git("fetch", "--no-tags", "--depth=1", "origin", base)
+                  if not have_commit(base):
+                      raise BaseUnavailable("base-fetch-failed")
+              if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+                  raise BaseUnavailable("dest-unsafe")
+              if dest.exists():
+                  shutil.rmtree(str(dest))
+              try:
+                  for name in names:
+                      blob = fetch_blob(base, name)
+                      target = dest / "impact" / name
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(blob)
+              except OSError:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise BaseUnavailable("write-failed")
+              except BaseException:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise
+
+
+          def report(ok, reason):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+                  handle.write("ok=%s\n" % ("true" if ok else "false"))
+              if ok:
+                  print("impact: selector files loaded from the base sha")
+                  return
+              line = ("impact: base selector unavailable (%s); selecting the full matrix"
+                      % reason)
+              print(line)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as handle:
+                      handle.write(line + "\n")
+
+
+          def main():
+              try:
+                  dest = Path(os.environ["RUNNER_TEMP"]) / "impact-base"
+                  names = os.environ.get("IMPACT_FILES", "").split()
+                  if not names:
+                      raise BaseUnavailable("no-files-listed")
+                  materialise(os.environ.get("BASE_SHA", ""), dest, names)
+              except BaseUnavailable as exc:
+                  report(False, str(exc))
+                  return 0
+              except (OSError, KeyError):
+                  report(False, "environment-unusable")
+                  return 0
+              report(True, "")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+      # decision: !cancelled() && over plain result check because a failed
+      # select must not skip the gated jobs
+      - name: Fold job results (base gate)
+        if: ${{ !cancelled() && steps.base.outputs.ok == 'true' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GITHUB_REF_NAME_FULL: ${{ github.ref }}
+        run: |
+          python3 -I "$RUNNER_TEMP/impact-base/impact/gate.py" --needs "$NEEDS_JSON" \
+            --github-ref "$GITHUB_REF_NAME_FULL"
+      - name: Fold job results (bootstrap, PR-tree gate)
+        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' }}
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           GITHUB_REF_NAME_FULL: ${{ github.ref }}

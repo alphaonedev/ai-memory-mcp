@@ -66,11 +66,12 @@ def read_jobs(path: Path) -> Dict[str, dict]:
 
 STEP_START_RE = re.compile(r"^      - (?:([A-Za-z0-9_-]+):\s*(.*))?$")
 STEP_KEY_RE = re.compile(r"^        ([A-Za-z0-9_-]+):\s*(.*)$")
+STEP_ENV_RE = re.compile(r"^          ([A-Za-z0-9_]+):\s*(.*)$")
 STEP_INDENT = 10
 
 
 def read_steps(path: Path, job: str) -> List[dict]:
-    """Return the steps of `job` as [{"name","id","if","run","uses"}] in order.
+    """Return the steps of `job` as [{"name","id","if","run","uses","env"}] in order.
 
     `run` is the block scalar text with its 10-space indent removed (a one-line
     `run:` value is returned as is); keys a step does not carry are None.
@@ -78,6 +79,7 @@ def read_steps(path: Path, job: str) -> List[dict]:
     steps: List[dict] = []
     in_job = in_steps = False
     run_lines: Optional[List[str]] = None
+    in_env = False
     for line in Path(path).read_text().split("\n"):
         job_match = JOB_ID_RE.match(line)
         if job_match:
@@ -101,12 +103,18 @@ def read_steps(path: Path, job: str) -> List[dict]:
         start = STEP_START_RE.match(line)
         if start:
             steps.append({"name": None, "id": None, "if": None, "run": None,
-                          "uses": None})
+                          "uses": None, "env": {}})
             key, value = start.group(1), start.group(2)
+            in_env = False
         else:
+            env_match = STEP_ENV_RE.match(line)
+            if in_env and env_match and steps:
+                steps[-1]["env"][env_match.group(1)] = env_match.group(2).strip()
+                continue
             key_match = STEP_KEY_RE.match(line)
             if not key_match or not steps:
                 continue
+            in_env = key_match.group(1) == "env"
             key, value = key_match.group(1), key_match.group(2)
         if key in ("name", "id", "if", "uses"):
             steps[-1][key] = (value or "").strip()
