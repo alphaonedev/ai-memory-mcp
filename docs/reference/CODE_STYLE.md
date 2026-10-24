@@ -614,7 +614,7 @@ supply-chain gate was switchable off by a classifier verdict about
 markdown.
 
 **9. Doc symbol/path anchor gate** (#2629, CERT GATE 2) —
-`scripts/check-doc-symbol-anchors.sh`. Gate 4 pins VALUES; **nothing
+`scripts/check-doc-symbol-anchors.py`. Gate 4 pins VALUES; **nothing
 pinned SYMBOLS**. Documents cite `file:line` anchors, `path.rs::symbol`
 qualifications and ``[`sym`](../src/path.rs)`` links that rot silently
 on every rename and module split. The 3x7 audit sampled SIX anchors and

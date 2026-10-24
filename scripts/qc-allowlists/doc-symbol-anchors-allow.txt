@@ -1,4 +1,4 @@
-# BURN-DOWN allowlist for scripts/check-doc-symbol-anchors.sh (#2629).
+# BURN-DOWN allowlist for scripts/check-doc-symbol-anchors.py (#2629).
 #
 # FORMAT, one entry per line, everything from the first `#` is comment:
 #

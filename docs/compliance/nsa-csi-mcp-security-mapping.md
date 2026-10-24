@@ -194,7 +194,7 @@ The NSA document recommends every MCP implementation declare and enforce its bou
 
 ### 4.3 Validate parameters (NSA recommendation c)
 
-The NSA document recommends MCP servers validate every parameter at every wire entry. ai-memory's `RequestValidator` (§3.9) realises this recommendation as a single struct method covering all three protocol surfaces. The validation surface is pinned by the co-located test module in `src/validate.rs` plus the property-based suite `tests/proptest_validate.rs` (there is no `tests/validate.rs`; an earlier revision of this document cited one), and the wire-boundary contract is preserved (errors carry the byte-equal v0.6.x message shape via `ValidationError`'s `Display` impl).
+The NSA document recommends MCP servers validate every parameter at every wire entry. ai-memory's `RequestValidator` (§3.9) realises this recommendation as a single struct method covering all three protocol surfaces. The validation surface is pinned by the co-located test module in `src/validate.rs` plus the property-based suite `tests/proptest_validate.rs` (there is no `validate.rs` under `tests/`; an earlier revision of this document cited one), and the wire-boundary contract is preserved (errors carry the byte-equal v0.6.x message shape via `ValidationError`'s `Display` impl).
 
 ### 4.4 Constrain and sandbox tool execution (NSA recommendation d)
 

@@ -88,7 +88,7 @@ touching adapter selection:
 ### Wave 2 — postgres schema parity v15 → v28
 
 Port the 13 SQLite migrations the postgres adapter is currently
-missing (per `docs/coverage.md` schema-parity gap table):
+missing (the DDL fingerprint check is `tests/postgres_schema_parity.rs`):
 
 | Migration | Feature gated |
 |-----------|---------------|
@@ -159,7 +159,8 @@ acceptance criterion for the v0.7.0 expanded scope.
   outputs across a 100-entity / 500-edge KG.
 - `tests/postgres_schema_parity.rs` (Wave 2) — DDL fingerprint
   against the SQLite v28 truth.
-- `tests/serve_postgres_e2e.rs` (Wave 3) — spin `ai-memory serve
+- A serve-postgres end-to-end test (Wave 3; not published in this repository, the
+  shipped smoke coverage is `tests/serve_postgres_smoke.rs`) — spin `ai-memory serve
   --store-url postgres://…` against the docker-compose fixture and
   run `test_mcp_tools_list` + `test_cli_store_and_recall` through
   the HTTP API.
