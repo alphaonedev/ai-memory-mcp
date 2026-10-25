@@ -141,7 +141,10 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
   value is touched (code r4 F1, F2); a `str` subclass is checked and sent as one plain `str` copy (sec r4 N1), and a
   TLS bound, `verify_mode`, `check_hostname` and `verify_flags` are also read through the C-level `getset_descriptor` objects, resolved from the
   real `ssl.SSLContext` MRO, and must agree with the Python-level reads (sec r4 N2, sec r5 S1, code r5 F2). The getset objects are immutable; the lookup path to
-  them is not, which is why they come from the class chain and not from the `_ssl` module table. The threat boundary is code that runs in the caller's
+  them is not, which is why they come from the class chain and not from the `_ssl` module table. A candidate counts as a getset only by identity with the
+  builtin getset type (`type(type.__dict__["__dict__"])`), never by type name, which a Python class can copy (sec r6 S1). The negotiated session (version, suite, peer
+  certificate, context) is read through the C `_ssl._SSLSocket` method descriptors, not the Python `SSLSocket` or `SSLObject` methods, which a class set before the import can
+  replace (sec r6 S1-wire). The threat boundary is code that runs in the caller's
   process before `ai_memory` is imported; the negotiated-session gate holds on the wire either way. ASCII label shape (length, hyphens) is not validated by the SDK; check and send agree (code r5 F4). README ("Base URLs are `https://` even for
   `localhost`") and the in-transit standard #3824 grant no loopback exception.
   decision: refuse every non-https base URL at construction over a warning or a loopback exception because

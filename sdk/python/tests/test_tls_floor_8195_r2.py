@@ -40,6 +40,7 @@ import pytest
 from ai_memory import AiMemoryClient, AsyncAiMemoryClient, _common, _ownedfile
 
 from ._tlslab import Lab, RecordingServer
+from . import _fake_session_8195
 
 _CLIENTS = [AiMemoryClient, AsyncAiMemoryClient]
 _ORIGIN = "https://localhost:9077"
@@ -176,7 +177,9 @@ def test_range_lowered_after_construction_is_refused_per_request_8195(
                 return client._client.get("/x").status_code  # noqa: SLF001
 
         async def run() -> object:
-            async with AsyncAiMemoryClient(base_url=origin.url, verify=context, timeout=5) as client:
+            async with AsyncAiMemoryClient(
+                base_url=origin.url, verify=context, timeout=5
+            ) as client:
                 lower()
                 return (await client._client.get("/x")).status_code  # noqa: SLF001
 
@@ -217,7 +220,9 @@ def test_builder_context_sets_the_floor_even_when_the_library_default_is_lower_8
     stock, built, from_path = (int(x) for x in result.stdout.split())
     floor = int(_TLS.TLSv1_2)
     if stock >= floor:
-        pytest.skip("this Python already defaults to TLS 1.2; the in-process test below covers the builder")
+        pytest.skip(
+            "this Python already defaults to TLS 1.2; the in-process test below covers the builder"
+        )
     assert built == floor
     assert from_path == floor
 
@@ -249,6 +254,12 @@ def test_builder_assigns_the_floor_over_a_lower_starting_state_8195(
 def test_sdk_built_context_reports_the_floor_8195(lab: Lab) -> None:
     built = _common._context_from_path(str(lab.ca_path))  # noqa: SLF001
     assert built.minimum_version >= _TLS.TLSv1_2
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand-in sessions are read through the test seam (sec r6 S1-wire)."""
+    _fake_session_8195.install(monkeypatch)
 
 
 class _WireSession:
@@ -303,6 +314,7 @@ def _suite(
 
 def _offering(monkeypatch: pytest.MonkeyPatch, suites: list[Any]) -> ssl.SSLContext:
     """A verifying context whose ``get_ciphers`` lists ``suites`` (deterministic, any OpenSSL)."""
+
     def get_ciphers(_self: ssl.SSLContext) -> list[Any]:
         return suites
 
@@ -535,7 +547,10 @@ def test_file_vanishing_between_check_and_open_gives_the_typed_error_8195(
 # descriptor replaced BEFORE the import is captured as stock, so there the type check is the only
 # refusal; ``test_tls_prepatch_8195_r5.py`` pins that case in a fresh interpreter (mutant M66, code r4 F3).
 
-_ORIG_BOUND = {"minimum_version": ssl.SSLContext.minimum_version, "maximum_version": ssl.SSLContext.maximum_version}
+_ORIG_BOUND = {
+    "minimum_version": ssl.SSLContext.minimum_version,
+    "maximum_version": ssl.SSLContext.maximum_version,
+}
 
 # Numerically legal bounds (771 is TLSv1_2) that are not a TLSVersion: the stock-descriptor identity check refuses them.
 _NOT_A_TLS_VERSION = {"int-1.2": 771, "int-1.3": 772, "string": "TLSv1.2", "none": None}
@@ -566,4 +581,3 @@ def test_bound_that_is_not_a_tls_version_is_refused_at_construction_8195(
     _stub_bound(monkeypatch, attr, value)
     with pytest.raises(ValueError, match="verify=False"):
         _construct(client_cls, context)
-

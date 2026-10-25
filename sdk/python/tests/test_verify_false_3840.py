@@ -37,6 +37,7 @@ from cryptography.x509.oid import NameOID
 from ai_memory import AiMemoryClient, AsyncAiMemoryClient
 from ai_memory._common import build_httpx_kwargs
 
+from . import _fake_session_8195
 from ._tlslab import Lab
 
 
@@ -190,7 +191,11 @@ def test_lying_ssl_context_subclass_is_refused_6248(client_cls: type) -> None:
 
 
 def test_funnel_forwards_nothing_the_caller_can_re_decide_6248() -> None:
-    for make in (lambda: _FalsyStr(_ca()), lambda: _FalsyPathLike(_ca()), lambda: _FalsyPath(_ca())):
+    for make in (
+        lambda: _FalsyStr(_ca()),
+        lambda: _FalsyPathLike(_ca()),
+        lambda: _FalsyPath(_ca()),
+    ):
         forwarded = _kwargs(make())["verify"]  # type: ignore[operator]
         assert forwarded is True or type(forwarded) is ssl.SSLContext
 
@@ -943,6 +948,12 @@ def test_verified_session_still_connects_and_reuses_the_connection_6305(
         assert client._client.get("/a").status_code == 200  # noqa: SLF001
         assert client._client.get("/b").status_code == 200  # noqa: SLF001
     assert counting_server.hits == ["/a", "/b"]
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand-in sessions are read through the test seam (sec r6 S1-wire)."""
+    _fake_session_8195.install(monkeypatch)
 
 
 def test_negotiated_session_check_is_fail_closed_6305() -> None:

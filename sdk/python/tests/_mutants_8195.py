@@ -50,6 +50,7 @@ TRUST = "tests/test_default_trust_8195_r3.py"
 HTTPS_T = "tests/test_require_https_8195_r4.py"
 PREPATCH = "tests/test_tls_prepatch_8195_r5.py"
 PREPATCH6 = "tests/test_tls_prepatch_8195_r6.py"
+PREPATCH7 = "tests/test_tls_getset_identity_8195_r7.py"
 RUNNER_T = "tests/test_run_mutants_8195.py"
 DOCS_T = "tests/test_docs_truth_6689.py"
 CLIENT_T = "tests/test_client.py"
@@ -59,7 +60,7 @@ ATTEST = "tests/test_attestation_keyfile_3784.py"
 #: Every test file a mutant may be killed by; the runner executes all of them per row.
 KILLER_TESTS = (
     FLOOR, SESSION, VERIFY, CAPATH7, CAPATH8, OWNED_T, OWNED_R, ACL, ACL_FC, WAKE_T,
-    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T, PREPATCH, PREPATCH6,
+    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T, PREPATCH, PREPATCH6, PREPATCH7,
 )
 
 
@@ -119,8 +120,8 @@ MUTANTS: tuple[Mutant, ...] = (
            "    def _recheck() -> None:\n        if False:",
            killers=(FLOOR, SESSION, VERIFY,)),
     Mutant("S10", "session on another context admitted", COMMON,
-           '    if session is None or getattr(session, "context", None) is not context:\n        raise ValueError(_SESSION_MESSAGE)',
-           '    if session is None:\n        raise ValueError(_SESSION_MESSAGE)',
+           '    facts = _session_facts(session)\n    if facts is None or facts.context is not context:\n        raise ValueError(_SESSION_MESSAGE)',
+           '    facts = _session_facts(session)\n    if facts is None:\n        raise ValueError(_SESSION_MESSAGE)',
            killers=(SESSION, VERIFY,)),
     Mutant("S11", "session hostname check removed", COMMON,
            "    if not _peer_matches_host(peer, host, context):", "    if False:",
@@ -307,7 +308,7 @@ MUTANTS: tuple[Mutant, ...] = (
            "",
            killers=(PREPATCH,)),
     Mutant("R2", "session gate: negotiated version not checked", COMMON,
-           "    if version is None or version() not in _MODERN_TLS_NAMES:\n        raise ValueError(_SESSION_MESSAGE)\n",
+           "    if facts.version not in _MODERN_TLS_NAMES:\n        raise ValueError(_SESSION_MESSAGE)\n",
            "",
            killers=(TRUST, FLOOR,)),
     Mutant("R2", "session gate: TLS 1.1 named modern", COMMON,
@@ -315,8 +316,8 @@ MUTANTS: tuple[Mutant, ...] = (
            '_MODERN_TLS_NAMES = frozenset({"TLSv1.1", "TLSv1.2", "TLSv1.3"})',
            killers=(TRUST, FLOOR,)),
     Mutant("R2", "session gate: missing version() admitted", COMMON,
-           "    if version is None or version() not in _MODERN_TLS_NAMES:",
-           "    if version is not None and version() not in _MODERN_TLS_NAMES:",
+           "    if facts.version not in _MODERN_TLS_NAMES:",
+           "    if facts.version is not None and facts.version not in _MODERN_TLS_NAMES:",
            killers=(FLOOR,)),
     Mutant("R3", "default trust built without the floor", COMMON,
            "    context = _pinned_base_context()\n    try:\n        context.load_verify_locations(cafile=certifi.where())",
@@ -385,7 +386,7 @@ MUTANTS: tuple[Mutant, ...] = (
            "    if any(item is not first for item in found):\n        return None\n", "",
            killers=(PREPATCH,)),
     Mutant("R6", "C descriptor: any attribute type accepted (sec r5 S1)", COMMON,
-           '            if type(candidate).__name__ == "getset_descriptor":\n',
+           "            if type(candidate) is _GETSET:\n",
            "            if candidate is not None:\n", killers=(PREPATCH,)),
     Mutant("R6", "C descriptors read from the _ssl module table again (sec r5 S1)", COMMON,
            '_C_MIN_VERSION = _resolve_c_bound(_C_CLASSES, "minimum_version")\n',
@@ -406,4 +407,35 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant("R6", "verification: unresolved C descriptor admitted (code r5 F2)", COMMON,
            "    if descriptor is None:\n        return False\n", "",
            killers=(PREPATCH,)),
+    Mutant("R7", "C descriptor: matched by type name again (sec r6 S1)", COMMON,
+           "            if type(candidate) is _GETSET:\n",
+           '            if type(candidate).__name__ == "getset_descriptor":\n', killers=(PREPATCH7,)),
+    Mutant("R7", "C descriptor: forged type identity accepted (sec r6 S1)", COMMON,
+           "            if type(candidate) is _GETSET:\n", "            if isinstance(candidate, object):\n",
+           killers=(PREPATCH7,)),
+    Mutant("R7", "session: negotiated version read through the Python socket (sec r6 S1-wire)", COMMON,
+           "        return _SessionFacts(raw)\n",
+           "        facts = _SessionFacts(raw)\n        facts.version = session.version()  # type: ignore[attr-defined]\n        return facts\n",
+           killers=(PREPATCH7,)),
+    Mutant("R7", "session: cipher read through the Python socket (sec r6 S1-wire)", COMMON,
+           "        return _SessionFacts(raw)\n",
+           "        facts = _SessionFacts(raw)\n        facts.negotiated = session.cipher()  # type: ignore[attr-defined]\n        return facts\n",
+           killers=(PREPATCH7,)),
+    Mutant("R7", "session: peer certificate read through the Python socket (sec r6 S1-wire)", COMMON,
+           "        return _SessionFacts(raw)\n",
+           "        facts = _SessionFacts(raw)\n        facts.peer = session.getpeercert()  # type: ignore[attr-defined]\n        return facts\n",
+           killers=(PREPATCH7,)),
+    Mutant("R7", "session: context read through the Python socket (sec r6 S1-wire)", COMMON,
+           "        return _SessionFacts(raw)\n",
+           "        facts = _SessionFacts(raw)\n        facts.context = session.context  # type: ignore[attr-defined]\n        return facts\n",
+           killers=(PREPATCH7,)),
+    Mutant("R7", "session: Python stand-in _sslobj accepted (sec r6 S1-wire)", COMMON,
+           "    return raw if type(raw) is _C_SSLOBJ else None\n", "    return raw\n",
+           killers=(PREPATCH7,)),
+    Mutant("R7", "session: _sslobj read through a __getattribute__ override (sec r6 S1-wire)", COMMON,
+           '        raw = object.__getattribute__(session, "_sslobj")\n',
+           '        raw = getattr(session, "_sslobj")\n', killers=(PREPATCH7,)),
+    Mutant("R7", "session: leaf validity read through the Python socket (sec r6 S1-wire)", COMMON,
+           "    facts = _session_facts(session)\n    peer = None if facts is None else facts.peer\n",
+           "    peer = session.getpeercert()  # type: ignore[attr-defined]\n", killers=(PREPATCH7,)),
 )

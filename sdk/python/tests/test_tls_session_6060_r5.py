@@ -37,6 +37,7 @@ from ai_memory import AiMemoryClient, AsyncAiMemoryClient, _common
 from ai_memory._common import build_httpx_kwargs
 
 from ._tlslab import Lab, RecordingServer, TunnelProxy
+from . import _fake_session_8195
 
 _CLIENTS = [AiMemoryClient, AsyncAiMemoryClient]
 _API_KEY = "k-6060-r5"
@@ -202,6 +203,12 @@ def test_verified_context_connects_directly_6376(
 
 
 # ---- synthetic event sequences: branches a real server cannot reach --------
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand-in sessions are read through the test seam (sec r6 S1-wire)."""
+    _fake_session_8195.install(monkeypatch)
 
 
 class _Session:

@@ -151,6 +151,12 @@ _ALLOWED_VERIFY_FLAGS = (
 MINIMUM_TLS_VERSION = ssl.TLSVersion.TLSv1_2
 
 
+#: The genuine ``getset_descriptor`` type, taken from a builtin no Python code can patch. A type NAME is
+#: forgeable (a plain class can be called ``getset_descriptor``), the identity of this type is not
+#: (sec r6 S1).
+_GETSET = type(type.__dict__["__dict__"])
+
+
 def _resolve_c_bound(classes: "tuple[type, ...]", name: str) -> "Any | None":
     """The C-level ``getset_descriptor`` for ``name`` found on the MRO of ``classes``, or ``None``.
 
@@ -164,7 +170,7 @@ def _resolve_c_bound(classes: "tuple[type, ...]", name: str) -> "Any | None":
         match = None
         for base in cls.__mro__:
             candidate = base.__dict__.get(name)
-            if type(candidate).__name__ == "getset_descriptor":
+            if type(candidate) is _GETSET:
                 match = candidate
                 break
         if match is None:
@@ -186,6 +192,73 @@ _C_MAX_VERSION = _resolve_c_bound(_C_CLASSES, "maximum_version")
 _C_VERIFY_MODE = _resolve_c_bound(_C_CLASSES, "verify_mode")
 _C_CHECK_HOSTNAME = _resolve_c_bound(_C_CLASSES, "check_hostname")
 _C_VERIFY_FLAGS = _resolve_c_bound(_C_CLASSES, "verify_flags")
+
+
+def _capture_sslobj_type() -> "Any | None":
+    """The C ``_ssl._SSLSocket`` type behind every ``SSLSocket`` and ``SSLObject``, or ``None``.
+
+    Built from a throwaway in-memory wrap through the C base class that holds the already identity-checked
+    bound descriptors, never through the ``_ssl`` module table or ``wrap_bio``; the C method refuses
+    anything but real ``MemoryBIO`` objects, so what it returns is the C type or nothing (sec r6 S1-wire).
+    """
+    if _C_MIN_VERSION is None:
+        return None
+    base = getattr(_C_MIN_VERSION, "__objclass__", None)
+    wrap = None if base is None else base.__dict__.get("_wrap_bio")
+    if wrap is None:
+        return None
+    try:
+        probe = wrap(
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), ssl.MemoryBIO(), ssl.MemoryBIO(), False, None
+        )
+    except (TypeError, ValueError, ssl.SSLError):
+        return None
+    return type(probe)
+
+
+_C_SSLOBJ = _capture_sslobj_type()
+
+
+def _c_sslobj(session: object) -> "Any | None":
+    """The C ``_SSLSocket`` object of ``session``, or ``None`` when it is not one (sec r6 S1-wire).
+
+    ``object.__getattribute__`` skips a ``__getattribute__`` override on the socket subclass; the
+    value must be an instance of the C type itself, so a Python stand-in is refused. A property that
+    hands back a different genuine C session is not reachable by a lie: it can only name a real session.
+    """
+    try:
+        raw = object.__getattribute__(session, "_sslobj")
+    except AttributeError:
+        return None
+    return raw if type(raw) is _C_SSLOBJ else None
+
+
+class _SessionFacts:
+    """What the C ``_SSLSocket`` reports about one handshake, read with its own method descriptors.
+
+    Python-level ``SSLSocket`` and ``SSLObject`` methods are replaceable by a class set before import
+    (``sslsocket_class``, ``sslobject_class``); the C descriptors are not (sec r6 S1-wire).
+    """
+
+    __slots__ = ("context", "negotiated", "peer", "version")
+
+    def __init__(self, raw: Any) -> None:
+        kind: Any = _C_SSLOBJ
+        self.context = kind.context.__get__(raw)
+        self.peer = kind.getpeercert(raw, False)
+        self.negotiated = kind.cipher(raw)
+        self.version = kind.version(raw)
+
+
+def _session_facts(session: object) -> "_SessionFacts | None":
+    """The C-level facts of ``session``, or ``None`` when it has no readable C session."""
+    raw = _c_sslobj(session)
+    if raw is None:
+        return None
+    try:
+        return _SessionFacts(raw)
+    except (TypeError, ValueError, ssl.SSLError):
+        return None
 
 
 def _c_reads_agree(context: ssl.SSLContext, python_value: object, descriptor: "Any | None") -> bool:
@@ -835,20 +908,20 @@ def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: s
     negotiated protocol must be TLS 1.2 or newer and the suite must carry secret bits
     (no eNULL, #6305). Unlike the
     pre-handshake predicate this inspects what actually happened on the wire,
-    so it also closes the check/use race (#6306) and auth-null suites (#6305).
+    so it also closes the check/use race (#6306) and auth-null suites (#6305). Every read goes
+    through the C ``_ssl._SSLSocket`` object (:func:`_session_facts`), never through the Python
+    ``SSLSocket`` / ``SSLObject`` methods a class set before import can replace (sec r6 S1-wire).
     """
-    if session is None or getattr(session, "context", None) is not context:
+    facts = _session_facts(session)
+    if facts is None or facts.context is not context:
         raise ValueError(_SESSION_MESSAGE)
-    getpeercert = getattr(session, "getpeercert", None)
-    peer = None if getpeercert is None else getpeercert()
+    peer = facts.peer
     if not isinstance(peer, dict) or not peer:
         raise ValueError(_SESSION_MESSAGE)
     if not _peer_matches_host(peer, host, context):
         raise ValueError(_SESSION_MESSAGE)
-    cipher = getattr(session, "cipher", None)
-    negotiated = None if cipher is None else cipher()
-    version = getattr(session, "version", None)
-    if version is None or version() not in _MODERN_TLS_NAMES:
+    negotiated = facts.negotiated
+    if facts.version not in _MODERN_TLS_NAMES:
         raise ValueError(_SESSION_MESSAGE)
     if (
         not isinstance(negotiated, tuple)
@@ -936,8 +1009,8 @@ def _assert_leaf_current(session: object) -> None:
     is visible here. This runs on new sessions only (in the trace), never on a
     pooled connection, whose leaf was current when it was verified.
     """
-    getpeercert = getattr(session, "getpeercert", None)
-    peer = None if getpeercert is None else getpeercert()
+    facts = _session_facts(session)
+    peer = None if facts is None else facts.peer
     if not isinstance(peer, dict):
         raise ValueError(_SESSION_MESSAGE)
     not_before, not_after = peer.get("notBefore"), peer.get("notAfter")
@@ -1032,10 +1105,11 @@ class _SessionGate:
         if name == _TLS_DONE:
             stream = info.get("return_value")
             session = _session_of(stream)
+            facts = None if session is None else _session_facts(session)
             if (
                 leg == _DIRECT_TLS
                 and session is not None
-                and getattr(session, "context", None) is not self._context
+                and (facts is None or facts.context is not self._context)
             ):
                 self._pending.append(stream)
                 return None

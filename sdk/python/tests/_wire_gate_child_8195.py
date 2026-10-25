@@ -24,7 +24,7 @@ import _ssl
 SDK, SCRATCH, MODE = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, SDK)
 sys.path.insert(0, SDK + "/tests")
-import _tlslab  # noqa: E402
+import _tlslab  # type: ignore[import-not-found]  # noqa: E402
 
 REAL_MIN = _ssl._SSLContext.__dict__["minimum_version"]
 
