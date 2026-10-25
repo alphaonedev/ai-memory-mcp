@@ -102,7 +102,7 @@ EMBED_MODEL_CONFIG_ID="${DOCKER_1461_EMBED_CONFIG_ID:-nomic_embed_v15}"
 #      image's make-install'd 1.7.0 files cleanly (no dpkg conflict;
 #      verified) and its age.control default becomes 1.8.0.
 #   3. pgvector (PGVECTOR_APT_VERSION) — the sal-postgres adapter's server
-#      `vector` type. UNCHANGED at 0.8.6 (already current-stable).
+#      `vector` type. Advanced 0.8.6 -> 0.8.7 (current-stable, certified 2026-10-23).
 # Every literal lives HERE (SSOT), passed to the build as --build-arg,
 # asserted by the validate harness; the Dockerfile carries no version
 # literal of its own. AGE_BASE_IMAGE stays release_PG18_1.7.0 (it provides
@@ -111,11 +111,11 @@ AGE_BASE_IMAGE="${DOCKER_1461_AGE_BASE_IMAGE:-apache/age:release_PG18_1.7.0}"
 PG_MAJOR="${DOCKER_1461_PG_MAJOR:-18}"                            # server major (apt pkg suffix)
 PG_APT_VERSION="${DOCKER_1461_PG_APT_VERSION:-18.6-1.pgdg13+2}"   # pinned exact pgdg .deb
 AGE_APT_VERSION="${DOCKER_1461_AGE_APT_VERSION:-1.8.0~rc0-2.pgdg13+1}" # AGE 1.8.0 (extversion 1.8.0)
-PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.6-1.pgdg13+1}"
+PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.7-1.pgdg13+1}"
 # Reproducibility assertion anchors (validate harness asserts these exact
 # upstream-reported versions — the directive: results must reflect the data
 # tier PG 18.6 (current stable) + AGE 1.8.0 (newest released AGE for PG18) +
-# pgvector 0.8.6 (current stable)).
+# pgvector 0.8.7 (current stable)).
 EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-18.6}"
 EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.8.0}"
 PG_AGE_VECTOR_IMAGE="${DOCKER_1461_PG_IMAGE:-ai-memory-${CAMPAIGN}-pg-age-vector:latest}"

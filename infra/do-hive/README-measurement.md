@@ -334,7 +334,7 @@ PYTHONPATH=sdk/python python -m swarm
 infra/do-hive/teardown.sh
 ```
 
-The substrate is PostgreSQL 18.6, AGE 1.8.0, and pgvector 0.8.6. PgBouncer
+The substrate is PostgreSQL 18.6, AGE 1.8.0, and pgvector 0.8.7. PgBouncer
 listens only on `127.0.0.1:6432`, uses transaction pooling, and admits 2000
 clients; the daemon points its store URL there so Phase A and Phase B share the
 same baseline.
