@@ -13,9 +13,10 @@
 # Check). Same native pg18.6+AGE1.8.0+pgvector0.8.7 tier, same
 # per-job ephemeral db pattern as cert-postgres-age.yml.
 #
-# RUNNER PLACEMENT — self-hosted linux-fed (pg-tier). Needs :5445.
+# RUNNER PLACEMENT — either fed node (label `fed`: f2 linux-fed or f1
+# macos-fed), native tier via the per-node URL file. Needs :5445.
 # Required context as of #3552 (N24). Job-level `if:` is same-repo-only
-# (forks cannot use linux-fed); listed in
+# (forks cannot use the self-hosted fed nodes); listed in
 # required-contexts-joblevel-if-allow.txt so rule (b2) is honest about
 # skip=satisfied on fork PRs. Not a matrix (rule (b1) does not apply).
 
@@ -51,7 +52,7 @@ env:
 jobs:
   postgres-ignored:
     name: "Postgres ignored tests (sal-postgres --ignored)"
-    runs-on: [self-hosted, linux-fed]
+    runs-on: [self-hosted, fed]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 60
     steps:
@@ -96,6 +97,19 @@ jobs:
             *)    q=""; head="$base_url" ;;
           esac
           new_url="${head%/*}/${CI_FED_DB}${q}"
+          # #6161 - the macos-fed AGE install is hand-built; a Homebrew upgrade
+          # relinks the postgresql@18 trees and drops its files. These two
+          # workflows run on EITHER fed node (#8174), so mirror the ci.yml
+          # `Configure enterprise-fed tier` branch: on macOS self-heal from the
+          # node-local copy BEFORE CREATE EXTENSION (five sha256-pinned files;
+          # one-line reason on stderr). Linux is unchanged.
+          # python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then
+              echo "::error::$RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"
+              exit 1
+            fi
+          fi
           if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
             exit 1
