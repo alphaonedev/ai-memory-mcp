@@ -29,9 +29,10 @@ forged = type(
 forged.__objclass__ = ssl.SSLContext
 setattr(ssl.SSLContext, ATTR, forged)
 
-from ai_memory import _common  # noqa: E402,F401  (imported AFTER the forgery on purpose)
+from ai_memory import _common  # noqa: E402  (imported AFTER the forgery on purpose)
 from ai_memory.client import AiMemoryClient  # noqa: E402
 
+print("module=" + _common.__name__)
 print("forgery is genuine getset type: " + str(type(forged) is type(REAL)))
 try:
     AiMemoryClient("https://localhost:9077", verify=context).close()

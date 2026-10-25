@@ -27,6 +27,8 @@ sys.path.insert(0, SDK + "/tests")
 import _tlslab  # type: ignore[import-not-found]  # noqa: E402
 
 REAL_MIN = _ssl._SSLContext.__dict__["minimum_version"]
+_V11 = getattr(ssl.TLSVersion, "TLSv1_1")  # the deliberately weak version this row must see refused
+SERVER_ERRORS: list = []
 
 
 class _LyingSocket(ssl.SSLSocket):
@@ -70,8 +72,8 @@ cert_path, key_path = lab.leaf("localhost")
 
 server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 if MODE in ("plain", "socklie"):
-    server.minimum_version = ssl.TLSVersion.TLSv1_1
-    server.maximum_version = ssl.TLSVersion.TLSv1_1
+    server.minimum_version = _V11
+    server.maximum_version = _V11
     server.set_ciphers("DEFAULT:@SECLEVEL=0")
 elif MODE == "cipherlie":
     server.maximum_version = ssl.TLSVersion.TLSv1_2
@@ -89,11 +91,11 @@ def serve() -> None:
         wrapped = server.wrap_socket(conn, server_side=True)
         try:
             wrapped.recv(16)
-        except OSError:
-            pass
+        except OSError as exc:
+            SERVER_ERRORS.append(type(exc).__name__)
         wrapped.close()
-    except OSError:
-        pass
+    except OSError as exc:
+        SERVER_ERRORS.append(type(exc).__name__)
 
 
 thread = threading.Thread(target=serve, daemon=True)
@@ -101,7 +103,7 @@ thread.start()
 
 context = ssl.create_default_context(cafile=str(lab.ca_path))
 if MODE in ("plain", "socklie"):
-    REAL_MIN.__set__(context, ssl.TLSVersion.TLSv1_1)
+    REAL_MIN.__set__(context, _V11)
     context.set_ciphers("DEFAULT:@SECLEVEL=0")
 elif MODE in ("peerlie", "leaflie"):
     context.check_hostname = False
@@ -130,3 +132,4 @@ except ValueError:
 finally:
     session.close()
     thread.join(timeout=3)
+print("server_errors=" + str(SERVER_ERRORS))

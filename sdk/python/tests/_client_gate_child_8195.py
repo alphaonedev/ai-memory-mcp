@@ -28,6 +28,8 @@ sys.path.insert(0, SDK + "/tests")
 import _tlslab  # type: ignore[import-not-found]  # noqa: E402
 
 REAL_MIN = _ssl._SSLContext.__dict__["minimum_version"]
+_V11 = getattr(ssl.TLSVersion, "TLSv1_1")  # the deliberately weak version this row must see refused
+SERVER_ERRORS: list = []
 
 
 class _LyingObject(ssl.SSLObject):
@@ -74,8 +76,8 @@ from ai_memory import AiMemoryClient, AsyncAiMemoryClient, _common  # noqa: E402
 lab = _tlslab.Lab(pathlib.Path(SCRATCH))
 cert_path, key_path = lab.leaf("localhost")
 server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-server.minimum_version = ssl.TLSVersion.TLSv1_1
-server.maximum_version = ssl.TLSVersion.TLSv1_1
+server.minimum_version = _V11
+server.maximum_version = _V11
 server.set_ciphers("DEFAULT:@SECLEVEL=0")
 server.load_cert_chain(str(cert_path), str(key_path))
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -93,18 +95,18 @@ def serve() -> None:
         wrapped.settimeout(3)
         try:
             seen["bytes"] = len(wrapped.recv(4096))
-        except OSError:
-            pass
+        except OSError as exc:
+            SERVER_ERRORS.append(type(exc).__name__)
         wrapped.close()
-    except OSError:
-        pass
+    except OSError as exc:
+        SERVER_ERRORS.append(type(exc).__name__)
 
 
 thread = threading.Thread(target=serve, daemon=True)
 thread.start()
 
 context = ssl.create_default_context(cafile=str(lab.ca_path))
-REAL_MIN.__set__(context, ssl.TLSVersion.TLSv1_1)
+REAL_MIN.__set__(context, _V11)
 context.set_ciphers("DEFAULT:@SECLEVEL=0")
 _common._context_verifies = lambda candidate: True  # type: ignore[assignment]
 url = f"https://localhost:{port}"
@@ -121,9 +123,11 @@ def run_sync() -> object:
 
 
 try:
-    result = run_sync() if MODE in ("sync-ctl", "socklie") else asyncio.run(run_async())
+    if MODE in ("sync-ctl", "socklie"):
+        run_sync()
+    else:
+        asyncio.run(run_async())
     outcome = "COMPLETED"
-    del result
 except ValueError:
     outcome = "REFUSED-ValueError"
 except Exception as exc:  # noqa: BLE001 - the row reports the class only
@@ -132,3 +136,4 @@ thread.join(timeout=5)
 print("handshake=" + seen["version"])
 print("request_bytes=" + str(seen["bytes"]))
 print("outcome=" + outcome)
+print("server_errors=" + str(SERVER_ERRORS))
