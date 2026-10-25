@@ -15,6 +15,7 @@ repositories, then run the materialised selector. No network, no cargo.
 """
 import ast
 import contextlib
+import copy
 import hashlib
 import importlib
 import io
@@ -1109,6 +1110,9 @@ JOB_KEY_SETS = {
 JOB_RUNS_ON = "ubuntu-latest"
 JOB_TIMEOUT_MINUTES = {SELECT_JOB: "15", GATE_JOB: "5"}  # code r13 F2: ci.yml:173 and :2770
 JOB_NAMES = {SELECT_JOB: "Impact selection", GATE_JOB: "ci-gate"}  # sec r13 S2
+# sec r14 S2: the only job display names that hold an expression (matrix legs); any other `${{`
+# in a job name is a problem line (13 job names are checked at head, 2 of them hold a matrix name).
+JOB_NAME_EXPRESSIONS = {"Check (${{ matrix.leg }})", "Cross-compile (${{ matrix.target }})"}
 JOB_PERMISSIONS = None  # neither job sets `permissions`; the workflow-level block applies
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 JOB_KEYS_REFUSED = ("container", "services")
@@ -1183,12 +1187,17 @@ PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
 # normalised ast.dump of every class and function the heredoc defines is compared with the pinned
 # text MATERIALISE_FUNCTION_PINS, so a runner-conditioned or unconditional edit of a branch, a
 # return or a call in derive_base, rev_parse, materialise, gate_absent, report or main is a
-# problem line naming the function, whatever the sha256 pin says. The sha256 digest stays the
-# primary pin.
+# problem line naming the function, whatever the sha256 pin says. The module body outside those
+# functions is pinned too (sec r14 S1, the pinned module body): the ast.dump of the whole module with every class and
+# function body elided to `pass` is compared with MATERIALISE_MODULE_PIN, so the imports, the
+# constants, the order of the definitions and the guard are exactly the pinned sequence and a
+# module-level statement anywhere is a problem line naming "module body". Functions AND module
+# body are therefore pinned; the sha256 digest stays the primary pin.
 MATERIALISE_ENFORCES = ("call targets", "pinned imports", "no rebinding", "exact argv head",
                         "dash literals", "environment untouched",
                         "unrebound parameter", "exactly one binding",
-                        "read-only environment uses", "pinned function control flow")
+                        "read-only environment uses", "pinned function control flow",
+                        "pinned module body")
 MATERIALISE_MODULE_ROOTS = {"os", "re", "shutil", "subprocess", "sys", "pathlib"}
 MATERIALISE_IMPORT_STATEMENTS = sorted(["from pathlib import Path", "import os", "import re",
                                         "import shutil", "import subprocess", "import sys"])
@@ -1494,6 +1503,91 @@ MATERIALISE_FUNCTION_PINS = {
 }
 MATERIALISE_FUNCTION_DUMPS = {name: ast.dump(ast.parse(text).body[0])
                               for name, text in MATERIALISE_FUNCTION_PINS.items()}
+# sec r14 S1: the module body of the Materialise heredoc (ci.yml:228-418 of the select job and its
+# twin :2811-3001 of the gate job) as one ordered statement sequence: the imports, the four pinned
+# constants, the 12 definitions in order and the `__main__` guard. Every class and function body
+# is elided to `pass` here and in the checked tree (the per-function pins above compare the
+# bodies), so the module pin covers everything between and around the definitions and accepts
+# exactly one module body: a statement inserted, moved, repeated or appended is a problem line
+# naming "module body".
+MATERIALISE_MODULE_PIN = r'''import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+REGULAR_MODES = ("100644", "100755")
+IMPACT_PREFIX = "scripts/ci/impact/"
+GIT_TIMEOUT_S = 120
+
+
+class BaseUnavailable(Exception):
+    pass
+
+
+def git(*args):
+    pass
+
+
+def have_commit(base):
+    pass
+
+
+def fetch_blob(base, name):
+    pass
+
+
+def rev_parse(spec):
+    pass
+
+
+def replace_refs_present():
+    pass
+
+
+def git_state_refused():
+    pass
+
+
+def derive_base(env):
+    pass
+
+
+def gate_absent(base):
+    pass
+
+
+def materialise(base, dest, names):
+    pass
+
+
+def report(ok, reason, bootstrap=False):
+    pass
+
+
+def main():
+    pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _elided_module_dump(tree):
+    """The ast.dump of a module with every top-level class and function body replaced by `pass`."""
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            node = copy.copy(node)
+            node.body = [ast.Pass()]
+        body.append(node)
+    return ast.dump(ast.Module(body=body, type_ignores=[]))
+
+
+MATERIALISE_MODULE_DUMP = _elided_module_dump(ast.parse(MATERIALISE_MODULE_PIN))
 
 
 def _chain(node):
@@ -2021,6 +2115,15 @@ def _function_problems(label, tree):
     return problems
 
 
+def _module_body_problems(label, tree):
+    """sec r14 S1: the module body, with every class and function body elided, equals the pinned
+    statement sequence (imports, constants, the 12 definitions in order, the guard)."""
+    if _elided_module_dump(tree) == MATERIALISE_MODULE_DUMP:
+        return []
+    return ["%s: module body differs from its pinned statement sequence (function and class "
+            "bodies elided)" % label]
+
+
 def materialise_allow_list_problems(label, run):
     """Reasons the Materialise body reaches a call target, binding, environment write or argument
     outside the allow-list."""
@@ -2034,6 +2137,7 @@ def materialise_allow_list_problems(label, run):
     problems = _binding_problems(label, tree)
     problems.extend(_definition_problems(label, tree))
     problems.extend(_function_problems(label, tree))
+    problems.extend(_module_body_problems(label, tree))
     parents = _parents(tree)
     for name, kind, site in _bound_names(tree):
         if kind == "store" and _scope_of(site, parents) is None \
@@ -2172,6 +2276,34 @@ def _defaults_problems(defaults, where):
     return found
 
 
+def _fold_name(value):
+    """casefold, strip and collapse internal whitespace (sec r14 S2 / code r14 F1)."""
+    return " ".join(value.casefold().split())
+
+
+def _job_name_problems(job, definition):
+    """sec r14 S2 / code r14 F1: no job other than the gate has the gate check name, whether
+    spelled with another case, padding, or (when `name` is absent) its job id; and a job display
+    name is never an expression except the two pinned matrix names. The rule is a text pin: the
+    expressions are refused, never evaluated."""
+    if not isinstance(definition, dict):
+        return []
+    problems = []
+    gate = _fold_name(JOB_NAMES[GATE_JOB])
+    if "name" not in definition:
+        if job != GATE_JOB and isinstance(job, str) and _fold_name(job) == gate:
+            problems.append("job %s defaults its check name to the gate check name" % job)
+        return problems
+    name = definition["name"]
+    if not isinstance(name, str):
+        return ["job %s name is not a string" % job]
+    if "${{" in name and name not in JOB_NAME_EXPRESSIONS:
+        problems.append("job %s name carries an expression outside the pinned set" % job)
+    if job != GATE_JOB and _fold_name(name) == gate:
+        problems.append("job %s carries the gate check name %s" % (job, JOB_NAMES[GATE_JOB]))
+    return problems
+
+
 def pre_trust_problems(text):
     """Every reason the pre-trust steps of either job are off the allow-list; [] when clean.
 
@@ -2194,10 +2326,8 @@ def pre_trust_problems(text):
     if doc.get("permissions") != WORKFLOW_PERMISSIONS:
         problems.append("workflow permissions differ from the pinned mapping")
     jobs = _mapping(doc.get("jobs"), "jobs", problems)
-    for other, other_def in sorted(jobs.items()):
-        if other != GATE_JOB and isinstance(other_def, dict) \
-                and other_def.get("name") == JOB_NAMES[GATE_JOB]:
-            problems.append("job %s carries the gate check name %s" % (other, JOB_NAMES[GATE_JOB]))
+    for other, other_def in sorted(jobs.items(), key=lambda item: str(item[0])):
+        problems.extend(_job_name_problems(other, other_def))
     for job in (SELECT_JOB, GATE_JOB):
         allow, marker = WINDOWS[job]
         definition = _mapping(jobs.get(job), "job %s" % job, problems)
@@ -3667,10 +3797,12 @@ class TrustWindowMutants(unittest.TestCase):
             # code r12 C1: the changed value is also refused by the pinned-value rule.
             digest = [p for p in problems if "sha256" in p]
             self.assertEqual(len(digest), 1, problems)
-            self.assertEqual(len(problems), 2, problems)
+            # sec r14 S1: the module-body pin also sees the changed constant.
+            self.assertEqual(len(problems), 3, problems)
             second = [p for p in problems if "sha256" not in p]
-            self.assertEqual(len(second), 1, problems)
-            self.assertIn("GIT_TIMEOUT_S", second[0])
+            self.assertEqual(len(second), 2, problems)
+            self.assertIn("module body", second[0])
+            self.assertIn("GIT_TIMEOUT_S", second[1])
             self.assertIn(name, digest[0])
             self.assertIn(run_digest(changed), digest[0])
             self.assertIn(MATERIALISE_SHA256[name], digest[0])
@@ -5236,8 +5368,9 @@ class WorkflowFormMutants(unittest.TestCase):
                 failing_tests_on_workflow("x: 1\n", [("planted_8240", "Planted.test_errors")])
 
     def test_sec_r13_s2_no_other_job_carries_the_gate_check_name(self):
-        """sec r13 S2: the check context named by the gate stays unique, and the select job's
-        display name is pinned."""
+        """sec r13 S2, sec r14 S2, code r14 F1: the check context named by the gate stays unique
+        (case, padding and the job id of a nameless job folded), no job name holds an expression
+        outside the two pinned matrix names, and the select job's display name is pinned."""
         live = CI_YML.read_text()
         for label, old, new, needle in (
                 ("classify-named-ci-gate", "    name: Classify changes\n", "    name: ci-gate\n",
@@ -5266,7 +5399,7 @@ class WorkflowFormMutants(unittest.TestCase):
                  "  CI-GATE:\n", "defaults its check name"),
                 ("classify-id-is-gate-padded-no-name", "  classify:\n    name: Classify changes\n",
                  '  "ci-gate ":\n', "defaults its check name"),
-                ("classify-name-not-a-string", "    name: Classify changes\n", "    name: 7\n",
+                ("classify-name-is-a-list", "    name: Classify changes\n", "    name: [ci-gate]\n",
                  "name is not a string"),
                 ("classify-name-is-a-mapping", "    name: Classify changes\n",
                  "    name:\n      x: y\n", "name is not a string")):
@@ -5276,6 +5409,11 @@ class WorkflowFormMutants(unittest.TestCase):
                 problems = pre_trust_problems(text)
                 self.assertTrue([p for p in problems if needle in p], (needle, problems))
         self.assertEqual(pre_trust_problems(live), [])
+        jobs = yaml_subset_load(live)["jobs"]
+        names = [d["name"] for d in jobs.values() if "name" in d]
+        self.assertEqual((len(jobs), len(names)), (13, 13))
+        self.assertEqual({n for n in names if "${{" in n}, JOB_NAME_EXPRESSIONS)
+        self.assertEqual(_fold_name("  CI-\tGate "), "ci- gate")
 
     def test_each_form_that_stays_green_stays_green(self):
         live = CI_YML.read_text()
