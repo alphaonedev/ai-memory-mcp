@@ -8268,6 +8268,12 @@ mod tests {
     /// reshaped into an object.
     #[test]
     fn mcp_capabilities_v2_backwards_compatible() {
+        // #7450 — `memory_capabilities` resolves the key dir, so it reads the
+        // process-global `AI_MEMORY_KEY_DIR` the `handle_verify_*` tests
+        // rebind; serialise with them.
+        let _g = verify_key_env_guard()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call("memory_capabilities", json!({}));
         let resp = invoke_handle_request(&conn, &req);
@@ -8335,6 +8341,10 @@ mod tests {
     /// already wired through to a real subsystem instead of zero-state.
     #[test]
     fn mcp_capabilities_pending_requests_reflects_db() {
+        // #7450 — same shared `AI_MEMORY_KEY_DIR` read as above.
+        let _g = verify_key_env_guard()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         // Insert a pending action by hand (the queue path is exercised
         // elsewhere; here we only need the count to bump).
@@ -14053,7 +14063,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("AI_MEMORY_KEY_DIR").ok();
-        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tmp = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: lock acquired above; env writes are serialised.
         unsafe {
             std::env::set_var("AI_MEMORY_KEY_DIR", tmp.path());
