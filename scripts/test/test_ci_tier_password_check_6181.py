@@ -151,6 +151,7 @@ URL_LINES = frozenset((
     'if ! ' + RUN + ' -- psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
     'if ! ' + RUN + ' --database "$CI_FED_DB" -- psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age;'
     ' CREATE EXTENSION IF NOT EXISTS vector;"; then',
+    'if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then',
     'python3 -I ' + HELPER + ' github-env --url-file "$url_file" --database "$CI_FED_DB"',
     'echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and'
     ' pointed AI_MEMORY_TEST_POSTGRES_URL at it"',
