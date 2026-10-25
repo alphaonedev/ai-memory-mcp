@@ -140,7 +140,7 @@ Certified operating scope for the top stages: **500–1000-agent clusters,
 composed in 500-agent blocks**, within the documented peer-federation
 ceiling — [certification §1 and §6](../compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md).
 
-### 9.2 The data tier: PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6
+### 9.2 The data tier: PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7
 
 - **Why this triple:** multi-writer durability and strong consistency
   (Postgres), native graph traversal of `memory_links` via Cypher (AGE) with

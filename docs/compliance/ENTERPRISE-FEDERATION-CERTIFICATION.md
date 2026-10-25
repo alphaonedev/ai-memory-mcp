@@ -1058,7 +1058,7 @@ release binary is deliberately NOT enterprise-federation-compliant.
 
 ---
 
-## 3. §5.4(3) — Postgres + AGE + pgvector evidence (current triple 18.6 / 1.8.0 / 0.8.6 executed GREEN — run 33182767671)
+## 3. §5.4(3) — Postgres + AGE + pgvector evidence (18.6 / 1.8.0 / pgvector at 0.8.6, then current, executed GREEN — run 33182767671; current pin 0.8.7)
 
 The certified stack is **executed in-PR** by `.github/workflows/cert-postgres-age.yml`
 (#2548), which BUILDS and runs the exact certified triple and hard-fails on any
@@ -1076,7 +1076,9 @@ version drift (the `Assert certified stack versions` step in
   RELEASED AGE for PG18. Apache AGE tags every release `X.Y.Z-rc0` on GitHub
   (its release-vote convention), which is why the pgdg package version reads
   `1.8.0~rc0-…`; `CREATE EXTENSION age` reports `extversion = 1.8.0`.
-- **pgvector 0.8.6** (`PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`)
+- **pgvector 0.8.7** (`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`; advanced from the
+  0.8.6 patch on 2026-10-23, see the dated note below — the executed-GREEN runs
+  cited in this section ran on the prior 0.8.6 patch)
 
 **Executed GREEN on the cert SHA:** run
 `https://github.com/alphaonedev/ai-memory-mcp/actions/runs/31601974424`
@@ -1087,11 +1089,11 @@ This answers the ruling's "executed, at certified versions, not
 CI-on-16-while-certifying-18" — the workflow refuses to certify a mismatched
 stack. (Those specific dated runs executed the historical **18.4 / 1.7.0 /
 0.8.5** round; the CURRENT standard tier — **PG 18.6 / AGE 1.8.0 / pgvector
-0.8.6** — is the tier this same workflow asserts in-PR on `release/**` from
+0.8.7** — is the tier this same workflow asserts in-PR on `release/**` from
 the SSOT pins, per the STANDARD data-tier note below.)
 
-> **Evidence status, stated plainly (2026-08-28 Wave-1 C3).** Current
-> triple **PG 18.6 / AGE 1.8.0 / pgvector 0.8.6** is executed GREEN:
+> **Evidence status, stated plainly (2026-08-28 Wave-1 C3).** The
+> then-current triple **PG 18.6 / AGE 1.8.0 / pgvector at 0.8.6** is executed GREEN:
 > run [`33182767671`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33182767671)
 > (`Certified Postgres + AGE + pgvector tier (#2548)`, push of
 > `release/v1.0.0` head `00dd0162`, conclusion `success`,
@@ -1114,26 +1116,42 @@ the SSOT pins, per the STANDARD data-tier note below.)
 > resolution failure reds the job and blocks the merge). On-host
 > corroboration exists ahead of that run: on 2026-08-14 the permanent
 > container `ai-memory-cert-pg` built and served **PostgreSQL 18.4 + Apache
-> AGE 1.7.0 + pgvector 0.8.6** with `create_graph`, a pgvector cosine op, and a
-> `sslmode=verify-full` daemon `schema-init` all functional. pgvector **0.8.6
-> is now the standard, CI-asserted pin** (`PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`,
+> AGE 1.7.0 + pgvector at 0.8.6** with `create_graph`, a pgvector cosine op, and a
+> `sslmode=verify-full` daemon `schema-init` all functional. pgvector at **0.8.6
+> was then the standard, CI-asserted pin** (`PGVECTOR_APT_VERSION` was `0.8.6-1.pgdg13+1`,
 > read by the `Assert certified stack versions` step; see the STANDARD
 > data-tier note below); this dated note records the historical 0.8.5→0.8.6
 > pin advance.
 
+> **pgvector advance 0.8.6 to 0.8.7 (2026-10-23, operator directive: "certified
+> PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.7 => ai-memory v1.0.0 GA
+> release").** The v1.0.0 GA enterprise governance data tier is certified on
+> **PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.7**. Fleet measurement
+> 2026-10-23: both nodes serve PostgreSQL 18.6 with Apache AGE 1.8.0 and
+> pgvector 0.8.7 (Linux: PGDG `postgresql-18-pgvector` `0.8.7-1.pgdg24.04+1`,
+> 207 databases updated with `ALTER EXTENSION vector UPDATE`; macOS: Homebrew
+> pgvector 0.8.7 on `postgresql@18` 18.6_1, 39 databases updated), and
+> `pg_available_extensions` reports `vector=0.8.7 age=1.8.0` on both. The
+> provisioning SSOT pins and the in-PR `Assert certified stack versions` step
+> now read 0.8.7, so the first GREEN `cert-postgres-age.yml` run of the change
+> that carries this advance is the 0.8.7 build+assert evidence (fail-closed).
+> The executed-GREEN run ids quoted elsewhere in this document ran on the prior
+> 0.8.6 patch and are kept as the dated record of those rounds.
+>
 > **STANDARD data tier: PG 18.6 (current stable) + AGE 1.8.0 (newest released
-> AGE for PG18) + pgvector 0.8.6 (current stable) — STANDARDIZED 2026-08-18
-> (operator directive).** **PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector
-> 0.8.6 is the CURRENT certified/standard enterprise-federation data tier.**
+> AGE for PG18) + pgvector at 0.8.6 (then current stable) — STANDARDIZED
+> 2026-08-18 (operator directive).** **PostgreSQL 18.6 + Apache AGE 1.8.0 +
+> pgvector 0.8.7 is the CURRENT certified/standard enterprise-federation data
+> tier** (pgvector advanced from 0.8.6 on 2026-10-23, see the note above).
 > It is the SSOT pin in `deploy/docker-1461/provision/lib.sh`
 > (`EXPECTED_PG_VERSION=18.6`, `EXPECTED_AGE_VERSION=1.8.0`,
-> `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`) and is ASSERTED IN-PR on
+> `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`) and is ASSERTED IN-PR on
 > `release/**` by the `Assert certified stack versions` step of
 > `.github/workflows/cert-postgres-age.yml`, which reads those pins and
 > hard-fails on any drift from exactly those minors — so a GREEN merge to the
-> release branch IS the 18.6 / 1.8.0 / 0.8.6 build+assert evidence
+> release branch IS the 18.6 / 1.8.0 / 0.8.7 build+assert evidence
 > (fail-closed: a mismatched resolution reds the job and blocks the merge).
-> PG 18.6 and pgvector 0.8.6 are current-stable without qualification.
+> PG 18.6 and pgvector 0.8.7 are current-stable without qualification.
 > **Apache AGE 1.8.0 is the newest RELEASED AGE for PostgreSQL 18** per
 > [github.com/apache/age/releases](https://github.com/apache/age/releases)
 > (`PG18/v1.8.0-rc0`, 2026-07-09) — NOTE: the project download page
@@ -1149,7 +1167,7 @@ the SSOT pins, per the STANDARD data-tier note below.)
 > which is why the pgdg package version reads `1.8.0~rc0-…`; `CREATE EXTENSION
 > age` reports `extversion = 1.8.0`. **On-host corroboration:** an
 > `ai-memory-cert-pg` image rebuilt on this tier serves **PostgreSQL 18.6 +
-> Apache AGE 1.8.0 + pgvector 0.8.6** with `postgres --version` = 18.6, AGE
+> Apache AGE 1.8.0 + pgvector at 0.8.6** with `postgres --version` = 18.6, AGE
 > `extversion` = 1.8.0, `create_graph`, a pgvector cosine op, the Leg-3
 > verify-full TLS POS/NEG suite, and a `sslmode=verify-full` daemon
 > `schema-init` all functional; the AGE-1.8.0 compatibility gate (the
@@ -1158,7 +1176,7 @@ the SSOT pins, per the STANDARD data-tier note below.)
 >
 > **History (2026-08-12 ratification round — superseded prior minor).** The
 > 5-agent adversarial ratification determination of 2026-08-12 was conducted
-> against the then-current **PG 18.4 / AGE 1.7.0 / pgvector 0.8.6** minor;
+> against the then-current **PG 18.4 / AGE 1.7.0 / pgvector at 0.8.6** minor;
 > 18.6 / 1.8.0 is the current-stable successor of the SAME tier (a minor-version
 > advance, not a substrate change). The GREEN `cert-postgres-age.yml` runs
 > cited above (`31601974424`, `31601912912`, PR #2910) executed that historical
@@ -1473,13 +1491,13 @@ is observed:**
    `Assert certified stack versions` step reads from
    `deploy/docker-1461/provision/lib.sh`** (a drift that step should have
    caught) voids it. The current standard pins are
-   **PG 18.6 / AGE 1.8.0 / pgvector 0.8.6** (`EXPECTED_PG_VERSION=18.6`,
-   `EXPECTED_AGE_VERSION=1.8.0`, `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`),
-   standardized 2026-08-18 and asserted in-PR on `release/**` by that step;
+   **PG 18.6 / AGE 1.8.0 / pgvector 0.8.7** (`EXPECTED_PG_VERSION=18.6`,
+   `EXPECTED_AGE_VERSION=1.8.0`, `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`),
+   standardized 2026-08-18 (pgvector advanced to 0.8.7 on 2026-10-23) and asserted in-PR on `release/**` by that step;
    the 2026-08-12 ratification round was against the prior, now-superseded
-   **PG 18.4 / AGE 1.7.0 / pgvector 0.8.6** minor (recorded as history in the
+   **PG 18.4 / AGE 1.7.0 / pgvector at 0.8.6** minor (recorded as history in the
    §3 STANDARD data-tier note). The disconfirmation trigger tracks the pins
-   the step actually asserts — currently 18.6 / 1.8.0 / 0.8.6.
+   the step actually asserts — currently 18.6 / 1.8.0 / 0.8.7.
    *Observable:* that step (the `Assert certified stack versions` step in
    `.github/workflows/cert-postgres-age.yml`) hard-fails the job on any
    mismatch against those pins.
@@ -1565,7 +1583,8 @@ runs — a vacuous leg that certifies nothing and must never be cited.
 
 *§5.4(3) Postgres + AGE + pgvector, and the live-pg §5.4(4) negative lanes:
 executed GREEN in CI on `f32c18dad`.* `Certified pg+AGE cells (live PG 18.6 +
-AGE 1.8.0 + pgvector 0.8.6)` — run
+AGE 1.8.0 + pgvector
+0.8.6)` — run
 [`35544846676`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/35544846676)
 (success). `Check (linux-fed,enterprise-fed)` + `Check (macos-fed,enterprise-fed)`
 — the federation namespace-scope negative lanes on both backends — run
