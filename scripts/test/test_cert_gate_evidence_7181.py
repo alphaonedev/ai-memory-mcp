@@ -616,10 +616,10 @@ class MacOsPathRoots8174(unittest.TestCase):
 
     def test_f1_runner_paths_survive(self):
         for path in (
-            "/Volumes/f1dev/runners/f1-macos-fed-3/_work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-gate/bootstrap.log",
-            "/Users/Shared/f1-macos-fed-3/_work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-gate/x.log",
-            "/private/var/folders/zz/zyxwvutsrqponmlkjihgfedcba/T/cert-gate-evidence-run/bootstrap.log",
-            "/Library/PostgreSQL/18/data/log/postgresql-2026-10-25_000000.log",
+            "/Volumes/ci-data/runners/runner-3/_work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-gate/bootstrap.log",
+            "/Users/f1dev/runner-3/_work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-gate/x.log",
+            "/private/var/db/postgresql18/cert-gate-evidence-run/bootstrap-failure.log",
+            "/Library/postgresql/18/data/log/postgresql-2026-10-25_000000.log",
             "/opt/homebrew/opt/postgresql@18/share/postgresql@18/extension/age--1.8.0.sql",
         ):
             self.assertEqual(self._red("log: " + path), "log: " + path)
@@ -633,7 +633,7 @@ class MacOsPathRoots8174(unittest.TestCase):
 
     def test_uppercase_only_allowed_in_the_root_segment(self):
         sec = "AbCdEfGhIjKlMnOpQrStUvWxYz012345" + "67"
-        self.assertNotIn(sec, self._red("/Volumes/f1dev/" + sec + "/x"))
+        self.assertNotIn(sec, self._red("/Volumes/ci-data/" + sec + "/x"))
 
 
 class GateScriptPins(unittest.TestCase):
