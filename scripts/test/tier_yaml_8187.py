@@ -22,6 +22,8 @@ or id and the first differing key path, with any ``scheme://user:pass@`` masked.
 import hashlib
 import json
 import re
+import unicodedata
+import urllib.parse
 
 try:
     import yaml
@@ -44,6 +46,13 @@ EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|
 URL_ALL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*")
 # a ``scheme:`` URI form without the slashes (``postgresql:user:pass``): a letter-led scheme, a colon, then a non-space
 SCHEME_FORM = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:\S")
+# a percent escape (``%40``, ``%3A``): an encoding the printer does not understand is a leak the mask will not catch (F39-b)
+PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+# a credential keyword followed by ``=`` or ``:`` (``password=``, ``pwd=``, ``user=``, ``host=``, ``pass:``), not part of a longer word
+CREDENTIAL_KEYWORD = re.compile(
+    r"(?<![A-Za-z0-9])(?:password|passwd|pass|pwd|user|username|uid|host|hostname|secret|token|dsn)\s*[=:]", re.IGNORECASE)
+DELIMITERS = frozenset("@:/=%")
+DECODE_PASSES = 3
 # the second-layer line mask (F36): every ``scheme://`` token up to the next whitespace is replaced, with no look-ahead that
 # author text can satisfy; only a trailing run of closing punctuation survives, so a label that arrived pre-masked keeps
 # its bracket (``(https://***):`` stays whole) while a userinfo can never be carried past the mask by the text after it
@@ -98,16 +107,39 @@ def mask_userinfo(text):
     return URL_USERINFO.sub(r"\1***\2", text)
 
 
+def fold(value):
+    """``value`` NFKC-normalised, then percent-decoded up to ``DECODE_PASSES`` times (each pass followed by NFKC), so a
+    credential delimiter that arrives fullwidth, percent-encoded or encoded twice reads as the ASCII delimiter (F39-b)."""
+    text = unicodedata.normalize("NFKC", value)
+    for _ in range(DECODE_PASSES):
+        decoded = unicodedata.normalize("NFKC", urllib.parse.unquote(text))
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
+def carries_credential_form(text):
+    """True when ``text`` holds an ``@``, a ``://``, a ``scheme:`` form or a credential keyword with ``=`` or ``:``."""
+    return "@" in text or "://" in text or bool(SCHEME_FORM.search(text) or CREDENTIAL_KEYWORD.search(text))
+
+
 def printable(value, fallback):
-    """``value`` as a name for a message, or ``fallback`` (F34, fail closed).
+    """``value`` as a name for a message, or ``fallback`` (F34, F39, fail closed).
 
     The whole value is joined on its whitespace and tested RAW, before any mask (F38): an ``@``, a ``://`` or a ``scheme:``
     form anywhere in it may carry a credential fragment (a userinfo broken by a line break, folding whitespace, ``/`` or
     ``@``, or an ``@`` that a later ``scheme://`` token would swallow from a mask), so none of its text is printed.  The
-    mask runs afterwards as a second layer for a value that never carried those tokens, and the cut to 60 characters
-    comes last (F33)."""
+    test runs on the raw value and on its ``fold`` (NFKC, bounded percent-decode), and any percent escape, any non-ASCII
+    character that folds to a delimiter, and any credential keyword followed by ``=`` or ``:`` is also a reason to fall
+    back (F39-b).  The mask runs afterwards as a second layer for a value that never carried those tokens, and the cut to
+    60 characters comes last (F33)."""
     joined = " ".join(str(value).split())
-    if "@" in joined or "://" in joined or SCHEME_FORM.search(joined):
+    if PERCENT_ESCAPE.search(joined):
+        return fallback
+    if any(ord(ch) > 127 and DELIMITERS & set(unicodedata.normalize("NFKC", ch)) for ch in joined):
+        return fallback
+    if carries_credential_form(joined) or carries_credential_form(fold(joined)):
         return fallback
     return URL_ALL.sub(r"\1***", joined)[:60]
 

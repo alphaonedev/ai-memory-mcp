@@ -835,7 +835,8 @@ def job_pin_problems(workflow, text, pins=None):
     pinned_level = entry.get("workflow", {})
     for key in sorted(set(level) | set(pinned_level)):
         if key not in level:
-            problems.append(f"{workflow}: the pinned workflow-level {key}: block is missing")
+            label = ty.name_label(key, set(level) | set(pinned_level))
+            problems.append(f"{workflow}: the pinned workflow-level {label}: block is missing")
         elif key not in pinned_level:
             problems.append(f"{workflow}: a workflow-level {key}: block was added and is not pinned")
         elif hashlib.sha256(level[key].encode("utf-8")).hexdigest() != pinned_level[key]["sha256"]:
@@ -2819,7 +2820,7 @@ class TestFallbackDecidedOnTheRawValue8187R20(TestEveryAuthorKeyIsPrintable8187R
             if target is None:
                 continue
             for variant, name in self.shapes().items():
-                step_edit = splice(text, target[3], [f"      - name: {name}", "        run: echo one"])
+                step_edit = splice(text, target[3], [f"      - name: {json.dumps(name)}", "        run: echo one"])
                 job_edit = text.replace("\njobs:\n", f'\njobs:\n  "{name}":\n    runs-on: ubuntu-latest\n'
                                         '    steps:\n      - run: echo hi\n', 1)
                 self.assertIn(self.SENTINEL, json.dumps(ty.load_strict(step_edit)))
@@ -2833,6 +2834,120 @@ class TestFallbackDecidedOnTheRawValue8187R20(TestEveryAuthorKeyIsPrintable8187R
                             self.assertTrue(problems)
                             self.assertEqual(self.leaks(problems), [])
         self.assertEqual(checked, 3 * len(self.shapes()) * 4)
+
+
+def r21_shapes(kind, user, sentinel):
+    """The r21 value shapes: ``encoded`` (F39-b: percent-encoded, fullwidth, keyword=value, mixed) or ``scheme`` (F39-c: a
+    scheme-prefixed credential without ``//`` and without ``@``).  Every shape holds the sentinel."""
+    common = {
+        "space": f"https://{user}:{sentinel} pw@dbhost/db",
+        "star colon": f"https://***:{sentinel}@dbhost/db",
+        "star slash": f"https://***/{sentinel}@dbhost/db",
+        "postgresql": f"postgresql:{user}:{sentinel}@dbhost",
+    }
+    if kind == "scheme":
+        return {**common,
+                "scheme user pass no slashes": f"postgresql:{user}:{sentinel}/dbhost/db",
+                "scheme pass": f"mysql:{sentinel}/dbhost",
+                "scheme pass bare": f"redis:{sentinel} dbhost"}
+    return {**common,
+            "percent url": f"https%3A%2F%2F{user}%3A{sentinel}%40dbhost%2Fdb",
+            "percent colon only": f"{user}%3A{sentinel}%2Fdbhost",
+            "double encoded": f"{user}%253A{sentinel}%2540dbhost",
+            "fullwidth delimiters": f"https：／／{user}：{sentinel}＠dbhost／db",
+            "fullwidth at only": f"{user}{sentinel}＠dbhost",
+            "password keyword": f"password={sentinel} host=dbhost",
+            "pwd keyword": f"pwd={sentinel};dbhost",
+            "user and pass colon": f"user={user} pass: {sentinel} dbhost",
+            "mixed": f"host=dbhost%2Fdb user%3D{user} ＰＡＳＳ＝{sentinel}"}
+
+
+class TestEncodedAndKeywordFormsFallBack8187R21(TestFallbackDecidedOnTheRawValue8187R20):
+    """r21 F39-b: ``printable`` NFKC-normalises and percent-decodes (bounded) before it decides, and any escape, non-ASCII
+    delimiter or credential keyword followed by ``=`` or ``:`` is a reason to fall back.  Every author-sourced site of
+    the r19 and r20 classes runs again, in both views, with the encoded, fullwidth, keyword and mixed shapes."""
+
+    KIND = "encoded"
+    USER = "f39user"
+    SENTINEL = "SENTINEL-F39-pw"
+
+    def shapes(self):
+        return r21_shapes(self.KIND, self.USER, self.SENTINEL)
+
+    def test_fold_decodes_a_bounded_number_of_passes_and_normalises_8187_f39b(self):
+        self.assertEqual(ty.fold("a%40b"), "a@b")
+        self.assertEqual(ty.fold("a%2540b"), "a@b")
+        self.assertEqual(ty.fold("a%253Ab"), "a:b")
+        self.assertEqual(ty.fold("a＠b"), "a@b")
+        self.assertEqual(ty.fold("a：b"), "a:b")
+        self.assertEqual(ty.fold("ＰＡＳＳ＝"), "PASS=")
+        self.assertNotEqual(ty.fold("a%25252540b"), "a@b", "the decode is bounded")
+        self.assertEqual(ty.printable("a%25252540b", "key[3]"), "key[3]")
+
+    def test_each_escape_delimiter_and_keyword_arm_falls_back_alone_8187_f39b(self):
+        for value in ("100%2F200", "a%3Ab", "a＠b", "a：b", "a／b", "password=x", "PWD =x", "pass: x",
+                      "user=x", "host=x", "Host : x", "secret=x", "token: x"):
+            with self.subTest(value=value):
+                self.assertEqual(ty.printable(value, "key[9]"), "key[9]")
+
+    def test_a_name_with_no_credential_form_is_still_printed_8187_f39b(self):
+        for value in ("Run the unit tests", "Build 100% of the crates", "Résumé build", "passphrase check",
+                      "compass heading", "hostile takeover"):
+            with self.subTest(value=value):
+                self.assertEqual(ty.printable(value, "key[9]"), value)
+
+    def test_the_decision_is_in_the_predicate_docstring_8187_f39b(self):
+        self.assertIn("fold", ty.printable.__doc__)
+        self.assertIn("credential keyword", ty.printable.__doc__)
+
+
+class TestBareSchemeFormsFallBack8187R21(TestEncodedAndKeywordFormsFallBack8187R21):
+    """r21 F39-c: a scheme-prefixed credential without ``//`` and without ``@`` (``postgresql:user:pass``, ``scheme:pass``)
+    is held back only by the ``SCHEME_FORM`` arm, so every author-sourced site runs with those shapes in both views."""
+
+    KIND = "scheme"
+    USER = "f39cuser"
+    SENTINEL = "SENTINEL-F39C-pw"
+
+    def test_the_bare_scheme_arm_alone_falls_back_8187_f39c(self):
+        for value in ("postgresql:f39cuser:SENTINEL-F39C-pw", "scheme:SENTINEL-F39C-pw", "redis:x"):
+            with self.subTest(value=value):
+                self.assertFalse(ty.PERCENT_ESCAPE.search(value) or ty.CREDENTIAL_KEYWORD.search(value), value)
+                self.assertTrue(ty.SCHEME_FORM.search(value))
+                self.assertEqual(ty.printable(value, "key[2]"), "key[2]")
+
+
+class TestPinSourcedEncodedFormsFallBack8187R21(TestEveryPinSourcedNameIsPrintable8187R20):
+    """r21 F39-a and F39-b: every pin-sourced site takes the encoded, fullwidth and keyword shapes, and the text view's
+    workflow-level block key (the :838 site) is printed by position."""
+
+    KIND = "encoded"
+    USER = "f39user"
+    SENTINEL = "SENTINEL-F39-pw"
+
+    def shapes(self):
+        return r21_shapes(self.KIND, self.USER, self.SENTINEL)
+
+    def test_a_pinned_workflow_level_block_key_is_printed_by_position_8187_f39a(self):
+        """Checker site ``the pinned workflow-level {key}: block is missing`` in the text view, on the 3 pinned workflows."""
+        checked = 0
+        for wf, text in self.texts.items():
+            for variant, key in self.shapes().items():
+                pins = self.pins()
+                pins[SECONDARY][wf].setdefault("workflow", {})[key] = {"sha256": "0" * 64}
+                with self.subTest(workflow=wf, shape=variant):
+                    checked += 1
+                    found = job_pin_problems(wf, text, pins[SECONDARY])
+                    self.assert_clean(found, "text", r"the pinned workflow-level " + self.LABEL + r": block is missing")
+        self.assertEqual(checked, 3 * len(self.shapes()))
+
+
+class TestPinSourcedBareSchemeFormsFallBack8187R21(TestPinSourcedEncodedFormsFallBack8187R21):
+    """r21 F39-c on the pin-sourced sites: the bare scheme-prefixed shapes."""
+
+    KIND = "scheme"
+    USER = "f39cuser"
+    SENTINEL = "SENTINEL-F39C-pw"
 
 
 if __name__ == "__main__":
