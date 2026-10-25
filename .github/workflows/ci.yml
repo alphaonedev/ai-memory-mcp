@@ -1710,6 +1710,8 @@ jobs:
             else
               SHARD_BUDGET="$(cap_to_job_left "$WATCHDOG_SECS")"
             fi
+            # #7343: the budget this shard ran under, for the ratchet after the join.
+            echo "$SHARD_BUDGET" > "$sd/$name.budget"
             while IFS= read -r l; do
               [ -n "$l" ] || continue
               if [ "$l" = "--lib" ]; then
@@ -1782,7 +1784,7 @@ jobs:
           run_sharded() {
             local label="$1" with_doc="$2"; shift 2
             local sd="${RUNNER_TEMP:-$PWD/.local-runs}/ci-shard"
-            local job_now job_elapsed pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc=0 n
+            local job_now job_elapsed pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc_r=0 rc=0 n
             rm -rf "$sd"; mkdir -p "$sd"
             echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
             cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
@@ -1804,6 +1806,11 @@ jobs:
               if [ "$SERIAL_BUDGET_SECS" -lt 60 ]; then SERIAL_BUDGET_SECS=60; fi
             fi
             echo "::notice::[#6795] serial shard budget ${SERIAL_BUDGET_SECS}s (job cap ${JOB_TIMEOUT_MIN} min - ${job_elapsed}s elapsed since job start - 300s safety); parallel shards min(${WATCHDOG_SECS}s, job time left)"
+            # #7343: fail at partition time, naming the shard, estimate and budget,
+            # when a shard cannot fit its budget (run 39063295132 spent 4099 s and was
+            # killed on a 6274 s estimate). The #1492 watchdog below is unchanged.
+            PARALLEL_BUDGET_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
+            python3 scripts/ci/shard_budget.py gate --manifest "$sd/manifest.json" --budget serial="$SERIAL_BUDGET_SECS" --budget parallel_1="$PARALLEL_BUDGET_SECS" --budget parallel_2="$PARALLEL_BUDGET_SECS" || return "$?"
             ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
             pid_s=$!
             ( run_shard parallel_1 "$sd" 3 skip 0 ) > "$sd/parallel_1.log" 2>&1 &
@@ -1821,6 +1828,8 @@ jobs:
             wait "$pid_2" || rc_2=$?
             kill "$hb" 2>/dev/null || true
             wait "$hb" 2>/dev/null || true
+            # #7343 ratchet: a green shard above 85% of its budget warns, above 95% fails.
+            python3 scripts/ci/shard_budget.py ratchet --dir "$sd" --rc serial="$rc_s" --rc parallel_1="$rc_1" --rc parallel_2="$rc_2" || rc_r=$?
             for n in serial parallel_1 parallel_2; do
               echo "::group::[#6344] ${n} shard output"
               cat "$sd/$n.log"
@@ -1830,6 +1839,7 @@ jobs:
             for n in "$rc_s" "$rc_1" "$rc_2"; do
               if [ "$n" -ne 0 ]; then rc="$n"; fi
             done
+            if [ "$rc" -eq 0 ] && [ "$rc_r" -ne 0 ]; then rc="$rc_r"; fi
             if [ "$rc" -ne 0 ]; then
               echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the shard output groups above"
             fi
@@ -1911,6 +1921,7 @@ jobs:
           path: |
             ${{ runner.temp }}/ci-shard/*.log
             ${{ runner.temp }}/ci-shard/*.txt
+            ${{ runner.temp }}/ci-shard/*.budget
             ${{ runner.temp }}/ci-shard/manifest.json
           if-no-files-found: ignore
           retention-days: 30

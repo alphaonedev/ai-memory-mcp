@@ -91,19 +91,19 @@ class ClassifyTests(Base):
         self.assertEqual((e.cls, e.shared), ('b', []))
 
     def test_postgres_tokens_are_a(self):
-        for i, tok in enumerate(['AI_MEMORY_TEST_POSTGRES_URL', 'sqlx::query', 'PgPool',
-                                 '#[cfg(feature = "sal-postgres")]', 'PostgresStore',
-                                 'common::lane_db::x']):
-            self.assertEqual(self.cls('pg%d' % i, 'use %s;' % tok if 'cfg' not in tok else tok).cls, 'a', tok)
+        # Use tokens only (#7343): the type and cfg-gate mentions are class (b)
+        # and are pinned in test_serial_moves_7343.py.
+        for i, tok in enumerate(['AI_MEMORY_TEST_POSTGRES_URL', 'AI_MEMORY_TEST_AGE_URL',
+                                 'common::postgres_env::x', 'common::lane_db::x']):
+            self.assertEqual(self.cls('pg%d' % i, 'use %s;' % tok).cls, 'a', tok)
 
     def test_serial_is_a(self):
         self.assertEqual(self.cls('ser', '#[serial]\nfn t() {}').cls, 'a')
         self.assertEqual(self.cls('ser2', 'use serial_test::serial;').cls, 'a')
 
-    def test_federat_name_is_a(self):
+    def test_federat_name_alone_is_b_7343(self):
         e = self.cls('federation_scale', 'fn x() {}')
-        self.assertEqual(e.cls, 'a')
-        self.assertIn('name:federat', e.reasons)
+        self.assertEqual((e.cls, e.moved), ('b', ['name-federat-only']))
 
     def test_unknown_source_is_a(self):
         e = pt.Exe('test', 'ghost', str(SCRATCH / 'tests' / 'ghost.rs'), '/x/ghost')
@@ -152,13 +152,13 @@ class PartitionTests(Base):
         return w
 
     def test_disjoint_and_complete(self):
-        exes = self.build({'a1': 'PgPool', 'b1': '', 'b2': '', 'b3': '', 'federation_x': ''})
+        exes = self.build({'a1': 'postgres_env', 'b1': '', 'b2': '', 'b3': '', 'federation_x': ''})
         serial, h1, h2, has_lib, totals, _ = pt.partition(
             exes, self.weights(a1=1, b1=40, b2=30, b3=20, federation_x=2), ['store::postgres'])
         pt.write_lists(SCRATCH / 'out', serial, h1, h2, has_lib)
         pt.verify_written(SCRATCH / 'out', exes)
-        self.assertEqual({e.name for e in serial}, {'a1', 'federation_x'})
-        self.assertEqual({e.name for e in h1} | {e.name for e in h2}, {'b1', 'b2', 'b3'})
+        self.assertEqual({e.name for e in serial}, {'a1'})
+        self.assertEqual({e.name for e in h1} | {e.name for e in h2}, {'b1', 'b2', 'b3', 'federation_x'})
         self.assertTrue((SCRATCH / 'out' / 'serial.txt').read_text().startswith('--lib\n'))
         self.assertTrue((SCRATCH / 'out' / 'parallel_1.txt').read_text().startswith('--lib\n'))
         self.assertNotIn('--lib', (SCRATCH / 'out' / 'parallel_2.txt').read_text())
@@ -183,7 +183,7 @@ class PartitionTests(Base):
         self.assertLessEqual({'p1', 'p2', 'p3'}, halves[homes[0]])
 
     def test_unmeasured_uses_class_mean(self):
-        exes = self.build({'b1': '', 'new_b': '', 'a1': 'PgPool', 'new_a': '#[serial]'})
+        exes = self.build({'b1': '', 'new_b': '', 'a1': 'postgres_env', 'new_a': '#[serial]'})
         _, _, _, _, totals, means = pt.partition(exes, self.weights(b1=10, a1=30), [])
         self.assertEqual(means, {'a': 30.0, 'b': 10.0})
         self.assertAlmostEqual(totals['serial'], 5.0 + 30.0 + 30.0)
@@ -704,7 +704,7 @@ class LibMacroCaller6425(Base):
 class DocEstimateTests6344B6(Base):
     def test_doc_tests_are_in_the_serial_estimate_6344(self):
         exes = pt.parse_build_json([artifact(['lib'], 'ai_memory', SCRATCH / 'src' / 'lib.rs', '/x/lib'),
-                                    artifact(['test'], 'a1', fx('tests/a1.rs', 'PgPool'))])
+                                    artifact(['test'], 'a1', fx('tests/a1.rs', 'postgres_env'))])
         w = {'lib:pg': 5.0, 'lib:nonpg': 10.0, 'doc:tests': 16.0, 'test:a1': 2.0}
         self.assertEqual(pt.partition(exes, w, ['x'], with_doc=True)[4]['serial'], 23.0)
         self.assertEqual(pt.partition(exes, w, ['x'], with_doc=False)[4]['serial'], 7.0)
