@@ -112,8 +112,8 @@ def _agent_on(module: _Module, ordinal: int) -> SwarmAgent:
 
 def _two_module_swarm(*, leaky: bool = False) -> tuple[SimpleNamespace, _Module, _Module]:
     """Agents round-robined across two modules, exactly as the launcher does."""
-    second = _Module("http://mod-b")
-    first = _Module("http://mod-a", leaks_to=second if leaky else None)
+    second = _Module("https://mod-b")
+    first = _Module("https://mod-a", leaks_to=second if leaky else None)
     agents = [_agent_on(first if ordinal % 2 == 0 else second, ordinal)
               for ordinal in range(6)]
     swarm = SimpleNamespace(agents=agents, coverage=CoverageTracker(),
@@ -129,8 +129,8 @@ async def _aclose(swarm: SimpleNamespace) -> None:
 def test_modules_groups_agents_by_client_base_url() -> None:
     swarm, first, second = _two_module_swarm()
     grouped = modules(swarm)
-    assert sorted(grouped) == ["http://mod-a", "http://mod-b"]
-    assert [module_of(agent) for agent in grouped["http://mod-a"]] == ["http://mod-a"] * 3
+    assert sorted(grouped) == ["https://mod-a", "https://mod-b"]
+    assert [module_of(agent) for agent in grouped["https://mod-a"]] == ["https://mod-a"] * 3
     # Round-robin really does split agent 0 from agent 1 (the #3441 failure).
     assert module_of(swarm.agents[0]) != module_of(swarm.agents[1])
 
@@ -139,12 +139,12 @@ def test_modules_groups_agents_by_client_base_url() -> None:
 async def test_producer_consumer_is_module_local() -> None:
     swarm, first, second = _two_module_swarm()
     try:
-        agents = modules(swarm)["http://mod-a"]
-        result = await producer_consumer(swarm, agents, "http://mod-a")
+        agents = modules(swarm)["https://mod-a"]
+        result = await producer_consumer(swarm, agents, "https://mod-a")
     finally:
         await _aclose(swarm)
     assert result.ok, result.detail
-    assert result.name == "producer_consumer@http://mod-a"
+    assert result.name == "producer_consumer@https://mod-a"
     assert "b_saw=True" in result.detail and "c_isolated=True" in result.detail
     # Every call stayed on one tier; the other module was never touched.
     assert second.requests == []
@@ -179,11 +179,11 @@ async def test_consensus_quorum_across_modules_cannot_read_its_own_votes() -> No
 async def test_consensus_quorum_votes_and_consolidates_on_one_module() -> None:
     swarm, first, second = _two_module_swarm()
     try:
-        result = await consensus_quorum(swarm, modules(swarm)["http://mod-b"], "http://mod-b")
+        result = await consensus_quorum(swarm, modules(swarm)["https://mod-b"], "https://mod-b")
     finally:
         await _aclose(swarm)
     assert result.ok, result.detail
-    assert result.name == "consensus_quorum@http://mod-b"
+    assert result.name == "consensus_quorum@https://mod-b"
     assert "votes=3" in result.detail
     # The consolidator only ever saw ids minted by its own module.
     assert first.requests == []
@@ -199,8 +199,8 @@ async def test_run_all_runs_every_scenario_once_per_module() -> None:
     names = [result.name for result in results]
     for scenario in ("producer_consumer", "consensus_quorum", "governance_approval",
                      "full_surface_sweep"):
-        assert f"{scenario}@http://mod-a" in names
-        assert f"{scenario}@http://mod-b" in names
+        assert f"{scenario}@https://mod-a" in names
+        assert f"{scenario}@https://mod-b" in names
         # No un-tagged (cross-module) variant is run any more.
         assert scenario not in names
     assert "cross_module_handoff" in names
@@ -211,7 +211,7 @@ async def test_run_all_runs_every_scenario_once_per_module() -> None:
 
 @pytest.mark.asyncio
 async def test_single_module_run_is_unchanged() -> None:
-    only = _Module("http://mod-a")
+    only = _Module("https://mod-a")
     agents = [_agent_on(only, ordinal) for ordinal in range(3)]
     swarm = SimpleNamespace(agents=agents, coverage=CoverageTracker(),
                             shared_namespace="swarm-shared")
@@ -279,7 +279,7 @@ def test_federation_flag_is_opt_in_and_explicit() -> None:
 
 @pytest.mark.asyncio
 async def test_cross_module_handoff_is_not_applicable_on_one_module() -> None:
-    only = _Module("http://mod-a")
+    only = _Module("https://mod-a")
     agents = [_agent_on(only, ordinal) for ordinal in range(2)]
     swarm = SimpleNamespace(agents=agents, coverage=CoverageTracker(),
                             shared_namespace="swarm-shared")

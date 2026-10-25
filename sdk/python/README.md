@@ -145,7 +145,10 @@ Refused with `ValueError` (#3840, #6267, #6268, #6269):
   `TLSv1_1` or lower, or a `maximum_version` below `TLSv1_2` (#8195). The
   library default (`MINIMUM_SUPPORTED`) is accepted; the SDK then refuses any
   connection that negotiated less than TLS 1.2. The context the SDK builds from
-  a CA path sets `minimum_version = TLSv1_2` itself.
+  a CA path, and the default-trust context it builds for `verify=None` and
+  `verify=True`, set `minimum_version = TLSv1_2` themselves.
+- A base URL whose scheme is not `https`, loopback included: the API key is
+  never sent in plaintext (#3824).
 - Any `ssl.SSLContext` subclass, including `truststore.SSLContext`: such an
   object keeps its real verification state elsewhere, so the SDK cannot prove
   it verifies. Use `ssl.create_default_context(cafile=...)` or pass the CA path.

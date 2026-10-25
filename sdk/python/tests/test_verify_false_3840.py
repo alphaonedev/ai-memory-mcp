@@ -362,11 +362,12 @@ def test_funnel_refuses_falsy_non_bool_verify(verify: object) -> None:
 
 @pytest.mark.parametrize("verify", [None, True])
 def test_funnel_admits_none_and_true(verify: object) -> None:
-    kwargs = _kwargs(verify)
-    if verify is None:
-        assert "verify" not in kwargs
-    else:
-        assert kwargs["verify"] is True
+    # #8195 sec r2 F1: the SDK forwards a context it built on the pinned builder (TLS 1.2
+    # minimum), never httpx's own default and never the bare ``True`` / omitted kwarg.
+    forwarded = _kwargs(verify)["verify"]
+    assert isinstance(forwarded, ssl.SSLContext)
+    assert _effective(forwarded) == (ssl.CERT_REQUIRED, True)
+    assert ssl.SSLContext.minimum_version.__get__(forwarded) >= ssl.TLSVersion.TLSv1_2
 
 
 def test_funnel_forwards_a_context_the_sdk_built_from_the_ca_path() -> None:

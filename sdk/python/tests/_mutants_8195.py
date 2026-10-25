@@ -43,6 +43,8 @@ ACL = "tests/test_acl_6934.py"
 ACL_FC = "tests/test_acl_failclosed_7050.py"
 WAKE_T = "tests/test_wake_bundle_typed_6936.py"
 CI_T = "tests/test_ci_install_6688.py"
+TRUST = "tests/test_default_trust_8195_r3.py"
+RUNNER_T = "tests/test_run_mutants_8195.py"
 DOCS_T = "tests/test_docs_truth_6689.py"
 CLIENT_T = "tests/test_client.py"
 WAKE_C = "tests/test_wake_client.py"
@@ -51,7 +53,7 @@ ATTEST = "tests/test_attestation_keyfile_3784.py"
 #: Every test file a mutant may be killed by; the runner executes all of them per row.
 KILLER_TESTS = (
     FLOOR, SESSION, VERIFY, CAPATH7, CAPATH8, OWNED_T, OWNED_R, ACL, ACL_FC, WAKE_T,
-    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST,
+    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST,
 )
 
 
@@ -104,7 +106,7 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant("S11", "session hostname check removed", COMMON,
            "    if not _peer_matches_host(peer, host, context):", "    if False:"),
     Mutant("C11", "session gate not installed", COMMON,
-           '    context = kwargs.get("verify")\n    if not (isinstance(context, ssl.SSLContext) and context is verify):\n        return',
+           '    context = kwargs.get("verify")\n    sdk_built = verify is None or verify is True  # the SDK built this context itself (#8195)\n    if not (isinstance(context, ssl.SSLContext) and (context is verify or sdk_built)):\n        return',
            '    return\n    context = kwargs.get("verify")'),
     Mutant("S12/C24", "CA walk: symlink holder skipped", COMMON,
            "        _refuse_untrusted_holder(path, resolved, candidate, info)\n        if not stat.S_ISLNK(info.st_mode):",
@@ -149,7 +151,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant("C21", "trailing-slash leg removed", COMMON,
            "    if path.endswith(_PATH_SEPARATORS) and not stat.S_ISDIR(mode):", "    if False:"),
     Mutant("C22", "SSL_CERT_* env not read at construction", COMMON,
-           "        return verify if from_env is None else from_env", "        return verify"),
+           "        return _default_trust_context() if from_env is None else from_env",
+           "        return _default_trust_context()"),
     Mutant("C23", "missing component skips holder rule", COMMON,
            "        except OSError:\n            _refuse_untrusted_holder(path, resolved, candidate, None)",
            "        except OSError:\n            pass"),
@@ -240,4 +243,20 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant("R2", "session gate: missing version() admitted", COMMON,
            "    if version is None or version() not in _MODERN_TLS_NAMES:",
            "    if version is not None and version() not in _MODERN_TLS_NAMES:"),
+    Mutant("R3", "default trust built without the floor", COMMON,
+           "    context = _pinned_base_context()\n    try:\n        context.load_verify_locations(cafile=certifi.where())",
+           "    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n    context.verify_mode = ssl.CERT_REQUIRED\n"
+           "    context.check_hostname = True\n    try:\n        context.load_verify_locations(cafile=certifi.where())",
+           killers=(TRUST,)),
+    Mutant("R3", "default trust: request hooks not installed", COMMON,
+           "    if checked is verify or verify is None or verify is True:", "    if checked is verify:",
+           killers=(TRUST,)),
+    Mutant("R3", "default trust: session gate not installed", COMMON,
+           "    sdk_built = verify is None or verify is True  # the SDK built this context itself (#8195)",
+           "    sdk_built = False  # the SDK built this context itself (#8195)",
+           killers=(TRUST,)),
+    Mutant("R3", "non-https base URL admitted", COMMON,
+           '    if scheme != "https":', "    if False:", killers=(TRUST,)),
+    Mutant("R3", "base URL check skipped", COMMON,
+           "    _require_https(base_url)\n", "", killers=(TRUST,)),
 )

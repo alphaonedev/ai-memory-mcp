@@ -129,6 +129,16 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
   negotiated protocol is not TLS 1.2 or 1.3.
   decision: MINIMUM_SUPPORTED admitted at construction (library default) over refused because the Ubuntu distro
   default context reports it and the session gate refuses any negotiated version below TLS 1.2.
+- #8195 (sec r2 F1): the TLS 1.2 minimum also holds for `verify=None` and `verify=True`. Both used to hand httpx its
+  own default context, with no minimum, no request hooks and no session gate; on a host whose OpenSSL policy permits
+  TLS 1.1 the request and its API key went out over TLS 1.1. The SDK now builds the default (certifi) context on the
+  same builder, sets `minimum_version = TLSv1_2`, and installs the request hooks and the session gate on it exactly as
+  for a caller context, sync and async.
+- #8195 (sec r2 F2): a base URL whose scheme is not `https` is refused at construction in both clients, with a typed
+  `ValueError` that names the scheme and never the key, host or userinfo. README ("Base URLs are `https://` even for
+  `localhost`") and the in-transit standard #3824 grant no loopback exception.
+  decision: refuse every non-https base URL at construction over a warning or a loopback exception because
+  README:26-29 and the #3824 in-transit standard already promise https even for localhost.
 - #6377: `verify=<CA path>` is read once, at construction. For a directory, only the hashed entries OpenSSL's own
   `capath` lookup reads (`<hash>.<n>`, `<hash>.r<n>`) are loaded. A group- or world-writable directory, file, symlink
   target or target directory is refused (POSIX). An empty directory gives a context with no trust anchor, which fails

@@ -63,7 +63,7 @@ async def test_full_surface_sweep_dispatches_order_and_confines_forget() -> None
 
     await agent.client._client.aclose()  # noqa: SLF001
     agent.client._client = httpx.AsyncClient(  # noqa: SLF001
-        base_url="http://mock", transport=httpx.MockTransport(handler)
+        base_url="https://mock", transport=httpx.MockTransport(handler)
     )
     swarm = SimpleNamespace(agents=[agent], coverage=CoverageTracker())
     try:

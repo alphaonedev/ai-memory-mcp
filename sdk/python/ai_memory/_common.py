@@ -25,7 +25,7 @@ import sys
 import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel
@@ -683,12 +683,35 @@ def _context_from_env() -> ssl.SSLContext | None:
     return None
 
 
-def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
+def _default_trust_context() -> ssl.SSLContext:
+    """The context ``verify=None`` / ``True`` uses when no env trust is set (sec r2 F1).
+
+    httpx would build its own default context from certifi with no TLS minimum. This
+    builds the same trust (certifi) on the pinned builder, so ``MINIMUM_TLS_VERSION``
+    applies, and the caller of :func:`build_httpx_kwargs` hooks and gates it like any
+    other checked context.
+    """
+    import certifi
+
+    context = _pinned_base_context()
+    try:
+        context.load_verify_locations(cafile=certifi.where())
+    except (OSError, ssl.SSLError):
+        raise ValueError(
+            "the default CA bundle (certifi) could not be loaded; pass verify=<CA path> "
+            "or reinstall certifi (#8195)."
+        ) from None
+    return context
+
+
+def _checked_verify(verify: object) -> ssl.SSLContext:
     """Return the ONLY value ``build_httpx_kwargs`` may forward, or raise (#3840).
 
-    Forwarded to httpx: ``None`` (httpx default trust, kwarg omitted) and
-    ``True`` when no ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` is set, else the
-    context :func:`_context_from_env` builds from that variable (#6538),
+    Forwarded to httpx: for ``None`` and ``True`` the context
+    :func:`_context_from_env` builds from ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``
+    (#6538), else the certifi context :func:`_default_trust_context` builds on
+    the pinned builder, so the TLS 1.2 minimum holds for the default trust too
+    (#8195),
     a caller context that passes :func:`_context_verifies` (exactly
     ``ssl.SSLContext``), or a context this SDK builds itself from the resolved
     absolute path of an existing CA file or directory (``str`` or
@@ -700,7 +723,7 @@ def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
     """
     if verify is None or verify is True:
         from_env = _context_from_env()
-        return verify if from_env is None else from_env
+        return _default_trust_context() if from_env is None else from_env
     if isinstance(verify, ssl.SSLContext):
         if _context_verifies(verify):
             return verify
@@ -1120,7 +1143,8 @@ def gate_transports(
     socket (#6693).
     """
     context = kwargs.get("verify")
-    if not (isinstance(context, ssl.SSLContext) and context is verify):
+    sdk_built = verify is None or verify is True  # the SDK built this context itself (#8195)
+    if not (isinstance(context, ssl.SSLContext) and (context is verify or sdk_built)):
         return
     is_async = isinstance(client, httpx.AsyncClient)
     base: type = httpx.AsyncBaseTransport if is_async else httpx.BaseTransport
@@ -1201,6 +1225,25 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
     return {"request": [_request], "response": [_response]}
 
 
+def _require_https(base_url: object) -> None:
+    """Refuse every non-https base URL before anything is sent (sec r2 F2, #3824).
+
+    The in-transit standard and ``README`` ("Base URLs are ``https://`` even for
+    ``localhost``") promise https for every daemon, loopback included, so there is no
+    loopback exception. Only the scheme is named: never the key, the host or any
+    userinfo the URL carries.
+    """
+    try:
+        scheme = urlsplit(base_url).scheme.lower() if isinstance(base_url, str) else ""
+    except ValueError:
+        scheme = ""
+    if scheme != "https":
+        raise ValueError(
+            f"base_url scheme {scheme or '(none)'!r} refused: the SDK sends the API key only over "
+            "https, loopback included (#3824). Use an https:// base URL."
+        )
+
+
 def build_httpx_kwargs(
     *,
     base_url: str,
@@ -1272,10 +1315,10 @@ def build_httpx_kwargs(
     # for `""` too), and a caller-supplied `ssl.SSLContext` is used as given.
     # Only the value `_checked_verify` returns is forwarded (#6248), and a
     # caller-held context is re-checked on every request (#6249).
+    _require_https(base_url)
     checked = _checked_verify(verify)
-    if checked is not None:
-        kwargs["verify"] = checked
-    if isinstance(checked, ssl.SSLContext) and checked is verify:
+    kwargs["verify"] = checked
+    if checked is verify or verify is None or verify is True:
         kwargs["event_hooks"] = _request_hooks(checked, is_async=is_async)
     if cert is not None:
         kwargs["cert"] = cert
