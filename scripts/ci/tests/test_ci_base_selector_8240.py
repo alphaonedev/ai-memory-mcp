@@ -737,37 +737,155 @@ class TrustDecisionFirst(unittest.TestCase):
 
     JOBS = ((SELECT_JOB, MATERIALISE_STEP), (GATE_JOB, GATE_MATERIALISE_STEP))
     CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-    CHECKOUT_FILE_RE = re.compile(
-        r"scripts/|\.github/|GITHUB_PATH|GITHUB_ENV|\bpython3?\b|\bbash\b|\bsource\b"
-        r"|(^|\s)\./|\bPATH=")
     NAMED_EXCEPTIONS = (BOOTSTRAP_STEP, BRANCH_TIP_STEP)
 
-    def steps_before(self, job, stop):
-        steps = workflow_text.read_steps(CI_YML, job)
+    # F4 / S16: an ALLOW-LIST of the steps that may run before the first step
+    # that executes checkout content after the fold. Anything not listed here
+    # (a `run:`, another `uses:`, a `shell:` or `working-directory:` override,
+    # an `env:` key that alters shell start-up) is red until it is allow-listed.
+    # decision: an allow-list of pre-trust steps and an explicit grafts,
+    # replace, shallow and alternates refusal over a forbid-list and a comment
+    # because every git state the runner can carry into the derivation is
+    # refused by name and any new pre-trust step is red until it is allow-listed
+    CHECKOUT_USES = CHECKOUT + " # v4"
+    ECHO_RUN = 'echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"'
+    INDEX_RUN = ('python3 -I "$RUNNER_TEMP/impact-base/impact/build_index.py"'
+                 ' --repo . --db "$RUNNER_TEMP/impact.db"')
+    BASE_FOLD_RUN = ('python3 -I "$RUNNER_TEMP/impact-base/impact/gate.py"'
+                     ' --needs "$NEEDS_JSON" \\\n  --github-ref "$GITHUB_REF_NAME_FULL"\n')
+    FORBIDDEN_ENV_RE = re.compile(
+        r"^(BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PATH|LD_PRELOAD|LD_LIBRARY_PATH|GIT_.*|PYTHON.*"
+        r"|NODE_OPTIONS|RUNNER_TEMP|GITHUB_(PATH|ENV|OUTPUT))$")
+    HEREDOC = object()
+    # (name, exact top-level keys, exact env keys, exact `with:` mapping, exact run text)
+    SELECT_ALLOW = (
+        (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
+        ("Selection mode", {"name", "id", "env", "run"}, {"ENFORCE"}, None, ECHO_RUN),
+        (MATERIALISE_STEP, {"name", "id", "env", "run"},
+         {"CONTEXT_SHA", "EVENT_NAME", "HEAD_SHA", "MERGE_GROUP_BASE_SHA", "IMPACT_FILES"},
+         None, HEREDOC),
+        ("Build impact index", {"name", "if", "continue-on-error", "run"}, set(), None,
+         INDEX_RUN),
+    )
+    GATE_ALLOW = (
+        (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
+        (GATE_MATERIALISE_STEP, {"name", "id", "if", "env", "run"},
+         {"CONTEXT_SHA", "EVENT_NAME", "HEAD_SHA", "MERGE_GROUP_BASE_SHA", "IMPACT_FILES"},
+         None, HEREDOC),
+        (BASE_GATE_STEP, {"name", "if", "env", "run"}, {"NEEDS_JSON", "GITHUB_REF_NAME_FULL"},
+         None, BASE_FOLD_RUN),
+    )
+    # job -> (allow-list, first step that may execute checkout content)
+    WINDOWS = {SELECT_JOB: (SELECT_ALLOW, "Select jobs"),
+               GATE_JOB: (GATE_ALLOW, BOOTSTRAP_STEP)}
+
+    RAW_KEY_RE = re.compile(r"^(?: {6}- | {8})([A-Za-z0-9_-]+):[ \t]*(.*)$")
+    RAW_SUB_RE = re.compile(r"^ {10}([A-Za-z0-9_.-]+):[ \t]*(.*)$")
+
+    def raw_steps(self, job):
+        """Every step of `job` with ALL its top-level keys and its env/with mappings."""
+        steps = []
+        in_job = in_steps = False
+        current = None
+        for line in CI_YML.read_text().split("\n"):
+            job_match = workflow_text.JOB_ID_RE.match(line)
+            if job_match:
+                in_job, in_steps = job_match.group(1) == job, False
+                continue
+            if not in_job:
+                continue
+            if line == "    steps:":
+                in_steps = True
+                continue
+            if not in_steps:
+                continue
+            if line.startswith("      - "):
+                steps.append({"keys": {}, "env": {}, "with": {}})
+                current = None
+            elif not steps:
+                continue
+            key = self.RAW_KEY_RE.match(line)
+            if key:
+                current = key.group(1)
+                steps[-1]["keys"][current] = key.group(2).strip()
+                continue
+            sub = self.RAW_SUB_RE.match(line)
+            if sub and current in ("env", "with"):
+                steps[-1][current][sub.group(1)] = sub.group(2).strip()
+        parsed = workflow_text.read_steps(CI_YML, job)
+        self.assertEqual(len(parsed), len(steps), job)
+        for raw, step in zip(steps, parsed):
+            raw["name"], raw["run"] = step["name"], step["run"]
+        return steps
+
+    def window(self, job):
+        steps = self.raw_steps(job)
         names = [s["name"] for s in steps]
-        return steps[:names.index(stop)]
+        return steps[:names.index(self.WINDOWS[job][1])]
 
-    def assert_runs_no_checkout_file(self, step):
-        if step["uses"]:
-            self.assertTrue(step["uses"].startswith(self.CHECKOUT), step["uses"])
+    def assert_step_allowed(self, step, entry):
+        name, keys, env_keys, with_map, run = entry
+        self.assertEqual(step["name"], name)
+        self.assertEqual(set(step["keys"]), keys, "step %r keys" % name)
+        self.assertEqual(set(step["env"]), env_keys, "step %r env" % name)
+        for env_key in step["env"]:
+            self.assertIsNone(self.FORBIDDEN_ENV_RE.match(env_key),
+                              "step %r sets %s" % (name, env_key))
+        for banned in ("shell", "working-directory", "submodules", "path", "ref",
+                       "repository", "persist-credentials"):
+            self.assertNotIn(banned, step["keys"])
+            self.assertNotIn(banned, step["with"])
+        if name is None:
+            self.assertEqual(step["keys"]["uses"], self.CHECKOUT_USES)
+            self.assertEqual(step["with"], with_map)
+            self.assertIsNone(step["run"])
             return
-        self.assertIsNone(self.CHECKOUT_FILE_RE.search(step["run"] or ""),
-                          "step %r may execute a checkout file" % step["name"])
+        self.assertNotIn("uses", step["keys"])
+        if run is self.HEREDOC:
+            self.assertIsNotNone(HEREDOC_RE.match(step["run"] or ""), name)
+        else:
+            self.assertEqual(step["run"], run, name)
 
-    def test_no_step_before_the_materialise_step_executes_a_checkout_file(self):
-        for job, stop in self.JOBS:
-            before = self.steps_before(job, stop)
-            self.assertTrue(before, job)
-            for step in before:
-                with self.subTest(job=job, step=step["name"]):
-                    self.assert_runs_no_checkout_file(step)
+    def test_the_pre_trust_window_is_an_exact_allow_list_of_steps(self):
+        for job in (SELECT_JOB, GATE_JOB):
+            allow = self.WINDOWS[job][0]
+            steps = self.window(job)
+            with self.subTest(job=job):
+                self.assertEqual([s["name"] for s in steps], [a[0] for a in allow])
+            for step, entry in zip(steps, allow):
+                with self.subTest(job=job, step=entry[0]):
+                    self.assert_step_allowed(step, entry)
 
     def test_the_only_action_before_the_trust_decision_is_the_pinned_checkout(self):
-        for job, stop in self.JOBS:
-            uses = [s["uses"] for s in self.steps_before(job, stop) if s["uses"]]
+        for job in (SELECT_JOB, GATE_JOB):
+            uses = [s["keys"]["uses"] for s in self.window(job) if "uses" in s["keys"]]
             with self.subTest(job=job):
-                self.assertEqual(len(uses), 1, uses)
-                self.assertTrue(uses[0].startswith(self.CHECKOUT))
+                self.assertEqual(uses, [self.CHECKOUT_USES])
+
+    def test_no_job_level_override_can_alter_the_shell_or_the_start_up_env(self):
+        """S16: shell, working-directory, defaults and poisoned env anywhere in either job."""
+        for job in (SELECT_JOB, GATE_JOB):
+            for step in self.raw_steps(job):
+                with self.subTest(job=job, step=step["name"]):
+                    self.assertNotIn("shell", step["keys"])
+                    self.assertNotIn("working-directory", step["keys"])
+                    for env_key in step["env"]:
+                        self.assertIsNone(self.FORBIDDEN_ENV_RE.match(env_key), env_key)
+            block = []
+            in_job = False
+            for line in CI_YML.read_text().split("\n"):
+                job_match = workflow_text.JOB_ID_RE.match(line)
+                if job_match:
+                    in_job = job_match.group(1) == job
+                    continue
+                if in_job:
+                    block.append(line)
+            with self.subTest(job=job, scope="job"):
+                text = "\n".join(block)
+                self.assertIsNone(re.search(r"^\s*(shell|working-directory|defaults):", text, re.M))
+                for line in text.split("\n"):
+                    if re.match(r"^ {6}[A-Z_]+:", line):
+                        self.assertIsNone(self.FORBIDDEN_ENV_RE.match(line.strip().split(":")[0]))
 
     def test_no_step_runs_before_the_fold_on_a_live_event_except_the_decision(self):
         """Every step that runs on pull_request or merge_group ahead of the first fold."""
@@ -777,10 +895,9 @@ class TrustDecisionFirst(unittest.TestCase):
                 first_fold = min(i for i, n in enumerate(names)
                                  if (n or "").startswith(("Fold job results", "Fail the gate")))
                 for step in ran[:first_fold]:
-                    if step["name"] == GATE_MATERIALISE_STEP:
-                        continue
                     with self.subTest(event=event, outputs=outputs, step=step["name"]):
-                        self.assert_runs_no_checkout_file(step)
+                        allowed = [entry[0] for entry in self.GATE_ALLOW]
+                        self.assertIn(step["name"], allowed)
 
     def test_the_resolver_is_wired_into_no_step_of_either_job(self):
         for job in (SELECT_JOB, GATE_JOB):
@@ -837,6 +954,30 @@ class TrustDecisionFirst(unittest.TestCase):
             for step in workflow_text.read_steps(CI_YML, job):
                 with self.subTest(job=job, step=step["name"]):
                     self.assertNotIn("${{", step["run"] or "")
+
+    LIBRARY_NOTE = ("base_sha.py is a library kept for the unit tests that pin its behaviour;"
+                    " no workflow step runs it.")
+    SELECT_ORDER_NOTE = ("Only the pinned checkout action and the echo-only Selection mode"
+                         " step run before this step;")
+    GATE_ORDER_NOTE = "Only the pinned checkout action runs before this step;"
+
+    def test_no_run_line_of_any_workflow_invokes_base_sha_py(self):
+        """F5: the resolver is a library; a `run:` line (or any non-comment line) naming it is red."""
+        for name in PR_WORKFLOWS:
+            for number, line in enumerate((WORKFLOW_DIR / name).read_text().split("\n"), 1):
+                with self.subTest(workflow=name, line=number):
+                    if not line.lstrip().startswith("#"):
+                        self.assertNotIn("base_sha.py", line)
+
+    def test_the_comments_and_the_docstring_state_the_step_order_as_it_is(self):
+        text = CI_YML.read_text()
+        self.assertEqual(text.count(self.LIBRARY_NOTE), 2)
+        self.assertEqual(text.count(self.SELECT_ORDER_NOTE), 1)
+        self.assertEqual(text.count(self.GATE_ORDER_NOTE), 1)
+        doc = (fx.IMPACT_DIR / "base_sha.py").read_text().split('"""')[1]
+        self.assertNotIn("run this one script", doc)
+        self.assertIn("library", doc)
+        self.assertIn("no workflow step runs it", " ".join(doc.split()))
 
     def test_the_stale_chain_push_wording_is_gone_from_the_workflow(self):
         text = CI_YML.read_text()
@@ -1036,7 +1177,7 @@ class DerivedBase(BaseCase):
     def hostile_replace(self, real, forged):
         fx.git(self.repo, "replace", "-f", real, forged)
 
-    def run_both(self, event, head, context_sha, merge_group_base=""):
+    def run_both(self, event, head, context_sha, merge_group_base="", extra_env=None):
         """Run both materialise steps; return {job: (lines, summary)}."""
         results = {}
         for job, name in ((SELECT_JOB, MATERIALISE_STEP), (GATE_JOB, GATE_MATERIALISE_STEP)):
@@ -1044,6 +1185,7 @@ class DerivedBase(BaseCase):
             env = {"IMPACT_FILES": step["env"]["IMPACT_FILES"], "EVENT_NAME": event,
                    "HEAD_SHA": head, "MERGE_GROUP_BASE_SHA": merge_group_base,
                    "CONTEXT_SHA": context_sha}
+            env.update(extra_env or {})
             shutil.rmtree(str(self.dest), ignore_errors=True)
             _, lines, summary, _ = run_snippet(snippet_of(step), self.repo, env)
             results[job] = (lines, summary)
@@ -1102,6 +1244,61 @@ class DerivedBase(BaseCase):
         self.hostile_replace(shas["base"], self.forged_merge(shas))
         self.assert_gate_fails_on_mismatch(
             self.run_both("merge_group", shas["p1"], shas["merge"], shas["base"]))
+
+    def git_state_file(self, rel):
+        """Absolute path of a file under the fixture's git dir (`rev-parse --git-path`)."""
+        path = Path(fx.git(self.repo, "rev-parse", "--git-path", rel))
+        path = path if path.is_absolute() else self.repo / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def run_each_event(self, shas, extra_env=None):
+        """Run both steps on both live events; assert every one fails closed."""
+        for event, mg_base in (("pull_request", ""), ("merge_group", shas["base"])):
+            with self.subTest(event=event):
+                self.assert_gate_fails_on_mismatch(
+                    self.run_both(event, shas["p1"], shas["merge"], mg_base, extra_env))
+
+    def test_F3_a_grafts_file_that_reparents_the_merge_commit_fails_closed(self):
+        """F3 / S15 grafts: with .git/info/grafts present both jobs used the PR's permissive gate."""
+        shas = self.build()
+        self.git_state_file("info/grafts").write_text(
+            "%s %s %s\n" % (shas["merge"], shas["p0"], shas["p1"]))
+        self.run_each_event(shas)
+
+    def test_F3_a_replace_ref_is_refused_on_both_events(self):
+        shas = self.build()
+        self.hostile_replace(shas["c1"], self.forged_merge(shas))
+        self.run_each_event(shas)
+
+    def test_F3_an_alternates_file_is_refused_on_both_events(self):
+        shas = self.build()
+        self.git_state_file("objects/info/alternates").write_text(
+            str(self.tmp / "other-objects") + "\n")
+        self.run_each_event(shas)
+
+    def test_F3_alternate_object_directories_in_the_environment_are_refused(self):
+        shas = self.build()
+        self.run_each_event(shas, {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.tmp / "other")})
+
+    def test_F3_a_graft_file_in_the_environment_is_refused(self):
+        shas = self.build()
+        self.run_each_event(shas, {"GIT_GRAFT_FILE": str(self.tmp / "grafts")})
+
+    def test_F3_a_shallow_checkout_is_refused_on_both_events(self):
+        """fetch-depth 0 leaves no shallow file; one that exists is never accepted."""
+        shas = self.build()
+        self.git_state_file("shallow").write_text(shas["c0"] + "\n")
+        self.run_each_event(shas)
+
+    def test_F3_the_refusal_names_a_token_and_no_author_text(self):
+        shas = self.build()
+        self.git_state_file("info/grafts").write_text("%s %s\n" % (shas["merge"], shas["p0"]))
+        results = self.run_both("pull_request", shas["p1"], shas["merge"])
+        for job, (lines, summary) in results.items():
+            with self.subTest(job=job):
+                self.assertEqual(lines.get("reason"), "base-sha-mismatch")
+                self.assertNotIn("forged", summary)
 
     def test_the_derivation_uses_the_github_sha_context_not_head(self):
         shas = self.build()

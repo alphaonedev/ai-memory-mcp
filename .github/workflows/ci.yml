@@ -208,11 +208,13 @@ jobs:
       # decision: the trust decision runs before any checkout file executes and
       # the resolver is demoted to a post-derivation report over keeping the
       # resolver step first because any PR-tree step that runs earlier in the
-      # job can rewrite the git state and PATH the derivation reads. Only the
-      # pinned checkout action runs before this step; the base is derived from
+      # job can rewrite the git state and PATH the derivation reads.
+      # Only the pinned checkout action and the echo-only Selection mode step run before this step;
+      # the base is derived from
       # the github.sha context value (CONTEXT_SHA) and the event payload, every
       # git call ignores replace objects, and anything unexpected fails closed
       # (base-sha-mismatch, never a bootstrap).
+      # base_sha.py is a library kept for the unit tests that pin its behaviour; no workflow step runs it.
       - name: Materialise the base selector (#8240)
         id: base
         env:
@@ -241,7 +243,9 @@ jobs:
 
 
           def git(*args):
-              # Replace objects and grafts never reach the derivation or the reads.
+              # --no-replace-objects and GIT_NO_REPLACE_OBJECTS=1 ignore replace
+              # refs only; grafts, shallow files and alternates are refused by
+              # git_state_refused() before the derivation reads anything.
               env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
               try:
                   return subprocess.run(["git", "--no-replace-objects"] + list(args),
@@ -278,21 +282,45 @@ jobs:
 
 
           def replace_refs_present():
-              # Any refs/replace entry is unexpected on a fresh checkout: fail closed.
+              # Any refs/replace entry is unexpected on a fresh checkout: fail
+              # closed. Both the ref namespace and `git replace --list` are read.
               res = git("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
-              return res.returncode != 0 or bool(res.stdout.strip())
+              if res.returncode != 0 or res.stdout.strip():
+                  return True
+              listed = git("replace", "--list")
+              return listed.returncode != 0 or bool(listed.stdout.strip())
+
+
+          def git_state_refused():
+              # Fail closed on every git state the runner can carry into the
+              # derivation. fetch-depth 0 produces a full clone: no shallow file,
+              # no grafts, no alternates (replace refs are read by
+              # replace_refs_present()); any of them, or the env vars that
+              # point git at one, is refused. Only the reason
+              # token is ever reported, never a path or author text.
+              for var in ("GIT_GRAFT_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                          "GIT_OBJECT_DIRECTORY"):
+                  if os.environ.get(var):
+                      return True
+              for rel in ("info/grafts", "shallow", "objects/info/alternates"):
+                  res = git("rev-parse", "--git-path", rel)
+                  path = res.stdout.decode("utf-8", "replace").strip()
+                  if res.returncode != 0 or not path or os.path.lexists(path):
+                      return True
+              return False
 
 
           def derive_base(env):
               # The authority: git and the event payload, never a resolver. The
               # checked-out commit must be exactly the github.sha context value
-              # (the merge ref); a moved HEAD or a replace ref is a mismatch.
+              # (the merge ref); a moved HEAD, a replace ref, grafts, a shallow file
+              # or alternates is a mismatch.
               event = env.get("EVENT_NAME", "")
               context = env.get("CONTEXT_SHA", "")
               if event in ("pull_request", "merge_group"):
                   if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:
                       raise BaseUnavailable("base-sha-mismatch")
-                  if replace_refs_present():
+                  if replace_refs_present() or git_state_refused():
                       raise BaseUnavailable("base-sha-mismatch")
               if event == "pull_request":
                   head = env.get("HEAD_SHA", "")
@@ -2762,11 +2790,13 @@ jobs:
       # decision: the trust decision runs before any checkout file executes and
       # the resolver is demoted to a post-derivation report over keeping the
       # resolver step first because any PR-tree step that runs earlier in the
-      # job can rewrite the git state and PATH the derivation reads. Only the
-      # pinned checkout action runs before this step; the base is derived from
+      # job can rewrite the git state and PATH the derivation reads.
+      # Only the pinned checkout action runs before this step;
+      # the base is derived from
       # the github.sha context value (CONTEXT_SHA) and the event payload, every
       # git call ignores replace objects, and anything unexpected fails closed
       # (base-sha-mismatch, never a bootstrap).
+      # base_sha.py is a library kept for the unit tests that pin its behaviour; no workflow step runs it.
       - name: Materialise the base gate (#8240)
         id: base
         if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
@@ -2796,7 +2826,9 @@ jobs:
 
 
           def git(*args):
-              # Replace objects and grafts never reach the derivation or the reads.
+              # --no-replace-objects and GIT_NO_REPLACE_OBJECTS=1 ignore replace
+              # refs only; grafts, shallow files and alternates are refused by
+              # git_state_refused() before the derivation reads anything.
               env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
               try:
                   return subprocess.run(["git", "--no-replace-objects"] + list(args),
@@ -2833,21 +2865,45 @@ jobs:
 
 
           def replace_refs_present():
-              # Any refs/replace entry is unexpected on a fresh checkout: fail closed.
+              # Any refs/replace entry is unexpected on a fresh checkout: fail
+              # closed. Both the ref namespace and `git replace --list` are read.
               res = git("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
-              return res.returncode != 0 or bool(res.stdout.strip())
+              if res.returncode != 0 or res.stdout.strip():
+                  return True
+              listed = git("replace", "--list")
+              return listed.returncode != 0 or bool(listed.stdout.strip())
+
+
+          def git_state_refused():
+              # Fail closed on every git state the runner can carry into the
+              # derivation. fetch-depth 0 produces a full clone: no shallow file,
+              # no grafts, no alternates (replace refs are read by
+              # replace_refs_present()); any of them, or the env vars that
+              # point git at one, is refused. Only the reason
+              # token is ever reported, never a path or author text.
+              for var in ("GIT_GRAFT_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                          "GIT_OBJECT_DIRECTORY"):
+                  if os.environ.get(var):
+                      return True
+              for rel in ("info/grafts", "shallow", "objects/info/alternates"):
+                  res = git("rev-parse", "--git-path", rel)
+                  path = res.stdout.decode("utf-8", "replace").strip()
+                  if res.returncode != 0 or not path or os.path.lexists(path):
+                      return True
+              return False
 
 
           def derive_base(env):
               # The authority: git and the event payload, never a resolver. The
               # checked-out commit must be exactly the github.sha context value
-              # (the merge ref); a moved HEAD or a replace ref is a mismatch.
+              # (the merge ref); a moved HEAD, a replace ref, grafts, a shallow file
+              # or alternates is a mismatch.
               event = env.get("EVENT_NAME", "")
               context = env.get("CONTEXT_SHA", "")
               if event in ("pull_request", "merge_group"):
                   if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:
                       raise BaseUnavailable("base-sha-mismatch")
-                  if replace_refs_present():
+                  if replace_refs_present() or git_state_refused():
                       raise BaseUnavailable("base-sha-mismatch")
               if event == "pull_request":
                   head = env.get("HEAD_SHA", "")

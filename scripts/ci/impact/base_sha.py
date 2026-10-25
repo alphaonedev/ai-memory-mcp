@@ -4,9 +4,11 @@ decision: the live base is the first parent of the pull_request merge ref and
 merge_group.base_sha over pull_request.base.sha because base.sha is frozen at
 PR-open time and github.sha on merge_group contains the PR
 
-Both the `select` job and the `ci-gate` job run this one script, so the base
-they judge by cannot drift apart. The workflow passes only the event name and
-the raw candidate shas as environment variables:
+This module is a library kept for the unit tests that pin its behaviour; no
+workflow step runs it. The `select` and `ci-gate` jobs derive the base inline
+in their materialise steps, before any checkout file executes, so a resolver
+that ran from the checkout could be rewritten by the code it judges. The
+contract below is what those tests pin:
 
   EVENT_NAME             github.event_name
   HEAD_SHA               pull_request.head.sha, or merge_group.head_sha
