@@ -2435,6 +2435,36 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
         self.assertGreater(checked, 0)
 
 
+    def test_a_userinfo_past_the_label_cut_is_masked_in_both_views_8187_f33(self):
+        """F33: the mask runs before the 60-character cut, so an ``@`` past character 60 still hides the userinfo."""
+        sentinel = "SENTINEL-F33-pw"
+        cases = {
+            "at-past-60": (f"the staging database lives at https://ciuser:{sentinel}-{'x' * 40}@host.example/db",
+                           "the staging database lives at https://***@host.example/db"),
+            "password-over-60": (f"https://ciuser:{sentinel}-{'y' * 70}@host.example/db", "https://***@host.example/db"),
+            "prefix-and-password-over-60": (f"see https://ciuser:{sentinel}-{'z' * 70}@host.example/db",
+                                            "see https://***@host.example/db"),
+        }
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            for variant, (name, label) in cases.items():
+                self.assertGreaterEqual(name.index("@"), 70)
+                edited = splice(text, target[3], [f"      - name: {name}", "        run: echo one"])
+                job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+                index = next(i for i, step in enumerate(job_steps) if sentinel in json.dumps(step))
+                views = {"loaded": tier_pin_problems(wf, edited, self.pins),
+                         "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
+                for view, problems in views.items():
+                    with self.subTest(workflow=wf, variant=variant, view=view):
+                        checked += 1
+                        self.assertEqual([p for p in problems if sentinel in p or "ciuser" in p], [])
+                        self.assertTrue([p for p in problems if f"step {index} ({label})" in p], (view, index))
+        self.assertGreater(checked, 0)
+
+
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
         # regenerate all three pin sections from the workflows; the diff of the data file is what a reviewer reads

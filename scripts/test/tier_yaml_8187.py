@@ -218,12 +218,12 @@ def build_pins(data):
 
 
 def step_label(step, index):
-    """``name`` or ``id`` of a step for a message, masked; a step with neither is ``step[<index>]``, never its content (F25)."""
+    """``name`` or ``id`` of a step for a message, masked BEFORE the 60-character cut (F33); a step with neither is ``step[<index>]``, never its content (F25)."""
     if isinstance(step, dict):
         for key in ("name", "id"):
             value = step.get(key)
             if isinstance(value, str) and value.strip():
-                return mask_userinfo(value.strip().splitlines()[0][:60])
+                return mask_userinfo(value.strip()).splitlines()[0][:60]
     return "step[%d]" % index
 
 
