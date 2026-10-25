@@ -91,8 +91,7 @@ echo "$changed"
 # v0.7.0 Task #12 (#1399) — compute test-impact set.
 # Always runs; the consumer steps decide whether to honor
 # the output based on docs_only. The script is self-contained
-# POSIX-compatible bash; full discipline + foundational list
-# documented inline in scripts/ci-test-impact.sh.
-chmod +x scripts/ci-test-impact.sh
-scripts/ci-test-impact.sh "$base" "HEAD"
+# Python 3 script; full discipline + foundational list
+# documented inline in scripts/ci/test_impact.py.
+python3 -I scripts/ci/test_impact.py "$base" "HEAD"
 
