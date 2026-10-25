@@ -528,3 +528,38 @@ def test_file_vanishing_between_check_and_open_gives_the_typed_error_8195(
     assert not isinstance(refused, OSError)
     assert "No such file" in str(refused)
 
+
+# ---- code r2 F2: a bound that is not an ``ssl.TLSVersion`` is refused (M66 killer) ----
+
+_ORIG_BOUND = {"minimum_version": ssl.SSLContext.minimum_version, "maximum_version": ssl.SSLContext.maximum_version}
+
+# Numerically legal bounds (771 is TLSv1_2) that are not a TLSVersion: only a type check refuses them.
+_NOT_A_TLS_VERSION = {"int-1.2": 771, "int-1.3": 772, "string": "TLSv1.2", "none": None}
+
+
+def _stub_bound(monkeypatch: pytest.MonkeyPatch, attr: str, value: object) -> None:
+    """Make ``SSLContext.<attr>`` report ``value`` (the property is Python-level)."""
+    monkeypatch.setattr(ssl.SSLContext, attr, property(lambda _self: value, _ORIG_BOUND[attr].fset))
+
+
+@pytest.mark.parametrize("attr", ["minimum_version", "maximum_version"])
+@pytest.mark.parametrize("value", _NOT_A_TLS_VERSION.values(), ids=_NOT_A_TLS_VERSION.keys())
+def test_predicate_refuses_a_bound_that_is_not_a_tls_version_8195(
+    monkeypatch: pytest.MonkeyPatch, attr: str, value: object
+) -> None:
+    context = ssl.create_default_context()
+    _stub_bound(monkeypatch, attr, value)
+    assert _common._context_verifies(context) is False  # noqa: SLF001
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("attr", ["minimum_version", "maximum_version"])
+@pytest.mark.parametrize("value", _NOT_A_TLS_VERSION.values(), ids=_NOT_A_TLS_VERSION.keys())
+def test_bound_that_is_not_a_tls_version_is_refused_at_construction_8195(
+    monkeypatch: pytest.MonkeyPatch, client_cls: type, attr: str, value: object
+) -> None:
+    context = ssl.create_default_context()
+    _stub_bound(monkeypatch, attr, value)
+    with pytest.raises(ValueError, match="verify=False"):
+        _construct(client_cls, context)
+
