@@ -835,9 +835,11 @@ jobs:
 
       - name: Configure NDK toolchain envs (all 4 ABIs)
         shell: bash
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           set -euo pipefail
-          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          NDK="${NDK_PATH}"
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           # min-sdk 24 (Android 7.0+). Same floor as the cross-compile
           # gate in ci.yml.
