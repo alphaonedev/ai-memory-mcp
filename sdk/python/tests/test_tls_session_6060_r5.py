@@ -61,6 +61,7 @@ def origin(lab: Lab) -> Iterator[RecordingServer]:
 def anonymous_origin() -> Iterator[RecordingServer]:
     """A TLS 1.2 origin with anonymous (auth-null) suites and no certificate."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.maximum_version = ssl.TLSVersion.TLSv1_2
     context.set_ciphers("aNULL:@SECLEVEL=0")
     server = RecordingServer(context)
@@ -944,13 +945,13 @@ def test_fifo_entry_in_a_ca_directory_is_refused_without_blocking_6377(
     directory = _ca_dir(tmp_path)
     fifo = directory / f"{_subject_hash(lab.ca_path)}.0"
     os.mkfifo(fifo, 0o644)
-    outcome: list[BaseException | None] = []
+    outcome: list[Exception | None] = []
 
     def build() -> None:
         try:
             client_cls(base_url=_ORIGIN, verify=str(directory))
             outcome.append(None)
-        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
             outcome.append(exc)
 
     # A blocking open of the FIFO never returns, so the build runs on a daemon

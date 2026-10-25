@@ -125,6 +125,7 @@ class Lab:
     def server_context(self, label: str, **leaf: object) -> ssl.SSLContext:
         cert_path, key_path = self.leaf(label, **leaf)  # type: ignore[arg-type]
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cert_path), str(key_path))
         return context
 

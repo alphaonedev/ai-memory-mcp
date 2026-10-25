@@ -27,7 +27,6 @@ import threading
 from collections.abc import Iterator
 from typing import Any
 
-import certifi
 import httpx
 import pytest
 from cryptography import x509
@@ -37,6 +36,8 @@ from cryptography.x509.oid import NameOID
 
 from ai_memory import AiMemoryClient, AsyncAiMemoryClient
 from ai_memory._common import build_httpx_kwargs
+
+from ._tlslab import Lab
 
 
 class _EmptyStr(str):
@@ -136,7 +137,23 @@ def _lying_context() -> ssl.SSLContext:
     return context
 
 
-_CA = certifi.where()
+_LAB: dict[str, Lab] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _lab_ca(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """The CA bundle the path-form tests pass: the lab CA, never certifi's public store.
+
+    The SDK refuses the public bundle on a runner (#6060); the fixtures use a
+    bundle that holds one certificate the tests control (#8195, sec r1 F1).
+    """
+    _LAB["lab"] = Lab(tmp_path_factory.mktemp("lab3840"))
+
+
+def _ca() -> str:
+    return str(_LAB["lab"].ca_path)
+
+
 _CLIENTS = [AiMemoryClient, AsyncAiMemoryClient]
 
 
@@ -144,10 +161,10 @@ _CLIENTS = [AiMemoryClient, AsyncAiMemoryClient]
 @pytest.mark.parametrize(
     "make",
     [
-        lambda: _FalsyStr(_CA),
-        lambda: _ZeroLenStr(_CA),
-        lambda: _FalsyPathLike(_CA),
-        lambda: _FalsyPath(_CA),
+        lambda: _FalsyStr(_ca()),
+        lambda: _ZeroLenStr(_ca()),
+        lambda: _FalsyPathLike(_ca()),
+        lambda: _FalsyPath(_ca()),
     ],
     ids=["str-lying-bool", "str-lying-len", "pathlike-lying-bool", "path-subclass-lying-bool"],
 )
@@ -173,7 +190,7 @@ def test_lying_ssl_context_subclass_is_refused_6248(client_cls: type) -> None:
 
 
 def test_funnel_forwards_nothing_the_caller_can_re_decide_6248() -> None:
-    for make in (lambda: _FalsyStr(_CA), lambda: _FalsyPathLike(_CA), lambda: _FalsyPath(_CA)):
+    for make in (lambda: _FalsyStr(_ca()), lambda: _FalsyPathLike(_ca()), lambda: _FalsyPath(_ca())):
         forwarded = _kwargs(make())["verify"]  # type: ignore[operator]
         assert forwarded is True or type(forwarded) is ssl.SSLContext
 
@@ -238,6 +255,7 @@ def tls_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, 
 
     server = Server(("127.0.0.1", 0), Handler)
     server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     server_ctx.load_cert_chain(str(cert_path), str(key_path))
     # Handshake lazily in the per-connection handler thread, not in accept():
     # a client that refuses the certificate must not stall the accept loop.
@@ -278,7 +296,7 @@ async def test_async_ca_path_gives_a_working_verified_client_6245(
 def test_wrong_ca_still_fails_verification_6245(tls_server: tuple[str, str]) -> None:
     # Harness control: the same listener is NOT trusted via the public bundle.
     base_url, _ = tls_server
-    with AiMemoryClient(base_url=base_url, verify=pathlib.Path(certifi.where())) as client:
+    with AiMemoryClient(base_url=base_url, verify=pathlib.Path(_ca())) as client:
         with pytest.raises(httpx.ConnectError):
             client._client.get("/ok")  # noqa: SLF001
 
@@ -355,7 +373,7 @@ def test_funnel_forwards_a_context_the_sdk_built_from_the_ca_path() -> None:
     # #3840 / #6248 — the SDK forwards ONLY what it checked: a CA path becomes
     # a verifying context built from the exact path string, never the
     # caller's object (httpx would re-read its truthiness or type).
-    forwarded = _kwargs(certifi.where())["verify"]
+    forwarded = _kwargs(_ca())["verify"]
     assert isinstance(forwarded, ssl.SSLContext)
     assert _effective(forwarded) == (ssl.CERT_REQUIRED, True)
 
@@ -371,12 +389,12 @@ def test_async_constructor_refuses_verify_false() -> None:
 
 
 def test_sync_constructor_admits_ca_path() -> None:
-    with AiMemoryClient(base_url=BASE_URL, verify=certifi.where()) as client:
+    with AiMemoryClient(base_url=BASE_URL, verify=_ca()) as client:
         assert isinstance(client._client, httpx.Client)  # noqa: SLF001 - construction probe
 
 
 async def test_async_constructor_admits_ca_path() -> None:
-    async with AsyncAiMemoryClient(base_url=BASE_URL, verify=certifi.where()) as client:
+    async with AsyncAiMemoryClient(base_url=BASE_URL, verify=_ca()) as client:
         assert isinstance(client._client, httpx.AsyncClient)  # noqa: SLF001 - construction probe
 
 
@@ -411,7 +429,7 @@ def test_funnel_refuses_non_verifying_ssl_context(make: object) -> None:
 def test_funnel_admits_verifying_ssl_context_and_pathlike() -> None:
     context = ssl.create_default_context()
     assert _kwargs(context)["verify"] is context
-    forwarded = _kwargs(pathlib.Path(certifi.where()))["verify"]
+    forwarded = _kwargs(pathlib.Path(_ca()))["verify"]
     assert isinstance(forwarded, ssl.SSLContext)
     assert _effective(forwarded) == (ssl.CERT_REQUIRED, True)
 
@@ -796,6 +814,7 @@ def counting_server(tls_server: tuple[str, str]) -> Iterator[_CountingServer]:
     """A certificate-presenting server (the cert of ``tls_server``) counting requests."""
     _, cert_path = tls_server
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert_path, str(pathlib.Path(cert_path).with_name("key.pem")))
     server = _CountingServer(context)
     try:
@@ -808,6 +827,7 @@ def counting_server(tls_server: tuple[str, str]) -> Iterator[_CountingServer]:
 def anonymous_server() -> Iterator[_CountingServer]:
     """A TLS 1.2 server with anonymous (auth-null) suites and NO certificate."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.maximum_version = ssl.TLSVersion.TLSv1_2
     context.set_ciphers("aNULL:@SECLEVEL=0")
     server = _CountingServer(context)
@@ -960,13 +980,13 @@ def test_fifo_as_verify_is_refused_without_hanging_6307(tmp_path: pathlib.Path) 
 
     fifo = tmp_path / "ca.fifo"
     os.mkfifo(fifo)
-    outcome: list[BaseException | None] = []
+    outcome: list[Exception | None] = []
 
     def build() -> None:
         try:
             AiMemoryClient(base_url=BASE_URL, verify=str(fifo))
             outcome.append(None)
-        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
             outcome.append(exc)
 
     worker = threading.Thread(target=build, daemon=True)
