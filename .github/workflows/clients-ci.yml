@@ -41,6 +41,7 @@ on:
     paths:
       - "clients/**"
       - "sdk/**"
+      - "scripts/test/check_sdk_install_integrity.py"
       - ".github/workflows/clients-ci.yml"
   # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
   # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
@@ -51,6 +52,7 @@ on:
     paths:
       - "clients/**"
       - "sdk/**"
+      - "scripts/test/check_sdk_install_integrity.py"
       - ".github/workflows/clients-ci.yml"
 
 permissions:
@@ -195,12 +197,62 @@ jobs:
           node-version: "20"
       - name: npm ci
         working-directory: sdk/typescript
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: npm ci
+      - name: Verify native install integrity refusal
+        run: python3 scripts/test/check_sdk_install_integrity.py --evidence "${{ runner.temp }}/sdk-install-integrity-7117"
       - name: npm test
         working-directory: sdk/typescript
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: npm test
       # `npm run build` is what publish-sdks.yml ships; running it here means a
       # type error can never first surface during the tag-triggered publish.
       - name: npm run build
         working-directory: sdk/typescript
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: npm run build
+
+  sdk-typescript-native-platforms:
+    name: SDK native install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      # Exercise the actual platform binding installed by npm with lifecycle
+      # scripts disabled by the SDK's project configuration (#7117).
+      - name: npm ci
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: npm ci
+      - name: npm test
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: npm test
+      - name: npm run build
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: npm run build
