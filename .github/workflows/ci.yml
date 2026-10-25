@@ -231,6 +231,8 @@ jobs:
         with: { fetch-depth: 2 }
       - name: Test impact selector security fallbacks
         run: python3 scripts/test/test_ci_test_impact.py
+      - name: Cert gate evidence and hermetic config tests (#7181 #7182)
+        run: python3 -I scripts/test/test_cert_gate_evidence_7181.py
       - name: Workflow concurrency invariants (#6340)
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a

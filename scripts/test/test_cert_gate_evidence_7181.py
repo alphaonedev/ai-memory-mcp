@@ -73,6 +73,8 @@ CLEARED_ENVS = (
     "AI_MEMORY_EMBED_BASE_URL",
     "AI_MEMORY_LLM_BASE_URL",
 )
+# #7182: the earliest points at which the gate runs (or builds) a binary.
+FIRST_BINARY_MARKERS = ("mkstub()", "cargo build", "probe_features()")
 PINNED_UPLOAD = re.compile(r"actions/upload-artifact@[0-9a-f]{40}\b")
 REDACTED_DIR = ".local-runs/cert-bootstrap-evidence-redacted"
 
@@ -656,6 +658,49 @@ class GateScriptPins(unittest.TestCase):
         self.assertIn(".local-runs/tmp", text[export : export + 160])
         self.assertLess(export, text.index("mktemp"))
         self.assertIn("chmod 700", text[export : export + 320])
+
+    def test_7182_hermetic_config_exported_before_first_binary_invocation(self):
+        text = GATE.read_text(encoding="utf-8")
+        no_config = text.index("export AI_MEMORY_NO_CONFIG=1")
+        xdg = text.index("export XDG_CONFIG_HOME")
+        self.assertIn("$TMPDIR/xdg-config-", text[xdg - 200 : xdg])
+        first_binary = min(text.index(marker) for marker in FIRST_BINARY_MARKERS if marker in text)
+        self.assertLess(no_config, first_binary)
+        self.assertLess(xdg, first_binary)
+        # the env block is never stripped or unset anywhere in the gate
+        self.assertNotRegex(text, r"env\s+-i\b")
+        self.assertNotRegex(text, r"env\s+-u\s+(AI_MEMORY_NO_CONFIG|XDG_CONFIG_HOME)")
+        self.assertNotRegex(text, r"unset\s+(AI_MEMORY_NO_CONFIG|XDG_CONFIG_HOME)")
+        # cleanup: registered for the main path and removed by the self-test trap
+        self.assertRegex(text, r'printf .*"\$XDG_CONFIG_HOME".*cleanup-list')
+        self.assertRegex(text, r"trap 'rm -rf -- \"\$ST\" \"\$\{TMPDIR:\?\}/xdg-config-\$\$\"' EXIT")
+        # the python3 early exit precedes the dir creation, so it cannot leak it
+        self.assertLess(text.index("python3 -c 'import json,sys'"), text.index('mkdir -p "$XDG_CONFIG_HOME"'))
+
+    def test_7182_prologue_executes_hermetic_env_for_a_stub_binary(self):
+        # decision: the behavioural check runs the gate's real env prologue (TMPDIR through
+        # export XDG_CONFIG_HOME) against a stub that records its environment; the full gate
+        # is not run because it builds and starts real binaries.
+        text = GATE.read_text(encoding="utf-8")
+        start = text.index('export TMPDIR="$REPO_ROOT')
+        end_marker = "export XDG_CONFIG_HOME\n"
+        prologue = text[start : text.index(end_marker) + len(end_marker)]
+        with _scratch() as scratch:
+            root = Path(scratch)
+            record = root / "env.out"
+            stub = root / "stub-bin"
+            stub.write_text(
+                '#!/bin/sh\nprintf "%s\\n%s\\n" "$AI_MEMORY_NO_CONFIG" "$XDG_CONFIG_HOME" > "$1"\n',
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            script = 'REPO_ROOT="%s"\n%s\n"%s" "%s"\n' % (root, prologue, stub, record)
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(root)}
+            res = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            lines = record.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], "1")
+            self.assertTrue(lines[1].startswith(str(root / ".local-runs" / "tmp" / "xdg-config-")))
 
     def test_f4_no_shell_control_flow_for_cleanup(self):
         text = GATE.read_text(encoding="utf-8")
