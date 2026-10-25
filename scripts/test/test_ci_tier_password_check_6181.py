@@ -5868,6 +5868,419 @@ class TestNotesTwoLinksDeepAreCaptured8187R27(unittest.TestCase):
         self.assertIn("notes stripped two links deep", HARNESS_MUTANTS)
 
 
+# ---- r28 (security r27 F1-F4, code r27 F1-F8): accept by receiver plus name, judge every raise, assert and lookup ----
+TAINT_R28_HEAD = TAINT_R26_SEC_HEAD
+# the 31 shapes of the security r27 review (part 1; C1-C3 are controls and live in TAINT_R28_CLEAN) and its part 2 (B1-B5)
+TAINT_R28_SEC_SHAPES = {
+    "sec P1 functools.partial(print)(v)": "        functools.partial(print)(body)\n",
+    "sec P2 operator.methodcaller('write', v)(sys.stdout)":
+        "        import operator\n        operator.methodcaller('write', body)(sys.stdout)\n",
+    "sec P3 (lambda f: f(v))(print)": "        (lambda f: f(body))(print)\n",
+    "sec P4 print.__call__(v)": "        print.__call__(body)\n",
+    "sec P5 builtins.__dict__['print'](v)": "        import builtins\n        builtins.__dict__['print'](body)\n",
+    "sec P6 sys.modules['builtins'].print(v)": "        sys.modules['builtins'].print(body)\n",
+    "sec P7 exec('print(v)')": "        exec('print(body)')\n",
+    "sec P8 f-string exception": "        raise RuntimeError(f'bad {body}')\n",
+    "sec A1 Path(stream).write_text(v)": "        import pathlib\n        pathlib.Path('/dev/stdout').write_text(body)\n",
+    "sec A2 os.replace(v, dst)": "        os.replace(body, 'nowhere-dst')\n",
+    "sec A3 os.mkdir(path + v)": "        os.mkdir('/nonexistent-r28/' + body)\n",
+    "sec A4 float(v)": "        float(body)\n",
+    "sec A5 int(v)": "        int(body)\n",
+    "sec A6 ast.parse(v)": "        import ast\n        ast.parse(body)\n",
+    "sec A7 [].index(v)": "        [].index(body)\n",
+    "sec A8 format(1, v)": "        format(1, body)\n",
+    "sec A9 shutil.copy(v, dst)": "        import shutil\n        shutil.copy(body, 'nowhere-dst')\n",
+    "sec A10 re.sub(p, print, v)": "        re.sub('.+', print, body)\n",
+    "sec A11 sorted([v], key=partial(print))": "        sorted([body], key=functools.partial(print))\n",
+    "sec A12 max([v], key=P(print, file=sys.stderr))": "        max([body], key=P(print, file=sys.stderr))\n",
+    "sec A13 re.Scanner(...).scan(v)": "        re.Scanner([(r'.+', lambda s, t: print(t))]).scan(body)\n",
+    "sec A14 add_note(v) then bare raise": (
+        "        try:\n            raise ValueError('x')\n        except ValueError as e:\n            e.add_note(body)\n"
+        "            raise\n"),
+    "sec A15 os.environ.update(K=v)":
+        "        import subprocess\n        os.environ.update(LEAKV=body)\n        subprocess.run(['printenv', 'LEAKV'])\n",
+    "sec A16 os.environ.setdefault(K, v)":
+        "        os.environ.setdefault('LEAKV', body)\n        os.system('printenv LEAKV')\n",
+    "sec A17 {}[v]": "        {}[body]\n",
+    "sec A18 os.environ[v]": "        os.environ[body]\n",
+    "sec A19 '{0}'.format(v) to a stream file":
+        "        import pathlib\n        pathlib.Path('/dev/stderr').write_text('{0}'.format(body))\n",
+    "sec A20 sorted(v.split(), key=sys.stderr.write)": "        sorted(body.split(), key=sys.stderr.write)\n",
+    "sec B1 StackSummary capture_locals": (
+        "        def peek():\n"
+        "            return traceback.StackSummary.extract(traceback.walk_stack(None), capture_locals=True).format()\n"
+        "        print(''.join(peek()))\n"),
+    "sec B2 assert len(v) == -1": "        assert len(body) == -1\n",
+    "sec B3 assert v.count('q') == 99": "        assert body.count('q') == 99\n",
+    "sec B4 assert v.startswith('nope')": "        assert body.startswith('nope')\n",
+    "sec B5 assert 'nope' in v": "        assert 'nope' in body\n",
+}
+# the 20 shapes of the code r27 review (o1-o20; the ones the r27 scan already flagged stay as regression rows)
+TAINT_R28_CODE_SHAPES = {
+    "code o1 Path(/dev/stderr).write_text": "        from pathlib import Path\n        Path('/dev/stderr').write_text(body)\n",
+    "code o2 int(text)": "        int(body)\n",
+    "code o3 [].index(text)": "        [].index(body)\n",
+    "code o4 float(text)": "        float(body)\n",
+    "code o5 os.environ.update then env":
+        "        import subprocess\n        os.environ.update(X=body)\n        subprocess.run(['env'])\n",
+    "code o6 nested receiver append then print": "        box = [[]]\n        box[0].append(body)\n        print(box)\n",
+    "code o7 re.sub positional repl=print": "        re.sub(r'(?s).+', print, body)\n",
+    "code o8 sorted key=partial(print)": "        sorted([body], key=functools.partial(print))\n",
+    "code o9 functools.partial(print)(text)": "        functools.partial(print)(body)\n",
+    "code o10 operator.methodcaller write":
+        "        import operator\n        operator.methodcaller('write', body)(sys.stdout)\n",
+    "code o11 (lambda f: f(text))(print)": "        (lambda f: f(body))(print)\n",
+    "code o12 print.__call__(text)": "        print.__call__(body)\n",
+    "code o13 builtins.__dict__['print'](text)": "        import builtins\n        builtins.__dict__['print'](body)\n",
+    "code o14 sys.modules['builtins'].print": "        sys.modules['builtins'].print(body)\n",
+    "code o15 exec('print(text)')": "        exec('print(body)')\n",
+    "code o16 f-string in a raised message": "        raise ValueError(f'bad {body}')\n",
+    "code o17 dict subscript KeyError echo": "        {}[body]\n",
+    "code o18 os.mkdir(text)": "        os.mkdir(body)\n",
+    "code o19 attribute receiver append then print":
+        "        ns = type('N', (), {})()\n        ns.l = []\n        ns.l.append(body)\n        print(ns.l)\n",
+    "code o20 format(x, text)": "        format(1, body)\n",
+}
+# r28 own shapes: output and error paths in none of the reviews' corpora, and the propagation forms (sec F1 e)
+TAINT_R28_OWN_SHAPES = {
+    "r28 pathlib.Path(v).mkdir()": "        import pathlib\n        pathlib.Path(body).mkdir()\n",
+    "r28 os.environ.setdefault('X', v)": "        os.environ.setdefault('X', body)\n",
+    "r28 subscript lookup of a local dict": "        table = {}\n        table[body]\n",
+    "r28 int(v) unwrapped": "        n = int(body.strip())\n",
+    "r28 assert v == expected": "        expected = 'x'\n        assert body == expected\n",
+    "r28 raise RuntimeError(v)": "        raise RuntimeError(body)\n",
+    "r28 warnings.warn(v)": "        warnings.warn(body)\n",
+    "r28 sys.exit(v)": "        sys.exit(body)\n",
+    "r28 os.environ['X'] = v": "        os.environ['X'] = body\n",
+    "r28 os.putenv('X', v)": "        os.putenv('X', body)\n",
+    "r28 del os.environ[v]": "        del os.environ[body]\n",
+    "r28 bare raise in a handler": (
+        "        try:\n            n = len(body)\n            raise ValueError('constant')\n        except ValueError:\n            raise\n"),
+    "r28 assert with a message": "        assert len(body) < 0, 'size'\n",
+    "r28 sys.modules['x'] = v": "        sys.modules['x'] = body\n",
+    "r28 an attribute store on a module": "        sys.stdout = body\n",
+    "r28 write_text on a name bound from Path": (
+        "        from pathlib import Path\n        target = Path('/dev/stderr')\n        target.write_text(body)\n"),
+    "r28 get on a name bound from a client":
+        "        import urllib.request\n        client = urllib.request.build_opener()\n        client.get(body)\n",
+    "r28 search on a name that is not a regex": "        import subprocess\n        pattern = subprocess.Popen\n        pattern.search(body)\n",
+    "r28 propagation: BinOp into sys.exit": "        sys.exit('bad ' + body)\n",
+    "r28 propagation: f-string into sys.exit": "        sys.exit(f'bad {body}')\n",
+    "r28 propagation: comprehension into sys.exit": "        sys.exit([c for c in body])\n",
+    "r28 propagation: ternary into sys.exit": "        sys.exit(body if body else 'x')\n",
+    "r28 propagation: walrus into sys.exit": "        sys.exit((seen := body))\n",
+    "r28 propagation: tuple unpack into sys.exit": "        first, second = body, 'x'\n        sys.exit(first)\n",
+    "r28 propagation: f-string into a bare assert": "        assert f'{body}' == 'x'\n",
+    "r28 propagation: comprehension into a bare assert": "        assert [c for c in body] == []\n",
+    "r28 propagation: ternary into a bare assert": "        assert (body if body else '') == 'x'\n",
+    "r28 propagation: walrus into a bare assert": "        assert (seen := body) == 'x'\n",
+    "r28 propagation: unpack into a bare assert": "        first, second = body, 'x'\n        assert first == 'y'\n",
+    "r28 propagation: BinOp into raise": "        raise RuntimeError('bad ' + body)\n",
+    "r28 callable argument that is a call result": "        sorted([body], key=P(print))\n",
+    "r28 callable argument that is a stream method": "        list(map(sys.stdout.write, [body]))\n",
+    "r28 callable argument by keyword on an accepted callee": "        body.split(sep=print)\n",
+}
+TAINT_R28_CLEAN = {
+    "sec C1 a failing constant exception": TAINT_R28_HEAD + "        n = len(body)\n        raise ValueError('constant')\n",
+    "sec C2 a printed count": TAINT_R28_HEAD + "        print('count', len(body))\n",
+    "sec C3 a failing assertEqual on a length": TAINT_R28_HEAD + "        self.assertEqual(len(body), -1)\n",
+    "sec B6 assertTrue on a predicate": TAINT_R28_HEAD + "        self.assertTrue(body.startswith('nope'))\n",
+    "sec B7 a bare assert on a constant": TAINT_R28_HEAD + "        n = len(body)\n        assert n == n and 1 == 2\n",
+    "r28 a bare assert on a flag": TAINT_R28_HEAD + "        ok = isinstance(body, dict)\n        assert ok\n",
+    "r28 regex search with a constant pattern":
+        TAINT_R28_HEAD + "        hit = re.search('[a-z]+', body)\n        self.assertTrue(bool(hit))\n",
+    "r28 compiled regex held in a name": (
+        TAINT_R28_HEAD + "        pattern = re.compile('[a-z]+')\n        self.assertTrue(bool(pattern.search(body)))\n"),
+    "r28 sha256 hexdigest then length": (
+        TAINT_R28_HEAD + "        import hashlib\n        digest = hashlib.sha256(body.encode()).hexdigest()\n"
+        "        self.assertEqual(len(digest), 64)\n"),
+    "r28 dict get then length": TAINT_R28_HEAD + "        part = body.get('k')\n        self.assertEqual(len(part), 1)\n",
+    "r28 sorted key=len then length": TAINT_R28_HEAD + "        names = sorted(body, key=len)\n        self.assertEqual(len(names), 2)\n",
+    "r28 str.join of sorted": TAINT_R28_HEAD + "        joined = ' '.join(sorted(body))\n        self.assertEqual(len(joined), 3)\n",
+    "r28 slice of tainted text": TAINT_R28_HEAD + "        head = body[:3]\n        self.assertEqual(len(head), 3)\n",
+    "r28 constant subscript of tainted data": TAINT_R28_HEAD + "        first = body[0]\n        self.assertEqual(len(first), 3)\n",
+}
+# member names no accepted set may hold: each can write, rename, spawn, mutate the environment or raise with the value in
+# its message (security r27 F1 b)
+TAINT_R28_NEVER_ACCEPTED = (
+    "ast.parse", "copy", "float", "format", "get_client", "index", "int", "mkdir", "os.mkdir", "os.putenv", "os.replace",
+    "parse", "pathlib.Path", "rindex", "shutil.copy", "write_text", "print", "write", "add_note", "os.environ", "sys.exit")
+# the output-capable inserts of both r27 reviews, as lines at the top of an exempt function body
+TAINT_R28_EXEMPT_INSERTS = {
+    "print(KEEP)": "    print(KEEP)\n",
+    "sys.stdout.write(str(KEEP))": "    sys.stdout.write(str(KEEP))\n",
+    "pprint.pp(KEEP)": "    import pprint\n    pprint.pp(KEEP)\n",
+    "sys.displayhook(KEEP)": "    import sys\n    sys.displayhook(KEEP)\n",
+    "functools.partial(print, KEEP)()": "    import functools\n    functools.partial(print, KEEP)()\n",
+    "subprocess.call(['echo', str(KEEP)])": "    import subprocess\n    subprocess.call(['echo', str(KEEP)])\n",
+    "logging.getLogger().fatal(KEEP)": "    import logging\n    logging.getLogger().fatal(KEEP)\n",
+    "logger.fatal(KEEP)": "    import logging\n    logger = logging.getLogger('x')\n    logger.fatal(KEEP)\n",
+    "raise ValueError(repr(KEEP))": "    if KEEP is None:\n        raise ValueError(repr(KEEP))\n",
+    "json.dump(KEEP, sys.stderr)": "    import json\n    json.dump(KEEP, sys.stderr)\n",
+    "os.write(2, repr(KEEP).encode())": "    import os\n    os.write(2, repr(KEEP).encode())\n",
+    "sys.__stdout__.write(str(KEEP))": "    import sys\n    sys.__stdout__.write(str(KEEP))\n",
+    "assert KEEP, 'empty'": "    assert KEEP, 'empty'\n",
+    "os.environ['X'] = str(KEEP)": "    import os\n    os.environ['X'] = str(KEEP)\n",
+}
+OPAQUE_R28_NAME_STORES = {
+    "r28 plain store to __name__": "import sys\n__name__ = 'tier_yaml_8187'\nm = sys.modules[__name__]\nx = m.Opaque\n",
+    "r28 augmented store to __name__": "import sys\n__name__ += 'x'\nm = sys.modules[__name__]\n",
+    "r28 annotated store to __name__": "import sys\n__name__: str = 'tier_yaml_8187'\nm = sys.modules[__name__]\n",
+    "r28 for target __name__": "import sys\nfor __name__ in ['tier_yaml_8187']:\n    m = sys.modules[__name__]\n",
+    "r28 with target __name__": "import io\nwith io.StringIO() as __name__:\n    pass\n",
+    "r28 import as __name__": "import sys\nimport tier_yaml_8187 as __name__\nm = sys.modules[__name__]\n",
+    "r28 walrus store to __name__": "import sys\nif (__name__ := 'tier_yaml_8187'):\n    m = sys.modules[__name__]\n",
+    "r28 except target __name__": "try:\n    pass\nexcept ValueError as __name__:\n    pass\n",
+    "r28 parameter named __name__": "def f(__name__):\n    return __name__\n",
+    "r28 function named __name__": "def __name__():\n    return 1\n",
+    "r28 delete of __name__": "del __name__\n",
+}
+
+
+def exempt_source_with(source, function, insert):
+    """``source`` with ``insert`` (4-space indented lines) placed first in the body of ``function``."""
+    lines = source.splitlines(True)
+    header = next(i for i, line in enumerate(lines) if line.startswith("def %s(" % function))
+    lines[header + 1:header + 1] = [insert]
+    return "".join(lines)
+
+
+class TestTaintScanAcceptsByReceiverAndName8187R28(unittest.TestCase):
+    """r28 sec F1, code F1-F2 (sec r27 finding 1, code r27 findings 1-2): a callee is accepted only by receiver plus name or as a
+    resolved builtin; every unlisted call, environment mutation, failing lookup, raise and assert that receives a loaded
+    value is a sink.  The 33 security, 20 code and 33 own shapes are flagged; the clean controls stay clean."""
+
+    def shapes(self):
+        for table in (TAINT_R28_SEC_SHAPES, TAINT_R28_CODE_SHAPES, TAINT_R28_OWN_SHAPES):
+            for name, body in table.items():
+                yield name, TAINT_R28_HEAD + body
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R28_SEC_SHAPES), 33)
+        self.assertEqual(len(TAINT_R28_CODE_SHAPES), 20)
+        self.assertEqual(len(TAINT_R28_OWN_SHAPES), 33)
+        self.assertGreaterEqual(len(TAINT_R28_OWN_SHAPES), 6)
+        self.assertEqual(len(TAINT_R28_CLEAN), 14)
+        self.assertEqual(len(TAINT_R28_EXEMPT_INSERTS), 14)
+        self.assertEqual(len(OPAQUE_R28_NAME_STORES), 11)
+
+    def test_every_shape_is_flagged(self):
+        survivors = []
+        for name, source in self.shapes():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(source):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, source in TAINT_R28_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(tainted_assert_lines(source), [])
+
+    def test_the_accepted_sets_are_sorted_named_constants(self):
+        module = sys.modules[__name__]
+        tree = ast.parse(THIS_PATH.read_text(encoding="utf-8"))
+        for constant in ("TAINT_ACCEPTED_BUILTINS", "TAINT_ACCEPTED_QUALIFIED", "TAINT_ACCEPTED_METHODS"):
+            with self.subTest(constant=constant):
+                accepted = getattr(module, constant, None)
+                self.assertIsInstance(accepted, frozenset)
+                self.assertGreater(len(accepted), 0)
+                assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == constant)
+                elements = [e for e in ast.walk(assignment.value) if isinstance(e, ast.Constant)]
+                self.assertTrue([e.value for e in elements] == sorted(accepted))
+                self.assertEqual(len({e.lineno for e in elements}), len(elements))  # one member per line
+        self.assertTrue(all("." in name for name in TAINT_ACCEPTED_QUALIFIED))
+        self.assertTrue(all(name.isidentifier() for name in TAINT_ACCEPTED_BUILTINS | TAINT_ACCEPTED_METHODS))
+
+    def test_no_accepted_set_holds_a_member_that_can_write_spawn_mutate_or_echo(self):
+        everything = TAINT_ACCEPTED_BUILTINS | TAINT_ACCEPTED_QUALIFIED | TAINT_ACCEPTED_METHODS
+        self.assertEqual(sorted(everything & set(TAINT_R28_NEVER_ACCEPTED)), [])
+        for name in ("int", "float", "format", "index"):
+            self.assertNotIn(name, TAINT_ACCEPTED_BUILTINS)
+            self.assertNotIn(name, TAINT_ACCEPTED_METHODS)
+
+    def test_the_bare_name_sets_of_r27_are_gone(self):
+        module = sys.modules[__name__]
+        self.assertEqual([n for n in ("TAINT_ACCEPTED_CALLEES", "TAINT_ACCEPTED_HARNESS", "TAINT_ACCEPTED_ALL") if hasattr(module, n)], [])
+
+    def test_both_shipped_files_have_no_tainted_line(self):
+        for path in (TY_PATH, THIS_PATH):
+            with self.subTest(file=path.name):
+                self.assertEqual(tainted_assert_lines(path.read_text(encoding="utf-8"), exempt=TAINT_EXEMPT_FUNCTIONS), [])
+
+
+class TestExemptFunctionsAreCheckedPositively8187R28(unittest.TestCase):
+    """r28 sec F2, code F4 (sec r27 finding 2, code r27 finding 4): the two exempt functions are walked for every call, raise,
+    assert, subscript store and environment mutation against the SAME accepted set the scan uses, so each of the 14 output-capable
+    inserts is red in both and the shipped bodies are clean."""
+
+    def source(self):
+        return THIS_PATH.read_text(encoding="utf-8")
+
+    def test_the_shipped_bodies_are_clean(self):
+        self.assertEqual(exempt_function_problems(self.source()), [])
+
+    def test_each_insert_is_flagged_in_each_function(self):
+        survivors = []
+        for function in sorted(TAINT_EXEMPT_FUNCTIONS):
+            for name, insert in TAINT_R28_EXEMPT_INSERTS.items():
+                with self.subTest(function=function, insert=name):
+                    if not exempt_function_problems(exempt_source_with(self.source(), function, insert)):
+                        survivors.append((function, name))
+        self.assertEqual(survivors, [])
+
+    def test_the_check_reads_the_same_accepted_set_as_the_scan(self):
+        module = sys.modules[__name__]
+        insert = exempt_source_with(self.source(), "canary_dump", TAINT_R28_EXEMPT_INSERTS["pprint.pp(KEEP)"])
+        self.assertNotEqual(exempt_function_problems(insert), [])
+        widened = TAINT_ACCEPTED_QUALIFIED | {"pprint.pp"}
+        with unittest.mock.patch.object(module, "TAINT_ACCEPTED_QUALIFIED", widened):
+            self.assertEqual(exempt_function_problems(insert), [])
+
+    def test_the_exempt_allowance_is_a_named_sorted_constant(self):
+        self.assertIsInstance(TAINT_EXEMPT_CALLS, frozenset)
+        self.assertEqual(sorted(TAINT_EXEMPT_CALLS & set(TAINT_R28_NEVER_ACCEPTED)), [])
+        for output in ("print", "sys.stdout.write", "pprint.pp", "sys.displayhook", "logging.getLogger"):
+            self.assertNotIn(output, TAINT_EXEMPT_CALLS)
+
+
+class TestOpaqueHashAndSameRevealNothing8187R28(unittest.TestCase):
+    """r28 sec F3, code F3 (sec r27 O5, code r27 finding 3): ``Opaque.__hash__`` is a salt plus the length only, and ``same``
+    compares exact-type plain data and refuses any other comparand with a typed error before calling its ``__eq__``."""
+
+    def test_an_int_raw_does_not_hash_to_itself(self):
+        for raw in (4242424242, 7, 2 ** 40 + 1):
+            with self.subTest(raw=raw):
+                self.assertNotEqual(hash(ty.Opaque(raw, "key[2]")), raw)
+                self.assertNotEqual(hash(ty.Opaque(raw, "key[2]")), hash(raw))
+
+    def test_two_equal_length_opaques_hash_alike_whatever_their_raws(self):
+        first = ty.Opaque("aaaa", "key[0]")
+        second = ty.Opaque("bbbb", "key[1]")
+        self.assertEqual(hash(first), hash(second))
+        self.assertFalse(first == second)
+        self.assertEqual(len({first, second}), 2)
+        self.assertEqual(hash(ty.Opaque("same", "key[0]")), hash(ty.Opaque("same", "key[1]")))
+
+    def test_the_hash_depends_on_the_length_only(self):
+        self.assertEqual(hash(ty.Opaque(b"abc", "key[0]")), hash(ty.Opaque("xyz", "key[0]")))
+        self.assertNotEqual(hash(ty.Opaque("abc", "key[0]")), hash(ty.Opaque("abcd", "key[0]")))
+
+    def test_same_refuses_a_comparand_with_a_recording_eq(self):
+        class Grab:
+            def __init__(self):
+                self.seen = []
+
+            def __eq__(self, other):
+                self.seen.append(other)
+                return True
+
+            __hash__ = None
+
+        class Subclass(str):
+            seen = []
+
+            def __eq__(self, other):
+                Subclass.seen.append(other)
+                return True
+
+            __hash__ = str.__hash__
+
+        wrapped = ty.Opaque("workflow-text", "step[0]")
+        for build in (Grab, lambda: [Grab()], lambda: {"k": Grab()}, lambda: (Grab(),)):
+            comparand = build()
+            with self.subTest(comparand=type(comparand).__name__):
+                with self.assertRaises(TypeError):
+                    ty.same(wrapped, comparand)
+                with self.assertRaises(TypeError):
+                    ty.same(comparand, wrapped)
+                holder = comparand if isinstance(comparand, Grab) else (comparand[0] if isinstance(comparand, (list, tuple)) else comparand["k"])
+                self.assertEqual(holder.seen, [])
+        Subclass.seen = []
+        with self.assertRaises(TypeError):
+            ty.same(wrapped, Subclass("x"))
+        self.assertEqual(Subclass.seen, [])
+
+    def test_same_still_compares_plain_data(self):
+        wrapped = ty.Opaque("workflow-text", "step[0]")
+        self.assertTrue(ty.same(wrapped, "workflow-text"))
+        self.assertFalse(ty.same(wrapped, "other"))
+        self.assertTrue(ty.same(wrapped, ty.Opaque("workflow-text", "step[1]")))
+        self.assertTrue(ty.same(b"ab", b"ab"))
+        self.assertFalse(ty.same(b"ab", b"ac"))
+        self.assertTrue(ty.same(["a", {"k": 1}], ["a", {"k": 1}]))
+        self.assertFalse(ty.same(None, "x"))
+
+    def test_opaque_equality_does_not_call_a_raw_comparand(self):
+        class Grab:
+            seen = []
+
+            def __eq__(self, other):
+                Grab.seen.append(other)
+                return True
+
+            __hash__ = None
+
+        self.assertFalse(ty.Opaque("text", "key[0]") == ty.Opaque(Grab(), "key[1]"))
+        self.assertEqual(Grab.seen, [])
+
+    def test_the_docstring_states_the_hash(self):
+        self.assertIn("salt", ty.Opaque.__doc__)
+        self.assertNotIn("``__eq__`` and\n    ``__hash__`` compare the raw text", ty.Opaque.__doc__)
+
+
+class TestTheGateRefusesAStoreToTheModuleName8187R28(unittest.TestCase):
+    """r28 code F3 (code r27 finding 3, p2): ``sys.modules[__name__]`` is accepted only while ``__name__`` is the module's own,
+    so any store to the name in the gated code is refused."""
+
+    def test_every_store_form_is_refused(self):
+        survivors = []
+        for name, source in OPAQUE_R28_NAME_STORES.items():
+            with self.subTest(snippet=name):
+                if not opaque_refusals(source):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_a_load_of_the_name_stays_accepted(self):
+        for source in ("if __name__ == '__main__':\n    pass\n", "import sys\nm = sys.modules[__name__]\n", "x = __name__\n"):
+            with self.subTest(source=source):
+                self.assertEqual(opaque_refusals(source), [])
+
+
+class TestNotesEightLinksDeepAndACycleAreCaptured8187R28(unittest.TestCase):
+    """r28 code F5 (code r27 finding 5): a note eight ``__cause__`` links deep, eight ``__context__`` links deep and on a
+    cyclic chain each have a seeded control that a two-link walk misses, and the two-link-walk harness mutant is red."""
+
+    DEEP = ["exception-cause-8-notes", "exception-context-8-notes", "exception-cycle-notes"]
+
+    @unittest.skipIf(sys.version_info < (3, 11), "exception notes exist from Python 3.11")
+    def test_the_controls_exist_and_are_live(self):
+        names = set(canary_controls(CanaryRun(sys.modules[__name__])))
+        for name in self.DEEP:
+            self.assertIn(name, names)
+        self.assertEqual(canary_control_failures(sys.modules[__name__]), [])
+
+    @unittest.skipIf(sys.version_info < (3, 11), "exception notes exist from Python 3.11")
+    def test_a_two_link_walk_is_red_for_the_three_controls_only(self):
+        ty_source = TY_PATH.read_text(encoding="utf-8")
+        test_source = THIS_PATH.read_text(encoding="utf-8")
+        variant = load_variant(ty_source, harness_mutant_source(test_source, "two-link-walk", "exception-chain"))
+        self.assertEqual(sorted(canary_control_failures(variant)), sorted(self.DEEP))
+
+    def test_the_mutant_is_in_the_harness_table(self):
+        self.assertIn("chain walk stops after two links", HARNESS_MUTANTS)
+
+
+class TestTheRoundTwentyEightSourceIsConsistent8187R28(unittest.TestCase):
+    """r28 code F6 (code r27 finding 6): the count in the comment above ``OPAQUE_R27_PASSED_AT_R26`` is the count of the tuple."""
+
+    def test_the_comment_states_the_tuple_length(self):
+        source = THIS_PATH.read_text(encoding="utf-8")
+        counts = re.findall(r"^# the (\d+) snippets above that the r26 gates passed", source, re.MULTILINE)
+        self.assertTrue(counts == [str(len(OPAQUE_R27_PASSED_AT_R26))])
+        self.assertEqual(len(OPAQUE_R27_PASSED_AT_R26), 15)
+
+
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
         # regenerate all three pin sections from the workflows; the diff of the data file is what a reviewer reads
