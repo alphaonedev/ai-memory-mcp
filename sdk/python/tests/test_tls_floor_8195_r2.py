@@ -216,9 +216,34 @@ def test_builder_context_sets_the_floor_even_when_the_library_default_is_lower_8
     assert result.returncode == 0, result.stderr[-400:]
     stock, built, from_path = (int(x) for x in result.stdout.split())
     floor = int(_TLS.TLSv1_2)
-    assert stock < floor, "the probe needs a library default below TLS 1.2"
+    if stock >= floor:
+        pytest.skip("this Python already defaults to TLS 1.2; the in-process test below covers the builder")
     assert built == floor
     assert from_path == floor
+
+
+def test_builder_assigns_the_floor_over_a_lower_starting_state_8195(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The builder's own assignment sets TLS 1.2, whatever state a new context starts in.
+
+    A context class that starts at ``MINIMUM_SUPPORTED`` stands in for a distro
+    Python whose default is below TLS 1.2; only an explicit assignment in the
+    builder can move it, on any Python and OpenSSL.
+    """
+    real = ssl.SSLContext
+
+    class _LowStart(real):  # type: ignore[misc, valid-type]
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            instance = super().__new__(cls, *args, **kwargs)
+            instance.minimum_version = _TLS.MINIMUM_SUPPORTED
+            return instance
+
+    shim = types.SimpleNamespace(**{name: getattr(ssl, name) for name in dir(ssl)})
+    shim.SSLContext = _LowStart
+    monkeypatch.setattr(_common, "ssl", shim)
+    built = _common._pinned_base_context()  # noqa: SLF001
+    assert built.minimum_version == _TLS.TLSv1_2
 
 
 def test_sdk_built_context_reports_the_floor_8195(lab: Lab) -> None:
@@ -441,6 +466,16 @@ def _open_after_lstat(path: pathlib.Path) -> int:
     )
 
 
+def _refusal_of(path: pathlib.Path) -> _Refused:
+    """The refusal ``_open_after_lstat`` raises; a descriptor it returns is closed and fails the test."""
+    try:
+        fd = _open_after_lstat(path)
+    except _Refused as refused:
+        return refused
+    os.close(fd)
+    raise AssertionError("the open was admitted")
+
+
 @_POSIX_ONLY
 def test_unchanged_identity_opens_8195(tmp_path: pathlib.Path) -> None:
     fd = _open_after_lstat(_credential(tmp_path))
@@ -470,8 +505,7 @@ def test_each_identity_field_alone_binds_the_open_to_the_check_8195(
     monkeypatch.setattr(_ownedfile, "check_owned_stat", lambda *a, **k: None)
     monkeypatch.setattr(_ownedfile, "check_owned_acl", lambda *a, **k: None)
     monkeypatch.setattr(_ownedfile.os, "fstat", swapped)
-    with pytest.raises(_Refused, match="changed between its check and its open"):
-        _open_after_lstat(path)
+    assert "changed between its check and its open" in str(_refusal_of(path))
 
 
 @_POSIX_ONLY
@@ -489,8 +523,8 @@ def test_file_vanishing_between_check_and_open_gives_the_typed_error_8195(
         raise FileNotFoundError(2, "No such file or directory", str(_path))
 
     monkeypatch.setattr(_ownedfile.os, "open", gone)
-    with pytest.raises(_Refused, match="could not be opened after its check") as refused:
-        _open_after_lstat(path)
-    assert not isinstance(refused.value, OSError)
-    assert "No such file" in str(refused.value)
+    refused = _refusal_of(path)
+    assert "could not be opened after its check" in str(refused)
+    assert not isinstance(refused, OSError)
+    assert "No such file" in str(refused)
 

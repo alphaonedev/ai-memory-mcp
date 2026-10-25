@@ -59,8 +59,6 @@ class Mutant(NamedTuple):
     equivalent: bool = False
 
 
-_SEC_MIN = "    context.verify_mode = ssl.CERT_REQUIRED\n    context.check_hostname = True\n"
-
 MUTANTS: tuple[Mutant, ...] = (
     Mutant("S01/C01", "verify=False forwarded", COMMON,
            "if verify is None or verify is True:", "if verify is None or verify is True or verify is False:"),

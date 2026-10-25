@@ -455,6 +455,7 @@ def test_both_constructors_refuse_bypass_forms(verify: object) -> None:
 
 def _insecure_stdlib_context() -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     return context
