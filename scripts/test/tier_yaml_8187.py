@@ -40,10 +40,10 @@ import weakref
 
 try:
     import yaml
-except ImportError as exc:  # fail the module: a missing loader must never turn the pins into a skip
+except ImportError:  # fail the module: a missing loader must never turn the pins into a skip
     raise ImportError("PyYAML is required by the tier workflow pins (#8187): install it with `python3 -m pip install "
                       "--require-hashes --no-deps -r scripts/test/requirements-ci.txt` (scripts/test/requirements-ci.txt)"
-                      ) from exc
+                      ) from None
 
 TOP_LEVEL_KEYS = frozenset(("name", "run-name", "on", "permissions", "env", "defaults", "concurrency", "jobs"))
 STR_TAG = "tag:yaml.org,2002:str"
@@ -148,10 +148,13 @@ class Opaque:
     when the wrapper dies (r24 code F42b: a slot or a ``__dict__`` entry is one ``getattr`` from a message; the slot read,
     ``object.__getstate__`` and ``json.dumps(default=...)`` each returned it).  The instance holds the label, the length and
     ``__weakref__`` only; ``__getstate__`` returns the label-only string and ``__reduce__`` the label.  ``raw()`` is called
-    only inside comparison helpers that return a bool and never build a message (``__eq__``, ``same``).  ``__eq__`` and
-    ``__hash__`` compare the raw text; the label is a fixed positional string, so a label-shaped author name prints as its
-    own label and cannot be told from one (the intended result).  The length is the only property of the text that is
-    shown: a hash prefix of a low-entropy credential is an offline-guess oracle."""
+    only inside comparison helpers that return a bool and never build a message (``__eq__``, ``same``).  ``__eq__`` compares
+    plain data by digest (``plain_equal``) and refuses any other operand with a typed error, so a comparand's own ``__eq__`` is
+    never called with the raw.  ``__hash__`` is the salt plus the length (r28 sec F3): the hash of the raw value would be the
+    value for an integer and an equality oracle for any text; two opaques of equal length hash equal whether or not their text
+    is equal.  The label is a fixed positional string, so a label-shaped author name prints as its own label and cannot be
+    told from one (the intended result).  The length is the only property of the text that is shown: a hash prefix of a
+    low-entropy credential is an offline-guess oracle."""
 
     __slots__ = ("_label", "_n", "__weakref__")
 
@@ -187,14 +190,11 @@ class Opaque:
 
     def __eq__(self, other):
         if isinstance(other, Opaque):
-            return bool(self.raw() == other.raw())
+            return plain_equal(self.raw(), other.raw())
         return NotImplemented
 
     def __hash__(self):
-        try:
-            return hash(self.raw())
-        except TypeError:
-            return 0
+        return hash((_SALT, self._n))  # r28 sec F3: salt plus length only, never a function of the raw value
 
     def __getstate__(self):
         return self._shown()
@@ -214,11 +214,63 @@ def opaque(value, label):
     return Opaque(value, label)
 
 
+_SALT = object()  # the hash of an Opaque is this plus its length: an object nobody can recompute from the text
+_PLAIN_SCALARS = (str, bytes, int, float, bool, type(None))
+_PLAIN_LIMIT = 40
+
+
+class OpaqueComparisonError(TypeError):
+    """A comparison that would hand a raw value to a comparand's own ``__eq__`` (r28 code F3): refused with fixed text."""
+
+
+def _canonical(value, depth=0):
+    """``value`` as nested tuples of tags and digests: str and bytes by digest, scalars by value, containers element by
+    element.  Only EXACT built-in types are read; any other object is refused with a typed error that names nothing."""
+    if depth > _PLAIN_LIMIT:
+        raise OpaqueComparisonError("an Opaque compares plain data only (the value is withheld)")
+    kind = type(value)
+    if kind is str:
+        return ("s", hashlib.sha256(value.encode("utf-8", "surrogatepass")).digest())
+    if kind is bytes:
+        return ("b", hashlib.sha256(value).digest())
+    if kind in _PLAIN_SCALARS:
+        return (kind.__name__, value)
+    if kind in (list, tuple):
+        return (kind.__name__, tuple(_canonical(item, depth + 1) for item in value))
+    if kind in (set, frozenset):
+        return (kind.__name__, tuple(sorted(_canonical(item, depth + 1) for item in value)))
+    if kind is dict:
+        return ("dict", tuple(sorted((_canonical(k, depth + 1), _canonical(v, depth + 1)) for k, v in value.items())))
+    raise OpaqueComparisonError("an Opaque compares plain data only (the value is withheld)")
+
+
+def plain_equal(left, right):
+    """Whether two plain values are equal; a bool.  Never calls an ``__eq__`` of either operand: both are read by exact type
+    (r28 code F3, p1 and p5)."""
+    return _canonical(left) == _canonical(right)
+
+
 def same(left, right):
-    """True when two values (``Opaque`` or raw) hold equal raw text; a bool, never a message."""
+    """True when two values (``Opaque`` or raw) hold equal plain data; a bool, never a message.  A comparand that is not
+    exact-type plain data (a recording ``__eq__``, a subclass, a custom object) is refused with ``OpaqueComparisonError``."""
     left = left.raw() if isinstance(left, Opaque) else left
     right = right.raw() if isinstance(right, Opaque) else right
-    return bool(left == right)
+    return plain_equal(left, right)
+
+
+def lookup(mapping, key):
+    """``mapping[key]`` that never repeats the key when it is missing (r28 sec F1 d: a ``KeyError`` carries the key).  The
+    error is a ``LookupError`` with fixed text and nothing chained."""
+    if isinstance(mapping, (list, tuple, str, bytes)):  # a sequence: an out-of-range index would also name the index in its error
+        value = mapping[key] if isinstance(key, int) and -len(mapping) <= key < len(mapping) else _MISSING
+    else:
+        value = mapping.get(key, _MISSING)
+    if value is _MISSING:
+        raise LookupError("a key is missing from the mapping (the key is withheld)")
+    return value
+
+
+_MISSING = object()
 
 
 def key_label(key, position):
@@ -266,9 +318,7 @@ def load_strict(text):
         refuse_anchors(text)  # its scan can fail on a malformed document too
         loader = StrictLoader(text)
         return loader.get_single_data()
-    except StrictYamlError:
-        raise  # our own rule text, never author text
-    except Exception as exc:  # a parser error AND a builtin from a standard-tag constructor (``!!int x`` -> ValueError): r25 sec S1
+    except Exception as exc:  # our own rule text, a parser error AND a builtin from a standard-tag constructor (r25 sec S1); r28: no bare ``raise``
         failure = load_failure(exc)
     finally:
         if loader is not None:

@@ -295,8 +295,16 @@ def url_leaks(text):
 HEADER = "      - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)\n        "
 
 
+def stage_text(target, body):
+    """Write ``body`` to ``target`` (a path under a scratch root or the pin table), creating its directory.  The one write the
+    tests make with loaded text: it is an exempt function of the taint scan, so no other test calls ``write_text``."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+
+
 def sub_once(text, old, new):
-    assert text.count(old) == 1, f"ci.yml no longer holds exactly one copy of the {len(old)}-character mutated text"
+    if text.count(old) != 1:  # a bare assert would print its operands, the workflow text among them
+        raise AssertionError(f"ci.yml no longer holds exactly one copy of the {len(old)}-character mutated text")
     return text.replace(old, new, 1)
 
 
@@ -309,6 +317,11 @@ def assert_same(case, left, right, label):
 def job_re(name):
     """A regex for the printed form of the job ``name``: the positional label and the length, never the name."""
     return r"(?:job|key)\[(?:\d+|\?)\] len=%d" % len(name)
+
+
+def steps_key_ref(index):
+    """A regex for the printed ``steps[N].`` position of the pinned step ``index``."""
+    return r"steps\[%d\]\." % index
 
 
 def step_ref(index, name=""):
@@ -486,13 +499,13 @@ def quote_masked(text, names):
     out = []
     i = 0
     while i < len(text):
-        c = text[i]
+        c = ty.lookup(text, i)
         if c == '"':
             j = i + 1
             while True:
                 if j >= len(text):
                     return None
-                ch = text[j]
+                ch = ty.lookup(text, j)
                 if ch == '"':
                     break
                 if ch == "\\":
@@ -676,10 +689,10 @@ def post_export_steps(workflow, text):
     result = []
     seen = {}
     for index, (job, name, body, _a, _b) in enumerate(steps_found):
-        if job in start and index >= start[job]:
+        if job in start and index >= ty.lookup(start, job):
             key = f"{workflow}:{job}:{name}"
             seen[key] = seen.get(key, 0) + 1
-            result.append((key if seen[key] == 1 else f"{key}#{seen[key]}", body))
+            result.append((key if ty.lookup(seen, key) == 1 else f"{key}#{ty.lookup(seen, key)}", body))
     return result
 
 
@@ -689,8 +702,8 @@ def pin_entry(body):
     Hashes, not the text: the table stays small, and the data file never repeats workflow prose that the repository
     phrase scans read.  Equality of the full SHA-256 is exact-text equality.
     """
-    return {"sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "lines": "".join(hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in body.split("\n"))}
+    return {"sha256": hashlib.sha256(body.encode("utf-8", "surrogatepass")).hexdigest(),
+            "lines": "".join(hashlib.sha256(ln.encode("utf-8", "surrogatepass")).hexdigest()[:12] for ln in body.split("\n"))}
 
 
 JOB_HEAD = re.compile(r"^jobs:\s*(?:#.*)?$")
@@ -742,7 +755,7 @@ def job_layout(text):
     names = set()
     for number, (name, first) in enumerate(keys):
         end = keys[number + 1][1] if number + 1 < len(keys) else stop
-        while end > first + 1 and comment_or_blank(lines[end - 1]):
+        while end > first + 1 and comment_or_blank(ty.lookup(lines, end - 1)):
             end -= 1
         if name in names:
             problems.append(f"job {ty.name_label(name, [k[0] for k in keys])} appears twice")
@@ -839,7 +852,7 @@ def first_difference(pinned, block):
     for number in range(max(len(old), len(new))):
         if number >= len(new):
             return number, "<the job ends here; pinned lines are missing>"
-        if number >= len(old) or hashlib.sha256(new[number].encode("utf-8")).hexdigest()[:12] != old[number]:
+        if number >= len(old) or hashlib.sha256(new[number].encode("utf-8", "surrogatepass")).hexdigest()[:12] != old[number]:
             return number, ""
     return 0, ""
 
@@ -872,11 +885,11 @@ def job_pin_problems(workflow, text, pins=None):
         if name not in tiered:
             problems.append(f"{workflow} job {ty.name_label(name, entry['pinned'])}: "
                             "pinned job is missing or no longer names the tier credential")
-        elif hashlib.sha256(tiered[name].encode("utf-8")).hexdigest() != pinned["sha256"]:
-            offset, _changed = first_difference(pinned, tiered[name])
+        elif hashlib.sha256(ty.lookup(tiered, name).encode("utf-8", "surrogatepass")).hexdigest() != pinned["sha256"]:
+            offset, _changed = first_difference(pinned, ty.lookup(tiered, name))
             loaded, _found = ty.parse_workflow(text)
             job = ((loaded or {}).get("jobs") or {}).get(name)
-            index, label = step_label(tiered[name], offset, job.get("steps") if isinstance(job, dict) else None)
+            index, label = step_label(ty.lookup(tiered, name), offset, job.get("steps") if isinstance(job, dict) else None)
             where = "job-level keys" if index is None else f"step {index} ({label})"
             first = next(j[1] for j in jobs if j[0] == name)
             problems.append(f"{workflow} job {ty.name_label(name, names)} {where}: "
@@ -894,8 +907,8 @@ def job_pin_problems(workflow, text, pins=None):
             problems.append(f"{workflow}: the pinned workflow-level {label}: block is missing")
         elif key not in pinned_level:
             problems.append(f"{workflow}: a workflow-level {key}: block was added and is not pinned")
-        elif hashlib.sha256(level[key].encode("utf-8")).hexdigest() != pinned_level[key]["sha256"]:
-            offset, _changed = first_difference(pinned_level[key], level[key])
+        elif hashlib.sha256(ty.lookup(level, key).encode("utf-8", "surrogatepass")).hexdigest() != ty.lookup(pinned_level, key)["sha256"]:
+            offset, _changed = first_difference(ty.lookup(pinned_level, key), ty.lookup(level, key))
             problems.append(f"{workflow}: the workflow-level {key}: block differs from the pin at its line {offset + 1}")
     if not any(EXPORT_CALL.search(normalised_code(tiered.get(name, ""))) for name in entry["pinned"]):
         problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
@@ -929,7 +942,7 @@ def exempt_pins(root=None):
         if bad or name not in data["jobs"]:
             sys.exit(f"{workflow}: cannot pin an exempt job")  # r26 sec F1: ``exit`` prints its argument, so no job name in it
         entry = table.setdefault(workflow, {"jobs": {}, "workflow_keys": ty.build_pins(data)["workflow_keys"]})
-        entry["jobs"][name] = ty.pin_job(data["jobs"][name])
+        entry["jobs"][name] = ty.pin_job(ty.lookup(data["jobs"], name))
     return table
 
 
@@ -956,7 +969,7 @@ def workflow_key_problems(workflow, data, pinned_keys):
             problems.append(f"{workflow}: the pinned workflow-level key {label} is missing")
         elif key not in pinned_keys:
             problems.append(f"{workflow}: a workflow-level key {label} was added and is not pinned")
-        elif level[key] != pinned_keys[key]:
+        elif ty.lookup(level, key) != ty.lookup(pinned_keys, key):
             problems.append(f"{workflow}: the workflow-level key {label} differs from the pin")
     return problems
 
@@ -979,7 +992,7 @@ def where_differs(job, index):
     if index is None:
         return "job-level keys"
     if index < len(steps):
-        return f"step {index} ({ty.step_label(steps[index], index)})"
+        return f"step {index} ({ty.step_label(ty.lookup(steps, index), index)})"
     return f"step {index} (removed)"
 
 
@@ -1012,15 +1025,15 @@ def primary_pin_problems(workflow, text, primary):
         if name not in tier:
             problems.append(f"{workflow} job {ty.name_label(name, entry['tier_jobs'])}: "
                             "pinned job is missing or no longer names the tier credential")
-        elif ty.digest(jobs[name]) != pinned["sha256"]:
-            index, path = ty.first_difference(pinned, jobs[name])
-            problems.append(f"{workflow} job {ty.job_label(name, jobs)} {where_differs(jobs[name], index)}: differs from the pin at {path}")
+        elif ty.digest(ty.lookup(jobs, name)) != pinned["sha256"]:
+            index, path = ty.first_difference(pinned, ty.lookup(jobs, name))
+            problems.append(f"{workflow} job {ty.job_label(name, jobs)} {where_differs(ty.lookup(jobs, name), index)}: differs from the pin at {path}")
     pinned_keys = entry["workflow_keys"]
     problems += workflow_key_problems(workflow, data, pinned_keys)
     for name, job in jobs.items():
         if name not in entry["tier_jobs"] and EXPORT_CALL.search(ty.normalised_leaves(job)):
             problems.append(f"{workflow} job {ty.job_label(name, jobs)}: the tier export call sits outside a pinned job")
-    if not any(EXPORT_CALL.search(ty.normalised_leaves(jobs[name])) for name in entry["tier_jobs"] if name in jobs):
+    if not any(EXPORT_CALL.search(ty.normalised_leaves(ty.lookup(jobs, name))) for name in entry["tier_jobs"] if name in jobs):
         problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
     problems += ty.non_tier_runner_problems(workflow, data, set(tier))
     for job, where, value in ty.uses_references(data):
@@ -1447,7 +1460,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
             assert_same(self, self.pins[SECONDARY][wf]["jobs"], [j[0] for j in jobs], f"{wf} pinned job list")
             for name, block in tier_blocks(jobs):
                 label = ty.name_label(name, self.pins[SECONDARY][wf]["pinned"])
-                assert_same(self, self.pins[SECONDARY][wf]["pinned"][name], pin_entry(block), f"{wf} pin of {label}")
+                assert_same(self, ty.lookup(self.pins[SECONDARY][wf]["pinned"], name), pin_entry(block), f"{wf} pin of {label}")
             assert_same(self, sorted(self.pins[SECONDARY][wf]["pinned"]), sorted(n for n, _ in tier_blocks(jobs)),
                         f"{wf} pinned job set")
 
@@ -1586,7 +1599,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
         step = next(s for s in pin_targets(wf, text) if "Cleanup" in s[1])
         edited = inject_run_line(text, step, "printenv | base64")
         message = "\n".join(tier_pin_problems(wf, edited, self.pins))
-        index = [s[3] for s in job_steps(wf, text)].index(step[3])
+        index = [i for i, s in enumerate(job_steps(wf, text)) if s[3] == step[3]][0]
         for part in (wf, "line ", f"step {index}"):
             self.assertIs(part in message, True)
         self.assertTrue(re.search(job_re(step[0]), message))
@@ -1665,11 +1678,10 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         (root / ".github" / "workflows").mkdir(parents=True)
         for path in WORKFLOWS.glob("*.y*ml"):
             body = (replace or {}).get(path.name, path.read_text(encoding="utf-8"))
-            (root / ".github" / "workflows" / path.name).write_text(body, encoding="utf-8")
-        for rel, body in (extra or {}).items():
-            target = root / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(body, encoding="utf-8")
+            stage_text(root / ".github" / "workflows" / path.name, body)
+        files = extra or {}
+        for rel, body in files.items():
+            stage_text(root / rel, body)
         return root
 
     # --- the loader -------------------------------------------------------------------------------------------
@@ -2077,7 +2089,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
                         f"{wf} workflow key list")
             self.assertTrue(entry["tier_jobs"])
             for name, pinned in entry["tier_jobs"].items():
-                self.assertEqual(len(pinned["steps"]), len(data["jobs"][name]["steps"]))
+                self.assertEqual(len(pinned["steps"]), len(ty.lookup(data["jobs"], name)["steps"]))
         assert_same(self, sorted(self.pins[PRIMARY]), sorted(PIN_WORKFLOWS), "primary pin workflow set")
 
     def test_the_failure_message_names_workflow_job_step_and_first_differing_key_path_8187_f17(self):
@@ -2085,7 +2097,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         text = self.texts[wf]
         data, _ = ty.parse_workflow(text)
         job = ty.tier_job_names(data)[0]
-        steps = data["jobs"][job]["steps"]
+        steps = ty.lookup(data["jobs"], job)["steps"]
         index = next(i for i, s in enumerate(steps) if isinstance(s.get("run"), str) and "Cleanup" in str(s.get("name", "")))
         step = steps[index]
         edited = add_step_run(text, step["run"], "printenv | base64 # " + USERINFO_SAMPLE)
@@ -2204,7 +2216,7 @@ def write_pins(out=None):
         sys.exit(str(exc))
     table[EXEMPT] = exempt_pins()
     target = JOB_PINS_FILE if out is None else Path(out)
-    target.write_text(json.dumps(table, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    stage_text(target, json.dumps(table, indent=1, sort_keys=True) + "\n")
 
 
 class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
@@ -2221,14 +2233,14 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
         carry the sentinel, and the step index, or ``(None, None)`` when no step fits."""
         for step in pin_targets(workflow, text):
             lines = text.split("\n")
-            if not lines[step[3]].lstrip().startswith("- name:"):
+            if not ty.lookup(lines, step[3]).lstrip().startswith("- name:"):
                 continue
             edited = inject_run_line(text, step, f"echo {sentinel}")
             lines = edited.split("\n")
-            pad = lines[step[3]][:indent_of(lines[step[3]])]
+            pad = ty.lookup(lines, step[3])[:indent_of(ty.lookup(lines, step[3]))]
             lines[step[3]] = f"{pad}- x-note: {sentinel}"
             data = ty.load_strict("\n".join(lines))
-            job = data["jobs"][step[0]]
+            job = ty.lookup(data["jobs"], step[0])
             index = next(i for i, s in enumerate(job["steps"]) if s.get("x-note") == sentinel)
             return "\n".join(lines), index
         return None, None
@@ -2246,7 +2258,7 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
                 self.assertTrue(problems, "the edited step must differ from its pins")
                 self.assertEqual(len([p for p in problems if sentinel in p]), 0)
                 primary = [p for p in problems if re.search(step_ref(index), p) and "differs from the pin at" in p]
-                self.assertTrue([p for p in primary if re.search(rf"steps\[{index}\]\.", p)], "%d problem lines" % len(problems))
+                self.assertTrue([p for p in primary if re.search(steps_key_ref(index), p)], "%d problem lines" % len(problems))
                 self.assertTrue([p for p in job_pin_problems(wf, edited, self.pins[SECONDARY])
                                  if re.search(step_ref(index), p) and "differs from the pin at line" in p])
         self.assertGreater(checked, 0)
@@ -2345,7 +2357,7 @@ class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
                                               ("unnamed", False, False)):
                 edited = splice(text, target[3], self.planted_step(named, env_first))
                 data = ty.load_strict(edited)
-                job_steps = data["jobs"][target[0]]["steps"]
+                job_steps = ty.lookup(data["jobs"], target[0])["steps"]
                 index = next(i for i, s in enumerate(job_steps) if "SENTINEL-F27-env" in json.dumps(s))
                 want = "real" if named else ""
                 problems = tier_pin_problems(wf, edited, self.pins) + job_pin_problems(wf, edited, self.pins[SECONDARY])
@@ -2459,7 +2471,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                 continue
             for variant, (planted, real) in self.cases().items():
                 edited = splice(text, target[3], planted)
-                job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+                job_steps = ty.lookup(ty.load_strict(edited)["jobs"], target[0])["steps"]
                 index = next(i for i, step in enumerate(job_steps)
                              if any(x in json.dumps(step) for x in sentinels))
                 problems = tier_pin_problems(wf, edited, self.pins) + job_pin_problems(wf, edited, self.pins[SECONDARY])
@@ -2481,7 +2493,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
             if target is None:
                 continue
             edited = splice(text, target[3], planted)
-            job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+            job_steps = ty.lookup(ty.load_strict(edited)["jobs"], target[0])["steps"]
             index = next(i for i, step in enumerate(job_steps) if sentinel in json.dumps(step))
             views = {"loaded": tier_pin_problems(wf, edited, self.pins),
                      "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
@@ -2511,7 +2523,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
             for variant, (name, label) in cases.items():
                 self.assertGreaterEqual(name.index("@"), 70)
                 edited = splice(text, target[3], [f"      - name: {name}", "        run: echo one"])
-                job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+                job_steps = ty.lookup(ty.load_strict(edited)["jobs"], target[0])["steps"]
                 index = next(i for i, step in enumerate(job_steps) if sentinel in json.dumps(step))
                 views = {"loaded": tier_pin_problems(wf, edited, self.pins),
                          "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
@@ -2552,7 +2564,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                 continue
             for variant, planted in cases.items():
                 edited = splice(text, target[3], planted + ["        run: echo one"])
-                job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+                job_steps = ty.lookup(ty.load_strict(edited)["jobs"], target[0])["steps"]
                 index = next(i for i, step in enumerate(job_steps) if sentinel in json.dumps(step))
                 views = {"loaded": tier_pin_problems(wf, edited, self.pins),
                          "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
@@ -2727,7 +2739,7 @@ class CanaryRun:
         key = (shape_name, original)
         if key not in self.names:
             self.names[key] = self.mint(kind, shape)
-        return self.names[key]
+        return ty.lookup(self.names, key)
 
     def observe(self, shape_name, scenario, call, *args, expect=None):
         """Run ``call(*args)`` capturing every channel; scan it for markers; record the pass/fail expectation.  Each capture
@@ -2863,8 +2875,8 @@ def pins_for(texts, mod=None):
         found, layout_bad = mod.job_layout(raw)
         if layout_bad:
             raise ValueError("%s: %d layout problems" % (workflow, len(layout_bad)))
-        table[mod.PRIMARY][workflow] = mod.ty.build_pins(data)
-        table[mod.SECONDARY][workflow] = {
+        ty.lookup(table, mod.PRIMARY)[workflow] = mod.ty.build_pins(data)
+        ty.lookup(table, mod.SECONDARY)[workflow] = {
             "jobs": [j[0] for j in found],
             "pinned": {name: mod.pin_entry(block) for name, block in mod.tier_blocks(found)},
             "workflow": {key: mod.pin_entry(block) for key, block in sorted(mod.workflow_level_blocks(raw).items())}}
@@ -2913,21 +2925,21 @@ def canary_diff_scenarios(run, shape_name, shape, wf, text):
     the secondary pins name a workflow-level block the text lacks (the ``first_difference`` and ``name_label`` arms)."""
     mod = run.mod
     pins = run.pins
-    job = sorted(pins[mod.PRIMARY][wf]["tier_jobs"])[0]
+    job = sorted(ty.lookup(pins, mod.PRIMARY)[wf]["tier_jobs"])[0]
     zero = "0" * 64
     for where in ("job", "step"):
         data = copy.deepcopy(run.datas[wf])
-        holder = data["jobs"][job] if where == "job" else data["jobs"][job]["steps"][0]
+        holder = ty.lookup(data["jobs"], job) if where == "job" else ty.lookup(data["jobs"], job)["steps"][0]
         holder[run.name("extra-" + where + "-key", "key", shape_name, shape)] = "x"
-        run.views(shape_name, "fail-text-extra-%s-key/%s" % (where, wf), wf, canary_dump(data), pins[mod.PRIMARY],
-                  pins[mod.SECONDARY], "fail")
-        edited = copy.deepcopy(pins[mod.PRIMARY])
-        entry = edited[wf]["tier_jobs"][job]
+        run.views(shape_name, "fail-text-extra-%s-key/%s" % (where, wf), wf, canary_dump(data), ty.lookup(pins, mod.PRIMARY),
+                  ty.lookup(pins, mod.SECONDARY), "fail")
+        edited = copy.deepcopy(ty.lookup(pins, mod.PRIMARY))
+        entry = ty.lookup(edited[wf]["tier_jobs"], job)
         target = entry if where == "job" else entry["steps"][0]
         target["keys"][run.name("pin-" + where + "-key", "key", shape_name, shape)] = zero
         target["sha256"] = entry["sha256"] = zero
-        run.views(shape_name, "fail-pin-extra-%s-key/%s" % (where, wf), wf, text, edited, pins[mod.SECONDARY], "fail", None)
-    blocks = copy.deepcopy(pins[mod.SECONDARY])
+        run.views(shape_name, "fail-pin-extra-%s-key/%s" % (where, wf), wf, text, edited, ty.lookup(pins, mod.SECONDARY), "fail", None)
+    blocks = copy.deepcopy(ty.lookup(pins, mod.SECONDARY))
     blocks[wf].setdefault("workflow", {})[run.name("pin-block", "key", shape_name, shape)] = mod.pin_entry("x: 1")
     run.observe(shape_name, "fail-pin-extra-block/" + wf + "/text", mod.job_pin_problems, wf, text, blocks, expect="fail")
 
@@ -2971,7 +2983,7 @@ def canary_scenarios(run, shape_name, shape):
                 renamed = text.replace("- name: " + step[1], "- name: " + json.dumps(shape(run.mint("step", shape))), 1)
                 run.views(shape_name, "fail-renamed-step/" + wf, wf, renamed, pins[mod.PRIMARY], pins[mod.SECONDARY], "fail")
                 lines = injected.split("\n")
-                pad = lines[step[3]][:mod.indent_of(lines[step[3]])]
+                pad = ty.lookup(lines, step[3])[:mod.indent_of(ty.lookup(lines, step[3]))]
                 lines[step[3]] = "%s- x-note: %s" % (pad, json.dumps(shape(run.mint("key", shape))))
                 run.views(shape_name, "fail-unnamed-step/" + wf, wf, "\n".join(lines), pins[mod.PRIMARY], pins[mod.SECONDARY], "fail")
         for keys in (False, True):
@@ -3037,7 +3049,7 @@ def canary_repo_scenario(run, shape_name, shape):
         run.observe(shape_name, "fail-repo-marker-pins", mod.repo_problems, root, marked, expect="fail")
         for workflow, job in mod.self_hosted_rows():
             exempt = ty_mod.load_lenient((mod.WORKFLOWS / workflow).read_text(encoding="utf-8"))
-            exempt["jobs"][job]["strategy"]["matrix"] = {run.name("matrix-key", "key", shape_name, shape): "scalar"}
+            ty.lookup(exempt["jobs"], job)["strategy"]["matrix"] = {run.name("matrix-key", "key", shape_name, shape): "scalar"}
             (target / workflow).write_text(canary_dump(exempt), encoding="utf-8")
         run.observe(shape_name, "fail-repo-marker-matrix", mod.repo_problems, root, run.pins, expect="fail")
 
@@ -3113,9 +3125,9 @@ def canary_controls(run):
         warnings.warn(marker)
 
     def control_notes(marker):
-        exc = ValueError("outer")
-        exc.add_note(marker)  # the marker lives in ``__notes__`` only: not in str, args, the cause or the context
-        raise exc
+        outer = ValueError("outer")
+        outer.add_note(marker)  # the marker lives in ``__notes__`` only: not in str, args, the cause or the context
+        raise outer
 
     def control_cause_notes(marker):
         inner = ValueError("inner")
@@ -3146,6 +3158,33 @@ def canary_controls(run):
         outer.__context__ = middle
         raise outer
 
+    def control_cause_8_notes(marker):
+        link = ValueError("deepest")
+        link.add_note(marker)  # the marker lives in the notes of the cause eight links deep only (r28 code F5)
+        for depth in range(8):
+            outer = RuntimeError("cause link %d" % depth)
+            outer.__cause__ = link
+            link = outer
+        raise link
+
+    def control_context_8_notes(marker):
+        link = ValueError("deepest")
+        link.add_note(marker)  # the marker lives in the notes of the context eight links deep only (r28 code F5)
+        for depth in range(8):
+            outer = RuntimeError("context link %d" % depth)
+            outer.__context__ = link
+            link = outer
+        raise link
+
+    def control_cycle_notes(marker):
+        top, second, third, last = ValueError("top"), RuntimeError("second"), KeyError("third"), OSError("last")
+        last.add_note(marker)  # three links deep, behind a cycle (last -> second): the walk must end and still reach the note
+        top.__cause__ = second
+        second.__cause__ = third
+        third.__cause__ = last
+        last.__cause__ = second
+        raise top
+
     controls = {
         "print": lambda marker: print("seen", marker),
         "stderr": lambda marker: print(marker, file=sys.stderr),
@@ -3162,6 +3201,9 @@ def canary_controls(run):
         controls["exception-context-notes"] = control_context_notes
         controls["exception-cause-cause-notes"] = control_cause_cause_notes
         controls["exception-context-context-notes"] = control_context_context_notes
+        controls["exception-cause-8-notes"] = control_cause_8_notes
+        controls["exception-context-8-notes"] = control_context_8_notes
+        controls["exception-cycle-notes"] = control_cycle_notes
     return controls
 
 
@@ -3265,42 +3307,344 @@ ASSERT_PREFIX = "assert"
 # names that hold repo paths or test-written constants (workflow file names, mutant labels), public by construction
 PUBLIC_NAMES = frozenset(("wf", "workflow", "workflow_name", "path"))
 # containers keyed by test-written constants: the KEY of ``.items()`` over them is public
-STATIC_KEYED = frozenset(("mutants", "forms", "texts", "DUMP_MUTANTS", "F10_MUTANTS", "cases", "shapes", "views", "keys", "variants",
+STATIC_KEYED = frozenset(("files", "mutants", "forms", "texts", "DUMP_MUTANTS", "F10_MUTANTS", "cases", "shapes", "views", "keys", "variants",
                           "positional_cases"))
 WRAPPED_ASSERTS = frozenset(("assert_same", "assert_has"))
-# r27 sec F1, code F1: the scan is a POSITIVE enumeration.  A call that receives a tainted value (positionally, by keyword,
-# starred, inside a container literal, through an f-string or an operator, as the receiver, or as the callee itself) is
-# flagged unless its callee is on one of the accepted sets below: the wrappers of ``TAINT_SAFE_CALLS``, the loaders of
-# ``TAINT_SOURCES``, the test's own helpers (their bodies are analysed with the tainted parameters), the container mutators
-# of ``TAINT_MUTATORS`` (they only move the value into a container) and the named non-output callables of
-# ``TAINT_ACCEPTED_CALLEES``.  Every output path (a print, a logger, a stream, a descriptor, a child process, an exit, an
-# exception hook, a deferred call) is therefore refused without being listed: it is simply not on the accepted sets.
-TAINT_MUTATORS = frozenset(("add", "add_note", "append", "extend", "insert", "setdefault", "update"))
-TAINT_ACCEPTED_CALLEES = frozenset((
-    "abs", "bytes", "chr", "copy", "count", "decode", "deepcopy", "dict",
-    "dumps", "encode", "end", "enumerate", "findall", "finditer", "float", "format",
-    "frozenset", "fullmatch", "get", "group", "groups", "hexdigest", "int", "items",
-    "iter", "join", "keys", "list", "lower", "lstrip", "match", "max",
-    "min", "next", "ord", "partition", "removeprefix", "removesuffix", "replace", "repr",
-    "reversed", "rfind", "rindex", "rsplit", "rstrip", "search", "set", "sha256",
-    "sorted", "span", "split", "splitlines", "str", "strip", "sub",
-    "sum", "tuple", "upper", "values", "zip"))
-# r27: the value helpers of the two checked files, the AST walkers and the file-system calls the harness uses on loaded text;
-# none of them prints, logs, writes a stream or starts a process (a file written under ``.local-runs`` is not an output path:
-# the canary reads every channel it can reach, and the file contents are checked by the same leak scan)
-TAINT_ACCEPTED_HARNESS = frozenset((
-    "TaintScan", "exemption_problem", "first_difference", "get_source_segment", "indent_of", "inject_run_line",
-    "iter_child_nodes", "mkdir", "name", "non_tier_runner_problems", "observe", "parse", "pin_job", "runner_problem",
-    "scan", "splice", "stale_row_problems", "url_leaks", "views", "walk", "where_differs", "write_text"))
-TAINT_ACCEPTED_ALL = TAINT_ACCEPTED_CALLEES | TAINT_ACCEPTED_HARNESS
+# r27 sec F1, code F1; revised r28 sec F1, code F1-F2: the scan is a POSITIVE enumeration.  A call that receives a loaded value
+# (positionally, by keyword, starred, inside a container literal, through an f-string or an operator, as the receiver, or as
+# the callee itself) is flagged unless its callee is accepted BY RECEIVER PLUS NAME or as a resolved builtin: a bare name of
+# ``TAINT_ACCEPTED_BUILTINS``; an import-resolved name listed whole in ``TAINT_ACCEPTED_QUALIFIED`` (``re.sub``); a value
+# method of ``TAINT_ACCEPTED_METHODS`` / ``TAINT_MUTATORS`` on a plain receiver (not an import, not a name bound from one); a
+# wrapper or loader of the checker; a function, class or lambda of this module (its body is analysed with the tainted
+# parameters).  A bare attribute name matches nothing by itself.  An argument that resolves to a callable must be accepted too
+# (``sorted(xs, key=partial(print))``, ``re.sub(p, print, text)``).  A subscript with a loaded key, a store to an imported
+# object, a bare ``raise``, a ``raise`` of a caught exception and every sub-expression of a bare ``assert`` are sinks.  Every
+# output path (a print, a logger, a stream, a descriptor, a child process, an exit, an exception hook, a deferred call, an
+# environment write) is therefore refused without being listed: it is simply not on the accepted sets.
+TAINT_MUTATORS = frozenset(("add", "append", "extend", "insert", "setdefault", "update"))
+# bare names that resolve to a builtin: none of them writes, spawns, mutates the environment or repeats its argument in an
+# error (``int``, ``float``, ``format`` and ``open`` are not here)
+TAINT_ACCEPTED_BUILTINS = frozenset((
+    "abs",
+    "all",
+    "any",
+    "bool",
+    "bytes",
+    "callable",
+    "chr",
+    "dict",
+    "enumerate",
+    "frozenset",
+    "hasattr",
+    "id",
+    "isinstance",
+    "iter",
+    "len",
+    "list",
+    "max",
+    "min",
+    "next",
+    "ord",
+    "range",
+    "repr",
+    "reversed",
+    "set",
+    "sorted",
+    "str",
+    "sum",
+    "tuple",
+    "zip",
+))
+# value methods: ``decode`` and ``encode`` (accepted with a constant ``errors=\"replace\"`` or ``\"ignore\"``) and ``format``
+# (accepted on a constant template without a spec, a conversion or a field path) are judged in ``static_accepts``
+TAINT_ACCEPTED_METHODS = frozenset((
+    "count",
+    "end",
+    "endswith",
+    "find",
+    "get",
+    "group",
+    "groupdict",
+    "groups",
+    "hexdigest",
+    "isdigit",
+    "items",
+    "join",
+    "keys",
+    "lower",
+    "lstrip",
+    "partition",
+    "removeprefix",
+    "removesuffix",
+    "replace",
+    "rfind",
+    "rpartition",
+    "rsplit",
+    "rstrip",
+    "span",
+    "split",
+    "splitlines",
+    "start",
+    "startswith",
+    "strip",
+    "upper",
+    "values",
+))
+# import-resolved names, listed whole
+TAINT_ACCEPTED_QUALIFIED = frozenset((
+    "ast.get_source_segment",
+    "ast.iter_child_nodes",
+    "ast.walk",
+    "copy.copy",
+    "copy.deepcopy",
+    "hashlib.sha256",
+    "json.dumps",
+    "json.loads",
+    "os.path.join",
+    "re.compile",
+    "re.escape",
+    "re.findall",
+    "re.finditer",
+    "re.fullmatch",
+    "re.match",
+    "re.search",
+    "re.split",
+    "re.sub",
+    "re.subn",
+    "unicodedata.normalize",
+    "urllib.parse.unquote",
+))
+# the calls the bodies of ``TAINT_EXEMPT_FUNCTIONS`` make besides the accepted sets above, by their dotted text
+TAINT_EXEMPT_CALLS = frozenset((
+    "Dumper.add_representer",
+    "compile",
+    "dumper.represent_scalar",
+    "exec",
+    "super",
+    "super().increase_indent",
+    "sys.modules.get",
+    "sys.modules.pop",
+    "sys.modules.update",
+    "target.parent.mkdir",
+    "target.write_text",
+    "types.ModuleType",
+    "yaml.dump",
+))
+# a string run as code is a path the scan cannot follow: flagged wherever it appears in scanned code
+# methods of a compiled pattern (a name bound from ``re.compile``); they only read the text they are given
+# r28: the compiled patterns of the gated tier module, which the checker re-exports under the same name
+TAINT_PROJECT_PATTERNS = frozenset(("EMPTY_EXPANSION", "EXPORT_CALL", "TIER_JOB_MARK", "TIER_MARKERS", "TIER_VERBS"))
+TAINT_PATTERN_METHODS = frozenset(("findall", "finditer", "fullmatch", "match", "search", "split", "sub", "subn"))
+# calls and methods that return a number (a position, a count, a code point): a subscript keyed by one repeats no author text
+TAINT_INT_FUNCTIONS = frozenset(("len", "ord", "id"))
+TAINT_INT_METHODS = frozenset(("count", "end", "find", "rfind", "start"))
+# accepted callees that RUN a positional argument on the value (``re.sub(p, repl, text)``, ``iter(f, stop)``); every accepted callee
+# also runs a callable handed by one of the ``CALLABLE_KEYWORDS``
+TAINT_RUNS_POSITIONAL = frozenset(("iter", "re.sub", "re.subn", "sub", "subn"))
+TAINT_NEVER_CALLED = frozenset(("__import__", "compile", "eval", "exec"))
+# a call that reads the local variables of a frame (or builds a summary that can) shows every tainted local of the scope it
+# runs in: a finding while the scope holds loaded material (security r27 B1)
+TAINT_FRAME_CALLS = frozenset((
+    "FrameSummary", "StackSummary", "_getframe", "currentframe", "getframeinfo", "getinnerframes", "getouterframes", "globals",
+    "locals", "stack", "vars", "walk_stack", "walk_tb"))
+TAINT_PROJECT_MODULE = "tier_yaml_8187"
+# data attributes of imported modules (an UPPER-CASE name such as ``re.I`` is data as well)
+TAINT_DATA_ATTRS = frozenset(("curdir", "linesep", "maxsize", "pardir", "pathsep", "platform", "sep"))
+# the callable builtins: one of them handed as an argument is a callable (accepted only if listed above)
+TAINT_BUILTIN_CALLABLES = frozenset((
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "NotADirectoryError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+    "__import__",
+    "abs",
+    "aiter",
+    "all",
+    "anext",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "breakpoint",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "compile",
+    "complex",
+    "copyright",
+    "credits",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "exit",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "help",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "license",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "quit",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
+))
+# factories whose result is a callable (a name bound from one is a suspect callable)
+TAINT_CALLABLE_FACTORIES = frozenset((
+    "functools.partial", "functools.partialmethod", "operator.attrgetter", "operator.itemgetter", "operator.methodcaller",
+    "types.MethodType"))
+# the files this checker reads of itself are public repository text, not workflow data
+TAINT_PUBLIC_PATHS = frozenset(("THIS_PATH", "TY_PATH"))
 # r27: attributes that hold a number or a name, never author text (``node.lineno``, ``loader.__name__``)
 TAINT_CLEAN_ATTRS = frozenset(("lineno", "end_lineno", "col_offset", "end_col_offset", "__name__"))
 # r27: the two functions whose bodies the scan skips on the SHIPPED files only (``exempt=``): ``load_variant`` executes the
-# mutated module source and ``canary_dump`` serialises a canary tree; neither has an output path, and a shape that defines
-# a function of the same name is still scanned because the shape tests pass no exemption
-TAINT_EXEMPT_FUNCTIONS = frozenset(("canary_dump", "load_variant"))
+# mutated module source and ``canary_dump`` serialises a canary tree.  r28: ``exempt_function_defects`` walks every call, raise,
+# assert, subscript store and attribute store in both against the accepted sets above plus ``TAINT_EXEMPT_CALLS``; a shape that
+# defines a function of the same name is still scanned because the shape tests pass no exemption
+TAINT_EXEMPT_FUNCTIONS = frozenset(("canary_dump", "load_variant", "stage_text"))
+# r28: an exempt function that writes a file; a tainted path argument is a finding (the body is the exempt part, the path is not)
+TAINT_PATH_FUNCTIONS = frozenset(("stage_text",))
 # the keywords through which an accepted callee runs a callable on the loaded value (``sorted(..., key=f)``)
-CALLABLE_KEYWORDS = frozenset(("key", "default", "repl", "cmp", "func", "callback", "object_hook", "object_pairs_hook"))
+CALLABLE_KEYWORDS = frozenset(("key", "default", "repl", "cmp", "func", "callback", "object_hook", "object_pairs_hook", "cls"))
+
+
+def root_name(node):
+    """The name at the root of an attribute, subscript, call or star chain (``box[0].append`` -> ``box``), else None."""
+    while True:
+        if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            node = node.func
+        else:
+            break
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def constant_template(node):
+    """A constant string template whose fields hold a bare name or number: no spec, no conversion, no attribute or item path."""
+    if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+        return False
+    return re.search(r"\{[^{}]*[.\[:!]", re.sub(r"\{\{|\}\}", "", node.value)) is None
+
+
+def call_text(func):
+    """The dotted text of a callee (``super().increase_indent``), ``?`` for anything else."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return call_text(func.value) + "." + func.attr
+    if isinstance(func, ast.Call):
+        return call_text(func.func) + "()"
+    return "?"
 
 
 def call_name(node):
@@ -3343,6 +3687,516 @@ class TaintScan:
         self.lambdas = {}       # name -> (Lambda node, environment at the assignment): a local lambda is a helper too
         self.callees = set()    # r27: the names of the calls that were flagged (to curate ``TAINT_ACCEPTED_CALLEES``)
         self.leaked_public = set()  # r24 sec F5: a PUBLIC_NAMES name that was ever assigned or passed a tainted value
+        self.defs = [n for n in ast.walk(self.tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        self.classes = {n.name for n in ast.walk(self.tree) if isinstance(n, ast.ClassDef)}
+        self.handler_names = {n.name for n in ast.walk(self.tree) if isinstance(n, ast.ExceptHandler) and n.name}
+        self.imports = {}       # r28: the name an import binds -> the dotted name it resolves to
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    self.imports[alias.asname or top] = alias.name if alias.asname else top
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                for alias in node.names:
+                    self.imports[alias.asname or alias.name] = "%s.%s" % (node.module, alias.name)
+        self.scopes = {None: set()}  # r28: per function, the names bound from an import (a stream, a path, a client, a process)
+        self.cur = None
+        self.instances = set()  # r28: names bound to an instance of a class of this module
+        self.patterns = set()   # r28: names bound to a compiled pattern
+        self.keyed = []         # r28: the load subscripts flagged for a tainted key (a missing key repeats it)
+        self.projects = {None: set()}  # r28: per scope, the names bound to the checker module, the gated tier module or a variant
+        self.mparams = set()    # (function, parameter) pairs that every call site fills with one of those modules
+        self.callable_names = set()  # r28: names bound to a callable factory result (``partial(print)``)
+        self.int_scopes = {None: set()}
+        self.pub_scopes = {None: set()}  # r28: per scope, the names bound ONLY to the checker's own two files (``for path in (TY_PATH, ...)``)
+        self.tables = {}        # r28: module-level tables whose values are all lambdas or functions of this module
+        self.table_lams = []    # the lambdas of those tables (each is run when a table callable gets a loaded value)
+        self.table_funcs = set()
+        self.cparams, self.tparams = set(), set()  # (function, parameter) pairs that always receive a callable / a table
+        self.clocals, self.tlocals, self.cbad = {None: set()}, {None: set()}, {None: set()}
+        self.lambda_names = {t.id for n in ast.walk(self.tree) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Lambda)
+                             for t in n.targets if isinstance(t, ast.Name)}  # r28: names bound to a lambda of this module
+        self.const_keyed = set()  # r28: functions whose every return is a dict literal keyed by string constants
+        for func in self.defs:
+            returns = [n for n in self.scope_nodes(func) if isinstance(n, ast.Return)]
+            if returns and all(isinstance(r.value, ast.Dict) and r.value.keys and all(
+                    isinstance(k, ast.Constant) and isinstance(k.value, str) for k in r.value.keys) for r in returns):
+                self.const_keyed.add(func.name)
+        self.ctor_calls = set()  # ids of the calls that build an instance of a class of this module
+        self.parent, self.argnames = {}, {}  # a function's enclosing function, and the names of its parameters
+        self.prepass()
+
+    @property
+    def foreign(self):
+        """The foreign names visible in the scope being walked: the module's and the current function's."""
+        return self.scopes[None] | self.scopes.get(self.cur, set())
+
+    @staticmethod
+    def scope_nodes(top):
+        """Every node of ``top`` without descending into a function or lambda nested in it (a function is its own scope)."""
+        pending = [top]
+        while pending:
+            node = pending.pop()
+            yield node
+            for child in ast.iter_child_nodes(node):
+                if not (child is not top and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))):
+                    pending.append(child)
+
+    @property
+    def ints(self):
+        """The integer-valued names visible in the scope being walked."""
+        return self.int_scopes[None] | self.int_scopes.get(self.cur, set())
+
+    def int_valued(self, node):
+        """Whether ``node`` is a number: a constant, a counted or positioned value, arithmetic over numbers, or a name that is
+        bound only to numbers in this scope (a loop index, a ``len``).  A subscript keyed by one cannot repeat author text."""
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, int) and not isinstance(node.value, bool)
+        if isinstance(node, ast.Name):
+            return node.id in self.ints
+        if isinstance(node, ast.UnaryOp):
+            return isinstance(node.op, (ast.USub, ast.UAdd)) and self.int_valued(node.operand)
+        if isinstance(node, ast.BinOp):
+            return isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod)) and self.int_valued(node.left) \
+                and self.int_valued(node.right)
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                return func.id in TAINT_INT_FUNCTIONS and func.id not in self.functions
+            return isinstance(func, ast.Attribute) and func.attr in TAINT_INT_METHODS and self.plain_receiver(func.value)
+        return False
+
+    @property
+    def pubs(self):
+        return self.pub_scopes[None] | self.pub_scopes.get(self.cur, set())
+
+    def pub_pass(self, scope, top):
+        """The names of ``scope`` that are bound ONLY to one of the checker's own two files: a loop variable over a tuple or a
+        list of them, or an alias of one.  ``path.read_text()`` on such a name reads public repository text."""
+        good, bad = set(), set()
+        for node in self.scope_nodes(top):
+            pairs = []
+            if isinstance(node, ast.Assign):
+                pairs = [(target, node.value) for target in node.targets]
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
+                pairs = [(node.target, None)]
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                it = node.iter
+                if isinstance(it, (ast.Tuple, ast.List)) and it.elts and all(
+                        isinstance(e, ast.Name) and e.id in TAINT_PUBLIC_PATHS for e in it.elts):
+                    pairs = [(node.target, it.elts[0])]
+                else:
+                    pairs = [(node.target, None)]
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                pairs = [(item.optional_vars, None) for item in node.items if item.optional_vars is not None]
+            elif isinstance(node, ast.NamedExpr):
+                pairs = [(node.target, None)]
+            for target, value in pairs:
+                for name in (n.id for n in ast.walk(target) if isinstance(n, ast.Name)):
+                    if isinstance(target, ast.Name) and isinstance(value, ast.Name) and value.id in TAINT_PUBLIC_PATHS:
+                        good.add(name)
+                    else:
+                        bad.add(name)
+        args = top.args if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+        if args is not None:
+            bad.update(a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs])
+            bad.update(a.arg for a in (args.vararg, args.kwarg) if a is not None)
+        return good - bad
+
+    def int_pass(self, scope, top):
+        """The names of ``scope`` that are bound ONLY to numbers (a loop index from ``range`` or ``enumerate``, a ``len``, a
+        position): every binding of the name in the scope must be a number."""
+        good, bad = set(), set()
+        for node in self.scope_nodes(top):
+            pairs = []
+            if isinstance(node, ast.Assign):
+                pairs = [(target, node.value) for target in node.targets]
+            elif isinstance(node, ast.AugAssign):
+                pairs = [(node.target, ast.BinOp(left=node.target, op=node.op, right=node.value))]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                pairs = [(node.target, node.value)]
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                it, tgt = node.iter, node.target
+                if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" \
+                        and isinstance(tgt, ast.Name):
+                    pairs = [(tgt, ast.Constant(value=0))]
+                elif isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "enumerate" \
+                        and isinstance(tgt, ast.Tuple) and len(tgt.elts) == 2 and isinstance(tgt.elts[0], ast.Name):
+                    pairs = [(tgt.elts[0], ast.Constant(value=0)), (tgt.elts[1], None)]
+                else:
+                    pairs = [(tgt, None)]
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                pairs = [(item.optional_vars, None) for item in node.items if item.optional_vars is not None]
+            elif isinstance(node, ast.NamedExpr):
+                pairs = [(node.target, node.value)]
+            for target, value in pairs:
+                for name in (n.id for n in ast.walk(target) if isinstance(n, ast.Name)):
+                    if value is not None and isinstance(target, ast.Name) and self.int_valued(value):
+                        good.add(name)
+                    else:
+                        bad.add(name)
+        args = top.args if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+        if args is not None:
+            bad.update(a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs])
+            bad.update(a.arg for a in (args.vararg, args.kwarg) if a is not None)
+        return good - bad
+
+    def module_value(self, value):
+        """Whether ``value`` is the checker module, the gated tier module or a variant of one: the ``ty`` / ``mod`` attribute
+        of a harness object, ``sys.modules[__name__]``, or the project module itself."""
+        if isinstance(value, ast.Attribute):
+            return value.attr in ("ty", "mod")
+        if isinstance(value, ast.Subscript):  # exactly ``sys.modules[__name__]``: any other key is another module
+            return self.dotted(value.value) == "sys.modules" and isinstance(value.slice, ast.Name) and value.slice.id == "__name__"
+        if isinstance(value, ast.Name):
+            return self.is_project(value.id) or self.imports.get(value.id) == TAINT_PROJECT_MODULE
+        if isinstance(value, ast.Call):  # the harness builds a variant of the two files
+            return isinstance(value.func, ast.Name) and value.func.id == "load_variant" and "load_variant" in self.functions
+        return False
+
+    def is_project(self, name):
+        """Whether ``name`` is, in the scope being walked, bound to the checker module, the gated tier module or a variant of
+        one: assigned from such a value, or a parameter that every call site fills with one."""
+        scope = self.cur
+        while True:
+            if name in self.projects.get(scope, ()):
+                return True
+            if name in self.argnames.get(scope, ()):
+                return (scope, name) in self.mparams
+            if scope is None:
+                return False
+            scope = self.parent.get(scope)
+
+    def foreign_value(self, value):
+        """Whether ``value`` is an object of an imported module (or a call that returns one) rather than a plain value."""
+        if self.module_value(value):
+            return False
+        if isinstance(value, ast.Call):
+            if self.static_accepts(value):
+                return False
+            func = value.func
+            if isinstance(func, ast.Name):
+                return func.id not in self.functions and func.id not in self.classes and func.id not in self.lambda_names
+            root = root_name(func)
+            return root is not None and (root in self.imports or root in self.foreign)
+        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+            root = self.store_root(value)
+            return root is not None and (root in self.imports or root in self.foreign)
+        return False
+
+    def prepass(self):
+        """The names the checks below need before the walk: ``foreign`` (bound from an import), ``instances`` (bound to an
+        instance of a class of this module) and ``callable_names`` (bound to a callable factory result)."""
+        scopes = [(None, self.tree)] + [(func.name, func) for func in self.defs]
+        for _ in range(4):
+            for scope, top in scopes:
+                self.cur = scope
+                self.scope_pass(scope, top)
+        self.callable_pass(scopes)
+        for _ in range(2):
+            for scope, top in scopes:
+                self.cur = scope
+                self.scope_pass(scope, top)
+        for _ in range(3):
+            for scope, top in scopes:
+                self.cur = scope
+                self.int_scopes[scope] = self.int_pass(scope, top)
+        for scope, top in scopes:
+            self.pub_scopes[scope] = self.pub_pass(scope, top)
+        self.cur = None
+
+    def callable_expr(self, e, scope):
+        """r28: whether ``e`` is, by construction, a lambda or a function of this module (not a value an import supplies)."""
+        if isinstance(e, ast.Lambda) or (isinstance(e, ast.Constant) and e.value is None):
+            return True
+        if isinstance(e, ast.Name):
+            found = self.visible(scope, e.id, "c")
+            if found is not None:
+                return found
+            return e.id in self.lambdas or (e.id in self.functions and e.id not in self.imports)
+        if isinstance(e, ast.Subscript):
+            return self.table_expr(e.value, scope)
+        if isinstance(e, ast.IfExp):
+            return self.callable_expr(e.body, scope) and self.callable_expr(e.orelse, scope)
+        if isinstance(e, ast.Attribute):  # a name of the checker or of the gated tier module: both are scanned themselves
+            saved, self.cur = self.cur, scope
+            try:
+                return self.module_value(e.value)
+            finally:
+                self.cur = saved
+        return False
+
+    def visible(self, scope, name, kind):
+        """Whether ``name`` is, in ``scope`` or the nearest enclosing scope that binds it, a callable (``c``) or a table (``t``)
+        by construction; None when no function scope binds it (the module level decides)."""
+        while True:
+            if name in self.cbad.get(scope, ()):
+                return False
+            if name in (self.clocals if kind == "c" else self.tlocals).get(scope, ()):
+                return True
+            if name in self.argnames.get(scope, ()):
+                return (scope, name) in (self.cparams if kind == "c" else self.tparams)
+            if scope is None:
+                return None
+            scope = self.parent.get(scope)
+
+    def table_expr(self, e, scope):
+        """r28: whether ``e`` is a table of callables: a module-level one, one handed over by every caller, or a literal."""
+        if isinstance(e, ast.Constant):
+            return e.value is None
+        if isinstance(e, ast.Name):
+            found = self.visible(scope, e.id, "t")
+            return e.id in self.tables if found is None else found
+        if isinstance(e, ast.Attribute):
+            base = e.value
+            project = (isinstance(base, ast.Name) and (self.is_project(base.id) or base.id not in self.imports)) \
+                or (isinstance(base, ast.Attribute) and base.attr in ("ty", "mod"))
+            return project and e.attr in self.tables  # only the two module-level tables of this module, by name
+        if isinstance(e, ast.BoolOp):
+            return all(self.table_expr(v, scope) for v in e.values)
+        if isinstance(e, ast.IfExp):
+            return self.table_expr(e.body, scope) and self.table_expr(e.orelse, scope)
+        if isinstance(e, ast.Dict):
+            return bool(e.values) and all(v is not None and self.callable_expr(v, scope) for v in e.values)
+        if isinstance(e, (ast.List, ast.Tuple)):
+            return bool(e.elts) and all(self.callable_expr(v, scope) for v in e.elts)
+        if isinstance(e, ast.DictComp):
+            return isinstance(e.value, ast.Subscript) and self.table_expr(e.value.value, scope)  # {name: TABLE[name] ...}
+        return False
+
+    def table_factory(self, call):
+        """r28: a call of a function of this module that returns only a dict of callables built in its own body."""
+        func = call.func if isinstance(call, ast.Call) else None
+        name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
+        if name is None or name not in self.functions or name in self.imports:
+            return False
+        found = False
+        for func in self.defs:
+            if func.name != name:
+                continue
+            returns = [n for n in ast.walk(func) if isinstance(n, ast.Return)]
+            if not returns:
+                return False
+            for ret in returns:
+                if not isinstance(ret.value, ast.Name):
+                    return False
+                table = [n for n in ast.walk(func) if isinstance(n, ast.Assign) and len(n.targets) == 1
+                         and isinstance(n.targets[0], ast.Name) and n.targets[0].id == ret.value.id]
+                if len(table) != 1 or not isinstance(table[0].value, ast.Dict)                         or not all(v is not None and self.callable_expr(v, name) for v in table[0].value.values):
+                    return False
+                for n in ast.walk(func):
+                    if isinstance(n, ast.Assign) and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                                                         and t.value.id == ret.value.id for t in n.targets)                             and not self.callable_expr(n.value, name):
+                        return False
+            found = True
+        return found
+
+    def local_callables(self, scope, top):
+        """The names of one scope bound ONLY to callables / tables of callables (every other binding makes the name bad)."""
+        good_c, good_t, bad = set(), set(), set()
+        for node in self.scope_nodes(top):
+            pairs = []
+            if isinstance(node, ast.Assign):
+                pairs = [(target, node.value) for target in node.targets]
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and getattr(node, "value", None) is not None:
+                pairs = [(node.target, node.value)]
+            elif isinstance(node, ast.AugAssign):
+                pairs = [(node.target, None)]
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                it, tgt = node.iter, node.target
+                if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id in ("sorted", "list", "tuple") \
+                        and len(it.args) == 1 and not it.keywords:
+                    it = it.args[0]
+                items = isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and not it.args \
+                    and (self.table_expr(it.func.value, scope) or self.table_factory(it.func.value))
+                if items and it.func.attr == "items" and isinstance(tgt, ast.Tuple) and len(tgt.elts) == 2:
+                    pairs = [(tgt.elts[0], None), (tgt.elts[1], ast.Lambda(args=None, body=None))]
+                elif items and it.func.attr == "values":
+                    pairs = [(tgt, ast.Lambda(args=None, body=None))]
+                elif isinstance(it, (ast.Tuple, ast.List)) and it.elts and isinstance(tgt, ast.Name):
+                    pairs = [(tgt, ast.Lambda(args=None, body=None) if all(self.callable_expr(v, scope) for v in it.elts) else None)]
+                elif isinstance(it, (ast.Tuple, ast.List)) and it.elts and isinstance(tgt, ast.Tuple) \
+                        and all(isinstance(v, ast.Tuple) and len(v.elts) == len(tgt.elts) for v in it.elts):
+                    pairs = [(part, ast.Lambda(args=None, body=None)
+                              if all(self.callable_expr(v.elts[i], scope) for v in it.elts) else None)
+                             for i, part in enumerate(tgt.elts)]  # ``for label, function, text in ((..., mod.f, ...), ...)``
+                else:
+                    pairs = [(tgt, None)]
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                pairs = [(item.optional_vars, None) for item in node.items if item.optional_vars is not None]
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bad.add(node.name)
+            for target, value in pairs:
+                if isinstance(target, ast.Name) and value is not None and self.callable_expr(value, scope):
+                    good_c.add(target.id)
+                elif isinstance(target, ast.Name) and value is not None and self.table_expr(value, scope):
+                    good_t.add(target.id)
+                else:
+                    bad.update(n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+        return good_c, good_t, bad
+
+    def site_value(self, definition, call, name):
+        """The expression a call site passes for parameter ``name`` of ``definition`` (its default when omitted), or None."""
+        args = definition.args
+        names = [a.arg for a in [*args.posonlyargs, *args.args]]
+        method = bool(names) and names[0] in ("self", "cls")
+        if method and not (isinstance(call.func, ast.Attribute) or id(call) in self.ctor_calls):
+            return None
+        if method:
+            names = names[1:]
+        if any(isinstance(a, ast.Starred) for a in call.args) or any(kw.arg is None for kw in call.keywords):
+            return None
+        for kw in call.keywords:
+            if kw.arg == name:
+                return kw.value
+        if name in names:
+            index = names.index(name)
+            if index < len(call.args):
+                return call.args[index]
+            defaults = args.defaults
+            pos = index - (len(names) - len(defaults))
+            return defaults[pos] if 0 <= pos < len(defaults) else None
+        for kwarg, default in zip(args.kwonlyargs, args.kw_defaults):
+            if kwarg.arg == name:
+                return default
+        return None
+
+    def callable_pass(self, scopes):
+        """r28: the parameters of this module's functions that EVERY call site fills with a lambda or a function of this module
+        (or with a table of them), and the names bound only to such callables.  A call through one of them is accepted and runs
+        every table lambda on the loaded value (``shape(text)`` where ``shape`` comes from ``CANARY_SHAPES``)."""
+        by_name = {}
+        for func in self.defs:
+            by_name.setdefault(func.name, []).append(func)
+            self.argnames[func.name] = {a.arg for a in [*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs]}
+            pending = list(ast.iter_child_nodes(func))
+            while pending:  # the functions directly nested in ``func`` (their own nesting is found from their own entry)
+                inner = pending.pop()
+                if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self.parent[inner.name] = func.name
+                else:
+                    pending.extend(ast.iter_child_nodes(inner))
+        sites, escaped = {}, set()
+        for scope, top in scopes:
+            called = set()
+            for node in self.scope_nodes(top):
+                if isinstance(node, ast.Call):
+                    f = node.func
+                    if isinstance(f, ast.Name):
+                        called.add(id(f))
+                        sites.setdefault(f.id, []).append((scope, node))
+                    elif isinstance(f, ast.Attribute):
+                        sites.setdefault(f.attr, []).append((scope, node))
+                    callee = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+                    if callee in self.classes:  # a class call runs ``__init__``: the site fills its parameters
+                        sites.setdefault("__init__", []).append((scope, node))
+                        self.ctor_calls.add(id(node))
+            for node in self.scope_nodes(top):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in by_name and id(node) not in called:
+                    escaped.add(node.id)
+                elif isinstance(node, ast.Attribute) and node.attr in by_name and isinstance(node.ctx, ast.Load):
+                    escaped.add(node.attr)  # a method reference or a call: the call case is rechecked through ``sites``
+        for func in self.defs:
+            for call_scope, call in sites.get(func.name, ()):
+                if isinstance(call.func, ast.Attribute):
+                    escaped.discard(func.name)
+        candidates = set()
+        for name, defs in by_name.items():
+            for func in defs:
+                for a in [*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs]:
+                    if a.arg not in ("self", "cls") and name not in escaped and sites.get(name):
+                        candidates.add((name, a.arg))
+        self.cparams, self.tparams, self.mparams = set(candidates), set(candidates), set(candidates)
+        for node in self.tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                value = node.value
+                if isinstance(value, (ast.Dict, ast.List, ast.Tuple)):
+                    parts = value.values if isinstance(value, ast.Dict) else value.elts
+                    if parts and all(v is not None and (isinstance(v, ast.Lambda) or (isinstance(v, ast.Name) and v.id in self.functions))
+                                     for v in parts):
+                        self.tables[node.targets[0].id] = value
+                        self.table_lams.extend(v for v in parts if isinstance(v, ast.Lambda))
+                        self.table_funcs.update(v.id for v in parts if isinstance(v, ast.Name))
+        for _ in range(8):
+            for scope, top in scopes:
+                good_c, good_t, bad = self.local_callables(scope, top)
+                self.clocals[scope], self.tlocals[scope], self.cbad[scope] = good_c, good_t, bad
+            dropped = False
+            for kind in (self.cparams, self.tparams, self.mparams):
+                for name, param in sorted(kind):
+                    ok = True
+                    for func in by_name[name]:
+                        for call_scope, call in sites.get(name, ()):
+                            value = self.site_value(func, call, param)
+                            self.cur = call_scope
+                            if value is None:
+                                ok = False
+                            elif kind is self.cparams and not self.callable_expr(value, call_scope):
+                                ok = False
+                            elif kind is self.tparams and not self.table_expr(value, call_scope):
+                                ok = False
+                            elif kind is self.mparams and not (self.module_value(value) or (
+                                    isinstance(value, ast.Constant) and value.value is None)):
+                                ok = False
+                    if not ok:
+                        kind.discard((name, param))
+                        dropped = True
+            if not dropped:
+                break
+
+    def callable_callee(self, func):
+        """Whether the callee expression is a callable of this module by construction (see ``callable_pass``)."""
+        if isinstance(func, ast.Name):
+            return bool(self.visible(self.cur, func.id, "c"))
+        if isinstance(func, ast.Subscript):
+            return self.table_expr(func.value, self.cur)
+        return False
+
+    def run_tables(self, node, env):
+        """A table callable gets a loaded value: every lambda of every table runs on it, every function of one has its parameters
+        tainted."""
+        for lam in self.table_lams:
+            inner = set(env) | {a.arg for a in [*lam.args.posonlyargs, *lam.args.args, *lam.args.kwonlyargs]}
+            for child in ast.walk(lam.body):
+                if isinstance(child, ast.Call):
+                    self.visit_call(child, inner, False)
+        for name in sorted(self.table_funcs):
+            self.taint_all_params(name)
+
+    def scope_pass(self, scope, top):
+        """One pass over the nodes of one scope (the module without its functions, or one function)."""
+        mine = self.scopes.setdefault(scope, set())
+        if True:
+            for node in self.scope_nodes(top):
+                pairs = []
+                if isinstance(node, ast.Assign):
+                    pairs = [(target, node.value) for target in node.targets]
+                elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
+                    pairs = [(node.target, node.value)]
+                elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                    pairs = [(node.target, node.iter)]
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    pairs = [(item.optional_vars, item.context_expr) for item in node.items if item.optional_vars is not None]
+                elif isinstance(node, ast.NamedExpr):
+                    pairs = [(node.target, node.value)]
+                for target, value in pairs:
+                    names = [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+                    if self.module_value(value):
+                        self.projects.setdefault(scope, set()).update(names)
+                    elif self.foreign_value(value):
+                        mine.update(names)
+                    if isinstance(value, ast.Attribute) and value.attr in TAINT_PROJECT_PATTERNS and self.module_value(value.value):
+                        self.patterns.update(names)
+                    if isinstance(value, ast.Call):
+                        if self.dotted(value.func) == "re.compile":
+                            self.patterns.update(names)
+                        if isinstance(value.func, ast.Name) and value.func.id in self.classes:
+                            self.instances.update(names)
+                        callee = self.imports.get(value.func.id) if isinstance(value.func, ast.Name) else self.dotted(value.func)
+                        if callee in TAINT_CALLABLE_FACTORIES:
+                            self.callable_names.update(names)
+                    elif isinstance(value, (ast.Name, ast.Attribute)) and self.unaccepted_callable(value, set(), act=False):
+                        self.callable_names.update(names)
 
     def tainted(self, node, env):
         t = self.tainted
@@ -3365,6 +4219,8 @@ class TaintScan:
         if isinstance(node, ast.UnaryOp):
             return False if isinstance(node.op, ast.Not) else t(node.operand, env)
         if isinstance(node, ast.Call):
+            if self.int_valued(node):
+                return False  # r28: a count or a length is a number, not author text
             return self.call_tainted(node, env)
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
             inner = set(env)
@@ -3380,6 +4236,9 @@ class TaintScan:
         if is_safe_call(name):
             return False
         args = [*node.args, *(kw.value for kw in node.keywords)]
+        if name in TAINT_SOURCES and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) \
+                and (node.func.value.id in TAINT_PUBLIC_PATHS or node.func.value.id in self.pubs):
+            return False  # r28: the checker's own two files are public repository text
         if name in TAINT_SOURCES or name.endswith(TAINT_PROBLEM_SUFFIXES) or name in ("url_leaks", "first_difference", "where_differs"):
             return True
         base = node.func.value if isinstance(node.func, ast.Attribute) else None
@@ -3391,7 +4250,7 @@ class TaintScan:
         if isinstance(node.func, (ast.Subscript, ast.Call)) and self.tainted(node.func, env):
             return True  # r25 sec S2: ``fs[0]()`` where the container holds a tainted callable
         if self.is_helper(node):
-            self.pass_params(self.functions[name], node, env)
+            self.pass_params(ty.lookup(self.functions, name), node, env)
             return name in self.returns
         return any(self.tainted(a, env) for a in args) or (base is not None and self.tainted(base, env))
 
@@ -3457,23 +4316,44 @@ class TaintScan:
                     self.add_param(func.name, func.args.kwarg.arg)
 
     def add_param(self, function, name):
-        self.params[function].add(name)
+        ty.lookup(self.params, function).add(name)
         if name in PUBLIC_NAMES:
             self.leaked_public.add(name)
 
     def bind(self, target, env):
-        for sub in ast.walk(target):
-            if isinstance(sub, ast.Name):
-                if sub.id not in ("self", "cls"):  # ``cls.text = tainted`` taints the attribute, never ``cls`` itself
-                    env.add(sub.id)
-            elif isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id in ("self", "cls"):
-                self.attrs.add(sub.attr)
+        """The names a store taints: the bound names, and the ROOT of a container or attribute store (``box[0] = v`` taints
+        ``box``); the index and attribute expressions are only read, so their names stay as they were."""
+        if isinstance(target, ast.Name):
+            if target.id not in ("self", "cls"):  # ``cls.text = tainted`` taints the attribute, never ``cls`` itself
+                env.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self.bind(element, env)
+        elif isinstance(target, ast.Starred):
+            self.bind(target.value, env)
+        elif isinstance(target, (ast.Attribute, ast.Subscript)):
+            chain = target
+            while isinstance(chain, (ast.Attribute, ast.Subscript)):
+                if isinstance(chain, ast.Attribute) and isinstance(chain.value, ast.Name) and chain.value.id in ("self", "cls"):
+                    self.attrs.add(chain.attr)
+                    return
+                chain = chain.value
+            if isinstance(chain, ast.Name) and chain.id not in ("self", "cls"):
+                env.add(chain.id)
 
     def bind_iter(self, target, iterable, env):
         """Bind a loop target; the position of ``enumerate(...)`` is an int, never author text."""
+        if isinstance(iterable, ast.Call) and isinstance(iterable.func, ast.Name) and iterable.func.id in ("sorted", "list", "tuple") \
+                and len(iterable.args) == 1 and not iterable.keywords:
+            iterable = iterable.args[0]
+        if isinstance(iterable, ast.Call) and isinstance(iterable.func, ast.Attribute) and iterable.func.attr in ("items", "values") \
+                and not iterable.args and self.table_expr(iterable.func.value, self.cur):
+            return  # a table of this module's callables: its keys are test-written constants and its values are the module's own
         if isinstance(iterable, ast.Call) and isinstance(target, ast.Tuple) and len(target.elts) == 2 and (
                 call_name(iterable) == "enumerate"
-                or (call_name(iterable) == "items" and static_keyed(iterable.func.value))):
+                or (call_name(iterable) == "items" and (static_keyed(iterable.func.value) or (
+                    isinstance(iterable.func.value, ast.Call) and isinstance(iterable.func.value.func, ast.Name)
+                    and iterable.func.value.func.id in self.const_keyed)))):
             self.bind(target.elts[1], env)
         else:
             self.bind(target, env)
@@ -3513,14 +4393,17 @@ class TaintScan:
             self.statement(stmt, env, scope)
 
     def operands_tainted(self, test, env):
-        """A bare ``assert``: pytest prints the operands of a failing comparison, so each operand counts."""
-        if isinstance(test, ast.Compare):
-            return any(self.tainted(part, env) for part in [test.left, *test.comparators])
-        if isinstance(test, ast.BoolOp):
-            return any(self.operands_tainted(part, env) for part in test.values)
-        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            return self.operands_tainted(test.operand, env)
-        return self.tainted(test, env)
+        """A bare ``assert`` (r28 sec F1 d, e): pytest prints every operand and every ``where`` sub-expression of a failing
+        assertion, so ANY sub-expression that holds loaded text counts, inside a call, an f-string, a comprehension, a ternary,
+        a walrus or an unpacked name.  A comparison, a ``not`` and a boolean operator are judged by their parts."""
+        pending = [test]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, ast.expr) and not isinstance(node, (ast.Constant, ast.Compare, ast.BoolOp, ast.Lambda)) \
+                    and self.tainted(node, env):
+                return True
+            pending.extend(ast.iter_child_nodes(node))
+        return False
 
     def statement(self, stmt, env, scope):
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -3538,8 +4421,13 @@ class TaintScan:
                         self.visit_call(node, env)
                 self.visit_call(ast.copy_location(ast.Call(func=decorator, args=[ast.Constant(None)], keywords=[]), decorator), env)
             return  # analysed on its own, with its own environment
-        if isinstance(stmt, ast.Raise) and (self.tainted(stmt.exc, env) or self.tainted(stmt.cause, env)):
-            self.flagged.add(stmt.lineno)  # r24 sec F5, r25 sec S2: an exception (or its cause) built from author text prints it
+        if isinstance(stmt, ast.Raise) and (
+                stmt.exc is None or self.tainted(stmt.exc, env) or self.tainted(stmt.cause, env)
+                or any(isinstance(part, ast.Name) and part.id in self.handler_names for part in (stmt.exc, stmt.cause))):
+            # r24 sec F5, r25 sec S2: an exception (or its cause) built from author text prints it; r28 sec F1 d: so does a bare
+            # ``raise`` and the re-raise of a caught exception, whose message may hold the value
+            self.flagged.add(stmt.lineno)
+        self.sinks(stmt, env)
         if isinstance(stmt, ast.Assert) and (self.operands_tainted(stmt.test, env) or self.tainted(stmt.msg, env)):
             self.flagged.add(stmt.lineno)
         if isinstance(stmt, ast.ClassDef):
@@ -3577,23 +4465,162 @@ class TaintScan:
             if isinstance(node, ast.NamedExpr) and self.tainted(node.value, env):
                 self.bind(node.target, env)
 
-    def accepted_callee(self, node):
-        """Whether the callee of ``node`` is on an accepted set (r27): a safe wrapper, a loader, a container mutator, a named
-        non-output callable, a lambda, or a helper of this module (called by its bare name or through ``self``/``cls``, so
-        that ``sys.stdout.write`` is never mistaken for a helper that happens to be called ``write``)."""
-        func = node.func
-        name = call_name(node)
-        if isinstance(func, (ast.Name, ast.Attribute)) and (
-                is_safe_call(name) or name in TAINT_SOURCES or name in TAINT_MUTATORS or name in TAINT_ACCEPTED_ALL):
+    def dotted(self, node):
+        """``re.sub`` for ``re.sub`` / ``from re import sub``: the import-resolved dotted name of ``node``, or None when the chain
+        does not start at an imported name (a local variable, ``self``, a call result)."""
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name) and node.id in self.imports:
+            return ".".join([ty.lookup(self.imports, node.id), *reversed(parts)])
+        return None
+
+    def qualified_accepted(self, dotted):
+        """r28: an import-resolved name is accepted only when it is listed whole (``re.sub``), or is a name of the checker module
+        that is a wrapper or a loader (``tier_yaml_8187.same``)."""
+        if dotted in TAINT_ACCEPTED_QUALIFIED:
             return True
-        return self.is_helper(node) or self.lambda_of(node) is not None
+        module, _, member = dotted.partition(".")
+        return module == TAINT_PROJECT_MODULE and bool(member) and "." not in member  # the module is gated and scanned itself
+
+    def plain_receiver(self, node):
+        """Whether a method is called on a plain value: not on an imported name, nor on a name bound from one (a stream, a path,
+        a client, a process), nor on the result of a call that is not accepted."""
+        if isinstance(node, ast.Call):
+            return self.static_accepts(node)
+        if isinstance(node, ast.Name):
+            return (node.id not in self.foreign and node.id not in self.imports) or self.is_project(node.id)
+        if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+            return self.plain_receiver(node.value)
+        return True
+
+    def static_accepts(self, node):
+        """Whether the callee of ``node`` is accepted whatever the values are (r28): by RECEIVER plus name or as a resolved
+        builtin, never by a bare attribute name.  A bare name is a builtin of ``TAINT_ACCEPTED_BUILTINS``, a wrapper or loader of
+        the checker, a function, class or lambda of this module, or an import listed in ``TAINT_ACCEPTED_QUALIFIED``; an
+        attribute call is an import-resolved name on that list, a loader, a helper called through ``self``/``cls`` or an instance
+        of a class of this module, or a value method (``TAINT_ACCEPTED_METHODS``, ``TAINT_MUTATORS``) on a plain receiver."""
+        func = node.func
+        if self.callable_callee(func):
+            return True
+        if isinstance(func, ast.Name):
+            name = func.id
+            if name in self.imports:
+                return self.qualified_accepted(ty.lookup(self.imports, name))
+            if name == "getattr" and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) \
+                    and isinstance(node.args[1].value, str) and not node.args[1].value.startswith("__"):
+                return True  # a lookup by a constant name reads an attribute and repeats nothing
+            return (name in self.functions or name in self.classes or name in self.lambdas or name in TAINT_ACCEPTED_BUILTINS
+                    or is_safe_call(name) or name in TAINT_SOURCES)
+        if not isinstance(func, ast.Attribute):
+            return False
+        dotted = self.dotted(func)
+        if dotted is not None:
+            return self.qualified_accepted(dotted)
+        if self.module_value(func.value):
+            return True  # a function of the checker or of the gated tier module: both are scanned themselves
+        name = func.attr
+        if name in TAINT_SOURCES:
+            return True  # a read: its result is tainted, nothing is written
+        if name in self.functions and isinstance(func.value, ast.Name) and (
+                func.value.id in ("self", "cls") or func.value.id in self.instances):
+            return True
+        if name in self.functions and isinstance(func.value, ast.Call) and isinstance(func.value.func, ast.Name) \
+                and func.value.func.id in self.classes:
+            return True  # ``TaintScan(...).scan()``: a method of a class of this module, called on a fresh instance
+        if isinstance(func.value, ast.Name) and func.value.id in self.patterns and name in TAINT_PATTERN_METHODS:
+            return True
+        if not self.plain_receiver(func.value):
+            return False
+        if name in TAINT_ACCEPTED_METHODS or name in TAINT_MUTATORS:
+            return True
+        if name == "format":
+            return constant_template(func.value)
+        if name in ("decode", "encode"):
+            return self.errors_replaced(node, name)
+        return False
+
+    @staticmethod
+    def errors_replaced(node, method="decode"):
+        """``decode``/``encode`` raise a message that holds a byte or a character of the value, so they are accepted only with a
+        constant ``errors`` argument that never raises (``encode`` also with ``surrogatepass`` and the two escapes)."""
+        values = [*node.args[1:2], *(kw.value for kw in node.keywords if kw.arg == "errors")]
+        never = ("ignore", "replace") + (("surrogatepass", "backslashreplace", "xmlcharrefreplace") if method == "encode" else ())
+        return len(values) == 1 and isinstance(values[0], ast.Constant) and values[0].value in never
+
+    def accepted_callee(self, node, env):
+        """Whether the callee of ``node`` is accepted (r28): a lambda, or ``static_accepts`` for a name that is not bound to
+        tainted material."""
+        func = node.func
+        if self.lambda_of(node) is not None:
+            return True
+        if self.callable_callee(func):
+            self.run_tables(node, env)
+            return True
+        if isinstance(func, ast.Name) and func.id in env and func.id not in self.functions:
+            return False
+        return self.static_accepts(node)
 
     def is_helper(self, node):
-        """A helper of this module: called by its bare name or through ``self``/``cls`` (``subprocess.run`` is not the helper
-        ``run``)."""
+        """A helper of this module: called by its bare name or through ``self``/``cls`` or an instance of a class of this module
+        (``subprocess.run`` is not the helper ``run``)."""
         func = node.func
         return self.follow and call_name(node) in self.functions and (isinstance(func, ast.Name) or (
-            isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in ("self", "cls")))
+            isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+            and (func.value.id in ("self", "cls") or func.value.id in self.instances)))
+
+    def unaccepted_callable(self, value, env, act=True):
+        """r28 sec F1 (c): whether ``value``, handed as an argument, resolves to a callable that is not itself accepted.  A
+        function or reference of this module's own is accepted and its parameters become tainted (it runs on the value)."""
+        if isinstance(value, ast.Name):
+            name = value.id
+            if name in env or name in self.lambdas:
+                return False
+            if name in self.imports:
+                return self.unaccepted_import(ty.lookup(self.imports, name))
+            if name in self.functions or name in self.classes:
+                if act:
+                    self.taint_all_params(name)
+                return False
+            if name in TAINT_BUILTIN_CALLABLES:
+                return name not in TAINT_ACCEPTED_BUILTINS
+            return name in self.callable_names
+        if isinstance(value, ast.Attribute):
+            dotted = self.dotted(value)
+            if dotted is not None:
+                return self.unaccepted_import(dotted)
+            root = root_name(value.value)
+            if isinstance(value.value, ast.Name) and value.value.id in TAINT_ACCEPTED_BUILTINS:
+                return value.attr not in TAINT_ACCEPTED_METHODS  # ``str.lower`` is a value method of a builtin type
+            if isinstance(value.value, ast.Name) and (root in ("self", "cls") or root in self.instances) \
+                    and value.attr in self.functions:
+                if act:
+                    self.taint_all_params(value.attr)
+                return False
+            return root in self.foreign or root in self.imports
+        if isinstance(value, ast.Call):
+            return not self.accepted_callee(value, env)
+        return False
+
+    def unaccepted_import(self, dotted):
+        """An imported name handed over as an argument is a callable unless it is accepted, an UPPER-CASE constant
+        (``re.I``) or one of the data attributes of ``TAINT_DATA_ATTRS`` (``os.sep``)."""
+        last = dotted.rpartition(".")[2]
+        return not (self.qualified_accepted(dotted) or last.isupper() or last in TAINT_DATA_ATTRS)
+
+    def taint_all_params(self, name):
+        func = self.functions.get(name)
+        if func is None and name in self.classes:
+            func = self.functions.get("__init__")
+        if func is None:
+            return
+        for arg in [*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs]:
+            if arg.arg not in ("self", "cls"):
+                self.add_param(func.name, arg.arg)
+        for extra in (func.args.vararg, func.args.kwarg):
+            if extra is not None:
+                self.add_param(func.name, extra.arg)
 
     def received(self, node, env):
         """Whether the call hands a loaded value to its callee: as an argument (positional, keyword, starred, inside a container
@@ -3609,10 +4636,16 @@ class TaintScan:
         return isinstance(func, (ast.Name, ast.Subscript, ast.Call)) and self.tainted(func, env)
 
     def callable_arguments(self, node, env):
-        """The callables handed to an accepted callee run on the loaded value: a lambda has its calls visited with its
-        parameters tainted, and the ``key=``/``default=`` style keyword must name an accepted callable."""
-        for value in [*node.args, *(kw.value for kw in node.keywords)]:
-            lam = value if isinstance(value, ast.Lambda) else (self.lambdas[value.id][0] if isinstance(value, ast.Name)
+        """The callables handed to an accepted callee run on the loaded value (r28 sec F1 c): a lambda has its calls visited with
+        its parameters tainted, and every other argument that resolves to a callable (a name, an attribute, a call result,
+        positional or by keyword) must itself be accepted."""
+        callee = self.imports.get(node.func.id, node.func.id) if isinstance(node.func, ast.Name) else (
+            self.dotted(node.func) or (node.func.attr if isinstance(node.func, ast.Attribute) else "?"))
+        runs = callee in TAINT_RUNS_POSITIONAL
+        for value, runs_it in [*((a, runs) for a in node.args), *((kw.value, True) for kw in node.keywords)]:  # a keyword may name any parameter: a callable there is judged
+            if isinstance(value, ast.Starred):
+                value = value.value
+            lam = value if isinstance(value, ast.Lambda) else (ty.lookup(self.lambdas, value.id)[0] if isinstance(value, ast.Name)
                                                                  and value.id in self.lambdas else None)
             if lam is not None:
                 inner = set(env) | {a.arg for a in [*lam.args.posonlyargs, *lam.args.args, *lam.args.kwonlyargs]}
@@ -3621,14 +4654,42 @@ class TaintScan:
                 for child in ast.walk(lam.body):
                     if isinstance(child, ast.Call):
                         self.visit_call(child, inner, False)
-        for kw in node.keywords:
-            if kw.arg in CALLABLE_KEYWORDS and isinstance(kw.value, (ast.Name, ast.Attribute)):
-                name = kw.value.id if isinstance(kw.value, ast.Name) else kw.value.attr
-                if name not in env and not (is_safe_call(name) or name in TAINT_ACCEPTED_ALL or name in self.lambdas):
+            elif runs_it and isinstance(value, (ast.Name, ast.Attribute, ast.Call)) and not self.tainted(value, env):
+                if self.unaccepted_callable(value, env):
                     self.flagged.add(node.lineno)
+
+    def argument_rules(self, node, env):
+        """r28: arguments an accepted callee must not receive tainted: a regular-expression pattern (the error repeats it) and
+        anything handed to ``decode``/``encode``."""
+        func = node.func
+        dotted = self.imports.get(func.id) if isinstance(func, ast.Name) else self.dotted(func)
+        if dotted is not None and dotted.startswith("re.") and node.args and self.tainted(node.args[0], env):
+            self.flagged.add(node.lineno)
+        if isinstance(func, ast.Attribute) and func.attr in ("decode", "encode") and any(
+                self.tainted(a, env) for a in [*node.args, *(kw.value for kw in node.keywords)]):
+            self.flagged.add(node.lineno)
+
+    def taint_receiver(self, node, env):
+        """A container mutator moves the value into the container: the ROOT name of the receiver chain becomes tainted
+        (``box[0].append(text)`` taints ``box``; ``self.items.append(text)`` taints the attribute ``items``)."""
+        receiver = node.func.value
+        chain = receiver
+        while isinstance(chain, (ast.Attribute, ast.Subscript)):
+            if isinstance(chain, ast.Attribute) and isinstance(chain.value, ast.Name) and chain.value.id in ("self", "cls"):
+                self.attrs.add(chain.attr)
+                return
+            chain = chain.value
+        root = root_name(receiver)
+        if root is not None and root not in ("self", "cls"):
+            env.add(root)
 
     def visit_call(self, node, env, follow_lambda=True):
         name = call_name(node)
+        if isinstance(node.func, ast.Name) and node.func.id in TAINT_NEVER_CALLED and node.func.id not in self.functions:
+            self.flagged.add(node.lineno)  # r28: a string run as code is a path the scan cannot follow
+        if env and (name in TAINT_FRAME_CALLS or any(kw.arg == "capture_locals" for kw in node.keywords)
+                    or "StackSummary" in call_text(node.func)):
+            self.flagged.add(node.lineno)  # r28: a frame summary shows the tainted locals of the frame it describes
         lam = self.lambda_of(node) if follow_lambda else None
         if lam is not None:
             self.lambda_calls(lam, node, env)
@@ -3640,19 +4701,57 @@ class TaintScan:
             return
         if not self.received(node, env):
             return
-        if not self.accepted_callee(node):
+        if not self.accepted_callee(node, env):
             self.callees.add(name)
             self.flagged.add(node.lineno)  # r27: every call that receives a loaded value and is not accepted is a finding
             return
+        if name in TAINT_PATH_FUNCTIONS and name in self.functions and node.args and self.tainted(node.args[0], env):
+            self.flagged.add(node.lineno)  # r28: the path of an exempt write is never loaded material
+        self.argument_rules(node, env)
         self.callable_arguments(node, env)
         if name in TAINT_MUTATORS and isinstance(node.func, ast.Attribute):
-            receiver = node.func.value
-            if isinstance(receiver, ast.Name):
-                env.add(receiver.id)
-            elif isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name) and receiver.value.id in ("self", "cls"):
-                self.attrs.add(receiver.attr)
+            self.taint_receiver(node, env)
         if self.is_helper(node):
-            self.pass_params(self.functions[name], node, env)
+            self.pass_params(ty.lookup(self.functions, name), node, env)
+        elif isinstance(node.func, ast.Name) and node.func.id in self.classes and "__init__" in self.functions:
+            self.pass_params(self.functions["__init__"], node, env)
+
+    def sinks(self, stmt, env):
+        """r28 sec F1 (d): the statement-level output paths.  A subscript or attribute store whose root is an imported name or a
+        name bound from one (``os.environ[k] = v``, ``sys.modules[k] = v``, ``sys.stdout = v``) with a tainted key or value; a
+        lookup with a tainted key that is not a slice or a constant (a missing key repeats the key in its ``KeyError``)."""
+        stored = isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign)) and getattr(stmt, "value", None) is not None \
+            and self.tainted(stmt.value, env)
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Subscript):
+                keyed = not isinstance(node.slice, (ast.Slice, ast.Constant)) and not self.int_valued(node.slice) \
+                    and self.tainted(node.slice, env)
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    root = self.store_root(node)
+                    if (root in self.imports or root in self.foreign) and (keyed or stored):
+                        self.flagged.add(node.lineno)
+                elif keyed:
+                    self.flagged.add(node.lineno)
+                    self.keyed.append(node)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                root = self.store_root(node)
+                if root not in ("self", "cls") and (root in self.imports or root in self.foreign) and stored:
+                    self.flagged.add(node.lineno)
+
+    def store_root(self, node):
+        """The name a store lands in: the root of the chain, looking through ``ty.lookup(container, key)`` to its container
+        (the fixed-text lookup returns the stored object itself, so a store into it is a store into ``container``)."""
+        while True:
+            if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+                node = node.value
+            elif isinstance(node, ast.Call) and call_name(node) == "lookup" and node.args and isinstance(node.func, ast.Attribute) \
+                    and self.module_value(node.func.value):
+                node = node.args[0]
+            elif isinstance(node, ast.Call):
+                node = node.func
+            else:
+                break
+        return node.id if isinstance(node, ast.Name) else None
 
     def state(self):
         return (sorted(self.returns), sorted(self.attrs), {k: sorted(v) for k, v in self.params.items()},
@@ -3662,10 +4761,13 @@ class TaintScan:
         for _ in range(6):
             before = self.state()
             self.flagged = set()
+            self.cur = None
             self.walk(self.tree.body, set(), None)
-            for name, func in self.functions.items():
+            for func in self.defs:
+                name = func.name
                 if name in self.exempt:
                     continue
+                self.cur = name
                 env = set(self.params[name]) | set(self.closure.get(name, ()))
                 for _pass in range(2):
                     self.walk(func.body, env, name)
@@ -3678,6 +4780,37 @@ class TaintScan:
 def tainted_assert_lines(source, follow_helpers=True, exempt=()):
     """Sorted line numbers of the ``assert*`` calls in ``source`` with an unwrapped tainted argument."""
     return TaintScan(source, follow_helpers, exempt).scan()
+
+
+def exempt_call_ok(scan, node):
+    """Whether a call inside an exempt function is on the accepted sets (the same constants the scan reads) or is one of the
+    named ``TAINT_EXEMPT_CALLS``."""
+    if call_text(node.func) in TAINT_EXEMPT_CALLS:
+        return True
+    return scan.static_accepts(node)
+
+
+def exempt_function_defects(source, names=TAINT_EXEMPT_FUNCTIONS):
+    """r28 sec F2, code F4: the line numbers inside the exempt functions that are not on the accepted sets.  A positive walk over
+    every call, raise, assert, subscript store and attribute store: a call passes only if ``exempt_call_ok``; a raise, an
+    assert, a subscript store and a store to the attribute of an imported or import-bound name never pass."""
+    scan = TaintScan(source)
+    problems = set()
+    for func in scan.defs:
+        if func.name not in names:
+            continue
+        for node in ast.walk(func):
+            if isinstance(node, (ast.Raise, ast.Assert)):
+                problems.add(node.lineno)
+            elif isinstance(node, ast.Call) and not exempt_call_ok(scan, node):
+                problems.add(node.lineno)
+            elif isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                problems.add(node.lineno)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                root = root_name(node)
+                if root in scan.imports or root in scan.foreign:
+                    problems.add(node.lineno)
+    return sorted(problems)
 
 
 # ---- r24 sec F6: no path to the raw text outside the wrapper class ----
@@ -3799,6 +4932,12 @@ def opaque_escape_lines(source, allowed=("Opaque",)):
         if not exempt:
             if opaque_unlisted_access(node, parent):
                 found.add(node.lineno)
+            elif (isinstance(node, ast.Name) and node.id == "__name__" and not isinstance(node.ctx, ast.Load)) \
+                    or (isinstance(node, ast.arg) and node.arg == "__name__") \
+                    or "__name__" in (getattr(node, "name", None), getattr(node, "asname", None), getattr(node, "rest", None)):
+                # r28 code F3: ``sys.modules[__name__]`` is the module itself only while nothing rebinds ``__name__`` (a plain,
+                # augmented, annotated, loop, with, walrus, import, except, parameter, def/class or ``del`` binding is refused)
+                found.add(getattr(node, "lineno", getattr(parent, "lineno", 0)))
             elif isinstance(node, ast.Attribute) and node.attr in OPAQUE_PRIVATE:
                 found.add(node.lineno)
             elif isinstance(node, ast.Name) and node.id in OPAQUE_PRIVATE and not isinstance(node.ctx, ast.Store):
@@ -3904,7 +5043,7 @@ class TestOpaqueIsFailClosed8187R23(unittest.TestCase):
     def test_raw_is_called_only_inside_same(self):
         """The places that unwrap are the bool helper ``ty.same`` and ``Opaque.__eq__`` / ``__hash__`` (both return a bool or
         an int, never text); no other code (checker, tests) calls ``.raw()``."""
-        for path in (Path(ty.__file__), Path(__file__)):
+        for path in (TY_PATH, THIS_PATH):
             allowed = ("same", "__eq__", "__hash__") if path.name == "tier_yaml_8187.py" else ()
             with self.subTest(file=path.name):
                 self.assertEqual(raw_unwrap_lines(path.read_text(encoding="utf-8"), allowed=allowed), [])
@@ -3949,7 +5088,7 @@ class TestNoRoutedSiteCanEchoAuthorText8187R23(unittest.TestCase):
         """Per-site driving is proven by ``TestEveryRoutedSiteIsDriven8187R24`` (one source mutant per routed site)."""
         run = self.run_
         forms = {re.sub(r"\[.*", "", form) for form in run.label_forms}
-        self.assertLessEqual({"job", "step", "key"}, forms, "label forms seen: %s" % sorted(forms))
+        self.assertIs({"job", "step", "key"} <= forms, True, "label forms seen: %d" % len(forms))
         # a job id the layout reader cannot read plainly has no pins of its own (that refusal is itself a fail path the
         # scenarios drive against the real pins); the shapes whose ids stay plain must all have run on their own pins
         self.assertLessEqual(len(run.skipped), len(CANARY_SHAPES) * 6, "%d self-pin scenarios were skipped" % len(run.skipped))
@@ -3972,13 +5111,14 @@ class TestNoAssertCanEchoAuthorText8187R23(unittest.TestCase):
         "        self.assertEqual([row], ['x'])\n")
     CLEAN = (
         "import unittest\n"
+        "import tier_yaml_8187 as ty\n"
         "class T(unittest.TestCase):\n"
         "    def test(self):\n"
         "        text = path.read_text()\n"
         "        data = load_strict(text)\n"
         "        self.assertTrue(text == 'x', 'differs')\n"
         "        self.assertTrue(len(text) == 3 and ty.same(data, {}))\n"
-        "        self.assertEqual(ty.opaque(text, 'key[0]'), ty.opaque('x', 'key[0]'))\n"
+        "        self.assertEqual(ty.Opaque(text, 'key[0]'), ty.Opaque('x', 'key[0]'))\n"
         "        assert_same(self, data, {}, 'the data')\n"
         "        self.assertTrue(data)\n"
         "        for position, item in enumerate(data):\n"
@@ -4095,7 +5235,7 @@ def routed_sites(source, in_test_file):
     ordered, seen = {}, {}
     for (site_kind, lineno, col), helper in sorted(sites.items(), key=lambda item: item[0][1:]):
         seen[lineno] = seen.get(lineno, 0) + 1
-        suffix = "" if seen[lineno] == 1 else "#%d" % seen[lineno]
+        suffix = "" if ty.lookup(seen, lineno) == 1 else "#%d" % ty.lookup(seen, lineno)
         ordered["%s:%d%s %s" % (site_kind, lineno, suffix, helper)] = (site_kind, lineno, col, helper)
     return ordered
 
@@ -4116,11 +5256,11 @@ def load_variant(ty_source, test_source):
     try:
         variant_ty = types.ModuleType("tier_yaml_8187")
         variant_ty.__file__ = str(TY_PATH)
-        sys.modules["tier_yaml_8187"] = variant_ty
+        sys.modules.update(tier_yaml_8187=variant_ty)
         exec(compile(ty_source, str(TY_PATH), "exec"), variant_ty.__dict__)
         variant = types.ModuleType("canary_variant_6181")
         variant.__file__ = str(THIS_PATH)
-        sys.modules["canary_variant_6181"] = variant
+        sys.modules.update(canary_variant_6181=variant)
         exec(compile(test_source, str(THIS_PATH), "exec"), variant.__dict__)
         return variant
     finally:
@@ -4128,7 +5268,7 @@ def load_variant(ty_source, test_source):
             if module is None:
                 sys.modules.pop(name, None)
             else:
-                sys.modules[name] = module
+                sys.modules.update({name: module})
 
 
 def site_mutant_leaks(task):
@@ -4177,9 +5317,9 @@ class TestEveryRoutedSiteIsDriven8187R24(unittest.TestCase):
         survivors = []
         for key in self.SITES:
             with self.subTest(site=key):
-                if self.LEAKS[key] == 0:
+                if ty.lookup(self.LEAKS, key) == 0:
                     survivors.append(key)
-                self.assertGreater(self.LEAKS[key], 0)
+                self.assertGreater(ty.lookup(self.LEAKS, key), 0)
         self.assertEqual(len(survivors), 0)
 
 
@@ -4236,7 +5376,7 @@ class TestTaintScanFlagsEveryEchoShape8187R24(unittest.TestCase):
             TAINT_HEAD + "        f = lambda v: len(v)\n        self.assertEqual(f(text), 3)\n",
             TAINT_HEAD + "        def g(v=3):\n            return v\n        self.assertEqual(g(), 3)\n",
             TAINT_HEAD + "        def inner():\n            return len(text)\n        self.assertEqual(inner(), 3)\n",
-            TAINT_HEAD + "        assert len(text) == 3, 'length'\n",
+            TAINT_HEAD + "        size = len(text)\n        assert size == 3, 'length'\n",  # r28: ``assert len(text) == 3`` prints the text
             TAINT_HEAD + "        raise AssertionError('the file changed')\n",
             "import unittest\ndef first(*rows):\n    return len(rows)\nclass T(unittest.TestCase):\n    def test(self):\n"
             "        text = p.read_text()\n        self.assertEqual(first(text), 1)\n")
@@ -4566,6 +5706,8 @@ HARNESS_MUTANTS = {
     # r27 code F4: a chain walk that stops after one link, and a strip of the notes two links deep
     "chain walk stops after one link": ("one-link-walk", "exception-chain", "controls"),
     "notes stripped two links deep": ("deep-notes-strip", "exception-chain", "controls"),
+    # r28 code F5: a chain walk that stops after two links (the controls eight links deep and behind a cycle are the ones it misses)
+    "chain walk stops after two links": ("two-link-walk", "exception-chain", "controls"),
 }
 
 
@@ -4602,6 +5744,18 @@ def harness_mutant_source(source, kind, what):
                     "for line in traceback.format_exception(type(link), link, link.__traceback__, chain=False)]"
                     "  # canary-channel: " + what)
         return CHANNEL_LINE.sub(one_link, source)
+    if kind == "two-link-walk":  # r28 code F5: the chain is walked two links deep (the exception and two levels of causes and contexts)
+        def two_link(match):
+            if match.group("name") != what:
+                return match.group(0)
+            indent = match.group("indent")
+            return (indent + "links = [exc]\n" + indent + "for _ in range(2):\n" + indent
+                    + "    links += [getattr(link, name, None) for link in list(links) if link is not None "
+                    "for name in ('__cause__', '__context__')]\n" + indent
+                    + "chunks += [line for link in links if link is not None "
+                    "for line in traceback.format_exception(type(link), link, link.__traceback__, chain=False)]"
+                    "  # canary-channel: " + what)
+        return CHANNEL_LINE.sub(two_link, source)
     if kind == "deep-notes-strip":  # r27 code F4: the notes two links deep are removed before the chain is formatted
         def strip_deep(match):
             if match.group("name") != what:
@@ -4646,7 +5800,8 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         expected = {"print", "stderr", "log", "warning", "problem-line", "exception", "exception-chain", "exception-context"}
         if sys.version_info >= (3, 11):
             expected.update(("exception-notes", "exception-cause-notes", "exception-context-notes",
-                             "exception-cause-cause-notes", "exception-context-context-notes"))  # r25 sec S3, r26 code C4, sec F3, r27 code F4
+                             "exception-cause-cause-notes", "exception-context-context-notes",
+                             "exception-cause-8-notes", "exception-context-8-notes", "exception-cycle-notes"))  # r25 sec S3, r26 code C4, sec F3, r27 code F4, r28 code F5
         self.assertEqual(names, expected)
 
     def test_each_harness_mutant_is_red(self):
@@ -4655,7 +5810,7 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         for name, (kind, what, check) in HARNESS_MUTANTS.items():
             with self.subTest(mutant=name):
                 if kind in ("chain-str", "notes-strip", "cause-notes-strip", "context-notes-strip", "link-notes-strip",
-                            "one-link-walk", "deep-notes-strip") and sys.version_info < (3, 11):
+                            "one-link-walk", "two-link-walk", "deep-notes-strip") and sys.version_info < (3, 11):
                     continue  # exception notes exist from Python 3.11; the control is registered from there too
                 variant = load_variant(ty_source, harness_mutant_source(test_source, kind, what))
                 if check == "controls":
@@ -4822,8 +5977,8 @@ def raw_operand_comparisons(source):
         operands = node.args[:2]
         if any(isinstance(arg, ast.List) and not arg.elts for arg in operands):
             continue
-        exempt = lambda arg: isinstance(arg, ast.Call) and call_name(arg) in wrappers
-        if any(RAW_OPERAND.search(ast.get_source_segment(source, arg) or "") for arg in operands if not exempt(arg)):
+        wrapped = lambda arg: isinstance(arg, ast.Call) and call_name(arg) in wrappers
+        if any(RAW_OPERAND.search(ast.get_source_segment(source, arg) or "") for arg in operands if not wrapped(arg)):
             lines.append(node.lineno)
     return lines
 
@@ -4859,8 +6014,9 @@ def has_line(problems, pattern):
 
 
 def positional_cases():
-    """``{site: (problems, [pattern, ...])}``: one fault per label-printing site family, the marker planted in the text the
-    fault is about; each pattern names the label family and the length of the marker."""
+    """``{site: problems}``: one fault per label-printing site family, the marker planted in the text the fault is about; the
+    patterns that name each label family live in ``positional_patterns`` (a separate function, so no pattern is derived
+    from a loaded value)."""
     n = len(POS_MARK)
     wf = "ci.yml"
     text = (WORKFLOWS / wf).read_text(encoding="utf-8")
@@ -4868,67 +6024,73 @@ def positional_cases():
     target = pin_targets(wf, text)[0]
     job = target[0]
     head = "\n  %s:" % job
-    pad = " " * (indent_of(text.split("\n")[target[3]]) + 2)
+    pad = " " * (indent_of(ty.lookup(text.split("\n"), target[3])) + 2)
     copy_ = lambda: json.loads(json.dumps(pins))
     cases = {}
     dup = text.rstrip("\n") + '\n"%s": 1\n"%s": 2\n' % (POS_MARK, POS_MARK)
-    cases["duplicate top-level key (r19 F36)"] = (
-        primary_pin_problems(wf, dup, pins[PRIMARY]), [r"the mapping key key\[\d+\] len=%d appears twice" % n])
+    cases["duplicate top-level key (r19 F36)"] = primary_pin_problems(wf, dup, pins[PRIMARY])
     extra = text.rstrip("\n") + '\n"%s": 1\n' % POS_MARK
-    cases["extra top-level key (r19 F36)"] = (
-        primary_pin_problems(wf, extra, pins[PRIMARY]),
-        [r"top-level keys outside the closed set: key\[0\] len=%d" % n, r"a workflow-level key key\[0\] len=%d was added" % n])
+    cases["extra top-level key (r19 F36)"] = primary_pin_problems(wf, extra, pins[PRIMARY])
     job_edit = text.replace(head, '%s\n    "%s": 1' % (head, POS_MARK))
-    cases["job key, loaded view (r19 F36)"] = (
-        primary_pin_problems(wf, job_edit, pins[PRIMARY]),
-        [r"job\[\d+\] len=\d+ job-level keys: differs from the pin at job\.key\[0\] len=%d" % n])
-    cases["job key, text view (r19 F36)"] = (
-        job_pin_problems(wf, job_edit, pins[SECONDARY]), [r"job key\[\d+\] len=\d+ job-level keys: differs from the pin at line \d+"])
+    cases["job key, loaded view (r19 F36)"] = primary_pin_problems(wf, job_edit, pins[PRIMARY])
+    cases["job key, text view (r19 F36)"] = job_pin_problems(wf, job_edit, ty.lookup(pins, SECONDARY))
     step_edit = splice(text, target[3] + 1, ['%s"%s": 1' % (pad, POS_MARK)])
-    cases["step key, loaded view (r19 F36)"] = (
-        primary_pin_problems(wf, step_edit, pins[PRIMARY]),
-        [r"step \d+ \(step\[\d+\] len=\d+\): differs from the pin at steps\[\d+\]\.key\[1\] len=%d" % n])
-    cases["step key, text view (r19 F36)"] = (
-        job_pin_problems(wf, step_edit, pins[SECONDARY]), [r"step \d+ \(step\[\d+\] len=\d+\): differs from the pin at line \d+"])
+    cases["step key, loaded view (r19 F36)"] = primary_pin_problems(wf, step_edit, pins[PRIMARY])
+    cases["step key, text view (r19 F36)"] = job_pin_problems(wf, step_edit, ty.lookup(pins, SECONDARY))
     row = next(iter(ty.RUNS_ON_EXEMPT.values()))
-    matrix = {"runs-on": row[1], "strategy": {"matrix": {ty.RUNS_ON_FORMS[row[1]][0]: ["ubuntu-latest"], POS_MARK: 1}}}
-    cases["matrix key (r19 F36)"] = ([ty.exemption_problem(row, matrix)], [r"^matrix\.key\[1\] len=%d is not a list" % n])
+    matrix = {"runs-on": row[1], "strategy": {"matrix": {ty.lookup(ty.RUNS_ON_FORMS, row[1])[0]: ["ubuntu-latest"], POS_MARK: 1}}}
+    cases["matrix key (r19 F36)"] = [ty.exemption_problem(row, matrix)]
     removed_job = copy_()
     entry = removed_job[PRIMARY][wf]["tier_jobs"]
     first = next(iter(entry))
-    entry[first]["sha256"] = "0" * 64
-    entry[first]["keys"][POS_MARK] = "0" * 64
-    cases["removed pinned job key (r20 F38)"] = (
-        primary_pin_problems(wf, text, removed_job[PRIMARY]), [r"differs from the pin at job\.key\[\d+\] len=%d \(removed\)" % n])
+    ty.lookup(entry, first)["sha256"] = "0" * 64
+    ty.lookup(entry, first)["keys"][POS_MARK] = "0" * 64
+    cases["removed pinned job key (r20 F38)"] = primary_pin_problems(wf, text, removed_job[PRIMARY])
     removed_step = copy_()
     entry = removed_step[PRIMARY][wf]["tier_jobs"]
     first = next(iter(entry))
-    index = next(i for i, step in enumerate(entry[first]["steps"]) if "keys" in step)
-    entry[first]["sha256"] = "0" * 64
-    entry[first]["steps"][index]["sha256"] = "0" * 64
-    entry[first]["steps"][index]["keys"][POS_MARK] = "0" * 64
-    cases["removed pinned step key (r20 F38)"] = (
-        primary_pin_problems(wf, text, removed_step[PRIMARY]),
-        [r"differs from the pin at steps\[%d\]\.key\[\d+\] len=%d \(removed\)" % (index, n)])
+    index = next(i for i, step in enumerate(ty.lookup(entry, first)["steps"]) if "keys" in step)
+    ty.lookup(entry, first)["sha256"] = "0" * 64
+    ty.lookup(entry, first)["steps"][index]["sha256"] = "0" * 64
+    ty.lookup(entry, first)["steps"][index]["keys"][POS_MARK] = "0" * 64
+    cases["removed pinned step key (r20 F38)"] = primary_pin_problems(wf, text, removed_step[PRIMARY])
     gone = copy_()
     primary = gone[PRIMARY][wf]
     primary["job_names"] = sorted([*primary["job_names"], POS_MARK])
     primary["job_names_sha256"] = "0" * 64
     primary["tier_jobs"][POS_MARK] = json.loads(json.dumps(next(iter(primary["tier_jobs"].values()))))
-    secondary = gone[SECONDARY][wf]
+    secondary = ty.lookup(gone, SECONDARY)[wf]
     secondary["jobs"] = [*secondary["jobs"], POS_MARK]
     secondary["pinned"][POS_MARK] = json.loads(json.dumps(next(iter(secondary["pinned"].values()))))
     for view, problems in (("loaded", primary_pin_problems(wf, text, gone[PRIMARY])),
-                           ("text", job_pin_problems(wf, text, gone[SECONDARY]))):
-        cases["pinned job that is gone, %s view (r20 F38)" % view] = (
-            problems, [r"missing \[key\[\d+\] len=%d\]" % n, r"job key\[\d+\] len=%d: pinned job is missing" % n])
+                           ("text", job_pin_problems(wf, text, ty.lookup(gone, SECONDARY)))):
+        cases["pinned job that is gone, %s view (r20 F38)" % view] = problems
     block = copy_()
-    block[SECONDARY][wf]["workflow"][POS_MARK] = next(iter(block[SECONDARY][wf]["workflow"].values()))
-    cases["pinned workflow-level block key (r22 F39a)"] = (
-        job_pin_problems(wf, text, block[SECONDARY]), [r"the pinned workflow-level key\[\d+\] len=%d: block is missing" % n])
+    ty.lookup(block, SECONDARY)[wf]["workflow"][POS_MARK] = next(iter(ty.lookup(block, SECONDARY)[wf]["workflow"].values()))
+    cases["pinned workflow-level block key (r22 F39a)"] = job_pin_problems(wf, text, ty.lookup(block, SECONDARY))
     named = splice(text, target[3], ["      - name: %s" % POS_MARK, "        run: echo one"])
-    cases["an inserted step's name (r14 F27)"] = (
-        primary_pin_problems(wf, named, pins[PRIMARY]), [r"step \d+ \(step\[\d+\] len=%d\)" % n])
+    cases["an inserted step's name (r14 F27)"] = primary_pin_problems(wf, named, pins[PRIMARY])
+    return cases
+
+
+def positional_patterns():
+    """``{site: [pattern, ...]}``: each pattern names the label family and the length of the marker."""
+    n = len(POS_MARK)
+    cases = {}
+    cases["duplicate top-level key (r19 F36)"] = [r"the mapping key key\[\d+\] len=%d appears twice" % n]
+    cases["extra top-level key (r19 F36)"] = [r"top-level keys outside the closed set: key\[0\] len=%d" % n, r"a workflow-level key key\[0\] len=%d was added" % n]
+    cases["job key, loaded view (r19 F36)"] = [r"job\[\d+\] len=\d+ job-level keys: differs from the pin at job\.key\[0\] len=%d" % n]
+    cases["job key, text view (r19 F36)"] = [r"job key\[\d+\] len=\d+ job-level keys: differs from the pin at line \d+"]
+    cases["step key, loaded view (r19 F36)"] = [r"step \d+ \(step\[\d+\] len=\d+\): differs from the pin at steps\[\d+\]\.key\[1\] len=%d" % n]
+    cases["step key, text view (r19 F36)"] = [r"step \d+ \(step\[\d+\] len=\d+\): differs from the pin at line \d+"]
+    cases["matrix key (r19 F36)"] = [r"^matrix\.key\[1\] len=%d is not a list" % n]
+    cases["removed pinned job key (r20 F38)"] = [r"differs from the pin at job\.key\[\d+\] len=%d \(removed\)" % n]
+    cases["removed pinned step key (r20 F38)"] = [r"differs from the pin at steps\[\d+\]\.key\[\d+\] len=%d \(removed\)" % n]
+    for view in ("loaded", "text"):
+        cases["pinned job that is gone, %s view (r20 F38)" % view] = [
+            r"missing \[key\[\d+\] len=%d\]" % n, r"job key\[\d+\] len=%d: pinned job is missing" % n]
+    cases["pinned workflow-level block key (r22 F39a)"] = [r"the pinned workflow-level key\[\d+\] len=%d: block is missing" % n]
+    cases["an inserted step's name (r14 F27)"] = [r"step \d+ \(step\[\d+\] len=%d\)" % n]
     return cases
 
 
@@ -4939,14 +6101,16 @@ class TestEveryLabelIsPositional8187R24(unittest.TestCase):
 
     def test_every_site_family_is_covered(self):
         self.assertEqual(len(positional_cases()), 13)
+        self.assertIs(sorted(positional_cases()) == sorted(positional_patterns()), True, "the two tables name different sites")
 
     def test_no_line_carries_the_marker_and_each_names_its_label(self):
-        for site, (problems, patterns) in positional_cases().items():
+        expected = positional_patterns()
+        for site, problems in positional_cases().items():
             with self.subTest(site=site):
                 self.assertGreater(len(problems), 0)
                 self.assertIs(has_line(problems, re.escape(POS_MARK)), False)
                 self.assertIs(has_line(problems, "feed0123456789abcdef01"), False)
-                for pattern in patterns:
+                for pattern in expected[site]:
                     self.assertIs(has_line(problems, pattern), True)
 
 
@@ -5056,9 +6220,9 @@ class TestLoadersRaiseOnlyStrictYamlError8187R25(unittest.TestCase):
                 target = root / ".github" / "workflows"
                 shutil.copytree(WORKFLOWS, target)
                 planted = plant_tag(run.texts["ci.yml"], kind, run.mint("tag", CANARY_SHAPES["plain"]))
-                (target / "ci.yml").write_text(planted, encoding="utf-8")
-                (target / "extra.yml").write_text(plant_tag("name: x\non: push\nenv:\n  A: b\njobs: {}\n", kind,
-                                                            run.mint("tag", CANARY_SHAPES["plain"])), encoding="utf-8")
+                stage_text(target / "ci.yml", planted)
+                stage_text(target / "extra.yml", plant_tag("name: x\non: push\nenv:\n  A: b\njobs: {}\n", kind,
+                                                           run.mint("tag", CANARY_SHAPES["plain"])))
                 run.observe("plain", "std/%s/repo" % kind, repo_problems, root, run.pins, expect=None)
                 run.observe("plain", "std/%s/names" % kind, names_the_tier, planted, expect=None)
                 run.observe("plain", "std/%s/discovery" % kind, tier_workflows, target, expect=None)
@@ -5698,7 +6862,7 @@ OPAQUE_R27_SNIPPETS = {
     "r27 importlib.import_module": "import importlib\nx = importlib.import_module('gc')\n",
     "r27 sys.modules read of another module": "import sys\nx = sys.modules['gc']\n",
 }
-# the 14 snippets above that the r26 gates passed: each is named and refused on its own
+# the 15 snippets above that the r26 gates passed: each is named and refused on its own
 OPAQUE_R27_PASSED_AT_R26 = (
     "sec own pickle reduce of w", "sec own reduce(getattr, [joined name], w)()", "sec own map(getattr, [w], [joined])",
     "sec own eval of a built expression", "sec own exec of a built statement", "sec own __import__('gc').get_objects walk",
@@ -5744,29 +6908,6 @@ class TestTaintScanIsAPositiveEnumeration8187R27(unittest.TestCase):
         for name, source in TAINT_R27_CLEAN.items():
             with self.subTest(shape=name):
                 self.assertEqual(tainted_assert_lines(source), [])
-
-    def test_the_accepted_callees_are_a_short_sorted_named_constant(self):
-        accepted = getattr(sys.modules[__name__], "TAINT_ACCEPTED_CALLEES", None)
-        self.assertIsInstance(accepted, frozenset)
-        self.assertGreater(len(accepted), 0)
-        self.assertLessEqual(len(accepted), 80)
-        self.assertEqual(sorted(TAINT_ACCEPTED_ALL & set(TAINT_R27_NEVER_ACCEPTED)), [])
-        self.assertLessEqual(len(TAINT_ACCEPTED_HARNESS), 30)
-        self.assertEqual(sorted(TAINT_EXEMPT_FUNCTIONS), ["canary_dump", "load_variant"])
-        self.assertTrue(all(name.isidentifier() for name in accepted))
-        self.assertEqual(sorted(TAINT_ACCEPTED_CALLEES), sorted(set(TAINT_ACCEPTED_CALLEES)))
-
-    def test_the_exempt_functions_have_no_output_call(self):
-        tree = ast.parse(THIS_PATH.read_text(encoding="utf-8"))
-        outputs = {"print", "write", "writelines", "log", "warn", "exit", "system", "Popen", "run", "open", "write_text",
-                   "debug", "info", "warning", "error", "critical", "exception", "excepthook"}
-        seen = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name in TAINT_EXEMPT_FUNCTIONS:
-                seen.append(node.name)
-                calls = {call_name(c) for c in ast.walk(node) if isinstance(c, ast.Call)}
-                self.assertEqual(len(calls & outputs), 0)
-        self.assertEqual(len(seen), len(TAINT_EXEMPT_FUNCTIONS))
 
     def test_the_lists_of_refused_output_calls_are_gone(self):
         source = THIS_PATH.read_text(encoding="utf-8")
@@ -5858,10 +6999,12 @@ class TestNotesTwoLinksDeepAreCaptured8187R27(unittest.TestCase):
     def test_a_one_link_walk_and_a_depth_two_strip_are_red_for_the_two_deep_controls_only(self):
         ty_source = TY_PATH.read_text(encoding="utf-8")
         test_source = THIS_PATH.read_text(encoding="utf-8")
-        for kind in ("one-link-walk", "deep-notes-strip"):
+        # a one-link walk also misses the three r28 controls (eight links deep, behind a cycle); a strip two links deep does not
+        eight = ["exception-cause-8-notes", "exception-context-8-notes", "exception-cycle-notes"]
+        for kind, expected in (("one-link-walk", sorted(self.DEEP + eight)), ("deep-notes-strip", sorted(self.DEEP))):
             with self.subTest(kind=kind):
                 variant = load_variant(ty_source, harness_mutant_source(test_source, kind, "exception-chain"))
-                self.assertEqual(sorted(canary_control_failures(variant)), self.DEEP)
+                self.assertEqual(sorted(canary_control_failures(variant)), expected)
 
     def test_the_two_mutants_are_in_the_harness_table(self):
         self.assertIn("chain walk stops after one link", HARNESS_MUTANTS)
@@ -5992,7 +7135,7 @@ TAINT_R28_CLEAN = {
     "r28 compiled regex held in a name": (
         TAINT_R28_HEAD + "        pattern = re.compile('[a-z]+')\n        self.assertTrue(bool(pattern.search(body)))\n"),
     "r28 sha256 hexdigest then length": (
-        TAINT_R28_HEAD + "        import hashlib\n        digest = hashlib.sha256(body.encode()).hexdigest()\n"
+        TAINT_R28_HEAD + "        import hashlib\n        digest = hashlib.sha256(body.encode('utf-8', 'surrogatepass')).hexdigest()\n"
         "        self.assertEqual(len(digest), 64)\n"),
     "r28 dict get then length": TAINT_R28_HEAD + "        part = body.get('k')\n        self.assertEqual(len(part), 1)\n",
     "r28 sorted key=len then length": TAINT_R28_HEAD + "        names = sorted(body, key=len)\n        self.assertEqual(len(names), 2)\n",
@@ -6078,16 +7221,16 @@ class TestTaintScanAcceptsByReceiverAndName8187R28(unittest.TestCase):
                 self.assertEqual(tainted_assert_lines(source), [])
 
     def test_the_accepted_sets_are_sorted_named_constants(self):
-        module = sys.modules[__name__]
         tree = ast.parse(THIS_PATH.read_text(encoding="utf-8"))
-        for constant in ("TAINT_ACCEPTED_BUILTINS", "TAINT_ACCEPTED_QUALIFIED", "TAINT_ACCEPTED_METHODS"):
+        constants = {"TAINT_ACCEPTED_BUILTINS": TAINT_ACCEPTED_BUILTINS, "TAINT_ACCEPTED_QUALIFIED": TAINT_ACCEPTED_QUALIFIED,
+                     "TAINT_ACCEPTED_METHODS": TAINT_ACCEPTED_METHODS}
+        for constant, accepted in constants.items():
             with self.subTest(constant=constant):
-                accepted = getattr(module, constant, None)
                 self.assertIsInstance(accepted, frozenset)
                 self.assertGreater(len(accepted), 0)
                 assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == constant)
                 elements = [e for e in ast.walk(assignment.value) if isinstance(e, ast.Constant)]
-                self.assertTrue([e.value for e in elements] == sorted(accepted))
+                self.assertIs([e.value for e in elements] == sorted(accepted), True)
                 self.assertEqual(len({e.lineno for e in elements}), len(elements))  # one member per line
         self.assertTrue(all("." in name for name in TAINT_ACCEPTED_QUALIFIED))
         self.assertTrue(all(name.isidentifier() for name in TAINT_ACCEPTED_BUILTINS | TAINT_ACCEPTED_METHODS))
@@ -6100,8 +7243,8 @@ class TestTaintScanAcceptsByReceiverAndName8187R28(unittest.TestCase):
             self.assertNotIn(name, TAINT_ACCEPTED_METHODS)
 
     def test_the_bare_name_sets_of_r27_are_gone(self):
-        module = sys.modules[__name__]
-        self.assertEqual([n for n in ("TAINT_ACCEPTED_CALLEES", "TAINT_ACCEPTED_HARNESS", "TAINT_ACCEPTED_ALL") if hasattr(module, n)], [])
+        source = THIS_PATH.read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"^TAINT_ACCEPTED_(?:CALLEES|HARNESS|ALL)\s*=", source, re.MULTILINE), [])
 
     def test_both_shipped_files_have_no_tainted_line(self):
         for path in (TY_PATH, THIS_PATH):
@@ -6118,24 +7261,40 @@ class TestExemptFunctionsAreCheckedPositively8187R28(unittest.TestCase):
         return THIS_PATH.read_text(encoding="utf-8")
 
     def test_the_shipped_bodies_are_clean(self):
-        self.assertEqual(exempt_function_problems(self.source()), [])
+        self.assertEqual(exempt_function_defects(self.source()), [])
 
     def test_each_insert_is_flagged_in_each_function(self):
         survivors = []
         for function in sorted(TAINT_EXEMPT_FUNCTIONS):
             for name, insert in TAINT_R28_EXEMPT_INSERTS.items():
                 with self.subTest(function=function, insert=name):
-                    if not exempt_function_problems(exempt_source_with(self.source(), function, insert)):
+                    if not exempt_function_defects(exempt_source_with(self.source(), function, insert)):
                         survivors.append((function, name))
         self.assertEqual(survivors, [])
 
     def test_the_check_reads_the_same_accepted_set_as_the_scan(self):
         module = sys.modules[__name__]
         insert = exempt_source_with(self.source(), "canary_dump", TAINT_R28_EXEMPT_INSERTS["pprint.pp(KEEP)"])
-        self.assertNotEqual(exempt_function_problems(insert), [])
+        self.assertNotEqual(exempt_function_defects(insert), [])
         widened = TAINT_ACCEPTED_QUALIFIED | {"pprint.pp"}
         with unittest.mock.patch.object(module, "TAINT_ACCEPTED_QUALIFIED", widened):
-            self.assertEqual(exempt_function_problems(insert), [])
+            self.assertEqual(exempt_function_defects(insert), [])
+
+    def test_stage_text_is_the_third_exempt_function_and_its_path_is_never_loaded_text(self):
+        self.assertEqual(sorted(TAINT_EXEMPT_FUNCTIONS), ["canary_dump", "load_variant", "stage_text"])
+        self.assertEqual(exempt_function_defects(self.source(), ("stage_text",)), [])
+        defined = "def stage_text(target, body):\n    target.write_text(body)\n"
+        self.assertEqual(tainted_assert_lines(defined + TAINT_R26_SEC_HEAD + "        stage_text('fixed', 'x')\n"), [])
+        self.assertNotEqual(tainted_assert_lines(defined + TAINT_R26_SEC_HEAD + "        stage_text(body, 'x')\n"), [])
+
+    def test_json_loads_never_repeats_its_input_in_an_error(self):
+        marker = "CANARY-json-0123456789"
+        for text in ('{"a": %s' % marker, '[%s]' % marker, '"%s' % marker, '{%s: 1}' % marker, marker):
+            with self.subTest(shape=len(text)):
+                with self.assertRaises(ValueError) as caught:
+                    json.loads(text)
+                shown = [str(caught.exception), repr(caught.exception), repr(caught.exception.args)]
+                self.assertEqual([part for part in shown if marker in part], [])
 
     def test_the_exempt_allowance_is_a_named_sorted_constant(self):
         self.assertIsInstance(TAINT_EXEMPT_CALLS, frozenset)
@@ -6158,7 +7317,7 @@ class TestOpaqueHashAndSameRevealNothing8187R28(unittest.TestCase):
         first = ty.Opaque("aaaa", "key[0]")
         second = ty.Opaque("bbbb", "key[1]")
         self.assertEqual(hash(first), hash(second))
-        self.assertFalse(first == second)
+        self.assertIs(first == second, False)
         self.assertEqual(len({first, second}), 2)
         self.assertEqual(hash(ty.Opaque("same", "key[0]")), hash(ty.Opaque("same", "key[1]")))
 
@@ -6183,8 +7342,6 @@ class TestOpaqueHashAndSameRevealNothing8187R28(unittest.TestCase):
             def __eq__(self, other):
                 Subclass.seen.append(other)
                 return True
-
-            __hash__ = str.__hash__
 
         wrapped = ty.Opaque("workflow-text", "step[0]")
         for build in (Grab, lambda: [Grab()], lambda: {"k": Grab()}, lambda: (Grab(),)):
@@ -6221,7 +7378,8 @@ class TestOpaqueHashAndSameRevealNothing8187R28(unittest.TestCase):
 
             __hash__ = None
 
-        self.assertFalse(ty.Opaque("text", "key[0]") == ty.Opaque(Grab(), "key[1]"))
+        with self.assertRaises(ty.OpaqueComparisonError):
+            ty.Opaque("text", "key[0]") == ty.Opaque(Grab(), "key[1]")
         self.assertEqual(Grab.seen, [])
 
     def test_the_docstring_states_the_hash(self):
@@ -6277,7 +7435,7 @@ class TestTheRoundTwentyEightSourceIsConsistent8187R28(unittest.TestCase):
     def test_the_comment_states_the_tuple_length(self):
         source = THIS_PATH.read_text(encoding="utf-8")
         counts = re.findall(r"^# the (\d+) snippets above that the r26 gates passed", source, re.MULTILINE)
-        self.assertTrue(counts == [str(len(OPAQUE_R27_PASSED_AT_R26))])
+        self.assertIs(counts == [str(len(OPAQUE_R27_PASSED_AT_R26))], True)
         self.assertEqual(len(OPAQUE_R27_PASSED_AT_R26), 15)
 
 
