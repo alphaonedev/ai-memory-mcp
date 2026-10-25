@@ -183,7 +183,7 @@ fi
 # Certified pgvector PATCH — the single fleet-wide provisioning pin. It
 # lives ONCE, in the docker-1461 lane's `DOCKER_1461_PGVECTOR_APT_VERSION`
 # default in deploy/docker-1461/provision/lib.sh, reduced to its bare
-# upstream x.y.z (`0.8.6-1.pgdg13+1` -> `0.8.6`). This is the SAME SSOT
+# upstream x.y.z (`0.8.7-1.pgdg13+1` -> `0.8.7`). This is the SAME SSOT
 # default tests/provisioning_pgvector_pin_parity.rs reads (and asserts the
 # do-1461 lane agrees on), so the gate introduces NO third source of
 # truth — it reuses the parity test's extraction shape (first live
@@ -2369,15 +2369,15 @@ HOOKHISTPD
     # pinned ONCE in deploy/docker-1461/provision/lib.sh's
     # DOCKER_1461_PGVECTOR_APT_VERSION default (the SAME default
     # tests/provisioning_pgvector_pin_parity.rs reads); ~15 current-cert
-    # doc citations must agree. Plant the SSOT at 0.8.6, then plant a doc
+    # doc citations must agree. Plant the SSOT at 0.8.7, then plant a doc
     # citing a STALE 0.8.5 across all three anchor forms and assert the
-    # gate REJECTS it; the correct 0.8.6 must PASS. Clean the leftover
+    # gate REJECTS it; the correct 0.8.7 must PASS. Clean the leftover
     # HookEvent fixtures first so this leg isolates exactly the planted
     # pgvector doc.
     rm -f "$led" "$tmpdir/docs/production-deployment.md"
     mkdir -p "$tmpdir/deploy/docker-1461/provision"
     cat > "$tmpdir/deploy/docker-1461/provision/lib.sh" <<'PGVECSSOT'
-PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.6-1.pgdg13+1}"
+PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.7-1.pgdg13+1}"
 PGVECSSOT
     cat > CLAUDE.md <<'PGVECCLEANCLAUDE'
 Fixture CLAUDE.md — deliberately carries no narrative counts.
@@ -2385,7 +2385,7 @@ PGVECCLEANCLAUDE
     cat > README.md <<'PGVECCLEANREADME'
 Fixture README — deliberately carries no narrative counts.
 PGVECCLEANREADME
-    # Fixture SSOT patch = 0.8.6; plant a stale 0.8.5 across all three
+    # Fixture SSOT patch = 0.8.7; plant a stale 0.8.5 across all three
     # anchors (table cell, prose, apt literal).
     cat > "$tmpdir/docs/CONFIG_SCHEMA.md" <<'PGVECSTALE'
 | pgvector (server extension) | **0.8.5** | `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1` |
@@ -2394,7 +2394,7 @@ The image layers pgvector 0.8.5 onto the AGE base.
 > Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
 PGVECSTALE
     if pgv_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
-        echo "FAIL: self-test — gate did NOT catch the stale pgvector patch (0.8.5 vs SSOT 0.8.6)" >&2
+        echo "FAIL: self-test — gate did NOT catch the stale pgvector patch (0.8.5 vs SSOT 0.8.7)" >&2
         printf '%s\n' "$pgv_out" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2414,18 +2414,18 @@ PGVECSTALE
     fi
     echo "PASS: self-test — pgvector rule REJECTS a stale patch across all three anchors, spares the Rust-crate + alternate-matrix figures"
 
-    # ---- PGVECTOR CONTROL: the correct patch (matching SSOT 0.8.6) PASSES.
+    # ---- PGVECTOR CONTROL: the correct patch (matching SSOT 0.8.7) PASSES.
     cat > "$tmpdir/docs/CONFIG_SCHEMA.md" <<'PGVECGOOD'
-| pgvector (server extension) | **0.8.6** | `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1` |
-The image layers pgvector 0.8.6 onto the AGE base.
+| pgvector (server extension) | **0.8.7** | `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1` |
+The image layers pgvector 0.8.7 onto the AGE base.
 > Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
 PGVECGOOD
     if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
-        echo "FAIL: self-test — pgvector rule fired on the CORRECT patch (0.8.6)" >&2
+        echo "FAIL: self-test — pgvector rule fired on the CORRECT patch (0.8.7)" >&2
         AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
-    echo "PASS: self-test — the certified pgvector patch (0.8.6) still PASSES"
+    echo "PASS: self-test — the certified pgvector patch (0.8.7) still PASSES"
 
     # ---- ASI-HARD PINNED-KNOB COUNT + THE MARKDOWN-HEADING SCOPING (#3113).
     # Two directions in one leg, because the SECOND is what makes the first
