@@ -112,7 +112,7 @@ CA and per-peer keys are minted once and reused on re-runs for stable trust.
   embedder/LLM model ids,
   every port/name/path — all single-source constants, env-overridable for forks,
   with **no hostname/region/vendor literal baked into any variable name**.
-  PostgreSQL 18.6 and pgvector 0.8.6 are current-stable; **Apache AGE 1.8.0 is
+  PostgreSQL 18.6 and pgvector 0.8.7 are current-stable; **Apache AGE 1.8.0 is
   the newest released AGE for PostgreSQL 18** per
   [github.com/apache/age/releases](https://github.com/apache/age/releases)
   (`PG18/v1.8.0-rc0`, 2026-07-09). Apache AGE tags every release `X.Y.Z-rc0` on
