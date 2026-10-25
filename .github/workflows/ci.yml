@@ -1601,6 +1601,8 @@ jobs:
             # is re-tuned from data, not from the next surprise kill.
             if [ "$rc" -eq 0 ]; then
               echo "::notice::[#6202] '${label}' passed: suite wall ${elapsed}s of the ${WATCHDOG_SECS}s watchdog budget ($((elapsed * 100 / WATCHDOG_SECS))% used, $(( (WATCHDOG_SECS - elapsed) / 60 )) min margin; tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
+              # #7343 — warn (never fail) when a green shard used more than 85% of its budget.
+              python3 scripts/ci/watchdog_margin.py --label "$label" --elapsed "$elapsed" --budget "$WATCHDOG_SECS" --tier "${TIER:-sqlite}" --node "${CI_NODE:-unknown}" || true
             fi
             echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget ($((elapsed * 100 / WATCHDOG_SECS))% used, $((WATCHDOG_SECS - elapsed))s margin; tier=${TIER:-sqlite} node=${CI_NODE:-unknown} watchdog=${TIMEOUT_BIN:-disabled})"
             if [ "$rc" -ne 0 ]; then
@@ -1617,7 +1619,7 @@ jobs:
           # test set runs as three concurrent shards, each a `run_tests` chain
           # (so the #1492 watchdog, #2500 --no-fail-fast and #2657 prebuild
           # shapes are unchanged):
-          #   serial      class (a): Postgres / #[serial] / federat* / unknown
+          #   serial      class (a): Postgres / #[serial] / unknown (#7343: a federat* name alone is not evidence)
           #               source binaries + the lib Postgres test-name prefixes
           #               + doc tests, --test-threads=1. The ONLY shard that
           #               touches the per-job Postgres database.

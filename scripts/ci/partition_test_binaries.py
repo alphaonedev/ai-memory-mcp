@@ -5,7 +5,7 @@ Input is the stdout of ``cargo test --no-run --message-format=json`` (or
 ``json-render-diagnostics``), read from ``--build-json`` or stdin, plus the
 repository sources. Output is written to ``--out-dir``:
 
-* ``serial.txt``      class (a): Postgres / ``#[serial]`` / ``federat`` in the name /
+* ``serial.txt``      class (a): Postgres / ``#[serial]`` evidence (#7343: not the name alone) /
                       unknown source. Run at ``--test-threads=1`` in ONE process.
                       Also carries ``--lib`` (the lib unittests filtered to the
                       Postgres test-name prefixes).
@@ -21,7 +21,9 @@ crate root, every ``mod name;`` (``name.rs`` / ``name/mod.rs``), every
 that two or more targets compile (``tests/common/``) is a shared helper: its
 Postgres / ``#[serial]`` / fixed-port evidence counts only for the targets that
 reference the helper item carrying it, unless the file itself declares tests,
-in which case it is unioned like any other. A ``mod`` that resolves to no file
+in which case it is unioned like any other. A free ``fn`` helper counts only for a
+real call, ``module::name`` path or ``use`` of it, never for the same word as a
+local, a field, a method call or an associated fn (#7352). A ``mod`` that resolves to no file
 is class (a) (fail closed).
 
 Every list line is one cargo target selector: ``--lib``, ``--bin NAME``,
@@ -58,7 +60,6 @@ PG_RE = re.compile(
     r'|pg_barrier|lane_db|pg_sources|pg_blocking_pids'
 )
 SERIAL_RE = re.compile(r'serial_test|#\[serial')
-FEDERAT_RE = re.compile(r'federat', re.IGNORECASE)
 # Class (b) binaries carrying these run in the SAME half so two of them never
 # run in different processes at once.
 PORT_RE = re.compile(r'(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(?!0\b)\d{2,5}\b')
@@ -150,8 +151,8 @@ PATH_ATTR_RE = re.compile(r'#\s*\[\s*path\s*=\s*"')
 # #[test_log::test]. Not #[cfg(test)] / #[cfg_attr(test, ..)]: those mark helpers (r2 F3).
 TEST_ATTR_RE = re.compile(r'#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(?:test|rstest|test_case)\b')
 ITEM_RE = re.compile(
-    r'\b(?:(fn|struct|enum|union|trait|type|const|static|mod)\s+(?:mut\s+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)'
-    r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')
+    r"(?<!')\b(?:(fn|struct|enum|union|trait|type|const|static|mod)\s+(?:mut\s+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)"
+    r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')  # (?<!'): `&'static T` is a lifetime, not an item (#7352)
 FN_BEFORE_RE = re.compile(r'\bfn\s+$')  # the name is being defined here, not called
 DEF_BEFORE_RE = re.compile(r'\b(?:fn|mod|struct|enum|union|trait|type)\s+$')  # any item definition token
 
@@ -454,6 +455,65 @@ def code_evidence(rf, a, b, pg_consts=None):
     return tags
 
 
+FREE_FN_ITEM_RE = re.compile(r'fn\s+(?:r#)?[A-Za-z_]')
+USE_STMT_RE = re.compile(r'\buse\b[^;]*;')
+
+
+def free_fn_names(files):
+    """Names every top-level definition of which, across the shared files, is a free ``fn``.
+
+    #7352: such a name is a call, not a word. A binary with a local called ``plan``, a field
+    ``.resolve`` or a method call ``client.connect(`` does not call the helper ``fn plan`` / ``fn connect``.
+    """
+    kinds = {}
+    for rf in files:
+        for name, a, _b in top_level_items(rf):
+            kinds.setdefault(name, set()).add(bool(FREE_FN_ITEM_RE.match(rf.shape, a)))
+    return frozenset(n for n, k in kinds.items() if k == {True})
+
+
+class NameRefs:
+    """Finds the references to a set of helper names in a code slice (#7352).
+
+    A name defined only as a free ``fn`` is referenced by a call (``name(``, ``name::<T>(``,
+    ``name!``) that is not a method call (a single ``.`` before it) nor a definition (``fn name``),
+    by a ``module::name`` path (not ``Type::name``) and by its appearance in a ``use`` statement. Every other name (type, const, static, macro, alias)
+    is referenced by any whole-word occurrence, as before.
+    """
+
+    def __init__(self, names, fn_names=frozenset()):
+        def order(ns):
+            return sorted(ns, key=lambda x: (-len(x), x))
+
+        def alt(ns):
+            return '|'.join(map(re.escape, ns))
+
+        words = order(n for n in names if n not in fn_names)
+        fns = order(n for n in names if n in fn_names)
+        self.word = re.compile(r'\b(%s)\b' % alt(words)) if words else None
+        # no identifier char or lifetime tick before, and no single `.` (`..name(` is a range, so it counts)
+        self.call = re.compile(r"(?<![\w':])(?<!(?<!\.)\.)(%s)\b(?=\s*(?:\(|::\s*<|!))" % alt(fns)) if fns else None
+        self.path = re.compile(r'(\w+)\s*::\s*(%s)\b' % alt(fns)) if fns else None
+        self.bare = re.compile(r'\b(%s)\b' % alt(fns)) if fns else None
+
+    def find(self, text, a=0, b=None):
+        b = len(text) if b is None else b
+        found = set()
+        if self.word is not None:
+            found.update(m.group(1) for m in self.word.finditer(text, a, b))
+        if self.call is not None:
+            # `fn name(` defines a method of that name, it does not call the helper
+            found.update(m.group(1) for m in self.call.finditer(text, a, b)
+                         if not FN_BEFORE_RE.search(text[max(0, m.start() - 16):m.start()]))
+        if self.path is not None:
+            # `module::name`; `Type::name` is an associated fn of some type, never the free fn
+            found.update(m.group(2) for m in self.path.finditer(text, a, b) if not m.group(1)[:1].isupper())
+        if self.bare is not None:
+            for u in USE_STMT_RE.finditer(text, a, b):
+                found.update(m.group(1) for m in self.bare.finditer(u.group(0)))
+        return found
+
+
 class SourceIndex:
     """Cross-target view of the test sources (#6344 r1 B1).
 
@@ -483,18 +543,17 @@ class SourceIndex:
                     helpers[str(rf.path)] = rf
         self.helper_files = set(helpers)
         files = list(helpers.values())
-        self.evidence = self._helper_evidence(files, full_evidence)
+        self.fn_names = free_fn_names(files)
+        self.evidence = self._helper_evidence(files, full_evidence, self.fn_names)
         self.name_re = self._names_re(self.evidence)
         consts = sorted({m.group(1) for rf in files for m in PG_CONST_RE.finditer(rf.code)})
         pg_consts = re.compile(r'\b(%s)\b' % '|'.join(consts)) if consts else None
-        self.code_ev = self._helper_evidence(files, lambda rf, a, b: code_evidence(rf, a, b, pg_consts))
+        self.code_ev = self._helper_evidence(files, lambda rf, a, b: code_evidence(rf, a, b, pg_consts), self.fn_names)
         self.code_name_re = self._names_re(self.code_ev)
         self.shared_test_tags = {path: self._shared_test_tags(rf, pg_consts) for path, rf in helpers.items()}
 
-    @staticmethod
-    def _names_re(ev):
-        names = sorted(ev, key=lambda x: (-len(x), x))
-        return re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, names))) if names else None
+    def _names_re(self, ev):
+        return NameRefs(ev, self.fn_names) if ev else None
 
     def _shared_test_tags(self, rf, pg_consts):
         """{tag: reason} carried by the test fns a shared file declares."""
@@ -508,10 +567,10 @@ class SourceIndex:
             for tag in sorted(code_evidence(rf, a, b, pg_consts)):
                 tags.setdefault(tag, '%s:%s' % (label, name))
             if self.code_name_re is not None:
-                for m in self.code_name_re.finditer(rf.shape, a, b):
-                    if m.group(1) != name:
-                        for tag in sorted(self.code_ev[m.group(1)]):
-                            tags.setdefault(tag, '%s:%s' % (label, m.group(1)))
+                for ref in self.code_name_re.find(rf.shape, a, b):
+                    if ref != name:
+                        for tag in sorted(self.code_ev[ref]):
+                            tags.setdefault(tag, '%s:%s' % (label, ref))
         return tags
 
     def _walk(self, exe):
@@ -520,7 +579,7 @@ class SourceIndex:
         return walk_crate(exe.src_path, cache=self.cache)
 
     @staticmethod
-    def _helper_evidence(files, evidence_of):
+    def _helper_evidence(files, evidence_of, fn_names=frozenset()):
         items = []
         for rf in files:
             for name, a, b in top_level_items(rf):
@@ -534,12 +593,12 @@ class SourceIndex:
         changed = True
         while changed and ev:
             changed = False
-            rx = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(ev))))
+            refs = NameRefs(ev, fn_names)
             for name, rf, a, b, _ in items:
                 got = set()
-                for m in rx.finditer(rf.code, a, b):
-                    if m.group(1) != name:
-                        got |= ev[m.group(1)]
+                for ref in refs.find(rf.code, a, b):
+                    if ref != name:
+                        got |= ev[ref]
                 if got - ev.get(name, set()):
                     ev.setdefault(name, set()).update(got)
                     changed = True
@@ -560,9 +619,9 @@ class SourceIndex:
                 inherited.setdefault(tag, why)
         if self.name_re is not None:
             for code in [rf.code for rf in own] + [mask(t)[0] for t in extras]:
-                for m in self.name_re.finditer(code):
-                    for tag in sorted(self.evidence[m.group(1)]):
-                        inherited.setdefault(tag, m.group(1))
+                for ref in sorted(self.name_re.find(code)):
+                    for tag in sorted(self.evidence[ref]):
+                        inherited.setdefault(tag, ref)
         return '\n'.join([rf.text for rf in own] + extras), unresolved, inherited
 
 
@@ -634,8 +693,11 @@ def classify(exe, index=None):
         reasons.append('serial')
     elif 'serial' in inherited:
         reasons.append('serial-helper:' + inherited['serial'])
-    if FEDERAT_RE.search(exe.name):
-        reasons.append('name:federat')
+    # #7343: a federat* NAME is no longer evidence by itself. A federation binary with no
+    # Postgres / #[serial] / fixed-port evidence (own tempdir, 127.0.0.1:0 listeners,
+    # per-process env) is decided by the evidence rules above and the shared-port
+    # grouping below, exactly as every other binary. How many binaries that moves is
+    # whatever the partitioner computes for the tree at hand (run it; do not hard-code).
     if unresolved:
         reasons.append('unresolved-mod')
     if reasons:
