@@ -27,6 +27,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
 
+import _ssl  # stdlib C module behind ``ssl``; its getset descriptors are not patchable
 import httpx
 from pydantic import BaseModel
 
@@ -150,6 +151,15 @@ _ALLOWED_VERIFY_FLAGS = (
 #: below it, or ends below it, is refused (#8195, security r1 F4).
 MINIMUM_TLS_VERSION = ssl.TLSVersion.TLSv1_2
 
+try:
+    _C_MIN_VERSION = _ssl._SSLContext.__dict__["minimum_version"]
+    _C_MAX_VERSION = _ssl._SSLContext.__dict__["maximum_version"]
+except (AttributeError, KeyError) as _exc:  # pragma: no cover - a stdlib without the descriptors
+    raise ImportError(
+        "ai_memory needs the C-level _ssl._SSLContext minimum_version and maximum_version "
+        "descriptors to verify a context's TLS range (#8195)."
+    ) from _exc
+
 #: Accepted ``get_ciphers()`` ``strength_bits`` floor: export and low-grade
 #: suites report fewer bits and are refused (#6305).
 _MINIMUM_SUITE_STRENGTH_BITS = 112
@@ -164,11 +174,16 @@ def _tls_range_is_modern(context: ssl.SSLContext) -> bool:
     ``MINIMUM_SUPPORTED`` on a stock ``create_default_context()``, so refusing it
     would refuse the documented form. What the library default can negotiate on
     the wire is held to TLS 1.2 by :func:`_assert_negotiated_session`. Anything
-    that is not a ``TLSVersion`` is refused.
+    that is not a ``TLSVersion`` is refused. Both bounds are also read through the C-level
+    ``_ssl._SSLContext`` descriptors, which cannot be replaced, and must equal the Python-level
+    reads: a descriptor patched before this module was imported counts as stock in
+    ``_STOCK_HANDSHAKE``, so this comparison is what exposes a bound that lies (sec r4 N2).
     """
     low = ssl.SSLContext.minimum_version.__get__(context)  # type: ignore[attr-defined]
     high = ssl.SSLContext.maximum_version.__get__(context)  # type: ignore[attr-defined]
     if not isinstance(low, ssl.TLSVersion) or not isinstance(high, ssl.TLSVersion):
+        return False
+    if low != int(_C_MIN_VERSION.__get__(context)) or high != int(_C_MAX_VERSION.__get__(context)):
         return False
     if low != ssl.TLSVersion.MINIMUM_SUPPORTED and low < MINIMUM_TLS_VERSION:
         return False
@@ -1225,13 +1240,15 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
     return {"request": [_request], "response": [_response]}
 
 
-def _require_https(base_url: object) -> None:
+def _require_https(base_url: object) -> str:
     """Refuse every non-https base URL before anything is sent (sec r2 F2, #3824).
 
     The in-transit standard and ``README`` ("Base URLs are ``https://`` even for
     ``localhost``") promise https for every daemon, loopback included, so there is no
     loopback exception. The URL is parsed with ``httpx.URL``, the parser the client sends
-    with, so the check and the send cannot disagree (sec r3 F2). The scheme must be
+    with (sec r3 F2). A ``str`` subclass could answer ``rstrip`` or ``str()`` differently from
+    its content, so the check runs on a plain ``str`` copy (``str.__str__``) and that same
+    copy is returned for the caller to send (sec r4 N1). The scheme must be
     exactly ``https`` (``httpx`` lower-cases it), the host non-empty and no userinfo
     present. A value that is not a ``str`` (bytes, ``httpx.URL``, a path, ``None``) is refused
     the same way, and :func:`build_httpx_kwargs` runs this check before it touches the value
@@ -1240,9 +1257,11 @@ def _require_https(base_url: object) -> None:
     the host, the userinfo, nor a fragment mis-parsed as a scheme.
     """
     admitted = False
+    plain = ""
     if isinstance(base_url, str):
+        plain = str.__str__(base_url)
         try:
-            parsed = httpx.URL(base_url)
+            parsed = httpx.URL(plain)
             admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo
         except (httpx.InvalidURL, ValueError):
             # Every parser failure, an IDNA-invalid host included, is the one fixed refusal below;
@@ -1253,6 +1272,7 @@ def _require_https(base_url: object) -> None:
             "base_url refused: it must be an absolute https:// URL with a host and no userinfo; "
             "the SDK sends the API key only over https, loopback included (#3824)."
         )
+    return plain
 
 
 def build_httpx_kwargs(
@@ -1316,9 +1336,9 @@ def build_httpx_kwargs(
     if extra_headers:
         headers.update(extra_headers)
 
-    _require_https(base_url)  # first, before the value is touched (code r4 F2)
+    plain_url = _require_https(base_url)  # first, before the value is touched (code r4 F2)
     kwargs: dict[str, Any] = {
-        "base_url": base_url.rstrip("/"),
+        "base_url": plain_url.rstrip("/"),
         "headers": headers,
         "timeout": timeout,
     }
