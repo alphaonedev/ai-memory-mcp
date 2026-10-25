@@ -137,9 +137,12 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
 - #8195 (sec r2 F2): a base URL whose scheme is not `https` is refused at construction in both clients, with a typed
   `ValueError` that echoes no part of the URL (sec r3 F2, code r3 F6): the URL is parsed with `httpx.URL`, the parser
   the client sends with, and must carry the scheme `https`, a host and no userinfo; a whitespace-prefixed, control-
-  character, hostless, IDNA-invalid or non-`str` form is refused with the same typed error, validated before the
+  character, hostless or non-`str` form, and a non-ASCII host that does not IDNA-encode, is refused with the same typed error, validated before the
   value is touched (code r4 F1, F2); a `str` subclass is checked and sent as one plain `str` copy (sec r4 N1), and a
-  TLS bound is also read through the C-level `_ssl._SSLContext` descriptors and must agree (sec r4 N2). README ("Base URLs are `https://` even for
+  TLS bound, `verify_mode`, `check_hostname` and `verify_flags` are also read through the C-level `getset_descriptor` objects, resolved from the
+  real `ssl.SSLContext` MRO, and must agree with the Python-level reads (sec r4 N2, sec r5 S1, code r5 F2). The getset objects are immutable; the lookup path to
+  them is not, which is why they come from the class chain and not from the `_ssl` module table. The threat boundary is code that runs in the caller's
+  process before `ai_memory` is imported; the negotiated-session gate holds on the wire either way. ASCII label shape (length, hyphens) is not validated by the SDK; check and send agree (code r5 F4). README ("Base URLs are `https://` even for
   `localhost`") and the in-transit standard #3824 grant no loopback exception.
   decision: refuse every non-https base URL at construction over a warning or a loopback exception because
   README:26-29 and the #3824 in-transit standard already promise https even for localhost.

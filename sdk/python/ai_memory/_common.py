@@ -27,7 +27,6 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
 
-import _ssl  # stdlib C module behind ``ssl``; its getset descriptors are not patchable
 import httpx
 from pydantic import BaseModel
 
@@ -151,14 +150,60 @@ _ALLOWED_VERIFY_FLAGS = (
 #: below it, or ends below it, is refused (#8195, security r1 F4).
 MINIMUM_TLS_VERSION = ssl.TLSVersion.TLSv1_2
 
-try:
-    _C_MIN_VERSION = _ssl._SSLContext.__dict__["minimum_version"]
-    _C_MAX_VERSION = _ssl._SSLContext.__dict__["maximum_version"]
-except (AttributeError, KeyError) as _exc:  # pragma: no cover - a stdlib without the descriptors
-    raise ImportError(
-        "ai_memory needs the C-level _ssl._SSLContext minimum_version and maximum_version "
-        "descriptors to verify a context's TLS range (#8195)."
-    ) from _exc
+
+def _resolve_c_bound(classes: "tuple[type, ...]", name: str) -> "Any | None":
+    """The C-level ``getset_descriptor`` for ``name`` found on the MRO of ``classes``, or ``None``.
+
+    The base that holds it is found by walking the class chain itself, never through a module
+    lookup: the ``_ssl`` module binding is substitutable before this module is imported, the MRO of
+    the class the SDK constructs is not (sec r5 S1). The descriptor must be a ``getset_descriptor``
+    whose ``__objclass__`` sits on every given MRO, and every class must resolve to the same object.
+    """
+    found: "list[Any]" = []
+    for cls in classes:
+        match = None
+        for base in cls.__mro__:
+            candidate = base.__dict__.get(name)
+            if type(candidate).__name__ == "getset_descriptor":
+                match = candidate
+                break
+        if match is None:
+            return None
+        found.append(match)
+    first = found[0]
+    if any(item is not first for item in found):
+        return None
+    if any(getattr(first, "__objclass__", None) not in cls.__mro__ for cls in classes):
+        return None
+    return first
+
+
+_C_CLASSES = (ssl.SSLContext, type(ssl.create_default_context()))
+#: The C-level bound descriptors, or ``None`` when the real class does not carry them; a ``None``
+#: makes :func:`_tls_range_is_modern` refuse every context (typed, at construction, fail closed).
+_C_MIN_VERSION = _resolve_c_bound(_C_CLASSES, "minimum_version")
+_C_MAX_VERSION = _resolve_c_bound(_C_CLASSES, "maximum_version")
+_C_VERIFY_MODE = _resolve_c_bound(_C_CLASSES, "verify_mode")
+_C_CHECK_HOSTNAME = _resolve_c_bound(_C_CLASSES, "check_hostname")
+_C_VERIFY_FLAGS = _resolve_c_bound(_C_CLASSES, "verify_flags")
+
+
+def _c_reads_agree(context: ssl.SSLContext, python_value: object, descriptor: "Any | None") -> bool:
+    """Whether the C-level read of ``descriptor`` equals ``python_value`` (sec r5 S1, code r5 F2).
+
+    ``_STOCK_HANDSHAKE`` counts whatever was bound on ``ssl.SSLContext`` when this module was
+    imported as stock, so a property replaced before the import passes that identity check. The
+    ``getset_descriptor`` read reaches the real C state; a Python-level read that disagrees, or
+    that is not an integer, a ``bool`` or an enum member, is refused. An unresolved descriptor
+    refuses.
+    """
+    if descriptor is None:
+        return False
+    try:
+        return int(python_value) == int(descriptor.__get__(context))  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return False
+
 
 #: Accepted ``get_ciphers()`` ``strength_bits`` floor: export and low-grade
 #: suites report fewer bits and are refused (#6305).
@@ -175,10 +220,15 @@ def _tls_range_is_modern(context: ssl.SSLContext) -> bool:
     would refuse the documented form. What the library default can negotiate on
     the wire is held to TLS 1.2 by :func:`_assert_negotiated_session`. Anything
     that is not a ``TLSVersion`` is refused. Both bounds are also read through the C-level
-    ``_ssl._SSLContext`` descriptors, which cannot be replaced, and must equal the Python-level
-    reads: a descriptor patched before this module was imported counts as stock in
-    ``_STOCK_HANDSHAKE``, so this comparison is what exposes a bound that lies (sec r4 N2).
+    ``getset_descriptor`` objects, which are immutable, and must equal the Python-level reads:
+    a descriptor patched before this module was imported counts as stock in ``_STOCK_HANDSHAKE``,
+    so this comparison is what exposes a bound that lies (sec r4 N2). The descriptors are resolved
+    from the real ``SSLContext`` MRO (:func:`_resolve_c_bound`), not from the ``_ssl`` module
+    table, which can be substituted before import (sec r5 S1); if they did not resolve, every
+    context is refused.
     """
+    if _C_MIN_VERSION is None or _C_MAX_VERSION is None:
+        return False
     low = ssl.SSLContext.minimum_version.__get__(context)  # type: ignore[attr-defined]
     high = ssl.SSLContext.maximum_version.__get__(context)  # type: ignore[attr-defined]
     if not isinstance(low, ssl.TLSVersion) or not isinstance(high, ssl.TLSVersion):
@@ -199,7 +249,9 @@ def _context_verifies(context: object) -> bool:
       ``truststore.SSLContext``, keeps its real state on an inner object, so
       the outer object reporting ``CERT_REQUIRED`` proves nothing (#6267);
     * ``verify_mode``/``check_hostname`` read through the base-class
-      descriptors are ``CERT_REQUIRED`` and on (#6248);
+      descriptors are ``CERT_REQUIRED`` and on (#6248), and so do the C-level
+      ``getset_descriptor`` reads of all three of ``verify_mode``,
+      ``check_hostname`` and ``verify_flags`` (code r5 F2);
     * the instance dict shadows no ``ssl.SSLContext`` attribute, so no
       ``context.wrap_socket = ...`` style patch reroutes the handshake (#6268);
     * the handshake-deciding class attributes are still the objects captured
@@ -218,17 +270,22 @@ def _context_verifies(context: object) -> bool:
         ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()
     ):
         return False
-    flags = int(ssl.SSLContext.verify_flags.__get__(context))  # type: ignore[attr-defined]
-    if flags & ~_ALLOWED_VERIFY_FLAGS:
+    py_flags = ssl.SSLContext.verify_flags.__get__(context)  # type: ignore[attr-defined]
+    py_mode = ssl.SSLContext.verify_mode.__get__(context)  # type: ignore[attr-defined]
+    py_host = ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]
+    if not (
+        _c_reads_agree(context, py_flags, _C_VERIFY_FLAGS)
+        and _c_reads_agree(context, py_mode, _C_VERIFY_MODE)
+        and _c_reads_agree(context, py_host, _C_CHECK_HOSTNAME)
+    ):
+        return False
+    if int(py_flags) & ~_ALLOWED_VERIFY_FLAGS:
         return False
     if not _tls_range_is_modern(context):
         return False
     if not _suites_authenticate_server(context):
         return False
-    return bool(
-        ssl.SSLContext.verify_mode.__get__(context) == ssl.CERT_REQUIRED  # type: ignore[attr-defined]
-        and ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]
-    )
+    return bool(py_mode == ssl.CERT_REQUIRED and py_host)
 
 
 #: ``get_ciphers()`` ``auth`` values of suites that authenticate no server
@@ -1259,12 +1316,12 @@ def _require_https(base_url: object) -> str:
     admitted = False
     plain = ""
     if isinstance(base_url, str):
-        plain = str.__str__(base_url)
         try:
+            plain = str.__str__(base_url)
             parsed = httpx.URL(plain)
             admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo
-        except (httpx.InvalidURL, ValueError):
-            # Every parser failure, an IDNA-invalid host included, is the one fixed refusal below;
+        except (httpx.InvalidURL, ValueError, TypeError):
+            # Every parser failure, an IDNA-invalid host or an isinstance spoof included, is the one fixed refusal below;
             # the library message is never surfaced because it can carry a decoded host label.
             admitted = False
     if not admitted:

@@ -49,6 +49,7 @@ CI_T = "tests/test_ci_install_6688.py"
 TRUST = "tests/test_default_trust_8195_r3.py"
 HTTPS_T = "tests/test_require_https_8195_r4.py"
 PREPATCH = "tests/test_tls_prepatch_8195_r5.py"
+PREPATCH6 = "tests/test_tls_prepatch_8195_r6.py"
 RUNNER_T = "tests/test_run_mutants_8195.py"
 DOCS_T = "tests/test_docs_truth_6689.py"
 CLIENT_T = "tests/test_client.py"
@@ -58,7 +59,7 @@ ATTEST = "tests/test_attestation_keyfile_3784.py"
 #: Every test file a mutant may be killed by; the runner executes all of them per row.
 KILLER_TESTS = (
     FLOOR, SESSION, VERIFY, CAPATH7, CAPATH8, OWNED_T, OWNED_R, ACL, ACL_FC, WAKE_T,
-    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T, PREPATCH,
+    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T, PREPATCH, PREPATCH6,
 )
 
 
@@ -77,11 +78,11 @@ MUTANTS: tuple[Mutant, ...] = (
            "if verify is None or verify is True:", "if verify is None or verify is True or verify is False:",
            killers=(VERIFY,)),
     Mutant("S02/C02", "CERT_NONE admitted (equivalent: CERT_NONE forces check_hostname off)", COMMON,
-           "== ssl.CERT_REQUIRED  # type: ignore[attr-defined]",
-           "in (ssl.CERT_REQUIRED, ssl.CERT_NONE)  # type: ignore[attr-defined]", equivalent=True,
+           "py_mode == ssl.CERT_REQUIRED",
+           "py_mode in (ssl.CERT_REQUIRED, ssl.CERT_NONE)", equivalent=True,
            killers=(VERIFY,)),
     Mutant("S03/C03", "check_hostname off admitted", COMMON,
-           "and ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]", "and True",
+           "and py_host)", "and True)",
            killers=(SESSION, VERIFY,)),
     Mutant("S04/C04", "builder minimum TLS 1.0", COMMON,
            "    context.minimum_version = MINIMUM_TLS_VERSION\n",
@@ -103,7 +104,7 @@ MUTANTS: tuple[Mutant, ...] = (
            "            or False\n",
            killers=(FLOOR,)),
     Mutant("S07/C08", "verify_flags allowlist removed", COMMON,
-           "    if flags & ~_ALLOWED_VERIFY_FLAGS:\n        return False", "    if False:\n        return False",
+           "    if int(py_flags) & ~_ALLOWED_VERIFY_FLAGS:\n        return False", "    if False:\n        return False",
            killers=(SESSION,)),
     Mutant("S08/C09", "subclass (truststore) admitted", COMMON,
            "    if type(context) is not ssl.SSLContext:\n        return False",
@@ -271,8 +272,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant("S37/C38", "dev extra: socksio missing", PYPROJECT, '    "socksio>=1.0,<2",\n', "",
            killers=(CI_T,)),
     Mutant("S38", "CERT_OPTIONAL admitted", COMMON,
-           "== ssl.CERT_REQUIRED  # type: ignore[attr-defined]",
-           "in (ssl.CERT_REQUIRED, ssl.CERT_OPTIONAL)  # type: ignore[attr-defined]",
+           "py_mode == ssl.CERT_REQUIRED",
+           "py_mode in (ssl.CERT_REQUIRED, ssl.CERT_OPTIONAL)",
            killers=(VERIFY,)),
     Mutant("R2", "builder minimum removed", COMMON,
            "    context.minimum_version = MINIMUM_TLS_VERSION\n", "",
@@ -345,15 +346,15 @@ MUTANTS: tuple[Mutant, ...] = (
            'admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo',
            'admitted = parsed.scheme == "https" and bool(parsed.host)', killers=(HTTPS_T,)),
     Mutant("R4", "base URL: InvalidURL not mapped to the typed error", COMMON,
-           "        except (httpx.InvalidURL, ValueError):\n",
+           "        except (httpx.InvalidURL, ValueError, TypeError):\n",
            "        except ValueError:\n", killers=(HTTPS_T,)),
     Mutant("R5", "base URL: parsed fields read outside the try (code r4 F1)", COMMON,
            '            admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo\n'
-           "        except (httpx.InvalidURL, ValueError):\n"
-           "            # Every parser failure, an IDNA-invalid host included, is the one fixed refusal below;\n"
+           "        except (httpx.InvalidURL, ValueError, TypeError):\n"
+           "            # Every parser failure, an IDNA-invalid host or an isinstance spoof included, is the one fixed refusal below;\n"
            "            # the library message is never surfaced because it can carry a decoded host label.\n"
            "            admitted = False\n",
-           "        except (httpx.InvalidURL, ValueError):\n            pass\n        else:\n"
+           "        except (httpx.InvalidURL, ValueError, TypeError):\n            pass\n        else:\n"
            '            admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo\n',
            killers=(HTTPS_T,)),
     Mutant("R5", "base URL: validated after the value is touched (code r4 F2)", COMMON,
@@ -361,10 +362,48 @@ MUTANTS: tuple[Mutant, ...] = (
            "    base_url.rstrip(\"/\")\n    plain_url = _require_https(base_url)\n",
            killers=(HTTPS_T,)),
     Mutant("R5", "base URL: str subclass copy dropped (sec r4 N1)", COMMON,
-           "        plain = str.__str__(base_url)\n", "        plain = base_url\n",
+           "            plain = str.__str__(base_url)\n", "            plain = base_url\n",
            killers=(HTTPS_T,)),
     Mutant("R5", "TLS range: C-level bound comparison dropped (sec r4 N2)", COMMON,
            "    if low != int(_C_MIN_VERSION.__get__(context)) or high != int(_C_MAX_VERSION.__get__(context)):\n"
            "        return False\n", "",
+           killers=(PREPATCH,)),
+    Mutant("R6", "base URL: str copy moved out of the try (sec r5 S2)", COMMON,
+           "        try:\n            plain = str.__str__(base_url)\n            parsed = httpx.URL(plain)\n",
+           "        plain = str.__str__(base_url)\n        try:\n            parsed = httpx.URL(plain)\n",
+           killers=(HTTPS_T,)),
+    Mutant("R6", "base URL: TypeError not mapped to the typed error (sec r5 S2)", COMMON,
+           "        except (httpx.InvalidURL, ValueError, TypeError):\n",
+           "        except (httpx.InvalidURL, ValueError):\n", killers=(HTTPS_T,)),
+    Mutant("R6", "TLS range: unresolved C descriptors admitted (sec r5 S1)", COMMON,
+           "    if _C_MIN_VERSION is None or _C_MAX_VERSION is None:\n        return False\n", "",
+           killers=(PREPATCH,)),
+    Mutant("R6", "C descriptor: __objclass__ not on the MRO accepted (sec r5 S1)", COMMON,
+           '    if any(getattr(first, "__objclass__", None) not in cls.__mro__ for cls in classes):\n        return None\n',
+           "", killers=(PREPATCH,)),
+    Mutant("R6", "C descriptor: differing classes may resolve to different objects (sec r5 S1)", COMMON,
+           "    if any(item is not first for item in found):\n        return None\n", "",
+           killers=(PREPATCH,)),
+    Mutant("R6", "C descriptor: any attribute type accepted (sec r5 S1)", COMMON,
+           '            if type(candidate).__name__ == "getset_descriptor":\n',
+           "            if candidate is not None:\n", killers=(PREPATCH,)),
+    Mutant("R6", "C descriptors read from the _ssl module table again (sec r5 S1)", COMMON,
+           '_C_MIN_VERSION = _resolve_c_bound(_C_CLASSES, "minimum_version")\n',
+           'import _ssl\n_C_MIN_VERSION = _ssl._SSLContext.__dict__["minimum_version"]\n',
+           killers=(PREPATCH,)),
+    Mutant("R6", "verification: verify_flags C read not compared (code r5 F2)", COMMON,
+           "        _c_reads_agree(context, py_flags, _C_VERIFY_FLAGS)\n        and _c_reads_agree(context, py_mode, _C_VERIFY_MODE)\n",
+           "        _c_reads_agree(context, py_flags, _C_VERIFY_FLAGS) or True\n        and _c_reads_agree(context, py_mode, _C_VERIFY_MODE)\n",
+           killers=(PREPATCH6,)),
+    Mutant("R6", "verification: verify_mode C read not compared (code r5 F2)", COMMON,
+           "        and _c_reads_agree(context, py_mode, _C_VERIFY_MODE)\n",
+           "        and (_c_reads_agree(context, py_mode, _C_VERIFY_MODE) or True)\n",
+           killers=(PREPATCH6,)),
+    Mutant("R6", "verification: check_hostname C read not compared (code r5 F2)", COMMON,
+           "        and _c_reads_agree(context, py_host, _C_CHECK_HOSTNAME)\n",
+           "        and (_c_reads_agree(context, py_host, _C_CHECK_HOSTNAME) or True)\n",
+           killers=(PREPATCH6,)),
+    Mutant("R6", "verification: unresolved C descriptor admitted (code r5 F2)", COMMON,
+           "    if descriptor is None:\n        return False\n", "",
            killers=(PREPATCH,)),
 )
