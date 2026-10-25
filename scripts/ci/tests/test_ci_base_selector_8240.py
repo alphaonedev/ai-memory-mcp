@@ -65,6 +65,12 @@ GATE_SCRIPT = IMPACT_REL + "/gate.py"
 FAKE_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
+def derived_env(base):
+    """Event env under which the materialise step derives exactly `base` (merge_group form)."""
+    return {"BASE_SHA": base, "EVENT_NAME": "merge_group", "HEAD_SHA": "",
+            "MERGE_GROUP_BASE_SHA": base}
+
+
 def step_named(job, name):
     """Return the step of `job` called `name`, or fail the test."""
     for step in workflow_text.read_steps(CI_YML, job):
@@ -120,7 +126,7 @@ class BaseCase(unittest.TestCase):
     def materialise(self, base, files=" ".join(SELECTOR_FILES), source=None):
         step = step_named(SELECT_JOB, MATERIALISE_STEP)
         return run_snippet(source or snippet_of(step), self.repo,
-                           {"BASE_SHA": base, "IMPACT_FILES": files})
+                           dict(derived_env(base), IMPACT_FILES=files))
 
 
 class WorkflowShape(unittest.TestCase):
@@ -249,7 +255,7 @@ class GateBaseRead(BaseCase):
 
     def gate_materialise(self, base, path=None):
         step = step_named(GATE_JOB, GATE_MATERIALISE_STEP)
-        env = {"BASE_SHA": base, "IMPACT_FILES": step["env"]["IMPACT_FILES"]}
+        env = dict(derived_env(base), IMPACT_FILES=step["env"]["IMPACT_FILES"])
         if path is not None:
             env["PATH"] = path
         return run_snippet(snippet_of(step), self.repo, env)
@@ -557,7 +563,8 @@ class FailClosed(BaseCase):
                 raise OSError(28, "No space left on device")
             return real(path, data)
 
-        env = {"BASE_SHA": base, "IMPACT_FILES": " ".join(SELECTOR_FILES),
+        env = {"BASE_SHA": base, "EVENT_NAME": "merge_group", "MERGE_GROUP_BASE_SHA": base,
+               "IMPACT_FILES": " ".join(SELECTOR_FILES),
                "RUNNER_TEMP": str(self.tmp / "runner-temp"),
                "GITHUB_OUTPUT": str(self.tmp / "go.txt"),
                "GITHUB_STEP_SUMMARY": str(self.tmp / "gs.md")}
@@ -811,6 +818,20 @@ class BranchTipGate(unittest.TestCase):
                     if FAIL_STEP in [s["name"] for s in ran]:
                         self.assertIn(event, LIVE_EVENTS)
 
+    def test_exactly_one_fold_or_fail_step_runs_on_every_event(self):
+        """S14: no event ends with zero verdict steps (a silent pass) or with two."""
+        verdict = (BASE_GATE_STEP, BOOTSTRAP_STEP, BRANCH_TIP_STEP, FAIL_STEP)
+        consistent = (("true", None), ("true", "false"), ("false", "true"),
+                      ("false", "false"), ("false", None))
+        for event in OTHER_EVENTS + LIVE_EVENTS:
+            for ran, outputs in gate_steps_that_run(event):
+                live = event in LIVE_EVENTS
+                if live and (outputs.get("ok"), outputs.get("bootstrap")) not in consistent:
+                    continue
+                names = [s["name"] for s in ran if s["name"] in verdict]
+                with self.subTest(event=event, outputs=outputs):
+                    self.assertEqual(len(names), 1, names)
+
     def test_the_fail_step_still_runs_when_a_live_base_event_has_no_base_gate(self):
         hit = [outputs for ran, outputs in gate_steps_that_run("pull_request")
                if FAIL_STEP in [s["name"] for s in ran]]
@@ -832,6 +853,189 @@ class BranchTipGate(unittest.TestCase):
                     text = (step["run"] or "") + " ".join(step["env"].values())
                     with self.subTest(event=event, step=step["name"]):
                         self.assertNotIn(BASE_DIR, text)
+
+
+
+PERMISSIVE_GATE = (
+    "import sys\n"
+    "print('PERMISSIVE-GATE-RAN')\n"
+    "sys.exit(0)\n"
+)
+
+
+def printer_source(sha):
+    """A hostile scripts/ci/impact/base_sha.py: prints a chosen sha as the live base."""
+    return (
+        "import sys\n"
+        "out = sys.argv[sys.argv.index('--github-output') + 1]\n"
+        "lines = 'sha=%s\\nreason=live-base-first-parent\\n'\n"
+        "open(out, 'a').write(lines)\n"
+        "sys.stdout.write(lines)\n"
+    ).replace("%s", sha)
+
+
+class DerivedBase(BaseCase):
+    """R4-F12: both materialise steps re-derive the base; the resolver is a cross-check only.
+
+    decision: materialise steps re-derive the base inline from git and the
+    event payload and fail closed on mismatch over running the resolver from a
+    non-PR-tree copy because the copy itself would need a trusted base to be
+    fetched from, while HEAD^1 of the merge ref and merge_group.base_sha are
+    not author-controllable
+    """
+
+    def build(self, helper_sha=None):
+        """main: c0 (no gate.py) -> c1 (selector + helper); PR p1 edits the helper; merge M on HEAD.
+
+        helper_sha: None keeps the real helper; "c0" / "p1" / "merge" make the PR commit
+        replace scripts/ci/impact/base_sha.py with a printer of that sha (and gate.py with
+        a permissive gate), exactly the change a PR limited to scripts/ci/impact can make.
+        """
+        c0 = self.base
+        git = lambda *a: fx.git(self.repo, *a)
+        self.commit_selector()
+        real_helper = (fx.IMPACT_DIR / "base_sha.py").read_text()
+        c1 = fx.commit_change(self.repo, {IMPACT_REL + "/base_sha.py": real_helper})
+        git("checkout", "-q", "-b", "pr")
+        change = {"pr.txt": "pr\n"}
+        if helper_sha is not None:
+            change[IMPACT_REL + "/gate.py"] = PERMISSIVE_GATE
+        p0 = fx.commit_change(self.repo, change)
+        p1 = p0
+        if helper_sha is not None:
+            printed = c0 if helper_sha == "c0" else p0
+            p1 = fx.commit_change(self.repo, {
+                IMPACT_REL + "/base_sha.py": printer_source(printed)})
+        git("checkout", "-q", "main")
+        later = fx.commit_change(self.repo, {"later.txt": "later\n"})
+        git("checkout", "-q", "-b", "merge-ref")
+        git("merge", "-q", "--no-ff", "-m", "merge", "pr")
+        git("update-ref", "refs/remotes/origin/main", later)
+        return {"c0": c0, "c1": c1, "p0": p0, "p1": p1, "base": later}
+
+    def live_step(self, event, head, merge_group_base=""):
+        """Run the checked-out (PR-tree) resolver exactly as the workflow does."""
+        out_path = self.tmp / "live_out.txt"
+        out_path.write_text("")
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.tmp), "EVENT_NAME": event,
+               "HEAD_SHA": head, "MERGE_GROUP_BASE_SHA": merge_group_base,
+               "BASE_REF": "main"}
+        subprocess.run([sys.executable, "-I", IMPACT_REL + "/base_sha.py",
+                        "--github-output", str(out_path)], cwd=str(self.repo), env=env,
+                       capture_output=True, text=True, timeout=120)
+        return dict(i.split("=", 1) for i in out_path.read_text().split("\n") if "=" in i)
+
+    def run_both(self, event, head, resolver_sha, merge_group_base=""):
+        """Run both materialise steps; return {job: (lines, summary)}."""
+        results = {}
+        for job, name in ((SELECT_JOB, MATERIALISE_STEP), (GATE_JOB, GATE_MATERIALISE_STEP)):
+            step = step_named(job, name)
+            env = {"BASE_SHA": resolver_sha, "IMPACT_FILES": step["env"]["IMPACT_FILES"],
+                   "EVENT_NAME": event, "HEAD_SHA": head,
+                   "MERGE_GROUP_BASE_SHA": merge_group_base}
+            _, lines, summary, _ = run_snippet(snippet_of(step), self.repo, env)
+            results[job] = (lines, summary)
+        return results
+
+    def assert_gate_fails_on_mismatch(self, results):
+        for job, (lines, summary) in results.items():
+            with self.subTest(job=job):
+                self.assertEqual(lines.get("ok"), "false", summary)
+                self.assertEqual(lines.get("reason"), "base-sha-mismatch", summary)
+                self.assertNotEqual(lines.get("bootstrap"), "true", summary)
+        gate_lines = results[GATE_JOB][0]
+        self.assertEqual(GateBaseRead.plan(self, gate_lines), [FAIL_STEP])
+        code, text = GateBaseRead.run_fail_step(self, gate_lines["reason"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("base-sha-mismatch", text)
+
+    def test_a_pr_replacing_the_helper_with_a_stale_sha_printer_fails_ci_gate(self):
+        shas = self.build("c0")
+        live = self.live_step("pull_request", shas["p1"])
+        self.assertEqual(live["sha"], shas["c0"])
+        self.assert_gate_fails_on_mismatch(self.run_both("pull_request", shas["p1"], live["sha"]))
+
+    def test_a_pr_replacing_the_helper_with_a_self_containing_printer_fails_ci_gate(self):
+        shas = self.build("p0")
+        live = self.live_step("pull_request", shas["p1"])
+        self.assertEqual(live["sha"], shas["p0"])
+        self.assert_gate_fails_on_mismatch(self.run_both("pull_request", shas["p1"], live["sha"]))
+
+    def test_the_hostile_printers_cannot_reach_the_permissive_pr_tree_gate(self):
+        for helper in ("c0", "p0"):
+            with self.subTest(helper=helper):
+                shas = self.build(helper)
+                live = self.live_step("pull_request", shas["p1"])
+                lines = self.run_both("pull_request", shas["p1"], live["sha"])[GATE_JOB][0]
+                plan = GateBaseRead.plan(self, lines)
+                self.assertNotIn(BOOTSTRAP_STEP, plan)
+                self.assertNotIn(BASE_GATE_STEP, plan)
+                self.assertFalse((self.dest / "impact" / "gate.py").exists())
+                self.fresh_repo()
+
+    def fresh_repo(self):
+        shutil.rmtree(str(self.repo))
+        shutil.rmtree(str(self.dest), ignore_errors=True)
+        self.base = fx.init_repo(self.repo)
+
+    def test_the_honest_helper_agrees_with_the_derived_base_and_the_base_gate_runs(self):
+        shas = self.build(None)
+        live = self.live_step("pull_request", shas["p1"])
+        self.assertEqual(live["sha"], shas["base"])
+        results = self.run_both("pull_request", shas["p1"], live["sha"])
+        for job, (lines, summary) in results.items():
+            with self.subTest(job=job):
+                self.assertEqual(lines.get("ok"), "true", summary)
+        self.assertEqual(GateBaseRead.plan(self, results[GATE_JOB][0]), [BASE_GATE_STEP])
+        copy = (self.dest / "impact" / "gate.py").read_text()
+        self.assertEqual(copy, (fx.IMPACT_DIR / "gate.py").read_text())
+
+    def test_the_derived_base_is_the_merge_ref_first_parent_not_the_resolver_value(self):
+        shas = self.build(None)
+        results = self.run_both("pull_request", shas["p1"], shas["c1"])
+        self.assert_gate_fails_on_mismatch(results)
+
+    def test_an_empty_resolver_output_is_a_mismatch_not_a_bootstrap(self):
+        shas = self.build(None)
+        self.assert_gate_fails_on_mismatch(self.run_both("pull_request", shas["p1"], ""))
+
+    def test_a_checkout_that_is_not_the_merge_ref_fails_closed(self):
+        shas = self.build(None)
+        fx.git(self.repo, "checkout", "-q", "main")
+        self.assert_gate_fails_on_mismatch(
+            self.run_both("pull_request", shas["p1"], shas["base"]))
+
+    def test_merge_group_takes_the_event_base_sha_and_rejects_a_different_resolver_sha(self):
+        shas = self.build(None)
+        ok = self.run_both("merge_group", shas["p1"], shas["base"],
+                           merge_group_base=shas["base"])
+        for job, (lines, summary) in ok.items():
+            with self.subTest(job=job):
+                self.assertEqual(lines.get("ok"), "true", summary)
+        self.assert_gate_fails_on_mismatch(self.run_both(
+            "merge_group", shas["p1"], shas["p1"], merge_group_base=shas["base"]))
+
+    def test_bootstrap_still_runs_when_the_derived_base_lacks_gate_py(self):
+        shas = self.build(None)
+        step = step_named(GATE_JOB, GATE_MATERIALISE_STEP)
+        env = {"BASE_SHA": shas["c0"], "IMPACT_FILES": step["env"]["IMPACT_FILES"],
+               "EVENT_NAME": "merge_group", "HEAD_SHA": shas["p1"],
+               "MERGE_GROUP_BASE_SHA": shas["c0"]}
+        _, lines, summary, _ = run_snippet(snippet_of(step), self.repo, env)
+        self.assertEqual(lines.get("ok"), "false", summary)
+        self.assertEqual(lines.get("bootstrap"), "true", summary)
+        self.assertEqual(GateBaseRead.plan(self, lines), [BOOTSTRAP_STEP])
+
+    def test_both_materialise_steps_carry_the_event_payload_for_the_derivation(self):
+        for job, name in ((SELECT_JOB, MATERIALISE_STEP), (GATE_JOB, GATE_MATERIALISE_STEP)):
+            env = step_named(job, name)["env"]
+            with self.subTest(job=job):
+                self.assertEqual(env["EVENT_NAME"], "${{ github.event_name }}")
+                self.assertEqual(env["HEAD_SHA"], "${{ github.event.pull_request.head.sha"
+                                 " || github.event.merge_group.head_sha }}")
+                self.assertEqual(env["MERGE_GROUP_BASE_SHA"],
+                                 "${{ github.event.merge_group.base_sha }}")
+                self.assertIn("base-sha-mismatch", snippet_of(step_named(job, name)))
 
 
 if __name__ == "__main__":

@@ -134,8 +134,64 @@ class Evaluate(unittest.TestCase):
                          {"lint": "success", "check": "failure"})
 
 
+def complete(doc):
+    """Add a success entry for every required job the document lacks."""
+    full = dict(doc)
+    for job in gate.REQUIRED_NEEDS:
+        full.setdefault(job, {"result": "success", "outputs": {}})
+    return full
+
+
+class MissingNeededJob(unittest.TestCase):
+    """S13: an absent needed job fails the gate (an absent result looks like a skipped gate).
+
+    decision: the gate requires the full expected job set over tolerating an
+    absent job because an absent result is indistinguishable from a skipped
+    gate
+    """
+
+    def run_gate(self, doc):
+        cmd = [sys.executable, "-I", str(GATE_SCRIPT), "--needs", json.dumps(doc),
+               "--rules", str(fx.RULES_JSON)]
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def test_the_full_set_passes(self):
+        res = self.run_gate(complete(needs()))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_each_removed_job_fails_with_the_fixed_reason_naming_it(self):
+        for job in gate.REQUIRED_NEEDS:
+            doc = complete(needs())
+            del doc[job]
+            with self.subTest(job=job):
+                res = self.run_gate(doc)
+                self.assertEqual(res.returncode, EXIT_FAIL, res.stdout)
+                self.assertIn("ci-gate: missing-needed-job: %s" % job, res.stdout)
+                self.assertIn("ci-gate: FAIL", res.stdout)
+
+    def test_an_empty_payload_fails(self):
+        res = self.run_gate({})
+        self.assertEqual(res.returncode, EXIT_FAIL, res.stdout)
+        for job in gate.REQUIRED_NEEDS:
+            self.assertIn("missing-needed-job: %s" % job, res.stdout)
+
+    def test_evaluate_reports_the_missing_job_row(self):
+        doc = needs(lint="success")
+        ok, rows = gate.evaluate(doc, JOB_MAP, "", (), ("lint", "check"))
+        self.assertFalse(ok)
+        self.assertIn({"job": "check", "result": "missing-needed-job",
+                       "selected": True, "ok": False}, rows)
+
+    def test_the_required_set_equals_the_ci_gate_needs_list(self):
+        import workflow_text
+        jobs = workflow_text.read_jobs(fx.REPO_ROOT / ".github" / "workflows" / "ci.yml")
+        job = jobs["ci-gate"]
+        self.assertEqual(sorted(job["needs"]), sorted(gate.REQUIRED_NEEDS))
+
+
 class CommandLine(unittest.TestCase):
     def run_gate(self, doc, ref=""):
+        doc = complete(doc)
         cmd = [sys.executable, "-I", str(GATE_SCRIPT), "--needs", json.dumps(doc),
                "--rules", str(fx.RULES_JSON)]
         if ref:
@@ -166,7 +222,7 @@ class CommandLine(unittest.TestCase):
         path = fx.make_scratch()
         self.addCleanup(path.cleanup)
         doc = fx.Path(path.name) / "needs.json"
-        doc.write_text(json.dumps(needs()))
+        doc.write_text(json.dumps(complete(needs())))
         res = subprocess.run(
             [sys.executable, "-I", str(GATE_SCRIPT), "--needs", "@" + str(doc)],
             capture_output=True, text=True)

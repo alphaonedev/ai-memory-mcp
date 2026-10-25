@@ -221,10 +221,19 @@ jobs:
       # copy against the PR tree. When any file is missing at the base (this
       # very PR adds them) or unreadable, the `fallback` step selects the full
       # matrix and the reason lands in the step summary.
+      # decision: materialise steps re-derive the base inline from git and the
+      # event payload and fail closed on mismatch over running the resolver
+      # from a non-PR-tree copy because the copy itself would need a trusted
+      # base to be fetched from, while HEAD^1 of the merge ref and
+      # merge_group.base_sha are not author-controllable. BASE_SHA below is
+      # the resolver's output: a cross-check only, never the authority.
       - name: Materialise the base selector (#8240)
         id: base
         env:
           BASE_SHA: ${{ steps.live.outputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           IMPACT_FILES: __init__.py common.py select.py build_index.py gate.py rules.json
         run: |
           python3 -I - <<'PY'
@@ -271,6 +280,32 @@ jobs:
               if blob.returncode != 0 or not blob.stdout:
                   raise BaseUnavailable("base-read-failed:" + name)
               return blob.stdout
+
+
+          def rev_parse(spec):
+              res = git("rev-parse", "--verify", "--quiet", spec)
+              value = res.stdout.decode("utf-8", "replace").strip()
+              return value if res.returncode == 0 and SHA_RE.match(value) else ""
+
+
+          def derive_base(env):
+              # The authority: git and the event payload, never the resolver. No PR
+              # tree can change HEAD^1 of the merge ref or merge_group.base_sha.
+              event = env.get("EVENT_NAME", "")
+              if event == "pull_request":
+                  head = env.get("HEAD_SHA", "")
+                  if not SHA_RE.match(head) or rev_parse("HEAD^2^{commit}") != head:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  parent = rev_parse("HEAD^1^{commit}")
+                  if not parent:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  return parent
+              if event == "merge_group":
+                  raw = env.get("MERGE_GROUP_BASE_SHA", "")
+                  if not SHA_RE.match(raw):
+                      raise BaseUnavailable("base-sha-invalid")
+                  return raw
+              raise BaseUnavailable("base-event-unsupported")
 
 
           def gate_absent(base):
@@ -329,14 +364,22 @@ jobs:
 
 
           def main():
+              derived = ""
               try:
                   dest = Path(os.environ["RUNNER_TEMP"]) / "impact-base"
                   names = os.environ.get("IMPACT_FILES", "").split()
                   if not names:
                       raise BaseUnavailable("no-files-listed")
-                  materialise(os.environ.get("BASE_SHA", ""), dest, names)
+                  derived = derive_base(os.environ)
+                  if os.environ.get("BASE_SHA", "") != derived:
+                      # The resolver output is a cross-check, never the authority: a
+                      # disagreement never bootstraps and never runs a PR-tree gate.
+                      report(False, "base-sha-mismatch")
+                      return 0
+                  print("impact: derived base %s equals the resolver sha" % derived)
+                  materialise(derived, dest, names)
               except BaseUnavailable as exc:
-                  report(False, str(exc), gate_absent(os.environ.get("BASE_SHA", "")))
+                  report(False, str(exc), gate_absent(derived))
                   return 0
               except (OSError, KeyError):
                   report(False, "environment-unusable")
@@ -2740,11 +2783,20 @@ jobs:
       # self-judging; the select job already fails safe to the full matrix,
       # the gate must fail closed. Any other failure to read a base file
       # (fetch failure, timeout, invalid sha) fails this job.
+      # decision: materialise steps re-derive the base inline from git and the
+      # event payload and fail closed on mismatch over running the resolver
+      # from a non-PR-tree copy because the copy itself would need a trusted
+      # base to be fetched from, while HEAD^1 of the merge ref and
+      # merge_group.base_sha are not author-controllable. BASE_SHA below is
+      # the resolver's output: a cross-check only, never the authority.
       - name: Materialise the base gate (#8240)
         id: base
         if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
         env:
           BASE_SHA: ${{ steps.live.outputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           IMPACT_FILES: __init__.py common.py gate.py rules.json
         run: |
           python3 -I - <<'PY'
@@ -2791,6 +2843,32 @@ jobs:
               if blob.returncode != 0 or not blob.stdout:
                   raise BaseUnavailable("base-read-failed:" + name)
               return blob.stdout
+
+
+          def rev_parse(spec):
+              res = git("rev-parse", "--verify", "--quiet", spec)
+              value = res.stdout.decode("utf-8", "replace").strip()
+              return value if res.returncode == 0 and SHA_RE.match(value) else ""
+
+
+          def derive_base(env):
+              # The authority: git and the event payload, never the resolver. No PR
+              # tree can change HEAD^1 of the merge ref or merge_group.base_sha.
+              event = env.get("EVENT_NAME", "")
+              if event == "pull_request":
+                  head = env.get("HEAD_SHA", "")
+                  if not SHA_RE.match(head) or rev_parse("HEAD^2^{commit}") != head:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  parent = rev_parse("HEAD^1^{commit}")
+                  if not parent:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  return parent
+              if event == "merge_group":
+                  raw = env.get("MERGE_GROUP_BASE_SHA", "")
+                  if not SHA_RE.match(raw):
+                      raise BaseUnavailable("base-sha-invalid")
+                  return raw
+              raise BaseUnavailable("base-event-unsupported")
 
 
           def gate_absent(base):
@@ -2849,14 +2927,22 @@ jobs:
 
 
           def main():
+              derived = ""
               try:
                   dest = Path(os.environ["RUNNER_TEMP"]) / "impact-base"
                   names = os.environ.get("IMPACT_FILES", "").split()
                   if not names:
                       raise BaseUnavailable("no-files-listed")
-                  materialise(os.environ.get("BASE_SHA", ""), dest, names)
+                  derived = derive_base(os.environ)
+                  if os.environ.get("BASE_SHA", "") != derived:
+                      # The resolver output is a cross-check, never the authority: a
+                      # disagreement never bootstraps and never runs a PR-tree gate.
+                      report(False, "base-sha-mismatch")
+                      return 0
+                  print("impact: derived base %s equals the resolver sha" % derived)
+                  materialise(derived, dest, names)
               except BaseUnavailable as exc:
-                  report(False, str(exc), gate_absent(os.environ.get("BASE_SHA", "")))
+                  report(False, str(exc), gate_absent(derived))
                   return 0
               except (OSError, KeyError):
                   report(False, "environment-unusable")

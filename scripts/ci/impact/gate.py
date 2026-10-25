@@ -15,6 +15,10 @@ Every other outcome fails: failure, cancelled, timed_out, an unknown or
 missing result, a skip while `select` failed, was cancelled or skipped, a skip
 with an empty, missing or malformed domain output. A job with no key in
 rules.json job_map (select, classify, build-script-vetting) must succeed.
+A job of REQUIRED_NEEDS that is absent from the needs payload fails the gate
+with the fixed reason `missing-needed-job` naming the job.
+decision: the gate requires the full expected job set over tolerating an
+absent job because an absent result is indistinguishable from a skipped gate
 Exit 0 only when every job passed.
 """
 import argparse
@@ -36,6 +40,11 @@ DOMAIN_FALSE = "false"
 DOCS_ONLY_KEY = "docs_only"
 DOCS_ONLY_TRUE = "true"
 TAG_REF_PREFIX = "refs/tags/v"
+MISSING_REASON = "missing-needed-job"
+# The `needs:` list of the ci-gate job in .github/workflows/ci.yml; a test
+# keeps the two in step.
+REQUIRED_NEEDS = ("select", "classify", "build-script-vetting", "check",
+                  "mobile-cross-compile")
 
 
 def outputs_of(needs: dict, job: str) -> dict:
@@ -64,11 +73,16 @@ def skip_allowed(needs: dict, job: str, key: Optional[str], github_ref: str,
 
 
 def evaluate(needs: dict, job_map: Dict[str, str], github_ref: str = "",
-             tag_skip_jobs: Iterable[str] = ()) -> Tuple[bool, List[dict]]:
-    """Return (ok, rows) for a needs document."""
+             tag_skip_jobs: Iterable[str] = (),
+             required: Iterable[str] = ()) -> Tuple[bool, List[dict]]:
+    """Return (ok, rows) for a needs document; every `required` job must be present."""
     rows: List[dict] = []
     ok = True
     tag_skip = list(tag_skip_jobs)
+    for job in sorted(set(required) - set(needs)):
+        ok = False
+        rows.append({"job": job, "result": MISSING_REASON, "selected": True,
+                     "ok": False})
     for job in sorted(needs):
         result = result_of(needs, job)
         key = job_map.get(job)
@@ -120,8 +134,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (ValueError, OSError, KeyError) as exc:
         common.log("gate: unusable input: %s" % exc)
         return common.EXIT_USAGE
-    ok, rows = evaluate(needs, job_map, args.github_ref, tag_skip_jobs)
+    ok, rows = evaluate(needs, job_map, args.github_ref, tag_skip_jobs, REQUIRED_NEEDS)
     print(render(rows))
+    for row in rows:
+        if row["result"] == MISSING_REASON:
+            print("ci-gate: %s: %s" % (MISSING_REASON, row["job"]))
     print("ci-gate: %s" % ("pass" if ok else "FAIL"))
     return common.EXIT_OK if ok else common.EXIT_FAIL
 
