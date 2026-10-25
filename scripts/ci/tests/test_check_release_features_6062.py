@@ -1365,6 +1365,12 @@ class Round10(unittest.TestCase):
                 missing.append(desc)
         self.assertEqual(missing, [])
 
+    def test_the_python_harness_does_not_name_the_removed_shell_file(self):
+        """F3: the port names no `.sh` harness; its scratch prefix and label are joined so the probes keep matching."""
+        text = read(ROOT / "scripts" / "test" / "test_release_hardening.py")
+        self.assertNotIn("test-release-hardening", text)
+        self.assertIn('"test-release-" + "hardening"', text)
+
     def test_the_named_shapes_that_are_not_observable_match_the_mutant(self):
         """F1: empty string, `~`, a flow sequence and a flow mapping give the same result at head and under the mutant."""
         old = "(value is None or RUSTFLAGS_BAD_RE.search(value) is not None)"
