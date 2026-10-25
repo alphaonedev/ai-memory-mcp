@@ -2105,6 +2105,60 @@ class TrustDecisionFirst(unittest.TestCase):
                     found = materialise_allow_list_problems(name, mutated)
                     self.assertTrue([p for p in found if needle in p], (needle, found))
 
+    # sec r10 S1-S3 (round 13): an allowed module chain only in call position, method receiver
+    # names resolved by their binding, the heredoc body ends at the FIRST terminator line.
+    S_REC = "method receiver name"
+    C14_MUTANTS = (
+        ("s1-chain-as-keyword-opener", None, "open('true', opener=subprocess.run)",
+         "reaches subprocess.run"),
+        ("s1-chain-as-keyword", None, "print(key=shutil.rmtree)", "reaches shutil.rmtree"),
+        ("s1-chain-as-argument", None, "print(subprocess.run)", "reaches subprocess.run"),
+        ("s1-chain-as-argument-sys-exit", None, "list(sys.exit)", "reaches sys.exit"),
+        ("s1-chain-assigned-value", None, "_f = os.path.lexists", "reaches os.path.lexists"),
+        ("s1-exception-chain-outside-except", None, "dict(a=subprocess.TimeoutExpired)",
+         "reaches subprocess.TimeoutExpired"),
+        ("s2-module-receiver-rebound", None, "handle = open('X', 'a')\nhandle.write('X')", S_REC),
+        ("s2-handle-rebound-in-report", "def report(ok, reason, bootstrap=False):\n",
+         '    handle = open(os.environ["GITHUB_OUTPUT"], "a")\n', S_REC),
+        ("s2-env-rebound-in-derive-base", "def derive_base(env):\n", "    env = dict()\n", S_REC),
+        ("s2-dest-rebound-in-materialise", "def materialise(base, dest, names):\n",
+         '    dest = Path("x")\n', S_REC),
+        ("s2-res-rebound-in-rev-parse", "def rev_parse(spec):\n", '    res = git("show", spec)\n',
+         S_REC),
+        ("s2-tree-rebound-in-fetch-blob", "def fetch_blob(base, name):\n", "    tree = base\n",
+         S_REC),
+        ("s2-listed-rebound-in-replace-refs", "def replace_refs_present():\n", "    listed = 1\n",
+         S_REC),
+        ("s2-target-rebound-in-materialise", "def materialise(base, dest, names):\n",
+         "    target = dest\n", S_REC),
+        ("s2-sha-re-rebound", None, "SHA_RE = 1", S_REC),
+        ("s2-name-rebound-in-materialise", "def materialise(base, dest, names):\n",
+         '    name = "x"\n', S_REC),
+        ("s3-inner-terminator-line", None, "PY\ntrue", "heredoc"),
+        ("s3-inner-terminator-then-command", None, "PY\nmake prep\ncat <<'PY'", "heredoc"),
+    )
+
+    def _check_rows(self, rows):
+        for job, name in self.JOBS:
+            run = step_named(job, name)["run"]
+            for label, anchor, text, needle in rows:
+                anchor = anchor or self.C2_MUTANT_ANCHOR
+                text = text if text.endswith("\n") else text + "\n"
+                mutated = run.replace(anchor, anchor + text, 1)
+                with self.subTest(job=job, mutant=label):
+                    self.assertIn(anchor, run)
+                    self.assertNotEqual(mutated, run)
+                    with unittest.mock.patch.dict(MATERIALISE_SHA256,
+                                                  {name: run_digest(mutated)}):
+                        problems = materialise_problems(name, mutated)
+                    self.assertFalse([p for p in problems if "sha256" in p], problems)
+                    found = materialise_allow_list_problems(name, mutated)
+                    self.assertTrue([p for p in found if needle in p], (needle, found))
+
+    def test_sec_r10_chain_receiver_and_heredoc_forms_are_red_when_rehashed(self):
+        """sec r10 S1-S3: each probe form, rebuilt as a mutant row, is red from the second layer."""
+        self._check_rows(self.C14_MUTANTS)
+
     @unittest.skipUnless(hasattr(ast, "Match"), "match statements need Python 3.10")
     def test_code_r10_c2_match_captures_are_collected_as_bindings(self):
         tree = ast.parse("match 1:\n    case [a, *rest]:\n        pass\n"
@@ -2117,7 +2171,9 @@ class TrustDecisionFirst(unittest.TestCase):
         start = text.index("sec F1 / code C1-C3 (round 12)")
         block = text[start:text.index("MATERIALISE_MODULE_ROOTS =", start)]
         for phrase in ("code r10 C1-C4 (round 13)", "unrebound parameter",
-                       "exactly one binding", "read-only environment uses"):
+                       "exactly one binding", "read-only environment uses",
+                       "sec r10 S1-S4 (round 13)", "call position", "first terminator line",
+                       "does not check"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, block)
 
