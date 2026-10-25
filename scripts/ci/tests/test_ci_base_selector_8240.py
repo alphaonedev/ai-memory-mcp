@@ -2213,6 +2213,207 @@ class TrustDecisionFirst(unittest.TestCase):
         """sec r10 S1-S3: each probe form, rebuilt as a mutant row, is red from the second layer."""
         self._check_rows(self.C14_MUTANTS)
 
+    # sec r11 S1-S5 (round 14): one pinned environment construction, enumerated value and call
+    # arguments, no type parameters, no decorators or class keywords, enumerated rmtree and print
+    # arguments, no parameter defaults as value bindings. Each row is (label, old, new, needle);
+    # `old` is replaced by `new` once; with the sha256 pin re-pinned the second layer alone must
+    # report a problem line holding the needle.
+    R14_ENVL = '    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")\n'
+    R14_RUNENV = "                              env=env)\n"
+    R14_DERIVED = "        derived = derive_base(os.environ)\n"
+    R14_HAVE = '    return git("cat-file", "-e", base + "^{commit}").returncode == 0\n'
+    R14_SHOWBLOB = '    blob = git("show", "%s:%s" % (base, path))\n'
+    R14_PRINT_OK = '        print("impact: selector files loaded from the base sha")\n'
+    R14_RMTREE = "        shutil.rmtree(str(dest))\n"
+    R14_CLASS = "class BaseUnavailable(Exception):\n"
+    R14_TP = "type parameter" if sys.version_info >= (3, 12) else "not valid python"
+    R14_DASH_FORMS = (
+        ("chr", "chr(45) + 'c'"), ("percent-c", "'%c' % 45"),
+        ("str-bytes", "str(b'-', 'ascii')"), ("dash-join", "'-'.join(['', 'c'])"),
+        ("replace", "'x'.replace('x', '-')"), ("str-int", "str(-1)[0] * 2 + 'inert'"),
+        ("fstring", "f'{chr(45)}c'"), ("slice", "'xx-c'[2:]"))
+    R14_MUTANTS = (
+        # S1: the one pinned environment construction
+        ("s1-env-kw-PATH", R14_ENVL,
+         '    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", PATH="inert")\n', "environment"),
+        ("s1-env-kw-GIT_EXEC_PATH", R14_ENVL,
+         '    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_EXEC_PATH="inert")\n',
+         "environment"),
+        ("s1-env-kw-GIT_CONFIG", R14_ENVL,
+         '    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_CONFIG_COUNT="1", '
+         'GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0="inert")\n', "environment"),
+        ("s1-env-drop-noreplace", R14_ENVL, "    env = dict(os.environ)\n", "environment"),
+        ("s1-env-wrong-value", R14_ENVL,
+         '    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="0")\n', "environment"),
+        ("s1-env-starstar-literal", R14_ENVL,
+         '    env = dict(os.environ, **{"GIT_NO_REPLACE_OBJECTS": "1", "PATH": "inert"})\n',
+         "environment"),
+        ("s1-env-starred-positional", R14_ENVL,
+         '    env = dict(*[os.environ], GIT_NO_REPLACE_OBJECTS="1")\n', "environment"),
+        ("s1-env-dict-of-dict", R14_ENVL,
+         '    env = dict(dict(os.environ, GIT_NO_REPLACE_OBJECTS="1"), PATH="inert")\n',
+         "environment"),
+        ("s1-env-two-step-copy", R14_ENVL,
+         '    base_env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")\n'
+         '    env = dict(base_env, PATH="inert")\n', "environment"),
+        ("s1-env-recopy-PATH-prefix", R14_ENVL,
+         R14_ENVL + '    env = dict(env, PATH="inert:" + os.environ["PATH"])\n', "environment"),
+        ("s1-env-recopy-GIT_CONFIG", R14_ENVL,
+         R14_ENVL + '    env = dict(env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", '
+         'GIT_CONFIG_VALUE_0="inert")\n', "environment"),
+        ("s1-env-literal-assigned", R14_ENVL, '    env = {"PATH": "inert"}\n', "environment"),
+        ("s1-env-dict-comprehension", R14_ENVL,
+         "    env = {k: v for k, v in os.environ.items()}\n", "environment"),
+        ("s1-env-union-literal", R14_ENVL,
+         '    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1") | {"PATH": "inert"}\n',
+         "environment"),
+        ("s1-env-copy-of-copy", R14_ENVL, "    env = os.environ.copy().copy()\n", "environment"),
+        ("s1-env-literal-in-run", R14_RUNENV, '                              env={"PATH": "inert"})\n',
+         "environment"),
+        ("s1-env-dict-call-in-run", R14_RUNENV, '                              env=dict(PATH="inert"))\n',
+         "environment"),
+        ("s1-env-none-in-run", R14_RUNENV, "                              env=None)\n", "environment"),
+        ("s1-env-os-environ-in-run", R14_RUNENV, "                              env=os.environ)\n",
+         "environment"),
+        ("s1-env-function-result-in-run", R14_RUNENV,
+         '                              env=(lambda: {"PATH": "inert"})())\n', "environment"),
+        ("s1-env-missing-in-run", "timeout=GIT_TIMEOUT_S,\n" + R14_RUNENV,
+         "timeout=GIT_TIMEOUT_S)\n", "environment"),
+        ("s1-env-alias-then-run", R14_ENVL, R14_ENVL + "    other = env\n", "environment"),
+        ("s1-env-second-pinned-copy", R14_ENVL,
+         R14_ENVL + '    spare = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")\n', "environment"),
+        ("s1-env-renamed", R14_ENVL,
+         '    penv = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")\n', "environment"),
+        ("s1-derive-base-dict-copy", R14_DERIVED,
+         "        derived = derive_base(dict(os.environ))\n", "environment"),
+        ("s1-derive-base-keyword", R14_DERIVED,
+         "        derived = derive_base(env=os.environ)\n", "environment"),
+        ("s1-derive-base-extra-arg", R14_DERIVED,
+         "        derived = derive_base(os.environ, 1)\n", "environment"),
+        ("s1-environ-alias-assign", "def main():\n", "def main():\n    alias = os.environ\n",
+         "environment"),
+        # S2: value arguments only from enumerated bindings
+        ("s2-str-bytes-at-have-commit", R14_HAVE,
+         R14_HAVE.rstrip("\n") + " or have_commit(str(b'-', 'ascii'))\n", "argument is not"),
+        ("s2-chr-at-fetch-blob", "            blob = fetch_blob(base, name)\n",
+         "            blob = fetch_blob(base, chr(45) + 'c')\n", "argument is not"),
+        ("s2-chr-at-materialise", "        materialise(derived, dest, names)\n",
+         "        materialise(chr(45) + 'c', dest, names)\n", "argument is not"),
+        ("s2-chr-at-gate-absent", "        report(False, str(exc), gate_absent(derived))\n",
+         "        report(False, str(exc), gate_absent(chr(45) + 'c'))\n", "argument is not"),
+        ("s2-literal-dash-at-rev-parse", R14_DERIVED, R14_DERIVED + "        rev_parse('-c')\n",
+         "argument is not"),
+        ("s2-unlisted-literal-at-rev-parse", R14_DERIVED,
+         R14_DERIVED + "        rev_parse('main')\n", "argument is not"),
+        ("s2-keyword-at-rev-parse", R14_DERIVED,
+         R14_DERIVED + "        rev_parse(spec=derived)\n", "argument is not"),
+        ("s2-starred-at-rev-parse", R14_DERIVED, R14_DERIVED + "        rev_parse(*names)\n",
+         "argument is not"),
+        # S3: type parameters and type aliases (3.12)
+        ("s3-def-type-param-subprocess", "def git(*args):\n", "def git[subprocess](*args):\n",
+         R14_TP),
+        ("s3-def-type-param-git", "def main():\n", "def main[git]():\n", R14_TP),
+        ("s3-async-def-type-param", "def main():\n", "async def main[os]():\n", R14_TP),
+        ("s3-class-type-param", R14_CLASS, "class BaseUnavailable[os](Exception):\n", R14_TP),
+        ("s3-type-alias-os", "GIT_TIMEOUT_S = 120\n", "GIT_TIMEOUT_S = 120\ntype os = int\n",
+         R14_TP),
+        ("s3-type-alias-other", "GIT_TIMEOUT_S = 120\n",
+         "GIT_TIMEOUT_S = 120\ntype Other = int\n", R14_TP),
+        # S4: decorators and class keywords call without a Call node
+        ("s4-decorator-print", "def main():\n", "@print\ndef main():\n", "decorator"),
+        ("s4-decorator-git", "def main():\n", "@git\ndef main():\n", "decorator"),
+        ("s4-decorator-call", "def main():\n", "@print()\ndef main():\n", "decorator"),
+        ("s4-decorator-attribute", "def main():\n", "@os.fspath\ndef main():\n", "decorator"),
+        ("s4-decorator-subscript", "def main():\n", "@[print][0]\ndef main():\n", "decorator"),
+        ("s4-decorator-on-class", R14_CLASS, "@print\n" + R14_CLASS, "decorator"),
+        ("s4-class-metaclass-print", R14_CLASS,
+         "class BaseUnavailable(Exception, metaclass=print):\n", "class keyword"),
+        ("s4-class-keyword-any", R14_CLASS, "class BaseUnavailable(Exception, flag=1):\n",
+         "class keyword"),
+        ("s4-class-keyword-starstar", R14_CLASS, "class BaseUnavailable(Exception, **{}):\n",
+         "class keyword"),
+        ("s4-class-base-print", R14_CLASS, "class BaseUnavailable(print):\n", "class base"),
+        ("s4-class-base-extra", R14_CLASS, "class BaseUnavailable(Exception, OSError):\n",
+         "class base"),
+        # S5: shutil.rmtree and print arguments enumerated, no parameter defaults as bindings
+        ("s5-rmtree-env-target", R14_RMTREE, '        shutil.rmtree(os.environ["HOME"])\n',
+         "rmtree call"),
+        ("s5-rmtree-bare-dest", R14_RMTREE, "        shutil.rmtree(dest)\n", "rmtree call"),
+        ("s5-rmtree-literal", R14_RMTREE, "        shutil.rmtree('x')\n", "rmtree call"),
+        ("s5-rmtree-other-name", R14_RMTREE, "        shutil.rmtree(str(target))\n",
+         "rmtree call"),
+        ("s5-rmtree-onerror", R14_RMTREE, "        shutil.rmtree(str(dest), onerror=print)\n",
+         "rmtree call"),
+        ("s5-rmtree-ignore-errors-false", "shutil.rmtree(str(dest), ignore_errors=True)\n",
+         "shutil.rmtree(str(dest), ignore_errors=False)\n", "rmtree call"),
+        ("s5-rmtree-dir-fd", R14_RMTREE, "        shutil.rmtree(str(dest), dir_fd=1)\n",
+         "rmtree call"),
+        ("s5-print-file-kw", R14_PRINT_OK,
+         '        print("impact: selector files loaded from the base sha", file=handle)\n',
+         "print call"),
+        ("s5-print-sep-kw", R14_PRINT_OK,
+         '        print("impact: selector files loaded from the base sha", sep="x")\n',
+         "print call"),
+        ("s5-print-starred", R14_PRINT_OK, "        print(*[1])\n", "print call"),
+        ("s5-print-new-literal", R14_PRINT_OK, '        print("other")\n', "print call"),
+        ("s5-print-env-value", "    print(line)\n", '    print(line, os.environ.get("HOME"))\n',
+         "print call"),
+        ("s5-default-rev-parse-spec", "def rev_parse(spec):\n", "def rev_parse(spec='HEAD'):\n",
+         "default"),
+        ("s5-default-have-commit-base", "def have_commit(base):\n",
+         "def have_commit(base='HEAD'):\n", "default"),
+        ("s5-default-fetch-blob-name", "def fetch_blob(base, name):\n",
+         "def fetch_blob(base, name='x'):\n", "default"),
+        ("s5-default-gate-absent-base", "def gate_absent(base):\n", "def gate_absent(base=None):\n",
+         "default"),
+        ("s5-kwonly-default-materialise", "def materialise(base, dest, names):\n",
+         "def materialise(base, dest, *, names=()):\n", "default"),
+        ("s5-default-derive-base-env", "def derive_base(env):\n", "def derive_base(env=None):\n",
+         "default"),
+    )
+
+    def _check_replace_rows(self, rows):
+        for job, name in self.JOBS:
+            run = step_named(job, name)["run"]
+            for label, old, new, needle in rows:
+                mutated = run.replace(old, new, 1)
+                with self.subTest(job=job, mutant=label):
+                    self.assertIn(old, run)
+                    self.assertNotEqual(mutated, run)
+                    with unittest.mock.patch.dict(MATERIALISE_SHA256,
+                                                  {name: run_digest(mutated)}):
+                        problems = materialise_problems(name, mutated)
+                    self.assertFalse([p for p in problems if "sha256" in p], problems)
+                    found = materialise_allow_list_problems(name, mutated)
+                    self.assertTrue([p for p in found if needle in p], (needle, found))
+
+    def test_sec_r11_every_environment_dash_typeparam_decorator_and_argument_form_is_red(self):
+        """sec r11 S1-S5: each probe form, rebuilt as a mutant row, is red from the second layer
+        with the pin re-pinned, naming the rule that caught it."""
+        self._check_replace_rows(self.R14_MUTANTS + self.R14_DASH_ROWS)
+
+    def test_sec_r11_the_pinned_construction_and_enumerated_arguments_are_named(self):
+        """sec r11 S1/S2/S5: the one environment construction and the enumerated call arguments
+        are constants of the module, and the unmutated bodies report nothing."""
+        self.assertEqual(MATERIALISE_ENV_CONSTRUCTION,
+                         "dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')")
+        for callee in ("rev_parse", "have_commit", "fetch_blob", "gate_absent", "materialise",
+                       "derive_base", "print", "report", "BaseUnavailable"):
+            with self.subTest(callee=callee):
+                self.assertIn(callee, MATERIALISE_CALL_ARGS)
+                self.assertEqual(list(MATERIALISE_CALL_ARGS[callee]),
+                                 sorted(MATERIALISE_CALL_ARGS[callee]))
+        for job, name in self.JOBS:
+            with self.subTest(job=job):
+                self.assertEqual(materialise_allow_list_problems(
+                    name, step_named(job, name)["run"]), [])
+
+    @unittest.skipUnless(sys.version_info >= (3, 12), "type parameters need Python 3.12")
+    def test_sec_r11_s3_type_parameters_are_collected_as_bindings(self):
+        tree = ast.parse("def f[T](): pass\nclass C[U, *V]: pass\ntype A = int\n")
+        names = {name for name, _kind, _node in _bound_names(tree)}
+        self.assertTrue({"T", "U", "V", "A"} <= names, names)
+
     @unittest.skipUnless(hasattr(ast, "Match"), "match statements need Python 3.10")
     def test_code_r10_c2_match_captures_are_collected_as_bindings(self):
         tree = ast.parse("match 1:\n    case [a, *rest]:\n        pass\n"
@@ -2337,6 +2538,16 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(text.count("every chain push"), 0)
         self.assertEqual(text.count("nightly full run can"), 0)
         self.assertIn("red on every release/** push and workflow_dispatch full run", text)
+
+
+# sec r11 S2 rows built from the dash forms (a class body cannot build them in a comprehension).
+TrustDecisionFirst.R14_DASH_ROWS = tuple(
+    [("s2-%s-at-git" % tag, TrustDecisionFirst.R14_SHOWBLOB,
+      '    blob = git("show", %s)\n' % form, "argument is not")
+     for tag, form in TrustDecisionFirst.R14_DASH_FORMS]
+    + [("s2-%s-at-rev-parse" % tag, TrustDecisionFirst.R14_DERIVED,
+        TrustDecisionFirst.R14_DERIVED + "        rev_parse(%s)\n" % form, "argument is not")
+       for tag, form in TrustDecisionFirst.R14_DASH_FORMS])
 
 
 class StrictWorkflowLoader(unittest.TestCase):
