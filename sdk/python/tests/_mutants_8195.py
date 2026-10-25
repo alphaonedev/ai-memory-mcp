@@ -9,10 +9,15 @@ labels, plus the TLS-minimum rows added in round 2 (``R2``).
 refactor cannot silently turn a row into a no-op. ``run_mutants_8195.py`` is the
 opt-in runner that applies each row to a copy and runs the killer tests.
 
-Round 1 called ``S02`` (CERT_NONE) an equivalent mutant because OpenSSL forces
-``check_hostname`` off with ``CERT_NONE``. The suite kills it anyway, so it is a
-normal row. A row may still carry ``equivalent=True`` for a snippet no test can
-distinguish; the runner then expects it to survive.
+Rounds 1 and 2 disagreed about ``S02`` (CERT_NONE); round 3 settles it: it is a true
+equivalent. OpenSSL forces ``check_hostname`` off with ``CERT_NONE``, so a context
+carrying it already fails the ``check_hostname`` leg of the verifying check and no
+observable behaviour changes. Round 2 wrongly said the suite kills it (the runner
+reported RED only because one test read a path above its copy). Equivalent rows carry
+``equivalent=True``; the runner expects them to survive.
+
+A row may name its killers (``killers``: test files or node ids). A row is RED only when
+one of them fails; the default is every file in ``KILLER_TESTS``.
 """
 from __future__ import annotations
 
@@ -57,14 +62,15 @@ class Mutant(NamedTuple):
     old: str
     new: str
     equivalent: bool = False
+    killers: tuple[str, ...] = ()
 
 
 MUTANTS: tuple[Mutant, ...] = (
     Mutant("S01/C01", "verify=False forwarded", COMMON,
            "if verify is None or verify is True:", "if verify is None or verify is True or verify is False:"),
-    Mutant("S02/C02", "CERT_NONE admitted (equivalent: forces check_hostname off)", COMMON,
+    Mutant("S02/C02", "CERT_NONE admitted (equivalent: CERT_NONE forces check_hostname off)", COMMON,
            "== ssl.CERT_REQUIRED  # type: ignore[attr-defined]",
-           "in (ssl.CERT_REQUIRED, ssl.CERT_NONE)  # type: ignore[attr-defined]"),
+           "in (ssl.CERT_REQUIRED, ssl.CERT_NONE)  # type: ignore[attr-defined]", equivalent=True),
     Mutant("S03/C03", "check_hostname off admitted", COMMON,
            "and ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]", "and True"),
     Mutant("S04/C04", "builder minimum TLS 1.0", COMMON,
@@ -222,7 +228,9 @@ MUTANTS: tuple[Mutant, ...] = (
            "    return True"),
     Mutant("R2", "validator: non-TLSVersion bound admitted", COMMON,
            "    if not isinstance(low, ssl.TLSVersion) or not isinstance(high, ssl.TLSVersion):\n        return False\n",
-           ""),
+           "",
+           killers=(FLOOR + "::test_predicate_refuses_a_bound_that_is_not_a_tls_version_8195",
+                    FLOOR + "::test_bound_that_is_not_a_tls_version_is_refused_at_construction_8195")),
     Mutant("R2", "session gate: negotiated version not checked", COMMON,
            "    if version is None or version() not in _MODERN_TLS_NAMES:\n        raise ValueError(_SESSION_MESSAGE)\n",
            ""),
