@@ -5415,6 +5415,114 @@ class WorkflowFormMutants(unittest.TestCase):
         self.assertEqual({n for n in names if "${{" in n}, JOB_NAME_EXPRESSIONS)
         self.assertEqual(_fold_name("  CI-\tGate "), "ci- gate")
 
+    R18_PINNED = (
+        ("check", "Check (${{ matrix.leg }})", "leg"),
+        ("mobile-cross-compile", "Cross-compile (${{ matrix.target }})", "target"),
+    )
+
+    def test_sec_r15_a_matrix_names_are_bound_to_their_job_and_matrix_key(self):
+        """sec r15 A: each pinned matrix display name is accepted on its own job id and only
+        while that job carries a strategy.matrix holding the referenced key; the value on any
+        other job, or on its own job without the key, is a problem line."""
+        live = CI_YML.read_text()
+        jobs = yaml_subset_load(live)["jobs"]
+        for job, name, key in self.R18_PINNED:
+            other_name = next(p[1] for p in self.R18_PINNED if p[0] != job)
+            host_line = "    name: %s\n" % name
+            rows = [
+                ("%s-name-on-classify-no-matrix" % job, "    name: Classify changes\n",
+                 host_line),
+                ("%s-name-on-lint-no-matrix" % job, "    name: Lint (fmt + clippy)\n", host_line),
+                ("%s-name-on-the-other-pinned-job" % job, "    name: %s\n" % other_name,
+                 host_line),
+            ]
+            for label, old, new in rows:
+                with self.subTest(form=label):
+                    text = live.replace(old, new, 1)
+                    self.assertNotEqual(text, live)
+                    problems = pre_trust_problems(text)
+                    self.assertTrue([p for p in problems if "name carries an expression" in p],
+                                    problems)
+            self.assertEqual(_job_name_problems(job, jobs[job]), [])
+
+            def rename_key(definition, key=key):
+                for entry in definition["strategy"]["matrix"]["include"]:
+                    entry[key + "x"] = entry.pop(key)
+
+            def rename_one_entry(definition, key=key):
+                entry = definition["strategy"]["matrix"]["include"][0]
+                entry[key + "x"] = entry.pop(key)
+
+            def drop_matrix(definition):
+                del definition["strategy"]["matrix"]
+
+            def drop_strategy(definition):
+                del definition["strategy"]
+
+            def string_matrix(definition):
+                definition["strategy"]["matrix"] = "${{ fromJSON(needs.x.outputs.m) }}"
+
+            def empty_include(definition):
+                definition["strategy"]["matrix"] = {"include": []}
+
+            for label, mutate in (("matrix-key-renamed", rename_key),
+                                  ("one-include-entry-lacks-the-key", rename_one_entry),
+                                  ("matrix-absent", drop_matrix),
+                                  ("strategy-absent", drop_strategy),
+                                  ("matrix-is-a-string", string_matrix),
+                                  ("matrix-include-empty", empty_include)):
+                with self.subTest(form="%s-%s" % (job, label)):
+                    definition = copy.deepcopy(jobs[job])
+                    mutate(definition)
+                    problems = _job_name_problems(job, definition)
+                    self.assertTrue([p for p in problems if "matrix" in p], problems)
+        for third in ("ci", "x-check", "mobile", "Check", "check ", "CHECK"):
+            for _, name, _ in self.R18_PINNED:
+                with self.subTest(form="third-job-%r-%s" % (third, name[:5])):
+                    definition = {"name": name, "runs-on": "ubuntu-latest",
+                                  "strategy": {"matrix": {"leg": ["a"], "target": ["b"]}}}
+                    problems = _job_name_problems(third, definition)
+                    self.assertTrue([p for p in problems if "name carries an expression" in p],
+                                    problems)
+
+    def test_sec_r15_b_null_and_empty_job_names_are_refused_and_the_id_is_judged(self):
+        """sec r15 B: a job name that is the YAML null spelling or empty (or only whitespace) is a
+        problem line naming the job, and the job is still judged by its folded id."""
+        live = CI_YML.read_text()
+        hosts = (("classify", "  classify:\n    name: Classify changes\n"),
+                 ("lint", "  lint:\n    name: Lint (fmt + clippy)\n"))
+        spellings = ("null", "~", "Null", "NULL", '""', "''", '" "', '"\\t"', '"  "')
+        ids = ("CI-GATE", "Ci-Gate", '"ci-gate "', "ci_gate", "plain")
+        for host, header in hosts:
+            for ident in ids:
+                for spelling in spellings:
+                    label = "%s-id-%s-name-%s" % (host, ident, spelling)
+                    with self.subTest(form=label):
+                        text = live.replace(
+                            header, "  %s:\n    name: %s\n" % (ident, spelling), 1)
+                        self.assertNotEqual(text, live)
+                        problems = pre_trust_problems(text)
+                        shown = ident.strip('"')
+                        self.assertTrue(
+                            [p for p in problems if "null or empty name" in p and shown in p],
+                            problems)
+                        by_id = [p for p in problems if "defaults its check name" in p]
+                        if ident in ("CI-GATE", "Ci-Gate", '"ci-gate "'):
+                            self.assertTrue(by_id, problems)
+                        else:
+                            self.assertFalse(by_id, problems)
+        with self.subTest(form="bare-empty-name"):
+            text = live.replace(hosts[0][1], "  classify:\n    name:\n", 1)
+            problems = pre_trust_problems(text)
+            self.assertTrue([p for p in problems if "null or empty name" in p], problems)
+        with self.subTest(form="gate-job-null-name"):
+            text = live.replace("    name: ci-gate\n", "    name: null\n", 1)
+            problems = pre_trust_problems(text)
+            self.assertTrue([p for p in problems if "null or empty name" in p], problems)
+        for fine in ("nullable", "null job", "Nul", "~x"):
+            with self.subTest(form="not-a-null-spelling-%s" % fine):
+                self.assertEqual(_job_name_problems("classify", {"name": fine}), [])
+
     def test_each_form_that_stays_green_stays_green(self):
         live = CI_YML.read_text()
         for fid, reason in WF_FORM_GREEN.items():
