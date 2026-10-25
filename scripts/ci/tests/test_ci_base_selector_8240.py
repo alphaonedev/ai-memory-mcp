@@ -1431,6 +1431,49 @@ class TrustDecisionFirst(unittest.TestCase):
         module = " ".join(Path(__file__).read_text().split())
         self.assertNotIn(self.BANNED_PHRASE, module)
 
+    C2_MUTANT_ANCHOR = "GIT_TIMEOUT_S = 120\n"
+    C2_MUTANTS = (
+        ("sh-getoutput", 'subprocess.getoutput("make prep")'),
+        ("sh-posix-spawnp", 'os.posix_spawnp("make", ["make"], dict(os.environ))'),
+        ("sh-call-bare-file", 'subprocess.call(["sh", "prep.bash"])'),
+        ("sh-git-alias", 'git("-c", "alias.p=!make", "p")'),
+        ("sh-git-fsmonitor", 'git("-c", "core.fsmonitor=make", "status")'),
+        ("sh-check-call", 'subprocess.check_call(["make", "prep"])'),
+        ("sh-second-run", 'subprocess.run(["make", "prep"])'),
+        ("sh-git-rebase-exec", 'git("rebase", "--exec", "make", "HEAD~1")'),
+        ("sh-git-hookspath", 'git("status", "--config-env=core.hooksPath=H")'),
+    )
+
+    def test_code_c2_the_second_layer_is_an_allow_list_even_when_the_hash_is_rehashed(self):
+        """code r8 C2: each non-git execution form is red with the sha256 pin rehashed to it."""
+        for job, name in self.JOBS:
+            run = step_named(job, name)["run"]
+            self.assertIn(self.C2_MUTANT_ANCHOR, run)
+            for label, line in self.C2_MUTANTS:
+                mutated = run.replace(self.C2_MUTANT_ANCHOR,
+                                      self.C2_MUTANT_ANCHOR + line + "\n", 1)
+                with self.subTest(job=job, mutant=label):
+                    with unittest.mock.patch.dict(MATERIALISE_SHA256,
+                                                  {name: run_digest(mutated)}):
+                        problems = materialise_problems(name, mutated)
+                    self.assertFalse([p for p in problems if "sha256" in p], problems)
+                    self.assertNotEqual(problems, [])
+
+    def test_code_c2_the_real_body_passes_the_allow_list_alone(self):
+        for job, name in self.JOBS:
+            with self.subTest(job=job):
+                run = step_named(job, name)["run"]
+                self.assertEqual(materialise_allow_list_problems(name, run), [])
+
+    def test_code_c1_no_docstring_of_this_module_uses_the_post_derivation_wording(self):
+        """code r8 C1: extends the step-order text test to every docstring of the module."""
+        tree = ast.parse(Path(__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
+                doc = ast.get_docstring(node) or ""
+                with self.subTest(node=getattr(node, "name", "module")):
+                    self.assertNotIn(self.BANNED_PHRASE, " ".join(doc.split()))
+
     def test_no_step_runs_before_the_fold_on_a_live_event_except_the_decision(self):
         """Every step that runs on pull_request or merge_group ahead of the first fold."""
         for event in LIVE_EVENTS:
