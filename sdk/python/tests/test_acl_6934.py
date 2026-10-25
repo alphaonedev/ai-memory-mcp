@@ -400,6 +400,7 @@ def test_ca_checks_do_not_read_acls_where_the_platform_has_none_6934(
     bundle = _ca(directory)
     asked: list[int] = []
     monkeypatch.setattr(_acl, "reads_acls", lambda: False)
+
     def _record(fd: int, rights: int) -> int:  # noqa: ARG001 - signature of foreign_acl_rights
         asked.append(fd)
         return 0

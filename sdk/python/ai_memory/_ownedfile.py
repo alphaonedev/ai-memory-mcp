@@ -140,12 +140,11 @@ def _open_checked(
     *,
     error: Callable[[str], Exception],
     mode_advice: str,
-) -> int | None:
+) -> int:
     """Open ``p`` once and prove the standard on THAT descriptor.
 
-    Returns the open descriptor — the caller owns it and must close it — or
-    ``None`` on a platform with no ``O_NOFOLLOW``, in which case the
-    path-based check has ALREADY been applied and the caller reads by path.
+    Returns the open descriptor; the caller owns it, must close it, and reads
+    the credential from it and never from the path again (#6317).
 
     ``p.lstat()`` followed by ``p.read_bytes()`` resolves the path TWICE, and
     the bytes that are read are not the bytes that were checked. A local user
@@ -164,24 +163,26 @@ def _open_checked(
     (``open_owner_only``), modelled in turn on ``AllowlistCache::open_checked``
     (#3504).
 
-    **Platform caveat:** Windows has no ``O_NOFOLLOW`` and no ``O_NONBLOCK``,
-    so there is no way to bind the check to the descriptor there. That leg
-    keeps the historical path-based check-then-read, unchanged and still racy
-    (and, as before #3780, still requiring a POSIX ``os.geteuid``), and says so
-    rather than pretending otherwise. The hub socket and the key directory this
-    loader serves are POSIX-only surfaces today.
+    **Platform without ``O_NOFOLLOW``** (Windows): a symlink cannot be refused
+    at the open, so the path is checked with ``lstat`` first (a symlink, a
+    FIFO or any other non-regular file is refused before anything is opened),
+    then opened ONCE, and the ``fstat`` of that descriptor must name the same
+    file: device, inode, owner and mode equal to the checked ``lstat``. A file,
+    a link or a looser mode swapped in between the check and the open is
+    refused (fail closed), and the caller reads from the descriptor, so the
+    bytes read are the bytes checked (#6317, the Python twin of #3812). As
+    before #3780 the owner check needs a POSIX ``os.geteuid``; the hub socket
+    and the key directory this loader serves are POSIX-only surfaces today.
     """
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     non_block = getattr(os, "O_NONBLOCK", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
     if not no_follow:
-        # Windows. Documented above: the pre-#3780 shape, verbatim.
-        st = p.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            raise error(f"{p} {_SYMLINK_REFUSAL}")
-        check_owned_stat(p, st, error=error, mode_advice=mode_advice)
-        return None
+        return _open_checked_after_lstat(
+            p, error=error, mode_advice=mode_advice, flags=os.O_RDONLY | non_block | cloexec
+        )
 
-    flags = os.O_RDONLY | no_follow | non_block | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | no_follow | non_block | cloexec
     try:
         fd = os.open(p, flags)
     except OSError as err:
@@ -194,6 +195,45 @@ def _open_checked(
     try:
         # fstat on the descriptor just opened — never a second look at the path.
         check_owned_stat(p, os.fstat(fd), error=error, mode_advice=mode_advice)
+        check_owned_acl(p, fd, error=error, mode_advice=mode_advice)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+#: ``stat`` fields that must be equal on the checked path and the opened
+#: descriptor for the two to be the same, unchanged file (#6317).
+_IDENTITY_FIELDS = ("st_dev", "st_ino", "st_uid", "st_mode")
+
+
+def _open_checked_after_lstat(
+    p: Path,
+    *,
+    error: Callable[[str], Exception],
+    mode_advice: str,
+    flags: int,
+) -> int:
+    """The ``O_NOFOLLOW``-less leg of :func:`_open_checked` (#6317).
+
+    Check by ``lstat``, open once, then bind the check to the descriptor by
+    comparing :data:`_IDENTITY_FIELDS`; any difference is refused.
+    """
+    checked = p.lstat()
+    if stat.S_ISLNK(checked.st_mode):
+        raise error(f"{p} {_SYMLINK_REFUSAL}")
+    # Refuses a FIFO, a device or a directory before it is ever opened.
+    check_owned_stat(p, checked, error=error, mode_advice=mode_advice)
+    fd = os.open(p, flags | getattr(os, "O_BINARY", 0))
+    try:
+        opened = os.fstat(fd)
+        if any(getattr(opened, f) != getattr(checked, f) for f in _IDENTITY_FIELDS):
+            raise error(
+                f"{p} changed between its check and its open (device, inode, owner "
+                "or mode differ); it is refused because the file that would be read "
+                "is not the file that was checked (#6317)"
+            )
+        check_owned_stat(p, opened, error=error, mode_advice=mode_advice)
         check_owned_acl(p, fd, error=error, mode_advice=mode_advice)
     except BaseException:
         os.close(fd)
@@ -222,8 +262,6 @@ def read_owner_only_bytes(
     because a 32-byte Ed25519 seed is not text.
     """
     fd = _open_checked(p, error=error, mode_advice=mode_advice)
-    if fd is None:
-        return p.read_bytes()
     try:
         return _drain(fd)
     finally:
@@ -239,10 +277,9 @@ def read_owner_only_text(
     """:func:`read_owner_only_bytes`, decoded as UTF-8, for JSON credentials."""
     fd = _open_checked(p, error=error, mode_advice=mode_advice)
     try:
-        raw = p.read_bytes() if fd is None else _drain(fd)
+        raw = _drain(fd)
     finally:
-        if fd is not None:
-            os.close(fd)
+        os.close(fd)
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as exc:
