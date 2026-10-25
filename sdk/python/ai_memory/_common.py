@@ -25,7 +25,7 @@ import sys
 import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Union
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel
@@ -90,7 +90,7 @@ _UNVERIFIED_MESSAGE = (
     "into an unauthenticated one (an encrypted pipe to whoever answers). "
     "This covers any falsy or blank verify value and an SSL context that "
     "does not verify certificates or is not provably the stock one. "
-    "Accepted verify= forms: None (httpx default trust: certifi, or SSL_CERT_FILE / SSL_CERT_DIR), True, the path of a "
+    "Accepted verify= forms: None (the SDK default trust: a context it builds over certifi, or SSL_CERT_FILE / SSL_CERT_DIR, with the TLS 1.2 floor), True, the path of a "
     "CA bundle file or CA directory (str or os.PathLike), or exactly an "
     "ssl.SSLContext (not a subclass, such as truststore.SSLContext) that is "
     "CERT_REQUIRED with check_hostname on, has no verify_flags that relax "
@@ -1230,17 +1230,24 @@ def _require_https(base_url: object) -> None:
 
     The in-transit standard and ``README`` ("Base URLs are ``https://`` even for
     ``localhost``") promise https for every daemon, loopback included, so there is no
-    loopback exception. Only the scheme is named: never the key, the host or any
-    userinfo the URL carries.
+    loopback exception. The URL is parsed with ``httpx.URL``, the parser the client sends
+    with, so the check and the send cannot disagree (sec r3 F2). The scheme must be
+    exactly ``https`` (``httpx`` lower-cases it), the host non-empty and no userinfo
+    present. The refusal never echoes any part of the URL (code r3 F6): not the key, the
+    host, the userinfo, nor a fragment mis-parsed as a scheme.
     """
-    try:
-        scheme = urlsplit(base_url).scheme.lower() if isinstance(base_url, str) else ""
-    except ValueError:
-        scheme = ""
-    if scheme != "https":
+    admitted = False
+    if isinstance(base_url, str):
+        try:
+            parsed = httpx.URL(base_url)
+        except (httpx.InvalidURL, ValueError):
+            pass
+        else:
+            admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo
+    if not admitted:
         raise ValueError(
-            f"base_url scheme {scheme or '(none)'!r} refused: the SDK sends the API key only over "
-            "https, loopback included (#3824). Use an https:// base URL."
+            "base_url refused: it must be an absolute https:// URL with a host and no userinfo; "
+            "the SDK sends the API key only over https, loopback included (#3824)."
         )
 
 

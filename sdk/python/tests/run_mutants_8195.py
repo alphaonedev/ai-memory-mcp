@@ -8,8 +8,9 @@ Order of work:
 2. Each row is applied to a fresh copy and the killer tests run to completion (no
    ``-x``), so the result is the FULL set of failing test ids.
 3. A row is RED only when at least one of its NAMED killers fails (``Mutant.killers``,
-   default: every file in ``KILLER_TESTS``). A failure outside the named killers is
-   ``UNATTRIBUTED``, a runner defect, never RED.
+   required: a row without killers is ``NO-KILLERS``, a defect, and is not run). A failure
+   outside the named killers is ``UNATTRIBUTED``, a runner defect, never RED. The run
+   executes every file in ``KILLER_TESTS`` so an unattributed failure is visible.
 
 The copy keeps the repository layout (``<copy>/sdk/python`` plus ``<copy>/.github``) so
 tests that read the CI workflow resolve it the same way they do in the checkout.
@@ -91,7 +92,9 @@ def _shown(ids: Sequence[str]) -> str:
 def _classify(mutant: Mutant, code: int, failing: Sequence[str], killer_tests: Sequence[str]) -> str:
     if code == -9:
         return "TIMEOUT"
-    named = mutant.killers or tuple(killer_tests)
+    named = mutant.killers
+    if not named:
+        return "NO-KILLERS"
     if code == 0:
         verdict = "SURVIVES"
     elif any(_matches(f, k) for f in failing for k in named):
@@ -119,6 +122,8 @@ def run_row(
     index: int, mutant: Mutant, sdk_root: Path, python: str, scratch: Path, timeout: int, killer_tests: Sequence[str]
 ) -> RowResult:
     head = f"M{index:02d} | {mutant.label} | {mutant.name}"
+    if not mutant.killers:
+        return RowResult("NO-KILLERS", f"{head} | NO-KILLERS (every row names its killers, code r3 F5)")
     dest = scratch / f"m{index:03d}"
     tree = stage_tree(sdk_root, dest)
     try:

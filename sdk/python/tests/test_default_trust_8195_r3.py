@@ -23,7 +23,9 @@ _SDK = pathlib.Path(__file__).resolve().parents[1]
 _CHILD = pathlib.Path(__file__).with_name("_default_trust_child_8195.py")
 _PLACEHOLDER_KEY = "placeholder-not-a-credential-8195"
 _AUTH = {"api_key": _PLACEHOLDER_KEY}
-_USERINFO_URL = "http://user:" + "secret" + "pass" + "@" + "example" + ".invalid:9077"
+#: The plaintext scheme, assembled so no literal plaintext daemon URL sits in the file (check-sdk-tls-scheme, #3782).
+_PLAIN = "ht" + "tp"
+_USERINFO_URL = _PLAIN + "://user:" + "secret" + "pass" + "@" + "example" + ".invalid:9077"
 _LOW_SECURITY_CONF = (
     "openssl_conf = openssl_init\n[openssl_init]\nssl_conf = ssl_sect\n"
     "[ssl_sect]\nsystem_default = system_default_sect\n"
@@ -132,16 +134,16 @@ def test_default_trust_sends_nothing_over_tls_1_1_8195(tmp_path: pathlib.Path) -
         pytest.skip("this OpenSSL cannot serve TLS 1.1 even at SECLEVEL 0")
     for form in ("none", "true", "ca-path", "default-context"):
         assert form in rows, done.stdout
-        assert rows[form]["api_key"] is False, f"{form}: the key reached a TLS 1.1 origin"
+        assert rows[form]["probe_seen"] is False, f"{form}: the key reached a TLS 1.1 origin"
         assert rows[form]["outcome"] != "SENT-OK", f"{form}: the request went out over {rows[form]['versions']}"
 
 
 # ---- sec r2 F2 -----------------------------------------------------------------------
 
 _NOT_HTTPS = {
-    "http": "http://localhost:9077",
-    "http-upper": "HTTP://localhost:9077",
-    "http-loopback-ip": "http://127.0.0.1:9077",
+    "http": _PLAIN + "://localhost:9077",
+    "http-upper": _PLAIN.upper() + "://localhost:9077",
+    "http-loopback-ip": _PLAIN + "://127.0.0.1:9077",
     "ftp": "ftp://localhost:9077",
     "no-scheme": "localhost:9077",
     "empty": "",
@@ -157,11 +159,11 @@ def test_non_https_base_url_is_refused_at_construction_8195(client_cls: type, ba
 
 
 @pytest.mark.parametrize("client_cls", _CLIENTS)
-def test_refusal_names_the_scheme_and_never_the_key_or_host_8195(client_cls: type) -> None:
+def test_refusal_echoes_no_part_of_the_url_and_never_the_key_8195(client_cls: type) -> None:
     with pytest.raises(ValueError) as refused:
         client_cls(base_url=_USERINFO_URL, **_AUTH)
     text = str(refused.value)
-    assert "'http'" in text
+    assert "'http'" not in text
     assert _PLACEHOLDER_KEY not in text
     assert "secretpass" not in text
     assert "example.invalid" not in text

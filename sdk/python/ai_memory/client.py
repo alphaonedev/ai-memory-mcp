@@ -73,8 +73,9 @@ class AiMemoryClient:
         agent_id: If provided, sent as ``X-Agent-Id`` so the server stamps
             this identity on stored memories (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
-        verify: TLS server verification. Accepted: ``None`` (httpx default trust:
-            certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set, which
+        verify: TLS server verification. Accepted: ``None`` (the SDK default trust, a
+            context it builds with the TLS 1.2 floor, the session gate and the
+            request hooks: certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set, which
             the SDK reads at construction under the path rules below, #6538),
             ``True``, the path of an existing CA bundle file or hashed CA
             directory (``str`` / ``os.PathLike``, resolved component by

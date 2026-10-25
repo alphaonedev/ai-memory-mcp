@@ -77,7 +77,7 @@ def test_every_failing_test_id_is_reported_not_only_the_first_8195(tmp_path: Pat
         "def test_b() -> None:\n    assert OTHER == 1\n",
         encoding="utf-8",
     )
-    result = _run(sdk, tmp_path / "s", _row("pkg/mod.py", "VALUE = 1\nOTHER = 1", "VALUE = 2\nOTHER = 2"))
+    result = _run(sdk, tmp_path / "s", _row("pkg/mod.py", "VALUE = 1\nOTHER = 1", "VALUE = 2\nOTHER = 2", ("tests/test_o.py",)))
     assert result.verdict == "RED"
     assert "test_o.py::test_a" in result.line
     assert "test_o.py::test_b" in result.line
@@ -108,8 +108,8 @@ def test_main_counts_red_equivalent_and_survivors_8195(
 ) -> None:
     sdk = _tree(tmp_path / "repo")
     rows = (
-        _row("pkg/mod.py", "VALUE = 1", "VALUE = 2"),
-        _row("pkg/mod.py", "VALUE = 1", "VALUE = 1  # eq", equivalent=True),
+        _row("pkg/mod.py", "VALUE = 1", "VALUE = 2", ("tests/test_k.py",)),
+        _row("pkg/mod.py", "VALUE = 1", "VALUE = 1  # eq", ("tests/test_k.py",), equivalent=True),
         _row("pkg/other.py", "OTHER = 1", "OTHER = 1  # live", ("tests/test_o.py",)),
     )
     monkeypatch.setattr(runner, "MUTANTS", rows)

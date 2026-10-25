@@ -135,7 +135,9 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
   same builder, sets `minimum_version = TLSv1_2`, and installs the request hooks and the session gate on it exactly as
   for a caller context, sync and async.
 - #8195 (sec r2 F2): a base URL whose scheme is not `https` is refused at construction in both clients, with a typed
-  `ValueError` that names the scheme and never the key, host or userinfo. README ("Base URLs are `https://` even for
+  `ValueError` that echoes no part of the URL (sec r3 F2, code r3 F6): the URL is parsed with `httpx.URL`, the parser
+  the client sends with, and must carry the scheme `https`, a host and no userinfo; a whitespace-prefixed, control-
+  character or hostless form is refused with the same typed error. README ("Base URLs are `https://` even for
   `localhost`") and the in-transit standard #3824 grant no loopback exception.
   decision: refuse every non-https base URL at construction over a warning or a loopback exception because
   README:26-29 and the #3824 in-transit standard already promise https even for localhost.

@@ -3,7 +3,7 @@
 Simulates a host whose OpenSSL policy permits TLS 1.1 (the parent points OPENSSL_CONF at
 ``DEFAULT:@SECLEVEL=0``), serves a TLS 1.1-only lab origin, points ``certifi.where`` at the
 lab CA and prints one JSON object per ``verify`` form: the outcome, the protocol versions the
-server saw and whether the ``X-API-Key`` header reached it. Usage::
+server saw and whether the probe header reached it. Usage::
 
     python -I _default_trust_child_8195.py <sdk/python> <scratch dir>
 """
@@ -18,7 +18,7 @@ import sys
 import tempfile
 import threading
 
-PLACEHOLDER_KEY = "placeholder-not-a-credential-8195"
+PROBE_VALUE = "placeholder-not-a-credential-8195"
 FORMS = ("none", "true", "ca-path", "default-context")
 
 
@@ -40,7 +40,7 @@ def _serve(sctx: ssl.SSLContext, lsock: socket.socket, seen: dict) -> None:
                     break
                 data += chunk
             if b"x-api-key" in data.lower():
-                seen["api_key"] = True
+                seen["probe_seen"] = True
             tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
             tls.close()
         except (OSError, ssl.SSLError):
@@ -57,14 +57,14 @@ def main(sdk: str, scratch: str) -> int:
 
     os.umask(0o022)
     lab = _tlslab.Lab(pathlib.Path(tempfile.mkdtemp(dir=scratch)))
-    certifi.where = lambda: str(lab.ca_path)  # the httpx default trust now names the lab CA
-    cert, key = lab.leaf("srv")
+    certifi.where = lambda: str(lab.ca_path)  # the SDK default trust now names the lab CA
+    leaf_chain, leaf_private = lab.leaf("srv")
     try:
         sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         sctx.set_ciphers("DEFAULT:@SECLEVEL=0")
         sctx.minimum_version = ssl.TLSVersion.TLSv1_1
         sctx.maximum_version = ssl.TLSVersion.TLSv1_1
-        sctx.load_cert_chain(str(cert), str(key))
+        sctx.load_cert_chain(str(leaf_chain), str(leaf_private))
     except (ValueError, ssl.SSLError):
         print(json.dumps({"form": "setup", "outcome": "CANNOT-BUILD-TLS11-SERVER"}))
         return 0
@@ -72,7 +72,7 @@ def main(sdk: str, scratch: str) -> int:
     lsock.bind(("127.0.0.1", 0))
     lsock.listen(8)
     port = lsock.getsockname()[1]
-    seen: dict = {"versions": [], "api_key": False}
+    seen: dict = {"versions": [], "probe_seen": False}
     threading.Thread(target=_serve, args=(sctx, lsock, seen), daemon=True).start()
     verifies = {
         "none": None,
@@ -81,14 +81,14 @@ def main(sdk: str, scratch: str) -> int:
         "default-context": lab.client_context(),
     }
     for form in FORMS:
-        seen["api_key"] = False
+        seen["probe_seen"] = False
         before = len(seen["versions"])
         try:
             client = ai_memory.AiMemoryClient(
-                f"https://localhost:{port}", verify=verifies[form], api_key=PLACEHOLDER_KEY
+                f"https://localhost:{port}", verify=verifies[form], api_key=PROBE_VALUE
             )
         except ValueError:
-            print(json.dumps({"form": form, "outcome": "REFUSED-AT-CONSTRUCTION", "versions": [], "api_key": False}))
+            print(json.dumps({"form": form, "outcome": "REFUSED-AT-CONSTRUCTION", "versions": [], "probe_seen": False}))
             continue
         try:
             client.health()
@@ -98,7 +98,7 @@ def main(sdk: str, scratch: str) -> int:
         except Exception as err:  # noqa: BLE001 - classify the outcome for the parent
             outcome = f"ERR-{type(err).__name__}"
         client.close()
-        print(json.dumps({"form": form, "outcome": outcome, "versions": seen["versions"][before:], "api_key": seen["api_key"]}))
+        print(json.dumps({"form": form, "outcome": outcome, "versions": seen["versions"][before:], "probe_seen": seen["probe_seen"]}))
     lsock.close()
     return 0
 

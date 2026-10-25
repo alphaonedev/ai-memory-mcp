@@ -529,11 +529,15 @@ def test_file_vanishing_between_check_and_open_gives_the_typed_error_8195(
     assert "No such file" in str(refused)
 
 
-# ---- code r2 F2: a bound that is not an ``ssl.TLSVersion`` is refused (M66 killer) ----
+# ---- code r2 F2: a bound that is not an ``ssl.TLSVersion`` is refused ----
+# These tests pin the refusal as a whole. The ``_STOCK_HANDSHAKE`` identity check refuses a replaced
+# ``minimum_version`` / ``maximum_version`` descriptor before the type check in ``_tls_range_is_modern``
+# is reached, so the type check is defence in depth that no public path reaches (mutant M66 is
+# equivalent; code r3 F3, F4).
 
 _ORIG_BOUND = {"minimum_version": ssl.SSLContext.minimum_version, "maximum_version": ssl.SSLContext.maximum_version}
 
-# Numerically legal bounds (771 is TLSv1_2) that are not a TLSVersion: only a type check refuses them.
+# Numerically legal bounds (771 is TLSv1_2) that are not a TLSVersion: the stock-descriptor identity check refuses them.
 _NOT_A_TLS_VERSION = {"int-1.2": 771, "int-1.3": 772, "string": "TLSv1.2", "none": None}
 
 
