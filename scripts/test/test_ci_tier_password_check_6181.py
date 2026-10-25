@@ -7439,6 +7439,202 @@ class TestTheRoundTwentyEightSourceIsConsistent8187R28(unittest.TestCase):
         self.assertEqual(len(OPAQUE_R27_PASSED_AT_R26), 15)
 
 
+# ---- r29 RED: code r28 F1-F4 (the other r29 tests ship with the fix) ----
+TAINT_R29_F1 = {
+    "len of a subscript": "        self.assertEqual(len(body[0]), 3)\n",
+    "len plus ord": "        self.assertEqual(len(body) + ord(body[0]), 3)\n",
+    "sum of ord map": "        self.assertEqual(sum(map(ord, body)), 3)\n",
+    "index": "        self.assertEqual(body.index('x'), 3)\n",
+    "hash": "        self.assertEqual(hash(body), 3)\n",
+    "from_bytes": "        self.assertEqual(int.from_bytes(body.encode(), 'big'), 3)\n",
+    "ord": "        self.assertEqual(ord(body[0]), 3)\n",
+    "find": "        self.assertEqual(body.find('x'), 3)\n",
+    "count": "        self.assertEqual(body.count('x'), 3)\n",
+    "id": "        self.assertEqual(id(body), 3)\n",
+    "len of a slice": "        self.assertEqual(len(body[:3]), 3)\n",
+    "len of an encoded value": "        self.assertEqual(len(body.encode()), 3)\n",
+    "len of a join": "        self.assertEqual(len(' '.join(body)), 3)\n",
+    "rfind": "        self.assertEqual(body.rfind('x'), 3)\n",
+}
+TAINT_R29_F1_CLEAN = {
+    "len of the whole value": "        self.assertEqual(len(body), 3)\n",
+    "len of the whole value plus a constant": "        self.assertEqual(len(body) + 1, 3)\n",
+}
+TAINT_R29_ECHO = "        class Echo:\n            def %s(self, text):\n                print(text)\n        Echo().%s(body)\n"
+# code r28 F2: rebinding an accepted name, and a module-defined method named like an accepted method
+TAINT_R29_F2 = {
+    "len rebound to print": "        len = print\n        len(body)\n",
+    "str rebound to print": "        str = print\n        str(body)\n",
+    "def len": "        def len(x):\n            print(x)\n        len(body)\n",
+    "for len": "        for len in [print]:\n            len(body)\n",
+    "walrus len": "        (len := print)\n        len(body)\n",
+    "import as len": "        from builtins import print as len\n        len(body)\n",
+    "with as len": "        import io\n        with io.StringIO() as len:\n            pass\n",
+    "class named len": "        class len:\n            pass\n",
+    "method startswith": TAINT_R29_ECHO % ("startswith", "startswith"),
+    "method get": TAINT_R29_ECHO % ("get", "get"),
+    "method encode": TAINT_R29_ECHO % ("encode", "encode"),
+    "method endswith": TAINT_R29_ECHO % ("endswith", "endswith"),
+}
+TAINT_R29_F2_MODULE = {
+    "module len rebound": ("len = print\n", "        self.assertEqual(len(body), 3)\n"),
+    "module def str": ("def str(x):\n    print(x)\n", "        self.assertEqual(len(body), 3)\n"),
+    "module class with startswith": ("class Echo:\n    def startswith(self, text):\n        print(text)\n", "        Echo().startswith(body)\n"),
+}
+# code r28 F3: every positional and every keyword argument is judged
+TAINT_R29_F3 = {
+    "re.compile(pattern=v)": "        re.compile(pattern=body)\n",
+    "re.sub(p, v, s)": "        re.sub('p', body, 's')\n",
+    "re.sub(p, repl=v, string=s)": "        re.sub('p', repl=body, string='s')\n",
+    "s.replace('x', v)": "        'abc'.replace('x', body)\n",
+    "print(sep=v)": "        print(sep=body)\n",
+    "open(path, mode=v)": "        open('p', mode=body)\n",
+}
+TAINT_R29_F3_CLEAN = {
+    "re.search with a constant pattern": "        self.assertTrue(bool(re.search('[a-z]+', body)))\n",
+    "replace on the value": "        self.assertTrue(bool(body.replace('x', 'y')))\n",
+}
+
+
+class TestAnIntValuedCallIsNotAnOracle8187R29(unittest.TestCase):
+    """r29 code F1: only ``len`` of the WHOLE value is exempt; ``ord``, ``id``, ``find``, ``count``, ``index`` and ``hash`` over the
+    value are oracles (each leaks bits of it).  The 14 shapes are flagged and the clean controls stay clean."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R29_F1), 14)
+        self.assertEqual(len(TAINT_R29_F1_CLEAN), 2)
+
+    def test_the_int_valued_exemption_is_len_alone(self):
+        self.assertEqual(TAINT_INT_FUNCTIONS, frozenset(("len",)))
+        for name in ("ord", "id", "hash", "sum", "max", "min", "reversed", "hasattr"):
+            self.assertNotIn(name, TAINT_ACCEPTED_BUILTINS)
+        for name in ("index", "rindex"):
+            self.assertNotIn(name, TAINT_ACCEPTED_METHODS)
+
+    def test_every_oracle_shape_is_flagged(self):
+        survivors = []
+        for name, body in TAINT_R29_F1.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, body in TAINT_R29_F1_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(tainted_assert_lines(TAINT_R28_HEAD + body), [])
+
+
+class TestAnAcceptedNameIsABindingNotAFunction8187R29(unittest.TestCase):
+    """r29 code F2: rebinding an accepted name (in a test, at module level, or by a module-defined method of the same name) is a
+    defect, because a name is a binding and not a function."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R29_F2), 12)
+        self.assertEqual(len(TAINT_R29_F2_MODULE), 3)
+
+    def test_every_rebinding_inside_a_test_is_flagged(self):
+        survivors = []
+        for name, body in TAINT_R29_F2.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_every_module_level_rebinding_is_flagged(self):
+        survivors = []
+        for name, (prefix, body) in TAINT_R29_F2_MODULE.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(prefix + TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_a_rebinding_inside_each_exempt_function_is_flagged(self):
+        shipped = THIS_PATH.read_text(encoding="utf-8")
+        for function in sorted(TAINT_EXEMPT_FUNCTIONS):
+            with self.subTest(function=function):
+                self.assertNotEqual(exempt_function_defects(exempt_source_with(shipped, function, "    len = print\n")), [])
+
+
+class TestEveryArgumentIsJudged8187R29(unittest.TestCase):
+    """r29 code F3: the argument rules judge every positional AND every keyword argument, not the first positional alone."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R29_F3), 6)
+        self.assertEqual(len(TAINT_R29_F3_CLEAN), 2)
+
+    def test_every_argument_position_is_flagged(self):
+        survivors = []
+        for name, body in TAINT_R29_F3.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, body in TAINT_R29_F3_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(tainted_assert_lines(TAINT_R28_HEAD + body), [])
+
+
+class TestOpaqueRaisesOnAForeignOperand8187R29(unittest.TestCase):
+    """r29 code F4 / security F3: ``Opaque.__eq__`` and ``__ne__`` raise ``OpaqueComparisonError`` for every operand that is not an
+    ``Opaque`` (a silent False is an oracle the docstring promised not to give); two ``Opaque`` compare as before."""
+
+    def setUp(self):
+        self.plain = "plain-text-value"
+        self.wrapped = ty.Opaque(self.plain, "key[0]")
+        self.twin = ty.Opaque(self.plain, "key[1]")
+        self.other = ty.Opaque("another-value", "key[2]")
+
+    def test_equality_with_a_plain_operand_raises_on_either_side(self):
+        with self.assertRaises(ty.OpaqueComparisonError):
+            self.wrapped == self.plain
+        with self.assertRaises(ty.OpaqueComparisonError):
+            self.plain == self.wrapped
+
+    def test_inequality_with_a_plain_operand_raises_on_either_side(self):
+        with self.assertRaises(ty.OpaqueComparisonError):
+            self.wrapped != self.plain
+        with self.assertRaises(ty.OpaqueComparisonError):
+            self.plain != self.wrapped
+
+    def test_membership_in_a_list_of_plain_values_raises(self):
+        with self.assertRaises(ty.OpaqueComparisonError):
+            self.wrapped in [self.plain]
+        with self.assertRaises(ty.OpaqueComparisonError):
+            self.plain in [self.wrapped]
+
+    def test_none_and_other_foreign_operands_raise(self):
+        for foreign in (None, 0, b"x", ("x",), object()):
+            with self.subTest(foreign=type(foreign).__name__):
+                with self.assertRaises(ty.OpaqueComparisonError):
+                    self.wrapped == foreign
+                with self.assertRaises(ty.OpaqueComparisonError):
+                    self.wrapped != foreign
+
+    def test_assertEqual_against_a_plain_value_raises_the_typed_error_without_the_value(self):
+        with self.assertRaises(ty.OpaqueComparisonError) as caught:
+            self.assertEqual(self.wrapped, self.plain)
+        shown = [str(caught.exception), repr(caught.exception), repr(caught.exception.args)]
+        self.assertEqual([part for part in shown if self.plain in part], [])
+
+    def test_two_opaque_values_compare_by_their_raw_values(self):
+        self.assertIs(self.wrapped == self.twin, True)
+        self.assertIs(self.wrapped != self.twin, False)
+        self.assertIs(self.wrapped != self.other, True)
+        self.assertIs(self.wrapped == self.other, False)
+
+    def test_neither_method_falls_back_to_not_implemented(self):
+        tree = ast.parse(TY_PATH.read_text(encoding="utf-8"))
+        klass = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Opaque")
+        methods = [n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name in ("__eq__", "__ne__")]
+        self.assertEqual(sorted(m.name for m in methods), ["__eq__", "__ne__"])
+        for method in methods:
+            with self.subTest(method=method.name):
+                self.assertEqual([n.lineno for n in ast.walk(method) if isinstance(n, ast.Name) and n.id == "NotImplemented"], [])
+
+
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
         # regenerate all three pin sections from the workflows; the diff of the data file is what a reviewer reads
