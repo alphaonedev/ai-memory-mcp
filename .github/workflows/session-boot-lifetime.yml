@@ -1,9 +1,10 @@
 name: Session-boot lifetime suite
 
 # Issue #487 PR-3 — proves `ai-memory boot` loads on session start across
-# every supported AI / AI-agent recipe, on every supported platform, on a
-# recurring schedule. If a recipe in `docs/integrations/<agent>.md`
-# regresses, this workflow fails on the next nightly run.
+# every supported AI / AI-agent recipe, on every supported platform. It runs
+# nightly on main, on every push to main or a release line, and on every PR
+# into a release, rehearsal or chain base that touches the boot recipe (#7246).
+# If a recipe in `docs/integrations/<agent>.md` regresses, this workflow fails.
 
 on:
   schedule:
@@ -12,7 +13,20 @@ on:
     - cron: '0 4 * * *'
   workflow_dispatch:
   push:
-    branches: [release/v0.6.3.1, main]
+    branches: [main, "release/**"]
+    paths:
+      - 'docs/integrations/**'
+      - 'src/cli/boot.rs'
+      - 'tests/boot_primitive_contract.rs'
+      - 'tests/recipe_contract.rs'
+      - 'tests/boot_lifecycle.rs'
+      - 'scripts/run-session-boot-lifetime-tests.sh'
+      - '.github/workflows/session-boot-lifetime.yml'
+  # #7246 — PRs into a release, rehearsal or chain base. push.branches must
+  # never overlap a PR head (#2506, #2523, #2508), so chain/** lives here only.
+  pull_request:
+    branches: ["release/**", "rehearsal/**", "chain/**"]
+    types: [opened, synchronize, reopened]
     paths:
       - 'docs/integrations/**'
       - 'src/cli/boot.rs'
@@ -26,6 +40,15 @@ on:
 # Checkout + cargo/scripts only; no PR comments, SARIF, or checks writes.
 permissions:
   contents: read
+
+# #7246 review r1 F1: a superseded pull_request run must not keep the single
+# self-hosted macos-fed runner queued. Same shape as cert-postgres-age.yml and
+# postgres-ignored.yml: fork-safe key, event name in the group so push, pull_request
+# and schedule runs never share one, cancel only PR runs (#6340: push runs on
+# release/** are never cancelled in progress).
+concurrency:
+  group: session-boot-lifetime-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,6 +81,17 @@ jobs:
             runner: '["self-hosted","macos-fed"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
     steps:
+      # 2026-08-26 rigid-security-controls (precedents: ci.yml:857,
+      # postgres-ignored.yml:55): a fork PR must NEVER have its code checked
+      # out on a self-hosted node. This step fails the self-hosted leg BEFORE
+      # `actions/checkout`; GitHub-hosted legs are unaffected. STEP-level, not
+      # job-level (#2494 wedge class). Added with the pull_request trigger (#7246).
+      - name: Fork-PR refusal (self-hosted legs never run fork code)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
+        run: |
+          echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.os }})."
+          exit 1
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
