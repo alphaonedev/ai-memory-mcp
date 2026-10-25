@@ -9,9 +9,15 @@ are otherwise identical.
 
 from __future__ import annotations
 
+import os
+import ssl
 from types import TracebackType
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
+
+# #3840 — see ai_memory/client.py: the `list` method shadows the builtin in
+# annotations inside the class body.
+import builtins
 
 import httpx
 
@@ -62,7 +68,7 @@ class AsyncAiMemoryClient:
         api_key: str | None = None,
         agent_id: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
-        verify: bool | str | None = None,
+        verify: Union[bool, str, os.PathLike[str], ssl.SSLContext, None] = None,
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
@@ -75,6 +81,7 @@ class AsyncAiMemoryClient:
                 verify=verify,
                 cert=cert,
                 extra_headers=headers,
+                is_async=True,
             )
         )
 
@@ -130,7 +137,7 @@ class AsyncAiMemoryClient:
         content: str,
         tier: str | None = None,
         namespace: str | None = None,
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
         priority: int | None = None,
         confidence: float | None = None,
         source: str | None = None,
@@ -174,7 +181,7 @@ class AsyncAiMemoryClient:
         return await self._request("POST", "/api/v1/memories", json_body=body)
 
     async def bulk_store(
-        self, memories: list[CreateMemory | dict[str, Any]]
+        self, memories: builtins.list[CreateMemory | dict[str, Any]]
     ) -> BulkCreateResponse:
         payload = [prep_json(m) for m in memories]
         raw = await self._request("POST", "/api/v1/memories/bulk", json_body=payload)
@@ -222,7 +229,7 @@ class AsyncAiMemoryClient:
         until: str | None = None,
         tags: str | None = None,
         agent_id: str | None = None,
-    ) -> list[Memory]:
+    ) -> builtins.list[Memory]:
         raw = await self._request(
             "GET",
             "/api/v1/memories",
@@ -254,7 +261,7 @@ class AsyncAiMemoryClient:
         tags: str | None = None,
         agent_id: str | None = None,
         as_agent: str | None = None,
-    ) -> list[Memory]:
+    ) -> builtins.list[Memory]:
         raw = await self._request(
             "GET",
             "/api/v1/search",
@@ -322,7 +329,7 @@ class AsyncAiMemoryClient:
             json_body={"source_id": source_id, "target_id": target_id, "relation": relation},
         )
 
-    async def get_links(self, memory_id: str) -> list[dict[str, Any]]:
+    async def get_links(self, memory_id: str) -> builtins.list[dict[str, Any]]:
         raw = await self._request("GET", f"/api/v1/links/{memory_id}")
         return raw.get("links", raw) if isinstance(raw, dict) else raw
 
@@ -343,7 +350,7 @@ class AsyncAiMemoryClient:
     async def stats(self) -> Stats:
         return Stats.model_validate(await self._request("GET", "/api/v1/stats"))
 
-    async def namespaces(self) -> list[dict[str, Any]]:
+    async def namespaces(self) -> builtins.list[dict[str, Any]]:
         raw = await self._request("GET", "/api/v1/namespaces")
         return raw.get("namespaces", raw) if isinstance(raw, dict) else raw
 
@@ -401,7 +408,7 @@ class AsyncAiMemoryClient:
             "DELETE", "/api/v1/subscriptions", params={"id": subscription_id}
         )
 
-    async def subscriptions(self) -> list[Subscription]:
+    async def subscriptions(self) -> builtins.list[Subscription]:
         raw = await self._request("GET", "/api/v1/subscriptions")
         items = raw.get("subscriptions", raw) if isinstance(raw, dict) else raw
         return [Subscription.model_validate(s) for s in items]
@@ -416,7 +423,7 @@ class AsyncAiMemoryClient:
         agent_id: str | None = None,
         unread_only: bool | None = None,
         limit: int | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         raw = await self._request(
             "GET",
             "/api/v1/inbox",
@@ -430,13 +437,13 @@ class AsyncAiMemoryClient:
     # 404'd. See :class:`ai_memory.AiMemoryClient` for the replacements.
 
     # -- agents -------------------------------------------------------------
-    async def agents(self) -> list[AgentRegistration]:
+    async def agents(self) -> builtins.list[AgentRegistration]:
         raw = await self._request("GET", "/api/v1/agents")
         items = raw.get("agents", raw) if isinstance(raw, dict) else raw
         return [AgentRegistration.model_validate(a) for a in items]
 
     async def register_agent(
-        self, agent_id: str, agent_type: str, capabilities: list[str] | None = None
+        self, agent_id: str, agent_type: str, capabilities: builtins.list[str] | None = None
     ) -> dict[str, Any]:
         return await self._request(
             "POST",
