@@ -114,12 +114,22 @@ fn get_links_surfaces_valid_until_after_invalidate() {
         .iter()
         .find(|l| l.source_id == src && l.target_id == tgt)
         .expect("post-invalidate link must still surface in get_links");
+    // #3809: the reader renders the canonical `Z` form of the stamp.
     assert_eq!(
         matched_after.valid_until.as_deref(),
-        Some(stamp),
+        Some("2026-05-18T12:34:56Z"),
         "get_links must surface the post-invalidate valid_until stamp \
          (pre-#860 fix this was hard-coded to None)"
     );
+    // The STORED bytes are untouched by the canonical-on-read rendering.
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT valid_until FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+            rusqlite::params![src, tgt],
+            |r| r.get(0),
+        )
+        .expect("raw valid_until select");
+    assert_eq!(stored.as_deref(), Some(stamp));
     // attest_level must reflect the post-invalidation column value. The
     // create-default leaves the row at `unsigned`; H5 keeps it unsigned
     // because there was no prior signature to clear. Either way the
@@ -141,7 +151,7 @@ fn get_links_surfaces_valid_until_after_invalidate() {
         .expect("inbound view must include the now-invalidated link");
     assert_eq!(
         matched_inbound.valid_until.as_deref(),
-        Some(stamp),
+        Some("2026-05-18T12:34:56Z"),
         "inbound get_links must also surface valid_until"
     );
 }
