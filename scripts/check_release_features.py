@@ -5646,6 +5646,42 @@ R9_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
 }
 
 
+# Round 11 (code r10 F1-F3): (document, files, message count, needle). F1: a quoted span inside `${...}` is scanned like the
+# word around it. F2: a here-document body under an unquoted delimiter is expanded, so it is scanned as double-quoted text; under
+# a quoted delimiter it is literal. F3: `@` is an operator only right after the parameter name or its subscript.
+R11_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    "r11 F2: ${X@P} in an unquoted here-document body is refused": (_r8("X='$(./f)'", "cat <<E", "${X@P}", "E"), None, 1, "parameter transformation"),
+    "r11 F2: a command substitution in an unquoted here-document body is refused": (_r8("cat <<E", "$(./f)", "E"), None, 1, ""),
+    "r11 F2: a backtick in an unquoted here-document body is refused": (_r8("cat <<E", "`./f`", "E"), None, 1, ""),
+    "r11 F2: ${X@P} in a <<- here-document body is refused (YAML forbids a tab, so the body has none)": (_r8("X='$(./f)'", "cat <<-E", "${X@P}", "E"), None, 1, "parameter transformation"),
+    "r11 F2: a command substitution in a <<- here-document body is refused (YAML forbids a tab, so the body has none)": (_r8("cat <<-E", "$(./f)", "E"), None, 1, ""),
+    "r11 F2: a command substitution in the body of the second of two here-documents is refused": (
+        _r8("cat <<A <<B", "plain", "A", "$(./f)", "B"), None, 1, ""),
+    "r11 F2: an escaped dollar in an unquoted here-document body is literal": (_r8("cat <<E", "\\$(./f)", "E"), None, 0, ""),
+    "r11 F2: plain text and a variable in an unquoted here-document body pass": (_r8("cat <<E", "hello $HOME", "E"), None, 0, ""),
+    "r11 F2: a single-quoted delimiter keeps the body literal": (_r8("cat <<'E'", "${X@P} $(./f) `./f`", "E"), None, 0, ""),
+    "r11 F2: a double-quoted delimiter keeps the body literal": (_r8("cat <<\"E\"", "${X@P} $(./f) `./f`", "E"), None, 0, ""),
+    "r11 F2: a backslash delimiter keeps the body literal": (_r8("cat <<\\E", "${X@P} $(./f) `./f`", "E"), None, 0, ""),
+    "r11 F2: a quoted <<- delimiter keeps the body literal": (_r8("cat <<-'E'", "$(./f)", "E"), None, 0, ""),
+    "r11 F1: ${X@P} in double quotes inside ${X:-...} is refused": (_r8("Y='$(./f)'", 'echo ${X:-"${Y@P}"}'), None, 1, "parameter transformation"),
+    "r11 F1: a command substitution in double quotes inside ${X:-...} is refused": (_r8('echo ${X:-"$(./f)"}'), None, 1, "command substitution"),
+    "r11 F1: a command substitution in single quotes inside a double-quoted ${X:-...} is refused": (
+        _r8("echo \"${X:-'$(./f)'}\""), None, 1, "command substitution"),
+    "r11 F1: a backtick in double quotes inside ${X:-...} is refused": (_r8('echo ${X:-"`./f`"}'), None, 1, "command substitution"),
+    "r11 F1: ${X@P} in single quotes inside ${X:-...} is refused": (_r8("Y='$(./f)'", "echo ${X:-'${Y@P}'}"), None, 1, "parameter transformation"),
+    "r11 F1: a quoted default word without an expansion passes": (_r8('echo ${X:-"a b"} ${Y:-\'c d\'}'), None, 0, ""),
+    "r11 F1: a closing brace inside quotes does not end the expansion": (_r8('echo ${X:-"}"}'), None, 0, ""),
+    "r11 F3: an at sign in a default word passes": (_r8("echo ${X:-me@host}"), None, 0, ""),
+    "r11 F3: an at sign in a quoted default word passes": (_r8('echo ${X:-"me@host"}'), None, 0, ""),
+    "r11 F3: an at sign in a pattern removal passes": (_r8("echo ${X#*@a} ${X%@a} ${X//@a/b} ${X:+u@host}"), None, 0, ""),
+    "r11 F3: ${arr[@]} ${!arr[@]} ${@} and \"$@\" pass": (_r8("echo ${arr[@]} ${!arr[@]} ${@} \"$@\" ${#arr[@]}"), None, 0, ""),
+    "r11 F3: ${X@P} right after the name is still refused": (_r8("echo ${X@P}"), None, 1, "parameter transformation"),
+    "r11 F3: ${arr[@]@P} right after the subscript is still refused": (_r8("echo ${arr[@]@P}"), None, 1, "parameter transformation"),
+    "r11 F3: ${!N@P} after an indirection is still refused": (_r8("echo ${!N@P}"), None, 1, "parameter transformation"),
+    "r11 F3: ${arr[${X@P}]} in a subscript is still refused": (_r8("echo ${arr[${X@P}]}"), None, 1, "parameter transformation"),
+}
+
+
 def cargo_config_twins() -> List[str]:
     """Round 9 (sec r8 F2): the problems of CARGO_CONFIG_ENV_TWINS: every key `cargo --config` is refused for has an
     environment twin that DANGEROUS_ASSIGN_RE (or the flag rule) refuses."""
@@ -5768,6 +5804,12 @@ def self_test(root: Path) -> int:
                 print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
                       file=sys.stderr)
                 failures += 1
+        for name, (doc_text, files, count, needle) in R11_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r11")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
         for twin in cargo_config_twins():
             print(f"self-test FAIL: {twin}", file=sys.stderr)
             failures += 1
@@ -5791,7 +5833,7 @@ def self_test(root: Path) -> int:
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
         f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
-        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(R8_CASES)} round-8 cases, {len(R9_CASES)} round-9 cases, {len(JOINED_CASES)} joined cases)"
+        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(R8_CASES)} round-8 cases, {len(R9_CASES)} round-9 cases, {len(R11_CASES)} round-11 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 

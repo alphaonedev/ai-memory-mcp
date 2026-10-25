@@ -1382,6 +1382,106 @@ class Round10(unittest.TestCase):
         self.assertEqual(mutated, at_head)
 
 
+class Round11(unittest.TestCase):
+    """PR 8003 round 11 (code r10 F1-F6): the quoted spans of `${...}` and the bodies of unquoted here-documents are
+    scanned, `@` is an operator only after the parameter name, the sweep never counts a failed observation as a kill,
+    and the tests remove the trees they create."""
+
+    def setUp(self):
+        self.sweep = load_sweep()
+        self.tmp = Path(tempfile.mkdtemp(prefix="r11.", dir=scratch()))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+
+    def errs(self, *lines):
+        return G.r5_errors(G._r8(*lines), None, self.tmp / "t")
+
+    def test_the_round10_probe_rows_are_refused(self):
+        """F1 (O8, O9, O10) and F2 (O3, O3b, O3c): each ran a command off RUN_ALLOWED in bash and passed the guard."""
+        rows = {
+            "O3": ("X='$(./f)'", "cat <<E", "${X@P}", "E"),
+            "O3b": ("cat <<E", "$(./f)", "E"),
+            "O3c": ("cat <<E", "`./f`", "E"),
+            "O8": ("Y='$(./f)'", 'echo ${X:-"${Y@P}"}'),
+            "O9": ('echo ${X:-"$(./f)"}',),
+            "O10": ("echo \"${X:-'$(./f)'}\"",),
+        }
+        passed = [name for name, lines in rows.items() if not self.errs(*lines)]
+        self.assertEqual(passed, [])
+
+    def test_the_quoted_here_document_and_plain_default_controls_pass(self):
+        """O17 and O18 of the review, and `${X:-me@host}` (F3), are accepted."""
+        rows = {
+            "O17": ("cat <<'E'", "${X@P}", "E"),
+            "O18": ("echo ${X:-default}",),
+            "L13": ("echo ${X:-me@host}",),
+        }
+        refused = [name for name, lines in rows.items() if self.errs(*lines)]
+        self.assertEqual(refused, [])
+
+    def test_the_legitimate_at_shapes_are_accepted(self):
+        shapes = ("echo ${arr[@]}", "echo ${!arr[@]}", "echo ${@}", 'echo "$@"', "echo ${#arr[@]}", "echo ${arr[@]:1:2}",
+                  "echo ${arr[@]/x/y}", "echo ${arr[@]#x}", "echo ${X@}", "echo ${X@ P}", "echo \\${X@P}", "echo '${X@P}'",
+                  "echo ${X#*@}", "echo ${X@1}", "echo ${X@_}")
+        refused = [s for s in shapes if self.errs(s)]
+        self.assertEqual(refused, [])
+
+    def test_the_guard_round11_cases_match(self):
+        wrong = []
+        for name, (doc, files, count, needle) in G.R11_CASES.items():
+            errs = G.r5_errors(doc, files, self.tmp / "c")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                wrong.append(name)
+        self.assertEqual(wrong, [])
+        self.assertEqual(len(G.R11_CASES), 27)
+
+    def test_the_new_observations_are_named_and_refused_at_head(self):
+        for name in ("heredoc body ${X@P}", "heredoc body command substitution", "heredoc body backticks",
+                     "quoted default word ${Y@P}", "quoted default word command substitution",
+                     "single-quoted default word command substitution"):
+            self.assertIn(name, self.sweep.OBSERVATIONS)
+        self.assertEqual(len(self.sweep.OBSERVATIONS), 10 + 44 + 6)
+        self.assertEqual(self.sweep.accepted_observations(SCRIPT, self.tmp / "head"), [])
+
+    def test_a_failed_observation_run_is_not_a_kill(self):
+        """F4: a run that exits with neither expected code is OTHER-DEFECT, also on the unmutated guard."""
+        (self.tmp / "obs").write_text("a file where the observation tree goes", encoding="utf-8")
+        kind, _names = self.sweep.observe(SCRIPT, self.tmp)
+        self.assertEqual(kind, "failed")
+        state, _label, note = self.sweep.work_row(SCRIPT.read_bytes(), "unmutated guard", ROOT, str(self.tmp), False)
+        self.assertEqual(state, "OTHER-DEFECT", note)
+
+    def test_an_accepted_observation_is_a_kill_and_a_clean_run_is_none(self):
+        kind, names = self.sweep.observe(SCRIPT, self.tmp)
+        self.assertEqual((kind, names), ("none", []))
+        text = read(SCRIPT)
+        mutated = self.sweep.mutate(text, 'if not alit and ("$(" in arg or "`" in arg):', "if False:")
+        self.assertIsNotNone(mutated)
+        path = self.tmp / "m.py"
+        path.write_text(mutated, encoding="utf-8")
+        kind, names = self.sweep.observe(path, self.tmp / "o")
+        self.assertEqual(kind, "accepted")
+        self.assertIn("digest text with a command substitution", names)
+
+    def test_the_control_row_observes_and_must_be_green(self):
+        self.assertEqual(self.sweep.control_row(ROOT, str(self.tmp))[0], "GREEN")
+        (self.tmp / "obs").write_text("x", encoding="utf-8")
+        self.assertNotEqual(self.sweep.control_row(ROOT, str(self.tmp))[0], "GREEN")
+
+    def test_the_sweep_text_is_consistent(self):
+        """F5: the survivor count in the comment is the real one and `mutate` uses the guard's marker constant."""
+        text = read(ROOT / "scripts" / "test" / "mutation_sweep_release_features.py")
+        self.assertNotIn("# --- end of condition mutants", text)
+        self.assertNotIn("The four that follow", text)
+        self.assertIn("The five that follow", text)
+        self.assertIn("G.CONDITION_MARKER", text)
+
+    def test_no_test_leaves_a_fixed_tree_under_local_runs(self):
+        """F6: every scratch tree of this module is a mkdtemp directory with a cleanup."""
+        text = read(Path(__file__))
+        needle = "Path(scratch())" + " / " + chr(34)
+        self.assertEqual([i + 1 for i, ln in enumerate(text.splitlines()) if needle in ln and "assertEqual" not in ln], [])
+
+
 class SelfTest8023(unittest.TestCase):
     """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
 
