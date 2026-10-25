@@ -54,7 +54,7 @@ Per-Module Coverage Thresholds
 # ---------------------------------------------------------------------------
 # 2026-09-11 (#3552) — certified-pin jobs. Same-repo-only job-level `if:`
 # (`github.event.pull_request.head.repo.full_name == github.repository`)
-# because forks cannot be scheduled onto the self-hosted linux-fed pg
+# because forks cannot be scheduled onto the self-hosted fed pg
 # tier. Skipped-on-fork counts as SATISFIED; that is a dated fail-open
 # for external PRs, not for same-repo traffic (the merge train). Not a
 # matrix, so not a (b1) wedge.
