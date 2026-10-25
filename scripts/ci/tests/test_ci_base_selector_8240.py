@@ -1123,14 +1123,39 @@ MATERIALISE_REFUSED_ATTRS = {"system", "popen", "Popen", "execv", "execve", "exe
 MATERIALISE_REFUSED_NAMES = MATERIALISE_REFUSED_ATTRS | {"exec", "eval", "compile", "__import__",
                                                          "runpy", "importlib"}
 PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
-# code r8 C2: the second layer is an ALLOW-LIST. The body may call only these names, reach only
-# these module attributes, run exactly one `subprocess.run` whose argv starts with the literal
-# ["git", "--no-replace-objects"], pass only these git subcommands and dash arguments (no `-c`,
-# no alias, fsmonitor, hooksPath or exec option), and use only these `subprocess.run` keywords.
+# sec F1 / code C1-C3 (round 12): the second layer is a POSITIVE ALLOW-LIST over the parsed body.
+# With the sha256 pin re-pinned to a mutated body, it enforces exactly this and no more:
+# call targets: a bare name in MATERIALISE_NAME_CALLS, or a rendered receiver chain listed in
+# MATERIALISE_MODULE_CHAINS or MATERIALISE_METHOD_CHAINS (any other receiver is a problem line);
+# pinned imports: exactly the statements in MATERIALISE_IMPORT_STATEMENTS, no `as` and no other
+# module; no rebinding: no assignment, parameter, loop, with, except or comprehension target binds
+# an allowed name or a module root, and a function or class is defined only under a pinned name;
+# exact argv head: the one subprocess.run argv is the two literals of MATERIALISE_GIT_ARGV plus
+# `list(args)`; dash argument at every position: a string starting with a dash must be in
+# MATERIALISE_DASH_ARGS and every git() argument is a string literal or one of the pinned
+# expressions in MATERIALISE_GIT_VALUE_ARGS (those names are pinned by spelling, not by value);
+# environment untouched: no store, delete or attribute assignment on os.environ and none of
+# MATERIALISE_ENVIRON_WRITERS. The sha256 digest stays the primary pin.
+MATERIALISE_ENFORCES = ("call targets", "pinned imports", "no rebinding", "exact argv head",
+                        "dash argument at every position", "environment untouched")
 MATERIALISE_MODULE_ROOTS = {"os", "re", "shutil", "subprocess", "sys", "pathlib"}
+MATERIALISE_IMPORT_STATEMENTS = sorted(["from pathlib import Path", "import os", "import re",
+                                        "import shutil", "import subprocess", "import sys"])
 MATERIALISE_MODULE_CHAINS = {"os.environ", "os.environ.get", "os.path.lexists", "re.compile",
                              "shutil.rmtree", "subprocess.TimeoutExpired", "subprocess.run",
                              "sys.exit"}
+# Receiver chains of method calls on values; a call is rendered as `()` in the chain.
+MATERIALISE_METHOD_CHAINS = sorted([
+    "SHA_RE.match", "dest.exists", "dest.is_dir", "dest.is_symlink", "env.get", "handle.write",
+    "listed.stdout.strip", "os.environ.get().split", "res.stdout.decode", "res.stdout.decode().strip",
+    "res.stdout.strip", "target.parent.mkdir", "target.write_bytes", "tree.stdout.decode",
+    "tree.stdout.decode().split", "tree.stdout.strip"])
+MATERIALISE_ENVIRON_WRITERS = sorted(["os.environ.clear", "os.environ.pop", "os.environ.popitem",
+                                      "os.environ.setdefault", "os.environ.update", "os.putenv",
+                                      "os.unsetenv"])
+MATERIALISE_DEFINED_NAMES = sorted(["BaseUnavailable", "derive_base", "fetch_blob", "gate_absent",
+                                    "git", "git_state_refused", "have_commit", "main",
+                                    "materialise", "replace_refs_present", "report", "rev_parse"])
 MATERIALISE_NAME_CALLS = {"BaseUnavailable", "Path", "bool", "derive_base", "dict", "fetch_blob",
                           "gate_absent", "git", "git_state_refused", "have_commit", "len", "list",
                           "main", "materialise", "open", "print", "replace_refs_present",
@@ -1140,23 +1165,101 @@ MATERIALISE_GIT_SUBCOMMANDS = {"cat-file", "fetch", "for-each-ref", "ls-tree", "
 MATERIALISE_DASH_ARGS = {"--", "--count=1", "--depth=1", "--format=%(refname)", "--git-path",
                          "--list", "--no-replace-objects", "--no-tags", "--quiet", "--verify",
                          "-e"}
+# Non-literal git() arguments, by their unparsed spelling.
+MATERIALISE_GIT_VALUE_ARGS = sorted(["'%s:%s' % (base, path)", "IMPACT_PREFIX + 'gate.py'",
+                                     "base", "base + '^{commit}'", "path", "rel", "spec"])
 MATERIALISE_RUN_KEYWORDS = {"capture_output", "env", "timeout"}
 MATERIALISE_GIT_ARGV = ("git", "--no-replace-objects")
+MATERIALISE_RUN_ARGV_TAIL = "list(args)"
 
 
-def _dotted(node):
-    parts = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
+def _chain(node):
+    """Render a call target as `a.b.c`; a call inside the receiver is rendered `()`. None for any
+    other receiver (subscript, constant, lambda, ...)."""
     if isinstance(node, ast.Name):
-        parts.append(node.id)
-        return ".".join(reversed(parts))
+        return node.id
+    if isinstance(node, ast.Attribute):
+        inner = _chain(node.value)
+        return None if inner is None else "%s.%s" % (inner, node.attr)
+    if isinstance(node, ast.Call):
+        inner = _chain(node.func)
+        return None if inner is None else inner + "()"
     return None
 
 
+def _bound_names(tree):
+    """(name, kind, statement) for every binding in the tree; kind is store, def, arg, import."""
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            found.append((node.id, "store", node))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            found.append((node.name, "def", node))
+        elif isinstance(node, ast.arg):
+            found.append((node.arg, "arg", node))
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            found.append((node.name, "store", node))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                found.append(((alias.asname or alias.name).split(".")[0], "import", node))
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            found.extend((name, "store", node) for name in node.names)
+    return found
+
+
+def _binding_problems(label, tree):
+    problems = []
+    protected = MATERIALISE_NAME_CALLS | MATERIALISE_MODULE_ROOTS
+    defs = {}
+    for name, kind, node in _bound_names(tree):
+        if kind == "import":
+            if ast.unparse(node) not in MATERIALISE_IMPORT_STATEMENTS or len(node.names) != 1:
+                problems.append("%s: import statement outside the pinned set (%s)"
+                                % (label, ast.unparse(node)))
+        elif kind == "def" and name in MATERIALISE_DEFINED_NAMES:
+            defs[name] = defs.get(name, 0) + 1
+            if defs[name] > 1:
+                problems.append("%s: %s defined more than once" % (label, name))
+        elif name in protected:
+            problems.append("%s: binds %s (an allowed name or a module root)" % (label, name))
+        elif kind == "def":
+            problems.append("%s: defines %s outside the pinned set" % (label, name))
+    return problems
+
+
+def _argv_problems(label, node):
+    argv = node.args[0] if node.args else None
+    head = argv.left if isinstance(argv, ast.BinOp) and isinstance(argv.op, ast.Add) else None
+    good = (isinstance(head, ast.List) and len(head.elts) == len(MATERIALISE_GIT_ARGV)
+            and all(isinstance(e, ast.Constant) for e in head.elts)
+            and tuple(e.value for e in head.elts) == MATERIALISE_GIT_ARGV
+            and ast.unparse(argv.right) == MATERIALISE_RUN_ARGV_TAIL and len(node.args) == 1)
+    problems = []
+    if not good:
+        problems.append("%s: subprocess.run argv is not the exact git head plus list(args)" % label)
+    if {k.arg for k in node.keywords} - MATERIALISE_RUN_KEYWORDS or any(
+            k.arg is None for k in node.keywords):
+        problems.append("%s: subprocess.run keyword outside the allow-list" % label)
+    return problems
+
+
+def _git_call_problems(label, node):
+    problems = []
+    first = node.args[0] if node.args else None
+    if not (isinstance(first, ast.Constant) and first.value in MATERIALISE_GIT_SUBCOMMANDS):
+        problems.append("%s: git call with a subcommand outside the allow-list" % label)
+    if node.keywords:
+        problems.append("%s: git call with keyword arguments" % label)
+    for arg in node.args:
+        literal = isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+        if not literal and ast.unparse(arg) not in MATERIALISE_GIT_VALUE_ARGS:
+            problems.append("%s: git argument is not a literal or a pinned expression" % label)
+    return problems
+
+
 def materialise_allow_list_problems(label, run):
-    """Reasons the Materialise body reaches a call target outside the allow-list."""
+    """Reasons the Materialise body reaches a call target, binding, environment write or argument
+    outside the allow-list."""
     found = HEREDOC_RE.match(normalise_run(run or ""))
     if found is None:
         return ["%s: run text is not one bare python3 -I heredoc" % label]
@@ -1164,44 +1267,54 @@ def materialise_allow_list_problems(label, run):
         tree = ast.parse(found.group("body"))
     except SyntaxError:
         return ["%s: heredoc body is not valid python" % label]
-    problems = []
-    inner = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    problems = _binding_problems(label, tree)
+    callees = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    receivers = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    allowed_uses = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            allowed_uses.update(id(a) for a in node.args)
+            allowed_uses.update(id(k.value) for k in node.keywords)
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+            allowed_uses.add(id(node.value))
+        elif isinstance(node, ast.ExceptHandler) and node.type is not None:
+            allowed_uses.add(id(node.type))
+            if isinstance(node.type, ast.Tuple):
+                allowed_uses.update(id(e) for e in node.type.elts)
     runs = 0
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and id(node) not in inner:
-            chain = _dotted(node)
-            if (chain and chain.split(".")[0] in MATERIALISE_MODULE_ROOTS
-                    and chain not in MATERIALISE_MODULE_CHAINS):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
+                and node.id in MATERIALISE_MODULE_ROOTS and id(node) not in receivers:
+            problems.append("%s: bare reference to module %s" % (label, node.id))
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            problems.append("%s: assigns or deletes attribute .%s" % (label, node.attr))
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            chain = _chain(node.value) or ""
+            if chain.split(".")[0] in MATERIALISE_MODULE_ROOTS:
+                problems.append("%s: stores into or deletes from %s" % (label, chain))
+        elif isinstance(node, ast.Attribute) and id(node) not in callees \
+                and id(node) not in receivers:
+            chain = _chain(node)
+            if (chain or "").split(".")[0] in MATERIALISE_MODULE_ROOTS and (
+                    chain not in MATERIALISE_MODULE_CHAINS or id(node) not in allowed_uses):
                 problems.append("%s: reaches %s outside the allow-list" % (label, chain))
         if isinstance(node, ast.Call):
             func = node.func
+            chain = _chain(func)
             if isinstance(func, ast.Name):
                 if func.id not in MATERIALISE_NAME_CALLS:
                     problems.append("%s: calls %s outside the allow-list" % (label, func.id))
                 if func.id == "git":
-                    first = node.args[0] if node.args else None
-                    if not (isinstance(first, ast.Constant)
-                            and first.value in MATERIALISE_GIT_SUBCOMMANDS):
-                        problems.append("%s: git call with a subcommand outside the allow-list"
-                                        % label)
-            elif _dotted(func) == "subprocess.run":
+                    problems.extend(_git_call_problems(label, node))
+            elif chain in MATERIALISE_ENVIRON_WRITERS:
+                problems.append("%s: writes the process environment (%s)" % (label, chain))
+            elif chain is None:
+                problems.append("%s: call on an unenumerated receiver" % label)
+            elif chain not in MATERIALISE_MODULE_CHAINS and chain not in MATERIALISE_METHOD_CHAINS:
+                problems.append("%s: calls %s outside the allow-list" % (label, chain))
+            if chain == "subprocess.run":
                 runs += 1
-                argv = node.args[0] if node.args else None
-                head = argv.left if isinstance(argv, ast.BinOp) else None
-                literal = tuple(e.value for e in head.elts
-                                if isinstance(e, ast.Constant)) if isinstance(head, ast.List) else ()
-                if literal != MATERIALISE_GIT_ARGV:
-                    problems.append("%s: subprocess.run argv does not start with the git literal"
-                                    % label)
-                if {k.arg for k in node.keywords} - MATERIALISE_RUN_KEYWORDS:
-                    problems.append("%s: subprocess.run keyword outside the allow-list" % label)
-            elif isinstance(func, ast.Attribute):
-                chain = _dotted(func)
-                if chain and chain.split(".")[0] in MATERIALISE_MODULE_ROOTS \
-                        and chain not in MATERIALISE_MODULE_CHAINS:
-                    problems.append("%s: calls %s outside the allow-list" % (label, chain))
-            elif not isinstance(func, (ast.Attribute, ast.Name)):
-                problems.append("%s: indirect call target" % label)
+                problems.extend(_argv_problems(label, node))
         elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
               and node.value.startswith("-") and node.value not in MATERIALISE_DASH_ARGS):
             problems.append("%s: dash argument outside the allow-list" % label)
