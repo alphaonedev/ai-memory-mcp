@@ -105,6 +105,69 @@ pub struct AdminHeaderTrustBootInputs {
     pub agent_api_key_count: usize,
 }
 
+/// #7707 — the boot-time verdict on allowlisted admin ids that have NO enrolled
+/// per-agent key while per-agent keys ARE enrolled.
+///
+/// Admin elevation is key-attested once the enrolled map is non-empty
+/// ([`is_admin_caller_trusted`], [`require_admin`]). Under `advisory` and `off`
+/// that is a behaviour change relative to earlier builds, so an admin who has
+/// been using the shared transport key would lose admin access with no signal.
+/// This names every such admin id and the migration step. `enforce` already
+/// refused those admins, so it carries no new signal. An empty map (keyless
+/// single-operator daemon) is inert. Pure, so the boot wiring and its tests
+/// share one decision; the caller decides severity by posture (WARN by default,
+/// REFUSE under the certified / asi-hard posture, as for #3065).
+#[must_use]
+pub fn unattested_admin_boot_reason(
+    mode: crate::config::HttpIdentityMode,
+    enrolled: &std::collections::HashMap<String, String>,
+    admin_ids: &[String],
+) -> Option<String> {
+    if enrolled.is_empty() || mode == crate::config::HttpIdentityMode::Enforce {
+        return None;
+    }
+    let keyed: std::collections::HashSet<&str> = enrolled.values().map(String::as_str).collect();
+    let mut missing: Vec<&str> = admin_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !keyed.contains(id))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    Some(format!(
+        "per-agent api-keys are enrolled but allowlisted admin id(s) [{}] have no enrolled \
+         per-agent key, so admin elevation is refused for them in every identity mode (#7707): \
+         a shared transport key plus a self-asserted X-Agent-Id no longer grants admin once \
+         keys are enrolled. Run `ai-memory agents bind-api-key --agent-id <admin-id> \
+         --token-file <0600 path>` for each listed id; the live refresh picks it up with no \
+         restart.",
+        missing.join(", ")
+    ))
+}
+
+/// #7707 r2 (L2) - the pure boot verdict for an unkeyed admin id. Under the
+/// certified / asi-hard posture (`posture_engaged`) the reason REFUSES boot;
+/// otherwise it is an operator WARN and boot proceeds. `None` always permits.
+///
+/// # Errors
+/// Returns the reason as an error when `posture_engaged` and a reason exists.
+pub(crate) fn unattested_admin_boot_decision(
+    reason: Option<String>,
+    posture_engaged: bool,
+) -> anyhow::Result<()> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    if posture_engaged {
+        anyhow::bail!(reason);
+    }
+    tracing::warn!(target: super::HTTP_AUTH_TRACE_TARGET, "{reason}");
+    Ok(())
+}
+
 /// #3065 (Wave-2 Cluster B) — the LOAD-BEARING boot-refusal decision for the
 /// `ADMIN_HEADER_TRUST` identity gate. Pure (no I/O): the boot caller resolves
 /// the live [`AdminHeaderTrustBootInputs`] and this renders the verdict, so the
@@ -287,20 +350,47 @@ pub fn is_admin_caller_trusted(state: &AppState, headers: &HeaderMap, caller: &s
     // #2093 (#2044 / #2032-A / M1) — this predicate is the SECOND admin-admission
     // path (alongside `require_admin`), guarding read+destructive admin surfaces
     // (`purge_archive`, `forget`, kg/power/governance/links admin branches). It
-    // must consume the SAME per-agent-key attestation gate as `require_admin`:
-    // under the `enforce` posture an allowlisted admin NAME must ALSO be
-    // KEY-ATTESTED (a per-agent api-key bound to that id), not merely claimed via
-    // the SHARED transport key. `enforce_for_request` returns `Some(403)` when it
-    // would refuse; the predicate maps that to "not trusted". Fully inert (no
-    // demotion) when no per-agent keys are enrolled — the single-operator case.
-    crate::handlers::identity_binding::enforce_for_request(
+    // must consume the SAME per-agent-key attestation decision as `require_admin`.
+    //
+    // #7707 — once ANY per-agent key is enrolled, an allowlisted admin NAME must
+    // ALSO be KEY-ATTESTED (a per-agent api-key bound to that id) in EVERY
+    // identity mode, not only `enforce`. Under the default `advisory` mode (and
+    // under `off`) the previous decision WARNed and then admitted a merely
+    // `Claimed` shared-transport-key caller. `advisory` keeps that WARN-only
+    // behaviour for ordinary identity decisions; admin elevation is never granted
+    // on a self-asserted identity. Fully inert (no demotion) when no per-agent
+    // keys are enrolled — the single-operator case.
+    admin_elevation_attested(state, headers, caller, "is_admin_caller_trusted")
+}
+
+/// #7707 — the shared admin-elevation attestation decision for
+/// [`is_admin_caller_trusted`] and [`require_admin`]. `true` = elevation may be
+/// granted (no keys enrolled, or the caller is key-attested); `false` = refuse.
+/// Emits an operator-side WARN (never caller-facing) when it demotes.
+fn admin_elevation_attested(
+    state: &AppState,
+    headers: &HeaderMap,
+    caller: &str,
+    endpoint: &str,
+) -> bool {
+    let attested = crate::handlers::identity_binding::admin_identity_attested(
         &state.enrolled_agent_keys,
-        state.http_identity_mode,
         headers,
         caller,
-        "is_admin_caller_trusted",
-    )
-    .is_none()
+    );
+    if !attested {
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            endpoint,
+            caller,
+            mode = ?state.http_identity_mode,
+            "#7707: allowlisted admin {caller:?} on {endpoint} is only claimed \
+             (X-Agent-Id is self-asserted) while per-agent keys are enrolled; admin \
+             elevation refused. Run `ai-memory agents bind-api-key \
+             --agent-id <admin-id> --token-file <0600 path>`."
+        );
+    }
+    attested
 }
 
 /// Resolve the caller from `headers`, check it against the admin
@@ -396,9 +486,23 @@ pub fn require_admin(
     // unauthenticated"; the audit row carries the distinct outcome for
     // operators.
     let header_trusted = request_authn_configured() || admin_header_trust_enabled();
-    let admitted = allowlisted && header_trusted;
+    let name_admitted = allowlisted && header_trusted;
+    // #7707 (and #2044 / M1) — an allowlisted admin NAME is admitted above only
+    // when the deployment has request authn (or the legacy header-trust escape
+    // hatch). But a SHARED api_key proves possession of the transport secret,
+    // NOT of the claimed admin principal. Once ANY per-agent key is enrolled the
+    // admin identity must additionally be KEY-ATTESTED (a per-agent api-key
+    // bound to this admin id, schema v83) in EVERY identity mode: `advisory`
+    // (the default) used to WARN and admit, `off` skipped the check. Inert when
+    // no per-agent keys are enrolled (the single-operator case). The decision
+    // is taken BEFORE the audit row so an "allow" row is only ever written for
+    // an actual allow; the refusal is audited as a refusal.
+    let attested = !name_admitted || admin_elevation_attested(state, headers, &caller, endpoint);
+    let admitted = name_admitted && attested;
     let outcome = if admitted {
         "admitted"
+    } else if name_admitted {
+        "rejected_unattested_admin_identity"
     } else if allowlisted {
         // Allowlisted name, but no authn on the deployment and the
         // trust flag is off — the #1570 secure-default refusal.
@@ -417,31 +521,38 @@ pub fn require_admin(
     );
 
     if admitted {
-        // #2044 (v1.0.0, #2032-A / M1 admin spoof) — an allowlisted admin NAME
-        // is admitted above only when the deployment has request authn (or the
-        // legacy header-trust escape hatch). But under a SHARED api_key that
-        // proves possession of the transport secret, NOT of the claimed admin
-        // principal — so a shared-key holder could still assert
-        // `X-Agent-Id: <admin>`. Under the `enforce` posture the admin identity
-        // must additionally be KEY-ATTESTED (a per-agent api-key bound to this
-        // admin id, schema v83); a merely-`Claimed` shared-key caller is refused.
-        // `advisory` (the default) WARNs but admits (inert when no per-agent keys
-        // are enrolled — the single-operator case).
-        if let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
-            &state.enrolled_agent_keys,
-            state.http_identity_mode,
-            headers,
-            &caller,
-            endpoint,
-        ) {
-            return Err(resp);
-        }
         Ok(caller)
     } else {
+        // #7707 r2 (S1) - ONE generic 403 for EVERY refusal (unknown id, allowlisted
+        // but unattested, unauthenticated header identity): a distinct wire body
+        // would let a caller without an attested credential enumerate the admin
+        // allowlist. The specific reason lives only in the audit outcome above and
+        // the operator WARN.
         Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "admin role required"})),
         )
             .into_response())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unattested_admin_boot_decision_refuses_under_posture_and_names_admin() {
+        let enrolled = std::collections::HashMap::from([("h".to_string(), "bob".to_string())]);
+        let admins = vec!["root-admin".to_string()];
+        let reason = unattested_admin_boot_reason(
+            crate::config::HttpIdentityMode::Advisory,
+            &enrolled,
+            &admins,
+        );
+        let err = unattested_admin_boot_decision(reason.clone(), true)
+            .expect_err("posture engaged + unkeyed admin must refuse boot");
+        assert!(err.to_string().contains("root-admin"), "{err}");
+        assert!(unattested_admin_boot_decision(reason, false).is_ok());
+        assert!(unattested_admin_boot_decision(None, true).is_ok());
     }
 }

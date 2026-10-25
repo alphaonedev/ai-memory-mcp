@@ -1362,6 +1362,32 @@ pub(crate) async fn enforce_admin_header_trust_boot_gate(
     Ok(())
 }
 
+/// #7707 — boot signal for allowlisted admin ids that cannot be key-attested.
+///
+/// Applies [`crate::handlers::admin_role::unattested_admin_boot_reason`]: a WARN
+/// by default, and a boot REFUSAL under the certified / asi-hard posture, the
+/// same posture test [`enforce_admin_header_trust_boot_gate`] (#3065) uses. The
+/// reason is operator log text, never caller-facing.
+///
+/// # Errors
+/// Returns the reason when the posture is engaged and an admin id is unkeyed.
+pub(crate) fn enforce_unattested_admin_boot_gate(
+    http_identity_mode: crate::config::HttpIdentityMode,
+    enrolled: &std::collections::HashMap<String, String>,
+    admin_ids: &[String],
+) -> Result<()> {
+    let Some(reason) = crate::handlers::admin_role::unattested_admin_boot_reason(
+        http_identity_mode,
+        enrolled,
+        admin_ids,
+    ) else {
+        return Ok(());
+    };
+    let posture_engaged = crate::security_profile::is_asi_hard()
+        || crate::enterprise_federation_posture::enterprise_federation_posture_required();
+    crate::handlers::admin_role::unattested_admin_boot_decision(Some(reason), posture_engaged)
+}
+
 /// Top-level CLI dispatch. Called from `main()` after `Cli::parse()`.
 ///
 /// Handles:
@@ -7462,6 +7488,15 @@ pub async fn bootstrap_serve(
         args.mtls_allowlist.as_deref(),
     )
     .await?;
+
+    // #7707 — admin elevation is key-attested once keys are enrolled; say so at
+    // boot for every allowlisted admin id that has no enrolled key (REFUSE under
+    // the certified / asi-hard posture, as #3065 does).
+    enforce_unattested_admin_boot_gate(
+        http_identity_mode,
+        enrolled_agent_keys.snapshot().as_ref(),
+        &resolve_admin_agent_ids(app_config.admin.as_ref()),
+    )?;
 
     // v1.0.0 #3418 — LIVE refresh of the per-agent api-key registry.
     //
