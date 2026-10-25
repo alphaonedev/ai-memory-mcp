@@ -802,11 +802,11 @@ else
 fi
 
 # ===========================================================================
-# SECTION G — #6383 / #6386: the opt-in per-binary Postgres isolation lane.
+# SECTION G — #6383 / #6386: the per-binary Postgres isolation lane (default on for the enterprise-fed legs).
 # The checks live in Python (review r1 L1): scripts/ci/check_pg_isolate_invariants.py,
 # unit-tested with one mutant per check in scripts/ci/tests/.
 # ===========================================================================
-if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
+if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (default-on for enterprise-fed, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then

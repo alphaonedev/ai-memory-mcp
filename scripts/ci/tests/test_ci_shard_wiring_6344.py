@@ -89,8 +89,8 @@ class ShardBudgetTests(unittest.TestCase):
     def test_shards_share_one_budget_each(self):
         body = function_body(ci_text(), 'run_shard')
         self.assertIn('remaining=$(shard_left "$t0")', body)
-        # Three shard runs (lib, binaries, doc tests) plus the opt-in isolated
-        # lane of #6386, which draws on the same shard budget.
+        # Three shard runs (lib, binaries, doc tests) plus the isolated
+        # lane of #6386 (default-on for enterprise-fed, kill switch CI_PG_ISOLATE_OFF), which draws on the same shard budget.
         self.assertEqual(body.count('WATCHDOG_SECS="$remaining"'), 4)
         self.assertIn('WATCHDOG_SECS="$remaining" run_isolated_lane', body)
 
