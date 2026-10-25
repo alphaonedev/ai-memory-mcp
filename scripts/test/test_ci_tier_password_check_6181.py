@@ -4435,6 +4435,12 @@ VIEW_SITE_MUTANTS = {
         VIEW_SITE_CALL,
         "run.observe(shape_name, %s + \"/text\", mod.job_pin_problems, wf, text1, pins[mod.SECONDARY], expect=\"fail\")"
         % VIEW_SITE_FAMILY),
+    # r27 code F3: both labels, but the loaded function runs under each of them
+    "both labels, loaded function only": (
+        VIEW_SITE_CALL,
+        "run.observe(shape_name, %s + \"/loaded\", mod.primary_pin_problems, wf, text1, pins[mod.PRIMARY], expect=\"fail\"); "
+        "run.observe(shape_name, %s + \"/text\", mod.primary_pin_problems, wf, text1, pins[mod.PRIMARY], expect=\"fail\")"
+        % (VIEW_SITE_FAMILY, VIEW_SITE_FAMILY)),
 }
 
 
@@ -4468,6 +4474,9 @@ HARNESS_MUTANTS = {
     # r26 sec F3: a note on a chain link is lost (cause, context, both)
     "notes stripped from the context chain": ("context-notes-strip", "exception-chain", "controls"),
     "notes stripped from both chain links": ("link-notes-strip", "exception-chain", "controls"),
+    # r27 code F4: a chain walk that stops after one link, and a strip of the notes two links deep
+    "chain walk stops after one link": ("one-link-walk", "exception-chain", "controls"),
+    "notes stripped two links deep": ("deep-notes-strip", "exception-chain", "controls"),
 }
 
 
@@ -4531,7 +4540,8 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         names = set(canary_controls(CanaryRun(sys.modules[__name__])))
         expected = {"print", "stderr", "log", "warning", "problem-line", "exception", "exception-chain", "exception-context"}
         if sys.version_info >= (3, 11):
-            expected.update(("exception-notes", "exception-cause-notes", "exception-context-notes"))  # r25 sec S3, r26 code C4, sec F3
+            expected.update(("exception-notes", "exception-cause-notes", "exception-context-notes",
+                             "exception-cause-cause-notes", "exception-context-context-notes"))  # r25 sec S3, r26 code C4, sec F3, r27 code F4
         self.assertEqual(names, expected)
 
     def test_each_harness_mutant_is_red(self):
@@ -4539,8 +4549,8 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         test_source = THIS_PATH.read_text(encoding="utf-8")
         for name, (kind, what, check) in HARNESS_MUTANTS.items():
             with self.subTest(mutant=name):
-                if kind in ("chain-str", "notes-strip", "cause-notes-strip", "context-notes-strip", "link-notes-strip") \
-                        and sys.version_info < (3, 11):
+                if kind in ("chain-str", "notes-strip", "cause-notes-strip", "context-notes-strip", "link-notes-strip",
+                            "one-link-walk", "deep-notes-strip") and sys.version_info < (3, 11):
                     continue  # exception notes exist from Python 3.11; the control is registered from there too
                 variant = load_variant(ty_source, harness_mutant_source(test_source, kind, what))
                 if check == "controls":
@@ -5470,6 +5480,271 @@ class TestNotesOnEveryChainLinkAreCaptured8187R26(unittest.TestCase):
             with self.subTest(kind=kind):
                 variant = load_variant(ty_source, harness_mutant_source(test_source, kind, "exception-chain"))
                 self.assertEqual(sorted(canary_control_failures(variant)), controls)
+
+
+# ---- r27 sec F1-F2 / code F1-F5 (sec r26, code r26): the two gates are POSITIVE enumerations ----
+# Every shape below is a call that carries a loaded value out of the test, or a path to the raw text of an ``Opaque``.  The r26
+# gates refused listed shapes and the reviewers added 25 passing shapes to lists that were already extended twice; the r27
+# gates accept a short named set and refuse the rest, so these rows are the proof, not the definition.
+TAINT_R27_HEAD = TAINT_R26_SEC_HEAD
+TAINT_R27_SHAPES = {
+    # security r26 reviewer-own shapes (verbatim, 23)
+    "sec own os.writev": TAINT_R27_HEAD + "        os.writev(2, [body.encode()])\n",
+    "sec own print(*parts, file=sys.stderr)": TAINT_R27_HEAD + "        parts = [body]\n        print(*parts, file=sys.stderr)\n",
+    "sec own LoggerAdapter inline .warning":
+        TAINT_R27_HEAD + "        logging.LoggerAdapter(logging.getLogger('x'), {}).warning(body)\n",
+    "sec own LoggerAdapter var .log":
+        TAINT_R27_HEAD + "        ad = logging.LoggerAdapter(logging.getLogger('x'), {})\n        ad.log(30, body)\n",
+    "sec own codecs.getwriter(...).write":
+        TAINT_R27_HEAD + "        import codecs\n        codecs.getwriter('utf-8')(sys.stdout.buffer).write(body)\n",
+    "sec own __import__('builtins').print": TAINT_R27_HEAD + "        __import__('builtins').print(body)\n",
+    "sec own getattr(sys.stdout, 'write')(text)": TAINT_R27_HEAD + "        getattr(sys.stdout, 'write')(body)\n",
+    "sec own logger .fatal": TAINT_R27_HEAD + "        logging.getLogger('x').fatal(body)\n",
+    "sec own logging.root.warning": TAINT_R27_HEAD + "        logging.root.warning(body)\n",
+    "sec own pprint.pp": TAINT_R27_HEAD + "        pprint.pp(body)\n",
+    "sec own sys.displayhook": TAINT_R27_HEAD + "        sys.displayhook(body)\n",
+    "sec own json.dump to stdout": TAINT_R27_HEAD + "        import json\n        json.dump(body, sys.stdout)\n",
+    "sec own subprocess echo argv": TAINT_R27_HEAD + "        import subprocess\n        subprocess.run(['echo', body])\n",
+    "sec own os.system": TAINT_R27_HEAD + "        os.system('echo ' + body)\n",
+    "sec own shutil.copyfileobj to stdout":
+        TAINT_R27_HEAD + "        import io, shutil\n        shutil.copyfileobj(io.StringIO(body), sys.stdout)\n",
+    "sec own atexit.register(print, text)": TAINT_R27_HEAD + "        import atexit\n        atexit.register(print, body)\n",
+    "sec own map(print, [text])": TAINT_R27_HEAD + "        list(map(print, [body]))\n",
+    "sec own Thread(target=print, args=(text,))":
+        TAINT_R27_HEAD + "        import threading\n        threading.Thread(target=print, args=(body,)).start()\n",
+    "sec own exec print": TAINT_R27_HEAD + "        exec('print(b)', {'b': body})\n",
+    "sec own alias of print": TAINT_R27_HEAD + "        out = print\n        out(body)\n",
+    "sec own handle(makeLogRecord)":
+        TAINT_R27_HEAD + "        logging.getLogger().handle(logging.makeLogRecord({'msg': body}))\n",
+    "sec own ExceptionGroup raise": TAINT_R27_HEAD + "        raise ExceptionGroup('g', [ValueError(body)])\n",
+    "sec own addCleanup(print, text)": TAINT_R27_HEAD + "        self.addCleanup(print, body)\n",
+    # code r26 reviewer-own shapes that the security corpus does not hold
+    "code own sys.__stdout__.write": TAINT_R27_HEAD + "        sys.__stdout__.write(body)\n",
+    "code own exec built print": TAINT_R27_HEAD + "        exec('print(' + repr(body) + ')')\n",
+    "code own Logger.handle(makeLogRecord)":
+        TAINT_R27_HEAD + "        logging.getLogger('x').handle(logging.makeLogRecord({'msg': body}))\n",
+    # r27 own shapes: output paths and indirect invocations in neither review's corpus
+    "r27 os.execv argv": TAINT_R27_HEAD + "        os.execv('/bin/echo', ['echo', body])\n",
+    "r27 os.popen": TAINT_R27_HEAD + "        os.popen('echo ' + body).read()\n",
+    "r27 builtins.print": TAINT_R27_HEAD + "        import builtins\n        builtins.print(body)\n",
+    "r27 os.pwrite": TAINT_R27_HEAD + "        os.pwrite(2, body.encode(), 0)\n",
+    "r27 socket.sendall": TAINT_R27_HEAD + "        import socket\n        socket.socket().sendall(body.encode())\n",
+    "r27 ctypes puts": TAINT_R27_HEAD + "        import ctypes\n        ctypes.CDLL(None).puts(body.encode())\n",
+    "r27 pdb.set_trace(header=)": TAINT_R27_HEAD + "        import pdb\n        pdb.set_trace(header=body)\n",
+    "r27 operator.call(print, text)": TAINT_R27_HEAD + "        import operator\n        operator.call(print, body)\n",
+    "r27 executor.submit(print, text)":
+        TAINT_R27_HEAD + "        import concurrent.futures as cf\n        cf.ThreadPoolExecutor().submit(print, body)\n",
+    "r27 Process(target=print, args=)":
+        TAINT_R27_HEAD + "        import multiprocessing\n        multiprocessing.Process(target=print, args=(body,)).start()\n",
+    "r27 reduce(print, [text])": TAINT_R27_HEAD + "        functools.reduce(print, [body])\n",
+    "r27 decorator from text": TAINT_R27_HEAD + "        deco = lambda f: print(body)\n        @deco\n        def g():\n            pass\n",
+    "r27 sorted key=print": TAINT_R27_HEAD + "        sorted([body, body], key=print)\n",
+    "r27 sorted key=lambda printing": TAINT_R27_HEAD + "        sorted(body.split(), key=lambda p: print(p))\n",
+    "r27 max key=stream write": TAINT_R27_HEAD + "        max(body, key=sys.stdout.write)\n",
+}
+TAINT_R27_CLEAN = {
+    "count printed": TAINT_R27_HEAD + "        n = len(body)\n        print('count', n)\n",
+    "split then length": TAINT_R27_HEAD + "        parts = body.split()\n        self.assertEqual(len(parts), 3)\n",
+    "membership flag": TAINT_R27_HEAD + "        ok = isinstance(body, dict) and 'k' in body\n        self.assertTrue(ok)\n",
+    "sorted then length": TAINT_R27_HEAD + "        names = sorted(body)\n        self.assertEqual(len(names), 2)\n",
+    "sorted key=len": TAINT_R27_HEAD + "        names = sorted(body, key=len)\n        self.assertEqual(len(names), 2)\n",
+    "max key=lambda len": TAINT_R27_HEAD + "        top = max(body, key=lambda v: len(v))\n        self.assertEqual(len(top), 2)\n",
+    "json.dumps then length": TAINT_R27_HEAD + "        import json\n        blob = json.dumps(body, sort_keys=True)\n        self.assertEqual(len(blob), 10)\n",
+    "dict copy flag": TAINT_R27_HEAD + "        copy = dict(body)\n        self.assertIs(bool(copy), True)\n",
+    "constant output": TAINT_R27_HEAD + "        sys.stdout.write('ok')\n        logging.getLogger('x').warning('ok')\n",
+}
+# the callees the scan accepts for a tainted argument, receiver or callee (``TAINT_ACCEPTED_CALLEES``); none of them writes
+TAINT_R27_NEVER_ACCEPTED = (
+    "print", "write", "writelines", "dump", "log", "warn", "exit", "map", "filter", "reduce", "submit", "register", "exec", "eval",
+    "compile", "open", "system", "run", "Popen", "partial", "getattr", "setattr", "call", "start", "format_exc", "excepthook",
+    "fail", "subTest", "addCleanup", "assertEqual", "assertTrue", "debug", "info", "warning", "error", "critical", "exception")
+# r26 lists the r27 scan no longer holds: an output path is refused because it is not accepted, not because it is named
+TAINT_R27_REMOVED_LISTS = ("ECHO_CALLS", "PRINT_CALLS", "LOG_BASES", "LOG_METHODS", "SINK_ATTRS")
+
+# the 8 access paths of the security r26 review's ``OWN_GATE`` (executed and static) and the 7 of the code r26 review that passed
+OPAQUE_R27_SNIPPETS = {
+    "sec own pickle reduce of w": "import pickle\nx = pickle.loads(pickle.dumps(w))\n",
+    "sec own reduce(getattr, [joined name], w)()":
+        "import functools\nx = functools.reduce(getattr, [''.join(['r', 'aw'])], w)()\n",
+    "sec own map(getattr, [w], [joined])": "x = [m() for m in map(getattr, [w], [''.join(['r', 'aw'])])]\n",
+    "sec own eval of a built expression": "x = eval('w.r' + 'aw()')\n",
+    "sec own exec of a built statement": "exec('y = w.r' + 'aw()', g)\n",
+    "sec own __import__('gc').get_objects walk":
+        "x = [d for d in __import__('gc').get_objects() if isinstance(d, dict) and id(w) in d]\n",
+    "sec own __import__('operator').methodcaller": "x = __import__('operator').methodcaller(''.join(['r', 'aw']))(w)\n",
+    "sec own vars passed as a value": "f = vars\nx = f(m)\n",
+    "code own eval built unwrap": "x = eval('w.r' + 'aw()')\n",
+    "code own exec built registry": "exec('x = ty._' + 'RA' + 'W')\n",
+    "code own reduce(getattr, ['raw'], w)()": "import functools\nx = functools.reduce(getattr, ['raw'], w)()\n",
+    "code own map(getattr, [w], ['raw'])": "x = list(map(getattr, [w], ['raw']))[0]()\n",
+    "code own match class pattern raw=": "match w:\n    case ty.Opaque(raw=m):\n        x = m()\n",
+    "code own traceback frame f_globals walk": (
+        "try:\n    ty.digest(object())\nexcept Exception as exc:\n    tb = exc.__traceback__\n    while tb.tb_next:\n"
+        "        tb = tb.tb_next\n    x = [v for v in tb.tb_frame.f_back.f_globals.values() if isinstance(v, dict)]\n"),
+    "code own generator gi_frame f_globals": "g = (i for i in [])\nx = g.gi_frame.f_globals\n",
+    # r27 own paths, in neither corpus
+    "r27 compile of a built expression": "code_obj = compile('w.r' + 'aw()', 'x', 'eval')\n",
+    "r27 partial(getattr, w)(joined name)": "import functools\nx = functools.partial(getattr, w)(''.join(['r', 'aw']))()\n",
+    "r27 getattr passed to a lambda": "x = (lambda g: g(w, ''.join(['r', 'aw'])))(getattr)()\n",
+    "r27 dir mapped": "x = list(map(dir, [m]))\n",
+    "r27 str.format attribute field on the module": "x = '{0._R' + 'AW}'.format(m)\nz = '{0._RAW}'.format(m)\n",
+    "r27 str.format attribute field on the wrapper": "x = '{0.raw}'.format(w)\n",
+    "r27 importlib.import_module": "import importlib\nx = importlib.import_module('gc')\n",
+    "r27 sys.modules read of another module": "import sys\nx = sys.modules['gc']\n",
+}
+# the 14 snippets above that the r26 gates passed: each is named and refused on its own
+OPAQUE_R27_PASSED_AT_R26 = (
+    "sec own pickle reduce of w", "sec own reduce(getattr, [joined name], w)()", "sec own map(getattr, [w], [joined])",
+    "sec own eval of a built expression", "sec own exec of a built statement", "sec own __import__('gc').get_objects walk",
+    "sec own __import__('operator').methodcaller", "sec own vars passed as a value", "code own eval built unwrap",
+    "code own exec built registry", "code own reduce(getattr, ['raw'], w)()", "code own map(getattr, [w], ['raw'])",
+    "code own match class pattern raw=", "code own traceback frame f_globals walk", "code own generator gi_frame f_globals")
+OPAQUE_R27_ACCEPTED = {
+    "direct getattr with a constant public name": "x = getattr(w, 'label', None)\ny = hasattr(ty, 'Opaque')\n",
+    "public names of the module": "x = ty.parse_workflow(text)\ny = ty.Opaque(text, 'key[0]')\nz = ty.__file__\n",
+    "this module by name": "import sys\nm = sys.modules[__name__]\n",
+    "stdlib imports": "import json, re, weakref\nfrom pathlib import Path\nx = json.dumps({})\n",
+    "exception chain": "try:\n    pass\nexcept ValueError as exc:\n    x = exc.__cause__, exc.__context__, exc.__traceback__\n",
+    "plain format templates": "x = '{}: {}'.format(1, 2)\ny = '{0} {name}'.format(1, name=2)\n",
+    "names that only look like the refused ones": "evaluate = 1\nexecuted = [evaluate]\ncompiled_count = len(executed)\n",
+    "traceback module": "import traceback\nx = traceback.format_exc()\n",
+}
+# the names the opaque gate refuses as a value or as anything but a direct call, and the attributes it refuses everywhere
+OPAQUE_R27_REFUSED_CALLEES = ("eval", "exec", "compile", "__import__", "getattr", "hasattr", "setattr", "delattr", "vars", "globals",
+                              "locals", "dir")
+
+
+class TestTaintScanIsAPositiveEnumeration8187R27(unittest.TestCase):
+    """r27 sec F1, code F1 (sec r26 finding 1, code r26 finding 1): a call that receives a loaded value is flagged unless its
+    callee is on the named accepted set.  The 23 security, 3 code and 15 own shapes are flagged; the lists of refused output
+    calls of r26 are gone; the clean controls (including the accepted callees) stay clean."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R27_SHAPES), 41)
+        self.assertEqual(len([n for n in TAINT_R27_SHAPES if n.startswith("sec own")]), 23)
+        self.assertEqual(len([n for n in TAINT_R27_SHAPES if n.startswith("code own")]), 3)
+        self.assertEqual(len([n for n in TAINT_R27_SHAPES if n.startswith("r27")]), 15)
+        self.assertEqual(len(TAINT_R27_CLEAN), 9)
+
+    def test_every_shape_is_flagged(self):
+        survivors = []
+        for name, source in TAINT_R27_SHAPES.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(source):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, source in TAINT_R27_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(tainted_assert_lines(source), [])
+
+    def test_the_accepted_callees_are_a_short_sorted_named_constant(self):
+        accepted = getattr(sys.modules[__name__], "TAINT_ACCEPTED_CALLEES", None)
+        self.assertIsInstance(accepted, frozenset)
+        self.assertGreater(len(accepted), 0)
+        self.assertLessEqual(len(accepted), 80)
+        self.assertEqual(sorted(accepted & set(TAINT_R27_NEVER_ACCEPTED)), [])
+        self.assertTrue(all(name.isidentifier() for name in accepted))
+        self.assertEqual(sorted(TAINT_ACCEPTED_CALLEES), sorted(set(TAINT_ACCEPTED_CALLEES)))
+
+    def test_the_lists_of_refused_output_calls_are_gone(self):
+        present = [name for name in TAINT_R27_REMOVED_LISTS if hasattr(sys.modules[__name__], name)]
+        self.assertEqual(present, [])
+
+    def test_both_shipped_files_have_no_tainted_line(self):
+        for path in (TY_PATH, THIS_PATH):
+            with self.subTest(file=path.name):
+                self.assertEqual(tainted_assert_lines(path.read_text(encoding="utf-8")), [])
+
+
+class TestOpaqueGateAcceptsOnlyNamedPaths8187R27(unittest.TestCase):
+    """r27 sec F2, code F2 (sec r26 finding 2, code r26 finding 2): ``eval``, ``exec``, ``compile`` and ``__import__`` are
+    refused anywhere, ``getattr``/``vars``/``globals``/``locals``/``dir`` only as the callee of a direct call with a constant
+    public name, frame and traceback attributes and a ``raw=`` class pattern are refused, and a format template that reaches an
+    attribute is refused.  The 15 snippets the r26 gates passed are named; the accepted forms stay clean."""
+
+    def test_the_tables_hold_the_counted_snippets(self):
+        self.assertEqual(len(OPAQUE_R27_SNIPPETS), 23)
+        self.assertEqual(len(OPAQUE_R27_PASSED_AT_R26), 15)
+        self.assertEqual(sorted(set(OPAQUE_R27_PASSED_AT_R26) - set(OPAQUE_R27_SNIPPETS)), [])
+        self.assertGreaterEqual(len([n for n in OPAQUE_R27_SNIPPETS if n.startswith("r27")]), 4)
+
+    def test_every_snippet_is_refused(self):
+        survivors = []
+        for name, source in OPAQUE_R27_SNIPPETS.items():
+            with self.subTest(snippet=name):
+                if not opaque_refusals(source):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_previously_passing_snippet_is_refused_on_its_own(self):
+        for name in OPAQUE_R27_PASSED_AT_R26:
+            with self.subTest(snippet=name):
+                self.assertGreater(len(opaque_refusals(OPAQUE_R27_SNIPPETS[name])), 0)
+
+    def test_the_accepted_forms_are_not_refused(self):
+        for table in (OPAQUE_R27_ACCEPTED, OPAQUE_R26_ACCEPTED):
+            for name, source in table.items():
+                with self.subTest(path=name):
+                    self.assertEqual(opaque_refusals(source), [])
+
+    def test_each_reflection_name_is_refused_as_a_value_and_as_a_non_constant_call(self):
+        for name in OPAQUE_R27_REFUSED_CALLEES:
+            with self.subTest(name=name):
+                self.assertGreater(len(opaque_refusals("f = %s\n" % name)), 0)
+                self.assertGreater(len(opaque_refusals("x = %s(ty, n)\n" % name)), 0)
+
+    def test_both_shipped_files_pass_the_enumerating_gates(self):
+        for path in (TY_PATH, THIS_PATH):
+            with self.subTest(file=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertEqual(opaque_escape_lines(source, allowed=OPAQUE_GATE_ALLOWED), [])
+                allowed = ("same", "__eq__", "__hash__") if path == TY_PATH else ()
+                self.assertEqual(raw_unwrap_lines(source, allowed=allowed), [])
+
+
+class TestTheViewComesFromTheExecutedFunction8187R27(unittest.TestCase):
+    """r27 code F3 (code r26 finding 3): ``observe`` keys the view on the function it ran, not on the label it was given, so a
+    mutant that gives both labels to the loaded function is red and names the text view."""
+
+    def test_the_both_labels_mutant_is_in_the_view_table_and_the_harness_table(self):
+        self.assertIn("both labels, loaded function only", VIEW_SITE_MUTANTS)
+        self.assertIn("view dropped: both labels, loaded function only", HARNESS_MUTANTS)
+
+    def test_the_view_of_a_call_is_the_view_of_its_function(self):
+        for label, function, view in (("x/loaded", job_pin_problems, "text"), ("x/text", primary_pin_problems, "loaded")):
+            with self.subTest(label=label):
+                run = CanaryRun(sys.modules[__name__])
+                run.observe("plain", label, function, "ci.yml", "", {}, expect="fail")
+                self.assertEqual(sorted(run.fail_views), [("plain", view)])
+
+
+class TestNotesTwoLinksDeepAreCaptured8187R27(unittest.TestCase):
+    """r27 code F4 (code r26 finding 4): a note on the cause of the cause and a note on the context of the context each have a
+    seeded control, and a chain walk that stops after one link and a notes strip that reaches only the second link are red."""
+
+    DEEP = ["exception-cause-cause-notes", "exception-context-context-notes"]
+
+    @unittest.skipIf(sys.version_info < (3, 11), "exception notes exist from Python 3.11")
+    def test_both_two_deep_controls_exist_and_are_live(self):
+        names = set(canary_controls(CanaryRun(sys.modules[__name__])))
+        for name in self.DEEP:
+            self.assertIn(name, names)
+        self.assertEqual(canary_control_failures(sys.modules[__name__]), [])
+
+    @unittest.skipIf(sys.version_info < (3, 11), "exception notes exist from Python 3.11")
+    def test_a_one_link_walk_and_a_depth_two_strip_are_red_for_the_two_deep_controls_only(self):
+        ty_source = TY_PATH.read_text(encoding="utf-8")
+        test_source = THIS_PATH.read_text(encoding="utf-8")
+        for kind in ("one-link-walk", "deep-notes-strip"):
+            with self.subTest(kind=kind):
+                variant = load_variant(ty_source, harness_mutant_source(test_source, kind, "exception-chain"))
+                self.assertEqual(sorted(canary_control_failures(variant)), self.DEEP)
+
+    def test_the_two_mutants_are_in_the_harness_table(self):
+        self.assertIn("chain walk stops after one link", HARNESS_MUTANTS)
+        self.assertIn("notes stripped two links deep", HARNESS_MUTANTS)
 
 
 if __name__ == "__main__":
