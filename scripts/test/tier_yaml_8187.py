@@ -19,7 +19,16 @@ or id and the first differing key path, as labels only (r23: nothing is masked a
 Echo class closed by construction (r23, 3-agent vote (6def5ab6)): the checker NEVER emits author- or pin-derived text.  Every
 name that reaches a message goes through ``Opaque`` (see the class), whose ``str``, ``repr``, ``format`` and ``bytes`` are
 the positional label and the length only; the raw text is reachable only through ``raw()``, which comparison helpers alone
-call.  There is no deny-list predicate: a deny-list fails open on every shape nobody listed.
+call, and is held in a module-private registry keyed by ``id(wrapper)``, not in an attribute (r24).  There is no deny-list
+predicate: a deny-list fails open on every shape nobody listed.
+
+The one exception is a file name: ``repo_problems`` builds its messages from plain file paths (``<name>: does not load ...``,
+``<name>: names the tier secret but no pin covers it``).  A workflow file name is settled public: it is a repository path,
+visible in the PR body (row 26) and in Rounds 20 and 21, and it is never read from a workflow's content.  Nothing read FROM a
+file is printed.
+
+The loaders never re-raise a parser error: ``load_strict`` and ``load_lenient`` raise ``StrictYamlError`` carrying the error
+class and the line only, from outside the handler, so no ``__cause__`` or ``__context__`` holds a source fragment (r24).
 
 ``import yaml`` failing is an error, never a skip: the message names ``scripts/test/requirements-ci.txt``.
 """
@@ -27,6 +36,7 @@ call.  There is no deny-list predicate: a deny-list fails open on every shape no
 import hashlib
 import json
 import re
+import weakref
 
 try:
     import yaml
@@ -117,34 +127,44 @@ class StrictLoader(BASE_LOADER):
         return mapping
 
 
+_RAW = {}  # id(wrapper) -> the raw value: module-private, so no attribute of a wrapper holds the text (r24 code F42b)
+
+
 class Opaque:
     """An author- or pin-derived value that can never be printed (r23, 3-agent vote (6def5ab6), fail closed).
 
     ``str``, ``repr``, ``format`` and ``bytes`` return ONLY the positional label (``job[3]``, ``step[0]``, ``key[2]``,
     ``pin[1]``) and the length (``len=N``): any f-string, ``%``, ``.format``, ``print``, logging call, exception text or
-    assertion message that receives the wrapper prints that, by construction.  The raw text is reachable through ``raw()``
-    only, and ``raw()`` is called only inside comparison helpers that return a bool and never build a message
-    (``__eq__``, ``same``).  ``__eq__`` and ``__hash__`` compare the raw text; the label is a fixed positional string, so a
-    label-shaped author name prints as its own label and cannot be told from one (the intended result).  The length is the
-    only property of the text that is shown: a hash prefix of a low-entropy credential is an offline-guess oracle."""
+    assertion message that receives the wrapper prints that, by construction.
 
-    __slots__ = ("_raw", "_label")
+    The raw text lives in the module-private registry ``_RAW``, keyed by ``id(self)`` and dropped by ``weakref.finalize``
+    when the wrapper dies (r24 code F42b: a slot or a ``__dict__`` entry is one ``getattr`` from a message; the slot read,
+    ``object.__getstate__`` and ``json.dumps(default=...)`` each returned it).  The instance holds the label, the length and
+    ``__weakref__`` only; ``__getstate__`` returns the label-only string and ``__reduce__`` the label.  ``raw()`` is called
+    only inside comparison helpers that return a bool and never build a message (``__eq__``, ``same``).  ``__eq__`` and
+    ``__hash__`` compare the raw text; the label is a fixed positional string, so a label-shaped author name prints as its
+    own label and cannot be told from one (the intended result).  The length is the only property of the text that is
+    shown: a hash prefix of a low-entropy credential is an offline-guess oracle."""
+
+    __slots__ = ("_label", "_n", "__weakref__")
 
     def __init__(self, raw, label):
         if not isinstance(label, str) or not _LABEL.fullmatch(label):
             raise ValueError("an Opaque label is a positional label")
-        self._raw = raw
+        try:
+            size = len(raw)
+        except Exception:  # noqa: BLE001  (a value without a usable length is length 0; nothing it raises is printed)
+            size = 0
         self._label = label
+        self._n = size if isinstance(size, int) else 0
+        _RAW[id(self)] = raw
+        weakref.finalize(self, _RAW.pop, id(self), None)
 
     def raw(self):
-        return self._raw
+        return _RAW.get(id(self))
 
     def _shown(self):
-        try:
-            size = len(self._raw)
-        except TypeError:
-            size = 0
-        return "%s len=%d" % (self._label, size)
+        return "%s len=%d" % (self._label, self._n)
 
     def __str__(self):
         return self._shown()
@@ -160,14 +180,17 @@ class Opaque:
 
     def __eq__(self, other):
         if isinstance(other, Opaque):
-            return bool(self._raw == other._raw)
+            return bool(self.raw() == other.raw())
         return NotImplemented
 
     def __hash__(self):
         try:
-            return hash(self._raw)
+            return hash(self.raw())
         except TypeError:
             return 0
+
+    def __getstate__(self):
+        return self._shown()
 
     def __reduce__(self):
         return (Opaque, ("", self._label))
@@ -222,25 +245,42 @@ def load_failure(exc):
 
 
 def load_strict(text):
-    """The document of ``text`` through ``StrictLoader``; raises ``StrictYamlError`` or ``yaml.YAMLError``."""
-    refuse_anchors(text)
-    loader = StrictLoader(text)
+    """The document of ``text`` through ``StrictLoader``; raises ``StrictYamlError`` only.
+
+    A parser error is not re-raised (r24 sec F4): its message carries the source line around the fault, and so does a
+    chained ``__cause__`` or ``__context__``, so a tag or an escape in an author's workflow would reach pytest's output
+    through any uncaught call.  The failure is read inside the handler (class and line only, ``load_failure``) and the new
+    error is raised OUTSIDE it, with nothing chained."""
+    failure = None
+    loader = None
     try:
+        refuse_anchors(text)  # its scan can fail on a malformed document too
+        loader = StrictLoader(text)
         return loader.get_single_data()
+    except yaml.YAMLError as exc:  # a StrictYamlError is a ValueError, not a YAMLError: it passes through with its own text
+        failure = load_failure(exc)
     finally:
-        loader.dispose()
+        if loader is not None:
+            loader.dispose()
+    raise StrictYamlError(failure)
 
 
 def load_lenient(text):
-    """The document through the plain safe loader (anchors expanded): for files outside the pinned set."""
-    return yaml.load(text, Loader=yaml.SafeLoader)
+    """The document through the plain safe loader (anchors expanded): for files outside the pinned set; raises
+    ``StrictYamlError`` (class and line only, nothing chained) for a document it cannot read (r24 sec F4)."""
+    failure = None
+    try:
+        return yaml.load(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError as exc:
+        failure = load_failure(exc)
+    raise StrictYamlError(failure)
 
 
 def parse_workflow(text):
     """``(data, problems)`` of a tier workflow: strict load, a mapping, top-level keys in the closed set, ``jobs`` set."""
     try:
         data = load_strict(text)
-    except (StrictYamlError, yaml.YAMLError) as exc:
+    except StrictYamlError as exc:
         return None, ["the workflow does not load strictly: " + load_failure(exc)]
     if not isinstance(data, dict):
         return None, ["the workflow is not a mapping"]

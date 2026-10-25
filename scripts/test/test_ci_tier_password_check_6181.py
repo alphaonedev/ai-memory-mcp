@@ -302,7 +302,7 @@ def sub_once(text, old, new):
 def assert_same(case, left, right, label):
     """Compare two raw workflow or pin values and report only ``label`` (F40-a): ``assertEqual`` prints both operands when
     it fails, and an operand taken from an author's workflow or from the pin data may hold a credential fragment."""
-    case.assertTrue(left == right, "differs: " + label)
+    case.assertEqual(ty.opaque(left, "key[0]"), ty.opaque(right, "key[0]"), "differs: " + label)
 
 
 def job_re(name):
@@ -332,12 +332,12 @@ def any_match(problems, *patterns):
 
 def assert_has(case, member, container, label):
     """``member in container`` for raw workflow data, reporting only ``label`` (F40-a)."""
-    case.assertTrue(member in container, "missing: " + label)
+    case.assertIs(member in container, True, "missing: " + label)
 
 
 class TestTierPasswordWiring6181(unittest.TestCase):
     def test_the_wiring_is_pinned(self):
-        self.assertTrue((wiring_problems(CI_YML.read_text(encoding="utf-8")) == []))
+        self.assertEqual(len(wiring_problems(CI_YML.read_text(encoding="utf-8"))), 0)
 
     def test_the_wiring_check_rejects_each_mutant(self):
         text = CI_YML.read_text(encoding="utf-8")
@@ -377,7 +377,7 @@ class TestTierPasswordWiring6181(unittest.TestCase):
 
     def test_no_credential_reaches_argv_or_a_shell_variable_6172(self):
         text = CI_YML.read_text(encoding="utf-8")
-        self.assertTrue((argv_problems(text) == []))
+        self.assertEqual(len(argv_problems(text)), 0)
         mutants = {
             "psql with a URL variable": (RUN + " -- psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE",
                                          'psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE'),
@@ -398,7 +398,7 @@ class TestTierPasswordWiring6181(unittest.TestCase):
 
     def test_every_line_that_uses_the_url_is_reviewed_6672(self):
         text = CI_YML.read_text(encoding="utf-8")
-        self.assertTrue((url_leaks(text) == []))
+        self.assertEqual(len(url_leaks(text)), 0)
         anchor = 'echo "::notice::[enterprise-fed] created'
         extra = {
             "printf of the file": 'printf "%s\\n" "$(cat "$url_file")"',
@@ -429,7 +429,7 @@ class TestTierPasswordWiring6181(unittest.TestCase):
         # keeps the allowlist from going stale: each reviewed line still exists in one of the two steps
         configure, cleanup = steps(CI_YML.read_text(encoding="utf-8"))
         present = {ln.strip() for ln in configure + cleanup}
-        self.assertTrue((sorted(URL_LINES - present) == []))
+        self.assertEqual(len(sorted(URL_LINES - present)), 0)
 
 
 WORKFLOWS = ROOT / ".github/workflows"
@@ -610,7 +610,7 @@ def names_the_tier(text):
         return True
     try:
         data = ty.load_lenient(text)
-    except ty.yaml.YAMLError:
+    except ty.StrictYamlError:
         return False
     return data is not None and ty.matches_markers(data)
 
@@ -1051,8 +1051,8 @@ def repo_problems(root=None, pins=None):
             found.append(f"{name}: names the tier secret but no pin covers it")
         try:
             data = ty.load_lenient(raw)
-        except ty.yaml.YAMLError as exc:
-            found.append(f"{name}: the workflow does not load ({type(exc).__name__}); an unparsable workflow is refused")
+        except ty.StrictYamlError as exc:
+            found.append(f"{name}: the workflow does not load ({ty.load_failure(exc)}); an unparsable workflow is refused")
             continue
         jobs = data.get("jobs") if isinstance(data, dict) else None
         if not isinstance(jobs, dict):
@@ -1080,7 +1080,7 @@ def repo_problems(root=None, pins=None):
             continue
         try:
             found += ty.stale_row_problems(workflow, ty.load_lenient(target.read_text(encoding="utf-8")))
-        except ty.yaml.YAMLError:
+        except ty.StrictYamlError:
             pass  # reported above as an unparsable workflow
     actions = root / ".github" / "actions"
     for path in sorted([*actions.rglob("action.yml"), *actions.rglob("action.yaml")]) if actions.is_dir() else []:
@@ -1147,26 +1147,25 @@ DUMP_MUTANTS = {
 class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
     def test_no_workflow_that_names_the_tier_secret_escapes_the_pins(self):
         covered = {"ci.yml", *SHARED_TIER, *LOCAL_ONLY}
-        self.assertTrue(sorted(set(tier_workflows()) - covered) == [],
-                        "a workflow names the tier secret but no pin covers it: route it through tier_credential.py")
-        self.assertTrue((sorted(covered - set(tier_workflows())) == []), "a covered workflow no longer names the tier")
+        self.assertEqual(len(sorted(set(tier_workflows()) - covered)), 0, "a workflow names the tier secret but no pin covers it: route it through tier_credential.py")
+        self.assertEqual(len(sorted(covered - set(tier_workflows()))), 0, "a covered workflow no longer names the tier")
 
     def test_the_shared_tier_workflows_never_put_the_url_on_argv_or_in_github_env(self):
         for name in SHARED_TIER:
             with self.subTest(workflow=name):
-                self.assertTrue((workflow_problems((WORKFLOWS / name).read_text(encoding="utf-8")) == []))
+                self.assertEqual(len(workflow_problems((WORKFLOWS / name).read_text(encoding="utf-8"))), 0)
 
     def test_the_local_only_workflows_hold_no_tier_url(self):
         for name, literal in LOCAL_ONLY.items():
             text = (WORKFLOWS / name).read_text(encoding="utf-8")
-            self.assertTrue(("ai-memory-ci-fed-url" not in text))
+            self.assertIs("ai-memory-ci-fed-url" not in text, True)
             for line in code_lines(text):
                 if TIER_MARKERS.search(line):
-                    self.assertTrue((literal in line), "only a literal throwaway local database may name the variable")
+                    self.assertIs(literal in line, True, "only a literal throwaway local database may name the variable")
 
     def test_each_mutant_of_a_shared_workflow_is_caught(self):
         text = (WORKFLOWS / "cert-postgres-age.yml").read_text(encoding="utf-8")
-        self.assertTrue((workflow_problems(text) == []))
+        self.assertEqual(len(workflow_problems(text)), 0)
         run = "python3 -I " + HELPER + ' run --url-file "$url_file" --database "$CI_FED_DB" -- psql'
         mutants = {
             "psql on argv": text.replace(run + " -v ON_ERROR_STOP=1 -tAc", 'psql "$AI_MEMORY_TEST_POSTGRES_URL" -tAc', 1),
@@ -1178,7 +1177,7 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
         }
         for name, edited in mutants.items():
             with self.subTest(mutant=name):
-                self.assertTrue((edited != text), "the mutation did not apply")
+                self.assertIs(edited != text, True, "the mutation did not apply")
                 self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
 
     def test_the_allowlist_catches_the_round_2_bypasses_8187(self):
@@ -1199,7 +1198,7 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
         for name, add in mutants.items():
             with self.subTest(mutant=name):
                 edited = text.replace(anchor, add + "\n" + anchor, 1)
-                self.assertTrue((edited != text), "the mutation did not apply")
+                self.assertIs(edited != text, True, "the mutation did not apply")
                 self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
 
     def test_message_echo_check_is_linear_on_pathological_input_8187(self):
@@ -1241,7 +1240,7 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
         for name, add in mutants.items():
             with self.subTest(mutant=name):
                 edited = text.replace(anchor, add + "\n" + anchor, 1)
-                self.assertTrue((edited != text), "the mutation did not apply")
+                self.assertIs(edited != text, True, "the mutation did not apply")
                 self.assertTrue(workflow_problems(edited), f"mutant not caught: {name}")
 
     def test_environment_dumps_are_rejected_in_every_shared_workflow_8187(self):
@@ -1252,13 +1251,13 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
                  "bare env": "env", "export -p": "export -p"}
         for name in SHARED_TIER:
             text = (WORKFLOWS / name).read_text(encoding="utf-8")
-            self.assertTrue((workflow_problems(text) == []))
+            self.assertEqual(len(workflow_problems(text)), 0)
             for label, line in extra.items():
                 with self.subTest(workflow=name, mutant=label):
                     edited = text.replace(anchor, "          " + line + "\n" + anchor, 1)
                     if edited == text:
                         edited = text.replace("      - name:", "      - run: " + line + "\n      - name:", 1)
-                    self.assertTrue((edited != text), "the mutation did not apply")
+                    self.assertIs(edited != text, True, "the mutation did not apply")
                     self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
 
     def test_environment_dump_forms_are_all_rejected_8187(self):
@@ -1274,15 +1273,15 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
                 text = (WORKFLOWS / name).read_text(encoding="utf-8")
                 with self.subTest(workflow=name, mutant=label):
                     edited = text.replace(anchor, "          " + line + "\n" + anchor, 1)
-                    self.assertTrue((edited != text), "the mutation did not apply")
+                    self.assertIs(edited != text, True, "the mutation did not apply")
                     self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
                 with self.subTest(workflow=name, mutant=label, form="one-line step"):
                     edited = text.replace("      - name:", "      - run: " + line + "\n      - name:", 1)
-                    self.assertTrue((edited != text), "the mutation did not apply")
+                    self.assertIs(edited != text, True, "the mutation did not apply")
                     self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
         for name in SHARED_TIER:
-            self.assertTrue((workflow_problems((WORKFLOWS / name).read_text(encoding="utf-8")) == []))
-        self.assertTrue((url_leaks(ci_text) == []))
+            self.assertEqual(len(workflow_problems((WORKFLOWS / name).read_text(encoding="utf-8"))), 0)
+        self.assertEqual(len(url_leaks(ci_text)), 0)
 
     def test_a_yaml_workflow_naming_the_tier_secret_is_checked_8187(self):
         scratch = ROOT / ".local-runs" / "r3"
@@ -1291,7 +1290,7 @@ class TestEveryTierWorkflowIsCovered8187(unittest.TestCase):
             directory = Path(raw)
             (directory / "scratch-tier.yaml").write_text("steps:\n  - run: cat ~/.ai-memory-ci-fed-url\n", encoding="utf-8")
             (directory / "other.yml").write_text("steps:\n  - run: echo hi\n", encoding="utf-8")
-            self.assertTrue((tier_workflows(directory) == ["scratch-tier.yaml"]))
+            self.assertIs(tier_workflows(directory) == ["scratch-tier.yaml"], True)
 
 
 # r6 F10: the reviewers' dump forms that the command-word detector passes.  Each is placed in a post-export step.
@@ -1410,7 +1409,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
     def test_the_real_workflows_match_their_pins(self):
         for wf, text in self.texts.items():
             with self.subTest(workflow=wf):
-                self.assertTrue((tier_pin_problems(wf, text, self.pins) == []))
+                self.assertEqual(len(tier_pin_problems(wf, text, self.pins)), 0)
                 self.assertTrue(self.pins[SECONDARY].get(wf, {}).get("pinned"), "no job is pinned for this workflow")
 
     def test_a_changed_line_is_never_echoed_into_a_problem_8187_f24(self):
@@ -1461,8 +1460,8 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                 for label, line in forms.items():
                     with self.subTest(workflow=wf, step=position, mutant=label):
                         edited = inject_run_line(text, step, line)
-                        self.assertTrue((edited is not None))
-                        self.assertTrue((edited != text), "the mutation did not apply")
+                        self.assertIs(edited is not None, True)
+                        self.assertIs(edited != text, True, "the mutation did not apply")
                         self.caught(wf, edited, label)
 
     def test_a_second_job_with_four_space_steps_that_exports_and_dumps_fails_8187_f11a(self):
@@ -1549,7 +1548,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
             with self.subTest(workflow=wf, edit="step reordered"):
                 a, b = steps_found[0], steps_found[1]
                 swapped = lines[:a[3]] + lines[b[3]:b[4]] + lines[a[3]:a[4]] + lines[b[4]:]
-                self.assertTrue((swapped != lines))
+                self.assertIs(swapped != lines, True)
                 self.caught(wf, "\n".join(swapped), "reordered")
             for place, step in enumerate((steps_found[0], steps_found[-1])):
                 if step[2].lstrip().startswith("- name:"):
@@ -1576,7 +1575,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                     continue
                 with self.subTest(workflow=wf, job=ty.opaque(name, "job[?]")):
                     edited = "\n".join(lines[:first + 1] + ["    # edited freely"] + lines[first + 1:])
-                    self.assertTrue((tier_pin_problems(wf, edited, self.pins) == []))
+                    self.assertEqual(len(tier_pin_problems(wf, edited, self.pins)), 0)
                     checked += 1
         self.assertGreater(checked, 0, "no job outside the tier job to edit")
 
@@ -1588,10 +1587,10 @@ class TestExportJobIsPinned8187(unittest.TestCase):
         message = "\n".join(tier_pin_problems(wf, edited, self.pins))
         index = [s[3] for s in job_steps(wf, text)].index(step[3])
         for part in (wf, "line ", f"step {index}"):
-            self.assertTrue((part in message))
+            self.assertIs(part in message, True)
         self.assertTrue(re.search(job_re(step[0]), message))
         self.assertTrue(re.search(rf"step {index} \(step\[\d+\] len=\d+\)", message))
-        self.assertTrue("printenv | base64" not in message)  # r13 F24: the changed line is never echoed
+        self.assertIs("printenv | base64" not in message, True)  # r13 F24: the changed line is never echoed
 
     def test_continuations_are_joined_before_the_environment_scan(self):
         extra = {"word split": "prin\\\ntenv | base64", "interpreter continued": "python3 -c \\\n'print(os.environ)'",
@@ -1603,7 +1602,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                 with self.subTest(workflow=name, mutant=label):
                     pad = "          "
                     edited = text.replace(anchor, pad + line.replace("\n", "\n" + pad) + "\n" + anchor, 1)
-                    self.assertTrue((edited != text))
+                    self.assertIs(edited != text, True)
                     self.assertTrue(workflow_problems(edited), f"mutant not caught: {label}")
         ci_anchor = 'echo "::notice::[enterprise-fed] created'
         ci_text = self.texts["ci.yml"]
@@ -1612,7 +1611,7 @@ class TestExportJobIsPinned8187(unittest.TestCase):
                 pad = "          "
                 edited = sub_once(ci_text, ci_anchor, pad + line.replace("\n", "\n" + pad) + "\n" + pad + ci_anchor)
                 self.assertTrue(url_leaks(edited), f"mutant not caught: {label}")
-        self.assertTrue((joined_lines(["prin\\", "  tenv x", "echo ok"]) == ["printenv x", "echo ok"]))
+        self.assertIs(joined_lines(["prin\\", "  tenv x", "echo ok"]) == ["printenv x", "echo ok"], True)
 
 
 SCRATCH_ROOT = ROOT / ".local-runs" / "r8-tests"
@@ -1679,10 +1678,10 @@ class TestStrictLoaderPins8187(unittest.TestCase):
             with self.subTest(workflow=wf):
                 data, problems = ty.parse_workflow(text)
                 self.assertEqual(problems, [])
-                self.assertTrue((primary_pin_problems(wf, text, self.pins[PRIMARY]) == []))
-                self.assertTrue((tier_pin_problems(wf, text, self.pins) == []))
+                self.assertEqual(len(primary_pin_problems(wf, text, self.pins[PRIMARY])), 0)
+                self.assertEqual(len(tier_pin_problems(wf, text, self.pins)), 0)
                 assert_same(self, self.pins[PRIMARY][wf], ty.build_pins(data), f"{wf} primary pin")
-        self.assertTrue((repo_problems(ROOT, self.pins) == []))
+        self.assertEqual(len(repo_problems(ROOT, self.pins)), 0)
 
     def test_the_loader_refuses_duplicate_keys_after_normalisation(self):
         base = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n"
@@ -1700,7 +1699,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         for label, text in forms.items():
             with self.subTest(form=label):
                 data, problems = ty.parse_workflow(text)
-                self.assertTrue((data is None), f"duplicate key accepted: {label}")
+                self.assertIs(data is None, True, f"duplicate key accepted: {label}")
                 self.assertTrue(problems)
 
     def test_the_loader_refuses_anchors_aliases_merge_keys_and_odd_keys(self):
@@ -1719,14 +1718,14 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         for label, text in forms.items():
             with self.subTest(form=label):
                 data, problems = ty.parse_workflow(text)
-                self.assertTrue((data is None), f"accepted: {label}")
+                self.assertIs(data is None, True, f"accepted: {label}")
                 self.assertTrue(problems)
 
     def test_on_is_read_as_a_string_and_the_top_level_key_set_is_closed(self):
         data, problems = ty.parse_workflow("name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n")
         self.assertEqual(problems, [])
         assert_has(self, "on", data, "the loaded workflow keeps the string key on")
-        self.assertTrue(True not in data, "the loaded workflow has no boolean key")
+        self.assertIs(True not in data, True, "the loaded workflow has no boolean key")
         for key in ("x-anchors", "extra", "Jobs", "env2"):
             with self.subTest(key=key):
                 text = f"name: x\non: push\n{key}: 1\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n"
@@ -1748,7 +1747,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
             for label, lines in forms.items():
                 with self.subTest(workflow=wf, form=label):
                     edited = before_jobs(text, lines)
-                    self.assertTrue((edited != text))
+                    self.assertIs(edited != text, True, "the edit changed nothing")
                     self.caught(wf, edited, label)
 
     def test_a_repeated_jobs_key_with_a_split_export_and_dump_is_caught_8187_f13(self):
@@ -1775,7 +1774,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
             }
             for label, edited in forms.items():
                 with self.subTest(workflow=wf, form=label):
-                    self.assertTrue((edited != text))
+                    self.assertIs(edited != text, True)
                     self.caught(wf, edited, label)
 
     # --- discovery on normalised loader output (security F14) -------------------------------------------------
@@ -1795,7 +1794,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
             body = "name: new\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          " + line + "\n"
             with self.subTest(form=label):
                 root = self.tree(extra={".github/workflows/new.yml": body})
-                self.assertTrue((tier_workflows(root / ".github" / "workflows").count("new.yml") == 1))
+                self.assertEqual(tier_workflows(root / ".github" / "workflows").count("new.yml"), 1)
                 self.assertTrue(any("new.yml" in p for p in repo_problems(root, self.pins)), label)
 
     def test_a_composite_action_that_names_the_tier_file_is_caught_8187_f14(self):
@@ -1852,7 +1851,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         root = self.tree(extra={".github/workflows/other.yml": body})
         self.assertTrue(any("other.yml" in p and "j" in p for p in repo_problems(root, self.pins)))
         root = self.tree(extra={".github/workflows/other.yml": body.replace("[self-hosted, linux-fed]", "ubuntu-latest")})
-        self.assertTrue((repo_problems(root, self.pins) == []))
+        self.assertEqual(len(repo_problems(root, self.pins)), 0)
 
     def test_an_unparsable_workflow_is_a_problem_not_skipped_8187_f18(self):
         body = "name: o\non: push\njobs:\n  j:\n    runs-on:\t[self-hosted]\n    steps:\n      - run: echo hi\n"
@@ -1878,7 +1877,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
     def test_the_self_hosted_exemption_is_bound_to_its_label_sets_8187_f18a(self):
         name = "session-boot-lifetime.yml"
         text = (WORKFLOWS / name).read_text(encoding="utf-8")
-        self.assertTrue((repo_problems(self.tree(), self.pins) == []))
+        self.assertEqual(len(repo_problems(self.tree(), self.pins)), 0)
         mutants = {
             "macos-fed moved to the tier label": text.replace('["self-hosted","macos-fed"]', '["self-hosted","linux-fed"]'),
             "extra self-hosted leg": text.replace("          - os: macos-fed\n",
@@ -1887,7 +1886,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         }
         for label, body in mutants.items():
             with self.subTest(mutant=label):
-                self.assertTrue((body != text))
+                self.assertIs(body != text, True)
                 problems = repo_problems(self.tree(replace={name: body}), self.pins)
                 self.assertTrue(any(name in p and "lifetime-tests" in p for p in problems), "%d problem lines" % len(problems))
 
@@ -1953,7 +1952,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
             text = (WORKFLOWS / name).read_text(encoding="utf-8")
             renamed = text.replace("\n  %s:\n" % job, "\n  %s-renamed:\n" % job, 1)
             with self.subTest(workflow=name):
-                self.assertTrue((renamed != text))
+                self.assertIs(renamed != text, True)
                 problems = repo_problems(self.tree(replace={name: renamed}), self.pins)
                 self.assertTrue(any(name in p and job in p and "stale" in p for p in problems), "%d problem lines" % len(problems))
 
@@ -1961,20 +1960,20 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
         leg = "          - target: x86_64-unknown-linux-gnu\n"
         drift = release.replace(leg, "          - target: x86_64-pc-windows-msvc\n            os: windows-latest\n" + leg, 1)
-        self.assertTrue((drift != release))
+        self.assertIs(drift != release, True)
         problems = repo_problems(self.tree(replace={"release.yml": drift}), self.pins)
         self.assertTrue(any_match(problems, r"release\.yml job " + job_re("release")), "%d problem lines" % len(problems))
         ci = self.texts["ci.yml"]
         leg = "          - target: aarch64-apple-ios\n"
         drift = ci.replace(leg, "          - target: t\n            os: windows-latest\n" + leg, 1)
-        self.assertTrue((drift != ci))
+        self.assertIs(drift != ci, True)
         self.caught("ci.yml", drift, "mobile-cross-compile gains a windows leg")
         removed = ci.replace(leg + "            os: macos-latest\n", "", 1)
-        self.assertTrue((removed != ci))
+        self.assertIs(removed != ci, True, "the removal changed nothing")
         self.caught("ci.yml", removed, "mobile-cross-compile loses a leg")
         life = (WORKFLOWS / "session-boot-lifetime.yml").read_text(encoding="utf-8")
         reordered = life.replace('\'["self-hosted","macos-fed"]\'', '\'["macos-fed","self-hosted"]\'')
-        self.assertTrue((reordered != life))
+        self.assertIs(reordered != life, True)
         problems = repo_problems(self.tree(replace={"session-boot-lifetime.yml": reordered}), self.pins)
         self.assertTrue(any_match(problems, job_re("lifetime-tests")), "%d problem lines" % len(problems))
 
@@ -1987,7 +1986,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
             for labels in label_sets:
                 if key[1] != "lifetime-tests":
                     self.assertTrue(all(ty.HOSTED_LABEL.match(label) for label in labels), (key, labels))
-        self.assertTrue((repo_problems(ROOT, self.pins) == []))
+        self.assertEqual(len(repo_problems(ROOT, self.pins)), 0)
         self.assertFalse(hasattr(ty, "MATRIX_REF"), "the matrix lookup branch is deleted")
 
     def test_a_step_added_to_the_pinned_exempt_job_is_caught_8187_f20(self):
@@ -2002,14 +2001,14 @@ class TestStrictLoaderPins8187(unittest.TestCase):
                 problems = repo_problems(self.tree(replace={name: add_step(text, "lifetime-tests", step)}), self.pins)
                 self.assertTrue(any(name in p and "lifetime-tests" in p and "step" in p for p in problems), "%d problem lines" % len(problems))
         edited = text.replace("AI_MEMORY_NO_CONFIG: '1'", "AI_MEMORY_NO_CONFIG: '0'", 1)
-        self.assertTrue((edited != text))
+        self.assertIs(edited != text, True)
         problems = repo_problems(self.tree(replace={name: edited}), self.pins)
         self.assertTrue(any(name in p and "lifetime-tests" in p for p in problems), "%d problem lines" % len(problems))
 
     def test_the_exempt_workflow_level_keys_are_pinned_8187_f21(self):
         name = "session-boot-lifetime.yml"
         text = (WORKFLOWS / name).read_text(encoding="utf-8")
-        self.assertTrue((repo_problems(self.tree(), self.pins) == []))
+        self.assertEqual(len(repo_problems(self.tree(), self.pins)), 0)
         mutants = {
             "env entry added": (text.replace("\nenv:\n", "\nenv:\n  BASH_ENV: ./hook\n", 1), "env"),
             "defaults.run.shell added": (text.replace("\nenv:\n", "\ndefaults:\n  run:\n    shell: bash -x\nenv:\n", 1),
@@ -2019,7 +2018,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         }
         for label, (body, key) in mutants.items():
             with self.subTest(mutant=label):
-                self.assertTrue((body != text))
+                self.assertIs(body != text, True)
                 problems = repo_problems(self.tree(replace={name: body}), self.pins)
                 self.assertTrue(any(name in p and "workflow-level" in p and re.search(key_re(key), p) for p in problems), "%d problem lines" % len(problems))
                 self.assertTrue(not (any("bash -x" in p or "./hook" in p for p in problems)))
@@ -2037,11 +2036,11 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         keys = json.loads(JOB_PINS_FILE.read_text(encoding="utf-8")).keys()
         for position, key in enumerate(keys):
             with self.subTest(section=position):
-                self.assertTrue((key in load_job_pins.__doc__))
+                self.assertIs(key in load_job_pins.__doc__, True)
         for position, text in enumerate((" ".join((__doc__ or "").split()),
                                          " ".join(Path(ty.__file__).read_text(encoding="utf-8").replace("# ", " ").split()))):
             with self.subTest(text=position):
-                self.assertTrue(("the exempt job and every workflow-level key except ``jobs`` of its workflow" in text))
+                self.assertIs("the exempt job and every workflow-level key except ``jobs`` of its workflow" in text, True)
 
     def test_both_workflow_key_comparisons_use_one_shared_helper_8187_f23(self):
         module = sys.modules[__name__]
@@ -2053,17 +2052,17 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         with unittest.mock.patch.object(module, "workflow_key_problems", return_value=sentinel):
             exempt = exempt_workflow_key_problems(exempt_name, exempt_text, self.pins)
             primary = primary_pin_problems("ci.yml", text, self.pins[PRIMARY])
-        self.assertTrue((sentinel[0] in exempt))
-        self.assertTrue((sentinel[0] in primary))
+        self.assertIs(sentinel[0] in exempt, True)
+        self.assertIs(sentinel[0] in primary, True)
 
     def test_hosted_labels_and_non_tier_edits_are_not_flagged(self):
         text = self.texts["ci.yml"]
         for value in ("ubuntu-latest", "ubuntu-22.04", "macos-14", "windows-latest", "ubuntu-24.04-arm"):
             with self.subTest(runs_on=value):
-                self.assertTrue((tier_pin_problems("ci.yml", set_runs_on(text, "lint", value), self.pins) == []))
+                self.assertEqual(len(tier_pin_problems("ci.yml", set_runs_on(text, "lint", value), self.pins)), 0)
         edited = add_step(text, "lint", ["      - run: echo a freely edited non-tier step"])
-        self.assertTrue((tier_pin_problems("ci.yml", edited, self.pins) == []))
-        self.assertTrue((tier_pin_problems("ci.yml", before_jobs(text, ["# a comment above jobs"]), self.pins) == []))
+        self.assertEqual(len(tier_pin_problems("ci.yml", edited, self.pins)), 0)
+        self.assertEqual(len(tier_pin_problems("ci.yml", before_jobs(text, ["# a comment above jobs"]), self.pins)), 0)
 
     # --- pins: structure, failure messages, determinism ------------------------------------------------------
 
@@ -2091,15 +2090,15 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         edited = add_step_run(text, step["run"], "printenv | base64 # " + USERINFO_SAMPLE)
         message = "\n".join(primary_pin_problems(wf, edited, self.pins[PRIMARY]))
         for part in (wf, f"step {index}"):
-            self.assertTrue((part in message))
+            self.assertIs(part in message, True)
         self.assertTrue(re.search(job_re(job), message))
         self.assertTrue(re.search(rf"steps\[{index}\]\.{key_re('run')}", message))
         self.assertTrue(re.search(step_ref(index, step["name"]), message))
-        self.assertTrue(("somepass" not in message))
-        self.assertTrue(("printenv" not in message), "the message names the key path, not the changed line")
+        self.assertIs("somepass" not in message, True)
+        self.assertIs("printenv" not in message, True, "the message names the key path, not the changed line")
         again = "\n".join(tier_pin_problems(wf, edited, self.pins))
-        self.assertTrue(("somepass" not in again))
-        self.assertTrue(("someuser" not in again))
+        self.assertIs("somepass" not in again, True)
+        self.assertIs("someuser" not in again, True)
 
     def test_a_job_level_key_difference_names_the_job_key(self):
         wf = "postgres-ignored.yml"
@@ -2154,7 +2153,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
                 self.assertIn("requirements-ci.txt", result.stderr)
         source = Path(__file__).read_text(encoding="utf-8") + (Path(__file__).parent / "tier_yaml_8187.py").read_text(encoding="utf-8")
         for needle in ("skip" + "Unless", "Skip" + "Test", "importor" + "skip", "self.skip" + "Test"):
-            self.assertTrue((needle not in source))
+            self.assertIs(needle not in source, True)
 
     def test_requirements_pin_one_package_with_hashes_only(self):
         rows = [ln.rstrip() for ln in (Path(__file__).parent / "requirements-ci.txt").read_text(encoding="utf-8").split("\n")
@@ -2171,9 +2170,9 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         data, problems = ty.parse_workflow(self.texts["ci.yml"])
         self.assertEqual(problems, [])
         job = data["jobs"]["tier-credential-pins"]
-        self.assertTrue((job["runs-on"] == "ubuntu-latest"))
-        self.assertTrue(("needs" not in job), "the pins must run on a docs-only PR as well")
-        self.assertTrue(("if" not in job))
+        self.assertIs(job["runs-on"] == "ubuntu-latest", True)
+        self.assertIs("needs" not in job, True, "the pins must run on a docs-only PR as well")
+        self.assertIs("if" not in job, True)
         runs = [s["run"] for s in job["steps"] if isinstance(s.get("run"), str)]
         self.assertTrue(any("pip install --require-hashes --no-deps -r scripts/test/requirements-ci.txt" in r for r in runs))
         self.assertTrue(any("python3 -I -m unittest discover -s scripts/test -p 'test_*tier*.py'" in r for r in runs))
@@ -2244,7 +2243,7 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
             problems = tier_pin_problems(wf, edited, self.pins)
             with self.subTest(workflow=wf):
                 self.assertTrue(problems, "the edited step must differ from its pins")
-                self.assertTrue(([p for p in problems if sentinel in p] == []))
+                self.assertEqual(len([p for p in problems if sentinel in p]), 0)
                 primary = [p for p in problems if re.search(step_ref(index), p) and "differs from the pin at" in p]
                 self.assertTrue([p for p in primary if re.search(rf"steps\[{index}\]\.", p)], "%d problem lines" % len(problems))
                 self.assertTrue([p for p in job_pin_problems(wf, edited, self.pins[SECONDARY])
@@ -2274,7 +2273,7 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
             edited = splice(text, at + 1, ["          " + part for part in self.planted(template).split("\n")])
             with self.subTest(site=label):
                 problems = function(edited)
-                self.assertTrue(([p for p in problems if sentinel in p or "postgres://" in p] == []))
+                self.assertEqual(len([p for p in problems if sentinel in p or "postgres://" in p]), 0)
                 self.assertTrue([p for p in problems if p.startswith(expected)], "%d problem lines" % len(problems))
 
     def test_workflow_problems_name_the_line_number_and_rule_only_8187_f26(self):
@@ -2283,7 +2282,7 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
         lines = text.split("\n")
         lines.insert(section_end(text), "      run: psql postgres://u:%s@h/db -c 'select 1'" % sentinel)
         problems = workflow_problems("\n".join(lines))
-        self.assertTrue(([p for p in problems if sentinel in p or "postgres://" in p] == []))
+        self.assertEqual(len([p for p in problems if sentinel in p or "postgres://" in p]), 0)
         self.assertTrue([p for p in problems if re.match(r"line \d+: psql without the loader$", p)], "%d problem lines" % len(problems))
 
     def test_a_workflow_that_does_not_load_names_the_rule_never_its_text_8187_f26(self):
@@ -2293,7 +2292,7 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
                            "non-string key": f"? [{sentinel}]\n: 1\n", "duplicate": "a: 1\na: 2\n"}.items():
             data, problems = ty.parse_workflow(doc)
             with self.subTest(document=label):
-                self.assertTrue((data is None))
+                self.assertIs(data is None, True)
                 self.assertEqual([p for p in problems if sentinel in p], [])
                 self.assertTrue(problems and problems[0].startswith("the workflow does not load strictly: "), problems)
 
@@ -2301,8 +2300,8 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
         wide = {path.name: [int(n) for n in re.findall(r"\[:(\d+)\]", path.read_text(encoding="utf-8")) if int(n) >= 40]
                 for path in (Path(__file__), Path(__file__).with_name("tier_yaml_8187.py"))}
         # r23: the 60-character cut went with the deny-list predicate; no checker slice is wide
-        self.assertTrue((wide["tier_yaml_8187.py"] == []))
-        self.assertTrue((wide[Path(__file__).name] == []))
+        self.assertEqual(len(wide["tier_yaml_8187.py"]), 0)
+        self.assertEqual(len(wide[Path(__file__).name]), 0)
 
 
 def step_head_rows(block):
@@ -2353,7 +2352,7 @@ class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
                     checked += 1
                     self.assertTrue(problems)
                     for sentinel in self.SENTINELS:
-                        self.assertTrue(([p for p in problems if sentinel in p] == []))
+                        self.assertEqual(len([p for p in problems if sentinel in p]), 0)
                     self.assertTrue([p for p in problems if re.search(step_ref(index, want), p)], "%d problem lines" % len(problems))
         self.assertGreater(checked, 0)
 
@@ -2404,13 +2403,14 @@ class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
             with self.subTest(document=label):
                 with self.assertRaises(Exception) as caught:
                     ty.load_strict(doc)
-                if label.startswith("local tag"):
-                    self.assertIn(sentinel, str(caught.exception), "the parser message carries the author text here")
+                self.assertNotIn(sentinel, str(caught.exception))  # r24 sec F4: the loader itself no longer carries it
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertIsNone(caught.exception.__context__)
                 message = ty.load_failure(caught.exception)
                 self.assertNotIn(sentinel, message)
                 self.assertRegex(message, r"^\w+ at line \d+$")
                 data, problems = ty.parse_workflow(doc)
-                self.assertTrue((data is None))
+                self.assertIs(data is None, True)
                 self.assertEqual([p for p in problems if sentinel in p], [])
 
     def test_the_pure_python_fallback_loader_failure_carries_no_author_text_8187_f28(self):
@@ -2422,7 +2422,7 @@ class TestStepLabelIsTheStepsOwnKey8187R15(unittest.TestCase):
             with self.subTest(document=label):
                 with self.assertRaises(ty.yaml.YAMLError) as caught:
                     ty.yaml.load(doc, Loader=ty.yaml.SafeLoader)
-                self.assertIn(sentinel, str(caught.exception), "the pure-Python message carries the author text")
+                self.assertIs(sentinel in str(caught.exception), True, "the pure-Python message carries the author text")
                 message = ty.load_failure(caught.exception)
                 self.assertNotIn(sentinel, message)
                 self.assertRegex(message, r"^\w+ at line \d+$")
@@ -2466,7 +2466,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                     checked += 1
                     self.assertTrue(problems)
                     for sentinel in sentinels:
-                        self.assertTrue(([p for p in problems if sentinel in p] == []))
+                        self.assertEqual(len([p for p in problems if sentinel in p]), 0)
                     self.assertTrue([p for p in problems if re.search(step_ref(index, real or ""), p)], (index,))
         self.assertGreater(checked, 0)
 
@@ -2487,7 +2487,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
             for view, problems in views.items():
                 with self.subTest(workflow=wf, view=view):
                     checked += 1
-                    self.assertTrue(([p for p in problems if sentinel in p or "dbhost" in p] == []))
+                    self.assertEqual(len([p for p in problems if sentinel in p or "dbhost" in p]), 0)
                     self.assertTrue([p for p in problems if re.search(step_any(index), p)])
         self.assertGreater(checked, 0)
 
@@ -2517,7 +2517,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                 for view, problems in views.items():
                     with self.subTest(workflow=wf, variant=variant, view=view):
                         checked += 1
-                        self.assertTrue(([p for p in problems if sentinel in p or "ciuser" in p or "dbhost" in p] == []))
+                        self.assertEqual(len([p for p in problems if sentinel in p or "ciuser" in p or "dbhost" in p]), 0)
                         self.assertTrue([p for p in problems if re.search(step_any(index), p)])
         self.assertGreater(checked, 0)
 
@@ -2559,8 +2559,8 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                     with self.subTest(workflow=wf, variant=variant, view=view):
                         checked += 1
                         self.assertTrue(problems)
-                        self.assertTrue([p for p in problems if sentinel in p or user in p
-                                         or "://" in p.replace("://***", "") or "dbhost" in p] == [])
+                        self.assertEqual(len([p for p in problems if sentinel in p or user in p
+                                         or "://" in p.replace("://***", "") or "dbhost" in p]), 0)
                         labelled = [p for p in problems if re.search(step_any(index), p)]
                         self.assertTrue(labelled)
         self.assertGreater(checked, 0)
@@ -2581,18 +2581,18 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                 continue
             job = target[0]
             head = f"\n  {job}:"
-            self.assertTrue((text.count(head) == 1))
+            self.assertEqual(text.count(head), 1)
             for variant, key in keys.items():
                 edited = text.replace(head, f'\n  "{key}":')
-                self.assertTrue((sentinel in json.dumps(ty.load_strict(edited)["jobs"])))
+                self.assertIs(sentinel in json.dumps(ty.load_strict(edited)["jobs"]), True)
                 views = {"loaded": tier_pin_problems(wf, edited, self.pins),
                          "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
                 for view, problems in views.items():
                     with self.subTest(workflow=wf, variant=variant, view=view):
                         checked += 1
                         self.assertTrue(problems)
-                        self.assertTrue([p for p in problems if sentinel in p or user in p
-                                         or "://" in p.replace("://***", "") or "dbhost" in p] == [])
+                        self.assertEqual(len([p for p in problems if sentinel in p or user in p
+                                         or "://" in p.replace("://***", "") or "dbhost" in p]), 0)
         self.assertGreater(checked, 0)
 
 
@@ -2610,6 +2610,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
 #   3. the wrapper itself: ``raw()`` is called in ``ty.same`` only, and ``Opaque`` never returns its text from any
 #      string protocol.
 
+CANARY_SCRATCH = Path(__file__).resolve().parents[2] / ".local-runs"  # repo-local and gitignored: never the system temp dir
 CANARY_FORCE_FAIL = True  # the mutant "fail-path forcing dropped" sets this False; the coverage assertions then go red
 CANARY_BLIND = "\u034f\ufe0f\u3164\uffa0\u00ad"
 CANARY_SHAPES = {
@@ -2634,18 +2635,40 @@ CANARY_SHAPES = {
 CANARY_AUTHOR_MAPS = frozenset(("jobs", "env", "with", "outputs", "services", "permissions", "secrets"))
 
 
-def canary_view(text):
+CANARY_SENTINEL = "MK"  # r24 F42f: a marker is this non-hex prefix plus 24 hex digits, matched per line after decoding
+
+
+def canary_decode(text):
     """``text`` the way a reader would decode it: probe-shape blind characters removed, percent-decoded twice, NFKC,
-    format characters removed, lower case, then only the hex digits kept (a marker is hex)."""
+    format characters removed, lower case."""
     text = "".join(c for c in text if c not in CANARY_BLIND)
     text = urllib.parse.unquote(urllib.parse.unquote(text))
     text = unicodedata.normalize("NFKC", text)
-    text = "".join(c for c in text if unicodedata.category(c) != "Cf" and c not in CANARY_BLIND)
-    return re.sub(r"[^0-9a-f]+", "", text.lower())
+    return "".join(c for c in text if unicodedata.category(c) != "Cf" and c not in CANARY_BLIND).lower()
 
 
-def canary_windows(hexview, size=8):
-    return {hexview[i:i + size] for i in range(len(hexview) - size + 1)}
+def canary_hits(text, windows, size=8):
+    """The registered markers (hex digests) of which ``text`` shows an 8-hex window.  The text is decoded, split into lines,
+    and only the hex run that follows the sentinel on a line is read, so constant text and the hex digits of two adjacent
+    lines cannot form a hit (r23 matched windows across a line break and across unrelated digits)."""
+    found = set()
+    pattern = re.compile(re.escape(CANARY_SENTINEL.lower()) + r"([0-9a-f]+)")
+    for line in canary_decode(text).split("\n"):
+        for match in pattern.finditer(line):
+            digits = match.group(1)
+            for start in range(len(digits) - size + 1):
+                digest = windows.get(digits[start:start + size])
+                if digest is not None:
+                    found.add(digest)
+    return found
+
+
+def canary_digest(seed, counter):
+    return hashlib.sha256(b"r24-canary-%d-%d" % (seed, counter)).hexdigest()[:24]
+
+
+def canary_window_table(digests, size=8):
+    return {digest[i:i + size]: digest for digest in digests for i in range(len(digest) - size + 1)}
 
 
 class CanaryListHandler(logging.Handler):
@@ -2663,10 +2686,15 @@ class CanaryRun:
     """One canary run over a module ``mod`` that exposes the checker (``mod.ty`` and the problem functions): the markers
     it minted, every channel it captured and the leaks, coverage and pass/fail results."""
 
-    def __init__(self, mod):
+    def __init__(self, mod, seed=0, foreign_seed=None):
         self.mod = mod
         self.ty = mod.ty
+        self.seed = seed
         self.counter = 0
+        self.stray = []        # (shape, scenario) whose output showed a marker of the OTHER seed (a false positive)
+        self.foreign = {} if foreign_seed is None else canary_window_table(canary_digest(foreign_seed, n) for n in range(1, 20001))
+        self.fail_views = {}   # (shape, view) -> fail-path observations (r24 sec F2)
+        self.fail_families = {}  # (shape, view, scenario family) -> fail-path observations
         self.kind = {}      # marker hex -> kind
         self.names = {}     # (shape, original) -> marker (names are shared between the workflow and its pins)
         self.windows = {}   # 8-hex window -> marker hex
@@ -2688,11 +2716,10 @@ class CanaryRun:
 
     def mint(self, kind, shape, memo=None):
         self.counter += 1
-        digest = hashlib.sha256(b"r23-canary-%d" % self.counter).hexdigest()[:24]
+        digest = canary_digest(self.seed, self.counter)
         self.kind[digest] = kind
-        for i in range(len(digest) - 7):
-            self.windows[digest[i:i + 8]] = digest
-        return shape("CANARY-" + digest)
+        self.windows.update(canary_window_table([digest]))
+        return shape(CANARY_SENTINEL + digest)
 
     def name(self, original, kind, shape_name, shape):
         key = (shape_name, original)
@@ -2701,7 +2728,9 @@ class CanaryRun:
         return self.names[key]
 
     def observe(self, shape_name, scenario, call, *args, expect=None):
-        """Run ``call(*args)`` capturing every channel; scan it for markers; record the pass/fail expectation."""
+        """Run ``call(*args)`` capturing every channel; scan it for markers; record the pass/fail expectation.  Each capture
+        line carries a ``# canary-channel: <name>`` comment: the harness mutants of ``HARNESS_MUTANTS`` replace those lines,
+        and ``canary_controls`` seeds a marker through every channel to prove each one is live (r24 sec F1, F3)."""
         out, err = io.StringIO(), io.StringIO()
         handler = CanaryListHandler()
         logger = logging.getLogger()
@@ -2718,33 +2747,42 @@ class CanaryRun:
                     result = call(*args)
                 except Exception as exc:  # noqa: BLE001  (the exception text is one of the channels under test)
                     self.errors.append((shape_name, scenario, type(exc).__name__))
-                    chunks += [str(exc), repr(exc), "".join(traceback.format_exception_only(type(exc), exc)),
-                               repr(exc.args)]
-            chunks += [str(w.message) for w in caught]
+                    chunks += [str(exc), repr(exc), repr(exc.args)]  # canary-channel: exception
+                    chunks += [*traceback.format_exception(type(exc), exc, exc.__traceback__), traceback.format_exc()]  # canary-channel: exception-chain
+            chunks += [str(w.message) for w in caught]  # canary-channel: warning
         finally:
             logger.removeHandler(handler)
             logger.setLevel(old_level)
-        chunks += [out.getvalue(), err.getvalue(), *handler.chunks]
+        chunks += [out.getvalue(), err.getvalue()]  # canary-channel: stdout-stderr
+        chunks += handler.chunks  # canary-channel: log
         if isinstance(result, list):
             for line in result:
                 if not isinstance(line, str):
                     self.errors.append((shape_name, scenario, "non-str problem line"))
-                chunks += [str(line), repr(line)]
+                chunks += [str(line), repr(line)]  # canary-channel: problem-line
                 self.label_forms.update(re.findall(r"\b(?:job|step|key|pin)\[(?:\d+|\?)\] len=\d+", str(line)))
             self.problem_lines += len(result)
         self.calls += 1
+        view = scenario.rsplit("/", 1)[-1]
         if expect == "pass":
             self.pass_calls += 1
             if result:
                 self.unexpected.append((shape_name, scenario))
         elif expect == "fail":
             self.fail_calls += 1
+            if view in ("loaded", "text"):
+                self.fail_views[(shape_name, view)] = self.fail_views.get((shape_name, view), 0) + 1
+                family = scenario.split("/", 1)[0]
+                key = (shape_name, view, family)
+                self.fail_families[key] = self.fail_families.get(key, 0) + 1
             if not result:
                 self.silent.append((shape_name, scenario))
-        found = canary_windows(canary_view("\n".join(chunks))) & self.windows.keys()
-        for digest in sorted({self.windows[w] for w in found}):
+        text = "\n".join(chunks)
+        for digest in sorted(canary_hits(text, self.windows)):
             self.leaks.append((shape_name, scenario, self.kind[digest]))
             self.by_shape[shape_name] = self.by_shape.get(shape_name, 0) + 1
+        if self.foreign and canary_hits(text, self.foreign):
+            self.stray.append((shape_name, scenario))
         return result
 
     def views(self, shape_name, scenario, wf, text, pins_primary, pins_secondary, expect, expect_text="same"):
@@ -2851,7 +2889,36 @@ def canary_loader_faults(run, shape_name, shape):
         "unterminated-quote": 'name: "%s\njobs: {\n' % run.mint("value", shape),
         "tab-indent": "name: x\njobs:\n\t%s: 1\n" % key("j3"),
         "extra-top-level-key": "%s: %s\n" % (key("extra"), value()),
+        "duplicate-job": "name: x\njobs:\n  %s:\n    runs-on: a\n  %s:\n    runs-on: b\n" % ((run.name("dup-job", "key", shape_name, shape),) * 2),
+        # r24 sec F4: the tag, the %TAG directive and the escape sequence are text the parser quotes back in its errors
+        "local-tag": "name: x\nenv:\n  X_TAG: !%s v\n" % run.mint("tag", shape),
+        "tag-directive": "%%TAG !e! tag:%s,2000:\n---\nname: x\n" % run.mint("tag", shape),
+        "bad-escape": 'name: x\nenv:\n  X_ESC: "%s\\q"\n' % run.mint("tag", shape),
     }
+
+
+def canary_diff_scenarios(run, shape_name, shape, wf, text):
+    """Marker keys on either side of a job pin: the text has an extra job or step key, the pin names a key the job lacks, and
+    the secondary pins name a workflow-level block the text lacks (the ``first_difference`` and ``name_label`` arms)."""
+    mod = run.mod
+    pins = run.pins
+    job = sorted(pins[mod.PRIMARY][wf]["tier_jobs"])[0]
+    zero = "0" * 64
+    for where in ("job", "step"):
+        data = copy.deepcopy(run.datas[wf])
+        holder = data["jobs"][job] if where == "job" else data["jobs"][job]["steps"][0]
+        holder[run.name("extra-" + where + "-key", "key", shape_name, shape)] = "x"
+        run.views(shape_name, "fail-text-extra-%s-key/%s" % (where, wf), wf, canary_dump(data), pins[mod.PRIMARY],
+                  pins[mod.SECONDARY], "fail")
+        edited = copy.deepcopy(pins[mod.PRIMARY])
+        entry = edited[wf]["tier_jobs"][job]
+        target = entry if where == "job" else entry["steps"][0]
+        target["keys"][run.name("pin-" + where + "-key", "key", shape_name, shape)] = zero
+        target["sha256"] = entry["sha256"] = zero
+        run.views(shape_name, "fail-pin-extra-%s-key/%s" % (where, wf), wf, text, edited, pins[mod.SECONDARY], "fail", None)
+    blocks = copy.deepcopy(pins[mod.SECONDARY])
+    blocks[wf].setdefault("workflow", {})[run.name("pin-block", "key", shape_name, shape)] = mod.pin_entry("x: 1")
+    run.observe(shape_name, "fail-pin-extra-block/" + wf + "/text", mod.job_pin_problems, wf, text, blocks, expect="fail")
 
 
 def canary_scenarios(run, shape_name, shape):
@@ -2901,6 +2968,7 @@ def canary_scenarios(run, shape_name, shape):
                            mod.SECONDARY: canary_pin_tree(run, pins[mod.SECONDARY], shape_name, shape, keys)}
             run.views(shape_name, "fail-marked-pins-%s/%s" % ("keys" if keys else "values", wf), wf, text,
                       marked_pins[mod.PRIMARY], marked_pins[mod.SECONDARY], "fail")
+        canary_diff_scenarios(run, shape_name, shape, wf, text)
         for fault, doc in canary_loader_faults(run, shape_name, shape).items():
             suffix = fault == "extra-top-level-key"
             run.views(shape_name, "fail-%s/%s" % (fault, wf), wf, text + "\n" + doc if suffix else doc,
@@ -2927,7 +2995,8 @@ def canary_repo_scenario(run, shape_name, shape):
     mod = run.mod
     ty_mod = run.ty
     run.keep_jobs = frozenset()
-    with tempfile.TemporaryDirectory() as raw_root:
+    CANARY_SCRATCH.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(CANARY_SCRATCH)) as raw_root:
         root = Path(raw_root)
         target = root / ".github" / "workflows"
         shutil.copytree(mod.WORKFLOWS, target)
@@ -2951,6 +3020,11 @@ def canary_repo_scenario(run, shape_name, shape):
                   mod.SECONDARY: canary_pin_tree(run, run.pins[mod.SECONDARY], shape_name, shape, True),
                   mod.EXEMPT: canary_pin_tree(run, run.pins[mod.EXEMPT], shape_name, shape, True)}
         run.observe(shape_name, "fail-repo-marker-pins", mod.repo_problems, root, marked, expect="fail")
+        for workflow, job in mod.self_hosted_rows():
+            exempt = ty_mod.load_lenient((mod.WORKFLOWS / workflow).read_text(encoding="utf-8"))
+            exempt["jobs"][job]["strategy"]["matrix"] = {run.name("matrix-key", "key", shape_name, shape): "scalar"}
+            (target / workflow).write_text(canary_dump(exempt), encoding="utf-8")
+        run.observe(shape_name, "fail-repo-marker-matrix", mod.repo_problems, root, run.pins, expect="fail")
 
 
 def canary_wrapper_scenario(run, shape_name, shape):
@@ -2968,7 +3042,17 @@ def canary_wrapper_scenario(run, shape_name, shape):
         print(str(a), repr([a, b]), str({a: b}), str((a, b)), bytes(a), json.dumps(str(a)))
         for failing in (lambda: case.assertEqual(a, b), lambda: case.assertNotEqual(a, a), lambda: case.assertIn(a, [b]),
                         lambda: case.assertEqual([a], [b]), lambda: case.assertDictEqual({a: a}, {b: b}),
-                        lambda: case.assertTrue(a == b, "msg %s" % a), lambda: case.assertEqual({a, b}, {b})):
+                        lambda: case.assertEqual(a, b, "msg %s" % a), lambda: case.assertEqual({a, b}, {b})):
+            try:
+                failing()
+            except AssertionError as exc:
+                print(str(exc))
+                logging.getLogger("canary").error("failed: %s", exc)
+        left, right = shape(run.mint("value", shape)), shape(run.mint("value", shape))
+        unknown = ty_mod.job_label(left, {})   # the "job[?]" arm: a name that is not one of the jobs
+        known = ty_mod.job_label(left, {left: 1, right: 2})
+        for failing in (lambda: case.assertEqual(ty_mod.opaque(left, "key[0]"), ty_mod.opaque(right, "key[0]"), "differs: key[0]"),
+                        lambda: case.assertEqual(unknown, known), lambda: case.assertEqual(known, ty_mod.job_label(right, {left: 1, right: 2}))):
             try:
                 failing()
             except AssertionError as exc:
@@ -2978,29 +3062,85 @@ def canary_wrapper_scenario(run, shape_name, shape):
             raise ValueError(a)
         except ValueError as exc:
             print(str(exc), repr(exc))
-        return [str(a), repr(b)]
+        return [str(a), repr(b), str(unknown), str(known)]
 
     run.observe(shape_name, "wrapper-protocols", protocols, expect=None)
 
 
-def canary_run(mod, shapes=None):
-    """Drive every routed site of ``mod`` with every probe shape; the returned ``CanaryRun`` holds the leaks and the coverage."""
-    run = CanaryRun(mod)
-    counters = {}
-    patches = []
-    for name in ("key_label", "name_label", "job_label", "step_label"):
-        for owner in (mod.ty, mod):
-            if hasattr(owner, name):
-                counters[(owner is mod, name)] = unittest.mock.Mock(wraps=getattr(owner, name))
-                patches.append(unittest.mock.patch.object(owner, name, counters[(owner is mod, name)]))
-    run.counters = counters
-    with contextlib.ExitStack() as stack:
-        for patch in patches:
-            stack.enter_context(patch)
-        for shape_name, shape in (shapes or CANARY_SHAPES).items():
-            canary_scenarios(run, shape_name, shape)
-            canary_wrapper_scenario(run, shape_name, shape)
+def canary_run(mod, shapes=None, seed=0, foreign_seed=None):
+    """Drive every routed site of ``mod`` with every probe shape; the returned ``CanaryRun`` holds the leaks and the coverage.
+    ``seed`` picks the marker family; ``foreign_seed`` registers a second family whose markers must NOT show (``run.stray``)."""
+    run = mod.CanaryRun(mod, seed, foreign_seed)  # the harness of ``mod`` itself: a mutated copy runs its own mutated harness
+    for shape_name, shape in (shapes or mod.CANARY_SHAPES).items():
+        mod.canary_scenarios(run, shape_name, shape)
+        mod.canary_wrapper_scenario(run, shape_name, shape)
     return run
+
+
+def canary_controls(run):
+    """One seeded positive control per capture channel: ``{name: effect(marker)}``.  Each effect writes its marker through
+    exactly that channel (or, for the exception pair, through the chain only), so a harness that stopped capturing the
+    channel shows no leak for it."""
+
+    def control_exception(marker):
+        raise ValueError(marker)
+
+    def control_chain(marker):
+        raise RuntimeError("outer") from ValueError(marker)
+
+    def control_context(marker):
+        try:
+            raise ValueError(marker)
+        except ValueError:
+            raise RuntimeError("outer")  # noqa: B904  (the implicit __context__ is the path under test)
+
+    def control_warning(marker):
+        warnings.warn(marker)
+
+    return {
+        "print": lambda marker: print("seen", marker),
+        "stderr": lambda marker: print(marker, file=sys.stderr),
+        "log": lambda marker: logging.getLogger("canary").warning("seen %s", marker),
+        "warning": control_warning,
+        "problem-line": lambda marker: ["problem line " + marker],
+        "exception": control_exception,
+        "exception-chain": control_chain,
+        "exception-context": control_context,
+    }
+
+
+def canary_control_failures(mod):
+    """The controls of ``mod`` (a loaded copy of this module, possibly a mutant) that its ``observe`` did NOT report as a leak."""
+    run = mod.CanaryRun(mod)
+    failures = []
+    for name, effect in mod.canary_controls(run).items():
+        marker = run.mint("control", mod.CANARY_SHAPES["plain"])
+        before = len(run.leaks)
+        run.observe("plain", "control/" + name, effect, marker)
+        if len(run.leaks) == before:
+            failures.append(name)
+    return failures
+
+
+# the scenario families the fail-path guard gates: every shape must reach the first in both views, the plain shape the others
+CANARY_FAIL_FAMILIES = ("fail-real-pins",)
+CANARY_FAIL_FAMILIES_PLAIN = ("fail-other-values", "fail-real-text-own-pins")
+
+
+def canary_coverage_failures(run, shapes):
+    """Fail-path coverage holes of ``run`` (r24 sec F2): a shape and view with no fail-path observation, or a guarded family
+    that never ran.  Counting every fail observation is not enough (other fail scenarios keep the count above zero when the
+    guard is forced off), so the families the guard gates are counted on their own."""
+    failures = []
+    for shape in shapes:
+        for view in ("loaded", "text"):
+            if run.fail_views.get((shape, view), 0) == 0:
+                failures.append("%s/%s: no fail-path observation" % (shape, view))
+            families = CANARY_FAIL_FAMILIES + (CANARY_FAIL_FAMILIES_PLAIN if shape == "plain" else ())
+            for family in families:
+                if run.fail_families.get((shape, view, family), 0) == 0:
+                    failures.append("%s/%s: family %s never ran" % (shape, view, family))
+    return failures
 
 
 # ---- r23 AST taint scanner (3-agent vote (6def5ab6)) ----
@@ -3008,14 +3148,24 @@ TAINT_SOURCES = frozenset((
     "read_text", "read_bytes", "load_job_pins", "load_strict", "load_lenient", "parse_workflow", "pin_targets",
     "job_layout", "workflow_steps", "job_steps", "tier_job", "tier_blocks", "post_export_steps", "build_pins",
     "exempt_pins", "pin_entry", "loads", "workflow_level_blocks", "tier_job_names", "leaf_strings", "normalised_leaves",
-    "normalised_code", "normalise_shell", "uses_references", "canonical_json", "dumps", "safe_dump", "tier_workflows"))
+    "normalised_code", "normalise_shell", "uses_references", "tier_workflows"))
+# (r24: ``canonical_json``, ``dumps`` and ``safe_dump`` are no longer sources: they carry what their argument carries, so a
+# tainted argument taints the result and an Opaque or a literal does not)
 # calls whose result is a bool, a count or a positional label: a value that went through one is "wrapped" (r23 F41-a)
 TAINT_SAFE_CALLS = frozenset((
     "len", "bool", "any", "all", "isinstance", "hasattr", "callable", "id", "opaque", "Opaque", "same", "any_match",
     "load_failure", "matches_markers", "names_tier", "names_the_tier",
     "step_head_rows", "assert_same",
     "assert_has", "range", "enumerate_count", "job_re", "step_ref", "step_any", "key_re", "digest",
-    "count", "index", "find", "startswith", "endswith", "search", "match", "fullmatch", "isdigit"))
+    "count", "index", "find", "startswith", "endswith", "isdigit",
+    # these return line numbers (ints) and nothing else
+    "opaque_escape_lines", "tainted_assert_lines", "raw_operand_comparisons",
+    # a canary run object, a loaded variant module and the marker digests carry no author text; the run's ``texts``,
+    # ``datas`` and ``pins`` attributes do and are sources below (``TAINT_ATTRS``)
+    "canary_run", "CanaryRun", "load_variant", "canary_hits", "canary_control_failures", "canary_coverage_failures"))
+TAINT_ATTRS = frozenset(("texts", "datas", "pins"))
+# r24 sec F5: a Match object from ``search``/``match``/``fullmatch`` holds the text it matched, so it is tainted like the text
+# (only ``bool(...)`` of it is clear); the three names left the safe list
 TAINT_SAFE_SUFFIXES = ("_label", "_re", "_ref")
 # problem lines are labels-only by construction, but an assert that compares or prints them would echo a leaked line on
 # failure, so they stay tainted like any other value derived from a workflow
@@ -3026,10 +3176,15 @@ ASSERT_PREFIX = "assert"
 # names that hold repo paths or test-written constants (workflow file names, mutant labels), public by construction
 PUBLIC_NAMES = frozenset(("wf", "workflow", "workflow_name", "path"))
 # containers keyed by test-written constants: the KEY of ``.items()`` over them is public
-STATIC_KEYED = frozenset(("mutants", "forms", "texts", "DUMP_MUTANTS", "F10_MUTANTS", "cases", "shapes", "views", "keys", "variants"))
+STATIC_KEYED = frozenset(("mutants", "forms", "texts", "DUMP_MUTANTS", "F10_MUTANTS", "cases", "shapes", "views", "keys", "variants",
+                          "positional_cases"))
 # calls that print their arguments into a failure report besides the assert* family (``subTest`` parameters, ``fail``)
 ECHO_CALLS = frozenset(("subTest", "fail", "skipTest", "addCleanup"))
 WRAPPED_ASSERTS = frozenset(("assert_same", "assert_has"))
+# r24 sec F5: print and logging write their arguments out; a tainted argument is a finding like an assert operand
+PRINT_CALLS = frozenset(("print", "pprint", "warn"))
+LOG_BASES = frozenset(("logging", "logger", "log", "LOG"))
+LOG_METHODS = frozenset(("debug", "info", "warning", "error", "critical", "exception", "log"))
 
 
 def call_name(node):
@@ -3044,7 +3199,8 @@ def call_name(node):
 def static_keyed(node):
     """True for a container named in ``STATIC_KEYED`` (``mutants``, ``self.texts``, ``forms`` ...)."""
     return (isinstance(node, ast.Name) and node.id in STATIC_KEYED) or (
-        isinstance(node, ast.Attribute) and node.attr in STATIC_KEYED)
+        isinstance(node, ast.Attribute) and node.attr in STATIC_KEYED) or (
+        isinstance(node, ast.Call) and call_name(node) in STATIC_KEYED)
 
 
 def is_safe_call(name):
@@ -3066,15 +3222,24 @@ class TaintScan:
         self.returns = set()
         self.attrs = set()
         self.flagged = set()
+        self.closure = {}       # function name -> the enclosing scope's live environment (a closure sees later binds too)
+        self.lambdas = {}       # name -> (Lambda node, environment at the assignment): a local lambda is a helper too
+        self.aliases = {}       # name -> the assert or echo method it was bound to (``eq = self.assertEqual``)
+        self.leaked_public = set()  # r24 sec F5: a PUBLIC_NAMES name that was ever assigned or passed a tainted value
 
     def tainted(self, node, env):
         t = self.tainted
-        if node is None or isinstance(node, (ast.Constant, ast.Compare, ast.Lambda)):
+        if node is None or isinstance(node, (ast.Constant, ast.Compare)):
             return False
+        if isinstance(node, ast.Lambda):
+            return any(t(default, env) for default in [*node.args.defaults, *node.args.kw_defaults] if default is not None)
         if isinstance(node, ast.Name):
-            return node.id in env and node.id not in PUBLIC_NAMES
+            return node.id in env and (node.id not in PUBLIC_NAMES or node.id in self.leaked_public)
         if isinstance(node, ast.Attribute):
-            return node.attr in self.attrs or t(node.value, env)
+            if node.attr in TAINT_ATTRS:
+                return True
+            return (node.attr in self.attrs and (node.attr not in PUBLIC_NAMES or node.attr in self.leaked_public)) \
+                or t(node.value, env)
         if isinstance(node, ast.UnaryOp):
             return False if isinstance(node.op, ast.Not) else t(node.operand, env)
         if isinstance(node, ast.Call):
@@ -3096,24 +3261,79 @@ class TaintScan:
         if name in TAINT_SOURCES or name.endswith(TAINT_PROBLEM_SUFFIXES) or name in ("url_leaks", "first_difference", "where_differs"):
             return True
         base = node.func.value if isinstance(node.func, ast.Attribute) else None
+        lam = self.lambda_of(node)
+        if lam is not None:
+            return self.lambda_result(lam, node, env)
+        if isinstance(node.func, ast.Name) and node.func.id in env:
+            return True  # a callable bound from tainted material (``functools.partial(f, text)``) yields it
         if self.follow and name in self.functions:
             self.pass_params(self.functions[name], node, env)
             return name in self.returns
         return any(self.tainted(a, env) for a in args) or (base is not None and self.tainted(base, env))
 
-    def pass_params(self, func, node, env):
-        names = [a.arg for a in func.args.args if a.arg not in ("self", "cls")]
+    def lambda_of(self, node):
+        """``(Lambda, defining environment)`` of the callee of ``node`` when it is a local lambda, called by name or inline."""
+        if isinstance(node.func, ast.Lambda):
+            return node.func, None
+        if isinstance(node.func, ast.Name) and node.func.id in self.lambdas:
+            return self.lambdas[node.func.id]
+        return None
+
+    def lambda_result(self, lam, node, env):
+        """Whether calling the lambda with the arguments of ``node`` yields tainted material."""
+        lambda_node, inner = self.lambda_env(lam, node, env)
+        return self.tainted(lambda_node.body, inner)
+
+    def lambda_calls(self, lam, node, env):
+        """Visit every call inside the lambda body as it runs with the arguments of ``node`` (an assert in it sees them)."""
+        lambda_node, inner = self.lambda_env(lam, node, env)
+        for child in ast.walk(lambda_node.body):
+            if isinstance(child, ast.Call):
+                self.visit_call(child, inner, False)
+
+    def lambda_env(self, lam, node, env):
+        lambda_node, defined = lam
+        names = [a.arg for a in lambda_node.args.args]
+        inner = (set(env if defined is None else defined) | set(env)) - set(names)  # a parameter hides an outer name
         for position, arg in enumerate(node.args):
-            if position < len(names) and self.tainted(arg, env):
-                self.params[func.name].add(names[position])
+            if self.tainted(arg, env):
+                if position < len(names):
+                    inner.add(names[position])
+                elif lambda_node.args.vararg is not None:
+                    inner.add(lambda_node.args.vararg.arg)
         for kw in node.keywords:
-            if kw.arg and self.tainted(kw.value, env):
-                self.params[func.name].add(kw.arg)
+            if self.tainted(kw.value, env):
+                inner.add(kw.arg if kw.arg in names else getattr(lambda_node.args.kwarg, "arg", kw.arg))
+        return lambda_node, inner
+
+    def pass_params(self, func, node, env):
+        names = [a.arg for a in [*func.args.posonlyargs, *func.args.args] if a.arg not in ("self", "cls")]
+        known = {*names, *(a.arg for a in func.args.kwonlyargs)}
+        for position, arg in enumerate(node.args):
+            if isinstance(arg, ast.Starred):
+                arg = arg.value
+            if self.tainted(arg, env):
+                if position < len(names):
+                    self.add_param(func.name, names[position])
+                elif func.args.vararg is not None:
+                    self.add_param(func.name, func.args.vararg.arg)
+        for kw in node.keywords:
+            if self.tainted(kw.value, env):
+                if kw.arg in known:
+                    self.add_param(func.name, kw.arg)
+                elif func.args.kwarg is not None:
+                    self.add_param(func.name, func.args.kwarg.arg)
+
+    def add_param(self, function, name):
+        self.params[function].add(name)
+        if name in PUBLIC_NAMES:
+            self.leaked_public.add(name)
 
     def bind(self, target, env):
         for sub in ast.walk(target):
             if isinstance(sub, ast.Name):
-                env.add(sub.id)
+                if sub.id not in ("self", "cls"):  # ``cls.text = tainted`` taints the attribute, never ``cls`` itself
+                    env.add(sub.id)
             elif isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id in ("self", "cls"):
                 self.attrs.add(sub.attr)
 
@@ -3128,9 +3348,20 @@ class TaintScan:
 
     def assign(self, node, env):
         value = node.value
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                if isinstance(value, ast.Lambda):
+                    self.lambdas[target.id] = (value, env)
+                if self.echo_method(value) is not None:
+                    self.aliases[target.id] = self.echo_method(value)
         if not self.tainted(value, env):
             return
-        for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in PUBLIC_NAMES:
+                self.leaked_public.add(target.id)  # r24 sec F5: a public name rebound to author text is author text
+            if isinstance(target, ast.Attribute) and target.attr in PUBLIC_NAMES:
+                self.leaked_public.add(target.attr)
             safe = TAINT_SAFE_POSITIONS.get(call_name(value), set()) if isinstance(value, ast.Call) else set()
             if safe and isinstance(target, ast.Tuple):
                 for position, element in enumerate(target.elts):
@@ -3146,9 +3377,48 @@ class TaintScan:
                     pass
             self.statement(stmt, env, scope)
 
+    def echo_method(self, node):
+        """The assert or echo method an expression denotes: ``self.assertX``, ``getattr(self, "assertX")`` (any non-constant
+        name counts), a name bound to one, or ``functools.partial`` of one; None for anything else."""
+        if isinstance(node, ast.Attribute):
+            return node.attr if node.attr.startswith(ASSERT_PREFIX) or node.attr in ECHO_CALLS else None
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id)
+        if isinstance(node, ast.Call):
+            if call_name(node) == "getattr" and len(node.args) >= 2:
+                name = node.args[1]
+                if isinstance(name, ast.Constant) and isinstance(name.value, str):
+                    return name.value if name.value.startswith(ASSERT_PREFIX) or name.value in ECHO_CALLS else None
+                return "getattr"
+            if call_name(node) == "partial" and node.args:
+                return self.echo_method(node.args[0])
+        return None
+
+    def operands_tainted(self, test, env):
+        """A bare ``assert``: pytest prints the operands of a failing comparison, so each operand counts."""
+        if isinstance(test, ast.Compare):
+            return any(self.tainted(part, env) for part in [test.left, *test.comparators])
+        if isinstance(test, ast.BoolOp):
+            return any(self.operands_tainted(part, env) for part in test.values)
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return self.operands_tainted(test.operand, env)
+        return self.tainted(test, env)
+
     def statement(self, stmt, env, scope):
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.closure[stmt.name] = env  # the function sees this scope as it stands when it is called
+            positional = [*stmt.args.posonlyargs, *stmt.args.args]
+            for arg, default in zip(positional[len(positional) - len(stmt.args.defaults):], stmt.args.defaults):
+                if self.tainted(default, env):
+                    self.add_param(stmt.name, arg.arg)
+            for arg, default in zip(stmt.args.kwonlyargs, stmt.args.kw_defaults):
+                if default is not None and self.tainted(default, env):
+                    self.add_param(stmt.name, arg.arg)
             return  # analysed on its own, with its own environment
+        if isinstance(stmt, ast.Raise) and stmt.exc is not None and self.tainted(stmt.exc, env):
+            self.flagged.add(stmt.lineno)  # r24 sec F5: an exception built from author text prints it
+        if isinstance(stmt, ast.Assert) and (self.operands_tainted(stmt.test, env) or self.tainted(stmt.msg, env)):
+            self.flagged.add(stmt.lineno)
         if isinstance(stmt, ast.ClassDef):
             self.walk(stmt.body, set(env), scope)
             return
@@ -3170,25 +3440,41 @@ class TaintScan:
                 continue
             if isinstance(node, ast.Call):
                 self.visit_call(node, env)
-        for field in ("body", "orelse", "finalbody"):
-            for child in getattr(stmt, field, []) or []:
-                if isinstance(stmt, ast.ClassDef):
-                    break
+        for block in (getattr(stmt, "body", None), getattr(stmt, "orelse", None), getattr(stmt, "finalbody", None)):
+            for child in block if isinstance(block, list) and not isinstance(stmt, ast.ClassDef) else ():
                 self.statement(child, env, scope)
         for handler in getattr(stmt, "handlers", []) or []:
             for child in handler.body:
                 self.statement(child, env, scope)
 
-    def visit_call(self, node, env):
+    def echo_target(self, node):
+        """The assert, echo, print or logging method a call invokes (see ``echo_method``), else None."""
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in PRINT_CALLS:
+            return func.id
+        if isinstance(func, ast.Attribute):
+            if func.attr in PRINT_CALLS or (func.attr in LOG_METHODS and isinstance(func.value, ast.Name)
+                                            and func.value.id in LOG_BASES):
+                return func.attr
+            return self.echo_method(func)
+        return self.echo_method(func)
+
+    def visit_call(self, node, env, follow_lambda=True):
         name = call_name(node)
+        lam = self.lambda_of(node) if follow_lambda else None
+        if lam is not None:
+            self.lambda_calls(lam, node, env)
         if name in WRAPPED_ASSERTS:
             # the wrapper compares raw operands and reports only its label: the label argument must not be tainted
             label = node.args[3] if len(node.args) > 3 else next((kw.value for kw in node.keywords if kw.arg == "label"), None)
             if label is not None and self.tainted(label, env):
                 self.flagged.add(node.lineno)
-        elif (name.startswith(ASSERT_PREFIX) or name in ECHO_CALLS) and isinstance(node.func, ast.Attribute):
+        elif self.echo_target(node) is not None:
+            target = self.echo_target(node)
             args = [*node.args, *(kw.value for kw in node.keywords)]
-            if name == "assertTrue" and args:
+            if isinstance(node.func, ast.Call) and call_name(node.func) == "partial":
+                args += [*node.func.args[1:], *(kw.value for kw in node.func.keywords)]
+            if target == "assertTrue" and args and isinstance(node.func, ast.Attribute):
                 args = args[1:]  # a failing assertTrue prints a FALSY first operand: empty text, never a value
             if any(self.tainted(a, env) for a in args):
                 self.flagged.add(node.lineno)
@@ -3199,16 +3485,20 @@ class TaintScan:
         elif self.follow and name in self.functions:
             self.pass_params(self.functions[name], node, env)
 
+    def state(self):
+        return (sorted(self.returns), sorted(self.attrs), {k: sorted(v) for k, v in self.params.items()},
+                sorted(self.leaked_public))
+
     def run(self):
         for _ in range(6):
-            before = (sorted(self.returns), sorted(self.attrs), {k: sorted(v) for k, v in self.params.items()})
+            before = self.state()
             self.flagged = set()
             self.walk(self.tree.body, set(), None)
             for name, func in self.functions.items():
-                env = set(self.params[name])
+                env = set(self.params[name]) | set(self.closure.get(name, ()))
                 for _pass in range(2):
                     self.walk(func.body, env, name)
-            after = (sorted(self.returns), sorted(self.attrs), {k: sorted(v) for k, v in self.params.items()})
+            after = self.state()
             if before == after:
                 break
         return sorted(self.flagged)
@@ -3217,6 +3507,39 @@ class TaintScan:
 def tainted_assert_lines(source, follow_helpers=True):
     """Sorted line numbers of the ``assert*`` calls in ``source`` with an unwrapped tainted argument."""
     return TaintScan(source, follow_helpers).run()
+
+
+# ---- r24 sec F6: no path to the raw text outside the wrapper class ----
+OPAQUE_PRIVATE = frozenset(("_" + "raw", "_" + "RAW", "__get" + "state__"))  # spelled in parts so this line is not a hit
+
+
+def opaque_escape_lines(source, allowed=("Opaque",)):
+    """Sorted line numbers in ``source`` that reach the raw text of an ``Opaque`` by a path other than ``Opaque.raw()``:
+    an attribute ``._raw`` or ``.__getstate__``, a read of the registry name ``_RAW``, a string constant that names one of
+    them, or ``getattr``/``hasattr``/``setattr``/``delattr`` with a name that is not a constant string.  Code inside a class or
+    function named in ``allowed`` (the wrapper itself; the probe that tries every path) is exempt."""
+    tree = ast.parse(source)
+    found = set()
+
+    def visit(node, exempt):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in allowed:
+            exempt = True
+        if not exempt:
+            if isinstance(node, ast.Attribute) and node.attr in OPAQUE_PRIVATE:
+                found.add(node.lineno)
+            elif isinstance(node, ast.Name) and node.id in OPAQUE_PRIVATE and not isinstance(node.ctx, ast.Store):
+                found.add(node.lineno)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in OPAQUE_PRIVATE:
+                found.add(node.lineno)
+            elif isinstance(node, ast.Call) and call_name(node) in ("getattr", "hasattr", "setattr", "delattr") \
+                    and len(node.args) >= 2 and not (isinstance(node.args[1], ast.Constant)
+                                                     and isinstance(node.args[1].value, str)):
+                found.add(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            visit(child, exempt)
+
+    visit(tree, False)
+    return sorted(found)
 
 
 class TestOpaqueIsFailClosed8187R23(unittest.TestCase):
@@ -3232,12 +3555,12 @@ class TestOpaqueIsFailClosed8187R23(unittest.TestCase):
         self.assertTrue(f"{value}" == shown and f"{value!r}" == shown and f"{value:>40}" == shown)
         self.assertTrue("%s" % value == shown and "%r" % value == shown and "{}".format(value) == shown)
         self.assertTrue(bytes(value) == shown.encode("ascii") and str([value]) == "[" + shown + "]")
-        self.assertTrue(json.dumps(str(value)) == json.dumps(shown))
+        self.assertEqual(json.dumps(str(value)), json.dumps(shown))
         self.assertTrue(self.SECRET not in repr({value: value}) and self.SECRET not in str((value, value)))
 
     def test_a_label_shaped_author_text_prints_as_its_own_label_and_is_told_apart_by_equality_only(self):
         shaped = ty.Opaque("step[3]", "step[0]")
-        self.assertTrue(str(shaped) == "step[0] len=7")
+        self.assertEqual(str(shaped), "step[0] len=7")
         self.assertTrue(shaped == ty.Opaque("step[3]", "key[9]") and shaped != ty.Opaque("step[4]", "step[0]"))
 
     def test_equality_and_hash_compare_the_raw_text_and_a_plain_string_never_equals_the_wrapper(self):
@@ -3264,17 +3587,17 @@ class TestOpaqueIsFailClosed8187R23(unittest.TestCase):
     def test_the_label_helpers_return_wrappers_with_positions(self):
         jobs = {"b": 1, "a": 2}
         self.assertTrue(str(ty.job_label("a", jobs)) == "job[0] len=1" and str(ty.job_label("zzz", jobs)) == "job[?] len=3")
-        self.assertTrue(str(ty.name_label("b", ["a", "c"])) == "key[1] len=1")
-        self.assertTrue(str(ty.key_label("hunter2", 4)) == "key[4] len=7")
-        self.assertTrue(str(ty.step_label({"name": "n" * 9}, 2)) == "step[2] len=9")
-        self.assertTrue(str(ty.step_label({"run": "x"}, 5)) == "step[5] len=0")
+        self.assertEqual(str(ty.name_label("b", ["a", "c"])), "key[1] len=1")
+        self.assertEqual(str(ty.key_label("hunter2", 4)), "key[4] len=7")
+        self.assertEqual(str(ty.step_label({"name": "n" * 9}, 2)), "step[2] len=9")
+        self.assertEqual(str(ty.step_label({"run": "x"}, 5)), "step[5] len=0")
 
     def test_raw_is_called_only_inside_same(self):
-        """The one place that unwraps is the bool helper ``ty.same``; ``Opaque.__eq__`` reads the slot directly and no
-        other code (checker, tests) calls ``.raw()``."""
+        """The places that unwrap are the bool helper ``ty.same`` and ``Opaque.__eq__`` / ``__hash__`` (both return a bool or
+        an int, never text); no other code (checker, tests) calls ``.raw()``."""
         for path in (Path(ty.__file__), Path(__file__)):
             tree = ast.parse(path.read_text(encoding="utf-8"))
-            allowed = {"same"} if path.name == "tier_yaml_8187.py" else set()
+            allowed = {"same", "__eq__", "__hash__"} if path.name == "tier_yaml_8187.py" else set()
             for owner in ast.walk(tree):
                 if not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
@@ -3295,19 +3618,19 @@ class TestNoRoutedSiteCanEchoAuthorText8187R23(unittest.TestCase):
 
     def test_no_marker_reaches_any_channel(self):
         run = self.run_
-        self.assertTrue(run.leaks == [], "%d marker leaks; by shape %s" % (len(run.leaks), sorted(run.by_shape.items())))
+        self.assertEqual(len(run.leaks), 0, "%d marker leaks" % len(run.leaks))
 
     def test_every_probe_shape_leaks_zero_markers(self):
         for shape in CANARY_SHAPES:
             with self.subTest(shape=shape):
-                self.assertTrue(self.run_.by_shape.get(shape, 0) == 0)
+                self.assertIs(self.run_.by_shape.get(shape, 0) == 0, True)
 
     def test_no_scenario_raised_and_pass_and_fail_paths_behaved(self):
         run = self.run_
-        self.assertTrue(run.errors == [], "%d scenarios raised: %s" % (len(run.errors), sorted({e[2] for e in run.errors})))
-        self.assertTrue(run.unexpected == [], "%d pass-path scenarios returned problems: %s" % (
+        self.assertEqual(run.errors, [], "%d scenarios raised: %s" % (len(run.errors), sorted({e[2] for e in run.errors})))
+        self.assertEqual(run.unexpected, [], "%d pass-path scenarios returned problems: %s" % (
             len(run.unexpected), sorted({(shape, scenario) for shape, scenario in run.unexpected})[:6]))
-        self.assertTrue(run.silent == [], "%d fail-path scenarios returned none: %s" % (
+        self.assertEqual(run.silent, [], "%d fail-path scenarios returned none: %s" % (
             len(run.silent), sorted({scenario for _shape, scenario in run.silent})[:8]))
 
     def test_the_fail_path_was_forced_in_both_views_for_every_shape(self):
@@ -3319,17 +3642,15 @@ class TestNoRoutedSiteCanEchoAuthorText8187R23(unittest.TestCase):
         self.assertGreaterEqual(run.problem_lines, shapes * 100)
         self.assertGreaterEqual(run.counter, shapes * 200)
 
-    def test_every_routed_site_was_driven_and_every_label_form_appeared(self):
+    def test_every_label_form_appeared(self):
+        """Per-site driving is proven by ``TestEveryRoutedSiteIsDriven8187R24`` (one source mutant per routed site)."""
         run = self.run_
-        for (in_test_module, name), counter in sorted(run.counters.items()):
-            with self.subTest(site=name, module="test" if in_test_module else "checker"):
-                self.assertTrue(counter.call_count > 0, "the routed site was never driven")
         forms = {re.sub(r"\[.*", "", form) for form in run.label_forms}
-        self.assertTrue({"job", "step", "key"} <= forms, "label forms seen: %s" % sorted(forms))
+        self.assertLessEqual({"job", "step", "key"}, forms, "label forms seen: %s" % sorted(forms))
         # a job id the layout reader cannot read plainly has no pins of its own (that refusal is itself a fail path the
         # scenarios drive against the real pins); the shapes whose ids stay plain must all have run on their own pins
-        self.assertTrue(len(run.skipped) <= len(CANARY_SHAPES) * 6, "%d self-pin scenarios were skipped" % len(run.skipped))
-        self.assertTrue([s for s in run.skipped if s[0] in ("plain", "key-suffix")] == [], "a plain-id self-pin scenario was skipped")
+        self.assertLessEqual(len(run.skipped), len(CANARY_SHAPES) * 6, "%d self-pin scenarios were skipped" % len(run.skipped))
+        self.assertEqual([s for s in run.skipped if s[0] in ("plain", "key-suffix")], [], "a plain-id self-pin scenario was skipped")
 
 
 class TestNoAssertCanEchoAuthorText8187R23(unittest.TestCase):
@@ -3373,24 +3694,24 @@ class TestNoAssertCanEchoAuthorText8187R23(unittest.TestCase):
 
     def test_no_assert_in_this_module_receives_a_raw_workflow_or_pin_value(self):
         flagged = tainted_assert_lines(Path(__file__).read_text(encoding="utf-8"))
-        self.assertTrue(flagged == [], "%d asserts receive an unwrapped value; lines %s" % (len(flagged), flagged[:12]))
+        self.assertEqual(flagged, [], "%d asserts receive an unwrapped value; lines %s" % (len(flagged), flagged[:12]))
 
     def test_the_scanner_flags_each_echo_shape_and_clears_the_wrapped_forms(self):
         for name, source in self.DIRTY.items():
             with self.subTest(shape=name):
-                self.assertTrue(len(tainted_assert_lines(source)) == 1)
-        self.assertTrue(tainted_assert_lines(self.CLEAN) == [])
+                self.assertEqual(len(tainted_assert_lines(source)), 1)
+        self.assertEqual(tainted_assert_lines(self.CLEAN), [])
 
     def test_the_scanner_follows_helpers_so_a_raw_compare_restored_through_a_helper_and_a_list_is_red(self):
-        self.assertTrue(len(tainted_assert_lines(self.HELPER_AND_LIST)) == 1)
-        self.assertTrue(tainted_assert_lines(self.HELPER_AND_LIST, follow_helpers=False) == [],
-                        "the stop-at-the-helper scanner is the mutant this gate exists to catch")
+        self.assertEqual(len(tainted_assert_lines(self.HELPER_AND_LIST)), 1)
+        self.assertEqual(tainted_assert_lines(self.HELPER_AND_LIST, follow_helpers=False), [], "the stop-at-the-helper scanner is the mutant this gate exists to catch")
 
     def test_the_default_scan_follows_helpers(self):
         self.assertTrue(TaintScan("x = 1").follow)
 
 F40E_BYTES = 1 << 20
-F40E_SECONDS = 5.0
+F40E_RATIO_MAX = 3.0
+F40E_CAP_SECONDS = 20.0
 
 
 def f40e_big(shape):
@@ -3411,53 +3732,9 @@ def f40e_edit(text, step, value):
     return "\n".join(lines[:at + 1] + [pad + "X_BIG: " + json.dumps(value, ensure_ascii=False)] + lines[at + 1:])
 
 
-class TestCheckerTimeIsBounded8187R23(unittest.TestCase):
-    """sec F40-e (r23): the checker finishes on a workflow whose step name, env value and run text are each a 1 MiB value
-    (letters, then every probe shape), both views, pass path and fail path, in under ``F40E_SECONDS`` per shape, and
-    prints labels only.  At the r21 head a 1 MiB plain-letter value took 4229.7 s inside ``printable``; the deny-list is gone,
-    the userinfo mask (a quadratic regex, 4.5 s at 64 KiB) is gone, and ``EXPORT_CALL`` is a linear scan."""
-
-    workflow = "ci.yml"
-
-    @classmethod
-    def setUpClass(cls):
-        cls.text = (WORKFLOWS / cls.workflow).read_text(encoding="utf-8")
-        cls.pins = load_job_pins()
-        cls.step = pin_targets(cls.workflow, cls.text)[0]
-
-    def run_shape(self, name, shape):
-        value = f40e_big(shape)
-        edited = f40e_edit(self.text, self.step, value)
-        own = pins_for({self.workflow: edited})
-        kinds = ("fail loaded", "fail text", "pass loaded", "pass text")
-        calls = (
-            (primary_pin_problems, self.pins[PRIMARY], True),
-            (job_pin_problems, self.pins[SECONDARY], True),
-            (primary_pin_problems, own[PRIMARY], False),
-            (job_pin_problems, own[SECONDARY], False),
-        )
-        start = time.perf_counter()
-        for position, (fn, pins, must_fail) in enumerate(calls):
-            problems = fn(self.workflow, edited, pins)
-            count = len(problems)
-            self.assertTrue((count > 0) == must_fail, "%s %s: %d problems" % (name, kinds[position], count))
-            longest = max([len(line) for line in problems] + [0])
-            self.assertTrue(longest < 600, "%s %s: a problem line of %d chars" % (name, kinds[position], longest))
-            echoed = len([line for line in problems if value[:32] in line])
-            self.assertTrue(echoed == 0, "%s %s: the value is in %d problem lines" % (name, kinds[position], echoed))
-        elapsed = time.perf_counter() - start
-        self.assertTrue(elapsed < F40E_SECONDS, "%s: %.2f s for four calls (budget %.1f s)" % (name, elapsed, F40E_SECONDS))
-        return elapsed
-
-    def test_letters_one_mebibyte_in_name_env_and_run(self):
-        self.run_shape("letters", lambda marker: marker)
-
-    def test_every_probe_shape_one_mebibyte_in_name_env_and_run(self):
-        for name, shape in sorted(CANARY_SHAPES.items()):
-            if name == "plain":
-                continue
-            with self.subTest(shape=name):
-                self.run_shape(name, shape)
+class TestExportCallScanIsLinear8187R23(unittest.TestCase):
+    """sec F40-e (r23): ``EXPORT_CALL`` is a linear scan equal to the old regex on the probe cases.  The whole-checker
+    time gate is ``TestCheckerTimeIsLinear8187R24`` (a linearity ratio plus a cap, not a host-speed budget)."""
 
     def test_the_export_call_scan_is_linear_and_matches_the_regex(self):
         old = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
@@ -3468,12 +3745,12 @@ class TestCheckerTimeIsBounded8187R23(unittest.TestCase):
             "tier_credential.py github-env tier_credential.py github-env\n--url-file tier_credential.py github-env",
             "tier_credential.py\ngithub-env --url-file", "x --url-file tier_credential.py github-env")
         for case in cases:
-            self.assertTrue(bool(old.search(case)) == bool(ty.EXPORT_CALL.search(case)), "a case differs")
+            self.assertEqual(bool(old.search(case)), bool(ty.EXPORT_CALL.search(case)), "a case differs")
         unit = "tier_credential.py github-env "
         start = time.perf_counter()
         self.assertTrue(not ty.EXPORT_CALL.search(unit * (F40E_BYTES // len(unit))))
         self.assertTrue(ty.EXPORT_CALL.search(unit * (F40E_BYTES // len(unit)) + "--url-file"))
-        self.assertTrue(time.perf_counter() - start < 1.0)
+        self.assertLess(time.perf_counter() - start, 1.0)
 
 
 
@@ -3509,6 +3786,8 @@ def routed_sites(source, in_test_file):
             continue
         if kind == "ty" and isinstance(node.func, ast.Attribute):
             continue
+        if kind == "test" and call_name(node) == "step_label" and isinstance(node.func, ast.Name):
+            continue  # the module-local tuple wrapper: its own label comes from the routed ``ty.step_label`` inside it
         sites[(kind, node.lineno, node.col_offset)] = call_name(node)
     ordered, seen = {}, {}
     for (site_kind, lineno, col), helper in sorted(sites.items(), key=lambda item: item[0][1:]):
@@ -3799,6 +4078,42 @@ class TestLeakDetectorHasNoFalsePositives8187R24(unittest.TestCase):
 
 
 # ---- r24 F42c and F42e: hygiene gates over this module ----
+class TestFailingAssertsPrintLabelsOnly8187R24(unittest.TestCase):
+    """r24 F42e (CodeQL ``py/imprecise-assert``): the converted asserts keep failing output label-only.  A failing probe of
+    each converted form carries a marker in every operand; its message holds the label and no marker."""
+
+    def failure(self, call):
+        try:
+            call()
+        except AssertionError as exc:
+            return str(exc)
+        return None
+
+    def test_each_converted_form_fails_with_a_label_only_message(self):
+        case = unittest.TestCase()
+        left, right = CANARY_SENTINEL + "a1b2c3d4e5f60718293a4b5c", CANARY_SENTINEL + "0f1e2d3c4b5a69788796a5b4"
+        calls = {
+            "assert_same": lambda: assert_same(case, left, right, "probe label"),
+            "assert_has": lambda: assert_has(case, left, [right], "probe label"),
+            "assertIs-compare": lambda: case.assertIs(left == right, True, "probe label"),
+            "len-compare": lambda: case.assertEqual(len([left, right]), 0, "probe label"),
+        }
+        for name, call in sorted(calls.items()):
+            with self.subTest(form=name):
+                message = self.failure(call)
+                self.assertIs(message is not None, True, "the probe did not fail")
+                self.assertIs("probe label" in message or "len" in message or "2 != 0" in message, True)
+                self.assertEqual(canary_hits(message, canary_window_table([left[len(CANARY_SENTINEL):], right[len(CANARY_SENTINEL):]])), set())
+
+    def test_no_converted_assert_is_an_imprecise_single_compare(self):
+        tree = ast.parse(THIS_PATH.read_text(encoding="utf-8"))
+        found = [node.lineno for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and node.func.attr in ("assertTrue", "assertFalse") and node.args and isinstance(node.args[0], ast.Compare)
+                 and len(node.args[0].ops) == 1]
+        self.assertEqual(found, [], "assertTrue/assertFalse of one comparison remain")
+
+
 class TestModuleHygiene8187R24(unittest.TestCase):
     """r24: no ``tempfile`` call without ``dir=`` (F42c) and no ``assertTrue``/``assertFalse`` of a comparison (F42e,
     CodeQL ``py/imprecise-assert``)."""
@@ -3829,12 +4144,12 @@ def f40e_measure(case, name, shape, nbytes):
     value = shape("a" * int(nbytes / unit))
     edited = f40e_edit(case.text, case.step, value)
     own = pins_for({case.workflow: edited})
-    calls = ((primary_pin_problems, case.pins[PRIMARY], True), (job_pin_problems, case.pins[SECONDARY], True),
-             (primary_pin_problems, own[PRIMARY], False), (job_pin_problems, own[SECONDARY], False))
+    calls = ((primary_pin_problems, case.pins[PRIMARY]), (job_pin_problems, case.pins[SECONDARY]),
+             (primary_pin_problems, own[PRIMARY]), (job_pin_problems, own[SECONDARY]))
     start = time.perf_counter()
-    for fn, pins, must_fail in calls:
+    for position, (fn, pins) in enumerate(calls):
         problems = fn(case.workflow, edited, pins)
-        case.assertEqual(len(problems) > 0, must_fail)
+        case.assertIs(len(problems) > 0, position < 2)  # the first two calls use the real pins and must fail
         case.assertLess(max([len(line) for line in problems] + [0]), 600)
         case.assertEqual(len([line for line in problems if value[:32] in line]), 0)
     return time.perf_counter() - start
@@ -3933,7 +4248,7 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         self.assertEqual(canary_coverage_failures(run, ["plain", "multi-line"]), [])
         for shape in ("plain", "multi-line"):
             for view in ("loaded", "text"):
-                self.assertGreater(run.fail_views.get((shape, view), 0), 0)
+                self.assertIs(run.fail_views.get((shape, view), 0) > 0, True, "%s/%s" % (shape, view))
 
 
 # ---- r24 security F4: YAML tags, %TAG directives and bad escapes are seeded; no loader call prints author text ----
@@ -3966,7 +4281,7 @@ class TestNoLoaderCallPrintsAuthorText8187R24(unittest.TestCase):
         run = CanaryRun(sys.modules[__name__])
         faults = canary_loader_faults(run, "plain", CANARY_SHAPES["plain"])
         for name in ("local-tag", "tag-directive", "bad-escape"):
-            self.assertIn(name, faults)
+            self.assertIs(name in faults, True, name)
 
     def test_each_plant_is_refused_without_the_marker_in_any_channel(self):
         run = CanaryRun(sys.modules[__name__])
@@ -4007,6 +4322,11 @@ TAINT_SEC_SHAPES = {
     "raise ValueError": TAINT_HEAD + "        raise ValueError(text)\n",
     "partial of an assert": TAINT_HEAD + "        functools.partial(self.assertEqual, text)('x')\n",
     "lambda direct call": TAINT_HEAD + "        self.assertEqual((lambda t: t)(text), 'x')\n",
+    "closure": TAINT_HEAD + "        def inner():\n            self.assertEqual(text, 'x')\n        inner()\n",
+    "assigned lambda": TAINT_HEAD + "        check = lambda t: self.assertEqual(t, 'x')\n        check(text)\n",
+    "default argument": TAINT_HEAD + "        def probe(v=text):\n            self.assertEqual(v, 'x')\n        probe()\n",
+    "public name path": TAINT_HEAD + "        path = text\n        self.assertEqual(path, 'x')\n",
+    "public name workflow": TAINT_HEAD + "        workflow = text\n        self.assertEqual(workflow, 'x')\n",
 }
 
 
@@ -4048,7 +4368,9 @@ class TestNoPathToTheRawTextOutsideOpaque8187R24(unittest.TestCase):
     def test_neither_file_reaches_for_the_raw_text(self):
         for path in (TY_PATH, THIS_PATH):
             with self.subTest(file=path.name):
-                self.assertEqual(opaque_escape_lines(path.read_text(encoding="utf-8")), [])
+                # the probe function is the one place that tries every path on purpose; nothing else may
+                self.assertEqual(opaque_escape_lines(path.read_text(encoding="utf-8"),
+                                                     allowed=("Opaque", "opaque_probe_paths")), [])
 
     def test_the_module_docstring_states_the_file_name_exception(self):
         self.assertIn("repo_problems", ty.__doc__)
