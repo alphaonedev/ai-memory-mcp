@@ -111,6 +111,44 @@ def test_non_str_base_url_is_a_typed_value_error_at_construction_8195(client_cls
     assert type(refused.value) is ValueError
 
 
+# ---- sec r4 N1(b): a ``str`` subclass cannot make the send differ from the check -----------
+
+
+class _Rewriting(str):
+    """A ``str`` whose ``rstrip`` returns another URL: the value sent must be the value checked."""
+
+    def __new__(cls, value: str, rewritten: str) -> "_Rewriting":
+        obj = super().__new__(cls, value)
+        obj.rewritten = rewritten  # type: ignore[attr-defined]
+        return obj
+
+    def rstrip(self, chars: "str | None" = None) -> str:  # type: ignore[override]
+        return self.rewritten  # type: ignore[attr-defined,no-any-return]
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_str_subclass_cannot_rewrite_an_https_check_into_a_plaintext_send_8195(client_cls: type) -> None:
+    sneaky = _Rewriting(_HTTPS + "://localhost:9077", "ht" + "tp://127.0.0.1:9")
+    client = client_cls(base_url=sneaky, api_key=_PLACEHOLDER, verify=None)
+    try:
+        assert client._client.base_url.scheme == "https"  # noqa: SLF001
+        assert client._client.build_request("GET", "/").url.scheme == "https"  # noqa: SLF001
+        assert client._client.base_url.host == "localhost"  # noqa: SLF001
+    finally:
+        if isinstance(client, AiMemoryClient):
+            client.close()
+        else:
+            asyncio.run(client.aclose())  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_str_subclass_with_a_plaintext_value_is_refused_whatever_rstrip_returns_8195(client_cls: type) -> None:
+    sneaky = _Rewriting("ht" + "tp://localhost:9077", _HTTPS + "://localhost:9077")
+    with pytest.raises(ValueError, match="https") as refused:
+        client_cls(base_url=sneaky, api_key=_PLACEHOLDER, verify=None)
+    assert type(refused.value) is ValueError
+
+
 # ---- code r3 F6: the refusal never echoes a part of the URL ---------------------------
 
 _SCHEMELESS = {"userinfo-host": "alice" + ":" + _PW + "@daemon-host.invalid", "host-port": "daemon-host.invalid:9077"}

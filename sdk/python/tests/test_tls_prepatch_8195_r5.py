@@ -3,9 +3,12 @@
 ``_STOCK_HANDSHAKE`` is captured at import, so a ``minimum_version`` / ``maximum_version`` descriptor
 replaced before that import passes the stock-identity leg of ``_context_verifies``. The
 ``isinstance(..., ssl.TLSVersion)`` check in ``_tls_range_is_modern`` is then the only refusal: it
-turns an ``int`` 771 (numerically TLS 1.2), a ``str`` or ``None`` bound into the typed ``ValueError``
-instead of an admitted context or an untyped ``TypeError``. This file kills mutant M66; it reruns
-the child in a fresh interpreter so the import order is real.
+turns an ``int`` bound (the true value as a plain ``int``, or 771), a ``str`` or ``None`` bound into the
+typed ``ValueError`` instead of an admitted context or an untyped ``TypeError``. A replacement that
+reports a ``TLSVersion`` other than the context's real bound (``lie``) is refused too, because the
+bounds are also read through the C-level ``_ssl._SSLContext`` descriptors and compared (sec r4 N2).
+The ``int-raw`` form is the one only the type check refuses, so it kills mutant M66. The child runs
+in a fresh interpreter so the import order is real.
 """
 from __future__ import annotations
 
@@ -33,7 +36,7 @@ def _outcome(attr: str, kind: str) -> str:
     return lines[0]
 
 
-@pytest.mark.parametrize("kind", ["int-771", "str", "none"])
+@pytest.mark.parametrize("kind", ["int-raw", "int-771", "str", "none", "lie"])
 @pytest.mark.parametrize("attr", ["minimum_version", "maximum_version"])
 def test_bound_replaced_before_import_is_refused_with_the_typed_error_8195(attr: str, kind: str) -> None:
     assert _outcome(attr, kind) == "outcome=REFUSED-ValueError"
