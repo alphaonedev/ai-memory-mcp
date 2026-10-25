@@ -1295,8 +1295,6 @@ RUN_PY_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.py")
 RUN_SH_FLAGS_RE = re.compile(r"[-+][euxBE]+")
 RUN_PY_FLAGS_RE = re.compile(r"-[IuBsSE]+")
 RUN_DURATION_RE = re.compile(r"[0-9]+[smhd]?")
-AWK_UNSAFE_RE = re.compile(r"system\s*\(|getline|\|\s*[\"&]|[\"]\s*\||@load|@include")
-SED_UNSAFE_RE = re.compile(r"(?:^|[;{\n])\s*e(?:\s|$)|/[gIpm0-9]*e[gIpm0-9]*(?:$|[;}\n])")
 FETCH_ALLOWED = ("curl", "wget", "sha256sum", "shasum", "tar", "unzip", "mkdir", "mv", "cp", "cd", "echo", "test", "[",
                  "ls", "chmod")
 FETCH_FILE_RE = re.compile(r"GITHUB_(?:ENV|PATH)(?![A-Za-z0-9_])")  # a fetch step never edits the next steps' env or PATH
@@ -1317,9 +1315,6 @@ WGET_SHORT_VALUE_RE = re.compile(r"-[qvcN]*[OtTP]")
 WGET_SHORT_ATTACHED_RE = re.compile(r"-[qvcN]*O(.+)")
 WGET_LONG_FLAGS = frozenset(("--quiet", "--no-verbose", "--continue", "--no-clobber", "--https-only", "--retry-connrefused"))
 WGET_LONG_VALUE = frozenset(("--output-document", "--tries", "--timeout", "--directory-prefix", "--max-redirect"))
-DANGEROUS_ASSIGN_RE = re.compile(r"LD_\w*|DYLD_\w*|BASH_ENV|ENV|PATH|IFS|PS4|CDPATH|SHELLOPTS|PYTHONPATH|PYTHONSTARTUP|"
-                                 r"NODE_OPTIONS|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|GIT_\w*|CURL_\w*|WGETRC|TAR_OPTIONS|SSL_CERT_\w+|"
-                                 r"(?i:https?_proxy|all_proxy|no_proxy)")
 TAR_FLAGS_RE = re.compile(r"-?[xzfvCjJtpmkO]+")  # no -I / --use-compress-program / --to-command / --checkpoint-action
 TAR_LONG_RE = re.compile(r"--(?:strip-components=[0-9]+|no-same-owner|no-same-permissions)")
 RUNS_ON_MATRIX_RE = re.compile(r"\$\{\{\s*matrix\.os\s*\}\}")
@@ -1353,6 +1348,8 @@ class RunCtx:
         self.uses_ids = frozenset(uses_ids)  # Round 8 (S3): ids of `uses:` steps, whose outputs run text never names
         self.matrix_values: Dict[str, List[str]] = dict(matrix_values or {})  # Round 8 (S4): literal values per key
         self.fetched: set = set()
+        self.fetch_dirs: set = set()  # Round 9 (sec F3): the directories a step wrote a download into
+        self.made: set = set()  # Round 9 (F6): variables an earlier step wrote to GITHUB_ENV from a computed value
 
 
 def expr_allowed(expr: str, ctx: RunCtx) -> bool:
@@ -1532,9 +1529,19 @@ def matrix_literals(job: Node) -> Dict[str, List[str]]:
         return out
 
     def values(node: Node) -> List[str]:
+        if node.kind == "map":
+            return [MATRIX_COMPLEX]  # Round 9 (F8): a mapping value spliced whole is not a word
         if node.kind == "seq" and isinstance(node.value, list):
-            return [t for n in node.value if n.kind == "scalar" for t in flow_items(n.text())]
-        return flow_items(node.text()) if node.kind == "scalar" else []
+            got: List[str] = []
+            for n in node.value:
+                if n.kind != "scalar" or matrix_complex_text(n.text()):
+                    got.append(MATRIX_COMPLEX)
+                else:
+                    got.extend(flow_items(n.text()))
+            return got
+        if node.kind == "scalar":
+            return [MATRIX_COMPLEX] if matrix_complex_text(node.text()) else flow_items(node.text())
+        return []
 
     for key, val in matrix.value.items():
         if key == "include":
@@ -1579,6 +1586,19 @@ class ShellError(Exception):
     """The script text is outside what the scanner understands (a step that fetches then fails closed)."""
 
 
+class XStr(str):
+    """Round 9 (F7, F1, F2, F6): a decoded shell word that remembers whether an expansion (`$name`, `${...}`, `$(...)`, a
+    backtick) took part in it. ``lit`` of a word is False for any quote, so a quoted literal and an expansion differ
+    only here."""
+
+    exp = True
+
+
+def is_exp(text: str) -> bool:
+    """True when the word ``text`` held an expansion, or is a plain str of unknown origin (then it is assumed to)."""
+    return bool(getattr(text, "exp", True))
+
+
 class ShellLevel:
     """The parse state of one command list (the top level, a `$(...)`, a backtick or a `<(...)`)."""
 
@@ -1593,6 +1613,7 @@ class ShellLevel:
         self.prev = "\n"  # the separator before the next command (Round 7, F3)
         self.neg = False  # a command that follows `if`, `elif`, `while`, `until` or `!` is a condition
         self.stack: List[str] = []  # open if / while / until / for / case / `{` constructs
+        self.kind = ""  # Round 9: the kind of the redirect whose target word is next ("<", ">" or "<<<")
         self.last: Optional[int] = None  # index into ShellScan.info of the command the next separator ends
         self.fn_next = False  # a function definition was just read, so the next `{` opens its body
         self.dbl = False  # inside `[[ ... ]]`, where `(`, `)`, `&&` and `||` are operators of the test, not of the shell
@@ -1621,6 +1642,10 @@ class ShellScan:
         self.info: List[Dict[str, object]] = []
         self.targets: List[str] = []
         self.funcs: set = set()  # Round 8 (S8): the names `name()` defines in the script
+        self.xcount = 0  # Round 9: expansions read so far (a word is expanded when the count moved while it was read)
+        self.pre_redirs: List[Tuple[str, str]] = []  # redirects read before the command word they belong to
+        self.assign_vals: List[Tuple[str, str, bool]] = []  # Round 9 (F6): (name, value, expanded) per assignment
+        self.for_vars: List[str] = []  # Round 9 (F6): the loop variables of `for` and `select`
         self.nest = 0
         self.scan(None)
 
@@ -1629,6 +1654,10 @@ class ShellScan:
         if lv.skip:
             lv.skip = False
             self.targets.append(text)
+            if lv.cur is not None and lv.last is not None:
+                self.info[lv.last]["redirs"].append((lv.kind, text))  # type: ignore[union-attr]
+            else:
+                self.pre_redirs.append((lv.kind, text))
             return
         if lv.cases and lv.cases[-1] == "pat":
             if lit and text == "esac":
@@ -1639,6 +1668,7 @@ class ShellScan:
         ex, lv.expect = lv.expect, ""
         if ex == "for_var":
             lv.expect = "for_in"
+            self.for_vars.append(str(text))
             return
         if ex == "for_in" and lit and text == "in":
             lv.wordlist = True
@@ -1661,6 +1691,7 @@ class ShellScan:
         m = SHELL_ASSIGN_RE.match(text)
         if m is not None:
             self.assigns.append(m.group(1))
+            self.assign_vals.append((m.group(1), ("\0+" if m.group(0).endswith("+=") else "") + str(text[m.end():]), is_exp(text)))
             return
         if lit and text in SHELL_CMD_KW:
             if text in ("if", "elif", "while", "until", "!"):
@@ -1688,7 +1719,9 @@ class ShellScan:
             return
         lv.cur = []
         top = self.nest == 0 and lv.paren == 0 and not any(k in ("if", "while", "until", "case", "fn") for k in lv.stack)
-        self.info.append({"prev": lv.prev, "nxt": "", "neg": lv.neg, "top": top, "sub": self.nest > 0})
+        self.info.append({"prev": lv.prev, "nxt": "", "neg": lv.neg, "top": top, "sub": self.nest > 0,
+                          "redirs": self.pre_redirs})
+        self.pre_redirs = []
         lv.last, lv.neg = len(self.info) - 1, False
         self.cmds.append((text, lit, lv.cur))
         lv.cmd_pos = False
@@ -1746,8 +1779,10 @@ class ShellScan:
 
     def redirect(self, lv: ShellLevel) -> None:
         s, i = self.s, self.i
+        lv.kind = ">" if s[i] == ">" else "<"
         if s[i:i + 3] == "<<<":
             self.i += 3
+            lv.kind = "<<<"
             lv.skip = True
         elif s[i:i + 2] == "<<":
             self.i += 2
@@ -1839,6 +1874,7 @@ class ShellScan:
 
     def dollar(self) -> str:
         s, i = self.s, self.i
+        self.xcount += 1
         nxt = s[i + 1:i + 2]
         if s[i + 1:i + 3] == "((" and self.arithmetic(i + 3):
             return self.walk_arithmetic(i)
@@ -1875,6 +1911,7 @@ class ShellScan:
                 out.append(self.dollar())
             elif c == "`":
                 self.i += 1
+                self.xcount += 1
                 self.scan("`")
                 out.append("`")
             else:
@@ -1917,12 +1954,15 @@ class ShellScan:
         s, lv = self.s, ShellLevel()
         buf: List[str] = []
         lit, have = True, False
+        mark = self.xcount
 
         def end_word() -> None:
-            nonlocal buf, lit, have
+            nonlocal buf, lit, have, mark
             if have:
-                self.word("".join(buf), lit, lv)
-            buf, lit, have = [], True, False
+                word = XStr("".join(buf))
+                word.exp = self.xcount != mark
+                self.word(word, lit, lv)
+            buf, lit, have, mark = [], True, False, self.xcount
 
         while True:
             if self.i >= self.n:
@@ -1958,6 +1998,7 @@ class ShellScan:
                 if closer == "`":
                     end_word()
                     return
+                self.xcount += 1
                 self.scan("`")
                 buf.append("`")
                 lit, have = False, True
@@ -2120,6 +2161,617 @@ def tool_url_problem(word: str, texts: List[str]) -> str:
     return ""
 
 
+# Round 9 (code r8 F1-F4, F10): the policies of awk, sed, tar, gh and openssl read their arguments instead of matching them.
+# decision: refuse sed program files over inspecting them because a program file is content the step may have just
+# fetched and the guard reads only the workflow.
+# decision: every captured gh api or git show output is a download over listing gh as a safe tool because the allow-list
+# design refuses every unlisted fetch and an API body is a fetch.
+GH_API_READONLY = (  # the endpoints `gh api` may read (and only read) in a release workflow
+    re.compile(r"repos/[A-Za-z0-9_.${}-]+(?:/[A-Za-z0-9_.${}-]+)?/pulls/[A-Za-z0-9_${}]+/reviews"),
+)
+GH_API_SINKS = frozenset(("bash", "sh", "zsh", "dash", "python3", "python", "source", ".", "xargs", "sudo", "timeout", "command",
+                          "env", "eval", "exec", "tee", "perl", "ruby", "node"))  # a command that runs or stores what it reads
+GIT_REF_PATH_RE = re.compile(r"[^-\s:][^\s:]*:\S+")  # `git show <ref>:<path>` prints a file of another ref
+TAR_LONG_OK = frozenset((
+    "strip-components", "no-same-owner", "no-same-permissions", "extract", "create", "list", "file", "directory", "gzip",
+    "gunzip", "bzip2", "xz", "verbose", "preserve-permissions", "keep-old-files", "exclude"))
+TAR_RUN_SHORT = frozenset("IF")  # -I runs a compression program, -F an info script
+OPENSSL_CODE_OPTS = ("-engine", "-provider", "-provider-path", "-modulepath")
+SED_FLAG_CHARS = frozenset("gpiImM0123456789")
+SED_SIMPLE_CMDS = frozenset("pdDnNgGhHxP=FzqQlL")
+AWK_REGEX_BEFORE = frozenset("(,;{}!~&|=<>+-*%^?:\n")
+
+
+def awk_problem(args: List[Tuple[str, bool]]) -> str:
+    """Round 9 (F1): "" when the awk program is one this guard can read and it cannot run a command: no `-f`, no variable-held
+    or expanded program, no pipe, `system`, `getline`, `@load`, and a `print` or `printf` redirected only to a literal path."""
+    n = 0
+    while n < len(args):
+        arg = args[n][0]
+        if arg == "--":
+            n += 1
+            break
+        if arg in ("-F", "-v"):
+            n += 2
+            continue
+        if arg.startswith("-F") or arg.startswith("-v"):
+            n += 1
+            continue
+        if arg.startswith("-") and arg != "-":
+            return f"`awk` with the option `{arg[:30]}` (only -F, -v and --; a program file or an extension is refused)"
+        break
+    if n >= len(args):
+        return ""
+    prog, _lit = args[n]
+    if is_exp(prog):
+        return "`awk` with a program held in a variable or built by an expansion (the guard cannot read it)"
+    i, size, depth, in_print, prev = 0, len(prog), 0, False, "\n"
+    while i < size:
+        c = prog[i]
+        if c == '"':
+            j = i + 1
+            while j < size and prog[j] != '"':
+                j += 2 if prog[j] == "\\" else 1
+            if j >= size:
+                return "`awk` with an unterminated string in the program"
+            i, prev = j + 1, '"'
+            continue
+        if c == "/" and prev in AWK_REGEX_BEFORE:
+            j = i + 1
+            while j < size and prog[j] != "/":
+                j += 2 if prog[j] == "\\" else 1
+            if j >= size:
+                return "`awk` with an unterminated regular expression in the program"
+            i, prev = j + 1, "/"
+            continue
+        if c == "#":
+            j = prog.find("\n", i)
+            i = size if j < 0 else j
+            continue
+        if c == "@":
+            return "`awk` with `@load`, `@include` or `@namespace`"
+        if c == "|":
+            if prog[i + 1:i + 2] == "|":
+                i, prev = i + 2, "|"
+                continue
+            return "`awk` with a pipe to or from a command"
+        if c.isalpha() or c == "_":
+            j = i
+            while j < size and (prog[j].isalnum() or prog[j] == "_"):
+                j += 1
+            ident = prog[i:j]
+            if ident in ("system", "getline"):
+                return f"`awk` with `{ident}`, which runs or reads a command or file"
+            if ident in ("print", "printf"):
+                in_print, depth = True, 0
+            i, prev = j, "a"
+            continue
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c in ";}\n":
+            in_print, depth = False, 0
+        elif c == ">" and in_print and depth <= 0:
+            j = i + (2 if prog[i + 1:i + 2] == ">" else 1)
+            while j < size and prog[j] in " \t":
+                j += 1
+            if prog[j:j + 1] != '"':
+                return "`awk` with a print redirected to a path that is not a literal string"
+            k = j + 1
+            while k < size and prog[k] != '"':
+                k += 2 if prog[k] == "\\" else 1
+            if k >= size:
+                return "`awk` with an unterminated string in the program"
+            target = prog[j + 1:k]
+            k += 1
+            while k < size and prog[k] in " \t":
+                k += 1
+            if k < size and prog[k] not in ";}\n#":
+                return "`awk` with a print redirected to a path that is not a single literal string"
+            if "/inet" in target:
+                return "`awk` with a print to a network special file"
+            i, in_print, prev = k, False, '"'
+            continue
+        i += 1
+        if not c.isspace():
+            prev = c
+    return ""
+
+
+def sed_value_end(script: str, pos: int, delim: str) -> int:
+    """The index of the first unescaped ``delim`` at or after ``pos`` (-1 when there is none)."""
+    while pos < len(script):
+        if script[pos] == "\\":
+            pos += 2
+            continue
+        if script[pos] == delim:
+            return pos
+        pos += 1
+    return -1
+
+
+def sed_script_problem(script: str, exp: bool) -> str:
+    """Round 9 (F2): parse one sed script. ``exp`` is True when an expansion took part in it: then a `$` or a backtick is an
+    expansion, and one at an address, a command or a flag is refused (inside a regex, a replacement or a text it is data)."""
+    size, pos = len(script), 0
+
+    def bad_pos(ch: str) -> bool:
+        return bool(ch) and exp and ch in "$`"
+
+    def rest_of_line(at: int) -> Tuple[str, int]:
+        end = at
+        while end < size and script[end] != "\n":
+            end += 2 if script[end] == "\\" and end + 1 < size else 1
+        return script[at:end], min(end, size)
+
+    while pos < size:
+        while pos < size and script[pos] in " \t\n;":
+            pos += 1
+        if pos >= size:
+            break
+        # addresses
+        for _addr in range(2):
+            ch = script[pos:pos + 1]
+            if bad_pos(ch):
+                return "`sed` with an address that comes from an expansion"
+            if ch.isdigit():
+                while pos < size and script[pos].isdigit():
+                    pos += 1
+                if script[pos:pos + 1] == "~":
+                    pos += 1
+                    while pos < size and script[pos].isdigit():
+                        pos += 1
+            elif ch == "$":
+                pos += 1
+            elif ch in ("/", "\\"):
+                delim = "/"
+                if ch == "\\":
+                    delim = script[pos + 1:pos + 2]
+                    pos += 1
+                    if not delim or delim in "\n\\" or bad_pos(delim):
+                        return "`sed` with an address delimiter the guard cannot read"
+                end = sed_value_end(script, pos + 1, delim)
+                if end < 0:
+                    return "`sed` with an unterminated address"
+                pos = end + 1
+                while pos < size and script[pos] in "IM":
+                    pos += 1
+            elif _addr == 1 and ch in "+~":
+                pos += 1
+                while pos < size and script[pos].isdigit():
+                    pos += 1
+            else:
+                break
+            if _addr == 0 and script[pos:pos + 1] == ",":
+                pos += 1
+                continue
+            break
+        while pos < size and script[pos] in " \t!":
+            pos += 1
+        if pos >= size:
+            return "`sed` with an address and no command"
+        cmd = script[pos]
+        pos += 1
+        if bad_pos(cmd):
+            return "`sed` with a command that comes from an expansion"
+        if cmd in "{}":
+            continue
+        if cmd == "#":
+            _text, pos = rest_of_line(pos)
+            continue
+        if cmd == "s":
+            delim = script[pos:pos + 1]
+            if not delim or delim in "\n\\" or bad_pos(delim):
+                return "`sed` with a substitution delimiter the guard cannot read"
+            first = sed_value_end(script, pos + 1, delim)
+            second = sed_value_end(script, first + 1, delim) if first >= 0 else -1
+            if second < 0:
+                return "`sed` with an unterminated substitution"
+            pos = second + 1
+            while pos < size and script[pos] not in " \t\n;}#":
+                flag = script[pos]
+                if bad_pos(flag):
+                    return "`sed` with a substitution flag that comes from an expansion"
+                if flag == "w":
+                    path, pos = rest_of_line(pos + 1)
+                    if not path.strip() or (exp and ("$" in path or "`" in path)):
+                        return "`sed` with a `w` flag to a path that is not a literal"
+                    break
+                if flag not in SED_FLAG_CHARS:
+                    return f"`sed` with the substitution flag `{flag}` (the `e` flag runs a command)"
+                pos += 1
+        elif cmd == "y":
+            delim = script[pos:pos + 1]
+            if not delim or delim in "\n\\" or bad_pos(delim):
+                return "`sed` with a transliteration delimiter the guard cannot read"
+            first = sed_value_end(script, pos + 1, delim)
+            second = sed_value_end(script, first + 1, delim) if first >= 0 else -1
+            if second < 0:
+                return "`sed` with an unterminated transliteration"
+            pos = second + 1
+        elif cmd in "aic":
+            _text, pos = rest_of_line(pos)
+            continue
+        elif cmd in "rRwW":
+            path, pos = rest_of_line(pos)
+            if not path.strip() or (exp and ("$" in path or "`" in path)):
+                return f"`sed` with a `{cmd}` command on a path that is not a literal"
+            continue
+        elif cmd in ":btTv":
+            while pos < size and script[pos] not in "\n;":
+                pos += 1
+            continue
+        elif cmd in SED_SIMPLE_CMDS:
+            while pos < size and script[pos].isdigit():
+                pos += 1
+        elif cmd == "e":
+            return "`sed` with the `e` command, which runs a command"
+        else:
+            return f"`sed` with the command `{cmd}`, which the guard does not read"
+        while pos < size and script[pos] in " \t":
+            pos += 1
+        if pos < size and script[pos] not in "\n;}#":
+            return f"`sed` with `{script[pos]}` where a command ends (the guard reads one command at a time)"
+    return ""
+
+
+def sed_problem(args: List[Tuple[str, bool]]) -> str:
+    """Round 9 (F2): "" when the options of sed are on the short list (no `-f`, `--file`, `-s`) and every script parses."""
+    scripts: List[Tuple[str, bool]] = []
+    operands: List[Tuple[str, bool]] = []
+    n = 0
+    while n < len(args):
+        arg = args[n][0]
+        n += 1
+        if arg == "--":
+            operands.extend(args[n:])
+            break
+        if arg.startswith("--"):
+            name, eq, val = arg.partition("=")
+            if name in ("--quiet", "--silent", "--regexp-extended", "--posix", "--sandbox", "--null-data", "--unbuffered",
+                        "--binary") and not eq:
+                continue
+            if name == "--in-place":
+                continue
+            if name == "--expression":
+                if eq:
+                    scripts.append((val, is_exp(arg)))
+                elif n < len(args):
+                    scripts.append((args[n][0], is_exp(args[n][0])))
+                    n += 1
+                else:
+                    return "`sed --expression` without a script"
+                continue
+            return f"`sed` with the option `{arg[:30]}` (program files, `-s` and unknown options are refused)"
+        if arg.startswith("-") and len(arg) > 1:
+            k = 1
+            while k < len(arg):
+                ch = arg[k]
+                k += 1
+                if ch in "nErzub":
+                    continue
+                if ch == "i":
+                    break
+                if ch == "e":
+                    if k < len(arg):
+                        scripts.append((arg[k:], is_exp(arg)))
+                    elif n < len(args):
+                        scripts.append((args[n][0], is_exp(args[n][0])))
+                        n += 1
+                    else:
+                        return "`sed -e` without a script"
+                    break
+                return f"`sed` with the option `-{ch}` (program files, `-s` and unknown options are refused)"
+            continue
+        operands.append(args[n - 1])
+    if not scripts:
+        if not operands:
+            return "`sed` without a script"
+        scripts.append((operands[0][0], is_exp(operands[0][0])))
+    merged: List[Tuple[str, bool]] = []
+    for text, exp in scripts:
+        if merged and merged[-1][0].endswith("\\"):
+            merged[-1] = (merged[-1][0] + "\n" + text, merged[-1][1] or exp)
+        else:
+            merged.append((text, exp))
+    for text, exp in merged:
+        reason = sed_script_problem(text, exp)
+        if reason:
+            return reason
+    return ""
+
+
+def tar_problem(texts: List[str]) -> str:
+    """Round 9 (F3): in every `run:`, tar takes the long options of TAR_LONG_OK (spelled in full, so an abbreviation of
+    `--to-command` is refused too) and short options without `-I` or `-F`, which run a program."""
+    for n, arg in enumerate(texts):
+        if arg == "--":
+            continue
+        if arg.startswith("--"):
+            if arg[2:].partition("=")[0] not in TAR_LONG_OK:
+                return f"`tar` with the option `{arg[:40]}` (it can run a program, or the guard does not know it)"
+        elif arg.startswith("-") and len(arg) > 1:
+            if TAR_RUN_SHORT & set(arg[1:]):
+                return f"`tar` with the option `{arg[:40]}` (`-I` and `-F` run a program)"
+        elif n == 0 and TAR_RUN_SHORT & set(arg):
+            return f"`tar` with the option cluster `{arg[:40]}` (`I` and `F` run a program)"
+    return ""
+
+
+def gh_problem(texts: List[str], site: Optional[Tuple["ShellScan", int]]) -> str:
+    """Round 9 (F4): `gh attestation verify`, or `gh api` of one read-only endpoint of GH_API_READONLY with the options
+    --paginate, --slurp and --jq, never piped into a shell or interpreter. A captured body is a download (fetch_problem)."""
+    plain = [a for a in texts if not a.startswith("-")]
+    if plain[:2] == ["attestation", "verify"]:
+        return ""
+    if texts[:1] != ["api"]:
+        return f"`gh {' '.join(plain[:2])[:30]}`, which is neither `gh api` nor `gh attestation verify`"
+    endpoint = ""
+    n = 1
+    while n < len(texts):
+        arg = texts[n]
+        n += 1
+        if arg in ("--paginate", "--slurp"):
+            continue
+        if arg in ("--jq", "-q"):
+            n += 1
+            continue
+        if arg.startswith("--jq="):
+            continue
+        if arg.startswith("-") or endpoint:
+            return f"`gh api` with `{arg[:30]}` (only --paginate, --slurp and --jq of one endpoint)"
+        endpoint = arg
+    if not any(p.fullmatch(endpoint) for p in GH_API_READONLY):
+        return f"`gh api` of `{endpoint[:50]}`, which is not an endpoint of GH_API_READONLY"
+    if site is not None:
+        scan, k = site
+        if scan.info[k]["nxt"] in ("|", "|&") and k + 1 < len(scan.cmds) and (
+                scan.cmds[k + 1][0].rsplit("/", 1)[-1] in GH_API_SINKS or not scan.cmds[k + 1][1]):
+            return "`gh api` piped into a shell, an interpreter or tee"
+    return ""
+
+
+def openssl_problem(args: List[Tuple[str, bool]]) -> str:
+    """Round 9 (F10): an openssl subcommand of RUN_OPENSSL, never an option that loads code (`-engine`, `-provider`, ...), a
+    `-config` of a computed path, or a `dgst -verify` key outside the repository."""
+    texts = [a for a, _l in args]
+    if not texts or texts[0] not in RUN_OPENSSL:
+        return f"`openssl {' '.join(texts[:1])[:30]}`, which is not in RUN_OPENSSL"
+    for n, (arg, _lit) in enumerate(args):
+        name, eq, val = arg.partition("=")
+        if name in OPENSSL_CODE_OPTS:
+            return f"`openssl` with `{name}`, which loads code"
+        if name in ("-config", "-conf", "-verify"):
+            path = val if eq else (args[n + 1][0] if n + 1 < len(args) else "")
+            if not path or is_exp(path) or path.startswith("/") or ".." in path or path.startswith("-"):
+                return f"`openssl` with `{name}` of the path `{path[:40]}`, which is not a literal path of the repository"
+    return ""
+
+
+# Round 9 (sec r8 F2): ONE named list of the variables that pick a program, a linker, a config, a registry or a module
+# for the shell, the linker, cargo, rustc, rustup, a C toolchain or openssl. A `--config` key of cargo that names a program
+# has an environment twin in this list (CARGO_CONFIG_ENV_TWINS keeps the pairs, the self-test checks each).
+DANGEROUS_ASSIGN_NAMES = (
+    r"LD_\w*", r"DYLD_\w*", "BASH_ENV", "ENV", "PATH", "IFS", "PS4", "CDPATH", "SHELLOPTS", "PYTHONPATH", "PYTHONSTARTUP",
+    "NODE_OPTIONS", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", r"GIT_\w*", r"CURL_\w*", "WGETRC", "TAR_OPTIONS",
+    r"SSL_CERT_\w+", "(?i:https?_proxy|all_proxy|no_proxy)",
+    "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTDOC", r"CARGO_BUILD_RUSTC\w*", r"CARGO_BUILD_RUSTDOC\w*",
+    r"CARGO_TARGET_\w+_(?:LINKER|RUNNER)", "CARGO_HOME", r"CARGO_HTTP_\w+", "CARGO_NET_GIT_FETCH_WITH_CLI",
+    r"CARGO_REGISTRIES_\w+", r"CARGO_ALIAS_\w+", r"CARGO_CONFIG_\w+",
+    "RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "RUSTUP_DIST_SERVER", "RUSTUP_UPDATE_ROOT", "RUSTUP_DIST_ROOT",
+    "CC", "CXX", "LD", "AR", "LINKER", r"CC_\w+", r"CXX_\w+", r"AR_\w+", r"\w+_LINKER", r"(?:C|CXX|CPP|LD)FLAGS(?:_\w+)?",
+    "OPENSSL_CONF", "OPENSSL_MODULES", "OPENSSL_ENGINES",
+)
+DANGEROUS_ASSIGN_RE = re.compile("|".join(DANGEROUS_ASSIGN_NAMES))
+# The flag variables are refused when their value names a linker, a plugin or an unstable option (or is computed).
+RUSTFLAGS_NAME_RE = re.compile(r"RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS|"
+                               r"CARGO_BUILD_RUSTFLAGS|CARGO_BUILD_RUSTDOCFLAGS|CARGO_TARGET_\w+_RUSTFLAGS")
+RUSTFLAGS_BAD_RE = re.compile(r"linker|link[-_]args?|-Z|plugin|codegen-backend|llvm-args|--sysroot|--config|\$|\{\{|`")
+# The one narrow exemption: the Android NDK toolchain lines of release.yml (`CC_<triple>=$TC/<file of the toolchain dir>`).
+ANDROID_ENV_RE = re.compile(r"(?:(?:CC|CXX|AR)_(?:aarch64_linux_android|armv7_linux_androideabi|x86_64_linux_android|"
+                            r"i686_linux_android)|CARGO_TARGET_(?:AARCH64_LINUX_ANDROID|ARMV7_LINUX_ANDROIDEABI|"
+                            r"X86_64_LINUX_ANDROID|I686_LINUX_ANDROID)_LINKER)")
+ANDROID_VALUE_RE = re.compile(r'"?\$(?:TC|\{TC\})/[A-Za-z0-9_.+-]+"?')
+CARGO_CONFIG_ENV_TWINS = (  # (`cargo --config` key that names a program, a registry or a proxy, a sample of its environment twin)
+    ("build.rustc", "CARGO_BUILD_RUSTC"), ("build.rustc-wrapper", "CARGO_BUILD_RUSTC_WRAPPER"),
+    ("build.rustc-workspace-wrapper", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"), ("build.rustdoc", "CARGO_BUILD_RUSTDOC"),
+    ("build.rustflags", "CARGO_BUILD_RUSTFLAGS"), ("build.rustdocflags", "CARGO_BUILD_RUSTDOCFLAGS"),
+    ("target.x86_64-unknown-linux-gnu.linker", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"),
+    ("target.x86_64-unknown-linux-gnu.runner", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"),
+    ("target.x86_64-unknown-linux-gnu.rustflags", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"),
+    ("net.git-fetch-with-cli", "CARGO_NET_GIT_FETCH_WITH_CLI"), ("http.proxy", "CARGO_HTTP_PROXY"),
+    ("http.cainfo", "CARGO_HTTP_CAINFO"), ("registries.x.index", "CARGO_REGISTRIES_X_INDEX"),
+    ("registries.x.token", "CARGO_REGISTRIES_X_TOKEN"), ("alias.b", "CARGO_ALIAS_B"), ("home", "CARGO_HOME"),
+)
+GITHUB_ENV_RE = re.compile(r"GITHUB_ENV(?![A-Za-z0-9_])")
+GITHUB_PATH_RE = re.compile(r"GITHUB_PATH(?![A-Za-z0-9_])")
+HEX64_RE = re.compile(r"[0-9a-fA-F]{64}")
+DIGEST_VAR_RE = re.compile(r"\$\{?([A-Za-z_]\w*)")
+ENV_DECLARERS = frozenset(("export", "declare", "typeset", "local", "readonly"))
+MATRIX_COMPLEX = "\0complex"  # a matrix value that is a mapping or a sequence (Round 9, F8)
+FETCH_DIR_PREFIX_RE = re.compile(r"(?:\$PWD|\$\{PWD\}|\$GITHUB_WORKSPACE|\$__GHX__|\.)(?=/|$)")
+
+
+def rustflags_bad(name: str, value: Optional[str]) -> bool:
+    """A flag variable whose value (or lack of a readable value) can name a linker, a plugin or an unstable option."""
+    return RUSTFLAGS_NAME_RE.fullmatch(name) is not None and (value is None or RUSTFLAGS_BAD_RE.search(value) is not None)
+
+
+def dangerous_assign(name: str, value: Optional[str] = None) -> bool:
+    """Round 9 (sec r8 F1, F2): True when setting ``name`` to ``value`` changes what a later command loads or runs. The NDK
+    toolchain lines of the Android job (`CC_<triple>=$TC/<file>`) are the one exemption."""
+    if DANGEROUS_ASSIGN_RE.fullmatch(name):
+        return not (ANDROID_ENV_RE.fullmatch(name) and value is not None and ANDROID_VALUE_RE.fullmatch(value))
+    return rustflags_bad(name, value)
+
+
+def env_written_names(scan: "ShellScan") -> set:
+    """The variable names a step writes to GITHUB_ENV with a value that is not a literal 64-hex digest."""
+    out: set = set()
+    if not any(GITHUB_ENV_RE.search(x) for x in scan.targets):
+        return out
+    for word, _lit, args in scan.cmds:
+        if word not in ("echo", "printf"):
+            continue
+        for arg, _l in args:
+            for seg in re.split(r"\\n|\n", arg):
+                m = re.match(r"([A-Za-z_]\w*)=(.*)", seg, re.S)
+                if m and (is_exp(arg) or HEX64_RE.fullmatch(m.group(2)) is None):
+                    out.add(m.group(1))
+    return out
+
+
+def self_made_names(scan: "ShellScan", prior: Iterable[str] = ()) -> set:
+    """Round 9 (F6): the variables a step sets from anything but a literal 64-hex digest (an assignment, a loop variable,
+    export/declare/local, read, printf -v, mapfile, a GITHUB_ENV line), and those of ``prior`` (earlier steps)."""
+    made: set = set(prior)
+    for name, value, exp in scan.assign_vals:
+        if exp or HEX64_RE.fullmatch(value) is None:
+            made.add(name)
+    made.update(scan.for_vars)
+    for word, _lit, args in scan.cmds:
+        texts = [a for a, _l in args]
+        if word in ENV_DECLARERS:
+            for a, _l in args:
+                m = SHELL_ASSIGN_RE.match(a)
+                if m and (is_exp(a) or HEX64_RE.fullmatch(a[m.end():]) is None or m.group(0).endswith("+=")):
+                    made.add(m.group(1))
+        elif word in ("read", "mapfile", "readarray", "getopts"):
+            made.update(a for a in texts if re.fullmatch(r"[A-Za-z_]\w*", a))
+        elif word == "printf":
+            made.update(texts[n + 1] for n, a in enumerate(texts[:-1]) if a == "-v")
+    made.update(env_written_names(scan))
+    return made
+
+
+def captured_fetch(scan: "ShellScan", k: int) -> bool:
+    """Round 9 (F4): command ``k`` is a fetch whose output the step keeps: `gh release download`, `gh run download`, or a
+    `gh api`, `git show <ref>:<path>` or `git archive` with a captured output (`>`, `>>`, `--output`, `-o`)."""
+    word, _lit, args = scan.cmds[k]
+    texts = [a for a, _l in args]
+    plain = [a for a in texts if not a.startswith("-")]
+    if word == "gh" and plain[:2] in (["release", "download"], ["run", "download"]):
+        return True
+    if word == "gh":
+        kind = plain[:1] == ["api"]
+    elif word == "git":
+        kind = plain[:1] == ["archive"] or (plain[:1] == ["show"] and any(GIT_REF_PATH_RE.fullmatch(a) for a in plain[1:]))
+    else:
+        return False
+    if not kind:
+        return False
+    if any(a in ("-o", "--output") or a.startswith("--output=") for a in texts):
+        return True
+    return any(kind_ == ">" and t and not t.isdigit() and not t.startswith("&") and t != "-" and not t.startswith("/dev/")
+               for kind_, t in scan.info[k]["redirs"])
+
+
+def captured_outputs(scan: "ShellScan", k: int) -> List[str]:
+    """The files a captured fetch writes besides its redirects: the `--output` value, or the directory a `gh ... download`
+    fills (every file of it, as "<dir>/*")."""
+    word, _lit, args = scan.cmds[k]
+    texts = [a for a, _l in args]
+    plain = [a for a in texts if not a.startswith("-")]
+    outs: List[str] = []
+    for n, a in enumerate(texts):
+        if a in ("-o", "--output", "-O") and n + 1 < len(texts):
+            outs.append(texts[n + 1])
+        elif a.startswith("--output="):
+            outs.append(a.partition("=")[2])
+        elif a in ("-D", "--dir") and n + 1 < len(texts):
+            outs.append(texts[n + 1].rstrip("/") + "/*")
+    if word == "gh" and plain[:2] in (["release", "download"], ["run", "download"]) and not any(o.endswith("/*") for o in outs):
+        outs.append("./*")
+    return outs
+
+
+def compare_names(scan: "ShellScan", k: int) -> Optional[set]:
+    """Round 9 (F5): the names a top-level `[ "$(sha256sum f | cut ...)" = <64-hex literal> ]` compares (the print-only
+    checksum commands inside a command substitution), or None when command ``k`` is not such a comparison."""
+    word, _lit, args = scan.cmds[k]
+    info = scan.info[k]
+    if word not in ("[", "[[", "test") or not info["top"] or info["neg"] or info["prev"] not in ("\n", ";"):
+        return None
+    if info["nxt"] not in ("\n", ";", ""):
+        return None
+    if not any(a in ("=", "==") for a, _l in args):
+        return None
+    if not any(HEX64_RE.fullmatch(a) and not is_exp(a) for a, _l in args):
+        return None
+    names: set = set()
+    for j, (pword, _pl, pargs) in enumerate(scan.cmds):
+        if pword in FETCH_VERIFIERS and scan.info[j]["sub"] and not is_verify(pword, pargs):
+            names.update(base_of(a) for a, _l in pargs if not a.startswith("-"))
+    return names or None
+
+
+def fetch_dir_of(path: str) -> str:
+    """The directory a path names or lives in, relative to the workspace ("." for the current directory)."""
+    p = norm_name(path)
+    m = FETCH_DIR_PREFIX_RE.match(p)
+    if m:
+        p = p[m.end():].lstrip("/")
+    return p.rpartition("/")[0] or "."
+
+
+def bare_glob(part: str) -> bool:
+    base = part.rsplit("/", 1)[-1]
+    return any(c in base for c in "*?[") and not base.strip("*?[].")
+
+
+def matrix_complex_text(text: str) -> bool:
+    t = text.strip()
+    return t.startswith("{") or re.match(r"\[\s*[\[{]", t) is not None or re.search(r",\s*[\[{]", t) is not None
+
+
+def env_write_problem(scan: "ShellScan") -> str:
+    """Round 9 (sec r8 F1): in EVERY `run:` step, a dangerous inline assignment, `export`, or GITHUB_ENV line is refused.
+    decision: refuse them in every run step of a release job over only in fetch steps because an environment variable
+    that picks a program loads it in any later command and any later step."""
+    for name, value, _exp in scan.assign_vals:
+        if dangerous_assign(name, value):
+            return f"an assignment to `{name}`"
+        if GITHUB_ENV_RE.search(value):
+            return "a copy of GITHUB_ENV into a variable"
+    to_env = any(GITHUB_ENV_RE.search(x) for x in scan.targets)
+    if to_env and scan.heredocs:
+        return "a here-document written to GITHUB_ENV"
+    for k, (word, _lit, args) in enumerate(scan.cmds):
+        texts = [a for a, _l in args]
+        if word in ENV_DECLARERS:
+            for a in texts:
+                m = SHELL_ASSIGN_RE.match(a)
+                if m and dangerous_assign(m.group(1), a[m.end():]):
+                    return f"`{word} {m.group(1)}`"
+        if word == "env" and any(a in ("-i", "--ignore-environment", "-") for a in texts):
+            return "`env -i`"
+        if word in ("echo", "printf"):
+            continue
+        if any(GITHUB_ENV_RE.search(a) for a in texts) or any(
+                GITHUB_ENV_RE.search(t) for kind, t in scan.info[k]["redirs"] if kind != "<"):
+            return f"`{word}` writing GITHUB_ENV"
+    if to_env:
+        for word, _lit, args in scan.cmds:
+            if word not in ("echo", "printf"):
+                continue
+            vals = [a for a, _l in args if not a.startswith("-")]
+            if word == "echo" and any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", a) for a, _l in args):
+                return "a GITHUB_ENV write by `echo -e` (its escapes split one argument into lines the guard cannot read)"
+            if word == "printf":
+                vals = vals[:1]
+                if vals and (vals[0].startswith("%") or vals[0].count("=") > 1):
+                    return "a GITHUB_ENV line whose variable name is computed"
+            for val in vals:
+                for seg in re.split(r"\\n|\n", val):
+                    if seg.startswith(("$", "`")):
+                        return "a GITHUB_ENV line whose variable name is computed"
+                    m = re.match(r"([A-Za-z_]\w*)=(.*)", seg, re.S)
+                    if m and dangerous_assign(m.group(1), m.group(2)):
+                        return f"a GITHUB_ENV line for `{m.group(1)}`"
+    return ""
+
+
 def script_problem(word: str, args: List[Tuple[str, bool]]) -> str:
     """Round 8 (S8): bash, sh, source and python3 run a literal script file of the repository and nothing else:
     `-c`, `-m`, a here-document or stdin, a computed or absolute path and `..` are refused."""
@@ -2127,7 +2779,7 @@ def script_problem(word: str, args: List[Tuple[str, bool]]) -> str:
     n = 0
     while word != "source" and n < len(args) and flags.fullmatch(args[n][0]):
         n += 1
-    if n >= len(args) or not args[n][1]:
+    if n >= len(args) or is_exp(args[n][0]):  # Round 9 (F7): a quoted literal path is a literal
         return f"`{word}` without a literal script file (`-c`, `-m`, stdin and a here-document are refused)"
     path = args[n][0]
     ok = RUN_PY_RE.fullmatch(path) if word == "python3" else RUN_SCRIPT_RE.fullmatch(path)
@@ -2136,13 +2788,16 @@ def script_problem(word: str, args: List[Tuple[str, bool]]) -> str:
     return ""
 
 
-def git_problem(texts: List[str]) -> str:
+def git_problem(texts: List[str], site: Optional[Tuple["ShellScan", int]] = None) -> str:
     if not texts or texts[0].startswith("-"):
         return "`git` with a global option or no subcommand"
     if texts[0] not in RUN_GIT:
         return f"`git {texts[0][:30]}`, which is not in RUN_GIT"
     if any(a.split("=")[0] in ("--upload-pack", "--receive-pack", "--exec") for a in texts):
         return "`git` with an option that runs a program"
+    if texts[0] == "show" and any(GIT_REF_PATH_RE.fullmatch(a) for a in texts[1:]) and site is not None \
+            and site[0].info[site[1]]["sub"]:
+        return "`git show <ref>:<path>` inside a command substitution (a file of another ref is a download)"
     if texts[0] == "config":
         keys = [a for a in texts[1:] if not a.startswith("-")]
         if keys[:1] not in (["user.name"], ["user.email"]):
@@ -2198,7 +2853,8 @@ def docker_problem(texts: List[str], ctx: Optional[RunCtx]) -> str:
     return ""
 
 
-def wrapper_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCtx], depth: int) -> str:
+def wrapper_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCtx], depth: int,
+                    site: Optional[Tuple["ShellScan", int]] = None) -> str:
     """Round 8 (S8): `command`, `sudo`, `timeout` and `xargs` run the command that follows them; that command is
     held to the same list. A wrapper option outside the short fixed set is refused."""
     rest = list(args)
@@ -2219,7 +2875,8 @@ def wrapper_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCt
     return command_problem(rest[0][0], rest[1:], ctx, depth + 1)
 
 
-def command_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCtx], depth: int = 0) -> str:
+def command_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCtx], depth: int = 0,
+                    site: Optional[Tuple["ShellScan", int]] = None) -> str:
     """Round 8 (S8): "" when ``word`` is in RUN_ALLOWED and its arguments meet the policy of that tool, else the
     reason. A tool that can fetch or run code has a policy; the others take any argument."""
     if word not in RUN_ALLOWED:
@@ -2230,21 +2887,21 @@ def command_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCt
     if reason:
         return reason
     if word in RUN_WRAPPERS:
-        return wrapper_problem(word, args, ctx, depth)
+        return wrapper_problem(word, args, ctx, depth, site)
     if word in ("bash", "sh", "source", "python3"):
         return script_problem(word, args)
     if word == "git":
-        return git_problem(texts)
+        return git_problem(texts, site)
+    if word == "tar":
+        return tar_problem(texts)  # Round 9 (F3): in every `run:`, not only in a fetch step
     if word == "cargo":
         return cargo_problem(texts)
     if word == "docker":
         return docker_problem(texts, ctx)
     if word == "gh":
-        if plain[:1] == ["api"] or plain[:2] == ["attestation", "verify"]:
-            return ""
-        return f"`gh {' '.join(plain[:2])[:30]}`, which is neither `gh api` nor `gh attestation verify`"
+        return gh_problem(texts, site)
     if word == "openssl":
-        return "" if texts[:1] and texts[0] in RUN_OPENSSL else f"`openssl {' '.join(texts[:1])[:30]}`, which is not in RUN_OPENSSL"
+        return openssl_problem(args)
     if word == "pipx":
         return "" if not [a for a in texts if a.startswith("-")] and tuple(plain) in RUN_PIPX else \
             f"`pipx {' '.join(texts)[:40]}`, which is not in RUN_PIPX"
@@ -2256,10 +2913,9 @@ def command_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCt
             return ""
         return f"`apt-get {' '.join(texts)[:40]}`, which is neither `update` nor `install -y` of {', '.join(RUN_APT_PKGS)}"
     if word == "awk":
-        if any(a in ("-f", "-i", "-E") or AWK_UNSAFE_RE.search(a) for a in texts):
-            return "`awk` with a program that runs a command, reads a program file or loads an extension"
-    if word == "sed" and any(SED_UNSAFE_RE.search(a) for a in texts):
-        return "`sed` with a script that runs a command"
+        return awk_problem(args)
+    if word == "sed":
+        return sed_problem(args)
     return ""
 
 
@@ -2270,56 +2926,86 @@ def run_problem(scan: "ShellScan", ctx: Optional[RunCtx]) -> str:
     for name in sorted(scan.funcs):
         if name in RUN_ALLOWED:
             return f"a function named `{name}`, which would replace the listed command"
-    for word, literal, args in scan.cmds:
+    for k, (word, literal, args) in enumerate(scan.cmds):
         if not literal:
             if word == "$__GHS__":  # a `${{ secrets.NAME }}` the repository owner set is the whole command
                 continue
             return f"the computed command word `{word[:40]}`"
         if word in scan.funcs:
             continue
-        reason = command_problem(word, args, ctx)
+        reason = command_problem(word, args, ctx, 0, (scan, k))
         if reason:
             return reason
     return ""
 
 
-def verify_names(scan: "ShellScan", k: int, dl: Iterable[str]) -> Optional[set]:
+def digest_token(word: str, args: List[Tuple[str, bool]]) -> str:
+    """The first token of the text an `echo` or `printf` feeds a checksum command: the expected digest."""
+    vals = [a for a, _l in args if not a.startswith("-")]
+    if word == "printf" and vals and "%" in vals[0]:
+        return vals[1] if len(vals) > 1 else ""
+    first = vals[0].split() if vals else []
+    return first[0] if first else ""
+
+
+def verify_names(scan: "ShellScan", k: int, dl: Iterable[str], made: Iterable[str] = (),
+                 ok: Iterable[str] = ()) -> Optional[set]:
     """Round 8 (S1, S7): the names the check-mode checksum command ``k`` covers: the names of the `echo` or `printf`
-    that feeds it (`echo "$SUM  f" | sha256sum -c -`), or "*" when its checklist is a file the step did not download.
-    None when the digest source is not the repository text: a checklist the step downloaded, a download piped in,
-    or a command substitution in the echoed text."""
+    (or the here-string) that feeds it (`echo "$SUM  f" | sha256sum -c -`), or "*" when its checklist is a file the step
+    did not download (or one whose own check ran, ``ok``). None when the digest source is not the repository text: a
+    checklist the step downloaded, a download piped in, a command substitution in the echoed text, or (Round 9, F6) a
+    digest held in a variable the job assigned from anything but a literal 64-hex.
+    decision: a literal or already-verified expected digest over any variable because a variable assigned in the job can
+    only come from the file itself or from another fetch."""
     _word, _lit, args = scan.cmds[k]
-    downloaded = set(dl)
+    downloaded = set(dl) - set(ok)
+    madeset = set(made)
     files = [a for a, _l in args if not a.startswith("-")]
     if any(base_of(f) in downloaded for f in files):
         return None
     names: set = {"*"} if files else set()
+    sources: List[Tuple[str, List[Tuple[str, bool]]]] = []
     j = k
     while j > 0 and scan.info[j]["prev"] == "|":
         j -= 1
         pword, plit, pargs = scan.cmds[j]
         if not (plit and pword in ("echo", "printf")):
             return None
+        sources.append((pword, pargs))
+    for kind, text in scan.info[k]["redirs"]:
+        if kind == "<<<":
+            sources.append(("echo", [(str(text), False)]))
+        elif kind == "<":
+            if is_exp(text) or base_of(text) in downloaded:
+                return None
+            names.add("*")
+    for pword, pargs in sources:
         for arg, alit in pargs:
             if not alit and ("$(" in arg or "`" in arg):
                 return None
             names.update(base_of(t) for t in arg.split() if not t.startswith("-"))
+        if any(m.group(1) in madeset for m in DIGEST_VAR_RE.finditer(digest_token(pword, pargs))):
+            return None
     return names
 
 
-def verified_names(scan: "ShellScan") -> set:
-    """Round 8 (S2): the file names any checksum or attestation command of the text names (for the later steps)."""
+def verified_names(scan: "ShellScan", made: Iterable[str] = ()) -> set:
+    """Round 8 (S2): the file names any checksum or attestation command of the text names (for the later steps). Round 9
+    (F5): only a check-mode call fed repository text, a comparison with a literal 64-hex or `gh attestation verify` names a
+    file; a print-only `sha256sum` or `shasum` verifies nothing."""
     out: set = set()
     for k, (word, _lit, args) in enumerate(scan.cmds):
         plain = [a for a, _l in args if not a.startswith("-") and a != "-"]
         if word in FETCH_VERIFIERS and is_verify(word, args):
-            out.update((verify_names(scan, k, ()) or set()) - {"*"})
-        elif word in FETCH_VERIFIERS or (word.rsplit("/", 1)[-1] == "gh" and "attestation" in plain):
+            out.update((verify_names(scan, k, (), made) or set()) - {"*"})
+        elif word.rsplit("/", 1)[-1] == "gh" and "attestation" in plain:
             out.update(base_of(a) for a in plain)
+        elif word in ("[", "[[", "test"):
+            out.update(compare_names(scan, k) or set())
     return out
 
 
-def fetch_problem(scan: "ShellScan", facts: Dict[str, object]) -> str:
+def fetch_problem(scan: "ShellScan", facts: Dict[str, object], made: Iterable[str] = ()) -> str:
     """Round 6 (vote 6def5ab6): "" unless the text is a fetch step (curl, wget, Invoke-WebRequest, iwr or git clone in
     any word) that runs a command outside FETCH_ALLOWED; then the reason. Round 7: the options of curl and wget are
     listed (N3), a command that consumes a fetched file needs a checksum check first (F3) and no fetched file lands in
@@ -2328,9 +3014,18 @@ def fetch_problem(scan: "ShellScan", facts: Dict[str, object]) -> str:
     a fetch step no longer try to name every downloader (S8: RUN_ALLOWED does). ``facts`` receives the decoded words,
     the names written and the names a checksum command names."""
     outputs: List[str] = []
-    facts.update(words=[norm_name(w) for w in scan.words], outputs=outputs, verified=verified_names(scan))
+    made_all = self_made_names(scan, made)
+    globs = [a for _w, _lit, args in scan.cmds for a, lit in args if (lit or is_exp(a)) and any(c in a for c in "*?[")]
+    ls_dirs = [fetch_dir_of(next((a for a, _l in args if not a.startswith("-")), ".") + "/_")
+               for k, (w, _lit, args) in enumerate(scan.cmds) if w == "ls" and scan.info[k]["sub"]]
+    path_args = [a for w, _lit, args in scan.cmds if w in ("echo", "printf") and any(GITHUB_PATH_RE.search(x) for x in scan.targets)
+                 for a, _l in args if not a.startswith("-")]
+    facts.update(words=[norm_name(w) for w in scan.words] + [norm_name(v) for _n, v, _e in scan.assign_vals],
+                 outputs=outputs, verified=verified_names(scan, made_all), made=made_all,
+                 env_names=env_written_names(scan), globs=globs, ls_dirs=ls_dirs, path_args=path_args)
     clone = any(w == "git" and any(a == "clone" for a, _l in args) for w, _lit, args in scan.cmds)
-    if not clone and not any(FETCH_WORD_RE.search(w) for w in scan.words):
+    captured = [captured_fetch(scan, k) for k in range(len(scan.cmds))]
+    if not clone and not any(captured) and not any(FETCH_WORD_RE.search(w) for w in scan.words):
         return ""
     if scan.heredocs:
         return "a here-document"
@@ -2362,9 +3057,14 @@ def fetch_problem(scan: "ShellScan", facts: Dict[str, object]) -> str:
     chain: Optional[Tuple[int, set]] = None  # (index of a check followed by `&&`, the names it covers)
     for k, (word, literal, args) in enumerate(scan.cmds):
         info = scan.info[k]
-        if not literal or word not in FETCH_ALLOWED:
+        if not literal or (word not in FETCH_ALLOWED and not captured[k]):
             return f"the command `{word[:40]}`"
         plain = [a for a, _l in args if not a.startswith("-")]
+        if captured[k]:  # Round 9 (F4): a captured gh api, git show or download is a fetch whose target needs its own check
+            for out in captured_outputs(scan, k):
+                outputs.append(out)
+                dl.add(base_of(out))
+                ok.discard(base_of(out))
         if word in ("curl", "wget"):
             if info["sub"]:
                 return f"a `{word}` inside a command substitution"
@@ -2407,15 +3107,18 @@ def fetch_problem(scan: "ShellScan", facts: Dict[str, object]) -> str:
         while first > 0 and scan.info[first]["prev"] == "|":  # a pipeline stands or falls with its first command
             first -= 1
         start = scan.info[first]
+        names = None
         if is_verify(word, args) and info["top"] and not start["neg"] and start["prev"] in ("\n", ";"):
-            names = verify_names(scan, k, dl)
-            if names is not None:
-                names = set(dl) if "*" in names else {n for n in names if n in dl}
-                if info["nxt"] in ("\n", ";", ""):
-                    ok |= names
-                    any_ok = True
-                elif info["nxt"] == "&&":
-                    chain = (k, names)
+            names = verify_names(scan, k, dl, made_all, ok)
+        elif word in ("[", "[[", "test"):
+            names = compare_names(scan, k)  # Round 9 (F5): a comparison with a literal 64-hex verifies the names it hashes
+        if names is not None:
+            names = set(dl) if "*" in names else {n for n in names if n in dl}
+            if info["nxt"] in ("\n", ";", ""):
+                ok |= names
+                any_ok = True
+            elif info["nxt"] == "&&":
+                chain = (k, names)
     for out in outputs:
         if base_of(out) in FETCH_ALLOWED:
             return f"a download written over the command name `{base_of(out)[:40]}`"
@@ -2572,8 +3275,8 @@ def matrix_variants(raw: str, ctx: RunCtx) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     for key in keys:
         for value in ctx.matrix_values[key]:
-            if "${{" in value:
-                continue  # an expression value is refused by check_matrix_exprs
+            if "${{" in value or value == MATRIX_COMPLEX:
+                continue  # an expression value is refused by check_matrix_exprs; a mapping or sequence by check_run
             text = EXPR_RE.sub(lambda m, k=key, v=value: v if m.group(1).strip() == f"matrix.{k}" else "$__GHX__", raw)
             out.append((f"matrix.{key} = {value[:40]}", text))
     return out
@@ -2590,18 +3293,100 @@ def check_env_keys(env: Optional[Node], name: str, where: str, rep: Report) -> N
     if env is None or env.kind != "map":
         return
     for key in env.keys():
-        if DANGEROUS_ASSIGN_RE.fullmatch(key):
+        held = env.get(key)
+        vtext = held.text().strip() if held is not None and held.kind == "scalar" else None
+        if DANGEROUS_ASSIGN_RE.fullmatch(key) or rustflags_bad(key, vtext):
             rep.bad(f"{name}: {where}: line {env.line + 1}: `env:` sets `{key}`, which changes what the shell or a tool "
                     "loads before it runs (Round 8, S6: the inline form is refused, so the mapping form is too)")
+
+
+def step_value_words(step: Node) -> List[str]:
+    """Round 9 (sec r8 F3): the values of a step's `env:` and `with:` (a `uses:` step has no `run:`), as words that may name a
+    download."""
+    out: List[str] = []
+    for key in ("env", "with"):
+        held = step.get(key)
+        if held is not None and held.kind == "map" and isinstance(held.value, dict):
+            for val in held.value.values():
+                if val.kind == "scalar":
+                    out.append(norm_name(val.text().strip().strip("'\"")))
+    return out
+
+
+def matrix_complex_keys(raw: str, ctx: RunCtx) -> List[str]:
+    """Round 9 (F8): the matrix keys the run text names whose value is a mapping or a sequence."""
+    keys: List[str] = []
+    for m in EXPR_RE.finditer(raw):
+        parts = m.group(1).strip().split(".")
+        if (len(parts) == 2 and parts[0] == "matrix" and MATRIX_COMPLEX in ctx.matrix_values.get(parts[1], ())
+                and parts[1] not in keys):
+            keys.append(parts[1])
+    return keys
+
+
+def cross_step(step: Node, facts: Dict[str, object], ctx: RunCtx, name: str, where: str, rep: Report, line: int) -> None:
+    """The names of a step against the downloads of the earlier steps of its job (Round 8, S2) and, Round 9 (sec r8 F3), the
+    indirect references to them: an `env:` or `with:` value, a variable's value, a bare glob or `$(ls)` over a download
+    directory, a download directory on PATH.
+    decision: refuse every indirect reference to a download over tracking renames because the guard reads workflow text and
+    cannot follow shell data flow."""
+    words = [str(w) for w in facts.get("words", [])] + step_value_words(step)  # type: ignore[union-attr]
+    parts = {p for w in words for p in re.split(r"[/=:]", w)}  # a path component or an option value, never a substring
+    verified = facts.get("verified", set())
+    flagged = False
+    for hit in sorted(f for f in ctx.fetched if f in parts or any(glob_hit(f, p) for p in parts)):
+        # Round 9 (F5): the `.sha256` companion is only data next to an asset this step verified by a real check
+        if hit in verified or (hit.endswith(".sha256") and hit[:-len(".sha256")] in verified):
+            continue
+        rep.bad(f"{name}: {where}: line {line}: `run:` names `{hit[:40]}`, a file an earlier step of the job "
+                "downloaded, and no `sha256sum`, `shasum` or `gh attestation verify` of this step names that file "
+                "(Round 8, S2: the checksum tool must name the exact downloaded file; a glob does not; a downloaded file is "
+                "checked in the step that uses it)")
+        flagged = True
+        break
+    if not flagged:
+        for glob in facts.get("globs", []):  # type: ignore[union-attr]
+            for piece in re.split(r"[=:]", str(glob)):
+                if bare_glob(piece) and fetch_dir_of(piece) in ctx.fetch_dirs:
+                    rep.bad(f"{name}: {where}: line {line}: `run:` names the bare glob `{str(glob)[:40]}` over "
+                            f"`{fetch_dir_of(piece)}`, a directory an earlier step of the job downloaded into (Round 9, sec r8 F3: "
+                            "a glob that matches a download without naming it is an indirect reference; name the file)")
+                    flagged = True
+                    break
+            if flagged:
+                break
+    if not flagged:
+        for d in facts.get("ls_dirs", []):  # type: ignore[union-attr]
+            if d in ctx.fetch_dirs:
+                rep.bad(f"{name}: {where}: line {line}: `run:` lists `{str(d)[:40]}` with `ls` in a command substitution, "
+                        "a directory an earlier step of the job downloaded into (Round 9, sec r8 F3: an indirect reference)")
+                flagged = True
+                break
+    if not flagged:
+        for arg in facts.get("path_args", []):  # type: ignore[union-attr]
+            if fetch_dir_of(str(arg) + "/_") in ctx.fetch_dirs:
+                rep.bad(f"{name}: {where}: line {line}: `run:` puts `{str(arg)[:40]}` on GITHUB_PATH, a directory an earlier "
+                        "step of the job downloaded into (Round 9, sec r8 F3: a downloaded program would shadow a tool)")
+                break
+    for out in facts.get("outputs", []):  # type: ignore[union-attr]
+        base = base_of(str(out))
+        if base:
+            ctx.fetched.add(base)
+            ctx.fetch_dirs.add(fetch_dir_of(str(out)))
+    ctx.made.update(facts.get("env_names", ()))  # type: ignore[arg-type]
 
 
 def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> None:
     """Round 6 (vote 6def5ab6): a `run:` names only allow-listed expression roots, and a fetch step runs only
     the commands of FETCH_ALLOWED. Round 7 adds the shell, the network-redirection patterns and the check that a
     step naming a downloaded file verifies it. Round 8 holds every command word of every `run:` to RUN_ALLOWED (S8),
-    scans the literal matrix values that reach the text (S4) and checks the names against the checksum commands."""
+    scans the literal matrix values that reach the text (S4) and checks the names against the checksum commands. Round 9
+    (sec r8 F1-F3) checks the `env:` of every step (a `uses:` step too), refuses a dangerous variable in every run step and
+    refuses an indirect reference to a download (an `env:` value, a variable, a bare glob, a PATH entry)."""
+    check_env_keys(step.get("env"), name, where, rep)
     run = step.get("run")
     if run is None:
+        cross_step(step, {}, ctx, name, where, rep, step.line + 1)
         return
     raw = run_text(run)
     if raw is None:
@@ -2616,7 +3401,6 @@ def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> No
     elif ctx.windows and not ctx.default_shell:
         rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` has no `shell:` on a Windows runner (the default shell there "
                 f"is pwsh; Round 7: name {' or '.join(SHELL_ALLOWED)})")
-    check_env_keys(step.get("env"), name, where, rep)
     for m in EXPR_RE.finditer(raw):
         if expr_allowed(m.group(1), ctx):
             continue
@@ -2642,7 +3426,7 @@ def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> No
         facts.update(words=[norm_name(text)], outputs=[], verified=set())
     else:
         reason = run_problem(scan, ctx)
-        problem = fetch_problem(scan, facts)
+        problem = fetch_problem(scan, facts, ctx.made)
         if problem:  # one line per cause: the fetch-step reason names the command, so the allow-list line is not repeated
             rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` is a fetch step that runs {problem} "
                     "(Round 6, 3-agent vote 6def5ab6: a step that downloads may run only "
@@ -2650,30 +3434,25 @@ def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> No
         elif reason and not (DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw)):
             rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` runs {reason} (Round 8, S8, 3-agent vote 6def5ab6: the "
                     f"run allow-list RUN_ALLOWED names every command word a `run:` may use, {', '.join(RUN_ALLOWED[:6])}, ...)")
+        if not problem and not reason:
+            env_bad = env_write_problem(scan)
+            if env_bad:
+                rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` sets {env_bad} (Round 9, sec r8 F1, F2: a variable that "
+                        "picks a program, a linker, a config or a registry loads it in every later command and step, so it is "
+                        "refused in every `run:`, not only in a fetch step)")
+        for key in matrix_complex_keys(raw, ctx):
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` splices `matrix.{key}`, a mapping or sequence value, whole "
+                    "into the script (Round 9, F8: only a scalar matrix value is a word the guard can read)")
         for label, variant in matrix_variants(raw, ctx):
             try:
                 vscan = ShellScan(variant)
-                why = run_problem(vscan, ctx) or fetch_problem(vscan, {})
+                why = run_problem(vscan, ctx) or fetch_problem(vscan, {}, ctx.made)
             except ShellError as err:
                 why = f"text the scanner cannot read ({err})"
             if why:
                 rep.bad(f"{name}: {where}: line {run.line + 1}: matrix value `{label}` spliced into `run:` runs {why} "
                         "(Round 8, S4: a literal matrix value is scanned as run text)")
-    words = [w for w in facts.get("words", [])]  # type: ignore[union-attr]
-    parts = {p for w in words for p in re.split(r"[/=:]", w)}  # a path component or an option value, never a substring
-    verified = facts.get("verified", set())
-    for hit in sorted(f for f in ctx.fetched if f in parts or any(glob_hit(f, p) for p in parts)):
-        if hit in verified or (hit.endswith(".sha256") and hit[:-len(".sha256")] in ctx.fetched):
-            continue
-        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` names `{hit[:40]}`, a file an earlier step of the job "
-                "downloaded, and no `sha256sum`, `shasum` or `gh attestation verify` of this step names that file "
-                "(Round 8, S2: the checksum tool must name the exact downloaded file; a glob does not; a downloaded file is "
-                "checked in the step that uses it)")
-        break
-    for out in facts.get("outputs", []):  # type: ignore[union-attr]
-        base = base_of(str(out))
-        if base:
-            ctx.fetched.add(base)
+    cross_step(step, facts, ctx, name, where, rep, run.line + 1)
 
 
 def defaults_shell(node: Node, name: str, what: str, rep: Report) -> str:
@@ -4474,7 +5253,7 @@ R8_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r8 S8: cargo install of a listed crate passes": (_r8("cargo install --locked cbindgen --version 0.29.4"), None, 0, ""),
     "r8 S8: cargo build passes": (_r8("cargo build --release --features sal"), None, 0, ""),
     "r8 S8: gh release is refused": (_r8("gh release view v1"), None, 1, "gh"),
-    "r8 S8: gh api passes": (_r8("gh api repos/o/r"), None, 0, ""),
+    "r8 S8: gh api of a listed read-only endpoint passes": (_r8("gh api repos/o/r/pulls/1/reviews --paginate"), None, 0, ""),
     "r8 S8: openssl s_client is refused": (_r8("openssl s_client -connect x.example:443"), None, 1, "RUN_OPENSSL"),
     "r8 S8: openssl rand passes": (_r8("openssl rand -hex 8"), None, 0, ""),
     "r8 S8: pipx install of another package is refused": (_r8("pipx install evil"), None, 1, "RUN_PIPX"),
@@ -4526,13 +5305,350 @@ R8_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r8 S2: a later step that checks the exact file passes": (
         _r7_steps(R8_TOOL, "      - run: |\n          echo \"${SUM}  tool\" | sha256sum -c -\n          chmod +x tool\n"), None, 0, ""),
     "r8 S2: a later step cannot be read is refused": (_r7_steps(R8_TOOL, "      - run: |\n          chmod +x tool\n          echo )\n"), None, 1, "cannot read"),
-    "r8 S2: the weak companion pattern of a .sha256 pair keeps passing": (
+    "r8 S2: the weak companion pattern of a .sha256 pair is refused (Round 9, F5: a print-only sha256sum verifies nothing)": (
         _r7_steps("      - run: |\n          curl -fsSL -o a https://x.example/a\n          curl -fsSL -o a.sha256 https://x.example/a.sha256\n",
-                  "      - run: |\n          ACTUAL=$(sha256sum a | cut -d' ' -f1)\n          test \"$ACTUAL\" = \"$(awk '{print $1}' a.sha256)\"\n"), None, 0, ""),
+                  "      - run: |\n          ACTUAL=$(sha256sum a | cut -d' ' -f1)\n          test \"$ACTUAL\" = \"$(awk '{print $1}' a.sha256)\"\n"), None, 1, "checksum"),
     # --- C2: a verify inside a function body never runs until called.
     "r8 C2: a verify in an uncalled function does not count": (_r8(R7_FETCH, "g() { " + R7_VERIFY + "; }", "tar xzf f"), None, 1, "checksum"),
     "r8 C2: a verify in a brace group counts": (_r8(R7_FETCH, "{ " + R7_VERIFY + "; }", "tar xzf f"), None, 0, ""),
 }
+
+
+# Round 9 (code r8 F1-F10): (document, files, message count, needle). Each row of F1-F6, F10 and the gh/git forms of F4 is a probe
+# of the reviewer (probe_r8.py R-rows, probe_r8b.py B-rows) or the same class with another delimiter, option or shape.
+R9_HEX = "0123456789abcdef" * 4
+R9_GH_REVIEWS = "repos/o/r/pulls/1/reviews"
+R9_SEQ = "    strategy:\n      matrix:\n        k:\n%s"
+
+R9_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    # --- F1: an awk program is read, not matched: no pipe, no getline, no system(), a print redirect only to a literal path.
+    "r9 F1: awk print to a pipe held in a variable is refused": (_r8("awk 'BEGIN { c = \"id\"; print 1 | c }'"), None, 1, "awk"),
+    "r9 F1: awk getline from a command is refused": (_r8("awk 'BEGIN { c = \"id\"; c | getline x }'"), None, 1, "awk"),
+    "r9 F1: awk getline from a file is refused": (_r8("awk 'BEGIN { getline x < \"f\" }'"), None, 1, "awk"),
+    "r9 F1: awk print to a pipe with a quoted command is refused": (_r8("awk '{ print $1 | \"sh\" }'"), None, 1, "awk"),
+    "r9 F1: awk printf to a pipe is refused": (_r8("awk '{ printf \"%s\", $1 | c }'"), None, 1, "awk"),
+    "r9 F1: awk print redirected to a variable path is refused": (_r8("awk '{ print $1 > f }' x"), None, 1, "awk"),
+    "r9 F1: awk print appended to a variable path is refused": (_r8("awk '{ print $1 >> f }' x"), None, 1, "awk"),
+    "r9 F1: awk print redirected to a literal path passes": (_r8("awk '{ print $1 > \"out.txt\" }' x"), None, 0, ""),
+    "r9 F1: awk print appended to a literal path passes": (_r8("awk '{ print $1 >> \"out.txt\" }' x"), None, 0, ""),
+    "r9 F1: awk print redirected to a concatenated path is refused": (_r8("awk '{ print $1 > \"o\" f }' x"), None, 1, "awk"),
+    "r9 F1: awk comparison inside parentheses passes": (_r8("awk '{ print ($1 > 2) }' x"), None, 0, ""),
+    "r9 F1: awk logical or and a quoted bar pass": (_r8("awk 'NR == 1 || NR == 2 { print \"a|b\" }' x"), None, 0, ""),
+    "r9 F1: awk with -F and -v passes": (_r8("awk -F= -v k=1 '{ print $2 }' x"), None, 0, ""),
+    "r9 F1: awk program held in a variable is refused": (_r8("P='{ print 1 }'", "awk \"$P\" x"), None, 1, "awk"),
+    "r9 F1: awk program held in an unquoted variable is refused": (_r8("P='{ print 1 }'", "awk $P x"), None, 1, "awk"),
+    "r9 F1: awk program in double quotes with an expansion is refused": (_r8("awk \"{ print \\$1 > \\\"$F\\\" }\" x"), None, 1, "awk"),
+    "r9 F1: awk -f program file is refused": (_r8("awk -f ci/x.awk x"), None, 1, "awk"),
+    "r9 F1: awk --file program file is refused": (_r8("awk --file=ci/x.awk x"), None, 1, "awk"),
+    "r9 F1: awk @load is refused": (_r8("awk '@load \"x\" BEGIN { }'"), None, 1, "awk"),
+    "r9 F1: awk with an unterminated string is refused": (_r8("awk '{ print \"a }' x"), None, 1, "awk"),
+    "r9 F1: awk system with a space is refused": (_r8("awk 'BEGIN { system (\"id\") }'"), None, 1, "awk"),
+    # --- F2: a sed script is parsed: the e command and the e flag with any delimiter, program files, w and r to a computed path.
+    "r9 F2: sed address and e command is refused": (_r8("sed -n '1e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed last-line address and e command is refused": (_r8("sed '$e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed regex address and e command is refused": (_r8("sed '/x/e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed range address and e command is refused": (_r8("sed '1,3e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed custom regex delimiter address and e command is refused": (_r8("sed '\\,x,e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed e command after a semicolon is refused": (_r8("sed 's/a/b/;e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed e command inside a block is refused": (_r8("sed -n -e '1{e id' -e '}' README.md"), None, 1, "sed"),
+    "r9 F2: sed e flag with a bar delimiter is refused": (_r8("echo x | sed 's|x|id|e'"), None, 1, "sed"),
+    "r9 F2: sed e flag with a hash delimiter and other flags is refused": (_r8("echo x | sed 's#x#id#ge'"), None, 1, "sed"),
+    "r9 F2: sed e flag with a comma delimiter is refused": (_r8("echo x | sed 's,x,id,e'"), None, 1, "sed"),
+    "r9 F2: sed w flag path is not a flag": (_r8("echo x | sed 's/x/y/w out.txt'"), None, 0, ""),
+    "r9 F2: sed -f program file is refused": (_r8("sed -f ci/x.sed README.md"), None, 1, "sed"),
+    "r9 F2: sed -n -f program file is refused": (_r8("sed -n -f ci/x.sed README.md"), None, 1, "sed"),
+    "r9 F2: sed --file program file is refused": (_r8("sed --file=ci/x.sed README.md"), None, 1, "sed"),
+    "r9 F2: sed -s is refused": (_r8("sed -s -n p a b"), None, 1, "sed"),
+    "r9 F2: sed w to a literal path passes": (_r8("sed -n 'w out.txt' README.md"), None, 0, ""),
+    "r9 F2: sed w to a computed path is refused": (_r8("sed -n \"w $OUT\" README.md"), None, 1, "sed"),
+    "r9 F2: sed r of a computed path is refused": (_r8("sed \"r $IN\" README.md"), None, 1, "sed"),
+    "r9 F2: sed flag from an expansion is refused": (_r8("sed \"s/a/b/$F\" README.md"), None, 1, "sed"),
+    "r9 F2: sed command from an expansion is refused": (_r8("sed \"$CMD\" README.md"), None, 1, "sed"),
+    "r9 F2: sed with an unknown option is refused": (_r8("sed --debug-x p README.md"), None, 1, "sed"),
+    "r9 F2: sed in-place with a replacement variable passes": (_r8("sed -i \"s/X/${V}/\" README.md"), None, 0, ""),
+    "r9 F2: sed two -e scripts with a replacement variable pass": (
+        _r8("sed -e \"s/^Version:.*/Version:  ${V}/\" -e 's/a/b/' README.md"), None, 0, ""),
+    "r9 F2: sed substitutions, ranges, blocks and y pass": (
+        _r8("sed -n -e 's/a/b/g;s/c/d/' -e '/a/,/b/p' -e '2{p;q}' -e '$d' -e 'y/abc/xyz/' README.md"), None, 0, ""),
+    "r9 F2: sed -E with an alternation passes": (_r8("sed -E 's/(a)|b/\\1/g' README.md"), None, 0, ""),
+    "r9 F2: sed append text that contains an e passes": (_r8("sed '1a echo e' README.md"), None, 0, ""),
+    # --- F3: tar program options are refused in every run, not only in a fetch step.
+    "r9 F3: tar --to-command outside a fetch step is refused": (_r8("tar xf vendor.tar --to-command=id"), None, 1, "tar"),
+    "r9 F3: tar -I outside a fetch step is refused": (_r8("tar -I ./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar -I in a bundled cluster is refused": (_r8("tar -xIf ./x vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar old-style cluster with I is refused": (_r8("tar xIf ./x vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --use-compress-program is refused": (_r8("tar --use-compress-program=./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --checkpoint-action=exec is refused": (_r8("tar --checkpoint=1 --checkpoint-action=exec=id -cf o.tar ."), None, 1, "tar"),
+    "r9 F3: tar --rsh-command is refused": (_r8("tar --rsh-command=./x -xf h:vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --rmt-command is refused": (_r8("tar --rmt-command=./x -xf h:vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --info-script is refused": (_r8("tar --info-script=./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --new-volume-script is refused": (_r8("tar --new-volume-script=./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar abbreviated --to-c is refused": (_r8("tar xf vendor.tar --to-c=id"), None, 1, "tar"),
+    "r9 F3: tar --strip-components extract passes": (_r8("tar --strip-components=1 -xzf vendor.tgz -C out"), None, 0, ""),
+    "r9 F3: tar xzf passes": (_r8("tar xzf vendor.tgz"), None, 0, ""),
+    # --- F4: gh api only on a listed read-only endpoint, never into a shell; a captured API or git show body is a download.
+    "r9 F4: gh api raw content to a file then bash is refused": (
+        _r8("gh api -H 'Accept: application/vnd.github.raw' repos/o/r/contents/i.sh > i.sh", "bash i.sh"), None, 1, "bash"),
+    "r9 F4: gh api tarball then tar and source is refused": (
+        _r8("gh api repos/o/r/tarball/v1 > f.tgz", "tar xzf f.tgz", "source f/i.sh"), None, 1, "f.tgz"),
+    "r9 F4: gh api to a file in one step, bash in the next is refused": (
+        _r7_steps("      - run: |\n          gh api -H 'Accept: application/vnd.github.raw' repos/o/r/contents/i.sh > i.sh\n",
+                  "      - run: bash i.sh\n"), None, 2, "i.sh"),
+    "r9 F4: gh api of an unlisted endpoint is refused": (_r8("gh api repos/o/r"), None, 1, "gh api"),
+    "r9 F4: gh api with --input is refused": (_r8(f"gh api {R9_GH_REVIEWS} --input x.json"), None, 1, "gh api"),
+    "r9 F4: gh api with -X is refused": (_r8(f"gh api -X POST {R9_GH_REVIEWS}"), None, 1, "gh api"),
+    "r9 F4: gh api with --output is refused": (_r8(f"gh api {R9_GH_REVIEWS} --output r.json"), None, 1, "gh api"),
+    "r9 F4: gh api of a listed endpoint into a command substitution passes": (
+        _r8(f"approved=$(gh api \"{R9_GH_REVIEWS}\" --paginate --jq '.[]')"), None, 0, ""),
+    "r9 F4: gh api of a listed endpoint with variables passes": (
+        _r8("approved=$(gh api \"repos/$REPO/pulls/$PR_NUMBER/reviews\" --paginate --jq \"[.[] | select(.user.login == \\\"$L\\\")] | length\")"), None, 0, ""),
+    "r9 F4: gh api of a listed endpoint into bash is refused": (_r8(f"gh api {R9_GH_REVIEWS} | bash"), None, 1, "gh api"),
+    "r9 F4: gh api of a listed endpoint into python3 is refused": (_r8(f"gh api {R9_GH_REVIEWS} | python3 -"), None, 1, "gh api"),
+    "r9 F4: gh api of a listed endpoint into tee is refused": (_r8(f"gh api {R9_GH_REVIEWS} | tee r.json"), None, 1, "tee"),
+    "r9 F4: gh api of a listed endpoint to a file is a download that is named by the next step": (
+        _r7_steps(f"      - run: gh api {R9_GH_REVIEWS} > r.json\n", "      - run: cat r.json\n"), None, 1, "r.json"),
+    "r9 F4: gh api of a listed endpoint to a file, then a non-fetch command in the same step is refused": (
+        _r8(f"gh api {R9_GH_REVIEWS} > r.json", "cat r.json"), None, 1, "fetch step"),
+    "r9 F4: git show of another ref to a file then bash is refused": (_r8("git show origin/x:i.sh > i.sh", "bash i.sh"), None, 1, "fetch step"),
+    "r9 F4: git show of another ref to a file, named by the next step, is refused": (
+        _r7_steps("      - run: git show origin/x:i.sh > i.sh\n", "      - run: bash i.sh\n"), None, 1, "i.sh"),
+    "r9 F4: git show of a ref and path into a substitution is refused": (_r8("x=$(git show origin/x:i.sh)"), None, 1, "git show"),
+    "r9 F4: git show without a path passes": (_r8("git show --stat HEAD"), None, 0, ""),
+    "r9 F4: git show of a ref and path that prints passes": (_r8("git show HEAD:README.md"), None, 0, ""),
+    "r9 F4: gh release download is refused": (_r8("gh release download v1 -p i.sh"), None, 1, "gh"),
+    "r9 F4: gh run download is refused": (_r8("gh run download 1 -n a"), None, 1, "gh"),
+    # --- F5: a name is verified by a check-mode call fed a literal pair or a repository checklist, or a literal digest comparison.
+    "r9 F5: a later step whose sha256sum only prints a digest is refused": (
+        _r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n", "      - run: |\n          sha256sum i.sh\n          bash i.sh\n"), None, 1, "checksum"),
+    "r9 F5: a later step whose shasum only prints a digest is refused": (
+        _r7_steps("      - run: curl -fsSL -o t.py https://x.example/t.py\n", "      - run: |\n          shasum -a 256 t.py\n          python3 t.py\n"), None, 1, "checksum"),
+    "r9 F5: a later step whose sha256sum -c names the file passes": (
+        _r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n",
+                  f"      - run: |\n          sha256sum -c <<< \"{R9_HEX}  i.sh\"\n          bash i.sh\n"), None, 0, ""),
+    "r9 F5: a later step whose literal digest comparison names the file passes": (
+        _r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n",
+                  f"      - run: |\n          h=$(sha256sum i.sh)\n          [ \"${{h%% *}}\" = \"{R9_HEX}\" ]\n          bash i.sh\n"), None, 0, ""),
+    "r9 F5: a check-mode call fed a literal pair verifies": (_r8(R7_FETCH, f"sha256sum -c <<< \"{R9_HEX}  f\"", "tar xzf f"), None, 0, ""),
+    "r9 F5: a check-mode call fed a pair that names another file does not verify": (
+        _r8(R7_FETCH, f"sha256sum -c <<< \"{R9_HEX}  g\"", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a print-only digest then tar is refused": (_r8(R7_FETCH, "sha256sum f", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a digest compared with a literal 64-hex verifies": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", f"[ \"${{h%% *}}\" = \"{R9_HEX}\" ]", "tar xzf f"), None, 0, ""),
+    "r9 F5: a double bracket test in a fetch step is refused (use `[`)": (
+        _r8(R7_FETCH, "[[ \"$(sha256sum f)\" == " + R9_HEX + " ]]", "tar xzf f"), None, 1, "[["),
+    "r9 F5: a digest compared with a variable is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", "[ \"${h%% *}\" = \"$WANT\" ]", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a digest compared with a short literal is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", "[ \"${h%% *}\" = abcdef ]", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a literal digest comparison that a || true defuses is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", f"[ \"${{h%% *}}\" = \"{R9_HEX}\" ] || true", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a literal digest comparison inside a condition is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", f"if [ \"${{h%% *}}\" = \"{R9_HEX}\" ]; then echo ok; fi", "tar xzf f"), None, 1, "own checksum"),
+    # --- F6: the expected digest is a literal 64-hex or comes from a verified file; a variable the job assigns is a self-made digest.
+    "r9 F6: a digest computed from the file and fed back through a variable is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum < f)", "echo \"${h%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F6: a digest computed by an exported variable is refused": (
+        _r8(R7_FETCH, "export H=$(sha256sum f)", "echo \"${H%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "export"),
+    "r9 F6: a digest read into a variable is refused": (
+        _r8(R7_FETCH, "read -r H < <(sha256sum f)", "echo \"${H%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "read"),
+    "r9 F6: a digest set by printf -v is refused": (
+        _r8(R7_FETCH, "printf -v H '%s' \"$(sha256sum f)\"", "echo \"${H%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "printf"),
+    "r9 F6: a digest in a variable the job sets to a literal 64-hex passes": (
+        _r8(R7_FETCH, f"H={R9_HEX}", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 0, ""),
+    "r9 F6: a digest in a variable the job sets to a short literal is refused": (
+        _r8(R7_FETCH, "H=abc", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F6: a digest in a variable set from a file is refused": (
+        _r8(R7_FETCH, "H=$(cat deploy/f.sum)", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "cat"),
+    "r9 F6: a digest in an unassigned variable passes": (_r8(R7_FETCH, R7_VERIFY, "tar xzf f"), None, 0, ""),
+    "r9 F6: a digest in a variable a case arm sets to a literal 64-hex passes": (
+        _r8(R7_FETCH, f"case \"$A\" in x) H={R9_HEX} ;; *) H={R9_HEX[::-1]} ;; esac", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 0, ""),
+    # --- F7: a quoted literal repository script path is a literal path.
+    "r9 F7: bash of a double-quoted literal script passes": (_r8('bash "ci/x.sh"'), None, 0, ""),
+    "r9 F7: bash of a single-quoted literal script passes": (_r8("bash 'ci/x.sh'"), None, 0, ""),
+    "r9 F7: python3 of a quoted literal script passes": (_r8('python3 -I "scripts/x.py"'), None, 0, ""),
+    "r9 F7: source of a quoted literal script passes": (_r8('source "ci/x.sh"'), None, 0, ""),
+    "r9 F7: bash of a quoted variable is refused": (_r8('bash "$X"'), None, 1, "script file"),
+    "r9 F7: bash of a quoted path with a variable is refused": (_r8('bash "ci/$X.sh"'), None, 1, "script file"),
+    "r9 F7: bash of an unquoted path with a variable is refused": (_r8("bash ci/${X}.sh"), None, 1, "script file"),
+    "r9 F7: bash of a quoted parent path is refused": (_r8('bash "../x.sh"'), None, 1, "script file"),
+    "r9 F7: bash of a quoted absolute path is refused": (_r8('bash "/etc/x.sh"'), None, 1, "script file"),
+    "r9 F7: bash of a command substitution is refused": (_r8('bash "$(pick)"'), None, 1, "without a literal script file"),
+    'r9 F6/sec F1: a fetch step that opens with an assignment to LD_PRELOAD is refused as a fetch step': (_r8("LD_PRELOAD=./x.so curl -fsSL -o a.tgz https://h.test/a.tgz"), None, 1, 'is a fetch step that runs an assignment'),
+    'r9 F6/sec F1: a fetch step that sets LD_PRELOAD after the download is refused as a fetch step': (_r8("curl -fsSL -o a.tgz https://h.test/a.tgz", "LD_PRELOAD=./x.so true"), None, 1, 'is a fetch step that runs an assignment'),
+    'r9 sec F1: a fetch step that writes GITHUB_ENV is refused as a fetch step': (_r8("curl -fsSL -o a.tgz https://h.test/a.tgz", "echo A=1 >> $GITHUB_ENV"), None, 1, 'a write to GITHUB_ENV or GITHUB_PATH'),
+    'r9 F4: gh release list is neither gh api nor gh attestation verify': (_r8("gh release list"), None, 1, 'neither `gh api`'),
+    'r9 F2: sed with a bare e command is refused': (_r8("sed e in.txt"), None, 1, '`e` command'),
+    'r9 F2: sed with an addressed e command is refused': (_r8("sed '1e' in.txt"), None, 1, '`e` command'),
+    'r9 F1: awk print to a path that is not a literal string is refused': (_r8("awk '{print > $1\";}' in.txt"), None, 1, 'not a literal string'),
+    'r9 F1: awk print to a variable path is refused': (_r8("awk '{print > f\";}' in.txt"), None, 1, 'not a literal string'),
+    'r9 F1: awk print to a network special file is refused': (_r8("awk '{print > \"/inet/tcp/0/h/80\"}' in.txt"), None, 1, 'network special file'),
+    'r9 F2: sed s///w to an expanded path is refused': (_r8('sed "s/a/b/w $OUT" in.txt'), None, 1, '`w` flag'),
+    'r9 F2: sed address from an expansion is refused': (_r8('sed -n "${N}p" in.txt'), None, 1, 'address'),
+    'r9 F2: sed with a command the guard does not read is refused': (_r8("sed 'k' in.txt"), None, 1, 'does not read'),
+    'r9 F2: sed with text where a command ends is refused': (_r8("sed 'pq' in.txt"), None, 1, 'where a command ends'),
+    'r9 F4: gh api with -X is refused by name': (_r8("gh api -X DELETE " + R9_GH_REVIEWS), None, 1, 'with `-X`'),
+    'r9 F5: a later step whose sha256sum is fed a pair but not in check mode verifies nothing': (_r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n", "      - run: |\n          echo \"abc  i.sh\" | sha256sum\n          bash i.sh\n"), None, 1, 'checksum'),
+    'r9 F5: a later step whose shasum reads a here-string pair but not in check mode verifies nothing': (_r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n", "      - run: |\n          shasum -a 256 <<< \"abc  i.sh\"\n          bash i.sh\n"), None, 1, 'checksum'),
+    'r9 F4: a gh release download to a named file, then tar of it, is refused by name': (_r8("gh release download v1 -p f.tgz -O f.tgz", "tar xzf f.tgz"), None, 1, 'f.tgz'),
+    'r9 sec F1: a here-document written to GITHUB_ENV is refused': (_r7_steps("      - run: |\n          cat >> $GITHUB_ENV <<EOF\n          A=1\n          EOF\n"), None, 1, 'here-document'),
+    'r9 sec F1: a here-document written to a quoted GITHUB_ENV is refused': (_r7_steps("      - run: |\n          cat <<EOF >> \"$GITHUB_ENV\"\n          A=1\n          EOF\n"), None, 1, 'here-document'),
+    'r9 sec F1: a printf format holding two variable assignments for GITHUB_ENV is refused': (_r8("printf 'A=1\\nB=2\\n' >> $GITHUB_ENV"), None, 1, 'computed'),
+    # --- F8: a mapping or a sequence matrix value spliced whole into run text is a problem.
+    "r9 F8: a mapping-valued matrix key spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head=R9_SEQ % "          a: b\n"), None, 1, "mapping or sequence"),
+    "r9 F8: a flow list of mappings spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head=R8_MATRIX % "{a: 1}, {b: 2}"), None, 1, "subset grammar"),
+    "r9 F8: a block list of mappings spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head=R9_SEQ % "          - a: 1\n"), None, 1, "mapping or sequence"),
+    "r9 F8: an include entry holding a mapping spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head="    strategy:\n      matrix:\n        include:\n          - k:\n              a: b\n"), None, 1, "mapping or sequence"),
+    "r9 F8: an include entry holding a flow mapping spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head="    strategy:\n      matrix:\n        include:\n          - k: {a: b}\n"), None, 1, "subset grammar"),
+    "r9 F8: a mapping-valued matrix key that run never names passes": (
+        _r7_steps("      - run: echo ok\n", head=R9_SEQ % "          a: b\n"), None, 0, ""),
+    "r9 F8: a plain list spliced into run passes": (_r7_steps("      - run: echo ${{ matrix.k }}\n", head=R8_MATRIX % "a, b"), None, 0, ""),
+    # --- F10: openssl options that load code, and a verify key outside the repository.
+    "r9 F10: openssl -engine is refused": (_r8("openssl req -engine ./x.so -new"), None, 1, "openssl"),
+    "r9 F10: openssl -provider is refused": (_r8("openssl req -provider ./x -new"), None, 1, "openssl"),
+    "r9 F10: openssl -provider-path is refused": (_r8("openssl req -provider-path ./x -new"), None, 1, "openssl"),
+    "r9 F10: openssl -modulepath is refused": (_r8("openssl req -modulepath ./x -new"), None, 1, "openssl"),
+    "r9 F10: openssl -config of a computed path is refused": (_r8("openssl req -config \"$C\" -new"), None, 1, "openssl"),
+    "r9 F10: openssl -conf of a computed path is refused": (_r8("openssl x509 -conf $C -noout"), None, 1, "openssl"),
+    "r9 F10: openssl -config of a literal path passes": (_r8("openssl req -config ci/openssl.cnf -new -x509 -days 1 -nodes -keyout k -out c"), None, 0, ""),
+    "r9 F10: openssl dgst -verify of a computed key is refused": (_r8("openssl dgst -sha256 -verify \"$K\" -signature s f"), None, 1, "openssl"),
+    "r9 F10: openssl dgst -verify of a repository key passes": (_r8("openssl dgst -sha256 -verify keys/pub.pem -signature s f"), None, 0, ""),
+    "r9 F10: openssl dgst -verify of a parent path key is refused": (_r8("openssl dgst -sha256 -verify ../pub.pem -signature s f"), None, 1, "openssl"),
+    "r9 F10: openssl pkeyutl is refused": (_r8("openssl pkeyutl -verify -inkey k -in f -sigfile s"), None, 1, "openssl"),
+    "r9 F10: openssl rand passes": (_r8("openssl rand -hex 8"), None, 0, ""),
+    # --- sec F1: a dangerous variable is refused in EVERY run step, in an `env:` of any step (a `uses:` step too) and in GITHUB_ENV.
+    "r9 sec F1: export LD_PRELOAD then cargo is refused": (_r8("export LD_PRELOAD=./x.so", "cargo build --locked"), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: a GITHUB_ENV line for LD_PRELOAD is refused": (_r8("echo \"LD_PRELOAD=./x.so\" >> \"$GITHUB_ENV\""), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: a GITHUB_ENV line for BASH_ENV in a group is refused": (
+        _r8("{ echo \"A=1\"; echo \"BASH_ENV=./x\"; } >> \"$GITHUB_ENV\""), None, 1, "BASH_ENV"),
+    "r9 sec F1: a GITHUB_ENV line with a computed name is refused": (_r8("echo \"$L\" >> \"$GITHUB_ENV\""), None, 1, "computed"),
+    "r9 sec F1: a GITHUB_ENV line after a printf format name is refused": (_r8("printf '%s\\n' \"X=1\" >> \"$GITHUB_ENV\""), None, 1, "computed"),
+    "r9 sec F1: two GITHUB_ENV lines in one echo are read per line": (
+        _r8("echo -e \"A=1\\nLD_PRELOAD=./x\" >> \"$GITHUB_ENV\""), None, 1, "echo -e"),
+    "r9 sec F1: a GITHUB_ENV write by cat is refused": (_r8("cat ci/env.txt >> \"$GITHUB_ENV\""), None, 1, "cat"),
+    "r9 sec F1: a GITHUB_ENV here-document is refused": (_r8("cat >> \"$GITHUB_ENV\" <<EOF", "A=1", "EOF"), None, 1, "GITHUB_ENV"),
+    "r9 sec F1: GITHUB_ENV held in a variable is refused": (_r8("F=\"$GITHUB_ENV\"", "echo \"A=1\" >> \"$F\""), None, 1, "GITHUB_ENV"),
+    "r9 sec F1: an ordinary GITHUB_ENV line passes": (_r8("echo \"CI_IMAGE_TAG=${img_tag}\" >> \"$GITHUB_ENV\""), None, 0, ""),
+    "r9 sec F1: a GITHUB_ENV group of ordinary lines passes": (
+        _r8("{ echo \"A=1\"; echo \"B=${C}\"; } >> \"$GITHUB_ENV\"", "echo \"::notice::done\""), None, 0, ""),
+    "r9 sec F1: inline LD_PRELOAD before cargo is refused": (_r8("LD_PRELOAD=./x.so cargo build --locked"), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: env -i is refused": (_r8("env -i cargo build --locked"), None, 1, "env"),
+    "r9 sec F1: env VAR=value is refused": (_r8("env BASH_ENV=./x bash ci/x.sh"), None, 1, "env"),
+    "r9 sec F1: declare of PATH is refused": (_r8("declare -x PATH=./bin:$PATH", "cargo build --locked"), None, 1, "PATH"),
+    "r9 sec F1: a uses step env BASH_ENV is refused": (
+        _r7_steps("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n        env:\n          BASH_ENV: ./x\n"), None, 1, "BASH_ENV"),
+    "r9 sec F1: a run step env LD_PRELOAD is refused": (_r7_steps("      - run: cargo build --locked\n        env:\n          LD_PRELOAD: ./x.so\n"), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: a uses step env that passes a uses output passes": (
+        _r7_steps("      - id: u\n        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+                  "      - run: cargo build --locked\n        env:\n          NDK_PATH: ${{ steps.u.outputs.p }}\n"), None, 0, ""),
+    # --- sec F2: the variables that pick a program for cargo, rustc, rustup, a C toolchain or openssl.
+    "r9 sec F2: step env RUSTC_WRAPPER is refused": (_r7_steps("      - run: cargo build --locked\n        env:\n          RUSTC_WRAPPER: ./x\n"), None, 1, "RUSTC_WRAPPER"),
+    "r9 sec F2: inline CARGO_BUILD_RUSTC_WRAPPER is refused": (_r8("CARGO_BUILD_RUSTC_WRAPPER=./x cargo build --locked"), None, 1, "CARGO_BUILD_RUSTC_WRAPPER"),
+    "r9 sec F2: a GITHUB_ENV line for RUSTC_WRAPPER is refused": (
+        _r7_steps("      - run: echo \"RUSTC_WRAPPER=./x\" >> \"$GITHUB_ENV\"\n", "      - run: cargo build --locked\n"), None, 1, "RUSTC_WRAPPER"),
+    "r9 sec F2: RUSTC is refused": (_r8("RUSTC=./x cargo build --locked"), None, 1, "RUSTC"),
+    "r9 sec F2: RUSTDOC is refused": (_r8("export RUSTDOC=./x"), None, 1, "RUSTDOC"),
+    "r9 sec F2: RUSTC_WORKSPACE_WRAPPER is refused": (_r8("RUSTC_WORKSPACE_WRAPPER=./x cargo build --locked"), None, 1, "RUSTC_WORKSPACE_WRAPPER"),
+    "r9 sec F2: RUSTFLAGS with a linker is refused": (_r8("export RUSTFLAGS=\"-C linker=./x\""), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: RUSTFLAGS with -Z is refused": (_r8("RUSTFLAGS=\"-Zunstable-options\" cargo build --locked"), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: RUSTFLAGS with link-arg is refused": (_r8("RUSTFLAGS=\"-C link-arg=-fuse-ld=./x\" cargo build --locked"), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: a computed RUSTFLAGS is refused": (_r8("RUSTFLAGS=\"$F\" cargo build --locked"), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: CARGO_ENCODED_RUSTFLAGS with a linker is refused": (_r8("CARGO_ENCODED_RUSTFLAGS=\"-Clinker=./x\" cargo build --locked"), None, 1, "CARGO_ENCODED_RUSTFLAGS"),
+    "r9 sec F2: RUSTFLAGS with a target feature passes": (_r8("RUSTFLAGS=\"-C target-cpu=native\" cargo build --locked"), None, 0, ""),
+    "r9 sec F2: CARGO_TARGET linker is refused": (_r8("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=./x cargo build --locked"), None, 1, "LINKER"),
+    "r9 sec F2: CARGO_TARGET runner is refused": (_r8("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=./x cargo test --locked"), None, 1, "RUNNER"),
+    "r9 sec F2: CARGO_HOME is refused": (_r8("CARGO_HOME=./h cargo build --locked"), None, 1, "CARGO_HOME"),
+    "r9 sec F2: CARGO_HTTP_PROXY is refused": (_r8("CARGO_HTTP_PROXY=http://x cargo build --locked"), None, 1, "CARGO_HTTP"),
+    "r9 sec F2: CARGO_REGISTRIES index is refused": (_r8("CARGO_REGISTRIES_X_INDEX=sparse+http://x cargo build --locked"), None, 1, "CARGO_REGISTRIES"),
+    "r9 sec F2: CARGO_NET_GIT_FETCH_WITH_CLI is refused": (_r8("CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --locked"), None, 1, "CARGO_NET"),
+    "r9 sec F2: CARGO_ALIAS is refused": (_r8("CARGO_ALIAS_B=./x cargo build --locked"), None, 1, "CARGO_ALIAS"),
+    "r9 sec F2: RUSTUP_TOOLCHAIN is refused": (_r8("RUSTUP_TOOLCHAIN=./t cargo build --locked"), None, 1, "RUSTUP_TOOLCHAIN"),
+    "r9 sec F2: RUSTUP_DIST_SERVER is refused": (_r8("RUSTUP_DIST_SERVER=http://x cargo build --locked"), None, 1, "RUSTUP_DIST_SERVER"),
+    "r9 sec F2: CC is refused": (_r8("CC=./x cargo build --locked"), None, 1, "`CC`"),
+    "r9 sec F2: CXX is refused": (_r8("export CXX=./x"), None, 1, "CXX"),
+    "r9 sec F2: AR_target is refused": (_r8("AR_x86_64_unknown_linux_gnu=./x cargo build --locked"), None, 1, "AR_"),
+    "r9 sec F2: LDFLAGS is refused": (_r8("LDFLAGS=-L./x cargo build --locked"), None, 1, "LDFLAGS"),
+    "r9 sec F2: OPENSSL_CONF is refused": (_r8("OPENSSL_CONF=./x openssl rand -hex 8"), None, 1, "OPENSSL_CONF"),
+    "r9 sec F2: OPENSSL_MODULES is refused": (_r8("export OPENSSL_MODULES=./x"), None, 1, "OPENSSL_MODULES"),
+    "r9 sec F2: the Android NDK lines of the release job pass": (
+        _r8("TC=\"$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin\"",
+            "{ echo \"CC_aarch64_linux_android=$TC/aarch64-linux-android24-clang\"; echo \"AR_i686_linux_android=$TC/llvm-ar\"; "
+            "echo \"CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android24-clang\"; } >> \"$GITHUB_ENV\""), None, 0, ""),
+    "r9 sec F2: an Android NDK name with another value is refused": (
+        _r8("echo \"CC_aarch64_linux_android=./evil\" >> \"$GITHUB_ENV\""), None, 1, "CC_aarch64_linux_android"),
+    "r9 sec F2: an Android NDK name outside the toolchain directory is refused": (
+        _r8("echo \"CARGO_TARGET_I686_LINUX_ANDROID_LINKER=/opt/evil\" >> \"$GITHUB_ENV\""), None, 1, "LINKER"),
+    "r9 sec F2: a C compiler for another target is refused": (_r8("echo \"CC_x86_64_unknown_linux_gnu=$TC/clang\" >> \"$GITHUB_ENV\""), None, 1, "CC_x86_64"),
+    "r9 sec F2: CARGO_REGISTRY_TOKEN passes": (
+        _r7_steps("      - run: cargo build --locked\n        env:\n          CARGO_REGISTRY_TOKEN: ${{ secrets.T }}\n"), None, 0, ""),
+    "r9 sec F2: CARGO_TERM_COLOR and CARGO_INCREMENTAL pass": (
+        _r7_steps("      - run: cargo build --locked\n        env:\n          CARGO_TERM_COLOR: always\n          CARGO_INCREMENTAL: \"0\"\n"), None, 0, ""),
+    # --- sec F3: an indirect reference to a download (a variable, an env value, a bare glob, a PATH entry) is refused.
+    "r9 sec F3: a download renamed through an env variable is refused": (
+        _r7_steps("      - run: curl -fsSL -o run.sh https://x.example/run.sh\n",
+                  "      - run: cp \"$F\" x.sh\n        env:\n          F: run.sh\n", "      - run: bash x.sh\n"), None, 1, "run.sh"),
+    "r9 sec F3: a download extracted through an env variable is refused": (
+        _r7_steps("      - run: curl -fsSL -o a.tgz https://x.example/a.tgz\n",
+                  "      - run: tar xzf \"$F\"\n        env:\n          F: a.tgz\n"), None, 1, "a.tgz"),
+    "r9 sec F3: a download named by a variable of the script is refused": (
+        _r7_steps("      - run: curl -fsSL -o run.sh https://x.example/run.sh\n", "      - run: |\n          F=run.sh\n          cp \"$F\" x.sh\n"), None, 1, "run.sh"),
+    "r9 sec F3: a download named by a uses step with value is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n",
+                  "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n        with:\n          path: tool\n"), None, 1, "tool"),
+    "r9 sec F3: a bare glob over the directory of a download is refused": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: chmod +x d/*\n"), None, 1, "bare glob"),
+    "r9 sec F3: a bare glob in the working directory is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: chmod +x *\n"), None, 1, "bare glob"),
+    "r9 sec F3: a dot slash glob in the working directory is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: chmod +x ./*\n"), None, 1, "bare glob"),
+    "r9 sec F3: ls in a substitution over the download directory is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: cp $(ls) y\n"), None, 1, "ls"),
+    "r9 sec F3: a download directory on GITHUB_PATH is refused": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: echo \"$PWD/d\" >> \"$GITHUB_PATH\"\n"), None, 1, "GITHUB_PATH"),
+    "r9 sec F3: the glob and PATH forms of a download tool are refused together": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: |\n          chmod +x d/*\n          echo \"$PWD/d\" >> \"$GITHUB_PATH\"\n", "      - run: cargo build --locked\n"), None, 1, "bare glob"),
+    "r9 sec F3: a GITHUB_PATH entry elsewhere passes": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: echo \"$HOME/.local/bin\" >> \"$GITHUB_PATH\"\n"), None, 0, ""),
+    "r9 sec F3: a glob over another directory passes": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n", "      - run: rm -f out/*\n"), None, 0, ""),
+    "r9 sec F3: a named glob passes when nothing was downloaded": (_r8("chmod +x *"), None, 0, ""),
+    "r9 sec F3: env RUSTC naming a download is refused twice over": (
+        _r7_steps("      - run: curl -fsSL -o r https://x.example/r\n", "      - run: cargo build --locked\n        env:\n          RUSTC: ./r\n"), None, 2, "RUSTC"),
+    "r9 sec F3: a verified download renamed in the same step passes": (
+        _r7_steps("      - run: curl -fsSL -o f https://x.example/f\n",
+                  "      - run: |\n          echo \"${SUM}  f\" | sha256sum -c -\n          cp f g\n"), None, 0, ""),
+    "r9 sec F3: a digest written to GITHUB_ENV by an earlier step is a self-made digest": (
+        _r7_steps("      - run: echo \"SUM=$(printf x | sha256sum)\" >> \"$GITHUB_ENV\"\n",
+                  "      - run: |\n          curl -fsSL -o f https://x.example/f\n          echo \"${SUM}  f\" | sha256sum -c -\n          tar xzf f\n"), None, 1, "own checksum"),
+    "r9 sec F3: a checksum file verified by a literal digest then used passes": (
+        _r8(R7_FETCH, "curl -fsSL -o f.sum https://x.example/f.sum", f"echo \"{R9_HEX}  f.sum\" | sha256sum -c -",
+            "sha256sum -c f.sum", "tar xzf f"), None, 0, ""),
+    "r9 sec F3: a checksum file that nothing verified is refused": (
+        _r8(R7_FETCH, "curl -fsSL -o f.sum https://x.example/f.sum", "sha256sum -c f.sum", "tar xzf f"), None, 1, "checksum"),
+    "r9 sec K01: a pinned literal digest then tar passes": (_r8(R7_FETCH, f"echo \"{R9_HEX}  f\" | sha256sum -c -", "tar xzf f"), None, 0, ""),
+    "r9 sec K03: gh attestation verify then tar passes": (
+        _r7_steps("      - run: curl -fsSL -o f https://x.example/f\n",
+                  "      - run: |\n          gh attestation verify f -R o/r\n          tar xzf f\n"), None, 0, ""),
+    "r9 sec K04: cargo install of a pinned version passes": (_r8("cargo install cargo-cyclonedx --locked --version 0.5.7"), None, 0, ""),
+}
+
+
+def cargo_config_twins() -> List[str]:
+    """Round 9 (sec r8 F2): the problems of CARGO_CONFIG_ENV_TWINS: every key `cargo --config` is refused for has an
+    environment twin that DANGEROUS_ASSIGN_RE (or the flag rule) refuses."""
+    bad: List[str] = []
+    for key, env in CARGO_CONFIG_ENV_TWINS:
+        if not (DANGEROUS_ASSIGN_RE.fullmatch(env) or RUSTFLAGS_NAME_RE.fullmatch(env)):
+            bad.append(f"`cargo --config {key}` has the environment twin `{env}`, which is not refused")
+    return bad
 
 
 def self_test(root: Path) -> int:
@@ -4641,6 +5757,15 @@ def self_test(root: Path) -> int:
                 print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
                       file=sys.stderr)
                 failures += 1
+        for name, (doc_text, files, count, needle) in R9_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r9")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+        for twin in cargo_config_twins():
+            print(f"self-test FAIL: {twin}", file=sys.stderr)
+            failures += 1
         if RUN_ALLOWED != tuple(sorted(RUN_ALLOWED)):
             print("self-test FAIL: RUN_ALLOWED is not sorted", file=sys.stderr)
             failures += 1
@@ -4661,7 +5786,7 @@ def self_test(root: Path) -> int:
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
         f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
-        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(R8_CASES)} round-8 cases, {len(JOINED_CASES)} joined cases)"
+        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(R8_CASES)} round-8 cases, {len(R9_CASES)} round-9 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 
@@ -4833,11 +5958,11 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("tainting expressions ignored", 'or not all(expr_allowed(e, ctx) for e in step_exprs(step))', 'or False'),
     ("taint does not spread", 'tainted.add(sid)\n                changed = True', 'tainted.add(sid)\n                changed = False'),
     ("here-document in a fetch step allowed", 'if scan.heredocs:', 'if False:'),
-    ("dangerous assignment in a fetch step allowed", 'if DANGEROUS_ASSIGN_RE.fullmatch(name):', 'if False:'),
+    ('dangerous assignment in a fetch step allowed', 'if DANGEROUS_ASSIGN_RE.fullmatch(name):\n            return f"an assignment to', 'if False:\n            return f"an assignment to'),
     ("GITHUB_ENV write in a fetch step allowed", 'if any(FETCH_FILE_RE.search(w) for w in scan.words):', 'if False:'),
-    ("fetch command allow-list not applied", 'if not literal or word not in FETCH_ALLOWED:', 'if False:'),
-    ("fetch command may be non-literal", 'if not literal or word not in FETCH_ALLOWED:', 'if word not in FETCH_ALLOWED:'),
-    ("tar options not checked", 'if word == "tar":', 'if False:'),
+    ('fetch command allow-list not applied', 'if not literal or (word not in FETCH_ALLOWED and not captured[k]):', 'if False:'),
+    ('fetch command may be non-literal', 'if not literal or (word not in FETCH_ALLOWED and not captured[k]):', 'if (word not in FETCH_ALLOWED and not captured[k]):'),
+    ('tar options not checked', 'if word == "tar":\n            for n, (arg, _lit) in enumerate(args):', 'if False:\n            for n, (arg, _lit) in enumerate(args):'),
     ("git clone is not a fetch", 'clone = any(w == "git" and', 'clone = False and any(w == "git" and'),
     ("runs-on label list not applied", 'ok = text in HOSTED_RUNNERS', 'ok = bool(text)'),
     ("runs-on matrix may be empty", 'ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)', 'ok = all(v in HOSTED_RUNNERS for v in values)'),
@@ -4891,16 +6016,16 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ('downloaded file never looked for', 'if f in parts or any(glob_hit(f, p) for p in parts)', 'if any(glob_hit(f, p) for p in parts)'),
     ('downloaded file glob never looked for', 'if f in parts or any(glob_hit(f, p) for p in parts)', 'if f in parts'),
     ('glob needs no other character', 'and bool(part.strip("*?[]")) and', 'and True and'),
-    ('later step needs no checksum', 'if hit in verified or (hit.endswith(".sha256") and hit[:-len(".sha256")] in ctx.fetched):', 'if True:'),
-    ('sha256 companion of any name exempt', 'and hit[:-len(".sha256")] in ctx.fetched):', 'and True):'),
+    ('later step needs no checksum', 'if hit in verified or (hit.endswith(".sha256") and hit[:-len(".sha256")] in verified):', 'if True:'),
+    ('sha256 companion of any name exempt', 'and hit[:-len(".sha256")] in verified):', 'and True):'),
     ('consumer of a named file needs no checksum', 'missing = [n for n in named if n not in covered]', 'missing = []'),
     ('consumer of no named file needs no checksum', 'elif not (any_ok or chained):', 'elif False:'),
     ('verify and consumer chain refused', 'extra = chain[1] if chained and chain is not None else set()', 'extra = set()'),
     ('chain must be adjacent', 'chain[0] == k - 1 and info["prev"] == "&&"', 'info["prev"] == "&&"'),
     ('output over a command name allowed', 'if base_of(out) in FETCH_ALLOWED:', 'if False:'),
-    ('gh any subcommand allowed', 'if plain[:1] == ["api"] or plain[:2] == ["attestation", "verify"]:', 'if True:'),
-    ('gh api refused', 'if plain[:1] == ["api"] or plain[:2] == ["attestation", "verify"]:', 'if plain[:2] == ["attestation", "verify"]:'),
-    ('gh attestation verify refused', 'if plain[:1] == ["api"] or plain[:2] == ["attestation", "verify"]:', 'if plain[:1] == ["api"]:'),
+    ('gh any subcommand allowed', 'if texts[:1] != ["api"]:\n        return f"`gh ', 'if False:\n        return f"`gh '),
+    ('gh api refused', 'if texts[:1] != ["api"]:\n        return f"`gh ', 'if True:\n        return f"`gh '),
+    ('gh attestation verify refused', 'if plain[:2] == ["attestation", "verify"]:\n        return ""', 'if False:\n        return ""'),
     ('script flags skipped', 'while word != "source" and n < len(args) and flags.fullmatch(args[n][0]):', 'while False:'),
     ('script path unchecked', 'if not ok or ".." in path:', 'if False:'),
     ('script dot-dot allowed', 'if not ok or ".." in path:', 'if not ok:'),
@@ -4924,15 +6049,72 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ('secret command word refused', 'if word == "$__GHS__":', 'if False:'),
     ('computed command word allowed', 'return f"the computed command word `{word[:40]}`"', 'continue'),
     ('scalar defaults allowed', 'if held is not None and held.kind != "map":', 'if False:'),
-    ('env BASH_ENV allowed', 'if DANGEROUS_ASSIGN_RE.fullmatch(key):', 'if False:'),
+    ('env BASH_ENV allowed', 'if DANGEROUS_ASSIGN_RE.fullmatch(key) or rustflags_bad(key, vtext):', 'if False:'),
     ('tool URL argument allowed', 'if word in RUN_URL_TOOLS and any(', 'if False and any('),
-    ('openssl any subcommand', 'return "" if texts[:1] and texts[0] in RUN_OPENSSL else', 'return "" if True else'),
+    ('openssl any subcommand', 'if not texts or texts[0] not in RUN_OPENSSL:', 'if False:'),
     ('pipx any package', 'return "" if not [a for a in texts if a.startswith("-")] and tuple(plain) in RUN_PIPX else', 'return "" if True else'),
     ('apt-get any package', 'plain[:1] == ["install"] and pkgs and all(p in RUN_APT_PKGS for p in pkgs))):', 'plain[:1] == ["install"] and pkgs)):'),
-    ('awk program runs a command', 'if any(a in ("-f", "-i", "-E") or AWK_UNSAFE_RE.search(a) for a in texts):', 'if False:'),
-    ('sed program runs a command', 'if word == "sed" and any(SED_UNSAFE_RE.search(a) for a in texts):', 'if False:'),
+    ('awk pipe allowed', 'return "`awk` with a pipe to or from a command"', 'i, prev = i + 1, "|"\n            continue'),
+    ('sed execute command allowed', 'return "`sed` with the `e` command, which runs a command"', 'pass'),
     ('wrapper command unchecked', 'return command_problem(rest[0][0], rest[1:], ctx, depth + 1)', 'return ""'),
     ('function shadowing a listed command allowed', 'if name in RUN_ALLOWED:\n            return f"a function named', 'if False:\n            return f"a function named'),
+    # --- Round 9: one mutant per new rule (code r8 F1-F10, security r8 F1-F3)
+    ('awk program file option allowed', 'if arg.startswith("-") and arg != "-":\n            return f"`awk` with the option', 'if False:\n            return f"`awk` with the option'),
+    ('awk expanded program allowed', 'if is_exp(prog):\n        return "`awk` with a program held', 'if False:\n        return "`awk` with a program held'),
+    ('awk system or getline allowed', 'if ident in ("system", "getline"):', 'if False:'),
+    ('awk @load allowed', 'if c == "@":', 'if False:'),
+    ('awk print to a computed path allowed', 'if prog[j:j + 1] != \'"\':', 'if False:'),
+    ('awk print to a network file allowed', 'if "/inet" in target:', 'if False:'),
+    ('awk redirect with trailing text allowed', 'if k < size and prog[k] not in ";}\\n#":', 'if False:'),
+    ('sed program file short option allowed', 'return f"`sed` with the option `-{ch}` (program files, `-s` and unknown options are refused)"', 'continue'),
+    ('sed long option allowed', 'return f"`sed` with the option `{arg[:30]}` (program files, `-s` and unknown options are refused)"', 'continue'),
+    ('sed execute flag allowed', 'if flag not in SED_FLAG_CHARS:', 'if False:'),
+    ('sed r or w command to a computed path allowed', 'if not path.strip() or (exp and ("$" in path or "`" in path)):\n                return f"`sed` with a `{cmd}`', 'if False:\n                return f"`sed` with a `{cmd}`'),
+    ('sed w flag to a computed path allowed', 'if not path.strip() or (exp and ("$" in path or "`" in path)):\n                        return "`sed` with a `w` flag', 'if False:\n                        return "`sed` with a `w` flag'),
+    ('sed address from an expansion allowed', 'if bad_pos(ch):\n                return "`sed` with an address that comes', 'if False:\n                return "`sed` with an address that comes'),
+    ('sed unknown command allowed', 'return f"`sed` with the command `{cmd}`, which the guard does not read"', 'pass'),
+    ('sed trailing command text allowed', 'if pos < size and script[pos] not in "\\n;}#":\n            return f"`sed` with `', 'if False:\n            return f"`sed` with `'),
+    ('tar long option list not applied', 'if arg[2:].partition("=")[0] not in TAR_LONG_OK:', 'if False:'),
+    ('tar -I and -F allowed', 'if TAR_RUN_SHORT & set(arg[1:]):', 'if False:'),
+    ('tar option cluster with I allowed', 'elif n == 0 and TAR_RUN_SHORT & set(arg):', 'elif False:'),
+    ('gh api endpoint list not applied', 'if not any(p.fullmatch(endpoint) for p in GH_API_READONLY):', 'if False:'),
+    ('gh api pipe into a shell allowed', 'if scan.info[k]["nxt"] in ("|", "|&") and k + 1 < len(scan.cmds) and (', 'if False and scan.info[k]["nxt"] in ("|", "|&") and k + 1 < len(scan.cmds) and ('),
+    ('gh api extra option allowed', 'if arg.startswith("-") or endpoint:', 'if endpoint:'),
+    ('git show of a ref path in a substitution allowed', 'if texts[0] == "show" and any(GIT_REF_PATH_RE.fullmatch(a) for a in texts[1:]) and site is not None \\', 'if False and texts[0] == "show" and any(GIT_REF_PATH_RE.fullmatch(a) for a in texts[1:]) and site is not None \\'),
+    ('openssl code option allowed', 'if name in OPENSSL_CODE_OPTS:', 'if False:'),
+    ('openssl computed config path allowed', 'if not path or is_exp(path) or path.startswith("/") or ".." in path or path.startswith("-"):', 'if False:'),
+    ('print-only checksum counts as a verify', 'if word in FETCH_VERIFIERS and is_verify(word, args):\n            out.update', 'if word in FETCH_VERIFIERS:\n            out.update'),
+    ('comparison with a literal digest not credited', 'elif word in ("[", "[[", "test"):\n            names = compare_names(scan, k)', 'elif False:\n            names = compare_names(scan, k)'),
+    ('comparison with any word credited', 'if not any(HEX64_RE.fullmatch(a) and not is_exp(a) for a, _l in args):', 'if False:'),
+    ('comparison credit for a later step dropped', 'out.update(compare_names(scan, k) or set())', 'pass'),
+    ('digest variable assigned in the job allowed', 'if any(m.group(1) in madeset for m in DIGEST_VAR_RE.finditer(digest_token(pword, pargs))):', 'if False:'),
+    ('script computed path allowed', 'if n >= len(args) or is_exp(args[n][0]):', 'if n >= len(args):'),
+    ('captured gh or git output not a fetch', 'if captured[k]:  # Round 9 (F4)', 'if False:  # Round 9 (F4)'),
+    ('captured fetch alone not a fetch step', 'if not clone and not any(captured) and not any(FETCH_WORD_RE.search(w) for w in scan.words):', 'if not clone and not any(FETCH_WORD_RE.search(w) for w in scan.words):'),
+    ('matrix mapping value not marked', 'if node.kind == "map":\n            return [MATRIX_COMPLEX]', 'if False:\n            return [MATRIX_COMPLEX]'),
+    ('matrix complex key never named', 'MATRIX_COMPLEX in ctx.matrix_values.get(parts[1], ())', 'False'),
+    ('matrix complex message dropped', 'for key in matrix_complex_keys(raw, ctx):', 'for key in []:'),
+    ('dangerous assignment in a run step allowed', 'if dangerous_assign(name, value):\n            return f"an assignment to', 'if False:\n            return f"an assignment to'),
+    ('GITHUB_ENV copied into a variable allowed', 'if GITHUB_ENV_RE.search(value):\n            return "a copy', 'if False:\n            return "a copy'),
+    ('GITHUB_ENV here-document allowed', 'if to_env and scan.heredocs:', 'if False:'),
+    ('export of a dangerous name allowed', 'if m and dangerous_assign(m.group(1), a[m.end():]):', 'if False:'),
+    ('GITHUB_ENV written by another command allowed', 'return f"`{word}` writing GITHUB_ENV"', 'pass'),
+    ('echo -e to GITHUB_ENV allowed', 'if word == "echo" and any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", a) for a, _l in args):', 'if False:'),
+    ('GITHUB_ENV line with a computed name allowed', 'if seg.startswith(("$", "`")):', 'if False:'),
+    ('GITHUB_ENV dangerous name allowed', 'if m and dangerous_assign(m.group(1), m.group(2)):', 'if False:'),
+    ('GITHUB_ENV printf format with two names allowed', 'vals[0].count("=") > 1', 'False'),
+    ('env write check skipped', 'if not problem and not reason:\n            env_bad', 'if False:\n            env_bad'),
+    ('env of a uses step not checked', 'check_env_keys(step.get("env"), name, where, rep)\n    run = step.get("run")', 'run = step.get("run")'),
+    ('dangerous name never matches', 'if DANGEROUS_ASSIGN_RE.fullmatch(name):\n        return not', 'if False:\n        return not'),
+    ('RUSTFLAGS value not read', 'return RUSTFLAGS_NAME_RE.fullmatch(name) is not None and (value is None or RUSTFLAGS_BAD_RE.search(value) is not None)', 'return False'),
+    ('Android exemption of any value', 'return not (ANDROID_ENV_RE.fullmatch(name) and value is not None and ANDROID_VALUE_RE.fullmatch(value))', 'return not ANDROID_ENV_RE.fullmatch(name)'),
+    ('Android exemption of any name', 'return not (ANDROID_ENV_RE.fullmatch(name) and value is not None and ANDROID_VALUE_RE.fullmatch(value))', 'return not (value is not None and ANDROID_VALUE_RE.fullmatch(value))'),
+    ('env and with values not read as words', 'words = [str(w) for w in facts.get("words", [])] + step_value_words(step)', 'words = [str(w) for w in facts.get("words", [])]'),
+    ('bare glob over a download directory allowed', 'if bare_glob(piece) and fetch_dir_of(piece) in ctx.fetch_dirs:', 'if False:'),
+    ('ls over a download directory allowed', 'if d in ctx.fetch_dirs:', 'if False:'),
+    ('download directory on GITHUB_PATH allowed', 'if fetch_dir_of(str(arg) + "/_") in ctx.fetch_dirs:', 'if False:'),
+    ('download directory not remembered', 'ctx.fetch_dirs.add(fetch_dir_of(str(out)))', 'pass'),
+    ('self-made names not carried to later steps', 'ctx.made.update(facts.get("env_names", ()))  # type: ignore[arg-type]', 'pass'),
 )
 
 
