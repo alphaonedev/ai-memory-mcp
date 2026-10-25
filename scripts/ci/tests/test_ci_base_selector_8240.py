@@ -1753,6 +1753,109 @@ class TrustDecisionFirst(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, " ".join(block.replace("#", " ").split()))
 
+    # code r10 C1-C4 (round 13): environment mappings, match bindings, argv tail and value names
+    # resolved by binding, open/Path arguments, the __main__ guard. Each row is
+    # (label, anchor, inserted text, needle); the text is inserted straight after the anchor (the
+    # module anchor when it is None); with the sha256 pin re-pinned the second layer alone must
+    # report a problem line holding the needle.
+    C13_GUARD = "    sys.exit(main())\n"
+    C13_ENV_LINE = 'env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")\n'
+    C13_ENV = "environment mapping"
+    C13_MUTANTS = (
+        ("c1-child-env-store", C13_ENV_LINE, '    env["GIT_CONFIG_COUNT"] = "1"\n', C13_ENV),
+        ("c1-child-env-update", C13_ENV_LINE, '    env.update({"A": "b"})\n', C13_ENV),
+        ("c1-child-env-pop", C13_ENV_LINE, '    env.pop("PATH")\n', C13_ENV),
+        ("c1-child-env-setdefault", C13_ENV_LINE, '    env.setdefault("A", "b")\n', C13_ENV),
+        ("c1-child-env-clear", C13_ENV_LINE, "    env.clear()\n", C13_ENV),
+        ("c1-child-env-augassign", C13_ENV_LINE, '    env |= {"A": "b"}\n', C13_ENV),
+        ("c1-child-env-del", C13_ENV_LINE, '    del env["A"]\n', C13_ENV),
+        ("c1-child-env-alias-store", C13_ENV_LINE, '    child = env\n    child["A"] = "b"\n',
+         C13_ENV),
+        ("c1-child-env-passed-on", C13_ENV_LINE, '    report(env, "x")\n', C13_ENV),
+        ("c1-param-env-store", "def derive_base(env):\n", '    env["GIT_DIR"] = "x"\n', C13_ENV),
+        ("c1-param-env-update", "def derive_base(env):\n", '    env.update({"A": "b"})\n',
+         C13_ENV),
+        ("c1-dict-copy-store-then-pass", None,
+         'cenv = dict(os.environ)\ncenv["A"] = "b"\nderive_base(cenv)', C13_ENV),
+        ("c1-dict-copy-alias-update", None,
+         'cenv = dict(os.environ)\nalias = cenv\nalias.update({})', C13_ENV),
+        ("c1-environ-copy-store", None, 'cenv = os.environ.copy()\ncenv["A"] = "b"', C13_ENV),
+        ("c1-walrus-env-copy", None, '(cenv := dict(os.environ))\ncenv["A"] = "b"', C13_ENV),
+        ("c2-match-capture-module", None, "match 1:\n    case subprocess:\n        pass",
+         "match statement"),
+        ("c2-match-star", None, "match [1]:\n    case [run, *rest]:\n        pass",
+         "match statement"),
+        ("c2-match-mapping-rest", None, "match {}:\n    case {**os}:\n        pass",
+         "match statement"),
+        ("c2-match-as", None, "match 1:\n    case x as run:\n        pass", "match statement"),
+        ("c2-match-allowed-name", None, "match 1:\n    case git:\n        pass",
+         "match statement"),
+        ("c2-match-class-keyword", None, "match 1:\n    case dict(a=open):\n        pass",
+         "match statement"),
+        ("c3-args-assign", C13_ENV_LINE, '    args = ("show", "HEAD")\n', "argv tail"),
+        ("c3-args-augassign", C13_ENV_LINE, '    args += ("show",)\n', "argv tail"),
+        ("c3-args-annassign", C13_ENV_LINE, '    args: tuple = ("show",)\n', "argv tail"),
+        ("c3-args-walrus", C13_ENV_LINE, '    (args := ("show",))\n', "argv tail"),
+        ("c3-args-for-target", C13_ENV_LINE, '    for args in (("show",),):\n        pass\n',
+         "argv tail"),
+        ("c3-args-with-target", C13_ENV_LINE, "    with print() as args:\n        pass\n",
+         "argv tail"),
+        ("c3-args-comprehension", C13_ENV_LINE, "    [0 for args in ()]\n", "argv tail"),
+        ("c3-args-match", C13_ENV_LINE, "    match 1:\n        case args:\n            pass\n",
+         "argv tail"),
+        ("c3-value-reassign", "def rev_parse(spec):\n", '    spec = "HEAD"\n', "git value name"),
+        ("c3-value-augassign", "def rev_parse(spec):\n", '    spec += "x"\n', "git value name"),
+        ("c3-value-walrus", "def rev_parse(spec):\n", '    (spec := "HEAD")\n',
+         "git value name"),
+        ("c3-base-reassign", "def have_commit(base):\n", '    base = "HEAD"\n', "git value name"),
+        ("c3-path-reassign", "path = IMPACT_PREFIX + name\n", '    path = "x"\n',
+         "git value name"),
+        ("c3-rel-reassign", 'for rel in ("info/grafts", "shallow", "objects/info/alternates"):\n',
+         '        rel = "x"\n', "git value name"),
+        ("c3-prefix-reassign", None, 'IMPACT_PREFIX = "other/"', "git value name"),
+        ("c4-open-unpinned-path", None, 'open("x.git", "a")', "open call"),
+        ("c4-open-write-mode", None, 'open(os.environ["GITHUB_OUTPUT"], "w")', "open call"),
+        ("c4-path-unpinned", None, 'Path(os.environ["HOME"])', "Path call"),
+        ("c4-statement-after-guard", C13_GUARD, 'print("after")\n', "__main__ guard"),
+        ("c4-statement-inside-guard", 'if __name__ == "__main__":\n', '    print("in")\n',
+         "__main__ guard"),
+    )
+
+    def test_code_r10_every_environment_match_binding_argv_open_and_guard_form_is_red(self):
+        """code r10 C1-C4: with the pin re-pinned to the mutated body, the second layer alone
+        reports every form, naming the rule that caught it."""
+        for job, name in self.JOBS:
+            run = step_named(job, name)["run"]
+            for label, anchor, text, needle in self.C13_MUTANTS:
+                anchor = anchor or self.C2_MUTANT_ANCHOR
+                text = text if text.endswith("\n") else text + "\n"
+                mutated = run.replace(anchor, anchor + text, 1)
+                with self.subTest(job=job, mutant=label):
+                    self.assertIn(anchor, run)
+                    self.assertNotEqual(mutated, run)
+                    with unittest.mock.patch.dict(MATERIALISE_SHA256,
+                                                  {name: run_digest(mutated)}):
+                        problems = materialise_problems(name, mutated)
+                    self.assertFalse([p for p in problems if "sha256" in p], problems)
+                    found = materialise_allow_list_problems(name, mutated)
+                    self.assertTrue([p for p in found if needle in p], (needle, found))
+
+    @unittest.skipUnless(hasattr(ast, "Match"), "match statements need Python 3.10")
+    def test_code_r10_c2_match_captures_are_collected_as_bindings(self):
+        tree = ast.parse("match 1:\n    case [a, *rest]:\n        pass\n"
+                         "    case {**more}:\n        pass\n    case x as y:\n        pass\n")
+        names = {name for name, _kind, _node in _bound_names(tree)}
+        self.assertEqual(names, {"a", "rest", "more", "x", "y"})
+
+    def test_code_r10_c3_the_comment_states_the_rule_for_args_and_the_value_names(self):
+        text = " ".join(Path(__file__).read_text().replace("#", " ").split())
+        start = text.index("sec F1 / code C1-C3 (round 12)")
+        block = text[start:text.index("MATERIALISE_MODULE_ROOTS =", start)]
+        for phrase in ("code r10 C1-C4 (round 13)", "unrebound parameter",
+                       "exactly one binding", "read-only environment uses"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, block)
+
     def test_code_c1_no_docstring_of_this_module_uses_the_post_derivation_wording(self):
         """code r8 C1: extends the step-order text test to every docstring of the module."""
         tree = ast.parse(Path(__file__).read_text())
