@@ -608,6 +608,34 @@ class RedactorRound6(unittest.TestCase):
             self.assertEqual(mod.redact_line(ln), ln)
 
 
+class MacOsPathRoots8174(unittest.TestCase):
+    """sec r1 F2 (#8174): f1 workspace paths stay readable; a base64 secret under a root is masked."""
+
+    def _red(self, line):
+        return _load_helper().redact_line(line)
+
+    def test_f1_runner_paths_survive(self):
+        for path in (
+            "/Volumes/f1dev/runners/f1-macos-fed-3/_work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-gate/bootstrap.log",
+            "/Users/Shared/f1-macos-fed-3/_work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-gate/x.log",
+            "/private/var/folders/zz/zyxwvutsrqponmlkjihgfedcba/T/cert-gate-evidence-run/bootstrap.log",
+            "/Library/PostgreSQL/18/data/log/postgresql-2026-10-25_000000.log",
+            "/opt/homebrew/opt/postgresql@18/share/postgresql@18/extension/age--1.8.0.sql",
+        ):
+            self.assertEqual(self._red("log: " + path), "log: " + path)
+
+    def test_base64_under_macos_root_still_masked(self):
+        sec = "Qx7Kp2" + "Lm9Zr4Tv8Wy3Bn6Hc1Dj5Fg0AaZ" + "+Uv3Wx5Yz7Ab9Cd1Ef=="
+        for root in ("/Users", "/Volumes", "/Library"):
+            for line in (root + sec, root + "/" + sec, "dir=" + root + "/x/" + sec, root + "+" + sec):
+                self.assertNotIn(sec, self._red(line), line)
+                self.assertNotIn(sec[:30], self._red(line), line)
+
+    def test_uppercase_only_allowed_in_the_root_segment(self):
+        sec = "AbCdEfGhIjKlMnOpQrStUvWxYz012345" + "67"
+        self.assertNotIn(sec, self._red("/Volumes/f1dev/" + sec + "/x"))
+
+
 class GateScriptPins(unittest.TestCase):
     def test_witness_recorder_generate_is_sandboxed_and_not_silenced(self):
         leg_b = _leg_b_text()
