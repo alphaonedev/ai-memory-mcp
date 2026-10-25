@@ -2907,6 +2907,13 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(len(self.R16_CODE_ROWS), 17)
         self._check_replace_rows(self.R16_CODE_ROWS)
 
+    def test_sec_r14_s1_the_module_body_outside_the_pinned_functions_is_pinned(self):
+        """sec r14 S1: a re-pinned statement at module level (before, between or after the defs,
+        a duplicated or second guard, a moved import, an exec, a try around main) is refused by
+        the module-body pin alone; the 8 reviewer forms and 7 placement forms are all red."""
+        self.assertEqual(len(self.R17_MODULE_ROWS), 15)
+        self._check_replace_rows(self.R17_MODULE_ROWS)
+
     def test_code_r13_f1_the_two_regression_pins_stay_red_with_their_earlier_rule(self):
         """code r13 F1: a gate_absent defined twice and a lambda rebinding of it are refused by
         the earlier rules at d883f264c; they stay as declared regression pins."""
@@ -2943,6 +2950,7 @@ class TrustDecisionFirst(unittest.TestCase):
         tables = [self.C13_MUTANTS, self.C14_MUTANTS, self.R14_MUTANTS, self.R14_DASH_ROWS,
                   self.R14_CODE_ROWS, self.R13_REGRESSION_ROWS, self.R15_C1_ROWS,
                   self.R15_SEC_ROWS, self.R16_CODE_ROWS, self.R16_REGRESSION_ROWS,
+                  self.R17_MODULE_ROWS,
                   [(fid, None, None, needle) for fid, needle in WF_FORM_RED.items()],
                   [(fid, None, None, reason) for fid, reason in WF_FORM_GREEN.items()],
                   [(fid, None, None, specs) for fid, specs in WF_FORM_TESTS.items()]]
@@ -3407,6 +3415,48 @@ TrustDecisionFirst.R16_REGRESSION_ROWS = (
      "gate_absent defined more than once"),
     ("f1-gate-absent-lambda-rebinding", "def main():\n",
      "gate_absent = lambda base: True\n\n\ndef main():\n", "lambda statement outside the allow-list"),
+)
+
+
+# sec r14 S1 (round 17): the module body outside the pinned functions is one ordered statement
+# sequence. Rows are (label, old, new, needle) and every row carries the needle "module body"; the
+# 8 reviewer forms come first, then the 7 placement forms of the prompt. All 15 are red at 47f4d9173
+# (no earlier rule emits the needle).
+_R17_GUARD = 'if __name__ == "__main__":\n    sys.exit(main())\n'
+_R17_NEEDLE = "module body"
+_R17_RUNNER = 'os.environ.get("GITHUB_ACTIONS")'
+
+
+def _r17_before_guard(label, statement):
+    return (label, _R17_GUARD, statement + "\n\n\n" + _R17_GUARD, _R17_NEEDLE)
+
+
+TrustDecisionFirst.R17_MODULE_ROWS = (
+    ("m-guard-early-main-runner", _R17_GUARD,
+     "if " + _R17_RUNNER + ":\n    sys.exit(main())\n\n\n" + _R17_GUARD, _R17_NEEDLE),
+    _r17_before_guard("m-early-report-ok-runner",
+                      "if " + _R17_RUNNER + ':\n    report(True, "")\n    sys.exit(0)'),
+    _r17_before_guard("m-early-report-ok", 'report(True, "")\nsys.exit(0)'),
+    _r17_before_guard("m-early-exit-runner", "if " + _R17_RUNNER + ":\n    sys.exit(0)"),
+    _r17_before_guard("m-early-report-unusable-runner",
+                      "if " + _R17_RUNNER + ':\n    report(False, "environment-unusable")\n'
+                      "    sys.exit(0)"),
+    _r17_before_guard("m-module-try-exit", "try:\n    pass\nexcept Exception:\n    sys.exit(0)"),
+    _r17_before_guard("m-early-main-twice", "main()"),
+    _r17_before_guard("m-main-then-report-ok-runner",
+                      "if " + _R17_RUNNER + ':\n    main()\n    report(True, "")\n    sys.exit(0)'),
+    ("m-statement-between-defs", "def have_commit(base):\n",
+     "pass\n\n\ndef have_commit(base):\n", _R17_NEEDLE),
+    ("m-statement-after-guard", _R17_GUARD, _R17_GUARD + "pass\n", _R17_NEEDLE),
+    ("m-guard-duplicated", _R17_GUARD, _R17_GUARD + "\n\n" + _R17_GUARD, _R17_NEEDLE),
+    ("m-second-main-guard-other-body", _R17_GUARD,
+     'if __name__ == "__main__":\n    report(True, "")\n\n\n' + _R17_GUARD, _R17_NEEDLE),
+    ("m-import-moved-after-def", ("import shutil\n", "def have_commit(base):\n"),
+     ("", "import shutil\n\n\ndef have_commit(base):\n"), _R17_NEEDLE),
+    _r17_before_guard("m-module-exec", 'exec("pass")'),
+    ("m-module-try-around-main", _R17_GUARD,
+     'if __name__ == "__main__":\n    try:\n        sys.exit(main())\n    except Exception:\n'
+     "        sys.exit(0)\n", _R17_NEEDLE),
 )
 
 
@@ -5195,7 +5245,31 @@ class WorkflowFormMutants(unittest.TestCase):
                 ("select-named-ci-gate", "    name: Impact selection\n", "    name: ci-gate\n",
                  "carries the gate check name"),
                 ("select-name-changed", "    name: Impact selection\n",
-                 "    name: Impact selection x\n", "job select name")):
+                 "    name: Impact selection x\n", "job select name"),
+                ("classify-named-CI-GATE", "    name: Classify changes\n", "    name: CI-GATE\n",
+                 "carries the gate check name"),
+                ("classify-named-Ci-Gate", "    name: Classify changes\n", "    name: Ci-Gate\n",
+                 "carries the gate check name"),
+                ("classify-named-trailing-space", "    name: Classify changes\n",
+                 '    name: "ci-gate "\n', "carries the gate check name"),
+                ("classify-named-leading-space", "    name: Classify changes\n",
+                 '    name: " ci-gate"\n', "carries the gate check name"),
+                ("classify-named-by-expression", "    name: Classify changes\n",
+                 "    name: ${{ 'ci-gate' }}\n", "name carries an expression"),
+                ("classify-named-by-format", "    name: Classify changes\n",
+                 "    name: ${{ format('ci-{0}', 'gate') }}\n", "name carries an expression"),
+                ("lint-name-any-expression", "    name: Lint (fmt + clippy)\n",
+                 "    name: Lint ${{ github.sha }}\n", "name carries an expression"),
+                ("check-name-other-matrix-expression", "    name: Check (${{ matrix.leg }})\n",
+                 "    name: Check (${{ matrix.other }})\n", "name carries an expression"),
+                ("classify-id-is-gate-no-name", "  classify:\n    name: Classify changes\n",
+                 "  CI-GATE:\n", "defaults its check name"),
+                ("classify-id-is-gate-padded-no-name", "  classify:\n    name: Classify changes\n",
+                 '  "ci-gate ":\n', "defaults its check name"),
+                ("classify-name-not-a-string", "    name: Classify changes\n", "    name: 7\n",
+                 "name is not a string"),
+                ("classify-name-is-a-mapping", "    name: Classify changes\n",
+                 "    name:\n      x: y\n", "name is not a string")):
             with self.subTest(form=label):
                 text = live.replace(old, new, 1)
                 self.assertNotEqual(text, live)
