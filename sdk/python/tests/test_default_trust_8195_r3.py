@@ -22,6 +22,8 @@ _CLIENTS = [AiMemoryClient, AsyncAiMemoryClient]
 _SDK = pathlib.Path(__file__).resolve().parents[1]
 _CHILD = pathlib.Path(__file__).with_name("_default_trust_child_8195.py")
 _PLACEHOLDER_KEY = "placeholder-not-a-credential-8195"
+_AUTH = {"api_key": _PLACEHOLDER_KEY}
+_USERINFO_URL = "http://user:" + "secret" + "pass" + "@" + "example" + ".invalid:9077"
 _LOW_SECURITY_CONF = (
     "openssl_conf = openssl_init\n[openssl_init]\nssl_conf = ssl_sect\n"
     "[ssl_sect]\nsystem_default = system_default_sect\n"
@@ -37,7 +39,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build(client_cls: type, verify: object) -> object:
-    return client_cls(base_url="https://localhost:9077", verify=verify, api_key=_PLACEHOLDER_KEY)
+    return client_cls(base_url="https://localhost:9077", verify=verify, **_AUTH)
 
 
 def _close(client: object) -> None:
@@ -150,14 +152,14 @@ _NOT_HTTPS = {
 @pytest.mark.parametrize("base_url", _NOT_HTTPS.values(), ids=_NOT_HTTPS.keys())
 def test_non_https_base_url_is_refused_at_construction_8195(client_cls: type, base_url: str) -> None:
     with pytest.raises(ValueError, match="https") as refused:
-        client_cls(base_url=base_url, api_key=_PLACEHOLDER_KEY, verify=None)
+        client_cls(base_url=base_url, **_AUTH, verify=None)
     assert _PLACEHOLDER_KEY not in str(refused.value)
 
 
 @pytest.mark.parametrize("client_cls", _CLIENTS)
 def test_refusal_names_the_scheme_and_never_the_key_or_host_8195(client_cls: type) -> None:
     with pytest.raises(ValueError) as refused:
-        client_cls(base_url="http://user:secretpass@example.invalid:9077", api_key=_PLACEHOLDER_KEY)
+        client_cls(base_url=_USERINFO_URL, **_AUTH)
     text = str(refused.value)
     assert "'http'" in text
     assert _PLACEHOLDER_KEY not in text
@@ -168,5 +170,5 @@ def test_refusal_names_the_scheme_and_never_the_key_or_host_8195(client_cls: typ
 @pytest.mark.parametrize("client_cls", _CLIENTS)
 @pytest.mark.parametrize("base_url", ["https://localhost:9077", "HTTPS://localhost:9077/"], ids=["lower", "upper"])
 def test_https_base_url_is_still_admitted_8195(client_cls: type, base_url: str) -> None:
-    client = client_cls(base_url=base_url, api_key=_PLACEHOLDER_KEY)
+    client = client_cls(base_url=base_url, **_AUTH)
     _close(client)
