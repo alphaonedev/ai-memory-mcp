@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -1106,6 +1107,7 @@ JOB_KEY_SETS = {
     GATE_JOB: sorted(["name", "if", "needs", "runs-on", "timeout-minutes", "steps"]),
 }
 JOB_RUNS_ON = "ubuntu-latest"
+JOB_TIMEOUT_MINUTES = {SELECT_JOB: "15", GATE_JOB: "5"}  # code r13 F2: ci.yml:173 and :2770
 JOB_PERMISSIONS = None  # neither job sets `permissions`; the workflow-level block applies
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 JOB_KEYS_REFUSED = ("container", "services")
@@ -2174,6 +2176,20 @@ class TrustDecisionFirst(unittest.TestCase):
             with self.subTest(mutant=label):
                 self.assertNotEqual(pre_trust_problems(self.mutated(job, old, new)), [])
 
+    def test_code_r13_f2_both_jobs_timeout_minutes_are_pinned(self):
+        """code r13 F2: the select job and the gate job each keep their timeout-minutes value
+        (a longer gate timeout lets a hung base fold hold the required check open)."""
+        jobs = yaml_subset_load(CI_YML.read_text())["jobs"]
+        self.assertEqual({job: jobs[job].get("timeout-minutes") for job in JOB_TIMEOUT_MINUTES},
+                         JOB_TIMEOUT_MINUTES)
+        for job, minutes in JOB_TIMEOUT_MINUTES.items():
+            with self.subTest(job=job):
+                widened = CI_YML.read_text().replace(
+                    "    timeout-minutes: %s\n" % minutes, "    timeout-minutes: 600\n", 1)
+                self.assertNotEqual(widened, CI_YML.read_text())
+                again = yaml_subset_load(widened)["jobs"]
+                self.assertNotEqual(again[job].get("timeout-minutes"), minutes)
+
     def test_f2_workflow_permissions_are_pinned(self):
         body = CI_YML.read_text()
         old = "permissions:\n  contents: read\n"
@@ -2656,6 +2672,40 @@ class TrustDecisionFirst(unittest.TestCase):
         of line (runner-conditioned forms included) is refused by the second layer alone."""
         self._check_replace_rows(self.R15_SEC_ROWS)
 
+    def test_code_r13_f1_f3_sec_r13_s1_the_control_flow_of_every_local_function_is_pinned(self):
+        """code r13 F1/F3, sec r13 S1: a re-pinned runner-conditioned or unconditional edit of the
+        control flow of any local function (gate_absent, derive_base, main) and of the shape of
+        the `line` augmentation and the summary write is refused by the second layer alone."""
+        self.assertEqual(len(self.R16_CODE_ROWS), 17)
+        self._check_replace_rows(self.R16_CODE_ROWS)
+
+    def test_code_r13_f1_the_two_regression_pins_stay_red_with_their_earlier_rule(self):
+        """code r13 F1: a gate_absent defined twice and a lambda rebinding of it are refused by
+        the earlier rules at d883f264c; they stay as declared regression pins."""
+        self.assertEqual(len(self.R16_REGRESSION_ROWS), 2)
+        self._check_replace_rows(self.R16_REGRESSION_ROWS)
+
+    def test_code_r13_f5_both_base_red_rows_of_round_15_are_declared_regression_pins(self):
+        """code r13 F5 / sec r13 S3: the two R15_SEC_ROWS that 02c1ac64a already refused are
+        named, so the table comment and the PR body cannot drift from the table."""
+        self.assertEqual(self.R15_REGRESSION_PINS,
+                         ("r2-print-other-name", "r1-report-call-forged-bootstrap"))
+        labels = {row[0] for row in self.R15_SEC_ROWS}
+        self.assertTrue(set(self.R15_REGRESSION_PINS) <= labels)
+
+    def test_sec_r13_s1_the_function_pins_name_every_local_function_of_the_heredoc(self):
+        """sec r13 S1: the pinned set is exactly the defined names the allow-list names, and each
+        pinned text parses to the one def of that name."""
+        pins = getattr(sys.modules[__name__], "MATERIALISE_FUNCTION_PINS", None)
+        self.assertIsNotNone(pins)
+        self.assertEqual(sorted(pins), MATERIALISE_DEFINED_NAMES)
+        for name, text in pins.items():
+            node = ast.parse(text).body[0]
+            self.assertEqual(node.name, name)
+        for job, name in self.JOBS:
+            self.assertEqual(materialise_allow_list_problems(name, step_named(job, name)["run"]),
+                             [])
+
     def test_code_r12_c2_no_row_in_any_table_has_an_empty_needle(self):
         """code r12 C2: every row names the rule that refuses it; an empty needle guards nothing.
         The checker itself is shown to flag a planted empty row."""
@@ -2664,7 +2714,7 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(empty_needle_rows([(("planted-named", "a", "b", "rule"),)]), [])
         tables = [self.C13_MUTANTS, self.C14_MUTANTS, self.R14_MUTANTS, self.R14_DASH_ROWS,
                   self.R14_CODE_ROWS, self.R13_REGRESSION_ROWS, self.R15_C1_ROWS,
-                  self.R15_SEC_ROWS,
+                  self.R15_SEC_ROWS, self.R16_CODE_ROWS, self.R16_REGRESSION_ROWS,
                   [(fid, None, None, needle) for fid, needle in WF_FORM_RED.items()],
                   [(fid, None, None, reason) for fid, reason in WF_FORM_GREEN.items()],
                   [(fid, None, None, specs) for fid, specs in WF_FORM_TESTS.items()]]
@@ -3060,6 +3110,80 @@ TrustDecisionFirst.R15_SEC_ROWS = (
 )
 
 
+# code r13 F1/F3 and sec r13 S1 (round 16): the control flow of every local function of the
+# Materialise heredoc decides the trust values (bootstrap, the derived base), so the second layer
+# pins the normalised ast.dump of each of them, independent of MATERIALISE_SHA256; the one
+# augmented literal of `line` is the sole body of `if bootstrap:` directly after its assignment.
+# Rows are (label, old, new, needle). R16_CODE_ROWS are all red at d883f264c (they carry a needle
+# no earlier rule emits); R16_REGRESSION_ROWS are green at d883f264c because an earlier rule
+# already refuses them with that needle, and they stay as declared regression pins.
+_R16_RUNNER = 'os.environ.get("GITHUB_ACTIONS")'
+_R16_GA_DEF = "def gate_absent(base):\n"
+_R16_GA_RET = "    return tree.returncode == 0 and not tree.stdout.strip()\n"
+_R16_GA_EXC = "    except BaseUnavailable:\n        return False\n" + _R16_GA_RET
+_R16_PARENT = '        parent = rev_parse(context + "^1^{commit}")\n'
+_R16_RET_PARENT = "        return parent\n"
+_R16_RET_RAW = "        return raw\n"
+_R16_IFB = "    if bootstrap:\n"
+_R16_AUG4 = '    line += "; bootstrap: the base sha has no scripts/ci/impact/gate.py"\n'
+_R16_PIN = "differs from its pinned normalised ast.dump"
+_R16_GATE_ABSENT = "function gate_absent " + _R16_PIN
+_R16_MAIN = "function main " + _R16_PIN
+_R16_DERIVE = "function derive_base " + _R16_PIN
+_R16_AUG_SHAPE = "sole body of `if bootstrap:` directly after"
+_R16_SUMMARY_SHAPE = "summary write is not the sole body"
+TrustDecisionFirst.R16_CODE_ROWS = (
+    ("f1-gate-absent-environ-return-true", _R16_GA_DEF,
+     _R16_GA_DEF + "    if " + _R16_RUNNER + ":\n        return True\n", _R16_GATE_ABSENT),
+    ("f1-gate-absent-return-true", _R16_GA_DEF, _R16_GA_DEF + "    return True\n",
+     _R16_GATE_ABSENT),
+    ("f1-gate-absent-except-true", _R16_GA_EXC,
+     _R16_GA_EXC.replace("return False", "return True", 1), _R16_GATE_ABSENT),
+    ("f1-gate-absent-return-bool-environ", _R16_GA_RET,
+     "    return bool(" + _R16_RUNNER + ")\n", _R16_GATE_ABSENT),
+    ("f1-gate-absent-try-else-true", _R16_GA_EXC,
+     "    except BaseUnavailable:\n        return False\n    else:\n        return True\n"
+     + _R16_GA_RET, _R16_GATE_ABSENT),
+    ("f1-main-report-under-condition", '        report(False, "environment-unusable")\n',
+     "        if " + _R16_RUNNER + ":\n            report(False, str(exc), gate_absent(derived))\n"
+     + '        report(False, "environment-unusable")\n', _R16_MAIN),
+    ("f1-main-early-ok-on-runner", 'def main():\n    derived = ""\n',
+     'def main():\n    derived = ""\n    if ' + _R16_RUNNER + ':\n        report(True, "")\n'
+     "        return 0\n", _R16_MAIN),
+    ("s1-gate-absent-runner", _R16_GA_RET,
+     "    return bool(" + _R16_RUNNER + ") or (tree.returncode == 0 and not tree.stdout.strip())\n",
+     _R16_GATE_ABSENT),
+    ("s1-parent-is-head-runner", _R16_PARENT,
+     _R16_PARENT + "        if " + _R16_RUNNER
+     + ':\n            parent = rev_parse(context + "^2^{commit}")\n', _R16_DERIVE),
+    ("s1-return-context-runner", _R16_RET_PARENT,
+     "        if " + _R16_RUNNER + ":\n            return context\n" + _R16_RET_PARENT,
+     _R16_DERIVE),
+    ("s1-merge-group-return-head-runner", _R16_RET_RAW,
+     "        if " + _R16_RUNNER + ':\n            return env.get("HEAD_SHA", "")\n'
+     + _R16_RET_RAW, _R16_DERIVE),
+    ("f3-augment-in-loop", _R16_IFB + _R15_AUG,
+     "    while bootstrap:\n" + _R15_AUG + "        break\n", _R16_AUG_SHAPE),
+    ("f3-augment-unconditional", _R16_IFB + _R15_AUG, _R16_AUG4, _R16_AUG_SHAPE),
+    ("f3-augment-under-environ-if", _R16_IFB, "    if " + _R16_RUNNER + ":\n", _R16_AUG_SHAPE),
+    ("f3-augment-under-not-bootstrap", _R16_IFB, "    if not bootstrap:\n", _R16_AUG_SHAPE),
+    ("f3-summary-write-under-ok", "    if summary:\n", "    if ok:\n", _R16_SUMMARY_SHAPE),
+    ("f3-summary-write-in-loop", "    if summary:\n", "    while summary:\n", _R16_SUMMARY_SHAPE),
+)
+TrustDecisionFirst.R16_REGRESSION_ROWS = (
+    ("f1-gate-absent-redefined-later", "def report(ok, reason, bootstrap=False):\n",
+     "def gate_absent(base):\n    return True\n\n\ndef report(ok, reason, bootstrap=False):\n",
+     "gate_absent defined more than once"),
+    ("f1-gate-absent-lambda-rebinding", "def main():\n",
+     "gate_absent = lambda base: True\n\n\ndef main():\n", "lambda statement outside the allow-list"),
+)
+
+
+# code r13 F5 / sec r13 S3: the rows of R15_SEC_ROWS that 02c1ac64a already refused with their
+# needle (regression pins, not red-first rows).
+TrustDecisionFirst.R15_REGRESSION_PINS = ("r2-print-other-name", "r1-report-call-forged-bootstrap")
+
+
 def empty_needle_rows(tables):
     """Labels of the rows whose needle (the fourth item) is empty: an empty needle matches any
     problem line and so guards no rule."""
@@ -3263,6 +3387,9 @@ class TrustWindowMutants(unittest.TestCase):
             digest = [p for p in problems if "sha256" in p]
             self.assertEqual(len(digest), 1, problems)
             self.assertEqual(len(problems), 2, problems)
+            second = [p for p in problems if "sha256" not in p]
+            self.assertEqual(len(second), 1, problems)
+            self.assertIn("GIT_TIMEOUT_S", second[0])
             self.assertIn(name, digest[0])
             self.assertIn(run_digest(changed), digest[0])
             self.assertIn(MATERIALISE_SHA256[name], digest[0])
@@ -3657,13 +3784,13 @@ class DerivedBase(BaseCase):
 # round 10 (119 forms of its first family, 61 of its second), carried as rows of this module so
 # they run in both CI jobs on every push. Each form edits ci.yml text in memory (nothing is
 # written to the checkout) and the module asserts the gate refuses it:
-#   WF_FORM_RED    161 forms the pre-trust gate refuses; the value is the problem line it must
+#   WF_FORM_RED    162 forms the pre-trust gate refuses; the value is the problem line it must
 #                  report. A form marked REHASH changes a Materialise heredoc, so the sha256 pin
 #                  is re-pinned to the mutated text and the second layer must refuse it alone.
 #   WF_FORM_TESTS  9 forms another test of the gate suite refuses (this module, or the sibling
 #                  module for the ci-gate job); the named tests run on the mutated text.
-#   WF_FORM_GREEN  9 forms that stay green by design, each with its reason (controls, order
-#                  insensitive sets, a display name, a move toward fail closed).
+#   WF_FORM_GREEN  8 forms that stay green by design, each with its reason (controls, order
+#                  insensitive sets, a move toward fail closed).
 #   WF_FORM_DOC    1 form that reverts a docstring of this module to the banned wording.
 # WF_FORM_SAME_AS names the 18 forms whose mutated text equals the text of a row that already
 # exists in this module; they still run here, and a test asserts the text equality.
@@ -4295,6 +4422,7 @@ def _workflow_forms():
     return m
 
 WF_FORM_RED = {
+    "k8-select-name-value": "job select name",
     "r10-01-quoted-shell": (
         "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'shell'], expected"
         " ['env', 'id', 'name', 'run']"
@@ -4645,7 +4773,6 @@ WF_FORM_GREEN = {
     "f2-reorder-wf-env": "workflow env is an order-insensitive mapping",
     "f2-reorder-mat-env": "step env is an order-insensitive mapping",
     "k8-build-index-coe-false": "continue-on-error false moves toward fail closed",
-    "k8-select-name-value": "the display name of the select job only",
 }
 
 WF_FORM_TESTS = {
@@ -4664,7 +4791,7 @@ WF_FORM_TESTS = {
     "k8-gate-timeout-value": (
         (
             "__self__",
-            "TrustDecisionFirst.test_f2_exact_env_values_job_keys_runs_on_and_permissions_are_pinned",
+            "TrustDecisionFirst.test_code_r13_f2_both_jobs_timeout_minutes_are_pinned",
         ),
     ),
     "w1-ci-comment-reverted": (
@@ -4765,7 +4892,7 @@ class WorkflowFormMutants(unittest.TestCase):
         kinds = [set(WF_FORM_RED), set(WF_FORM_TESTS), set(WF_FORM_GREEN), {WF_FORM_DOC}]
         self.assertEqual(sum(len(k) for k in kinds), 180)
         self.assertEqual(set().union(*kinds), set(self.FORMS))
-        self.assertEqual((len(WF_FORM_RED), len(WF_FORM_TESTS), len(WF_FORM_GREEN)), (161, 9, 9))
+        self.assertEqual((len(WF_FORM_RED), len(WF_FORM_TESTS), len(WF_FORM_GREEN)), (162, 9, 8))
         self.assertTrue(set(WF_FORM_SAME_AS) <= set(WF_FORM_RED))
         self.assertEqual(len(WF_FORM_SAME_AS), 18)
 
@@ -4802,6 +4929,42 @@ class WorkflowFormMutants(unittest.TestCase):
                 text = _apply_form(self.FORMS[fid], live)
                 self.assertNotEqual(text, live)
                 self.assertTrue(failing_tests_on_workflow(text, specs))
+
+    def test_a_planted_erroring_test_is_a_harness_defect_not_a_refusal(self):
+        """code r13 F2: a spec that errors is reported as a harness defect; only a failing spec
+        counts as a refusal."""
+        planted = type("Planted", (unittest.TestCase,), {
+            "test_fails": lambda self: self.fail("refused"),
+            "test_errors": lambda self: 1 // 0,
+            "test_passes": lambda self: None,
+        })
+        fake = types.ModuleType("planted_8240")
+        fake.Planted = planted
+        fake.CI_YML = None
+        with unittest.mock.patch.dict(sys.modules, {"planted_8240": fake}):
+            self.assertEqual(failing_tests_on_workflow("x: 1\n", [
+                ("planted_8240", "Planted.test_fails"), ("planted_8240", "Planted.test_passes")]),
+                ["Planted.test_fails"])
+            with self.assertRaisesRegex(RuntimeError, "harness defect"):
+                failing_tests_on_workflow("x: 1\n", [("planted_8240", "Planted.test_errors")])
+
+    def test_sec_r13_s2_no_other_job_carries_the_gate_check_name(self):
+        """sec r13 S2: the check context named by the gate stays unique, and the select job's
+        display name is pinned."""
+        live = CI_YML.read_text()
+        for label, old, new, needle in (
+                ("classify-named-ci-gate", "    name: Classify changes\n", "    name: ci-gate\n",
+                 "carries the gate check name"),
+                ("select-named-ci-gate", "    name: Impact selection\n", "    name: ci-gate\n",
+                 "carries the gate check name"),
+                ("select-name-changed", "    name: Impact selection\n",
+                 "    name: Impact selection x\n", "job select name")):
+            with self.subTest(form=label):
+                text = live.replace(old, new, 1)
+                self.assertNotEqual(text, live)
+                problems = pre_trust_problems(text)
+                self.assertTrue([p for p in problems if needle in p], (needle, problems))
+        self.assertEqual(pre_trust_problems(live), [])
 
     def test_each_form_that_stays_green_stays_green(self):
         live = CI_YML.read_text()
