@@ -546,13 +546,21 @@ mod tests {
         assert_eq!(lines.last().unwrap(), &"line 100");
     }
 
+    /// Writer delay before the appended lines land (#7934).
+    const FOLLOW_WRITER_DELAY_MS: u64 = 60;
+    /// Follow poll interval for the appended-lines test (#7934).
+    const FOLLOW_POLL_INTERVAL_MS: u64 = 30;
+    /// Follow poll cap: 100 polls x 30 ms is a 3 s ceiling, 50x the writer
+    /// delay, so a loaded host cannot starve the writer past the window (#7934).
+    const FOLLOW_MAX_POLLS: u64 = 100;
+
     #[test]
     fn logs_tail_follows_appended_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
         let path_clone = path.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(FOLLOW_WRITER_DELAY_MS));
             let mut f = fs::OpenOptions::new()
                 .append(true)
                 .open(&path_clone)
@@ -568,8 +576,8 @@ mod tests {
             let args = TailArgs {
                 lines: 10,
                 follow: true,
-                follow_interval_ms: 30,
-                max_polls: 6,
+                follow_interval_ms: FOLLOW_POLL_INTERVAL_MS,
+                max_polls: FOLLOW_MAX_POLLS,
             };
             run_tail(dir.path(), &filters, &args, &mut out).unwrap();
         }

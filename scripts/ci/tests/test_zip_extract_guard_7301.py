@@ -9,6 +9,7 @@ Fixture trees live under the worktree's `.local-runs/` (never a tmpfs).
 
 Run: python3 -m unittest scripts/ci/tests/test_zip_extract_guard_7301.py
 """
+import importlib.util
 import json
 import os
 import shutil
@@ -442,11 +443,7 @@ class SourceScope7301(GuardBase):
         self.assertNotIn('Traceback', res.stderr)
 
 
-try:
-    import tomllib  # noqa: F401  (Python 3.11+)
-    HAVE_TOMLLIB = True
-except ImportError:
-    HAVE_TOMLLIB = False
+HAVE_TOMLLIB = importlib.util.find_spec('tomllib') is not None  # Python 3.11+
 
 PY39 = Path.home() / '.local' / 'bin' / 'python3.9'
 

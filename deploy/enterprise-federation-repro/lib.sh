@@ -5,7 +5,7 @@
 #
 # This kit stands up the EXACT environment the v1.0.0 enterprise-federation
 # audit used, so any AI NHI (or human peer reviewer) can reproduce it 100%
-# from committed steps: a PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6
+# from committed steps: a PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7
 # data tier over TLS 1.3 (hostssl-only, cleartext refused) + mTLS to the
 # store, an ai-memory daemon wired into ONLY that tier over the encrypted
 # store link and served on the client<->daemon mTLS API (:9077) under the
@@ -72,7 +72,7 @@ die()  { printf '[%s] FATAL %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; exit 1; }
 : "${PG_MAJOR:?docker-1461 SSOT did not define PG_MAJOR}"
 : "${AGE_GRAPH_NAME:?docker-1461 SSOT did not define AGE_GRAPH_NAME}"
 
-# The bare upstream pgvector x.y.z (0.8.6-1.pgdg13+1 -> 0.8.6). Reuses the
+# The bare upstream pgvector x.y.z (0.8.7-1.pgdg13+1 -> 0.8.7). Reuses the
 # parity-test extraction shape so this kit and check-docs-vs-ssot.sh agree.
 EXPECTED_PGVECTOR_VERSION="$(printf '%s' "$PGVECTOR_APT_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
 
@@ -119,7 +119,7 @@ JUDGE_KEY_DIR="${KEYS_DIR}/judge"
 STOPPER_KEY_DIR="${KEYS_DIR}/stopper"
 
 # --------------------------------------------------------------------------
-# PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.6 container.
+# PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.7 container.
 # --------------------------------------------------------------------------
 PG_CONTAINER="${EF_REPRO_PG_CONTAINER:-${CAMPAIGN}-pg}"
 PG_IMAGE="${EF_REPRO_PG_IMAGE:-ai-memory-cert-pg:pg${EXPECTED_PG_VERSION}-age${EXPECTED_AGE_VERSION}-pgv${EXPECTED_PGVECTOR_VERSION}}"
