@@ -1123,6 +1123,91 @@ MATERIALISE_REFUSED_ATTRS = {"system", "popen", "Popen", "execv", "execve", "exe
 MATERIALISE_REFUSED_NAMES = MATERIALISE_REFUSED_ATTRS | {"exec", "eval", "compile", "__import__",
                                                          "runpy", "importlib"}
 PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
+# code r8 C2: the second layer is an ALLOW-LIST. The body may call only these names, reach only
+# these module attributes, run exactly one `subprocess.run` whose argv starts with the literal
+# ["git", "--no-replace-objects"], pass only these git subcommands and dash arguments (no `-c`,
+# no alias, fsmonitor, hooksPath or exec option), and use only these `subprocess.run` keywords.
+MATERIALISE_MODULE_ROOTS = {"os", "re", "shutil", "subprocess", "sys", "pathlib"}
+MATERIALISE_MODULE_CHAINS = {"os.environ", "os.environ.get", "os.path.lexists", "re.compile",
+                             "shutil.rmtree", "subprocess.TimeoutExpired", "subprocess.run",
+                             "sys.exit"}
+MATERIALISE_NAME_CALLS = {"BaseUnavailable", "Path", "bool", "derive_base", "dict", "fetch_blob",
+                          "gate_absent", "git", "git_state_refused", "have_commit", "len", "list",
+                          "main", "materialise", "open", "print", "replace_refs_present",
+                          "report", "rev_parse", "str"}
+MATERIALISE_GIT_SUBCOMMANDS = {"cat-file", "fetch", "for-each-ref", "ls-tree", "replace",
+                               "rev-parse", "show"}
+MATERIALISE_DASH_ARGS = {"--", "--count=1", "--depth=1", "--format=%(refname)", "--git-path",
+                         "--list", "--no-replace-objects", "--no-tags", "--quiet", "--verify",
+                         "-e"}
+MATERIALISE_RUN_KEYWORDS = {"capture_output", "env", "timeout"}
+MATERIALISE_GIT_ARGV = ("git", "--no-replace-objects")
+
+
+def _dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def materialise_allow_list_problems(label, run):
+    """Reasons the Materialise body reaches a call target outside the allow-list."""
+    found = HEREDOC_RE.match(normalise_run(run or ""))
+    if found is None:
+        return ["%s: run text is not one bare python3 -I heredoc" % label]
+    try:
+        tree = ast.parse(found.group("body"))
+    except SyntaxError:
+        return ["%s: heredoc body is not valid python" % label]
+    problems = []
+    inner = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    runs = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and id(node) not in inner:
+            chain = _dotted(node)
+            if (chain and chain.split(".")[0] in MATERIALISE_MODULE_ROOTS
+                    and chain not in MATERIALISE_MODULE_CHAINS):
+                problems.append("%s: reaches %s outside the allow-list" % (label, chain))
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id not in MATERIALISE_NAME_CALLS:
+                    problems.append("%s: calls %s outside the allow-list" % (label, func.id))
+                if func.id == "git":
+                    first = node.args[0] if node.args else None
+                    if not (isinstance(first, ast.Constant)
+                            and first.value in MATERIALISE_GIT_SUBCOMMANDS):
+                        problems.append("%s: git call with a subcommand outside the allow-list"
+                                        % label)
+            elif _dotted(func) == "subprocess.run":
+                runs += 1
+                argv = node.args[0] if node.args else None
+                head = argv.left if isinstance(argv, ast.BinOp) else None
+                literal = tuple(e.value for e in head.elts
+                                if isinstance(e, ast.Constant)) if isinstance(head, ast.List) else ()
+                if literal != MATERIALISE_GIT_ARGV:
+                    problems.append("%s: subprocess.run argv does not start with the git literal"
+                                    % label)
+                if {k.arg for k in node.keywords} - MATERIALISE_RUN_KEYWORDS:
+                    problems.append("%s: subprocess.run keyword outside the allow-list" % label)
+            elif isinstance(func, ast.Attribute):
+                chain = _dotted(func)
+                if chain and chain.split(".")[0] in MATERIALISE_MODULE_ROOTS \
+                        and chain not in MATERIALISE_MODULE_CHAINS:
+                    problems.append("%s: calls %s outside the allow-list" % (label, chain))
+            elif not isinstance(func, (ast.Attribute, ast.Name)):
+                problems.append("%s: indirect call target" % label)
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+              and node.value.startswith("-") and node.value not in MATERIALISE_DASH_ARGS):
+            problems.append("%s: dash argument outside the allow-list" % label)
+    if runs != 1:
+        problems.append("%s: %d subprocess.run calls, expected exactly 1" % (label, runs))
+    return problems
 
 
 def normalise_run(text):
@@ -1152,6 +1237,7 @@ def materialise_problems(label, run):
     except SyntaxError:
         problems.append("%s: heredoc body is not valid python" % label)
         return problems
+    problems.extend(materialise_allow_list_problems(label, run))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
