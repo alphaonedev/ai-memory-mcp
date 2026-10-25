@@ -1001,6 +1001,28 @@ class Round7(unittest.TestCase):
         G.check_uses_pinned(parsed, "w.yml", rep)
         self.assertTrue(any("cannot be resolved" in e or "cycle" in e for e in rep.errors), rep.errors)
 
+    def test_n6_node_main_symlink_loop_is_refused_not_raised(self):
+        """A node action whose `main` is a symlink to itself is refused with a message, never an exception."""
+        tree = Path(scratch()) / "r7main"
+        if tree.exists():
+            import shutil
+            shutil.rmtree(tree)
+        (tree / "act").mkdir(parents=True)
+        (tree / "act" / "action.yml").write_text("name: p\nruns:\n  using: node20\n  main: loop.js\n", encoding="utf-8")
+        (tree / "act" / "loop.js").symlink_to("loop.js")
+        rep = G.Report()
+        rep.root = tree
+        parsed = G.parse_yaml(G._r5_job(steps="    steps:\n" + G.R5_LOCAL), "w.yml", rep)
+        G.check_uses_pinned(parsed, "w.yml", rep)
+        self.assertTrue(any("runs.main" in e for e in rep.errors), rep.errors)
+
+    def test_f3_pipeline_verify_needs_a_top_level_start(self):
+        """The verify of `a | sha256sum -c` counts only when the pipeline starts at the top of the step."""
+        tree = Path(scratch()) / "r7pipe"
+        for line, want in (("false && " + G.R7_VERIFY, 1), ("! " + G.R7_VERIFY, 1), (G.R7_VERIFY, 0)):
+            doc = G._r7(G.R7_FETCH, line, "tar xzf f")
+            self.assertEqual(len(G.r5_errors(doc, None, tree)), want, line)
+
     def test_every_round7_case_has_a_group_test(self):
         groups = {n.split(":")[0] for n in G.R7_CASES}
         self.assertEqual(groups, {"r7 N1", "r7 N2", "r7 N3", "r7 N4", "r7 F4", "r7 N5", "r7 F1", "r7 F2", "r7 F3", "r7 F5", "r7 N6"})

