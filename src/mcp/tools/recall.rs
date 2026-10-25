@@ -1101,6 +1101,17 @@ pub fn handle_recall_dto(
             .collect()
     };
 
+    // Intentional discard (rust-1.98 ERRORS-19: "Never silently drop a
+    // `Result`; handle it, propagate with `?`, or discard with an explicit
+    // `let _ =` only when intentional"). The recall response is already
+    // assembled, so a failed opportunistic sweep must not fail the read.
+    // `gc_if_needed` already swallows its own expiry-probe error
+    // (`unwrap_or(false)`); the only errors left are the record-stop gate and
+    // the `gc` sweep itself, and a missed sweep degrades to "expired rows
+    // linger until the next gc tick", never corrupts. This is the
+    // `gc_if_needed` member of the declared read-path side-effect set
+    // (design: the `gc_if_needed` doc in `src/storage/mod.rs`, #2308;
+    // `docs/USER_GUIDE.md` section "Read-path side effects").
     let _ = db::gc_if_needed(conn, archive_on_gc);
     let context = req.context.as_str();
     if context.is_empty() {
