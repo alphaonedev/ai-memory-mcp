@@ -224,7 +224,14 @@ def _open_checked_after_lstat(
         raise error(f"{p} {_SYMLINK_REFUSAL}")
     # Refuses a FIFO, a device or a directory before it is ever opened.
     check_owned_stat(p, checked, error=error, mode_advice=mode_advice)
-    fd = os.open(p, flags | getattr(os, "O_BINARY", 0))
+    try:
+        fd = os.open(p, flags | getattr(os, "O_BINARY", 0))
+    except OSError as err:
+        # The file vanished or changed kind after the lstat: the caller's
+        # typed refusal, naming the errno text only (code r1 F6).
+        raise error(
+            f"{p} could not be opened after its check ({err.strerror or type(err).__name__})"
+        ) from None
     try:
         opened = os.fstat(fd)
         if any(getattr(opened, f) != getattr(checked, f) for f in _IDENTITY_FIELDS):

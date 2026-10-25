@@ -223,6 +223,9 @@ class _Session:
     def cipher(self) -> tuple[str, str, int]:
         return ("TLS_AES_256_GCM_SHA384", "TLSv1.3", self._bits)
 
+    def version(self) -> str:
+        return "TLSv1.3"
+
 
 class _Stream:
     def __init__(self, session: object) -> None:
@@ -706,9 +709,6 @@ def test_out_of_date_leaf_is_refused_after_the_handshake_6375(
 _UNAUTHENTICATED_SUITES = {
     "auth-null": "aNULL:@SECLEVEL=0",
     "null-encryption": "eNULL:@SECLEVEL=0",
-    "auth-psk": "PSK:@SECLEVEL=0",
-    "auth-srp": "SRP:@SECLEVEL=0",
-    "openssl-DEFAULT": "DEFAULT",
 }
 
 
@@ -730,18 +730,18 @@ def test_unauthenticated_suites_are_refused_at_construction_6305(
 ) -> None:
     context = _with_ciphers(spec)
     if not any(
-        suite.get("auth") in {"auth-null", "auth-psk", "auth-srp"} or suite.get("symmetric") is None
+        suite.get("auth") == "auth-null" or suite.get("symmetric") is None
         for suite in context.get_ciphers()
     ):
         pytest.skip(f"{spec!r} has no unauthenticated suite on this OpenSSL")
     with pytest.raises(ValueError, match="verify=False") as refused:
         client_cls(base_url=_ORIGIN, verify=context)
-    assert ":!PSK:!SRP:!aNULL:!eNULL" in str(refused.value)  # names the remedy
+    assert ":!aNULL:!eNULL" in str(refused.value)  # names the remedy
 
 
 @pytest.mark.parametrize("client_cls", _CLIENTS)
 def test_remedy_cipher_string_is_admitted_6305(client_cls: type) -> None:
-    context = _with_ciphers("DEFAULT:!PSK:!SRP:!aNULL:!eNULL")
+    context = _with_ciphers("DEFAULT:!aNULL:!eNULL")
     client = client_cls(base_url=_ORIGIN, verify=context)
     if client_cls is AiMemoryClient:
         client.close()
@@ -1231,6 +1231,8 @@ _PINNED_HANDSHAKE_ATTRIBUTES = frozenset(
         "verify_flags",
         "hostname_checks_common_name",
         "get_ciphers",
+        "minimum_version",
+        "maximum_version",
     }
 )
 

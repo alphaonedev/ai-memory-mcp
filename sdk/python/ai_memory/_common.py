@@ -95,7 +95,8 @@ _UNVERIFIED_MESSAGE = (
     "ssl.SSLContext (not a subclass, such as truststore.SSLContext) that is "
     "CERT_REQUIRED with check_hostname on, has no verify_flags that relax "
     "chain validation, offers no cipher suite without server authentication "
-    "(remove them with set_ciphers('<your list>:!PSK:!SRP:!aNULL:!eNULL')) "
+    "(remove them with set_ciphers('<your list>:!aNULL:!eNULL')), "
+    "allows no TLS version below 1.2 (minimum_version TLSv1_2 or higher) "
     "and has no patched wrap_socket or "
     "wrap_bio. Build one with ssl.create_default_context(cafile=<CA path>) "
     "or pass verify=<CA path>, e.g. <key_dir>/tls/local-ca.pem for a "
@@ -106,6 +107,8 @@ _UNVERIFIED_MESSAGE = (
 #: captured at import. A context is admitted only while every one of them is
 #: still the stock object, so a later class-level patch is caught too (#6268).
 _HANDSHAKE_ATTRIBUTES = (
+    "minimum_version",
+    "maximum_version",
     "wrap_socket",
     "wrap_bio",
     "verify_mode",
@@ -142,6 +145,36 @@ _ALLOWED_VERIFY_FLAGS = (
 )
 
 
+#: The lowest TLS protocol version the SDK accepts: the context it builds
+#: sets it as ``minimum_version``, and a caller context whose range reaches
+#: below it, or ends below it, is refused (#8195, security r1 F4).
+MINIMUM_TLS_VERSION = ssl.TLSVersion.TLSv1_2
+
+#: Accepted ``get_ciphers()`` ``strength_bits`` floor: export and low-grade
+#: suites report fewer bits and are refused (#6305).
+_MINIMUM_SUITE_STRENGTH_BITS = 112
+
+
+def _tls_range_is_modern(context: ssl.SSLContext) -> bool:
+    """Whether ``context`` can negotiate only TLS 1.2 or newer (#8195).
+
+    Reads both bounds through the base-class descriptors. A concrete floor must
+    be ``TLSv1_2`` or higher, and a concrete ceiling too. ``MINIMUM_SUPPORTED``
+    and ``MAXIMUM_SUPPORTED`` mean "the library default": distro Pythons report
+    ``MINIMUM_SUPPORTED`` on a stock ``create_default_context()``, so refusing it
+    would refuse the documented form. What the library default can negotiate on
+    the wire is held to TLS 1.2 by :func:`_assert_negotiated_session`. Anything
+    that is not a ``TLSVersion`` is refused.
+    """
+    low = ssl.SSLContext.minimum_version.__get__(context)  # type: ignore[attr-defined]
+    high = ssl.SSLContext.maximum_version.__get__(context)  # type: ignore[attr-defined]
+    if not isinstance(low, ssl.TLSVersion) or not isinstance(high, ssl.TLSVersion):
+        return False
+    if low != ssl.TLSVersion.MINIMUM_SUPPORTED and low < MINIMUM_TLS_VERSION:
+        return False
+    return high == ssl.TLSVersion.MAXIMUM_SUPPORTED or high >= MINIMUM_TLS_VERSION
+
+
 def _context_verifies(context: object) -> bool:
     """Whether ``context`` is the stock ``ssl.SSLContext`` and verifies.
 
@@ -158,8 +191,9 @@ def _context_verifies(context: object) -> bool:
       at import (#6268);
     * ``verify_flags`` (base descriptor) carries only bits in
       :data:`_ALLOWED_VERIFY_FLAGS` (#6375);
-    * every cipher suite it offers authenticates the server and encrypts
-      (:func:`_suites_authenticate_server`, #6305).
+    * its protocol range is TLS 1.2 or newer (:func:`_tls_range_is_modern`);
+    * it offers no anonymous (aNULL), NULL-encryption (eNULL) or low-strength
+      cipher suite (:func:`_suites_authenticate_server`, #6305).
     """
     if type(context) is not ssl.SSLContext:
         return False
@@ -172,6 +206,8 @@ def _context_verifies(context: object) -> bool:
     flags = int(ssl.SSLContext.verify_flags.__get__(context))  # type: ignore[attr-defined]
     if flags & ~_ALLOWED_VERIFY_FLAGS:
         return False
+    if not _tls_range_is_modern(context):
+        return False
     if not _suites_authenticate_server(context):
         return False
     return bool(
@@ -181,17 +217,22 @@ def _context_verifies(context: object) -> bool:
 
 
 #: ``get_ciphers()`` ``auth`` values of suites that authenticate no server
-#: certificate: anonymous, pre-shared key and SRP (#6305). TLS 1.3 suites
-#: report ``auth-any``; their authentication is the certificate exchange.
-_UNAUTHENTICATED_SUITE_AUTH = frozenset({"auth-null", "auth-psk", "auth-srp"})
+#: certificate: anonymous (aNULL, #6305). TLS 1.3 suites report ``auth-any``;
+#: their authentication is the certificate exchange. PSK and SRP suites are
+#: not listed: they cannot complete a handshake without a key or password
+#: callback, which Python exposes only from 3.13 and this SDK never installs,
+#: and distro OpenSSL builds list them in the DEFAULT set, so refusing them
+#: would refuse ``ssl.create_default_context()`` (code r1 F1).
+_UNAUTHENTICATED_SUITE_AUTH = frozenset({"auth-null"})
 
 
 def _suites_authenticate_server(context: ssl.SSLContext) -> bool:
-    """Whether every suite ``context`` offers authenticates the server and encrypts (#6305).
+    """Whether ``context`` offers no anonymous, NULL-encryption or low-strength suite (#6305).
 
-    An entry without an ``auth`` value, with an unauthenticated one, or with
-    no ``symmetric`` cipher (eNULL) refuses the whole context, and so does an
-    empty list.
+    An entry without an ``auth`` value, with an anonymous one (aNULL), with no
+    ``symmetric`` cipher (eNULL) or with fewer than
+    :data:`_MINIMUM_SUITE_STRENGTH_BITS` strength bits (export and low-grade
+    classes) refuses the whole context, and so does an empty list.
     """
     suites = ssl.SSLContext.get_ciphers(context)
     if not suites:
@@ -203,6 +244,13 @@ def _suites_authenticate_server(context: ssl.SSLContext) -> bool:
         if not isinstance(auth, str) or auth in _UNAUTHENTICATED_SUITE_AUTH:
             return False
         if not isinstance(suite.get("symmetric"), str):
+            return False
+        strength = suite.get("strength_bits")
+        if (
+            not isinstance(strength, int)
+            or isinstance(strength, bool)
+            or strength < _MINIMUM_SUITE_STRENGTH_BITS
+        ):
             return False
     return True
 
@@ -460,6 +508,7 @@ def _pinned_base_context() -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.verify_mode = ssl.CERT_REQUIRED
     context.check_hostname = True
+    context.minimum_version = MINIMUM_TLS_VERSION
     if sys.version_info >= (3, 13):
         context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | ssl.VERIFY_X509_STRICT
     keylog = os.environ.get("SSLKEYLOGFILE")
@@ -674,6 +723,10 @@ _SESSION_MESSAGE = (
 )
 
 
+#: ``SSLObject.version()`` names of the protocol versions the SDK accepts on the wire.
+_MODERN_TLS_NAMES = frozenset({"TLSv1.2", "TLSv1.3"})
+
+
 def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: str) -> None:
     """Raise ``ValueError`` unless ``session`` is a verified session of ``context`` for ``host``.
 
@@ -684,7 +737,8 @@ def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: s
     ``CERT_OPTIONAL`` without a certificate, anonymous suites). The certificate
     must also name ``host``, the host the request is addressed to, whatever
     the context's ``check_hostname`` was at handshake time (#6350), and the
-    negotiated suite must carry secret bits (no eNULL, #6305). Unlike the
+    negotiated protocol must be TLS 1.2 or newer and the suite must carry secret bits
+    (no eNULL, #6305). Unlike the
     pre-handshake predicate this inspects what actually happened on the wire,
     so it also closes the check/use race (#6306) and auth-null suites (#6305).
     """
@@ -698,6 +752,9 @@ def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: s
         raise ValueError(_SESSION_MESSAGE)
     cipher = getattr(session, "cipher", None)
     negotiated = None if cipher is None else cipher()
+    version = getattr(session, "version", None)
+    if version is None or version() not in _MODERN_TLS_NAMES:
+        raise ValueError(_SESSION_MESSAGE)
     if (
         not isinstance(negotiated, tuple)
         or len(negotiated) != 3

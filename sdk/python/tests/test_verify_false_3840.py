@@ -960,6 +960,9 @@ def test_negotiated_session_check_is_fail_closed_6305() -> None:
         def cipher(self) -> tuple[str, str, int]:
             return ("TLS_AES_128_GCM_SHA256", "TLSv1.3", 128)
 
+        def version(self) -> str:
+            return "TLSv1.3"
+
     good = FakeSession(context, {"subject": ((("commonName", "x"),),)})
     _assert_negotiated_session(good, context, "x")  # does not raise
     for session in {

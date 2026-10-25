@@ -113,9 +113,22 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
 - #6375: verify flags are an allowlist. `VERIFY_X509_PARTIAL_CHAIN` is admitted, because Python 3.13+
   `create_default_context` sets it; a flag that relaxes validation, such as `VERIFY_X509_NO_CHECK_TIME` or
   `VERIFY_ALLOW_PROXY_CERTS`, is refused.
-- #6305: a context offering a suite without server authentication (auth-null, PSK, SRP, eNULL) is refused at
-  construction. Cost: the plain OpenSSL `"DEFAULT"` cipher string and some system cipher policies include PSK and SRP
-  suites and are refused; the error message gives the remedy string.
+- #6305: a context offering an anonymous (auth-null), NULL-encryption (eNULL) or low-strength (under 112 bits) suite
+  is refused at construction; the error message gives the remedy string. PSK and SRP suites are NOT refused (#8195,
+  code r1 F1): they cannot complete a handshake without a key or password callback, which the SDK never installs, and
+  distro OpenSSL builds list them in `"DEFAULT"`, so refusing them refused `ssl.create_default_context()`.
+  decision: refuse by anonymous and null suite classes over refusing every non-ECDHE suite because the documented
+  happy path must pass on the distro default OpenSSL.
+- #8195 (sec r1 F4, code r1 F2): TLS 1.2 is the minimum. The SDK-built context sets `minimum_version = TLSv1_2`
+  (the constant `MINIMUM_TLS_VERSION`), and the validator refuses a caller context with a concrete `minimum_version`
+  below it or a concrete `maximum_version` below it, at construction and again on every request, sync and async.
+  decision: minimum TLS 1.2 enforced in the builder AND refused by the validator over builder-only because a
+  caller-supplied context bypasses the builder.
+  `MINIMUM_SUPPORTED` and `MAXIMUM_SUPPORTED` mean "the library default" and are admitted, because a distro Python
+  reports `MINIMUM_SUPPORTED` on a stock default context; the session gate then refuses any connection whose
+  negotiated protocol is not TLS 1.2 or 1.3.
+  decision: MINIMUM_SUPPORTED admitted at construction (library default) over refused because the Ubuntu distro
+  default context reports it and the session gate refuses any negotiated version below TLS 1.2.
 - #6377: `verify=<CA path>` is read once, at construction. For a directory, only the hashed entries OpenSSL's own
   `capath` lookup reads (`<hash>.<n>`, `<hash>.r<n>`) are loaded. A group- or world-writable directory, file, symlink
   target or target directory is refused (POSIX). An empty directory gives a context with no trust anchor, which fails

@@ -278,7 +278,13 @@ def _suite(
 
 def _offering(monkeypatch: pytest.MonkeyPatch, suites: list[Any]) -> ssl.SSLContext:
     """A verifying context whose ``get_ciphers`` lists ``suites`` (deterministic, any OpenSSL)."""
-    monkeypatch.setattr(ssl.SSLContext, "get_ciphers", lambda _self: suites)
+    def get_ciphers(_self: ssl.SSLContext) -> list[Any]:
+        return suites
+
+    # ``get_ciphers`` is one of the pinned handshake attributes: re-pin the
+    # stand-in so only the suite list under test differs from stock.
+    monkeypatch.setattr(ssl.SSLContext, "get_ciphers", get_ciphers)
+    monkeypatch.setitem(_common._STOCK_HANDSHAKE, "get_ciphers", get_ciphers)  # noqa: SLF001
     return ssl.create_default_context()
 
 

@@ -135,15 +135,23 @@ Refused with `ValueError` (#3840, #6267, #6268, #6269):
 - A context with a verify flag that relaxes chain validation, such as
   `VERIFY_X509_NO_CHECK_TIME` or `VERIFY_ALLOW_PROXY_CERTS` (#6375).
   `VERIFY_X509_PARTIAL_CHAIN` and the CRL and strict flags are accepted.
-- A context that offers any cipher suite without server authentication
-  (anonymous, PSK, SRP or NULL-encryption suites, #6305). The plain OpenSSL
-  `"DEFAULT"` string includes PSK and SRP suites; remove them with
-  `set_ciphers("<your list>:!PSK:!SRP:!aNULL:!eNULL")`.
+- A context that offers an anonymous (aNULL), NULL-encryption (eNULL) or
+  low-strength (under 112 bits, export or legacy class) cipher suite (#6305).
+  Remove them with `set_ciphers("<your list>:!aNULL:!eNULL")`. The plain
+  `ssl.create_default_context()` is accepted: PSK and SRP suites a distro
+  OpenSSL lists in `"DEFAULT"` cannot complete a handshake without a key or
+  password callback and are not refused.
+- A context that allows a TLS version below 1.2: a `minimum_version` of
+  `TLSv1_1` or lower, or a `maximum_version` below `TLSv1_2` (#8195). The
+  library default (`MINIMUM_SUPPORTED`) is accepted; the SDK then refuses any
+  connection that negotiated less than TLS 1.2. The context the SDK builds from
+  a CA path sets `minimum_version = TLSv1_2` itself.
 - Any `ssl.SSLContext` subclass, including `truststore.SSLContext`: such an
   object keeps its real verification state elsewhere, so the SDK cannot prove
   it verifies. Use `ssl.create_default_context(cafile=...)` or pass the CA path.
 - A context whose `wrap_socket`, `wrap_bio`, `verify_mode`, `check_hostname`,
   `verify_flags`, `hostname_checks_common_name`, `get_ciphers`,
+  `minimum_version`, `maximum_version`,
   `sslsocket_class` or `sslobject_class` was replaced on the class, or that
   shadows any `ssl.SSLContext` attribute on the instance.
 - Any other type.
