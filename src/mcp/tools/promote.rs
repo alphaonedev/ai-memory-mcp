@@ -180,8 +180,12 @@ pub(super) fn handle_promote(
                 &dest_payload,
                 dest_capability.as_ref(),
             )
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
-            {
+            .map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err(
+                    crate::mcp::error_text::site::ENFORCE_GOVERNANCE,
+                    e,
+                )
+            })? {
                 GovernanceDecision::Allow => {}
                 GovernanceDecision::Deny(refusal) => {
                     return Err(crate::governance::deny_message(
@@ -267,8 +271,12 @@ pub(super) fn handle_promote(
             &payload,
             capability.as_ref(),
         )
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
-        {
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err(
+                crate::mcp::error_text::site::ENFORCE_GOVERNANCE,
+                e,
+            )
+        })? {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
                 return Err(crate::governance::deny_message(
@@ -301,7 +309,7 @@ pub(super) fn handle_promote(
         })?;
         let clone_id =
             db::promote_to_namespace(conn, &resolved_id, to_ns, Some(dest_agent_id.as_str()))
-                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_str", e))?;
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("promote_to_namespace", e))?;
         // P5 (G9): fire `memory_promote` webhook for vertical mode AFTER
         // the clone commits. memory_id = source id (subscribers can
         // distinguish via `mode` and `clone_id` in the details block).

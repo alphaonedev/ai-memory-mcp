@@ -213,4 +213,7 @@ mod tests {
 pub mod site {
     pub const LIST_AGENTS: &str = "list_agents";
     pub const RESOLVE_ID: &str = "resolve_id";
+    /// `db::enforce_governance`, wrapped at the delete, promote, store and
+    /// update funnels (#6894).
+    pub const ENFORCE_GOVERNANCE: &str = "enforce_governance";
 }
