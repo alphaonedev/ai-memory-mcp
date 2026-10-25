@@ -2602,6 +2602,11 @@ class TrustDecisionFirst(unittest.TestCase):
         assignment under if, try or while are all refused for every pinned module-level name."""
         self._check_replace_rows(self.R15_C1_ROWS)
 
+    def test_sec_r12_report_writes_and_the_names_in_them_are_pinned(self):
+        """sec r12 R1/R2: a re-pinned edit of the step output writes, of ok, reason, bootstrap or
+        of line (runner-conditioned forms included) is refused by the second layer alone."""
+        self._check_replace_rows(self.R15_SEC_ROWS)
+
     def test_code_r12_c2_no_row_in_any_table_has_an_empty_needle(self):
         """code r12 C2: every row names the rule that refuses it; an empty needle guards nothing.
         The checker itself is shown to flag a planted empty row."""
@@ -2610,6 +2615,7 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(empty_needle_rows([(("planted-named", "a", "b", "rule"),)]), [])
         tables = [self.C13_MUTANTS, self.C14_MUTANTS, self.R14_MUTANTS, self.R14_DASH_ROWS,
                   self.R14_CODE_ROWS, self.R13_REGRESSION_ROWS, self.R15_C1_ROWS,
+                  self.R15_SEC_ROWS,
                   [(fid, None, None, needle) for fid, needle in WF_FORM_RED.items()],
                   [(fid, None, None, reason) for fid, reason in WF_FORM_GREEN.items()],
                   [(fid, None, None, specs) for fid, specs in WF_FORM_TESTS.items()]]
@@ -2946,6 +2952,53 @@ TrustDecisionFirst.R15_C1_ROWS = (
      _R15_C1_NEEDLE),
     ("c1-only-binding-wrapped-in-if", _R15_TIMEOUT, "if True:\n    GIT_TIMEOUT_S = 120\n",
      _R15_C1_NEEDLE),
+)
+
+
+# sec r12 R1/R2 (round 15): the four writes of report() decide the ok, bootstrap and reason step
+# outputs and the summary line, so their arguments are enumerated and the names in them (ok,
+# reason, bootstrap, line) resolve by binding. Rows are (label, old, new, needle).
+_R15_DEF = "def report(ok, reason, bootstrap=False):\n"
+_R15_W_OK = '        handle.write("ok=%s\\n" % ("true" if ok else "false"))\n'
+_R15_W_BOOT = '        handle.write("bootstrap=%s\\n" % ("true" if bootstrap else "false"))\n'
+_R15_W_REASON = '        handle.write("reason=%s\\n" % reason)\n'
+_R15_LINE = '    line = "impact: base files unavailable (%s)" % reason\n'
+_R15_AUG = '        line += "; bootstrap: the base sha has no scripts/ci/impact/gate.py"\n'
+_R15_PRINT = "    print(line)\n"
+_R15_RUNNER = 'os.environ.get("GITHUB_ACTIONS")'
+_R15_WRITE = "step output write outside the enumerated arguments"
+_R15_PARAM = "is not an unrebound parameter without a default"
+_R15_DEFAULT = "is not an unrebound parameter with its pinned default"
+_R15_LINE_RULE = "is not bound only to its pinned assignment and one pinned augmented literal"
+TrustDecisionFirst.R15_SEC_ROWS = (
+    ("r1-write-bootstrap-runner-conditioned", _R15_W_BOOT,
+     '        handle.write("bootstrap=%s\\n" % ("true" if bootstrap or ' + _R15_RUNNER
+     + ' else "false"))\n', _R15_WRITE),
+    ("r1-write-ok-literal", _R15_W_OK, '        handle.write("ok=%s\\n" % "true")\n', _R15_WRITE),
+    ("r1-write-reason-from-environment", _R15_W_REASON,
+     '        handle.write("reason=%s\\n" % os.environ.get("X", ""))\n', _R15_WRITE),
+    ("r1-fifth-write-bootstrap-true", _R15_W_REASON,
+     _R15_W_REASON + '        handle.write("bootstrap=true\\n")\n', _R15_WRITE),
+    ("r1-bootstrap-rebound-on-runner", _R15_DEF,
+     _R15_DEF + "    bootstrap = bootstrap or bool(" + _R15_RUNNER + ")\n", _R15_DEFAULT),
+    ("r1-bootstrap-default-true", _R15_DEF, "def report(ok, reason, bootstrap=True):\n",
+     _R15_DEFAULT),
+    ("r1-ok-rebound-on-runner", _R15_DEF,
+     _R15_DEF + "    ok = ok and not " + _R15_RUNNER + "\n", _R15_PARAM),
+    ("r1-reason-rebound-from-environment", _R15_DEF,
+     _R15_DEF + '    reason = os.environ.get("X", reason)\n', _R15_PARAM),
+    ("r2-line-rebound-from-environment", _R15_LINE,
+     _R15_LINE + '    line = os.environ.get("X", "")\n', _R15_LINE_RULE),
+    ("r2-line-extended-from-environment", _R15_PRINT,
+     '    line += os.environ.get("X", "")\n' + _R15_PRINT, _R15_LINE_RULE),
+    ("r2-line-rebound-on-runner", _R15_PRINT,
+     "    if " + _R15_RUNNER + ':\n        line = os.environ["X"]\n' + _R15_PRINT, _R15_LINE_RULE),
+    ("r2-line-assignment-value-changed", _R15_LINE,
+     '    line = "impact: base files unavailable (%s)" % os.environ.get("X", reason)\n',
+     _R15_LINE_RULE),
+    ("r2-line-literal-changed", _R15_AUG,
+     '        line += "; bootstrap: " + os.environ.get("X", "")\n', _R15_LINE_RULE),
+    ("r2-print-other-name", _R15_PRINT, "    print(summary)\n", "print call outside the enumerated"),
 )
 
 
