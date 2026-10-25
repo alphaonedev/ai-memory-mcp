@@ -69,7 +69,11 @@ def runs_on_lists(path):
 
 def run_blocks(path):
     """Each ``run:`` body as a list of non-comment lines."""
-    lines = lines_of(path)
+    return run_blocks_of(lines_of(path))
+
+
+def run_blocks_of(lines):
+    """``run_blocks`` over already-split text (used for the in-memory mutation rows)."""
     blocks = []
     i = 0
     while i < len(lines):
@@ -89,6 +93,54 @@ def run_blocks(path):
             i += 1
         blocks.append(body)
     return blocks
+
+
+def macos_defects(lines):
+    """Defects of one workflow text: heal call outside its guard, Linux-only tool, missing bin twin."""
+    found = []
+    healed = 0
+    for body in run_blocks_of(lines):
+        for n, ln in enumerate(body):
+            if ln.strip() == HEAL_GUARD:
+                indent = len(ln) - len(ln.lstrip())
+                end = next(
+                    (i for i in range(n + 1, len(body))
+                     if body[i].strip() == "fi" and len(body[i]) - len(body[i].lstrip()) == indent),
+                    len(body),
+                )
+                healed += sum(HEAL_SCRIPT in x for x in body[n + 1:end])
+        for ln in body:
+            for name, rx in LINUX_ONLY_TOKENS:
+                if rx.search(ln):
+                    found.append("linux-only " + name)
+            if POSTGRES_LINUX_BIN in ln and POSTGRES_MACOS_BIN not in ln:
+                found.append("no homebrew twin")
+    if healed != 1 or sum(HEAL_SCRIPT in x for b in run_blocks_of(lines) for x in b) != 1:
+        found.append("heal call not exactly once inside the guard")
+    return found
+
+
+HEAL_CALL = (
+    '            if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then\n'
+    '              echo "::error::$RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"\n'
+    "              exit 1\n"
+    "            fi\n"
+)
+GUARD_END = HEAL_CALL + "          fi\n"
+# Mutation table (code r1 F1/F2): name -> (old text, new text) applied to an in-memory copy of
+# postgres-ignored.yml. Every row must make macos_defects report a defect.
+MUTATIONS = {
+    "M11 heal call moved after the guard fi": (
+        GUARD_END,
+        "          if true; then\n            :\n          fi\n" + HEAL_CALL.replace("            ", "          "),
+    ),
+    "M12 nproc added": (GUARD_END, GUARD_END + "          nproc\n"),
+    "M13 /proc/meminfo added": (GUARD_END, GUARD_END + "          cat /proc/meminfo\n"),
+    "M14 postgresql bin loop without homebrew twin": (
+        GUARD_END,
+        GUARD_END + "          for d in /usr/lib/postgresql/18/bin; do :; done\n",
+    ),
+}
 
 
 class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
@@ -159,6 +211,20 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
                     if POSTGRES_LINUX_BIN in ln:
                         with self.subTest(workflow=path.name):
                             self.assertIn(POSTGRES_MACOS_BIN, ln, ln.strip())
+
+
+    def test_unmutated_workflows_have_no_macos_defect(self):
+        for path in WORKFLOWS:
+            with self.subTest(workflow=path.name):
+                self.assertEqual(macos_defects(lines_of(path)), [])
+
+    def test_every_mutation_row_is_detected(self):
+        """code r1 F1/F2: each of M11-M14 applied to an in-memory copy must be reported."""
+        base = WORKFLOWS[0].read_text(encoding="utf-8")
+        for name, (old, new) in MUTATIONS.items():
+            with self.subTest(mutation=name):
+                self.assertEqual(base.count(old), 1, "mutation anchor drifted")
+                self.assertNotEqual(macos_defects(base.replace(old, new, 1).splitlines()), [])
 
 
 if __name__ == "__main__":
