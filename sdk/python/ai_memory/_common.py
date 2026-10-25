@@ -18,9 +18,12 @@ import inspect
 import ipaddress
 import json
 import os
+import re
 import ssl
 import stat
+import sys
 import time
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
 
@@ -200,27 +203,197 @@ def _suites_authenticate_server(context: ssl.SSLContext) -> bool:
     return True
 
 
-def _context_from_path(path: str) -> ssl.SSLContext:
-    """A verifying context for the CA file or directory ``path`` (#6269).
+#: OpenSSL ``capath`` entry names: ``<subject hash>.<n>`` for a certificate,
+#: ``<subject hash>.r<n>`` for a CRL. Only these are trust input in a hashed
+#: CA directory, exactly as OpenSSL's own directory lookup reads it (#6377).
+_HASHED_CA_ENTRY = re.compile(r"[0-9a-f]{8}\.r?[0-9]+")
 
-    The path is resolved with ``os.path.realpath`` NOW and the context is
-    built from the absolute result: OpenSSL resolves a relative CA directory
-    lazily, at handshake time, against whatever the working directory is then.
-    A path that is neither an existing regular file nor an existing directory
-    (missing, FIFO, socket, device) is a ``ValueError`` rather than a late
-    ``FileNotFoundError`` or a hang.
+#: Write bits that let someone other than the owner change trust input.
+_SHARED_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
+
+
+def _shared_writable(mode: int) -> bool:
+    """Whether ``mode`` lets the group or others write (POSIX only, #6377)."""
+    return os.name != "nt" and bool(mode & _SHARED_WRITE_BITS)
+
+
+def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
+    """Raise when a trust input ``path`` is group- or world-writable (#6377)."""
+    if _shared_writable(mode):
+        raise ValueError(
+            f"verify= {what} {path!r} is group- or world-writable (mode "
+            f"{stat.S_IMODE(mode):o}): anyone with that write access could change "
+            "which servers this client trusts. Remove the write bits "
+            "(chmod go-w) or pass a CA path only its owner can change (#6377)."
+        )
+
+
+#: Symlinks followed while resolving one CA path, as Linux's MAXSYMLINKS.
+_MAX_SYMLINK_HOPS = 40
+
+
+def _checked_realpath(path: str) -> str:
+    """``os.path.realpath(path)``, refusing a symlink others could re-point (#6559).
+
+    Every component is resolved in order. A symlink met on the way (the path
+    itself, a directory component, or a link its target leads through) is
+    refused when the directory holding it lets the group or others write and
+    is not sticky with the link owned by this user or root: anyone with that
+    write access could replace the link and change which CA is read. This is
+    the #6377 rule for a CA file's directory, applied to every link. A
+    missing component ends the walk with the remainder appended, as
+    ``realpath`` does; the caller then refuses the path.
     """
-    resolved = os.path.realpath(path)
+    if os.name == "nt":
+        return os.path.realpath(path)
+    parts = [part for part in os.path.join(os.getcwd(), path).split(os.sep) if part]
+    resolved = os.sep
+    hops = 0
+    while parts:
+        name = parts.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, name)
+        try:
+            info = os.lstat(candidate)
+        except OSError:
+            return os.path.join(candidate, *parts)
+        if not stat.S_ISLNK(info.st_mode):
+            resolved = candidate
+            continue
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            raise ValueError(f"verify= CA path {path!r} has too many symlinks (#6559).")
+        held = os.stat(resolved).st_mode
+        sticky_and_owned = bool(held & stat.S_ISVTX) and info.st_uid in (0, os.geteuid())
+        if _shared_writable(held) and not sticky_and_owned:
+            raise ValueError(
+                f"verify= CA path {path!r} passes through the symlink {candidate!r}, "
+                f"whose directory is group- or world-writable (mode {stat.S_IMODE(held):o}): "
+                "anyone with that write access could re-point it and change which "
+                "servers this client trusts. Pass the real path, or keep the link in "
+                "a directory only its owner can change (#6559)."
+            )
+        try:
+            target = os.readlink(candidate)
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA path {path!r}: symlink {candidate!r} cannot be read: "
+                f"{exc.strerror} (#6559)."
+            ) from None
+        if os.path.isabs(target):
+            resolved = os.sep
+        parts = [part for part in target.split(os.sep) if part] + parts
+    return resolved
+
+
+def _pinned_base_context() -> ssl.SSLContext:
+    """``ssl.create_default_context()`` with NO trust anchors loaded (#6377).
+
+    The same steps the standard library takes for ``Purpose.SERVER_AUTH``
+    (``PROTOCOL_TLS_CLIENT``, ``CERT_REQUIRED``, ``check_hostname``, the
+    3.13+ strict and partial-chain flags, ``SSLKEYLOGFILE``), minus its
+    fallback to the system store: an empty CA directory must mean no anchor
+    at all, and ``create_default_context`` loads the system store whenever it
+    is given no CA input.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    if sys.version_info >= (3, 13):
+        context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | ssl.VERIFY_X509_STRICT
+    keylog = os.environ.get("SSLKEYLOGFILE")
+    if keylog and not sys.flags.ignore_environment:
+        context.keylog_filename = keylog
+    return context
+
+
+def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
+    """Load one CA file into ``context`` NOW, after checking who can change it.
+
+    ``entry`` is resolved through symlinks (each held to #6559), opened without blocking (a FIFO
+    would otherwise hang), and must be a regular file that neither it nor its
+    directory lets the group or others rewrite; a sticky directory is
+    admitted when the file belongs to this user or root, since nobody else
+    can then replace it. The file is loaded by path and re-checked to be the
+    same inode afterwards, so a swap during the load is refused (#6377).
+    """
+    real = _checked_realpath(entry)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(real, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} cannot be opened: {exc.strerror} (#6377)."
+        ) from None
+    try:
+        opened = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ValueError(
+            f"verify= CA entry {shown!r} is not a regular file; a hashed CA "
+            "directory may hold only certificate and CRL files (#6307, #6377)."
+        )
+    _refuse_shared_writable("CA file", real, opened.st_mode)
+    parent = os.path.dirname(real)
+    held = os.stat(parent)
+    sticky_and_owned = bool(held.st_mode & stat.S_ISVTX) and opened.st_uid in (0, os.geteuid())
+    if not sticky_and_owned:
+        _refuse_shared_writable("CA file directory", parent, held.st_mode)
+    try:
+        context.load_verify_locations(cafile=real)
+    except (ssl.SSLError, OSError) as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} holds no usable certificate: {exc} (#6377)."
+        ) from None
+    after = os.stat(real)
+    if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(f"verify= CA file {shown!r} changed while it was being read (#6377).")
+
+
+def _context_from_path(path: str) -> ssl.SSLContext:
+    """A verifying context for the CA file or directory ``path`` (#6269, #6377).
+
+    The path is resolved NOW, as ``os.path.realpath`` does, refusing a symlink
+    on the way that sits in a directory others can write (#6559). A path that is neither
+    an existing regular file nor an existing directory (missing, FIFO, socket,
+    device) is a ``ValueError`` rather than a late ``FileNotFoundError`` or a
+    hang (#6307).
+
+    Trust is read ONCE, here. For a directory every hashed entry
+    (``<hash>.<n>``, ``<hash>.r<n>``) is loaded eagerly, so a certificate
+    added to the directory after construction is never trusted (OpenSSL's own
+    ``capath`` lookup reads the directory again on every handshake). A
+    directory, file, symlink target or target directory that the group or
+    others can write is refused (POSIX; #6377). An empty directory gives a
+    context with no anchor at all, which fails every handshake (#6269).
+    """
+    resolved = _checked_realpath(path)
     try:
         mode = os.stat(resolved).st_mode
     except OSError:
         mode = 0
-    # `S_ISREG`/`S_ISDIR` only: a FIFO, socket or device would block or misbehave
-    # when opened (#6307), so it is refused before anything opens it.
     if stat.S_ISDIR(mode):
-        return ssl.create_default_context(capath=resolved)
+        _refuse_shared_writable("CA directory", path, mode)
+        context = _pinned_base_context()
+        try:
+            names = sorted(os.listdir(resolved))
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA directory {path!r} cannot be listed: {exc.strerror} (#6377)."
+            ) from None
+        for name in names:
+            if _HASHED_CA_ENTRY.fullmatch(name):
+                _load_trust_file(context, os.path.join(path, name), os.path.join(resolved, name))
+        return context
     if stat.S_ISREG(mode):
-        return ssl.create_default_context(cafile=resolved)
+        context = _pinned_base_context()
+        _load_trust_file(context, path, resolved)
+        return context
     raise ValueError(
         "verify= names a CA path that is not an existing regular file or "
         f"directory: {path!r}. Pass the CA bundle file or hashed CA directory "
@@ -228,10 +401,51 @@ def _context_from_path(path: str) -> ssl.SSLContext:
     )
 
 
+#: httpx's env trust, in its own precedence order: the variable, and whether
+#: it must name a directory (else a regular file).
+_ENV_TRUST = (("SSL_CERT_FILE", False), ("SSL_CERT_DIR", True))
+
+
+def _context_from_env() -> ssl.SSLContext | None:
+    """The env trust httpx would use for ``verify=None``/``True``, read NOW (#6538).
+
+    httpx takes ``SSL_CERT_FILE`` when it is non-empty, else ``SSL_CERT_DIR``,
+    else certifi (``None`` here). The named path is loaded through
+    :func:`_context_from_path`, so the #6377 rules hold for it: read once at
+    construction, never re-read per handshake, and refused when the group or
+    others can change it. A path that is missing or of the wrong kind is
+    refused, fail closed, where httpx 0.27 would silently fall back to
+    certifi.
+    """
+    for variable, wants_directory in _ENV_TRUST:
+        value = os.environ.get(variable, "")
+        if not value:
+            continue
+        try:
+            mode = os.stat(value).st_mode
+        except OSError:
+            mode = 0
+        if not (stat.S_ISDIR(mode) if wants_directory else stat.S_ISREG(mode)):
+            kind = "directory" if wants_directory else "regular file"
+            raise ValueError(
+                f"{variable}={value!r} is not an existing {kind}; httpx would read "
+                f"trust from it. Point {variable} at a CA "
+                f"{'hashed directory' if wants_directory else 'bundle file'} or unset it "
+                "(#6538)."
+            )
+        try:
+            return _context_from_path(value)
+        except ValueError as exc:
+            raise ValueError(f"{variable}: {exc} (#6538)") from None
+    return None
+
+
 def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
     """Return the ONLY value ``build_httpx_kwargs`` may forward, or raise (#3840).
 
-    Forwarded to httpx: ``None`` (httpx default trust, kwarg omitted), ``True``,
+    Forwarded to httpx: ``None`` (httpx default trust, kwarg omitted) and
+    ``True`` when no ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` is set, else the
+    context :func:`_context_from_env` builds from that variable (#6538),
     a caller context that passes :func:`_context_verifies` (exactly
     ``ssl.SSLContext``), or a context this SDK builds itself from the resolved
     absolute path of an existing CA file or directory (``str`` or
@@ -242,7 +456,8 @@ def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
     exist, and any type this SDK does not document.
     """
     if verify is None or verify is True:
-        return verify
+        from_env = _context_from_env()
+        return verify if from_env is None else from_env
     if isinstance(verify, ssl.SSLContext):
         if _context_verifies(verify):
             return verify
@@ -524,17 +739,172 @@ async def _aclose_quietly(stream: object) -> None:
         pass  # the refusal below is raised either way
 
 
+def _session_trace(context: ssl.SSLContext, request: httpx.Request) -> Any:
+    """The per-request httpcore trace that runs :class:`_SessionGate` (sync)."""
+    gate = _SessionGate(context, request)
+
+    def _trace(event: str, info: dict[str, Any]) -> None:
+        streams = gate.refused(event, info)
+        if streams is None:
+            return
+        for stream in streams:
+            _close_quietly(stream)
+        raise ValueError(_SESSION_MESSAGE)
+
+    return _trace
+
+
+def _async_session_trace(context: ssl.SSLContext, request: httpx.Request) -> Any:
+    """The per-request httpcore trace that runs :class:`_SessionGate` (async)."""
+    gate = _SessionGate(context, request)
+
+    async def _atrace(event: str, info: dict[str, Any]) -> None:
+        streams = gate.refused(event, info)
+        if streams is None:
+            return
+        for stream in streams:
+            await _aclose_quietly(stream)
+        raise ValueError(_SESSION_MESSAGE)
+
+    return _atrace
+
+
+class _GatedTransport(httpx.BaseTransport):
+    """Installs the session trace AFTER every request event hook ran (#6537).
+
+    httpx calls a transport's ``handle_request`` once all request hooks have
+    run, so a caller hook can no longer replace or remove the trace: a trace
+    it set is chained after the SDK's. The request's own ``extensions`` dict
+    is restored afterwards, so a resent or redirected request never stacks
+    one hop's check on the next.
+    """
+
+    def __init__(self, inner: httpx.BaseTransport, context: ssl.SSLContext) -> None:
+        self._inner = inner
+        self._context = context
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        original = request.extensions
+        request.extensions = dict(original)
+        _with_trace(request, _session_trace(self._context, request))
+        try:
+            return self._inner.handle_request(request)
+        finally:
+            request.extensions = original
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __enter__(self) -> _GatedTransport:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        self._inner.__exit__(exc_type, exc_value, traceback)
+
+
+class _AsyncGatedTransport(httpx.AsyncBaseTransport):
+    """The async :class:`_GatedTransport` (#6537)."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, context: ssl.SSLContext) -> None:
+        self._inner = inner
+        self._context = context
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        original = request.extensions
+        request.extensions = dict(original)
+        _with_trace(request, _async_session_trace(self._context, request))
+        try:
+            return await self._inner.handle_async_request(request)
+        finally:
+            request.extensions = original
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+    async def __aenter__(self) -> _AsyncGatedTransport:
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+_GATE_UNSUPPORTED = (
+    "verify=<ssl.SSLContext> needs the TLS session check on every transport, "
+    "and this httpx client does not expose them; pass verify= a CA file or "
+    "directory path instead (#6537)."
+)
+
+
+def gate_transports(
+    client: httpx.Client | httpx.AsyncClient,
+    kwargs: dict[str, Any],
+    verify: object,
+) -> None:
+    """Put the post-handshake session check on every transport of ``client`` (#6537).
+
+    Applies when ``kwargs`` (from :func:`build_httpx_kwargs`) forwards the
+    caller's own context. The default transport and every mounted proxy
+    transport are wrapped, so the check runs inside the transport, after all
+    request event hooks. Fails closed: if the client does not expose its
+    transports the client is closed and construction is refused.
+    """
+    context = kwargs.get("verify")
+    if not (isinstance(context, ssl.SSLContext) and context is verify):
+        return
+    is_async = isinstance(client, httpx.AsyncClient)
+    base: type = httpx.AsyncBaseTransport if is_async else httpx.BaseTransport
+    gated: Any = _AsyncGatedTransport if is_async else _GatedTransport
+    transport = getattr(client, "_transport", None)
+    mounts = getattr(client, "_mounts", None)
+    wrapped: dict[Any, Any] = {}
+    supported = isinstance(transport, base) and isinstance(mounts, dict)
+    if supported and isinstance(mounts, dict):
+        for pattern, mounted in mounts.items():
+            if isinstance(mounted, base):
+                wrapped[pattern] = gated(mounted, context)
+            elif mounted is not None:
+                supported = False
+                break
+    if not supported or not isinstance(mounts, dict):
+        # A just-built client has opened no connection; its sync transports
+        # are closed anyway so nothing outlives the refusal.
+        if not is_async:
+            owned = [transport, *(mounts.values() if isinstance(mounts, dict) else ())]
+            for candidate in owned:
+                if isinstance(candidate, httpx.BaseTransport):
+                    candidate.close()
+        raise ValueError(_GATE_UNSUPPORTED)
+    client._transport = gated(transport, context)  # noqa: SLF001
+    mounts.update(wrapped)
+
+
 def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list[Any]]:
     """httpx event hooks that enforce a caller-held context (#6249, #6305, #6306, #6349).
 
     * ``request``: re-check the context before every request (early, clear
-      error) and install a per-request httpcore ``trace`` (:class:`_SessionGate`)
-      that inspects every TLS session of the request, direct, tunnelled or
-      over SOCKS, right after its handshake and before any request byte is
-      sent; an unverified session is closed and refused.
+      error). The post-handshake session check (:class:`_SessionGate`) is not
+      installed here: a caller hook appended later could replace the trace
+      (#6537). :func:`gate_transports` installs it inside every transport,
+      after all request hooks; it inspects every TLS session of the request,
+      direct, tunnelled or over SOCKS, right after its handshake and before
+      the request's first byte is written on that connection, and an
+      unverified session is closed and refused.
     * ``response``: a backstop that inspects the connection the response came
       over, which also covers a pooled connection and a trace event that never
-      fired, so a missing check fails closed.
+      fired. It runs after the request was written, so it refuses the result
+      but cannot un-send the request.
 
     The caller keeps a reference to the context and may weaken it after
     construction or between the check and the handshake; the session check
@@ -547,19 +917,8 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
 
     if is_async:
 
-        async def _arequest(request: httpx.Request) -> None:
+        async def _arequest(_request: httpx.Request) -> None:
             _recheck()
-            gate = _SessionGate(context, request)
-
-            async def _atrace(event: str, info: dict[str, Any]) -> None:
-                streams = gate.refused(event, info)
-                if streams is None:
-                    return
-                for stream in streams:
-                    await _aclose_quietly(stream)
-                raise ValueError(_SESSION_MESSAGE)
-
-            _with_trace(request, _atrace)
 
         async def _aresponse(response: httpx.Response) -> None:
             _assert_negotiated_session(
@@ -570,19 +929,8 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
 
         return {"request": [_arequest], "response": [_aresponse]}
 
-    def _request(request: httpx.Request) -> None:
+    def _request(_request: httpx.Request) -> None:
         _recheck()
-        gate = _SessionGate(context, request)
-
-        def _trace(event: str, info: dict[str, Any]) -> None:
-            streams = gate.refused(event, info)
-            if streams is None:
-                return
-            for stream in streams:
-                _close_quietly(stream)
-            raise ValueError(_SESSION_MESSAGE)
-
-        _with_trace(request, _trace)
 
     def _response(response: httpx.Response) -> None:
         _assert_negotiated_session(
@@ -625,14 +973,18 @@ def build_httpx_kwargs(
             whoever answers — the man-in-the-middle exposure the #3828
             ``http://`` refusal closes, one layer up. Accepted forms are exactly
             ``None``, ``True``, the path of an existing CA file or directory (``str``
-            or ``os.PathLike``, resolved with ``os.path.realpath`` at
-            construction) and exactly ``ssl.SSLContext`` (never a subclass) that
-            is ``CERT_REQUIRED`` with ``check_hostname`` on and no patched
-            ``wrap_socket``/``wrap_bio``. Every other value is refused. Only a checked
+            or ``os.PathLike``, resolved with ``os.path.realpath`` and read
+            once at construction, never group- or world-writable, #6377) and
+            exactly ``ssl.SSLContext`` (never a subclass) that is
+            ``CERT_REQUIRED`` with ``check_hostname`` on, no relaxing verify
+            flag, no suite without server authentication and no replaced
+            handshake attribute. Every other value is refused. Only a checked
             value reaches httpx: a CA path becomes a context this SDK builds
             from the exact path string (#6248, #6245), and a caller-supplied
-            context is re-checked before every request (#6249; the client does
-            not own it, so a later weakening is refused, not honoured). Both
+            context is re-checked before every request (#6249, #6375, #6305;
+            the client does not own it, so turning verification off after
+            construction is refused) and every TLS session is checked after
+            its handshake (#6349, #6350). Both
             clients construct through this one funnel, so the refusal lives
             here once.
     """

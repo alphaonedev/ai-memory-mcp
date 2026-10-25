@@ -32,6 +32,7 @@ from ai_memory._common import (
     DEFAULT_TIMEOUT,
     build_create_body,
     build_httpx_kwargs,
+    gate_transports,
     encode_path_segment,
     handle_response,
     if_match_headers,
@@ -75,14 +76,21 @@ class AiMemoryClient:
         verify: TLS server verification. Accepted: ``None`` (httpx default trust:
             certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set), ``True``, the path of an existing CA bundle file or hashed
             CA directory (``str`` / ``os.PathLike``, resolved with
-            ``os.path.realpath`` now and loaded into a context the SDK builds,
-            #6248, #6269) and exactly ``ssl.SSLContext`` (not a subclass such
-            as ``truststore.SSLContext``) that is ``CERT_REQUIRED`` with
-            ``check_hostname`` on and no patched ``wrap_socket``/``wrap_bio``
-            (re-checked on every request; a later weakening is refused, #6249,
-            #6267, #6268). ``False`` and every other value raise
-            ``ValueError`` (#3840): there is no accept-any-certificate mode. A
-            zero-config daemon's CA is ``<key_dir>/tls/local-ca.pem`` (#3782).
+            ``os.path.realpath`` and read ONCE, now, into a context the SDK
+            builds; a group- or world-writable path is refused, #6248, #6269,
+            #6377) and exactly ``ssl.SSLContext`` (not a subclass such as
+            ``truststore.SSLContext``) that is ``CERT_REQUIRED`` with
+            ``check_hostname`` on, no verify flag that relaxes chain
+            validation, no cipher suite without server authentication and no
+            replaced handshake attribute (re-checked before every request, so
+            turning any of these off after construction is refused, #6249,
+            #6267, #6268, #6305, #6375). After every TLS handshake, direct,
+            proxied or over SOCKS, the session must belong to that context,
+            name the request host and be within its validity dates before the
+            request is written (#6349, #6350). ``False`` and every other value
+            raise ``ValueError`` (#3840): there is no accept-any-certificate
+            mode. A zero-config daemon's CA is ``<key_dir>/tls/local-ca.pem``
+            (#3782).
         cert: ``httpx`` ``cert`` — client cert for mTLS (path or
             ``(cert, key)``).
         headers: Additional headers to send on every request.
@@ -99,17 +107,17 @@ class AiMemoryClient:
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        self._client = httpx.Client(
-            **build_httpx_kwargs(
-                base_url=base_url,
-                api_key=api_key,
-                agent_id=agent_id,
-                timeout=timeout,
-                verify=verify,
-                cert=cert,
-                extra_headers=headers,
-            )
+        kwargs = build_httpx_kwargs(
+            base_url=base_url,
+            api_key=api_key,
+            agent_id=agent_id,
+            timeout=timeout,
+            verify=verify,
+            cert=cert,
+            extra_headers=headers,
         )
+        self._client = httpx.Client(**kwargs)
+        gate_transports(self._client, kwargs, verify)
 
     # -- lifecycle ----------------------------------------------------------
     def close(self) -> None:

@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import pathlib
+import shutil
 import ssl
+import subprocess
+import sys
 from collections.abc import Iterator
 from typing import Any, Callable
 
@@ -27,7 +31,7 @@ import httpcore
 import httpx
 import pytest
 
-from ai_memory import AiMemoryClient, AsyncAiMemoryClient
+from ai_memory import AiMemoryClient, AsyncAiMemoryClient, _common
 from ai_memory._common import build_httpx_kwargs
 
 from ._tlslab import Lab, RecordingServer, TunnelProxy
@@ -248,8 +252,32 @@ def _get_request() -> httpcore.Request:
     return httpcore.Request(b"GET", _ORIGIN + "/x", headers=[(b"X-API-Key", _API_KEY.encode())])
 
 
+def _gated_trace(context: ssl.SSLContext, request: httpx.Request, *, is_async: bool) -> Any:
+    """The trace the SDK's gated transport hands its inner transport (#6537)."""
+    captured: list[Any] = []
+
+    def capture(sent: httpx.Request) -> httpx.Response:
+        captured.append(sent.extensions["trace"])
+        return httpx.Response(200)
+
+    if is_async:
+
+        async def acapture(sent: httpx.Request) -> httpx.Response:
+            return capture(sent)
+
+        transport: Any = _common._AsyncGatedTransport(  # noqa: SLF001
+            httpx.MockTransport(acapture), context
+        )
+        asyncio.run(transport.handle_async_request(request))
+    else:
+        _common._GatedTransport(httpx.MockTransport(capture), context).handle_request(  # noqa: SLF001
+            request
+        )
+    return captured[0]
+
+
 class _Driver:
-    """Installs the SDK's request hook on a fresh request and drives its trace."""
+    """Runs a fresh request through the SDK's gated transport and drives its trace."""
 
     def __init__(self, context: ssl.SSLContext, *, is_async: bool) -> None:
         kwargs = build_httpx_kwargs(
@@ -263,16 +291,12 @@ class _Driver:
             is_async=is_async,
         )
         self.is_async = is_async
+        self.context = context
         self.hooks = kwargs["event_hooks"]
 
     def new_request(self) -> Callable[[str, dict[str, Any]], None]:
         request = httpx.Request("GET", _ORIGIN + "/x")
-        hook = self.hooks["request"][0]
-        if self.is_async:
-            asyncio.run(hook(request))
-        else:
-            hook(request)
-        trace = request.extensions["trace"]
+        trace = _gated_trace(self.context, request, is_async=self.is_async)
 
         def fire(event: str, info: dict[str, Any]) -> None:
             if self.is_async:
@@ -626,6 +650,11 @@ def test_relaxing_flag_set_after_construction_is_refused_per_request_6375(
 _DAY = datetime.timedelta(days=1)
 
 
+def _no_time_check(context: ssl.SSLContext) -> None:
+    """Turn validity-date checking off AFTER the SDK's per-request check ran."""
+    _with_flags(context, _RELAXING_FLAGS["NO_CHECK_TIME"])
+
+
 @pytest.mark.parametrize("client_cls", _CLIENTS)
 @pytest.mark.parametrize("window", ["expired", "not-yet-valid"])
 def test_out_of_date_leaf_is_refused_after_the_handshake_6375(
@@ -647,7 +676,7 @@ def test_out_of_date_leaf_is_refused_after_the_handshake_6375(
                 client_cls,
                 server.url,
                 lab.client_context(),
-                hook=lambda context: _with_flags(context, _RELAXING_FLAGS["NO_CHECK_TIME"]),
+                hook=_no_time_check,
             )
         assert server.hits == []
     finally:
@@ -746,6 +775,822 @@ def test_session_without_secret_bits_is_refused_6305(
     with pytest.raises(ValueError, match="verify=False"):
         drive.new_request()("connection.start_tls.complete", {"return_value": stream})
     assert stream.closed
+
+
+# ---- #6377: a CA directory is read once, at construction, and not shared ---
+
+_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+
+
+def _subject_hash(cert_path: pathlib.Path) -> str:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is needed to hash a CA directory")
+    return subprocess.run(  # noqa: S603 - fixed argv
+        [openssl, "x509", "-hash", "-noout", "-in", str(cert_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _add_anchor(directory: pathlib.Path, cert_path: pathlib.Path) -> pathlib.Path:
+    entry = directory / f"{_subject_hash(cert_path)}.0"
+    shutil.copy(cert_path, entry)
+    entry.chmod(0o644)
+    return entry
+
+
+def _ca_dir(tmp_path: pathlib.Path, name: str = "ca", mode: int = 0o755) -> pathlib.Path:
+    directory = tmp_path / name
+    directory.mkdir()
+    directory.chmod(mode)
+    return directory
+
+
+def _get_once(client_cls: type, url: str, verify: Any) -> object:
+    """One GET on a fresh client: the status code, or the connect error type."""
+    try:
+        return _fetch(client_cls, url, verify)[0]
+    except httpx.ConnectError as exc:
+        return type(exc)
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_anchor_added_after_construction_is_not_trusted_6377(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    directory = _ca_dir(tmp_path)
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=origin.url, verify=str(directory), timeout=5) as client:
+            _add_anchor(directory, lab.ca_path)
+            with pytest.raises(httpx.ConnectError):
+                client._client.get("/x")  # noqa: SLF001
+    else:
+
+        async def run() -> None:
+            async with AsyncAiMemoryClient(
+                base_url=origin.url, verify=str(directory), timeout=5
+            ) as client:
+                _add_anchor(directory, lab.ca_path)
+                with pytest.raises(httpx.ConnectError):
+                    await client._client.get("/x")  # noqa: SLF001
+
+        asyncio.run(run())
+    assert origin.hits == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_anchor_present_at_construction_is_trusted_6377(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    assert _get_once(client_cls, origin.url, str(directory)) == 200
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o777, 0o1777], ids=oct)
+def test_shared_writable_ca_directory_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    directory.chmod(mode)
+    with pytest.raises(ValueError, match="writable") as refused:
+        client_cls(base_url=_ORIGIN, verify=str(directory))
+    assert str(directory) in str(refused.value)
+    assert oct(mode)[2:] in str(refused.value)  # names the mode, not the contents
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o664, 0o646], ids=oct)
+def test_shared_writable_ca_file_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int
+) -> None:
+    bundle = tmp_path / "bundle.pem"
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(mode)
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=str(bundle))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_writable_anchor_behind_a_symlink_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    shared = _ca_dir(tmp_path, "shared", 0o755)
+    target = shared / "lab-ca.pem"
+    shutil.copy(lab.ca_path, target)
+    target.chmod(0o666)
+    directory = _ca_dir(tmp_path)
+    (directory / f"{_subject_hash(lab.ca_path)}.0").symlink_to(target)
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=str(directory))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_anchor_in_a_shared_writable_directory_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    # The file is 0644 but its directory lets others replace it.
+    shared = _ca_dir(tmp_path, "shared", 0o755)
+    target = shared / "lab-ca.pem"
+    shutil.copy(lab.ca_path, target)
+    target.chmod(0o644)
+    shared.chmod(0o777)
+    directory = _ca_dir(tmp_path)
+    (directory / f"{_subject_hash(lab.ca_path)}.0").symlink_to(target)
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=str(directory))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_fifo_entry_in_a_ca_directory_is_refused_without_blocking_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    directory = _ca_dir(tmp_path)
+    os.mkfifo(directory / f"{_subject_hash(lab.ca_path)}.0", 0o644)
+    with pytest.raises(ValueError, match="regular file"):
+        client_cls(base_url=_ORIGIN, verify=str(directory))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_ca_directory_read_is_the_one_whose_mode_was_checked_6377(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    # verify= names a symlink to a checked 0755 directory. The link is moved to
+    # a sticky shared directory holding the anchor after the mode check and
+    # before the directory is listed: the SDK must list the directory it
+    # resolved and checked, never what the name points at later.
+    _clear_proxy_env(monkeypatch)
+    checked = _ca_dir(tmp_path, "checked", 0o755)
+    swapped = _ca_dir(tmp_path, "swapped", 0o755)
+    _add_anchor(swapped, lab.ca_path)
+    swapped.chmod(0o1777)
+    link = tmp_path / "ca-link"
+    link.symlink_to(checked)
+    listdir = os.listdir
+
+    def retarget_then_list(target: Any = ".") -> list[str]:
+        if link.resolve() == checked.resolve():
+            link.unlink()
+            link.symlink_to(swapped)
+        return listdir(target)
+
+    monkeypatch.setattr(os, "listdir", retarget_then_list)
+    assert _get_once(client_cls, origin.url, str(link)) is httpx.ConnectError
+    assert origin.hits == []
+
+
+# ---- #6360: the response backstop refuses on its own -----------------------
+
+
+def _backstop(context: ssl.SSLContext, *, is_async: bool) -> Callable[[object], None]:
+    """The SDK's response hook for ``context``, driven synchronously."""
+    hook = _Driver(context, is_async=is_async).hooks["response"][0]
+
+    def check(session: object) -> None:
+        request = httpx.Request("GET", _ORIGIN + "/x")
+        response = httpx.Response(
+            200, request=request, extensions={"network_stream": _Stream(session)}
+        )
+        if is_async:
+            asyncio.run(hook(response))
+        else:
+            hook(response)
+
+    return check
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "session",
+    [
+        pytest.param(lambda _context: None, id="no-session"),
+        pytest.param(lambda _context: _Session(ssl.create_default_context()), id="other-context"),
+        pytest.param(lambda context: _Session(context, host="elsewhere.lab"), id="wrong-name"),
+        pytest.param(lambda context: _Session(context, bits=0), id="no-secret-bits"),
+    ],
+)
+def test_backstop_refuses_an_unverified_response_session_6360(
+    is_async: bool, session: Callable[[ssl.SSLContext], object]
+) -> None:
+    context = ssl.create_default_context()
+    with pytest.raises(ValueError, match="verify=False"):
+        _backstop(context, is_async=is_async)(session(context))
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_backstop_refuses_an_empty_peer_certificate_6360(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    session = _Session(context)
+    session._peer = {}  # noqa: SLF001
+    with pytest.raises(ValueError, match="verify=False"):
+        _backstop(context, is_async=is_async)(session)
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_backstop_admits_a_verified_response_session_6360(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    _backstop(context, is_async=is_async)(_Session(context))
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_backstop_refuses_when_the_session_trace_never_ran_6360(
+    wrong_name_origin: RecordingServer,
+    lab: Lab,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    # No trace is installed, so only the response hook stands between the
+    # weakened context and a response from a server named for another host.
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setattr("ai_memory._common._with_trace", lambda _request, _trace: None)
+    with pytest.raises(ValueError, match="verify=False"):
+        _fetch(client_cls, wrong_name_origin.url, lab.client_context(), hook=_no_hostname_check)
+
+
+# ---- #6361: a refused session's stream is closed, once, before the raise ---
+
+
+class _CountingStream(_Stream):
+    """Counts close calls; optionally fails them the way a dead socket does."""
+
+    def __init__(self, session: object, *, fail: bool = False) -> None:
+        super().__init__(session)
+        self.closes = 0
+        self.fail = fail
+        self.closed_while_raising = False
+
+    def close(self) -> None:
+        self.closes += 1
+        # Closed by a handler or finally that runs after the refusal was raised?
+        self.closed_while_raising |= sys.exc_info()[0] is not None
+        if self.fail:
+            raise OSError("already closed")
+
+    async def aclose(self) -> None:
+        self.close()
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["clean-close", "close-raises"])
+@pytest.mark.parametrize(
+    ("event", "session"),
+    [
+        pytest.param(
+            "connection.start_tls.complete",
+            lambda context: _Session(context, host="elsewhere.lab"),
+            id="direct-wrong-name",
+        ),
+        pytest.param("connection.start_tls.complete", lambda _context: None, id="direct-none"),
+        pytest.param(
+            "proxy.start_tls.complete",
+            lambda _context: _Session(ssl.create_default_context()),
+            id="tunnel-foreign",
+        ),
+        pytest.param(
+            "socks.start_tls.complete",
+            lambda context: _Session(context, bits=0),
+            id="socks-no-bits",
+        ),
+    ],
+)
+def test_refused_session_stream_is_closed_once_before_the_raise_6361(
+    driver: tuple[_Driver, ssl.SSLContext],
+    event: str,
+    session: Callable[[ssl.SSLContext], object],
+    fail: bool,
+) -> None:
+    drive, context = driver
+    stream = _CountingStream(session(context), fail=fail)
+    with pytest.raises(ValueError, match="verify=False"):
+        drive.new_request()(event, {"return_value": stream})
+    assert stream.closes == 1
+    assert not stream.closed_while_raising
+
+
+def test_pending_proxy_leg_stream_is_closed_when_the_request_is_refused_6361(
+    driver: tuple[_Driver, ssl.SSLContext],
+) -> None:
+    drive, _ = driver
+    fire = drive.new_request()
+    leg = _CountingStream(_Session(ssl.create_default_context()))
+    fire("connection.start_tls.complete", {"return_value": leg})
+    assert leg.closes == 0  # a proxy leg is pending, not yet refused
+    with pytest.raises(ValueError, match="verify=False"):
+        fire("http11.send_request_headers.started", {"request": _get_request()})
+    assert leg.closes == 1
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_verified_session_stream_is_left_open_6361(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    stream = _CountingStream(_Session(context))
+    _Driver(context, is_async=is_async).new_request()(
+        "connection.start_tls.complete", {"return_value": stream}
+    )
+    assert stream.closes == 0
+
+
+# ---- #6362: a trace already on the request is chained after the SDK's ------
+
+
+def _chained(
+    context: ssl.SSLContext, *, is_async: bool, inherited_async: bool
+) -> tuple[Callable[[str, dict[str, Any]], None], list[str]]:
+    """Run the SDK gated transport on a request that already carries a trace."""
+    seen: list[str] = []
+
+    def inherited(event: str, _info: dict[str, Any]) -> None:
+        seen.append(event)
+
+    async def ainherited(event: str, info: dict[str, Any]) -> None:
+        inherited(event, info)
+
+    request = httpx.Request(
+        "GET", _ORIGIN + "/x", extensions={"trace": ainherited if inherited_async else inherited}
+    )
+    trace = _gated_trace(context, request, is_async=is_async)
+
+    def fire(event: str, info: dict[str, Any]) -> None:
+        if is_async:
+            asyncio.run(trace(event, info))
+        else:
+            trace(event, info)
+
+    return fire, seen
+
+
+_CHAIN_SHAPES = [
+    pytest.param(False, False, id="sync"),
+    pytest.param(True, True, id="async-inherits-async"),
+    pytest.param(True, False, id="async-inherits-sync"),
+]
+
+
+@pytest.mark.parametrize(("is_async", "inherited_async"), _CHAIN_SHAPES)
+def test_inherited_trace_still_receives_every_event_6362(
+    is_async: bool, inherited_async: bool
+) -> None:
+    context = ssl.create_default_context()
+    fire, seen = _chained(context, is_async=is_async, inherited_async=inherited_async)
+    fire("connection.connect_tcp.complete", {"return_value": object()})
+    fire("connection.start_tls.complete", {"return_value": _Stream(_Session(context))})
+    fire("http11.send_request_headers.started", {"request": _get_request()})
+    assert seen == [
+        "connection.connect_tcp.complete",
+        "connection.start_tls.complete",
+        "http11.send_request_headers.started",
+    ]
+
+
+@pytest.mark.parametrize(("is_async", "inherited_async"), _CHAIN_SHAPES)
+def test_sdk_check_runs_before_the_inherited_trace_6362(
+    is_async: bool, inherited_async: bool
+) -> None:
+    context = ssl.create_default_context()
+    fire, seen = _chained(context, is_async=is_async, inherited_async=inherited_async)
+    stream = _Stream(_Session(ssl.create_default_context(), host="elsewhere.lab"))
+    with pytest.raises(ValueError, match="verify=False"):
+        fire("proxy.start_tls.complete", {"return_value": stream})
+    assert seen == []  # refused before the inherited trace saw the session
+    assert stream.closed
+
+
+# ---- #6363: every handshake attribute is pinned at class level -------------
+
+_PINNED_HANDSHAKE_ATTRIBUTES = frozenset(
+    {
+        "wrap_socket",
+        "wrap_bio",
+        "verify_mode",
+        "check_hostname",
+        "sslsocket_class",
+        "sslobject_class",
+        "verify_flags",
+        "hostname_checks_common_name",
+        "get_ciphers",
+    }
+)
+
+
+def _stock_descriptor(name: str) -> Any:
+    for klass in ssl.SSLContext.__mro__:
+        if name in klass.__dict__:
+            return klass.__dict__[name]
+    raise AssertionError(name)
+
+
+def _equivalent_replacement(name: str) -> object:
+    """A class attribute that behaves exactly like the stock one for ``name``."""
+    stock = _stock_descriptor(name)
+    if isinstance(stock, type):
+        return type(stock.__name__, (stock,), {})
+    if hasattr(stock, "__set__"):
+        return property(stock.__get__, stock.__set__)
+
+    def forward(self: ssl.SSLContext, *args: Any, **kwargs: Any) -> Any:
+        return stock.__get__(self, ssl.SSLContext)(*args, **kwargs)
+
+    return forward
+
+
+def test_handshake_attribute_list_is_complete_6363() -> None:
+    from ai_memory import _common
+
+    assert frozenset(_common._HANDSHAKE_ATTRIBUTES) == _PINNED_HANDSHAKE_ATTRIBUTES  # noqa: SLF001
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("name", sorted(_PINNED_HANDSHAKE_ATTRIBUTES))
+def test_class_level_replacement_of_any_handshake_attribute_is_refused_6363(
+    monkeypatch: pytest.MonkeyPatch, client_cls: type, name: str
+) -> None:
+    context = ssl.create_default_context()
+    monkeypatch.setattr(ssl.SSLContext, name, _equivalent_replacement(name), raising=False)
+    with pytest.raises(ValueError, match="verify=False is refused"):
+        client_cls(base_url=_ORIGIN, verify=context)
+
+
+# ---- #6378: the per-request re-check refuses on its own ---------------------
+
+
+def _weakened_then_get(client_cls: type, url: str, context: ssl.SSLContext, weaken: Hook) -> None:
+    """Build a client on ``context``, weaken the context, then send one GET."""
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=url, verify=context, api_key=_API_KEY, timeout=5) as client:
+            weaken(context)
+            client._client.get("/x")  # noqa: SLF001
+        return
+
+    async def run() -> None:
+        async with AsyncAiMemoryClient(
+            base_url=url, verify=context, api_key=_API_KEY, timeout=5
+        ) as client:
+            weaken(context)
+            await client._client.get("/x")  # noqa: SLF001
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_hostname_check_turned_off_after_construction_is_refused_by_the_recheck_6378(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    # The server's certificate names the request host, so the session check
+    # admits the session: only the per-request re-check sees the change.
+    _clear_proxy_env(monkeypatch)
+    with pytest.raises(ValueError, match="verify=False is refused"):
+        _weakened_then_get(client_cls, origin.url, lab.client_context(), _no_hostname_check)
+    assert origin.hits == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_class_level_patch_after_construction_is_refused_by_the_recheck_6378(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+
+    def patch_class(_context: ssl.SSLContext) -> None:
+        monkeypatch.setattr(ssl.SSLContext, "wrap_bio", _equivalent_replacement("wrap_bio"))
+
+    with pytest.raises(ValueError, match="verify=False is refused"):
+        _weakened_then_get(client_cls, origin.url, lab.client_context(), patch_class)
+    assert origin.hits == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_unweakened_context_reaches_the_right_name_origin_6378(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    _weakened_then_get(client_cls, origin.url, lab.client_context(), lambda _context: None)
+    assert len(origin.hits) == 1
+
+
+# ---- #6537: a later caller hook cannot remove the session check ------------
+
+
+def _late_trace_fetch(
+    client_cls: type, url: str, context: ssl.SSLContext, action: str, seen: list[str]
+) -> int:
+    """GET once with a caller hook, appended after the SDK's, that weakens the
+    context and then replaces (``replace``) or deletes (``remove``) the
+    httpcore trace on the request. A replacing trace records its events in
+    ``seen``. Returns the status code.
+    """
+
+    def record(event: str, _info: dict[str, Any]) -> None:
+        seen.append(event)
+
+    async def arecord(event: str, info: dict[str, Any]) -> None:
+        record(event, info)
+
+    def late(request: httpx.Request, trace: Any) -> None:
+        if action == "weaken-replace" or action == "weaken-remove":
+            _no_hostname_check(context)
+        if action.endswith("remove"):
+            request.extensions.pop("trace", None)
+        else:
+            request.extensions["trace"] = trace
+
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=url, verify=context, api_key=_API_KEY, timeout=5) as client:
+            client._client.event_hooks["request"].append(  # noqa: SLF001
+                lambda request: late(request, record)
+            )
+            return client._client.get("/x").status_code  # noqa: SLF001
+
+    async def run() -> int:
+        async with AsyncAiMemoryClient(
+            base_url=url, verify=context, api_key=_API_KEY, timeout=5
+        ) as client:
+
+            async def alate(request: httpx.Request) -> None:
+                late(request, arecord)
+
+            client._client.event_hooks["request"].append(alate)  # noqa: SLF001
+            return (await client._client.get("/x")).status_code  # noqa: SLF001
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("action", ["weaken-replace", "weaken-remove"])
+def test_later_hook_cannot_remove_the_session_check_6537(
+    wrong_name_origin: RecordingServer,
+    lab: Lab,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    action: str,
+) -> None:
+    # The hook runs after the SDK's re-check, so only the session check can
+    # refuse the wrong-name server, and it must do so before any byte.
+    _clear_proxy_env(monkeypatch)
+    with pytest.raises(ValueError, match="verify=False"):
+        _late_trace_fetch(client_cls, wrong_name_origin.url, lab.client_context(), action, [])
+    assert wrong_name_origin.hits == []
+    assert wrong_name_origin.api_keys == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("action", ["weaken-replace", "weaken-remove"])
+def test_later_hook_cannot_remove_the_tunnelled_session_check_6537(
+    proxy: TunnelProxy,
+    wrong_name_origin: RecordingServer,
+    lab: Lab,
+    client_cls: type,
+    action: str,
+) -> None:
+    with pytest.raises(ValueError, match="verify=False"):
+        _late_trace_fetch(client_cls, wrong_name_origin.url, lab.client_context(), action, [])
+    assert len(proxy.tunnels) == 1
+    assert wrong_name_origin.hits == []
+    assert wrong_name_origin.api_keys == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_trace_set_by_a_later_hook_still_receives_events_6537(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    seen: list[str] = []
+    assert _late_trace_fetch(client_cls, origin.url, lab.client_context(), "replace", seen) == 200
+    assert "connection.start_tls.complete" in seen
+    assert "http11.send_request_headers.started" in seen
+    assert origin.hits == ["/x"]
+
+
+# ---- #6559: a symlink on the CA path may not sit in a shared-writable dir ---
+
+
+def _linked_ca(lab: Lab, tmp_path: pathlib.Path, kind: str, mode: int) -> str:
+    """A ``verify=`` path whose ``kind`` symlink lives in a directory of ``mode``.
+
+    The CA file and CA directory themselves are safe (0644 in 0755); only the
+    directory holding the link lets others replace it.
+    """
+    safe = _ca_dir(tmp_path, "safe", 0o755)
+    bundle = safe / "lab-ca.pem"
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(0o644)
+    hashed = _ca_dir(tmp_path, "hashed", 0o755)
+    _add_anchor(hashed, lab.ca_path)
+    swap = _ca_dir(tmp_path, "swap", 0o755)
+    if kind == "file":
+        (swap / "ca.pem").symlink_to(bundle)
+        verify = swap / "ca.pem"
+    elif kind == "directory":
+        (swap / "ca").symlink_to(hashed)
+        verify = swap / "ca"
+    elif kind == "component":
+        (swap / "certs").symlink_to(safe)
+        verify = swap / "certs" / "lab-ca.pem"
+    else:  # an entry of a safe CA directory points through a link in `swap`
+        (swap / "anchor.pem").symlink_to(bundle)
+        verify = _ca_dir(tmp_path, "entries", 0o755)
+        (verify / f"{_subject_hash(lab.ca_path)}.0").symlink_to(swap / "anchor.pem")
+    swap.chmod(mode)
+    return str(verify)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o777, 0o775], ids=oct)
+@pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
+def test_symlink_in_a_shared_writable_directory_is_refused_6559(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int, kind: str
+) -> None:
+    verify = _linked_ca(lab, tmp_path, kind, mode)
+    with pytest.raises(ValueError, match="symlink") as refused:
+        client_cls(base_url=_ORIGIN, verify=verify)
+    assert "writable" in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
+def test_own_symlink_in_a_sticky_directory_is_accepted_6559(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    verify = _linked_ca(lab, tmp_path, kind, 0o1777)
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
+# ---- #6538: env trust (SSL_CERT_FILE / SSL_CERT_DIR) is held to #6377 ------
+
+_ENV_VERIFY = pytest.mark.parametrize("verify", [None, True], ids=["None", "True"])
+
+
+def _env_trust(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+    _clear_proxy_env(monkeypatch)
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_env_anchor_added_after_construction_is_not_trusted_6538(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _env_trust(monkeypatch, SSL_CERT_DIR=str(directory))
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=origin.url, verify=verify, timeout=5) as client:  # type: ignore[arg-type]
+            _add_anchor(directory, lab.ca_path)
+            with pytest.raises(httpx.ConnectError):
+                client._client.get("/x")  # noqa: SLF001
+    else:
+
+        async def run() -> None:
+            async with AsyncAiMemoryClient(
+                base_url=origin.url,
+                verify=verify,  # type: ignore[arg-type]
+                timeout=5,
+            ) as client:
+                _add_anchor(directory, lab.ca_path)
+                with pytest.raises(httpx.ConnectError):
+                    await client._client.get("/x")  # noqa: SLF001
+
+        asyncio.run(run())
+    assert origin.hits == []
+
+
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_env_anchor_present_at_construction_is_trusted_6538(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+    variable: str,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    entry = _add_anchor(directory, lab.ca_path)
+    _env_trust(monkeypatch, **{variable: str(entry if variable == "SSL_CERT_FILE" else directory)})
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_writable_env_ca_directory_is_refused_6538(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    directory.chmod(0o777)
+    _env_trust(monkeypatch, SSL_CERT_DIR=str(directory))
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=verify)
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_writable_env_ca_file_is_refused_6538(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    bundle = tmp_path / "bundle.pem"
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(0o666)
+    _env_trust(monkeypatch, SSL_CERT_FILE=str(bundle))
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=verify)
+
+
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize(
+    ("variable", "target"),
+    [
+        ("SSL_CERT_FILE", "missing"),
+        ("SSL_CERT_DIR", "missing"),
+        ("SSL_CERT_FILE", "directory"),
+        ("SSL_CERT_DIR", "file"),
+    ],
+)
+def test_unusable_env_trust_path_is_refused_6538(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+    variable: str,
+    target: str,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    entry = _add_anchor(directory, lab.ca_path)
+    path = {"missing": tmp_path / "absent", "directory": directory, "file": entry}[target]
+    _env_trust(monkeypatch, **{variable: str(path)})
+    with pytest.raises(ValueError, match=variable):
+        client_cls(base_url=_ORIGIN, verify=verify)
+
+
+@pytest.mark.parametrize("client_cls", [httpx.Client, httpx.AsyncClient], ids=["sync", "async"])
+def test_unwrappable_transport_refuses_construction_6537(client_cls: type) -> None:
+    context = ssl.create_default_context()
+    kwargs = build_httpx_kwargs(
+        base_url=_ORIGIN,
+        api_key=_API_KEY,
+        agent_id=None,
+        timeout=1.0,
+        verify=context,
+        cert=None,
+        extra_headers=None,
+        is_async=client_cls is httpx.AsyncClient,
+    )
+    client = client_cls(**kwargs)
+    inner = client._transport  # noqa: SLF001
+    client._mounts[httpx.URL("https://other.invalid")] = object()  # type: ignore[index]  # noqa: SLF001
+    with pytest.raises(ValueError, match="#6537"):
+        _common.gate_transports(client, kwargs, context)
+    assert client._transport is inner  # noqa: SLF001 - never left half-wrapped
 
 
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
