@@ -10,7 +10,8 @@ Row 0 is the control: the unmutated guard must be GREEN. Rows 1.. are every
 refusal call neutralised in turn (``x.bad(...)``) and every CONDITION_MUTANTS
 entry. A mutant is RED when ``--self-test`` fails with a named case
 (``self-test FAIL: '<name>'`` on stderr); the first named case is the killer.
-A mutant that fails without naming a case, or whose anchor is not found exactly
+A mutant that crashes the guard with a traceback is RED too (killer "crash: <error>").
+A mutant that fails without naming a case or a traceback, or whose anchor is not found exactly
 once, is an OTHER-DEFECT. A survivor is SURVIVES unless it is listed in
 EQUIVALENT_MUTANTS below, where it prints EQUIVALENT (and is RED if killed).
 
@@ -70,7 +71,7 @@ EXTRA_MUTANTS = (
     ),
 )
 
-FAIL_RE =re.compile(r"self-test FAIL:[^'\n]*'([^']*)'")
+FAIL_RE = re.compile(r"self-test FAIL:[^'\n]*'([^']*)'")
 
 
 def run_guard(path, root, tmpdir):
@@ -93,6 +94,8 @@ def classify(rc, err, equivalent):
     m = re.search(r"self-test FAIL: ([^\n]{1,80})", err)
     if m:  # a named check that is not a table case (for example a helper of the guard)
         return "RED", m.group(1)
+    if "Traceback (most recent call last)" in err:  # the mutant made the guard crash: detected, killed by a crash
+        return "RED", "crash: " + err.strip().splitlines()[-1][:100]
     return "OTHER-DEFECT", "failed without a named case: " + err.strip().splitlines()[-1][:100] if err.strip() else "failed without output"
 
 
