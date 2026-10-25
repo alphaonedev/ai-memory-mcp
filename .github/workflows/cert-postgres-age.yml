@@ -3,14 +3,14 @@
 # v1.0.0 SELF-HOSTED REWRITE (chore/ci-self-hosted-2x2). This job now runs on
 # `[self-hosted, linux-fed]` and points AI_MEMORY_TEST_POSTGRES_URL /
 # AI_MEMORY_TEST_AGE_URL at the node's ALWAYS-UP native cert tier (pg18.6 +
-# AGE 1.8.0 + pgvector 0.8.6, TLS verify-full, port 5445), read from
+# AGE 1.8.0 + pgvector 0.8.7, TLS verify-full, port 5445), read from
 # $HOME/.ai-memory-ci-fed-url. The former per-PR `docker build`/pull of
 # deploy/docker-1461/Dockerfile.pg-age-vector + `docker run` is REMOVED (the
 # tier it constructed now exists continuously). The cert EVIDENCE is
 # preserved: "Resolve certified stack pins from deploy SSOT" still reads the
 # expected versions from deploy/docker-1461/provision/lib.sh, and "Assert
 # certified stack versions" still HARD-FAILS on ANY drift from the pinned
-# 18.6 / 1.8.0 / 0.8.6 — now measured on the live native tier. The historical
+# 18.6 / 1.8.0 / 0.8.7 — now measured on the live native tier. The historical
 # image-build narrative below is retained for provenance; the mechanics it
 # describes were the GitHub-hosted construction path, not what runs today.
 #
@@ -31,7 +31,7 @@
 # of this job started the STOCK `apache/age:release_PG18_1.7.0` service image
 # unmodified (which ships PostgreSQL 18.1, not 18.4) and installed pgvector
 # UNPINNED (resolves to whatever the pgdg snapshot currently carries, e.g.
-# 0.8.6) — so the docs claiming "the exact triple 18.4/1.7.0/0.8.5 is
+# 0.8.6 at the time) — so the docs claiming "the exact triple 18.4/1.7.0/0.8.5 is
 # CI-asserted in-PR" OVERCLAIMED what this job actually proved. The fix is to
 # make CI run the ACTUAL certified minors rather than weaken the docs: this
 # job now BUILDS the real deploy artifact —
@@ -54,7 +54,7 @@
 #   * PostgreSQL   18.6   (EXPECTED_PG_VERSION=18.6; PG_APT_VERSION=18.6-1.pgdg13+2)
 #   * Apache AGE   1.8.0  (EXPECTED_AGE_VERSION=1.8.0; AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1,
 #                          installed via pgdg apt over base image apache/age:release_PG18_1.7.0)
-#   * pgvector     0.8.6  (PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1)
+#   * pgvector     0.8.7  (PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1)
 #
 # `deploy/docker-1461/Dockerfile.pg-age-vector` bumps the apache/age base
 # image's server to the exact pinned minor via a pgdg `apt --only-upgrade`
@@ -120,7 +120,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   # AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL are NO LONGER hardcoded
   # here — they are read at runtime from the node's $HOME/.ai-memory-ci-fed-url
-  # (the always-up native cert tier: pg18.6 + AGE 1.8.0 + pgvector 0.8.6, TLS
+  # (the always-up native cert tier: pg18.6 + AGE 1.8.0 + pgvector 0.8.7, TLS
   # verify-full, port 5445) by the "Point at the native enterprise-fed tier"
   # step below, which threads them through $GITHUB_ENV to every later step.
 
@@ -133,7 +133,7 @@ jobs:
     # `docker run` container is GONE (the tier the job used to construct now
     # exists continuously); the cert EVIDENCE is unchanged — the "Assert
     # certified stack versions" step still hard-fails on ANY drift from the
-    # SSOT-pinned 18.6 / 1.8.0 / 0.8.6, now read off the live native tier.
+    # SSOT-pinned 18.6 / 1.8.0 / 0.8.7, now read off the live native tier.
     runs-on: [self-hosted, linux-fed]
     # 2026-08-26 rigid-security-controls: never schedule a fork PR onto the
     # self-hosted enterprise-fed node (defence-in-depth behind the Actions
@@ -210,7 +210,7 @@ jobs:
             exit 1
           fi
           # Both the pg and AGE test URLs are the same ephemeral db on the
-          # native tier (a single PG 18.6 + AGE 1.8.0 + pgvector 0.8.6
+          # native tier (a single PG 18.6 + AGE 1.8.0 + pgvector 0.8.7
           # instance). Setting AI_MEMORY_TEST_AGE_URL is what stops the
           # AGE-backed cells from self-skipping — the whole point of the in-PR
           # cert evidence (#2548).
@@ -243,7 +243,7 @@ jobs:
             echo "CERT_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
             echo "CERT_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
             # pg_extension.extversion for pgvector reports the bare semver
-            # (e.g. "0.8.6"), never the pgdg package suffix — strip it here
+            # (e.g. "0.8.7"), never the pgdg package suffix — strip it here
             # once so the assert step below has no literal of its own.
             echo "CERT_EXPECTED_PGVECTOR_VERSION=${PGVECTOR_APT_VERSION%%-*}"
           } >> "$GITHUB_ENV"
