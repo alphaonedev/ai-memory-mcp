@@ -44,13 +44,22 @@ EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
 EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
 # everything from the scheme to the next whitespace is replaced (F34): a userinfo with a `/` or an `@` in it is masked too
 URL_ALL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*")
-# a ``scheme:`` URI form without the slashes (``postgresql:user:pass``): a letter-led scheme, a colon, then a non-space
-SCHEME_FORM = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:\S")
+# a ``head:rest`` form with no slashes (``postgresql:user:pass``, ``1234:pw``, ``usé:pw``): any character that is not a space or a
+# colon, then a colon, then a non-space; the first character is not restricted to an ASCII letter (F40-d)
+SCHEME_FORM = re.compile(r"[^\s:]:\S")
 # a percent escape (``%40``, ``%3A``): an encoding the printer does not understand is a leak the mask will not catch (F39-b)
 PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
-# a credential keyword followed by ``=`` or ``:`` (``password=``, ``pwd=``, ``user=``, ``host=``, ``pass:``), not part of a longer word
+# a credential keyword as a SUBSTRING of an identifier (prefix or suffix allowed: ``PGPASSWORD=``, ``SECRET_KEY=``,
+# ``AWS_SECRET_ACCESS_KEY=``, ``api_key=``, ``DB_PASSWORD_FILE=``), case-insensitive, optionally quoted (``'password':``,
+# ``"pwd"=``), then ``=`` or ``:`` (F40-b).  A false match only costs a positional label.
 CREDENTIAL_KEYWORD = re.compile(
-    r"(?<![A-Za-z0-9])(?:password|passwd|pass|pwd|user|username|uid|host|hostname|secret|token|dsn)\s*[=:]", re.IGNORECASE)
+    r"(?:password|passwd|pass|pwd|user|uid|host|secret|token|dsn|credential|auth|api[_-]?key|access[_-]?key)"
+    r"[A-Za-z0-9_.-]*[\'\"]*\s*[=:]", re.IGNORECASE)
+# a character of one of these Unicode categories (format, control, surrogate, private use, unassigned; Cf holds the zero-width
+# characters and U+00AD) is never printed and never reaches the predicate (F40-c)
+UNSAFE_CATEGORIES = frozenset(("Cf", "Cc", "Cs", "Co", "Cn"))
+# the input bound of ``printable``: a longer value falls back before any decode or pattern runs (F40-e)
+PRINTABLE_MAX_CHARS = 256
 DELIMITERS = frozenset("@:/=%")
 DECODE_PASSES = 3
 # the second-layer line mask (F36): every ``scheme://`` token up to the next whitespace is replaced, with no look-ahead that
@@ -112,7 +121,7 @@ def fold(value):
     credential delimiter that arrives fullwidth, percent-encoded or encoded twice reads as the ASCII delimiter (F39-b)."""
     text = unicodedata.normalize("NFKC", value)
     for _ in range(DECODE_PASSES):
-        decoded = unicodedata.normalize("NFKC", urllib.parse.unquote(text))
+        decoded = unicodedata.normalize("NFKC", urllib.parse.unquote_plus(text))
         if decoded == text:
             break
         text = decoded
@@ -132,14 +141,21 @@ def printable(value, fallback):
     ``@``, or an ``@`` that a later ``scheme://`` token would swallow from a mask), so none of its text is printed.  The
     test runs on the raw value and on its ``fold`` (NFKC, bounded percent-decode), and any percent escape, any non-ASCII
     character that folds to a delimiter, and any credential keyword followed by ``=`` or ``:`` is also a reason to fall
-    back (F39-b).  The mask runs afterwards as a second layer for a value that never carried those tokens, and the cut to
-    60 characters comes last (F33)."""
-    joined = " ".join(str(value).split())
+    back (F39-b).  The input is bounded first: a value longer than ``PRINTABLE_MAX_CHARS`` falls back before any decode or
+    pattern runs (F40-e), and any format, control, surrogate, private-use or unassigned character falls back before the
+    predicate (F40-c).  A ``+`` is read as whitespace too (form encoding, F40-b).  The mask runs afterwards as a second
+    layer for a value that never carried those tokens, and the cut to 60 characters comes last (F33)."""
+    raw = str(value)
+    if len(raw) > PRINTABLE_MAX_CHARS:
+        return fallback
+    joined = " ".join(raw.split())
+    if any(unicodedata.category(ch) in UNSAFE_CATEGORIES for ch in joined):
+        return fallback
     if PERCENT_ESCAPE.search(joined):
         return fallback
     if any(ord(ch) > 127 and DELIMITERS & set(unicodedata.normalize("NFKC", ch)) for ch in joined):
         return fallback
-    if carries_credential_form(joined) or carries_credential_form(fold(joined)):
+    if any(carries_credential_form(text) for text in (joined, joined.replace("+", " "), fold(joined))):
         return fallback
     return URL_ALL.sub(r"\1***", joined)[:60]
 

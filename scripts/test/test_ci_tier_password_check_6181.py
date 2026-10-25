@@ -51,13 +51,17 @@ Needs PyYAML (``python3 -m pip install --require-hashes --no-deps -r scripts/tes
 module is an import error of this module, never a skip.
 """
 
+import ast
+import contextlib
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -279,6 +283,17 @@ HEADER = "      - name: Configure enterprise-fed tier (per-job ephemeral db, ent
 def sub_once(text, old, new):
     assert text.count(old) == 1, f"ci.yml no longer holds exactly one copy of the {len(old)}-character mutated text"
     return text.replace(old, new, 1)
+
+
+def assert_same(case, left, right, label):
+    """Compare two raw workflow or pin values and report only ``label`` (F40-a): ``assertEqual`` prints both operands when
+    it fails, and an operand taken from an author's workflow or from the pin data may hold a credential fragment."""
+    case.assertTrue(left == right, "differs: " + label)
+
+
+def assert_has(case, member, container, label):
+    """``member in container`` for raw workflow data, reporting only ``label`` (F40-a)."""
+    case.assertTrue(member in container, "missing: " + label)
 
 
 class TestTierPasswordWiring6181(unittest.TestCase):
@@ -1386,14 +1401,16 @@ class TestExportJobIsPinned8187(unittest.TestCase):
         self.assertGreater(seen["workflow-level"], 0)
 
     def test_the_pin_table_holds_exactly_the_jobs_that_name_the_tier(self):
-        self.assertEqual(sorted(self.pins[SECONDARY]), sorted(PIN_WORKFLOWS))
+        assert_same(self, sorted(self.pins[SECONDARY]), sorted(PIN_WORKFLOWS), "secondary pin workflow set")
         for wf, text in self.texts.items():
             jobs, problems = job_layout(text)
             self.assertEqual(problems, [])
-            self.assertEqual(self.pins[SECONDARY][wf]["jobs"], [j[0] for j in jobs])
+            assert_same(self, self.pins[SECONDARY][wf]["jobs"], [j[0] for j in jobs], f"{wf} pinned job list")
             for name, block in tier_blocks(jobs):
-                self.assertEqual(self.pins[SECONDARY][wf]["pinned"][name], pin_entry(block), f"{wf}:{name}")
-            self.assertEqual(sorted(self.pins[SECONDARY][wf]["pinned"]), sorted(n for n, _ in tier_blocks(jobs)))
+                label = ty.name_label(name, self.pins[SECONDARY][wf]["pinned"])
+                assert_same(self, self.pins[SECONDARY][wf]["pinned"][name], pin_entry(block), f"{wf} pin of {label}")
+            assert_same(self, sorted(self.pins[SECONDARY][wf]["pinned"]), sorted(n for n, _ in tier_blocks(jobs)),
+                        f"{wf} pinned job set")
 
     def test_every_dump_form_after_the_export_fails_the_pin(self):
         forms = {**DUMP_MUTANTS, **F10_MUTANTS}
@@ -1623,7 +1640,7 @@ class TestStrictLoaderPins8187(unittest.TestCase):
                 self.assertEqual(problems, [])
                 self.assertEqual(primary_pin_problems(wf, text, self.pins[PRIMARY]), [])
                 self.assertEqual(tier_pin_problems(wf, text, self.pins), [])
-                self.assertEqual(self.pins[PRIMARY][wf], ty.build_pins(data))
+                assert_same(self, self.pins[PRIMARY][wf], ty.build_pins(data), f"{wf} primary pin")
         self.assertEqual(repo_problems(ROOT, self.pins), [])
 
     def test_the_loader_refuses_duplicate_keys_after_normalisation(self):
@@ -1667,8 +1684,8 @@ class TestStrictLoaderPins8187(unittest.TestCase):
     def test_on_is_read_as_a_string_and_the_top_level_key_set_is_closed(self):
         data, problems = ty.parse_workflow("name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n")
         self.assertEqual(problems, [])
-        self.assertIn("on", data)
-        self.assertNotIn(True, data)
+        assert_has(self, "on", data, "the loaded workflow keeps the string key on")
+        self.assertTrue(True not in data, "the loaded workflow has no boolean key")
         for key in ("x-anchors", "extra", "Jobs", "env2"):
             with self.subTest(key=key):
                 text = f"name: x\non: push\n{key}: 1\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n"
@@ -1969,9 +1986,11 @@ class TestStrictLoaderPins8187(unittest.TestCase):
     def test_the_exempt_pin_section_carries_the_workflow_keys_8187_f21(self):
         entry = self.pins[EXEMPT]["session-boot-lifetime.yml"]
         data, _ = ty.parse_workflow((WORKFLOWS / "session-boot-lifetime.yml").read_text(encoding="utf-8"))
-        self.assertEqual(sorted(entry["workflow_keys"]), sorted(k for k in data if k != "jobs"))
-        self.assertEqual(entry["workflow_keys"], ty.build_pins(data)["workflow_keys"])
-        self.assertEqual(sorted(entry["jobs"]), ["lifetime-tests"])
+        assert_same(self, sorted(entry["workflow_keys"]), sorted(k for k in data if k != "jobs"),
+                    "session-boot-lifetime.yml workflow key list")
+        assert_same(self, entry["workflow_keys"], ty.build_pins(data)["workflow_keys"],
+                    "session-boot-lifetime.yml workflow key pin")
+        assert_same(self, sorted(entry["jobs"]), ["lifetime-tests"], "session-boot-lifetime.yml exempt job set")
 
     def test_the_pin_loader_and_module_docstrings_name_every_section_8187_f23(self):
         keys = json.loads(JOB_PINS_FILE.read_text(encoding="utf-8")).keys()
@@ -2012,13 +2031,14 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         for wf, text in self.texts.items():
             data, _ = ty.parse_workflow(text)
             entry = self.pins[PRIMARY][wf]
-            self.assertEqual(entry["job_names"], sorted(data["jobs"]))
-            self.assertEqual(sorted(entry["tier_jobs"]), ty.tier_job_names(data))
-            self.assertEqual(sorted(entry["workflow_keys"]), sorted(k for k in data if k != "jobs"))
+            assert_same(self, entry["job_names"], sorted(data["jobs"]), f"{wf} job name list")
+            assert_same(self, sorted(entry["tier_jobs"]), ty.tier_job_names(data), f"{wf} tier job list")
+            assert_same(self, sorted(entry["workflow_keys"]), sorted(k for k in data if k != "jobs"),
+                        f"{wf} workflow key list")
             self.assertTrue(entry["tier_jobs"])
             for name, pinned in entry["tier_jobs"].items():
                 self.assertEqual(len(pinned["steps"]), len(data["jobs"][name]["steps"]))
-        self.assertEqual(sorted(self.pins[PRIMARY]), sorted(PIN_WORKFLOWS))
+        assert_same(self, sorted(self.pins[PRIMARY]), sorted(PIN_WORKFLOWS), "primary pin workflow set")
 
     def test_the_failure_message_names_workflow_job_step_and_first_differing_key_path_8187_f17(self):
         wf = "cert-postgres-age.yml"
@@ -2066,7 +2086,8 @@ class TestStrictLoaderPins8187(unittest.TestCase):
     def test_the_pin_data_file_is_regenerated_byte_identically(self):
         built = json.dumps({PRIMARY: {wf: ty.build_pins(ty.parse_workflow(t)[0]) for wf, t in self.texts.items()},
                             SECONDARY: self.pins[SECONDARY], EXEMPT: exempt_pins()}, indent=1, sort_keys=True) + "\n"
-        self.assertEqual(JOB_PINS_FILE.read_text(encoding="utf-8"), built, "run --write-pins and commit the data file")
+        assert_same(self, JOB_PINS_FILE.read_text(encoding="utf-8"), built,
+                    "the pin data file differs from the regeneration: run --write-pins and commit the data file")
         outputs = []
         for number in range(2):
             out = SCRATCH_ROOT / f"pins-{number}.json"
@@ -2074,8 +2095,8 @@ class TestStrictLoaderPins8187(unittest.TestCase):
                                     capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr[-300:])
             outputs.append(out.read_bytes())
-        self.assertEqual(outputs[0], outputs[1])
-        self.assertEqual(outputs[0], JOB_PINS_FILE.read_bytes())
+        assert_same(self, outputs[0], outputs[1], "two regenerations of the pin data differ")
+        assert_same(self, outputs[0], JOB_PINS_FILE.read_bytes(), "the regenerated pin data differs from the data file")
 
     # --- the dependency and the CI job ----------------------------------------------------------------------
 
@@ -2845,6 +2866,23 @@ def r21_shapes(kind, user, sentinel):
         "star slash": f"https://***/{sentinel}@dbhost/db",
         "postgresql": f"postgresql:{user}:{sentinel}@dbhost",
     }
+    if kind == "r22":
+        zw, shy = "​", "­"
+        return {**common,
+                "libpq PGPASSWORD": f"PGPASSWORD={sentinel} psql",
+                "SECRET_KEY": f"SECRET_KEY={sentinel}",
+                "AWS_SECRET_ACCESS_KEY": f"AWS_SECRET_ACCESS_KEY={sentinel}",
+                "api_key": f"api_key={sentinel}",
+                "PGUSER and PGPASSWORD": f"PGUSER={user} PGPASSWORD={sentinel}",
+                "form-encoded plus": f"password+=+{sentinel}",
+                "quoted keyword": f"'password': '{sentinel}'",
+                "quoted keyword equals": f"'pwd'={sentinel}",
+                "zero width in keyword": f"pass{zw}word={sentinel}",
+                "soft hyphen in keyword": f"pass{shy}word={sentinel}",
+                "zwj before colon": f"{user}‍:{sentinel}",
+                "digit first userinfo": f"1234:{sentinel}",
+                "non-ASCII first userinfo": f"usé:{sentinel}",
+                "underscore first userinfo": f"_u:{sentinel}"}
     if kind == "scheme":
         return {**common,
                 "scheme user pass no slashes": f"postgresql:{user}:{sentinel}/dbhost/db",
@@ -2910,7 +2948,7 @@ class TestBareSchemeFormsFallBack8187R21(TestEncodedAndKeywordFormsFallBack8187R
     SENTINEL = "SENTINEL-F39C-pw"
 
     def test_the_bare_scheme_arm_alone_falls_back_8187_f39c(self):
-        for value in ("postgresql:f39cuser:SENTINEL-F39C-pw", "scheme:SENTINEL-F39C-pw", "redis:x"):
+        for value in ("postgresql:f39cname:SENTINEL-F39C-pw", "scheme:SENTINEL-F39C-pw", "redis:x"):
             with self.subTest(value=value):
                 self.assertFalse(ty.PERCENT_ESCAPE.search(value) or ty.CREDENTIAL_KEYWORD.search(value), value)
                 self.assertTrue(ty.SCHEME_FORM.search(value))
@@ -2948,6 +2986,142 @@ class TestPinSourcedBareSchemeFormsFallBack8187R21(TestPinSourcedEncodedFormsFal
     KIND = "scheme"
     USER = "f39cuser"
     SENTINEL = "SENTINEL-F39C-pw"
+
+
+class TestKeywordSubstringFormatAndSchemeShapesFallBack8187R22(TestBareSchemeFormsFallBack8187R21):
+    """r22 (security F40-b, F40-c, F40-d / code F40a): every author-sourced site, both views, with the libpq and ``*_KEY``
+    keyword forms, the form-encoded plus, the quoted keyword, the zero-width and soft-hyphen characters and the digit-,
+    underscore- and non-ASCII-first userinfo."""
+
+    KIND = "r22"
+    USER = "f40user"
+    SENTINEL = "SENTINEL-F40-pw"
+
+
+class TestPinSourcedKeywordFormatAndSchemeShapesFallBack8187R22(TestPinSourcedBareSchemeFormsFallBack8187R21):
+    """r22 (security F40-b, F40-c, F40-d / code F40a) on the pin-sourced sites, including the :838 workflow-level block key."""
+
+    KIND = "r22"
+    USER = "f40user"
+    SENTINEL = "SENTINEL-F40-pw"
+
+
+RAW_OPERAND = re.compile(r"\bentry\b|\bdata\b|\bpinned\b|\boutputs\b|read_text|read_bytes|JOB_PINS_FILE|build_pins|"
+                         r"self\.pins\b|\.texts\b|workflow_keys|job_names|tier_jobs")
+COMPARE_FAMILY = frozenset(("assertEqual", "assertNotEqual", "assertIn", "assertNotIn", "assertCountEqual",
+                            "assertListEqual", "assertDictEqual", "assertSequenceEqual"))
+
+
+def raw_operand_comparisons(source):
+    """The line numbers of the ``assertEqual`` family calls in ``source`` whose first two operands are raw workflow or pin
+    data (F40-a).  A failing call prints both operands, so only a comparison with ``[]`` (a list of already labelled
+    problem lines) or a ``len(...)`` operand is exempt; everything else goes through ``assert_same`` / ``assert_has``."""
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in COMPARE_FAMILY):
+            continue
+        operands = node.args[:2]
+        if any(isinstance(arg, ast.List) and not arg.elts for arg in operands):
+            continue
+        exempt = lambda arg: isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "len"
+        if any(RAW_OPERAND.search(ast.get_source_segment(source, arg) or "") for arg in operands if not exempt(arg)):
+            lines.append(node.lineno)
+    return lines
+
+
+class TestNoRawWorkflowOperandIsCompared8187R22(unittest.TestCase):
+    """r22 F40-a (code F40a companion): a failing ``assertEqual`` prints both operands, so a comparison of raw author or pin
+    text would echo it.  The allowed set is pinned to zero in both files."""
+
+    ALLOWED = 0
+
+    def test_neither_file_compares_raw_workflow_or_pin_text_with_assertEqual_8187_f40a(self):
+        for path in (Path(__file__), Path(ty.__file__)):
+            with self.subTest(file=path.name):
+                found = raw_operand_comparisons(path.read_text(encoding="utf-8"))
+                self.assertEqual(len(found), self.ALLOWED, f"{len(found)} raw comparisons at lines {found}")
+
+    def test_the_scanner_counts_a_restored_raw_comparison_8187_f40a(self):
+        raw = 'class T:\n    def t(self):\n        self.assertEqual(entry["job_names"], sorted(data["jobs"]))\n'
+        self.assertEqual(raw_operand_comparisons(raw), [3])
+        mixed = "self.assertIn('on', data)\nself.assertEqual(f(data), [])\n"
+        self.assertEqual(raw_operand_comparisons(mixed), [1])
+        exempt = "self.assertEqual(len(data), 3)\nassert_same(self, data, 1, 'x')\n"
+        self.assertEqual(raw_operand_comparisons(exempt), [])
+
+
+class TestPrintableBoundsAndWholeValue8187R22(unittest.TestCase):
+    """r22: the input bound (F40-e), the Unicode categories (F40-c), the keyword substring (F40-b), the bare form (F40-d)
+    and the whole-value join of F37 (code F40b) pinned one arm at a time."""
+
+    def test_each_keyword_form_falls_back_alone_8187_f40b(self):
+        for value in ("PGPASSWORD=x", "export PGPASSWORD=x", "PGUSER=x", "SECRET_KEY=x", "AWS_SECRET_ACCESS_KEY=x",
+                      "api_key=x", "API-KEY: x", "DB_PASSWORD_FILE=x", "passwd=x", "pwd=x", "token=x", "my_token : x",
+                      "secret=x", "credential=x", "auth=x", "Authorization: x", "'password': x", '"pwd"=x',
+                      "'secret' : x", "password+=+x", "password + = x", "password+:x"):
+            with self.subTest(value_class=len(value)):
+                self.assertEqual(ty.printable(value, "key[1]"), "key[1]")
+
+    def test_a_format_control_or_unassigned_character_falls_back_8187_f40c(self):
+        for ch in ("\u200b", "\u200c", "\u200d", "\u2060", "\u00ad", "\ufeff", "\u202e", "\x01", "\x7f", "\ue000",
+                   "\ud800", "\u0378"):
+            for value in (f"pass{ch}word=x", f"abc{ch}def", f"a{ch}:b", ch):
+                with self.subTest(category=ty.unicodedata.category(ch), shape=len(value)):
+                    self.assertEqual(ty.printable(value, "key[2]"), "key[2]")
+
+    def test_a_bare_colon_form_with_any_first_character_falls_back_8187_f40d(self):
+        for value in ("1234:pw", "us\u00e9:pw", "_u:pw", "-u:pw", "\u65e5\u672c:pw", "9:9", "a:b"):
+            with self.subTest(value_class=len(value)):
+                self.assertEqual(ty.printable(value, "key[3]"), "key[3]")
+        for value in ("Run the unit tests", "Build 100 crates", "Resume build", "passphrase check", "plus + minus"):
+            with self.subTest(printed=value):
+                self.assertEqual(ty.printable(value, "key[3]"), value)
+
+    def test_the_input_bound_falls_back_before_any_pattern_runs_8187_f40e(self):
+        self.assertEqual(ty.PRINTABLE_MAX_CHARS, 256)
+        self.assertEqual(ty.printable("a" * 60, "key[4]"), "a" * 60)
+        self.assertEqual(ty.printable("a" * ty.PRINTABLE_MAX_CHARS, "key[4]"), "a" * 60)
+        self.assertEqual(ty.printable("a" * (ty.PRINTABLE_MAX_CHARS + 1), "key[4]"), "key[4]")
+        for value in ("a" * 2**20, "ab+." * 2**18, "a" * 2**20 + "://", "\ufdfa" * 2**19):
+            out, err = io.StringIO(), io.StringIO()
+            started = time.perf_counter()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                label = ty.printable(value, "key[4]")
+            elapsed = time.perf_counter() - started
+            with self.subTest(length=len(value)):
+                self.assertEqual(label, "key[4]")
+                self.assertLess(elapsed, 0.5)
+                self.assertEqual(out.getvalue() + err.getvalue(), "")
+
+    def test_the_whole_value_is_joined_before_the_decision_8187_code_f40b(self):
+        """A credential on line 2 or later decides the label exactly as one on line 1 does (F37 join)."""
+        for value in ("harmless first line\nPGPASSWORD=x", "ok\nhttps://u:x@h/db", "ok\n\n\tuser:x", "a\r\nb\tc\nhttp x@y",
+                      "one\ntwo\nthree\npassword =\nx", "first\n1234:x", "first\n  'pwd': x"):
+            with self.subTest(value_class=len(value)):
+                self.assertEqual(ty.printable(value, "key[5]"), "key[5]")
+        self.assertEqual(ty.printable("line one\nline  two", "key[5]"), "line one line two")
+
+    def test_a_multi_line_step_name_prints_no_later_line_in_both_views_8187_code_f40b(self):
+        texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+        pins = load_job_pins()
+        sentinel, checked = "SENTINEL-F40B-pw", 0
+        for wf, text in texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            for variant, name in {"later line keyword": f"clean first line\nPGPASSWORD={sentinel}",
+                                  "later line url": f"clean\nhttps://u:{sentinel}@dbhost/db",
+                                  "later line bare": f"clean\n\n1234:{sentinel}"}.items():
+                edited = splice(text, target[3], [f"      - name: {json.dumps(name)}", "        run: echo one"])
+                self.assertIn(sentinel, json.dumps(ty.load_strict(edited)))
+                views = {"loaded": tier_pin_problems(wf, edited, pins),
+                         "text": job_pin_problems(wf, edited, pins[SECONDARY])}
+                for view, problems in views.items():
+                    with self.subTest(workflow=wf, shape=variant, view=view):
+                        checked += 1
+                        self.assertTrue(problems)
+                        self.assertEqual([p for p in problems if sentinel in p or "dbhost" in p or "clean" in p], [])
+        self.assertEqual(checked, 3 * 3 * 2)
 
 
 if __name__ == "__main__":
