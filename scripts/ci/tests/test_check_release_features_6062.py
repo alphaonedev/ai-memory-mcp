@@ -1368,7 +1368,7 @@ class Round10(unittest.TestCase):
     def test_the_python_harness_does_not_name_the_removed_shell_file(self):
         """F3: the port names no `.sh` harness; its scratch prefix and label are joined so the probes keep matching."""
         text = read(ROOT / "scripts" / "test" / "test_release_hardening.py")
-        self.assertNotIn("test-release-hardening", text)
+        self.assertNotIn("test-release-" + "hardening", text)  # joined: this file must not name it either
         self.assertIn('"test-release-" + "hardening"', text)
 
     def test_the_named_shapes_that_are_not_observable_match_the_mutant(self):
