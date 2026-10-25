@@ -39,7 +39,19 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 HELPER = REPO / "scripts" / "ci" / "shared_cargo_target.py"
-SCRATCH = REPO / ".local-runs" / "per-runner-7188"
+SCRATCH_PARENT = REPO / ".local-runs"
+SCRATCH = None  # per-run mkdtemp dir, set by setUpModule (#8024)
+
+
+def setUpModule():
+    global SCRATCH
+    SCRATCH_PARENT.mkdir(parents=True, exist_ok=True)
+    SCRATCH = Path(tempfile.mkdtemp(prefix="per-runner-7188-", dir=str(SCRATCH_PARENT)))
+
+
+def tearDownModule():
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
 CARGO_SLOT_ENV = "AI_MEMORY_CARGO_SLOT"
 EXIT_OK = 0
 EXIT_USAGE = 2

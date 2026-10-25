@@ -8,6 +8,7 @@ the system temp directory).
 import json
 import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -17,7 +18,18 @@ sys.path.insert(0, str(HERE.parent))
 import partition_test_binaries as pt  # noqa: E402
 
 REPO = HERE.parents[2]
-SCRATCH = REPO / '.local-runs' / 'partition-unittests'
+SCRATCH_PARENT = REPO / '.local-runs'
+SCRATCH = None  # per-run mkdtemp dir, set by setUpModule (#8024)
+
+
+def setUpModule():
+    global SCRATCH
+    SCRATCH_PARENT.mkdir(parents=True, exist_ok=True)
+    SCRATCH = Path(tempfile.mkdtemp(prefix='partition-unittests-', dir=str(SCRATCH_PARENT)))
+
+
+def tearDownModule():
+    shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
 def artifact(kind, name, src, executable=None, test=True):
