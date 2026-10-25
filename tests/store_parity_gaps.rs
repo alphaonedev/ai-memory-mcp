@@ -1098,16 +1098,19 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
         // Sqlite reference still runs to pin the contract shape.
         verify_gap_1_version_sqlite();
 
         // Postgres-side: seed a row, drive the version gate.
         let ctx = ai_memory::store::CallerContext::for_agent("parity-test");
-        let mem = sample_memory("pg-g1");
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+        let mem = sample_memory(&format!("pg-g1-{run}"));
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
+            .await
+            .expect("seed store");
 
         let patch = ai_memory::store::UpdatePatch {
-            title: Some("v2".to_string()),
+            title: Some(format!("v2-{run}")),
             ..ai_memory::store::UpdatePatch::default()
         };
         // #1628 — the inherent helper now takes a CallerContext and
@@ -1203,6 +1206,7 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
         // Sqlite reference still runs to pin the contract shape.
         verify_gap_1725_in_place_archive_sqlite();
 
@@ -1210,9 +1214,11 @@ mod postgres_side {
         // caller-owns gate via the admin/bypass context (same idiom as
         // `pg_parity_gap_1_version`).
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test");
-        let mut mem = sample_memory("pg-g1725");
+        let mut mem = sample_memory(&format!("pg-g1725-{run}"));
         mem.content = "content-v1".to_string();
-        let _ = ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem).await;
+        ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem)
+            .await
+            .expect("seed store");
 
         // Edit 1: content v1 → v2. Archives v1 under 'in_place_edit'.
         let p1 = ai_memory::store::UpdatePatch {
@@ -1264,9 +1270,11 @@ mod postgres_side {
         );
 
         // Non-content edit (priority only) archives NOTHING.
-        let mut mem2 = sample_memory("pg-g1725-b");
+        let mut mem2 = sample_memory(&format!("pg-g1725-b-{run}"));
         mem2.content = "stable content".to_string();
-        let _ = ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem2).await;
+        ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem2)
+            .await
+            .expect("seed store");
         let p3 = ai_memory::store::UpdatePatch {
             priority: Some(9),
             ..ai_memory::store::UpdatePatch::default()
@@ -1307,7 +1315,9 @@ mod postgres_side {
         let mut mem = sample_memory(&format!("pg-g2221-{run}"));
         mem.content = "content-v1".to_string();
         mem.metadata = serde_json::json!({ "agent_id": "parity-test" });
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
+            .await
+            .expect("seed store");
 
         // Precondition: an in-place content edit snapshots content-v1 into
         // archived_memories under archive_reason='in_place_edit' (SAME id,
@@ -1406,7 +1416,9 @@ mod postgres_side {
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-1728");
         let run = uuid::Uuid::new_v4().simple().to_string();
         let mem = sample_memory(&format!("pg-1728-env-{run}"));
-        let _ = MemoryStore::store(&pg, &admin_ctx, &mem).await;
+        MemoryStore::store(&pg, &admin_ctx, &mem)
+            .await
+            .expect("seed store");
 
         // Stamp a known ciphertext envelope onto the live row.
         let envelope: Vec<u8> = vec![2, 7, 7, 7, 42, 99, 1, 0, 255, 16];
@@ -1475,8 +1487,8 @@ mod postgres_side {
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
 
-        let agent = "pg-commit-b-on-agent";
         let run = uuid::Uuid::new_v4().simple().to_string();
+        let agent = format!("pg-commit-b-on-agent-{run}");
         let plaintext = "pg sensitive content — #228 Commit B ON";
         let mut mem = sample_memory(&format!("pg-commitb-on-{run}"));
         mem.content = plaintext.to_string();
@@ -1534,7 +1546,7 @@ mod postgres_side {
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
 
-        let agent = "pg-2288-batch-agent";
+        let agent = format!("pg-2288-batch-agent-{}", uuid::Uuid::new_v4().simple());
         let run = uuid::Uuid::new_v4().simple().to_string();
         let plaintext = "pg batch sensitive content — #2288 seal parity";
         let mut mem = sample_memory(&format!("pg-2288-batch-{run}"));
@@ -1663,13 +1675,14 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
         let plaintext = "pg SENSITIVE 2292 store_with_embedding";
         let mut mem = sample_memory(&format!("pg-2292-swe-on-{run}"));
         mem.content = plaintext.to_string();
-        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        mem.metadata = serde_json::json!({ "agent_id": agent });
         let id = MemoryStore::store_with_embedding(&pg, &admin_ctx, &mem, None, None)
             .await
             .expect("store_with_embedding under encryption");
@@ -1683,7 +1696,7 @@ mod postgres_side {
         let off_plain = "pg plaintext-when-off 2292 swe";
         let mut mem_off = sample_memory(&format!("pg-2292-swe-off-{run}"));
         mem_off.content = off_plain.to_string();
-        mem_off.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        mem_off.metadata = serde_json::json!({ "agent_id": agent });
         let off_id = MemoryStore::store_with_embedding(&pg, &admin_ctx, &mem_off, None, None)
             .await
             .expect("store_with_embedding, gate off");
@@ -1718,13 +1731,14 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
         let plaintext = "pg SENSITIVE 2292 apply_remote";
         let mut mem = sample_memory(&format!("pg-2292-remote-on-{run}"));
         mem.content = plaintext.to_string();
-        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        mem.metadata = serde_json::json!({ "agent_id": agent });
         let id = MemoryStore::apply_remote_memory(&pg, &admin_ctx, &mem)
             .await
             .expect("apply_remote_memory under encryption");
@@ -1738,7 +1752,7 @@ mod postgres_side {
         let off_plain = "pg plaintext-when-off 2292 remote";
         let mut mem_off = sample_memory(&format!("pg-2292-remote-off-{run}"));
         mem_off.content = off_plain.to_string();
-        mem_off.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        mem_off.metadata = serde_json::json!({ "agent_id": agent });
         let off_id = MemoryStore::apply_remote_memory(&pg, &admin_ctx, &mem_off)
             .await
             .expect("apply_remote_memory, gate off");
@@ -1779,6 +1793,7 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2303-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
@@ -1789,7 +1804,7 @@ mod postgres_side {
         let plaintext = "pg SENSITIVE 2303 fed-send";
         let mut mem = sample_memory(&format!("pg-2303-fed-send-{run}"));
         mem.content = plaintext.to_string();
-        mem.metadata = serde_json::json!({ "agent_id": "pg-2303-agent" });
+        mem.metadata = serde_json::json!({ "agent_id": agent });
         let id = MemoryStore::store_with_embedding(&pg, &admin_ctx, &mem, None, None)
             .await
             .expect("store under encryption");
@@ -1847,6 +1862,7 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
@@ -1854,10 +1870,10 @@ mod postgres_side {
         let plaintext = "pg SENSITIVE 2292 capture_turn";
         let mut mem = sample_memory(&format!("pg-2292-capture-{run}"));
         mem.content = plaintext.to_string();
-        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        mem.metadata = serde_json::json!({ "agent_id": agent });
         let ev = ai_memory::signed_events::SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
-            agent_id: "pg-2292-agent".to_string(),
+            agent_id: agent.clone(),
             event_type: "l4.capture".to_string(),
             payload_hash: vec![0u8; 32],
             signature: None,
@@ -1900,6 +1916,7 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
@@ -1907,7 +1924,7 @@ mod postgres_side {
         let plaintext = "pg SENSITIVE 2292 recover_turn";
         let mut mem = sample_memory(&format!("pg-2292-recover-{run}"));
         mem.content = plaintext.to_string();
-        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        mem.metadata = serde_json::json!({ "agent_id": agent });
         let norm = uuid::Uuid::new_v4().as_bytes().to_vec();
         let write = ai_memory::models::RecoverTurnWrite {
             memory: mem.clone(),
@@ -1946,6 +1963,7 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
@@ -1954,7 +1972,7 @@ mod postgres_side {
         let mut src = sample_memory(&format!("pg-2292-reflect-src-{run}"));
         src.namespace.clone_from(&ns);
         src.content = "source body".to_string();
-        src.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        src.metadata = serde_json::json!({ "agent_id": agent });
         let src_id = MemoryStore::store(&pg, &admin_ctx, &src)
             .await
             .expect("store reflect source");
@@ -1970,7 +1988,7 @@ mod postgres_side {
             priority: 5,
             confidence: 1.0,
             source: "nhi".to_string(),
-            agent_id: "pg-2292-agent".to_string(),
+            agent_id: agent.clone(),
             metadata: serde_json::json!({}),
         };
         let outcome = pg
@@ -2001,6 +2019,7 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
@@ -2008,7 +2027,7 @@ mod postgres_side {
         let mut src = sample_memory(&format!("pg-2292-consol-src-{run}"));
         src.namespace.clone_from(&ns);
         src.content = "source body".to_string();
-        src.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        src.metadata = serde_json::json!({ "agent_id": agent });
         let src_id = MemoryStore::store(&pg, &admin_ctx, &src)
             .await
             .expect("store consolidate source");
@@ -2023,7 +2042,7 @@ mod postgres_side {
             &ns,
             &ai_memory::models::Tier::Long,
             "test",
-            "pg-2292-agent",
+            &agent,
         )
         .await
         .expect("consolidate under encryption");
@@ -2051,13 +2070,14 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
 
         let mut orig = sample_memory(&format!("pg-2292-supersede-{run}"));
         orig.content = "original body".to_string();
-        orig.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        orig.metadata = serde_json::json!({ "agent_id": agent });
         let old_id = MemoryStore::store(&pg, &admin_ctx, &orig)
             .await
             .expect("store supersede original");
@@ -2101,6 +2121,7 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
@@ -2108,7 +2129,7 @@ mod postgres_side {
         // Seed the existing row (sealed under the gate).
         let mut orig = sample_memory(&format!("pg-2292-merge-{run}"));
         orig.content = "original body".to_string();
-        orig.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        orig.metadata = serde_json::json!({ "agent_id": agent });
         let id = MemoryStore::store(&pg, &admin_ctx, &orig)
             .await
             .expect("store merge original");
@@ -2151,6 +2172,7 @@ mod postgres_side {
         // Drop, so a panic mid-test cannot leak the at-rest gate into a
         // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
         let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
+        let agent = format!("pg-2292-agent-{run}");
         // #3302 — supply an isolated key dir so `seal_content`'s
         // `default_key_dir()` resolves through the shared test-support sandbox.
         let _keys = key_dir_guard();
@@ -2158,7 +2180,7 @@ mod postgres_side {
         // Seed the row with V1 (sealed under the gate).
         let mut orig = sample_memory(&format!("pg-2292-update-{run}"));
         orig.content = "original V1 body".to_string();
-        orig.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        orig.metadata = serde_json::json!({ "agent_id": agent });
         let id = MemoryStore::store(&pg, &admin_ctx, &orig)
             .await
             .expect("store V1");
@@ -2307,16 +2329,16 @@ mod postgres_side {
         // directly (no `ENCRYPT_AT_REST` gate), so it needs an isolated key
         // dir too or `default_key_dir()` fails closed. Hold both.
         let _keys = key_dir_guard();
-        let seal_agent = "pg-commit-b-seal";
-        let wrong_agent = "pg-commit-b-wrong";
-        let kp = get_or_create_keypair(seal_agent).expect("keypair");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let seal_agent = format!("pg-commit-b-seal-{run}");
+        let wrong_agent = format!("pg-commit-b-wrong-{run}");
+        let kp = get_or_create_keypair(&seal_agent).expect("keypair");
         // #3718 — the wrong agent must own a key (a read no longer mints).
-        let _wrong_kp = get_or_create_keypair(wrong_agent).expect("wrong agent's own key");
+        let _wrong_kp = get_or_create_keypair(&wrong_agent).expect("wrong agent's own key");
         let env_bytes = encrypt("pg secret for seal_agent", &kp.public)
             .expect("encrypt")
             .to_bytes();
 
-        let run = uuid::Uuid::new_v4().simple().to_string();
         let mut mem = sample_memory(&format!("pg-commitb-fc-{run}"));
         mem.content = String::new();
         mem.metadata = serde_json::json!({ "agent_id": wrong_agent });
@@ -2352,25 +2374,34 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let uri = format!("uri:pg-fixture/a-{run}");
         verify_gap_2_source_uri_sqlite();
         let ctx = ai_memory::store::CallerContext::for_agent("parity-test");
-        let mut m1 = sample_memory("pg-g2-a");
-        m1.source_uri = Some("uri:pg-fixture/a".to_string());
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m1).await;
-        let mut m2 = sample_memory("pg-g2-b");
-        m2.source_uri = Some("uri:pg-fixture/a".to_string());
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m2).await;
+        let mut m1 = sample_memory(&format!("pg-g2-a-{run}"));
+        m1.source_uri = Some(uri.clone());
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m1)
+            .await
+            .expect("seed store");
+        let mut m2 = sample_memory(&format!("pg-g2-b-{run}"));
+        m2.source_uri = Some(uri.clone());
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m2)
+            .await
+            .expect("seed store");
 
         let hits = pg
-            .list_by_source_uri("uri:pg-fixture/a", None, None)
+            .list_by_source_uri(&uri, None, None)
             .await
             .expect("list_by_source_uri");
-        assert!(
-            hits.len() >= 2,
-            "two seeded memories should match uri:pg-fixture/a"
-        );
+        assert!(hits.len() >= 2, "two seeded memories should match {uri}");
+        for id in [&m1.id, &m2.id] {
+            assert!(
+                hits.iter().any(|m| &m.id == id),
+                "this run's seeded memory {id} must be returned for {uri}"
+            );
+        }
         for m in &hits {
-            assert_eq!(m.source_uri.as_deref(), Some("uri:pg-fixture/a"));
+            assert_eq!(m.source_uri.as_deref(), Some(uri.as_str()));
         }
     }
 
@@ -2383,16 +2414,22 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
         verify_gap_3_recall_observations_sqlite();
         let ctx = ai_memory::store::CallerContext::for_agent("parity-test");
-        let m1 = sample_memory("pg-g3-1");
-        let m2 = sample_memory("pg-g3-2");
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m1).await;
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m2).await;
+        let rid = format!("pg-g3-r1-{run}");
+        let m1 = sample_memory(&format!("pg-g3-1-{run}"));
+        let m2 = sample_memory(&format!("pg-g3-2-{run}"));
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m1)
+            .await
+            .expect("seed store");
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m2)
+            .await
+            .expect("seed store");
 
         let written = pg
             .recall_observation_insert(
-                "pg-g3-r1",
+                &rid,
                 &[
                     (m1.id.clone(), "hybrid".to_string(), 1, 0.9),
                     (m2.id.clone(), "hybrid".to_string(), 2, 0.8),
@@ -2407,7 +2444,7 @@ mod postgres_side {
         // Idempotency: ON CONFLICT DO NOTHING.
         let again = pg
             .recall_observation_insert(
-                "pg-g3-r1",
+                &rid,
                 &[(m1.id.clone(), "hybrid".to_string(), 1, 0.9)],
                 None,
                 None,
@@ -2457,7 +2494,9 @@ mod postgres_side {
         }];
         mem.confidence_source = ai_memory::models::ConfidenceSource::AutoDerived;
         mem.entity_id = Some("ent-g5".to_string());
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
+            .await
+            .expect("seed store");
 
         let patch = ai_memory::store::UpdatePatch {
             content: Some("new content".to_string()),
@@ -2518,18 +2557,30 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let uri_a = format!("uri:pg-doc/a-{run}");
+        let uri_b = format!("uri:pg-doc/b-{run}");
         verify_gap_6_search_source_uri_sqlite();
         let ctx = ai_memory::store::CallerContext::for_agent("parity-test");
-        let mut m1 = sample_memory("pg-g6-a");
-        m1.title = "foo bar".to_string();
+        let mut m1 = sample_memory(&format!("pg-g6-a-{run}"));
+        m1.title = format!("foo bar {run}");
         m1.content = "matching keyword payload".to_string();
-        m1.source_uri = Some("uri:pg-doc/a".to_string());
-        let mut m2 = sample_memory("pg-g6-b");
-        m2.title = "foo baz".to_string();
+        // The pg visibility gate defaults an absent `scope` to private and
+        // keys it on `metadata.agent_id`; own the rows as the searching
+        // caller so the uri-scoped result is non-vacuous (#7754 review r1).
+        m1.metadata = serde_json::json!({ "agent_id": "parity-test" });
+        m1.source_uri = Some(uri_a.clone());
+        let mut m2 = sample_memory(&format!("pg-g6-b-{run}"));
+        m2.title = format!("foo baz {run}");
         m2.content = "matching keyword payload".to_string();
-        m2.source_uri = Some("uri:pg-doc/b".to_string());
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m1).await;
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m2).await;
+        m2.metadata = serde_json::json!({ "agent_id": "parity-test" });
+        m2.source_uri = Some(uri_b.clone());
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m1)
+            .await
+            .expect("seed store");
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m2)
+            .await
+            .expect("seed store");
 
         let filter = {
             let mut __f = ai_memory::store::Filter::new();
@@ -2537,11 +2588,16 @@ mod postgres_side {
             __f
         };
         let scoped = pg
-            .search_with_source_uri(&ctx, "matching", &filter, Some("uri:pg-doc/a"))
+            .search_with_source_uri(&ctx, "matching", &filter, Some(uri_a.as_str()))
             .await
             .expect("search_with_source_uri");
+        assert!(
+            scoped.iter().any(|m| m.id == m1.id),
+            "this run's memory {} must be returned for {uri_a}",
+            m1.id
+        );
         for m in &scoped {
-            assert_eq!(m.source_uri.as_deref(), Some("uri:pg-doc/a"));
+            assert_eq!(m.source_uri.as_deref(), Some(uri_a.as_str()));
         }
     }
 
@@ -2619,13 +2675,14 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
         // #1138: the SAL get path applies is_visible_to_caller (#910);
         // a private-scope row with no owner is invisible to every
         // caller. The test's purpose is verifying the trait `update`
         // bumps version, not visibility, so use for_admin (which sets
         // bypass_visibility = true).
         let ctx = ai_memory::store::CallerContext::for_admin("parity-test-1024");
-        let mem = sample_memory("pg-1024-version");
+        let mem = sample_memory(&format!("pg-1024-version-{run}"));
         ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
             .await
             .expect("store seed");
@@ -2689,21 +2746,30 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
         // #1138: bypass_visibility (via for_admin) so the test observes
         // both alice + bob rows. The test's purpose is verifying that
         // the postgres WHERE clause binds the agent_id filter, NOT the
         // visibility gate.
         let ctx = ai_memory::store::CallerContext::for_admin("parity-test-1110");
-        let mut m1 = sample_memory("pg-1030-alice");
+        let ns = format!("parity-1030-{run}");
+        let mut m1 = sample_memory(&format!("pg-1030-alice-{run}"));
+        m1.namespace.clone_from(&ns);
         m1.metadata = serde_json::json!({"agent_id": "ai:alice"});
-        let mut m2 = sample_memory("pg-1030-bob");
+        let mut m2 = sample_memory(&format!("pg-1030-bob-{run}"));
+        m2.namespace.clone_from(&ns);
         m2.metadata = serde_json::json!({"agent_id": "ai:bob"});
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m1).await;
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m2).await;
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m1)
+            .await
+            .expect("seed store");
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &m2)
+            .await
+            .expect("seed store");
 
         let filter = {
             let mut __f = ai_memory::store::Filter::new();
             __f.agent_id = Some("ai:alice".into());
+            __f.namespace = Some(ns.clone());
             __f.limit = 100;
             __f
         };
@@ -2711,11 +2777,11 @@ mod postgres_side {
             .await
             .expect("list with agent_id filter");
         assert!(
-            hits.iter().any(|m| m.id == "pg-1030-alice"),
+            hits.iter().any(|m| m.id == format!("pg-1030-alice-{run}")),
             "#1030: alice row must be present in agent_id=ai:alice filter result"
         );
         assert!(
-            hits.iter().all(|m| m.id != "pg-1030-bob"),
+            hits.iter().all(|m| m.id != format!("pg-1030-bob-{run}")),
             "#1030: bob row must NOT appear under agent_id=ai:alice filter; \
              postgres WHERE clause must bind the agent_id parameter"
         );
@@ -2748,14 +2814,17 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
         let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1026");
         // Seed an expired short-tier memory by setting expires_at
         // in the past.
         let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        let mut mem = sample_memory("pg-1026-expired");
+        let mut mem = sample_memory(&format!("pg-1026-expired-{run}"));
         mem.tier = ai_memory::models::Tier::Short;
         mem.expires_at = Some(past.clone());
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
+            .await
+            .expect("seed store");
 
         let archived = ai_memory::store::MemoryStore::run_gc(&pg, true)
             .await
@@ -2793,21 +2862,19 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
         let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1776");
-        let mut mem = sample_memory("pg-1776-forget");
-        mem.namespace = "parity-forget-1776".to_string();
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+        let mut mem = sample_memory(&format!("pg-1776-forget-{run}"));
+        let ns = format!("parity-forget-1776-{run}");
+        mem.namespace.clone_from(&ns);
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
+            .await
+            .expect("seed store");
 
-        let deleted = ai_memory::store::MemoryStore::forget(
-            &pg,
-            &ctx,
-            Some("parity-forget-1776"),
-            None,
-            None,
-            true,
-        )
-        .await
-        .expect("forget");
+        let deleted =
+            ai_memory::store::MemoryStore::forget(&pg, &ctx, Some(ns.as_str()), None, None, true)
+                .await
+                .expect("forget");
         assert!(
             deleted >= 1,
             "#1776: forget(archive=true) MUST delete the fixture; got {deleted}"
@@ -2866,28 +2933,35 @@ mod postgres_side {
         const NS: &str = "fortitude/X";
         const ALICE: &str = "ai:alice";
         const BOB: &str = "ai:bob";
-        const NEEDLE: &str = "needle-a7";
 
         let Some(pg) = live_pg().await else {
             return;
         };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let needle = format!("needle-a7-{run}");
 
         // Seed alice's scope=private row + a target_agent_id inbox row
         // (carve-out: alice owns it, bob is the recipient). Use a bypass
         // ctx to seed so the SAL store path applies no visibility filter
         // to the writes; the rows carry explicit owner/scope metadata.
         let seed_ctx = ai_memory::store::CallerContext::for_admin("parity-test-a7");
-        let mut priv_mem = sample_memory("pg-a7-alice-priv");
+        let priv_id = format!("pg-a7-alice-priv-{run}");
+        let inbox_id = format!("pg-a7-inbox-{run}");
+        let mut priv_mem = sample_memory(&priv_id);
         priv_mem.namespace = NS.to_string();
-        priv_mem.content = format!("{NEEDLE} alice private");
+        priv_mem.content = format!("{needle} alice private");
         priv_mem.metadata = serde_json::json!({"agent_id": ALICE, "scope": "private"});
-        let mut inbox_mem = sample_memory("pg-a7-inbox");
+        let mut inbox_mem = sample_memory(&inbox_id);
         inbox_mem.namespace = NS.to_string();
-        inbox_mem.content = format!("{NEEDLE} alice inbox for bob");
+        inbox_mem.content = format!("{needle} alice inbox for bob");
         inbox_mem.metadata =
             serde_json::json!({"agent_id": ALICE, "scope": "private", "target_agent_id": BOB});
-        let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &priv_mem).await;
-        let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &inbox_mem).await;
+        ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &priv_mem)
+            .await
+            .expect("seed store");
+        ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &inbox_mem)
+            .await
+            .expect("seed store");
 
         let filter = {
             let mut __f = ai_memory::store::Filter::new();
@@ -2926,31 +3000,31 @@ mod postgres_side {
              target_agent_id carve-out keys on the seeded inbox recipient"
         );
 
-        let bob_search = ai_memory::store::MemoryStore::search(&pg, &bob_ctx, NEEDLE, &filter)
+        let bob_search = ai_memory::store::MemoryStore::search(&pg, &bob_ctx, &needle, &filter)
             .await
             .expect("bob search");
         assert!(
-            !has(&bob_search, "pg-a7-alice-priv"),
+            !has(&bob_search, &priv_id),
             "#1720 pg LEAK: bob (non-admin) MUST NOT see alice's private row via search; got={:?}",
             bob_search.iter().map(|m| &m.id).collect::<Vec<_>>()
         );
         // Inbox carve-out: bob IS the target_agent_id, so bob DOES see it.
         assert!(
-            has(&bob_search, "pg-a7-inbox"),
+            has(&bob_search, &inbox_id),
             "#1720 pg: target_agent_id carve-out MUST let bob read alice's inbox row via search"
         );
 
         let bob_recall =
-            ai_memory::store::MemoryStore::recall_hybrid(&pg, &bob_ctx, NEEDLE, None, &filter)
+            ai_memory::store::MemoryStore::recall_hybrid(&pg, &bob_ctx, &needle, None, &filter)
                 .await
                 .expect("bob recall_hybrid");
         assert!(
-            !has_scored(&bob_recall, "pg-a7-alice-priv"),
+            !has_scored(&bob_recall, &priv_id),
             "#1720 pg LEAK: bob MUST NOT see alice's private row via recall_hybrid; got={:?}",
             bob_recall.iter().map(|(m, _)| &m.id).collect::<Vec<_>>()
         );
         assert!(
-            has_scored(&bob_recall, "pg-a7-inbox"),
+            has_scored(&bob_recall, &inbox_id),
             "#1720 pg: target_agent_id carve-out MUST let bob read alice's inbox via recall_hybrid"
         );
 
@@ -2961,11 +3035,11 @@ mod postgres_side {
         // value stamped on her seeded private row, not the namespace.
         let mut alice_ctx = ai_memory::store::CallerContext::for_agent(ALICE);
         alice_ctx.as_agent = Some(ALICE.to_string());
-        let alice_search = ai_memory::store::MemoryStore::search(&pg, &alice_ctx, NEEDLE, &filter)
+        let alice_search = ai_memory::store::MemoryStore::search(&pg, &alice_ctx, &needle, &filter)
             .await
             .expect("alice search");
         assert!(
-            has(&alice_search, "pg-a7-alice-priv"),
+            has(&alice_search, &priv_id),
             "#1720 pg: owner alice MUST see her own private row via search"
         );
 
@@ -2979,21 +3053,21 @@ mod postgres_side {
                 admin_ctx.as_agent = Some(NS.to_string());
             }
             let admin_search =
-                ai_memory::store::MemoryStore::search(&pg, &admin_ctx, NEEDLE, &filter)
+                ai_memory::store::MemoryStore::search(&pg, &admin_ctx, &needle, &filter)
                     .await
                     .expect("admin search");
             assert!(
-                has(&admin_search, "pg-a7-alice-priv"),
+                has(&admin_search, &priv_id),
                 "#1720 A7 pg: admin bypass (as_agent={with_as_agent}) MUST trust-all and see \
                  alice's private row via search — parity with sqlite + the pg NULL-caller bypass"
             );
             let admin_recall = ai_memory::store::MemoryStore::recall_hybrid(
-                &pg, &admin_ctx, NEEDLE, None, &filter,
+                &pg, &admin_ctx, &needle, None, &filter,
             )
             .await
             .expect("admin recall_hybrid");
             assert!(
-                has_scored(&admin_recall, "pg-a7-alice-priv"),
+                has_scored(&admin_recall, &priv_id),
                 "#1720 A7 pg: admin bypass (as_agent={with_as_agent}) MUST trust-all and see \
                  alice's private row via recall_hybrid"
             );
