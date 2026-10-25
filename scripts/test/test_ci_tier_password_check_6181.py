@@ -3950,7 +3950,7 @@ def probe_text(fn):
     try:
         out = fn()
         return out if isinstance(out, str) else repr(out)
-    except BaseException as exc:  # noqa: BLE001  (the exception text is a channel under test)
+    except Exception as exc:  # noqa: BLE001  (the exception text is a channel under test)
         return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
