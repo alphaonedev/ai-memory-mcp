@@ -1108,6 +1108,7 @@ JOB_KEY_SETS = {
 }
 JOB_RUNS_ON = "ubuntu-latest"
 JOB_TIMEOUT_MINUTES = {SELECT_JOB: "15", GATE_JOB: "5"}  # code r13 F2: ci.yml:173 and :2770
+JOB_NAMES = {SELECT_JOB: "Impact selection", GATE_JOB: "ci-gate"}  # sec r13 S2
 JOB_PERMISSIONS = None  # neither job sets `permissions`; the workflow-level block applies
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 JOB_KEYS_REFUSED = ("container", "services")
@@ -1178,12 +1179,16 @@ PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
 # MATERIALISE_PATH_ARGS, and the `__main__` guard is the last top-level statement and holds
 # exactly `sys.exit(main())`.
 # The layer does not check runtime values (environment variable contents, the IMPACT_FILES names,
-# fetched blob bytes) or what the allowed local functions do beyond the rules above. The sha256
-# digest stays the primary pin.
+# fetched blob bytes). It DOES pin what the local functions do (sec r13 S1, code r13 F1): the
+# normalised ast.dump of every class and function the heredoc defines is compared with the pinned
+# text MATERIALISE_FUNCTION_PINS, so a runner-conditioned or unconditional edit of a branch, a
+# return or a call in derive_base, rev_parse, materialise, gate_absent, report or main is a
+# problem line naming the function, whatever the sha256 pin says. The sha256 digest stays the
+# primary pin.
 MATERIALISE_ENFORCES = ("call targets", "pinned imports", "no rebinding", "exact argv head",
                         "dash literals", "environment untouched",
                         "unrebound parameter", "exactly one binding",
-                        "read-only environment uses")
+                        "read-only environment uses", "pinned function control flow")
 MATERIALISE_MODULE_ROOTS = {"os", "re", "shutil", "subprocess", "sys", "pathlib"}
 MATERIALISE_IMPORT_STATEMENTS = sorted(["from pathlib import Path", "import os", "import re",
                                         "import shutil", "import subprocess", "import sys"])
@@ -1316,6 +1321,179 @@ MATERIALISE_OPEN_ARGS = sorted(["os.environ['GITHUB_OUTPUT']", "summary"])
 MATERIALISE_PATH_ARGS = sorted(["os.environ['RUNNER_TEMP']"])
 MATERIALISE_GUARD_TEST = "__name__ == '__main__'"
 MATERIALISE_GUARD_BODY = ["sys.exit(main())"]
+# code r13 F1 / sec r13 S1: the text of every class and function of the Materialise heredoc (ci.yml
+# :241-415 of the select job and its twin :2824-2998 of the gate job; the two bodies are byte
+# identical, the sha256 pin is the same). The second layer compares the normalised ast.dump (no
+# attributes, so no line numbers) of the defined name in the checked body with the dump of the text
+# here; comments and blank lines do not count. The set of keys is exactly MATERIALISE_DEFINED_NAMES.
+MATERIALISE_FUNCTION_PINS = {
+    "BaseUnavailable": r'''class BaseUnavailable(Exception):
+    """The base copy cannot be built; the reason is a fixed token."""
+''',
+    "git": r'''def git(*args):
+    # --no-replace-objects and GIT_NO_REPLACE_OBJECTS=1 ignore replace
+    # refs only; grafts, shallow files and alternates are refused by
+    # git_state_refused() before the derivation reads anything.
+    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    try:
+        return subprocess.run(["git", "--no-replace-objects"] + list(args),
+                              capture_output=True, timeout=GIT_TIMEOUT_S,
+                              env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        raise BaseUnavailable("git-failed")
+''',
+    "have_commit": r'''def have_commit(base):
+    return git("cat-file", "-e", base + "^{commit}").returncode == 0
+''',
+    "fetch_blob": r'''def fetch_blob(base, name):
+    path = IMPACT_PREFIX + name
+    tree = git("ls-tree", base, "--", path)
+    if tree.returncode != 0:
+        raise BaseUnavailable("base-read-failed:" + name)
+    fields = tree.stdout.decode("utf-8", "replace").split()
+    if len(fields) < 4:
+        raise BaseUnavailable("base-file-missing:" + name)
+    if fields[1] != "blob" or fields[0] not in REGULAR_MODES:
+        raise BaseUnavailable("base-file-not-regular:" + name)
+    blob = git("show", "%s:%s" % (base, path))
+    if blob.returncode != 0 or not blob.stdout:
+        raise BaseUnavailable("base-read-failed:" + name)
+    return blob.stdout
+''',
+    "rev_parse": r'''def rev_parse(spec):
+    res = git("rev-parse", "--verify", "--quiet", spec)
+    value = res.stdout.decode("utf-8", "replace").strip()
+    return value if res.returncode == 0 and SHA_RE.match(value) else ""
+''',
+    "replace_refs_present": r'''def replace_refs_present():
+    # Any refs/replace entry is unexpected on a fresh checkout: fail
+    # closed. Both the ref namespace and `git replace --list` are read.
+    res = git("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
+    if res.returncode != 0 or res.stdout.strip():
+        return True
+    listed = git("replace", "--list")
+    return listed.returncode != 0 or bool(listed.stdout.strip())
+''',
+    "git_state_refused": r'''def git_state_refused():
+    # Fail closed on every git state the runner can carry into the
+    # derivation. fetch-depth 0 produces a full clone: no shallow file,
+    # no grafts, no alternates (replace refs are read by
+    # replace_refs_present()); any of them, or the env vars that
+    # point git at one, is refused. Only the reason
+    # token is ever reported, never a path or author text.
+    for var in ("GIT_GRAFT_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_OBJECT_DIRECTORY"):
+        if os.environ.get(var):
+            return True
+    for rel in ("info/grafts", "shallow", "objects/info/alternates"):
+        res = git("rev-parse", "--git-path", rel)
+        path = res.stdout.decode("utf-8", "replace").strip()
+        if res.returncode != 0 or not path or os.path.lexists(path):
+            return True
+    return False
+''',
+    "derive_base": r'''def derive_base(env):
+    # The authority: git and the event payload, never a resolver. The
+    # checked-out commit must be exactly the github.sha context value
+    # (the merge ref); a moved HEAD, a replace ref, grafts, a shallow file
+    # or alternates is a mismatch.
+    event = env.get("EVENT_NAME", "")
+    context = env.get("CONTEXT_SHA", "")
+    if event in ("pull_request", "merge_group"):
+        if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:
+            raise BaseUnavailable("base-sha-mismatch")
+        if replace_refs_present() or git_state_refused():
+            raise BaseUnavailable("base-sha-mismatch")
+    if event == "pull_request":
+        head = env.get("HEAD_SHA", "")
+        if not SHA_RE.match(head) or rev_parse(context + "^2^{commit}") != head:
+            raise BaseUnavailable("base-sha-mismatch")
+        parent = rev_parse(context + "^1^{commit}")
+        if not parent:
+            raise BaseUnavailable("base-sha-mismatch")
+        return parent
+    if event == "merge_group":
+        raw = env.get("MERGE_GROUP_BASE_SHA", "")
+        if not SHA_RE.match(raw):
+            raise BaseUnavailable("base-sha-invalid")
+        return raw
+    raise BaseUnavailable("base-event-unsupported")
+''',
+    "gate_absent": r'''def gate_absent(base):
+    # Bootstrap is exactly: the base tree lists no gate.py. A failed
+    # read (bad sha, missing commit, git error) is never bootstrap.
+    try:
+        if not SHA_RE.match(base) or not have_commit(base):
+            return False
+        tree = git("ls-tree", base, "--", IMPACT_PREFIX + "gate.py")
+    except BaseUnavailable:
+        return False
+    return tree.returncode == 0 and not tree.stdout.strip()
+''',
+    "materialise": r'''def materialise(base, dest, names):
+    if not SHA_RE.match(base):
+        raise BaseUnavailable("base-sha-invalid")
+    if not have_commit(base):
+        git("fetch", "--no-tags", "--depth=1", "origin", base)
+        if not have_commit(base):
+            raise BaseUnavailable("base-fetch-failed")
+    if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+        raise BaseUnavailable("dest-unsafe")
+    if dest.exists():
+        shutil.rmtree(str(dest))
+    try:
+        for name in names:
+            blob = fetch_blob(base, name)
+            target = dest / "impact" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob)
+    except OSError:
+        shutil.rmtree(str(dest), ignore_errors=True)
+        raise BaseUnavailable("write-failed")
+    except BaseException:
+        shutil.rmtree(str(dest), ignore_errors=True)
+        raise
+''',
+    "report": r'''def report(ok, reason, bootstrap=False):
+    with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+        handle.write("ok=%s\n" % ("true" if ok else "false"))
+        handle.write("bootstrap=%s\n" % ("true" if bootstrap else "false"))
+        handle.write("reason=%s\n" % reason)
+    if ok:
+        print("impact: selector files loaded from the base sha")
+        return
+    line = "impact: base files unavailable (%s)" % reason
+    if bootstrap:
+        line += "; bootstrap: the base sha has no scripts/ci/impact/gate.py"
+    print(line)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as handle:
+            handle.write(line + "\n")
+''',
+    "main": r'''def main():
+    derived = ""
+    try:
+        dest = Path(os.environ["RUNNER_TEMP"]) / "impact-base"
+        names = os.environ.get("IMPACT_FILES", "").split()
+        if not names:
+            raise BaseUnavailable("no-files-listed")
+        derived = derive_base(os.environ)
+        print("impact: derived base %s from github.sha %s"
+              % (derived, os.environ.get("CONTEXT_SHA", "")))
+        materialise(derived, dest, names)
+    except BaseUnavailable as exc:
+        report(False, str(exc), gate_absent(derived))
+        return 0
+    except (OSError, KeyError):
+        report(False, "environment-unusable")
+        return 0
+    report(True, "")
+    return 0
+''',
+}
+MATERIALISE_FUNCTION_DUMPS = {name: ast.dump(ast.parse(text).body[0])
+                              for name, text in MATERIALISE_FUNCTION_PINS.items()}
 
 
 def _chain(node):
@@ -1471,6 +1649,15 @@ def _name_problems(tree, parents, scope, name, seen=()):
         if not ok:
             return ["%s is not bound only to its pinned assignment and one pinned augmented "
                     "literal" % name]
+        guard = parents.get(augments[0])
+        body = scope.body
+        direct = (isinstance(guard, ast.If) and ast.unparse(guard.test) == "bootstrap"
+                  and not guard.orelse and guard.body == [augments[0]]
+                  and any(a is assigns[0] and i + 1 < len(body) and body[i + 1] is guard
+                          for i, a in enumerate(body)))
+        if not direct:
+            return ["%s augmented literal is not the sole body of `if bootstrap:` directly after "
+                    "its pinned assignment in report()" % name]
         return _value_name_problems("line", tree, parents, assigns[0], assigns[0].value)
     if isinstance(expected, tuple):
         sites = [parents.get(b[2]) for b in local]
@@ -1747,6 +1934,18 @@ def _call_arg_problems(label, tree, parents, node, callee):
             return ["%s: %s outside the enumerated arguments" % (label, kind)]
         return ["%s: call argument is not enumerated for %s" % (label, callee)]
     problems = []
+    if callee == "handle.write" and _call_args_text(node) == "line + '\\n'":
+        stmt = parents.get(node)
+        block = parents.get(stmt)
+        guard = parents.get(block)
+        scope = parents.get(guard)
+        if not (isinstance(stmt, ast.Expr) and isinstance(block, ast.With) and block.body == [stmt]
+                and isinstance(guard, ast.If) and ast.unparse(guard.test) == "summary"
+                and not guard.orelse and guard.body == [block]
+                and isinstance(scope, ast.FunctionDef) and scope.name == "report"
+                and any(a is guard for a in scope.body)):
+            problems.append("%s: summary write is not the sole body of `with open(summary)` under "
+                            "`if summary:` directly in report()" % label)
     if callee in MATERIALISE_OUTPUT_SINKS:
         for arg in node.args:
             problems.extend(_value_name_problems(label, tree, parents, node, arg))
@@ -1801,6 +2000,27 @@ def _git_call_problems(label, node, tree, parents):
     return problems
 
 
+def _function_problems(label, tree):
+    """code r13 F1 / sec r13 S1: every class and function of the heredoc is one of the pinned set,
+    defined once at module level, and its normalised ast.dump equals the pinned one."""
+    problems = []
+    every = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    for node in every:
+        if node.name not in MATERIALISE_FUNCTION_DUMPS:
+            problems.append("%s: function %s is not in the pinned function set" % (label, node.name))
+    for name in sorted(MATERIALISE_FUNCTION_DUMPS):
+        top = [n for n in tree.body if getattr(n, "name", None) == name]
+        total = len([n for n in every if n.name == name])
+        if not top:
+            problems.append("%s: function %s is missing from the pinned function set"
+                            % (label, name))
+        elif len(top) != 1 or total != 1 or ast.dump(top[0]) != MATERIALISE_FUNCTION_DUMPS[name]:
+            problems.append("%s: function %s differs from its pinned normalised ast.dump"
+                            % (label, name))
+    return problems
+
+
 def materialise_allow_list_problems(label, run):
     """Reasons the Materialise body reaches a call target, binding, environment write or argument
     outside the allow-list."""
@@ -1813,6 +2033,7 @@ def materialise_allow_list_problems(label, run):
         return ["%s: heredoc body is not valid python" % label]
     problems = _binding_problems(label, tree)
     problems.extend(_definition_problems(label, tree))
+    problems.extend(_function_problems(label, tree))
     parents = _parents(tree)
     for name, kind, site in _bound_names(tree):
         if kind == "store" and _scope_of(site, parents) is None \
@@ -1973,9 +2194,16 @@ def pre_trust_problems(text):
     if doc.get("permissions") != WORKFLOW_PERMISSIONS:
         problems.append("workflow permissions differ from the pinned mapping")
     jobs = _mapping(doc.get("jobs"), "jobs", problems)
+    for other, other_def in sorted(jobs.items()):
+        if other != GATE_JOB and isinstance(other_def, dict) \
+                and other_def.get("name") == JOB_NAMES[GATE_JOB]:
+            problems.append("job %s carries the gate check name %s" % (other, JOB_NAMES[GATE_JOB]))
     for job in (SELECT_JOB, GATE_JOB):
         allow, marker = WINDOWS[job]
         definition = _mapping(jobs.get(job), "job %s" % job, problems)
+        if definition.get("name") != JOB_NAMES[job]:
+            problems.append("job %s name %r, expected %r"
+                            % (job, definition.get("name"), JOB_NAMES[job]))
         for key in JOB_KEYS_REFUSED:
             if key in definition:
                 problems.append("job %s sets %s" % (job, key))
@@ -3069,6 +3297,9 @@ _R15_WRITE = "step output write outside the enumerated arguments"
 _R15_PARAM = "is not an unrebound parameter without a default"
 _R15_DEFAULT = "is not an unrebound parameter with its pinned default"
 _R15_LINE_RULE = "is not bound only to its pinned assignment and one pinned augmented literal"
+# Regression pins of this table (green at 02c1ac64a, refused there with their needle): the
+# print-argument row r2-print-other-name and r1-report-call-forged-bootstrap (code r13 F5, sec r13
+# S3); the other 16 rows are red-first. R15_REGRESSION_PINS names them and a test asserts it.
 TrustDecisionFirst.R15_SEC_ROWS = (
     ("r1-write-bootstrap-runner-conditioned", _R15_W_BOOT,
      '        handle.write("bootstrap=%s\\n" % ("true" if bootstrap or ' + _R15_RUNNER
@@ -3792,6 +4023,10 @@ class DerivedBase(BaseCase):
 #   WF_FORM_GREEN  8 forms that stay green by design, each with its reason (controls, order
 #                  insensitive sets, a move toward fail closed).
 #   WF_FORM_DOC    1 form that reverts a docstring of this module to the banned wording.
+# Round 16: k8-gate-timeout-value is refused by test_code_r13_f2_both_jobs_timeout_minutes_are_pinned
+# (a failure; failing_tests_on_workflow counts failures only and raises on an error), and
+# k8-select-name-value moved from WF_FORM_GREEN to WF_FORM_RED because the job names are pinned
+# (sec r13 S2), so the counts are 162 / 9 / 8 / 1 (were 161 / 9 / 9 / 1).
 # WF_FORM_SAME_AS names the 18 forms whose mutated text equals the text of a row that already
 # exists in this module; they still run here, and a test asserts the text equality.
 
@@ -4878,7 +5113,9 @@ def failing_tests_on_workflow(text, specs):
             with unittest.mock.patch.object(module, "CI_YML", path):
                 result = unittest.TestResult()
                 unittest.defaultTestLoader.loadTestsFromName(dotted, module).run(result)
-            if not result.wasSuccessful():
+            if result.errors:
+                raise RuntimeError("harness defect: %s errored, which is not a refusal" % dotted)
+            if result.failures:
                 failed.append(dotted)
     return failed
 
