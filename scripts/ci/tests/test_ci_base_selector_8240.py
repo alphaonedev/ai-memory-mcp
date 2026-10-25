@@ -1327,6 +1327,61 @@ class TrustDecisionFirst(unittest.TestCase):
                 self.assertEqual([p for p in materialise_problems(name, run)
                                   if "sha256" not in p], [])
 
+    def mutated(self, job, old, new):
+        """ci.yml text with the first `old` after the `  <job>:` header replaced by `new`."""
+        body = CI_YML.read_text()
+        start = body.index("\n  %s:\n" % job)
+        at = body.index(old, start)
+        return body[:at] + new + body[at + len(old):]
+
+    F2_MUTANTS = (
+        ("select step env value", SELECT_JOB, "CONTEXT_SHA: ${{ github.sha }}",
+         "CONTEXT_SHA: ${{ github.ref }}"),
+        ("gate step env value", GATE_JOB, "IMPACT_FILES: __init__.py common.py gate.py rules.json",
+         "IMPACT_FILES: __init__.py common.py gate.py rules.json extra.py"),
+        ("select mode env value", SELECT_JOB, "ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}",
+         "ENFORCE: ${{ vars.OTHER }}"),
+        ("gate fold env value", GATE_JOB, "GITHUB_REF_NAME_FULL: ${{ github.ref }}",
+         "GITHUB_REF_NAME_FULL: refs/heads/main"),
+        ("select job env value", SELECT_JOB, "RUSTUP_TOOLCHAIN: stable",
+         "RUSTUP_TOOLCHAIN: nightly"),
+        ("select job-level key", SELECT_JOB, "    timeout-minutes: 15\n",
+         "    timeout-minutes: 15\n    continue-on-error: true\n"),
+        ("gate job-level key", GATE_JOB, "    timeout-minutes: 5\n",
+         "    timeout-minutes: 5\n    concurrency: x\n"),
+        ("select runs-on self-hosted", SELECT_JOB, "    runs-on: ubuntu-latest\n",
+         "    runs-on: [self-hosted, linux]\n"),
+        ("gate runs-on self-hosted", GATE_JOB, "    runs-on: ubuntu-latest\n",
+         "    runs-on: self-hosted\n"),
+        ("select job permissions widened", SELECT_JOB, "    timeout-minutes: 15\n",
+         "    timeout-minutes: 15\n    permissions:\n      contents: write\n"),
+        ("gate job permissions widened", GATE_JOB, "    timeout-minutes: 5\n",
+         "    timeout-minutes: 5\n    permissions: write-all\n"),
+    )
+
+    def test_f2_exact_env_values_job_keys_runs_on_and_permissions_are_pinned(self):
+        """sec r8 F2: a changed pre-trust env VALUE, an extra job key, a self-hosted runs-on
+        or a widened permissions block each make the allow-list red."""
+        for label, job, old, new in self.F2_MUTANTS:
+            with self.subTest(mutant=label):
+                self.assertNotEqual(pre_trust_problems(self.mutated(job, old, new)), [])
+
+    def test_f2_workflow_permissions_are_pinned(self):
+        body = CI_YML.read_text()
+        old = "permissions:\n  contents: read\n"
+        self.assertEqual(body.count("\n" + old), 1)
+        widened = body.replace("\n" + old, "\npermissions:\n  contents: write\n")
+        self.assertNotEqual(pre_trust_problems(widened), [])
+
+    BANNED_PHRASE = "demoted to a post-" + "derivation report"
+
+    def test_f1_no_post_derivation_report_wording_in_the_workflow_or_this_module(self):
+        """sec r8 F1: no step runs the resolver after the derivation; the wording is gone."""
+        flat = " ".join(CI_YML.read_text().split())
+        self.assertNotIn(self.BANNED_PHRASE, flat)
+        module = " ".join(Path(__file__).read_text().split())
+        self.assertNotIn(self.BANNED_PHRASE, module)
+
     def test_no_step_runs_before_the_fold_on_a_live_event_except_the_decision(self):
         """Every step that runs on pull_request or merge_group ahead of the first fold."""
         for event in LIVE_EVENTS:
