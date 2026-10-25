@@ -186,6 +186,86 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 # rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
+**AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
+Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
+them (CI then fails with `extension "age" is not available`). A brew-independent
+copy now lives in `<pg-age-stack>/age-1.8.0/{share,lib}`. On the macos-fed node the
+"Configure enterprise-fed tier" step runs `scripts/ci/ensure-age-extension.py`
+before `CREATE EXTENSION`:
+
+- **Manifest.** It installs exactly five files, each pinned to a sha256 in the
+  script's `MANIFEST`: `age.dylib` (into `pg_config --pkglibdir`) and
+  `age.control`, `age--1.8.0.sql`, `age--1.7.0--1.8.0.sql`, `age--1.6.0--1.7.0.sql`
+  (into `pg_config --sharedir`/extension). Nothing else in the source directory
+  is read or copied. Rebuilding AGE means updating those pins in the same change.
+- **Health check.** AGE counts as present only when `pg_available_extensions`
+  lists `age` (that view reflects `age.control` alone) AND all five files are at
+  their destinations as regular files with the pinned hashes, none of them group-
+  or world-writable (#7016). A lost, stale or writable `age.dylib` or SQL file is
+  therefore restored with its source's mode (#6898), not reported as healthy.
+- **Source validation.** Before any write, the source dir, `share/`, `lib/` and
+  each file must be real (no symlinks), owned by the runner's uid and not group-
+  or world-writable, and each file's bytes (read through an `O_NOFOLLOW` fd) must
+  match its pin. Any failure exits 2 with one `ensure-age-extension: ...` line and
+  writes nothing.
+- **Install.** `lib` is installed before `share`, so the control file never
+  appears ahead of its module. Each file goes through a per-process `mkstemp`
+  temp file, `fsync` and an atomic `os.replace`, so the three macos-fed runner
+  instances can restore concurrently. On a write error the temp file is removed;
+  if another runner has meanwhile made AGE healthy the run passes, otherwise it
+  exits 1. Files already written stay in place: each carries its pinned bytes,
+  and removing one could undo a restore another runner has already verified.
+- **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
+  psql's argv carries no password, and neither form is printed. Only the
+  password is moved off argv: allowed path- and name-valued keys (`sslrootcert`,
+  `sslcert`, `sslkey`, `sslcrl`, `sslcrldir`, `passfile`,
+  `krbsrvname`, `requirepeer`) stay in the URL on psql's argv. The URL is refused
+  with exit 2 and one stderr line (no value printed) when it does not start with
+  the exact lowercase `postgres://` or `postgresql://`; holds a TAB, CR, LF or NUL
+  (VT, FF, DEL and NBSP pass, as in libpq), a raw space, a `#`, a `%` not followed by two hex digits or `%00`;
+  has more than one `@` in the host part, an `@` after it, or an empty host part
+  (`postgres:///db...`); or its query has an empty segment (one trailing `&` is
+  accepted), a segment without exactly one `=`, or a key not on
+  `ALLOWED_QUERY_KEYS`. These are libpq's own refusals plus fail-closed cases
+  where urllib and libpq could split the URL differently; a URL the helper
+  accepts is read the same way by libpq. Decoding is percent-decoding only:
+  `%XX` becomes one raw byte (`%FF` reaches `PGPASSWORD` as byte 0xFF) and `+`
+  stays a plus. A socket directory given as `?host=%2F...` or as a
+  percent-encoded host works, also with a userinfo password and an empty host
+  (`postgres://:pw@/db?host=%2Fdir`). The URL psql receives drops the password
+  and keeps every other segment as written. `ALLOWED_QUERY_KEYS` is a
+  case-sensitive allowlist that is a subset of the non-secret libpq parameters
+  (`sslmode`, `application_name`, `connect_timeout`, `sslnegotiation`,
+  `min_protocol_version`, ...). Secrets (`sslpassword`, `oauth_client_secret`,
+  `scram_client_key`, `scram_server_key`, which libpq cannot take from the
+  environment) and keys that change the auth mechanism or session mode
+  (`gsslib`, `gssdelegation`, `replication`, `oauth_issuer`, `oauth_client_id`,
+  `oauth_scope`) are refused by name, as is `service` (#6345: libpq reads a
+  `pg_service.conf` entry before `PGPASSWORD`, so its password would beat the
+  moved one; psql also runs without `PGSERVICE`/`PGSERVICEFILE`); `ssl=true` (a JDBC alias that libpq maps to `sslmode=require`) is refused so the TLS mode is always spelled `sslmode`; `sslkeylogfile` (writes TLS session secrets to a file) and `require_auth` (changes the accepted authentication methods) are refused by name as well.
+  A refusal names a key only when it is a known libpq keyword (an unlisted key
+  can be the tail of a password that held a raw `&`), never a value. psql runs
+  with `PGCONNECT_TIMEOUT=15` and a 60 s limit; a URL `connect_timeout` must be an
+  integer in 1..60 (#6338), but that timeout bounds only the connect phase of one host and
+  psql 18.6 catches SIGALRM, so it is not the orphan bound. psql runs under a stdlib
+  supervisor that holds the read end of a pipe the helper holds the write end of: when
+  the helper dies for any reason, SIGKILL included, the supervisor kills psql within
+  0.2 s regardless of the host count (#6517, #6505); the supervisor also enforces its own
+  65 s deadline, which covers a SIGSTOPped helper. Only the loss of the helper AND the
+  supervisor together leaves psql unbounded after authentication: the connect timeout ends only
+  the connect phase, and nothing ends an authenticated psql until the server closes the
+  connection (#6673). Any catchable signal valid on the
+  platform (except default-ignored, job-control and fault signals) stops the psql child,
+  also when it arrives while it is being spawned (#6337, #6504), and exits 1 with one
+  `ensure-age-extension: interrupted` line. Only a `0` or `1` answer counts: a psql that exits
+  non-zero or prints anything else fails the run with no restore (#6677). A supervisor killed by a signal is reported as `the psql supervisor was killed by signal N` (#6728).
+
+- **Database, TLS and psql environment (#6181, #6871, #6676, #7982).** The helper passes the database name to psql through `PGDATABASE`, so its argv carries no path component. A tier URL that names no database is refused with exit 2 before any restore or psql call (the database is read as libpq reads it: the last `dbname` query value wins over the path, so `/db?dbname=` names none, #6871), and psql's environment is an allowlist: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*` and `TZ` from the caller, then the helper's own `PGPASSWORD`, `PGDATABASE` and `PGCONNECT_TIMEOUT`; no caller `PG*` variable reaches psql (redirect `PGHOST` `PGHOSTADDR` `PGPORT` `PGLOADBALANCEHOSTS`; transport `PGSSLMODE` `PGREQUIRESSL` `PGGSSENCMODE` `PGCHANNELBINDING` `PGSSLROOTCERT` `PGSSLCRL` `PGSSLNEGOTIATION` `PGREQUIREAUTH` `PGMINPROTOCOLVERSION` `PGMAXPROTOCOLVERSION`; credentials `PGUSER` `PGPASSWORD` `PGPASSFILE` `PGSSLCERT` `PGSSLKEY`; target `PGDATABASE` `PGOPTIONS` `PGTARGETSESSIONATTRS`) (#6676). The tier URL must carry exactly one `sslmode=verify-full` and exactly one non-empty `sslrootcert`; any other value, a missing or repeated `sslmode`, or a missing `sslrootcert` is refused with exit 2 before any restore or psql call, so the tier password is never sent without certificate and hostname verification. The refusal names the key only, never a value or the URL.
+
+It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
+CI always uses the default node path, and there is no environment override.
+Keep `postgresql@18` and `pgvector` brew-pinned on the node regardless.
+
 ### Self-hosted runners
 ```bash
 # status (names/ids are not published here)
