@@ -52,12 +52,19 @@ module is an import error of this module, never a skip.
 """
 
 import ast
+import concurrent.futures
 import contextlib
+import copy
+import dataclasses
 import hashlib
 import io
 import json
 import logging
+import multiprocessing
+import os
 from pathlib import Path
+import pickle
+import pprint
 import re
 import shutil
 import subprocess
@@ -65,6 +72,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 import unicodedata
 import unittest
 import unittest.mock
@@ -3468,6 +3476,730 @@ class TestCheckerTimeIsBounded8187R23(unittest.TestCase):
         self.assertTrue(time.perf_counter() - start < 1.0)
 
 
+
+
+# ---- r24 (code review round 23, F42a-g; 3-agent vote (6def5ab6), option B stands) ----
+# decision: remove printable and fail closed on every routed site over extending the deny-list because a deny-list fails
+# open on every shape nobody listed and did so in rounds 20, 21 and 22 (3-agent vote (6def5ab6), 3-0)
+# decision: an id-keyed private registry over a slot because every slot or dict attribute is one getattr away from a message
+# decision: a linearity ratio plus a 20 s cap over a tight absolute budget because the finding is super-linear regex
+# behaviour, not host speed
+
+TY_PATH = Path(ty.__file__)
+THIS_PATH = Path(__file__)
+ROUTED_HELPERS = frozenset(("key_label", "name_label", "job_label", "step_label", "Opaque", "opaque"))
+
+
+def routed_sites(source, in_test_file):
+    """``{key: (kind, lineno, col, helper)}`` for every call of a label helper in ``source`` whose first argument is not a
+    constant (a constant has nothing to leak).  In the checker module that is every call; in this file it is the checker part
+    only (``load_job_pins`` up to the first test class), never a test class, a canary scenario or an assert helper."""
+    tree = ast.parse(source)
+    kind = "test" if in_test_file else "ty"
+    low, high = 0, 10 ** 9
+    if in_test_file:
+        low = next(n.lineno for n in tree.body if isinstance(n, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "JOB_PINS_FILE" for target in n.targets))
+        high = next(n.lineno for n in tree.body if isinstance(n, ast.ClassDef) and n.lineno > low)
+    sites = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and call_name(node) in ROUTED_HELPERS and node.args):
+            continue
+        if isinstance(node.args[0], ast.Constant) or not low <= node.lineno < high:
+            continue
+        if kind == "ty" and isinstance(node.func, ast.Attribute):
+            continue
+        sites[(kind, node.lineno, node.col_offset)] = call_name(node)
+    ordered, seen = {}, {}
+    for (site_kind, lineno, col), helper in sorted(sites.items(), key=lambda item: item[0][1:]):
+        seen[lineno] = seen.get(lineno, 0) + 1
+        suffix = "" if seen[lineno] == 1 else "#%d" % seen[lineno]
+        ordered["%s:%d%s %s" % (site_kind, lineno, suffix, helper)] = (site_kind, lineno, col, helper)
+    return ordered
+
+
+def splice_call(source, node):
+    """``source`` with the call ``node`` replaced by its first argument: the one-site mutant (byte offsets, as ``ast`` counts)."""
+    data = source.encode("utf-8")
+    starts = [0] + [m.end() for m in re.finditer(b"\n", data)]
+    begin = starts[node.lineno - 1] + node.col_offset
+    end = starts[node.end_lineno - 1] + node.end_col_offset
+    argument = ast.get_source_segment(source, node.args[0])
+    return (data[:begin] + ("(" + argument + ")").encode("utf-8") + data[end:]).decode("utf-8")
+
+
+def load_variant(ty_source, test_source):
+    """A fresh copy of this module executed against a (possibly mutated) checker module; ``sys.modules`` is restored."""
+    saved = {name: sys.modules.get(name) for name in ("tier_yaml_8187", "canary_variant_6181")}
+    try:
+        variant_ty = types.ModuleType("tier_yaml_8187")
+        variant_ty.__file__ = str(TY_PATH)
+        sys.modules["tier_yaml_8187"] = variant_ty
+        exec(compile(ty_source, str(TY_PATH), "exec"), variant_ty.__dict__)
+        variant = types.ModuleType("canary_variant_6181")
+        variant.__file__ = str(THIS_PATH)
+        sys.modules["canary_variant_6181"] = variant
+        exec(compile(test_source, str(THIS_PATH), "exec"), variant.__dict__)
+        return variant
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def site_mutant_leaks(task):
+    """Leaks the plain-shape canary reports when the one routed site ``task`` hands its raw argument on (0 = a survivor)."""
+    kind, lineno, col, _helper = task
+    ty_source = TY_PATH.read_text(encoding="utf-8")
+    test_source = THIS_PATH.read_text(encoding="utf-8")
+    source = test_source if kind == "test" else ty_source
+    node = next(n for n in ast.walk(ast.parse(source))
+                if isinstance(n, ast.Call) and (n.lineno, n.col_offset) == (lineno, col))
+    mutated = splice_call(source, node)
+    variant = load_variant(ty_source if kind == "test" else mutated, mutated if kind == "test" else test_source)
+    return len(canary_run(variant, {"plain": CANARY_SHAPES["plain"]}).leaks)
+
+
+def run_site_mutants(tasks):
+    """``site_mutant_leaks`` over ``tasks``, forked across the cores when the platform can fork, in order otherwise."""
+    try:
+        context = multiprocessing.get_context("fork")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1), mp_context=context) as pool:
+            return list(pool.map(site_mutant_leaks, tasks))
+    except (ValueError, OSError, NotImplementedError):
+        return [site_mutant_leaks(task) for task in tasks]
+
+
+class TestEveryRoutedSiteIsDriven8187R24(unittest.TestCase):
+    """r24 F42g (code r23): the canary has to reach EVERY routed site, not just most of them.  Each site is mutated alone (its
+    helper call replaced by the bare argument) and the plain-shape canary runs on that variant; a site whose mutant leaves
+    the canary green is a survivor.  This replaces the per-helper call count, which a single driven site satisfied."""
+
+    SITES = None
+    LEAKS = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.SITES = {**routed_sites(TY_PATH.read_text(encoding="utf-8"), False),
+                     **routed_sites(THIS_PATH.read_text(encoding="utf-8"), True)}
+        cls.LEAKS = dict(zip(cls.SITES, run_site_mutants(list(cls.SITES.values()))))
+
+    def test_the_enumeration_covers_both_files(self):
+        kinds = {site[0] for site in self.SITES.values()}
+        self.assertEqual(kinds, {"ty", "test"})
+        self.assertGreaterEqual(len(self.SITES), 30)
+
+    def test_each_routed_site_mutant_is_red(self):
+        survivors = []
+        for key in self.SITES:
+            with self.subTest(site=key):
+                if self.LEAKS[key] == 0:
+                    survivors.append(key)
+                self.assertGreater(self.LEAKS[key], 0)
+        self.assertEqual(len(survivors), 0)
+
+
+# ---- r24 F42a: the taint scanner, one mutant per echo shape ----
+TAINT_HEAD = "import unittest, functools\nclass T(unittest.TestCase):\n    def test(self):\n        text = p.read_text()\n"
+TAINT_SHAPES = {
+    "control direct": TAINT_HEAD + "        self.assertEqual(text, 'x')\n",
+    "helper + list": TestNoAssertCanEchoAuthorText8187R23.HELPER_AND_LIST,
+    "dict comprehension": TAINT_HEAD + "        d = {k: v for k, v in enumerate(text.split())}\n        self.assertEqual(d, {})\n",
+    "dict comprehension over items":
+        TAINT_HEAD + "        d = {k: v for k, v in load_strict(text).items()}\n        self.assertEqual(d, {})\n",
+    "lambda": TAINT_HEAD + "        f = lambda: text\n        self.assertEqual(f(), 'x')\n",
+    "lambda param": TAINT_HEAD + "        f = lambda v: v\n        self.assertEqual(f(text), 'x')\n",
+    "default argument": TAINT_HEAD + "        def g(v=text):\n            return v\n        self.assertEqual(g(), 'x')\n",
+    "functools.partial": TAINT_HEAD + "        h = functools.partial(str.strip, text)\n        self.assertEqual(h(), 'x')\n",
+    "closure": TAINT_HEAD + "        def inner():\n            return text\n        self.assertEqual(inner(), 'x')\n",
+    "*args helper": "import unittest\ndef first(*rows):\n    return rows[0]\nclass T(unittest.TestCase):\n    def test(self):\n"
+                    "        text = p.read_text()\n        self.assertEqual(first(text), 'x')\n",
+    "**kwargs helper": "import unittest\ndef first(**rows):\n    return rows['a']\nclass T(unittest.TestCase):\n    def test(self):\n"
+                       "        text = p.read_text()\n        self.assertEqual(first(a=text), 'x')\n",
+    "msg= keyword": TAINT_HEAD + "        self.assertTrue(False, msg=text)\n",
+    "assertRaises msg": TAINT_HEAD + "        with self.assertRaises(ValueError, msg=text):\n            pass\n",
+    "raise AssertionError": TAINT_HEAD + "        raise AssertionError(text)\n",
+    "bare assert statement": TAINT_HEAD + "        assert text == 'x', text\n",
+    "subscript": TAINT_HEAD + "        self.assertEqual(text[0:5], 'x')\n",
+    "f-string": TAINT_HEAD + "        self.assertEqual(f'{text}', 'x')\n",
+    "walrus": TAINT_HEAD + "        self.assertEqual((y := text), 'x')\n",
+    "tuple unpack swap": TAINT_HEAD + "        a, b = 'x', text\n        self.assertEqual(b, 'x')\n",
+    "starred list": TAINT_HEAD + "        rows = [*text.split()]\n        self.assertEqual(rows, [])\n",
+    "ternary": TAINT_HEAD + "        self.assertEqual(text if ok else '', 'x')\n",
+    "global via module": TAINT_HEAD + "        global G\n        G = text\n        self.assertEqual(G, 'x')\n",
+}
+
+
+class TestTaintScanFlagsEveryEchoShape8187R24(unittest.TestCase):
+    """r24 F42a: the reviewer's 22-shape corpus is this test's own mutant table; the scanner has to be red on all 22
+    (at r23 it missed the lambda, default-argument, partial, closure, *args, **kwargs, raise and bare-assert shapes)."""
+
+    def test_the_corpus_has_the_22_shapes(self):
+        self.assertEqual(len(TAINT_SHAPES), 22)
+
+    def test_each_shape_is_flagged(self):
+        survivors = []
+        for name, source in TAINT_SHAPES.items():
+            with self.subTest(shape=name):
+                flagged = tainted_assert_lines(source)
+                if not flagged:
+                    survivors.append(name)
+                self.assertGreater(len(flagged), 0)
+        self.assertEqual(survivors, [])
+
+    def test_the_wrapped_forms_of_the_new_shapes_stay_clean(self):
+        clean = (
+            TAINT_HEAD + "        f = lambda v: len(v)\n        self.assertEqual(f(text), 3)\n",
+            TAINT_HEAD + "        def g(v=3):\n            return v\n        self.assertEqual(g(), 3)\n",
+            TAINT_HEAD + "        def inner():\n            return len(text)\n        self.assertEqual(inner(), 3)\n",
+            TAINT_HEAD + "        assert len(text) == 3, 'length'\n",
+            TAINT_HEAD + "        raise AssertionError('the file changed')\n",
+            "import unittest\ndef first(*rows):\n    return len(rows)\nclass T(unittest.TestCase):\n    def test(self):\n"
+            "        text = p.read_text()\n        self.assertEqual(first(text), 1)\n")
+        for position, source in enumerate(clean):
+            with self.subTest(shape=position):
+                self.assertEqual(tainted_assert_lines(source), [])
+
+
+# ---- r24 F42b: every way to pull the raw text out of an Opaque ----
+PROBE_MARK = "MKfeedfacecafe0123456789ab"
+
+
+def probe_text(fn):
+    try:
+        out = fn()
+        return out if isinstance(out, str) else repr(out)
+    except BaseException as exc:  # noqa: BLE001  (the exception text is a channel under test)
+        return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def opaque_probe_paths(o, p, case):
+    """The 62 channels of the r23 review's ``probe_opaque.py``: 46 value paths and 16 failing assertions."""
+    paths = {
+        "str": lambda: str(o), "repr": lambda: repr(o), "format spec": lambda: format(o, "!<99"), "fstring !a": lambda: f"{o!a}",
+        "percent %s %r %a": lambda: "%s %r %a" % (o, o, o), "percent %d": lambda: "%d" % o, "bytes": lambda: bytes(o),
+        "__dict__": lambda: o.__dict__, "vars": lambda: vars(o), "getattr _raw (slot read)": lambda: getattr(o, "_raw"),
+        "__getstate__": lambda: o.__getstate__(), "__reduce_ex__(2)": lambda: o.__reduce_ex__(2),
+        "__reduce_ex__(4)": lambda: o.__reduce_ex__(4), "pickle p0": lambda: pickle.dumps(o, 0),
+        "pickle p5": lambda: pickle.dumps(o, 5), "copy": lambda: repr(copy.copy(o)), "deepcopy": lambda: repr(copy.deepcopy([o])),
+        "json.dumps": lambda: json.dumps(o), "json.dumps default=str": lambda: json.dumps([o], default=str),
+        "json.dumps default=vars": lambda: json.dumps([o], default=lambda x: x.__getstate__()),
+        "dataclasses.asdict": lambda: dataclasses.asdict(o), "pprint": lambda: pprint.pformat({"a": [o, p]}),
+        "iter": lambda: list(o), "getitem": lambda: o[0], "add": lambda: o + "s", "radd": lambda: "s" + o,
+        "contains str": lambda: "C" in o, "str contains opaque": lambda: o in "MKFEED", "len": lambda: len(o),
+        "lt": lambda: sorted([o, p]), "join": lambda: ",".join([o]), "int": lambda: int(o), "hash": lambda: str(hash(o)),
+        "dir": lambda: dir(o),
+        "logging %s": lambda: logging.LogRecord("x", 10, "f", 1, "%s %r", (o, o), None).getMessage(),
+        "exception arg": lambda: str(ValueError(o)), "exception repr": lambda: repr(KeyError(o)),
+        "KeyError on dict lookup": lambda: {}[o], "ValueError list.index": lambda: [].index(o),
+        "set repr": lambda: repr({o, p}), "dict repr": lambda: repr({o: p}),
+        "traceback locals": lambda: "".join(
+            traceback.TracebackException(ValueError, ValueError("x"), None, capture_locals=True).format()),
+        "__init_subclass__ subclass str": lambda: str(type("S", (ty.Opaque,), {})(PROBE_MARK, "key[1]")),
+        "object.__repr__": lambda: object.__repr__(o),
+        "eq with str": lambda: str(o == PROBE_MARK), "same": lambda: str(ty.same(o, PROBE_MARK)),
+    }
+    asserts = {
+        "assertEqual long": lambda: case.assertEqual(o, p), "assertNotEqual": lambda: case.assertNotEqual(o, o),
+        "assertIn list": lambda: case.assertIn(o, [p]), "assertNotIn": lambda: case.assertNotIn(o, [o]),
+        "assertListEqual": lambda: case.assertListEqual([o, o], [o, p]),
+        "assertDictEqual": lambda: case.assertDictEqual({"k": o}, {"k": p}),
+        "assertSetEqual": lambda: case.assertSetEqual({o}, {p}), "assertTupleEqual": lambda: case.assertTupleEqual((o,), (p,)),
+        "assertCountEqual": lambda: case.assertCountEqual([o], [p]), "assertIs": lambda: case.assertIs(o, p),
+        "assertIsNone": lambda: case.assertIsNone(o), "assertFalse": lambda: case.assertFalse(o),
+        "assertSequenceEqual": lambda: case.assertSequenceEqual([o], [p]),
+        "assertMultiLineEqual str": lambda: case.assertEqual(str(o), str(p)),
+        "assertIsInstance": lambda: case.assertIsInstance(o, str), "assertGreater": lambda: case.assertGreater(o, p),
+    }
+    return paths, asserts
+
+
+class TestOpaqueHoldsNoReachableText8187R24(unittest.TestCase):
+    """r24 F42b: 62 probe paths, all label-only (at r23 three returned the raw text: the ``_raw`` slot read,
+    ``object.__getstate__`` and ``json.dumps(default=vars)``)."""
+
+    def rows(self):
+        case = unittest.TestCase()
+        case.maxDiff = None
+        o = ty.Opaque(PROBE_MARK, "key[3]")
+        p = ty.Opaque(PROBE_MARK + "-other-" + "x" * 900, "key[4]")
+        paths, asserts = opaque_probe_paths(o, p, case)
+        rows = {name: probe_text(fn) for name, fn in paths.items()}
+        for name, fn in asserts.items():
+            try:
+                fn()
+                rows[name] = ""
+            except Exception as exc:  # noqa: BLE001  (a TypeError of an ordering assert is a channel too)
+                rows[name] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        return rows
+
+    def test_62_paths(self):
+        self.assertEqual(len(self.rows()), 62)
+
+    def test_no_path_returns_the_text(self):
+        raw = []
+        for name, text in self.rows().items():
+            with self.subTest(path=name):
+                leaked = "feedfacecafe" in text or PROBE_MARK in text or PROBE_MARK.encode().hex() in text
+                if leaked:
+                    raw.append(name)
+                self.assertFalse(leaked)
+        self.assertEqual(raw, [])
+
+    def test_a_failing_assert_prints_the_label_and_length_only(self):
+        o = ty.Opaque(PROBE_MARK, "key[3]")
+        p = ty.Opaque(PROBE_MARK + "x", "key[4]")
+        with self.assertRaises(AssertionError) as caught:
+            unittest.TestCase().assertEqual(o, p)
+        shown = str(caught.exception)
+        self.assertIn("key[3] len=26", shown)
+        self.assertIn("key[4] len=27", shown)
+        self.assertNotIn("feedface", shown)
+        self.assertNotIn("MK", shown)
+
+
+# ---- r24 F42f: the leak detector matches a sentinel-prefixed marker, per line ----
+class TestLeakDetectorHasNoFalsePositives8187R24(unittest.TestCase):
+    """r24 F42f: markers carry a fixed non-hex prefix and the detector matches that form per line, so constant text and
+    adjacent label lines cannot form a hit across a line break."""
+
+    DIGEST = "00525ecedb000000000000ab"
+
+    def windows(self):
+        return {self.DIGEST[i:i + 8]: self.DIGEST for i in range(len(self.DIGEST) - 7)}
+
+    def test_the_sentinel_is_a_non_hex_prefix(self):
+        self.assertTrue(CANARY_SENTINEL)
+        self.assertFalse(any(c in "0123456789abcdef" for c in CANARY_SENTINEL.lower()))
+
+    def test_constant_text_is_not_a_hit(self):
+        for text in ("ci.yml: line 525: unrecognised job key", "a\nb\nc\nd\ne\nf\n0\n1", "525ecedb 25ecedbe",
+                     "job[0] len=8\nkey[3] len=1\nstep[2] len=4"):
+            with self.subTest(text_class=len(text)):
+                self.assertEqual(canary_hits(text, self.windows()), set())
+
+    def test_a_marker_in_every_probe_shape_is_a_hit(self):
+        marker = CANARY_SENTINEL + self.DIGEST
+        for name, shape in CANARY_SHAPES.items():
+            with self.subTest(shape=name):
+                self.assertEqual(canary_hits("lead " + shape(marker) + " tail", self.windows()), {self.DIGEST})
+
+    def test_a_partial_marker_is_a_hit(self):
+        self.assertEqual(canary_hits("x " + CANARY_SENTINEL + self.DIGEST[:12] + " y", self.windows()), {self.DIGEST})
+
+    def test_a_second_seed_run_is_clean_and_has_no_cross_seed_hit(self):
+        """The plain and four more shapes under seed 1: no leak, and none of seed 0's windows appears either."""
+        shapes = {name: CANARY_SHAPES[name] for name in ("plain", "percent-encoded", "multi-line", "userinfo-url", "fullwidth")}
+        run = canary_run(sys.modules[__name__], shapes, seed=1, foreign_seed=0)
+        self.assertEqual(run.leaks, [])
+        self.assertEqual(run.stray, [])
+        self.assertEqual(run.errors, [])
+
+
+# ---- r24 F42c and F42e: hygiene gates over this module ----
+class TestModuleHygiene8187R24(unittest.TestCase):
+    """r24: no ``tempfile`` call without ``dir=`` (F42c) and no ``assertTrue``/``assertFalse`` of a comparison (F42e,
+    CodeQL ``py/imprecise-assert``)."""
+
+    def calls(self, predicate):
+        tree = ast.parse(THIS_PATH.read_text(encoding="utf-8"))
+        return sorted(node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call) and predicate(node))
+
+    def test_every_tempfile_call_names_a_repo_local_dir(self):
+        def bare(node):
+            func = node.func
+            return (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "tempfile"
+                    and not any(kw.arg == "dir" for kw in node.keywords))
+        self.assertEqual(self.calls(bare), [])
+
+    def test_no_assert_true_or_false_wraps_a_single_comparison(self):
+        def imprecise(node):
+            return (isinstance(node.func, ast.Attribute) and node.func.attr in ("assertTrue", "assertFalse") and node.args
+                    and isinstance(node.args[0], ast.Compare) and len(node.args[0].ops) == 1)
+        self.assertEqual(self.calls(imprecise), [])
+
+
+# ---- r24 F42d: linearity ratio plus an absolute cap ----
+def f40e_measure(case, name, shape, nbytes):
+    """Seconds for the four-call round (both views, pass and fail) on a workflow whose step name, env value and run text are
+    each ``nbytes`` of ``shape``; the problem lines are checked for length and echo on the way."""
+    unit = len(shape("a" * 64)) / 64.0
+    value = shape("a" * int(nbytes / unit))
+    edited = f40e_edit(case.text, case.step, value)
+    own = pins_for({case.workflow: edited})
+    calls = ((primary_pin_problems, case.pins[PRIMARY], True), (job_pin_problems, case.pins[SECONDARY], True),
+             (primary_pin_problems, own[PRIMARY], False), (job_pin_problems, own[SECONDARY], False))
+    start = time.perf_counter()
+    for fn, pins, must_fail in calls:
+        problems = fn(case.workflow, edited, pins)
+        case.assertEqual(len(problems) > 0, must_fail)
+        case.assertLess(max([len(line) for line in problems] + [0]), 600)
+        case.assertEqual(len([line for line in problems if value[:32] in line]), 0)
+    return time.perf_counter() - start
+
+
+class TestCheckerTimeIsLinear8187R24(unittest.TestCase):
+    """r24 F42d: the finding is super-linear regex behaviour, not host speed, so the gate is the 2 MiB / 1 MiB wall-time ratio
+    (named ``F40E_RATIO_MAX``) plus an absolute cap per shape (named ``F40E_CAP_SECONDS``)."""
+
+    workflow = "ci.yml"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (WORKFLOWS / cls.workflow).read_text(encoding="utf-8")
+        cls.pins = load_job_pins()
+        cls.step = pin_targets(cls.workflow, cls.text)[0]
+
+    def test_the_constants_are_named(self):
+        self.assertEqual(F40E_RATIO_MAX, 3.0)
+        self.assertEqual(F40E_CAP_SECONDS, 20.0)
+
+    def test_letters_scale_linearly(self):
+        shape = CANARY_SHAPES["plain"]
+        f40e_measure(self, "warm", shape, 1 << 16)
+        one = min(f40e_measure(self, "letters", shape, 1 << 20) for _ in range(2))
+        two = f40e_measure(self, "letters", shape, 2 << 20)
+        self.assertLess(two / max(one, 0.05), F40E_RATIO_MAX)
+        self.assertLess(two, F40E_CAP_SECONDS)
+
+    def test_every_probe_shape_is_under_the_cap_at_one_mebibyte(self):
+        for name, shape in sorted(CANARY_SHAPES.items()):
+            with self.subTest(shape=name):
+                self.assertLess(f40e_measure(self, name, shape, F40E_BYTES), F40E_CAP_SECONDS)
+
+
+# ---- r24 security F1-F3: every capture channel has a positive control, every harness mutant is red ----
+CHANNEL_LINE = re.compile(r"^(?P<indent>\s*).*# canary-channel: (?P<name>[a-z-]+)$", re.M)
+HARNESS_MUTANTS = {
+    "drop exception capture": ("channel", ("exception", "exception-chain"), "controls"),
+    "drop exception chain walk": ("channel", ("exception-chain",), "controls"),
+    "drop stdout and stderr capture": ("channel", ("stdout-stderr",), "controls"),
+    "drop log capture": ("channel", ("log",), "controls"),
+    "drop warning capture": ("channel", ("warning",), "controls"),
+    "drop problem-line scan": ("channel", ("problem-line",), "controls"),
+    "fail-path forcing removed, flag kept": ("text", "if CANARY_FORCE_FAIL:", "coverage"),
+}
+
+
+def harness_mutant_source(source, kind, what):
+    """``source`` with the capture lines of the channels in ``what`` dropped (each marked line becomes ``pass``), or the
+    fail-path guard forced off with its flag kept."""
+    if kind == "channel":
+        count = [0]
+
+        def drop(match):
+            if match.group("name") not in what:
+                return match.group(0)
+            count[0] += 1
+            return match.group("indent") + "pass"
+        mutated = CHANNEL_LINE.sub(drop, source)
+        if count[0] == 0:
+            raise AssertionError("no capture line is marked with that channel")
+        return mutated
+    if what not in source:
+        raise AssertionError("the guard text is not in the module")
+    return source.replace(what, "if False:")
+
+
+class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
+    """r24 sec F1, F2, F3 (security r23, check 3): the exception chain, stdout and stderr, log, warning and problem-line
+    channels each have a seeded positive control, and the fail-path forcing is proven by a per-view count; dropping any of
+    them makes the harness red."""
+
+    def test_the_unmutated_harness_passes_every_control(self):
+        self.assertEqual(canary_control_failures(sys.modules[__name__]), [])
+
+    def test_every_capture_channel_has_a_seeded_control(self):
+        names = set(canary_controls(CanaryRun(sys.modules[__name__])))
+        self.assertEqual(names, {"print", "stderr", "log", "warning", "problem-line", "exception", "exception-chain",
+                                 "exception-context"})
+
+    def test_each_harness_mutant_is_red(self):
+        ty_source = TY_PATH.read_text(encoding="utf-8")
+        test_source = THIS_PATH.read_text(encoding="utf-8")
+        for name, (kind, what, check) in HARNESS_MUTANTS.items():
+            with self.subTest(mutant=name):
+                variant = load_variant(ty_source, harness_mutant_source(test_source, kind, what))
+                if check == "controls":
+                    failures = canary_control_failures(variant)
+                else:
+                    failures = canary_coverage_failures(canary_run(variant, {"plain": CANARY_SHAPES["plain"]}), ["plain"])
+                self.assertGreater(len(failures), 0)
+
+    def test_the_real_canary_counts_fail_path_observations_per_view_and_shape(self):
+        run = canary_run(sys.modules[__name__], {"plain": CANARY_SHAPES["plain"], "multi-line": CANARY_SHAPES["multi-line"]})
+        self.assertEqual(canary_coverage_failures(run, ["plain", "multi-line"]), [])
+        for shape in ("plain", "multi-line"):
+            for view in ("loaded", "text"):
+                self.assertGreater(run.fail_views.get((shape, view), 0), 0)
+
+
+# ---- r24 security F4: YAML tags, %TAG directives and bad escapes are seeded; no loader call prints author text ----
+TAG_PLANTS = {
+    "local tag": lambda marker: "X_TAG: !%s v" % marker,
+    "bad escape": lambda marker: 'X_ESC: "%s\\q"' % marker,
+    "tag directive": lambda marker: "%TAG !e! tag:" + marker + ",2000:",
+}
+
+
+def plant_tag(text, kind, marker):
+    """``text`` (a workflow) with the tag-field marker planted: an env entry carrying a local tag or a bad escape, or a ``%TAG``
+    directive ahead of the document."""
+    if kind == "tag directive":
+        return TAG_PLANTS[kind](marker) + "\n---\n" + text
+    out, done = [], False
+    for line in text.split("\n"):
+        out.append(line)
+        if not done and line.strip() == "env:":
+            out.append(line[:len(line) - len(line.lstrip())] + "  " + TAG_PLANTS[kind](marker))
+            done = True
+    return "\n".join(out)
+
+
+class TestNoLoaderCallPrintsAuthorText8187R24(unittest.TestCase):
+    """r24 sec F4 (security r23, ``attack_tag.py`` rebuilt): a marker in a YAML tag, a ``%TAG`` directive or a bad escape
+    reaches no exception text, log record, stdout, stderr or problem line, through the loaders and both views."""
+
+    def test_the_canary_seeds_tags_and_directives(self):
+        run = CanaryRun(sys.modules[__name__])
+        faults = canary_loader_faults(run, "plain", CANARY_SHAPES["plain"])
+        for name in ("local-tag", "tag-directive", "bad-escape"):
+            self.assertIn(name, faults)
+
+    def test_each_plant_is_refused_without_the_marker_in_any_channel(self):
+        run = CanaryRun(sys.modules[__name__])
+        raised = []
+        for kind in TAG_PLANTS:
+            for shape_name in ("plain", "percent-encoded", "fullwidth", "format-characters"):
+                shape = CANARY_SHAPES[shape_name]
+                text = plant_tag(run.texts["ci.yml"], kind, run.mint("tag", shape))
+                for loader in (ty.load_strict, ty.load_lenient):
+                    before = len(run.errors)
+                    run.observe(shape_name, "tag/%s/%s" % (kind, loader.__name__), loader, text)
+                    raised.append(len(run.errors) > before)
+                run.views(shape_name, "tag-view/" + kind, "ci.yml", text, run.pins[PRIMARY], run.pins[SECONDARY], None)
+        self.assertEqual(run.leaks, [])
+        self.assertGreater(sum(raised), 0, "no plant was refused by a loader")
+
+    def test_a_loader_failure_names_the_class_and_the_line_only(self):
+        for kind in ("local tag", "bad escape"):
+            text = plant_tag("a:\n  env:\n    K: v\n", kind, "MKsecretsecret")
+            for loader in (ty.load_strict, ty.load_lenient):
+                with self.subTest(plant=kind, loader=loader.__name__):
+                    with self.assertRaises(ValueError) as caught:
+                        loader(text)
+                    shown = "".join(traceback.format_exception(type(caught.exception), caught.exception,
+                                                               caught.exception.__traceback__))
+                    self.assertNotIn("MKsecret", shown)
+                    self.assertIsNone(caught.exception.__cause__)
+                    self.assertIsNone(caught.exception.__context__)
+                    self.assertRegex(str(caught.exception), r"^\w+(?: at line \d+)?$")
+
+
+# ---- r24 security F5: more taint shapes ----
+TAINT_SEC_SHAPES = {
+    "getattr assert": TAINT_HEAD + "        getattr(self, 'assertEqual')(text, 'x')\n",
+    "bound alias": TAINT_HEAD + "        eq = self.assertEqual\n        eq(text, 'x')\n",
+    "re.search Match": TAINT_HEAD + "        import re\n        self.assertIsNone(re.search('.+', text))\n",
+    "print": TAINT_HEAD + "        print(text)\n",
+    "raise ValueError": TAINT_HEAD + "        raise ValueError(text)\n",
+    "partial of an assert": TAINT_HEAD + "        functools.partial(self.assertEqual, text)('x')\n",
+    "lambda direct call": TAINT_HEAD + "        self.assertEqual((lambda t: t)(text), 'x')\n",
+}
+
+
+class TestTaintScanSeesTheSecurityShapes8187R24(unittest.TestCase):
+    """r24 sec F5 (security r23, check 4): getattr-built and aliased assert methods, Match objects, and print, raise and bare
+    assert operands are scanned like any assert."""
+
+    def test_each_shape_is_flagged(self):
+        for name, source in TAINT_SEC_SHAPES.items():
+            with self.subTest(shape=name):
+                self.assertGreater(len(tainted_assert_lines(source)), 0)
+
+    def test_a_match_object_that_is_only_tested_for_truth_is_clean(self):
+        source = TAINT_HEAD + "        import re\n        self.assertEqual(bool(re.search('a', text)), True)\n"
+        self.assertEqual(tainted_assert_lines(source), [])
+
+
+# ---- r24 security F6 and F7: the raw text has no path outside Opaque; the docstring states the file-name exception ----
+class TestNoPathToTheRawTextOutsideOpaque8187R24(unittest.TestCase):
+    """r24 sec F6 (security r23, check 1) and F7."""
+
+    DIRTY = {
+        "attribute": "x = wrapped._raw\n",
+        "getattr": "x = getattr(wrapped, '_raw')\n",
+        "getattr dynamic prefix": "x = getattr(wrapped, '_' + 'raw')\n",
+        "getstate": "x = wrapped.__getstate__()\n",
+        "slot descriptor": "x = Opaque._raw.__get__(wrapped)\n",
+    }
+    CLEAN = "x = wrapped.raw\ny = str(wrapped)\nclass Opaque:\n    def raw(self):\n        return self._raw\n"
+
+    def test_the_gate_refuses_each_path(self):
+        for name, source in self.DIRTY.items():
+            with self.subTest(path=name):
+                self.assertGreater(len(opaque_escape_lines(source)), 0)
+
+    def test_the_gate_allows_the_class_itself(self):
+        self.assertEqual(opaque_escape_lines(self.CLEAN), [])
+
+    def test_neither_file_reaches_for_the_raw_text(self):
+        for path in (TY_PATH, THIS_PATH):
+            with self.subTest(file=path.name):
+                self.assertEqual(opaque_escape_lines(path.read_text(encoding="utf-8")), [])
+
+    def test_the_module_docstring_states_the_file_name_exception(self):
+        self.assertIn("repo_problems", ty.__doc__)
+        self.assertIn("file name", ty.__doc__)
+
+
+# ---- r24 F42a: the r22 decision pins, restored (the AST taint scan binds names to loaders; this one is by NAME) ----
+RAW_OPERAND = re.compile(r"\bentry\b|\bdata\b|\bpinned\b|\boutputs\b|read_text|read_bytes|JOB_PINS_FILE|build_pins|"
+                         r"self\.pins\b|\.texts\b|workflow_keys|job_names|tier_jobs")
+COMPARE_FAMILY = frozenset(("assertEqual", "assertNotEqual", "assertIn", "assertNotIn", "assertCountEqual",
+                            "assertListEqual", "assertDictEqual", "assertSequenceEqual"))
+
+
+def raw_operand_comparisons(source):
+    """The line numbers of the ``assertEqual`` family calls in ``source`` whose first two operands are raw workflow or pin
+    data by NAME (r22 F40-a).  Exempt: a comparison with ``[]`` (already labelled problem lines), a ``len(...)`` operand and
+    an operand wrapped by ``opaque`` or ``same``; everything else goes through ``assert_same`` / ``assert_has``."""
+    lines = []
+    wrappers = ("len", "opaque", "same")
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in COMPARE_FAMILY):
+            continue
+        operands = node.args[:2]
+        if any(isinstance(arg, ast.List) and not arg.elts for arg in operands):
+            continue
+        exempt = lambda arg: isinstance(arg, ast.Call) and call_name(arg) in wrappers
+        if any(RAW_OPERAND.search(ast.get_source_segment(source, arg) or "") for arg in operands if not exempt(arg)):
+            lines.append(node.lineno)
+    return lines
+
+
+class TestNoRawWorkflowOperandIsCompared8187R22(unittest.TestCase):
+    """r22 F40-a, restored by r24 F42a: the AST taint scan follows values from the loaders, so a comparison of a name the
+    scan never saw bound (``entry``, ``data``, ``pinned``) is only caught by name.  The allowed set is zero in both files."""
+
+    ALLOWED = 0
+
+    def test_neither_file_compares_raw_workflow_or_pin_text_with_assertEqual_8187_f40a(self):
+        for path in (THIS_PATH, TY_PATH):
+            with self.subTest(file=path.name):
+                found = raw_operand_comparisons(path.read_text(encoding="utf-8"))
+                self.assertEqual(len(found), self.ALLOWED)
+
+    def test_the_scanner_counts_a_restored_raw_comparison_8187_f40a(self):
+        raw = 'class T:\n    def t(self):\n        self.assertEqual(entry["job_names"], sorted(data["jobs"]))\n'
+        self.assertEqual(raw_operand_comparisons(raw), [3])
+        mixed = "self.assertIn('on', data)\nself.assertEqual(f(data), [])\n"
+        self.assertEqual(raw_operand_comparisons(mixed), [1])
+        exempt = "self.assertEqual(len(data), 3)\nassert_same(self, data, 1, 'x')\nself.assertEqual(ty.opaque(data, 'key[0]'), 1)\n"
+        self.assertEqual(raw_operand_comparisons(exempt), [])
+
+
+# ---- r24 F42g (3): the positional labels the r19, r20 and r22 pins printed by position, in opaque form ----
+POS_MARK = "MK" + "feed0123456789abcdef01"
+
+
+def has_line(problems, pattern):
+    """True when one line of ``problems`` matches ``pattern`` (a bool, so an assert on it prints no problem text)."""
+    return any(re.search(pattern, line) for line in problems)
+
+
+def positional_cases():
+    """``{site: (problems, [pattern, ...])}``: one fault per label-printing site family, the marker planted in the text the
+    fault is about; each pattern names the label family and the length of the marker."""
+    n = len(POS_MARK)
+    wf = "ci.yml"
+    text = (WORKFLOWS / wf).read_text(encoding="utf-8")
+    pins = load_job_pins()
+    target = pin_targets(wf, text)[0]
+    job = target[0]
+    head = "\n  %s:" % job
+    pad = " " * (indent_of(text.split("\n")[target[3]]) + 2)
+    copy_ = lambda: json.loads(json.dumps(pins))
+    cases = {}
+    dup = text.rstrip("\n") + '\n"%s": 1\n"%s": 2\n' % (POS_MARK, POS_MARK)
+    cases["duplicate top-level key (r19 F36)"] = (
+        primary_pin_problems(wf, dup, pins[PRIMARY]), [r"the mapping key key\[\d+\] len=%d appears twice" % n])
+    extra = text.rstrip("\n") + '\n"%s": 1\n' % POS_MARK
+    cases["extra top-level key (r19 F36)"] = (
+        primary_pin_problems(wf, extra, pins[PRIMARY]),
+        [r"top-level keys outside the closed set: key\[0\] len=%d" % n, r"a workflow-level key key\[0\] len=%d was added" % n])
+    job_edit = text.replace(head, '%s\n    "%s": 1' % (head, POS_MARK))
+    cases["job key, loaded view (r19 F36)"] = (
+        primary_pin_problems(wf, job_edit, pins[PRIMARY]),
+        [r"job\[\d+\] len=\d+ job-level keys: differs from the pin at job\.key\[0\] len=%d" % n])
+    cases["job key, text view (r19 F36)"] = (
+        job_pin_problems(wf, job_edit, pins[SECONDARY]), [r"job key\[\d+\] len=\d+ job-level keys: differs from the pin at line \d+"])
+    step_edit = splice(text, target[3] + 1, ['%s"%s": 1' % (pad, POS_MARK)])
+    cases["step key, loaded view (r19 F36)"] = (
+        primary_pin_problems(wf, step_edit, pins[PRIMARY]),
+        [r"step \d+ \(step\[\d+\] len=\d+\): differs from the pin at steps\[\d+\]\.key\[1\] len=%d" % n])
+    cases["step key, text view (r19 F36)"] = (
+        job_pin_problems(wf, step_edit, pins[SECONDARY]), [r"step \d+ \(step\[\d+\] len=\d+\): differs from the pin at line \d+"])
+    row = next(iter(ty.RUNS_ON_EXEMPT.values()))
+    matrix = {"runs-on": row[1], "strategy": {"matrix": {ty.RUNS_ON_FORMS[row[1]][0]: ["ubuntu-latest"], POS_MARK: 1}}}
+    cases["matrix key (r19 F36)"] = ([ty.exemption_problem(row, matrix)], [r"^matrix\.key\[1\] len=%d is not a list" % n])
+    removed_job = copy_()
+    entry = removed_job[PRIMARY][wf]["tier_jobs"]
+    first = next(iter(entry))
+    entry[first]["sha256"] = "0" * 64
+    entry[first]["keys"][POS_MARK] = "0" * 64
+    cases["removed pinned job key (r20 F38)"] = (
+        primary_pin_problems(wf, text, removed_job[PRIMARY]), [r"differs from the pin at job\.key\[\d+\] len=%d \(removed\)" % n])
+    removed_step = copy_()
+    entry = removed_step[PRIMARY][wf]["tier_jobs"]
+    first = next(iter(entry))
+    index = next(i for i, step in enumerate(entry[first]["steps"]) if "keys" in step)
+    entry[first]["sha256"] = "0" * 64
+    entry[first]["steps"][index]["sha256"] = "0" * 64
+    entry[first]["steps"][index]["keys"][POS_MARK] = "0" * 64
+    cases["removed pinned step key (r20 F38)"] = (
+        primary_pin_problems(wf, text, removed_step[PRIMARY]),
+        [r"differs from the pin at steps\[%d\]\.key\[\d+\] len=%d \(removed\)" % (index, n)])
+    gone = copy_()
+    primary = gone[PRIMARY][wf]
+    primary["job_names"] = sorted([*primary["job_names"], POS_MARK])
+    primary["job_names_sha256"] = "0" * 64
+    primary["tier_jobs"][POS_MARK] = json.loads(json.dumps(next(iter(primary["tier_jobs"].values()))))
+    secondary = gone[SECONDARY][wf]
+    secondary["jobs"] = [*secondary["jobs"], POS_MARK]
+    secondary["pinned"][POS_MARK] = json.loads(json.dumps(next(iter(secondary["pinned"].values()))))
+    for view, problems in (("loaded", primary_pin_problems(wf, text, gone[PRIMARY])),
+                           ("text", job_pin_problems(wf, text, gone[SECONDARY]))):
+        cases["pinned job that is gone, %s view (r20 F38)" % view] = (
+            problems, [r"missing \[key\[\d+\] len=%d\]" % n, r"job key\[\d+\] len=%d: pinned job is missing" % n])
+    block = copy_()
+    block[SECONDARY][wf]["workflow"][POS_MARK] = next(iter(block[SECONDARY][wf]["workflow"].values()))
+    cases["pinned workflow-level block key (r22 F39a)"] = (
+        job_pin_problems(wf, text, block[SECONDARY]), [r"the pinned workflow-level key\[\d+\] len=%d: block is missing" % n])
+    named = splice(text, target[3], ["      - name: %s" % POS_MARK, "        run: echo one"])
+    cases["an inserted step's name (r14 F27)"] = (
+        primary_pin_problems(wf, named, pins[PRIMARY]), [r"step \d+ \(step\[\d+\] len=%d\)" % n])
+    return cases
+
+
+class TestEveryLabelIsPositional8187R24(unittest.TestCase):
+    """r24 F42g (3): the r19, r20 and r22 pins that checked a fault is "printed by position" were removed with ``printable``;
+    this is each of them in opaque form: the fault is reported, the marker planted in the text it is about is nowhere in a
+    line, and the label family, position and length are the contract."""
+
+    def test_every_site_family_is_covered(self):
+        self.assertEqual(len(positional_cases()), 13)
+
+    def test_no_line_carries_the_marker_and_each_names_its_label(self):
+        for site, (problems, patterns) in positional_cases().items():
+            with self.subTest(site=site):
+                self.assertGreater(len(problems), 0)
+                self.assertIs(has_line(problems, re.escape(POS_MARK)), False)
+                self.assertIs(has_line(problems, "feed0123456789abcdef01"), False)
+                for pattern in patterns:
+                    self.assertIs(has_line(problems, pattern), True)
 
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
