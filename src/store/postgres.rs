@@ -15574,21 +15574,39 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     // so it stays off the 63-of-64 non-emitting appends (K3 parity with sqlite).
     let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
     if crate::governance::audit::watermark_emission_due(next_seq) {
-        let genesis: Option<(String, String, Vec<u8>)> =
+        // decision (#7238, #7239, #7604): a genesis read error SKIPS the
+        // emission and the append succeeds, as on sqlite (3-agent vote
+        // (6def5ab6), 3-0). A failed statement aborts a postgres transaction, so
+        // the read runs in a SAVEPOINT: on error it is rolled back explicitly
+        // and the append's own transaction stays usable.
+        let mut savepoint = sqlx::Acquire::begin(&mut *tx).await?;
+        let genesis: Result<Option<(String, String, Vec<u8>)>, sqlx::Error> =
             sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
-                .fetch_optional(&mut **tx)
-                .await?;
-        // #7228 — never anchor a db_id-less (legacy) watermark (sqlite parity):
-        // an absent genesis skips the emission with a single WARN.
-        if let Some((gid, gagent, gpayload)) = genesis {
-            let db_id = crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload);
-            anchor = crate::governance::audit::PendingAuditAnchor::watermark(
-                next_seq,
-                &head_hash_hex,
-                &db_id,
-            );
-        } else {
-            crate::governance::audit::warn_watermark_skipped_no_genesis();
+                .fetch_optional(&mut *savepoint)
+                .await;
+        match genesis {
+            Ok(genesis) => {
+                savepoint.commit().await?;
+                // #7228 — never anchor a db_id-less (legacy) watermark (sqlite
+                // parity): an absent genesis skips the emission with a single WARN.
+                if let Some((gid, gagent, gpayload)) = genesis {
+                    let db_id =
+                        crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload);
+                    anchor = crate::governance::audit::PendingAuditAnchor::watermark(
+                        next_seq,
+                        &head_hash_hex,
+                        &db_id,
+                    );
+                } else {
+                    crate::governance::audit::warn_watermark_skipped_no_genesis();
+                }
+            }
+            Err(e) => {
+                savepoint.rollback().await?;
+                crate::governance::audit::warn_watermark_skipped_genesis_read_error(&e);
+                anchor = crate::governance::audit::PendingAuditAnchor::genesis_skip(next_seq);
+                crate::governance::audit::note_genesis_skip_in_transaction(next_seq);
+            }
         }
     }
 
