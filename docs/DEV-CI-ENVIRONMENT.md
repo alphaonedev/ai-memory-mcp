@@ -35,7 +35,7 @@ Every enterprise-fed test tier runs the identical certified stack:
 |---|---|
 | PostgreSQL | **18.6** |
 | Apache AGE | **1.8.0** |
-| pgvector | **0.8.6** |
+| pgvector | **0.8.7** |
 
 **TLS is mandatory on every tier, both nodes** — no customer permits unencrypted
 traffic to/from PostgreSQL. Each tier enforces:
@@ -63,7 +63,7 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 ### 3.1 Linux node (self-hosted `linux-fed`)
 
 - **OS:** Linux x86_64 (Ubuntu/Pop!_OS noble-class)
-- **Data tier:** **native** (pgdg apt pg18.6 + pgvector 0.8.6; **AGE 1.8.0 built
+- **Data tier:** **native** (pgdg apt pg18.6 + pgvector 0.8.7; **AGE 1.8.0 built
   from source** — AGE is not packaged in pgdg apt)
   - Cluster listens on `127.0.0.1:5445`
   - TLS certs operator-local (postgres-owned; CA reused from `pg-age-stack/certs`)
@@ -74,7 +74,7 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 ### 3.2 macOS node (self-hosted `macos-fed`)
 
 - **OS:** macOS arm64 (Apple Silicon)
-- **Data tier:** **native** (Homebrew `postgresql@18` 18.6 + pgvector 0.8.6 built
+- **Data tier:** **native** (Homebrew `postgresql@18` 18.6 + pgvector 0.8.7 built
   from source; **AGE 1.8.0 built from source**, branch `release/PG18/1.8.0`)
   - Cluster listens on `127.0.0.1:5445`
   - Certs / env / init script live under the operator-local `pg-age-stack/` tree
@@ -91,7 +91,7 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 
 **Test matrix — self-hosted 2×2:**
 
-|                     | sqlite (local/default) | enterprise-fed (pg18.6+AGE1.8.0+pgvector0.8.6, TLS) |
+|                     | sqlite (local/default) | enterprise-fed (pg18.6+AGE1.8.0+pgvector0.8.7, TLS) |
 |---------------------|:----------------------:|:---------------------------------------------------:|
 | **Linux** (f2)      | ✓ self-hosted          | ✓ self-hosted (native `:5445`)                      |
 | **macOS** (f1)      | ✓ self-hosted          | ✓ self-hosted (native `:5445`)                      |
@@ -157,7 +157,7 @@ The containerized certified stack is retained as a **dormant reproduction
 artifact** so a reviewer can spin up an equivalent enterprise-fed environment:
 
 - Compose: `pg-age-stack/docker-compose.yml` + `pg-age-stack/Dockerfile`
-- Image (kept): `ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.6`
+- Image (kept): `ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.7`
 - Deploy recipe (SSOT for the triple): `deploy/docker-1461/`
 
 ```bash
@@ -210,7 +210,7 @@ stubs. Fix by symlinking each to the keg subdir
 `PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config`. Also install brew
 `bison`+`flex` (Apple's bison 2.3 is too old).
 
-**Linux:** pgdg apt provides pg18.6 + pgvector 0.8.6 (`noble-pgdg`); AGE must be
+**Linux:** pgdg apt provides pg18.6 + pgvector 0.8.7 (`noble-pgdg`); AGE must be
 built from source (`release/PG18/1.8.0`) with the same BISONFLAGS patch.
 
 **Rust on a CI node must be rustup-managed, never Homebrew (2026-08-22):**
