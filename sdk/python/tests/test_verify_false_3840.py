@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import datetime
 import http.server
+import inspect
 import ipaddress
 import pathlib
 import socketserver
 import ssl
 import threading
 from collections.abc import Iterator
+from typing import Any
 
 import certifi
 import httpx
@@ -63,15 +65,17 @@ BASE_URL = "https://localhost:9077"
 def _effective(context: ssl.SSLContext) -> tuple[ssl.VerifyMode, bool]:
     """The OpenSSL-level state, read through the base-class descriptors so a
     subclass's overridden properties cannot misreport it."""
-    return (
-        ssl.SSLContext.verify_mode.__get__(context),
-        ssl.SSLContext.check_hostname.__get__(context),
-    )
+    # typeshed types these class attributes as their value types, so the
+    # descriptors are fetched with ``inspect.getattr_static`` (typed Any, MRO
+    # walk, no descriptor call) to keep mypy clean (#7047).
+    verify_mode: Any = inspect.getattr_static(ssl.SSLContext, "verify_mode")
+    check_hostname: Any = inspect.getattr_static(ssl.SSLContext, "check_hostname")
+    return (verify_mode.__get__(context), check_hostname.__get__(context))
 
 
 def _client_context(client: AiMemoryClient | AsyncAiMemoryClient) -> ssl.SSLContext:
-    pool = client._client._transport._pool  # noqa: SLF001 - effective TLS posture probe
-    return pool._ssl_context  # type: ignore[no-any-return]  # noqa: SLF001
+    transport: Any = client._client._transport  # noqa: SLF001 - effective TLS posture probe
+    return transport._pool._ssl_context  # type: ignore[no-any-return]  # noqa: SLF001
 
 
 class _FalsyStr(str):
