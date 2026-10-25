@@ -2696,6 +2696,7 @@ class CanaryRun:
         self.foreign = {} if foreign_seed is None else canary_window_table(canary_digest(foreign_seed, n) for n in range(1, 20001))
         self.fail_views = {}   # (shape, view) -> fail-path observations (r24 sec F2)
         self.fail_families = {}  # (shape, view, scenario family) -> fail-path observations
+        self.fail_sites = {}  # (shape, scenario family) -> fail-path observations of any view (r25 code C2)
         self.kind = {}      # marker hex -> kind
         self.names = {}     # (shape, original) -> marker (names are shared between the workflow and its pins)
         self.windows = {}   # 8-hex window -> marker hex
@@ -2771,6 +2772,8 @@ class CanaryRun:
                 self.unexpected.append((shape_name, scenario))
         elif expect == "fail":
             self.fail_calls += 1
+            site = (shape_name, scenario.split("/", 1)[0])
+            self.fail_sites[site] = self.fail_sites.get(site, 0) + 1
             if view in ("loaded", "text"):
                 self.fail_views[(shape_name, view)] = self.fail_views.get((shape_name, view), 0) + 1
                 family = scenario.split("/", 1)[0]
@@ -3107,7 +3110,12 @@ def canary_controls(run):
     def control_warning(marker):
         warnings.warn(marker)
 
-    return {
+    def control_notes(marker):
+        exc = ValueError("outer")
+        exc.add_note(marker)  # the marker lives in ``__notes__`` only: not in str, args, the cause or the context
+        raise exc
+
+    controls = {
         "print": lambda marker: print("seen", marker),
         "stderr": lambda marker: print(marker, file=sys.stderr),
         "log": lambda marker: logging.getLogger("canary").warning("seen %s", marker),
@@ -3117,6 +3125,9 @@ def canary_controls(run):
         "exception-chain": control_chain,
         "exception-context": control_context,
     }
+    if sys.version_info >= (3, 11):  # PEP 678 notes exist from 3.11 (r25 sec S3)
+        controls["exception-notes"] = control_notes
+    return controls
 
 
 def canary_control_failures(mod):
@@ -3132,24 +3143,40 @@ def canary_control_failures(mod):
     return failures
 
 
-# the scenario families the fail-path guard gates: every shape must reach the first in both views, the plain shape the others
-CANARY_FAIL_FAMILIES = ("fail-real-pins",)
-CANARY_FAIL_FAMILIES_PLAIN = ("fail-other-values", "fail-real-text-own-pins")
+# the scenario families each fail-path guard gates (r25 code C2): every shape must reach every family of every guard
+CANARY_GUARDED_FAMILIES = {
+    "real-pins fail view": ("fail-real-pins",),
+    "post-pass tail": (
+        "fail-injected-run", "fail-renamed-step", "fail-unnamed-step", "fail-marked-pins-keys", "fail-marked-pins-values",
+        "fail-text-extra-job-key", "fail-text-extra-step-key", "fail-pin-extra-block", "fail-pin-extra-job-key",
+        "fail-pin-extra-step-key",
+        "fail-bad-escape", "fail-duplicate-job", "fail-duplicate-key", "fail-extra-top-level-key", "fail-job-level-uses",
+        "fail-job-not-a-mapping", "fail-jobs-not-a-mapping", "fail-local-tag", "fail-merge-key", "fail-no-jobs",
+        "fail-non-string-key", "fail-plain-anchor", "fail-sequence-document", "fail-std-bool-value", "fail-std-float-value",
+        "fail-std-int-key", "fail-std-int-value", "fail-tab-indent", "fail-tag-directive", "fail-unterminated-quote"),
+    "legacy scenarios": ("fail-legacy-argv", "fail-legacy-continued", "fail-legacy-url"),
+    "repository scenario": ("fail-repo-marker-matrix", "fail-repo-marker-pins", "fail-repo-marker-tree"),
+}
+# families only the shapes whose own pins could be built reach (the own-pins fail views)
+CANARY_GUARDED_FAMILIES_PLAIN = {"own-pins fail views": ("fail-other-values", "fail-real-text-own-pins")}
 
 
 def canary_coverage_failures(run, shapes):
-    """Fail-path coverage holes of ``run`` (r24 sec F2): a shape and view with no fail-path observation, or a guarded family
-    that never ran.  Counting every fail observation is not enough (other fail scenarios keep the count above zero when the
-    guard is forced off), so the families the guard gates are counted on their own."""
+    """Fail-path coverage holes of ``run`` (r24 sec F2, r25 sec S4 and code C2): a shape and view with no fail-path
+    observation, or a guarded family that never ran for a shape.  Every family of every guard is counted on its own (other
+    fail scenarios keep a bare count above zero when one guard is forced off), and a hole names its guard."""
     failures = []
     for shape in shapes:
         for view in ("loaded", "text"):
             if run.fail_views.get((shape, view), 0) == 0:
                 failures.append("%s/%s: no fail-path observation" % (shape, view))
-            families = CANARY_FAIL_FAMILIES + (CANARY_FAIL_FAMILIES_PLAIN if shape == "plain" else ())
+        groups = dict(CANARY_GUARDED_FAMILIES)
+        if shape == "plain":
+            groups.update(CANARY_GUARDED_FAMILIES_PLAIN)
+        for guard, families in groups.items():
             for family in families:
-                if run.fail_families.get((shape, view, family), 0) == 0:
-                    failures.append("%s/%s: family %s never ran" % (shape, view, family))
+                if run.fail_sites.get((shape, family), 0) == 0:
+                    failures.append("%s: guard '%s' family %s never ran" % (shape, guard, family))
     return failures
 
 
@@ -3242,7 +3269,10 @@ class TaintScan:
         if node is None or isinstance(node, (ast.Constant, ast.Compare)):
             return False
         if isinstance(node, ast.Lambda):
-            return any(t(default, env) for default in [*node.args.defaults, *node.args.kw_defaults] if default is not None)
+            if any(t(default, env) for default in [*node.args.defaults, *node.args.kw_defaults] if default is not None):
+                return True
+            hidden = {a.arg for a in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]}
+            return t(node.body, set(env) - hidden)  # r25 sec S2: ``[lambda: body]`` yields author text when called
         if isinstance(node, ast.Name):
             return node.id in env and (node.id not in PUBLIC_NAMES or node.id in self.leaked_public)
         if isinstance(node, ast.Attribute):
@@ -3276,6 +3306,8 @@ class TaintScan:
             return self.lambda_result(lam, node, env)
         if isinstance(node.func, ast.Name) and node.func.id in env:
             return True  # a callable bound from tainted material (``functools.partial(f, text)``) yields it
+        if isinstance(node.func, (ast.Subscript, ast.Call)) and self.tainted(node.func, env):
+            return True  # r25 sec S2: ``fs[0]()`` where the container holds a tainted callable
         if self.follow and name in self.functions:
             self.pass_params(self.functions[name], node, env)
             return name in self.returns
@@ -3314,6 +3346,14 @@ class TaintScan:
         for kw in node.keywords:
             if self.tainted(kw.value, env):
                 inner.add(kw.arg if kw.arg in names else getattr(lambda_node.args.kwarg, "arg", kw.arg))
+        supplied = {kw.arg for kw in node.keywords}
+        positional = [a.arg for a in [*lambda_node.args.posonlyargs, *lambda_node.args.args]]
+        defaulted = list(zip(positional[len(positional) - len(lambda_node.args.defaults):], lambda_node.args.defaults))
+        defaulted += [(a.arg, d) for a, d in zip(lambda_node.args.kwonlyargs, lambda_node.args.kw_defaults) if d is not None]
+        for position, (name, default) in enumerate(defaulted):
+            given = name in supplied or (name in positional and positional.index(name) < len(node.args))
+            if not given and self.tainted(default, env):
+                inner.add(name)  # r25 sec S2: ``lambda v=body: v`` called bare
         return lambda_node, inner
 
     def pass_params(self, func, node, env):
@@ -3359,12 +3399,17 @@ class TaintScan:
     def assign(self, node, env):
         value = node.value
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        pairs = [(target, value) for target in targets]
         for target in targets:
+            if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)) \
+                    and len(target.elts) == len(value.elts):
+                pairs += list(zip(target.elts, value.elts))  # r25 sec S2: ``eq, ne = self.assertEqual, self.assertNotEqual``
+        for target, source in pairs:
             if isinstance(target, ast.Name):
-                if isinstance(value, ast.Lambda):
-                    self.lambdas[target.id] = (value, env)
-                if self.echo_method(value) is not None:
-                    self.aliases[target.id] = self.echo_method(value)
+                if isinstance(source, ast.Lambda):
+                    self.lambdas[target.id] = (source, env)
+                if self.echo_method(source) is not None:
+                    self.aliases[target.id] = self.echo_method(source)
         if not self.tainted(value, env):
             return
         for target in targets:
@@ -3393,7 +3438,7 @@ class TaintScan:
         if isinstance(node, ast.Attribute):
             return node.attr if node.attr.startswith(ASSERT_PREFIX) or node.attr in ECHO_CALLS else None
         if isinstance(node, ast.Name):
-            return self.aliases.get(node.id)
+            return node.id if node.id in PRINT_CALLS else self.aliases.get(node.id)  # ``partial(print, text)()`` (r25 code C4)
         if isinstance(node, ast.Call):
             if call_name(node) == "getattr" and len(node.args) >= 2:
                 name = node.args[1]
@@ -3425,8 +3470,8 @@ class TaintScan:
                 if default is not None and self.tainted(default, env):
                     self.add_param(stmt.name, arg.arg)
             return  # analysed on its own, with its own environment
-        if isinstance(stmt, ast.Raise) and stmt.exc is not None and self.tainted(stmt.exc, env):
-            self.flagged.add(stmt.lineno)  # r24 sec F5: an exception built from author text prints it
+        if isinstance(stmt, ast.Raise) and (self.tainted(stmt.exc, env) or self.tainted(stmt.cause, env)):
+            self.flagged.add(stmt.lineno)  # r24 sec F5, r25 sec S2: an exception (or its cause) built from author text prints it
         if isinstance(stmt, ast.Assert) and (self.operands_tainted(stmt.test, env) or self.tainted(stmt.msg, env)):
             self.flagged.add(stmt.lineno)
         if isinstance(stmt, ast.ClassDef):
@@ -3463,6 +3508,9 @@ class TaintScan:
         if isinstance(func, ast.Name) and func.id in PRINT_CALLS:
             return func.id
         if isinstance(func, ast.Attribute):
+            if func.attr in ("write", "writelines") and isinstance(func.value, ast.Attribute) \
+                    and func.value.attr in ("stdout", "stderr"):
+                return func.attr  # r25 sec S2 and code C4: ``sys.stdout.write(text)`` echoes like print
             if func.attr in PRINT_CALLS or (func.attr in LOG_METHODS and isinstance(func.value, ast.Name)
                                             and func.value.id in LOG_BASES):
                 return func.attr
@@ -3488,7 +3536,7 @@ class TaintScan:
                 args = args[1:]  # a failing assertTrue prints a FALSY first operand: empty text, never a value
             if any(self.tainted(a, env) for a in args):
                 self.flagged.add(node.lineno)
-        elif name in ("append", "extend", "add", "update", "insert", "setdefault") and isinstance(node.func, ast.Attribute) \
+        elif name in ("append", "extend", "add", "update", "insert", "setdefault", "add_note") and isinstance(node.func, ast.Attribute) \
                 and isinstance(node.func.value, ast.Name):
             if any(self.tainted(a, env) for a in node.args):
                 env.add(node.func.value.id)
@@ -3520,14 +3568,28 @@ def tainted_assert_lines(source, follow_helpers=True):
 
 
 # ---- r24 sec F6: no path to the raw text outside the wrapper class ----
-OPAQUE_PRIVATE = frozenset(("_" + "raw", "_" + "RAW", "__get" + "state__"))  # spelled in parts so this line is not a hit
+OPAQUE_PRIVATE = frozenset("".join(parts) for parts in (("_", "raw"), ("_", "RAW"), ("__get", "state__"), ("_regis", "try"), ("__glob", "als__")))  # spelled in parts
+OPAQUE_NAMESPACES = ("vars", "globals", "locals")
+
+
+def folded_string(node):
+    """The string a constant, or a ``+`` chain of constants, spells; None for anything else (r25 code C5: ``'_' + 'RAW'``)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = folded_string(node.left), folded_string(node.right)
+        return None if left is None or right is None else left + right
+    return None
 
 
 def opaque_escape_lines(source, allowed=("Opaque",)):
     """Sorted line numbers in ``source`` that reach the raw text of an ``Opaque`` by a path other than ``Opaque.raw()``:
     an attribute ``._raw`` or ``.__getstate__``, a read of the registry name ``_RAW``, a string constant that names one of
-    them, or ``getattr``/``hasattr``/``setattr``/``delattr`` with a name that is not a constant string.  Code inside a class or
-    function named in ``allowed`` (the wrapper itself; the probe that tries every path) is exempt."""
+    them (also when built from constants joined with ``+``), a ``from m import _RAW``, a subscript of ``vars()`` /
+    ``globals()`` / ``locals()`` / ``__dict__`` whose key is not a constant string, the finalizer registry (``_registry``)
+    and a function's ``__globals__``, or ``getattr``/``hasattr``/``setattr``/``delattr`` with a name that is not a constant
+    string.  Code inside a class or function named in ``allowed`` (the wrapper itself; the probes that try every path) is
+    exempt."""
     tree = ast.parse(source)
     found = set()
 
@@ -3541,9 +3603,39 @@ def opaque_escape_lines(source, allowed=("Opaque",)):
                 found.add(node.lineno)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in OPAQUE_PRIVATE:
                 found.add(node.lineno)
+            elif isinstance(node, ast.BinOp) and folded_string(node) in OPAQUE_PRIVATE:
+                found.add(node.lineno)
+            elif isinstance(node, ast.ImportFrom) and any(alias.name in OPAQUE_PRIVATE for alias in node.names):
+                found.add(node.lineno)
+            elif isinstance(node, ast.Subscript) and (
+                    (isinstance(node.value, ast.Call) and call_name(node.value) in OPAQUE_NAMESPACES)
+                    or (isinstance(node.value, ast.Attribute) and node.value.attr == "__dict__")) \
+                    and not (isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str)):
+                found.add(node.lineno)
             elif isinstance(node, ast.Call) and call_name(node) in ("getattr", "hasattr", "setattr", "delattr") \
                     and len(node.args) >= 2 and not (isinstance(node.args[1], ast.Constant)
                                                      and isinstance(node.args[1].value, str)):
+                found.add(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            visit(child, exempt)
+
+    visit(tree, False)
+    return sorted(found)
+
+
+def raw_unwrap_lines(source, allowed=()):
+    """Sorted line numbers in ``source`` that unwrap an ``Opaque``: a ``.raw()`` call, or ``getattr(x, "raw")`` (also with the
+    name built from constants), outside the functions named in ``allowed`` (r25 code C5)."""
+    tree = ast.parse(source)
+    found = set()
+
+    def visit(node, exempt):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in allowed:
+            exempt = True
+        if not exempt and isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "raw":
+                found.add(node.lineno)
+            elif call_name(node) in ("getattr", "hasattr") and len(node.args) >= 2 and folded_string(node.args[1]) == "raw":
                 found.add(node.lineno)
         for child in ast.iter_child_nodes(node):
             visit(child, exempt)
@@ -3606,15 +3698,9 @@ class TestOpaqueIsFailClosed8187R23(unittest.TestCase):
         """The places that unwrap are the bool helper ``ty.same`` and ``Opaque.__eq__`` / ``__hash__`` (both return a bool or
         an int, never text); no other code (checker, tests) calls ``.raw()``."""
         for path in (Path(ty.__file__), Path(__file__)):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            allowed = {"same", "__eq__", "__hash__"} if path.name == "tier_yaml_8187.py" else set()
-            for owner in ast.walk(tree):
-                if not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                for node in ast.walk(owner):
-                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "raw" \
-                            and owner.name not in allowed:
-                        self.fail("a .raw() call outside ty.same at line %d of %s" % (node.lineno, path.name))
+            allowed = ("same", "__eq__", "__hash__") if path.name == "tier_yaml_8187.py" else ()
+            with self.subTest(file=path.name):
+                self.assertEqual(raw_unwrap_lines(path.read_text(encoding="utf-8"), allowed=allowed), [])
 
 
 class TestNoRoutedSiteCanEchoAuthorText8187R23(unittest.TestCase):
@@ -4291,7 +4377,7 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         for name, (kind, what, check) in HARNESS_MUTANTS.items():
             with self.subTest(mutant=name):
                 if kind in ("chain-str", "notes-strip") and sys.version_info < (3, 11):
-                    self.skipTest("exception notes exist from Python 3.11")
+                    continue  # exception notes exist from Python 3.11; the control is registered from there too
                 variant = load_variant(ty_source, harness_mutant_source(test_source, kind, what))
                 if check == "controls":
                     failures = canary_control_failures(variant)
@@ -4586,7 +4672,7 @@ class TestEveryLabelIsPositional8187R24(unittest.TestCase):
 
 
 # ---- r25 code C5: the opaque gate's four bypasses ----
-OPAQUE_GATE_ALLOWED = ("Opaque", "opaque_probe_paths", "opaque_finalizer_funcs")  # the wrapper and the two probes that try every path
+OPAQUE_GATE_ALLOWED = ("Opaque", "_forget", "opaque_probe_paths", "opaque_finalizer_funcs")  # the wrapper and the two probes that try every path
 
 
 def opaque_finalizer_funcs(o):

@@ -130,6 +130,13 @@ class StrictLoader(BASE_LOADER):
 _RAW = {}  # id(wrapper) -> the raw value: module-private, so no attribute of a wrapper holds the text (r24 code F42b)
 
 
+def _forget(key):
+    """The finalizer of an ``Opaque``: drops its registry entry.  A module-level function, not the bound ``_RAW.pop``: the
+    ``weakref`` finalizer registry holds this function, and a bound method would hand its owner (the registry) to anything
+    that walks ``weakref.finalize`` (r25 code C5)."""
+    _RAW.pop(key, None)
+
+
 class Opaque:
     """An author- or pin-derived value that can never be printed (r23, 3-agent vote (6def5ab6), fail closed).
 
@@ -158,7 +165,7 @@ class Opaque:
         self._label = label
         self._n = size if isinstance(size, int) else 0
         _RAW[id(self)] = raw
-        weakref.finalize(self, _RAW.pop, id(self), None)
+        weakref.finalize(self, _forget, id(self))
 
     def raw(self):
         return _RAW.get(id(self))
@@ -245,7 +252,9 @@ def load_failure(exc):
 
 
 def load_strict(text):
-    """The document of ``text`` through ``StrictLoader``; raises ``StrictYamlError`` only.
+    """The document of ``text`` through ``StrictLoader``; raises ``StrictYamlError`` only: every other exception, parser or
+    builtin (r25 sec S1: ``!!int x`` raises ValueError), is converted to its class name (and line when it has one) OUTSIDE the
+    handler.
 
     A parser error is not re-raised (r24 sec F4): its message carries the source line around the fault, and so does a
     chained ``__cause__`` or ``__context__``, so a tag or an escape in an author's workflow would reach pytest's output
@@ -257,7 +266,9 @@ def load_strict(text):
         refuse_anchors(text)  # its scan can fail on a malformed document too
         loader = StrictLoader(text)
         return loader.get_single_data()
-    except yaml.YAMLError as exc:  # a StrictYamlError is a ValueError, not a YAMLError: it passes through with its own text
+    except StrictYamlError:
+        raise  # our own rule text, never author text
+    except Exception as exc:  # a parser error AND a builtin from a standard-tag constructor (``!!int x`` -> ValueError): r25 sec S1
         failure = load_failure(exc)
     finally:
         if loader is not None:
@@ -271,7 +282,7 @@ def load_lenient(text):
     failure = None
     try:
         return yaml.load(text, Loader=yaml.SafeLoader)
-    except yaml.YAMLError as exc:
+    except Exception as exc:  # parser errors and builtin constructor errors alike (r25 sec S1): class and line only
         failure = load_failure(exc)
     raise StrictYamlError(failure)
 
