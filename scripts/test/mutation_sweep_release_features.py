@@ -147,6 +147,11 @@ EXTRA_MUTANTS = (
         "if False:",
     ),
     (
+        "parameter transformation allowed",
+        'elif c == "@" and s[j + 1:j + 2].isalpha():',
+        "elif False:",
+    ),
+    (
         "unreadable RUSTFLAGS value allowed",
         "(value is None or RUSTFLAGS_BAD_RE.search(value) is not None)",
         "(value is not None and RUSTFLAGS_BAD_RE.search(value) is not None)",

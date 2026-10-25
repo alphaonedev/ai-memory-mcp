@@ -1813,6 +1813,11 @@ class ShellScan:
                     raise ShellError("unterminated quote in `${...}`")
             elif c == "`" or s[j:j + 2] == "$(":
                 raise ShellError("command substitution inside `${...}`")
+            elif c == "@" and s[j + 1:j + 2].isalpha():
+                # Round 10 (sec r9 F1): `${name@P}` and its siblings re-evaluate the value (a command substitution in it runs).
+                # decision: refuse every @-transformation operator over refusing @P alone because the scanner cannot know
+                # which operators a future bash re-evaluates, and the guard is fail-closed by design.
+                raise ShellError(f"parameter transformation `${{...@{s[j + 1]}}}` re-evaluates the value")
             elif c == "{":
                 depth += 1
             elif c == "}":
