@@ -1071,8 +1071,39 @@ GATE_ALLOW = (
 WINDOWS = {SELECT_JOB: (SELECT_ALLOW, "Select jobs"),
            GATE_JOB: (GATE_ALLOW, BOOTSTRAP_STEP)}
 # The whole effective environment a pre-trust step may inherit: workflow env + job env + step env.
-WORKFLOW_ENV_ALLOW = {"CARGO_TERM_COLOR", "SELF_HOSTED_TARGET_CAP_BYTES", "CARGO_INCREMENTAL"}
-JOB_ENV_ALLOW = {SELECT_JOB: {"RUSTUP_TOOLCHAIN"}, GATE_JOB: set()}
+WORKFLOW_ENV_VALUES = {"CARGO_TERM_COLOR": "always",
+                       "SELF_HOSTED_TARGET_CAP_BYTES": "42949672960",
+                       "CARGO_INCREMENTAL": "0"}
+WORKFLOW_ENV_ALLOW = set(WORKFLOW_ENV_VALUES)
+JOB_ENV_VALUES = {SELECT_JOB: {"RUSTUP_TOOLCHAIN": "stable"}, GATE_JOB: {}}
+JOB_ENV_ALLOW = {job: set(values) for job, values in JOB_ENV_VALUES.items()}
+# sec r8 F2: the exact value of every env entry a pre-trust step may carry (a value is the same
+# attack surface as a key), the exact job-level key set, runs-on and permissions of both jobs.
+GITHUB_SHA_EXPR = "${{ github.sha }}"
+HEAD_SHA_EXPR = "${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}"
+MATERIALISE_ENV_VALUES = {
+    "CONTEXT_SHA": GITHUB_SHA_EXPR,
+    "EVENT_NAME": "${{ github.event_name }}",
+    "HEAD_SHA": HEAD_SHA_EXPR,
+    "MERGE_GROUP_BASE_SHA": "${{ github.event.merge_group.base_sha }}",
+}
+STEP_ENV_VALUES = {
+    (SELECT_JOB, "Selection mode"): {"ENFORCE": "${{ vars.CI_IMPACT_ENFORCE }}"},
+    (SELECT_JOB, MATERIALISE_STEP): dict(
+        MATERIALISE_ENV_VALUES,
+        IMPACT_FILES="__init__.py common.py select.py build_index.py gate.py rules.json"),
+    (GATE_JOB, GATE_MATERIALISE_STEP): dict(
+        MATERIALISE_ENV_VALUES, IMPACT_FILES="__init__.py common.py gate.py rules.json"),
+    (GATE_JOB, BASE_GATE_STEP): {"NEEDS_JSON": "${{ toJSON(needs) }}",
+                                 "GITHUB_REF_NAME_FULL": "${{ github.ref }}"},
+}
+JOB_KEY_SETS = {
+    SELECT_JOB: sorted(["name", "runs-on", "timeout-minutes", "env", "outputs", "steps"]),
+    GATE_JOB: sorted(["name", "if", "needs", "runs-on", "timeout-minutes", "steps"]),
+}
+JOB_RUNS_ON = "ubuntu-latest"
+JOB_PERMISSIONS = None  # neither job sets `permissions`; the workflow-level block applies
+WORKFLOW_PERMISSIONS = {"contents": "read"}
 JOB_KEYS_REFUSED = ("container", "services")
 STEP_KEYS_REFUSED = ("shell", "working-directory")
 # sha256 of the normalised `run:` text of each Materialise step (see run_digest).
@@ -1176,6 +1207,10 @@ def pre_trust_problems(text):
     problems.extend(_defaults_problems(doc.get("defaults"), "workflow"))
     for key in sorted(set(workflow_env) - WORKFLOW_ENV_ALLOW):
         problems.append("workflow env sets %s" % key)
+    if workflow_env != WORKFLOW_ENV_VALUES:
+        problems.append("workflow env differs from the pinned key/value mapping")
+    if doc.get("permissions") != WORKFLOW_PERMISSIONS:
+        problems.append("workflow permissions differ from the pinned mapping")
     jobs = _mapping(doc.get("jobs"), "jobs", problems)
     for job in (SELECT_JOB, GATE_JOB):
         allow, marker = WINDOWS[job]
@@ -1184,9 +1219,20 @@ def pre_trust_problems(text):
             if key in definition:
                 problems.append("job %s sets %s" % (job, key))
         problems.extend(_defaults_problems(definition.get("defaults"), "job %s" % job))
+        if sorted(definition) != JOB_KEY_SETS[job]:
+            problems.append("job %s keys %r, expected %r"
+                            % (job, sorted(definition), JOB_KEY_SETS[job]))
+        if definition.get("runs-on") != JOB_RUNS_ON:
+            problems.append("job %s runs-on %r, expected %r"
+                            % (job, definition.get("runs-on"), JOB_RUNS_ON))
+        if definition.get("permissions") != JOB_PERMISSIONS:
+            problems.append("job %s permissions %r, expected %r"
+                            % (job, definition.get("permissions"), JOB_PERMISSIONS))
         job_env = _mapping(definition.get("env", {}), "job %s env" % job, problems)
         for key in sorted(set(job_env) - JOB_ENV_ALLOW[job]):
             problems.append("job %s env sets %s" % (job, key))
+        if job_env != JOB_ENV_VALUES[job]:
+            problems.append("job %s env differs from the pinned key/value mapping" % job)
         steps = definition.get("steps")
         if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
             problems.append("job %s steps are not a list of mappings" % job)
@@ -1220,6 +1266,8 @@ def pre_trust_problems(text):
             if set(step_env) != env_keys:
                 problems.append("%s env keys %r, expected %r"
                                 % (where, sorted(step_env), sorted(env_keys)))
+            if step_env != STEP_ENV_VALUES.get((job, name), {}):
+                problems.append("%s env values differ from the pinned mapping" % where)
             if name is None:
                 if step.get("uses") != CHECKOUT_ACTION:
                     problems.append("%s uses %r" % (where, step.get("uses")))
@@ -1241,9 +1289,10 @@ class TrustDecisionFirst(unittest.TestCase):
     """S15: the trust decision runs before any checkout file executes.
 
     decision: the trust decision runs before any checkout file executes and the
-    resolver is demoted to a post-derivation report over keeping the resolver
+    derivation is inline with no resolver script run over keeping a resolver
     step first because any PR-tree step that runs earlier in the job can rewrite
-    the git state and PATH the derivation reads
+    the git state and PATH the derivation reads (the resolver is a library for
+    its unit tests; no workflow step runs it)
 
     The base_sha.py resolver is wired into no step of either job: the inline
     derivation is the sole authority. The bootstrap fold and the branch-tip fold
@@ -1847,9 +1896,10 @@ class DerivedBase(BaseCase):
     """S15 (R4-F12): both materialise steps derive the base before any PR code can run.
 
     decision: the trust decision runs before any checkout file executes and the
-    resolver is demoted to a post-derivation report over keeping the resolver
+    derivation is inline with no resolver script run over keeping a resolver
     step first because any PR-tree step that runs earlier in the job can rewrite
-    the git state and PATH the derivation reads
+    the git state and PATH the derivation reads (the resolver is a library for
+    its unit tests; no workflow step runs it)
 
     The hostile cases below model the reviewer probes P2, P3, P4 and P8: a
     PR-tree step that had run first rewrites the checkout's git state (moves
