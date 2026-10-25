@@ -96,10 +96,23 @@ pub fn require_audit_trail_enabled() -> bool {
 #[cfg(test)]
 static FORCE_ON_FOR_TEST: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    /// #7381 - test-only latch scope. The latch is process-global, so a test
+    /// that latched it made every unlocked write-path test on another thread
+    /// refuse. Under `cfg(test)` the gate refuses only on a thread whose scope
+    /// is set by [`force_on_for_test`]`(true)` or [`latch_for_test`]; any other
+    /// thread sees an open gate. Never compiled into a production build.
+    static LATCH_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Test-only: force the mode on (or back to the environment) and reset the
 /// latch and retry clock. Callers hold `audit::sink_test_lock`.
 #[cfg(test)]
 pub(crate) fn force_on_for_test(on: bool) {
+    // A thread that calls the latch helpers has opted into latch semantics,
+    // whatever `on` is; only the `LatchGuard` drop releases the scope.
+    LATCH_SCOPE.set(true);
     FORCE_ON_FOR_TEST.store(on, Ordering::SeqCst);
     reset_for_test();
 }
@@ -151,6 +164,11 @@ impl std::fmt::Display for AuditTrailUnavailable {
 /// [`AuditTrailUnavailable`] while the trail is latched and the retry (or the
 /// rate limit) says it is still not recording.
 pub fn audit_trail_gate() -> Result<(), AuditTrailUnavailable> {
+    #[cfg(test)]
+    if !LATCH_SCOPE.get() {
+        // #7381: a latch is only seen by the thread whose test set it.
+        return Ok(());
+    }
     if !LATCHED.load(Ordering::SeqCst) {
         // The common path: one atomic load, no environment read.
         return Ok(());
@@ -239,6 +257,7 @@ fn probe_trail() -> bool {
 /// behind for the rest of the process.
 #[cfg(test)]
 pub(crate) fn latch_for_test() -> LatchGuard {
+    LATCH_SCOPE.set(true);
     FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
     LATCHED.store(true, Ordering::SeqCst);
     LAST_PROBE_MS.store(u64::MAX, Ordering::SeqCst);
@@ -255,6 +274,7 @@ pub(crate) struct LatchGuard(());
 impl Drop for LatchGuard {
     fn drop(&mut self) {
         force_on_for_test(false);
+        LATCH_SCOPE.set(false);
     }
 }
 
@@ -363,6 +383,23 @@ mod tests {
         assert!(r.is_err(), "the concurrent failure must keep refusing");
         assert!(audit_trail_latched(), "the latch survives the retry");
         force_on_for_test(false);
+    }
+
+    /// #7381 - the production decision is process-global: a latch held by one
+    /// thread refuses `gate_with` on every other thread. The `cfg(test)` scope
+    /// in `audit_trail_gate` spares other threads, so this is the witness that
+    /// `gate_with` itself never became per-thread.
+    #[test]
+    fn the_production_decision_refuses_every_thread_7381() {
+        let _g = lock();
+        let _latch = latch_for_test();
+        let refused = std::thread::spawn(|| gate_with(true, 1, || false).is_err())
+            .join()
+            .expect("gate thread panicked");
+        assert!(
+            refused,
+            "thread B is refused while thread A holds the latch"
+        );
     }
 
     /// Latched but the mode was turned off: allowed, latch cleared, no retry.
