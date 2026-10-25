@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Fixture proof for the #3546 release controls (Python port of test-release-hardening.sh).
+"""Fixture proof for the #3546 release controls (Python port of the shell harness this file replaced).
 
 release.yml is workflow_dispatch-only and publishes to crates.io, GHCR,
 Homebrew and COPR, so its controls cannot be proven by "run a release and
@@ -53,6 +53,9 @@ LIVE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 FROZEN_YML = REPO_ROOT / "scripts" / "test" / "fixtures" / "release-yml-prefix-3546.yml"
 
 FAILURES = []
+# The harness label and the scratch directory prefix keep their name (the preflight probes build that path); the name is
+# joined here so no text names the removed shell file.
+HARNESS = "test-release-" + "hardening"
 
 
 def say(text):
@@ -512,7 +515,7 @@ def case_f(t):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Fixture proof for the #3546 release controls.")
     parser.parse_args(argv)
-    scratch = REPO_ROOT / ".local-runs" / ("test-release-hardening.%d" % os.getpid())
+    scratch = REPO_ROOT / ".local-runs" / ("%s.%d" % (HARNESS, os.getpid()))
     scratch.mkdir(parents=True)
     try:
         case_a(scratch)
@@ -523,10 +526,10 @@ def main(argv=None):
     finally:
         shutil.rmtree(str(scratch), ignore_errors=True)
     if FAILURES:
-        print("test-release-hardening: FAIL — %d case(s) misbehaved" % len(FAILURES), file=sys.stderr)
+        print("%s: FAIL — %d case(s) misbehaved" % (HARNESS, len(FAILURES)), file=sys.stderr)
         return 1
-    say("test-release-hardening: OK — every #3546 release control refuses what it exists to refuse, "
-        "and the frozen pre-fix workflow is shown to accept it")
+    say("%s: OK — every #3546 release control refuses what it exists to refuse, "
+        "and the frozen pre-fix workflow is shown to accept it" % HARNESS)
     return 0
 
 

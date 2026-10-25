@@ -103,8 +103,21 @@ def mutate(text, old, new):
     return (head.replace(old, new, 1) + tail) if head.count(old) == 1 else None
 
 
-# (description, anchor, replacement): mutants that cannot change behaviour.
-EQUIVALENT_MUTANTS = (
+# (description, anchor, replacement): mutants that cannot change behaviour. Round 10 (code r9 F1): a row stays here only
+# with the observation attempts that failed to tell it from the guard, named in a comment above it. The four rows of
+# Round 9 were each tried against OBSERVATIONS; all four were observable, so they are EXTRA_MUTANTS rows now and the
+# table is empty. `decision: prove each equivalent row by an attempted observation over keeping the label because the
+# reviewer found one of four labels wrong`.
+EQUIVALENT_MUTANTS = ()
+
+# (description, anchor, replacement): mutants the guard's own table does not hold; each must be RED. The four that follow
+# survive `--self-test` and are killed by a named OBSERVATIONS workflow (the killer column shows `observation: <name>`).
+EXTRA_MUTANTS = (
+    (
+        "literal matrix value not scanned",
+        "for label, variant in matrix_variants(raw, ctx):",
+        "for label, variant in []:",
+    ),
     (
         "chain chain needs the &&",
         'chained = chain is not None and chain[0] == k - 1 and info["prev"] == "&&"',
@@ -115,27 +128,15 @@ EQUIVALENT_MUTANTS = (
         'if not alit and ("$(" in arg or "`" in arg):',
         "if False:",
     ),
-    # `env` is not on RUN_ALLOWED, so `env -i` is refused as an unlisted command before this defence-in-depth line runs.
     (
         "env -i allowed",
         'if word == "env" and any(a in ("-i", "--ignore-environment", "-") for a in texts):',
         "if False:",
     ),
-    # Every caller passes a string value; None only comes from the default argument, so the unreadable-value arm is
-    # reachable only by a future caller (the fail-closed default is kept on purpose).
     (
         "unreadable RUSTFLAGS value allowed",
-        '(value is None or RUSTFLAGS_BAD_RE.search(value) is not None)',
-        '(value is not None and RUSTFLAGS_BAD_RE.search(value) is not None)',
-    ),
-)
-
-# (description, anchor, replacement): mutants the guard's own table does not hold; each must be RED.
-EXTRA_MUTANTS = (
-    (
-        "literal matrix value not scanned",
-        "for label, variant in matrix_variants(raw, ctx):",
-        "for label, variant in []:",
+        "(value is None or RUSTFLAGS_BAD_RE.search(value) is not None)",
+        "(value is not None and RUSTFLAGS_BAD_RE.search(value) is not None)",
     ),
 )
 
@@ -167,6 +168,15 @@ def classify(rc, err, equivalent):
     return "OTHER-DEFECT", "failed without a named case: " + err.strip().splitlines()[-1][:100] if err.strip() else "failed without output"
 
 
+def observe(path, tmpdir):
+    """Round 10: the names of the OBSERVATIONS the mutant at ``path`` accepts (run in its own interpreter)."""
+    res = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--observe", str(path), str(Path(tmpdir) / "obs")],
+                         capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(tmpdir)))
+    if res.returncode != 0:
+        return ["observation run failed: " + (res.stderr.strip().splitlines() or ["no output"])[-1][:100]]
+    return [ln for ln in res.stdout.splitlines() if ln]
+
+
 def work(item):
     k, label, mutated, root, tmpdir, equivalent = item
     if mutated is None:
@@ -175,6 +185,10 @@ def work(item):
     path.write_bytes(mutated)
     rc, _out, err = run_guard(path, root, tmpdir)
     state, note = classify(rc, err, equivalent)
+    if rc == 0:  # self-test stayed green: try to tell the mutant from the guard by an observation
+        seen = observe(path, tmpdir)
+        if seen:
+            state, note = "RED", "observation: " + seen[0]
     try:
         path.unlink()
     except OSError:
@@ -217,6 +231,11 @@ def build_items(root, tmpdir, limit):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--observe"]:  # internal: print the OBSERVATIONS the guard module at argv[1] accepts
+        for name in accepted_observations(argv[1], argv[2]):
+            print(name)
+        return 0
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--root", default=str(HERE.parent.parent))
