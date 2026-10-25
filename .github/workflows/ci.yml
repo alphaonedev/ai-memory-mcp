@@ -197,22 +197,6 @@ jobs:
           ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}
         run: echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"
 
-      # decision: the live base is the first parent of the pull_request merge
-      # ref and merge_group.base_sha over pull_request.base.sha because
-      # base.sha is frozen at PR-open time and github.sha on merge_group
-      # contains the PR. The ci-gate job runs the same helper step. A failure
-      # leaves `sha` empty, so the materialise step reports base-sha-invalid
-      # and the fallback step selects the full matrix.
-      - name: Resolve the live base (#8240)
-        id: live
-        continue-on-error: true
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
-          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
-        run: python3 -I scripts/ci/impact/base_sha.py --github-output "$GITHUB_OUTPUT"
-
       # The selector that judges a PR is the BASE sha's: a PR must not judge
       # itself. decision: base-sha selector over PR-tree selector because a PR
       # must not judge itself; bootstrap and read failure select ALL (fail
@@ -221,16 +205,18 @@ jobs:
       # copy against the PR tree. When any file is missing at the base (this
       # very PR adds them) or unreadable, the `fallback` step selects the full
       # matrix and the reason lands in the step summary.
-      # decision: materialise steps re-derive the base inline from git and the
-      # event payload and fail closed on mismatch over running the resolver
-      # from a non-PR-tree copy because the copy itself would need a trusted
-      # base to be fetched from, while HEAD^1 of the merge ref and
-      # merge_group.base_sha are not author-controllable. BASE_SHA below is
-      # the resolver's output: a cross-check only, never the authority.
+      # decision: the trust decision runs before any checkout file executes and
+      # the resolver is demoted to a post-derivation report over keeping the
+      # resolver step first because any PR-tree step that runs earlier in the
+      # job can rewrite the git state and PATH the derivation reads. Only the
+      # pinned checkout action runs before this step; the base is derived from
+      # the github.sha context value (CONTEXT_SHA) and the event payload, every
+      # git call ignores replace objects, and anything unexpected fails closed
+      # (base-sha-mismatch, never a bootstrap).
       - name: Materialise the base selector (#8240)
         id: base
         env:
-          BASE_SHA: ${{ steps.live.outputs.sha }}
+          CONTEXT_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
@@ -255,9 +241,12 @@ jobs:
 
 
           def git(*args):
+              # Replace objects and grafts never reach the derivation or the reads.
+              env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
               try:
-                  return subprocess.run(["git"] + list(args), capture_output=True,
-                                        timeout=GIT_TIMEOUT_S)
+                  return subprocess.run(["git", "--no-replace-objects"] + list(args),
+                                        capture_output=True, timeout=GIT_TIMEOUT_S,
+                                        env=env)
               except (OSError, subprocess.TimeoutExpired):
                   raise BaseUnavailable("git-failed")
 
@@ -288,15 +277,28 @@ jobs:
               return value if res.returncode == 0 and SHA_RE.match(value) else ""
 
 
+          def replace_refs_present():
+              # Any refs/replace entry is unexpected on a fresh checkout: fail closed.
+              res = git("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
+              return res.returncode != 0 or bool(res.stdout.strip())
+
+
           def derive_base(env):
-              # The authority: git and the event payload, never the resolver. No PR
-              # tree can change HEAD^1 of the merge ref or merge_group.base_sha.
+              # The authority: git and the event payload, never a resolver. The
+              # checked-out commit must be exactly the github.sha context value
+              # (the merge ref); a moved HEAD or a replace ref is a mismatch.
               event = env.get("EVENT_NAME", "")
+              context = env.get("CONTEXT_SHA", "")
+              if event in ("pull_request", "merge_group"):
+                  if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  if replace_refs_present():
+                      raise BaseUnavailable("base-sha-mismatch")
               if event == "pull_request":
                   head = env.get("HEAD_SHA", "")
-                  if not SHA_RE.match(head) or rev_parse("HEAD^2^{commit}") != head:
+                  if not SHA_RE.match(head) or rev_parse(context + "^2^{commit}") != head:
                       raise BaseUnavailable("base-sha-mismatch")
-                  parent = rev_parse("HEAD^1^{commit}")
+                  parent = rev_parse(context + "^1^{commit}")
                   if not parent:
                       raise BaseUnavailable("base-sha-mismatch")
                   return parent
@@ -371,12 +373,8 @@ jobs:
                   if not names:
                       raise BaseUnavailable("no-files-listed")
                   derived = derive_base(os.environ)
-                  if os.environ.get("BASE_SHA", "") != derived:
-                      # The resolver output is a cross-check, never the authority: a
-                      # disagreement never bootstraps and never runs a PR-tree gate.
-                      report(False, "base-sha-mismatch")
-                      return 0
-                  print("impact: derived base %s equals the resolver sha" % derived)
+                  print("impact: derived base %s from github.sha %s"
+                        % (derived, os.environ.get("CONTEXT_SHA", "")))
                   materialise(derived, dest, names)
               except BaseUnavailable as exc:
                   report(False, str(exc), gate_absent(derived))
@@ -2746,34 +2744,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      # decision: the live base is the first parent of the pull_request merge
-      # ref and merge_group.base_sha over pull_request.base.sha because
-      # base.sha is frozen at PR-open time and github.sha on merge_group
-      # contains the PR. Same helper step as the select job. A failure leaves
-      # `sha` empty and the gate fails closed below (never the PR-tree gate).
       # decision: on push, schedule and workflow_dispatch the gate runs from
       # the checked-out tree over failing closed because there is no second
       # party to judge itself: the tree under test is already the branch tip,
-      # and a gate that is red on every chain push and nightly full run can
-      # never be made required. Only pull_request and merge_group resolve a
+      # and a gate that is red on every release/** push and workflow_dispatch full run
+      # can never be made required. Only pull_request and merge_group derive a
       # live base and keep every base-gate rule below.
-      - name: Resolve the live base (#8240)
-        id: live
-        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
-        continue-on-error: true
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
-          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
-        run: python3 -I scripts/ci/impact/base_sha.py --github-output "$GITHUB_OUTPUT"
-      - name: Name the live base in the summary
-        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
-        env:
-          LIVE_BASE: ${{ steps.live.outputs.sha }}
-          LIVE_BASE_REASON: ${{ steps.live.outputs.reason }}
-        run: |
-          echo "ci-gate: live base ${LIVE_BASE:-none} (${LIVE_BASE_REASON})" | tee -a "$GITHUB_STEP_SUMMARY"
       # decision: base-sha selector over PR-tree selector because a PR must not
       # judge itself. gate.py and rules.json come from the base sha. Only the
       # bootstrap (the base tree has no scripts/ci/impact/gate.py, this very
@@ -2783,17 +2759,19 @@ jobs:
       # self-judging; the select job already fails safe to the full matrix,
       # the gate must fail closed. Any other failure to read a base file
       # (fetch failure, timeout, invalid sha) fails this job.
-      # decision: materialise steps re-derive the base inline from git and the
-      # event payload and fail closed on mismatch over running the resolver
-      # from a non-PR-tree copy because the copy itself would need a trusted
-      # base to be fetched from, while HEAD^1 of the merge ref and
-      # merge_group.base_sha are not author-controllable. BASE_SHA below is
-      # the resolver's output: a cross-check only, never the authority.
+      # decision: the trust decision runs before any checkout file executes and
+      # the resolver is demoted to a post-derivation report over keeping the
+      # resolver step first because any PR-tree step that runs earlier in the
+      # job can rewrite the git state and PATH the derivation reads. Only the
+      # pinned checkout action runs before this step; the base is derived from
+      # the github.sha context value (CONTEXT_SHA) and the event payload, every
+      # git call ignores replace objects, and anything unexpected fails closed
+      # (base-sha-mismatch, never a bootstrap).
       - name: Materialise the base gate (#8240)
         id: base
         if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
         env:
-          BASE_SHA: ${{ steps.live.outputs.sha }}
+          CONTEXT_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
@@ -2818,9 +2796,12 @@ jobs:
 
 
           def git(*args):
+              # Replace objects and grafts never reach the derivation or the reads.
+              env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
               try:
-                  return subprocess.run(["git"] + list(args), capture_output=True,
-                                        timeout=GIT_TIMEOUT_S)
+                  return subprocess.run(["git", "--no-replace-objects"] + list(args),
+                                        capture_output=True, timeout=GIT_TIMEOUT_S,
+                                        env=env)
               except (OSError, subprocess.TimeoutExpired):
                   raise BaseUnavailable("git-failed")
 
@@ -2851,15 +2832,28 @@ jobs:
               return value if res.returncode == 0 and SHA_RE.match(value) else ""
 
 
+          def replace_refs_present():
+              # Any refs/replace entry is unexpected on a fresh checkout: fail closed.
+              res = git("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
+              return res.returncode != 0 or bool(res.stdout.strip())
+
+
           def derive_base(env):
-              # The authority: git and the event payload, never the resolver. No PR
-              # tree can change HEAD^1 of the merge ref or merge_group.base_sha.
+              # The authority: git and the event payload, never a resolver. The
+              # checked-out commit must be exactly the github.sha context value
+              # (the merge ref); a moved HEAD or a replace ref is a mismatch.
               event = env.get("EVENT_NAME", "")
+              context = env.get("CONTEXT_SHA", "")
+              if event in ("pull_request", "merge_group"):
+                  if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  if replace_refs_present():
+                      raise BaseUnavailable("base-sha-mismatch")
               if event == "pull_request":
                   head = env.get("HEAD_SHA", "")
-                  if not SHA_RE.match(head) or rev_parse("HEAD^2^{commit}") != head:
+                  if not SHA_RE.match(head) or rev_parse(context + "^2^{commit}") != head:
                       raise BaseUnavailable("base-sha-mismatch")
-                  parent = rev_parse("HEAD^1^{commit}")
+                  parent = rev_parse(context + "^1^{commit}")
                   if not parent:
                       raise BaseUnavailable("base-sha-mismatch")
                   return parent
@@ -2934,12 +2928,8 @@ jobs:
                   if not names:
                       raise BaseUnavailable("no-files-listed")
                   derived = derive_base(os.environ)
-                  if os.environ.get("BASE_SHA", "") != derived:
-                      # The resolver output is a cross-check, never the authority: a
-                      # disagreement never bootstraps and never runs a PR-tree gate.
-                      report(False, "base-sha-mismatch")
-                      return 0
-                  print("impact: derived base %s equals the resolver sha" % derived)
+                  print("impact: derived base %s from github.sha %s"
+                        % (derived, os.environ.get("CONTEXT_SHA", "")))
                   materialise(derived, dest, names)
               except BaseUnavailable as exc:
                   report(False, str(exc), gate_absent(derived))
@@ -2989,7 +2979,6 @@ jobs:
         if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap != 'true' }}
         env:
           IMPACT_REASON: ${{ steps.base.outputs.reason }}
-          LIVE_BASE_REASON: ${{ steps.live.outputs.reason }}
         run: |
-          echo "ci-gate: FAIL, the base gate could not be read (${IMPACT_REASON}; live base: ${LIVE_BASE_REASON}); the PR-tree gate is never run" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "ci-gate: FAIL, the base gate could not be read (${IMPACT_REASON}); the PR-tree gate is never run" | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
