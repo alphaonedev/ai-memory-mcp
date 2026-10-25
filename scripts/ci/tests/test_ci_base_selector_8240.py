@@ -1242,7 +1242,11 @@ MATERIALISE_VALUE_BINDINGS = {
     ("replace_refs_present", "listed"): "git('replace', '--list')",
     ("replace_refs_present", "res"):
         "git('for-each-ref', '--count=1', '--format=%(refname)', 'refs/replace/')",
+    ("report", "bootstrap"): "param-default:False",
     ("report", "handle"): "with-open",
+    ("report", "line"): "line-accum",
+    ("report", "ok"): "param",
+    ("report", "reason"): "param",
     ("report", "summary"): "os.environ.get('GITHUB_STEP_SUMMARY')",
     ("rev_parse", "res"): "git('rev-parse', '--verify', '--quiet', spec)",
     ("rev_parse", "spec"): "param",
@@ -1278,6 +1282,9 @@ MATERIALISE_CALL_ARGS = {
     "fetch_blob": ["base, name"],
     "gate_absent": ["derived"],
     "git_state_refused": [""],
+    "handle.write": sorted(["'bootstrap=%s\\n' % ('true' if bootstrap else 'false')",
+                            "'ok=%s\\n' % ('true' if ok else 'false')",
+                            "'reason=%s\\n' % reason", "line + '\\n'"]),
     "have_commit": ["base"],
     "main": [""],
     "materialise": ["derived, dest, names"],
@@ -1290,11 +1297,19 @@ MATERIALISE_CALL_ARGS = {
     "rev_parse": sorted(["'HEAD^{commit}'", "context + '^1^{commit}'", "context + '^2^{commit}'"]),
     "shutil.rmtree": ["str(dest)", "str(dest), ignore_errors=True"],
 }
+# sec r12 R2: the two statements that build `line` in report(): the one assignment and the one
+# augmented literal.
+MATERIALISE_LINE_ASSIGN = "'impact: base files unavailable (%s)' % reason"
+MATERIALISE_LINE_AUGMENT = "'; bootstrap: the base sha has no scripts/ci/impact/gate.py'"
 # Callees whose arguments reach git (or delete a tree): each name in an argument must resolve by
 # its binding.
 MATERIALISE_CALL_SINKS = {"fetch_blob", "gate_absent", "have_commit", "materialise", "rev_parse",
                           "shutil.rmtree"}
-MATERIALISE_CALL_KINDS = {"print": "print call", "shutil.rmtree": "rmtree call"}
+# sec r12 R1/R2: print and the step output writes carry values into the job log, the step summary
+# and the step outputs, so the names in their arguments resolve by binding as well.
+MATERIALISE_OUTPUT_SINKS = MATERIALISE_CALL_SINKS | {"handle.write", "print"}
+MATERIALISE_CALL_KINDS = {"handle.write": "step output write", "print": "print call",
+                          "shutil.rmtree": "rmtree call"}
 MATERIALISE_OPEN_ARGS = sorted(["os.environ['GITHUB_OUTPUT']", "summary"])
 MATERIALISE_PATH_ARGS = sorted(["os.environ['RUNNER_TEMP']"])
 MATERIALISE_GUARD_TEST = "__name__ == '__main__'"
@@ -1388,6 +1403,20 @@ def _param_ok(scope, name):
             and not _has_default(scope, local[0][2]))
 
 
+def _default_text(scope, arg):
+    """The unparsed default value of a parameter, or None when it has none."""
+    spec = scope.args
+    positional = list(spec.posonlyargs) + list(spec.args)
+    for index, item in enumerate(positional):
+        if item is arg:
+            at = index - (len(positional) - len(spec.defaults))
+            return ast.unparse(spec.defaults[at]) if at >= 0 else None
+    for item, default in zip(spec.kwonlyargs, spec.kw_defaults):
+        if item is arg:
+            return ast.unparse(default) if default is not None else None
+    return None
+
+
 def _has_default(scope, arg):
     """True when the parameter carries a default value (a default is a value binding of its own)."""
     spec = scope.args
@@ -1421,6 +1450,26 @@ def _name_problems(tree, parents, scope, name, seen=()):
         return [] if _param_ok(scope, name) else [
             "%s is not an unrebound parameter without a default" % name]
     local = _local_bindings(scope, name)
+    if isinstance(expected, str) and expected.startswith("param-default:"):
+        default = expected.split(":", 1)[1]
+        ok = (len(local) == 1 and local[0][1] == "arg"
+              and any(local[0][2] is p for p in ast.walk(scope.args))
+              and _default_text(scope, local[0][2]) == default)
+        return [] if ok else ["%s is not an unrebound parameter with its pinned default" % name]
+    if expected == "line-accum":
+        sites = [parents.get(b[2]) for b in local]
+        assigns = [s for b, s in zip(local, sites) if b[1] == "store" and isinstance(s, ast.Assign)
+                   and len(s.targets) == 1 and s.targets[0] is b[2]]
+        augments = [s for b, s in zip(local, sites) if b[1] == "store"
+                    and isinstance(s, ast.AugAssign) and s.target is b[2]
+                    and isinstance(s.op, ast.Add)]
+        ok = (len(local) == 2 and len(assigns) == 1 and len(augments) == 1
+              and ast.unparse(assigns[0].value) == MATERIALISE_LINE_ASSIGN
+              and ast.unparse(augments[0].value) == MATERIALISE_LINE_AUGMENT)
+        if not ok:
+            return ["%s is not bound only to its pinned assignment and one pinned augmented "
+                    "literal" % name]
+        return _value_name_problems("line", tree, parents, assigns[0], assigns[0].value)
     if isinstance(expected, tuple):
         sites = [parents.get(b[2]) for b in local]
         ok = (len(local) == len(expected) and all(
@@ -1696,7 +1745,7 @@ def _call_arg_problems(label, tree, parents, node, callee):
             return ["%s: %s outside the enumerated arguments" % (label, kind)]
         return ["%s: call argument is not enumerated for %s" % (label, callee)]
     problems = []
-    if callee in MATERIALISE_CALL_SINKS:
+    if callee in MATERIALISE_OUTPUT_SINKS:
         for arg in node.args:
             problems.extend(_value_name_problems(label, tree, parents, node, arg))
     return problems
@@ -2627,7 +2676,7 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(MATERIALISE_ENV_CONSTRUCTION,
                          "dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')")
         for callee in ("rev_parse", "have_commit", "fetch_blob", "gate_absent", "materialise",
-                       "derive_base", "print", "report", "BaseUnavailable"):
+                       "derive_base", "print", "report", "BaseUnavailable", "handle.write"):
             with self.subTest(callee=callee):
                 self.assertIn(callee, MATERIALISE_CALL_ARGS)
                 self.assertEqual(list(MATERIALISE_CALL_ARGS[callee]),
@@ -2999,6 +3048,15 @@ TrustDecisionFirst.R15_SEC_ROWS = (
     ("r2-line-literal-changed", _R15_AUG,
      '        line += "; bootstrap: " + os.environ.get("X", "")\n', _R15_LINE_RULE),
     ("r2-print-other-name", _R15_PRINT, "    print(summary)\n", "print call outside the enumerated"),
+    ("r1-write-bootstrap-literal-true", _R15_W_BOOT,
+     '        handle.write("bootstrap=%s\\n" % "true")\n', _R15_WRITE),
+    ("r1-summary-write-from-environment", '            handle.write(line + "\\n")\n',
+     '            handle.write(os.environ.get("HOME", "") + "\\n")\n', _R15_WRITE),
+    ("r2-line-assignment-runner-conditioned", _R15_LINE,
+     '    line = "impact: base files unavailable (%s)" % (' + _R15_RUNNER
+     + ' and os.environ.get("HOME", "") or reason)\n', _R15_LINE_RULE),
+    ("r1-report-call-forged-bootstrap", "report(False, str(exc), gate_absent(derived))",
+     "report(False, str(exc), True)", "call argument is not enumerated for report"),
 )
 
 
