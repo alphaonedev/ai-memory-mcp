@@ -13,6 +13,7 @@ import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import load_gate  # noqa: E402
@@ -102,6 +103,29 @@ class Run(unittest.TestCase):
 
 
 class Main(unittest.TestCase):
+    def test_7811_nonfinite_ratios_exit_2_before_gate(self):
+        for text in ('nan', 'NaN', 'inf', '+inf', '-inf', 'Infinity', '-Infinity', '1e309'):
+            with self.subTest(ratio=text), patch.object(load_gate, 'run') as run:
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+                    load_gate.main(['--max-ratio=' + text])
+                self.assertEqual(cm.exception.code, 2)
+                run.assert_not_called()
+
+    def test_7811_finite_positive_ratios_reach_gate_unchanged(self):
+        for text in ('5e-324', '0.25', '1.5', '1.7976931348623157e308'):
+            with self.subTest(ratio=text), patch.object(load_gate, 'run', return_value=0) as run:
+                self.assertEqual(load_gate.main(['--max-ratio=' + text]), 0)
+                self.assertEqual(run.call_args.args[1], float(text))
+                run.assert_called_once()
+
+    def test_7811_nonpositive_ratios_exit_2_before_gate(self):
+        for text in ('0', '-0.0', '-0.25'):
+            with self.subTest(ratio=text), patch.object(load_gate, 'run') as run:
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+                    load_gate.main(['--max-ratio=' + text])
+                self.assertEqual(cm.exception.code, 2)
+                run.assert_not_called()
+
     def test_bad_args_exit_2(self):
         for argv in (['--max-ratio', '0'], ['--poll-secs', '0'], ['--max-wait-secs', '-1']):
             with self.assertRaises(SystemExit) as cm:
