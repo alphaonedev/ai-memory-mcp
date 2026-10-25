@@ -530,10 +530,10 @@ def test_file_vanishing_between_check_and_open_gives_the_typed_error_8195(
 
 
 # ---- code r2 F2: a bound that is not an ``ssl.TLSVersion`` is refused ----
-# These tests pin the refusal as a whole. The ``_STOCK_HANDSHAKE`` identity check refuses a replaced
-# ``minimum_version`` / ``maximum_version`` descriptor before the type check in ``_tls_range_is_modern``
-# is reached, so the type check is defence in depth that no public path reaches (mutant M66 is
-# equivalent; code r3 F3, F4).
+# These tests pin the refusal as a whole. The ``_STOCK_HANDSHAKE`` identity check refuses a descriptor
+# replaced after ``ai_memory`` is imported before the type check in ``_tls_range_is_modern`` runs. A
+# descriptor replaced BEFORE the import is captured as stock, so there the type check is the only
+# refusal; ``test_tls_prepatch_8195_r5.py`` pins that case in a fresh interpreter (mutant M66, code r4 F3).
 
 _ORIG_BOUND = {"minimum_version": ssl.SSLContext.minimum_version, "maximum_version": ssl.SSLContext.maximum_version}
 

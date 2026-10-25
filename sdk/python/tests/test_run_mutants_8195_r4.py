@@ -9,8 +9,6 @@ import pathlib
 import re
 import sys
 
-import pytest
-
 from . import run_mutants_8195 as runner
 from ._mutants_8195 import KILLER_TESTS, MUTANTS, Mutant
 
@@ -32,7 +30,9 @@ def _scan(root: pathlib.Path) -> "tuple[int, list[str]]":
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix not in _SUFFIXES:
             continue
-        if any(part in path.parts for part in _SKIP_PARTS) or any(p.endswith("egg-info") for p in path.parts):
+        # Relative parts only: a checkout under ``.local-runs``, ``dist`` or ``.venv`` must still be scanned.
+        parts = path.relative_to(root).parts
+        if any(part in parts for part in _SKIP_PARTS) or any(p.endswith("egg-info") for p in parts):
             continue
         scanned += 1
         for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):

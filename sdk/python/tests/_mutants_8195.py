@@ -17,9 +17,10 @@ reported RED only because one test read a path above its copy). Equivalent rows 
 ``equivalent=True``; the runner expects them to survive.
 
 Every row names its killers (``killers``: test files or node ids; code r3 F5): a row is RED
-only when one of them fails, and the runner refuses a row without killers. Round 4 settles
-M66: the ``isinstance`` leg is equivalent because the ``_STOCK_HANDSHAKE`` identity check
-makes it unreachable (code r3 F3, F4).
+only when one of them fails, and the runner refuses a row without killers. Round 5 re-opens
+M66 (code r4 F3): ``_STOCK_HANDSHAKE`` is captured at import, so a bound replaced before
+``ai_memory`` is imported passes the identity check and the ``isinstance`` leg is reachable;
+``test_tls_prepatch_8195_r5.py`` kills the row, which is no longer equivalent.
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ WAKE_T = "tests/test_wake_bundle_typed_6936.py"
 CI_T = "tests/test_ci_install_6688.py"
 TRUST = "tests/test_default_trust_8195_r3.py"
 HTTPS_T = "tests/test_require_https_8195_r4.py"
+PREPATCH = "tests/test_tls_prepatch_8195_r5.py"
 RUNNER_T = "tests/test_run_mutants_8195.py"
 DOCS_T = "tests/test_docs_truth_6689.py"
 CLIENT_T = "tests/test_client.py"
@@ -56,7 +58,7 @@ ATTEST = "tests/test_attestation_keyfile_3784.py"
 #: Every test file a mutant may be killed by; the runner executes all of them per row.
 KILLER_TESTS = (
     FLOOR, SESSION, VERIFY, CAPATH7, CAPATH8, OWNED_T, OWNED_R, ACL, ACL_FC, WAKE_T,
-    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T,
+    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T, PREPATCH,
 )
 
 
@@ -297,12 +299,12 @@ MUTANTS: tuple[Mutant, ...] = (
            "    return high == ssl.TLSVersion.MAXIMUM_SUPPORTED or high >= MINIMUM_TLS_VERSION",
            "    return True",
            killers=(FLOOR,)),
-    Mutant("R2", "validator: non-TLSVersion bound admitted (equivalent: the _STOCK_HANDSHAKE identity check "
-           "in _context_verifies refuses a replaced minimum_version or maximum_version before this type check "
-           "is reached, so the stock descriptor always yields a TLSVersion)", COMMON,
+    Mutant("R2", "validator: non-TLSVersion bound admitted (killed by the pre-import patch: _STOCK_HANDSHAKE "
+           "is captured at import, so a minimum_version or maximum_version descriptor replaced before ai_memory "
+           "is imported passes the identity check and this type check is the only refusal)", COMMON,
            "    if not isinstance(low, ssl.TLSVersion) or not isinstance(high, ssl.TLSVersion):\n        return False\n",
-           "", equivalent=True,
-           killers=(FLOOR,)),
+           "",
+           killers=(PREPATCH,)),
     Mutant("R2", "session gate: negotiated version not checked", COMMON,
            "    if version is None or version() not in _MODERN_TLS_NAMES:\n        raise ValueError(_SESSION_MESSAGE)\n",
            "",
@@ -331,7 +333,8 @@ MUTANTS: tuple[Mutant, ...] = (
            "    if not admitted:\n        raise ValueError(\n            \"base_url refused:",
            "    if False:\n        raise ValueError(\n            \"base_url refused:", killers=(TRUST, HTTPS_T)),
     Mutant("R3", "base URL check skipped", COMMON,
-           "    _require_https(base_url)\n", "", killers=(TRUST, HTTPS_T)),
+           "    _require_https(base_url)  # first, before the value is touched (code r4 F2)\n", "",
+           killers=(TRUST, HTTPS_T)),
     Mutant("R4", "base URL: scheme leg dropped", COMMON,
            'admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo',
            "admitted = bool(parsed.host) and not parsed.userinfo", killers=(TRUST,)),
@@ -342,6 +345,19 @@ MUTANTS: tuple[Mutant, ...] = (
            'admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo',
            'admitted = parsed.scheme == "https" and bool(parsed.host)', killers=(HTTPS_T,)),
     Mutant("R4", "base URL: InvalidURL not mapped to the typed error", COMMON,
-           "        except (httpx.InvalidURL, ValueError):\n            pass\n",
-           "        except ValueError:\n            pass\n", killers=(HTTPS_T,)),
+           "        except (httpx.InvalidURL, ValueError):\n",
+           "        except ValueError:\n", killers=(HTTPS_T,)),
+    Mutant("R5", "base URL: parsed fields read outside the try (code r4 F1)", COMMON,
+           '            admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo\n'
+           "        except (httpx.InvalidURL, ValueError):\n"
+           "            # Every parser failure, an IDNA-invalid host included, is the one fixed refusal below;\n"
+           "            # the library message is never surfaced because it can carry a decoded host label.\n"
+           "            admitted = False\n",
+           "        except (httpx.InvalidURL, ValueError):\n            pass\n        else:\n"
+           '            admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo\n',
+           killers=(HTTPS_T,)),
+    Mutant("R5", "base URL: validated after the value is touched (code r4 F2)", COMMON,
+           "    _require_https(base_url)  # first, before the value is touched (code r4 F2)\n",
+           "    base_url.rstrip(\"/\")\n    _require_https(base_url)\n",
+           killers=(HTTPS_T,)),
 )

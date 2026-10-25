@@ -1233,17 +1233,21 @@ def _require_https(base_url: object) -> None:
     loopback exception. The URL is parsed with ``httpx.URL``, the parser the client sends
     with, so the check and the send cannot disagree (sec r3 F2). The scheme must be
     exactly ``https`` (``httpx`` lower-cases it), the host non-empty and no userinfo
-    present. The refusal never echoes any part of the URL (code r3 F6): not the key, the
-    host, the userinfo, nor a fragment mis-parsed as a scheme.
+    present. A value that is not a ``str`` (bytes, ``httpx.URL``, a path, ``None``) is refused
+    the same way, and :func:`build_httpx_kwargs` runs this check before it touches the value
+    (code r4 F2). Every parser failure, an IDNA-invalid host included, maps to the one fixed
+    refusal, which never echoes any part of the URL (code r3 F6, code r4 F1): not the key,
+    the host, the userinfo, nor a fragment mis-parsed as a scheme.
     """
     admitted = False
     if isinstance(base_url, str):
         try:
             parsed = httpx.URL(base_url)
-        except (httpx.InvalidURL, ValueError):
-            pass
-        else:
             admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo
+        except (httpx.InvalidURL, ValueError):
+            # Every parser failure, an IDNA-invalid host included, is the one fixed refusal below;
+            # the library message is never surfaced because it can carry a decoded host label.
+            admitted = False
     if not admitted:
         raise ValueError(
             "base_url refused: it must be an absolute https:// URL with a host and no userinfo; "
@@ -1312,6 +1316,7 @@ def build_httpx_kwargs(
     if extra_headers:
         headers.update(extra_headers)
 
+    _require_https(base_url)  # first, before the value is touched (code r4 F2)
     kwargs: dict[str, Any] = {
         "base_url": base_url.rstrip("/"),
         "headers": headers,
@@ -1322,7 +1327,6 @@ def build_httpx_kwargs(
     # for `""` too), and a caller-supplied `ssl.SSLContext` is used as given.
     # Only the value `_checked_verify` returns is forwarded (#6248), and a
     # caller-held context is re-checked on every request (#6249).
-    _require_https(base_url)
     checked = _checked_verify(verify)
     kwargs["verify"] = checked
     if checked is verify or verify is None or verify is True:

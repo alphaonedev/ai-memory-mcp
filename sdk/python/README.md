@@ -67,9 +67,10 @@ option (#3840).
 
 Accepted (anything else raises `ValueError` from the constructor):
 
-- `None` (the default): httpx's own default trust, which is the `certifi`
-  bundle, or the file or directory named by `SSL_CERT_FILE` / `SSL_CERT_DIR`
-  when those are set. It is NOT the operating-system store, and
+- `None` (the default): the default trust the SDK builds itself, a context
+  with the TLS 1.2 floor, the session gate and the request hooks, whose trust
+  is the `certifi` bundle, or the file or directory named by `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` when those are set. It is NOT the operating-system store, and
   `REQUESTS_CA_BUNDLE` is ignored. When one of the variables is set, the SDK
   reads the path it names exactly as it reads a `verify=<path>` below (once,
   at construction, permissions checked); `SSL_CERT_FILE` must name a regular
@@ -177,9 +178,10 @@ context. Decision record: `docs/adr/ADR-003-sdk-python-tls-verify-enforcement.md
 Two ways to avoid passing `verify=` per client:
 
 - point `SSL_CERT_FILE` (or `SSL_CERT_DIR`) at `local-ca.pem` and leave
-  `verify=` unset: httpx reads those variables for its default trust, whereas
-  installing the CA into the operating-system store does not affect it. The
-  SDK reads that path once, at construction, and checks its permissions, the
+  `verify=` unset: the SDK reads those variables when it builds its default
+  context (with the TLS 1.2 floor, the session gate and the request hooks),
+  whereas installing the CA into the operating-system store does not affect it.
+  The SDK reads that path once, at construction, and checks its permissions, the
   same as `verify=<path>` (#6538);
 - run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
   a CA your hosts already trust, in which case no pinning is needed at all.
