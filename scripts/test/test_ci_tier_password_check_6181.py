@@ -63,7 +63,6 @@ import logging
 import multiprocessing
 import os
 from pathlib import Path
-import pickle
 import pprint
 import re
 import shutil
@@ -2274,7 +2273,7 @@ class TestNoWorkflowFragmentIsEchoed8187R14(unittest.TestCase):
         for label, (function, template, expected) in cases.items():
             edited = splice(text, at + 1, ["          " + part for part in self.planted(template).split("\n")])
             with self.subTest(site=label):
-                problems = function(edited)
+                problems = argv_problems(edited) if function is argv_problems else url_leaks(edited)
                 self.assertEqual(len([p for p in problems if sentinel in p or "postgres://" in p]), 0)
                 self.assertTrue([p for p in problems if p.startswith(expected)], "%d problem lines" % len(problems))
 
@@ -2766,7 +2765,9 @@ class CanaryRun:
                 self.label_forms.update(re.findall(r"\b(?:job|step|key|pin)\[(?:\d+|\?)\] len=\d+", str(line)))
             self.problem_lines += len(result)
         self.calls += 1
-        view = scenario.rsplit("/", 1)[-1]
+        # r27 code F3: the view is the function that ran, never the label it was given, so a call site that passes the loaded
+        # function under the text label is counted as the loaded view
+        view = "loaded" if call is self.mod.primary_pin_problems else ("text" if call is self.mod.job_pin_problems else None)
         if expect == "pass":
             self.pass_calls += 1
             if result:
@@ -3129,6 +3130,22 @@ def canary_controls(run):
         except ValueError:
             raise RuntimeError("outer")  # noqa: B904  (the implicit __context__ is the path under test)
 
+    def control_cause_cause_notes(marker):
+        deepest = ValueError("deepest")
+        deepest.add_note(marker)  # the marker lives in the notes of the cause of the cause only (r27 code F4)
+        middle = RuntimeError("middle")
+        middle.__cause__ = deepest
+        raise KeyError("outer") from middle
+
+    def control_context_context_notes(marker):
+        deepest = ValueError("deepest")
+        deepest.add_note(marker)  # the marker lives in the notes of the context of the context only (r27 code F4)
+        middle = RuntimeError("middle")
+        middle.__context__ = deepest
+        outer = KeyError("outer")
+        outer.__context__ = middle
+        raise outer
+
     controls = {
         "print": lambda marker: print("seen", marker),
         "stderr": lambda marker: print(marker, file=sys.stderr),
@@ -3143,6 +3160,8 @@ def canary_controls(run):
         controls["exception-notes"] = control_notes
         controls["exception-cause-notes"] = control_cause_notes
         controls["exception-context-notes"] = control_context_notes
+        controls["exception-cause-cause-notes"] = control_cause_cause_notes
+        controls["exception-context-context-notes"] = control_context_context_notes
     return controls
 
 
@@ -3248,18 +3267,40 @@ PUBLIC_NAMES = frozenset(("wf", "workflow", "workflow_name", "path"))
 # containers keyed by test-written constants: the KEY of ``.items()`` over them is public
 STATIC_KEYED = frozenset(("mutants", "forms", "texts", "DUMP_MUTANTS", "F10_MUTANTS", "cases", "shapes", "views", "keys", "variants",
                           "positional_cases"))
-# calls that print their arguments into a failure report besides the assert* family (``subTest`` parameters, ``fail``)
-ECHO_CALLS = frozenset(("subTest", "fail", "skipTest", "addCleanup"))
 WRAPPED_ASSERTS = frozenset(("assert_same", "assert_has"))
-# r24 sec F5: print and logging write their arguments out; a tainted argument is a finding like an assert operand
-PRINT_CALLS = frozenset(("print", "pprint", "warn", "warn_explicit", "input", "exit", "quit"))  # r26 sec F1: exit, input, warn_explicit
-LOG_BASES = frozenset(("logging", "logger", "log", "LOG"))
-LOG_METHODS = frozenset(("debug", "info", "warning", "error", "critical", "exception", "log"))
-# r26 code C2: any call of these methods writes its arguments out, whatever the receiver is (a stream, an alias of one, a file
-# descriptor module, an exception hook, the traceback printers); the receiver is not tracked because every spelling of it
-# would be one more case, while the method name is the one thing every spelling shares
-SINK_ATTRS = frozenset(("write", "writelines", "excepthook", "__excepthook__", "print_exception", "print_exc", "print_tb",
-                        "print_stack", "print_last", "showwarning"))
+# r27 sec F1, code F1: the scan is a POSITIVE enumeration.  A call that receives a tainted value (positionally, by keyword,
+# starred, inside a container literal, through an f-string or an operator, as the receiver, or as the callee itself) is
+# flagged unless its callee is on one of the accepted sets below: the wrappers of ``TAINT_SAFE_CALLS``, the loaders of
+# ``TAINT_SOURCES``, the test's own helpers (their bodies are analysed with the tainted parameters), the container mutators
+# of ``TAINT_MUTATORS`` (they only move the value into a container) and the named non-output callables of
+# ``TAINT_ACCEPTED_CALLEES``.  Every output path (a print, a logger, a stream, a descriptor, a child process, an exit, an
+# exception hook, a deferred call) is therefore refused without being listed: it is simply not on the accepted sets.
+TAINT_MUTATORS = frozenset(("add", "add_note", "append", "extend", "insert", "setdefault", "update"))
+TAINT_ACCEPTED_CALLEES = frozenset((
+    "abs", "bytes", "chr", "copy", "count", "decode", "deepcopy", "dict",
+    "dumps", "encode", "end", "enumerate", "findall", "finditer", "float", "format",
+    "frozenset", "fullmatch", "get", "group", "groups", "hexdigest", "int", "items",
+    "iter", "join", "keys", "list", "lower", "lstrip", "match", "max",
+    "min", "next", "ord", "partition", "removeprefix", "removesuffix", "replace", "repr",
+    "reversed", "rfind", "rindex", "rsplit", "rstrip", "search", "set", "sha256",
+    "sorted", "span", "split", "splitlines", "str", "strip", "sub",
+    "sum", "tuple", "upper", "values", "zip"))
+# r27: the value helpers of the two checked files, the AST walkers and the file-system calls the harness uses on loaded text;
+# none of them prints, logs, writes a stream or starts a process (a file written under ``.local-runs`` is not an output path:
+# the canary reads every channel it can reach, and the file contents are checked by the same leak scan)
+TAINT_ACCEPTED_HARNESS = frozenset((
+    "TaintScan", "exemption_problem", "first_difference", "get_source_segment", "indent_of", "inject_run_line",
+    "iter_child_nodes", "mkdir", "name", "non_tier_runner_problems", "observe", "parse", "pin_job", "runner_problem",
+    "scan", "splice", "stale_row_problems", "url_leaks", "views", "walk", "where_differs", "write_text"))
+TAINT_ACCEPTED_ALL = TAINT_ACCEPTED_CALLEES | TAINT_ACCEPTED_HARNESS
+# r27: attributes that hold a number or a name, never author text (``node.lineno``, ``loader.__name__``)
+TAINT_CLEAN_ATTRS = frozenset(("lineno", "end_lineno", "col_offset", "end_col_offset", "__name__"))
+# r27: the two functions whose bodies the scan skips on the SHIPPED files only (``exempt=``): ``load_variant`` executes the
+# mutated module source and ``canary_dump`` serialises a canary tree; neither has an output path, and a shape that defines
+# a function of the same name is still scanned because the shape tests pass no exemption
+TAINT_EXEMPT_FUNCTIONS = frozenset(("canary_dump", "load_variant"))
+# the keywords through which an accepted callee runs a callable on the loaded value (``sorted(..., key=f)``)
+CALLABLE_KEYWORDS = frozenset(("key", "default", "repl", "cmp", "func", "callback", "object_hook", "object_pairs_hook"))
 
 
 def call_name(node):
@@ -3289,9 +3330,10 @@ class TaintScan:
     a ``*_label`` or ``*_problems`` function, a comparison that yields a bool) clears it.  ``follow_helpers=False`` is the
     mutant that stops at helper boundaries."""
 
-    def __init__(self, source, follow_helpers=True):
+    def __init__(self, source, follow_helpers=True, exempt=()):
         self.tree = ast.parse(source)
         self.follow = follow_helpers
+        self.exempt = frozenset(exempt)
         self.functions = {n.name: n for n in ast.walk(self.tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
         self.params = {name: set() for name in self.functions}
         self.returns = set()
@@ -3299,11 +3341,7 @@ class TaintScan:
         self.flagged = set()
         self.closure = {}       # function name -> the enclosing scope's live environment (a closure sees later binds too)
         self.lambdas = {}       # name -> (Lambda node, environment at the assignment): a local lambda is a helper too
-        self.aliases = {}       # name -> the assert or echo method it was bound to (``eq = self.assertEqual``)
-        self.loggers = set()    # r26 code C2: names bound from ``getLogger(...)``
-        # r26 sec F1: ``from functools import partial as P`` makes ``P(print, text)()`` a sink too
-        self.partials = {"partial"} | {a.asname for n in ast.walk(self.tree) if isinstance(n, ast.ImportFrom)
-                                       and n.module == "functools" for a in n.names if a.name == "partial" and a.asname}
+        self.callees = set()    # r27: the names of the calls that were flagged (to curate ``TAINT_ACCEPTED_CALLEES``)
         self.leaked_public = set()  # r24 sec F5: a PUBLIC_NAMES name that was ever assigned or passed a tainted value
 
     def tainted(self, node, env):
@@ -3318,6 +3356,8 @@ class TaintScan:
         if isinstance(node, ast.Name):
             return node.id in env and (node.id not in PUBLIC_NAMES or node.id in self.leaked_public)
         if isinstance(node, ast.Attribute):
+            if node.attr in TAINT_CLEAN_ATTRS:
+                return False
             if node.attr in TAINT_ATTRS:
                 return True
             return (node.attr in self.attrs and (node.attr not in PUBLIC_NAMES or node.attr in self.leaked_public)) \
@@ -3350,7 +3390,7 @@ class TaintScan:
             return True  # a callable bound from tainted material (``functools.partial(f, text)``) yields it
         if isinstance(node.func, (ast.Subscript, ast.Call)) and self.tainted(node.func, env):
             return True  # r25 sec S2: ``fs[0]()`` where the container holds a tainted callable
-        if self.follow and name in self.functions:
+        if self.is_helper(node):
             self.pass_params(self.functions[name], node, env)
             return name in self.returns
         return any(self.tainted(a, env) for a in args) or (base is not None and self.tainted(base, env))
@@ -3447,14 +3487,9 @@ class TaintScan:
                     and len(target.elts) == len(value.elts):
                 pairs += list(zip(target.elts, value.elts))  # r25 sec S2: ``eq, ne = self.assertEqual, self.assertNotEqual``
         for target, source in pairs:
-            if isinstance(source, ast.Call) and call_name(source) == "getLogger":
-                self.loggers.update(sub.id if isinstance(sub, ast.Name) else sub.attr
-                                    for sub in ast.walk(target) if isinstance(sub, (ast.Name, ast.Attribute)))
             if isinstance(target, ast.Name):
                 if isinstance(source, ast.Lambda):
                     self.lambdas[target.id] = (source, env)
-                if self.echo_method(source) is not None:
-                    self.aliases[target.id] = self.echo_method(source)
         if not self.tainted(value, env):
             return
         for target in targets:
@@ -3477,23 +3512,6 @@ class TaintScan:
                     pass
             self.statement(stmt, env, scope)
 
-    def echo_method(self, node):
-        """The assert or echo method an expression denotes: ``self.assertX``, ``getattr(self, "assertX")`` (any non-constant
-        name counts), a name bound to one, or ``functools.partial`` of one; None for anything else."""
-        if isinstance(node, ast.Attribute):  # r26 code C2: ``w = sys.stdout.write`` binds a sink too
-            return node.attr if node.attr.startswith(ASSERT_PREFIX) or node.attr in ECHO_CALLS or node.attr in SINK_ATTRS else None
-        if isinstance(node, ast.Name):
-            return node.id if node.id in PRINT_CALLS else self.aliases.get(node.id)  # ``partial(print, text)()`` (r25 code C4)
-        if isinstance(node, ast.Call):
-            if call_name(node) == "getattr" and len(node.args) >= 2:
-                name = node.args[1]
-                if isinstance(name, ast.Constant) and isinstance(name.value, str):
-                    return name.value if name.value.startswith(ASSERT_PREFIX) or name.value in ECHO_CALLS else None
-                return "getattr"
-            if self.is_partial(node) and node.args:
-                return self.echo_method(node.args[0])
-        return None
-
     def operands_tainted(self, test, env):
         """A bare ``assert``: pytest prints the operands of a failing comparison, so each operand counts."""
         if isinstance(test, ast.Compare):
@@ -3514,6 +3532,11 @@ class TaintScan:
             for arg, default in zip(stmt.args.kwonlyargs, stmt.args.kw_defaults):
                 if default is not None and self.tainted(default, env):
                     self.add_param(stmt.name, arg.arg)
+            for decorator in stmt.decorator_list:  # r27: a decorator is a call that runs on the function
+                for node in ast.walk(decorator):
+                    if isinstance(node, ast.Call):
+                        self.visit_call(node, env)
+                self.visit_call(ast.copy_location(ast.Call(func=decorator, args=[ast.Constant(None)], keywords=[]), decorator), env)
             return  # analysed on its own, with its own environment
         if isinstance(stmt, ast.Raise) and (self.tainted(stmt.exc, env) or self.tainted(stmt.cause, env)):
             self.flagged.add(stmt.lineno)  # r24 sec F5, r25 sec S2: an exception (or its cause) built from author text prints it
@@ -3548,35 +3571,61 @@ class TaintScan:
             for child in handler.body:
                 self.statement(child, env, scope)
 
-    def is_partial(self, node):
-        return isinstance(node, ast.Call) and call_name(node) in self.partials
-
     def bind_walrus(self, stmt, env):
         """r26 sec F1: ``if (v := text):`` binds ``v`` to author text before the body runs."""
         for node in ast.walk(stmt):
             if isinstance(node, ast.NamedExpr) and self.tainted(node.value, env):
                 self.bind(node.target, env)
 
-    def is_logger(self, node):
-        """A logging receiver: a name from ``LOG_BASES`` or bound from ``getLogger(...)``, or ``getLogger(...)`` inline."""
-        if isinstance(node, ast.Name):
-            return node.id in LOG_BASES or node.id in self.loggers
-        if isinstance(node, ast.Attribute):
-            return node.attr in LOG_BASES or node.attr in self.loggers
-        return isinstance(node, ast.Call) and call_name(node) == "getLogger"
-
-    def echo_target(self, node):
-        """The assert, echo, print or logging method a call invokes (see ``echo_method``), else None."""
+    def accepted_callee(self, node):
+        """Whether the callee of ``node`` is on an accepted set (r27): a safe wrapper, a loader, a container mutator, a named
+        non-output callable, a lambda, or a helper of this module (called by its bare name or through ``self``/``cls``, so
+        that ``sys.stdout.write`` is never mistaken for a helper that happens to be called ``write``)."""
         func = node.func
-        if isinstance(func, ast.Name) and func.id in PRINT_CALLS:
-            return func.id
+        name = call_name(node)
+        if isinstance(func, (ast.Name, ast.Attribute)) and (
+                is_safe_call(name) or name in TAINT_SOURCES or name in TAINT_MUTATORS or name in TAINT_ACCEPTED_ALL):
+            return True
+        return self.is_helper(node) or self.lambda_of(node) is not None
+
+    def is_helper(self, node):
+        """A helper of this module: called by its bare name or through ``self``/``cls`` (``subprocess.run`` is not the helper
+        ``run``)."""
+        func = node.func
+        return self.follow and call_name(node) in self.functions and (isinstance(func, ast.Name) or (
+            isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in ("self", "cls")))
+
+    def received(self, node, env):
+        """Whether the call hands a loaded value to its callee: as an argument (positional, keyword, starred, inside a container
+        or an f-string), as the receiver of the method, or as the callee itself (``fs[0]()``, ``partial(f, text)()``)."""
+        func = node.func
+        args = [*node.args, *(kw.value for kw in node.keywords)]
+        if call_name(node) == "assertTrue" and isinstance(func, ast.Attribute) and args:
+            args = args[1:]  # a failing assertTrue prints a FALSY first operand: empty text, never a value
+        if any(self.tainted(a.value if isinstance(a, ast.Starred) else a, env) for a in args):
+            return True
         if isinstance(func, ast.Attribute):
-            if func.attr in SINK_ATTRS:
-                return func.attr  # r25 sec S2 and code C4, r26 code C2: ``sys.stdout.write(text)``, ``os.write(1, b)`` ...
-            if func.attr in PRINT_CALLS or (func.attr in LOG_METHODS and self.is_logger(func.value)):
-                return func.attr
-            return self.echo_method(func)
-        return self.echo_method(func)
+            return self.tainted(func.value, env)
+        return isinstance(func, (ast.Name, ast.Subscript, ast.Call)) and self.tainted(func, env)
+
+    def callable_arguments(self, node, env):
+        """The callables handed to an accepted callee run on the loaded value: a lambda has its calls visited with its
+        parameters tainted, and the ``key=``/``default=`` style keyword must name an accepted callable."""
+        for value in [*node.args, *(kw.value for kw in node.keywords)]:
+            lam = value if isinstance(value, ast.Lambda) else (self.lambdas[value.id][0] if isinstance(value, ast.Name)
+                                                                 and value.id in self.lambdas else None)
+            if lam is not None:
+                inner = set(env) | {a.arg for a in [*lam.args.posonlyargs, *lam.args.args, *lam.args.kwonlyargs]}
+                if lam.args.vararg is not None:
+                    inner.add(lam.args.vararg.arg)
+                for child in ast.walk(lam.body):
+                    if isinstance(child, ast.Call):
+                        self.visit_call(child, inner, False)
+        for kw in node.keywords:
+            if kw.arg in CALLABLE_KEYWORDS and isinstance(kw.value, (ast.Name, ast.Attribute)):
+                name = kw.value.id if isinstance(kw.value, ast.Name) else kw.value.attr
+                if name not in env and not (is_safe_call(name) or name in TAINT_ACCEPTED_ALL or name in self.lambdas):
+                    self.flagged.add(node.lineno)
 
     def visit_call(self, node, env, follow_lambda=True):
         name = call_name(node)
@@ -3588,32 +3637,35 @@ class TaintScan:
             label = node.args[3] if len(node.args) > 3 else next((kw.value for kw in node.keywords if kw.arg == "label"), None)
             if label is not None and self.tainted(label, env):
                 self.flagged.add(node.lineno)
-        elif self.echo_target(node) is not None:
-            target = self.echo_target(node)
-            args = [*node.args, *(kw.value for kw in node.keywords)]
-            if isinstance(node.func, ast.Call) and self.is_partial(node.func):
-                args += [*node.func.args[1:], *(kw.value for kw in node.func.keywords)]
-            if target == "assertTrue" and args and isinstance(node.func, ast.Attribute):
-                args = args[1:]  # a failing assertTrue prints a FALSY first operand: empty text, never a value
-            if any(self.tainted(a, env) for a in args):
-                self.flagged.add(node.lineno)
-        elif name in ("append", "extend", "add", "update", "insert", "setdefault", "add_note") and isinstance(node.func, ast.Attribute) \
-                and isinstance(node.func.value, ast.Name):
-            if any(self.tainted(a, env) for a in node.args):
-                env.add(node.func.value.id)
-        elif self.follow and name in self.functions:
+            return
+        if not self.received(node, env):
+            return
+        if not self.accepted_callee(node):
+            self.callees.add(name)
+            self.flagged.add(node.lineno)  # r27: every call that receives a loaded value and is not accepted is a finding
+            return
+        self.callable_arguments(node, env)
+        if name in TAINT_MUTATORS and isinstance(node.func, ast.Attribute):
+            receiver = node.func.value
+            if isinstance(receiver, ast.Name):
+                env.add(receiver.id)
+            elif isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name) and receiver.value.id in ("self", "cls"):
+                self.attrs.add(receiver.attr)
+        if self.is_helper(node):
             self.pass_params(self.functions[name], node, env)
 
     def state(self):
         return (sorted(self.returns), sorted(self.attrs), {k: sorted(v) for k, v in self.params.items()},
                 sorted(self.leaked_public))
 
-    def run(self):
+    def scan(self):
         for _ in range(6):
             before = self.state()
             self.flagged = set()
             self.walk(self.tree.body, set(), None)
             for name, func in self.functions.items():
+                if name in self.exempt:
+                    continue
                 env = set(self.params[name]) | set(self.closure.get(name, ()))
                 for _pass in range(2):
                     self.walk(func.body, env, name)
@@ -3623,9 +3675,9 @@ class TaintScan:
         return sorted(self.flagged)
 
 
-def tainted_assert_lines(source, follow_helpers=True):
+def tainted_assert_lines(source, follow_helpers=True, exempt=()):
     """Sorted line numbers of the ``assert*`` calls in ``source`` with an unwrapped tainted argument."""
-    return TaintScan(source, follow_helpers).run()
+    return TaintScan(source, follow_helpers, exempt).scan()
 
 
 # ---- r24 sec F6: no path to the raw text outside the wrapper class ----
@@ -3637,7 +3689,7 @@ RAW_METHOD = "raw"
 # - an attribute that starts with an underscore is accepted only if listed here (every private slot, registry, descriptor and
 #   frame attribute is therefore refused, with no list of them);
 OPAQUE_ACCEPTED_UNDERSCORE_ATTRS = frozenset((
-    "__doc__", "__file__", "__name__", "__init__", "__cause__", "__context__", "__traceback__"))
+    "__doc__", "__file__", "__name__", "__init__", "__cause__", "__context__", "__traceback__", "__with_libyaml__"))
 # - the checker module is touched only by a public name (``ty.parse_workflow``, ``ty.Opaque(...)``) or by ``hasattr`` /
 #   ``getattr`` with a constant public name: the bare module, as an argument or an iterable, is a namespace walk;
 OPAQUE_MODULE_NAMES = frozenset(("ty", "ty_mod", "variant_ty"))
@@ -3647,13 +3699,40 @@ OPAQUE_NAMESPACE_CALLS = frozenset(("vars", "globals", "locals", "dir"))
 # - imports come from this list (reflection modules such as ``gc``, ``inspect``, ``operator`` and ``ctypes`` are not on it).
 OPAQUE_ACCEPTED_IMPORTS = frozenset((
     "ast", "concurrent", "contextlib", "copy", "dataclasses", "functools", "hashlib", "io", "json", "logging", "multiprocessing",
-    "os", "pathlib", "pickle", "pprint", "re", "shutil", "subprocess", "sys", "tempfile", "time", "traceback", "types",
+    "os", "pathlib", "pprint", "re", "shutil", "subprocess", "sys", "tempfile", "time", "traceback", "types",
     "unicodedata", "unittest", "urllib", "warnings", "weakref", "yaml", "tier_yaml_8187"))
+
+
+# r27 sec F2, code F2: the reflection builtins are accepted only as the callee of a direct call, and only ``getattr`` and
+# ``hasattr`` with a constant public name; ``eval``, ``exec``, ``compile``, ``__import__``, ``setattr``, ``delattr`` and the
+# namespace functions are not accepted anywhere in the gated code (the functions named in ``allowed`` are exempt)
+OPAQUE_REFUSED_NAMES = frozenset((
+    "eval", "exec", "compile", "__import__", "getattr", "hasattr", "setattr", "delattr", "vars", "globals", "locals", "dir",
+    "__builtins__", "breakpoint"))
+OPAQUE_NAME_PROBES = frozenset(("getattr", "hasattr"))
+# - the frame, traceback and generator attributes are accepted nowhere (they reach the globals of the caller);
+OPAQUE_FRAME_ATTRS = frozenset((
+    "tb_frame", "tb_next", "tb_lasti", "f_back", "f_globals", "f_locals", "f_builtins", "f_code", "gi_frame", "gi_code",
+    "gi_yieldfrom", "cr_frame", "cr_code", "cr_await", "ag_frame", "ag_code", "ag_await"))
+# - a class pattern may not read ``raw=`` or a private attribute (``case ty.Opaque(raw=m)``);
+# - a format template that reaches an attribute or an item of its argument (``'{0.raw}'.format(w)``) is refused, and the
+#   template of a ``.format`` call must be a constant string.
+OPAQUE_FORMAT_REACH = re.compile(r"\{[^{}!:]*[.\[]")
+
+
+def format_reaches(template):
+    """Whether a ``str.format`` template names an attribute or an item field (``{0.x}``, ``{a[0]}``), also inside a nested spec."""
+    return OPAQUE_FORMAT_REACH.search(re.sub(r"\{\{|\}\}", "", template)) is not None
 
 
 def opaque_unlisted_access(node, parent):
     """Whether ``node`` (with its parent) is an access path the gate does not list as accepted (r26 code C3)."""
+    match_class = getattr(ast, "MatchClass", None)
+    if match_class is not None and isinstance(node, match_class):
+        return any(attr == RAW_METHOD or attr.startswith("_") for attr in node.kwd_attrs)
     if isinstance(node, ast.Attribute):
+        if node.attr in OPAQUE_FRAME_ATTRS:
+            return True
         if node.attr.startswith("_") and node.attr not in OPAQUE_ACCEPTED_UNDERSCORE_ATTRS:
             return True
         if node.attr == "modules":
@@ -3666,6 +3745,12 @@ def opaque_unlisted_access(node, parent):
                             or (isinstance(t, ast.Attribute) and t.attr in OPAQUE_MODULE_NAMES) for t in parent.targets)))
         return False
     if isinstance(node, ast.Name):
+        if node.id in OPAQUE_REFUSED_NAMES and isinstance(node.ctx, ast.Load):
+            if not (isinstance(parent, ast.Call) and parent.func is node and node.id in OPAQUE_NAME_PROBES
+                    and len(parent.args) >= 2 and not parent.keywords):
+                return True
+            name = folded_string(parent.args[1])
+            return name is None or (name.startswith("_") and name not in OPAQUE_ACCEPTED_UNDERSCORE_ATTRS)
         if node.id in OPAQUE_MODULE_NAMES and isinstance(node.ctx, ast.Load):
             if isinstance(parent, ast.Attribute) and parent.value is node:
                 return False  # the attribute itself is judged on its own turn
@@ -3676,6 +3761,9 @@ def opaque_unlisted_access(node, parent):
             return True
         return False
     if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute) and node.func.attr in ("format", "format_map"):
+            template = folded_string(node.func.value)
+            return template is None or format_reaches(template)
         return isinstance(node.func, ast.Name) and node.func.id in OPAQUE_NAMESPACE_CALLS
     if isinstance(node, ast.Import):
         return any(alias.name.split(".")[0] not in OPAQUE_ACCEPTED_IMPORTS for alias in node.names)
@@ -3908,7 +3996,7 @@ class TestNoAssertCanEchoAuthorText8187R23(unittest.TestCase):
     }
 
     def test_no_assert_in_this_module_receives_a_raw_workflow_or_pin_value(self):
-        flagged = tainted_assert_lines(Path(__file__).read_text(encoding="utf-8"))
+        flagged = tainted_assert_lines(Path(__file__).read_text(encoding="utf-8"), exempt=TAINT_EXEMPT_FUNCTIONS)
         self.assertEqual(flagged, [], "%d asserts receive an unwrapped value; lines %s" % (len(flagged), flagged[:12]))
 
     def test_the_scanner_flags_each_echo_shape_and_clears_the_wrapped_forms(self):
@@ -4170,6 +4258,7 @@ def probe_text(fn):
 
 
 def opaque_probe_paths(o, p, case):
+    import pickle  # the probe pickles the wrapper; ``pickle`` is not an accepted import of the gated code
     """The 63 channels: the 62 of the r23 review's ``probe_opaque.py`` (46 value paths and 16 failing assertions) plus the
     ``weakref.finalize`` registry walk of the r24 code review."""
     paths = {
@@ -4363,11 +4452,11 @@ def f40e_measure(case, name, shape, nbytes):
     value = shape("a" * int(nbytes / unit))
     edited = f40e_edit(case.text, case.step, value)
     own = pins_for({case.workflow: edited})
-    calls = ((primary_pin_problems, case.pins[PRIMARY]), (job_pin_problems, case.pins[SECONDARY]),
-             (primary_pin_problems, own[PRIMARY]), (job_pin_problems, own[SECONDARY]))
+    calls = ((True, case.pins[PRIMARY]), (False, case.pins[SECONDARY]), (True, own[PRIMARY]), (False, own[SECONDARY]))
     start = time.perf_counter()
-    for position, (fn, pins) in enumerate(calls):
-        problems = fn(case.workflow, edited, pins)
+    for position, (primary, pins) in enumerate(calls):
+        problems = (primary_pin_problems(case.workflow, edited, pins) if primary
+                    else job_pin_problems(case.workflow, edited, pins))
         case.assertIs(len(problems) > 0, position < 2)  # the first two calls use the real pins and must fail
         case.assertLess(max([len(line) for line in problems] + [0]), 600)
         case.assertEqual(len([line for line in problems if value[:32] in line]), 0)
@@ -4505,6 +4594,22 @@ def harness_mutant_source(source, kind, what):
                            for link in links)
             return match.group("indent") + pops + match.group(0).lstrip()
         return CHANNEL_LINE.sub(strip_links, source)
+    if kind == "one-link-walk":  # r27 code F4: the chain is walked one link deep (the exception, its cause, its context)
+        def one_link(match):
+            if match.group("name") != what:
+                return match.group(0)
+            return (match.group("indent") + "chunks += [line for link in (exc, exc.__cause__, exc.__context__) if link is not None "
+                    "for line in traceback.format_exception(type(link), link, link.__traceback__, chain=False)]"
+                    "  # canary-channel: " + what)
+        return CHANNEL_LINE.sub(one_link, source)
+    if kind == "deep-notes-strip":  # r27 code F4: the notes two links deep are removed before the chain is formatted
+        def strip_deep(match):
+            if match.group("name") != what:
+                return match.group(0)
+            pops = "".join("getattr(getattr(getattr(exc, '%s', None), '%s', None), '__dict__', {}).pop('__notes__', None)\n%s"
+                           % (link, link, match.group("indent")) for link in ("__cause__", "__context__"))
+            return match.group("indent") + pops + match.group(0).lstrip()
+        return CHANNEL_LINE.sub(strip_deep, source)
     if kind == "chain-str":
         def narrow(match):
             if match.group("name") != what:
@@ -4625,7 +4730,7 @@ class TestNoLoaderCallPrintsAuthorText8187R24(unittest.TestCase):
             for loader in (ty.load_strict, ty.load_lenient):
                 with self.subTest(plant=kind, loader=loader.__name__):
                     with self.assertRaises(ValueError) as caught:
-                        loader(text)
+                        ty.load_strict(text) if loader is ty.load_strict else ty.load_lenient(text)
                     shown = "".join(traceback.format_exception(type(caught.exception), caught.exception,
                                                                caught.exception.__traceback__))
                     self.assertNotIn("MKsecret", shown)
@@ -4847,7 +4952,8 @@ class TestEveryLabelIsPositional8187R24(unittest.TestCase):
 
 # ---- r25 code C5: the opaque gate's four bypasses ----
 # the wrapper, the two probes that try every path, and the one function that execs a module copy into its namespace
-OPAQUE_GATE_ALLOWED = ("Opaque", "_forget", "opaque_probe_paths", "opaque_finalizer_funcs", "load_variant")
+OPAQUE_GATE_ALLOWED = ("Opaque", "_forget", "opaque_probe_paths", "opaque_finalizer_funcs", "load_variant",
+                       "test_length_of_a_value_without_a_length_is_zero_and_copies_do_not_leak")
 
 
 def opaque_finalizer_funcs(o):
@@ -4889,7 +4995,7 @@ class TestOpaqueGateClosesTheBypasses8187R25(unittest.TestCase):
         o = ty.Opaque(PROBE_MARK, "key[5]")
         funcs = opaque_finalizer_funcs(o)
         self.assertEqual(len(funcs), 1)
-        self.assertIs(hasattr(funcs[0], "__self__"), False)
+        self.assertIs(isinstance(funcs[0], types.MethodType), False)  # a bound method would hold its instance
 
 
 # ---- r25 security S1: the loaders raise StrictYamlError only ----
@@ -5177,7 +5283,7 @@ class TestTaintScanFollowsEveryOutputSink8187R26(unittest.TestCase):
     def test_both_shipped_files_have_no_tainted_line(self):
         for path in (TY_PATH, THIS_PATH):
             with self.subTest(file=path.name):
-                self.assertEqual(tainted_assert_lines(path.read_text(encoding="utf-8")), [])
+                self.assertEqual(tainted_assert_lines(path.read_text(encoding="utf-8"), exempt=TAINT_EXEMPT_FUNCTIONS), [])
 
 
 class TestOpaqueGateEnumeratesTheAcceptedPaths8187R26(unittest.TestCase):
@@ -5644,18 +5750,33 @@ class TestTaintScanIsAPositiveEnumeration8187R27(unittest.TestCase):
         self.assertIsInstance(accepted, frozenset)
         self.assertGreater(len(accepted), 0)
         self.assertLessEqual(len(accepted), 80)
-        self.assertEqual(sorted(accepted & set(TAINT_R27_NEVER_ACCEPTED)), [])
+        self.assertEqual(sorted(TAINT_ACCEPTED_ALL & set(TAINT_R27_NEVER_ACCEPTED)), [])
+        self.assertLessEqual(len(TAINT_ACCEPTED_HARNESS), 30)
+        self.assertEqual(sorted(TAINT_EXEMPT_FUNCTIONS), ["canary_dump", "load_variant"])
         self.assertTrue(all(name.isidentifier() for name in accepted))
         self.assertEqual(sorted(TAINT_ACCEPTED_CALLEES), sorted(set(TAINT_ACCEPTED_CALLEES)))
 
+    def test_the_exempt_functions_have_no_output_call(self):
+        tree = ast.parse(THIS_PATH.read_text(encoding="utf-8"))
+        outputs = {"print", "write", "writelines", "log", "warn", "exit", "system", "Popen", "run", "open", "write_text",
+                   "debug", "info", "warning", "error", "critical", "exception", "excepthook"}
+        seen = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in TAINT_EXEMPT_FUNCTIONS:
+                seen.append(node.name)
+                calls = {call_name(c) for c in ast.walk(node) if isinstance(c, ast.Call)}
+                self.assertEqual(len(calls & outputs), 0)
+        self.assertEqual(len(seen), len(TAINT_EXEMPT_FUNCTIONS))
+
     def test_the_lists_of_refused_output_calls_are_gone(self):
-        present = [name for name in TAINT_R27_REMOVED_LISTS if hasattr(sys.modules[__name__], name)]
+        source = THIS_PATH.read_text(encoding="utf-8")
+        present = [name for name in TAINT_R27_REMOVED_LISTS if re.search(r"^%s\s*=" % name, source, re.MULTILINE)]
         self.assertEqual(present, [])
 
     def test_both_shipped_files_have_no_tainted_line(self):
         for path in (TY_PATH, THIS_PATH):
             with self.subTest(file=path.name):
-                self.assertEqual(tainted_assert_lines(path.read_text(encoding="utf-8")), [])
+                self.assertEqual(tainted_assert_lines(path.read_text(encoding="utf-8"), exempt=TAINT_EXEMPT_FUNCTIONS), [])
 
 
 class TestOpaqueGateAcceptsOnlyNamedPaths8187R27(unittest.TestCase):

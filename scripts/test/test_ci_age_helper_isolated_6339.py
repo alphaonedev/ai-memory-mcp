@@ -51,30 +51,24 @@ XTRACE = re.compile(r"(?:\bset\s+(?:-\S*x\S*|[-+]o\s+xtrace)|\bxtrace\b|\bBASH_X
 GUARD = 'if [ "${CI_NODE:-}" = "macos-fed" ]; then'
 CALL = re.compile(r'^\s*if ! python3 -I ' + re.escape(HELPER) + r' --url-file "\$url_file"; then$')
 URL_VARS = re.compile(r"\$\{?(?:base_url|new_url)\b|\$\(cat\b")
-READ = 'base_url="$(cat "$url_file")"'
+READ = 'url_file="$HOME/.ai-memory-ci-fed-url"'
 URL_REF = re.compile(r"\$\{?(?:url_file|base_url|new_url|head|q)\b|ai-memory-ci-fed-url")
 URL_NAMES = re.compile(r"\b(?:url_file|base_url|new_url|head|q)\b")
 EXPORTS = re.compile(r"^(?:export|declare\s+-\S*x|typeset\s+-\S*x|readonly)\b(.*)$")
 ENV_DUMP = re.compile(r"(?:^|[;&|(]\s*)(?:env|printenv|compgen\s+-[vA]|(?:export|declare|typeset)\s+-p|set)\s*(?:$|[;&|)])")
-# The reviewed lines that use the URL.  psql "$base_url"/"$new_url" on argv and the $GITHUB_ENV write are #6172.
+# The reviewed lines that use the URL.
 URL_LINES = frozenset((
     'url_file="$HOME/.ai-memory-ci-fed-url"',
     'if [ ! -f "$url_file" ]; then',
     'echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not'
     ' provisioned on this node"',
-    READ,
-    'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
-    'case "$base_url" in',
-    '*\\?*) q="?${base_url#*\\?}"; head="${base_url%%\\?*}" ;;',
-    '*)    q=""; head="$base_url" ;;',
-    'new_url="${head%/*}/${CI_FED_DB}${q}"',
     'if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then',
-    'if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS'
-    ' vector;"; then',
-    'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"',
-    # #6383: the per-binary isolation wrapper takes the URL through its environment, never argv.
-    'AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB"'
-    ' --jobs 8 --emit-env >> "$GITHUB_ENV"',
+    # #8187: the credential never reaches argv or a shell variable; every tier use goes through the two helpers.
+    'if ! python3 -I scripts/ci/check-tier-password.py --url-file "$url_file"; then',
+    'if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" -- psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
+    'if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" -- psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then',
+    'python3 -I scripts/ci/tier_credential.py github-env --url-file "$url_file" --database "$CI_FED_DB"',
+    'python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" --export-url -- python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"',
 ))
 
 
@@ -323,7 +317,7 @@ class TestAgeHelperIsolated6339(unittest.TestCase):
             "::debug:: URL": (READ, READ + '\n          echo "::debug::${new_url:-$base_url}"'),
             "::notice:: URL": (NOTICE, NOTICE.replace("pointed AI_MEMORY_TEST_POSTGRES_URL at it", "set $new_url")),
             "URL copied to another name": (READ, READ + '\n          u="$base_url"'),
-            "URL head on argv": ('new_url="${head%/*}', 'logger "$head"\n          new_url="${head%/*}'),
+            "URL head on argv": (READ, READ + '\n          logger "$head"'),
             "URL to stderr": (READ, READ + '\n          echo "$base_url" >&2'),
         }
         for name, (old, new) in mutants.items():
