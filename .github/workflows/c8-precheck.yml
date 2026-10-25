@@ -1226,15 +1226,30 @@ jobs:
     # it mechanically.
     #
     # RULE. If the PR author is not OWNER / MEMBER / COLLABORATOR, or the head
-    # is a fork, this job HARD-FAILS unless an APPROVED review by the
-    # accountable operator account (`alphaonedev`) exists for the PR's CURRENT
-    # head SHA. That review is a native GitHub review the biological operator
+    # is a fork, this job HARD-FAILS unless the accountable operator account's
+    # (`alphaonedev`) latest review of the PR's CURRENT head SHA is APPROVED
+    # (#6329: a later CHANGES_REQUESTED or a dismissal fails the next run of
+    # this job; there is no pull_request_review trigger, so a check that
+    # already passed stays green until the job runs again, tracked in #6511).
+    # That review is a native GitHub review the biological operator
     # submits by hand ("Approve" on the PR); it is NOT a label, NOT a comment,
     # and NOT something an AI agent acting under the operator's token may
     # submit (docs/AI_DEVELOPER_GOVERNANCE.md §3.1 — Restricted). A new push
     # to the PR changes the head SHA and voids the approval, so the operator
     # re-reviews what will actually merge. Team-authored same-repo PRs pass
     # unconditionally: the single-authority merge train is untouched.
+    #
+    # EVERY EVENT (#6117 / #6193 / #6227). A push or merge_group run reports
+    # this REQUIRED context on the same sha as the PR run, so it is judged
+    # too: scripts/check_external_pr_approval.py judges the event's own pull
+    # request on pull_request; on merge_group the PR named by the queue ref
+    # (whose sha must equal merge_group.base_sha, the queue commit's
+    # parent; #6325), and only when the base branch's merge_queue rule has
+    # max_entries_to_merge == 1 so no queued PR goes unjudged (#6229); on push
+    # the open PRs whose head is GITHUB_SHA (none: pass). Exit 2 is an
+    # undecidable verdict; any API error fails closed. Residual (#6213): a PR opened LATER
+    # on a sha a push run already judged still sits beside that earlier
+    # run's result.
     #
     # Commit signing is enforced separately (live `required_signatures`
     # ruleset + `Commit-signing posture gate (#2486)`); this job does not
@@ -1249,48 +1264,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # #3591 — `Evaluate external-PR approval requirement` calls
-    # `gh api repos/$REPO/pulls/$PR_NUMBER/reviews` (read-only). Job-level
+    # `gh api repos/$REPO/pulls/<n>/reviews` and, off pull_request (#6193),
+    # `gh api repos/$REPO/pulls?state=open` and, on merge_group (#6229),
+    # `gh api repos/$REPO/rules/branches/<base>` (all read-only). Job-level
     # permissions replace the workflow default, so contents: read stays listed.
     permissions:
       contents: read
       pull-requests: read
     steps:
+      # #6117 / #6193: the evaluator runs on EVERY event. On pull_request it
+      # judges the event's PR; on merge_group it judges the PR named by
+      # merge_group.head_ref (#6227); on push it judges every OPEN PR whose
+      # head is GITHUB_SHA by the same rule (a push run reports this
+      # REQUIRED context on the same sha as the PR run, so it may never pass
+      # where the PR run fails). Any API error fails closed. The checkout only
+      # supplies the evaluator; it does not keep the token on disk.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Self-test the external-PR approval evaluator (#6193)
+        run: python3 -I scripts/check_external_pr_approval.py --self-test
       - name: Evaluate external-PR approval requirement
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_ASSOC: ${{ github.event.pull_request.author_association }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           OPERATOR_LOGIN: alphaonedev
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" != "pull_request" ]; then
-            echo "event=$EVENT — not a pull_request; gate not applicable (pass)"; exit 0
-          fi
-          team=false
-          case "$PR_ASSOC" in OWNER|MEMBER|COLLABORATOR) team=true ;; esac
-          if [ "$team" = true ] && [ "$PR_HEAD_REPO" = "$REPO" ]; then
-            echo "author=$PR_AUTHOR ($PR_ASSOC), same-repo head — team PR (pass)"; exit 0
-          fi
-          echo "author=$PR_AUTHOR ($PR_ASSOC) head_repo=$PR_HEAD_REPO — EXTERNAL contribution; operator approval required"
-          # An APPROVED review by the operator account for THIS head SHA.
-          approved=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate             --jq "[.[] | select(.user.login == \"$OPERATOR_LOGIN\" and .state == \"APPROVED\" and .commit_id == \"$PR_HEAD_SHA\")] | length")
-          if [ "${approved:-0}" -ge 1 ]; then
-            echo "APPROVED review by @$OPERATOR_LOGIN found for head $PR_HEAD_SHA (pass)"; exit 0
-          fi
-          cat >&2 <<MSG
-          ::error::External-PR operator-approval gate FAILED.
-          This PR was authored by '$PR_AUTHOR' ($PR_ASSOC) from '$PR_HEAD_REPO'. Per project policy
-          (docs/AI_DEVELOPER_GOVERNANCE.md), contributions from outside the team are welcome but can
-          only merge after the accountable biological operator (@$OPERATOR_LOGIN) has reviewed the
-          exact head commit ($PR_HEAD_SHA) and submitted an APPROVED review on it. After approving,
-          re-run this job. Any new push voids the approval.
-          MSG
-          exit 1
+        run: python3 -I scripts/check_external_pr_approval.py
 
   # ---------------------------------------------------------------------------
   # #3967 — three gates that existed and ran NOWHERE. Rule (g) of
