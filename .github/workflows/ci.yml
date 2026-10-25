@@ -2708,8 +2708,15 @@ jobs:
       # base.sha is frozen at PR-open time and github.sha on merge_group
       # contains the PR. Same helper step as the select job. A failure leaves
       # `sha` empty and the gate fails closed below (never the PR-tree gate).
+      # decision: on push, schedule and workflow_dispatch the gate runs from
+      # the checked-out tree over failing closed because there is no second
+      # party to judge itself: the tree under test is already the branch tip,
+      # and a gate that is red on every chain push and nightly full run can
+      # never be made required. Only pull_request and merge_group resolve a
+      # live base and keep every base-gate rule below.
       - name: Resolve the live base (#8240)
         id: live
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
         continue-on-error: true
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -2718,7 +2725,7 @@ jobs:
           BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
         run: python3 -I scripts/ci/impact/base_sha.py --github-output "$GITHUB_OUTPUT"
       - name: Name the live base in the summary
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
         env:
           LIVE_BASE: ${{ steps.live.outputs.sha }}
           LIVE_BASE_REASON: ${{ steps.live.outputs.reason }}
@@ -2735,6 +2742,7 @@ jobs:
       # (fetch failure, timeout, invalid sha) fails this job.
       - name: Materialise the base gate (#8240)
         id: base
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
         env:
           BASE_SHA: ${{ steps.live.outputs.sha }}
           IMPACT_FILES: __init__.py common.py gate.py rules.json
@@ -2863,7 +2871,7 @@ jobs:
       # decision: !cancelled() && over plain result check because a failed
       # select must not skip the gated jobs
       - name: Fold job results (base gate)
-        if: ${{ !cancelled() && steps.base.outputs.ok == 'true' }}
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && steps.base.outputs.ok == 'true' }}
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           GITHUB_REF_NAME_FULL: ${{ github.ref }}
@@ -2871,7 +2879,7 @@ jobs:
           python3 -I "$RUNNER_TEMP/impact-base/impact/gate.py" --needs "$NEEDS_JSON" \
             --github-ref "$GITHUB_REF_NAME_FULL"
       - name: Fold job results (bootstrap, PR-tree gate)
-        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap == 'true' }}
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap == 'true' }}
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           GITHUB_REF_NAME_FULL: ${{ github.ref }}
@@ -2879,8 +2887,20 @@ jobs:
           echo "ci-gate: bootstrap, the base sha has no scripts/ci/impact/gate.py; the PR-tree gate runs for this base only" >> "$GITHUB_STEP_SUMMARY"
           python3 -I scripts/ci/impact/gate.py --needs "$NEEDS_JSON" \
             --github-ref "$GITHUB_REF_NAME_FULL"
+      # The gate itself is unchanged: it still fails on any needed job that
+      # failed, was cancelled, or was skipped without a permitted reason.
+      - name: Fold job results (branch tip gate)
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GITHUB_REF_NAME_FULL: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "ci-gate: no live base needed (${EVENT_NAME}): the checked-out tree is the branch tip" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -I scripts/ci/impact/gate.py --needs "$NEEDS_JSON" \
+            --github-ref "$GITHUB_REF_NAME_FULL"
       - name: Fail the gate (base gate unreadable)
-        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap != 'true' }}
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap != 'true' }}
         env:
           IMPACT_REASON: ${{ steps.base.outputs.reason }}
           LIVE_BASE_REASON: ${{ steps.live.outputs.reason }}

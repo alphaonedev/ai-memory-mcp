@@ -168,7 +168,8 @@ class WorkflowShape(unittest.TestCase):
         materialise = step_named(GATE_JOB, GATE_MATERIALISE_STEP)
         self.assertEqual(materialise["id"], "base")
         runs = [s for s in workflow_text.read_steps(CI_YML, GATE_JOB)
-                if s["run"] and "gate.py" in s["run"] and "<<'PY'" not in s["run"]]
+                if s["run"] and "gate.py" in s["run"] and "<<'PY'" not in s["run"]
+                and s["name"] != BRANCH_TIP_STEP]
         self.assertEqual(len(runs), 2)
         base_run = [s for s in runs if BASE_DIR in s["run"]]
         pr_run = [s for s in runs if BASE_DIR not in s["run"]]
@@ -176,7 +177,9 @@ class WorkflowShape(unittest.TestCase):
         self.assertEqual(len(pr_run), 1)
         self.assertIn("steps.base.outputs.ok == 'true'", base_run[0]["if"])
         self.assertEqual(pr_run[0]["if"],
-                         "${{ !cancelled() && steps.base.outputs.ok != 'true' "
+                         "${{ !cancelled() && (github.event_name == 'pull_request' || "
+                         "github.event_name == 'merge_group') && "
+                         "steps.base.outputs.ok != 'true' "
                          "&& steps.base.outputs.bootstrap == 'true' }}")
         self.assertTrue(base_run[0]["if"].startswith("${{ !cancelled() &&"))
 
@@ -253,7 +256,8 @@ class GateBaseRead(BaseCase):
 
     def plan(self, lines):
         """Return the names of the gate steps whose `if:` holds after the materialise step."""
-        context = {"steps": {"base": {"outputs": lines}}}
+        context = {"github": {"event_name": "pull_request"},
+                   "steps": {"base": {"outputs": lines}}}
         ran = []
         for step in workflow_text.read_steps(CI_YML, GATE_JOB):
             if step["uses"] or step["name"] in (GATE_MATERIALISE_STEP, LIVE_BASE_STEP,
@@ -738,6 +742,96 @@ class LiveBaseWorkflow(unittest.TestCase):
         step = step_named(GATE_JOB, FAIL_STEP)
         self.assertIn("steps.live.outputs.reason", " ".join(step["env"].values()))
 
+
+BRANCH_TIP_STEP = "Fold job results (branch tip gate)"
+LIVE_EVENTS = ("pull_request", "merge_group")
+BRANCH_EVENTS = ("push", "schedule", "workflow_dispatch")
+OTHER_EVENTS = BRANCH_EVENTS + ("release", "workflow_run", "")
+OUTPUT_VALUES = (None, "true", "false")
+
+
+def gate_steps_that_run(event):
+    """Yield (steps, outputs) for every output combination of the ci-gate job.
+
+    `steps` are the ci-gate steps whose `if:` holds for `event`. The base step
+    is skipped on a branch-tip event, so its outputs are empty there; every
+    output combination is still tried so a guard that only works for one
+    combination is caught.
+    """
+    steps = workflow_text.read_steps(CI_YML, GATE_JOB)
+    for ok in OUTPUT_VALUES:
+        for bootstrap in OUTPUT_VALUES:
+            outputs = {k: v for k, v in (("ok", ok), ("bootstrap", bootstrap)) if v}
+            context = {"github": {"event_name": event},
+                       "steps": {"base": {"outputs": outputs}, "live": {"outputs": {}}}}
+            ran = [s for s in steps
+                   if s["if"] is None or gha_expr.evaluate_job_if(s["if"], context)]
+            yield ran, outputs
+
+
+class BranchTipGate(unittest.TestCase):
+    """R5-RISK: push, schedule and workflow_dispatch run the gate on the branch tip.
+
+    decision: on push, schedule and workflow_dispatch the gate runs from the
+    checked-out tree over failing closed because there is no second party to
+    judge itself: the tree under test is already the branch tip, and a gate
+    that is red on every chain push and nightly full run can never be made
+    required
+    """
+
+    def test_a_branch_tip_event_runs_exactly_the_branch_tip_fold(self):
+        for event in OTHER_EVENTS:
+            for ran, outputs in gate_steps_that_run(event):
+                folds = [s["name"] for s in ran if (s["name"] or "").startswith("Fold job results")]
+                with self.subTest(event=event, outputs=outputs):
+                    self.assertEqual(folds, [BRANCH_TIP_STEP])
+
+    def test_a_branch_tip_event_skips_the_live_base_and_the_materialise_steps(self):
+        for event in OTHER_EVENTS:
+            for ran, outputs in gate_steps_that_run(event):
+                names = [s["name"] for s in ran]
+                with self.subTest(event=event, outputs=outputs):
+                    self.assertNotIn(LIVE_BASE_STEP, names)
+                    self.assertNotIn(GATE_MATERIALISE_STEP, names)
+                    self.assertNotIn(LIVE_SUMMARY_STEP, names)
+
+    def test_a_live_base_event_never_runs_the_branch_tip_fold(self):
+        for event in LIVE_EVENTS:
+            for ran, outputs in gate_steps_that_run(event):
+                names = [s["name"] for s in ran]
+                with self.subTest(event=event, outputs=outputs):
+                    self.assertNotIn(BRANCH_TIP_STEP, names)
+                    self.assertIn(LIVE_BASE_STEP, names)
+                    self.assertIn(GATE_MATERIALISE_STEP, names)
+
+    def test_the_fail_step_can_only_run_on_a_live_base_event(self):
+        for event in OTHER_EVENTS + LIVE_EVENTS:
+            for ran, outputs in gate_steps_that_run(event):
+                with self.subTest(event=event, outputs=outputs):
+                    if FAIL_STEP in [s["name"] for s in ran]:
+                        self.assertIn(event, LIVE_EVENTS)
+
+    def test_the_fail_step_still_runs_when_a_live_base_event_has_no_base_gate(self):
+        hit = [outputs for ran, outputs in gate_steps_that_run("pull_request")
+               if FAIL_STEP in [s["name"] for s in ran]]
+        self.assertTrue(hit)
+
+    def test_the_branch_tip_fold_runs_the_checked_out_gate_and_names_the_event(self):
+        step = step_named(GATE_JOB, BRANCH_TIP_STEP)
+        self.assertIn("python3 -I " + GATE_SCRIPT + " --needs", step["run"])
+        self.assertIn("--github-ref", step["run"])
+        self.assertIn("ci-gate: no live base needed (", step["run"])
+        self.assertIn("the checked-out tree is the branch tip", step["run"])
+        self.assertIn("github.event_name", " ".join(step["env"].values()))
+        self.assertIn("!cancelled()", step["if"])
+
+    def test_no_step_that_runs_on_a_branch_tip_event_reads_the_base_copy(self):
+        for event in OTHER_EVENTS:
+            for ran, outputs in gate_steps_that_run(event):
+                for step in ran:
+                    text = (step["run"] or "") + " ".join(step["env"].values())
+                    with self.subTest(event=event, step=step["name"]):
+                        self.assertNotIn(BASE_DIR, text)
 
 
 if __name__ == "__main__":
