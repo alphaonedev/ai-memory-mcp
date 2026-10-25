@@ -87,7 +87,7 @@ on:
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
     branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
   # Merge Queue (#3089) — GitHub runs a queued PR's REQUIRED checks against the
   # ephemeral `merge_group` ref, NOT the PR ref. A required workflow that does
   # not trigger on `merge_group` never reports on that ref, so its context stays
@@ -259,7 +259,7 @@ jobs:
       # sweep script tests (including the Linux-only O_PATH test, which this
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
       - name: Target sweep unit tests (#7160)
-        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py scripts/test/test_workflow_edited_7072.py
       - id: cls
         shell: bash
         env:
