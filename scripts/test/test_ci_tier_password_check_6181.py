@@ -4303,6 +4303,22 @@ FLAG_SITE_MUTANT = ("%s = True  #" % FORCE_FLAG, "%s = False  #" % FORCE_FLAG)
 FORCING_SITE_MUTANTS = {**GUARD_SITE_MUTANTS, "flag switched off": FLAG_SITE_MUTANT}
 
 
+# r26 code C1: the real-pins fail scenario runs in ONE view only (the other view's call is replaced).  Each text is found once;
+# the family name is split so this table is not a second occurrence of the site it replaces
+VIEW_SITE_FAMILY = '"fail-real' + '-pins/" + tag'
+VIEW_SITE_CALL = "run.views(shape_name, %s, wf, text1, pins[mod.PRIMARY], pins[mod.SECONDARY], \"fail\")" % VIEW_SITE_FAMILY
+VIEW_SITE_MUTANTS = {
+    "text view of the real-pins fail scenario": (
+        VIEW_SITE_CALL,
+        "run.observe(shape_name, %s + \"/loaded\", mod.primary_pin_problems, wf, text1, pins[mod.PRIMARY], expect=\"fail\")"
+        % VIEW_SITE_FAMILY),
+    "loaded view of the real-pins fail scenario": (
+        VIEW_SITE_CALL,
+        "run.observe(shape_name, %s + \"/text\", mod.job_pin_problems, wf, text1, pins[mod.SECONDARY], expect=\"fail\")"
+        % VIEW_SITE_FAMILY),
+}
+
+
 CHANNEL_LINE = re.compile(r"^(?P<indent>\s*).*# canary-channel: (?P<name>[a-z-]+)$", re.M)
 HARNESS_MUTANTS = {
     "drop exception capture": ("channel", ("exception", "exception-chain"), "controls"),
@@ -4316,6 +4332,9 @@ HARNESS_MUTANTS = {
     "notes stripped before formatting": ("notes-strip", "exception-chain", "controls"),  # r25 code C3
     # r25 code C2: one row per fail-path guard, each red on its own
     **{"guard removed: " + name: ("site", pair, "coverage") for name, pair in GUARD_SITE_MUTANTS.items()},
+    "notes stripped from the cause chain": ("cause-notes-strip", "exception-chain", "controls"),  # r26 code C4
+    # r26 code C1: one row per view of the real-pins fail scenario, each red on its own
+    **{"view dropped: " + name: ("site", pair, "coverage") for name, pair in VIEW_SITE_MUTANTS.items()},
 }
 
 
@@ -4333,6 +4352,12 @@ def harness_mutant_source(source, kind, what):
                 return match.group(0)
             return match.group("indent") + "exc.__dict__.pop('__notes__', None)\n" + match.group(0)
         return CHANNEL_LINE.sub(strip, source)
+    if kind == "cause-notes-strip":
+        def strip_cause(match):
+            if match.group("name") != what:
+                return match.group(0)
+            return match.group("indent") + "getattr(exc.__cause__, '__dict__', {}).pop('__notes__', None)\n" + match.group(0)
+        return CHANNEL_LINE.sub(strip_cause, source)
     if kind == "chain-str":
         def narrow(match):
             if match.group("name") != what:
@@ -4368,7 +4393,7 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         names = set(canary_controls(CanaryRun(sys.modules[__name__])))
         expected = {"print", "stderr", "log", "warning", "problem-line", "exception", "exception-chain", "exception-context"}
         if sys.version_info >= (3, 11):
-            expected.add("exception-notes")  # r25 sec S3
+            expected.update(("exception-notes", "exception-cause-notes"))  # r25 sec S3, r26 code C4
         self.assertEqual(names, expected)
 
     def test_each_harness_mutant_is_red(self):
@@ -4376,7 +4401,7 @@ class TestCanaryHarnessIsProven8187R24(unittest.TestCase):
         test_source = THIS_PATH.read_text(encoding="utf-8")
         for name, (kind, what, check) in HARNESS_MUTANTS.items():
             with self.subTest(mutant=name):
-                if kind in ("chain-str", "notes-strip") and sys.version_info < (3, 11):
+                if kind in ("chain-str", "notes-strip", "cause-notes-strip") and sys.version_info < (3, 11):
                     continue  # exception notes exist from Python 3.11; the control is registered from there too
                 variant = load_variant(ty_source, harness_mutant_source(test_source, kind, what))
                 if check == "controls":
@@ -4888,6 +4913,206 @@ class TestEveryForcingSiteIsCounted8187R25(unittest.TestCase):
                     survivors.append(name)
                 self.assertGreater(len(failures), 0)
         self.assertEqual(survivors, [])
+
+
+# ---- r26 code C1-C6 (code r25): the sink table, the opaque snippets, the view gate and the cause-notes control ----
+# the 26 output-sink shapes of the code r25 review's ``probes.py`` (check 3), verbatim; the first 19 were red at r25 head
+TAINT_R26_SHAPES = {
+    "lambda stored in a dict": TAINT_HEAD + "        d = {'k': lambda: text}\n        self.assertEqual(d['k'](), 'x')\n",
+    "lambda in list, called later": TAINT_HEAD + "        fs = []\n        fs.append(lambda: text)\n        self.assertEqual(fs[0](), 'x')\n",
+    "lambda kw-only default": TAINT_HEAD + "        f = lambda *, v=text: v\n        self.assertIn(f(), [])\n",
+    "assert alias tuple unpack (3)": TAINT_HEAD + "        a, b, c = self.assertTrue, self.assertEqual, self.assertIn\n        b(text, 'x')\n",
+    "raise from (name)": TAINT_HEAD + "        cause = ValueError(text)\n        raise RuntimeError('x') from cause\n",
+    "add_note then raise": TAINT_HEAD + "        err = KeyError('k')\n        err.add_note(str(text))\n        raise err\n",
+    "stdout.write(str())": TAINT_HEAD + "        import sys\n        sys.stdout.write('%s\\n' % text)\n",
+    "stdout.write(text)": TAINT_HEAD + "        import sys\n        sys.stdout.write(text)\n",
+    "partial(print, text)()": TAINT_HEAD + "        functools.partial(print, 'a', text)()\n",
+    "os.write": TAINT_HEAD + "        import os\n        os.write(1, text.encode())\n",
+    "print(file=stream)": TAINT_HEAD + "        import io\n        s = io.StringIO()\n        print(text, file=s)\n",
+    "logging.Logger.log": TAINT_HEAD + "        import logging\n        logging.getLogger('x').log(40, text)\n",
+    "logger var .log": TAINT_HEAD + "        import logging\n        logger = logging.getLogger('x')\n        logger.log(40, text)\n",
+    "warnings.warn": TAINT_HEAD + "        import warnings\n        warnings.warn(text)\n",
+    "sys.excepthook": TAINT_HEAD + "        import sys\n        sys.excepthook(ValueError, ValueError(text), None)\n",
+    "traceback.print_exc": TAINT_HEAD + "        import traceback\n        try:\n            raise ValueError(text)\n"
+                          "        except ValueError:\n            traceback.print_exc()\n",
+    "traceback.print_exception": TAINT_HEAD + "        import traceback\n        traceback.print_exception(ValueError(text))\n",
+    "f-string assert message": TAINT_HEAD + "        assert len(text) == 0, f'got {text}'\n",
+    "stderr alias write": TAINT_HEAD + "        import sys\n        out = sys.stderr\n        out.write(text)\n",
+    "sys.__stdout__.write": TAINT_HEAD + "        import sys\n        sys.__stdout__.write(text)\n",
+    "print(*list)": TAINT_HEAD + "        print(*[text])\n",
+    "pprint.pprint": TAINT_HEAD + "        import pprint\n        pprint.pprint(text)\n",
+    "logging.log module fn": TAINT_HEAD + "        import logging\n        logging.log(40, text)\n",
+    "subTest msg": TAINT_HEAD + "        with self.subTest(text):\n            pass\n",
+    "assertEqual msg kw from text": TAINT_HEAD + "        self.assertEqual(1, 1, msg=text)\n",
+    "bound write method": TAINT_HEAD + "        import sys\n        w = sys.stdout.write\n        w(text)\n",
+}
+TAINT_R26_MISSED_AT_R25 = (
+    "os.write", "logging.Logger.log", "sys.excepthook", "traceback.print_exception", "stderr alias write", "sys.__stdout__.write",
+    "bound write method")
+TAINT_R26_CLEAN = {
+    "len": TAINT_HEAD + "        self.assertEqual(len(text), 3)\n",
+    "lambda param shadows": TAINT_HEAD + "        f = lambda text: 1\n        self.assertEqual(f(0), 1)\n",
+    "write constant": TAINT_HEAD + "        import sys\n        sys.stdout.write('ok')\n",
+    "raise constant from None": TAINT_HEAD + "        raise RuntimeError('x') from None\n",
+    "logger constant": TAINT_HEAD + "        import logging\n        logging.getLogger('x').log(40, 'ok')\n",
+    "excepthook constant": TAINT_HEAD + "        import sys\n        sys.excepthook(ValueError, ValueError('ok'), None)\n",
+    "write of a length": TAINT_HEAD + "        import os\n        os.write(1, b'%d' % len(text))\n",
+}
+
+# the 16 gate snippets of the code r25 review's ``probes.py`` (check 6), verbatim; the first 8 were refused at r25 head
+OPAQUE_R26_SNIPPETS = {
+    "from tier_yaml_8187 import _RAW": "from tier_yaml_8187 import " + "_" + "RAW\n",
+    "vars(ty)['_' + 'RAW']": "x = vars(ty)['_' + 'R' + 'AW']\n",
+    "getattr(w, 'raw')()": "x = getattr(w, 'raw')()\n",
+    "weakref.finalize._registry walk": "import weakref\nx = list(weakref.finalize._registry.values())\n",
+    "f.__globals__": "x = f.__globals__\n",
+    "object.__getattribute__ built name": "x = object.__getattribute__(ty, '_' + 'RAW')\n",
+    "operator.attrgetter('_RAW')": "import operator\nx = operator.attrgetter('_R' + 'AW')(ty)\n",
+    "Opaque.raw unbound (call)": "x = ty.Opaque.raw(w)\n",
+    "vars(ty).values() walk": "x = [v for v in vars(ty).values() if isinstance(v, dict)]\n",
+    "ty.__dict__.values() walk": "x = [v for v in ty.__dict__.values() if isinstance(v, dict)]\n",
+    "gc.get_objects walk": "import gc\nx = [d for d in gc.get_objects() if isinstance(d, dict)]\n",
+    "inspect.getmembers(ty)": "import inspect\nx = dict(inspect.getmembers(ty))\n",
+    "sys.modules lookup .__dict__ values": "import sys\nx = list(sys.modules['tier_yaml_8187'].__dict__.values())\n",
+    "bound method alias m = w.raw; m()": "m = w.raw\nx = m()\n",
+    "methodcaller('raw')": "import operator\nx = operator.methodcaller('raw')(w)\n",
+    "Opaque.raw.__get__(w)()": "x = ty.Opaque.raw.__get__(w)()\n",
+}
+OPAQUE_R26_PASSED_AT_R25 = (
+    "vars(ty).values() walk", "ty.__dict__.values() walk", "gc.get_objects walk", "inspect.getmembers(ty)",
+    "sys.modules lookup .__dict__ values", "bound method alias m = w.raw; m()", "methodcaller('raw')", "Opaque.raw.__get__(w)()")
+# forms the positive gate accepts: a public name of the checker module, ``sys.modules[__name__]``, a constant name, a stdlib import
+OPAQUE_R26_ACCEPTED = {
+    "public name of the module": "x = ty.parse_workflow(text)\ny = ty.Opaque(text, 'key[0]')\nz = ty.__file__\n",
+    "module table of this module": "import sys\nm = sys.modules[__name__]\n",
+    "constant getattr": "x = getattr(w, 'label', None)\n",
+    "stdlib imports": "import json, re, weakref\nfrom pathlib import Path\nx = json.dumps({})\n",
+    "exception chain": "try:\n    pass\nexcept ValueError as exc:\n    x = exc.__cause__, exc.__context__, exc.__traceback__\n",
+}
+
+
+def opaque_refusals(source):
+    """Line numbers refused by the two source gates together (the review counts a snippet refused when either gate refuses it)."""
+    return sorted({*opaque_escape_lines(source, allowed=OPAQUE_GATE_ALLOWED), *raw_unwrap_lines(source)})
+
+
+class TestTaintScanFollowsEveryOutputSink8187R26(unittest.TestCase):
+    """r26 code C2 (code r25, finding 2): the 26 sink shapes of the review's probe are this test's own table; each is red, and
+    each of the seven the r25 scanner missed (fd write, inline logger, exception hook, ``print_exception``, a stream alias, a
+    dunder stream, a bound ``write``) is named."""
+
+    def test_the_table_has_26_shapes_and_the_seven_named_survivors(self):
+        self.assertEqual(len(TAINT_R26_SHAPES), 26)
+        self.assertEqual(sorted(set(TAINT_R26_MISSED_AT_R25) - set(TAINT_R26_SHAPES)), [])
+        self.assertEqual(len(TAINT_R26_MISSED_AT_R25), 7)
+
+    def test_every_shape_is_flagged(self):
+        survivors = []
+        for name, source in TAINT_R26_SHAPES.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(source):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_of_the_seven_previously_missed_shapes_is_red_on_its_own(self):
+        for name in TAINT_R26_MISSED_AT_R25:
+            with self.subTest(shape=name):
+                self.assertGreater(len(tainted_assert_lines(TAINT_R26_SHAPES[name])), 0)
+
+    def test_each_clean_control_stays_clean(self):
+        for name, source in TAINT_R26_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(tainted_assert_lines(source), [])
+
+    def test_both_shipped_files_have_no_tainted_line(self):
+        for path in (TY_PATH, THIS_PATH):
+            with self.subTest(file=path.name):
+                self.assertEqual(tainted_assert_lines(path.read_text(encoding="utf-8")), [])
+
+
+class TestOpaqueGateEnumeratesTheAcceptedPaths8187R26(unittest.TestCase):
+    """r26 code C3 (code r25, finding 3): the 16 snippets of the review's probe are refused, among them the 8 the r25 gates
+    passed.  The gate names what it accepts (public names of the checker module, ``sys.modules[__name__]``, constant
+    attribute names, listed imports) and refuses everything else, so the next spelling of a namespace walk is refused too."""
+
+    def test_the_table_has_16_snippets_and_the_eight_named_survivors(self):
+        self.assertEqual(len(OPAQUE_R26_SNIPPETS), 16)
+        self.assertEqual(len(OPAQUE_R26_PASSED_AT_R25), 8)
+        self.assertEqual(sorted(set(OPAQUE_R26_PASSED_AT_R25) - set(OPAQUE_R26_SNIPPETS)), [])
+
+    def test_every_snippet_is_refused(self):
+        survivors = []
+        for name, source in OPAQUE_R26_SNIPPETS.items():
+            with self.subTest(snippet=name):
+                if not opaque_refusals(source):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_of_the_eight_previously_passing_snippets_is_refused_on_its_own(self):
+        for name in OPAQUE_R26_PASSED_AT_R25:
+            with self.subTest(snippet=name):
+                self.assertGreater(len(opaque_refusals(OPAQUE_R26_SNIPPETS[name])), 0)
+
+    def test_the_accepted_paths_are_not_refused(self):
+        for name, source in OPAQUE_R26_ACCEPTED.items():
+            with self.subTest(path=name):
+                self.assertEqual(opaque_refusals(source), [])
+
+    def test_both_shipped_files_pass_the_enumerating_gates(self):
+        for path in (TY_PATH, THIS_PATH):
+            with self.subTest(file=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertEqual(opaque_escape_lines(source, allowed=OPAQUE_GATE_ALLOWED), [])
+                allowed = ("same", "__eq__", "__hash__") if path == TY_PATH else ()
+                self.assertEqual(raw_unwrap_lines(source, allowed=allowed), [])
+
+
+class TestEveryFailScenarioRunsInEveryView8187R26(unittest.TestCase):
+    """r26 code C1 (code r25, finding 1): the gate counts each guarded family per view again.  A mutant that runs the real-pins
+    fail scenario in one view only (either) is red, and the views each family really runs in are the table's."""
+
+    def test_the_views_each_family_runs_in_are_the_tables(self):
+        run = canary_run(sys.modules[__name__], {"plain": CANARY_SHAPES["plain"]})
+        families = {family for guarded in (CANARY_GUARDED_FAMILIES, CANARY_GUARDED_FAMILIES_PLAIN)
+                    for names in guarded.values() for family in names}
+        for family in sorted(families):
+            with self.subTest(family=family):
+                seen = tuple(view for view in CANARY_BOTH_VIEWS if run.fail_families.get(("plain", view, family), 0) > 0)
+                self.assertEqual(seen, CANARY_FAMILY_VIEWS.get(family, CANARY_BOTH_VIEWS))
+
+    def test_the_view_mutants_are_in_the_harness_table_and_found_once(self):
+        source = THIS_PATH.read_text(encoding="utf-8")
+        for name, (old, _new) in VIEW_SITE_MUTANTS.items():
+            with self.subTest(mutant=name):
+                self.assertIn("view dropped: " + name, HARNESS_MUTANTS)
+                self.assertEqual(source.count(old), 1)
+
+    def test_each_view_mutant_is_red_and_names_the_view(self):
+        ty_source = TY_PATH.read_text(encoding="utf-8")
+        test_source = THIS_PATH.read_text(encoding="utf-8")
+        for name, (old, new) in VIEW_SITE_MUTANTS.items():
+            with self.subTest(mutant=name):
+                variant = load_variant(ty_source, test_source.replace(old, new))
+                failures = canary_coverage_failures(canary_run(variant, {"plain": CANARY_SHAPES["plain"]}), ["plain"])
+                self.assertEqual(len(failures), 1)
+                self.assertIn("family fail-real-pins never ran", failures[0])
+
+
+class TestNotesOnTheCauseAreCaptured8187R26(unittest.TestCase):
+    """r26 code C4 (code r25, finding 4): a note attached to the ``__cause__`` of the raised exception has its own seeded
+    control, and the harness mutant that strips the notes of the cause chain is red."""
+
+    @unittest.skipIf(sys.version_info < (3, 11), "exception notes exist from Python 3.11")
+    def test_the_cause_notes_control_exists_and_is_live(self):
+        names = set(canary_controls(CanaryRun(sys.modules[__name__])))
+        self.assertIn("exception-cause-notes", names)
+        self.assertEqual(canary_control_failures(sys.modules[__name__]), [])
+
+    @unittest.skipIf(sys.version_info < (3, 11), "exception notes exist from Python 3.11")
+    def test_stripping_the_notes_of_the_cause_chain_is_red(self):
+        variant = load_variant(TY_PATH.read_text(encoding="utf-8"),
+                               harness_mutant_source(THIS_PATH.read_text(encoding="utf-8"), "cause-notes-strip", "exception-chain"))
+        self.assertEqual(canary_control_failures(variant), ["exception-cause-notes"])
 
 
 if __name__ == "__main__":
