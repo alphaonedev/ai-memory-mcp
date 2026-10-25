@@ -1110,9 +1110,17 @@ JOB_KEY_SETS = {
 JOB_RUNS_ON = "ubuntu-latest"
 JOB_TIMEOUT_MINUTES = {SELECT_JOB: "15", GATE_JOB: "5"}  # code r13 F2: ci.yml:173 and :2770
 JOB_NAMES = {SELECT_JOB: "Impact selection", GATE_JOB: "ci-gate"}  # sec r13 S2
-# sec r14 S2: the only job display names that hold an expression (matrix legs); any other `${{`
-# in a job name is a problem line (13 job names are checked at head, 2 of them hold a matrix name).
-JOB_NAME_EXPRESSIONS = {"Check (${{ matrix.leg }})", "Cross-compile (${{ matrix.target }})"}
+# sec r14 S2 / sec r15 A: the only job display names that hold an expression (matrix legs), each
+# bound to its job id and to the matrix key it renders; any other `${{` in a job name, the same
+# value on another job, or the value on its own job without that matrix key, is a problem line
+# (13 job names are checked at head, 2 of them hold a matrix name). ci.yml holds both jobs:
+# `check` (matrix.include entries carry `leg`) and `mobile-cross-compile` (entries carry `target`).
+JOB_MATRIX_NAMES = {
+    "check": ("Check (${{ matrix.leg }})", "leg"),
+    "mobile-cross-compile": ("Cross-compile (${{ matrix.target }})", "target"),
+}
+JOB_NAME_EXPRESSIONS = {name for name, _ in JOB_MATRIX_NAMES.values()}
+NULL_SPELLINGS = ("null", "~")  # YAML 1.1/1.2 core null spellings, any case (sec r15 B)
 JOB_PERMISSIONS = None  # neither job sets `permissions`; the workflow-level block applies
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 JOB_KEYS_REFUSED = ("container", "services")
@@ -2281,25 +2289,60 @@ def _fold_name(value):
     return " ".join(value.casefold().split())
 
 
+def _matrix_carries_key(definition, key):
+    """sec r15 A: strategy.matrix is a mapping that holds `key` directly or in every entry of a
+    non-empty `include` list; anything else (absent, a string expression, an empty include) is no."""
+    strategy = definition.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if not isinstance(matrix, dict):
+        return False
+    if key in matrix:
+        return True
+    include = matrix.get("include")
+    return (isinstance(include, list) and bool(include)
+            and all(isinstance(entry, dict) and key in entry for entry in include))
+
+
+def _job_id_problem(job, gate):
+    """The job id of a job other than the gate folds to the gate check name (a nameless job, or a
+    job whose name is null or empty, renders its id as the check context)."""
+    if job != GATE_JOB and isinstance(job, str) and _fold_name(job) == gate:
+        return "job %s defaults its check name to the gate check name" % job
+    return None
+
+
 def _job_name_problems(job, definition):
-    """sec r14 S2 / code r14 F1: no job other than the gate has the gate check name, whether
-    spelled with another case, padding, or (when `name` is absent) its job id; and a job display
-    name is never an expression except the two pinned matrix names. The rule is a text pin: the
+    """sec r14 S2 / code r14 F1, sec r15 A-B: no job other than the gate has the gate check name,
+    whether spelled with another case, padding, or (when `name` is absent, empty or a YAML null
+    spelling) its job id; a job display name is never an expression except the two pinned matrix
+    names, each accepted only on its own job id while that job carries a strategy.matrix holding the
+    key it renders; a null-spelled or empty name is refused outright. The rule is a text pin: the
     expressions are refused, never evaluated."""
     if not isinstance(definition, dict):
         return []
     problems = []
     gate = _fold_name(JOB_NAMES[GATE_JOB])
     if "name" not in definition:
-        if job != GATE_JOB and isinstance(job, str) and _fold_name(job) == gate:
-            problems.append("job %s defaults its check name to the gate check name" % job)
-        return problems
+        by_id = _job_id_problem(job, gate)
+        return [by_id] if by_id else problems
     name = definition["name"]
     if not isinstance(name, str):
         return ["job %s name is not a string" % job]
-    if "${{" in name and name not in JOB_NAME_EXPRESSIONS:
-        problems.append("job %s name carries an expression outside the pinned set" % job)
-    if job != GATE_JOB and _fold_name(name) == gate:
+    folded = _fold_name(name)
+    if not folded or folded in NULL_SPELLINGS:
+        problems.append("job %s has a null or empty name" % job)
+        by_id = _job_id_problem(job, gate)
+        if by_id:
+            problems.append(by_id)
+        return problems
+    if "${{" in name:
+        pinned = JOB_MATRIX_NAMES.get(job)
+        if pinned is None or name != pinned[0]:
+            problems.append("job %s name carries an expression outside the pinned set" % job)
+        elif not _matrix_carries_key(definition, pinned[1]):
+            problems.append("job %s name needs a strategy.matrix holding the key %s"
+                            % (job, pinned[1]))
+    if job != GATE_JOB and folded == gate:
         problems.append("job %s carries the gate check name %s" % (job, JOB_NAMES[GATE_JOB]))
     return problems
 
@@ -5426,6 +5469,7 @@ class WorkflowFormMutants(unittest.TestCase):
         other job, or on its own job without the key, is a problem line."""
         live = CI_YML.read_text()
         jobs = yaml_subset_load(live)["jobs"]
+        self.assertEqual(JOB_MATRIX_NAMES, {job: (name, key) for job, name, key in self.R18_PINNED})
         for job, name, key in self.R18_PINNED:
             other_name = next(p[1] for p in self.R18_PINNED if p[0] != job)
             host_line = "    name: %s\n" % name
