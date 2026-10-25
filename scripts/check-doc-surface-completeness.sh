@@ -8,7 +8,7 @@
 # register `.local-runs/3x7-2026-08-09/lane2-api-netnew-register.md` §E).
 #
 # THE DEFECT THIS CLOSES. `scripts/check-docs-vs-ssot.sh` (gate 4) and
-# `scripts/check-doc-symbol-anchors.sh` (gate 9) both answer "is this
+# `scripts/check-doc-symbol-anchors.py` (gate 9) both answer "is this
 # CITED value / symbol RIGHT?" — an ACCURACY axis. NEITHER answers "is
 # anything MISSING?" — a COMPLETENESS axis. #2831 found, by three trivial
 # diffs, that a reference doc can be a full release behind while every

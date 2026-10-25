@@ -1568,7 +1568,7 @@ Upgrade procedure:
 5. Start Postgres; verify `SELECT extversion FROM pg_extension WHERE
    extname='age';` reports the new version (expect `1.8.0`).
 6. Start the ai-memory daemons.
-7. Run the `tests/recall_scoring_parity.rs` + `tests/age_vs_cte.rs`
+7. Run the `tests/recall_scoring_parity.rs` + `benches/age_vs_cte.rs`
    parity suite against the upgraded host (operator-side, against a
    non-production copy) to confirm AGE Cypher still wins the S76 perf
    gate.

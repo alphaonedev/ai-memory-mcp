@@ -584,7 +584,7 @@ export TLS_DEFAULT_CLIENT_KEY=/etc/ai-memory-a2a/tls/client-default.key
 The agent suffix is the upper-cased `agent_id` with non-alphanumerics
 collapsed to `_` (so `ai:alice@nyc3-droplet-1` becomes
 `AI_ALICE_NYC3_DROPLET_1`). The Python campaign harness
-(`scripts/a2a_harness.py`, `Harness.client_cert_for`) that implemented
+(`a2a_harness.py` under `scripts/`, `Harness.client_cert_for`) that implemented
 this lookup has been retired from the repo; the live mTLS leg checks
 are the shell harness at `deploy/do-1461/test/encrypted_legs.sh`
 (`MTLS_CLIENT_CERT` / `MTLS_CLIENT_KEY` convention — see

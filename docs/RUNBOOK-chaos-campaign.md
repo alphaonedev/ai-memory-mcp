@@ -130,7 +130,7 @@ line per cycle plus a summary. Final convergence-bound:
 
 ## Publication
 
-On pass, the report lands as `docs/CHAOS-REPORT-v0.7.0.md` with:
+On pass, the chaos report is written up (it is not published in this repository) with:
 
 - Date, commit SHA, hardware specs.
 - Per-fault-class summary table.

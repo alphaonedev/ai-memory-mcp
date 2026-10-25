@@ -18,7 +18,7 @@ The reproducible, versioned, CI-driven implementation of everything in
 this runbook lives at
 [`alphaonedev/ai-memory-ship-gate`](https://github.com/alphaonedev/ai-memory-ship-gate).
 That repo's `terraform/`, `scripts/phase{1,2,3,4}_*.sh`, and
-`.github/workflows/campaign.yml` are the **executable** forms of the
+`workflows/campaign.yml` under that repo's `.github/` are the **executable** forms of the
 commands below. This document describes the methodology; the other
 repo runs it.
 
@@ -293,7 +293,7 @@ v0.6.0.0 tags **only** when:
 - [ ] All per-phase JSON reports are attached to the release PR.
 
 On pass: cut the tag, archive the droplets, publish the aggregated
-report as `docs/CAMPAIGN-v0.6.0.0.md` on the release.
+report on the release (the report is not published in this repository).
 
 ## Not included (deliberate)
 
