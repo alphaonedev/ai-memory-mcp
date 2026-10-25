@@ -43,7 +43,9 @@ BASE_DIR = "impact-base"
 IMPACT_REL = "scripts/ci/impact"
 SELECTOR_FILES = ("__init__.py", "common.py", "select.py", "build_index.py",
                   "gate.py", "rules.json")
-HEREDOC_RE = re.compile(r"^python3 -I - <<'PY'\n(?P<body>.*)^PY\n\Z", re.S | re.M)
+# The shell ends the heredoc at the FIRST line equal to the terminator: the body holds no such
+# line, and anything after the first terminator makes the text not match (sec r10 S3).
+HEREDOC_RE = re.compile(r"^python3 -I - <<'PY'\n(?P<body>(?:(?!^PY\n).)*)^PY\n\Z", re.S | re.M)
 DECLARED_NON_DOMAIN_OUTPUTS = {"jobs", "all", "crates", "enforce"}
 ENFORCE = "true"
 WORKFLOW_DIR = fx.REPO_ROOT / ".github" / "workflows"
@@ -1123,36 +1125,46 @@ MATERIALISE_REFUSED_ATTRS = {"system", "popen", "Popen", "execv", "execve", "exe
 MATERIALISE_REFUSED_NAMES = MATERIALISE_REFUSED_ATTRS | {"exec", "eval", "compile", "__import__",
                                                          "runpy", "importlib"}
 PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
-# sec F1 / code C1-C3 (round 12): the second layer is a POSITIVE ALLOW-LIST over the parsed body.
-# With the sha256 pin re-pinned to a mutated body, it enforces exactly this and no more:
+# sec F1 / code C1-C3 (round 12), sec r10 S1-S4 (round 13) and code r10 C1-C4 (round 13): the
+# second layer is a POSITIVE ALLOW-LIST over the parsed body. With the sha256 pin re-pinned to a
+# mutated body it enforces exactly the rules below and no more.
+# parse model: the heredoc body ends at the first terminator line, and a text with anything after
+# it is not one bare heredoc (the first terminator line is what the shell uses).
 # call targets: a bare name in MATERIALISE_NAME_CALLS, or a rendered receiver chain listed in
 # MATERIALISE_MODULE_CHAINS or MATERIALISE_METHOD_CHAINS (any other receiver is a problem line);
+# an allowed module chain is accepted in call position only: as an argument, keyword value or
+# assigned value it is a problem line, except os.environ (read-only rule) and the exception class
+# subprocess.TimeoutExpired as an `except` type (MATERIALISE_VALUE_CHAINS).
 # pinned imports: exactly the statements in MATERIALISE_IMPORT_STATEMENTS, no `as` and no other
-# module; no rebinding: no assignment, parameter, loop, with, except or comprehension target binds
-# an allowed name or a module root, and a function or class is defined only under a pinned name;
+# module; no rebinding: no assignment, parameter, loop, with, except, comprehension or match
+# target binds an allowed name or a module root, and a function or class is defined only under a
+# pinned name; match and lambda are refused.
 # exact argv head: the one subprocess.run argv is the two literals of MATERIALISE_GIT_ARGV plus
-# `list(args)`; dash argument at every position: a string starting with a dash must be in
-# MATERIALISE_DASH_ARGS and every git() argument is a string literal or one of the pinned
-# expressions in MATERIALISE_GIT_VALUE_ARGS; environment untouched: no store, delete or attribute
-# assignment on os.environ and none of MATERIALISE_ENVIRON_WRITERS. The sha256 digest stays the
-# primary pin.
-# code r10 C1-C4 (round 13): names are resolved by their binding, not by their spelling.
-# argv tail: `list(args)` is accepted only when `args` is an unrebound parameter of the enclosing
-# function, that is exactly one binding (the parameter) and no assignment, augmented or annotated
-# assignment, walrus, for, with, comprehension, match or import binding of `args` in that function.
-# git value arguments: each name in a pinned expression must have exactly one binding in its
-# function, and that binding is the enumerated one in MATERIALISE_VALUE_BINDINGS (an unrebound
-# parameter, a single pinned assignment or the single literal for-loop target); IMPACT_PREFIX has
-# exactly one module-level binding to a string constant. Any other binding is a problem line.
-# read-only environment uses: every name bound from os.environ (a dict copy, an alias, the `env`
-# keyword of subprocess.run, a parameter that receives it) and os.environ itself may only be read
-# through a subscript load, .get, .items, .keys, .values, `in`, a dict() copy or the env keyword;
-# every other reference, store, delete, update, pop, clear or pass-on is a problem line.
-# match statements are refused and match captures are collected as bindings. open() takes only
-# the enumerated MATERIALISE_OPEN_ARGS with mode "a", Path() only MATERIALISE_PATH_ARGS, and the
-# `__main__` guard is the last top-level statement and holds exactly `sys.exit(main())`.
+# `list(args)`; argv tail: `args` must be an unrebound parameter of the enclosing function, that
+# is exactly one binding (the parameter) and no assignment, augmented or annotated assignment,
+# walrus, for, with, comprehension, match or import binding of `args` in that function.
+# dash literals: a string constant starting with a dash must be in MATERIALISE_DASH_ARGS, and every
+# git() argument is a string literal or one of the pinned expressions in
+# MATERIALISE_GIT_VALUE_ARGS.
+# names resolved by binding: each name in a pinned git expression, in an open() or Path() argument
+# and the root name of every method call has exactly one binding in its function, and that
+# binding is the enumerated one in MATERIALISE_VALUE_BINDINGS (an unrebound parameter, a single
+# pinned assignment, a single pinned for loop, or only `with open(...)` for handle); IMPACT_PREFIX
+# and SHA_RE have exactly one module-level binding to their constant in
+# MATERIALISE_CONST_BINDINGS. Any other binding is a problem line.
+# environment untouched, read-only environment uses: every name bound from os.environ (a dict
+# copy, an alias, the `env` keyword of subprocess.run, a parameter that receives it) and
+# os.environ itself may only be read through a subscript load, .get, .items, .keys, .values, `in`,
+# a dict() copy or the env keyword; every other reference, store, delete, update, pop, clear or
+# pass-on is a problem line, and the body has no subscript store.
+# open() takes only the enumerated MATERIALISE_OPEN_ARGS with mode "a", Path() only
+# MATERIALISE_PATH_ARGS, and the `__main__` guard is the last top-level statement and holds
+# exactly `sys.exit(main())`.
+# The layer does not check runtime values (environment variable contents, the IMPACT_FILES names,
+# fetched blob bytes) or what the allowed local functions do beyond the rules above. The sha256
+# digest stays the primary pin.
 MATERIALISE_ENFORCES = ("call targets", "pinned imports", "no rebinding", "exact argv head",
-                        "dash argument at every position", "environment untouched",
+                        "dash literals", "environment untouched",
                         "unrebound parameter", "exactly one binding",
                         "read-only environment uses")
 MATERIALISE_MODULE_ROOTS = {"os", "re", "shutil", "subprocess", "sys", "pathlib"}
@@ -1192,17 +1204,35 @@ MATERIALISE_RUN_ARGV_TAIL = "list(args)"
 # (function, name). "param" is an unrebound parameter, "for-literal" the single loop target over
 # a tuple of string literals, any other string the unparsed value of the single assignment.
 MATERIALISE_VALUE_BINDINGS = {
+    ("derive_base", "env"): "param",
     ("fetch_blob", "base"): "param",
     ("fetch_blob", "name"): "param",
     ("fetch_blob", "path"): "IMPACT_PREFIX + name",
+    ("fetch_blob", "tree"): "git('ls-tree', base, '--', path)",
     ("gate_absent", "base"): "param",
-    ("git_state_refused", "rel"): "for-literal",
+    ("gate_absent", "tree"): "git('ls-tree', base, '--', IMPACT_PREFIX + 'gate.py')",
+    ("git_state_refused", "rel"): "for:('info/grafts', 'shallow', 'objects/info/alternates')",
+    ("git_state_refused", "res"): "git('rev-parse', '--git-path', rel)",
     ("have_commit", "base"): "param",
     ("materialise", "base"): "param",
+    ("materialise", "dest"): "param",
+    ("materialise", "name"): "for:names",
+    ("materialise", "names"): "param",
+    ("materialise", "target"): "dest / 'impact' / name",
+    ("replace_refs_present", "listed"): "git('replace', '--list')",
+    ("replace_refs_present", "res"):
+        "git('for-each-ref', '--count=1', '--format=%(refname)', 'refs/replace/')",
+    ("report", "handle"): "with-open",
     ("report", "summary"): "os.environ.get('GITHUB_STEP_SUMMARY')",
+    ("rev_parse", "res"): "git('rev-parse', '--verify', '--quiet', spec)",
     ("rev_parse", "spec"): "param",
 }
-MATERIALISE_CONST_NAMES = {"IMPACT_PREFIX"}  # exactly one module-level string-constant binding
+# Module-level names: exactly one binding in the whole body, an assignment of this value.
+MATERIALISE_CONST_BINDINGS = {"IMPACT_PREFIX": "'scripts/ci/impact/'",
+                              "SHA_RE": "re.compile('^[0-9a-f]{40}$')"}
+# Module chains read as a VALUE rather than called: the environment (checked by the read-only rule)
+# and the one exception class, which is accepted only as an `except` type.
+MATERIALISE_VALUE_CHAINS = {"os.environ", "subprocess.TimeoutExpired"}
 MATERIALISE_ENV_PARAMS = {"env"}  # parameters that receive os.environ (derive_base)
 MATERIALISE_ENV_READS = {"get", "items", "keys", "values"}
 MATERIALISE_ENV_COPIERS = {"dict", "derive_base"}  # callees that may take an environment mapping
@@ -1300,46 +1330,71 @@ def _name_problems(tree, parents, scope, name, seen=()):
     """Reasons `name` does not resolve to its one enumerated binding (empty when it does)."""
     if name in seen:
         return []
-    if name in MATERIALISE_CONST_NAMES:
+    if name in MATERIALISE_CONST_BINDINGS:
         found = [b for b in _bound_names(tree) if b[0] == name]
         assign = parents.get(found[0][2]) if len(found) == 1 else None
         ok = (isinstance(assign, ast.Assign) and parents.get(assign) is tree
-              and len(assign.targets) == 1 and isinstance(assign.value, ast.Constant)
-              and isinstance(assign.value.value, str))
-        return [] if ok else ["%s has no single module-level constant binding" % name]
+              and len(assign.targets) == 1
+              and ast.unparse(assign.value) == MATERIALISE_CONST_BINDINGS[name])
+        return [] if ok else ["%s has no single module-level binding to its constant" % name]
+    if scope is None:
+        return ["%s is used at module level without an enumerated binding" % name]
     expected = MATERIALISE_VALUE_BINDINGS.get((scope.name if scope else None, name))
     if expected is None:
         return ["%s is not an enumerated value name in its function" % name]
     if expected == "param":
         return [] if _param_ok(scope, name) else ["%s is not an unrebound parameter" % name]
     local = _local_bindings(scope, name)
+    if expected == "with-open":
+        sites = [parents.get(b[2]) for b in local]
+        ok = bool(local) and all(
+            b[1] == "store" and isinstance(s, ast.withitem) and s.optional_vars is b[2]
+            and isinstance(s.context_expr, ast.Call) and isinstance(s.context_expr.func, ast.Name)
+            and s.context_expr.func.id == "open" for b, s in zip(local, sites))
+        return [] if ok else ["%s is not only bound by `with open(...)`" % name]
     if len(local) != 1 or local[0][1] != "store":
         return ["%s does not have exactly one binding" % name]
     site = parents.get(local[0][2])
-    if expected == "for-literal":
-        ok = (isinstance(site, ast.For) and site.target is local[0][2]
-              and isinstance(site.iter, (ast.Tuple, ast.List))
-              and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
-                      for e in site.iter.elts))
-        return [] if ok else ["%s is not the single literal loop target" % name]
-    if not (isinstance(site, ast.Assign) and len(site.targets) == 1
-            and site.targets[0] is local[0][2] and ast.unparse(site.value) == expected):
-        return ["%s is not bound once to %s" % (name, expected)]
+    if expected.startswith("for:"):
+        source = expected[4:]
+        if not (isinstance(site, ast.For) and site.target is local[0][2]
+                and ast.unparse(site.iter) == source):
+            return ["%s is not the single loop target over %s" % (name, source)]
+        value = site.iter
+    else:
+        if not (isinstance(site, ast.Assign) and len(site.targets) == 1
+                and site.targets[0] is local[0][2] and ast.unparse(site.value) == expected):
+            return ["%s is not bound once to %s" % (name, expected)]
+        value = site.value
     problems = []
-    for inner in ast.walk(site.value):
-        if (isinstance(inner, ast.Name) and inner.id not in MATERIALISE_MODULE_ROOTS):
+    for inner in ast.walk(value):
+        if (isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load)
+                and inner.id not in MATERIALISE_MODULE_ROOTS
+                and inner.id not in MATERIALISE_NAME_CALLS):
             problems.extend(_name_problems(tree, parents, scope, inner.id, seen + (name,)))
     return problems
 
 
-def _value_name_problems(label, tree, parents, node, expr):
+def _value_name_problems(label, tree, parents, node, expr, what="git value name"):
     scope = _scope_of(node, parents)
     problems = []
     for inner in ast.walk(expr):
-        if isinstance(inner, ast.Name) and inner.id not in MATERIALISE_MODULE_ROOTS:
-            problems.extend("%s: git value name %s: %s" % (label, inner.id, why) for why in
+        if isinstance(inner, ast.Name) and inner.id not in MATERIALISE_MODULE_ROOTS \
+                and inner.id not in MATERIALISE_NAME_CALLS:
+            problems.extend("%s: %s %s: %s" % (label, what, inner.id, why) for why in
                             _name_problems(tree, parents, scope, inner.id)[:1])
     return problems
+
+
+def _receiver_problems(label, tree, parents, node):
+    """A method call on a value: the receiver root name must resolve to its enumerated binding."""
+    root = node.func
+    while isinstance(root, (ast.Attribute, ast.Call)):
+        root = root.value if isinstance(root, ast.Attribute) else root.func
+    if not isinstance(root, ast.Name) or root.id in MATERIALISE_MODULE_ROOTS \
+            or root.id in MATERIALISE_NAME_CALLS:
+        return []
+    return _value_name_problems(label, tree, parents, node, root, "method receiver name")
 
 
 def _open_path_problems(label, tree, parents, node, kind):
@@ -1529,17 +1584,12 @@ def materialise_allow_list_problems(label, run):
     parents = _parents(tree)
     callees = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     receivers = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-    allowed_uses = set()
+    except_types = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            allowed_uses.update(id(a) for a in node.args)
-            allowed_uses.update(id(k.value) for k in node.keywords)
-        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
-            allowed_uses.add(id(node.value))
-        elif isinstance(node, ast.ExceptHandler) and node.type is not None:
-            allowed_uses.add(id(node.type))
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            except_types.add(id(node.type))
             if isinstance(node.type, ast.Tuple):
-                allowed_uses.update(id(e) for e in node.type.elts)
+                except_types.update(id(e) for e in node.type.elts)
     runs = 0
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
@@ -1554,8 +1604,10 @@ def materialise_allow_list_problems(label, run):
                 and id(node) not in receivers:
             chain = _chain(node)
             if (chain or "").split(".")[0] in MATERIALISE_MODULE_ROOTS and (
-                    chain not in MATERIALISE_MODULE_CHAINS or id(node) not in allowed_uses):
-                problems.append("%s: reaches %s outside the allow-list" % (label, chain))
+                    chain not in MATERIALISE_VALUE_CHAINS
+                    or (chain == "subprocess.TimeoutExpired" and id(node) not in except_types)):
+                problems.append("%s: reaches %s outside the allow-list (an allowed module chain "
+                                "is accepted in call position only)" % (label, chain))
         if isinstance(node, ast.Call):
             func = node.func
             chain = _chain(func)
@@ -1572,6 +1624,8 @@ def materialise_allow_list_problems(label, run):
                 problems.append("%s: call on an unenumerated receiver" % label)
             elif chain not in MATERIALISE_MODULE_CHAINS and chain not in MATERIALISE_METHOD_CHAINS:
                 problems.append("%s: calls %s outside the allow-list" % (label, chain))
+            else:
+                problems.extend(_receiver_problems(label, tree, parents, node))
             if chain == "subprocess.run":
                 runs += 1
                 problems.extend(_argv_problems(label, node, tree, parents))
