@@ -2472,14 +2472,14 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
         sentinel = "SENTINEL-F34-pw"
         user = "f34user"
         cases = {
-            "literal block": ["      - name: |", f"          https://{user}:{sentinel}-pa", "          ss@host.example/db"],
-            "folded block": ["      - name: >", f"          https://{user}:{sentinel}-pa", "          ss@host.example/db"],
-            "escaped newline": [f'      - name: "https://{user}:{sentinel}-pa\\nss@host.example/db"'],
-            "plain continuation": [f"      - name: https://{user}:{sentinel}-pa", "          ss@host.example/db"],
+            "literal block": ["      - name: |", f"          https://{user}:{sentinel}-pa", "          ss@dbhost/db"],
+            "folded block": ["      - name: >", f"          https://{user}:{sentinel}-pa", "          ss@dbhost/db"],
+            "escaped newline": [f'      - name: "https://{user}:{sentinel}-pa\\nss@dbhost/db"'],
+            "plain continuation": [f"      - name: https://{user}:{sentinel}-pa", "          ss@dbhost/db"],
             "break before the at sign": ["      - name: |", f"          https://{user}:{sentinel}-{'x' * 20}",
                                          "          @host.example/db"],
-            "slash in the password": [f"      - name: https://{user}:{sentinel}/pw@host.example/db"],
-            "at sign in the password": [f"      - name: https://{user}:{sentinel}@pw@host.example/db"],
+            "slash in the password": [f"      - name: https://{user}:{sentinel}/pw@dbhost/db"],
+            "at sign in the password": [f"      - name: https://{user}:{sentinel}@pw@dbhost/db"],
         }
         checked = 0
         for wf, text in self.texts.items():
@@ -2497,7 +2497,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                         checked += 1
                         self.assertTrue(problems)
                         self.assertEqual([p for p in problems if sentinel in p or user in p
-                                          or "://" in p.replace("://***", "") or "@host" in p], [])
+                                          or "://" in p.replace("://***", "") or "@dbhost" in p], [])
                         labelled = [p for p in problems if re.search(
                             r"step %d \((?:step\[%d\]|[^)@]*\*\*\*[^)@]*)\)" % (index, index), p)]
                         self.assertTrue(labelled, (view, index))
@@ -2508,9 +2508,9 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
         sentinel = "SENTINEL-F34-jk"
         user = "f34jobuser"
         keys = {
-            "slash": f"https://{user}:{sentinel}/pw@host.example/db",
-            "at sign": f"https://{user}:{sentinel}@pw@host.example/db",
-            "space": f"https://{user}:{sentinel} pw@host.example/db",
+            "slash": f"https://{user}:{sentinel}/pw@dbhost/db",
+            "at sign": f"https://{user}:{sentinel}@pw@dbhost/db",
+            "space": f"https://{user}:{sentinel} pw@dbhost/db",
         }
         checked = 0
         for wf, text in self.texts.items():
@@ -2530,7 +2530,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                         checked += 1
                         self.assertTrue(problems)
                         self.assertEqual([p for p in problems if sentinel in p or user in p
-                                          or "://" in p.replace("://***", "") or "@host" in p], [])
+                                          or "://" in p.replace("://***", "") or "@dbhost" in p], [])
         self.assertGreater(checked, 0)
 
 
