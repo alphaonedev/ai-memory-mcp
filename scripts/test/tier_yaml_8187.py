@@ -191,7 +191,11 @@ class Opaque:
     def __eq__(self, other):
         if isinstance(other, Opaque):
             return plain_equal(self.raw(), other.raw())
-        return NotImplemented
+        # r29 code F4 / sec F3: a foreign operand raises (never NotImplemented, never False): a silent False is an oracle
+        raise OpaqueComparisonError("an Opaque compares with another Opaque only (the value is withheld)")
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
     def __hash__(self):
         return hash((_SALT, self._n))  # r28 sec F3: salt plus length only, never a function of the raw value
