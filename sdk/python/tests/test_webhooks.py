@@ -85,9 +85,7 @@ def test_key_is_sha256_of_secret_not_the_secret(vector: dict[str, Any], body: by
     )
 
 
-def test_message_is_timestamp_dot_body_not_bare_body(
-    vector: dict[str, Any], body: bytes
-) -> None:
+def test_message_is_timestamp_dot_body_not_bare_body(vector: dict[str, Any], body: bytes) -> None:
     """Pin defect #2: the timestamp is part of the signed message.
 
     Verifying the SAME body + secret under a DIFFERENT timestamp must fail
@@ -107,8 +105,7 @@ def test_message_is_timestamp_dot_body_not_bare_body(
 def test_signer_reproduces_the_rust_signature(vector: dict[str, Any], body: bytes) -> None:
     """``sign_webhook_body`` must emit the byte-exact Rust header value."""
     assert (
-        sign_webhook_body(body, vector["secret"], vector["timestamp"])
-        == vector["signature_header"]
+        sign_webhook_body(body, vector["secret"], vector["timestamp"]) == vector["signature_header"]
     )
 
 
@@ -198,9 +195,7 @@ def test_rejects_unparseable_timestamp(vector: dict[str, Any], body: bytes) -> N
         )
 
 
-def test_timestamp_is_required_and_fails_loudly(
-    vector: dict[str, Any], body: bytes
-) -> None:
+def test_timestamp_is_required_and_fails_loudly(vector: dict[str, Any], body: bytes) -> None:
     """A pre-#2455 3-argument call must raise, never silently mis-verify.
 
     Failing closed with a ``TypeError`` is deliberate: a caller that has not

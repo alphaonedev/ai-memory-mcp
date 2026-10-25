@@ -60,6 +60,7 @@ def export_ceiling_from_error(exc: Exception) -> int | None:
     ceiling = payload.get("max")
     return ceiling if isinstance(ceiling, int) and ceiling > 0 else None
 
+
 #: The daemon's own default `memory_kind` when the field is absent. Kept here
 #: because a SIGNED write must sign the kind the server will actually store —
 #: leaving `kind` unset while signing a different value silently 403s.
@@ -163,7 +164,9 @@ def _context_verifies(context: object) -> bool:
         return False
     if any(hasattr(ssl.SSLContext, key) for key in vars(context)):
         return False
-    if any(ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()):
+    if any(
+        ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()
+    ):
         return False
     flags = int(ssl.SSLContext.verify_flags.__get__(context))  # type: ignore[attr-defined]
     if flags & ~_ALLOWED_VERIFY_FLAGS:
@@ -228,29 +231,121 @@ def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
         )
 
 
+def _refuse_foreign_owner(what: str, path: str, info: os.stat_result) -> None:
+    """Refuse a CA file or directory owned by anyone but this user or root (#6815).
+
+    Its owner can rewrite it whatever its mode, exactly as the owner of a
+    directory on the way can replace what is under it (3-agent vote
+    (6def5ab6), StrictModes). POSIX only.
+    """
+    if os.name == "nt" or info.st_uid in (0, os.geteuid()):
+        return
+    raise ValueError(
+        f"verify= {what} {path!r} is owned by uid {info.st_uid}: that user could "
+        "rewrite it and change which servers this client trusts. Give it to this "
+        "user or root (chown), or copy it to a file you own (#6815)."
+    )
+
+
+#: Path separators a CA path may end with; a trailing one names a directory.
+_PATH_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
+
+
+def _refuse_untrusted_holder(
+    path: str, directory: str, entry: str, info: os.stat_result | None
+) -> None:
+    """Refuse ``directory`` when anyone but this user or root can change ``entry`` in it.
+
+    The #6377 rule for a CA file's directory, applied to every directory the
+    CA path passes through (3-agent vote (6def5ab6), #6559, #6653, #6654):
+    the directory must be owned by this user or root (OpenSSH StrictModes),
+    and must not let the group or others write, unless it is sticky and
+    ``entry`` (``info`` is its ``lstat``) belongs to this user or root, since
+    nobody else can then replace it. ``info`` is ``None`` for an entry that
+    does not exist: no sticky exception then, since anyone who can write the
+    directory can create it after this check (#6828).
+    """
+    try:
+        held = os.stat(directory)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA path {path!r}: the directory {directory!r} holding {entry!r} "
+            f"cannot be checked ({exc.strerror}); it changed while the path was being "
+            "checked (#6829)."
+        ) from None
+    trusted = (0, os.geteuid())
+    if held.st_uid not in trusted:
+        raise ValueError(
+            f"verify= CA path {path!r} passes through the directory {directory!r}, "
+            f"owned by uid {held.st_uid} (mode {stat.S_IMODE(held.st_mode):o}): that user "
+            f"could replace {entry!r} and change which servers this client trusts. "
+            "Give the directory to this user or root (chown), or pass a CA path whose "
+            "directories only you or root own (#6653)."
+        )
+    sticky_and_owned = (
+        info is not None and bool(held.st_mode & stat.S_ISVTX) and info.st_uid in trusted
+    )
+    if _shared_writable(held.st_mode) and not sticky_and_owned:
+        if info is None:
+            what = "the missing entry"
+        else:
+            what = "the symlink" if stat.S_ISLNK(info.st_mode) else "the entry"
+        raise ValueError(
+            f"verify= CA path {path!r} passes through {what} {entry!r}, whose directory "
+            f"{directory!r} (owner uid {held.st_uid}, mode {stat.S_IMODE(held.st_mode):o}) "
+            "is group- or world-writable: anyone with that write access could replace "
+            "it and change which servers this client trusts. Remove the write bits "
+            f"(chmod go-w {directory}) or pass a CA path whose directories only their "
+            "owner can change (#6559, #6653)."
+        )
+
+
 #: Symlinks followed while resolving one CA path, as Linux's MAXSYMLINKS.
 _MAX_SYMLINK_HOPS = 40
 
 
 def _checked_realpath(path: str) -> str:
-    """``os.path.realpath(path)``, refusing a symlink others could re-point (#6559).
+    """Resolve ``path`` component by component, refusing a directory others can change.
 
-    Every component is resolved in order. A symlink met on the way (the path
-    itself, a directory component, or a link its target leads through) is
-    refused when the directory holding it lets the group or others write and
-    is not sticky with the link owned by this user or root: anyone with that
-    write access could replace the link and change which CA is read. This is
-    the #6377 rule for a CA file's directory, applied to every link. A
-    missing component ends the walk with the remainder appended, as
-    ``realpath`` does; the caller then refuses the path.
+    This is not ``os.path.realpath``: every component is resolved in order,
+    and the directory holding each one (an ancestor of the path, of a symlink
+    met on the way, or of a link's target) goes through
+    :func:`_refuse_untrusted_holder`, so whoever could swap a directory,
+    re-point a link or replace the file is refused (3-agent vote (6def5ab6),
+    #6559, #6653). A missing component ends the walk with the remainder
+    appended unchanged (a later ``..`` is NOT collapsed lexically; the kernel
+    returns ENOENT for it too), so the caller refuses the path; the directory
+    that would hold it is held to the same rule first, so nobody else can
+    create it between this walk and the open (#6828). Any component after a
+    file (``ca.pem/.``, ``ca.pem/..``) is refused, as the kernel's ENOTDIR
+    (#6811), and a directory that vanishes mid-walk is a ``ValueError``,
+    never a raw ``OSError`` (#6829).
     """
     if os.name == "nt":
         return os.path.realpath(path)
-    parts = [part for part in os.path.join(os.getcwd(), path).split(os.sep) if part]
+    if not os.path.isabs(path):
+        try:
+            path_from_root = os.path.join(os.getcwd(), path)
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA path {path!r} is relative and the working directory cannot "
+                f"be read ({exc.strerror}) (#6829)."
+            ) from None
+    else:
+        path_from_root = path
+    parts = [part for part in path_from_root.split(os.sep) if part]
     resolved = os.sep
+    resolved_is_dir = True
     hops = 0
     while parts:
         name = parts.pop(0)
+        if not resolved_is_dir:
+            # The kernel gives ENOTDIR for anything after a file, `.` and
+            # `..` included: `ca.pem/.` is never `ca.pem` (#6811).
+            raise ValueError(
+                f"verify= CA path {path!r}: {resolved!r} is not a directory, so no "
+                "component can follow it (ENOTDIR, #6811)."
+            )
         if name == ".":
             continue
         if name == "..":
@@ -260,23 +355,16 @@ def _checked_realpath(path: str) -> str:
         try:
             info = os.lstat(candidate)
         except OSError:
+            _refuse_untrusted_holder(path, resolved, candidate, None)
             return os.path.join(candidate, *parts)
+        _refuse_untrusted_holder(path, resolved, candidate, info)
         if not stat.S_ISLNK(info.st_mode):
             resolved = candidate
+            resolved_is_dir = stat.S_ISDIR(info.st_mode)
             continue
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
             raise ValueError(f"verify= CA path {path!r} has too many symlinks (#6559).")
-        held = os.stat(resolved).st_mode
-        sticky_and_owned = bool(held & stat.S_ISVTX) and info.st_uid in (0, os.geteuid())
-        if _shared_writable(held) and not sticky_and_owned:
-            raise ValueError(
-                f"verify= CA path {path!r} passes through the symlink {candidate!r}, "
-                f"whose directory is group- or world-writable (mode {stat.S_IMODE(held):o}): "
-                "anyone with that write access could re-point it and change which "
-                "servers this client trusts. Pass the real path, or keep the link in "
-                "a directory only its owner can change (#6559)."
-            )
         try:
             target = os.readlink(candidate)
         except OSError as exc:
@@ -314,12 +402,20 @@ def _pinned_base_context() -> ssl.SSLContext:
 def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
     """Load one CA file into ``context`` NOW, after checking who can change it.
 
-    ``entry`` is resolved through symlinks (each held to #6559), opened without blocking (a FIFO
+    ``entry`` is resolved by :func:`_checked_realpath` (every directory on the way held to
+    #6653), opened without blocking (a FIFO
     would otherwise hang), and must be a regular file that neither it nor its
     directory lets the group or others rewrite; a sticky directory is
     admitted when the file belongs to this user or root, since nobody else
-    can then replace it. The file is loaded by path and re-checked to be the
-    same inode afterwards, so a swap during the load is refused (#6377).
+    can then replace it. The file's owner and its directory's owner must be
+    this user or root (#6815, 3-agent vote (6def5ab6)).
+
+    The opened file is then bound to the rule: ``entry`` is walked again
+    AFTER the open, and the entry that walk ends at must be the inode the
+    descriptor holds, so the checks above describe a file every directory on
+    the way still vouches for (#6828). The file is loaded by path and
+    re-checked to be the same inode afterwards, so a swap during the load is
+    refused (#6377).
     """
     real = _checked_realpath(entry)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -339,27 +435,38 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
             "directory may hold only certificate and CRL files (#6307, #6377)."
         )
     _refuse_shared_writable("CA file", real, opened.st_mode)
-    parent = os.path.dirname(real)
-    held = os.stat(parent)
-    sticky_and_owned = bool(held.st_mode & stat.S_ISVTX) and opened.st_uid in (0, os.geteuid())
-    if not sticky_and_owned:
-        _refuse_shared_writable("CA file directory", parent, held.st_mode)
+    _refuse_untrusted_holder(shown, os.path.dirname(real), real, opened)
+    _refuse_foreign_owner("CA file", shown, opened)
+    walked = _checked_realpath(entry)
+    try:
+        found = os.lstat(walked)
+    except OSError:
+        found = None
+    if found is None or (found.st_dev, found.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(
+            f"verify= CA file {shown!r} changed while it was being checked: the file "
+            "opened is not the one its path names now (#6828)."
+        )
     try:
         context.load_verify_locations(cafile=real)
     except (ssl.SSLError, OSError) as exc:
         raise ValueError(
             f"verify= CA file {shown!r} holds no usable certificate: {exc} (#6377)."
         ) from None
-    after = os.stat(real)
-    if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+    try:
+        after = os.stat(real)
+    except OSError:
+        after = None
+    if after is None or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
         raise ValueError(f"verify= CA file {shown!r} changed while it was being read (#6377).")
 
 
-def _context_from_path(path: str) -> ssl.SSLContext:
+def _context_from_path(path: str, *, kind: str | None = None) -> ssl.SSLContext:
     """A verifying context for the CA file or directory ``path`` (#6269, #6377).
 
-    The path is resolved NOW, as ``os.path.realpath`` does, refusing a symlink
-    on the way that sits in a directory others can write (#6559). A path that is neither
+    The path is resolved NOW, component by component by ``_checked_realpath``,
+    refusing a directory on the way that another user could change (#6559,
+    #6653). A path that is neither
     an existing regular file nor an existing directory (missing, FIFO, socket,
     device) is a ``ValueError`` rather than a late ``FileNotFoundError`` or a
     hang (#6307).
@@ -371,14 +478,32 @@ def _context_from_path(path: str) -> ssl.SSLContext:
     directory, file, symlink target or target directory that the group or
     others can write is refused (POSIX; #6377). An empty directory gives a
     context with no anchor at all, which fails every handshake (#6269).
+
+    ``kind`` (``"file"`` or ``"directory"``) additionally requires that kind;
+    the env trust variables pass it, so ``SSL_CERT_FILE`` and ``verify=`` share
+    this one check (#6538, #6690). A path ending in a separator names a
+    directory, as it does for the kernel: ``ca.pem/`` is refused (#6690).
     """
     resolved = _checked_realpath(path)
     try:
-        mode = os.stat(resolved).st_mode
+        found: os.stat_result | None = os.stat(resolved)
     except OSError:
+        found = None
+    mode = 0 if found is None else found.st_mode
+    if path.endswith(_PATH_SEPARATORS) and not stat.S_ISDIR(mode):
+        # A trailing separator names a directory: the kernel refuses
+        # ``ca.pem/`` (ENOTDIR) even though the walk above drops the empty
+        # last part (#6690).
         mode = 0
-    if stat.S_ISDIR(mode):
+    wanted = {"file": stat.S_ISREG, "directory": stat.S_ISDIR}.get(kind or "")
+    if wanted is not None and not wanted(mode):
+        raise ValueError(
+            f"CA path {path!r} is not an existing "
+            f"{'regular file' if kind == 'file' else kind} (#6538, #6690)."
+        )
+    if stat.S_ISDIR(mode) and found is not None:
         _refuse_shared_writable("CA directory", path, mode)
+        _refuse_foreign_owner("CA directory", path, found)
         context = _pinned_base_context()
         try:
             names = sorted(os.listdir(resolved))
@@ -422,21 +547,13 @@ def _context_from_env() -> ssl.SSLContext | None:
         if not value:
             continue
         try:
-            mode = os.stat(value).st_mode
-        except OSError:
-            mode = 0
-        if not (stat.S_ISDIR(mode) if wants_directory else stat.S_ISREG(mode)):
-            kind = "directory" if wants_directory else "regular file"
-            raise ValueError(
-                f"{variable}={value!r} is not an existing {kind}; httpx would read "
-                f"trust from it. Point {variable} at a CA "
-                f"{'hashed directory' if wants_directory else 'bundle file'} or unset it "
-                "(#6538)."
-            )
-        try:
-            return _context_from_path(value)
+            return _context_from_path(value, kind="directory" if wants_directory else "file")
         except ValueError as exc:
-            raise ValueError(f"{variable}: {exc} (#6538)") from None
+            raise ValueError(
+                f"{variable}={value!r}: {exc} httpx would read trust from it; point "
+                f"{variable} at a CA {'hashed directory' if wants_directory else 'bundle file'} "
+                "or unset it (#6538)."
+            ) from None
     return None
 
 
@@ -532,7 +649,9 @@ def _dns_name_matches(pattern: object, host: str) -> bool:
     if labels[0] != "*" or len(labels) < 3 or any("*" in label for label in labels[1:]):
         return False
     host_labels = host.split(".")
-    return len(host_labels) == len(labels) and bool(host_labels[0]) and host_labels[1:] == labels[1:]
+    return (
+        len(host_labels) == len(labels) and bool(host_labels[0]) and host_labels[1:] == labels[1:]
+    )
 
 
 def _peer_matches_host(peer: dict[str, Any], host: str, context: ssl.SSLContext) -> bool:
@@ -858,7 +977,13 @@ def gate_transports(
     caller's own context. The default transport and every mounted proxy
     transport are wrapped, so the check runs inside the transport, after all
     request event hooks. Fails closed: if the client does not expose its
-    transports the client is closed and construction is refused.
+    transports, construction is refused.
+
+    On that refusal the sync transports are closed before the raise. The
+    async ones are not: ``aclose`` needs a running event loop, which a
+    constructor called from sync code does not have, and a just-built
+    async transport has opened no connection, so dropping it leaks no
+    socket (#6693).
     """
     context = kwargs.get("verify")
     if not (isinstance(context, ssl.SSLContext) and context is verify):
@@ -973,8 +1098,12 @@ def build_httpx_kwargs(
             whoever answers — the man-in-the-middle exposure the #3828
             ``http://`` refusal closes, one layer up. Accepted forms are exactly
             ``None``, ``True``, the path of an existing CA file or directory (``str``
-            or ``os.PathLike``, resolved with ``os.path.realpath`` and read
-            once at construction, never group- or world-writable, #6377) and
+            or ``os.PathLike``, resolved component by component at
+            construction, a missing component refused rather than normalised
+            away, read once then and never group- or world-writable nor under
+            a directory another user can change, #6377, #6559, #6653;
+            ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` under ``None`` or
+            ``True`` are read the same way, #6538) and
             exactly ``ssl.SSLContext`` (never a subclass) that is
             ``CERT_REQUIRED`` with ``check_hostname`` on, no relaxing verify
             flag, no suite without server authentication and no replaced
@@ -1094,9 +1223,7 @@ def build_create_body(
 
     if signing_key is not None:
         if supplied.get("signature"):
-            raise ValueError(
-                "pass either signing_key or an explicit signature, not both"
-            )
+            raise ValueError("pass either signing_key or an explicit signature, not both")
         agent_id = supplied.get("agent_id")
         if not agent_id:
             raise ValueError(

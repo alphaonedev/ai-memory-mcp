@@ -394,6 +394,21 @@ def test_only_the_tunnel_connect_crosses_a_pending_proxy_leg_6349(
     assert leg.closed
 
 
+def test_verified_direct_leg_leaves_a_pending_proxy_leg_pending_6836(
+    driver: tuple[_Driver, ssl.SSLContext],
+) -> None:
+    # Only the session of the tunnel through the pending proxy leg clears it:
+    # a verified handshake on a direct leg of the same request does not.
+    drive, context = driver
+    fire = drive.new_request()
+    leg = _Stream(_Session(ssl.create_default_context()))
+    fire("connection.start_tls.complete", {"return_value": leg})
+    fire("connection.start_tls.complete", {"return_value": _Stream(_Session(context))})
+    with pytest.raises(ValueError, match="verify=False"):
+        fire("http11.send_request_headers.started", {"request": _get_request()})
+    assert leg.closed
+
+
 def test_pending_state_is_per_request_6349(driver: tuple[_Driver, ssl.SSLContext]) -> None:
     # Request B's verified tunnel must not clear request A's pending proxy leg.
     drive, context = driver
@@ -1417,7 +1432,7 @@ def _linked_ca(lab: Lab, tmp_path: pathlib.Path, kind: str, mode: int) -> str:
 
 @_POSIX_ONLY
 @pytest.mark.parametrize("client_cls", _CLIENTS)
-@pytest.mark.parametrize("mode", [0o777, 0o775], ids=oct)
+@pytest.mark.parametrize("mode", [0o777, 0o775, 0o757, 0o707], ids=oct)  # #6691: group AND other
 @pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
 def test_symlink_in_a_shared_writable_directory_is_refused_6559(
     lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int, kind: str
@@ -1595,3 +1610,547 @@ def test_unwrappable_transport_refuses_construction_6537(client_cls: type) -> No
 
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
+
+
+# ---- #6690: one path check for verify= and the env trust variables ---------
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("source", ["verify", "SSL_CERT_FILE"])
+def test_trailing_slash_on_a_ca_file_is_refused_6690(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    source: str,
+) -> None:
+    """``ca.pem/`` names no file to the kernel (ENOTDIR); both inputs refuse it."""
+    directory = _ca_dir(tmp_path)
+    entry = _add_anchor(directory, lab.ca_path)
+    spelled = str(entry) + os.sep
+    if source == "verify":
+        _env_trust(monkeypatch)
+        with pytest.raises(ValueError, match="not an existing regular file"):
+            client_cls(base_url=_ORIGIN, verify=spelled)
+    else:
+        _env_trust(monkeypatch, SSL_CERT_FILE=spelled)
+        with pytest.raises(ValueError, match="SSL_CERT_FILE"):
+            client_cls(base_url=_ORIGIN, verify=None)
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("source", ["verify", "SSL_CERT_DIR"])
+def test_trailing_slash_on_a_ca_directory_is_accepted_6690(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    source: str,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    spelled = str(directory) + os.sep
+    if source == "verify":
+        _env_trust(monkeypatch)
+        assert _get_once(client_cls, origin.url, spelled) == 200
+    else:
+        _env_trust(monkeypatch, SSL_CERT_DIR=spelled)
+        assert _get_once(client_cls, origin.url, None) == 200
+
+
+def test_env_and_verify_share_one_path_check_6690(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env variables are checked by the same funnel as ``verify=<path>``."""
+    seen: list[tuple[str, object]] = []
+    real = _common._context_from_path
+
+    def spy(path: str, *args: Any, **kwargs: Any) -> ssl.SSLContext:
+        seen.append((path, kwargs.get("kind")))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(_common, "_context_from_path", spy)
+    _env_trust(monkeypatch, SSL_CERT_FILE=str(tmp_path / "absent.pem"))
+    with pytest.raises(ValueError, match="SSL_CERT_FILE"):
+        AiMemoryClient(base_url=_ORIGIN, verify=None)
+    assert seen == [(str(tmp_path / "absent.pem"), "file")]
+
+
+# ---- #6692 / #6656: the component walk, not a lexical normalisation --------
+
+
+def _built(client_cls: type, verify: Any) -> None:
+    """Construct (and close) one client; raises what construction raises."""
+    client = client_cls(base_url=_ORIGIN, verify=verify)
+    if client_cls is AsyncAiMemoryClient:
+        asyncio.run(client.aclose())
+    else:
+        client.close()
+
+
+def _bundle(lab: Lab, directory: pathlib.Path, name: str = "ca.pem") -> pathlib.Path:
+    bundle = directory / name
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(0o644)
+    return bundle
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_missing_component_before_dotdot_is_refused_6692(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    """``dir/missing/../ca.pem`` is ENOENT to the kernel; it is never read as ``dir/ca.pem``."""
+    directory = _ca_dir(tmp_path)
+    _bundle(lab, directory)
+    with pytest.raises(ValueError, match="not an existing"):
+        _built(client_cls, str(directory / "missing" / ".." / "ca.pem"))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_missing_component_before_a_shared_link_is_refused_6692(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    directory = _ca_dir(tmp_path)
+    bundle = _bundle(lab, directory)
+    shared = _ca_dir(tmp_path / "ca", "shared777", 0o755)
+    (shared / "link.pem").symlink_to(bundle)
+    shared.chmod(0o777)
+    with pytest.raises(ValueError):
+        _built(client_cls, str(directory / "missing" / ".." / "shared777" / "link.pem"))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_dotdot_after_an_existing_component_steps_back_one_level_6656(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _bundle(lab, directory)
+    _ca_dir(directory, "sub")
+    _built(client_cls, str(directory / "sub" / ".." / "ca.pem"))
+
+
+# ---- #6660: the symlink hop cap is enforced at its bound -------------------
+
+
+def _link_chain(tmp_path: pathlib.Path, target: pathlib.Path, links: int) -> pathlib.Path:
+    """``links`` symlinks in a private directory, each pointing at the next."""
+    chain = _ca_dir(tmp_path, f"chain{links}")
+    nxt = target
+    for index in range(links, 0, -1):
+        link = chain / f"l{index}"
+        link.symlink_to(nxt)
+        nxt = link
+    return nxt
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_symlink_chain_over_the_hop_cap_is_refused_6660(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    bundle = _bundle(lab, _ca_dir(tmp_path))
+    at_cap = _link_chain(tmp_path, bundle, _common._MAX_SYMLINK_HOPS)
+    _built(client_cls, str(at_cap))
+    over = _link_chain(tmp_path, bundle, _common._MAX_SYMLINK_HOPS + 1)
+    with pytest.raises(ValueError, match="too many symlinks"):
+        _built(client_cls, str(over))
+
+
+# ---- #6695 / #6655: the sticky exception needs an entry owned by us or root -
+
+
+_FOREIGN_UID = os.geteuid() + 4242 if os.name != "nt" else 4242
+
+
+def _as_foreign(
+    real: Callable[..., os.stat_result], inode: tuple[int, int], uid: int = _FOREIGN_UID
+) -> Callable[..., Any]:
+    """``real`` (``os.stat``/``os.lstat``/``os.fstat``), reporting ``inode`` as owned by ``uid``."""
+
+    def stat_as_foreign(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real(target, *args, **kwargs)
+        if (result.st_dev, result.st_ino) != inode:
+            return result
+        fields = list(result[:10])
+        fields[4] = uid  # st_uid
+        return os.stat_result(fields)
+
+    return stat_as_foreign
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("owner", ["self", "foreign"])
+def test_ca_file_in_a_sticky_directory_needs_an_owned_file_6695(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    owner: str,
+) -> None:
+    sticky = _ca_dir(tmp_path, "sticky", 0o755)
+    bundle = _bundle(lab, sticky)
+    sticky.chmod(0o1777)
+    if owner == "self":
+        _built(client_cls, str(bundle))
+        return
+    found = os.stat(bundle)
+    monkeypatch.setattr(os, "fstat", _as_foreign(os.fstat, (found.st_dev, found.st_ino)))
+    with pytest.raises(ValueError, match="writable"):
+        _built(client_cls, str(bundle))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
+def test_foreign_symlink_in_a_sticky_directory_is_refused_6655(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    # The accepted twin is test_own_symlink_in_a_sticky_directory_is_accepted_6559.
+    verify = _linked_ca(lab, tmp_path, kind, 0o1777)
+    link = next((tmp_path / "swap").iterdir())
+    found = os.lstat(link)
+    monkeypatch.setattr(os, "lstat", _as_foreign(os.lstat, (found.st_dev, found.st_ino)))
+    with pytest.raises(ValueError, match="symlink"):
+        _built(client_cls, verify)
+
+
+# ---- #6657 / #6658: which env variable httpx would honour ------------------
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_ssl_cert_file_wins_over_ssl_cert_dir_6657(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    """httpx reads SSL_CERT_FILE first; the SDK must load the same one."""
+    bundle = _bundle(lab, _ca_dir(tmp_path, "file"))
+    empty = _ca_dir(tmp_path, "empty")  # a valid hashed directory trusting nothing
+    _env_trust(monkeypatch, SSL_CERT_FILE=str(bundle), SSL_CERT_DIR=str(empty))
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_empty_ssl_cert_file_is_unset_6658(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    """httpx treats an empty SSL_CERT_FILE as unset and falls to SSL_CERT_DIR."""
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    _env_trust(monkeypatch, SSL_CERT_FILE="", SSL_CERT_DIR=str(directory))
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
+# ---- #6693 / #6694 / #6659: what the gated transports own and leave behind -
+
+
+class _RecordingTransport(httpx.BaseTransport):
+    def __init__(self) -> None:
+        self.closed = False
+        self.seen: list[dict[str, Any]] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.seen.append(dict(request.extensions))
+        return httpx.Response(200, request=request)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _AsyncRecordingTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.closed = False
+        self.seen: list[dict[str, Any]] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.seen.append(dict(request.extensions))
+        return httpx.Response(200, request=request)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _gate_kwargs(context: ssl.SSLContext, *, is_async: bool) -> dict[str, Any]:
+    return build_httpx_kwargs(
+        base_url=_ORIGIN,
+        api_key=_API_KEY,
+        agent_id=None,
+        timeout=1.0,
+        verify=context,
+        cert=None,
+        extra_headers=None,
+        is_async=is_async,
+    )
+
+
+def test_refused_gate_closes_the_sync_transports_6693() -> None:
+    context = ssl.create_default_context()
+    kwargs = _gate_kwargs(context, is_async=False)
+    client = httpx.Client(**kwargs)
+    recording = _RecordingTransport()
+    client._transport = recording  # noqa: SLF001
+    client._mounts[httpx.URL("https://other.invalid")] = object()  # type: ignore[index]  # noqa: SLF001
+    with pytest.raises(ValueError, match="#6537"):
+        _common.gate_transports(client, kwargs, context)
+    assert recording.closed
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_closing_the_client_closes_the_gated_inner_transport_6694(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    kwargs = _gate_kwargs(context, is_async=is_async)
+    if is_async:
+        inner: Any = _AsyncRecordingTransport()
+        client: Any = httpx.AsyncClient(**{**kwargs, "transport": inner})
+    else:
+        inner = _RecordingTransport()
+        client = httpx.Client(**{**kwargs, "transport": inner})
+    _common.gate_transports(client, kwargs, context)
+    assert client._transport is not inner  # noqa: SLF001 - wrapped
+    if is_async:
+        asyncio.run(client.aclose())
+    else:
+        client.close()
+    assert inner.closed
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_gated_send_leaves_the_request_extensions_untouched_6659(is_async: bool) -> None:
+    """The SDK trace lives in a per-send copy; the caller's dict never sees it."""
+    context = ssl.create_default_context()
+    request = httpx.Request("GET", _ORIGIN, extensions={"timeout": {"connect": 1.0}})
+    before = request.extensions
+    snapshot = dict(before)
+    if is_async:
+        inner: Any = _AsyncRecordingTransport()
+        asyncio.run(_common._AsyncGatedTransport(inner, context).handle_async_request(request))
+    else:
+        inner = _RecordingTransport()
+        _common._GatedTransport(inner, context).handle_request(request)
+    assert "trace" in inner.seen[0]  # the inner transport did see the SDK trace
+    assert request.extensions is before  # restored (#6537)
+    assert request.extensions == snapshot  # and never written through
+
+
+# ---- #6653 / #6559 / #6654: every directory on the way, 3-agent vote (6def5ab6)
+
+
+def _owned_by(monkeypatch: pytest.MonkeyPatch, directory: pathlib.Path, uid: int) -> None:
+    """Make ``os.stat`` and ``os.lstat`` report ``directory`` as owned by ``uid``."""
+    found = os.stat(directory)
+    inode = (found.st_dev, found.st_ino)
+    monkeypatch.setattr(os, "stat", _as_foreign(os.stat, inode, uid))
+    monkeypatch.setattr(os, "lstat", _as_foreign(os.lstat, inode, uid))
+
+
+def _under_ancestor(lab: Lab, tmp_path: pathlib.Path, kind: str) -> tuple[pathlib.Path, str]:
+    """``anc/sub/<CA>``: a CA file or hashed directory two levels under ``anc``."""
+    sub = _ca_dir(_ca_dir(tmp_path, "anc"), "sub")
+    if kind == "file":
+        return tmp_path / "anc", str(_bundle(lab, sub))
+    _add_anchor(sub, lab.ca_path)
+    return tmp_path / "anc", str(sub)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o777, 0o775, 0o757, 0o707], ids=oct)
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_plain_path_under_a_shared_writable_ancestor_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int, kind: str
+) -> None:
+    """Probe P2b: whoever can write ``anc`` can swap ``sub`` for their own; no symlink needed."""
+    ancestor, verify = _under_ancestor(lab, tmp_path, kind)
+    ancestor.chmod(mode)
+    with pytest.raises(ValueError, match="writable") as refused:
+        _built(client_cls, verify)
+    # It names the directory to fix, not the one holding it, and the exact fix.
+    assert f"whose directory {str(ancestor)!r}" in str(refused.value)
+    assert f"(chmod go-w {ancestor})" in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_link_target_under_a_shared_writable_grandparent_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    """Probe P3b: the link sits in a private directory; its target's grandparent is 0777."""
+    ancestor, target = _under_ancestor(lab, tmp_path, "file")
+    links = _ca_dir(tmp_path, "links")
+    (links / "ca.pem").symlink_to(target)
+    ancestor.chmod(0o777)
+    with pytest.raises(ValueError, match="writable") as refused:
+        _built(client_cls, str(links / "ca.pem"))
+    assert f"whose directory {str(ancestor)!r}" in str(refused.value)
+    assert f"(chmod go-w {ancestor})" in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_ancestor_swapped_during_the_load_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    """Probe P4: ``anc/sub`` is swapped out and back around the load (ABA).
+
+    The inode re-check cannot see an ABA swap of an ancestor, so a directory
+    others can write is refused before anything is read.
+    """
+    import certifi
+
+    ancestor, verify = _under_ancestor(lab, tmp_path, "file")
+    evil = _ca_dir(ancestor, "evil")
+    shutil.copy(certifi.where(), evil / "ca.pem")
+    ancestor.chmod(0o777)
+
+    class Racy(ssl.SSLContext):
+        def load_verify_locations(self, *args: Any, **kwargs: Any) -> None:
+            os.rename(ancestor / "sub", ancestor / "tmp")
+            os.rename(evil, ancestor / "sub")
+            try:
+                super().load_verify_locations(*args, **kwargs)
+            finally:
+                os.rename(ancestor / "sub", evil)
+                os.rename(ancestor / "tmp", ancestor / "sub")
+
+    def racy_base() -> ssl.SSLContext:
+        context = Racy(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
+        return context
+
+    monkeypatch.setattr(_common, "_pinned_base_context", racy_base)
+    with pytest.raises(ValueError, match="writable"):
+        _built(client_cls, verify)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o755, 0o1777], ids=oct)  # #6654: a sticky one too
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_ancestor_owned_by_another_user_is_refused_6653(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    mode: int,
+    kind: str,
+) -> None:
+    """StrictModes: the owner of a directory on the way can replace what is under it."""
+    ancestor, verify = _under_ancestor(lab, tmp_path, kind)
+    ancestor.chmod(mode)
+    _owned_by(monkeypatch, ancestor, _FOREIGN_UID)
+    with pytest.raises(ValueError, match="owned by uid") as refused:
+        _built(client_cls, verify)
+    # The owner named is the directory's, not the owner of what it holds.
+    assert f"the directory {str(ancestor)!r}, owned by uid {_FOREIGN_UID}" in str(refused.value)
+    assert "chown" in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_link_target_under_a_foreign_ancestor_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    ancestor, target = _under_ancestor(lab, tmp_path, "file")
+    links = _ca_dir(tmp_path, "links")
+    (links / "ca.pem").symlink_to(target)
+    _owned_by(monkeypatch, ancestor, _FOREIGN_UID)
+    with pytest.raises(ValueError, match="owned by uid"):
+        _built(client_cls, str(links / "ca.pem"))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_root_owned_ancestor_is_accepted_6653(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    ancestor, verify = _under_ancestor(lab, tmp_path, kind)
+    _owned_by(monkeypatch, ancestor, 0)
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("via", ["path", "link"])
+def test_own_subdir_of_a_sticky_ancestor_is_accepted_6653(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    via: str,
+) -> None:
+    """Probes P5 / P5b: a CA under ``/tmp``-style 1777 in a subdir this user owns."""
+    _clear_proxy_env(monkeypatch)
+    sticky = _ca_dir(tmp_path, "tmpish")
+    own = _ca_dir(sticky, "me", 0o700)
+    verify = _bundle(lab, own)
+    if via == "link":
+        (sticky / "link.pem").symlink_to(verify)
+        verify = sticky / "link.pem"
+    sticky.chmod(0o1777)
+    assert _get_once(client_cls, origin.url, str(verify)) == 200
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_kubernetes_data_double_symlink_is_accepted_6653(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    """Probe P7: a projected volume's ``ca.crt -> ..data/ca.crt``, ``..data -> ..2026_x``."""
+    _clear_proxy_env(monkeypatch)
+    volume = _ca_dir(tmp_path, "volume")
+    _bundle(lab, _ca_dir(volume, "..2026_x"), "ca.crt")
+    (volume / "..data").symlink_to("..2026_x")
+    (volume / "ca.crt").symlink_to("..data/ca.crt")
+    assert _get_once(client_cls, origin.url, str(volume / "ca.crt")) == 200
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_env_trust_under_a_shared_writable_ancestor_is_refused_6653(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    """``SSL_CERT_FILE`` goes through the same walk as ``verify=`` (#6690)."""
+    ancestor, bundle = _under_ancestor(lab, tmp_path, "file")
+    ancestor.chmod(0o777)
+    _env_trust(monkeypatch, SSL_CERT_FILE=bundle)
+    with pytest.raises(ValueError, match="writable"):
+        _built(client_cls, verify)

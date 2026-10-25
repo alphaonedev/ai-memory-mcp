@@ -74,11 +74,14 @@ class AiMemoryClient:
             this identity on stored memories (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
         verify: TLS server verification. Accepted: ``None`` (httpx default trust:
-            certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set), ``True``, the path of an existing CA bundle file or hashed
-            CA directory (``str`` / ``os.PathLike``, resolved with
-            ``os.path.realpath`` and read ONCE, now, into a context the SDK
-            builds; a group- or world-writable path is refused, #6248, #6269,
-            #6377) and exactly ``ssl.SSLContext`` (not a subclass such as
+            certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set, which
+            the SDK reads at construction under the path rules below, #6538),
+            ``True``, the path of an existing CA bundle file or hashed CA
+            directory (``str`` / ``os.PathLike``, resolved component by
+            component, a missing component refused rather than normalised
+            away, and read ONCE, now, into a context the SDK builds; a group-
+            or world-writable path, or one under a directory another user
+            can change, is refused, #6248, #6269, #6377, #6559, #6653) and exactly ``ssl.SSLContext`` (not a subclass such as
             ``truststore.SSLContext``) that is ``CERT_REQUIRED`` with
             ``check_hostname`` on, no verify flag that relaxes chain
             validation, no cipher suite without server authentication and no
@@ -241,7 +244,9 @@ class AiMemoryClient:
         )
         return self._request("POST", "/api/v1/memories", json_body=body)
 
-    def bulk_store(self, memories: builtins.list[CreateMemory | dict[str, Any]]) -> BulkCreateResponse:
+    def bulk_store(
+        self, memories: builtins.list[CreateMemory | dict[str, Any]]
+    ) -> BulkCreateResponse:
         """``POST /api/v1/memories/bulk`` — insert up to 1000 at once."""
         payload = [prep_json(m) for m in memories]
         raw = self._request("POST", "/api/v1/memories/bulk", json_body=payload)
@@ -403,9 +408,7 @@ class AiMemoryClient:
         )
 
     # -- links / stats / admin ---------------------------------------------
-    def link(
-        self, source_id: str, target_id: str, relation: str = "related_to"
-    ) -> dict[str, Any]:
+    def link(self, source_id: str, target_id: str, relation: str = "related_to") -> dict[str, Any]:
         """``POST /api/v1/links``."""
         return self._request(
             "POST",
@@ -522,9 +525,7 @@ class AiMemoryClient:
         endpoint kept receiving signed deliveries indefinitely. Check the
         returned ``deleted`` flag.
         """
-        return self._request(
-            "DELETE", "/api/v1/subscriptions", params={"id": subscription_id}
-        )
+        return self._request("DELETE", "/api/v1/subscriptions", params={"id": subscription_id})
 
     def subscriptions(self) -> builtins.list[Subscription]:
         """``GET /api/v1/subscriptions``."""

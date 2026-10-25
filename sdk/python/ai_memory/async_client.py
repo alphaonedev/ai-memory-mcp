@@ -458,9 +458,7 @@ class AsyncAiMemoryClient:
             },
         )
 
-    async def bind_agent_pubkey_challenge(
-        self, agent_id: str, pubkey_b64: str
-    ) -> dict[str, Any]:
+    async def bind_agent_pubkey_challenge(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
         """``POST /api/v1/agents/{id}/pubkey/challenge``. See
         :meth:`AiMemoryClient.bind_agent_pubkey_challenge`."""
         encoded_agent_id = encode_path_segment(agent_id)

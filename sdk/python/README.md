@@ -77,9 +77,10 @@ Accepted (anything else raises `ValueError` from the constructor):
   refused rather than falling back to `certifi` (#6538).
 - `True`: the same, explicit.
 - A `str` or `os.PathLike` naming an existing CA bundle file or hashed CA
-  directory. The path is resolved with `os.path.realpath` when the client is
-  built (symlinks followed, a relative path fixed against the working
-  directory at that moment). The SDK reads the trust ONCE, at construction,
+  directory. The path is resolved component by component when the client is
+  built (symlinks followed under the #6653 rule below, a relative path fixed against
+  the working directory at that moment; a missing component is refused, not
+  normalised away by a later `..` as `os.path.realpath` would). The SDK reads the trust ONCE, at construction,
   into a context it builds the way `ssl.create_default_context` does but
   without the system store: for a directory, every hashed entry
   (`<hash>.0`, `<hash>.r0`, ..., as `c_rehash` / `openssl rehash` name them)
@@ -87,6 +88,13 @@ Accepted (anything else raises `ValueError` from the constructor):
   trusted, and a later `chdir` cannot change what is trusted. An empty
   directory trusts nothing, so every connection fails. The path must not be
   writable by its group or by others (#6377).
+
+  This also refuses a CA bundle kept under a group-writable directory, such as
+  Homebrew's `/opt/homebrew/etc` (`drwxrwxr-x`, group `admin`) or an Intel
+  Mac's `/usr/local`: anyone in that group could swap the bundle. The error
+  names the directory, its owner and mode, and the fix: `chmod go-w <dir>`
+  (or `chown` it to yourself or root), or copy the bundle to a directory only
+  you can change (#6653).
 - Exactly `ssl.SSLContext` (not a subclass): the object returned by
   `ssl.create_default_context(cafile=...)`, with `verify_mode` left at
   `CERT_REQUIRED`, `check_hostname` on, no verify flag that relaxes chain
@@ -103,11 +111,17 @@ Refused with `ValueError` (#3840, #6267, #6268, #6269):
   `str`/path subclass).
 - A path that does not exist, or is neither a file nor a directory; a CA
   file, CA directory, symlink target or target directory that its group or
-  others can write (POSIX, #6377); a symlink anywhere on the path (the path
-  itself, a directory component, or a link a hashed entry leads through)
-  whose directory its group or others can write, unless that directory is
-  sticky and the link is yours or root's (POSIX, #6559); a directory entry
-  that is not a regular file.
+  others can write (POSIX, #6377); a path that passes through a directory
+  (an ancestor of the path, of a symlink on the way, or of a link's target)
+  that is owned by another user than you or root, or that its group or others
+  can write, unless that directory is sticky and the entry in it is yours or
+  root's (POSIX, #6559, #6653; a CA in your own subdirectory of `/tmp` is
+  fine); a path naming a component that does not exist yet under such a
+  directory, sticky or not (#6828); a CA file or CA directory owned by another
+  user than you or root, whatever its mode (POSIX, #6815); a component after
+  a file, such as `ca.pem/.` or `ca.pem/..` (#6811); a directory entry that
+  is not a regular file. A CA file is walked again after it is opened and
+  must still be the file that was opened (#6828).
 - A context with `verify_mode` of `CERT_NONE` or `CERT_OPTIONAL`, or with
   `check_hostname` off.
 - A context with a verify flag that relaxes chain validation, such as
@@ -165,7 +179,7 @@ Ed25519 key whose public half is bound to the agent:
 from ai_memory import AiMemoryClient, Tier
 from ai_memory.attestation import AgentSigningKey
 
-key = AgentSigningKey.generate()          # or .from_file("svc.priv")
+key = AgentSigningKey.generate()  # or .from_file("svc.priv")
 # `.from_file` refuses a key that is not a regular file, is reached through a
 # symlink, has any group/other bit, or is owned by another uid (#3784) — the
 # same standard the daemon applies to `<key_dir>/<agent_id>.priv`.
@@ -180,7 +194,7 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
         content="Use --with-openssl=/opt/openssl, disable DoH for the lab.",
         tier=Tier.LONG,
         tags=["dns", "bind9"],
-        agent_id="svc",       # required when signing — it is inside the envelope
+        agent_id="svc",  # required when signing — it is inside the envelope
         signing_key=key,
     )
     print(created["id"])
@@ -212,12 +226,14 @@ Notes:
 import asyncio
 from ai_memory import AsyncAiMemoryClient
 
+
 async def main() -> None:
     # `ca`: see "Trust the daemon's CA".
     async with AsyncAiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client:
         resp = await client.recall(context="hello")
         for memory in resp.memories:
             print(memory.title)
+
 
 asyncio.run(main())
 ```
@@ -250,7 +266,9 @@ server writes `metadata.agent_id` accordingly (see docs/reference/ARCHITECTURE_R
 Identity).
 
 ```python
-AiMemoryClient(base_url="https://localhost:9077", verify=str(ca), agent_id="ai:claude-opus-4.7@host")
+AiMemoryClient(
+    base_url="https://localhost:9077", verify=str(ca), agent_id="ai:claude-opus-4.7@host"
+)
 ```
 
 ## All methods
@@ -325,10 +343,12 @@ bundle = DelegationBundle.load(
 # `ca` is the daemon CA path — see "Trust the daemon's CA".
 client = AiMemoryClient(base_url="https://localhost:9077", verify=str(ca))
 
+
 def catch_up(signal):
     # EXACTLY ONE inbox read per signal — never one per queued hint.
     for message in client.inbox(agent_id=bundle.agent_id, unread_only=True):
         handle(message)
+
 
 WakeListener("/run/user/1000/ai-memory/wake-hub.sock", bundle, catch_up).run()
 ```
@@ -373,6 +393,7 @@ the hello.
 
 ```python
 from ai_memory import verify_webhook_signature
+
 
 def handle(request) -> None:
     sig = request.headers["X-AI-Memory-Signature"]

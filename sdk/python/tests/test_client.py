@@ -316,9 +316,7 @@ def _pubkey_bind_transport(seen: list[httpx.Request]) -> httpx.MockTransport:
 def _assert_encoded_pubkey_bind_sequence(seen: list[httpx.Request]) -> None:
     encoded = "spiffe%3A%2F%2Fexample.org%2Fns%2Fprod"
     assert [request.method for request in seen] == ["POST", "PUT"]
-    assert seen[0].url.raw_path.decode() == (
-        f"/api/v1/agents/{encoded}/pubkey/challenge"
-    )
+    assert seen[0].url.raw_path.decode() == (f"/api/v1/agents/{encoded}/pubkey/challenge")
     assert seen[1].url.raw_path.decode() == f"/api/v1/agents/{encoded}/pubkey"
     assert json.loads(seen[0].read()) == {"pubkey_b64": "candidate-public-key"}
     assert json.loads(seen[1].read()) == {
@@ -347,7 +345,8 @@ def test_pubkey_bind_percent_encodes_spiffe_agent_sync(
     )
     try:
         result = client.bind_agent_pubkey(
-            "spiffe://example.org/ns/prod", _FakeSigningKey()  # type: ignore[arg-type]
+            "spiffe://example.org/ns/prod",
+            _FakeSigningKey(),  # type: ignore[arg-type]
         )
     finally:
         client.close()
@@ -384,7 +383,8 @@ async def test_pubkey_bind_percent_encodes_spiffe_agent_async(
     )
     try:
         result = await client.bind_agent_pubkey(
-            "spiffe://example.org/ns/prod", _FakeSigningKey()  # type: ignore[arg-type]
+            "spiffe://example.org/ns/prod",
+            _FakeSigningKey(),  # type: ignore[arg-type]
         )
     finally:
         await client.aclose()
@@ -417,11 +417,19 @@ def test_removed_v1_methods_are_gone() -> None:
 
 def _wire_memory(memory_id: str = "mem-3331") -> dict[str, object]:
     return {
-        "id": memory_id, "tier": "mid", "namespace": "global",
-        "title": "wire fixture", "content": "zebra", "tags": [],
-        "priority": 5, "confidence": 1.0, "source": "api", "access_count": 0,
+        "id": memory_id,
+        "tier": "mid",
+        "namespace": "global",
+        "title": "wire fixture",
+        "content": "zebra",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "access_count": 0,
         "created_at": "2026-09-01T00:00:00Z",
-        "updated_at": "2026-09-01T00:00:00Z", "metadata": {},
+        "updated_at": "2026-09-01T00:00:00Z",
+        "metadata": {},
     }
 
 
@@ -430,23 +438,49 @@ def _wire_handler(seen: list[httpx.Request]):
         seen.append(request)
         path = request.url.path
         if path == "/api/v1/search":
-            return httpx.Response(200, json={"count": 1, "query": "zebra", "results": [_wire_memory()]})
+            return httpx.Response(
+                200, json={"count": 1, "query": "zebra", "results": [_wire_memory()]}
+            )
         if path == "/api/v1/memories/mem-3331":
             return httpx.Response(200, json={"memory": _wire_memory(), "links": []})
         if path == "/api/v1/notify":
-            return httpx.Response(201, json={"id": "n1", "target_agent_id": "ai:target", "namespace": "global", "storage_backend": "postgres"})
+            return httpx.Response(
+                201,
+                json={
+                    "id": "n1",
+                    "target_agent_id": "ai:target",
+                    "namespace": "global",
+                    "storage_backend": "postgres",
+                },
+            )
         if path == "/api/v1/stats":
-            return httpx.Response(200, json={"total_memories": 1, "by_tier": [], "by_namespace": [], "expiring_soon": 0, "links_count": 0, "db_size_bytes": 10, "live": 1, "expired_pending_gc": 0, "storage_backend": "postgres"})
+            return httpx.Response(
+                200,
+                json={
+                    "total_memories": 1,
+                    "by_tier": [],
+                    "by_namespace": [],
+                    "expiring_soon": 0,
+                    "links_count": 0,
+                    "db_size_bytes": 10,
+                    "live": 1,
+                    "expired_pending_gc": 0,
+                    "storage_backend": "postgres",
+                },
+            )
         if path == "/api/v1/forget":
             return httpx.Response(200, json={"deleted": 1})
         raise AssertionError(path)
+
     return handler
 
 
 def test_v1_wire_contract_sync() -> None:
     seen: list[httpx.Request] = []
     client = AiMemoryClient(base_url=TEST_BASE_URL)
-    client._client = httpx.Client(base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen)))
+    client._client = httpx.Client(
+        base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen))
+    )
     assert client.search("zebra")[0].id == "mem-3331"
     assert client.get("mem-3331").title == "wire fixture"
     client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"})
@@ -455,7 +489,9 @@ def test_v1_wire_contract_sync() -> None:
     notify = next(r for r in seen if r.url.path.endswith("notify"))
     forget = next(r for r in seen if r.url.path.endswith("forget"))
     assert json.loads(notify.read()) == {
-        "target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"
+        "target_agent_id": "ai:target",
+        "title": "hello",
+        "payload": "unit-of-work",
     }
     assert forget.url.query == b""
     assert json.loads(forget.read()) == {"namespace": "global"}
@@ -464,12 +500,17 @@ def test_v1_wire_contract_sync() -> None:
 @pytest.mark.asyncio
 async def test_v1_wire_contract_async() -> None:
     from ai_memory import AsyncAiMemoryClient
+
     seen: list[httpx.Request] = []
     client = AsyncAiMemoryClient(base_url=TEST_BASE_URL)
-    client._client = httpx.AsyncClient(base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen)))
+    client._client = httpx.AsyncClient(
+        base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen))
+    )
     assert (await client.search("zebra"))[0].id == "mem-3331"
     assert (await client.get("mem-3331")).title == "wire fixture"
-    await client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"})
+    await client.notify(
+        {"target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"}
+    )
     assert (await client.stats()).total_memories == 1
     assert await client.forget(namespace="global") == {"deleted": 1}
     forget = next(r for r in seen if r.url.path.endswith("forget"))

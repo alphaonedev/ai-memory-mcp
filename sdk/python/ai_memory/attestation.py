@@ -204,9 +204,7 @@ def canonical_cbor_write(
         ValueError: if ``content_hash`` is not exactly 32 bytes.
     """
     if len(content_hash) != _KEY_LEN:
-        raise ValueError(
-            f"content_hash must be a 32-byte SHA-256 digest, got {len(content_hash)}"
-        )
+        raise ValueError(f"content_hash must be a 32-byte SHA-256 digest, got {len(content_hash)}")
     # RFC 8949 §4.2.1 orders map keys by their ENCODED bytes: shorter keys
     # first, then bytewise. For this fixed key set that is the literal order
     # below ('_' 0x5F sorts before 'k' 0x6B at length 4). Hard-coding the
