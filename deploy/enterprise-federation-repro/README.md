@@ -17,7 +17,7 @@ This README is the operator quick-reference.
 
 ## What it stands up
 
-- **Data tier** — PostgreSQL **18.6** + Apache AGE **1.8.0** + pgvector **0.8.6**
+- **Data tier** — PostgreSQL **18.6** + Apache AGE **1.8.0** + pgvector **0.8.7**
   (the pins are SOURCED from `deploy/docker-1461/provision/lib.sh`; the image is
   built from the canonical `deploy/docker-1461/Dockerfile.pg-age-vector`). TLS
   1.3, **hostssl-only** (cleartext refused pre-auth), **client-cert mTLS** to

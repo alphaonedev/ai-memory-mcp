@@ -6,7 +6,7 @@
 
   The single, GitHub-Pages-sourceable procedure for standing up the EXACT
   environment the v1.0.0 enterprise-federation audit used (Docker PostgreSQL
-  18.6 + Apache AGE 1.8.0 + pgvector 0.8.6, TLS 1.3 hostssl-only + mTLS to the
+  18.6 + Apache AGE 1.8.0 + pgvector 0.8.7, TLS 1.3 hostssl-only + mTLS to the
   store, ai-memory served on the client<->daemon mTLS API under the certified
   posture) and re-running the 3x7 audit scheme.
 
@@ -20,7 +20,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory — Enterprise-Federation Reproduction</title>
-<meta name="description" content="The 100%-reproducible enterprise-federation audit environment: Docker PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 over TLS 1.3 hostssl-only + mTLS, ai-memory served on the client-to-daemon mTLS API under the certified posture, plus the 3x7 audit scheme (7 feature domains x 3 adversarial lenses).">
+<meta name="description" content="The 100%-reproducible enterprise-federation audit environment: Docker PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7 over TLS 1.3 hostssl-only + mTLS, ai-memory served on the client-to-daemon mTLS API under the certified posture, plus the 3x7 audit scheme (7 feature domains x 3 adversarial lenses).">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/compliance/enterprise-federation-repro.html">
 <style>
@@ -104,11 +104,11 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Enterprise-Federation · Audit Reproduction</span>
     <h1>Reproduce the audit environment. Re-run the audit.</h1>
-    <p class="tagline">An audit you cannot reproduce is an anecdote. This page is the single, GitHub-Pages-sourceable procedure for standing up the <strong>exact</strong> substrate the v1.0.0 enterprise-federation audit ran on — a Docker PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 data tier over TLS 1.3 (hostssl-only, cleartext refused) with mutual-TLS to the store, and <code>ai-memory</code> wired into ONLY that tier, served on the client&harr;daemon mTLS API under the certified posture — and re-running the <strong>3&times;7 audit scheme</strong>. Any AI NHI (or human peer reviewer) can operate the substrate exactly as this audit did.</p>
+    <p class="tagline">An audit you cannot reproduce is an anecdote. This page is the single, GitHub-Pages-sourceable procedure for standing up the <strong>exact</strong> substrate the v1.0.0 enterprise-federation audit ran on — a Docker PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7 data tier over TLS 1.3 (hostssl-only, cleartext refused) with mutual-TLS to the store, and <code>ai-memory</code> wired into ONLY that tier, served on the client&harr;daemon mTLS API under the certified posture — and re-running the <strong>3&times;7 audit scheme</strong>. Any AI NHI (or human peer reviewer) can operate the substrate exactly as this audit did.</p>
     <div class="hero-pills">
       <span class="hero-pill good">PostgreSQL 18.6</span>
       <span class="hero-pill good">Apache AGE 1.8.0</span>
-      <span class="hero-pill good">pgvector 0.8.6</span>
+      <span class="hero-pill good">pgvector 0.8.7</span>
       <span class="hero-pill">TLS 1.3 · hostssl-only</span>
       <span class="hero-pill">mTLS store + API</span>
       <span class="hero-pill">Ed25519 audit chain</span>
@@ -137,7 +137,7 @@ deploy/enterprise-federation-repro/verify.sh     <span class="cm"># prove the in
 <section id="provisioning">
   <div class="container">
     <span class="section-eyebrow">1 · Provisioning the data tier</span>
-    <h2>PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.6</h2>
+    <h2>PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.7</h2>
     <p class="lede">The tier image is built from the canonical in-repo Dockerfile. Apache AGE 1.8.0 installs from a <strong>pinned pgdg apt package</strong> (<code>postgresql-18-age=1.8.0~rc0-2.pgdg13+1</code>) overlaid on the <code>apache/age:release_PG18_1.7.0</code> base — NOT a source build; <code>CREATE EXTENSION age</code> then reports extversion 1.8.0. Every version literal lives once, in <code>deploy/docker-1461/provision/lib.sh</code>, and arrives at the build as a <code>--build-arg</code>. <code>repro.sh</code> reads those same pins.</p>
 
     <h3>Image build</h3>
@@ -147,9 +147,9 @@ docker build \
   --build-arg PG_MAJOR=18 \
   --build-arg PG_APT_VERSION=18.6-1.pgdg13+2 \
   --build-arg AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1 \
-  --build-arg PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1 \
+  --build-arg PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1 \
   -f deploy/docker-1461/Dockerfile.pg-age-vector \
-  -t ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.6 \
+  -t ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.7 \
   deploy/docker-1461</pre>
 
     <h3>initdb — extensions only</h3>
@@ -271,7 +271,7 @@ curl --cacert "$RUN/tls/ca.crt" --cert "$RUN/tls/client-good.crt" --key "$RUN/tl
       <thead><tr><th>#</th><th>Invariant</th><th>How it is proven</th></tr></thead>
       <tbody>
         <tr><td>1</td><td class="col-name"><code>SELECT version()</code> = PostgreSQL 18.6</td><td><code>psql</code> over the container's local trust socket.</td></tr>
-        <tr><td>2</td><td class="col-name">age / vector extversion = 1.8.0 / 0.8.6</td><td><code>SELECT extversion FROM pg_extension</code>.</td></tr>
+        <tr><td>2</td><td class="col-name">age / vector extversion = 1.8.0 / 0.8.7</td><td><code>SELECT extversion FROM pg_extension</code>.</td></tr>
         <tr><td>3</td><td class="col-name"><code>SHOW ssl</code> = on</td><td>direct GUC read.</td></tr>
         <tr><td>4</td><td class="col-name">cleartext refused</td><td>a <code>sslmode=disable</code> TCP connection is rejected pre-auth (hostssl healthcheck + host-side probe).</td></tr>
         <tr><td>5</td><td class="col-name">TLS 1.3 negotiated</td><td><code>openssl s_client -starttls postgres</code> reports <code>Protocol: TLSv1.3</code>.</td></tr>
