@@ -168,6 +168,9 @@ def case_a(t):
         passed("R-203: frozen pre-#3546 release.yml trips R1 R2 R3 R5 R6 R7 R8 R9 R11 R12")
 
 
+PRINCIPAL = "operator-fixture"  # the tagger identity and the allowed-signers principal of the throwaway keys
+
+
 def case_b_c(t):
     say("B  tag verification (extracted preflight block)")
     run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(t / "op"), "-C", "op"], check=True)
@@ -176,7 +179,7 @@ def case_b_c(t):
     run(["git", "init", "-q", "--bare", str(remote)], check=True)
     author = t / "author"
     run(["git", "init", "-q", "-b", "main", str(author)], check=True)
-    for key, value in (("user.name", "Operator"), ("user.email", "op@example.test"), ("gpg.format", "ssh"),
+    for key, value in (("user.name", "Operator"), ("user.email", PRINCIPAL), ("gpg.format", "ssh"),
                        ("user.signingkey", str(t / "op.pub")), ("commit.gpgsign", "false"),
                        ("tag.gpgsign", "false")):
         git(author, "config", key, value)
@@ -201,7 +204,7 @@ def case_b_c(t):
         shutil.copy(str(sh), str(trusted / "scripts" / "release" / sh.name))
     pub = (t / "op.pub").read_text(encoding="utf-8").split()
     signers = trusted / "scripts" / "qc-allowlists" / "release-tag-signers.txt"
-    signers.write_text("op@example.test %s %s\n" % (pub[0], pub[1]), encoding="utf-8")
+    signers.write_text("%s %s %s\n" % (PRINCIPAL, pub[0], pub[1]), encoding="utf-8")
 
     verify = extract_run(LIVE_YML, "Verify the tag (annotated, SSH-signed by an enrolled release key)")
     gh_output = t / "gh_output"
