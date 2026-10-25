@@ -35,10 +35,54 @@ use predicates::prelude::*;
 
 mod common;
 use common::free_port;
+// Shared `AI_MEMORY_TEST_TIMING_BUDGET_MULT` parse (`mcp_wait::budget_mult_from`,
+// `1..=100`, default 1), the same knob `tests/transit_encryption_3705.rs` scales
+// its boot budget with (#7345). Not a path attribute inside tests/common (#6569).
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
 use rusqlite::params;
 use tempfile::TempDir;
 
+/// Floor of the serve-readiness bound; [`spawn_budget`] scales it (#5010).
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Ceiling of the scaled readiness bound (#5010): `min(SPAWN_TIMEOUT * mult,
+/// 120 s)`, so mult 1 gives 15 s, mult 2 gives 30 s and mult 8 or more is
+/// capped at 120 s.
+const SPAWN_TIMEOUT_CEILING: Duration = Duration::from_secs(120);
+
+/// The readiness bound of one spawn, computed once per spawn (never per
+/// poll) and reported in the failure so a near-miss reads differently from
+/// a daemon that never bound a socket.
+#[derive(Clone, Copy, Debug)]
+struct SpawnBudget {
+    floor: Duration,
+    mult: u64,
+    budget: Duration,
+}
+
+/// Scale `floor` by the raw `AI_MEMORY_TEST_TIMING_BUDGET_MULT` value
+/// (`mcp_wait::budget_mult_from`, the #7345 shape) and clamp to
+/// [`SPAWN_TIMEOUT_CEILING`]. The value is a parameter so tests never mutate
+/// the process environment shared with parallel tests.
+fn spawn_budget_from(floor: Duration, raw_mult: Option<&str>) -> SpawnBudget {
+    let mult = mcp_wait::budget_mult_from(raw_mult);
+    // The clamp is `1..=100`, so the conversion never falls back.
+    let budget = floor
+        .saturating_mul(u32::try_from(mult).unwrap_or(1))
+        .min(SPAWN_TIMEOUT_CEILING);
+    SpawnBudget {
+        floor,
+        mult,
+        budget,
+    }
+}
+
+/// [`spawn_budget_from`] with the one production read of the environment.
+fn spawn_budget() -> SpawnBudget {
+    let raw = std::env::var(mcp_wait::ENV_TEST_TIMING_BUDGET_MULT).ok();
+    spawn_budget_from(SPAWN_TIMEOUT, raw.as_deref())
+}
 
 /// Number of times [`spawn_serve`] re-rolls the ephemeral port when the
 /// daemon child loses the `free_port()` TOCTOU race and exits with a bind
@@ -59,8 +103,17 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Per-request timeout for the readiness `/health` probe.
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The `NeverReady` panic headline: bound, measured elapsed, floor and mult.
+fn never_ready_message(elapsed: Duration, budget: SpawnBudget) -> String {
+    format!(
+        "serve daemon did not become ready within {:?} (elapsed {elapsed:?}, floor {:?}, mult {})",
+        budget.budget, budget.floor, budget.mult
+    )
+}
+
 /// Why a single [`try_spawn_serve_once`] attempt failed. `BindRace` is the
 /// only retryable variant; the others surface the child's stderr.
+#[derive(Debug)]
 enum SpawnFailure {
     /// Child exited before readiness and its stderr names an in-use port —
     /// it lost the `free_port()` TOCTOU race. Safe to retry on a new port.
@@ -71,9 +124,13 @@ enum SpawnFailure {
         status: std::process::ExitStatus,
         stderr: String,
     },
-    /// Child stayed up but `/health` never returned 200 within
-    /// [`SPAWN_TIMEOUT`].
-    NeverReady { stderr: String },
+    /// Child stayed up but `/health` never returned 200 within the scaled
+    /// [`SpawnBudget`]; carries the measured elapsed time and the bound.
+    NeverReady {
+        stderr: String,
+        elapsed: Duration,
+        budget: SpawnBudget,
+    },
 }
 
 /// Build the standard `ai-memory --db <tmp>` command shape with
@@ -432,10 +489,14 @@ fn spawn_serve(db: &Path) -> ServeChild {
                      --- child stderr ---\n{stderr}"
                 );
             }
-            Err(SpawnFailure::NeverReady { stderr }) => {
+            Err(SpawnFailure::NeverReady {
+                stderr,
+                elapsed,
+                budget,
+            }) => {
                 panic!(
-                    "serve daemon did not become ready within {SPAWN_TIMEOUT:?}\n\
-                     --- child stderr ---\n{stderr}"
+                    "{}\n--- child stderr ---\n{stderr}",
+                    never_ready_message(elapsed, budget)
                 );
             }
         }
@@ -450,6 +511,17 @@ fn spawn_serve(db: &Path) -> ServeChild {
 /// child's stderr so the outcome can distinguish a retryable port race
 /// from a genuine startup crash (and so panics carry real diagnostics).
 fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
+    try_spawn_serve_with(db, spawn_budget(), None)
+}
+
+/// [`try_spawn_serve_once`] with an explicit `budget`; `probe_port` points
+/// the readiness probe somewhere else (the #5010 planted never-ready case:
+/// a live daemon whose probe never succeeds).
+fn try_spawn_serve_with(
+    db: &Path,
+    budget: SpawnBudget,
+    probe_port: Option<u16>,
+) -> Result<ServeChild, SpawnFailure> {
     let port = free_port();
     let port_s = port.to_string();
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"));
@@ -509,8 +581,12 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
     };
 
     let client = tls.client_with_timeout(READINESS_PROBE_TIMEOUT);
-    let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
+    let url = format!(
+        "{}/api/v1/health",
+        common::tls::TestTls::base_url(probe_port.unwrap_or(port))
+    );
+    let started = Instant::now();
+    let deadline = started + budget.budget;
     while Instant::now() < deadline {
         if let Ok(resp) = client.get(&url).send()
             && resp.status().is_success()
@@ -535,5 +611,63 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
     let _ = child.wait();
     Err(SpawnFailure::NeverReady {
         stderr: drain_stderr(),
+        elapsed: started.elapsed(),
+        budget,
     })
+}
+
+/// #5010 — the readiness bound is `min(floor * mult, 120 s)` with the mult
+/// parsed like the rest of the suite (`1..=100`, default 1).
+#[test]
+fn spawn_budget_scales_floor_by_the_timing_multiplier_5010() {
+    let floor = SPAWN_TIMEOUT;
+    assert_eq!(
+        spawn_budget_from(floor, None).budget,
+        Duration::from_secs(15)
+    );
+    assert_eq!(spawn_budget_from(floor, Some("garbage")).mult, 1);
+    let two = spawn_budget_from(floor, Some("2"));
+    assert_eq!((two.mult, two.budget), (2, Duration::from_secs(30)));
+    assert_eq!(
+        never_ready_message(Duration::from_millis(29_900), two),
+        "serve daemon did not become ready within 30s (elapsed 29.9s, floor 15s, mult 2)"
+    );
+    assert_eq!(
+        spawn_budget_from(floor, Some("100")).budget,
+        SPAWN_TIMEOUT_CEILING,
+        "the 120 s ceiling caps a large multiplier"
+    );
+}
+
+/// #5010 planted never-ready case: a LIVE daemon whose readiness probe is
+/// pointed at a port nothing listens on, so the margin cannot make it green.
+/// It must still fail as `NeverReady`, with `elapsed` close to the scaled
+/// bound (floor 2 s x mult 2 = 4 s here) and both reported.
+#[test]
+fn planted_never_ready_still_fails_with_elapsed_near_scaled_bound_5010() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    let budget = spawn_budget_from(Duration::from_secs(2), Some("2"));
+    assert_eq!(budget.budget, Duration::from_secs(4));
+    let dead_port = free_port();
+    match try_spawn_serve_with(&db, budget, Some(dead_port)) {
+        Err(SpawnFailure::NeverReady {
+            elapsed, budget: b, ..
+        }) => {
+            eprintln!("planted: {}", never_ready_message(elapsed, b));
+            assert!(
+                elapsed >= b.budget,
+                "elapsed {elapsed:?} < bound {:?}",
+                b.budget
+            );
+            assert!(
+                elapsed < b.budget + Duration::from_secs(5),
+                "elapsed {elapsed:?} is not close to the bound {:?}",
+                b.budget
+            );
+            assert_eq!((b.floor, b.mult), (Duration::from_secs(2), 2));
+        }
+        Err(other) => panic!("expected NeverReady, got {other:?}"),
+        Ok(_) => panic!("planted never-ready daemon reported ready"),
+    }
 }
