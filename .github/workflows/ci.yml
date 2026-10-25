@@ -206,8 +206,8 @@ jobs:
       # very PR adds them) or unreadable, the `fallback` step selects the full
       # matrix and the reason lands in the step summary.
       # decision: the trust decision runs before any checkout file executes and
-      # the resolver is demoted to a post-derivation report over keeping the
-      # resolver step first because any PR-tree step that runs earlier in the
+      # this step derives the base inline and no resolver script runs over
+      # keeping a resolver step first because any PR-tree step that runs earlier in the
       # job can rewrite the git state and PATH the derivation reads.
       # Only the pinned checkout action and the echo-only Selection mode step run before this step;
       # the base is derived from
@@ -2788,8 +2788,8 @@ jobs:
       # the gate must fail closed. Any other failure to read a base file
       # (fetch failure, timeout, invalid sha) fails this job.
       # decision: the trust decision runs before any checkout file executes and
-      # the resolver is demoted to a post-derivation report over keeping the
-      # resolver step first because any PR-tree step that runs earlier in the
+      # this step derives the base inline and no resolver script runs over
+      # keeping a resolver step first because any PR-tree step that runs earlier in the
       # job can rewrite the git state and PATH the derivation reads.
       # Only the pinned checkout action runs before this step;
       # the base is derived from

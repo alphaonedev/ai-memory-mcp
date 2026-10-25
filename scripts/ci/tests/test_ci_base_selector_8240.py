@@ -13,7 +13,9 @@ build_index.py and select.py from that copy against the PR tree's diff.
 These tests pull the inline python out of ci.yml, run it against fixture
 repositories, then run the materialised selector. No network, no cargo.
 """
+import ast
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -65,6 +67,322 @@ BRANCH_TIP_STEP = "Fold job results (branch tip gate)"
 FAIL_STEP = "Fail the gate (base gate unreadable)"
 GATE_SCRIPT = IMPACT_REL + "/gate.py"
 FAKE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+# Strict reader of the workflow document (r7 F1). The repo's workflow helpers are line
+# readers and no sibling test imports PyYAML, so this stdlib-only reader parses the block
+# YAML ci.yml uses and RAISES on anything else (anchors, tags, multi-line scalars, tabs,
+# duplicate keys): a construct it cannot read is a failure, never a skipped line.
+class YamlSubsetError(Exception):
+    """The document uses YAML this loader does not read; every caller fails closed on it."""
+
+
+_ESCAPES = {"n": "\n", "t": "\t", "\\": "\\", '"': '"', "/": "/", "0": "\0", "r": "\r", " ": " "}
+_INDICATORS = "&*!%@`"
+_MAP_ENTRY_RE = re.compile(r":(?: |$)")
+_BLOCK_MODS_RE = re.compile(r"^(?:[+-]?[1-9]?|[1-9][+-])$")
+
+
+def _unquote(text, pos):
+    """Read the quoted scalar that starts at text[pos]; return (value, index after it)."""
+    quote, out, i = text[pos], [], pos + 1
+    while i < len(text):
+        ch = text[i]
+        if quote == "'" and ch == "'":
+            if text[i + 1:i + 2] == "'":
+                out.append("'")
+                i += 2
+                continue
+            return "".join(out), i + 1
+        if quote == '"' and ch == '"':
+            return "".join(out), i + 1
+        if quote == '"' and ch == "\\":
+            if text[i + 1:i + 2] not in _ESCAPES:
+                raise YamlSubsetError("unsupported escape in a double-quoted scalar")
+            out.append(_ESCAPES[text[i + 1]])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    raise YamlSubsetError("unterminated or multi-line quoted scalar")
+
+
+def _strip_comment(line):
+    """Drop a trailing ` # comment` that is outside quotes."""
+    quote, i = None, 0
+    while i < len(line):
+        ch = line[i]
+        if quote == "'":
+            if ch == "'":
+                if line[i + 1:i + 2] == "'":
+                    i += 1
+                else:
+                    quote = None
+        elif quote == '"':
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                quote = None
+        elif ch in "'\"" and (i == 0 or line[i - 1] in " \t[{,:"):
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i].rstrip()
+        i += 1
+    return line.rstrip()
+
+
+def _parse_flow(text):
+    """Parse one single-line flow collection (`[a, b]`, `{k: v}`) or fail closed."""
+    size = len(text)
+
+    def ws(pos):
+        while pos < size and text[pos] in " \t":
+            pos += 1
+        return pos
+
+    def scalar(pos, is_key):
+        pos = ws(pos)
+        if pos >= size:
+            raise YamlSubsetError("flow collection ends early")
+        if text[pos] in "'\"":
+            return _unquote(text, pos)
+        if text[pos] in _INDICATORS + "|>":
+            raise YamlSubsetError("flow scalar uses an anchor, alias, tag or block indicator")
+        start = pos
+        while pos < size and text[pos] not in ",]}[{":
+            if is_key and text[pos] == ":" and (pos + 1 >= size or text[pos + 1] in " ,]}"):
+                break
+            pos += 1
+        return text[start:pos].strip(), pos
+
+    def node(pos):
+        pos = ws(pos)
+        if pos >= size:
+            raise YamlSubsetError("flow collection ends early")
+        if text[pos] == "[":
+            items, pos = [], pos + 1
+            while True:
+                pos = ws(pos)
+                if pos < size and text[pos] == "]":
+                    return items, pos + 1
+                value, pos = node(pos)
+                items.append(value)
+                pos = ws(pos)
+                if pos < size and text[pos] == ",":
+                    pos += 1
+                elif not (pos < size and text[pos] == "]"):
+                    raise YamlSubsetError("flow sequence is not closed")
+        if text[pos] == "{":
+            result, pos = {}, pos + 1
+            while True:
+                pos = ws(pos)
+                if pos < size and text[pos] == "}":
+                    return result, pos + 1
+                key, pos = scalar(pos, True)
+                pos = ws(pos)
+                value = ""
+                if pos < size and text[pos] == ":":
+                    pos = ws(pos + 1)
+                    if pos < size and text[pos] not in ",}":
+                        value, pos = node(pos)
+                if not key or key in result:
+                    raise YamlSubsetError("empty or duplicate flow key")
+                result[key] = value
+                pos = ws(pos)
+                if pos < size and text[pos] == ",":
+                    pos += 1
+                elif not (pos < size and text[pos] == "}"):
+                    raise YamlSubsetError("flow mapping is not closed")
+        return scalar(pos, False)
+
+    value, end = node(0)
+    if ws(end) != size:
+        raise YamlSubsetError("text after a flow collection")
+    return value
+
+
+class _SubsetLoader:
+    """Block YAML as ci.yml writes it: mappings, sequences, scalars, flow collections and
+    `|` / `>` block scalars. Scalars stay strings. Anchors, aliases, tags, merge keys,
+    multi-line plain, quoted or flow scalars, tabs, directives and extra documents raise."""
+
+    def __init__(self, text):
+        self.lines = text.split("\n")
+        self.i = 0
+
+    def peek(self):
+        while self.i < len(self.lines):
+            raw = self.lines[self.i].rstrip("\r")
+            body = raw.lstrip(" ")
+            if raw[:len(raw) - len(body)].count("\t") or body[:1] == "\t":
+                raise YamlSubsetError("tab in indentation, line %d" % (self.i + 1))
+            if not body.strip() or body.startswith("#"):
+                self.i += 1
+                continue
+            content = _strip_comment(body)
+            if content in ("---", "...") or content.startswith(("--- ", "%")):
+                raise YamlSubsetError("directive or document marker, line %d" % (self.i + 1))
+            return len(raw) - len(body), content
+        return None
+
+    @staticmethod
+    def is_item(content):
+        return content == "-" or content.startswith("- ")
+
+    def parse_block(self, indent):
+        content = self.peek()[1]
+        return self.parse_seq(indent) if self.is_item(content) else self.parse_map(indent)
+
+    def split_entry(self, content):
+        if content[0] in "'\"":
+            key, end = _unquote(content, 0)
+            tail = content[end:].lstrip(" ")
+            if not tail.startswith(":") or (len(tail) > 1 and tail[1] != " "):
+                raise YamlSubsetError("quoted scalar is not a mapping key")
+            return key, tail[1:].strip()
+        if content[0] in "[{?|>" + _INDICATORS:
+            raise YamlSubsetError("unsupported mapping key")
+        found = _MAP_ENTRY_RE.search(content)
+        if found is None or not content[:found.start()].strip():
+            raise YamlSubsetError("not a mapping entry (multi-line plain scalar?)")
+        return content[:found.start()].rstrip(), content[found.end():].strip()
+
+    def inline(self, rest):
+        if rest[0] in "[{":
+            return _parse_flow(rest)
+        if rest[0] in "'\"":
+            value, end = _unquote(rest, 0)
+            if rest[end:].strip():
+                raise YamlSubsetError("text after a quoted scalar")
+            return value
+        if rest[0] in _INDICATORS or rest.startswith("<<"):
+            raise YamlSubsetError("anchor, alias, tag or merge key")
+        if _MAP_ENTRY_RE.search(rest):
+            raise YamlSubsetError("a plain scalar holding `: `")
+        return rest
+
+    def parse_map(self, indent):
+        result = {}
+        while True:
+            peeked = self.peek()
+            if peeked is None or peeked[0] < indent:
+                return result
+            if peeked[0] > indent:
+                raise YamlSubsetError("unexpected indent, line %d" % (self.i + 1))
+            if self.is_item(peeked[1]):
+                return result
+            key, rest = self.split_entry(peeked[1])
+            if key in result or key == "<<":
+                raise YamlSubsetError("duplicate or merge key %r" % key)
+            self.i += 1
+            if rest == "":
+                nxt = self.peek()
+                if nxt is not None and nxt[0] > indent:
+                    value = self.parse_block(nxt[0])
+                elif nxt is not None and nxt[0] == indent and self.is_item(nxt[1]):
+                    value = self.parse_seq(indent)
+                else:
+                    value = ""
+            elif rest[0] in "|>":
+                value = self.block_scalar(rest, indent)
+            else:
+                value = self.inline(rest)
+            result[key] = value
+
+    def parse_seq(self, indent):
+        items = []
+        while True:
+            peeked = self.peek()
+            if peeked is None or peeked[0] != indent or not self.is_item(peeked[1]):
+                if peeked is not None and peeked[0] > indent:
+                    raise YamlSubsetError("unexpected indent, line %d" % (self.i + 1))
+                return items
+            after = peeked[1][1:]
+            rest = after.lstrip(" ")
+            if rest == "":
+                self.i += 1
+                nxt = self.peek()
+                items.append(self.parse_block(nxt[0]) if nxt is not None and nxt[0] > indent
+                             else "")
+                continue
+            col = indent + 1 + len(after) - len(rest)
+            self.lines[self.i] = " " * col + rest
+            if self.is_item(rest):
+                items.append(self.parse_seq(col))
+                continue
+            try:
+                self.split_entry(rest)
+                is_entry = True
+            except YamlSubsetError:
+                is_entry = False
+            if is_entry:
+                items.append(self.parse_map(col))
+            else:
+                self.i += 1
+                items.append(self.inline(rest))
+
+    def block_scalar(self, header, key_indent):
+        style, mods = header[0], header[1:]
+        if not _BLOCK_MODS_RE.match(mods):
+            raise YamlSubsetError("unsupported block scalar header %r" % header)
+        digits = [c for c in mods if c.isdigit()]
+        content_indent = key_indent + int(digits[0]) if digits else None
+        lines = []
+        while self.i < len(self.lines):
+            raw = self.lines[self.i].rstrip("\r")
+            if not raw.strip():
+                lines.append("")
+                self.i += 1
+                continue
+            indent = len(raw) - len(raw.lstrip(" "))
+            if content_indent is None:
+                if indent <= key_indent:
+                    break
+                content_indent = indent
+            if indent < content_indent:
+                break
+            lines.append(raw[content_indent:])
+            self.i += 1
+        trailing = 0
+        while lines and lines[-1] == "":
+            lines.pop()
+            trailing += 1
+        if style == ">":
+            folded = ""
+            for number, line in enumerate(lines):
+                if number and line and lines[number - 1] and not line.startswith(" ") \
+                        and not lines[number - 1].startswith(" "):
+                    folded += " "
+                elif number:
+                    folded += "\n"
+                folded += line
+            text = folded
+        else:
+            text = "\n".join(lines)
+        if not lines:
+            return ""
+        if "-" in mods:
+            return text
+        return text + "\n" + ("\n" * trailing if "+" in mods else "")
+
+    def load(self):
+        peeked = self.peek()
+        if peeked is None:
+            return {}
+        if peeked[0] != 0:
+            raise YamlSubsetError("document does not start at column 0")
+        value = self.parse_block(0)
+        if self.peek() is not None:
+            raise YamlSubsetError("unparsed text, line %d" % (self.i + 1))
+        return value
+
+
+def yaml_subset_load(text):
+    """Load `text` with the fail-closed subset reader; raises YamlSubsetError."""
+    try:
+        return _SubsetLoader(text).load()
+    except (IndexError, RecursionError) as exc:
+        raise YamlSubsetError("malformed document: %s" % type(exc).__name__)
 
 
 def derived_env(base, head):
@@ -720,6 +1038,205 @@ class LiveBase(BaseCase):
                 self.assertEqual(out["sha"], "")
 
 
+# F1-F3 (r7): the allow-list reads the PARSED workflow document and the EFFECTIVE
+# environment of each pre-trust step, and pins the Materialise run text by content.
+# decision: a YAML-parsed effective-environment allow-list and a content hash on the
+# Materialise block over a line-oriented text scan because the runner evaluates the
+# parsed document and inherited env, so a scanner that sees less than the runner fails open
+CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+ECHO_RUN = 'echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"'
+INDEX_RUN = ('python3 -I "$RUNNER_TEMP/impact-base/impact/build_index.py"'
+             ' --repo . --db "$RUNNER_TEMP/impact.db"')
+BASE_FOLD_RUN = ('python3 -I "$RUNNER_TEMP/impact-base/impact/gate.py"'
+                 ' --needs "$NEEDS_JSON" \\\n  --github-ref "$GITHUB_REF_NAME_FULL"\n')
+FORBIDDEN_ENV_RE = re.compile(
+    r"^(BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PATH|LD_PRELOAD|LD_LIBRARY_PATH|GIT_.*|PYTHON.*"
+    r"|NODE_OPTIONS|RUNNER_TEMP|GITHUB_(PATH|ENV|OUTPUT))$")
+HEREDOC = object()
+MATERIALISE_ENV = {"CONTEXT_SHA", "EVENT_NAME", "HEAD_SHA", "MERGE_GROUP_BASE_SHA", "IMPACT_FILES"}
+# (name, exact top-level keys, exact env keys, exact `with:` mapping, exact run text)
+SELECT_ALLOW = (
+    (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
+    ("Selection mode", {"name", "id", "env", "run"}, {"ENFORCE"}, None, ECHO_RUN),
+    (MATERIALISE_STEP, {"name", "id", "env", "run"}, MATERIALISE_ENV, None, HEREDOC),
+    ("Build impact index", {"name", "if", "continue-on-error", "run"}, set(), None, INDEX_RUN),
+)
+GATE_ALLOW = (
+    (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
+    (GATE_MATERIALISE_STEP, {"name", "id", "if", "env", "run"}, MATERIALISE_ENV, None, HEREDOC),
+    (BASE_GATE_STEP, {"name", "if", "env", "run"}, {"NEEDS_JSON", "GITHUB_REF_NAME_FULL"},
+     None, BASE_FOLD_RUN),
+)
+# job -> (allow-list, first step that may execute checkout content)
+WINDOWS = {SELECT_JOB: (SELECT_ALLOW, "Select jobs"),
+           GATE_JOB: (GATE_ALLOW, BOOTSTRAP_STEP)}
+# The whole effective environment a pre-trust step may inherit: workflow env + job env + step env.
+WORKFLOW_ENV_ALLOW = {"CARGO_TERM_COLOR", "SELF_HOSTED_TARGET_CAP_BYTES", "CARGO_INCREMENTAL"}
+JOB_ENV_ALLOW = {SELECT_JOB: {"RUSTUP_TOOLCHAIN"}, GATE_JOB: set()}
+JOB_KEYS_REFUSED = ("container", "services")
+STEP_KEYS_REFUSED = ("shell", "working-directory")
+# sha256 of the normalised `run:` text of each Materialise step (see run_digest).
+MATERIALISE_SHA256 = {
+    MATERIALISE_STEP: "7c5fbf963de63f69b8715375a039868e33060d839649eb6029d7689e8f946995",
+    GATE_MATERIALISE_STEP: "7c5fbf963de63f69b8715375a039868e33060d839649eb6029d7689e8f946995",
+}
+# The only names a Materialise body may spell as a path: git tree paths and the .git state
+# files it REFUSES. Anything else that names a file under the checkout is red.
+MATERIALISE_PATH_WORDS = {"scripts/ci/impact/", "scripts/ci/impact/gate.py", "refs/replace/",
+                          "info/grafts", "objects/info/alternates",
+                          "gate.py"}  # "gate.py" is joined onto the impact git tree prefix
+MATERIALISE_IMPORTS = {"os", "re", "shutil", "subprocess", "sys", "pathlib"}
+MATERIALISE_REFUSED_ATTRS = {"system", "popen", "Popen", "execv", "execve", "execl", "execlp",
+                             "execvp", "execvpe", "spawnv", "spawnl", "load_module", "run_path",
+                             "run_module", "startfile", "import_module"}
+MATERIALISE_REFUSED_NAMES = MATERIALISE_REFUSED_ATTRS | {"exec", "eval", "compile", "__import__",
+                                                         "runpy", "importlib"}
+PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
+
+
+def normalise_run(text):
+    """CRLF to LF, trailing blanks off every line, exactly one final newline."""
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def run_digest(text):
+    return hashlib.sha256(normalise_run(text).encode("utf-8")).hexdigest()
+
+
+def materialise_problems(label, run):
+    """Reasons a Materialise `run:` text is not the pinned one; names the label and both
+    hashes, never the block."""
+    problems = []
+    got = run_digest(run or "")
+    if got != MATERIALISE_SHA256[label]:
+        problems.append("%s: run text sha256 %s, expected %s"
+                        % (label, got, MATERIALISE_SHA256[label]))
+    found = HEREDOC_RE.match(normalise_run(run or ""))
+    if found is None:
+        problems.append("%s: run text is not one bare python3 -I heredoc" % label)
+        return problems
+    try:
+        tree = ast.parse(found.group("body"))
+    except SyntaxError:
+        problems.append("%s: heredoc body is not valid python" % label)
+        return problems
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in MATERIALISE_IMPORTS:
+                    problems.append("%s: imports %s" % (label, alias.name))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module not in MATERIALISE_IMPORTS or node.level:
+                problems.append("%s: imports from %s" % (label, node.module))
+        elif isinstance(node, ast.Name) and node.id in MATERIALISE_REFUSED_NAMES:
+            problems.append("%s: names %s" % (label, node.id))
+        elif isinstance(node, ast.Attribute) and node.attr in MATERIALISE_REFUSED_ATTRS:
+            problems.append("%s: names .%s" % (label, node.attr))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for word in node.value.split():
+                if PATH_LIKE_RE.search(word) and word not in MATERIALISE_PATH_WORDS:
+                    problems.append("%s: names a path outside the allow-list (%d chars)"
+                                    % (label, len(word)))
+    return problems
+
+
+def _mapping(value, where, problems):
+    if isinstance(value, dict):
+        return value
+    problems.append("%s is not a mapping" % where)
+    return {}
+
+
+def _defaults_problems(defaults, where):
+    """Any workflow or job `defaults` is refused: it can set the shell and the cwd."""
+    if defaults is None:
+        return []
+    found = ["%s sets defaults" % where]
+    run = defaults.get("run") if isinstance(defaults, dict) else None
+    if isinstance(run, dict):
+        found.extend("%s sets defaults.run.%s" % (where, key) for key in sorted(run))
+    return found
+
+
+def pre_trust_problems(text):
+    """Every reason the pre-trust steps of either job are off the allow-list; [] when clean.
+
+    Reads the PARSED document (strict subset loader, fails closed) and judges the effective
+    environment of each pre-trust step: workflow env, job env, step env, and the workflow,
+    job and step shell / working-directory.
+    """
+    try:
+        doc = yaml_subset_load(text)
+    except YamlSubsetError as exc:
+        return ["workflow is unreadable by the strict loader: %s" % exc]
+    problems = []
+    doc = _mapping(doc, "workflow", problems)
+    workflow_env = _mapping(doc.get("env", {}), "workflow env", problems)
+    problems.extend(_defaults_problems(doc.get("defaults"), "workflow"))
+    for key in sorted(set(workflow_env) - WORKFLOW_ENV_ALLOW):
+        problems.append("workflow env sets %s" % key)
+    jobs = _mapping(doc.get("jobs"), "jobs", problems)
+    for job in (SELECT_JOB, GATE_JOB):
+        allow, marker = WINDOWS[job]
+        definition = _mapping(jobs.get(job), "job %s" % job, problems)
+        for key in JOB_KEYS_REFUSED:
+            if key in definition:
+                problems.append("job %s sets %s" % (job, key))
+        problems.extend(_defaults_problems(definition.get("defaults"), "job %s" % job))
+        job_env = _mapping(definition.get("env", {}), "job %s env" % job, problems)
+        for key in sorted(set(job_env) - JOB_ENV_ALLOW[job]):
+            problems.append("job %s env sets %s" % (job, key))
+        steps = definition.get("steps")
+        if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+            problems.append("job %s steps are not a list of mappings" % job)
+            continue
+        names = [s.get("name") for s in steps]
+        if marker not in names:
+            problems.append("job %s has no step %r" % (job, marker))
+            continue
+        window = steps[:names.index(marker)]
+        if [s.get("name") for s in window] != [entry[0] for entry in allow]:
+            problems.append("job %s pre-trust steps are %r, expected %r"
+                            % (job, [s.get("name") for s in window], [e[0] for e in allow]))
+            continue
+        for step, (name, keys, env_keys, with_map, run) in zip(window, allow):
+            where = "job %s step %r" % (job, name)
+            if set(step) != keys:
+                problems.append("%s keys %r, expected %r" % (where, sorted(step), sorted(keys)))
+            for key in STEP_KEYS_REFUSED:
+                if key in step:
+                    problems.append("%s sets %s" % (where, key))
+            step_env = _mapping(step.get("env", {}), where + " env", problems)
+            effective = dict(workflow_env)
+            effective.update(job_env)
+            effective.update(step_env)
+            allowed_env = WORKFLOW_ENV_ALLOW | JOB_ENV_ALLOW[job] | env_keys
+            for key in sorted(set(effective) - allowed_env):
+                problems.append("%s inherits env %s" % (where, key))
+            for key in sorted(effective):
+                if FORBIDDEN_ENV_RE.match(key):
+                    problems.append("%s inherits start-up env %s" % (where, key))
+            if set(step_env) != env_keys:
+                problems.append("%s env keys %r, expected %r"
+                                % (where, sorted(step_env), sorted(env_keys)))
+            if name is None:
+                if step.get("uses") != CHECKOUT_ACTION:
+                    problems.append("%s uses %r" % (where, step.get("uses")))
+                if step.get("with") != with_map:
+                    problems.append("%s with %r, expected %r" % (where, step.get("with"), with_map))
+                continue
+            if "uses" in step:
+                problems.append("%s uses an action" % where)
+            if with_map is not None and step.get("with") != with_map:
+                problems.append("%s with differs" % where)
+            if run is HEREDOC:
+                problems.extend(materialise_problems(name, step.get("run")))
+            elif step.get("run") != run:
+                problems.append("%s run text differs from the allow-list" % where)
+    return problems
+
+
 class TrustDecisionFirst(unittest.TestCase):
     """S15: the trust decision runs before any checkout file executes.
 
@@ -739,153 +1256,76 @@ class TrustDecisionFirst(unittest.TestCase):
     CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
     NAMED_EXCEPTIONS = (BOOTSTRAP_STEP, BRANCH_TIP_STEP)
 
-    # F4 / S16: an ALLOW-LIST of the steps that may run before the first step
-    # that executes checkout content after the fold. Anything not listed here
-    # (a `run:`, another `uses:`, a `shell:` or `working-directory:` override,
-    # an `env:` key that alters shell start-up) is red until it is allow-listed.
-    # decision: an allow-list of pre-trust steps and an explicit grafts,
-    # replace, shallow and alternates refusal over a forbid-list and a comment
-    # because every git state the runner can carry into the derivation is
-    # refused by name and any new pre-trust step is red until it is allow-listed
-    CHECKOUT_USES = CHECKOUT + " # v4"
-    ECHO_RUN = 'echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"'
-    INDEX_RUN = ('python3 -I "$RUNNER_TEMP/impact-base/impact/build_index.py"'
-                 ' --repo . --db "$RUNNER_TEMP/impact.db"')
-    BASE_FOLD_RUN = ('python3 -I "$RUNNER_TEMP/impact-base/impact/gate.py"'
-                     ' --needs "$NEEDS_JSON" \\\n  --github-ref "$GITHUB_REF_NAME_FULL"\n')
-    FORBIDDEN_ENV_RE = re.compile(
-        r"^(BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PATH|LD_PRELOAD|LD_LIBRARY_PATH|GIT_.*|PYTHON.*"
-        r"|NODE_OPTIONS|RUNNER_TEMP|GITHUB_(PATH|ENV|OUTPUT))$")
-    HEREDOC = object()
-    # (name, exact top-level keys, exact env keys, exact `with:` mapping, exact run text)
-    SELECT_ALLOW = (
-        (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
-        ("Selection mode", {"name", "id", "env", "run"}, {"ENFORCE"}, None, ECHO_RUN),
-        (MATERIALISE_STEP, {"name", "id", "env", "run"},
-         {"CONTEXT_SHA", "EVENT_NAME", "HEAD_SHA", "MERGE_GROUP_BASE_SHA", "IMPACT_FILES"},
-         None, HEREDOC),
-        ("Build impact index", {"name", "if", "continue-on-error", "run"}, set(), None,
-         INDEX_RUN),
-    )
-    GATE_ALLOW = (
-        (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
-        (GATE_MATERIALISE_STEP, {"name", "id", "if", "env", "run"},
-         {"CONTEXT_SHA", "EVENT_NAME", "HEAD_SHA", "MERGE_GROUP_BASE_SHA", "IMPACT_FILES"},
-         None, HEREDOC),
-        (BASE_GATE_STEP, {"name", "if", "env", "run"}, {"NEEDS_JSON", "GITHUB_REF_NAME_FULL"},
-         None, BASE_FOLD_RUN),
-    )
-    # job -> (allow-list, first step that may execute checkout content)
-    WINDOWS = {SELECT_JOB: (SELECT_ALLOW, "Select jobs"),
-               GATE_JOB: (GATE_ALLOW, BOOTSTRAP_STEP)}
+    # F4 / S16 / F1-F3: the pre-trust window is an ALLOW-LIST judged on the PARSED document
+    # (pre_trust_problems above): a `run:`, another `uses:`, a `shell:` or `working-directory:`
+    # at the step, job or workflow level, and any env key the step inherits beyond the
+    # allow-list is red until it is allow-listed.
+    # decision: a YAML-parsed effective-environment allow-list and a content hash on the
+    # Materialise block over a line-oriented text scan because the runner evaluates the
+    # parsed document and inherited env, so a scanner that sees less than the runner fails open
+    CHECKOUT_USES = CHECKOUT_ACTION
+    GATE_ALLOW = GATE_ALLOW
 
-    RAW_KEY_RE = re.compile(r"^(?: {6}- | {8})([A-Za-z0-9_-]+):[ \t]*(.*)$")
-    RAW_SUB_RE = re.compile(r"^ {10}([A-Za-z0-9_.-]+):[ \t]*(.*)$")
-
-    def raw_steps(self, job):
-        """Every step of `job` with ALL its top-level keys and its env/with mappings."""
-        steps = []
-        in_job = in_steps = False
-        current = None
-        for line in CI_YML.read_text().split("\n"):
-            job_match = workflow_text.JOB_ID_RE.match(line)
-            if job_match:
-                in_job, in_steps = job_match.group(1) == job, False
-                continue
-            if not in_job:
-                continue
-            if line == "    steps:":
-                in_steps = True
-                continue
-            if not in_steps:
-                continue
-            if line.startswith("      - "):
-                steps.append({"keys": {}, "env": {}, "with": {}})
-                current = None
-            elif not steps:
-                continue
-            key = self.RAW_KEY_RE.match(line)
-            if key:
-                current = key.group(1)
-                steps[-1]["keys"][current] = key.group(2).strip()
-                continue
-            sub = self.RAW_SUB_RE.match(line)
-            if sub and current in ("env", "with"):
-                steps[-1][current][sub.group(1)] = sub.group(2).strip()
-        parsed = workflow_text.read_steps(CI_YML, job)
-        self.assertEqual(len(parsed), len(steps), job)
-        for raw, step in zip(steps, parsed):
-            raw["name"], raw["run"] = step["name"], step["run"]
-        return steps
+    def parsed_steps(self, job):
+        doc = yaml_subset_load(CI_YML.read_text())
+        return doc["jobs"][job]["steps"]
 
     def window(self, job):
-        steps = self.raw_steps(job)
-        names = [s["name"] for s in steps]
-        return steps[:names.index(self.WINDOWS[job][1])]
-
-    def assert_step_allowed(self, step, entry):
-        name, keys, env_keys, with_map, run = entry
-        self.assertEqual(step["name"], name)
-        self.assertEqual(set(step["keys"]), keys, "step %r keys" % name)
-        self.assertEqual(set(step["env"]), env_keys, "step %r env" % name)
-        for env_key in step["env"]:
-            self.assertIsNone(self.FORBIDDEN_ENV_RE.match(env_key),
-                              "step %r sets %s" % (name, env_key))
-        for banned in ("shell", "working-directory", "submodules", "path", "ref",
-                       "repository", "persist-credentials"):
-            self.assertNotIn(banned, step["keys"])
-            self.assertNotIn(banned, step["with"])
-        if name is None:
-            self.assertEqual(step["keys"]["uses"], self.CHECKOUT_USES)
-            self.assertEqual(step["with"], with_map)
-            self.assertIsNone(step["run"])
-            return
-        self.assertNotIn("uses", step["keys"])
-        if run is self.HEREDOC:
-            self.assertIsNotNone(HEREDOC_RE.match(step["run"] or ""), name)
-        else:
-            self.assertEqual(step["run"], run, name)
+        steps = self.parsed_steps(job)
+        names = [s.get("name") for s in steps]
+        return steps[:names.index(WINDOWS[job][1])]
 
     def test_the_pre_trust_window_is_an_exact_allow_list_of_steps(self):
+        """F1/F2: parsed steps, effective env, workflow and job defaults; [] problems."""
+        self.assertEqual(pre_trust_problems(CI_YML.read_text()), [])
         for job in (SELECT_JOB, GATE_JOB):
-            allow = self.WINDOWS[job][0]
-            steps = self.window(job)
             with self.subTest(job=job):
-                self.assertEqual([s["name"] for s in steps], [a[0] for a in allow])
-            for step, entry in zip(steps, allow):
-                with self.subTest(job=job, step=entry[0]):
-                    self.assert_step_allowed(step, entry)
+                self.assertEqual([s.get("name") for s in self.window(job)],
+                                 [a[0] for a in WINDOWS[job][0]])
 
     def test_the_only_action_before_the_trust_decision_is_the_pinned_checkout(self):
         for job in (SELECT_JOB, GATE_JOB):
-            uses = [s["keys"]["uses"] for s in self.window(job) if "uses" in s["keys"]]
+            uses = [s["uses"] for s in self.window(job) if "uses" in s]
             with self.subTest(job=job):
                 self.assertEqual(uses, [self.CHECKOUT_USES])
 
     def test_no_job_level_override_can_alter_the_shell_or_the_start_up_env(self):
-        """S16: shell, working-directory, defaults and poisoned env anywhere in either job."""
+        """S16/F2: shell, working-directory, defaults and poisoned env at every scope."""
+        doc = yaml_subset_load(CI_YML.read_text())
+        self.assertNotIn("defaults", doc)
+        self.assertEqual(set(doc.get("env", {})), WORKFLOW_ENV_ALLOW)
+        for key in doc["env"]:
+            self.assertIsNone(FORBIDDEN_ENV_RE.match(key), key)
         for job in (SELECT_JOB, GATE_JOB):
-            for step in self.raw_steps(job):
-                with self.subTest(job=job, step=step["name"]):
-                    self.assertNotIn("shell", step["keys"])
-                    self.assertNotIn("working-directory", step["keys"])
-                    for env_key in step["env"]:
-                        self.assertIsNone(self.FORBIDDEN_ENV_RE.match(env_key), env_key)
-            block = []
-            in_job = False
-            for line in CI_YML.read_text().split("\n"):
-                job_match = workflow_text.JOB_ID_RE.match(line)
-                if job_match:
-                    in_job = job_match.group(1) == job
-                    continue
-                if in_job:
-                    block.append(line)
+            definition = doc["jobs"][job]
             with self.subTest(job=job, scope="job"):
-                text = "\n".join(block)
-                self.assertIsNone(re.search(r"^\s*(shell|working-directory|defaults):", text, re.M))
-                for line in text.split("\n"):
-                    if re.match(r"^ {6}[A-Z_]+:", line):
-                        self.assertIsNone(self.FORBIDDEN_ENV_RE.match(line.strip().split(":")[0]))
+                for key in JOB_KEYS_REFUSED + ("defaults",):
+                    self.assertNotIn(key, definition)
+                self.assertEqual(set(definition.get("env", {})), JOB_ENV_ALLOW[job])
+                for key in definition.get("env", {}):
+                    self.assertIsNone(FORBIDDEN_ENV_RE.match(key), key)
+            for step in definition["steps"]:
+                with self.subTest(job=job, step=step.get("name")):
+                    for key in STEP_KEYS_REFUSED:
+                        self.assertNotIn(key, step)
+                    for key in step.get("env", {}):
+                        self.assertIsNone(FORBIDDEN_ENV_RE.match(key), key)
+
+    def test_the_materialise_run_text_is_pinned_by_content(self):
+        """F3: sha256 of the normalised run block; a failure names the label and both hashes."""
+        for job, name in self.JOBS:
+            with self.subTest(job=job):
+                self.assertEqual(materialise_problems(name, step_named(job, name)["run"]), [])
+                self.assertEqual(run_digest(step_named(job, name)["run"]),
+                                 MATERIALISE_SHA256[name])
+
+    def test_the_materialise_body_names_no_checkout_path_and_runs_no_checkout_file(self):
+        """F3: no import beyond the stdlib set, no exec-like name, no path outside the list."""
+        for job, name in self.JOBS:
+            run = step_named(job, name)["run"]
+            with self.subTest(job=job):
+                self.assertEqual([p for p in materialise_problems(name, run)
+                                  if "sha256" not in p], [])
 
     def test_no_step_runs_before_the_fold_on_a_live_event_except_the_decision(self):
         """Every step that runs on pull_request or merge_group ahead of the first fold."""
@@ -896,7 +1336,7 @@ class TrustDecisionFirst(unittest.TestCase):
                                  if (n or "").startswith(("Fold job results", "Fail the gate")))
                 for step in ran[:first_fold]:
                     with self.subTest(event=event, outputs=outputs, step=step["name"]):
-                        allowed = [entry[0] for entry in self.GATE_ALLOW]
+                        allowed = [entry[0] for entry in GATE_ALLOW]
                         self.assertIn(step["name"], allowed)
 
     def test_the_resolver_is_wired_into_no_step_of_either_job(self):
@@ -984,6 +1424,219 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(text.count("every chain push"), 0)
         self.assertEqual(text.count("nightly full run can"), 0)
         self.assertIn("red on every release/** push and workflow_dispatch full run", text)
+
+
+class StrictWorkflowLoader(unittest.TestCase):
+    """r7 F1: the loader reads what the runner reads, or refuses; it never skips a key."""
+
+    def test_quoted_keys_spaced_colons_flow_mappings_and_block_scalars_are_read(self):
+        doc = yaml_subset_load(
+            "a:\n  \"b\" : 1\n  'c': {d: e, 'f' : g}\n  h: |\n    x\n    y\n"
+            "k: [m, n]\nq:\n  - r: s\n    t : u\n  - {v: w}\n  - plain\n")
+        self.assertEqual(doc, {"a": {"b": "1", "c": {"d": "e", "f": "g"}, "h": "x\ny\n"},
+                               "k": ["m", "n"],
+                               "q": [{"r": "s", "t": "u"}, {"v": "w"}, "plain"]})
+
+    def test_constructs_the_loader_cannot_read_are_refused(self):
+        refused = {
+            "anchor": "a: &x 1\n",
+            "alias": "a: *x\n",
+            "tag": "a: !!str 1\n",
+            "tab indent": "a:\n\tb: 1\n",
+            "multi-line plain": "a: b\n  c\n",
+            "document marker": "---\na: 1\n",
+            "duplicate key": "a: 1\na: 2\n",
+            "duplicate quoted key": "a: 1\n\"a\": 2\n",
+            "merge key": "a: 1\n<<: {b: 2}\n",
+            "multi-line quote": "a: \"b\n  c\"\n",
+            "open flow": "a: {b: 1\n",
+            "text after flow": "a: [b] c\n",
+            "plain holding colon": "a: b: c\n",
+            "complex key": "? a\n: b\n",
+            "unexpected indent": "a: 1\n   b: 2\n",
+        }
+        for label, text in refused.items():
+            with self.subTest(label=label):
+                with self.assertRaises(YamlSubsetError):
+                    yaml_subset_load(text)
+
+    def test_the_live_workflow_loads_with_every_step_a_mapping(self):
+        doc = yaml_subset_load(CI_YML.read_text())
+        for job in (SELECT_JOB, GATE_JOB):
+            self.assertTrue(all(isinstance(s, dict) for s in doc["jobs"][job]["steps"]))
+
+    def test_the_loader_agrees_with_the_line_reader_on_the_pinned_steps(self):
+        doc = yaml_subset_load(CI_YML.read_text())
+        for job in (SELECT_JOB, GATE_JOB):
+            parsed = doc["jobs"][job]["steps"]
+            lined = workflow_text.read_steps(CI_YML, job)
+            self.assertEqual(len(parsed), len(lined), job)
+            for left, right in zip(parsed, lined):
+                with self.subTest(job=job, step=right["name"]):
+                    self.assertEqual(left.get("name"), right["name"])
+                    self.assertEqual(left.get("run"), right["run"])
+                    self.assertEqual(left.get("env", {}), right["env"])
+
+
+class TrustWindowMutants(unittest.TestCase):
+    """r7 F1-F3: each mutant of the live ci.yml or of a Materialise run block is red."""
+
+    SELECTION_ID = "      - name: Selection mode\n        id: mode\n"
+    CHECKOUT_WITH = "        with:\n          fetch-depth: 0\n"
+
+    def live(self):
+        return CI_YML.read_text()
+
+    def mutate(self, old, new, text=None, count=1):
+        text = self.live() if text is None else text
+        self.assertEqual(text.count(old), count, old)
+        return text.replace(old, new, 1)
+
+    def assert_red(self, text):
+        problems = pre_trust_problems(text)
+        self.assertTrue(problems)
+        return problems
+
+    def test_the_control_is_green(self):
+        self.assertEqual(pre_trust_problems(self.live()), [])
+
+    # ---- F1: the parsed key set, whatever the YAML spelling
+    def test_F1_quoted_step_shell_key_is_red(self):
+        self.assert_red(self.mutate(self.SELECTION_ID, self.SELECTION_ID + '        "shell": bash\n'))
+        self.assert_red(self.mutate(self.SELECTION_ID, self.SELECTION_ID + "        'shell': bash\n"))
+
+    def test_F1_spaced_colon_step_shell_key_is_red(self):
+        self.assert_red(self.mutate(self.SELECTION_ID, self.SELECTION_ID + "        shell : bash\n"))
+
+    def test_F1_flow_mapped_step_with_a_shell_is_red(self):
+        step = "      - {name: Extra, shell: bash, run: 'true'}\n"
+        self.assert_red(self.mutate(self.SELECTION_ID, step + self.SELECTION_ID))
+
+    def test_F1_flow_mapped_env_with_a_start_up_key_is_red(self):
+        old = (self.SELECTION_ID + "        env:\n"
+               "          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}\n")
+        problems = self.assert_red(self.mutate(
+            old, self.SELECTION_ID + "        env: {ENFORCE: x, BASH_ENV: /x}\n"))
+        self.assertTrue(any("BASH_ENV" in p for p in problems))
+
+    def test_F1_block_scalar_step_shell_key_is_red(self):
+        self.assert_red(self.mutate(self.SELECTION_ID,
+                                    self.SELECTION_ID + "        shell: |\n          bash\n"))
+
+    def test_F1_quoted_and_spaced_env_keys_are_red(self):
+        anchor = (self.SELECTION_ID + "        env:\n"
+                  "          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}\n")
+        for extra in ('          "BASH_ENV": /x\n', "          'BASH_ENV': /x\n",
+                      "          BASH_ENV : /x\n"):
+            with self.subTest(extra=extra):
+                problems = self.assert_red(self.mutate(anchor, anchor + extra))
+                self.assertTrue(any("BASH_ENV" in p for p in problems))
+
+    def test_F1_quoted_submodules_with_key_is_red(self):
+        text = self.mutate(self.CHECKOUT_WITH, self.CHECKOUT_WITH + '          "submodules": true\n',
+                           count=self.live().count(self.CHECKOUT_WITH))
+        self.assert_red(text)
+
+    def test_F1_a_construct_the_loader_cannot_read_is_red_not_skipped(self):
+        problems = self.assert_red(self.mutate(self.SELECTION_ID,
+                                               self.SELECTION_ID + "        shell: &s bash\n"))
+        self.assertIn("unreadable", problems[0])
+
+    # ---- F2: the effective environment, not just the step
+    def test_F2_workflow_level_bash_env_is_red(self):
+        text = self.mutate('\n  CARGO_INCREMENTAL: "0"\n', '\n  CARGO_INCREMENTAL: "0"\n  BASH_ENV: /x\n')
+        self.assertTrue(any("BASH_ENV" in p for p in self.assert_red(text)))
+
+    def test_F2_job_level_bash_env_on_the_select_job_is_red(self):
+        old = "    env:\n      RUSTUP_TOOLCHAIN: stable\n"
+        text = self.mutate(old, old + "      BASH_ENV: /x\n")
+        self.assertTrue(any("BASH_ENV" in p for p in self.assert_red(text)))
+
+    def test_F2_job_level_bash_env_on_the_gate_job_is_red(self):
+        old = "    timeout-minutes: 5\n    steps:\n"
+        text = self.mutate(old, "    timeout-minutes: 5\n    env:\n      BASH_ENV: /x\n    steps:\n")
+        self.assertTrue(any("BASH_ENV" in p for p in self.assert_red(text)))
+
+    def test_F2_workflow_level_defaults_run_shell_is_red(self):
+        text = self.mutate("\njobs:\n", "\ndefaults:\n  run:\n    shell: bash\n\njobs:\n")
+        self.assertTrue(any("defaults.run.shell" in p for p in self.assert_red(text)))
+
+    def test_F2_job_level_defaults_run_working_directory_is_red(self):
+        old = "    timeout-minutes: 5\n    steps:\n"
+        text = self.mutate(old, "    timeout-minutes: 5\n    defaults:\n      run:\n"
+                                "        working-directory: .git\n    steps:\n")
+        self.assertTrue(any("working-directory" in p for p in self.assert_red(text)))
+
+    def test_F2_job_level_defaults_run_shell_on_the_select_job_is_red(self):
+        old = "    env:\n      RUSTUP_TOOLCHAIN: stable\n"
+        text = self.mutate(old, old.replace("    env:", "    defaults:\n      run:\n"
+                                            "        shell: bash\n    env:"))
+        self.assertTrue(any("defaults.run.shell" in p for p in self.assert_red(text)))
+
+    # ---- S18 (security r7): every setting that applies to a step before the trust check
+    def test_S18_workflow_level_pythonpath_is_red(self):
+        text = self.mutate('\n  CARGO_INCREMENTAL: "0"\n', '\n  CARGO_INCREMENTAL: "0"\n  PYTHONPATH: /x\n')
+        self.assertTrue(any("PYTHONPATH" in p for p in self.assert_red(text)))
+
+    def test_S18_workflow_level_defaults_run_working_directory_is_red(self):
+        text = self.mutate("\njobs:\n", "\ndefaults:\n  run:\n    working-directory: .git\n\njobs:\n")
+        self.assertTrue(any("defaults.run.working-directory" in p for p in self.assert_red(text)))
+
+    def test_S18_job_level_container_is_red_on_both_jobs(self):
+        for old, new in (("    env:\n      RUSTUP_TOOLCHAIN: stable\n",
+                          "    container: ubuntu:latest\n    env:\n      RUSTUP_TOOLCHAIN: stable\n"),
+                         ("    timeout-minutes: 5\n    steps:\n",
+                          "    timeout-minutes: 5\n    container: ubuntu:latest\n    steps:\n")):
+            with self.subTest(old=old):
+                self.assertTrue(any("container" in p for p in self.assert_red(self.mutate(old, new))))
+
+    # ---- F3: the Materialise block is pinned by content
+    def run_of(self, job, name):
+        return step_named(job, name)["run"]
+
+    def test_F3_appended_commands_that_execute_a_checkout_file_are_red(self):
+        appended = ("python3 scripts/ci/base_sha.py", "source .env", ". ./a", "bash ./b", "./c")
+        for job, name in TrustDecisionFirst.JOBS:
+            for line in appended:
+                with self.subTest(job=job, line=line):
+                    problems = materialise_problems(name, self.run_of(job, name) + line + "\n")
+                    self.assertTrue(any("sha256" in p for p in problems))
+                    self.assertTrue(any("heredoc" in p for p in problems))
+
+    def test_F3_a_checkout_path_inside_the_body_is_red_beyond_the_hash(self):
+        for job, name in TrustDecisionFirst.JOBS:
+            run = self.run_of(job, name)
+            for line in ('subprocess.run(["./x"])', 'subprocess.run(["python3", "scripts/x.py"])',
+                         "import runpy", "exec(open('.env').read())"):
+                with self.subTest(job=job, line=line):
+                    problems = materialise_problems(name, run.replace("\nPY\n", "\n" + line + "\nPY\n"))
+                    rest = [p for p in problems if "sha256" not in p]
+                    self.assertTrue(rest, problems)
+
+    def test_F3_one_changed_byte_is_red_and_names_both_hashes_not_the_block(self):
+        for job, name in TrustDecisionFirst.JOBS:
+            run = self.run_of(job, name)
+            changed = run.replace("GIT_TIMEOUT_S = 120", "GIT_TIMEOUT_S = 121")
+            self.assertNotEqual(changed, run)
+            problems = materialise_problems(name, changed)
+            self.assertEqual(len(problems), 1)
+            self.assertIn(name, problems[0])
+            self.assertIn(run_digest(changed), problems[0])
+            self.assertIn(MATERIALISE_SHA256[name], problems[0])
+            self.assertNotIn("GIT_TIMEOUT_S", problems[0])
+
+    def test_F3_a_line_appended_in_ci_yml_after_either_heredoc_is_red(self):
+        text = self.live()
+        marker = "          PY\n"
+        first = text.index(marker)
+        second = text.index(marker, text.index("      - name: Materialise the base gate (#8240)\n"))
+        for index, line in enumerate(("python3 scripts/ci/base_sha.py", "source .env", "./x",
+                                      ". ./a")):
+            position = (first, second)[index % 2]
+            mutated = text[:position + len(marker)] + "          " + line + "\n" \
+                + text[position + len(marker):]
+            with self.subTest(line=line):
+                self.assert_red(mutated)
 
 
 class GitHardening(BaseCase):
