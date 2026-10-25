@@ -1125,7 +1125,8 @@ MATERIALISE_REFUSED_ATTRS = {"system", "popen", "Popen", "execv", "execve", "exe
 MATERIALISE_REFUSED_NAMES = MATERIALISE_REFUSED_ATTRS | {"exec", "eval", "compile", "__import__",
                                                          "runpy", "importlib"}
 PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
-# sec F1 / code C1-C3 (round 12), sec r10 S1-S4 (round 13) and code r10 C1-C4 (round 13): the
+# sec F1 / code C1-C3 (round 12), sec r10 S1-S4 (round 13), code r10 C1-C4 (round 13) and
+# sec r11 S1-S5 (round 14): the
 # second layer is a POSITIVE ALLOW-LIST over the parsed body. With the sha256 pin re-pinned to a
 # mutated body it enforces exactly the rules below and no more.
 # parse model: the heredoc body ends at the first terminator line, and a text with anything after
@@ -1145,18 +1146,27 @@ PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
 # walrus, for, with, comprehension, match or import binding of `args` in that function.
 # dash literals: a string constant starting with a dash must be in MATERIALISE_DASH_ARGS, and every
 # git() argument is a string literal or one of the pinned expressions in
-# MATERIALISE_GIT_VALUE_ARGS.
+# MATERIALISE_GIT_VALUE_ARGS. Enumerated call arguments (sec r11 S2, S5): every call of a local
+# function, of print and of shutil.rmtree takes exactly one of the argument texts listed for it in
+# MATERIALISE_CALL_ARGS (no keyword, no starred, no expression built from literals or calls), and
+# each name in the argument of a git value sink resolves by its binding.
 # names resolved by binding: each name in a pinned git expression, in an open() or Path() argument
 # and the root name of every method call has exactly one binding in its function, and that
 # binding is the enumerated one in MATERIALISE_VALUE_BINDINGS (an unrebound parameter, a single
 # pinned assignment, a single pinned for loop, or only `with open(...)` for handle); IMPACT_PREFIX
 # and SHA_RE have exactly one module-level binding to their constant in
 # MATERIALISE_CONST_BINDINGS. Any other binding is a problem line.
-# environment untouched, read-only environment uses: every name bound from os.environ (a dict
-# copy, an alias, the `env` keyword of subprocess.run, a parameter that receives it) and
-# os.environ itself may only be read through a subscript load, .get, .items, .keys, .values, `in`,
-# a dict() copy or the env keyword; every other reference, store, delete, update, pop, clear or
-# pass-on is a problem line, and the body has no subscript store.
+# environment untouched, read-only environment uses (sec r11 S1): the child environment is the
+# pinned copy, unmodified. The pinned environment construction is the one statement
+# `env = dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')` (MATERIALISE_ENV_CONSTRUCTION) in git(),
+# bound to the one name env; the `env=` keyword of the one subprocess.run is that name; every other
+# dict() call, mapping literal or comprehension, copy, copy of a copy, `env=None`, missing `env=`
+# and any other `env=` value is a problem line. Every other name bound from os.environ (an alias,
+# a parameter that receives it) and os.environ itself may only be read through a subscript load,
+# .get, .items, .keys, .values, `in`, or the one call derive_base(os.environ); every other
+# reference, store, delete, update, pop, clear or pass-on is a problem line, and the body has no
+# subscript store. No decorator and no class keyword (they call without a Call node), no type
+# parameter and no type alias (sec r11 S3, S4), and no parameter default as a value binding.
 # open() takes only the enumerated MATERIALISE_OPEN_ARGS with mode "a", Path() only
 # MATERIALISE_PATH_ARGS, and the `__main__` guard is the last top-level statement and holds
 # exactly `sys.exit(main())`.
@@ -1204,6 +1214,7 @@ MATERIALISE_RUN_ARGV_TAIL = "list(args)"
 # (function, name). "param" is an unrebound parameter, "for-literal" the single loop target over
 # a tuple of string literals, any other string the unparsed value of the single assignment.
 MATERIALISE_VALUE_BINDINGS = {
+    ("derive_base", "context"): "env.get('CONTEXT_SHA', '')",
     ("derive_base", "env"): "param",
     ("fetch_blob", "base"): "param",
     ("fetch_blob", "name"): "param",
@@ -1213,7 +1224,11 @@ MATERIALISE_VALUE_BINDINGS = {
     ("gate_absent", "tree"): "git('ls-tree', base, '--', IMPACT_PREFIX + 'gate.py')",
     ("git_state_refused", "rel"): "for:('info/grafts', 'shallow', 'objects/info/alternates')",
     ("git_state_refused", "res"): "git('rev-parse', '--git-path', rel)",
+    ("git", "env"): "dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')",
     ("have_commit", "base"): "param",
+    ("main", "dest"): "Path(os.environ['RUNNER_TEMP']) / 'impact-base'",
+    ("main", "derived"): ("''", "derive_base(os.environ)"),
+    ("main", "names"): "os.environ.get('IMPACT_FILES', '').split()",
     ("materialise", "base"): "param",
     ("materialise", "dest"): "param",
     ("materialise", "name"): "for:names",
@@ -1228,6 +1243,8 @@ MATERIALISE_VALUE_BINDINGS = {
     ("rev_parse", "spec"): "param",
 }
 # Module-level names: exactly one binding in the whole body, an assignment of this value.
+# code r11 C1: the only names the body binds at module level, each by a plain assignment.
+MATERIALISE_MODULE_STORES = {"SHA_RE", "REGULAR_MODES", "IMPACT_PREFIX", "GIT_TIMEOUT_S"}
 MATERIALISE_CONST_BINDINGS = {"IMPACT_PREFIX": "'scripts/ci/impact/'",
                               "SHA_RE": "re.compile('^[0-9a-f]{40}$')"}
 # Module chains read as a VALUE rather than called: the environment (checked by the read-only rule)
@@ -1235,7 +1252,40 @@ MATERIALISE_CONST_BINDINGS = {"IMPACT_PREFIX": "'scripts/ci/impact/'",
 MATERIALISE_VALUE_CHAINS = {"os.environ", "subprocess.TimeoutExpired"}
 MATERIALISE_ENV_PARAMS = {"env"}  # parameters that receive os.environ (derive_base)
 MATERIALISE_ENV_READS = {"get", "items", "keys", "values"}
-MATERIALISE_ENV_COPIERS = {"dict", "derive_base"}  # callees that may take an environment mapping
+# sec r11 S1: the ONE accepted environment construction (the exact unparsed statement value) and
+# the function that holds it; the one accepted pass-on of os.environ is derive_base(os.environ).
+MATERIALISE_ENV_CONSTRUCTION = "dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')"
+MATERIALISE_ENV_SCOPE = "git"
+MATERIALISE_ENV_NAME = "env"
+MATERIALISE_ENV_PASS_ON = "derive_base(os.environ)"
+# sec r11 S2/S5: the argument texts (unparsed, keywords as k=v) each call may carry, by callee.
+MATERIALISE_CALL_ARGS = {
+    "BaseUnavailable": sorted(["'base-event-unsupported'", "'base-fetch-failed'",
+                               "'base-file-missing:' + name", "'base-file-not-regular:' + name",
+                               "'base-read-failed:' + name", "'base-sha-invalid'",
+                               "'base-sha-mismatch'", "'dest-unsafe'", "'git-failed'",
+                               "'no-files-listed'", "'write-failed'"]),
+    "derive_base": ["os.environ"],
+    "fetch_blob": ["base, name"],
+    "gate_absent": ["derived"],
+    "git_state_refused": [""],
+    "have_commit": ["base"],
+    "main": [""],
+    "materialise": ["derived, dest, names"],
+    "print": sorted(["'impact: derived base %s from github.sha %s' % "
+                     "(derived, os.environ.get('CONTEXT_SHA', ''))",
+                     "'impact: selector files loaded from the base sha'", "line"]),
+    "replace_refs_present": [""],
+    "report": sorted(["False, 'environment-unusable'", "False, str(exc), gate_absent(derived)",
+                      "True, ''"]),
+    "rev_parse": sorted(["'HEAD^{commit}'", "context + '^1^{commit}'", "context + '^2^{commit}'"]),
+    "shutil.rmtree": ["str(dest)", "str(dest), ignore_errors=True"],
+}
+# Callees whose arguments reach git (or delete a tree): each name in an argument must resolve by
+# its binding.
+MATERIALISE_CALL_SINKS = {"fetch_blob", "gate_absent", "have_commit", "materialise", "rev_parse",
+                          "shutil.rmtree"}
+MATERIALISE_CALL_KINDS = {"print": "print call", "shutil.rmtree": "rmtree call"}
 MATERIALISE_OPEN_ARGS = sorted(["os.environ['GITHUB_OUTPUT']", "summary"])
 MATERIALISE_PATH_ARGS = sorted(["os.environ['RUNNER_TEMP']"])
 MATERIALISE_GUARD_TEST = "__name__ == '__main__'"
@@ -1273,6 +1323,8 @@ def _bound_names(tree):
                 found.append(((alias.asname or alias.name).split(".")[0], "import", node))
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             found.extend((name, "store", node) for name in node.names)
+        elif type(node).__name__ in ("TypeVar", "ParamSpec", "TypeVarTuple"):
+            found.append((node.name, "store", node))  # PEP 695 type parameters (3.12+)
         elif type(node).__name__ in ("MatchAs", "MatchStar") and node.name:
             found.append((node.name, "store", node))  # match capture patterns (3.10+)
         elif type(node).__name__ == "MatchMapping" and node.rest:
@@ -1323,7 +1375,21 @@ def _param_ok(scope, name):
         return False
     params = list(ast.walk(scope.args))
     local = _local_bindings(scope, name)
-    return len(local) == 1 and local[0][1] == "arg" and any(local[0][2] is p for p in params)
+    return (len(local) == 1 and local[0][1] == "arg" and any(local[0][2] is p for p in params)
+            and not _has_default(scope, local[0][2]))
+
+
+def _has_default(scope, arg):
+    """True when the parameter carries a default value (a default is a value binding of its own)."""
+    spec = scope.args
+    positional = list(spec.posonlyargs) + list(spec.args)
+    for index, item in enumerate(positional):
+        if item is arg:
+            return index >= len(positional) - len(spec.defaults)
+    for item, default in zip(spec.kwonlyargs, spec.kw_defaults):
+        if item is arg:
+            return default is not None
+    return False
 
 
 def _name_problems(tree, parents, scope, name, seen=()):
@@ -1343,8 +1409,17 @@ def _name_problems(tree, parents, scope, name, seen=()):
     if expected is None:
         return ["%s is not an enumerated value name in its function" % name]
     if expected == "param":
-        return [] if _param_ok(scope, name) else ["%s is not an unrebound parameter" % name]
+        return [] if _param_ok(scope, name) else [
+            "%s is not an unrebound parameter without a default" % name]
     local = _local_bindings(scope, name)
+    if isinstance(expected, tuple):
+        sites = [parents.get(b[2]) for b in local]
+        ok = (len(local) == len(expected) and all(
+            b[1] == "store" and isinstance(s, ast.Assign) and len(s.targets) == 1
+            and s.targets[0] is b[2] for b, s in zip(local, sites))
+            and sorted(ast.unparse(s.value) for s in sites if isinstance(s, ast.Assign))
+            == sorted(expected))
+        return [] if ok else ["%s is not bound only to %s" % (name, " and ".join(expected))]
     if expected == "with-open":
         sites = [parents.get(b[2]) for b in local]
         ok = bool(local) and all(
@@ -1474,8 +1549,15 @@ def _environment_names(tree):
     return names
 
 
-def _env_use_ok(node, parents):
-    """True when the reference is one of the read-only uses of an environment mapping."""
+def _pinned_env_assigns(tree):
+    """Assignment statements whose value is exactly the pinned environment construction."""
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign) and ast.unparse(n.value) == MATERIALISE_ENV_CONSTRUCTION]
+
+
+def _env_use_ok(node, parents, pinned_call=None):
+    """True when the reference is one of the read-only uses of an environment mapping, or the one
+    pinned construction / pass-on."""
     parent = parents.get(node)
     if isinstance(parent, ast.Subscript):
         return parent.value is node and isinstance(parent.ctx, ast.Load)
@@ -1492,33 +1574,122 @@ def _env_use_ok(node, parents):
         return parent.arg == "env" and isinstance(call, ast.Call) \
             and _chain(call.func) == "subprocess.run"
     if isinstance(parent, ast.Call):
-        return node in parent.args and isinstance(parent.func, ast.Name) \
-            and parent.func.id in MATERIALISE_ENV_COPIERS
-    if isinstance(parent, ast.Assign):
-        return parent.value is node  # an alias or copy: the target is itself checked
+        return parent is pinned_call or (
+            ast.unparse(parent) == MATERIALISE_ENV_PASS_ON and parent.args[0] is node)
     return False
 
 
-def _environment_problems(label, tree, parents):
-    """Positive rule: an environment mapping is only read (subscript load, .get/.items/.keys/
-    .values, `in`, a dict() copy, the env keyword); every other reference is a problem line."""
-    names = _environment_names(tree)
+def _pinned_env_problems(label, tree, parents, pinned):
+    """sec r11 S1: exactly one pinned construction bound to the one name in its function, every
+    other mapping-valued expression refused, every env= keyword the pinned name."""
     problems = []
+    scope = _scope_of(pinned[0], parents) if len(pinned) == 1 else None
+    if not (len(pinned) == 1 and len(pinned[0].targets) == 1
+            and isinstance(pinned[0].targets[0], ast.Name)
+            and pinned[0].targets[0].id == MATERIALISE_ENV_NAME
+            and scope is not None and scope.name == MATERIALISE_ENV_SCOPE):
+        problems.append("%s: environment construction is not exactly one %s = %s in %s()"
+                        % (label, MATERIALISE_ENV_NAME, MATERIALISE_ENV_CONSTRUCTION,
+                           MATERIALISE_ENV_SCOPE))
+    pinned_call = pinned[0].value if len(pinned) == 1 else None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "dict" and node is not pinned_call:
+            problems.append("%s: environment mapping built by dict() outside the pinned "
+                            "construction" % label)
+        elif isinstance(node, (ast.Dict, ast.DictComp)):
+            problems.append("%s: environment mapping literal or comprehension outside the pinned "
+                            "construction" % label)
+        elif isinstance(node, ast.keyword) and node.arg == "env":
+            call = parents.get(node)
+            if not (isinstance(call, ast.Call) and _chain(call.func) == "subprocess.run"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == MATERIALISE_ENV_NAME):
+                problems.append("%s: environment keyword is not the pinned name %s on "
+                                "subprocess.run" % (label, MATERIALISE_ENV_NAME))
+        elif isinstance(node, ast.Call) and _chain(node.func) == "subprocess.run":
+            keys = [k for k in node.keywords if k.arg == "env"]
+            scope = _scope_of(node, parents)
+            if len(keys) != 1 or scope is None or scope.name != MATERIALISE_ENV_SCOPE:
+                problems.append("%s: environment of subprocess.run is not the pinned copy (one "
+                                "env= keyword in %s())" % (label, MATERIALISE_ENV_SCOPE))
+            else:
+                problems.extend("%s: environment name %s: %s" % (label, MATERIALISE_ENV_NAME, why)
+                                for why in _name_problems(tree, parents, scope,
+                                                          MATERIALISE_ENV_NAME)[:1])
+    return problems
+
+
+def _environment_problems(label, tree, parents):
+    """Positive rule (sec r11 S1): the child environment is the one pinned construction, bound
+    once and passed unmodified; every other environment mapping is only read (subscript load,
+    .get/.items/.keys/.values, `in`) or passed on as derive_base(os.environ)."""
+    pinned = _pinned_env_assigns(tree)
+    pinned_call = pinned[0].value if len(pinned) == 1 else None
+    names = _environment_names(tree)
+    problems = _pinned_env_problems(label, tree, parents, pinned)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in names:
             if isinstance(node.ctx, ast.Load):
-                ok = _env_use_ok(node, parents)
+                ok = _env_use_ok(node, parents, pinned_call)
             else:
-                parent = parents.get(node)
-                ok = (isinstance(node.ctx, ast.Store) and isinstance(parent, ast.Assign)
-                      and node in parent.targets)
+                ok = (isinstance(node.ctx, ast.Store) and len(pinned) == 1
+                      and parents.get(node) is pinned[0] and node in pinned[0].targets)
             if not ok:
                 problems.append("%s: environment mapping %s used outside the read-only forms"
                                 % (label, node.id))
         elif isinstance(node, ast.Attribute) and _chain(node) == "os.environ":
-            if not _env_use_ok(node, parents):
+            if not _env_use_ok(node, parents, pinned_call):
                 problems.append("%s: environment mapping os.environ used outside the read-only "
                                 "forms" % label)
+    return problems
+
+
+def _definition_problems(label, tree):
+    """sec r11 S3/S4: no decorator, class keyword, class base other than Exception, type
+    parameter or type alias; each of them binds or calls without a Call or Name node the
+    allow-list would see."""
+    problems = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.decorator_list:
+                problems.append("%s: decorator on %s outside the allow-list" % (label, node.name))
+            if getattr(node, "type_params", None):
+                problems.append("%s: type parameters on %s outside the allow-list"
+                                % (label, node.name))
+        if isinstance(node, ast.ClassDef):
+            if node.keywords:
+                problems.append("%s: class keyword on %s outside the allow-list"
+                                % (label, node.name))
+            if [ast.unparse(b) for b in node.bases] != ["Exception"]:
+                problems.append("%s: class base of %s is not exactly Exception"
+                                % (label, node.name))
+        if type(node).__name__ == "TypeAlias":
+            problems.append("%s: type parameter or type alias statement outside the allow-list"
+                            % label)
+    return problems
+
+
+def _call_args_text(node):
+    """The arguments of a call as one text: positional unparsed, keywords as k=v (`**v` for **)."""
+    parts = [ast.unparse(a) for a in node.args]
+    parts += [("%s=%s" % (k.arg, ast.unparse(k.value))) if k.arg else "**" + ast.unparse(k.value)
+              for k in node.keywords]
+    return ", ".join(parts)
+
+
+def _call_arg_problems(label, tree, parents, node, callee):
+    """sec r11 S2/S5: the call takes one of the enumerated argument texts of its callee, and the
+    names in the argument of a git value sink resolve by their binding."""
+    kind = MATERIALISE_CALL_KINDS.get(callee)
+    if _call_args_text(node) not in MATERIALISE_CALL_ARGS[callee]:
+        if kind:
+            return ["%s: %s outside the enumerated arguments" % (label, kind)]
+        return ["%s: call argument is not enumerated for %s" % (label, callee)]
+    problems = []
+    if callee in MATERIALISE_CALL_SINKS:
+        for arg in node.args:
+            problems.extend(_value_name_problems(label, tree, parents, node, arg))
     return problems
 
 
@@ -1581,7 +1752,14 @@ def materialise_allow_list_problems(label, run):
     except SyntaxError:
         return ["%s: heredoc body is not valid python" % label]
     problems = _binding_problems(label, tree)
+    problems.extend(_definition_problems(label, tree))
     parents = _parents(tree)
+    for name, kind, site in _bound_names(tree):
+        if kind == "store" and _scope_of(site, parents) is None \
+                and not (name in MATERIALISE_MODULE_STORES
+                         and isinstance(parents.get(site), ast.Assign)):
+            problems.append("%s: module-level binding of %s outside the pinned module stores"
+                            % (label, name))
     callees = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     receivers = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     except_types = set()
@@ -1626,6 +1804,8 @@ def materialise_allow_list_problems(label, run):
                 problems.append("%s: calls %s outside the allow-list" % (label, chain))
             else:
                 problems.extend(_receiver_problems(label, tree, parents, node))
+            if chain in MATERIALISE_CALL_ARGS:
+                problems.extend(_call_arg_problems(label, tree, parents, node, chain))
             if chain == "subprocess.run":
                 runs += 1
                 problems.extend(_argv_problems(label, node, tree, parents))
@@ -2376,9 +2556,14 @@ class TrustDecisionFirst(unittest.TestCase):
         for job, name in self.JOBS:
             run = step_named(job, name)["run"]
             for label, old, new, needle in rows:
-                mutated = run.replace(old, new, 1)
+                olds = old if isinstance(old, tuple) else (old,)
+                news = new if isinstance(new, tuple) else (new,)
+                mutated = run
+                for one_old, one_new in zip(olds, news):
+                    mutated = mutated.replace(one_old, one_new, 1)
                 with self.subTest(job=job, mutant=label):
-                    self.assertIn(old, run)
+                    for one_old in olds:
+                        self.assertIn(one_old, run)
                     self.assertNotEqual(mutated, run)
                     with unittest.mock.patch.dict(MATERIALISE_SHA256,
                                                   {name: run_digest(mutated)}):
@@ -2390,7 +2575,8 @@ class TrustDecisionFirst(unittest.TestCase):
     def test_sec_r11_every_environment_dash_typeparam_decorator_and_argument_form_is_red(self):
         """sec r11 S1-S5: each probe form, rebuilt as a mutant row, is red from the second layer
         with the pin re-pinned, naming the rule that caught it."""
-        self._check_replace_rows(self.R14_MUTANTS + self.R14_DASH_ROWS)
+        self._check_replace_rows(self.R14_MUTANTS + self.R14_DASH_ROWS
+                                 + self.R14_CODE_ROWS)
 
     def test_sec_r11_the_pinned_construction_and_enumerated_arguments_are_named(self):
         """sec r11 S1/S2/S5: the one environment construction and the enumerated call arguments
@@ -2428,7 +2614,9 @@ class TrustDecisionFirst(unittest.TestCase):
         for phrase in ("code r10 C1-C4 (round 13)", "unrebound parameter",
                        "exactly one binding", "read-only environment uses",
                        "sec r10 S1-S4 (round 13)", "call position", "first terminator line",
-                       "does not check"):
+                       "does not check", "sec r11 S1-S5 (round 14)",
+                       "pinned environment construction", "unmodified",
+                       "Enumerated call arguments", "decorator and no class keyword"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, block)
 
@@ -2548,6 +2736,88 @@ TrustDecisionFirst.R14_DASH_ROWS = tuple(
     + [("s2-%s-at-rev-parse" % tag, TrustDecisionFirst.R14_DERIVED,
         TrustDecisionFirst.R14_DERIVED + "        rev_parse(%s)\n" % form, "argument is not")
        for tag, form in TrustDecisionFirst.R14_DASH_FORMS])
+
+# code r11 C1 (round 14): the reviewer's probe forms, one row each, built as (label, old, new,
+# needle); the needle is empty because any non-sha256 problem line counts as red. A string form is
+# inserted after the module anchor, ("sub", old, new) replaces once, ("sub2", (old, new), ...)
+# replaces each pair once.
+_R11_ANCHOR = "GIT_TIMEOUT_S = 120\n"
+_R11_ENVLINE = 'env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")'
+_R11_ENVKW = "env=env)"
+_R11_ARGV = '["git", "--no-replace-objects"] + list(args)'
+_R11_GITDEF = "def git(*args):"
+_R11_HAVEDEF = "def have_commit(base):"
+_R11_FORMS = (
+    ("c2-ns-rebind-subprocess", "subprocess = types.SimpleNamespace(run=os.system)"),
+    ("c2-tuple-unpack-value", "base, path = 'X', 'Y'"),
+    ("c2-for-target", "for base in 'X':\n    pass"),
+    ("c2-with-as", "with open('X') as base:\n    pass"),
+    ("c2-except-as", "try:\n    pass\nexcept OSError as base:\n    pass"),
+    ("c2-comprehension-var", "_l = [base for base in 'X']"),
+    ("c2-nested-def-param", "def _f():\n    def _g(base):\n        return base\n    return _g"),
+    ("c2-global", "def _f():\n    global base\n    base = 'X'"),
+    ("c2-nonlocal", "def _f():\n    base = 'X'\n    def _g():\n        nonlocal base\n"
+     "        base = 'Y'\n    return _g"),
+    ("c2f-assign-in-fn", ("sub", _R11_HAVEDEF, _R11_HAVEDEF + "\n    base = 'X'")),
+    ("c2f-tuple-unpack-in-fn", ("sub", _R11_HAVEDEF, _R11_HAVEDEF + "\n    base, _ = 'X', 0")),
+    ("c2f-for-target-in-fn", ("sub", _R11_HAVEDEF,
+                              _R11_HAVEDEF + "\n    for base in ['X']:\n        pass")),
+    ("c2f-except-as-in-fn", ("sub", _R11_HAVEDEF, _R11_HAVEDEF
+                             + "\n    try:\n        pass\n    except OSError as base:\n        pass")),
+    ("c2f-with-as-in-fn", ("sub", _R11_HAVEDEF,
+                           _R11_HAVEDEF + "\n    with open('X') as base:\n        pass")),
+    ("c2f-walrus-in-fn", ("sub", _R11_HAVEDEF, _R11_HAVEDEF + "\n    (base := 'X')")),
+    ("c2-default-arg", "def _f(base=subprocess):\n    pass"),
+    ("c2-star-import", "from os import *"),
+    ("c3-alias-store", "env = os.environ\nenv['X'] = 'X'"),
+    ("c3-copy-update-passed", ("sub", _R11_ENVLINE, _R11_ENVLINE + '\n    env.update(X="X")')),
+    ("c3-dict-copy-update", "e = dict(os.environ)\ne.update(X='X')"),
+    ("c3-environ-copy-store", "e = os.environ.copy()\ne['X'] = 'X'"),
+    ("c3-def-env-default", "def _f(env=os.environ):\n    pass"),
+    ("c3-setitem-alias", "m = os.environ.__setitem__"),
+    ("c3-operator-setitem", "operator.setitem(os.environ, 'X', 'X')"),
+    ("c3-class-setitem", "os.environ.__class__.__setitem__(os.environ, 'X', 'X')"),
+    ("c3-vars-os", "vars(os)['environ']"),
+    ("c3-getattr-os", "getattr(os, 'environ')"),
+    ("c4-match-in-def", "def _f():\n    match 1:\n        case 1:\n            pass"),
+    ("c4-match-in-class", "class _C:\n    match 1:\n        case _:\n            pass"),
+    ("c5-call-arg-module", "git(subprocess)"),
+    ("c5-print-os", "print(os)"),
+    ("c5-star-list", "print(*[subprocess])"),
+    ("c5-starstar-dict", "print(**{'m': os})"),
+    ("c5-keyword-module", "print(mod=subprocess)"),
+    ("c5-list-subscript-call", "[subprocess][0].run('X')"),
+    ("c5-tuple-subscript", "(subprocess,)[0]"),
+    ("ga-env-extra-keyword", ("sub", _R11_ENVLINE, _R11_ENVLINE[:-1] + ', X="Y")')),
+    ("ga-env-literal-dict", ("sub", _R11_ENVLINE, 'env = {"GIT_NO_REPLACE_OBJECTS": "1"}')),
+    ("ga-env-dict-without-environ",
+     ("sub", _R11_ENVLINE, 'env = dict(GIT_NO_REPLACE_OBJECTS="1")')),
+    ("ga-env-dict-starstar", ("sub", _R11_ENVLINE, 'env = dict(os.environ, **{"X": "Y"})')),
+    ("ga-env-starstar-guard-kept",
+     ("sub", _R11_ENVLINE, _R11_ENVLINE[:-1] + ', **{"X": "Y"})')),
+    ("ga-env-literal-guard-path",
+     ("sub", _R11_ENVLINE, 'env = {"GIT_NO_REPLACE_OBJECTS": "1", "PATH": os.environ["PATH"], '
+      '"X": "Y"}')),
+    ("ga-env-keyword-inline-dict", ("sub", _R11_ENVKW, 'env=dict(os.environ, X="Y"))')),
+    ("ga-env-keyword-none", ("sub", _R11_ENVKW, "env=None)")),
+    ("gb-second-run-other-fn",
+     'def _f(*more):\n    return subprocess.run(["git", "--no-replace-objects"] + list(more), '
+     'capture_output=True, timeout=GIT_TIMEOUT_S, env=dict(os.environ))'),
+    ("gb-git-extra-param", ("sub2", (_R11_GITDEF, "def git(*args, extra=()):"),
+                            (_R11_ARGV, _R11_ARGV + " + list(extra)"))),
+    ("gb-caller-dash-literal", "have_commit('--X')"),
+)
+
+
+def _r11_row(label, form):
+    if isinstance(form, str):
+        return (label, _R11_ANCHOR, _R11_ANCHOR + form + "\n", "")
+    if form[0] == "sub":
+        return (label, form[1], form[2], "")
+    return (label, tuple(p[0] for p in form[1:]), tuple(p[1] for p in form[1:]), "")
+
+
+TrustDecisionFirst.R14_CODE_ROWS = tuple(_r11_row(label, form) for label, form in _R11_FORMS)
 
 
 class StrictWorkflowLoader(unittest.TestCase):
