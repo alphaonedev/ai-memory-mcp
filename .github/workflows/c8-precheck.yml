@@ -923,7 +923,7 @@ jobs:
         # git repositories, canned check-runs and PATH shims. Every R-203 leg
         # runs the frozen pre-#3546 copy and must see it ACCEPT what the live
         # workflow refuses, so the harness cannot pass vacuously.
-        run: bash scripts/test/test-release-hardening.sh
+        run: python3 -I scripts/test/test_release_hardening.py
 
       - name: Self-test the evidence-bundle gate (#3547)
         # Fixture-only: untracked producer refused, run→binary mismatch,
