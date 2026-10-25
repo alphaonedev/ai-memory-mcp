@@ -124,7 +124,16 @@ def git_environment() -> dict:
 def git_limits() -> None:
     """Bound child address space and each pack/output file; used only in this single-threaded CLI."""
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_GIT_FILE_BYTES, MAX_GIT_FILE_BYTES))
-    resource.setrlimit(resource.RLIMIT_AS, (MAX_GIT_MEMORY_BYTES, MAX_GIT_MEMORY_BYTES))
+    # #7336: never request more than the inherited hard limit (a raise is refused). macOS refuses every finite
+    # RLIMIT_AS with ValueError "current limit exceeds maximum limit", so the memory guard is skipped there only.
+    _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    memory = MAX_GIT_MEMORY_BYTES if hard == resource.RLIM_INFINITY else min(MAX_GIT_MEMORY_BYTES, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+    except ValueError:
+        # ValueError covers EINVAL (macOS refuses every finite RLIMIT_AS) and EPERM (a concurrent hard-limit
+        # lowering, which leaves a tighter limit); any other errno is OSError and propagates.
+        pass
 
 
 def git(repo: Path, *args: str, network: bool = False) -> bytes:
