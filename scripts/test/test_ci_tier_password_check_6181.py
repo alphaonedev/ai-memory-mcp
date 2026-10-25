@@ -690,7 +690,7 @@ def job_layout(text):
         while end > first + 1 and comment_or_blank(lines[end - 1]):
             end -= 1
         if name in names:
-            problems.append(f"job {name} appears twice")
+            problems.append(f"job {ty.name_label(name, [k[0] for k in keys])} appears twice")
         names.add(name)
         jobs.append((name, first, end, "\n".join(lines[first:end])))
     return jobs, problems
@@ -805,17 +805,18 @@ def job_pin_problems(workflow, text, pins=None):
         return problems + [f"{workflow}: no job pin exists for this workflow"]
     names = [j[0] for j in jobs]
     if names != entry["jobs"]:
-        added = sorted(set(names) - set(entry["jobs"]))
-        gone = sorted(set(entry["jobs"]) - set(names))
+        added = [ty.name_label(n, names) for n in sorted(set(names) - set(entry["jobs"]))]
+        gone = [ty.name_label(n, entry["jobs"]) for n in sorted(set(entry["jobs"]) - set(names))]
         problems.append(f"{workflow}: the set of jobs changed (added {added}, missing {gone}"
                         f"{'' if set(names) != set(entry['jobs']) else ', order changed'})")
     tiered = dict(tier_blocks(jobs))
     for name in tiered:
         if name not in entry["pinned"]:
-            problems.append(f"{workflow} job {name}: names the tier credential but is not pinned")
+            problems.append(f"{workflow} job {ty.name_label(name, names)}: names the tier credential but is not pinned")
     for name, pinned in entry["pinned"].items():
         if name not in tiered:
-            problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
+            problems.append(f"{workflow} job {ty.name_label(name, entry['pinned'])}: "
+                            "pinned job is missing or no longer names the tier credential")
         elif hashlib.sha256(tiered[name].encode("utf-8")).hexdigest() != pinned["sha256"]:
             offset, _changed = first_difference(pinned, tiered[name])
             loaded, _found = ty.parse_workflow(text)
@@ -823,7 +824,8 @@ def job_pin_problems(workflow, text, pins=None):
             index, label = step_label(tiered[name], offset, job.get("steps") if isinstance(job, dict) else None)
             where = "job-level keys" if index is None else f"step {index} ({label})"
             first = next(j[1] for j in jobs if j[0] == name)
-            problems.append(f"{workflow} job {name} {where}: differs from the pin at line {first + offset + 1}")
+            problems.append(f"{workflow} job {ty.name_label(name, names)} {where}: "
+                            f"differs from the pin at line {first + offset + 1}")
     outside = [i + 1 for i, ln in enumerate(text.split("\n"))
                if EXPORT_CALL.search(normalised_code(ln)) and not any(j[1] <= i < j[2] and j[0] in entry["pinned"]
                                                                       for j in jobs)]
@@ -944,7 +946,7 @@ def primary_pin_problems(workflow, text, primary):
     names = sorted(jobs)
     if ty.digest(names) != entry["job_names_sha256"]:
         added = [ty.job_label(n, jobs) for n in sorted(set(names) - set(entry["job_names"]))]
-        gone = sorted(set(entry["job_names"]) - set(names))
+        gone = [ty.name_label(n, entry["job_names"]) for n in sorted(set(entry["job_names"]) - set(names))]
         problems.append(f"{workflow}: the set of jobs changed (added {added}, missing {gone})")
     tier = ty.tier_job_names(data)
     for name in tier:
@@ -952,10 +954,11 @@ def primary_pin_problems(workflow, text, primary):
             problems.append(f"{workflow} job {ty.job_label(name, jobs)}: names the tier credential but is not pinned")
     for name, pinned in entry["tier_jobs"].items():
         if name not in tier:
-            problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
+            problems.append(f"{workflow} job {ty.name_label(name, entry['tier_jobs'])}: "
+                            "pinned job is missing or no longer names the tier credential")
         elif ty.digest(jobs[name]) != pinned["sha256"]:
             index, path = ty.first_difference(pinned, jobs[name])
-            problems.append(f"{workflow} job {name} {where_differs(jobs[name], index)}: differs from the pin at {path}")
+            problems.append(f"{workflow} job {ty.job_label(name, jobs)} {where_differs(jobs[name], index)}: differs from the pin at {path}")
     pinned_keys = entry["workflow_keys"]
     problems += workflow_key_problems(workflow, data, pinned_keys)
     for name, job in jobs.items():
@@ -2432,8 +2435,8 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                 with self.subTest(workflow=wf, view=view):
                     checked += 1
                     self.assertEqual([p for p in problems if sentinel in p or "dbhost" in p], [])
-                    self.assertTrue([p for p in problems if f"step {index} (https://***)" in p],
-                                    (view, index))
+                    self.assertTrue([p for p in problems if f"step {index} (https://***)" in p
+                                     or f"step {index} (step[{index}])" in p], (view, index))
         self.assertGreater(checked, 0)
 
 
@@ -2463,7 +2466,8 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                     with self.subTest(workflow=wf, variant=variant, view=view):
                         checked += 1
                         self.assertEqual([p for p in problems if sentinel in p or "ciuser" in p or "dbhost" in p], [])
-                        self.assertTrue([p for p in problems if f"step {index} ({label})" in p], (view, index))
+                        self.assertTrue([p for p in problems if f"step {index} ({label})" in p
+                                         or f"step {index} (step[{index}])" in p], (view, index))
         self.assertGreater(checked, 0)
 
 
@@ -2670,6 +2674,165 @@ class TestEveryAuthorKeyIsPrintable8187R19(unittest.TestCase):
                 self.assertNotIn(sentinel, masked)
                 self.assertNotIn("dbhost", masked)
         self.assertEqual(ty.mask_userinfo("step 3 (https://***): differs"), "step 3 (https://***): differs")
+
+
+class TestEveryPinSourcedNameIsPrintable8187R20(unittest.TestCase):
+    """r20 F38: a key or job name that comes from the PIN data takes the same positional-label rule as a live author
+    key (``key[<n>]``), because ``--write-pins`` writes the pin file from the author's workflow."""
+
+    USER = "f38user"
+    SENTINEL = "SENTINEL-F38-pw"
+    LABEL = r"(?:key\[\d+\]|https://\*\*\*)"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+
+    def pins(self):
+        return json.loads(json.dumps(load_job_pins()))
+
+    def shapes(self):
+        sentinel, user = self.SENTINEL, self.USER
+        return {
+            "space": f"https://{user}:{sentinel} pw@dbhost/db",
+            "slash": f"https://{user}:{sentinel}/pw@dbhost/db",
+            "at sign": f"https://{user}:{sentinel}@pw@dbhost/db",
+            "star colon": f"https://***:{sentinel}@dbhost/db",
+            "no scheme": f"{user}:{sentinel} pw@dbhost/db",
+            "postgresql": f"postgresql:{user}:{sentinel}@dbhost",
+        }
+
+    def leaks(self, problems):
+        return [p for p in problems if self.SENTINEL in p or self.USER in p or "dbhost" in p
+                or "://" in p.replace("://***", "")]
+
+    def assert_clean(self, problems, view, want):
+        self.assertTrue(problems, view)
+        self.assertEqual(self.leaks(problems), [], view)
+        self.assertTrue([p for p in problems if re.search(want, p)], (view, want, problems))
+
+    def test_a_removed_pinned_job_key_is_printed_by_position_8187_f38(self):
+        checked = 0
+        for wf, text in self.texts.items():
+            for variant, key in self.shapes().items():
+                pins = self.pins()
+                entry = pins[PRIMARY][wf]["tier_jobs"]
+                job = next(iter(entry))
+                entry[job]["sha256"] = "0" * 64
+                entry[job]["keys"][key] = "0" * 64
+                with self.subTest(workflow=wf, shape=variant):
+                    checked += 1
+                    self.assert_clean(primary_pin_problems(wf, text, pins[PRIMARY]), "loaded",
+                                      r"differs from the pin at job\." + self.LABEL + r" \(removed\)")
+        self.assertEqual(checked, 3 * len(self.shapes()))
+
+    def test_a_removed_pinned_step_key_is_printed_by_position_8187_f38(self):
+        checked = 0
+        for wf, text in self.texts.items():
+            for variant, key in self.shapes().items():
+                pins = self.pins()
+                entry = pins[PRIMARY][wf]["tier_jobs"]
+                job = next(iter(entry))
+                index = next(i for i, step in enumerate(entry[job]["steps"]) if "keys" in step)
+                entry[job]["sha256"] = "0" * 64
+                entry[job]["steps"][index]["sha256"] = "0" * 64
+                entry[job]["steps"][index]["keys"][key] = "0" * 64
+                with self.subTest(workflow=wf, shape=variant):
+                    checked += 1
+                    self.assert_clean(primary_pin_problems(wf, text, pins[PRIMARY]), "loaded",
+                                      rf"differs from the pin at steps\[{index}\]\." + self.LABEL + r" \(removed\)")
+        self.assertEqual(checked, 3 * len(self.shapes()))
+
+    def test_a_pinned_job_name_that_is_gone_is_printed_by_position_8187_f38(self):
+        """Checker :948 (``gone``) and :955 (a pinned tier job that is missing), loaded view; the text view's pin."""
+        checked = 0
+        for wf, text in self.texts.items():
+            for variant, key in self.shapes().items():
+                pins = self.pins()
+                primary = pins[PRIMARY][wf]
+                primary["job_names"] = sorted([*primary["job_names"], key])
+                primary["job_names_sha256"] = "0" * 64
+                primary["tier_jobs"][key] = json.loads(json.dumps(next(iter(primary["tier_jobs"].values()))))
+                secondary = pins[SECONDARY][wf]
+                secondary["jobs"] = [*secondary["jobs"], key]
+                secondary["pinned"][key] = json.loads(json.dumps(next(iter(secondary["pinned"].values()))))
+                with self.subTest(workflow=wf, shape=variant):
+                    checked += 1
+                    loaded = primary_pin_problems(wf, text, pins[PRIMARY])
+                    self.assert_clean(loaded, "loaded", r"missing \['" + self.LABEL)
+                    self.assert_clean(loaded, "loaded", r" job " + self.LABEL + r": pinned job is missing")
+                    seen = job_pin_problems(wf, text, pins[SECONDARY])
+                    self.assert_clean(seen, "text", r"missing \['" + self.LABEL)
+                    self.assert_clean(seen, "text", r" job " + self.LABEL + r": pinned job is missing")
+        self.assertEqual(checked, 3 * len(self.shapes()))
+
+    def test_the_whole_workflow_set_has_no_leak_on_the_pinned_shapes_8187_f38(self):
+        """Every message of the real tier check on a pin file that carries each shape in every pin-sourced place."""
+        for variant, key in self.shapes().items():
+            pins = self.pins()
+            for wf in PIN_WORKFLOWS:
+                primary = pins[PRIMARY][wf]
+                job = next(iter(primary["tier_jobs"]))
+                primary["tier_jobs"][job]["sha256"] = "0" * 64
+                primary["tier_jobs"][job]["keys"][key] = "0" * 64
+            with self.subTest(shape=variant):
+                found = [p for wf in PIN_WORKFLOWS for p in tier_pin_problems(wf, self.texts[wf], pins)]
+                self.assertTrue(found)
+                self.assertEqual(self.leaks(found), [])
+
+
+class TestFallbackDecidedOnTheRawValue8187R20(TestEveryAuthorKeyIsPrintable8187R19):
+    """r20 F38-security: ``printable`` decides the fallback on the RAW joined value before any mask, because a later
+    ``scheme://`` token can swallow the at sign of an earlier credential.  The r19 sites run again with the four
+    absorbed-at-sign shapes, and the step-name and job-name sites run with every shape in both views."""
+
+    USER = "f38suser"
+    SENTINEL = "SENTINEL-F38S-pw"
+
+    def shapes(self):
+        sentinel, user = self.SENTINEL, self.USER
+        return {
+            "no double slash then token": f"postgresql:{user}:{sentinel}a://b@dbhost/db",
+            "whitespace then token": f"postgresql:{user}:{sentinel} pw a://b@dbhost/db",
+            "double slash whitespace then token": f"https://{user}:{sentinel} pw a://b@dbhost/db",
+            "tail before token": f"{user}:{sentinel} pwtail a://b@dbhost/db",
+            "space": f"https://{user}:{sentinel} pw@dbhost/db",
+            "star colon": f"https://***:{sentinel}@dbhost/db",
+            "star slash": f"https://***/{sentinel}@dbhost/db",
+            "no scheme": f"{user}:{sentinel} pw@dbhost/db",
+        }
+
+    def test_the_four_absorbed_at_sign_shapes_fall_back_before_any_mask_8187_f38s(self):
+        for variant, value in self.shapes().items():
+            with self.subTest(shape=variant):
+                label = ty.printable(value, "key[7]")
+                self.assertEqual(label, "key[7]")
+
+    def test_a_value_that_never_carried_the_tokens_is_still_printed_8187_f38s(self):
+        self.assertEqual(ty.printable("Run the unit tests", "step[1]"), "Run the unit tests")
+        self.assertEqual(ty.printable("a   b\tc", "step[1]"), "a b c")
+
+    def test_a_step_name_and_a_job_name_print_no_fragment_in_both_views_8187_f38s(self):
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            for variant, name in self.shapes().items():
+                step_edit = splice(text, target[3], [f"      - name: {name}", "        run: echo one"])
+                job_edit = text.replace("\njobs:\n", f'\njobs:\n  "{name}":\n    runs-on: ubuntu-latest\n'
+                                        '    steps:\n      - run: echo hi\n', 1)
+                self.assertIn(self.SENTINEL, json.dumps(ty.load_strict(step_edit)))
+                self.assertIn(self.SENTINEL, json.dumps(ty.load_strict(job_edit)))
+                for site, edited in (("step name", step_edit), ("job name", job_edit)):
+                    views = {"loaded": tier_pin_problems(wf, edited, self.pins),
+                             "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
+                    for view, problems in views.items():
+                        with self.subTest(workflow=wf, shape=variant, site=site, view=view):
+                            checked += 1
+                            self.assertTrue(problems)
+                            self.assertEqual(self.leaks(problems), [])
+        self.assertEqual(checked, 3 * len(self.shapes()) * 4)
 
 
 if __name__ == "__main__":

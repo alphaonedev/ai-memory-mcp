@@ -42,6 +42,8 @@ EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
 EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
 # everything from the scheme to the next whitespace is replaced (F34): a userinfo with a `/` or an `@` in it is masked too
 URL_ALL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*")
+# a ``scheme:`` URI form without the slashes (``postgresql:user:pass``): a letter-led scheme, a colon, then a non-space
+SCHEME_FORM = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:\S")
 # the second-layer line mask (F36): every ``scheme://`` token up to the next whitespace is replaced, with no look-ahead that
 # author text can satisfy; only a trailing run of closing punctuation survives, so a label that arrived pre-masked keeps
 # its bracket (``(https://***):`` stays whole) while a userinfo can never be carried past the mask by the text after it
@@ -99,20 +101,29 @@ def mask_userinfo(text):
 def printable(value, fallback):
     """``value`` as a name for a message, or ``fallback`` (F34, fail closed).
 
-    The whole value is joined on its whitespace and masked first, then tested: if any ``@`` or unmasked ``://`` is left, the
-    value may still carry a credential fragment (a userinfo broken by a line break, folding whitespace, ``/`` or ``@``)
-    and none of its text is printed.  The cut to 60 characters comes last (F33)."""
+    The whole value is joined on its whitespace and tested RAW, before any mask (F38): an ``@``, a ``://`` or a ``scheme:``
+    form anywhere in it may carry a credential fragment (a userinfo broken by a line break, folding whitespace, ``/`` or
+    ``@``, or an ``@`` that a later ``scheme://`` token would swallow from a mask), so none of its text is printed.  The
+    mask runs afterwards as a second layer for a value that never carried those tokens, and the cut to 60 characters
+    comes last (F33)."""
     joined = " ".join(str(value).split())
-    masked = URL_ALL.sub(r"\1***", joined)
-    if "@" in masked or masked.count("://") != len(URL_ALL.findall(joined)):
+    if "@" in joined or "://" in joined or SCHEME_FORM.search(joined):
         return fallback
-    return masked[:60]
+    return URL_ALL.sub(r"\1***", joined)[:60]
 
 
 def key_label(key, position):
     """``key`` of a mapping for a message, or ``key[<position>]`` (F36): every author key goes through ``printable`` with a
     fixed positional fallback, so no key text that is not provably free of a credential fragment is ever printed."""
     return printable(key, "key[%d]" % position)
+
+
+def name_label(name, universe):
+    """``name`` for a message, or ``key[<n>]`` (F38): ``n`` is its position among the sorted names of ``universe`` (a
+    mapping or list of the names it is one of).  Pin data is written from the author's workflow, so a pin-sourced name
+    takes the same positional rule as a live author key."""
+    names = sorted(set(universe) | {name}, key=str)
+    return key_label(name, names.index(name))
 
 
 def job_label(name, jobs):
@@ -265,9 +276,9 @@ def first_difference(pinned, job):
             continue
         if pinned["keys"].get(key) != digest(value):
             return None, "job." + key_label(key, position)
-    for key in pinned["keys"]:
+    for position, key in enumerate(pinned["keys"]):
         if key != "steps" and key not in job:
-            return None, "job." + key + " (removed)"
+            return None, "job." + key_label(key, position) + " (removed)"
     old_steps = pinned["steps"]
     for index, step in enumerate(steps):
         if index >= len(old_steps):
@@ -277,9 +288,9 @@ def first_difference(pinned, job):
                 for position, (key, value) in enumerate(step.items()):
                     if old_steps[index]["keys"].get(key) != digest(value):
                         return index, "steps[%d].%s" % (index, key_label(key, position))
-                for key in old_steps[index]["keys"]:
+                for position, key in enumerate(old_steps[index]["keys"]):
                     if key not in step:
-                        return index, "steps[%d].%s (removed)" % (index, key)
+                        return index, "steps[%d].%s (removed)" % (index, key_label(key, position))
             return index, "steps[%d]" % index
     if len(old_steps) > len(steps):
         return len(steps), "steps[%d] (removed)" % len(steps)
