@@ -2578,6 +2578,21 @@ class TrustDecisionFirst(unittest.TestCase):
         self._check_replace_rows(self.R14_MUTANTS + self.R14_DASH_ROWS
                                  + self.R14_CODE_ROWS)
 
+    def test_code_r12_c1_each_pinned_module_name_has_one_direct_binding_of_its_value(self):
+        """code r12 C1: a second assignment, a changed value, a multi-target assignment and an
+        assignment under if, try or while are all refused for every pinned module-level name."""
+        self._check_replace_rows(self.R15_C1_ROWS)
+
+    def test_code_r12_c2_no_row_in_any_table_has_an_empty_needle(self):
+        """code r12 C2: every row names the rule that refuses it; an empty needle guards nothing.
+        The checker itself is shown to flag a planted empty row."""
+        planted = (("planted-empty", "a", "b", ""),)
+        self.assertEqual(empty_needle_rows([planted]), ["planted-empty"])
+        self.assertEqual(empty_needle_rows([(("planted-named", "a", "b", "rule"),)]), [])
+        tables = [self.C13_MUTANTS, self.C14_MUTANTS, self.R14_MUTANTS, self.R14_DASH_ROWS,
+                  self.R14_CODE_ROWS, self.R15_C1_ROWS]
+        self.assertEqual(empty_needle_rows(tables), [])
+
     def test_sec_r11_the_pinned_construction_and_enumerated_arguments_are_named(self):
         """sec r11 S1/S2/S5: the one environment construction and the enumerated call arguments
         are constants of the module, and the unmutated bodies report nothing."""
@@ -2818,6 +2833,39 @@ def _r11_row(label, form):
 
 
 TrustDecisionFirst.R14_CODE_ROWS = tuple(_r11_row(label, form) for label, form in _R11_FORMS)
+
+
+# code r12 C1 (round 15): the four pinned module-level names each have exactly ONE binding, a direct
+# module-body assignment of the pinned value. Rows are (label, old, new, needle); the needle is the
+# rule that refuses the form.
+_R15_C1_NEEDLE = "has no single module-level binding to its constant"
+_R15_TIMEOUT = "GIT_TIMEOUT_S = 120\n"
+_R15_MODES = 'REGULAR_MODES = ("100644", "100755")\n'
+TrustDecisionFirst.R15_C1_ROWS = (
+    ("c1-second-assign-timeout", _R15_TIMEOUT, _R15_TIMEOUT + "GIT_TIMEOUT_S = None\n",
+     _R15_C1_NEEDLE),
+    ("c1-second-assign-regular-modes", _R15_MODES,
+     _R15_MODES + 'REGULAR_MODES = ("100644", "100755", "120000")\n', _R15_C1_NEEDLE),
+    ("c1-value-change-timeout", _R15_TIMEOUT, "GIT_TIMEOUT_S = None\n", _R15_C1_NEEDLE),
+    ("c1-value-change-regular-modes", _R15_MODES,
+     'REGULAR_MODES = ("100644", "100755", "120000")\n', _R15_C1_NEEDLE),
+    ("c1-multi-target-allowed", _R15_TIMEOUT, _R15_TIMEOUT + "GIT_TIMEOUT_S = REGULAR_MODES = None\n",
+     _R15_C1_NEEDLE),
+    ("c1-if-branch-allowed", _R15_TIMEOUT, _R15_TIMEOUT + "if True:\n    GIT_TIMEOUT_S = None\n",
+     _R15_C1_NEEDLE),
+    ("c1-try-allowed", _R15_TIMEOUT,
+     _R15_TIMEOUT + "try:\n    GIT_TIMEOUT_S = None\nexcept OSError:\n    pass\n", _R15_C1_NEEDLE),
+    ("c1-while-allowed", _R15_TIMEOUT, _R15_TIMEOUT + "while False:\n    GIT_TIMEOUT_S = None\n",
+     _R15_C1_NEEDLE),
+    ("c1-only-binding-wrapped-in-if", _R15_TIMEOUT, "if True:\n    GIT_TIMEOUT_S = 120\n",
+     _R15_C1_NEEDLE),
+)
+
+
+def empty_needle_rows(tables):
+    """Labels of the rows whose needle (the fourth item) is empty: an empty needle matches any
+    problem line and so guards no rule."""
+    return [row[0] for table in tables for row in table if not row[3]]
 
 
 class StrictWorkflowLoader(unittest.TestCase):
