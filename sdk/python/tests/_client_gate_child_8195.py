@@ -74,12 +74,10 @@ elif MODE in ("biolie", "biofake"):
 from ai_memory import AiMemoryClient, AsyncAiMemoryClient, _common  # noqa: E402
 
 lab = _tlslab.Lab(pathlib.Path(SCRATCH))
-cert_path, key_path = lab.leaf("localhost")
-server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+server = lab.server_context("localhost")
 server.minimum_version = _V11
 server.maximum_version = _V11
 server.set_ciphers("DEFAULT:@SECLEVEL=0")
-server.load_cert_chain(str(cert_path), str(key_path))
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 listener.bind(("127.0.0.1", 0))
 listener.listen(4)
@@ -105,7 +103,7 @@ def serve() -> None:
 thread = threading.Thread(target=serve, daemon=True)
 thread.start()
 
-context = ssl.create_default_context(cafile=str(lab.ca_path))
+context = lab.client_context()
 REAL_MIN.__set__(context, _V11)
 context.set_ciphers("DEFAULT:@SECLEVEL=0")
 _common._context_verifies = lambda candidate: True  # type: ignore[assignment]

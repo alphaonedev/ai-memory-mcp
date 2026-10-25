@@ -68,9 +68,8 @@ from ai_memory import _common  # noqa: E402
 
 scratch = pathlib.Path(SCRATCH)
 lab = _tlslab.Lab(scratch)
-cert_path, key_path = lab.leaf("localhost")
 
-server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+server = lab.server_context("localhost")
 if MODE in ("plain", "socklie"):
     server.minimum_version = _V11
     server.maximum_version = _V11
@@ -78,7 +77,6 @@ if MODE in ("plain", "socklie"):
 elif MODE == "cipherlie":
     server.maximum_version = ssl.TLSVersion.TLSv1_2
     server.set_ciphers("eNULL:@SECLEVEL=0")
-server.load_cert_chain(str(cert_path), str(key_path))
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 listener.bind(("127.0.0.1", 0))
 listener.listen(1)
@@ -101,7 +99,7 @@ def serve() -> None:
 thread = threading.Thread(target=serve, daemon=True)
 thread.start()
 
-context = ssl.create_default_context(cafile=str(lab.ca_path))
+context = lab.client_context()
 if MODE in ("plain", "socklie"):
     REAL_MIN.__set__(context, _V11)
     context.set_ciphers("DEFAULT:@SECLEVEL=0")
@@ -120,7 +118,7 @@ except ssl.SSLError:
 print("handshake=OK real=" + str(ssl.SSLSocket.version(session)))
 try:
     if MODE == "ctxlie":
-        GATE_CONTEXT = ssl.create_default_context(cafile=str(lab.ca_path))
+        GATE_CONTEXT = lab.client_context()
         _common._assert_negotiated_session(session, GATE_CONTEXT, "localhost")
     elif MODE == "leaflie":
         _common._assert_leaf_current(session)
