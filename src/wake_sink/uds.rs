@@ -505,7 +505,7 @@ async fn handshake(
 
     // NO topics. A substrate wake is addressed directly to the recipient, so
     // the forwarder subscribes to nothing — there is no topic it could receive
-    // another agent's wake on (#3468's own-inbox scope, until #3505).
+    // another agent's wake on (the sink's own-inbox addressing rule, #3468).
     let topics: Vec<String> = Vec::new();
     let transcript = hello_transcript(
         &cfg.hub_id,
