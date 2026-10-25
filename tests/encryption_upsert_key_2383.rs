@@ -118,15 +118,21 @@ impl EncryptGate {
             _lock: lock,
         }
     }
+}
 
-    /// Engage the operator knob that reverts discovery scans to fail-closed.
-    /// Takes `&self` so the caller must keep the live guard (and therefore
-    /// `ENV_GATE_LOCK`) in scope across the write.
-    #[allow(clippy::unused_self)]
-    fn strict_reads_on(&self) {
-        // SAFETY: the caller still holds this guard, so ENV_GATE_LOCK is held.
-        unsafe { std::env::set_var(db::ENV_STRICT_DECRYPT_READS, "1") };
-    }
+/// Engage the operator knob that reverts discovery scans to fail-closed. Only called by a test
+/// that holds an `EncryptGate` (bound `let _gate = ...;`, never mentioned again), so
+/// `ENV_GATE_LOCK` is held across the write for the whole test (#7347).
+fn strict_reads_on() {
+    // SAFETY: the calling test holds `ENV_GATE_LOCK` through its `EncryptGate`.
+    unsafe { std::env::set_var(db::ENV_STRICT_DECRYPT_READS, "1") };
+}
+
+/// Turn at-rest encryption ON inside a test that already holds an `EncryptGate` (same contract as
+/// `strict_reads_on`; the guard's `Drop` restores the starting value).
+fn encrypt_on() {
+    // SAFETY: the calling test holds `ENV_GATE_LOCK` through its `EncryptGate`.
+    unsafe { std::env::set_var(ENV_ENCRYPT_AT_REST, "1") };
 }
 
 impl Drop for EncryptGate {
@@ -309,7 +315,7 @@ fn cross_agent_upsert_preserves_authorship_and_new_content_2383() {
 /// stored in the clear. The remedy is `ai-memory reown` before re-storing.
 #[test]
 fn upsert_onto_agentless_legacy_row_is_refused_fail_closed_never_claimed_2383_3626() {
-    let gate = EncryptGate::off();
+    let _gate = EncryptGate::off();
     let conn = fresh_conn();
     let ns = "n2383-agentless";
 
@@ -321,9 +327,7 @@ fn upsert_onto_agentless_legacy_row_is_refused_fail_closed_never_claimed_2383_36
         None,
         "fixture precondition: the legacy row carries NO agent_id"
     );
-    drop(gate);
-
-    let _on = EncryptGate::on();
+    encrypt_on();
     let incoming = make_mem("legacy", "encrypted rewrite", ns, "agent-legacy-2383");
     let err = db::insert(&conn, &incoming).expect_err(
         "#3626: the merge would leave the row owner-less, so there is no recipient key",
@@ -567,7 +571,7 @@ fn export_all_fails_closed_on_poisoned_row_2383() {
 fn strict_decrypt_reads_env_restores_fail_closed_scans_2383() {
     // The operator knob reverts discovery scans to the pre-#2383 uniform
     // fail-closed posture for deployments that prefer the outage to a gap.
-    let gate = EncryptGate::on();
+    let _gate = EncryptGate::on();
     let conn = fresh_conn();
     let ns = "n2383-strict";
 
@@ -581,7 +585,7 @@ fn strict_decrypt_reads_env_restores_fail_closed_scans_2383() {
         "default posture skips the poisoned row"
     );
 
-    gate.strict_reads_on();
+    strict_reads_on();
     list_all(&conn, ns)
         .expect_err("AI_MEMORY_STRICT_DECRYPT_READS=1 must restore the fail-closed scan");
 }

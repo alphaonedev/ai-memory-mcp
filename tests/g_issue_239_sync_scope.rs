@@ -214,7 +214,7 @@ async fn sync_since_body(router: axum::Router, peer_id: Option<&str>) -> Value {
 
 #[tokio::test]
 async fn case_1_allowlist_match_returns_in_scope_excludes_others() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     let allowlist = r#"{
         "peer-1": {
@@ -244,7 +244,6 @@ async fn case_1_allowlist_match_returns_in_scope_excludes_others() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(
         mems.len(),
@@ -264,7 +263,7 @@ async fn case_1_allowlist_match_returns_in_scope_excludes_others() {
 
 #[tokio::test]
 async fn case_2_allowlist_mismatch_returns_empty() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     // peer-1's allowlist doesn't intersect anything we seed.
     let allowlist = r#"{
@@ -285,7 +284,6 @@ async fn case_2_allowlist_mismatch_returns_empty() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
     assert_eq!(
         body["memories"].as_array().unwrap().len(),
         0,
@@ -299,7 +297,7 @@ async fn case_2_allowlist_mismatch_returns_empty() {
 
 #[tokio::test]
 async fn case_3_no_allowlist_with_bypass_is_full_dump() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     // Legacy posture: operator deliberately opted out.
     unsafe {
@@ -315,7 +313,6 @@ async fn case_3_no_allowlist_with_bypass_is_full_dump() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::SYNC_TRUST_PEER_ENV);
     }
-    drop(env_guard);
     assert_eq!(
         body["memories"].as_array().unwrap().len(),
         2,
@@ -326,13 +323,12 @@ async fn case_3_no_allowlist_with_bypass_is_full_dump() {
 
 #[tokio::test]
 async fn case_4_no_allowlist_no_bypass_default_denies() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     seed(&db, "public/alpha", "a").await;
     seed(&db, "private/secret", "b").await;
     let body = sync_since_body(router, Some("peer-1")).await;
-    drop(env_guard);
     assert_eq!(
         body["memories"].as_array().unwrap().len(),
         0,
@@ -345,12 +341,11 @@ async fn case_4_no_allowlist_no_bypass_default_denies() {
 async fn case_5_no_peer_header_default_denies() {
     // Defense-in-depth — even a peer that skips the header gets
     // default-deny rather than the legacy full dump.
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     seed(&db, "public/alpha", "a").await;
     let body = sync_since_body(router, None).await;
-    drop(env_guard);
     assert_eq!(
         body["memories"].as_array().unwrap().len(),
         0,

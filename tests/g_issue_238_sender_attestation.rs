@@ -179,7 +179,7 @@ fn reset_env() {
 
 #[tokio::test]
 async fn case_1_header_matches_body_accepts() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     let body = push_body("peer-1");
@@ -204,7 +204,6 @@ async fn case_1_header_matches_body_accepts() {
         StatusCode::OK,
         "matching x-peer-id and body sender_agent_id must accept; body={env_body}"
     );
-    drop(env_guard);
     assert_eq!(
         count_memories_in_ns(&db, "issue-238").await,
         1,
@@ -214,7 +213,7 @@ async fn case_1_header_matches_body_accepts() {
 
 #[tokio::test]
 async fn case_2_header_mismatch_no_allowlist_refuses_403() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     let body = push_body("alice"); // body claims alice
@@ -241,7 +240,6 @@ async fn case_2_header_mismatch_no_allowlist_refuses_403() {
     assert_eq!(env["error"], "sender_agent_id_mismatch");
     assert_eq!(env["claimed"], "alice");
     assert_eq!(env["peer_header"], "peer-1");
-    drop(env_guard);
     assert_eq!(
         count_memories_in_ns(&db, "issue-238").await,
         0,
@@ -257,7 +255,7 @@ async fn case_3_header_absent_body_present_refuses_unless_bypass() {
     // exercise the explicit-header-missing case where the body still
     // carries a claim — that's the substantive #238 threat surface
     // and must 403 (header absent = peer cannot be attested).
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, _db) = build_router_with_db();
     let body = push_body("alice");
@@ -279,12 +277,11 @@ async fn case_3_header_absent_body_present_refuses_unless_bypass() {
         .unwrap();
     let env: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(env["error"], "peer_id_header_missing");
-    drop(env_guard);
 }
 
 #[tokio::test]
 async fn case_4_env_bypass_allows_mismatch() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     // Operator-explicit opt-out for legacy peers.
     unsafe {
@@ -314,7 +311,6 @@ async fn case_4_env_bypass_allows_mismatch() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
     }
-    drop(env_guard);
     assert_eq!(
         count_memories_in_ns(&db, "issue-238").await,
         1,
@@ -327,7 +323,7 @@ async fn case_5_allowlist_permits_mismatch() {
     // The brief's third "allowlist" semantics: peer-1 with operator-
     // configured `allowed_sender_agent_ids = ["alice"]` may legitimately
     // claim alice on the body even though x-peer-id is peer-1.
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     let allowlist = r#"{
         "peer-1": {
@@ -363,6 +359,5 @@ async fn case_5_allowlist_permits_mismatch() {
         StatusCode::OK,
         "operator-configured allowlist must permit body-claim ∈ allowed_sender_agent_ids"
     );
-    drop(env_guard);
     assert_eq!(count_memories_in_ns(&db, "issue-238").await, 1);
 }

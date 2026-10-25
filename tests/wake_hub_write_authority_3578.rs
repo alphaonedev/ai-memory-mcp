@@ -614,10 +614,68 @@ fn sqlite_mcp_http_hub_credential_and_write_authority_3578() {
     rt.block_on(exercise_http(&f));
 }
 
+/// Register, bind and exercise the live PostgreSQL fixture (an `async fn`, so the env gate
+/// sees a named call, not a detached async block).
+#[cfg(feature = "sal-postgres")]
+async fn register_and_exercise_pg(f: &mut Fixture, ctx: &ai_memory::store::CallerContext) {
+    use ai_memory::identity::pubkey_bind::{PossessionProof, sign_bind_challenge};
+    f.app
+        .store
+        .register_agent(
+            ctx,
+            &ai_memory::models::AgentRegistration {
+                agent_id: CALLER.into(),
+                agent_type: "nhi".into(),
+                capabilities: vec![],
+                registered_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+        .expect("register live pg");
+    let public = f.root.public_base64();
+    let issued = f
+        .app
+        .store
+        .issue_pubkey_bind_challenge(ctx, CALLER, &public, "test:3578")
+        .await
+        .expect("challenge");
+    let sig = sign_bind_challenge(f.root.private.as_ref().expect("root"), &issued);
+    let taken = f
+        .app
+        .store
+        .consume_pubkey_bind_challenge(ctx, CALLER, &issued.nonce_b64)
+        .await
+        .expect("consume")
+        .expect("unspent");
+    let proof =
+        PossessionProof::verify_challenge_response(taken, CALLER, &public, &sig).expect("proof");
+    f.app
+        .store
+        .bind_agent_pubkey(ctx, CALLER, &public, proof)
+        .await
+        .expect("bind live pg");
+    let history = f
+        .app
+        .store
+        .agent_pubkey_versions(CALLER)
+        .await
+        .expect("actual PG root history");
+    let entry = ai_memory::identity::hub_cache::entry(
+        CALLER,
+        &history,
+        vec![],
+        vec![],
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .expect("derived PG hub entry");
+    f.prove_hub_admission(entry);
+    exercise_http(f).await;
+}
+
 #[cfg(feature = "sal-postgres")]
 #[test]
 fn live_postgres_http_and_forwarded_mcp_write_authority_3578() {
-    use ai_memory::identity::pubkey_bind::{PossessionProof, sign_bind_challenge};
     use ai_memory::store::CallerContext;
     let _serial = TEST_LOCK.lock().expect("serialize fixture environment");
     let _caller = AgentIdOverride::unset();
@@ -646,60 +704,7 @@ fn live_postgres_http_and_forwarded_mcp_write_authority_3578() {
             .expect("live snapshot pool"),
     );
     let ctx = CallerContext::for_admin("test:3578");
-    rt.block_on(async {
-        f.app
-            .store
-            .register_agent(
-                &ctx,
-                &ai_memory::models::AgentRegistration {
-                    agent_id: CALLER.into(),
-                    agent_type: "nhi".into(),
-                    capabilities: vec![],
-                    registered_at: chrono::Utc::now().to_rfc3339(),
-                    last_seen_at: chrono::Utc::now().to_rfc3339(),
-                },
-            )
-            .await
-            .expect("register live pg");
-        let public = f.root.public_base64();
-        let issued = f
-            .app
-            .store
-            .issue_pubkey_bind_challenge(&ctx, CALLER, &public, "test:3578")
-            .await
-            .expect("challenge");
-        let sig = sign_bind_challenge(f.root.private.as_ref().expect("root"), &issued);
-        let taken = f
-            .app
-            .store
-            .consume_pubkey_bind_challenge(&ctx, CALLER, &issued.nonce_b64)
-            .await
-            .expect("consume")
-            .expect("unspent");
-        let proof = PossessionProof::verify_challenge_response(taken, CALLER, &public, &sig)
-            .expect("proof");
-        f.app
-            .store
-            .bind_agent_pubkey(&ctx, CALLER, &public, proof)
-            .await
-            .expect("bind live pg");
-        let history = f
-            .app
-            .store
-            .agent_pubkey_versions(CALLER)
-            .await
-            .expect("actual PG root history");
-        let entry = ai_memory::identity::hub_cache::entry(
-            CALLER,
-            &history,
-            vec![],
-            vec![],
-            &chrono::Utc::now().to_rfc3339(),
-        )
-        .expect("derived PG hub entry");
-        f.prove_hub_admission(entry);
-        exercise_http(&f).await;
-    });
+    rt.block_on(register_and_exercise_pg(&mut f, &ctx));
     // The MCP forwarder sends X-Agent-Id, not an API key. This loopback-only
     // fixture separately requires the root's write signature. API-key refusal
     // is covered above; this tests the production forwarding/PG write twin.

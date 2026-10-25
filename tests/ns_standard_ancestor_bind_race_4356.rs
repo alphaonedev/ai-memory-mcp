@@ -102,9 +102,10 @@ async fn sqlite_concurrent_first_bind_cannot_pass_on_a_stale_chain_4356() {
 
     // The racing stranger binds: MCP wire handler and SAL adapter.
     let mcp = {
-        let (path, leaf, b_id) = (path.clone(), format!("{gov}/mcp"), b_id.clone());
+        let (leaf, b_id) = (format!("{gov}/mcp"), b_id.clone());
+        // #7994: open on the test thread (env protected); the detached worker only uses the connection.
+        let conn = ai_memory::db::open(&path).expect("mcp conn");
         std::thread::spawn(move || {
-            let conn = ai_memory::db::open(&path).expect("mcp conn");
             ai_memory::mcp::handle_namespace_set_standard(
                 &conn,
                 &json!({"namespace": leaf, "id": b_id, "agent_id": BOB}),

@@ -59,7 +59,7 @@ impl Posture {
         use ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
         use ai_memory::federation::signing::REQUIRE_SIG_ENV;
         const REQUIRE_ATTEST_ENV: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTATION";
-        let keys = [
+        let keys: [&str; 5] = [
             PEER_ATTESTATION_ENV,
             REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
             REQUIRE_SIG_ENV,

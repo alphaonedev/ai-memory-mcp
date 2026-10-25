@@ -1214,6 +1214,7 @@ fn unreachable_peer() -> ai_memory::federation::PeerEndpoint {
 
 #[tokio::test]
 async fn broadcast_archive_quorum_no_peers_ok() {
+    let _g = FED_ENV_LOCK.lock().await;
     let cfg = quorum_config(Vec::new());
     let tracker = ai_memory::federation::sync::broadcast_archive_quorum(&cfg, "arch-1")
         .await
@@ -1223,6 +1224,7 @@ async fn broadcast_archive_quorum_no_peers_ok() {
 
 #[tokio::test]
 async fn broadcast_delete_quorum_no_peers_ok() {
+    let _g = FED_ENV_LOCK.lock().await;
     let cfg = quorum_config(Vec::new());
     let tracker = ai_memory::federation::sync::broadcast_delete_quorum(&cfg, "del-1")
         .await
@@ -1232,6 +1234,7 @@ async fn broadcast_delete_quorum_no_peers_ok() {
 
 #[tokio::test]
 async fn broadcast_link_quorum_no_peers_ok() {
+    let _g = FED_ENV_LOCK.lock().await;
     let cfg = quorum_config(Vec::new());
     let link = ga2_link();
     let tracker = ai_memory::federation::sync::broadcast_link_quorum(&cfg, &link)
@@ -1242,6 +1245,7 @@ async fn broadcast_link_quorum_no_peers_ok() {
 
 #[tokio::test]
 async fn broadcast_consolidate_quorum_no_peers_ok() {
+    let _g = FED_ENV_LOCK.lock().await;
     let cfg = quorum_config(Vec::new());
     let mem = ga2_memory("consol-new");
     let sources = vec!["src-a".to_string(), "src-b".to_string()];
