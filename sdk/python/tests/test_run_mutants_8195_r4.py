@@ -12,7 +12,7 @@ import sys
 import pytest
 
 from . import run_mutants_8195 as runner
-from ._mutants_8195 import MUTANTS, Mutant
+from ._mutants_8195 import KILLER_TESTS, MUTANTS, Mutant
 
 _TESTS = pathlib.Path(__file__).resolve().parent
 _SDK = _TESTS.parent
@@ -22,17 +22,41 @@ _SUFFIXES = (".ts", ".js", ".py", ".md", ".json", ".toml", ".sh")
 _SKIP_PARTS = ("node_modules", "dist", "__pycache__", ".venv", ".local-runs", "egg-info")
 
 
-def test_no_sdk_file_carries_a_plaintext_daemon_url_8195() -> None:
-    hits = []
-    for path in sorted(_SDK.parent.rglob("*")):
+#: The scan must reach more files than this, or a skipped ancestor directory emptied it (code r4 F4).
+_MIN_SCANNED = 20
+
+
+def _scan(root: pathlib.Path) -> "tuple[int, list[str]]":
+    """Return (files scanned, plaintext daemon URL hits) under ``root``, the repository ``sdk`` parent."""
+    scanned, hits = 0, []
+    for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix not in _SUFFIXES:
             continue
         if any(part in path.parts for part in _SKIP_PARTS) or any(p.endswith("egg-info") for p in path.parts):
             continue
+        scanned += 1
         for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if _GATE_RE.search(line):
-                hits.append(f"{path.relative_to(_SDK.parent)}:{number}")
+                hits.append(f"{path.relative_to(root)}:{number}")
+    return scanned, hits
+
+
+def test_no_sdk_file_carries_a_plaintext_daemon_url_8195() -> None:
+    scanned, hits = _scan(_SDK.parent)
+    assert scanned > _MIN_SCANNED, f"only {scanned} files scanned: the filter emptied the scan"
     assert hits == []
+
+
+def test_scan_still_reads_a_checkout_that_sits_under_a_skipped_directory_name_8195(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / ".local-runs" / "dist" / ".venv" / "repo" / "sdk"
+    (root / "python").mkdir(parents=True)
+    (root / "python" / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / "python" / "bad.py").write_text('URL = "' + "http" + '://localhost:9077"\n', encoding="utf-8")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "skipped.py").write_text('URL = "' + "http" + '://localhost:1"\n', encoding="utf-8")
+    scanned, hits = _scan(root)
+    assert scanned == 2
+    assert hits == ["python/bad.py:1"]
 
 
 def test_every_row_names_its_killers_explicitly_8195() -> None:
@@ -61,15 +85,34 @@ def test_runner_refuses_a_row_without_killers_8195(tmp_path: pathlib.Path) -> No
     assert result.verdict not in runner.GOOD_VERDICTS
 
 
-def test_no_op_row_with_an_unrelated_failing_test_is_not_red_8195(tmp_path: pathlib.Path) -> None:
+def _tree_with_an_unrelated_failing_test(tmp_path: pathlib.Path) -> pathlib.Path:
     sdk = tmp_path / "repo" / "sdk" / "python"
     (sdk / "pkg").mkdir(parents=True)
     (sdk / "tests").mkdir()
     (sdk / "pkg" / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
     (sdk / "tests" / "test_k.py").write_text("def test_ok() -> None:\n    assert True\n", encoding="utf-8")
+    (sdk / "tests" / "test_unrelated.py").write_text("def test_broken() -> None:\n    assert False\n", encoding="utf-8")
+    return sdk
+
+
+def test_no_op_row_beside_a_failing_unrelated_test_is_not_red_8195(tmp_path: pathlib.Path) -> None:
+    sdk = _tree_with_an_unrelated_failing_test(tmp_path)
     row = Mutant("T", "synthetic", "pkg/mod.py", "VALUE = 1", "VALUE = 1  # no-op", killers=("tests/test_k.py",))
+    # The failing unrelated file is present in the copy but is not one of the killer tests that run.
     result = runner.run_row(1, row, sdk, sys.executable, tmp_path / "s", 120, ("tests/test_k.py",))
     assert result.verdict == "SURVIVES"
+    assert result.verdict not in {"RED", "EQUIVALENT"}
+
+
+def test_failure_outside_the_named_killers_is_unattributed_never_red_8195(tmp_path: pathlib.Path) -> None:
+    sdk = _tree_with_an_unrelated_failing_test(tmp_path)
+    row = Mutant("T", "synthetic", "pkg/mod.py", "VALUE = 1", "VALUE = 1  # no-op", killers=("tests/test_k.py",))
+    # The unrelated failing file runs with the killers; its failure must not be credited to the row.
+    result = runner.run_row(
+        1, row, sdk, sys.executable, tmp_path / "s", 120, ("tests/test_k.py", "tests/test_unrelated.py")
+    )
+    assert result.verdict == "UNATTRIBUTED"
+    assert result.verdict not in runner.GOOD_VERDICTS
 
 
 def _m66() -> Mutant:
@@ -80,19 +123,23 @@ def _m66() -> Mutant:
 
 def test_m66_rationale_names_the_identity_check_not_a_caller_that_catches_type_error_8195() -> None:
     row = _m66()
-    assert row.equivalent is True
+    assert row.equivalent is False
+    assert "tests/test_tls_prepatch_8195_r5.py" in row.killers
+    assert "tests/test_tls_prepatch_8195_r5.py" in KILLER_TESTS
     assert "_STOCK_HANDSHAKE" in row.name
+    assert "captured at import" in row.name
     assert "TypeError" not in row.name
     assert "caller refuses" not in row.name
+    assert "always yields" not in row.name
 
 
 def test_floor_tests_do_not_claim_that_only_a_type_check_refuses_the_bounds_8195() -> None:
     text = (_TESTS / "test_tls_floor_8195_r2.py").read_text(encoding="utf-8")
     assert "only a type check refuses them" not in text
+    assert "no public path reaches" not in text
+    assert "equivalent" not in text.split("code r2 F2: a bound that is not")[1].split("_ORIG_BOUND")[0]
 
 
-@pytest.mark.parametrize("label", ["S02/C02"])
-def test_the_two_equivalent_rows_are_the_only_ones_marked_equivalent_8195(label: str) -> None:
-    flagged = sorted(m.label for m in MUTANTS if m.equivalent)
-    assert label in flagged
-    assert len(flagged) == 2
+def test_the_cert_none_row_is_the_only_one_marked_equivalent_8195() -> None:
+    flagged = [m for m in MUTANTS if m.equivalent]
+    assert [m.label for m in flagged] == ["S02/C02"]
