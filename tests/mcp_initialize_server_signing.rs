@@ -32,6 +32,11 @@
 //!    session, not on the recall hot path. The performance smoke
 //!    test asserts the order of magnitude is correct.
 
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
+
+use std::time::Duration;
+
 use ai_memory::identity::keypair::AgentKeypair;
 use ai_memory::mcp::server_identity::{build_signed_identity, verify_signed_identity};
 use ai_memory::storage::migrations::current_schema_version;
@@ -465,54 +470,111 @@ fn identical_inputs_produce_identical_signatures() {
 //  Group H — performance (no hot-path regression)
 // ============================================================================
 
+/// Single-sign samples per run of the latency guard; the guard uses the
+/// FASTEST sample (#7244).
+const SINGLE_SIGN_SAMPLES: usize = 9;
+/// Unscaled wall-clock budget for one single sign + serialize. The best
+/// sample measured under load (~23) in a debug build is ~0.32 ms (319.95 us),
+/// so 5 ms sits ~15x above it: a one-off scheduling stall (13.8 ms, #7244) no
+/// longer fails because the guard takes the best of
+/// [`SINGLE_SIGN_SAMPLES`], while a per-call slowdown of ~15x or more (key
+/// derivation or hashing per call) fails every sample and so fails the
+/// minimum. Scaled by `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
+const SINGLE_SIGN_BASE_BUDGET: Duration = Duration::from_millis(5);
+
 #[test]
-fn single_sign_is_sub_millisecond() {
-    // Ed25519 sign over ~150 bytes of canonical identity. Even on the
-    // slowest CI runner this completes in well under 1 ms. Catches
-    // accidental introduction of expensive operations (key derivation
-    // in a hot loop, cryptographic hashing on the request thread, etc).
+fn single_sign_completes_within_load_tolerant_budget() {
+    // Ed25519 sign over ~150 bytes of canonical identity. Catches accidental
+    // introduction of expensive operations (key derivation in a hot loop,
+    // cryptographic hashing on the request thread, etc). One fixed 5 ms
+    // sample flaked under runner load (#7244), so the guard takes the best of
+    // SINGLE_SIGN_SAMPLES samples against a named, env-scaled budget.
     let kp = keypair_with_signing("ai:nhi@host", 71);
-    let start = std::time::Instant::now();
-    let _ = build_signed_identity(Some(&kp), TEST_TIMESTAMP).unwrap();
-    let elapsed = start.elapsed();
+    let mut best = Duration::MAX;
+    for _ in 0..SINGLE_SIGN_SAMPLES {
+        let start = std::time::Instant::now();
+        let _ = build_signed_identity(Some(&kp), TEST_TIMESTAMP).unwrap();
+        best = best.min(start.elapsed());
+    }
+    let mult = u32::try_from(mcp_wait::timing_budget_mult()).unwrap_or(u32::MAX);
+    let budget = SINGLE_SIGN_BASE_BUDGET.saturating_mul(mult);
     assert!(
-        elapsed.as_millis() < 5,
-        "single sign + serialize must be sub-5ms (was {elapsed:?})"
+        best < budget,
+        "single sign + serialize must complete under {budget:?} (best of {SINGLE_SIGN_SAMPLES}: {best:?})"
     );
 }
 
+/// Signs per timed batch in the throughput guard.
+const SIGN_BATCH_SIZE: usize = 1000;
+/// Timed batches per run; the guard uses the FASTEST batch (#7187).
+const SIGN_BATCH_RUNS: usize = 3;
+/// Unscaled wall-clock budget for one batch of [`SIGN_BATCH_SIZE`] signs.
+/// An unloaded debug build takes ~0.3 s per batch, so 2 s trips at a slowdown
+/// of 2 / 0.3 = ~6.7x: a 10x regression (~3.0 s per batch, key derivation or
+/// hashing in the loop) fails, while best-of-[`SIGN_BATCH_RUNS`] absorbs a
+/// transient load spike. Runners under sustained oversubscription (2.61 s
+/// measured at load ~21, #7187) set `AI_MEMORY_TEST_TIMING_BUDGET_MULT`,
+/// which scales this budget (and widens the threshold by the same factor).
+const SIGN_BATCH_BASE_BUDGET: Duration = Duration::from_secs(2);
+
 #[test]
-fn one_thousand_signs_complete_under_one_second() {
+fn one_thousand_signs_complete_within_load_tolerant_budget() {
     // The MCP initialize handshake fires ONCE per session, not on the
     // recall hot path. But CI may exercise the path many times during
-    // an integration sweep. 1000 iterations should complete well under
-    // 1 second on any reasonable hardware, confirming the per-call cost
-    // is on the order of 10s of µs.
+    // an integration sweep. A batch of 1000 signs confirms the per-call
+    // cost stays on the order of 10s of µs. The fixed 1 s wall-clock limit
+    // flaked under runner load (#7187), so the guard takes the best of
+    // SIGN_BATCH_RUNS batches (a transient load spike cannot fail it; a
+    // real regression slows every batch) against a named, env-scaled budget.
     let kp = keypair_with_signing("ai:nhi@host", 72);
-    let start = std::time::Instant::now();
-    for _ in 0..1000 {
-        let _ = build_signed_identity(Some(&kp), TEST_TIMESTAMP).unwrap();
+    let mut best = Duration::MAX;
+    for _ in 0..SIGN_BATCH_RUNS {
+        let start = std::time::Instant::now();
+        for _ in 0..SIGN_BATCH_SIZE {
+            let _ = build_signed_identity(Some(&kp), TEST_TIMESTAMP).unwrap();
+        }
+        best = best.min(start.elapsed());
     }
-    let elapsed = start.elapsed();
+    let mult = u32::try_from(mcp_wait::timing_budget_mult()).unwrap_or(u32::MAX);
+    let budget = SIGN_BATCH_BASE_BUDGET.saturating_mul(mult);
     assert!(
-        elapsed.as_secs() < 1,
-        "1000 signs must complete under 1s (was {elapsed:?})"
+        best < budget,
+        "{SIGN_BATCH_SIZE} signs must complete under {budget:?} (best of {SIGN_BATCH_RUNS}: {best:?})"
     );
 }
 
+/// No-keypair calls per timed batch.
+const NO_KEYPAIR_BATCH_SIZE: usize = 10_000;
+/// Timed batches per run; the guard uses the FASTEST batch (#7244).
+const NO_KEYPAIR_BATCH_RUNS: usize = 5;
+/// Unscaled wall-clock budget for one batch of [`NO_KEYPAIR_BATCH_SIZE`]
+/// no-keypair calls. The best batch measured under load (~23) in a debug build
+/// is ~0.18 ms (182.867 us), so 10 ms sits ~55x above it, while a per-call
+/// cost of 1 us or more (key derivation or hashing, 10 ms per batch) fails
+/// every batch. Scaled by `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
+const NO_KEYPAIR_BASE_BUDGET: Duration = Duration::from_millis(10);
+
 #[test]
-fn no_keypair_path_is_constant_time_cheap() {
+fn no_keypair_path_completes_within_load_tolerant_budget() {
     // When the daemon has no keypair, the initialize hot path should
     // not pay any meaningful cost. This is critical because every
-    // unattested deployment hits this path on every session start.
-    let start = std::time::Instant::now();
-    for _ in 0..10_000 {
-        let _ = build_signed_identity(None, TEST_TIMESTAMP).unwrap();
+    // unattested deployment hits this path on every session start. The fixed
+    // 10 ms single-sample limit flaked under load (#7244), so the guard takes
+    // the best of NO_KEYPAIR_BATCH_RUNS batches against a named, env-scaled
+    // budget.
+    let mut best = Duration::MAX;
+    for _ in 0..NO_KEYPAIR_BATCH_RUNS {
+        let start = std::time::Instant::now();
+        for _ in 0..NO_KEYPAIR_BATCH_SIZE {
+            let _ = build_signed_identity(None, TEST_TIMESTAMP).unwrap();
+        }
+        best = best.min(start.elapsed());
     }
-    let elapsed = start.elapsed();
+    let mult = u32::try_from(mcp_wait::timing_budget_mult()).unwrap_or(u32::MAX);
+    let budget = NO_KEYPAIR_BASE_BUDGET.saturating_mul(mult);
     assert!(
-        elapsed.as_millis() < 10,
-        "10k no-keypair calls must complete under 10ms (was {elapsed:?})"
+        best < budget,
+        "{NO_KEYPAIR_BATCH_SIZE} no-keypair calls must complete under {budget:?} (best of {NO_KEYPAIR_BATCH_RUNS}: {best:?})"
     );
 }
 

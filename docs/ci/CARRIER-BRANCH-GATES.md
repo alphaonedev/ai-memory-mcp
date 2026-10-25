@@ -151,3 +151,26 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
 - **Operational cap.** Run at most 2 concurrent cargo lanes per host (f1 had 9
   cargo / 17 rustc processes during the failing run). This is a fleet rule for
   Modules, not enforced by the workflow.
+
+### Manifest-inventoried paths (#8050)
+
+- **Owning pin test.** Every file path inventoried by a
+  `tests/fixtures/**/*.json` manifest (searched recursively; for example
+  `sdk/typescript/src/wake.ts`) is gated by that manifest's `tests/qual_*.rs`
+  test, even when the diff contains no Rust. The gate inventories every string
+  in the manifest, object keys included. Each string is normalised: backslashes
+  become `/`, surrounding whitespace is trimmed, `//` collapses, a leading `./`
+  or `/` and a trailing `/` are stripped, literal `..` segments are resolved,
+  and a string that leaves the repo root is ignored; matching is case-sensitive.
+  A changed path is normalised the same way and
+  matches when it equals the string or lies under it as a directory prefix, so a
+  deleted or renamed path and a deleted directory are still gated. A diff that
+  edits the manifest itself names its owning test. A lane and a reviewer must run
+  `python3 scripts/ci/manifest_owned_paths.py --diff-file <changed files>` and
+  then run and quote every `cargo test --test <qual>` it names before claiming
+  gates green. Exit 0 means nothing inventoried changed, exit 1 means tests are
+  named, exit 2 is a gate defect (unparseable manifest, manifest without an
+  owning test, unreadable fixtures folder, a `.json` fixture a qual test includes
+  that the walk never read, bad root or any internal error) and
+  fails the check. Unit tests:
+  `scripts/ci/tests/test_manifest_owned_paths_8050.py`.
