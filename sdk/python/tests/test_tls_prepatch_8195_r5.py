@@ -40,3 +40,25 @@ def _outcome(attr: str, kind: str) -> str:
 @pytest.mark.parametrize("attr", ["minimum_version", "maximum_version"])
 def test_bound_replaced_before_import_is_refused_with_the_typed_error_8195(attr: str, kind: str) -> None:
     assert _outcome(attr, kind) == "outcome=REFUSED-ValueError"
+
+
+_SUBST_CHILD = _TESTS / "_prepatch_subst_child_8195.py"
+
+
+def _subst_lines(mode: str) -> list[str]:
+    env = dict(os.environ, PYTHONPATH=str(_SDK))
+    env.pop("SSL_CERT_FILE", None)
+    env.pop("SSL_CERT_DIR", None)
+    done = subprocess.run(
+        [sys.executable, str(_SUBST_CHILD), mode], capture_output=True, text=True, env=env, timeout=120, check=False
+    )
+    assert done.returncode == 0, f"child rc {done.returncode}: {done.stderr[-300:]}"
+    return done.stdout.splitlines()
+
+
+@pytest.mark.parametrize("mode", ["py-lie+attr", "py-lie+mods"])
+def test_substituted_ssl_module_cannot_admit_a_tls_11_floor_8195(mode: str) -> None:
+    """sec r5 S1: the C descriptors come from the real ``SSLContext`` MRO, not a ``_ssl`` lookup."""
+    lines = _subst_lines(mode)
+    assert "C_MIN is real getset: True" in lines
+    assert "outcome=REFUSED-ValueError" in lines

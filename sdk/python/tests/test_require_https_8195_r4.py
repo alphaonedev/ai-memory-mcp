@@ -149,6 +149,30 @@ def test_str_subclass_with_a_plaintext_value_is_refused_whatever_rstrip_returns_
     assert type(refused.value) is ValueError
 
 
+# ---- sec r5 S2: an isinstance spoof is the one typed refusal, not an untyped TypeError -----
+
+
+class _Spoof:
+    """``isinstance(x, str)`` is True through ``__class__``, yet ``x`` is not a ``str``."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return str
+
+
+def test_isinstance_spoof_check_raises_the_typed_value_error_8195() -> None:
+    with pytest.raises(ValueError, match="https") as refused:
+        _common._require_https(_Spoof())
+    assert type(refused.value) is ValueError
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_isinstance_spoof_base_url_is_a_typed_value_error_at_construction_8195(client_cls: type) -> None:
+    with pytest.raises(ValueError, match="https") as refused:
+        client_cls(base_url=_Spoof(), api_key=_PLACEHOLDER, verify=None)  # type: ignore[arg-type]
+    assert type(refused.value) is ValueError
+
+
 # ---- code r3 F6: the refusal never echoes a part of the URL ---------------------------
 
 _SCHEMELESS = {"userinfo-host": "alice" + ":" + _PW + "@daemon-host.invalid", "host-port": "daemon-host.invalid:9077"}
