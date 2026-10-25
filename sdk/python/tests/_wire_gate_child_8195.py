@@ -100,6 +100,7 @@ thread = threading.Thread(target=serve, daemon=True)
 thread.start()
 
 context = lab.client_context()
+context.minimum_version = ssl.TLSVersion.TLSv1_2  # the plain rows lower it below through the C setter
 if MODE in ("plain", "socklie"):
     REAL_MIN.__set__(context, _V11)
     context.set_ciphers("DEFAULT:@SECLEVEL=0")
