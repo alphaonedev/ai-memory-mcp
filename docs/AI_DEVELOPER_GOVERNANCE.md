@@ -323,7 +323,8 @@ Required fields:
 | `tier` | `long` |
 | `priority` | `9` |
 | `namespace` | `ai-memory-mcp` (this repo) — or the repo's namespace standard if different |
-| `source` | the agent identifier (`claude`, `codex`, `grok`, etc.) |
+| `source` | `nhi` for an agent-authored audit record |
+| `agent_id` | the specific agent identity, for example `ai:codex-god-f2` |
 | `tags` | must include `governance,event-review,nhi-sop` |
 | `title` | `Governance event-review: NHI Merge SOP invocation on <branch> (<YYYY-MM-DD>)` |
 | `content` | the full audit record per the template in §3.4.5 |
