@@ -481,14 +481,14 @@ jobs:
             -CAcreateserial -days 1 -extfile "$TLS_DIR/server.ext" -out "$TLS_DIR/server.crt"
           chmod 644 "$TLS_DIR/ca.crt" "$TLS_DIR/server.crt" "$TLS_DIR/server.key"
           docker run -d --name pg-age -p 5432:5432 \
-            -e POSTGRES_USER=ai_memory -e POSTGRES_PASSWORD=ai_memory_test -e POSTGRES_DB=ai_memory_test \
+            -e POSTGRES_USER=ai_memory -e POSTGRES_PASSWORD=ai_memory_test -e POSTGRES_DB=postgres \
             -v "$TLS_DIR:/certs-src:ro" \
             apache/age:release_PG16_1.6.0 \
             bash -c 'mkdir -p /certs && cp /certs-src/server.crt /certs-src/server.key /certs && chown postgres:postgres /certs/* && chmod 600 /certs/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key'
           # Bounded readiness wait (fail LOUD, never hang to the job timeout).
           ready=0
           for attempt in $(seq 1 60); do
-            if docker exec pg-age pg_isready -U ai_memory -d ai_memory_test >/dev/null 2>&1; then
+            if docker exec pg-age pg_isready -U ai_memory -d postgres >/dev/null 2>&1; then
               ready=1; break
             fi
             sleep 2
@@ -502,14 +502,24 @@ jobs:
           # any test runs (the positive path, not just the refusal).
           # (psql comes from the `Install jq + postgresql-client` step above.)
           PGPASSWORD=ai_memory_test PGSSLMODE=verify-full PGSSLROOTCERT="$TLS_DIR/ca.crt" \
-            psql -h localhost -p 5432 -U ai_memory -d ai_memory_test -tAc \
+            psql -h localhost -p 5432 -U ai_memory -d postgres -tAc \
               "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid();" | grep -qx t \
             || { echo "::error::verify-full connect to the TLS postgres container failed"; exit 1; }
+          # #7031 H2 — mint the ephemeral per-run base (the ci.yml enterprise-fed
+          # recipe): the container's own db is the maintenance `postgres`, never
+          # the shared `ai_memory_test` name. Unique per run+attempt, [a-z0-9_],
+          # <= 63 chars; compute once and pass to later steps via $GITHUB_ENV.
+          CI_COV_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_cov" | cut -c1-63)"
+          echo "CI_COV_DB=$CI_COV_DB" >> "$GITHUB_ENV"
+          PGPASSWORD=ai_memory_test PGSSLMODE=verify-full PGSSLROOTCERT="$TLS_DIR/ca.crt" \
+            psql -h localhost -p 5432 -U ai_memory -d postgres -v ON_ERROR_STOP=1 \
+              -c "CREATE DATABASE \"$CI_COV_DB\";" \
+            || { echo "::error::failed to CREATE DATABASE $CI_COV_DB"; exit 1; }
           # The DSNs every postgres-backed test reads. `localhost` matches the
           # certificate SAN; the CA path is absolute on this runner.
           {
-            echo "AI_MEMORY_TEST_POSTGRES_URL=postgres://ai_memory:ai_memory_test@localhost:5432/ai_memory_test?sslmode=verify-full&sslrootcert=$TLS_DIR/ca.crt"
-            echo "AI_MEMORY_TEST_AGE_URL=postgres://ai_memory:ai_memory_test@localhost:5432/ai_memory_test?sslmode=verify-full&sslrootcert=$TLS_DIR/ca.crt"
+            echo "AI_MEMORY_TEST_POSTGRES_URL=postgres://ai_memory:ai_memory_test@localhost:5432/${CI_COV_DB}?sslmode=verify-full&sslrootcert=$TLS_DIR/ca.crt"
+            echo "AI_MEMORY_TEST_AGE_URL=postgres://ai_memory:ai_memory_test@localhost:5432/${CI_COV_DB}?sslmode=verify-full&sslrootcert=$TLS_DIR/ca.crt"
             echo "PGSSLMODE=verify-full"
             echo "PGSSLROOTCERT=$TLS_DIR/ca.crt"
           } >> "$GITHUB_ENV"
@@ -547,10 +557,13 @@ jobs:
           # PGSSLMODE=verify-full / PGSSLROOTCERT come from $GITHUB_ENV (set by
           # the TLS start step), so these provisioning connects take the same
           # verified TLS path the tests do.
-          psql -h localhost -p 5432 -U ai_memory -d ai_memory_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
-          psql -h localhost -p 5432 -U ai_memory -d ai_memory_test -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists or AGE init handled by ladder"
+          # The image creates `age` only in POSTGRES_DB (`postgres`), so the minted
+          # db gets BOTH extensions here (ci.yml enterprise-fed recipe); a failure
+          # fails the step (ON_ERROR_STOP, no swallow).
+          psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"
+          psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -v ON_ERROR_STOP=1 -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');"
           # Sanity check: extensions present.
-          psql -h localhost -p 5432 -U ai_memory -d ai_memory_test -c "SELECT extname FROM pg_extension ORDER BY extname;"
+          psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -c "SELECT extname FROM pg_extension ORDER BY extname;"
 
       - name: Generate coverage JSON
         # v0.7.x (#1148) — dev profile (default) WITH env-var
@@ -582,7 +595,7 @@ jobs:
             -- schema_init_postgres_embedding_dim_conversion \
                --ignored --test-threads=1
         # v0.8.0 #1709 SHIP-HARDEN — `--test-threads=1` (was `=2`).
-        # The postgres-backed tests share ONE `ai_memory_test` database with
+        # The postgres-backed tests share ONE ephemeral per-run database with
         # no per-test isolation, so running two concurrently let an
         # `archive_by_ids` (INSERT archived_memories + DELETE memories)
         # deadlock on the shared table/index locks (postgres `40P01`),

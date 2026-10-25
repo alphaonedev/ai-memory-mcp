@@ -9,9 +9,13 @@
 # `.github/workflows/coverage.yml`'s "Generate coverage JSON" step, then the
 # same "Enforce per-module thresholds" step.
 #
+# BASE DATABASE (#7031): point AI_MEMORY_TEST_POSTGRES_URL at an EPHEMERAL base
+# (`ai_memory_test_ci_<run>_cov` or `ci_base_<id>`), never the shared
+# `ai_memory_test`; coverage.yml mints one per run (CI_COV_DB).
+#
 # WHY THIS EXISTS: `cargo llvm-cov` runs the whole test binary suite under
 # instrumentation. The `sal-postgres` feature's tests share ONE
-# `ai_memory_test` database with no per-test schema isolation (see the
+# throwaway database with no per-test schema isolation (see the
 # `--test-threads=1` comment in coverage.yml, v0.8.0 #1709 SHIP-HARDEN): two
 # postgres-backed tests running CONCURRENTLY under llvm-cov can deadlock on
 # shared table/index locks (postgres `40P01`) or otherwise race on shared

@@ -7,7 +7,7 @@
 # full log under .local-runs/ for ship-gate audit trail.
 #
 # WHY `-- --test-threads=1` IS MANDATORY (do not remove):
-#   The sal-postgres suite shares ONE `ai_memory_test` database with NO
+#   The sal-postgres suite shares ONE throwaway `ai_memory_test_p1_*` database with NO
 #   per-test schema isolation (see CLAUDE.md §"Local coverage"). Running
 #   it WITHOUT serialising threads lets two postgres-backed tests grab the
 #   same advisory-lock key (`SELECT pg_advisory_lock($1)`) and DEADLOCK on
@@ -22,7 +22,7 @@
 # exercised too. The script exits non-zero if EITHER pass fails.
 #
 # WHY PASS 2 GIVES EACH BINARY ITS OWN DATABASE (#2848 — durable class fix):
-#   Pass 1 (the default suite) shares ONE `ai_memory_test` database, which
+#   Pass 1 (the default suite) shares ONE throwaway `ai_memory_test_p1_*` database, which
 #   is safe because `--test-threads=1` serialises access. Pass 2 exercises
 #   the `#[ignore]`-gated LIVE-PG tests, several of which SEED long-lived
 #   rows in mutable, cross-test-contaminating tables (e.g. the #1831 G17
@@ -69,6 +69,9 @@ PG_MAINT_DB="ai_memory_test"
 # Prefix for the throwaway per-binary Pass-2 probe databases. Kept distinct
 # from PG_MAINT_DB so leftover probes are trivially identifiable + reapable.
 PG_PROBE_PREFIX="ai_memory_test_p2_"
+# #7031 H3 — Pass 1 gets its own throwaway base too (never the shared
+# PG_MAINT_DB, which is a maintenance connection for CREATE/DROP only).
+PG_P1_DB="ai_memory_test_p1_$(date -u +%Y%m%d%H%M%S)_$$"
 # #3705 — "only encrypted data in transit": the SAL postgres adapter refuses
 # a DSN that does not pin `sslmode=verify-full` at the connect funnel, so
 # every DSN this script hands to cargo carries it, verified against the
@@ -86,7 +89,7 @@ if [ ! -s "$PG_CA" ]; then
     exit 2
 fi
 PG_SSL_QUERY="sslmode=verify-full&sslrootcert=${PG_CA}"
-PG_URL="postgres://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${PG_MAINT_DB}?${PG_SSL_QUERY}"
+PG_URL="postgres://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${PG_P1_DB}?${PG_SSL_QUERY}"
 # psql honours the same floor through libpq's env (the CLI is not gated by
 # the adapter, but the pre-flight should prove the TLS path the tests use).
 export PGSSLMODE="verify-full" PGSSLROOTCERT="$PG_CA"
@@ -97,23 +100,7 @@ echo "[lan-parity] Log:    $LOG"
 echo "[lan-parity] Pre-flight PG reach check (TLS, verify-full)..."
 PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_MAINT_DB" \
     -c "SELECT 'pg+age reachable' AS status;" >/dev/null
-echo "[lan-parity] PG+AGE reachable. Running cargo SAL-postgres tests..."
-echo ""
-
-# Pass 1 — default suite, serialized (--test-threads=1 mandatory; see header).
-echo "[lan-parity] Pass 1/2: default suite (serialized)..."
-AI_MEMORY_TEST_POSTGRES_URL="$PG_URL" \
-AI_MEMORY_NO_CONFIG=1 \
-cargo test --features sal,sal-postgres --release -- --test-threads=1 2>&1 | tee "$LOG"
-EXIT_DEFAULT=${PIPESTATUS[0]}
-echo ""
-echo "[lan-parity] Pass 1/2 cargo exit code: $EXIT_DEFAULT"
-
-# ---------------------------------------------------------------------------
-# Pass 2 — #[ignore]-gated live-pg tests, serialized, PER-BINARY-ISOLATED.
-# Appended to the same log. See the header block for why each binary gets its
-# own fresh database.
-# ---------------------------------------------------------------------------
+echo "[lan-parity] PG+AGE reachable. Minting Pass 1 base ${PG_P1_DB}..."
 
 # psql against the maintenance DB (used only for CREATE/DROP DATABASE, which
 # cannot run inside a transaction block — hence one `-c` per statement).
@@ -134,6 +121,30 @@ cleanup_probe_dbs() {
     done
 }
 trap cleanup_probe_dbs EXIT
+
+CREATED_PROBE_DBS+=("$PG_P1_DB")
+pg_maint -c "CREATE DATABASE \"$PG_P1_DB\";"
+psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_P1_DB" -v ON_ERROR_STOP=1 -q \
+    -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"
+echo "[lan-parity] Running cargo SAL-postgres tests..."
+echo ""
+
+# Pass 1 — default suite, serialized (--test-threads=1 mandatory; see header).
+echo "[lan-parity] Pass 1/2: default suite (serialized)..."
+AI_MEMORY_TEST_POSTGRES_URL="$PG_URL" \
+AI_MEMORY_NO_CONFIG=1 \
+cargo test --features sal,sal-postgres --release -- --test-threads=1 2>&1 | tee "$LOG"
+EXIT_DEFAULT=${PIPESTATUS[0]}
+echo ""
+echo "[lan-parity] Pass 1/2 cargo exit code: $EXIT_DEFAULT"
+# Drop the Pass 1 base now; the EXIT trap would reap it on an early failure.
+pg_maint -c "DROP DATABASE IF EXISTS \"$PG_P1_DB\" WITH (FORCE);" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Pass 2 — #[ignore]-gated live-pg tests, serialized, PER-BINARY-ISOLATED.
+# Appended to the same log. See the header block for why each binary gets its
+# own fresh database.
+# ---------------------------------------------------------------------------
 
 # Reap any probe DBs left behind by a previously-crashed run (idempotent /
 # safe-to-re-run).

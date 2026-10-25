@@ -255,6 +255,10 @@ jobs:
         run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      - name: Shared test database reference gate unit tests (#7031)
+        run: python3 -m unittest scripts/test/test_check_shared_test_db_refs_7031.py
+      - name: Refuse shared test database references (#7031)
+        run: python3 scripts/ci/check_shared_test_db_refs.py --root .
       # #7160 - scripts/test/ is outside the discovery root above; run the
       # sweep script tests (including the Linux-only O_PATH test, which this
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
@@ -1219,7 +1223,7 @@ jobs:
             echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1"
           else
-            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
+            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env --emit-env-unmasked >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
           fi
 
@@ -1234,7 +1238,7 @@ jobs:
         run: |
           set -euo pipefail
           cd scripts/ci/tests
-          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd
+          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd test_pg_isolated_binary.LiveLineagePrecheck7031
 
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary

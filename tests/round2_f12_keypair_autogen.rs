@@ -19,7 +19,7 @@ use ai_memory::identity::keypair::{EnsureOutcome, ensure_keypair};
 
 #[test]
 fn auto_gen_creates_keypair_files_on_first_call() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = private_tempdir();
     let outcome = ensure_keypair("daemon-test", dir.path(), false).expect("ensure");
     let pub_path = dir.path().join("daemon-test.pub");
     let priv_path = dir.path().join("daemon-test.priv");
@@ -37,7 +37,7 @@ fn auto_gen_creates_keypair_files_on_first_call() {
 
 #[test]
 fn auto_gen_is_idempotent_across_restarts() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = private_tempdir();
 
     // First "serve startup" — generates a fresh keypair.
     let first = ensure_keypair("daemon-test", dir.path(), false).expect("first");
@@ -67,7 +67,7 @@ fn auto_gen_is_idempotent_across_restarts() {
 
 #[test]
 fn auto_gen_skips_when_identity_disabled() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = private_tempdir();
     let outcome = ensure_keypair("daemon-test", dir.path(), true).expect("ensure");
     assert_eq!(outcome, EnsureOutcome::SkippedDisabled);
 
@@ -83,9 +83,23 @@ fn auto_gen_skips_when_identity_disabled() {
 fn auto_gen_third_call_still_observes_existing() {
     // Defence-in-depth: idempotency holds across an arbitrary number
     // of calls, not just two.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = private_tempdir();
     let _ = ensure_keypair("daemon-test", dir.path(), false).unwrap();
     let _ = ensure_keypair("daemon-test", dir.path(), false).unwrap();
     let third = ensure_keypair("daemon-test", dir.path(), false).unwrap();
     assert!(matches!(third, EnsureOutcome::AlreadyExists { .. }));
+}
+
+/// #7185 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }
