@@ -51,6 +51,8 @@ HTTPS_T = "tests/test_require_https_8195_r4.py"
 PREPATCH = "tests/test_tls_prepatch_8195_r5.py"
 PREPATCH6 = "tests/test_tls_prepatch_8195_r6.py"
 PREPATCH7 = "tests/test_tls_getset_identity_8195_r7.py"
+ASYNC7 = "tests/test_tls_async_wire_8195_r7.py"
+FLOOR7 = "tests/test_tls_session_floor_8195_r7.py"
 RUNNER_T = "tests/test_run_mutants_8195.py"
 DOCS_T = "tests/test_docs_truth_6689.py"
 CLIENT_T = "tests/test_client.py"
@@ -60,7 +62,7 @@ ATTEST = "tests/test_attestation_keyfile_3784.py"
 #: Every test file a mutant may be killed by; the runner executes all of them per row.
 KILLER_TESTS = (
     FLOOR, SESSION, VERIFY, CAPATH7, CAPATH8, OWNED_T, OWNED_R, ACL, ACL_FC, WAKE_T,
-    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T, PREPATCH, PREPATCH6, PREPATCH7,
+    CI_T, DOCS_T, CLIENT_T, WAKE_C, ATTEST, TRUST, HTTPS_T, PREPATCH, PREPATCH6, PREPATCH7, ASYNC7, FLOOR7,
 )
 
 
@@ -416,7 +418,7 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant("R7", "session: negotiated version read through the Python socket (sec r6 S1-wire)", COMMON,
            "        return _SessionFacts(raw)\n",
            "        facts = _SessionFacts(raw)\n        facts.version = session.version()  # type: ignore[attr-defined]\n        return facts\n",
-           killers=(PREPATCH7,)),
+           killers=(PREPATCH7, ASYNC7)),
     Mutant("R7", "session: cipher read through the Python socket (sec r6 S1-wire)", COMMON,
            "        return _SessionFacts(raw)\n",
            "        facts = _SessionFacts(raw)\n        facts.negotiated = session.cipher()  # type: ignore[attr-defined]\n        return facts\n",
@@ -431,10 +433,16 @@ MUTANTS: tuple[Mutant, ...] = (
            killers=(PREPATCH7,)),
     Mutant("R7", "session: Python stand-in _sslobj accepted (sec r6 S1-wire)", COMMON,
            "    return raw if type(raw) is _C_SSLOBJ else None\n", "    return raw\n",
-           killers=(PREPATCH7,)),
+           killers=(PREPATCH7, ASYNC7)),
     Mutant("R7", "session: _sslobj read through a __getattribute__ override (sec r6 S1-wire)", COMMON,
            '        raw = object.__getattribute__(session, "_sslobj")\n',
            '        raw = getattr(session, "_sslobj")\n', killers=(PREPATCH7,)),
+    Mutant("R7", "session: 111-bit suite admitted, bits > 0 only (code r6 F1)", COMMON,
+           "        or negotiated[2] < _MINIMUM_SUITE_STRENGTH_BITS\n",
+           "        or negotiated[2] <= 0\n", killers=(FLOOR7,)),
+    Mutant("R7", "session: floor lowered to 56 bits (code r6 F1)", COMMON,
+           "        or negotiated[2] < _MINIMUM_SUITE_STRENGTH_BITS\n",
+           "        or negotiated[2] < 56\n", killers=(FLOOR7,)),
     Mutant("R7", "session: leaf validity read through the Python socket (sec r6 S1-wire)", COMMON,
            "    facts = _session_facts(session)\n    peer = None if facts is None else facts.peer\n",
            "    peer = session.getpeercert()  # type: ignore[attr-defined]\n", killers=(PREPATCH7,)),

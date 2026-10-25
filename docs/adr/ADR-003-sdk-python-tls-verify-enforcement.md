@@ -23,7 +23,7 @@ SDK enforces that the negotiated session:
 - uses the caller's context object
 - carries a non-empty peer certificate that names the request host and whose
   validity dates include now
-- negotiated a cipher with secret bits
+- negotiated a cipher with at least 112 secret bits (the same floor as the construction check)
 
 Failure closes the stream and raises `ValueError` (fail closed). A response-time
 backstop repeats the check on the connection the response came over. It covers a
@@ -144,7 +144,9 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
   them is not, which is why they come from the class chain and not from the `_ssl` module table. A candidate counts as a getset only by identity with the
   builtin getset type (`type(type.__dict__["__dict__"])`), never by type name, which a Python class can copy (sec r6 S1). The negotiated session (version, suite, peer
   certificate, context) is read through the C `_ssl._SSLSocket` method descriptors, not the Python `SSLSocket` or `SSLObject` methods, which a class set before the import can
-  replace (sec r6 S1-wire). The threat boundary is code that runs in the caller's
+  replace (sec r6 S1-wire). On the async client the stream's `SSLObject` class (`sslobject_class`) and factory
+  (`wrap_bio`) are replaceable the same way; the gate reads the C object behind the session (`_sslobj`, checked by
+  identity with the C type) and refuses a session with no provably-C object (code r6 F1). The threat boundary is code that runs in the caller's
   process before `ai_memory` is imported; the negotiated-session gate holds on the wire either way. ASCII label shape (length, hyphens) is not validated by the SDK; check and send agree (code r5 F4). README ("Base URLs are `https://` even for
   `localhost`") and the in-transit standard #3824 grant no loopback exception.
   decision: refuse every non-https base URL at construction over a warning or a loopback exception because

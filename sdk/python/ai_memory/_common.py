@@ -905,12 +905,14 @@ def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: s
     ``CERT_OPTIONAL`` without a certificate, anonymous suites). The certificate
     must also name ``host``, the host the request is addressed to, whatever
     the context's ``check_hostname`` was at handshake time (#6350), and the
-    negotiated protocol must be TLS 1.2 or newer and the suite must carry secret bits
-    (no eNULL, #6305). Unlike the
+    negotiated protocol must be TLS 1.2 or newer and the suite must carry at least
+    :data:`_MINIMUM_SUITE_STRENGTH_BITS` secret bits (no eNULL, no export grade, #6305, code r6 F1). Unlike the
     pre-handshake predicate this inspects what actually happened on the wire,
     so it also closes the check/use race (#6306) and auth-null suites (#6305). Every read goes
     through the C ``_ssl._SSLSocket`` object (:func:`_session_facts`), never through the Python
-    ``SSLSocket`` / ``SSLObject`` methods a class set before import can replace (sec r6 S1-wire).
+    ``SSLSocket`` / ``SSLObject`` methods a class set before import can replace (sec r6 S1-wire); on the async client the stream's ``SSLObject`` class
+    (``sslobject_class``) and factory (``wrap_bio``) are replaceable the same way, so a session whose
+    ``_sslobj`` is not the C type is refused (code r6 F1).
     """
     facts = _session_facts(session)
     if facts is None or facts.context is not context:
@@ -927,7 +929,7 @@ def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: s
         not isinstance(negotiated, tuple)
         or len(negotiated) != 3
         or not isinstance(negotiated[2], int)
-        or negotiated[2] <= 0
+        or negotiated[2] < _MINIMUM_SUITE_STRENGTH_BITS
     ):
         raise ValueError(_SESSION_MESSAGE)
 
