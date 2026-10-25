@@ -42,11 +42,10 @@ EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
 EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
 # everything from the scheme to the next whitespace is replaced (F34): a userinfo with a `/` or an `@` in it is masked too
 URL_ALL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*")
-# the line-level mask leaves a token that is already ``scheme://***`` alone, so a masked label inside a problem line keeps
-# its closing bracket and the text after it
-URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)(?!\*\*\*(?:\W|$))\S*")
-# an `@`, or a `://` that the mask did not replace, left in a name that is about to be printed (F34)
-URL_LEFT = re.compile(r"@|://(?!\*\*\*)")
+# the second-layer line mask (F36): every ``scheme://`` token up to the next whitespace is replaced, with no look-ahead that
+# author text can satisfy; only a trailing run of closing punctuation survives, so a label that arrived pre-masked keeps
+# its bracket (``(https://***):`` stays whole) while a userinfo can never be carried past the mask by the text after it
+URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*?([)\]}:,;.]*)(?=\s|$)")
 HOSTED_LABEL = re.compile(r"^(?:ubuntu|macos|windows)-(?:latest|\d+(?:\.\d+)?)(?:-(?:arm|arm64|xlarge|large|intel))*$")
 LOCAL_USES = re.compile(r"^\./")
 
@@ -75,7 +74,7 @@ class StrictLoader(BASE_LOADER):
         if not isinstance(node, yaml.MappingNode):
             raise StrictYamlError("expected a mapping")
         mapping = {}
-        for key_node, value_node in node.value:
+        for position, (key_node, value_node) in enumerate(node.value):
             if key_node.tag == MERGE_TAG:
                 raise StrictYamlError("a merge key (<<) is not allowed in a tier workflow")
             if not isinstance(key_node, yaml.ScalarNode):
@@ -87,14 +86,14 @@ class StrictLoader(BASE_LOADER):
             else:
                 raise StrictYamlError("a mapping key that is not a string is not allowed")
             if key in mapping:
-                raise StrictYamlError("the mapping key %r appears twice" % key)
+                raise StrictYamlError("the mapping key %r appears twice" % key_label(key, position))
             mapping[key] = self.construct_object(value_node, deep=deep)
         return mapping
 
 
 def mask_userinfo(text):
     """``text`` with the user:password of every ``scheme://user:pass@`` replaced (a failure message never echoes it)."""
-    return URL_USERINFO.sub(r"\1***", text)
+    return URL_USERINFO.sub(r"\1***\2", text)
 
 
 def printable(value, fallback):
@@ -103,10 +102,17 @@ def printable(value, fallback):
     The whole value is joined on its whitespace and masked first, then tested: if any ``@`` or unmasked ``://`` is left, the
     value may still carry a credential fragment (a userinfo broken by a line break, folding whitespace, ``/`` or ``@``)
     and none of its text is printed.  The cut to 60 characters comes last (F33)."""
-    masked = URL_ALL.sub(r"\1***", " ".join(str(value).split()))
-    if URL_LEFT.search(masked):
+    joined = " ".join(str(value).split())
+    masked = URL_ALL.sub(r"\1***", joined)
+    if "@" in masked or masked.count("://") != len(URL_ALL.findall(joined)):
         return fallback
     return masked[:60]
+
+
+def key_label(key, position):
+    """``key`` of a mapping for a message, or ``key[<position>]`` (F36): every author key goes through ``printable`` with a
+    fixed positional fallback, so no key text that is not provably free of a credential fragment is ever printed."""
+    return printable(key, "key[%d]" % position)
 
 
 def job_label(name, jobs):
@@ -151,7 +157,7 @@ def parse_workflow(text):
     problems = []
     extra = sorted(set(data) - TOP_LEVEL_KEYS)
     if extra:
-        problems.append("top-level keys outside the closed set: " + ", ".join(extra))
+        problems.append("top-level keys outside the closed set: " + ", ".join(key_label(key, position) for position, key in enumerate(extra)))
     if not isinstance(data.get("jobs"), dict) or not data["jobs"]:
         problems.append("the workflow holds no jobs mapping")
     return data, problems
@@ -254,11 +260,11 @@ def step_label(step, index):
 def first_difference(pinned, job):
     """``(step index or None, path)`` of the first key of ``job`` that differs from its pin entry."""
     steps = job.get("steps") if isinstance(job.get("steps"), list) else []
-    for key, value in job.items():
+    for position, (key, value) in enumerate(job.items()):
         if key == "steps":
             continue
         if pinned["keys"].get(key) != digest(value):
-            return None, "job." + key
+            return None, "job." + key_label(key, position)
     for key in pinned["keys"]:
         if key != "steps" and key not in job:
             return None, "job." + key + " (removed)"
@@ -268,9 +274,9 @@ def first_difference(pinned, job):
             return index, "steps[%d] (added)" % index
         if old_steps[index]["sha256"] != digest(step):
             if isinstance(step, dict) and "keys" in old_steps[index]:
-                for key, value in step.items():
+                for position, (key, value) in enumerate(step.items()):
                     if old_steps[index]["keys"].get(key) != digest(value):
-                        return index, "steps[%d].%s" % (index, key)
+                        return index, "steps[%d].%s" % (index, key_label(key, position))
                 for key in old_steps[index]["keys"]:
                     if key not in step:
                         return index, "steps[%d].%s (removed)" % (index, key)
@@ -351,13 +357,13 @@ def matrix_values(matrix, field):
         return None, "strategy.matrix is not a mapping"
     if "exclude" in matrix:
         return None, "strategy.matrix.exclude is present"
-    for key, value in matrix.items():
+    for position, (key, value) in enumerate(matrix.items()):
         if not isinstance(key, str) or EXPRESSION in key:
             return None, "a matrix key is not a plain string"
         if key == "include":
             continue
         if not isinstance(value, list) or not value or not all(plain_scalar(item) for item in value):
-            return None, "matrix.%s is not a list of plain scalars" % key
+            return None, "matrix.%s is not a list of plain scalars" % key_label(key, position)
     include = matrix.get("include", [])
     if not isinstance(include, list):
         return None, "matrix.include is not a list"

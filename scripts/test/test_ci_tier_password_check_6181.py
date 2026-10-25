@@ -892,13 +892,14 @@ def workflow_key_problems(workflow, data, pinned_keys):
     shared by ``primary_pin_problems`` and ``exempt_workflow_key_problems`` (F23b); key names only, never values."""
     level = {key: ty.digest(value) for key, value in data.items() if key != "jobs"}
     problems = []
-    for key in sorted(set(level) | set(pinned_keys)):
+    for position, key in enumerate(sorted(set(level) | set(pinned_keys))):
+        label = ty.key_label(key, position)
         if key not in level:
-            problems.append(f"{workflow}: the pinned workflow-level key {key} is missing")
+            problems.append(f"{workflow}: the pinned workflow-level key {label} is missing")
         elif key not in pinned_keys:
-            problems.append(f"{workflow}: a workflow-level key {key} was added and is not pinned")
+            problems.append(f"{workflow}: a workflow-level key {label} was added and is not pinned")
         elif level[key] != pinned_keys[key]:
-            problems.append(f"{workflow}: the workflow-level key {key} differs from the pin")
+            problems.append(f"{workflow}: the workflow-level key {label} differs from the pin")
     return problems
 
 
@@ -2416,7 +2417,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
 
     def test_a_userinfo_shaped_step_name_is_masked_in_both_views_8187_f31(self):
         sentinel = "SENTINEL-F31-pw"
-        planted = [f"      - name: https://user:{sentinel}@host.example/db", "        run: echo one"]
+        planted = [f"      - name: https://user:{sentinel}@dbhost/db", "        run: echo one"]
         checked = 0
         for wf, text in self.texts.items():
             target = next(iter(pin_targets(wf, text)), None)
@@ -2430,7 +2431,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
             for view, problems in views.items():
                 with self.subTest(workflow=wf, view=view):
                     checked += 1
-                    self.assertEqual([p for p in problems if sentinel in p], [])
+                    self.assertEqual([p for p in problems if sentinel in p or "dbhost" in p], [])
                     self.assertTrue([p for p in problems if f"step {index} (https://***)" in p],
                                     (view, index))
         self.assertGreater(checked, 0)
@@ -2440,10 +2441,10 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
         """F33: the mask runs before the 60-character cut, so an ``@`` past character 60 still hides the userinfo."""
         sentinel = "SENTINEL-F33-pw"
         cases = {
-            "at-past-60": (f"the staging database lives at https://ciuser:{sentinel}-{'x' * 40}@host.example/db",
+            "at-past-60": (f"the staging database lives at https://ciuser:{sentinel}-{'x' * 40}@dbhost/db",
                            "the staging database lives at https://***"),
-            "password-over-60": (f"https://ciuser:{sentinel}-{'y' * 70}@host.example/db", "https://***"),
-            "prefix-and-password-over-60": (f"see https://ciuser:{sentinel}-{'z' * 70}@host.example/db",
+            "password-over-60": (f"https://ciuser:{sentinel}-{'y' * 70}@dbhost/db", "https://***"),
+            "prefix-and-password-over-60": (f"see https://ciuser:{sentinel}-{'z' * 70}@dbhost/db",
                                             "see https://***"),
         }
         checked = 0
@@ -2461,7 +2462,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                 for view, problems in views.items():
                     with self.subTest(workflow=wf, variant=variant, view=view):
                         checked += 1
-                        self.assertEqual([p for p in problems if sentinel in p or "ciuser" in p], [])
+                        self.assertEqual([p for p in problems if sentinel in p or "ciuser" in p or "dbhost" in p], [])
                         self.assertTrue([p for p in problems if f"step {index} ({label})" in p], (view, index))
         self.assertGreater(checked, 0)
 
@@ -2477,9 +2478,16 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
             "escaped newline": [f'      - name: "https://{user}:{sentinel}-pa\\nss@dbhost/db"'],
             "plain continuation": [f"      - name: https://{user}:{sentinel}-pa", "          ss@dbhost/db"],
             "break before the at sign": ["      - name: |", f"          https://{user}:{sentinel}-{'x' * 20}",
-                                         "          @host.example/db"],
+                                         "          @dbhost/db"],
             "slash in the password": [f"      - name: https://{user}:{sentinel}/pw@dbhost/db"],
             "at sign in the password": [f"      - name: https://{user}:{sentinel}@pw@dbhost/db"],
+            # F37: a scheme with no `//` is not masked, so only the whole-value `@` check keeps these off the line; the
+            # `@` sits past character 60 (m4b, m6) or on the next physical line (m4a)
+            "no-slash scheme, at sign past 60": [f"      - name: postgresql:{user}:{sentinel}-{'x' * 60}@dbhost/db"],
+            "no-slash scheme, at sign on the next line": ["      - name: |", f"          postgresql:{user}:{sentinel}-pa",
+                                                          "          ss@dbhost/db"],
+            "no-slash scheme, at sign past 60 on a second line": [
+                "      - name: |", f"          postgresql:{user}:{sentinel}-{'y' * 60}", "          @dbhost/db"],
         }
         checked = 0
         for wf, text in self.texts.items():
@@ -2497,7 +2505,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                         checked += 1
                         self.assertTrue(problems)
                         self.assertEqual([p for p in problems if sentinel in p or user in p
-                                          or "://" in p.replace("://***", "") or "@dbhost" in p], [])
+                                          or "://" in p.replace("://***", "") or "dbhost" in p], [])
                         labelled = [p for p in problems if re.search(
                             r"step %d \((?:step\[%d\]|[^)@]*\*\*\*[^)@]*)\)" % (index, index), p)]
                         self.assertTrue(labelled, (view, index))
@@ -2530,8 +2538,138 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                         checked += 1
                         self.assertTrue(problems)
                         self.assertEqual([p for p in problems if sentinel in p or user in p
-                                          or "://" in p.replace("://***", "") or "@dbhost" in p], [])
+                                          or "://" in p.replace("://***", "") or "dbhost" in p], [])
         self.assertGreater(checked, 0)
+
+
+class TestEveryAuthorKeyIsPrintable8187R19(unittest.TestCase):
+    """r19 F36: every author key that reaches a message goes through ``ty.printable`` with a positional fallback
+    (``key[<n>]``); the line mask is a second layer with no look-ahead that author text can satisfy."""
+
+    USER = "f36user"
+    SENTINEL = "SENTINEL-F36-pw"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {wf: (WORKFLOWS / wf).read_text(encoding="utf-8") for wf in PIN_WORKFLOWS}
+        cls.pins = load_job_pins()
+
+    def shapes(self):
+        sentinel, user = self.SENTINEL, self.USER
+        return {
+            "space": f"https://{user}:{sentinel} pw@dbhost/db",
+            "slash": f"https://{user}:{sentinel}/pw@dbhost/db",
+            "at sign": f"https://{user}:{sentinel}@pw@dbhost/db",
+            "star colon": f"https://***:{sentinel}@dbhost/db",
+            "star slash": f"https://***/{sentinel}@dbhost/db",
+            "star dot space": f"https://***. {sentinel} pw@dbhost/db",
+            "no scheme": f"{user}:{sentinel} pw@dbhost/db",
+        }
+
+    def leaks(self, problems):
+        return [p for p in problems if self.SENTINEL in p or self.USER in p or "dbhost" in p
+                or "://" in p.replace("://***", "")]
+
+    def assert_clean(self, problems, view):
+        self.assertTrue(problems, view)
+        self.assertEqual(self.leaks(problems), [], view)
+        self.assertTrue([p for p in problems if "key[" in p or "://***" in p], (view, problems))
+
+    def test_a_duplicate_top_level_key_is_printed_by_position_8187_f36(self):
+        checked = 0
+        for wf, text in self.texts.items():
+            for variant, key in self.shapes().items():
+                edited = text.rstrip("\n") + f'\n"{key}": 1\n"{key}": 2\n'
+                with self.subTest(workflow=wf, shape=variant):
+                    checked += 1
+                    self.assert_clean(primary_pin_problems(wf, edited, self.pins[PRIMARY]), "loaded")
+        self.assertGreater(checked, 0)
+
+    def test_an_extra_top_level_key_is_printed_by_position_8187_f36(self):
+        """Covers the closed-set message of ``parse_workflow`` and the ``workflow_key_problems`` "added" message."""
+        checked = 0
+        for wf, text in self.texts.items():
+            for variant, key in self.shapes().items():
+                edited = text.rstrip("\n") + f'\n"{key}": 1\n'
+                self.assertIn(self.SENTINEL, json.dumps(ty.load_strict(edited)))
+                problems = primary_pin_problems(wf, edited, self.pins[PRIMARY])
+                with self.subTest(workflow=wf, shape=variant):
+                    checked += 1
+                    self.assert_clean(problems, "loaded")
+                    self.assertTrue([p for p in problems if "top-level keys outside the closed set" in p])
+                    self.assertTrue([p for p in problems if "was added and is not pinned" in p])
+        self.assertGreater(checked, 0)
+
+    def test_a_job_key_and_a_step_key_are_printed_by_position_8187_f36(self):
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            job = target[0]
+            head = f"\n  {job}:"
+            self.assertEqual(text.count(head), 1, (wf, job))
+            lines = text.split("\n")
+            step_head = lines[target[3]]
+            self.assertTrue(step_head.lstrip().startswith("- name:"), (wf, step_head))
+            pad = " " * (indent_of(step_head) + 2)
+            for variant, key in self.shapes().items():
+                job_edit = text.replace(head, f'{head}\n    "{key}": 1')
+                step_edit = splice(text, target[3] + 1, [f'{pad}"{key}": 1'])
+                for site, edited, want in (("job key", job_edit, "job.key["), ("step key", step_edit, "].key[")):
+                    self.assertIn(self.SENTINEL, json.dumps(ty.load_strict(edited)["jobs"]))
+                    problems = primary_pin_problems(wf, edited, self.pins[PRIMARY])
+                    with self.subTest(workflow=wf, shape=variant, site=site):
+                        checked += 1
+                        self.assert_clean(problems, "loaded")
+                        self.assertTrue([p for p in problems if "differs from the pin at" in p
+                                         and (want in p or "://***" in p)], (site, problems))
+        self.assertGreater(checked, 0)
+
+    def test_a_matrix_key_is_printed_by_position_8187_f36(self):
+        row = next(iter(ty.RUNS_ON_EXEMPT.values()))
+        pinned = row[1]
+        field = ty.RUNS_ON_FORMS[pinned][0]
+        for variant, key in self.shapes().items():
+            job = {"runs-on": pinned, "strategy": {"matrix": {field: ["ubuntu-latest"], key: 1}}}
+            with self.subTest(shape=variant):
+                why = ty.exemption_problem(row, job)
+                self.assertTrue(why)
+                self.assertEqual(self.leaks([why]), [])
+                self.assertRegex(why, r"^matrix\.(?:key\[\d+\]|https://\*\*\*) is not a list of plain scalars$")
+
+    def test_a_userinfo_that_starts_with_the_mask_token_is_masked_in_both_views_8187_f36(self):
+        """The ``***:``-prefixed userinfo that the r18 look-ahead let through, planted in a step name."""
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            for variant in ("star colon", "star slash"):
+                name = self.shapes()[variant]
+                edited = splice(text, target[3], [f"      - name: {name}", "        run: echo one"])
+                job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+                index = next(i for i, step in enumerate(job_steps) if self.SENTINEL in json.dumps(step))
+                views = {"loaded": tier_pin_problems(wf, edited, self.pins),
+                         "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
+                for view, problems in views.items():
+                    with self.subTest(workflow=wf, shape=variant, view=view):
+                        checked += 1
+                        self.assertTrue(problems)
+                        self.assertEqual(self.leaks(problems), [])
+                        self.assertTrue([p for p in problems if f"step {index} (https://***)" in p
+                                         or f"step {index} (step[{index}])" in p], (view, index))
+        self.assertGreater(checked, 0)
+
+    def test_the_line_mask_is_a_second_layer_with_no_look_ahead_8187_f36(self):
+        sentinel = self.SENTINEL
+        for text in (f"x https://***:{sentinel}@dbhost/db y", f"x https://***/{sentinel}@dbhost y",
+                     f"x https://***@{sentinel}@dbhost y", f"x https://***){sentinel}@dbhost y"):
+            with self.subTest(text=text):
+                masked = ty.mask_userinfo(text)
+                self.assertNotIn(sentinel, masked)
+                self.assertNotIn("dbhost", masked)
+        self.assertEqual(ty.mask_userinfo("step 3 (https://***): differs"), "step 3 (https://***): differs")
 
 
 if __name__ == "__main__":
