@@ -631,6 +631,19 @@ class MacOsPathRoots8174(unittest.TestCase):
                 self.assertNotIn(sec, self._red(line), line)
                 self.assertNotIn(sec[:30], self._red(line), line)
 
+    def test_sub32_mixed_case_run_near_a_root_is_masked(self):
+        """sec r2 F1: the whole-path 32+ floor spans the peeled root (masked at base)."""
+        tok = "Qx7Kp2" + "Lm9Zr4Tv8Wy3Bn6Hc1Dj5Fg"
+        self.assertEqual(len(tok), 29)
+        for line in (
+            "/home/" + tok,
+            "/home/x/" + tok,
+            "/Users/" + tok,
+            "/Users/x/" + tok,
+            "/Volumes/x/" + tok,
+        ):
+            self.assertNotIn(tok, self._red("dir=" + line), line)
+
     def test_uppercase_only_allowed_in_the_root_segment(self):
         sec = "AbCdEfGhIjKlMnOpQrStUvWxYz012345" + "67"
         self.assertNotIn(sec, self._red("/Volumes/ci-data/" + sec + "/x"))
