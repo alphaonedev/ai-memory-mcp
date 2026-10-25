@@ -63,6 +63,19 @@ OBSERVATIONS = {
     "function env then env --ignore-environment": _job("env() { :; }", "env --ignore-environment cargo build --locked"),
 }
 
+# Round 10 (sec r9 F1): `${name@<op>}` re-evaluates the value, so every operator letter (and one unknown letter) in four
+# placements is a step text the guard refuses. Row C18 of the security review is `echo "${X@P}"` shaped.
+TRANSFORM_OPS = ("P", "E", "Q", "A", "a", "K", "k", "U", "u", "L", "Z")
+TRANSFORM_PLACES = {
+    "bare": "echo ${X@%s}",
+    "in double quotes": 'echo "${X@%s}"',
+    "with an array subscript": "echo ${A[@]@%s}",
+    "nested in a command substitution": "echo $(echo ${X@%s})",
+}
+for _op in TRANSFORM_OPS:
+    for _place, _shape in TRANSFORM_PLACES.items():
+        OBSERVATIONS["parameter transformation @%s %s" % (_op, _place)] = _job(_shape % _op)
+
 # Round 10 (code r9 F1): the shapes the reviewer named that are NOT observable. name -> (workflow text, errors at head);
 # the unmutated guard and the "unreadable RUSTFLAGS value allowed" mutant give the same count for each, so none of them
 # can kill the mutant.

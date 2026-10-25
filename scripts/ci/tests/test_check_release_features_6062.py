@@ -1341,7 +1341,7 @@ class Round10(unittest.TestCase):
 
     def test_every_observation_is_refused_at_head(self):
         self.assertEqual(self.sweep.accepted_observations(SCRIPT, self.tmp / "head"), [])
-        self.assertEqual(len(self.sweep.OBSERVATIONS), 10)
+        self.assertEqual(len(self.sweep.OBSERVATIONS), 10 + 44)
 
     def test_no_equivalent_row_is_observable(self):
         """F1: an observation that the mutant accepts proves the row is not equivalent (and its absence is the proof)."""
@@ -1357,7 +1357,7 @@ class Round10(unittest.TestCase):
         rows = {desc: (old, new) for desc, old, new in self.sweep.EXTRA_MUTANTS}
         missing = []
         for desc in ("unreadable RUSTFLAGS value allowed", "chain chain needs the &&",
-                     "substitution in the checklist allowed", "env -i allowed"):
+                     "substitution in the checklist allowed", "env -i allowed", "parameter transformation allowed"):
             if desc not in rows:
                 missing.append(desc)
                 continue
