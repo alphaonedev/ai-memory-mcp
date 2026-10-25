@@ -30,7 +30,7 @@ name: CI
 #
 # So on LINUX there is now exactly ONE reason to be self-hosted:
 #
-#   pg-tier   the always-up native PG 18.6 + AGE 1.8.0 + pgvector 0.8.6
+#   pg-tier   the always-up native PG 18.6 + AGE 1.8.0 + pgvector 0.8.7
 #             instance on :5445. A job qualifies if it reads the node-local
 #             tier-URL file, CREATE DATABASEs an ephemeral db on it, or points
 #             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL at it. TWO
@@ -233,6 +233,26 @@ jobs:
         run: python3 scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)
         run: python3 scripts/test/test_workflow_concurrency_6340.py
+      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
+      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
+      - name: Resolve the corpus ratchet base (#7987)
+        env:
+          PR_BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$PR_BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
+              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
+              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+              git fetch --no-tags --deepen=200 origin HEAD || true
+            fi
+            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
+          else
+            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
+          fi
+      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
+      - name: Fetch the corpus replay objects (#7988)
+        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
       # #7160 - scripts/test/ is outside the discovery root above; run the
@@ -603,7 +623,7 @@ jobs:
   # in <30 seconds.
   # v1.0.0 self-hosted 2x2 correctness matrix. {linux-fed, macos-fed} nodes
   # × {sqlite (default features), enterprise-fed (sal-postgres against the
-  # always-up native pg18.6+AGE1.8.0+pgvector0.8.6 tier)}. These four
+  # always-up native pg18.6+AGE1.8.0+pgvector0.8.7 tier)}. These four
   # `Check (…)` job names are REQUIRED contexts on release/v1.0.0 — declared
   # in scripts/qc-allowlists/required-contexts-release.txt — so all four
   # expansions MUST run and complete SUCCESS even on docs-only PRs; the
@@ -1108,7 +1128,7 @@ jobs:
       # the heuristic might otherwise miss still fails the build.
       # v1.0.0 self-hosted 2x2 — enterprise-fed tier wiring. Only the
       # `enterprise-fed` legs point at the node's always-up native pg tier
-      # (pg18.6 + AGE 1.8.0 + pgvector 0.8.6, TLS verify-full). The URL lives
+      # (pg18.6 + AGE 1.8.0 + pgvector 0.8.7, TLS verify-full). The URL lives
       # ONLY on that node's disk ($HOME/.ai-memory-ci-fed-url); reading it into
       # $GITHUB_ENV switches on the `sal-postgres` integration cells. The
       # `sqlite` legs deliberately leave AI_MEMORY_TEST_POSTGRES_URL UNSET so
@@ -2059,7 +2079,7 @@ jobs:
   # spun up a `services: pgvector/pgvector:pg16` container and ran the whole
   # sal-postgres integration suite. That coverage now lives in the 2x2 `check`
   # matrix's `enterprise-fed` legs, which run the sal-postgres tests against
-  # the node's ALWAYS-UP native pg18.6 + AGE 1.8.0 + pgvector 0.8.6 tier — a
+  # the node's ALWAYS-UP native pg18.6 + AGE 1.8.0 + pgvector 0.8.7 tier — a
   # truer target than a throwaway pg16 container. So there is no `services:`
   # block, no per-PR pg image, no mold/disk/swap hosted-runner hacks here.
   #

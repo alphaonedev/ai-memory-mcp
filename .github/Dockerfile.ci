@@ -111,7 +111,7 @@ RUN set -eux; \
 
 # Provenance labels (mirrors the release.yml GHCR image convention).
 LABEL org.opencontainers.image.source="https://github.com/alphaonedev/ai-memory-mcp"
-LABEL org.opencontainers.image.description="ai-memory CI image: certified PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 data tier plus the Rust CI build deps (mold, build-essential, jq, sqlite3, postgresql-client)."
+LABEL org.opencontainers.image.description="ai-memory CI image: certified PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7 data tier plus the Rust CI build deps (mold, build-essential, jq, sqlite3, postgresql-client)."
 
 # The base image's postgres ENTRYPOINT/CMD + USER state are intentionally
 # left untouched: `docker run` starts postgres (AGE auto-inits) exactly as the

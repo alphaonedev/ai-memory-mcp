@@ -309,7 +309,7 @@ EOS
 )"
     echo "$versions" | grep -q '^18\.6' && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($versions)"
     echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($versions)"
-    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($versions)"
+    echo "$versions" | grep -qx 'vector=0.8.7' && ok "node $((i + 1)) pgvector 0.8.7" || no "node $((i + 1)) pgvector is not 0.8.7 ($versions)"
   done
 
   # These two assertions intentionally originate on f2/public internet.
