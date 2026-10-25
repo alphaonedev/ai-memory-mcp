@@ -10,7 +10,7 @@
 #
 # THIS JOB. Runs ONLY the ignored tests (`--ignored`, not a full-suite
 # `--include-ignored` duplicate of the already-required enterprise-fed
-# Check). Same native pg18.6+AGE1.8.0+pgvector0.8.6 tier, same
+# Check). Same native pg18.6+AGE1.8.0+pgvector0.8.7 tier, same
 # per-job ephemeral db pattern as cert-postgres-age.yml.
 #
 # RUNNER PLACEMENT — self-hosted linux-fed (pg-tier). Needs :5445.

@@ -386,8 +386,23 @@ impl Client {
     ///
     /// # Panics
     ///
-    /// On a metadata encoding failure.
+    /// On a metadata encoding failure or an I/O failure.
     pub async fn wake(&mut self, to: &str, inbox_row_id: &str) {
+        self.try_wake(to, inbox_row_id).await.expect("write wake");
+    }
+
+    /// [`Self::wake`], but reporting a write failure instead of panicking
+    /// (#7951): the hub closes a session whose own egress queue is full, so a
+    /// flood that never reads its refusals sees `BrokenPipe` by design.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error from writing to the hub.
+    ///
+    /// # Panics
+    ///
+    /// On a metadata encoding failure.
+    pub async fn try_wake(&mut self, to: &str, inbox_row_id: &str) -> std::io::Result<()> {
         let payload = WakeMeta {
             inbox_row_id: inbox_row_id.to_string(),
             namespace: "hive".into(),
@@ -398,7 +413,10 @@ impl Client {
         .encode()
         .expect("wake meta");
         let from = self.agent_id.clone();
-        self.send(Frame::new(Kind::Wake, from, to, payload)).await;
+        let body = Frame::new(Kind::Wake, from, to, payload)
+            .encode()
+            .expect("encode");
+        self.try_write_raw_framed(&body).await
     }
 
     /// Encode and write one frame.
@@ -417,13 +435,26 @@ impl Client {
     ///
     /// On an I/O failure.
     pub async fn write_raw_framed(&mut self, body: &[u8]) {
-        let len = u32::try_from(body.len()).expect("len");
-        self.stream
-            .write_all(&len.to_be_bytes())
+        self.try_write_raw_framed(body)
             .await
-            .expect("write len");
-        self.stream.write_all(body).await.expect("write body");
-        self.stream.flush().await.expect("flush");
+            .expect("write framed body");
+    }
+
+    /// [`Self::write_raw_framed`], but reporting the I/O error (#7951).
+    ///
+    /// # Errors
+    ///
+    /// The I/O error from writing to the hub, e.g. `BrokenPipe` once the hub
+    /// has closed this session.
+    ///
+    /// # Panics
+    ///
+    /// When the body length does not fit the `u32` prefix.
+    pub async fn try_write_raw_framed(&mut self, body: &[u8]) -> std::io::Result<()> {
+        let len = u32::try_from(body.len()).expect("len");
+        self.stream.write_all(&len.to_be_bytes()).await?;
+        self.stream.write_all(body).await?;
+        self.stream.flush().await
     }
 
     /// Write a raw length prefix and nothing else — used to make the hub
@@ -531,3 +562,22 @@ mod lane_db;
 pub use lane_db::{
     SHARED_LIVE_STORE_PORT, assert_lane_database, database_name, is_shared_live_store, port_of,
 };
+
+/// `AI_MEMORY_TEST_TIMING_BUDGET_MULT` (env #68), parsed like
+/// `tests/common/mcp_wait.rs::budget_mult_from`: an integer in `1..=100`,
+/// otherwise 1 (#7952 class, #7959). Hub tests scale every wall-clock poll
+/// through [`scaled_timing`] so a saturated host stretches them uniformly.
+#[must_use]
+pub fn timing_budget_mult() -> u32 {
+    std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| (1..=100).contains(n))
+        .unwrap_or(1)
+}
+
+/// `base` multiplied by [`timing_budget_mult`].
+#[must_use]
+pub fn scaled_timing(base: std::time::Duration) -> std::time::Duration {
+    base.saturating_mul(timing_budget_mult())
+}
