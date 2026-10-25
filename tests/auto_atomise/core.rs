@@ -95,18 +95,6 @@ impl Curator for MockCurator {
     }
 }
 
-fn shared_state() -> Arc<Mutex<MockState>> {
-    static SLOT: OnceLock<Arc<Mutex<MockState>>> = OnceLock::new();
-    SLOT.get_or_init(|| {
-        Arc::new(Mutex::new(MockState {
-            responses: Vec::new(),
-            calls: 0,
-            last_max_atom_tokens: None,
-        }))
-    })
-    .clone()
-}
-
 /// Serialise tests. The dispatch is process-wide and the mock state
 /// is shared; only one test may drive at a time.
 fn test_serial() -> &'static Mutex<()> {
@@ -188,63 +176,14 @@ fn enqueue_atoms_into(state: &Arc<Mutex<MockState>>, texts: &[&str]) {
         .collect()));
 }
 
-/// Reset the mock call counter + clear pending responses.
-fn reset_mock() {
-    let arc = shared_state();
-    let mut s = arc.lock().unwrap();
-    s.responses.clear();
-    s.calls = 0;
-    s.last_max_atom_tokens = None;
-}
-
-/// Read the current mock call count.
-fn mock_call_count() -> usize {
-    let arc = shared_state();
-    let n = arc.lock().unwrap().calls;
-    n
-}
-
 // ---------------------------------------------------------------------------
 // Dispatch install
 // ---------------------------------------------------------------------------
 
-/// v1.0.0 #2983 — the process-global `AUTO_ATOMISE_DISPATCH` slot this
-/// suite used to install is GONE (it had zero production callers, which
-/// is the whole defect #2983 filed). The wiring is now threaded
-/// explicitly, so the mock atomiser + the bounded background worker are
-/// ordinary process-lifetime fixtures rather than a one-shot `OnceLock`
-/// nobody could re-install between cases.
-fn shared_atomiser() -> &'static Arc<Atomiser> {
-    static A: OnceLock<Arc<Atomiser>> = OnceLock::new();
-    A.get_or_init(|| {
-        let curator: Box<dyn Curator> = Box::new(MockCurator {
-            state: shared_state(),
-        });
-        Arc::new(Atomiser::new(
-            curator,
-            None,
-            AtomiserConfig::default(),
-            FeatureTier::Smart,
-        ))
-    })
-}
-
-/// The bounded, single-consumer worker (#2986) the deferred path now
-/// enqueues onto instead of `std::thread::spawn`-ing one unbounded
-/// detached thread per store.
-fn shared_queue() -> &'static AtomiseQueue {
-    static Q: OnceLock<AtomiseQueue> = OnceLock::new();
-    Q.get_or_init(|| {
-        ai_memory::background::atomise_worker::spawn(Arc::new(|| {
-            Some(Arc::clone(shared_atomiser()))
-        }))
-        .expect("atomise worker spawns")
-    })
-}
-
-fn wiring() -> AtomiseWiring<'static> {
-    AtomiseWiring::new(Some(shared_atomiser()), Some(shared_queue()))
-}
+// v1.0.0 #2983 — the process-global `AUTO_ATOMISE_DISPATCH` slot this
+// suite used to install is GONE. The wiring is threaded explicitly, and
+// since #3509 every case owns a private curator + worker (below); the
+// suite-wide mock and queue that could not be awaited are removed.
 
 /// v1.0.0 #3509 — a CASE-PRIVATE curator + bounded worker, handed back
 /// with the consumer's `JoinHandle` so the case can await quiescence
@@ -252,12 +191,12 @@ fn wiring() -> AtomiseWiring<'static> {
 ///
 /// # Why this exists
 ///
-/// [`shared_queue`] is a process-lifetime `OnceLock`: its in-flight
-/// jobs can never be awaited, only guessed at. A drain helper guessed
-/// by watching the suite-wide call counter hold still for a wall-clock
-/// window — so on a saturated host a previous case's jobs are still
-/// running when that window expires, and their curator calls land AFTER
-/// the next case's `reset_mock()`. That is the #3509 flake verbatim:
+/// The suite-wide queue this replaced was a process-lifetime `OnceLock`:
+/// its in-flight jobs could never be awaited, only guessed at. A drain
+/// helper guessed by watching the suite-wide call counter hold still for
+/// a wall-clock window — so on a saturated host a previous case's jobs
+/// were still running when that window expired, and their curator calls
+/// landed AFTER the next case's `reset_mock()`. That is the #3509 flake verbatim:
 /// `curator must not fire when the originating insert was refused —
 /// left: 2, right: 0`, where the 2 were another case's leftovers.
 ///
@@ -569,7 +508,9 @@ fn test_auto_atomise_disabled_does_nothing() {
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
-    reset_mock();
+    // #3509: private curator + worker, so the "never fired" observation
+    // is attributable and is read after full drain, not after a sleep.
+    let (curator_state, atomiser, queue, worker) = private_worker();
 
     let ns = format!("wt1d/disabled-{}", uuid::Uuid::new_v4().simple());
     seed_policy(&conn, &ns, opt_out_policy());
@@ -577,8 +518,14 @@ fn test_auto_atomise_disabled_does_nothing() {
     let body = long_body(1000); // well over default threshold
     let mem = insert_memory(&conn, &ns, &body);
 
-    let outcome =
-        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
+    let outcome = maybe_enqueue_auto_atomise(
+        &conn,
+        shared_db_path(),
+        &mem,
+        &mem.id,
+        "ai:test",
+        AtomiseWiring::new(Some(&atomiser), Some(&queue)),
+    );
     match outcome {
         AutoAtomisationOutcome::Skipped { reason } => {
             assert_eq!(
@@ -589,10 +536,11 @@ fn test_auto_atomise_disabled_does_nothing() {
         other => panic!("expected Skipped(policy_disabled), got {other:?}"),
     }
 
-    // Spin a bit to prove no background work fires.
-    std::thread::sleep(Duration::from_millis(300));
+    // Await full drain of the private worker (any job the hook had
+    // handed over has run by the join), then prove no curator call.
+    await_worker_drain(queue, worker);
     assert_eq!(
-        mock_call_count(),
+        curator_state.lock().unwrap().calls,
         0,
         "curator must not have been called when policy is disabled"
     );
@@ -610,7 +558,7 @@ fn test_auto_atomise_below_threshold_does_nothing() {
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
-    reset_mock();
+    let (curator_state, atomiser, queue, worker) = private_worker();
 
     let ns = format!("wt1d/below-{}", uuid::Uuid::new_v4().simple());
     // Threshold = 500. Body below ~400 tokens.
@@ -625,8 +573,14 @@ fn test_auto_atomise_below_threshold_does_nothing() {
     );
     let mem = insert_memory(&conn, &ns, &body);
 
-    let outcome =
-        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
+    let outcome = maybe_enqueue_auto_atomise(
+        &conn,
+        shared_db_path(),
+        &mem,
+        &mem.id,
+        "ai:test",
+        AtomiseWiring::new(Some(&atomiser), Some(&queue)),
+    );
     match outcome {
         AutoAtomisationOutcome::UnderThreshold {
             tokens: t,
@@ -637,8 +591,8 @@ fn test_auto_atomise_below_threshold_does_nothing() {
         }
         other => panic!("expected UnderThreshold, got {other:?}"),
     }
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(mock_call_count(), 0);
+    await_worker_drain(queue, worker);
+    assert_eq!(curator_state.lock().unwrap().calls, 0);
     assert!(read_atomised_into(&conn, &mem.id).is_none());
 }
 
@@ -941,7 +895,7 @@ fn test_auto_atomise_child_override() {
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
     let _ = &db_path;
-    reset_mock();
+    let (curator_state, atomiser, queue, worker) = private_worker();
 
     let parent = format!("wt1d-ovr-{}", uuid::Uuid::new_v4().simple());
     let child = format!("{parent}/restricted");
@@ -953,16 +907,22 @@ fn test_auto_atomise_child_override() {
     let body = long_body(900);
     let mem = insert_memory(&conn, &child, &body);
 
-    let outcome =
-        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
+    let outcome = maybe_enqueue_auto_atomise(
+        &conn,
+        shared_db_path(),
+        &mem,
+        &mem.id,
+        "ai:test",
+        AtomiseWiring::new(Some(&atomiser), Some(&queue)),
+    );
     match outcome {
         AutoAtomisationOutcome::Skipped { reason } => {
             assert_eq!(reason, OUTCOME_SKIPPED_POLICY_DISABLED);
         }
         other => panic!("expected Skipped(policy_disabled) on child override, got {other:?}"),
     }
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(mock_call_count(), 0);
+    await_worker_drain(queue, worker);
+    assert_eq!(curator_state.lock().unwrap().calls, 0);
     assert!(read_atomised_into(&conn, &mem.id).is_none());
 }
 

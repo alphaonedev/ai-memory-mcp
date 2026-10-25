@@ -60,9 +60,15 @@
 //! it is not assertable. It measures BEHAVIOUR; it just refuses to
 //! convert host load into a red build.
 //!
-//! Only the L4 budget is gated. L1 and L2 carry 10x-100x debug headroom
-//! over their release budgets and have not been observed to flake; they
-//! stay unconditionally enforced.
+//! Every debug wall-clock pin is gated the same way: the L1 mean-cost
+//! pins, the L2 fast path, the L2 gap path and the L4 p95. L1/L2 were
+//! first left unconditional because they had not been observed to flake;
+//! CI run 39146194630 then read `L2 gap-path 100-turn cost 21024 ms >
+//! budget 10000 ms` on a saturated runner (every correctness assert
+//! before it green), so they now share the L4 rule: release always
+//! enforced, debug measured-and-printed unless `AI_MEMORY_PERF_BUDGET=1`.
+//! Every correctness assert (gap path taken, 100 lines atomised, no
+//! errors, shape asserts) stays unconditional in both profiles.
 //!
 //! ## Why two budgets?
 //!
@@ -154,10 +160,33 @@ const ENV_PERF_BUDGET: &str = "AI_MEMORY_PERF_BUDGET";
 /// arms it with `AI_MEMORY_PERF_BUDGET=1`, because a debug binary's
 /// wall clock on a saturated shared host measures the host (#3509).
 ///
-/// Currently consulted only by the L4 p95 case; L1/L2 keep their
-/// unconditional debug budgets (10x-100x headroom, no observed flake).
+/// Consulted by every wall-clock pin (L1, L2 fast and gap path, L4):
+/// CI run 39146194630 showed the L2 gap path at 21024 ms against a
+/// 10_000 ms debug budget on a saturated runner, so no debug wall clock
+/// is unconditional any more. Correctness asserts never consult it.
 fn wall_clock_budget_enforced() -> bool {
     !cfg!(debug_assertions) || std::env::var(ENV_PERF_BUDGET).is_ok_and(|raw| raw.trim() == "1")
+}
+
+/// #3509 — the single wall-clock assertion path for L1 and L2 (the L4
+/// case keeps its own p95 arm, same shape).
+///
+/// Always prints `measured` against `budget` (so a regression is visible
+/// in the log even where it is not assertable). It then asserts
+/// `measured <= budget` only when [`wall_clock_budget_enforced`] holds:
+/// always on the release profile, under debug only with
+/// `AI_MEMORY_PERF_BUDGET=1`. Every correctness assert stays at its call
+/// site, unconditional. `failure` is the full panic message.
+fn assert_wall_clock_budget(label: &str, measured: u128, budget: u128, unit: &str, failure: &str) {
+    let enforcement = if wall_clock_budget_enforced() {
+        "ENFORCED"
+    } else {
+        "recorded only (debug profile; set AI_MEMORY_PERF_BUDGET=1 to enforce)"
+    };
+    eprintln!("{label}: measured {measured} {unit}; budget {budget} {unit} — {enforcement}");
+    if wall_clock_budget_enforced() {
+        assert!(measured <= budget, "{failure}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,15 +221,20 @@ fn l1_observe_tool_call_mean_cost_under_budget() {
     let elapsed = start.elapsed();
     let mean_ns = elapsed.as_nanos() / (N as u128);
 
-    assert!(
-        mean_ns <= L1_BUDGET_NS_MEAN,
-        "L1 budget violated: observe_tool_call mean cost {mean_ns} ns > budget {L1_BUDGET_NS_MEAN} ns \
+    assert_wall_clock_budget(
+        "L1 observe_tool_call mean cost",
+        mean_ns,
+        L1_BUDGET_NS_MEAN,
+        "ns",
+        &format!(
+            "L1 budget violated: observe_tool_call mean cost {mean_ns} ns > budget {L1_BUDGET_NS_MEAN} ns \
          (operator directive 2026-05-28: optimal performance on the critical path). \
          {N} iterations in {elapsed:?}. \
          If this fires in release-mode CI but passes locally in debug, the budget is doing its job — \
          investigate src/recover/nag.rs::observe_tool_call hot path. \
          If this fires in debug mode locally, it's a major regression: the dev-loop \
          budget is 100x the production budget specifically to avoid debug-mode flakes."
+        ),
     );
 }
 
@@ -227,10 +261,15 @@ fn l1_observe_tool_call_memory_write_reset_cost_under_budget() {
     let elapsed = start.elapsed();
     let mean_ns = elapsed.as_nanos() / (N as u128);
 
-    assert!(
-        mean_ns <= L1_BUDGET_NS_MEAN,
-        "L1 budget violated on MemoryWrite path: mean cost {mean_ns} ns > budget {L1_BUDGET_NS_MEAN} ns. \
-         {N} iterations in {elapsed:?}."
+    assert_wall_clock_budget(
+        "L1 MemoryWrite mean cost",
+        mean_ns,
+        L1_BUDGET_NS_MEAN,
+        "ns",
+        &format!(
+            "L1 budget violated on MemoryWrite path: mean cost {mean_ns} ns > budget {L1_BUDGET_NS_MEAN} ns. \
+             {N} iterations in {elapsed:?}."
+        ),
     );
 }
 
@@ -265,12 +304,17 @@ fn l1_per_session_independence_does_not_inflate_mean_cost() {
     let total_calls = SESSIONS * PER_SESSION;
     let mean_ns = elapsed.as_nanos() / (total_calls as u128);
 
-    assert!(
-        mean_ns <= L1_BUDGET_NS_MEAN,
-        "L1 multi-session mean cost {mean_ns} ns > budget {L1_BUDGET_NS_MEAN} ns \
-         ({SESSIONS} sessions × {PER_SESSION} calls = {total_calls} in {elapsed:?}). \
-         A regression here likely means the HashMap inner lookup is no longer O(1) — \
-         check src/recover/nag.rs::observe_tool_call inner.lock().entry(key) path."
+    assert_wall_clock_budget(
+        "L1 multi-session mean cost",
+        mean_ns,
+        L1_BUDGET_NS_MEAN,
+        "ns",
+        &format!(
+            "L1 multi-session mean cost {mean_ns} ns > budget {L1_BUDGET_NS_MEAN} ns \
+             ({SESSIONS} sessions × {PER_SESSION} calls = {total_calls} in {elapsed:?}). \
+             A regression here likely means the HashMap inner lookup is no longer O(1) — \
+             check src/recover/nag.rs::observe_tool_call inner.lock().entry(key) path."
+        ),
     );
 }
 
@@ -414,11 +458,17 @@ fn l2_fast_path_under_budget_when_mtime_le_watermark() {
         report.lines_atomised, 0,
         "fast-path does not parse → 0 lines atomised; got: {report:?}"
     );
-    assert!(
-        elapsed_ms <= L2_FAST_PATH_BUDGET_MS,
-        "L2 fast-path took {elapsed_ms} ms > budget {L2_FAST_PATH_BUDGET_MS} ms. \
-         If this fires only in debug, raise L2_FAST_PATH_BUDGET_MS for debug; if it \
-         fires in release CI, investigate the open-DB + stat-mtime + SELECT MAX query path."
+    assert_wall_clock_budget(
+        "L2 fast-path",
+        elapsed_ms,
+        L2_FAST_PATH_BUDGET_MS,
+        "ms",
+        &format!(
+            "L2 fast-path took {elapsed_ms} ms > budget {L2_FAST_PATH_BUDGET_MS} ms. \
+             If this fires in release CI, investigate the open-DB + stat-mtime + SELECT MAX \
+             query path; a debug run armed with AI_MEMORY_PERF_BUDGET=1 measures the host as \
+             much as the code (#3509)."
+        ),
     );
 }
 
@@ -458,13 +508,18 @@ fn l2_gap_path_100_turns_under_budget() {
         "gap-path must not error in the happy case; got errors: {:?}",
         report.errors
     );
-    assert!(
-        elapsed_ms <= L2_GAP_PATH_100_TURNS_BUDGET_MS,
-        "L2 gap-path 100-turn cost {elapsed_ms} ms > budget {L2_GAP_PATH_100_TURNS_BUDGET_MS} ms. \
-         Per-turn amortised: {} ms/turn. Production target is 10 ms/turn. \
-         Investigate src/recover/mod.rs::recover_from_transcript step-4 \
-         (BEGIN IMMEDIATE → INSERT memory → INSERT dedup row → COMMIT).",
-        elapsed_ms / 100
+    assert_wall_clock_budget(
+        "L2 gap-path 100 turns",
+        elapsed_ms,
+        L2_GAP_PATH_100_TURNS_BUDGET_MS,
+        "ms",
+        &format!(
+            "L2 gap-path 100-turn cost {elapsed_ms} ms > budget {L2_GAP_PATH_100_TURNS_BUDGET_MS} ms. \
+             Per-turn amortised: {} ms/turn. Production target is 10 ms/turn. \
+             Investigate src/recover/mod.rs::recover_from_transcript step-4 \
+             (BEGIN IMMEDIATE → INSERT memory → INSERT dedup row → COMMIT).",
+            elapsed_ms / 100
+        ),
     );
 }
 
