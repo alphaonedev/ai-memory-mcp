@@ -95,29 +95,55 @@ def run_blocks_of(lines):
     return blocks
 
 
-def macos_defects(lines):
-    """Defects of one workflow text: heal call outside its guard, Linux-only tool, missing bin twin."""
-    found = []
-    healed = 0
+def heal_defects(lines):
+    """The heal call must appear exactly once, inside the RUNNER_OS guard block of its step."""
+    inside = 0
+    total = 0
     for body in run_blocks_of(lines):
+        total += sum(HEAL_SCRIPT in x for x in body)
         for n, ln in enumerate(body):
-            if ln.strip() == HEAL_GUARD:
-                indent = len(ln) - len(ln.lstrip())
-                end = next(
-                    (i for i in range(n + 1, len(body))
-                     if body[i].strip() == "fi" and len(body[i]) - len(body[i].lstrip()) == indent),
-                    len(body),
-                )
-                healed += sum(HEAL_SCRIPT in x for x in body[n + 1:end])
-        for ln in body:
-            for name, rx in LINUX_ONLY_TOKENS:
-                if rx.search(ln):
-                    found.append("linux-only " + name)
-            if POSTGRES_LINUX_BIN in ln and POSTGRES_MACOS_BIN not in ln:
-                found.append("no homebrew twin")
-    if healed != 1 or sum(HEAL_SCRIPT in x for b in run_blocks_of(lines) for x in b) != 1:
-        found.append("heal call not exactly once inside the guard")
-    return found
+            if ln.strip() != HEAL_GUARD:
+                continue
+            indent = len(ln) - len(ln.lstrip())
+            end = next(
+                (i for i in range(n + 1, len(body))
+                 if body[i].strip() == "fi" and len(body[i]) - len(body[i].lstrip()) == indent),
+                len(body),
+            )
+            inside += sum(HEAL_SCRIPT in x for x in body[n + 1:end])
+    if inside != 1 or total != 1:
+        return ["heal call not exactly once inside the guard"]
+    return []
+
+
+def linux_only_defects(lines):
+    """Linux-only tools or paths (nproc, /proc/, free) in any run block."""
+    return [
+        "linux-only " + name
+        for body in run_blocks_of(lines)
+        for ln in body
+        for name, rx in LINUX_ONLY_TOKENS
+        if rx.search(ln)
+    ]
+
+
+def twin_defects(lines):
+    """A /usr/lib/postgresql search path without the homebrew bin dir beside it."""
+    return [
+        "no homebrew twin"
+        for body in run_blocks_of(lines)
+        for ln in body
+        if POSTGRES_LINUX_BIN in ln and POSTGRES_MACOS_BIN not in ln
+    ]
+
+
+# One named table of checks: the property tests and the mutation rows both read it.
+MACOS_CHECKS = (heal_defects, linux_only_defects, twin_defects)
+
+
+def macos_defects(lines):
+    """All defects of one workflow text, from every check in MACOS_CHECKS."""
+    return [d for check in MACOS_CHECKS for d in check(lines)]
 
 
 HEAL_CALL = (
@@ -170,48 +196,22 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
                 self.assertLess(guard_at, heal_at)
                 self.assertLess(heal_at, create_at)
 
+    def _assert_check_clean(self, check):
+        for path in WORKFLOWS:
+            with self.subTest(workflow=path.name, check=check.__name__):
+                self.assertEqual(check(lines_of(path)), [])
+
     def test_heal_call_is_inside_the_guard_block_of_one_step(self):
         """code r1 F1: the heal call sits between the guard line and its matching fi."""
-        for path in WORKFLOWS:
-            with self.subTest(workflow=path.name):
-                inside = 0
-                for body in run_blocks(path):
-                    for n, ln in enumerate(body):
-                        if ln.strip() != HEAL_GUARD:
-                            continue
-                        indent = len(ln) - len(ln.lstrip())
-                        end = next(
-                            i for i in range(n + 1, len(body))
-                            if body[i].strip() == "fi" and len(body[i]) - len(body[i].lstrip()) == indent
-                        )
-                        if any(HEAL_SCRIPT in x for x in body[n + 1:end]):
-                            inside += 1
-                    outside = [x for x in body if HEAL_SCRIPT in x]
-                    guarded = [i for i, x in enumerate(body) if x.strip() == HEAL_GUARD]
-                    if outside:
-                        self.assertTrue(guarded, "heal call in a step with no RUNNER_OS guard")
-                self.assertEqual(inside, 1)
-                text = "\n".join("\n".join(b) for b in run_blocks(path))
-                self.assertEqual(text.count(HEAL_SCRIPT), 1)
+        self._assert_check_clean(heal_defects)
 
     def test_no_linux_only_tool_or_path_in_any_run_block(self):
         """code r1 F2: nproc and /proc are absent on macOS."""
-        for path in WORKFLOWS:
-            for body in run_blocks(path):
-                for ln in body:
-                    for name, rx in LINUX_ONLY_TOKENS:
-                        with self.subTest(workflow=path.name, token=name):
-                            self.assertIsNone(rx.search(ln), ln.strip())
+        self._assert_check_clean(linux_only_defects)
 
     def test_every_linux_postgres_bin_path_has_its_homebrew_twin(self):
         """code r1 F2: a /usr/lib/postgresql search path needs the macOS bin dir beside it."""
-        for path in WORKFLOWS:
-            for body in run_blocks(path):
-                for ln in body:
-                    if POSTGRES_LINUX_BIN in ln:
-                        with self.subTest(workflow=path.name):
-                            self.assertIn(POSTGRES_MACOS_BIN, ln, ln.strip())
-
+        self._assert_check_clean(twin_defects)
 
     def test_unmutated_workflows_have_no_macos_defect(self):
         for path in WORKFLOWS:
