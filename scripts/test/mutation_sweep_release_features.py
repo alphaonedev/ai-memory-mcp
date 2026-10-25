@@ -35,6 +35,74 @@ HERE = Path(__file__).resolve().parent
 GUARD = HERE.parent / "check_release_features.py"
 sys.path.insert(0, str(GUARD.parent))
 
+def _job(*lines):
+    """A one-step workflow whose `run:` is the given lines."""
+    return "jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n" + "".join("          " + x + "\n" for x in lines)
+
+
+def _env_job(env_lines):
+    return ("jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo build --locked\n        env:\n"
+            + env_lines)
+
+
+_FETCH = "curl -fsSL -o f https://x.example/f"
+_CHECK = 'echo "' + "ab" * 32 + '  f" | sha256sum -c -'
+
+# Round 10 (code r9 F1): name -> workflow text that the unmutated guard REFUSES. A mutant that makes the guard accept one
+# of these is killed by it even when `--self-test` stays green; the sweep prints the name as the killer.
+OBSERVATIONS = {
+    "env RUSTFLAGS key with no value": _env_job("          RUSTFLAGS:\n"),
+    "env RUSTFLAGS block scalar folding to empty": _env_job("          RUSTFLAGS: >-\n\n"),
+    "checksum && then a consumer on the next line": _job(_FETCH, _CHECK + " &&", "tar xzf f"),
+    "checksum && then a comment then a consumer": _job(_FETCH, _CHECK + " && # c", "tar xzf f"),
+    "checksum && then a consumer in a command substitution": _job(_FETCH, _CHECK + " && x=$(tar xzf f)"),
+    "digest text with a command substitution": _job(_FETCH, 'echo "$(true) f" | sha256sum -c -', "tar xzf f"),
+    "digest text with backticks": _job(_FETCH, 'echo "`true` f" | sha256sum -c -', "tar xzf f"),
+    "function env then env -i": _job("env() { :; }", "env -i cargo build --locked"),
+    "function env then env -": _job("env() { :; }", "env - cargo build --locked"),
+    "function env then env --ignore-environment": _job("env() { :; }", "env --ignore-environment cargo build --locked"),
+}
+
+# Round 10 (code r9 F1): the shapes the reviewer named that are NOT observable. name -> (workflow text, errors at head);
+# the unmutated guard and the "unreadable RUSTFLAGS value allowed" mutant give the same count for each, so none of them
+# can kill the mutant.
+UNOBSERVABLE = {
+    "env RUSTFLAGS empty string": (_env_job("          RUSTFLAGS: ''\n"), 0),
+    "env RUSTFLAGS tilde": (_env_job("          RUSTFLAGS: ~\n"), 0),
+    "env RUSTFLAGS flow sequence": (_env_job("          RUSTFLAGS: [a, b]\n"), 0),
+    "env RUSTFLAGS flow mapping": (_env_job("          RUSTFLAGS: {a: b}\n"), 1),
+}
+
+
+def load_guard_module(path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("check_release_features_obs", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def error_counts(path, tree, docs):
+    """{name: error count} of ``docs`` ({name: workflow text}) under the guard module at ``path``."""
+    mod = load_guard_module(path)
+    tree = Path(tree)
+    tree.mkdir(parents=True, exist_ok=True)
+    return {name: len(mod.r5_errors(doc, None, tree)) for name, doc in docs.items()}
+
+
+def accepted_observations(path, tree):
+    """Names of the OBSERVATIONS the guard module at ``path`` accepts (the unmutated guard accepts none)."""
+    return [n for n, c in error_counts(path, tree, OBSERVATIONS).items() if c == 0]
+
+
+def mutate(text, old, new):
+    """The guard text with ``old`` replaced once above CONDITION_MARKER, or None when the anchor is not found exactly once."""
+    cut = text.index("# --- end of condition mutants\n")
+    head, tail = text[:cut], text[cut:]
+    return (head.replace(old, new, 1) + tail) if head.count(old) == 1 else None
+
+
 # (description, anchor, replacement): mutants that cannot change behaviour.
 EQUIVALENT_MUTANTS = (
     (

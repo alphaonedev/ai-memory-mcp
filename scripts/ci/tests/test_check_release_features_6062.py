@@ -10,6 +10,7 @@ Stdlib only, Python 3.9+.
 """
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1312,6 +1313,67 @@ class Round9(unittest.TestCase):
         """Security r8 F2: `cargo --config <key>` is refused, so the env variable that sets the same key is refused too."""
         self.assertEqual(G.cargo_config_twins(), [])
         self.assertGreaterEqual(len(G.CARGO_CONFIG_ENV_TWINS), 8)
+
+
+def load_sweep():
+    spec = importlib.util.spec_from_file_location("mutation_sweep_under_test", ROOT / "scripts" / "test" / "mutation_sweep_release_features.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class Round10(unittest.TestCase):
+    """PR 8003 round 10 (code r9 F1): an EQUIVALENT label is proven by an attempted observation. Every observation is a
+    workflow the guard refuses; a mutant that makes the guard accept one is not equivalent."""
+
+    def setUp(self):
+        self.sweep = load_sweep()
+        self.tmp = Path(tempfile.mkdtemp(prefix="r10.", dir=scratch()))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.text = read(SCRIPT)
+
+    def mutant_path(self, old, new):
+        mutated = self.sweep.mutate(self.text, old, new)
+        self.assertIsNotNone(mutated, "anchor not found exactly once: %s" % old[:60])
+        path = self.tmp / "mutant.py"
+        path.write_text(mutated, encoding="utf-8")
+        return path
+
+    def test_every_observation_is_refused_at_head(self):
+        self.assertEqual(self.sweep.accepted_observations(SCRIPT, self.tmp / "head"), [])
+        self.assertEqual(len(self.sweep.OBSERVATIONS), 10)
+
+    def test_no_equivalent_row_is_observable(self):
+        """F1: an observation that the mutant accepts proves the row is not equivalent (and its absence is the proof)."""
+        observable = []
+        for desc, old, new in self.sweep.EQUIVALENT_MUTANTS:
+            seen = self.sweep.accepted_observations(self.mutant_path(old, new), self.tmp / "m")
+            if seen:
+                observable.append("%s: %s" % (desc, seen[0]))
+        self.assertEqual(observable, [])
+
+    def test_observed_rows_are_killed_by_their_observations(self):
+        """F1: each of the four former EQUIVALENT rows is an EXTRA_MUTANTS row that an observation kills."""
+        rows = {desc: (old, new) for desc, old, new in self.sweep.EXTRA_MUTANTS}
+        missing = []
+        for desc in ("unreadable RUSTFLAGS value allowed", "chain chain needs the &&",
+                     "substitution in the checklist allowed", "env -i allowed"):
+            if desc not in rows:
+                missing.append(desc)
+                continue
+            if not self.sweep.accepted_observations(self.mutant_path(*rows[desc]), self.tmp / "k"):
+                missing.append(desc)
+        self.assertEqual(missing, [])
+
+    def test_the_named_shapes_that_are_not_observable_match_the_mutant(self):
+        """F1: empty string, `~`, a flow sequence and a flow mapping give the same result at head and under the mutant."""
+        old = "(value is None or RUSTFLAGS_BAD_RE.search(value) is not None)"
+        new = "(value is not None and RUSTFLAGS_BAD_RE.search(value) is not None)"
+        docs = {n: d for n, (d, _c) in self.sweep.UNOBSERVABLE.items()}
+        at_head = self.sweep.error_counts(SCRIPT, self.tmp / "h", docs)
+        mutated = self.sweep.error_counts(self.mutant_path(old, new), self.tmp / "u", docs)
+        self.assertEqual(at_head, {n: c for n, (_d, c) in self.sweep.UNOBSERVABLE.items()})
+        self.assertEqual(mutated, at_head)
 
 
 class SelfTest8023(unittest.TestCase):
