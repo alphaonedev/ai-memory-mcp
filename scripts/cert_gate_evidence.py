@@ -101,8 +101,8 @@ GIT_SHA = re.compile(r"[0-9a-f]{40}")
 # its neighbours. The root needs a boundary (``/run<token>`` is not a path). Any other slash
 # run (URL path, bare ``a/b/c``) gets no exemption. ``KEY=/abs/path`` is a path too.
 # macOS roots (#8174): ``Volumes``, ``Users`` and ``Library`` start uppercase, ``private`` does not.
-# Only the ROOT segment may be uppercase: _mask_path peels it off before the lowercase-only
-# passes, so a std-base64 secret under a root is still masked.
+# Only the ROOT segment may be uppercase: _mask_path lowercases it for pass 1 (the floor still
+# spans the whole path) and slices it off before pass 2, so a std-base64 secret under a root is masked.
 PATH_ROOTS = (
     "home|srv|usr|var|opt|mnt|etc|tmp|root|run|lib|bin|sbin|github|runner|workspace|ai-scratch"
     "|Volumes|Users|Library|private"
@@ -185,7 +185,12 @@ def _mask_path(path: str) -> str:
     head = "/" + root
     if not sep:
         return head
-    path = LONG_B64.sub(_path_run_sub, LONG_HEX.sub(REDACTED, sep + rest))
+    # Pass 1 over the WHOLE path with the root lowercased, so a run spanning the root is masked
+    # exactly as before the peel; the root itself is then sliced off and re-attached.
+    whole = LONG_B64.sub(_path_run_sub, LONG_HEX.sub(REDACTED, "/" + root.lower() + sep + rest))
+    if not whole.startswith("/" + root.lower() + "/"):
+        return REDACTED
+    path = whole[len("/" + root) :]
     segs = path.split("/")
     odd = [SEG_LOWER.fullmatch(s) is None for s in segs]
     n = len(segs)
