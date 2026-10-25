@@ -1,0 +1,16 @@
+# Burn-down allowlist for scripts/check-comment-quorum-503.py (#7278).
+# FORMAT: one `path:line` per line, everything from the first `#` is comment.
+# decision: path:line pins over a per-file list because the neighbouring
+# allowlists (doc-symbol-anchors-allow.txt) pin the exact token, and a
+# file-level entry let a NEW stale comment in the same file pass.
+# These lines sit on the enterprise-federation certification section 7 watched
+# surface (scripts/check_cert_expiry.py: src/federation/**). The certification
+# is EXPIRED with no bound SHA, so a comment-only edit there cannot satisfy the
+# section 7 gate without a re-issue or voiding, which a comment fix must not
+# make. The next federation-wire PR fixes these comments and deletes the
+# entries: a stale entry FAILS the gate, and a line that moves also fails, so
+# the list only shrinks.
+src/federation/mod.rs:14
+src/federation/quorum.rs:13
+src/federation/quorum.rs:24
+src/federation/quorum.rs:29

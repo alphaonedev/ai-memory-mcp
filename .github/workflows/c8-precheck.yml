@@ -262,6 +262,13 @@ jobs:
         run: python3 scripts/check-claude-md-size.py
       - name: Self-test the CLAUDE.md size guard
         run: python3 scripts/check-claude-md-size.py --self-test
+      - name: No comment pairs a quorum miss with 503 (#7278)
+        # A quorum miss answers 202 Accepted + quorum_met:false via
+        # under_replicated_response; comments still describing the old
+        # 503 contract fail here.
+        run: python3 scripts/check-comment-quorum-503.py
+      - name: Self-test the quorum/503 comment gate
+        run: python3 scripts/check-comment-quorum-503.py --self-test
 
   doc-symbol-anchor-gate:
     # Issue #2629 / 3x7 claims register. `check-docs-vs-ssot.sh` pins

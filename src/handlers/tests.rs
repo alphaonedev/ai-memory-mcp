@@ -11070,7 +11070,7 @@ async fn http_capabilities_version_matches_pkg_version() {
 // the path-form handlers used by S34/S35 (`/api/v1/namespaces?namespace=…`).
 // The QS-form arms were uncovered prior to this batch — both the
 // happy paths and the 400-on-missing-namespace branches needed direct
-// exercise. The `fanout_or_pending` 503 paths are exercised through the
+// exercise. The `fanout_or_pending` `202 Accepted` paths are exercised through the
 // QS-form `set` handler (`set_namespace_standard_inner` calls
 // `fanout_or_pending` for the standard memory and then
 // `broadcast_namespace_meta_quorum` for the meta row); the same
@@ -11708,7 +11708,7 @@ async fn http_clear_namespace_standard_qs_missing_namespace_returns_400() {
 #[tokio::test]
 async fn http_set_qs_fanout_202_when_all_peers_down() {
     // Single peer, W=2 (local + 1 peer required). Peer 500s on every
-    // POST → cannot meet quorum → 503 `quorum_not_met` payload.
+    // POST → cannot meet quorum → `202 Accepted` + `quorum_met:false`.
     let state = test_state();
     let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
     let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
@@ -11733,8 +11733,8 @@ async fn http_set_qs_fanout_202_when_all_peers_down() {
 
 #[tokio::test]
 async fn http_set_qs_fanout_202_payload_shape_includes_quorum_fields() {
-    // The 503 body must round-trip through `QuorumNotMetPayload` and
-    // surface `error="quorum_not_met"`, `got`, `needed`, `reason`.
+    // The 202 body must carry `quorum_met=false`, `acks`, `needed`, `reason`
+    // (the `under_replicated_response` shape built from `QuorumNotMetPayload`).
     // Single peer down @ W=2 → got=1 (local), needed=2, reason names
     // the failure (unreachable / 500 → "unreachable").
     let state = test_state();
@@ -12060,8 +12060,8 @@ async fn http_set_qs_fanout_majority_tolerates_minority_partition() {
 async fn http_clear_qs_fanout_202_when_peer_down() {
     // The CLEAR path uses `broadcast_namespace_meta_clear_quorum`,
     // a different fanout function from `fanout_or_pending`. Both share
-    // the QuorumNotMetPayload contract and Retry-After=2 header.
-    // This test exercises the clear-side 503 lane.
+    // the QuorumNotMetPayload contract and the 202 `quorum_met:false` answer.
+    // This test exercises the clear-side 202 lane.
     let state = test_state();
     // Pre-seed a namespace standard so the clear has something to do.
     // We do this with no federation by using a separate AppState.
