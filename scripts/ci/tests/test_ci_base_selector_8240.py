@@ -1551,6 +1551,95 @@ class TrustDecisionFirst(unittest.TestCase):
                 run = step_named(job, name)["run"]
                 self.assertEqual(materialise_allow_list_problems(name, run), [])
 
+    # sec F1 / code C1-C3 (round 12): receiver, binding, environment and argv forms. Each row is
+    # one module-level snippet inserted after the anchor; with the sha256 pin re-pinned to the
+    # mutated body the second layer alone must report it (a problem line that is not the digest).
+    C12_MUTANTS = (
+        ("x-module-alias", 'm = subprocess\nm.getoutput("make prep")'),
+        ("x-module-alias-run", 'm = subprocess\nm.run(["git", "--no-replace-objects"] + [])'),
+        ("x-os-alias", 'o = os\no.posix_spawnp("make", ["make"], {})'),
+        ("c2x-module-alias-call", 'sp = subprocess; sp.call(["sh", "prep.bash"])'),
+        ("b1-import-rebinds-allowed-name", "from subprocess import getoutput as git"),
+        ("b1-import-os-as-module-root", "import os as subprocess"),
+        ("b1-from-os-system-as-name", "from os import system as git"),
+        ("b2-rebound-module-receiver", "re = sys\nre.exit(0)"),
+        ("x-assign-allowed-name", "open = print"),
+        ("x-annassign-allowed-name", "git: int = 1"),
+        ("x-augassign-module-root", "subprocess += 1"),
+        ("x-with-as-allowed-name", 'with print("x") as git:\n    pass'),
+        ("x-for-target-module-root", "for subprocess in ():\n    pass"),
+        ("x-comprehension-allowed-name", "[len for len in ()]"),
+        ("x-parameter-allowed-name", "def _f(open):\n    return open"),
+        ("x-environ-store", 'os.environ["GIT_CONFIG_COUNT"] = "1"'),
+        ("x-environ-del", 'del os.environ["PATH"]'),
+        ("x-environ-update", 'os.environ.update({"A": "b"})'),
+        ("x-environ-setdefault", 'os.environ.setdefault("A", "b")'),
+        ("x-environ-putenv", 'os.putenv("A", "b")'),
+        ("x-environ-unsetenv", 'os.unsetenv("A")'),
+        ("x-environ-alias-store", 'e = os.environ\ne["A"] = "b"'),
+        ("x-environ-attr-rebind", "os.environ = {}"),
+        ("b3-non-literal-head-element", 'ARGV = ["git", GIT_TIMEOUT_S, "--no-replace-objects"]'),
+        ("b3-short-head", 'ARGV = ["git"] + []'),
+        ("b3-plus-joined-non-list", 'ARGV = "git" + "x"'),
+        ("b5-sliced-dash-argument", 'git("show", "xx-c"[2:])'),
+        ("b5-concat-dash-argument", 'git("show", "--upload" + "-pack=make")'),
+        ("b5-joinedstr-dash-argument", 'git("show", f"{GIT_TIMEOUT_S}")'),
+        ("x-str-method-dash", 'git("fetch", "xx-c".replace("xx", ""), "origin")'),
+        ("x-str-join-dash", 'git("fetch", "".join(["-", "c"]), "origin")'),
+        ("x-str-format-dash", 'git("fetch", "{}c".format("-"), "origin")'),
+        ("x-path-method-open", 'Path("x.git").open("a")'),
+        ("x-path-method-write", 'Path("x.git").write_text("a")'),
+        ("x-method-on-call-result", 'dict().update({"a": "b"})'),
+        ("x-call-on-subscript", 'dict()["a"]()'),
+    )
+    C12_ARGV_ROWS = {"b3-non-literal-head-element", "b3-short-head", "b3-plus-joined-non-list"}
+
+    def _c12_body(self, run, label, line):
+        if label in self.C12_ARGV_ROWS:
+            argv = '["git", "--no-replace-objects"] + list(args)'
+            head = {"b3-non-literal-head-element": '["git", GIT_TIMEOUT_S, "--no-replace-objects"]',
+                    "b3-short-head": '["git"]',
+                    "b3-plus-joined-non-list": '"git" + "--no-replace-objects"'}[label]
+            self.assertIn(argv, run)
+            return run.replace(argv, head + " + list(args)", 1)
+        return run.replace(self.C2_MUTANT_ANCHOR, self.C2_MUTANT_ANCHOR + line + "\n", 1)
+
+    def test_sec_f1_every_receiver_binding_environment_and_argv_form_is_red_when_rehashed(self):
+        """sec F1 / code C1-C2: with the sha256 pin re-pinned to the mutated body, the second layer
+        alone reports every form (rebound receiver, import rebinding, os.environ writes, a
+        non-literal or short argv head, a computed dash argument)."""
+        for job, name in self.JOBS:
+            run = step_named(job, name)["run"]
+            for label, line in self.C12_MUTANTS:
+                mutated = self._c12_body(run, label, line)
+                with self.subTest(job=job, mutant=label):
+                    self.assertNotEqual(mutated, run)
+                    with unittest.mock.patch.dict(MATERIALISE_SHA256,
+                                                  {name: run_digest(mutated)}):
+                        problems = materialise_problems(name, mutated)
+                    self.assertFalse([p for p in problems if "sha256" in p], problems)
+                    self.assertNotEqual(problems, [])
+                    self.assertNotEqual(materialise_allow_list_problems(name, mutated), [])
+
+    def test_sec_f1_the_allow_list_constants_are_named_and_sorted(self):
+        for const in (MATERIALISE_IMPORT_STATEMENTS, MATERIALISE_METHOD_CHAINS,
+                      MATERIALISE_DEFINED_NAMES, MATERIALISE_GIT_VALUE_ARGS,
+                      MATERIALISE_ENVIRON_WRITERS):
+            self.assertEqual(list(const), sorted(const))
+            self.assertEqual(len(const), len(set(const)))
+
+    def test_code_c3_the_comment_states_what_the_allow_list_enforces_and_no_more(self):
+        """code C3: the claim that the layer admits no -c, alias, fsmonitor, hooksPath or exec
+        option holds for literal arguments only; the comment now lists what is enforced."""
+        text = Path(__file__).read_text()
+        claim = "no `-c`, no alias, fsmonitor, hooksPath" + " or exec option"
+        self.assertNotIn(claim, " ".join(text.replace("#", " ").split()))
+        start = text.index("# sec F1 / code C1-C3 (round 12)")
+        block = text[start:text.index("MATERIALISE_MODULE_ROOTS =", start)]
+        for phrase in MATERIALISE_ENFORCES:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, " ".join(block.replace("#", " ").split()))
+
     def test_code_c1_no_docstring_of_this_module_uses_the_post_derivation_wording(self):
         """code r8 C1: extends the step-order text test to every docstring of the module."""
         tree = ast.parse(Path(__file__).read_text())
