@@ -16,6 +16,7 @@ repositories, then run the materialised selector. No network, no cargo.
 import ast
 import contextlib
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -25,6 +26,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -1153,9 +1155,12 @@ PATH_LIKE_RE = re.compile(r"/|\.py$|\.sh$|\.env$|^\.")
 # names resolved by binding: each name in a pinned git expression, in an open() or Path() argument
 # and the root name of every method call has exactly one binding in its function, and that
 # binding is the enumerated one in MATERIALISE_VALUE_BINDINGS (an unrebound parameter, a single
-# pinned assignment, a single pinned for loop, or only `with open(...)` for handle); IMPACT_PREFIX
-# and SHA_RE have exactly one module-level binding to their constant in
-# MATERIALISE_CONST_BINDINGS. Any other binding is a problem line.
+# pinned assignment, a single pinned for loop, or only `with open(...)` for handle). The four
+# module-level names IMPACT_PREFIX, SHA_RE, REGULAR_MODES and GIT_TIMEOUT_S each have exactly ONE
+# binding in the whole body: a direct module-body assignment with a single Name target and the
+# value pinned in MATERIALISE_CONST_BINDINGS, checked whether or not the name is read (code r12
+# C1). A second assignment, a changed value, a multi-target assignment and an assignment under
+# if, try or while are each a problem line. Any other binding is a problem line.
 # environment untouched, read-only environment uses (sec r11 S1): the child environment is the
 # pinned copy, unmodified. The pinned environment construction is the one statement
 # `env = dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')` (MATERIALISE_ENV_CONSTRUCTION) in git(),
@@ -1242,11 +1247,15 @@ MATERIALISE_VALUE_BINDINGS = {
     ("rev_parse", "res"): "git('rev-parse', '--verify', '--quiet', spec)",
     ("rev_parse", "spec"): "param",
 }
-# Module-level names: exactly one binding in the whole body, an assignment of this value.
-# code r11 C1: the only names the body binds at module level, each by a plain assignment.
+# Module-level names: the only names the body binds at module level (code r11 C1). Each has a
+# pinned value and exactly ONE binding, a direct module-body assignment of that value with a single
+# Name target (code r12 C1); an allow-list of names alone would accept any value and any number of
+# bindings.
 MATERIALISE_MODULE_STORES = {"SHA_RE", "REGULAR_MODES", "IMPACT_PREFIX", "GIT_TIMEOUT_S"}
 MATERIALISE_CONST_BINDINGS = {"IMPACT_PREFIX": "'scripts/ci/impact/'",
-                              "SHA_RE": "re.compile('^[0-9a-f]{40}$')"}
+                              "SHA_RE": "re.compile('^[0-9a-f]{40}$')",
+                              "REGULAR_MODES": "('100644', '100755')",
+                              "GIT_TIMEOUT_S": "120"}
 # Module chains read as a VALUE rather than called: the environment (checked by the read-only rule)
 # and the one exception class, which is accepted only as an `except` type.
 MATERIALISE_VALUE_CHAINS = {"os.environ", "subprocess.TimeoutExpired"}
@@ -1760,6 +1769,9 @@ def materialise_allow_list_problems(label, run):
                          and isinstance(parents.get(site), ast.Assign)):
             problems.append("%s: module-level binding of %s outside the pinned module stores"
                             % (label, name))
+    for name in sorted(MATERIALISE_CONST_BINDINGS):
+        problems.extend("%s: %s" % (label, reason)
+                        for reason in _name_problems(tree, parents, None, name))
     callees = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     receivers = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     except_types = set()
@@ -2578,6 +2590,13 @@ class TrustDecisionFirst(unittest.TestCase):
         self._check_replace_rows(self.R14_MUTANTS + self.R14_DASH_ROWS
                                  + self.R14_CODE_ROWS)
 
+    def test_code_r12_c2_the_round_13_regression_rows_are_red_with_their_own_rule(self):
+        """code r12 C2: the 35 code r11 forms a round-13 rule already refuses stay as a named
+        regression table; each carries the needle of the rule that refuses it."""
+        self.assertEqual(len(self.R13_REGRESSION_ROWS), 35)
+        self.assertEqual(len(self.R14_CODE_ROWS), 12)
+        self._check_replace_rows(self.R13_REGRESSION_ROWS)
+
     def test_code_r12_c1_each_pinned_module_name_has_one_direct_binding_of_its_value(self):
         """code r12 C1: a second assignment, a changed value, a multi-target assignment and an
         assignment under if, try or while are all refused for every pinned module-level name."""
@@ -2590,7 +2609,10 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(empty_needle_rows([planted]), ["planted-empty"])
         self.assertEqual(empty_needle_rows([(("planted-named", "a", "b", "rule"),)]), [])
         tables = [self.C13_MUTANTS, self.C14_MUTANTS, self.R14_MUTANTS, self.R14_DASH_ROWS,
-                  self.R14_CODE_ROWS, self.R15_C1_ROWS]
+                  self.R14_CODE_ROWS, self.R13_REGRESSION_ROWS, self.R15_C1_ROWS,
+                  [(fid, None, None, needle) for fid, needle in WF_FORM_RED.items()],
+                  [(fid, None, None, reason) for fid, reason in WF_FORM_GREEN.items()],
+                  [(fid, None, None, specs) for fid, specs in WF_FORM_TESTS.items()]]
         self.assertEqual(empty_needle_rows(tables), [])
 
     def test_sec_r11_the_pinned_construction_and_enumerated_arguments_are_named(self):
@@ -2752,10 +2774,13 @@ TrustDecisionFirst.R14_DASH_ROWS = tuple(
         TrustDecisionFirst.R14_DERIVED + "        rev_parse(%s)\n" % form, "argument is not")
        for tag, form in TrustDecisionFirst.R14_DASH_FORMS])
 
-# code r11 C1 (round 14): the reviewer's probe forms, one row each, built as (label, old, new,
-# needle); the needle is empty because any non-sha256 problem line counts as red. A string form is
-# inserted after the module anchor, ("sub", old, new) replaces once, ("sub2", (old, new), ...)
-# replaces each pair once.
+# code r11 C1 (round 14) and code r12 C2 (round 15): the reviewer's probe forms, one row each, built
+# as (label, old, new, needle). Every row carries the needle of the rule that refuses it, found by
+# running the form at 21519d95b (round 13) and at the round-14 head: 35 forms are already refused
+# by a round-13 rule and sit in the round-13 regression table R13_REGRESSION_ROWS; the 12 forms the
+# round-14 rules newly refuse sit in R14_CODE_ROWS. No row keeps an empty needle (an empty needle
+# matches any problem line and guards no rule). A string form is inserted after the module anchor,
+# ("sub", old, new) replaces once, ("sub2", (old, new), ...) replaces each pair once.
 _R11_ANCHOR = "GIT_TIMEOUT_S = 120\n"
 _R11_ENVLINE = 'env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")'
 _R11_ENVKW = "env=env)"
@@ -2824,15 +2849,77 @@ _R11_FORMS = (
 )
 
 
+_R13_BASE = "git value name base: base is not an unrebound parameter"
+_R14_STORES = "outside the pinned module stores"
+_R14_ENV = ("environment construction is not exactly one env = dict(os.environ, "
+            "GIT_NO_REPLACE_OBJECTS='1') in git()")
+_R14_ENVKW = "environment keyword is not the pinned name env on subprocess.run"
+# label -> (round whose rule refuses the form, needle). Round 13 = refused at 21519d95b.
+_R11_RULES = {
+    "c2-ns-rebind-subprocess": (13, "binds subprocess"),
+    "c2-tuple-unpack-value": (14, _R14_STORES),
+    "c2-for-target": (14, _R14_STORES),
+    "c2-with-as": (13, "open call outside the enumerated arguments"),
+    "c2-except-as": (14, _R14_STORES),
+    "c2-comprehension-var": (14, _R14_STORES),
+    "c2-nested-def-param": (13, "defines _g outside the pinned set"),
+    "c2-global": (13, "defines _f outside the pinned set"),
+    "c2-nonlocal": (13, "defines _g outside the pinned set"),
+    "c2f-assign-in-fn": (13, _R13_BASE),
+    "c2f-tuple-unpack-in-fn": (13, _R13_BASE),
+    "c2f-for-target-in-fn": (13, _R13_BASE),
+    "c2f-except-as-in-fn": (13, _R13_BASE),
+    "c2f-with-as-in-fn": (13, _R13_BASE),
+    "c2f-walrus-in-fn": (13, _R13_BASE),
+    "c2-default-arg": (13, "defines _f outside the pinned set"),
+    "c2-star-import": (13, "import statement outside the pinned set (from os import *)"),
+    "c3-alias-store": (13, "stores into or deletes from env"),
+    "c3-copy-update-passed": (13, "calls env.update outside the allow-list"),
+    "c3-dict-copy-update": (13, "calls e.update outside the allow-list"),
+    "c3-environ-copy-store": (13, "calls os.environ.copy outside the allow-list"),
+    "c3-def-env-default": (13, "environment mapping os.environ used outside the read-only forms"),
+    "c3-setitem-alias": (13, "reaches os.environ.__setitem__ outside the allow-list"),
+    "c3-operator-setitem": (13, "calls operator.setitem outside the allow-list"),
+    "c3-class-setitem": (13, "calls os.environ.__class__.__setitem__ outside the allow-list"),
+    "c3-vars-os": (13, "calls vars outside the allow-list"),
+    "c3-getattr-os": (13, "calls getattr outside the allow-list"),
+    "c4-match-in-def": (13, "match statement outside the allow-list"),
+    "c4-match-in-class": (13, "match statement outside the allow-list"),
+    "c5-call-arg-module": (13, "bare reference to module subprocess"),
+    "c5-print-os": (13, "bare reference to module os"),
+    "c5-star-list": (13, "bare reference to module subprocess"),
+    "c5-starstar-dict": (13, "bare reference to module os"),
+    "c5-keyword-module": (13, "bare reference to module subprocess"),
+    "c5-list-subscript-call": (13, "call on an unenumerated receiver"),
+    "c5-tuple-subscript": (13, "bare reference to module subprocess"),
+    "ga-env-extra-keyword": (14, _R14_ENV),
+    "ga-env-literal-dict": (14, _R14_ENV),
+    "ga-env-dict-without-environ": (14, _R14_ENV),
+    "ga-env-dict-starstar": (14, _R14_ENV),
+    "ga-env-starstar-guard-kept": (14, _R14_ENV),
+    "ga-env-literal-guard-path": (14, _R14_ENV),
+    "ga-env-keyword-inline-dict": (14, _R14_ENVKW),
+    "ga-env-keyword-none": (14, _R14_ENVKW),
+    "gb-second-run-other-fn": (13, "2 subprocess.run calls, expected exactly 1"),
+    "gb-git-extra-param": (13, "subprocess.run argv is not the exact git head plus list(args)"),
+    "gb-caller-dash-literal": (13, "dash argument outside the allow-list"),
+}
+
+
 def _r11_row(label, form):
+    needle = _R11_RULES[label][1]
     if isinstance(form, str):
-        return (label, _R11_ANCHOR, _R11_ANCHOR + form + "\n", "")
+        return (label, _R11_ANCHOR, _R11_ANCHOR + form + "\n", needle)
     if form[0] == "sub":
-        return (label, form[1], form[2], "")
-    return (label, tuple(p[0] for p in form[1:]), tuple(p[1] for p in form[1:]), "")
+        return (label, form[1], form[2], needle)
+    return (label, tuple(p[0] for p in form[1:]), tuple(p[1] for p in form[1:]), needle)
 
 
-TrustDecisionFirst.R14_CODE_ROWS = tuple(_r11_row(label, form) for label, form in _R11_FORMS)
+assert set(_R11_RULES) == {label for label, _form in _R11_FORMS}
+TrustDecisionFirst.R13_REGRESSION_ROWS = tuple(
+    _r11_row(label, form) for label, form in _R11_FORMS if _R11_RULES[label][0] == 13)
+TrustDecisionFirst.R14_CODE_ROWS = tuple(
+    _r11_row(label, form) for label, form in _R11_FORMS if _R11_RULES[label][0] == 14)
 
 
 # code r12 C1 (round 15): the four pinned module-level names each have exactly ONE binding, a direct
@@ -3061,11 +3148,14 @@ class TrustWindowMutants(unittest.TestCase):
             changed = run.replace("GIT_TIMEOUT_S = 120", "GIT_TIMEOUT_S = 121")
             self.assertNotEqual(changed, run)
             problems = materialise_problems(name, changed)
-            self.assertEqual(len(problems), 1)
-            self.assertIn(name, problems[0])
-            self.assertIn(run_digest(changed), problems[0])
-            self.assertIn(MATERIALISE_SHA256[name], problems[0])
-            self.assertNotIn("GIT_TIMEOUT_S", problems[0])
+            # code r12 C1: the changed value is also refused by the pinned-value rule.
+            digest = [p for p in problems if "sha256" in p]
+            self.assertEqual(len(digest), 1, problems)
+            self.assertEqual(len(problems), 2, problems)
+            self.assertIn(name, digest[0])
+            self.assertIn(run_digest(changed), digest[0])
+            self.assertIn(MATERIALISE_SHA256[name], digest[0])
+            self.assertNotIn("GIT_TIMEOUT_S", digest[0])
 
     def test_F3_a_line_appended_in_ci_yml_after_either_heredoc_is_red(self):
         text = self.live()
@@ -3450,6 +3540,1192 @@ class DerivedBase(BaseCase):
                                  "${{ github.event.merge_group.base_sha }}")
                 self.assertEqual(env["CONTEXT_SHA"], CONTEXT_SHA_EXPR)
                 self.assertIn("base-sha-mismatch", snippet_of(step_named(job, name)))
+
+
+# code r12 C3 (round 15): the 180 workflow-level mutation forms of the security review of
+# round 10 (119 forms of its first family, 61 of its second), carried as rows of this module so
+# they run in both CI jobs on every push. Each form edits ci.yml text in memory (nothing is
+# written to the checkout) and the module asserts the gate refuses it:
+#   WF_FORM_RED    161 forms the pre-trust gate refuses; the value is the problem line it must
+#                  report. A form marked REHASH changes a Materialise heredoc, so the sha256 pin
+#                  is re-pinned to the mutated text and the second layer must refuse it alone.
+#   WF_FORM_TESTS  9 forms another test of the gate suite refuses (this module, or the sibling
+#                  module for the ci-gate job); the named tests run on the mutated text.
+#   WF_FORM_GREEN  9 forms that stay green by design, each with its reason (controls, order
+#                  insensitive sets, a display name, a move toward fail closed).
+#   WF_FORM_DOC    1 form that reverts a docstring of this module to the banned wording.
+# WF_FORM_SAME_AS names the 18 forms whose mutated text equals the text of a row that already
+# exists in this module; they still run here, and a test asserts the text equality.
+
+
+def _workflow_forms():
+    """The reviewer's workflow-level mutation forms: id -> edits."""
+    PIN = "11d5960a326750d5838078e36cf38b85af677262"
+    OTHER = "08eba0b27e820071cde6df949e0beb9ba4906955"
+    SEL_CO = (
+        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n\n      #"
+        " Skipping is off" % PIN
+    )
+    GATE_CO = (
+        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n      #"
+        " decision: on push, schedule" % PIN
+    )
+    CO_BLOCK = (
+        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n" % PIN
+    )
+    MODE_NAME = "      - name: Selection mode\n"
+    MODE_ENV = "        id: mode\n        env:\n          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}\n"
+    MODE_RUN = '        run: echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"\n'
+    GATE_IF = (
+        "        id: base\n        if: ${{ github.event_name == 'pull_request' || github.event_name"
+        " == 'merge_group' }}\n        env:\n"
+    )
+    SEL_PY_END = "          PY\n\n      - name: Build impact index"
+    GATE_PY_END = "          PY\n      # decision: !cancelled() &&"
+    WF_ENV = "env:\n  CARGO_TERM_COLOR: always\n"
+    SEL_JOB_ENV = "    timeout-minutes: 15\n    env:\n      RUSTUP_TOOLCHAIN: stable\n"
+    GATE_HDR = "    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    steps:\n"
+    SEL_RUNSON = (
+        "    # RUNNER PLACEMENT - GitHub-hosted: it only runs git and python.\n    runs-on:"
+        " ubuntu-latest\n"
+    )
+    CONCURRENCY = re.compile("^concurrency:\\n(?:  .*\\n)+", re.M)
+    ENV_KEYS = (
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "PATH",
+        "LD_PRELOAD",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+    )
+    IMPORTS = "          import sys\n          from pathlib import Path\n"
+    MAIN = '          if __name__ == "__main__":\n'
+
+    def rep(old, new, count=1):
+        """Replace exactly `count` occurrences (count=0: all, at least one)."""
+
+        def fn(text):
+            n = text.count(old)
+            if count and n != count or n == 0:
+                raise ValueError(
+                    "expected %s occurrence(s), found %d of %r" % (count or ">=1", n, old[:50])
+                )
+            return text.replace(old, new)
+
+        return fn
+
+    def rep_nth(old, new, nth):
+
+        def fn(text):
+            idx = -1
+            for _ in range(nth):
+                idx = text.index(old, idx + 1)
+            return text[:idx] + new + text[idx + len(old) :]
+
+        return fn
+
+    def regex_sub(pattern, new):
+
+        def fn(text):
+            out, n = pattern.subn(new, text, count=1)
+            if n != 1:
+                raise ValueError("pattern not found")
+            return out
+
+        return fn
+
+    def new_step(job, body):
+        if job == "select":
+            return rep(
+                SEL_CO, SEL_CO.replace("\n\n      # Skipping", "\n\n" + body + "\n      # Skipping")
+            )
+        return rep(
+            GATE_CO,
+            GATE_CO.replace(
+                "\n      # decision: on push", "\n" + body + "      # decision: on push"
+            ),
+        )
+
+    def append_run(job, line):
+        """Append a shell line to the Materialise `run: |` block after the heredoc end."""
+        if job == "select":
+            return rep(
+                SEL_PY_END, "          PY\n          %s\n\n      - name: Build impact index" % line
+            )
+        return rep(
+            GATE_PY_END, "          PY\n          %s\n      # decision: !cancelled() &&" % line
+        )
+
+    ANCHOR = "          GIT_TIMEOUT_S = 120\n"
+    WF_PERM = "\npermissions:\n  contents: read\n"
+    SEL_HDR = (
+        "    # RUNNER PLACEMENT - GitHub-hosted: it only runs git and python.\n    runs-on:"
+        " ubuntu-latest\n    timeout-minutes: 15\n"
+    )
+    SEL_CMT = "    # RUNNER PLACEMENT - GitHub-hosted: it only runs git and python.\n"
+    GATE_TOP = "    name: ci-gate\n    if: always()\n"
+    BUILD_IF = (
+        "        if: ${{ steps.base.outputs.ok == 'true' }}\n        continue-on-error: true\n     "
+        '   run: python3 -I "$RUNNER_TEMP/impact-base/impact/build_index.py"'
+    )
+    GATE_MAT_IF = (
+        "        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group'"
+        " }}\n"
+    )
+    BASE_FOLD_IF = (
+        "        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name"
+        " == 'merge_group') && steps.base.outputs.ok == 'true' }}\n"
+    )
+
+    def heredoc_line(line):
+        """Insert one module-level line after GIT_TIMEOUT_S in BOTH Materialise heredocs."""
+        return [rep(ANCHOR, ANCHOR + "          " + line + "\n", 2), "REHASH"]
+
+    m = {}
+    m["r10-01-quoted-shell"] = [
+        rep("        id: mode\n", '        id: mode\n        "shell": bash\n')
+    ]
+    m["r10-02-spaced-shell"] = [
+        rep("        id: mode\n", "        id: mode\n        shell : bash\n")
+    ]
+    m["r10-03-flow-step-shell"] = [
+        rep(
+            MODE_NAME + MODE_ENV + MODE_RUN,
+            "      - {name: Selection mode, id: mode, shell: bash, env: {ENFORCE: x}, run: echo}\n",
+        )
+    ]
+    m["r10-04-block-scalar-shell"] = [
+        rep(
+            "        id: mode\n",
+            "        id: mode\n        shell: |\n          bash --noprofile {0}\n",
+        )
+    ]
+    m["r10-05-quoted-BASH_ENV"] = [rep(MODE_ENV, MODE_ENV + '          "BASH_ENV": ./x\n')]
+    m["r10-06-spaced-BASH_ENV"] = [rep(MODE_ENV, MODE_ENV + "          BASH_ENV : ./x\n")]
+    m["r10-07-flow-env-BASH_ENV"] = [
+        rep(
+            "        env:\n          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}\n",
+            '        env: {ENFORCE: "${{ vars.CI_IMPACT_ENFORCE }}", BASH_ENV: ./x}\n',
+        )
+    ]
+    m["r10-08-quoted-submodules"] = [
+        rep(
+            SEL_CO,
+            SEL_CO.replace("fetch-depth: 0\n", 'fetch-depth: 0\n          "submodules": true\n'),
+        )
+    ]
+    m["r10-09-wf-BASH_ENV"] = [rep(WF_ENV, WF_ENV + "  BASH_ENV: ./x\n")]
+    m["r10-10-job-BASH_ENV-select"] = [rep(SEL_JOB_ENV, SEL_JOB_ENV + "      BASH_ENV: ./x\n")]
+    m["r10-11-job-BASH_ENV-gate"] = [
+        rep(
+            GATE_HDR,
+            GATE_HDR.replace("    steps:\n", "    env:\n      BASH_ENV: ./x\n    steps:\n"),
+        )
+    ]
+    m["r10-12-wf-defaults-shell"] = [
+        rep("\njobs:\n", "\ndefaults:\n  run:\n    shell: bash --rcfile ./x -i {0}\n\njobs:\n")
+    ]
+    m["r10-13-job-defaults-wd-select"] = [
+        rep(
+            SEL_JOB_ENV,
+            SEL_JOB_ENV + "    defaults:\n      run:\n        working-directory: scripts\n",
+        )
+    ]
+    m["r10-14-wf-PYTHONPATH"] = [rep(WF_ENV, WF_ENV + "  PYTHONPATH: scripts/ci\n")]
+    m["r10-15-wf-defaults-wd"] = [
+        rep("\njobs:\n", "\ndefaults:\n  run:\n    working-directory: scripts\n\njobs:\n")
+    ]
+    m["r10-16-container-select"] = [rep(SEL_JOB_ENV, SEL_JOB_ENV + "    container: ubuntu:24.04\n")]
+    m["r10-17-container-gate"] = [
+        rep(GATE_HDR, GATE_HDR.replace("    steps:\n", "    container: ubuntu:24.04\n    steps:\n"))
+    ]
+    for job in ("select", "gate"):
+        m["r10-f3-%s-append-base_sha" % job] = [
+            append_run(job, "python3 scripts/ci/impact/base_sha.py")
+        ]
+        m["r10-f3-%s-append-source-env" % job] = [append_run(job, "source .env")]
+        m["r10-f3-%s-append-dot-x" % job] = [append_run(job, "./x")]
+    m["r10-f3-select-one-byte"] = [rep_nth("GIT_TIMEOUT_S = 120", "GIT_TIMEOUT_S = 121", 1)]
+    m["r10-f3-gate-one-byte"] = [rep_nth("GIT_TIMEOUT_S = 120", "GIT_TIMEOUT_S = 121", 2)]
+    m["l01-grafts-path-dropped"] = [
+        rep(
+            '("info/grafts", "shallow", "objects/info/alternates")',
+            '("shallow", "objects/info/alternates")',
+            2,
+        )
+    ]
+    m["l02-shallow-path-dropped"] = [
+        rep(
+            '("info/grafts", "shallow", "objects/info/alternates")',
+            '("info/grafts", "objects/info/alternates")',
+            2,
+        )
+    ]
+    m["l03-alternates-path-dropped"] = [
+        rep(
+            '("info/grafts", "shallow", "objects/info/alternates")', '("info/grafts", "shallow")', 2
+        )
+    ]
+    m["l04-GIT_ALTERNATE_OBJECT_DIRECTORIES-dropped"] = [
+        rep('("GIT_GRAFT_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",', '("GIT_GRAFT_FILE",', 2)
+    ]
+    m["l05-GIT_GRAFT_FILE-dropped"] = [
+        rep(
+            '("GIT_GRAFT_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",',
+            '("GIT_ALTERNATE_OBJECT_DIRECTORIES",',
+            2,
+        )
+    ]
+    m["l06-git_state_refused-not-called"] = [
+        rep("if replace_refs_present() or git_state_refused():", "if replace_refs_present():", 2)
+    ]
+    m["l07-select-make-prep"] = [new_step("select", "      - name: Prep\n        run: make prep\n")]
+    m["l08-select-sh-c"] = [
+        new_step("select", "      - name: Prep\n        run: sh -c ./ci/prep\n")
+    ]
+    m["l09-select-second-uses"] = [new_step("select", "      - uses: actions/cache@v4\n")]
+    m["l10-select-checkout-sha"] = [rep(SEL_CO, SEL_CO.replace(PIN, OTHER))]
+    m["l11-gate-make-prep"] = [new_step("gate", "      - name: Prep\n        run: make prep\n")]
+    m["l12-gate-sh-c"] = [new_step("gate", "      - name: Prep\n        run: sh -c ./ci/prep\n")]
+    m["l13-gate-second-uses"] = [new_step("gate", "      - uses: actions/cache@v4\n")]
+    m["l14-ref-checkout-after-materialise"] = [
+        rep(
+            SEL_PY_END,
+            "          PY\n\n      - uses: actions/checkout@%s # v4\n        with:\n          ref:"
+            " ${{ github.event.pull_request.head.sha }}\n\n      - name: Build impact index" % PIN,
+        )
+    ]
+    m["l15-plain-checkout-after-materialise"] = [
+        rep(
+            SEL_PY_END,
+            "          PY\n\n      - uses: actions/checkout@%s # v4\n\n      - name: Build impact"
+            " index" % PIN,
+        )
+    ]
+    m["l16-BASH_ENV-selection-mode"] = [rep(MODE_ENV, MODE_ENV + "          BASH_ENV: ./x\n")]
+    m["l17-shell-selection-mode"] = [
+        rep("        id: mode\n", "        id: mode\n        shell: sh\n")
+    ]
+    m["l18-wd-selection-mode"] = [
+        rep("        id: mode\n", "        id: mode\n        working-directory: scripts\n")
+    ]
+    m["l19-base_sha-run-step"] = [
+        rep(
+            MODE_RUN,
+            MODE_RUN
+            + "\n      - name: Report\n        run: python3 -I scripts/ci/impact/base_sha.py\n",
+        )
+    ]
+    resolver = (
+        "      - name: Resolve the live base (#8240)\n        id: live\n        run: python3 -I"
+        " scripts/ci/impact/base_sha.py\n"
+    )
+    m["l20-resolver-in-select"] = [new_step("select", resolver)]
+    m["l21-resolver-in-gate"] = [new_step("gate", resolver)]
+    m["l22-GIT_NO_REPLACE_OBJECTS-dropped"] = [
+        rep('env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")', "env = dict(os.environ)", 2)
+    ]
+    m["l23-github.sha-replaced-by-HEAD"] = [
+        rep('rev_parse(context + "^1^{commit}")', 'rev_parse("HEAD^1^{commit}")', 2)
+    ]
+    m["l24-script-appended-to-selection-mode"] = [
+        rep(MODE_RUN, MODE_RUN.rstrip("\n") + " && bash scripts/ci/prep.bash\n")
+    ]
+    m["l25-replace-ref-check-dropped"] = [
+        rep("if replace_refs_present() or git_state_refused():", "if git_state_refused():", 2)
+    ]
+    m["l26-replace-and-state-dropped"] = [
+        rep(
+            "                  if replace_refs_present() or git_state_refused():\n                 "
+            '     raise BaseUnavailable("base-sha-mismatch")\n',
+            "",
+            2,
+        )
+    ]
+    m["l27-HEAD-eq-context-dropped"] = [
+        rep(
+            'if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:',
+            "if not SHA_RE.match(context):",
+            2,
+        )
+    ]
+    m["c1-single-quoted-shell"] = [
+        rep("        id: mode\n", "        id: mode\n        'shell': bash\n")
+    ]
+    m["c1-quoted-with-plus-submodules"] = [
+        rep(
+            SEL_CO,
+            SEL_CO.replace(
+                "        with:\n          fetch-depth: 0\n",
+                '        "with":\n          fetch-depth: 0\n          submodules: true\n',
+            ),
+        )
+    ]
+    m["c1-quoted-with-only-control"] = [
+        rep(SEL_CO, SEL_CO.replace("        with:\n", '        "with":\n'))
+    ]
+    m["c1-spaced-submodules"] = [
+        rep(
+            SEL_CO,
+            SEL_CO.replace("fetch-depth: 0\n", "fetch-depth: 0\n          submodules : true\n"),
+        )
+    ]
+    m["c1-flow-with-submodules"] = [
+        rep(
+            SEL_CO,
+            SEL_CO.replace(
+                "        with:\n          fetch-depth: 0\n",
+                "        with: {fetch-depth: 0, submodules: true}\n",
+            ),
+        )
+    ]
+    m["c1-folded-env-value"] = [
+        rep(MODE_ENV, MODE_ENV + "          BASH_ENV: >\n            ./x\n")
+    ]
+    m["c1-literal-env-value"] = [
+        rep(MODE_ENV, MODE_ENV + "          BASH_ENV: |-\n            ./x\n")
+    ]
+    m["c1-anchor-alias"] = [
+        rep(WF_ENV, "env:\n  CARGO_TERM_COLOR: &a always\n"),
+        rep(MODE_ENV, MODE_ENV + "          BASH_ENV: *a\n"),
+    ]
+    m["c1-anchor-on-mapping-merge"] = [
+        rep(WF_ENV, "env: &wf\n  CARGO_TERM_COLOR: always\n"),
+        rep(MODE_ENV, MODE_ENV.replace("        env:\n", "        env:\n          <<: *wf\n")),
+    ]
+    m["c1-merge-key-flow"] = [rep(MODE_ENV, MODE_ENV + "          <<: {BASH_ENV: ./x}\n")]
+    m["c1-escaped-key"] = [rep(MODE_ENV, MODE_ENV + '          "BASH\\u005fENV": ./x\n')]
+    m["c1-tab-after-colon"] = [rep(MODE_ENV, MODE_ENV + "          BASH_ENV:\t./x\n")]
+    m["c1-tab-before-colon"] = [rep(MODE_ENV, MODE_ENV + "          BASH_ENV\t: ./x\n")]
+    m["c1-job-env-flow"] = [
+        rep(
+            SEL_JOB_ENV,
+            "    timeout-minutes: 15\n    env: {RUSTUP_TOOLCHAIN: stable, BASH_ENV: ./x}\n",
+        )
+    ]
+    m["c1-wf-env-quoted"] = [rep(WF_ENV, WF_ENV + "  'BASH_ENV': ./x\n")]
+    m["c1-trailing-comment-key"] = [rep(MODE_ENV, MODE_ENV + "          BASH_ENV: ./x # note\n")]
+    m["c1-explicit-tag-value"] = [rep(MODE_ENV, MODE_ENV + "          BASH_ENV: !!str ./x\n")]
+    for key in ENV_KEYS:
+        m["c2-wf-env-" + key] = [rep(WF_ENV, WF_ENV + "  %s: ./x\n" % key)]
+    m["c2-container-image-options"] = [
+        rep(
+            SEL_JOB_ENV,
+            SEL_JOB_ENV + "    container:\n      image: ubuntu:24.04\n      options: --user 0\n",
+        )
+    ]
+    m["c2-services-select"] = [
+        rep(SEL_JOB_ENV, SEL_JOB_ENV + "    services:\n      db:\n        image: postgres:18\n")
+    ]
+    m["c2-job-defaults-shell-gate"] = [
+        rep(
+            GATE_HDR,
+            GATE_HDR.replace(
+                "    steps:\n", "    defaults:\n      run:\n        shell: sh\n    steps:\n"
+            ),
+        )
+    ]
+    m["c2-job-env-gate-benign"] = [
+        rep(GATE_HDR, GATE_HDR.replace("    steps:\n", "    env:\n      FOO: bar\n    steps:\n"))
+    ]
+    m["c2-runs-on-self-hosted-select"] = [
+        rep(SEL_RUNSON, SEL_RUNSON.replace("ubuntu-latest", "[self-hosted, linux]"))
+    ]
+    m["c2-runs-on-self-hosted-gate"] = [
+        rep(GATE_HDR, GATE_HDR.replace("ubuntu-latest", "[self-hosted, linux]"))
+    ]
+    m["c2-permissions-select"] = [
+        rep(
+            SEL_JOB_ENV,
+            SEL_JOB_ENV + "    permissions:\n      contents: write\n      id-token: write\n",
+        )
+    ]
+    m["c2-concurrency-removed"] = [regex_sub(CONCURRENCY, "")]
+    for job in ("select", "gate"):
+        for tag, line in (
+            ("py-c", "python3 -c 'import runpy'"),
+            ("source", "source ./x"),
+            ("dot", ". ./x"),
+            ("exec", "exec ./x"),
+            ("eval", 'eval "$X"'),
+            ("cmdsub", "echo $(./x)"),
+            ("backtick", "echo `./x`"),
+            ("procsub", "bash <(cat x)"),
+            ("hookspath", "git -c core.hooksPath=h status"),
+            ("alias", "git -c alias.x='!sh' x"),
+            ("rebase-exec", "git rebase --exec make HEAD~1"),
+            ("ssh-command", "GIT_SSH_COMMAND=make git fetch"),
+        ):
+            m["c3-%s-%s" % (job, tag)] = [append_run(job, line)]
+    stale = {
+        "x8-runpy": (
+            IMPORTS.replace("import sys\n", "import sys\n          import runpy\n")
+            + "          os.path.exists('scripts/ci/prep.py') and"
+            " runpy.run_path('scripts/ci/prep.py')\n"
+        ),
+        "check-call-make": IMPORTS + '          subprocess.check_call(["make", "prep"])\n',
+        "getoutput": IMPORTS + '          subprocess.getoutput("make prep")\n',
+        "posix-spawnp": IMPORTS + '          os.posix_spawnp("make", ["make"], dict(os.environ))\n',
+        "call-bare-file": IMPORTS + '          subprocess.call(["sh", "prep.bash"])\n',
+        "relative-dotfile": IMPORTS + '          subprocess.call(["sh", ".prep"])\n',
+    }
+    for tag, new in stale.items():
+        m["sh-" + tag] = [rep(IMPORTS, new, 2), "REHASH"]
+    m["sh-git-fsmonitor"] = [
+        rep(MAIN, '          git("-c", "core.fsmonitor=make", "status")\n\n\n' + MAIN, 2),
+        "REHASH",
+    ]
+    m["sh-git-alias"] = [
+        rep(MAIN, '          git("-c", "alias.p=!make", "p")\n\n\n' + MAIN, 2),
+        "REHASH",
+    ]
+    m["c2-baseline-unmutated"] = []
+    m["f2-select-mat-env-value"] = [
+        rep_nth(
+            "          CONTEXT_SHA: ${{ github.sha }}\n",
+            "          CONTEXT_SHA: ${{ github.ref }}\n",
+            1,
+        )
+    ]
+    m["f2-gate-mat-env-value"] = [
+        rep_nth(
+            "          CONTEXT_SHA: ${{ github.sha }}\n",
+            "          CONTEXT_SHA: ${{ github.ref }}\n",
+            2,
+        )
+    ]
+    m["f2-gate-impact-files-value"] = [
+        rep(
+            "IMPACT_FILES: __init__.py common.py gate.py rules.json\n",
+            "IMPACT_FILES: __init__.py common.py gate.py rules.json x.py\n",
+        )
+    ]
+    m["f2-gate-fold-env-value"] = [
+        rep_nth(
+            "          GITHUB_REF_NAME_FULL: ${{ github.ref }}\n",
+            "          GITHUB_REF_NAME_FULL: refs/heads/main\n",
+            1,
+        )
+    ]
+    m["f2-select-mode-env-value"] = [
+        rep_nth("ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}\n", "ENFORCE: 'true'\n", 1)
+    ]
+    m["f2-wf-env-value"] = [rep("  CARGO_TERM_COLOR: always\n", "  CARGO_TERM_COLOR: never\n")]
+    m["f2-select-job-env-value"] = [
+        rep("      RUSTUP_TOOLCHAIN: stable\n", "      RUSTUP_TOOLCHAIN: nightly\n")
+    ]
+    m["f2-select-jobkey-strategy"] = [
+        rep(SEL_HDR, SEL_HDR + "    strategy:\n      matrix:\n        x: [a]\n")
+    ]
+    m["f2-select-jobkey-continue-on-error"] = [
+        rep(SEL_HDR, SEL_HDR + "    continue-on-error: true\n")
+    ]
+    m["f2-select-jobkey-environment"] = [rep(SEL_HDR, SEL_HDR + "    environment: release\n")]
+    m["f2-gate-jobkey-concurrency"] = [
+        rep(GATE_HDR, GATE_HDR.replace("    steps:\n", "    concurrency: x\n    steps:\n"))
+    ]
+    m["f2-gate-jobkey-strategy"] = [
+        rep(
+            GATE_HDR,
+            GATE_HDR.replace(
+                "    steps:\n", "    strategy:\n      matrix:\n        x: [a]\n    steps:\n"
+            ),
+        )
+    ]
+    m["f2-select-key-missing-timeout"] = [rep(SEL_HDR, SEL_CMT + "    runs-on: ubuntu-latest\n")]
+    m["f2-gate-key-missing-timeout"] = [rep(GATE_HDR, "    runs-on: ubuntu-latest\n    steps:\n")]
+    m["f2-select-runs-on-self-hosted"] = [
+        rep(SEL_HDR, SEL_HDR.replace("ubuntu-latest", "[self-hosted, linux]"))
+    ]
+    m["f2-gate-runs-on-self-hosted"] = [
+        rep(GATE_HDR, GATE_HDR.replace("ubuntu-latest", "self-hosted"))
+    ]
+    m["f2-select-runs-on-group"] = [rep(SEL_HDR, SEL_HDR.replace("ubuntu-latest", "{group: big}"))]
+    m["f2-wf-perm-contents-write"] = [rep(WF_PERM, "\npermissions:\n  contents: write\n")]
+    m["f2-wf-perm-add-scope"] = [rep(WF_PERM, WF_PERM + "  id-token: write\n")]
+    m["f2-wf-perm-write-all"] = [rep(WF_PERM, "\npermissions: write-all\n")]
+    m["f2-wf-perm-removed"] = [rep(WF_PERM, "\n")]
+    m["f2-select-perm-contents-write"] = [
+        rep(SEL_HDR, SEL_HDR + "    permissions:\n      contents: write\n")
+    ]
+    m["f2-select-perm-add-scope"] = [
+        rep(SEL_HDR, SEL_HDR + "    permissions:\n      contents: read\n      id-token: write\n")
+    ]
+    m["f2-gate-perm-write-all"] = [
+        rep(GATE_HDR, GATE_HDR.replace("    steps:\n", "    permissions: write-all\n    steps:\n"))
+    ]
+    m["f2-reorder-select-job-keys"] = [
+        rep(SEL_HDR, SEL_CMT + "    timeout-minutes: 15\n    runs-on: ubuntu-latest\n")
+    ]
+    m["f2-reorder-gate-job-keys"] = [
+        rep(GATE_HDR, "    timeout-minutes: 5\n    runs-on: ubuntu-latest\n    steps:\n")
+    ]
+    m["f2-reorder-wf-env"] = [
+        rep(
+            "env:\n  CARGO_TERM_COLOR: always\n",
+            'env:\n  CARGO_INCREMENTAL: "0"\n  CARGO_TERM_COLOR: always\n',
+        ),
+        rep('  CARGO_INCREMENTAL: "0"\n\njobs:\n', "\njobs:\n"),
+    ]
+    m["f2-reorder-mat-env"] = [
+        rep("          CONTEXT_SHA: ${{ github.sha }}\n", "", 2),
+        rep(
+            "          IMPACT_FILES:",
+            "          CONTEXT_SHA: ${{ github.sha }}\n          IMPACT_FILES:",
+            2,
+        ),
+    ]
+    m["c2-sh-getoutput"] = heredoc_line('subprocess.getoutput("make prep")')
+    m["c2-sh-posix-spawnp"] = heredoc_line('os.posix_spawnp("make", ["make"], dict(os.environ))')
+    m["c2-sh-call-bare-file"] = heredoc_line('subprocess.call(["sh", "prep.bash"])')
+    m["c2-sh-git-alias"] = heredoc_line('git("-c", "alias.p=!make", "p")')
+    m["c2-sh-git-fsmonitor"] = heredoc_line('git("-c", "core.fsmonitor=make", "status")')
+    m["c2-git-c-hookspath"] = heredoc_line('git("-c", "core.hooksPath=h", "fetch")')
+    m["c2-second-subprocess-run"] = heredoc_line('subprocess.run(["make", "prep"])')
+    m["c2-argv0-variable"] = heredoc_line('ARGV = ["make"]')[:1] + [
+        rep(
+            'subprocess.run(["git", "--no-replace-objects"] + list(args),',
+            "subprocess.run(ARGV + list(args),",
+            2,
+        ),
+        "REHASH",
+    ]
+    m["c2-shutil-which-git"] = heredoc_line('GIT = shutil.which("git")')
+    m["c2x-module-alias-call"] = heredoc_line('sp = subprocess; sp.getoutput("make prep")')
+    m["c2x-method-on-constant-dash"] = heredoc_line(
+        'git("fetch", "x--upload-pack=make".lstrip("x"), "origin")'
+    )
+    m["c2x-environ-subscript-store"] = heredoc_line('os.environ["GIT_CONFIG_COUNT"] = "1"')
+    m["c2x-path-method-write"] = heredoc_line('Path("x.git".lstrip("x"), "config").open("a")')
+    m["k8-build-index-if-pr-data"] = [
+        rep(
+            BUILD_IF,
+            BUILD_IF.replace(
+                "steps.base.outputs.ok == 'true'", "github.event.pull_request.title != ''"
+            ),
+        )
+    ]
+    m["k8-build-index-coe-false"] = [
+        rep(BUILD_IF, BUILD_IF.replace("continue-on-error: true", "continue-on-error: false"))
+    ]
+    m["k8-gate-materialise-if-false"] = [rep(GATE_MAT_IF, "        if: ${{ false }}\n")]
+    m["k8-base-fold-if-false"] = [rep(BASE_FOLD_IF, "        if: ${{ false }}\n")]
+    m["k8-gate-job-if-false"] = [rep(GATE_TOP, "    name: ci-gate\n    if: ${{ false }}\n")]
+    m["k8-gate-job-if-success"] = [rep(GATE_TOP, "    name: ci-gate\n    if: success()\n")]
+    m["k8-gate-needs-drop-check"] = [
+        rep(
+            "      - mobile-cross-compile\n    # RUNNER PLACEMENT - GitHub-hosted: it only reads",
+            "    # RUNNER PLACEMENT - GitHub-hosted: it only reads",
+        )
+    ]
+    m["k8-select-output-literal"] = [
+        rep(
+            "      rust: ${{ steps.select.outputs.rust || steps.fallback.outputs.rust }}\n",
+            "      rust: 'false'\n",
+        )
+    ]
+    m["k8-gate-timeout-value"] = [
+        rep(GATE_HDR, GATE_HDR.replace("timeout-minutes: 5", "timeout-minutes: 600"))
+    ]
+    m["k8-select-name-value"] = [
+        rep("    name: Impact selection\n", "    name: Impact selection x\n")
+    ]
+    m["k8-mode-step-continue-on-error"] = [
+        rep("        id: mode\n", "        id: mode\n        continue-on-error: true\n")
+    ]
+    m["k8-mode-step-timeout"] = [
+        rep("        id: mode\n", "        id: mode\n        timeout-minutes: 1\n")
+    ]
+    m["k8-mode-step-if-pr-data"] = [
+        rep(
+            "        id: mode\n",
+            "        id: mode\n        if: ${{ github.event.pull_request.title != '' }}\n",
+        )
+    ]
+    m["k8-select-job-uses-reusable"] = [
+        rep(SEL_HDR, SEL_HDR + "    uses: ./.github/workflows/x.yml\n")
+    ]
+    m["k8-container-credentials"] = [
+        rep(
+            SEL_HDR,
+            SEL_HDR + "    container:\n      image: x\n      credentials:\n        username: u\n",
+        )
+    ]
+    m["k8-services-gate"] = [
+        rep(
+            GATE_HDR,
+            GATE_HDR.replace(
+                "    steps:\n", "    services:\n      db:\n        image: x\n    steps:\n"
+            ),
+        )
+    ]
+    m["k8-checkout-with-ref"] = [
+        rep(SEL_CO, SEL_CO.replace("fetch-depth: 0\n", "fetch-depth: 0\n          ref: x\n"))
+    ]
+    m["k8-checkout-with-persist"] = [
+        rep(
+            SEL_CO,
+            SEL_CO.replace(
+                "fetch-depth: 0\n", "fetch-depth: 0\n          persist-credentials: true\n"
+            ),
+        )
+    ]
+    m["w1-docstring-reverted"] = ["DOCSTRING_REVERT"]
+    m["w1-ci-comment-reverted"] = [
+        rep_nth(
+            "      # this step derives the base inline and no resolver script runs over\n",
+            "      # the resolver is demoted to a post-" + "derivation report over\n",
+            1,
+        )
+    ]
+    return m
+
+WF_FORM_RED = {
+    "r10-01-quoted-shell": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'shell'], expected"
+        " ['env', 'id', 'name', 'run']"
+    ),
+    "r10-02-spaced-shell": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'shell'], expected"
+        " ['env', 'id', 'name', 'run']"
+    ),
+    "r10-03-flow-step-shell": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'shell'], expected"
+        " ['env', 'id', 'name', 'run']"
+    ),
+    "r10-04-block-scalar-shell": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'shell'], expected"
+        " ['env', 'id', 'name', 'run']"
+    ),
+    "r10-05-quoted-BASH_ENV": "job select step 'Selection mode' inherits env BASH_ENV",
+    "r10-06-spaced-BASH_ENV": "job select step 'Selection mode' inherits env BASH_ENV",
+    "r10-07-flow-env-BASH_ENV": "job select step 'Selection mode' inherits env BASH_ENV",
+    "r10-08-quoted-submodules": (
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
+        " {'fetch-depth': '0'}"
+    ),
+    "r10-09-wf-BASH_ENV": "workflow env sets BASH_ENV",
+    "r10-10-job-BASH_ENV-select": "job select env sets BASH_ENV",
+    "r10-11-job-BASH_ENV-gate": (
+        "job ci-gate keys ['env', 'if', 'name', 'needs', 'runs-on', 'steps', 'timeout-minutes'],"
+        " expected ['if', 'name', 'needs', 'runs-on', 'steps', 'timeout-minutes']"
+    ),
+    "r10-12-wf-defaults-shell": "workflow sets defaults",
+    "r10-13-job-defaults-wd-select": "job select sets defaults",
+    "r10-14-wf-PYTHONPATH": "workflow env sets PYTHONPATH",
+    "r10-15-wf-defaults-wd": "workflow sets defaults",
+    "r10-16-container-select": "job select sets container",
+    "r10-17-container-gate": "job ci-gate sets container",
+    "r10-f3-select-append-base_sha": "run text sha256",
+    "r10-f3-select-append-source-env": "run text sha256",
+    "r10-f3-select-append-dot-x": "run text sha256",
+    "r10-f3-gate-append-base_sha": "run text sha256",
+    "r10-f3-gate-append-source-env": "run text sha256",
+    "r10-f3-gate-append-dot-x": "run text sha256",
+    "r10-f3-select-one-byte": "run text sha256",
+    "r10-f3-gate-one-byte": "run text sha256",
+    "l01-grafts-path-dropped": "run text sha256",
+    "l02-shallow-path-dropped": "run text sha256",
+    "l03-alternates-path-dropped": "run text sha256",
+    "l04-GIT_ALTERNATE_OBJECT_DIRECTORIES-dropped": "run text sha256",
+    "l05-GIT_GRAFT_FILE-dropped": "run text sha256",
+    "l06-git_state_refused-not-called": "run text sha256",
+    "l07-select-make-prep": (
+        "job select pre-trust steps are [None, 'Prep', 'Selection mode', 'Materialise the base"
+        " selector (#8240)', 'Build impact index'], expected [None, 'Selection mode', 'Materialise"
+        " the base selector (#8240)', 'Build impact index']"
+    ),
+    "l08-select-sh-c": (
+        "job select pre-trust steps are [None, 'Prep', 'Selection mode', 'Materialise the base"
+        " selector (#8240)', 'Build impact index'], expected [None, 'Selection mode', 'Materialise"
+        " the base selector (#8240)', 'Build impact index']"
+    ),
+    "l09-select-second-uses": (
+        "job select pre-trust steps are [None, None, 'Selection mode', 'Materialise the base"
+        " selector (#8240)', 'Build impact index'], expected [None, 'Selection mode', 'Materialise"
+        " the base selector (#8240)', 'Build impact index']"
+    ),
+    "l10-select-checkout-sha": (
+        "job select step None uses 'actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955'"
+    ),
+    "l11-gate-make-prep": (
+        "job ci-gate pre-trust steps are [None, 'Prep', 'Materialise the base gate (#8240)', 'Fold"
+        " job results (base gate)'], expected [None, 'Materialise the base gate (#8240)', 'Fold job"
+        " results (base gate)']"
+    ),
+    "l12-gate-sh-c": (
+        "job ci-gate pre-trust steps are [None, 'Prep', 'Materialise the base gate (#8240)', 'Fold"
+        " job results (base gate)'], expected [None, 'Materialise the base gate (#8240)', 'Fold job"
+        " results (base gate)']"
+    ),
+    "l13-gate-second-uses": (
+        "job ci-gate pre-trust steps are [None, None, 'Materialise the base gate (#8240)', 'Fold"
+        " job results (base gate)'], expected [None, 'Materialise the base gate (#8240)', 'Fold job"
+        " results (base gate)']"
+    ),
+    "l14-ref-checkout-after-materialise": (
+        "job select pre-trust steps are [None, 'Selection mode', 'Materialise the base selector"
+        " (#8240)', None, 'Build impact index'], expected [None, 'Selection mode', 'Materialise the"
+        " base selector (#8240)', 'Build impact index']"
+    ),
+    "l15-plain-checkout-after-materialise": (
+        "job select pre-trust steps are [None, 'Selection mode', 'Materialise the base selector"
+        " (#8240)', None, 'Build impact index'], expected [None, 'Selection mode', 'Materialise the"
+        " base selector (#8240)', 'Build impact index']"
+    ),
+    "l16-BASH_ENV-selection-mode": "job select step 'Selection mode' inherits env BASH_ENV",
+    "l17-shell-selection-mode": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'shell'], expected"
+        " ['env', 'id', 'name', 'run']"
+    ),
+    "l18-wd-selection-mode": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'working-directory'],"
+        " expected ['env', 'id', 'name', 'run']"
+    ),
+    "l19-base_sha-run-step": (
+        "job select pre-trust steps are [None, 'Selection mode', 'Report', 'Materialise the base"
+        " selector (#8240)', 'Build impact index'], expected [None, 'Selection mode', 'Materialise"
+        " the base selector (#8240)', 'Build impact index']"
+    ),
+    "l20-resolver-in-select": (
+        "job select pre-trust steps are [None, 'Resolve the live base (#8240)', 'Selection mode',"
+        " 'Materialise the base selector (#8240)', 'Build impact index'], expected [None,"
+        " 'Selection mode', 'Materialise the base selector (#8240)', 'Build impact index']"
+    ),
+    "l21-resolver-in-gate": (
+        "job ci-gate pre-trust steps are [None, 'Resolve the live base (#8240)', 'Materialise the"
+        " base gate (#8240)', 'Fold job results (base gate)'], expected [None, 'Materialise the"
+        " base gate (#8240)', 'Fold job results (base gate)']"
+    ),
+    "l22-GIT_NO_REPLACE_OBJECTS-dropped": "run text sha256",
+    "l23-github.sha-replaced-by-HEAD": "run text sha256",
+    "l24-script-appended-to-selection-mode": (
+        "job select step 'Selection mode' run text differs from the allow-list"
+    ),
+    "l25-replace-ref-check-dropped": "run text sha256",
+    "l26-replace-and-state-dropped": "run text sha256",
+    "l27-HEAD-eq-context-dropped": "run text sha256",
+    "c1-single-quoted-shell": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'shell'], expected"
+        " ['env', 'id', 'name', 'run']"
+    ),
+    "c1-quoted-with-plus-submodules": (
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
+        " {'fetch-depth': '0'}"
+    ),
+    "c1-spaced-submodules": (
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
+        " {'fetch-depth': '0'}"
+    ),
+    "c1-flow-with-submodules": (
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
+        " {'fetch-depth': '0'}"
+    ),
+    "c1-folded-env-value": "job select step 'Selection mode' inherits env BASH_ENV",
+    "c1-literal-env-value": "job select step 'Selection mode' inherits env BASH_ENV",
+    "c1-anchor-alias": (
+        "workflow is unreadable by the strict loader: anchor, alias, tag or merge key"
+    ),
+    "c1-anchor-on-mapping-merge": (
+        "workflow is unreadable by the strict loader: anchor, alias, tag or merge key"
+    ),
+    "c1-merge-key-flow": "workflow is unreadable by the strict loader: duplicate or merge key '<<'",
+    "c1-escaped-key": (
+        "workflow is unreadable by the strict loader: unsupported escape in a double-quoted scalar"
+    ),
+    "c1-tab-after-colon": (
+        "workflow is unreadable by the strict loader: not a mapping entry (multi-line plain"
+        " scalar?)"
+    ),
+    "c1-tab-before-colon": "job select step 'Selection mode' inherits env BASH_ENV",
+    "c1-job-env-flow": "job select env sets BASH_ENV",
+    "c1-wf-env-quoted": "workflow env sets BASH_ENV",
+    "c1-trailing-comment-key": "job select step 'Selection mode' inherits env BASH_ENV",
+    "c1-explicit-tag-value": (
+        "workflow is unreadable by the strict loader: anchor, alias, tag or merge key"
+    ),
+    "c2-wf-env-BASH_ENV": "workflow env sets BASH_ENV",
+    "c2-wf-env-ENV": "workflow env sets ENV",
+    "c2-wf-env-SHELLOPTS": "workflow env sets SHELLOPTS",
+    "c2-wf-env-PATH": "workflow env sets PATH",
+    "c2-wf-env-LD_PRELOAD": "workflow env sets LD_PRELOAD",
+    "c2-wf-env-GIT_CONFIG_PARAMETERS": "workflow env sets GIT_CONFIG_PARAMETERS",
+    "c2-wf-env-GIT_DIR": "workflow env sets GIT_DIR",
+    "c2-wf-env-PYTHONPATH": "workflow env sets PYTHONPATH",
+    "c2-wf-env-PYTHONSTARTUP": "workflow env sets PYTHONSTARTUP",
+    "c2-container-image-options": "job select sets container",
+    "c2-services-select": "job select sets services",
+    "c2-job-defaults-shell-gate": "job ci-gate sets defaults",
+    "c2-job-env-gate-benign": (
+        "job ci-gate keys ['env', 'if', 'name', 'needs', 'runs-on', 'steps', 'timeout-minutes'],"
+        " expected ['if', 'name', 'needs', 'runs-on', 'steps', 'timeout-minutes']"
+    ),
+    "c2-runs-on-self-hosted-select": (
+        "job select runs-on ['self-hosted', 'linux'], expected 'ubuntu-latest'"
+    ),
+    "c2-runs-on-self-hosted-gate": (
+        "job ci-gate runs-on ['self-hosted', 'linux'], expected 'ubuntu-latest'"
+    ),
+    "c2-permissions-select": (
+        "job select keys ['env', 'name', 'outputs', 'permissions', 'runs-on', 'steps',"
+        " 'timeout-minutes'], expected ['env', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "c3-select-py-c": "run text sha256",
+    "c3-select-source": "run text sha256",
+    "c3-select-dot": "run text sha256",
+    "c3-select-exec": "run text sha256",
+    "c3-select-eval": "run text sha256",
+    "c3-select-cmdsub": "run text sha256",
+    "c3-select-backtick": "run text sha256",
+    "c3-select-procsub": "run text sha256",
+    "c3-select-hookspath": "run text sha256",
+    "c3-select-alias": "run text sha256",
+    "c3-select-rebase-exec": "run text sha256",
+    "c3-select-ssh-command": "run text sha256",
+    "c3-gate-py-c": "run text sha256",
+    "c3-gate-source": "run text sha256",
+    "c3-gate-dot": "run text sha256",
+    "c3-gate-exec": "run text sha256",
+    "c3-gate-eval": "run text sha256",
+    "c3-gate-cmdsub": "run text sha256",
+    "c3-gate-backtick": "run text sha256",
+    "c3-gate-procsub": "run text sha256",
+    "c3-gate-hookspath": "run text sha256",
+    "c3-gate-alias": "run text sha256",
+    "c3-gate-rebase-exec": "run text sha256",
+    "c3-gate-ssh-command": "run text sha256",
+    "sh-x8-runpy": "import statement outside the pinned set (import runpy)",
+    "sh-check-call-make": "calls subprocess.check_call outside the allow-list",
+    "sh-getoutput": "calls subprocess.getoutput outside the allow-list",
+    "sh-posix-spawnp": "calls os.posix_spawnp outside the allow-list",
+    "sh-call-bare-file": "calls subprocess.call outside the allow-list",
+    "sh-relative-dotfile": "calls subprocess.call outside the allow-list",
+    "sh-git-fsmonitor": "git call with a subcommand outside the allow-list",
+    "sh-git-alias": "git call with a subcommand outside the allow-list",
+    "f2-select-mat-env-value": (
+        "job select step 'Materialise the base selector (#8240)' env values differ from the pinned"
+        " mapping"
+    ),
+    "f2-gate-mat-env-value": (
+        "job ci-gate step 'Materialise the base gate (#8240)' env values differ from the pinned"
+        " mapping"
+    ),
+    "f2-gate-impact-files-value": (
+        "job ci-gate step 'Materialise the base gate (#8240)' env values differ from the pinned"
+        " mapping"
+    ),
+    "f2-gate-fold-env-value": (
+        "job ci-gate step 'Fold job results (base gate)' env values differ from the pinned mapping"
+    ),
+    "f2-select-mode-env-value": (
+        "job select step 'Selection mode' env values differ from the pinned mapping"
+    ),
+    "f2-wf-env-value": "workflow env differs from the pinned key/value mapping",
+    "f2-select-job-env-value": "job select env differs from the pinned key/value mapping",
+    "f2-select-jobkey-strategy": (
+        "job select keys ['env', 'name', 'outputs', 'runs-on', 'steps', 'strategy',"
+        " 'timeout-minutes'], expected ['env', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "f2-select-jobkey-continue-on-error": (
+        "job select keys ['continue-on-error', 'env', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes'], expected ['env', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "f2-select-jobkey-environment": (
+        "job select keys ['env', 'environment', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes'], expected ['env', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "f2-gate-jobkey-concurrency": (
+        "job ci-gate keys ['concurrency', 'if', 'name', 'needs', 'runs-on', 'steps',"
+        " 'timeout-minutes'], expected ['if', 'name', 'needs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "f2-gate-jobkey-strategy": (
+        "job ci-gate keys ['if', 'name', 'needs', 'runs-on', 'steps', 'strategy',"
+        " 'timeout-minutes'], expected ['if', 'name', 'needs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "f2-select-key-missing-timeout": (
+        "job select keys ['env', 'name', 'outputs', 'runs-on', 'steps'], expected ['env', 'name',"
+        " 'outputs', 'runs-on', 'steps', 'timeout-minutes']"
+    ),
+    "f2-gate-key-missing-timeout": (
+        "job ci-gate keys ['if', 'name', 'needs', 'runs-on', 'steps'], expected ['if', 'name',"
+        " 'needs', 'runs-on', 'steps', 'timeout-minutes']"
+    ),
+    "f2-select-runs-on-self-hosted": (
+        "job select runs-on ['self-hosted', 'linux'], expected 'ubuntu-latest'"
+    ),
+    "f2-gate-runs-on-self-hosted": "job ci-gate runs-on 'self-hosted', expected 'ubuntu-latest'",
+    "f2-select-runs-on-group": "job select runs-on {'group': 'big'}, expected 'ubuntu-latest'",
+    "f2-wf-perm-contents-write": "workflow permissions differ from the pinned mapping",
+    "f2-wf-perm-add-scope": "workflow permissions differ from the pinned mapping",
+    "f2-wf-perm-write-all": "workflow permissions differ from the pinned mapping",
+    "f2-wf-perm-removed": "workflow permissions differ from the pinned mapping",
+    "f2-select-perm-contents-write": (
+        "job select keys ['env', 'name', 'outputs', 'permissions', 'runs-on', 'steps',"
+        " 'timeout-minutes'], expected ['env', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "f2-select-perm-add-scope": (
+        "job select keys ['env', 'name', 'outputs', 'permissions', 'runs-on', 'steps',"
+        " 'timeout-minutes'], expected ['env', 'name', 'outputs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "f2-gate-perm-write-all": (
+        "job ci-gate keys ['if', 'name', 'needs', 'permissions', 'runs-on', 'steps',"
+        " 'timeout-minutes'], expected ['if', 'name', 'needs', 'runs-on', 'steps',"
+        " 'timeout-minutes']"
+    ),
+    "c2-sh-getoutput": "calls subprocess.getoutput outside the allow-list",
+    "c2-sh-posix-spawnp": "calls os.posix_spawnp outside the allow-list",
+    "c2-sh-call-bare-file": "calls subprocess.call outside the allow-list",
+    "c2-sh-git-alias": "git call with a subcommand outside the allow-list",
+    "c2-sh-git-fsmonitor": "git call with a subcommand outside the allow-list",
+    "c2-git-c-hookspath": "git call with a subcommand outside the allow-list",
+    "c2-second-subprocess-run": "subprocess.run argv is not the exact git head plus list(args)",
+    "c2-argv0-variable": "module-level binding of ARGV outside the pinned module stores",
+    "c2-shutil-which-git": "module-level binding of GIT outside the pinned module stores",
+    "c2x-module-alias-call": "module-level binding of sp outside the pinned module stores",
+    "c2x-method-on-constant-dash": "git argument is not a literal or a pinned expression",
+    "c2x-environ-subscript-store": (
+        "stores into or deletes from os.environ (the body has no subscript store)"
+    ),
+    "c2x-path-method-write": "calls Path().open outside the allow-list",
+    "k8-mode-step-continue-on-error": (
+        "job select step 'Selection mode' keys ['continue-on-error', 'env', 'id', 'name', 'run'],"
+        " expected ['env', 'id', 'name', 'run']"
+    ),
+    "k8-mode-step-timeout": (
+        "job select step 'Selection mode' keys ['env', 'id', 'name', 'run', 'timeout-minutes'],"
+        " expected ['env', 'id', 'name', 'run']"
+    ),
+    "k8-mode-step-if-pr-data": (
+        "job select step 'Selection mode' keys ['env', 'id', 'if', 'name', 'run'], expected ['env',"
+        " 'id', 'name', 'run']"
+    ),
+    "k8-select-job-uses-reusable": (
+        "job select keys ['env', 'name', 'outputs', 'runs-on', 'steps', 'timeout-minutes', 'uses'],"
+        " expected ['env', 'name', 'outputs', 'runs-on', 'steps', 'timeout-minutes']"
+    ),
+    "k8-container-credentials": "job select sets container",
+    "k8-services-gate": "job ci-gate sets services",
+    "k8-checkout-with-ref": (
+        "job select step None with {'fetch-depth': '0', 'ref': 'x'}, expected {'fetch-depth': '0'}"
+    ),
+    "k8-checkout-with-persist": (
+        "job select step None with {'fetch-depth': '0', 'persist-credentials': 'true'}, expected"
+        " {'fetch-depth': '0'}"
+    ),
+}
+
+WF_FORM_GREEN = {
+    "c1-quoted-with-only-control": "control: a quoted key with no added key",
+    "c2-baseline-unmutated": "control: the unmutated workflow",
+    "c2-concurrency-removed": "the concurrency block carries no trust",
+    "f2-reorder-select-job-keys": "job keys are an order-insensitive set",
+    "f2-reorder-gate-job-keys": "job keys are an order-insensitive set",
+    "f2-reorder-wf-env": "workflow env is an order-insensitive mapping",
+    "f2-reorder-mat-env": "step env is an order-insensitive mapping",
+    "k8-build-index-coe-false": "continue-on-error false moves toward fail closed",
+    "k8-select-name-value": "the display name of the select job only",
+}
+
+WF_FORM_TESTS = {
+    "k8-build-index-if-pr-data": (
+        ("__self__", "WorkflowShape.test_build_and_select_run_from_the_base_copy"),
+    ),
+    "k8-select-output-literal": (
+        ("__self__", "WorkflowShape.test_select_outputs_fall_back_to_the_full_matrix_step"),
+    ),
+    "k8-gate-materialise-if-false": (
+        ("__self__", "BranchTipGate.test_a_live_base_event_never_runs_the_branch_tip_fold"),
+    ),
+    "k8-base-fold-if-false": (
+        ("__self__", "WorkflowShape.test_gate_job_runs_the_base_gate_when_available"),
+    ),
+    "k8-gate-timeout-value": (
+        (
+            "__self__",
+            "TrustDecisionFirst.test_f2_exact_env_values_job_keys_runs_on_and_permissions_are_pinned",
+        ),
+    ),
+    "w1-ci-comment-reverted": (
+        (
+            "__self__",
+            "TrustDecisionFirst.test_f1_no_post_derivation_report_wording_in_the_workflow_or_this_module",
+        ),
+    ),
+    "k8-gate-job-if-false": (("test_ci_select_gating_8240", "CiGateNeeds.test_gate_runs_always"),),
+    "k8-gate-job-if-success": (
+        ("test_ci_select_gating_8240", "CiGateNeeds.test_gate_runs_always"),
+    ),
+    "k8-gate-needs-drop-check": (
+        (
+            "test_ci_select_gating_8240",
+            "CiGateNeeds.test_gate_needs_every_other_job_except_the_b4_set",
+        ),
+    ),
+}
+
+WF_FORM_DOC = "w1-docstring-reverted"
+WF_FORM_SAME_AS = {
+    "f2-select-mat-env-value": ("F2_MUTANTS", "select step env value"),
+    "f2-gate-fold-env-value": ("F2_MUTANTS", "gate fold env value"),
+    "f2-select-job-env-value": ("F2_MUTANTS", "select job env value"),
+    "f2-select-jobkey-continue-on-error": ("F2_MUTANTS", "select job-level key"),
+    "f2-gate-jobkey-concurrency": ("F2_MUTANTS", "gate job-level key"),
+    "f2-select-runs-on-self-hosted": ("F2_MUTANTS", "select runs-on self-hosted"),
+    "c2-runs-on-self-hosted-select": ("F2_MUTANTS", "select runs-on self-hosted"),
+    "f2-gate-runs-on-self-hosted": ("F2_MUTANTS", "gate runs-on self-hosted"),
+    "f2-select-perm-contents-write": ("F2_MUTANTS", "select job permissions widened"),
+    "f2-gate-perm-write-all": ("F2_MUTANTS", "gate job permissions widened"),
+    "f2-wf-perm-contents-write": ("WORKFLOW_PERMISSIONS", "test_f2_workflow_permissions"),
+    "c2-sh-getoutput": ("C2_MUTANTS", "sh-getoutput"),
+    "c2-sh-posix-spawnp": ("C2_MUTANTS", "sh-posix-spawnp"),
+    "c2-sh-call-bare-file": ("C2_MUTANTS", "sh-call-bare-file"),
+    "c2-sh-git-alias": ("C2_MUTANTS", "sh-git-alias"),
+    "c2-sh-git-fsmonitor": ("C2_MUTANTS", "sh-git-fsmonitor"),
+    "c2-second-subprocess-run": ("C2_MUTANTS", "sh-second-run"),
+    "c2x-environ-subscript-store": ("C12_MUTANTS", "x-environ-store"),
+}
+
+
+def _apply_form(edits, live):
+    text = live
+    for edit in edits:
+        if callable(edit):
+            text = edit(text)
+    return text
+
+
+def _form_pins(edits, text):
+    """The re-pinned Materialise digests of a REHASH form (empty for the others)."""
+    if "REHASH" not in edits:
+        return {}
+    doc = yaml_subset_load(text)
+    pins = {}
+    for job, name in ((SELECT_JOB, MATERIALISE_STEP), (GATE_JOB, GATE_MATERIALISE_STEP)):
+        for step in doc["jobs"][job]["steps"]:
+            if step.get("name") == name:
+                pins[name] = run_digest(step["run"])
+    return pins
+
+
+def docstring_phrase_hits(source, phrase):
+    """Names of the docstrings of `source` that hold `phrase` (whitespace folded)."""
+    hits = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
+            if phrase in " ".join((ast.get_docstring(node) or "").split()):
+                hits.append(getattr(node, "name", "module"))
+    return hits
+
+
+def failing_tests_on_workflow(text, specs):
+    """Names of the (module, Class.test) specs that fail when CI_YML is `text`."""
+    failed = []
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+        path = Path(scratch) / "ci.yml"
+        path.write_text(text)
+        for module_name, dotted in specs:
+            module = (sys.modules[__name__] if module_name == "__self__"
+                      else importlib.import_module(module_name))
+            with unittest.mock.patch.object(module, "CI_YML", path):
+                result = unittest.TestResult()
+                unittest.defaultTestLoader.loadTestsFromName(dotted, module).run(result)
+            if not result.wasSuccessful():
+                failed.append(dotted)
+    return failed
+
+
+class WorkflowFormMutants(unittest.TestCase):
+    """code r12 C3: every workflow-level form of the round-10 security harness is a row."""
+
+    FORMS = _workflow_forms()
+
+    def test_the_table_carries_all_180_forms_once(self):
+        kinds = [set(WF_FORM_RED), set(WF_FORM_TESTS), set(WF_FORM_GREEN), {WF_FORM_DOC}]
+        self.assertEqual(sum(len(k) for k in kinds), 180)
+        self.assertEqual(set().union(*kinds), set(self.FORMS))
+        self.assertEqual((len(WF_FORM_RED), len(WF_FORM_TESTS), len(WF_FORM_GREEN)), (161, 9, 9))
+        self.assertTrue(set(WF_FORM_SAME_AS) <= set(WF_FORM_RED))
+        self.assertEqual(len(WF_FORM_SAME_AS), 18)
+
+    def test_each_red_form_is_refused_by_the_pre_trust_gate_with_its_problem_line(self):
+        live = CI_YML.read_text()
+        for fid, needle in WF_FORM_RED.items():
+            with self.subTest(form=fid):
+                edits = self.FORMS[fid]
+                text = _apply_form(edits, live)
+                self.assertNotEqual(text, live)
+                with unittest.mock.patch.dict(MATERIALISE_SHA256, _form_pins(edits, text)):
+                    problems = pre_trust_problems(text)
+                self.assertTrue([p for p in problems if needle in p], (needle, problems[:3]))
+
+    def test_each_rehash_form_is_refused_with_the_pin_matching_the_mutated_text(self):
+        """With the pin re-pinned the sha256 check is quiet, so the second layer is what refuses."""
+        live = CI_YML.read_text()
+        rehashed = [fid for fid in WF_FORM_RED if "REHASH" in self.FORMS[fid]]
+        self.assertTrue(rehashed)
+        for fid in rehashed:
+            with self.subTest(form=fid):
+                edits = self.FORMS[fid]
+                text = _apply_form(edits, live)
+                with unittest.mock.patch.dict(MATERIALISE_SHA256, _form_pins(edits, text)):
+                    problems = pre_trust_problems(text)
+                self.assertFalse([p for p in problems if "sha256" in p], problems)
+
+    def test_each_form_another_test_refuses_fails_those_tests_on_the_mutated_text(self):
+        live = CI_YML.read_text()
+        self.assertEqual(failing_tests_on_workflow(live, [
+            spec for specs in WF_FORM_TESTS.values() for spec in specs]), [])
+        for fid, specs in WF_FORM_TESTS.items():
+            with self.subTest(form=fid):
+                text = _apply_form(self.FORMS[fid], live)
+                self.assertNotEqual(text, live)
+                self.assertTrue(failing_tests_on_workflow(text, specs))
+
+    def test_each_form_that_stays_green_stays_green(self):
+        live = CI_YML.read_text()
+        for fid, reason in WF_FORM_GREEN.items():
+            with self.subTest(form=fid):
+                self.assertTrue(reason)
+                self.assertEqual(pre_trust_problems(_apply_form(self.FORMS[fid], live)), [])
+
+    def test_the_docstring_form_reverts_a_docstring_to_the_banned_wording(self):
+        source = Path(__file__).read_text()
+        phrase = TrustDecisionFirst.BANNED_PHRASE
+        old = "    derivation is inline with no resolver script run over keeping a resolver\n"
+        self.assertEqual(self.FORMS[WF_FORM_DOC], ["DOCSTRING_REVERT"])
+        self.assertEqual(source.count(old), 2)
+        self.assertEqual(docstring_phrase_hits(source, phrase), [])
+        reverted = source.replace(
+            old, "    resolver is demoted to a post-" + "derivation report over keeping it\n", 1)
+        self.assertTrue(docstring_phrase_hits(reverted, phrase))
+
+    def test_the_eighteen_mapped_forms_equal_the_text_of_the_existing_row(self):
+        live = CI_YML.read_text()
+        for fid, (table, label) in WF_FORM_SAME_AS.items():
+            with self.subTest(form=fid, row=label):
+                if table == "F2_MUTANTS":
+                    row = next(r for r in TrustDecisionFirst.F2_MUTANTS if r[0] == label)
+                    existing = TrustDecisionFirst.mutated(None, row[1], row[2], row[3])
+                elif table == "WORKFLOW_PERMISSIONS":
+                    existing = live.replace("\npermissions:\n  contents: read\n",
+                                            "\npermissions:\n  contents: write\n")
+                else:
+                    line = next(r[1] for r in getattr(TrustDecisionFirst, table) if r[0] == label)
+                    anchor = TrustDecisionFirst.C2_MUTANT_ANCHOR
+                    existing = live.replace(
+                        anchor, anchor + "          " + line.replace("\n", "\n          ") + "\n")
+                self.assertEqual(_apply_form(self.FORMS[fid], live), existing)
 
 
 if __name__ == "__main__":
