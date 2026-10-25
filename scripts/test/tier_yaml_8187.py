@@ -14,7 +14,12 @@ continuations, quoted keys, anchors).  Round 8 reads the tier workflows with PyY
 
 A job or a workflow-level key is pinned as the SHA-256 of ``canonical_json`` of the loaded object.  The pins are in
 ``tier_export_job_pins_8187.json`` (section ``primary``); a failure names the workflow, job, step index, step name
-or id and the first differing key path, with any ``scheme://user:pass@`` masked.
+or id and the first differing key path, as labels only (r23: nothing is masked after the fact).
+
+Echo class closed by construction (r23, 3-agent vote (6def5ab6)): the checker NEVER emits author- or pin-derived text.  Every
+name that reaches a message goes through ``Opaque`` (see the class), whose ``str``, ``repr``, ``format`` and ``bytes`` are
+the positional label and the length only; the raw text is reachable only through ``raw()``, which comparison helpers alone
+call.  There is no deny-list predicate: a deny-list fails open on every shape nobody listed.
 
 ``import yaml`` failing is an error, never a skip: the message names ``scripts/test/requirements-ci.txt``.
 """
@@ -22,8 +27,6 @@ or id and the first differing key path, with any ``scheme://user:pass@`` masked.
 import hashlib
 import json
 import re
-import unicodedata
-import urllib.parse
 
 try:
     import yaml
@@ -40,32 +43,35 @@ MERGE_TAG = "tag:yaml.org,2002:merge"
 TIER_MARKERS = re.compile(r"AI_MEMORY_CI_FED_URL|AI_MEMORY_TEST_POSTGRES_URL|pg_ci_url_file|ai-memory-ci-fed-url")
 TIER_JOB_MARK = re.compile(TIER_MARKERS.pattern + r"|tier_credential\.py|check-tier-password")
 TIER_VERBS = re.compile(r"github-env|export-url")
-EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
+
+
+class ExportCall:
+    """The tier export call, ``tier_credential.py github-env ... --url-file`` on one line, found in LINEAR time (r23 sec F40-e).
+
+    The regex ``tier_credential\\.py\\s+github-env\\b.*--url-file`` restarts its ``.*`` scan to the end of the line at every
+    occurrence of the prefix, so a megabyte line of prefixes costs the square of its length.  Here the prefix is found once
+    per occurrence and the rest of its line is searched once: a later prefix on the same line has a shorter tail, so it is
+    skipped.  The result is the same as the regex's, as a bool."""
+
+    PREFIX = re.compile(r"tier_credential\.py\s+github-env\b")
+
+    def search(self, text):
+        checked_to = -1
+        for match in self.PREFIX.finditer(text):
+            if match.end() <= checked_to:
+                continue
+            line_end = text.find("\n", match.end())
+            line_end = len(text) if line_end < 0 else line_end
+            if text.find("--url-file", match.end(), line_end) >= 0:
+                return True
+            checked_to = line_end
+        return False
+
+
+EXPORT_CALL = ExportCall()
+
 EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
-# everything from the scheme to the next whitespace is replaced (F34): a userinfo with a `/` or an `@` in it is masked too
-URL_ALL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*")
-# a ``head:rest`` form with no slashes (``postgresql:user:pass``, ``1234:pw``, ``usé:pw``): any character that is not a space or a
-# colon, then a colon, then a non-space; the first character is not restricted to an ASCII letter (F40-d)
-SCHEME_FORM = re.compile(r"[^\s:]:\S")
-# a percent escape (``%40``, ``%3A``): an encoding the printer does not understand is a leak the mask will not catch (F39-b)
-PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
-# a credential keyword as a SUBSTRING of an identifier (prefix or suffix allowed: ``PGPASSWORD=``, ``SECRET_KEY=``,
-# ``AWS_SECRET_ACCESS_KEY=``, ``api_key=``, ``DB_PASSWORD_FILE=``), case-insensitive, optionally quoted (``'password':``,
-# ``"pwd"=``), then ``=`` or ``:`` (F40-b).  A false match only costs a positional label.
-CREDENTIAL_KEYWORD = re.compile(
-    r"(?:password|passwd|pass|pwd|user|uid|host|secret|token|dsn|credential|auth|api[_-]?key|access[_-]?key)"
-    r"[A-Za-z0-9_.-]*[\'\"]*\s*[=:]", re.IGNORECASE)
-# a character of one of these Unicode categories (format, control, surrogate, private use, unassigned; Cf holds the zero-width
-# characters and U+00AD) is never printed and never reaches the predicate (F40-c)
-UNSAFE_CATEGORIES = frozenset(("Cf", "Cc", "Cs", "Co", "Cn"))
-# the input bound of ``printable``: a longer value falls back before any decode or pattern runs (F40-e)
-PRINTABLE_MAX_CHARS = 256
-DELIMITERS = frozenset("@:/=%")
-DECODE_PASSES = 3
-# the second-layer line mask (F36): every ``scheme://`` token up to the next whitespace is replaced, with no look-ahead that
-# author text can satisfy; only a trailing run of closing punctuation survives, so a label that arrived pre-masked keeps
-# its bracket (``(https://***):`` stays whole) while a userinfo can never be carried past the mask by the text after it
-URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*?([)\]}:,;.]*)(?=\s|$)")
+_LABEL = re.compile(r"(?:job|step|key|pin)\[(?:\d+|\?)\]")
 HOSTED_LABEL = re.compile(r"^(?:ubuntu|macos|windows)-(?:latest|\d+(?:\.\d+)?)(?:-(?:arm|arm64|xlarge|large|intel))*$")
 LOCAL_USES = re.compile(r"^\./")
 
@@ -111,80 +117,105 @@ class StrictLoader(BASE_LOADER):
         return mapping
 
 
-def mask_userinfo(text):
-    """``text`` with the user:password of every ``scheme://user:pass@`` replaced (a failure message never echoes it)."""
-    return URL_USERINFO.sub(r"\1***\2", text)
+class Opaque:
+    """An author- or pin-derived value that can never be printed (r23, 3-agent vote (6def5ab6), fail closed).
+
+    ``str``, ``repr``, ``format`` and ``bytes`` return ONLY the positional label (``job[3]``, ``step[0]``, ``key[2]``,
+    ``pin[1]``) and the length (``len=N``): any f-string, ``%``, ``.format``, ``print``, logging call, exception text or
+    assertion message that receives the wrapper prints that, by construction.  The raw text is reachable through ``raw()``
+    only, and ``raw()`` is called only inside comparison helpers that return a bool and never build a message
+    (``__eq__``, ``same``).  ``__eq__`` and ``__hash__`` compare the raw text; the label is a fixed positional string, so a
+    label-shaped author name prints as its own label and cannot be told from one (the intended result).  The length is the
+    only property of the text that is shown: a hash prefix of a low-entropy credential is an offline-guess oracle."""
+
+    __slots__ = ("_raw", "_label")
+
+    def __init__(self, raw, label):
+        if not isinstance(label, str) or not _LABEL.fullmatch(label):
+            raise ValueError("an Opaque label is a positional label")
+        self._raw = raw
+        self._label = label
+
+    def raw(self):
+        return self._raw
+
+    def _shown(self):
+        try:
+            size = len(self._raw)
+        except TypeError:
+            size = 0
+        return "%s len=%d" % (self._label, size)
+
+    def __str__(self):
+        return self._shown()
+
+    def __repr__(self):
+        return self._shown()
+
+    def __format__(self, spec):
+        return self._shown()
+
+    def __bytes__(self):
+        return self._shown().encode("ascii")
+
+    def __eq__(self, other):
+        if isinstance(other, Opaque):
+            return bool(self._raw == other._raw)
+        return NotImplemented
+
+    def __hash__(self):
+        try:
+            return hash(self._raw)
+        except TypeError:
+            return 0
+
+    def __reduce__(self):
+        return (Opaque, ("", self._label))
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
 
 
-def fold(value):
-    """``value`` NFKC-normalised, then percent-decoded up to ``DECODE_PASSES`` times (each pass followed by NFKC), so a
-    credential delimiter that arrives fullwidth, percent-encoded or encoded twice reads as the ASCII delimiter (F39-b)."""
-    text = unicodedata.normalize("NFKC", value)
-    for _ in range(DECODE_PASSES):
-        decoded = unicodedata.normalize("NFKC", urllib.parse.unquote_plus(text))
-        if decoded == text:
-            break
-        text = decoded
-    return text
+def opaque(value, label):
+    """``value`` as an ``Opaque`` with the positional ``label`` (a test wraps a loaded value this way before it asserts)."""
+    return Opaque(value, label)
 
 
-def carries_credential_form(text):
-    """True when ``text`` holds an ``@``, a ``://``, a ``scheme:`` form or a credential keyword with ``=`` or ``:``."""
-    return "@" in text or "://" in text or bool(SCHEME_FORM.search(text) or CREDENTIAL_KEYWORD.search(text))
-
-
-def printable(value, fallback):
-    """``value`` as a name for a message, or ``fallback`` (F34, F39, fail closed).
-
-    The whole value is joined on its whitespace and tested RAW, before any mask (F38): an ``@``, a ``://`` or a ``scheme:``
-    form anywhere in it may carry a credential fragment (a userinfo broken by a line break, folding whitespace, ``/`` or
-    ``@``, or an ``@`` that a later ``scheme://`` token would swallow from a mask), so none of its text is printed.  The
-    test runs on the raw value and on its ``fold`` (NFKC, bounded percent-decode), and any percent escape, any non-ASCII
-    character that folds to a delimiter, and any credential keyword followed by ``=`` or ``:`` is also a reason to fall
-    back (F39-b).  The input is bounded first: a value longer than ``PRINTABLE_MAX_CHARS`` falls back before any decode or
-    pattern runs (F40-e), and any format, control, surrogate, private-use or unassigned character falls back before the
-    predicate (F40-c).  A ``+`` is read as whitespace too (form encoding, F40-b).  The mask runs afterwards as a second
-    layer for a value that never carried those tokens, and the cut to 60 characters comes last (F33)."""
-    raw = str(value)
-    if len(raw) > PRINTABLE_MAX_CHARS:
-        return fallback
-    joined = " ".join(raw.split())
-    if any(unicodedata.category(ch) in UNSAFE_CATEGORIES for ch in joined):
-        return fallback
-    if PERCENT_ESCAPE.search(joined):
-        return fallback
-    if any(ord(ch) > 127 and DELIMITERS & set(unicodedata.normalize("NFKC", ch)) for ch in joined):
-        return fallback
-    if any(carries_credential_form(text) for text in (joined, joined.replace("+", " "), fold(joined))):
-        return fallback
-    return URL_ALL.sub(r"\1***", joined)[:60]
+def same(left, right):
+    """True when two values (``Opaque`` or raw) hold equal raw text; a bool, never a message."""
+    left = left.raw() if isinstance(left, Opaque) else left
+    right = right.raw() if isinstance(right, Opaque) else right
+    return bool(left == right)
 
 
 def key_label(key, position):
-    """``key`` of a mapping for a message, or ``key[<position>]`` (F36): every author key goes through ``printable`` with a
-    fixed positional fallback, so no key text that is not provably free of a credential fragment is ever printed."""
-    return printable(key, "key[%d]" % position)
+    """``key`` of a mapping as an ``Opaque`` labelled ``key[<position>]`` (r23: no key text is ever printed)."""
+    return Opaque(key, "key[%d]" % position)
 
 
 def name_label(name, universe):
-    """``name`` for a message, or ``key[<n>]`` (F38): ``n`` is its position among the sorted names of ``universe`` (a
-    mapping or list of the names it is one of).  Pin data is written from the author's workflow, so a pin-sourced name
-    takes the same positional rule as a live author key."""
+    """``name`` as an ``Opaque`` labelled ``key[<n>]``: ``n`` is its position among the sorted names of ``universe`` (a mapping
+    or list of the names it is one of).  Pin data is written from the author's workflow, so a pin-sourced name is opaque
+    like a live author key."""
     names = sorted(set(universe) | {name}, key=str)
     return key_label(name, names.index(name))
 
 
 def job_label(name, jobs):
-    """``name`` of a job for a message, or ``job[<position>]`` (position in the sorted job keys) when it is not printable."""
+    """``name`` of a job as an ``Opaque`` labelled ``job[<position>]`` (position in the sorted job keys), ``job[?]`` when it is
+    not one of them."""
     names = sorted(jobs, key=str)
-    return printable(name, "job[%d]" % names.index(name)) if name in names else printable(name, "job[?]")
+    return Opaque(name, "job[%d]" % names.index(name)) if name in names else Opaque(name, "job[?]")
 
 
 def load_failure(exc):
     """The rule that refused a document, never a fragment of it (F26): our own rule text for a ``StrictYamlError``, else
     the parser error class and the line of its mark."""
     if isinstance(exc, StrictYamlError):
-        return mask_userinfo(str(exc.args[0]))
+        return str(exc.args[0])
     mark = getattr(exc, "problem_mark", None)
     where = " at line %d" % (mark.line + 1) if mark is not None else ""
     return "%s%s" % (type(exc).__name__, where)
@@ -216,7 +247,7 @@ def parse_workflow(text):
     problems = []
     extra = sorted(set(data) - TOP_LEVEL_KEYS)
     if extra:
-        problems.append("top-level keys outside the closed set: " + ", ".join(key_label(key, position) for position, key in enumerate(extra)))
+        problems.append("top-level keys outside the closed set: " + ", ".join(str(key_label(key, position)) for position, key in enumerate(extra)))
     if not isinstance(data.get("jobs"), dict) or not data["jobs"]:
         problems.append("the workflow holds no jobs mapping")
     return data, problems
@@ -307,13 +338,14 @@ def build_pins(data):
 
 
 def step_label(step, index):
-    """``name`` or ``id`` of a step for a message, joined and masked BEFORE the 60-character cut (F33), ``step[<index>]`` whenever an ``@`` or an unmasked ``://`` survives the mask (F34); a step with neither is ``step[<index>]``, never its content (F25)."""
+    """The ``name`` or ``id`` of a step as an ``Opaque`` labelled ``step[<index>]`` (r23: nothing of the text is printed); a step
+    with neither wraps the empty string (F25)."""
     if isinstance(step, dict):
         for key in ("name", "id"):
             value = step.get(key)
             if isinstance(value, str) and value.strip():
-                return printable(value, "step[%d]" % index)
-    return "step[%d]" % index
+                return Opaque(value, "step[%d]" % index)
+    return Opaque("", "step[%d]" % index)
 
 
 def first_difference(pinned, job):
@@ -323,10 +355,10 @@ def first_difference(pinned, job):
         if key == "steps":
             continue
         if pinned["keys"].get(key) != digest(value):
-            return None, "job." + key_label(key, position)
+            return None, "job.%s" % key_label(key, position)
     for position, key in enumerate(pinned["keys"]):
         if key != "steps" and key not in job:
-            return None, "job." + key_label(key, position) + " (removed)"
+            return None, "job.%s (removed)" % key_label(key, position)
     old_steps = pinned["steps"]
     for index, step in enumerate(steps):
         if index >= len(old_steps):
