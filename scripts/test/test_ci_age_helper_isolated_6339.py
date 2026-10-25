@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+"""Pin that ci.yml runs the AGE self-heal helper in Python isolated mode (#6339).
+
+``scripts/ci/ensure-age-extension.py`` reads the tier URL file and builds
+``PGPASSWORD``.  Without ``python3 -I`` Python puts ``scripts/ci/`` first on
+``sys.path`` and honours ``PYTHONPATH`` from the persistent self-hosted runner, so a
+``scripts/ci/<stdlib-name>.py`` file or a ``PYTHONPATH`` entry could replace a standard
+library module inside that process.  The repository runs its other security gate
+scripts with ``python3 -I`` (#5163, #5280).
+
+#6508 pins the rest of the step that runs the helper, so an edit that echoes the tier URL into the job
+log (``set -x``, a URL in an ``::error::`` line, a URL on the helper argv), widens the ``macos-fed``
+guard, or lets a failed self-heal pass (``|| true``, ``exit 0``, ``continue-on-error``) fails here.
+
+#6672 closes the remaining output paths: a step line that names the URL file (by variable or by path), the URL,
+or the parts the step cuts from it (``head``, ``q``) must be one of the exact lines in ``URL_LINES``, the step
+may not export them, and it may not dump the environment (``env``, ``printenv``, ``export -p``, ``declare -p``,
+``typeset -p``, ``compgen -v``, a bare ``set``).  A new use of the URL therefore fails here until it is reviewed
+and added to the allowlist.
+
+#6996 pins where the guard's ``CI_NODE`` comes from: the step's ``env:`` sets it exactly once, to
+``${{ matrix.node }}`` (not ``matrix.leg`` or a literal), no step line other than the guard writes, exports,
+unsets or reads it, and the matrix still has the ``macos-fed`` / ``enterprise-fed`` entry, so the guard can
+neither be fed another value nor silently never match.
+
+#6886 pins the classify-job step that runs the helper's own unit suite: exactly one step names
+``test_ensure_age_extension_6161.py`` and it is exactly the two reviewed lines (no ``|| true``, no
+``continue-on-error``, no ``if:``), and the classify job itself has no ``if:`` or ``continue-on-error``.
+
+Rule: every ci.yml line that runs ``ensure-age-extension.py`` through python3 passes ``-I``
+before the script path, and at least one such invocation exists (a rename must not make
+the pin vacuous).  The check is exercised against a mutant that drops ``-I``.
+Stdlib only.
+"""
+
+from pathlib import Path
+import re
+import sys
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+CI_YML = ROOT / ".github/workflows/ci.yml"
+HELPER = "scripts/ci/ensure-age-extension.py"
+ISOLATED = re.compile(r"\bpython3\s+(?:-\S+\s+)*-I(?:\s+-\S+)*\s+" + re.escape(HELPER) + r"(?:\s|$)")
+
+
+STEP_START = re.compile(r"^(\s*)- (?:name|uses|run):")
+XTRACE = re.compile(r"(?:\bset\s+(?:-\S*x\S*|[-+]o\s+xtrace)|\bxtrace\b|\bBASH_XTRACEFD\b|\bPS4=)")
+GUARD = 'if [ "${CI_NODE:-}" = "macos-fed" ]; then'
+CALL = re.compile(r'^\s*if ! python3 -I ' + re.escape(HELPER) + r' --url-file "\$url_file"; then$')
+URL_VARS = re.compile(r"\$\{?(?:base_url|new_url)\b|\$\(cat\b")
+READ = 'base_url="$(cat "$url_file")"'
+URL_REF = re.compile(r"\$\{?(?:url_file|base_url|new_url|head|q)\b|ai-memory-ci-fed-url")
+URL_NAMES = re.compile(r"\b(?:url_file|base_url|new_url|head|q)\b")
+EXPORTS = re.compile(r"^(?:export|declare\s+-\S*x|typeset\s+-\S*x|readonly)\b(.*)$")
+ENV_DUMP = re.compile(r"(?:^|[;&|(]\s*)(?:env|printenv|compgen\s+-[vA]|(?:export|declare|typeset)\s+-p|set)\s*(?:$|[;&|)])")
+# The reviewed lines that use the URL.  psql "$base_url"/"$new_url" on argv and the $GITHUB_ENV write are #6172.
+URL_LINES = frozenset((
+    'url_file="$HOME/.ai-memory-ci-fed-url"',
+    'if [ ! -f "$url_file" ]; then',
+    'echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not'
+    ' provisioned on this node"',
+    READ,
+    'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
+    'case "$base_url" in',
+    '*\\?*) q="?${base_url#*\\?}"; head="${base_url%%\\?*}" ;;',
+    '*)    q=""; head="$base_url" ;;',
+    'new_url="${head%/*}/${CI_FED_DB}${q}"',
+    'if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then',
+    'if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS'
+    ' vector;"; then',
+    'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"',
+    # #6383: the per-binary isolation wrapper takes the URL through its environment, never argv.
+    'AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB"'
+    ' --jobs 8 --emit-env >> "$GITHUB_ENV"',
+))
+
+
+def url_leaks(step):
+    """#6672: step lines that use the URL outside the allowlist, export it, or dump the environment."""
+    found = []
+    for ln in step:
+        s = ln.strip()
+        if s.startswith("#"):
+            continue
+        if URL_REF.search(s) and s not in URL_LINES:
+            found.append(f"a line uses the tier URL outside the reviewed lines: {s[:60]}")
+        exported = EXPORTS.match(s)
+        if exported and URL_NAMES.search(exported.group(1)):
+            found.append(f"a line exports the tier URL: {s[:60]}")
+        if ENV_DUMP.search(s):
+            found.append(f"a line dumps the environment: {s[:60]}")
+    return found
+
+
+NOTICE = 'echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"'
+
+
+def helper_step(text):
+    """The workflow step (its lines) that holds the helper call."""
+    lines = text.splitlines()
+    at = next(i for i, ln in enumerate(lines) if HELPER in ln and re.search(r"\bpython3\b", ln))
+    start = at
+    while start > 0 and not re.match(r"^\s*- name:", lines[start]):
+        start -= 1
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = at + 1
+    while end < len(lines) and not (lines[end].strip() and len(lines[end]) - len(lines[end].lstrip()) <= indent
+                                    and lines[end].lstrip().startswith("- ")):
+        end += 1
+    return lines[start:end]
+
+
+def wiring_problems(text):
+    """Every way the helper step could leak the tier URL, run on another runner, or let a failure pass."""
+    step = helper_step(text)
+    body = "\n".join(step)
+    found = []
+    if XTRACE.search(body):
+        found.append("the step enables xtrace; it would print the tier URL")
+    if "continue-on-error" in body:
+        found.append("the step sets continue-on-error")
+    calls = [i for i, ln in enumerate(step) if HELPER in ln and re.search(r"\bpython3\b", ln)]
+    if len(calls) != 1 or not CALL.match(step[calls[0]]):
+        found.append('the helper must run as `if ! python3 -I <helper> --url-file "$url_file"; then` and nothing else')
+        return found
+    i = calls[0]
+    if step[i - 1].strip() != GUARD:
+        found.append("the helper call is not guarded by exactly the macos-fed CI_NODE test")
+    err, leave = step[i + 1].strip(), step[i + 2].strip()
+    if not err.startswith('echo "::error::') or re.findall(r"\$\{?(\w+)", err) != ["RUNNER_NAME"]:
+        found.append("the failure line must be an ::error:: echo that references only $RUNNER_NAME")
+    if leave != "exit 1" or step[i + 3].strip() != "fi" or step[i + 4].strip() != "fi":
+        found.append("the failure branch must end in `exit 1` with no other branch")
+    for ln in step:
+        s = ln.strip()
+        if s.startswith("echo") and ">>" not in s and URL_VARS.search(s):
+            found.append(f"an echo line prints the tier URL: {s[:60]}")
+    return found + url_leaks(step)
+
+
+CI_NODE_ENV = "CI_NODE: ${{ matrix.node }}"
+CI_NODE_REF = re.compile(r"\bCI_NODE\b")
+
+
+def matrix_entries(text):
+    """Every matrix ``include:`` entry (a ``- leg:`` item) as {key: value}."""
+    entries, current, indent = [], None, None
+    for ln in text.splitlines():
+        stripped = ln.strip()
+        if stripped.startswith("- leg:"):
+            current, indent = {}, len(ln) - len(ln.lstrip())
+            entries.append(current)
+            stripped = stripped[2:]
+        elif current is None or not stripped or stripped.startswith("#"):
+            continue
+        elif len(ln) - len(ln.lstrip()) <= indent:
+            current = None
+            continue
+        key, sep, value = stripped.partition(":")
+        if sep and current is not None:
+            current[key.strip()] = value.strip().strip("'\"")
+    return entries
+
+
+def node_provenance_problems(text):
+    """#6996: the guard's CI_NODE is the matrix node label, set once in env and never touched in the script."""
+    step = helper_step(text)
+    found = []
+    run_at = next((i for i, ln in enumerate(step) if re.match(r"^\s*run:", ln)), len(step))
+    env_lines = [ln.strip() for ln in step[:run_at] if re.match(r"^\s*CI_NODE\s*:", ln)]
+    if env_lines != [CI_NODE_ENV]:
+        found.append(f"the step env must set CI_NODE exactly once, as `{CI_NODE_ENV}`")
+    for ln in step[run_at:]:
+        s = ln.strip()
+        if s.startswith("#") or s == GUARD:
+            continue
+        if CI_NODE_REF.search(s):
+            found.append(f"a script line other than the guard touches CI_NODE: {s[:60]}")
+    if not any(e.get("node") == "macos-fed" and e.get("tier") == "enterprise-fed" for e in matrix_entries(text)):
+        found.append("the matrix has no node macos-fed / tier enterprise-fed entry; the guard would never match")
+    return found
+
+
+HELPER_SUITE = "scripts/test/test_ensure_age_extension_6161.py"
+HELPER_SUITE_STEP = ["- name: AGE self-heal helper unit test (#6161)", "run: python3 " + HELPER_SUITE]
+
+
+def classify_job(text):
+    """The lines of the ``classify`` job."""
+    lines = text.splitlines()
+    start = lines.index("  classify:")
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^  \S", lines[i])), len(lines))
+    return lines[start:end]
+
+
+def classify_problems(text):
+    """#6886: the classify job runs the helper suite in exactly one reviewed step that cannot pass on failure."""
+    job = classify_job(text)
+    found = []
+    for ln in job:
+        if re.match(r"^    (?:if|continue-on-error)\s*:", ln):
+            found.append(f"the classify job sets a job-level key that can skip or excuse it: {ln.strip()[:60]}")
+    steps, current = [], None
+    for ln in job:
+        if re.match(r"^      - ", ln):
+            current = []
+            steps.append(current)
+        if current is not None and ln.strip() and not ln.strip().startswith("#"):
+            current.append(ln.strip())
+    runs = [step for step in steps if any("test_ensure_age_extension_6161" in ln for ln in step)]
+    if len(runs) != 1:
+        found.append(f"the classify job must run the helper suite in exactly one step, found {len(runs)}")
+    elif runs[0] != HELPER_SUITE_STEP:
+        found.append("the helper-suite step must be exactly the reviewed name and run lines")
+    return found
+
+
+def helper_invocations(text):
+    """Lines that run the helper through python3."""
+    return [ln for ln in text.splitlines() if HELPER in ln and re.search(r"\bpython3\b", ln)]
+
+
+def non_isolated(text):
+    return [ln.strip() for ln in helper_invocations(text) if not ISOLATED.search(ln)]
+
+
+class TestAgeHelperIsolated6339(unittest.TestCase):
+    def test_ci_runs_the_helper_with_python_isolated_mode(self):
+        text = CI_YML.read_text(encoding="utf-8")
+        self.assertTrue(helper_invocations(text), "ci.yml no longer runs the AGE helper; update this pin")
+        self.assertEqual(non_isolated(text), [], "the helper must run as `python3 -I`")
+
+    def test_the_check_rejects_a_mutant_without_dash_i(self):
+        text = CI_YML.read_text(encoding="utf-8")
+        mutant = text.replace("python3 -I " + HELPER, "python3 " + HELPER)
+        self.assertTrue(mutant != text, "ci.yml has no `python3 -I` helper invocation to mutate")
+        self.assertTrue(non_isolated(mutant))
+        self.assertTrue(non_isolated("run: python3 -S " + HELPER + " --url-file x"))
+        self.assertEqual(non_isolated("run: python3 -I " + HELPER + " --url-file x"), [])
+
+    def test_the_step_wiring_is_pinned_6508(self):
+        self.assertEqual(wiring_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_the_guard_reads_the_matrix_node_label_6996(self):
+        self.assertEqual(node_provenance_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_the_provenance_check_rejects_each_mutant_6996(self):
+        text = CI_YML.read_text(encoding="utf-8")
+        env = "          # #6161 — node label via env (same expression-injection rule as LEG).\n          " + CI_NODE_ENV
+        comment = "          # python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.\n"
+        entry = "            node: macos-fed\n            tier: enterprise-fed\n"
+        mutants = {
+            "Y09b CI_NODE from matrix.leg": (env, env.replace("matrix.node", "matrix.leg")),
+            "Y11b CI_NODE env dropped": (env + "\n", env.split("\n")[0] + "\n"),
+            "Y13 CI_NODE reset before the guard": (comment, comment + "          CI_NODE=moved\n"),
+            "CI_NODE literal": (env, env.replace("${{ matrix.node }}", "macos-fed")),
+            "CI_NODE set twice": (env, env + "\n          CI_NODE: linux-fed"),
+            "export CI_NODE": (comment, comment + "          export CI_NODE=macos-fed\n"),
+            "unset CI_NODE": (comment, comment + "          unset CI_NODE\n"),
+            "read CI_NODE": (comment, comment + "          read -r CI_NODE < /dev/null || true\n"),
+            "matrix node renamed": (entry, entry.replace("node: macos-fed", "node: macos-fed-2")),
+            "matrix tier renamed": (entry, entry.replace("tier: enterprise-fed", "tier: enterprise")),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, f"ci.yml no longer holds the text mutated by {name!r}")
+                self.assertTrue(node_provenance_problems(text.replace(old, new, 1)), f"mutant not caught: {name}")
+
+    def test_the_classify_job_runs_the_helper_suite_6886(self):
+        self.assertEqual(classify_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_the_classify_check_rejects_each_mutant_6886(self):
+        text = CI_YML.read_text(encoding="utf-8")
+        step = "      " + HELPER_SUITE_STEP[0] + "\n        " + HELPER_SUITE_STEP[1] + "\n"
+        job_key = "    runs-on: ubuntu-latest\n    outputs:\n      docs_only:"
+        mutants = {
+            "Y05 step removed": (step, ""),
+            "Y06 || true": (step, step[:-1] + " || true\n"),
+            "Y07 continue-on-error": (step, step + "        continue-on-error: true\n"),
+            "if: false": (step, step.replace("\n        run:", "\n        if: false\n        run:")),
+            "run changed": (step, step.replace("python3 " + HELPER_SUITE, "python3 -c pass")),
+            "suite filtered": (step, step[:-1] + " -k nothing\n"),
+            "step duplicated as a no-op": (step, step + "      - name: again\n        run: echo " + HELPER_SUITE + "\n"),
+            "job continue-on-error": (job_key, job_key.replace("    outputs:", "    continue-on-error: true\n    outputs:")),
+            "job if": (job_key, job_key.replace("    outputs:", "    if: false\n    outputs:")),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, f"ci.yml no longer holds the text mutated by {name!r}")
+                self.assertTrue(classify_problems(text.replace(old, new, 1)), f"mutant not caught: {name}")
+
+    def test_every_reviewed_url_line_is_in_the_step_6672(self):
+        step = {ln.strip() for ln in helper_step(CI_YML.read_text(encoding="utf-8"))}
+        self.assertEqual(sorted(URL_LINES - step), [], "a reviewed URL line is gone; shrink URL_LINES")
+
+    def test_the_wiring_check_rejects_each_mutant_6508(self):
+        text = CI_YML.read_text(encoding="utf-8")
+        call = 'if ! python3 -I ' + HELPER + ' --url-file "$url_file"; then'
+        mutants = {
+            "set-x on the step": ("set -euo pipefail\n          # psql lives", "set -euxo pipefail\n          # psql lives"),
+            "set -x before the call": (call, "set -x\n            " + call),
+            "URL in the ::error:: line": ("AGE self-heal failed (#6161), see", "AGE self-heal failed (#6161) $base_url, see"),
+            "widened guard": (GUARD + "\n            " + call, 'if [ "${CI_NODE:-}" != "linux-fed" ]; then\n            ' + call),
+            "|| true": (call, call[:-6] + " || true; then"),
+            "exit 0 on failure": ('see the ensure-age-extension line above"\n              exit 1',
+                                  'see the ensure-age-extension line above"\n              exit 0'),
+            "URL on argv": (HELPER + ' --url-file "$url_file"; then', HELPER + ' --url-file "$url_file" "$base_url"; then'),
+            "continue-on-error": ("        run: |\n          set -euo pipefail\n          # psql lives",
+                                  "        continue-on-error: true\n        run: |\n          set -euo pipefail\n          # psql lives"),
+            "echoed URL": (call, 'echo "url=$(cat "$url_file")"\n            ' + call),
+            # #6672: every other way to write the tier URL to the job log, the job summary or the environment.
+            "printf URL": (READ, READ + "\n          printf '%s\\n' \"$base_url\""),
+            "cat URL file": (READ, READ + '\n          cat "$url_file"'),
+            "cat URL file by path": (READ, READ + "\n          cat ~/.ai-memory-ci-fed-url"),
+            "URL into the step summary": (READ, READ + '\n          echo "tier=$base_url" >> "$GITHUB_STEP_SUMMARY"'),
+            "export and env dump": (READ, READ + "\n          export base_url\n          env | sort"),
+            "export alone": (READ, READ + "\n          export base_url new_url"),
+            "printenv": (READ, READ + "\n          printenv"),
+            "declare -p": (READ, READ + "\n          declare -p"),
+            "::debug:: URL": (READ, READ + '\n          echo "::debug::${new_url:-$base_url}"'),
+            "::notice:: URL": (NOTICE, NOTICE.replace("pointed AI_MEMORY_TEST_POSTGRES_URL at it", "set $new_url")),
+            "URL copied to another name": (READ, READ + '\n          u="$base_url"'),
+            "URL head on argv": ('new_url="${head%/*}', 'logger "$head"\n          new_url="${head%/*}'),
+            "URL to stderr": (READ, READ + '\n          echo "$base_url" >&2'),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old) >= 1, True, f"ci.yml no longer holds the text mutated by {name!r}")
+                self.assertTrue(wiring_problems(text.replace(old, new, 1)), f"mutant not caught: {name}")
+
+
+if __name__ == "__main__":
+    sys.exit(unittest.main())
