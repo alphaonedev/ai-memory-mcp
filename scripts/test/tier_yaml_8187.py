@@ -40,7 +40,13 @@ TIER_JOB_MARK = re.compile(TIER_MARKERS.pattern + r"|tier_credential\.py|check-t
 TIER_VERBS = re.compile(r"github-env|export-url")
 EXPORT_CALL = re.compile(r"tier_credential\.py\s+github-env\b.*--url-file")
 EMPTY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}|\$''|\$\"\"|''|\"\"")
-URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]*@")
+# everything from the scheme to the next whitespace is replaced (F34): a userinfo with a `/` or an `@` in it is masked too
+URL_ALL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)\S*")
+# the line-level mask leaves a token that is already ``scheme://***`` alone, so a masked label inside a problem line keeps
+# its closing bracket and the text after it
+URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)(?!\*\*\*(?:\W|$))\S*")
+# an `@`, or a `://` that the mask did not replace, left in a name that is about to be printed (F34)
+URL_LEFT = re.compile(r"@|://(?!\*\*\*)")
 HOSTED_LABEL = re.compile(r"^(?:ubuntu|macos|windows)-(?:latest|\d+(?:\.\d+)?)(?:-(?:arm|arm64|xlarge|large|intel))*$")
 LOCAL_USES = re.compile(r"^\./")
 
@@ -88,7 +94,25 @@ class StrictLoader(BASE_LOADER):
 
 def mask_userinfo(text):
     """``text`` with the user:password of every ``scheme://user:pass@`` replaced (a failure message never echoes it)."""
-    return URL_USERINFO.sub(r"\1***@", text)
+    return URL_USERINFO.sub(r"\1***", text)
+
+
+def printable(value, fallback):
+    """``value`` as a name for a message, or ``fallback`` (F34, fail closed).
+
+    The whole value is joined on its whitespace and masked first, then tested: if any ``@`` or unmasked ``://`` is left, the
+    value may still carry a credential fragment (a userinfo broken by a line break, folding whitespace, ``/`` or ``@``)
+    and none of its text is printed.  The cut to 60 characters comes last (F33)."""
+    masked = URL_ALL.sub(r"\1***", " ".join(str(value).split()))
+    if URL_LEFT.search(masked):
+        return fallback
+    return masked[:60]
+
+
+def job_label(name, jobs):
+    """``name`` of a job for a message, or ``job[<position>]`` (position in the sorted job keys) when it is not printable."""
+    names = sorted(jobs, key=str)
+    return printable(name, "job[%d]" % names.index(name)) if name in names else printable(name, "job[?]")
 
 
 def load_failure(exc):
@@ -218,12 +242,12 @@ def build_pins(data):
 
 
 def step_label(step, index):
-    """``name`` or ``id`` of a step for a message, masked BEFORE the 60-character cut (F33); a step with neither is ``step[<index>]``, never its content (F25)."""
+    """``name`` or ``id`` of a step for a message, joined and masked BEFORE the 60-character cut (F33), ``step[<index>]`` whenever an ``@`` or an unmasked ``://`` survives the mask (F34); a step with neither is ``step[<index>]``, never its content (F25)."""
     if isinstance(step, dict):
         for key in ("name", "id"):
             value = step.get(key)
             if isinstance(value, str) and value.strip():
-                return mask_userinfo(value.strip()).splitlines()[0][:60]
+                return printable(value, "step[%d]" % index)
     return "step[%d]" % index
 
 
@@ -426,7 +450,7 @@ def non_tier_runner_problems(workflow, data, tier):
             continue  # a reusable workflow call: its called file is scanned separately
         why = runner_problem(workflow, name, job)
         if why:
-            found.append("%s job %s: %s" % (workflow, name, why))
+            found.append("%s job %s: %s" % (workflow, job_label(name, data["jobs"]), why))
     return found
 
 

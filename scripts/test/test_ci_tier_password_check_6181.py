@@ -942,13 +942,13 @@ def primary_pin_problems(workflow, text, primary):
     jobs = data["jobs"]
     names = sorted(jobs)
     if ty.digest(names) != entry["job_names_sha256"]:
-        added = sorted(set(names) - set(entry["job_names"]))
+        added = [ty.job_label(n, jobs) for n in sorted(set(names) - set(entry["job_names"]))]
         gone = sorted(set(entry["job_names"]) - set(names))
         problems.append(f"{workflow}: the set of jobs changed (added {added}, missing {gone})")
     tier = ty.tier_job_names(data)
     for name in tier:
         if name not in entry["tier_jobs"]:
-            problems.append(f"{workflow} job {name}: names the tier credential but is not pinned")
+            problems.append(f"{workflow} job {ty.job_label(name, jobs)}: names the tier credential but is not pinned")
     for name, pinned in entry["tier_jobs"].items():
         if name not in tier:
             problems.append(f"{workflow} job {name}: pinned job is missing or no longer names the tier credential")
@@ -959,13 +959,14 @@ def primary_pin_problems(workflow, text, primary):
     problems += workflow_key_problems(workflow, data, pinned_keys)
     for name, job in jobs.items():
         if name not in entry["tier_jobs"] and EXPORT_CALL.search(ty.normalised_leaves(job)):
-            problems.append(f"{workflow} job {name}: the tier export call sits outside a pinned job")
+            problems.append(f"{workflow} job {ty.job_label(name, jobs)}: the tier export call sits outside a pinned job")
     if not any(EXPORT_CALL.search(ty.normalised_leaves(jobs[name])) for name in entry["tier_jobs"] if name in jobs):
         problems.append(f"{workflow}: no pinned job exports the tier URL, so the pin cannot be placed")
     problems += ty.non_tier_runner_problems(workflow, data, set(tier))
     for job, where, value in ty.uses_references(data):
         if where == "job" or value.startswith("./"):
-            problems.append(f"{workflow} job {job} {where}: a local action or reusable workflow call is not allowed here")
+            problems.append(f"{workflow} job {ty.job_label(job, jobs)} {where}: "
+                            "a local action or reusable workflow call is not allowed here")
     return [ty.mask_userinfo(p) for p in problems]
 
 
@@ -1001,15 +1002,15 @@ def repo_problems(root=None, pins=None):
             continue
         for job_name, job in jobs.items():
             if not isinstance(job, dict):
-                found.append(f"{name} job {job_name}: the job is not a mapping")
+                found.append(f"{name} job {ty.job_label(job_name, jobs)}: the job is not a mapping")
                 continue
             if "uses" in job:
-                found.append(f"{name} job {job_name}: a job-level uses (reusable workflow call) is not allowed; "
+                found.append(f"{name} job {ty.job_label(job_name, jobs)}: a job-level uses (reusable workflow call) is not allowed; "
                              "the called workflow chooses its own runner")
                 continue
             why = ty.runner_problem(name, job_name, job)
             if why:
-                found.append(f"{name} job {job_name}: {why}")
+                found.append(f"{name} job {ty.job_label(job_name, jobs)}: {why}")
             if (name, job_name) in self_hosted_rows():
                 found += exempt_pin_problems(name, job_name, job, pins)
         if any(wf == name for wf, _job in self_hosted_rows()):
@@ -2430,7 +2431,7 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                 with self.subTest(workflow=wf, view=view):
                     checked += 1
                     self.assertEqual([p for p in problems if sentinel in p], [])
-                    self.assertTrue([p for p in problems if f"step {index} (https://***@host.example/db)" in p],
+                    self.assertTrue([p for p in problems if f"step {index} (https://***)" in p],
                                     (view, index))
         self.assertGreater(checked, 0)
 
@@ -2440,10 +2441,10 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
         sentinel = "SENTINEL-F33-pw"
         cases = {
             "at-past-60": (f"the staging database lives at https://ciuser:{sentinel}-{'x' * 40}@host.example/db",
-                           "the staging database lives at https://***@host.example/db"),
-            "password-over-60": (f"https://ciuser:{sentinel}-{'y' * 70}@host.example/db", "https://***@host.example/db"),
+                           "the staging database lives at https://***"),
+            "password-over-60": (f"https://ciuser:{sentinel}-{'y' * 70}@host.example/db", "https://***"),
             "prefix-and-password-over-60": (f"see https://ciuser:{sentinel}-{'z' * 70}@host.example/db",
-                                            "see https://***@host.example/db"),
+                                            "see https://***"),
         }
         checked = 0
         for wf, text in self.texts.items():
@@ -2462,6 +2463,74 @@ class TestStepLabelComesFromTheLoadedDocument8187R16(unittest.TestCase):
                         checked += 1
                         self.assertEqual([p for p in problems if sentinel in p or "ciuser" in p], [])
                         self.assertTrue([p for p in problems if f"step {index} ({label})" in p], (view, index))
+        self.assertGreater(checked, 0)
+
+
+    def test_a_userinfo_broken_by_a_line_break_or_a_slash_never_reaches_a_message_8187_f34(self):
+        """F34: a userinfo split by a line break, folding whitespace or ``/`` is not matched by the mask, so the label falls
+        back to ``step[<index>]``; no ``scheme://user:`` and no password fragment may reach a message."""
+        sentinel = "SENTINEL-F34-pw"
+        user = "f34user"
+        cases = {
+            "literal block": ["      - name: |", f"          https://{user}:{sentinel}-pa", "          ss@host.example/db"],
+            "folded block": ["      - name: >", f"          https://{user}:{sentinel}-pa", "          ss@host.example/db"],
+            "escaped newline": [f'      - name: "https://{user}:{sentinel}-pa\\nss@host.example/db"'],
+            "plain continuation": [f"      - name: https://{user}:{sentinel}-pa", "          ss@host.example/db"],
+            "break before the at sign": ["      - name: |", f"          https://{user}:{sentinel}-{'x' * 20}",
+                                         "          @host.example/db"],
+            "slash in the password": [f"      - name: https://{user}:{sentinel}/pw@host.example/db"],
+            "at sign in the password": [f"      - name: https://{user}:{sentinel}@pw@host.example/db"],
+        }
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            for variant, planted in cases.items():
+                edited = splice(text, target[3], planted + ["        run: echo one"])
+                job_steps = ty.load_strict(edited)["jobs"][target[0]]["steps"]
+                index = next(i for i, step in enumerate(job_steps) if sentinel in json.dumps(step))
+                views = {"loaded": tier_pin_problems(wf, edited, self.pins),
+                         "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
+                for view, problems in views.items():
+                    with self.subTest(workflow=wf, variant=variant, view=view):
+                        checked += 1
+                        self.assertTrue(problems)
+                        self.assertEqual([p for p in problems if sentinel in p or user in p
+                                          or "://" in p.replace("://***", "") or "@host" in p], [])
+                        labelled = [p for p in problems if re.search(
+                            r"step %d \((?:step\[%d\]|[^)@]*\*\*\*[^)@]*)\)" % (index, index), p)]
+                        self.assertTrue(labelled, (view, index))
+        self.assertGreater(checked, 0)
+
+    def test_a_url_shaped_job_key_never_reaches_a_message_8187_f34(self):
+        """F34: a job key shaped like a URL with ``/``, ``@`` or a space in the password is printed as ``job[<n>]``."""
+        sentinel = "SENTINEL-F34-jk"
+        user = "f34jobuser"
+        keys = {
+            "slash": f"https://{user}:{sentinel}/pw@host.example/db",
+            "at sign": f"https://{user}:{sentinel}@pw@host.example/db",
+            "space": f"https://{user}:{sentinel} pw@host.example/db",
+        }
+        checked = 0
+        for wf, text in self.texts.items():
+            target = next(iter(pin_targets(wf, text)), None)
+            if target is None:
+                continue
+            job = target[0]
+            head = f"\n  {job}:"
+            self.assertEqual(text.count(head), 1, (wf, job))
+            for variant, key in keys.items():
+                edited = text.replace(head, f'\n  "{key}":')
+                self.assertIn(sentinel, json.dumps(ty.load_strict(edited)["jobs"]))
+                views = {"loaded": tier_pin_problems(wf, edited, self.pins),
+                         "text": job_pin_problems(wf, edited, self.pins[SECONDARY])}
+                for view, problems in views.items():
+                    with self.subTest(workflow=wf, variant=variant, view=view):
+                        checked += 1
+                        self.assertTrue(problems)
+                        self.assertEqual([p for p in problems if sentinel in p or user in p
+                                          or "://" in p.replace("://***", "") or "@host" in p], [])
         self.assertGreater(checked, 0)
 
 
