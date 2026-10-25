@@ -255,6 +255,13 @@ def scratch():
     return str(d)
 
 
+def scratch_tree(test, prefix):
+    """A fresh directory under .local-runs that the test removes when it ends (code r10 F6)."""
+    d = Path(tempfile.mkdtemp(prefix=prefix + ".", dir=scratch()))
+    test.addCleanup(shutil.rmtree, str(d), True)
+    return d
+
+
 class FailClosed(unittest.TestCase):
     """The guard compares the workflows in the tree it runs on and is never green on a skipped check."""
 
@@ -955,7 +962,7 @@ class Round7(unittest.TestCase):
     def run_group(self, prefix):
         cases = {n: c for n, c in G.R7_CASES.items() if n.startswith(prefix)}
         self.assertGreaterEqual(len(cases), 2, prefix)
-        tree = Path(scratch()) / "r7"
+        tree = scratch_tree(self, "r7")
         for name, (doc, files, count, needle) in cases.items():
             errs = G.r5_errors(doc, files, tree)
             self.assertEqual(len(errs), count, (name, errs))
@@ -997,11 +1004,7 @@ class Round7(unittest.TestCase):
 
     def test_n6_symlink_loop_is_refused_not_raised(self):
         """A local action directory that is a symlink to itself is refused with a message, never an exception."""
-        tree = Path(scratch()) / "r7loop"
-        if tree.exists():
-            import shutil
-            shutil.rmtree(tree)
-        tree.mkdir(parents=True)
+        tree = scratch_tree(self, "r7loop")
         (tree / "act").symlink_to("act")
         doc = G._r5_job(steps="    steps:\n" + G.R5_LOCAL)
         rep = G.Report()
@@ -1012,10 +1015,7 @@ class Round7(unittest.TestCase):
 
     def test_n6_node_main_symlink_loop_is_refused_not_raised(self):
         """A node action whose `main` is a symlink to itself is refused with a message, never an exception."""
-        tree = Path(scratch()) / "r7main"
-        if tree.exists():
-            import shutil
-            shutil.rmtree(tree)
+        tree = scratch_tree(self, "r7main")
         (tree / "act").mkdir(parents=True)
         (tree / "act" / "action.yml").write_text("name: p\nruns:\n  using: node20\n  main: loop.js\n", encoding="utf-8")
         (tree / "act" / "loop.js").symlink_to("loop.js")
@@ -1027,7 +1027,7 @@ class Round7(unittest.TestCase):
 
     def test_f3_pipeline_verify_needs_a_top_level_start(self):
         """The verify of `a | sha256sum -c` counts only when the pipeline starts at the top of the step."""
-        tree = Path(scratch()) / "r7pipe"
+        tree = scratch_tree(self, "r7pipe")
         for line, want in (("false && " + G.R7_VERIFY, 1), ("! " + G.R7_VERIFY, 1), (G.R7_VERIFY, 0)):
             doc = G._r7(G.R7_FETCH, line, "tar xzf f")
             self.assertEqual(len(G.r5_errors(doc, None, tree)), want, line)
@@ -1184,7 +1184,7 @@ class Round8(unittest.TestCase):
         self.assertEqual(len(PROBES), 69 + 15)  # 69 of security r7 (S1-S9) plus 15 of code r7 (C1-C6 X probes)
 
     def test_every_probe_matches_its_wanted_result(self):
-        tree = Path(scratch()) / "r8probe"
+        tree = scratch_tree(self, "r8probe")
         wrong = []
         for name, (doc, files, want) in PROBES.items():
             errs = G.r5_errors(doc, files, tree)
@@ -1216,7 +1216,7 @@ class Round8(unittest.TestCase):
     )
 
     def test_each_refused_probe_names_its_reason(self):
-        tree = Path(scratch()) / "r8needle"
+        tree = scratch_tree(self, "r8needle")
         for name, needle in self.NEEDLES:
             doc, files, want = PROBES[name]
             self.assertEqual(want, 1, name)
@@ -1291,7 +1291,7 @@ class Round9(unittest.TestCase):
         self.assertEqual(len(PROBES9), 41)
 
     def test_every_probe_matches_its_wanted_result(self):
-        tree = Path(scratch()) / "r9probe"
+        tree = scratch_tree(self, "r9probe")
         wrong = []
         for name, (doc, files, want) in PROBES9.items():
             got = 1 if G.r5_errors(doc, files, tree) else 0
@@ -1300,7 +1300,7 @@ class Round9(unittest.TestCase):
         self.assertEqual(wrong, [])
 
     def test_the_guard_round9_cases_match(self):
-        tree = Path(scratch()) / "r9cases"
+        tree = scratch_tree(self, "r9cases")
         wrong = []
         for name, (doc, files, count, needle) in G.R9_CASES.items():
             errs = G.r5_errors(doc, files, tree)
@@ -1341,7 +1341,7 @@ class Round10(unittest.TestCase):
 
     def test_every_observation_is_refused_at_head(self):
         self.assertEqual(self.sweep.accepted_observations(SCRIPT, self.tmp / "head"), [])
-        self.assertEqual(len(self.sweep.OBSERVATIONS), 10 + 44)
+        self.assertGreaterEqual(len(self.sweep.OBSERVATIONS), 10 + 44)
 
     def test_no_equivalent_row_is_observable(self):
         """F1: an observation that the mutant accepts proves the row is not equivalent (and its absence is the proof)."""
@@ -1419,8 +1419,8 @@ class Round11(unittest.TestCase):
         self.assertEqual(refused, [])
 
     def test_the_legitimate_at_shapes_are_accepted(self):
-        shapes = ("echo ${arr[@]}", "echo ${!arr[@]}", "echo ${@}", 'echo "$@"', "echo ${#arr[@]}", "echo ${arr[@]:1:2}",
-                  "echo ${arr[@]/x/y}", "echo ${arr[@]#x}", "echo ${X@}", "echo ${X@ P}", "echo \\${X@P}", "echo '${X@P}'",
+        shapes = ("echo ${ary[@]}", "echo ${!ary[@]}", "echo ${@}", 'echo "$@"', "echo ${#ary[@]}", "echo ${ary[@]:1:2}",
+                  "echo ${ary[@]/x/y}", "echo ${ary[@]#x}", "echo ${X@}", "echo ${X@ P}", "echo \\${X@P}", "echo '${X@P}'",
                   "echo ${X#*@}", "echo ${X@1}", "echo ${X@_}")
         refused = [s for s in shapes if self.errs(s)]
         self.assertEqual(refused, [])
@@ -1432,14 +1432,14 @@ class Round11(unittest.TestCase):
             if len(errs) != count or (needle and needle not in " | ".join(errs)):
                 wrong.append(name)
         self.assertEqual(wrong, [])
-        self.assertEqual(len(G.R11_CASES), 27)
+        self.assertEqual(len(G.R11_CASES), 47)
 
     def test_the_new_observations_are_named_and_refused_at_head(self):
         for name in ("heredoc body ${X@P}", "heredoc body command substitution", "heredoc body backticks",
                      "quoted default word ${Y@P}", "quoted default word command substitution",
                      "single-quoted default word command substitution"):
             self.assertIn(name, self.sweep.OBSERVATIONS)
-        self.assertEqual(len(self.sweep.OBSERVATIONS), 10 + 44 + 6)
+        self.assertEqual(len(self.sweep.OBSERVATIONS), 10 + 44 + 6 + 4)
         self.assertEqual(self.sweep.accepted_observations(SCRIPT, self.tmp / "head"), [])
 
     def test_a_failed_observation_run_is_not_a_kill(self):
@@ -1447,7 +1447,7 @@ class Round11(unittest.TestCase):
         (self.tmp / "obs").write_text("a file where the observation tree goes", encoding="utf-8")
         kind, _names = self.sweep.observe(SCRIPT, self.tmp)
         self.assertEqual(kind, "failed")
-        state, _label, note = self.sweep.work_row(SCRIPT.read_bytes(), "unmutated guard", ROOT, str(self.tmp), False)
+        state, note = self.sweep.work_row(SCRIPT.read_bytes(), "unmutated guard", ROOT, str(self.tmp), False)
         self.assertEqual(state, "OTHER-DEFECT", note)
 
     def test_an_accepted_observation_is_a_kill_and_a_clean_run_is_none(self):
@@ -1464,6 +1464,7 @@ class Round11(unittest.TestCase):
 
     def test_the_control_row_observes_and_must_be_green(self):
         self.assertEqual(self.sweep.control_row(ROOT, str(self.tmp))[0], "GREEN")
+        shutil.rmtree(str(self.tmp / "obs"))
         (self.tmp / "obs").write_text("x", encoding="utf-8")
         self.assertNotEqual(self.sweep.control_row(ROOT, str(self.tmp))[0], "GREEN")
 

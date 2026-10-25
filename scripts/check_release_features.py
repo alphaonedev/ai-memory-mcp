@@ -1580,6 +1580,12 @@ SHELL_CMD_KW = frozenset(("if", "then", "elif", "else", "while", "until", "do", 
 SHELL_END_KW = frozenset(("fi", "done", "esac", "}"))
 SHELL_NOOP = frozenset(("set", "exit", ":", "true", "false", "break", "continue", "return"))
 SHELL_ASSIGN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
+# Round 11 (sec r10 F3): the letters that follow the `@` of a parameter transformation. Bash 5.2 reads U u L Q E P A a K; any
+# other letter is refused too, because the scanner cannot know which a later bash re-evaluates.
+TRANSFORM_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+# Round 11 (sec r10 F2): array-subscript text that holds a substitution: `[` then `$(`, a backtick or a `${` with an
+# `@` operator, before any `]`.
+SUBSCRIPT_SUBST_RE = re.compile(r"\[[^\]]*(?:\$\(|`|\$\{[^}]*@[A-Za-z])")
 
 
 class ShellError(Exception):
@@ -1636,7 +1642,7 @@ class ShellScan:
         self.words: List[str] = []
         self.assigns: List[str] = []
         self.heredocs = 0
-        self.pending: List[Tuple[str, bool]] = []
+        self.pending: List[Tuple[str, bool, bool]] = []
         # Round 7 (F3): per command, aligned with ``cmds``: the separators around it and whether it runs unconditionally
         # at the top level; ``targets`` holds the redirect targets (and here-string words).
         self.info: List[Dict[str, object]] = []
@@ -1740,7 +1746,7 @@ class ShellScan:
     def newline(self, lv: ShellLevel) -> None:
         self.separator(lv, "\n")
         while self.pending:
-            delim, strip = self.pending.pop(0)
+            delim, strip, quoted = self.pending.pop(0)
             body: List[str] = []
             while True:
                 if self.i >= self.n:
@@ -1751,7 +1757,39 @@ class ShellScan:
                 if (line.lstrip("\t") if strip else line) == delim:
                     break
                 body.append(line)
-            self.words.append("\n".join(body))
+            text = "\n".join(body)
+            # Round 11 (code r10 F2): bash expands the body of a here-document whose delimiter has no quote or backslash,
+            # so a `$( )`, a backtick and a `${X@P}` in it run; the body is scanned as double-quoted text. A quoted
+            # delimiter keeps the body literal.
+            # decision: scan unquoted heredoc bodies as double-quoted text over refusing heredocs because release.yml's own steps use literal heredocs
+            self.words.append(text if quoted else self.heredoc_text(text))
+
+    def heredoc_text(self, body: str) -> str:
+        """Round 11 (code r10 F2): the expansion of an unquoted here-document body, read like the inside of double quotes
+        without the closing quote (a `"` is plain text); every expansion in it is scanned."""
+        saved, rest = (self.s, self.n, self.i), self.pending
+        self.s, self.n, self.i, self.pending = body, len(body), 0, []
+        out: List[str] = []
+        try:
+            while self.i < self.n:
+                c = self.s[self.i]
+                if c == "\\" and self.i + 1 < self.n:
+                    out.append(self.s[self.i + 1])
+                    self.i += 2
+                elif c == "$":
+                    out.append(self.dollar())
+                elif c == "`":
+                    self.i += 1
+                    self.xcount += 1
+                    self.scan("`")
+                    out.append("`")
+                else:
+                    out.append(c)
+                    self.i += 1
+        finally:
+            self.s, self.n, self.i = saved
+            self.pending = rest
+        return "".join(out)
 
     def operator(self, lv: ShellLevel) -> None:
         two = self.s[self.i:self.i + 2]
@@ -1765,17 +1803,20 @@ class ShellScan:
             self.i += 1
             self.separator(lv, two[0])
 
-    def heredoc_delim(self) -> str:
+    def heredoc_delim(self) -> Tuple[str, bool]:
         while self.i < self.n and self.s[self.i] in " \t":
             self.i += 1
         out: List[str] = []
+        quoted = False
         while self.i < self.n and self.s[self.i] not in " \t\n;&|()<>":
             if self.s[self.i] not in "'\"\\":
                 out.append(self.s[self.i])
+            else:
+                quoted = True
             self.i += 1
         if not out:
             raise ShellError("here-document without a delimiter")
-        return "".join(out)
+        return "".join(out), quoted
 
     def redirect(self, lv: ShellLevel) -> None:
         s, i = self.s, self.i
@@ -1788,7 +1829,8 @@ class ShellScan:
             self.i += 2
             strip = s[self.i:self.i + 1] == "-"
             self.i += 1 if strip else 0
-            self.pending.append((self.heredoc_delim(), strip))
+            delim, quoted = self.heredoc_delim()
+            self.pending.append((delim, strip, quoted))
             self.heredocs += 1
         elif s[i:i + 2] in ("<(", ">("):
             self.i += 2
@@ -1800,20 +1842,63 @@ class ShellScan:
                 self.i += 1
             lv.skip = True
 
+    def quoted_span(self, j: int) -> int:
+        """Round 11 (code r10 F1): the index after the quoted span that opens at ``j`` inside a `${...}`. The span is scanned
+        with the rules of the word around it: a `$( )`, a backtick and a nested `${ }` stay live in both quote kinds.
+        decision: treat a single-quoted span inside `${...}` as live over skipping it because bash does not quote inside a
+        default word that sits in double quotes (bash manual, Shell Parameter Expansion and Quoting), so `"${X:-'$(f)'}"` runs f."""
+        s, q = self.s, self.s[j]
+        j += 1
+        while j < self.n:
+            c = s[j]
+            if c == q:
+                return j + 1
+            if c == "\\" and q == '"':
+                j += 1
+            elif c == "`" or s[j:j + 2] == "$(":
+                raise ShellError("command substitution inside `${...}`")
+            elif s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            j += 1
+        raise ShellError("unterminated quote in `${...}`")
+
     def braced(self, j: int) -> int:
         """The index after the `}` that closes a `${` whose body starts at ``j``."""
         s, depth = self.s, 1
+        # Round 11 (code r10 F3): `@` is an operator only where bash reads one, right after the parameter name or its
+        # subscript (`${name@op}`, `${name[i]@op}`, `${!name@op}`); after `:-`, `#`, `%`, `/` and the like it is word text.
+        op = j + 1 if s[j:j + 1] in ("!", "#") and s[j + 1:j + 2] not in ("", "}") else j
+        if s[op:op + 1].isalpha() or s[op:op + 1] == "_":
+            while op < self.n and (s[op].isalnum() or s[op] == "_"):
+                op += 1
+        elif s[op:op + 1].isdigit():
+            while op < self.n and s[op].isdigit():
+                op += 1
+        elif s[op:op + 1] and s[op] in "@*#?$!-":
+            op += 1
+        sub = 0
         while j < self.n:
             c = s[j]
             if c == "\\":
                 j += 1
             elif c in "'\"":
-                j = s.find(c, j + 1)
-                if j < 0:
-                    raise ShellError("unterminated quote in `${...}`")
+                j = self.quoted_span(j)
+                continue
             elif c == "`" or s[j:j + 2] == "$(":
                 raise ShellError("command substitution inside `${...}`")
-            elif c == "@" and s[j + 1:j + 2].isalpha():
+            elif s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            elif c == "[" and j == op and not sub:
+                sub = 1
+            elif c == "[" and sub:
+                sub += 1
+            elif c == "]" and sub:
+                sub -= 1
+                if not sub:
+                    op = j + 1
+            elif c == "@" and j == op and s[j + 1:j + 2] != "" and s[j + 1] in TRANSFORM_LETTERS:
                 # Round 10 (sec r9 F1): `${name@P}` and its siblings re-evaluate the value (a command substitution in it runs).
                 # decision: refuse every @-transformation operator over refusing @P alone because the scanner cannot know
                 # which operators a future bash re-evaluates, and the guard is fail-closed by design.
@@ -1965,6 +2050,12 @@ class ShellScan:
             nonlocal buf, lit, have, mark
             if have:
                 word = XStr("".join(buf))
+                # Round 11 (sec r10 F2): a quoted word such as `a[$(cmd)]` is data when assigned, but bash re-evaluates an
+                # array subscript in `$(( X ))`, `declare -n`, `${!X}`, `${ary[X]}`, `[[ X -eq 0 ]]`, `printf -v`, `test -v`,
+                # `declare -i` and `${S:X:1}`, and the command then runs outside the run allow-list.
+                # decision: refuse subscript text holding a substitution inside quoted values over tracking every re-evaluating context because bash re-evaluates such subscripts in nine distinct places and the allow-list cannot see any of them
+                if SUBSCRIPT_SUBST_RE.search(word):
+                    raise ShellError("array subscript holding a substitution is re-evaluated by bash")
                 word.exp = self.xcount != mark
                 self.word(word, lit, lv)
             buf, lit, have, mark = [], True, False, self.xcount
@@ -3300,6 +3391,10 @@ def check_env_keys(env: Optional[Node], name: str, where: str, rep: Report) -> N
     for key in env.keys():
         held = env.get(key)
         vtext = held.text().strip() if held is not None and held.kind == "scalar" else None
+        if vtext is not None and SUBSCRIPT_SUBST_RE.search(vtext):
+            rep.bad(f"{name}: {where}: line {env.line + 1}: `env:` value of `{key}` holds an array subscript with a "
+                    "substitution, which bash re-evaluates wherever the variable is read as a number or a name "
+                    "(Round 11, sec r10 F2)")
         if DANGEROUS_ASSIGN_RE.fullmatch(key) or rustflags_bad(key, vtext):
             rep.bad(f"{name}: {where}: line {env.line + 1}: `env:` sets `{key}`, which changes what the shell or a tool "
                     "loads before it runs (Round 8, S6: the inline form is refused, so the mapping form is too)")
@@ -5657,6 +5752,8 @@ R11_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r11 F2: a command substitution in a <<- here-document body is refused (YAML forbids a tab, so the body has none)": (_r8("cat <<-E", "$(./f)", "E"), None, 1, ""),
     "r11 F2: a command substitution in the body of the second of two here-documents is refused": (
         _r8("cat <<A <<B", "plain", "A", "$(./f)", "B"), None, 1, ""),
+    "r11 F2: a multi-line command substitution in the first of two here-document bodies keeps its own state": (
+        _r8("cat <<A <<B", "$(echo", ")", "A", "b", "B"), None, 0, ""),
     "r11 F2: an escaped dollar in an unquoted here-document body is literal": (_r8("cat <<E", "\\$(./f)", "E"), None, 0, ""),
     "r11 F2: plain text and a variable in an unquoted here-document body pass": (_r8("cat <<E", "hello $HOME", "E"), None, 0, ""),
     "r11 F2: a single-quoted delimiter keeps the body literal": (_r8("cat <<'E'", "${X@P} $(./f) `./f`", "E"), None, 0, ""),
@@ -5674,11 +5771,43 @@ R11_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r11 F3: an at sign in a default word passes": (_r8("echo ${X:-me@host}"), None, 0, ""),
     "r11 F3: an at sign in a quoted default word passes": (_r8('echo ${X:-"me@host"}'), None, 0, ""),
     "r11 F3: an at sign in a pattern removal passes": (_r8("echo ${X#*@a} ${X%@a} ${X//@a/b} ${X:+u@host}"), None, 0, ""),
-    "r11 F3: ${arr[@]} ${!arr[@]} ${@} and \"$@\" pass": (_r8("echo ${arr[@]} ${!arr[@]} ${@} \"$@\" ${#arr[@]}"), None, 0, ""),
+    "r11 F3: ${ary[@]} ${!ary[@]} ${@} and \"$@\" pass": (_r8("echo ${ary[@]} ${!ary[@]} ${@} \"$@\" ${#ary[@]}"), None, 0, ""),
     "r11 F3: ${X@P} right after the name is still refused": (_r8("echo ${X@P}"), None, 1, "parameter transformation"),
-    "r11 F3: ${arr[@]@P} right after the subscript is still refused": (_r8("echo ${arr[@]@P}"), None, 1, "parameter transformation"),
+    "r11 F3: ${ary[@]@P} right after the subscript is still refused": (_r8("echo ${ary[@]@P}"), None, 1, "parameter transformation"),
     "r11 F3: ${!N@P} after an indirection is still refused": (_r8("echo ${!N@P}"), None, 1, "parameter transformation"),
-    "r11 F3: ${arr[${X@P}]} in a subscript is still refused": (_r8("echo ${arr[${X@P}]}"), None, 1, "parameter transformation"),
+    "r11 F3: ${ary[${X@P}]} in a subscript is still refused": (_r8("echo ${ary[${X@P}]}"), None, 1, "parameter transformation"),
+    "r11 F2 sec r10 S01: a quoted subscript holding a command substitution then ${!X} indirection is refused": (
+        _r8("X='a[$(./f)]'", 'echo ${!X}'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S03: a quoted subscript holding a command substitution then declare -n nameref is refused": (
+        _r8("X='a[$(./f)]'", 'declare -n N=X'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S08: a quoted subscript holding a command substitution then [[ X -eq 0 ]] test is refused": (
+        _r8("X='a[$(./f)]'", '[[ $X -eq 0 ]]'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S10: a quoted subscript holding a command substitution then $(( X )) arithmetic is refused": (
+        _r8("X='a[$(./f)]'", 'echo $(( X ))'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S12: a quoted subscript holding a command substitution then ${ary[X]} subscript is refused": (
+        _r8("X='a[$(./f)]'", 'echo ${ary[X]}'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S21: a quoted subscript holding a command substitution then printf -v target is refused": (
+        _r8("X='a[$(./f)]'", 'printf -v "$X" %s v'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S22: a quoted subscript holding a command substitution then test -v operand is refused": (
+        _r8("X='a[$(./f)]'", 'test -v "$X"'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S27: a quoted subscript holding a command substitution then declare -i Y=X is refused": (
+        _r8("X='a[$(./f)]'", 'declare -i Y=X'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S28: a quoted subscript holding a command substitution then ${S:X:1} offset is refused": (
+        _r8("X='a[$(./f)]'", 'echo ${S:X:1}'), None, 1, "array subscript"),
+    "r11 F2 sec r10: a quoted subscript holding a backtick is refused": (_r8("X='a[`./f`]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r11 F2 sec r10: a quoted subscript holding a ${Y@P} transformation is refused": (
+        _r8("X='a[${Y@P}]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r11 F2 sec r10: an escaped dollar in double quotes does not hide the subscript": (_r8('X="a[\\$(./f)]"', "echo $(( X ))"), None, 1, "array subscript"),
+    "r11 F2 sec r10 H7: a step env value holding a subscript with a substitution is refused": (
+        _r7_steps("      - run: echo $(( X ))\n        env:\n          X: 'a[$(./f)]'\n"), None, 1, "array subscript"),
+    "r11 F2 sec r10: a job env value holding a subscript with a substitution is refused": (
+        _r7_steps("      - run: echo $(( X ))\n", head="    env:\n      X: 'a[$(./f)]'\n"), None, 1, "array subscript"),
+    "r11 F2 sec r10: a plain subscript in a quoted value passes": (_r8("X='a[1]'", "echo $(( X ))"), None, 0, ""),
+    "r11 F2 sec r10: a variable subscript in an expansion passes": (_r8("echo ${ary[$i]} ${ary[i+1]} ${#ary[@]}"), None, 0, ""),
+    "r11 F2 sec r10: a plain subscript in an env value passes": (
+        _r7_steps("      - run: echo ok\n        env:\n          X: 'a[1]'\n"), None, 0, ""),
+    "r11 F3 sec r10: an e-mail address in a default word passes (H8)": (_r8("echo ${E:-ci@host}"), None, 0, ""),
+    "r11 F3 sec r10: an at sign in a substitution pattern passes": (_r8("echo ${E/@example/x}"), None, 0, ""),
 }
 
 

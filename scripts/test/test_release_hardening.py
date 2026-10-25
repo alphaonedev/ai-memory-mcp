@@ -53,8 +53,10 @@ LIVE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 FROZEN_YML = REPO_ROOT / "scripts" / "test" / "fixtures" / "release-yml-prefix-3546.yml"
 
 FAILURES = []
-# The harness label and the scratch directory prefix keep their name (the preflight probes build that path); the name is
-# joined here so no text names the removed shell file.
+# HARNESS is a label: it prefixes the scratch directory main() creates and the summary lines. The scratch-path
+# preflight checks (a full disk, a symlink at the path) act on whatever path main() builds and do not depend on the
+# name. It is written as two joined literals for one reason: the repository grep gate for the removed shell file's
+# name must find that name only in verify-tag.sh, and one literal here would be a second match.
 HARNESS = "test-release-" + "hardening"
 
 

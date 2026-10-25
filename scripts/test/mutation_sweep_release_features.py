@@ -63,6 +63,24 @@ OBSERVATIONS = {
     "function env then env --ignore-environment": _job("env() { :; }", "env --ignore-environment cargo build --locked"),
 }
 
+# Round 11 (code r10 F1, F2): a quoted span inside `${...}` and the body of an unquoted here-document are expanded by bash.
+OBSERVATIONS.update({
+    "heredoc body ${X@P}": _job("X='$(./f)'", "cat <<E", "${X@P}", "E"),
+    "heredoc body command substitution": _job("cat <<E", "$(./f)", "E"),
+    "heredoc body backticks": _job("cat <<E", "`./f`", "E"),
+    "quoted default word ${Y@P}": _job("Y='$(./f)'", 'echo ${X:-"${Y@P}"}'),
+    "quoted default word command substitution": _job('echo ${X:-"$(./f)"}'),
+    "single-quoted default word command substitution": _job("echo \"${X:-'$(./f)'}\""),
+})
+
+# Round 11 (sec r10 F2): a quoted value holding an array subscript with a substitution is re-evaluated by bash.
+OBSERVATIONS.update({
+    "subscript with a command substitution": _job("X='a[$(./f)]'", "echo $(( X ))"),
+    "subscript with a backtick": _job("X='a[`./f`]'", "echo $(( X ))"),
+    "subscript with a transformation": _job("X='a[${Y@P}]'", "echo $(( X ))"),
+    "env value with a subscript substitution": _env_job("          X: 'a[$(./f)]'\n"),
+})
+
 # Round 10 (sec r9 F1): `${name@<op>}` re-evaluates the value, so every operator letter (and one unknown letter) in four
 # placements is a step text the guard refuses. Row C18 of the security review is `echo "${X@P}"` shaped.
 TRANSFORM_OPS = ("P", "E", "Q", "A", "a", "K", "k", "U", "u", "L", "Z")
@@ -111,7 +129,9 @@ def accepted_observations(path, tree):
 
 def mutate(text, old, new):
     """The guard text with ``old`` replaced once above CONDITION_MARKER, or None when the anchor is not found exactly once."""
-    cut = text.index("# --- end of condition mutants\n")
+    import check_release_features as G
+
+    cut = text.index(G.CONDITION_MARKER + "\n")
     head, tail = text[:cut], text[cut:]
     return (head.replace(old, new, 1) + tail) if head.count(old) == 1 else None
 
@@ -123,7 +143,7 @@ def mutate(text, old, new):
 # reviewer found one of four labels wrong`.
 EQUIVALENT_MUTANTS = ()
 
-# (description, anchor, replacement): mutants the guard's own table does not hold; each must be RED. The four that follow
+# (description, anchor, replacement): mutants the guard's own table does not hold; each must be RED. The five that follow
 # survive `--self-test` and are killed by a named OBSERVATIONS workflow (the killer column shows `observation: <name>`).
 EXTRA_MUTANTS = (
     (
@@ -148,8 +168,113 @@ EXTRA_MUTANTS = (
     ),
     (
         "parameter transformation allowed",
-        'elif c == "@" and s[j + 1:j + 2].isalpha():',
+        'elif c == "@" and j == op and s[j + 1:j + 2] != "" and s[j + 1] in TRANSFORM_LETTERS:',
         "elif False:",
+    ),
+    (
+        "quoted span in a braced expansion not scanned",
+        "j = self.quoted_span(j)",
+        "j = s.find(c, j + 1) + 1",
+    ),
+    (
+        "command substitution in a quoted span allowed",
+        '''            elif c == "`" or s[j:j + 2] == "$(":
+                raise ShellError("command substitution inside `${...}`")
+            elif s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            j += 1
+        raise ShellError("unterminated quote in `${...}`")''',
+        '''            elif False:
+                raise ShellError("command substitution inside `${...}`")
+            elif s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            j += 1
+        raise ShellError("unterminated quote in `${...}`")''',
+    ),
+    (
+        "nested expansion in a quoted span not scanned",
+        '''            elif s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            j += 1
+        raise ShellError("unterminated quote in `${...}`")''',
+        '''            elif False:
+                j = self.braced(j + 2)
+                continue
+            j += 1
+        raise ShellError("unterminated quote in `${...}`")''',
+    ),
+    (
+        "transformation operator read at any position",
+        'elif c == "@" and j == op and s[j + 1:j + 2] != "" and s[j + 1] in TRANSFORM_LETTERS:',
+        'elif c == "@" and s[j + 1:j + 2] != "" and s[j + 1] in TRANSFORM_LETTERS:',
+    ),
+    (
+        "transformation after a subscript allowed",
+        "                if not sub:\n                    op = j + 1",
+        "                if not sub:\n                    pass",
+    ),
+    (
+        "transformation after an indirection prefix allowed",
+        'op = j + 1 if s[j:j + 1] in ("!", "#") and s[j + 1:j + 2] not in ("", "}") else j',
+        "op = j",
+    ),
+    (
+        "unquoted here-document body not scanned",
+        "self.words.append(text if quoted else self.heredoc_text(text))",
+        "self.words.append(text)",
+    ),
+    (
+        "quoted here-document body scanned",
+        "self.words.append(text if quoted else self.heredoc_text(text))",
+        "self.words.append(self.heredoc_text(text))",
+    ),
+    (
+        "here-document delimiter quote not noticed",
+        "            else:\n                quoted = True",
+        "            else:\n                quoted = False",
+    ),
+    (
+        "backslash in a here-document body not an escape",
+        'if c == "\\\\" and self.i + 1 < self.n:\n                    out.append(self.s[self.i + 1])',
+        "if False:\n                    out.append(self.s[self.i + 1])",
+    ),
+    (
+        "pending here-documents shared with a nested scan",
+        "self.s, self.n, self.i, self.pending = body, len(body), 0, []",
+        "self.s, self.n, self.i = body, len(body), 0",
+    ),
+    (
+        'transformation letters narrowed to one',
+        'TRANSFORM_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"',
+        'TRANSFORM_LETTERS = "P"',
+    ),
+    (
+        'subscript holding a substitution allowed in a word',
+        'if SUBSCRIPT_SUBST_RE.search(word):',
+        'if False:',
+    ),
+    (
+        'subscript rule ignores a command substitution',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:`|\\$\\{[^}]*@[A-Za-z])")',
+    ),
+    (
+        'subscript rule ignores a backtick',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|\\$\\{[^}]*@[A-Za-z])")',
+    ),
+    (
+        'subscript rule ignores a transformation',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`)")',
+    ),
+    (
+        'env value with a subscript substitution allowed',
+        'if vtext is not None and SUBSCRIPT_SUBST_RE.search(vtext):',
+        'if False:',
     ),
     (
         "unreadable RUSTFLAGS value allowed",
@@ -186,31 +311,62 @@ def classify(rc, err, equivalent):
     return "OTHER-DEFECT", "failed without a named case: " + err.strip().splitlines()[-1][:100] if err.strip() else "failed without output"
 
 
+OBSERVE_NONE, OBSERVE_ACCEPTED = 0, 3  # the two exit codes of `--observe`; anything else is a failed run
+
+
 def observe(path, tmpdir):
-    """Round 10: the names of the OBSERVATIONS the mutant at ``path`` accepts (run in its own interpreter)."""
+    """Round 10/11: run the OBSERVATIONS against the guard at ``path`` in its own interpreter. Returns ("none", []) when it
+    refuses all of them, ("accepted", names) when it accepts some, and ("failed", [message]) when the run exited with
+    neither expected code (code r10 F4: a run that broke is not evidence about the mutant)."""
     res = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--observe", str(path), str(Path(tmpdir) / "obs")],
                          capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(tmpdir)))
-    if res.returncode != 0:
-        return ["observation run failed: " + (res.stderr.strip().splitlines() or ["no output"])[-1][:100]]
-    return [ln for ln in res.stdout.splitlines() if ln]
+    names = [ln for ln in res.stdout.splitlines() if ln]
+    if res.returncode == OBSERVE_NONE and not names:
+        return "none", []
+    if res.returncode == OBSERVE_ACCEPTED and names:
+        return "accepted", names
+    last = (res.stderr.strip().splitlines() or ["no output"])[-1][:100]
+    return "failed", [f"observation run exited {res.returncode}: {last}"]
+
+
+def work_row(mutated, label, root, tmpdir, equivalent, stem="mutant"):
+    """(state, note) of one mutant (bytes). The row is RED on a self-test kill or on an accepted observation, and an
+    OTHER-DEFECT when the observation run itself failed."""
+    path = Path(tmpdir) / f"{stem}.py"
+    path.write_bytes(mutated)
+    try:
+        rc, _out, err = run_guard(path, root, tmpdir)
+        state, note = classify(rc, err, equivalent)
+        if rc == 0:  # self-test stayed green: try to tell the mutant from the guard by an observation
+            kind, seen = observe(path, tmpdir)
+            if kind == "accepted":
+                state, note = "RED", "observation: " + seen[0]
+            elif kind == "failed":
+                state, note = "OTHER-DEFECT", seen[0]
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return state, note
+
+
+def control_row(root, tmpdir):
+    """Row 0: the unmutated guard passes `--self-test` and accepts no observation (code r10 F4: the control observes too)."""
+    rc, _o, err = run_guard(GUARD, root, tmpdir)
+    if rc != 0:
+        return "RED", (err.strip().splitlines() or ["self-test failed"])[-1][:200]
+    kind, seen = observe(GUARD, tmpdir)
+    if kind == "none":
+        return "GREEN", "-"
+    return ("RED" if kind == "accepted" else "OTHER-DEFECT"), seen[0]
 
 
 def work(item):
     k, label, mutated, root, tmpdir, equivalent = item
     if mutated is None:
         return k, "OTHER-DEFECT", label
-    path = Path(tmpdir) / f"mutant_{k}.py"
-    path.write_bytes(mutated)
-    rc, _out, err = run_guard(path, root, tmpdir)
-    state, note = classify(rc, err, equivalent)
-    if rc == 0:  # self-test stayed green: try to tell the mutant from the guard by an observation
-        seen = observe(path, tmpdir)
-        if seen:
-            state, note = "RED", "observation: " + seen[0]
-    try:
-        path.unlink()
-    except OSError:
-        pass
+    state, note = work_row(mutated, label, root, tmpdir, equivalent, f"mutant_{k}")
     return k, state, f"{label} | {note}"
 
 
@@ -251,9 +407,10 @@ def build_items(root, tmpdir, limit):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["--observe"]:  # internal: print the OBSERVATIONS the guard module at argv[1] accepts
-        for name in accepted_observations(argv[1], argv[2]):
+        names = accepted_observations(argv[1], argv[2])
+        for name in names:
             print(name)
-        return 0
+        return OBSERVE_ACCEPTED if names else OBSERVE_NONE
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--root", default=str(HERE.parent.parent))
@@ -266,9 +423,10 @@ def main(argv=None):
     started = time.time()
     lines = []
     with tempfile.TemporaryDirectory(prefix="relfeat-par.", dir=str(base)) as tmpdir:
-        rc, _o, err = run_guard(GUARD, root, tmpdir)
-        control = "GREEN" if rc == 0 else "RED"
-        lines.append(f"0 CONTROL-{control} unmutated guard")
+        control, cnote = control_row(root, tmpdir)
+        rc = 0 if control == "GREEN" else 1
+        err = cnote
+        lines.append(f"0 CONTROL-{control} unmutated guard" + ("" if control == "GREEN" else f" | {cnote}"))
         counts = {"RED": 0, "EQUIVALENT": 0, "SURVIVES": 0, "OTHER-DEFECT": 0}
         if rc == 0:
             items = build_items(root, tmpdir, args.limit)
