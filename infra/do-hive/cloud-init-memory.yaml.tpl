@@ -468,11 +468,11 @@ write_files:
       chown aimemory:aimemory /etc/ai-memory/store-url
       chmod 0600 /etc/ai-memory/store-url
 
-      # --- build + install certified pgvector 0.8.6 against PG18 ---
-      # Build the exact certified v0.8.6 tag rather than accepting apt drift.
+      # --- build + install certified pgvector 0.8.7 against PG18 ---
+      # Build the exact certified v0.8.7 tag rather than accepting apt drift.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
         rm -rf /opt/pgvector-src
-        git clone --branch v0.8.6 --depth 1 https://github.com/pgvector/pgvector.git /opt/pgvector-src
+        git clone --branch v0.8.7 --depth 1 https://github.com/pgvector/pgvector.git /opt/pgvector-src
         cd /opt/pgvector-src
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
