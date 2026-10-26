@@ -296,6 +296,12 @@ def workflow_problems(ci):
     for job_name, job_body in (('classify', classify), ('check', check)):
         if re.search(r'^    continue-on-error:', job_body, re.M):
             problems.append('the %s job must have no job-level continue-on-error (a failed leg must stay red)' % job_name)
+        # #8174 code r4 F1: no step of a gate job may soften a refusal, at any indent and in any
+        # spelling (`continue-on-error:true`, `continue-on-error: ${{ ... }}`).
+        for number, line in enumerate(job_body.split('\n'), 1):
+            if line.strip().startswith('continue-on-error'):
+                problems.append('the %s job must not use continue-on-error at any indent (line %d: %r)'
+                                % (job_name, number, line.strip()))
     # The step ends only at the next list item or the end of the job: comment and blank
     # lines inside it still belong to the step.
     m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\Z)', classify, re.S)
@@ -406,6 +412,15 @@ class WorkflowWiring(unittest.TestCase):
         for b in blocks:
             if is_exempt(b):
                 self.assertNotIn('cargo', step_field(b, 'run') or '')
+
+    def test_step_level_continue_on_error_is_a_named_defect(self):
+        # #8174 code r4 F1: the defect quotes the line and its 1-based line within the job text.
+        ci = CI_YML.read_text()
+        mutated = ci.replace('      - id: cls\n', '      - id: cls\n        continue-on-error: true\n', 1)
+        line_no = job_text(mutated, 'classify').split('\n').index('        continue-on-error: true') + 1
+        want = ("the classify job must not use continue-on-error at any indent (line %d: "
+                "'continue-on-error: true')" % line_no)
+        self.assertIn(want, workflow_problems(mutated))
 
     def test_notice_escapes_hostile_refs(self):
         # #8174 security r2 F1: `%` is a legal refname byte and the runner decodes it.
