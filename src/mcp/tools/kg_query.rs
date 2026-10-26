@@ -454,7 +454,7 @@ mod visibility_1935_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.db");
         let c = crate::db::open(&path).expect("db::open");
-        std::mem::forget(dir);
+        crate::test_tmp_retain::retain(dir);
         c
     }
 

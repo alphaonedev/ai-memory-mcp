@@ -23,6 +23,8 @@
     clippy::similar_names
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 mod wake_hub_harness;
 
 use std::path::PathBuf;
@@ -58,10 +60,10 @@ fn uid(prefix: &str) -> String {
 }
 
 fn temp_db() -> PathBuf {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
+    tmp_retain::retain(f);
     db_path
 }
 
@@ -641,10 +643,10 @@ fn publish_allowlist(
     out: &std::path::Path,
     rows: &[ai_memory::wake_hub::delegation_verifier::AllowlistEntry],
 ) {
-    let db = tempfile::NamedTempFile::new().expect("tempfile");
+    let db = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let db_path = db.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(db);
+    tmp_retain::retain(db);
     let snapshot = ai_memory::cli::identity_hub_cache::derive_with_extra(
         &db_path,
         None,

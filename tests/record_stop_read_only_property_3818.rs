@@ -29,6 +29,7 @@
 //! STAY LIVE" (a read-freeze is deferred to v1.1 R6): a read tool staying live is
 //! correct; it must merely not MUTATE.
 
+use common::tmp_retain;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod common;
@@ -75,8 +76,8 @@ fn call(tool: &str, args: &Value) -> Value {
     json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}})
 }
 
-fn open_db() -> (tempfile::NamedTempFile, rusqlite::Connection) {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+fn open_db() -> (crate::tmp_retain::SidecarTempFile, rusqlite::Connection) {
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("open db");
     (tmp, conn)
 }

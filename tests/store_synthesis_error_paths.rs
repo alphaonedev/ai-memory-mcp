@@ -70,6 +70,8 @@
     clippy::cast_precision_loss
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -117,7 +119,9 @@ fn fresh_db_path() -> PathBuf {
     permissive_attestation_for_tests();
     let root = local_runs_root();
     std::fs::create_dir_all(&root).ok();
-    root.join(format!("store-syn-err-{}.db", uuid::Uuid::new_v4()))
+    let p = root.join(format!("store-syn-err-{}.db", uuid::Uuid::new_v4()));
+    tmp_retain::retain(tmp_retain::DbFiles::new(p.clone()));
+    p
 }
 
 fn open_db() -> (Connection, PathBuf) {

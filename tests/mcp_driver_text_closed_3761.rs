@@ -21,9 +21,9 @@
 #![allow(clippy::missing_panics_doc)]
 
 use ai_memory::mcp::error_text::DB_ERROR_TEXT;
+use common::tmp_retain;
 use serde_json::json;
 
-#[cfg(feature = "sal")]
 mod common;
 
 fn open_mem() -> rusqlite::Connection {
@@ -141,7 +141,7 @@ fn namespace_bind_read_fault_refuses_closed_3761() {
 fn namespace_ownership_refusal_passes_through_3761() {
     unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") };
     unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-    let dir = tempfile::NamedTempFile::new().expect("tempfile");
+    let dir = tmp_retain::SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(dir.path()).expect("open");
     let ttl = ai_memory::config::ResolvedTtl::default();
     let owner = "ai:owner-3761";

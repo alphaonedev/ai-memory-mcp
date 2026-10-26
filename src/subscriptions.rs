@@ -3500,7 +3500,7 @@ mod tests {
     // The pre-W12 tests covered URL validation thoroughly but left the
     // DB-touching paths (`insert`, `delete`, `list`, `dispatch_event`,
     // `record_dispatch`, `load_secret_hash`) and the HTTP send path
-    // (`send`) at 0 % coverage.  These tests use a `tempfile::NamedTempFile`
+    // (`send`) at 0 % coverage.  These tests use a `crate::test_tmp_retain::SidecarTempFile`
     // to back a real on-disk SQLite (so dispatch threads can re-open the
     // connection via `Connection::open(db_path)`) and an in-process TLS
     // receiver for HTTP (#3705 — plaintext targets are refused, so the
@@ -3514,13 +3514,13 @@ mod tests {
     //     `llm.rs::wiremock_tests`.
     // ----------------------------------------------------------------
 
-    use tempfile::NamedTempFile;
+    use crate::test_tmp_retain::SidecarTempFile;
 
     /// Stand up a fresh on-disk SQLite at a tempfile path with the
     /// production schema applied. Returns the path and keeps the file
-    /// alive via the returned `NamedTempFile` (drop deletes it).
-    fn fresh_db() -> (NamedTempFile, std::path::PathBuf) {
-        let f = NamedTempFile::new().expect("tempfile");
+    /// alive via the returned `SidecarTempFile` (drop deletes it).
+    fn fresh_db() -> (SidecarTempFile, std::path::PathBuf) {
+        let f = SidecarTempFile::new().expect("tempfile");
         let p = f.path().to_path_buf();
         // Apply schema via the production opener so migrations run.
         let _ = crate::db::open(&p).expect("db::open");

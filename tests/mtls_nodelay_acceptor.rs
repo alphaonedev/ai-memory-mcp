@@ -29,6 +29,8 @@
 //!    (and really did NOT on the legacy path — proving the bug existed and
 //!    that the behavioural delta is exactly the socket option).
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +54,7 @@ const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
 /// the committed fixture cert (`valid_cert.pem`).
 async fn mtls_config_pinning_fixture_cert() -> axum_server::tls_rustls::RustlsConfig {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let allowlist = tempfile::NamedTempFile::new().expect("tempfile");
+    let allowlist = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let fp = std::fs::read_to_string(fixture("valid_cert_sha256.txt"))
         .expect("fixture fingerprint — regenerate via tests/fixtures/tls/regenerate.sh");
     std::fs::write(allowlist.path(), fp).expect("write allowlist");
@@ -298,7 +300,7 @@ async fn peer_binding_resolved(
     let config = mtls_config_pinning_fixture_cert().await;
     let bindings = match binding_body {
         Some(body) => {
-            let f = tempfile::NamedTempFile::new().expect("tempfile");
+            let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
             std::fs::write(f.path(), body).expect("write binding map");
             tls::load_cert_peer_binding_map(f.path()).expect("parse binding map")
         }

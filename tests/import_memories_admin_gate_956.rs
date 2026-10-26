@@ -5,14 +5,16 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -134,7 +136,7 @@ fn read_metadata(db_path: &std::path::Path, id: &str) -> Option<Value> {
 
 #[tokio::test]
 async fn non_admin_caller_gets_403_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router = build_router_fixture_with_admin(db_path, vec!["ops:admin".into()]);
     let mem_id = "11111111-1111-4111-8111-111111111111";
@@ -148,7 +150,7 @@ async fn non_admin_caller_gets_403_956() {
 
 #[tokio::test]
 async fn admin_caller_can_import_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router = build_router_fixture_with_admin(db_path, vec!["ops:admin".into()]);
     let mem_id = "22222222-2222-4222-8222-222222222222";
@@ -160,7 +162,7 @@ async fn admin_caller_can_import_956() {
 
 #[tokio::test]
 async fn missing_agent_id_header_gets_403_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router = build_router_fixture_with_admin(db_path, vec!["ops:admin".into()]);
     let body = json!({"memories": [body_memory("33333333-3333-4333-8333-333333333333", "import-956/c", json!({"agent_id": "alice"}))]});
@@ -171,7 +173,7 @@ async fn missing_agent_id_header_gets_403_956() {
 
 #[tokio::test]
 async fn empty_allowlist_rejects_every_caller_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router = build_router_fixture_with_admin(db_path, vec![]);
     for caller in &["ops:admin", "bob", "alice", "root"] {
@@ -188,7 +190,7 @@ async fn empty_allowlist_rejects_every_caller_956() {
 
 #[tokio::test]
 async fn error_body_is_sanitised_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router =
         build_router_fixture_with_admin(db_path, vec!["ops:admin".into(), "ops:other".into()]);
@@ -200,7 +202,7 @@ async fn error_body_is_sanitised_956() {
 
 #[tokio::test]
 async fn admin_import_restamps_agent_id_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router = build_router_fixture_with_admin(db_path, vec!["ops:admin".into()]);
     let mem_id = "66666666-6666-4666-8666-666666666666";
@@ -223,7 +225,7 @@ async fn admin_import_restamps_agent_id_956() {
 
 #[tokio::test]
 async fn admin_import_preserves_when_body_matches_caller_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router = build_router_fixture_with_admin(db_path, vec!["ops:admin".into()]);
     let mem_id = "77777777-7777-4777-8777-777777777777";
@@ -238,7 +240,7 @@ async fn admin_import_preserves_when_body_matches_caller_956() {
 
 #[tokio::test]
 async fn admin_import_metadata_absent_agent_id_stamps_caller_956() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     let router = build_router_fixture_with_admin(db_path, vec!["ops:admin".into()]);
     let mem_id = "88888888-8888-4888-8888-888888888888";

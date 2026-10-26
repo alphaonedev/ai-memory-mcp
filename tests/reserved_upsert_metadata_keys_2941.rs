@@ -38,9 +38,11 @@
 //! Layer 2 is only sound while both backends preserve the SAME set, so
 //! the first two tests here are the anti-drift gate for that.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
+use crate::tmp_retain::SidecarTempFile;
 use base64::Engine as _;
 use serde_json::json;
-use tempfile::NamedTempFile;
 
 use ai_memory::config::ResolvedTtl;
 
@@ -172,7 +174,7 @@ fn bound_pubkey(conn: &rusqlite::Connection, agent_id: &str) -> Option<String> {
 /// — rather than an error.
 #[test]
 fn reregister_preserves_bound_pubkey_and_signed_store_stays_agent_attested() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
 

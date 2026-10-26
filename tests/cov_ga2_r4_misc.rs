@@ -63,6 +63,8 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::similar_names)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -111,9 +113,9 @@ fn permissive_attestation_for_tests() {
 /// default `StorageBackend::Sqlite`). The `app.store` SqliteStore opens
 /// against the SAME path so seed → read works through both the legacy
 /// `db` path and the SAL trait. Mirrors `tests/cov3_handlers_sqlite.rs`.
-fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
+fn sqlite_router() -> (axum::Router, crate::tmp_retain::SidecarTempFile) {
     permissive_attestation_for_tests();
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

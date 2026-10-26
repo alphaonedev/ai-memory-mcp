@@ -24,6 +24,8 @@
 //! in `resolve_inbound_attribution`) is unit-covered in
 //! `handlers::federation_receive::tests::rebroadcast_source_honors_crypto_attested_claim_2863`.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
@@ -44,9 +46,9 @@ fn build_app() -> ai_memory::handlers::AppState {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )

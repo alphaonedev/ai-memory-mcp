@@ -4,6 +4,8 @@
 //! Auto-tag envelope and caller/governance regressions in their own process.
 //! Test identity and probe-free APIs stay outside production source (#3523).
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::llm::OllamaClient;
 use ai_memory::mcp::tools::handle_auto_tag_for_tests as handle_auto_tag;
 use ai_memory::storage as db;
@@ -13,9 +15,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build a fresh in-memory SQLite DB (via a tempfile, since
 /// `:memory:` doesn't survive across the WAL pragma touch).
-fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
+fn fresh_db() -> (rusqlite::Connection, crate::tmp_retain::SidecarTempFile) {
     std::fs::create_dir_all(".local-runs").expect("scratch directory");
-    let tmp = tempfile::NamedTempFile::new_in(".local-runs").expect("tempfile");
+    let tmp = crate::tmp_retain::SidecarTempFile::new_in(".local-runs").expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
     (conn, tmp)
 }

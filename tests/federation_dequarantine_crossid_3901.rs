@@ -22,6 +22,8 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -119,9 +121,9 @@ async fn router(backend: &Backend) -> (axum::Router, Arc<dyn MemoryStore>, Db) {
     )));
     let (store, storage_backend): (Arc<dyn MemoryStore>, StorageBackend) = match backend {
         Backend::Sqlite => {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
             let p = tmp.path().to_path_buf();
-            std::mem::forget(tmp);
+            tmp_retain::retain(tmp);
             (
                 Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store")),
                 StorageBackend::Sqlite,

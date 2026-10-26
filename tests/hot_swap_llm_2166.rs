@@ -13,8 +13,11 @@
 //!   (c) egress=deny on reload → the client becomes `None` (disabled);
 //!   (d) concurrency — a swap concurrent to reads never panics/deadlocks.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::atomisation::curator::{Curator, LlmCurator};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
 use ai_memory::autonomy::AutonomyLlm as _;
@@ -25,7 +28,6 @@ use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::reload::{Swappable, SwappableLlm, resolve_and_build_mcp_llm};
 use ai_memory::storage;
 use serde_json::json;
-use tempfile::NamedTempFile;
 
 /// rustls 0.23 requires an explicit `CryptoProvider`. `install_default` is
 /// process-global; wrapping it in `OnceLock` makes concurrent first-use from
@@ -268,7 +270,7 @@ fn atomise_handler_from_client(
 // lifetime (silent stale-model + a signed-provenance lie).
 #[test]
 fn atomise_driven_after_swap_uses_new_model_2172() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SidecarTempFile::new().expect("tempfile");
     let conn = storage::open(tmp.path()).expect("open db");
 
     // Boot handler on the boot model.

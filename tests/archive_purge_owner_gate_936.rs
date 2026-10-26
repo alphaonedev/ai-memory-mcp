@@ -52,15 +52,17 @@
 //!    by the recipient even when the sender is a different agent
 //!    (mirrors the `is_visible_to_caller` semantic).
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -212,7 +214,7 @@ async fn purge_as(router: &axum::Router, caller: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn bob_cannot_purge_alice_rows_936() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_archived(db_path, "alice", "shared-936/a", &json!({}));
     assert_eq!(
@@ -243,7 +245,7 @@ async fn bob_cannot_purge_alice_rows_936() {
 
 #[tokio::test]
 async fn owner_can_purge_own_archived_rows_936() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_archived(db_path, "alice", "shared-936/b", &json!({}));
     assert_eq!(
@@ -269,7 +271,7 @@ async fn owner_can_purge_own_archived_rows_936() {
 
 #[tokio::test]
 async fn non_admin_caller_does_not_get_admin_owner_scope_936() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     // Mixed deployment — alice's + carol's rows in the archive.
     seed_archived(db_path, "alice", "mixed-936/a", &json!({}));
@@ -300,7 +302,7 @@ async fn non_admin_caller_does_not_get_admin_owner_scope_936() {
 
 #[tokio::test]
 async fn admin_caller_can_purge_cross_tenant_936() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_archived(db_path, "alice", "mixed-936/a", &json!({}));
     seed_archived(db_path, "carol", "mixed-936/c", &json!({}));
@@ -328,7 +330,7 @@ async fn admin_caller_can_purge_cross_tenant_936() {
 
 #[tokio::test]
 async fn inbox_target_carve_out_purgeable_by_recipient_936() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path();
     // Carol sent alice an inbox message; the row lives in alice's
     // `_inbox/alice` namespace with `metadata.agent_id = "carol"`

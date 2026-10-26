@@ -355,7 +355,7 @@ mod tests {
         let conn = crate::db::open(&path).expect("db::open");
         // Keep the tempdir alive by leaking it for the lifetime of this
         // test process (each test runs in its own DB).
-        std::mem::forget(dir);
+        crate::test_tmp_retain::retain(dir);
         conn
     }
 

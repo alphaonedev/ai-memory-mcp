@@ -11,6 +11,8 @@
 
 #[path = "forensic/bundle_test.rs"]
 mod bundle_test;
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 
 #[path = "forensic/wt1e_chain_test.rs"]
 mod wt1e_chain_test;

@@ -16,6 +16,8 @@
 // assertions; the pedantic `similar_names` lint is noise here.
 #![allow(clippy::similar_names)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 
 use ai_memory::governance::rules_store::{self, Rule};
@@ -75,7 +77,7 @@ fn fresh_db(tag: &str) -> Connection {
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     drop(ai_memory::db::open(&path).expect("init db"));
-    std::mem::forget(dir); // keep the file alive for the connection's lifetime
+    tmp_retain::retain(dir); // keep the file alive for the connection's lifetime
     ai_memory::db::open(&path).expect("open db")
 }
 

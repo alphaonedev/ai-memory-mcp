@@ -2010,7 +2010,7 @@ mod tests {
             .expect("tempdir");
         let path = dir.path().join("db.sqlite");
         drop(crate::db::open(&path).expect("init"));
-        std::mem::forget(dir);
+        crate::test_tmp_retain::retain(dir);
         crate::db::open(&path).expect("open")
     }
 

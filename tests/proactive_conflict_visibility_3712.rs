@@ -34,6 +34,7 @@
 #![allow(clippy::doc_markdown)]
 
 mod common;
+use common::tmp_retain;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -216,8 +217,8 @@ async fn mock_embed_server() -> MockServer {
     server
 }
 
-fn build_router(embed_base_url: &str) -> (axum::Router, Db, tempfile::NamedTempFile) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+fn build_router(embed_base_url: &str) -> (axum::Router, Db, crate::tmp_retain::SidecarTempFile) {
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

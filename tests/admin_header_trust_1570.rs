@@ -26,14 +26,17 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 const ADMIN_ID: &str = "ai:operator-alice";
@@ -53,8 +56,8 @@ fn fresh_dir() -> TempDir {
 
 /// Build an HTTP test fixture with `ADMIN_ID` on the admin allowlist
 /// and NO `api_key` configured (the unauthenticated default install).
-fn build_router() -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_router() -> (axum::Router, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

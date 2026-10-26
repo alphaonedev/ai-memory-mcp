@@ -26,6 +26,8 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -50,9 +52,9 @@ fn setup_router() -> axum::Router {
 }
 
 fn setup_router_with_path() -> (axum::Router, std::path::PathBuf) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
-    std::mem::forget(db_tmp);
+    tmp_retain::retain(db_tmp);
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((

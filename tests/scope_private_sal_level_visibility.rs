@@ -33,14 +33,16 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::models::{
     ConfidenceSource, Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier,
 };
 use ai_memory::store::{CallerContext, Filter, MemoryStore, sqlite::SqliteStore};
 use serde_json::json;
-use tempfile::NamedTempFile;
 
 const NS: &str = "shared-ns-sal-910";
 
@@ -77,8 +79,8 @@ fn make_memory(title: &str, content: &str, owner: &str, scope: &str) -> Memory {
     }
 }
 
-async fn fixture() -> (Arc<dyn MemoryStore>, NamedTempFile, String, String) {
-    let f = NamedTempFile::new().expect("tempfile");
+async fn fixture() -> (Arc<dyn MemoryStore>, SidecarTempFile, String, String) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let store: Arc<dyn MemoryStore> =
         Arc::new(SqliteStore::open(f.path()).expect("open SqliteStore"));
     let alice_ctx = CallerContext::for_agent("alice");

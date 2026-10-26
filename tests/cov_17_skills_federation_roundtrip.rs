@@ -42,6 +42,8 @@
     clippy::map_unwrap_or
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 
 use ai_memory::db;
@@ -67,6 +69,7 @@ fn fresh_db_at(label: &str) -> (rusqlite::Connection, PathBuf) {
     let root = local_runs_root();
     std::fs::create_dir_all(&root).ok();
     let path = root.join(format!("cov17-{}-{}.db", label, uuid::Uuid::new_v4()));
+    tmp_retain::retain(tmp_retain::DbFiles::new(path.clone()));
     let conn = db::open(&path).expect("db::open");
     (conn, path)
 }
@@ -111,6 +114,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
     // 1. Build authored skill folder (the operator's source artifact).
     // -----------------------------------------------------------------
     let workspace = local_runs_root().join(format!("cov17-ws-{}", uuid::Uuid::new_v4()));
+    tmp_retain::retain(tmp_retain::RemoveTree::new(workspace.clone()));
     std::fs::create_dir_all(&workspace).expect("mkdir workspace");
     let authored = workspace.join("authored-skill");
     write_authored_skill_folder(&authored);
@@ -289,6 +293,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
 #[test]
 fn skill_export_folder_is_self_contained_for_peer_import() {
     let workspace = local_runs_root().join(format!("cov17-sc-{}", uuid::Uuid::new_v4()));
+    tmp_retain::retain(tmp_retain::RemoveTree::new(workspace.clone()));
     std::fs::create_dir_all(&workspace).expect("mkdir workspace");
     let authored = workspace.join("authored");
     write_authored_skill_folder(&authored);

@@ -21,22 +21,24 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::{Arc, Mutex};
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::federation_wire_notes::{ENV_PREFIX, remediation, wire};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
 const UNENROLLED_PEER: &str = "peer-3204-unenrolled";
 
-fn build_router(storage_backend: StorageBackend) -> (axum::Router, NamedTempFile) {
+fn build_router(storage_backend: StorageBackend) -> (axum::Router, SidecarTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let file = NamedTempFile::new().expect("tempfile");
+    let file = SidecarTempFile::new().expect("tempfile");
     let path = file.path().to_path_buf();
     let conn = ai_memory::db::open(&path).expect("open DB");
     let db: Db = Arc::new(tokio::sync::Mutex::new((

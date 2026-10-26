@@ -13,12 +13,14 @@
 //! search wire shape (`{results, count}`) with a `source_uri` field
 //! echoed when the filter narrowed the result set.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -26,8 +28,8 @@ use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{Memory, Tier};
 
-fn build_test_router() -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_test_router() -> (axum::Router, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

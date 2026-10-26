@@ -26,6 +26,8 @@
     clippy::needless_pass_by_value
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 
 use ai_memory::config::ResolvedTtl;
@@ -65,6 +67,7 @@ fn open_db() -> (Connection, PathBuf) {
     let root = local_runs_root();
     std::fs::create_dir_all(&root).ok();
     let p = root.join(format!("issue-2122-synth-{}.db", uuid::Uuid::new_v4()));
+    tmp_retain::retain(tmp_retain::DbFiles::new(p.clone()));
     let conn = db::open(&p).expect("open db");
     (conn, p)
 }

@@ -29,15 +29,17 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -172,7 +174,7 @@ async fn forget_as(router: &axum::Router, caller: &str, namespace: &str) -> (Sta
 
 #[tokio::test]
 async fn non_admin_cannot_forget_memories_942() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SidecarTempFile::new().expect("tempfile");
     let _alice_id = seed_memory(
         tmp.path(),
         "ai:alice",
@@ -192,7 +194,7 @@ async fn non_admin_cannot_forget_memories_942() {
 
 #[tokio::test]
 async fn admin_can_forget_memories_942() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SidecarTempFile::new().expect("tempfile");
     let _alice_id = seed_memory(
         tmp.path(),
         "ai:alice",

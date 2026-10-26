@@ -245,7 +245,17 @@ pub fn local_ca_client(key_dir: &Path, deadline: Duration) -> Option<reqwest::bl
 /// `dir`, shared by every spawn in that binary.
 pub fn shared(dir: &Path) -> &'static TestTls {
     static SHARED: std::sync::OnceLock<TestTls> = std::sync::OnceLock::new();
-    SHARED.get_or_init(|| TestTls::generate(&dir.join(format!("tls-{}", std::process::id()))))
+    SHARED.get_or_init(|| {
+        // #6122: the per-process leaf directory is removed at process exit
+        // (a `static` is never dropped, so the old bare `create_dir` leaked it).
+        let leaf = tempfile::Builder::new()
+            .prefix(&format!("tls-{}-", std::process::id()))
+            .tempdir_in(dir)
+            .expect("tls leaf directory");
+        let tls = TestTls::generate(&leaf.path().join("leaf"));
+        super::tmp_retain::retain(leaf);
+        tls
+    })
 }
 
 /// Convenience for `Arc`-sharing across spawned tasks.

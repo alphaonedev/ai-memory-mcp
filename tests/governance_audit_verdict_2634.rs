@@ -28,6 +28,8 @@
 // from cross-test races and is never awaited on.
 #![allow(clippy::missing_panics_doc, clippy::await_holding_lock)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -98,8 +100,8 @@ fn decisions_for(dir: &std::path::Path, kind: &str, id_field: &str, id_val: &str
     out
 }
 
-fn open_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+fn open_db() -> (rusqlite::Connection, crate::tmp_retain::SidecarTempFile) {
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
     (conn, f)
 }
@@ -443,9 +445,9 @@ fn approval_signature(secret: &str, canonical: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-fn build_router() -> (axum::Router, tempfile::NamedTempFile, PathBuf) {
+fn build_router() -> (axum::Router, crate::tmp_retain::SidecarTempFile, PathBuf) {
     permissive_attestation();
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

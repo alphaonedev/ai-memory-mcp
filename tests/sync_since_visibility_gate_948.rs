@@ -54,6 +54,8 @@
 //!   allowlisted namespace is projected to every peer regardless of
 //!   the scope filter — confirms the post-filter doesn't over-block.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::models::ConfidenceSource;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -78,9 +80,9 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )

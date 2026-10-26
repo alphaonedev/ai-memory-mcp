@@ -58,6 +58,8 @@
     clippy::cast_sign_loss
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -96,7 +98,9 @@ fn local_runs_root() -> PathBuf {
 fn fresh_db_path(tag: &str) -> PathBuf {
     let root = local_runs_root();
     std::fs::create_dir_all(&root).ok();
-    root.join(format!("cluster-f-{tag}-{}.db", uuid::Uuid::new_v4()))
+    let p = root.join(format!("cluster-f-{tag}-{}.db", uuid::Uuid::new_v4()));
+    tmp_retain::retain(tmp_retain::DbFiles::new(p.clone()));
+    p
 }
 
 fn open_db(tag: &str) -> (Connection, PathBuf) {
