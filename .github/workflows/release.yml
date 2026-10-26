@@ -47,10 +47,12 @@ on:
 
 # #4719 - `packages: write` (GHCR push) is granted to the `docker` job only;
 # jobs without their own `permissions:` (supply-chain, crates-io) get
-# `contents: write` and nothing else. scripts/check_release_features.py pins
-# this block and every job's `permissions:`.
+# `contents: read` and nothing else (#8172: neither writes to GitHub); the jobs
+# that publish release assets declare `contents: write` themselves.
+# scripts/check_release_features.py pins this block and every job's
+# `permissions:`.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   # One release at a time, per tag.
@@ -89,6 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           # The workflow's own commit, NOT the tag: this checkout supplies
           # the trusted tooling. Full history so the tag object and the
           # ancestry check below are available.
@@ -198,6 +201,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ github.sha }}
 
       - name: Qualify the tagged SHA
@@ -229,6 +233,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
@@ -304,6 +309,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + target std
@@ -546,6 +552,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0
@@ -663,6 +670,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + iOS targets
@@ -807,6 +815,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 + Android targets
@@ -957,6 +966,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
@@ -1169,6 +1179,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Set up Docker Buildx
@@ -1233,6 +1244,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Extract version from tag

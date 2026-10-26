@@ -1643,6 +1643,8 @@ WORKFLOW_CANONICAL_LINES = (
     '    timeout-minutes: 5',
     '    steps:',
     '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    '        with:',
+    '          persist-credentials: false',
     '      - name: Guard the tracked CLAUDE.md and its reference files',
     '        run: python3 scripts/check-claude-md-size.py',
     '      - name: Guard self-test',

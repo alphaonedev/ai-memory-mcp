@@ -80,6 +80,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust 1.98.0 + iOS-sim target (matches rust-toolchain.toml pin)
         # MUST be @1.98.0, not @stable: the repo's rust-toolchain.toml
@@ -226,6 +228,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust 1.98.0 + Android x86_64 target (matches rust-toolchain.toml pin)
         # @1.98.0 (not @stable): same rust-toolchain.toml pin reasoning as
