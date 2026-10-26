@@ -23,7 +23,11 @@ every node):
       (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``), and no ``defaults:`` key
       exists. No shell is lexed, so no bash text shape can be misread. A comment, a flag or a word
       changed inside the step is refused on purpose. Maintenance cost: the expected tuples are
-      updated in the same PR as any edit to the step.
+      updated in the same PR as any edit to the step. The step's extent runs to the next non-blank
+      non-comment line at or below the dash indent (a key after a comment is still a step key), the
+      text is split on LF only and stripped of space, tab and CR only, and a non-ASCII or control
+      character in a step line is a named defect unless the line is itself a pinned line (the live
+      blocks print one em dash inside an echo string) or a comment that is not a line break.
 
 Run: python3 -m unittest discover -s scripts/ci/tests -p 'test_pg_workflows_fed_label_8174.py'
 """
@@ -191,8 +195,17 @@ EXPECTED_POINT_AT_RUN_IGNORED = (
 )
 
 
+PIN_WS = " \t\r"  # the only characters the pin strips: the runner shell is not Unicode-aware
+
+
+def split_lines(text):
+    """Split on LF only: str.splitlines() also splits on U+2028, U+0085 and others the shell keeps."""
+    parts = text.split("\n")
+    return parts[:-1] if parts and parts[-1] == "" else parts
+
+
 def lines_of(path):
-    return path.read_text(encoding="utf-8").splitlines()
+    return split_lines(path.read_text(encoding="utf-8"))
 
 
 def runs_on_lists(path):
@@ -233,9 +246,10 @@ def run_blocks_of(lines):
 
 
 STEP_NAME = "Point at the native enterprise-fed tier (per-job ephemeral db)"
-STEP_NAME_RX = re.compile(r"^\s*- name:\s*" + re.escape(STEP_NAME) + r"\s*$")
+# A step is a list item at exactly 6 spaces; the same words as data deeper inside a run block are not one.
+STEP_NAME_RX = re.compile(r"^      - name: *" + re.escape(STEP_NAME) + r"[ \t\r]*$")
 KEY_RX = re.compile(r"^([A-Za-z_][\w-]*)\s*:")
-DEFAULTS_RX = re.compile(r"^\s*defaults\s*:")
+DEFAULTS_RX = re.compile(r"^[ \t]*([\"']?)defaults\1[ \t]*:")
 BODY_DIFFERS = "step body differs from the pinned text at line "
 PINNED_OUTSIDE_TOKENS = ("ensure-age-extension.py", "RUNNER_OS")
 EXPECTED_BY_WORKFLOW = {
@@ -245,7 +259,13 @@ EXPECTED_BY_WORKFLOW = {
 
 
 def indent_of(line):
-    return len(line) - len(line.lstrip())
+    return len(line) - len(line.lstrip(" "))
+
+
+def is_skipped(line):
+    """Blank or comment line: YAML ignores its indentation, so it never ends a step."""
+    text = line.strip(PIN_WS)
+    return not text or text.startswith("#")
 
 
 def as_lines(source):
@@ -274,27 +294,56 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
         return ["step named %r occurs %d times, expected exactly 1" % (STEP_NAME, len(heads))]
     at = heads[0]
     dash = indent_of(lines[at])
+    # decision: the step's extent ends at the next non-blank non-comment line at or below the dash
+    # indent and the key scan covers the whole extent, over stopping at the first comment, because
+    # YAML ignores comment indentation and a key written after a comment is still a step key
+    # (fail-closed precedent PR 8252 cd57f84db; LOW with precedent, no vote).
     end = at + 1
-    while end < len(lines) and (not lines[end].strip() or indent_of(lines[end]) > dash):
+    while end < len(lines) and (is_skipped(lines[end]) or indent_of(lines[end]) > dash):
         end += 1
     defects = []
+    # decision: ASCII-only step text with a "\n"-only split and " \t\r"-only strip over Unicode-aware
+    # splitlines/strip because the runner shell reads bytes and the pin must compare what the shell
+    # executes (byte-for-byte docstring at :18; LOW with precedent, no vote).
+    # The two live run blocks print an em dash inside an echo string; a line is exempt only when its
+    # stripped text IS a line of the pinned tuple (the body pin below then compares it byte for byte).
+    # A comment line may carry printable non-ASCII (the live HOSTED ONLY block does) but never a control
+    # character or a Unicode line break; a comment inside the run body is also compared by the body pin.
+    for i in range(at, end):
+        stripped = lines[i].strip(PIN_WS)
+        if stripped in expected:
+            continue
+        comment = stripped.startswith("#")
+        for ch in lines[i].rstrip("\r"):
+            bad_control = (ord(ch) < 32 and ch != "\t") or ord(ch) in (127, 0x85, 0x2028, 0x2029)
+            if bad_control or (ord(ch) > 126 and not comment):
+                defects.append(
+                    "step line %d carries U+%04X (non-ASCII or control character): %s"
+                    % (i + 1, ord(ch), ascii(lines[i].strip(PIN_WS)))
+                )
+                break
+    if defects:
+        return defects
     keys = []
     for i in range(at + 1, end):
-        text = lines[i].strip()
+        text = lines[i].strip(PIN_WS)
         if text and not text.startswith("#") and indent_of(lines[i]) == dash + 2:
             hit = KEY_RX.match(text)
             keys.append((i, hit.group(1) if hit else text))
-    defects += ["step has a key other than name and run: " + k for _, k in keys if k != "run"]
+    defects += ["step has a key other than name and run: " + k for _, k in keys if k not in ("name", "run")]
     runs = [i for i, k in keys if k == "run"]
     inside = range(0)
     if len(runs) != 1:
         defects.append("step has %d run keys, expected exactly 1" % len(runs))
-    elif lines[runs[0]].strip() != "run: |":
-        defects.append("step run key is not a literal block: " + lines[runs[0]].strip())
+    elif lines[runs[0]].strip(PIN_WS) != "run: |":
+        defects.append("step run key is not a literal block: " + lines[runs[0]].strip(PIN_WS))
     else:
-        body_end = next((i for i, _ in keys if i > runs[0]), end)
+        # The run body ends at the first non-blank line at or below the key indent, comment or not.
+        body_end = runs[0] + 1
+        while body_end < len(lines) and (not lines[body_end].strip(PIN_WS) or indent_of(lines[body_end]) > dash + 2):
+            body_end += 1
         inside = range(runs[0] + 1, body_end)
-        got = [lines[i].strip() for i in inside if lines[i].strip()]
+        got = [lines[i].strip(PIN_WS) for i in inside if lines[i].strip(PIN_WS)]
         for k, (g, w) in enumerate(zip_longest(got, expected), 1):
             if g != w:
                 defects.append(
@@ -304,11 +353,11 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
                 break
     for i, ln in enumerate(lines):
         if DEFAULTS_RX.match(ln):
-            defects.append("defaults: key in the workflow: " + ln.strip())
+            defects.append("defaults: key in the workflow: " + ln.strip(PIN_WS))
         if i in inside:
             continue
         defects += [
-            "%s outside the Point-at run block: %s" % (tok, ln.strip())
+            "%s outside the Point-at run block: %s" % (tok, ln.strip(PIN_WS))
             for tok in PINNED_OUTSIDE_TOKENS
             if tok in ln
         ]
@@ -787,7 +836,11 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
 
     def test_r9_comment_after_the_step_is_accepted(self):
         """Control: the live cert shape (indent-6 comment block after the step) and a trailing indent-8 comment."""
-        for idx, comment in ((1, None), (0, ("      # trailing at indent 6",))):
+        for idx, comment in (
+            (1, None),
+            (0, ("      # trailing at indent 6",)),
+            (0, ("        # trailing at indent 8",)),
+        ):
             with self.subTest(comment=comment):
                 lines = WORKFLOWS[idx].read_text(encoding="utf-8").splitlines()
                 if comment:
