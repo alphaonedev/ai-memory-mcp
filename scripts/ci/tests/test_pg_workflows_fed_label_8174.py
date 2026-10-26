@@ -175,6 +175,12 @@ MUTATIONS = {
         GUARD_END,
         "            :\n            fi\n" + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True)),
     ),
+    "M20 one-line if/fi in the guard, heal after the real fi, later mid-line if (sec r4 F1 = code r4 O1)": (
+        GUARD_END,
+        "            if true; then :; fi\n          fi\n"
+        + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True))
+        + "          x=1; if true; then\n            :\n          fi\n",
+    ),
     "M12 nproc added": (GUARD_END, GUARD_END + "          nproc\n"),
     "M13 /proc/meminfo added": (GUARD_END, GUARD_END + "          cat /proc/meminfo\n"),
     "M14 postgresql bin loop without homebrew twin": (
@@ -232,6 +238,16 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         for path in WORKFLOWS:
             with self.subTest(workflow=path.name):
                 self.assertEqual(macos_defects(lines_of(path)), [])
+
+    def test_uncountable_if_fi_line_in_guard_is_a_named_defect(self):
+        """sec r4 F1: an if/fi the per-line rule cannot count is reported, never a late guard end."""
+        base = WORKFLOWS[0].read_text(encoding="utf-8")
+        name = next(n for n in MUTATIONS if n.startswith("M20"))
+        old, new = MUTATIONS[name]
+        got = heal_defects(base.replace(old, new, 1).splitlines())
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("uncountable if/fi", got[0])
+        self.assertIn("if true; then :; fi", got[0])
 
     def test_every_mutation_row_is_detected(self):
         """code r1 F1/F2: each of M11-M14 applied to an in-memory copy must be reported."""
