@@ -224,6 +224,28 @@ MUTATIONS = {
         + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True))
         + '          echo "a\n          fi\n          b"\n',
     ),
+    "M24 mixed-quote multi-line string hides if x / fi, heal after the real fi (code r6 x9 = sec r6 y1)": (
+        GUARD_END,
+        "            echo \"'\" '\n            if x\n            x' \"'\"\n            fi\n"
+        + HEAL_CALL
+        + "            echo \"'\" '\n          fi\n          x' \"'\"\n",
+    ),
+    "M25 backslash inside single quotes hides if x / fi, heal after the real fi (code r6 x10 = sec r6 y2)": (
+        GUARD_END,
+        "            echo 'a\\'b'\n            if x\n            x\\'\n            fi\n"
+        + HEAL_CALL
+        + "            echo 'a\\'b'\n          fi\n          x\\'\n",
+    ),
+    "M26 heal call is data inside a mixed-quote string in the guard (code r6 x11)": (
+        GUARD_END,
+        "            echo \"'\" '\n" + HEAL_CALL + "            x' \"'\"\n          fi\n",
+    ),
+    "M27 multi-line (( )) names if / fi as variables, heal after the real fi (sec r6 y3)": (
+        GUARD_END,
+        "            (( a = 0 +\n            if +\n            1 ))\n            fi\n"
+        + HEAL_CALL
+        + "            (( a = 0 +\n          fi\n          + 1 ))\n",
+    ),
     "M12 nproc added": (GUARD_END, GUARD_END + "          nproc\n"),
     "M13 /proc/meminfo added": (GUARD_END, GUARD_END + "          cat /proc/meminfo\n"),
     "M14 postgresql bin loop without homebrew twin": (
