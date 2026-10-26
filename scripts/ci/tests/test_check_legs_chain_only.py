@@ -27,8 +27,10 @@ DOCS_GUARD = "needs.classify.outputs.docs_only != 'true'"
 NOTICE_STEP_NAME = 'name: Enterprise-fed leg inactive on this run (#8174)'
 # Steps of `check` that may run without the tier guard, named exactly as ci.yml spells
 # them: the checkout, the docs-only short-circuit and the inactive-leg notice.
+DOCS_ONLY_STEP_NAME = 'name: docs-only short-circuit'
+DOCS_ONLY_STEP_IF = "needs.classify.outputs.docs_only == 'true'"
 TIER_GUARD_EXEMPT_STEPS = (
-    'name: docs-only short-circuit',
+    DOCS_ONLY_STEP_NAME,
     NOTICE_STEP_NAME,
 )
 # The checkout is pinned to a full commit sha plus an optional trailing version comment.
@@ -246,6 +248,20 @@ def workflow_problems(ci):
     guarded = [b for b in step_blocks(check) if DOCS_GUARD in b]
     if len(guarded) < 30:
         problems.append('expected >= 30 docs-only guarded steps in Check, found %d' % len(guarded))
+    blocks = step_blocks(check)
+    firsts = [blk.split('\n')[0].rstrip() for blk in blocks]
+    for exempt_name in TIER_GUARD_EXEMPT_STEPS:
+        if firsts.count(exempt_name) != 1:
+            problems.append('exempt step %r must occur exactly once in Check, found %d'
+                            % (exempt_name, firsts.count(exempt_name)))
+    for block in blocks:
+        if not is_exempt(block):
+            continue
+        if 'cargo' in (step_field(block, 'run') or ''):
+            problems.append('exempt step must not run cargo: %s' % block.split('\n')[0][:80])
+        if block.startswith(DOCS_ONLY_STEP_NAME) and step_field(block, 'if') != DOCS_ONLY_STEP_IF:
+            problems.append('docs-only short-circuit if must be exactly %r, got %r'
+                            % (DOCS_ONLY_STEP_IF, step_field(block, 'if')))
     for block in step_blocks(check):
         if is_exempt(block):
             continue
@@ -277,8 +293,9 @@ def workflow_problems(ci):
                 problems.append('inactive-leg notice missing %r' % needle)
     if 'check_tiers: ${{ steps.legs.outputs.check_tiers }}' not in classify:
         problems.append('classify must export check_tiers from steps.legs')
-    if re.search(r'^    continue-on-error:', classify, re.M):
-        problems.append('the classify job must have no job-level continue-on-error (a failed classify must stay red)')
+    for job_name, job_body in (('classify', classify), ('check', check)):
+        if re.search(r'^    continue-on-error:', job_body, re.M):
+            problems.append('the %s job must have no job-level continue-on-error (a failed leg must stay red)' % job_name)
     # The step ends only at the next list item or the end of the job: comment and blank
     # lines inside it still belong to the step.
     m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\Z)', classify, re.S)
@@ -377,6 +394,18 @@ class DecisionScript(unittest.TestCase):
 class WorkflowWiring(unittest.TestCase):
     def test_workflow_has_no_problems(self):
         self.assertEqual(workflow_problems(CI_YML.read_text()), [])
+
+    def test_exempt_steps_are_unique_exact_and_cargo_free(self):
+        # #8174 code r3 F1: each exempt name occurs once, the docs-only `if` is exact, no cargo.
+        blocks = step_blocks(job_text(CI_YML.read_text(), 'check'))
+        firsts = [b.split('\n')[0].rstrip() for b in blocks]
+        for name in TIER_GUARD_EXEMPT_STEPS:
+            self.assertEqual(firsts.count(name), 1, name)
+        docs = [b for b in blocks if b.startswith(DOCS_ONLY_STEP_NAME)][0]
+        self.assertEqual(step_field(docs, 'if'), DOCS_ONLY_STEP_IF)
+        for b in blocks:
+            if is_exempt(b):
+                self.assertNotIn('cargo', step_field(b, 'run') or '')
 
     def test_notice_escapes_hostile_refs(self):
         # #8174 security r2 F1: `%` is a legal refname byte and the runner decodes it.
