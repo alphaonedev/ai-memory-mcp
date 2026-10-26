@@ -28,10 +28,11 @@ NOTICE_STEP_NAME = 'name: Enterprise-fed leg inactive on this run (#8174)'
 # Steps of `check` that may run without the tier guard, named exactly as ci.yml spells
 # them: the checkout, the docs-only short-circuit and the inactive-leg notice.
 TIER_GUARD_EXEMPT_STEPS = (
-    'uses: actions/checkout@',
     'name: docs-only short-circuit',
     NOTICE_STEP_NAME,
 )
+# The checkout is pinned to a full commit sha plus an optional trailing version comment.
+CHECKOUT_STEP_RE = re.compile(r'^uses: actions/checkout@[0-9a-f]{40}( # v[0-9.]+)?$')
 RUNS_ON = ("runs-on: ${{ fromJSON(contains(needs.classify.outputs.check_tiers, matrix.tier)"
            " && matrix.runner || '[\"ubuntu-latest\"]') }}")
 
@@ -113,7 +114,9 @@ def step_blocks(job):
 
 
 def is_exempt(block):
-    return any(block.startswith(prefix) for prefix in TIER_GUARD_EXEMPT_STEPS)
+    """Exact match of the step's first line against the documented exempt set."""
+    first = block.split('\n')[0].rstrip()
+    return first in TIER_GUARD_EXEMPT_STEPS or CHECKOUT_STEP_RE.match(first) is not None
 
 
 def step_field(block, key):
@@ -270,7 +273,11 @@ def workflow_problems(ci):
                 problems.append('inactive-leg notice missing %r' % needle)
     if 'check_tiers: ${{ steps.legs.outputs.check_tiers }}' not in classify:
         problems.append('classify must export check_tiers from steps.legs')
-    m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\n      # |\Z)', classify, re.S)
+    if re.search(r'^    continue-on-error:', classify, re.M):
+        problems.append('the classify job must have no job-level continue-on-error (a failed classify must stay red)')
+    # The step ends only at the next list item or the end of the job: comment and blank
+    # lines inside it still belong to the step.
+    m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\Z)', classify, re.S)
     if not m:
         problems.append('classify step `id: legs` not found')
     else:
