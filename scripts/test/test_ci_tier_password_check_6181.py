@@ -8663,6 +8663,28 @@ class TestTheCanaryDocstringsDescribeTheShippedMechanism8187R33(unittest.TestCas
         doc = TestRuntimeCanaryRunsTheWholeModule8187R29.__doc__
         self.assertNotIn("reader's", doc)
         self.assertIn("tb_locals=forced", doc)
+R33_RULE = "=" * 70
+R33_FORCED_BLOCK = (
+    "FAIL: test_a (mod.Case.test_a)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+    '  File "hook.py", line 9, in forced\n    raise error\nAssertionError: forced failure after the test body\n')
+R33_REAL_BLOCK_WITH_LOCALS = (
+    "FAIL: test_b (mod.Case.test_b)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+    '  File "mod.py", line 5, in test_b\n    self.assertEqual(text, 1)\n    text = \'AssertionError: forced failure after the test body\'\n'
+    "AssertionError: 'x' != 1\n")
+
+
+class TestRealFailuresAreKeyedOnTheBlockEnd8187R33(unittest.TestCase):
+    """r33 security r32 observation: a block was dropped from ``real_failures`` when the forced message appeared anywhere in it, so a
+    real failure whose frame locals (``tb_locals``) hold that text was lost.  Only the block's closing exception line decides."""
+
+    def test_a_real_failure_with_the_forced_text_in_its_locals_is_kept(self):
+        report = R33_RULE + "\n" + R33_REAL_BLOCK_WITH_LOCALS
+        self.assertEqual(canary.real_failure_heads(report), ["FAIL: test_b"])
+
+    def test_the_forced_test_own_block_is_dropped(self):
+        report = R33_RULE + "\n" + R33_FORCED_BLOCK + "\n" + R33_RULE + "\n" + R33_REAL_BLOCK_WITH_LOCALS
+        self.assertEqual(canary.real_failure_heads(report), ["FAIL: test_b"])
+        self.assertEqual(canary.real_failure_heads(R33_RULE + "\n" + R33_FORCED_BLOCK), [])
 # ---- r33 END ----
 
 

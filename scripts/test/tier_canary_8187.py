@@ -454,6 +454,19 @@ def parse_junit(path):
     return ran, skipped
 
 
+FORCED_MESSAGE = "forced failure after the test body"
+
+
+def real_failure_heads(stderr_text):
+    """The ``FAIL:`` / ``ERROR:`` names in a unittest report whose block is not the forced error."""
+    heads = []
+    for block in stderr_text.split("=" * 70):
+        head = block.strip().split("\n", 1)[0]
+        if head.startswith(("FAIL:", "ERROR:")) and FORCED_MESSAGE not in block:
+            heads.append(head.split(" (", 1)[0])
+    return heads
+
+
 def run_child(leg, copy, snapshot, marker, out_root, name=CANARY_MODULE, only=None, scan_files=True, timeout=None):
     """One child run in ``copy``; the channels (stdout, stderr, junit, new or changed files) are scanned for the marker.
     ``leg`` is ``(interpreter, runner, cwd_mode, mode)``."""
@@ -487,10 +500,7 @@ def run_child(leg, copy, snapshot, marker, out_root, name=CANARY_MODULE, only=No
         for transform, offset in scan_bytes(data, marker):
             result.hits.append((transform, channel, offset))
     if runner == "unittest":
-        for block in channels[1][1].decode("utf-8", "replace").split("=" * 70):
-            head = block.strip().split("\n", 1)[0]
-            if head.startswith(("FAIL:", "ERROR:")) and "forced failure after the test body" not in block:
-                result.real_failures.append(head.split(" (", 1)[0])
+        result.real_failures.extend(real_failure_heads(channels[1][1].decode("utf-8", "replace")))
     if runner == "unittest" and (out_dir / "unittest.json").exists():
         data = json.loads((out_dir / "unittest.json").read_text(encoding="utf-8"))
         result.ran, result.skipped = set(data["ran"]), set(data["skipped"])
