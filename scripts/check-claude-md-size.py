@@ -1643,6 +1643,8 @@ WORKFLOW_CANONICAL_LINES = (
     '    timeout-minutes: 5',
     '    steps:',
     '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    '        with:',
+    '          persist-credentials: false',
     '      - name: Guard the tracked CLAUDE.md and its reference files',
     '        run: python3 scripts/check-claude-md-size.py',
     '      - name: Guard self-test',
@@ -2186,7 +2188,7 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
         if old:
             target.write_text(good.replace(old, new, 1), encoding="utf-8")
         try:
-            res = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(live)], capture_output=True,
+            res = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), str(live)], capture_output=True,
                                  text=True, check=False, timeout=300)
             rc, stream = res.returncode, (res.stdout if want_rc == 0 else res.stderr)
         except (OSError, subprocess.SubprocessError) as exc:

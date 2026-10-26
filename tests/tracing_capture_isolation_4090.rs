@@ -52,6 +52,7 @@ const HELPERS: &[(&str, &str)] = &[
     ("src/mcp/span_capture_4088_tests.rs", "run_with_capture"),
     ("src/mcp/provider_echo_sinks_3648_tests.rs", "assert_sink"),
     ("src/mcp/provider_echo_sinks_3648_tests.rs", "run_matrix"),
+    ("src/subscriptions/scan_failure.rs", "captured"),
 ];
 
 /// (file, enclosing fn, tracking): known-unguarded sites whose guard is
