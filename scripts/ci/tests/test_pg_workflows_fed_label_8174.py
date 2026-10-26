@@ -95,6 +95,20 @@ def run_blocks_of(lines):
     return blocks
 
 
+def guard_end(body, start):
+    """Index of the ``fi`` that closes the ``if`` at body[start], by if/fi nesting depth (None if unclosed)."""
+    depth = 0
+    for i in range(start, len(body)):
+        word = body[i].strip()
+        if word.startswith("if "):
+            depth += 1
+        elif word == "fi":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 def heal_defects(lines):
     """The heal call must appear exactly once, inside the RUNNER_OS guard block of its step."""
     inside = 0
@@ -104,12 +118,9 @@ def heal_defects(lines):
         for n, ln in enumerate(body):
             if ln.strip() != HEAL_GUARD:
                 continue
-            indent = len(ln) - len(ln.lstrip())
-            end = next(
-                (i for i in range(n + 1, len(body))
-                 if body[i].strip() == "fi" and len(body[i]) - len(body[i].lstrip()) == indent),
-                len(body),
-            )
+            end = guard_end(body, n)
+            if end is None:
+                return ["RUNNER_OS guard has no closing fi"]
             inside += sum(HEAL_SCRIPT in x for x in body[n + 1:end])
     if inside != 1 or total != 1:
         return ["heal call not exactly once inside the guard"]
