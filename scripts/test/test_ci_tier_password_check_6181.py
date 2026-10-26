@@ -374,9 +374,9 @@ class TestTierPasswordWiring6181(unittest.TestCase):
             "no -I": (CALL, CALL.replace("python3 -I", "python3")),
             "|| true": (CALL, CALL[:-6] + " || true; then"),
             "exit 0": (CALL + "\n            exit 1", CALL + "\n            exit 0"),
-            # the canary copy injects an entry between ``env:`` and the comment, so the anchor allows that one optional line (r31)
-            "continue-on-error": (re.search(CONTINUE_PATTERN, text).group(0),
-                                  re.search(CONTINUE_PATTERN, text).group(0).replace("        env:\n", "        continue-on-error: true\n        env:\n", 1)),
+            # r31: the anchor sits after the env block, which the canary copy edits (it injects an entry into every env block)
+            "continue-on-error": (CONTINUE_ANCHOR_TEXT,
+                                  CONTINUE_ANCHOR_TEXT.replace("        run: |\n", "        continue-on-error: true\n        run: |\n", 1)),
             # #6671: edits that leave every line in place but make the check unreachable.
             "guarded by an if": (block, 'if [ "${CI_NODE:-}" = "never" ]; then\n          ' + block + "\n          fi"),
             "inside a function": (block, "tier_check() {\n          " + block + "\n          }"),
@@ -2241,7 +2241,8 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         self.assertIs(len(canary_uses) == 2 and all(re.search(r"@[0-9a-f]{40}$", u) for u in canary_uses), True)
 
 
-CONTINUE_PATTERN = r"        shell: bash\n        env:\n(?:          CANARY_CREDENTIAL: \S+\n)?          # matrix\.leg via env"
+CONTINUE_ANCHOR_TEXT = ("          CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}\n        run: |\n          set -euo pipefail\n"
+                        "          # psql lives under a platform-specific prefix.")
 
 
 def tier_job_of(text):
@@ -8529,7 +8530,7 @@ class TestBacktrackingIsSeenByTheSecondsGate8187R31(unittest.TestCase):
         self.assertEqual(F40E_SECONDS_RATIO_MAX, 3.0)
 
     def test_a_backtracking_search_passes_the_work_gate_and_fails_the_seconds_gate(self):
-        work_ratio, seconds_ratio = self.ratios(re.compile("a*b"), (4096, 8192), 3)
+        work_ratio, seconds_ratio = self.ratios(re.compile("a*b"), (16384, 32768), 3)
         print("backtracking probe a*b: work ratio %.2f (gate %.1f), seconds ratio %.2f (gate %.1f)" % (
             work_ratio, F40E_WORK_RATIO_MAX, seconds_ratio, F40E_SECONDS_RATIO_MAX))
         self.assertLess(work_ratio, F40E_WORK_RATIO_MAX)
