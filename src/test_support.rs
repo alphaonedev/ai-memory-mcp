@@ -690,3 +690,33 @@ pub(crate) fn count_error_and_debug_lines(sink: &CapturedLines) -> (usize, usize
     let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
     (count("ERROR"), count("DEBUG"))
 }
+
+/// Panics with `expected <expected>, got <label>` for an unexpected
+/// [`crate::config::KeySource`]. The label comes from `as_str` (never the
+/// `Debug` form, which would carry the key-source payload) per the #8179
+/// CodeQL fix; shared by the `config` key-resolution tests (#8179).
+#[cold]
+#[track_caller]
+pub(crate) fn key_panic(expected: &str, got: &crate::config::KeySource) -> ! {
+    panic!("expected {expected}, got {}", got.as_str())
+}
+
+#[test]
+fn key_panic_messages_pinned_8179() {
+    use crate::config::KeySource;
+    for e in [
+        "AliasFallback(XAI_API_KEY)",
+        "ConfigEnvVar(MY_CUSTOM_LLM_KEY)",
+        "KeySource::Error(lax perms)",
+        "AliasFallback(OPENROUTER_API_KEY)",
+        "ConfigEnvVar(MY_CUSTOM_EMBED_KEY)",
+        "KeySource::Error",
+    ] {
+        let r = std::panic::catch_unwind(|| key_panic(e, &KeySource::ProcessEnv));
+        let m = r.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(
+            *m,
+            format!("expected {e}, got {}", KeySource::ProcessEnv.as_str())
+        );
+    }
+}
