@@ -367,7 +367,7 @@ class Unit(str):
 # list does not pin (only the cleanup step runs `if: always()`), and none can be
 # added, dropped or reordered.
 SHAPE_STEPS: List[Spec] = [
-    {"uses": CHECKOUT_USES},
+    {"uses": CHECKOUT_USES, "with": {"persist-credentials": "false"}},
     {"name": "Install Rust 1.98.0 (matches rust-toolchain.toml pin)", "uses": "dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0"},
     {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
     {"name": "Release feature declaration guard", "run": "python3 scripts/check_release_features.py"},
