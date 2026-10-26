@@ -847,6 +847,85 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
                     lines = insert_lines(idx, "after_body", comment)
                 self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), [])
 
+    def _top_level_keys(self, lines):
+        return list(yaml.safe_load("\n".join(lines))) if yaml is not None else None
+
+    def _defaults_spelling(self, head, expected):
+        """Both workflows: PyYAML reads ``head`` as a top-level defaults key, the pin names it."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._text_defects_lines(idx, "jobs:\n", head + "  run:\n    shell: bash\njobs:\n")
+                keys = self._top_level_keys(lines)
+                if keys is not None:
+                    self.assertIn("defaults", keys)
+                self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), [expected])
+
+    def test_m47_double_quoted_defaults_key_spelled_with_a_hex_escape_is_refused(self):
+        """code r9 F1 (Q8): the escaped key is the key defaults for YAML; no decoder is needed to refuse it."""
+        self._defaults_spelling('"\\x64efaults":\n', 'escaped double-quoted key in the workflow: "\\x64efaults":')
+
+    def test_m48_explicit_key_form_of_the_defaults_key_is_refused(self):
+        """code r9 F1 (Q10): ``? defaults`` on its own line, value on the next, is the key defaults."""
+        self._defaults_spelling("? defaults\n:\n", "defaults: key in the workflow: ? defaults")
+
+    def test_m49_double_quoted_key_spelled_with_a_unicode_escape_is_refused(self):
+        """code r9 F1: a backslash escape spells any key, so a backslash in a double-quoted key is refused."""
+        self._defaults_spelling('"\\u0064efaults":\n', 'escaped double-quoted key in the workflow: "\\u0064efaults":')
+
+    def test_m50_control_a_comment_line_that_mentions_defaults_is_accepted(self):
+        """Control: ``# defaults: tuned`` at indent 0 is a YAML comment, not a key."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._text_defects_lines(idx, "jobs:\n", "# defaults: tuned\njobs:\n")
+                self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), [])
+                if yaml is not None:
+                    self.assertNotIn("defaults", self._top_level_keys(lines))
+
+    def test_m55_tagged_defaults_key_is_refused(self):
+        """security r9 F2: ``!!str defaults:`` is the key defaults."""
+        self._defaults_spelling("!!str defaults:\n", "defaults: key in the workflow: !!str defaults:")
+
+    def test_m56_anchored_defaults_key_is_refused(self):
+        """security r9 F2: ``&a defaults:`` is the key defaults."""
+        self._defaults_spelling("&a defaults:\n", "defaults: key in the workflow: &a defaults:")
+
+    def _env_row(self, level, key, value):
+        """Add one env entry at workflow or job level of both workflows; PyYAML sees it, the pin names it."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name, level=level):
+                job = {0: "postgres-ignored", 1: "cert-postgres-age"}[idx]
+                if level == "workflow":
+                    old, new = "  CARGO_TERM_COLOR: always\n", "  CARGO_TERM_COLOR: always\n  %s: %s\n" % (key, value)
+                else:
+                    old = "\n  %s:\n" % job
+                    new = old + "    env:\n      %s: %s\n" % (key, value)
+                lines = self._text_defects_lines(idx, old, new)
+                if yaml is not None:
+                    doc = yaml.safe_load("\n".join(lines))
+                    env = doc["env"] if level == "workflow" else doc["jobs"][job]["env"]
+                    self.assertIn(key, env)
+                self.assertEqual(
+                    heal_defects(lines, WORKFLOWS[idx].name), ["%s-level env key added: %s" % (level, key)]
+                )
+
+    def test_m51_bash_env_at_workflow_level_is_refused(self):
+        """security r9 F1: BASH_ENV changes what the pinned step executes."""
+        self._env_row("workflow", "BASH_ENV", "./x")
+
+    def test_m52_shellopts_at_job_level_is_refused(self):
+        """security r9 F1: SHELLOPTS at job level."""
+        self._env_row("job", "SHELLOPTS", "xtrace")
+
+    def test_m53_an_innocuous_new_job_env_key_is_refused_too(self):
+        """The pin is a set pin, not a denylist: any new key fails."""
+        self._env_row("job", "FOO", "bar")
+
+    def test_m54_control_the_live_env_sets_are_accepted(self):
+        """Control: the unmutated workflows carry exactly the pinned env key sets."""
+        for path in WORKFLOWS:
+            with self.subTest(workflow=path.name):
+                self.assertEqual(heal_defects(path), [])
+
 
 if __name__ == "__main__":
     unittest.main()
