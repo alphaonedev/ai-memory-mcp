@@ -5981,6 +5981,22 @@ def metered(meter):
         yield
 
 
+# r31 code F4: the meter cannot see engine steps (a backtracking search hands the engine the same characters), so a second gate
+# takes the minimum of several timed runs at two sizes: linear is 2.0, quadratic 4.0, the gate sits between them
+F40E_SECONDS_RATIO_MAX = 3.0
+
+
+def f40e_min_seconds(run, repeats=3):
+    """The smallest wall time of ``repeats`` calls of ``run`` (``run`` may return a ``(work, seconds)`` pair from ``f40e_measure``)."""
+    best = None
+    for _ in range(repeats):
+        start = time.perf_counter()
+        outcome = run()
+        took = outcome[1] if isinstance(outcome, tuple) else time.perf_counter() - start
+        best = took if best is None else min(best, took)
+    return best
+
+
 def f40e_measure(case, name, shape, nbytes):
     """Counted scan work and seconds for the four-call round (both views, pass and fail) on a workflow whose step name, env value
     and run text are each ``nbytes`` of ``shape``; the problem lines are checked for length and echo on the way.  Returns
