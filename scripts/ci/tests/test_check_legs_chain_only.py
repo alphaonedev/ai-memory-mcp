@@ -45,6 +45,12 @@ LEGS = (
     {'leg': 'macos-fed,enterprise-fed', 'runner': '["self-hosted","macos-fed"]', 'node': 'macos-fed',
      'tier': 'enterprise-fed', 'timeout': '160'},
 )
+INSTALL_RUST_STEP = '      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)\n'
+INSTALL_RUST_IF = ('        if: needs.classify.outputs.docs_only != \'true\' && '
+                   'contains(needs.classify.outputs.check_tiers, matrix.tier)\n')
+STRAY_NO_IF = '      - name: stray cargo build\n        run: cargo build\n'
+STRAY_IF_FIRST = ("      - if: needs.classify.outputs.docs_only != 'true'\n"
+                  '        run: cargo build\n')
 LEG_KEYS = ('leg', 'runner', 'node', 'tier', 'timeout', 'once', 'shared_target')
 
 
@@ -239,6 +245,13 @@ class MutationTable(unittest.TestCase):
             'drop the inactive-leg notice step': ci.replace(NOTICE_STEP_NAME, 'name: Renamed step', 1),
             'notice forgets the postgres workflows': ci.replace('cert-postgres-age.yml and postgres-ignored.yml"', 'elsewhere"', 1),
             'drop HEAD_REF env': ci.replace('HEAD_REF: ${{ github.head_ref }}', 'HEAD_REF: ""', 1),
+            # #8174 code r1 F2 (X1, X2, X4): a step with no tier guard at all must fail the pin.
+            'X1 delete the whole if of Install Rust': ci.replace(
+                INSTALL_RUST_STEP + INSTALL_RUST_IF, INSTALL_RUST_STEP, 1),
+            'X2 new cargo build step with no if': ci.replace(
+                '      - uses: actions/checkout@', STRAY_NO_IF + '      - uses: actions/checkout@', 1),
+            'X4 new if-first step after a guarded step': ci.replace(
+                '      - name: Fork-PR refusal', STRAY_IF_FIRST + '      - name: Fork-PR refusal', 1),
         }
 
     def test_every_script_mutant_fails_the_behaviour_pins(self):
