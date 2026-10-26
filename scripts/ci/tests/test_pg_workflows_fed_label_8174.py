@@ -21,7 +21,9 @@ every node):
       ``EXPECTED_POINT_AT_RUN_IGNORED`` (tuples copied from the workflows, never built from them at
       test time). ``ensure-age-extension.py`` and ``RUNNER_OS`` occur nowhere outside that block
       (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``), and no ``defaults:`` key
-      exists. No shell is lexed, so no bash text shape can be misread. A comment, a flag or a word
+      exists in any spelling (every non-comment line mentioning it, every indent-0 ``?`` line and
+      every double-quoted key with a backslash is refused). The workflow-level and job-level ``env``
+      key sets equal ``ENV_KEYS_BY_WORKFLOW`` (a new, removed or renamed key is a named defect). No shell is lexed, so no bash text shape can be misread. A comment, a flag or a word
       changed inside the step is refused on purpose. Maintenance cost: the expected tuples are
       updated in the same PR as any edit to the step. The step's extent runs to the next non-blank
       non-comment line at or below the dash indent (a key after a comment is still a step key), the
@@ -249,7 +251,32 @@ STEP_NAME = "Point at the native enterprise-fed tier (per-job ephemeral db)"
 # A step is a list item at exactly 6 spaces; the same words as data deeper inside a run block are not one.
 STEP_NAME_RX = re.compile(r"^      - name: *" + re.escape(STEP_NAME) + r"[ \t\r]*$")
 KEY_RX = re.compile(r"^([A-Za-z_][\w-]*)\s*:")
-DEFAULTS_RX = re.compile(r"^[ \t]*([\"']?)defaults\1[ \t]*:")
+QUOTED_KEY_RX = re.compile(r'^[ \t]*"((?:[^"\\]|\\.)*)"[ \t]*:')
+# decision: pin the workflow-level and job-level env key sets to the live sets over a denylist of
+# shell-affecting variable names because a denylist is never complete (BASH_ENV, ENV, SHELLOPTS,
+# BASHOPTS, PS4, LD_PRELOAD, PATH, ...) and the pin already compares the step text byte for byte
+# (fail-closed precedent PR 8252 cd57f84db; LOW with precedent, no vote).
+ENV_KEYS_BY_WORKFLOW = {
+    "postgres-ignored.yml": (
+        (
+            "CARGO_TERM_COLOR",
+            "SELF_HOSTED_TARGET_CAP_BYTES",
+            "CARGO_INCREMENTAL",
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_PROFILE_TEST_DEBUG",
+        ),
+        (),
+    ),
+    "cert-postgres-age.yml": (
+        (
+            "CARGO_TERM_COLOR",
+            "SELF_HOSTED_TARGET_CAP_BYTES",
+            "CARGO_INCREMENTAL",
+            "CARGO_PROFILE_DEV_DEBUG",
+        ),
+        (),
+    ),
+}
 BODY_DIFFERS = "step body differs from the pinned text at line "
 PINNED_OUTSIDE_TOKENS = ("ensure-age-extension.py", "RUNNER_OS")
 EXPECTED_BY_WORKFLOW = {
@@ -271,6 +298,80 @@ def is_skipped(line):
 def as_lines(source):
     """``source`` is a workflow ``Path`` or already-split text (the in-memory mutation rows)."""
     return lines_of(source) if isinstance(source, Path) else list(source)
+
+
+def top_level_key_defect(line):
+    """Named defect of a line that can spell a ``defaults`` key in any YAML form, else ``""``.
+
+    decision: refuse every top-level non-comment line that mentions defaults, every indent-0
+    explicit-key line starting with ?, and every double-quoted key carrying a backslash escape, over
+    decoding YAML escapes inside the pin, because the pin compares text the shell never decodes and a
+    fail-closed refusal of every spelling needs no decoder (fail-closed precedent PR 8252 cd57f84db;
+    LOW with precedent, no vote).
+    """
+    text = line.strip(PIN_WS)
+    if text.startswith("#"):
+        return ""
+    if "defaults" in text.lower():
+        return "defaults: key in the workflow: " + text
+    if indent_of(line) == 0 and text.startswith("?"):
+        return "explicit-key line in the workflow: " + text
+    hit = QUOTED_KEY_RX.match(line)
+    if hit and "\\" in hit.group(1):
+        return "escaped double-quoted key in the workflow: " + text
+    return ""
+
+
+def env_keys(lines, key_indent):
+    """Keys of every ``env:`` block whose ``env:`` line sits at ``key_indent - 2`` (a flow or inline ``env:`` is one key)."""
+    found = []
+    in_env = False
+    head = key_indent - 2
+    for ln in lines:
+        text = ln.strip(PIN_WS)
+        if not text or text.startswith("#"):
+            continue
+        ind = indent_of(ln)
+        if ind == head:
+            in_env = text == "env:"
+            if text.startswith("env:") and not in_env:
+                found.append(text)
+        elif ind < head:
+            in_env = False
+        elif in_env and ind == key_indent:
+            found.append(text.split(":", 1)[0].strip())
+    return found
+
+
+def env_defects(lines, workflow):
+    """Named defects when the workflow-level or job-level ``env`` key set differs from the pinned set."""
+    wf_expected, job_expected = ENV_KEYS_BY_WORKFLOW[workflow]
+    # Workflow level: ``env:`` at indent 0, keys at indent 2. Job level: ``env:`` at indent 4 inside
+    # ``jobs:``, keys at indent 6.
+    levels = (
+        ("workflow", wf_expected, env_keys(lines, 2)),
+        ("job", job_expected, env_keys_in_jobs(lines)),
+    )
+    defects = []
+    for level, expected, got in levels:
+        for key in got:
+            if got.count(key) > 1 and key in expected:
+                defects.append("%s-level env key duplicated: %s" % (level, key))
+            elif key not in expected:
+                defects.append("%s-level env key added: %s" % (level, key))
+        defects += ["%s-level env key removed: %s" % (level, k) for k in expected if k not in got]
+    return list(dict.fromkeys(defects))
+
+
+def env_keys_in_jobs(lines):
+    """Keys of every job-level ``env:`` block (``env:`` at indent 4, keys at indent 6, under ``jobs:``)."""
+    start = next((i for i, ln in enumerate(lines) if ln.rstrip(PIN_WS) == "jobs:"), None)
+    if start is None:
+        return []
+    end = start + 1
+    while end < len(lines) and (is_skipped(lines[end]) or indent_of(lines[end]) > 0):
+        end += 1
+    return env_keys(lines[start + 1 : end], 6)
 
 
 def heal_defects(source, workflow="postgres-ignored.yml"):
@@ -351,9 +452,11 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
                     % (k, "(block ends)" if g is None else g, "(block ends)" if w is None else w)
                 )
                 break
+    defects += env_defects(lines, getattr(source, "name", workflow))
     for i, ln in enumerate(lines):
-        if DEFAULTS_RX.match(ln):
-            defects.append("defaults: key in the workflow: " + ln.strip(PIN_WS))
+        defect = top_level_key_defect(ln)
+        if defect:
+            defects.append(defect)
         if i in inside:
             continue
         defects += [
@@ -663,7 +766,11 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
 
     def test_m35_runner_os_in_the_workflow_level_env_block_is_refused(self):
         self.assertEqual(
-            self._row("M35"), ["RUNNER_OS outside the Point-at run block: RUNNER_OS: macOS"]
+            self._row("M35"),
+            [
+                "workflow-level env key added: RUNNER_OS",
+                "RUNNER_OS outside the Point-at run block: RUNNER_OS: macOS",
+            ],
         )
 
     def test_body_defect_names_the_first_differing_line(self):
@@ -736,7 +843,11 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
             "env:\n  CARGO_TERM_COLOR: always\n  HEAL: scripts/ci/ensure-age-extension.py\n",
         )
         self.assertEqual(
-            got, ["ensure-age-extension.py outside the Point-at run block: HEAL: scripts/ci/ensure-age-extension.py"]
+            got,
+            [
+                "workflow-level env key added: HEAL",
+                "ensure-age-extension.py outside the Point-at run block: HEAL: scripts/ci/ensure-age-extension.py",
+            ],
         )
 
     def test_defaults_key_anywhere_in_the_workflow_is_refused(self):
