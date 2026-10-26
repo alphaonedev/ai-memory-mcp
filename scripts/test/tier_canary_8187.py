@@ -203,10 +203,12 @@ def pick_interpreters(found):
 # --------------------------------------------------------------------------------------------------------------------
 # the copy
 
-FORCE_SOURCE = '''"""Forced-failure hook (canary): a trace function raises at the return event of every test body, and every assert*
+FORCE_SOURCE = '''"""Forced-failure hook (canary): a test that passed is made to fail after its body, and every assert*
 call echoes its operands to stderr, as the message of a failing assertion would."""
 import functools
+import os
 import sys
+import types
 import unittest
 
 ECHO_SKIP = frozenset(("assertRaises", "assertRaisesRegex", "assertWarns", "assertWarnsRegex", "assertLogs", "assertNoLogs"))
@@ -231,21 +233,35 @@ def install():
             setattr(unittest.TestCase, name, echoing(name, getattr(unittest.TestCase, name)))
 
     def forced(self, method):
-        code = getattr(getattr(method, "__func__", method), "__code__", None)
+        # Only a test that PASSED is forced to fail: an exception of the test's own (a failed assertion, ``self.fail``, a raised
+        # error, a skip) propagates untouched, so the real failure report CI produces is what the canary scans.  The default
+        # run is trace-free; the informational locals leg keeps the test frame in the forced traceback.
+        kept = []
+        if os.environ.get("TIER_CANARY_LOCALS_8187") == "1":
+            code = getattr(getattr(method, "__func__", method), "__code__", None)
 
-        def local(frame, event, arg):
-            if event == "return":
-                raise AssertionError("forced failure after the test body")
-            return local
+            def local(frame, event, arg):
+                if event == "return":
+                    kept.append(frame)
+                return local
 
-        def glob(frame, event, arg):
-            return local if frame.f_code is code else None
+            def glob(frame, event, arg):
+                if frame.f_code is not code:
+                    return None
+                frame.f_trace_lines = False
+                frame.f_trace_opcodes = False
+                return local
 
-        sys.settrace(glob)
+            sys.settrace(glob)
         try:
-            return method()
+            method()
         finally:
             sys.settrace(None)
+        error = AssertionError("forced failure after the test body")
+        if kept:
+            frame = kept[-1]
+            error = error.with_traceback(types.TracebackType(None, frame, frame.f_lasti, frame.f_lineno))
+        raise error
 
     unittest.TestCase._callTestMethod = forced
 '''
@@ -289,7 +305,7 @@ if only:
     suite = unittest.defaultTestLoader.loadTestsFromName(only)
 else:
     suite = unittest.defaultTestLoader.discover(here, pattern=os.path.basename(path), top_level_dir=here)
-runner = unittest.TextTestRunner(stream=sys.stderr, verbosity=2, tb_locals=forced and os.environ.get("TIER_CANARY_LOCALS_8187") == "1",
+runner = unittest.TextTestRunner(stream=sys.stderr, verbosity=2, tb_locals=forced,
                                  resultclass=Result)
 result = runner.run(suite)
 with open(out, "w", encoding="utf-8") as handle:
