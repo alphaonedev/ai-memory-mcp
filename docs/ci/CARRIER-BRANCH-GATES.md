@@ -182,7 +182,7 @@ The `Check` job keeps its four legs and their names. A topic-branch
 `macos-fed,sqlite`); the two enterprise-fed legs are rerouted to a hosted runner
 with every step skipped (the docs-only no-op shape), so they still report but
 hold no self-hosted runner. A chain `pull_request` (head branch `chain/...`),
-`push`, `merge_group` and `workflow_dispatch` run all four legs. The reason is
+`push` and `merge_group` run all four legs. The reason is
 compute: a full `Check (linux-fed,enterprise-fed)` run held one of the four
 linux-fed runners for 2 h 09 min to 2 h 37 min per topic PR, whether it ended
 green or red, while sal-postgres coverage for topic PRs stays in

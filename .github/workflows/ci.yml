@@ -225,7 +225,7 @@ jobs:
       test_impact: ${{ steps.cls.outputs.test_impact }}
       # #8174 - which `Check` tiers run on this workflow run, decided in ONE
       # place (scripts/ci/check_legs.py). A topic-branch pull_request gets
-      # `sqlite`; chain/ carrier PRs, push, merge_group and workflow_dispatch
+      # `sqlite`; chain/ carrier PRs, pushes and merge_group runs
       # get `sqlite,enterprise-fed`. Consumed by the `check` job below.
       check_tiers: ${{ steps.legs.outputs.check_tiers }}
       test_impact_count: ${{ steps.cls.outputs.test_impact_count }}
@@ -663,11 +663,12 @@ jobs:
   # two sqlite legs do work: the two enterprise-fed legs are rerouted to a
   # hosted runner with every step skipped, so no linux-fed / macos-fed runner is
   # held (a full linux-fed leg held a runner 2h09-2h37 per PR run, green or red).
-  # Chain/ carrier PRs, push, merge_group and workflow_dispatch run all four.
+  # Chain/ carrier PRs, pushes and merge_group runs keep all four.
   # The decision lives in scripts/ci/check_legs.py (classify output
   # `check_tiers`); the pins are scripts/ci/tests/test_check_legs_chain_only.py.
   # sal-postgres coverage on topic PRs stays in cert-postgres-age.yml and
-  # postgres-ignored.yml (the `fed` label).
+  # postgres-ignored.yml; both run on every same-repo pull_request to
+  # release/**, rehearsal/** and chain/** (neither is label-gated).
   check:
     name: Check (${{ matrix.leg }})
     needs: classify
@@ -922,7 +923,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
-          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${HEAD_REF}): enterprise-fed legs run on chain/* pull requests, push, merge_group and workflow_dispatch; this topic-PR run reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
+          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${HEAD_REF}): enterprise-fed legs run on chain/* pull requests, push and merge_group; this topic-PR run reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
           echo "::notice::${msg}"
           echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 

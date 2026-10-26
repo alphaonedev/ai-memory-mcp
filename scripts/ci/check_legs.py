@@ -9,15 +9,17 @@ linux-fed runners for 2 h 09 min to 2 h 37 min per PR run, green or red
 (measured: runs 40172299587 and 40181658963 passed in 2 h 09-2 h 11; job
 121109122420 ran 17:56Z-20:31Z and the #1492 watchdog then killed the serial
 shard). The justification is compute, not signal. sal-postgres coverage for
-topic PRs lives in ``cert-postgres-age.yml`` and ``postgres-ignored.yml`` (the
-``fed`` label).
+topic PRs lives in ``cert-postgres-age.yml`` and ``postgres-ignored.yml``; both run on every
+same-repo ``pull_request`` to ``release/**``, ``rehearsal/**`` and ``chain/**`` (neither is
+label-gated).
 
 Rule, one place:
 
 * ``pull_request`` whose head branch does NOT start with ``chain/`` (a topic
   PR): only the ``sqlite`` tier is active.
 * every other run (``pull_request`` from a ``chain/`` carrier branch, ``push``,
-  ``merge_group``, ``workflow_dispatch``, ``schedule`` and anything unknown):
+  ``merge_group``, ``schedule`` and anything unknown; ci.yml itself triggers only on
+  ``push``, ``pull_request`` and ``merge_group``):
   both tiers are active. The chain branch is tested ONLY through the
   ``pull_request`` runs of its carrier PR, so "push only" would drop the chain
   from coverage; the ``chain/`` carve-out keeps it.

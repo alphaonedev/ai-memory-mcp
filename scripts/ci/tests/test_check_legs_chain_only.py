@@ -2,8 +2,7 @@
 """Pins for the chain-only enterprise-fed ``Check`` legs (#8174).
 
 Topic-branch pull requests run only the sqlite legs of the ``Check`` job; the
-two enterprise-fed legs run on chain carrier PRs, pushes, merge groups and
-manual dispatches. This suite pins (1) the decision script
+two enterprise-fed legs run on chain carrier PRs, pushes, merge groups. This suite pins (1) the decision script
 ``scripts/ci/check_legs.py``, (2) the ``.github/workflows/ci.yml`` wiring that
 consumes it (all four legs and their names unchanged, runner rerouted for an
 inactive tier, every guarded step carrying the tier guard) and (3) a mutation
@@ -152,7 +151,7 @@ def workflow_problems(ci):
         for needle in ('::notice::', '$GITHUB_STEP_SUMMARY', 'LEG: ${{ matrix.leg }}',
                        'EVENT_NAME: ${{ github.event_name }}', 'HEAD_REF: ${{ github.head_ref }}',
                        'cert-postgres-age.yml', 'postgres-ignored.yml',
-                       'chain/* pull requests, push, merge_group and workflow_dispatch'):
+                       'chain/* pull requests, push and merge_group'):
             if needle not in block:
                 problems.append('inactive-leg notice missing %r' % needle)
     if 'check_tiers: ${{ steps.legs.outputs.check_tiers }}' not in classify:
