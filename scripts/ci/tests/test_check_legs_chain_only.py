@@ -291,6 +291,22 @@ class MutationTable(unittest.TestCase):
             'drop BASE_REF env from the legs step': ci.replace(
                 '          BASE_REF: ${{ github.base_ref }}\n        run: python3', '        run: python3', 1),
             'notice stops refusing a non-chain base': ci.replace('chain/*) ;;', 'chain/*|*) ;;', 1),
+            # #8174 security r1 F3: edits to the guard wiring and the injection rule.
+            'guard joined with || instead of &&': ci.replace(
+                "docs_only != 'true' && " + TIER_GUARD, "docs_only != 'true' || " + TIER_GUARD, 1),
+            'negated tier guard on a step': ci.replace(
+                "docs_only != 'true' && " + TIER_GUARD, "docs_only != 'true' && !" + TIER_GUARD, 1),
+            'continue-on-error on the legs step': ci.replace(
+                '        name: Decide the Check tiers (#8174)\n',
+                '        name: Decide the Check tiers (#8174)\n        continue-on-error: true\n', 1),
+            'if on the legs step': ci.replace(
+                '        name: Decide the Check tiers (#8174)\n',
+                "        name: Decide the Check tiers (#8174)\n        if: github.event_name == 'pull_request'\n", 1),
+            'head_ref inlined in the legs run': ci.replace(
+                'run: python3 -I scripts/ci/check_legs.py --github-output',
+                'run: python3 -I scripts/ci/check_legs.py --head-ref ${{ github.head_ref }} --github-output', 1),
+            'head_ref inlined in the notice run': ci.replace(
+                'head ref ${HEAD_REF}, base ref', 'head ref ${{ github.head_ref }}, base ref', 1),
             'drop HEAD_REF env': ci.replace('HEAD_REF: ${{ github.head_ref }}', 'HEAD_REF: ""', 1),
             # #8174 code r1 F2 (X1, X2, X4): a step with no tier guard at all must fail the pin.
             'X1 delete the whole if of Install Rust': ci.replace(
