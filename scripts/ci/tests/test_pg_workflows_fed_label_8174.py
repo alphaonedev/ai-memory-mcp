@@ -1334,5 +1334,195 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
                 self.assertTrue(any(d.startswith("skeleton line ") and "can spell" in d and lead in d for d in got), got)
 
 
+    # Round 12 rows (code r11 F1 F2 F3, security r11 F1 F2): a deep continuation line above steps:, the whole
+    # step list, and the Unicode line breaks YAML honours but the LF split keeps inside one line.
+    ASSERT_HEAD = "      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)\n"
+    INSTALL_HEAD = "      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)\n"
+    JOB_IF = (
+        "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name"
+        " == github.repository\n"
+    )
+
+    def _r12_each(self, old, new, prefix, fragment, yaml_check=None):
+        """Both workflows: ``new`` replaces ``old``; the pin names a ``prefix`` defect quoting ``fragment``."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._text_defects_lines(idx, old, new)
+                if yaml is not None and yaml_check is not None:
+                    yaml_check(yaml.safe_load("\n".join(lines)), self.JOB_BY_IDX[idx])
+                got = heal_defects(lines, WORKFLOWS[idx].name)
+                self.assertTrue(
+                    any(d.startswith(prefix) and fragment in d for d in got),
+                    "no %r defect quotes %r: %r" % (prefix, fragment, got),
+                )
+
+    def test_m74_continuation_line_under_the_job_if_guard_is_refused(self):
+        """code r11 F1: a deep plain-scalar continuation turns the fork guard into ``... || true``."""
+        self._r12_each(
+            self.JOB_IF,
+            self.JOB_IF + "      || true\n",
+            "deep line ",
+            "|| true",
+            lambda doc, job: self.assertTrue(doc["jobs"][job]["if"].endswith("|| true")),
+        )
+
+    def test_m75_continuation_line_under_a_workflow_env_value_is_refused(self):
+        """code r11 F1: ``CARGO_TERM_COLOR: always`` plus a continuation reads as ``always never``."""
+        old = "  CARGO_TERM_COLOR: always\n"
+        self._r12_each(
+            old,
+            old + "      never\n",
+            "deep line ",
+            "never",
+            lambda doc, job: self.assertEqual(doc["env"]["CARGO_TERM_COLOR"], "always never"),
+        )
+
+    def test_m76_continuation_line_under_the_concurrency_group_is_refused(self):
+        """code r11 F1: a continuation after the concurrency group value changes the group."""
+        old = "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n"
+        self._r12_each(
+            old,
+            "      tail\n" + old,
+            "deep line ",
+            "tail",
+            lambda doc, job: self.assertTrue(doc["concurrency"]["group"].endswith(" tail")),
+        )
+
+    def test_m77_earlier_step_writing_github_env_is_refused(self):
+        """code r11 F2 = security r11 F1: an added earlier step that writes BASH_ENV into $GITHUB_ENV."""
+        self._r12_each(
+            self.ASSERT_HEAD,
+            "      - name: Early env\n        run: echo \"BASH_ENV=./x\" >> \"$GITHUB_ENV\"\n\n" + self.ASSERT_HEAD,
+            "step-list line ",
+            "GITHUB_ENV",
+        )
+
+    def test_m78_earlier_step_writing_github_path_is_refused(self):
+        """code r11 F2 = security r11 F1: an added earlier step that prepends a directory to $GITHUB_PATH."""
+        self._r12_each(
+            self.ASSERT_HEAD,
+            "      - name: Early path\n        run: echo \"$PWD/x\" >> \"$GITHUB_PATH\"\n\n" + self.ASSERT_HEAD,
+            "step-list line ",
+            "GITHUB_PATH",
+        )
+
+    def test_m79_added_uses_step_is_refused(self):
+        """code r11 F2: an added ``uses:`` step."""
+        self._r12_each(
+            self.ASSERT_HEAD,
+            "      - uses: actions/cache@v4\n\n" + self.ASSERT_HEAD,
+            "step-list line ",
+            "actions/cache@v4",
+        )
+
+    def _install_block(self, idx):
+        """The text of the Install Rust step of workflow ``idx`` (its lines up to the next blank line)."""
+        base = WORKFLOWS[idx].read_text(encoding="utf-8")
+        start = base.index(self.INSTALL_HEAD)
+        return base[start : base.index("\n\n", start) + 1]
+
+    def test_m80_reordered_steps_are_refused(self):
+        """code r11 F2: the Install Rust step moved above the Assert rustup step."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                block = self._install_block(idx)
+                base = WORKFLOWS[idx].read_text(encoding="utf-8")
+                text = base.replace(block, "", 1).replace(self.ASSERT_HEAD, block + self.ASSERT_HEAD, 1)
+                got = heal_defects(text.split("\n"), WORKFLOWS[idx].name)
+                self.assertTrue(
+                    any(d.startswith("step-list line ") and "reordered" in d for d in got), got
+                )
+
+    def test_m81_removed_step_is_refused(self):
+        """code r11 F2: the Install Rust step deleted."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                base = WORKFLOWS[idx].read_text(encoding="utf-8")
+                got = heal_defects(base.replace(self._install_block(idx), "", 1).split("\n"), WORKFLOWS[idx].name)
+                self.assertTrue(
+                    any(d.startswith("step-list line removed") and "Install Rust 1.98.0" in d for d in got), got
+                )
+
+    def test_m82_changed_uses_ref_is_refused(self):
+        """code r11 F2: the pinned toolchain action moved to another ref."""
+        self._r12_each(
+            "@f8be11a05b1d4f3fcebe6410cc16743212b999b0",
+            "@0000000000000000000000000000000000000000",
+            "step-list line ",
+            "@0000000000000000000000000000000000000000",
+        )
+
+    def test_m83_changed_with_entry_of_an_earlier_step_is_refused(self):
+        """code r11 F2: a ``with:`` entry of the Install Rust step (changed in cert, added in ignored)."""
+        for idx, old, new in (
+            (0, "# 1.98.0\n", "# 1.98.0\n        with:\n          components: rust-src\n"),
+            (1, "          components: clippy\n", "          components: clippy, rust-src\n"),
+        ):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                got = heal_defects(self._text_defects_lines(idx, old, new), WORKFLOWS[idx].name)
+                self.assertTrue(any(d.startswith("step-list line ") and "rust-src" in d for d in got), got)
+
+    def test_m84_deep_continuation_inside_an_earlier_step_is_refused(self):
+        """code r11 F2: a continuation line under the Assert rustup step's ``if:`` value."""
+        old = "        if: runner.environment != 'github-hosted'\n"
+        self._r12_each(
+            old,
+            old + "          || true\n",
+            "step-list line ",
+            "|| true",
+            lambda doc, job: self.assertTrue(
+                any(str(s.get("if", "")).endswith("|| true") for s in doc["jobs"][job]["steps"])
+            ),
+        )
+
+    def _break_row(self, ch):
+        """A comment line carrying ``ch`` hides a ``defaults:`` key from the LF split; PyYAML reads the key."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._spelled(idx, "workflow", "# note%sdefaults:\n  run:\n    shell: bash\n" % ch)
+                if yaml is not None:
+                    self.assertIn("defaults", yaml.safe_load("\n".join(lines)))
+                got = heal_defects(lines, WORKFLOWS[idx].name)
+                code = "U+%04X" % ord(ch)
+                self.assertTrue(any(d.startswith("line ") and code in d for d in got), got)
+
+    def test_m85_u0085_inside_a_comment_line_is_refused(self):
+        """security r11 F1: U+0085 (NEL) ends a line for PyYAML but not for the LF split."""
+        self._break_row("\u0085")
+
+    def test_m86_u2028_inside_a_comment_line_is_refused(self):
+        """security r11 F1: U+2028 (line separator)."""
+        self._break_row(" ")
+
+    def test_m87_u2029_inside_a_comment_line_is_refused(self):
+        """security r11 F1: U+2029 (paragraph separator)."""
+        self._break_row(" ")
+
+    def test_m91_a_lone_carriage_return_inside_a_comment_line_is_refused(self):
+        """Same class as M85-M87: a CR in mid-line is a line break for PyYAML; only a trailing CR is CRLF."""
+        self._break_row("\r")
+
+    def test_m88_control_a_comment_at_indent_6_or_deeper_above_steps_is_accepted(self):
+        """Control: comments are never deep lines, whatever their indent."""
+        old = "    steps:\n"
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._text_defects_lines(idx, old, "      # note at 6\n          # note at 10\n" + old)
+                self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), [])
+
+    def test_m89_control_the_unchanged_live_files_have_no_defect(self):
+        """Control: the live step list, skeleton, deep-line scan and line-break scan are clean."""
+        for path in WORKFLOWS:
+            with self.subTest(workflow=path.name):
+                self.assertEqual(heal_defects(path), [])
+                self.assertEqual(macos_defects(path), [])
+
+    def test_m90_control_a_changed_run_line_is_caught_by_the_run_pin_not_the_step_list(self):
+        """Control: block-scalar content is outside the skeleton and the step list; the run-text pin owns it."""
+        got = self._defects(NEW_URL_LINE, NEW_URL_LINE.replace("new_url=", "new_url2="))
+        self._assert_body_differs(got)
+        self.assertFalse(any(d.startswith(("skeleton line ", "step-list line ", "deep line ")) for d in got), got)
+
+
 if __name__ == "__main__":
     unittest.main()
