@@ -125,7 +125,7 @@ jobs:
             -e POSTGRES_PASSWORD=ci_verify \
             -e POSTGRES_DB=ci_verify \
             ai-memory-ci:verify
-          for i in $(seq 1 60); do
+          for i in {1..60}; do
             if docker exec ci-image-verify pg_isready -U ai_memory -d ci_verify >/dev/null 2>&1; then
               echo "::notice::postgres up after $((i*2))s"; break
             fi
