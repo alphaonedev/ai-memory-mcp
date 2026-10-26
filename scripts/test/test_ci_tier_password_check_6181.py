@@ -6051,6 +6051,15 @@ class TestCheckerTimeIsLinear8187R24(unittest.TestCase):
         self.assertLess(ratios["linear"], F40E_WORK_RATIO_MAX)
         self.assertGreater(ratios["quadratic"], F40E_WORK_RATIO_MAX)
 
+    def test_the_checker_seconds_scale_linearly_8187_r31(self):
+        """Code r30 F4: the meter counts input characters, not engine steps, so a backtracking scan passes the work gate; the
+        minimum of several timed runs at two sizes is the second gate (``F40E_SECONDS_RATIO_MAX`` sits between 2.0 and 4.0)."""
+        shape = CANARY_SHAPES["plain"]
+        f40e_measure(self, "warm", shape, 1 << 16)
+        one = f40e_min_seconds(lambda: f40e_measure(self, "seconds", shape, 1 << 19))
+        two = f40e_min_seconds(lambda: f40e_measure(self, "seconds", shape, 2 << 19))
+        self.assertLess(two / max(one, 1e-9), F40E_SECONDS_RATIO_MAX)
+
     def test_every_probe_shape_is_under_the_work_budget_at_one_mebibyte(self):
         for name, shape in sorted(CANARY_SHAPES.items()):
             with self.subTest(shape=name):
@@ -8472,6 +8481,41 @@ class TestClassBasesAndKeywordsAreJudged8187R31(unittest.TestCase):
         for name, body in TAINT_R31_F3_CLEAN.items():
             with self.subTest(shape=name):
                 self.assertEqual(tainted_assert_lines(TAINT_R28_HEAD + body), [])
+
+
+class TestBacktrackingIsSeenByTheSecondsGate8187R31(unittest.TestCase):
+    """r31 code F4: ``a*b`` searched over a run of ``a`` is quadratic in the engine while the characters handed to it only double
+    (work ratio 2.00 against the 2.5 gate); the minimum-of-N seconds ratio is about 4 and fails the seconds gate.  A linear search
+    stays under the same gate.
+    decision: gate on the minimum of several timed runs at two sizes over a bare wall-clock ratio because the minimum drops host noise and the gate sits at 3.0 between linear 2.0 and quadratic 4.0."""
+
+    @staticmethod
+    def ratios(pattern, sizes, repeats):
+        work, seconds = [], []
+        for size in sizes:
+            blob = "a" * size
+            meter = ScanMeter()
+            recorder = unittest.mock.MagicMock(wraps=pattern)
+            meter.watch(recorder, 0, True)
+            recorder.search(blob)
+            work.append(meter.characters)
+            seconds.append(f40e_min_seconds(lambda: pattern.search(blob), repeats))
+        return work[1] / work[0], seconds[1] / max(seconds[0], 1e-9)
+
+    def test_the_gate_constant_sits_between_linear_and_quadratic(self):
+        self.assertEqual(F40E_SECONDS_RATIO_MAX, 3.0)
+
+    def test_a_backtracking_search_passes_the_work_gate_and_fails_the_seconds_gate(self):
+        work_ratio, seconds_ratio = self.ratios(re.compile("a*b"), (4096, 8192), 3)
+        print("backtracking probe a*b: work ratio %.2f (gate %.1f), seconds ratio %.2f (gate %.1f)" % (
+            work_ratio, F40E_WORK_RATIO_MAX, seconds_ratio, F40E_SECONDS_RATIO_MAX))
+        self.assertLess(work_ratio, F40E_WORK_RATIO_MAX)
+        self.assertGreater(seconds_ratio, F40E_SECONDS_RATIO_MAX)
+
+    def test_a_linear_search_passes_both_gates(self):
+        work_ratio, seconds_ratio = self.ratios(re.compile("needle"), (1 << 24, 2 << 24), 5)
+        self.assertLess(work_ratio, F40E_WORK_RATIO_MAX)
+        self.assertLess(seconds_ratio, F40E_SECONDS_RATIO_MAX)
 # ---- r31 END ----
 
 
