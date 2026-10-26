@@ -915,9 +915,16 @@ jobs:
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
 
-      - name: Skip notice (enterprise-fed legs run on chain and release runs only)
+      - name: Enterprise-fed leg inactive on this run (#8174)
         if: needs.classify.outputs.docs_only != 'true' && !contains(needs.classify.outputs.check_tiers, matrix.tier)
-        run: echo "::notice::topic-branch PR - ${{ matrix.leg }} matrix leg is a no-op here; it runs on chain/ carrier PRs, pushes and manual dispatches (#8174)"
+        env:
+          LEG: ${{ matrix.leg }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${HEAD_REF}): enterprise-fed legs run on chain/* pull requests, push, merge_group and workflow_dispatch; this topic-PR run reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
+          echo "::notice::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 
       # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
       # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,

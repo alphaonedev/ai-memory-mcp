@@ -25,6 +25,7 @@ CI_YML = REPO / '.github' / 'workflows' / 'ci.yml'
 
 TIER_GUARD = 'contains(needs.classify.outputs.check_tiers, matrix.tier)'
 DOCS_GUARD = "needs.classify.outputs.docs_only != 'true'"
+NOTICE_STEP_NAME = 'name: Enterprise-fed leg inactive on this run (#8174)'
 RUNS_ON = ("runs-on: ${{ fromJSON(contains(needs.classify.outputs.check_tiers, matrix.tier)"
            " && matrix.runner || '[\"ubuntu-latest\"]') }}")
 
@@ -125,8 +126,19 @@ def workflow_problems(ci):
             problems.append('guarded step without the tier guard: %s' % block.split('\n')[0][:80])
     if "needs.classify.outputs.docs_only == 'true'" not in check or 'check_tiers' not in check:
         problems.append('Check needs a docs-only no-op notice and a tier-skip notice')
-    if 'name: Skip notice (enterprise-fed legs run on chain and release runs only)' not in check:
-        problems.append('inactive-tier no-op notice step missing')
+    notice = [b for b in step_blocks(check) if b.startswith(NOTICE_STEP_NAME)]
+    if len(notice) != 1:
+        problems.append('exactly one loud inactive-leg notice step is required, found %d' % len(notice))
+    else:
+        block = notice[0]
+        if ("if: " + DOCS_GUARD + " && !" + TIER_GUARD) not in block:
+            problems.append('inactive-leg notice must run exactly when the tier is inactive')
+        for needle in ('::notice::', '$GITHUB_STEP_SUMMARY', 'LEG: ${{ matrix.leg }}',
+                       'EVENT_NAME: ${{ github.event_name }}', 'HEAD_REF: ${{ github.head_ref }}',
+                       'cert-postgres-age.yml', 'postgres-ignored.yml',
+                       'chain/* pull requests, push, merge_group and workflow_dispatch'):
+            if needle not in block:
+                problems.append('inactive-leg notice missing %r' % needle)
     if 'check_tiers: ${{ steps.legs.outputs.check_tiers }}' not in classify:
         problems.append('classify must export check_tiers from steps.legs')
     m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\n      # |\Z)', classify, re.S)
@@ -217,6 +229,8 @@ class MutationTable(unittest.TestCase):
             'rename a leg': ci.replace('- leg: linux-fed,enterprise-fed', '- leg: linux-fed,enterprise', 1),
             'drop a step tier guard': ci.replace(' && ' + TIER_GUARD, '', 1),
             'plain runs-on': ci.replace(RUNS_ON, 'runs-on: ${{ fromJSON(matrix.runner) }}', 1),
+            'drop the inactive-leg notice step': ci.replace(NOTICE_STEP_NAME, 'name: Renamed step', 1),
+            'notice forgets the postgres workflows': ci.replace('cert-postgres-age.yml and postgres-ignored.yml"', 'elsewhere"', 1),
             'drop HEAD_REF env': ci.replace('HEAD_REF: ${{ github.head_ref }}', 'HEAD_REF: ""', 1),
         }
 
