@@ -274,7 +274,7 @@ fn resolve_namespace_standard_memory(
 /// distinguishing an INTERNALLY-SYNTHESIZED trusted principal from a
 /// SELF-ASSERTED wire `agent_id`.
 ///
-/// `trusted_caller` is supplied OUT OF BAND by an in-process operator
+/// `out_of_band_caller` is supplied OUT OF BAND by an in-process operator
 /// surface (the CLI) that legitimately acts as the reserved
 /// [`sentinels::DAEMON_PRINCIPAL`]; it is used verbatim.
 ///
@@ -304,10 +304,10 @@ fn resolve_namespace_standard_memory(
 /// A wire `agent_id` that disagrees with the enforced-read caller.
 fn resolve_namespace_standard_caller(
     params: &Value,
-    trusted_caller: Option<&str>,
+    out_of_band_caller: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(trusted) = trusted_caller {
-        return Ok(trusted.to_string());
+    if let Some(oob_caller) = out_of_band_caller {
+        return Ok(oob_caller.to_string());
     }
     let wire = params.get(param_names::AGENT_ID).and_then(|v| v.as_str());
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
@@ -337,15 +337,15 @@ pub fn handle_namespace_set_standard(
 }
 
 /// Trusted in-process entry — the CLI operator surface supplies the daemon
-/// principal OUT OF BAND via `trusted_caller`, never through the wire
+/// principal OUT OF BAND via `out_of_band_caller`, never through the wire
 /// `params.agent_id` (#2721 / CB-19). Not reachable from any wire surface, so
 /// the reserved principal it carries cannot be self-asserted by a wire caller.
 pub fn handle_namespace_set_standard_trusted(
     conn: &rusqlite::Connection,
     params: &Value,
-    trusted_caller: &str,
+    out_of_band_caller: &str,
 ) -> Result<Value, String> {
-    handle_namespace_set_standard_inner(conn, params, Some(trusted_caller))
+    handle_namespace_set_standard_inner(conn, params, Some(out_of_band_caller))
 }
 
 /// Error context for the #4356 set-standard write transaction (begin / commit).
@@ -354,7 +354,7 @@ const SET_STANDARD_TXN_CONTEXT: &str = "set-standard write transaction";
 fn handle_namespace_set_standard_inner(
     conn: &rusqlite::Connection,
     params: &Value,
-    trusted_caller: Option<&str>,
+    out_of_band_caller: Option<&str>,
 ) -> Result<Value, String> {
     // #4356 — the owner gates (#3758 rebind, #4356 ancestor) and every write
     // of a SET run inside ONE `BEGIN IMMEDIATE` transaction (joined when the
@@ -395,11 +395,11 @@ fn handle_namespace_set_standard_inner(
     // #2721 / CB-19 — the caller is resolved via
     // `resolve_namespace_standard_caller`: a reserved sentinel (e.g.
     // `daemon`) is honored ONLY when supplied OUT OF BAND by a trusted
-    // in-process surface (`trusted_caller`), never from the self-asserted wire
+    // in-process surface (`out_of_band_caller`), never from the self-asserted wire
     // `params.agent_id`, which the wire-strict `validate_agent_id` rejects
     // (#977). A wire caller spoofing a reserved id downgrades to
     // `anonymous:invalid` and is refused by the ownership gate below.
-    let caller = resolve_namespace_standard_caller(params, trusted_caller)?;
+    let caller = resolve_namespace_standard_caller(params, out_of_band_caller)?;
     // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership gate on
     // the MCP entry. Mirrors the HTTP handler gate at
     // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
@@ -860,7 +860,7 @@ pub fn handle_namespace_clear_standard(
 }
 
 /// Trusted in-process entry — the CLI operator surface supplies the daemon
-/// principal OUT OF BAND via `trusted_caller`, never through the wire
+/// principal OUT OF BAND via `out_of_band_caller`, never through the wire
 /// `params.agent_id` (#2721 / CB-19). The exact mirror of
 /// [`handle_namespace_set_standard_trusted`]: #3171 made the CLEAR owner gate
 /// unconditional, so the operator remediation path (clearing a standard bound
@@ -873,15 +873,15 @@ pub fn handle_namespace_clear_standard(
 pub fn handle_namespace_clear_standard_trusted(
     conn: &rusqlite::Connection,
     params: &Value,
-    trusted_caller: &str,
+    out_of_band_caller: &str,
 ) -> Result<Value, String> {
-    handle_namespace_clear_standard_inner(conn, params, Some(trusted_caller))
+    handle_namespace_clear_standard_inner(conn, params, Some(out_of_band_caller))
 }
 
 fn handle_namespace_clear_standard_inner(
     conn: &rusqlite::Connection,
     params: &Value,
-    trusted_caller: Option<&str>,
+    out_of_band_caller: Option<&str>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
@@ -892,7 +892,7 @@ fn handle_namespace_clear_standard_inner(
     // #3171 — single-sourced with the SET twin via
     // `resolve_namespace_standard_caller`, so a reserved sentinel is honored
     // only when supplied OUT OF BAND by a trusted in-process surface.
-    let caller = resolve_namespace_standard_caller(params, trusted_caller)?;
+    let caller = resolve_namespace_standard_caller(params, out_of_band_caller)?;
 
     // #1777 — owner gate, MIRRORING the #929 SET gate above. Clearing a
     // namespace's governance STANDARD reverts it to permissive allow-on-silence,
@@ -1479,7 +1479,7 @@ mod tests {
     /// helper `resolve_namespace_standard_caller`. The end-to-end 2721 test
     /// above exercises the handlers, but the Per-Module Coverage gate dips on
     /// the two branches of this pure resolver, so pin them directly:
-    ///   (a) a `trusted_caller` is returned VERBATIM (the out-of-band operator
+    ///   (a) an `out_of_band_caller` is returned VERBATIM (the out-of-band operator
     ///       surface — the daemon/reserved principal it carries is honored);
     ///   (b) a wire `agent_id` equal to a reserved sentinel (`daemon`) falls to
     ///       `ANONYMOUS_INVALID` — the security-critical CB-19 branch a wire
@@ -1500,7 +1500,7 @@ mod tests {
             resolve_namespace_standard_caller(&params_with_wire, Some(sentinels::DAEMON_PRINCIPAL))
                 .expect("trusted caller never refuses"),
             sentinels::DAEMON_PRINCIPAL,
-            "a trusted_caller must be returned verbatim (out-of-band operator surface)"
+            "an out_of_band_caller must be returned verbatim (out-of-band operator surface)"
         );
 
         // (b) Wire agent_id spoofing the reserved daemon sentinel, with NO

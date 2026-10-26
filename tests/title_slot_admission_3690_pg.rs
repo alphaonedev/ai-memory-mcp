@@ -68,7 +68,7 @@ async fn connect() -> Option<PostgresStore> {
     )
 }
 
-fn uid(prefix: &str) -> String {
+fn fresh_name(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
@@ -152,8 +152,8 @@ async fn pg_schema_v100_carries_the_partial_title_slot_index_3690() {
 async fn pg_store_beside_a_tombstone_lands_as_a_fresh_visible_row_3690() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_agent("ai:tester-3690");
-    let ns = uid("ns");
-    let (a, b) = (uid("a"), uid("b"));
+    let ns = fresh_name("ns");
+    let (a, b) = (fresh_name("a"), fresh_name("b"));
     store
         .store(&ctx, &mem(&a, &ns, "slot", "consolidated away"))
         .await
@@ -174,14 +174,14 @@ async fn pg_store_beside_a_tombstone_lands_as_a_fresh_visible_row_3690() {
         ("consolidated away".to_string(), "tombstoned".to_string(), 1)
     );
     // the embedded hot path too (`store_with_embedding_inner`, Merge arm)
-    let c = uid("c");
+    let c = fresh_name("c");
     let id = store
         .store_with_embedding(&ctx, &mem(&c, &ns, "slot-emb", "x"), None, None)
         .await
         .expect("seed emb");
     assert_eq!(id, c);
     set_state(&store, &c, "tombstoned").await;
-    let d = uid("d");
+    let d = fresh_name("d");
     let id = store
         .store_with_embedding(&ctx, &mem(&d, &ns, "slot-emb", "fresh"), None, None)
         .await
@@ -197,8 +197,8 @@ async fn pg_store_onto_a_hidden_holder_is_a_typed_unnamed_conflict_3695() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_agent("ai:tester-3690");
     for hidden in ["quarantined", "contaminated"] {
-        let ns = uid("ns");
-        let a = uid("a");
+        let ns = fresh_name("ns");
+        let a = fresh_name("a");
         store
             .store(&ctx, &mem(&a, &ns, "slot", "peer text"))
             .await
@@ -206,7 +206,7 @@ async fn pg_store_onto_a_hidden_holder_is_a_typed_unnamed_conflict_3695() {
         set_state(&store, &a, hidden).await;
 
         let err = store
-            .store(&ctx, &mem(&uid("b"), &ns, "slot", "local"))
+            .store(&ctx, &mem(&fresh_name("b"), &ns, "slot", "local"))
             .await
             .expect_err("store: refused");
         assert_eq!(
@@ -215,7 +215,12 @@ async fn pg_store_onto_a_hidden_holder_is_a_typed_unnamed_conflict_3695() {
             "{hidden}: store never names the hidden row"
         );
         let err = store
-            .store_with_embedding(&ctx, &mem(&uid("c"), &ns, "slot", "local"), None, None)
+            .store_with_embedding(
+                &ctx,
+                &mem(&fresh_name("c"), &ns, "slot", "local"),
+                None,
+                None,
+            )
             .await
             .expect_err("store_with_embedding: refused");
         assert_eq!(
@@ -226,7 +231,7 @@ async fn pg_store_onto_a_hidden_holder_is_a_typed_unnamed_conflict_3695() {
         let err = store
             .store_with_embedding_no_overwrite(
                 &ctx,
-                &mem(&uid("d"), &ns, "slot", "local"),
+                &mem(&fresh_name("d"), &ns, "slot", "local"),
                 None,
                 None,
             )
@@ -238,7 +243,7 @@ async fn pg_store_onto_a_hidden_holder_is_a_typed_unnamed_conflict_3695() {
             "{hidden}: no-overwrite never names the hidden row"
         );
         let err = store
-            .store_batch(&ctx, &[mem(&uid("e"), &ns, "slot", "local")])
+            .store_batch(&ctx, &[mem(&fresh_name("e"), &ns, "slot", "local")])
             .await
             .expect_err("store_batch: refused");
         assert_eq!(
@@ -267,8 +272,8 @@ async fn pg_store_onto_a_hidden_holder_is_a_typed_unnamed_conflict_3695() {
 async fn pg_find_by_title_namespace_reports_only_the_visible_occupant_3690() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_agent("ai:tester-3690");
-    let ns = uid("ns");
-    let a = uid("a");
+    let ns = fresh_name("ns");
+    let a = fresh_name("a");
     store
         .store(&ctx, &mem(&a, &ns, "slot", "x"))
         .await
@@ -317,8 +322,8 @@ async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
     // snapshot's state via the ONE re-open predicate
     // (`LifecycleState::restore_reopens_row`, rendered into the restore arm
     // by `models::restore_reopen_lifecycle_assignment` on both adapters).
-    let ns = uid("ns");
-    let a = uid("a");
+    let ns = fresh_name("ns");
+    let a = fresh_name("a");
     store
         .store(&ctx, &mem(&a, &ns, "slot", "pre-tombstone"))
         .await
@@ -365,14 +370,14 @@ async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
     // a different live row holds the key → refused, naming it. (Fresh
     // namespace: since #2894 the tombstone above re-opened, so it holds its
     // own key again - the holder scenario needs its own key.)
-    let ns_hold = uid("ns");
-    let t = uid("t");
+    let ns_hold = fresh_name("ns");
+    let t = fresh_name("t");
     store
         .store(&ctx, &mem(&t, &ns_hold, "slot", "original"))
         .await
         .expect("seed tombstone-to-be");
     set_state(&store, &t, "tombstoned").await;
-    let h = uid("h");
+    let h = fresh_name("h");
     store
         .store(&ctx, &mem(&h, &ns_hold, "slot", "live holder"))
         .await
@@ -393,8 +398,8 @@ async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
     );
 
     // quarantined same id → refused unnamed
-    let ns2 = uid("ns");
-    let q = uid("q");
+    let ns2 = fresh_name("ns");
+    let q = fresh_name("q");
     store
         .store(&ctx, &mem(&q, &ns2, "slot", "peer text"))
         .await
@@ -417,8 +422,8 @@ async fn pg_restore_same_id_dispositions_across_hidden_rows_2887_3690_3695() {
 async fn pg_merge_store_reusing_a_tombstones_id_is_refused_3690() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_agent("ai:tester-3690");
-    let ns = uid("ns");
-    let a = uid("a");
+    let ns = fresh_name("ns");
+    let a = fresh_name("a");
     store
         .store(&ctx, &mem(&a, &ns, "slot", "old"))
         .await
@@ -445,8 +450,8 @@ async fn pg_merge_store_reusing_a_tombstones_id_is_refused_3690() {
 async fn pg_plain_embed_merge_onto_own_tombstone_never_reopens_2894() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_agent("ai:tester-3690");
-    let ns = uid("ns");
-    let a = uid("a");
+    let ns = fresh_name("ns");
+    let a = fresh_name("a");
     store
         .store_with_embedding(&ctx, &mem(&a, &ns, "slot", "old"), None, None)
         .await
@@ -487,8 +492,8 @@ async fn pg_consolidate_aborts_the_cluster_when_a_source_is_quarantined_after_sn
     ai_memory::config::set_lineage_dag(true);
     ai_memory::config::set_consolidate_tombstone_sources(true);
     let ctx = CallerContext::for_admin("ai:consolidator");
-    let ns = uid("ns");
-    let (a, b) = (uid("a"), uid("b"));
+    let ns = fresh_name("ns");
+    let (a, b) = (fresh_name("a"), fresh_name("b"));
     store
         .store(&ctx, &mem(&a, &ns, "a-3691", "alpha"))
         .await
@@ -497,7 +502,7 @@ async fn pg_consolidate_aborts_the_cluster_when_a_source_is_quarantined_after_sn
         .store(&ctx, &mem(&b, &ns, "b-3691", "beta"))
         .await
         .expect("seed b");
-    let summary_title = uid("C-3691");
+    let summary_title = fresh_name("C-3691");
     let fn_name = format!("quarantine_b_{}", uuid::Uuid::new_v4().simple());
     sqlx::raw_sql(&format!(
         "CREATE FUNCTION {fn_name}() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -564,8 +569,8 @@ async fn pg_find_contradictions_skips_hidden_rows_3693() {
     let Some(store) = connect().await else { return };
     let ctx = CallerContext::for_agent("ai:tester-3690");
     for hidden in ["quarantined", "contaminated", "tombstoned"] {
-        let ns = uid("ns");
-        let (hid, vis) = (uid("hid"), uid("vis"));
+        let ns = fresh_name("ns");
+        let (hid, vis) = (fresh_name("hid"), fresh_name("vis"));
         store
             .store(&ctx, &mem(&hid, &ns, "deploy strategy canary", "peer text"))
             .await
@@ -626,19 +631,19 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
         serde_json::json!({"agent_id": ""}),
     ] {
         // plain store
-        let ns = uid("ns");
-        let legacy = uid("legacy");
+        let ns = fresh_name("ns");
+        let legacy = fresh_name("legacy");
         let mut seed = mem(&legacy, &ns, "slot", "legacy text");
         seed.metadata = unstamped.clone();
         store.store(&ctx, &seed).await.expect("seed unstamped");
         let err = store
-            .store(&named, &mem(&uid("claimer"), &ns, "slot", "claimed"))
+            .store(&named, &mem(&fresh_name("claimer"), &ns, "slot", "claimed"))
             .await
             .expect_err("a named caller cannot read an owner-less private row: refused");
         assert_eq!(conflict_id(&err), "", "seed {unstamped}: refused unnamed");
         assert_eq!(raw(&store, &legacy).await.0, "legacy text");
         let id = store
-            .store(&ctx, &mem(&uid("claimer"), &ns, "slot", "claimed"))
+            .store(&ctx, &mem(&fresh_name("claimer"), &ns, "slot", "claimed"))
             .await
             .expect("merge (trust-all viewer)");
         assert_eq!(id, legacy);
@@ -653,7 +658,7 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
             "the merge itself still happened"
         );
         // embedded store + batch
-        let legacy2 = uid("legacy2");
+        let legacy2 = fresh_name("legacy2");
         let mut seed = mem(&legacy2, &ns, "slot-emb", "legacy text");
         seed.metadata = unstamped.clone();
         store
@@ -663,7 +668,7 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
         let id = store
             .store_with_embedding(
                 &ctx,
-                &mem(&uid("claimer"), &ns, "slot-emb", "claimed"),
+                &mem(&fresh_name("claimer"), &ns, "slot-emb", "claimed"),
                 None,
                 None,
             )
@@ -676,7 +681,10 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
             "store_with_embedding: seed {unstamped}"
         );
         let ids = store
-            .store_batch(&ctx, &[mem(&uid("claimer"), &ns, "slot-emb", "batched")])
+            .store_batch(
+                &ctx,
+                &[mem(&fresh_name("claimer"), &ns, "slot-emb", "batched")],
+            )
             .await
             .expect("batch merge");
         assert_eq!(ids, vec![legacy2.clone()]);
@@ -687,13 +695,13 @@ async fn pg_upsert_merge_onto_an_unstamped_row_leaves_it_unstamped_3626() {
         );
     }
     // stamped control
-    let ns = uid("ns");
-    let owned = uid("owned");
+    let ns = fresh_name("ns");
+    let owned = fresh_name("owned");
     store
         .store(&named, &mem(&owned, &ns, "slot", "owned text"))
         .await
         .expect("seed");
-    let mut other = mem(&uid("other"), &ns, "slot", "x");
+    let mut other = mem(&fresh_name("other"), &ns, "slot", "x");
     other.metadata = serde_json::json!({ "agent_id": "ai:someone-else" });
     store.store(&ctx, &other).await.expect("merge");
     assert_eq!(
@@ -713,12 +721,12 @@ async fn pg_store_onto_another_agents_private_row_is_a_typed_unnamed_conflict_36
     let Some(store) = connect().await else { return };
     let alice = CallerContext::for_agent("ai:alice-3696");
     let bob = CallerContext::for_agent("ai:bob-3696");
-    let ns = uid("ns");
-    let a = uid("a");
+    let ns = fresh_name("ns");
+    let a = fresh_name("a");
     let mut seed = mem(&a, &ns, "slot", "alice's text");
     seed.metadata = serde_json::json!({ "agent_id": "ai:alice-3696", "scope": "private" });
     store.store(&alice, &seed).await.expect("seed");
-    let mut bobs = mem(&uid("b"), &ns, "slot", "bob's text");
+    let mut bobs = mem(&fresh_name("b"), &ns, "slot", "bob's text");
     bobs.metadata = serde_json::json!({ "agent_id": "ai:bob-3696", "scope": "private" });
 
     let err = store.store(&bob, &bobs).await.expect_err("store: refused");
@@ -758,7 +766,7 @@ async fn pg_store_onto_another_agents_private_row_is_a_typed_unnamed_conflict_36
         Some(a.clone())
     );
     // the owner's re-store still merges
-    let mut again = mem(&uid("c"), &ns, "slot", "alice v2");
+    let mut again = mem(&fresh_name("c"), &ns, "slot", "alice v2");
     again.metadata = serde_json::json!({ "agent_id": "ai:alice-3696", "scope": "private" });
     let id = store.store(&alice, &again).await.expect("owner merges");
     assert_eq!(id, a);
@@ -777,12 +785,12 @@ async fn pg_refused_conflict_keeps_its_typed_shape_and_a_visible_occupant_keeps_
     let alice = CallerContext::for_agent("ai:alice-3696");
     let bob = CallerContext::for_agent("ai:bob-3696");
     let admin = CallerContext::for_admin("ai:substrate-3696");
-    let ns = uid("ns");
-    let a = uid("a");
+    let ns = fresh_name("ns");
+    let a = fresh_name("a");
     let mut seed = mem(&a, &ns, "slot", "alice's text");
     seed.metadata = serde_json::json!({ "agent_id": "ai:alice-3696", "scope": "private" });
     store.store(&alice, &seed).await.expect("seed");
-    let mut bobs = mem(&uid("b"), &ns, "slot", "bob's text");
+    let mut bobs = mem(&fresh_name("b"), &ns, "slot", "bob's text");
     bobs.metadata = serde_json::json!({ "agent_id": "ai:bob-3696", "scope": "private" });
     // hidden to bob: typed Conflict, id EMPTY
     let err = store

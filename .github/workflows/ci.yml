@@ -712,7 +712,7 @@ jobs:
     #                                 `cargo audit` steps to the leg, so +10.
     #                                 The 1500s (25 min) sqlite watchdog stays
     #                                 well inside it.
-    #   linux-fed,enterprise-fed 160  (was 80: raised in #6411/#6344, see the matrix entry.) Compile ~12 min (hoisted
+    #   linux-fed,enterprise-fed 300  (was 160, 80 before: raised in #6411/#6344 and #7914, see the matrix entry.) Compile ~12 min (hoisted
     #                                 OUTSIDE the per-invocation watchdog) plus
     #                                 the 3300s (55 min) hang-watchdog can
     #                                 legitimately approach ~67 min, so the
@@ -746,6 +746,9 @@ jobs:
     # watchdog and shard budget is capped to the job time left (JOB_T0), so a
     # named #1492 watchdog fires before GitHub's cancel. Do not raise a cap
     # for the gate.
+    # #7914: on the self-hosted linux-fed enterprise-fed leg the compile+test
+    # phase also waits for a host-local semaphore slot (2 slots, up to 3600 s);
+    # that wait counts against the cap (JOB_T0 is unchanged), hence 300 there.
     timeout-minutes: ${{ matrix.timeout }}
     env:
       # Debuginfo budget for this job — the heaviest compile in CI (~600
@@ -877,7 +880,20 @@ jobs:
             # first measured sharded run (#6344 review r2 F1): re-derive both
             # from the per-shard timings after the first green run. Budget
             # table: docs/ci/CARRIER-BRANCH-GATES.md.
-            timeout: 160
+            # #7914 - 300 on this leg only (self-hosted, no billing). The
+            # host-local semaphore ("Run tests (impact-aware)" runs under
+            # scripts/ci/host_semaphore.py) admits 2 compile+test phases at
+            # once and its wait counts against this cap: run 39686450440
+            # attempt 2 had the serial shard budget cut to 5239 s (160 min -
+            # 4061 s elapsed - 300 s) and the #1492 watchdog killed it
+            # (serial=124) with no test failing; the same leg alone took
+            # ~7980 s. Budget identity (pinned by test_ci_semaphore_wiring_7914):
+            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)
+            # The waits are kept, not shrunk, because they are what bound
+            # contention on a 4-runner host (#7928). The semaphore wait is the
+            # one named constant HOST_SEMAPHORE_MAX_WAIT_SECS below. The
+            # macos-fed and hosted caps are unchanged.
+            timeout: 300
           - leg: macos-fed,sqlite
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
@@ -1414,9 +1430,22 @@ jobs:
           # #6795 — the job cap (minutes) the serial shard budget is derived from.
           JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
           CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
+          # #7914 - slots of the host-local semaphore for the self-hosted
+          # linux-fed enterprise-fed leg; 0 = no semaphore (every other leg).
+          HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' && '2' || '0' }}
+          # #7928 - the one place the semaphore wait is set (seconds); it is a
+          # term of the job cap identity in the matrix timeout comment.
+          HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'
         shell: bash
         run: |
           set -euo pipefail
+          # #7914 - bound how many legs compile and test at once on this host:
+          # re-run this very script under host_semaphore.py (the slot is held
+          # for the whole compile+test phase; the exit code is the script's).
+          if [ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ] && [ -z "${HOST_SEMAPHORE_HELD:-}" ]; then
+            export HOST_SEMAPHORE_HELD=1
+            exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots "$HOST_SEMAPHORE_SLOTS" --max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS" --label "${CI_NODE}/${TIER}" -- bash --noprofile --norc -eo pipefail "$0"
+          fi
           # #6795 — JOB_T0 is written to $GITHUB_ENV by the first step of the job.
           # Invalid or missing: warn and keep the flat watchdog values (fail
           # toward the old behaviour, never toward a 0 s or empty watchdog).
