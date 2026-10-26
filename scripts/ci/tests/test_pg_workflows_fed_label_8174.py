@@ -42,9 +42,13 @@ every node):
       outside block scalars, is pinned as a literal tuple (``EXPECTED_STEPS_IGNORED`` /
       ``EXPECTED_STEPS_CERT``), so an added, removed, reordered or changed step, ``uses:`` ref, ``with:`` or
       ``env:`` entry, and a deep continuation inside a step are named defects with line numbers. Block
-      scalar content (the ``run:`` bodies) is outside both pins; the Point-at run text is pinned by the body
-      check above. Maintenance cost: an edit to any step key line of either workflow is made in the same PR
-      as the matching edit to the step-list tuple. U+0085, U+2028, U+2029 and a CR before the last character
+      scalar content (the ``run:`` bodies) is outside those two pins; (3) Run bodies: the run text of EVERY step
+      of the job (each block scalar, non-blank lines, trailing whitespace stripped, indentation and comments
+      kept) is pinned as a literal tuple per workflow (``EXPECTED_RUN_BODIES_IGNORED`` / ``EXPECTED_RUN_BODIES_CERT``),
+      so a changed earlier body (a ``$GITHUB_ENV`` or ``$GITHUB_PATH`` write, a lost ``exit 1``, even a comment
+      line) is a named ``run-body line N`` defect; the Point-at body stays with the Point-at check above (only
+      its mark is listed). Maintenance cost: an edit to any step key line or run body of either workflow is made
+      in the same PR as the matching edit to the step-list and run-body tuples. U+0085, U+2028, U+2029 and a CR before the last character
       are refused anywhere in the file: PyYAML ends a line at each of them but a ``\n`` split does not, so a
       comment line carrying one can hide a key line from every line-based pin (membership test, not
       ``str.splitlines()``, so the reported line numbers stay the LF ones).
@@ -118,7 +122,7 @@ EXPECTED_POINT_AT_RUN_CERT = (
     'export PATH',
     'url_file="$HOME/.ai-memory-ci-fed-url"',
     'if [ ! -f "$url_file" ]; then',
-    'echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"',
+    'echo "::error::$RUNNER_NAME is missing $url_file \u2014 the native cert tier URL is not provisioned on this node"',
     'exit 1',
     'fi',
     'base_url="$(cat "$url_file")"',
@@ -164,7 +168,7 @@ EXPECTED_POINT_AT_RUN_CERT = (
     '# Both the pg and AGE test URLs are the same ephemeral db on the',
     '# native tier (a single PG 18.6 + AGE 1.8.0 + pgvector 0.8.7',
     '# instance). Setting AI_MEMORY_TEST_AGE_URL is what stops the',
-    '# AGE-backed cells from self-skipping — the whole point of the in-PR',
+    '# AGE-backed cells from self-skipping \u2014 the whole point of the in-PR',
     '# cert evidence (#2548).',
     '{',
     'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url"',
@@ -183,7 +187,7 @@ EXPECTED_POINT_AT_RUN_IGNORED = (
     'export PATH',
     'url_file="$HOME/.ai-memory-ci-fed-url"',
     'if [ ! -f "$url_file" ]; then',
-    'echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"',
+    'echo "::error::$RUNNER_NAME is missing $url_file \u2014 the native cert tier URL is not provisioned on this node"',
     'exit 1',
     'fi',
     'base_url="$(cat "$url_file")"',
@@ -413,7 +417,7 @@ EXPECTED_STEPS_CERT = (
     '        run: |',
     '      - name: Wait for native tier readiness',
     '        run: |',
-    '      - name: Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)',
+    '      - name: Ensure AGE + vector extensions present (best-effort \u2014 tier is pre-provisioned)',
     '        run: |',
     '      - name: Assert certified stack versions (cert evidence, hard-fail on drift)',
     '        run: |',
@@ -439,6 +443,251 @@ EXPECTED_STEPS_CERT = (
     "        if: always() && runner.environment == 'self-hosted'",
     '        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}',
 )
+# decision: pin the run text of every step of the pinned job as a literal tuple over pinning only the steps
+# after the checkout, because the r12 step-list pin already proved the literal-tuple mechanism refuses every
+# changed line in any spelling and extending it to every run body closes code r12 F2 / security r12 F2 with
+# the same mechanism (precedent PR 8252 7aacb037e and e1e4b84f7; LOW with precedent, no vote).
+# One tuple per workflow: RUN_BODY_MARK for each block scalar, then its non-blank lines in file order. The
+# Point-at body is the Point-at pin's (EXPECTED_POINT_AT_RUN_*), so only its mark is listed. Copied from the
+# workflows, never built from them at test time.
+EXPECTED_RUN_BODIES_IGNORED = (
+    '<run body>',
+    '          test -x "$HOME/.cargo/bin/rustup" || {',
+    '            echo "::error::rustup is not provisioned at \\$HOME/.cargo/bin/rustup on $RUNNER_NAME \u2014 repair the node."',
+    '            exit 1',
+    '          }',
+    '<run body>',
+    '<run body>',
+    '          set -euo pipefail',
+    '          # #3552 non-vacuity: list first, then run, then FAIL if executed',
+    '          # < listed or < the committed ratchet (or if any skip: line',
+    '          # appears \u2014 live_pg() connect failure is FAIL in a cert leg).',
+    '          mkdir -p .local-runs',
+    '          LIST_OUT=".local-runs/postgres-ignored-list.txt"',
+    '          TEST_OUT=".local-runs/postgres-ignored-run.txt"',
+    '          cargo test --features sal-postgres -- --ignored --list | tee "$LIST_OUT"',
+    '          LISTED="$(grep -c \': test$\' "$LIST_OUT" || true)"',
+    '          set +e',
+    '          cargo test --features sal-postgres -- --ignored --test-threads=1 2>&1 | tee "$TEST_OUT"',
+    '          rc="${PIPESTATUS[0]}"',
+    '          set -e',
+    '          bash scripts/check-cert-leg-nonvacuity.sh \\',
+    '            --leg postgres-ignored --log "$TEST_OUT" --listed "$LISTED"',
+    '          exit "$rc"',
+    '<run body>',
+    '          set -euo pipefail',
+    '          if [ -z "${CI_FED_DB:-}" ]; then',
+    '            echo "::notice::no ephemeral db to drop (CI_FED_DB unset \u2014 configure never ran)"',
+    '            exit 0',
+    '          fi',
+    '          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do',
+    '            [ -d "$d" ] && PATH="$d:$PATH"',
+    '          done',
+    '          export PATH',
+    '          url_file="$HOME/.ai-memory-ci-fed-url"',
+    '          if [ ! -f "$url_file" ]; then',
+    '            echo "::warning::cannot drop $CI_FED_DB \u2014 $url_file missing on $RUNNER_NAME (leaked ephemeral db)"',
+    '            exit 0',
+    '          fi',
+    '          base_url="$(cat "$url_file")"',
+    '          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \\"$CI_FED_DB\\" WITH (FORCE);"; then',
+    '            echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"',
+    '          else',
+    '            echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"',
+    '          fi',
+)
+EXPECTED_RUN_BODIES_CERT = (
+    '<run body>',
+    '          test -x "$HOME/.cargo/bin/rustup" || {',
+    '            echo "::error::rustup is not provisioned at \\$HOME/.cargo/bin/rustup on $RUNNER_NAME \u2014 repair the node."',
+    '            exit 1',
+    '          }',
+    '<run body>',
+    '<run body>',
+    '          set -euo pipefail',
+    '          # ONE declaration source (#B1): every version literal this job',
+    '          # exercises comes from deploy/docker-1461/provision/lib.sh \u2014 the',
+    '          # SAME file the docker-1461 mesh + its validate harness consume.',
+    '          # Nothing below is re-typed as a bare literal; a future SSOT pin',
+    '          # bump (e.g. a PG 18.5 point release) moves this job automatically.',
+    '          source deploy/docker-1461/provision/lib.sh',
+    '          {',
+    '            echo "CERT_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"',
+    '            echo "CERT_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"',
+    '            # pg_extension.extversion for pgvector reports the bare semver',
+    '            # (e.g. "0.8.7"), never the pgdg package suffix \u2014 strip it here',
+    '            # once so the assert step below has no literal of its own.',
+    '            echo "CERT_EXPECTED_PGVECTOR_VERSION=${PGVECTOR_APT_VERSION%%-*}"',
+    '          } >> "$GITHUB_ENV"',
+    '          echo "::notice::certified pins resolved from deploy/docker-1461/provision/lib.sh \u2014 PG server ${EXPECTED_PG_VERSION}, AGE server ${EXPECTED_AGE_VERSION}, pgvector ${PGVECTOR_APT_VERSION%%-*}"',
+    '<run body>',
+    '          set -euo pipefail',
+    '          attempt=1',
+    '          while [ "$attempt" -le 30 ]; do',
+    '            if psql "$AI_MEMORY_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -tAc \'SELECT 1\' >/dev/null 2>&1; then',
+    '              echo "::notice::native cert tier is up"',
+    '              exit 0',
+    '            fi',
+    '            attempt=$((attempt + 1))',
+    '            sleep 2',
+    '          done',
+    '          echo "::error::native enterprise-fed tier did not answer within 60s on $RUNNER_NAME"',
+    '          exit 1',
+    '<run body>',
+    '          set -euo pipefail',
+    '          # The native cert tier is provisioned with the pinned extensions +',
+    '          # the memory_graph AGE graph already. These statements are',
+    '          # BEST-EFFORT self-heal only: the test user on a verify-full tier may',
+    '          # lack CREATE EXTENSION privilege, and that is fine \u2014 the "Assert',
+    '          # certified stack versions" step below is the load-bearing check and',
+    '          # HARD-FAILS if any extension is actually absent or off-version.',
+    '          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -v ON_ERROR_STOP=0"',
+    '          $PSQL -c "CREATE EXTENSION IF NOT EXISTS vector;" || echo "vector: pre-provisioned or no CREATE priv (asserted below)"',
+    '          $PSQL -c "CREATE EXTENSION IF NOT EXISTS age;" || echo "age: pre-provisioned or no CREATE priv (asserted below)"',
+    '          $PSQL -c "LOAD \'age\'; SET search_path = ag_catalog, \\"\\$user\\", public; SELECT ag_catalog.create_graph(\'memory_graph\');" || echo "memory_graph already exists / no priv / AGE init handled by ladder"',
+    '<run body>',
+    '          set -euo pipefail',
+    '          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -tAX"',
+    '          # split_part(...,\' \',1) strips the "(Debian 18.4-1.pgdg13+1)" build',
+    '          # metadata SHOW server_version / current_setting append after the',
+    "          # bare version \u2014 without this, tr -d '[:space:]' collapses that",
+    '          # into "18.4(Debian18.4-1.pgdg13+1)", which never equals the exact',
+    '          # SSOT string and false-reds the assert below even when the',
+    '          # server IS the certified 18.4.',
+    '          pg_ver=$($PSQL -c "SELECT split_part(current_setting(\'server_version\'), \' \', 1);" | tr -d \'[:space:]\')',
+    '          age_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname=\'age\';" | tr -d \'[:space:]\')',
+    '          vec_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname=\'vector\';" | tr -d \'[:space:]\')',
+    '          echo "::notice::certified stack \u2014 PostgreSQL=$pg_ver  Apache AGE=$age_ver  pgvector=$vec_ver"',
+    '          {',
+    '            echo "### Certified Postgres + AGE + pgvector tier"',
+    '            echo ""',
+    '            echo "| component | running | certified (SSOT) |"',
+    '            echo "| --- | --- | --- |"',
+    '            echo "| PostgreSQL | $pg_ver | ${CERT_EXPECTED_PG_VERSION} |"',
+    '            echo "| Apache AGE | $age_ver | ${CERT_EXPECTED_AGE_VERSION} |"',
+    '            echo "| pgvector | $vec_ver | ${CERT_EXPECTED_PGVECTOR_VERSION} |"',
+    '          } >> "$GITHUB_STEP_SUMMARY"',
+    '          # EXACT-minor assertion (#B1) \u2014 the SSOT-pinned minor, not merely',
+    '          # the major. A base-image drift off the exact pinned minor (an apt',
+    '          # snapshot moving, a base-image digest update) must RED, never',
+    '          # silently certify a different version than the one the docs cite.',
+    '          case "$pg_ver" in',
+    '            "$CERT_EXPECTED_PG_VERSION") echo "PostgreSQL $pg_ver == certified $CERT_EXPECTED_PG_VERSION OK" ;;',
+    '            *) echo "::error::expected PostgreSQL exactly $CERT_EXPECTED_PG_VERSION (certified, deploy/docker-1461/provision/lib.sh EXPECTED_PG_VERSION), got \'$pg_ver\' \u2014 CI must not certify a version it does not run (\xa75.4(3))"; exit 1 ;;',
+    '          esac',
+    '          # Certified AGE is exactly 1.7.0. Reject 1.6.x and anything else \u2014',
+    '          # the whole point of #2512 is that CI must run the certified 1.7.0,',
+    '          # not merely a 1.7.* rendering of a different point release.',
+    '          case "$age_ver" in',
+    '            "$CERT_EXPECTED_AGE_VERSION") echo "Apache AGE $age_ver == certified $CERT_EXPECTED_AGE_VERSION OK" ;;',
+    '            *) echo "::error::expected Apache AGE exactly $CERT_EXPECTED_AGE_VERSION (certified, deploy/docker-1461/provision/lib.sh EXPECTED_AGE_VERSION), got \'$age_ver\' \u2014 CI must not certify a version it does not run (\xa75.4(3))"; exit 1 ;;',
+    '          esac',
+    '          # pgvector must match the SSOT-pinned semver exactly (allowing only',
+    '          # for a trailing suffix the extversion column itself might carry).',
+    '          case "$vec_ver" in',
+    '            "") echo "::error::pgvector extension not present"; exit 1 ;;',
+    '            ${CERT_EXPECTED_PGVECTOR_VERSION}*) echo "pgvector $vec_ver == certified ${CERT_EXPECTED_PGVECTOR_VERSION} OK" ;;',
+    '            *) echo "::error::expected pgvector exactly ${CERT_EXPECTED_PGVECTOR_VERSION} (certified, deploy/docker-1461/provision/lib.sh PGVECTOR_APT_VERSION), got \'$vec_ver\' \u2014 CI must not certify a version it does not run (\xa75.4(3))"; exit 1 ;;',
+    '          esac',
+    '<run body>',
+    '          set -euo pipefail',
+    '          # The pg-parity binaries are the cross-backend parity cells (they do',
+    '          # not touch AGE). The AGE-backed binaries self-skip unless',
+    '          # AI_MEMORY_TEST_AGE_URL is set (it is, in env: above), so they run',
+    '          # here \u2014 this is the in-PR cert evidence that was missing (#2548).',
+    '          # `--include-ignored` also runs the explicitly #[ignore]-gated cells',
+    '          # (e.g. age_cypher_param_binding_2511). --test-threads=1 because the',
+    '          # sal-postgres suite shares one database with no per-test isolation.',
+    '          #',
+    '          # #3552 non-vacuity: list first, then run, then FAIL if executed',
+    '          # < listed or < the committed ratchet (or if any skip: line',
+    '          # appears \u2014 live_pg() connect failure is FAIL in a cert leg).',
+    '          mkdir -p .local-runs',
+    '          LIST_OUT=".local-runs/cert-postgres-age-list.txt"',
+    '          TEST_OUT=".local-runs/cert-postgres-age-run.txt"',
+    '          TESTS=(',
+    '            --test secret_screen_postgres_parity_g29',
+    '            --test postgres_l2_rehydration_1693',
+    '            --test erasure_fanout_postgres_g30',
+    '            --test recall_purity_p01_postgres',
+    '            --test qual_pg_write_funnel_parity_2393_2397',
+    '            --test store_parity_gaps',
+    '            --test age_cypher_param_binding_2511',
+    '            --test kg_query_relation_parity_2792',
+    '            --test g2_postgres_find_paths_age_param_binding',
+    '            --test g4_postgres_link_projects_into_age_graph',
+    '            --test g5_find_paths_cte_served_on_age',
+    '            --test kg_age_fallback',
+    '            --test kg_age_orphan_graph_3883',
+    '            --test age_cte_equivalence',
+    '            --test issue_1482_age_cypher_persistent',
+    '            --test pillar4_4c_deferred_age_cold_path_1735',
+    '            --test pillar4_4d_age_unprojection_on_delete_1783',
+    '            --test age_deferred_projection_cluster_2375_2376_2377',
+    '            --test bootstrap_node_cert_gate_3016',
+    '          )',
+    '          cargo test --features sal-postgres "${TESTS[@]}" \\',
+    '            -- --include-ignored --list | tee "$LIST_OUT"',
+    '          LISTED="$(grep -c \': test$\' "$LIST_OUT" || true)"',
+    '          set +e',
+    '          cargo test --features sal-postgres "${TESTS[@]}" \\',
+    '            -- --include-ignored --test-threads=1 2>&1 | tee "$TEST_OUT"',
+    '          rc="${PIPESTATUS[0]}"',
+    '          set -e',
+    '          bash scripts/check-cert-leg-nonvacuity.sh \\',
+    '            --leg cert-postgres-age --log "$TEST_OUT" --listed "$LISTED"',
+    '          exit "$rc"',
+    '<run body>',
+    '          set -euo pipefail',
+    '          # Load-bearing end-to-end proof (sibling to',
+    '          # scripts/check-cert-removal-proof.sh): LEG A proves #3061 makes',
+    '          # posture control #15 ARMABLE on a postgres store (doctor --posture',
+    '          # exit 0 in the certified pg config, with negative controls for the',
+    '          # attestation + verify-full halves \u2014 env-only, no live pg needed);',
+    '          # LEG B proves the #3016/#3067 born-dirty -> bootstrap-node -> clean',
+    '          # gate on a fresh sqlite node. Reuse the sal-postgres build cache for',
+    '          # the `ai-memory` binary so no second toolchain build is needed.',
+    '          # #4333/#4434: LEG A is certified in two shapes. This build is the',
+    '          # A-pg binary (sal-postgres); the gate self-builds the driverless',
+    '          # binary for LEG A-driverless (a driverless binary must REFUSE).',
+    '          cargo build --features sal-postgres --bin ai-memory',
+    '          AI_MEMORY_BIN_PG="$(pwd)/target/debug/ai-memory" \\',
+    '            bash scripts/check-bootstrap-cert-gate.sh',
+    '<run body>',
+    '          python3 scripts/cert_gate_evidence.py \\',
+    '            --evidence-dir .local-runs/cert-bootstrap-evidence \\',
+    '            --write-redacted .local-runs/cert-bootstrap-evidence-redacted',
+    '<run body>',
+    '          set -euo pipefail',
+    '          if [ -z "${CI_FED_DB:-}" ]; then',
+    '            echo "::notice::no ephemeral db to drop (CI_FED_DB unset \u2014 configure never ran)"',
+    '            exit 0',
+    '          fi',
+    '          # Re-derive psql on PATH defensively (GITHUB_PATH from the configure',
+    '          # step normally carries it, but this step must not depend on that).',
+    '          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do',
+    '            [ -d "$d" ] && PATH="$d:$PATH"',
+    '          done',
+    '          export PATH',
+    '          url_file="$HOME/.ai-memory-ci-fed-url"',
+    '          if [ ! -f "$url_file" ]; then',
+    '            echo "::warning::cannot drop $CI_FED_DB \u2014 $url_file missing on $RUNNER_NAME (leaked ephemeral db)"',
+    '            exit 0',
+    '          fi',
+    '          base_url="$(cat "$url_file")"',
+    '          # Connect to the base ai_memory_test to drop the ephemeral db. FORCE',
+    '          # terminates any lingering backend so the drop cannot wedge on a',
+    '          # still-connected test process.',
+    '          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \\"$CI_FED_DB\\" WITH (FORCE);"; then',
+    '            echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"',
+    '          else',
+    '            echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"',
+    '          fi',
+)
+RUN_BODIES_BY_WORKFLOW = {
+    "postgres-ignored.yml": EXPECTED_RUN_BODIES_IGNORED,
+    "cert-postgres-age.yml": EXPECTED_RUN_BODIES_CERT,
+}
 STEPS_BY_WORKFLOW = {
     "postgres-ignored.yml": EXPECTED_STEPS_IGNORED,
     "cert-postgres-age.yml": EXPECTED_STEPS_CERT,
@@ -456,6 +705,7 @@ QUOTED_BACKSLASH_RX = re.compile(r"[\"'][^\"']*\\")
 NO_JOBS_DEFECT = "workflow has no exact jobs: line at indent 0"
 NO_STEPS_DEFECT = "workflow has no exact steps: line at indent 4"
 STEPS_LINE = "    steps:"
+RUN_BODY_MARK = "<run body>"
 YAML_ONLY_BREAKS = ("\x85", "\u2028", "\u2029", "\r")
 
 
@@ -557,6 +807,47 @@ def skeleton_defects(lines, workflow):
 def step_list_defects(lines, workflow):
     """Named defects of every added, removed, changed or reordered line of the whole step list."""
     return pin_defects(step_list_of(lines), STEPS_BY_WORKFLOW[workflow], "step-list", len(lines))
+
+
+def run_bodies_of(lines):
+    """``(1-based file line number, text)`` of the run text of every step of the pinned job: for each block
+    scalar after ``    steps:`` (to the end of the job) one ``RUN_BODY_MARK`` entry followed by its non-blank
+    lines, trailing whitespace stripped, indentation and comment lines kept (the body is compared byte for
+    byte). The mark's line number is the key line's. The Point-at step keeps only its mark: its body is
+    pinned by the Point-at body check, so one change is never reported twice."""
+    first = steps_line(lines)
+    if first is None:
+        return []
+    found = []
+    block_above = None
+    point_at = False
+    for number, line in enumerate(lines, 1):
+        if number <= first:
+            continue
+        if not line.strip(PIN_WS):
+            continue
+        indent = indent_of(line)
+        if block_above is not None and indent > block_above:
+            if not point_at:
+                found.append((number, line.rstrip(PIN_WS)))
+            continue
+        if is_skipped(line):
+            continue
+        block_above = None
+        if indent < SKELETON_INDENT:
+            break
+        text = line.rstrip(PIN_WS)
+        if indent == SKELETON_INDENT and text.lstrip(" ").startswith("- "):
+            point_at = bool(STEP_NAME_RX.match(line))
+        if BLOCK_SCALAR_RX.search(text):
+            block_above = key_column(text)
+            found.append((number, RUN_BODY_MARK))
+    return found
+
+
+def run_body_defects(lines, workflow):
+    """Named defects of every added, removed, changed or reordered line of any step's run text."""
+    return pin_defects(run_bodies_of(lines), RUN_BODIES_BY_WORKFLOW[workflow], "run-body", len(lines))
 
 
 def deep_line_defects(lines):
@@ -746,6 +1037,7 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
     defects += skeleton_defects(lines, name)
     defects += skeleton_form_defects(lines)
     defects += step_list_defects(lines, name)
+    defects += run_body_defects(lines, name)
     defects += deep_line_defects(lines)
     defects += line_break_defects(lines)
     if not any(ln.rstrip(PIN_WS) == "jobs:" for ln in lines):
@@ -1257,7 +1549,11 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         lines = self._text_defects_lines(0, old, old + decoy)
         if yaml is not None:
             self.assertEqual(yaml_step_keys(lines), ["name", "run"])
-        self.assertEqual(heal_defects(lines, WORKFLOWS[0].name), [])
+        # r13: the data line is not a second Point-at step (no "occurs 2 times"), but it now changes a pinned run
+        # body, so the run-body pin names it (the only defect).
+        got = heal_defects(lines, WORKFLOWS[0].name)
+        self.assertEqual(len(got), 1, got)
+        self.assertTrue(got[0].startswith("run-body line ") and decoy.strip() in got[0], got)
 
     def _text_defects_lines(self, idx, old, new):
         base = WORKFLOWS[idx].read_text(encoding="utf-8")
@@ -1668,11 +1964,11 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
 
     def test_m86_u2028_inside_a_comment_line_is_refused(self):
         """security r11 F1: U+2028 (line separator)."""
-        self._break_row(" ")
+        self._break_row("\u2028")
 
     def test_m87_u2029_inside_a_comment_line_is_refused(self):
         """security r11 F1: U+2029 (paragraph separator)."""
-        self._break_row(" ")
+        self._break_row("\u2029")
 
     def test_m91_a_lone_carriage_return_inside_a_comment_line_is_refused(self):
         """Same class as M85-M87: a CR in mid-line is a line break for PyYAML; only a trailing CR is CRLF."""
