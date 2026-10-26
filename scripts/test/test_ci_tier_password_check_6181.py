@@ -8665,7 +8665,7 @@ class TestTheCanaryDocstringsDescribeTheShippedMechanism8187R33(unittest.TestCas
         self.assertIn("tb_locals=forced", doc)
 R33_RULE = "=" * 70
 R33_FORCED_BLOCK = (
-    "FAIL: test_a (mod.Case.test_a)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+    "FAIL: test_a (mod.Case.test_a)\nA test docstring line.\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
     '  File "hook.py", line 9, in forced\n    raise error\nAssertionError: forced failure after the test body\n')
 R33_REAL_BLOCK_WITH_LOCALS = (
     "FAIL: test_b (mod.Case.test_b)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"

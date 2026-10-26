@@ -466,8 +466,8 @@ def real_failure_heads(stderr_text):
         lines = block.strip().split("\n")
         if not lines[0].startswith(("FAIL:", "ERROR:")):
             continue
-        rules = [index for index, line in enumerate(lines) if line == "-" * 70 and index > 1]
-        body = lines[:rules[-1]] if rules else lines
+        rules = [index for index, line in enumerate(lines) if line == "-" * 70]  # the first closes the header, the last opens the summary
+        body = lines[:rules[-1]] if len(rules) > 1 else lines
         closing = next((line for line in reversed(body) if line.strip()), "")
         if closing != "AssertionError: " + FORCED_MESSAGE:
             heads.append(lines[0].split(" (", 1)[0])
