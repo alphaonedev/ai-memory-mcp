@@ -59,6 +59,10 @@ STRAY_NO_IF = '      - name: stray cargo build\n        run: cargo build\n'
 STRAY_IF_FIRST = ("      - if: needs.classify.outputs.docs_only != 'true'\n"
                   '        run: cargo build\n')
 STRAY_EXEMPT_PREFIX = '      - name: docs-only short-circuit cargo\n        run: cargo build\n'
+STRAY_EXEMPT_TWICE = '      - name: docs-only short-circuit\n        run: cargo build\n'
+DOCS_ONLY_IF_LINE = "        if: needs.classify.outputs.docs_only == 'true'\n        run: echo \"::notice::docs-only PR"
+DOCS_ONLY_WIDENED = ("        if: needs.classify.outputs.docs_only == 'true' || always()\n"
+                     '        run: cargo build && echo "::notice::docs-only PR')
 LEGS_RUN_LINE = '        run: python3 -I scripts/ci/check_legs.py --github-output "$GITHUB_OUTPUT"\n'
 LEG_KEYS = ('leg', 'runner', 'node', 'tier', 'timeout', 'once', 'shared_target')
 
@@ -442,6 +446,15 @@ class MutationTable(unittest.TestCase):
                 LEGS_RUN_LINE, LEGS_RUN_LINE + '      # probe comment\n        continue-on-error: true\n', 1),
             'J1 continue-on-error on the classify job': ci.replace(
                 '    name: Classify changes\n', '    name: Classify changes\n    continue-on-error: true\n', 1),
+            # #8174 code r3 F1-F2 (m2b, m2c, m7): duplicate exempt name, widened docs-only if, job-level
+            # continue-on-error on `check`.
+            'm2b second step with an exempt name and cargo': ci.replace(
+                '      - ' + NOTICE_STEP_NAME, STRAY_EXEMPT_TWICE + '      - ' + NOTICE_STEP_NAME, 1),
+            'm2c docs-only step if widened with always() and cargo': ci.replace(
+                DOCS_ONLY_IF_LINE, DOCS_ONLY_WIDENED, 1),
+            'm7 continue-on-error on the check job': ci.replace(
+                '    name: Check (${{ matrix.leg }})\n',
+                '    name: Check (${{ matrix.leg }})\n    continue-on-error: true\n', 1),
         }
 
     def test_every_script_mutant_fails_the_behaviour_pins(self):
