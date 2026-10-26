@@ -939,14 +939,23 @@ jobs:
         run: |
           # Independent second check (security r1 F1): the no-op shape is sound only
           # for a PR that lands on a chain/ carrier, so it never reports green elsewhere.
+          # Workflow-command escaping (security r2 F1): `%` is a legal refname byte and
+          # the runner percent-decodes a command message, so escape `%` first, then CR
+          # and LF, before either ref enters a message or the step summary.
+          head_ref_esc="${HEAD_REF//'%'/%25}"
+          head_ref_esc="${head_ref_esc//$'\r'/%0D}"
+          head_ref_esc="${head_ref_esc//$'\n'/%0A}"
+          base_ref_esc="${BASE_REF//'%'/%25}"
+          base_ref_esc="${base_ref_esc//$'\r'/%0D}"
+          base_ref_esc="${base_ref_esc//$'\n'/%0A}"
           case "${BASE_REF}" in
             chain/*) ;;
             *)
-              echo "::error::leg ${LEG} refuses the hosted no-op: base ref '${BASE_REF}' is not chain/*, so no carrier run follows this PR"
+              echo "::error::leg ${LEG} refuses the hosted no-op: base ref '${base_ref_esc}' is not chain/*, so no carrier run follows this PR"
               exit 1
               ;;
           esac
-          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${HEAD_REF}, base ref ${BASE_REF}): enterprise-fed legs run on chain/* pull requests, push, merge_group and any pull request whose base is not chain/*; this topic-PR run into a chain base reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
+          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${head_ref_esc}, base ref ${base_ref_esc}): enterprise-fed legs run on chain/* pull requests, push, merge_group and any pull request whose base is not chain/*; this topic-PR run into a chain base reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
           echo "::notice::${msg}"
           echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 

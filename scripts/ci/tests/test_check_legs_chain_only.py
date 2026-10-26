@@ -249,6 +249,7 @@ def workflow_problems(ci):
             problems.append('step without the tier guard as a top-level && conjunct: %s' % name)
         if has_or:
             problems.append('step guard has a top-level || (the tier guard can be bypassed): %s' % name)
+    problems.extend(notice_escape_problems(ci))
     if "needs.classify.outputs.docs_only == 'true'" not in check or 'check_tiers' not in check:
         problems.append('Check needs a docs-only no-op notice and a tier-skip notice')
     notice = [b for b in step_blocks(check) if b.startswith(NOTICE_STEP_NAME)]
@@ -414,7 +415,11 @@ class MutationTable(unittest.TestCase):
                 'run: python3 -I scripts/ci/check_legs.py --github-output',
                 'run: python3 -I scripts/ci/check_legs.py --head-ref ${{ github.head_ref }} --github-output', 1),
             'head_ref inlined in the notice run': ci.replace(
-                'head ref ${HEAD_REF}, base ref', 'head ref ${{ github.head_ref }}, base ref', 1),
+                'head ref ${head_ref_esc}, base ref', 'head ref ${{ github.head_ref }}, base ref', 1),
+            'notice loses the percent escape of the head ref': ci.replace(
+                'head_ref_esc="${HEAD_REF//\'%\'/%25}"', 'head_ref_esc="${HEAD_REF}"', 1),
+            'notice loses the LF escape of the head ref': ci.replace(
+                'head_ref_esc="${head_ref_esc//$\'\\n\'/%0A}"', 'head_ref_esc="${head_ref_esc}"', 1),
             'drop HEAD_REF env': ci.replace('HEAD_REF: ${{ github.head_ref }}', 'HEAD_REF: ""', 1),
             # #8174 code r1 F2 (X1, X2, X4): a step with no tier guard at all must fail the pin.
             'X1 delete the whole if of Install Rust': ci.replace(
