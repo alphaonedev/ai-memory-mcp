@@ -8,6 +8,10 @@ consumes it (all four legs and their names unchanged, runner rerouted for an
 inactive tier, every guarded step carrying the tier guard) and (3) a mutation
 table: each deliberate break must make the pins fail.
 
+Fail-closed cost (#8174 security r5 F1): inside the ``check`` and ``classify`` jobs the token
+``continue-on-error`` is refused on any non-comment line, so a ``run:`` line that merely echoes
+the word is refused too; the live ci.yml carries no such line.
+
 Run: python3 -m unittest discover -s scripts/ci/tests
 Python 3.9+, standard library only (the workflow is read as text).
 """
@@ -106,6 +110,13 @@ def behaviour_problems(module):
     if nested_base != both:
         problems.append('chain/ must be a prefix match on the base, fix/chain/y got %r' % (nested_base,))
     return problems
+
+
+# A double-quoted YAML scalar in structural position carrying a backslash: a line (after any `- `
+# sequence markers) that opens with a double quote, or a flow collection (`{`, `[`) with a
+# double-quoted scalar containing a backslash. Shell lines inside `run:` bodies open with a command
+# word, so the live workflow does not match.
+DQ_ESCAPE_RE = re.compile(r'(?:-\s+)*(?:"[^"\n]*\\|[{\[].*"[^"\n]*\\)')
 
 
 def job_text(ci, job):
@@ -296,12 +307,26 @@ def workflow_problems(ci):
     for job_name, job_body in (('classify', classify), ('check', check)):
         if re.search(r'^    continue-on-error:', job_body, re.M):
             problems.append('the %s job must have no job-level continue-on-error (a failed leg must stay red)' % job_name)
-        # #8174 code r4 F1: no step of a gate job may soften a refusal, at any indent and in any
-        # spelling (`continue-on-error:true`, `continue-on-error: ${{ ... }}`).
+        # #8174 code r4 F1 + security r5 F1 / code r5 F1: no step of a gate job may soften a refusal
+        # in any spelling. Fail-closed, no YAML parser: refuse (a) the token `continue-on-error`
+        # anywhere on a non-comment line (any position, quoting or spacing around the colon),
+        # (b) any line starting with `?` (YAML explicit key) and (c) any double-quoted scalar with a
+        # backslash (an escape such as "continue\x2don-error" can spell any key). The fail-closed
+        # cost: a `run:` line that merely echoes the word is refused too; the live ci.yml has none.
+        # The named defect carries the FILE line number (job start offset plus the job line).
+        offset = ci[:ci.index(job_body)].count('\n')
         for number, line in enumerate(job_body.split('\n'), 1):
-            if line.strip().startswith('continue-on-error'):
-                problems.append('the %s job must not use continue-on-error at any indent (line %d: %r)'
-                                % (job_name, number, line.strip()))
+            text = line.strip()
+            if text.startswith('#'):
+                continue
+            where = '(line %d: %r)' % (offset + number, text)
+            if 'continue-on-error' in text:
+                problems.append('the %s job must not use continue-on-error at any indent %s' % (job_name, where))
+            elif text.startswith('?'):
+                problems.append('the %s job must not use a YAML explicit key %s' % (job_name, where))
+            elif DQ_ESCAPE_RE.match(text):
+                problems.append('the %s job must not use a backslash escape in a double-quoted key or scalar %s'
+                                % (job_name, where))
     # The step ends only at the next list item or the end of the job: comment and blank
     # lines inside it still belong to the step.
     m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\Z)', classify, re.S)
@@ -414,13 +439,20 @@ class WorkflowWiring(unittest.TestCase):
                 self.assertNotIn('cargo', step_field(b, 'run') or '')
 
     def test_step_level_continue_on_error_is_a_named_defect(self):
-        # #8174 code r4 F1: the defect quotes the line and its 1-based line within the job text.
+        # #8174 code r4 F1 + code r5 observation: the defect quotes the line and its 1-based FILE line.
         ci = CI_YML.read_text()
         mutated = ci.replace('      - id: cls\n', '      - id: cls\n        continue-on-error: true\n', 1)
-        line_no = job_text(mutated, 'classify').split('\n').index('        continue-on-error: true') + 1
+        line_no = mutated.split('\n').index('        continue-on-error: true') + 1
         want = ("the classify job must not use continue-on-error at any indent (line %d: "
                 "'continue-on-error: true')" % line_no)
         self.assertIn(want, workflow_problems(mutated))
+        # The same number on a check-job mutant (m9b), counted from the top of ci.yml.
+        step = '      - name: docs-only short-circuit\n'
+        m9b = ci.replace(step, step + '        "continue-on-error": true\n', 1)
+        line_no = m9b.split('\n').index('        "continue-on-error": true') + 1
+        want = ("the check job must not use continue-on-error at any indent (line %d: "
+                "'\"continue-on-error\": true')" % line_no)
+        self.assertIn(want, workflow_problems(m9b))
 
     def test_continue_on_error_controls_pass(self):
         # #8174 security r5 F1 controls: a comment carrying the word inside the check job passes
