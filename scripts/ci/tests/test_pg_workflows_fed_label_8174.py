@@ -1037,6 +1037,150 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
             with self.subTest(workflow=path.name):
                 self.assertEqual(heal_defects(path), [])
 
+    # Round 11 rows (security r10 F1-F3): the spellings the per-spelling regexes of rounds 8-10 passed.
+    # Each bypass row changes PyYAML's reading of the workflow while the older pin returned [].
+    JOB_BY_IDX = {0: "postgres-ignored", 1: "cert-postgres-age"}
+    DV = "{run: {shell: bash}}"
+    ANCHOR_INPUT = '    inputs:\n      note:\n        description: &d "def\\x61ults"\n'
+
+    def _spelled(self, idx, level, snippet, anchor=False):
+        """Lines of workflow ``idx`` with ``snippet`` (indent-0 text) at workflow or job level (indent +4)."""
+        base = WORKFLOWS[idx].read_text(encoding="utf-8")
+        if anchor:
+            hook = "  workflow_dispatch:\n"
+            self.assertEqual(base.count(hook), 1, "anchor drifted: " + hook.strip())
+            base = base.replace(hook, hook + self.ANCHOR_INPUT, 1)
+        if level == "workflow":
+            old, new = "jobs:\n", snippet + "jobs:\n"
+        else:
+            old = "\n  %s:\n" % self.JOB_BY_IDX[idx]
+            new = old + "".join("    " + x + "\n" for x in snippet.rstrip("\n").split("\n"))
+        self.assertEqual(base.count(old), 1, "anchor drifted: " + old.strip())
+        return base.replace(old, new, 1).split("\n")
+
+    def _assert_skeleton_refused(self, lines, idx, quoted):
+        """The pin names a skeleton line carrying ``quoted``; PyYAML is not consulted here."""
+        got = heal_defects(lines, WORKFLOWS[idx].name)
+        self.assertTrue(got, "the pin returned [] for a spelling PyYAML reads")
+        self.assertTrue(
+            any(d.startswith("skeleton line ") and quoted in d for d in got), "no skeleton defect names %r: %r" % (quoted, got)
+        )
+
+    def _defaults_row(self, snippet, quoted, levels=("workflow", "job"), anchor=False):
+        for idx in (0, 1):
+            for level in levels:
+                with self.subTest(workflow=WORKFLOWS[idx].name, level=level):
+                    lines = self._spelled(idx, level, snippet, anchor)
+                    if yaml is not None:
+                        doc = yaml.safe_load("\n".join(lines))
+                        seen = doc if level == "workflow" else doc["jobs"][self.JOB_BY_IDX[idx]]
+                        self.assertIn("defaults", seen)
+                    self._assert_skeleton_refused(lines, idx, quoted)
+
+    def test_m57_tagged_escaped_defaults_key_is_refused(self):
+        """security r10 F1: a tag in front of the escaped quoted key."""
+        self._defaults_row('!!str "\\x64efaults": ' + self.DV + "\n", '!!str "\\x64efaults"')
+
+    def test_m58_anchored_escaped_defaults_key_is_refused(self):
+        """security r10 F1: an anchor in front of the escaped quoted key."""
+        self._defaults_row('&d "\\x64efaults": ' + self.DV + "\n", '&d "\\x64efaults"')
+
+    def test_m59_explicit_key_below_indent_0_is_refused(self):
+        """security r10 F1: ``?`` at job level (indent 4), value on the next line."""
+        self._defaults_row('? "\\x64efaults"\n: ' + self.DV + "\n", '? "\\x64efaults"', levels=("job",))
+
+    def test_m60_escaped_line_break_in_the_key_is_refused(self):
+        """security r10 F1: a backslash-newline escape inside the quoted key."""
+        self._defaults_row('? "def\\\n  aults"\n: ' + self.DV + "\n", '? "def\\', levels=("job",))
+
+    def test_m61_alias_defaults_key_is_refused(self):
+        """security r10 F1: ``*d :`` where the anchor ``&d "def\\x61ults"`` sits in a dispatch input."""
+        self._defaults_row("*d : " + self.DV + "\n", "*d :", anchor=True)
+
+    def test_m62_merge_key_carrying_defaults_is_refused(self):
+        """security r10 F1: ``<<: {"\\x64efaults": ...}`` (PyYAML merge key)."""
+        self._defaults_row('<<: {"\\x64efaults": ' + self.DV + "}\n", "<<:")
+
+    def _env_spelling_row(self, spelling, quoted):
+        """A job-level env block spelled ``spelling`` (PyYAML reads BASH_ENV) must be refused."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._spelled(idx, "job", spelling)
+                if yaml is not None:
+                    doc = yaml.safe_load("\n".join(lines))
+                    self.assertIn("BASH_ENV", doc["jobs"][self.JOB_BY_IDX[idx]]["env"])
+                self._assert_skeleton_refused(lines, idx, quoted)
+
+    def test_m63_double_quoted_job_env_key_is_refused(self):
+        """security r10 F2: ``"env":`` at job level."""
+        self._env_spelling_row('"env":\n  BASH_ENV: ./x\n', '"env":')
+
+    def test_m64_tagged_job_env_key_is_refused(self):
+        """security r10 F2: ``!!str env:``."""
+        self._env_spelling_row("!!str env:\n  BASH_ENV: ./x\n", "!!str env:")
+
+    def test_m65_anchored_job_env_key_is_refused(self):
+        """security r10 F2: ``&e env:``."""
+        self._env_spelling_row("&e env:\n  BASH_ENV: ./x\n", "&e env:")
+
+    def test_m66_explicit_key_job_env_is_refused(self):
+        """security r10 F2: ``? env`` with the mapping on the next line."""
+        self._env_spelling_row("? env\n: {BASH_ENV: ./x}\n", "? env")
+
+    def test_m67_job_env_keys_indented_deeper_are_refused(self):
+        """security r10 F2: env keys at +4 instead of +2 (the older pin only read +2)."""
+        self._env_spelling_row("env:\n    BASH_ENV: ./x\n", "env:")
+
+    def test_m68_jobs_line_with_a_trailing_comment_is_refused(self):
+        """security r10 F2: ``jobs:  # note`` hid every job-level env from the older pin."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._spelled(idx, "job", "env:\n  BASH_ENV: ./x\n")
+                at = lines.index("jobs:")
+                lines[at] = "jobs:  # note"
+                self._assert_skeleton_refused(lines, idx, "jobs:  # note")
+
+    def test_m69_workflow_without_a_jobs_line_is_refused(self):
+        """security r10 F2: no exact ``jobs:`` line at indent 0 was fail-open."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = WORKFLOWS[idx].read_text(encoding="utf-8").split("\n")
+                lines.remove("jobs:")
+                self.assertIn(
+                    "workflow has no exact jobs: line at indent 0", heal_defects(lines, WORKFLOWS[idx].name)
+                )
+
+    def test_m70_second_name_key_in_the_pinned_step_is_refused(self):
+        """security r10 F3 (= r9 O1): PyYAML renames the step to the last ``name``."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                head = "      - name: " + STEP_NAME + "\n"
+                lines = self._text_defects_lines(idx, head, head + "        name: renamed\n")
+                if yaml is not None:
+                    self.assertNotIn(STEP_NAME, [s.get("name") for s in yaml.safe_load("\n".join(lines))["jobs"][self.JOB_BY_IDX[idx]]["steps"]])
+                self.assertIn("step has 2 name keys, expected exactly 1", heal_defects(lines, WORKFLOWS[idx].name))
+
+    def test_m71_control_a_comment_line_at_indent_0_is_accepted(self):
+        """Control: comments are not skeleton lines."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._spelled(idx, "workflow", "# note: a comment line\n")
+                self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), [])
+
+    def test_m72_control_a_changed_run_block_line_is_caught_by_the_run_pin_not_the_skeleton(self):
+        """Control: block-scalar lines are not skeleton lines; the run-text pin owns them."""
+        got = self._defects(NEW_URL_LINE, NEW_URL_LINE.replace("new_url=", "new_url2="))
+        self._assert_body_differs(got)
+        self.assertFalse(any(d.startswith("skeleton line ") for d in got), got)
+
+    def test_m73_skeleton_lines_that_can_spell_any_key_are_refused_by_form(self):
+        """An explicit key, anchor, tag, alias or merge key, or a backslash inside quotes, is refused by form."""
+        for lead in ("? x", "&a x: 1", "!!str x: 1", "*a : 1", "<<: {}", '"a\\x41": 1'):
+            with self.subTest(line=lead):
+                lines = self._spelled(0, "workflow", lead + "\n")
+                got = heal_defects(lines, WORKFLOWS[0].name)
+                self.assertTrue(any(d.startswith("skeleton line ") and "can spell" in d and lead in d for d in got), got)
+
 
 if __name__ == "__main__":
     unittest.main()
