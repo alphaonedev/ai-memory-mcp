@@ -374,6 +374,8 @@ EXPECTED_SKELETON_CERT = (
 # The step-list tuples are copied from the workflows, never built from them at test time.
 EXPECTED_STEPS_IGNORED = (
     '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4',
+    '        with:',
+    '          persist-credentials: false',
     '      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)',
     "        if: runner.environment != 'github-hosted'",
     '        shell: bash',
@@ -393,6 +395,8 @@ EXPECTED_STEPS_IGNORED = (
 )
 EXPECTED_STEPS_CERT = (
     '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4',
+    '        with:',
+    '          persist-credentials: false',
     '      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)',
     "        if: runner.environment != 'github-hosted'",
     '        shell: bash',
