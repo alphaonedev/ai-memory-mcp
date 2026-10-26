@@ -8543,6 +8543,101 @@ class TestBacktrackingIsSeenByTheSecondsGate8187R31(unittest.TestCase):
 # ---- r31 END ----
 
 
+# ---- r33 BEGIN (code review round 32 F1-F3) ----
+# decision: refuse every alias import of a sink module and every store into sys.modules outright, over tracking alias bindings and refusing later stores to them, because the gate's own modules never alias a sink module (live grep 0) and a flat refusal has no binding-tracker to get wrong, closing the rebind class by construction (fail-closed precedent PR 8236 round 30 F2; LOW with precedent, no vote).
+R33_PRINTER = "types.SimpleNamespace(path=types.SimpleNamespace(join=print))"
+# code r32 F1: a class decorator is a call that runs on the class; the same shapes on a function were already refused
+TAINT_R32_F1 = {
+    "class decorator argument @deco(v)": "        def deco(a):\n            print(a)\n            return lambda c: c\n"
+                                         "        @deco(body)\n        class K:\n            pass\n",
+    "class decorator @functools.partial(print, v)": "        import functools\n        @functools.partial(print, body)\n"
+                                                    "        class K:\n            pass\n",
+}
+TAINT_R32_F1_CLEAN = {
+    "a bare class decorator without arguments": "        def deco(c):\n            return c\n        @deco\n        class K:\n            pass\n",
+}
+# code r32 F2: an alias of a sink module, rebound, and the module table; (prefix, body) rows are module level
+TAINT_R32_F2_BODY = {
+    "import os as o; o = sys": "        import os as o\n        o = sys\n        o.path.join(body)\n",
+    "import os.path as p; p = printer.path": "        import types\n        import os.path as p\n        p = %s.path\n        p.join(body)\n" % R33_PRINTER,
+    "sys.modules item store then import os": "        import types\n        sys.modules['os'] = %s\n        import os\n        os.path.join(body)\n" % R33_PRINTER,
+    "sys.modules.update with os": "        import types\n        sys.modules.update({'os': %s})\n        import os\n        os.path.join(body)\n" % R33_PRINTER,
+    "importlib.import_module of os": "        import importlib\n        importlib.import_module('os')\n        self.assertEqual(len(body), 3)\n",
+    "importlib.reload of os": "        import importlib\n        import os\n        importlib.reload(os)\n        os.path.join(body)\n",
+    "from os import path as p; p = printer.path": "        import types\n        from os import path as p\n        p = %s.path\n        p.join(body)\n" % R33_PRINTER,
+}
+TAINT_R32_F2_MODULE = {
+    "module import os as o; o = printer": ("import types\nimport os as o\no = %s\n" % R33_PRINTER, "        o.path.join(body)\n"),
+}
+TAINT_R32_F2_CLEAN = {
+    "a plain import of os through the trusted sink": "        import os\n        self.assertEqual(len(os.path.join('a', 'b')), 3)\n",
+}
+
+
+class TestClassDecoratorsAreJudged8187R33(unittest.TestCase):
+    """r33 code r32 F1: ``@deco(v)`` and ``@functools.partial(print, v)`` on a class passed while the same shapes on a function
+    were refused.  Every Call in the class decorator list is judged under the every-argument rule; a bare decorator stays clean."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R32_F1), 2)
+        self.assertEqual(len(TAINT_R32_F1_CLEAN), 1)
+
+    def test_every_class_decorator_shape_is_flagged(self):
+        survivors = []
+        for name, body in TAINT_R32_F1.items():
+            with self.subTest(shape=name):
+                if not precheck_lines(TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, body in TAINT_R32_F1_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(precheck_lines(TAINT_R28_HEAD + body), [])
+
+
+class TestASinkModuleIsNeverAliasedOrReplaced8187R33(unittest.TestCase):
+    """r33 code r32 F2: the rebind refusal keyed on the module root name, so ``import os as o; o = sys`` and a ``sys.modules`` store
+    passed.  Any alias import of a sink module and any store into ``sys.modules`` is refused outright."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R32_F2_BODY), 7)
+        self.assertEqual(len(TAINT_R32_F2_MODULE), 1)
+        self.assertEqual(len(TAINT_R32_F2_CLEAN), 1)
+
+    def test_every_alias_and_module_table_shape_is_flagged(self):
+        survivors = []
+        for name, body in TAINT_R32_F2_BODY.items():
+            with self.subTest(shape=name):
+                if not precheck_lines(TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        for name, (prefix, body) in TAINT_R32_F2_MODULE.items():
+            with self.subTest(shape=name):
+                if not precheck_lines(prefix + TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, body in TAINT_R32_F2_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(precheck_lines(TAINT_R28_HEAD + body), [])
+
+
+class TestTheCanaryDocstringsDescribeTheShippedMechanism8187R33(unittest.TestCase):
+    """r33 code r32 F3: both docstrings described a trace function and a reader's choice of frame locals; the shipped forced mode
+    wraps the test call and raises after the body, and the forced unittest runner always passes ``tb_locals=forced``."""
+
+    def test_the_canary_module_docstring(self):
+        self.assertNotIn("trace function", canary.__doc__)
+        self.assertIn("tb_locals=forced", canary.__doc__)
+
+    def test_the_runtime_canary_class_docstring(self):
+        doc = TestRuntimeCanaryRunsTheWholeModule8187R29.__doc__
+        self.assertNotIn("reader's", doc)
+        self.assertIn("tb_locals=forced", doc)
+# ---- r33 END ----
+
+
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
         # regenerate all three pin sections from the workflows; the diff of the data file is what a reviewer reads
