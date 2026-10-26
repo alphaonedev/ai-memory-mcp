@@ -15,9 +15,12 @@ label-gated).
 
 Rule, one place:
 
-* ``pull_request`` whose head branch does NOT start with ``chain/`` (a topic
-  PR): only the ``sqlite`` tier is active.
-* every other run (``pull_request`` from a ``chain/`` carrier branch, ``push``,
+* ``pull_request`` whose BASE branch starts with ``chain/`` and whose head
+  branch does NOT (a topic PR into a chain carrier): only the ``sqlite`` tier
+  is active. The hosted no-op is sound only because the chain carrier PR runs
+  the real legs afterwards, so a PR that lands anywhere else (``release/**``,
+  ``rehearsal/**``, ``main``, ``develop``) keeps both tiers (security r1 F1).
+* every other run (``pull_request`` from a ``chain/`` carrier branch or into a non-chain base, ``push``,
   ``merge_group``, ``schedule`` and anything unknown; ci.yml itself triggers only on
   ``push``, ``pull_request`` and ``merge_group``):
   both tiers are active. The chain branch is tested ONLY through the
@@ -32,13 +35,13 @@ same no-op shape the docs-only path already uses, so no self-hosted runner is
 held and the contexts still report.
 
 Usage (in the ``classify`` job, context passed through env, never inlined):
-    EVENT_NAME=pull_request HEAD_REF=fix/x python3 -I scripts/ci/check_legs.py \\
+    EVENT_NAME=pull_request HEAD_REF=fix/x BASE_REF=chain/x python3 -I scripts/ci/check_legs.py \\
         --github-output "$GITHUB_OUTPUT"
 prints ``check_tiers=sqlite`` (comma separated) and, with ``--github-output``,
 appends the same line to that file.
 
 Exit codes: 0 success, 2 bad arguments (empty ``EVENT_NAME``) or a malformed
-event (``pull_request`` with an empty ``HEAD_REF``: loud, never a silent
+event (``pull_request`` with an empty ``HEAD_REF`` or ``BASE_REF``: loud, never a silent
 drop of the enterprise-fed tier).
 
 Python 3.9+, standard library only.
@@ -58,9 +61,10 @@ EXIT_USAGE = 2
 EXIT_MALFORMED_EVENT = 2
 
 
-def active_tiers(event_name, head_ref):
+def active_tiers(event_name, head_ref, base_ref):
     """Return the tuple of tiers the ``Check`` job runs for this event."""
-    if event_name == EVENT_PULL_REQUEST and not head_ref.startswith(CHAIN_BRANCH_PREFIX):
+    if (event_name == EVENT_PULL_REQUEST and base_ref.startswith(CHAIN_BRANCH_PREFIX)
+            and not head_ref.startswith(CHAIN_BRANCH_PREFIX)):
         return (TIER_SQLITE,)
     return ALL_TIERS
 
@@ -73,6 +77,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--event-name', default=os.environ.get('EVENT_NAME', ''))
     parser.add_argument('--head-ref', default=os.environ.get('HEAD_REF', ''))
+    parser.add_argument('--base-ref', default=os.environ.get('BASE_REF', ''))
     parser.add_argument('--github-output', default=None,
                         help='file to append the output line to (the $GITHUB_OUTPUT file)')
     return parser.parse_args(argv)
@@ -87,7 +92,11 @@ def main(argv=None):
         print('check_legs: malformed event: pull_request with an empty head ref (HEAD_REF)',
               file=sys.stderr)
         return EXIT_MALFORMED_EVENT
-    line = output_line(active_tiers(args.event_name, args.head_ref))
+    if args.event_name == EVENT_PULL_REQUEST and not args.base_ref:
+        print('check_legs: malformed event: pull_request with an empty base ref (BASE_REF)',
+              file=sys.stderr)
+        return EXIT_MALFORMED_EVENT
+    line = output_line(active_tiers(args.event_name, args.head_ref, args.base_ref))
     print(line)
     if args.github_output:
         with open(args.github_output, 'a', encoding='utf-8') as handle:

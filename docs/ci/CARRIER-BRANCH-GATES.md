@@ -178,14 +178,19 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
 ## Enterprise-fed legs run on chain and release runs only (#8174)
 
 The `Check` job keeps its four legs and their names. A topic-branch
-`pull_request` runs only the two sqlite legs (`ubuntu-latest,sqlite`,
+`pull_request` into a `chain/` carrier branch runs only the two sqlite legs (`ubuntu-latest,sqlite`,
 `macos-fed,sqlite`); the two enterprise-fed legs are rerouted to a hosted runner
 with every step skipped (the docs-only no-op shape), so they still report but
-hold no self-hosted runner. A chain `pull_request` (head branch `chain/...`),
-`push` and `merge_group` run all four legs. The reason is
+hold no self-hosted runner. A chain `pull_request` (head branch `chain/...`), a
+`pull_request` into any non-chain base (`release/**`, `rehearsal/**`, `main`,
+`develop`), `push` and `merge_group` run all four legs; the no-op is sound only
+when the PR lands on the chain, where the carrier PR runs the real legs, and the
+notice step fails (exit 1) on any other base. The reason is
 compute: a full `Check (linux-fed,enterprise-fed)` run held one of the four
 linux-fed runners for 2 h 09 min to 2 h 37 min per topic PR, whether it ended
-green or red, while sal-postgres coverage for topic PRs stays in
-`cert-postgres-age.yml` and `postgres-ignored.yml`. The rule is one function,
+green or red, while sal-postgres coverage for topic PRs into the chain stays in
+`cert-postgres-age.yml` and `postgres-ignored.yml` (they trigger only on
+`release/**`, `rehearsal/**` and `chain/**`, so PRs into `main` and `develop`
+get none, which is why those keep the real legs). The rule is one function,
 `active_tiers` in `scripts/ci/check_legs.py`, exported as the `classify` output
 `check_tiers`; pins: `scripts/ci/tests/test_check_legs_chain_only.py`.

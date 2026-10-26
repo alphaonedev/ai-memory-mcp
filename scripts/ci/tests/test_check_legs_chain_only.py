@@ -164,7 +164,7 @@ def workflow_problems(ci):
                        'EVENT_NAME: ${{ github.event_name }}', 'HEAD_REF: ${{ github.head_ref }}',
                        'BASE_REF: ${{ github.base_ref }}', 'chain/*) ;;', 'exit 1',
                        'cert-postgres-age.yml', 'postgres-ignored.yml',
-                       'chain/* pull requests, push and merge_group'):
+                       'chain/* pull requests, push, merge_group and any pull request whose base is not chain/*'):
             if needle not in block:
                 problems.append('inactive-leg notice missing %r' % needle)
     if 'check_tiers: ${{ steps.legs.outputs.check_tiers }}' not in classify:

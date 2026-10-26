@@ -225,8 +225,8 @@ jobs:
       test_impact: ${{ steps.cls.outputs.test_impact }}
       # #8174 - which `Check` tiers run on this workflow run, decided in ONE
       # place (scripts/ci/check_legs.py). A topic-branch pull_request gets
-      # `sqlite`; chain/ carrier PRs, pushes and merge_group runs
-      # get `sqlite,enterprise-fed`. Consumed by the `check` job below.
+      # `sqlite`, but only when its BASE is a chain/ branch; chain/ carrier PRs,
+      # PRs into any other base, pushes and merge_group runs get `sqlite,enterprise-fed`. Consumed by the `check` job below.
       check_tiers: ${{ steps.legs.outputs.check_tiers }}
       test_impact_count: ${{ steps.cls.outputs.test_impact_count }}
       test_impact_total: ${{ steps.cls.outputs.test_impact_total }}
@@ -274,6 +274,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
         run: python3 -I scripts/ci/check_legs.py --github-output "$GITHUB_OUTPUT"
       - id: cls
         shell: bash
@@ -663,12 +664,14 @@ jobs:
   # two sqlite legs do work: the two enterprise-fed legs are rerouted to a
   # hosted runner with every step skipped, so no linux-fed / macos-fed runner is
   # held (a full linux-fed leg held a runner 2h09-2h37 per PR run, green or red).
-  # Chain/ carrier PRs, pushes and merge_group runs keep all four.
+  # Chain/ carrier PRs, PRs into a non-chain base (release/**, rehearsal/**, main,
+  # develop), pushes and merge_group runs keep all four.
   # The decision lives in scripts/ci/check_legs.py (classify output
   # `check_tiers`); the pins are scripts/ci/tests/test_check_legs_chain_only.py.
   # sal-postgres coverage on topic PRs stays in cert-postgres-age.yml and
   # postgres-ignored.yml; both run on every same-repo pull_request to
-  # release/**, rehearsal/** and chain/** (neither is label-gated).
+  # release/**, rehearsal/** and chain/** (neither is label-gated); PRs into
+  # main/develop never get that coverage, which is why they keep the real legs.
   check:
     name: Check (${{ matrix.leg }})
     needs: classify
@@ -922,8 +925,18 @@ jobs:
           LEG: ${{ matrix.leg }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${HEAD_REF}): enterprise-fed legs run on chain/* pull requests, push and merge_group; this topic-PR run reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
+          # Independent second check (security r1 F1): the no-op shape is sound only
+          # for a PR that lands on a chain/ carrier, so it never reports green elsewhere.
+          case "${BASE_REF}" in
+            chain/*) ;;
+            *)
+              echo "::error::leg ${LEG} refuses the hosted no-op: base ref '${BASE_REF}' is not chain/*, so no carrier run follows this PR"
+              exit 1
+              ;;
+          esac
+          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${HEAD_REF}, base ref ${BASE_REF}): enterprise-fed legs run on chain/* pull requests, push, merge_group and any pull request whose base is not chain/*; this topic-PR run into a chain base reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
           echo "::notice::${msg}"
           echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 
