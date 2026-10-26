@@ -180,8 +180,11 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
 The `Check` job keeps its four legs and their names. A topic-branch
 `pull_request` into a `chain/` carrier branch runs only the two sqlite legs (`ubuntu-latest,sqlite`,
 `macos-fed,sqlite`); the two enterprise-fed legs are rerouted to a hosted runner
-with every step skipped (the docs-only no-op shape), so they still report but
-hold no self-hosted runner. A chain `pull_request` (head branch `chain/...`), a
+as a no-op (the docs-only no-op shape): on those legs the checkout and the
+`Enterprise-fed leg inactive` notice step run, every tier-guarded step is
+skipped, so they still report but hold no self-hosted runner. The notice
+percent-escapes `%`, CR and LF in both refs before they enter the annotation
+and the step summary. A chain `pull_request` (head branch `chain/...`), a
 `pull_request` into any non-chain base (`release/**`, `rehearsal/**`, `main`,
 `develop`), `push` and `merge_group` run all four legs; the no-op is sound only
 when the PR lands on the chain, where the carrier PR runs the real legs, and the
@@ -194,3 +197,10 @@ green or red, while sal-postgres coverage for topic PRs into the chain stays in
 get none, which is why those keep the real legs). The rule is one function,
 `active_tiers` in `scripts/ci/check_legs.py`, exported as the `classify` output
 `check_tiers`; pins: `scripts/ci/tests/test_check_legs_chain_only.py`.
+
+`check_legs.py` fails closed on malformed input: it exits 2
+(`EXIT_MALFORMED_EVENT`) on an empty event name, and on a `pull_request` with an
+empty head ref or an empty base ref, printing a `check_legs: ...` message
+(`malformed event: ...` for the pull_request cases) on stderr and no
+`check_tiers` line. That fails the `classify` step and the
+run goes red instead of silently scheduling or dropping a tier.
