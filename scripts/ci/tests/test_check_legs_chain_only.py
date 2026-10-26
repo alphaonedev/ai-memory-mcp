@@ -68,22 +68,34 @@ def load_module(source, name='check_legs_under_test'):
     return module
 
 
+CHAIN_BASE = 'chain/promo6-ssh-r2'
+NON_CHAIN_BASES = ('release/v1.0.0', 'main', 'develop', 'rehearsal/audit-wip-ssh')
+
+
 def behaviour_problems(module):
-    """Every way the decision function deviates from the chain-only rule."""
+    """Every way the decision function deviates from the base-and-head rule (#8174)."""
     problems = []
-    topic = tuple(module.active_tiers('pull_request', 'fix/x'))
-    if topic != ('sqlite',):
-        problems.append('topic pull_request must run only sqlite, got %r' % (topic,))
     both = ('sqlite', 'enterprise-fed')
-    for event, ref in (('pull_request', 'chain/promo6-ssh-r2'), ('push', ''),
-                       ('workflow_dispatch', ''), ('merge_group', ''), ('schedule', ''),
-                       ('something_new', 'fix/x')):
-        got = tuple(module.active_tiers(event, ref))
+    topic = tuple(module.active_tiers('pull_request', 'fix/x', CHAIN_BASE))
+    if topic != ('sqlite',):
+        problems.append('topic pull_request into a chain base must run only sqlite, got %r' % (topic,))
+    for event, head, base in (('pull_request', 'chain/promo6-ssh-r2', CHAIN_BASE), ('push', '', ''),
+                              ('workflow_dispatch', '', ''), ('merge_group', '', ''), ('schedule', '', ''),
+                              ('something_new', 'fix/x', CHAIN_BASE)):
+        got = tuple(module.active_tiers(event, head, base))
         if got != both:
-            problems.append('%s/%s must run both tiers, got %r' % (event, ref, got))
-    nested = tuple(module.active_tiers('pull_request', 'fix/chain/x'))
+            problems.append('%s/%s/%s must run both tiers, got %r' % (event, head, base, got))
+    for base in NON_CHAIN_BASES:
+        for head in ('fix/x', 'dependabot/x', 'chain/promo6-ssh-r2'):
+            got = tuple(module.active_tiers('pull_request', head, base))
+            if got != both:
+                problems.append('pull_request %s -> %s must run both tiers, got %r' % (head, base, got))
+    nested = tuple(module.active_tiers('pull_request', 'fix/chain/x', CHAIN_BASE))
     if nested != ('sqlite',):
-        problems.append('chain/ must be a prefix match, fix/chain/x got %r' % (nested,))
+        problems.append('chain/ must be a prefix match on the head, fix/chain/x got %r' % (nested,))
+    nested_base = tuple(module.active_tiers('pull_request', 'fix/x', 'fix/chain/y'))
+    if nested_base != both:
+        problems.append('chain/ must be a prefix match on the base, fix/chain/y got %r' % (nested_base,))
     return problems
 
 
@@ -150,6 +162,7 @@ def workflow_problems(ci):
             problems.append('inactive-leg notice must run exactly when the tier is inactive')
         for needle in ('::notice::', '$GITHUB_STEP_SUMMARY', 'LEG: ${{ matrix.leg }}',
                        'EVENT_NAME: ${{ github.event_name }}', 'HEAD_REF: ${{ github.head_ref }}',
+                       'BASE_REF: ${{ github.base_ref }}', 'chain/*) ;;', 'exit 1',
                        'cert-postgres-age.yml', 'postgres-ignored.yml',
                        'chain/* pull requests, push and merge_group'):
             if needle not in block:
@@ -162,7 +175,7 @@ def workflow_problems(ci):
     else:
         body = m.group(1)
         for needle in ('EVENT_NAME: ${{ github.event_name }}', 'HEAD_REF: ${{ github.head_ref }}',
-                       'python3 -I scripts/ci/check_legs.py', '--github-output "$GITHUB_OUTPUT"'):
+                       'BASE_REF: ${{ github.base_ref }}', 'python3 -I scripts/ci/check_legs.py', '--github-output "$GITHUB_OUTPUT"'):
             if needle not in body:
                 problems.append('classify legs step missing %r' % needle)
         if re.search(r'run:[^\n]*\$\{\{', body.split('env:')[0] if 'env:' in body else body):
@@ -176,18 +189,18 @@ class DecisionScript(unittest.TestCase):
         self.mod = load_module(self.source)
 
     def test_topic_pr_runs_only_the_two_sqlite_legs(self):
-        self.assertEqual(self.mod.active_tiers('pull_request', 'fix/x'), ('sqlite',))
-        legs = [l['leg'] for l in LEGS if l['tier'] in self.mod.active_tiers('pull_request', 'fix/x')]
+        self.assertEqual(self.mod.active_tiers('pull_request', 'fix/x', CHAIN_BASE), ('sqlite',))
+        legs = [l['leg'] for l in LEGS if l['tier'] in self.mod.active_tiers('pull_request', 'fix/x', CHAIN_BASE)]
         self.assertEqual(legs, ['ubuntu-latest,sqlite', 'macos-fed,sqlite'])
 
     def test_chain_carrier_pr_runs_all_four_legs_in_order(self):
-        tiers = self.mod.active_tiers('pull_request', 'chain/promo6-ssh-r2')
+        tiers = self.mod.active_tiers('pull_request', 'chain/promo6-ssh-r2', CHAIN_BASE)
         legs = [l['leg'] for l in LEGS if l['tier'] in tiers]
         self.assertEqual(legs, [l['leg'] for l in LEGS])
 
     def test_push_and_dispatch_run_all_four(self):
         for event in ('push', 'workflow_dispatch', 'merge_group'):
-            self.assertEqual(len([l for l in LEGS if l['tier'] in self.mod.active_tiers(event, '')]), 4)
+            self.assertEqual(len([l for l in LEGS if l['tier'] in self.mod.active_tiers(event, '', '')]), 4)
 
     def test_behaviour_has_no_problems(self):
         self.assertEqual(behaviour_problems(self.mod), [])
@@ -199,7 +212,7 @@ class DecisionScript(unittest.TestCase):
         try:
             res = subprocess.run(
                 [sys.executable, '-I', str(SCRIPT), '--event-name', 'pull_request', '--head-ref', 'fix/x',
-                 '--github-output', str(out)], capture_output=True, text=True, check=False)
+                 '--base-ref', CHAIN_BASE, '--github-output', str(out)], capture_output=True, text=True, check=False)
             self.assertEqual(res.returncode, 0)
             self.assertEqual(res.stdout.strip(), 'check_tiers=sqlite')
             self.assertEqual(out.read_text(), 'check_tiers=sqlite\n')
@@ -215,13 +228,32 @@ class DecisionScript(unittest.TestCase):
         # #8174 code r1 F1: a pull_request without a head ref must be loud (rc 2, no
         # check_tiers line), never a silent drop of the enterprise-fed tier.
         res = subprocess.run([sys.executable, '-I', str(SCRIPT), '--event-name', 'pull_request',
-                              '--head-ref', ''], capture_output=True, text=True, check=False)
+                              '--head-ref', '', '--base-ref', CHAIN_BASE], capture_output=True, text=True, check=False)
         self.assertEqual(res.returncode, 2)
         self.assertNotIn('check_tiers', res.stdout)
         self.assertIn('head ref', res.stderr)
 
+    def test_cli_base_rows(self):
+        # #8174 security F1: only a PR that lands on a chain/ carrier may get the hosted no-op.
+        for base in NON_CHAIN_BASES:
+            res = subprocess.run([sys.executable, '-I', str(SCRIPT), '--event-name', 'pull_request',
+                                  '--head-ref', 'fix/x', '--base-ref', base],
+                                 capture_output=True, text=True, check=False)
+            self.assertEqual((res.returncode, res.stdout.strip()), (0, 'check_tiers=sqlite,enterprise-fed'), base)
+        res = subprocess.run([sys.executable, '-I', str(SCRIPT), '--event-name', 'pull_request',
+                              '--head-ref', 'fix/x', '--base-ref', CHAIN_BASE],
+                             capture_output=True, text=True, check=False)
+        self.assertEqual((res.returncode, res.stdout.strip()), (0, 'check_tiers=sqlite'))
+
+    def test_cli_pull_request_with_empty_base_ref_is_malformed(self):
+        res = subprocess.run([sys.executable, '-I', str(SCRIPT), '--event-name', 'pull_request',
+                              '--head-ref', 'fix/x', '--base-ref', ''], capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 2)
+        self.assertNotIn('check_tiers', res.stdout)
+        self.assertIn('base ref', res.stderr)
+
     def test_output_line_round_trips(self):
-        line = self.mod.output_line(self.mod.active_tiers('push', ''))
+        line = self.mod.output_line(self.mod.active_tiers('push', '', ''))
         key, value = line.split('=', 1)
         self.assertEqual((key, value.split(',')), ('check_tiers', ['sqlite', 'enterprise-fed']))
 
@@ -242,6 +274,7 @@ class MutationTable(unittest.TestCase):
             'flip the tier condition': src.replace('return (TIER_SQLITE,)', 'return (TIER_ENTERPRISE_FED,)'),
             'remove the chain/ carve-out': src.replace(
                 ' and not head_ref.startswith(CHAIN_BRANCH_PREFIX)', ''),
+            'ignore the base': src.replace(' and base_ref.startswith(CHAIN_BRANCH_PREFIX)', ''),
             'carve-out matches anywhere': src.replace(
                 'not head_ref.startswith(CHAIN_BRANCH_PREFIX)', 'CHAIN_BRANCH_PREFIX not in head_ref'),
         }
@@ -255,6 +288,9 @@ class MutationTable(unittest.TestCase):
             'plain runs-on': ci.replace(RUNS_ON, 'runs-on: ${{ fromJSON(matrix.runner) }}', 1),
             'drop the inactive-leg notice step': ci.replace(NOTICE_STEP_NAME, 'name: Renamed step', 1),
             'notice forgets the postgres workflows': ci.replace('cert-postgres-age.yml and postgres-ignored.yml"', 'elsewhere"', 1),
+            'drop BASE_REF env from the legs step': ci.replace(
+                '          BASE_REF: ${{ github.base_ref }}\n        run: python3', '        run: python3', 1),
+            'notice stops refusing a non-chain base': ci.replace('chain/*) ;;', 'chain/*|*) ;;', 1),
             'drop HEAD_REF env': ci.replace('HEAD_REF: ${{ github.head_ref }}', 'HEAD_REF: ""', 1),
             # #8174 code r1 F2 (X1, X2, X4): a step with no tier guard at all must fail the pin.
             'X1 delete the whole if of Install Rust': ci.replace(
