@@ -350,6 +350,39 @@ def workflow_problems(ci):
     return problems
 
 
+YAML_LINE_BREAKS = (('\x85', 'U+0085'), ('\u2028', 'U+2028'), ('\u2029', 'U+2029'), ('\r', 'CR'))
+JOB_FOLLOWED_BY = (('check', 'postgres-feature'), ('classify', 'lint'))
+
+
+def scan_mutants(ci):
+    """#8174 security r6 F1-F3 rows: line-break characters, alias keys, a job ended early."""
+    check_job, check_step = '    name: Check (${{ matrix.leg }})\n', '      - name: docs-only short-circuit\n'
+    cls_job, cls_step = '    name: Classify changes\n', '      - id: cls\n'
+    rows = {}
+    for char, label in YAML_LINE_BREAKS:
+        for scope, (anchor, indent) in (
+            ('check job level', (check_job, '    ')), ('check step level', (check_step, '        ')),
+            ('classify job level', (cls_job, '    ')), ('classify step level', (cls_step, '        ')),
+        ):
+            hidden = '%s# note%s%scontinue-on-error: true\n' % (indent, char, indent)
+            rows['m11 %s in a comment, %s' % (label, scope)] = ci.replace(anchor, anchor + hidden, 1)
+    rows['m12a alias key on a check step'] = ci.replace(check_step, check_step + '        *a : true\n', 1)
+    rows['m12b alias key at job level on check'] = ci.replace(check_job, check_job + '    *a : true\n', 1)
+    rows['m12c step-first alias key on a classify step'] = ci.replace(
+        cls_step, '      - *a : true\n        id: cls\n', 1)
+    rows['m12d flow-mapping alias key on a check step'] = ci.replace(
+        check_step, check_step + '        { *a : true }\n', 1)
+    rows['m12e alias key at job level on classify'] = ci.replace(cls_job, cls_job + '    *a : true\n', 1)
+    rows['m12f anchored key on a check step'] = ci.replace(check_step, check_step + '        &b key : true\n', 1)
+    for job, following in JOB_FOLLOWED_BY:
+        tail = '  %s:\n' % following
+        rows['m13a %s job ended early by a quoted scalar, key after it' % job] = ci.replace(
+            tail, '        note: "a\n  fakejob:\n  b"\n        continue-on-error: true\n' + tail, 1)
+        rows['m13b %s followed-by key repeated inside a quoted scalar' % job] = ci.replace(
+            tail, '        note: "a\n  %s:\n  b"\n' % following + tail, 1)
+    return rows
+
+
 class DecisionScript(unittest.TestCase):
     def setUp(self):
         self.source = SCRIPT.read_text()
@@ -507,7 +540,7 @@ class MutationTable(unittest.TestCase):
 
     def workflow_mutants(self):
         ci = CI_YML.read_text()
-        return {
+        mutants = {
             'drop a leg from the matrix': ci.replace('          - leg: macos-fed,enterprise-fed\n', '          - leg: macos-fed,enterprise-fed-x\n', 1),
             'rename a leg': ci.replace('- leg: linux-fed,enterprise-fed', '- leg: linux-fed,enterprise', 1),
             'drop a step tier guard': ci.replace(' && ' + TIER_GUARD, '', 1),
@@ -598,6 +631,8 @@ class MutationTable(unittest.TestCase):
             'm10b macos-fed enterprise-fed timeout 160 edited to 300': ci.replace(
                 MACOS_FED_TIMEOUT_160, MACOS_FED_TIMEOUT_160.replace('160', '300'), 1),
         }
+        mutants.update(scan_mutants(ci))
+        return mutants
 
     def test_every_script_mutant_fails_the_behaviour_pins(self):
         for name, src in self.script_mutants().items():
