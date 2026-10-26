@@ -8373,6 +8373,100 @@ class TestRuntimeCanaryRunsTheWholeModule8187R29(unittest.TestCase):
 # ---- r29 END ----
 
 
+# ---- r31 BEGIN (code review round 30 F2-F3, security review round 30 F2-F3) ----
+# decision: refuse any rebinding of a trusted module root over trusting the import because a name is a binding, not a function, and a module root is trusted by name too
+# decision: judge class bases and keywords under the every-argument rule over walking the body alone because a metaclass call runs on them
+R31_PRINTER = "types.SimpleNamespace(path=types.SimpleNamespace(join=print))"
+# the trusted module roots (os, re, json, ...) rebound to a printing object: module level and function body, one row each
+TAINT_R31_F2_BODY = {
+    "os assigned in a test": "        import types\n        os = %s\n        os.path.join(body)\n" % R31_PRINTER,
+    "os assigned in a nested function": "        def helper():\n            import types\n            os = %s\n            os.path.join(body)\n"
+                                        "        helper()\n" % R31_PRINTER,
+    "re imported as another module": "        import json as re\n        re.escape(body)\n",
+    "json from another module": "        from builtins import print as json\n        json.dumps(body)\n",
+    "global os": "        global os\n        os = print\n",
+    "def os": "        def os(x):\n            print(x)\n        os(body)\n",
+    "class hashlib": "        class hashlib:\n            pass\n",
+    "parameter named os": "        def helper(os):\n            os.path.join(body)\n        helper(print)\n",
+    "for copy": "        for copy in [print]:\n            copy.copy(body)\n",
+}
+TAINT_R31_F2_MODULE = {
+    "module os assigned": ("import types\nos = %s\n" % R31_PRINTER, "        os.path.join(body)\n"),
+    "module def ast": ("def ast(x):\n    print(x)\n", "        self.assertEqual(len(body), 3)\n"),
+    "module unicodedata annotated": ("unicodedata: object = print\n", "        self.assertEqual(len(body), 3)\n"),
+}
+TAINT_R31_F2_CLEAN = {
+    "a plain import of a trusted root": "        import os\n        self.assertEqual(len(body), 3)\n",
+    "a dotted import of a trusted root": "        import urllib.parse\n        self.assertEqual(len(body), 3)\n",
+}
+TAINT_R31_F3 = {
+    "metaclass keyword with the value": "        class M(type):\n            def __init__(cls, *a, **k):\n                print(k)\n"
+                                        "        class C(metaclass=M, x=body):\n            pass\n",
+    "the value as a base": "        class C(body):\n            pass\n",
+    "a derived value as a keyword": "        class C(x=body.upper()):\n            pass\n",
+}
+TAINT_R31_F3_CLEAN = {
+    "a class with a constant keyword": "        class C(metaclass=type):\n            pass\n",
+    "a class with a constant base": "        class C(object):\n            pass\n",
+}
+
+
+class TestAModuleRootIsABindingNotAFunction8187R31(unittest.TestCase):
+    """r31 code F2 / security F2: ``os = <printing object>`` passed at module level and inside a function body, because none of the
+    module roots of ``TAINT_ACCEPTED_QUALIFIED`` was a rebind name.  Each rebinding is flagged in both scopes; a plain import of the
+    root stays clean."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R31_F2_BODY), 9)
+        self.assertEqual(len(TAINT_R31_F2_MODULE), 3)
+        self.assertEqual(len(TAINT_R31_F2_CLEAN), 2)
+        self.assertEqual(TAINT_REBIND_MODULES, frozenset(("ast", "copy", "hashlib", "json", "os", "re", "unicodedata", "urllib")))
+
+    def test_every_rebinding_inside_a_function_body_is_flagged(self):
+        survivors = []
+        for name, body in TAINT_R31_F2_BODY.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_every_module_level_rebinding_is_flagged(self):
+        survivors = []
+        for name, (prefix, body) in TAINT_R31_F2_MODULE.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(prefix + TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, body in TAINT_R31_F2_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(tainted_assert_lines(TAINT_R28_HEAD + body), [])
+
+
+class TestClassBasesAndKeywordsAreJudged8187R31(unittest.TestCase):
+    """r31 code F3 / security F3: only the body of a class was walked, so ``class C(metaclass=M, x=v)`` passed and the metaclass could
+    print the value.  The bases and the keywords are judged under the every-argument rule."""
+
+    def test_the_tables_hold_the_counted_shapes(self):
+        self.assertEqual(len(TAINT_R31_F3), 3)
+        self.assertEqual(len(TAINT_R31_F3_CLEAN), 2)
+
+    def test_every_class_argument_shape_is_flagged(self):
+        survivors = []
+        for name, body in TAINT_R31_F3.items():
+            with self.subTest(shape=name):
+                if not tainted_assert_lines(TAINT_R28_HEAD + body):
+                    survivors.append(name)
+        self.assertEqual(survivors, [])
+
+    def test_each_clean_control_stays_clean(self):
+        for name, body in TAINT_R31_F3_CLEAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(tainted_assert_lines(TAINT_R28_HEAD + body), [])
+# ---- r31 END ----
+
+
 if __name__ == "__main__":
     if "--write-pins" in sys.argv[1:]:
         # regenerate all three pin sections from the workflows; the diff of the data file is what a reviewer reads
