@@ -484,6 +484,18 @@ class MutationTable(unittest.TestCase):
             'm7 continue-on-error on the check job': ci.replace(
                 '    name: Check (${{ matrix.leg }})\n',
                 '    name: Check (${{ matrix.leg }})\n    continue-on-error: true\n', 1),
+            # #8174 code r4 F1 (m8-m8d): a step-level continue-on-error inside a gate job.
+            'm8 continue-on-error on the inactive-leg notice step': ci.replace(
+                '      - name: Enterprise-fed leg inactive on this run (#8174)\n',
+                '      - name: Enterprise-fed leg inactive on this run (#8174)\n        continue-on-error: true\n', 1),
+            'm8b expression continue-on-error on Run tests': ci.replace(
+                '      - name: Run tests (impact-aware)\n',
+                '      - name: Run tests (impact-aware)\n        continue-on-error: ${{ true }}\n', 1),
+            'm8c continue-on-error with no blank on a check step': ci.replace(
+                '      - name: docs-only short-circuit\n',
+                '      - name: docs-only short-circuit\n        continue-on-error:true\n', 1),
+            'm8d continue-on-error on a classify step': ci.replace(
+                '      - id: cls\n', '      - id: cls\n        continue-on-error: true\n', 1),
         }
 
     def test_every_script_mutant_fails_the_behaviour_pins(self):
