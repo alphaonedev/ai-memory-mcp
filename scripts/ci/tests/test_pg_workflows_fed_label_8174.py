@@ -1696,5 +1696,43 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         self.assertFalse(any(d.startswith(("skeleton line ", "step-list line ", "deep line ")) for d in got), got)
 
 
+    # Round 13 rows (code r12 F1 MAJOR = security r12 F1 MEDIUM): the step-list pin guards the chain's #8172
+    # hardening, ``persist-credentials: false`` under the checkout step of both workflows.
+    PERSIST_BLOCK = "        with:\n          persist-credentials: false\n"
+
+    def test_m92_removing_persist_credentials_false_from_the_checkout_step_is_refused(self):
+        """code r12 F1: dropping the #8172 hardening (``with:`` and ``persist-credentials: false``) names both lines."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._text_defects_lines(idx, self.PERSIST_BLOCK, "")
+                got = heal_defects(lines, WORKFLOWS[idx].name)
+                self.assertTrue(
+                    any(d.startswith("step-list line removed") and "persist-credentials: false" in d for d in got), got
+                )
+                self.assertTrue(any(d.startswith("step-list line removed") and d.endswith("        with:") for d in got), got)
+
+    def test_m93_persist_credentials_true_on_the_checkout_step_is_refused(self):
+        """code r12 F1: ``persist-credentials: true`` is a changed line against the pinned ``false``."""
+        for idx in (0, 1):
+            with self.subTest(workflow=WORKFLOWS[idx].name):
+                lines = self._text_defects_lines(
+                    idx, self.PERSIST_BLOCK, "        with:\n          persist-credentials: true\n"
+                )
+                if yaml is not None:
+                    steps = yaml.safe_load("\n".join(lines))["jobs"][self.JOB_BY_IDX[idx]]["steps"]
+                    self.assertIs(steps[0]["with"]["persist-credentials"], True)
+                got = heal_defects(lines, WORKFLOWS[idx].name)
+                self.assertTrue(
+                    any(
+                        d.startswith("step-list line ")
+                        and " changed: " in d
+                        and "persist-credentials: true (expected:" in d
+                        and d.endswith("persist-credentials: false)")
+                        for d in got
+                    ),
+                    got,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
