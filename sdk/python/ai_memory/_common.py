@@ -226,6 +226,8 @@ def _c_sslobj(session: object) -> "Any | None":
     value must be an instance of the C type itself, so a Python stand-in is refused. A property that
     hands back a different genuine C session is not reachable by a lie: it can only name a real session.
     """
+    if type(session) is _C_SSLOBJ:
+        return session  # httpcore's sync stream hands over the C object itself
     try:
         raw = object.__getattribute__(session, "_sslobj")
     except AttributeError:

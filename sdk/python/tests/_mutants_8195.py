@@ -53,6 +53,7 @@ PREPATCH6 = "tests/test_tls_prepatch_8195_r6.py"
 PREPATCH7 = "tests/test_tls_getset_identity_8195_r7.py"
 ASYNC7 = "tests/test_tls_async_wire_8195_r7.py"
 FLOOR7 = "tests/test_tls_session_floor_8195_r7.py"
+SYNC8 = "tests/test_tls_sync_c_session_8195_r8.py"
 RUNNER_T = "tests/test_run_mutants_8195.py"
 DOCS_T = "tests/test_docs_truth_6689.py"
 CLIENT_T = "tests/test_client.py"
@@ -446,4 +447,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant("R7", "session: leaf validity read through the Python socket (sec r6 S1-wire)", COMMON,
            "    facts = _session_facts(session)\n    peer = None if facts is None else facts.peer\n",
            "    peer = session.getpeercert()  # type: ignore[attr-defined]\n", killers=(PREPATCH7,)),
+    Mutant("R8", "session: the C object is not accepted as its own session (code r7 F-A)", COMMON,
+           "    if type(session) is _C_SSLOBJ:\n"
+           "        return session  # httpcore's sync stream hands over the C object itself\n",
+           "", killers=(SYNC8,)),
 )
