@@ -2210,6 +2210,34 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         self.assertEqual(found, ["test_check_tier_password_6181.py", "test_ci_tier_password_check_6181.py",
                                  "test_tier_credential_8187.py"], "the CI glob must match exactly the tier modules")
 
+    def test_ci_splits_the_canary_into_its_own_parallel_job_8187_r31(self):
+        """r31: the hosted pins job passed its 30 minute cap at bc9dd1c2c (run 40253207349), so the runtime canary runs in a
+        parallel job of its own; the skip variable is set by the pins test step ONLY and the canary job never sets it (fail-closed)."""
+        data, problems = ty.parse_workflow(self.texts["ci.yml"])
+        self.assertEqual(problems, [])
+        pins = data["jobs"]["tier-credential-pins"]
+        canary_job = data["jobs"]["tier-credential-canary"]
+        self.assertIs(pins["name"] == "Tier credential pins (#8187)", True)
+        self.assertIs(canary_job["name"] == "Tier credential canary (#8187)", True)
+        for job in (pins, canary_job):
+            self.assertIs(job["runs-on"] == "ubuntu-latest", True)
+            self.assertIs(job["timeout-minutes"] == 15, True)
+            self.assertIs(job["permissions"] == {"contents": "read"}, True)
+            self.assertIs("needs" not in job and "if" not in job, True)
+        skip_name = "TIER_CANARY_8187_SKIP"
+        pin_env = [s["env"] for s in pins["steps"] if "env" in s]
+        self.assertIs(pin_env == [{skip_name: "1"}], True, "only the pins test step sets the skip variable")
+        self.assertIs("env" not in canary_job and all("env" not in s for s in canary_job["steps"]), True)
+        self.assertIs(str(data["jobs"]).count(skip_name) == 1, True, "the skip variable appears in no other job")
+        canary_runs = [s["run"] for s in canary_job["steps"] if isinstance(s.get("run"), str)]
+        self.assertIs(any("pip install --require-hashes --no-deps -r scripts/test/requirements-ci.txt" in r for r in canary_runs), True)
+        self.assertIs(any("python3 -I -m unittest discover -s scripts/test -p 'test_ci_tier_password_check_6181.py' -k TestRuntimeCanary"
+                          in r for r in canary_runs), True)
+        pin_uses = [s["uses"] for s in pins["steps"] if "uses" in s]
+        canary_uses = [s["uses"] for s in canary_job["steps"] if "uses" in s]
+        self.assertIs(pin_uses == canary_uses, True, "the same pinned action SHAs in both jobs")
+        self.assertIs(len(canary_uses) == 2 and all(re.search(r"@[0-9a-f]{40}$", u) for u in canary_uses), True)
+
 
 def tier_job_of(text):
     data, _ = ty.parse_workflow(text)
