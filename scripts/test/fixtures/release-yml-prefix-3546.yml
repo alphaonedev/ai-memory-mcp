@@ -1,5 +1,5 @@
 # FROZEN pre-#3546 copy of .github/workflows/release.yml (from 188369ae).
-# Used ONLY by scripts/test/test-release-hardening.sh as the R-203 leg: the
+# Used ONLY by scripts/test/test_release_hardening.py as the R-203 leg: the
 # static and extracted-block checks must FAIL against this file, proving the
 # harness is not tautological. Never edit it to make a test pass.
 name: Release (workflow_dispatch — operator-gated publish)

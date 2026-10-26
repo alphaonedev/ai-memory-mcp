@@ -9,7 +9,7 @@
 # grants release authority; it is a reviewed PR to this file, like
 # enrolled-commit-signers.txt. Every line must also appear VERBATIM in
 # enrolled-commit-signers.txt (release signers are a subset of commit
-# signers), which scripts/test/test-release-hardening.sh asserts. It is a
+# signers), which scripts/test/test_release_hardening.py asserts. It is a
 # separate file so that enrolling a future commit-signing key does not
 # silently grant it release authority.
 #
