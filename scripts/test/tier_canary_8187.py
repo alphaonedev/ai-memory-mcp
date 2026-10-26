@@ -14,11 +14,12 @@ is the claim.
 2. The WHOLE test module runs in a copy of that tree as a subprocess, under unittest and under pytest, from two working
    directories, with file descriptors 1 and 2 redirected to files (children inherit them), ``PYTHONUNBUFFERED=1``, a scratch
    home and temp directory, and an environment sentinel so the child does not start a canary of its own.
-3. The FORCED mode makes every test fail after its body (a trace function raises at the ``return`` event of the test method)
-   and makes EVERY ``assert*`` call echo its operands to stderr, as a failing assertion would print them (the same reprs the
-   failure message and its diff are built from).  Frame locals are not part of the authoritative mode: a runner option that
-   lists them (``pytest --showlocals``, unittest ``tb_locals``) is the reader's choice, and the tests hold workflow text in locals
-   by design.  ``TIER_CANARY_LOCALS_8187=1`` runs that informational leg as well (it is NOT claimed clean).
+3. The FORCED mode wraps the test-method call so that a test that PASSED raises a forced failure after its body (a test's own
+   exception, skip or failed assertion propagates untouched, so the real failure report is scanned) and makes EVERY ``assert*``
+   call echo its operands to stderr, as a failing assertion would print them (the same reprs the failure message and its diff
+   are built from).  The forced unittest runner always passes ``tb_locals=forced``, so a failure report lists the frame locals
+   too and those bytes are scanned.  pytest lists locals only with ``--showlocals``, which the informational leg
+   ``TIER_CANARY_LOCALS_8187=1`` adds (that leg also keeps the test frame in the forced traceback; it is NOT claimed clean).
 4. Every captured byte (stdout, stderr, the junit report and every file created or changed under the copy) is searched for the
    marker under the finite NAMED transform set ``CANARY_TRANSFORMS``.
 5. Any hit fails, naming only the transform, the run and the byte offset: never the text around it, never the marker.

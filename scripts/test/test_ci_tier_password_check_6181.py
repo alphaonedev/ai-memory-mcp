@@ -3669,6 +3669,9 @@ TAINT_REBIND_BUILTINS = frozenset(TAINT_ACCEPTED_BUILTINS | {"getattr"})
 # r31 code F2 / security F2: the module roots of ``TAINT_ACCEPTED_QUALIFIED`` (``os.path.join``, ``re.escape``) are trusted by name
 # too; ``os = <printing object>`` at module level or in a function made every ``os.path.join(v)`` an echo that passed
 TAINT_REBIND_MODULES = frozenset(name.partition(".")[0] for name in TAINT_ACCEPTED_QUALIFIED)
+# r33 code r32 F2: ``import os as o`` / ``from os import path as p`` / ``import os.path as p`` bind a name the root-keyed refusal never
+# saw, so an alias import of a sink module (or of ``sys``, whose ``modules`` table resolves every import) is refused outright
+TAINT_ALIAS_REFUSED_MODULES = frozenset(TAINT_REBIND_MODULES | {"sys"})
 TAINT_REBIND_NAMES = frozenset(TAINT_REBIND_BUILTINS | TAINT_SAFE_CALLS | TAINT_SOURCES | TAINT_REBIND_MODULES)
 TAINT_REBIND_ATTRS = frozenset(TAINT_ACCEPTED_METHODS | TAINT_MUTATORS | TAINT_PATTERN_METHODS | {"decode", "encode", "format"}
                                | TAINT_REBIND_NAMES)
@@ -3851,6 +3854,10 @@ class TaintScan:
                     if bound in TAINT_REBIND_NAMES and not own:
                         names.add(bound)
                         lines.add(node.lineno)
+                    sink = (alias.name if isinstance(node, ast.Import) else node.module or "").partition(".")[0]
+                    if sink in TAINT_ALIAS_REFUSED_MODULES and alias.asname not in (None, alias.name) and (
+                            isinstance(node, ast.Import) or not node.level):
+                        lines.add(node.lineno)  # r33 code r32 F2: an alias of a sink module is refused outright, bound or not
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if node.name in TAINT_REBIND_BUILTINS | TAINT_REBIND_MODULES and not in_class:
                     names.add(node.name)
@@ -4581,11 +4588,7 @@ class TaintScan:
             for arg, default in zip(stmt.args.kwonlyargs, stmt.args.kw_defaults):
                 if default is not None and self.tainted(default, env):
                     self.add_param(stmt.name, arg.arg)
-            for decorator in stmt.decorator_list:  # r27: a decorator is a call that runs on the function
-                for node in ast.walk(decorator):
-                    if isinstance(node, ast.Call):
-                        self.visit_call(node, env)
-                self.visit_call(ast.copy_location(ast.Call(func=decorator, args=[ast.Constant(None)], keywords=[]), decorator), env)
+            self.decorators(stmt, env)  # r27: a decorator is a call that runs on the function
             return  # analysed on its own, with its own environment
         if isinstance(stmt, ast.Raise) and (
                 stmt.exc is None or self.tainted(stmt.exc, env) or self.tainted(stmt.cause, env)
@@ -4601,6 +4604,7 @@ class TaintScan:
             # metaclass; they are judged under the every-argument rule like the arguments of any other call
             if any(self.tainted(base, env) for base in stmt.bases) or any(self.tainted(kw.value, env) for kw in stmt.keywords):
                 self.flagged.add(stmt.lineno)
+            self.decorators(stmt, env)  # r33 code r32 F1: a class decorator is a call that runs on the class, as on a function
             self.walk(stmt.body, set(env), scope)
             return
         if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and getattr(stmt, "value", None) is not None:
@@ -4628,6 +4632,15 @@ class TaintScan:
         for handler in getattr(stmt, "handlers", []) or []:
             for child in handler.body:
                 self.statement(child, env, scope)
+
+    def decorators(self, stmt, env):
+        """r27, r33 code r32 F1: every Call inside a decorator of ``stmt`` (a function or a class) is judged under the every-argument
+        rule, and so is the call of the decorator itself on the decorated object."""
+        for decorator in stmt.decorator_list:
+            for node in ast.walk(decorator):
+                if isinstance(node, ast.Call):
+                    self.visit_call(node, env)
+            self.visit_call(ast.copy_location(ast.Call(func=decorator, args=[ast.Constant(None)], keywords=[]), decorator), env)
 
     def bind_walrus(self, stmt, env):
         """r26 sec F1: ``if (v := text):`` binds ``v`` to author text before the body runs."""
@@ -5059,7 +5072,8 @@ PRECHECK_REFLECTION_ALLOWED = ("opaque_probe_paths", "opaque_finalizer_funcs", "
 PRECHECK_REFLECTION_CALLS = frozenset(("getattr", "setattr", "delattr", "globals", "locals", "vars", "__import__"))
 PRECHECK_REFLECTION_ATTRS = frozenset(("__dict__", "__class__", "".join(("__glob", "als__")), "__builtins__", "__getattribute__",
                                        "__subclasses__", "__reduce__", "__reduce_ex__"))
-PRECHECK_DEVICE_PREFIXES = ("/dev/", "/proc/")
+PRECHECK_IMPORT_CALLS = frozenset(("import_module", "reload"))
+PRECHECK_DEVICE_PREFIXES =("/dev/", "/proc/")
 PRECHECK_WRITER_NAMES = frozenset(("write_text", "write_bytes", "open"))
 
 
@@ -5071,12 +5085,20 @@ def precheck_refusals(source):
     tree = ast.parse(source)
     lines = set()
 
-    def visit(node, stack):
+    def visit(node, stack, parent=None):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             stack = stack + (node.name,)
         if isinstance(node, ast.Attribute):
             if node.attr == "_exit":
                 lines.add(node.lineno)
+            if node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys" \
+                    and "load_variant" not in stack:
+                # r33 code r32 F2: the module table is read (``sys.modules[__name__]``, ``.get``), never stored into, updated, popped,
+                # deleted or handed on (``patch.dict(sys.modules, ...)``): a stored ``os`` is what every later ``import os`` returns
+                read = (isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load)) or (
+                    isinstance(parent, ast.Attribute) and parent.value is node and parent.attr == "get")
+                if not read:
+                    lines.add(node.lineno)
             if node.attr in PRECHECK_REFLECTION_ATTRS and not set(stack) & set(PRECHECK_REFLECTION_ALLOWED):
                 lines.add(node.lineno)
         if isinstance(node, ast.Call):
@@ -5097,8 +5119,13 @@ def precheck_refusals(source):
                     and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
                 if not constant_lookup:
                     lines.add(node.lineno)  # a getattr with a constant name reads one named attribute; the taint scan judges the operand
+        if isinstance(node, ast.ImportFrom) and node.module == "sys" and any(alias.name == "modules" for alias in node.names):
+            lines.add(node.lineno)  # r33: ``from sys import modules`` is the module table under a bare name
+        if isinstance(node, ast.Call) and call_name(node) in PRECHECK_IMPORT_CALLS \
+                and not set(stack) & set(PRECHECK_REFLECTION_ALLOWED):
+            lines.add(node.lineno)  # r33: ``importlib.import_module`` / ``importlib.reload`` (``__import__`` is in PRECHECK_REFLECTION_CALLS)
         for child in ast.iter_child_nodes(node):
-            visit(child, stack)
+            visit(child, stack, node)
 
     visit(tree, ())
     return sorted(lines)
@@ -8335,9 +8362,10 @@ class TestRuntimeCanaryRunsTheWholeModule8187R29(unittest.TestCase):
     """r29 B-1: the WHOLE module runs as a subprocess in a throwaway copy of the repository whose workflows carry a unique marker
     (loaded through the real loading path), under unittest (and pytest, and the lowest and highest interpreter, when
     ``TIER_CANARY_FULL_8187=1``), in FORCED-FAILURE mode (every test fails after its body and every ``assert*`` call echoes the operands a failing
-    assertion would print); frame locals are the reader's runner option and are not part of the authoritative mode
-    (decision: force every assertion's operands into the output over dumping frame locals because a runner option that
-    lists locals is the reader's choice and the tests hold workflow text by design); every captured byte is searched under
+    assertion would print); the forced unittest runner always passes ``tb_locals=forced``, so a failure report lists the frame locals
+    too, and pytest lists them only on the informational ``--showlocals`` leg
+    (decision: force every assertion's operands into the output and run unittest with ``tb_locals=forced`` over a runner option
+    left to the reader because the tests hold workflow text in locals by design); every captured byte is searched under
     ``CANARY_TRANSFORMS``.  Only the sha256 of the marker is ever printed."""
 
     def scratch(self):
