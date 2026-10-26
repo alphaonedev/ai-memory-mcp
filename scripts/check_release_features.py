@@ -5811,6 +5811,96 @@ R11_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
 }
 
 
+# Round 12 (code r11 F1-F3): (document, files, message count, needle). F1: a here-document delimiter is a plain word in at most
+# one whole quote pair or after one backslash, else it is refused. F2: a `[` that opens a subscript is followed by no
+# substitution anywhere in the rest of the word (no `]` stop), in words and `env:` values. F3: a re-evaluating context
+# (`$(( ))`, `(( ))`, `[[ -eq ]]`, `declare -i`, `${!name}`, `declare -n`, `test -v`, a substring offset, a read subscript)
+# is refused on a non-literal operand, and `$'..'` with an escape and `printf -v` are refused outright.
+_R12_ENV_STEP = "      - run: echo $(( X ))\n        env:\n          X: '%s'\n"
+R12_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
+    # --- F1: refused delimiters (red at c3c0223d4).
+    "r12 F1 H17: a delimiter with a backslash-escaped blank is refused": (_r8("cat <<E\\ F", "body", "E F", "./f", "E"), None, 1, "here-document delimiter"),
+    "r12 F1 H18: a dollar-quoted delimiter is refused": (_r8("cat <<$'E'", "body", "E", "./f", "$E"), None, 1, "here-document delimiter"),
+    "r12 F1 H19: a quoted delimiter with a blank is refused": (_r8("cat <<'E F'", "body", "E F", "./f", "'", "E"), None, 1, "here-document delimiter"),
+    "r12 F1: an empty quoted pair after the word is refused": (_r8("cat <<E\"\"", "body", "E", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a dollar-double-quoted delimiter is refused": (_r8("cat <<$\"E\"", "body", "E", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a quote pair in the middle of the word is refused": (_r8("cat <<E'F'", "body", "EF", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: text after the closing quote is refused": (_r8("cat <<'E'x", "body", "Ex", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a quote that does not close is refused": (_r8("cat <<'E", "body", "E", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a backslash inside the word is refused": (_r8("cat <<E\\F", "body", "EF", "./f"), None, 1, "here-document delimiter"),
+    "r12 F1: a quoted delimiter with a dash is refused": (_r8("cat <<'E-1'", "body", "E-1", "./f"), None, 1, "here-document delimiter"),
+    # --- F1: accepted delimiters (green at both).
+    "r12 F1 ok: <<'E' passes": (_r8("cat <<'E'", "$(./f)", "E"), None, 0, ""),
+    "r12 F1 ok: <<\"E\" passes": (_r8("cat <<\"E\"", "$(./f)", "E"), None, 0, ""),
+    "r12 F1 ok: <<\\E passes": (_r8("cat <<\\E", "$(./f)", "E"), None, 0, ""),
+    "r12 F1 ok: <<E passes": (_r8("cat <<E", "plain", "E"), None, 0, ""),
+    "r12 F1 ok: <<-E passes": (_r8("cat <<-E", "plain", "E"), None, 0, ""),
+    "r12 F1 ok: << 'E' with a blank passes (release.yml FORMULA_EOF shape)": (_r8("cat > f << 'FORMULA_EOF'", "$(./f)", "FORMULA_EOF"), None, 0, ""),
+    "r12 F1 ok: <<E_1 passes": (_r8("cat <<E_1", "plain", "E_1"), None, 0, ""),
+    "r12 F1 ok: <<'MODULEMAP' with a redirect passes (release.yml shape)": (_r8("cat > f <<'MODULEMAP'", "$(./f)", "MODULEMAP"), None, 0, ""),
+    "r12 F1 ok: <<MSG passes (c8-precheck.yml shape)": (_r8("cat <<MSG", "plain", "MSG"), None, 0, ""),
+    # --- F2: nested or quoted ] before a substitution (red at c3c0223d4).
+    "r12 F2 A1: a nested subscript before a substitution is refused": (_r8("X='a[b[1]+$(./f)]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r12 F2 A7: a quoted ] before a substitution is refused": (_r8("X='a[\"]\"$(./f)]'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r12 F2 E1: an env value with a nested subscript is refused": (_r7_steps(_R12_ENV_STEP % "a[b[1]+$(./f)]"), None, 1, "array subscript"),
+    "r12 F2: a closed subscript then a substitution in a word is refused": (_r8("echo \"x[y]$(true)\""), None, 1, "array subscript"),
+    "r12 F2: a closed subscript then a transformation is refused": (_r8("X='a[b]${Y@P}'", "echo $(( X ))"), None, 1, "array subscript"),
+    "r12 F2: an env value with a closed subscript then a substitution is refused": (_r7_steps(_R12_ENV_STEP % "a[b]$(./f)"), None, 1, "array subscript"),
+    "r12 F2: an env value with a backtick after a subscript is refused": (_r7_steps(_R12_ENV_STEP % "a[b]`./f`"), None, 1, "array subscript"),
+    # --- F2: accepted (green at both).
+    "r12 F2 ok: ${arr[@]} passes": (_r8("echo ${arr[@]}"), None, 0, ""),
+    "r12 F2 ok: \"$@\" passes": (_r8("echo \"$@\""), None, 0, ""),
+    "r12 F2 ok: ${X:-me@host} passes": (_r8("echo ${X:-me@host}"), None, 0, ""),
+    "r12 F2 ok: a closed subscript with no substitution passes": (_r8("X='a[1]b[2]'", "echo $X"), None, 0, ""),
+    "r12 F2 ok: a plain env value passes": (_r7_steps("      - run: echo ok\n        env:\n          X: 'a[1]b'\n"), None, 0, ""),
+    # --- F3: refused (red at c3c0223d4).
+    "r12 F3 A2: an ANSI-C string with an escape is refused": (_r8("X=$'a[\\x24(./f)]'", "echo $(( X ))"), None, 1, "ANSI-C"),
+    "r12 F3 A3: two halves joined by concatenation then used as a number are refused": (
+        _r8("A='a['", "B='$(./f)]'", "X=$A$B", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3 A4: += append then used as a number is refused": (_r8("X='a['", "X+='$(./f)]'", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3 A5: printf -v is refused": (_r8("printf -v X 'a[%s(./f)]' '$'", "echo $(( X ))"), None, 1, "printf -v"),
+    "r12 F3: printf -v of any text is refused": (_r8("printf -v Y %s ok"), None, 1, "printf -v"),
+    "r12 F3: an ANSI-C string with a tab escape is refused": (_r8("echo $'a\\tb'"), None, 1, "ANSI-C"),
+    "r12 F3: a non-literal operand in $(( )) is refused": (_r8("X=$HOME", "echo $(( X + 1 ))"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal operand written as $X in $(( )) is refused": (_r8("X=$HOME", "echo $(( $X + 1 ))"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal operand in (( )) is refused": (_r8("X=$HOME", "(( X ))"), None, 1, "(( ))"),
+    "r12 F3: a non-literal operand in [[ -eq ]] is refused": (_r8("X=$HOME", "[[ $X -eq 0 ]]"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal left operand in [[ -lt ]] is refused": (_r8("X=$HOME", "[[ 0 -lt $X ]]"), None, 1, "non-literal operand"),
+    "r12 F3: declare -i of a non-literal value is refused": (_r8("X=$HOME", "declare -i Y=$X"), None, 1, "non-literal operand"),
+    "r12 F3: ${!X} on a non-literal name is refused": (_r8("X=$HOME", "echo ${!X}"), None, 1, "non-literal operand"),
+    "r12 F3: declare -n to a non-literal name is refused": (_r8("X=$HOME", "declare -n R=$X"), None, 1, "non-literal operand"),
+    "r12 F3: test -v on a non-literal name is refused": (_r8("X=$HOME", "test -v \"$X\""), None, 1, "non-literal operand"),
+    "r12 F3: [ -v ] on a non-literal name is refused": (_r8("X=$HOME", "[ -v \"$X\" ]"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal substring offset is refused": (_r8("X=$HOME", "echo ${S:$X:1}"), None, 1, "non-literal operand"),
+    "r12 F3: a non-literal read subscript is refused": (_r8("X=$HOME", "echo ${ary[X]}"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable in $(( )) is refused": (_r8("for i in 1 2; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: an array-valued name in $(( )) is refused": (_r8("N=(1 2)", "echo $(( N ))"), None, 1, "non-literal operand"),
+    "r12 F3: a name with one plain and one expanded assignment is refused": (_r8("N=5", "N=$HOME", "echo $(( N ))"), None, 1, "non-literal operand"),
+    "r12 F3: a command substitution as an operand is refused": (_r8("echo $(( $(true) + 1 ))"), None, 1, "non-literal operand"),
+    # --- F3: accepted (green at both).
+    "r12 F3 ok: literal arithmetic $(( 1 + 2 )) passes": (_r8("echo $(( 1 + 2 ))"), None, 0, ""),
+    "r12 F3 ok: $(( N )) with N a plain number passes": (_r8("N=5", "echo $(( N ))"), None, 0, ""),
+    "r12 F3 ok: the release.yml counter shape passes": (
+        _r8("emitted=0", "for t in a b; do", "emitted=$((emitted + 1))", "done", "[ \"$emitted\" -eq 0 ]"), None, 0, ""),
+    "r12 F3 ok: [[ $N -eq 5 ]] with N a plain number passes": (_r8("N=5", "[[ $N -eq 5 ]]"), None, 0, ""),
+    "r12 F3 ok: [ \"$attempt\" -lt 3 ] with a plain number passes": (_r8("attempt=1", "[ \"$attempt\" -lt 3 ]"), None, 0, ""),
+    "r12 F3 ok: a defaulted operand ${approved:-0} in [ -ge ] passes": (_r8("[ \"${approved:-0}\" -ge 1 ]"), None, 0, ""),
+    "r12 F3 ok: ${X:0:3} passes": (_r8("echo ${X:0:3}"), None, 0, ""),
+    "r12 F3 ok: ${X: -1} passes": (_r8("echo ${X: -1}"), None, 0, ""),
+    "r12 F3 ok: ${X:$N} with N a plain number passes": (_r8("N=2", "echo ${X:$N}"), None, 0, ""),
+    "r12 F3 ok: ${!ary[@]} passes": (_r8("echo ${!ary[@]}"), None, 0, ""),
+    "r12 F3 ok: ${!pre*} passes": (_r8("echo ${!pre*}"), None, 0, ""),
+    "r12 F3 ok: test -v HOME passes": (_r8("test -v HOME"), None, 0, ""),
+    "r12 F3 ok: [ -v HOME ] passes": (_r8("[ -v HOME ]"), None, 0, ""),
+    "r12 F3 ok: an associative array read with a loop key passes (release.yml ABI_OF shape)": (
+        _r8("declare -A ABI_OF=(", "[a]=x", ")", "for TARGET in a; do", "ABI=\"${ABI_OF[$TARGET]}\"", "done"), None, 0, ""),
+    "r12 F3 ok: declare -i N=5 passes": (_r8("declare -i N=5"), None, 0, ""),
+    "r12 F3 ok: declare -n R=X passes": (_r8("declare -n R=X"), None, 0, ""),
+    "r12 F3 ok: a plain $'abc' passes": (_r8("echo $'abc'"), None, 0, ""),
+    "r12 F3 ok: a quoted plain string assignment then $(( N )) passes": (_r8("N='7'", "echo $(( N ))"), None, 0, ""),
+}
+
+
 def cargo_config_twins() -> List[str]:
     """Round 9 (sec r8 F2): the problems of CARGO_CONFIG_ENV_TWINS: every key `cargo --config` is refused for has an
     environment twin that DANGEROUS_ASSIGN_RE (or the flag rule) refuses."""

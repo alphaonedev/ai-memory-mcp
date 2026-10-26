@@ -1483,6 +1483,33 @@ class Round11(unittest.TestCase):
         self.assertEqual([i + 1 for i, ln in enumerate(text.splitlines()) if needle in ln and "assertEqual" not in ln], [])
 
 
+class Round12(unittest.TestCase):
+    """PR 8003 round 12 (code r11 F1-F3): one generated test method per row of G.R12_CASES. A refusal row fails on the
+    round-11 head and passes on the round-12 head; an acceptance row passes on both."""
+
+    def check_row(self, name):
+        tmp = Path(tempfile.mkdtemp(prefix="r12.", dir=scratch()))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        doc, files, count, needle = G.R12_CASES[name]
+        errs = G.r5_errors(doc, files, tmp / "t")
+        self.assertEqual(len(errs), count, f"{name}: {errs[:3]}")
+        if needle:
+            self.assertIn(needle, " | ".join(errs), name)
+
+
+def _r12_add_row_tests():
+    for index, row in enumerate(G.R12_CASES):
+        slug = re.sub(r"[^a-z0-9]+", "_", row.lower()).strip("_")[:80]
+
+        def method(self, row=row):
+            self.check_row(row)
+        method.__doc__ = row
+        setattr(Round12, f"test_{index:03d}_{slug}", method)
+
+
+_r12_add_row_tests()
+
+
 class SelfTest8023(unittest.TestCase):
     """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
 
