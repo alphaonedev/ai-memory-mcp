@@ -95,18 +95,29 @@ def run_blocks_of(lines):
     return blocks
 
 
+IF_FI_WORD = re.compile(r"\b(?:if|fi)\b")
+
+
 def guard_end(body, start):
-    """Index of the ``fi`` that closes the ``if`` at body[start], by if/fi nesting depth (None if unclosed)."""
+    """``(end, problem)``: the ``fi`` closing the ``if`` at body[start], by if/fi nesting depth.
+
+    ``end`` is None when unclosed or when a line carries an if/fi the per-line rule cannot count
+    (sec r4 F1 = code r4 O1): then ``problem`` names the line. decision: fail closed on uncountable
+    if/fi lines over a real shell parser because the pin's job is to refuse what it cannot prove and
+    a parser would be a second implementation of bash in a test.
+    """
     depth = 0
     for i in range(start, len(body)):
         word = body[i].strip()
-        if word.startswith("if "):
+        if word.startswith("if ") and len(IF_FI_WORD.findall(word)) == 1:
             depth += 1
         elif word == "fi":
             depth -= 1
             if depth == 0:
-                return i
-    return None
+                return i, None
+        elif IF_FI_WORD.search(word):
+            return None, "uncountable if/fi line in the RUNNER_OS guard: " + word
+    return None, "RUNNER_OS guard has no closing fi"
 
 
 def heal_defects(lines):
@@ -118,9 +129,9 @@ def heal_defects(lines):
         for n, ln in enumerate(body):
             if ln.strip() != HEAL_GUARD:
                 continue
-            end = guard_end(body, n)
+            end, problem = guard_end(body, n)
             if end is None:
-                return ["RUNNER_OS guard has no closing fi"]
+                return [problem]
             inside += sum(HEAL_SCRIPT in x for x in body[n + 1:end])
     if inside != 1 or total != 1:
         return ["heal call not exactly once inside the guard"]
