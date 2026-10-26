@@ -3660,7 +3660,10 @@ TAINT_PATH_FUNCTIONS = frozenset(("stage_text",))
 # re-assigned, imported under another source, declared global or stored into a namespace; an attribute store to a method name the
 # scan accepts (``Cls.lower = print``) or to the ``builtins`` module is a defect too
 TAINT_REBIND_BUILTINS = frozenset(TAINT_ACCEPTED_BUILTINS | {"getattr"})
-TAINT_REBIND_NAMES = frozenset(TAINT_REBIND_BUILTINS | TAINT_SAFE_CALLS | TAINT_SOURCES)
+# r31 code F2 / security F2: the module roots of ``TAINT_ACCEPTED_QUALIFIED`` (``os.path.join``, ``re.escape``) are trusted by name
+# too; ``os = <printing object>`` at module level or in a function made every ``os.path.join(v)`` an echo that passed
+TAINT_REBIND_MODULES = frozenset(name.partition(".")[0] for name in TAINT_ACCEPTED_QUALIFIED)
+TAINT_REBIND_NAMES = frozenset(TAINT_REBIND_BUILTINS | TAINT_SAFE_CALLS | TAINT_SOURCES | TAINT_REBIND_MODULES)
 TAINT_REBIND_ATTRS = frozenset(TAINT_ACCEPTED_METHODS | TAINT_MUTATORS | TAINT_PATTERN_METHODS | {"decode", "encode", "format"}
                                | TAINT_REBIND_NAMES)
 # the keywords through which an accepted callee runs a callable on the loaded value (``sorted(..., key=f)``)
@@ -3837,12 +3840,13 @@ class TaintScan:
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for alias in node.names:
                     bound = alias.asname or alias.name.split(".")[0]
-                    own = isinstance(node, ast.ImportFrom) and node.module == TAINT_PROJECT_MODULE and alias.name == bound
+                    own = (isinstance(node, ast.ImportFrom) and node.module == TAINT_PROJECT_MODULE and alias.name == bound) or (
+                        isinstance(node, ast.Import) and alias.name.split(".")[0] == bound and alias.asname in (None, bound))
                     if bound in TAINT_REBIND_NAMES and not own:
                         names.add(bound)
                         lines.add(node.lineno)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node.name in TAINT_REBIND_BUILTINS and not in_class:
+                if node.name in TAINT_REBIND_BUILTINS | TAINT_REBIND_MODULES and not in_class:
                     names.add(node.name)
                     lines.add(node.lineno)
                 if not isinstance(node, ast.ClassDef):
@@ -3865,7 +3869,7 @@ class TaintScan:
         """The line of ``node`` when one of its parameters is named like a builtin the scan accepts (``def f(len): len(x)``)."""
         args = node.args
         every = [*args.posonlyargs, *args.args, *args.kwonlyargs, *(a for a in (args.vararg, args.kwarg) if a is not None)]
-        hit = [a.arg for a in every if a.arg in TAINT_REBIND_BUILTINS]
+        hit = [a.arg for a in every if a.arg in TAINT_REBIND_BUILTINS | TAINT_REBIND_MODULES]
         names.update(hit)
         return [node.lineno] if hit else []
 
@@ -4587,6 +4591,10 @@ class TaintScan:
         if isinstance(stmt, ast.Assert) and (self.operands_tainted(stmt.test, env) or self.tainted(stmt.msg, env)):
             self.flagged.add(stmt.lineno)
         if isinstance(stmt, ast.ClassDef):
+            # r31 code F3 / security F3: the bases and the class keywords (``metaclass=M``) are arguments of a call that runs the
+            # metaclass; they are judged under the every-argument rule like the arguments of any other call
+            if any(self.tainted(base, env) for base in stmt.bases) or any(self.tainted(kw.value, env) for kw in stmt.keywords):
+                self.flagged.add(stmt.lineno)
             self.walk(stmt.body, set(env), scope)
             return
         if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and getattr(stmt, "value", None) is not None:
@@ -7237,7 +7245,7 @@ TAINT_R27_CLEAN = {
     "sorted key=len": TAINT_R27_HEAD + "        names = sorted(body, key=len)\n        self.assertEqual(len(names), 2)\n",
     "sorted key=lambda len": TAINT_R27_HEAD + "        top = sorted(body, key=lambda v: len(v))\n        self.assertEqual(len(top), 2)\n",
     "json.dumps then length": TAINT_R27_HEAD + "        import json\n        blob = json.dumps(body, sort_keys=True)\n        self.assertEqual(len(blob), 10)\n",
-    "dict copy flag": TAINT_R27_HEAD + "        copy = dict(body)\n        self.assertIs(bool(copy), True)\n",
+    "dict copy flag": TAINT_R27_HEAD + "        clone = dict(body)\n        self.assertIs(bool(clone), True)\n",
     "constant output": TAINT_R27_HEAD + "        sys.stdout.write('ok')\n        logging.getLogger('x').warning('ok')\n",
 }
 # the callees the scan accepts for a tainted argument, receiver or callee (``TAINT_ACCEPTED_CALLEES``); none of them writes
