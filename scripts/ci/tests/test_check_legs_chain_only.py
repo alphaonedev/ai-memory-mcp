@@ -42,17 +42,18 @@ CHECKOUT_STEP_RE = re.compile(r'^uses: actions/checkout@[0-9a-f]{40}( # v[0-9.]+
 RUNS_ON = ("runs-on: ${{ fromJSON(contains(needs.classify.outputs.check_tiers, matrix.tier)"
            " && matrix.runner || '[\"ubuntu-latest\"]') }}")
 
-# The four legs, in order, exactly as `.github/workflows/ci.yml` at the base
-# afbcd9729696 carries them (`git show afbcd9729696:.github/workflows/ci.yml`):
+# The four legs, in order, exactly as `.github/workflows/ci.yml` at the chain tip
+# 432334ff901d carries them (`git show 432334ff901d:.github/workflows/ci.yml`); the
+# linux-fed,enterprise-fed cap is 300 since PR #7924 (#7914):
 #   leg: ubuntu-latest,sqlite      runner: '["ubuntu-latest"]'              node: ubuntu-latest tier: sqlite         timeout: 95  once: true
-#   leg: linux-fed,enterprise-fed  runner: '["self-hosted","linux-fed"]'    node: linux-fed     tier: enterprise-fed timeout: 160 shared_target: true
+#   leg: linux-fed,enterprise-fed  runner: '["self-hosted","linux-fed"]'    node: linux-fed     tier: enterprise-fed timeout: 300 shared_target: true
 #   leg: macos-fed,sqlite          runner: '["self-hosted","macos-fed"]'    node: macos-fed     tier: sqlite         timeout: 80
 #   leg: macos-fed,enterprise-fed  runner: '["self-hosted","macos-fed"]'    node: macos-fed     tier: enterprise-fed timeout: 160
 LEGS = (
     {'leg': 'ubuntu-latest,sqlite', 'runner': '["ubuntu-latest"]', 'node': 'ubuntu-latest',
      'tier': 'sqlite', 'timeout': '95', 'once': 'true'},
     {'leg': 'linux-fed,enterprise-fed', 'runner': '["self-hosted","linux-fed"]', 'node': 'linux-fed',
-     'tier': 'enterprise-fed', 'timeout': '160', 'shared_target': 'true'},
+     'tier': 'enterprise-fed', 'timeout': '300', 'shared_target': 'true'},
     {'leg': 'macos-fed,sqlite', 'runner': '["self-hosted","macos-fed"]', 'node': 'macos-fed',
      'tier': 'sqlite', 'timeout': '80'},
     {'leg': 'macos-fed,enterprise-fed', 'runner': '["self-hosted","macos-fed"]', 'node': 'macos-fed',
