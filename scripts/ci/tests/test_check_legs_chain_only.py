@@ -135,6 +135,74 @@ NODE_PROPERTY_RE = re.compile(r'(?:^|[\s{\[,])[*&][A-Za-z0-9_]')
 JOB_FOLLOWED_BY = (('check', 'postgres-feature'), ('classify', 'lint'))
 
 
+# #8174 code r6 F1: an allow-list of the key FORM. Outside block scalars, a line of a gate job opens
+# (after any `- `) with a plain unquoted key or with plain text; a line opening with a tag (!), an
+# anchor (&), an alias (*), an explicit key (?), a quote, a flow bracket or a directive is refused,
+# and so is a quoted scalar that runs over a line end (it can hide a fake block-scalar header).
+PLAIN_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]*:(?:\s|$)')
+BLOCK_HEADER_RE = re.compile(r'(?:^|:\s+)[|>][+-]?\d?[+-]?\s*(?:#.*)?$')
+REFUSED_KEY_STARTS = '!&*?"\'{[%@`'
+
+
+def opens_multiline_quote(line):
+    """True when a quoted scalar starts on this line and is still open at its end."""
+    quote, i = None, 0
+    while i < len(line):
+        ch = line[i]
+        if quote is None:
+            if ch == '#' and (i == 0 or line[i - 1] in ' \t'):
+                return False
+            if ch in '\'"' and (i == 0 or line[i - 1] in ' \t[{,:-?'):
+                quote = ch
+        elif quote == '"':
+            if ch == '\\':
+                i += 1
+            elif ch == '"':
+                quote = None
+        elif ch == "'":
+            if line[i + 1:i + 2] == "'":
+                i += 1
+            else:
+                quote = None
+        i += 1
+    return quote is not None
+
+
+def key_form_scan(job_body):
+    """Yield (line number in the job, line, kind) for every line; block-scalar bodies are 'block'.
+
+    kind is one of blank, comment, block, plain-key, text, bad-start, multiline-quote.
+    """
+    block_col = None
+    for number, line in enumerate(job_body.split('\n'), 1):
+        indent = len(line) - len(line.lstrip(' '))
+        if block_col is not None:
+            if not line.strip() or indent > block_col:
+                yield number, line, 'block'
+                continue
+            block_col = None
+        text = line.strip()
+        if not text:
+            yield number, line, 'blank'
+            continue
+        if text.startswith('#'):
+            yield number, line, 'comment'
+            continue
+        body, col = text, indent
+        while body.startswith('- ') or body == '-':
+            body = body[1:].lstrip(' ')
+            col = len(line) - len(body)
+        if body and body[0] in REFUSED_KEY_STARTS:
+            kind = 'bad-start'
+        elif opens_multiline_quote(line):
+            kind = 'multiline-quote'
+        else:
+            kind = 'plain-key' if PLAIN_KEY_RE.match(body) else 'text'
+            if BLOCK_HEADER_RE.search(body):
+                block_col = col if PLAIN_KEY_RE.match(body) else indent
+        yield number, line, kind
+
+
 def job_text(ci, job):
     m = re.search(r'^  %s:\n(.*?)(?=^  [a-z][a-z0-9_-]*:\n)' % re.escape(job), ci, re.S | re.M)
     return m.group(1) if m else ''
@@ -363,6 +431,11 @@ def workflow_problems(ci):
             elif DQ_ESCAPE_RE.match(text):
                 problems.append('the %s job must not use a backslash escape in a double-quoted key or scalar %s'
                                 % (job_name, where))
+        # #8174 code r6 F1: the key-form allow-list (see PLAIN_KEY_RE), outside block scalars.
+        for number, line, kind in key_form_scan(job_body):
+            if kind in ('bad-start', 'multiline-quote'):
+                problems.append('the %s job must use plain unquoted keys and single-line quoted scalars: %s '
+                                '(line %d: %r)' % (job_name, kind, offset + number, line.strip()))
     # The step ends only at the next list item or the end of the job: comment and blank
     # lines inside it still belong to the step.
     m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\Z)', classify, re.S)
@@ -536,7 +609,7 @@ class WorkflowWiring(unittest.TestCase):
 
     def test_continue_on_error_controls_pass(self):
         # #8174 security r5 F1 controls: a comment carrying the word inside the check job passes
-        # (comments do not execute); the key inside a different job is out of scope.
+        # (comments do not execute); the key inside a different job is outside the ban.
         ci = CI_YML.read_text()
         m9x = ci.replace('      - name: docs-only short-circuit\n',
                          '      # continue-on-error: true\n      - name: docs-only short-circuit\n', 1)
