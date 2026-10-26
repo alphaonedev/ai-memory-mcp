@@ -32,6 +32,11 @@ import unittest
 from itertools import zip_longest
 from pathlib import Path
 
+try:  # the cross-check rows need PyYAML; the pin itself never does
+    import yaml
+except ImportError:  # pragma: no cover - a node without PyYAML skips the cross-check rows
+    yaml = None
+
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOWS = (
     REPO / ".github" / "workflows" / "postgres-ignored.yml",
@@ -448,6 +453,46 @@ MUTATIONS = {
 }
 
 
+# Round 9 rows (security r8 F1): a step key written after a comment line. Each row inserts lines into
+# a copy of one workflow: (workflow index in WORKFLOWS, where, inserted lines, expected key).
+# ``after_body`` = right after the last body line of the step; ``before_next`` = just above the next
+# ``      - `` item, i.e. after the comment block that follows the step.
+ROWS9 = {
+    "M36 cert, continue-on-error after the indent-6 comment block (sec r8 H1)": (
+        1, "before_next", ("        continue-on-error: true",), "continue-on-error"),
+    "M37 cert, if after a column-0 comment (sec r8 H2)": (
+        1, "after_body", ("# column zero note", "        if: runner.os == 'Linux'"), "if"),
+    "M38 ign, continue-on-error after an indent-6 comment (sec r8 H3)": (
+        0, "after_body", ("      # note", "        continue-on-error: true"), "continue-on-error"),
+    "M39 cert, working-directory after an indent-4 comment (sec r8 H4)": (
+        1, "after_body", ("    # note", "        working-directory: ."), "working-directory"),
+    "M40 ign, shell after an indent-8 comment inside the step": (
+        0, "after_body", ("        # note", "        shell: bash"), "shell"),
+}
+
+
+def insert_lines(idx, where, new):
+    """The text of ``WORKFLOWS[idx]`` split into lines with ``new`` inserted after the Point-at step body."""
+    lines = WORKFLOWS[idx].read_text(encoding="utf-8").splitlines()
+    at = next(i for i, ln in enumerate(lines) if ln.strip() == "- name: " + STEP_NAME)
+    nxt = next(i for i in range(at + 1, len(lines)) if lines[i].startswith("      - "))
+    if where == "before_next":
+        pos = nxt
+    else:
+        pos = nxt
+        while not lines[pos - 1].strip() or (lines[pos - 1].lstrip().startswith("#") and indent_of(lines[pos - 1]) <= 6):
+            pos -= 1
+    return lines[:pos] + list(new) + lines[pos:]
+
+
+def yaml_step_keys(lines):
+    """Keys of the Point-at step as PyYAML sees them (the live truth the line pin is compared with)."""
+    doc = yaml.safe_load("\n".join(lines) + "\n")
+    steps = [st for job in doc["jobs"].values() for st in job["steps"] if st.get("name") == STEP_NAME]
+    assert len(steps) == 1, steps
+    return list(steps[0])
+
+
 class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
     def test_runs_on_is_the_shared_fed_label(self):
         for path in WORKFLOWS:
@@ -648,6 +693,106 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
     def test_defaults_key_anywhere_in_the_workflow_is_refused(self):
         got = self._defects("jobs:\n", "defaults:\n  run:\n    shell: bash\njobs:\n")
         self.assertEqual(got, ["defaults: key in the workflow: defaults:"])
+
+    def _r9_row(self, prefix):
+        """One ROWS9 row: the pin names the key, and PyYAML (when present) agrees the key is a step key."""
+        name = next(n for n in ROWS9 if n.startswith(prefix + " "))
+        idx, where, new, key = ROWS9[name]
+        lines = insert_lines(idx, where, new)
+        if yaml is not None:
+            self.assertEqual(yaml_step_keys(lines), ["name", "run", key])
+        self.assertEqual(
+            heal_defects(lines, WORKFLOWS[idx].name), ["step has a key other than name and run: " + key]
+        )
+
+    def test_m36_key_after_the_indent_6_comment_block_is_refused(self):
+        """sec r8 H1 (cert)."""
+        self._r9_row("M36")
+
+    def test_m37_key_after_a_column_0_comment_is_refused(self):
+        """sec r8 H2 (cert)."""
+        self._r9_row("M37")
+
+    def test_m38_key_after_a_comment_is_refused_in_the_ignored_workflow(self):
+        """sec r8 H3 (ign)."""
+        self._r9_row("M38")
+
+    def test_m39_working_directory_after_a_comment_is_refused(self):
+        """sec r8 H4 (cert)."""
+        self._r9_row("M39")
+
+    def test_m40_key_after_an_indent_8_comment_is_refused_naming_only_the_key(self):
+        """The comment sits inside the step; the body must end at it, so the key is the only defect."""
+        self._r9_row("M40")
+
+    @unittest.skipIf(yaml is None, "PyYAML absent on this node: the live cross-check is skipped")
+    def test_r9_live_truth_yaml_and_the_pin_agree_on_the_step_keys(self):
+        """Cross-check: PyYAML says name+run at head and the pin is clean, in both workflows."""
+        for path in WORKFLOWS:
+            with self.subTest(workflow=path.name):
+                text = path.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(yaml_step_keys(text), ["name", "run"])
+                self.assertEqual(heal_defects(path), [])
+
+    def _text_defects(self, idx, old, new):
+        """heal_defects of one workflow text with ``old`` replaced by ``new``, split on LF only."""
+        base = WORKFLOWS[idx].read_text(encoding="utf-8")
+        self.assertEqual(base.count(old), 1, "anchor drifted: " + old.strip())
+        return heal_defects(base.replace(old, new, 1).split("\n"), WORKFLOWS[idx].name)
+
+    def test_m41_u2028_inside_the_run_block_is_refused(self):
+        """code r8 F1 (E3): U+2028 joins two lines for the shell but splitlines() still splits them."""
+        old = "\n          " + HEAL_GUARD
+        got = self._text_defects(1, old, "\u2028          " + HEAL_GUARD)
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("U+2028", got[0])
+
+    def test_m42_trailing_nbsp_on_the_env_redirect_line_is_refused(self):
+        """code r8 F1 (E4): strip() removes a trailing U+00A0 the shell keeps in the redirect target."""
+        old = '          } >> "$GITHUB_ENV"\n'
+        got = self._text_defects(0, old, '          } >> "$GITHUB_ENV"\u00a0\n')
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("U+00A0", got[0])
+
+    def test_m43_zero_width_space_inside_a_shell_word_is_refused_by_code_point(self):
+        """code r8 F1: the named defect quotes the code point, not just a body mismatch."""
+        old = "      - name: " + STEP_NAME + "\n        run: |\n          set -euo pipefail"
+        got = self._text_defects(1, old, old.replace("pipefail", "pipe\u200bfail"))
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("U+200B", got[0])
+
+    def test_m44_double_quoted_defaults_key_is_refused(self):
+        """code r8 F2 (E5a): YAML maps "defaults" to the same key as defaults."""
+        got = self._text_defects(1, "jobs:\n", '"defaults":\n  run:\n    shell: bash\njobs:\n')
+        self.assertEqual(got, ['defaults: key in the workflow: "defaults":'])
+
+    def test_m45_single_quoted_defaults_key_is_refused(self):
+        """code r8 F2 (E5b)."""
+        got = self._text_defects(1, "jobs:\n", "'defaults':\n  run:\n    shell: bash\njobs:\n")
+        self.assertEqual(got, ["defaults: key in the workflow: 'defaults':"])
+
+    def test_m46_step_name_as_data_inside_another_run_block_is_not_a_step(self):
+        """code r8 F3 observation: only a dash at exactly 6 spaces is a step; the data line is not."""
+        decoy = "          - name: " + STEP_NAME + "\n"
+        old = "      - name: cargo test --features sal-postgres -- --ignored\n        run: |\n"
+        lines = self._text_defects_lines(0, old, old + decoy)
+        if yaml is not None:
+            self.assertEqual(yaml_step_keys(lines), ["name", "run"])
+        self.assertEqual(heal_defects(lines, WORKFLOWS[0].name), [])
+
+    def _text_defects_lines(self, idx, old, new):
+        base = WORKFLOWS[idx].read_text(encoding="utf-8")
+        self.assertEqual(base.count(old), 1, "anchor drifted: " + old.strip())
+        return base.replace(old, new, 1).split("\n")
+
+    def test_r9_comment_after_the_step_is_accepted(self):
+        """Control: the live cert shape (indent-6 comment block after the step) and a trailing indent-8 comment."""
+        for idx, comment in ((1, None), (0, ("      # trailing at indent 6",))):
+            with self.subTest(comment=comment):
+                lines = WORKFLOWS[idx].read_text(encoding="utf-8").splitlines()
+                if comment:
+                    lines = insert_lines(idx, "after_body", comment)
+                self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), [])
 
 
 if __name__ == "__main__":
