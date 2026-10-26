@@ -58,7 +58,9 @@ LEGS = (
     {'leg': 'macos-fed,enterprise-fed', 'runner': '["self-hosted","macos-fed"]', 'node': 'macos-fed',
      'tier': 'enterprise-fed', 'timeout': '160'},
 )
-INSTALL_RUST_STEP = '      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)\n'
+LINUX_FED_TIMEOUT_300 = '            timeout: 300\n          - leg: macos-fed,sqlite\n'
+MACOS_FED_TIMEOUT_160 = '            timeout: 160\n    steps:\n'
+INSTALL_RUST_STEP ='      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)\n'
 INSTALL_RUST_IF = ('        if: needs.classify.outputs.docs_only != \'true\' && '
                    'contains(needs.classify.outputs.check_tiers, matrix.tier)\n')
 STRAY_NO_IF = '      - name: stray cargo build\n        run: cargo build\n'
@@ -467,6 +469,20 @@ class WorkflowWiring(unittest.TestCase):
                 self.assertNotEqual(text, ci, 'control did not apply')
                 self.assertEqual(workflow_problems(text), [], name)
 
+    def test_timeout_drift_names_leg_and_both_values(self):
+        # #8174 class (i): the LEGS table pins each matrix cap; a cap edited either way is refused,
+        # naming the leg, the pinned value and the value found.
+        ci = CI_YML.read_text()
+        for name, text, want in (
+            ('m10a', ci.replace(LINUX_FED_TIMEOUT_300, LINUX_FED_TIMEOUT_300.replace('300', '160'), 1),
+             "leg linux-fed,enterprise-fed key timeout: want '300' got '160'"),
+            ('m10b', ci.replace(MACOS_FED_TIMEOUT_160, MACOS_FED_TIMEOUT_160.replace('160', '300'), 1),
+             "leg macos-fed,enterprise-fed key timeout: want '160' got '300'"),
+        ):
+            with self.subTest(name):
+                self.assertNotEqual(text, ci, 'mutation did not apply')
+                self.assertEqual(workflow_problems(text), [want], name)
+
     def test_notice_escapes_hostile_refs(self):
         # #8174 security r2 F1: `%` is a legal refname byte and the runner decodes it.
         self.assertEqual(notice_escape_problems(CI_YML.read_text()), [])
@@ -575,6 +591,11 @@ class MutationTable(unittest.TestCase):
             'm9f escaped double-quoted key': ci.replace(
                 '      - name: docs-only short-circuit\n',
                 '      - name: docs-only short-circuit\n        "continue\\x2don-error": true\n', 1),
+            # #8174 class (i) (m10a, m10b): a matrix cap edited away from its pin, either leg.
+            'm10a linux-fed enterprise-fed timeout 300 edited back to 160': ci.replace(
+                LINUX_FED_TIMEOUT_300, LINUX_FED_TIMEOUT_300.replace('300', '160'), 1),
+            'm10b macos-fed enterprise-fed timeout 160 edited to 300': ci.replace(
+                MACOS_FED_TIMEOUT_160, MACOS_FED_TIMEOUT_160.replace('160', '300'), 1),
         }
 
     def test_every_script_mutant_fails_the_behaviour_pins(self):
