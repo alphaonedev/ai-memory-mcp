@@ -1,0 +1,2154 @@
+#!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+"""Pin scripts/ci/ensure-age-extension.py (#6161).
+
+The macos-fed runner keeps Apache AGE in the Homebrew-managed postgresql@18
+trees; a ``brew upgrade`` relinks them and drops the AGE files.  The helper
+restores exactly five sha256-pinned files from a node-local directory.
+
+These tests drive the script as a subprocess against a fake sharedir/pkglibdir
+and a fake psql/pg_config (Python stubs), so no live Postgres is needed.  The
+fake psql models the real ``pg_available_extensions`` view: it lists ``age``
+when ``age.control`` exists and never looks at ``age.dylib``.
+
+Most tests run the script through a small harness that loads it as a module and
+swaps ``MANIFEST`` for pins of the fake files (the real pins name the node's
+real AGE build).  ``test_real_script_*`` run the unmodified script.  Scratch
+lives under the repo's ``.local-runs`` (never /tmp).
+"""
+
+import argparse
+import ctypes
+import ctypes.util
+import errno
+import hashlib
+import importlib.util
+import json
+import os
+import random
+from pathlib import Path
+import re
+import stat
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts/ci/ensure-age-extension.py"
+PW_MARKER = "marker-6161-pw"
+PREFIX = "ensure-age-extension: "
+SHARE_FILES = ("age--1.6.0--1.7.0.sql", "age--1.7.0--1.8.0.sql", "age--1.8.0.sql", "age.control")
+DYLIB = b"\x7fAGE-dylib-6161" * 64
+
+FAKE_PG_CONFIG = """#!{py}
+import sys
+base = {base!r}
+print({{"--sharedir": base + "/share", "--pkglibdir": base + "/lib"}}[sys.argv[1]])
+"""
+
+# Fake psql with real-view semantics: only the control file decides the row.
+# It records its argv and whether PGPASSWORD carried the marker value, and refuses (exit 3) any SQL other than
+# the reviewed read-only probe (#6896).
+PROBE_SQL_6896 = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
+FAKE_PSQL = """#!{py}
+import json, os, sys
+base = {base!r}
+sql = [sys.argv[i + 1] for i, arg in enumerate(sys.argv[:-1]) if arg == "-c"]
+if sql != [""" + repr(PROBE_SQL_6896) + """]:
+    sys.exit(3)
+with open(base + "/psql.log", "a") as fh:
+    fh.write(json.dumps({{"argv": sys.argv, "env_marker_ok": os.environ.get("PGPASSWORD") == {marker!r},
+                         "pgpassword": os.environ.get("PGPASSWORD"),
+                         "pgpassword_hex": os.environb.get(b"PGPASSWORD", b"").hex(),
+                         "connect_timeout_env": os.environ.get("PGCONNECT_TIMEOUT"),
+                         "pgdatabase": os.environ.get("PGDATABASE"),
+                         "pgservice": os.environ.get("PGSERVICE"),
+                         "pgservicefile": os.environ.get("PGSERVICEFILE"),
+                         "env_keys": sorted(os.environ),
+                         "pg_env": {{k: v for k, v in os.environ.items() if k.startswith("PG") and k != "PGPASSWORD"}}}})
+             + "\\n")
+print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
+"""
+
+# Fake psql that never answers a connect: records its pid and its parent pid, then sleeps.
+SLEEPING_PSQL = """#!{py}
+import os, time
+with open({base!r} + "/sleep.ppid", "w") as fh:
+    fh.write(str(os.getppid()))
+with open({base!r} + "/sleep.pid", "w") as fh:
+    fh.write(str(os.getpid()))
+time.sleep(120)
+"""
+
+# Like psql 18.6 after authentication: it catches the signals a naive timeout would use (#6517).
+STUBBORN_PSQL = """#!{py}
+import os, signal, time
+for name in ("SIGTERM", "SIGHUP", "SIGINT", "SIGALRM", "SIGQUIT", "SIGUSR1", "SIGUSR2"):
+    signal.signal(getattr(signal, name), signal.SIG_IGN)
+with open({base!r} + "/sleep.ppid", "w") as fh:
+    fh.write(str(os.getppid()))
+with open({base!r} + "/sleep.pid", "w") as fh:
+    fh.write(str(os.getpid()))
+time.sleep(120)
+"""
+
+# Fake psql that dies by the given signal before printing anything (#6643).
+SELF_SIGNAL_PSQL = """#!{py}
+import os
+os.kill(os.getpid(), {signum})
+"""
+
+# Fake psql that prints a fixed text and exits with a fixed code (#6677).
+EXITING_PSQL = """#!{py}
+import sys
+sys.stdout.write("{out}")
+sys.exit({code})
+"""
+
+# Fake psql that writes connection detail to stderr and exits 2, as a real authentication failure does (#6897).
+STDERR_PSQL = """#!{py}
+import sys
+sys.stderr.write('psql: error: connection to server at "leakhost6897" (192.0.2.97), port 5445 failed: FATAL:  '
+                 'password authentication failed for user "leakuser6897" database "leakdb6897" marker-6897-stderr\\n')
+sys.exit(2)
+"""
+
+# Fake psql that closes its output pipes, SIGKILLs its parent (the supervisor) and keeps running (#6642).
+PARENT_KILLING_PSQL = """#!{py}
+import os, signal, time
+with open({base!r} + "/sleep.pid", "w") as fh:
+    fh.write(str(os.getpid()))
+os.close(1)
+os.close(2)
+os.kill(os.getppid(), signal.SIGKILL)
+time.sleep(120)
+"""
+
+# STUBBORN_PSQL that needs 1.5 s before it records its pid: a loaded host's start-up delay, made deterministic (#6646).
+SLOW_STUBBORN_PSQL = STUBBORN_PSQL.replace('with open({base!r} + "/sleep.ppid"', 'time.sleep(1.5)\nwith open({base!r} + "/sleep.ppid"', 1)
+assert SLOW_STUBBORN_PSQL != STUBBORN_PSQL
+
+# Signals the helper does not turn into an interrupt: default-ignored (CHLD, URG, WINCH, INFO, CONT),
+# job control (TSTP, TTIN, TTOU), PIPE (Python ignores it), the synchronous faults (SEGV, BUS, ILL, FPE) and the
+# two nothing can catch (KILL, STOP).  Every other signal valid on this platform must end in `interrupted` (#6504).
+NOT_INTERRUPT_SIGNALS = (
+    "SIGKILL", "SIGSTOP", "SIGCHLD", "SIGCLD", "SIGURG", "SIGWINCH", "SIGINFO", "SIGCONT", "SIGTSTP", "SIGTTIN",
+    "SIGTTOU", "SIGPIPE", "SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE",
+)
+
+# Every libpq 18.6 connection keyword (PQconndefaults, 50 entries).
+LIBPQ_18_KEYWORDS = (
+    "service user password passfile channel_binding connect_timeout dbname host hostaddr port client_encoding "
+    "options application_name fallback_application_name keepalives keepalives_idle keepalives_interval "
+    "keepalives_count tcp_user_timeout sslmode sslnegotiation sslcompression sslcert sslkey sslcertmode "
+    "sslpassword sslrootcert sslcrl sslcrldir sslsni requirepeer require_auth min_protocol_version "
+    "max_protocol_version ssl_min_protocol_version ssl_max_protocol_version gssencmode krbsrvname gsslib "
+    "gssdelegation replication target_session_attrs load_balance_hosts scram_client_key scram_server_key "
+    "oauth_issuer oauth_client_id oauth_client_secret oauth_scope sslkeylogfile"
+).split()
+
+# Loads the script as a module, swaps MANIFEST (and optionally the uid check),
+# then runs main() with the remaining argv.
+HARNESS = """import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("ensure_age_extension", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+with open(sys.argv[2]) as fh:
+    cfg = json.load(fh)
+mod.MANIFEST = tuple(tuple(row) for row in cfg["manifest"])
+if cfg.get("uid") is not None:
+    mod.running_uid = lambda: cfg["uid"]
+sys.exit(mod.main(sys.argv[3:]))
+"""
+
+
+# Delivers a signal to the helper's own pid right after the real Popen returns (the spawn window).
+# argv: script, signum, pid-file, then the helper's own arguments.
+WINDOW_HARNESS = """import importlib.util, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("ensure_age_extension", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.installed_ok = lambda dests: True
+mod.dest_dirs = lambda pg_config: {}
+signum, pid_file = int(sys.argv[2]), sys.argv[3]
+real_popen = subprocess.Popen
+
+
+class WindowPopen(real_popen):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        with open(pid_file, "w") as fh:
+            fh.write(str(self.pid))
+        os.kill(os.getpid(), signum)
+
+
+subprocess.Popen = WindowPopen
+sys.exit(mod.main(sys.argv[4:]))
+"""
+
+
+# Like HARNESS, but records the argv of every Popen the helper starts (one JSON line each) before delegating.
+# argv: script, cfg, record-file, then the helper's own arguments.
+RECORD_HARNESS = """import importlib.util, json, subprocess, sys
+spec = importlib.util.spec_from_file_location("ensure_age_extension", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+with open(sys.argv[2]) as fh:
+    mod.MANIFEST = tuple(tuple(row) for row in json.load(fh)["manifest"])
+record = sys.argv[3]
+real_popen = subprocess.Popen
+
+
+class RecordPopen(real_popen):
+    def __init__(self, args, *rest, **kwargs):
+        with open(record, "a") as fh:
+            fh.write(json.dumps([str(a) for a in args]) + "\\n")
+        super().__init__(args, *rest, **kwargs)
+
+
+subprocess.Popen = RecordPopen
+sys.exit(mod.main(sys.argv[4:]))
+"""
+
+
+class PsqlStartClock:
+    """Stand-in for the helper's ``time`` module: ``monotonic()`` stays frozen until the stub psql records its pid
+    (or a 30 s real-time cap passes), then advances in real time.  A deadline test then measures the helper's limit
+    from psql's start, whatever the host load (#6646, #6674)."""
+
+    def __init__(self, pid_file, cap_seconds=30):
+        self.pid_file = pid_file
+        self.frozen = time.monotonic()
+        self.cap_at = self.frozen + cap_seconds
+        self.started = None
+        self.psql_started = False
+
+    def monotonic(self):
+        now = time.monotonic()
+        if self.started is None:
+            self.psql_started = self.pid_file.exists() and bool(self.pid_file.read_text())
+            if not self.psql_started and now < self.cap_at:
+                return self.frozen
+            self.started = now
+        return self.frozen + (now - self.started)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def write_exe(path, text):
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("ensure_age_extension", str(SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+TLS_TAIL = "sslmode=verify-full&sslrootcert=%2Fr"
+TLS_ROOT_CERT = "%2Fetc%2Fci%2Froot.crt"  # a path-valued, non-secret sslrootcert (#7982)
+TEST_UMASK = 0o022  # the fixtures' file modes must not depend on the caller's umask (#7981, #7984)
+
+
+def tls_text(text):
+    """Return a URL-file text with the verify-full TLS tail the helper requires (#7982) added when it has no sslmode."""
+    url = text.rstrip("\n")
+    if "sslmode=" in url:
+        return text
+    return url + ("&" if "?" in url else "?") + TLS_TAIL + "\n"
+
+
+class TestEnsureAgeExtension6161(unittest.TestCase):
+    def setUp(self):
+        old_umask = os.umask(TEST_UMASK)
+        self.addCleanup(os.umask, old_umask)
+        scratch_root = ROOT / ".local-runs" / "tmp"
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="age-6161-", dir=str(scratch_root))
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.ext = self.base / "share/extension"
+        self.lib = self.base / "lib"
+        self.ext.mkdir(parents=True)
+        self.lib.mkdir(parents=True)
+        self.age = self.base / "age-src"
+        for d in (self.age, self.age / "share", self.age / "lib"):
+            d.mkdir(parents=True, exist_ok=True)
+            d.chmod(0o755)
+        self.src = {("lib", "age.dylib"): DYLIB}
+        for name in SHARE_FILES:
+            self.src[("share", name)] = ("src " + name).encode()
+        for (sub, name), data in self.src.items():
+            p = self.age / sub / name
+            p.write_bytes(data)
+            p.chmod(0o755 if sub == "lib" else 0o644)
+        self.pg_config = self.base / "pg_config"
+        self.psql = self.base / "psql"
+        write_exe(self.pg_config, FAKE_PG_CONFIG.format(py=sys.executable, base=str(self.base)))
+        write_exe(self.psql, FAKE_PSQL.format(py=sys.executable, base=str(self.base), marker=PW_MARKER))
+        self.url_file = self.base / "url"
+        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr\n")
+        self.harness = self.base / "harness.py"
+        self.harness.write_text(HARNESS)
+        self.uid = None
+
+    # ---- helpers -------------------------------------------------------
+    def manifest(self):
+        order = [("lib", "age.dylib")] + [("share", n) for n in SHARE_FILES]
+        return [[sub, name, sha(self.src[(sub, name)])] for sub, name in order]
+
+    def cmd(self, age_dir=None):
+        cfg = self.base / "cfg.json"
+        cfg.write_text(json.dumps({"manifest": self.manifest(), "uid": self.uid}))
+        return [
+            sys.executable, "-I", str(self.harness), str(SCRIPT), str(cfg),
+            "--url-file", str(self.url_file),
+            "--age-dir", str(age_dir if age_dir is not None else self.age),
+            "--pg-config", str(self.pg_config),
+            "--psql", str(self.psql),
+        ]
+
+    def run_script(self, age_dir=None, env=None):
+        return subprocess.run(self.cmd(age_dir), capture_output=True, text=True, check=False, env=env)
+
+    def install_good(self):
+        for (sub, name), data in self.src.items():
+            (self.lib if sub == "lib" else self.ext).joinpath(name).write_bytes(data)
+
+    def assert_restored(self):
+        for (sub, name), data in self.src.items():
+            dest = (self.lib if sub == "lib" else self.ext) / name
+            self.assertFalse(dest.is_symlink(), dest)
+            self.assertEqual(dest.read_bytes(), data, dest)
+
+    def assert_no_temp_files(self):
+        left = [p.name for d in (self.lib, self.ext) for p in d.iterdir() if p.name.endswith(".age-restore")]
+        self.assertEqual(left, [])
+
+    def assert_fails(self, r, code, message):
+        self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+        self.assertTrue(r.stderr.startswith(PREFIX + message), r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
+
+    def assert_dest_modes_match_sources(self):
+        # #6898: each restored file carries its validated source's mode, never group- or world-writable.
+        for sub, name in self.src:
+            src_mode = stat.S_IMODE((self.age / sub / name).stat().st_mode)
+            dest_mode = stat.S_IMODE(((self.lib if sub == "lib" else self.ext) / name).stat().st_mode)
+            self.assertEqual(dest_mode, src_mode, f"{sub}/{name}")
+            self.assertEqual(dest_mode & 0o022, 0, f"{sub}/{name}")
+
+    def assert_nothing_installed(self):
+        self.assertEqual(sorted(p.name for p in self.ext.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.lib.iterdir()), [])
+
+    # ---- restore / no-op -----------------------------------------------
+    def test_missing_extension_is_restored(self):
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout)
+        self.assert_restored()
+        self.assert_no_temp_files()
+        self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
+
+    def test_restored_files_carry_the_source_mode_6898(self):
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout)
+        self.assert_dest_modes_match_sources()
+        for (sub, name), data in self.src.items():  # stale wrong-content destinations, world-writable
+            dest = (self.lib if sub == "lib" else self.ext) / name
+            dest.write_bytes(b"stale " + data)
+            dest.chmod(0o666)
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout)
+        self.assert_restored()
+        self.assert_dest_modes_match_sources()
+
+    def test_a_writable_destination_with_the_right_bytes_is_restored_7016(self):
+        # #7016: right bytes are not enough; a group- or world-writable library in pkglibdir is not healthy.
+        for mode in (0o666, 0o620, 0o646):
+            with self.subTest(mode=oct(mode)):
+                self.install_good()
+                (self.lib / "age.dylib").chmod(mode)
+                (self.ext / "age.control").chmod(mode)
+                r = self.run_script()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("restored", r.stdout)
+                self.assert_restored()
+                self.assert_dest_modes_match_sources()
+
+    def test_present_extension_is_a_noop(self):
+        self.install_good()
+        before = {p: p.stat().st_ino for p in list(self.lib.iterdir()) + list(self.ext.iterdir())}
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no restore needed", r.stdout)
+        self.assertEqual({p: p.stat().st_ino for p in before}, before)
+
+    def test_control_present_dylib_missing_is_restored(self):
+        self.install_good()
+        (self.lib / "age.dylib").unlink()
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout)
+        self.assert_restored()
+
+    def test_control_present_wrong_hash_dylib_is_restored(self):
+        self.install_good()
+        (self.lib / "age.dylib").write_bytes(b"stale build")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout)
+        self.assert_restored()
+
+    def test_missing_sql_file_is_restored(self):
+        self.install_good()
+        (self.ext / "age--1.8.0.sql").unlink()
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assert_restored()
+
+    def test_run_twice_is_idempotent(self):
+        first = self.run_script()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        inodes = {p: p.stat().st_ino for p in list(self.lib.iterdir()) + list(self.ext.iterdir())}
+        second = self.run_script()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("no restore needed", second.stdout)
+        self.assertEqual({p: p.stat().st_ino for p in inodes}, inodes)
+        self.assert_restored()
+
+    def test_concurrent_restores_all_succeed(self):
+        big = DYLIB * 16384  # ~16 MB widens the race window
+        self.src[("lib", "age.dylib")] = big
+        (self.age / "lib/age.dylib").write_bytes(big)
+        cmd = self.cmd()
+        for round_no in range(4):  # 3 runners at once, repeated: the race must never be lost
+            for d in (self.lib, self.ext):
+                for f in d.iterdir():
+                    f.unlink()
+            procs = [subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                     for _ in range(3)]
+            results = [p.communicate(timeout=120) for p in procs]
+            codes = [p.returncode for p in procs]
+            self.assertEqual(codes, [0, 0, 0], (round_no, results))
+            self.assert_restored()
+            self.assert_no_temp_files()
+
+    # ---- secrets ---------------------------------------------------------
+    def test_password_never_on_psql_argv(self):
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            argv = " ".join(call["argv"])
+            self.assertNotIn(PW_MARKER, argv)
+            self.assertIn("postgres://ciuser@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr", call["argv"])
+            self.assertNotIn("cidb", argv, "#6181: the database name must not be on psql's argv")
+            self.assertEqual(call["pgdatabase"], "cidb")
+            self.assertTrue(call["env_marker_ok"], "PGPASSWORD must carry the password")
+
+    def test_psql_runs_with_exactly_the_reviewed_argv_6895(self):
+        # #6895: -X keeps psql from running $HOME/.psqlrc (HOME is in the psql env allowlist) with the tier
+        # credentials before the probe; the whole argv after the program is pinned, so no flag can drop or move.
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["argv"][1:], [
+                "postgres://ciuser@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                "-c", "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"])
+
+    def test_the_probe_sql_is_the_reviewed_catalog_read_6896(self):
+        # #6896: the probe is the helper's only SQL, a read of pg_available_extensions under the tier role.
+        self.assertEqual(load_module().PROBE_SQL, PROBE_SQL_6896)
+        self.assertEqual(PROBE_SQL_6896, "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'")
+
+    def test_psql_stderr_is_never_relayed_6897(self):
+        # #6897: real psql error text names the host, address, user and database; the helper keeps all of it
+        # out of the CI log and prints only psql's exit code.
+        write_exe(self.psql, STDERR_PSQL.format(py=sys.executable))
+        self.url_file.write_text(f"postgres://leakuser6897:{PW_MARKER}@leakhost6897:5445/leakdb6897?sslmode=verify-full&sslrootcert=%2Fr\n")
+        r = self.run_script()
+        self.assert_fails(r, load_module().EXIT_UNAVAILABLE, "age probe failed: psql exited 2")
+        for needle in ("leakhost6897", "192.0.2.97", "leakuser6897", "leakdb6897", "marker-6897-stderr", "FATAL",
+                       "authentication", "5445"):
+            self.assertNotIn(needle, r.stdout + r.stderr, "psql's stderr must not reach the helper's output")
+
+    def test_database_name_moves_to_pgdatabase_6181(self):
+        # #6181: a database name equal to a secret would show on every psql argv; the name travels in PGDATABASE.
+        mod = load_module()
+        cases = {
+            "postgres://u@h:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr": ("postgres://u@h:5445?sslmode=verify-full&sslrootcert=%2Fr", "cidb"),
+            "postgres://u@h:5445/cidb": ("postgres://u@h:5445", "cidb"),
+            "postgres://u@h:5445/": ("postgres://u@h:5445", None),
+            "postgres://u@h:5445": ("postgres://u@h:5445", None),
+            "postgres://u@h/ci%20db?x=1&sslmode=verify-full&sslrootcert=%2Fr": ("postgres://u@h?x=1&sslmode=verify-full&sslrootcert=%2Fr", "ci db"),
+            "postgres://:@/d?host=%2Fdir": ("postgres://:@?host=%2Fdir", "d"),
+        }
+        for url, (want_target, want_db) in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(mod.split_database(url), (want_target, want_db))
+        with self.assertRaises(mod.HelperError):
+            mod.split_database("postgres://u@h/a%00b")
+
+    def test_password_in_query_moves_to_env(self):
+        self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={PW_MARKER}&sslmode=verify-full&sslrootcert=%2Fr\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for line in (self.base / "psql.log").read_text().splitlines():
+            call = json.loads(line)
+            self.assertNotIn(PW_MARKER, " ".join(call["argv"]))
+            self.assertTrue(call["env_marker_ok"])
+
+    def test_keyword_dsn_is_rejected(self):
+        self.url_file.write_text(f"host=127.0.0.1 user=ciuser password={PW_MARKER}\n")
+        self.assert_fails(self.run_script(), 2, "tier URL file does not hold a postgres:// URL")
+        self.assertFalse((self.base / "psql.log").exists())
+
+    def test_sslpassword_is_rejected(self):
+        # libpq has no env var for sslpassword, so it cannot be moved off argv: refuse it.
+        self.install_good()  # a healthy tier would reach psql if the URL were accepted
+        self.url_file.write_text(
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslpassword={PW_MARKER}\n")
+        self.assert_fails(self.run_script(), 2,
+                          "tier URL file carries sslpassword; use a key without a passphrase")
+        self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
+
+    def test_sslpassword_case_variants_get_the_sslpassword_message(self):
+        # R6-F2 (mutant rev_drop_sslpassword_lower): a case variant is a secret, not "an unlisted key".
+        self.install_good()
+        for key in ("SSLPassword", "SSLPASSWORD", "sslPassword"):
+            with self.subTest(key=key):
+                self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}={PW_MARKER}\n")
+                self.assert_fails(self.run_script(), 2,
+                                  "tier URL file carries sslpassword; use a key without a passphrase")
+                self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
+
+    # ---- URL shapes libpq parses differently from urllib (R3-F1, F-R3-1) --
+    def test_docs_describe_the_helper_inside_the_self_heal_list_7986(self):
+        # #7986: the database/environment text was an orphan paragraph ahead of the paragraph that introduces the
+        # AGE self-heal; it belongs in that list, after the intro and before the closing no-op sentence.
+        docs = (ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text()
+        intro = docs.index("**AGE self-heal (#6161).**")
+        bullet = docs.index("- **Database, TLS and psql environment (#6181, #6871, #6676, #7982).**")
+        closing = docs.index("It is a no-op when AGE is healthy.")
+        self.assertTrue(intro < bullet < closing, (intro, bullet, closing))
+        self.assertNotIn("**AGE helper database and environment", docs)
+        # the bullet sits in the list: every earlier list item starts with "- **" and no heading intervenes
+        self.assertNotIn("\n#", docs[intro:closing])
+        # sentence-to-step: the self-heal runs before CREATE EXTENSION in the "Configure enterprise-fed tier" step
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        step = ci.index("- name: Configure enterprise-fed tier")
+        helper_call = ci.index("scripts/ci/ensure-age-extension.py", step)
+        create_ext = ci.index("CREATE EXTENSION IF NOT EXISTS age", step)
+        self.assertLess(helper_call, create_ext)
+
+    # ---- TLS: verify-full is required (#7982) -----------------------------
+    def test_tls_url_must_be_verify_full_with_a_root_cert_7982(self):
+        base = "postgres://ciuser:" + PW_MARKER + "@127.0.0.1:5445/cidb"
+        refused = {
+            "missing sslmode": f"{base}?sslrootcert={TLS_ROOT_CERT}",
+            "no query at all": base,
+            "sslmode=disable": f"{base}?sslmode=disable&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=allow": f"{base}?sslmode=allow&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=prefer": f"{base}?sslmode=prefer&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=require": f"{base}?sslmode=require&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=verify-ca": f"{base}?sslmode=verify-ca&sslrootcert={TLS_ROOT_CERT}",
+            "empty sslmode": f"{base}?sslmode=&sslrootcert={TLS_ROOT_CERT}",
+            "duplicated sslmode": f"{base}?sslmode=disable&sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}",
+            "verify-full without sslrootcert": f"{base}?sslmode=verify-full",
+            "verify-full with an empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert=",
+            "non-empty then empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}&sslrootcert=",
+            "empty then non-empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert=&sslrootcert={TLS_ROOT_CERT}",
+            "two non-empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}&sslrootcert={TLS_ROOT_CERT}",
+        }
+        for label, url in refused.items():
+            with self.subTest(label):
+                self.assert_url_refused(url)
+                self.assertNotIn("postgres://", self.last_stderr)
+        self.install_good()
+        self.url_file.write_text(f"{base}?sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def assert_url_refused(self, url, names=(), absent=()):
+        """The URL is refused with exit 2 before psql runs, and the value never prints.
+
+        ``names`` must appear in stderr; ``absent`` strings (R5-F1: identifier-shaped
+        password fragments) must not.
+        """
+        self.install_good()  # a healthy tier would reach psql if the URL were accepted
+        (self.base / "psql.log").unlink(missing_ok=True)  # each subTest starts without a psql call
+        self.url_file.write_text(url + "\n")
+        r = self.run_script()
+        self.last_stderr = r.stderr
+        log = self.base / "psql.log"
+        self.assertNotIn(PW_MARKER, log.read_text() if log.exists() else "", "marker reached psql's argv")
+        self.assert_fails(r, 2, "tier URL file ")
+        for name in names:
+            self.assertIn(name, r.stderr)
+        for fragment in absent + ("marker_6161_bare",):
+            self.assertNotIn(fragment, r.stderr)
+        self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
+
+    def test_password_key_case_variants_are_rejected(self):
+        # libpq matches query keys case-sensitively; a PASSWORD= key would stay on argv.
+        for key in ("PASSWORD", "Password"):
+            with self.subTest(key=key):
+                self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}={PW_MARKER}",
+                                        ("password",), (key,))
+
+    def test_fragment_credentials_are_rejected(self):
+        # libpq has no fragment: it reads keys after a '#' as query parameters.
+        for url in (
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr#&password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr#&sslpassword={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb#sslpassword={PW_MARKER}",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url)
+
+    def test_raw_hash_or_question_mark_in_password_is_rejected(self):
+        # libpq ends the userinfo at the first '@' before '/', urllib at '?' or '#'.
+        for sep in ("#", "?"):
+            with self.subTest(sep=sep):
+                self.assert_url_refused(f"postgres://ciuser:{PW_MARKER}{sep}z@127.0.0.1:5445/cidb")
+        # R4-F3: only the '@'-after-host guard refuses these two (no '#', one '=').
+        for url in (
+            f"postgres://ciuser:{PW_MARKER}/z@127.0.0.1:5445/cidb",
+            f"postgres://ciuser:{PW_MARKER}?sslmode=verify-full&sslrootcert=%2Fr@127.0.0.1/cidb",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url)
+
+    def test_libpq_secret_keys_without_env_var_are_rejected(self):
+        for key in ("oauth_client_secret", "scram_client_key", "scram_server_key"):
+            with self.subTest(key=key):
+                self.assert_url_refused(
+                    f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&{key}={PW_MARKER}", (key,))
+
+    def test_unknown_query_key_is_rejected_without_its_value(self):
+        # R5-F1: an unlisted key may be a password tail, so it is never named.
+        self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?not_a_libpq_key={PW_MARKER}",
+                                ("unlisted query key",), ("not_a_libpq_key",))
+
+    def test_unlisted_key_that_is_a_password_tail_is_not_echoed(self):
+        # R5-F1: a query-form password holding a raw '&' leaves its tail as a "key".
+        tail = "Ident6161tail"
+        for url in (
+            f"postgres://ciuser@127.0.0.1:5445/cidb?password=Tr0ub&{tail}or3=x",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&password=Tr0ub&{tail}=x",
+        ):
+            with self.subTest(url=url.replace(tail, "<T>")):
+                self.assert_url_refused(url, ("unlisted query key",), (tail,))
+
+    def test_known_refused_key_names_still_print(self):
+        # R5-F1: only known libpq keywords are named; the message stays useful for them.
+        self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?sslkeylogfile={PW_MARKER}",
+                                ("sslkeylogfile",))
+
+    def test_query_segment_without_equals_is_rejected_unnamed(self):
+        # A bare segment is a value, not a key: it must never be printed as a key name.
+        bare = "marker_6161_bare"
+        self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&{bare}")
+        self.assertFalse((self.base / "psql.log").exists())
+
+    def test_allowlisted_query_keys_are_accepted(self):
+        self.install_good()
+        url = ("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&application_name=ci"
+               "&connect_timeout=10&target_session_attrs=any")
+        self.url_file.write_text(url + "\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no restore needed", r.stdout)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertIn(url.replace("/cidb?", "?"), call["argv"])
+            self.assertEqual(call["pgdatabase"], "cidb")
+
+    # ---- round 5 (R4-F1..R4-F3, F-R4-2, F-R4-3) ---------------------------
+    def test_query_segment_with_second_equals_is_rejected(self):
+        # R4-F2: parse_qsl reads the remainder as the value of an allowlisted key, so the
+        # password would stay on argv; libpq refuses these only after psql has started.
+        for url in (
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr;password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr?password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?application_name=ci=password={PW_MARKER}",
+            # R5-F3: the extra '=' sits in a later segment (a first-segment-only check misses it).
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&application_name=ci;password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&connect_timeout=5&application_name=ci=x=y",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url)
+
+    def test_control_characters_in_url_are_rejected(self):
+        # R4-F2 / F-R4-2: urlsplit silently drops TAB/CR/LF (joining a two-line URL file),
+        # and a NUL makes subprocess raise; both are refused before parsing.
+        for label, url in (
+            ("two-line file", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr\npassword={PW_MARKER}"),
+            ("CR", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr\rpassword={PW_MARKER}"),
+            ("TAB", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?application_name=c\ti"),
+            ("NUL in password", f"postgres://ciuser:{PW_MARKER}\x00@127.0.0.1:5445/cidb"),
+            ("NUL in host", f"postgres://ciuser:{PW_MARKER}@127.0.0.1\x00:5445/cidb"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url)
+
+    def test_percent_encoded_nul_in_password_is_rejected(self):
+        # F-R4-2: unquote/parse_qsl decode %00 into PGPASSWORD, which subprocess refuses.
+        for url in (
+            f"postgres://ciuser:{PW_MARKER}%00@127.0.0.1:5445/cidb",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?password={PW_MARKER}%00",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url)
+
+    def test_psql_value_error_is_a_one_line_refusal(self):
+        # F-R4-2 belt and braces: a ValueError from subprocess becomes HelperError exit 2.
+        mod = load_module()
+        with self.assertRaises(mod.HelperError) as cm:
+            mod.probe_lists_age(str(self.psql) + "\x00", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb")
+        self.assertEqual(cm.exception.code, mod.EXIT_BAD_INPUT)
+        self.assertNotIn(PW_MARKER, str(cm.exception))
+        self.assertEqual(len(str(cm.exception).splitlines()), 1)
+        self.assertFalse((self.base / "psql.log").exists())
+
+    def test_more_than_one_at_in_authority_is_rejected(self):
+        # R4-F1: urllib splits the userinfo at the last '@', libpq at the first.
+        for url in (
+            f"postgres://ciuser:{PW_MARKER}@x@127.0.0.1:5445/cidb",
+            f"postgres://ci@user:{PW_MARKER}@127.0.0.1/cidb",
+            f"postgres://a:{PW_MARKER}@b:c@127.0.0.1/cidb",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url, ("percent-encode",))
+
+    def test_empty_host_part_gets_a_clear_refusal(self):
+        # F-R4-3 / R5-F4: an empty authority is refused and named as such; the message
+        # must not claim that socket-directory URLs are unsupported (host=%2F... works).
+        self.assert_url_refused(
+            f"postgres:///cidb?host=/var/run/postgresql&password={PW_MARKER}", ("empty host part",))
+        self.assertNotIn("not supported", self.run_script().stderr)
+
+    def test_socket_directory_forms_with_a_host_part_are_accepted(self):
+        # R5-F4: the encoded-directory forms carry a host part or key and are not refused.
+        mod = load_module()
+        for url in (
+            "postgres://ciuser@%2Fvar%2Frun%2Fpostgresql/cidb",
+            "postgres://ciuser@/cidb?host=%2Fvar%2Frun%2Fpostgresql",
+        ):
+            with self.subTest(url=url):
+                # R6-F2: must return (no HelperError), with no password and the URL unchanged.
+                self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_password_only_userinfo_keeps_the_authority_slashes(self):
+        # Cloud F2: urlunsplit dropped '//' for an empty netloc ('postgres:/db'), which libpq rejects.
+        mod = load_module()
+        self.assertEqual(mod.psql_target("postgres://:pw@/db?host=%2Ftmp"), ("postgres:///db?host=%2Ftmp", "pw"))
+        self.assertEqual(mod.psql_target("postgres://:pw@/db?host=%2Ftmp&password=q"),
+                         ("postgres:///db?host=%2Ftmp", "q"))
+        self.assertEqual(mod.psql_target("postgresql://:pw@h/db"), ("postgresql://h/db", "pw"))
+
+    # ---- round 6 (R5-F2 / #6221): libpq percent-decodes only, '+' is literal --
+    def test_plus_in_query_password_is_literal(self):
+        mod = load_module()
+        for raw, want in (("ab+cd", "ab+cd"), ("ab%2Bcd", "ab+cd"), ("a%20b+c", "a b+c")):
+            with self.subTest(raw=raw):
+                target, password = mod.psql_target(f"postgres://ciuser@127.0.0.1:5445/cidb?password={raw}")
+                self.assertEqual(password, want)
+                self.assertNotIn(raw, target)
+
+    def test_plus_in_query_password_reaches_pgpassword_unchanged(self):
+        self.install_good()
+        pw = PW_MARKER + "+x"
+        self.url_file.write_text(tls_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={pw}\n"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["pgpassword"], pw)
+
+    # ---- round 7 (R6-F1 / #6251, R6-F2): libpq URI parity, byte-exact password -----
+    def test_invalid_percent_escape_is_refused(self):
+        # libpq: 'invalid percent-encoded token'. The helper used to accept the literal.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("query password %zz", f"postgres://ciuser@{host}?password={PW_MARKER}%zzb"),
+            ("userinfo password %zz", f"postgres://ciuser:{PW_MARKER}%zzb@{host}"),
+            ("query password %2", f"postgres://ciuser@{host}?password={PW_MARKER}%2"),
+            ("query password lone %", f"postgres://ciuser@{host}?password={PW_MARKER}%"),
+            ("userinfo password lone %", f"postgres://ciuser:{PW_MARKER}%@{host}"),
+            ("options %zz without a password", f"postgres://ciuser@{host}?options=-c%zzx"),
+            ("options % plus a password", f"postgres://ciuser@{host}?options=%&password={PW_MARKER}"),
+            ("password plus options %", f"postgres://ciuser@{host}?password={PW_MARKER}&options=%"),
+            ("key %zz", f"postgres://ciuser@{host}?pass%zzword={PW_MARKER}"),
+            ("path %zz", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/ci%zzdb"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("percent-encoded",))
+
+    def test_percent_encoded_nul_anywhere_is_refused(self):
+        # libpq: 'forbidden value %00 in percent-encoded value' in every URI component.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("user", f"postgres://ci%00user:{PW_MARKER}@{host}"),
+            ("host", f"postgres://ciuser:{PW_MARKER}@127.0.0.1%00:5445/cidb"),
+            ("path", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/ci%00db"),
+            ("kept value", f"postgres://ciuser:{PW_MARKER}@{host}?options=a%00b"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("%00",))
+
+    def test_raw_space_is_refused(self):
+        # libpq: 'unexpected spaces found ... use percent-encoded spaces (%20)'.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("query password", f"postgres://ciuser@{host}?password={PW_MARKER} b"),
+            ("userinfo password", f"postgres://ciuser:{PW_MARKER} b@{host}"),
+            ("options", f"postgres://ciuser@{host}?options=-c x"),
+            ("options plus password", f"postgres://ciuser@{host}?options=-c x&password={PW_MARKER}"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("space",))
+
+    def test_empty_query_segment_is_refused(self):
+        # libpq: 'missing key/value separator "="' for '?&&k=v', '?k=v&&' and '?&'.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("leading &&", f"postgres://ciuser@{host}?&&password={PW_MARKER}"),
+            ("leading &", f"postgres://ciuser@{host}?&password={PW_MARKER}"),
+            ("middle &&", f"postgres://ciuser@{host}?password={PW_MARKER}&&sslmode=verify-full&sslrootcert=%2Fr"),
+            ("double trailing &&", f"postgres://ciuser@{host}?password={PW_MARKER}&sslmode=verify-full&sslrootcert=%2Fr&&"),
+            ("only &", f"postgres://ciuser:{PW_MARKER}@{host}?&"),
+            ("no password &&", f"postgres://ciuser@{host}?application_name=a&&sslmode=verify-full&sslrootcert=%2Fr"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("empty query segment",))
+
+    def test_single_trailing_ampersand_and_empty_query_are_accepted(self):
+        # libpq accepts '?k=v&' and a bare '?'; the helper keeps accepting both.
+        mod = load_module()
+        host = "127.0.0.1:5445/cidb"
+        target, password = mod.psql_target(f"postgres://ciuser@{host}?password=pw&")
+        self.assertEqual((target, password), (f"postgres://ciuser@{host}", "pw"))
+        target, password = mod.psql_target(f"postgres://ciuser@{host}?password=pw&sslmode=verify-full&sslrootcert=%2Fr&")
+        self.assertEqual((target, password), (f"postgres://ciuser@{host}?sslmode=verify-full&sslrootcert=%2Fr", "pw"))
+        url = f"postgres://ciuser@{host}?"
+        self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_percent_ff_reaches_pgpassword_byte_exact(self):
+        # R6-F1 / #6251: %FF is the single byte 0xFF in libpq, not U+FFFD (EF BF BD).
+        mod = load_module()
+        for url in (
+            "postgres://ciuser@127.0.0.1:5445/cidb?password=a%FFb",
+            "postgres://ciuser:a%FFb@127.0.0.1:5445/cidb",
+            "postgres://ciuser:a%ffb@127.0.0.1:5445/cidb",
+        ):
+            with self.subTest(url=url):
+                _, password = mod.psql_target(url)
+                self.assertEqual(os.fsencode(password), b"a\xffb")
+        self.install_good()
+        self.url_file.write_text(tls_text("postgres://ciuser@127.0.0.1:5445/cidb?password=a%FFb\n"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["pgpassword_hex"], b"a\xffb".hex())
+            self.assertNotIn("a%FFb", " ".join(call["argv"]))
+
+    def test_percent_encoded_query_key_is_decoded(self):
+        # R6-F2: libpq decodes keys too, so %70assword is the password key.
+        mod = load_module()
+        for key in ("%70assword", "pass%77ord", "p%61ssword"):
+            with self.subTest(key=key):
+                target, password = mod.psql_target(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=pw&sslmode=verify-full&sslrootcert=%2Fr")
+                self.assertEqual((target, password), ("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr", "pw"))
+        # an encoded allowlisted key is kept as written
+        url = "postgres://ciuser@127.0.0.1:5445/cidb?%73slmode=require"
+        self.assertEqual(mod.psql_target(url), (url, None))
+        # an encoded key never loosens the allowlist: %68ost is host, req%75ire_auth is refused
+        self.assert_url_refused("postgres://ciuser@127.0.0.1:5445/cidb?req%75ire_auth=scram-sha-256", ("require_auth",))
+
+    def test_plus_in_userinfo_password_is_literal(self):
+        # R6-F2: the CI form is user:pass@host; '+' stays a plus there too.
+        mod = load_module()
+        target, password = mod.psql_target("postgres://ciuser:ab+cd@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr")
+        self.assertEqual(password, "ab+cd")
+        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr")
+        _, password = mod.psql_target("postgres://ciuser:a%20b+c%2Bd@127.0.0.1:5445/cidb")
+        self.assertEqual(password, "a b+c+d")
+        self.install_good()
+        self.url_file.write_text(tls_text(f"postgres://ciuser:{PW_MARKER}+x@127.0.0.1:5445/cidb\n"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["pgpassword"], PW_MARKER + "+x")
+
+    def test_scheme_is_matched_exactly_as_libpq_does(self):
+        # Cloud F4: urlsplit lower-cases the scheme, so 'Postgres://' (not a URI to libpq) was rewritten.
+        for url in (f"Postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb",
+                    f"POSTGRESQL://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb"):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url, ("postgres://",))
+
+    def test_non_secret_libpq_keywords_are_allowed(self):
+        # Cloud F5: nine non-secret libpq 18 keywords were refused as "unlisted".
+        mod = load_module()
+        for key in ("fallback_application_name", "sslnegotiation", "sslcompression", "sslcertmode", "sslcrldir",
+                    "min_protocol_version", "max_protocol_version", "ssl_min_protocol_version",
+                    "ssl_max_protocol_version"):
+            with self.subTest(key=key):
+                url = f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=x"
+                self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_remaining_libpq_keywords_are_refused_and_named(self):
+        # Cloud F5: keywords that change the auth mechanism or the session mode stay refused, by name.
+        for key in ("gsslib", "gssdelegation", "replication", "oauth_issuer", "oauth_client_id", "oauth_scope",
+                    "ssl"):
+            with self.subTest(key=key):
+                self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=x", (f"query key {key}",))
+
+    def test_every_libpq_keyword_is_classified(self):
+        # Cloud F5: allowed, refused-by-name, or the password keyword: none falls through to "unlisted".
+        mod = load_module()
+        for key in LIBPQ_18_KEYWORDS:
+            with self.subTest(key=key):
+                self.assertIn(key, mod.ALLOWED_QUERY_KEYS | mod.REFUSED_KNOWN_KEYS)
+        self.assertEqual(mod.ALLOWED_QUERY_KEYS & mod.REFUSED_KNOWN_KEYS, set())
+
+    # ---- #6345: a pg_service.conf password must never beat the moved PGPASSWORD ----------
+    # ---- #6676: psql's environment is an allowlist; a URL must name its database -------------
+    def psql_calls(self):
+        log = self.base / "psql.log"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def test_psql_env_is_an_allowlist_6676(self):
+        # 3-agent vote (6def5ab6) on #6676, option B: no caller PG* variable reaches psql, only the three the
+        # helper sets; every other caller variable outside PSQL_ENV_KEEP is dropped too.
+        self.install_good()
+        caller = dict(os.environ, PGSSLMODE="disable", PGHOSTADDR="127.0.0.1", PGREQUIREAUTH="none",
+                      PGPASSFILE=str(self.base / "pgpass"), PGOPTIONS="-c search_path=decoy",
+                      PGTARGETSESSIONATTRS="any", PGHOST="decoy.invalid", PGPORT="1", PGUSER="decoyuser",
+                      PGDATABASE="callerdb", PGCHANNELBINDING="disable", PGGSSENCMODE="disable",
+                      PGSSLROOTCERT=str(self.base / "decoy.crt"), PGLOADBALANCEHOSTS="random",
+                      PGMINPROTOCOLVERSION="3.0", PGSSLNEGOTIATION="postgres", CALLER_SECRET_6676="caller",
+                      LANG="C", LC_ALL="C", TZ="UTC")
+        cases = ((f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/urldb?sslmode=verify-full&sslrootcert=%2Fr", "urldb"),
+                 (f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445?dbname=qdb&sslmode=verify-full&sslrootcert=%2Fr", None))
+        for text, want in cases:
+            with self.subTest(url=text.split("@", 1)[1]):
+                (self.base / "psql.log").unlink(missing_ok=True)
+                self.url_file.write_text(tls_text(text + "\n"))
+                r = self.run_script(env=caller)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                calls = self.psql_calls()
+                self.assertTrue(calls)
+                for call in calls:
+                    self.assertTrue(call["env_marker_ok"])
+                    self.assertEqual(call["pgdatabase"], want)
+                    self.assertEqual(call["connect_timeout_env"], "15")
+                    self.assertEqual(sorted(call["pg_env"]), sorted(["PGCONNECT_TIMEOUT"] + (["PGDATABASE"] if want else [])))
+                    self.assertFalse("CALLER_SECRET_6676" in call["env_keys"], "a caller variable reached psql")
+                    for key in ("LANG", "LC_ALL", "TZ", "PATH", "HOME"):
+                        self.assertTrue(key in call["env_keys"], f"{key} did not reach psql")
+
+    def test_psql_never_receives_pghostaddr_6676(self):
+        # The decoy that decided #6676: libpq connects to PGHOSTADDR instead of the URL's host and sends the
+        # URL's password there (probe_hostaddr.py, real psql 18.6 against throwaway listeners).
+        self.install_good()
+        r = self.run_script(env=dict(os.environ, PGHOSTADDR="127.0.0.1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.psql_calls()
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertFalse("PGHOSTADDR" in call["env_keys"], "the caller's PGHOSTADDR reached psql")
+
+    def test_a_url_without_a_database_is_refused_6676(self):
+        # 3-agent vote (6def5ab6) on #6676, option C (supersedes the #6577 M13 pin): with no database libpq
+        # falls back to the user name or a caller's PGDATABASE, so the URL is refused before any restore or psql.
+        for good in (True, False):
+            for text in ("postgres://ciuser:pw-6676@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr", "postgres://ciuser@127.0.0.1:5445/",
+                         "postgres://ciuser@127.0.0.1:5445", "postgresql://ciuser@127.0.0.1:5445/?dbname=",
+                         "postgres://ciuser@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr&%64bname="):
+                with self.subTest(installed=good, url=text.split("@", 1)[1]):
+                    for d in (self.lib, self.ext):
+                        for f in d.iterdir():
+                            f.unlink()
+                    if good:
+                        self.install_good()
+                    (self.base / "psql.log").unlink(missing_ok=True)
+                    self.url_file.write_text(tls_text(text + "\n"))
+                    r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
+                    self.assert_fails(r, 2, "tier URL file names no database")
+                    self.assertNotIn("pw-6676", r.stderr)
+                    self.assertFalse((self.base / "psql.log").exists())
+                    if not good:
+                        self.assert_nothing_installed()
+
+    def test_an_empty_effective_dbname_is_refused_6871(self):
+        # #6871: libpq takes the LAST dbname key, and a dbname key beats the URL path.  When that value is empty
+        # libpq falls back to the user name, so each of these URLs names no database and is refused before any
+        # restore or psql call, whatever PGDATABASE the caller sets.
+        for text in ("postgres://ciuser@127.0.0.1:5445/?dbname=cidb&dbname=",
+                     "postgres://ciuser@127.0.0.1:5445/cidb?dbname=",
+                     "postgres://ciuser@127.0.0.1:5445/cidb?dbname=other&%64bname=",
+                     "postgres://ciuser:pw-6871@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&dbname=&application_name=a"):
+            with self.subTest(url=text.split("@", 1)[1]):
+                (self.base / "psql.log").unlink(missing_ok=True)
+                self.url_file.write_text(tls_text(text + "\n"))
+                r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
+                self.assert_fails(r, 2, "tier URL file names no database")
+                self.assertNotIn("pw-6871", r.stdout + r.stderr)
+                self.assertFalse((self.base / "psql.log").exists())
+                self.assert_nothing_installed()
+        # A non-empty last dbname names the database even after an empty one or a path database (libpq reads it).
+        for text in ("postgres://ciuser@127.0.0.1:5445/?dbname=&dbname=cidb",
+                     "postgres://ciuser@127.0.0.1:5445/other?dbname=cidb"):
+            with self.subTest(accepted=text.split("@", 1)[1]):
+                (self.base / "psql.log").unlink(missing_ok=True)
+                self.url_file.write_text(tls_text(text + "\n"))
+                r = self.run_script()
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+                self.assertTrue(calls)
+                self.assertTrue(all("dbname=cidb" in call["argv"][1].split("?", 1)[1].split("&") for call in calls), calls)
+
+    def test_service_key_in_url_is_refused_by_name(self):
+        # libpq fills unset options from the service file BEFORE it reads PGPASSWORD, so a service
+        # entry carrying a password beats the moved password (the URL password beat it originally).
+        for url in ("postgres://ciuser:pw@127.0.0.1:5445/cidb?service=svc",
+                    "postgres://ciuser@127.0.0.1:5445/cidb?service=svc",
+                    "postgres://ciuser:pw@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&%73ervice=svc"):
+            with self.subTest(url=url.split("@", 1)[1]):
+                self.assert_url_refused(url, ("query key service",))
+
+    def test_pgservice_env_is_not_passed_to_psql(self):
+        self.install_good()
+        env = dict(os.environ, PGSERVICE="svc-6345", PGSERVICEFILE=str(self.base / "pg_service.conf"))
+        r = self.run_script(env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertIsNone(call["pgservice"], "PGSERVICE reached psql (service-file password would win)")
+            self.assertIsNone(call["pgservicefile"], "PGSERVICEFILE reached psql")
+            self.assertTrue(call["env_marker_ok"], "the moved password must still reach psql")
+
+    # ---- #6346 / #6348: the docs say what the code does ------------------------------
+    @staticmethod
+    def collapsed(path):
+        return " ".join(Path(path).read_text(encoding="utf-8").split())
+
+    def test_docs_name_every_refused_by_name_key(self):
+        # #6346: sslkeylogfile and require_auth were refused by name but missing from the docstring and docs.
+        mod = load_module()
+        docstring = " ".join(mod.__doc__.split())
+        docs = self.collapsed(ROOT / "docs/DEV-CI-ENVIRONMENT.md")
+        changelog = self.collapsed(ROOT / "changelog.d/6161.fixed.md")
+        for key in sorted(mod.REFUSED_KNOWN_KEYS):
+            pattern = r"(?<![A-Za-z0-9_])" + key + r"(?![A-Za-z0-9_])"
+            with self.subTest(key=key):
+                self.assertTrue(re.search(pattern, docstring), f"{key} missing from the module docstring")
+                self.assertTrue(re.search(pattern, docs), f"{key} missing from docs/DEV-CI-ENVIRONMENT.md")
+        for key in ("sslkeylogfile", "require_auth"):
+            with self.subTest(changelog_key=key):
+                self.assertTrue(key in changelog, f"{key} missing from changelog.d/6161.fixed.md")
+
+    def test_docstring_states_the_real_reason_ssl_true_is_refused(self):
+        # #6346: libpq 18.6 DOES know ssl=true (it maps it to sslmode=require); the helper refuses it on purpose.
+        doc = " ".join(load_module().__doc__.split())
+        self.assertFalse("libpq does not know" in doc, "docstring still says libpq does not know ssl=true")
+        self.assertTrue("maps to ``sslmode=require``" in doc, "docstring does not say ssl=true maps to sslmode=require")
+
+    def test_docs_state_the_exact_control_character_refusal(self):
+        # #6348: only TAB, CR, LF and NUL are refused; VT, FF, SOH, DEL and NBSP pass (libpq accepts them too).
+        for path in ("docs/DEV-CI-ENVIRONMENT.md", "changelog.d/6161.fixed.md"):
+            with self.subTest(path=path):
+                text = self.collapsed(ROOT / path)
+                self.assertFalse("control character" in text, "overstates the refusal as any control character")
+                self.assertTrue("TAB, CR, LF or NUL" in text, "does not list TAB, CR, LF or NUL")
+
+    # ---- #6252 / cloud F6: signals and the connect timeout --------------------
+    def start_sleeping_helper(self, psql_template=SLEEPING_PSQL, hosts="127.0.0.1:5445"):
+        write_exe(self.psql, psql_template.format(py=sys.executable, base=str(self.base)))
+        self.install_good()
+        for stale in ("sleep.pid", "sleep.ppid"):  # a previous subTest's pid must not be read as this one's
+            if (self.base / stale).exists():
+                (self.base / stale).unlink()
+        self.url_file.write_text(tls_text(f"postgres://ciuser:{PW_MARKER}@{hosts}/cidb\n"))
+        proc = subprocess.Popen(self.cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        pid_file = self.base / "sleep.pid"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (pid_file.exists() and pid_file.read_text()):
+            time.sleep(0.05)
+        child = int(pid_file.read_text())
+
+        def reap():
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                # the process already exited: nothing left to kill
+                pass
+            proc.kill()
+            proc.communicate()
+
+        self.addCleanup(reap)
+        return proc, child
+
+    def assert_gone(self, pid):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"psql child {pid} outlived the helper (orphan holding PGPASSWORD)")
+
+    def test_sigterm_mid_connect_terminates_the_psql_child(self):
+        proc, child = self.start_sleeping_helper()
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(err.strip(), PREFIX + "interrupted")
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone(child)
+
+    def test_sigint_mid_connect_is_one_line_and_terminates_the_psql_child(self):
+        proc, child = self.start_sleeping_helper()
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(err.strip(), PREFIX + "interrupted")
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone(child)
+
+    def test_sighup_mid_connect_is_one_line_and_terminates_the_psql_child(self):
+        # #6338: SIGHUP kept its default action, so the helper died and psql was reparented with PGPASSWORD.
+        proc, child = self.start_sleeping_helper()
+        proc.send_signal(signal.SIGHUP)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(err.strip(), PREFIX + "interrupted")
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone(child)
+
+    def run_signal_in_spawn_window(self, signum):
+        """Deliver ``signum`` to the helper's own pid right after the real Popen returns (#6337).
+
+        This is the window a runner's signal can hit: the psql child exists, but the guard around
+        ``communicate`` has not been entered.  The wrapper records the child pid first, so the
+        assertion on the child's fate does not depend on timing.
+        """
+        write_exe(self.psql, SLEEPING_PSQL.format(py=sys.executable, base=str(self.base)))
+        self.install_good()
+        pid_file = self.base / "window.pid"
+        harness = self.base / "window_harness.py"
+        harness.write_text(WINDOW_HARNESS)
+        cmd = [sys.executable, "-I", str(harness), str(SCRIPT), str(int(signum)), str(pid_file),
+               "--url-file", str(self.url_file), "--age-dir", str(self.age),
+               "--pg-config", str(self.pg_config), "--psql", str(self.psql)]
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        # The Popen child is the supervisor; psql is the process that wrote sleep.pid (when it got that far).
+        children = [int(pid_file.read_text())]
+        psql_pid = self.base / "sleep.pid"
+        if psql_pid.exists() and psql_pid.read_text():
+            children.append(int(psql_pid.read_text()))
+
+        def reap():
+            for pid in children:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    # the process already exited: nothing left to kill
+                    pass
+
+        self.addCleanup(reap)
+        return r, children
+
+    def test_signal_in_the_psql_spawn_window_terminates_the_psql_child(self):
+        # #6337: a handled signal between Popen() and the communicate() guard escaped the guard.
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=signum.name):
+                r, children = self.run_signal_in_spawn_window(signum)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertEqual(r.stderr.strip(), PREFIX + "interrupted")
+                self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
+                for child in children:
+                    self.assert_gone(child)
+
+    # ---- #6504 / #6517 / #6505 / #6506 / #6518 / #6507: containment of the psql child ---------------
+    def interrupt_signals(self):
+        skip = {getattr(signal, name) for name in NOT_INTERRUPT_SIGNALS if hasattr(signal, name)}
+        return sorted((s for s in signal.valid_signals() if s not in skip), key=int)
+
+    def test_every_catchable_signal_mid_connect_terminates_the_psql_child(self):
+        # #6504: SIGQUIT, SIGUSR1, SIGUSR2, SIGALRM and every other signal kept the default action, so the helper
+        # died and psql was re-parented with PGPASSWORD.  Each signal is sent to a real helper process.
+        signums = self.interrupt_signals()
+        self.assertGreaterEqual(len(signums), 15, signums)
+        for name in ("SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM", "SIGTERM", "SIGINT", "SIGHUP"):
+            self.assertIn(getattr(signal, name), signums)
+        for signum in signums:
+            with self.subTest(signal=int(signum)):
+                proc, child = self.start_sleeping_helper()
+                proc.send_signal(signum)
+                out, err = proc.communicate(timeout=15)
+                self.assertEqual(proc.returncode, 1, out + err)
+                self.assertEqual(err.strip(), PREFIX + "interrupted")
+                self.assertNotIn(PW_MARKER, out + err)
+                self.assert_gone(child)
+
+    def assert_gone_within(self, pid, seconds, why):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        self.fail(f"psql {pid} still alive {seconds} s after {why} (orphan holding PGPASSWORD)")
+
+    def test_psql_does_not_outlive_a_sigkilled_helper_after_authentication(self):
+        # #6517: SIGKILL cannot be caught.  connect_timeout bounds only the connect phase, and psql 18.6 catches
+        # SIGALRM, so a psql that stalls after authentication lived on without bound.  The stand-in ignores
+        # every catchable signal, as a stalled authenticated session does.
+        proc, child = self.start_sleeping_helper(STUBBORN_PSQL)
+        proc.send_signal(signal.SIGKILL)
+        proc.communicate(timeout=15)
+        self.assert_gone_within(child, 3, "the helper was SIGKILLed")
+
+    def test_orphan_bound_does_not_scale_with_the_host_count(self):
+        # #6505: libpq tries every host in turn, each for connect_timeout; the bound was hosts x timeout.
+        four = ",".join(f"127.0.0.{n}:5445" for n in (1, 2, 3, 4))
+        for hosts in ("127.0.0.1:5445", four):
+            with self.subTest(hosts=hosts.count(",") + 1):
+                proc, child = self.start_sleeping_helper(STUBBORN_PSQL, hosts=hosts)
+                proc.send_signal(signal.SIGKILL)
+                proc.communicate(timeout=15)
+                self.assert_gone_within(child, 3, "the helper was SIGKILLed")
+
+    def test_uncatchable_and_fault_signals_leave_no_psql_child(self):
+        # Signals the helper cannot or does not turn into an interrupt still end psql: the supervisor sees
+        # the helper's pipe close.
+        for name in ("SIGKILL", "SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE"):
+            with self.subTest(signal=name):
+                proc, child = self.start_sleeping_helper(STUBBORN_PSQL)
+                proc.send_signal(getattr(signal, name))
+                proc.communicate(timeout=15)
+                self.assert_gone_within(child, 3, f"the helper got {name}")
+
+    def test_psql_is_killed_when_the_supervisor_itself_is_sigkilled(self):
+        # The supervisor is a process too: killing it must not leave psql behind while the helper lives.
+        proc, child = self.start_sleeping_helper(STUBBORN_PSQL)
+        supervisor = int((self.base / "sleep.ppid").read_text())
+        os.kill(supervisor, signal.SIGKILL)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone_within(child, 3, "the supervisor was SIGKILLed")
+
+    def run_supervisor(self, deadline, psql_template=STUBBORN_PSQL, keep_pipe=True, require_pid=True):
+        """Run the supervisor mode directly; returns (process, write end of the pipe or None, psql pid)."""
+        write_exe(self.psql, psql_template.format(py=sys.executable, base=str(self.base)))
+        for stale in ("sleep.pid", "sleep.ppid"):
+            if (self.base / stale).exists():
+                (self.base / stale).unlink()
+        mod = load_module()
+        r, w = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), str(deadline), "--", str(self.psql)],
+            pass_fds=(r,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        os.close(r)
+        pid_file = self.base / "sleep.pid"
+        end = time.monotonic() + 15
+        while time.monotonic() < end and not (pid_file.exists() and pid_file.read_text()):
+            if not require_pid and proc.poll() is not None:
+                break  # the supervisor stopped psql before it recorded its pid (#6646, #6674)
+            time.sleep(0.05)
+        child = int(pid_file.read_text()) if require_pid or (pid_file.exists() and pid_file.read_text()) else None
+        if not keep_pipe:  # closed only once psql is running, or the supervisor would stop it before it starts
+            os.close(w)
+            w = None
+
+        def reap():
+            for pid in (child, proc.pid):
+                if pid is None:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    # the process already exited: nothing left to kill
+                    pass
+            if w is not None:
+                os.close(w)
+            proc.communicate()
+
+        self.addCleanup(reap)
+        return proc, child
+
+    def test_supervisor_kills_psql_when_the_helper_pipe_closes(self):
+        proc, child = self.run_supervisor(600, keep_pipe=False)
+        proc.communicate(timeout=15)
+        self.assert_gone_within(child, 3, "the pipe closed")
+
+    def test_supervisor_enforces_its_own_deadline(self):
+        for template in (STUBBORN_PSQL, SLOW_STUBBORN_PSQL):  # #6646/#6674: also when psql starts slowly
+            with self.subTest(slow_start=template is SLOW_STUBBORN_PSQL):
+                self.check_supervisor_enforces_its_own_deadline(template)
+
+    def check_supervisor_enforces_its_own_deadline(self, template):
+        # A helper that is SIGSTOPped keeps the pipe open and cannot enforce the probe limit.
+        # The deadline counts from the supervisor's start, so on a loaded host (or with a slow stub) it can stop
+        # psql before psql records its pid.  Exit 1 is the kill path, which kills AND reaps psql before returning.
+        proc, child = self.run_supervisor(1, psql_template=template, require_pid=False)
+        t0 = time.monotonic()
+        proc.communicate(timeout=15)
+        self.assertLess(time.monotonic() - t0, 6)
+        self.assertEqual(proc.returncode, 1, "the supervisor must report its own deadline kill, not psql's status")
+        if child is not None:
+            self.assert_gone_within(child, 3, "the supervisor deadline passed")
+
+    def test_supervisor_kills_psql_on_a_signal_sent_to_itself(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGUSR1):
+            with self.subTest(signal=int(signum)):
+                proc, child = self.run_supervisor(600)
+                proc.send_signal(signum)
+                proc.communicate(timeout=15)
+                self.assert_gone_within(child, 3, f"the supervisor got signal {int(signum)}")
+
+    def test_supervisor_passes_psql_output_and_exit_code_through(self):
+        write_exe(self.psql, FAKE_PSQL.format(py=sys.executable, base=str(self.base), marker=PW_MARKER))
+        self.install_good()
+        mod = load_module()
+        r, w = os.pipe()
+        try:
+            done = subprocess.run(
+                [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), "30", "--", str(self.psql),
+                 "-c", PROBE_SQL_6896],
+                pass_fds=(r,), capture_output=True, text=True, timeout=30)
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "1")
+
+    def test_a_psql_killed_by_a_signal_is_reported_as_128_plus_the_signal_6643(self):
+        # supervise() maps a psql killed by signal N to 128+N; a 0 there would read as "age not listed" (#6643 R12)
+        mod = load_module()
+        for signum in (signal.SIGKILL, signal.SIGTERM):
+            write_exe(self.psql, SELF_SIGNAL_PSQL.format(py=sys.executable, signum=int(signum)))
+            with self.subTest(supervisor=int(signum)):
+                r, w = os.pipe()
+                try:
+                    done = subprocess.run(
+                        [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), "30", "--", str(self.psql)],
+                        pass_fds=(r,), capture_output=True, text=True, timeout=30)
+                finally:
+                    os.close(r)
+                    os.close(w)
+                self.assertEqual(done.returncode, 128 + int(signum), done.stderr)
+            with self.subTest(helper=int(signum)):
+                before = self.install_snapshot()
+                r = self.run_script()
+                self.assert_fails(r, 1, f"age probe failed: psql exited {128 + int(signum)}")
+                self.assertEqual(self.install_snapshot(), before, "a failed probe must never trigger a restore")
+
+    def test_a_failed_or_garbled_probe_never_reads_as_age_missing_6677(self):
+        # Only "1" (listed) and "0" (not listed) are answers.  A psql that fails, or exits 0 with any other output,
+        # must fail closed with no restore: a restore on a misread answer rewrites a healthy install (#6677, S16).
+        cases = (
+            (2, "", "age probe failed: psql exited 2"),
+            (0, "", "age probe failed: psql printed no 0/1 answer"),
+            (0, "garbage", "age probe failed: psql printed no 0/1 answer"),
+            (0, "2", "age probe failed: psql printed no 0/1 answer"),
+            (0, "1\\n1", "age probe failed: psql printed no 0/1 answer"),
+        )
+        for code, out, message in cases:
+            write_exe(self.psql, EXITING_PSQL.format(py=sys.executable, out=out, code=code))
+            with self.subTest(code=code, out=out):
+                before = self.install_snapshot()
+                r = self.run_script()
+                self.assert_fails(r, 1, message)
+                self.assertEqual(self.install_snapshot(), before, "a failed probe must never trigger a restore")
+
+    def test_psql_that_outlives_a_killed_supervisor_with_closed_pipes_is_killed_6642(self):
+        # psql closes its output pipes and the supervisor is SIGKILLed: communicate() returns (EOF, supervisor
+        # reaped), wait_for_probe never sees a live dead-supervisor slice, and only the returncode < 0 group kill
+        # stops psql, which still holds PGPASSWORD (#6642 R03).
+        write_exe(self.psql, PARENT_KILLING_PSQL.format(py=sys.executable, base=str(self.base)))
+        self.install_good()
+        r = self.run_script()
+        self.assertTrue((self.base / "sleep.pid").exists(), r.stdout + r.stderr)
+        child = int((self.base / "sleep.pid").read_text())
+        self.addCleanup(self.kill_quietly, child)
+        # #6728: a negative returncode is the supervisor's own death (psql's signals arrive as 128+N, #6643).
+        self.assert_fails(r, 1, "age probe failed: the psql supervisor was killed by signal 9")
+        self.assertNotIn("psql exited -", r.stderr)
+        self.assert_gone_within(child, 3, "the supervisor was SIGKILLed after psql closed its pipes")
+
+    @staticmethod
+    def kill_quietly(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            # the process already exited: nothing left to kill
+            pass
+
+    def install_snapshot(self):
+        """Install the good files once and return their (inode, mtime_ns, bytes): a restore replaces the inode."""
+        if not any(self.ext.iterdir()):
+            self.install_good()
+        return {p.name: (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes())
+                for d in (self.ext, self.lib) for p in sorted(d.iterdir())}
+
+    def run_recorded(self, env=None):
+        """Run the helper on a healthy install and return (result, the argv of the --supervise Popen)."""
+        self.install_good()
+        cmd = self.cmd()
+        harness, record = self.base / "record_harness.py", self.base / "popen.jsonl"
+        harness.write_text(RECORD_HARNESS)
+        cmd[2:4] = [str(harness), str(SCRIPT)]
+        cmd.insert(5, str(record))
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+        calls = [json.loads(line) for line in record.read_text().splitlines()] if record.exists() else []
+        sup = [argv for argv in calls if "--supervise" in argv]
+        self.assertEqual(len(sup), 1, (r.stdout + r.stderr, calls))
+        return r, sup[0]
+
+    def test_supervisor_runs_isolated_6641_6675(self):
+        # The supervisor inherits the env that holds PGPASSWORD: it must run as `python -I` so no PYTHONPATH,
+        # PYTHONSTARTUP, sitecustomize or user site directory can run code in it (#6641, #6675, #6339 class).
+        site = self.base / "site"
+        site.mkdir()
+        marker = self.base / "sitecustomize.ran"
+        # the fake psql and pg_config are Python scripts without -I: the hook records only the --supervise process
+        (site / "sitecustomize.py").write_text(
+            f"import sys\nif '--supervise' in sys.argv:\n    open({str(marker)!r}, 'a').write('ran')\n")
+        env = dict(os.environ, PYTHONPATH=str(site), PYTHONSTARTUP=str(site / "sitecustomize.py"))
+        control = subprocess.run([sys.executable, "-c", "pass", "--supervise"], env=env, check=False)
+        self.assertEqual(control.returncode, 0)
+        self.assertTrue(marker.exists(), "control: without -I the sitecustomize hook runs")
+        marker.unlink()
+        r, argv = self.run_recorded(env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(argv[:4], [sys.executable, "-I", os.path.abspath(str(SCRIPT)), "--supervise"])
+        self.assertFalse(marker.exists(), "the --supervise process ran a sitecustomize hook")
+
+    def test_supervisor_deadline_is_the_probe_limit_plus_5_s_6644_6678(self):
+        # The supervisor deadline is the only bound on an authenticated psql while the helper is SIGSTOPped; the
+        # value the helper passes, not one a test hands to supervise(), is pinned (#6644 R18, #6678 S09).
+        mod = load_module()
+        _, argv = self.run_recorded()
+        deadline = argv[argv.index("--supervise") + 2]
+        self.assertEqual(deadline, str(mod.PROBE_TIMEOUT_SECONDS + mod.SUPERVISOR_GRACE_SECONDS))
+        self.assertEqual((mod.PROBE_TIMEOUT_SECONDS, mod.SUPERVISOR_GRACE_SECONDS), (60, 5))
+        self.assertLessEqual(mod.SUPERVISOR_GRACE_SECONDS, 10)
+        self.assertEqual(argv[argv.index("--supervise") + 3], "--")
+        for path in ("docs/DEV-CI-ENVIRONMENT.md", "changelog.d/6161.fixed.md"):
+            with self.subTest(doc=path):
+                self.assertIn(f"{int(deadline)} s deadline", " ".join((ROOT / path).read_text().split()))
+        self.assertIn(f"the {mod.PROBE_TIMEOUT_SECONDS} s limit plus {mod.SUPERVISOR_GRACE_SECONDS} s",
+                      " ".join(mod.__doc__.split()))
+
+    def test_overall_deadline_stops_a_stalled_psql_6506(self):
+        for template in (STUBBORN_PSQL, SLOW_STUBBORN_PSQL):  # #6646/#6674: also when psql starts slowly
+            with self.subTest(slow_start=template is SLOW_STUBBORN_PSQL):
+                for stale in ("sleep.pid", "sleep.ppid"):
+                    if (self.base / stale).exists():
+                        (self.base / stale).unlink()
+                self.check_overall_deadline_stops_a_stalled_psql(template)
+
+    def check_overall_deadline_stops_a_stalled_psql(self, template):
+        # #6506: the 60 s limit is the only bound on a psql that connects and then stalls.  The supervisor
+        # deadline is held far away so only the helper's own limit and stop_child can end psql here (#6518).
+        write_exe(self.psql, template.format(py=sys.executable, base=str(self.base)))
+        mod = load_module()
+        mod.PROBE_TIMEOUT_SECONDS = 1
+        mod.SUPERVISOR_GRACE_SECONDS = 600
+        clock = PsqlStartClock(self.base / "sleep.pid")
+        mod.time = clock  # the 1 s limit counts from psql's start, not from two Python start-ups (#6646, #6674)
+        with self.assertRaises(mod.HelperError) as ctx:
+            mod.probe_lists_age(str(self.psql), f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb")
+        self.assertTrue(clock.psql_started, "psql never recorded its pid within the clock's 30 s cap")
+        self.assertLess(time.monotonic() - clock.started, 6)
+        self.assertEqual(ctx.exception.code, mod.EXIT_UNAVAILABLE)
+        self.assertEqual(str(ctx.exception), "age probe could not run psql (TimeoutExpired)")
+        self.assertNotIn(PW_MARKER, str(ctx.exception))
+        child = int((self.base / "sleep.pid").read_text())
+
+        def reap():
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                # the process already exited: nothing left to kill
+                pass
+
+        self.addCleanup(reap)
+        self.assert_gone_within(child, 3, "the overall deadline passed (stop_child)")
+
+    def test_a_signal_recorded_while_psql_runs_is_raised_when_the_guard_exits(self):
+        # #6507: the interrupt is held as a flag inside the guard and must surface when the guard ends.
+        mod = load_module()
+        with self.assertRaises(KeyboardInterrupt):
+            with mod.deferred_interrupts():
+                mod.note_interrupt(signal.SIGTERM, None)
+        with mod.deferred_interrupts():  # the flag does not leak into the next guard
+            pass
+        with self.assertRaises(KeyboardInterrupt):
+            mod.note_interrupt(signal.SIGTERM, None)  # outside the guard it raises at once
+
+    def test_main_installs_a_handler_for_every_interrupt_signal(self):
+        mod = load_module()
+        saved = {s: signal.getsignal(s) for s in signal.valid_signals() if s not in (signal.SIGKILL, signal.SIGSTOP)}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items() if h is not None])
+        mod.install_interrupt_handlers()
+        handled = {s for s in saved if signal.getsignal(s) == mod.note_interrupt}
+        wanted = set(self.interrupt_signals())
+        self.assertTrue(wanted <= handled, sorted(int(s) for s in wanted - handled))
+        for name in NOT_INTERRUPT_SIGNALS:
+            if hasattr(signal, name) and getattr(signal, name) in saved:
+                self.assertNotEqual(signal.getsignal(getattr(signal, name)), mod.note_interrupt, name)
+
+    def test_docs_state_the_true_orphan_bound(self):
+        # #6504/#6517/#6505/#6520: no document claims a bound that only holds while psql connects.
+        mod = load_module()
+        texts = {
+            "docstring": " ".join(mod.__doc__.split()),
+            "docs": " ".join((ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text().split()),
+            "changelog": " ".join((ROOT / "changelog.d/6161.fixed.md").read_text().split()),
+        }
+        for where, text in texts.items():
+            with self.subTest(where=where):
+                self.assertIn("supervisor", text.lower())
+                self.assertNotIn("15 s per host", text)
+                self.assertNotIn("Every catchable signal", text)
+        self.assertIn("SIGKILL", texts["docstring"])
+        self.assertIn("SIGSTOP", texts["docstring"])
+
+    def test_docs_state_that_losing_helper_and_supervisor_leaves_psql_unbounded_6673(self):
+        # The connect timeout bounds only the connect phase: after authentication nothing bounds a psql whose
+        # helper and supervisor were both SIGKILLed (macOS has no parent-death signal; psql catches SIGALRM).
+        mod = load_module()
+        claim = ("the loss of the helper AND the supervisor together leaves psql unbounded after authentication: "
+                 "the connect timeout ends only the connect phase")
+        for where, text in {
+            "docstring": " ".join(mod.__doc__.split()),
+            "docs": " ".join((ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text().split()),
+            "changelog": " ".join((ROOT / "changelog.d/6161.fixed.md").read_text().split()),
+        }.items():
+            with self.subTest(where=where):
+                self.assertNotIn("bounded by the connect timeout alone", text)
+                self.assertIn(claim, text)
+
+    def test_connect_timeout_width_and_decoded_value_6509(self):
+        # #6509: two digits at most, and the rule applies to the percent-DECODED value.
+        for value in ("060", "015", "001", "0015", "%30%36%30"):
+            with self.subTest(refused=value):
+                self.assert_url_refused(
+                    f"postgres://ciuser:pw@127.0.0.1:5445/cidb?connect_timeout={value}", ("connect_timeout",))
+        mod = load_module()
+        for value in ("%31%35", "%36%30", "%35"):
+            with self.subTest(accepted=value):
+                url = f"postgres://ciuser@127.0.0.1:5445/cidb?connect_timeout={value}"
+                self.assertEqual(mod.psql_target(url), (url, None))
+        self.assert_url_refused(
+            "postgres://ciuser@127.0.0.1:5445/cidb?connect_timeout=%36%31", ("connect_timeout",))
+
+    def test_docstring_names_the_oracle_that_pins_the_claim(self):
+        # #6519: a docstring check needs no libpq, so it lives outside LibpqOracleTests (which skips without one).
+        doc = " ".join(load_module().__doc__.split())
+        self.assertIn("LibpqOracleTests", doc, "the parity claim must name the test class that pins it")
+
+    def test_connect_timeout_must_be_a_bounded_positive_integer(self):
+        # #6338: libpq reads connect_timeout=0 as "wait forever", which removes the orphan bound.
+        for value in ("0", "00", "61", "100", "-1", "+5", "5s", "", "1e1", "%30"):
+            with self.subTest(value=value):
+                self.assert_url_refused(
+                    f"postgres://ciuser:pw@127.0.0.1:5445/cidb?connect_timeout={value}", ("connect_timeout",))
+        self.assert_url_refused("postgres://ciuser@127.0.0.1:5445/cidb?%63onnect_timeout=0", ("connect_timeout",))
+        mod = load_module()
+        for value in ("1", "15", "60", "05"):
+            with self.subTest(accepted=value):
+                url = f"postgres://ciuser@127.0.0.1:5445/cidb?connect_timeout={value}"
+                self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_psql_gets_a_bounded_connect_timeout(self):
+        self.install_good()
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["connect_timeout_env"], "15")
+
+    def test_kept_query_segments_are_not_re_encoded(self):
+        mod = load_module()
+        url = ("postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20statement_timeout%3D5"
+               "&password=pw&application_name=a+b&sslmode=verify-full&sslrootcert=%2Fr")
+        target, password = mod.psql_target(url)
+        self.assertEqual(password, "pw")
+        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb"
+                                 "?options=-c%20statement_timeout%3D5&application_name=a+b&sslmode=verify-full&sslrootcert=%2Fr")
+
+    def test_query_without_password_is_passed_through_as_written(self):
+        mod = load_module()
+        url = "postgres://ciuser:pw@127.0.0.1:5445/cidb?options=-c%20x&application_name=a+b"
+        target, password = mod.psql_target(url)
+        self.assertEqual(password, "pw")
+        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20x&application_name=a+b")
+        # Segments (even libpq's single trailing '&') are never rebuilt when no password was removed.
+        url = "postgres://ciuser@127.0.0.1:5445/cidb?application_name=a&sslmode=verify-full&sslrootcert=%2Fr&"
+        self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_allowlist_excludes_every_libpq_secret_key(self):
+        # R4-F3: adding any of these to ALLOWED_QUERY_KEYS would put a secret on argv.
+        mod = load_module()
+        secrets = {"password", "sslpassword", "oauth_client_secret", "scram_client_key",
+                   "scram_server_key", "sslkeylogfile", "require_auth"}
+        self.assertEqual(set(mod.ALLOWED_QUERY_KEYS) & secrets, set())
+
+    # ---- bad input -------------------------------------------------------
+    def test_missing_source_dir_fails_closed(self):
+        r = self.run_script(age_dir=self.base / "nope")
+        self.assert_fails(r, 2, "age source incomplete: ")
+        self.assert_nothing_installed()
+
+    def test_incomplete_source_dir_fails_closed(self):
+        (self.age / "lib/age.dylib").unlink()
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source incomplete: ")
+        self.assertIn("age.dylib", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_missing_url_file_fails_closed(self):
+        self.url_file.unlink()
+        self.assert_fails(self.run_script(), 2, "tier URL file ")
+        self.assert_nothing_installed()
+
+    def test_non_utf8_url_file_fails_closed(self):
+        self.url_file.write_bytes(b"\xff\xfepostgres://u:" + PW_MARKER.encode() + b"@h/db")
+        self.assert_fails(self.run_script(), 2, "tier URL file ")
+        self.assert_nothing_installed()
+
+    # ---- source integrity -----------------------------------------------
+    def test_hash_mismatch_is_rejected(self):
+        manifest_cmd = self.cmd()  # pins computed from the good bytes
+        (self.age / "share/age--1.8.0.sql").write_bytes(b"tampered")
+        r = subprocess.run(manifest_cmd, capture_output=True, text=True, check=False)
+        self.assert_fails(r, 2, "age source rejected: ")
+        self.assertIn("pinned sha256", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_symlinked_source_file_is_rejected(self):
+        outside = self.base / "outside.bin"
+        outside.write_bytes(DYLIB)
+        (self.age / "lib/age.dylib").unlink()
+        os.symlink(str(outside), str(self.age / "lib/age.dylib"))
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source rejected: ")
+        self.assertIn("symlink", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_symlinked_source_dir_is_rejected(self):
+        real = self.base / "real-lib"
+        (self.age / "lib").rename(real)
+        os.symlink(str(real), str(self.age / "lib"))
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source rejected: ")
+        self.assertIn("symlink", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_foreign_owner_is_rejected(self):
+        self.uid = os.geteuid() + 4242
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source rejected: ")
+        self.assertIn("not owned by the running user", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_group_writable_source_dir_is_rejected(self):
+        (self.age / "lib").chmod(0o775)
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source rejected: ")
+        self.assertIn("group- or world-writable", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_world_writable_source_file_is_rejected(self):
+        (self.age / "share/age.control").chmod(0o646)
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source rejected: ")
+        self.assertIn("group- or world-writable", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_extra_source_files_are_never_copied(self):
+        (self.lib / "vector.dylib").write_bytes(b"REAL-PGVECTOR")
+        (self.age / "lib/vector.dylib").write_bytes(b"FOREIGN")
+        (self.age / "share/evil.sql").write_bytes(b"FOREIGN")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.lib / "vector.dylib").read_bytes(), b"REAL-PGVECTOR")
+        self.assertFalse((self.ext / "evil.sql").exists())
+        self.assert_restored()
+
+    # ---- destination safety ----------------------------------------------
+    def test_preplaced_temp_symlink_is_not_followed(self):
+        victim = self.base / "victim.txt"
+        victim.write_text("ORIG")
+        os.symlink(str(victim), str(self.lib / ".age.dylib.age-restore"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(victim.read_text(), "ORIG")
+        self.assert_restored()
+
+    def test_preplaced_dest_symlink_is_replaced_not_followed(self):
+        victim = self.base / "victim.txt"
+        victim.write_text("ORIG")
+        os.symlink(str(victim), str(self.lib / "age.dylib"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(victim.read_text(), "ORIG", "the install wrote through a planted symlink")
+        dest = self.lib / "age.dylib"
+        self.assertFalse(dest.is_symlink())
+        self.assertTrue(stat.S_ISREG(os.lstat(str(dest)).st_mode))
+        self.assert_restored()
+        self.assert_no_temp_files()
+
+    def test_dest_symlink_to_good_bytes_is_not_healthy(self):
+        self.install_good()
+        good_copy = self.base / "good-copy.dylib"
+        good_copy.write_bytes(DYLIB)
+        (self.lib / "age.dylib").unlink()
+        os.symlink(str(good_copy), str(self.lib / "age.dylib"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout, "a symlink to correct bytes must not count as healthy")
+        self.assertFalse((self.lib / "age.dylib").is_symlink())
+        self.assertEqual(good_copy.read_bytes(), DYLIB)
+        self.assert_restored()
+
+    def test_unwritable_lib_dir_fails_without_partial_state(self):
+        # F7: a regular file where the directory belongs fails mkdir for root and non-root alike.
+        shutil.rmtree(str(self.lib))
+        self.lib.write_bytes(b"")
+        r = self.run_script()
+        self.assert_fails(r, 1, "age restore failed: ")
+        self.assertFalse((self.ext / "age.control").exists(), "control must never precede its module")
+        self.lib.unlink()
+        self.lib.mkdir()
+        self.assert_no_temp_files()
+        again = self.run_script()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assert_restored()
+
+    def test_share_failure_keeps_pinned_lib_file(self):
+        shutil.rmtree(str(self.ext))  # F7: a file where the share dir belongs, uid-independent
+        self.ext.write_bytes(b"")
+        r = self.run_script()
+        self.assert_fails(r, 1, "age restore failed: ")
+        # Every written file carries the pinned bytes, so a failed run leaves it in place.
+        self.assertEqual((self.lib / "age.dylib").read_bytes(), DYLIB)
+        self.ext.unlink()
+        self.ext.mkdir()
+        self.assertFalse((self.ext / "age.control").exists(), "control must never precede its module")
+        self.assert_no_temp_files()
+        again = self.run_script()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("restored", again.stdout)
+        self.assert_restored()
+
+    def test_failed_run_never_removes_a_concurrently_verified_file(self):
+        # R2-F1: runner B fails on a share file after replacing the dylib runner A wrote;
+        # A then completes and verifies the tier. B's failure must not undo A's restore.
+        dests = {"lib": self.lib, "share": self.ext}
+        manifest = tuple(tuple(row) for row in self.manifest())
+
+        def load():
+            mod = load_module()
+            mod.MANIFEST = manifest
+            mod.dest_dirs = lambda pg_config: dests
+            mod.read_url = lambda url_file: "postgres://u@h/db"
+            mod.probe_lists_age = lambda psql, url: (self.ext / "age.control").is_file()
+            return mod
+
+        a, b = load(), load()
+        sources = a.load_sources(self.age)
+        real_b_write = b.write_atomic
+
+        def b_write(data, mode, dest):
+            if dest.name == "age.dylib":
+                a.write_atomic(data, mode, dest)  # A writes after B's existence check ...
+                return real_b_write(data, mode, dest)  # ... and B replaces it
+            raise OSError(errno.ENOSPC, "No space left on device (injected for B)")
+
+        b.write_atomic = b_write
+        real_b_healthy = b.healthy
+        checks, a_verified = [], []
+
+        def b_healthy(args, d, url):
+            result = real_b_healthy(args, d, url)
+            checks.append(result)
+            if len(checks) == 2:  # B's post-failure re-check: A finishes and verifies now
+                for sub, name, data, mode in sources[1:]:
+                    a.write_atomic(data, mode, dests[sub] / name)
+                a_verified.append(a.healthy(args, dests, url))
+            return result
+
+        b.healthy = b_healthy
+        args = argparse.Namespace(url_file=None, pg_config=None, psql=None, age_dir=self.age)
+        with self.assertRaises(b.HelperError) as ctx:
+            b.run(args)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(a_verified, [True], "runner A must have verified the tier")
+        self.assertTrue(a.installed_ok(dests), "B's failure removed a file A had verified")
+        self.assert_restored()
+        self.assert_no_temp_files()
+
+    # ---- the unmodified script -------------------------------------------
+    def real_script(self, extra_env=None, age_dir=True):
+        env = dict(os.environ)
+        env.update(extra_env or {})
+        argv = [sys.executable, "-I", str(SCRIPT), "--url-file", str(self.url_file),
+                "--pg-config", str(self.pg_config), "--psql", str(self.psql)]
+        if age_dir:
+            argv += ["--age-dir", str(self.age)]
+        return subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
+
+    def test_real_script_rejects_unpinned_source(self):
+        r = self.real_script()
+        self.assert_fails(r, 2, "age source rejected: ")
+        self.assertIn("pinned sha256", r.stderr)
+        self.assert_nothing_installed()
+
+    def test_real_script_ignores_env_source_override(self):
+        home = self.base / "home"
+        home.mkdir()
+        r = self.real_script({"HOME": str(home), "AI_MEMORY_CI_AGE_DIR": str(self.age)}, age_dir=False)
+        self.assert_fails(r, 2, "age source incomplete: ")
+        self.assertIn(str(home / "pg-age-stack" / "age-1.8.0"), r.stderr)
+        self.assert_nothing_installed()
+
+    def test_manifest_pins_exactly_the_five_age_files(self):
+        mod = load_module()
+        rows = list(mod.MANIFEST)
+        self.assertEqual(
+            sorted((sub, name) for sub, name, _ in rows),
+            [("lib", "age.dylib")] + [("share", n) for n in SHARE_FILES],
+        )
+        self.assertEqual(rows[0][:2], ("lib", "age.dylib"), "lib must be installed before share")
+        for _, _, pin in rows:
+            self.assertRegex(pin, r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(dict(((s, n), p) for s, n, p in rows)[("lib", "age.dylib")],
+                         "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927")
+
+
+    def test_a_stop_recorded_during_handler_install_spawns_no_psql_6846(self):
+        # #6846 (mutant S18): a signal recorded while supervise() installs its handlers must end it before psql,
+        # which would hold PGPASSWORD, is ever spawned; killing psql on the first loop pass is too late.
+        mod = load_module()
+        spawned = []
+
+        def record_popen(*args, **kwargs):
+            spawned.append(args)
+            raise AssertionError("supervise() spawned psql after a recorded stop")
+
+        def install(handler=None):
+            handler(signal.SIGTERM, None)  # the signal lands while the handlers are being installed
+
+        mod.install_interrupt_handlers = install
+        mod.subprocess = type("SubprocessShim", (), {"Popen": staticmethod(record_popen),
+                                                     "SubprocessError": subprocess.SubprocessError})
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        self.assertEqual(mod.supervise(read_fd, 30, [str(self.psql)]), mod.EXIT_UNAVAILABLE)
+        self.assertEqual(spawned, [], "psql was spawned after the stop was recorded")
+
+    def test_probe_leaves_no_descriptor_open_in_the_helper_6847(self):
+        # #6847 (mutant S20): the supervisor is the only holder of the pipe's read end; the helper closes its
+        # copy after the spawn, so one probe leaves the helper's descriptor set unchanged.
+        mod = load_module()
+        url = f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb"
+        mod.probe_lists_age(str(self.psql), url)  # warm-up: imports and caches may open descriptors once
+        before = set(os.listdir("/dev/fd"))
+        self.assertFalse(mod.probe_lists_age(str(self.psql), url))
+        after = set(os.listdir("/dev/fd"))
+        self.assertEqual(after - before, set(), "probe_lists_age left a descriptor open in the helper")
+
+# ---- #6347: the libpq oracle behind the docstring claim "a URL the helper accepts is read the same way by libpq" --
+LIBPQ_CANDIDATES = (
+    "/opt/homebrew/opt/libpq/lib/libpq.5.dylib",
+    "/opt/homebrew/opt/postgresql@18/lib/postgresql/libpq.5.dylib",
+    "/usr/local/opt/libpq/lib/libpq.5.dylib",
+    "/usr/lib/x86_64-linux-gnu/libpq.so.5",
+    "/usr/lib/aarch64-linux-gnu/libpq.so.5",
+)
+
+
+class _ConninfoOption(ctypes.Structure):
+    _fields_ = [("keyword", ctypes.c_char_p), ("envvar", ctypes.c_char_p), ("compiled", ctypes.c_char_p),
+                ("val", ctypes.c_char_p), ("label", ctypes.c_char_p), ("dispchar", ctypes.c_char_p),
+                ("dispsize", ctypes.c_int)]
+
+
+def load_libpq():
+    """Return the libpq CDLL with PQconninfoParse, or None when no libpq is installed."""
+    names = list(LIBPQ_CANDIDATES)
+    found = ctypes.util.find_library("pq")
+    if found:
+        names.insert(0, found)
+    for name in names:
+        try:
+            lib = ctypes.CDLL(name)
+            lib.PQconninfoParse.restype = ctypes.POINTER(_ConninfoOption)
+            lib.PQconninfoParse.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+            lib.PQconninfoFree.argtypes = [ctypes.POINTER(_ConninfoOption)]
+            return lib
+        except (OSError, AttributeError):
+            continue
+    return None
+
+
+# Obsolete keywords an older libpq (before 14 / 18) still reports from PQconndefaults.  They are inert and the helper
+# does not allowlist them (a URL carrying one is refused), so the table check ignores them rather than failing on a
+# host whose libpq is older than the pinned one.
+LIBPQ_LEGACY_KEYWORDS = frozenset(("authtype", "tty"))
+
+
+def libpq_keywords(lib):
+    """Every connection keyword the installed libpq defines (PQconndefaults)."""
+    lib.PQconndefaults.restype = ctypes.POINTER(_ConninfoOption)
+    lib.PQconndefaults.argtypes = []
+    res = lib.PQconndefaults()
+    out, i = [], 0
+    while res and res[i].keyword:
+        keyword = res[i].keyword.decode()
+        if keyword not in LIBPQ_LEGACY_KEYWORDS:
+            out.append(keyword)
+        i += 1
+    if res:
+        lib.PQconninfoFree(res)
+    return out
+
+
+def libpq_options(lib, url):
+    """PQconninfoParse(url) -> {keyword: value bytes}, or None when libpq refuses the URL."""
+    err = ctypes.c_char_p()
+    res = lib.PQconninfoParse(os.fsencode(url), ctypes.byref(err))
+    if not res:
+        return None
+    out, i = {}, 0
+    while res[i].keyword:
+        if res[i].val is not None:
+            out[res[i].keyword.decode()] = res[i].val
+        i += 1
+    lib.PQconninfoFree(res)
+    return out
+
+
+def oracle_divergences(lib, psql_target, helper_error, url):
+    """Why a URL the helper ACCEPTS is not read the same way by libpq (empty list = parity holds)."""
+    try:
+        target, pw = psql_target(url)
+    except helper_error:
+        return []  # a refusal is never a parity break (the helper may be stricter)
+    orig, rew = libpq_options(lib, url), libpq_options(lib, target)
+    if orig is None:
+        return ["libpq refuses the original URL the helper accepted"]
+    if rew is None:
+        return ["libpq refuses the password-free argv URL"]
+    bad = []
+    rest_o = {k: v for k, v in orig.items() if k != "password"}
+    rest_r = {k: v for k, v in rew.items() if k != "password"}
+    if rest_o != rest_r:
+        bad.append("non-password options differ")
+    want = orig.get("password") or None
+    have = os.fsencode(pw) if pw else None
+    if want != have:
+        bad.append("PGPASSWORD differs from libpq's password")
+    if rew.get("password"):
+        bad.append("the argv URL still carries a password per libpq")
+    return bad
+
+
+ORACLE_URLS = (
+    "postgres://u:Fk3Pw0rd@h:5432/db?sslmode=verify-full&sslrootcert=%2Fr",
+    "postgres://:Fk3Pw0rd@/db?host=%2Fvar%2Frun",
+    "postgres://u:Fk3:Pw0rd@h/db",
+    "postgres://u:Fk3%40Pw0rd@h/db",
+    "postgres://u:Fk3%FFPw0rd@h/db",
+    "postgres://u:Fk3+Pw0rd@h/db",
+    "postgres://u:Fk3Pw0rd@[::1]:5432/db",
+    "postgres://u:Fk3Pw0rd@h1:5432,h2:5433/db",
+    "postgres://u@h/db?password=Fk3Pw0rd&application_name=a%26b",
+    "postgres://u@h/db?application_name=a&password=Fk3Pw0rd&",
+    "postgres://u:Fk3Pw0rd@h/db?password=Other9pw",
+    "postgres://u:Fk3Pw0rd@h/d%40b?connect_timeout=7",
+    "postgres://u:Fk3\x0bPw0rd@h/db",
+    "postgres://u:Fk3\x0cPw0rd@h/db",
+    "postgres://u:Fk3\x7fPw0rd@h/db",
+    "postgres://u:Fk3 Pw0rd@h/db",
+    "postgres://u@h/db?password=Fk3Pw0rd&sslmode=verify-full&sslrootcert=%2Fr",
+    "postgres://u@h/db?password=Fk3%0D%0APw0rd",
+    "postgres://u@h/db?pass%77ord=Fk3Pw0rd",
+    "postgres://u@h/db?PASSWORD=Fk3Pw0rd",
+    "postgresql://u:Fk3Pw0rd@h/db",
+)
+
+ORACLE_FUZZ_PIECES = ("%", "%2", "%41", "%40", "%3A", "%2F", "%26", "%3D", "%00", "%FF", "%C0%AF", "%25", "%23",
+                      "@", ":", "/", "?", "&", "=", "#", "+", "[", "]", ",", " ", "\\", ";", "a", "Fk3", "Pw0", "9",
+                      "é", "＠", "／", "\x0b")
+ORACLE_FUZZ_KEYS = ("password", "%70assword", "Password", "sslmode", "%73slmode", "host", "hostaddr", "port", "user",
+                    "dbname", "options", "passfile", "ssl", "application_name", "x", "", "p%00")
+
+
+def oracle_fuzz_urls(seed, count):
+    rnd = random.Random(seed)
+    for _ in range(count):
+        pw = "Fk3" + "".join(rnd.choice(ORACLE_FUZZ_PIECES) for _ in range(rnd.randint(0, 5)))
+        user = "".join(rnd.choice(ORACLE_FUZZ_PIECES) for _ in range(rnd.randint(0, 3)))
+        host = rnd.choice(["h", "h:5432", "", "h1,h2", "[::1]", "%2Fs", "h" + rnd.choice(ORACLE_FUZZ_PIECES)])
+        path = rnd.choice(["/db", "", "/", "/d" + rnd.choice(ORACLE_FUZZ_PIECES) + "b"])
+        segs = [rnd.choice(ORACLE_FUZZ_KEYS) + rnd.choice(["=", "=", "==", ""]) +
+                "".join(rnd.choice(ORACLE_FUZZ_PIECES) for _ in range(rnd.randint(0, 3)))
+                for _ in range(rnd.randint(0, 3))]
+        if rnd.random() < 0.5:
+            segs.append("password=" + pw)
+        userinfo = rnd.choice([f"{user}:{pw}@", f"{user}@", "", f":{pw}@"])
+        yield (rnd.choice(["postgres://", "postgresql://"]) + userinfo + host + path +
+               ("?" + "&".join(segs) if segs or rnd.random() < 0.1 else ""))
+
+
+class LibpqOracleTests(unittest.TestCase):
+    """#6347: a URL the helper accepts is read the same way by libpq (checked against the real libpq)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lib = load_libpq()
+        if cls.lib is None:
+            raise unittest.SkipTest("no libpq with PQconninfoParse on this host")
+        cls.mod = load_module()
+
+    def divergences(self, urls):
+        found = []
+        for url in urls:
+            for why in oracle_divergences(self.lib, self.mod.psql_target, self.mod.HelperError, url):
+                found.append(f"{why}: {url!r}")
+        return found
+
+    def test_hostile_table_has_parity_with_libpq(self):
+        self.assertEqual(self.divergences(ORACLE_URLS), [])
+
+    def test_seeded_fuzz_has_parity_with_libpq(self):
+        for seed in (6161, 90210):
+            with self.subTest(seed=seed):
+                self.assertEqual(self.divergences(oracle_fuzz_urls(seed, 1500)), [])
+
+    def test_oracle_accepts_urls_and_is_not_vacuous(self):
+        accepted = 0
+        for url in ORACLE_URLS:
+            try:
+                self.mod.psql_target(url)
+            except self.mod.HelperError:
+                continue
+            accepted += 1
+        self.assertGreaterEqual(accepted, 15, "the oracle table must exercise accepted URLs")
+
+    def test_fuzz_exercises_accepted_urls(self):
+        accepted = 0
+        for url in oracle_fuzz_urls(6161, 1500):
+            try:
+                self.mod.psql_target(url)
+                accepted += 1
+            except self.mod.HelperError:
+                continue
+        self.assertGreaterEqual(accepted, 100, "the fuzz must reach accepted URLs, not only refusals")
+
+    def test_every_url_probe_target_accepts_names_a_database_for_libpq_6871(self):
+        # #6871: the helper's database rule must agree with libpq: libpq's own parse of every URL that probe_target
+        # accepts yields a non-empty dbname, and libpq's parse of each refused #6871 shape yields an empty one.
+        refused = ("postgres://u@h:5445/?dbname=x&dbname=", "postgres://u@h:5445/db?dbname=",
+                   "postgres://u@h:5445/db?dbname=x&%64bname=")
+        for url in refused:
+            with self.subTest(libpq_premise=url):
+                self.assertFalse((libpq_options(self.lib, url) or {}).get("dbname"))
+        urls = list(refused) + list(ORACLE_URLS) + list(oracle_fuzz_urls(6871, 1500)) + [
+            "postgres://u@h:5445/?dbname=&dbname=x", "postgres://u@h:5445/db?dbname=x", "postgres://u@h:5445/db"]
+        accepted, empty = 0, []
+        for url in urls:
+            try:
+                self.mod.probe_target(url)
+            except self.mod.HelperError:
+                continue
+            accepted += 1
+            opts = libpq_options(self.lib, url)
+            if opts is not None and not opts.get("dbname"):
+                empty.append(url)
+        self.assertEqual(empty, [], "probe_target accepted a URL whose libpq dbname is empty")
+        self.assertGreaterEqual(accepted, 20, "the check must exercise accepted URLs")
+
+    def test_keyword_table_covers_the_installed_libpq(self):
+        # #6347 (a): every keyword the installed libpq defines is in LIBPQ_18_KEYWORDS (subset, since an older
+        # libpq on a runner defines fewer).  Dropping a keyword from the table, or a newer libpq adding one the
+        # helper has not classified, fails here.
+        real = libpq_keywords(self.lib)
+        self.assertGreaterEqual(len(real), 30, sorted(real))
+        self.assertEqual(sorted(set(real) - set(LIBPQ_18_KEYWORDS)), [])
+        self.assertTrue(set(real) & set(self.mod.ALLOWED_QUERY_KEYS), "the allowlist must overlap libpq")
+
+    def test_keyword_table_check_detects_a_dropped_keyword(self):
+        real = libpq_keywords(self.lib)
+        dropped = [k for k in LIBPQ_18_KEYWORDS if k != "user"]
+        self.assertIn("user", real)
+        self.assertEqual(sorted(set(real) - set(dropped)), ["user"])
+
+    def test_oracle_detects_a_password_left_on_argv(self):
+        def leaky(url):
+            return url, "Fk3Pw0rd"
+        self.assertTrue(oracle_divergences(self.lib, leaky, self.mod.HelperError,
+                                           "postgres://u:Fk3Pw0rd@h/db"))
+
+    def test_oracle_detects_a_wrong_password(self):
+        real = self.mod.psql_target
+
+        def wrong(url):
+            target, _ = real(url)
+            return target, "not-the-password"
+        self.assertTrue(oracle_divergences(self.lib, wrong, self.mod.HelperError,
+                                           "postgres://u:Fk3Pw0rd@h/db"))
+
+    def test_oracle_detects_a_dropped_option(self):
+        def drops(url):
+            return "postgres://u@h/db", None
+        self.assertTrue(oracle_divergences(self.lib, drops, self.mod.HelperError,
+                                           "postgres://u@h/db?application_name=a"))
+
+
+if __name__ == "__main__":
+    unittest.main()

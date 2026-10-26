@@ -92,7 +92,7 @@ each unit is and WHAT is substituted into it:
     exact keys, its ``uses`` pinned to a SHA constant, its ``with:`` inputs and
     its run text. No step can be added, removed, reordered or changed.
   * Permissions, secrets and the registry. The top-level ``permissions:`` is
-    exactly ``contents: write`` and every job's ``permissions:`` is pinned
+    exactly ``contents: read`` and every job's ``permissions:`` is pinned
     (``RELEASE_JOB_PERMISSIONS``; ``packages: write`` exists in the docker job
     only); the job set is pinned and no job may call a reusable workflow. Every
     ``secrets`` reference must be ``secrets.<NAME>`` with NAME in
@@ -266,7 +266,7 @@ DOCKER_JOB: Dict[str, Spec] = {
     "permissions": {"contents": "read", "packages": "write", "id-token": "write", "attestations": "write"},
 }
 DOCKER_STEPS: List[Spec] = [
-    {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
+    {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}", "persist-credentials": "false"}},
     {"name": "Set up Docker Buildx", "uses": BUILDX_USES},
     {"name": "Log in to GitHub Container Registry", "uses": LOGIN_USES,
      "with": {"registry": "ghcr.io", "username": "${{ github.actor }}", "password": "${{ secrets.GITHUB_TOKEN }}"}},
@@ -297,7 +297,7 @@ DOCKER_STEPS: List[Spec] = [
 DOCKER_STEP_ROLES = ("checkout", "Buildx setup", "registry login", "version", "image build", "provenance attestation")
 # release.yml permissions, pinned per job (#4719 SR-8): `packages: write` exists in
 # the docker job only; None = the job declares none and inherits the top level.
-RELEASE_TOP_PERMISSIONS: Dict[str, Spec] = {"contents": "write"}
+RELEASE_TOP_PERMISSIONS: Dict[str, Spec] = {"contents": "read"}
 _SIGN = {"contents": "write", "id-token": "write", "attestations": "write"}
 _READ_ATTEST = {"contents": "read", "attestations": "read"}
 RELEASE_JOB_PERMISSIONS: Dict[str, Optional[Dict[str, Spec]]] = {
@@ -1186,7 +1186,7 @@ def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
         if want is None:
             if perms is not None:
                 rep.bad(pin_message("release.yml", f"`jobs.{name}.permissions` is declared; the pinned job inherits the "
-                                    "top-level `contents: write` and declares none", "RELEASE_JOB_PERMISSIONS"))
+                                    "top-level `contents: read` and declares none", "RELEASE_JOB_PERMISSIONS"))
             continue
         why = pin_problem(perms, want, f"jobs.{name}.permissions")
         if why:
@@ -4963,8 +4963,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: echo x ghcr.io/o/ai-memory:latest\n")]),
     "SR8/I11b upper-case registry name in the crates-io job": ("fail", [_rel(
         CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: echo x GHCR.IO/o/ai-memory:latest\n")]),
-    "SR8 top-level packages write": ("fail", [_rel("\npermissions:\n  contents: write\n",
-                                                  "\npermissions:\n  contents: write\n  packages: write\n")]),
+    "SR8 top-level packages write": ("fail", [_rel("\npermissions:\n  contents: read\n",
+                                                  "\npermissions:\n  contents: read\n  packages: write\n")]),
+    "8172 top-level contents write regained": ("fail", [_rel("\npermissions:\n  contents: read\n",
+                                                            "\npermissions:\n  contents: write\n")]),
     "SR8 crates-io declares permissions": ("fail", [_rel(CRATES_STEPS, CRATES_STEPS.replace(
         "    environment:", "    permissions:\n      packages: write\n    environment:"))]),
     "SR8 release job permissions changed": ("fail", [_rel(REL_PERMS, "      id-token: write\n    strategy:\n")]),
