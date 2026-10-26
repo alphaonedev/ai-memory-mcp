@@ -72,8 +72,6 @@ def behaviour_problems(module):
     nested = tuple(module.active_tiers('pull_request', 'fix/chain/x'))
     if nested != ('sqlite',):
         problems.append('chain/ must be a prefix match, fix/chain/x got %r' % (nested,))
-    if tuple(module.active_tiers('pull_request', '')) != ('sqlite',):
-        problems.append('empty head ref on pull_request is a topic PR')
     return problems
 
 
@@ -195,6 +193,15 @@ class DecisionScript(unittest.TestCase):
         res = subprocess.run([sys.executable, '-I', str(SCRIPT), '--event-name', ''],
                              capture_output=True, text=True, check=False)
         self.assertEqual(res.returncode, 2)
+
+    def test_cli_pull_request_with_empty_head_ref_is_malformed(self):
+        # #8174 code r1 F1: a pull_request without a head ref must be loud (rc 2, no
+        # check_tiers line), never a silent drop of the enterprise-fed tier.
+        res = subprocess.run([sys.executable, '-I', str(SCRIPT), '--event-name', 'pull_request',
+                              '--head-ref', ''], capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 2)
+        self.assertNotIn('check_tiers', res.stdout)
+        self.assertIn('head ref', res.stderr)
 
     def test_output_line_round_trips(self):
         line = self.mod.output_line(self.mod.active_tiers('push', ''))
