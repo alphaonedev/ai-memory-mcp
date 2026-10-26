@@ -14,16 +14,16 @@ every node):
   (b) no ``run:`` block contains a GNU-only token (a macOS runner has BSD tools);
   (c) each workflow self-heals the hand-built macOS AGE install through
       ``scripts/ci/ensure-age-extension.py`` behind a ``$RUNNER_OS`` check, the
-      same branch ci.yml takes for its macos-fed enterprise-fed leg. The guard body is pinned
-      to exactly the heal call: the stripped lines between the guard line and the guard's
-      closing ``fi`` must equal the stripped ``HEAL_CALL`` lines, same order, same count. The
-      end is therefore never trusted from line shape alone: a late end or a data ``fi`` (a
-      quote of one kind inside a string of the other, ``\\'`` inside single quotes, an
-      arithmetic ``(( ))`` command naming ``if`` / ``fi``) changes the body and is refused as a
-      named defect. ``guard_end`` keeps its own refusals (unprovable line, not indented deeper,
-      uncountable if/fi, guard ``fi`` off the guard indent, no closing ``fi``). Fail-closed
-      cost: a valid but different guard body (an elif or case shape) is a named defect too;
-      neither live workflow has one.
+      same branch ci.yml takes for its macos-fed enterprise-fed leg. The whole "Point at the
+      native enterprise-fed tier (per-job ephemeral db)" step is pinned byte for byte (3-agent
+      vote 6def5ab6, 3-0): exactly one such step, only the keys ``name`` and ``run``, and the
+      ``run: |`` lines, each stripped and blank lines dropped, equal ``EXPECTED_POINT_AT_RUN_CERT`` /
+      ``EXPECTED_POINT_AT_RUN_IGNORED`` (tuples copied from the workflows, never built from them at
+      test time). ``ensure-age-extension.py`` and ``RUNNER_OS`` occur nowhere outside that block
+      (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``), and no ``defaults:`` key
+      exists. No shell is lexed, so no bash text shape can be misread. A comment, a flag or a word
+      changed inside the step is refused on purpose. Maintenance cost: the expected tuples are
+      updated in the same PR as any edit to the step.
 
 Run: python3 -m unittest discover -s scripts/ci/tests -p 'test_pg_workflows_fed_label_8174.py'
 """
@@ -62,6 +62,128 @@ LINUX_ONLY_TOKENS = (
 )
 POSTGRES_LINUX_BIN = "/usr/lib/postgresql"
 POSTGRES_MACOS_BIN = "/opt/homebrew/opt/postgresql@18/bin"
+
+# Pinned text of the Point-at step's ``run: |`` block (stripped lines, blank lines dropped), copied from
+# the workflows at cd57f84db. They are NOT built from the workflow at test time: an edit to the step
+# is made in the same PR as the matching edit here.
+EXPECTED_POINT_AT_RUN_CERT = (
+    'set -euo pipefail',
+    '# psql for the native tier lives under a versioned prefix. Prepend it',
+    '# to GITHUB_PATH (for LATER steps + the always() cleanup) AND to THIS',
+    "# step's own PATH (GITHUB_PATH does not affect the current step) so",
+    '# the CREATE DATABASE below can find psql.',
+    'for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do',
+    'if [ -d "$d" ]; then',
+    'echo "$d" >> "$GITHUB_PATH"',
+    'PATH="$d:$PATH"',
+    'fi',
+    'done',
+    'export PATH',
+    'url_file="$HOME/.ai-memory-ci-fed-url"',
+    'if [ ! -f "$url_file" ]; then',
+    'echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"',
+    'exit 1',
+    'fi',
+    'base_url="$(cat "$url_file")"',
+    '# Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63',
+    '# chars). run_id+attempt make it unique across concurrent runs; the',
+    '# fixed `cert` suffix keeps it distinct from the ci.yml enterprise-fed',
+    "# legs' ephemeral dbs on the same tier.",
+    'CI_FED_DB="$(printf \'%s\' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_cert" | cut -c1-63)"',
+    '# Compute-once, pass to the cleanup step via $GITHUB_ENV so create and',
+    '# drop use the byte-identical name.',
+    'echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"',
+    '# Create the ephemeral db on the base tier (connected to ai_memory_test).',
+    'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
+    'echo "::error::$RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native cert tier"',
+    'exit 1',
+    'fi',
+    "# Rewrite the base URL's db-name path segment (the last path segment,",
+    "# before any '?') to the ephemeral db, preserving every query param",
+    '# (sslmode/sslrootcert). The db name is [a-z0-9_] so needs no encoding.',
+    'case "$base_url" in',
+    '*\\?*) q="?${base_url#*\\?}"; head="${base_url%%\\?*}" ;;',
+    '*)    q=""; head="$base_url" ;;',
+    'esac',
+    'new_url="${head%/*}/${CI_FED_DB}${q}"',
+    '# #6161 - the macos-fed AGE install is hand-built; a Homebrew upgrade',
+    '# relinks the postgresql@18 trees and drops its files. These two',
+    '# workflows run on EITHER fed node (#8174), so mirror the ci.yml',
+    '# `Configure enterprise-fed tier` branch: on macOS self-heal from the',
+    '# node-local copy BEFORE CREATE EXTENSION (five sha256-pinned files;',
+    '# one-line reason on stderr). Linux is unchanged.',
+    '# python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.',
+    'if [ "$RUNNER_OS" = "macOS" ]; then',
+    'if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then',
+    'echo "::error::$RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"',
+    'exit 1',
+    'fi',
+    'fi',
+    "# Provision the ephemeral db's extensions (the tier role is SUPERUSER).",
+    'if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then',
+    'echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"',
+    'exit 1',
+    'fi',
+    '# Both the pg and AGE test URLs are the same ephemeral db on the',
+    '# native tier (a single PG 18.6 + AGE 1.8.0 + pgvector 0.8.7',
+    '# instance). Setting AI_MEMORY_TEST_AGE_URL is what stops the',
+    '# AGE-backed cells from self-skipping — the whole point of the in-PR',
+    '# cert evidence (#2548).',
+    '{',
+    'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url"',
+    'echo "AI_MEMORY_TEST_AGE_URL=$new_url"',
+    '} >> "$GITHUB_ENV"',
+    'echo "::notice::cert cells pointed at ephemeral db $CI_FED_DB on the native enterprise-fed tier ($RUNNER_NAME)"',
+)
+EXPECTED_POINT_AT_RUN_IGNORED = (
+    'set -euo pipefail',
+    'for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do',
+    'if [ -d "$d" ]; then',
+    'echo "$d" >> "$GITHUB_PATH"',
+    'PATH="$d:$PATH"',
+    'fi',
+    'done',
+    'export PATH',
+    'url_file="$HOME/.ai-memory-ci-fed-url"',
+    'if [ ! -f "$url_file" ]; then',
+    'echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"',
+    'exit 1',
+    'fi',
+    'base_url="$(cat "$url_file")"',
+    'CI_FED_DB="$(printf \'%s\' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_ignored" | cut -c1-63)"',
+    'echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"',
+    'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
+    'echo "::error::$RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native cert tier"',
+    'exit 1',
+    'fi',
+    'case "$base_url" in',
+    '*\\?*) q="?${base_url#*\\?}"; head="${base_url%%\\?*}" ;;',
+    '*)    q=""; head="$base_url" ;;',
+    'esac',
+    'new_url="${head%/*}/${CI_FED_DB}${q}"',
+    '# #6161 - the macos-fed AGE install is hand-built; a Homebrew upgrade',
+    '# relinks the postgresql@18 trees and drops its files. These two',
+    '# workflows run on EITHER fed node (#8174), so mirror the ci.yml',
+    '# `Configure enterprise-fed tier` branch: on macOS self-heal from the',
+    '# node-local copy BEFORE CREATE EXTENSION (five sha256-pinned files;',
+    '# one-line reason on stderr). Linux is unchanged.',
+    '# python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.',
+    'if [ "$RUNNER_OS" = "macOS" ]; then',
+    'if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then',
+    'echo "::error::$RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"',
+    'exit 1',
+    'fi',
+    'fi',
+    'if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then',
+    'echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"',
+    'exit 1',
+    'fi',
+    '{',
+    'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url"',
+    'echo "AI_MEMORY_TEST_AGE_URL=$new_url"',
+    '} >> "$GITHUB_ENV"',
+    'echo "::notice::[#3274] ignored pg tests pointed at ephemeral db $CI_FED_DB on $RUNNER_NAME"',
+)
 
 
 def lines_of(path):
@@ -105,90 +227,105 @@ def run_blocks_of(lines):
     return blocks
 
 
-IF_FI_WORD = re.compile(r"\b(?:if|fi)\b")
+STEP_NAME = "Point at the native enterprise-fed tier (per-job ephemeral db)"
+STEP_NAME_RX = re.compile(r"^\s*- name:\s*" + re.escape(STEP_NAME) + r"\s*$")
+KEY_RX = re.compile(r"^([A-Za-z_][\w-]*)\s*:")
+DEFAULTS_RX = re.compile(r"^\s*defaults\s*:")
+BODY_DIFFERS = "step body differs from the pinned text at line "
+PINNED_OUTSIDE_TOKENS = ("ensure-age-extension.py", "RUNNER_OS")
+EXPECTED_BY_WORKFLOW = {
+    "cert-postgres-age.yml": EXPECTED_POINT_AT_RUN_CERT,
+    "postgres-ignored.yml": EXPECTED_POINT_AT_RUN_IGNORED,
+}
 
 
-def guard_end(body, start):
-    """``(end, problem)``: the ``fi`` closing the ``if`` at body[start], by if/fi nesting depth.
+def indent_of(line):
+    return len(line) - len(line.lstrip())
 
-    ``end`` is None when unclosed or when a line carries an if/fi the per-line rule cannot count
-    (sec r4 F1 = code r4 O1): then ``problem`` names the line. decision: fail closed on uncountable
-    if/fi lines over a real shell parser because the pin's job is to refuse what it cannot prove and
-    a parser would be a second implementation of bash in a test.
+
+def as_lines(source):
+    """``source`` is a workflow ``Path`` or already-split text (the in-memory mutation rows)."""
+    return lines_of(source) if isinstance(source, Path) else list(source)
+
+
+def heal_defects(source, workflow="postgres-ignored.yml"):
+    """Named defects of the pinned "Point at the native enterprise-fed tier" step; ``[]`` when clean.
+
+    The step is pinned as a whole (decision: fixed-shape pin of the whole "Point at the native
+    enterprise-fed tier (per-job ephemeral db)" run block over a sixth per-construct refusal round
+    because five review rounds (r3-r7) each found a bash text shape the line scanner misreads, and
+    a byte-for-byte pin has no shell lexing left to probe while changing nothing that runs in CI;
+    3-agent vote (6def5ab6), 3-0, memory 8da30b8e; packet VOTE-8252-guard-shape.md.):
+    exactly one such step; only the keys ``name`` and ``run``; the stripped, blank-dropped lines of
+    ``run: |`` equal the pinned tuple for that workflow; ``ensure-age-extension.py`` and ``RUNNER_OS``
+    occur nowhere outside that block (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``);
+    no ``defaults:`` key. A ``Path`` selects the pinned tuple by file name; in-memory lines take
+    ``workflow`` (default ``postgres-ignored.yml``).
     """
-    depth = 0
-    indent = len(body[start]) - len(body[start].lstrip())
-    for i in range(start, len(body)):
-        word = body[i].strip()
-        if i > start:
-            # code r5 F1 + sec r5 F1: bash reads if/fi as DATA after a continuation, in a heredoc
-            # or in a multi-line string; refuse lines that can hide that, then demand indentation.
-            bare = word.replace("\\\\", "").replace('\\"', "").replace("\\'", "")
-            if word.endswith("\\") or "<<" in word or bare.count('"') % 2 or bare.count("'") % 2:
-                return None, "unprovable line in the RUNNER_OS guard: " + word
-            if len(body[i]) - len(body[i].lstrip()) <= indent and not (word == "fi" and depth == 1):
-                return None, "line inside the guard not indented deeper: " + word
-        if word.startswith("if ") and len(IF_FI_WORD.findall(word)) == 1:
-            depth += 1
-        elif word == "fi":
-            depth -= 1
-            if depth == 0:
-                if len(body[i]) - len(body[i].lstrip()) != indent:
-                    return None, "guard fi not at the guard indent: " + word
-                return i, None
-        elif IF_FI_WORD.search(word):
-            return None, "uncountable if/fi line in the RUNNER_OS guard: " + word
-    return None, "RUNNER_OS guard has no closing fi"
-
-
-def heal_defects(lines):
-    """The heal call must appear exactly once, inside the RUNNER_OS guard block of its step."""
-    inside = 0
-    total = 0
-    for body in run_blocks_of(lines):
-        total += sum(HEAL_SCRIPT in x for x in body)
-        for n, ln in enumerate(body):
-            if ln.strip() != HEAL_GUARD:
-                continue
-            end, problem = guard_end(body, n)
-            if end is None:
-                return [problem]
-            # decision: pin the guard body to exactly the heal call over a per-line quote-state
-            # scanner because the exact-body pin stops inferring the guard end from line shape at
-            # all (no shell lexing left to fool), ends the defect class in one function, and keeps
-            # the settled fail-closed no-parser design; a quote scanner would still leave
-            # arithmetic and future contexts (y3) open.
-            got = [x.strip() for x in body[n + 1:end]]
-            want = [x.strip() for x in HEAL_CALL.splitlines()]
-            if got != want:
-                differing = next(
-                    (g if g is not None else "(guard ends before: " + w + ")")
-                    for g, w in zip_longest(got, want)
-                    if g != w
+    lines = as_lines(source)
+    expected = EXPECTED_BY_WORKFLOW[getattr(source, "name", workflow)]
+    heads = [i for i, ln in enumerate(lines) if STEP_NAME_RX.match(ln)]
+    if len(heads) != 1:
+        return ["step named %r occurs %d times, expected exactly 1" % (STEP_NAME, len(heads))]
+    at = heads[0]
+    dash = indent_of(lines[at])
+    end = at + 1
+    while end < len(lines) and (not lines[end].strip() or indent_of(lines[end]) > dash):
+        end += 1
+    defects = []
+    keys = []
+    for i in range(at + 1, end):
+        text = lines[i].strip()
+        if text and not text.startswith("#") and indent_of(lines[i]) == dash + 2:
+            hit = KEY_RX.match(text)
+            keys.append((i, hit.group(1) if hit else text))
+    defects += ["step has a key other than name and run: " + k for _, k in keys if k != "run"]
+    runs = [i for i, k in keys if k == "run"]
+    inside = range(0)
+    if len(runs) != 1:
+        defects.append("step has %d run keys, expected exactly 1" % len(runs))
+    elif lines[runs[0]].strip() != "run: |":
+        defects.append("step run key is not a literal block: " + lines[runs[0]].strip())
+    else:
+        body_end = next((i for i, _ in keys if i > runs[0]), end)
+        inside = range(runs[0] + 1, body_end)
+        got = [lines[i].strip() for i in inside if lines[i].strip()]
+        for k, (g, w) in enumerate(zip_longest(got, expected), 1):
+            if g != w:
+                defects.append(
+                    BODY_DIFFERS + "%d: %s != %s"
+                    % (k, "(block ends)" if g is None else g, "(block ends)" if w is None else w)
                 )
-                return ["RUNNER_OS guard body is not exactly the heal call: " + differing]
-            inside += sum(HEAL_SCRIPT in x for x in body[n + 1:end])
-    if inside != 1 or total != 1:
-        return ["heal call not exactly once inside the guard"]
-    return []
+                break
+    for i, ln in enumerate(lines):
+        if DEFAULTS_RX.match(ln):
+            defects.append("defaults: key in the workflow: " + ln.strip())
+        if i in inside:
+            continue
+        defects += [
+            "%s outside the Point-at run block: %s" % (tok, ln.strip())
+            for tok in PINNED_OUTSIDE_TOKENS
+            if tok in ln
+        ]
+    return defects
 
 
-def linux_only_defects(lines):
+def linux_only_defects(source):
     """Linux-only tools or paths (nproc, /proc/, free) in any run block."""
     return [
         "linux-only " + name
-        for body in run_blocks_of(lines)
+        for body in run_blocks_of(as_lines(source))
         for ln in body
         for name, rx in LINUX_ONLY_TOKENS
         if rx.search(ln)
     ]
 
 
-def twin_defects(lines):
+def twin_defects(source):
     """A /usr/lib/postgresql search path without the homebrew bin dir beside it."""
     return [
         "no homebrew twin"
-        for body in run_blocks_of(lines)
+        for body in run_blocks_of(as_lines(source))
         for ln in body
         if POSTGRES_LINUX_BIN in ln and POSTGRES_MACOS_BIN not in ln
     ]
@@ -198,9 +335,9 @@ def twin_defects(lines):
 MACOS_CHECKS = (heal_defects, linux_only_defects, twin_defects)
 
 
-def macos_defects(lines):
-    """All defects of one workflow text, from every check in MACOS_CHECKS."""
-    return [d for check in MACOS_CHECKS for d in check(lines)]
+def macos_defects(source):
+    """All defects of one workflow (a ``Path`` or split text), from every check in MACOS_CHECKS."""
+    return [d for check in MACOS_CHECKS for d in check(source)]
 
 
 HEAL_CALL = (
@@ -211,6 +348,7 @@ HEAL_CALL = (
 )
 GUARD_END = HEAL_CALL + "          fi\n"
 GUARD_LINE = '          if [ "$RUNNER_OS" = "macOS" ]; then\n'
+NEW_URL_LINE = "          new_url=\"${head%/*}/${CI_FED_DB}${q}\"\n"
 STEP_HEAD = "      - name: Point at the native enterprise-fed tier (per-job ephemeral db)\n"
 # Mutation table (code r1 F1/F2): name -> (old text, new text) applied to an in-memory copy of
 # postgres-ignored.yml. Every row must make macos_defects report a defect.
@@ -330,10 +468,14 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         for path in WORKFLOWS:
             with self.subTest(workflow=path.name):
                 text = "\n".join("\n".join(b) for b in run_blocks(path))
-                self.assertIn(HEAL_GUARD, text)
                 create_anchor = "CREATE EXTENSION IF NOT EXISTS age"
                 for anchor in (HEAL_GUARD, HEAL_SCRIPT, create_anchor):
-                    self.assertIn(anchor, text, "anchor absent from the run blocks: " + anchor)
+                    # code r7 F2: the message names the anchor and the workflow only, never the
+                    # run block (assertIn would append the whole container text).
+                    self.assertTrue(
+                        anchor in text,
+                        "anchor absent from the run blocks of %s: %s" % (path.relative_to(REPO).as_posix(), anchor),
+                    )
                 guard_at = text.index(HEAL_GUARD)
                 heal_at = text.index(HEAL_SCRIPT)
                 create_at = text.index(create_anchor)
@@ -343,10 +485,10 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
     def _assert_check_clean(self, check):
         for path in WORKFLOWS:
             with self.subTest(workflow=path.name, check=check.__name__):
-                self.assertEqual(check(lines_of(path)), [])
+                self.assertEqual(check(path), [])
 
-    def test_heal_call_is_inside_the_guard_block_of_one_step(self):
-        """code r1 F1: the heal call sits between the guard line and its matching fi."""
+    def test_point_at_step_matches_the_pin_in_both_workflows(self):
+        """The live truth row: both workflows are byte-for-byte the pinned step (stripped lines)."""
         self._assert_check_clean(heal_defects)
 
     def test_no_linux_only_tool_or_path_in_any_run_block(self):
@@ -360,64 +502,131 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
     def test_unmutated_workflows_have_no_macos_defect(self):
         for path in WORKFLOWS:
             with self.subTest(workflow=path.name):
-                self.assertEqual(macos_defects(lines_of(path)), [])
+                self.assertEqual(macos_defects(path), [])
 
-    def test_uncountable_if_fi_line_in_guard_is_a_named_defect(self):
-        """sec r4 F1: an if/fi the per-line rule cannot count is reported, never a late guard end."""
-        base = WORKFLOWS[0].read_text(encoding="utf-8")
-        name = next(n for n in MUTATIONS if n.startswith("M20"))
+    def test_pinned_tuples_are_the_guard_and_heal_text_of_each_workflow(self):
+        """The tuples hold the guard line and the heal call once each, in order, and differ per workflow."""
+        for const in (EXPECTED_POINT_AT_RUN_CERT, EXPECTED_POINT_AT_RUN_IGNORED):
+            at = const.index(HEAL_GUARD)
+            self.assertEqual(const[at + 1 : at + 5], tuple(x.strip() for x in HEAL_CALL.splitlines()))
+            self.assertEqual(const[at + 5], "fi")
+            self.assertEqual(sum(HEAL_SCRIPT in x for x in const), 1)
+            self.assertEqual(sum("RUNNER_OS" in x for x in const if x.startswith("if [")), 1)
+        self.assertNotEqual(EXPECTED_POINT_AT_RUN_CERT, EXPECTED_POINT_AT_RUN_IGNORED)
+
+    def _defects(self, old, new, workflow=0):
+        """heal_defects of one workflow text with ``old`` replaced by ``new`` (anchor must be unique)."""
+        path = WORKFLOWS[workflow]
+        base = path.read_text(encoding="utf-8")
+        self.assertEqual(base.count(old), 1, "anchor drifted: " + old.strip())
+        return heal_defects(base.replace(old, new, 1).splitlines(), path.name)
+
+    def _row(self, prefix):
+        name = next(n for n in MUTATIONS if n.startswith(prefix + " "))
         old, new = MUTATIONS[name]
-        got = heal_defects(base.replace(old, new, 1).splitlines())
+        return self._defects(old, new)
+
+    def _assert_body_differs(self, got):
         self.assertEqual(len(got), 1, got)
-        self.assertIn("uncountable if/fi", got[0])
-        self.assertIn("if true; then :; fi", got[0])
+        self.assertTrue(got[0].startswith(BODY_DIFFERS), got)
 
-    def _defects_with_guard_body(self, body_lines):
-        """heal_defects of postgres-ignored.yml with the guard body replaced by ``body_lines``."""
+    def test_every_mutation_row_is_detected(self):
+        """Every MUTATIONS row (M11-M35) applied to an in-memory copy must be reported."""
         base = WORKFLOWS[0].read_text(encoding="utf-8")
-        guard = '          if [ "$RUNNER_OS" = "macOS" ]; then\n'
-        self.assertEqual(base.count(guard + HEAL_CALL), 1, "guard anchor drifted")
-        return heal_defects(base.replace(guard + HEAL_CALL, guard + body_lines, 1).splitlines())
+        for name, (old, new) in MUTATIONS.items():
+            with self.subTest(mutation=name):
+                self.assertEqual(base.count(old), 1, "mutation anchor drifted")
+                self.assertNotEqual(macos_defects(base.replace(old, new, 1).splitlines()), [])
 
-    def test_data_fi_rows_are_refused_as_a_body_that_is_not_the_heal_call(self):
-        """code r6 F1 / sec r6 F1: M24-M27 end late or hide the call; the exact-body pin names it."""
-        base = WORKFLOWS[0].read_text(encoding="utf-8")
-        for prefix in ("M24", "M25", "M26", "M27"):
-            name = next(n for n in MUTATIONS if n.startswith(prefix))
-            old, new = MUTATIONS[name]
-            with self.subTest(mutation=prefix):
-                got = heal_defects(base.replace(old, new, 1).splitlines())
-                self.assertEqual(len(got), 1, got)
-                self.assertTrue(got[0].startswith("RUNNER_OS guard body is not exactly the heal call: "), got)
+    def test_m28_heredoc_before_the_guard_is_refused(self):
+        """code r7 w1: the guard line is the delimiter of a here-document opened before it."""
+        self._assert_body_differs(self._row("M28"))
+
+    def test_m29_runner_os_assigned_before_the_guard_is_refused(self):
+        """security r7 W1."""
+        self._assert_body_differs(self._row("M29"))
+
+    def test_m30_guard_inside_a_single_quoted_string_is_refused(self):
+        """security r7 W2."""
+        self._assert_body_differs(self._row("M30"))
+
+    def test_m31_bracket_shadowed_by_a_function_is_refused(self):
+        """security r7 W3."""
+        self._assert_body_differs(self._row("M31"))
+
+    def test_m32_step_level_env_key_is_refused(self):
+        got = self._row("M32")
+        self.assertIn("step has a key other than name and run: env", got)
+        self.assertIn("RUNNER_OS outside the Point-at run block: RUNNER_OS: macOS", got)
+
+    def test_m33_second_step_with_the_same_name_is_refused(self):
+        got = self._row("M33")
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("occurs 2 times, expected exactly 1", got[0])
+
+    def test_m34_shell_key_on_the_step_is_refused(self):
+        self.assertEqual(self._row("M34"), ["step has a key other than name and run: shell"])
+
+    def test_m35_runner_os_in_the_workflow_level_env_block_is_refused(self):
+        self.assertEqual(
+            self._row("M35"), ["RUNNER_OS outside the Point-at run block: RUNNER_OS: macOS"]
+        )
 
     def test_body_defect_names_the_first_differing_line(self):
-        got = self._defects_with_guard_body("            echo extra\n" + HEAL_CALL)
-        self.assertEqual(got, ["RUNNER_OS guard body is not exactly the heal call: echo extra"])
-        got = self._defects_with_guard_body("")
-        self.assertEqual(len(got), 1, got)
-        self.assertIn("not exactly the heal call", got[0])
+        at = EXPECTED_POINT_AT_RUN_IGNORED.index(HEAL_GUARD) + 1
+        got = self._defects(GUARD_LINE, GUARD_LINE + "            echo extra\n")
+        self.assertEqual(
+            got,
+            [BODY_DIFFERS + "%d: echo extra != %s" % (at + 1, EXPECTED_POINT_AT_RUN_IGNORED[at])],
+        )
 
-    def test_noop_edits_keep_the_guard_body_exact(self):
-        """A comment, an empty line, a uniform re-indent or a full-line ``# don't`` change nothing."""
-        calls = HEAL_CALL.splitlines(keepends=True)
-        shapes = {
-            "comment line in guard": "            # note\n" + HEAL_CALL,
-            "empty line in guard": "\n" + HEAL_CALL,
-            "full-line # don't": "            # don't\n" + HEAL_CALL,
-            "body +2 uniformly": "".join("  " + x for x in calls),
-        }
-        for label, body in shapes.items():
-            with self.subTest(shape=label):
-                self.assertEqual(self._defects_with_guard_body(body), [])
-        base = WORKFLOWS[0].read_text(encoding="utf-8")
-        guard = '          if [ "$RUNNER_OS" = "macOS" ]; then\n'
-        whole = guard + GUARD_END
-        self.assertEqual(base.count(whole), 1, "guard anchor drifted")
+    def test_body_defect_names_a_truncated_block(self):
+        last = EXPECTED_POINT_AT_RUN_IGNORED[-1]
+        got = self._defects("          " + last + "\n", "")
+        self.assertEqual(
+            got, [BODY_DIFFERS + "%d: (block ends) != %s" % (len(EXPECTED_POINT_AT_RUN_IGNORED), last)]
+        )
+
+    def _body_shifted(self, shift):
+        """postgres-ignored.yml defects with every line of the Point-at run block indented by ``shift``."""
+        lines = WORKFLOWS[0].read_text(encoding="utf-8").splitlines(keepends=True)
+        at = next(i for i, ln in enumerate(lines) if ln.strip() == "- name: " + STEP_NAME)
+        end = next(i for i in range(at + 1, len(lines)) if lines[i].startswith("      - "))
+        out = lines[: at + 2] + [" " * shift + x if x.strip() else x for x in lines[at + 2 : end]] + lines[end:]
+        return heal_defects("".join(out).splitlines(), "postgres-ignored.yml")
+
+    def test_noop_run_block_reindent_is_accepted(self):
+        """Pin control (b): the pin strips, so a uniform re-indent of the run block changes nothing."""
+        self.assertEqual(self._body_shifted(2), [])
+
+    def test_noop_blank_line_inside_the_run_block_is_accepted(self):
+        """Pin control (c): blank lines are dropped."""
+        self.assertEqual(self._defects(NEW_URL_LINE, NEW_URL_LINE + "\n"), [])
+
+    def test_noop_trailing_whitespace_is_accepted(self):
+        """Pin control (d)."""
+        self.assertEqual(self._defects(NEW_URL_LINE, NEW_URL_LINE.rstrip("\n") + "   \n"), [])
+
+    def test_noop_whole_guard_reindent_is_accepted(self):
+        whole = GUARD_LINE + GUARD_END
         shifted = "".join("  " + x for x in whole.splitlines(keepends=True))
-        self.assertEqual(heal_defects(base.replace(whole, shifted, 1).splitlines()), [])
+        self.assertEqual(self._defects(whole, shifted), [])
+
+    def test_comment_inserted_inside_the_step_is_refused_by_design(self):
+        """Pin control (a): a byte pin refuses every change inside the step, a comment included."""
+        got = self._defects(NEW_URL_LINE, NEW_URL_LINE + "          # note\n")
+        self._assert_body_differs(got)
+        self.assertIn(": # note != ", got[0])
+
+    def test_legitimate_comment_word_edit_is_refused_until_the_pin_is_updated(self):
+        """Maintenance cost: the pinned text is updated in the same PR as any edit to the step."""
+        old = "          # Create the ephemeral db on the base tier (connected to ai_memory_test).\n"
+        got = self._defects(old, old.replace("Create", "Make"), workflow=1)
+        self._assert_body_differs(got)
+        self.assertIn("# Make the ephemeral db", got[0])
 
     def test_valid_elif_and_case_bodies_are_named_defects(self):
-        """Fail-closed cost: shapes absent from the live guards are refused, not guessed at."""
+        """Shapes absent from the live guards are refused, not guessed at."""
         elif_body = (
             "            if a; then\n              :\n            elif b; then\n              :\n"
             "            else\n              :\n            fi\n"
@@ -425,17 +634,20 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         case_body = '            case "$x" in\n              a) : ;;\n            esac\n'
         for label, body in (("elif", elif_body), ("case", case_body)):
             with self.subTest(shape=label):
-                got = self._defects_with_guard_body(body + HEAL_CALL)
-                self.assertEqual(len(got), 1, got)
-                self.assertIn("not exactly the heal call", got[0])
+                self._assert_body_differs(self._defects(GUARD_LINE, GUARD_LINE + body))
 
-    def test_every_mutation_row_is_detected(self):
-        """code r1 F1/F2: each of M11-M14 applied to an in-memory copy must be reported."""
-        base = WORKFLOWS[0].read_text(encoding="utf-8")
-        for name, (old, new) in MUTATIONS.items():
-            with self.subTest(mutation=name):
-                self.assertEqual(base.count(old), 1, "mutation anchor drifted")
-                self.assertNotEqual(macos_defects(base.replace(old, new, 1).splitlines()), [])
+    def test_heal_script_named_outside_the_point_at_run_block_is_refused(self):
+        got = self._defects(
+            "env:\n  CARGO_TERM_COLOR: always\n",
+            "env:\n  CARGO_TERM_COLOR: always\n  HEAL: scripts/ci/ensure-age-extension.py\n",
+        )
+        self.assertEqual(
+            got, ["ensure-age-extension.py outside the Point-at run block: HEAL: scripts/ci/ensure-age-extension.py"]
+        )
+
+    def test_defaults_key_anywhere_in_the_workflow_is_refused(self):
+        got = self._defects("jobs:\n", "defaults:\n  run:\n    shell: bash\njobs:\n")
+        self.assertEqual(got, ["defaults: key in the workflow: defaults:"])
 
 
 if __name__ == "__main__":
