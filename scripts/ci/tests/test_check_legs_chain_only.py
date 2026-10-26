@@ -57,6 +57,8 @@ INSTALL_RUST_IF = ('        if: needs.classify.outputs.docs_only != \'true\' && 
 STRAY_NO_IF = '      - name: stray cargo build\n        run: cargo build\n'
 STRAY_IF_FIRST = ("      - if: needs.classify.outputs.docs_only != 'true'\n"
                   '        run: cargo build\n')
+STRAY_EXEMPT_PREFIX = '      - name: docs-only short-circuit cargo\n        run: cargo build\n'
+LEGS_RUN_LINE = '        run: python3 -I scripts/ci/check_legs.py --github-output "$GITHUB_OUTPUT"\n'
 LEG_KEYS = ('leg', 'runner', 'node', 'tier', 'timeout', 'once', 'shared_target')
 
 
@@ -163,6 +165,57 @@ def matrix_legs(check_job):
         if 'timeout' in entry or 'leg' in entry:
             legs.append(entry)
     return legs
+
+
+def step_run_body(block):
+    """Raw ``run: |`` script of a step block, dedented, newlines kept ('' when absent)."""
+    lines = block.split('\n')
+    for i, line in enumerate(lines):
+        if line.rstrip() == '        run: |':
+            body = []
+            for extra in lines[i + 1:]:
+                if extra.strip() and not extra.startswith('          '):
+                    break
+                body.append(extra[10:])
+            return '\n'.join(body) + '\n'
+    return ''
+
+
+# Refs that try to forge a second workflow command or extra annotation lines through
+# `%` (a legal refname byte that the runner percent-decodes) and raw CR/LF.
+ESCAPE_ROWS = (
+    ('fix/a%0A::error::x', '%250A'),
+    ('fix/a%0D%0A::error::x', '%250D%250A'),
+    ('fix/a\n::error::x', '%0A::error::x'),
+    ('fix/a\r::error::x', '%0D::error::x'),
+)
+
+
+def notice_escape_problems(ci):
+    """Run the notice step's script in bash; every hostile ref must come out escaped."""
+    notice = [b for b in step_blocks(job_text(ci, 'check')) if b.startswith(NOTICE_STEP_NAME)]
+    if len(notice) != 1:
+        return ['notice step not found for the escape pin']
+    script = step_run_body(notice[0])
+    scratch = REPO / '.local-runs'
+    scratch.mkdir(exist_ok=True)
+    summary = scratch / 'notice_summary.txt'
+    problems = []
+    try:
+        for head, want in ESCAPE_ROWS:
+            summary.write_text('')
+            env = {'PATH': '/usr/bin:/bin', 'LEG': 'linux-fed,enterprise-fed', 'EVENT_NAME': 'pull_request',
+                   'HEAD_REF': head, 'BASE_REF': CHAIN_BASE, 'GITHUB_STEP_SUMMARY': str(summary)}
+            res = subprocess.run(['bash', '-e', '-c', script], env=env, capture_output=True, text=True, check=False)
+            commands = [l for l in res.stdout.split('\n') if l.startswith('::')]
+            if res.returncode != 0 or len(commands) != 1 or want not in res.stdout:
+                problems.append('notice does not escape head ref %r (rc %d, stdout %r)' % (head, res.returncode, res.stdout))
+            if '\r' in res.stdout or len(summary.read_text().strip().split('\n')) != 1:
+                problems.append('notice leaks a raw CR or extra line for head ref %r' % (head,))
+    finally:
+        if summary.exists():
+            summary.unlink()
+    return problems
 
 
 def workflow_problems(ci):
@@ -313,6 +366,10 @@ class WorkflowWiring(unittest.TestCase):
     def test_workflow_has_no_problems(self):
         self.assertEqual(workflow_problems(CI_YML.read_text()), [])
 
+    def test_notice_escapes_hostile_refs(self):
+        # #8174 security r2 F1: `%` is a legal refname byte and the runner decodes it.
+        self.assertEqual(notice_escape_problems(CI_YML.read_text()), [])
+
 
 class MutationTable(unittest.TestCase):
     """Each deliberate break must make the pins fail (run against in-memory copies)."""
@@ -366,6 +423,13 @@ class MutationTable(unittest.TestCase):
                 '      - ' + NOTICE_STEP_NAME, STRAY_NO_IF + '      - ' + NOTICE_STEP_NAME, 1),
             'X4 new if-first step after a guarded step': ci.replace(
                 '      - name: Fork-PR refusal', STRAY_IF_FIRST + '      - name: Fork-PR refusal', 1),
+            # #8174 code r2 F1-F3: exact exempt names, comment-proof legs step, classify job.
+            'E1 unguarded step named with an exempt prefix': ci.replace(
+                '      - ' + NOTICE_STEP_NAME, STRAY_EXEMPT_PREFIX + '      - ' + NOTICE_STEP_NAME, 1),
+            'L1 continue-on-error after a comment in the legs step': ci.replace(
+                LEGS_RUN_LINE, LEGS_RUN_LINE + '      # probe comment\n        continue-on-error: true\n', 1),
+            'J1 continue-on-error on the classify job': ci.replace(
+                '    name: Classify changes\n', '    name: Classify changes\n    continue-on-error: true\n', 1),
         }
 
     def test_every_script_mutant_fails_the_behaviour_pins(self):
