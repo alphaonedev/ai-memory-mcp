@@ -201,10 +201,11 @@
     "msrv",
     "postgres-feature",
     "sal-feature",
+    "tier-credential-canary",
     "tier-credential-pins",
     "vectorlite-feature"
    ],
-   "job_names_sha256": "2b986d4c48ea87c45c9291f940052f22efb880c5f383e7253e68a2fd0f9c7411",
+   "job_names_sha256": "4cdc3e18d24b2233e24cfe509863c0bf8f5c6a1cbe8b32a44ff2f5cd67e809ef",
    "tier_jobs": {
     "check": {
      "keys": {
@@ -610,7 +611,8 @@
     "sal-feature",
     "vectorlite-feature",
     "dockerfile-validate",
-    "tier-credential-pins"
+    "tier-credential-pins",
+    "tier-credential-canary"
    ],
    "pinned": {
     "check": {

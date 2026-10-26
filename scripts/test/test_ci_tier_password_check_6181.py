@@ -7866,6 +7866,7 @@ class TestTheRoundTwentyEightSourceIsConsistent8187R28(unittest.TestCase):
 CANARY_AUTHORITY = "the runtime canary is authoritative; the static scan is a fail-closed pre-check and is not claimed complete"
 CANARY_IS_CHILD = bool(os.environ.get(canary.CANARY_CHILD_ENV))
 CANARY_IS_FULL = os.environ.get(canary.CANARY_FULL_ENV) == "1"
+CANARY_IS_SKIPPED = os.environ.get(canary.CANARY_SKIP_ENV) == "1"  # set by the pins job only; the canary job runs the canary
 CANARY_CLASS = "TestRuntimeCanaryRunsTheWholeModule8187R29"
 
 # code r28 F1: an int-valued call over the value is an oracle unless it is the length of the whole value
@@ -8290,6 +8291,7 @@ class TestTheCanaryByteScanSeesEveryTransform8187R29(unittest.TestCase):
 
 
 @unittest.skipIf(CANARY_IS_CHILD, "a canary child does not start a canary of its own")
+@unittest.skipIf(CANARY_IS_SKIPPED, "the parallel canary job (#8187, r31) runs the canary; TIER_CANARY_8187_SKIP=1 skips it here")
 class TestRuntimeCanaryRunsTheWholeModule8187R29(unittest.TestCase):
     """r29 B-1: the WHOLE module runs as a subprocess in a throwaway copy of the repository whose workflows carry a unique marker
     (loaded through the real loading path), under unittest (and pytest, and the lowest and highest interpreter, when

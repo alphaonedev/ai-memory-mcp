@@ -44,6 +44,8 @@ from pathlib import Path
 
 CANARY_CHILD_ENV = "TIER_CANARY_CHILD_8187"
 CANARY_FULL_ENV = "TIER_CANARY_FULL_8187"
+# Fail-closed skip: the canary runs whenever this is absent (local runs, the canary job); only an explicit "1" skips it.
+CANARY_SKIP_ENV = "TIER_CANARY_8187_SKIP"
 CANARY_FORCE_ENV = "TIER_CANARY_FORCE_8187"
 CANARY_EXTRA_PATH_ENV = "TIER_CANARY_EXTRA_PATH_8187"
 CANARY_MODULE = "test_ci_tier_password_check_6181.py"
