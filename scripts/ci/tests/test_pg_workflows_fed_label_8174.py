@@ -20,10 +20,21 @@ every node):
       ``run: |`` lines, each stripped and blank lines dropped, equal ``EXPECTED_POINT_AT_RUN_CERT`` /
       ``EXPECTED_POINT_AT_RUN_IGNORED`` (tuples copied from the workflows, never built from them at
       test time). ``ensure-age-extension.py`` and ``RUNNER_OS`` occur nowhere outside that block
-      (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``), and no ``defaults:`` key
-      exists in any spelling (every non-comment line mentioning it, every indent-0 ``?`` line and
-      every double-quoted key with a backslash is refused). The workflow-level and job-level ``env``
-      key sets equal ``ENV_KEYS_BY_WORKFLOW`` (a new, removed or renamed key is a named defect). No shell is lexed, so no bash text shape can be misread. A comment, a flag or a word
+      (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``). The whole workflow SKELETON
+      is pinned as a literal tuple per workflow (``EXPECTED_SKELETON_IGNORED`` / ``EXPECTED_SKELETON_CERT``):
+      every non-blank, non-comment line at indent below 6 that is outside a block scalar, stripped of
+      trailing whitespace, in file order. An added, removed, changed or reordered skeleton line is a
+      named defect quoting the line and its 1-based file line number, so a ``defaults:``, ``env:`` or
+      any other key is refused in every YAML spelling (quoted, escaped, tagged, anchored, explicit
+      ``?`` key, alias, merge key, a commented ``jobs:`` line) without a YAML decoder. A skeleton line
+      whose first non-blank character is ``?``, ``&``, ``!``, ``*`` or ``<``, or that carries a
+      backslash inside quotes, is refused by form on top of that: those forms can spell any key and
+      neither live workflow uses one (``grep -c`` of both live files: 0 each). A workflow with no
+      exact ``jobs:`` line at indent 0 is refused. The workflow-level and job-level ``env`` key sets
+      equal ``ENV_KEYS_BY_WORKFLOW`` (a new, removed or renamed key is a named defect), and the step has
+      exactly one ``name`` key. Maintenance cost: an edit to the workflow header (triggers, permissions,
+      concurrency, env, job keys) is made in the same PR as the matching edit to the skeleton tuples.
+      No shell is lexed, so no bash text shape can be misread. A comment, a flag or a word
       changed inside the step is refused on purpose. Maintenance cost: the expected tuples are
       updated in the same PR as any edit to the step. The step's extent runs to the next non-blank
       non-comment line at or below the dash indent (a key after a comment is still a step key), the
@@ -35,6 +46,7 @@ Run: python3 -m unittest discover -s scripts/ci/tests -p 'test_pg_workflows_fed_
 """
 import re
 import unittest
+from difflib import SequenceMatcher
 from itertools import zip_longest
 from pathlib import Path
 
@@ -251,7 +263,6 @@ STEP_NAME = "Point at the native enterprise-fed tier (per-job ephemeral db)"
 # A step is a list item at exactly 6 spaces; the same words as data deeper inside a run block are not one.
 STEP_NAME_RX = re.compile(r"^      - name: *" + re.escape(STEP_NAME) + r"[ \t\r]*$")
 KEY_RX = re.compile(r"^([A-Za-z_][\w-]*)\s*:")
-QUOTED_KEY_RX = re.compile(r'^[ \t]*"((?:[^"\\]|\\.)*)"[ \t]*:')
 # decision: pin the workflow-level and job-level env key sets to the live sets over a denylist of
 # shell-affecting variable names because a denylist is never complete (BASH_ENV, ENV, SHELLOPTS,
 # BASHOPTS, PS4, LD_PRELOAD, PATH, ...) and the pin already compares the step text byte for byte
@@ -283,6 +294,75 @@ EXPECTED_BY_WORKFLOW = {
     "cert-postgres-age.yml": EXPECTED_POINT_AT_RUN_CERT,
     "postgres-ignored.yml": EXPECTED_POINT_AT_RUN_IGNORED,
 }
+# decision: pin the whole workflow skeleton (every non-comment line at indent below 6 outside block
+# scalars) as a literal tuple over adding more key-spelling regexes, because ten rounds of per-spelling
+# pins each left another YAML spelling open and a literal skeleton refuses any added or changed line in
+# any spelling without a decoder (fail-closed precedent PR 8252 cd57f84db; LOW with precedent, no vote).
+# The tuples are copied from the workflows, never built from them at test time.
+EXPECTED_SKELETON_IGNORED = (
+    'name: Postgres ignored tests (#3274)',
+    'on:',
+    '  pull_request:',
+    '    branches: ["release/**", "rehearsal/**", "chain/**"]',
+    '  push:',
+    '    branches: ["release/**"]',
+    '  workflow_dispatch:',
+    'permissions:',
+    '  contents: read',
+    'concurrency:',
+    '  group: pg-ignored-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}',
+    "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+    'env:',
+    '  CARGO_TERM_COLOR: always',
+    '  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960',
+    '  CARGO_INCREMENTAL: "0"',
+    '  CARGO_PROFILE_DEV_DEBUG: "0"',
+    '  CARGO_PROFILE_TEST_DEBUG: "0"',
+    'jobs:',
+    '  postgres-ignored:',
+    '    name: "Postgres ignored tests (sal-postgres --ignored)"',
+    '    runs-on: [self-hosted, fed]',
+    "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+    '    timeout-minutes: 60',
+    '    steps:',
+)
+EXPECTED_SKELETON_CERT = (
+    'name: "Certified Postgres + AGE + pgvector tier (#2548)"',
+    'on:',
+    '  pull_request:',
+    '    branches: ["release/**", "rehearsal/**", "chain/**"]',
+    '  push:',
+    '    branches: ["release/**"]',
+    '  workflow_dispatch:',
+    'permissions:',
+    '  contents: read',
+    'concurrency:',
+    '  group: cert-pg-age-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}',
+    "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+    'env:',
+    '  CARGO_TERM_COLOR: always',
+    '  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960',
+    '  CARGO_INCREMENTAL: "0"',
+    '  CARGO_PROFILE_DEV_DEBUG: "0"',
+    'jobs:',
+    '  cert-postgres-age:',
+    '    name: "Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)"',
+    '    runs-on: [self-hosted, fed]',
+    "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+    '    timeout-minutes: 60',
+    '    steps:',
+)
+SKELETON_BY_WORKFLOW = {
+    "postgres-ignored.yml": EXPECTED_SKELETON_IGNORED,
+    "cert-postgres-age.yml": EXPECTED_SKELETON_CERT,
+}
+SKELETON_INDENT = 6  # a step item sits at indent 6; the skeleton is every line shallower than that
+BLOCK_SCALAR_RX = re.compile(r"(?:^|[\s:\-])[|>][+-]?\d?[+-]?(?:[ \t]+#.*)?$")
+# These leads (explicit key, anchor, tag, alias, merge key) and a backslash inside quotes can spell any
+# key; neither live workflow uses one at indent below 6, so a skeleton line carrying one is refused.
+SPELL_ANY_KEY_LEADS = "?&!*<"
+QUOTED_BACKSLASH_RX = re.compile(r"[\"'][^\"']*\\")
+NO_JOBS_DEFECT = "workflow has no exact jobs: line at indent 0"
 
 
 def indent_of(line):
@@ -300,26 +380,61 @@ def as_lines(source):
     return lines_of(source) if isinstance(source, Path) else list(source)
 
 
-def top_level_key_defect(line):
-    """Named defect of a line that can spell a ``defaults`` key in any YAML form, else ``""``.
+def skeleton_of(lines):
+    """``(1-based file line number, text)`` of every skeleton line: non-blank, non-comment, indent below 6,
+    outside a block scalar (``|`` or ``>`` and their chomping forms), trailing whitespace stripped."""
+    found = []
+    block_above = None
+    for number, line in enumerate(lines, 1):
+        if is_skipped(line):
+            continue
+        indent = indent_of(line)
+        if block_above is not None:
+            if indent > block_above:
+                continue
+            block_above = None
+        text = line.rstrip(PIN_WS)
+        if BLOCK_SCALAR_RX.search(text):
+            block_above = indent
+        if indent < SKELETON_INDENT:
+            found.append((number, text))
+    return found
 
-    decision: refuse every top-level non-comment line that mentions defaults, every indent-0
-    explicit-key line starting with ?, and every double-quoted key carrying a backslash escape, over
-    decoding YAML escapes inside the pin, because the pin compares text the shell never decodes and a
-    fail-closed refusal of every spelling needs no decoder (fail-closed precedent PR 8252 cd57f84db;
-    LOW with precedent, no vote).
-    """
-    text = line.strip(PIN_WS)
-    if text.startswith("#"):
-        return ""
-    if "defaults" in text.lower():
-        return "defaults: key in the workflow: " + text
-    if indent_of(line) == 0 and text.startswith("?"):
-        return "explicit-key line in the workflow: " + text
-    hit = QUOTED_KEY_RX.match(line)
-    if hit and "\\" in hit.group(1):
-        return "escaped double-quoted key in the workflow: " + text
-    return ""
+
+def skeleton_defects(lines, workflow):
+    """Named defects of every added, removed, changed or reordered skeleton line, in file order."""
+    expected = SKELETON_BY_WORKFLOW[workflow]
+    live = skeleton_of(lines)
+    matcher = SequenceMatcher(None, [text for _, text in live], list(expected), autojunk=False)
+    added, changed, removed = [], [], []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        pair = min(i2 - i1, j2 - j1) if tag == "replace" else 0
+        changed += [(live[i1 + k][0], live[i1 + k][1], expected[j1 + k]) for k in range(pair)]
+        added += live[i1 + pair : i2]
+        before = live[i1][0] if i1 < len(live) else len(lines) + 1
+        removed += [(before, expected[k]) for k in range(j1 + pair, j2)]
+    moved = {text for _, text in added} & {text for _, text in removed}
+    found = [(n, "skeleton line %d %s: %s" % (n, "reordered" if t in moved else "added", t)) for n, t in added]
+    found += [(n, "skeleton line %d changed: %s (expected: %s)" % (n, t, want)) for n, t, want in changed]
+    found += [(n, "skeleton line removed before line %d: %s" % (n, t)) for n, t in removed if t not in moved]
+    return [message for _, message in sorted(found, key=lambda item: item[0])]
+
+
+def skeleton_form_defects(lines):
+    """Skeleton lines whose form can spell any key: ``?``, ``&``, ``!``, ``*`` or ``<`` first, or a backslash in quotes."""
+    found = []
+    for number, text in skeleton_of(lines):
+        content = text.lstrip(" \t")
+        while content.startswith("- "):
+            content = content[2:].lstrip(" \t")
+        if (content and content[0] in SPELL_ANY_KEY_LEADS) or QUOTED_BACKSLASH_RX.search(text):
+            found.append(
+                "skeleton line %d can spell any key (explicit key, anchor, tag, alias, merge key or escape): %s"
+                % (number, text)
+            )
+    return found
 
 
 def env_keys(lines, key_indent):
@@ -385,8 +500,10 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
     exactly one such step; only the keys ``name`` and ``run``; the stripped, blank-dropped lines of
     ``run: |`` equal the pinned tuple for that workflow; ``ensure-age-extension.py`` and ``RUNNER_OS``
     occur nowhere outside that block (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``);
-    no ``defaults:`` key. A ``Path`` selects the pinned tuple by file name; in-memory lines take
-    ``workflow`` (default ``postgres-ignored.yml``).
+    exactly one ``name`` key; the workflow skeleton equals the pinned tuple (``skeleton_defects``), no
+    skeleton line has a key-spelling form (``skeleton_form_defects``) and an exact ``jobs:`` line exists.
+    A ``Path`` selects the pinned tuple by file name; in-memory lines take ``workflow`` (default
+    ``postgres-ignored.yml``).
     """
     lines = as_lines(source)
     expected = EXPECTED_BY_WORKFLOW[getattr(source, "name", workflow)]
@@ -432,6 +549,9 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
             hit = KEY_RX.match(text)
             keys.append((i, hit.group(1) if hit else text))
     defects += ["step has a key other than name and run: " + k for _, k in keys if k not in ("name", "run")]
+    names = sum(1 for _, k in keys if k == "name") + 1  # the list item itself is the first name key
+    if names > 1:
+        defects.append("step has %d name keys, expected exactly 1" % names)
     runs = [i for i, k in keys if k == "run"]
     inside = range(0)
     if len(runs) != 1:
@@ -452,11 +572,13 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
                     % (k, "(block ends)" if g is None else g, "(block ends)" if w is None else w)
                 )
                 break
-    defects += env_defects(lines, getattr(source, "name", workflow))
+    name = getattr(source, "name", workflow)
+    defects += env_defects(lines, name)
+    defects += skeleton_defects(lines, name)
+    defects += skeleton_form_defects(lines)
+    if not any(ln.rstrip(PIN_WS) == "jobs:" for ln in lines):
+        defects.append(NO_JOBS_DEFECT)
     for i, ln in enumerate(lines):
-        defect = top_level_key_defect(ln)
-        if defect:
-            defects.append(defect)
         if i in inside:
             continue
         defects += [
@@ -718,6 +840,16 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         self.assertEqual(base.count(old), 1, "anchor drifted: " + old.strip())
         return heal_defects(base.replace(old, new, 1).splitlines(), path.name)
 
+    def _added(self, idx, old, new, text):
+        """The skeleton defect the pin names for the line ``text`` that ``new`` adds in place of ``old``."""
+        lines = WORKFLOWS[idx].read_text(encoding="utf-8").replace(old, new, 1).split("\n")
+        return "skeleton line %d added: %s" % (next(n for n, ln in enumerate(lines, 1) if ln.rstrip() == text), text)
+
+    def _added_block(self, idx, head):
+        """The three skeleton defects of ``head`` + ``  run:`` + ``    shell: bash`` inserted above ``jobs:``."""
+        new = head + "\n  run:\n    shell: bash\njobs:\n"
+        return [self._added(idx, "jobs:\n", new, t) for t in (head, "  run:", "    shell: bash")]
+
     def _row(self, prefix):
         name = next(n for n in MUTATIONS if n.startswith(prefix + " "))
         old, new = MUTATIONS[name]
@@ -769,6 +901,12 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
             self._row("M35"),
             [
                 "workflow-level env key added: RUNNER_OS",
+                self._added(
+                    0,
+                    "env:\n  CARGO_TERM_COLOR: always\n",
+                    "env:\n  CARGO_TERM_COLOR: always\n  RUNNER_OS: macOS\n",
+                    "  RUNNER_OS: macOS",
+                ),
                 "RUNNER_OS outside the Point-at run block: RUNNER_OS: macOS",
             ],
         )
@@ -846,13 +984,19 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
             got,
             [
                 "workflow-level env key added: HEAL",
+                self._added(
+                    0,
+                    "env:\n  CARGO_TERM_COLOR: always\n",
+                    "env:\n  CARGO_TERM_COLOR: always\n  HEAL: scripts/ci/ensure-age-extension.py\n",
+                    "  HEAL: scripts/ci/ensure-age-extension.py",
+                ),
                 "ensure-age-extension.py outside the Point-at run block: HEAL: scripts/ci/ensure-age-extension.py",
             ],
         )
 
     def test_defaults_key_anywhere_in_the_workflow_is_refused(self):
         got = self._defects("jobs:\n", "defaults:\n  run:\n    shell: bash\njobs:\n")
-        self.assertEqual(got, ["defaults: key in the workflow: defaults:"])
+        self.assertEqual(got, self._added_block(0, "defaults:"))
 
     def _r9_row(self, prefix):
         """One ROWS9 row: the pin names the key, and PyYAML (when present) agrees the key is a step key."""
@@ -924,12 +1068,12 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
     def test_m44_double_quoted_defaults_key_is_refused(self):
         """code r8 F2 (E5a): YAML maps "defaults" to the same key as defaults."""
         got = self._text_defects(1, "jobs:\n", '"defaults":\n  run:\n    shell: bash\njobs:\n')
-        self.assertEqual(got, ['defaults: key in the workflow: "defaults":'])
+        self.assertEqual(got, self._added_block(1, '"defaults":'))
 
     def test_m45_single_quoted_defaults_key_is_refused(self):
         """code r8 F2 (E5b)."""
         got = self._text_defects(1, "jobs:\n", "'defaults':\n  run:\n    shell: bash\njobs:\n")
-        self.assertEqual(got, ["defaults: key in the workflow: 'defaults':"])
+        self.assertEqual(got, self._added_block(1, "'defaults':"))
 
     def test_m46_step_name_as_data_inside_another_run_block_is_not_a_step(self):
         """code r8 F3 observation: only a dash at exactly 6 spaces is a step; the data line is not."""
@@ -962,26 +1106,32 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         return list(yaml.safe_load("\n".join(lines))) if yaml is not None else None
 
     def _defaults_spelling(self, head, expected):
-        """Both workflows: PyYAML reads ``head`` as a top-level defaults key, the pin names it."""
+        """Both workflows: PyYAML reads ``head`` as a top-level defaults key, the pin names its skeleton line.
+
+        ``expected`` is the text of the first inserted line; every defect is a skeleton defect.
+        """
         for idx in (0, 1):
             with self.subTest(workflow=WORKFLOWS[idx].name):
                 lines = self._text_defects_lines(idx, "jobs:\n", head + "  run:\n    shell: bash\njobs:\n")
                 keys = self._top_level_keys(lines)
                 if keys is not None:
                     self.assertIn("defaults", keys)
-                self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), [expected])
+                got = heal_defects(lines, WORKFLOWS[idx].name)
+                at = next(n for n, ln in enumerate(lines, 1) if ln.rstrip() == expected)
+                self.assertIn("skeleton line %d added: %s" % (at, expected), got)
+                self.assertTrue(all(d.startswith("skeleton line ") for d in got), got)
 
     def test_m47_double_quoted_defaults_key_spelled_with_a_hex_escape_is_refused(self):
         """code r9 F1 (Q8): the escaped key is the key defaults for YAML; no decoder is needed to refuse it."""
-        self._defaults_spelling('"\\x64efaults":\n', 'escaped double-quoted key in the workflow: "\\x64efaults":')
+        self._defaults_spelling('"\\x64efaults":\n', '"\\x64efaults":')
 
     def test_m48_explicit_key_form_of_the_defaults_key_is_refused(self):
         """code r9 F1 (Q10): ``? defaults`` on its own line, value on the next, is the key defaults."""
-        self._defaults_spelling("? defaults\n:\n", "defaults: key in the workflow: ? defaults")
+        self._defaults_spelling("? defaults\n:\n", "? defaults")
 
     def test_m49_double_quoted_key_spelled_with_a_unicode_escape_is_refused(self):
         """code r9 F1: a backslash escape spells any key, so a backslash in a double-quoted key is refused."""
-        self._defaults_spelling('"\\u0064efaults":\n', 'escaped double-quoted key in the workflow: "\\u0064efaults":')
+        self._defaults_spelling('"\\u0064efaults":\n', '"\\u0064efaults":')
 
     def test_m50_control_a_comment_line_that_mentions_defaults_is_accepted(self):
         """Control: ``# defaults: tuned`` at indent 0 is a YAML comment, not a key."""
@@ -994,11 +1144,11 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
 
     def test_m55_tagged_defaults_key_is_refused(self):
         """security r9 F2: ``!!str defaults:`` is the key defaults."""
-        self._defaults_spelling("!!str defaults:\n", "defaults: key in the workflow: !!str defaults:")
+        self._defaults_spelling("!!str defaults:\n", "!!str defaults:")
 
     def test_m56_anchored_defaults_key_is_refused(self):
         """security r9 F2: ``&a defaults:`` is the key defaults."""
-        self._defaults_spelling("&a defaults:\n", "defaults: key in the workflow: &a defaults:")
+        self._defaults_spelling("&a defaults:\n", "&a defaults:")
 
     def _env_row(self, level, key, value):
         """Add one env entry at workflow or job level of both workflows; PyYAML sees it, the pin names it."""
@@ -1015,8 +1165,10 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
                     doc = yaml.safe_load("\n".join(lines))
                     env = doc["env"] if level == "workflow" else doc["jobs"][job]["env"]
                     self.assertIn(key, env)
+                skeleton_line = "  %s: %s" % (key, value) if level == "workflow" else "    env:"
                 self.assertEqual(
-                    heal_defects(lines, WORKFLOWS[idx].name), ["%s-level env key added: %s" % (level, key)]
+                    heal_defects(lines, WORKFLOWS[idx].name),
+                    ["%s-level env key added: %s" % (level, key), self._added(idx, old, new, skeleton_line)],
                 )
 
     def test_m51_bash_env_at_workflow_level_is_refused(self):
