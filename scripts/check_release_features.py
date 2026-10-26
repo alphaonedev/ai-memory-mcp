@@ -6118,6 +6118,23 @@ R12_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r12 F3: an array-valued name in $(( )) is refused": (_r8("N=(1 2)", "echo $(( N ))"), None, 1, "non-literal operand"),
     "r12 F3: a name with one plain and one expanded assignment is refused": (_r8("N=5", "N=$HOME", "echo $(( N ))"), None, 1, "non-literal operand"),
     "r12 F3: a command substitution as an operand is refused": (_r8("echo $(( $(true) + 1 ))"), None, 1, "non-literal operand"),
+    # --- Sweep rows (Round 12): one row per mutant the first impact-selected sweep left alive.
+    "r12 F1 ok: a delimiter that ends at a semicolon is read as that word": (_r8("cat <<E;echo ok", "text", "E"), None, 0, ""),
+    "r12 F2: a substitution on the line after the open bracket of a quoted value is refused": (_r8("echo 'a[", "$(./f)]'"), None, 1, "subscript"),
+    "r12 F3: declare -i of an array name with a plain value is refused": (_r8("N=(1 2)", "declare -i N=3"), None, 1, "non-literal operand"),
+    "r12 F3: declare -i of a subscripted name with an unreadable value is refused": (_r8("declare -i 'a[0]'=' 1 ;'"), None, 1, "non-literal operand"),
+    "r12 F3: declare of an expanded name is refused": (_r8("declare $X"), None, 1, "of `declare`"),
+    "r12 F3: a name declared -a is not literal": (_r8("declare -a N", "echo $(( N ))"), None, 1, "non-literal operand"),
+    "r12 F3: a nameref is not literal": (_r8("declare -n R=1", "echo $(( R ))"), None, 1, "non-literal operand"),
+    "r12 F3: the target of a nameref is not literal": (_r8("X=1", "declare -n R=X", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3: a positional parameter read as a name is refused": (_r8("echo ${!1}"), None, 1, "non-literal operand"),
+    "r12 F3: a single-quoted value holding $name is not literal": (_r8("X='$HOME'", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3: a quoted value with a character outside the arithmetic tokens is not literal": (_r8("X='a;b'", "echo $(( X ))"), None, 1, "non-literal operand"),
+    "r12 F3: the subscript of an indirect read is checked": (_r8("X=$HOME", "echo ${!ary[X]}"), None, 1, "non-literal operand"),
+    "r12 F3: a refusal beside an env write is reported once": (
+        _r8("echo \"RUSTFLAGS=-Zx\" >> \"$GITHUB_ENV\"", "X=$HOME", "echo $(( X ))"), None, 1, "sets"),
+    "r12 F3: a matrix value that makes an operand non-literal is refused": (
+        _r7_steps("      - run: |\n          X=$HOME\n          echo $(( ${{ matrix.k }} ))\n", head=R8_MATRIX % "X"), None, 1, "matrix value"),
     # --- F3: accepted (green at both).
     "r12 F3 ok: literal arithmetic $(( 1 + 2 )) passes": (_r8("echo $(( 1 + 2 ))"), None, 0, ""),
     "r12 F3 ok: $(( N )) with N a plain number passes": (_r8("N=5", "echo $(( N ))"), None, 0, ""),
