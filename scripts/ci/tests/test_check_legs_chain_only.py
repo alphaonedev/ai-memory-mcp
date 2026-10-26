@@ -129,7 +129,7 @@ def workflow_problems(ci):
         problems.append('inactive-tier no-op notice step missing')
     if 'check_tiers: ${{ steps.legs.outputs.check_tiers }}' not in classify:
         problems.append('classify must export check_tiers from steps.legs')
-    m = re.search(r'      - name: [^\n]*\n        id: legs\n(.*?)(?=\n      - |\Z)', classify, re.S)
+    m = re.search(r'      - id: legs\n(.*?)(?=\n      - |\n      # |\Z)', classify, re.S)
     if not m:
         problems.append('classify step `id: legs` not found')
     else:

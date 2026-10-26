@@ -174,3 +174,18 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
   that the walk never read, bad root or any internal error) and
   fails the check. Unit tests:
   `scripts/ci/tests/test_manifest_owned_paths_8050.py`.
+
+## Enterprise-fed legs run on chain and release runs only (#8174)
+
+The `Check` job keeps its four legs and their names. A topic-branch
+`pull_request` runs only the two sqlite legs (`ubuntu-latest,sqlite`,
+`macos-fed,sqlite`); the two enterprise-fed legs are rerouted to a hosted runner
+with every step skipped (the docs-only no-op shape), so they still report but
+hold no self-hosted runner. A chain `pull_request` (head branch `chain/...`),
+`push`, `merge_group` and `workflow_dispatch` run all four legs. The reason is
+compute: a full `Check (linux-fed,enterprise-fed)` run held one of the four
+linux-fed runners for 2 h 09 min to 2 h 37 min per topic PR, whether it ended
+green or red, while sal-postgres coverage for topic PRs stays in
+`cert-postgres-age.yml` and `postgres-ignored.yml`. The rule is one function,
+`active_tiers` in `scripts/ci/check_legs.py`, exported as the `classify` output
+`check_tiers`; pins: `scripts/ci/tests/test_check_legs_chain_only.py`.
