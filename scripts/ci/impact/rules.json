@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "_comment": "First matching rule (lowest priority number) wins per path; selections are unioned over paths. Job key ALL forces the full matrix. A rust key also resolves the owning crate and its reverse-dependency closure. cell_crates names workspace crates whose change adds the cells key; this workspace has one crate (ai-memory), so the SAL and storage code is selected by cell_globs instead. The sal, sal-postgres and vectorlite cfgs are spread across 587 src/ and tests/ files (8240 F3), so every Rust source tree maps to cells; no file is excepted. scripts/ci/** and the check scripts judge CI itself, so they select ALL. Markdown compiled in by include_str!/include_bytes! is found by build_index and selects rust.",
+  "known_jobs": [
+    "rust", "cells", "python", "actionlint", "isolation-smoke", "docs",
+    "codeql", "signatures", "leakscan", "banned-phrases"
+  ],
+  "always_on": ["codeql", "signatures", "leakscan", "banned-phrases"],
+  "force_all_base_prefixes": ["release/"],
+  "force_all_base_names": ["main", "develop"],
+  "cell_crates": [],
+  "cell_globs": [
+    "src/**", "tests/**", "benches/**", "crates/**", "migrations/**"
+  ],
+  "tag_skip_jobs": ["dockerfile-validate"],
+  "job_map": {
+    "lint": "rust",
+    "msrv": "rust",
+    "check": "rust",
+    "vectorlite-feature": "rust",
+    "mobile-cross-compile": "rust",
+    "dockerfile-validate": "rust",
+    "postgres-feature": "cells",
+    "sal-feature": "cells",
+    "actionlint": "actionlint"
+  },
+  "rules": [
+    {"priority": 4, "glob": "scripts/ci/impact/rules.json", "jobs": ["ALL"]},
+    {"priority": 5, "glob": "scripts/ci/**", "jobs": ["ALL"]},
+    {"priority": 6, "glob": "scripts/check_*.py", "jobs": ["ALL"]},
+    {"priority": 7, "glob": "scripts/check-*.py", "jobs": ["ALL"]},
+    {"priority": 10, "glob": ".github/**", "jobs": ["ALL"]},
+    {"priority": 11, "glob": "scripts/ci/isolation*", "jobs": ["ALL"]},
+    {"priority": 12, "glob": "**/Cargo.toml", "jobs": ["ALL"]},
+    {"priority": 13, "glob": "**/Cargo.lock", "jobs": ["ALL"]},
+    {"priority": 14, "glob": "**/rust-toolchain*", "jobs": ["ALL"]},
+    {"priority": 15, "glob": "**/build.rs", "jobs": ["ALL"]},
+    {"priority": 16, "glob": "**/deny.toml", "jobs": ["ALL"]},
+    {"priority": 17, "glob": "scripts/**/*.sh", "jobs": ["ALL"]},
+    {"priority": 18, "glob": "scripts/test/**", "jobs": ["ALL"]},
+    {"priority": 20, "glob": "**/*.md", "jobs": ["docs"]},
+    {"priority": 21, "glob": "docs/**", "jobs": ["docs"]},
+    {"priority": 22, "glob": "site/**", "jobs": ["docs"]},
+    {"priority": 23, "glob": "mkdocs*", "jobs": ["docs"]},
+    {"priority": 30, "glob": "src/**", "jobs": ["rust"]},
+    {"priority": 31, "glob": "crates/**", "jobs": ["rust"]},
+    {"priority": 32, "glob": "tests/**", "jobs": ["rust"]},
+    {"priority": 33, "glob": "benches/**", "jobs": ["rust"]},
+    {"priority": 40, "glob": "scripts/**", "jobs": ["python", "actionlint", "isolation-smoke"]},
+    {"priority": 41, "glob": "**/*.py", "jobs": ["python", "actionlint", "isolation-smoke"]}
+  ]
+}

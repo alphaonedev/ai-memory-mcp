@@ -97,6 +97,9 @@ on:
   # group must exercise the FULL gate, never short-circuit to a docs-only skip.
   merge_group:
     types: [checks_requested]
+  # #8240: the nightly full run (ci-full.yml) dispatches this workflow. A
+  # non-pull_request event always selects the full matrix.
+  workflow_dispatch:
 
 # #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
 # Every job here is checkout + cargo/scripts; none posts PR comments, uploads
@@ -158,6 +161,304 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # #8240 - impact selection. Maps the diff to job keys (scripts/ci/impact) and
+  # exposes them to the heavy jobs. Fails closed to the full matrix: any error,
+  # an empty diff, a non-pull_request event, a release/main/develop base or an
+  # unclassified path selects everything. The steps are continue-on-error so an
+  # unusable selector can only widen the run, never narrow it.
+  select:
+    name: Impact selection
+    # RUNNER PLACEMENT - GitHub-hosted: it only runs git and python.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    outputs:
+      jobs: ${{ steps.select.outputs.jobs || steps.fallback.outputs.jobs }}
+      all: ${{ steps.select.outputs.all || steps.fallback.outputs.all }}
+      crates: ${{ steps.select.outputs.crates || steps.fallback.outputs.crates }}
+      enforce: ${{ steps.mode.outputs.enforce }}
+      # One output per gated domain: 'false' ONLY when this job succeeded, the
+      # repo var CI_IMPACT_ENFORCE is 'true' and the selection left it out.
+      # A gated job is skipped only on an explicit 'false' (fail closed).
+      rust: ${{ steps.select.outputs.rust || steps.fallback.outputs.rust }}
+      cells: ${{ steps.select.outputs.cells || steps.fallback.outputs.cells }}
+      actionlint: ${{ steps.select.outputs.actionlint || steps.fallback.outputs.actionlint }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      # Skipping is off until the repository variable CI_IMPACT_ENFORCE is
+      # "true"; until then every heavy job still runs and only the report differs.
+      - name: Selection mode
+        id: mode
+        env:
+          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}
+        run: echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"
+
+      # The selector that judges a PR is the BASE sha's: a PR must not judge
+      # itself. decision: base-sha selector over PR-tree selector because a PR
+      # must not judge itself; bootstrap and read failure select ALL (fail
+      # closed). The files below come from `git show <base>:<path>` into
+      # $RUNNER_TEMP/impact-base/; build_index.py and select.py run from that
+      # copy against the PR tree. When any file is missing at the base (this
+      # very PR adds them) or unreadable, the `fallback` step selects the full
+      # matrix and the reason lands in the step summary.
+      # decision: the trust decision runs before any checkout file executes and
+      # this step derives the base inline and no resolver script runs over
+      # keeping a resolver step first because any PR-tree step that runs earlier in the
+      # job can rewrite the git state and PATH the derivation reads.
+      # Only the pinned checkout action and the echo-only Selection mode step run before this step;
+      # the base is derived from
+      # the github.sha context value (CONTEXT_SHA) and the event payload, every
+      # git call ignores replace objects, and anything unexpected fails closed
+      # (base-sha-mismatch, never a bootstrap).
+      # base_sha.py is a library kept for the unit tests that pin its behaviour; no workflow step runs it.
+      - name: Materialise the base selector (#8240)
+        id: base
+        env:
+          CONTEXT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          IMPACT_FILES: __init__.py common.py select.py build_index.py gate.py rules.json
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+          REGULAR_MODES = ("100644", "100755")
+          IMPACT_PREFIX = "scripts/ci/impact/"
+          GIT_TIMEOUT_S = 120
+
+
+          class BaseUnavailable(Exception):
+              """The base copy cannot be built; the reason is a fixed token."""
+
+
+          def git(*args):
+              # --no-replace-objects and GIT_NO_REPLACE_OBJECTS=1 ignore replace
+              # refs only; grafts, shallow files and alternates are refused by
+              # git_state_refused() before the derivation reads anything.
+              env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+              try:
+                  return subprocess.run(["git", "--no-replace-objects"] + list(args),
+                                        capture_output=True, timeout=GIT_TIMEOUT_S,
+                                        env=env)
+              except (OSError, subprocess.TimeoutExpired):
+                  raise BaseUnavailable("git-failed")
+
+
+          def have_commit(base):
+              return git("cat-file", "-e", base + "^{commit}").returncode == 0
+
+
+          def fetch_blob(base, name):
+              path = IMPACT_PREFIX + name
+              tree = git("ls-tree", base, "--", path)
+              if tree.returncode != 0:
+                  raise BaseUnavailable("base-read-failed:" + name)
+              fields = tree.stdout.decode("utf-8", "replace").split()
+              if len(fields) < 4:
+                  raise BaseUnavailable("base-file-missing:" + name)
+              if fields[1] != "blob" or fields[0] not in REGULAR_MODES:
+                  raise BaseUnavailable("base-file-not-regular:" + name)
+              blob = git("show", "%s:%s" % (base, path))
+              if blob.returncode != 0 or not blob.stdout:
+                  raise BaseUnavailable("base-read-failed:" + name)
+              return blob.stdout
+
+
+          def rev_parse(spec):
+              res = git("rev-parse", "--verify", "--quiet", spec)
+              value = res.stdout.decode("utf-8", "replace").strip()
+              return value if res.returncode == 0 and SHA_RE.match(value) else ""
+
+
+          def replace_refs_present():
+              # Any refs/replace entry is unexpected on a fresh checkout: fail
+              # closed. Both the ref namespace and `git replace --list` are read.
+              res = git("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
+              if res.returncode != 0 or res.stdout.strip():
+                  return True
+              listed = git("replace", "--list")
+              return listed.returncode != 0 or bool(listed.stdout.strip())
+
+
+          def git_state_refused():
+              # Fail closed on every git state the runner can carry into the
+              # derivation. fetch-depth 0 produces a full clone: no shallow file,
+              # no grafts, no alternates (replace refs are read by
+              # replace_refs_present()); any of them, or the env vars that
+              # point git at one, is refused. Only the reason
+              # token is ever reported, never a path or author text.
+              for var in ("GIT_GRAFT_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                          "GIT_OBJECT_DIRECTORY"):
+                  if os.environ.get(var):
+                      return True
+              for rel in ("info/grafts", "shallow", "objects/info/alternates"):
+                  res = git("rev-parse", "--git-path", rel)
+                  path = res.stdout.decode("utf-8", "replace").strip()
+                  if res.returncode != 0 or not path or os.path.lexists(path):
+                      return True
+              return False
+
+
+          def derive_base(env):
+              # The authority: git and the event payload, never a resolver. The
+              # checked-out commit must be exactly the github.sha context value
+              # (the merge ref); a moved HEAD, a replace ref, grafts, a shallow file
+              # or alternates is a mismatch.
+              event = env.get("EVENT_NAME", "")
+              context = env.get("CONTEXT_SHA", "")
+              if event in ("pull_request", "merge_group"):
+                  if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  if replace_refs_present() or git_state_refused():
+                      raise BaseUnavailable("base-sha-mismatch")
+              if event == "pull_request":
+                  head = env.get("HEAD_SHA", "")
+                  if not SHA_RE.match(head) or rev_parse(context + "^2^{commit}") != head:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  parent = rev_parse(context + "^1^{commit}")
+                  if not parent:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  return parent
+              if event == "merge_group":
+                  raw = env.get("MERGE_GROUP_BASE_SHA", "")
+                  if not SHA_RE.match(raw):
+                      raise BaseUnavailable("base-sha-invalid")
+                  return raw
+              raise BaseUnavailable("base-event-unsupported")
+
+
+          def gate_absent(base):
+              # Bootstrap is exactly: the base tree lists no gate.py. A failed
+              # read (bad sha, missing commit, git error) is never bootstrap.
+              try:
+                  if not SHA_RE.match(base) or not have_commit(base):
+                      return False
+                  tree = git("ls-tree", base, "--", IMPACT_PREFIX + "gate.py")
+              except BaseUnavailable:
+                  return False
+              return tree.returncode == 0 and not tree.stdout.strip()
+
+
+          def materialise(base, dest, names):
+              if not SHA_RE.match(base):
+                  raise BaseUnavailable("base-sha-invalid")
+              if not have_commit(base):
+                  git("fetch", "--no-tags", "--depth=1", "origin", base)
+                  if not have_commit(base):
+                      raise BaseUnavailable("base-fetch-failed")
+              if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+                  raise BaseUnavailable("dest-unsafe")
+              if dest.exists():
+                  shutil.rmtree(str(dest))
+              try:
+                  for name in names:
+                      blob = fetch_blob(base, name)
+                      target = dest / "impact" / name
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(blob)
+              except OSError:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise BaseUnavailable("write-failed")
+              except BaseException:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise
+
+
+          def report(ok, reason, bootstrap=False):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+                  handle.write("ok=%s\n" % ("true" if ok else "false"))
+                  handle.write("bootstrap=%s\n" % ("true" if bootstrap else "false"))
+                  handle.write("reason=%s\n" % reason)
+              if ok:
+                  print("impact: selector files loaded from the base sha")
+                  return
+              line = "impact: base files unavailable (%s)" % reason
+              if bootstrap:
+                  line += "; bootstrap: the base sha has no scripts/ci/impact/gate.py"
+              print(line)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as handle:
+                      handle.write(line + "\n")
+
+
+          def main():
+              derived = ""
+              try:
+                  dest = Path(os.environ["RUNNER_TEMP"]) / "impact-base"
+                  names = os.environ.get("IMPACT_FILES", "").split()
+                  if not names:
+                      raise BaseUnavailable("no-files-listed")
+                  derived = derive_base(os.environ)
+                  print("impact: derived base %s from github.sha %s"
+                        % (derived, os.environ.get("CONTEXT_SHA", "")))
+                  materialise(derived, dest, names)
+              except BaseUnavailable as exc:
+                  report(False, str(exc), gate_absent(derived))
+                  return 0
+              except (OSError, KeyError):
+                  report(False, "environment-unusable")
+                  return 0
+              report(True, "")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+
+      - name: Build impact index
+        if: ${{ steps.base.outputs.ok == 'true' }}
+        continue-on-error: true
+        run: python3 -I "$RUNNER_TEMP/impact-base/impact/build_index.py" --repo . --db "$RUNNER_TEMP/impact.db"
+
+      - name: Select jobs
+        id: select
+        if: ${{ steps.base.outputs.ok == 'true' }}
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}
+        run: |
+          python3 -I "$RUNNER_TEMP/impact-base/impact/select.py" --db "$RUNNER_TEMP/impact.db" \
+            --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --event "$EVENT" \
+            --base-ref "$BASE_REF" --enforce "$ENFORCE" \
+            --out "$RUNNER_TEMP/selection.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      # Fail closed: no usable base copy means every gated job runs.
+      - name: Select the full matrix (base selector unavailable)
+        id: fallback
+        if: ${{ !cancelled() && steps.base.outputs.ok != 'true' }}
+        run: |
+          python3 -I - <<'PY'
+          import os
+
+          LINES = ("all=true", "jobs=", "crates=", "rust=true", "cells=true",
+                   "actionlint=true")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+              handle.write("\n".join(LINES) + "\n")
+          NOTICE = "impact: selecting the full matrix (fail closed)"
+          print(NOTICE)
+          if os.environ.get("GITHUB_STEP_SUMMARY"):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+                  handle.write(NOTICE + "\n")
+          PY
+
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
   # matrix instead of waiting on the full per-OS test build. Required status
   # checks are still satisfied because the matrix jobs keep their names AND
@@ -466,8 +767,8 @@ jobs:
   # `scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt`.
   lint:
     name: Lint (fmt + clippy)
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # Two full pedantic clippy passes (default + `--all-targets --features
@@ -578,8 +879,8 @@ jobs:
   # burn-down allowlist entry.
   actionlint:
     name: actionlint (workflow-injection guard)
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.actionlint != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). A single
     # container-action step over `.github/workflows/`: no cargo, no Postgres.
     runs-on: ubuntu-latest
@@ -611,8 +912,8 @@ jobs:
   # scripts/qc-allowlists/ + scripts/test/fixtures/) in lockstep.
   msrv:
     name: MSRV (Rust 1.98)
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # `cargo check --all-targets` over the whole crate.
@@ -2164,8 +2465,8 @@ jobs:
   # tracked in required-contexts-joblevel-if-allow.txt like the other gates.
   postgres-feature:
     name: Postgres feature gate
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.cells != 'false') }}
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     #
@@ -2351,8 +2652,8 @@ jobs:
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # clippy + `cargo build --release --features sal` + `cargo test`.
     name: SAL-only feature gate
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.cells != 'false') }}
     # NOTE the `Free disk` step that #3109 removed (it recursively deleted
     # system paths such as the bundled dotnet SDK to make headroom on the
     # ephemeral hosted image) is deliberately NOT restored. This job has since
@@ -2419,8 +2720,8 @@ jobs:
     # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
     # `--all-targets --features vectorlite` clippy + two test binaries.
     name: vectorlite feature gate
-    needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    needs: [classify, select]
+    if: ${{ !cancelled() && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     runs-on: ubuntu-latest
     # #1487 — bound the job so a wedged test can't pin the runner. 30 is the
     # pre-#3109 value measured on this runner class and is unchanged by #3109.
@@ -2478,7 +2779,7 @@ jobs:
   # when only /docs/ or *.md changed.
   dockerfile-validate:
     name: Dockerfile build (no push)
-    needs: classify
+    needs: [classify, select]
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). The
     # build happens inside a Docker layer cache backed by `type=gha` (the
     # GitHub Actions cache service), NOT by the self-hosted nodes' `target/`
@@ -2488,7 +2789,7 @@ jobs:
     # hosts.
     runs-on: ubuntu-latest
     # Skip on tag pushes — the docker job below handles those (with push).
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' && (needs.select.result != 'success' || needs.select.outputs.rust != 'false') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -2522,3 +2823,297 @@ jobs:
   # AND every per-module floor and now also posts the sticky coverage PR
   # comment. Coverage is owned end-to-end by `coverage.yml`; running the
   # full instrumented sweep twice per PR was pure waste.
+
+  # #8240 - the single aggregate check. Passes when every job either succeeded
+  # or was skipped for a recorded reason (docs-only, or select succeeded and said
+  # 'false' for the job's domain). Not a required check yet. It lists every job
+  # except the seven that carry a job-level `if:` (lint, actionlint, msrv,
+  # postgres-feature, sal-feature, vectorlite-feature, dockerfile-validate):
+  # rule (b4) of scripts/check-required-contexts.sh hard-fails any required job
+  # that another job `needs` and that has a job-level `if:`, and is not
+  # allowlistable. scripts/ci/tests/test_ci_select_gating_8240.py asserts the
+  # list equals every job minus exactly that set, so a new job cannot be left
+  # out. The seven join this list when (b4) exempts an `if: always()` aggregate
+  # (open item on #8240); the ruleset switch waits for that.
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs:
+      - select
+      - classify
+      - build-script-vetting
+      - check
+      - mobile-cross-compile
+    # RUNNER PLACEMENT - GitHub-hosted: it only reads the needs context.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # decision: on push, schedule and workflow_dispatch the gate runs from
+      # the checked-out tree over failing closed because there is no second
+      # party to judge itself: the tree under test is already the branch tip,
+      # and a gate that is red on every release/** push and workflow_dispatch full run
+      # can never be made required. Only pull_request and merge_group derive a
+      # live base and keep every base-gate rule below.
+      # decision: base-sha selector over PR-tree selector because a PR must not
+      # judge itself. gate.py and rules.json come from the base sha. Only the
+      # bootstrap (the base tree has no scripts/ci/impact/gate.py, this very
+      # PR adds it) runs the PR tree's gate, and says so in the step summary.
+      # decision: fail the gate on a non-bootstrap base read failure over
+      # falling back to the PR tree because a fallback the PR can trigger is
+      # self-judging; the select job already fails safe to the full matrix,
+      # the gate must fail closed. Any other failure to read a base file
+      # (fetch failure, timeout, invalid sha) fails this job.
+      # decision: the trust decision runs before any checkout file executes and
+      # this step derives the base inline and no resolver script runs over
+      # keeping a resolver step first because any PR-tree step that runs earlier in the
+      # job can rewrite the git state and PATH the derivation reads.
+      # Only the pinned checkout action runs before this step;
+      # the base is derived from
+      # the github.sha context value (CONTEXT_SHA) and the event payload, every
+      # git call ignores replace objects, and anything unexpected fails closed
+      # (base-sha-mismatch, never a bootstrap).
+      # base_sha.py is a library kept for the unit tests that pin its behaviour; no workflow step runs it.
+      - name: Materialise the base gate (#8240)
+        id: base
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+        env:
+          CONTEXT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          IMPACT_FILES: __init__.py common.py gate.py rules.json
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+          REGULAR_MODES = ("100644", "100755")
+          IMPACT_PREFIX = "scripts/ci/impact/"
+          GIT_TIMEOUT_S = 120
+
+
+          class BaseUnavailable(Exception):
+              """The base copy cannot be built; the reason is a fixed token."""
+
+
+          def git(*args):
+              # --no-replace-objects and GIT_NO_REPLACE_OBJECTS=1 ignore replace
+              # refs only; grafts, shallow files and alternates are refused by
+              # git_state_refused() before the derivation reads anything.
+              env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+              try:
+                  return subprocess.run(["git", "--no-replace-objects"] + list(args),
+                                        capture_output=True, timeout=GIT_TIMEOUT_S,
+                                        env=env)
+              except (OSError, subprocess.TimeoutExpired):
+                  raise BaseUnavailable("git-failed")
+
+
+          def have_commit(base):
+              return git("cat-file", "-e", base + "^{commit}").returncode == 0
+
+
+          def fetch_blob(base, name):
+              path = IMPACT_PREFIX + name
+              tree = git("ls-tree", base, "--", path)
+              if tree.returncode != 0:
+                  raise BaseUnavailable("base-read-failed:" + name)
+              fields = tree.stdout.decode("utf-8", "replace").split()
+              if len(fields) < 4:
+                  raise BaseUnavailable("base-file-missing:" + name)
+              if fields[1] != "blob" or fields[0] not in REGULAR_MODES:
+                  raise BaseUnavailable("base-file-not-regular:" + name)
+              blob = git("show", "%s:%s" % (base, path))
+              if blob.returncode != 0 or not blob.stdout:
+                  raise BaseUnavailable("base-read-failed:" + name)
+              return blob.stdout
+
+
+          def rev_parse(spec):
+              res = git("rev-parse", "--verify", "--quiet", spec)
+              value = res.stdout.decode("utf-8", "replace").strip()
+              return value if res.returncode == 0 and SHA_RE.match(value) else ""
+
+
+          def replace_refs_present():
+              # Any refs/replace entry is unexpected on a fresh checkout: fail
+              # closed. Both the ref namespace and `git replace --list` are read.
+              res = git("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
+              if res.returncode != 0 or res.stdout.strip():
+                  return True
+              listed = git("replace", "--list")
+              return listed.returncode != 0 or bool(listed.stdout.strip())
+
+
+          def git_state_refused():
+              # Fail closed on every git state the runner can carry into the
+              # derivation. fetch-depth 0 produces a full clone: no shallow file,
+              # no grafts, no alternates (replace refs are read by
+              # replace_refs_present()); any of them, or the env vars that
+              # point git at one, is refused. Only the reason
+              # token is ever reported, never a path or author text.
+              for var in ("GIT_GRAFT_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                          "GIT_OBJECT_DIRECTORY"):
+                  if os.environ.get(var):
+                      return True
+              for rel in ("info/grafts", "shallow", "objects/info/alternates"):
+                  res = git("rev-parse", "--git-path", rel)
+                  path = res.stdout.decode("utf-8", "replace").strip()
+                  if res.returncode != 0 or not path or os.path.lexists(path):
+                      return True
+              return False
+
+
+          def derive_base(env):
+              # The authority: git and the event payload, never a resolver. The
+              # checked-out commit must be exactly the github.sha context value
+              # (the merge ref); a moved HEAD, a replace ref, grafts, a shallow file
+              # or alternates is a mismatch.
+              event = env.get("EVENT_NAME", "")
+              context = env.get("CONTEXT_SHA", "")
+              if event in ("pull_request", "merge_group"):
+                  if not SHA_RE.match(context) or rev_parse("HEAD^{commit}") != context:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  if replace_refs_present() or git_state_refused():
+                      raise BaseUnavailable("base-sha-mismatch")
+              if event == "pull_request":
+                  head = env.get("HEAD_SHA", "")
+                  if not SHA_RE.match(head) or rev_parse(context + "^2^{commit}") != head:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  parent = rev_parse(context + "^1^{commit}")
+                  if not parent:
+                      raise BaseUnavailable("base-sha-mismatch")
+                  return parent
+              if event == "merge_group":
+                  raw = env.get("MERGE_GROUP_BASE_SHA", "")
+                  if not SHA_RE.match(raw):
+                      raise BaseUnavailable("base-sha-invalid")
+                  return raw
+              raise BaseUnavailable("base-event-unsupported")
+
+
+          def gate_absent(base):
+              # Bootstrap is exactly: the base tree lists no gate.py. A failed
+              # read (bad sha, missing commit, git error) is never bootstrap.
+              try:
+                  if not SHA_RE.match(base) or not have_commit(base):
+                      return False
+                  tree = git("ls-tree", base, "--", IMPACT_PREFIX + "gate.py")
+              except BaseUnavailable:
+                  return False
+              return tree.returncode == 0 and not tree.stdout.strip()
+
+
+          def materialise(base, dest, names):
+              if not SHA_RE.match(base):
+                  raise BaseUnavailable("base-sha-invalid")
+              if not have_commit(base):
+                  git("fetch", "--no-tags", "--depth=1", "origin", base)
+                  if not have_commit(base):
+                      raise BaseUnavailable("base-fetch-failed")
+              if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+                  raise BaseUnavailable("dest-unsafe")
+              if dest.exists():
+                  shutil.rmtree(str(dest))
+              try:
+                  for name in names:
+                      blob = fetch_blob(base, name)
+                      target = dest / "impact" / name
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(blob)
+              except OSError:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise BaseUnavailable("write-failed")
+              except BaseException:
+                  shutil.rmtree(str(dest), ignore_errors=True)
+                  raise
+
+
+          def report(ok, reason, bootstrap=False):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+                  handle.write("ok=%s\n" % ("true" if ok else "false"))
+                  handle.write("bootstrap=%s\n" % ("true" if bootstrap else "false"))
+                  handle.write("reason=%s\n" % reason)
+              if ok:
+                  print("impact: selector files loaded from the base sha")
+                  return
+              line = "impact: base files unavailable (%s)" % reason
+              if bootstrap:
+                  line += "; bootstrap: the base sha has no scripts/ci/impact/gate.py"
+              print(line)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as handle:
+                      handle.write(line + "\n")
+
+
+          def main():
+              derived = ""
+              try:
+                  dest = Path(os.environ["RUNNER_TEMP"]) / "impact-base"
+                  names = os.environ.get("IMPACT_FILES", "").split()
+                  if not names:
+                      raise BaseUnavailable("no-files-listed")
+                  derived = derive_base(os.environ)
+                  print("impact: derived base %s from github.sha %s"
+                        % (derived, os.environ.get("CONTEXT_SHA", "")))
+                  materialise(derived, dest, names)
+              except BaseUnavailable as exc:
+                  report(False, str(exc), gate_absent(derived))
+                  return 0
+              except (OSError, KeyError):
+                  report(False, "environment-unusable")
+                  return 0
+              report(True, "")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+      # decision: !cancelled() && over plain result check because a failed
+      # select must not skip the gated jobs
+      - name: Fold job results (base gate)
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && steps.base.outputs.ok == 'true' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GITHUB_REF_NAME_FULL: ${{ github.ref }}
+        run: |
+          python3 -I "$RUNNER_TEMP/impact-base/impact/gate.py" --needs "$NEEDS_JSON" \
+            --github-ref "$GITHUB_REF_NAME_FULL"
+      - name: Fold job results (bootstrap, PR-tree gate)
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap == 'true' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GITHUB_REF_NAME_FULL: ${{ github.ref }}
+        run: |
+          echo "ci-gate: bootstrap, the base sha has no scripts/ci/impact/gate.py; the PR-tree gate runs for this base only" >> "$GITHUB_STEP_SUMMARY"
+          python3 -I scripts/ci/impact/gate.py --needs "$NEEDS_JSON" \
+            --github-ref "$GITHUB_REF_NAME_FULL"
+      # The gate itself is unchanged: it still fails on any needed job that
+      # failed, was cancelled, or was skipped without a permitted reason.
+      - name: Fold job results (branch tip gate)
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GITHUB_REF_NAME_FULL: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "ci-gate: no live base needed (${EVENT_NAME}): the checked-out tree is the branch tip" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -I scripts/ci/impact/gate.py --needs "$NEEDS_JSON" \
+            --github-ref "$GITHUB_REF_NAME_FULL"
+      - name: Fail the gate (base gate unreadable)
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && steps.base.outputs.ok != 'true' && steps.base.outputs.bootstrap != 'true' }}
+        env:
+          IMPACT_REASON: ${{ steps.base.outputs.reason }}
+        run: |
+          echo "ci-gate: FAIL, the base gate could not be read (${IMPACT_REASON}); the PR-tree gate is never run" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1

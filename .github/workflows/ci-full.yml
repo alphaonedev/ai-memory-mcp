@@ -1,0 +1,83 @@
+# Nightly full run (#8240). Impact selection narrows pull-request CI; this
+# workflow keeps the full matrix honest by dispatching ci.yml every night,
+# waiting for the dispatched run, and failing (and filing one issue labelled
+# ci-full-red) when that run is not green. A dispatch is not a pull_request
+# event, so the selector in ci.yml always chooses the full matrix for it.
+#
+# GitHub fires `schedule` only from the default branch's copy of this file, so
+# the cron below runs against the default branch and becomes active once the
+# file is on the default branch (operator item, tracked on #8240). Until then
+# `workflow_dispatch` runs it by hand with a `ref` input (default: the branch
+# the workflow was dispatched from).
+name: CI full (nightly)
+
+on:
+  schedule:
+    # 03:17 UTC, off the hour to avoid the scheduler's top-of-hour queue.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to run the full CI on (default: this workflow's own ref)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-full-nightly
+  cancel-in-progress: false
+
+env:
+  # schedule: the default branch (github.ref_name); dispatch: the input, falling
+  # back to the ref the workflow was dispatched from. Never a hard-coded branch.
+  FULL_RUN_REF: ${{ (github.event_name == 'workflow_dispatch' && inputs.ref) || github.ref_name }}
+
+jobs:
+  dispatch-full-ci:
+    name: Dispatch full CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      conclusion: ${{ steps.wait.outputs.conclusion }}
+      run_url: ${{ steps.wait.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Dispatch ci.yml and wait for its conclusion
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 -I scripts/ci/ci_full_nightly.py dispatch --repo "$GH_REPO" \
+            --ref "$FULL_RUN_REF" --github-output "$GITHUB_OUTPUT"
+
+  # Aggregate: red when the dispatch job or the dispatched run is not green, so
+  # the nightly's own conclusion (and a dispatched run's) is the full run's.
+  ci-full-result:
+    name: CI full result
+    if: always()
+    needs:
+      - dispatch-full-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Fail on a red nightly and file one issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          JOB_RESULT: ${{ needs.dispatch-full-ci.result }}
+          CONCLUSION: ${{ needs.dispatch-full-ci.outputs.conclusion }}
+          RUN_URL: ${{ needs.dispatch-full-ci.outputs.run_url }}
+        run: |
+          python3 -I scripts/ci/ci_full_nightly.py report --repo "$GH_REPO" \
+            --ref "$FULL_RUN_REF" --job-result "$JOB_RESULT" \
+            --conclusion "$CONCLUSION" --run-url "$RUN_URL"
