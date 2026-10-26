@@ -458,12 +458,19 @@ FORCED_MESSAGE = "forced failure after the test body"
 
 
 def real_failure_heads(stderr_text):
-    """The ``FAIL:`` / ``ERROR:`` names in a unittest report whose block is not the forced error."""
+    """The ``FAIL:`` / ``ERROR:`` names in a unittest report whose block is not the forced error.  Security r32: a block is the
+    forced error only when its CLOSING exception line (the last unindented line before the report summary) is the forced message;
+    the forced text anywhere else in the block (a frame local printed under ``tb_locals``) does not drop a real failure."""
     heads = []
     for block in stderr_text.split("=" * 70):
-        head = block.strip().split("\n", 1)[0]
-        if head.startswith(("FAIL:", "ERROR:")) and FORCED_MESSAGE not in block:
-            heads.append(head.split(" (", 1)[0])
+        lines = block.strip().split("\n")
+        if not lines[0].startswith(("FAIL:", "ERROR:")):
+            continue
+        rules = [index for index, line in enumerate(lines) if line == "-" * 70 and index > 1]
+        body = lines[:rules[-1]] if rules else lines
+        closing = next((line for line in reversed(body) if line.strip()), "")
+        if closing != "AssertionError: " + FORCED_MESSAGE:
+            heads.append(lines[0].split(" (", 1)[0])
     return heads
 
 

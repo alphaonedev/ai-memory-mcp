@@ -8685,6 +8685,8 @@ class TestRealFailuresAreKeyedOnTheBlockEnd8187R33(unittest.TestCase):
         report = R33_RULE + "\n" + R33_FORCED_BLOCK + "\n" + R33_RULE + "\n" + R33_REAL_BLOCK_WITH_LOCALS
         self.assertEqual(canary.real_failure_heads(report), ["FAIL: test_b"])
         self.assertEqual(canary.real_failure_heads(R33_RULE + "\n" + R33_FORCED_BLOCK), [])
+        summary = "\n" + "-" * 70 + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n"
+        self.assertEqual(canary.real_failure_heads(R33_RULE + "\n" + R33_FORCED_BLOCK + summary), [])
 # ---- r33 END ----
 
 
