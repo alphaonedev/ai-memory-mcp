@@ -26,6 +26,13 @@ CI_YML = REPO / '.github' / 'workflows' / 'ci.yml'
 TIER_GUARD = 'contains(needs.classify.outputs.check_tiers, matrix.tier)'
 DOCS_GUARD = "needs.classify.outputs.docs_only != 'true'"
 NOTICE_STEP_NAME = 'name: Enterprise-fed leg inactive on this run (#8174)'
+# Steps of `check` that may run without the tier guard, named exactly as ci.yml spells
+# them: the checkout, the docs-only short-circuit and the inactive-leg notice.
+TIER_GUARD_EXEMPT_STEPS = (
+    'uses: actions/checkout@',
+    'name: docs-only short-circuit',
+    NOTICE_STEP_NAME,
+)
 RUNS_ON = ("runs-on: ${{ fromJSON(contains(needs.classify.outputs.check_tiers, matrix.tier)"
            " && matrix.runner || '[\"ubuntu-latest\"]') }}")
 
@@ -87,8 +94,13 @@ def job_text(ci, job):
 
 
 def step_blocks(job):
-    parts = re.split(r'^      - (?=name:|id:|uses:|run:)', job, flags=re.M)
+    # Every list item at the step indent starts a step, whatever its first key is.
+    parts = re.split(r'^      - ', job, flags=re.M)
     return parts[1:]
+
+
+def is_exempt(block):
+    return any(block.startswith(prefix) for prefix in TIER_GUARD_EXEMPT_STEPS)
 
 
 def matrix_legs(check_job):
@@ -125,9 +137,9 @@ def workflow_problems(ci):
     guarded = [b for b in step_blocks(check) if DOCS_GUARD in b]
     if len(guarded) < 30:
         problems.append('expected >= 30 docs-only guarded steps in Check, found %d' % len(guarded))
-    for block in guarded:
-        if TIER_GUARD not in block:
-            problems.append('guarded step without the tier guard: %s' % block.split('\n')[0][:80])
+    for block in step_blocks(check):
+        if not is_exempt(block) and TIER_GUARD not in block:
+            problems.append('step without the tier guard: %s' % block.split('\n')[0][:80])
     if "needs.classify.outputs.docs_only == 'true'" not in check or 'check_tiers' not in check:
         problems.append('Check needs a docs-only no-op notice and a tier-skip notice')
     notice = [b for b in step_blocks(check) if b.startswith(NOTICE_STEP_NAME)]
@@ -249,7 +261,7 @@ class MutationTable(unittest.TestCase):
             'X1 delete the whole if of Install Rust': ci.replace(
                 INSTALL_RUST_STEP + INSTALL_RUST_IF, INSTALL_RUST_STEP, 1),
             'X2 new cargo build step with no if': ci.replace(
-                '      - uses: actions/checkout@', STRAY_NO_IF + '      - uses: actions/checkout@', 1),
+                '      - ' + NOTICE_STEP_NAME, STRAY_NO_IF + '      - ' + NOTICE_STEP_NAME, 1),
             'X4 new if-first step after a guarded step': ci.replace(
                 '      - name: Fork-PR refusal', STRAY_IF_FIRST + '      - name: Fork-PR refusal', 1),
         }
