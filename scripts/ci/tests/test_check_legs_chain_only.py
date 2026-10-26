@@ -114,6 +114,44 @@ def is_exempt(block):
     return any(block.startswith(prefix) for prefix in TIER_GUARD_EXEMPT_STEPS)
 
 
+def step_field(block, key):
+    """Value of a step key at the step-body indent (8 spaces); block scalars are joined."""
+    lines = block.split('\n')
+    for i, line in enumerate(lines):
+        m = re.match(r'^(?:  |      - )?(?:        )?%s:(.*)$' % re.escape(key), line)
+        if not m or not (line.startswith('        ' + key + ':') or line.startswith(key + ':')):
+            continue
+        parts = [m.group(1).strip()]
+        for extra in lines[i + 1:]:
+            if extra.strip() and not extra.startswith('          '):
+                break
+            parts.append(extra.strip())
+        return ' '.join(p for p in parts if p and p not in ('>-', '>', '|', '|-'))
+    return None
+
+
+def top_level_conjuncts(expr):
+    """Split an expression on top-level &&; report whether a top-level || exists."""
+    depth, start, conj, has_or = 0, 0, [], False
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif depth == 0 and expr.startswith('&&', i):
+            conj.append(expr[start:i].strip())
+            start = i + 2
+            i += 1
+        elif depth == 0 and expr.startswith('||', i):
+            has_or = True
+            i += 1
+        i += 1
+    conj.append(expr[start:].strip())
+    return conj, has_or
+
+
 def matrix_legs(check_job):
     legs = []
     for block in re.split(r'^          - (?=leg: )', check_job, flags=re.M)[1:]:
@@ -149,8 +187,15 @@ def workflow_problems(ci):
     if len(guarded) < 30:
         problems.append('expected >= 30 docs-only guarded steps in Check, found %d' % len(guarded))
     for block in step_blocks(check):
-        if not is_exempt(block) and TIER_GUARD not in block:
-            problems.append('step without the tier guard: %s' % block.split('\n')[0][:80])
+        if is_exempt(block):
+            continue
+        name = block.split('\n')[0][:80]
+        cond = step_field(block, 'if')
+        conjuncts, has_or = top_level_conjuncts(cond or '')
+        if TIER_GUARD not in conjuncts:
+            problems.append('step without the tier guard as a top-level && conjunct: %s' % name)
+        if has_or:
+            problems.append('step guard has a top-level || (the tier guard can be bypassed): %s' % name)
     if "needs.classify.outputs.docs_only == 'true'" not in check or 'check_tiers' not in check:
         problems.append('Check needs a docs-only no-op notice and a tier-skip notice')
     notice = [b for b in step_blocks(check) if b.startswith(NOTICE_STEP_NAME)]
@@ -160,6 +205,8 @@ def workflow_problems(ci):
         block = notice[0]
         if ("if: " + DOCS_GUARD + " && !" + TIER_GUARD) not in block:
             problems.append('inactive-leg notice must run exactly when the tier is inactive')
+        if '${{' in (step_field(block, 'run') or ''):
+            problems.append('github context must not be inlined into the notice script body')
         for needle in ('::notice::', '$GITHUB_STEP_SUMMARY', 'LEG: ${{ matrix.leg }}',
                        'EVENT_NAME: ${{ github.event_name }}', 'HEAD_REF: ${{ github.head_ref }}',
                        'BASE_REF: ${{ github.base_ref }}', 'chain/*) ;;', 'exit 1',
@@ -178,8 +225,12 @@ def workflow_problems(ci):
                        'BASE_REF: ${{ github.base_ref }}', 'python3 -I scripts/ci/check_legs.py', '--github-output "$GITHUB_OUTPUT"'):
             if needle not in body:
                 problems.append('classify legs step missing %r' % needle)
-        if re.search(r'run:[^\n]*\$\{\{', body.split('env:')[0] if 'env:' in body else body):
+        legs_run = step_field(body, 'run') or ''
+        if '${{' in legs_run:
             problems.append('github context must not be inlined into the legs script body')
+        for key in ('if', 'continue-on-error'):
+            if step_field(body, key) is not None:
+                problems.append('the legs step must have no %s (a failed classify must stay red)' % key)
     return problems
 
 
