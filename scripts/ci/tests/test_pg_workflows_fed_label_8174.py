@@ -34,6 +34,20 @@ every node):
       equal ``ENV_KEYS_BY_WORKFLOW`` (a new, removed or renamed key is a named defect), and the step has
       exactly one ``name`` key. Maintenance cost: an edit to the workflow header (triggers, permissions,
       concurrency, env, job keys) is made in the same PR as the matching edit to the skeleton tuples.
+      The skeleton stops at indent 6, so two more pins cover what it cannot see. (1) Deep lines: any
+      non-blank, non-comment line at indent 6 or deeper above the job's ``    steps:`` line and outside a
+      block scalar is a named defect (a plain-scalar continuation there changes the value YAML reads while
+      every skeleton line stays equal); neither live workflow has one (census: 0 per file). (2) Step list:
+      every non-blank, non-comment line after ``    steps:`` to the end of the job, at every indent and
+      outside block scalars, is pinned as a literal tuple (``EXPECTED_STEPS_IGNORED`` /
+      ``EXPECTED_STEPS_CERT``), so an added, removed, reordered or changed step, ``uses:`` ref, ``with:`` or
+      ``env:`` entry, and a deep continuation inside a step are named defects with line numbers. Block
+      scalar content (the ``run:`` bodies) is outside both pins; the Point-at run text is pinned by the body
+      check above. Maintenance cost: an edit to any step key line of either workflow is made in the same PR
+      as the matching edit to the step-list tuple. U+0085, U+2028, U+2029 and a CR before the last character
+      are refused anywhere in the file: PyYAML ends a line at each of them but a ``\n`` split does not, so a
+      comment line carrying one can hide a key line from every line-based pin (membership test, not
+      ``str.splitlines()``, so the reported line numbers stay the LF ones).
       No shell is lexed, so no bash text shape can be misread. A comment, a flag or a word
       changed inside the step is refused on purpose. Maintenance cost: the expected tuples are
       updated in the same PR as any edit to the step. The step's extent runs to the next non-blank
@@ -352,6 +366,79 @@ EXPECTED_SKELETON_CERT = (
     '    timeout-minutes: 60',
     '    steps:',
 )
+# decision: pin the pinned job's complete step list as a literal tuple at every indent and refuse any deep
+# line above steps: over adding per-step regexes for the earlier steps, because the r11 skeleton pin already
+# proved a literal tuple refuses every added or changed line in any spelling and extending its reach to the
+# step list and the deep lines closes both r11 findings with the same mechanism (precedent PR 8252 e1e4b84f7;
+# LOW with precedent, no vote).
+# The step-list tuples are copied from the workflows, never built from them at test time.
+EXPECTED_STEPS_IGNORED = (
+    '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4',
+    '      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)',
+    "        if: runner.environment != 'github-hosted'",
+    '        shell: bash',
+    '        run: |',
+    '      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)',
+    '        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0',
+    '      - name: Point at the native enterprise-fed tier (per-job ephemeral db)',
+    '        run: |',
+    '      - name: cargo test --features sal-postgres -- --ignored',
+    '        run: |',
+    '      - name: Cleanup enterprise-fed ephemeral db',
+    '        if: always()',
+    '        run: |',
+    '      - name: Sweep target/debug to the size cap (self-hosted)',
+    "        if: always() && runner.environment == 'self-hosted'",
+    '        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}',
+)
+EXPECTED_STEPS_CERT = (
+    '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4',
+    '      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)',
+    "        if: runner.environment != 'github-hosted'",
+    '        shell: bash',
+    '        run: |',
+    '      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)',
+    '        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0',
+    '        with:',
+    '          components: clippy',
+    '      - name: Point at the native enterprise-fed tier (per-job ephemeral db)',
+    '        run: |',
+    '      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2',
+    "        if: runner.environment == 'github-hosted'",
+    '      - name: Resolve certified stack pins from deploy SSOT',
+    '        run: |',
+    '      - name: Wait for native tier readiness',
+    '        run: |',
+    '      - name: Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)',
+    '        run: |',
+    '      - name: Assert certified stack versions (cert evidence, hard-fail on drift)',
+    '        run: |',
+    '      - name: Run #[ignore]-gated pg + AGE cells against the certified stack',
+    '        run: |',
+    '      - name: Cluster-A cert-posture armability gate (#3061 #3016 #3067)',
+    '        run: |',
+    '      - name: Redact cert-bootstrap evidence on failure',
+    '        if: failure()',
+    '        run: |',
+    '      - name: Upload cert-bootstrap evidence on failure',
+    '        if: failure()',
+    '        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5',
+    '        with:',
+    '          name: cert-bootstrap-evidence-${{ github.run_id }}-${{ github.run_attempt }}',
+    '          path: .local-runs/cert-bootstrap-evidence-redacted/',
+    '          if-no-files-found: ignore',
+    '          retention-days: 7',
+    '      - name: Cleanup enterprise-fed ephemeral db',
+    '        if: always()',
+    '        run: |',
+    '      - name: Sweep target/debug to the size cap (self-hosted)',
+    "        if: always() && runner.environment == 'self-hosted'",
+    '        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}',
+)
+STEPS_BY_WORKFLOW = {
+    "postgres-ignored.yml": EXPECTED_STEPS_IGNORED,
+    "cert-postgres-age.yml": EXPECTED_STEPS_CERT,
+}
 SKELETON_BY_WORKFLOW = {
     "postgres-ignored.yml": EXPECTED_SKELETON_IGNORED,
     "cert-postgres-age.yml": EXPECTED_SKELETON_CERT,
@@ -363,6 +450,9 @@ BLOCK_SCALAR_RX = re.compile(r"(?:^|[\s:\-])[|>][+-]?\d?[+-]?(?:[ \t]+#.*)?$")
 SPELL_ANY_KEY_LEADS = "?&!*<"
 QUOTED_BACKSLASH_RX = re.compile(r"[\"'][^\"']*\\")
 NO_JOBS_DEFECT = "workflow has no exact jobs: line at indent 0"
+NO_STEPS_DEFECT = "workflow has no exact steps: line at indent 4"
+STEPS_LINE = "    steps:"
+YAML_ONLY_BREAKS = ("\x85", "\u2028", "\u2029", "\r")
 
 
 def indent_of(line):
@@ -380,10 +470,20 @@ def as_lines(source):
     return lines_of(source) if isinstance(source, Path) else list(source)
 
 
-def skeleton_of(lines):
-    """``(1-based file line number, text)`` of every skeleton line: non-blank, non-comment, indent below 6,
-    outside a block scalar (``|`` or ``>`` and their chomping forms), trailing whitespace stripped."""
-    found = []
+def key_column(text):
+    """Column of the first mapping key on ``text``: the indent plus any ``- `` list-item prefixes."""
+    column = indent_of(text)
+    rest = text[column:]
+    while rest.startswith("- "):
+        trimmed = rest[2:].lstrip(" ")
+        column += len(rest) - len(trimmed)
+        rest = trimmed
+    return column
+
+
+def code_lines(lines):
+    """``(1-based file line number, indent, text)`` of every non-blank, non-comment line outside a block
+    scalar (``|`` or ``>`` and their chomping forms), trailing whitespace stripped, in file order."""
     block_above = None
     for number, line in enumerate(lines, 1):
         if is_skipped(line):
@@ -395,16 +495,39 @@ def skeleton_of(lines):
             block_above = None
         text = line.rstrip(PIN_WS)
         if BLOCK_SCALAR_RX.search(text):
-            block_above = indent
+            block_above = key_column(text)
+        yield number, indent, text
+
+
+def skeleton_of(lines):
+    """``(1-based file line number, text)`` of every skeleton line: a ``code_lines`` line at indent below 6."""
+    return [(number, text) for number, indent, text in code_lines(lines) if indent < SKELETON_INDENT]
+
+
+def steps_line(lines):
+    """1-based number of the first exact ``    steps:`` line, or ``None``."""
+    return next((n for n, ln in enumerate(lines, 1) if ln.rstrip(PIN_WS) == STEPS_LINE), None)
+
+
+def step_list_of(lines):
+    """``(number, text)`` of every ``code_lines`` line, at any indent, after ``    steps:`` up to the first line
+    at indent below 6 (the end of the job); block-scalar content is outside it (the run-text pin owns it)."""
+    first = steps_line(lines)
+    if first is None:
+        return []
+    found = []
+    for number, indent, text in code_lines(lines):
+        if number <= first:
+            continue
         if indent < SKELETON_INDENT:
-            found.append((number, text))
+            break
+        found.append((number, text))
     return found
 
 
-def skeleton_defects(lines, workflow):
-    """Named defects of every added, removed, changed or reordered skeleton line, in file order."""
-    expected = SKELETON_BY_WORKFLOW[workflow]
-    live = skeleton_of(lines)
+def pin_defects(live, expected, label, total):
+    """Named defects of every added, removed, changed or reordered line of ``live`` against ``expected``;
+    ``label`` names the pin in each message and ``total`` is the file's line count."""
     matcher = SequenceMatcher(None, [text for _, text in live], list(expected), autojunk=False)
     added, changed, removed = [], [], []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -413,13 +536,52 @@ def skeleton_defects(lines, workflow):
         pair = min(i2 - i1, j2 - j1) if tag == "replace" else 0
         changed += [(live[i1 + k][0], live[i1 + k][1], expected[j1 + k]) for k in range(pair)]
         added += live[i1 + pair : i2]
-        before = live[i1][0] if i1 < len(live) else len(lines) + 1
+        before = live[i1][0] if i1 < len(live) else total + 1
         removed += [(before, expected[k]) for k in range(j1 + pair, j2)]
     moved = {text for _, text in added} & {text for _, text in removed}
-    found = [(n, "skeleton line %d %s: %s" % (n, "reordered" if t in moved else "added", t)) for n, t in added]
-    found += [(n, "skeleton line %d changed: %s (expected: %s)" % (n, t, want)) for n, t, want in changed]
-    found += [(n, "skeleton line removed before line %d: %s" % (n, t)) for n, t in removed if t not in moved]
+    found = [(n, "%s line %d %s: %s" % (label, n, "reordered" if t in moved else "added", t)) for n, t in added]
+    found += [(n, "%s line %d changed: %s (expected: %s)" % (label, n, t, want)) for n, t, want in changed]
+    found += [(n, "%s line removed before line %d: %s" % (label, n, t)) for n, t in removed if t not in moved]
     return [message for _, message in sorted(found, key=lambda item: item[0])]
+
+
+def skeleton_defects(lines, workflow):
+    """Named defects of every added, removed, changed or reordered skeleton line, in file order."""
+    return pin_defects(skeleton_of(lines), SKELETON_BY_WORKFLOW[workflow], "skeleton", len(lines))
+
+
+def step_list_defects(lines, workflow):
+    """Named defects of every added, removed, changed or reordered line of the whole step list."""
+    return pin_defects(step_list_of(lines), STEPS_BY_WORKFLOW[workflow], "step-list", len(lines))
+
+
+def deep_line_defects(lines):
+    """Every ``code_lines`` line at indent 6 or deeper above ``    steps:``: a plain-scalar continuation there
+    changes the value YAML reads while every skeleton line stays equal. Comments are never code lines."""
+    first = steps_line(lines)
+    if first is None:
+        return [NO_STEPS_DEFECT]
+    return [
+        "deep line %d above steps: (indent %d): %s" % (number, indent, text.strip())
+        for number, indent, text in code_lines(lines)
+        if number < first and indent >= SKELETON_INDENT
+    ]
+
+
+def line_break_defects(lines):
+    """Every line carrying U+0085, U+2028, U+2029 or a CR before the last character. These end a line for
+    PyYAML but not for the LF split, so a line-based pin sees one comment line where YAML reads a key
+    (a membership test, not ``str.splitlines()``, so the file's own line numbers stay the LF ones)."""
+    found = []
+    for number, line in enumerate(lines, 1):
+        body = line.rstrip("\r")
+        for ch in YAML_ONLY_BREAKS:
+            if ch in body:
+                found.append(
+                    "line %d carries U+%04X (a line break for YAML, not for the LF split): %s"
+                    % (number, ord(ch), ascii(line.strip(PIN_WS)))
+                )
+    return found
 
 
 def skeleton_form_defects(lines):
@@ -501,7 +663,10 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
     ``run: |`` equal the pinned tuple for that workflow; ``ensure-age-extension.py`` and ``RUNNER_OS``
     occur nowhere outside that block (so the workflow-level ``env:`` block cannot carry ``RUNNER_OS``);
     exactly one ``name`` key; the workflow skeleton equals the pinned tuple (``skeleton_defects``), no
-    skeleton line has a key-spelling form (``skeleton_form_defects``) and an exact ``jobs:`` line exists.
+    skeleton line has a key-spelling form (``skeleton_form_defects``), an exact ``jobs:`` line exists, the
+    whole step list equals the pinned tuple (``step_list_defects``), no code line at indent 6 or deeper
+    sits above ``    steps:`` (``deep_line_defects``) and no line carries a YAML-only line break
+    (``line_break_defects``).
     A ``Path`` selects the pinned tuple by file name; in-memory lines take ``workflow`` (default
     ``postgres-ignored.yml``).
     """
@@ -576,6 +741,9 @@ def heal_defects(source, workflow="postgres-ignored.yml"):
     defects += env_defects(lines, name)
     defects += skeleton_defects(lines, name)
     defects += skeleton_form_defects(lines)
+    defects += step_list_defects(lines, name)
+    defects += deep_line_defects(lines)
+    defects += line_break_defects(lines)
     if not any(ln.rstrip(PIN_WS) == "jobs:" for ln in lines):
         defects.append(NO_JOBS_DEFECT)
     for i, ln in enumerate(lines):
@@ -893,8 +1061,13 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         self.assertEqual(len(got), 1, got)
         self.assertIn("occurs 2 times, expected exactly 1", got[0])
 
+    def _key_then_step_list(self, got, key):
+        """The step-key defect first, then only step-list defects (the added key line is a step-list line)."""
+        self.assertEqual(got[0], "step has a key other than name and run: " + key, got)
+        self.assertTrue(len(got) == 2 and got[1].startswith("step-list line "), got)
+
     def test_m34_shell_key_on_the_step_is_refused(self):
-        self.assertEqual(self._row("M34"), ["step has a key other than name and run: shell"])
+        self._key_then_step_list(self._row("M34"), "shell")
 
     def test_m35_runner_os_in_the_workflow_level_env_block_is_refused(self):
         self.assertEqual(
@@ -1005,9 +1178,7 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         lines = insert_lines(idx, where, new)
         if yaml is not None:
             self.assertEqual(yaml_step_keys(lines), ["name", "run", key])
-        self.assertEqual(
-            heal_defects(lines, WORKFLOWS[idx].name), ["step has a key other than name and run: " + key]
-        )
+        self._key_then_step_list(heal_defects(lines, WORKFLOWS[idx].name), key)
 
     def test_m36_key_after_the_indent_6_comment_block_is_refused(self):
         """sec r8 H1 (cert)."""
@@ -1166,10 +1337,11 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
                     env = doc["env"] if level == "workflow" else doc["jobs"][job]["env"]
                     self.assertIn(key, env)
                 skeleton_line = "  %s: %s" % (key, value) if level == "workflow" else "    env:"
-                self.assertEqual(
-                    heal_defects(lines, WORKFLOWS[idx].name),
-                    ["%s-level env key added: %s" % (level, key), self._added(idx, old, new, skeleton_line)],
-                )
+                want = ["%s-level env key added: %s" % (level, key), self._added(idx, old, new, skeleton_line)]
+                if level == "job":  # the env entry sits at indent 6 above steps: a deep line
+                    at = next(n for n, ln in enumerate(lines, 1) if ln.rstrip() == "      %s: %s" % (key, value))
+                    want.append("deep line %d above steps: (indent 6): %s: %s" % (at, key, value))
+                self.assertEqual(heal_defects(lines, WORKFLOWS[idx].name), want)
 
     def test_m51_bash_env_at_workflow_level_is_refused(self):
         """security r9 F1: BASH_ENV changes what the pinned step executes."""
