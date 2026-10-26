@@ -1738,5 +1738,43 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
                 )
 
 
+    # Round 13 rows (code r12 F2 LOW = security r12 F2 LOW): the run text of every step of the pinned job is
+    # pinned byte for byte, so a changed body of a step BEFORE the pinned step is a named defect too.
+    RUSTUP_END = "            exit 1\n          }\n"
+
+    def _earlier_body_row(self, new, prefix, fragment):
+        """Both workflows: the Assert rustup run body is changed to ``new``; the pin names a ``prefix`` defect."""
+        self._r12_each(self.RUSTUP_END, new, prefix, fragment)
+
+    def test_m94_earlier_run_body_writing_bash_env_to_the_job_env_file_is_refused(self):
+        """code r12 F2: the Assert rustup body gains a BASH_ENV write that the pinned step's bash then honours."""
+        self._earlier_body_row(
+            self.RUSTUP_END + '          echo "BASH_ENV=$HOME/x" >> "$GITHUB_ENV"\n', "run-body line ", "GITHUB_ENV"
+        )
+
+    def test_m95_earlier_run_body_writing_the_job_path_file_is_refused(self):
+        """code r12 F2: the Assert rustup body gains a ``$GITHUB_PATH`` write."""
+        self._earlier_body_row(
+            self.RUSTUP_END + '          echo "$HOME/x" >> "$GITHUB_PATH"\n', "run-body line ", "GITHUB_PATH"
+        )
+
+    def test_m96_earlier_run_body_losing_its_fail_closed_exit_is_refused(self):
+        """code r12 F2: the Assert rustup body without ``exit 1`` no longer fails closed."""
+        self._earlier_body_row("          }\n", "run-body line removed", "exit 1")
+
+    def test_m97_control_a_comment_line_added_to_an_earlier_run_body_is_refused_too(self):
+        """Control: the run-text pin is byte for byte, so even a comment inside an earlier body is a named defect."""
+        self._earlier_body_row(self.RUSTUP_END + "          # note\n", "run-body line ", "# note")
+
+    def test_m98_control_the_live_run_bodies_equal_the_pinned_tuples(self):
+        """Control: one pinned run-body tuple per workflow, equal to the live text, and no defect."""
+        for path in WORKFLOWS:
+            with self.subTest(workflow=path.name):
+                live = tuple(text for _, text in run_bodies_of(lines_of(path)))
+                self.assertEqual(live, tuple(RUN_BODIES_BY_WORKFLOW[path.name]))
+                self.assertEqual(run_body_defects(lines_of(path), path.name), [])
+                self.assertEqual(heal_defects(path), [])
+
+
 if __name__ == "__main__":
     unittest.main()
