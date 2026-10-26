@@ -639,6 +639,17 @@ PLANT_SHAPES = {
              "else:\n    print(v)\n"),
 }
 
+# r31 (code r30 F1, security r30 F1): the value leaves through the test's OWN failure report, which the forced hook must not replace;
+# each plant fails for real, so a hook that raised its own error over it would hide the value
+PLANT_FAILURES = {
+    "r31 raise ValueError(v)": "raise ValueError(v)\n",
+    "r31 self.fail(v)": "self.fail(v)\n",
+    "r31 assertEqual(v, 'x')": "self.assertEqual(v, 'x')\n",
+    "r31 assertEqual(v.encode(), b'x')": "self.assertEqual(v.encode(), b'x')\n",
+    "r31 assertTrue(False, msg=v)": "self.assertTrue(False, msg=v)\n",
+    "r31 assertIn(v, [])": "self.assertIn(v, [])\n",
+}
+
 # the 12 inserts of the security r28 review that the r28 exempt-function check passed; ``{p}`` is the parameter of the function
 PLANT_INSERTS = {
     "Y1 yaml.dump(V, sys.stderr)": "    import sys, yaml\n    yaml.dump({p}, sys.stderr)\n",
@@ -678,8 +689,11 @@ def plant_source(source, extra, body, function=None, insert=None):
 
 def planted_catalogue(source):
     """``{category: {name: planted module source}}`` for a module ``source``: ``transforms`` (14), ``shapes`` (31) and
-    ``inserts`` (12 = 4 inserts x 3 exempt functions) and ``controls`` (4, none may be caught)."""
-    catalogue = {"transforms": {}, "shapes": {}, "inserts": {}, "controls": {}}
+    ``inserts`` (12 = 4 inserts x 3 exempt functions), ``failures`` (6, the value leaves through the test's own failure
+    report) and ``controls`` (4, none may be caught)."""
+    catalogue = {"transforms": {}, "shapes": {}, "inserts": {}, "controls": {}, "failures": {}}
+    for name, body in PLANT_FAILURES.items():
+        catalogue["failures"][name] = plant_source(source, "", body)
     for name, body in PLANT_CONTROLS.items():
         catalogue["controls"][name] = plant_source(source, "", body)
     for name, statement in PLANT_TRANSFORMS.items():
@@ -693,7 +707,7 @@ def planted_catalogue(source):
     return catalogue
 
 
-def run_planted(repo_root, work_dir, marker, interpreter, categories=("transforms", "shapes", "inserts", "controls"), runners=None, workers=None,
+def run_planted(repo_root, work_dir, marker, interpreter, categories=("transforms", "shapes", "inserts", "controls", "failures"), runners=None, workers=None,
                 names=None, modes=("normal", "forced")):
     """Plant every echo in a copy of the module and run it under unittest (normal and forced) and, where pytest is installed,
     pytest (normal and forced, or only ``modes``); ``names`` limits the plants.  Returns ``{category: [(name, caught, transforms seen, legs)]}``."""

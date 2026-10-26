@@ -8327,6 +8327,19 @@ class TestRuntimeCanaryRunsTheWholeModule8187R29(unittest.TestCase):
         self.assertEqual([(name, caught) for name, caught, _seen, _legs in outcome["transforms"]], [("identity", True)])
         self.assertEqual([(name, caught) for name, caught, _seen, _legs in outcome["controls"]], [("control a count", False)])
 
+    def test_a_value_in_a_real_failure_report_is_caught_in_forced_mode_8187_r31(self):
+        """Code r30 F1 / security r30 F1: CI runs only the forced mode, and a hook that raised its own error at every test return
+        replaced the test's real exception, ``self.fail`` and assertion messages, so a value in them was never scanned.
+        decision: force only passing tests over replacing every outcome because the canary must still read the real failure reports CI produces."""
+        here = canary.probe_interpreter(sys.executable)
+        marker = canary.mint_marker()
+        with self.scratch() as raw:
+            outcome, _ = canary.run_planted(ROOT, raw, marker, here, categories=("failures", "controls"), runners=("unittest",),
+                                            names=set(canary.PLANT_FAILURES) | {"control a failing constant"}, modes=("forced",))
+        self.assertEqual([(name, caught) for name, caught, _seen, _legs in outcome["failures"]],
+                         [(name, True) for name in canary.PLANT_FAILURES])
+        self.assertEqual([(name, caught) for name, caught, _seen, _legs in outcome["controls"]], [("control a failing constant", False)])
+
     @unittest.skipIf(not CANARY_IS_FULL, "set TIER_CANARY_FULL_8187=1 for the full matrix")
     def test_the_full_matrix_finds_nothing_and_the_union_runs_every_test(self):
         chosen = canary.pick_interpreters(canary.discover_interpreters())
