@@ -8346,6 +8346,8 @@ class TestRuntimeCanaryRunsTheWholeModule8187R29(unittest.TestCase):
             lines = canary.describe_results(results)
         print("canary default plan (marker sha256 %s):" % canary.marker_label(marker), *lines, *notes, sep="\n  ")
         self.assertEqual(canary.describe_hits(results), [], CANARY_AUTHORITY)
+        # r31: with the hook fix a test that fails on its own shows its real report, so the child must fail only by the forced error
+        self.assertEqual([name for result in results for name in result.real_failures], [], "a test failed on its own in the canary copy")
         for result in results:
             with self.subTest(run=result.label):
                 self.assertEqual(result.error, "")

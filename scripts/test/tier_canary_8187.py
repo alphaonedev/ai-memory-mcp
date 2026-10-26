@@ -412,6 +412,7 @@ class RunResult:
         self.seconds = 0.0
         self.hits = []        # (transform name, channel, byte offset)
         self.counts = {}      # ran, skipped, failures, errors
+        self.real_failures = []  # r31: failures and errors that are not the forced error (a test that failed on its own)
         self.ran = set()
         self.skipped = set()
         self.error = ""
@@ -484,6 +485,11 @@ def run_child(leg, copy, snapshot, marker, out_root, name=CANARY_MODULE, only=No
     for channel, data in channels:
         for transform, offset in scan_bytes(data, marker):
             result.hits.append((transform, channel, offset))
+    if runner == "unittest":
+        for block in channels[1][1].decode("utf-8", "replace").split("=" * 70):
+            head = block.strip().split("\n", 1)[0]
+            if head.startswith(("FAIL:", "ERROR:")) and "forced failure after the test body" not in block:
+                result.real_failures.append(head.split(" (", 1)[0])
     if runner == "unittest" and (out_dir / "unittest.json").exists():
         data = json.loads((out_dir / "unittest.json").read_text(encoding="utf-8"))
         result.ran, result.skipped = set(data["ran"]), set(data["skipped"])
