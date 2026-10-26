@@ -409,6 +409,21 @@ def scan_mutants(ci):
             tail, '        note: "a\n  fakejob:\n  b"\n        continue-on-error: true\n' + tail, 1)
         rows['m13b %s followed-by key repeated inside a quoted scalar' % job] = ci.replace(
             tail, '        note: "a\n  %s:\n  b"\n' % following + tail, 1)
+    # #8174 code r6 F1 (m14, m15): a tagged escaped key, an alias key whose anchor sits in another
+    # job, and a fake block-scalar header opened inside a multi-line quoted scalar.
+    lint_name = '    name: Lint (fmt + clippy)\n'
+    positions = (('check job level', check_job, '    '), ('check step level', check_step, '        '),
+                 ('classify job level', cls_job, '    '), ('classify step level', cls_step, '        '))
+    for scope, anchor, indent in positions:
+        for tag, label in (('!!str', 'm14a'), ('!<tag:yaml.org,2002:str>', 'm14b')):
+            rows['%s tagged escaped key, %s' % (label, scope)] = ci.replace(
+                anchor, anchor + '%s%s "continue\\x2don-error": true\n' % (indent, tag), 1)
+        defined = ci.replace(lint_name, lint_name + '    x: &coe continue-on-error\n', 1)
+        rows['m14c alias key, anchor in another job, %s' % scope] = defined.replace(
+            anchor, anchor + '%s*coe : true\n' % indent, 1)
+    for job, anchor in (('check', check_step), ('classify', cls_step)):
+        rows['m15 %s fake block header in a quoted scalar hides a tagged key' % job] = ci.replace(
+            anchor, anchor + '        note: "a\n     b: |\n"\n        !!str "continue\\x2don-error": true\n', 1)
     return rows
 
 
