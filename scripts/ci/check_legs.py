@@ -30,9 +30,10 @@ Rule, one place:
 Fail closed: an event this script does not recognise runs everything.
 
 The workflow keeps all four legs (the check names never change). A leg whose
-tier is inactive is rerouted to a hosted runner and every step is skipped, the
-same no-op shape the docs-only path already uses, so no self-hosted runner is
-held and the contexts still report.
+tier is inactive is rerouted to a hosted runner: the checkout and the notice
+step run and the tier-guarded steps are skipped, the same no-op shape the
+docs-only path already uses, so no self-hosted runner is held and the contexts
+still report.
 
 Usage (in the ``classify`` job, context passed through env, never inlined):
     EVENT_NAME=pull_request HEAD_REF=fix/x BASE_REF=chain/x python3 -I scripts/ci/check_legs.py \\

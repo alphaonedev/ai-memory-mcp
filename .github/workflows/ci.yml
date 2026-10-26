@@ -670,8 +670,8 @@ jobs:
   # #8174 - CHAIN-ONLY ENTERPRISE-FED LEGS. All four legs always exist (the
   # check names never change), but on a topic-branch `pull_request` only the
   # two sqlite legs do work: the two enterprise-fed legs are rerouted to a
-  # hosted runner with every step skipped, so no linux-fed / macos-fed runner is
-  # held (a full linux-fed leg held a runner 2h09-2h37 per PR run, green or red).
+  # hosted runner (checkout and notice run, tier-guarded steps skipped), so no
+  # linux-fed / macos-fed runner is held (a full linux-fed leg held a runner 2h09-2h37 per PR run, green or red).
   # Chain/ carrier PRs, PRs into a non-chain base (release/**, rehearsal/**, main,
   # develop), pushes and merge_group runs keep all four.
   # The decision lives in scripts/ci/check_legs.py (classify output
@@ -691,9 +691,10 @@ jobs:
     # `["ubuntu-latest"]` is the hosted form; `["self-hosted","linux-fed"]` is
     # the label-set form. macOS is unchanged (operator directive is Linux-only).
     # #8174 - an INACTIVE tier (the enterprise-fed legs on a topic-branch PR)
-    # is rerouted to a hosted runner and every step below is skipped, so the
-    # check name still reports (the contexts are mirrored as required) but no
-    # self-hosted runner is held. Same no-op shape as the docs-only path.
+    # is rerouted to a hosted runner. The checkout and the inactive-leg notice
+    # step run there; every tier-guarded step is skipped, so the check name
+    # still reports (the contexts are mirrored as required) but no self-hosted
+    # runner is held. Same no-op shape as the docs-only path.
     runs-on: ${{ fromJSON(contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.runner || '["ubuntu-latest"]') }}
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
