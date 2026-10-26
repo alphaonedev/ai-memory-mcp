@@ -324,8 +324,13 @@ mod tests {
         let screened = screen_dsn(&dsn);
         assert_eq!(screened.removed_positions, vec![2, 3, 4, 6]);
         let out = screened.dsn.as_ref();
-        for secret in ["S1", "S2", "S3", "S4"] {
-            assert!(!out.contains(secret), "{secret} survived: {out}");
+        // #6098 / #6351 — failures name the fixture by index; neither the
+        // fixture nor the rendering that would carry it is echoed.
+        for (fixture_idx, fixture) in ["S1", "S2", "S3", "S4"].into_iter().enumerate() {
+            assert!(
+                !out.contains(fixture),
+                "credential fixture #{fixture_idx} survived screening"
+            );
         }
         let url = reqwest::Url::parse(out).expect("screened DSN parses");
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -403,7 +408,7 @@ mod tests {
             "the text floor pinned the host, so sqlx's parse is what failed: {err:?}"
         );
         for rendering in [format!("{err}"), format!("{err:?}")] {
-            for secret in [
+            for (fixture_idx, fixture) in [
                 "pasted-s3cr3t-4934",
                 "userinfo-s3cr3t",
                 "ssl-p4ss",
@@ -412,10 +417,13 @@ mod tests {
                 "password",
                 "svc-alice",
                 "?",
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 assert!(
-                    !rendering.contains(secret),
-                    "#4934: {secret} reached the parse error: {rendering}"
+                    !rendering.contains(fixture),
+                    "#4934: credential fixture #{fixture_idx} reached the parse error"
                 );
             }
             assert!(
@@ -428,8 +436,14 @@ mod tests {
         let err = evaluate(dsn).expect_err("a non-numeric port must not parse");
         let shown = format!("{err}");
         assert!(shown.contains("db.internal"), "{shown}");
-        for secret in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"] {
-            assert!(!shown.contains(secret), "leaked {secret}: {shown}");
+        for (fixture_idx, fixture) in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                !shown.contains(fixture),
+                "credential fixture #{fixture_idx} leaked into the parse error"
+            );
         }
     }
 }
