@@ -422,6 +422,19 @@ class WorkflowWiring(unittest.TestCase):
                 "'continue-on-error: true')" % line_no)
         self.assertIn(want, workflow_problems(mutated))
 
+    def test_continue_on_error_controls_pass(self):
+        # #8174 security r5 F1 controls: a comment carrying the word inside the check job passes
+        # (comments do not execute); the key inside a different job is out of scope.
+        ci = CI_YML.read_text()
+        m9x = ci.replace('      - name: docs-only short-circuit\n',
+                         '      # continue-on-error: true\n      - name: docs-only short-circuit\n', 1)
+        m9y = ci.replace('    name: Lint (fmt + clippy)\n',
+                         '    name: Lint (fmt + clippy)\n    continue-on-error: true\n', 1)
+        for name, text in (('m9x', m9x), ('m9y', m9y)):
+            with self.subTest(name):
+                self.assertNotEqual(text, ci, 'control did not apply')
+                self.assertEqual(workflow_problems(text), [], name)
+
     def test_notice_escapes_hostile_refs(self):
         # #8174 security r2 F1: `%` is a legal refname byte and the runner decodes it.
         self.assertEqual(notice_escape_problems(CI_YML.read_text()), [])
@@ -511,6 +524,25 @@ class MutationTable(unittest.TestCase):
                 '      - name: docs-only short-circuit\n        continue-on-error:true\n', 1),
             'm8d continue-on-error on a classify step': ci.replace(
                 '      - id: cls\n', '      - id: cls\n        continue-on-error: true\n', 1),
+            # #8174 security r5 F1 (m9a-m9f): every other spelling of continue-on-error.
+            'm9a step-first key on a check step': ci.replace(
+                '      - name: Run tests (impact-aware)\n',
+                '      - continue-on-error: true\n        name: Run tests (impact-aware)\n', 1),
+            'm9b double-quoted key on a check step': ci.replace(
+                '      - name: docs-only short-circuit\n',
+                '      - name: docs-only short-circuit\n        "continue-on-error": true\n', 1),
+            'm9c single-quoted key at job level on check': ci.replace(
+                '    name: Check (${{ matrix.leg }})\n',
+                "    name: Check (${{ matrix.leg }})\n    'continue-on-error': true\n", 1),
+            'm9d step-first key on the classify step that runs this pin': ci.replace(
+                '      - name: Shard partition and wiring unit tests (#6344)\n',
+                '      - continue-on-error: true\n        name: Shard partition and wiring unit tests (#6344)\n', 1),
+            'm9e explicit-key form': ci.replace(
+                '      - name: docs-only short-circuit\n',
+                '      - name: docs-only short-circuit\n        ? continue-on-error\n        : true\n', 1),
+            'm9f escaped double-quoted key': ci.replace(
+                '      - name: docs-only short-circuit\n',
+                '      - name: docs-only short-circuit\n        "continue\\x2don-error": true\n', 1),
         }
 
     def test_every_script_mutant_fails_the_behaviour_pins(self):
