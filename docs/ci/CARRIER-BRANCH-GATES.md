@@ -198,9 +198,9 @@ get none, which is why those keep the real legs). The rule is one function,
 `active_tiers` in `scripts/ci/check_legs.py`, exported as the `classify` output
 `check_tiers`; pins: `scripts/ci/tests/test_check_legs_chain_only.py`.
 
-`check_legs.py` fails closed on malformed input: it exits 2
-(`EXIT_MALFORMED_EVENT`) on an empty event name, and on a `pull_request` with an
-empty head ref or an empty base ref, printing a `check_legs: ...` message
+`check_legs.py` fails closed on malformed input: it exits 2 on an empty event
+name (`EXIT_USAGE`) and on a `pull_request` with an empty head ref or an empty
+base ref (`EXIT_MALFORMED_EVENT`), printing a `check_legs: ...` message
 (`malformed event: ...` for the pull_request cases) on stderr and no
 `check_tiers` line. That fails the `classify` step and the
 run goes red instead of silently scheduling or dropping a tier.
