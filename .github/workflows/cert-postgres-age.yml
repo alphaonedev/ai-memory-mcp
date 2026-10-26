@@ -193,7 +193,6 @@ jobs:
             echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"
             exit 1
           fi
-          base_url="$(cat "$url_file")"
           # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63
           # chars). run_id+attempt make it unique across concurrent runs; the
           # fixed `cert` suffix keeps it distinct from the ci.yml enterprise-fed
@@ -203,20 +202,12 @@ jobs:
           # drop use the byte-identical name.
           echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
           # Create the ephemeral db on the base tier (connected to ai_memory_test).
-          if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
+          if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" -- psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
             echo "::error::$RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native cert tier"
             exit 1
           fi
-          # Rewrite the base URL's db-name path segment (the last path segment,
-          # before any '?') to the ephemeral db, preserving every query param
-          # (sslmode/sslrootcert). The db name is [a-z0-9_] so needs no encoding.
-          case "$base_url" in
-            *\?*) q="?${base_url#*\?}"; head="${base_url%%\?*}" ;;
-            *)    q=""; head="$base_url" ;;
-          esac
-          new_url="${head%/*}/${CI_FED_DB}${q}"
           # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
-          if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
+          if ! python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" -- psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
             exit 1
           fi
@@ -225,10 +216,7 @@ jobs:
           # instance). Setting AI_MEMORY_TEST_AGE_URL is what stops the
           # AGE-backed cells from self-skipping — the whole point of the in-PR
           # cert evidence (#2548).
-          {
-            echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url"
-            echo "AI_MEMORY_TEST_AGE_URL=$new_url"
-          } >> "$GITHUB_ENV"
+          python3 -I scripts/ci/tier_credential.py github-env --url-file "$url_file" --database "$CI_FED_DB" --age-url
           echo "::notice::cert cells pointed at ephemeral db $CI_FED_DB on the native enterprise-fed tier ($RUNNER_NAME)"
 
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
@@ -269,9 +257,10 @@ jobs:
       - name: Wait for native tier readiness
         run: |
           set -euo pipefail
+          url_file="$HOME/.ai-memory-ci-fed-url"
           attempt=1
           while [ "$attempt" -le 30 ]; do
-            if psql "$AI_MEMORY_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
+            if python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" -- psql -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
               echo "::notice::native cert tier is up"
               exit 0
             fi
@@ -290,24 +279,26 @@ jobs:
           # lack CREATE EXTENSION privilege, and that is fine — the "Assert
           # certified stack versions" step below is the load-bearing check and
           # HARD-FAILS if any extension is actually absent or off-version.
-          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -v ON_ERROR_STOP=0"
-          $PSQL -c "CREATE EXTENSION IF NOT EXISTS vector;" || echo "vector: pre-provisioned or no CREATE priv (asserted below)"
-          $PSQL -c "CREATE EXTENSION IF NOT EXISTS age;" || echo "age: pre-provisioned or no CREATE priv (asserted below)"
-          $PSQL -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists / no priv / AGE init handled by ladder"
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          PSQL=(python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" -- psql -v ON_ERROR_STOP=0)
+          "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS vector;" || echo "vector: pre-provisioned or no CREATE priv (asserted below)"
+          "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS age;" || echo "age: pre-provisioned or no CREATE priv (asserted below)"
+          "${PSQL[@]}" -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists / no priv / AGE init handled by ladder"
 
       - name: Assert certified stack versions (cert evidence, hard-fail on drift)
         run: |
           set -euo pipefail
-          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -tAX"
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          PSQL=(python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" --database "$CI_FED_DB" -- psql -tAX)
           # split_part(...,' ',1) strips the "(Debian 18.4-1.pgdg13+1)" build
           # metadata SHOW server_version / current_setting append after the
           # bare version — without this, tr -d '[:space:]' collapses that
           # into "18.4(Debian18.4-1.pgdg13+1)", which never equals the exact
           # SSOT string and false-reds the assert below even when the
           # server IS the certified 18.4.
-          pg_ver=$($PSQL -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
-          age_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
-          vec_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
+          pg_ver=$("${PSQL[@]}" -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
+          age_ver=$("${PSQL[@]}" -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
+          vec_ver=$("${PSQL[@]}" -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
           echo "::notice::certified stack — PostgreSQL=$pg_ver  Apache AGE=$age_ver  pgvector=$vec_ver"
           {
             echo "### Certified Postgres + AGE + pgvector tier"
@@ -453,11 +444,10 @@ jobs:
             echo "::warning::cannot drop $CI_FED_DB — $url_file missing on $RUNNER_NAME (leaked ephemeral db)"
             exit 0
           fi
-          base_url="$(cat "$url_file")"
           # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
           # terminates any lingering backend so the drop cannot wedge on a
           # still-connected test process.
-          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
+          if python3 -I scripts/ci/tier_credential.py run --url-file "$url_file" -- psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
             echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
