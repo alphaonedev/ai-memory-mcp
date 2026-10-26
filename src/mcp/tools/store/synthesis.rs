@@ -387,6 +387,12 @@ fn k9_allows_synthesis_delete(namespace: &str, agent_id: &str, candidate_id: &st
 /// # Errors
 /// [`crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY`] when any queued update
 /// or delete targets a row the caller does not own.
+///
+/// #7742 / #7750 — an `Err` with an ids-only message when the supersedes link
+/// for an Update verdict fails (integrity fault: audit append or pre-image
+/// encode) or is refused by a K9 `memory_link` rule (link permission policy).
+/// The `WriteTxn` guard rolls the whole merge back; the incoming memory is not
+/// written.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_synthesis_updates_and_deletes(
     conn: &rusqlite::Connection,
@@ -541,12 +547,34 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                     MemoryLinkRelation::Supersedes.as_str(),
                     active_keypair,
                 ) {
-                    tracing::warn!(
+                    // #7742 — always inside the WriteTxn above, and a failed
+                    // link may have escalated to a ROLLBACK of it (#7660), so
+                    // stop here: continuing would autocommit later writes.
+                    // Dropping `write_txn` rolls the merge back as a unit.
+                    tracing::error!(
                         target: "synthesis",
-                        "synthesis supersedes link emit failed for {} -> {}: {e}",
-                        provenance_id,
+                        "synthesis supersedes link emit failed for {provenance_id} -> {}: {e:#}",
                         target.id,
                     );
+                    // #7750 — name the class for the caller, ids only: a link
+                    // permission refusal is an operator policy outcome, not an
+                    // integrity fault. The rule reason text is never echoed
+                    // (#7749).
+                    let refused = matches!(
+                        e.downcast_ref::<crate::storage::StorageError>(),
+                        Some(crate::storage::StorageError::LinkPermissionDenied { .. })
+                    );
+                    return Err(if refused {
+                        format!(
+                            "supersedes link refused by link permission policy for {provenance_id} -> {}, merge rolled back",
+                            target.id,
+                        )
+                    } else {
+                        format!(
+                            "synthesis supersedes link emit failed for {provenance_id} -> {}, merge rolled back",
+                            target.id,
+                        )
+                    });
                 }
             }
             Err(e) => {
@@ -736,6 +764,153 @@ mod tests {
             }),
             ..owned_by(owner)
         }
+    }
+
+    fn seed_7742(conn: &rusqlite::Connection, title: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::db::insert(
+            conn,
+            &Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: crate::models::Tier::Long,
+                namespace: "synthesis-7742".to_string(),
+                title: title.to_string(),
+                content: format!("original {title}"),
+                created_at: now.clone(),
+                updated_at: now,
+                metadata: crate::models::default_metadata(),
+                ..Memory::default()
+            },
+        )
+        .expect("seed")
+    }
+
+    fn content_of(conn: &rusqlite::Connection, id: &str) -> Option<String> {
+        conn.query_row("SELECT content FROM memories WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .ok()
+    }
+
+    /// #7742 — a failed `ROLLBACK TO` escalates to a full `ROLLBACK`; the
+    /// merge must stop there, not autocommit its later updates and deletes.
+    #[test]
+    fn failed_link_rollback_aborts_the_whole_merge_7742() {
+        struct Fault;
+        impl Drop for Fault {
+            fn drop(&mut self) {
+                crate::storage::link_savepoint::FAIL_ROLLBACK_TO.with(|f| f.set(false));
+            }
+        }
+        let _fault = Fault;
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let (p, q, c) = (
+            seed_7742(&conn, "p"),
+            seed_7742(&conn, "q"),
+            seed_7742(&conn, "c"),
+        );
+        conn.execute_batch(
+            "CREATE TRIGGER x7742_audit_fault BEFORE INSERT ON signed_events \
+             WHEN NEW.event_type = 'memory_link.created' \
+             BEGIN SELECT RAISE(ABORT, 'x7742 injected audit fault'); END;",
+        )
+        .expect("install fault");
+        crate::storage::link_savepoint::FAIL_ROLLBACK_TO.with(|f| f.set(true));
+        let existing: Vec<Memory> = [&p, &q, &c]
+            .iter()
+            .map(|id| crate::db::get(&conn, id).expect("get").expect("row"))
+            .collect();
+        let incoming = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "incoming".to_string(),
+            ..existing[0].clone()
+        };
+        let outcome = SynthesisOutcome {
+            updates: vec![
+                (p.clone(), "merged p".into()),
+                (q.clone(), "merged q".into()),
+            ],
+            deletes: vec![c.clone()],
+            ..SynthesisOutcome::empty()
+        };
+        let result = apply_synthesis_updates_and_deletes(
+            &conn, &incoming, &existing, None, None, &outcome, None, None,
+        );
+        let msg = result
+            .as_ref()
+            .expect_err("#7742: a failed link must fail the merge");
+        assert!(msg.contains("merge rolled back"), "{msg}");
+        assert!(
+            !msg.contains("x7742 injected audit fault"),
+            "#7749: db text leaked to the caller: {msg}"
+        );
+        assert!(content_of(&conn, &c).is_some(), "#7742: candidate deleted");
+        assert_eq!(content_of(&conn, &p).as_deref(), Some("original p"));
+        assert_eq!(content_of(&conn, &q).as_deref(), Some("original q"));
+    }
+
+    /// #7750 — a K9 Deny rule on `memory_link` fails the synthesis merge with a
+    /// fixed, ids-only message naming the permission class; the rule reason
+    /// never reaches the caller (#7749) and nothing is merged or deleted.
+    #[test]
+    fn k9_link_deny_fails_the_merge_7742() {
+        use crate::permissions::{PermissionRule, RuleDecision, set_active_permission_rules};
+        const RULE_REASON: &str = "x7750 secret operator rule reason";
+        struct Scope {
+            _rules: std::sync::MutexGuard<'static, ()>,
+            _mode: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                crate::permissions::clear_active_permission_rules_for_test();
+                crate::config::clear_permissions_mode_override_for_test();
+            }
+        }
+        let mode = crate::config::lock_permissions_mode_for_test();
+        let rules = crate::mcp::SHARED_PERMISSION_RULES_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _scope = Scope {
+            _rules: rules,
+            _mode: mode,
+        };
+        crate::config::set_active_permissions_mode(crate::config::PermissionsMode::Enforce);
+        set_active_permission_rules(vec![PermissionRule {
+            namespace_pattern: "synthesis-7742".to_string(),
+            op: "memory_link".to_string(),
+            agent_pattern: "*".to_string(),
+            decision: RuleDecision::Deny,
+            reason: Some(RULE_REASON.to_string()),
+        }]);
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let (p, c) = (seed_7742(&conn, "p"), seed_7742(&conn, "c"));
+        let existing: Vec<Memory> = [&p, &c]
+            .iter()
+            .map(|id| crate::db::get(&conn, id).expect("get").expect("row"))
+            .collect();
+        let incoming = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "incoming".to_string(),
+            ..existing[0].clone()
+        };
+        let outcome = SynthesisOutcome {
+            updates: vec![(p.clone(), "merged p".into())],
+            deletes: vec![c.clone()],
+            ..SynthesisOutcome::empty()
+        };
+        let result = apply_synthesis_updates_and_deletes(
+            &conn, &incoming, &existing, None, None, &outcome, None, None,
+        );
+        let msg = result
+            .as_ref()
+            .expect_err("#7750: a refused supersedes link must fail the merge");
+        assert!(msg.contains("link permission policy"), "{msg}");
+        assert!(
+            !msg.contains(RULE_REASON),
+            "#7749: rule reason leaked: {msg}"
+        );
+        assert!(content_of(&conn, &c).is_some(), "#7750: candidate deleted");
+        assert_eq!(content_of(&conn, &p).as_deref(), Some("original p"));
     }
 
     #[test]

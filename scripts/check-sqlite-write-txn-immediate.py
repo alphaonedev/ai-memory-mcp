@@ -20,7 +20,11 @@ Rules (each has a mutant in ``--self-test``):
   R5  an allowlisted DEFERRED function must be read-only: its body may not
       contain a write statement (INSERT / UPDATE / DELETE / REPLACE / CREATE /
       DROP / ALTER).  A DEFERRED function that reads then writes, or writes
-      first, is refused by R1-R4 (it is not allowlistable) and by R5.
+      first, is refused by R1-R4 (it is not allowlistable) and by R5.  The one
+      exception kind is a nested savepoint guard (``link_savepoint.rs`` open),
+      allowlisted because it issues SAVEPOINT only when the connection is
+      already inside a transaction (``!is_autocommit()``), so it never begins
+      a DEFERRED transaction and carries no write statement itself.
 
   R6  ``.savepoint()`` / ``savepoint_with_name`` / a raw ``SAVEPOINT`` open a
       DEFERRED transaction when no transaction is open.
@@ -49,7 +53,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# (relative file, enclosing fn) -> reason.  Read-only snapshots only.
+# (relative file, enclosing fn) -> reason.  Two kinds: read-only snapshots, and a nested savepoint guarded by !is_autocommit().
 ALLOWLIST = {
     ("src/governance/policy_version.rs", "with_read_snapshot"): (
         "read-only snapshot: two reads must share one view; it never writes, "
@@ -58,6 +62,11 @@ ALLOWLIST = {
     ("src/cli/keys.rs", "sqlite"): (
         "preview arm only: opens read-only (open_read_only) and issues plain "
         "BEGIN for a consistent read; the delete arm is BEGIN IMMEDIATE"
+    ),
+    ("src/storage/link_savepoint.rs", "open"): (
+        "#7559 nested savepoint only: it is issued solely when "
+        "`!conn.is_autocommit()` (a caller-owned WriteTxn is already open), so "
+        "it never begins a DEFERRED transaction; autocommit callers skip it"
     ),
 }
 
@@ -554,7 +563,7 @@ def main(argv=None):
         print("stale allowlist entry (no matching site): %s fn %s" % (rel, fn))
     if bad or stale:
         return 1
-    print("check-sqlite-write-txn-immediate: ok (%d allowlisted read-only site(s))" % total)
+    print("check-sqlite-write-txn-immediate: ok (%d allowlisted site(s): read-only snapshots and the guarded savepoint)" % total)
     return 0
 
 

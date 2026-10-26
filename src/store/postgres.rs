@@ -20254,11 +20254,10 @@ fn resolve_quota_agent_id(ctx: &CallerContext, metadata: &serde_json::Value) -> 
 }
 
 /// v0.7.0.1 G1 — bytes counted toward a memory's storage cap. Mirrors
-/// `quotas::storage_bytes_for_memory` (title + content UTF-8 length —
+/// `quotas::memory_charge_bytes` (title + content UTF-8 length —
 /// ignoring tags/metadata, which is the SQLite parity contract).
 fn memory_storage_bytes(memory: &Memory) -> i64 {
-    let raw = memory.title.len().saturating_add(memory.content.len());
-    i64::try_from(raw).unwrap_or(i64::MAX)
+    crate::quotas::memory_charge_bytes(memory)
 }
 
 /// v0.7.0.1 G1 / v0.7.0 #1156 — increment
@@ -28377,6 +28376,14 @@ impl MemoryStore for PostgresStore {
                         THEN EXCLUDED.tier
                     ELSE memories.tier
                 END,
+                -- #7557 — a long-tier result never expires (GC deletes on
+                -- `expires_at < now`); otherwise the later expiry wins. Mirrors
+                -- the sqlite arm in `storage::consolidate_dest`.
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE GREATEST(EXCLUDED.expires_at, memories.expires_at)
+                END,
+                version = memories.version + 1,
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store() parity).
                 encrypted_envelope = EXCLUDED.encrypted_envelope,
@@ -28509,6 +28516,7 @@ impl MemoryStore for PostgresStore {
         } else {
             None
         };
+        let mut link_audit_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for (id, source_cid) in ids.iter().zip(source_cids.iter()) {
             if id == &new_id {
                 continue;
@@ -28548,7 +28556,12 @@ impl MemoryStore for PostgresStore {
                 // cid mirror, and flip `lifecycle_state` to `tombstoned`.
                 // The source's own inbound provenance edges survive (no
                 // delete, no CASCADE), so multi-hop lineage stays walkable.
-                sqlx::query(
+                // #7565 — truncate ONCE to the column's microsecond precision
+                // and use that instant for both the bind and the audit
+                // pre-image, so the hash re-derives from the stored edge
+                // (#3291 class; same fixpoint as `link_internal`).
+                let edge_now = truncate_to_microseconds(now);
+                let edge_inserted = sqlx::query(
                     "INSERT INTO memory_links
                          (source_id, target_id, relation, created_at, valid_from,
                           attest_level, source_cid, target_cid)
@@ -28558,13 +28571,46 @@ impl MemoryStore for PostgresStore {
                 .bind(&new_id)
                 .bind(id)
                 .bind(crate::models::MemoryLinkRelation::DerivedFrom.as_str())
-                .bind(now)
+                .bind(edge_now)
                 .bind(crate::models::AttestLevel::Unsigned.as_str())
                 .bind(new_row_cid.as_deref())
                 .bind(source_cid.as_deref())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?;
+                .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?
+                .rows_affected();
+                // #7092 — the sqlite twin appends one `memory_link.created`
+                // audit row per NEW edge inside the consolidate transaction;
+                // postgres wrote the edge with no audit row at all. Append
+                // in this same tx (fail closed: the error drops `tx`, so no
+                // summary, no edge and no audit row commit) and fold the
+                // off-table anchor into the one emitted after the COMMIT.
+                if edge_inserted > 0 {
+                    let payload_hash =
+                        crate::identity::attest::consolidate_edge_audit_payload_hash(
+                            &new_id, id, edge_now,
+                        )
+                        .map_err(|e| StoreError::IntegrityFailed {
+                            detail: format!("consolidate link audit canonical_cbor: {e}"),
+                        })?;
+                    let event_id = uuid::Uuid::new_v4().to_string();
+                    let appended = pg_append_signed_event_with_chain_in_tx(
+                        &mut tx,
+                        PgSignedEventInsert {
+                            id: &event_id,
+                            agent_id: "unknown",
+                            event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED,
+                            payload_hash: &payload_hash,
+                            signature: None,
+                            attest_level: crate::models::AttestLevel::Unsigned.as_str(),
+                            timestamp: chrono::Utc::now(),
+                            cause_hash: None,
+                        },
+                    )
+                    .await
+                    .map_err(|e| to_store_err("consolidate append memory_link.created", e))?;
+                    link_audit_anchor = std::mem::take(&mut link_audit_anchor).merge(appended);
+                }
                 // #3691 — GUARDED tombstone (sqlite twin in `storage::consolidate`):
                 // a source quarantined / contaminated since the snapshot read keeps
                 // its security state; zero rows affected aborts the whole cluster
@@ -28689,7 +28735,7 @@ impl MemoryStore for PostgresStore {
             }
         }
 
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, link_audit_anchor)
             .await
             .map_err(|e| to_store_err("consolidate commit", e))?;
         Ok(new_id)
