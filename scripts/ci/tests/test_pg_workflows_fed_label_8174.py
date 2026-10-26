@@ -14,7 +14,10 @@ every node):
   (b) no ``run:`` block contains a GNU-only token (a macOS runner has BSD tools);
   (c) each workflow self-heals the hand-built macOS AGE install through
       ``scripts/ci/ensure-age-extension.py`` behind a ``$RUNNER_OS`` check, the
-      same branch ci.yml takes for its macos-fed enterprise-fed leg.
+      same branch ci.yml takes for its macos-fed enterprise-fed leg. The guard's closing ``fi``
+      sits at the guard line's indent and every line between them is indented deeper; a line
+      inside the guard that ends with a backslash, contains ``<<`` or has an odd quote count is
+      refused, because bash may read an ``if``/``fi`` there as data.
 
 Run: python3 -m unittest discover -s scripts/ci/tests -p 'test_pg_workflows_fed_label_8174.py'
 """
@@ -107,13 +110,24 @@ def guard_end(body, start):
     a parser would be a second implementation of bash in a test.
     """
     depth = 0
+    indent = len(body[start]) - len(body[start].lstrip())
     for i in range(start, len(body)):
         word = body[i].strip()
+        if i > start:
+            # code r5 F1 + sec r5 F1: bash reads if/fi as DATA after a continuation, in a heredoc
+            # or in a multi-line string; refuse lines that can hide that, then demand indentation.
+            bare = word.replace("\\\\", "").replace('\\"', "").replace("\\'", "")
+            if word.endswith("\\") or "<<" in word or bare.count('"') % 2 or bare.count("'") % 2:
+                return None, "unprovable line in the RUNNER_OS guard: " + word
+            if len(body[i]) - len(body[i].lstrip()) <= indent and not (word == "fi" and depth == 1):
+                return None, "line inside the guard not indented deeper: " + word
         if word.startswith("if ") and len(IF_FI_WORD.findall(word)) == 1:
             depth += 1
         elif word == "fi":
             depth -= 1
             if depth == 0:
+                if len(body[i]) - len(body[i].lstrip()) != indent:
+                    return None, "guard fi not at the guard indent: " + word
                 return i, None
         elif IF_FI_WORD.search(word):
             return None, "uncountable if/fi line in the RUNNER_OS guard: " + word
