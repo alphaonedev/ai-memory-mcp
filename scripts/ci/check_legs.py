@@ -35,7 +35,9 @@ Usage (in the ``classify`` job, context passed through env, never inlined):
 prints ``check_tiers=sqlite`` (comma separated) and, with ``--github-output``,
 appends the same line to that file.
 
-Exit codes: 0 success, 2 bad arguments (empty ``EVENT_NAME``).
+Exit codes: 0 success, 2 bad arguments (empty ``EVENT_NAME``) or a malformed
+event (``pull_request`` with an empty ``HEAD_REF``: loud, never a silent
+drop of the enterprise-fed tier).
 
 Python 3.9+, standard library only.
 """
@@ -51,6 +53,7 @@ CHAIN_BRANCH_PREFIX = 'chain/'
 OUTPUT_KEY = 'check_tiers'
 EXIT_OK = 0
 EXIT_USAGE = 2
+EXIT_MALFORMED_EVENT = 2
 
 
 def active_tiers(event_name, head_ref):
@@ -78,6 +81,10 @@ def main(argv=None):
     if not args.event_name:
         print('check_legs: EVENT_NAME is empty', file=sys.stderr)
         return EXIT_USAGE
+    if args.event_name == EVENT_PULL_REQUEST and not args.head_ref:
+        print('check_legs: malformed event: pull_request with an empty head ref (HEAD_REF)',
+              file=sys.stderr)
+        return EXIT_MALFORMED_EVENT
     line = output_line(active_tiers(args.event_name, args.head_ref))
     print(line)
     if args.github_output:
