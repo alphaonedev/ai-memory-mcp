@@ -232,11 +232,6 @@ EXTRA_MUTANTS = (
         "self.words.append(self.heredoc_text(text))",
     ),
     (
-        "here-document delimiter quote not noticed",
-        "            else:\n                quoted = True",
-        "            else:\n                quoted = False",
-    ),
-    (
         "backslash in a here-document body not an escape",
         'if c == "\\\\" and self.i + 1 < self.n:\n                    out.append(self.s[self.i + 1])',
         "if False:\n                    out.append(self.s[self.i + 1])",
@@ -257,21 +252,6 @@ EXTRA_MUTANTS = (
         'if False:',
     ),
     (
-        'subscript rule ignores a command substitution',
-        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
-        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:`|\\$\\{[^}]*@[A-Za-z])")',
-    ),
-    (
-        'subscript rule ignores a backtick',
-        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
-        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|\\$\\{[^}]*@[A-Za-z])")',
-    ),
-    (
-        'subscript rule ignores a transformation',
-        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
-        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`)")',
-    ),
-    (
         'env value with a subscript substitution allowed',
         'if vtext is not None and SUBSCRIPT_SUBST_RE.search(vtext):',
         'if False:',
@@ -280,6 +260,292 @@ EXTRA_MUTANTS = (
         "unreadable RUSTFLAGS value allowed",
         "(value is None or RUSTFLAGS_BAD_RE.search(value) is not None)",
         "(value is not None and RUSTFLAGS_BAD_RE.search(value) is not None)",
+    ),
+    # Round 12 (code r11 F1-F3): one mutant per new rule site; every one must be RED.
+    (
+        'r12 F1: delimiter shape not enforced',
+        'm = HEREDOC_DELIM_RE.fullmatch(raw)',
+        'm = HEREDOC_DELIM_RE.fullmatch(raw) or raw',
+    ),
+    (
+        'r12 F1: delimiter quote not noticed',
+        'return raw.strip("\'\\"\\\\"), raw[0] in "\'\\"\\\\"',
+        'return raw.strip("\'\\"\\\\"), False',
+    ),
+    (
+        'r12 F1: delimiter shape accepts any text',
+        'HEREDOC_DELIM_RE = re.compile(r"\\\\[A-Za-z0-9_]+|\'[A-Za-z0-9_]+\'|\\"[A-Za-z0-9_]+\\"|[A-Za-z0-9_]+")',
+        'HEREDOC_DELIM_RE = re.compile(r".+")',
+    ),
+    (
+        'r12 F1: delimiter word ends only at a blank',
+        'HEREDOC_DELIM_END = " \\t\\n;&|()<>"',
+        'HEREDOC_DELIM_END = " \\t\\n"',
+    ),
+    (
+        'r12 F1: backslash delimiter form dropped',
+        'HEREDOC_DELIM_RE = re.compile(r"\\\\[A-Za-z0-9_]+|',
+        'HEREDOC_DELIM_RE = re.compile(r"',
+    ),
+    (
+        'r12 F1: single-quote delimiter form dropped',
+        "|'[A-Za-z0-9_]+'|",
+        '|',
+    ),
+    (
+        'r12 F2: subscript rule stops at the first bracket',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])", re.S)',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[[^\\]]*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
+    ),
+    (
+        'r12 F2: subscript rule ignores a command substitution',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])", re.S)',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:`|\\$\\{[^}]*@[A-Za-z])", re.S)',
+    ),
+    (
+        'r12 F2: subscript rule ignores a backtick',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])", re.S)',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|\\$\\{[^}]*@[A-Za-z])", re.S)',
+    ),
+    (
+        'r12 F2: subscript rule ignores a transformation',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])", re.S)',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|`)", re.S)',
+    ),
+    (
+        'r12 F2: subscript rule does not cross a newline',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])", re.S)',
+        'SUBSCRIPT_SUBST_RE = re.compile(r"\\[.*(?:\\$\\(|`|\\$\\{[^}]*@[A-Za-z])")',
+    ),
+    (
+        'r12 F3: arithmetic expansion operands not checked',
+        'self.need(self.arith_ok(body)',
+        '(lambda *_a: None)(self.arith_ok(body)',
+    ),
+    (
+        'r12 F3: indirect expansion name not checked',
+        'self.need(self.name_ok(name), "`${!name}`"',
+        '(lambda *_a: None)(self.name_ok(name), "`${!name}`"',
+    ),
+    (
+        'r12 F3: read subscript not checked',
+        'self.need(self.arith_ok(expr), f"the subscript',
+        '(lambda *_a: None)(self.arith_ok(expr), f"the subscript',
+    ),
+    (
+        'r12 F3: associative exemption applies to every array',
+        'if name not in self.assoc:',
+        'if True:',
+    ),
+    (
+        'r12 F3: associative declaration not recorded',
+        'self.assoc.add(nm)',
+        'pass',
+    ),
+    (
+        'r12 F3: substring offset not checked',
+        'self.need(self.arith_ok(off)',
+        '(lambda *_a: None)(self.arith_ok(off)',
+    ),
+    (
+        'r12 F3: printf -v allowed',
+        'if w == "printf" and k + 1 < len(texts) and texts[k + 1].startswith("-v"):',
+        'if False:',
+    ),
+    (
+        'r12 F3: test -v operand not checked',
+        'if w == "-v" and k + 1 < len(texts):',
+        'if False:',
+    ),
+    (
+        'r12 F3: [[ -eq ]] operands not checked',
+        'elif word == "[[" and w in ARITH_COMPARE and 1 < k < len(texts) - 1:',
+        'elif False:',
+    ),
+    (
+        'r12 F3: [[ -eq ]] left operand not checked',
+        'self.need(self.arith_ok(texts[k - 1])',
+        '(lambda *_a: None)(self.arith_ok(texts[k - 1])',
+    ),
+    (
+        'r12 F3: [[ -eq ]] right operand not checked',
+        'self.need(self.arith_ok(texts[k + 1]), f"`[[ {w} ]]`"',
+        '(lambda *_a: None)(self.arith_ok(texts[k + 1]), f"`[[ {w} ]]`"',
+    ),
+    (
+        'r12 F3: declare -i name not checked',
+        'self.name_ok(nm) and self.arith_ok(val)',
+        'self.arith_ok(val)',
+    ),
+    (
+        'r12 F3: declare -i value not checked',
+        'self.name_ok(nm) and self.arith_ok(val)',
+        'self.name_ok(nm)',
+    ),
+    (
+        'r12 F3: declare -n value not checked',
+        'self.need(self.name_text_ok(val), f"`{word} -n`"',
+        '(lambda *_a: None)(self.name_text_ok(val), f"`{word} -n`"',
+    ),
+    (
+        'r12 F3: declare of an expanded name allowed',
+        'if not eq and is_exp(a):',
+        'if False:',
+    ),
+    (
+        'r12 F3: array declaration not non-literal',
+        'if "A" in flags or "a" in flags:',
+        'if False:',
+    ),
+    (
+        'r12 F3: nameref not non-literal',
+        'if "n" in flags:\n                        self.nonlit.add(nm)',
+        'if "n" in flags:\n                        pass',
+    ),
+    (
+        'r12 F3: nameref target not non-literal',
+        'self.nonlit.add(tgt.group(1))',
+        'pass',
+    ),
+    (
+        'r12 F3: array literal not non-literal',
+        'self.nonlit.add(an.group(1))',
+        'pass',
+    ),
+    (
+        'r12 F3: non-literal names ignored',
+        'if name in self.nonlit or (name in self.for_vars',
+        'if (name in self.for_vars',
+    ),
+    (
+        'r12 F3: loop variable always literal',
+        '(name in self.for_vars and name in self.for_bad)',
+        'False',
+    ),
+    (
+        'r12 F3: positional parameter literal',
+        ' or (name.isdigit() and name != "0"):',
+        ':',
+    ),
+    (
+        'r12 F3: arithmetic-result assignment not required',
+        'if val != "$(())":',
+        'if False:',
+    ),
+    (
+        'r12 F3: expanded or backtick value allowed',
+        'elif "$" in val or "`" in val or not self.arith_ok(val, seen):',
+        'elif not self.arith_ok(val, seen):',
+    ),
+    (
+        'r12 F3: assigned value tokens not checked',
+        'elif "$" in val or "`" in val or not self.arith_ok(val, seen):',
+        'elif "$" in val or "`" in val:',
+    ),
+    (
+        'r12 F3: indirect name not recorded',
+        'self.brace_names.append(name)',
+        'pass',
+    ),
+    (
+        'r12 F3: subscript of an indirection not recorded',
+        'self.brace_subs.append((name, rest[1:rest.rfind("]")] if "]" in rest else rest[1:]))',
+        'pass',
+    ),
+    (
+        'r12 F3: subscript not recorded',
+        'self.brace_subs.append((name, expr))',
+        'pass',
+    ),
+    (
+        'r12 F3: offset not recorded',
+        'self.brace_offsets.extend(b[pos + 1:].split(":"))',
+        'pass',
+    ),
+    (
+        'r12 F3: name listing refused',
+        'if rest in ("*", "@", "[@]", "[*]"):',
+        'if False:',
+    ),
+    (
+        'r12 F3: (( )) allowed',
+        'if lv.cmd_pos and s[self.i:self.i + 1] == "(" and self.arithmetic(self.i + 1):',
+        'if False:',
+    ),
+    (
+        'r12 F3: ANSI-C not examined',
+        'if bare and nxt == "\'":',
+        'if False:',
+    ),
+    (
+        'r12 F3: ANSI-C without a backslash refused',
+        'if end >= 0 and "\\\\" in s[i + 2:end]:',
+        'if end >= 0:',
+    ),
+    (
+        'r12 F3: loop list words not examined',
+        'if not (lit and FOR_PLAIN_WORD_RE.fullmatch(str(text))):',
+        'if False:',
+    ),
+    (
+        'r12 F3: quoted loop list words plain',
+        'if not (lit and FOR_PLAIN_WORD_RE.fullmatch(str(text))):',
+        'if not FOR_PLAIN_WORD_RE.fullmatch(str(text)):',
+    ),
+    (
+        'r12 F3: loop list accepts any word',
+        'FOR_PLAIN_WORD_RE = re.compile(r"[0-9]+|\\{[0-9]+\\.\\.[0-9]+(?:\\.\\.[0-9]+)?\\}")',
+        'FOR_PLAIN_WORD_RE = re.compile(r".+")',
+    ),
+    (
+        'r12 F3: brace range form dropped',
+        'FOR_PLAIN_WORD_RE = re.compile(r"[0-9]+|\\{[0-9]+\\.\\.[0-9]+(?:\\.\\.[0-9]+)?\\}")',
+        'FOR_PLAIN_WORD_RE = re.compile(r"[0-9]+")',
+    ),
+    (
+        'r12 F3: bare for reads positional parameters as plain',
+        'if lv.expect == "for_in" and lv.for_name:',
+        'if False:',
+    ),
+    (
+        'r12 F3: C-style header accepts any text',
+        'FOR_ARITH_HEADER_RE.fullmatch(body.replace(";", " ")) is None',
+        'False',
+    ),
+    (
+        'r12 F3: C-style header character set widened',
+        'FOR_ARITH_HEADER_RE = re.compile(r"[A-Za-z0-9_ \\t+\\-*/%<>=!&|^~,()]*")',
+        'FOR_ARITH_HEADER_RE = re.compile(r".*")',
+    ),
+    (
+        'r12 F3: C-style other names plain',
+        'if m.group(0) != name:',
+        'if False:',
+    ),
+    (
+        'r12 F3: C-style loop not recorded as a loop variable',
+        '        self.for_vars.append(name)\n        self.i = j',
+        '        self.i = j',
+    ),
+    (
+        'r12 F3: refusal swallowed',
+        'self.f3_error = err',
+        'pass',
+    ),
+    (
+        'r12 F3: refusal reported beside an env problem',
+        'elif scan.f3_error is not None:  # Round 12',
+        'if scan.f3_error is not None:  # Round 12',
+    ),
+    (
+        'r12 F3: refusal dropped when no older rule fired',
+        'elif scan.f3_error is not None:  # Round 12',
+        'elif False:  # Round 12',
+    ),
+    (
+        'r12 F3: matrix variant refusal dropped',
+        'f"text the scanner cannot read ({vscan.f3_error})" if vscan.f3_error is not None else ""',
+        '""',
     ),
 )
 
@@ -370,7 +636,7 @@ def work(item):
     return k, state, f"{label} | {note}"
 
 
-def build_items(root, tmpdir, limit):
+def build_items(root, tmpdir, limit, select="", lines=""):
     import check_release_features as G
 
     src = GUARD.read_bytes()
@@ -401,6 +667,14 @@ def build_items(root, tmpdir, limit):
         label = desc if n == 1 else f"{desc} (anchor found {n} times, not once)"
         items.append((k, label, mutated, root, tmpdir, True))
         k += 1
+    if select or lines:  # Round 12: the impact-selected sweep keeps the rows whose label matches or whose refusal line is in range
+        lo, hi = (int(x) for x in lines.split("-")) if lines else (0, -1)
+        keep = []
+        for item in items:
+            site = re.fullmatch(r"refusal call at line (\d+)", item[1])
+            if (select and re.search(select, item[1])) or (site and lo <= int(site.group(1)) <= hi):
+                keep.append(item)
+        items = keep
     return items[:limit] if limit else items
 
 
@@ -416,6 +690,8 @@ def main(argv=None):
     ap.add_argument("--root", default=str(HERE.parent.parent))
     ap.add_argument("--out", default="")
     ap.add_argument("--limit", type=int, default=0, help="run only the first N mutants (debug)")
+    ap.add_argument("--select", default="", help="impact-selected sweep: only rows whose label matches this regex")
+    ap.add_argument("--lines", default="", help="impact-selected sweep: also the refusal calls on guard lines A-B")
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
     base = root / ".local-runs"
@@ -429,7 +705,7 @@ def main(argv=None):
         lines.append(f"0 CONTROL-{control} unmutated guard" + ("" if control == "GREEN" else f" | {cnote}"))
         counts = {"RED": 0, "EQUIVALENT": 0, "SURVIVES": 0, "OTHER-DEFECT": 0}
         if rc == 0:
-            items = build_items(root, tmpdir, args.limit)
+            items = build_items(root, tmpdir, args.limit, args.select, args.lines)
             with multiprocessing.Pool(max(1, args.jobs)) as pool:
                 for k, state, note in pool.imap_unordered(work, items):
                     counts[state] += 1

@@ -1583,9 +1583,24 @@ SHELL_ASSIGN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
 # Round 11 (sec r10 F3): the letters that follow the `@` of a parameter transformation. Bash 5.2 reads U u L Q E P A a K; any
 # other letter is refused too, because the scanner cannot know which a later bash re-evaluates.
 TRANSFORM_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-# Round 11 (sec r10 F2): array-subscript text that holds a substitution: `[` then `$(`, a backtick or a `${` with an
-# `@` operator, before any `]`.
-SUBSCRIPT_SUBST_RE = re.compile(r"\[[^\]]*(?:\$\(|`|\$\{[^}]*@[A-Za-z])")
+# Round 12 (code r11 F2): array-subscript text that holds a substitution: a `[` then, ANYWHERE in the rest of the word (no `]`
+# stop, so a nested subscript or a quoted `]` hides nothing), `$(`, a backtick or a `${` with an `@` operator.
+# decision: search the whole rest of the word after a `[` over stopping at the first `]` because bash re-evaluates the text of a
+# nested subscript and a quoted `]` ends the guard's reading at a different place than bash's.
+SUBSCRIPT_SUBST_RE = re.compile(r"\[.*(?:\$\(|`|\$\{[^}]*@[A-Za-z])", re.S)
+# Round 12 (code r11 F1): a here-document delimiter is a plain word, alone, in one whole quote pair, or after one backslash.
+HEREDOC_DELIM_RE = re.compile(r"\\[A-Za-z0-9_]+|'[A-Za-z0-9_]+'|\"[A-Za-z0-9_]+\"|[A-Za-z0-9_]+")
+HEREDOC_DELIM_END = " \t\n;&|()<>"
+# Round 12 (code r11 F3): the text a re-evaluating context may hold: blanks, `$name`, `${name}`, `$?` `$#` `$$` `$!`, numbers,
+# names and arithmetic operator characters (a quote, a backtick, a `$(`, a braced default and every other character is
+# not literal).
+ARITH_TOKEN_RE = re.compile(
+    r"\s+|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$[?#$!]"
+    r"|0[xX][0-9A-Fa-f]+|[0-9]+(?:#[0-9A-Za-z@_]+)?|([A-Za-z_][A-Za-z0-9_]*)|[-+*/%<>=!&|^~?:,()\[\]]")
+FOR_PLAIN_WORD_RE = re.compile(r"[0-9]+|\{[0-9]+\.\.[0-9]+(?:\.\.[0-9]+)?\}")
+FOR_ARITH_HEADER_RE = re.compile(r"[A-Za-z0-9_ \t+\-*/%<>=!&|^~,()]*")
+ARITH_COMPARE = frozenset(("-eq", "-ne", "-lt", "-le", "-gt", "-ge"))
+DECLARE_WORDS = frozenset(("declare", "typeset", "local", "export", "readonly"))
 
 
 class ShellError(Exception):
@@ -1612,6 +1627,7 @@ class ShellLevel:
         self.cmd_pos = True
         self.expect = ""
         self.wordlist = False
+        self.for_name = ""  # Round 12: the loop variable whose word list is being read
         self.skip = False
         self.paren = 0
         self.cases: List[str] = []
@@ -1653,7 +1669,131 @@ class ShellScan:
         self.assign_vals: List[Tuple[str, str, bool]] = []  # Round 9 (F6): (name, value, expanded) per assignment
         self.for_vars: List[str] = []  # Round 9 (F6): the loop variables of `for` and `select`
         self.nest = 0
+        # Round 12 (code r11 F3): the re-evaluating contexts read while scanning (checked once the whole script is read).
+        self.arith_bodies: List[str] = []  # the text of every `$(( ))`
+        self.brace_names: List[str] = []  # `${!name}`: the name that is read as a name
+        self.brace_subs: List[Tuple[str, str]] = []  # `${name[expr]}`: (name, expr)
+        self.brace_offsets: List[str] = []  # `${name:off:len}`: each offset or length
+        self.nonlit: set = set()  # names given an array literal, a nameref, `${X:=..}`: never literal
+        self.assoc: set = set()  # names declared `-A`: their subscripts are strings, not arithmetic
+        self.all_assigns: List[Tuple[str, str, bool]] = []
+        self.for_bad: set = set()  # loop variables with a header whose words are not all plain numbers or numeric brace ranges
         self.scan(None)
+        self.f3_error: Optional[ShellError] = None  # Round 12: the re-evaluation refusal, reported after every other check
+        try:
+            self.reeval_check()
+        except ShellError as err:
+            self.f3_error = err
+
+    def name_ok(self, name: str, seen: frozenset = frozenset()) -> bool:
+        """Round 12 (code r11 F3): True when every assignment of ``name`` in the script is a plain number, a quoted plain
+        string without `$` that is itself literal, or the result of a `$(( ))` (an integer by construction; the body is
+        checked on its own). A name never assigned here is literal (the `env:` rule reads what the step gives it)."""
+        if name in seen:
+            return True
+        if name in self.nonlit or (name in self.for_vars and name in self.for_bad) or (name.isdigit() and name != "0"):
+            return False
+        seen = seen | {name}
+        for n, val, exp in self.all_assigns:
+            if n != name:
+                continue
+            if val.startswith("\0+"):
+                val = val[2:]
+            if exp:
+                if val != "$(())":
+                    return False
+            elif "$" in val or "`" in val or not self.arith_ok(val, seen):
+                return False
+        return True
+
+    def arith_ok(self, text: str, seen: frozenset = frozenset()) -> bool:
+        """Round 12 (code r11 F3): ``text`` holds only blanks, numbers, operators and names (or `$name` references) that
+        are literal."""
+        pos = 0
+        while pos < len(text):
+            m = ARITH_TOKEN_RE.match(text, pos)
+            if m is None:
+                return False
+            name = m.group(1) or m.group(2) or m.group(3)
+            if name and not self.name_ok(name, seen):
+                return False
+            pos = m.end()
+        return True
+
+    def name_text_ok(self, text: str) -> bool:
+        """Round 12 (code r11 F3): ``text`` names a variable (`-v`, `declare -n`): a plain name is read as a name, never
+        as a value; anything else (a subscript, a `$name`) must hold literal operands."""
+        return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text) is not None or self.arith_ok(text)
+
+    def need(self, ok: bool, what: str, text: str) -> None:
+        if not ok:
+            raise ShellError(f"non-literal operand `{text[:40]}` in {what}: bash evaluates the text of a variable there as an "
+                             "arithmetic expression or a name, so only a plain number or a plain string is read (Round 12, code r11 F3)")
+
+    def reeval_check(self) -> None:
+        """Round 12 (code r11 F3): refuse a re-evaluating context on a non-literal operand, and `printf -v` outright.
+        Ordering (conductor decision): the refusal is recorded in ``f3_error`` and reported LAST, and only when the fetch-step,
+        run allow-list and env checks of the same step found nothing, so a step that breaks an older rule keeps that rule's
+        one message.
+        decision: refuse non-literal operands in every re-evaluating context and refuse $'..' escapes and printf -v outright over tracking provenance through concatenation and += because a data-flow analysis is exactly the parser this guard is designed not to be; the refusal is fail-closed and release.yml / c8-precheck.yml contain none of the refused shapes (quote the grep).
+        decision: count an assignment from `$(( ))` as a plain number over refusing it because the result of an arithmetic expansion is an integer by construction and its body is checked on its own; release.yml `emitted=$((emitted + 1))` is that shape."""
+        self.all_assigns = list(self.assign_vals)
+        for word, _lit, args in self.cmds:
+            if word not in DECLARE_WORDS:
+                continue
+            flags = "".join(a[1:] for a, _l in args if a.startswith("-") and len(a) > 1 and a[1] != "-")
+            for a, _l in args:
+                if a.startswith("-") and len(a) > 1:
+                    continue
+                nm, eq, val = a.partition("=")
+                if not eq and is_exp(a):
+                    raise ShellError(f"non-literal operand `{a[:40]}` of `{word}`: the options and names it reads are unknown "
+                                     "(Round 12, code r11 F3)")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", nm):
+                    continue
+                if eq:
+                    self.all_assigns.append((nm, val, is_exp(a)))
+                if word in ("declare", "typeset", "local"):
+                    if "A" in flags:
+                        self.assoc.add(nm)
+                    if "A" in flags or "a" in flags:
+                        self.nonlit.add(nm)
+                    if "n" in flags:
+                        self.nonlit.add(nm)
+                        tgt = re.match(r"\$?\{?([A-Za-z_][A-Za-z0-9_]*)", val)
+                        if tgt is not None:
+                            self.nonlit.add(tgt.group(1))
+        for body in self.arith_bodies:
+            self.need(self.arith_ok(body), "`$(( ))`", body)
+        for name in self.brace_names:
+            self.need(self.name_ok(name), "`${!name}`", name)
+        for name, expr in self.brace_subs:
+            if name not in self.assoc:
+                self.need(self.arith_ok(expr), f"the subscript of `${{{name}[...]}}`", expr)
+        for off in self.brace_offsets:
+            self.need(self.arith_ok(off), "a substring offset or length", off)
+        for word, _lit, args in self.cmds:
+            texts = [str(word)] + [str(a) for a, _l in args]
+            for k, w in enumerate(texts):
+                if w == "printf" and k + 1 < len(texts) and texts[k + 1].startswith("-v"):
+                    raise ShellError("`printf -v` assigns a name or text bash re-evaluates and is refused (Round 12, code r11 F3)")
+            if word in ("[[", "[", "test"):
+                for k, w in enumerate(texts[1:], 1):
+                    if w == "-v" and k + 1 < len(texts):
+                        self.need(self.name_text_ok(texts[k + 1]), f"`{word} -v`", texts[k + 1])
+                    elif word == "[[" and w in ARITH_COMPARE and 1 < k < len(texts) - 1:
+                        self.need(self.arith_ok(texts[k - 1]), f"`[[ {w} ]]`", texts[k - 1])
+                        self.need(self.arith_ok(texts[k + 1]), f"`[[ {w} ]]`", texts[k + 1])
+            if word in ("declare", "typeset", "local"):
+                flags = "".join(a[1:] for a, _l in args if a.startswith("-") and len(a) > 1 and a[1] != "-")
+                for a, _l in args:
+                    if a.startswith("-") and len(a) > 1:
+                        continue
+                    nm, _eq, val = a.partition("=")
+                    if "i" in flags:
+                        self.need(self.name_ok(nm) and self.arith_ok(val), f"`{word} -i`", a)
+                    if "n" in flags:
+                        self.need(self.name_text_ok(val), f"`{word} -n`", a)
 
     def word(self, text: str, lit: bool, lv: ShellLevel) -> None:
         self.words.append(text)
@@ -1675,6 +1815,7 @@ class ShellScan:
         if ex == "for_var":
             lv.expect = "for_in"
             self.for_vars.append(str(text))
+            lv.for_name = str(text)
             return
         if ex == "for_in" and lit and text == "in":
             lv.wordlist = True
@@ -1687,6 +1828,8 @@ class ShellScan:
             lv.stack.append("case")
             return
         if lv.wordlist:
+            if not (lit and FOR_PLAIN_WORD_RE.fullmatch(str(text))):
+                self.for_bad.add(lv.for_name)
             return
         if not lv.cmd_pos:
             if lv.cur is not None:
@@ -1734,6 +1877,8 @@ class ShellScan:
         lv.dbl = lit and text == "[["
 
     def separator(self, lv: ShellLevel, op: str) -> None:
+        if lv.expect == "for_in" and lv.for_name:
+            self.for_bad.add(lv.for_name)  # `for x;` iterates the positional parameters
         lv.dbl = False
         lv.cmd_pos, lv.wordlist, lv.skip, lv.expect, lv.cur = True, False, False, "", None
         if lv.last is not None:
@@ -1804,19 +1949,25 @@ class ShellScan:
             self.separator(lv, two[0])
 
     def heredoc_delim(self) -> Tuple[str, bool]:
+        """Round 12 (code r11 F1): the delimiter is a plain `[A-Za-z0-9_]+` word, alone, wrapped WHOLE in one quote pair or
+        after one backslash. Bash removes the quotes of the whole word before it compares lines, so any other spelling
+        (a quote inside the word, a backslash-escaped blank, `$'..'`, `$"..."`) ends the body at a line the scanner cannot
+        name; it is refused with the word quoted.
+        decision: refuse every delimiter that is not a plain word in one whole quote pair over reading the delimiter as bash does because the fail-closed refuse-what-you-cannot-prove precedent (PR 8252 exact-body pin; round 11 "refuse subscript text") ends the class without a shell word lexer, and release.yml / c8-precheck.yml use only plain delimiters (quote the grep that proves it)."""
         while self.i < self.n and self.s[self.i] in " \t":
             self.i += 1
-        out: List[str] = []
-        quoted = False
-        while self.i < self.n and self.s[self.i] not in " \t\n;&|()<>":
-            if self.s[self.i] not in "'\"\\":
-                out.append(self.s[self.i])
-            else:
-                quoted = True
-            self.i += 1
-        if not out:
+        j = self.i
+        while j < self.n and self.s[j] not in HEREDOC_DELIM_END:
+            j += 1
+        raw = self.s[self.i:j]
+        if not raw:
             raise ShellError("here-document without a delimiter")
-        return "".join(out), quoted
+        m = HEREDOC_DELIM_RE.fullmatch(raw)
+        if m is None:
+            raise ShellError(f"here-document delimiter `{raw[:40]}` is not a plain word (Round 12, code r11 F1: only a plain "
+                             "[A-Za-z0-9_]+ word, alone, in one whole quote pair or after one backslash is read)")
+        self.i = j
+        return raw.strip("'\"\\"), raw[0] in "'\"\\"
 
     def redirect(self, lv: ShellLevel) -> None:
         s, i = self.s, self.i
@@ -1866,6 +2017,7 @@ class ShellScan:
     def braced(self, j: int) -> int:
         """The index after the `}` that closes a `${` whose body starts at ``j``."""
         s, depth = self.s, 1
+        start = j
         # Round 11 (code r10 F3): `@` is an operator only where bash reads one, right after the parameter name or its
         # subscript (`${name@op}`, `${name[i]@op}`, `${!name@op}`); after `:-`, `#`, `%`, `/` and the like it is word text.
         op = j + 1 if s[j:j + 1] in ("!", "#") and s[j + 1:j + 2] not in ("", "}") else j
@@ -1908,9 +2060,42 @@ class ShellScan:
             elif c == "}":
                 depth -= 1
                 if depth == 0:
+                    self.brace_body(s[start:j])
                     return j + 1
             j += 1
         raise ShellError("unterminated `${`")
+
+    def brace_body(self, b: str) -> None:
+        """Round 12 (code r11 F3): note the parts of a `${...}` body that bash evaluates: the name of `${!name}`, the
+        subscript of `${name[expr]}` and the offset and length of `${name:off:len}`; `${name:=..}` makes the name non-literal."""
+        ind = re.match(r"!([A-Za-z_][A-Za-z0-9_]*|[0-9]+)(.*)", b, re.S)
+        if ind is not None:
+            name, rest = ind.groups()
+            if rest in ("*", "@", "[@]", "[*]"):
+                return  # a listing of names or of keys: nothing is evaluated
+            self.brace_names.append(name)
+            if rest.startswith("["):
+                self.brace_subs.append((name, rest[1:rest.rfind("]")] if "]" in rest else rest[1:]))
+            return
+        m = re.match(r"#?([A-Za-z_][A-Za-z0-9_]*|[@*]|[0-9]+)", b)
+        if m is None:
+            return
+        name, pos = m.group(1), m.end()
+        if b[pos:pos + 1] == "[":
+            depth, q = 0, pos
+            while q < len(b):
+                depth += 1 if b[q] == "[" else -1 if b[q] == "]" else 0
+                if depth == 0:
+                    break
+                q += 1
+            expr = b[pos + 1:q]
+            pos = q + 1
+            if expr not in ("@", "*"):
+                self.brace_subs.append((name, expr))
+        if b[pos:pos + 2] == ":=" or b[pos:pos + 1] == "=":
+            self.nonlit.add(name)
+        elif b[pos:pos + 1] == ":" and b[pos + 1:pos + 2] not in ("-", "=", "+", "?"):
+            self.brace_offsets.extend(b[pos + 1:].split(":"))
 
     def arithmetic(self, j: int) -> bool:
         """True when the `$((` whose body starts at ``j`` closes with an adjacent `))`; otherwise bash reads it as the
@@ -1927,6 +2112,29 @@ class ShellScan:
                     return True
             j += 1
         raise ShellError("unterminated `$((`")
+
+    def c_style_for(self, lv: ShellLevel) -> None:
+        """Round 12 (code r11 F3, conductor decision): ``for (( init; cond; step ))``. The header makes its variable
+        literal only when the three expressions hold nothing but plain numbers, that variable and arithmetic operators;
+        any other character (`$`, a quote, a backtick) is refused as text the scanner cannot read."""
+        s, j, depth = self.s, self.i + 1, 2
+        while j < self.n and depth:
+            depth += {"(": 1, ")": -1}.get(s[j], 0)
+            j += 1
+        body = s[self.i + 1:j - 2]
+        parts = body.split(";")
+        init = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[0-9]+\s*", parts[0]) if len(parts) == 3 else None
+        if init is None or FOR_ARITH_HEADER_RE.fullmatch(body.replace(";", " ")) is None:
+            raise ShellError(f"`for (( {body[:40]} ))` header is not a plain-number loop: only `NAME=N; test; step` over plain "
+                             "numbers, that name and arithmetic operators is read (Round 12, code r11 F3)")
+        name = init.group(1)
+        for part in parts[1:]:
+            for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", part):
+                if m.group(0) != name:
+                    self.for_bad.add(name)
+        self.for_vars.append(name)
+        self.i = j
+        lv.expect = ""
 
     def walk_arithmetic(self, i: int) -> str:
         """Round 7 (N1): the body of `$(( ))` is walked, so a `$( )`, a backtick or a `${ }` inside it is scanned."""
@@ -1959,13 +2167,21 @@ class ShellScan:
             j += 1
         if depth:
             raise ShellError("unterminated `$((`")
+        self.arith_bodies.append(s[i + 3:j - 2])
         self.i = j
         return "$(())"
 
-    def dollar(self) -> str:
+    def dollar(self, bare: bool = False) -> str:
         s, i = self.s, self.i
         self.xcount += 1
         nxt = s[i + 1:i + 2]
+        if bare and nxt == "'":
+            # Round 12 (code r11 F3): bash decodes `$'..'` escapes (`\x24` is a dollar), so the text it builds is never the
+            # text the scanner read. A `$'..'` with a backslash before its first closing quote is refused.
+            end = s.find("'", i + 2)
+            if end >= 0 and "\\" in s[i + 2:end]:
+                raise ShellError("ANSI-C quoting `$'..'` with an escape is decoded by bash into text the scanner cannot read "
+                                 "(Round 12, code r11 F3)")
         if s[i + 1:i + 3] == "((" and self.arithmetic(i + 3):
             return self.walk_arithmetic(i)
         if nxt == "(":
@@ -2087,7 +2303,7 @@ class ShellScan:
                 buf.append(self.dquote())
                 lit, have = False, True
             elif c == "$":
-                buf.append(self.dollar())
+                buf.append(self.dollar(True))
                 lit, have = False, True
             elif c == "`":
                 self.i += 1
@@ -2124,7 +2340,16 @@ class ShellScan:
                 self.i += 1
                 if lv.cases and lv.cases[-1] == "pat":
                     continue
+                paren_at = self.i
                 if s[self.i - 2:self.i - 1] == "=" and self.array_literal():
+                    an = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\+?=\($", s[:paren_at])
+                    if an is not None:
+                        self.nonlit.add(an.group(1))
+                    continue
+                if lv.cmd_pos and s[self.i:self.i + 1] == "(" and self.arithmetic(self.i + 1):
+                    raise ShellError("`(( ))` evaluates its body as arithmetic and is refused (Round 12, code r11 F3)")
+                if lv.expect == "for_var" and s[self.i:self.i + 1] == "(" and self.arithmetic(self.i + 1):
+                    self.c_style_for(lv)
                     continue
                 if not lv.cmd_pos:
                     name = self.cmds[-1] if self.cmds else None
@@ -3540,13 +3765,16 @@ def check_run(step: Node, name: str, where: str, rep: Report, ctx: RunCtx) -> No
                 rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` sets {env_bad} (Round 9, sec r8 F1, F2: a variable that "
                         "picks a program, a linker, a config or a registry loads it in every later command and step, so it is "
                         "refused in every `run:`, not only in a fetch step)")
+            elif scan.f3_error is not None:  # Round 12: last, so an older rule's message is never doubled
+                rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` is refused: {scan.f3_error}")
         for key in matrix_complex_keys(raw, ctx):
             rep.bad(f"{name}: {where}: line {run.line + 1}: `run:` splices `matrix.{key}`, a mapping or sequence value, whole "
                     "into the script (Round 9, F8: only a scalar matrix value is a word the guard can read)")
         for label, variant in matrix_variants(raw, ctx):
             try:
                 vscan = ShellScan(variant)
-                why = run_problem(vscan, ctx) or fetch_problem(vscan, {}, ctx.made)
+                why = run_problem(vscan, ctx) or fetch_problem(vscan, {}, ctx.made) or (
+                    f"text the scanner cannot read ({vscan.f3_error})" if vscan.f3_error is not None else "")
             except ShellError as err:
                 why = f"text the scanner cannot read ({err})"
             if why:
@@ -5873,7 +6101,18 @@ R12_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r12 F3: [ -v ] on a non-literal name is refused": (_r8("X=$HOME", "[ -v \"$X\" ]"), None, 1, "non-literal operand"),
     "r12 F3: a non-literal substring offset is refused": (_r8("X=$HOME", "echo ${S:$X:1}"), None, 1, "non-literal operand"),
     "r12 F3: a non-literal read subscript is refused": (_r8("X=$HOME", "echo ${ary[X]}"), None, 1, "non-literal operand"),
-    "r12 F3: a for-loop variable in $(( )) is refused": (_r8("for i in 1 2; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over a variable list in $(( )) is refused": (_r8("for i in $list; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over seq output in $(( )) is refused (the publish-ci-image shape)": (_r8("for i in $(seq 1 60); do echo $((i*2)); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over a letter brace range is refused": (_r8("for i in {a..c}; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over a quoted number is refused": (_r8("for i in \"1\"; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable over positional parameters is refused": (_r8("for i; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a for-loop variable with a plain and an expanded header is refused": (_r8("for i in 1 2; do :; done", "for i in $x; do echo $(( i )); done"), None, 1, "non-literal operand"),
+    "r12 F3: a C-style loop comparing to a variable is refused": (_r8("for ((i=0;i<n;i++)); do echo $((i*2)); done"), None, 1, "non-literal operand"),
+    "r12 F3: a C-style loop header with an expansion is refused": (_r8("for ((i=0;i<$n;i++)); do :; done"), None, 1, "plain-number loop"),
+    "r12 F3: a for-loop variable over a numeric brace range is accepted": (_r8("for i in {1..60}; do echo $((i*2)); done"), None, 0, ""),
+    "r12 F3: a for-loop variable over a stepped numeric brace range is accepted": (_r8("for i in {1..60..5}; do echo $((i*2)); done"), None, 0, ""),
+    "r12 F3: a for-loop variable over plain numbers is accepted": (_r8("for i in 1 2 3; do echo $((i*2)); done"), None, 0, ""),
+    "r12 F3: a C-style loop over plain numbers is accepted": (_r8("for ((i=0;i<3;i++)); do echo $((i*2)); done"), None, 0, ""),
     "r12 F3: an array-valued name in $(( )) is refused": (_r8("N=(1 2)", "echo $(( N ))"), None, 1, "non-literal operand"),
     "r12 F3: a name with one plain and one expanded assignment is refused": (_r8("N=5", "N=$HOME", "echo $(( N ))"), None, 1, "non-literal operand"),
     "r12 F3: a command substitution as an operand is refused": (_r8("echo $(( $(true) + 1 ))"), None, 1, "non-literal operand"),
@@ -6029,6 +6268,12 @@ def self_test(root: Path) -> int:
                 print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
                       file=sys.stderr)
                 failures += 1
+        for name, (doc_text, files, count, needle) in R12_CASES.items():
+            errs = r5_errors(doc_text, files, tmp / "r12")
+            if len(errs) != count or (needle and needle not in " | ".join(errs)):
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
         for twin in cargo_config_twins():
             print(f"self-test FAIL: {twin}", file=sys.stderr)
             failures += 1
@@ -6052,7 +6297,7 @@ def self_test(root: Path) -> int:
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
         f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases, "
-        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(R8_CASES)} round-8 cases, {len(R9_CASES)} round-9 cases, {len(R11_CASES)} round-11 cases, {len(JOINED_CASES)} joined cases)"
+        f"{len(R5_CASES)} round-5/6 cases, {len(R7_CASES)} round-7 cases, {len(R8_CASES)} round-8 cases, {len(R9_CASES)} round-9 cases, {len(R11_CASES)} round-11 cases, {len(R12_CASES)} round-12 cases, {len(JOINED_CASES)} joined cases)"
     )
     return 0
 
