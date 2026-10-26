@@ -374,9 +374,9 @@ class TestTierPasswordWiring6181(unittest.TestCase):
             "no -I": (CALL, CALL.replace("python3 -I", "python3")),
             "|| true": (CALL, CALL[:-6] + " || true; then"),
             "exit 0": (CALL + "\n            exit 1", CALL + "\n            exit 0"),
-            "continue-on-error": ("        shell: bash\n        env:\n          # matrix.leg via env",
-                                  "        shell: bash\n        continue-on-error: true\n        env:\n"
-                                  "          # matrix.leg via env"),
+            # the canary copy injects an entry between ``env:`` and the comment, so the anchor allows that one optional line (r31)
+            "continue-on-error": (re.search(CONTINUE_PATTERN, text).group(0),
+                                  re.search(CONTINUE_PATTERN, text).group(0).replace("        env:\n", "        continue-on-error: true\n        env:\n", 1)),
             # #6671: edits that leave every line in place but make the check unreachable.
             "guarded by an if": (block, 'if [ "${CI_NODE:-}" = "never" ]; then\n          ' + block + "\n          fi"),
             "inside a function": (block, "tier_check() {\n          " + block + "\n          }"),
@@ -2225,9 +2225,11 @@ class TestStrictLoaderPins8187(unittest.TestCase):
             self.assertIs(job["permissions"] == {"contents": "read"}, True)
             self.assertIs("needs" not in job and "if" not in job, True)
         skip_name = "TIER_CANARY_8187_SKIP"
-        pin_env = [s["env"] for s in pins["steps"] if "env" in s]
+        # the canary copy injects its own CANARY_CREDENTIAL entry into every env block; it is not the skip variable
+        pin_env = [{k: v for k, v in s["env"].items() if k != canary.CANARY_ENV_KEY} for s in pins["steps"] if "env" in s]
         self.assertIs(pin_env == [{skip_name: "1"}], True, "only the pins test step sets the skip variable")
-        self.assertIs("env" not in canary_job and all("env" not in s for s in canary_job["steps"]), True)
+        self.assertIs("env" not in canary_job and all(
+            not ({k for k in s.get("env", {})} - {canary.CANARY_ENV_KEY}) for s in canary_job["steps"]), True)
         self.assertIs(str(data["jobs"]).count(skip_name) == 1, True, "the skip variable appears in no other job")
         canary_runs = [s["run"] for s in canary_job["steps"] if isinstance(s.get("run"), str)]
         self.assertIs(any("pip install --require-hashes --no-deps -r scripts/test/requirements-ci.txt" in r for r in canary_runs), True)
@@ -2237,6 +2239,9 @@ class TestStrictLoaderPins8187(unittest.TestCase):
         canary_uses = [s["uses"] for s in canary_job["steps"] if "uses" in s]
         self.assertIs(pin_uses == canary_uses, True, "the same pinned action SHAs in both jobs")
         self.assertIs(len(canary_uses) == 2 and all(re.search(r"@[0-9a-f]{40}$", u) for u in canary_uses), True)
+
+
+CONTINUE_PATTERN = r"        shell: bash\n        env:\n(?:          CANARY_CREDENTIAL: \S+\n)?          # matrix\.leg via env"
 
 
 def tier_job_of(text):
