@@ -192,6 +192,24 @@ MUTATIONS = {
         + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True))
         + "          x=1; if true; then\n            :\n          fi\n",
     ),
+    "M21 heredoc body carries if x / fi, heal after the real fi (code r5 F1 = sec r5 F1, x1)": (
+        GUARD_END,
+        "            cat <<'EOF'\n            if x\n          EOF\n          fi\n"
+        + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True))
+        + "          cat <<'EOF'\n          fi\n          EOF\n",
+    ),
+    "M22 backslash-continued command whose next line is if x / fi (x2)": (
+        GUARD_END,
+        "            echo a \\\n            if x\n          fi\n"
+        + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True))
+        + "          echo b \\\n          fi\n",
+    ),
+    "M23 multi-line double-quoted string carries if x / fi (x3)": (
+        GUARD_END,
+        '            echo "a\n            if x\n            b"\n          fi\n'
+        + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True))
+        + '          echo "a\n          fi\n          b"\n',
+    ),
     "M12 nproc added": (GUARD_END, GUARD_END + "          nproc\n"),
     "M13 /proc/meminfo added": (GUARD_END, GUARD_END + "          cat /proc/meminfo\n"),
     "M14 postgresql bin loop without homebrew twin": (
