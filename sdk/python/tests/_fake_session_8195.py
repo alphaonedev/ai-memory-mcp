@@ -29,7 +29,12 @@ def install(monkeypatch: pytest.MonkeyPatch) -> None:
     real = _common._session_facts  # noqa: SLF001
 
     def reader(session: object) -> Any:
-        if session is not None and hasattr(session, "context") and not hasattr(session, "_sslobj"):
+        if (
+            session is not None
+            and type(session) is not _common._C_SSLOBJ  # noqa: SLF001
+            and hasattr(session, "context")
+            and not hasattr(session, "_sslobj")
+        ):
             return _Facts(session)
         return real(session)
 
