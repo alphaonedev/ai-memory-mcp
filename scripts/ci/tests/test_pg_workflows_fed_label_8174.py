@@ -160,6 +160,10 @@ MUTATIONS = {
         GUARD_END,
         "          if true; then\n            :\n          fi\n" + HEAL_CALL.replace("            ", "          "),
     ),
+    "M19 guard fi indented deeper, heal block after it at the guard indent": (
+        GUARD_END,
+        "            :\n            fi\n" + "".join(x[2:] for x in HEAL_CALL.splitlines(keepends=True)),
+    ),
     "M12 nproc added": (GUARD_END, GUARD_END + "          nproc\n"),
     "M13 /proc/meminfo added": (GUARD_END, GUARD_END + "          cat /proc/meminfo\n"),
     "M14 postgresql bin loop without homebrew twin": (
