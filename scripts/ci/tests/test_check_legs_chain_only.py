@@ -122,9 +122,40 @@ def behaviour_problems(module):
 DQ_ESCAPE_RE = re.compile(r'(?:-\s+)*(?:"[^"\n]*\\|[{\[].*"[^"\n]*\\)')
 
 
+# #8174 security r6 F1: characters YAML 1.1 reads as a line break but `str.split('\n')` does not;
+# one inside a comment hides a real key on the "next" line from the line scanner. Refused anywhere
+# in ci.yml (live count 0 each). A bare CR is a YAML line break too.
+YAML_LINE_BREAKS = (('\x85', 'U+0085'), (' ', 'U+2028'), (' ', 'U+2029'), ('\r', 'CR'))
+# #8174 security r6 F2: an alias or anchor used as (or inside) a key: the token opens a line after
+# any `- `/`? ` prefix, or follows `{`, `[`, `,` or a space. Refused inside the two gate jobs.
+NODE_PROPERTY_RE = re.compile(r'(?:^|[\s{\[,])[*&][A-Za-z0-9_]')
+# #8174 security r6 F3: the job after each gate job at indent 2. A multi-line quoted scalar whose
+# continuation line is `  other:` ends `job_text` early; the pin therefore requires the key that
+# really follows and that each of the four names occurs once.
+JOB_FOLLOWED_BY = (('check', 'postgres-feature'), ('classify', 'lint'))
+
+
 def job_text(ci, job):
     m = re.search(r'^  %s:\n(.*?)(?=^  [a-z][a-z0-9_-]*:\n)' % re.escape(job), ci, re.S | re.M)
     return m.group(1) if m else ''
+
+
+def scan_problems(ci):
+    """Whole-file scanner guards: YAML line-break characters and the gate jobs' real extent."""
+    problems = []
+    for char, label in YAML_LINE_BREAKS:
+        if char in ci:
+            problems.append('ci.yml must not contain %s (a YAML line break the line scanner cannot see)' % label)
+    for job, following in JOB_FOLLOWED_BY:
+        for name in (job, following):
+            count = len(re.findall(r'^  %s:$' % re.escape(name), ci, re.M))
+            if count != 1:
+                problems.append('job key %s must occur exactly once at indent 2, found %d' % (name, count))
+        m = re.search(r'^  %s:\n.*?^  ([a-z][a-z0-9_-]*):\n' % re.escape(job), ci, re.S | re.M)
+        if not m or m.group(1) != following:
+            problems.append('job %s must be followed by %s at indent 2, found %s'
+                            % (job, following, m.group(1) if m else None))
+    return problems
 
 
 def step_blocks(job):
@@ -243,11 +274,11 @@ def notice_escape_problems(ci):
 
 def workflow_problems(ci):
     """Every way the workflow wiring deviates from the chain-only design."""
-    problems = []
+    problems = scan_problems(ci)
     check = job_text(ci, 'check')
     classify = job_text(ci, 'classify')
     if not check or not classify:
-        return ['check or classify job not found']
+        return problems + ['check or classify job not found']
     legs = matrix_legs(check)
     if len(legs) != len(LEGS):
         problems.append('Check matrix must keep %d legs, found %d' % (len(LEGS), len(legs)))
@@ -323,7 +354,9 @@ def workflow_problems(ci):
             if text.startswith('#'):
                 continue
             where = '(line %d: %r)' % (offset + number, text)
-            if 'continue-on-error' in text:
+            if NODE_PROPERTY_RE.search(line):
+                problems.append('the %s job must not use a YAML alias or anchor %s' % (job_name, where))
+            elif 'continue-on-error' in text:
                 problems.append('the %s job must not use continue-on-error at any indent %s' % (job_name, where))
             elif text.startswith('?'):
                 problems.append('the %s job must not use a YAML explicit key %s' % (job_name, where))
@@ -348,10 +381,6 @@ def workflow_problems(ci):
             if step_field(body, key) is not None:
                 problems.append('the legs step must have no %s (a failed classify must stay red)' % key)
     return problems
-
-
-YAML_LINE_BREAKS = (('\x85', 'U+0085'), ('\u2028', 'U+2028'), ('\u2029', 'U+2029'), ('\r', 'CR'))
-JOB_FOLLOWED_BY = (('check', 'postgres-feature'), ('classify', 'lint'))
 
 
 def scan_mutants(ci):
