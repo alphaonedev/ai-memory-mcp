@@ -2458,7 +2458,9 @@ jobs:
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). It holds no secret, reads only the checked-out
     # workflow files and installs one hash-pinned Python package, so it never needs the tier node.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Measured 5m22s at 7bc7333bd (run 40218275501); the canary's forced child doubles the module, which passed 15 min.
+    # decision: timeout-minutes 30 over a separate parallel canary job because .github/workflows/ci.yml:2368 already uses 30 as a precedent and the change is one line; a measured hosted-runner duration above 20 min reopens the split
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
