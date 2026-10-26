@@ -14,15 +14,22 @@ every node):
   (b) no ``run:`` block contains a GNU-only token (a macOS runner has BSD tools);
   (c) each workflow self-heals the hand-built macOS AGE install through
       ``scripts/ci/ensure-age-extension.py`` behind a ``$RUNNER_OS`` check, the
-      same branch ci.yml takes for its macos-fed enterprise-fed leg. The guard's closing ``fi``
-      sits at the guard line's indent and every line between them is indented deeper; a line
-      inside the guard that ends with a backslash, contains ``<<`` or has an odd quote count is
-      refused, because bash may read an ``if``/``fi`` there as data.
+      same branch ci.yml takes for its macos-fed enterprise-fed leg. The guard body is pinned
+      to exactly the heal call: the stripped lines between the guard line and the guard's
+      closing ``fi`` must equal the stripped ``HEAL_CALL`` lines, same order, same count. The
+      end is therefore never trusted from line shape alone: a late end or a data ``fi`` (a
+      quote of one kind inside a string of the other, ``\\'`` inside single quotes, an
+      arithmetic ``(( ))`` command naming ``if`` / ``fi``) changes the body and is refused as a
+      named defect. ``guard_end`` keeps its own refusals (unprovable line, not indented deeper,
+      uncountable if/fi, guard ``fi`` off the guard indent, no closing ``fi``). Fail-closed
+      cost: a valid but different guard body (an elif or case shape) is a named defect too;
+      neither live workflow has one.
 
 Run: python3 -m unittest discover -s scripts/ci/tests -p 'test_pg_workflows_fed_label_8174.py'
 """
 import re
 import unittest
+from itertools import zip_longest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -146,6 +153,20 @@ def heal_defects(lines):
             end, problem = guard_end(body, n)
             if end is None:
                 return [problem]
+            # decision: pin the guard body to exactly the heal call over a per-line quote-state
+            # scanner because the exact-body pin stops inferring the guard end from line shape at
+            # all (no shell lexing left to fool), ends the defect class in one function, and keeps
+            # the settled fail-closed no-parser design; a quote scanner would still leave
+            # arithmetic and future contexts (y3) open.
+            got = [x.strip() for x in body[n + 1:end]]
+            want = [x.strip() for x in HEAL_CALL.splitlines()]
+            if got != want:
+                differing = next(
+                    (g if g is not None else "(guard ends before: " + w + ")")
+                    for g, w in zip_longest(got, want)
+                    if g != w
+                )
+                return ["RUNNER_OS guard body is not exactly the heal call: " + differing]
             inside += sum(HEAL_SCRIPT in x for x in body[n + 1:end])
     if inside != 1 or total != 1:
         return ["heal call not exactly once inside the guard"]
@@ -276,9 +297,12 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
             with self.subTest(workflow=path.name):
                 text = "\n".join("\n".join(b) for b in run_blocks(path))
                 self.assertIn(HEAL_GUARD, text)
+                create_anchor = "CREATE EXTENSION IF NOT EXISTS age"
+                for anchor in (HEAL_GUARD, HEAL_SCRIPT, create_anchor):
+                    self.assertIn(anchor, text, "anchor absent from the run blocks: " + anchor)
                 guard_at = text.index(HEAL_GUARD)
                 heal_at = text.index(HEAL_SCRIPT)
-                create_at = text.index("CREATE EXTENSION IF NOT EXISTS age")
+                create_at = text.index(create_anchor)
                 self.assertLess(guard_at, heal_at)
                 self.assertLess(heal_at, create_at)
 
@@ -313,6 +337,63 @@ class PgWorkflowsRunOnEitherFedNode(unittest.TestCase):
         self.assertEqual(len(got), 1, got)
         self.assertIn("uncountable if/fi", got[0])
         self.assertIn("if true; then :; fi", got[0])
+
+    def _defects_with_guard_body(self, body_lines):
+        """heal_defects of postgres-ignored.yml with the guard body replaced by ``body_lines``."""
+        base = WORKFLOWS[0].read_text(encoding="utf-8")
+        guard = '          if [ "$RUNNER_OS" = "macOS" ]; then\n'
+        self.assertEqual(base.count(guard + HEAL_CALL), 1, "guard anchor drifted")
+        return heal_defects(base.replace(guard + HEAL_CALL, guard + body_lines, 1).splitlines())
+
+    def test_data_fi_rows_are_refused_as_a_body_that_is_not_the_heal_call(self):
+        """code r6 F1 / sec r6 F1: M24-M27 end late or hide the call; the exact-body pin names it."""
+        base = WORKFLOWS[0].read_text(encoding="utf-8")
+        for prefix in ("M24", "M25", "M26", "M27"):
+            name = next(n for n in MUTATIONS if n.startswith(prefix))
+            old, new = MUTATIONS[name]
+            with self.subTest(mutation=prefix):
+                got = heal_defects(base.replace(old, new, 1).splitlines())
+                self.assertEqual(len(got), 1, got)
+                self.assertTrue(got[0].startswith("RUNNER_OS guard body is not exactly the heal call: "), got)
+
+    def test_body_defect_names_the_first_differing_line(self):
+        got = self._defects_with_guard_body("            echo extra\n" + HEAL_CALL)
+        self.assertEqual(got, ["RUNNER_OS guard body is not exactly the heal call: echo extra"])
+        got = self._defects_with_guard_body("")
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("not exactly the heal call", got[0])
+
+    def test_noop_edits_keep_the_guard_body_exact(self):
+        """A comment, an empty line, a uniform re-indent or a full-line ``# don't`` change nothing."""
+        calls = HEAL_CALL.splitlines(keepends=True)
+        shapes = {
+            "comment line in guard": "            # note\n" + HEAL_CALL,
+            "empty line in guard": "\n" + HEAL_CALL,
+            "full-line # don't": "            # don't\n" + HEAL_CALL,
+            "body +2 uniformly": "".join("  " + x for x in calls),
+        }
+        for label, body in shapes.items():
+            with self.subTest(shape=label):
+                self.assertEqual(self._defects_with_guard_body(body), [])
+        base = WORKFLOWS[0].read_text(encoding="utf-8")
+        guard = '          if [ "$RUNNER_OS" = "macOS" ]; then\n'
+        whole = guard + GUARD_END
+        self.assertEqual(base.count(whole), 1, "guard anchor drifted")
+        shifted = "".join("  " + x for x in whole.splitlines(keepends=True))
+        self.assertEqual(heal_defects(base.replace(whole, shifted, 1).splitlines()), [])
+
+    def test_valid_elif_and_case_bodies_are_named_defects(self):
+        """Fail-closed cost: shapes absent from the live guards are refused, not guessed at."""
+        elif_body = (
+            "            if a; then\n              :\n            elif b; then\n              :\n"
+            "            else\n              :\n            fi\n"
+        )
+        case_body = '            case "$x" in\n              a) : ;;\n            esac\n'
+        for label, body in (("elif", elif_body), ("case", case_body)):
+            with self.subTest(shape=label):
+                got = self._defects_with_guard_body(body + HEAL_CALL)
+                self.assertEqual(len(got), 1, got)
+                self.assertIn("not exactly the heal call", got[0])
 
     def test_every_mutation_row_is_detected(self):
         """code r1 F1/F2: each of M11-M14 applied to an in-memory copy must be reported."""
