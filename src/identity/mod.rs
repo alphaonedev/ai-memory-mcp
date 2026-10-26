@@ -353,8 +353,8 @@ pub fn process_discriminator() -> &'static str {
     static DISCRIMINATOR: OnceLock<String> = OnceLock::new();
     DISCRIMINATOR.get_or_init(|| {
         let pid = std::process::id();
-        let uuid_short = short_uuid();
-        format!("pid-{pid}-{uuid_short}")
+        let hex8 = random_hex8();
+        format!("pid-{pid}-{hex8}")
     })
 }
 
@@ -368,7 +368,7 @@ fn hostname_opt() -> Option<String> {
 }
 
 /// 8 lowercase hex characters derived from a fresh `UUIDv4`.
-fn short_uuid() -> String {
+fn random_hex8() -> String {
     let id = uuid::Uuid::new_v4();
     let simple = id.simple().to_string(); // 32 hex chars, no hyphens
     simple[..8].to_string()
@@ -871,7 +871,7 @@ pub fn enforce_owner_lockout_guard(conn: &rusqlite::Connection) -> Result<()> {
 /// drifted to a full 36-char uuid suffix while the documented contract
 /// and this module's resolver used uuid8).
 pub fn anonymous_request_id() -> String {
-    format!("{}{}", sentinels::ANONYMOUS_REQ_PREFIX, short_uuid())
+    format!("{}{}", sentinels::ANONYMOUS_REQ_PREFIX, random_hex8())
 }
 
 /// #3775 — the ONE predicate for "this HTTP principal was minted by
@@ -1265,8 +1265,8 @@ mod tests {
     }
 
     #[test]
-    fn short_uuid_is_8_hex_chars() {
-        let s = short_uuid();
+    fn random_hex8_is_8_hex_chars() {
+        let s = random_hex8();
         assert_eq!(s.len(), 8);
         assert!(
             s.chars()

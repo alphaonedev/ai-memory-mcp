@@ -16,13 +16,13 @@ that the named watchdog, not a nameless job-level cancel, is what fires (#6411).
 |---|---|---|---|---|
 | `ubuntu-latest,sqlite` | 2100 s (35 min) | 95 | see #3538 | see #3538 |
 | `macos-fed,sqlite` | 2400 s (40 min) | 80 | about 27 min (#3461) | n/a |
-| `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 160 | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
+| `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 300 (#7914) | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
 | `macos-fed,enterprise-fed` | 7800 s (130 min) per shard | 160 | n/a | n/a |
 
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. On the sharded
 `enterprise-fed` legs the stricter rule applies: job `timeout-minutes` >=
 watchdog minutes + 28 (pre-watchdog compile and database setup) + 2 (teardown)
-= 160. All four rows meet both.
+= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 3600 s, counted against the cap; identity: cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)). All four rows meet both.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
 

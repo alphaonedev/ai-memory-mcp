@@ -18,6 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
+
+#[path = "common/tls.rs"]
+mod tls_helper;
 const MONITOR: &str = "ai:monitor-3646";
 const TOKEN: &str = "SECRET_KEY_MATERIAL_3646";
 const CONTENT: &str = "TENANT_CONTENT_CANARY_3646";
@@ -474,9 +477,13 @@ async fn issue_3646_real_mtls_monitor_cannot_write() {
     let allowlist = dir.path().join("allowlist");
     let fingerprint = std::fs::read_to_string(fixtures.join("valid_cert_sha256.txt")).unwrap();
     std::fs::write(&allowlist, &fingerprint).unwrap();
+    // Server identity: a per-test leaf valid for 127.0.0.1 that the clients
+    // pin as their only root (#8179). The fixture pair stays the CLIENT
+    // identity whose fingerprint the allowlist binds to the monitor.
+    let server_tls = tls_helper::TestTls::generate(&dir.path().join("server-tls"));
     let tls = ai_memory::tls::load_mtls_rustls_config(
-        &fixtures.join("valid_cert.pem"),
-        &fixtures.join("valid_key_pkcs8.pem"),
+        &server_tls.cert_path,
+        &server_tls.key_path,
         &allowlist,
     )
     .await
@@ -507,8 +514,8 @@ async fn issue_3646_real_mtls_monitor_cannot_write() {
     let mut pem = std::fs::read(fixtures.join("valid_cert.pem")).unwrap();
     pem.extend(std::fs::read(fixtures.join("valid_key_pkcs8.pem")).unwrap());
     let client = reqwest::Client::builder()
-        // Committed self-signed fixture; the server still enforces its allowlist.
-        .danger_accept_invalid_certs(true)
+        .use_rustls_tls()
+        .add_root_certificate(server_tls.certificate())
         .identity(reqwest::Identity::from_pem(&pem).unwrap())
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -531,7 +538,8 @@ async fn issue_3646_real_mtls_monitor_cannot_write() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let anonymous = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .use_rustls_tls()
+        .add_root_certificate(server_tls.certificate())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();

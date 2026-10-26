@@ -1558,7 +1558,6 @@ WORKFLOW_COPY_TIMEOUT_S = 600
 
 REASON_LEXER = ("the 6560 lexer is not on the chain tip; the finished design (compiled liveness, "
                 "#6911) rejects a patch that makes the id dead while it stays named once")
-REASON_GENERATOR = "the vendored cert generator exists only on draft PR 7393, not on the chain tip"
 
 
 def repo_text(rel):
@@ -1627,7 +1626,7 @@ GENERATOR_NEEDLES = {
     (r"run_cert.py", r"the gate copy runs under python3 -I"):
         ('\\[sys\\.executable, "-I"',),
     (r"run_cert.py", r"the sweep goes through the directory fd"):
-        (r"def remove_tree\(dfd, name\)", r"dir_fd=dfd",),
+        (r"def remove_tree\(dfd, name\b", r"dir_fd=dfd",),
     (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the AST guard checks tempfile and folds join"):
         (r"TEMPFILE_ALWAYS", r"TMP_ROOTS subscript", r"PATH_JOINS", r"without dir=",),
     (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the posture OSError widening is pinned"):
@@ -2379,19 +2378,19 @@ class Corpus(CorpusBase):
         self.generator_file("../ci/tests/test_evidence_fixture_identity.py",
                             "the fixture byte-identity test the cert procedure cites")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7399_recapture_py_lookup(self):
         self.generator_file("build_bundle.py", "recapture lookup must find the .py")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7411_untracked_runs_as_tip(self):
         self.generator_file("run_cert.py", "scripts picked from the tip tree, never the worktree")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7412_outdir_unescaped(self):
         self.generator_file("run_cert.py", "the output dir must be quoted in generated bash")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7413_cert_env_unvalidated(self):
         self.generator_file("run_cert.py", "CERT_ env overrides validated and logged")
 
@@ -2403,127 +2402,127 @@ class Corpus(CorpusBase):
         self.assertNotIn("--passphrase", text)
         self.assertIn("AI_MEMORY_DB_PASSPHRASE", text, "the passphrase is no longer read from the environment")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7417_prep_hash_qualified(self):
         self.generator_file("prep.py", "commit-1 bytes hash-qualified, docstring true")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7419_crashed_run_after_done(self):
         self.generator_file("build_bundle.py", "check_run rejects a later crashed chain run")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7420_missing_wrapper_red(self):
         self.generator_file("run_cert.py", "a missing wrapper writes a RED and an EXIT row")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7421_relative_targets_cwd(self):
         self.generator_file("run_cert.py", "relative CERT_TARGETS and CERT_TMPDIR refused or resolved")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7422_push_fail_exit(self):
         self.generator_file("run_cert.py", "a failed cert commit push fails the gates leg")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7423_prep_grep_error(self):
         self.generator_file("prep.py", "a git grep error is an error, never an empty FED id set")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7425_ionice_recorded(self):
         self.generator_file("run_cert.py", "cert-alone.out records ionice only when it was used")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7439_lookalike_symlink_skipwt(self):
         self.generator_file("run_cert.py", "pick_expiry refuses look-alike, symlink and skip-worktree copies")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7440_tmpfs_outdir(self):
         self.generator_file("run_cert.py", "an output dir on tmpfs or under a tmp root is refused")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7441_wrapper_validated_config_row(self):
         self.generator_file("run_cert.py", "wrapper, flock and timeout validated; CONFIG row names the source")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7442_mount_octal_escape(self):
         self.generator_file("run_cert.py", "is_tmpfs_path decodes proc-mounts octal escapes")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7443_empty_fed_set(self):
         self.generator_file("prep.py", "an empty FED id set at either end is an error")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7446_docstring_exit64(self):
         self.generator_file("run_cert.py", "the docstring states ionice conditionally and exit 64")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7486_plans_gates_entry(self):
         self.generator_file("run_cert.py", "PLANS has a gates entry")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7489_copy_symlink_delete(self):
         self.generator_file("run_cert.py", "the expiry gate copy never follows a symlink")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7490_preflight_exit_row(self):
         self.generator_file("run_cert.py", "the preflight EXIT row says 64 where the exit is 64")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7492_tests_poison_tmp(self):
         self.generator_file("../ci/tests/test_evidence_generator_r3_7393.py", "tests write under the scratch root only")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7530_copy_oserror_row(self):
         self.generator_file("run_cert.py", "an OSError creating the gate copy writes an EXIT row")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7531_copy_repo_root(self):
         self.generator_file("run_cert.py", "a relocated gate copy resolves its repo root to the checkout")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7532_killed_run_cleanup_flags(self):
         self.generator_file("run_cert.py", "O_EXCL and O_NOFOLLOW pinned; a killed run is swept")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7534_tmp_root_spellings(self):
         self.generator_file("../ci/tests/test_evidence_generator_r2_7393.py", "the tmp-root guard covers every spelling")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7535_ignored_leg_flags(self):
         self.generator_file("run_cert.py", "push-branch and parent refused on legs that ignore them")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7581_copy_isolated_mode(self):
         self.generator_file("run_cert.py", "the gate copy runs under python3 -I")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7582_sweep_after_fd_open(self):
         self.generator_file("run_cert.py", "the sweep goes through the directory fd")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7583_ast_guard_tempfile_join(self):
         self.generator_file("../ci/tests/test_evidence_generator_r6_7393.py", "the AST guard checks tempfile and folds join")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7584_posture_oserror_pin(self):
         self.generator_file("../ci/tests/test_evidence_generator_r6_7393.py", "the posture OSError widening is pinned")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7585_realpath_pin(self):
         self.generator_file("../ci/tests/test_evidence_generator_r6_7393.py", "the realpath comparison is pinned")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7617_posture_copy_symlink(self):
         self.generator_file("run_cert.py", "the posture copy is never written through a symlink")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7618_check_to_exec_window(self):
         self.generator_file("run_cert.py", "the gate copy has no check-to-exec window")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7620_deep_stale_sweep(self):
         self.generator_file("run_cert.py", "a deeply nested stale dir does not crash the gates leg")
 
-    @expect(RED, REASON_GENERATOR)
+    @expect(GREEN)
     def case_7665_cwd_stdlib_shadow(self):
         self.generator_file("run_cert.py", "repo gate scripts run with an empty cwd")
 
