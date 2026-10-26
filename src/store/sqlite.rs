@@ -210,6 +210,58 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #7097 - the action label of an archive refusal; the postgres adapter
+/// reports the same string in its `PermissionDenied`.
+const ARCHIVE_ACTION: &str = "archive";
+
+/// #7097 - does a LIVE row with this id exist? (A missing id is skipped by
+/// `archive_by_ids`; a live row the caller may not touch refuses the batch.)
+const SQL_LIVE_ROW_METADATA: &str = "SELECT metadata FROM memories WHERE id = ?1";
+
+fn live_row_metadata(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> rusqlite::Result<Option<serde_json::Value>> {
+    use rusqlite::OptionalExtension;
+    let raw: Option<String> = conn
+        .query_row(SQL_LIVE_ROW_METADATA, [id], |r| r.get(0))
+        .optional()?;
+    // A live row whose metadata cannot be parsed has no provable owner: it
+    // is still a live row, so surface it as an empty object (unstamped).
+    Ok(raw.map(|m| serde_json::from_str(&m).unwrap_or_else(|_| serde_json::json!({}))))
+}
+
+/// #7097 / #7596 - the typed refusal for a LIVE row the caller may not
+/// archive, `None` for an absent id (a silent skip). An unstamped row carries
+/// the postgres reason (`REASON_UNSTAMPED_TENANT_ARCHIVE`); a foreign stamped
+/// row carries the bare `CALLER_DOES_NOT_OWN_MEMORY` and the owner goes only
+/// to the AUTHZ trace (#3426), exactly as the postgres twin does.
+fn archive_refusal(
+    conn: &rusqlite::Connection,
+    id: &str,
+    caller: &str,
+) -> rusqlite::Result<Option<StoreError>> {
+    let Some(metadata) = live_row_metadata(conn, id)? else {
+        return Ok(None);
+    };
+    let stamp = crate::identity::owner_stamp::OwnerStamp::of(&metadata);
+    let reason = if stamp.is_unstamped() {
+        crate::errors::msg::REASON_UNSTAMPED_TENANT_ARCHIVE.to_string()
+    } else {
+        let owner = stamp.owner_for_display();
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            "sal owner-gate refusal on {ARCHIVE_ACTION}: caller {caller} != owner {owner} (id={id})"
+        );
+        crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string()
+    };
+    Ok(Some(StoreError::PermissionDenied {
+        action: ARCHIVE_ACTION.to_string(),
+        target: id.to_string(),
+        reason,
+    }))
+}
+
 /// #4447 — map the typed in-transaction by-id refusal onto the ONE
 /// `PermissionDenied` envelope the postgres adapter returns (error parity);
 /// anything else stays a backend detail.
@@ -3200,10 +3252,9 @@ impl MemoryStore for SqliteStore {
         //
         // `archive_memory_for_caller` is sqlite's own #940 gate: it permits
         // owner, inbox-target, and the legacy-unowned carve-out (#3124),
-        // and reports a refusal as `Ok(false)` — NOT counted, so the row
-        // stays live and surfaces to the handler as `missing`. That is the
-        // sqlite disposition of the same fail-closed contract postgres
-        // expresses as `PermissionDenied`. Operator lanes
+        // and reports a refusal as `Ok(false)`. This SAL batch turns a
+        // refusal of a LIVE row into `PermissionDenied` for the whole batch
+        // (#7097, postgres parity). Operator lanes
         // (`ctx.bypass_visibility`) keep the owner-blind funnel.
         let conn = self.state.lock().await;
         // Parity finding #2 (2026-08) — ALL-OR-NOTHING batch, matching the
@@ -3227,9 +3278,9 @@ impl MemoryStore for SqliteStore {
         //
         // #3193 — owner gate INSIDE the same tx, before the owner-blind
         // `archive_memory_no_tx` core. A foreign-owned / unstamped-refused
-        // / missing id is `continue` (not counted) so sqlite's documented
-        // disposition holds: the row stays live and the handler reports
-        // `missing`. A 403 would be an existence oracle. Operator lanes
+        // LIVE id refuses the whole batch with `PermissionDenied` (#7097,
+        // the postgres contract); an id with no live row is `continue` (not
+        // counted), so absent ids are not an existence oracle. Operator lanes
         // (`ctx.bypass_visibility`) skip the gate. The predicate is the
         // ONE #3124 owner predicate shared with `db::archive_memory_for_caller`
         // (`db::caller_may_mutate_live_row`, a plain read) so a nested
@@ -3242,7 +3293,7 @@ impl MemoryStore for SqliteStore {
         };
         let caller = ctx.effective_principal().to_string();
         let bypass = ctx.bypass_visibility;
-        let batch = (|| -> anyhow::Result<usize> {
+        let batch = (|| -> StoreResult<usize> {
             let mut moved = 0usize;
             for id in ids {
                 if !bypass {
@@ -3255,18 +3306,30 @@ impl MemoryStore for SqliteStore {
                     // disagreed on probe-error disposition. The probe maps a
                     // missing row to `Ok(false)`, so the only `Err` here is a
                     // genuine backend fault, which must roll the whole batch
-                    // back (the closure returns `anyhow::Result`).
+                    // back (the closure returns `StoreResult`).
                     let owned = db::caller_may_mutate_live_row(
                         &conn,
                         id,
                         &caller,
                         crate::identity::owner_stamp::funnel::ARCHIVE,
-                    )?;
+                    )
+                    .map_err(box_err)?;
                     if !owned {
+                        // #7097 - postgres parity: a LIVE row the caller may
+                        // not archive refuses the whole batch with
+                        // `PermissionDenied` (the tx rolls back, nothing is
+                        // archived); an id with no live row stays a silent
+                        // skip (the count-delta contract, not an existence
+                        // oracle for absent ids).
+                        if let Some(refusal) =
+                            archive_refusal(&conn, id, &caller).map_err(box_err)?
+                        {
+                            return Err(refusal);
+                        }
                         continue;
                     }
                 }
-                if db::archive_memory_no_tx(&conn, id, reason)? {
+                if db::archive_memory_no_tx(&conn, id, reason).map_err(box_err)? {
                     moved += 1;
                 }
             }
@@ -3283,7 +3346,7 @@ impl MemoryStore for SqliteStore {
                 if let Some(txn) = write_txn {
                     txn.rollback();
                 }
-                Err(box_err(e))
+                Err(e)
             }
         }
     }

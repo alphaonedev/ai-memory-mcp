@@ -73,7 +73,9 @@ const BOOKKEEPING: &[&str] = &[
 const MUST_SURFACE_AS_WRITE: &[&str] = &["refund_update_growth", "mark_recall_consumed"];
 
 /// Round-6 named siblings. Must gate even if someone re-allowlists them.
-const MUST_BE_GATED: &[&str] = &["reflect_with_hooks", "update_embedding", "link_internal"];
+// #7541 / #7743: the link SQL moved from `link_internal` into `link_in_tx`;
+// `link_internal` no longer writes, so the writer is the pinned name.
+const MUST_BE_GATED: &[&str] = &["reflect_with_hooks", "update_embedding", "link_in_tx"];
 
 fn next_ident(s: &str) -> Option<(&str, &str)> {
     let s = s.trim_start();
