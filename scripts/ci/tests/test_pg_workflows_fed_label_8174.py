@@ -210,6 +210,8 @@ HEAL_CALL = (
     "            fi\n"
 )
 GUARD_END = HEAL_CALL + "          fi\n"
+GUARD_LINE = '          if [ "$RUNNER_OS" = "macOS" ]; then\n'
+STEP_HEAD = "      - name: Point at the native enterprise-fed tier (per-job ephemeral db)\n"
 # Mutation table (code r1 F1/F2): name -> (old text, new text) applied to an in-memory copy of
 # postgres-ignored.yml. Every row must make macos_defects report a defect.
 MUTATIONS = {
@@ -266,6 +268,38 @@ MUTATIONS = {
         "            (( a = 0 +\n            if +\n            1 ))\n            fi\n"
         + HEAL_CALL
         + "            (( a = 0 +\n          fi\n          + 1 ))\n",
+    ),
+    "M28 here-document opened before the guard swallows the guard line, heal runs on every OS (code r7 w1)": (
+        GUARD_LINE,
+        "          if true; then cat >/dev/null <<'" + GUARD_LINE.strip() + "'\n" + GUARD_LINE,
+    ),
+    "M29 RUNNER_OS=macOS assigned before the guard (sec r7 W1)": (
+        GUARD_LINE,
+        "          RUNNER_OS=macOS\n" + GUARD_LINE,
+    ),
+    "M30 the whole guard sits inside a single-quoted string opened before it (sec r7 W2)": (
+        GUARD_LINE + GUARD_END,
+        "          : '\n" + GUARD_LINE + GUARD_END + "          '\n",
+    ),
+    "M31 [ is shadowed by a function before the guard (sec r7 W3)": (
+        GUARD_LINE,
+        "          [() { return 1; }\n" + GUARD_LINE,
+    ),
+    "M32 step-level env key added to the step": (
+        STEP_HEAD + "        run: |\n",
+        STEP_HEAD + "        env:\n          RUNNER_OS: macOS\n        run: |\n",
+    ),
+    "M33 a second step with the same name": (
+        STEP_HEAD,
+        STEP_HEAD + "        run: |\n          echo decoy\n\n" + STEP_HEAD,
+    ),
+    "M34 shell key on the step": (
+        STEP_HEAD + "        run: |\n",
+        STEP_HEAD + "        shell: bash -e {0}\n        run: |\n",
+    ),
+    "M35 RUNNER_OS in the workflow-level env block": (
+        "env:\n  CARGO_TERM_COLOR: always\n",
+        "env:\n  CARGO_TERM_COLOR: always\n  RUNNER_OS: macOS\n",
     ),
     "M12 nproc added": (GUARD_END, GUARD_END + "          nproc\n"),
     "M13 /proc/meminfo added": (GUARD_END, GUARD_END + "          cat /proc/meminfo\n"),
