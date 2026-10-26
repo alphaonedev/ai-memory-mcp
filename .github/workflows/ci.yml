@@ -223,6 +223,11 @@ jobs:
       # value; impact selection optimises only the slow tests/*.rs
       # integration binaries (~5-15s setup per binary).
       test_impact: ${{ steps.cls.outputs.test_impact }}
+      # #8174 - which `Check` tiers run on this workflow run, decided in ONE
+      # place (scripts/ci/check_legs.py). A topic-branch pull_request gets
+      # `sqlite`, but only when its BASE is a chain/ branch; chain/ carrier PRs,
+      # PRs into any other base, pushes and merge_group runs get `sqlite,enterprise-fed`. Consumed by the `check` job below.
+      check_tiers: ${{ steps.legs.outputs.check_tiers }}
       test_impact_count: ${{ steps.cls.outputs.test_impact_count }}
       test_impact_total: ${{ steps.cls.outputs.test_impact_total }}
       test_impact_reason: ${{ steps.cls.outputs.test_impact_reason }}
@@ -262,6 +267,15 @@ jobs:
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
       - name: Target sweep unit tests (#7160)
         run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
+      # #8174 - decide the Check tiers. The github.* contexts come in through
+      # env, never inlined into the run: body.
+      - id: legs
+        name: Decide the Check tiers (#8174)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: python3 -I scripts/ci/check_legs.py --github-output "$GITHUB_OUTPUT"
       - id: cls
         shell: bash
         env:
@@ -652,6 +666,20 @@ jobs:
   # images and would DELETE real files on the persistent self-hosted hosts.
   # The enterprise-fed tier is always up on each node, so there is no
   # `services: postgres:` block and no per-PR pg image build.
+  #
+  # #8174 - CHAIN-ONLY ENTERPRISE-FED LEGS. All four legs always exist (the
+  # check names never change), but on a topic-branch `pull_request` only the
+  # two sqlite legs do work: the two enterprise-fed legs are rerouted to a
+  # hosted runner (checkout and notice run, tier-guarded steps skipped), so no
+  # linux-fed / macos-fed runner is held (a full linux-fed leg held a runner 2h09-2h37 per PR run, green or red).
+  # Chain/ carrier PRs, PRs into a non-chain base (release/**, rehearsal/**, main,
+  # develop), pushes and merge_group runs keep all four.
+  # The decision lives in scripts/ci/check_legs.py (classify output
+  # `check_tiers`); the pins are scripts/ci/tests/test_check_legs_chain_only.py.
+  # sal-postgres coverage on topic PRs stays in cert-postgres-age.yml and
+  # postgres-ignored.yml; both run on every same-repo pull_request to
+  # release/**, rehearsal/** and chain/** (neither is label-gated); PRs into
+  # main/develop never get that coverage, which is why they keep the real legs.
   check:
     name: Check (${{ matrix.leg }})
     needs: classify
@@ -662,7 +690,12 @@ jobs:
     # `fromJSON` turns into the list `runs-on` wants. A one-element
     # `["ubuntu-latest"]` is the hosted form; `["self-hosted","linux-fed"]` is
     # the label-set form. macOS is unchanged (operator directive is Linux-only).
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    # #8174 - an INACTIVE tier (the enterprise-fed legs on a topic-branch PR)
+    # is rerouted to a hosted runner. The checkout and the inactive-leg notice
+    # step run there; every tier-guarded step is skipped, so the check name
+    # still reports (the contexts are mirrored as required) but no self-hosted
+    # runner is held. Same no-op shape as the docs-only path.
+    runs-on: ${{ fromJSON(contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.runner || '["ubuntu-latest"]') }}
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
     # pinning a runner for hours.
@@ -887,7 +920,7 @@ jobs:
       # from the real time left under the job `timeout-minutes`, including the
       # load-gate wait and every pre-test step.
       - name: Record job start (#6795)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier)
         run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
 
       # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
@@ -901,7 +934,7 @@ jobs:
       # contexts and rule (b1) of scripts/check-required-contexts.sh forbids a
       # job-level `if:` here (#2494 wedge class).
       - name: Fork-PR refusal (self-hosted legs never run fork code)
-        if: needs.classify.outputs.docs_only != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
         run: |
           echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.leg }})."
           exit 1
@@ -912,6 +945,36 @@ jobs:
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
+
+      - name: Enterprise-fed leg inactive on this run (#8174)
+        if: needs.classify.outputs.docs_only != 'true' && !contains(needs.classify.outputs.check_tiers, matrix.tier)
+        env:
+          LEG: ${{ matrix.leg }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Independent second check (security r1 F1): the no-op shape is sound only
+          # for a PR that lands on a chain/ carrier, so it never reports green elsewhere.
+          # Workflow-command escaping (security r2 F1): `%` is a legal refname byte and
+          # the runner percent-decodes a command message, so escape `%` first, then CR
+          # and LF, before either ref enters a message or the step summary.
+          head_ref_esc="${HEAD_REF//'%'/%25}"
+          head_ref_esc="${head_ref_esc//$'\r'/%0D}"
+          head_ref_esc="${head_ref_esc//$'\n'/%0A}"
+          base_ref_esc="${BASE_REF//'%'/%25}"
+          base_ref_esc="${base_ref_esc//$'\r'/%0D}"
+          base_ref_esc="${base_ref_esc//$'\n'/%0A}"
+          case "${BASE_REF}" in
+            chain/*) ;;
+            *)
+              echo "::error::leg ${LEG} refuses the hosted no-op: base ref '${base_ref_esc}' is not chain/*, so no carrier run follows this PR"
+              exit 1
+              ;;
+          esac
+          msg="leg ${LEG} is inactive on this run (event ${EVENT_NAME}, head ref ${head_ref_esc}, base ref ${base_ref_esc}): enterprise-fed legs run on chain/* pull requests, push, merge_group and any pull request whose base is not chain/*; this topic-PR run into a chain base reports a no-op so the required context is satisfied without holding a self-hosted runner; sal-postgres coverage on topic PRs comes from cert-postgres-age.yml and postgres-ignored.yml"
+          echo "::notice::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 
       # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
       # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,
@@ -924,7 +987,7 @@ jobs:
       # root is defined once, in scripts/ci/shared_cargo_target.py.
       # Self-hosted legs only (matrix.shared_target).
       - name: Per-runner cargo target (#7188)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.shared_target
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
@@ -942,7 +1005,7 @@ jobs:
       # wrong disk). Linux self-hosted legs only: the macOS fleet hosts may lack
       # sccache.
       - name: sccache build cache (#7199)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target && runner.os == 'Linux'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.shared_target && runner.os == 'Linux'
         run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
@@ -984,7 +1047,7 @@ jobs:
       # BEFORE the setup-python / setup-node steps that repopulate exactly the
       # versions the #2452 conformance readers need.
       - name: Free disk before tests (hosted image only, #1407/#1405/#1387 fix)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment == 'github-hosted'
         run: |
           set -eu
           echo "::group::Disk usage before cleanup"
@@ -1059,15 +1122,15 @@ jobs:
       # makes the freed space (or a non-disk root cause) visible in the log.
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment == 'github-hosted'
         with:
           python-version: '3.12'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment == 'github-hosted'
         with:
           node-version: '22'
       - name: Ensure python3 + node present (self-hosted; #2452 fail-closed)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment != 'github-hosted'
         shell: bash
         run: |
           command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
@@ -1077,7 +1140,7 @@ jobs:
       # FAIL CLOSED if rustup is missing on a self-hosted node — see the
       # `lint` job in ci.yml for the full rationale (#3128 / restore #3293).
       - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted' && needs.classify.outputs.docs_only != 'true'
+        if: runner.environment != 'github-hosted' && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier)
         shell: bash
         run: |
           test -x "$HOME/.cargo/bin/rustup" || {
@@ -1085,7 +1148,7 @@ jobs:
             exit 1
           }
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier)
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
@@ -1099,7 +1162,7 @@ jobs:
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — SAVE the cache only on trunk `push` events
           # (push.branches = main/develop/release/**). `pull_request` and
@@ -1125,7 +1188,7 @@ jobs:
       # nested build never flaked on ubuntu, and skipping the step there
       # keeps the tool build off the ubuntu critical path.
       - name: Prebuild t0 orchestrator (macOS e1 anti-flake, #1853)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'macos-fed'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.node == 'macos-fed'
         shell: bash
         run: |
           set -euo pipefail
@@ -1173,7 +1236,7 @@ jobs:
       # a maintenance connection to issue CREATE/DROP DATABASE. Fail-closed:
       # a missing URL file or a failed CREATE reds the leg.
       - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
           # matrix.leg via env (never inlined into the script body) so the
@@ -1269,7 +1332,7 @@ jobs:
       # this leg is the one that has AI_MEMORY_TEST_POSTGRES_URL (minted above). The flag turns a missing
       # URL or psql into a failure instead of a silent skip.
       - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
           AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
@@ -1289,7 +1352,7 @@ jobs:
       # / quarantine #2469. If it ld-SIGBUS again → mold is still needed
       # for link and the SIGSEGV is independent. Hosted sqlite only.
       - name: Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.leg == 'ubuntu-latest,sqlite'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.leg == 'ubuntu-latest,sqlite'
         run: |
           {
             echo "CARGO_BUILD_JOBS=1"
@@ -1328,7 +1391,7 @@ jobs:
       # `AI_MEMORY_NO_CONFIG` is likewise kept deliberately: the f1 runners set
       # it on purpose so jobs never read operator config.
       - name: Scrub inherited passphrase env (self-hosted only, issue 3539 hygiene)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment != 'github-hosted'
         run: |
           set -euo pipefail
           for name in AI_MEMORY_DB_PASSPHRASE AI_MEMORY_DB_PASSPHRASE_FILE; do
@@ -1346,11 +1409,11 @@ jobs:
       # measured load, then proceed. The helper NEVER fails on load alone.
       # Self-hosted legs only: hosted runners are dedicated VMs.
       - name: Load gate (#6795)
-        if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && contains(matrix.runner, 'self-hosted')
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
       - name: Run tests (impact-aware)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier)
         env:
           AI_MEMORY_NO_CONFIG: "1"
           TIER: ${{ matrix.tier }}
@@ -1945,7 +2008,7 @@ jobs:
       # impact-aware dispatch invariants keep their exact `cargo test` shape;
       # the captured log is the honest durable record of what ran.
       - name: Upload test results (durable audit history)
-        if: needs.classify.outputs.docs_only != 'true' && always() && env.TEST_RESULT_LOG != ''
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && always() && env.TEST_RESULT_LOG != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: test-results-${{ matrix.node }}-${{ matrix.tier }}
@@ -1959,7 +2022,7 @@ jobs:
       # only 90 chars). always(): uploaded on success, failure, cancel and
       # timeout. build.jsonl (the compile JSON, large) is not uploaded.
       - name: Upload shard logs (#6344)
-        if: always() && needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        if: always() && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.tier == 'enterprise-fed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: shard-logs-${{ matrix.node }}-${{ matrix.tier }}
@@ -1974,7 +2037,7 @@ jobs:
       # by scripts/test/pg_isolated_binary.py under the shard directory. Only
       # present when the opt-in lane ran; uploaded on success AND failure.
       - name: Upload isolated-lane per-binary logs (#6383)
-        if: needs.classify.outputs.docs_only != 'true' && always() && matrix.tier == 'enterprise-fed'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && always() && matrix.tier == 'enterprise-fed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pg-iso-logs-${{ matrix.node }}-${{ matrix.tier }}
@@ -1985,7 +2048,7 @@ jobs:
       # cargo-audit runs once (the advisory DB is platform-independent) — on
       # the `once` leg so it does not multiply across the 2x2.
       - name: Security audit
-        if: needs.classify.outputs.docs_only != 'true' && matrix.once
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.once
         env:
           # #3138: named pin for the cargo-audit version this job installs.
           CARGO_AUDIT_VERSION: "0.22.2"
@@ -2020,7 +2083,7 @@ jobs:
       # never correctness. `cargo clean --profile dev` touches only the
       # workspace `target/`, never a system path.
       - name: Trim target/debug before release build (hosted)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment == 'github-hosted'
         run: |
           set -eu
           echo "::group::Disk usage before cargo clean"
@@ -2042,7 +2105,7 @@ jobs:
       # prep `cargo clean` step above is already ubuntu-only.
 
       - name: Build release (once leg — release-profile smoke)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.once
+        if: needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && matrix.once
         run: cargo build --release
 
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
@@ -2053,7 +2116,7 @@ jobs:
         # always() so a failed/cancelled test run still reclaims the db, but
         # still docs_only-guarded (rule (b3)): on a docs-only run the configure
         # step is skipped, no db is created, so there is nothing to drop.
-        if: always() && needs.classify.outputs.docs_only != 'true'
+        if: always() && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier)
         shell: bash
         run: |
           set -euo pipefail
@@ -2094,11 +2157,11 @@ jobs:
       # #7199 - hit rate of the CI sccache server, then stop that server (same
       # SCCACHE_SERVER_PORT) unless a sibling runner's in-use marker is fresh.
       - name: sccache hit-rate summary (#7199)
-        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/ci/sccache_env.py --stats
 
       - name: sccache stop CI server (#7199)
-        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/sccache_env.py --stop --runner-name "$RUNNER_NAME_ARG"
@@ -2117,7 +2180,7 @@ jobs:
       # Never this runner's target, never outside the root shared_cargo_target.py
       # computes, never through a symlink. Bad arguments are refused with exit 2.
       - name: Prune stale runner artifacts (#7188)
-        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
@@ -2135,11 +2198,11 @@ jobs:
       # --lock takes <root>/.evict.lock (the flock of the idle-target eviction)
       # for the sweep, waits at most 20 s and then skips with one warning and exit 0.
       - name: Sweep target/debug to the size cap (self-hosted)
-        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
+        if: always() && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment == 'self-hosted' && !matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
       - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
-        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
+        if: always() && needs.classify.outputs.docs_only != 'true' && contains(needs.classify.outputs.check_tiers, matrix.tier) && runner.environment == 'self-hosted' && matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
