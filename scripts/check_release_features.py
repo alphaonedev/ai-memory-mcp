@@ -6078,7 +6078,7 @@ R12_CASES: Dict[str, Tuple[str, Optional[Dict[str, str]], int, str]] = {
     "r12 F2: an env value with a closed subscript then a substitution is refused": (_r7_steps(_R12_ENV_STEP % "a[b]$(./f)"), None, 1, "array subscript"),
     "r12 F2: an env value with a backtick after a subscript is refused": (_r7_steps(_R12_ENV_STEP % "a[b]`./f`"), None, 1, "array subscript"),
     # --- F2: accepted (green at both).
-    "r12 F2 ok: ${arr[@]} passes": (_r8("echo ${arr[@]}"), None, 0, ""),
+    "r12 F2 ok: ${ary[@]} passes": (_r8("echo ${ary[@]}"), None, 0, ""),
     "r12 F2 ok: \"$@\" passes": (_r8("echo \"$@\""), None, 0, ""),
     "r12 F2 ok: ${X:-me@host} passes": (_r8("echo ${X:-me@host}"), None, 0, ""),
     "r12 F2 ok: a closed subscript with no substitution passes": (_r8("X='a[1]b[2]'", "echo $X"), None, 0, ""),
