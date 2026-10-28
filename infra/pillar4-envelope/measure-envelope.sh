@@ -24,7 +24,8 @@
 # it on a Docker-capable host. The local dev socket is permission-denied.
 #
 #   cd infra/pillar4-envelope
-#   POSTGRES_PASSWORD=secret ./measure-envelope.sh
+#   ./measure-envelope.sh                  (random password generated)
+#   POSTGRES_PASSWORD=<generated> ./measure-envelope.sh
 #
 # Exit 0 = a knee was found and printed (the measured X). Exit non-zero = the
 # stack failed to come up or no knee was reached within CONCURRENCY_STEPS (X is
@@ -35,7 +36,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # ── Tunables (env-overridable) ───────────────────────────────────────────
-PW="${POSTGRES_PASSWORD:-ai_memory_envelope}"
+# No fixed fallback (#4734): generate a random per-run password when unset.
+PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
+export POSTGRES_PASSWORD="$PW"
 POOL_COMPOSE="../pgbouncer/docker-compose.yml"
 PROJECT="ai-memory-4d-envelope"
 DAEMON_PORT="${DAEMON_PORT:-9077}"
@@ -58,9 +61,16 @@ mkdir -p "$RESULTS_DIR"
 DAEMON_PID=""
 
 cleanup() {
+  rc=$?
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
-  docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null 2>&1 || true
+  # POSTGRES_PASSWORD is exported above, so interpolation cannot fail here.
+  docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }
+  if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then
+    echo "FATAL: compose project $PROJECT still running after teardown" >&2
+    rc=1
+  fi
   rm -f "../pgbouncer/.userlist.generated.txt" "${STORE_URL_FILE:-}"
+  exit "$rc"
 }
 trap cleanup EXIT
 
@@ -80,7 +90,7 @@ BIN="$(cd ../.. && echo "$PWD/target/release/ai-memory")"
 echo "[2/5] bringing up postgres+AGE + pgbouncer (4.B stack) ..."
 # Render the pooler's md5 userlist from the password (same as 4.B smoke-test).
 md5hash="$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
-printf '"ai_memory" "md5%s"\n' "$md5hash" > "../pgbouncer/.userlist.generated.txt"
+(umask 077; printf '"ai_memory" "md5%s"\n' "$md5hash" > "../pgbouncer/.userlist.generated.txt")
 POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait
 
 # ── 3. schema-init + serve THROUGH the pooler ────────────────────────────

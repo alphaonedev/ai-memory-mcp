@@ -12,7 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `infra/pgbouncer/docker-compose.yml` publishes the pooler as `127.0.0.1:6432:6432`
   (was all interfaces) and requires `POSTGRES_PASSWORD` (was a fixed public
   fallback); `smoke-test.sh` generates a random password when none is supplied.
-  The original fix `aafd15ec3` never reached the chain and is re-applied by hand.
+  `infra/pillar4-envelope/measure-envelope.sh` drops its fixed fallback the same way, both
+  scripts write the generated userlist owner-only (#4735), pass the password to
+  `docker exec` by variable name, and tear down loudly. The compose and password parts of the
+  original fix `aafd15ec3` (never on the chain) are re-applied by hand; its TLS, SCRAM and
+  admin-split parts are not.
   Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py`.
 
 ### Security (#7112 — event-listener thread-safety advisory)

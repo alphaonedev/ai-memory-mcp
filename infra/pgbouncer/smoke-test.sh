@@ -24,20 +24,30 @@ cd "$(dirname "$0")"
 # No fixed fallback (#4734): generate a random per-run password when unset.
 PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 export POSTGRES_PASSWORD="$PW"
+# docker exec takes the password by variable NAME (inherited), never by argv.
+export PGPASSWORD="$PW"
 PROJECT="ai-memory-pgbouncer-smoke"
 PG_CONTAINER="ai-memory-pgbouncer-postgres"
-POOLED_URL="postgres://ai_memory:${PW}@pgbouncer:6432/ai_memory"
+POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"
 
 cleanup() {
-  docker compose -p "$PROJECT" down -v >/dev/null 2>&1 || true
+  rc=$?
+  # POSTGRES_PASSWORD is exported above, so interpolation cannot fail here.
+  docker compose -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }
+  if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then
+    echo "FATAL: compose project $PROJECT still running after teardown" >&2
+    rc=1
+  fi
   rm -f .userlist.generated.txt
+  exit "$rc"
 }
 trap cleanup EXIT
 
 # Render the md5 userlist from the password so the committed placeholder never
 # carries a secret. auth_type=md5 => 'md5' + md5(password + username).
 md5hash="$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
-printf '"ai_memory" "md5%s"\n' "$md5hash" > .userlist.generated.txt
+# Owner-only (#4735): the file is created under umask 077.
+(umask 077; printf '"ai_memory" "md5%s"\n' "$md5hash" > .userlist.generated.txt)
 
 echo "[1/4] bringing up postgres+AGE + pgbouncer ..."
 POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait
@@ -45,7 +55,7 @@ POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait
 # psql THROUGH the pooler is run from inside the postgres container (it has
 # psql and shares the compose network, so `pgbouncer` resolves).
 psql_pooled() {
-  docker exec -e PGPASSWORD="$PW" "$PG_CONTAINER" \
+  docker exec -e PGPASSWORD "$PG_CONTAINER" \
     psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"
 }
 
@@ -88,8 +98,8 @@ fi
 echo "      OK: role-default timeouts survive DISCARD ALL"
 
 echo "[4/4] pooler is in transaction mode ..."
-mode="$(docker exec -e PGPASSWORD="$PW" "$PG_CONTAINER" \
-  psql "postgres://ai_memory:${PW}@pgbouncer:6432/pgbouncer" -tA -c 'SHOW pool_mode;' 2>/dev/null | tr -dc 'a-z' || true)"
+mode="$(docker exec -e PGPASSWORD "$PG_CONTAINER" \
+  psql "postgres://ai_memory@pgbouncer:6432/pgbouncer" -tA -c 'SHOW pool_mode;' 2>/dev/null | tr -dc 'a-z' || true)"
 # Some PgBouncer builds report per-database mode; the global is what matters.
 echo "      pool_mode = ${mode:-<unreported>}"
 
