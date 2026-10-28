@@ -84,8 +84,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # writer so file I/O never stalls a tracing call site.
 tracing-appender = "0.2"
 # v0.6.3.1 (PR-5 / issue #487) — `ai-memory logs archive` compresses
-# rotated operational logs past their retention horizon. Pure-Rust
-# bindings via the `zstd` crate.
+# rotated operational logs past their retention horizon. Bindings over bundled C
+# libzstd built by zstd-sys/cc; audited release pins per #8257.
 zstd = { version = "0.14.3", default-features = false }
 uuid = { version = "1", features = ["v4", "v7"] }
 # #1579 B4 (operator-approved feature delta) — `compression-gzip`
