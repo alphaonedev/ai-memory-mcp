@@ -188,6 +188,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # Skipping is off until the repository variable CI_IMPACT_ENFORCE is
       # "true"; until then every heavy job still runs and only the report differs.
@@ -2119,7 +2120,7 @@ jobs:
             if [ "$n_iso" -gt 0 ]; then
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6383 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the isolated binaries"
+                echo "::error::[#6383 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the isolated binaries"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_isolated_lane "[${name}] isolated test binaries" "$sd" $FEAT || rc=$?
@@ -2851,6 +2852,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       # decision: on push, schedule and workflow_dispatch the gate runs from
       # the checked-out tree over failing closed because there is no second
       # party to judge itself: the tree under test is already the branch tip,

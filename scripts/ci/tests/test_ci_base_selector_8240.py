@@ -1062,13 +1062,13 @@ HEREDOC = object()
 MATERIALISE_ENV = {"CONTEXT_SHA", "EVENT_NAME", "HEAD_SHA", "MERGE_GROUP_BASE_SHA", "IMPACT_FILES"}
 # (name, exact top-level keys, exact env keys, exact `with:` mapping, exact run text)
 SELECT_ALLOW = (
-    (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
+    (None, {"uses", "with"}, set(), {"fetch-depth": "0", "persist-credentials": "false"}, None),
     ("Selection mode", {"name", "id", "env", "run"}, {"ENFORCE"}, None, ECHO_RUN),
     (MATERIALISE_STEP, {"name", "id", "env", "run"}, MATERIALISE_ENV, None, HEREDOC),
     ("Build impact index", {"name", "if", "continue-on-error", "run"}, set(), None, INDEX_RUN),
 )
 GATE_ALLOW = (
-    (None, {"uses", "with"}, set(), {"fetch-depth": "0"}, None),
+    (None, {"uses", "with"}, set(), {"fetch-depth": "0", "persist-credentials": "false"}, None),
     (GATE_MATERIALISE_STEP, {"name", "id", "if", "env", "run"}, MATERIALISE_ENV, None, HEREDOC),
     (BASE_GATE_STEP, {"name", "if", "env", "run"}, {"NEEDS_JSON", "GITHUB_REF_NAME_FULL"},
      None, BASE_FOLD_RUN),
@@ -3700,7 +3700,7 @@ class TrustWindowMutants(unittest.TestCase):
     """r7 F1-F3: each mutant of the live ci.yml or of a Materialise run block is red."""
 
     SELECTION_ID = "      - name: Selection mode\n        id: mode\n"
-    CHECKOUT_WITH = "        with:\n          fetch-depth: 0\n"
+    CHECKOUT_WITH = "        with:\n          fetch-depth: 0\n          persist-credentials: false\n"
 
     def live(self):
         return CI_YML.read_text()
@@ -4261,15 +4261,15 @@ def _workflow_forms():
     PIN = "11d5960a326750d5838078e36cf38b85af677262"
     OTHER = "08eba0b27e820071cde6df949e0beb9ba4906955"
     SEL_CO = (
-        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n\n      #"
+        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n\n      #"
         " Skipping is off" % PIN
     )
     GATE_CO = (
-        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n      #"
+        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n      #"
         " decision: on push, schedule" % PIN
     )
     CO_BLOCK = (
-        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n" % PIN
+        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n" % PIN
     )
     MODE_NAME = "      - name: Selection mode\n"
     MODE_ENV = "        id: mode\n        env:\n          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}\n"
@@ -4575,8 +4575,8 @@ def _workflow_forms():
         rep(
             SEL_CO,
             SEL_CO.replace(
-                "        with:\n          fetch-depth: 0\n",
-                "        with: {fetch-depth: 0, submodules: true}\n",
+                "        with:\n          fetch-depth: 0\n          persist-credentials: false\n",
+                "        with: {fetch-depth: 0, submodules: true, persist-credentials: false}\n",
             ),
         )
     ]
@@ -4866,9 +4866,7 @@ def _workflow_forms():
     m["k8-checkout-with-persist"] = [
         rep(
             SEL_CO,
-            SEL_CO.replace(
-                "fetch-depth: 0\n", "fetch-depth: 0\n          persist-credentials: true\n"
-            ),
+            SEL_CO.replace("persist-credentials: false", "persist-credentials: true"),
         )
     ]
     m["w1-docstring-reverted"] = ["DOCSTRING_REVERT"]
@@ -4903,8 +4901,8 @@ WF_FORM_RED = {
     "r10-06-spaced-BASH_ENV": "job select step 'Selection mode' inherits env BASH_ENV",
     "r10-07-flow-env-BASH_ENV": "job select step 'Selection mode' inherits env BASH_ENV",
     "r10-08-quoted-submodules": (
-        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
-        " {'fetch-depth': '0'}"
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true',"
+        " 'persist-credentials': 'false'}, expected {'fetch-depth': '0', 'persist-credentials': 'false'}"
     ),
     "r10-09-wf-BASH_ENV": "workflow env sets BASH_ENV",
     "r10-10-job-BASH_ENV-select": "job select env sets BASH_ENV",
@@ -5012,16 +5010,16 @@ WF_FORM_RED = {
         " ['env', 'id', 'name', 'run']"
     ),
     "c1-quoted-with-plus-submodules": (
-        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
-        " {'fetch-depth': '0'}"
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true',"
+        " 'persist-credentials': 'false'}, expected {'fetch-depth': '0', 'persist-credentials': 'false'}"
     ),
     "c1-spaced-submodules": (
-        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
-        " {'fetch-depth': '0'}"
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true',"
+        " 'persist-credentials': 'false'}, expected {'fetch-depth': '0', 'persist-credentials': 'false'}"
     ),
     "c1-flow-with-submodules": (
-        "job select step None with {'fetch-depth': '0', 'submodules': 'true'}, expected"
-        " {'fetch-depth': '0'}"
+        "job select step None with {'fetch-depth': '0', 'submodules': 'true',"
+        " 'persist-credentials': 'false'}, expected {'fetch-depth': '0', 'persist-credentials': 'false'}"
     ),
     "c1-folded-env-value": "job select step 'Selection mode' inherits env BASH_ENV",
     "c1-literal-env-value": "job select step 'Selection mode' inherits env BASH_ENV",
@@ -5216,11 +5214,12 @@ WF_FORM_RED = {
     "k8-container-credentials": "job select sets container",
     "k8-services-gate": "job ci-gate sets services",
     "k8-checkout-with-ref": (
-        "job select step None with {'fetch-depth': '0', 'ref': 'x'}, expected {'fetch-depth': '0'}"
+        "job select step None with {'fetch-depth': '0', 'ref': 'x', 'persist-credentials': 'false'}, expected "
+        "{'fetch-depth': '0', 'persist-credentials': 'false'}"
     ),
     "k8-checkout-with-persist": (
         "job select step None with {'fetch-depth': '0', 'persist-credentials': 'true'}, expected"
-        " {'fetch-depth': '0'}"
+        " {'fetch-depth': '0', 'persist-credentials': 'false'}"
     ),
 }
 
