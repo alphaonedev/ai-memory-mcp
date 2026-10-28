@@ -59,7 +59,7 @@ means no knee within the ramp (X ≥ last step — raise the ceiling and re-run)
 
 | Env | Default | Meaning |
 |---|---|---|
-| `POSTGRES_PASSWORD` | random per run | DB + pooler password; generated when unset, no fixed default (rendered into the md5 userlist, never committed). |
+| `POSTGRES_PASSWORD` | random per run | DB + pooler password; generated when unset, no fixed default (the pooler userlist holds the role's SCRAM verifier, never the password; never committed). |
 | `CONCURRENCY_STEPS` | `8 16 32 64 128 256 512 1024` | Geometric ramp (brackets the knee without 1000 linear steps). |
 | `STEP_DURATION_SECS` | `20` | Load duration per concurrency step. |
 | `P95_BUDGET_MS` | `250` | p95 latency knee (recall hot-path 35 ms + headroom for the write+AGE mix). |

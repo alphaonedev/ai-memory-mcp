@@ -21,6 +21,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# PgBouncer refuses to run as root (#4734). The pooler runs as the invoking
+# uid so the owner-only userlist stays readable, so fail fast with a clear
+# message instead of a container that exits at start.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "FATAL: run this script as a non-root user (PgBouncer refuses to run as root)" >&2
+  exit 64
+fi
+
 # No fixed fallback (#4734): generate a random per-run password when unset.
 PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 export POSTGRES_PASSWORD="$PW"
@@ -47,13 +55,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Render the md5 userlist from the password so the committed placeholder never
-# carries a secret. auth_type=md5 => 'md5' + md5(password + username).
-md5hash="$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
-# Owner-only (#4735): the file is created under umask 077.
-(umask 077; printf '"ai_memory" "md5%s"\n' "$md5hash" > .userlist.generated.txt)
-
-echo "[1/4] bringing up postgres+AGE + pgbouncer ..."
+echo "[1/4] bringing up postgres+AGE, then pgbouncer with a SCRAM userlist ..."
+POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait postgres
+# SCRAM end to end (#4732): bring up postgres first (default scram-sha-256
+# auth), then render the pooler userlist from the role's own stored SCRAM
+# verifier. pgbouncer 1.23 uses SCRAM when the userlist entry is a
+# SCRAM secret and passes it through to the backend. The verifier
+# (not the password) travels over docker exec stdout straight into a file
+# created under umask 077 (#4735); the password never appears in argv.
+VERIFIER_ROW="$(docker exec "$PG_CONTAINER" \
+  psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
+case "$VERIFIER_ROW" in
+  '"ai_memory" "SCRAM-SHA-256$'*) ;;
+  *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 72 ;;
+esac
+(umask 077; printf '%s\n' "$VERIFIER_ROW" > .userlist.generated.txt)
 POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait
 
 # psql THROUGH the pooler is run from inside the postgres container (it has

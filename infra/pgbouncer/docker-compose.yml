@@ -23,11 +23,6 @@ services:
       POSTGRES_USER: ai_memory
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (smoke-test.sh generates one; see README)}
       POSTGRES_DB: ai_memory
-      # pgbouncer.ini uses auth_type=md5 with an md5 userlist, so the pooler
-      # can only log in to a backend that stores an md5 verifier (see
-      # md5-password.sql) and asks for md5; a SCRAM backend fails with
-      # 'wrong password type'. SCRAM end to end is tracked separately.
-      POSTGRES_HOST_AUTH_METHOD: md5
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory"]
       interval: 3s
@@ -37,7 +32,6 @@ services:
     # otherwise strip from the per-session GUCs.
     volumes:
       - ./role-defaults.sql:/docker-entrypoint-initdb.d/10-role-defaults.sql:ro
-      - ./md5-password.sql:/docker-entrypoint-initdb.d/20-md5-password.sql:ro
 
   pgbouncer:
     image: edoburu/pgbouncer:v1.23.1-p2
@@ -52,8 +46,10 @@ services:
     user: "${PGBOUNCER_UID:?set PGBOUNCER_UID (smoke-test.sh exports id -u)}:${PGBOUNCER_GID:?set PGBOUNCER_GID (smoke-test.sh exports id -g)}"
     ports:
       - "127.0.0.1:6432:6432"
-    # The smoke test renders userlist.txt from POSTGRES_PASSWORD (see
-    # smoke-test.sh) so the committed placeholder never needs a real secret.
+    # SCRAM end to end (#4732): the smoke test renders userlist.txt from the
+    # role's own stored SCRAM-SHA-256 verifier (read from pg_authid once the
+    # postgres service is up, see smoke-test.sh), so the committed placeholder
+    # never needs a real secret and the backend keeps its default SCRAM auth.
     volumes:
       - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - ./.userlist.generated.txt:/etc/pgbouncer/userlist.txt:ro

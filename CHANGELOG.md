@@ -17,7 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docker exec` by variable name, and tear down loudly. The compose and password parts of the
   original fix `aafd15ec3` (never on the chain) are re-applied by hand; its TLS, SCRAM and
   admin-split parts are not.
-  Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py`.
+  The postgres image is pinned (`apache/age:release_PG16_1.6.0`) and the pooler runs as the
+  invoking uid (`PGBOUNCER_UID`/`PGBOUNCER_GID`, required by compose) so the 0600 userlist stays
+  readable; both scripts refuse to run as root (PgBouncer refuses uid 0).
+  Authentication is SCRAM-SHA-256 end to end (#4732 smoke path): the userlist is the role's own
+  stored SCRAM verifier, read after postgres is up; there is no md5 anywhere in the smoke stack.
+  Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py` (no md5, root guard, parsed SQL,
+  loud teardown).
 
 ### Security (#7112 — event-listener thread-safety advisory)
 
