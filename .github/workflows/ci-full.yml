@@ -47,6 +47,8 @@ jobs:
       run_url: ${{ steps.wait.outputs.run_url }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Dispatch ci.yml and wait for its conclusion
         id: wait
         env:
@@ -70,6 +72,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Fail on a red nightly and file one issue
         env:
           GH_TOKEN: ${{ github.token }}
