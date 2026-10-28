@@ -76,13 +76,14 @@ The `auto_atomise` field on
 [`crate::models::GovernancePolicy`](../src/models/namespace.rs)
 enables the WT-1-D pre_store hook
 ([`src/hooks/pre_store/auto_atomise.rs`](../src/hooks/pre_store/auto_atomise.rs)).
-When a namespace's `metadata.governance.auto_atomise = true`, every
-successful `memory_store` hands a curator pass to a **bounded,
-single-consumer background worker**
-([`src/background/atomise_worker.rs`](../src/background/atomise_worker.rs)).
-The store response **never blocks** on the curator — failures inside the
-worker are notify-class (logged via `tracing::warn`, never propagated).
-Operators opt in per namespace; the default is off.
+On sqlite, when the namespace policy resolves to `Deferred`, eligible
+writes enqueue a curator pass on a **bounded, single-consumer background
+worker** ([`src/background/atomise_worker.rs`](../src/background/atomise_worker.rs)).
+That path returns before the curator finishes; worker failures are logged
+rather than propagated as write failures. `Synchronous` on MCP stdio runs
+the curator inline. HTTP + sqlite uses the deferred path even when the
+namespace requests `Synchronous`; a postgres-backed daemon does not run
+the atomiser. Operators opt in per namespace; the default is off.
 
 Three requirements are load-bearing at v1.0.0 (#2983-#2987):
 
@@ -101,7 +102,19 @@ Three requirements are load-bearing at v1.0.0 (#2983-#2987):
   `atomise_outcome: "skipped_backend_unsupported"` at the enqueue site
   and never falls through to a sqlite handle.
 
-Every store response carries `atomise_mode` (the mode that ACTUALLY ran)
+See the [Form 2 transport/backend table](batman-active-mode.html#what-form-2-actually-requires-v100-2983-2987)
+for the exact response tokens. A postgres daemon with a curator reports
+`atomise_mode: "off"`, `atomise_mode_reason: "backend_unsupported"`, and
+`atomise_outcome: "skipped_backend_unsupported"`; without a curator it
+omits the atomisation disposition. Its `capabilities.atomisation` marks
+`tool`, `cli`, `auto`, and `curator` as `"unsupported_on_postgres"` and
+includes `unsupported_on_postgres: true` plus `unsupported_reason`.
+The **Atomisation Curator** note in `ai-memory doctor` states the same
+MCP-stdio + sqlite limit. [Issue #8255](https://github.com/alphaonedev/ai-memory-mcp/issues/8255)
+tracks the PostgreSQL port; its milestone remains the operator's decision.
+
+When a store response reports an atomisation disposition, it carries
+`atomise_mode` (the mode that ACTUALLY ran)
 and `atomise_outcome`; when the mode that ran differs from the configured
 one, `atomise_mode_configured` + `atomise_mode_reason` say why. The
 bounded worker's queue depth is `AI_MEMORY_ATOMISE_QUEUE_CAPACITY`
@@ -237,7 +250,8 @@ THEN embed" order set the policy explicitly.
 
 ### What changes in Synchronous mode
 
-When the policy resolves to `Synchronous`:
+On **MCP stdio + sqlite**, with a wired curator and an eligible source,
+a successful `Synchronous` atomisation follows this sequence:
 
 1. The MCP `memory_store` handler SKIPS source embedding (the
    `Synchronous`-policy branch in `src/mcp/tools/store/mod.rs`).
@@ -253,6 +267,12 @@ When the policy resolves to `Synchronous`:
    caller can verify the substrate did what the policy asked for.
 
 ### When to choose which mode
+
+This comparison describes successful atomisation on sqlite through MCP
+stdio. HTTP requests remain deferred, and PostgreSQL has no atomisation
+engine. Inspect `atomise_outcome`: a skip or failure does not promise an
+atom set. Failure atomicity is tracked separately in
+[issue #8256](https://github.com/alphaonedev/ai-memory-mcp/issues/8256).
 
 | Concern | Deferred (default) | Synchronous (Form 2) |
 |---------|--------------------|----------------------|
