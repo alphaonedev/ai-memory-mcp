@@ -89,6 +89,9 @@
 
 use crate::config::{AppConfig, PermissionsMode};
 use crate::federation::peer_attestation::{PEER_ATTESTATION_ENV, PeerScope};
+// The house truthy grammar (`1`/`true`/`yes`/`on`, case-insensitive, trimmed),
+// shared crate-wide (#3200, #2967); this module keeps no private copy.
+use crate::security_profile::is_truthy;
 use std::collections::HashMap;
 
 /// #3553 — the `PRAGMA synchronous` posture row (check #21) and its test.
@@ -187,15 +190,6 @@ fn check(
             remediation.to_string()
         },
     }
-}
-
-/// The house truthy grammar (`1`/`true`/`yes`/`on`, case-insensitive,
-/// trimmed) shared by every `AI_MEMORY_*` boolean knob in this crate.
-fn is_truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 /// #3061 — best-effort machine check that a `postgres://` DSN pins libpq's

@@ -1973,6 +1973,27 @@ captures, and the run refuses to publish over a bundle that does not match its
 recapture note above). The committed bundle stays bound to the build that
 produced it (not recaptured here).
 
+**Re-cert trigger — FIRED by #2967 (`src/federation/receive_auth.rs`,
+2026-10-28; PR #8269).** One §7-watched path changed. The delta in
+`quarantine_unattributed_enabled()` (the route-IN reader of
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) replaces a local exact-match
+(`"1" | "true" | "yes" | "on"`, lowercase only) with the crate-wide house
+grammar `crate::security_profile::is_truthy` (case-insensitive, trimmed), so the
+route-IN reader and the `asi-hard` posture floor now parse the knob identically.
+The other edits in that file are rustdoc and a test comment. No `AI_MEMORY_FED_*`
+identifier is added, removed or renamed, and no wire format, signature check or
+accept/refuse rule changes. The posture is strictly MORE protective, never
+weaker: a value the old reader read as off (for example `TRUE` or ` On `) now
+quarantines unattributed inbound rows, which is the fail-closed direction, and
+the `federated`, `hive` and `production` shapes pin the knob on at boot.
+
+*Disposition.* **This change does NOT re-mint the certification and does not
+approve its own control.** Re-running §5.4(2)–(5) on the certified tier and
+re-issuing this document against the new SHA is a Conductor task, tracked by
+[**#2967**](https://github.com/alphaonedev/ai-memory-mcp/issues/2967). The
+2026-09-21 status at `f32c18dad` in §8 stays the last bound determination and
+must be read together with this record until that re-issue lands.
+
 ---
 
 ## 8. Current determination

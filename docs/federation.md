@@ -955,7 +955,7 @@ onward — it is hidden AND black-holed until dequarantine** (either
 automatically when a re-received copy later verifies `agent_attested`, or
 by operator dequarantine). Each quarantine increments
 `ai_memory_fed_quarantined_unattributed_total` and emits one WARN; the
-counter is always zero when the knob is off (the default), so a non-zero
+counter is always zero when the knob is off (the singleton and team shapes unless set; the federated, hive and production shapes force it on), so a non-zero
 value means a peer is relaying provenance-less content this node is
 black-holing.
 

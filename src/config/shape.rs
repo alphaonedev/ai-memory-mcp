@@ -623,7 +623,7 @@ pub fn evaluate_quarantine_unattributed(
     match shape.derive().quarantine_unattributed {
         Requirement::Floor(_) | Requirement::Default(true) if raw.is_none() => Ok(Some("1")),
         Requirement::Floor(_) if !enabled => anyhow::bail!(
-            "{line} requires {env} on (a FLOOR), but it is set to {}. Set {env} to \
+            "{line} requires {env} on (a FLOOR), but it is set to {:?}. Set {env} to \
              a truthy value (`1`, `true`, `yes` or `on`) or unset it so the shape \
              pins it on.",
             raw.unwrap_or_default()
@@ -859,6 +859,12 @@ mod tests {
                 assert!(err.contains("FLOOR"), "{shape} {off:?}: {err}");
                 assert!(err.contains(shape.as_str()), "{err}");
                 assert!(!err.contains("Some("), "raw value printed plainly: {err}");
+                // LOW-B (r2): the value is quoted, so an empty value reads
+                // `set to "".` and never `set to . Set`.
+                assert!(
+                    err.contains(&format!("but it is set to {off:?}. Set")),
+                    "{shape} {off:?}: value must be debug-quoted: {err}"
+                );
                 assert!(
                     !err.contains("choose a shape"),
                     "no remedy that also refuses: {err}"
