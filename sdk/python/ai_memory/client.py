@@ -13,9 +13,15 @@ See :class:`AsyncAiMemoryClient` for the asyncio counterpart.
 
 from __future__ import annotations
 
+# #3840 — this class defines a `list` METHOD, so inside the class body a bare
+# `list[...]` annotation resolves to that method (mypy: "not valid as a type").
+# Annotations below spell the builtin explicitly.
+import builtins
+import os
+import ssl
 from types import TracebackType
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 import httpx
 
@@ -26,6 +32,7 @@ from ai_memory._common import (
     DEFAULT_TIMEOUT,
     build_create_body,
     build_httpx_kwargs,
+    gate_transports,
     encode_path_segment,
     handle_response,
     if_match_headers,
@@ -66,10 +73,28 @@ class AiMemoryClient:
         agent_id: If provided, sent as ``X-Agent-Id`` so the server stamps
             this identity on stored memories (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
-        verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
-            zero-config daemon serves a certificate from the local CA it
-            wrote to ``<key_dir>/tls/local-ca.pem`` on first boot; pass that
-            path to verify it (#3782). Never ``False``.
+        verify: TLS server verification. Accepted: ``None`` (the SDK default trust, a
+            context it builds with the TLS 1.2 floor, the session gate and the
+            request hooks: certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set, which
+            the SDK reads at construction under the path rules below, #6538),
+            ``True``, the path of an existing CA bundle file or hashed CA
+            directory (``str`` / ``os.PathLike``, resolved component by
+            component, a missing component refused rather than normalised
+            away, and read ONCE, now, into a context the SDK builds; a group-
+            or world-writable path, or one under a directory another user
+            can change, is refused, #6248, #6269, #6377, #6559, #6653) and exactly ``ssl.SSLContext`` (not a subclass such as
+            ``truststore.SSLContext``) that is ``CERT_REQUIRED`` with
+            ``check_hostname`` on, no verify flag that relaxes chain
+            validation, no cipher suite without server authentication and no
+            replaced handshake attribute (re-checked before every request, so
+            turning any of these off after construction is refused, #6249,
+            #6267, #6268, #6305, #6375). After every TLS handshake, direct,
+            proxied or over SOCKS, the session must belong to that context,
+            name the request host and be within its validity dates before the
+            request is written (#6349, #6350). ``False`` and every other value
+            raise ``ValueError`` (#3840): there is no accept-any-certificate
+            mode. A zero-config daemon's CA is ``<key_dir>/tls/local-ca.pem``
+            (#3782).
         cert: ``httpx`` ``cert`` — client cert for mTLS (path or
             ``(cert, key)``).
         headers: Additional headers to send on every request.
@@ -82,21 +107,21 @@ class AiMemoryClient:
         api_key: str | None = None,
         agent_id: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
-        verify: bool | str | None = None,
+        verify: Union[bool, str, os.PathLike[str], ssl.SSLContext, None] = None,
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        self._client = httpx.Client(
-            **build_httpx_kwargs(
-                base_url=base_url,
-                api_key=api_key,
-                agent_id=agent_id,
-                timeout=timeout,
-                verify=verify,
-                cert=cert,
-                extra_headers=headers,
-            )
+        kwargs = build_httpx_kwargs(
+            base_url=base_url,
+            api_key=api_key,
+            agent_id=agent_id,
+            timeout=timeout,
+            verify=verify,
+            cert=cert,
+            extra_headers=headers,
         )
+        self._client = httpx.Client(**kwargs)
+        gate_transports(self._client, kwargs, verify)
 
     # -- lifecycle ----------------------------------------------------------
     def close(self) -> None:
@@ -152,7 +177,7 @@ class AiMemoryClient:
         content: str,
         tier: str | None = None,
         namespace: str | None = None,
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
         priority: int | None = None,
         confidence: float | None = None,
         source: str | None = None,
@@ -220,7 +245,9 @@ class AiMemoryClient:
         )
         return self._request("POST", "/api/v1/memories", json_body=body)
 
-    def bulk_store(self, memories: list[CreateMemory | dict[str, Any]]) -> BulkCreateResponse:
+    def bulk_store(
+        self, memories: builtins.list[CreateMemory | dict[str, Any]]
+    ) -> BulkCreateResponse:
         """``POST /api/v1/memories/bulk`` — insert up to 1000 at once."""
         payload = [prep_json(m) for m in memories]
         raw = self._request("POST", "/api/v1/memories/bulk", json_body=payload)
@@ -278,7 +305,7 @@ class AiMemoryClient:
         until: str | None = None,
         tags: str | None = None,
         agent_id: str | None = None,
-    ) -> list[Memory]:
+    ) -> builtins.list[Memory]:
         """``GET /api/v1/memories`` — browse with filters."""
         raw = self._request(
             "GET",
@@ -311,7 +338,7 @@ class AiMemoryClient:
         tags: str | None = None,
         agent_id: str | None = None,
         as_agent: str | None = None,
-    ) -> list[Memory]:
+    ) -> builtins.list[Memory]:
         """``GET /api/v1/search`` — FTS keyword OR search (matches any token)."""
         raw = self._request(
             "GET",
@@ -382,9 +409,7 @@ class AiMemoryClient:
         )
 
     # -- links / stats / admin ---------------------------------------------
-    def link(
-        self, source_id: str, target_id: str, relation: str = "related_to"
-    ) -> dict[str, Any]:
+    def link(self, source_id: str, target_id: str, relation: str = "related_to") -> dict[str, Any]:
         """``POST /api/v1/links``."""
         return self._request(
             "POST",
@@ -392,7 +417,7 @@ class AiMemoryClient:
             json_body={"source_id": source_id, "target_id": target_id, "relation": relation},
         )
 
-    def get_links(self, memory_id: str) -> list[dict[str, Any]]:
+    def get_links(self, memory_id: str) -> builtins.list[dict[str, Any]]:
         """``GET /api/v1/links/{id}``."""
         raw = self._request("GET", f"/api/v1/links/{memory_id}")
         return raw.get("links", raw) if isinstance(raw, dict) else raw
@@ -424,7 +449,7 @@ class AiMemoryClient:
         """``GET /api/v1/stats``."""
         return Stats.model_validate(self._request("GET", "/api/v1/stats"))
 
-    def namespaces(self) -> list[dict[str, Any]]:
+    def namespaces(self) -> builtins.list[dict[str, Any]]:
         """``GET /api/v1/namespaces``."""
         raw = self._request("GET", "/api/v1/namespaces")
         return raw.get("namespaces", raw) if isinstance(raw, dict) else raw
@@ -501,11 +526,9 @@ class AiMemoryClient:
         endpoint kept receiving signed deliveries indefinitely. Check the
         returned ``deleted`` flag.
         """
-        return self._request(
-            "DELETE", "/api/v1/subscriptions", params={"id": subscription_id}
-        )
+        return self._request("DELETE", "/api/v1/subscriptions", params={"id": subscription_id})
 
-    def subscriptions(self) -> list[Subscription]:
+    def subscriptions(self) -> builtins.list[Subscription]:
         """``GET /api/v1/subscriptions``."""
         raw = self._request("GET", "/api/v1/subscriptions")
         items = raw.get("subscriptions", raw) if isinstance(raw, dict) else raw
@@ -522,7 +545,7 @@ class AiMemoryClient:
         agent_id: str | None = None,
         unread_only: bool | None = None,
         limit: int | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """``GET /api/v1/inbox`` — fetch received messages."""
         raw = self._request(
             "GET",
@@ -542,14 +565,14 @@ class AiMemoryClient:
     # (``docs/federation.md``).
 
     # -- agents -------------------------------------------------------------
-    def agents(self) -> list[AgentRegistration]:
+    def agents(self) -> builtins.list[AgentRegistration]:
         """``GET /api/v1/agents``."""
         raw = self._request("GET", "/api/v1/agents")
         items = raw.get("agents", raw) if isinstance(raw, dict) else raw
         return [AgentRegistration.model_validate(a) for a in items]
 
     def register_agent(
-        self, agent_id: str, agent_type: str, capabilities: list[str] | None = None
+        self, agent_id: str, agent_type: str, capabilities: builtins.list[str] | None = None
     ) -> dict[str, Any]:
         """``POST /api/v1/agents``."""
         return self._request(

@@ -44,9 +44,16 @@ attestation = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "mypy>=1.8",
-    "ruff>=0.3",
+    "mypy>=1.8,<3",
+    # #6662: one minor, so the `ruff format --check` gate cannot move under
+    # a new ruff release; bump it together with a reformat commit.
+    "ruff>=0.17,<0.18",
     "cryptography>=42.0",
+    # #6688: the TLS security tests need these; without them the SOCKS legs
+    # of the session check (#6349, #6537) and the truststore pins (#6267)
+    # skip in clients-ci. `socksio` is httpx's `socks` extra.
+    "socksio>=1.0,<2",
+    "truststore>=0.9",
 ]
 # TEST-ONLY acceptance-swarm driver (`swarm/` package). NOT shipped in the
 # wheel — `[tool.setuptools.packages.find].include` is `ai_memory*` only, so
@@ -83,3 +90,10 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# #3840 — ruff + mypy were declared dev tools but nothing ran them. The rule
+# set is pinned explicitly so the gate does not drift with the ruff release
+# (`pip install -e ".[dev]"` takes the newest ruff): the pyflakes + pycodestyle
+# error families, the same set the #3840 finding was measured against.
+select = ["E4", "E7", "E9", "F"]

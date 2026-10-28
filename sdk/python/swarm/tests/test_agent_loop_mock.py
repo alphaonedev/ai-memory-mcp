@@ -83,10 +83,10 @@ def _mock_daemon(
 def _agent(
     model: _FakeModel, seen: list[httpx.Request], *, fail_paths: set[str] | None = None
 ) -> SwarmAgent:
-    config = SwarmConfig(base_urls=["http://mock"], n_agents=1, max_steps=2)
-    client = AsyncAiMemoryClient(base_url="http://mock", agent_id="swarm-agent-000")
+    config = SwarmConfig(base_urls=["https://mock"], n_agents=1, max_steps=2)
+    client = AsyncAiMemoryClient(base_url="https://mock", agent_id="swarm-agent-000")
     client._client = httpx.AsyncClient(  # noqa: SLF001 - offline transport injection
-        base_url="http://mock", transport=_mock_daemon(seen, fail_paths=fail_paths)
+        base_url="https://mock", transport=_mock_daemon(seen, fail_paths=fail_paths)
     )
     identity = AgentIdentity(
         agent_id="swarm-agent-000",

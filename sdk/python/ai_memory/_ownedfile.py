@@ -30,7 +30,9 @@ A file that holds a private credential must be, proven on ONE descriptor:
 * a **regular file** — not a directory, not a FIFO (a FIFO parks the reader),
   not a device;
 * mode ``& 0o077 == 0`` — no group or other bit, i.e. 0600-or-tighter;
-* owned by the **effective uid** of the caller.
+* owned by the **effective uid** of the caller;
+* on macOS, carrying **no extended ACL entry** that grants another principal
+  read access or any right to change it (mode bits cannot see one, #6934).
 
 Reached by a **symlink** it is refused at the open, so a link in the key
 directory can never have its permissions checked on the target.
@@ -50,8 +52,11 @@ import stat
 from pathlib import Path
 from typing import Callable
 
+from ai_memory import _acl
+
 __all__ = [
     "BUNDLE_MODE_ADVICE",
+    "check_owned_acl",
     "check_owned_stat",
     "read_owner_only_bytes",
     "read_owner_only_text",
@@ -93,17 +98,53 @@ def check_owned_stat(
         raise error(f"{p} is owned by uid {st.st_uid}, not by the caller")
 
 
+#: ACL rights an owner-only credential must not grant to anyone else: reading
+#: it, and every right that lets a principal change it or give itself any
+#: right (#6934).
+_OWNER_ONLY_ACL_RIGHTS = _acl.ACL_READ_DATA | _acl.CHANGE_RIGHTS
+
+
+def check_owned_acl(
+    p: Path,
+    fd: int,
+    *,
+    error: Callable[[str], Exception],
+    mode_advice: str = BUNDLE_MODE_ADVICE,
+) -> None:
+    """Refuse the open credential ``fd`` when an extended ACL exposes it (#6934).
+
+    Mode bits cannot see a macOS ACL entry such as ``everyone allow read``, so a
+    ``0600`` key can still be readable by another account. An allow entry that
+    grants reading or changing the file to anyone but this user or root is
+    refused; an ACL that cannot be read is refused too (fail closed). The
+    message names the path, the rights and the reason, never the content.
+    """
+    if not _acl.reads_acls():
+        return
+    try:
+        granted = _acl.foreign_acl_rights(fd, _OWNER_ONLY_ACL_RIGHTS)
+    except _acl.AclUnreadable as exc:
+        raise error(
+            f"{p} carries an extended ACL that cannot be read ({exc}); it is refused "
+            "because an ACL entry could expose the credential (#6934)"
+        ) from None
+    if granted:
+        raise error(
+            f"{p} carries an extended ACL granting {_acl.describe(granted)} to another "
+            f"principal; {mode_advice} (#6934)"
+        )
+
+
 def _open_checked(
     p: Path,
     *,
     error: Callable[[str], Exception],
     mode_advice: str,
-) -> int | None:
+) -> int:
     """Open ``p`` once and prove the standard on THAT descriptor.
 
-    Returns the open descriptor — the caller owns it and must close it — or
-    ``None`` on a platform with no ``O_NOFOLLOW``, in which case the
-    path-based check has ALREADY been applied and the caller reads by path.
+    Returns the open descriptor; the caller owns it, must close it, and reads
+    the credential from it and never from the path again (#6317).
 
     ``p.lstat()`` followed by ``p.read_bytes()`` resolves the path TWICE, and
     the bytes that are read are not the bytes that were checked. A local user
@@ -122,24 +163,26 @@ def _open_checked(
     (``open_owner_only``), modelled in turn on ``AllowlistCache::open_checked``
     (#3504).
 
-    **Platform caveat:** Windows has no ``O_NOFOLLOW`` and no ``O_NONBLOCK``,
-    so there is no way to bind the check to the descriptor there. That leg
-    keeps the historical path-based check-then-read, unchanged and still racy
-    (and, as before #3780, still requiring a POSIX ``os.geteuid``), and says so
-    rather than pretending otherwise. The hub socket and the key directory this
-    loader serves are POSIX-only surfaces today.
+    **Platform without ``O_NOFOLLOW``** (Windows): a symlink cannot be refused
+    at the open, so the path is checked with ``lstat`` first (a symlink, a
+    FIFO or any other non-regular file is refused before anything is opened),
+    then opened ONCE, and the ``fstat`` of that descriptor must name the same
+    file: device, inode, owner and mode equal to the checked ``lstat``. A file,
+    a link or a looser mode swapped in between the check and the open is
+    refused (fail closed), and the caller reads from the descriptor, so the
+    bytes read are the bytes checked (#6317, the Python twin of #3812). As
+    before #3780 the owner check needs a POSIX ``os.geteuid``; the hub socket
+    and the key directory this loader serves are POSIX-only surfaces today.
     """
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     non_block = getattr(os, "O_NONBLOCK", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
     if not no_follow:
-        # Windows. Documented above: the pre-#3780 shape, verbatim.
-        st = p.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            raise error(f"{p} {_SYMLINK_REFUSAL}")
-        check_owned_stat(p, st, error=error, mode_advice=mode_advice)
-        return None
+        return _open_checked_after_lstat(
+            p, error=error, mode_advice=mode_advice, flags=os.O_RDONLY | non_block | cloexec
+        )
 
-    flags = os.O_RDONLY | no_follow | non_block | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | no_follow | non_block | cloexec
     try:
         fd = os.open(p, flags)
     except OSError as err:
@@ -152,6 +195,53 @@ def _open_checked(
     try:
         # fstat on the descriptor just opened — never a second look at the path.
         check_owned_stat(p, os.fstat(fd), error=error, mode_advice=mode_advice)
+        check_owned_acl(p, fd, error=error, mode_advice=mode_advice)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+#: ``stat`` fields that must be equal on the checked path and the opened
+#: descriptor for the two to be the same, unchanged file (#6317).
+_IDENTITY_FIELDS = ("st_dev", "st_ino", "st_uid", "st_mode")
+
+
+def _open_checked_after_lstat(
+    p: Path,
+    *,
+    error: Callable[[str], Exception],
+    mode_advice: str,
+    flags: int,
+) -> int:
+    """The ``O_NOFOLLOW``-less leg of :func:`_open_checked` (#6317).
+
+    Check by ``lstat``, open once, then bind the check to the descriptor by
+    comparing :data:`_IDENTITY_FIELDS`; any difference is refused.
+    """
+    checked = p.lstat()
+    if stat.S_ISLNK(checked.st_mode):
+        raise error(f"{p} {_SYMLINK_REFUSAL}")
+    # Refuses a FIFO, a device or a directory before it is ever opened.
+    check_owned_stat(p, checked, error=error, mode_advice=mode_advice)
+    try:
+        fd = os.open(p, flags | getattr(os, "O_BINARY", 0))
+    except OSError as err:
+        # The file vanished or changed kind after the lstat: the caller's
+        # typed refusal, naming the errno text only (code r1 F6).
+        raise error(
+            f"{p} could not be opened after its check ({err.strerror or type(err).__name__})"
+        ) from None
+    try:
+        opened = os.fstat(fd)
+        if any(getattr(opened, f) != getattr(checked, f) for f in _IDENTITY_FIELDS):
+            raise error(
+                f"{p} changed between its check and its open (device, inode, owner "
+                "or mode differ); it is refused because the file that would be read "
+                "is not the file that was checked (#6317)"
+            )
+        check_owned_stat(p, opened, error=error, mode_advice=mode_advice)
+        check_owned_acl(p, fd, error=error, mode_advice=mode_advice)
     except BaseException:
         os.close(fd)
         raise
@@ -179,8 +269,6 @@ def read_owner_only_bytes(
     because a 32-byte Ed25519 seed is not text.
     """
     fd = _open_checked(p, error=error, mode_advice=mode_advice)
-    if fd is None:
-        return p.read_bytes()
     try:
         return _drain(fd)
     finally:
@@ -195,9 +283,15 @@ def read_owner_only_text(
 ) -> str:
     """:func:`read_owner_only_bytes`, decoded as UTF-8, for JSON credentials."""
     fd = _open_checked(p, error=error, mode_advice=mode_advice)
-    if fd is None:
-        return p.read_text(encoding="utf-8")
     try:
-        return _drain(fd).decode("utf-8")
+        raw = _drain(fd)
     finally:
         os.close(fd)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # ``UnicodeDecodeError.object`` holds the whole credential: keep only
+        # the class name and raise OUTSIDE the handler so the refusal has no
+        # ``__context__`` to walk to it either (#6936).
+        failure = type(exc).__name__
+    raise error(f"{p} is not UTF-8 text ({failure})")

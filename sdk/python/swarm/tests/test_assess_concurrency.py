@@ -77,14 +77,14 @@ def _mock_daemon() -> httpx.MockTransport:
 
 
 def _swarm(model: _LatentModel, n_agents: int, *, concurrency: int) -> SimpleNamespace:
-    config = SwarmConfig(base_urls=["http://mock"], n_agents=n_agents, max_steps=1,
+    config = SwarmConfig(base_urls=["https://mock"], n_agents=n_agents, max_steps=1,
                          assess_concurrency=concurrency)
     agents = []
     for ordinal in range(n_agents):
         agent_id = f"ai:swarm-{ordinal}"
-        client = AsyncAiMemoryClient(base_url="http://mock", agent_id=agent_id)
+        client = AsyncAiMemoryClient(base_url="https://mock", agent_id=agent_id)
         client._client = httpx.AsyncClient(  # noqa: SLF001 - offline transport injection
-            base_url="http://mock", transport=_mock_daemon())
+            base_url="https://mock", transport=_mock_daemon())
         identity = AgentIdentity(agent_id=agent_id, signing_key=AgentSigningKey.generate(),
                                  namespace=f"swarm-{ordinal:03d}",
                                  allowed_namespaces={f"swarm-{ordinal:03d}", "swarm-shared"})
@@ -193,7 +193,7 @@ def test_concurrency_is_configurable_and_fails_closed_on_nonsense() -> None:
     with pytest.raises(ConfigError, match="SWARM_ASSESS_CONCURRENCY"):
         SwarmConfig.from_env({"SWARM_ASSESS_CONCURRENCY": "many"})
     with pytest.raises(ConfigError, match="assess_concurrency must be >= 1"):
-        SwarmConfig(base_urls=["http://mock"], assess_concurrency=0)
+        SwarmConfig(base_urls=["https://mock"], assess_concurrency=0)
 
 
 @pytest.mark.asyncio
@@ -210,10 +210,10 @@ async def test_complete_with_usage_returns_this_calls_usage() -> None:
                       "total_tokens": int(tag) + 1, "cost": 0.5},
         })
 
-    client = OpenRouterClient(api_key="test", model_slug="test-model", base_url="http://mock")
+    client = OpenRouterClient(api_key="test", model_slug="test-model", base_url="https://mock")
     await client._client.aclose()  # noqa: SLF001
     client._client = httpx.AsyncClient(  # noqa: SLF001
-        base_url="http://mock", transport=httpx.MockTransport(handler))
+        base_url="https://mock", transport=httpx.MockTransport(handler))
     try:
         results = await asyncio.gather(*(
             client.complete_with_usage(messages=[{"role": "system", "content": str(n)}])

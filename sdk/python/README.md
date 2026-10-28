@@ -42,8 +42,7 @@ so a client must be handed the CA explicitly:
 So on Linux, with no `AI_MEMORY_KEY_DIR` override, the file is
 `~/.config/ai-memory/keys/tls/local-ca.pem`.
 
-Pin it with the client's `verify=` option (the stock `httpx` parameter — it
-takes the PATH of a CA bundle). Both `AiMemoryClient` and
+Pin it with the client's `verify=` option. Both `AiMemoryClient` and
 `AsyncAiMemoryClient` accept it:
 
 ```python
@@ -61,13 +60,129 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
 
 `verify=` **replaces** the trust store with that bundle; verification stays
 full (chain + hostname — the daemon's leaf carries `localhost`, `127.0.0.1`,
-`::1` and the machine hostname as SANs). Never pass `verify=False`: that
-turns a TLS listener into an unauthenticated one. Two ways to avoid passing
-`verify=` per client:
+`::1` and the machine hostname as SANs). There is no accept-any-certificate
+option (#3840).
 
-- install `local-ca.pem` into the OS trust store
-  (`update-ca-certificates`, `security add-trusted-cert`), or point
-  `SSL_CERT_FILE` at it;
+#### Accepted and refused `verify=` forms
+
+Accepted (anything else raises `ValueError` from the constructor):
+
+- `None` (the default): the default trust the SDK builds itself, a context
+  with the TLS 1.2 floor, the session gate and the request hooks, whose trust
+  is the `certifi` bundle, or the file or directory named by `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` when those are set. It is NOT the operating-system store, and
+  `REQUESTS_CA_BUNDLE` is ignored. When one of the variables is set, the SDK
+  reads the path it names exactly as it reads a `verify=<path>` below (once,
+  at construction, permissions checked); `SSL_CERT_FILE` must name a regular
+  file and `SSL_CERT_DIR` a directory, and a missing or unusable path is
+  refused rather than falling back to `certifi` (#6538).
+- `True`: the same, explicit.
+- A `str` or `os.PathLike` naming an existing CA bundle file or hashed CA
+  directory. The path is resolved component by component when the client is
+  built (symlinks followed under the #6653 rule below, a relative path fixed against
+  the working directory at that moment; a missing component is refused, not
+  normalised away by a later `..` as `os.path.realpath` would). The SDK reads the trust ONCE, at construction,
+  into a context it builds the way `ssl.create_default_context` does but
+  without the system store: for a directory, every hashed entry
+  (`<hash>.0`, `<hash>.r0`, ..., as `c_rehash` / `openssl rehash` name them)
+  is loaded then, so a certificate added to the directory afterwards is never
+  trusted, and a later `chdir` cannot change what is trusted. An empty
+  directory trusts nothing, so every connection fails. The path must not be
+  writable by its group or by others (#6377).
+
+  This also refuses a CA bundle kept under a group-writable directory, such as
+  Homebrew's `/opt/homebrew/etc` (`drwxrwxr-x`, group `admin`) or an Intel
+  Mac's `/usr/local`: anyone in that group could swap the bundle. The error
+  names the directory, its owner and mode, and the fix: `chmod go-w <dir>`
+  (or `chown` it to yourself or root), or copy the bundle to a directory only
+  you can change (#6653).
+
+  On macOS an extended ACL counts as well as the mode bits (#6934): a CA file
+  or any directory on the path is refused when an ACL entry lets someone other
+  than you or root write, append, delete, delete a child, change the ACL or
+  change the owner (`ls -le` shows the entries; `chmod -N <path>` removes
+  them), and a credential file read by the SDK is refused when an ACL entry
+  lets someone else read it. An ACL the SDK cannot read is refused, not
+  assumed empty.
+- Exactly `ssl.SSLContext` (not a subclass): the object returned by
+  `ssl.create_default_context(cafile=...)`, with `verify_mode` left at
+  `CERT_REQUIRED`, `check_hostname` on, no verify flag that relaxes chain
+  validation, no cipher suite without server authentication, and no handshake
+  attribute replaced. The SDK keeps using the caller's object, so the same
+  checks run again before every request: turning verification, the hostname
+  check or date checking off, or adding unauthenticated suites, after
+  construction is refused. A CA the caller loads into its own context later
+  is trusted, because the context is the caller's trust decision.
+
+Refused with `ValueError` (#3840, #6267, #6268, #6269):
+
+- `False`, and every other falsy or blank value (`""`, `0`, a falsy
+  `str`/path subclass).
+- A path that does not exist, or is neither a file nor a directory; a CA
+  file, CA directory, symlink target or target directory that its group or
+  others can write (POSIX, #6377); a path that passes through a directory
+  (an ancestor of the path, of a symlink on the way, or of a link's target)
+  that is owned by another user than you or root, or that its group or others
+  can write, unless that directory is sticky and the entry in it is yours or
+  root's (POSIX, #6559, #6653; a CA in your own subdirectory of `/tmp` is
+  fine); a path naming a component that does not exist yet under such a
+  directory, sticky or not (#6828); a CA file or CA directory owned by another
+  user than you or root, whatever its mode (POSIX, #6815); a component after
+  a file, such as `ca.pem/.` or `ca.pem/..` (#6811); a directory entry that
+  is not a regular file. A CA file is walked again after it is opened and
+  must still be the file that was opened (#6828).
+- A context with `verify_mode` of `CERT_NONE` or `CERT_OPTIONAL`, or with
+  `check_hostname` off.
+- A context with a verify flag that relaxes chain validation, such as
+  `VERIFY_X509_NO_CHECK_TIME` or `VERIFY_ALLOW_PROXY_CERTS` (#6375).
+  `VERIFY_X509_PARTIAL_CHAIN` and the CRL and strict flags are accepted.
+- A context that offers an anonymous (aNULL), NULL-encryption (eNULL) or
+  low-strength (under 112 bits, export or legacy class) cipher suite (#6305).
+  Remove them with `set_ciphers("<your list>:!aNULL:!eNULL")`. The plain
+  `ssl.create_default_context()` is accepted: PSK and SRP suites a distro
+  OpenSSL lists in `"DEFAULT"` cannot complete a handshake without a key or
+  password callback and are not refused.
+- A context that allows a TLS version below 1.2: a `minimum_version` of
+  `TLSv1_1` or lower, or a `maximum_version` below `TLSv1_2` (#8195). The
+  library default (`MINIMUM_SUPPORTED`) is accepted; the SDK then refuses any
+  connection that negotiated less than TLS 1.2. The context the SDK builds from
+  a CA path, and the default-trust context it builds for `verify=None` and
+  `verify=True`, set `minimum_version = TLSv1_2` themselves.
+- A base URL whose scheme is not `https`, loopback included: the API key is
+  never sent in plaintext (#3824).
+- Any `ssl.SSLContext` subclass, including `truststore.SSLContext`: such an
+  object keeps its real verification state elsewhere, so the SDK cannot prove
+  it verifies. Use `ssl.create_default_context(cafile=...)` or pass the CA path.
+- A context whose `wrap_socket`, `wrap_bio`, `verify_mode`, `check_hostname`,
+  `verify_flags`, `hostname_checks_common_name`, `get_ciphers`,
+  `minimum_version`, `maximum_version`,
+  `sslsocket_class` or `sslobject_class` was replaced on the class, or that
+  shadows any `ssl.SSLContext` attribute on the instance.
+- Any other type.
+
+After every TLS handshake, the SDK checks the session before the request's
+first byte is written. This covers a direct connection, a tunnel through an
+`http://` or `https://` proxy, and SOCKS. The session must:
+
+- belong to the caller's context
+- present a certificate that names the request host and is within its
+  validity dates
+- use a cipher with secret bits
+
+Otherwise the connection is closed and the request raises `ValueError`
+(#6349, #6350, #6375). The `https://` proxy's own certificate is checked by
+httpx's default trust (`SSL_CERT_FILE` / `SSL_CERT_DIR` / certifi). No SDK
+header crosses that leg; the origin session inside the tunnel is held to your
+context. Decision record: `docs/adr/ADR-003-sdk-python-tls-verify-enforcement.md`.
+
+Two ways to avoid passing `verify=` per client:
+
+- point `SSL_CERT_FILE` (or `SSL_CERT_DIR`) at `local-ca.pem` and leave
+  `verify=` unset: the SDK reads those variables when it builds its default
+  context (with the TLS 1.2 floor, the session gate and the request hooks),
+  whereas installing the CA into the operating-system store does not affect it.
+  The SDK reads that path once, at construction, and checks its permissions, the
+  same as `verify=<path>` (#6538);
 - run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
   a CA your hosts already trust, in which case no pinning is needed at all.
 
@@ -85,7 +200,7 @@ Ed25519 key whose public half is bound to the agent:
 from ai_memory import AiMemoryClient, Tier
 from ai_memory.attestation import AgentSigningKey
 
-key = AgentSigningKey.generate()          # or .from_file("svc.priv")
+key = AgentSigningKey.generate()  # or .from_file("svc.priv")
 # `.from_file` refuses a key that is not a regular file, is reached through a
 # symlink, has any group/other bit, or is owned by another uid (#3784) — the
 # same standard the daemon applies to `<key_dir>/<agent_id>.priv`.
@@ -100,7 +215,7 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
         content="Use --with-openssl=/opt/openssl, disable DoH for the lab.",
         tier=Tier.LONG,
         tags=["dns", "bind9"],
-        agent_id="svc",       # required when signing — it is inside the envelope
+        agent_id="svc",  # required when signing — it is inside the envelope
         signing_key=key,
     )
     print(created["id"])
@@ -132,12 +247,14 @@ Notes:
 import asyncio
 from ai_memory import AsyncAiMemoryClient
 
+
 async def main() -> None:
     # `ca`: see "Trust the daemon's CA".
     async with AsyncAiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client:
         resp = await client.recall(context="hello")
         for memory in resp.memories:
             print(memory.title)
+
 
 asyncio.run(main())
 ```
@@ -170,7 +287,9 @@ server writes `metadata.agent_id` accordingly (see docs/reference/ARCHITECTURE_R
 Identity).
 
 ```python
-AiMemoryClient(base_url="https://localhost:9077", verify=str(ca), agent_id="ai:claude-opus-4.7@host")
+AiMemoryClient(
+    base_url="https://localhost:9077", verify=str(ca), agent_id="ai:claude-opus-4.7@host"
+)
 ```
 
 ## All methods
@@ -245,10 +364,12 @@ bundle = DelegationBundle.load(
 # `ca` is the daemon CA path — see "Trust the daemon's CA".
 client = AiMemoryClient(base_url="https://localhost:9077", verify=str(ca))
 
+
 def catch_up(signal):
     # EXACTLY ONE inbox read per signal — never one per queued hint.
     for message in client.inbox(agent_id=bundle.agent_id, unread_only=True):
         handle(message)
+
 
 WakeListener("/run/user/1000/ai-memory/wake-hub.sock", bundle, catch_up).run()
 ```
@@ -293,6 +414,7 @@ the hello.
 
 ```python
 from ai_memory import verify_webhook_signature
+
 
 def handle(request) -> None:
     sig = request.headers["X-AI-Memory-Signature"]
