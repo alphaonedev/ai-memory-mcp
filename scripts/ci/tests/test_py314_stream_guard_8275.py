@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Guard: helper parser construction survives closed standard streams (#8275).
 
-Python 3.14 argparse probes stdout/stderr (isatty) while building the parser, which
+Python 3.14 argparse probes stdout (isatty) while building the parser, which
 raises ValueError on a closed stream. The helper must still exit 2 with a diagnostic
 path that does not raise, on every interpreter that runs this suite.
 """
@@ -52,7 +52,8 @@ class StreamGuard8275Tests(unittest.TestCase):
                 self.assertIn(b"output error", result.stderr)
                 self.assertNotIn(b"Traceback", result.stderr)
 
-    def test_8275_parser_construction_with_closed_stderr_reports_exit_2(self):
+    def test_8275_closed_stderr_usage_error_exits_2(self):
+        """Pins the closed-stderr usage path (exit 2); passes on 3.12 and 3.14 with or without the construction guard."""
         result = self.run_helper(CLOSE_STDERR_ONLY, ("--unknown",))
         self.assertEqual(result.returncode, EXIT_ERROR)
         self.assertNotIn(b"Traceback", result.stderr)

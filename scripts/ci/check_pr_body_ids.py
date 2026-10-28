@@ -172,7 +172,7 @@ class OutputParser(argparse.ArgumentParser):
 def main(argv=None):
     """Read and report a body; failed standard output streams are closed."""
     try:
-        # Python 3.14 argparse probes stdout/stderr (isatty) while constructing the
+        # Python 3.14 argparse probes stdout only (isatty) while constructing the
         # parser; an unavailable stream must reach the exit-2 output-error path (#8275).
         parser = OutputParser(description=__doc__)
     except (OSError, ValueError):
