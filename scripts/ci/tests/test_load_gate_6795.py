@@ -61,6 +61,7 @@ class Run(unittest.TestCase):
                 label=kw.get('label', 'x'), max_ratio=1.5,
                 max_wait_secs=kw.get('max_wait', 120), poll_secs=30,
                 cores=10, load_fn=fake_load, sleep_fn=sleeps.append,
+                clock_fn=lambda: sum(sleeps),
             )
         return rc, out.getvalue(), sleeps
 

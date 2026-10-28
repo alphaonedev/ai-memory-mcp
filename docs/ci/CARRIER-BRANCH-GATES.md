@@ -134,7 +134,7 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
   average exceeds 1.5 x cores (`--max-ratio`), for at most 1200 s
   (`--max-wait-secs`), polling every 30 s, and prints the measured load in a
   `::notice::`. It never fails on load alone: after the wait it warns and
-  proceeds. Unit tests: `scripts/ci/tests/test_load_gate_6795.py`.
+  proceeds when its configured suite reserve still fits (#7795 below). Unit tests: `scripts/ci/tests/test_load_gate_6795.py`.
 - **Job start anchor.** The first step of the `check` job (`Record job start
   (#6795)`) writes `JOB_T0` (epoch seconds) to `$GITHUB_ENV`, so every budget
   counts the real time since the job started, including the load-gate wait.
@@ -174,3 +174,32 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
   that the walk never read, bad root or any internal error) and
   fails the check. Unit tests:
   `scripts/ci/tests/test_manifest_owned_paths_8050.py`.
+
+### Budget admission reserves (#7795)
+
+Both self-hosted Check legs and postgres-ignored pass the job cap and `JOB_T0`
+to `load_gate.py`. It subtracts elapsed job time and the existing 300-second
+teardown allowance once, then charges actual monotonic elapsed time during the
+wait (including load reads and scheduling delays). Waiting stops at the earlier
+of the load-wait deadline and the suite reserve. A remaining budget below the
+reserve returns exit 3 with the remaining seconds and configured reserve,
+regardless of current load. Invalid budget/clock arguments return exit 2.
+
+These are conservative **admission reserves**, not proven physical minima or
+promises that a saturated run will finish:
+
+| Suite | Reserve | Evidence |
+|---|---:|---|
+| Full enterprise-fed, either node | 3913 s | Existing #6344 longest-shard estimate above and in ci.yml; contended weights and class averages, not an idle-host measurement. |
+| Full macos-fed sqlite | 1500 s | Existing #3461 watchdog derivation in ci.yml measured about 1500 s of suite runtime. |
+| postgres-ignored | 400 s | Successful [run 39186401501, job 117849644320](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/39186401501/job/117849644320), 2026-10-19: passing libtest runtime sums to 400.01 s, rounded down; 215 executed = 215 listed. The 14m49s prebuild is excluded. This is observed runtime, not a measured idle-host floor. |
+| Impact-selected Check subset | 0 s | No full-suite estimate is asserted for a subset; expired budgets still refuse admission. |
+
+The initial check runs before the test step. A second, zero-wait check runs
+after prebuild/partition and before the whole sharded suite, after sqlite
+prebuild, and after postgres-ignored listing/prebuild. This catches compilation
+consuming the remaining reserve after the first check passed (#7795's 9578 s
+elapsed case). Existing watchdogs, job caps, test selection and non-vacuity
+checks are unchanged. Targeted subsets do not inherit a full-suite reserve.
+The helper's direct `--budget-secs` input is already usable time: callers of
+that mode subtract their teardown allowance before calling it.
