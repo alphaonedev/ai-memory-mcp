@@ -907,7 +907,7 @@ permissive one named here, so a reader must not assume the control:
   `src/curator/reflection_pass.rs:125-127`; [#8264](https://github.com/alphaonedev/ai-memory-mcp/issues/8264), open, operator milestone decision).
 - Batman Form 2 synchronous atomisation on postgres: sqlite and MCP stdio only, postgres reports
   `skipped_backend_unsupported` ([#8255](https://github.com/alphaonedev/ai-memory-mcp/issues/8255), open; `docs/atomisation.md:100-102`).
-- Top-shelf encryption documentation ([#3833](https://github.com/alphaonedev/ai-memory-mcp/issues/3833), deferred to v1.x).
+- Top-shelf encryption documentation ([#3833](https://github.com/alphaonedev/ai-memory-mcp/issues/3833), closed with the `deferred-v1.x` label, so deferred to v1.x).
 - Singleton and Team shapes keep allow-on-silence namespace governance by default
   (`src/config/shape.rs:191`; [#3125](https://github.com/alphaonedev/ai-memory-mcp/issues/3125)).
 

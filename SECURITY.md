@@ -1,5 +1,7 @@
 # Security Policy
 
+What the v1.0.0 GA candidate certifies and what it does not claim: see the [certification scope statement](docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262) (#8262).
+
 ai-memory is a substrate for persistent AI/agent memory. Customers and AgenticMem prospects deploy it in regulated environments. Security disclosures are taken seriously.
 
 ## Supported versions

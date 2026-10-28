@@ -5,6 +5,8 @@ layout: doc
 
 Threat model, trust boundaries, and hardening options for operators.
 
+What the v1.0.0 GA candidate certifies and what it does not claim: see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262) (#8262).
+
 For responsible disclosure: **security@alpha-one.mobi**. Please encrypt
 against the maintainer key listed in `SECURITY.md.sig` (if present)
 or via the fingerprint on our releases page.
