@@ -8,12 +8,16 @@
 //! ChaCha20-Poly1305 AEAD encryption so a single recipient (an agent
 //! identified by `agent_id`) can decrypt content encrypted to its public key.
 //!
-//! **NOT end-to-end across federation (#1809):** the at-rest envelope is not a
-//! wire field — federation catch-up (`memories_updated_since`) decrypts
-//! `content` and the receiving peer re-seals under its own per-node key, so a
-//! federated peer holds plaintext transiently at apply time (the wire itself is
-//! TLS/mTLS-protected + enrolled-peer-gated). True cross-peer end-to-end
-//! encryption is a separate (v0.9) design — this primitive is per-node at-rest.
+//! **The `0x02` / `0x03` schemes are NOT end-to-end across federation
+//! (#1809):** the at-rest envelope is not a wire field — federation catch-up
+//! (`memories_updated_since`) decrypts `content` and the receiving peer
+//! re-seals under its own per-node key, so a federated peer holds plaintext
+//! transiently at apply time (the wire itself is TLS/mTLS-protected +
+//! enrolled-peer-gated). The `0x05` scope envelope ([`scope`], #8278) is the
+//! end-to-end scheme: content sealed under a per-namespace key held only by the
+//! namespace's reader nodes (design: `docs/design/E2E_FEDERATION_ENCRYPTION.md`).
+//! E1 lands the envelope and the key store; the sync path that carries `0x05`
+//! bytes peer to peer is the E2 lane of #8278.
 //!
 //! ## Wire shape
 //!
@@ -98,6 +102,10 @@ use zeroize::Zeroize;
 
 /// v1.0.0 #3717 — recovery escrow of the per-agent at-rest key.
 pub mod escrow;
+/// v1.0.0 #8278 — the `0x05` end-to-end scope envelope and scope-key store.
+pub mod scope;
+
+pub use scope::{RecordBinding, SCOPE_ENVELOPE_VERSION};
 
 /// Envelope wire-version. Bumped when the byte layout OR the
 /// cryptographic scheme (KDF / AAD construction) changes; readers refuse
@@ -1181,9 +1189,16 @@ pub fn crypto_erase_marker() -> Vec<u8> {
 /// destroy) return `false`: they are the HONEST-LIMIT case (row-delete +
 /// tombstone only, NOT crypto-erasable). An empty / already-erased (`0x04`)
 /// envelope also returns `false`.
+///
+/// #8278 — a `0x05` scope envelope is erasable too: its per-record DEK exists
+/// only wrapped inside the envelope, so the `0x04` rewrite destroys it even
+/// for a holder of the namespace scope key.
 #[must_use]
 pub fn envelope_is_crypto_erasable(envelope_bytes: &[u8]) -> bool {
-    envelope_bytes.first() == Some(&RECORD_ENVELOPE_VERSION)
+    matches!(
+        envelope_bytes.first(),
+        Some(&RECORD_ENVELOPE_VERSION | &SCOPE_ENVELOPE_VERSION)
+    )
 }
 
 /// #1956 [R56] — has this `encrypted_envelope` already been crypto-erased
@@ -1217,6 +1232,12 @@ pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<Stri
             "record has been crypto-erased (envelope key destroyed); content is unrecoverable"
         )),
         Some(&RECORD_ENVELOPE_VERSION) => open_content_per_record(envelope_bytes, agent_id),
+        // #8278 — a 0x05 row is bound to its memory id + namespace, which this
+        // signature does not carry: refuse typed (the row stays sealed) and
+        // let the caller use `open_content_bound`.
+        Some(&SCOPE_ENVELOPE_VERSION) => Err(anyhow::Error::new(
+            scope::ScopeEnvelopeError::BindingRequired,
+        )),
         // 0x02 legacy per-agent scheme (and any other value → Envelope::from_bytes
         // rejects unknown versions with a typed error).
         _ => {
@@ -1225,6 +1246,27 @@ pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<Stri
             let kp = load_keypair(agent_id)?.ok_or_else(|| key_absent_error(agent_id))?;
             decrypt(&env, &kp.secret)
         }
+    }
+}
+
+/// #8278 — [`open_content`] for a read path that knows the row identity. A
+/// `0x05` scope envelope opens through the reader's scope-key stanza under
+/// the resolved key directory ([`scope::open_content_scoped`]); every other
+/// version dispatches exactly as [`open_content`] (the binding is unused by
+/// `0x02` / `0x03`, and `0x04` and unknown versions still refuse typed).
+///
+/// # Errors
+/// As [`open_content`], plus every [`scope::ScopeEnvelopeError`] and
+/// [`scope::store::ScopeKeyStoreError`] refusal of the scope path.
+pub fn open_content_bound(
+    envelope_bytes: &[u8],
+    agent_id: &str,
+    binding: RecordBinding<'_>,
+) -> Result<String> {
+    if envelope_bytes.first() == Some(&SCOPE_ENVELOPE_VERSION) {
+        scope::open_content_scoped(envelope_bytes, agent_id, binding)
+    } else {
+        open_content(envelope_bytes, agent_id)
     }
 }
 
