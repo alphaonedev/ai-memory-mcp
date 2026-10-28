@@ -16,6 +16,9 @@ r5: the generator must be token_hex(>=16); every docker exec in both scripts is
 password-free in argv; the cleanup trap and its exit status are pinned; the
 non-SCRAM verifier refusal exists; the userlist is removed before the write;
 the postgres healthcheck probes 127.0.0.1; pgbouncer.ini pins auth_type.
+r6: indented exit 0, a disarmed trap, every password spelling on every docker
+exec/run, an extra verifier arm, a widened userlist mode, a reused exit code,
+the [4/4] SHOW CONFIG check, and a per-run compose project name are pinned.
 """
 import pathlib
 import re
@@ -33,6 +36,11 @@ INI = PGB / "pgbouncer.ini"
 SMOKE = PGB / "smoke-test.sh"
 ENVELOPE = REPO / "infra" / "pillar4-envelope" / "measure-envelope.sh"
 SCRIPTS = (SMOKE, ENVELOPE)
+README_FOR = {SMOKE: PGB / "README.md", ENVELOPE: REPO / "infra" / "pillar4-envelope" / "README.md"}
+USERLIST_REF = re.compile(r"\.userlist\.generated|\$\{?USERLIST\b")
+PW_SPELLING = re.compile(r"\$\{?(?:PW|POSTGRES_PASSWORD|PGPASSWORD)\b")
+EXIT_ZERO = re.compile(r"(?<![\w-])exit\s+[\"']?0+[\"']?(?![\w])")
+DOCKER_EXEC_RUN = re.compile(r"\bdocker\b.*\s(?:exec|run)\s")
 LITERAL_DEFAULTS = ("ai_memory_smoke", "ai_memory_envelope")
 REQUIRED_PW = re.compile(r"^\$\{POSTGRES_PASSWORD:\?[^}]+\}$")
 PW_ASSIGN = re.compile(
@@ -282,82 +290,11 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertIn('PGBOUNCER_GID="$(id -g)"', code, path.name)
             self.assertIn("export PGBOUNCER_UID PGBOUNCER_GID", code, path.name)
 
-    def test_userlist_written_owner_only(self):
-        for path in SCRIPTS:
-            writes = [ln for ln in _code_lines(path) if ".userlist.generated.txt" in ln and ">" in ln]
-            self.assertTrue(writes, path.name)
-            for ln in writes:
-                self.assertRegex(ln, r"umask 077", "%s: userlist must be written under umask 077: %s" % (path.name, ln))
-
     def test_psql_pooled_forwards_stdin(self):
         # The probes feed SQL by heredoc; without -i docker exec drops stdin
         # and psql runs nothing (the count came back empty).
         text = _joined(SMOKE)
         self.assertRegex(text, r"psql_pooled\(\)\s*\{\s*docker exec -i\b")
-
-    def test_docker_exec_has_no_password_in_argv(self):
-        # EVERY docker exec in BOTH scripts: no PGPASSWORD=value, no $PW.
-        for path in SCRIPTS:
-            text = _joined(path)
-            execs = [ln for ln in text.splitlines() if re.search(r"\bdocker exec\b", ln)]
-            self.assertTrue(execs, path.name)
-            for ln in execs:
-                self.assertNotRegex(ln, r"PGPASSWORD=", "%s: %s" % (path.name, ln))
-                self.assertNotRegex(ln, r"\$\{?PW\b", "%s: %s" % (path.name, ln))
-        # The smoke pooled URL never carries the password. The envelope's
-        # POOLED_URL deliberately does (it feeds a 0600 file, #4577), so that
-        # one line is the explicit carve-out.
-        for ln in _joined(SMOKE).splitlines():
-            if re.match(r"^\s*POOLED_URL=", ln):
-                self.assertNotRegex(ln, r"\$\{?PW\b", ln)
-
-    def test_cleanup_trap_and_exit_status_are_pinned(self):
-        # N1: one `trap cleanup EXIT`; cleanup() starts with rc=$? and ends
-        # with exit "$rc"; no unconditional `exit 0` anywhere in the script.
-        for path in SCRIPTS:
-            code = [ln.strip() for ln in _code_lines(path)]
-            self.assertEqual(code.count("trap cleanup EXIT"), 1, "%s: need exactly one trap" % path.name)
-            start = code.index("cleanup() {")
-            end = code.index("}", start)
-            body = code[start + 1 : end]
-            self.assertEqual(body[0], "rc=$?", "%s: rc=$? must be the first statement" % path.name)
-            self.assertEqual(body[-1], 'exit "$rc"', "%s: cleanup must exit with rc" % path.name)
-            self.assertLess(end, code.index("trap cleanup EXIT"), path.name)
-            for ln in code:
-                self.assertNotRegex(ln, r"^rc=0\s*;?$", "%s: rc reset: %s" % (path.name, ln))
-            # An `exit 0` before the trap is armed, or at column 0 anywhere,
-            # ends the script before teardown can report a failure. The
-            # envelope's success exit is indented inside its knee branch.
-            trap_at = code.index("trap cleanup EXIT")
-            for ln in code[:trap_at]:
-                self.assertNotRegex(ln, r"^exit\s+0\s*;?$", "%s: exit 0 before teardown: %s" % (path.name, ln))
-            for ln in _code_lines(path):
-                self.assertNotRegex(ln, r"^exit\s+0\s*;?$", "%s: top-level exit 0: %s" % (path.name, ln))
-
-    def test_non_scram_verifier_is_refused(self):
-        # N3: the case on the verifier row must have a catch-all arm that exits
-        # non-zero, so a non-SCRAM or empty row is never written as the userlist.
-        for path in SCRIPTS:
-            code = [ln.strip() for ln in _code_lines(path)]
-            start = code.index('case "$VERIFIER_ROW" in')
-            end = code.index("esac", start)
-            arms = code[start + 1 : end]
-            self.assertIn("'\"ai_memory\" \"SCRAM-SHA-256$'*) ;;", arms, path.name)
-            fallback = [ln for ln in arms if ln.startswith("*)")]
-            self.assertEqual(len(fallback), 1, path.name)
-            self.assertRegex(fallback[0], r"\bexit [1-9]\d*\b", "%s: %s" % (path.name, fallback[0]))
-            self.assertIn(">&2", fallback[0], path.name)
-
-    def test_userlist_removed_before_write(self):
-        # N4: umask only applies to a new file. A leftover 0644 file must be
-        # removed (or chmod 600) before the verifier is written.
-        for path in SCRIPTS:
-            code = [ln.strip() for ln in _code_lines(path)]
-            writes = [i for i, ln in enumerate(code) if ".userlist.generated.txt" in ln and ">" in ln]
-            self.assertEqual(len(writes), 1, path.name)
-            prior = code[code.index("trap cleanup EXIT") : writes[0]]
-            removed = any(re.match(r'^rm -f "?(?:\.\./pgbouncer/)?\.userlist\.generated\.txt"?$', ln) for ln in prior)
-            self.assertTrue(removed, "%s: rm -f of the userlist must precede the write" % path.name)
 
     def test_postgres_healthcheck_probes_loopback(self):
         # N5: without -h the probe uses the unix socket, which the image's
@@ -368,7 +305,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertIn("-h 127.0.0.1", probe)
 
     def test_pooler_auth_type_is_pinned(self):
-        # #4732: only a SCRAM secret may authenticate; md5/plain/trust fail closed.
+        # #4732: the pin refuses md5 entries; a plain-text entry is still accepted by
+        # the pooler, so the verifier check in the scripts is what refuses plain rows.
         lines = [_strip_comment(ln).strip() for ln in INI.read_text().splitlines()]
         values = [ln for ln in lines if re.match(r"^auth_type\s*=", ln)]
         self.assertEqual(len(values), 1, values)
@@ -389,6 +327,151 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 self.assertNotRegex(ln, swallow, "%s: down failure must be loud: %s" % (path.name, ln))
                 self.assertRegex(ln, r"\|\|\s*\{[^}]*\brc=1\b[^}]*\}", "%s: need `|| { ...; rc=1; }`: %s" % (path.name, ln))
             self.assertIn("still running", text, "%s: must fail loudly when containers remain" % path.name)
+
+    def test_userlist_written_owner_only(self):
+        for path in SCRIPTS:
+            writes = [ln for ln in _code_lines(path) if USERLIST_REF.search(ln) and ">" in ln]
+            self.assertTrue(writes, path.name)
+            for ln in writes:
+                self.assertRegex(ln, r"umask 077", "%s: userlist must be written under umask 077: %s" % (path.name, ln))
+
+    def test_userlist_mode_is_never_widened(self):
+        # r4 security LOW-2: nothing after the write may widen the mode. No chmod
+        # or install anywhere, and every line naming the userlist is one of the
+        # assignment, the rm -f, or the umask-077 write.
+        allowed = (
+            r'^USERLIST="(?:\.\./pgbouncer/)?\.userlist\.generated\.\$RUN\.txt"$',
+            r'^rm -f "\$USERLIST"(?: "\$\{STORE_URL_FILE:-\}")?$',
+            r"""^\(umask 077; printf '%s\\n' "\$VERIFIER_ROW" > "\$USERLIST"\)$""",
+        )
+        for path in SCRIPTS:
+            for ln in (c.strip() for c in _code_lines(path)):
+                self.assertNotRegex(ln, r"\b(?:chmod|install)\b", "%s: mode change: %s" % (path.name, ln))
+                if USERLIST_REF.search(ln):
+                    self.assertTrue(any(re.match(a, ln) for a in allowed), "%s: unexpected userlist line: %s" % (path.name, ln))
+
+    def test_docker_exec_and_run_have_no_password_in_argv(self):
+        # r4 P3: EVERY docker exec / docker run in BOTH scripts, every spelling.
+        for path in SCRIPTS:
+            text = _joined(path)
+            cmds = [ln for ln in text.splitlines() if DOCKER_EXEC_RUN.search(ln)]
+            self.assertTrue(any(re.search(r"\bdocker exec\b", ln) for ln in cmds), path.name)
+            for ln in cmds:
+                self.assertNotRegex(ln, r"PGPASSWORD=", "%s: %s" % (path.name, ln))
+                self.assertNotRegex(ln, PW_SPELLING, "%s: %s" % (path.name, ln))
+            for ln in text.splitlines():
+                if re.match(r"^\s*\w*URL=", ln) and path == SMOKE:
+                    self.assertNotRegex(ln, PW_SPELLING, ln)
+            if path == ENVELOPE:
+                # Its POOLED_URL carries the password (0600 file, #4577); it must
+                # never reach a docker exec / run argv.
+                for ln in cmds:
+                    self.assertNotIn("POOLED_URL", ln, ln)
+
+    def test_cleanup_trap_and_exit_status_are_pinned(self):
+        # N1 + r4 P1/P2: exactly one trap in the script and it is the cleanup
+        # arming; cleanup() starts with rc=$? and ends with exit "$rc"; the smoke
+        # has no `exit 0` at all, the envelope exactly one inside its knee branch.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            traps = [ln for ln in code if re.search(r"\btrap\b", ln)]
+            self.assertEqual(traps, ["trap cleanup EXIT"], "%s: trap disarmed or duplicated: %r" % (path.name, traps))
+            start = code.index("cleanup() {")
+            end = code.index("}", start)
+            body = code[start + 1 : end]
+            self.assertEqual(body[0], "rc=$?", "%s: rc=$? must be the first statement" % path.name)
+            self.assertEqual(body[-1], 'exit "$rc"', "%s: cleanup must exit with rc" % path.name)
+            self.assertLess(end, code.index("trap cleanup EXIT"), path.name)
+            for ln in code:
+                self.assertNotRegex(ln, r"^rc=0\s*;?$", "%s: rc reset: %s" % (path.name, ln))
+            zeros = [i for i, ln in enumerate(code) if EXIT_ZERO.search(ln)]
+            if path == SMOKE:
+                self.assertEqual(zeros, [], "%s: exit 0 hides a failed property" % path.name)
+            else:
+                self.assertEqual(len(zeros), 1, "%s: expected one success exit" % path.name)
+                before = [ln for ln in code[: zeros[0]] if re.match(r"^(?:if\b|elif\b|else\b|fi\b)", ln)]
+                self.assertEqual(before[-1], 'if [ -n "$KNEE" ]; then', "%s: exit 0 outside the knee branch" % path.name)
+
+    def test_non_scram_verifier_is_refused(self):
+        # N3 + r4 P4: the case has exactly two arms, the SCRAM arm and one
+        # catch-all that exits non-zero, so no permissive arm can be added.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            start = code.index('case "$VERIFIER_ROW" in')
+            end = code.index("esac", start)
+            arms = [ln for ln in code[start + 1 : end] if ln]
+            self.assertEqual(len(arms), 2, "%s: unexpected extra case arm: %r" % (path.name, arms))
+            self.assertEqual(arms[0], "'\"ai_memory\" \"SCRAM-SHA-256$'*) ;;", path.name)
+            self.assertTrue(arms[1].startswith("*)"), arms[1])
+            self.assertRegex(arms[1], r"\bexit [1-9]\d*\b", "%s: %s" % (path.name, arms[1]))
+            self.assertIn(">&2", arms[1], path.name)
+
+    def test_userlist_removed_before_write(self):
+        # N4: umask only applies to a new file. A leftover 0644 file must be
+        # removed (or chmod 600) before the verifier is written.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            writes = [i for i, ln in enumerate(code) if USERLIST_REF.search(ln) and ">" in ln]
+            self.assertEqual(len(writes), 1, path.name)
+            prior = code[code.index("trap cleanup EXIT") : writes[0]]
+            removed = any(re.match(r'^rm -f "\$USERLIST"$', ln) for ln in prior)
+            self.assertTrue(removed, "%s: rm -f of the userlist must precede the write" % path.name)
+
+    def test_exit_codes_are_distinct_and_documented(self):
+        # r4 P5: every exit code >= 64 has exactly one meaning in a script, is
+        # named in the script header and in that script's README.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            codes = [int(c) for ln in code for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)]
+            big = sorted(c for c in codes if c >= 64)
+            self.assertEqual(len(big), len(set(big)), "%s: exit code reused: %r" % (path.name, big))
+            header = "\n".join(ln for ln in path.read_text().splitlines()[:50] if ln.startswith("#"))
+            readme = README_FOR[path].read_text()
+            for c in big:
+                self.assertRegex(header, r"\b%d\b" % c, "%s: exit %d missing from the header" % (path.name, c))
+                self.assertRegex(readme, r"\b%d\b" % c, "%s: exit %d missing from the README" % (path.name, c))
+        env = "\n".join(_code_lines(ENVELOPE))
+        verifier = re.search(r"no SCRAM-SHA-256 verifier.*?exit (\d+)", env)
+        knee = re.search(r"NO KNEE.*?\n\s*exit (\d+)", env, re.S)
+        self.assertTrue(verifier and knee)
+        self.assertNotEqual(verifier.group(1), knee.group(1))
+
+    def test_pool_mode_step_asserts_effective_config(self):
+        # r4 P6: [4/4] reads SHOW CONFIG and fails non-zero on a mismatch.
+        text = _joined(SMOKE)
+        self.assertNotRegex(text, r"SHOW pool_mode", "SHOW pool_mode is not a valid admin command")
+        self.assertIn("SHOW CONFIG;", text)
+        self.assertNotRegex(text.split("[4/4]", 1)[1], r"\|\|\s*true|2>\s*/dev/null")
+        code = [ln.strip() for ln in _code_lines(SMOKE)]
+        for var, want in (("pool_mode", "transaction"), ("auth_type", "scram-sha-256")):
+            check = 'if [ "$%s" != "%s" ]; then' % (var, want)
+            self.assertIn(check, code, "[4/4] must compare %s" % var)
+            tail = code[code.index(check) + 1 : code.index(check) + 4]
+            self.assertTrue(any(re.match(r"^exit [1-9]\d*$", ln) for ln in tail), "%s: mismatch must exit non-zero" % var)
+
+    def test_compose_project_name_is_derived_per_run(self):
+        # Collision fix: project, container names and the userlist derive from a
+        # per-run suffix, every compose call names the project, and the trap
+        # removes only that project.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            self.assertIn('RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"', code, path.name)
+            self.assertIn('export AI_MEMORY_SMOKE_RUN="$RUN"', code, path.name)
+            for var in ("PROJECT", "PG_CONTAINER"):
+                found = [ln for ln in code if ln.startswith(var + "=")]
+                self.assertEqual(len(found), 1, "%s: %s" % (path.name, var))
+                self.assertRegex(found[0], r'^%s="ai-memory-pgbouncer-[^"]*\$RUN[^"]*"$' % var, "%s: %s is not per-run" % (path.name, found[0]))
+            for ln in _joined(path).splitlines():
+                if re.search(r"\bdocker compose\b", ln) and not ln.lstrip().startswith("echo"):
+                    self.assertIn('-p "$PROJECT"', ln, "%s: compose call without the per-run project: %s" % (path.name, ln))
+        compose = _compose_code()
+        names = re.findall(r"(?m)^\s*container_name:\s*(\S+)", compose)
+        self.assertEqual(len(names), 2, names)
+        for name in names:
+            self.assertIn("${AI_MEMORY_SMOKE_RUN:?", name, "container_name must be per-run: %s" % name)
+            self.assertTrue(name.startswith("ai-memory-pgbouncer-"), name)
+        self.assertRegex(compose, r"\./\.userlist\.generated\.\$\{AI_MEMORY_SMOKE_RUN:\?[^}]*\}\.txt:/etc/pgbouncer/userlist\.txt:ro")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py` (no md5, root guard, parsed SQL,
   loud teardown, trap and exit status, argv password check on every `docker exec`, `token_hex(>=16)`,
   non-SCRAM refusal, `auth_type` pin).
+  Round 6: the compose project, container names and userlist file are per run
+  (`AI_MEMORY_SMOKE_RUN`, default date-and-pid) so concurrent smokes never recreate each other's
+  containers and a trap only removes its own project; the `[4/4]` step now asserts
+  `pool_mode = transaction` and `auth_type = scram-sha-256` from `SHOW CONFIG` and fails non-zero on a
+  mismatch; the envelope verifier refusal exits 73 (72 stays "no knee"); the pgbouncer.ini and README
+  wording now states that the pin refuses md5 entries but a plain-text entry is still accepted.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 

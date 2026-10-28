@@ -16,6 +16,9 @@
 #   ./smoke-test.sh                       (random password generated)
 #   POSTGRES_PASSWORD=<value> ./smoke-test.sh
 # Exit 0 = pooler config validated; non-zero = a property failed (see output).
+# Exit codes (each used once): 1 a property failed (AGE, timeout, pool_mode,
+# auth_type); 64 run as root; 65 bad AI_MEMORY_SMOKE_RUN; 73 the role has no
+# SCRAM-SHA-256 verifier (refused, never written to the userlist).
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -38,8 +41,18 @@ PGBOUNCER_GID="$(id -g)"
 export PGBOUNCER_UID PGBOUNCER_GID
 # docker exec takes the password by variable NAME (inherited), never by argv.
 export PGPASSWORD="$PW"
-PROJECT="ai-memory-pgbouncer-smoke"
-PG_CONTAINER="ai-memory-pgbouncer-postgres"
+# Per-run suffix (#4734): the compose project, container names and the userlist
+# file are derived from it so two concurrent runs never recreate each other's
+# containers and one trap only removes its own project. Override with
+# AI_MEMORY_SMOKE_RUN=<[a-z0-9_-]+> (tests); the stable prefix is ai-memory-pgbouncer-.
+RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"
+case "$RUN" in
+  ''|*[!a-z0-9_-]*) echo "FATAL: AI_MEMORY_SMOKE_RUN must match [a-z0-9_-]+" >&2; exit 65 ;;
+esac
+export AI_MEMORY_SMOKE_RUN="$RUN"
+PROJECT="ai-memory-pgbouncer-smoke-$RUN"
+PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"
+USERLIST=".userlist.generated.$RUN.txt"
 POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"
 
 cleanup() {
@@ -50,7 +63,7 @@ cleanup() {
     echo "FATAL: compose project $PROJECT still running after teardown" >&2
     rc=1
   fi
-  rm -f .userlist.generated.txt
+  rm -f "$USERLIST"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -67,12 +80,12 @@ VERIFIER_ROW="$(docker exec "$PG_CONTAINER" \
   psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
 case "$VERIFIER_ROW" in
   '"ai_memory" "SCRAM-SHA-256$'*) ;;
-  *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 72 ;;
+  *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;
 esac
 # Remove any leftover file first: umask only applies to a NEW file, so a stale
 # 0644 userlist would otherwise keep its mode (N4).
-rm -f .userlist.generated.txt
-(umask 077; printf '%s\n' "$VERIFIER_ROW" > .userlist.generated.txt)
+rm -f "$USERLIST"
+(umask 077; printf '%s\n' "$VERIFIER_ROW" > "$USERLIST")
 POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait
 
 # psql THROUGH the pooler is run from inside the postgres container (it has
@@ -120,10 +133,21 @@ Did you run role-defaults.sql / is it mounted into initdb.d?" >&2
 fi
 echo "      OK: role-default timeouts survive DISCARD ALL"
 
-echo "[4/4] pooler is in transaction mode ..."
-mode="$(docker exec -e PGPASSWORD "$PG_CONTAINER" \
-  psql "postgres://ai_memory@pgbouncer:6432/pgbouncer" -tA -c 'SHOW pool_mode;' 2>/dev/null | tr -dc 'a-z' || true)"
-# Some PgBouncer builds report per-database mode; the global is what matters.
-echo "      pool_mode = ${mode:-<unreported>}"
+echo "[4/4] pooler effective settings (SHOW CONFIG on the admin console) ..."
+cfg="$(docker exec -e PGPASSWORD "$PG_CONTAINER" \
+  psql "postgres://ai_memory@pgbouncer:6432/pgbouncer" -tA -c 'SHOW CONFIG;')" \
+  || { echo "FAIL: SHOW CONFIG on the pooler admin console failed" >&2; exit 1; }
+pool_mode="$(printf '%s\n' "$cfg" | awk -F'|' '$1 == "pool_mode" { print $2 }')"
+auth_type="$(printf '%s\n' "$cfg" | awk -F'|' '$1 == "auth_type" { print $2 }')"
+echo "      pool_mode = ${pool_mode:-<unreported>}"
+echo "      auth_type = ${auth_type:-<unreported>}"
+if [ "$pool_mode" != "transaction" ]; then
+  echo "FAIL: pooler pool_mode is '${pool_mode}', want 'transaction'" >&2
+  exit 1
+fi
+if [ "$auth_type" != "scram-sha-256" ]; then
+  echo "FAIL: pooler auth_type is '${auth_type}', want 'scram-sha-256'" >&2
+  exit 1
+fi
 
 echo "PASS: PgBouncer pooler validated (AGE cypher + role-default timeouts through 6432)."

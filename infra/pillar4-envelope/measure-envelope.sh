@@ -30,6 +30,11 @@
 # Exit 0 = a knee was found and printed (the measured X). Exit non-zero = the
 # stack failed to come up or no knee was reached within CONCURRENCY_STEPS (X is
 # then ">= the last step" — raise MAX concurrency and re-run).
+# Exit codes (each used once): 64 run as root; 65 bad AI_MEMORY_SMOKE_RUN;
+# 69 a required tool is missing; 70 the fresh binary was not built; 71 the
+# daemon did not become healthy; 72 no knee within CONCURRENCY_STEPS (a capacity
+# result: raise the ceiling and re-run); 73 the role has no SCRAM-SHA-256
+# verifier (an auth failure, not a capacity result).
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -52,7 +57,17 @@ PGBOUNCER_UID="$(id -u)"
 PGBOUNCER_GID="$(id -g)"
 export PGBOUNCER_UID PGBOUNCER_GID
 POOL_COMPOSE="../pgbouncer/docker-compose.yml"
-PROJECT="ai-memory-4d-envelope"
+# Per-run suffix (#4734): the compose project, container names and the userlist
+# file are derived from it so two concurrent runs never recreate each other's
+# containers and one trap only removes its own project. Override with
+# AI_MEMORY_SMOKE_RUN=<[a-z0-9_-]+> (tests); the stable prefix is ai-memory-pgbouncer-.
+RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"
+case "$RUN" in
+  ''|*[!a-z0-9_-]*) echo "FATAL: AI_MEMORY_SMOKE_RUN must match [a-z0-9_-]+" >&2; exit 65 ;;
+esac
+export AI_MEMORY_SMOKE_RUN="$RUN"
+PROJECT="ai-memory-pgbouncer-envelope-$RUN"
+USERLIST="../pgbouncer/.userlist.generated.$RUN.txt"
 DAEMON_PORT="${DAEMON_PORT:-9077}"
 DAEMON_HOST="127.0.0.1"
 POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"
@@ -81,7 +96,7 @@ cleanup() {
     echo "FATAL: compose project $PROJECT still running after teardown" >&2
     rc=1
   fi
-  rm -f "../pgbouncer/.userlist.generated.txt" "${STORE_URL_FILE:-}"
+  rm -f "$USERLIST" "${STORE_URL_FILE:-}"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -100,7 +115,7 @@ BIN="$(cd ../.. && echo "$PWD/target/release/ai-memory")"
 
 # ── 2. Bring up the 4.B pooled stack ─────────────────────────────────────
 echo "[2/5] bringing up postgres+AGE + pgbouncer (4.B stack) ..."
-PG_CONTAINER="ai-memory-pgbouncer-postgres"
+PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"
 POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait postgres
 # SCRAM end to end (#4732): bring up postgres first (default scram-sha-256
 # auth), then render the pooler userlist from the role's own stored SCRAM
@@ -112,12 +127,12 @@ VERIFIER_ROW="$(docker exec "$PG_CONTAINER" \
   psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
 case "$VERIFIER_ROW" in
   '"ai_memory" "SCRAM-SHA-256$'*) ;;
-  *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 72 ;;
+  *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;
 esac
 # Remove any leftover file first: umask only applies to a NEW file, so a stale
 # 0644 userlist would otherwise keep its mode (N4).
-rm -f "../pgbouncer/.userlist.generated.txt"
-(umask 077; printf '%s\n' "$VERIFIER_ROW" > "../pgbouncer/.userlist.generated.txt")
+rm -f "$USERLIST"
+(umask 077; printf '%s\n' "$VERIFIER_ROW" > "$USERLIST")
 POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait
 
 # ── 3. schema-init + serve THROUGH the pooler ────────────────────────────

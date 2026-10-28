@@ -18,7 +18,7 @@ name: ai-memory-pgbouncer-smoke
 services:
   postgres:
     image: apache/age:release_PG16_1.6.0
-    container_name: ai-memory-pgbouncer-postgres
+    container_name: ai-memory-pgbouncer-${AI_MEMORY_SMOKE_RUN:?set AI_MEMORY_SMOKE_RUN (the smoke scripts export a per-run suffix)}-postgres
     environment:
       POSTGRES_USER: ai_memory
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (smoke-test.sh generates one; see README)}
@@ -37,7 +37,7 @@ services:
 
   pgbouncer:
     image: edoburu/pgbouncer:v1.23.1-p2
-    container_name: ai-memory-pgbouncer
+    container_name: ai-memory-pgbouncer-${AI_MEMORY_SMOKE_RUN:?set AI_MEMORY_SMOKE_RUN (the smoke scripts export a per-run suffix)}
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,7 +54,7 @@ services:
     # never needs a real secret and the backend keeps its default SCRAM auth.
     volumes:
       - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./.userlist.generated.txt:/etc/pgbouncer/userlist.txt:ro
+      - ./.userlist.generated.${AI_MEMORY_SMOKE_RUN:?set AI_MEMORY_SMOKE_RUN}.txt:/etc/pgbouncer/userlist.txt:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ai_memory -d ai_memory || exit 1"]
       interval: 3s

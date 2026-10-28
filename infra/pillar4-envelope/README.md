@@ -54,6 +54,10 @@ What it does:
 
 Exit 0 prints `MEASURED ENVELOPE X = <n> concurrent agents/module`. Exit 72
 means no knee within the ramp (X ≥ last step — raise the ceiling and re-run).
+Exit 73 means the role has no SCRAM-SHA-256 verifier (an auth failure, not a
+capacity result). The other codes: 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN`,
+69 a required tool is missing, 70 the fresh binary was not built, 71 the daemon
+did not become healthy. Each code has exactly one meaning (guarded).
 
 ## Tunables (env)
 
