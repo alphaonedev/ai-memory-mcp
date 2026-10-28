@@ -2119,7 +2119,7 @@ jobs:
             if [ "$n_iso" -gt 0 ]; then
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6383 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the isolated binaries"
+                echo "::error::[#6383 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the isolated binaries"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_isolated_lane "[${name}] isolated test binaries" "$sd" $FEAT || rc=$?
