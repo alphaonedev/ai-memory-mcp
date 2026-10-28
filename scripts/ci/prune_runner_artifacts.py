@@ -49,6 +49,7 @@ does not fail the post-job step (exit stays 0): cleanup must never red a job.
 Python 3.9+, standard library only.
 """
 import argparse
+import errno
 import os
 import shutil
 import sys
@@ -80,7 +81,19 @@ EXIT_BAD_ARGS = EXIT_USAGE
 
 
 def resolve(path):
-    return Path(path).resolve()
+    """Resolve ``path``; a symlink loop raises ``RuntimeError`` on every Python.
+
+    Python 3.13+ no longer raises for a loop in non-strict ``Path.resolve()``, so
+    the loop is detected explicitly: following the original path yields ELOOP.
+    A merely missing path stays resolvable (#8275).
+    """
+    resolved = Path(path).resolve()
+    try:
+        os.stat(path)
+    except OSError as err:
+        if err.errno == errno.ELOOP:
+            raise RuntimeError("Symlink loop from %r" % str(path)) from err
+    return resolved
 
 
 UNRESOLVABLE_WARNED = set()
