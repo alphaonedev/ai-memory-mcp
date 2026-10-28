@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **EXPIRED as of 2026-10-07** (§7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`; 2026-10-28: a further §7-watched change, #2967 in `src/federation/receive_auth.rs`, is recorded in the §7 firing ledger and leaves the certification EXPIRED)
+> ## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 >
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
