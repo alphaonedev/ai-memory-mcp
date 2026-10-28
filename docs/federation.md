@@ -486,7 +486,7 @@ independently — these are layered on top.
 - **Outbound server-cert verification is fail-closed
   ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448)).**
   Federation replicates **plaintext** memory content (it is NOT
-  end-to-end encrypted —
+  end-to-end encrypted; see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262) —
   [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)), so
   an unverified peer *server* certificate is a direct content-disclosure
   surface for an adversary in DNS or BGP position. The mTLS control cuts

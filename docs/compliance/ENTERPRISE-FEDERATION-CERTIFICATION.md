@@ -861,6 +861,56 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 > `X-Agent-Id` enrollment lane (the `agent_api_keys` per-agent binding) is
 > deferred — see [#2044](https://github.com/alphaonedev/ai-memory-mcp/issues/2044).
 
+### Certification scope statement for the v1.0.0 GA candidate ([#8262](https://github.com/alphaonedev/ai-memory-mcp/issues/8262))
+
+> Pinned to chain tip `ced1419a83c5c8aec30920391b22533375e6d799`; the audit umbrella is [#8268](https://github.com/alphaonedev/ai-memory-mcp/issues/8268). Each
+> line is one claim, its tracking issue and, where code enforces it, the `file:line` at that SHA. This
+> statement does not re-mint the certification (the bind and expiry record above are unchanged).
+
+**Certified for the GA candidate (IN):**
+
+- Federation transport is mTLS, and outbound peer server-certificate verification is on by default and
+  refuses the skip flag ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448), [#232](https://github.com/alphaonedev/ai-memory-mcp/issues/232); `src/tls.rs:114`, `src/tls.rs:1200-1203`, asi-hard pin
+  `src/security_profile.rs:461-463`).
+- `sync/since` is peer-scoped: a peer without a scope allowlist receives an empty envelope, and rows are
+  filtered by namespace and private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948);
+  `src/handlers/federation_sync_since.rs:289-296`, `:358`, `:366`).
+- Every shape requires TLS and refuses plaintext peers (`src/config/shape.rs:173-174`); the Federated and
+  Hive shapes force governed namespaces (`src/config/shape.rs:190-194`), and Production defaults to them.
+- At-rest AEAD envelope encryption is available and OFF by default (`AI_MEMORY_ENCRYPT_AT_REST=1` or
+  `[encryption] at_rest = true`; `src/config.rs:3592-3593`); it is not applied on the wire.
+- rustls is at the audited version 0.23.46 with RUSTSEC-2026-0285 fixed ([#3821](https://github.com/alphaonedev/ai-memory-mcp/issues/3821), closed;
+  `Cargo.lock:3620-3621`).
+- Provenance links refuse a cycle-closing edge, including equal-instant pairs ([#3041](https://github.com/alphaonedev/ai-memory-mcp/issues/3041), closed;
+  `src/storage/mod.rs:9512-9514`).
+- Encryption in transit ([#3824](https://github.com/alphaonedev/ai-memory-mcp/issues/3824)) and setup simplicity ([#3830](https://github.com/alphaonedev/ai-memory-mcp/issues/3830)) are closed as met.
+
+**Fail-closed controls required for GA that are NOT yet landed at the pinned SHA.** Each is claimed only
+when its issue closes with a landed SHA on the GA candidate. At the pinned SHA the default is the
+permissive one named here, so a reader must not assume the control:
+
+- Quarantine of unattributed inbound writes on Production, Federated and Hive ([#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967), open): the
+  default is permissive today (`src/federation/receive_auth.rs:642-646`).
+- Cert-to-peer binding enforced ([#8260](https://github.com/alphaonedev/ai-memory-mcp/issues/8260), open): the default is `warn` (`src/tls.rs:474`) and a mismatch
+  is allowed (`src/handlers/federation_receive.rs:199-202`).
+- Refusal of Claimed (header-asserted) identity on Production, Federated and Hive ([#8265](https://github.com/alphaonedev/ai-memory-mcp/issues/8265), open): the
+  principal is `Claimed` today (`src/identity/authority.rs:99-101`).
+
+**NOT claimed for v1.0.0 (each is named so the certified claim is unambiguous):**
+
+- Federation end-to-end content encryption: peers replicate and store plaintext content ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968), closed
+  deferred-v1.x; `docs/federation.md:488`). Isolation between distrusting tenants is by disjoint deployments.
+- Postgres-native TDE as a machine-checked control: at-rest posture on the postgres tier is
+  operator-attested through `AI_MEMORY_PG_AT_REST_ATTESTED` (the paragraph above, "deliberately NOT claimed
+  for GA"; [#8262](https://github.com/alphaonedev/ai-memory-mcp/issues/8262)).
+- Curator namespace-scoped mode: the curator daemon is root-equivalent (cross-tenant `for_admin` reads,
+  `src/curator/reflection_pass.rs:125-127`; [#8264](https://github.com/alphaonedev/ai-memory-mcp/issues/8264), open, operator milestone decision).
+- Batman Form 2 synchronous atomisation on postgres: sqlite and MCP stdio only, postgres reports
+  `skipped_backend_unsupported` ([#8255](https://github.com/alphaonedev/ai-memory-mcp/issues/8255), open; `docs/atomisation.md:100-102`).
+- Top-shelf encryption documentation ([#3833](https://github.com/alphaonedev/ai-memory-mcp/issues/3833), deferred to v1.x).
+- Singleton and Team shapes keep allow-on-silence namespace governance by default
+  (`src/config/shape.rs:191`; [#3125](https://github.com/alphaonedev/ai-memory-mcp/issues/3125)).
+
 ---
 
 ## 2. §5.4(2) — machine-checked posture (LOCALHOST-VERIFIED)

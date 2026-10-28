@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs (#8262 — certification scope statement for v1.0.0 GA)
+
+- Add a "Certification scope statement" to `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` listing what the GA candidate certifies and what it does not claim (federation end-to-end encryption #1968, postgres TDE machine proof, curator namespace-scoped mode #8264, atomiser Form 2 on postgres #8255), each with its tracking issue and enforcing `file:line`; the three open fail-closed controls (#2967, #8260, #8265) are listed as claimed only once landed. Pointer added in `docs/federation.md`.
+
 ### Security (#7112 — event-listener thread-safety advisory)
 
 - Update the locked `event-listener` dependency from 5.4.1 to 5.4.2 to
