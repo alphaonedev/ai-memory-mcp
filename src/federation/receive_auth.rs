@@ -642,7 +642,7 @@ pub const FED_QUARANTINE_UNATTRIBUTED_ENV: &str = "AI_MEMORY_FED_QUARANTINE_UNAT
 pub fn quarantine_unattributed_enabled() -> bool {
     std::env::var(FED_QUARANTINE_UNATTRIBUTED_ENV)
         .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| crate::security_profile::is_truthy(&v))
 }
 
 // ---------------------------------------------------------------------------

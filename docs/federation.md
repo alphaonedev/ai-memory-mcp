@@ -932,14 +932,19 @@ to it — federation is **not** end-to-end encrypted
 ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968); see
 §"At-rest encryption and federation" below).
 
-**Opt-in quarantine of provenance-less inbound content
-([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948)).**
-`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (default `false` on the `singleton`
-and `team` shapes, which print one boot banner line saying so; forced ON by
-the `[deployment] shape` on `federated` and `hive` (a floor: a non-truthy
-value refuses boot) and defaulted ON on `production`, where an explicit
-non-truthy value is honoured with a boot banner line,
-[#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967)) route-IN
+**Quarantine of provenance-less inbound content, forced ON by the federating
+shapes
+([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948),
+[#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967)).**
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` is pinned ON by the `[deployment]
+shape` on `federated`, `hive` and `production` when unset. On `federated` and
+`hive` a non-truthy value is a floor violation and refuses boot; on
+`production` the always-engaged `asi-hard` posture refuses a non-truthy value
+the same way, so no hardened shape can run with it off. It stays `false`
+(permissive, listed by `ai-memory config show`) only on `singleton` and
+`team` unless `asi-hard` is selected there too. One truthiness grammar
+(`1`, `true`, `yes`, `on`, case-insensitive after trim) is shared by the
+shape floor, the `asi-hard` floor and the `/sync/push` receive reader. Route-IN
 quarantines any inbound relayed memory that did NOT reach
 `attest_level=agent_attested` (no verified per-write content signature —
 it would otherwise land `claimed`): the row is stored with the system-only

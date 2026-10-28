@@ -596,69 +596,39 @@ pub fn evaluate_boot(
     ))
 }
 
-/// The boot decision for `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (#2967).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QuarantineBoot {
-    /// The value to pin into the environment when the knob is unset.
-    pub pin: Option<&'static str>,
-    /// One boot banner line, when the posture deserves one.
-    pub banner: Option<String>,
-}
-
 /// Evaluate the shape's quarantine-unattributed requirement against the raw
-/// value of `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`. Pure: the caller reads
-/// the environment and applies the pin.
+/// value of `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` and return the value to pin
+/// into the environment, if any. Pure: the caller reads the environment and
+/// applies the pin. Truthiness is [`crate::security_profile::is_truthy`], the
+/// one grammar the live receive reader and the asi-hard floor share (#2967).
 ///
 /// - FLOOR (`federated`, `hive`): unset is pinned to `1`; a non-truthy value
 ///   refuses boot.
-/// - default-ON (`production`): unset is pinned to `1`; an explicit non-truthy
-///   value is honoured and announced in a banner line.
-/// - default-OFF (`singleton`, `team`): unchanged, with one banner line
-///   naming the permissive default unless the operator already enabled it.
+/// - default-ON (`production`): unset is pinned to `1`. An explicit non-truthy
+///   value is left alone here: `production` always engages the asi-hard
+///   posture, whose floor refuses the loosened value at
+///   `security_profile::enforce_at_boot_pre_runtime`, so the node never boots.
+/// - default-OFF (`singleton`, `team`): unchanged and silent (a hook-driven
+///   one-shot verb must stay quiet, #3411); `config show` lists the default.
 ///
 /// # Errors
 /// The shape holds the knob as a FLOOR and `raw` is set to a non-truthy value.
 pub fn evaluate_quarantine_unattributed(
     shape: DeploymentShape,
     raw: Option<&str>,
-) -> anyhow::Result<QuarantineBoot> {
+) -> anyhow::Result<Option<&'static str>> {
     let env = crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV;
     let line = shape.config_line();
     let enabled = raw.is_some_and(crate::security_profile::is_truthy);
-    let pin_on = QuarantineBoot {
-        pin: Some("1"),
-        banner: None,
-    };
-    let quiet = QuarantineBoot {
-        pin: None,
-        banner: None,
-    };
     match shape.derive().quarantine_unattributed {
-        Requirement::Floor(_) | Requirement::Default(true) if raw.is_none() => Ok(pin_on),
-        Requirement::Floor(_) | Requirement::Default(true) if enabled => Ok(quiet),
-        Requirement::Floor(_) => anyhow::bail!(
-            "{line} requires {env} on (a FLOOR), but it is set to {raw:?}. \
-             Remove the override (the shape pins it) or choose a shape whose \
-             quarantine is a default (`singleton`, `team`, `production`)."
+        Requirement::Floor(_) | Requirement::Default(true) if raw.is_none() => Ok(Some("1")),
+        Requirement::Floor(_) if !enabled => anyhow::bail!(
+            "{line} requires {env} on (a FLOOR), but it is set to {}. Set {env} to \
+             a truthy value (`1`, `true`, `yes` or `on`) or unset it so the shape \
+             pins it on.",
+            raw.unwrap_or_default()
         ),
-        Requirement::Default(true) => Ok(QuarantineBoot {
-            pin: None,
-            banner: Some(format!(
-                "ai-memory: WARN {line} defaults {env}=1, but it is explicitly \
-                 disabled: provenance-less inbound federation writes land visible \
-                 on this node."
-            )),
-        }),
-        Requirement::Default(false) => Ok(QuarantineBoot {
-            pin: None,
-            banner: (!enabled).then(|| {
-                format!(
-                    "ai-memory: {line} keeps the permissive default for {env}: \
-                     provenance-less inbound federation writes land visible. Set \
-                     {env}=1 to quarantine them."
-                )
-            }),
-        }),
+        Requirement::Floor(_) | Requirement::Default(_) => Ok(None),
     }
 }
 
@@ -702,7 +672,7 @@ pub fn enforce_at_boot_pre_runtime(cfg: &super::AppConfig) -> anyhow::Result<Sha
     let quarantine_raw =
         std::env::var(crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV).ok();
     let quarantine = evaluate_quarantine_unattributed(report.shape, quarantine_raw.as_deref())?;
-    if let Some(value) = quarantine.pin {
+    if let Some(value) = quarantine {
         // SAFETY: same single-threaded pre-runtime phase as the posture pin
         // above (#1889 / #2386).
         unsafe {
@@ -711,9 +681,6 @@ pub fn enforce_at_boot_pre_runtime(cfg: &super::AppConfig) -> anyhow::Result<Sha
                 value,
             );
         }
-    }
-    if let Some(banner) = quarantine.banner {
-        eprintln!("{banner}");
     }
     if report.at_rest_pending_escrow {
         eprintln!("{}", at_rest_pending_escrow_warning(report.shape));
@@ -884,59 +851,146 @@ mod tests {
                 "{shape}"
             );
             let unset = evaluate_quarantine_unattributed(shape, None).unwrap();
-            assert_eq!(unset.pin, Some("1"), "{shape}: unset must pin ON");
+            assert_eq!(unset, Some("1"), "{shape}: unset must pin ON");
             for off in ["0", "false", "off", "no", "", "maybe"] {
                 let err = evaluate_quarantine_unattributed(shape, Some(off))
                     .unwrap_err()
                     .to_string();
                 assert!(err.contains("FLOOR"), "{shape} {off:?}: {err}");
                 assert!(err.contains(shape.as_str()), "{err}");
+                assert!(!err.contains("Some("), "raw value printed plainly: {err}");
+                assert!(
+                    !err.contains("choose a shape"),
+                    "no remedy that also refuses: {err}"
+                );
             }
-            let on = evaluate_quarantine_unattributed(shape, Some("1")).unwrap();
-            assert_eq!(on.pin, None, "{shape}");
+            assert_eq!(
+                evaluate_quarantine_unattributed(shape, Some("1")).unwrap(),
+                None,
+                "{shape}"
+            );
         }
     }
 
     #[test]
-    fn quarantine_unattributed_production_defaults_on_and_honours_explicit_off_2967() {
+    fn quarantine_unattributed_production_pins_on_and_defers_explicit_off_to_asi_hard_2967() {
         let shape = DeploymentShape::Production;
         assert_eq!(
             shape.derive().quarantine_unattributed,
             Requirement::Default(true)
         );
-        let unset = evaluate_quarantine_unattributed(shape, None).unwrap();
-        assert_eq!(unset.pin, Some("1"));
-        assert!(unset.banner.is_none());
-
-        let off = evaluate_quarantine_unattributed(shape, Some("0")).unwrap();
-        assert_eq!(off.pin, None, "an explicit 0 is honoured, not overwritten");
-        let banner = off.banner.expect("explicit off prints a banner line");
-        assert!(banner.contains("explicitly disabled"), "{banner}");
-        assert!(banner.contains("production"), "{banner}");
-        assert!(!banner.contains('\n'), "exactly one line: {banner:?}");
-
-        let on = evaluate_quarantine_unattributed(shape, Some("true")).unwrap();
-        assert!(on.pin.is_none() && on.banner.is_none());
+        assert_eq!(
+            evaluate_quarantine_unattributed(shape, None).unwrap(),
+            Some("1")
+        );
+        assert_eq!(
+            evaluate_quarantine_unattributed(shape, Some("true")).unwrap(),
+            None
+        );
+        // The shape layer leaves an explicit 0 alone; the posture it always
+        // engages is what refuses it (see the boot-level test below).
+        assert_eq!(
+            evaluate_quarantine_unattributed(shape, Some("0")).unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn quarantine_unattributed_singleton_and_team_stay_permissive_with_one_banner_2967() {
+    fn quarantine_unattributed_production_explicit_zero_refuses_boot_with_asi_hard_message_2967() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "config::shape::tests::quarantine_unattributed_production_explicit_zero_refuses_boot_with_asi_hard_message_2967",
+        ) {
+            return;
+        }
+        let cfg = cfg_with(Some(DeploymentShape::Production), None);
+        // SAFETY: env-isolated child process, single test thread.
+        unsafe {
+            std::env::remove_var(crate::security_profile::ENV_SECURITY_PROFILE);
+            std::env::set_var(
+                crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV,
+                "0",
+            );
+        }
+        enforce_at_boot_pre_runtime(&cfg).expect("shape layer defers to asi-hard");
+        let err = crate::security_profile::enforce_at_boot()
+            .expect_err("production with an explicit 0 must refuse to boot")
+            .to_string();
+        assert!(err.contains("asi-hard"), "{err}");
+        assert!(
+            err.contains(crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn quarantine_unattributed_singleton_and_team_stay_permissive_and_silent_2967() {
         for shape in [DeploymentShape::Singleton, DeploymentShape::Team] {
             assert_eq!(
                 shape.derive().quarantine_unattributed,
                 Requirement::Default(false),
                 "{shape}"
             );
-            for raw in [None, Some("0")] {
-                let d = evaluate_quarantine_unattributed(shape, raw).unwrap();
-                assert_eq!(d.pin, None, "{shape} {raw:?}: no pin");
-                let banner = d.banner.expect("permissive default prints a banner");
-                assert!(banner.contains("permissive default"), "{banner}");
-                assert!(banner.contains(shape.as_str()), "{banner}");
-                assert!(!banner.contains('\n'), "exactly one line: {banner:?}");
+            for raw in [None, Some("0"), Some("1"), Some("TRUE")] {
+                assert_eq!(
+                    evaluate_quarantine_unattributed(shape, raw).unwrap(),
+                    None,
+                    "{shape} {raw:?}: no pin, no refusal"
+                );
             }
-            let on = evaluate_quarantine_unattributed(shape, Some("1")).unwrap();
-            assert!(on.pin.is_none() && on.banner.is_none(), "{shape}");
         }
+    }
+
+    /// The shape floor and the live `/sync/push` reader share one truthiness
+    /// grammar: for every token, a hardened shape accepts it iff the receive
+    /// reader reports quarantine ON (#2967 security r1 finding 1).
+    #[test]
+    fn quarantine_unattributed_floor_and_receive_reader_agree_on_every_token_2967() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "config::shape::tests::quarantine_unattributed_floor_and_receive_reader_agree_on_every_token_2967",
+        ) {
+            return;
+        }
+        let env = crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV;
+        let tokens = [
+            "true", "TRUE", "True", "1", "yes", "YES", " On ", "on", "off", "0", "false", "FALSE",
+            "no", "", "garbage",
+        ];
+        for token in tokens {
+            // SAFETY: env-isolated child process, single test thread.
+            unsafe { std::env::set_var(env, token) };
+            let reader_on = crate::federation::receive_auth::quarantine_unattributed_enabled();
+            for shape in [DeploymentShape::Federated, DeploymentShape::Hive] {
+                let shape_accepts = match evaluate_quarantine_unattributed(shape, Some(token)) {
+                    Ok(pin) => {
+                        assert_eq!(
+                            pin, None,
+                            "{shape} {token:?}: a set value is never re-pinned"
+                        );
+                        true
+                    }
+                    Err(_) => false,
+                };
+                assert_eq!(
+                    shape_accepts, reader_on,
+                    "{shape} {token:?}: shape floor and receive reader disagree"
+                );
+            }
+            // Production defers a rejected value to asi-hard, whose floor is
+            // the same predicate the reader now uses.
+            assert_eq!(
+                crate::security_profile::is_truthy(token),
+                reader_on,
+                "{token:?}: asi-hard floor and receive reader disagree"
+            );
+        }
+        // Unset on a floor shape: the boot pin makes the reader ON.
+        // SAFETY: env-isolated child process, single test thread.
+        unsafe {
+            std::env::remove_var(env);
+            std::env::remove_var(crate::security_profile::ENV_SECURITY_PROFILE);
+        }
+        let cfg = cfg_with(Some(DeploymentShape::Federated), None);
+        enforce_at_boot_pre_runtime(&cfg).unwrap();
+        assert!(crate::federation::receive_auth::quarantine_unattributed_enabled());
     }
 }
