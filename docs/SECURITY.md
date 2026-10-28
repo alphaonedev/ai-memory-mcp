@@ -392,6 +392,12 @@ separately scoped.
 Rotation: generate new key, update config, restart the daemon.
 Clients have a grace period determined by their connection
 lifetime — there's no in-flight rotation today.
+This covers the HTTP API key only. Rotation of end-to-end content keys
+(the `0x05` scope keys) is a separate mechanism: rewrap by default or a
+full re-encrypt, on one resumable cursor, verify-then-swap, old key kept
+until completion — see the rotation modes in
+[`docs/design/E2E_FEDERATION_ENCRYPTION.md`](design/E2E_FEDERATION_ENCRYPTION.md)
+(status: landing in #8278).
 
 ### mTLS (Layer 1 + Layer 2)
 
@@ -515,6 +521,30 @@ certification declaration (#3557), not silent. The guardian set
 (`AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS`) is a signature quorum for the
 identity-lineage recovery record, not a secret-sharing split of this
 file; splitting the recovery secret is a separate, later decision.
+
+### End-to-end scope envelope `0x05` (#8278)
+
+The `0x02`/`0x03` envelopes seal content to ONE node's key, so federation
+decrypts on the sender and re-seals on the receiver. The `0x05` scope
+envelope seals content under a per-namespace **scope key** shared by the
+namespace's reader set (3-agent vote (6def5ab6), decisions D1/D2): each row
+has its own random DEK, wrapped under a per-record key derived from the
+scope key; both AEAD operations bind the row's `memory_id`, `namespace`,
+the scope key id and the epoch, so a ciphertext moved to another row or
+namespace, or an edited key id or epoch, fails authentication. Opening a
+`0x05` row needs that row binding: `open_content` without it refuses with
+the typed `scope_envelope_refused` class (binding required), never a guess.
+Each scope key is wrapped per reader node under its X25519 KEK, and
+escrowed under the deployment recovery key at mint (mint refuses without
+an enrolled recovery key). Records live in `<key_dir>/scope-keys/`, mode
+`0600`, holding only wrapped keys. Title, tags, metadata and namespace
+stay plaintext; embeddings of `0x05` rows are withheld from non-readers.
+Crypto-erase (`0x04`) applies to `0x05` rows exactly as to `0x03`: the
+DEK exists only in the column, so the marker destroys the record even for
+a scope-key holder. Envelope, store and escrow land in #8278 (E1); the
+federation sync path and the `/keys/scope` key pull follow. Full contract
+and threat model:
+[`docs/design/E2E_FEDERATION_ENCRYPTION.md`](design/E2E_FEDERATION_ENCRYPTION.md).
 
 ### File permissions
 
