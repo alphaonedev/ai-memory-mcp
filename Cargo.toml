@@ -86,7 +86,7 @@ tracing-appender = "0.2"
 # v0.6.3.1 (PR-5 / issue #487) — `ai-memory logs archive` compresses
 # rotated operational logs past their retention horizon. Pure-Rust
 # bindings via the `zstd` crate.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 uuid = { version = "1", features = ["v4", "v7"] }
 # #1579 B4 (operator-approved feature delta) — `compression-gzip`
 # adds the response CompressionLayer for the HTTP daemon (measured
