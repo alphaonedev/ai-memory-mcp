@@ -97,6 +97,14 @@ class ShardBudgetTests(unittest.TestCase):
         self.assertEqual(body.count('WATCHDOG_SECS="$remaining"'), 4)
         self.assertIn('WATCHDOG_SECS="$remaining" run_isolated_lane', body)
 
+    def test_7000_exhaustion_diagnostics_report_the_actual_shard_budget(self):
+        body = function_body(ci_text(), 'run_shard')
+        messages = re.findall(
+            r'echo "::error::\[#[0-9]+ shard\] \$\{name\}: '
+            r'\$\{([^}]+)\}s shard budget exhausted before ([^"\n]+)"', body)
+        stages = ('the lib run', 'the binaries run', 'the isolated binaries', 'the doc tests')
+        self.assertEqual(messages, [('SHARD_BUDGET', stage) for stage in stages])
+
 
 class ShardWiringTests(unittest.TestCase):
     """B6: three shards, separate waits, OR'd exit codes, quoted arrays."""
