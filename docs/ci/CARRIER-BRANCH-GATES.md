@@ -35,8 +35,10 @@ The suite is 1,005 test executables run serially (`--test-threads=1`). From
 live job logs, the uncontended suite took 4007 s and 4750 s, and it reached the
 `federation_write_ns_scope_2447` binary at 2303 s and 2767 s. (The 88-92 min
 figures earlier quoted were job wall time including compile and setup, not the
-suite.) The `linux-fed` label is served by two runners (`f2-linux-fed`,
-`f2-linux-fed-2`) on one 14-core host. In run 37944916554 (PR #6160,
+suite.) The `linux-fed` label is served by four runners on one 14-core host
+(`f2-linux-fed` to `f2-linux-fed-4`; the shared `fed` label is on every
+runner of both nodes, #8174); when the run below was measured, two runners
+(`f2-linux-fed`, `f2-linux-fed-2`) served it. In run 37944916554 (PR #6160,
 2026-10-09) both slots were busy and the same point was reached only at about
 8100 s, about 3.5x slower, where the 8100 s watchdog killed a healthy,
 still-progressing run (exit 124). The 143-150 min figure earlier quoted was the

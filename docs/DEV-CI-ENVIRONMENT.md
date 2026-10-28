@@ -68,7 +68,8 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
   - Cluster listens on `127.0.0.1:5445`
   - TLS certs operator-local (postgres-owned; CA reused from `pg-age-stack/certs`)
   - Boot-managed via the distro postgresql systemd template
-- **Self-hosted runner labels:** `self-hosted,Linux,X64,linux-fed`
+- **Self-hosted runner labels:** `self-hosted,Linux,X64,linux-fed,fed`
+  (the shared `fed` label is on every runner of both nodes, #8174)
 - **sqlite tier:** local ai-memory default (no service needed)
 
 ### 3.2 macOS node (self-hosted `macos-fed`)
@@ -78,7 +79,10 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
   from source; **AGE 1.8.0 built from source**, branch `release/PG18/1.8.0`)
   - Cluster listens on `127.0.0.1:5445`
   - Certs / env / init script live under the operator-local `pg-age-stack/` tree
-- **Self-hosted runner labels:** `self-hosted,macOS,ARM64,macos-fed`
+- **Self-hosted runner labels:** `self-hosted,macOS,ARM64,macos-fed,fed`
+  (the shared `fed` label is on every runner of both nodes, #8174; the two
+  Postgres workflows `postgres-ignored.yml` and `cert-postgres-age.yml` use
+  `runs-on: [self-hosted, fed]`, so one run lands on whichever node is free)
 - **Rust toolchain:** rustup-managed ONLY, with `~/.cargo/bin` FIRST on `PATH`
   on both nodes. 1.96.0 and 1.98.0 are installed with `clippy` + `rustfmt`, so
   a `rust-toolchain.toml` pin flip needs no runner-side install. Never

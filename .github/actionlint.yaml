@@ -22,3 +22,7 @@ self-hosted-runner:
     # `ubuntu-24.04-arm` above, which is a GitHub-hosted label).
     - linux-fed
     - macos-fed
+    # #8174: `fed` is the shared label on every runner of both nodes (f2
+    # linux-fed and f1 macos-fed); the two Postgres workflows use
+    # `runs-on: [self-hosted, fed]` so one run lands on whichever node is free.
+    - fed

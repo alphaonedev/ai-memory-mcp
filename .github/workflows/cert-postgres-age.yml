@@ -1,7 +1,8 @@
 # Certified Postgres + Apache AGE + pgvector tier — IN-PR cert evidence (#2548).
 #
 # v1.0.0 SELF-HOSTED REWRITE (chore/ci-self-hosted-2x2). This job now runs on
-# `[self-hosted, linux-fed]` and points AI_MEMORY_TEST_POSTGRES_URL /
+# `[self-hosted, fed]` (either fed node, label `fed`: f2 linux-fed or
+# f1 macos-fed; native tier via the per-node URL file) and points AI_MEMORY_TEST_POSTGRES_URL /
 # AI_MEMORY_TEST_AGE_URL at the node's ALWAYS-UP native cert tier (pg18.6 +
 # AGE 1.8.0 + pgvector 0.8.7, TLS verify-full, port 5445), read from
 # $HOME/.ai-memory-ci-fed-url. The former per-PR `docker build`/pull of
@@ -127,14 +128,14 @@ env:
 jobs:
   cert-postgres-age:
     name: "Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)"
-    # v1.0.0 self-hosted rewrite. Re-homed onto the enterprise-fed Linux node,
-    # whose ALWAYS-UP native tier IS the certified triple. The former per-PR
+    # v1.0.0 self-hosted rewrite. Re-homed onto the enterprise-fed nodes (either
+    # fed node, label `fed`), whose ALWAYS-UP native tier IS the certified triple. The former per-PR
     # `docker build`/pull of deploy/docker-1461/Dockerfile.pg-age-vector +
     # `docker run` container is GONE (the tier the job used to construct now
     # exists continuously); the cert EVIDENCE is unchanged — the "Assert
     # certified stack versions" step still hard-fails on ANY drift from the
     # SSOT-pinned 18.6 / 1.8.0 / 0.8.7, now read off the live native tier.
-    runs-on: [self-hosted, linux-fed]
+    runs-on: [self-hosted, fed]
     # 2026-08-26 rigid-security-controls: never schedule a fork PR onto the
     # self-hosted enterprise-fed node (defence-in-depth behind the Actions
     # "require approval for all external contributors" policy). Required
@@ -215,6 +216,19 @@ jobs:
             *)    q=""; head="$base_url" ;;
           esac
           new_url="${head%/*}/${CI_FED_DB}${q}"
+          # #6161 - the macos-fed AGE install is hand-built; a Homebrew upgrade
+          # relinks the postgresql@18 trees and drops its files. These two
+          # workflows run on EITHER fed node (#8174), so mirror the ci.yml
+          # `Configure enterprise-fed tier` branch: on macOS self-heal from the
+          # node-local copy BEFORE CREATE EXTENSION (five sha256-pinned files;
+          # one-line reason on stderr). Linux is unchanged.
+          # python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then
+              echo "::error::$RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"
+              exit 1
+            fi
+          fi
           # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
           if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"

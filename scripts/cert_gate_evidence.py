@@ -100,7 +100,13 @@ GIT_SHA = re.compile(r"[0-9a-f]{40}")
 # or 64+ hex, is masked); a segment with an uppercase letter, ``+`` or ``=`` is joined with
 # its neighbours. The root needs a boundary (``/run<token>`` is not a path). Any other slash
 # run (URL path, bare ``a/b/c``) gets no exemption. ``KEY=/abs/path`` is a path too.
-PATH_ROOTS = "home|srv|usr|var|opt|mnt|etc|tmp|root|run|lib|bin|sbin|github|runner|workspace|ai-scratch"
+# macOS roots (#8174): ``Volumes``, ``Users`` and ``Library`` start uppercase, ``private`` does not.
+# Only the ROOT segment may be uppercase: _mask_path lowercases it for pass 1 (the floor still
+# spans the whole path) and slices it off before pass 2, so a std-base64 secret under a root is masked.
+PATH_ROOTS = (
+    "home|srv|usr|var|opt|mnt|etc|tmp|root|run|lib|bin|sbin|github|runner|workspace|ai-scratch"
+    "|Volumes|Users|Library|private"
+)
 ROOT_BOUNDARY = r"(?=/|[^A-Za-z0-9+_=-]|$)"
 SEG_LOWER = re.compile(r"[a-z0-9._-]*")
 PATH_LIKE = re.compile(r"[a-z0-9._/-]*")
@@ -175,7 +181,16 @@ def _path_run_sub(m: "re.Match") -> str:
 
 def _mask_path(path: str) -> str:
     """Mask an absolute path: the whole-path floor first, then every segment on its own."""
-    path = LONG_B64.sub(_path_run_sub, LONG_HEX.sub(REDACTED, path))
+    root, sep, rest = path[1:].partition("/")
+    head = "/" + root
+    if not sep:
+        return head
+    # Pass 1 over the WHOLE path with the root lowercased, so a run spanning the root is masked
+    # exactly as before the peel; the root itself is then sliced off and re-attached.
+    whole = LONG_B64.sub(_path_run_sub, LONG_HEX.sub(REDACTED, "/" + root.lower() + sep + rest))
+    if not whole.startswith("/" + root.lower() + "/"):
+        return REDACTED
+    path = whole[len("/" + root) :]
     segs = path.split("/")
     odd = [SEG_LOWER.fullmatch(s) is None for s in segs]
     n = len(segs)
@@ -188,7 +203,7 @@ def _mask_path(path: str) -> str:
             j += 1
         out.append(_mask_segment("/".join(segs[i:j])))
         i = j
-    return "/".join(out)
+    return head + "/".join(out)
 
 
 def _path_sub(found: List[str]):
