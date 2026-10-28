@@ -1985,8 +1985,8 @@ jobs:
           # the compiled artifact list (so a new tests/*.rs can never be
           # missed, unknown source -> serial) and asserts the three sets are
           # disjoint and complete. Union build once, outside every watchdog
-          # (#1989); each shard bounds its whole chain by $WATCHDOG_SECS
-          # (7800 s on this tier; derivation at the WATCHDOG_SECS assignment).
+          # (#1989); parallel shards bound their whole chain by $SHARD_BUDGET;
+          # the serial shard uses $SERIAL_BUDGET_SECS, capped to the job time left.
           # Every shard has its own log and PID; each PID is waited on
           # separately and the step fails if ANY shard failed.
           # SHARD_BUDGET is set per shard by run_shard (#6795): WATCHDOG_SECS for

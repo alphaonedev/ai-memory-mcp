@@ -97,6 +97,13 @@ class ShardBudgetTests(unittest.TestCase):
         self.assertEqual(body.count('WATCHDOG_SECS="$remaining"'), 4)
         self.assertIn('WATCHDOG_SECS="$remaining" run_isolated_lane', body)
 
+    def test_8277_shard_runner_comment_names_the_enforced_budgets(self):
+        comment = ci_text().split('# (#1989);', 1)[1].split('# Every shard has', 1)[0]
+        self.assertEqual(
+            re.findall(r'\b(?:SHARD_BUDGET|SERIAL_BUDGET_SECS|WATCHDOG_SECS)\b', comment),
+            ['SHARD_BUDGET', 'SERIAL_BUDGET_SECS'],
+            'the per-shard bound comment must distinguish parallel and serial budgets')
+
     def test_7000_exhaustion_diagnostics_report_the_actual_shard_budget(self):
         body = function_body(ci_text(), 'run_shard')
         messages = re.findall(
