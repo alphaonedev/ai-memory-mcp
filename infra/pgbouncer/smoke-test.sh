@@ -24,6 +24,10 @@ cd "$(dirname "$0")"
 # No fixed fallback (#4734): generate a random per-run password when unset.
 PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 export POSTGRES_PASSWORD="$PW"
+# The pooler runs as the invoking user so the 0600 userlist stays readable.
+PGBOUNCER_UID="$(id -u)"
+PGBOUNCER_GID="$(id -g)"
+export PGBOUNCER_UID PGBOUNCER_GID
 # docker exec takes the password by variable NAME (inherited), never by argv.
 export PGPASSWORD="$PW"
 PROJECT="ai-memory-pgbouncer-smoke"
@@ -55,7 +59,7 @@ POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait
 # psql THROUGH the pooler is run from inside the postgres container (it has
 # psql and shares the compose network, so `pgbouncer` resolves).
 psql_pooled() {
-  docker exec -e PGPASSWORD "$PG_CONTAINER" \
+  docker exec -i -e PGPASSWORD "$PG_CONTAINER" \
     psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"
 }
 

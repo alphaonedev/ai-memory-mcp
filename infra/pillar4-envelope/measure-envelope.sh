@@ -39,6 +39,10 @@ cd "$(dirname "$0")"
 # No fixed fallback (#4734): generate a random per-run password when unset.
 PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 export POSTGRES_PASSWORD="$PW"
+# The pooler runs as the invoking user so the 0600 userlist stays readable.
+PGBOUNCER_UID="$(id -u)"
+PGBOUNCER_GID="$(id -g)"
+export PGBOUNCER_UID PGBOUNCER_GID
 POOL_COMPOSE="../pgbouncer/docker-compose.yml"
 PROJECT="ai-memory-4d-envelope"
 DAEMON_PORT="${DAEMON_PORT:-9077}"

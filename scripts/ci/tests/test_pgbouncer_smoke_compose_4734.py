@@ -163,6 +163,16 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertTrue(ports, "no pgbouncer publish found; update this guard if it was dropped")
         self.assertTrue(any("6432" in str(p) for p in ports))
 
+    def test_images_are_pinned(self):
+        text = "\n".join(_strip_comment(ln) for ln in COMPOSE.read_text().splitlines())
+        images = re.findall(r"(?m)^\s*image:\s*(\S+)", text)
+        self.assertTrue(images)
+        for image in images:
+            last = image.rsplit("/", 1)[-1]
+            tag = last.split(":", 1)[1] if ":" in last else ""
+            self.assertTrue(tag, "%s: image must carry an explicit tag" % image)
+            self.assertNotRegex(tag, r"(?i)latest", "%s: floating tag" % image)
+
     def test_no_host_network(self):
         for name, spec in _services().items():
             self.assertIsNone(spec["network_mode"], "%s must not set network_mode" % name)
@@ -193,12 +203,37 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             for lit in LITERAL_DEFAULTS:
                 self.assertNotIn(lit, path.read_text(), path.name)
 
+    def test_backend_auth_matches_pooler_md5(self):
+        text = "\n".join(_strip_comment(ln) for ln in COMPOSE.read_text().splitlines())
+        self.assertRegex(text, r"POSTGRES_HOST_AUTH_METHOD:\s*md5")
+        self.assertIn("/20-md5-password.sql", text)
+        sql = (COMPOSE.parent / "md5-password.sql").read_text()
+        self.assertIn("password_encryption = 'md5'", sql)
+        self.assertIn("\\getenv smoke_pw POSTGRES_PASSWORD", sql)
+        for lit in LITERAL_DEFAULTS:
+            self.assertNotIn(lit, sql)
+
+    def test_pooler_runs_as_userlist_owner(self):
+        text = "\n".join(_strip_comment(ln) for ln in COMPOSE.read_text().splitlines())
+        self.assertRegex(text, r"(?m)^\s*user:\s*\"?\$\{PGBOUNCER_UID:\?[^}]*\}:\$\{PGBOUNCER_GID:\?[^}]*\}")
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            self.assertIn('PGBOUNCER_UID="$(id -u)"', code, path.name)
+            self.assertIn('PGBOUNCER_GID="$(id -g)"', code, path.name)
+            self.assertIn("export PGBOUNCER_UID PGBOUNCER_GID", code, path.name)
+
     def test_userlist_written_owner_only(self):
         for path in SCRIPTS:
             writes = [ln for ln in _code_lines(path) if ".userlist.generated.txt" in ln and ">" in ln]
             self.assertTrue(writes, path.name)
             for ln in writes:
                 self.assertRegex(ln, r"umask 077", "%s: userlist must be written under umask 077: %s" % (path.name, ln))
+
+    def test_psql_pooled_forwards_stdin(self):
+        # The probes feed SQL by heredoc; without -i docker exec drops stdin
+        # and psql runs nothing (the count came back empty).
+        text = _joined(SMOKE)
+        self.assertRegex(text, r"psql_pooled\(\)\s*\{\s*docker exec -i\b")
 
     def test_docker_exec_has_no_password_in_argv(self):
         text = _joined(SMOKE)
