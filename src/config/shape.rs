@@ -192,6 +192,14 @@ impl DeploymentShape {
                 Self::Production => D(true),
                 Self::Federated | Self::Hive => F(true),
             },
+            // #2967: decision: shape-forced over default-flip because
+            // precedent `governed_namespace_required` above (Floor on
+            // federated/hive, Default-ON on production).
+            quarantine_unattributed: match self {
+                Self::Singleton | Self::Team => D(false),
+                Self::Production => D(true),
+                Self::Federated | Self::Hive => F(true),
+            },
             at_rest: if hardened {
                 F(AtRestPolicy::RequiredPendingEscrow)
             } else {
@@ -344,6 +352,11 @@ pub struct ShapeDerived {
     pub permissions_mode: Requirement<super::PermissionsMode>,
     /// `AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE`. Consumed by #3700.
     pub governed_namespace_required: Requirement<bool>,
+    /// `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (#2967): quarantine
+    /// provenance-less inbound federation writes. A floor on `federated` /
+    /// `hive`, a default-ON on `production`, a permissive default below.
+    /// Enforced at boot by [`evaluate_quarantine_unattributed`].
+    pub quarantine_unattributed: Requirement<bool>,
     /// At-rest content-encryption policy. Enforced at boot by
     /// [`enforce_at_boot_pre_runtime`].
     pub at_rest: Requirement<AtRestPolicy>,
@@ -416,6 +429,12 @@ impl ShapeDerived {
                 self.governed_namespace_required,
                 |v| v.to_string(),
                 ENFORCED_BY_GOVERNANCE,
+            ),
+            row(
+                "quarantine_unattributed",
+                self.quarantine_unattributed,
+                |v| v.to_string(),
+                "boot (this module, via AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED)",
             ),
             row(
                 "at_rest",
@@ -577,6 +596,72 @@ pub fn evaluate_boot(
     ))
 }
 
+/// The boot decision for `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (#2967).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineBoot {
+    /// The value to pin into the environment when the knob is unset.
+    pub pin: Option<&'static str>,
+    /// One boot banner line, when the posture deserves one.
+    pub banner: Option<String>,
+}
+
+/// Evaluate the shape's quarantine-unattributed requirement against the raw
+/// value of `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`. Pure: the caller reads
+/// the environment and applies the pin.
+///
+/// - FLOOR (`federated`, `hive`): unset is pinned to `1`; a non-truthy value
+///   refuses boot.
+/// - default-ON (`production`): unset is pinned to `1`; an explicit non-truthy
+///   value is honoured and announced in a banner line.
+/// - default-OFF (`singleton`, `team`): unchanged, with one banner line
+///   naming the permissive default unless the operator already enabled it.
+///
+/// # Errors
+/// The shape holds the knob as a FLOOR and `raw` is set to a non-truthy value.
+pub fn evaluate_quarantine_unattributed(
+    shape: DeploymentShape,
+    raw: Option<&str>,
+) -> anyhow::Result<QuarantineBoot> {
+    let env = crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV;
+    let line = shape.config_line();
+    let enabled = raw.is_some_and(crate::security_profile::is_truthy);
+    let pin_on = QuarantineBoot {
+        pin: Some("1"),
+        banner: None,
+    };
+    let quiet = QuarantineBoot {
+        pin: None,
+        banner: None,
+    };
+    match shape.derive().quarantine_unattributed {
+        Requirement::Floor(_) | Requirement::Default(true) if raw.is_none() => Ok(pin_on),
+        Requirement::Floor(_) | Requirement::Default(true) if enabled => Ok(quiet),
+        Requirement::Floor(_) => anyhow::bail!(
+            "{line} requires {env} on (a FLOOR), but it is set to {raw:?}. \
+             Remove the override (the shape pins it) or choose a shape whose \
+             quarantine is a default (`singleton`, `team`, `production`)."
+        ),
+        Requirement::Default(true) => Ok(QuarantineBoot {
+            pin: None,
+            banner: Some(format!(
+                "ai-memory: WARN {line} defaults {env}=1, but it is explicitly \
+                 disabled: provenance-less inbound federation writes land visible \
+                 on this node."
+            )),
+        }),
+        Requirement::Default(false) => Ok(QuarantineBoot {
+            pin: None,
+            banner: (!enabled).then(|| {
+                format!(
+                    "ai-memory: {line} keeps the permissive default for {env}: \
+                     provenance-less inbound federation writes land visible. Set \
+                     {env}=1 to quarantine them."
+                )
+            }),
+        }),
+    }
+}
+
 /// The declared-gap WARN text for a shape whose at-rest floor is pending
 /// escrow. One site, shared by boot and `doctor`.
 #[must_use]
@@ -613,6 +698,22 @@ pub fn enforce_at_boot_pre_runtime(cfg: &super::AppConfig) -> anyhow::Result<Sha
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, value);
         }
+    }
+    let quarantine_raw =
+        std::env::var(crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV).ok();
+    let quarantine = evaluate_quarantine_unattributed(report.shape, quarantine_raw.as_deref())?;
+    if let Some(value) = quarantine.pin {
+        // SAFETY: same single-threaded pre-runtime phase as the posture pin
+        // above (#1889 / #2386).
+        unsafe {
+            std::env::set_var(
+                crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV,
+                value,
+            );
+        }
+    }
+    if let Some(banner) = quarantine.banner {
+        eprintln!("{banner}");
     }
     if report.at_rest_pending_escrow {
         eprintln!("{}", at_rest_pending_escrow_warning(report.shape));
@@ -771,6 +872,71 @@ mod tests {
                 assert!(r[1] == "FLOOR" || r[1] == "default");
             }
             assert!(text.contains("FLOOR = the shape requires it"));
+        }
+    }
+
+    #[test]
+    fn quarantine_unattributed_federated_and_hive_force_on_regardless_of_env_2967() {
+        for shape in [DeploymentShape::Federated, DeploymentShape::Hive] {
+            assert_eq!(
+                shape.derive().quarantine_unattributed,
+                Requirement::Floor(true),
+                "{shape}"
+            );
+            let unset = evaluate_quarantine_unattributed(shape, None).unwrap();
+            assert_eq!(unset.pin, Some("1"), "{shape}: unset must pin ON");
+            for off in ["0", "false", "off", "no", "", "maybe"] {
+                let err = evaluate_quarantine_unattributed(shape, Some(off))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("FLOOR"), "{shape} {off:?}: {err}");
+                assert!(err.contains(shape.as_str()), "{err}");
+            }
+            let on = evaluate_quarantine_unattributed(shape, Some("1")).unwrap();
+            assert_eq!(on.pin, None, "{shape}");
+        }
+    }
+
+    #[test]
+    fn quarantine_unattributed_production_defaults_on_and_honours_explicit_off_2967() {
+        let shape = DeploymentShape::Production;
+        assert_eq!(
+            shape.derive().quarantine_unattributed,
+            Requirement::Default(true)
+        );
+        let unset = evaluate_quarantine_unattributed(shape, None).unwrap();
+        assert_eq!(unset.pin, Some("1"));
+        assert!(unset.banner.is_none());
+
+        let off = evaluate_quarantine_unattributed(shape, Some("0")).unwrap();
+        assert_eq!(off.pin, None, "an explicit 0 is honoured, not overwritten");
+        let banner = off.banner.expect("explicit off prints a banner line");
+        assert!(banner.contains("explicitly disabled"), "{banner}");
+        assert!(banner.contains("production"), "{banner}");
+        assert!(!banner.contains('\n'), "exactly one line: {banner:?}");
+
+        let on = evaluate_quarantine_unattributed(shape, Some("true")).unwrap();
+        assert!(on.pin.is_none() && on.banner.is_none());
+    }
+
+    #[test]
+    fn quarantine_unattributed_singleton_and_team_stay_permissive_with_one_banner_2967() {
+        for shape in [DeploymentShape::Singleton, DeploymentShape::Team] {
+            assert_eq!(
+                shape.derive().quarantine_unattributed,
+                Requirement::Default(false),
+                "{shape}"
+            );
+            for raw in [None, Some("0")] {
+                let d = evaluate_quarantine_unattributed(shape, raw).unwrap();
+                assert_eq!(d.pin, None, "{shape} {raw:?}: no pin");
+                let banner = d.banner.expect("permissive default prints a banner");
+                assert!(banner.contains("permissive default"), "{banner}");
+                assert!(banner.contains(shape.as_str()), "{banner}");
+                assert!(!banner.contains('\n'), "exactly one line: {banner:?}");
+            }
+            let on = evaluate_quarantine_unattributed(shape, Some("1")).unwrap();
+            assert!(on.pin.is_none() && on.banner.is_none(), "{shape}");
         }
     }
 }

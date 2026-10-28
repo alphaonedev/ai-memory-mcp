@@ -934,7 +934,12 @@ to it — federation is **not** end-to-end encrypted
 
 **Opt-in quarantine of provenance-less inbound content
 ([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948)).**
-`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (default `false`, opt-in) route-IN
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (default `false` on the `singleton`
+and `team` shapes, which print one boot banner line saying so; forced ON by
+the `[deployment] shape` on `federated` and `hive` (a floor: a non-truthy
+value refuses boot) and defaulted ON on `production`, where an explicit
+non-truthy value is honoured with a boot banner line,
+[#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967)) route-IN
 quarantines any inbound relayed memory that did NOT reach
 `attest_level=agent_attested` (no verified per-write content signature —
 it would otherwise land `claimed`): the row is stored with the system-only
