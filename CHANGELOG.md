@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#4734 — pgbouncer smoke stack binds loopback and takes its password from env)
+
+- `infra/pgbouncer/docker-compose.yml` publishes the pooler as `127.0.0.1:6432:6432`
+  (was all interfaces) and requires `POSTGRES_PASSWORD` (was a fixed public
+  fallback); `smoke-test.sh` generates a random password when none is supplied.
+  The original fix `aafd15ec3` never reached the chain and is re-applied by hand.
+  Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py`.
+
 ### Security (#7112 — event-listener thread-safety advisory)
 
 - Update the locked `event-listener` dependency from 5.4.1 to 5.4.2 to

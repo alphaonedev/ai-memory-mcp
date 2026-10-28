@@ -21,7 +21,7 @@ services:
     container_name: ai-memory-pgbouncer-postgres
     environment:
       POSTGRES_USER: ai_memory
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_memory_smoke}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (smoke-test.sh generates one; see README)}
       POSTGRES_DB: ai_memory
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory"]
@@ -40,7 +40,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "6432:6432"
+      - "127.0.0.1:6432:6432"
     # The smoke test renders userlist.txt from POSTGRES_PASSWORD (see
     # smoke-test.sh) so the committed placeholder never needs a real secret.
     volumes:

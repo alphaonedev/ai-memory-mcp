@@ -13,14 +13,17 @@
 #      through the pooler even after DISCARD ALL between transactions.
 #
 # Requires docker + docker compose. Run from infra/pgbouncer/:
-#   POSTGRES_PASSWORD=secret ./smoke-test.sh
+#   ./smoke-test.sh                       (random password generated)
+#   POSTGRES_PASSWORD=<value> ./smoke-test.sh
 # Exit 0 = pooler config validated; non-zero = a property failed (see output).
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PW="${POSTGRES_PASSWORD:-ai_memory_smoke}"
+# No fixed fallback (#4734): generate a random per-run password when unset.
+PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
+export POSTGRES_PASSWORD="$PW"
 PROJECT="ai-memory-pgbouncer-smoke"
 PG_CONTAINER="ai-memory-pgbouncer-postgres"
 POOLED_URL="postgres://ai_memory:${PW}@pgbouncer:6432/ai_memory"

@@ -44,8 +44,13 @@ transaction to one backend, which is exactly what AGE needs.
 
 ```bash
 cd infra/pgbouncer
-POSTGRES_PASSWORD=secret ./smoke-test.sh
+./smoke-test.sh
 ```
+
+The script generates a random password for each run (or uses `POSTGRES_PASSWORD`
+from your environment if set). `docker-compose.yml` has no default password:
+running `docker compose` directly without `POSTGRES_PASSWORD` fails closed. The
+pooler is published on `127.0.0.1:6432` only, never on all interfaces (#4734).
 
 The smoke test brings the stack up, runs an AGE cypher MERGE+MATCH **through
 the pooler on 6432** in one transaction (asserting transaction-mode pinning
