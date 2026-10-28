@@ -16,7 +16,7 @@ concurrency (that is bounded by the postgres+AGE backbone — see 4.D).
 | File | Purpose |
 |---|---|
 | `pgbouncer.ini` | Pooler config. **`pool_mode = transaction` is required**; `max_prepared_statements = 256` (PgBouncer ≥ 1.21) preserves sqlx's prepared statements (Fix #4). Sizing reconciled to `AI_MEMORY_PG_POOL_MAX` (`DEFAULT_MAX_CONNECTIONS = 16`). |
-| `userlist.txt` | Auth template holding the role's **SCRAM-SHA-256** verifier (`pg_authid.rolpassword`). Render from your secret store at deploy (mode 0400); never commit a real credential. `pgbouncer.ini` keeps `auth_type = md5`, which PgBouncer 1.23 treats as "use SCRAM when the userlist secret is SCRAM". |
+| `userlist.txt` | Auth template holding the role's **SCRAM-SHA-256** verifier (`pg_authid.rolpassword`). Render from your secret store at deploy (mode 0400); never commit a real credential. `pgbouncer.ini` pins `auth_type = scram-sha-256`, so md5 and plain userlist entries are refused (guarded). |
 | `role-defaults.sql` | `ALTER ROLE ai_memory SET statement_timeout = '30s'; SET lock_timeout = '5s';` — the session GUCs ai-memory sets in `after_connect` do **not** survive PgBouncer's inter-transaction `DISCARD ALL`, so they must be role defaults. Values quote `DEFAULT_STATEMENT_TIMEOUT_SECS=30` / `DEFAULT_LOCK_TIMEOUT_SECS=5`. |
 | `docker-compose.yml` | postgres+AGE + pgbouncer, wired (clients → `pgbouncer:6432`). |
 | `smoke-test.sh` | Infra test: proves an AGE cypher transaction + the role-default timeouts survive transaction-mode pooling. |
@@ -58,7 +58,7 @@ Authentication is SCRAM-SHA-256 end to end (#4732). The postgres service keeps
 the image default (`scram-sha-256`). The script brings postgres up first, reads
 the role's stored SCRAM verifier from `pg_authid` over `docker exec` stdout
 (the password is never in argv, logs or the repo), writes it to
-`.userlist.generated.txt` under `umask 077` (mode 0600, removed at teardown),
+`.userlist.generated.txt` under `umask 077` (mode 0600, removed at teardown; any leftover file is removed before the write so a stale 0644 file never stays world-readable),
 then starts the pooler. The pooler runs as the invoking uid
 (`user: ${PGBOUNCER_UID}:${PGBOUNCER_GID}`) so the 0600 file stays readable, and
 PgBouncer refuses uid 0, so both scripts exit 64 with a clear message when run

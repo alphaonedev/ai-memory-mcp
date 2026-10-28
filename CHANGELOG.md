@@ -21,9 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invoking uid (`PGBOUNCER_UID`/`PGBOUNCER_GID`, required by compose) so the 0600 userlist stays
   readable; both scripts refuse to run as root (PgBouncer refuses uid 0).
   Authentication is SCRAM-SHA-256 end to end (#4732 smoke path): the userlist is the role's own
-  stored SCRAM verifier, read after postgres is up; there is no md5 anywhere in the smoke stack.
+  stored SCRAM verifier, read after postgres is up; there is no md5 anywhere in the smoke stack,
+  and `pgbouncer.ini` pins `auth_type = scram-sha-256`. The userlist write removes a leftover file
+  first (umask only applies to a new file), and the postgres healthcheck probes `127.0.0.1`.
   Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py` (no md5, root guard, parsed SQL,
-  loud teardown).
+  loud teardown, trap and exit status, argv password check on every `docker exec`, `token_hex(>=16)`,
+  non-SCRAM refusal, `auth_type` pin).
 
 ### Security (#7112 — event-listener thread-safety advisory)
 

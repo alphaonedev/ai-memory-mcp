@@ -114,6 +114,9 @@ case "$VERIFIER_ROW" in
   '"ai_memory" "SCRAM-SHA-256$'*) ;;
   *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 72 ;;
 esac
+# Remove any leftover file first: umask only applies to a NEW file, so a stale
+# 0644 userlist would otherwise keep its mode (N4).
+rm -f "../pgbouncer/.userlist.generated.txt"
 (umask 077; printf '%s\n' "$VERIFIER_ROW" > "../pgbouncer/.userlist.generated.txt")
 POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait
 

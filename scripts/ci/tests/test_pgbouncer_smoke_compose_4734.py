@@ -12,6 +12,10 @@ a variable that is unset, and a failed `down` is never swallowed. SCRAM end to
 end: no md5 in any executable line of the compose file, scripts or SQL, and the
 userlist is the role's stored SCRAM verifier (#4732). The scripts refuse uid 0
 (PgBouncer refuses root). SQL is parsed (comments dropped), not substring-matched.
+r5: the generator must be token_hex(>=16); every docker exec in both scripts is
+password-free in argv; the cleanup trap and its exit status are pinned; the
+non-SCRAM verifier refusal exists; the userlist is removed before the write;
+the postgres healthcheck probes 127.0.0.1; pgbouncer.ini pins auth_type.
 """
 import pathlib
 import re
@@ -25,13 +29,14 @@ except ImportError:  # pragma: no cover
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent.parent
 PGB = REPO / "infra" / "pgbouncer"
 COMPOSE = PGB / "docker-compose.yml"
+INI = PGB / "pgbouncer.ini"
 SMOKE = PGB / "smoke-test.sh"
 ENVELOPE = REPO / "infra" / "pillar4-envelope" / "measure-envelope.sh"
 SCRIPTS = (SMOKE, ENVELOPE)
 LITERAL_DEFAULTS = ("ai_memory_smoke", "ai_memory_envelope")
 REQUIRED_PW = re.compile(r"^\$\{POSTGRES_PASSWORD:\?[^}]+\}$")
 PW_ASSIGN = re.compile(
-    r"""^PW="\$\{POSTGRES_PASSWORD:-\$\(python3 -c 'import secrets; print\(secrets\.token_hex\(\d+\)\)'\)\}"$"""
+    r"""^PW="\$\{POSTGRES_PASSWORD:-\$\(python3 -c 'import secrets; print\(secrets\.token_hex\((?:1[6-9]|[2-9]\d|\d{3,})\)\)'\)\}"$"""
 )
 
 
@@ -291,15 +296,83 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertRegex(text, r"psql_pooled\(\)\s*\{\s*docker exec -i\b")
 
     def test_docker_exec_has_no_password_in_argv(self):
-        text = _joined(SMOKE)
-        execs = [ln for ln in text.splitlines() if "docker exec" in ln]
-        self.assertTrue(execs)
-        for ln in execs:
-            self.assertNotRegex(ln, r"PGPASSWORD=", ln)
-            self.assertNotRegex(ln, r"\$\{?PW\b", ln)
-        for ln in text.splitlines():
+        # EVERY docker exec in BOTH scripts: no PGPASSWORD=value, no $PW.
+        for path in SCRIPTS:
+            text = _joined(path)
+            execs = [ln for ln in text.splitlines() if re.search(r"\bdocker exec\b", ln)]
+            self.assertTrue(execs, path.name)
+            for ln in execs:
+                self.assertNotRegex(ln, r"PGPASSWORD=", "%s: %s" % (path.name, ln))
+                self.assertNotRegex(ln, r"\$\{?PW\b", "%s: %s" % (path.name, ln))
+        # The smoke pooled URL never carries the password. The envelope's
+        # POOLED_URL deliberately does (it feeds a 0600 file, #4577), so that
+        # one line is the explicit carve-out.
+        for ln in _joined(SMOKE).splitlines():
             if re.match(r"^\s*POOLED_URL=", ln):
                 self.assertNotRegex(ln, r"\$\{?PW\b", ln)
+
+    def test_cleanup_trap_and_exit_status_are_pinned(self):
+        # N1: one `trap cleanup EXIT`; cleanup() starts with rc=$? and ends
+        # with exit "$rc"; no unconditional `exit 0` anywhere in the script.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            self.assertEqual(code.count("trap cleanup EXIT"), 1, "%s: need exactly one trap" % path.name)
+            start = code.index("cleanup() {")
+            end = code.index("}", start)
+            body = code[start + 1 : end]
+            self.assertEqual(body[0], "rc=$?", "%s: rc=$? must be the first statement" % path.name)
+            self.assertEqual(body[-1], 'exit "$rc"', "%s: cleanup must exit with rc" % path.name)
+            self.assertLess(end, code.index("trap cleanup EXIT"), path.name)
+            for ln in code:
+                self.assertNotRegex(ln, r"^rc=0\s*;?$", "%s: rc reset: %s" % (path.name, ln))
+            # An `exit 0` before the trap is armed, or at column 0 anywhere,
+            # ends the script before teardown can report a failure. The
+            # envelope's success exit is indented inside its knee branch.
+            trap_at = code.index("trap cleanup EXIT")
+            for ln in code[:trap_at]:
+                self.assertNotRegex(ln, r"^exit\s+0\s*;?$", "%s: exit 0 before teardown: %s" % (path.name, ln))
+            for ln in _code_lines(path):
+                self.assertNotRegex(ln, r"^exit\s+0\s*;?$", "%s: top-level exit 0: %s" % (path.name, ln))
+
+    def test_non_scram_verifier_is_refused(self):
+        # N3: the case on the verifier row must have a catch-all arm that exits
+        # non-zero, so a non-SCRAM or empty row is never written as the userlist.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            start = code.index('case "$VERIFIER_ROW" in')
+            end = code.index("esac", start)
+            arms = code[start + 1 : end]
+            self.assertIn("'\"ai_memory\" \"SCRAM-SHA-256$'*) ;;", arms, path.name)
+            fallback = [ln for ln in arms if ln.startswith("*)")]
+            self.assertEqual(len(fallback), 1, path.name)
+            self.assertRegex(fallback[0], r"\bexit [1-9]\d*\b", "%s: %s" % (path.name, fallback[0]))
+            self.assertIn(">&2", fallback[0], path.name)
+
+    def test_userlist_removed_before_write(self):
+        # N4: umask only applies to a new file. A leftover 0644 file must be
+        # removed (or chmod 600) before the verifier is written.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            writes = [i for i, ln in enumerate(code) if ".userlist.generated.txt" in ln and ">" in ln]
+            self.assertEqual(len(writes), 1, path.name)
+            prior = code[code.index("trap cleanup EXIT") : writes[0]]
+            removed = any(re.match(r'^rm -f "?(?:\.\./pgbouncer/)?\.userlist\.generated\.txt"?$', ln) for ln in prior)
+            self.assertTrue(removed, "%s: rm -f of the userlist must precede the write" % path.name)
+
+    def test_postgres_healthcheck_probes_loopback(self):
+        # N5: without -h the probe uses the unix socket, which the image's
+        # temporary init server also serves.
+        probes = re.findall(r"pg_isready[^\"]*", _compose_code())
+        self.assertTrue(probes)
+        for probe in probes:
+            self.assertIn("-h 127.0.0.1", probe)
+
+    def test_pooler_auth_type_is_pinned(self):
+        # #4732: only a SCRAM secret may authenticate; md5/plain/trust fail closed.
+        lines = [_strip_comment(ln).strip() for ln in INI.read_text().splitlines()]
+        values = [ln for ln in lines if re.match(r"^auth_type\s*=", ln)]
+        self.assertEqual(len(values), 1, values)
+        self.assertRegex(values[0], r"^auth_type\s*=\s*scram-sha-256$")
 
     def test_teardown_does_not_hide_failure(self):
         # Teardown must not swallow a failed `down`: no `|| true` / `|| :` /
