@@ -188,6 +188,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # Skipping is off until the repository variable CI_IMPACT_ENFORCE is
       # "true"; until then every heavy job still runs and only the report differs.
@@ -2851,6 +2852,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       # decision: on push, schedule and workflow_dispatch the gate runs from
       # the checked-out tree over failing closed because there is no second
       # party to judge itself: the tree under test is already the branch tip,
