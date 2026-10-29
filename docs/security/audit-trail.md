@@ -684,7 +684,7 @@ logs:
     source: ai-memory-ops
 ```
 
-Pair with the [JSON parser]([https://docs.datadoghq.com/logs/log_configuration/parsing/](https://docs.datadoghq.com/logs/log_configuration/parsing/))
+Pair with the [JSON parser](https://docs.datadoghq.com/logs/log_configuration/parsing/)
 for the audit pipeline.
 
 ### Elastic Filebeat
