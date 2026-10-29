@@ -17713,6 +17713,9 @@ fn restored_cid_stamp(
         params![id],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
     )?;
+    // #8278 (code review r2 I-c): E2 routes a 0x05 row through
+    // `open_content_bound` and refuses instead of falling back to the stored
+    // content; E1 writes no 0x05 rows, so this fallback never sees one.
     let plaintext = match envelope {
         Some(env) => crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content),
         None => raw_content,

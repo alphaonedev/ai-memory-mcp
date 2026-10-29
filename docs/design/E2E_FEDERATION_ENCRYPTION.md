@@ -9,7 +9,8 @@ Parent issue #8268.
 Decision record: 3-agent vote (6def5ab6), recorded in ai-memory `b5713886`;
 operator directive `b577ee87`. Decisions D1 to D5 below are binding; this
 document fixes the details the vote left to the implementer. The review
-rulings of PR #8279 round 2 (conductor god-f2) are recorded as decision lines:
+rulings of PR #8279 rounds 2 and 3 (conductor god-f2) are recorded as decision
+lines (R2-amended replaces the row-version part of R2):
 
 * `decision: D1 stanzas live in the ledger: each scope-key record carries one id-bound stanza per reader KEK plus the escrow stanza; rows carry only the key id and epoch (3-agent vote (6def5ab6))`
 * `decision: D2 the 0x05 inner layer is a new HKDF-salted layout (per-record DEK wrapped under HKDF(wrap_salt, scope key)), not a reuse of the 0x03 layout (3-agent vote (6def5ab6))`
@@ -25,6 +26,13 @@ rulings of PR #8279 round 2 (conductor god-f2) are recorded as decision lines:
 * `decision: R10 the remaining review findings land in E1: per-field nonce and salt uniqueness, supersede recovery-key compare, no-follow descriptor-checked reads, plaintext zeroized on NotUtf8, non_exhaustive public error enums, Zeroizing stanza secret (conductor god-f2)`
 * `decision: R11 ScopeKeyStore = sync Send+Sync cache contract with write-through and versioned fail-closed freshness, async ledger on MemoryStore in E2 (3-agent vote (6def5ab6), B over A)`
 * `decision: R12 record validation returns the typed ScopeKeyStoreError, not a String error (QUAL-7 ceiling) (conductor god-f2)`
+* `decision: R2-amended content AAD binds memory id, namespace, key id, epoch, format version and role only, not the row version, because version changes on non-content writes and on federation merge without re-sealing (lifecycle_write.rs:84, storage/mod.rs:18356, postgres.rs:25297); replay protection is E2 record signing (conductor god-f2, amends R2, no vote: single-correct-answer fix inside the voted D2 layout)`
+* `decision: R13 audit entry binds key id and key check because the E2 signature must cover the key, not only the public inputs (security r2 M2)`
+* `decision: R14 the audit hash chain and the stanza id prefix are pinned by named tests and mutation runs (an edited middle line is refused AuditChainMismatch; a stanza for another key id, epoch or namespace does not parse) (security r2 L1)`
+* `decision: R15 the new count assertion is declared with a Count-Declared trailer and the duplicated unreadable-file detail is one named constant; the literal baseline is never bumped (security r2 L2, code r2 C3)`
+* `decision: R16 one erasable-version SSOT for both backends over keeping 0x03 on Postgres because the signed erasure kind must not depend on the backend (code r2 C1, CLAUDE.md SAL rule)`
+* `decision: R17 namespace marker re-reads the cold store on a cache miss over a caller-supplied freshness head because the E2 refusal that consumes it has no head to supply (code r2 C2, R11 fail-closed freshness)`
+* `decision: R18 the placeholder open sites name their E2 change, the commit crash window and the count-only ledger head are stated as known E1 properties, and open_content_scoped is documented as test-only in E1 (code r2 I-a to I-d)`
 
 ## 1. Why
 
@@ -65,10 +73,11 @@ The scope key is symmetric and every reader holds it. It gives
 confidentiality and row binding, not writer authenticity: any reader of a
 namespace can produce an envelope that opens, so any reader can forge a row
 in that namespace (new content under a valid key, id and epoch). The AAD
-binds the row version (section 3), so an older envelope of the same row
-presented under a newer version fails authentication, but a reader writing a
-fresh envelope is not detected by the envelope. Writer authenticity is record
-signing (signed events, Ed25519 over the row, verified against
+does not bind the row version (R2-amended, section 3): an older envelope of
+the same row still opens, so the envelope gives no replay protection, and a
+reader writing a fresh envelope is not detected by the envelope. Writer
+authenticity and replay protection are record signing (signed events, Ed25519
+over the row including its content and version, verified against
 `agent_pubkey_history`) in #8278 slice E2. Until then, write authority is the
 existing federation write authorization, not the envelope.
 
@@ -106,7 +115,6 @@ Keys:
 role(1) || 0x05 || key_id(16) || epoch_be(4)
         || len32_be(memory_id) || memory_id
         || len32_be(namespace) || namespace
-        || row_version_be(8)
 ```
 
 `role` is `0x01` for the DEK wrap and `0x02` for the content, so the two
@@ -116,13 +124,20 @@ namespace is NOT stored in the header: the row's own `namespace` column is the
 binding input, so a row moved to another namespace, a ciphertext copied
 between rows, or an edited key id / epoch all fail authentication.
 
-`row_version` is the storage field `Memory::version` (`i64`, the optimistic
-concurrency counter every mutation bumps; default 1), big-endian. An older
-envelope of a row presented under the row's newer version fails
-authentication. Consequences: every version-bumping write of a `0x05` row
-re-seals it (the E2 writer path), and refusing a whole row rolled back to an
-older version (envelope and version together) needs the receiver's monotonic
-version compare, also E2.
+The row version (`Memory::version`) is not an AAD input (R2-amended). The
+version changes on writes that never touch content and never re-seal, so an
+AAD over it would make the row unreadable after any of them. Every writer of
+`version` was checked: `set_lifecycle_state` (storage/lifecycle_write.rs:84),
+`operator_dequarantine` and `dequarantine` (storage/mod.rs:4133, :4195),
+`stamp_contaminated_descendants_as` (storage/mod.rs:13690), `swarm_rewind`
+(storage/mod.rs:13995), `reown` (storage/mod.rs:20151),
+`observe_and_release_sqlite` (storage/decontaminate.rs:167),
+`reclassify_memory_kind` (store/sqlite.rs:3927), and the federation merges
+`INSERT_IF_NEWER_SQL` (storage/mod.rs:18356, `MAX(version)`) and
+`apply_remote_memory` (store/postgres.rs:25297, `GREATEST(version)`). None of
+them changes `memory_id`, `namespace` or the envelope, so no remaining AAD
+input changes without a re-seal. Replay of an older envelope of the same row
+is detected by E2 record signing, which binds content and version together.
 
 ### Opening
 
@@ -134,8 +149,15 @@ row mappers onto `open_content_bound`.
 
 ### Crypto-erase
 
-`0x04` stays valid for `0x05` rows: `envelope_is_crypto_erasable` is true for
-`0x03` and `0x05`. The DEK exists only inside `wrapped_dek`; rewriting the
+`0x04` stays valid for `0x05` rows. The erasable version bytes are one
+source of truth, `CRYPTO_ERASABLE_ENVELOPE_VERSIONS` (`0x03` and `0x05`, built
+from `RECORD_ENVELOPE_VERSION` and `SCOPE_ENVELOPE_VERSION`), read by
+`envelope_is_crypto_erasable` on SQLite and bound into the Postgres erase
+predicates (single-row delete, forget, eviction) (R16). On both backends every
+hard-delete funnel rewrites a `0x05` row to the marker before the `DELETE` and
+signs the erasure kind `key-destroyed` (test
+`tests/scope_envelope_erase_parity_8278.rs`). The DEK exists only inside
+`wrapped_dek`; rewriting the
 column to the `0x04` marker destroys it, and holding the scope key no longer
 recovers that record. Peer copies are erased where the erase is applied; E2
 propagates the erase over sync (a `0x04` envelope replaces the peer's copy).
@@ -196,7 +218,12 @@ process never answers from a cache older than its own writes. The cache
 records each namespace's ledger head (its audit entry count).
 `load_by_key_id_fresh` takes the head a peer advertised and refuses with the
 typed `SealedForeign` error while the cache is older, until a refresh catches
-up. A namespace whose files fail verification is cached as that refusal, so
+up. `namespace_is_e2e` answers a cached namespace with an epoch from memory;
+on a cache miss (or a cached namespace with no epoch) it takes the shared
+`flock`, re-reads that namespace's records and audit log in the same call,
+and caches the result (R17). A store opened before another process minted
+epoch 1 therefore never reports the namespace as plaintext: the E2 refusal
+that consumes the marker has no peer head to supply. A namespace whose files fail verification is cached as that refusal, so
 its lookups fail closed while other namespaces keep working. The async ledger
 methods on `MemoryStore` (load, append, refresh) for SQLite and Postgres are
 #8278 slice E2 with the Codex SAL slice; they fill the same cache.
@@ -222,14 +249,18 @@ Every mutation appends one entry to the namespace's audit log: `mint`,
 `add_recipient`, `remove_recipient`, `supersede`. An entry records who (the
 process agent id), what (the action and the KEK fingerprint added or
 removed), the epoch touched, the previous epoch and the new epoch, the
-sorted reader fingerprints of that epoch after the change, the escrow
-recovery fingerprint, an RFC 3339 timestamp, and the SHA-256 of the previous
-entry's line. The log is append-only and hash-chained: `seq` is dense from 1,
+key id and `key_check` of that epoch (R13), the sorted reader fingerprints of
+that epoch after the change, the escrow recovery fingerprint, an RFC 3339
+timestamp, and the SHA-256 of the previous entry's line. The log is append-only and hash-chained: `seq` is dense from 1,
 and an entry whose previous-epoch pointer is not the head's epoch is refused
 `AuditChainMismatch` before anything is written. A load replays the chain and
-cross-checks it with the records (epoch count, each epoch's readers, each
-epoch's escrow fingerprint): a record edited outside the store, a removed or
-reordered entry, or a torn last line refuses the namespace.
+cross-checks it with the records (epoch count, each epoch's key id and
+`key_check`, readers and escrow fingerprint): a record edited outside the
+store, a whole record substituted from public inputs (a fresh key wrapped to
+the same readers and escrow key), an edited middle line, a removed or
+reordered entry, or a torn last line refuses the namespace. An entry naming a
+different key id or `key_check` for an epoch the log already holds is
+refused before it is written.
 
 Authority in E1 is the process boundary: the owner-only `0700` key-directory
 chain and local writers only. Signed, operator-authorised reader-set changes
@@ -263,7 +294,14 @@ E1; the CLI surface (verb, SSOT pins, doctor) lands with the Codex lane.
   appends the audit entry. A crash before the entry lands leaves records the
   log does not account for; the next load refuses the namespace
   (`AuditChainMismatch` / `RecordCorrupt`) instead of guessing, and the
-  doctor (Codex lane) reports it for repair.
+  doctor (Codex lane) reports it for repair. Known E1 property (code r2 I-a):
+  every mutator writes records before its audit line, so a crash in that
+  window refuses every epoch of the namespace until the doctor repair, which
+  is the E2 / Codex-lane resolution.
+* Known E1 property (code r2 I-b): the ledger head is an entry count, so two
+  forked ledgers with equal counts compare equal in `load_by_key_id_fresh`.
+  The E2 record and audit-entry signatures bind content (now including each
+  epoch's key id and `key_check`), which is what tells such forks apart.
 * New rows always seal under the current epoch. Old rows keep naming their
   epoch and open with that epoch's key until rotation rewrites them.
 * Removing a recipient (`remove_recipient`) stops the ledger handing that key
@@ -431,21 +469,25 @@ ChaCha20-Poly1305).
 | epoch | 3 |
 | memory id | `mem-kat` |
 | namespace | `test/kat-8278` |
-| row version | 7 |
 | content | `known answer #8278` |
 
 ```text
 wrap AAD    01054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d
-            6b61740000000d746573742f6b61742d383237380000000000000007
+            6b61740000000d746573742f6b61742d38323738
 content AAD 02054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d
-            6b61740000000d746573742f6b61742d383237380000000000000007
+            6b61740000000d746573742f6b61742d38323738
 HKDF okm    4646030666175724ba4a7341744114dc6544487cf9663060a7c7994b2023d413
 envelope    054c47463e6b7ed21881e2861ff46b04b600000003e0cb9169fff94df3a7d3
             0c3f8ef1f53cad28efb547f47f4211997cf553b646cc498d4dac5e94d2d113
-            3c16fd19402f9c614c349f6a8bdc13497d2d258ae7f25040e73881ee6cbd91
-            d5e55a103ffce1c4627aa7919b7ae3550813d939d3080695a77d03335b5dcb
-            c6a0fd901e2e17657a722f0fa7642526d9fc9f
+            3c16fd19402f9c614c349f6a8bdc13497d2d2545377d8aee8d360bbd58986b
+            8f87b8083ffce1c4627aa7919b7ae3550813d939d3080695a77d03335b5dcb
+            c6a0fd9f5adbaf43301ae3a53c0f438d153027
 ```
+
+Round 3 (R2-amended) removed the row version from both AADs; the HKDF okm is
+unchanged, the wrapped DEK and the inner ciphertext tags changed. The same
+independent computation reproduces the round-2 vector byte for byte from the
+old AAD before producing this one.
 
 The two AADs differ only in the role byte. The test also checks that the
 stored wrapped DEK and inner ciphertext do not verify under the other role
