@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pool_mode = transaction` and `auth_type = scram-sha-256` from `SHOW CONFIG` and fails non-zero on a
   mismatch; the envelope verifier refusal exits 73 (72 stays "no knee"); the pgbouncer.ini and README
   wording now states that the pin refuses md5 entries but a plain-text entry is still accepted.
+  Round 7: the guard requires an explicit non-zero exit after every FAIL/FATAL echo and pins every
+  step marker, treats the password variable as an allowlist (the smoke refuses a pooled URL that
+  carries a password, exit 74), pins the exact refusing catch-all arms and the gitignore pattern for the
+  per-run userlist; exit code 1 is documented as also covering stack bring-up and teardown failures.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 

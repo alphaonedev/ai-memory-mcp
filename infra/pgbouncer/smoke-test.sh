@@ -17,8 +17,10 @@
 #   POSTGRES_PASSWORD=<value> ./smoke-test.sh
 # Exit 0 = pooler config validated; non-zero = a property failed (see output).
 # Exit codes (each used once): 1 a property failed (AGE, timeout, pool_mode,
-# auth_type); 64 run as root; 65 bad AI_MEMORY_SMOKE_RUN; 73 the role has no
-# SCRAM-SHA-256 verifier (refused, never written to the userlist).
+# auth_type), the stack bring-up failed (including the bind failure when another
+# run holds 127.0.0.1:6432) or the teardown failed; 64 run as root; 65 bad
+# AI_MEMORY_SMOKE_RUN; 73 the role has no SCRAM-SHA-256 verifier (refused, never
+# written to the userlist); 74 the pooled URL carries a password (refused).
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -54,6 +56,12 @@ PROJECT="ai-memory-pgbouncer-smoke-$RUN"
 PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"
 USERLIST=".userlist.generated.$RUN.txt"
 POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"
+# The pooled URL reaches docker exec argv (visible to every local user), so it
+# must never carry a password in its userinfo; the password travels as the
+# inherited PGPASSWORD variable only.
+case "${POOLED_URL#*://}" in
+  *:*@*) echo "FATAL: POOLED_URL must not carry a password in its userinfo" >&2; exit 74 ;;
+esac
 
 cleanup() {
   rc=$?

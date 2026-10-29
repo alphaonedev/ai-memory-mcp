@@ -19,7 +19,16 @@ the postgres healthcheck probes 127.0.0.1; pgbouncer.ini pins auth_type.
 r6: indented exit 0, a disarmed trap, every password spelling on every docker
 exec/run, an extra verifier arm, a widened userlist mode, a reused exit code,
 the [4/4] SHOW CONFIG check, and a per-run compose project name are pinned.
+r7: every FAIL/FATAL echo must be followed by an explicit non-zero literal exit
+in its own branch (a bare exit, `exit $?` or a deleted exit is refused) and
+every step marker is pinned; the password variable is an allowlist (only the
+PW assignment, the exports and the compose lines may name it, an alias or a
+psql_pooled call-site argument fails, and the smoke refuses a pooled URL that
+carries a password); the refusing catch-all arms are pinned to their exact text
+(no `||`); the generated userlist name is gitignored; exit code 1 is documented
+as covering bring-up and teardown failures too.
 """
+import fnmatch
 import pathlib
 import re
 import unittest
@@ -41,6 +50,26 @@ USERLIST_REF = re.compile(r"\.userlist\.generated|\$\{?USERLIST\b")
 PW_SPELLING = re.compile(r"\$\{?(?:PW|POSTGRES_PASSWORD|PGPASSWORD)\b")
 EXIT_ZERO = re.compile(r"(?<![\w-])exit\s+[\"']?0+[\"']?(?![\w])")
 DOCKER_EXEC_RUN = re.compile(r"\bdocker\b.*\s(?:exec|run)\s")
+PW_TOKEN = re.compile(r"\b(?:PW|POSTGRES_PASSWORD|PGPASSWORD)\b")
+PW_BY_NAME = re.compile(r"-e PGPASSWORD(?![=\w])")
+BANNED_INDIRECTION = re.compile(r"\bprintf -v\b|\$\{!|\bev" + r"al\b")
+FAIL_ECHO = re.compile(r"\becho\b.*\b(?:FAIL|FATAL):")
+EXIT_SAME_LINE = re.compile(r">&2; exit [1-9]\d*(?: ;;|;? \}(?:;? \})?|;)?$")
+EXIT_NEXT_LINE = re.compile(r"^exit [1-9]\d*$")
+REFUSING_ARM = re.compile(r"""^(?:'[^']*'|\*|''\|\*[^)]*)\) echo "FATAL: [^"]+" >&2; exit [1-9]\d* ;;$""")
+STEP_MARKER = re.compile(r"""^echo "\[(\d+)/(\d+)\] """)
+POOLED_URL_LITERAL = 'POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"'
+POOLED_URL_ENVELOPE = 'POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"'
+COMPOSE_PW_LINE = re.compile(
+    r'^POSTGRES_PASSWORD="\$PW" docker compose -p "\$PROJECT"(?: -f "\$POOL_COMPOSE")? up -d --wait(?: postgres)?$'
+)
+PSQL_POOLED_SITES = (
+    re.compile(r"^psql_pooled <<'SQL'$"),
+    re.compile(r"""^path_count="\$\(psql_pooled <<'SQL'$"""),
+    re.compile(r"""^st="\$\(psql_pooled -c 'SHOW statement_timeout;'\)"$"""),
+)
+PSQL_POOLED_DEF = 'docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"'
+GITIGNORE = PGB / ".gitignore"
 LITERAL_DEFAULTS = ("ai_memory_smoke", "ai_memory_envelope")
 REQUIRED_PW = re.compile(r"^\$\{POSTGRES_PASSWORD:\?[^}]+\}$")
 PW_ASSIGN = re.compile(
@@ -161,6 +190,11 @@ def _compose_code(path=COMPOSE):
 
 def _joined(path):
     return re.sub(r"\\\n\s*", " ", "\n".join(_code_lines(path)))
+
+
+def _norm_lines(path):
+    """Joined code lines with whitespace runs collapsed, blank lines dropped."""
+    return [" ".join(ln.split()) for ln in _joined(path).splitlines() if ln.strip()]
 
 
 class ComposeParity(unittest.TestCase):
@@ -351,7 +385,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                     self.assertTrue(any(re.match(a, ln) for a in allowed), "%s: unexpected userlist line: %s" % (path.name, ln))
 
     def test_docker_exec_and_run_have_no_password_in_argv(self):
-        # r4 P3: EVERY docker exec / docker run in BOTH scripts, every spelling.
+        # r4 P3: every docker exec / docker run in BOTH scripts is password-free in
+        # argv for the named spellings; the r7 allowlist test covers every other line.
         for path in SCRIPTS:
             text = _joined(path)
             cmds = [ln for ln in text.splitlines() if DOCKER_EXEC_RUN.search(ln)]
@@ -402,9 +437,15 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             arms = [ln for ln in code[start + 1 : end] if ln]
             self.assertEqual(len(arms), 2, "%s: unexpected extra case arm: %r" % (path.name, arms))
             self.assertEqual(arms[0], "'\"ai_memory\" \"SCRAM-SHA-256$'*) ;;", path.name)
-            self.assertTrue(arms[1].startswith("*)"), arms[1])
-            self.assertRegex(arms[1], r"\bexit [1-9]\d*\b", "%s: %s" % (path.name, arms[1]))
-            self.assertIn(">&2", arms[1], path.name)
+            # r5 Q3: the exact refusing arm, echo to stderr then exit as separate
+            # statements; `>&2 || exit 73` would continue to the userlist write.
+            self.assertEqual(
+                arms[1],
+                '*) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;',
+                path.name,
+            )
+            self.assertNotIn("||", arms[1], path.name)
+            self.assertRegex(arms[1], REFUSING_ARM, path.name)
 
     def test_userlist_removed_before_write(self):
         # N4: umask only applies to a new file. A leftover 0644 file must be
@@ -471,6 +512,114 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertIn("${AI_MEMORY_SMOKE_RUN:?", name, "container_name must be per-run: %s" % name)
             self.assertTrue(name.startswith("ai-memory-pgbouncer-"), name)
         self.assertRegex(compose, r"\./\.userlist\.generated\.\$\{AI_MEMORY_SMOKE_RUN:\?[^}]*\}\.txt:/etc/pgbouncer/userlist\.txt:ro")
+
+    def test_every_fail_site_exits_nonzero_in_its_own_branch(self):
+        # r5 Q1: a FAIL:/FATAL: echo is followed, in the same branch, by an
+        # explicit `exit <non-zero literal>` (same statement list, or the next
+        # line). A bare `exit`, `exit $?`, a deleted exit or `|| exit` all fail.
+        # The only other form is the teardown's `rc=1`, which cleanup() turns
+        # into `exit "$rc"` (pinned by the trap test).
+        for path in SCRIPTS:
+            lines = _norm_lines(path)
+            sites = [i for i, ln in enumerate(lines) if FAIL_ECHO.search(ln)]
+            self.assertGreaterEqual(len(sites), 5, "%s: FAIL/FATAL sites vanished: %r" % (path.name, sites))
+            for i in sites:
+                nxt = lines[i + 1] if i + 1 < len(lines) else ""
+                ok = bool(EXIT_SAME_LINE.search(lines[i])) or bool(EXIT_NEXT_LINE.match(nxt)) or nxt == "rc=1"
+                self.assertTrue(ok, "%s: FAIL/FATAL echo without an explicit non-zero exit: %s | next: %s" % (path.name, lines[i], nxt))
+
+    def test_every_step_marker_is_pinned(self):
+        # r5 Q1: not only [4/4]. The markers run 1..N once each, in order, and
+        # the smoke ends with its PASS line as the last statement.
+        # The envelope's step 4 only defines the worker function and prints
+        # nothing, so its printed markers are 1, 2, 3 and 5 of 5.
+        want = {SMOKE: (4, [1, 2, 3, 4]), ENVELOPE: (5, [1, 2, 3, 5])}
+        for path, (total, printed) in want.items():
+            code = [ln.strip() for ln in _code_lines(path)]
+            marks = [STEP_MARKER.match(ln) for ln in code if STEP_MARKER.match(ln)]
+            self.assertEqual([int(m.group(1)) for m in marks], printed, path.name)
+            self.assertEqual({int(m.group(2)) for m in marks}, {total}, path.name)
+        code = [ln.strip() for ln in _code_lines(SMOKE) if ln.strip()]
+        self.assertRegex(code[-1], r'^echo "PASS: PgBouncer pooler validated ', "the PASS line must be last")
+
+    def test_password_variable_is_an_allowlist(self):
+        # r5 Q2: only these lines may name the password variable (PW,
+        # POSTGRES_PASSWORD, PGPASSWORD): the PW= assignment, the exports, the
+        # `POSTGRES_PASSWORD="$PW" docker compose` lines and, in the envelope
+        # only, its documented POOLED_URL (0600 store file, #4577). `-e PGPASSWORD`
+        # (by name, inherited) is stripped first. An alias (printf -v, export
+        # POOLED_URL=..., any other assignment), a psql_pooled call-site argument
+        # or an indirection (`printf -v`, `${!x}`, the shell word that re-parses
+        # a string) fails.
+        for path in SCRIPTS:
+            counts = {"assign": 0, "export_pw": 0, "export_pgpw": 0, "compose": 0, "envelope_url": 0}
+            for ln in _norm_lines(path):
+                self.assertNotRegex(ln, BANNED_INDIRECTION, "%s: indirection can hide the password: %s" % (path.name, ln))
+                rest = PW_BY_NAME.sub("", ln)
+                if not PW_TOKEN.search(rest):
+                    continue
+                if re.match(r"^PW=", rest) and PW_ASSIGN.match(rest):
+                    counts["assign"] += 1
+                elif rest == 'export POSTGRES_PASSWORD="$PW"':
+                    counts["export_pw"] += 1
+                elif rest == 'export PGPASSWORD="$PW"' and path == SMOKE:
+                    counts["export_pgpw"] += 1
+                elif COMPOSE_PW_LINE.match(rest):
+                    counts["compose"] += 1
+                elif rest == POOLED_URL_ENVELOPE and path == ENVELOPE:
+                    counts["envelope_url"] += 1
+                else:
+                    self.fail("%s: line names the password outside the allowlist: %s" % (path.name, ln))
+            want = {"assign": 1, "export_pw": 1, "export_pgpw": 1 if path == SMOKE else 0, "compose": 2, "envelope_url": 1 if path == ENVELOPE else 0}
+            self.assertEqual(counts, want, path.name)
+
+    def test_smoke_pooled_url_has_no_userinfo_password(self):
+        # r5 Q2: the smoke's pooled URL is the literal without a password, it is
+        # assigned once (no second assignment, no export, no printf -v), every
+        # psql_pooled call site passes no argument that could carry a secret, and
+        # the script refuses a URL whose userinfo carries a password (exit 74).
+        code = _norm_lines(SMOKE)
+        assigns = [ln for ln in code if re.search(r"\bPOOLED_URL\s*=", ln)]
+        self.assertEqual(assigns, [POOLED_URL_LITERAL])
+        self.assertFalse([ln for ln in code if re.search(r"\b(?:export|declare|typeset|readonly|local)\b.*\bPOOLED_URL\b", ln)])
+        self.assertIn(PSQL_POOLED_DEF, code)
+        sites = [ln for ln in code if "psql_pooled" in ln and not ln.startswith("psql_pooled()")]
+        self.assertEqual(len(sites), 3, sites)
+        for ln in sites:
+            self.assertTrue(any(rx.match(ln) for rx in PSQL_POOLED_SITES), "psql_pooled call site outside the allowlist: %s" % ln)
+        at = code.index(POOLED_URL_LITERAL)
+        self.assertEqual(
+            code[at + 1 : at + 4],
+            [
+                'case "${POOLED_URL#*://}" in',
+                '*:*@*) echo "FATAL: POOLED_URL must not carry a password in its userinfo" >&2; exit 74 ;;',
+                "esac",
+            ],
+        )
+
+    def test_gitignore_covers_the_generated_userlist(self):
+        # r5 Q4: the per-run file holds the role's SCRAM verifier. The compose
+        # bind path decides the name; the ignore file must match it for any run.
+        bind = re.search(r"\./(\.userlist\.generated\.\$\{AI_MEMORY_SMOKE_RUN:\?[^}]*\}\.txt):/etc/pgbouncer/userlist\.txt", _compose_code())
+        self.assertTrue(bind, "compose userlist bind path not found")
+        patterns = [ln.strip() for ln in GITIGNORE.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+        self.assertTrue(patterns)
+        for run in ("1793223336-12345", "r7code", "a_b-c"):
+            name = re.sub(r"\$\{AI_MEMORY_SMOKE_RUN:\?[^}]*\}", run, bind.group(1))
+            self.assertEqual(name, ".userlist.generated.%s.txt" % run)
+            self.assertTrue(any(fnmatch.fnmatchcase(name, pat) for pat in patterns), "%s is not gitignored: %r" % (name, patterns))
+        self.assertFalse(any(fnmatch.fnmatchcase("userlist.txt", pat) for pat in patterns), "the committed userlist.txt must stay tracked")
+
+    def test_exit_code_one_is_documented_with_bring_up_and_teardown(self):
+        # r5 Q6 (decision: document, no new code): 1 covers a failed property,
+        # a failed stack bring-up (including the concurrent-run bind failure) and
+        # a failed teardown, in each script header and each README.
+        for path in SCRIPTS:
+            header = " ".join(ln.lstrip("# ").strip() for ln in path.read_text().splitlines()[:50] if ln.startswith("#"))
+            readme = " ".join(README_FOR[path].read_text().split())
+            for where, text in (("header", header), ("README", readme)):
+                self.assertRegex(text, r"\b1\b[^;]*bring-up[^;]*teardown", "%s %s: exit code 1 must name bring-up and teardown" % (path.name, where))
+        self.assertRegex(" ".join(README_FOR[SMOKE].read_text().split()), r"\b1\b[^;]*bind failure")
 
 
 if __name__ == "__main__":

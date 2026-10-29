@@ -50,8 +50,10 @@ cd infra/pgbouncer
 The script generates a random password for each run (or uses `POSTGRES_PASSWORD`
 from your environment if set). `docker-compose.yml` has no default password and
 no default pooler user: running `docker compose` directly fails closed unless
-`POSTGRES_PASSWORD`, `PGBOUNCER_UID` and `PGBOUNCER_GID` are exported
-(`export PGBOUNCER_UID=$(id -u) PGBOUNCER_GID=$(id -g)`). The pooler is published
+`POSTGRES_PASSWORD`, `PGBOUNCER_UID`, `PGBOUNCER_GID` and `AI_MEMORY_SMOKE_RUN` are
+exported (`export PGBOUNCER_UID=$(id -u) PGBOUNCER_GID=$(id -g)`; the run suffix is
+`[a-z0-9_-]+`, and the userlist bind file name follows it:
+`.userlist.generated.<AI_MEMORY_SMOKE_RUN>.txt`, render it from the role verifier first, or compose binds a directory). The pooler is published
 on `127.0.0.1:6432` only, never on all interfaces (#4734).
 
 Authentication is SCRAM-SHA-256 end to end (#4732). The postgres service keeps
@@ -80,8 +82,10 @@ recreate each other's containers. Other smokes are found by the stable prefix
 the fixed host port `127.0.0.1:6432`, so a second concurrent run fails closed at the bind
 instead of touching the first. `smoke-test.sh` exit codes: 1 a property failed (AGE round trip,
 `statement_timeout`, or the `[4/4]` `SHOW CONFIG` check of `pool_mode = transaction` and
-`auth_type = scram-sha-256`), 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN`, 73 no SCRAM-SHA-256
-verifier. The envelope codes are in `infra/pillar4-envelope/README.md`.
+`auth_type = scram-sha-256`), the stack bring-up failed (including that concurrent-run bind failure) or the
+teardown failed, 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN`, 73 no SCRAM-SHA-256
+verifier, 74 the pooled URL carries a password (refused; the password only travels as the inherited
+`PGPASSWORD`). The envelope codes are in `infra/pillar4-envelope/README.md`.
 
 History: an earlier revision of this PR re-stored the smoke role as an md5
 verifier; that downgrade is gone.
