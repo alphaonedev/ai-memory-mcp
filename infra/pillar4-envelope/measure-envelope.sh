@@ -27,16 +27,19 @@
 #   ./measure-envelope.sh                  (random password generated)
 #   POSTGRES_PASSWORD=<generated> ./measure-envelope.sh
 #
-# Exit 0 = a knee was found and printed (the measured X). Exit non-zero = the
-# stack failed to come up or no knee was reached within CONCURRENCY_STEPS (X is
-# then ">= the last step" — raise MAX concurrency and re-run).
-# Exit codes (each used once): 1 the stack bring-up failed (including the bind
-# failure when another run holds 127.0.0.1:6432) or the teardown failed (any other
-# unlisted non-zero status is the failing command's own, under set -e); 64 run as root; 65 bad AI_MEMORY_SMOKE_RUN;
-# 69 a required tool is missing; 70 the fresh binary was not built; 71 the
-# daemon did not become healthy; 72 no knee within CONCURRENCY_STEPS (a capacity
-# result: raise the ceiling and re-run); 73 the role has no SCRAM-SHA-256
-# verifier (an auth failure, not a capacity result).
+# Exit codes:
+#   0   a knee was found and printed (the measured X)
+#   1   the stack bring-up failed (including the bind failure when another run
+#       holds 127.0.0.1:6432) or the teardown failed
+#   64  run as root
+#   65  bad AI_MEMORY_SMOKE_RUN
+#   69  a required tool is missing
+#   70  the fresh binary was not built
+#   71  the daemon did not become healthy
+#   72  no knee within CONCURRENCY_STEPS (a capacity result: X is >= the last
+#       step; raise the ceiling and re-run)
+#   73  the role has no SCRAM-SHA-256 verifier (an auth failure, not a capacity result)
+# Any other non-zero status is the failing command's own, under set -e.
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 

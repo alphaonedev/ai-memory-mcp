@@ -56,8 +56,7 @@ Exit 0 prints `MEASURED ENVELOPE X = <n> concurrent agents/module`. Exit 72
 means no knee within the ramp (X ≥ last step — raise the ceiling and re-run).
 Exit 73 means the role has no SCRAM-SHA-256 verifier (an auth failure, not a
 capacity result). Exit 1 means the stack bring-up failed (including the bind failure when another
-run holds 127.0.0.1:6432) or the teardown failed; any other unlisted non-zero status is the exit
-status of the failing command under `set -e`. The other codes: 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN` (outside `[a-z0-9_-]` or over 64 characters),
+run holds 127.0.0.1:6432) or the teardown failed. Any other non-zero status is the failing command's own, under set -e. The other codes: 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN` (outside `[a-z0-9_-]` or over 64 characters),
 69 a required tool is missing, 70 the fresh binary was not built, 71 the daemon
 did not become healthy. Each code has exactly one meaning (guarded).
 

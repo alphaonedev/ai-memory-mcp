@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step marker, treats the password variable as an allowlist (the smoke refuses a pooled URL that
   carries a password, exit 74), pins the exact refusing catch-all arms and the gitignore pattern for the
   per-run userlist; exit code 1 is documented as also covering stack bring-up and teardown failures.
+  Rounds 8-11: a bad `AI_MEMORY_SMOKE_RUN` exits 65 (class `[a-z0-9_-]` and a 64-character bound); a
+  password-bearing pooled URL exits 74 before any password is set and before the first docker line; a
+  failed psql step now exits 1 with a FAIL line that names it (it was psql's own 3). The guard refuses
+  dump words anywhere on a code line, the compose password more than once or via env_file, a second
+  cleanup definition or trap, a negated gitignore line and a mis-anchored heredoc opener. Round 11: the
+  compose file may interpolate only `AI_MEMORY_SMOKE_RUN`, `POSTGRES_PASSWORD` (once), `PGBOUNCER_UID` and
+  `PGBOUNCER_GID`; function, cleanup and alias definitions are read after `;`, `&&`, `||`, `{`, `(` and `|`;
+  a FAIL site inside a subshell or a group closed by `|| true` is refused by a group-depth scan; both
+  script headers and READMEs carry one exit-code table and one identical set -e caveat.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 

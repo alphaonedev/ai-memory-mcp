@@ -178,7 +178,20 @@ PINNED_FUNCTIONS = {
     SMOKE: {"cleanup", "psql_pooled"},
     ENVELOPE: {"cleanup", "need", "now_ms", "worker"},
 }
-FUNCTION_DEF = re.compile(r"^\s*(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\))")
+# r11 Q14: a definition is a command word, so it is read at line start and after ; && || { ( |.
+CMD_START = r"(?:^|[;&|{(])\s*"
+FUNCTION_DEF = re.compile(
+    CMD_START
+    + r"(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\)(?=\s*(?:\{|\(|\[\[|(?:if|for|while|until|case|select)\b))|([\w:-]+)\s*\(\)\s*$)"
+)
+CLEANUP_DEF = re.compile(CMD_START + r"(?:function\s+cleanup\b|cleanup\s*\(\))")
+ALIAS_DEF = re.compile(CMD_START + r"alias\s")
+# r11 Q16: an escaped `<` before `<word` is an input redirect, not a heredoc opener.
+HEREDOC_TOKEN = re.compile(r"\"[^\"]*\"|'[^']*'|(?<![<\\])<<(?!<)-?\s*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))")
+GROUP_OR_NEUTRAL = re.compile(r"\s*\"?\s*\|\|\s*(?:true\b|:(?![\w-])|echo\b)")
+GROUP_PIPED = re.compile(r"\s*\"?\s*\|(?!\|).*\|\|\s*(?:true\b|:(?![\w-])|echo\b)")
+CAVEAT = re.compile(r"Any other non-zero status[^.]*\.")
+COMPOSE_NAMES = {"AI_MEMORY_SMOKE_RUN", "POSTGRES_PASSWORD", "PGBOUNCER_UID", "PGBOUNCER_GID"}
 OR_TRUE_AFTER_GROUP = re.compile(r"\)\s*\|\|\s*(?:true|:)(?![\w-])")
 PSQL_POOLED_DEF = 'docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"'
 GITIGNORE = PGB / ".gitignore"
@@ -372,6 +385,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertEqual(
             len(re.findall(r"\$\{?POSTGRES_PASSWORD\b", text)), 1, "compose must name POSTGRES_PASSWORD exactly once"
         )
+        # r11 S11: compose interpolates every exported variable and the smoke also
+        # exports PGPASSWORD (same secret); only these four names may be interpolated.
+        names = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)", text))
+        self.assertEqual(names, COMPOSE_NAMES, "compose may interpolate only %s" % sorted(COMPOSE_NAMES))
         services = _services()
         self.assertRegex(services["postgres"]["environment"].get("POSTGRES_PASSWORD", ""), REQUIRED_PW)
         for name, spec in services.items():
@@ -534,7 +551,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # r10 Q9: a second cleanup() after the trap line replaces the pinned body at runtime.
         for path in SCRIPTS:
             code = [ln.strip() for ln in _code_lines(path)]
-            defs = [ln for ln in code if re.match(r"^(?:function\s+cleanup\b|cleanup\s*\(\))", ln)]
+            defs = [ln for ln in code if CLEANUP_DEF.search(ln)]
             self.assertEqual(defs, ["cleanup() {"], "%s: exactly one cleanup() definition (CLEANUP_BODY): %r" % (path.name, defs))
             self.assertEqual(code.count("trap cleanup EXIT"), 1, "%s: exactly one trap cleanup line (CLEANUP_BODY)" % path.name)
 
@@ -579,12 +596,13 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                     self.assertNotRegex(ln, r"\(\s*[^)]*\becho\b", "%s: FAIL echo inside a subshell: %s" % (path.name, ln))
                     prev = lines[k - 1] if k else ""
                     self.assertFalse(prev.endswith("("), "%s: FAIL echo inside a subshell: %s" % (path.name, ln))
-                self.assertNotRegex(ln, r"^\s*alias\s", "%s: alias can shadow a builtin: %s" % (path.name, ln))
+                self.assertIsNone(ALIAS_DEF.search(ln), "%s: alias can shadow a builtin: %s" % (path.name, ln))
+            for where, group in self._groups(lines, path.name):
+                self.assertFalse(group["bad"], "%s: FAIL site in a group that can be neutralised (%s): %s" % (path.name, group["why"], where))
             names = set()
             for ln in lines:
-                m = FUNCTION_DEF.match(ln)
-                if m and (m.group(1) or m.group(2)) and (m.group(1) or "{" in ln):
-                    names.add(m.group(1) or m.group(2))
+                for m in FUNCTION_DEF.finditer(ln):
+                    names.add(m.group(1) or m.group(2) or m.group(3))
             for banned in ("exit", "return", "trap", "builtin", "command"):
                 self.assertNotIn(banned, names, "%s: function named %s" % (path.name, banned))
             self.assertEqual(names, PINNED_FUNCTIONS[path], "%s: function set differs from the pinned list" % path.name)
@@ -736,7 +754,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 ln,
             )
             targets.extend(t.rstrip(");&|") for t in REDIRECT.findall(plain))
-            for tok in re.finditer(r"\"[^\"]*\"|'[^']*'|(?<!<)<<(?!<)-?\s*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))", ln):
+            for tok in HEREDOC_TOKEN.finditer(ln):
                 word = tok.group(1) or tok.group(2) or tok.group(3)
                 if word:
                     heredoc = word
@@ -744,6 +762,76 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         if heredoc is not None:
             raise AssertionError("%s: heredoc terminator %s never found; the redirect scan would be blind" % (name, heredoc))
         return targets
+
+    @staticmethod
+    def _groups(lines, name):
+        """r11 Q15: every ( ) and { } group over the code lines, across lines, outside
+        quotes, comments and heredoc bodies; returns (location, group). group["bad"] is set
+        when a FAIL echo sits inside a subshell, or in a group that closes with `|| true`,
+        `|| :` or `|| echo ...`, or is a pipeline element followed by `| ... || true`."""
+        out, stack, heredoc, in_sq = [], [], None, False
+        for n, raw in enumerate(lines):
+            if heredoc:
+                heredoc = None if raw == heredoc else heredoc
+                continue
+            ln = re.sub(r"\(\(.*?\)\)", lambda m: " " * len(m.group()), raw if in_sq else _strip_comment(raw))
+            fail = FAIL_ECHO.search(ln)
+            fail_at = fail.start() if fail else -1
+            i = 0
+            while i < len(ln):
+                ch, nxt = ln[i], ln[i + 1 : i + 2]
+                if i == fail_at:
+                    for g in stack:
+                        g["fail"] = True
+                step = 1
+                top = stack[-1]["kind"] if stack else ""
+                if in_sq:
+                    in_sq = ch != "'"
+                elif ch == "\\":
+                    step = 2
+                elif ch == "$" and nxt in ("(", "{"):
+                    stack.append({"kind": "(" if nxt == "(" else "p", "sub": True, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
+                    step = 2
+                elif top == "dq":
+                    if ch == '"':
+                        stack.pop()
+                elif ch == '"':
+                    stack.append({"kind": "dq", "fail": False})
+                elif ch == "'":
+                    in_sq = True
+                elif ch in "({":
+                    stack.append({"kind": ch, "sub": False, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
+                elif (ch == ")" and top == "(") or (ch == "}" and top in ("{", "p")):
+                    group = stack.pop()
+                    if group["kind"] != "p":
+                        tail = ln[i + 1 :]
+                        sub_fail = group["fail"] and group["kind"] == "("
+                        piped = bool(GROUP_OR_NEUTRAL.match(tail) or GROUP_PIPED.match(tail))
+                        group["bad"] = group["fail"] and (sub_fail or piped)
+                        group["why"] = "subshell" if sub_fail else "closes with or-true or in a pipeline"
+                        out.append(("%s %s%s" % (group["at"], "$" if group["sub"] else "", group["kind"]), group))
+                i += step
+            if not in_sq:
+                for tok in HEREDOC_TOKEN.finditer(ln):
+                    word = tok.group(1) or tok.group(2) or tok.group(3)
+                    if word:
+                        heredoc = word
+                        break
+        if heredoc is not None or in_sq or stack:
+            raise AssertionError("%s: the group scan lost sync (heredoc %r, open groups %d)" % (name, heredoc, len(stack)))
+        return out
+
+    def test_group_scan_selftest(self):
+        # r11 Q15: D3 (subshell carrying a command, closed by `|| echo ok`), D4 (brace group as
+        # a pipeline element), D1/D2 style one-line definitions after ; && || { ( |.
+        bad = lambda lines: [g["bad"] for _, g in self._groups(lines, "t")]  # noqa: E731
+        self.assertEqual(bad(['( cd x', 'echo "FAIL: a" >&2; exit 1', ') || echo ok']), [True])
+        self.assertEqual(bad(['{ echo "FAIL: a" >&2; exit 1; } | cat || true']), [True])
+        self.assertEqual(bad(['{ echo "FAIL: a" >&2; exit 1; }']), [False])
+        self.assertEqual(bad(['x="$(psql <<\'SQL\'', 'echo ) {', 'SQL', ')" || { echo "FAIL: a" >&2; exit 1; }']), [False, False])
+        for text in ("; exit() { :; }", "&& cleanup() { :; }", "|| alias x=y", "{ exit() { :; }", "( exit() { :; }", "true | exit() { :; }"):
+            self.assertTrue(FUNCTION_DEF.search(text) or ALIAS_DEF.search(text), text)
+        self.assertFalse(FUNCTION_DEF.search('x="$(date)"') or ALIAS_DEF.search("echo alias_set"))
 
     def test_redirect_scan_heredoc_opener_is_anchored(self):
         # r10 Q11: arithmetic `<<` and a here-string are not heredocs; an opener
@@ -754,6 +842,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertEqual(scan(["cat <<'EOF' > a.txt", "echo b > c.txt", "EOF", "echo d > e.txt"], "t"), ["a.txt", "e.txt"])
         with self.assertRaises(AssertionError):
             scan(["cat <<'EOF'", "echo b > c.txt"], "t")
+        # r11 Q16 (D7): an escaped `<` makes `<<word` an input redirect, so the next line is code.
+        self.assertEqual(scan(["cat \\<<word > a.txt", "echo b > c.txt"], "t"), ["a.txt", "c.txt"])
 
     def test_dump_word_patterns_selftest(self):
         # r10 S9: the words are refused anywhere once quotes and backslashes are deleted;
@@ -767,12 +857,27 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             s = strip(ok)
             self.assertFalse(DUMP_WORD.search(s) or BARE_SET.search(s) or BARE_EXPORT.search(s), ok)
 
-    def test_smoke_docs_carry_the_unlisted_status_caveat(self):
-        # r10 Q7: the four-doc exit table must mean the same thing everywhere.
-        header = " ".join(ln.lstrip("# ").strip() for ln in SMOKE.read_text().splitlines()[:50] if ln.startswith("#"))
-        readme = " ".join(README_FOR[SMOKE].read_text().split())
-        for where, text in (("smoke header", header), ("pgbouncer README", readme)):
-            self.assertRegex(text, r"unlisted non-zero status is the (?:failing command's own|exit status of the failing command)", where)
+    def test_exit_status_caveat_is_identical_in_the_four_docs(self):
+        # r11 Q13: one caveat sentence, identical (whitespace collapsed) in both
+        # script headers and both READMEs.
+        found = []
+        for path in SCRIPTS:
+            lead = path.read_text().splitlines()[:50]
+            header = " ".join(ln.lstrip("# ").strip() for ln in lead if ln.startswith("#"))
+            readme = README_FOR[path].read_text()
+            for where, text in ((path.name + " header", header), (path.name + " README", readme)):
+                hits = CAVEAT.findall(" ".join(text.split()))
+                self.assertEqual(len(hits), 1, "%s: exactly one caveat sentence: %r" % (where, hits))
+                found.append(hits[0])
+        self.assertEqual(len(set(found)), 1, "the caveat sentence differs between the four docs: %r" % sorted(set(found)))
+
+    def test_smoke_header_lists_exactly_the_exit_codes_used(self):
+        # r11 Q13: one header row per code: 0 plus every `exit N` on a code line.
+        used = {int(c) for ln in _code_lines(SMOKE) for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)}
+        header = [ln for ln in SMOKE.read_text().splitlines()[:50] if ln.startswith("#")]
+        rows = [int(m.group(1)) for m in (re.match(r"^#\s{2,}(\d+)\s{2,}\S", ln) for ln in header) if m]
+        self.assertEqual(rows, sorted(set(rows)), "the header rows must be unique and ascending")
+        self.assertEqual(set(rows), used | {0}, "smoke header exit table differs from the exit codes the script uses")
 
     def _assert_exec_surface(self, path):
         """r9 S7: tracing, bare builtins, dump commands, container metadata,

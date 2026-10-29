@@ -15,13 +15,16 @@
 # Requires docker + docker compose. Run from infra/pgbouncer/:
 #   ./smoke-test.sh                       (random password generated)
 #   POSTGRES_PASSWORD=<value> ./smoke-test.sh
-# Exit 0 = pooler config validated; non-zero = a property failed (see output).
-# Exit codes (each used once): 1 a property failed (AGE, timeout, pool_mode,
-# auth_type), the stack bring-up failed (including the bind failure when another
-# run holds 127.0.0.1:6432) or the teardown failed; 64 run as root; 65 bad
-# AI_MEMORY_SMOKE_RUN; 73 the role has no SCRAM-SHA-256 verifier (refused, never
-# written to the userlist); 74 the pooled URL carries a password (refused). Any
-# other unlisted non-zero status is the failing command's own, under set -e.
+# Exit codes:
+#   0   PASS, the pooler config is validated
+#   1   a property failed (the FAIL line names it: AGE, timeout, pool_mode,
+#       auth_type), the stack bring-up failed (including the bind failure when
+#       another run holds 127.0.0.1:6432) or the teardown failed
+#   64  run as root
+#   65  bad AI_MEMORY_SMOKE_RUN (outside [a-z0-9_-] or over 64 characters)
+#   73  the role has no SCRAM-SHA-256 verifier (refused, never written to the userlist)
+#   74  the pooled URL carries a password (refused)
+# Any other non-zero status is the failing command's own, under set -e.
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 

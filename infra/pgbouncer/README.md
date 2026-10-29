@@ -85,7 +85,7 @@ instead of touching the first. `smoke-test.sh` exit codes: 1 a property failed (
 `auth_type = scram-sha-256`), the stack bring-up failed (including that concurrent-run bind failure) or the
 teardown failed, 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN` (outside `[a-z0-9_-]` or over 64 characters), 73 no SCRAM-SHA-256
 verifier, 74 the pooled URL carries a password (refused; the password only travels as the inherited
-`PGPASSWORD`); any other unlisted non-zero status is the exit status of the failing command under `set -e`. The envelope codes are in `infra/pillar4-envelope/README.md`.
+`PGPASSWORD`). Any other non-zero status is the failing command's own, under set -e. The envelope codes are in `infra/pillar4-envelope/README.md`.
 
 History: an earlier revision of this PR re-stored the smoke role as an md5
 verifier; that downgrade is gone.
