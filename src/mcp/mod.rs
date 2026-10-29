@@ -17,7 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// Set after the first `initialize` protocolVersion downgrade diagnostic is
+/// written, so the advisory stderr line is emitted once per process (#6157).
+static DOWNGRADE_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
 use std::time::Instant;
 
 use crate::config::{AppConfig, FeatureTier, ResolvedModels, TierConfig};
@@ -3556,10 +3561,29 @@ fn handle_request(
             // server→stdout frame + the emit contract at a GA compat freeze,
             // with zero in-tree consumer and a T1 ripple through `handle_request`,
             // is premature. Pinned by `initialize_advertises_no_streaming_capability_1868`.
+            // #6157 — negotiate `protocolVersion` against
+            // `SUPPORTED_PROTOCOL_REVISIONS` (echo a supported request,
+            // otherwise downgrade to the newest supported revision and say
+            // so on stderr; stdout stays response-only).
+            let (protocol_revision, downgraded) = jsonrpc::negotiate_protocol_revision(&req.params);
+            if downgraded && !DOWNGRADE_DIAGNOSTIC_EMITTED.swap(true, Ordering::Relaxed) {
+                // Once per process: the diagnostic is advisory, and a host
+                // that never drains stderr would otherwise fill the pipe and
+                // stall this single-threaded loop (#6157 S3; CONCURRENCY-06,
+                // an independent flag so Relaxed suffices). A closed or
+                // broken stderr must not panic the stdio loop (`eprintln!`
+                // panics on a write error); the response still goes out
+                // (ERRORS-19).
+                let _ = writeln!(
+                    io::stderr(),
+                    "{}",
+                    jsonrpc::protocol_downgrade_diagnostic(&req.params, protocol_revision)
+                );
+            }
             ok_response(
                 id,
                 json!({
-                    "protocolVersion": jsonrpc::PROTOCOL_REVISION,
+                    (jsonrpc::PROTOCOL_VERSION_FIELD): protocol_revision,
                     (field_names::CAPABILITIES): { "tools": {}, "prompts": {} },
                     "serverInfo": server_info,
                 }),
@@ -8742,7 +8766,11 @@ mod tests {
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        // No `protocolVersion` requested: the newest supported (#6157).
+        assert_eq!(
+            result["protocolVersion"],
+            jsonrpc::SUPPORTED_PROTOCOL_REVISIONS[0]
+        );
         assert_eq!(result["serverInfo"]["name"], "ai-memory");
     }
 

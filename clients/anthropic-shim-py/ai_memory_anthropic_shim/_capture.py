@@ -42,7 +42,7 @@ def _frames(capture_request: dict[str, Any]) -> str:
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "ai-memory-anthropic-shim-py", "version": "0.1"},
         },
