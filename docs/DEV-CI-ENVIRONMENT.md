@@ -189,15 +189,20 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 **AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
 Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
 them (CI then fails with `extension "age" is not available`). A brew-independent
-copy now lives in `<pg-age-stack>/age-1.8.0/{share,lib}`. On the macos-fed node the
-"Configure enterprise-fed tier" step runs `scripts/ci/ensure-age-extension.py`
-before `CREATE EXTENSION`:
+copy now lives in `<pg-age-stack>/age-1.8.0-06ce678d/{share,lib}` (the suffix is the
+upstream apache/age commit the build carries; the build recipe, the pin rule and the
+tier restart are in `DEVELOPER_SETUP_NOTES.md`, "macos-fed AGE build", #8282). On the
+macos-fed node the "Configure enterprise-fed tier" step runs
+`scripts/ci/ensure-age-extension.py` before `CREATE EXTENSION`:
 
 - **Manifest.** It installs exactly five files, each pinned to a sha256 in the
   script's `MANIFEST`: `age.dylib` (into `pg_config --pkglibdir`) and
   `age.control`, `age--1.8.0.sql`, `age--1.7.0--1.8.0.sql`, `age--1.6.0--1.7.0.sql`
   (into `pg_config --sharedir`/extension). Nothing else in the source directory
-  is read or copied. Rebuilding AGE means updating those pins in the same change.
+  is read or copied. Rebuilding AGE means updating those pins in the same change,
+  and the `age.dylib` pin must never go back to the stock 1.8.0 bytes: the helper
+  installs whatever the pin names, so a stock pin reinstalls the apache/age#2580
+  lock leak over the patched library (that is how #8282 followed #7162).
 - **Health check.** AGE counts as present only when `pg_available_extensions`
   lists `age` (that view reflects `age.control` alone) AND all five files are at
   their destinations as regular files with the pinned hashes, none of them group-

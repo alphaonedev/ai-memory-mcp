@@ -1851,7 +1851,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         home.mkdir()
         r = self.real_script({"HOME": str(home), "AI_MEMORY_CI_AGE_DIR": str(self.age)}, age_dir=False)
         self.assert_fails(r, 2, "age source incomplete: ")
-        self.assertIn(str(home / "pg-age-stack" / "age-1.8.0"), r.stderr)
+        self.assertIn(str(home / "pg-age-stack" / "age-1.8.0-06ce678d"), r.stderr)
         self.assert_nothing_installed()
 
     def test_manifest_pins_exactly_the_five_age_files(self):
@@ -1864,8 +1864,12 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(rows[0][:2], ("lib", "age.dylib"), "lib must be installed before share")
         for _, _, pin in rows:
             self.assertRegex(pin, r"\A[0-9a-f]{64}\Z")
+        # #8282: the pin is the 1.8.0 + apache/age 06ce678d build, never the stock
+        # 1.8.0 bytes (8ecfc082...), which carry the apache/age#2580 lock leak.
         self.assertEqual(dict(((s, n), p) for s, n, p in rows)[("lib", "age.dylib")],
-                         "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927")
+                         "b6b5c442331cc45596e9be2e24172a51329ff69e7d08bbeb66ec970bacd08adf")
+        self.assertNotEqual(dict(((s, n), p) for s, n, p in rows)[("lib", "age.dylib")],
+                            "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927")
 
 
     def test_a_stop_recorded_during_handler_install_spawns_no_psql_6846(self):

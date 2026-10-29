@@ -249,3 +249,70 @@ Constants (named in code, change them there): `SCCACHE_CACHE_SIZE = "50G"` in `s
 - Eviction: after the post-job prune, `prune_runner_artifacts.py --evict-root` deletes other runners' target directories idle for more than `IDLE_TARGET_DAYS` and, while the filesystem has less than `FREE_FLOOR_GIB` free, the oldest remaining other targets. A target is evicted only when idle: the per-runner target step writes an in-use marker (`.in-use`, expires after `IN_USE_MARKER_MAX_AGE_SECS` = 6 h so a crashed job cannot pin it) that the post-job prune clears, and a target written within `BUSY_MTIME_MINUTES` (30) is also kept. It never touches the running runner's target, a symlink, or any root other than `~/.cache/ai-memory-ci/cargo-target`; an unmet floor prints a `::warning::` line.
 - f2 layout: `~/.cache/ai-memory-ci` is a symlink to a directory on the 1.8 TB external SSD mount (1.2 TB free when moved), so the cargo targets and the sccache directory share that disk: four labelled runners need about 4 x 165 + 50 + 200 = 910 GiB.
 - Relabel a runner once the budget allows: re-add the `linux-fed` label to the next unlabelled runner (f2-linux-fed-3, then -4) only when `df -BG ~/.cache/ai-memory-ci/` shows free space of at least `FREE_FLOOR_GIB` plus one more per-runner target after the new runner's first cold build; relabel one runner at a time and watch the first job's sccache hit rate and free space before the next.
+
+## macos-fed AGE build: 1.8.0 + apache/age 06ce678d (#7162, #8282)
+
+The `Check (macos-fed,enterprise-fed)` job runs against a native PostgreSQL 18
+(Homebrew `postgresql@18`) with Apache AGE in `shared_preload_libraries`. Stock AGE
+1.8.0 carries apache/age#2580: on the `ROLLBACK` of a failed transaction, after the
+shared-invalidation queue overflowed, its `post_parse_analyze` hook reads
+`pg_extension` while the transaction is aborting, PostgreSQL logs
+`ERROR: ResourceOwnerEnlarge called after release started`, the fast-path locks
+taken by that read leak into the backend's `PGPROC`, and every later backend that
+reuses that `PGPROC` fails at connect with
+`FATAL: failed to re-find shared lock object` until the server is restarted. In CI
+this shows as `connect: BackendUnavailable { backend: "postgres", detail: "connect:
+error returned from database: failed to re-find shared lock object" }` on the lib
+tests that open a fresh pool. Upstream fixed it in apache/age commit
+`06ce678d74210539705c77e2dc7c9fa861e2a331` (PR #2581): `is_age_extension_exists()`
+returns early when `!IsTransactionState()`. No 1.8.x release carries it, so the
+macos-fed node runs its own build.
+
+**Build (on the macos-fed node).** From a clone of `apache/age`:
+
+    git checkout -b f1-1.8.0-06ce678d origin/release/PG18/1.8.0
+    git cherry-pick 06ce678d74210539705c77e2dc7c9fa861e2a331
+    # bison 3.8 reports the grammar's %name-prefix / %pure-parser as deprecated;
+    # the Makefile's -Werror for the cypher_gram.c rule has to become
+    # -Wno-error=deprecated -Wno-error=other for the build to finish.
+    nice -n 19 make -j4 PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config \
+        BISON=/opt/homebrew/opt/bison/bin/bison FLEX=/opt/homebrew/opt/flex/bin/flex
+
+Stage the result in a NEW node-local directory named after the upstream commit,
+`<pg-age-stack>/age-1.8.0-<commit>/{lib/age.dylib, share/age.control,
+share/age--1.8.0.sql, share/age--1.7.0--1.8.0.sql, share/age--1.6.0--1.7.0.sql}`
+(files 0644, dirs 0755, owned by the runner uid, no symlinks; the SQL files are
+unchanged by the patch, copy them from the previous directory). Keep the previous
+directory: jobs on older branches still carry the older pin and source path, and
+the self-heal exits 2 (job red) when its source does not match its pin.
+
+**Pin rule.** `scripts/ci/ensure-age-extension.py` installs the five files its
+`MANIFEST` pins, on every enterprise-fed job, whenever the installed bytes differ.
+The pin is therefore the authority on which library the tier runs: a pin on the
+stock 1.8.0 bytes (`8ecfc082...`) reinstalls the #2580 defect over a patched
+library, which is exactly how #8282 followed the #7162 fix (the helper restored
+stock on 2026-10-22, the next tier restart on 2026-10-25 loaded it, and the
+connect failures were back on 2026-10-28). Every AGE rebuild changes, in one
+commit, the `age.dylib` pin and `DEFAULT_AGE_DIR` in the helper, the matching
+assertions in `scripts/test/test_ensure_age_extension_6161.py`, and this section.
+
+**Install and restart.** Copy the new `age.dylib` over `pg_config --pkglibdir`/age.dylib
+(keep the old one next to it with a suffix), then restart the tier when no
+enterprise-fed job is running on any runner slot of the node:
+
+    launchctl kickstart -k gui/<uid>/dev.alphaone.pg-age-stack
+
+A `SIGHUP` is not enough: a library in `shared_preload_libraries` is loaded once by
+the postmaster. Verify `select extversion from pg_extension where extname='age'`
+(1.8.0), that `lsof -p <postmaster pid>` maps the new `age.dylib`, and that the
+server log stays free of both messages above.
+
+**Reproduction (same scenario as the CI failure, on a throwaway cluster).** Start a
+scratch cluster with `shared_preload_libraries = 'age'` and a `dynamic_library_path`
+that names the library under test first; in session A run `BEGIN; SELECT 1/0;`,
+`SIGSTOP` its backend, create and drop 1000 tables from session B, `SIGCONT` A and
+run `ROLLBACK;` in A; then open fresh connections while B takes
+`LOCK TABLE pg_extension IN SHARE MODE`. Stock AGE: `ROLLBACK` fails with the
+`ResourceOwnerEnlarge` error and a fresh backend dies with
+`FATAL: failed to re-find shared lock object`. Patched AGE: `ROLLBACK` succeeds and
+every connection works.

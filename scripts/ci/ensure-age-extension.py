@@ -7,7 +7,8 @@ AGE on the macos-fed node is a hand-built install whose files live inside the
 Homebrew-managed ``postgresql@18`` share/lib trees.  A ``brew upgrade`` relinks
 those trees and drops the AGE files, so ``CREATE EXTENSION age`` fails.  A
 brew-independent copy lives in a node-local directory (default
-``~/pg-age-stack/age-1.8.0`` with ``share/`` and ``lib/``).
+``~/pg-age-stack/age-1.8.0-06ce678d`` with ``share/`` and ``lib/``; the suffix
+is the upstream apache/age commit the build carries, see ``MANIFEST``).
 
 The files installed are fixed by ``MANIFEST``: exactly five names, each pinned
 to a sha256.  Nothing else in the source directory is ever read or copied.
@@ -144,7 +145,7 @@ EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
 
 DEFAULT_URL_FILE = Path.home() / ".ai-memory-ci-fed-url"
-DEFAULT_AGE_DIR = Path.home() / "pg-age-stack" / "age-1.8.0"
+DEFAULT_AGE_DIR = Path.home() / "pg-age-stack" / "age-1.8.0-06ce678d"
 DEFAULT_PG_CONFIG = "/opt/homebrew/opt/postgresql@18/bin/pg_config"
 DEFAULT_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
 PROBE_TIMEOUT_SECONDS = 60
@@ -199,8 +200,18 @@ TEMP_SUFFIX = ".age-restore"
 # "lib" entries go to `pg_config --pkglibdir`, "share" entries to
 # `pg_config --sharedir`/extension.  lib is listed (and installed) first so the
 # control file never appears ahead of its module.
+#
+# The dylib pin is the node's build of release/PG18/1.8.0 plus upstream commit
+# 06ce678d74210539705c77e2dc7c9fa861e2a331 (apache/age#2580 / #2581: no catalog
+# read in is_age_extension_exists() outside a live transaction).  Stock 1.8.0
+# leaks fast-path locks on the ROLLBACK of a failed transaction and every
+# later backend on that PGPROC fails to connect with "failed to re-find shared
+# lock object" (#7162, #8282).  A pin on the stock bytes makes this helper
+# REINSTALL the defect over the patched library (that is how #8282 happened),
+# so the pin and DEFAULT_AGE_DIR change together with every AGE rebuild; the
+# recipe is in docs/DEVELOPER_SETUP_NOTES.md ("macos-fed AGE build").
 MANIFEST = (
-    ("lib", "age.dylib", "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927"),
+    ("lib", "age.dylib", "b6b5c442331cc45596e9be2e24172a51329ff69e7d08bbeb66ec970bacd08adf"),
     ("share", "age--1.6.0--1.7.0.sql", "3f63301c461e2ad3e952f1ead68d380ddadfe004b147ca81606ad63301e0514f"),
     ("share", "age--1.7.0--1.8.0.sql", "9b04323cc00cd57a9d28adc43c01f5de43d236c26d3e1a17682bc3ce039e35af"),
     ("share", "age--1.8.0.sql", "f6c2d353997a4479d1be63d0e0afc4a58fb2e0826d46f9d6d5a0e46d69441d4d"),
