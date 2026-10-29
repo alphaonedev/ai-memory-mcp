@@ -609,9 +609,13 @@ does **not** reach an MCP server the host launches with its own environment.
 
 ## Quarantine of provenance-less federated writes (v1.0.0 R19/A3, #1948)
 
-A federated node can OPT IN to hiding inbound relayed memories it cannot
-attribute. Set `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1` (default **off** /
-permissive) and any inbound `/sync/push` memory that does not reach
+Inbound relayed memories a node cannot attribute are hidden by default on the
+`federated`, `hive` and `production` deployment shapes: the shape pins
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` on at boot, and an explicit zero (or
+any non-truthy value) is refused at boot there (`production` through the
+`asi-hard` posture floor). The `singleton` and `team` shapes do not react and
+stay permissive unless you set `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1`
+yourself. Any inbound `/sync/push` memory that does not reach
 `attest_level=agent_attested` (no verified per-write content signature — it
 would land `claimed`) is **stored** with the system-only lifecycle state
 `quarantined`:

@@ -12,7 +12,7 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-Last LIVE bind (historical, no live bind while EXPIRED): `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
+Last LIVE bind (historical, no live bind while VOID): `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
 re-issued 2026-10-02 after **3 §7-watched federation-wire files changed** since the prior bind
 `eba96b307` — 74 changed lines, **49 of them code**, from five commits — §5.4(2)–(5) re-run at the
 new SHA per §7). The 2026-09-26 re-issue at `eba96b307`, the 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
@@ -1990,13 +1990,25 @@ the `federated`, `hive` and `production` shapes pin the knob on at boot.
 *Disposition.* **This change does NOT re-mint the certification and does not
 approve its own control.** Re-running §5.4(2)–(5) on the certified tier and
 re-issuing this document against the new SHA is a Conductor task, tracked by
-[**#2967**](https://github.com/alphaonedev/ai-memory-mcp/issues/2967). The
-2026-09-21 status at `f32c18dad` in §8 stays the last bound determination and
-must be read together with this record until that re-issue lands.
+[**#6063**](https://github.com/alphaonedev/ai-memory-mcp/issues/6063) (WP-B1),
+the tracker the STATUS banner names; #2967 only records the voiding. The last
+bound determination is the 2026-10-02 re-issue at
+`385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`, the same commit the banner names as
+the last LIVE claim. Gate output at this change: `check-cert-expiry: PASS —
+federation-wire surface changed AND cert doc re-issued/voided in the same
+change (...; banner EXPIRED - → VOID -)` and `check-cert-expiry: banner
+STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
+statuses below are historical records of earlier binds, not a live claim.
 
 ---
 
 ## 8. Current determination
+
+> **Read this section as history.** The STATUS banner above is VOID, so nothing
+> below is a live claim. The latest bound determination is the 2026-10-02
+> re-issue at `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`; the `f32c18dad`
+> status that opens the list below is an earlier, superseded bind, and the
+> re-issues recorded in the banner and the §7 firing ledger postdate it.
 
 **Status at `f32c18dadf8a659567960747cc2802186bac9de9` (2026-09-21
 re-issue; the v1.0.0 promotion candidate; supersedes the 2026-09-12 #3607

@@ -10638,6 +10638,17 @@ pub(crate) const TEST_ENV_ISOLATION_ROLE_ENV: &str = "AI_MEMORY_TEST_ENV_ISOLATI
 /// asserts the child stdout reports `1 passed` and never `0 passed`.
 #[cfg(test)]
 pub(crate) fn run_env_isolated_child_or_spawn(exact_path: &str) -> bool {
+    run_env_isolated_child_or_spawn_scrubbing(exact_path, &[])
+}
+
+/// [`run_env_isolated_child_or_spawn`] for a test whose outcome depends on
+/// variables the lib-test process may already have set (for example the
+/// process-wide `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` pin from
+/// `identity::attest::permissive_attestation_for_lib_tests`): every name in
+/// `scrub` is removed from the child's environment so the child starts from a
+/// hermetic baseline whatever order the parent's tests ran in (#2967).
+#[cfg(test)]
+pub(crate) fn run_env_isolated_child_or_spawn_scrubbing(exact_path: &str, scrub: &[&str]) -> bool {
     let _ = crate::identity::test_key_dir::install();
     if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
         return false; // caller runs the real body in this isolated child
@@ -10648,14 +10659,16 @@ pub(crate) fn run_env_isolated_child_or_spawn(exact_path: &str) -> bool {
     // process-constructor, which the `spawn_audit_gate_1937` guard bans
     // outside `src/spawn_audit.rs`). The best-effort audit emit is a no-op
     // here because no spawn-audit DB is seeded in a unit-test process.
-    let output = crate::spawn_audit::audited_command(
+    let mut cmd = crate::spawn_audit::audited_command(
         std::env::current_exe().expect("current_exe for env-isolated test spawn"),
         "config::run_env_isolated_child_or_spawn",
-    )
-    .args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
-    .env(TEST_ENV_ISOLATION_ROLE_ENV, "child")
-    .output()
-    .expect("spawn env-isolated child test");
+    );
+    cmd.args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
+        .env(TEST_ENV_ISOLATION_ROLE_ENV, "child");
+    for name in scrub {
+        cmd.env_remove(name);
+    }
+    let output = cmd.output().expect("spawn env-isolated child test");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
