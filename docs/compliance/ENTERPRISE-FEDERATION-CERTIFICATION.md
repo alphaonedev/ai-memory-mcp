@@ -742,7 +742,8 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
      memory's `content` under a per-agent X25519 / ChaCha20-Poly1305
      envelope (`src/encryption/mod.rs`, `ENV_ENCRYPT_AT_REST` at
      `:585`). This is **not** the same control as SQLCipher, and it is
-     **not** end-to-end across federation (see §6).
+     **not** end-to-end across federation (see the
+     [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262)).
 
    > **Control #15 is BACKEND-AWARE (#3061) — and the two backends carry
    > two DIFFERENT strengths of assurance. Read this before trusting a pg
@@ -863,7 +864,7 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 
 ### Certification scope statement for the v1.0.0 GA candidate ([#8262](https://github.com/alphaonedev/ai-memory-mcp/issues/8262))
 
-> Pinned to chain tip `ced1419a83c5c8aec30920391b22533375e6d799`; the audit umbrella is [#8268](https://github.com/alphaonedev/ai-memory-mcp/issues/8268). Each
+> Pinned to chain tip `89cdc32c83d347de5d63ac62f5edfa9ee973940f`; the audit umbrella is [#8268](https://github.com/alphaonedev/ai-memory-mcp/issues/8268). Each
 > line is one claim, its tracking issue and, where code enforces it, the `file:line` at that SHA. This
 > statement does not re-mint the certification (the bind and expiry record above are unchanged).
 
@@ -885,6 +886,15 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
   `src/storage/mod.rs:9512-9514`).
 - Encryption in transit ([#3824](https://github.com/alphaonedev/ai-memory-mcp/issues/3824)) and setup simplicity ([#3830](https://github.com/alphaonedev/ai-memory-mcp/issues/3830)) are closed as met.
 
+**In scope for v1.0.0 GA, certification issued on landing (not certified today):**
+
+- Federation end-to-end content encryption, variants A and B, is in scope for v1.0.0 GA and is delivered by
+  [#8278](https://github.com/alphaonedev/ai-memory-mcp/issues/8278). The certification is issued only when #8278 has landed on
+  release/v1.0.0 with its tests green.
+  Until #8278 lands, the shipped guarantee for federation content is the mTLS transport only: peers
+  replicate and store plaintext content. Isolation between distrusting tenants is by disjoint deployments.
+  [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) was closed with the `deferred-v1.x` label and is superseded by #8278.
+
 **Fail-closed controls required for GA that are NOT yet landed at the pinned SHA.** Each is claimed only
 when its issue closes with a landed SHA on the GA candidate. At the pinned SHA the default is the
 permissive one named here, so a reader must not assume the control:
@@ -898,16 +908,15 @@ permissive one named here, so a reader must not assume the control:
 
 **NOT claimed for v1.0.0 (each is named so the certified claim is unambiguous):**
 
-- Federation end-to-end content encryption: peers replicate and store plaintext content ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968), closed
-  deferred-v1.x; `docs/federation.md:488`). Isolation between distrusting tenants is by disjoint deployments.
-- Postgres-native TDE as a machine-checked control: at-rest posture on the postgres tier is
-  operator-attested through `AI_MEMORY_PG_AT_REST_ATTESTED` (the paragraph above, "deliberately NOT claimed
-  for GA"; [#8262](https://github.com/alphaonedev/ai-memory-mcp/issues/8262)).
+- Postgres-native TDE as a machine-checked control is deliberately NOT claimed for v1.0.0: at-rest posture
+  on the postgres tier is operator-attested through `AI_MEMORY_PG_AT_REST_ATTESTED`
+  ([#8284](https://github.com/alphaonedev/ai-memory-mcp/issues/8284), the operator ruling on a machine proof is still open; audit umbrella
+  [#8268](https://github.com/alphaonedev/ai-memory-mcp/issues/8268)).
 - Curator namespace-scoped mode: the curator daemon is root-equivalent (cross-tenant `for_admin` reads,
   `src/curator/reflection_pass.rs:125-127`; [#8264](https://github.com/alphaonedev/ai-memory-mcp/issues/8264), open, operator milestone decision).
 - Batman Form 2 synchronous atomisation on postgres: sqlite and MCP stdio only, postgres reports
   `skipped_backend_unsupported` ([#8255](https://github.com/alphaonedev/ai-memory-mcp/issues/8255), open; `docs/atomisation.md:100-102`).
-- Top-shelf encryption documentation ([#3833](https://github.com/alphaonedev/ai-memory-mcp/issues/3833), closed with the `deferred-v1.x` label, so deferred to v1.x).
+- Top-shelf encryption documentation ([#3833](https://github.com/alphaonedev/ai-memory-mcp/issues/3833), closed with the `deferred-v1.x` label).
 - Singleton and Team shapes keep allow-on-silence namespace governance by default
   (`src/config/shape.rs:191`; [#3125](https://github.com/alphaonedev/ai-memory-mcp/issues/3125)).
 
@@ -1254,7 +1263,8 @@ the SSOT pins, per the STANDARD data-tier note below.)
 > daemon and its PostgreSQL + AGE backing store — this is the
 > ai-memory↔store DATA-TIER link, DISTINCT from the federation
 > peer↔peer transport (§1 point 2, §6), and it carries no
-> end-to-end-content-encryption claim (that boundary stays open per §6).
+> end-to-end-content-encryption claim (see the
+> [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262)).
 > Live-proven this session with real `psql` / OpenSSL output:
 >
 > - **The daemon connects `sslmode=verify-full`.** ai-memory attaches to
@@ -1409,8 +1419,9 @@ control is the SOLE decisive gate.
 This certification does **NOT** cover, and a Fortune-500 that needs any of the
 following should **not** treat v1.0.0 as sufficient:
 
-- **No end-to-end content encryption.** Every in-scope federation peer reads
-  your memory content in **plaintext** (`src/encryption/mod.rs`, #1968 open).
+- **No end-to-end content encryption at the pinned SHA.** Every in-scope federation peer reads
+  your memory content in **plaintext** (`src/encryption/mod.rs`). Its scope and certification
+  status are stated once, in the [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262).
   SQLCipher protects data at rest on each node; it does **not** protect content
   in transit-to-peer beyond the TLS/mTLS transport, and an allowlisted peer sees
   cleartext. The per-content X25519/ChaCha envelope (`AI_MEMORY_ENCRYPT_AT_REST`)

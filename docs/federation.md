@@ -7,7 +7,7 @@ layout: doc
 >
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
-> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
 
 > **Looking for zero-touch trust?** This document covers the
 > **transport/identity hardening** layer — mTLS allowlist, X-API-Key, and
@@ -486,8 +486,7 @@ independently — these are layered on top.
 - **Outbound server-cert verification is fail-closed
   ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448)).**
   Federation replicates **plaintext** memory content (it is NOT
-  end-to-end encrypted; see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262) —
-  [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)), so
+  end-to-end encrypted; see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)), so
   an unverified peer *server* certificate is a direct content-disclosure
   surface for an adversary in DNS or BGP position. The mTLS control cuts
   the other way: the peer fingerprint-pinning **our** client cert
@@ -929,7 +928,7 @@ namespaces**. Those verbs are contained, and since #2489/#2480 so are the
 link, signal and pull-accept lanes (enrolled posture). What remains
 uncontained: the peer can read the plaintext of everything replicated
 to it — federation is **not** end-to-end encrypted
-([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968); see
+(see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262) and
 §"At-rest encryption and federation" below).
 
 **Opt-in quarantine of provenance-less inbound content
@@ -960,7 +959,7 @@ in-domain confinement primitive is `PeerScope.allowed_namespaces`,
 **which every inbound write lane now consults under an enrolled
 posture (#2489/#2480)**. The residual reason this is not a
 mutually-distrusting-tenant boundary is that federation replicates
-plaintext (#1968) and `trust_domain` is credential-replay scope only.
+plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)) and `trust_domain` is credential-replay scope only.
 For heterogeneous trust,
 §8.8 of `docs/enterprise-deployment.md` gives the correct answer:
 **use multiple disjoint swarms**, not one mesh with scopes.

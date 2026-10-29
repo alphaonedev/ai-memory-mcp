@@ -319,7 +319,8 @@ by the bundled clients on that host — never by a peer).
   `http://localhost:11434`). #3705 DETECTS a plaintext endpoint in doctor
   (`llm_egress_plaintext`) but does not yet refuse it; the operator's
   ruling on local model servers is pending.
-- *Federation content is not end-to-end encrypted* (#1968;
+- *Federation content is not end-to-end encrypted* (see the
+  [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262);
   `src/tls.rs` records it). Transport TLS satisfies "encrypted in transit"
   on the wire; a TLS-terminating intermediary — a load balancer, a reverse
   proxy, a compromised peer — sees plaintext memory content. Whether the
