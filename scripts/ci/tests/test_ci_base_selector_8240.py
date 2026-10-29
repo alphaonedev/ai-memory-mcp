@@ -1313,7 +1313,7 @@ MATERIALISE_CALL_ARGS = {
     "main": [""],
     "materialise": ["derived, dest, names"],
     "print": sorted(["'impact: derived base %s from github.sha %s' % "
-                     "(derived, os.environ.get('CONTEXT_SHA', ''))",
+                     + "(derived, os.environ.get('CONTEXT_SHA', ''))",
                      "'impact: selector files loaded from the base sha'", "line"]),
     "replace_refs_present": [""],
     "report": sorted(["False, 'environment-unusable'", "False, str(exc), gate_absent(derived)",
@@ -3099,7 +3099,7 @@ class TrustDecisionFirst(unittest.TestCase):
         self.assertEqual(self.R15_REGRESSION_PINS,
                          ("r2-print-other-name", "r1-report-call-forged-bootstrap"))
         labels = {row[0] for row in self.R15_SEC_ROWS}
-        self.assertTrue(set(self.R15_REGRESSION_PINS) <= labels)
+        self.assertLessEqual(set(self.R15_REGRESSION_PINS), labels)
 
     def test_sec_r13_s1_the_function_pins_name_every_local_function_of_the_heredoc(self):
         """sec r13 S1: the pinned set is exactly the defined names the allow-list names, and each
@@ -4268,16 +4268,9 @@ def _workflow_forms():
         "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n      #"
         " decision: on push, schedule" % PIN
     )
-    CO_BLOCK = (
-        "      - uses: actions/checkout@%s # v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n" % PIN
-    )
     MODE_NAME = "      - name: Selection mode\n"
     MODE_ENV = "        id: mode\n        env:\n          ENFORCE: ${{ vars.CI_IMPACT_ENFORCE }}\n"
     MODE_RUN = '        run: echo "enforce=${ENFORCE}" >> "$GITHUB_OUTPUT"\n'
-    GATE_IF = (
-        "        id: base\n        if: ${{ github.event_name == 'pull_request' || github.event_name"
-        " == 'merge_group' }}\n        env:\n"
-    )
     SEL_PY_END = "          PY\n\n      - name: Build impact index"
     GATE_PY_END = "          PY\n      # decision: !cancelled() &&"
     WF_ENV = "env:\n  CARGO_TERM_COLOR: always\n"
@@ -5354,7 +5347,7 @@ class WorkflowFormMutants(unittest.TestCase):
         self.assertEqual(sum(len(k) for k in kinds), 180)
         self.assertEqual(set().union(*kinds), set(self.FORMS))
         self.assertEqual((len(WF_FORM_RED), len(WF_FORM_TESTS), len(WF_FORM_GREEN)), (162, 9, 8))
-        self.assertTrue(set(WF_FORM_SAME_AS) <= set(WF_FORM_RED))
+        self.assertLessEqual(set(WF_FORM_SAME_AS), set(WF_FORM_RED))
         self.assertEqual(len(WF_FORM_SAME_AS), 18)
 
     def test_each_red_form_is_refused_by_the_pre_trust_gate_with_its_problem_line(self):
