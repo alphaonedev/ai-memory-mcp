@@ -829,6 +829,15 @@ struct SlugFiles {
     audit: bool,
 }
 
+/// Detail prefix of a scope-key file that cannot be opened or read
+/// (R15: one constant, not a repeated literal).
+const UNREADABLE_DETAIL: &str = "unreadable";
+
+/// The [`ScopeKeyStoreError::RecordCorrupt`] detail of an I/O read failure.
+fn unreadable_detail(error: &std::io::Error) -> String {
+    format!("{UNREADABLE_DETAIL}: {error}")
+}
+
 fn poisoned() -> anyhow::Error {
     anyhow!("{ISSUE_TAG}: the scope-key cache lock is poisoned; refusing to answer from it")
 }
@@ -946,7 +955,7 @@ impl FileScopeKeyStore {
         let mut file = match options.open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Self::corrupt(path, format!("unreadable: {e}"))),
+            Err(e) => return Err(Self::corrupt(path, unreadable_detail(&e))),
         };
         let meta = file
             .metadata()
@@ -970,7 +979,7 @@ impl FileScopeKeyStore {
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
-            .map_err(|e| Self::corrupt(path, format!("unreadable: {e}")))?;
+            .map_err(|e| Self::corrupt(path, unreadable_detail(&e)))?;
         Ok(Some(bytes))
     }
 
@@ -1123,6 +1132,32 @@ impl FileScopeKeyStore {
             ));
         }
         NamespaceLedger::replay(records, &log)
+    }
+
+    /// R17 (code review r2 C2): the namespace marker on a cache miss. Takes
+    /// the shared lock (lock order: flock first, cache second), re-reads the
+    /// slug's records and audit log, caches the result and answers from it,
+    /// so a store opened before another writer minted epoch 1 never reports
+    /// the namespace as plaintext. A ledger that fails verification answers
+    /// end-to-end (fail closed). Nothing is created on this read path.
+    fn reload_marker(&self, slug: &str) -> Result<bool> {
+        if !self.scope_dir().exists() {
+            return Ok(false);
+        }
+        let _lock = self.lock_shared()?;
+        let scanned = self.scan(Some(slug))?;
+        let Some(files) = scanned.get(slug) else {
+            return Ok(false);
+        };
+        let slot = self.load_slug(slug, files);
+        let e2e = slot
+            .as_ref()
+            .map_or(true, |ledger| !ledger.records.is_empty());
+        self.cache
+            .write()
+            .map_err(|_| poisoned())?
+            .insert(slug.to_string(), slot);
+        Ok(e2e)
     }
 
     /// The verified ledger of `namespace` straight from disk (the caller
@@ -1282,14 +1317,19 @@ impl ScopeKeyStore for FileScopeKeyStore {
     }
 
     fn namespace_is_e2e(&self, namespace: &str) -> bool {
-        let Ok(cache) = self.cache.read() else {
-            return true;
-        };
-        match cache.get(&Self::slug(namespace)) {
-            None => false,
-            Some(Err(_)) => true,
-            Some(Ok(ledger)) => !ledger.records.is_empty(),
+        let slug = Self::slug(namespace);
+        {
+            let Ok(cache) = self.cache.read() else {
+                return true;
+            };
+            match cache.get(&slug) {
+                Some(Err(_)) => return true,
+                Some(Ok(ledger)) if !ledger.records.is_empty() => return true,
+                _ => {}
+            }
         }
+        // R17: a miss re-reads the cold store; a read error is end-to-end.
+        self.reload_marker(&slug).unwrap_or(true)
     }
 
     fn ledger_head(&self, namespace: &str) -> Result<LedgerHead> {

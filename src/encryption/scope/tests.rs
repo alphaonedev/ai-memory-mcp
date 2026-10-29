@@ -24,7 +24,7 @@ fn test_key(namespace: &str, epoch: u32) -> ScopeKey {
 }
 
 fn row<'a>(memory_id: &'a str, namespace: &'a str) -> RecordBinding<'a> {
-    RecordBinding::new(memory_id, namespace, 1)
+    RecordBinding::new(memory_id, namespace)
 }
 
 fn refusal(err: &anyhow::Error) -> ScopeEnvelopeError {
@@ -71,37 +71,89 @@ fn scope_envelope_layout_is_fixed_header_then_inner_ct_8278() {
     }
 }
 
+/// The binding of a stored row, read back from storage.
+fn stored_row(mem: &crate::models::Memory) -> RecordBinding<'_> {
+    RecordBinding::new(&mem.id, &mem.namespace)
+}
+
+/// A plain row inserted through the storage writer.
+fn insert_row(conn: &rusqlite::Connection, title: &str) -> crate::models::Memory {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mem = crate::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: NS.to_string(),
+        title: title.to_string(),
+        content: "row body".to_string(),
+        source: "api".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        ..crate::models::Memory::default()
+    };
+    let id = crate::storage::insert(conn, &mem).expect("insert");
+    crate::storage::get(conn, &id)
+        .expect("get")
+        .expect("present")
+}
+
+/// R2-amended (security r2 M1): a non-content write bumps
+/// `memories.version` without re-sealing (here the lifecycle writer,
+/// `storage/lifecycle_write.rs`), so the envelope must still open on the row
+/// read back after it.
 #[test]
-fn scope_envelope_refuses_older_row_version_8278() {
+fn scope_envelope_opens_after_row_version_bump_8278() {
+    let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("db");
+    let before = insert_row(&conn, "version bump 8278");
     let key = test_key(NS, 1);
-    let sealed = seal_scoped(
-        "version 1 content",
-        &key,
-        RecordBinding::new("mem-v", NS, 1),
-    )
-    .expect("seal");
-    assert_eq!(
-        open_scoped(&sealed, &key, RecordBinding::new("mem-v", NS, 1)).expect("same version"),
-        "version 1 content"
+    let sealed = seal_scoped("sealed before the bump", &key, stored_row(&before)).expect("seal");
+    assert!(
+        crate::storage::set_lifecycle_state(
+            &conn,
+            &before.id,
+            crate::models::LifecycleState::Active
+        )
+        .expect("lifecycle write")
     );
-    for newer in [2, i64::MAX] {
-        let err = open_scoped(&sealed, &key, RecordBinding::new("mem-v", NS, newer))
-            .expect_err("an older envelope under a newer row version must not open");
-        assert_eq!(refusal(&err), ScopeEnvelopeError::Authentication);
-    }
+    let after = crate::storage::get(&conn, &before.id)
+        .expect("get")
+        .expect("present");
+    assert!(
+        after.version > before.version,
+        "the writer bumped the version"
+    );
+    assert_eq!(
+        open_scoped(&sealed, &key, stored_row(&after))
+            .expect("a non-content write must not make the row unreadable"),
+        "sealed before the bump"
+    );
+}
+
+/// R2-amended: without the row version in the AAD, a foreign row's envelope
+/// re-presented under this row's memory id is still refused (same key, same
+/// namespace, same stored version).
+#[test]
+fn scope_envelope_refuses_foreign_row_under_this_memory_id_8278() {
+    let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("db");
+    let this = insert_row(&conn, "this row 8278");
+    let foreign = insert_row(&conn, "foreign row 8278");
+    assert_eq!(this.version, foreign.version);
+    let key = test_key(NS, 1);
+    let foreign_sealed =
+        seal_scoped("foreign content", &key, stored_row(&foreign)).expect("seal foreign");
+    let err = open_scoped(&foreign_sealed, &key, stored_row(&this))
+        .expect_err("a foreign row's envelope must not open under this memory id");
+    assert_eq!(refusal(&err), ScopeEnvelopeError::Authentication);
 }
 
 const KAT_NS: &str = "test/kat-8278";
 const KAT_MEMORY_ID: &str = "mem-kat";
 const KAT_EPOCH: u32 = 3;
-const KAT_ROW_VERSION: i64 = 7;
 const KAT_CONTENT: &str = "known answer #8278";
 /// Expected values, computed independently of this crate (Python
 /// `cryptography`: HKDF-SHA256 and ChaCha20-Poly1305) from the same inputs.
-const KAT_WRAP_AAD: &str = "01054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d6b61740000000d746573742f6b61742d383237380000000000000007";
-const KAT_CONTENT_AAD: &str = "02054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d6b61740000000d746573742f6b61742d383237380000000000000007";
+const KAT_WRAP_AAD: &str = "01054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d6b61740000000d746573742f6b61742d38323738";
+const KAT_CONTENT_AAD: &str = "02054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d6b61740000000d746573742f6b61742d38323738";
 const KAT_OKM: &str = "4646030666175724ba4a7341744114dc6544487cf9663060a7c7994b2023d413";
-const KAT_ENVELOPE: &str = "054c47463e6b7ed21881e2861ff46b04b600000003e0cb9169fff94df3a7d30c3f8ef1f53cad28efb547f47f4211997cf553b646cc498d4dac5e94d2d1133c16fd19402f9c614c349f6a8bdc13497d2d258ae7f25040e73881ee6cbd91d5e55a103ffce1c4627aa7919b7ae3550813d939d3080695a77d03335b5dcbc6a0fd901e2e17657a722f0fa7642526d9fc9f";
+const KAT_ENVELOPE: &str = "054c47463e6b7ed21881e2861ff46b04b600000003e0cb9169fff94df3a7d30c3f8ef1f53cad28efb547f47f4211997cf553b646cc498d4dac5e94d2d1133c16fd19402f9c614c349f6a8bdc13497d2d2545377d8aee8d360bbd58986b8f87b8083ffce1c4627aa7919b7ae3550813d939d3080695a77d03335b5dcbc6a0fd9f5adbaf43301ae3a53c0f438d153027";
 
 /// A deterministic KAT input: the first `N` bytes of SHA-256 of a label.
 fn kat_draw<const N: usize>(name: &str) -> [u8; N] {
@@ -122,7 +174,7 @@ fn scope_envelope_known_answer_vector_8278() {
         inner_nonce: kat_draw("inner-nonce"),
         dek: kat_draw("dek"),
     };
-    let binding = RecordBinding::new(KAT_MEMORY_ID, KAT_NS, KAT_ROW_VERSION);
+    let binding = RecordBinding::new(KAT_MEMORY_ID, KAT_NS);
 
     let wrap_aad = binding_aad(AAD_ROLE_DEK_WRAP, key_ref, binding).expect("wrap aad");
     let content_aad = binding_aad(AAD_ROLE_CONTENT, key_ref, binding).expect("content aad");

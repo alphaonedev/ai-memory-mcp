@@ -10,9 +10,13 @@
 //! the exact line of entry `n - 1`, its `seq` is dense from 1 and its
 //! `previous_epoch` must equal the namespace's current epoch at the head. A
 //! load replays the chain and cross-checks it with the records (epoch count,
-//! each epoch's recipient fingerprints, each epoch's escrow fingerprint), so
-//! a record edited outside the store, a removed or reordered entry, or a
-//! mutation that never reached the log fails closed.
+//! each epoch's key id and key check, recipient fingerprints and escrow
+//! fingerprint), so a record edited outside the store, a whole record
+//! substituted from public inputs (a fresh key wrapped to the same readers
+//! and escrow key), a removed or reordered entry, or a mutation that never
+//! reached the log fails closed. An entry naming a different key id or key
+//! check for an epoch the log already holds is refused (ruling R13: the E2
+//! signature over the entry must cover the key, not only public inputs).
 //!
 //! The ledger head ([`LedgerHead`]) is the number of entries. It is the
 //! version the cache freshness check compares (R11): a lookup that must be at
@@ -70,6 +74,10 @@ pub struct AuditEntry {
     pub previous_epoch: u32,
     /// The namespace's current epoch after the mutation.
     pub new_epoch: u32,
+    /// Hex key id of `epoch` (R13).
+    pub key_id: String,
+    /// Hex `key_check` of `epoch` (R13): binds the entry to the key itself.
+    pub key_check: String,
     /// KEK fingerprint added or removed (recipient changes only).
     pub subject: Option<String>,
     /// Sorted KEK fingerprints of `epoch` after the mutation.
@@ -156,6 +164,8 @@ impl NamespaceLedger {
             epoch: change.record.epoch,
             previous_epoch: self.chain_epoch,
             new_epoch,
+            key_id: change.record.key_id.clone(),
+            key_check: change.record.key_check.clone(),
             subject: change.subject.clone(),
             recipients: recipient_fingerprints(change.record),
             recovery_fingerprint: change.record.escrow.recovery_fingerprint.clone(),
@@ -205,6 +215,17 @@ impl NamespaceLedger {
             && first.namespace != entry.namespace
         {
             return Err(Self::mismatch(ns, "entry namespace differs from the log"));
+        }
+        if let Some(earlier) = self.audit.iter().find(|e| e.epoch == entry.epoch)
+            && (earlier.key_id != entry.key_id || earlier.key_check != entry.key_check)
+        {
+            return Err(Self::mismatch(
+                ns,
+                format!(
+                    "entry {} names another key for epoch {} than entry {}",
+                    entry.seq, entry.epoch, earlier.seq
+                ),
+            ));
         }
         let next = self.chain_epoch.checked_add(1);
         let transition_ok = match entry.action {
@@ -293,6 +314,15 @@ impl NamespaceLedger {
                     namespace,
                     format!(
                         "epoch {} readers differ from its last audit entry {}",
+                        record.epoch, last.seq
+                    ),
+                ));
+            }
+            if last.key_id != record.key_id || last.key_check != record.key_check {
+                return Err(Self::mismatch(
+                    namespace,
+                    format!(
+                        "epoch {} key differs from its last audit entry {}",
                         record.epoch, last.seq
                     ),
                 ));

@@ -52,7 +52,7 @@ fn store_refusal(err: &anyhow::Error) -> ScopeKeyStoreError {
 }
 
 fn row<'a>(memory_id: &'a str, namespace: &'a str) -> RecordBinding<'a> {
-    RecordBinding::new(memory_id, namespace, 1)
+    RecordBinding::new(memory_id, namespace)
 }
 
 const NS: &str = "test/e2e-store-8278";
@@ -657,7 +657,22 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
         );
     };
 
-    // A record whose key id was rewritten no longer matches an envelope's key.
+    // An envelope naming another key id for an epoch the ledger holds.
+    let foreign = ScopeKeyRef {
+        key_id: ScopeKeyId::random(),
+        epoch: record.epoch,
+    };
+    let err = store
+        .load_by_key_id(NS, &foreign)
+        .expect_err("foreign key id at a held epoch");
+    assert!(matches!(
+        store_refusal(&err),
+        ScopeKeyStoreError::KeyIdMismatch { .. }
+    ));
+
+    // A record whose key id was rewritten disagrees with the key id its
+    // audit entry binds (R13), so the ledger refuses it at load, before any
+    // envelope key compare.
     let mut forged = record.clone();
     forged.key_id = ScopeKeyId::random().to_hex();
     store.write_record(&forged).expect("write forged");
@@ -667,7 +682,7 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
         .expect_err("divergent key id");
     assert!(matches!(
         store_refusal(&err),
-        ScopeKeyStoreError::KeyIdMismatch { .. }
+        ScopeKeyStoreError::AuditChainMismatch { .. }
     ));
     restore();
 
@@ -802,4 +817,133 @@ fn open_content_bound_unknown_key_is_typed_8278() {
         store_refusal(&err),
         ScopeKeyStoreError::UnknownKey { .. }
     ));
+}
+
+/// R13 (security r2 M2): a whole-record substitute built only from public
+/// inputs (the readers' and the recovery key's public halves, the public key
+/// id) must not load: the audit entry binds the key id and the key check.
+#[test]
+fn scope_key_audit_refuses_whole_record_substitution_8278() {
+    let dir = sandbox();
+    let recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    let node = test_node("node-a");
+    let record = minted(&store, &[&node]);
+    let readers = [ReaderKek::from_keypair(&node)];
+    let recovery_public = PublicKey::from(&recovery);
+    let fresh_ref = ScopeKeyRef {
+        key_id: ScopeKeyId::random(),
+        epoch: record.epoch,
+    };
+    // Case 1: a fresh key id; case 2: the record's own (public) key id.
+    for key_ref in [fresh_ref, record.key_ref().expect("ref")] {
+        let forged_key = ScopeKey::generate(NS, key_ref);
+        let substitute = build_record(
+            &forged_key,
+            &readers,
+            &recovery_public,
+            record.created_at.clone(),
+        )
+        .expect("substitute from public inputs");
+        assert_ne!(substitute.key_check, record.key_check);
+        store.write_record(&substitute).expect("write substitute");
+        store.refresh_from_ledger().expect("refresh");
+        let err = store
+            .load_current(NS)
+            .expect_err("a substituted key must not load");
+        assert!(matches!(
+            store_refusal(&err),
+            ScopeKeyStoreError::AuditChainMismatch { .. }
+        ));
+        store.write_record(&record).expect("restore");
+        store.refresh_from_ledger().expect("refresh");
+        assert_eq!(
+            store.load_current(NS).expect("healed"),
+            Some(record.clone())
+        );
+    }
+}
+
+/// R14 (security r2 L1): an edit to a middle audit line breaks the hash
+/// chain at the next line and fails closed with the typed chain error.
+#[test]
+fn scope_key_audit_refuses_an_edited_middle_line_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    let node = test_node("node-a");
+    let second = test_node("node-b");
+    let record = minted(&store, &[&node]);
+    let key = record.unwrap_for(&node).expect("unwrap");
+    store
+        .add_recipient(&key, &ReaderKek::from_keypair(&second))
+        .expect("add");
+    store
+        .remove_recipient(NS, 1, &kek_fp(&second))
+        .expect("remove");
+    assert_eq!(store.ledger_head(NS).expect("head"), LedgerHead(3));
+    let path = store.audit_path(NS);
+    let text = std::fs::read_to_string(&path).expect("read audit");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut middle: serde_json::Value = serde_json::from_str(&lines[1]).expect("middle line");
+    middle["at"] = serde_json::Value::String("2001-01-01T00:00:00+00:00".to_string());
+    lines[1] = serde_json::to_string(&middle).expect("edited line");
+    let edited = format!("{}\n", lines.join("\n"));
+    crate::identity::keypair::write_with_mode(&path, edited.as_bytes(), 0o600)
+        .expect("write edited audit");
+    store.refresh_from_ledger().expect("refresh");
+    assert!(matches!(
+        store_refusal(&store.history(NS).expect_err("edited middle line")),
+        ScopeKeyStoreError::AuditChainMismatch { .. }
+    ));
+    assert!(
+        store.namespace_is_e2e(NS),
+        "a broken ledger stays end-to-end"
+    );
+}
+
+/// R14 (security r2 INFO): the stanza plaintext is id-bound. A stanza for
+/// another key id, epoch or same-length namespace does not parse, even when
+/// its length is right (defence in depth beside the key check).
+#[test]
+fn scope_key_stanza_plaintext_prefix_is_bound_8278() {
+    let key_ref = ScopeKeyRef {
+        key_id: ScopeKeyId::random(),
+        epoch: 4,
+    };
+    let key = ScopeKey::generate(NS, key_ref);
+    let plaintext = stanza_plaintext(&key).expect("stanza plaintext");
+    assert!(parse_stanza_plaintext(&plaintext, key_ref, NS).is_some());
+    let other_id = ScopeKeyRef {
+        key_id: ScopeKeyId::random(),
+        epoch: 4,
+    };
+    let other_epoch = ScopeKeyRef {
+        key_id: key_ref.key_id,
+        epoch: 5,
+    };
+    let same_len_ns = "test/e2e-store-9999";
+    assert_eq!(same_len_ns.len(), NS.len());
+    assert!(parse_stanza_plaintext(&plaintext, other_id, NS).is_none());
+    assert!(parse_stanza_plaintext(&plaintext, other_epoch, NS).is_none());
+    assert!(parse_stanza_plaintext(&plaintext, key_ref, same_len_ns).is_none());
+}
+
+/// R17 (code r2 C2): a store opened before another writer minted epoch 1 in
+/// the same key directory answers the marker from the cold store on a cache
+/// miss, without an explicit refresh.
+#[test]
+fn scope_key_namespace_marker_refreshes_on_cache_miss_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = open_store(dir.path());
+    assert!(!early.namespace_is_e2e(NS), "no ledger yet");
+    let writer = open_store(dir.path());
+    let node = test_node("node-a");
+    minted(&writer, &[&node]);
+    assert!(
+        early.namespace_is_e2e(NS),
+        "a store opened before another writer minted must answer end-to-end"
+    );
+    assert!(!early.namespace_is_e2e("test/plain-8278"));
 }

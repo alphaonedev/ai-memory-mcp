@@ -34,16 +34,16 @@
 //!   random wrap nonces never share a key across records.
 //! * Both AEAD operations authenticate the same binding string
 //!   `version || key_id || epoch || len32(memory_id) || memory_id ||
-//!   len32(namespace) || namespace || row_version`, prefixed by a one-byte
-//!   role (DEK wrap or content). `row_version` is the row's optimistic
-//!   concurrency counter (`Memory::version`, i64 big-endian). Swapping
-//!   ciphertext between rows, renaming the namespace, editing the key id /
-//!   epoch, or presenting an older envelope of the same row under a newer row
-//!   version fails authentication.
-//! * Every version-bumping write of a `0x05` row therefore re-seals it (the
-//!   E2 writer path). The binding stops an old envelope being replayed under
-//!   the current version; refusing a whole row rolled back to an older
-//!   version needs the receiver's monotonic version compare (E2).
+//!   len32(namespace) || namespace`, prefixed by a one-byte role (DEK wrap
+//!   or content). Swapping ciphertext between rows, renaming the namespace
+//!   or editing the key id / epoch fails authentication.
+//! * The row version (`Memory::version`) is NOT bound (ruling R2-amended):
+//!   it changes on writes that never touch content and never re-seal
+//!   (lifecycle, quarantine, reown, reclassify) and on the federation merge
+//!   (`MAX` / `GREATEST` of the two versions), so binding it would make the
+//!   row unreadable after any of them. Replay of an older envelope of the
+//!   same row is detected by E2 record signing, which binds content and
+//!   version together.
 //! * The symmetric key gives confidentiality and row binding, not writer
 //!   authenticity: any reader of the namespace can produce a valid envelope.
 //!   Writer authenticity is record signing (E2), design section 2.
@@ -229,19 +229,15 @@ pub struct RecordBinding<'a> {
     pub memory_id: &'a str,
     /// The memory row namespace.
     pub namespace: &'a str,
-    /// The row version the envelope was sealed at (`Memory::version`, the
-    /// optimistic-concurrency counter every mutation bumps).
-    pub row_version: i64,
 }
 
 impl<'a> RecordBinding<'a> {
-    /// The binding of row `memory_id` in `namespace` at `row_version`.
+    /// The binding of row `memory_id` in `namespace`.
     #[must_use]
-    pub fn new(memory_id: &'a str, namespace: &'a str, row_version: i64) -> Self {
+    pub fn new(memory_id: &'a str, namespace: &'a str) -> Self {
         Self {
             memory_id,
             namespace,
-            row_version,
         }
     }
 }
@@ -422,18 +418,10 @@ fn push_len_prefixed(out: &mut Vec<u8>, field: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Length of the big-endian row-version field of the binding.
-const ROW_VERSION_LEN: usize = 8;
-
 /// The AAD of one AEAD operation: role byte, then the binding string.
 fn binding_aad(role: u8, key_ref: ScopeKeyRef, binding: RecordBinding<'_>) -> Result<Vec<u8>> {
     let mut aad = Vec::with_capacity(
-        2 + SCOPE_KEY_ID_LEN
-            + EPOCH_LEN
-            + 8
-            + binding.memory_id.len()
-            + binding.namespace.len()
-            + ROW_VERSION_LEN,
+        2 + SCOPE_KEY_ID_LEN + EPOCH_LEN + 8 + binding.memory_id.len() + binding.namespace.len(),
     );
     aad.push(role);
     aad.push(SCOPE_ENVELOPE_VERSION);
@@ -441,7 +429,6 @@ fn binding_aad(role: u8, key_ref: ScopeKeyRef, binding: RecordBinding<'_>) -> Re
     aad.extend_from_slice(&key_ref.epoch.to_be_bytes());
     push_len_prefixed(&mut aad, binding.memory_id.as_bytes())?;
     push_len_prefixed(&mut aad, binding.namespace.as_bytes())?;
-    aad.extend_from_slice(&binding.row_version.to_be_bytes());
     Ok(aad)
 }
 
@@ -619,6 +606,12 @@ pub fn open_content_scoped_in(
 
 /// [`open_content_scoped_in`] for `agent_id`'s on-disk KEK and the file store
 /// under the resolved key directory. A read never mints anything.
+///
+/// Test-only in E1 (code review r2 I-d): it and its one caller
+/// [`super::open_content_bound`] have no production callers in #8278 slice
+/// E1. Each call opens a fresh [`store::FileScopeKeyStore`] (a full scan of
+/// the scope-key directory), so the E2 row mappers call
+/// [`open_content_scoped_in`] with the process's long-lived store instead.
 ///
 /// # Errors
 /// The agent's key is absent (typed [`super::KeyAbsent`]) or
