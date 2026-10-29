@@ -271,6 +271,13 @@ sed_i "s/const CURRENT_SCHEMA_VERSION: i32 = [0-9]*/const CURRENT_SCHEMA_VERSION
 SH
   }
   B=$(git rev-parse HEAD)
+  # ceilings derive from the MEASURED size of migrations.rs (#8301): projected P = N + 94 (queue pads 69 + 25)
+  _N=$(git show "$B:src/storage/migrations.rs" | wc -l | tr -d ' ')
+  _grp() { printf '%s' "$1" | sed -E ':a;s/([0-9])([0-9]{3})($|_)/\1_\2\3/;ta'; }   # 7471 -> 7_471 (gate digit-group format)
+  CPASS=$(_grp $((_N + 94 + 16))); CRED=$(_grp $((_N + 94 - 55)))   # P+16 PASSES, P-55 WOULD RED
+  # a fixture value equal to the base's own ceiling would be a no-op commit: nudge it one line
+  _BC=$(git show "$B:tests/qual_10_module_size_ceiling.rs" | grep -oE '"src/storage/migrations.rs", *[0-9_]+' | grep -oE '[0-9_]+$')
+  [ "$CRED" = "$_BC" ] && CRED=$(_grp $((_N + 94 - 56))); [ "$CPASS" = "$_BC" ] && CPASS=$(_grp $((_N + 94 + 17)))
   # (1) two branches at the SAME new version with DIFFERENT bodies -> CRITICAL
   A1=$(bump_schema "$V1" sync_peer_contact | mk a1 "$B"); A2=$(bump_schema "$V1" tombstone_store | mk a2 "$B")
   out=$(run_check "$B" "$A1" "$A2"); rc=$?
@@ -281,13 +288,13 @@ SH
   out=$(run_check "$B" "$A1" "$A3"); rc=$?
   if [ $rc -ne 0 ]; then echo "self-test FAIL (1b): different versions flagged: $out"; ok=0; fi
   # (2) ceiling: identical pair on one file + a third different value -> FAIL naming the pair and both verdicts
-  C1=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_440)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 69); do echo "// pad $i" >> src/storage/migrations.rs; done\n' | mk c1 "$B")
-  C2=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_440)/" tests/qual_10_module_size_ceiling.rs\n' | mk c2 "$B")
-  C3=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_400)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 25); do echo "// pad $i" >> src/storage/migrations.rs; done\n' | mk c3 "$B")
+  C1=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 69); do echo "// pad $i" >> src/storage/migrations.rs; done\n' "$CRED" | mk c1 "$B")
+  C2=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs\n' "$CRED" | mk c2 "$B")
+  C3=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 25); do echo "// pad $i" >> src/storage/migrations.rs; done\n' "$CPASS" | mk c3 "$B")
   out=$(run_check "$B" "$C1" "$C2" "$C3"); rc=$?
-  if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q 'IDENTICAL PAIR' || ! printf '%s' "$out" | grep -q 'PASSES'; then echo "self-test FAIL (2): ceiling triple not reported with verdicts: $out"; ok=0; fi
+  if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q 'IDENTICAL PAIR' || ! printf '%s' "$out" | grep -q "$CPASS PASSES" || ! printf '%s' "$out" | grep -q "$CRED WOULD RED"; then echo "self-test FAIL (2): ceiling triple not reported with verdicts: $out"; ok=0; fi
   # (2b) negative control: two branches bumping DIFFERENT ceiling entries -> pass
-  C4=$(printf 'sed_i "s/(\\"src\\/llm.rs\\", *[0-9_]*)/(\\"src\\/llm.rs\\", 7_000)/" tests/qual_10_module_size_ceiling.rs\n' | mk c4 "$B")
+  C4=$(printf 'sed_i "s/(\\"src\\/llm.rs\\", *[0-9_]*)/(\\"src\\/llm.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs\n' "$CRED" | mk c4 "$B")
   out=$(run_check "$B" "$C2" "$C4"); rc=$?
   if [ $rc -ne 0 ]; then echo "self-test FAIL (2b): unrelated ceiling entries flagged: $out"; ok=0; fi
   # (3) duplicate branches per issue with identical src+tests surface -> FAIL; needs NAMED refs
