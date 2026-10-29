@@ -646,8 +646,8 @@ pub(super) async fn sync_push_via_store(
             &mut to_insert,
         );
         // v1.0.0 R19/A3 (#1948) — route-IN quarantine of a provenance-less
-        // (non-`agent_attested`) relayed write (postgres twin). Opt-in +
-        // permissive default; sets lifecycle_state=Quarantined so the
+        // (non-`agent_attested`) relayed write (postgres twin). Shape-scoped
+        // knob (#2967): off on singleton/team unless set; sets lifecycle_state=Quarantined so the
         // downstream merge persists it.
         crate::handlers::federation_receive::maybe_quarantine_unattributed(
             &mut to_insert,
