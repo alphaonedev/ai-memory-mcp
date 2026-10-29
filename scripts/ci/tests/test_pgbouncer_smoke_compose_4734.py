@@ -32,6 +32,13 @@ refusal sits above the PW assignment and the first docker line; the run-name
 sanitiser arm and a 64-character bound (exit 65) are pinned in both scripts; the
 password guard also refuses whole-environment dumps and any redirect outside an
 allowlist.
+r9: the cleanup() body of each script equals its exact statement list (any other
+`rc=$?`, a loop or a new statement is refused); shell tracing (`set -x`/`-v`,
+`-o xtrace`/`verbose`), bare set/export, declare/typeset/env/printenv as a command
+word (quoted or not, also as a docker exec command), `docker inspect`,
+`docker compose ... config`, `<>` redirects, any `environ`/`ENVIRON`/`getenv` word are
+refused; the redirect-target variables are pinned to their single assignment and the
+python3/awk call sites to an exact-line allowlist.
 """
 import fnmatch
 import pathlib
@@ -73,9 +80,68 @@ RUN_LENGTH_BOUND = [
 ]
 ENV_DUMPERS = re.compile(
     r"(?:^|[;&|(`]|\$\(|\b(?:then|do|else|command|exec|xargs|sudo|nohup|nice|time)\s|/)\s*env\b(?!-)|--env-file|\bprintenv\b|\bexport\s+-p\b|\bdeclare\s+-[a-zA-Z]*[xp]\b|\btypeset\s+-[a-zA-Z]*[xp]\b"
-    r"|/proc/(?:self|\$\$|\d+)/environ|\bcompgen\s+-[a-zA-Z]*[ev]\b|\bset\s*$|\bexport\s*$|\btee\b"
+    r"|/proc/(?:self|thread-self|\$\$|\$\{?BASHPID\}?|\d+)/environ|\bcompgen\s+-[a-zA-Z]*[ev]\b|\bset\s*$|\bexport\s*$|\btee\b"
 )
-REDIRECT = re.compile(r"(?<![-<=>])(?:\d?>>?|&>)(?!&\d)\s*(\S+)")
+REDIRECT = re.compile(r"(?<![-<=>])(?:\d?(?:>>?|<>)|&>)(?!&\d)\s*(\S+)")
+CMD_START = r"(?:^|[;&|(`{]|\$\(|\b(?:then|do|else|exec|command|xargs|sudo|nohup|nice|time)\s|/)\s*[\"']?"
+SHELL_TRACE = re.compile(
+    r"(?<![\w-])set\s+(?:-\S*\s+)*?(?:-[a-zA-Z]*[xv][a-zA-Z]*(?![\w-])|-[a-zA-Z]*o\s+[\"']?(?:xtrace|verbose))"
+)
+BARE_BUILTIN = re.compile(CMD_START + r"(?:set|export)[\"']?(?=\s*(?:$|[;&|)<>]))")
+DUMP_COMMAND = re.compile(CMD_START + r"(?:env|declare|typeset|printenv)[\"']?(?![\w-])")
+EXEC_DUMP = re.compile(r"\bdocker\b.*\bexec\b.*\s[\"']?(?:env|printenv|set|export|declare|typeset)[\"']?(?:\s|$)")
+DOCKER_DISCLOSE = re.compile(r"\bdocker\b.*\binspect\b|\bdocker\b.*\bcompose\b.*\bconfig\b|\bdocker-compose\b.*\bconfig\b")
+ENVIRON_WORD = re.compile(r"\benviron\b|\bENVIRON\b|\bgetenv\b")
+INTERPRETER = re.compile(r"\b(?:python[0-9.]*|awk|gawk|mawk|nawk|perl|ruby|node|php|lua)\b")
+PW_GEN = """PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}\""""
+INTERPRETER_SITES = {
+    SMOKE: [
+        PW_GEN,
+        """pool_mode="$(printf '%s\\n' "$cfg" | awk -F'|' '$1 == "pool_mode" { print $2 }')\"""",
+        """auth_type="$(printf '%s\\n' "$cfg" | awk -F'|' '$1 == "auth_type" { print $2 }')\"""",
+    ],
+    ENVELOPE: [
+        PW_GEN,
+        "need python3",
+        "now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }",
+        "cur_id=$(python3 -c 'import json,sys",
+        """read -r p50 p95 p99 shed reqs < <(cat "$step_out"/w*.txt 2>/dev/null | python3 -c '""",
+        """over_p95=$(python3 -c "print(1 if $p95 > $P95_BUDGET_MS else 0)")""",
+        """over_shed=$(python3 -c "print(1 if $shed > $SHED_RATE_KNEE else 0)")""",
+    ],
+}
+TARGET_ASSIGNMENTS = {
+    SMOKE: {"USERLIST": ['USERLIST=".userlist.generated.$RUN.txt"']},
+    ENVELOPE: {
+        "USERLIST": ['USERLIST="../pgbouncer/.userlist.generated.$RUN.txt"'],
+        "RESULTS_DIR": ['RESULTS_DIR="${RESULTS_DIR:-./.local-runs/envelope-$$}"'],
+        "STORE_URL_FILE": ['STORE_URL_FILE="$RESULTS_DIR/.store-url"'],
+        "out": ["""local wid="$1" out="$2" deadline="$3" n=0 prev_id="" bodyf="${out}.body\""""],
+    },
+}
+CLEANUP_BODY = {
+    SMOKE: [
+        "rc=$?",
+        """docker compose -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }""",
+        """if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then""",
+        """echo "FATAL: compose project $PROJECT still running after teardown" >&2""",
+        "rc=1",
+        "fi",
+        """rm -f "$USERLIST\"""",
+        """exit "$rc\"""",
+    ],
+    ENVELOPE: [
+        "rc=$?",
+        """[ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true""",
+        """docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }""",
+        """if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then""",
+        """echo "FATAL: compose project $PROJECT still running after teardown" >&2""",
+        "rc=1",
+        "fi",
+        """rm -f "$USERLIST" "${STORE_URL_FILE:-}\"""",
+        """exit "$rc\"""",
+    ],
+}
 REDIRECT_TARGETS = {
     "Q$USERLIST",
     "Q$STORE_URL_FILE",
@@ -440,6 +506,9 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             start = code.index("cleanup() {")
             end = code.index("}", start)
             body = code[start + 1 : end]
+            # r9 S6: `rc=$?` anywhere but the first line is itself a reset, and a
+            # loop can overwrite rc; the body is the exact statement list.
+            self.assertEqual(body, CLEANUP_BODY[path], "%s: cleanup() body differs from the pinned list" % path.name)
             self.assertEqual(body[0], "rc=$?", "%s: rc=$? must be the first statement" % path.name)
             self.assertEqual(body[-1], 'exit "$rc"', "%s: cleanup must exit with rc" % path.name)
             self.assertLess(end, code.index("trap cleanup EXIT"), path.name)
@@ -602,6 +671,29 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 heredoc = here.group(1)
         return targets
 
+    def _assert_exec_surface(self, path):
+        """r9 S7: tracing, bare builtins, dump commands, container metadata,
+        interpreter call sites and the redirect-target variables are pinned."""
+        name = path.name
+        lines = _norm_lines(path)
+        for ln in lines:
+            self.assertNotRegex(ln, SHELL_TRACE, "%s: shell tracing prints expanded secrets: %s" % (name, ln))
+            self.assertNotRegex(ln, BARE_BUILTIN, "%s: bare set/export lists the environment: %s" % (name, ln))
+            self.assertNotRegex(ln, DUMP_COMMAND, "%s: env/declare/typeset/printenv as a command: %s" % (name, ln))
+            self.assertNotRegex(ln, EXEC_DUMP, "%s: docker exec of an environment dumper: %s" % (name, ln))
+            self.assertNotRegex(ln, DOCKER_DISCLOSE, "%s: docker inspect/compose config discloses env: %s" % (name, ln))
+            self.assertNotRegex(ln, ENVIRON_WORD, "%s: environ access: %s" % (name, ln))
+        sites = [ln for ln in lines if INTERPRETER.search(ln)]
+        self.assertEqual(sites, INTERPRETER_SITES[path], "%s: interpreter call sites differ from the allowlist" % name)
+        for var in ("USERLIST", "STORE_URL_FILE", "RESULTS_DIR", "out"):
+            writers = [
+                ln
+                for ln in lines
+                if re.search(r"(?<![\w$])%s\+?=" % var, ln)
+                or re.search(r"\b(?:for|read|mapfile|printf -v|unset|local|declare|typeset|readonly|let)\b[^=]*\b%s\b" % var, ln)
+            ]
+            self.assertEqual(writers, TARGET_ASSIGNMENTS[path].get(var, []), "%s: %s assigned outside its pinned line" % (name, var))
+
     def test_no_environment_dump_and_no_stray_redirect(self):
         # r8 S4: the name allowlist cannot see a command that copies the password
         # without naming it. No whole-environment dumper, and every `>` redirect
@@ -610,6 +702,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         for path in SCRIPTS:
             for ln in _norm_lines(path):
                 self.assertNotRegex(ln, ENV_DUMPERS, "%s: command can dump the whole environment: %s" % (path.name, ln))
+            self._assert_exec_surface(path)
             targets = self._redirect_targets(path)
             self.assertGreaterEqual(len(targets), 2, "%s: redirect scan found nothing" % path.name)
             for target in targets:
