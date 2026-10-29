@@ -396,8 +396,9 @@ This covers the HTTP API key only. Rotation of end-to-end content keys
 (the `0x05` scope keys) is a separate mechanism: rewrap by default or a
 full re-encrypt, on one resumable cursor, verify-then-swap, old key kept
 until completion — see the rotation modes in
-[`docs/design/E2E_FEDERATION_ENCRYPTION.md`](design/E2E_FEDERATION_ENCRYPTION.md)
-(status: landing in #8278).
+[`docs/design/E2E_FEDERATION_ENCRYPTION.md`](design/E2E_FEDERATION_ENCRYPTION.md).
+Scope-key rotation is built by the Codex lane in #8278 slice E2; E1 has no
+rotation path (a reader removal mints a new epoch, nothing is re-sealed).
 
 ### mTLS (Layer 1 + Layer 2)
 
@@ -530,20 +531,34 @@ envelope seals content under a per-namespace **scope key** shared by the
 namespace's reader set (3-agent vote (6def5ab6), decisions D1/D2): each row
 has its own random DEK, wrapped under a per-record key derived from the
 scope key; both AEAD operations bind the row's `memory_id`, `namespace`,
-the scope key id and the epoch, so a ciphertext moved to another row or
-namespace, or an edited key id or epoch, fails authentication. Opening a
+row version, the scope key id and the epoch, so a ciphertext moved to
+another row or namespace, an older envelope under a newer row version, or
+an edited key id or epoch, fails authentication. The scope key is
+symmetric: any reader can write an envelope that opens, so the envelope
+gives confidentiality and row binding, not writer authenticity; that is
+record signing in #8278 slice E2. Opening a
 `0x05` row needs that row binding: `open_content` without it refuses with
 the typed `scope_envelope_refused` class (binding required), never a guess.
 Each scope key is wrapped per reader node under its X25519 KEK, and
 escrowed under the deployment recovery key at mint (mint refuses without
 an enrolled recovery key). Records live in `<key_dir>/scope-keys/`, mode
-`0600`, holding only wrapped keys. Title, tags, metadata and namespace
-stay plaintext; embeddings of `0x05` rows are withheld from non-readers.
+`0600`, holding only wrapped keys, read without following links and
+checked on the open descriptor. Every mint, reader add, reader removal and
+supersede appends one entry to a hash-chained, append-only audit log next
+to the records (who, what, previous and new epoch, time, recovery
+fingerprint); a load that finds the log and the records disagreeing
+refuses the namespace. A namespace is end-to-end exactly when its ledger
+holds an epoch. Title, tags, metadata and namespace stay plaintext.
 Crypto-erase (`0x04`) applies to `0x05` rows exactly as to `0x03`: the
 DEK exists only in the column, so the marker destroys the record even for
-a scope-key holder. Envelope, store and escrow land in #8278 (E1); the
-federation sync path and the `/keys/scope` key pull follow. Full contract
-and threat model:
+a scope-key holder. This is #8278 slice E1: envelope, store, audit log and
+escrow, with no sync path, so no `0x05` row or vector leaves the node.
+#8278 slice E2 adds the federation sync path, the `/keys/scope` key pull,
+withholding of embeddings of `0x05` rows from non-readers, refusal of a
+non-`0x05` representation for an end-to-end namespace, and the
+no-placeholder rule at the two open sites that today fall back to the raw
+column when `open_content` refuses (`restored_cid_stamp`,
+`archive_restore_inner`). Full contract and threat model:
 [`docs/design/E2E_FEDERATION_ENCRYPTION.md`](design/E2E_FEDERATION_ENCRYPTION.md).
 
 ### File permissions

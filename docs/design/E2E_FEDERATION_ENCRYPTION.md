@@ -1,13 +1,30 @@
 # End-to-end federation encryption (`0x05` scope envelope)
 
-Status: E1 (envelope + scope-key store + escrow) landing in #8278. E2 (sync
-path, capability gate, `/keys/scope`) and the Codex lane (SAL ledger, rotation
-cursor, CLI, doctor, CI guards) build on this contract. Parent issue #8268.
+Status: #8278 slice E1 provides the envelope, the scope-key store with its
+audit log, and escrow. #8278 slice E2 (sync path, capability gate,
+`/keys/scope`, row mappers, embedding withholding) and the Codex lane (SAL
+ledger, rotation cursor, CLI, doctor, CI guards) build on this contract.
+Parent issue #8268.
 
 Decision record: 3-agent vote (6def5ab6), recorded in ai-memory `b5713886`;
 operator directive `b577ee87`. Decisions D1 to D5 below are binding; this
-document fixes the details the vote left to the implementer and lists the open
-questions with a recommended answer each.
+document fixes the details the vote left to the implementer. The review
+rulings of PR #8279 round 2 (conductor god-f2) are recorded as decision lines:
+
+* `decision: D1 stanzas live in the ledger: each scope-key record carries one id-bound stanza per reader KEK plus the escrow stanza; rows carry only the key id and epoch (3-agent vote (6def5ab6))`
+* `decision: D2 the 0x05 inner layer is a new HKDF-salted layout (per-record DEK wrapped under HKDF(wrap_salt, scope key)), not a reuse of the 0x03 layout (3-agent vote (6def5ab6))`
+* `decision: R1 namespace marker = ledger has an epoch; refusal enforcement in E2 (conductor god-f2, amends D2 scope, 3-agent vote (6def5ab6))`
+* `decision: R2 AAD gains row version in E1; writer authenticity via record signing in E2 (conductor god-f2, amends D2 AAD field list, 3-agent vote (6def5ab6))`
+* `decision: R3 audit entries in E1, signed operator-authorised changes at the E2 mTLS gate (conductor god-f2, D3 as voted)`
+* `decision: R4 UnknownKey is pinned through both open funnels (open_content_scoped_in, open_content_bound) by named tests (conductor god-f2)`
+* `decision: R5 no constant-initialised buffer reaches a key, nonce or salt; random inputs are built from CSPRNG draws and test bytes are derived (conductor god-f2)`
+* `decision: R6 the security docs describe E1 as built; embedding withholding and the no-placeholder rule for every open site are E2 (conductor god-f2)`
+* `decision: R7 stanzas live in the ledger, rows are not self-contained, every reader depends on /keys/scope (D3 choice (b)); the D4 partial-result signal is a typed error variant added in E1 (SealedForeign) and surfaced in E2 (conductor god-f2)`
+* `decision: R8 escrow is tested on the real recovery path: the recovery private key alone opens a content row, a moved escrow stanza is refused StanzaBindingMismatch (conductor god-f2)`
+* `decision: R9 the 0x05 layout is pinned by a known-answer vector computed independently of the crate (Appendix A) (conductor god-f2)`
+* `decision: R10 the remaining review findings land in E1: per-field nonce and salt uniqueness, supersede recovery-key compare, no-follow descriptor-checked reads, plaintext zeroized on NotUtf8, non_exhaustive public error enums, Zeroizing stanza secret (conductor god-f2)`
+* `decision: R11 ScopeKeyStore = sync Send+Sync cache contract with write-through and versioned fail-closed freshness, async ledger on MemoryStore in E2 (3-agent vote (6def5ab6), B over A)`
+* `decision: R12 record validation returns the typed ScopeKeyStoreError, not a String error (QUAL-7 ceiling) (conductor god-f2)`
 
 ## 1. Why
 
@@ -33,13 +50,27 @@ Stays plaintext by design (needed for routing, filtering and listing without a
 key): `title`, `tags`, `metadata`, `namespace`, timestamps, ids. Operators must
 not put secrets there; the docs say so (docs/SECURITY.md, Data at rest).
 
-Embeddings are derived from content, so they leak it. A node withholds vectors
-of `0x05` rows from every peer that is not a reader (D4); a reader re-embeds
-locally after it opens the row.
+Embeddings are derived from content, so they leak it. In #8278 slice E2 a
+node withholds vectors of `0x05` rows from every peer that is not a reader
+(D4); a reader re-embeds locally after it opens the row. E1 has no sync path,
+so it sends no vectors anywhere.
 
 Out of the model: a compromised reader node (it holds the key by design), and
 traffic analysis of row sizes (the envelope is length-preserving plus a fixed
 125-byte overhead).
+
+### Integrity
+
+The scope key is symmetric and every reader holds it. It gives
+confidentiality and row binding, not writer authenticity: any reader of a
+namespace can produce an envelope that opens, so any reader can forge a row
+in that namespace (new content under a valid key, id and epoch). The AAD
+binds the row version (section 3), so an older envelope of the same row
+presented under a newer version fails authentication, but a reader writing a
+fresh envelope is not detected by the envelope. Writer authenticity is record
+signing (signed events, Ed25519 over the row, verified against
+`agent_pubkey_history`) in #8278 slice E2. Until then, write authority is the
+existing federation write authorization, not the envelope.
 
 ## 3. Envelope `0x05` byte layout
 
@@ -75,6 +106,7 @@ Keys:
 role(1) || 0x05 || key_id(16) || epoch_be(4)
         || len32_be(memory_id) || memory_id
         || len32_be(namespace) || namespace
+        || row_version_be(8)
 ```
 
 `role` is `0x01` for the DEK wrap and `0x02` for the content, so the two
@@ -83,6 +115,14 @@ prefixes so bytes cannot move between `memory_id` and `namespace`. The
 namespace is NOT stored in the header: the row's own `namespace` column is the
 binding input, so a row moved to another namespace, a ciphertext copied
 between rows, or an edited key id / epoch all fail authentication.
+
+`row_version` is the storage field `Memory::version` (`i64`, the optimistic
+concurrency counter every mutation bumps; default 1), big-endian. An older
+envelope of a row presented under the row's newer version fails
+authentication. Consequences: every version-bumping write of a `0x05` row
+re-seals it (the E2 writer path), and refusing a whole row rolled back to an
+older version (envelope and version together) needs the receiver's monotonic
+version compare, also E2.
 
 ### Opening
 
@@ -144,19 +184,57 @@ zeroizes on drop and is redacted from `Debug`.
 Modelled on `agent_pubkey_history`: append-only per namespace, epochs dense
 from 1, never deleted. Operations: `mint` (idempotent: returns the existing
 current key), `history`, `load_epoch`, `load_current`, `load_by_key_id`,
-`add_recipient`, `remove_recipient`, `supersede`.
+`load_by_key_id_fresh`, `namespace_is_e2e`, `ledger_head`, `audit_log`,
+`refresh_from_ledger`, `add_recipient`, `remove_recipient`, `supersede`.
 
-The file-backed store (E1) keeps records at
-`<key_dir>/scope-keys/<slug>.scope.<epoch>.json` with mode `0600` under the
-same secure-directory checks as the agent keys; `slug` is the first 16 bytes
-of `SHA-256(namespace)` in hex, so namespace text never reaches a file name.
-Mutations hold an exclusive lock on `scope-keys/.scope-keys.lock`; writes
-stage to a sibling file and rename. A record with group/other access, a
-missing epoch, malformed JSON or a stored key id that differs from the one an
-envelope names is refused `RecordCorrupt` / `KeyIdMismatch`.
+`ScopeKeyStore` is a synchronous `Send + Sync` cache contract (R11). Lookups
+are pure memory behind an `RwLock`; no lookup touches the disk or awaits. The
+files are the cold store: loaded once at construction
+(`FileScopeKeyStore::open`), reloaded by `refresh_from_ledger`, and written
+through by every mutator in the same call before it returns, so the mutating
+process never answers from a cache older than its own writes. The cache
+records each namespace's ledger head (its audit entry count).
+`load_by_key_id_fresh` takes the head a peer advertised and refuses with the
+typed `SealedForeign` error while the cache is older, until a refresh catches
+up. A namespace whose files fail verification is cached as that refusal, so
+its lookups fail closed while other namespaces keep working. The async ledger
+methods on `MemoryStore` (load, append, refresh) for SQLite and Postgres are
+#8278 slice E2 with the Codex SAL slice; they fill the same cache.
 
-The SAL DB ledger (SQLite and Postgres) implements the same trait; that is the
-Codex lane.
+The file-backed store keeps records at
+`<key_dir>/scope-keys/<slug>.scope.<epoch>.json` and the audit log at
+`<key_dir>/scope-keys/<slug>.audit.jsonl`, both mode `0600` under the same
+secure-directory checks as the agent keys; `slug` is the first 16 bytes of
+`SHA-256(namespace)` in hex, so namespace text never reaches a file name.
+Mutations hold an exclusive `flock` on `scope-keys/.scope-keys.lock`, loads
+hold it shared; the lock order is always `flock` first, cache `RwLock`
+second. Record writes stage to a sibling file and rename. Every read checks
+the directory chain, opens the file without following a link
+(`O_NOFOLLOW`), and checks the open descriptor (`fstat`: a regular file,
+owner-only mode) before reading from that same descriptor. A record with
+group/other access, a link in its place, a missing epoch, malformed JSON or
+a stored key id that differs from the one an envelope names is refused
+`RecordCorrupt` / `KeyIdMismatch`.
+
+### Audit log (R3)
+
+Every mutation appends one entry to the namespace's audit log: `mint`,
+`add_recipient`, `remove_recipient`, `supersede`. An entry records who (the
+process agent id), what (the action and the KEK fingerprint added or
+removed), the epoch touched, the previous epoch and the new epoch, the
+sorted reader fingerprints of that epoch after the change, the escrow
+recovery fingerprint, an RFC 3339 timestamp, and the SHA-256 of the previous
+entry's line. The log is append-only and hash-chained: `seq` is dense from 1,
+and an entry whose previous-epoch pointer is not the head's epoch is refused
+`AuditChainMismatch` before anything is written. A load replays the chain and
+cross-checks it with the records (epoch count, each epoch's readers, each
+epoch's escrow fingerprint): a record edited outside the store, a removed or
+reordered entry, or a torn last line refuses the namespace.
+
+Authority in E1 is the process boundary: the owner-only `0700` key-directory
+chain and local writers only. Signed, operator-authorised reader-set changes
+are enforced at the E2 mTLS `/keys/scope` gate (D3); the audit entry format is
+what that gate signs.
 
 ### Escrow
 
@@ -178,9 +256,14 @@ E1; the CLI surface (verb, SSOT pins, doctor) lands with the Codex lane.
 ### Epoch semantics
 
 * Epoch 1 is minted on first write into an E2E namespace.
-* `supersede` writes epoch N+1 FIRST, then closes epoch N's window. A crash in
-  between leaves two open-ended records; the highest epoch is current, so
-  there is never a moment without a current key.
+* `supersede` refuses with `RecoveryKeyChanged` when the enrolled recovery
+  key is not the one the current epoch is escrowed to: the escrow chain never
+  forks silently (re-escrow is the explicit recovery-key rotation, #3717).
+* `supersede` writes epoch N+1 FIRST, then closes epoch N's window, then
+  appends the audit entry. A crash before the entry lands leaves records the
+  log does not account for; the next load refuses the namespace
+  (`AuditChainMismatch` / `RecordCorrupt`) instead of guessing, and the
+  doctor (Codex lane) reports it for repair.
 * New rows always seal under the current epoch. Old rows keep naming their
   epoch and open with that epoch's key until rotation rewrites them.
 * Removing a recipient (`remove_recipient`) stops the ledger handing that key
@@ -201,6 +284,12 @@ E1; the CLI surface (verb, SSOT pins, doctor) lands with the Codex lane.
   never falls back to sending plaintext).
 * The receiver rejects a row with neither `content` nor `envelope`, and a row
   with both.
+* A namespace is end-to-end exactly when its scope-key ledger holds at least
+  one epoch (`ScopeKeyStore::namespace_is_e2e`, R1); a ledger that cannot be
+  read counts as end-to-end (fail closed). For an E2E namespace the sender
+  never emits, and the receiver never accepts, a non-`0x05` representation of
+  a row (plaintext, `0x02`, `0x03`). E1 provides the marker; the refusal is
+  enforced in #8278 slice E2.
 * A receiver that is not a reader stores the row verbatim as **sealed-foreign**
   (section 8) and relays forward it unchanged (D4).
 
@@ -259,6 +348,13 @@ metadata), never embedded, never searched by content, never decrypted, and
 forwarded unchanged. If the node later becomes a reader it opens the row in
 place; nothing is re-fetched.
 
+Rows are not self-contained: the stanzas live in the ledger (D1), so every
+reader depends on its ledger and on `/keys/scope` to obtain a key (D3 choice
+(b)). A node whose ledger is older than the head a peer advertised gets the
+typed `SealedForeign` error from `load_by_key_id_fresh` (R7), never "not a
+reader" and never an empty result. E1 adds the variant; E2 surfaces it as the
+D4 partial-result signal on read and sync paths.
+
 ## 9. Failure semantics (all fail closed)
 
 | Condition | Result |
@@ -271,24 +367,41 @@ place; nothing is re-fetched.
 | stanza or escrow identity mismatch | `StanzaBindingMismatch` / `RecoveryKeyMismatch` |
 | AEAD failure (tamper, wrong row, wrong key) | `Authentication` |
 | no recovery key at mint | `EscrowUnavailable`, nothing written |
-| record file insecure, malformed, gapped | `RecordCorrupt` |
+| record file insecure, malformed, gapped, or a link | `RecordCorrupt` |
+| audit log broken, or records disagree with it | `AuditChainMismatch` |
+| enrolled recovery key differs from the current escrow at supersede | `RecoveryKeyChanged`, nothing written |
+| local ledger older than the head a peer advertised | `SealedForeign` |
 | peer without capability bit | sender refuses the push (E2) |
 
-No path returns plaintext, an empty string or a placeholder for a row it could
-not open.
+In E1 the scope open functions (`open_scoped`, `open_content_scoped_in`,
+`open_content_scoped`, `open_content_bound`) never return plaintext, an empty
+string or a placeholder for a row they could not open: each refusal is one of
+the typed errors above. Two open sites outside the envelope code fall back to
+the raw column when `open_content` refuses
+(`open_content(..).unwrap_or(raw_content)`): `restored_cid_stamp`
+(`src/storage/mod.rs`, SQLite) and `archive_restore_inner`
+(`src/store/postgres/federation_by_id_4447.rs`, Postgres). They hash or
+restore the column bytes, not content shown to a caller, and #8278 slice E2
+changes both to the bound open with a typed refusal, so the no-placeholder
+rule then holds for every open site.
 
-## 10. Open questions (each with the recommended answer)
+## 10. Decisions and remaining questions
 
-1. **Signing records and `/keys/scope` responses.** `0x02` ECIES does not
-   authenticate the sender, so a party able to write a stanza could substitute
-   a key it knows. Recommended: the minting node signs each record (Ed25519,
-   canonical JSON without `recipients`) and `/keys/scope` responses; readers
-   verify against `agent_pubkey_history`. E2 adds the signature field; the
-   record `format` moves to 2.
+1. **Signing records and `/keys/scope` responses.** Decided (R3): `0x02` ECIES
+   does not authenticate the sender, so in E1 a party able to write a stanza
+   is bounded by the process boundary (owner-only key-directory chain, local
+   writers) and every change is in the hash-chained audit log. In E2 the
+   minting node signs each record (Ed25519, canonical JSON without
+   `recipients`) and the audit entries, `/keys/scope` responses are signed,
+   readers verify against `agent_pubkey_history`, and the record `format`
+   moves to 2.
 2. **Who may mint for a namespace.** Recommended: the namespace owner node
    only (the governance owner); other nodes request the key.
-3. **Reader-set authority.** Recommended: the namespace governance standard
-   (E2), not the key file; the ledger mirrors it.
+3. **Reader-set authority.** Decided (R3): E1 authority is the process
+   boundary and the audit log records every reader-set change; operator
+   authorisation and signing of reader-set changes are enforced at the E2
+   mTLS `/keys/scope` gate (D3), with the namespace governance standard as
+   the source and the ledger mirroring it.
 4. **Escrow key rotation.** Recommended: a new recovery key re-escrows every
    current epoch through the rotation cursor; old escrow stanzas stay until it
    completes.
@@ -298,3 +411,42 @@ not open.
 6. **Key-file protection at rest.** Records hold only wrapped keys (stanzas
    need a KEK secret), so mode `0600` plus the directory checks match the
    agent key files. Recommended: no extra passphrase layer.
+
+## Appendix A. Known-answer vector (R9)
+
+Test `scope_envelope_known_answer_vector_8278` (`src/encryption/scope/tests.rs`)
+pins the exact bytes. Each input is the first N bytes of
+`SHA-256("kat-8278/" || label)`; the expected values were computed
+independently of the crate (Python `cryptography`: HKDF-SHA256 and
+ChaCha20-Poly1305).
+
+| Input | Label / value |
+|---|---|
+| scope key (32) | `scope-key` |
+| key id (16) | `key-id` |
+| DEK (32) | `dek` |
+| wrap salt (16) | `salt` |
+| wrap nonce (12) | `wrap-nonce` |
+| inner nonce (12) | `inner-nonce` |
+| epoch | 3 |
+| memory id | `mem-kat` |
+| namespace | `test/kat-8278` |
+| row version | 7 |
+| content | `known answer #8278` |
+
+```text
+wrap AAD    01054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d
+            6b61740000000d746573742f6b61742d383237380000000000000007
+content AAD 02054c47463e6b7ed21881e2861ff46b04b600000003000000076d656d2d
+            6b61740000000d746573742f6b61742d383237380000000000000007
+HKDF okm    4646030666175724ba4a7341744114dc6544487cf9663060a7c7994b2023d413
+envelope    054c47463e6b7ed21881e2861ff46b04b600000003e0cb9169fff94df3a7d3
+            0c3f8ef1f53cad28efb547f47f4211997cf553b646cc498d4dac5e94d2d113
+            3c16fd19402f9c614c349f6a8bdc13497d2d258ae7f25040e73881ee6cbd91
+            d5e55a103ffce1c4627aa7919b7ae3550813d939d3080695a77d03335b5dcb
+            c6a0fd901e2e17657a722f0fa7642526d9fc9f
+```
+
+The two AADs differ only in the role byte. The test also checks that the
+stored wrapped DEK and inner ciphertext do not verify under the other role
+byte, and that sealing under it gives different bytes.
