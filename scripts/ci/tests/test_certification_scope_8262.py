@@ -280,6 +280,9 @@ _CONFUSABLE_PAIRS = (
     (0x03A5, "Y"), (0x03A7, "X"),
 )
 _CONFUSABLES = dict(_CONFUSABLE_PAIRS)
+# The same map as a character class: only the characters it names are rewritten (re.sub touches
+# the matches, where str.translate() looks up every character of the text).
+_CONFUSABLE_RE = re.compile("[" + "".join(chr(code) for code, _ in _CONFUSABLE_PAIRS) + "]")
 _REFUSED_CATEGORIES = ("Cf", "Mn", "Me", "Zl", "Zp")
 _ALLOWED_SPACE = " "
 _ALLOWED_CONTROLS = ("\t", "\n")
@@ -289,7 +292,7 @@ def normalise(text):
     """NFKC plus the confusable map, once."""
     if text.isascii():
         return text
-    return unicodedata.normalize("NFKC", text).translate(_CONFUSABLES)
+    return _CONFUSABLE_RE.sub(lambda m: _CONFUSABLES[ord(m.group())], unicodedata.normalize("NFKC", text))
 
 
 def _refused_raw(ch):
@@ -425,13 +428,19 @@ class _DropMarks(dict):
 
 
 _DROP_MARKS = _DropMarks()
+# Every mark and format character is non-ASCII, so only non-ASCII characters are looked up.
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+
+
+def _drop_mark(m):
+    return "" if _DROP_MARKS[ord(m.group())] is None else m.group()
 
 
 def fold(text):
     """Detection view: entities unescaped, NFKD, every mark and format character dropped, lower."""
     text = html.unescape(text) if "&" in text else text
     if not text.isascii():
-        text = unicodedata.normalize("NFKD", normalise(text)).translate(_DROP_MARKS)
+        text = _NON_ASCII_RE.sub(_drop_mark, unicodedata.normalize("NFKD", normalise(text)))
     return text.lower()
 
 
