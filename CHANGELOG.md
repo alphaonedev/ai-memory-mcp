@@ -88,7 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and backquotes starts a comment to the end of the line; an unterminated quote or backquote in code fails
   closed. Round 17: a `)` that closes `$(`, `$((`, `<(` or `>(`, and a closing backquote, no longer begin a
   word, so a `#` directly after one is text and the rest of that line stays visible to the pin readers; a
-  `)` that closes a plain subshell, an arithmetic command or a case pattern still does.
+  `)` that closes a plain subshell, an arithmetic command or a case pattern still does. Round 18: a `(`
+  opens a subshell or arithmetic-command bracket only in command position; the `(` of an array assignment
+  (`a=(`, `a+=(`), of an extglob pattern and every `(` inside `[[ ]]` is part of a word, so a `#` right
+  after its `)` is text; `case` and `esac` are keywords only in command position, an `esac` or a `)` the
+  pass cannot place fails closed, every problem names the script, line and column, and the bash agreement
+  selftest (`test_shell_comment_prepass_agrees_with_bash`) is the contract for this rule.
+
 ### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
 
 - **`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` now follows the `[deployment]
