@@ -16583,7 +16583,8 @@ async fn pg_hard_delete_in_tx(
 }
 
 /// #3192 — sqlite `tombstone_and_erase` parity for one live row: crypto-erase
-/// the per-record envelope (when 0x03), INSERT the forget tombstone, scrub
+/// the per-record envelope (when 0x03 or 0x05, the SSOT
+/// `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`), INSERT the forget tombstone, scrub
 /// `cid_genesis`, purge DLQ/dedup remanence, emit the signed erasure
 /// attestation. Returns `Some((namespace, version))` when the row existed
 /// (so the caller can emit the G6 leaf); `None` when already gone.
@@ -27653,7 +27654,8 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
 
                 // #1956 [R56] — CRYPTO-ERASE the per-record envelope key for every
-                // encrypted (0x03) row this forget will reap, BEFORE the delete
+                // crypto-erasable row (0x03 per-record or 0x05 scope, the SSOT
+                // `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) this forget will reap, BEFORE the delete
                 // (postgres parity with the sqlite `crypto_erase_record_envelope`).
                 // Overwriting the envelope with the destroy marker destroys the
                 // embedded wrapped DEK so the ciphertext is cryptographically

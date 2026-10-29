@@ -947,3 +947,108 @@ fn scope_key_namespace_marker_refreshes_on_cache_miss_8278() {
     );
     assert!(!early.namespace_is_e2e("test/plain-8278"));
 }
+
+/// Code r3 F2 / security r3 S2: a key directory this process can no longer
+/// traverse answers end-to-end on a cache miss (fail closed), never the
+/// plaintext answer, even when another store minted epoch 1 earlier.
+#[cfg(unix)]
+#[test]
+fn scope_key_namespace_marker_fails_closed_on_unreadable_key_dir_8278() {
+    use std::os::unix::fs::PermissionsExt as _;
+    /// Restores the sandbox mode even when an assertion below fails.
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    // SAFETY: `geteuid` has no preconditions and only reads a process property.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory modes, so mode 0o000 cannot deny the read");
+        return;
+    }
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = open_store(dir.path());
+    assert!(!early.namespace_is_e2e(NS), "no ledger yet");
+    minted(&open_store(dir.path()), &[&test_node("node-a")]);
+    let _restore = RestoreMode(dir.path());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000))
+        .expect("make the key dir untraversable");
+    assert!(
+        early.namespace_is_e2e(NS),
+        "an unreadable key dir must answer end-to-end (fail closed)"
+    );
+}
+
+/// The ledger of `NS` straight from disk, with its current record.
+fn disk_ledger(store: &FileScopeKeyStore) -> (NamespaceLedger, ScopeKeyRecord) {
+    let ledger = store.load_namespace_locked(NS).expect("ledger");
+    let record = ledger.records.last().cloned().expect("record");
+    (ledger, record)
+}
+
+/// Code r3 F4 / security r3 S3a: an appended entry for an epoch already in
+/// the log must name the same key; another key id or another key check is
+/// refused with the typed chain error.
+#[test]
+fn scope_key_audit_append_refuses_another_key_for_a_known_epoch_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    minted(&store, &[&test_node("node-a")]);
+    let (ledger, record) = disk_ledger(&store);
+    let change = Change {
+        action: AuditAction::AddRecipient,
+        actor: ACTOR,
+        record: &record,
+        subject: Some(kek_fp(&test_node("node-b"))),
+        at: record.created_at.clone(),
+    };
+    let honest = ledger.entry_for(&change);
+    assert!(
+        ledger.clone().append(honest.clone()).is_ok(),
+        "the same key appends"
+    );
+    let other_id = AuditEntry {
+        key_id: ScopeKeyId::random().to_hex(),
+        ..honest.clone()
+    };
+    let other_check = AuditEntry {
+        key_check: "00".repeat(32),
+        ..honest
+    };
+    for (case, entry) in [("key_id", other_id), ("key_check", other_check)] {
+        let err = ledger.clone().append(entry).expect_err(case);
+        assert!(
+            matches!(err, ScopeKeyStoreError::AuditChainMismatch { .. }),
+            "{case}: {err:?}"
+        );
+    }
+}
+
+/// Security r3 S3b: a record whose escrow stanza names another recovery
+/// fingerprint than its audit entry does not load.
+#[test]
+fn scope_key_record_with_another_recovery_fingerprint_is_refused_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    let record = minted(&store, &[&test_node("node-a")]);
+    let other = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+    let mut moved = record.clone();
+    moved.escrow.recovery_fingerprint = fingerprint_public_bytes(other.as_bytes());
+    assert_ne!(
+        moved.escrow.recovery_fingerprint,
+        record.escrow.recovery_fingerprint
+    );
+    store.write_record(&moved).expect("write record");
+    store.refresh_from_ledger().expect("refresh");
+    let err = store
+        .load_current(NS)
+        .expect_err("another recovery fingerprint");
+    assert!(matches!(
+        store_refusal(&err),
+        ScopeKeyStoreError::AuditChainMismatch { .. }
+    ));
+}

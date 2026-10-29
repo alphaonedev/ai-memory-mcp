@@ -1139,10 +1139,26 @@ impl FileScopeKeyStore {
     /// slug's records and audit log, caches the result and answers from it,
     /// so a store opened before another writer minted epoch 1 never reports
     /// the namespace as plaintext. A ledger that fails verification answers
-    /// end-to-end (fail closed). Nothing is created on this read path.
+    /// end-to-end (fail closed). The read path creates only the lock file
+    /// (`open_lock_file` opens it with `create(true)`), never a record or an
+    /// audit line.
+    ///
+    /// Only a key directory that does not exist answers "not end-to-end". Any
+    /// other error reading it (EACCES, EIO, ELOOP) is returned, so the
+    /// caller's fail-closed answer applies (code r3 F2, ERRORS-06).
+    /// `symlink_metadata` reports a link in the key dir's place itself rather
+    /// than following it (a dangling link is not "absent"), and taking the
+    /// lock below then fails closed on the link.
     fn reload_marker(&self, slug: &str) -> Result<bool> {
-        if !self.scope_dir().exists() {
-            return Ok(false);
+        let scope_dir = self.scope_dir();
+        match std::fs::symlink_metadata(&scope_dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("reading scope-key directory {}", scope_dir.display())
+                });
+            }
         }
         let _lock = self.lock_shared()?;
         let scanned = self.scan(Some(slug))?;

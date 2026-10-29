@@ -302,6 +302,14 @@ E1; the CLI surface (verb, SSOT pins, doctor) lands with the Codex lane.
   forked ledgers with equal counts compare equal in `load_by_key_id_fresh`.
   The E2 record and audit-entry signatures bind content (now including each
   epoch's key id and `key_check`), which is what tells such forks apart.
+* Known E1 property (code r3 I-r3a, security r3 INFO b): `namespace_is_e2e`
+  caches only a namespace with an epoch. A miss (every plaintext namespace,
+  every call) takes the shared `flock` and rescans the key directory, with no
+  negative cache; a key directory that cannot be read answers end-to-end.
+  Size that cost before E2 calls the marker on async request paths.
+* Known E1 property (code r3 I-r3b): the Postgres crypto-erase parity test
+  stops at the first failing delete funnel, so a red run names one funnel; a
+  per-funnel collect-then-assert would name every regressed funnel at once.
 * New rows always seal under the current epoch. Old rows keep naming their
   epoch and open with that epoch's key until rotation rewrites them.
 * Removing a recipient (`remove_recipient`) stops the ledger handing that key

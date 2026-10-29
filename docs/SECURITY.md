@@ -530,10 +530,14 @@ decrypts on the sender and re-seals on the receiver. The `0x05` scope
 envelope seals content under a per-namespace **scope key** shared by the
 namespace's reader set (3-agent vote (6def5ab6), decisions D1/D2): each row
 has its own random DEK, wrapped under a per-record key derived from the
-scope key; both AEAD operations bind the row's `memory_id`, `namespace`,
-row version, the scope key id and the epoch, so a ciphertext moved to
-another row or namespace, an older envelope under a newer row version, or
-an edited key id or epoch, fails authentication. The scope key is
+scope key; both AEAD operations bind the AAD role, the envelope format
+version, the scope key id, the epoch, the row's `memory_id` and its
+`namespace`, so a ciphertext moved to another row or namespace, or an
+edited key id or epoch, fails authentication. The row version is NOT bound
+(it moves on non-content writes and on federation merge without a
+re-seal), so rollback or replay of an older envelope of the same row is
+not detected in E1; that is the record-signing property of #8278 slice
+E2. The scope key is
 symmetric: any reader can write an envelope that opens, so the envelope
 gives confidentiality and row binding, not writer authenticity; that is
 record signing in #8278 slice E2. Opening a
