@@ -76,9 +76,17 @@ impl Drop for ServeChild {
 /// Bind collisions are retryable; a startup crash or expired deadline is not.
 #[derive(Debug)]
 pub enum SpawnFailure {
-    BindRace { stderr: String },
-    Crashed { status: ExitStatus, stderr: String },
-    NeverReady { stderr: String },
+    BindRace {
+        stderr: String,
+    },
+    Crashed {
+        status: ExitStatus,
+        stderr: String,
+    },
+    NeverReady {
+        stderr: String,
+        last_probe_error: String,
+    },
 }
 
 impl std::error::Error for SpawnFailure {}
@@ -94,9 +102,12 @@ impl std::fmt::Display for SpawnFailure {
                 f,
                 "serve child exited before /health became ready: {status}; child stderr:\n{stderr}"
             ),
-            Self::NeverReady { stderr } => write!(
+            Self::NeverReady {
+                stderr,
+                last_probe_error,
+            } => write!(
                 f,
-                "serve daemon did not become ready within {SPAWN_TIMEOUT:?}; child stderr:\n{stderr}"
+                "serve daemon did not become ready within {SPAWN_TIMEOUT:?}; last probe error: {last_probe_error}; child stderr:\n{stderr}"
             ),
         }
     }
@@ -139,10 +150,16 @@ fn try_spawn_serve_once(
     configure: &impl Fn(&mut Command),
 ) -> Result<ServeChild, SpawnFailure> {
     let parent = db.parent().expect("db lives in a test directory");
-    let tls_dir = tempfile::Builder::new()
-        .prefix("tls-serve-8293-")
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("tls-serve-8293-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let tls_dir = builder
         .tempdir_in(parent)
-        .expect("create per-spawn TLS directory");
+        .expect("create private per-spawn TLS directory");
     let tls = TestTls::generate(tls_dir.path());
     let keys = parent.join("keys-3198");
     std::fs::create_dir_all(&keys).expect("create test key directory");
@@ -195,6 +212,7 @@ fn try_spawn_serve_once(
     let client = serve.tls.client_with_timeout(READINESS_PROBE_TIMEOUT);
     let url = serve.url("/api/v1/health");
     let deadline = Instant::now() + SPAWN_TIMEOUT;
+    let mut last_probe_error = "no probe completed".to_owned();
     while Instant::now() < deadline {
         if let Ok(Some(status)) = serve.child.as_mut().unwrap().try_wait() {
             let _ = serve.stop();
@@ -205,17 +223,18 @@ fn try_spawn_serve_once(
                 SpawnFailure::Crashed { status, stderr }
             });
         }
-        if client
-            .get(&url)
-            .send()
-            .is_ok_and(|response| response.status().is_success())
-        {
-            return Ok(serve);
+        match client.get(&url).send() {
+            Ok(response) if response.status().is_success() => return Ok(serve),
+            Ok(response) => {
+                last_probe_error = format!("health probe returned {}", response.status());
+            }
+            Err(error) => last_probe_error = error.to_string(),
         }
         std::thread::sleep(READINESS_POLL_INTERVAL);
     }
     let _ = serve.stop();
     Err(SpawnFailure::NeverReady {
+        last_probe_error,
         stderr: serve.stderr(),
     })
 }
