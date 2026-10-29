@@ -41,16 +41,16 @@ from datetime import datetime, timezone
 CORPUS = [
     "operator directive: ship v0.7.0 release gate",
     "The federation quorum uses W=2-of-3 mTLS with /sync/* bypassing the api_key "
-    "under client-cert auth, so peer health gates and quorum POSTs succeed without "
-    "presenting the daemon HTTP api_key.",
+    + "under client-cert auth, so peer health gates and quorum POSTs succeed without "
+    + "presenting the daemon HTTP api_key.",
     "pgvector 0.8.7 HNSW index over the 768-dim nomic-embed-text vectors stored in "
-    "PostgreSQL 18.4; the daemon connects over TLS verify-full and the ANN search "
-    "honors hnsw.ef_search at query time.",
+    + "PostgreSQL 18.4; the daemon connects over TLS verify-full and the ANN search "
+    + "honors hnsw.ef_search at query time.",
     "Reflection: across the do-1461 provisioning run the role.sql application site "
-    "was switched from psql -f to a stdin redirect because -f names the file in its "
-    "permission-denied error, which is how we diagnosed the stale-binary failure; "
-    "the current 20_pg_age.sh already carries the fix and the green 15:54 fleet "
-    "validate confirmed it end to end across all four peer nodes and the pg node.",
+    + "was switched from psql -f to a stdin redirect because -f names the file in its "
+    + "permission-denied error, which is how we diagnosed the stale-binary failure; "
+    + "the current 20_pg_age.sh already carries the fix and the green 15:54 fleet "
+    + "validate confirmed it end to end across all four peer nodes and the pg node.",
 ]
 
 

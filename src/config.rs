@@ -14428,7 +14428,7 @@ max_page_size = 1000000
             KeySource::Error(reason) => {
                 assert!(
                     reason.contains("lax permissions") && reason.contains("0400"),
-                    "error must name the perm policy: {reason}"
+                    "error must name the perm policy"
                 );
             }
             other => crate::test_support::key_panic("KeySource::Error(lax perms)", other),
@@ -14799,12 +14799,15 @@ max_page_size = 1000000
             ..EmbeddingsSection::default()
         });
         let resolved = cfg.resolve_embeddings();
-        assert_eq!(resolved.api_key(), None, "lax-perm file must be refused");
+        assert!(
+            resolved.api_key().is_none(),
+            "lax-perm file must be refused"
+        );
         match &resolved.key_source {
             KeySource::Error(reason) => {
                 assert!(
                     reason.contains("[embeddings].api_key_file") && reason.contains("lax"),
-                    "error must attribute the embeddings field: {reason}"
+                    "error must attribute the embeddings field"
                 );
             }
             other => crate::test_support::key_panic("KeySource::Error", other),
