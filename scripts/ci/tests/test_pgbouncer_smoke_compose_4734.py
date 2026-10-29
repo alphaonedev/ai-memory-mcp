@@ -60,10 +60,25 @@ scalar, block scalars, a scalar or flow collection over several lines, a `$` ins
 variable is read or exported; a definition after a case pattern paren or if/while/until is read as a
 definition; if..fi and case..esac are groups, and a FAIL-bearing group may be followed only by end of
 line, `;`, `;;` or an enclosing closer.
+r14: a FAIL-bearing group may not be followed by `&&` (bash ignores set -e in a non-final element of an
+`&&` list) and may not sit in condition position (if, elif, while, until, `!`, or piped after `&&` /
+`||`); an explicit YAML tag is refused; a compose call has no global docker flag and no further file,
+project-directory, env-file or project-name path after the pin.
+r15: condition position lasts from if, elif, while or until to the matching `then` or `do`, across `;`,
+newlines, comments and blank lines (a state machine in the group scan); a FAIL-bearing function is judged
+by its call sites (statement position only: not `&`, not a pipeline element, not a non-final `&&` / `||`
+element, not a condition), and the psql_pooled, worker, need and now_ms bodies are pinned whole;
+measure-envelope.sh fails the run when a load worker exits non-zero, and psql_pooled returns non-zero to
+the callers that check it; the compose pin is also read on quote-removed shell words (shlex), so no
+spelling adds a file, project-directory, env-file, project-name or profile flag; the pillar4-envelope
+listing is checked too; the docker daemon and config selection names (DOCKER_HOST, DOCKER_CONTEXT,
+DOCKER_CONFIG, DOCKER_CERT_PATH, DOCKER_TLS_VERIFY, DOCKER_API_VERSION, any DOCKER_ name) and the docker
+context subcommand are refused in both scripts.
 """
 import fnmatch
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import unittest
@@ -139,7 +154,7 @@ TARGET_ASSIGNMENTS = {
         "USERLIST": ['USERLIST="../pgbouncer/.userlist.generated.$RUN.txt"'],
         "RESULTS_DIR": ['RESULTS_DIR="${RESULTS_DIR:-./.local-runs/envelope-$$}"'],
         "STORE_URL_FILE": ['STORE_URL_FILE="$RESULTS_DIR/.store-url"'],
-        "out": ["""local wid="$1" out="$2" deadline="$3" n=0 prev_id="" bodyf="${out}.body\""""],
+        "out": ['local wid="$1" out="$2" deadline="$3" n=0 prev_id=""'],
     },
 }
 CLEANUP_BODY = {
@@ -209,6 +224,27 @@ CLOSER_TAIL_TOKEN = re.compile(r"\s*(?:;;(?!&)|;(?![;&])|[)}]|(?:fi|done|esac)(?
 # r14 K6: a FAIL-bearing group whose construct is preceded, on the same command, by one of these is in
 # condition position (if, elif, while, until, `!`), where set -e does not apply.
 CONDITION_WORDS = ("if", "elif", "while", "until", "!")
+# r15 K7: the condition state machine of _scan_groups. bash ignores set -e in the condition list of if,
+# elif, while and until, and that list runs from the keyword to the matching `then` or `do` across `;`,
+# newlines, comments and blank lines. The scan keeps a stack of open heads, one entry per keyword:
+#   push   `if` (after its if..fi group opens) and `elif` end at `then`; `while` and `until` end at `do`;
+#          `for` and `select` push a non-condition entry that ends at `do`, so each `do` pops its own head;
+#   pop    `then` / `do` pop the top entry only when it ends with that word and was pushed at the same
+#          group depth; any other `then` or `do` RAISES, and so does an entry still open at the end;
+#   judge  every group opened, and every call of a FAIL-bearing function made, while an if, elif, while
+#          or until entry is open carries that keyword in its context, so _context_bad refuses it.
+# `!` negates one pipeline: it stays in the command words until `;` or the end of a line that does not
+# end in `|`, `&&`, `||` or `!`.
+# r15 K8: a function body runs in the set -e context of its call, so a FAIL-bearing function (its body
+# group holds a FAIL site, directly or through a call of another FAIL-bearing function) is judged by its
+# calls: each is at statement position (no `!` or condition keyword before it, not a pipeline element,
+# and followed only by end of line, `;`, `;;` or a closer, so not by `&`, `|`, `&&` or `||`); the only
+# other use of the name is the trap operand `trap NAME EXIT`. Names are read quote-removed.
+FUNC_BODY_PREFIX = re.compile(r"(?:^|[\s;&|(){])(?:function\s+([\w.:-]+)(?:\s*\(\))?|([\w.:-]+)\s*\(\))\s*$")
+STATIC_WORD = re.compile(r"""(?:"(?:\\.|[^"\\])*"|'[^']*'|\\.|[^\s;&|()<>"'\\])+""")
+ASSIGNMENT_PREFIX = re.compile(r"(?:(?:^|(?<=\s))[A-Za-z_]\w*=\S*\s+)+$")
+TRAP_OPERAND = re.compile(r"(?:^|[\s;&|(){])trap\s+$")
+CALL_PREFIX_WORD = re.compile(r"(?:^|[\s;&|(){])(?:time|!)$")
 
 
 def _closer_tail_ok(tail):
@@ -217,6 +253,45 @@ def _closer_tail_ok(tail):
     holds the same FAIL site and is judged by its own tail (so `done ) || true` is refused through the
     subshell and `done && : || true` is refused at `&&`)."""
     return not tail.strip() or bool(CLOSER_TAIL_TOKEN.match(tail))
+
+
+def _unquote_word(text):
+    """r15 K8 + S20: one static shell word with its quotes and backslashes removed."""
+    out = []
+    for m in re.finditer(r'"((?:\\.|[^"\\])*)"|\'([^\']*)\'|\\(.)|(.)', text, re.S):
+        if m.group(1) is not None:
+            out.append(re.sub(r"\\(.)", r"\1", m.group(1)))
+        else:
+            out.append(next(g for g in m.groups()[1:] if g is not None))
+    return "".join(out)
+
+
+def _call_tail(text):
+    """r15 K8: the text after a call's arguments, from the first unquoted `;`, `&`, `|`, `)` or `}` word
+    (a redirect such as `>&2`, `2>&1` or `&>` is an argument; `$( )` and `${ }` are skipped)."""
+    quote, depth, i = None, 0, 0
+    while i < len(text):
+        ch, nxt = text[i], text[i + 1 : i + 2]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                i += 1
+        elif ch == "\\":
+            i += 1
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "$" and nxt in ("(", "{"):
+            depth += 1
+            i += 1
+        elif ch in ")}" and depth:
+            depth -= 1
+        elif ch in "<>" and nxt == "&" or ch == "&" and nxt == ">":
+            i += 1
+        elif ch in ";&|)" or (ch == "}" and (i == 0 or text[i - 1] in " \t;")):
+            return text[i:]
+        i += 1
+    return ""
 
 
 def _context_bad(ctx):
@@ -236,7 +311,7 @@ YAML_MERGE_KEY = re.compile(r"""(?m)^\s*(?:-\s*)?["']?<<["']?\s*:""")
 COMPOSE_BANNED_KEYS = re.compile(r"""(?<![\w.-])["']?(?:extends|include|secrets|configs|env_file)["']?\s*:""")
 COMPOSE_TOP_KEY = re.compile(r"""^["']?([\w-]+)["']?\s*:""")
 OR_TRUE_AFTER_GROUP = re.compile(r"\)\s*\|\|\s*(?:true|:)(?![\w-])")
-PSQL_POOLED_DEF = 'docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"'
+PSQL_POOLED_DEF = 'docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@" || return 1'
 GITIGNORE = PGB / ".gitignore"
 LITERAL_DEFAULTS = ("ai_memory_smoke", "ai_memory_envelope")
 REQUIRED_PW = re.compile(r"^\$\{POSTGRES_PASSWORD:\?[^}]+\}$")
@@ -480,7 +555,15 @@ def _compose_pin_refusals(body):
     COMPOSE_PATH_SEPARATOR, COMPOSE_PROJECT_NAME are neither read nor exported), no export of those two,
     and each assigned at most once."""
     problems = []
+    words, problem = _shell_words(body)
     body = re.sub(r"\\\n\s*", " ", body)
+    if problem:
+        problems.append(problem)
+    else:
+        word_problems, calls = _compose_word_refusals(words)
+        problems.extend(word_problems)
+        if calls != len(COMPOSE_INVOCATION.findall(body)):
+            problems.append("compose calls read as words (%d) and as text (%d) differ" % (calls, len(COMPOSE_INVOCATION.findall(body))))
     for m in COMPOSE_INVOCATION.finditer(body):
         if " ".join(m.group().split()) != "docker compose":
             problems.append("a global docker flag between docker and compose: %s" % m.group())
@@ -503,16 +586,158 @@ def _compose_pin_refusals(body):
     return problems
 
 
-def _infra_dir_refusals(names):
+def _infra_dir_refusals(names, allowed=None, compose_files=("docker-compose.yml",)):
     """r13 S15: the infra/pgbouncer listing holds the allowlisted files (plus the per-run generated
-    userlist) and exactly one compose file; a compose override, compose.yaml, .env or *.env fails."""
+    userlist) and exactly one compose file; a compose override, compose.yaml, .env or *.env fails.
+    r15 S20: the same check reads the infra/pillar4-envelope listing (ENVELOPE_ALLOWED, no compose file)."""
+    allowed = INFRA_ALLOWED if allowed is None else allowed
     problems = []
     for name in names:
-        if name in INFRA_ALLOWED or fnmatch.fnmatch(name, ".userlist.generated.*.txt"):
+        if name in allowed or (allowed is INFRA_ALLOWED and fnmatch.fnmatch(name, ".userlist.generated.*.txt")):
             continue
         problems.append("file not on the allowlist: %s" % name)
-    if [n for n in names if re.search(r"(?i)compose.*\.ya?ml$", n)] != ["docker-compose.yml"]:
-        problems.append("the directory must hold exactly one compose file, docker-compose.yml")
+    if [n for n in names if re.search(r"(?i)compose.*\.ya?ml$", n)] != list(compose_files):
+        problems.append("the directory must hold exactly the compose files %s" % (list(compose_files),))
+    return problems
+
+
+# r15 S20: the infra/pillar4-envelope listing; `.local-runs` is the gitignored RESULTS_DIR parent.
+ENVELOPE_ALLOWED = {".gitignore", ".local-runs", "README.md", "measure-capacity-ramp.sh", "measure-envelope.sh", "usl-fit.py"}
+# r15 S20: the compose pin is also read on shell WORDS (shlex, posix, comments off, after the heredoc bodies
+# are dropped and the backslash continuations joined), so quoting, escapes and attached values cannot
+# respell a flag. A compose call is the word docker (or a path ending in /docker) followed by the word
+# compose; its next six words are exactly the pin, and each later word of that command is a plain word or
+# a lone $NAME that neither is nor starts with a refused flag. A redirect operator and its target are
+# skipped; any other operator after the pin is refused; ANSI-C ($'...') and locale ($"...") quoting is
+# refused outright; and the call count read as words equals the count read as text.
+SHELL_OPERATOR_CHARS = "();<>|&\n"
+REDIRECT_OPERATOR = re.compile(r"^(?:[<>]{1,3}[&|]?|&>>?|<>)$")
+COMPOSE_PIN_WORDS = ["-f", "$COMPOSE_FILE_PINNED", "--project-directory", "$COMPOSE_DIR", "-p", "$PROJECT"]
+COMPOSE_REFUSED_FLAG = re.compile(r"^(?:--(?:file|project-directory|env-file|project-name|profile)|-[A-Za-z]*[fp])")
+COMPOSE_PLAIN_WORD = re.compile(r"^(?:[A-Za-z0-9_./:=@+-]+|\$[A-Za-z_]\w*)$")
+DOCKER_SUBCOMMAND = re.compile(r"^[a-z]+$")
+# r15 S21: the docker client picks its daemon, TLS material, config (and so its context) and API version
+# from DOCKER_HOST, DOCKER_TLS_VERIFY, DOCKER_CERT_PATH, DOCKER_CONFIG, DOCKER_CONTEXT, DOCKER_API_VERSION.
+# Neither script may name any DOCKER_ variable in any form (assignment, export, prefix word, declare,
+# local or readonly operand, ${NAME:=...} default), read raw or quote-removed, nor run docker context.
+DAEMON_SELECTION_NAMES = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION")
+DAEMON_SELECTION_NAME = re.compile(r"DOCKER_\w*")
+
+
+def _drop_heredoc_bodies(text):
+    """r15 S20: the code text without heredoc bodies; (text, open terminator or None)."""
+    kept, heredoc = [], None
+    for ln in text.split("\n"):
+        if heredoc is not None:
+            heredoc = None if ln.strip() == heredoc else heredoc
+            continue
+        kept.append(ln)
+        for tok in HEREDOC_TOKEN.finditer(ln):
+            word = tok.group(1) or tok.group(2) or tok.group(3)
+            if word:
+                heredoc = word
+                break
+    return "\n".join(kept), heredoc
+
+
+def _ansi_or_locale_quote(code):
+    """r15 S20: True when $'...' or $\"...\" quoting appears outside single quotes."""
+    quote, i = None, 0
+    while i < len(code):
+        ch = code[i]
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif ch == "\\":
+            i += 1
+        elif quote == '"':
+            quote = None if ch == '"' else quote
+        elif ch == "$" and code[i + 1 : i + 2] in ("'", '"'):
+            return True
+        elif ch in "\"'":
+            quote = ch
+        i += 1
+    return False
+
+
+def _shell_words(body):
+    """r15 S20: (words, problem) for code text: shlex in posix mode, comments off, operators split out
+    (a newline outside quotes is an operator token), after the heredoc bodies are dropped and the
+    backslash continuations joined. An unreadable text is a problem, never an empty word list."""
+    code, open_heredoc = _drop_heredoc_bodies(body)
+    if open_heredoc is not None:
+        return None, "heredoc %s is never closed" % open_heredoc
+    if _ansi_or_locale_quote(code):
+        return None, "ANSI-C or locale quoting ($' or $\")"
+    lex = shlex.shlex(re.sub(r"\\\n", " ", code), posix=True, punctuation_chars=SHELL_OPERATOR_CHARS)
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex), None
+    except ValueError as exc:
+        return None, "the shell words cannot be read: %s" % exc
+
+
+def _is_operator(word):
+    return bool(word) and set(word) <= set(SHELL_OPERATOR_CHARS)
+
+
+def _is_docker(word):
+    return word == "docker" or word.endswith("/docker")
+
+
+def _compose_word_refusals(words):
+    """r15 S20: (refusals, compose call count) read on the shell words of one script."""
+    problems, calls = [], 0
+    for k, word in enumerate(words):
+        if not _is_docker(word):
+            continue
+        nxt = words[k + 1] if k + 1 < len(words) else "\n"
+        if _is_operator(nxt):
+            continue
+        if not DOCKER_SUBCOMMAND.match(nxt):
+            problems.append("a docker word that is not a plain subcommand (a global flag or a respelling)")
+            continue
+        if nxt != "compose":
+            continue
+        calls += 1
+        if words[k + 2 : k + 8] != COMPOSE_PIN_WORDS:
+            problems.append("compose call words differ from the pin %s" % " ".join(COMPOSE_PIN_WORDS))
+            continue
+        j = k + 8
+        while j < len(words):
+            w = words[j]
+            if _is_operator(w):
+                if REDIRECT_OPERATOR.match(w):
+                    j += 2
+                    continue
+                if set(w) <= set(";&|()\n") and not set(w) & set("<>"):
+                    break
+                problems.append("an operator after the compose pin: %r" % w)
+                break
+            if COMPOSE_REFUSED_FLAG.match(w):
+                problems.append("a further file, project-directory, env-file, project-name or profile flag after the pin")
+            elif not COMPOSE_PLAIN_WORD.match(w):
+                problems.append("a word after the compose pin that is not a plain word or a lone $NAME")
+            j += 1
+    return problems, calls
+
+
+def _daemon_selection_refusals(body):
+    """r15 S21: refusals for a DOCKER_ name or a docker context call in one script, raw and as words."""
+    problems = []
+    if DAEMON_SELECTION_NAME.search(body):
+        problems.append("names a DOCKER_ daemon or config selection variable")
+    if re.search(r"\bdocker\s+context\b", body):
+        problems.append("runs docker context")
+    words, problem = _shell_words(body)
+    if problem:
+        return problems + [problem]
+    for k, w in enumerate(words):
+        if DAEMON_SELECTION_NAME.search(w):
+            problems.append("names a DOCKER_ variable once quotes are removed")
+        if _is_docker(w) and words[k + 1 : k + 2] == ["context"]:
+            problems.append("runs docker context once quotes are removed")
     return problems
 
 
@@ -533,6 +758,84 @@ class ComposeParity(unittest.TestCase):
         for name in a:
             self.assertEqual([str(p) for p in a[name]["ports"]], [str(p) for p in b[name]["ports"]], name)
             self.assertEqual(a[name]["environment"], b[name]["environment"], name)
+
+
+DECLARATION_WORDS = ("local", "declare", "typeset", "readonly", "export")
+
+
+def _self_referencing_declarations(lines):
+    """r15: a declaration builtin expands all its words before it assigns any, so a word that reads a name
+    assigned earlier in the SAME command sees the old (under set -u: unbound) value. Returns the offending
+    (line number, name) pairs; a line shlex cannot split is returned as (n, "unparsable")."""
+    out = []
+    for n, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if stripped.split(" ", 1)[0] not in DECLARATION_WORDS:
+            continue
+        try:
+            words = shlex.split(stripped.split(";", 1)[0], posix=True)
+        except ValueError:
+            out.append((n, "unparsable"))
+            continue
+        assigned = []
+        for word in words[1:]:
+            if word.startswith("-"):
+                continue
+            name, _, value = word.partition("=")
+            for ref in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", value):
+                if ref in assigned:
+                    out.append((n, ref))
+            assigned.append(name)
+    return out
+
+
+FUNCTION_BODIES = {  # r15 K8: the whole body of each function, as _norm_lines reads it
+    SMOKE: {
+        'psql_pooled': (
+            'psql_pooled() {',
+            'docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@" || return 1',
+            '}',
+        ),
+    },
+    ENVELOPE: {
+        'need': (
+            'need() { command -v "$1" >/dev/null 2>&1 || { echo "FATAL: \'$1\' not found on PATH" >&2; exit 69; }; }',
+        ),
+        'now_ms': (
+            "now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }",
+        ),
+        'worker': (
+            'worker() {',
+            'local wid="$1" out="$2" deadline="$3" n=0 prev_id=""',
+            'local bodyf="${out}.body"',
+            'while [ "$(date +%s)" -lt "$deadline" ]; do',
+            'n=$((n+1))',
+            'local agent="env-w${wid}" title="w${wid}-m${n}"',
+            'local t0 code t1 cur_id',
+            't0=$(now_ms)',
+            'code=$(curl -s -o "$bodyf" -w \'%{http_code}\' -X POST "$BASE/memories" -H \'content-type: application/json\' -H "x-agent-id: $agent" -d "{\\"title\\":\\"$title\\",\\"content\\":\\"envelope load $title\\",\\"namespace\\":\\"envelope\\",\\"tier\\":\\"short\\"}" 2>/dev/null || echo "000")',
+            't1=$(now_ms)',
+            'echo "store $code $((t1-t0))" >> "$out"',
+            "cur_id=$(python3 -c 'import json,sys",
+            'try: print(json.load(open(sys.argv[1])).get("id",""))',
+            'except Exception: print("")\' "$bodyf" 2>/dev/null || echo "")',
+            'if [ -n "$prev_id" ] && [ -n "$cur_id" ]; then',
+            't0=$(now_ms)',
+            'code=$(curl -s -o /dev/null -w \'%{http_code}\' -X POST "$BASE/links" -H \'content-type: application/json\' -H "x-agent-id: $agent" -d "{\\"source_id\\":\\"$prev_id\\",\\"target_id\\":\\"$cur_id\\",\\"relation\\":\\"related_to\\"}" 2>/dev/null || echo "000")',
+            't1=$(now_ms)',
+            'echo "link $code $((t1-t0))" >> "$out"',
+            'fi',
+            '[ -n "$cur_id" ] && prev_id="$cur_id"',
+            't0=$(now_ms)',
+            'code=$(curl -s -o /dev/null -w \'%{http_code}\' "$BASE/recall?q=envelope&namespace=envelope&limit=5" -H "x-agent-id: $agent" 2>/dev/null || echo "000")',
+            't1=$(now_ms)',
+            'echo "recall $code $((t1-t0))" >> "$out"',
+            'done',
+            'rm -f "$bodyf"',
+            '}',
+        ),
+    },
+}
 
 
 class PgbouncerSmokeComposeTest(unittest.TestCase):
@@ -716,13 +1019,16 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertEqual(code[at + 1], pin, path.name)
             body = "\n".join(code)
             self.assertEqual(_compose_pin_refusals(body), [], path.name)
+            self.assertEqual(_daemon_selection_refusals(body), [], path.name)
             self.assertGreaterEqual(len(re.findall(r"\bdocker compose\b", body)), 3, path.name)
             first = re.search(r"\bdocker compose\b", body)
             self.assertGreater(first.start(), body.index(pin), "%s: compose call before the pin" % path.name)
         self.assertEqual(_infra_dir_refusals(sorted(p.name for p in PGB.iterdir())), [])
+        envelope_names = sorted(p.name for p in ENVELOPE.parent.iterdir())
+        self.assertEqual(_infra_dir_refusals(envelope_names, ENVELOPE_ALLOWED, ()), [], "pillar4-envelope listing")
 
     def test_compose_discovery_selftest(self):
-        ok = 'x docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$P" up'
+        ok = 'x docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up'
         self.assertEqual(_compose_pin_refusals(ok), [])
         # legit: other options after the pin, `-p` with a variable, a later command that has its own -f
         self.assertEqual(_compose_pin_refusals(ok + ' --wait && grep -f x y | cat'), [])
@@ -770,6 +1076,69 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         }.items():
             self.assertTrue(_infra_dir_refusals(listing + [extra]), "row %s is not refused" % row)
         self.assertTrue(_infra_dir_refusals([n for n in listing if n != "docker-compose.yml"]), "no compose file")
+        envelope = sorted(ENVELOPE_ALLOWED)
+        self.assertEqual(_infra_dir_refusals(envelope, ENVELOPE_ALLOWED, ()), [])
+        for extra in (".env", "x.env", "docker-compose.override.yml", "compose.override.yaml", "docker-compose.yml", "compose.yaml"):
+            self.assertTrue(_infra_dir_refusals(envelope + [extra], ENVELOPE_ALLOWED, ()), "envelope row %s is not refused" % extra)
+
+    def test_compose_word_pin_and_daemon_selection_selftest(self):
+        # r15 S20: R1-R10 are the reviewer's ten S20/S21 GREEN/GREEN shapes rebuilt from the finding text
+        # (static quoting, escapes, attached values, a profile, a brace word, ANSI-C quoting, a respelt
+        # command word, and the local-proxy DOCKER_HOST prefix); each is refused now, raw text or words.
+        ok = 'x docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up'
+        for legit in (ok, ok + " -d --wait postgres", ok + " down -v >/dev/null || { echo x; }", ok + " up 2>&1 | cat", "need docker", 'docker ps -aq --filter "label=x"'):
+            self.assertEqual(_compose_pin_refusals(legit), [], legit)
+            self.assertEqual(_daemon_selection_refusals(legit), [], legit)
+        refused = {
+            "R1-single-quoted-flag": ok + " '-f' ./extra.yml",
+            "R2-double-quoted-flag": ok + ' "-f" ./extra.yml',
+            "R3-escaped-flag": ok + " -\\f ./extra.yml",
+            "R4-attached-short-value": ok + " -f./extra.yml",
+            "R5-attached-equals-value": ok + " -f=./extra.yml",
+            "R6-split-long-flag": ok + " --fi''le=./extra.yml",
+            "R7-profile": ok + " --profile extra",
+            "R8-brace-word": ok + " {-f,./extra.yml}",
+            "R9-ansi-c-flag": ok + " $'-f' ./extra.yml",
+            "R10-local-proxy-prefix": "DOCKER_HOST=tcp://127.0.0.1:2399 " + ok,
+            "own-quoted-compose-other-file": 'docker "compose" -f ./x.yml up',
+            "own-escaped-compose-other-file": "docker co\\mpose -f ./x.yml up",
+            "own-quoted-docker-global-flag": '"docker" --host x compose -f "$COMPOSE_FILE_PINNED" up',
+            "own-long-file-quoted-value": ok + ' --file "./extra.yml"',
+            "own-env-file-attached": ok + " --env-file=./x.env",
+            "own-project-name-attached": ok + " --project-name=other",
+            "own-second-p": ok + " -p other",
+            "own-combined-short": ok + " -df ./extra.yml",
+            "own-locale-quote": ok + ' $"-f" ./extra.yml',
+            "own-glob-word": ok + " -[f] ./extra.yml",
+            "own-expansion-word": ok + " ${X:--f} ./extra.yml",
+            "own-process-substitution": ok + " <(cat x)",
+            "own-path-docker": "/usr/bin/docker compose -f ./x.yml up",
+        }
+        for row, text in refused.items():
+            self.assertTrue(_compose_pin_refusals(text) or _daemon_selection_refusals(text), "row %s is not refused" % row)
+        # r15 S21: one row per name and per form, and the docker context subcommand in any spelling
+        forms = {
+            "assignment": "{n}=x\n",
+            "export": "export {n}=x\n",
+            "export-name": "{n}=x; export {n}\n",
+            "prefix-word": "{n}=x ",
+            "env-prefix": "env {n}=x ",
+            "declare": "declare -x {n}=x\n",
+            "local": "local {n}=x\n",
+            "readonly": "readonly {n}=x\n",
+            "default": ': "${{{n}:=x}}"\n',
+            "quoted-name": "export {q}=x\n",
+            "escaped-name": "export {e}=x\n",
+        }
+        for name in DAEMON_SELECTION_NAMES:
+            for form, shape in forms.items():
+                text = shape.format(n=name, q=name[:4] + '""' + name[4:], e=name[:1] + "\\" + name[1:]) + ok
+                self.assertTrue(_daemon_selection_refusals(text), "S21 %s %s is not refused" % (name, form))
+        for text in ("docker context use x", 'docker "context" use x', "docker con\\text use x", "/usr/bin/docker context ls",
+                     "docker 'context' create x", "x; docker context inspect"):
+            self.assertTrue(_daemon_selection_refusals(text), text)
+        for text in (ok + " -f", "x='" , ok + " <<'EOF'"):
+            self.assertTrue(_compose_pin_refusals(text), "fail closed: %r" % text)
 
     def test_scripts_generate_random_password(self):
         for path in SCRIPTS:
@@ -1157,23 +1526,55 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
 
     @staticmethod
     def _groups(lines, name):
-        """r11 Q15 + r12 N2/N5 + r13 K2 + r14 K5/K6: every ( ) { } do..done if..fi (elif and else arms
-        belong to the if) and case..esac group over the code lines (a case pattern paren pops nothing),
-        across lines, outside quotes, comments and heredoc bodies; returns (location, group).
+        """r15 K8: the group scan run to a fixpoint over the FAIL-bearing functions (a function whose body
+        group holds a FAIL site, directly or through a call of another FAIL-bearing function). The last
+        pass is returned; its call records have kind "call"."""
+        funcs = set()
+        while True:
+            out = PgbouncerSmokeComposeTest._scan_groups(lines, name, funcs)
+            found = {g["func"] for _, g in out if g["kind"] != "call" and g.get("func") and g["fail"]}
+            if found <= funcs:
+                return out
+            funcs |= found
+
+    @staticmethod
+    def _scan_groups(lines, name, fail_funcs):
+        """r11 Q15 + r12 N2/N5 + r13 K2 + r14 K5/K6 + r15 K7/K8: every ( ) { } do..done if..fi (elif and
+        else arms belong to the if) and case..esac group over the code lines (a case pattern paren pops
+        nothing), across lines, outside quotes, comments and heredoc bodies; returns (location, group).
         group["bad"] is set when a FAIL echo sits inside a subshell, or in a group whose closer is
         followed by anything but end of line, `;`, `;;` or an enclosing closer (r13 K3, r14 K5: not
-        `&&`; a redirect, a pipe, `||`, a lone `&`), or in a group whose construct is preceded on its
-        command by if, elif, while, until, `!` or (when piped) `&&` / `||` (r14 K6: condition position
-        is exempt from set -e). A closer with no opener RAISES (fail closed)."""
+        `&&`; a redirect, a pipe, `||`, a lone `&`), or in a group opened in condition position: while
+        an if / elif / while / until head is open (r15 K7, the state machine described at
+        CONDITION_WORDS) or after `!` or (when piped) `&&` / `||` on its command (r14 K6). r15 K8: each
+        use of a function in fail_funcs is a call record, bad unless it is at statement position; it
+        marks every enclosing group FAIL-bearing. A closer with no opener, a `then` or `do` with no open
+        head, and a head left open RAISE (fail closed)."""
         out, stack, heredoc, in_sq = [], [], None, False
-        words, loops = [], []  # words: if/elif/while/until/!, | && || seen on the current command
+        words, loops, cond = [], [], []  # words: !, | && || on the current command; cond: open heads
+        pending_func = None
 
-        def opener(kind, sub, n, i, ctx):
-            stack.append({"kind": kind, "sub": sub, "fail": False, "at": "line %d col %d" % (n + 1, i + 1), "ctx": list(ctx), "saved": list(words)})
+        def cond_words():
+            return [c["word"] for c in cond if c["word"] in CONDITION_WORDS]
+
+        def opener(kind, sub, n, i, ctx, func=None):
+            stack.append(
+                {"kind": kind, "sub": sub, "fail": False, "at": "line %d col %d" % (n + 1, i + 1), "ctx": list(ctx) + cond_words(),
+                 "saved": list(words), "func": func}
+            )
 
         def cmd_start(prev):
             prev = prev.rstrip()
             return not prev or prev[-1] in ";&|({" or bool(re.search(r"(?:^|[\s;&|(){])(?:then|do|else|elif|if|while|until)$", prev))
+
+        def call_start(prev):
+            prev = ASSIGNMENT_PREFIX.sub("", prev.rstrip() + " ").rstrip()
+            return cmd_start(prev) or prev.endswith((")", "}")) or bool(CALL_PREFIX_WORD.search(prev))
+
+        def pop_head(word, n, i):
+            if not cond or cond[-1]["end"] != word or cond[-1]["depth"] != len(stack):
+                raise AssertionError("%s: line %d col %d: %s with no open head that ends there" % (name, n + 1, i + 1, word))
+            cond.pop()
 
         for n, raw in enumerate(lines):
             if heredoc:
@@ -1190,6 +1591,25 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                         g["fail"] = True
                 step = 1
                 top = stack[-1]["kind"] if stack else ""
+                if fail_funcs and not in_sq and top != "dq" and ch not in " \t" and (i == 0 or ln[i - 1] in " \t;&|(){}"):
+                    m = STATIC_WORD.match(ln, i)
+                    used = _unquote_word(m.group()) if m else ""
+                    rest = ln[i + len(m.group()) :] if m else ""
+                    prev = ln[:i]
+                    definition = re.match(r"\s*\(\)", rest) or re.search(r"(?:^|\s)function\s+$", prev)
+                    trap = TRAP_OPERAND.search(prev) and re.match(r"\s+EXIT\s*(?:$|;)", rest)
+                    if used in fail_funcs and not definition and not trap:
+                        at = "line %d col %d" % (n + 1, i + 1)
+                        ctx = words + cond_words()
+                        statement = call_start(prev)
+                        tail = _call_tail(rest)
+                        bad = not statement or "|" in words or _context_bad(ctx) or not _closer_tail_ok(tail)
+                        why = ("a FAIL-bearing function used outside statement position" if not statement
+                               else "a FAIL-bearing function called where set -e does not reach its body")
+                        for g in stack:
+                            g["fail"] = True
+                        out.append(("%s call %s" % (at, used), {"kind": "call", "sub": False, "func": used, "fail": True, "bad": bad,
+                                                                "why": why, "ctx": ctx, "at": at}))
                 if in_sq:
                     in_sq = ch != "'"
                 elif ch == "\\":
@@ -1213,10 +1633,12 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 elif ch == "|":
                     words.append("||" if nxt == "|" else "|")
                     step = 2 if nxt == "|" else 1
-                elif ch == "!" and nxt in (" ", "\t") and cmd_start(ln[:i]):
+                elif ch == "!" and nxt in (" ", "\t", "") and cmd_start(ln[:i]):
                     words.append("!")
                 elif ch in "({":
-                    opener(ch, False, n, i, words)
+                    m = FUNC_BODY_PREFIX.search(ln[:i])
+                    func = (m.group(1) or m.group(2)) if m else (pending_func if not ln[:i].strip() else None)
+                    opener(ch, False, n, i, words, func)
                     words.clear()
                 elif ch == ")" and top == "case":
                     words.clear()  # r12 N5: a case pattern paren closes no group
@@ -1232,6 +1654,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                     step = len(word)
                     if after == "" or after in " \t;&|()":
                         if word == "do":
+                            pop_head("do", n, i)
                             ctx = loops.pop() if loops else []
                             opener("do", False, n, i, ctx)
                             stack[-1]["saved"] = list(ctx)
@@ -1241,15 +1664,22 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                             words.clear()
                         elif word == "if":
                             opener("if", False, n, i, words)
-                            words[:] = ["if"]
-                        elif word in ("while", "until"):
+                            cond.append({"word": "if", "end": "then", "depth": len(stack)})
+                            words.clear()
+                        elif word in ("while", "until", "for", "select"):
                             loops.append(list(words))
-                            words.append(word)
-                        elif word in ("for", "select"):
-                            loops.append(list(words))
+                            cond.append({"word": word, "end": "do", "depth": len(stack)})
+                            if word in ("while", "until"):
+                                words.clear()
                         elif word == "elif":
-                            words[:] = ["elif"]
-                        elif word in ("then", "else"):
+                            if top != "if":
+                                raise AssertionError("%s: line %d col %d: elif outside an if" % (name, n + 1, i + 1))
+                            cond.append({"word": "elif", "end": "then", "depth": len(stack)})
+                            words.clear()
+                        elif word == "then":
+                            pop_head("then", n, i)
+                            words.clear()
+                        elif word == "else":
                             words.clear()
                         elif word in ("done", "esac", "fi"):
                             if top != {"done": "do", "esac": "case", "fi": "if"}[word]:
@@ -1259,15 +1689,17 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                             words[:] = saved + ["g"]
                 i += step
             if not in_sq:
-                if not (words and words[-1] in ("|", "&&", "||")):
+                if not (words and words[-1] in ("|", "&&", "||", "!")):
                     words.clear()
+                m = FUNC_BODY_PREFIX.search(ln)
+                pending_func = (m.group(1) or m.group(2)) if m else None
                 for tok in HEREDOC_TOKEN.finditer(ln):
                     word = tok.group(1) or tok.group(2) or tok.group(3)
                     if word:
                         heredoc = word
                         break
-        if heredoc is not None or in_sq or stack:
-            raise AssertionError("%s: the group scan lost sync (heredoc %r, open groups %d)" % (name, heredoc, len(stack)))
+        if heredoc is not None or in_sq or stack or cond:
+            raise AssertionError("%s: the group scan lost sync (heredoc %r, open groups %d, open heads %d)" % (name, heredoc, len(stack), len(cond)))
         return out
 
     def test_group_scan_selftest(self):
@@ -1352,12 +1784,20 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # r14 K5 + K6 + INFO: on the real scripts no FAIL-bearing group is followed by `&&` or
         # preceded by a condition word (the groups listing: bad 0), the FAIL-bearing group count floors are
         # pinned, and the compose-pin comment states what compose does with a `.env` next to the file.
-        counts = {SMOKE: (34, 15), ENVELOPE: (57, 10)}
-        for path, (total, failing) in counts.items():
-            groups = self._groups(_norm_lines(path), path.name)
-            self.assertGreaterEqual(len(groups), total, "%s: group count" % path.name)
-            self.assertGreaterEqual(sum(1 for _, g in groups if g["fail"]), failing, "%s: FAIL-bearing group count" % path.name)
-            for where, g in groups:
+        # r15 INFO 3: exact counts (groups, FAIL-bearing groups, calls of FAIL-bearing functions), measured
+        # on this head. Smoke 34 / 15 / 0 as in round 14 (psql_pooled holds no FAIL site, so it has no call
+        # records). Envelope 58 / 12 / 4: the round-15 worker-status check replaces `wait ... || true` inside
+        # the existing `for p ...; do ... done` loop and adds one `|| { echo FAIL ...; exit 1; }` group (57 + 1
+        # groups); that group and the enclosing `for conc ...; do ... done` step loop become FAIL-bearing
+        # (10 + 2); the 4 calls are `need docker|curl|cargo|python3`, each at statement position.
+        counts = {SMOKE: (34, 15, 0), ENVELOPE: (58, 12, 4)}
+        for path, (total, failing, ncalls) in counts.items():
+            out = self._groups(_norm_lines(path), path.name)
+            groups = [(w, g) for w, g in out if g["kind"] != "call"]
+            self.assertEqual(len(groups), total, "%s: group count" % path.name)
+            self.assertEqual(sum(1 for _, g in groups if g["fail"]), failing, "%s: FAIL-bearing group count" % path.name)
+            self.assertEqual(len(out) - len(groups), ncalls, "%s: calls of FAIL-bearing functions" % path.name)
+            for where, g in out:
                 self.assertFalse(g["bad"], "%s: %s" % (path.name, where))
                 if g["fail"]:
                     self.assertFalse(_context_bad(g["ctx"]), "%s: %s" % (path.name, where))
@@ -1365,6 +1805,126 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertIn("compose still reads a .env in that directory for interpolation", comment, path.name)
             self.assertIn("the environment outranks .env", comment, path.name)
             self.assertNotIn("a .env that sets COMPOSE_FILE", comment, path.name)
+
+    def test_condition_state_selftest(self):
+        # r15 K7: N20-N25 (the review rows) and own rows: a FAIL-bearing group opened anywhere in a
+        # condition list (across newlines, `;`, comments, blank lines) is refused; real-shaped conditions,
+        # then/do bodies, N6 `fi ;;` and N19 `time {...}` are not; a head without its then/do raises.
+        bad = lambda lines: [g["bad"] for _, g in self._groups(lines, "t")]  # noqa: E731
+        fail = 'echo "FAIL: a" >&2; exit 1'
+        loop = ["cat x | while read l; do", fail, "done"]
+        refused = {
+            "N20-if-newline": ["if"] + loop + ["then :; fi"],
+            "N21-while-newline": ["while"] + loop + ["do break; done"],
+            "N22-if-comment": ["if # c"] + loop + ["then :; fi"],
+            "N23-if-semicolons": ["if true; cat x | while read l; do " + fail + "; done; then :; fi"],
+            "N24-if-true-newline": ["if true"] + loop + ["then :; fi"],
+            "N25-elif-newline": ["if false; then :", "elif"] + loop + ["then :; fi"],
+            "own-until-newline": ["until"] + loop + ["do break; done"],
+            "own-blank-and-comment-lines": ["if true", "", "# note", ""] + loop + ["then :; fi"],
+            "own-while-semicolon-comment": ["while true; # c"] + loop + ["do break; done"],
+            "own-and-newline": ["if true &&"] + loop + ["then :; fi"],
+            "own-brace-group-newline": ["if true", "{ " + fail + "; }", "then :; fi"],
+            "own-negation-newline": ["!"] + loop,
+            "own-elif-semicolons": ["if false; then :; elif true; cat x | while read l; do " + fail + "; done; then :; fi"],
+            "own-nested-if-head": ["while if true", "then " + loop[0], fail, "done; fi; do break; done"],
+        }
+        for row, lines in refused.items():
+            self.assertTrue(any(bad(lines)), "row %s is not refused" % row)
+        legit = {
+            "real-if-substitution": ['if [ -n "$(docker ps -aq)" ]; then', fail, "fi"],
+            "real-while-head": ['while [ "$(date +%s)" -lt "$d" ]; do', ":", "done"],
+            "then-on-its-own-line": ["if true", "then", fail, "fi"],
+            "do-on-its-own-line": ["while read l", "do", fail, "done"],
+            "piped-loop-in-for-body": ["for w in a b; do"] + loop + ["done"],
+            "piped-loop-in-then-body": ["if true; then"] + loop + ["fi"],
+            "N6-fi-in-case-arm": ["case $x in", "a) if true; then", fail, "fi ;;", "esac"],
+            "N19-time-group": ["time { cat x | while read l; do " + fail + "; done; }"],
+        }
+        for row, lines in legit.items():
+            self.assertFalse(any(bad(lines)), "legit row %s is refused" % row)
+        for lines in (["then"], ["if true"], ["while true"], ["if true; do :; done"], ["for x in a"], ["elif true; then :"], ["do"]):
+            with self.assertRaises(AssertionError, msg=lines):
+                self._groups(lines, "t")
+
+    def test_function_call_sites_selftest(self):
+        # r15 K8: N26 (a FAIL group in worker(), called with `&` and reaped by `wait ... || true`), N27 (a
+        # piped FAIL loop then `:` in psql_pooled(), called as `psql_pooled <<'SQL' || {...}`) and own rows
+        # are refused; statement calls, a final `&&` / `||` element, the trap operand and calls of
+        # functions without a FAIL site are not.
+        fail = 'echo "FAIL: a" >&2; exit 1'
+        body = ["f() {", "cat x | while read l; do " + fail + "; done", ":", "}"]
+        bad = lambda lines: any(g["bad"] for _, g in self._groups(lines, "t"))  # noqa: E731
+        refused = {
+            "N26-worker-background": ["worker() {", 'code=""', '[ -n "$code" ] || { ' + fail + "; }", "}", "worker 1 x y &",
+                                      "pids+=($!)", 'for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done'],
+            "N27-psql-pooled-or-list": ["psql_pooled() {", "cat x | while read l; do " + fail + "; done", ":", "}",
+                                        "psql_pooled <<'SQL' || { " + fail + "; }", "SELECT 1;", "SQL"],
+            "own-or-true": body + ["f || true"],
+            "own-and-list": body + ["f && :"],
+            "own-if-head": body + ["if f; then :; fi"],
+            "own-while-head-newline": body + ["while", "f", "do break; done"],
+            "own-negated": body + ["! f"],
+            "own-pipeline-first": body + ["f | cat"],
+            "own-pipeline-last": body + ["cat x | f"],
+            "own-substitution": body + ['x="$(f)"'],
+            "own-quoted-name": body + ['"f" &'],
+            "own-escaped-name": body + ["\\f &"],
+            "own-transitive": body + ["g() { f; }", "g &"],
+            "own-brace-next-line": ["f()", "{", "cat x | while read l; do " + fail + "; done", "}", "f &"],
+            "own-function-keyword": ["function f {", "cat x | while read l; do " + fail + "; done", "}", "f &"],
+            "own-eval-operand": body + ["eval f"],
+            "own-assignment-prefix": body + ["X=1 f &"],
+            "own-time-or": body + ["time f || true"],
+        }
+        for row, lines in refused.items():
+            self.assertTrue(bad(lines), "row %s is not refused" % row)
+        legit = {
+            "statement": body + ["f"],
+            "statement-then-more": body + ["f; :"],
+            "final-and-element": body + ["true && f"],
+            "final-or-element": body + ["true || f"],
+            "then-body": body + ["if true; then", "f", "fi"],
+            "trap-operand": body + ["trap f EXIT"],
+            "redirected": body + ["f >/dev/null 2>&1"],
+            "no-fail-site-background": ["g() { :; }", "g &", "wait"],
+            "real-need": ["need() { command -v \"$1\" >/dev/null 2>&1 || { echo \"FATAL: '$1' not found on PATH\" >&2; exit 69; }; }",
+                          "need docker", "need curl"],
+            "real-psql-pooled": ["psql_pooled() {", PSQL_POOLED_DEF, "}", "psql_pooled <<'SQL' || { " + fail + "; }", "SELECT 1;", "SQL"],
+            "real-worker": ["worker() {", 'rm -f "$bodyf"', "}", "worker 1 x y &", "worker_rc=0",
+                            'for p in "${pids[@]}"; do wait "$p" || worker_rc=$?; done',
+                            '[ "$worker_rc" -eq 0 ] || { ' + fail + "; }"],
+        }
+        for row, lines in legit.items():
+            self.assertFalse(bad(lines), "legit row %s is refused" % row)
+
+    def test_declarations_do_not_read_their_own_names(self):
+        # r15: `local out="$2" bodyf="${out}.body"` expanded "${out}" before `local` assigned it; under
+        # set -u every envelope worker exited at its first line, and the old `wait ... || true` hid it.
+        for path in (SMOKE, ENVELOPE):
+            self.assertEqual(_self_referencing_declarations(_norm_lines(path)), [], path.name)
+        check = _self_referencing_declarations
+        self.assertEqual(check(['  local a="$1" b="${a}.x"']), [(1, "a")])
+        self.assertEqual(check(["  local a=1 b=$a"]), [(1, "a")])
+        self.assertEqual(check(['  export A="x" B="$A"; echo']), [(1, "A")])
+        self.assertEqual(check(['  declare -r a=1 b="${a:-2}"']), [(1, "a")])
+        self.assertEqual(check(['  local a="$1"', '  local b="${a}.x"']), [])
+        self.assertEqual(check(['  local a="$b" b=1']), [])
+        self.assertEqual(check(["  local a='unclosed"]), [(1, "unparsable")])
+
+    def test_function_bodies_are_pinned_whole(self):
+        # r15 K8: the whole body of psql_pooled (smoke) and of worker, need and now_ms (envelope), as
+        # _norm_lines reads them (cleanup is pinned by CLEANUP_BODY); a FAIL site, a swallowed status or a
+        # changed return cannot enter a function body without changing this pin.
+        for path, bodies in FUNCTION_BODIES.items():
+            lines = _norm_lines(path)
+            for fname, expected in bodies.items():
+                starts = [k for k, ln in enumerate(lines) if ln.startswith("%s() {" % fname)]
+                self.assertEqual(len(starts), 1, "%s: one %s() definition" % (path.name, fname))
+                k = starts[0]
+                end = k if lines[k].endswith("}") else lines.index("}", k)
+                self.assertEqual(tuple(lines[k : end + 1]), expected, "%s: %s() body differs from FUNCTION_BODIES" % (path.name, fname))
+        self.assertEqual({p: sorted(b) for p, b in FUNCTION_BODIES.items()}, {SMOKE: ["psql_pooled"], ENVELOPE: ["need", "now_ms", "worker"]})
 
     def test_redirect_scan_heredoc_opener_is_anchored(self):
         # r10 Q11: arithmetic `<<` and a here-string are not heredocs; an opener

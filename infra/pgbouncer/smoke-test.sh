@@ -121,7 +121,7 @@ POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-direc
 # psql and shares the compose network, so `pgbouncer` resolves).
 psql_pooled() {
   docker exec -i -e PGPASSWORD "$PG_CONTAINER" \
-    psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"
+    psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@" || return 1
 }
 
 echo "[2/4] AGE cypher transaction through the pooler (transaction-mode pinning) ..."

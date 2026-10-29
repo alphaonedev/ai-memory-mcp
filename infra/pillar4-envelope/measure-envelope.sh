@@ -29,8 +29,9 @@
 #
 # Exit codes:
 #   0   a knee was found and printed (the measured X)
-#   1   the stack bring-up failed (including the bind failure when another run
-#       holds 127.0.0.1:6432) or the teardown failed
+#   1   a load worker exited non-zero (the FAIL line names the step), the stack
+#       bring-up failed (including the bind failure when another run holds
+#       127.0.0.1:6432) or the teardown failed
 #   64  run as root
 #   65  bad AI_MEMORY_SMOKE_RUN
 #   69  a required tool is missing
@@ -180,7 +181,10 @@ curl -fsS "http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1/health" >/dev/null 2>&1 \
 BASE="http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1"
 now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 worker() {
-  local wid="$1" out="$2" deadline="$3" n=0 prev_id="" bodyf="${out}.body"
+  local wid="$1" out="$2" deadline="$3" n=0 prev_id=""
+  # A separate `local`: bash expands every word of one `local` before it assigns any, so
+  # "${out}" on the line above would be unbound under set -u and the worker would exit at once.
+  local bodyf="${out}.body"
   while [ "$(date +%s)" -lt "$deadline" ]; do
     n=$((n+1))
     local agent="env-w${wid}" title="w${wid}-m${n}"
@@ -229,7 +233,9 @@ for conc in $CONCURRENCY_STEPS; do
     worker "$w" "$step_out/w${w}.txt" "$deadline" &
     pids+=($!)
   done
-  for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+  worker_rc=0
+  for p in "${pids[@]}"; do wait "$p" || worker_rc=$?; done
+  [ "$worker_rc" -eq 0 ] || { echo "FAIL: a load worker exited with status $worker_rc at concurrency $conc" >&2; exit 1; }
 
   # Aggregate this step.
   read -r p50 p95 p99 shed reqs < <(cat "$step_out"/w*.txt 2>/dev/null | python3 -c '

@@ -67,6 +67,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--project-directory`, `--env-file` or `--project-name` path may follow on the same command; the pin
   comments now state that compose still reads a `.env` in the project directory for interpolation, which has
   no effect because the script exports every interpolated name and the guard refuses a tracked `.env`.
+  Round 15: the group scan models shell condition state: after `if`, `elif`, `while`, `until` or `!` the
+  scanner stays in condition context until the matching `then` or `do`, across `;`, newlines, comments and
+  blank lines, and refuses a group with a FAIL site opened there; a function whose body holds a FAIL site
+  is judged at each call site, which must be in statement position, and the whole body of `psql_pooled`,
+  `need`, `now_ms` and `worker` is pinned; `measure-envelope.sh` now exits 1 when a load worker exits
+  non-zero and `psql_pooled` returns non-zero to its caller on failure; each `docker compose` command is
+  read as shell words, so no later `-f`, `--file`, `--project-directory`, `--env-file`, `--project-name`,
+  `-p` or `--profile` may follow the pin in any quoting, and the envelope directory may hold only its listed
+  files; both scripts refuse every daemon-selection variable (`DOCKER_HOST`, `DOCKER_CONTEXT`,
+  `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`, `DOCKER_API_VERSION`) and `docker context`.
+  Propagating the worker status exposed #8299: `worker()` read `${out}` in the same `local` that assigned it, so
+  under `set -u` every worker had exited at its first line since #1737 and the harness could only report no
+  knee; `bodyf` now has its own `local`, and the guard refuses a declaration that reads its own names.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 
