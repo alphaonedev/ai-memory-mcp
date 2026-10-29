@@ -110,17 +110,24 @@ _W = r"(?:[^.;]|(?<=\d)\.(?=\d))"
 _T = "(?:" + E2E_TERM + ")"
 _STEM_RE = re.compile(_STEM, re.IGNORECASE)
 # A stem inside a path or file name token (01-secure-bootstrap.sh, docs/encryption.html) names a
-# file, not a claim: the whitespace-delimited token that holds it is a name that ends in a short
-# file extension. A bare "secure" or "end-to-end-encrypted" in the same sentence is still a stem.
-_FILENAME_RE = re.compile(r"^[\w./-]+\.[A-Za-z0-9]{1,4}$")
+# file, not a claim. A file name token is lower case, holds only word characters, dots, slashes and
+# hyphens, and either contains a slash or ends in one of the known extensions below; "encrypted.It"
+# (a missing space) and "encrypt-everything" are words, not files. A bare "secure" or
+# "end-to-end-encrypted" in the same sentence is still a stem. Each token is classified once.
+_FILE_EXTS = (".md", ".sh", ".py", ".rs", ".html", ".toml", ".yml", ".yaml", ".json", ".txt", ".lock")
+_FILE_CHARS_RE = re.compile(r"[\w./-]+")
 _TOKEN_EDGE = "()[]{}<>\"',;:!?"
 
 
-def _is_claim_stem(sent, match):
-    left = sent.rfind(" ", 0, match.start()) + 1
-    right = sent.find(" ", match.end())
-    token = sent[left:right if right >= 0 else len(sent)].strip(_TOKEN_EDGE)
-    return _FILENAME_RE.match(token) is None
+def _is_file_token(token):
+    token = token.strip(_TOKEN_EDGE)
+    return (token == token.lower() and _FILE_CHARS_RE.fullmatch(token) is not None
+            and ("/" in token or token.endswith(_FILE_EXTS)))
+
+
+def _has_claim_stem(sent):
+    """True when a whitespace-delimited token that is not a file name holds an encryption stem."""
+    return any(_STEM_RE.search(tok) and not _is_file_token(tok) for tok in sent.split(" "))
 
 
 def _strip_cf(text):
@@ -147,8 +154,7 @@ class _E2EGate:
         if E2E_SLUG_RE.search(unit) or E2E_ABBR_RE.search(unit):
             return True
         for sent in SENTENCE_SPLIT_RE.split(_plain(unit)):
-            if E2E_TERM_RE.search(sent) and any(_is_claim_stem(sent, m)
-                                                for m in _STEM_RE.finditer(sent)):
+            if E2E_TERM_RE.search(sent) and _has_claim_stem(sent):
                 return True
         return False
 
@@ -184,12 +190,15 @@ SCOPE_REFUSED = [
 FUTURE_RE = re.compile(r"\b(?:will|shall|to)\s+be\s+(?:\w+\s+){0,3}" + E
                        + r"|" + E + _W + r"{0,40}\bat\s+GA\b|\bencrypted\s+at\s+GA\b"
                        + r"|\bships?\s+(?:with|in|at)\s+GA\b|\bat\s+GA\b", re.IGNORECASE)
-# Under-claim wording: a sentence about the term, #8278 or variant A/B (UNDER_SUBJECT_RE) that uses
-# a postponement verb is refused whatever the target; a move verb followed by a later version, after
-# GA or the next release, or "removed from ... scope", is refused too; so is the GA scope
-# exclusion (SCOPE_REFUSED[:2]). The sentence bounds the scan, so the ROADMAP ruling paragraph that
-# postpones other items to v1.x stays clean; only "removed from this deferred set" (the dated
-# ROADMAP supersession note) is exempt, while "in this deferred set" is a postponement.
+# Under-claim wording, ONE definition. A sentence about the term, #8278 or variant A/B
+# (UNDER_SUBJECT_RE) is refused when it: uses a postponement predicate (_DEFER); uses a move or
+# plan verb (_MOVE: slip, push, plan, schedule, target, slate, aim, due ...) followed by a later
+# version, after GA or the next release; says "removed from ... scope"; names a GA scope exclusion
+# (SCOPE_REFUSED[:2], _EXCLUDE); calls it a later-version item (_EXCLUDE). Postponement wording
+# in a sentence that names #8278 or variant A/B is refused with no predicate needed (_NAMED_DEFER).
+# The sentence bounds the scan, so the ROADMAP ruling paragraph that postpones other items to v1.x
+# stays clean. Decision: no blanket "subject plus any later version" refusal (3 false positives on
+# the docs: README.md 1, ROADMAP.md 2). Exempt: the one true ROADMAP supersession clause only.
 # _LATER is any version other than v1.0.0, later, after GA, post GA, or a next/future release.
 _LATER = (r"(?:\bv(?:1\.0\.[1-9]\d*|1\.[1-9x]\d*|1\d+|[2-9]\d*)(?:\.\d+)*"
           r"|\blater\b|\bafter\s+GA\b|\bpost[\s-]*GA\b"
@@ -200,23 +209,44 @@ _PAST = r"(?:deferred|postponed|slipped)"
 _DEFER = (r"\b(?:is|are|was|were|be|been|being|remains?|remained|gets?|got)\s+(?:\w+\s+){0,2}"
           + _PAST + r"\b|\b" + _PAST + r"\s+(?:to|until|till|past|beyond|after|post|for)\b"
           r"|\b(?:defers?|postpones?|punts?)\b|\bdeferred\s+set\b")
-_MOVE = r"\b(?:slip|push|mov|punt|defer|postpon|land|ship|come|arriv)\w*\b"
+_MOVE = (r"\b(?:slip|push|mov|punt|defer|postpon|land|ship|come|arriv|plann|schedul|target|slat"
+         r"|aim|due|retarget|re-target)\w*\b")
 _REMOVED = r"\bremoved\s+from\s+(?:the |ga |v1\.0\.0 |\w+ ){0,3}scope\b"
-UNDER_RE = re.compile(_DEFER + "|" + _MOVE + r"(?:\W+\w+){0,4}?\W+" + _LATER + "|" + _REMOVED,
-                      re.IGNORECASE)
-# Subjects: the end-to-end term, #8278, and variant A or B (upper case letter only).
-UNDER_SUBJECT_RE = re.compile(E2E_TERM + r"|#8278|(?-i:\b[Vv]ariants?\s+[AB]\b)", re.IGNORECASE)
-DEFERRED_SET = "removed from this deferred set"
+_EXCLUDE = (r"\b(?:not|never|no\s+longer)\b(?:\W+\w+){0,3}?\W+"
+            r"(?:part\s+of|in|included\s+in|ship\w*|land\w*)\b[^.;]{0,30}?\b(?:v1\.0\.0|GA)\b"
+            r"|\bexclud\w*\s+from\b|\bdescoped\b"
+            r"|\b(?:planned|scheduled|targeted|slated|tracked)\s+for\s+(?:\w+\s+){0,2}" + _LATER
+            + r"|\ban?\s+" + _LATER + r"\s+(?:item|feature|deliverable|milestone|target)\b")
+UNDER_RE = re.compile(_DEFER + "|" + _MOVE + r"(?:\W+\w+){0,4}?\W+" + _LATER + "|" + _REMOVED
+                      + "|" + _EXCLUDE, re.IGNORECASE)
+# Subjects: the end-to-end term, content encryption, #8278, and variant A or B (upper case letter).
+UNDER_SUBJECT_RE = re.compile(E2E_TERM + r"|content\s+encryption|#8278|(?-i:\b[Vv]ariants?\s+[AB]\b)",
+                              re.IGNORECASE)
+NAMED_SUBJECT_RE = re.compile(r"#8278|(?-i:\b[Vv]ariants?\s+[AB]\b)", re.IGNORECASE)
+_NAMED_DEFER = re.compile(r"\b(?:deferr(?:ed|al)|postponed|descoped?)\b(?!-)", re.IGNORECASE)
+# The dated supersession note, ROADMAP.md:986: "(Superseded by #8278 on 2026-10-28: federation
+# content encryption was removed from this deferred set and is in v1.0.0 GA scope." Only this whole
+# true clause is exempt, only in ROADMAP.md, and only after the negated form is refused.
+DEFERRED_CLAUSE = ("federation content encryption was removed from this deferred set "
+                   "and is in v1.0.0 GA scope")
+ROADMAP_REL = "ROADMAP.md"
+NEG_REMOVED_RE = re.compile(r"\b(?:not|never)\b(?:\W+\w+){0,2}?\W+removed\s+from\s+this\s+deferred\s+set",
+                            re.IGNORECASE)
 # The one sentence splitter: a period or semicolon plus whitespace ends a sentence, except after
 # "e.g", "i.e" and "etc" in any case. A period with no whitespace after it (v1.x, a URL) never splits.
 SENTENCE_SPLIT_RE = re.compile(r"(?<!\b[eE]\.g)(?<!\b[iI]\.e)(?<!\b[eE][tT][cC])[.;]\s")
 
 
-def _underclaims(sent):
+def _underclaims(sent, rel=None):
     """True for a sentence about the term or #8278 that defers it or puts it out of GA scope."""
-    sent = sent.replace(DEFERRED_SET, "")
-    return bool(UNDER_SUBJECT_RE.search(sent)
-                and (UNDER_RE.search(sent) or any(rx.search(sent) for rx in SCOPE_REFUSED[:2])))
+    if NEG_REMOVED_RE.search(sent):
+        return True
+    if not UNDER_SUBJECT_RE.search(sent):
+        return False
+    if rel == ROADMAP_REL:
+        sent = sent.replace(DEFERRED_CLAUSE, "")
+    return bool(UNDER_RE.search(sent) or any(rx.search(sent) for rx in SCOPE_REFUSED[:2])
+                or (NAMED_SUBJECT_RE.search(sent) and _NAMED_DEFER.search(sent)))
 
 LANDING = "landed on release/v1.0.0"
 # The one pointer sentence quoted in every file that mentions end-to-end content encryption.
@@ -293,6 +323,16 @@ def _plain(text):
     """Flatten and drop markdown emphasis, backticks and link targets before wording scans."""
     text = re.sub(r"\]\([^)]*\)", "]", text)
     return _flat(re.sub(r"[*`]", "", _strip_cf(text)))
+
+
+# The statement is scanned like every other place, except for the two true sentences it exists to
+# state: the pinned canonical paragraph, and the one fact that #1968 was closed with the label
+# `deferred-v1.x` and is superseded by #8278. Only these exact strings are removed.
+LABEL_FACT = "[#1968] was closed with the deferred-v1.x label and is superseded by #8278."
+
+
+def _neutral_statement(plain):
+    return plain.replace(_plain(E2E_CANON), "").replace(LABEL_FACT, "")
 
 
 def _units(text):
@@ -417,7 +457,7 @@ class CertificationScope8262(unittest.TestCase):
             self.assertIsNone(STALE_RE.search(text), rel + " carries a stale '#1968 open' claim")
             for unit in _units(text):
                 for sent in SENTENCE_SPLIT_RE.split(_plain(unit)):
-                    self.assertFalse(_underclaims(sent),
+                    self.assertFalse(_underclaims(sent, rel),
                                      "end-to-end scope pushed past v1.0.0 (under-claim) in "
                                      + rel + ": " + sent[:100])
                 if not E2E_GATE.search(unit):
@@ -433,13 +473,21 @@ class CertificationScope8262(unittest.TestCase):
             for line in self._history(rel):
                 self._refuse_overclaim(_plain(line), rel + " history: " + line[:80])
 
-    def _refuse_overclaim(self, plain, head):
+    def _refuse_overclaim(self, plain, head, landing_ok=True):
         for rx in SCOPE_REFUSED:
             self.assertIsNone(rx.search(plain), "end-to-end over-claim (%s) in %s"
                               % (rx.pattern[:40], head))
-        if LANDING not in plain:
+        if LANDING not in plain or not landing_ok:
             self.assertIsNone(FUTURE_RE.search(plain),
                               "future-tense end-to-end wording without the landing condition: " + head)
+
+    def test_statement_is_scanned_for_over_and_under_claims(self):
+        for unit in _units(_subsection()):
+            plain = _neutral_statement(_plain(unit))
+            for sent in SENTENCE_SPLIT_RE.split(plain):
+                self.assertFalse(_underclaims(sent), "statement under-claim: " + sent[:100])
+            if E2E_GATE.search(plain):
+                self._refuse_overclaim(plain, "statement: " + plain[:100], landing_ok=False)
 
     def test_pointer_sentence_quoted_in_every_pointer_file(self):
         for rel in POINTER_SENTENCE_FILES:
@@ -516,6 +564,10 @@ class CertificationScope8262(unittest.TestCase):
                  "Federation is en\u00add-to-end encrypted.",
                  "Federation is end\ufe63to\ufe63end encrypted.",
                  "Federation is end\uff0dto\uff0dend encrypted.",
+                 # A missing space is a typo, not a file name; so is a hyphenated word.
+                 "Federation is end-to-end encrypted.It is certified.",
+                 "Federation is end-to-end in encrypt-everything mode and certified.",
+                 "Federation is end-to-end in Encrypt.MD mode.",
                  # One sentence is the plain text between sentence ends; e.g., i.e., etc. and the
                  # periods of v1.x or a URL do not end it.
                  "Federation content is end-to-end, e.g. across relays, encrypted and certified for v1.0.0.",
@@ -544,6 +596,7 @@ class CertificationScope8262(unittest.TestCase):
                   "Federation travels end-to-end. It is encrypted and certified.",
                   "Federation is encrypted (mTLS; end-to-end) and certified.",
                   "01-secure-bootstrap.sh is a runnable end-to-end demo.",
+                  "Run scripts/secure-demo for the end-to-end demo.",
                   "See docs/encryption.html for the end-to-end demo."]:
             self.assertFalse(E2E_GATE.search(s), s)
         for s in ["End-to-end content encryption is deferred until v1.x.", "#8278 postponed to v1.x.",
@@ -565,12 +618,43 @@ class CertificationScope8262(unittest.TestCase):
                   "A deferred graph projection ships beside end-to-end content encryption.",
                   "#8278 landed on release/v1.0.0 for GA."]:
             self.assertFalse(_underclaims(s), s)
-        # The dated ROADMAP supersession note is a true statement, not an under-claim.
+        # The dated ROADMAP supersession note is a true statement, not an under-claim: exempt as the
+        # whole clause, in ROADMAP.md only, and never in its negated or conjoined forms.
         note = ("(Superseded by #8278 on 2026-10-28: federation content encryption was removed "
                 "from this deferred set and is in v1.0.0 GA scope.")
-        self.assertFalse(any(_underclaims(s) for s in SENTENCE_SPLIT_RE.split(note)))
-        for s in ["Superseded by #8278: removed from this deferred set and is in v1.0.0 GA scope"]:
-            self.assertFalse(_underclaims(s), s)
+        self.assertFalse(any(_underclaims(s, ROADMAP_REL) for s in SENTENCE_SPLIT_RE.split(note)))
+        self.assertTrue(_underclaims(note, "SECURITY.md"), "the exemption is ROADMAP.md only")
+        for s in ["#8278 was not removed from this deferred set.",
+                  "#8278 was never removed from this deferred set.",
+                  "#8278 has not been removed from this deferred set.",
+                  "#8278 is not removed from this deferred set.",
+                  "federation content encryption was not removed from this deferred set",
+                  "#8278 was removed from this deferred set and re-targeted to v1.1.",
+                  "#8278 was removed from this deferred set and pushed to v1.1.",
+                  "#8278 is in this deferred set.",
+                  "federation content encryption was removed from this deferred set and is in "
+                  "v1.0.0 GA scope, then re-targeted to v1.1.",
+                  "federation content encryption was not removed from this deferred set and is "
+                  "in v1.0.0 GA scope"]:
+            self.assertTrue(_underclaims(s, ROADMAP_REL), s)
+            self.assertTrue(_underclaims(s), s)
+        # Non-predicate postponement of #8278 / variant A or B, and exclusions without "scope".
+        for s in ["Status of #8278: deferred.", "| #8278 | federation content encryption | deferred |",
+                  "Federation content encryption (#8278, deferred) follows GA.",
+                  "The operator approved the defer" "ral of #8278.", "#8278 is not part of v1.0.0 GA.",
+                  "#8278 does not ship in v1.0.0.", "#8278 is excluded from the v1.0.0 GA release.",
+                  "#8278 is a v1.1 item.", "#8278 is planned for v1.1.",
+                  "#8278 is no longer in the GA scope.", "#8278 is not in GA.",
+                  "End-to-end content encryption is not part of v1.0.0 GA.",
+                  "#8278 targets v1.1.", "#8278 is a v1.1 deliverable.",
+                  "#8278 is scheduled for v1.1.", "Federation content encryption is deferred until v1.1.",
+                  "Variant B is not part of v1.0.0 GA.", "#8278 is out of the GA scope.",
+                  "Variants A and B are out of the GA scope.", "#8278 is deferred until v1.1."]:
+            self.assertTrue(_underclaims(s), s)
+        # README.md:121 style: an attributive deferred noun, no #8278 or variant, stays clean.
+        self.assertFalse(_underclaims("A deferred Apache-AGE graph projection ships beside the "
+                                      "end-to-end content encryption work."))
+        self.assertFalse(_underclaims("The `deferred-v1.x` label was applied to #1968 in 2026."))
         for s in ["Federation content will be end-to-end encrypted at GA.",
                   "E2E at GA.", "Content is encrypted at GA.", "E2E ships with GA.",
                   "E2E ships in GA."]:
@@ -593,6 +677,11 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(src.count("(?:encrypt" + "|"), 1, "a second stem alternation literal")
         self.assertEqual(src.count("encrypt" + "|"), 1, "a second stem alternation literal")
         self.assertEqual(src.count("|seal" + "|"), 1, "a second stem alternation literal")
+        # The move and plan verbs are spelled once (_MOVE); a second narrower literal fails here.
+        self.assertEqual(src.count("slip" + "|push"), 1, "a second move verb alternation literal")
+        self.assertEqual(src.count("plann" + "|schedul"), 1, "a second plan verb alternation literal")
+        self.assertEqual(src.count("part" + chr(92) + "s+of|in|included"), 1,
+                         "a second exclusion alternation literal")
         for code in [0x2D, 0x20, 0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2212,
                      0xFE63, 0xFF0D]:
             sep = chr(code)
@@ -602,12 +691,38 @@ class CertificationScope8262(unittest.TestCase):
                                 for rx in SCOPE_REFUSED), repr(sep))
         self.assertTrue(E2E_GATE.search("Content is en" + SOFT_HYPHEN + "d-to-end encrypted."))
 
+    def test_statement_neutraliser_removes_only_the_two_true_strings(self):
+        canon = _plain(E2E_CANON)
+        self.assertEqual(_neutral_statement("a " + canon + " b"), "a  b")
+        self.assertIn(LABEL_FACT, _plain(_subsection()), "the true label sentence moved")
+        self.assertEqual(_neutral_statement("x " + LABEL_FACT + " y"), "x  y")
+        # A second sentence that names the label is NOT neutralised.
+        second = "[#8278] carries the deferred-v1.x label and is deferred until v1.1."
+        out = _neutral_statement(LABEL_FACT + " " + second)
+        self.assertIn(second, out)
+        self.assertTrue(any(_underclaims(s) for s in SENTENCE_SPLIT_RE.split(out)))
+        # A reworded canonical paragraph is not removed either.
+        self.assertIn("Variant B is deferred until v1.1.",
+                      _neutral_statement(canon + " Variant B is deferred until v1.1."))
+        over = "Federation content is end-to-end encrypted today."
+        self.assertTrue(E2E_GATE.search(over))
+        self.assertTrue(any(rx.search(over) for rx in SCOPE_REFUSED))
+
+    def test_claim_stem_classification_is_linear(self):
+        import time
+        for sent in ["end-to-end " + "x/encrypt" * 22000 + ".md", "end-to-end " + "encrypt" * 30000,
+                     "end-to-end " + "a.encrypt" * 22000, "encrypt " * 25000 + "end-to-end",
+                     "end-to-end " * 18200]:
+            t0 = time.perf_counter()
+            E2E_GATE.search(sent)
+            self.assertLess(time.perf_counter() - t0, 1.0, sent[:30])
+
     def test_underclaim_pattern_spares_the_roadmap_ruling_paragraph(self):
         units = [u for u in _units(self._scoped_text("ROADMAP.md")) if "postponed to v1.x" in u]
         self.assertTrue(units, "the ROADMAP ruling paragraph moved")
         for unit in units:
             for sent in SENTENCE_SPLIT_RE.split(_plain(unit)):
-                self.assertFalse(_underclaims(sent), sent[:80])
+                self.assertFalse(_underclaims(sent, ROADMAP_REL), sent[:80])
 
     def test_in_heading_does_not_say_certified_and_cites_reissue(self):
         text = CERT.read_text(encoding="utf-8")
