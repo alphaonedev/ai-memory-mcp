@@ -20,7 +20,8 @@
 # auth_type), the stack bring-up failed (including the bind failure when another
 # run holds 127.0.0.1:6432) or the teardown failed; 64 run as root; 65 bad
 # AI_MEMORY_SMOKE_RUN; 73 the role has no SCRAM-SHA-256 verifier (refused, never
-# written to the userlist); 74 the pooled URL carries a password (refused).
+# written to the userlist); 74 the pooled URL carries a password (refused). Any
+# other unlisted non-zero status is the failing command's own, under set -e.
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -114,7 +115,7 @@ echo "[2/4] AGE cypher transaction through the pooler (transaction-mode pinning)
 # All statements in ONE -c transaction => one BEGIN/COMMIT => one pooled
 # backend. If pool_mode were 'statement' the cypher() call could land on a
 # backend where LOAD/SET never ran and fail.
-psql_pooled <<'SQL'
+psql_pooled <<'SQL' || { echo "FAIL: AGE cypher transaction through the pooler failed" >&2; exit 1; }
 BEGIN;
 LOAD 'age';
 SET LOCAL search_path = ag_catalog, "$user", public;
@@ -130,7 +131,7 @@ SET LOCAL search_path = ag_catalog, "$user", public;
 SELECT count(*) FROM cypher('pgbouncer_smoke', $$ MATCH (a:N {id:'a'})-[:E]->(b:N {id:'b'}) RETURN a $$) AS (a agtype);
 COMMIT;
 SQL
-)"
+)" || { echo "FAIL: AGE edge lookup through the pooler failed" >&2; exit 1; }
 path_count="$(printf '%s' "$path_count" | tr -dc '0-9')"
 if [ "${path_count:-0}" -lt 1 ]; then
   echo "FAIL: AGE edge not found through the pooler (count=$path_count) — transaction-mode pinning broken?" >&2
@@ -139,7 +140,7 @@ fi
 echo "      OK: AGE edge round-tripped through pgbouncer:6432 (count=$path_count)"
 
 echo "[3/4] role-default statement_timeout visible through the pooler ..."
-st="$(psql_pooled -c 'SHOW statement_timeout;')"
+st="$(psql_pooled -c 'SHOW statement_timeout;')" || { echo "FAIL: SHOW statement_timeout through the pooler failed" >&2; exit 1; }
 echo "      statement_timeout = ${st}"
 if [ "$st" != "30s" ]; then
   echo "FAIL: role-default statement_timeout did not survive the pooler (got '${st}', want '30s'). \

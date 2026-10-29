@@ -52,7 +52,7 @@ from your environment if set). `docker-compose.yml` has no default password and
 no default pooler user: running `docker compose` directly fails closed unless
 `POSTGRES_PASSWORD`, `PGBOUNCER_UID`, `PGBOUNCER_GID` and `AI_MEMORY_SMOKE_RUN` are
 exported (`export PGBOUNCER_UID=$(id -u) PGBOUNCER_GID=$(id -g)`; the run suffix is
-`[a-z0-9_-]+`, and the userlist bind file name follows it:
+`[a-z0-9_-]+`, at most 64 characters, and the userlist bind file name follows it:
 `.userlist.generated.<AI_MEMORY_SMOKE_RUN>.txt`, render it from the role verifier first, or compose binds a directory). The pooler is published
 on `127.0.0.1:6432` only, never on all interfaces (#4734).
 
@@ -73,7 +73,7 @@ rules.
 ### Concurrent runs and exit codes
 
 Both scripts derive a per-run suffix (`AI_MEMORY_SMOKE_RUN`, default
-`$(date +%s)-$$`; override with `[a-z0-9_-]+`). The compose project
+`$(date +%s)-$$`; override with `[a-z0-9_-]+`, at most 64 characters). The compose project
 (`ai-memory-pgbouncer-smoke-<run>` / `ai-memory-pgbouncer-envelope-<run>`), both container
 names (`ai-memory-pgbouncer-<run>` and `ai-memory-pgbouncer-<run>-postgres`) and the
 userlist file are unique per run, so a trap only removes its own project and two runs never
@@ -85,7 +85,7 @@ instead of touching the first. `smoke-test.sh` exit codes: 1 a property failed (
 `auth_type = scram-sha-256`), the stack bring-up failed (including that concurrent-run bind failure) or the
 teardown failed, 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN` (outside `[a-z0-9_-]` or over 64 characters), 73 no SCRAM-SHA-256
 verifier, 74 the pooled URL carries a password (refused; the password only travels as the inherited
-`PGPASSWORD`). The envelope codes are in `infra/pillar4-envelope/README.md`.
+`PGPASSWORD`); any other unlisted non-zero status is the exit status of the failing command under `set -e`. The envelope codes are in `infra/pillar4-envelope/README.md`.
 
 History: an earlier revision of this PR re-stored the smoke role as an md5
 verifier; that downgrade is gone.

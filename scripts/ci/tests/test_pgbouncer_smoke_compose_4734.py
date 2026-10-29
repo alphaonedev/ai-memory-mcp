@@ -39,10 +39,19 @@ word (quoted or not, also as a docker exec command), `docker inspect`,
 `docker compose ... config`, `<>` redirects, any `environ`/`ENVIRON`/`getenv` word are
 refused; the redirect-target variables are pinned to their single assignment and the
 python3/awk call sites to an exact-line allowlist.
+r10: after deleting backslashes and quotes from a code line, env/printenv/declare/typeset
+are refused anywhere on it (no start anchor), as are a bare set/export and `local -n`;
+a heredoc body line starting with a backslash (psql shell escape) is refused; the
+compose file names POSTGRES_PASSWORD exactly once (postgres.environment) and has no
+env_file; every psql_pooled call carries the FAIL-and-exit-1 or-branch; a `) || true`
+subshell, a function named like a builtin or any function outside the pinned set, a
+second cleanup() or trap, a negated .gitignore line and a fake heredoc opener are refused.
 """
 import fnmatch
 import pathlib
 import re
+import shutil
+import subprocess
 import unittest
 
 try:  # CI Python may not ship PyYAML; the fallback below is a real structured parse.
@@ -83,12 +92,15 @@ ENV_DUMPERS = re.compile(
     r"|/proc/(?:self|thread-self|\$\$|\$\{?BASHPID\}?|\d+)/environ|\bcompgen\s+-[a-zA-Z]*[ev]\b|\bset\s*$|\bexport\s*$|\btee\b"
 )
 REDIRECT = re.compile(r"(?<![-<=>])(?:\d?(?:>>?|<>)|&>)(?!&\d)\s*(\S+)")
-CMD_START = r"(?:^|[;&|(`{]|\$\(|\b(?:then|do|else|exec|command|xargs|sudo|nohup|nice|time)\s|/)\s*[\"']?"
 SHELL_TRACE = re.compile(
     r"(?<![\w-])set\s+(?:-\S*\s+)*?(?:-[a-zA-Z]*[xv][a-zA-Z]*(?![\w-])|-[a-zA-Z]*o\s+[\"']?(?:xtrace|verbose))"
 )
-BARE_BUILTIN = re.compile(CMD_START + r"(?:set|export)[\"']?(?=\s*(?:$|[;&|)<>]))")
-DUMP_COMMAND = re.compile(CMD_START + r"(?:env|declare|typeset|printenv)[\"']?(?![\w-])")
+# r10 S9: matched on a line with `\`, `"` and `'` deleted, anywhere on the line.
+DUMP_WORD = re.compile(r"(?<![\w-])(?:env|printenv|declare|typeset)(?![\w-])")
+BARE_SET = re.compile(r"\bset\s*(?:$|[;&|)])")
+BARE_EXPORT = re.compile(r"\bexport\s*(?:$|[;&|)])")
+LOCAL_NAMEREF = re.compile(r"\blocal\s+-[a-zA-Z]*n")
+PSQL_META = re.compile(r"^\s*\\")
 EXEC_DUMP = re.compile(r"\bdocker\b.*\bexec\b.*\s[\"']?(?:env|printenv|set|export|declare|typeset)[\"']?(?:\s|$)")
 DOCKER_DISCLOSE = re.compile(r"\bdocker\b.*\binspect\b|\bdocker\b.*\bcompose\b.*\bconfig\b|\bdocker-compose\b.*\bconfig\b")
 ENVIRON_WORD = re.compile(r"\benviron\b|\bENVIRON\b|\bgetenv\b")
@@ -155,11 +167,19 @@ POOLED_URL_ENVELOPE = 'POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_
 COMPOSE_PW_LINE = re.compile(
     r'^POSTGRES_PASSWORD="\$PW" docker compose -p "\$PROJECT"(?: -f "\$POOL_COMPOSE")? up -d --wait(?: postgres)?$'
 )
+PSQL_FAIL_BRANCH = r""" \|\| \{ echo "FAIL: [^"]+" >&2; exit 1; \}"""
 PSQL_POOLED_SITES = (
-    re.compile(r"^psql_pooled <<'SQL'$"),
+    re.compile(r"^psql_pooled <<'SQL'" + PSQL_FAIL_BRANCH + "$"),
     re.compile(r"""^path_count="\$\(psql_pooled <<'SQL'$"""),
-    re.compile(r"""^st="\$\(psql_pooled -c 'SHOW statement_timeout;'\)"$"""),
+    re.compile(r"""^st="\$\(psql_pooled -c 'SHOW statement_timeout;'\)\"""" + PSQL_FAIL_BRANCH + "$"),
 )
+PSQL_HEREDOC_CLOSER = re.compile(r"""^\)\"""" + PSQL_FAIL_BRANCH + "$")
+PINNED_FUNCTIONS = {
+    SMOKE: {"cleanup", "psql_pooled"},
+    ENVELOPE: {"cleanup", "need", "now_ms", "worker"},
+}
+FUNCTION_DEF = re.compile(r"^\s*(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\))")
+OR_TRUE_AFTER_GROUP = re.compile(r"\)\s*\|\|\s*(?:true|:)(?![\w-])")
 PSQL_POOLED_DEF = 'docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"'
 GITIGNORE = PGB / ".gitignore"
 LITERAL_DEFAULTS = ("ai_memory_smoke", "ai_memory_envelope")
@@ -344,6 +364,21 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         for lit in LITERAL_DEFAULTS:
             self.assertNotIn(lit, COMPOSE.read_text())
 
+    def test_compose_password_is_referenced_once_and_no_env_file(self):
+        # r10 S10: a second ${POSTGRES_PASSWORD} (under any key, in any service)
+        # would copy the password into another container's environment, which
+        # `docker inspect` shows; env_file would load an arbitrary file.
+        text = _compose_code()
+        self.assertEqual(
+            len(re.findall(r"\$\{?POSTGRES_PASSWORD\b", text)), 1, "compose must name POSTGRES_PASSWORD exactly once"
+        )
+        services = _services()
+        self.assertRegex(services["postgres"]["environment"].get("POSTGRES_PASSWORD", ""), REQUIRED_PW)
+        for name, spec in services.items():
+            if name != "postgres":
+                self.assertNotIn("POSTGRES_PASSWORD", "".join(spec["environment"].values()), name)
+        self.assertNotRegex(text, r"(?m)^\s*-?\s*env_file\s*:", "no service may set env_file")
+
     def test_scripts_generate_random_password(self):
         for path in SCRIPTS:
             code = [ln.strip() for ln in _code_lines(path)]
@@ -495,6 +530,14 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 for ln in cmds:
                     self.assertNotIn("POOLED_URL", ln, ln)
 
+    def test_cleanup_is_defined_once_and_trapped_once(self):
+        # r10 Q9: a second cleanup() after the trap line replaces the pinned body at runtime.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            defs = [ln for ln in code if re.match(r"^(?:function\s+cleanup\b|cleanup\s*\(\))", ln)]
+            self.assertEqual(defs, ["cleanup() {"], "%s: exactly one cleanup() definition (CLEANUP_BODY): %r" % (path.name, defs))
+            self.assertEqual(code.count("trap cleanup EXIT"), 1, "%s: exactly one trap cleanup line (CLEANUP_BODY)" % path.name)
+
     def test_cleanup_trap_and_exit_status_are_pinned(self):
         # N1 + r4 P1/P2: exactly one trap in the script and it is the cleanup
         # arming; cleanup() starts with rc=$? and ends with exit "$rc"; the smoke
@@ -508,7 +551,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             body = code[start + 1 : end]
             # r9 S6: `rc=$?` anywhere but the first line is itself a reset, and a
             # loop can overwrite rc; the body is the exact statement list.
-            self.assertEqual(body, CLEANUP_BODY[path], "%s: cleanup() body differs from the pinned list" % path.name)
+            self.assertEqual(body, CLEANUP_BODY[path], "%s: cleanup() body differs from CLEANUP_BODY" % path.name)
             self.assertEqual(body[0], "rc=$?", "%s: rc=$? must be the first statement" % path.name)
             self.assertEqual(body[-1], 'exit "$rc"', "%s: cleanup must exit with rc" % path.name)
             self.assertLess(end, code.index("trap cleanup EXIT"), path.name)
@@ -523,6 +566,28 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 self.assertEqual(len(zeros), 1, "%s: expected one success exit" % path.name)
                 before = [ln for ln in code[: zeros[0]] if re.match(r"^(?:if\b|elif\b|else\b|fi\b)", ln)]
                 self.assertEqual(before[-1], 'if [ -n "$KNEE" ]; then', "%s: exit 0 outside the knee branch" % path.name)
+
+    def test_fail_sites_cannot_be_neutralised(self):
+        # r10 Q8: an exit inside a subshell does not end the script, so a FAIL site
+        # in `( ... ) || true` is fail-open; a function named exit/return/trap (or
+        # any function outside the pinned set) can shadow the builtins.
+        for path in SCRIPTS:
+            lines = _norm_lines(path)
+            for k, ln in enumerate(lines):
+                self.assertNotRegex(ln, OR_TRUE_AFTER_GROUP, "%s: a group or-true'd away: %s" % (path.name, ln))
+                if FAIL_ECHO.search(ln):
+                    self.assertNotRegex(ln, r"\(\s*[^)]*\becho\b", "%s: FAIL echo inside a subshell: %s" % (path.name, ln))
+                    prev = lines[k - 1] if k else ""
+                    self.assertFalse(prev.endswith("("), "%s: FAIL echo inside a subshell: %s" % (path.name, ln))
+                self.assertNotRegex(ln, r"^\s*alias\s", "%s: alias can shadow a builtin: %s" % (path.name, ln))
+            names = set()
+            for ln in lines:
+                m = FUNCTION_DEF.match(ln)
+                if m and (m.group(1) or m.group(2)) and (m.group(1) or "{" in ln):
+                    names.add(m.group(1) or m.group(2))
+            for banned in ("exit", "return", "trap", "builtin", "command"):
+                self.assertNotIn(banned, names, "%s: function named %s" % (path.name, banned))
+            self.assertEqual(names, PINNED_FUNCTIONS[path], "%s: function set differs from the pinned list" % path.name)
 
     def test_non_scram_verifier_is_refused(self):
         # N3 + r4 P4: the case has exactly two arms, the SCRAM arm and one
@@ -652,10 +717,15 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
 
     @staticmethod
     def _redirect_targets(path):
+        return PgbouncerSmokeComposeTest._scan_redirects(_norm_lines(path), path.name)
+
+    @staticmethod
+    def _scan_redirects(lines, name):
         """Redirect targets outside heredoc bodies; quoted text is neutralised
         to `Q<content>` (with `>` and `<` blanked) so a quoted target survives."""
         targets, heredoc = [], None
-        for ln in _norm_lines(path):
+        for ln in lines:
+            ln = ln if heredoc else re.sub(r"\(\(.*?\)\)", " ", ln)  # arithmetic is not a redirect or heredoc
             if heredoc:
                 if ln == heredoc:
                     heredoc = None
@@ -666,10 +736,43 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 ln,
             )
             targets.extend(t.rstrip(");&|") for t in REDIRECT.findall(plain))
-            here = re.search(r"<<-?\s*'?\"?(\w+)", ln)
-            if here:
-                heredoc = here.group(1)
+            for tok in re.finditer(r"\"[^\"]*\"|'[^']*'|(?<!<)<<(?!<)-?\s*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))", ln):
+                word = tok.group(1) or tok.group(2) or tok.group(3)
+                if word:
+                    heredoc = word
+                    break
+        if heredoc is not None:
+            raise AssertionError("%s: heredoc terminator %s never found; the redirect scan would be blind" % (name, heredoc))
         return targets
+
+    def test_redirect_scan_heredoc_opener_is_anchored(self):
+        # r10 Q11: arithmetic `<<` and a here-string are not heredocs; an opener
+        # whose terminator never appears fails the guard instead of blinding it.
+        scan = self._scan_redirects
+        self.assertEqual(scan(["x=$((1<<4))", "echo y > sixth.txt"], "t"), ["sixth.txt"])
+        self.assertEqual(scan(["cat <<<word > out.txt"], "t"), ["out.txt"])
+        self.assertEqual(scan(["cat <<'EOF' > a.txt", "echo b > c.txt", "EOF", "echo d > e.txt"], "t"), ["a.txt", "e.txt"])
+        with self.assertRaises(AssertionError):
+            scan(["cat <<'EOF'", "echo b > c.txt"], "t")
+
+    def test_dump_word_patterns_selftest(self):
+        # r10 S9: the words are refused anywhere once quotes and backslashes are deleted;
+        # env-w${wid} (a file-name prefix) and uppercase SQL SET LOCAL are not hits.
+        strip = lambda s: re.sub(r"[\\\"']", "", s)  # noqa: E731
+        for bad in ("timeout 5 env", "sh -c env", "e\"\"nv", "\\env", "builtin declare -x", "bash -c 'set'", "x; export"):
+            s = strip(bad)
+            self.assertTrue(DUMP_WORD.search(s) or BARE_SET.search(s) or BARE_EXPORT.search(s), bad)
+        self.assertTrue(LOCAL_NAMEREF.search("local -n ref=x"))
+        for ok in ("w${wid} env-w${wid}.txt", "SET LOCAL search_path = a, b", "set -euo pipefail", "envelope"):
+            s = strip(ok)
+            self.assertFalse(DUMP_WORD.search(s) or BARE_SET.search(s) or BARE_EXPORT.search(s), ok)
+
+    def test_smoke_docs_carry_the_unlisted_status_caveat(self):
+        # r10 Q7: the four-doc exit table must mean the same thing everywhere.
+        header = " ".join(ln.lstrip("# ").strip() for ln in SMOKE.read_text().splitlines()[:50] if ln.startswith("#"))
+        readme = " ".join(README_FOR[SMOKE].read_text().split())
+        for where, text in (("smoke header", header), ("pgbouncer README", readme)):
+            self.assertRegex(text, r"unlisted non-zero status is the (?:failing command's own|exit status of the failing command)", where)
 
     def _assert_exec_surface(self, path):
         """r9 S7: tracing, bare builtins, dump commands, container metadata,
@@ -678,8 +781,12 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         lines = _norm_lines(path)
         for ln in lines:
             self.assertNotRegex(ln, SHELL_TRACE, "%s: shell tracing prints expanded secrets: %s" % (name, ln))
-            self.assertNotRegex(ln, BARE_BUILTIN, "%s: bare set/export lists the environment: %s" % (name, ln))
-            self.assertNotRegex(ln, DUMP_COMMAND, "%s: env/declare/typeset/printenv as a command: %s" % (name, ln))
+            bare = re.sub(r"[\\\"']", "", ln)
+            self.assertNotRegex(bare, DUMP_WORD, "%s: env/printenv/declare/typeset word on a code line: %s" % (name, ln))
+            self.assertNotRegex(bare, BARE_SET, "%s: bare set lists the environment: %s" % (name, ln))
+            self.assertNotRegex(bare, BARE_EXPORT, "%s: bare export lists the environment: %s" % (name, ln))
+            self.assertNotRegex(bare, LOCAL_NAMEREF, "%s: local -n nameref can read the password: %s" % (name, ln))
+            self.assertNotRegex(ln, PSQL_META, "%s: psql backslash command (shell escape) in a heredoc: %s" % (name, ln))
             self.assertNotRegex(ln, EXEC_DUMP, "%s: docker exec of an environment dumper: %s" % (name, ln))
             self.assertNotRegex(ln, DOCKER_DISCLOSE, "%s: docker inspect/compose config discloses env: %s" % (name, ln))
             self.assertNotRegex(ln, ENVIRON_WORD, "%s: environ access: %s" % (name, ln))
@@ -753,6 +860,15 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertEqual(len(sites), 3, sites)
         for ln in sites:
             self.assertTrue(any(rx.match(ln) for rx in PSQL_POOLED_SITES), "psql_pooled call site outside the allowlist: %s" % ln)
+        # r10 Q7: a failed psql_pooled step must return the documented exit 1; the
+        # heredoc call carries the or-branch on its opener or on its closing line.
+        for k, ln in enumerate(code):
+            if re.match(r"""^(?:path_count="\$\()?psql_pooled <<'SQL'""", ln):
+                if ln.startswith("psql_pooled"):
+                    self.assertRegex(ln, PSQL_FAIL_BRANCH + "$", "psql_pooled heredoc call without the FAIL or-branch")
+                else:
+                    closer = code[code.index("SQL", k) + 1]
+                    self.assertRegex(closer, PSQL_HEREDOC_CLOSER, "psql_pooled heredoc call without the FAIL or-branch")
         at = code.index(POOLED_URL_LITERAL)
         # r8 S2: the refusal precedes the password and every container call.
         first_pw = next(i for i, ln in enumerate(code) if ln.startswith("PW="))
@@ -775,11 +891,26 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertTrue(bind, "compose userlist bind path not found")
         patterns = [ln.strip() for ln in GITIGNORE.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
         self.assertTrue(patterns)
+        self.assertFalse([p for p in patterns if p.startswith("!")], "negated .gitignore lines re-include the file: %r" % patterns)
         for run in ("1793223336-12345", "r7code", "a_b-c"):
             name = re.sub(r"\$\{AI_MEMORY_SMOKE_RUN:\?[^}]*\}", run, bind.group(1))
             self.assertEqual(name, ".userlist.generated.%s.txt" % run)
             self.assertTrue(any(fnmatch.fnmatchcase(name, pat) for pat in patterns), "%s is not gitignored: %r" % (name, patterns))
         self.assertFalse(any(fnmatch.fnmatchcase("userlist.txt", pat) for pat in patterns), "the committed userlist.txt must stay tracked")
+
+    def test_git_ignores_the_generated_userlist(self):
+        # r10 Q10: fnmatch is not git semantics; ask git itself when it is installed.
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git not on PATH; the fnmatch half in gitignore_covers_the_generated_userlist still ran")
+        probe = subprocess.run(
+            [git, "-C", str(PGB), "check-ignore", "--no-index", "-q", ".userlist.generated.r10code.txt"],
+            capture_output=True,
+            check=False,
+        )
+        if probe.returncode not in (0, 1):
+            self.skipTest("not inside a git work tree (git rc %d)" % probe.returncode)
+        self.assertEqual(probe.returncode, 0, "git does not ignore the generated userlist name")
 
     def test_exit_code_one_is_documented_with_bring_up_and_teardown(self):
         # r5 Q6 (decision: document, no new code): 1 covers a failed property,
