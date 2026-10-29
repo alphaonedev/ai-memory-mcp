@@ -519,10 +519,11 @@ def _block_start(text):
 
 def _lex(lines):
     """CommonMark reading of code blocks (round 16, sections 4.4, 4.5, 5.1 and 5.2). Returns
-    (code, bodies, unclosed): code[i] is True when line i opens, closes or sits inside a fenced
-    code block, or is an indented code line; bodies[i] is the line after its blockquote markers
-    and its list-item content column (what _line_heading() reads); unclosed holds the 0-based
-    opening line of a fence still open at the end of the text.
+    (code, bodies, unclosed, indented_code): code[i] is True when line i opens, closes or sits
+    inside a fenced code block, or is an indented code line; bodies[i] is the line after its
+    blockquote markers and its list-item content column (what _line_heading() reads); unclosed
+    holds the 0-based opening line of a fence still open at the end of the text; indented_code is
+    the set of 0-based indented code lines.
 
     The container is the blockquote depth plus the content column of the innermost open list item
     at that depth. A fence opens on 0-3 spaces relative to the container, also right after a list
@@ -533,7 +534,7 @@ def _lex(lines):
     than the list item's content column. Outside a paragraph a line 4+ spaces past the container is
     indented code. A list item ends at a non-blank line indented less than its content column unless
     the line continues a paragraph lazily."""
-    code, bodies, unclosed = [], [], []
+    code, bodies, unclosed, indented_code = [], [], [], set()
     items = []  # (blockquote depth, content column) of each open list item, outermost first
     fence = None  # [character, length, depth, container column, opening line]
     para = False
@@ -569,6 +570,7 @@ def _lex(lines):
         if ind - base >= 4 and not para:
             code.append(True)  # indented code: no heading, fence or list marker is read here
             bodies.append(body)
+            indented_code.add(n)
             continue
         if ind - base >= 4:
             code.append(False)  # 4+ spaces inside a paragraph: continuation text
@@ -604,7 +606,7 @@ def _lex(lines):
         para = not (_ATX_RE.match(text) or _BREAK_RE.match(text) or _HTML_HEADING_RE.match(text))
     if fence is not None:
         unclosed.append(fence[4])
-    return code, bodies, unclosed
+    return code, bodies, unclosed, indented_code
 
 
 def _alt_fence_flags(lines):
@@ -635,7 +637,11 @@ def _reading(lines, markdown=True):
     """(code, bodies, unclosed, alt) for a gated file. docs/encryption.html is HTML, not Markdown:
     no line is code, an HTML heading element is read at any indent and no ATX line is a heading."""
     if markdown:
-        return _lex(lines) + (_alt_fence_flags(lines),)
+        # The permissive reading models fences only, so an indented code line counts as code in
+        # both readings: indented code is never a disagreement (security r14 row rv-d8-atx-indent4-code).
+        code, bodies, unclosed, indented_code = _lex(lines)
+        alt = [flag or i in indented_code for i, flag in enumerate(_alt_fence_flags(lines))]
+        return code, bodies, unclosed, alt
     bodies = [x.lstrip(" \t") if _HTML_HEADING_RE.match(x.lstrip(" \t")) else "" for x in lines]
     return [False] * len(lines), bodies, [], [False] * len(lines)
 
@@ -1326,6 +1332,9 @@ class CertificationScope8262(unittest.TestCase):
         for head, tail in (("- item\n\n    ```\n  ", "\n    ```"), ("- ```\n  ", "\n  ```")):
             raw = notes + head + "## Federation\n\n  " + claim + tail
             self.assertEqual(texts(raw), [], raw)
+        # Indented code is code in both readings: a heading in it never adds a pair word.
+        self.assertEqual(texts(notes + "    ## Federation roadmap\n\n" + claim), [])
+        self.assertEqual(texts(notes + "    <h2>Federation</h2>\n\n" + claim), [])
         # Unclosed at the end: _lex() names the opening line; no gated file ends inside a fence.
         self.assertEqual(_lex(["x", "", "```", "## Federation"])[2], [2])
         self.assertEqual(_lex(["- ```", "  x", "", "y"])[2], [])
