@@ -515,7 +515,7 @@ pub fn evaluate_with_live(
 
     // ---- 13. AI_MEMORY_FED_SYNC_TRUST_PEER — MUST BE UNSET ---------
     // NB1 fix — call the REAL reader (`peer_attestation::sync_trust_peer_bypass`,
-    // exact-literal `"1"` match, `src/federation/peer_attestation.rs:366`)
+    // exact-literal `"1"` match, `src/federation/peer_attestation.rs`)
     // instead of the broader shared `security_profile::is_truthy` grammar (`1`/`true`/`yes`/`on`).
     // The real gate trips ONLY on the literal `1`, so e.g. `=true` never
     // opens the bypass in production but `must_be_unset_env`'s truthy
