@@ -7,7 +7,7 @@ layout: doc
 >
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
-> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
 
 > **Audience:** operators and platform/DevOps engineers deploying a
 > federated `ai-memory` fleet. This is the configuration **and** admin
@@ -133,7 +133,7 @@ for it. The in-domain confinement primitive is
 `links[]`, `signals[]` and the pull-accept path included — now
 consults under an enrolled posture (#2489/#2480); what still makes
 this not a mutually-distrusting-tenant boundary is that federation
-replicates plaintext (#1968), not an unscoped lane (see
+replicates plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)), not an unscoped lane (see
 [`docs/federation.md`](federation.html) §"Layer 3 — Peer
 attestation").
 
@@ -147,7 +147,7 @@ attestation").
 
 Federation also ships **plaintext memory content** — it is not
 end-to-end encrypted across peers
-([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968);
+(see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262);
 `docs/federation.md` §"At-rest encryption and federation" has the
 detail). A peer you federate with reads what you replicate to it.
 
