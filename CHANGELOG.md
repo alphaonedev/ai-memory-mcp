@@ -80,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Propagating the worker status exposed #8299: `worker()` read `${out}` in the same `local` that assigned it, so
   under `set -u` every worker had exited at its first line since #1737 and the harness could only report no
   knee; `bodyf` now has its own `local`, and the guard refuses a declaration that reads its own names.
+  Round 16: one quote-aware pass removes shell comments the way bash does before every shell reader of the
+  guard, so a quote inside a trailing comment can no longer hide a compose call from the word pin; the
+  envelope worker-status lines are pinned exactly and every `wait` must reach a FAIL exit; and an exact
+  group-count failure names its constant and the lockstep remedy.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 

@@ -74,6 +74,12 @@ spelling adds a file, project-directory, env-file, project-name or profile flag;
 listing is checked too; the docker daemon and config selection names (DOCKER_HOST, DOCKER_CONTEXT,
 DOCKER_CONFIG, DOCKER_CERT_PATH, DOCKER_TLS_VERIFY, DOCKER_API_VERSION, any DOCKER_ name) and the docker
 context subcommand are refused in both scripts.
+r16: shell comments are removed by one quote-aware pre-pass (_strip_shell_comments) before every shell
+reader (shlex words, the compose call text count, declarations, the redirect and group scans, the code
+lines), so a quote inside a trailing comment no longer opens a quote; the envelope worker-status block is
+pinned exactly (REAPING_PINS) and every wait in both scripts is a statement or `wait "$p" || NAME=$?` with
+a later statement-position check that reaches a FAIL exit; the exact group counts are named constants and
+their failure message names the constant and the lockstep remedy.
 """
 import fnmatch
 import pathlib
@@ -321,7 +327,8 @@ PW_ASSIGN = re.compile(
 
 
 def _strip_comment(line):
-    """Drop a trailing ` # ...` comment that is outside quotes."""
+    """Drop a trailing ` # ...` comment that is outside quotes (YAML and INI lines only; r16 K11: shell
+    text goes through _strip_shell_comments)."""
     quote = None
     for i, ch in enumerate(line):
         if quote:
@@ -416,7 +423,14 @@ def _services():
 
 
 def _code_lines(path):
-    return [ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#")]
+    """The lines of a script without its whole-line comments. r16 K11: a line is a comment only when the
+    shared pre-pass (_strip_shell_comments) removes all of it, so a `#` line inside a quoted string or a
+    heredoc body stays; a script the pre-pass cannot read fails the guard."""
+    text = path.read_text()
+    code, problem = _strip_shell_comments(text)
+    if problem:
+        raise AssertionError("%s: %s" % (path.name, problem))
+    return [ln for ln, kept in zip(text.splitlines(), code.splitlines()) if not (ln.lstrip().startswith("#") and not kept.strip())]
 
 
 def _sql_statements(path):
@@ -556,14 +570,16 @@ def _compose_pin_refusals(body):
     and each assigned at most once."""
     problems = []
     words, problem = _shell_words(body)
+    code, _ = _strip_shell_comments(body)  # r16 K11: the text count reads the same comment-free code
     body = re.sub(r"\\\n\s*", " ", body)
     if problem:
         problems.append(problem)
     else:
         word_problems, calls = _compose_word_refusals(words)
         problems.extend(word_problems)
-        if calls != len(COMPOSE_INVOCATION.findall(body)):
-            problems.append("compose calls read as words (%d) and as text (%d) differ" % (calls, len(COMPOSE_INVOCATION.findall(body))))
+        text_calls = len(COMPOSE_INVOCATION.findall(re.sub(r"\\\n\s*", " ", code)))
+        if calls != text_calls:
+            problems.append("compose calls read as words (%d) and as text (%d) differ" % (calls, text_calls))
     for m in COMPOSE_INVOCATION.finditer(body):
         if " ".join(m.group().split()) != "docker compose":
             problems.append("a global docker flag between docker and compose: %s" % m.group())
@@ -603,7 +619,7 @@ def _infra_dir_refusals(names, allowed=None, compose_files=("docker-compose.yml"
 
 # r15 S20: the infra/pillar4-envelope listing; `.local-runs` is the gitignored RESULTS_DIR parent.
 ENVELOPE_ALLOWED = {".gitignore", ".local-runs", "README.md", "measure-capacity-ramp.sh", "measure-envelope.sh", "usl-fit.py"}
-# r15 S20: the compose pin is also read on shell WORDS (shlex, posix, comments off, after the heredoc bodies
+# r15 S20: the compose pin is also read on shell WORDS (shlex, posix, after the r16 comment pre-pass and after the heredoc bodies
 # are dropped and the backslash continuations joined), so quoting, escapes and attached values cannot
 # respell a flag. A compose call is the word docker (or a path ending in /docker) followed by the word
 # compose; its next six words are exactly the pin, and each later word of that command is a plain word or
@@ -622,6 +638,137 @@ DOCKER_SUBCOMMAND = re.compile(r"^[a-z]+$")
 # local or readonly operand, ${NAME:=...} default), read raw or quote-removed, nor run docker context.
 DAEMON_SELECTION_NAMES = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION")
 DAEMON_SELECTION_NAME = re.compile(r"DOCKER_\w*")
+
+
+# r16 K11 / S22: shell comments, read the way bash reads them, by ONE pre-pass that every shell reader of
+# this guard uses (_code_lines, _shell_words and so the compose word pin and the daemon-selection check, the
+# text count of compose calls, _self_referencing_declarations, the redirect scan's heredoc openers and the
+# group scan). The rule: a `#` starts a comment that runs to the end of the line when it begins a word, that
+# is at the start of the text or of a line, or after unquoted, unescaped whitespace or one of ; & | ( ) < >,
+# and only in code (top level, $( ), ( ), a backquote pair, a case body). A `#` inside a word (${x#y}, $#,
+# a#b, --flag=#), after a backslash, or inside '...', "...", $'...' or ${...} is text. Heredoc bodies are
+# copied unchanged (the opener is read on the comment-free line). A quote, substitution or heredoc still open
+# at the end of the text is a problem (fail closed), never a guess; a single quote directly inside ${...}
+# inside double quotes is refused (bash reads it as text there and as a quote outside double quotes).
+# The comment text is removed, the newline kept, so line numbers do not move. Before round 16 shlex read
+# the comment text as code (commenters off), so a quote in one trailing comment and a quote in a later one
+# made the lines between them one word: a compose call there was invisible to the word pin.
+COMMENT_WORD_BREAK = " \t\n;&|()<>"
+CASE_WORD = re.compile(r"(case|esac)(?=[\s;&|()<>]|$)")
+
+
+def _strip_shell_comments(text):
+    """r16 K11: (comment-free text, problem or None); the rule is the comment block above."""
+    out, stack, i, n = [], [], 0, len(text)
+    word_start, keep = True, 0  # keep: out[:keep] holds an escape, never stripped as trailing blanks
+    while i < n:
+        ch, nxt = text[i], text[i + 1 : i + 2]
+        top = stack[-1] if stack else ""
+        if top == "'":
+            out.append(ch)
+            i += 1
+            if ch == "'":
+                stack.pop()
+            continue
+        if ch == "\\":
+            out.extend(text[i : i + 2])
+            i += 2
+            keep = len(out)
+            if nxt != "\n":
+                word_start = False
+            continue
+        if top == "$'":
+            out.append(ch)
+            i += 1
+            if ch == "'":
+                stack.pop()
+            continue
+        if ch == "$" and nxt in ("(", "{"):
+            stack.append("$" + nxt)
+            out.extend(ch + nxt)
+            i += 2
+            word_start = nxt == "("
+            continue
+        if top in ('"', "${"):
+            if ch == "`":
+                stack.append("`")
+                word_start = True
+                out.append(ch)
+                i += 1
+                continue
+            if top == '"' and ch == '"':
+                stack.pop()
+            elif top == "${" and ch == "}":
+                stack.pop()
+            elif top == "${" and ch == '"':
+                stack.append('"')
+            elif top == "${" and ch == "'":
+                if '"' in stack:
+                    return None, "a single quote inside ${...} inside double quotes"
+                stack.append("'")
+            out.append(ch)
+            i += 1
+            word_start = False
+            continue
+        # code: top level, $( ), ( ), a backquote pair or a case body
+        if ch == "#" and word_start:
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            while len(out) > keep and out[-1] in " \t":
+                out.pop()
+            i = j
+            continue
+        if word_start and CASE_WORD.match(text, i):
+            word = CASE_WORD.match(text, i).group(1)
+            if word == "case":
+                stack.append("case")
+            elif top == "case":
+                stack.pop()
+            out.extend(word)
+            i += len(word)
+            word_start = False
+            continue
+        if ch == "'":
+            stack.append("'")
+        elif ch == '"':
+            stack.append('"')
+        elif ch == "$" and nxt in ("'", '"'):
+            stack.append("$'" if nxt == "'" else '"')
+            out.append(ch)
+            i += 1
+            ch = nxt
+        elif ch == "`":
+            if top == "`":
+                stack.pop()
+            else:
+                stack.append("`")
+        elif ch == "(":
+            stack.append("(")
+        elif ch == ")" and top in ("$(", "("):
+            stack.pop()
+        out.append(ch)
+        i += 1
+        word_start = ch in COMMENT_WORD_BREAK or ch == "`"
+        if ch == "\n":
+            line = "".join(out[: len(out) - 1]).rsplit("\n", 1)[-1]
+            for tok in HEREDOC_TOKEN.finditer(re.sub(r"\(\(.*?\)\)", " ", line)):
+                word = tok.group(1) or tok.group(2) or tok.group(3)
+                if word:
+                    while True:
+                        if i >= n:
+                            return None, "heredoc %s is never closed" % word
+                        j = text.find("\n", i)
+                        j = n if j < 0 else j
+                        body = text[i:j]
+                        out.extend(text[i : j + 1])
+                        i = j + 1
+                        if body.strip() == word:
+                            break
+                    keep = len(out)
+                    break
+    if stack:
+        return None, "a quote, substitution or case left open at the end of the text (%s)" % " ".join(stack)
+    return "".join(out), None
 
 
 def _drop_heredoc_bodies(text):
@@ -660,9 +807,14 @@ def _ansi_or_locale_quote(code):
 
 
 def _shell_words(body):
-    """r15 S20: (words, problem) for code text: shlex in posix mode, comments off, operators split out
+    """r15 S20: (words, problem) for code text: shlex in posix mode, comments removed, operators split out
     (a newline outside quotes is an operator token), after the heredoc bodies are dropped and the
-    backslash continuations joined. An unreadable text is a problem, never an empty word list."""
+    backslash continuations joined. An unreadable text is a problem, never an empty word list.
+    r16 K11: comments are removed first by _strip_shell_comments (the shared pre-pass), so shlex reads code
+    only; commenters stay off because a `#` left after the pre-pass is text (${x#y}, $#, a#b, "#")."""
+    body, problem = _strip_shell_comments(body)
+    if problem:
+        return None, problem
     code, open_heredoc = _drop_heredoc_bodies(body)
     if open_heredoc is not None:
         return None, "heredoc %s is never closed" % open_heredoc
@@ -671,7 +823,7 @@ def _shell_words(body):
     lex = shlex.shlex(re.sub(r"\\\n", " ", code), posix=True, punctuation_chars=SHELL_OPERATOR_CHARS)
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
-    lex.commenters = ""
+    lex.commenters = ""  # r16 K11: every comment is already gone (the pre-pass above); a `#` here is text
     try:
         return list(lex), None
     except ValueError as exc:
@@ -772,8 +924,11 @@ def _self_referencing_declarations(lines):
         stripped = raw.strip()
         if stripped.split(" ", 1)[0] not in DECLARATION_WORDS:
             continue
+        code, problem = _strip_shell_comments(stripped)  # r16 K11: the shared comment pre-pass first
         try:
-            words = shlex.split(stripped.split(";", 1)[0], posix=True)
+            if problem:
+                raise ValueError(problem)
+            words = shlex.split(code.split(";", 1)[0], posix=True)
         except ValueError:
             out.append((n, "unparsable"))
             continue
@@ -787,6 +942,176 @@ def _self_referencing_declarations(lines):
                     out.append((n, ref))
             assigned.append(name)
     return out
+
+
+# r16 K9: the worker-status collection of measure-envelope.sh (the #8299 fix, round 15) pinned exactly, as
+# _norm_lines reads it: one contiguous block, once, and worker_rc named on no other line.
+REAPING_PINS = {
+    SMOKE: (),
+    ENVELOPE: (
+        'for w in $(seq 1 "$conc"); do',
+        'worker "$w" "$step_out/w${w}.txt" "$deadline" &',
+        'pids+=($!)',
+        'done',
+        'worker_rc=0',
+        'for p in "${pids[@]}"; do wait "$p" || worker_rc=$?; done',
+        '[ "$worker_rc" -eq 0 ] || { echo "FAIL: a load worker exited with status $worker_rc at concurrency $conc" >&2; exit 1; }',
+    ),
+}
+# r16 K9: the structural rule for every `wait` in both scripts, read on the comment-free shell words. A wait
+# site is the word wait where a command starts (after an operator, a keyword or a prefix word such as
+# builtin, command, exec, nohup, time, env or !). It is accepted in exactly two forms, each at statement
+# position (after a newline, `;`, do, then, else or `{`) with at least one operand and no option:
+#   statement: `wait "$p"` ended by a newline or `;` (set -e ends the script with the waited status);
+#   captured:  `wait "$p" || NAME=$?` ended by a newline or `;`, where NAME is named bare (assigned, reset,
+#              declared, read, unset) nowhere between the wait and its check, nor earlier in the loop body
+#              holding the wait, and the check is the next statement-position `[ "$NAME" -eq 0 ] || {`
+#              group or `if [ "$NAME" -ne 0 ]; then` arm that holds an `echo "FAIL: ..."` and an `exit`
+#              with a literal non-zero status.
+# Every compound command enclosing the wait is closed by a closer followed only by a newline, `;`, a
+# redirect or another closer (so not `|| true`, `&`, `|`, `&&`). Refused therefore: `|| true`, `|| :`,
+# `|| NAME=0`, a wait with no operand, a dropped status, a check with `-ge 0` or any other comparison, a
+# check that does not run at statement position (`true || [ ... ]`) and a reset of NAME after the wait.
+# A wait word built at runtime ("$fn" indirection) stays the structural residual on #8285.
+WAIT_STATEMENT_PREV = ("\n", ";", "do", "then", "else", "{")
+WAIT_COMMAND_PREV = WAIT_STATEMENT_PREV + (
+    "&", "&&", "||", "|", "(", "!", "if", "elif", "while", "until", "builtin", "command", "exec", "nohup", "time", "env",
+    "nice", "timeout", "eval",
+)
+WAIT_RC_CAPTURE = re.compile(r"^([A-Za-z_]\w*)=\$\?$")
+GROUP_OPENERS = ("do", "{", "if", "case", "(", "then")
+GROUP_CLOSERS = ("done", "}", "fi", "esac", ")")
+
+
+def _bare_name(word, name):
+    return bool(re.search(r"(?<![$\w{])%s(?!\w)" % re.escape(name), word))
+
+
+def _wait_check_ok(words, k, name):
+    """r16 K9: True when words[k:] starts a statement-position check of NAME that reaches a FAIL exit."""
+    if k > 0 and words[k - 1] not in WAIT_STATEMENT_PREV:
+        return False
+    ref = ("$" + name, "${" + name + "}")
+    if words[k : k + 2] == ["if", "["] and words[k + 2] in ref and words[k + 3 : k + 6] == ["-ne", "0", "]"]:
+        j, end = k + 6, "fi"
+        while j < len(words) and words[j] in (";", "\n"):
+            j += 1
+        if words[j : j + 1] != ["then"]:
+            return False
+    elif words[k : k + 1] == ["["] and words[k + 1] in ref and words[k + 2 : k + 7] == ["-eq", "0", "]", "||", "{"]:
+        j, end = k + 6, "}"
+    else:
+        return False
+    body, depth = [], 0
+    for w in words[j + 1 :]:
+        if w in ("{", "if"):
+            depth += 1
+        elif w == end and depth == 0:
+            break
+        elif w in ("}", "fi"):
+            depth -= 1
+        body.append(w)
+    else:
+        return False
+    echo = "echo" in body and any(w.startswith("FAIL:") for w in body[body.index("echo") :])
+    exits = [body[m + 1] for m, w in enumerate(body[:-1]) if w == "exit"]
+    return echo and any(re.match(r"^[1-9]\d*$", x) for x in exits)
+
+
+def _wait_refusals(body):
+    """r16 K9: refusals for the wait sites of one script (the rule above), read on the shell words."""
+    words, problem = _shell_words(body)
+    if problem:
+        return [problem]
+    problems = []
+    for k, w in enumerate(words):
+        prev = words[k - 1] if k else "\n"
+        if w != "wait" or prev not in WAIT_COMMAND_PREV:
+            continue
+        if prev not in WAIT_STATEMENT_PREV:
+            problems.append("a wait outside statement position (after %r)" % prev)
+            continue
+        j, operands = k + 1, 0
+        while j < len(words) and not _is_operator(words[j]):
+            if words[j].startswith("-"):
+                problems.append("a wait option: %s" % words[j])
+            operands += 1
+            j += 1
+        while j < len(words) and REDIRECT_OPERATOR.match(words[j]):
+            j += 2
+        if not operands:
+            problems.append("a wait with no operand (its status is always 0)")
+            continue
+        nxt = words[j] if j < len(words) else "\n"
+        name = None
+        if nxt == "||":
+            m = WAIT_RC_CAPTURE.match(words[j + 1]) if j + 1 < len(words) else None
+            if not m:
+                problems.append("a wait status dropped or replaced after || (%s)" % (words[j + 1] if j + 1 < len(words) else "end"))
+                continue
+            name, j = m.group(1), j + 2
+            nxt = words[j] if j < len(words) else "\n"
+        if nxt not in ("\n", ";"):
+            problems.append("a wait followed by %r (its status does not reach a FAIL exit)" % nxt)
+            continue
+        # every enclosing compound command is closed by a plain closer
+        depth, m, loop_start = 0, j, None
+        while m < len(words):
+            x = words[m]
+            if x in GROUP_OPENERS and x != "then":
+                depth += 1
+            elif x in GROUP_CLOSERS:
+                depth -= 1
+                if depth < 0:
+                    after = m + 1
+                    while after < len(words) and REDIRECT_OPERATOR.match(words[after]):
+                        after += 2
+                    tail = words[after] if after < len(words) else "\n"
+                    if tail not in ("\n", ";") + GROUP_CLOSERS:
+                        problems.append("a compound command holding a wait is followed by %r" % tail)
+                        break
+                    depth = 0
+            m += 1
+        if name is None:
+            continue
+        # the loop body holding the wait does not reset NAME before it
+        depth, b = 0, k - 1
+        while b >= 0:
+            x = words[b]
+            if x in GROUP_CLOSERS:
+                depth += 1
+            elif x in GROUP_OPENERS and x != "then":
+                if depth == 0:
+                    loop_start = b
+                    break
+                depth -= 1
+            b -= 1
+        if loop_start is not None and words[loop_start] == "do" and any(_bare_name(x, name) for x in words[loop_start:k]):
+            problems.append("%s is reset in the loop body before the wait" % name)
+            continue
+        for c in range(j, len(words)):
+            if _bare_name(words[c], name) and words[c] != "$" + name:
+                problems.append("%s is assigned, declared or reset between the wait and its check" % name)
+                break
+            if words[c] in ("[", "if") and any(r in words[c + 1 : c + 3] for r in ("$" + name, "${" + name + "}")):
+                if not _wait_check_ok(words, c, name):
+                    problems.append("the check of %s is not a statement-position -eq 0 / -ne 0 test reaching a FAIL exit" % name)
+                break
+        else:
+            problems.append("%s is never checked after the wait" % name)
+    return problems
+
+
+def _reaping_pin_refusals(path, lines):
+    """r16 K9: the REAPING_PINS block of one script, contiguous and once; its rc name on no other line."""
+    pin = REAPING_PINS[path]
+    if not pin:
+        return [] if not any(re.search(r"(?:^|[\s;&|(){}])wait(?:$|[\s;&|()])", ln) for ln in lines) else ["a wait in a script with no reaping pin"]
+    starts = [k for k in range(len(lines)) if tuple(lines[k : k + len(pin)]) == pin]
+    if len(starts) != 1:
+        return ["the worker-status block differs from REAPING_PINS (found %d times)" % len(starts)]
+    outside = [ln for k, ln in enumerate(lines) if not starts[0] <= k < starts[0] + len(pin) and "worker_rc" in ln]
+    return ["worker_rc named outside the pinned block: %s" % ln for ln in outside]
 
 
 FUNCTION_BODIES = {  # r15 K8: the whole body of each function, as _norm_lines reads it
@@ -1148,6 +1473,29 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertTrue(_daemon_selection_refusals(text), text)
         for text in (ok + " -f", "x='" , ok + " <<'EOF'"):
             self.assertTrue(_compose_pin_refusals(text), "fail closed: %r" % text)
+        # r16 K11 / S22: a quote in one trailing comment and a quote in a later one no longer make the code
+        # between them one word (each row GREEN on b5621ab07, measured with the b5621ab07 functions). A
+        # quote-respelt pinned call first keeps the word and text call counts equal, as in the review row.
+        pin = 'docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT"'
+        first = 'd"ocker" compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" ps\n'
+        k11 = {
+            "S20-comment-quote-pair": first + "true # it's a note\n" + pin + " -\\f /x/decoy.yml ps # that's all",
+            "S20-comment-quote-hide-backslash-f": first + "true # it's\n" + pin + " -\\f /x/decoy.yml up # it's",
+            "K11-comment-pair-project-directory": first + "true # it's\n" + pin + " --project-director\\y /x ps # that's",
+            "K11-comment-pair-docker-host": "true # it's\nexport D\"\"OCKER_HOST=tcp://127.0.0.1:2399 # that's\n" + ok,
+            "K11-comment-pair-for-loop": first + "for i in 1; do # it's\n  " + pin + " -\\f /x/decoy.yml ps\ndone # that's",
+            "own-K11-double-quote-pair": first + 'true # say "hi\n' + pin + ' -\\f /x/decoy.yml ps # bye"',
+            "own-K11-tab-comment": first + "true\t# it's\n" + pin + " -\\f /x/decoy.yml ps\t# it's",
+            "own-K11-semicolon-comment": first + "true;# it's\n" + pin + " --fi\\le /x/decoy.yml ps;# it's",
+            "own-K11-paren-comment": first + "( true # it's\n" + pin + " -\\f /x/decoy.yml ps ) # it's",
+        }
+        for row, text in k11.items():
+            self.assertTrue(_compose_pin_refusals(text) or _daemon_selection_refusals(text), "row %s is not refused" % row)
+        # re-judged (r15 S20-comment-quote-alone): a lone quote in a comment is a comment, not code; legit now
+        for legit in (ok + " # it's a note", "# it's\n" + ok, ok + " # a \"quote", ok + " # ${x"):
+            self.assertEqual(_compose_pin_refusals(legit), [], legit)
+            self.assertEqual(_daemon_selection_refusals(legit), [], legit)
+        self.assertTrue(_compose_pin_refusals(ok + " it's"), "an open quote in code still fails closed")
 
     def test_scripts_generate_random_password(self):
         for path in SCRIPTS:
@@ -1495,7 +1843,11 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         """Redirect targets outside heredoc bodies; quoted text is neutralised
         to `Q<content>` (with `>` and `<` blanked) so a quoted target survives."""
         targets, heredoc = [], None
-        for ln in lines:
+        code, problem = _strip_shell_comments("\n".join(lines))  # r16 K11: the shared comment pre-pass
+        if problem:
+            raise AssertionError("%s: %s; the redirect scan would be blind" % (name, problem))
+        for ln, kept in zip(lines, code.split("\n")):
+            kept = re.sub(r"\(\(.*?\)\)", " ", kept)
             ln = ln if heredoc else re.sub(r"\(\(.*?\)\)", " ", ln)  # arithmetic is not a redirect or heredoc
             if heredoc:
                 if ln == heredoc:
@@ -1507,7 +1859,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 ln,
             )
             targets.extend(t.rstrip(");&|") for t in REDIRECT.findall(plain))
-            for tok in HEREDOC_TOKEN.finditer(_strip_comment(ln)):  # r12 N4: a comment holds no opener
+            for tok in HEREDOC_TOKEN.finditer(kept):  # r12 N4 + r16 K11: a comment holds no opener
                 word = tok.group(1) or tok.group(2) or tok.group(3)
                 if word:
                     heredoc = word
@@ -1562,6 +1914,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         out, stack, heredoc, in_sq = [], [], None, False
         words, loops, cond = [], [], []  # words: !, | && || on the current command; cond: open heads
         pending_func = None
+        code, problem = _strip_shell_comments("\n".join(lines))  # r16 K11: the shared comment pre-pass
+        if problem:
+            raise AssertionError("%s: %s; the group scan would be blind" % (name, problem))
+        lines = code.split("\n")
 
         def cond_words():
             return [c["word"] for c in cond if c["word"] in CONDITION_WORDS]
@@ -1589,7 +1945,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             if heredoc:
                 heredoc = None if raw == heredoc else heredoc
                 continue
-            ln = re.sub(r"\(\(.*?\)\)", lambda m: " " * len(m.group()), raw if in_sq else _strip_comment(raw))
+            ln = re.sub(r"\(\(.*?\)\)", lambda m: " " * len(m.group()), raw)  # r16 K11: comments already gone
             fail = FAIL_ECHO.search(ln)
             fail_at = fail.start() if fail else -1
             i = 0
@@ -1789,6 +2145,50 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertFalse(FUNCTION_DEF.search('x="$(date)"') or ALIAS_DEF.search("echo alias_set"))
         self.assertFalse(FUNCTION_DEF.search("echo undo() x") or FUNCTION_DEF.search("*[!a-z0-9_-]*) echo x"))
 
+    # r16 K10: the exact group counts of the groups listing, one constant per number. A script edit that moves
+    # one fails with _count_pin_message, which names the script, both numbers, the constant and the remedy.
+    SMOKE_GROUPS_EXPECTED = 34
+    SMOKE_FAIL_GROUPS_EXPECTED = 15
+    SMOKE_FAIL_CALLS_EXPECTED = 0
+    ENVELOPE_GROUPS_EXPECTED = 58
+    ENVELOPE_FAIL_GROUPS_EXPECTED = 12
+    ENVELOPE_FAIL_CALLS_EXPECTED = 4
+
+    @staticmethod
+    def _count_pin_message(script, what, measured, pinned, constant):
+        return (
+            "%s: %s measured %d, pinned %d in %s; if the script edit is intended, update %s in this test in the same "
+            "commit and record the new count in the PR body Round section (the pin and the script change in lockstep)"
+            % (script, what, measured, pinned, constant, constant)
+        )
+
+    def _assert_counts(self, name, out, prefix):
+        groups = [(w, g) for w, g in out if g["kind"] != "call"]
+        measured = (
+            ("group count", len(groups), "GROUPS"),
+            ("FAIL-bearing group count", sum(1 for _, g in groups if g["fail"]), "FAIL_GROUPS"),
+            ("calls of FAIL-bearing functions", len(out) - len(groups), "FAIL_CALLS"),
+        )
+        for what, value, suffix in measured:
+            constant = "%s_%s_EXPECTED" % (prefix, suffix)
+            pinned = getattr(self, constant)
+            self.assertEqual(value, pinned, self._count_pin_message(name, what, value, pinned, constant))
+
+    def test_count_pin_message_names_the_constant_selftest(self):
+        # r16 K10: a deliberate miscount (one extra FAIL-bearing group, the code r12 legit row c6) fails with a
+        # message that names the script, the constant and the lockstep remedy.
+        lines = _norm_lines(SMOKE) + ['if true; then :; fi; true || { echo "FAIL: one" >&2; exit 1; }']
+        with self.assertRaises(AssertionError) as caught:
+            self._assert_counts(SMOKE.name, self._groups(lines, SMOKE.name), "SMOKE")
+        text = str(caught.exception)
+        groups = [g for _, g in self._groups(lines, SMOKE.name) if g["kind"] != "call"]
+        measured = "measured %d, pinned %d" % (len(groups), self.SMOKE_GROUPS_EXPECTED)
+        for part in ("smoke-test.sh", "SMOKE_GROUPS_EXPECTED", "lockstep", measured, "PR body Round section"):
+            self.assertIn(part, text)
+        msg = self._count_pin_message("measure-envelope.sh", "group count", 59, 58, "ENVELOPE_GROUPS_EXPECTED")
+        self.assertIn("ENVELOPE_GROUPS_EXPECTED", msg)
+        self.assertIn("lockstep", msg)
+
     def test_real_closers_and_contexts_are_clean_and_the_dotenv_comment_is_true(self):
         # r14 K5 + K6 + INFO: on the real scripts no FAIL-bearing group is followed by `&&` or
         # preceded by a condition word (the groups listing: bad 0), the FAIL-bearing group count floors are
@@ -1799,13 +2199,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # the existing `for p ...; do ... done` loop and adds one `|| { echo FAIL ...; exit 1; }` group (57 + 1
         # groups); that group and the enclosing `for conc ...; do ... done` step loop become FAIL-bearing
         # (10 + 2); the 4 calls are `need docker|curl|cargo|python3`, each at statement position.
-        counts = {SMOKE: (34, 15, 0), ENVELOPE: (58, 12, 4)}
-        for path, (total, failing, ncalls) in counts.items():
+        # r16 K10: the six numbers are the *_EXPECTED constants above; the failure message names the constant.
+        for path, prefix in ((SMOKE, "SMOKE"), (ENVELOPE, "ENVELOPE")):
             out = self._groups(_norm_lines(path), path.name)
-            groups = [(w, g) for w, g in out if g["kind"] != "call"]
-            self.assertEqual(len(groups), total, "%s: group count" % path.name)
-            self.assertEqual(sum(1 for _, g in groups if g["fail"]), failing, "%s: FAIL-bearing group count" % path.name)
-            self.assertEqual(len(out) - len(groups), ncalls, "%s: calls of FAIL-bearing functions" % path.name)
+            self._assert_counts(path.name, out, prefix)
             for where, g in out:
                 self.assertFalse(g["bad"], "%s: %s" % (path.name, where))
                 if g["fail"]:
@@ -1906,6 +2303,81 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         }
         for row, lines in legit.items():
             self.assertFalse(bad(lines), "legit row %s is refused" % row)
+
+    def test_wait_sites_reach_a_fail_group(self):
+        # r16 K9: the worker-status block is pinned exactly (REAPING_PINS) and every wait in both scripts
+        # follows the structural rule (_wait_refusals); wait-site list: measure-envelope.sh:237 only.
+        for path in SCRIPTS:
+            lines = _norm_lines(path)
+            self.assertEqual(_reaping_pin_refusals(path, lines), [], path.name)
+            body = "\n".join(ln.strip() for ln in _code_lines(path) if ln.strip())
+            self.assertEqual(_wait_refusals(body), [], path.name)
+        body = "\n".join(ln.strip() for ln in _code_lines(ENVELOPE) if ln.strip())
+        words, _ = _shell_words(body)
+        self.assertEqual(sum(1 for k, w in enumerate(words) if w == "wait" and words[k - 1] in WAIT_COMMAND_PREV), 1)
+
+    def test_wait_sites_selftest(self):
+        # r16 K9: w1-w7 are the code r12 rows (each GREEN on b5621ab07), applied to the real envelope text;
+        # own rows add other spellings. Each is refused by the wait rule or the reaping pin.
+        real = ENVELOPE.read_text()
+        wait_line = 'for p in "${pids[@]}"; do wait "$p" || worker_rc=$?; done'
+        check_line = '[ "$worker_rc" -eq 0 ] || { echo "FAIL: a load worker exited with status $worker_rc at concurrency $conc" >&2; exit 1; }'
+        self.assertEqual((real.count(wait_line), real.count(check_line)), (1, 1))
+        rows = {
+            "w1-or-rc-zero": (wait_line, wait_line.replace("worker_rc=$?", "worker_rc=0")),
+            "w2-no-operand": (wait_line, wait_line.replace('wait "$p"', "wait")),
+            "w3-reset-after-wait": (wait_line, wait_line + "\n  worker_rc=0"),
+            "w4-ge-zero": (check_line, check_line.replace("-eq 0", "-ge 0")),
+            "w5-or-colon": (wait_line, wait_line.replace("worker_rc=$?", ":")),
+            "w6-or-true-devnull": (wait_line, wait_line.replace('wait "$p" || worker_rc=$?', 'wait "$p" 2>/dev/null || true')),
+            "w7-check-true-or": (check_line, "true || " + check_line),
+            "own-builtin-wait": (wait_line, wait_line.replace('wait "$p"', 'builtin wait "$p"')),
+            "own-quoted-wait-or-true": (wait_line, wait_line.replace('wait "$p" || worker_rc=$?', '"wait" "$p" || true')),
+            "own-wait-background": (wait_line, wait_line.replace('wait "$p" || worker_rc=$?', 'wait "$p" &')),
+            "own-if-wait": (wait_line, wait_line.replace('wait "$p" || worker_rc=$?', 'if wait "$p"; then :; fi')),
+            "own-reset-in-loop": (wait_line, wait_line.replace("do wait", "do worker_rc=0; wait")),
+            "own-loop-or-true": (wait_line, wait_line.replace("; done", "; done || true")),
+            "own-check-no-exit": (check_line, check_line.replace("; exit 1; }", "; }")),
+            "own-check-exit-zero": (check_line, check_line.replace("exit 1", "exit 0")),
+            "own-check-ne-zero-if-no-fail": (check_line, 'if [ "$worker_rc" -ne 0 ]; then echo "note" >&2; fi'),
+            "own-local-rc-after": (wait_line, wait_line + "\n  local worker_rc"),
+            "own-wait-n": (wait_line, wait_line.replace('wait "$p"', 'wait -n "$p"')),
+        }
+        for row, (old, new) in rows.items():
+            text = real.replace(old, new, 1)
+            body = "\n".join(ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
+            lines = [" ".join(ln.split()) for ln in re.sub(r"\\\n\s*", " ", body).splitlines() if ln.strip()]
+            self.assertTrue(_wait_refusals(body) or _reaping_pin_refusals(ENVELOPE, lines), "row %s is not refused" % row)
+            self.assertTrue(_wait_refusals(body), "row %s: the wait rule alone must refuse it" % row)
+        legit = {
+            "real-lines": "worker_rc=0\nfor p in a; do wait \"$p\" || worker_rc=$?; done\n" + check_line,
+            "statement-wait": 'x &\nwait "$!"\necho done',
+            "if-ne-check": 'rc=0\nwait "$p" || rc=$?\nif [ "$rc" -ne 0 ]; then\necho "FAIL: worker $rc" >&2\nexit 1\nfi',
+            "wait-as-argument": 'echo wait; printf "%s" "please wait"',
+            "compose-wait-flag": 'docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait',
+        }
+        for row, text in legit.items():
+            self.assertEqual(_wait_refusals(text), [], "legit row %s is refused" % row)
+        self.assertEqual(_reaping_pin_refusals(SMOKE, ["wait \"$p\""]), ["a wait in a script with no reaping pin"])
+
+    def test_shell_comment_prepass_selftest(self):
+        # r16 K11 / S22: one pre-pass reads comments for every shell reader. A `#` that begins a word starts a
+        # comment; inside a word, after a backslash or in quotes it is text; an open quote in code fails closed.
+        strip = lambda s: _strip_shell_comments(s)[0]  # noqa: E731
+        self.assertEqual(strip("true # it's a note\nx # that's all"), "true\nx")
+        for text in ('echo ${x#y}', "echo $#", "echo a#b", "f --flag=#", 'echo "#"', "echo '#'", "echo \\#x", "echo ${#RUN}",
+                     "echo $'#'", 'echo "$(echo a#b)"'):
+            self.assertEqual(strip(text), text, text)
+        self.assertEqual(strip("a;# c\nb"), "a;\nb")
+        self.assertEqual(strip("x=$(true # c\n)"), "x=$(true\n)")
+        self.assertEqual(strip("cat <<'EOF'\n# body ' kept\nEOF\nz # c"), "cat <<'EOF'\n# body ' kept\nEOF\nz")
+        self.assertEqual(strip("case x in\n  a) y ;; # c'\nesac"), "case x in\n  a) y ;;\nesac")
+        for text in ("x='", 'x="a', "x=$(a", "cat <<EOF\nno end", 'echo "${x:-\'a\'}"', 'echo "$(echo #)"'):
+            self.assertIsNotNone(_strip_shell_comments(text)[1], "fail closed: %r" % text)
+        self.assertIsNone(_strip_shell_comments("x=1 # it's\n")[1])
+        # the same pre-pass feeds the group scan: a quote in a comment never opens a quote there
+        groups = self._groups(['true # it\'s', '{ echo "FAIL: a" >&2; exit 1; }', "x # that's"], "t")
+        self.assertEqual([g["bad"] for _, g in groups], [False])
 
     def test_declarations_do_not_read_their_own_names(self):
         # r15: `local out="$2" bodyf="${out}.body"` expanded "${out}" before `local` assigned it; under
