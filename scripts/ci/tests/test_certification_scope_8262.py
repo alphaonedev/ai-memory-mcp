@@ -21,6 +21,7 @@ single source of truth for what the GA candidate certifies. This guard pins:
 import pathlib
 import re
 import unittest
+from html import unescape
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 CERT_REL = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
@@ -30,7 +31,10 @@ ANCHOR = "certification-scope-statement-for-the-v100-ga-candidate-8262"
 POINTERS = ["docs/federation.md", "SECURITY.md", "docs/SECURITY.md", "README.md"]
 # Files whose end-to-end content encryption mentions must defer to the statement.
 SINGLE_SOURCE_FILES = [CERT_REL, "docs/federation.md", "SECURITY.md",
-                       "docs/SECURITY.md", "README.md", "CHANGELOG.md"]
+                       "docs/SECURITY.md", "README.md", "CHANGELOG.md",
+                       "docs/encryption.html", "docs/compliance/honest-limitations.md",
+                       "docs/compliance/nsa-csi-mcp-security-mapping.md",
+                       "docs/enterprise-deployment.md", "docs/federation-identity.md"]
 ISSUE_URL = "https://github.com/alphaonedev/ai-memory-mcp/issues/"
 
 B_IN = ("**Claimed for the GA candidate (IN; certification re-issue under "
@@ -81,27 +85,33 @@ NOT_ITEMS = {
 }
 E2E_RE = re.compile(r"end-to-end[- ]+(?:content[- ]+)?(?:encrypt|protect|confiden|seal)"
                     r"|#1968|end-to-end-content|(?-i:\bE2E\b)", re.IGNORECASE)
-STALE_RE = re.compile(r"1968[^.\n]{0,60}\bopen\b", re.IGNORECASE)
-# A dated history line ("Last updated: 2026-09-11 ... Previous: 2026-08-16 (... #1968 OPEN ...)")
-# records what was true on that date and is exempt from the stale and single-source scans.
-HISTORY_LINE_RE = re.compile(r"^(?:Last updated:\s*)?\d{4}-\d{2}-\d{2}\b")
+STALE_RE = re.compile(r"1968[^.\n]{0,60}\bopen\b|\bopen\b[^.\n]{0,40}1968", re.IGNORECASE)
+# The "Last updated: 2026-09-11 ... Previous: 2026-08-16 (... #1968 OPEN ...)" history line records
+# what was true on that date. It is exempt from the stale and anchor scans ONLY; the over-claim
+# scan (SCOPE_REFUSED, FUTURE_RE) still runs on it.
+HISTORY_LINE_RE = re.compile(r"^Last updated:\s*\d{4}-\d{2}-\d{2}\b")
 SECURITY_HISTORY_ENTRY = "federation-is-plaintext (#1968 OPEN) posture note added"
 OVERCLAIM_RE = re.compile(r"\b(live|certified)\b", re.IGNORECASE)
 E2E_WORD_RE = re.compile(r"end-to-end|content encryption|\bE2E\b", re.IGNORECASE)
 # Over-claim patterns refused in every end-to-end paragraph outside the statement.
 NEG_RE = re.compile(r"\b(?:not|no)\b[^.;]{0,60}end-to-end|end-to-end[^.;]{0,60}\bnot\b",
                     re.IGNORECASE)
+E = r"(?:end-to-end|\bE2E\b)"
 SCOPE_REFUSED = [
     re.compile(r"\bout of (?:the |ga |v1\.0\.0 |\w+ ){0,3}scope\b", re.IGNORECASE),
     re.compile(r"\bnot in (?:the |ga |v1\.0\.0 |\w+ ){0,3}scope\b", re.IGNORECASE),
     re.compile(r"\bships? in v1\.0\.0", re.IGNORECASE),
-    re.compile(r"\b(?:is|are)\s+(?!not\b)(?:\w+\s+){0,2}end-to-end", re.IGNORECASE),
-    re.compile(r"end-to-end[^.;]{0,60}\b(?:is|are)\s+(?:provided|supported|enabled|available|"
+    re.compile(r"\b(?:is|are)\s+(?!not\b)(?:\w+\s+){0,2}" + E, re.IGNORECASE),
+    re.compile(E + r"[^.;]{0,60}\b(?:is|are)\s+(?:provided|supported|enabled|available|"
                r"shipped|implemented)", re.IGNORECASE),
-    re.compile(r"\b(?:provides?|supports?|offers?)\s+(?:\w+\s+){0,2}end-to-end", re.IGNORECASE),
-    re.compile(r"(?<!not )\b(?:live|certified)\b[^.;]{0,50}end-to-end|"
-               r"end-to-end[^.;]{0,50}(?<!not )\b(?:live|certified)\b", re.IGNORECASE),
+    re.compile(r"\b(?:provides?|supports?|offers?)\s+(?:\w+\s+){0,2}" + E, re.IGNORECASE),
+    re.compile(r"(?<!not )\b(?:live|certified)\b[^.;]{0,50}" + E + "|"
+               + E + r"[^.;]{0,50}(?<!not )\b(?:live|certified)\b", re.IGNORECASE),
 ]
+# Future-tense or at-GA wording is refused in any unit that lacks the landing condition.
+FUTURE_RE = re.compile(r"\b(?:will|shall|to)\s+be\s+(?:\w+\s+){0,3}" + E
+                       + r"|" + E + r"[^.;]{0,40}\bat\s+GA\b|\bencrypted\s+at\s+GA\b", re.IGNORECASE)
+LANDING = "landed on release/v1.0.0"
 # The one pointer sentence quoted in every file that mentions end-to-end content encryption.
 # Only the link target differs per file; the anchor is pinned.
 POINTER_HEAD = ("Federation content is not end-to-end encrypted today (mTLS transport only); "
@@ -110,7 +120,9 @@ POINTER_RE = re.compile(re.escape(POINTER_HEAD + "[certification scope statement
                         + r"[^)\s]*#" + re.escape(ANCHOR) + r"\)\.")
 # Files whose in-scope text (outside the statement) must quote the pointer sentence.
 POINTER_SENTENCE_FILES = ["SECURITY.md", "docs/SECURITY.md", "docs/federation.md",
-                          "CHANGELOG.md", CERT_REL]
+                          "CHANGELOG.md", CERT_REL, "docs/encryption.html",
+                          "docs/compliance/honest-limitations.md",
+                          "docs/compliance/nsa-csi-mcp-security-mapping.md"]
 SECURITY_E2E_SHAPE = (
     "End-to-end content encryption across federation (per-namespace scope keys, a per-record "
     "content key wrapped to each reader with X25519, envelope version 0x05, sealed on the wire, "
@@ -120,6 +132,7 @@ SECURITY_E2E_SHAPE = (
 OLD_E2E_LABEL = re.compile(r"blind-replica|ciphertext-only|reduced-capability", re.IGNORECASE)
 SYNC_SINCE_PINS = [
     "`sync/since` is peer-scoped while the operator bypass `AI_MEMORY_FED_SYNC_TRUST_PEER=1` is unset",
+    "so the empty-envelope and private-visibility claim does not hold under it",
     "`src/federation/peer_attestation.rs:390-392`",
     "consumed at `src/handlers/federation_sync_since.rs:289`",
     "The bypass is outside the asi-hard KNOBS set; only the enterprise posture doctor flags it",
@@ -181,6 +194,14 @@ def _units(text):
     for para in _paragraphs(text):
         out.extend(u for u in re.split(r"\n(?=[-*] )", para) if u.strip())
     return out
+
+
+def _html_text(html):
+    """Plain text of an HTML page: links become markdown links, block ends become blank lines."""
+    html = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", html)
+    html = re.sub(r'(?is)<a\s[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r"[\2](\1)", html)
+    html = re.sub(r"(?i)</(?:p|div|li|h\d|tr|section|pre)>", "\n\n", html)
+    return unescape(re.sub(r"<[^>]+>", "", html))
 
 
 def _flat(text):
@@ -266,12 +287,21 @@ class CertificationScope8262(unittest.TestCase):
 
     def _scoped_text(self, rel):
         """The part of a file this guard scans: outside the statement, history lines removed."""
+        return "\n".join(ln for ln in self._text(rel).splitlines()
+                         if not HISTORY_LINE_RE.match(ln))
+
+    def _history(self, rel):
+        return [ln for ln in self._text(rel).splitlines() if HISTORY_LINE_RE.match(ln)]
+
+    def _text(self, rel):
         text = _read(rel)
+        if rel.endswith(".html"):
+            text = _html_text(text)
         if rel == CERT_REL:
             text = text.replace(_subsection(), "")
         elif rel == "CHANGELOG.md":
             text = _unreleased(text)
-        return "\n".join(ln for ln in text.splitlines() if not HISTORY_LINE_RE.match(ln))
+        return text
 
     def test_single_source_for_e2e_scope(self):
         for rel in SINGLE_SOURCE_FILES:
@@ -287,9 +317,17 @@ class CertificationScope8262(unittest.TestCase):
                 plain = _plain(unit)
                 self.assertRegex(plain, NEG_RE, "end-to-end paragraph lacks the not-E2E "
                                  "statement: " + head)
-                for rx in SCOPE_REFUSED:
-                    self.assertIsNone(rx.search(plain), "end-to-end over-claim (%s) in %s"
-                                      % (rx.pattern[:40], head))
+                self._refuse_overclaim(plain, head)
+            for line in self._history(rel):
+                self._refuse_overclaim(_plain(line), rel + " history: " + line[:80])
+
+    def _refuse_overclaim(self, plain, head):
+        for rx in SCOPE_REFUSED:
+            self.assertIsNone(rx.search(plain), "end-to-end over-claim (%s) in %s"
+                              % (rx.pattern[:40], head))
+        if LANDING not in plain:
+            self.assertIsNone(FUTURE_RE.search(plain),
+                              "future-tense end-to-end wording without the landing condition: " + head)
 
     def test_pointer_sentence_quoted_in_every_pointer_file(self):
         for rel in POINTER_SENTENCE_FILES:
@@ -304,7 +342,7 @@ class CertificationScope8262(unittest.TestCase):
         self.assertIn("**Federation is NOT end-to-end encrypted", _read("SECURITY.md"))
 
     def test_security_md_keeps_dated_history_entry(self):
-        history = [ln for ln in _read("SECURITY.md").splitlines() if HISTORY_LINE_RE.match(ln)]
+        history = CertificationScope8262._history(self, "SECURITY.md")
         self.assertTrue(any(SECURITY_HISTORY_ENTRY in ln for ln in history),
                         "the dated 2026-08-16 history entry lost '(#1968 OPEN)'")
 
@@ -313,6 +351,17 @@ class CertificationScope8262(unittest.TestCase):
         self.assertIsNotNone(STALE_RE.search(stale))
         self.assertIsNone(HISTORY_LINE_RE.match(stale))
         self.assertIsNotNone(HISTORY_LINE_RE.match("Last updated: 2026-09-11 (x). Previous: 2026-08-16"))
+
+    def test_overclaim_vocabulary_catches_reviewer_shapes(self):
+        refused = ["E2E content encryption is live and certified for v1.0.0.",
+                   "E2E is enabled by default.",
+                   "Federation content is end-to-end encrypted and certified."]
+        for s in refused:
+            self.assertTrue(any(rx.search(s) for rx in SCOPE_REFUSED), s)
+        for s in ["Federation content will be end-to-end encrypted at GA.",
+                  "E2E at GA.", "Content is encrypted at GA."]:
+            self.assertIsNotNone(FUTURE_RE.search(s), s)
+        self.assertIsNone(HISTORY_LINE_RE.match("2026-10-29: new dated line"))
 
     def test_in_heading_does_not_say_certified_and_cites_reissue(self):
         text = CERT.read_text(encoding="utf-8")
