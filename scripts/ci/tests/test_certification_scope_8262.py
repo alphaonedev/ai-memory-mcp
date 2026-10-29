@@ -38,6 +38,7 @@ SINGLE_SOURCE_FILES = [CERT_REL, "docs/federation.md", "SECURITY.md",
                        "ROADMAP.md", "docs/production-deployment.md",
                        "docs/reference/ARCHITECTURE_REFERENCE.md"]
 TRUST_FILES = ["docs/enterprise-deployment.md", "docs/federation-identity.md"]
+TRUST_PARA = "> Peers are **authenticated but NOT trusted"
 TRUST_SENTENCE = "Peers **ARE trusted for confidentiality**"
 BLOB_PREFIX = ("https://github.com/alphaonedev/ai-memory-mcp/blob/release/v1.0.0/docs/"
                "compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#")
@@ -89,12 +90,35 @@ NOT_ITEMS = {
     "Top-shelf encryption documentation": 3833,
     "Singleton and Team shapes": 3125,
 }
-# The one definition of the end-to-end term: ASCII hyphen, whitespace, U+2010 and U+2011 between
-# the words (HTML entities are unescaped before any scan), or the E2E abbreviation.
-E2E_TERM = r"end[-\s\u2010\u2011]+to[-\s\u2010\u2011]+end|(?-i:\bE2E\b)"
-E2E_RE = re.compile(r"(?:end[-\s\u2010\u2011]+to[-\s\u2010\u2011]+end)[-\s\u2010\u2011]+"
-                    r"(?:content[-\s\u2010\u2011]+)?(?:encrypt|protect|confiden|seal)"
-                    r"|#1968|end-to-end-content|(?-i:\bE2E\b)", re.IGNORECASE)
+# The one definition of the end-to-end term, spelled once. Separators between the words: ASCII
+# hyphen, whitespace, U+2010 through U+2015 (hyphen, non-breaking hyphen, figure dash, en dash,
+# em dash, horizontal bar) and U+2212 (minus sign); HTML entities are unescaped before any scan.
+# The abbreviation is E2E or E2EE (every pattern that uses it is case-insensitive).
+E2E_SEP = r"[-\s\u2010-\u2015\u2212]"
+E2E_ABBR = r"\bE2EE?\b"
+E2E_TERM = "end" + E2E_SEP + "+to" + E2E_SEP + "+end|" + E2E_ABBR
+E2E_TERM_RE = re.compile(E2E_TERM, re.IGNORECASE)
+_STEM = r"(?:encrypt|seal|confiden|protect|secur)"
+# term then stem within 40 characters (a table-cell boundary is allowed), or stem then term with at
+# most two words between; unrelated mentions far apart in one list item stay ungated.
+E2E_PAIR_RE = re.compile("(?:" + E2E_TERM + r")[^.;]{0,40}" + _STEM
+                         + "|" + _STEM + r"\w*\s+(?:\w+\s+){0,2}(?:" + E2E_TERM + ")",
+                         re.IGNORECASE)
+E2E_ABBR_RE = re.compile(E2E_ABBR)
+E2E_SLUG_RE = re.compile(r"#1968|end-to-end-content", re.IGNORECASE)
+
+
+class _E2EGate:
+    """A unit is scanned when it names #1968 or the content slug, the uppercase E2E/E2EE
+    abbreviation, or the term next to an encryption stem in either order."""
+
+    @staticmethod
+    def search(unit):
+        return bool(E2E_SLUG_RE.search(unit) or E2E_ABBR_RE.search(unit)
+                    or E2E_PAIR_RE.search(unit))
+
+
+E2E_RE = _E2EGate
 STALE_RE = re.compile(r"1968[^.\n]{0,60}\b(?:open|unresolved|still\s+open)\b"
                       r"|\b(?:open|unresolved|still\s+open)\b[^.\n]{0,40}1968", re.IGNORECASE)
 # The "Last updated: 2026-09-11 ... Previous: 2026-08-16 (... #1968 OPEN ...)" history line records
@@ -116,6 +140,8 @@ SCOPE_REFUSED = [
     re.compile(E + r"[^.;]{0,60}\b(?:is|are)\s+(?:provided|supported|enabled|available|"
                r"shipped|implemented)", re.IGNORECASE),
     re.compile(r"\b(?:provides?|supports?|offers?)\s+(?:\w+\s+){0,2}" + E, re.IGNORECASE),
+    re.compile(r"(?:encrypt|protect|seal|secur)\w*\s+(?:\w+\s+){0,2}" + E
+               + r"[^.;]{0,50}(?<!not )\b(?:live|certified)\b", re.IGNORECASE),
     re.compile(r"(?<!not )\b(?:live|certified)\b[^.;]{0,50}" + E + "|"
                + E + r"[^.;]{0,50}(?<!not )\b(?:live|certified)\b", re.IGNORECASE),
 ]
@@ -123,6 +149,12 @@ SCOPE_REFUSED = [
 FUTURE_RE = re.compile(r"\b(?:will|shall|to)\s+be\s+(?:\w+\s+){0,3}" + E
                        + r"|" + E + r"[^.;]{0,40}\bat\s+GA\b|\bencrypted\s+at\s+GA\b"
                        + r"|\bships?\s+(?:with|in|at)\s+GA\b|\bat\s+GA\b", re.IGNORECASE)
+# Under-claim wording: a sentence naming the term or #8278 that defers it to v1.x (sentence-bounded,
+# so the ROADMAP ruling paragraph that postpones other items to v1.x stays clean).
+UNDER_RE = re.compile(r"\b(?:deferred|postponed|slipped)\b.*?(?:v1\.x|v1\.1|post-GA)"
+                      r"|(?:v1\.x|v1\.1|post-GA).*?\b(?:deferred|postponed|slipped)\b",
+                      re.IGNORECASE)
+UNDER_SUBJECT_RE = re.compile(E2E_TERM + r"|#8278", re.IGNORECASE)
 LANDING = "landed on release/v1.0.0"
 # The one pointer sentence quoted in every file that mentions end-to-end content encryption.
 # Only the link target differs per file; the anchor is pinned.
@@ -295,7 +327,8 @@ class CertificationScope8262(unittest.TestCase):
         paras = _paragraphs(_read("README.md"))
         idx = [i for i, p in enumerate(paras) if ANCHOR in p]
         self.assertEqual(len(idx), 1)
-        self.assertTrue(paras[idx[0] - 1].startswith("**v1.0.0 — current release.**"))
+        # U+2014 em dash, written as an escape: the README heading uses it.
+        self.assertTrue(paras[idx[0] - 1].startswith("**v1.0.0 \u2014 current release.**"))
 
     def _scoped_text(self, rel):
         """The part of a file this guard scans: outside the statement, history lines removed."""
@@ -320,6 +353,10 @@ class CertificationScope8262(unittest.TestCase):
             text = self._scoped_text(rel)
             self.assertIsNone(STALE_RE.search(text), rel + " carries a stale '#1968 open' claim")
             for unit in _units(text):
+                for sent in re.split(r"[.;]\s", _plain(unit)):
+                    self.assertFalse(UNDER_SUBJECT_RE.search(sent) and UNDER_RE.search(sent),
+                                     "end-to-end scope pushed past v1.0.0 (under-claim) in "
+                                     + rel + ": " + sent[:100])
                 if not E2E_RE.search(unit):
                     continue
                 raw = _flat(unit)
@@ -349,13 +386,17 @@ class CertificationScope8262(unittest.TestCase):
 
     def test_trust_boundary_sentence_is_pinned(self):
         for rel in TRUST_FILES:
-            self.assertEqual(_read(rel).splitlines()[9].count(TRUST_SENTENCE), 1,
+            paras = [p for p in re.split(r"\n\s*\n", _read(rel)) if TRUST_PARA in p]
+            self.assertEqual(len(paras), 1, rel + " lost the trust-boundary paragraph")
+            self.assertEqual(paras[0].count(TRUST_SENTENCE), 1,
                              rel + " lost the peers-are-trusted-for-confidentiality sentence")
 
     def test_html_pointer_links_use_the_blob_url(self):
         text = _read("docs/encryption.html")
         hrefs = re.findall(r'href="([^"]*#' + re.escape(ANCHOR) + r')"', text)
         self.assertEqual(len(hrefs), 2)
+        self.assertEqual(re.findall(r'href="(?!https?://)[^"]*\.md', text), [],
+                         "docs/encryption.html carries a relative .md link")
         for href in hrefs:
             self.assertTrue(href.startswith(BLOB_PREFIX), "relative or wrong statement link: " + href)
 
@@ -366,7 +407,7 @@ class CertificationScope8262(unittest.TestCase):
         self.assertIn("**Federation is NOT end-to-end encrypted", _read("SECURITY.md"))
 
     def test_security_md_keeps_dated_history_entry(self):
-        history = CertificationScope8262._history(self, "SECURITY.md")
+        history = self._history("SECURITY.md")
         self.assertTrue(any(SECURITY_HISTORY_ENTRY in ln for ln in history),
                         "the dated 2026-08-16 history entry lost '(#1968 OPEN)'")
 
@@ -382,9 +423,30 @@ class CertificationScope8262(unittest.TestCase):
                    "Federation content is end-to-end encrypted and certified.",
                    "Federation content is end to end encrypted and certified for v1.0.0.",
                    "Federation is end\u2011to\u2011end encrypted and certified.",
-                   unescape("Federation is end&#8209;to&#8209;end encrypted and certified.")]
+                   unescape("Federation is end&#8209;to&#8209;end encrypted and certified."),
+                   "Federation content is encrypted end-to-end and certified for v1.0.0.",
+                   "Federation E2EE is live and certified",
+                   "Federation is end\u2013to\u2013end encrypted and certified.",
+                   "Federation is end\u2014to\u2014end encrypted and certified.",
+                   "Federation content is secured end-to-end and certified.",
+                   "Federation content is encrypted end to end and certified for v1.0.0.",
+                   "e2e encryption is live and certified."]
         for s in refused:
             self.assertTrue(any(rx.search(s) for rx in SCOPE_REFUSED), s)
+        gated = ["Federation content is encrypted end-to-end and certified.",
+                 "| end-to-end | encrypted and certified |",
+                 "Federation E2EE is live and certified", "e2e encryption is live",
+                 "Federation is secured end\u2011to\u2011end and certified.",
+                 "Federation is end\u2013to\u2013end encrypted.", "see #1968"]
+        for s in gated:
+            self.assertTrue(E2E_RE.search(s), s)
+        for s in ["Tested end-to-end in CI.", "The end-to-end suite passes."]:
+            self.assertFalse(E2E_RE.search(s), s)
+        for s in ["End-to-end content encryption is deferred until v1.x.", "#8278 postponed to v1.x.",
+                  "E2EE slipped to post-GA."]:
+            self.assertTrue(UNDER_SUBJECT_RE.search(s) and UNDER_RE.search(s), s)
+        self.assertFalse(UNDER_RE.search("Superseded by #8278: removed from this deferred set "
+                                         "and is in v1.0.0 GA scope"))
         for s in ["Federation content will be end-to-end encrypted at GA.",
                   "E2E at GA.", "Content is encrypted at GA.", "E2E ships with GA.",
                   "E2E ships in GA."]:
@@ -392,6 +454,23 @@ class CertificationScope8262(unittest.TestCase):
         self.assertIsNone(HISTORY_LINE_RE.match("2026-10-29: new dated line"))
         for s in ["#1968 is still unresolved.", "#1968 remains open.", "Open item #1968."]:
             self.assertIsNotNone(STALE_RE.search(s), s)
+
+    def test_term_is_spelled_once_and_covers_every_dash(self):
+        src = pathlib.Path(__file__).read_text(encoding="utf-8")
+        self.assertEqual(src.count("end" + "[-"), 0, "a second spelling of the separator class")
+        self.assertEqual(src.count(r"\u2010" + "-" + r"\u2015"), 1)
+        for sep in ["-", " ", "\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2015", "\u2212"]:
+            unit = "Content is end%sto%send encrypted." % (sep, sep)
+            self.assertTrue(E2E_RE.search(unit), repr(sep))
+            self.assertTrue(any(rx.search(unit.replace("is end", "is certified end"))
+                                for rx in SCOPE_REFUSED), repr(sep))
+
+    def test_underclaim_pattern_spares_the_roadmap_ruling_paragraph(self):
+        units = [u for u in _units(self._scoped_text("ROADMAP.md")) if "postponed to v1.x" in u]
+        self.assertTrue(units, "the ROADMAP ruling paragraph moved")
+        for unit in units:
+            for sent in re.split(r"[.;]\s", _plain(unit)):
+                self.assertFalse(UNDER_SUBJECT_RE.search(sent) and UNDER_RE.search(sent), sent[:80])
 
     def test_in_heading_does_not_say_certified_and_cites_reissue(self):
         text = CERT.read_text(encoding="utf-8")
