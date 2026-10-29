@@ -34,6 +34,16 @@ if [ "$(id -u)" -eq 0 ]; then
   exit 64
 fi
 
+# Refuse a password-bearing pooled URL before any password is generated or
+# exported and before any container exists (exit 74).
+POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"
+# The pooled URL reaches docker exec argv (visible to every local user), so it
+# must never carry a password in its userinfo; the password travels as the
+# inherited PGPASSWORD variable only.
+case "${POOLED_URL#*://}" in
+  *:*@*) echo "FATAL: POOLED_URL must not carry a password in its userinfo" >&2; exit 74 ;;
+esac
+
 # No fixed fallback (#4734): generate a random per-run password when unset.
 PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 export POSTGRES_PASSWORD="$PW"
@@ -51,17 +61,14 @@ RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"
 case "$RUN" in
   ''|*[!a-z0-9_-]*) echo "FATAL: AI_MEMORY_SMOKE_RUN must match [a-z0-9_-]+" >&2; exit 65 ;;
 esac
+if [ "${#RUN}" -gt 64 ]; then
+  echo "FATAL: AI_MEMORY_SMOKE_RUN must be at most 64 characters" >&2
+  exit 65
+fi
 export AI_MEMORY_SMOKE_RUN="$RUN"
 PROJECT="ai-memory-pgbouncer-smoke-$RUN"
 PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"
 USERLIST=".userlist.generated.$RUN.txt"
-POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"
-# The pooled URL reaches docker exec argv (visible to every local user), so it
-# must never carry a password in its userinfo; the password travels as the
-# inherited PGPASSWORD variable only.
-case "${POOLED_URL#*://}" in
-  *:*@*) echo "FATAL: POOLED_URL must not carry a password in its userinfo" >&2; exit 74 ;;
-esac
 
 cleanup() {
   rc=$?

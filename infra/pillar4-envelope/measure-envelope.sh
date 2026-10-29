@@ -67,6 +67,10 @@ RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"
 case "$RUN" in
   ''|*[!a-z0-9_-]*) echo "FATAL: AI_MEMORY_SMOKE_RUN must match [a-z0-9_-]+" >&2; exit 65 ;;
 esac
+if [ "${#RUN}" -gt 64 ]; then
+  echo "FATAL: AI_MEMORY_SMOKE_RUN must be at most 64 characters" >&2
+  exit 65
+fi
 export AI_MEMORY_SMOKE_RUN="$RUN"
 PROJECT="ai-memory-pgbouncer-envelope-$RUN"
 USERLIST="../pgbouncer/.userlist.generated.$RUN.txt"

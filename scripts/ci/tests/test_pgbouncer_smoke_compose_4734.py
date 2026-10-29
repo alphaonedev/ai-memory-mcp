@@ -27,6 +27,11 @@ psql_pooled call-site argument fails, and the smoke refuses a pooled URL that
 carries a password); the refusing catch-all arms are pinned to their exact text
 (no `||`); the generated userlist name is gitignored; exit code 1 is documented
 as covering bring-up and teardown failures too.
+r8: only `rc=$?` and `rc=1` may assign rc (any other spelling fails); the exit-74
+refusal sits above the PW assignment and the first docker line; the run-name
+sanitiser arm and a 64-character bound (exit 65) are pinned in both scripts; the
+password guard also refuses whole-environment dumps and any redirect outside an
+allowlist.
 """
 import fnmatch
 import pathlib
@@ -57,6 +62,27 @@ FAIL_ECHO = re.compile(r"\becho\b.*\b(?:FAIL|FATAL):")
 EXIT_SAME_LINE = re.compile(r">&2; exit [1-9]\d*(?: ;;|;? \}(?:;? \})?|;)?$")
 EXIT_NEXT_LINE = re.compile(r"^exit [1-9]\d*$")
 REFUSING_ARM = re.compile(r"""^(?:'[^']*'|\*|''\|\*[^)]*)\) echo "FATAL: [^"]+" >&2; exit [1-9]\d* ;;$""")
+RC_ASSIGN = re.compile(r"\brc\s*[-+*/%|&^]?=\s*(\S*?)\s*(?:;|\}|\)|$)")
+RC_OTHER_WRITERS = re.compile(r"\b(?:let|declare|typeset|local|readonly|read|mapfile|unset)\b.*\brc\b|printf -v rc\b|\(\(\s*rc\b")
+RUN_CASE_ARM = """''|*[!a-z0-9_-]*) echo "FATAL: AI_MEMORY_SMOKE_RUN must match [a-z0-9_-]+" >&2; exit 65 ;;"""
+RUN_LENGTH_BOUND = [
+    'if [ "${#RUN}" -gt 64 ]; then',
+    'echo "FATAL: AI_MEMORY_SMOKE_RUN must be at most 64 characters" >&2',
+    "exit 65",
+    "fi",
+]
+ENV_DUMPERS = re.compile(
+    r"(?:^|[;&|(`]|\$\(|\b(?:then|do|else|command|exec|xargs|sudo|nohup|nice|time)\s|/)\s*env\b(?!-)|--env-file|\bprintenv\b|\bexport\s+-p\b|\bdeclare\s+-[a-zA-Z]*[xp]\b|\btypeset\s+-[a-zA-Z]*[xp]\b"
+    r"|/proc/(?:self|\$\$|\d+)/environ|\bcompgen\s+-[a-zA-Z]*[ev]\b|\bset\s*$|\bexport\s*$|\btee\b"
+)
+REDIRECT = re.compile(r"(?<![-<=>])(?:\d?>>?|&>)(?!&\d)\s*(\S+)")
+REDIRECT_TARGETS = {
+    "Q$USERLIST",
+    "Q$STORE_URL_FILE",
+    "Q$RESULTS_DIR/daemon.log",
+    "Q$out",
+    "/dev/null",
+}
 STEP_MARKER = re.compile(r"""^echo "\[(\d+)/(\d+)\] """)
 POOLED_URL_LITERAL = 'POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"'
 POOLED_URL_ENVELOPE = 'POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"'
@@ -418,7 +444,9 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertEqual(body[-1], 'exit "$rc"', "%s: cleanup must exit with rc" % path.name)
             self.assertLess(end, code.index("trap cleanup EXIT"), path.name)
             for ln in code:
-                self.assertNotRegex(ln, r"^rc=0\s*;?$", "%s: rc reset: %s" % (path.name, ln))
+                for val in RC_ASSIGN.findall(ln):
+                    self.assertIn(val, ("$?", "1"), "%s: rc reset or odd assignment: %s" % (path.name, ln))
+                self.assertNotRegex(ln, RC_OTHER_WRITERS, "%s: rc written by a non-plain statement: %s" % (path.name, ln))
             zeros = [i for i, ln in enumerate(code) if EXIT_ZERO.search(ln)]
             if path == SMOKE:
                 self.assertEqual(zeros, [], "%s: exit 0 hides a failed property" % path.name)
@@ -465,6 +493,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             code = [ln.strip() for ln in _code_lines(path)]
             codes = [int(c) for ln in code for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)]
             big = sorted(c for c in codes if c >= 64)
+            # 65 has one meaning (bad AI_MEMORY_SMOKE_RUN) at two pinned sites:
+            # the character class and the 64-character bound.
+            self.assertEqual(big.count(65), 2, "%s: exit 65 sites" % path.name)
+            big = [c for c in big if c != 65] + [65]
             self.assertEqual(len(big), len(set(big)), "%s: exit code reused: %r" % (path.name, big))
             header = "\n".join(ln for ln in path.read_text().splitlines()[:50] if ln.startswith("#"))
             readme = README_FOR[path].read_text()
@@ -498,6 +530,13 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             code = [ln.strip() for ln in _code_lines(path)]
             self.assertIn('RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"', code, path.name)
             self.assertIn('export AI_MEMORY_SMOKE_RUN="$RUN"', code, path.name)
+            # r8 S3: the sanitiser arm is pinned to its exact text, followed by
+            # the length bound with its own exit-65 refusal.
+            self.assertEqual(code.count(RUN_CASE_ARM), 1, "%s: RUN sanitiser arm changed" % path.name)
+            at = code.index(RUN_CASE_ARM)
+            self.assertEqual(code[at - 1], 'case "$RUN" in', path.name)
+            self.assertEqual(code[at + 1], "esac", path.name)
+            self.assertEqual(code[at + 2 : at + 6], RUN_LENGTH_BOUND, "%s: RUN length bound missing or changed" % path.name)
             for var in ("PROJECT", "PG_CONTAINER"):
                 found = [ln for ln in code if ln.startswith(var + "=")]
                 self.assertEqual(len(found), 1, "%s: %s" % (path.name, var))
@@ -541,6 +580,40 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertEqual({int(m.group(2)) for m in marks}, {total}, path.name)
         code = [ln.strip() for ln in _code_lines(SMOKE) if ln.strip()]
         self.assertRegex(code[-1], r'^echo "PASS: PgBouncer pooler validated ', "the PASS line must be last")
+
+    @staticmethod
+    def _redirect_targets(path):
+        """Redirect targets outside heredoc bodies; quoted text is neutralised
+        to `Q<content>` (with `>` and `<` blanked) so a quoted target survives."""
+        targets, heredoc = [], None
+        for ln in _norm_lines(path):
+            if heredoc:
+                if ln == heredoc:
+                    heredoc = None
+                continue
+            plain = re.sub(
+                r"\"([^\"]*)\"|'([^']*)'",
+                lambda m: "Q" + re.sub(r"[<>]", "_", m.group(1) if m.group(1) is not None else m.group(2)),
+                ln,
+            )
+            targets.extend(t.rstrip(");&|") for t in REDIRECT.findall(plain))
+            here = re.search(r"<<-?\s*'?\"?(\w+)", ln)
+            if here:
+                heredoc = here.group(1)
+        return targets
+
+    def test_no_environment_dump_and_no_stray_redirect(self):
+        # r8 S4: the name allowlist cannot see a command that copies the password
+        # without naming it. No whole-environment dumper, and every `>` redirect
+        # targets the userlist, the envelope store-url file, the daemon log, the
+        # per-worker result file or /dev/null.
+        for path in SCRIPTS:
+            for ln in _norm_lines(path):
+                self.assertNotRegex(ln, ENV_DUMPERS, "%s: command can dump the whole environment: %s" % (path.name, ln))
+            targets = self._redirect_targets(path)
+            self.assertGreaterEqual(len(targets), 2, "%s: redirect scan found nothing" % path.name)
+            for target in targets:
+                self.assertIn(target, REDIRECT_TARGETS, "%s: redirect outside the allowlist: %s" % (path.name, target))
 
     def test_password_variable_is_an_allowlist(self):
         # r5 Q2: only these lines may name the password variable (PW,
@@ -588,6 +661,11 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         for ln in sites:
             self.assertTrue(any(rx.match(ln) for rx in PSQL_POOLED_SITES), "psql_pooled call site outside the allowlist: %s" % ln)
         at = code.index(POOLED_URL_LITERAL)
+        # r8 S2: the refusal precedes the password and every container call.
+        first_pw = next(i for i, ln in enumerate(code) if ln.startswith("PW="))
+        first_docker = next(i for i, ln in enumerate(code) if re.search(r"\bdocker\b", ln))
+        self.assertLess(at + 3, first_pw, "the exit-74 refusal must come before the PW assignment")
+        self.assertLess(at + 3, first_docker, "the exit-74 refusal must come before the first docker line")
         self.assertEqual(
             code[at + 1 : at + 4],
             [
