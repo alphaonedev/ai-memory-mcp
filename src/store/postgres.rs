@@ -800,10 +800,12 @@ const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memori
 /// the optional G6 TOMBSTONE leaf share one probe (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_AGENT_BY_ID: &str =
     "SELECT namespace, version, metadata->>'agent_id' FROM memories WHERE id = $1";
-/// #3192 — destroy the per-record envelope key for one encrypted (0x03) row.
+/// #3192 — destroy the per-record envelope key for one crypto-erasable row.
+/// `$3` binds [`crate::encryption::crypto_erasable_envelope_version_codes`]
+/// (`0x03` and `0x05`, #8278 R16), the SSOT the SQLite twin also reads.
 const SQL_CRYPTO_ERASE_ENVELOPE_BY_ID: &str = "UPDATE memories SET encrypted_envelope = $2 \
      WHERE id = $1 AND encrypted_envelope IS NOT NULL \
-       AND get_byte(encrypted_envelope, 0) = 3 \
+       AND get_byte(encrypted_envelope, 0) = ANY($3::int[]) \
      RETURNING id";
 /// #3192 — erasure invariant: NULL `cid_genesis` for one victim.
 const SQL_SCRUB_CID_GENESIS_BY_ID: &str =
@@ -16603,6 +16605,7 @@ async fn pg_tombstone_and_erase_in_tx(
     let erased: Option<(String,)> = sqlx::query_as(SQL_CRYPTO_ERASE_ENVELOPE_BY_ID)
         .bind(id)
         .bind(crate::encryption::crypto_erase_marker())
+        .bind(crate::encryption::crypto_erasable_envelope_version_codes())
         .fetch_optional(&mut **tx)
         .await?;
     sqlx::query(SQL_SCRUB_CID_GENESIS_BY_ID)
@@ -27656,7 +27659,8 @@ impl MemoryStore for PostgresStore {
                 // embedded wrapped DEK so the ciphertext is cryptographically
                 // unrecoverable even by a holder of the master KEK; the marker
                 // propagates to replicas / WAL as an UPDATE ahead of the tombstoning
-                // delete. `get_byte(...,0) = 3` selects only per-record envelopes —
+                // delete. `get_byte(...,0) = ANY($6)` selects the crypto-erasable
+                // versions (0x03 per-record and 0x05 scope, the #8278 R16 SSOT) —
                 // legacy 0x02 per-agent rows have no per-record key to destroy (the
                 // honest limit) and are left for row-delete + tombstone only. The
                 // predicate matches the DELETE's victim set EXACTLY. RETURNING id so
@@ -27664,7 +27668,7 @@ impl MemoryStore for PostgresStore {
                 let erased_ids: Vec<(String,)> = sqlx::query_as(
                     "UPDATE memories SET encrypted_envelope = $4
                      WHERE encrypted_envelope IS NOT NULL
-                       AND get_byte(encrypted_envelope, 0) = 3
+                       AND get_byte(encrypted_envelope, 0) = ANY($6::int[])
                        AND ($1::text IS NULL OR namespace = $1)
                        AND ($2::text IS NULL OR tier = $2)
                        AND ($3::text IS NULL
@@ -27677,6 +27681,7 @@ impl MemoryStore for PostgresStore {
                 .bind(pattern)
                 .bind(crate::encryption::crypto_erase_marker())
                 .bind(&locked)
+                .bind(crate::encryption::crypto_erasable_envelope_version_codes())
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;

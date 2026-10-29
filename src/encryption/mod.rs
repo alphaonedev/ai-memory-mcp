@@ -1192,13 +1192,32 @@ pub fn crypto_erase_marker() -> Vec<u8> {
 ///
 /// #8278 — a `0x05` scope envelope is erasable too: its per-record DEK exists
 /// only wrapped inside the envelope, so the `0x04` rewrite destroys it even
-/// for a holder of the namespace scope key.
+/// for a holder of the namespace scope key. The version set is
+/// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`], the one source both backends read
+/// (ruling R16).
 #[must_use]
 pub fn envelope_is_crypto_erasable(envelope_bytes: &[u8]) -> bool {
-    matches!(
-        envelope_bytes.first(),
-        Some(&RECORD_ENVELOPE_VERSION | &SCOPE_ENVELOPE_VERSION)
-    )
+    envelope_bytes
+        .first()
+        .is_some_and(|version| CRYPTO_ERASABLE_ENVELOPE_VERSIONS.contains(version))
+}
+
+/// #8278 R16 (code review r2 C1) — the envelope version bytes whose per-record
+/// DEK a `0x04` rewrite destroys: `0x03` per-record and `0x05` scope. The one
+/// source of truth for [`envelope_is_crypto_erasable`] (SQLite) and the
+/// Postgres erase predicates, so the signed erasure kind of a row never
+/// depends on the backend.
+pub const CRYPTO_ERASABLE_ENVELOPE_VERSIONS: [u8; 2] =
+    [RECORD_ENVELOPE_VERSION, SCOPE_ENVELOPE_VERSION];
+
+/// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] as SQL integers, for the Postgres
+/// `get_byte(encrypted_envelope, 0) = ANY($n::int[])` erase predicates.
+#[must_use]
+pub fn crypto_erasable_envelope_version_codes() -> Vec<i32> {
+    CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+        .iter()
+        .map(|version| i32::from(*version))
+        .collect()
 }
 
 /// #1956 [R56] — has this `encrypted_envelope` already been crypto-erased
