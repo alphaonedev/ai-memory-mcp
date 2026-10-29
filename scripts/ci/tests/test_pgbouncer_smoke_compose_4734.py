@@ -640,20 +640,33 @@ DAEMON_SELECTION_NAMES = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOC
 DAEMON_SELECTION_NAME = re.compile(r"DOCKER_\w*")
 
 
-# r16 K11 / S22: shell comments, read the way bash reads them, by ONE pre-pass that every shell reader of
-# this guard uses (_code_lines, _shell_words and so the compose word pin and the daemon-selection check, the
-# text count of compose calls, _self_referencing_declarations, the redirect scan's heredoc openers and the
-# group scan). The rule: a `#` starts a comment that runs to the end of the line when it begins a word, that
-# is at the start of the text or of a line, or after unquoted, unescaped whitespace or one of ; & | ( ) < >,
-# and only in code (top level, $( ), ( ), a backquote pair, a case body). A `#` inside a word (${x#y}, $#,
-# a#b, --flag=#), after a backslash, or inside '...', "...", $'...' or ${...} is text. Heredoc bodies are
-# copied unchanged (the opener is read on the comment-free line). A quote, substitution or heredoc still open
-# at the end of the text is a problem (fail closed), never a guess; a single quote directly inside ${...}
-# inside double quotes is refused (bash reads it as text there and as a quote outside double quotes).
-# The comment text is removed, the newline kept, so line numbers do not move. Before round 16 shlex read
-# the comment text as code (commenters off), so a quote in one trailing comment and a quote in a later one
-# made the lines between them one word: a compose call there was invisible to the word pin.
+# r16 K11 / S22, r17 K12 / S23: shell comments are removed by ONE pre-pass that every shell reader of this
+# guard uses (_code_lines, _shell_words and so the compose word pin and the daemon-selection check, the text
+# count of compose calls, _self_referencing_declarations, the redirect scan's heredoc openers and the group
+# scan). The rule: a `#` that begins a word outside single and double quotes, heredocs, command and arithmetic
+# substitutions, process substitutions and backquotes starts a comment that runs to the end of the line; a
+# word begins at the start of the text or of a line, after unquoted, unescaped whitespace or one of ; & | < >,
+# after an opening bracket, and after a `)` that closes an OPERATOR bracket. The pre-pass keeps a stack of
+# what each open bracket is. OPERATOR brackets: a plain subshell `(`, the `((` of an arithmetic command or of
+# `for ((`, and the case pattern close (a `)` directly in a case body). WORD brackets: `$(`, `$((`, `<(`, `>(`
+# and a backquote. A `)` that pops a WORD bracket, an unmatched `)` and a closing backquote never begin a
+# word, so `$(date)#c` is one word while `(echo a)#c` and `(echo a) #c` end in a comment (bash agrees on all
+# three). Inside `$((...))` and `((...))` a `#` is text (base#digits). A `#` anywhere inside a backquote pair
+# is text: the backquote body ends only at its matching unescaped backquote, never at a `#`. Fail toward
+# code, never toward comment: when the pre-pass cannot tell, the `#` is text, and the readers then see the
+# rest of the line and may refuse it (a false refusal is acceptable, a hidden command is not). A `#` inside
+# a word (${x#y}, $#, a#b, --flag=#), after a backslash, or inside '...', "...", $'...' or ${...} is text.
+# Heredoc bodies are copied unchanged (the opener is read on the comment-free line). A quote, backquote,
+# substitution or heredoc still open at the end of the text, and an arithmetic `$((` or `((` closed by a
+# lone `)`, is a problem (fail closed), never a guess; a single quote directly inside ${...} inside double
+# quotes is refused (bash reads it as text there and as a quote outside double quotes). The comment text is
+# removed, the newline kept, so line numbers do not move. Before round 16 shlex read the comment text as
+# code (commenters off), so a quote in one trailing comment and a quote in a later one made the lines
+# between them one word; in round 16 any `)` and a closing backquote began a word, so a `#` after `$(...)`,
+# `$((...))`, `<(...)` or a backquote pair hid the rest of a line that bash runs.
 COMMENT_WORD_BREAK = " \t\n;&|()<>"
+WORD_BRACKETS = ("$(", "<(")  # r17 K12: `<(` stands for both process substitutions, <( and >(
+ARITH_BRACKETS = ("$((", "((", "a(")  # `a(` is a plain paren inside arithmetic
 CASE_WORD = re.compile(r"(case|esac)(?=[\s;&|()<>]|$)")
 
 
@@ -683,11 +696,37 @@ def _strip_shell_comments(text):
             if ch == "'":
                 stack.pop()
             continue
+        if ch == "$" and text[i + 1 : i + 3] == "((":
+            stack.append("$((")  # r17 K12: an arithmetic substitution is a WORD bracket
+            out.extend("$((")
+            i += 3
+            word_start = False
+            continue
         if ch == "$" and nxt in ("(", "{"):
             stack.append("$" + nxt)
             out.extend(ch + nxt)
             i += 2
             word_start = nxt == "("
+            continue
+        if top in ARITH_BRACKETS:
+            # r17 K12: inside $((...)) or ((...)) a `#` is text; only the matching `))` closes it
+            if ch == ")" and top != "a(":
+                if nxt != ")":
+                    return None, "an arithmetic %s closed by a lone )" % top
+                stack.pop()
+                out.extend("))")
+                i += 2
+                word_start = top == "(("
+                continue
+            if ch == ")":
+                stack.pop()
+            elif ch == "(":
+                stack.append("a(")
+            elif ch in "'\"`":
+                stack.append(ch)
+            out.append(ch)
+            i += 1
+            word_start = False
             continue
         if top in ('"', "${"):
             if ch == "`":
@@ -711,7 +750,7 @@ def _strip_shell_comments(text):
             word_start = False
             continue
         # code: top level, $( ), ( ), a backquote pair or a case body
-        if ch == "#" and word_start:
+        if ch == "#" and word_start and "`" not in stack:  # r17 K12: inside a backquote pair `#` is text
             j = text.find("\n", i)
             j = n if j < 0 else j
             while len(out) > keep and out[-1] in " \t":
@@ -737,18 +776,33 @@ def _strip_shell_comments(text):
             out.append(ch)
             i += 1
             ch = nxt
-        elif ch == "`":
+        elif ch == "(" and word_start and nxt == "(":
+            stack.append("((")  # r17 K12: an arithmetic command (also `for ((`) is an OPERATOR bracket
+            out.extend("((")
+            i += 2
+            word_start = False
+            continue
+        # r17 K12 / S23: only a `)` that pops an OPERATOR bracket (a plain subshell, a case pattern close) begins
+        # a word; a `)` that pops $( <( >(, an unmatched `)` and a closing backquote do not
+        begins = ch in COMMENT_WORD_BREAK and ch != ")"
+        if ch == "`":
+            begins = top != "`"
             if top == "`":
                 stack.pop()
             else:
                 stack.append("`")
         elif ch == "(":
-            stack.append("(")
-        elif ch == ")" and top in ("$(", "("):
+            stack.append("<(" if out and out[-1] in "<>" and len(out) > keep else "(")
+        elif ch == ")" and top in WORD_BRACKETS:
             stack.pop()
+        elif ch == ")" and top == "(":
+            stack.pop()
+            begins = True
+        elif ch == ")" and top == "case":
+            begins = True
         out.append(ch)
         i += 1
-        word_start = ch in COMMENT_WORD_BREAK or ch == "`"
+        word_start = begins
         if ch == "\n":
             line = "".join(out[: len(out) - 1]).rsplit("\n", 1)[-1]
             for tok in HEREDOC_TOKEN.finditer(re.sub(r"\(\(.*?\)\)", " ", line)):
@@ -767,7 +821,7 @@ def _strip_shell_comments(text):
                     keep = len(out)
                     break
     if stack:
-        return None, "a quote, substitution or case left open at the end of the text (%s)" % " ".join(stack)
+        return None, "a quote, backquote, substitution or case left open at the end of the text (%s)" % " ".join(stack)
     return "".join(out), None
 
 
@@ -2378,6 +2432,67 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # the same pre-pass feeds the group scan: a quote in a comment never opens a quote there
         groups = self._groups(['true # it\'s', '{ echo "FAIL: a" >&2; exit 1; }', "x # that's"], "t")
         self.assertEqual([g["bad"] for _, g in groups], [False])
+
+    # r17 K12 / S23: lines that bash runs after a WORD bracket closes; each one ends in `echo RAN`.
+    BASH_RUNS_AFTER = (
+        ": $(true)#x; echo RAN",
+        ": `true`#x; echo RAN",
+        ": $((1+1))#x; echo RAN",
+        ": <(true)#x; echo RAN",
+        ": >(true)#x; echo RAN",
+        ": $( $(true) )#y; echo RAN",
+        ': `echo ")"`#x; echo RAN',
+        ": `true #c` ; echo RAN",
+        ": ${x#y}; echo RAN",
+    )
+    # and lines where bash reads a comment after an OPERATOR bracket closes
+    BASH_COMMENT_AFTER = (
+        "(true)#c; echo RAN",
+        "(true) #c; echo RAN",
+        "((1))#c; echo RAN",
+        "case a in a)#c; echo RAN\n;; esac",
+    )
+
+    def test_shell_comment_prepass_bracket_selftest(self):
+        # r17 K12 / S23: a `)` that closes $( $(( <( >( and a closing backquote never begin a word, so a `#`
+        # right after one is text and the rest of the line stays code; a `)` that closes a plain subshell, an
+        # arithmetic command or a case pattern does begin one. Inside a backquote pair `#` is text.
+        strip = lambda s: _strip_shell_comments(s)[0]  # noqa: E731
+        for text in self.BASH_RUNS_AFTER:
+            self.assertEqual(strip(text), text, text)
+        for text in ("x=$(true)#x", "x=`true`#x", "x=$((1+1))#x", "cat <(true)#x", "tee >(true)#x", "x=$( $(true) )#y",
+                     'x=`echo ")"`#x', "echo $((16#ff))", "for ((i=0; i<1; i++)); do :; done"):
+            self.assertEqual(strip(text), text, text)
+        self.assertEqual(strip("(true)#c; echo RAN"), "(true)")
+        self.assertEqual(strip("(true) #c; echo RAN"), "(true)")
+        self.assertEqual(strip("((1))#c; echo RAN"), "((1))")
+        self.assertEqual(strip("case a in a)#c; echo RAN\n;; esac"), "case a in a)\n;; esac")
+        self.assertEqual(strip("x=$(( $(date +%s) + 3 )) # c"), "x=$(( $(date +%s) + 3 ))")
+        self.assertEqual(strip("read -r a < <(cat x) # c"), "read -r a < <(cat x)")
+        self.assertEqual(strip("x=`echo #` # c"), "x=`echo #`")
+        for text in (": `true", ": $((1) )", ": `true`#x `"):
+            self.assertIsNotNone(_strip_shell_comments(text)[1], "fail closed: %r" % text)
+        # a compose call or a daemon selection after a closing WORD bracket is read by the pin readers
+        pin = "docker compose" + PINNED_COMPOSE_ARGS + '-p "$PROJECT"'
+        decoy = pin + " -\\f ./decoy.yml up -d --wait"
+        rows = [": $(true)#x; " + decoy, ": `true`#x; " + decoy, ": `true #a`; " + decoy, ": $((1))#x; " + decoy,
+                "n=$((0))#c " + decoy, "X=`true`#c " + decoy, "X=$(true)#c " + decoy, ": <(true)#x; " + decoy,
+                ": >(true)#x; " + decoy, ": $( $(true) )#y; " + decoy, ': `echo ")"`#x; ' + decoy,
+                ": $((1))#x; " + pin + " --project-director\\y /x up -d --wait",
+                ": $((1))#x; " + pin + " --fi\\le=./decoy.yml up -d --wait",
+                ": `true`#x; export D\"\"OCKER_HOST=tcp://127.0.0.1:2399", ': `true`#x; docker con""text use x']
+        for row in rows:
+            self.assertTrue(_compose_pin_refusals(row) or _daemon_selection_refusals(row), row)
+        self.assertEqual(_compose_pin_refusals("(true) #c " + decoy), [])
+
+    def test_shell_comment_prepass_agrees_with_bash(self):
+        # r17 K12 / S23: the pre-pass keeps `echo RAN` exactly when bash runs it (rows are inert: `:`, true, echo)
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash not installed")
+        for text in self.BASH_RUNS_AFTER + self.BASH_COMMENT_AFTER:
+            run = subprocess.run([bash, "--norc", "--noprofile", "-c", text], capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual("echo RAN" in _strip_shell_comments(text)[0], "RAN" in run.stdout, text)
 
     def test_declarations_do_not_read_their_own_names(self):
         # r15: `local out="$2" bodyf="${out}.body"` expanded "${out}" before `local` assigned it; under
