@@ -96,9 +96,12 @@ mkdir -p "$RESULTS_DIR"
 DAEMON_PID=""
 
 # Compose is pinned (#4734 r13): every `docker compose` call passes -f of this one file and
-# --project-directory of its directory, so a compose.override file, a compose.yaml, a .env
-# that sets COMPOSE_FILE or an inherited COMPOSE_FILE is never read. With -f given, compose
-# does not discover files and ignores COMPOSE_FILE (tested with Docker Compose v5.6.0).
+# --project-directory of its directory, so a compose.override file, a compose.yaml, or a
+# COMPOSE_FILE set in a .env or inherited is never read. With -f given, compose does not discover
+# files and ignores COMPOSE_FILE (tested with Docker Compose v5.6.0). With --project-directory,
+# compose still reads a .env in that directory for interpolation (same version); that has no effect
+# here, because this script exports every name the compose file interpolates (the environment
+# outranks .env) and the guard refuses a tracked .env in the infra directory.
 COMPOSE_DIR="$PWD/../pgbouncer"
 COMPOSE_FILE_PINNED="$COMPOSE_DIR/docker-compose.yml"
 

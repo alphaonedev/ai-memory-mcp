@@ -59,7 +59,7 @@ scalar, block scalars, a scalar or flow collection over several lines, a `$` ins
 `--project-directory`, the infra directory holds one compose file and no `.env`, and no COMPOSE_*
 variable is read or exported; a definition after a case pattern paren or if/while/until is read as a
 definition; if..fi and case..esac are groups, and a FAIL-bearing group may be followed only by end of
-line, `;`, `;;`, `&&` or an enclosing closer.
+line, `;`, `;;` or an enclosing closer.
 """
 import fnmatch
 import pathlib
@@ -201,10 +201,32 @@ CLEANUP_DEF = re.compile(CMD_START + r"(?:function\s+cleanup\b|cleanup\s*\(\))")
 ALIAS_DEF = re.compile(CMD_START + r"alias\s")
 # r11 Q16: an escaped `<` before `<word` is an input redirect, not a heredoc opener.
 HEREDOC_TOKEN = re.compile(r"\"[^\"]*\"|'[^']*'|(?<![<\\])<<(?!<)-?\s*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))")
-# r13 K3+S17: what may follow the closer of a group that holds a FAIL site: end of line, `;`, `;;`
-# (not `;&` or `;;&`), `&&`, or the closer of an enclosing group. A redirect, a pipe, `||`, a lone `&`
-# or any other token after the closer is refused.
-GROUP_CLOSER_OK = re.compile(r"\s*(?:$|;;(?!&)|;(?![;&])|&&|[)}]|(?:fi|done|esac)(?![\w-]))")
+# r13 K3+S17 / r14 K5: what may follow the closer of a group that holds a FAIL site: end of line, `;`,
+# `;;` (not `;&` or `;;&`), or the closer of an enclosing group (`)`, `}`, fi, done, esac; that group
+# holds the same FAIL site and is judged by its own tail). `&&` is NOT accepted: bash ignores set -e for
+# a failure in any non-final element of an `&&` list, so `done && :` swallows a piped loop's failure.
+CLOSER_TAIL_TOKEN = re.compile(r"\s*(?:;;(?!&)|;(?![;&])|[)}]|(?:fi|done|esac)(?![\w-]))")
+# r14 K6: a FAIL-bearing group whose construct is preceded, on the same command, by one of these is in
+# condition position (if, elif, while, until, `!`), where set -e does not apply.
+CONDITION_WORDS = ("if", "elif", "while", "until", "!")
+
+
+def _closer_tail_ok(tail):
+    """True when the text after a group closer starts with an accepted tail. The first token decides:
+    `;` / `;;` end the list, and an enclosing closer hands the judgement to that enclosing group, which
+    holds the same FAIL site and is judged by its own tail (so `done ) || true` is refused through the
+    subshell and `done && : || true` is refused at `&&`)."""
+    return not tail.strip() or bool(CLOSER_TAIL_TOKEN.match(tail))
+
+
+def _context_bad(ctx):
+    """r14 K6: the words before a group on its command (if/elif/while/until/`!` and the operators
+    `|`, `&&`, `||`). Condition position is refused; so is a piped group after `&&` or `||` (an
+    unpiped `|| { echo FAIL; exit 1; }` is the real fail branch: its `exit` ends the shell itself)."""
+    if any(w in CONDITION_WORDS for w in ctx):
+        return True
+    ops = [i for i, w in enumerate(ctx) if w in ("&&", "||")]
+    return bool(ops) and "|" in ctx[ops[-1] + 1 :]
 CAVEAT = re.compile(r"Any other non-zero status[^.]*\.")
 COMPOSE_NAMES = {"AI_MEMORY_SMOKE_RUN", "POSTGRES_PASSWORD", "PGBOUNCER_UID", "PGBOUNCER_GID"}
 # r12 S12: compose features that can move a second secret into a container.
@@ -390,6 +412,10 @@ def _decoded_scan(text):
     except yaml.YAMLError as exc:
         return names, ["the compose text does not parse: %s" % str(exc).splitlines()[0]]
     for ev in events:
+        # r14 S18: compose decodes an explicit tag (`!!binary`, `!!str`, a verbatim tag) BEFORE it
+        # interpolates, so the raw text and the scalar the checks below see are not what it renders.
+        if isinstance(ev, (yaml.ScalarEvent, yaml.MappingStartEvent, yaml.SequenceStartEvent)) and ev.tag is not None:
+            problems.append("explicit YAML tag %r" % ev.tag)
         if isinstance(ev, yaml.ScalarEvent):
             raw = text[ev.start_mark.index : ev.end_mark.index]
             if ev.start_mark.line != ev.end_mark.line:
@@ -417,15 +443,53 @@ PINNED_COMPOSE_ARGS = ' -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_
 COMPOSE_OWN_NAMES = {"COMPOSE_FILE_PINNED", "COMPOSE_DIR"}
 
 
+# r14 S19: every compose invocation, with or without a global docker flag between the two words.
+COMPOSE_INVOCATION = re.compile(r"\bdocker\b(?:\s+-{1,2}[\w-]+(?:[ =]\S+)?)*\s+compose\b")
+COMPOSE_EXTRA_ARG = re.compile(
+    r"(?<![\w$./-])(?:-f|--file|--project-directory|--env-file)(?![\w-])|(?<![\w$./-])(?:-p|--project-name)(?:\s+|=)\S*/"
+)
+
+
+def _command_tail(text):
+    """The rest of one shell command: up to the first unquoted newline, `;`, `|`, `&&` or unmatched `)`."""
+    quote, depth = None, 0
+    for i, ch in enumerate(text):
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "\\":
+            continue
+        elif text.startswith("$(", i):
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return text[:i]
+            depth -= 1
+        elif ch in ";|\n" or text.startswith("&&", i):
+            return text[:i]
+    return text
+
+
 def _compose_pin_refusals(body):
-    """r13 S15: refusals for the code of one script: every `docker compose` word is followed by the
-    pinned -f and --project-directory, no docker-compose (v1) binary, no COMPOSE_* name other than the
-    two derived ones (so COMPOSE_FILE, COMPOSE_PATH_SEPARATOR, COMPOSE_PROJECT_NAME are neither read nor
-    exported), no export of those two, and each assigned at most once."""
+    """r13 S15 + r14 S19: refusals for the code of one script. EVERY compose invocation (`docker`, then
+    only the word compose: a global docker flag in between is refused) is followed by the pinned
+    -f and --project-directory, and the rest of that command (a backslash continuation included) carries
+    no further -f, --file, --project-directory, --env-file or --project-name with a path; no docker-compose
+    (v1) binary, no COMPOSE_* name other than the two derived ones (so COMPOSE_FILE,
+    COMPOSE_PATH_SEPARATOR, COMPOSE_PROJECT_NAME are neither read nor exported), no export of those two,
+    and each assigned at most once."""
     problems = []
-    for m in re.finditer(r"\bdocker\s+compose\b", body):
+    body = re.sub(r"\\\n\s*", " ", body)
+    for m in COMPOSE_INVOCATION.finditer(body):
+        if " ".join(m.group().split()) != "docker compose":
+            problems.append("a global docker flag between docker and compose: %s" % m.group())
         if not body[m.end() :].startswith(PINNED_COMPOSE_ARGS):
             problems.append("docker compose call without the pinned -f and --project-directory")
+            continue
+        rest = _command_tail(body[m.end() + len(PINNED_COMPOSE_ARGS) :]).replace('"', "").replace("'", "")
+        if COMPOSE_EXTRA_ARG.search(rest):
+            problems.append("a further -f, --file, --project-directory, --env-file or --project-name path after the pin")
     if re.search(r"\bdocker-compose\b(?!\.ya?ml)", body):
         problems.append("docker-compose binary")
     for m in re.finditer(r"\bCOMPOSE_\w*", body):
@@ -600,10 +664,24 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             "comment-continuation": '    labels:\n      smoke.copy: "a\n# b\n      ${PGPASSWORD}"\n',
             "plain-second-name": "    environment:\n      X: ${PGPASSWORD}\n",
             "dollar-run": "    environment:\n      X: $$$PGPASSWORD\n",
+            # r14 S18: an explicit tag is decoded by compose before it interpolates: X1 `!!binary`
+            # under a non-environment key, X2 under environment, X3 `!!str` carrying a dollar, X4 a
+            # tagged mapping, plus a tagged sequence and a verbatim tag
+            "X1-binary-hostname": "    hostname: !!binary |\n      JHtQR1BBU1NXT1JEfQ==\n",
+            "X1b-binary-flow": "    hostname: !!binary JHtQR1BBU1NXT1JEfQ==\n",
+            "X2-binary-environment": "    environment:\n      X: !!binary JHtQR1BBU1NXT1JEfQ==\n",
+            "X3-str-tag-dollar": "    hostname: !!str ${PGPASSWORD}\n",
+            "X3b-str-tag-plain": "    hostname: !!str plain\n",
+            "X4-tagged-mapping": "    environment: !!map\n      X: plain\n",
+            "X4b-tagged-sequence": "    dns: !!seq\n      - 1.1.1.1\n",
+            "X4c-verbatim-tag": "    hostname: !<tag:yaml.org,2002:str> plain\n",
+            "X4d-local-tag": "    hostname: !x plain\n",
         }
         for row, extra in refused.items():
             names, problems = _decoded_scan(base.replace(port, extra + port, 1))
             self.assertTrue(problems or names != COMPOSE_NAMES, "row %s is not refused" % row)
+            if row.startswith(("X1", "X2", "X3", "X4")):
+                self.assertTrue([p for p in problems if p.startswith("explicit YAML tag")], "row %s: the tag rule did not fire" % row)
 
     def test_decoded_environment_and_labels_are_pinned_on_head(self):
         # r13 S14: the head environment keys, the absence of labels/command/entrypoint and the
@@ -646,6 +724,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
     def test_compose_discovery_selftest(self):
         ok = 'x docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$P" up'
         self.assertEqual(_compose_pin_refusals(ok), [])
+        # legit: other options after the pin, `-p` with a variable, a later command that has its own -f
+        self.assertEqual(_compose_pin_refusals(ok + ' --wait && grep -f x y | cat'), [])
+        self.assertEqual(_compose_pin_refusals(ok + ' down -v >/dev/null || { echo "WARN -f" >&2; }'), [])
+        self.assertEqual(_compose_pin_refusals('docker ps -aq --filter "label=com.docker.compose.project=$P"'), [])
         for row, text in {
             "no-f": 'docker compose -p "$P" up',
             "other-f": 'docker compose -f ./x.yml --project-directory "$COMPOSE_DIR" up',
@@ -658,6 +740,21 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             "project-name": 'COMPOSE_PROJECT_NAME=x ' + ok,
             "second-pin": 'COMPOSE_FILE_PINNED="$COMPOSE_DIR/x.yml"\nCOMPOSE_FILE_PINNED=/other.yml\n' + ok,
             "export-dir": 'export COMPOSE_DIR\n' + ok,
+            # r14 S19: Y1 a second -f, Y2 `-f -` fed by a heredoc, Y3 a second -f over a line
+            # continuation, Y4 a second --project-directory, Y5 a global docker flag (unpinned), Y6 a
+            # global flag with another file only, plus --file, --env-file, --project-name with a path
+            "Y1-second-f": ok + " -f ./extra.yml",
+            "Y2-stdin-f": ok + " -f - <<'EOF'",
+            "Y3-continuation": ok + " \\\n  -f ./extra.yml",
+            "Y4-second-project-directory": ok + " --project-directory /elsewhere",
+            "Y5-global-flag-unpinned": 'docker --debug compose -p "$P" up',
+            "Y6-global-flag-other-file": 'docker -H unix:///x compose -f ./other.yml up',
+            "Y6b-global-flag-pinned": 'docker --context=x compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" up',
+            "Y7-long-file": ok + " --file=./extra.yml",
+            "Y8-env-file": ok + " --env-file ./x.env",
+            "Y9-project-name-path": ok + " --project-name /x/y",
+            "Y10-second-invocation": ok + "\n" + 'docker compose -p "$P" up',
+            "Y11-after-and": ok + ' -p "$P" up && docker compose -f ./z.yml ps',
         }.items():
             self.assertTrue(_compose_pin_refusals(text), "row %s is not refused" % row)
         listing = sorted(INFRA_ALLOWED)
@@ -1043,25 +1140,41 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
 
     @staticmethod
     def _close_group(stack, out, tail):
-        """Pop the top group and, for ( ) { } and do..done, record whether it can be neutralised."""
+        """Pop the top group and, for ( ) { } and do..done, record whether it can be neutralised.
+        Returns the group (None for a ${ } group)."""
         group = stack.pop()
         if group["kind"] == "p":
-            return
+            return None
         sub_fail = group["fail"] and group["kind"] == "("
-        unsafe = not GROUP_CLOSER_OK.match(tail)
-        group["bad"] = group["fail"] and (sub_fail or unsafe)
-        group["why"] = "subshell" if sub_fail else "a token other than end of line, ; ;; && or a closer follows it"
+        unsafe = not _closer_tail_ok(tail)
+        in_context = _context_bad(group["ctx"])
+        group["bad"] = group["fail"] and (sub_fail or unsafe or in_context)
+        group["why"] = (
+            "subshell" if sub_fail else "a token other than end of line, ; ;; or a closer follows it" if unsafe else "condition or piped list position"
+        )
         out.append(("%s %s%s" % (group["at"], "$" if group["sub"] else "", group["kind"]), group))
+        return group
 
     @staticmethod
     def _groups(lines, name):
-        """r11 Q15 + r12 N2/N5 + r13 K2: every ( ) { } do..done if..fi (elif and else arms belong to
-        the if) and case..esac group over the code lines (a case pattern paren pops nothing),
+        """r11 Q15 + r12 N2/N5 + r13 K2 + r14 K5/K6: every ( ) { } do..done if..fi (elif and else arms
+        belong to the if) and case..esac group over the code lines (a case pattern paren pops nothing),
         across lines, outside quotes, comments and heredoc bodies; returns (location, group).
         group["bad"] is set when a FAIL echo sits inside a subshell, or in a group whose closer is
-        followed by anything but end of line, `;`, `;;`, `&&` or an enclosing closer (r13 K3: a
-        redirect, a pipe, `||`, a lone `&`). A closer with no opener RAISES (fail closed)."""
+        followed by anything but end of line, `;`, `;;` or an enclosing closer (r13 K3, r14 K5: not
+        `&&`; a redirect, a pipe, `||`, a lone `&`), or in a group whose construct is preceded on its
+        command by if, elif, while, until, `!` or (when piped) `&&` / `||` (r14 K6: condition position
+        is exempt from set -e). A closer with no opener RAISES (fail closed)."""
         out, stack, heredoc, in_sq = [], [], None, False
+        words, loops = [], []  # words: if/elif/while/until/!, | && || seen on the current command
+
+        def opener(kind, sub, n, i, ctx):
+            stack.append({"kind": kind, "sub": sub, "fail": False, "at": "line %d col %d" % (n + 1, i + 1), "ctx": list(ctx), "saved": list(words)})
+
+        def cmd_start(prev):
+            prev = prev.rstrip()
+            return not prev or prev[-1] in ";&|({" or bool(re.search(r"(?:^|[\s;&|(){])(?:then|do|else|elif|if|while|until)$", prev))
+
         for n, raw in enumerate(lines):
             if heredoc:
                 heredoc = None if raw == heredoc else heredoc
@@ -1082,7 +1195,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 elif ch == "\\":
                     step = 2
                 elif ch == "$" and nxt in ("(", "{"):
-                    stack.append({"kind": "(" if nxt == "(" else "p", "sub": True, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
+                    opener("(" if nxt == "(" else "p", True, n, i, words)
+                    words.clear()
                     step = 2
                 elif top == "dq":
                     if ch == '"':
@@ -1091,28 +1205,62 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                     stack.append({"kind": "dq", "fail": False})
                 elif ch == "'":
                     in_sq = True
+                elif ch == ";":
+                    words.clear()
+                elif ch == "&" and nxt == "&":
+                    words.append("&&")
+                    step = 2
+                elif ch == "|":
+                    words.append("||" if nxt == "|" else "|")
+                    step = 2 if nxt == "|" else 1
+                elif ch == "!" and nxt in (" ", "\t") and cmd_start(ln[:i]):
+                    words.append("!")
                 elif ch in "({":
-                    stack.append({"kind": ch, "sub": False, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
+                    opener(ch, False, n, i, words)
+                    words.clear()
                 elif ch == ")" and top == "case":
-                    pass  # r12 N5: a case pattern paren closes no group
+                    words.clear()  # r12 N5: a case pattern paren closes no group
                 elif ch in ")}" and not ((ch == ")" and top == "(") or (ch == "}" and top in ("{", "p"))):
                     raise AssertionError("%s: line %d col %d: closing %s with no matching opener" % (name, n + 1, i + 1, ch))
                 elif ch in ")}":
-                    close = ln[i + 1 :]
-                    PgbouncerSmokeComposeTest._close_group(stack, out, close)
+                    saved = stack[-1]["saved"]
+                    PgbouncerSmokeComposeTest._close_group(stack, out, ln[i + 1 :])
+                    words[:] = saved + ["g"]
                 elif ch.isalpha() and (i == 0 or ln[i - 1] in " \t;&|(){}`"):
                     word = re.match(r"[A-Za-z]+", ln[i:]).group()
                     after = ln[i + len(word) : i + len(word) + 1]
                     step = len(word)
                     if after == "" or after in " \t;&|()":
-                        if word in ("do", "case", "if"):
-                            stack.append({"kind": word, "sub": False, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
+                        if word == "do":
+                            ctx = loops.pop() if loops else []
+                            opener("do", False, n, i, ctx)
+                            stack[-1]["saved"] = list(ctx)
+                            words.clear()
+                        elif word == "case":
+                            opener("case", False, n, i, words)
+                            words.clear()
+                        elif word == "if":
+                            opener("if", False, n, i, words)
+                            words[:] = ["if"]
+                        elif word in ("while", "until"):
+                            loops.append(list(words))
+                            words.append(word)
+                        elif word in ("for", "select"):
+                            loops.append(list(words))
+                        elif word == "elif":
+                            words[:] = ["elif"]
+                        elif word in ("then", "else"):
+                            words.clear()
                         elif word in ("done", "esac", "fi"):
                             if top != {"done": "do", "esac": "case", "fi": "if"}[word]:
                                 raise AssertionError("%s: line %d col %d: %s with no matching opener" % (name, n + 1, i + 1, word))
+                            saved = stack[-1]["saved"]
                             PgbouncerSmokeComposeTest._close_group(stack, out, ln[i + len(word) :])
+                            words[:] = saved + ["g"]
                 i += step
             if not in_sq:
+                if not (words and words[-1] in ("|", "&&", "||")):
+                    words.clear()
                 for tok in HEREDOC_TOKEN.finditer(ln):
                     word = tok.group(1) or tok.group(2) or tok.group(3)
                     if word:
@@ -1146,15 +1294,43 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         loop = ["cat x | while read l; do", fail]
         for tail in ("done 2>&1 || true", "done </dev/null | cat || true", "done || printf ok", "done || /bin/true",
                      "done || command true", "done &", "done | cat", "done > /dev/null", "done >> x", "done &> x", "done 2> x",
-                     "done < x", "done || :", "done || echo ok", "done ;&"):
+                     "done < x", "done || :", "done || echo ok", "done ;&",
+                     # r14 K5 (H1, H1b, H15b): `&&` is no longer accepted, and the whole tail is judged
+                     "done && :", "done && true", "done && : || true", "done && x", "done;&& x"):
             self.assertEqual(bad(loop + [tail]), [True], tail)
-        for tail in ("done", "done;", "done && :", "done ; :"):
+        for tail in ("done", "done;", "done ; :", "done # note", "done ;; ", "done; : && true"):
             self.assertEqual(bad(loop + [tail]), [False], tail)
         self.assertEqual(bad(["{ " + fail + "; } 2>&1 || true"]), [True])
         self.assertEqual(bad(["{ " + fail + "; } | cat || /bin/true"]), [True])
         self.assertEqual(bad(["{ " + fail + "; } &"]), [True])
-        self.assertEqual(bad(["{ " + fail + "; } && :"]), [False])
+        self.assertEqual(bad(["{ " + fail + "; } && :"]), [True])
         self.assertEqual(bad(["if true; then", "{ " + fail + "; }", "fi"]), [False, False])
+        # r14 K5: H4 `{ piped loop; } && :`, H5 piped case `esac && :`, H6b piped if `fi && true`,
+        # H13 piped until `done && :`, H1 / H1b piped loop `done && :` / `done && true`
+        self.assertEqual(bad(["{ cat x | while read l; do " + fail + "; done; } && :"]), [False, True])
+        self.assertEqual(bad(["cat x | case $x in", "0) " + fail + " ;;", "esac && :"]), [True])
+        self.assertEqual(bad(["cat x | if true; then", fail, "fi && true"]), [True])
+        self.assertEqual(bad(["cat x | until false; do", fail, "done && :"]), [True])
+        self.assertEqual(bad(["cat x | if true; then", fail, "fi; true"]), [False])
+        # r14 K6: a FAIL-bearing group in condition position (H2 if, H3 `!`, H14 while, elif, until) is
+        # refused; the same words outside a FAIL-bearing group, and an unpiped `|| { FAIL; exit 1; }`, are not.
+        body = ["cat x | while read l; do", fail, "done"]
+        self.assertEqual(bad(["if " + body[0], body[1], body[2] + "; then :; fi"]), [True, False])
+        self.assertEqual(bad(["! " + body[0], body[1], body[2]]), [True])
+        self.assertEqual(bad(["while " + body[0], body[1], body[2] + "; do break; done"]), [True, False])
+        self.assertEqual(bad(["until " + body[0], body[1], body[2] + "; do break; done"]), [True, False])
+        self.assertEqual(bad(["if false; then :; elif " + body[0], body[1], body[2] + "; then :; fi"]), [True, False])
+        self.assertEqual(bad(["true && " + body[0], body[1], body[2]]), [True])
+        self.assertEqual(bad(["true || " + body[0], body[1], body[2]]), [True])
+        self.assertEqual(bad(["if { " + fail + "; }; then :; fi"]), [True, False])
+        self.assertEqual(bad(["if true; then", "! cat x | while read l; do", fail, "done", "fi"]), [True, False])
+        self.assertEqual(bad(["true || { " + fail + "; }"]), [False])
+        self.assertEqual(bad(["true && { " + fail + "; }"]), [False])
+        self.assertEqual(bad(["[ ! -n x ] && { " + fail + "; }"]), [False])
+        self.assertEqual(bad(["if true; then", "! cat x | while read l; do :; done", fail, "fi"]), [False, False])
+        self.assertEqual(bad(["if true; then", "cat x | while read l; do", fail, "done", "fi"]), [False, False])
+        self.assertEqual(bad(["while read l; do", fail, "done < x"]), [True])
+        self.assertEqual(bad(["if true; then", "while read l; do :; done", fail, "fi"]), [False, False])
         for unmatched in (["echo a )"], ["echo a }"], ["done"], ["esac"], ["case x in", "a) : ;;"], ["do : "]):
             with self.assertRaises(AssertionError, msg=unmatched):
                 self._groups(unmatched, "t")
@@ -1171,6 +1347,24 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertTrue(FUNCTION_DEF.search(text) or ALIAS_DEF.search(text), text)
         self.assertFalse(FUNCTION_DEF.search('x="$(date)"') or ALIAS_DEF.search("echo alias_set"))
         self.assertFalse(FUNCTION_DEF.search("echo undo() x") or FUNCTION_DEF.search("*[!a-z0-9_-]*) echo x"))
+
+    def test_real_closers_and_contexts_are_clean_and_the_dotenv_comment_is_true(self):
+        # r14 K5 + K6 + INFO: on the real scripts no FAIL-bearing group is followed by `&&` or
+        # preceded by a condition word (the groups listing: bad 0), the FAIL-bearing group count floors are
+        # pinned, and the compose-pin comment states what compose does with a `.env` next to the file.
+        counts = {SMOKE: (34, 15), ENVELOPE: (57, 10)}
+        for path, (total, failing) in counts.items():
+            groups = self._groups(_norm_lines(path), path.name)
+            self.assertGreaterEqual(len(groups), total, "%s: group count" % path.name)
+            self.assertGreaterEqual(sum(1 for _, g in groups if g["fail"]), failing, "%s: FAIL-bearing group count" % path.name)
+            for where, g in groups:
+                self.assertFalse(g["bad"], "%s: %s" % (path.name, where))
+                if g["fail"]:
+                    self.assertFalse(_context_bad(g["ctx"]), "%s: %s" % (path.name, where))
+            comment = " ".join(ln.lstrip("# ").strip() for ln in path.read_text().splitlines() if ln.lstrip().startswith("#"))
+            self.assertIn("compose still reads a .env in that directory for interpolation", comment, path.name)
+            self.assertIn("the environment outranks .env", comment, path.name)
+            self.assertNotIn("a .env that sets COMPOSE_FILE", comment, path.name)
 
     def test_redirect_scan_heredoc_opener_is_anchored(self):
         # r10 Q11: arithmetic `<<` and a here-string are not heredocs; an opener

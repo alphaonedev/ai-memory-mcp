@@ -56,7 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scalar; every `docker compose` call passes `-f` of the one pinned file and `--project-directory`, and the
   infra directory may hold no override file or `.env`; a definition after a case-pattern `)` or after
   `if`, `while` or `until` is read; the group scan tracks `if`..`fi` and `case`..`esac`, and a group with a
-  FAIL site may be followed only by end of line, `;`, `&&`, `;;`, `fi`, `done`, `esac`, `)` or `}`.
+  FAIL site may be followed only by end of line, `;`, `;;`, `fi`, `done`, `esac`, `)` or `}` (round 13 also
+  accepted `&&`; round 14 removes it).
+  Round 14: a group with a FAIL site is refused when `&&` follows its closer (`done && :` ran the failure
+  inside a list) or when it sits in condition position (after `if`, `elif`, `while`, `until`, `!`, or piped
+  after `&&` or `||`), because `set -e` ignores a failure there; the decoded-YAML scan refuses any explicit
+  tag (`!!binary`, `!!str`, a verbatim or local tag) on a scalar, mapping or sequence, since compose decodes it
+  before it interpolates; every `docker ... compose` invocation is matched, a global docker flag between the
+  two words is refused, and after the pinned `-f` and `--project-directory` no further `-f`, `--file`,
+  `--project-directory`, `--env-file` or `--project-name` path may follow on the same command; the pin
+  comments now state that compose still reads a `.env` in the project directory for interpolation, which has
+  no effect because the script exports every interpolated name and the guard refuses a tracked `.env`.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 
