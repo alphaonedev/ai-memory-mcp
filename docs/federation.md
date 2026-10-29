@@ -932,9 +932,19 @@ to it — federation is **not** end-to-end encrypted
 ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968); see
 §"At-rest encryption and federation" below).
 
-**Opt-in quarantine of provenance-less inbound content
-([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948)).**
-`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (default `false`, opt-in) route-IN
+**Quarantine of provenance-less inbound content, forced ON by the federating
+shapes
+([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948),
+[#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967)).**
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` is pinned ON by the `[deployment]
+shape` on `federated`, `hive` and `production` when unset. On `federated` and
+`hive` a non-truthy value is a floor violation and refuses boot; on
+`production` the always-engaged `asi-hard` posture refuses a non-truthy value
+the same way, so no hardened shape can run with it off. It stays `false`
+(permissive, listed by `ai-memory config show`) only on `singleton` and
+`team` unless `asi-hard` is selected there too. One truthiness grammar
+(`1`, `true`, `yes`, `on`, case-insensitive after trim) is shared by the
+shape floor, the `asi-hard` floor and the `/sync/push` receive reader. Route-IN
 quarantines any inbound relayed memory that did NOT reach
 `attest_level=agent_attested` (no verified per-write content signature —
 it would otherwise land `claimed`): the row is stored with the system-only
@@ -945,7 +955,7 @@ onward — it is hidden AND black-holed until dequarantine** (either
 automatically when a re-received copy later verifies `agent_attested`, or
 by operator dequarantine). Each quarantine increments
 `ai_memory_fed_quarantined_unattributed_total` and emits one WARN; the
-counter is always zero when the knob is off (the default), so a non-zero
+counter is always zero when the knob is off (the singleton and team shapes unless set; the federated, hive and production shapes force it on), so a non-zero
 value means a peer is relaying provenance-less content this node is
 black-holing.
 

@@ -89,6 +89,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed. Round 17: a `)` that closes `$(`, `$((`, `<(` or `>(`, and a closing backquote, no longer begin a
   word, so a `#` directly after one is text and the rest of that line stays visible to the pin readers; a
   `)` that closes a plain subshell, an arithmetic command or a case pattern still does.
+### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
+
+- **`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` now follows the `[deployment]
+  shape`.** `federated` and `hive` pin it ON when unset and refuse boot when
+  it is set non-truthy (a FLOOR); `production` pins it ON when unset, and an
+  explicit non-truthy value still refuses boot because `production` always
+  engages the `asi-hard` posture, whose no-disable floor covers this knob;
+  `singleton` and `team` keep the permissive default silently (the default is
+  listed by `ai-memory config show`, and hook-driven one-shot verbs stay
+  quiet). The shape table gains a `quarantine_unattributed` row. The shape
+  floor and the live `/sync/push` reader now share one truthiness parser
+  (`security_profile::is_truthy`, case-insensitive): before, a token such as
+  `TRUE` passed the floor and the `asi-hard` check but was read as OFF by the
+  receive path. Shape-forced over a global default flip, copying the
+  `governed_namespace_required` precedent.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 
