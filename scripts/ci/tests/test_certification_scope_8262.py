@@ -15,7 +15,8 @@ sets in test_ci_select_gating_8240.py and test_pg_isolated_binary.py, CODE_STYLE
 Units. Each line is NFKC-normalised and passed through the Cyrillic/Greek confusable map once.
 Block structure follows CommonMark/GFM: a line is blank only when it holds nothing but U+0020 and
 U+0009 (measured on the raw line, so NBSP, U+3000 and form feed never end a paragraph). Outside a
-fenced code block, and after any blockquote markers, three heading forms end the current paragraph
+fenced code block (opened as CommonMark opens one: 0-3 spaces, no backtick in a backtick
+info string, closed with its block quote), and after any blockquote markers, three heading forms end the current paragraph
 and are never part of a unit: an ATX heading line ("#" to "######" plus a space, also right after a
 list marker); a setext heading (the paragraph above a line of only "=" or only "-", at the same
 blockquote depth, indented under a list item when the paragraph is one; the paragraph lines plus
@@ -189,6 +190,14 @@ NOT_ITEMS = {
     "Top-shelf encryption documentation": 3833,
     "Singleton and Team shapes": 3125,
 }
+# Round 15 (security r13 INFO 2): the state word an item carries; the other state word is refused.
+STATE_WORDS = {"rustls is at the audited version": "closed", "Provenance links refuse a cycle-closing edge": "closed",
+               "Encryption in transit": "closed", "Quarantine of unattributed inbound writes": "closed",
+               "Cert-to-peer binding enforced": "open", "Refusal of Claimed (header-asserted) identity": "open",
+               "Postgres-native TDE": "open", "Curator namespace-scoped mode": "open", "Batman Form 2": "open",
+               "Top-shelf encryption documentation": "closed"}
+# Round 15 (code r11 LOW-1): IN items that moved from UNLANDED_ITEMS; their issues appear only in the IN block.
+LANDED_ITEMS = ("Quarantine of unattributed inbound writes",)
 STALE_RE = re.compile(r"1968[^.\n]{0,60}\b(?:open|unresolved|still\s+open)\b", re.IGNORECASE)
 HISTORY_LINE_RE = re.compile(r"^Last updated:\s*\d{4}-\d{2}-\d{2}\b")
 SECURITY_HISTORY_ENTRY = "federation-is-plaintext (#1968 OPEN) posture note added"
@@ -340,6 +349,9 @@ _HTML_HEADING_RE = re.compile(r"[ \t]*<h([1-6])(?:\s[^<>]*)?>[^\n]*</h\1\s*>[ \t
 # Round 14: any HTML heading open tag ("<h1>" to "<h6>", then whitespace, ">", "/" or the end of
 # the line); outside fenced code it must sit on a line _line_heading() reads as a heading.
 _HTML_HEADING_OPEN_RE = re.compile(r"<h[1-6](?:[\s>/]|$)", re.IGNORECASE)
+# Round 15: a fence opens only on 0-3 spaces after the blockquote markers; a closing line keeps the
+# permissive form (closing early reads more lines as text, so it fails closed).
+_FENCE_OPEN_RE = re.compile(r" {0,3}(`{3,}|~{3,})")
 _FENCE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})")
 _DELIM_PREFIX_RE = re.compile(r"[ \t]*(?:>[ \t]*)*")
 _DELIM_CHARS = frozenset("|-: \t")
@@ -434,13 +446,19 @@ def _is_blank(raw_line):
 
 def _fence_flags(lines):
     """Per line: True when it opens, closes or sits inside a fenced code block (a heading there is
-    code, not a heading). An unclosed fence runs to the end."""
-    flags, fence = [], None
+    code, not a heading). Fail closed (round 15, CommonMark): a fence opens only on 0-3 spaces after
+    the blockquote markers, never with a backtick in a backtick fence's info string, and a fence
+    closes when a line has fewer blockquote markers than its opener. An unclosed fence runs to the end."""
+    flags, fence, depth = [], None, 0
     for line in lines:
         m = _FENCE_RE.match(line)
+        here, body = _quote_split(line)
+        if fence is not None and here < depth:
+            fence = None
         if fence is None:
-            if m:
-                fence = m.group(1)
+            o = _FENCE_OPEN_RE.match(body)
+            if o and not (o.group(1)[0] == "`" and "`" in body[o.end():]):
+                fence, depth = o.group(1), here
             flags.append(fence is not None)
             continue
         flags.append(True)
@@ -816,6 +834,10 @@ def _check_items(case, body, expected):
         case.assertEqual(len(hit), 1, "item missing or duplicated: " + key)
         for num in (nums if isinstance(nums, tuple) else (nums,)):
             case.assertRegex(hit[0], r"#%d\b" % num, key + " lost #%d" % num)
+        if key in STATE_WORDS:
+            word = STATE_WORDS[key]
+            case.assertRegex(hit[0], r"\b%s\b" % word, key + " lost its state word: " + word)
+            case.assertNotRegex(hit[0], r"\b%s\b" % ("open" if word == "closed" else "closed"), key + " states both")
     return items
 
 
@@ -1038,6 +1060,26 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(texts("Federation roadmap\n    ---" + tail), [])
         self.assertEqual(gated_headings("```\nX25519 keys\n---\n```"), [])
 
+    def test_fence_opener_follows_commonmark_8262(self):
+        # Round 15 (code r11 MEDIUM-1): a line CommonMark does not open a fence with is not a fence (an
+        # indented line, a backtick in a backtick info string, a fence its block quote has closed), so
+        # the heading after it is read and the claim under it is checked.
+        claim = "The envelope ships in v1.1."
+
+        def texts(raw):
+            return [u[2] for u in gated_units(raw)]
+        for fake in ("    ```", "> ```\n> x", "``` a`b", "\t```"):
+            self.assertEqual(texts("## Notes\n\n" + fake + "\n\n## Federation\n\n" + claim), [claim], fake)
+        self.assertEqual(html_heading_misuse("## Notes\n\n    ```\n\n<h2>\nFederation\n</h2>\n\n" + claim), [5])
+        # Real fences stay code: up to three spaces, a tilde fence with a backtick in its info string,
+        # a fence inside a block quote, and a quoted fence closed by its own closing line.
+        for real in ("```\n## Federation\n\n" + claim + "\n```", "   ~~~ a`b\n## Federation\n\n" + claim + "\n~~~",
+                     "> ```\n> ## Federation\n> ```\n\n" + claim, "```html\n<h2>\nFederation\n</h2>\n```",
+                     "> ```\n> <h2>\n> Federation\n> </h2>\n> ```"):
+            self.assertEqual(texts("## Notes\n\n" + real), [], real)
+            self.assertEqual(html_heading_misuse(real), [], real)
+        self.assertEqual(texts("## Notes\n\n> ```\n> x\n> ```\n\n## Federation\n\n" + claim), [claim])
+
     def test_statement_ends_at_the_named_anchor(self):
         text = CERT.read_text(encoding="utf-8")
         self.assertEqual(text.count(STATEMENT_END), 1, "the statement anchor must appear exactly once")
@@ -1112,6 +1154,17 @@ class CertificationScope8262(unittest.TestCase):
             for num in UNLANDED_ITEMS.values():
                 self.assertNotRegex(blocks[marker], r"#%d\b" % num,
                                     "open gap #%d sits outside the not-yet-landed block" % num)
+
+    def test_landed_items_only_in_claimed_block(self):
+        blocks = _blocks()
+        for marker in (B_PENDING, B_UNLANDED, B_NOT):
+            for num in (n for key in LANDED_ITEMS for n in IN_ITEMS[key]):
+                self.assertNotRegex(blocks[marker], r"#%d\b" % num,
+                                    "landed item #%d sits outside the claimed block" % num)
+        for key in LANDED_ITEMS:
+            hit = [i for i in _items(blocks[B_IN]) if key in i]
+            self.assertEqual(len(hit), 1, "landed item missing or duplicated: " + key)
+            self.assertNotRegex(hit[0], r"(?i)permissive\s+today", key + " says the default is permissive today")
 
     def test_not_claimed_block_items(self):
         body = _blocks()[B_NOT]

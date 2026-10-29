@@ -875,13 +875,13 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
   `src/security_profile.rs:461-463`).
 - `sync/since` is peer-scoped while the operator bypass `AI_MEMORY_FED_SYNC_TRUST_PEER=1` is unset: a peer
   without a scope allowlist receives an empty envelope, and rows are filtered by namespace and
-  private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948);
+  private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948); `file:line` at merge `ffc54bd50`;
   `src/handlers/federation_sync_since.rs:289-296`, `:358`, `:366`). With the bypass set to `1`
   (`src/federation/peer_attestation.rs:390-392`, consumed at `src/handlers/federation_sync_since.rs:289`)
   an unscoped peer receives a full dump of every row in an allowed namespace and the private-visibility
   filter is skipped, so the empty-envelope and private-visibility claim does not hold under it. The bypass is
   outside the asi-hard KNOBS set; only the enterprise posture doctor flags it (check 13,
-  `src/enterprise_federation_posture.rs:522-538`; evidence
+  `src/enterprise_federation_posture.rs:516-531`; evidence
   `docs/compliance/evidence/cert-385da3a05/posture-*.out`).
 - Every shape requires TLS and refuses plaintext peers (`src/config/shape.rs:173-174`); the Federated and
   Hive shapes force governed namespaces (`src/config/shape.rs:190-194`), and Production defaults to them.
