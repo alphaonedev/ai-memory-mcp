@@ -927,9 +927,8 @@ peer from **authoring as other agents** and from **pulling unrelated
 namespaces**. Those verbs are contained, and since #2489/#2480 so are the
 link, signal and pull-accept lanes (enrolled posture). What remains
 uncontained: the peer can read the plaintext of everything replicated
-to it — federation is **not** end-to-end encrypted
-(see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262) and
-§"At-rest encryption and federation" below).
+to it. Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262).
+See also §"At-rest encryption and federation" below.
 
 **Opt-in quarantine of provenance-less inbound content
 ([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948)).**

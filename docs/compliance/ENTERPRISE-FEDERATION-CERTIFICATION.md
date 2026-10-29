@@ -868,14 +868,21 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 > line is one claim, its tracking issue and, where code enforces it, the `file:line` at that SHA. This
 > statement does not re-mint the certification (the bind and expiry record above are unchanged).
 
-**Certified for the GA candidate (IN):**
+**Claimed for the GA candidate (IN; certification re-issue under [#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)):**
 
 - Federation transport is mTLS, and outbound peer server-certificate verification is on by default and
   refuses the skip flag ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448), [#232](https://github.com/alphaonedev/ai-memory-mcp/issues/232); `src/tls.rs:114`, `src/tls.rs:1200-1203`, asi-hard pin
   `src/security_profile.rs:461-463`).
-- `sync/since` is peer-scoped: a peer without a scope allowlist receives an empty envelope, and rows are
-  filtered by namespace and private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948);
-  `src/handlers/federation_sync_since.rs:289-296`, `:358`, `:366`).
+- `sync/since` is peer-scoped while the operator bypass `AI_MEMORY_FED_SYNC_TRUST_PEER=1` is unset: a peer
+  without a scope allowlist receives an empty envelope, and rows are filtered by namespace and
+  private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948);
+  `src/handlers/federation_sync_since.rs:289-296`, `:358`, `:366`). With the bypass set to `1`
+  (`src/federation/peer_attestation.rs:390-392`, consumed at `src/handlers/federation_sync_since.rs:289`)
+  an unscoped peer receives a full dump of every row in an allowed namespace and the private-visibility
+  filter is skipped, so the empty-envelope and private-visibility claim does not hold under it. The bypass is
+  outside the asi-hard KNOBS set; only the enterprise posture doctor flags it (check 13,
+  `src/enterprise_federation_posture.rs:522-538`; evidence
+  `docs/compliance/evidence/cert-385da3a05/posture-*.out`).
 - Every shape requires TLS and refuses plaintext peers (`src/config/shape.rs:173-174`); the Federated and
   Hive shapes force governed namespaces (`src/config/shape.rs:190-194`), and Production defaults to them.
 - At-rest AEAD envelope encryption is available and OFF by default (`AI_MEMORY_ENCRYPT_AT_REST=1` or
@@ -1420,8 +1427,7 @@ This certification does **NOT** cover, and a Fortune-500 that needs any of the
 following should **not** treat v1.0.0 as sufficient:
 
 - **No end-to-end content encryption at the pinned SHA.** Every in-scope federation peer reads
-  your memory content in **plaintext** (`src/encryption/mod.rs`). Its scope and certification
-  status are stated once, in the [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262).
+  your memory content in **plaintext** (`src/encryption/mod.rs`). Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262).
   SQLCipher protects data at rest on each node; it does **not** protect content
   in transit-to-peer beyond the TLS/mTLS transport, and an allowlisted peer sees
   cleartext. The per-content X25519/ChaCha envelope (`AI_MEMORY_ENCRYPT_AT_REST`)
