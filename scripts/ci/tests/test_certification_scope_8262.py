@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Doc-pin for the v1.0.0 GA certification scope statement (#8262): a pinned-unit allowlist.
 
-Design (round 11, 3-agent vote 6def5ab6, choice B; conductor amendment memory db2a250b; round 12
-closes the listed scanner gaps without changing the design). The end-to-end content encryption
+Design (round 11, 3-agent vote 6def5ab6, choice B; conductor amendment memory db2a250b; rounds 12
+and 13 close the listed scanner gaps without changing the design). The end-to-end content encryption
 scope is stated once, in the certification scope statement of
 docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md. Every unit of the gated files that names
 that subject is pinned verbatim in a closed table (the sidecar JSON PINS_REL), checked in both
@@ -14,16 +14,21 @@ sets in test_ci_select_gating_8240.py and test_pg_isolated_binary.py, CODE_STYLE
 
 Units. Each line is NFKC-normalised and passed through the Cyrillic/Greek confusable map once.
 Block structure follows CommonMark/GFM: a line is blank only when it holds nothing but U+0020 and
-U+0009 (measured on the raw line, so NBSP, U+3000 and form feed never end a paragraph); an ATX
-heading line ("#" to "######" plus a space, outside a fenced code block) always ends the current
-paragraph and is never part of a unit; a pipe line starts a table only when the next line is a
+U+0009 (measured on the raw line, so NBSP, U+3000 and form feed never end a paragraph). Outside a
+fenced code block, and after any blockquote markers, three heading forms end the current paragraph
+and are never part of a unit: an ATX heading line ("#" to "######" plus a space, also right after a
+list marker); a setext heading (the paragraph above a line of only "=" or only "-", at the same
+blockquote depth, indented under a list item when the paragraph is one; the paragraph lines plus
+the underline are the heading); and an HTML heading element <h1> to <h6> opened and closed on one
+line. A thematic break ("---", "***" or "___", spaces allowed, not under paragraph text when it is
+dashes) ends the paragraph; it is not a heading and does not end a section. A pipe line starts a table only when the next line is a
 delimiter row, and each table row is its own unit; a list item starts a new paragraph, except an
 ordered item numbered other than 1, which cannot interrupt a paragraph that did not start with a
 list item. Inside a paragraph the splitter ends a sentence at ".", "!" or "?" plus up to four
 closers (quote, ")", "]", "*", "_", backtick) plus whitespace; it is one bounded regex, linear and
 deterministic. A sentence is subject-bearing when it carries a subject token, or a paired stem
 while a pair word is in context. The context is the whole paragraph (for a table row: the row and
-the table's header row) plus the nearest preceding heading at any level. The unit is that sentence
+the table's header row) plus the nearest preceding heading (any of the three forms) at any level. The unit is that sentence
 plus one sentence on each side, inside the paragraph; overlapping or touching windows merge. A
 paragraph whose subject straddles a sentence boundary is gated whole. Unit text is compared with
 whitespace runs collapsed, so a reflow is not a change. Units are cut from the text, so every
@@ -38,12 +43,17 @@ Subject tokens (matched case-insensitively on three views of a sentence: the fol
 folded text with tags and markdown emphasis removed; and the rendered view, which removes HTML
 comments and tags, unescapes entities and collapses markdown links and images to their text;
 every view drops marks and format characters after NFKD): 8278 in any form (#8278, issue 8278,
-the URL); variant A, variant B, variants A and B, both variants; end-to-end with any separator
-(any dash class, spaces) and E2E/E2EE; X25519; scope key, scope-key, per-namespace key;
-unreadable to relays or peers; payload confidentiality. Paired stems encrypt, decrypt, seal,
-envelope, wrap, ciphertext, plaintext and content encryption are subjects only with a pair word
-(federation/federated, peer, relay, replica or sync) in context; inside the certification scope
-statement subsection (HEADING to the next "---" rule) the pair word is implied.
+the URL); 1968 as a word (#1968, issue 1968, the URL); variant A, variant B, variants A and B,
+both variants; end-to-end with any separator (any dash class, spaces) and E2E/E2EE; X25519; scope
+key, scope-key, per-namespace key; unreadable to relays or peers; payload confidentiality; content
+encryption with any separator. Paired stems encrypt, decrypt, seal, envelope, wrap, ciphertext and
+plaintext are subjects only with a pair word (federation/federated, peer, relay, replica or sync)
+in context. Inside the certification scope statement subsection the pair word is implied; the
+subsection runs from HEADING to the named anchor STATEMENT_END (the "---" rule and the "## 2."
+heading that follow the statement), which must occur exactly once and after every statement block;
+otherwise the subsection fails closed to the end of the file. A thematic break inside the
+statement does not end it. The vocabulary tables carry these names and a selftest holds this
+paragraph to them.
 
 Characters. Refused anywhere in a gated file, except the measured (path, code point, count)
 entries of EXEMPT_CHARS: every Cf, Mn, Me, Zl and Zp character; every Zs character other than
@@ -79,6 +89,10 @@ CERT = ROOT / CERT_REL
 CHANGELOG_REL = "CHANGELOG.md"
 HTML_REL = "docs/encryption.html"
 HEADING = "### Certification scope statement for the v1.0.0 GA candidate"
+# Round 13: the statement subsection ends at this named anchor, the rule plus the heading that
+# follows the statement (U+00A7 section sign, U+2014 em dash), not at the first "---" line.
+STATEMENT_END_HEADING = "## 2. §5.4(2) — machine-checked posture (LOCALHOST-VERIFIED)"
+STATEMENT_END = "\n---\n\n" + STATEMENT_END_HEADING + "\n"
 ANCHOR = "certification-scope-statement-for-the-v100-ga-candidate-8262"
 POINTERS = ["docs/federation.md", "SECURITY.md", "docs/SECURITY.md", "README.md"]
 SINGLE_SOURCE_FILES = [CERT_REL, "docs/federation.md", "SECURITY.md",
@@ -262,24 +276,33 @@ _SEP = r"[^a-z0-9]{0,4}"
 # Every pattern starts with a literal (the boundary checks are look-behinds after it), so each is a
 # fast linear scan; the lists are searched one pattern at a time.
 _NB = "(?<![a-z0-9]%s)"
-_SUBJECTS = [
-    r"8278",
-    r"variant" + _NB % "variant" + r"s?" + _SEP + r"[ab](?![a-z0-9])",
-    r"both" + _SEP + r"variants",
-    r"end" + _NB % "end" + _SEP + r"to" + _SEP + r"end(?![a-z0-9])",
-    r"e2e" + _NB % "e2e" + r"e?(?![a-z0-9])",
-    r"x25519",
-    r"scope" + _SEP + r"keys?(?![a-z0-9])",
-    r"per" + _SEP + r"namespace" + _SEP + r"keys?(?![a-z0-9])",
-    r"unreadable" + _SEP + r"to" + _SEP + r"(?:relay|peer)",
-    r"payload" + _SEP + r"confidential",
+# (name, pattern): the name is the docstring's word for the token and must match its own pattern.
+SUBJECT_TABLE = [
+    ("8278", r"8278"),
+    # Round 13: #1968 is closed and superseded by #8278; a present-tense sentence naming it is a
+    # claim about the same subject (code verdict r9 LOW-3, security verdict r11 LOW 2).
+    ("1968", r"1968" + _NB % "1968" + r"(?![a-z0-9])"),
+    ("variant A", r"variant" + _NB % "variant" + r"s?" + _SEP + r"[ab](?![a-z0-9])"),
+    ("both variants", r"both" + _SEP + r"variants"),
+    ("end-to-end", r"end" + _NB % "end" + _SEP + r"to" + _SEP + r"end(?![a-z0-9])"),
+    ("E2E", r"e2e" + _NB % "e2e" + r"e?(?![a-z0-9])"),
+    ("X25519", r"x25519"),
+    ("scope key", r"scope" + _SEP + r"keys?(?![a-z0-9])"),
+    ("per-namespace key", r"per" + _SEP + r"namespace" + _SEP + r"keys?(?![a-z0-9])"),
+    ("unreadable to relays", r"unreadable" + _SEP + r"to" + _SEP + r"(?:relay|peer)"),
+    ("payload confidentiality", r"payload" + _SEP + r"confidential"),
     # Round 12: "content encryption" is a subject, not a paired stem: a version cell or deferral
     # next to it reads as a #8278 claim with no pair word anywhere (code verdict row c7-N5).
-    r"content" + _SEP + r"encrypt",
+    ("content encryption", r"content" + _SEP + r"encrypt"),
 ]
-_STEMS = [r"encrypt", r"decrypt", r"seal", r"envelope", r"wrap", r"cipher" + _SEP + r"text",
-          r"plain" + _SEP + r"text"]
-_PAIRS = [r"federat", r"peer", r"relay", r"replica", r"sync(?<![a-z]sync)"]
+STEM_TABLE = [("encrypt", r"encrypt"), ("decrypt", r"decrypt"), ("seal", r"seal"),
+              ("envelope", r"envelope"), ("wrap", r"wrap"), ("ciphertext", r"cipher" + _SEP + r"text"),
+              ("plaintext", r"plain" + _SEP + r"text")]
+PAIR_TABLE = [("federation", r"federat"), ("peer", r"peer"), ("relay", r"relay"),
+              ("replica", r"replica"), ("sync", r"sync(?<![a-z]sync)")]
+_SUBJECTS = [p for _, p in SUBJECT_TABLE]
+_STEMS = [p for _, p in STEM_TABLE]
+_PAIRS = [p for _, p in PAIR_TABLE]
 SUBJECT_RES = [re.compile(x) for x in _SUBJECTS]
 STEM_RES = [re.compile(x) for x in _STEMS]
 PAIR_RES = [re.compile(x) for x in _PAIRS]
@@ -303,6 +326,13 @@ _ITEM_RE = re.compile(r"[ \t]*(?:>[ \t]*)*(?:[-*+]|(\d{1,9})[.)])[ \t]")
 _ROW_RE = re.compile(r"[ \t]*(?:>[ \t]*)*\|")
 _MARKER_ONLY_RE = re.compile(r"(?:>[ \t]*)*\d{1,9}[.)]")
 _ATX_RE = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
+# Round 13 (CommonMark): blockquote markers, a setext underline, a thematic break, a list marker
+# before an ATX heading, and an HTML heading element on one line.
+_QUOTE_RE = re.compile(r"(?: {0,3}>[ \t]?)*")
+_SETEXT_RE = re.compile(r"( *)(?:=+|-+)[ \t]*$")
+_BREAK_RE = re.compile(r" {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$")
+_LEAD_ITEM_RE = re.compile(r" {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+")
+_HTML_HEADING_RE = re.compile(r"[ \t]*<h([1-6])(?:\s[^<>]*)?>[^\n]*</h\1\s*>[ \t]*$", re.IGNORECASE)
 _FENCE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})")
 _DELIM_PREFIX_RE = re.compile(r"[ \t]*(?:>[ \t]*)*")
 _DELIM_CHARS = frozenset("|-: \t")
@@ -461,11 +491,46 @@ def _heading_gated(line, pair_context):
     return _has_subject(views) or (_any(STEM_RES, views) and (pair_context or _any(PAIR_RES, views)))
 
 
+def _quote_split(line):
+    """(blockquote depth, the rest of the line after the blockquote markers)."""
+    prefix = _QUOTE_RE.match(line).group(0)
+    return prefix.count(">"), line[len(prefix):]
+
+
+def _line_heading(body):
+    """True when a line (after its blockquote markers) is an ATX heading, an ATX heading right after
+    a list marker, or an HTML heading element opened and closed on the line."""
+    if _ATX_RE.match(body) or _HTML_HEADING_RE.match(body):
+        return True
+    item = _LEAD_ITEM_RE.match(body)
+    return bool(item) and bool(_ATX_RE.match(body[item.end():]) or _HTML_HEADING_RE.match(body[item.end():]))
+
+
+def _setext_under(cur, line, prev_fenced):
+    """True when line is a setext underline for the open paragraph cur: same blockquote depth as
+    the paragraph's last line, which holds text, and indented under the list item when the paragraph
+    starts with one (otherwise a lazy line, never an underline)."""
+    depth, body = _quote_split(line)
+    m = _SETEXT_RE.match(body)
+    if not cur or prev_fenced or not m:
+        return False
+    last_depth, last_body = _quote_split(cur[1][-1])
+    if depth != last_depth or not last_body.strip(" \t"):
+        return False
+    indent = len(m.group(1))
+    if cur[2]:
+        first_body = _quote_split(cur[1][0])[1]
+        item = _ITEM_RE.match(first_body)
+        need = item.end() if item else 0
+        return need <= indent <= need + 3
+    return indent <= 3
+
+
 def _scan(raw, implied=False, first_line=1):
     """Cut raw text into blocks. Returns (paragraphs, headings): paragraphs are
-    (first index, normalised lines, pair context, is row); headings are (index, normalised line,
-    pair context). implied is True (every line is in the statement subsection), False, or an
-    inclusive (first, last) line-index range."""
+    (first index, normalised lines, pair context, is row); headings are (first index, normalised
+    heading text, pair context, last index). implied is True (every line is in the statement
+    subsection), False, or an inclusive (first, last) line-index range."""
     raw_lines = raw.split("\n")
     lines = [normalise(x) for x in raw_lines]
     if any("\n" in x for x in lines):
@@ -486,6 +551,11 @@ def _scan(raw, implied=False, first_line=1):
             paras.append((cur[0], cur[1], cur[3] or state["head_pair"], False))
             del cur[:]
 
+    def heading(first, text, context, last):
+        heads.append((first, text, context, last))
+        state["head_pair"] = _any(PAIR_RES, _views(text))
+        state["header_pair"] = None
+
     for i, line in enumerate(lines):
         imp = lo <= i <= hi
         if cur and cur[3] != imp:
@@ -495,12 +565,23 @@ def _scan(raw, implied=False, first_line=1):
             flush()
             state["header_pair"] = None
             continue
-        if not fenced[i] and _ATX_RE.match(line):
-            flush()
-            state["header_pair"] = None
-            heads.append((i, line, imp or state["head_pair"]))
-            state["head_pair"] = _any(PAIR_RES, _views(line))
-            continue
+        if not fenced[i]:
+            if _setext_under(cur, line, fenced[i - 1] if i else False):
+                # The open paragraph is a setext heading: its lines plus this underline.
+                first, text, context = cur[0], "\n".join(cur[1] + [line]), cur[3] or state["head_pair"]
+                del cur[:]
+                heading(first, text, context, i)
+                continue
+            body = _quote_split(line)[1]
+            if _BREAK_RE.match(body):
+                # A thematic break ends the paragraph; it is not a heading and ends no section.
+                flush()
+                state["header_pair"] = None
+                continue
+            if _line_heading(body):
+                flush()
+                heading(i, line, imp or state["head_pair"], i)
+                continue
         context = imp or state["head_pair"]
         if state["header_pair"] is not None:
             if _ROW_RE.match(line):
@@ -547,7 +628,7 @@ def gated_units(text, implied_pair=False, first_line=1):
 def gated_headings(text, implied_pair=False, first_line=1):
     """(line, collapsed normalised heading) for every heading that must be pinned."""
     return [(first_line + i, _WS_RE.sub(" ", line).strip())
-            for i, line, context in _scan(text, implied_pair, first_line)[1] if _heading_gated(line, context)]
+            for i, line, context, _ in _scan(text, implied_pair, first_line)[1] if _heading_gated(line, context)]
 
 
 def _stop_offset(raw):
@@ -571,14 +652,28 @@ def scoped_text(rel, raw):
     return raw
 
 
+def _statement_end(text, start):
+    """Offset of the named anchor STATEMENT_END that closes the statement starting at start, or -1
+    when the anchor is missing, repeated, before the heading, or before a statement block marker
+    or the canonical paragraph (the subsection then fails closed to the end of the file)."""
+    end = text.find(STATEMENT_END)
+    if end < start or text.count(STATEMENT_END) != 1:
+        return -1
+    tail = text[end:]
+    if any(marker in tail for marker in BLOCK_MARKERS) or E2E_CANON in tail:
+        return -1
+    return end
+
+
 def _implied_range(rel, text):
-    """Inclusive line-index range of the scope statement subsection (HEADING to the "---" rule)."""
+    """Inclusive line-index range of the scope statement subsection: HEADING to the line above the
+    named anchor STATEMENT_END, or to the end of the file when the anchor fails (fail closed)."""
     if rel != CERT_REL:
         return False
     a = text.find(HEADING)
     if a < 0:
         return False
-    b = text.find("\n---\n", a)
+    b = _statement_end(text, a)
     return text.count("\n", 0, a), text.count("\n", 0, b if b >= 0 else len(text))
 
 
@@ -639,8 +734,10 @@ def _subsection():
     start = text.find(HEADING)
     if start < 0:
         raise AssertionError("scope statement heading missing: " + HEADING)
-    end = text.find("\n---\n", start)
-    return text[start:end if end > 0 else len(text)]
+    end = _statement_end(text, start)
+    if end < 0:
+        raise AssertionError("the statement anchor must follow the statement exactly once: " + STATEMENT_END_HEADING)
+    return text[start:end]
 
 
 def _blocks():
@@ -737,10 +834,13 @@ class CertificationScope8262(unittest.TestCase):
 
     def test_no_unit_holds_a_heading_line(self):
         for rel, units in self.units.items():
-            lines = [normalise(x) for x in scoped_text(rel, _read(rel)).split("\n")]
+            text = scoped_text(rel, _read(rel))
+            lines = [normalise(x) for x in text.split("\n")]
             fenced = _fence_flags(lines)
+            heads = {n for first, _, _, last in _scan(text, _implied_range(rel, text))[1]
+                     for n in range(first + 1, last + 2)}
             bad = ["%s:%d" % (rel, n) for first, last, _ in units for n in range(first, last + 1)
-                   if not fenced[n - 1] and _ATX_RE.match(lines[n - 1])]
+                   if n in heads or (not fenced[n - 1] and _line_heading(_quote_split(lines[n - 1])[1]))]
             self.assertEqual(bad, [], "heading line inside a unit: " + ", ".join(bad[:5]))
 
     def test_every_gated_heading_is_pinned_exactly_once(self):
@@ -863,7 +963,8 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(gated_units("Content encryption is on."), [(1, 1, "Content encryption is on.")])
         self.assertEqual(gated_units("The envelope is on."), [])
         self.assertEqual(gated_units("The envelope is on.", True, 7), [(7, 7, "The envelope is on.")])
-        stmt = file_units(CERT_REL, HEADING + "\n\nOnce again, content encryption is enabled.\n\n---\n\nIt is on.\n")
+        stmt = file_units(CERT_REL, HEADING + "\n\nOnce again, content encryption is enabled.\n" + STATEMENT_END
+                          + "\nThe envelope is on.\n")
         self.assertEqual(stmt, [(3, 3, "Once again, content encryption is enabled.")])
         self.assertEqual(len(gated_units("Rows are sealed. Peers read them.")), 1)
         for text in ('<p title="#8278 is live.">x</p>', "<!-- #8278 -->", "#82​78 x",
@@ -871,6 +972,84 @@ class CertificationScope8262(unittest.TestCase):
                      "End—to—end x", "Variants A and B x", "X25519 x",
                      "unreadable to relays", "payload confidentiality", "per-namespace key"):
             self.assertTrue(gated_units(normalise(text)), text)
+
+    def test_round13_heading_forms_on_synthetic_text(self):
+        def texts(raw, implied=False):
+            return [u[2] for u in gated_units(raw, implied)]
+        tail = "\n\nThe envelope ships in v1.1."
+        # Setext headings carry the pair word to the next paragraph, like an ATX heading.
+        for under in ("------------------", "==================", "---", "=", "  ---"):
+            self.assertEqual(texts("Federation roadmap\n" + under + tail), ["The envelope ships in v1.1."], under)
+        self.assertEqual(gated_headings("X25519 keys\n---\nIt is fine."), [(1, "X25519 keys ---")])
+        self.assertEqual(gated_headings("Two line\nX25519 heading\n==="), [(1, "Two line X25519 heading ===")])
+        self.assertEqual(texts("> Federation roadmap\n> ---\n> The envelope ships in v1.1."),
+                         ["> The envelope ships in v1.1."])
+        self.assertEqual(texts("- Federation roadmap\n  ---" + tail), ["The envelope ships in v1.1."])
+        # HTML heading elements and list-item ATX headings are headings too.
+        for head in ("<h2>Federation</h2>", "<h3 id=\"x\">Federation</h3>", "  <H4>Peer sync</H4>  ",
+                     "- ## Federation", "> ## Federation"):
+            self.assertEqual(texts(head + tail), ["The envelope ships in v1.1."], head)
+        self.assertEqual(gated_headings("<h2>Variant B</h2>"), [(1, "<h2>Variant B</h2>")])
+        self.assertEqual(texts("Peers sync.\n<h2>Notes</h2>\nThe envelope ships in v1.1."), [])
+        # A thematic break ends a paragraph but is not a heading and keeps the heading context.
+        for rule in ("***", "___", "- - -", " * * *", "---"):
+            self.assertEqual(texts("## Federation\n\nIntro.\n\n" + rule + tail), ["The envelope ships in v1.1."], rule)
+            self.assertEqual(texts("## Notes\n\n" + rule + "\n\nPeers are trusted." + tail), [], rule)
+        self.assertEqual(texts("Keys are X25519 pairs.\n***\nIt is deferred."), ["Keys are X25519 pairs."])
+        # Not underlines: a lazy line under a list item, an underline at another blockquote depth,
+        # a fenced line, an empty blockquote line, four spaces.
+        self.assertEqual(texts("- Federation roadmap\n===" + tail), [])
+        self.assertEqual(texts("> Federation roadmap\n---" + tail), [])
+        self.assertEqual(texts(">\n---" + tail), [])
+        self.assertEqual(texts("```\nFederation\n```\n---" + tail), [])
+        self.assertEqual(texts("Federation roadmap\n    ---" + tail), [])
+        self.assertEqual(gated_headings("```\nX25519 keys\n---\n```"), [])
+
+    def test_statement_ends_at_the_named_anchor(self):
+        text = CERT.read_text(encoding="utf-8")
+        self.assertEqual(text.count(STATEMENT_END), 1, "the statement anchor must appear exactly once")
+        self.assertEqual(text.count(STATEMENT_END_HEADING), 1, "the anchor heading must appear exactly once")
+        start, end = text.find(HEADING), text.find(STATEMENT_END)
+        self.assertLess(start, end, "the anchor heading moved above the statement")
+        for marker in BLOCK_MARKERS + [E2E_CANON]:
+            self.assertLess(text.find(marker), end, "a statement block sits below the anchor")
+        self.assertEqual(_statement_end(text, start), end)
+        lo, hi = _implied_range(CERT_REL, text)
+        self.assertEqual(text.split("\n")[hi + 1:hi + 4], ["---", "", STATEMENT_END_HEADING])
+        # A thematic break inside the statement does not end it; text past the anchor is not implied.
+        body = HEADING + "\n\nIntro.\n\n---\n\nThe envelope ships in v1.1.\n" + STATEMENT_END + "\nThe wrap is late.\n"
+        self.assertEqual([u[2] for u in file_units(CERT_REL, body)], ["The envelope ships in v1.1."])
+        # Missing, repeated or moved anchor: fail closed to the end of the file.
+        for broken in (body.replace(STATEMENT_END, "\n---\n\n## 2. Posture\n"),
+                       body + STATEMENT_END, STATEMENT_END + body.replace(STATEMENT_END, "\n")):
+            self.assertIn("The wrap is late.", [u[2] for u in file_units(CERT_REL, broken)])
+        moved = HEADING + "\n" + STATEMENT_END + "\n" + B_NOT + "\n\nThe wrap is late.\n"
+        self.assertEqual(_statement_end(moved, 0), -1)
+        self.assertEqual(_implied_range(CERT_REL, moved)[1], moved.count("\n"))
+
+    def test_issue_1968_is_a_subject(self):
+        for text in ("Federation privacy stays tracked in #1968.", "#1968 remains open as the carrier.",
+                     "Issue 1968 is the carrier.", "See https://example.org/issues/1968 today."):
+            self.assertTrue(gated_units(text), text)
+        for text in ("Built in 19680 steps.", "Port 11968 is used.", "Version 1968b ships."):
+            self.assertEqual(gated_units(text), [], text)
+
+    def test_docstring_lists_every_vocabulary_token(self):
+        doc = _WS_RE.sub(" ", __doc__).lower()
+        def section(first, last):
+            start = doc.index(first)
+            return doc[start:doc.index(last, start)]
+        subjects = section("subject tokens (", "paired stems ")
+        stems = section("paired stems ", " are subjects only with a pair word")
+        pairs = section("with a pair word (", " in context.")
+        for table, section in ((SUBJECT_TABLE, subjects), (STEM_TABLE, stems), (PAIR_TABLE, pairs)):
+            for name, pattern in table:
+                self.assertIn(name.lower(), section, "the docstring vocabulary omits " + name)
+                self.assertIsNotNone(re.search(pattern, fold(name)), name + " does not match its own pattern")
+        for name, _ in SUBJECT_TABLE:
+            self.assertNotIn(name.lower(), stems + pairs, name + " is a subject but the docstring pairs it")
+        self.assertEqual([len(SUBJECT_TABLE), len(STEM_TABLE), len(PAIR_TABLE)],
+                         [len(SUBJECT_RES), len(STEM_RES), len(PAIR_RES)])
 
     # ---- structure of the statement and its pointers ----
     def test_heading_present_and_blocks_in_order(self):
