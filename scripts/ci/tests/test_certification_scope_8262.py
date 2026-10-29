@@ -14,9 +14,15 @@ sets in test_ci_select_gating_8240.py and test_pg_isolated_binary.py, CODE_STYLE
 
 Units. Each line is NFKC-normalised and passed through the Cyrillic/Greek confusable map once.
 Block structure follows CommonMark/GFM: a line is blank only when it holds nothing but U+0020 and
-U+0009 (measured on the raw line, so NBSP, U+3000 and form feed never end a paragraph). Outside a
-fenced code block (opened as CommonMark opens one: 0-3 spaces, no backtick in a backtick
-info string, closed with its block quote), and after any blockquote markers, three heading forms end the current paragraph
+U+0009 (measured on the raw line, so NBSP, U+3000 and form feed never end a paragraph). Code is
+read as CommonMark reads it, relative to the container (blockquote depth plus list-item content
+column, round 16, _lex()): a fence opens and closes on 0-3 spaces relative to the container (also
+right after a list marker), closes only on a same-character run at least as long with nothing after
+it, and closes when its container ends; a line 4+ spaces past the container outside a paragraph is
+indented code. Fail closed: where this reading and a permissive one (a fence after any spaces, tabs,
+blockquote or list markers) disagree, a heading adds its pair word and never clears one, and a
+gated file that ends inside an open fence is refused. Outside code, and after the container
+prefix, three heading forms end the current paragraph
 and are never part of a unit: an ATX heading line ("#" to "######" plus a space, also right after a
 list marker); a setext heading (the paragraph above a line of only "=" or only "-", at the same
 blockquote depth, indented under a list item when the paragraph is one; the paragraph lines plus
@@ -62,7 +68,7 @@ U+0020; every Cc character other than tab and line feed; and every non-ASCII let
 normalisation that is not in the measured LETTER_CENSUS. An HTML comment whose folded content
 carries a subject token or a paired stem is refused, except the measured COMMENT_EXEMPT entries.
 The one-line HTML heading element is the only HTML heading form read (round 14, fail closed): an
-"<h1>" to "<h6>" open tag outside fenced code on any other line (split over lines, wrapped in
+"<h1>" to "<h6>" open tag outside code on any other line (split over lines, wrapped in
 another element, or followed by more markup) is refused with its file:line.
 
 CHANGELOG.md is gated from the top down to the line that starts with STOP_HEADING (the
@@ -78,6 +84,7 @@ the docs would need; the unittest path only compares and never writes.
 """
 import collections
 import difflib
+import hashlib
 import html
 import json
 import pathlib
@@ -195,7 +202,11 @@ STATE_WORDS = {"rustls is at the audited version": "closed", "Provenance links r
                "Encryption in transit": "closed", "Quarantine of unattributed inbound writes": "closed",
                "Cert-to-peer binding enforced": "open", "Refusal of Claimed (header-asserted) identity": "open",
                "Postgres-native TDE": "open", "Curator namespace-scoped mode": "open", "Batman Form 2": "open",
-               "Top-shelf encryption documentation": "closed"}
+               "Top-shelf encryption documentation": "closed",
+               # Round 16 (code r12 INFO-1): every item carries its state; None = cites no issue, no state word.
+               "Federation transport is mTLS": "closed", "`sync/since` is peer-scoped": "closed",
+               "Every shape requires TLS": None, "At-rest AEAD envelope encryption": None,
+               "Singleton and Team shapes": "open"}
 # Round 15 (code r11 LOW-1): IN items that moved from UNLANDED_ITEMS; their issues appear only in the IN block.
 LANDED_ITEMS = ("Quarantine of unattributed inbound writes",)
 STALE_RE = re.compile(r"1968[^.\n]{0,60}\b(?:open|unresolved|still\s+open)\b", re.IGNORECASE)
@@ -223,6 +234,35 @@ SYNC_SINCE_PINS = [
     "consumed at `src/handlers/federation_sync_since.rs:289`",
     "The bypass is outside the asi-hard KNOBS set; only the enterprise posture doctor flags it",
     "`docs/compliance/evidence/cert-385da3a05/posture-*.out`",
+]
+# Round 16 (R3, security r14): NOT-claimed wording pin of the TDE_NOT_CLAIMED kind; the whole item.
+CURATOR_NOT_CLAIMED = (
+    "- Curator namespace-scoped mode: the curator daemon is root-equivalent (cross-tenant `for_admin` reads, "
+    "`src/curator/reflection_pass.rs:125-127`; [#8264](" + ISSUE_URL + "8264), open, operator milestone decision).")
+# Round 16 (R3, security r14): every sentence of a gated file that names the sync trust-peer bypass,
+# as (path, mention_key(sentence)). A new or reworded mention (one that endorses setting the bypass,
+# for one) fails until a reviewer reads it and the table changes in this source, never in the sidecar.
+TRUST_PEER_MENTIONS = [
+    (CERT_REL, "9093b9e0395301a8"),  # - `sync/since` is peer-scoped while the operator
+    (CERT_REL, "658752ca4236ef35"),  # The other 10 of 20 are PASS on the bare leg beca
+    ("docs/federation.md", "02d8dc5536c43023"),  # | | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (den
+    ("docs/federation.md", "d1c14ba729644f29"),  # Constants: the `*_ENV` consts in [`src/federatio
+    ("docs/federation.md", "1e3cadf87236a464"),  # Bypass detection: `trust_body_agent_id_bypass()`
+    (CHANGELOG_REL, "31a6102267320f00"),  # REFUTED and deliberately not changed: `peer_atte
+    (CHANGELOG_REL, "fa9e176818529e2b"),  # New module `src/enterprise_federation_posture.rs
+    (CHANGELOG_REL, "03f78c7040e51ccd"),  # Also folded in: the peer-enrollment / per-messag
+    (CHANGELOG_REL, "e76de8af5a02cfd4"),  # Its `scope_for(peer) == None` arm falls through
+    (CHANGELOG_REL, "fe6446ba07263189"),  # - **Docs / infra:** env-table rows **147** (dele
+    (CHANGELOG_REL, "c35fb77b27574a54"),  # Both files build their OWN router: `tests/l07_3_
+    (CHANGELOG_REL, "4011f12379944e23"),  # The file builds its OWN router with `AI_MEMORY_F
+    (CHANGELOG_REL, "7af8794440e35ac2"),  # The file builds its OWN router with `AI_MEMORY_F
+    (CHANGELOG_REL, "fe49ea88d2dcb019"),  # Calling `namespace_allowed` verbatim (as the del
+    ("docs/enterprise-deployment.md", "3cde5f24d90f3f48"),  # - [ ] `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` and `A
+    ("docs/federation-identity.md", "489a01f13977c5a4"),  # | | `AI_MEMORY_FED_SYNC_TRUST_PEER` / `AI_MEMORY
+    ("docs/reference/ARCHITECTURE_REFERENCE.md", "e7008bc70774ac95"),  # | | 25 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | bool
+    ("docs/reference/ARCHITECTURE_REFERENCE.md", "c0ce05541ec23938"),  # **[REACH TRUTH-FIX #2488/#2491, v1.0.0]** This k
+    ("docs/reference/ARCHITECTURE_REFERENCE.md", "05a8ec0a5b0d07cb"),  # Two documented behaviour flips this implies, nei
+    ("docs/reference/ARCHITECTURE_REFERENCE.md", "a7f6819833eef54c"),  # Note `AI_MEMORY_FED_SYNC_TRUST_PEER=1` (#25) doe
 ]
 
 # ---- normalisation and character refusal ----
@@ -345,17 +385,29 @@ _QUOTE_RE = re.compile(r"(?: {0,3}>[ \t]?)*")
 _SETEXT_RE = re.compile(r"( *)(?:=+|-+)[ \t]*$")
 _BREAK_RE = re.compile(r" {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$")
 _LEAD_ITEM_RE = re.compile(r" {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+")
-_HTML_HEADING_RE = re.compile(r"[ \t]*<h([1-6])(?:\s[^<>]*)?>[^\n]*</h\1\s*>[ \t]*$", re.IGNORECASE)
+# Round 16: 0-3 spaces of indent, measured after the container prefix (CommonMark 4.6 HTML blocks).
+_HTML_HEADING_RE = re.compile(r" {0,3}<h([1-6])(?:\s[^<>]*)?>[^\n]*</h\1\s*>[ \t]*$", re.IGNORECASE)
 # Round 14: any HTML heading open tag ("<h1>" to "<h6>", then whitespace, ">", "/" or the end of
-# the line); outside fenced code it must sit on a line _line_heading() reads as a heading.
+# the line); outside code it must sit on a line _line_heading() reads as a heading.
 _HTML_HEADING_OPEN_RE = re.compile(r"<h[1-6](?:[\s>/]|$)", re.IGNORECASE)
-# Round 15: a fence opens only on 0-3 spaces after the blockquote markers; a closing line keeps the
-# permissive form (closing early reads more lines as text, so it fails closed).
-_FENCE_OPEN_RE = re.compile(r" {0,3}(`{3,}|~{3,})")
-_FENCE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})")
+# Round 16 (code r12 MEDIUM-1/MEDIUM-2, security r14 MEDIUM-1/LOW-1): _lex() reads fences as
+# CommonMark does, relative to the container (blockquote depth plus list-item content column). These
+# match on the text after that prefix: a fence run, a closing line (the run plus only whitespace),
+# a list marker, and the prefix whose tabs expand to four-column stops.
+_FENCE_RUN_RE = re.compile(r"(`{3,}|~{3,})")
+_FENCE_CLOSE_RE = re.compile(r"(`{3,}|~{3,})[ \t]*$")
+_MARKER_RE = re.compile(r"(?:[-*+]|(\d{1,9})[.)])(?=[ \t]|$)")
+_LEAD_PREFIX_RE = re.compile(r"[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+[ \t>]*)*")
+# The permissive second reading the backstop compares with (the round-14 form plus list markers):
+# a fence opens after any run of spaces, tabs, blockquote and list markers and closes on the next
+# run of the same character, at least as long, with nothing after it.
+_ALT_OPEN_RE = re.compile(r"[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*(`{3,}|~{3,})")
+_ALT_CLOSE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})[ \t]*$")
 _DELIM_PREFIX_RE = re.compile(r"[ \t]*(?:>[ \t]*)*")
 _DELIM_CHARS = frozenset("|-: \t")
 _WS_RE = re.compile(r"\s+")
+# Round 16 (R3): the sync trust-peer bypass in any spelling the folded views read.
+TRUST_PEER_RE = re.compile(r"sync[^a-z0-9]{0,4}trust[^a-z0-9]{0,4}peer")
 _RELEASE_HEADING_RE = re.compile(r"^## \[\d+\.\d+\.\d+\]")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _COMMENT_OPEN = "<!--"
@@ -444,27 +496,148 @@ def _is_blank(raw_line):
     return raw_line.strip(" \t") == ""
 
 
-def _fence_flags(lines):
-    """Per line: True when it opens, closes or sits inside a fenced code block (a heading there is
-    code, not a heading). Fail closed (round 15, CommonMark): a fence opens only on 0-3 spaces after
-    the blockquote markers, never with a backtick in a backtick fence's info string, and a fence
-    closes when a line has fewer blockquote markers than its opener. An unclosed fence runs to the end."""
-    flags, fence, depth = [], None, 0
+def _expand_lead(line):
+    """The line with every tab in its prefix (spaces, tabs, blockquote and list markers) expanded to
+    the next four-column stop (CommonMark 2.2); the rest of the line is unchanged."""
+    if "\t" not in line:
+        return line
+    end = _LEAD_PREFIX_RE.match(line).end()
+    out, col = [], 0
+    for ch in line[:end]:
+        pad = 4 - col % 4 if ch == "\t" else 1
+        out.append(" " * pad if ch == "\t" else ch)
+        col += pad
+    return "".join(out) + line[end:]
+
+
+def _block_start(text):
+    """True when text (a line after its indent, at 0-3 spaces) would start a block rather than
+    continue a paragraph lazily: a heading, fence, quote, list item, thematic break or HTML tag."""
+    return (text[:1] in ("#", "`", "~", ">", "<") or bool(_MARKER_RE.match(text))
+            or bool(_BREAK_RE.match(text)))
+
+
+def _lex(lines):
+    """CommonMark reading of code blocks (round 16, sections 4.4, 4.5, 5.1 and 5.2). Returns
+    (code, bodies, unclosed): code[i] is True when line i opens, closes or sits inside a fenced
+    code block, or is an indented code line; bodies[i] is the line after its blockquote markers
+    and its list-item content column (what _line_heading() reads); unclosed holds the 0-based
+    opening line of a fence still open at the end of the text.
+
+    The container is the blockquote depth plus the content column of the innermost open list item
+    at that depth. A fence opens on 0-3 spaces relative to the container, also right after a list
+    marker ("- ```"), never with a backtick in a backtick fence's info string. It closes on a line at
+    the same depth, 0-3 spaces relative to the container, of the same character, at least as long,
+    with only whitespace after it; a deeper-quoted or 4+-indented line is content. It also closes
+    when its container ends: a line with fewer blockquote markers, or a non-blank line indented less
+    than the list item's content column. Outside a paragraph a line 4+ spaces past the container is
+    indented code. A list item ends at a non-blank line indented less than its content column unless
+    the line continues a paragraph lazily."""
+    code, bodies, unclosed = [], [], []
+    items = []  # (blockquote depth, content column) of each open list item, outermost first
+    fence = None  # [character, length, depth, container column, opening line]
+    para = False
+    for n, raw in enumerate(lines):
+        depth, rest = _quote_split(_expand_lead(raw))
+        blank = not rest.strip(" \t")
+        ind = len(rest) - len(rest.lstrip(" "))
+        if fence is not None:
+            if depth > fence[2] or (depth == fence[2] and (blank or ind >= fence[3])):
+                body = rest[fence[3]:] if depth == fence[2] else rest
+                code.append(True)
+                bodies.append(body)
+                lead = len(body) - len(body.lstrip(" "))
+                m = _FENCE_CLOSE_RE.match(body[lead:]) if depth == fence[2] and lead <= 3 else None
+                if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1]:
+                    fence = None
+                continue
+            fence = None  # the container ended: the fence closes and the line is read afresh
+        if blank:
+            items = [it for it in items if it[0] <= depth]
+            code.append(False)
+            bodies.append(rest)
+            para = False
+            continue
+        keep = [it for it in items if it[0] < depth or (it[0] == depth and ind >= it[1])]
+        if para and len(keep) < len(items) and not _block_start(rest[ind:]):
+            code.append(False)  # a lazy paragraph continuation line: the containers stay open
+            bodies.append(rest[ind:])
+            continue
+        popped, items = len(keep) < len(items), keep
+        base = items[-1][1] if items and items[-1][0] == depth else 0
+        body = rest[base:]
+        if ind - base >= 4 and not para:
+            code.append(True)  # indented code: no heading, fence or list marker is read here
+            bodies.append(body)
+            continue
+        if ind - base >= 4:
+            code.append(False)  # 4+ spaces inside a paragraph: continuation text
+            bodies.append(body)
+            continue
+        col, indented = ind, False
+        while True:
+            m = _MARKER_RE.match(rest, col)
+            if not m or _BREAK_RE.match(rest[col:]):
+                break
+            after = rest[m.end():]
+            if (para and not popped and (not after.strip(" \t")
+                                         or (m.group(1) is not None and m.group(1).lstrip("0") != "1"))):
+                break  # an empty item, or one numbered other than 1, does not interrupt a paragraph
+            gap = len(after) - len(after.lstrip(" "))
+            width = 1 if not after.strip(" \t") or gap > 4 else gap
+            items.append((depth, m.end() + width))
+            indented, col, para, popped = gap > 4 and bool(after.strip(" \t")), m.end() + width, False, True
+            if indented:
+                break
+        text = rest[col:]
+        o = _FENCE_RUN_RE.match(text)
+        if indented or (o and not (o.group(1)[0] == "`" and "`" in text[o.end():])):
+            if not indented:
+                fence = [o.group(1)[0], len(o.group(1)), depth, items[-1][1] if items and items[-1][0] == depth
+                         else 0, n]
+            code.append(True)
+            bodies.append(body)
+            para = False
+            continue
+        code.append(False)
+        bodies.append(body)
+        para = not (_ATX_RE.match(text) or _BREAK_RE.match(text) or _HTML_HEADING_RE.match(text))
+    if fence is not None:
+        unclosed.append(fence[4])
+    return code, bodies, unclosed
+
+
+def _alt_fence_flags(lines):
+    """Per line: True inside a fence under the permissive second reading (_ALT_OPEN_RE and
+    _ALT_CLOSE_RE, no container or indent rule). The fail-closed backstop in _scan() compares it
+    with _lex(): where the two readings disagree, a heading never resets the pair context."""
+    flags, fence = [], None
     for line in lines:
-        m = _FENCE_RE.match(line)
-        here, body = _quote_split(line)
-        if fence is not None and here < depth:
-            fence = None
         if fence is None:
-            o = _FENCE_OPEN_RE.match(body)
-            if o and not (o.group(1)[0] == "`" and "`" in body[o.end():]):
-                fence, depth = o.group(1), here
+            m = _ALT_OPEN_RE.match(line)
+            fence = m.group(1) if m else None
             flags.append(fence is not None)
             continue
         flags.append(True)
-        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not line[m.end():].strip():
+        m = _ALT_CLOSE_RE.match(line)
+        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
             fence = None
     return flags
+
+
+def _fence_flags(lines):
+    """Per line: True when _lex() reads it as code (a fenced code block line or an indented code
+    line); a heading there is code, not a heading."""
+    return _lex(lines)[0]
+
+
+def _reading(lines, markdown=True):
+    """(code, bodies, unclosed, alt) for a gated file. docs/encryption.html is HTML, not Markdown:
+    no line is code, an HTML heading element is read at any indent and no ATX line is a heading."""
+    if markdown:
+        return _lex(lines) + (_alt_fence_flags(lines),)
+    bodies = [x.lstrip(" \t") if _HTML_HEADING_RE.match(x.lstrip(" \t")) else "" for x in lines]
+    return [False] * len(lines), bodies, [], [False] * len(lines)
 
 
 def _windows(para, pair_context, row=False):
@@ -531,15 +704,14 @@ def _line_heading(body):
     return bool(item) and bool(_ATX_RE.match(body[item.end():]) or _HTML_HEADING_RE.match(body[item.end():]))
 
 
-def html_heading_misuse(text):
-    """1-based line numbers of the lines outside fenced code that open an HTML heading element
+def html_heading_misuse(text, markdown=True):
+    """1-based line numbers of the lines outside code (fenced or indented) that open an HTML heading element
     ("<h1>" to "<h6>") but are not the one-line heading form _line_heading() reads (round 14: a
     split, wrapped or trailed element is refused rather than read without heading context)."""
     lines = [normalise(x) for x in text.split("\n")]
-    fenced = _fence_flags(lines)
+    code, bodies, _, _ = _reading(lines, markdown)
     return [n + 1 for n, line in enumerate(lines)
-            if not fenced[n] and _HTML_HEADING_OPEN_RE.search(line)
-            and not _line_heading(_quote_split(line)[1])]
+            if not code[n] and _HTML_HEADING_OPEN_RE.search(line) and not _line_heading(bodies[n])]
 
 
 def _setext_under(cur, line, prev_fenced):
@@ -562,7 +734,7 @@ def _setext_under(cur, line, prev_fenced):
     return indent <= 3
 
 
-def _scan(raw, implied=False, first_line=1):
+def _scan(raw, implied=False, first_line=1, markdown=True):
     """Cut raw text into blocks. Returns (paragraphs, headings): paragraphs are
     (first index, normalised lines, pair context, is row); headings are (first index, normalised
     heading text, pair context, last index). implied is True (every line is in the statement
@@ -578,7 +750,9 @@ def _scan(raw, implied=False, first_line=1):
     else:
         lo, hi = -1, -2
     paras, heads = [], []
-    fenced = _fence_flags(lines)
+    # Round 16 fail-closed backstop: where _lex() and the permissive reading disagree on whether a
+    # line is code, a heading there (read either way) adds its pair word and never clears one.
+    fenced, bodies, _, alt = _reading(lines, markdown)
     cur = []  # [first index, lines, starts with a list item, implied]
     state = {"head_pair": False, "header_pair": None}
 
@@ -587,9 +761,9 @@ def _scan(raw, implied=False, first_line=1):
             paras.append((cur[0], cur[1], cur[3] or state["head_pair"], False))
             del cur[:]
 
-    def heading(first, text, context, last):
+    def heading(first, text, context, last, keep=False):
         heads.append((first, text, context, last))
-        state["head_pair"] = _any(PAIR_RES, _views(text))
+        state["head_pair"] = _any(PAIR_RES, _views(text)) or (keep and state["head_pair"])
         state["header_pair"] = None
 
     for i, line in enumerate(lines):
@@ -601,14 +775,18 @@ def _scan(raw, implied=False, first_line=1):
             flush()
             state["header_pair"] = None
             continue
-        if not fenced[i]:
+        split = fenced[i] != alt[i]
+        if fenced[i]:
+            if split and _line_heading(bodies[i].lstrip(" ")) and _any(PAIR_RES, _views(line)):
+                state["head_pair"] = True
+        else:
             if _setext_under(cur, line, fenced[i - 1] if i else False):
                 # The open paragraph is a setext heading: its lines plus this underline.
                 first, text, context = cur[0], "\n".join(cur[1] + [line]), cur[3] or state["head_pair"]
                 del cur[:]
-                heading(first, text, context, i)
+                heading(first, text, context, i, split)
                 continue
-            body = _quote_split(line)[1]
+            body = bodies[i]
             if _BREAK_RE.match(body):
                 # A thematic break ends the paragraph; it is not a heading and ends no section.
                 flush()
@@ -616,7 +794,7 @@ def _scan(raw, implied=False, first_line=1):
                 continue
             if _line_heading(body):
                 flush()
-                heading(i, line, imp or state["head_pair"], i)
+                heading(i, line, imp or state["head_pair"], i, split)
                 continue
         context = imp or state["head_pair"]
         if state["header_pair"] is not None:
@@ -656,15 +834,16 @@ def _units(paras, first_line):
     return out
 
 
-def gated_units(text, implied_pair=False, first_line=1):
+def gated_units(text, implied_pair=False, first_line=1, markdown=True):
     """(first line, last line, collapsed normalised text) for every gated unit of the text."""
-    return _units(_scan(text, implied_pair, first_line)[0], first_line)
+    return _units(_scan(text, implied_pair, first_line, markdown)[0], first_line)
 
 
-def gated_headings(text, implied_pair=False, first_line=1):
+def gated_headings(text, implied_pair=False, first_line=1, markdown=True):
     """(line, collapsed normalised heading) for every heading that must be pinned."""
     return [(first_line + i, _WS_RE.sub(" ", line).strip())
-            for i, line, context, _ in _scan(text, implied_pair, first_line)[1] if _heading_gated(line, context)]
+            for i, line, context, _ in _scan(text, implied_pair, first_line, markdown)[1]
+            if _heading_gated(line, context)]
 
 
 def _stop_offset(raw):
@@ -716,12 +895,12 @@ def _implied_range(rel, text):
 def file_units(rel, raw):
     """Units of one gated file; inside the scope statement subsection the pair word is implied."""
     text = scoped_text(rel, raw)
-    return gated_units(text, _implied_range(rel, text))
+    return gated_units(text, _implied_range(rel, text), 1, rel != HTML_REL)
 
 
 def file_headings(rel, raw):
     text = scoped_text(rel, raw)
-    return gated_headings(text, _implied_range(rel, text))
+    return gated_headings(text, _implied_range(rel, text), 1, rel != HTML_REL)
 
 
 def current_units(root=ROOT):
@@ -826,6 +1005,46 @@ def _changelog_entry(text):
     return text[start:start + 5 + nxt.start()] if nxt else text[start:]
 
 
+def trust_peer_mentions(root=ROOT):
+    """(path, sentence) for every sentence of a gated file that names the sync trust-peer bypass, in
+    any spelling the folded views read (round 16, R3). Paragraphs are flattened; an HTML page is read
+    as its plain text."""
+    return [(rel, sent) for rel in SINGLE_SOURCE_FILES
+            for sent in trust_peer_sentences(rel, (root / rel).read_text(encoding="utf-8"))]
+
+
+def trust_peer_sentences(rel, raw):
+    text = scoped_text(rel, raw)
+    if rel == HTML_REL:
+        text = _html_text(text)
+    out = []
+    for para in re.split(r"\n[ \t>]*\n", text):
+        para = _flat(para).strip()
+        if not any(TRUST_PEER_RE.search(v) for v in _mention_views(para)):
+            continue
+        sents = [s for s in _SENT_END_RE.split(para) if any(TRUST_PEER_RE.search(v) for v in _mention_views(s))]
+        out.extend(sents or [para])  # a mention split across sentences is kept as its paragraph
+    return out
+
+
+def _mention_views(text):
+    """_views() with one fold: the folded view, it without tags and emphasis, and a rendered view
+    (comments, tags and link syntax removed after unescaping, folded again if an entity remains)."""
+    low = fold(text)
+    out = low
+    if "<" in out:
+        out = _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(out)))
+    if "&" in out:
+        out = fold(out)
+    if "[" in out:
+        out = _REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", out)).replace("[", "").replace("]", "")
+    return low, _MARKUP_RE.sub("", _TAG_RE.sub("", low)), _MARKUP_RE.sub("", out)
+
+
+def mention_key(sentence):
+    return hashlib.sha256(sentence.encode("utf-8")).hexdigest()[:16]
+
+
 def _check_items(case, body, expected):
     items = _items(body)
     case.assertEqual(len(items), len(expected), "item count drifted: %d" % len(items))
@@ -834,10 +1053,10 @@ def _check_items(case, body, expected):
         case.assertEqual(len(hit), 1, "item missing or duplicated: " + key)
         for num in (nums if isinstance(nums, tuple) else (nums,)):
             case.assertRegex(hit[0], r"#%d\b" % num, key + " lost #%d" % num)
-        if key in STATE_WORDS:
-            word = STATE_WORDS[key]
-            case.assertRegex(hit[0], r"\b%s\b" % word, key + " lost its state word: " + word)
-            case.assertNotRegex(hit[0], r"\b%s\b" % ("open" if word == "closed" else "closed"), key + " states both")
+        # Round 16 (code r12 INFO-1): any case; exactly the item's own state word, never both.
+        found = {w for w in ("open", "closed") if re.search(r"\b%s\b" % w, hit[0], re.IGNORECASE)}
+        want = STATE_WORDS[key]
+        case.assertEqual(found, {want} if want else set(), "%s state words %s, want %s" % (key, sorted(found), want))
     return items
 
 
@@ -876,11 +1095,11 @@ class CertificationScope8262(unittest.TestCase):
         for rel, units in self.units.items():
             text = scoped_text(rel, _read(rel))
             lines = [normalise(x) for x in text.split("\n")]
-            fenced = _fence_flags(lines)
-            heads = {n for first, _, _, last in _scan(text, _implied_range(rel, text))[1]
+            fenced, bodies, _, _ = _reading(lines, rel != HTML_REL)
+            heads = {n for first, _, _, last in _scan(text, _implied_range(rel, text), 1, rel != HTML_REL)[1]
                      for n in range(first + 1, last + 2)}
             bad = ["%s:%d" % (rel, n) for first, last, _ in units for n in range(first, last + 1)
-                   if n in heads or (not fenced[n - 1] and _line_heading(_quote_split(lines[n - 1])[1]))]
+                   if n in heads or (not fenced[n - 1] and _line_heading(bodies[n - 1]))]
             self.assertEqual(bad, [], "heading line inside a unit: " + ", ".join(bad[:5]))
 
     def test_every_gated_heading_is_pinned_exactly_once(self):
@@ -923,7 +1142,7 @@ class CertificationScope8262(unittest.TestCase):
 
     def test_html_heading_only_in_one_line_form(self):
         bad = ["%s:%d" % (rel, n) for rel in SINGLE_SOURCE_FILES
-               for n in html_heading_misuse(scoped_text(rel, _read(rel)))]
+               for n in html_heading_misuse(scoped_text(rel, _read(rel)), rel != HTML_REL)]
         self.assertEqual(bad, [], "an HTML heading element outside the one-line form (open and close tag "
                          "alone on one line) gives no heading context and is refused: " + ", ".join(bad[:10]))
         # Synthetic: the six refused spellings, the accepted one-line forms, and fenced code.
@@ -1080,6 +1299,40 @@ class CertificationScope8262(unittest.TestCase):
             self.assertEqual(html_heading_misuse(real), [], real)
         self.assertEqual(texts("## Notes\n\n> ```\n> x\n> ```\n\n## Federation\n\n" + claim), [claim])
 
+    def test_code_is_read_relative_to_its_container_8262(self):
+        # Round 16 (code r12 MEDIUM-1/MEDIUM-2, security r14 MEDIUM-1/LOW-1): fences and indented code
+        # are read relative to the list item or block quote that holds them (CommonMark 0.31), so a
+        # heading inside code never resets the pair context and a heading outside code always does.
+        claim = "The envelope ships in v1.1."
+
+        def texts(raw):
+            return [u[2] for u in gated_units(raw)]
+        fed, notes = "## Federation\n\n", "## Notes\n\n"
+        claimed = (  # the heading inside the code is not read: the claim stays under Federation
+            fed + "- item\n\n    ```\n  ## Notes\n    ```\n\n",   # list fence 2 past the content column
+            fed + "```\n    ```\n## Notes\n```\n\n",            # a closer 4 spaces in does not close
+            fed + "```\n> ```\n## Notes\n```\n\n",              # a quoted closer does not close
+            fed + "- ```\n  ## Notes\n  ```\n\n",               # a fence right after the list marker
+            fed + "- item\n\n    ```\n    <h2>Notes</h2>\n    ```\n\n",
+            fed + "-   item\n\n    ```\n    <h2>Notes</h2>\n    ```\n\n",
+            fed + "- ```\n  <h2>Notes</h2>\n  ```\n\n",
+            fed + "```\n    ```\n<h2>Notes</h2>\n```\n\n",
+            fed + "    <h2>Notes</h2>\n\n",                     # indented code
+            notes + "- item\n\n  ```\n  code\n\n" + fed,        # the fence closes when its list item ends
+        )
+        for raw in claimed:
+            self.assertEqual(texts(raw + claim), [claim], raw)
+        # A real fence inside a list item hides the heading in it (no claim under Federation).
+        for head, tail in (("- item\n\n    ```\n  ", "\n    ```"), ("- ```\n  ", "\n  ```")):
+            raw = notes + head + "## Federation\n\n  " + claim + tail
+            self.assertEqual(texts(raw), [], raw)
+        # Unclosed at the end: _lex() names the opening line; no gated file ends inside a fence.
+        self.assertEqual(_lex(["x", "", "```", "## Federation"])[2], [2])
+        self.assertEqual(_lex(["- ```", "  x", "", "y"])[2], [])
+        for rel in SINGLE_SOURCE_FILES:
+            lines = [normalise(x) for x in scoped_text(rel, _read(rel)).split("\n")]
+            self.assertEqual(_reading(lines, rel != HTML_REL)[2], [], rel + " ends inside an open fence")
+
     def test_statement_ends_at_the_named_anchor(self):
         text = CERT.read_text(encoding="utf-8")
         self.assertEqual(text.count(STATEMENT_END), 1, "the statement anchor must appear exactly once")
@@ -1170,7 +1423,25 @@ class CertificationScope8262(unittest.TestCase):
         body = _blocks()[B_NOT]
         items = _check_items(self, body, NOT_ITEMS)
         self.assertIn(TDE_NOT_CLAIMED, _flat(body))
+        self.assertEqual([i for i in items if "Curator namespace-scoped mode" in i], [CURATOR_NOT_CLAIMED])
         self.assertTrue(any("deferred-v1.x" in i for i in items))
+
+    def test_trust_peer_bypass_never_endorsed_8262(self):
+        # Round 16 (R3): the sync trust-peer bypass is named only by the reviewed sentences in
+        # TRUST_PEER_MENTIONS, both directions, in every gated file.
+        mentions = trust_peer_mentions()
+        found = collections.Counter((rel, mention_key(s)) for rel, s in mentions)
+        want = collections.Counter(TRUST_PEER_MENTIONS)
+        texts = {(rel, mention_key(s)): s for rel, s in mentions}
+        self.assertEqual(sorted((found - want).elements()), [],
+                         "unreviewed bypass mention: " + " | ".join(texts[k] for k in (found - want)))
+        self.assertEqual(sorted((want - found).elements()), [], "reviewed bypass mention gone or reworded")
+        # Synthetic: every spelling the folded views read is a mention; an unrelated sentence is not.
+        for text in ("Set `AI_MEMORY_FED_SYNC_TRUST_PEER=1` on every peer.", "Enable sync-trust-peer.",
+                     "Turn on SYNC&#95;TRUST&#95;PEER for speed.", "<p>Set sync trust peer to 1.</p>"):
+            self.assertEqual(len(trust_peer_sentences(HTML_REL if text.startswith("<") else "README.md", text)),
+                             1, text)
+        self.assertEqual(trust_peer_sentences("README.md", "Peers sync and trust the mesh."), [])
 
     def test_pointers_present(self):
         for rel in POINTERS:

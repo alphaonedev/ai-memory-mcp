@@ -871,11 +871,11 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 **Claimed for the GA candidate (IN; certification re-issue under [#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)):**
 
 - Federation transport is mTLS, and outbound peer server-certificate verification is on by default and
-  refuses the skip flag ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448), [#232](https://github.com/alphaonedev/ai-memory-mcp/issues/232); `src/tls.rs:114`, `src/tls.rs:1200-1203`, asi-hard pin
+  refuses the skip flag ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448), [#232](https://github.com/alphaonedev/ai-memory-mcp/issues/232), closed; `src/tls.rs:114`, `src/tls.rs:1200-1203`, asi-hard pin
   `src/security_profile.rs:461-463`).
 - `sync/since` is peer-scoped while the operator bypass `AI_MEMORY_FED_SYNC_TRUST_PEER=1` is unset: a peer
   without a scope allowlist receives an empty envelope, and rows are filtered by namespace and
-  private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948); `file:line` at merge `ffc54bd50`;
+  private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948), closed; `file:line` at merge `ffc54bd50`;
   `src/handlers/federation_sync_since.rs:289-296`, `:358`, `:366`). With the bypass set to `1`
   (`src/federation/peer_attestation.rs:390-392`, consumed at `src/handlers/federation_sync_since.rs:289`)
   an unscoped peer receives a full dump of every row in an allowed namespace and the private-visibility
@@ -931,7 +931,7 @@ permissive one named here, so a reader must not assume the control:
   `skipped_backend_unsupported` ([#8255](https://github.com/alphaonedev/ai-memory-mcp/issues/8255), open; `docs/atomisation.md:100-102`).
 - Top-shelf encryption documentation ([#3833](https://github.com/alphaonedev/ai-memory-mcp/issues/3833), closed with the `deferred-v1.x` label).
 - Singleton and Team shapes keep allow-on-silence namespace governance by default
-  (`src/config/shape.rs:191`; [#3125](https://github.com/alphaonedev/ai-memory-mcp/issues/3125)).
+  (`src/config/shape.rs:191`; [#3125](https://github.com/alphaonedev/ai-memory-mcp/issues/3125), open).
 
 ---
 
