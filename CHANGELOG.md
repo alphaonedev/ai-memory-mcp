@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Docs (#8262 — certification scope statement for v1.0.0 GA)
 
 - Add a "Certification scope statement" to `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` listing what the GA candidate certifies, what is in scope and certified on landing, and what it does not claim, each with its tracking issue and enforcing `file:line`; the three open fail-closed controls (#2967, #8260, #8265) are listed as claimed only once landed. The end-to-end content encryption work is tracked in #8278 (supersedes the closed #1968). Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262). Pointers and corrections added across `README.md`, `ROADMAP.md`, `SECURITY.md`, `docs/SECURITY.md`, `docs/compliance/honest-limitations.md`, `docs/compliance/nsa-csi-mcp-security-mapping.md`, `docs/encryption.html`, `docs/enterprise-deployment.md`, `docs/federation-identity.md`, `docs/federation.md`, `docs/production-deployment.md`, `docs/reference/ARCHITECTURE_REFERENCE.md`, `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`, `CHANGELOG.md`; guard `scripts/ci/tests/test_certification_scope_8262.py`.
+### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
+
+- **`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` now follows the `[deployment]
+  shape`.** `federated` and `hive` pin it ON when unset and refuse boot when
+  it is set non-truthy (a FLOOR); `production` pins it ON when unset, and an
+  explicit non-truthy value still refuses boot because `production` always
+  engages the `asi-hard` posture, whose no-disable floor covers this knob;
+  `singleton` and `team` keep the permissive default silently (the default is
+  listed by `ai-memory config show`, and hook-driven one-shot verbs stay
+  quiet). The shape table gains a `quarantine_unattributed` row. The shape
+  floor and the live `/sync/push` reader now share one truthiness parser
+  (`security_profile::is_truthy`, case-insensitive): before, a token such as
+  `TRUE` passed the floor and the `asi-hard` check but was read as OFF by the
+  receive path. Shape-forced over a global default flip, copying the
+  `governed_namespace_required` precedent.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 

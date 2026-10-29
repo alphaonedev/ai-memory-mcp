@@ -12,7 +12,7 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-Last LIVE bind (historical, no live bind while EXPIRED): `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
+Last LIVE bind (historical, no live bind while VOID): `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
 re-issued 2026-10-02 after **3 §7-watched federation-wire files changed** since the prior bind
 `eba96b307` — 74 changed lines, **49 of them code**, from five commits — §5.4(2)–(5) re-run at the
 new SHA per §7). The 2026-09-26 re-issue at `eba96b307`, the 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **EXPIRED as of 2026-10-07** (§7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+> ## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 >
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
@@ -2040,9 +2040,42 @@ captures, and the run refuses to publish over a bundle that does not match its
 recapture note above). The committed bundle stays bound to the build that
 produced it (not recaptured here).
 
+**Re-cert trigger — FIRED by #2967 (`src/federation/receive_auth.rs`,
+2026-10-28; PR #8269).** One §7-watched path changed. The delta in
+`quarantine_unattributed_enabled()` (the route-IN reader of
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) replaces a local exact-match
+(`"1" | "true" | "yes" | "on"`, lowercase only) with the crate-wide house
+grammar `crate::security_profile::is_truthy` (case-insensitive, trimmed), so the
+route-IN reader and the `asi-hard` posture floor now parse the knob identically.
+The other edits in that file are rustdoc and a test comment. No `AI_MEMORY_FED_*`
+identifier is added, removed or renamed, and no wire format, signature check or
+accept/refuse rule changes. The posture is strictly MORE protective, never
+weaker: a value the old reader read as off (for example `TRUE` or ` On `) now
+quarantines unattributed inbound rows, which is the fail-closed direction, and
+the `federated`, `hive` and `production` shapes pin the knob on at boot.
+
+*Disposition.* **This change does NOT re-mint the certification and does not
+approve its own control.** Re-running §5.4(2)–(5) on the certified tier and
+re-issuing this document against the new SHA is a Conductor task, tracked by
+[**#6063**](https://github.com/alphaonedev/ai-memory-mcp/issues/6063) (WP-B1),
+the tracker the STATUS banner names; #2967 only records the voiding. The last
+bound determination is the 2026-10-02 re-issue at
+`385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`, the same commit the banner names as
+the last LIVE claim. Gate output at this change: `check-cert-expiry: PASS —
+federation-wire surface changed AND cert doc re-issued/voided in the same
+change (...; banner EXPIRED - → VOID -)` and `check-cert-expiry: banner
+STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
+statuses below are historical records of earlier binds, not a live claim.
+
 ---
 
 ## 8. Current determination
+
+> **Read this section as history.** The STATUS banner above is VOID, so nothing
+> below is a live claim. The latest bound determination is the 2026-10-02
+> re-issue at `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`; the `f32c18dad`
+> status that opens the list below is an earlier, superseded bind, and the
+> re-issues recorded in the banner and the §7 firing ledger postdate it.
 
 **Status at `f32c18dadf8a659567960747cc2802186bac9de9` (2026-09-21
 re-issue; the v1.0.0 promotion candidate; supersedes the 2026-09-12 #3607
