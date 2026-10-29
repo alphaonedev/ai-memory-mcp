@@ -52,6 +52,14 @@ extends/include/secrets/configs/env_file and any top-level key besides name and 
 a definition after then/do/else/elif/time/`!` is read as a definition; the group scan tracks do..done
 and case..esac and RAISES on a closer with no opener; a trailing comment holds no heredoc opener; both
 script headers are pinned to the exit codes the script uses (code 1 from its rc=1 site).
+r13: PyYAML is required (the guard fails without it) and the compose scalars are scanned AS DECODED,
+because compose interpolates after decoding; refused in the YAML: a backslash escape in a double-quoted
+scalar, block scalars, a scalar or flow collection over several lines, a `$` inside a quoted scalar
+(one pinned `user:` scalar excepted); every `docker compose` call passes the pinned `-f` and
+`--project-directory`, the infra directory holds one compose file and no `.env`, and no COMPOSE_*
+variable is read or exported; a definition after a case pattern paren or if/while/until is read as a
+definition; if..fi and case..esac are groups, and a FAIL-bearing group may be followed only by end of
+line, `;`, `;;`, `&&` or an enclosing closer.
 """
 import fnmatch
 import pathlib
@@ -60,10 +68,7 @@ import shutil
 import subprocess
 import unittest
 
-try:  # CI Python may not ship PyYAML; the fallback below is a real structured parse.
-    import yaml
-except ImportError:  # pragma: no cover
-    yaml = None
+import yaml  # r13 S14: required (the guard FAILS, never skips, without it); compose is scanned decoded
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent.parent
 PGB = REPO / "infra" / "pgbouncer"
@@ -140,7 +145,7 @@ TARGET_ASSIGNMENTS = {
 CLEANUP_BODY = {
     SMOKE: [
         "rc=$?",
-        """docker compose -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }""",
+        """docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }""",
         """if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then""",
         """echo "FATAL: compose project $PROJECT still running after teardown" >&2""",
         "rc=1",
@@ -151,7 +156,7 @@ CLEANUP_BODY = {
     ENVELOPE: [
         "rc=$?",
         """[ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true""",
-        """docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }""",
+        """docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }""",
         """if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then""",
         """echo "FATAL: compose project $PROJECT still running after teardown" >&2""",
         "rc=1",
@@ -171,7 +176,7 @@ STEP_MARKER = re.compile(r"""^echo "\[(\d+)/(\d+)\] """)
 POOLED_URL_LITERAL = 'POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"'
 POOLED_URL_ENVELOPE = 'POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"'
 COMPOSE_PW_LINE = re.compile(
-    r'^POSTGRES_PASSWORD="\$PW" docker compose -p "\$PROJECT"(?: -f "\$POOL_COMPOSE")? up -d --wait(?: postgres)?$'
+    r'^POSTGRES_PASSWORD="\$PW" docker compose -f "\$COMPOSE_FILE_PINNED" --project-directory "\$COMPOSE_DIR" -p "\$PROJECT" up -d --wait(?: postgres)?$'
 )
 PSQL_FAIL_BRANCH = r""" \|\| \{ echo "FAIL: [^"]+" >&2; exit 1; \}"""
 PSQL_POOLED_SITES = (
@@ -184,9 +189,10 @@ PINNED_FUNCTIONS = {
     SMOKE: {"cleanup", "psql_pooled"},
     ENVELOPE: {"cleanup", "need", "now_ms", "worker"},
 }
-# r11 Q14 / r12 N3+S13: a definition is a command word, so it is read at line start, after
-# ; && || { ( | and after the reserved words then do else elif time and the `!` negation.
-CMD_START = r"(?:^|[;&|{(]|(?<![\w$\[\\])!|(?<![\w.:$-])(?:then|do|else|elif|time)(?![\w.:-]))\s*"
+# r11 Q14 / r12 N3+S13 / r13 K1+S16: a definition is a command word, so it is read at line start,
+# after ; && || { ( ) | (the `)` closes a case pattern or a group), after the reserved words
+# then do else elif time if while until, and after the `!` negation.
+CMD_START = r"(?:^|[;&|{()]|(?<![\w$\[\\])!|(?<![\w.:$-])(?:then|do|else|elif|time|if|while|until)(?![\w.:-]))\s*"
 FUNCTION_DEF = re.compile(
     CMD_START
     + r"(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\)(?=\s*(?:\{|\(|\[\[|(?:if|for|while|until|case|select)\b))|([\w:-]+)\s*\(\)\s*$)"
@@ -195,8 +201,10 @@ CLEANUP_DEF = re.compile(CMD_START + r"(?:function\s+cleanup\b|cleanup\s*\(\))")
 ALIAS_DEF = re.compile(CMD_START + r"alias\s")
 # r11 Q16: an escaped `<` before `<word` is an input redirect, not a heredoc opener.
 HEREDOC_TOKEN = re.compile(r"\"[^\"]*\"|'[^']*'|(?<![<\\])<<(?!<)-?\s*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))")
-GROUP_OR_NEUTRAL = re.compile(r"\s*\"?\s*\|\|\s*(?:true\b|:(?![\w-])|echo\b)")
-GROUP_PIPED = re.compile(r"\s*\"?\s*\|(?!\|).*\|\|\s*(?:true\b|:(?![\w-])|echo\b)")
+# r13 K3+S17: what may follow the closer of a group that holds a FAIL site: end of line, `;`, `;;`
+# (not `;&` or `;;&`), `&&`, or the closer of an enclosing group. A redirect, a pipe, `||`, a lone `&`
+# or any other token after the closer is refused.
+GROUP_CLOSER_OK = re.compile(r"\s*(?:$|;;(?!&)|;(?![;&])|&&|[)}]|(?:fi|done|esac)(?![\w-]))")
 CAVEAT = re.compile(r"Any other non-zero status[^.]*\.")
 COMPOSE_NAMES = {"AI_MEMORY_SMOKE_RUN", "POSTGRES_PASSWORD", "PGBOUNCER_UID", "PGBOUNCER_GID"}
 # r12 S12: compose features that can move a second secret into a container.
@@ -307,7 +315,7 @@ def _yaml_parse(text):
 
 def _services():
     text = COMPOSE.read_text()
-    return _yaml_parse(text) if yaml is not None else _fallback_parse(text)
+    return _yaml_parse(text)
 
 
 def _code_lines(path):
@@ -331,12 +339,7 @@ def _compose_scan(text):
     escapes in pairs, so an ODD run followed by a name is an interpolation (r12 N1); a run of
     three or more is refused outright, as are YAML anchors, aliases, merge keys, the keys
     extends/include/secrets/configs/env_file and any top-level key besides name and services."""
-    names, problems = set(), []
-    for m in DOLLAR_RUN.finditer(text):
-        if len(m.group(1)) >= 3:
-            problems.append("a run of %d dollars (escape plus interpolation)" % len(m.group(1)))
-        if len(m.group(1)) % 2 == 1 and m.group(2):
-            names.add(m.group(2))
+    names, problems = _interpolations(text)
     if YAML_ANCHOR_ALIAS.search(text):
         problems.append("YAML anchor or alias")
     if YAML_MERGE_KEY.search(text):
@@ -356,6 +359,99 @@ def _compose_scan(text):
     return names, problems
 
 
+COMPOSE_QUOTED_DOLLAR_OK = {
+    '"${PGBOUNCER_UID:?set PGBOUNCER_UID (smoke-test.sh exports id -u)}:${PGBOUNCER_GID:?set PGBOUNCER_GID (smoke-test.sh exports id -g)}"'
+}
+
+
+def _interpolations(value):
+    """(names, problems) of one scalar under the compose escape rule (an odd run of dollars before
+    a name interpolates; a run of three or more is refused)."""
+    names, problems = set(), []
+    for m in DOLLAR_RUN.finditer(value):
+        if len(m.group(1)) >= 3:
+            problems.append("a run of %d dollars (escape plus interpolation)" % len(m.group(1)))
+        if len(m.group(1)) % 2 == 1 and m.group(2):
+            names.add(m.group(2))
+    return names, problems
+
+
+def _decoded_scan(text):
+    """r13 K4+S14: (interpolated names, refusals) of the compose file as YAML DECODES it, because
+    compose interpolates the decoded scalar, not the raw text. Needs PyYAML. Every scalar value
+    (keys included) goes through the escape rule; and every construct in which the raw text and the
+    decoded scalar can differ is refused: a backslash escape in a double-quoted scalar, a block
+    scalar (`|`, `>`), a scalar continued over several lines (folded join, escaped line break,
+    comment-looking continuation), a flow collection over several lines, and a `$` inside a quoted
+    scalar except the one pinned `user:` scalar."""
+    names, problems, flow = set(), [], []
+    try:
+        events = list(yaml.parse(text))
+    except yaml.YAMLError as exc:
+        return names, ["the compose text does not parse: %s" % str(exc).splitlines()[0]]
+    for ev in events:
+        if isinstance(ev, yaml.ScalarEvent):
+            raw = text[ev.start_mark.index : ev.end_mark.index]
+            if ev.start_mark.line != ev.end_mark.line:
+                problems.append("scalar over several lines: %r" % raw[:30])
+            if ev.style in ("|", ">"):
+                problems.append("block scalar")
+            if ev.style == '"' and "\\" in raw:
+                problems.append("backslash escape in a double-quoted scalar: %r" % raw[:30])
+            if ev.style in ('"', "'") and "$" in raw and raw not in COMPOSE_QUOTED_DOLLAR_OK:
+                problems.append("dollar inside a quoted scalar: %r" % raw[:30])
+            found, bad = _interpolations(ev.value)
+            names |= found
+            problems.extend(bad)
+        elif isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+            flow.append((bool(ev.flow_style), ev.start_mark.line))
+        elif isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+            is_flow, line = flow.pop()
+            if is_flow and ev.end_mark.line != line:
+                problems.append("flow collection over several lines")
+    return names, problems
+
+
+INFRA_ALLOWED = {".gitignore", "README.md", "docker-compose.yml", "pgbouncer.ini", "role-defaults.sql", "smoke-test.sh", "userlist.txt"}
+PINNED_COMPOSE_ARGS = ' -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" '
+COMPOSE_OWN_NAMES = {"COMPOSE_FILE_PINNED", "COMPOSE_DIR"}
+
+
+def _compose_pin_refusals(body):
+    """r13 S15: refusals for the code of one script: every `docker compose` word is followed by the
+    pinned -f and --project-directory, no docker-compose (v1) binary, no COMPOSE_* name other than the
+    two derived ones (so COMPOSE_FILE, COMPOSE_PATH_SEPARATOR, COMPOSE_PROJECT_NAME are neither read nor
+    exported), no export of those two, and each assigned at most once."""
+    problems = []
+    for m in re.finditer(r"\bdocker\s+compose\b", body):
+        if not body[m.end() :].startswith(PINNED_COMPOSE_ARGS):
+            problems.append("docker compose call without the pinned -f and --project-directory")
+    if re.search(r"\bdocker-compose\b(?!\.ya?ml)", body):
+        problems.append("docker-compose binary")
+    for m in re.finditer(r"\bCOMPOSE_\w*", body):
+        if m.group() not in COMPOSE_OWN_NAMES:
+            problems.append("reads or sets %s" % m.group())
+    if re.search(r"\bexport\b[^\n]*\bCOMPOSE_", body):
+        problems.append("exports a COMPOSE_ variable")
+    for name in sorted(COMPOSE_OWN_NAMES):
+        if len(re.findall(r"\b%s=" % name, body)) > 1:
+            problems.append("%s assigned more than once" % name)
+    return problems
+
+
+def _infra_dir_refusals(names):
+    """r13 S15: the infra/pgbouncer listing holds the allowlisted files (plus the per-run generated
+    userlist) and exactly one compose file; a compose override, compose.yaml, .env or *.env fails."""
+    problems = []
+    for name in names:
+        if name in INFRA_ALLOWED or fnmatch.fnmatch(name, ".userlist.generated.*.txt"):
+            continue
+        problems.append("file not on the allowlist: %s" % name)
+    if [n for n in names if re.search(r"(?i)compose.*\.ya?ml$", n)] != ["docker-compose.yml"]:
+        problems.append("the directory must hold exactly one compose file, docker-compose.yml")
+    return problems
+
+
 def _joined(path):
     return re.sub(r"\\\n\s*", " ", "\n".join(_code_lines(path)))
 
@@ -367,8 +463,6 @@ def _norm_lines(path):
 
 class ComposeParity(unittest.TestCase):
     def test_both_parsers_agree_on_head(self):
-        if yaml is None:
-            self.skipTest("PyYAML not installed; fallback parser is the one in use")
         text = COMPOSE.read_text()
         a, b = _yaml_parse(text), _fallback_parse(text)
         self.assertEqual(set(a), set(b))
@@ -433,6 +527,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         names, problems = _compose_scan(text)
         self.assertEqual(problems, [], "compose uses a form that can move a secret: %r" % problems)
         self.assertEqual(names, COMPOSE_NAMES, "compose may interpolate only %s" % sorted(COMPOSE_NAMES))
+        # r13 S14: the same rule on the DECODED scalars, which is what compose interpolates.
+        decoded_names, decoded_problems = _decoded_scan(COMPOSE.read_text())
+        self.assertEqual(decoded_problems, [], "compose has a raw/decoded divergence: %r" % decoded_problems)
+        self.assertEqual(decoded_names, COMPOSE_NAMES, "decoded scalars interpolate %s" % sorted(decoded_names))
         services = _services()
         self.assertRegex(services["postgres"]["environment"].get("POSTGRES_PASSWORD", ""), REQUIRED_PW)
         for name, spec in services.items():
@@ -472,6 +570,109 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # N1 parity alone (no run of three): an odd run is an interpolation, an even run is not.
         self.assertEqual(_compose_scan("a: $$$$HOME\nb: $${HOME}\nc: ${HOME}")[0], {"HOME"})
         self.assertEqual(_compose_scan("a: $$HOME")[0], set())
+
+    def test_decoded_scan_selftest(self):
+        # r13 S14 / K4: every construct in which the raw text and the decoded scalar differ is
+        # refused (backslash escapes, block scalars, folded joins, multi-line flow, a dollar inside
+        # quotes); the legitimate forms (F2b `$$HOME`, E4 `$ {NAME}`, E5 `$${NAME}`) are not.
+        base = COMPOSE.read_text()
+        port = '    ports:\n      - "127.0.0.1:6432:6432"'
+        self.assertEqual(_decoded_scan(base), (COMPOSE_NAMES, []))
+        legit = {
+            "F2b": "    environment:\n      SMOKE_NOTE: $$HOME\n",
+            "E4": "    environment:\n      SMOKE_NOTE: $ {PGPASSWORD}\n",
+            "E5": "    environment:\n      SMOKE_NOTE: $${PGPASSWORD}\n",
+            "dq-plain": '    environment:\n      SMOKE_NOTE: "plain text"\n',
+            "sq-plain": "    environment:\n      SMOKE_NOTE: 'plain text'\n",
+        }
+        for row, extra in legit.items():
+            self.assertEqual(_decoded_scan(base.replace(port, extra + port, 1)), (COMPOSE_NAMES, []), row)
+        refused = {
+            "hex-escape": '    environment:\n      X: "\\x24{PGPASSWORD}"\n',
+            "unicode-escape": '    environment:\n      X: "\\u0024{PGPASSWORD}"\n',
+            "escaped-line-break": '    environment:\n      X: "$\\\n        {PGPASSWORD}"\n',
+            "block-pipe": "    labels:\n      smoke.copy: |\n        ${PGPASSWORD}\n",
+            "block-fold": "    labels:\n      smoke.copy: >-\n        ${PGPASSWORD}\n",
+            "folded-join": "    labels:\n      smoke.copy: aaa\n        ${PGPASSWORD}\n",
+            "multi-line-flow": "    environment: {A: b,\n      C: ${PGPASSWORD}}\n",
+            "dollar-in-dq": '    environment:\n      X: "$PGPASSWORD"\n',
+            "dollar-in-sq": "    environment:\n      X: '${PGPASSWORD}'\n",
+            "comment-continuation": '    labels:\n      smoke.copy: "a\n# b\n      ${PGPASSWORD}"\n',
+            "plain-second-name": "    environment:\n      X: ${PGPASSWORD}\n",
+            "dollar-run": "    environment:\n      X: $$$PGPASSWORD\n",
+        }
+        for row, extra in refused.items():
+            names, problems = _decoded_scan(base.replace(port, extra + port, 1))
+            self.assertTrue(problems or names != COMPOSE_NAMES, "row %s is not refused" % row)
+
+    def test_decoded_environment_and_labels_are_pinned_on_head(self):
+        # r13 S14: the head environment keys, the absence of labels/command/entrypoint and the
+        # decoded values are pinned, so an interpolation shows here as well as in the scan.
+        doc = yaml.safe_load(COMPOSE.read_text())
+        self.assertEqual(set(doc), {"name", "services"})
+        env_keys = {name: sorted((spec.get("environment") or {})) for name, spec in doc["services"].items()}
+        # A new environment key is allowed (its value is scanned below); the head keys must stay.
+        self.assertTrue({"POSTGRES_DB", "POSTGRES_PASSWORD", "POSTGRES_USER"} <= set(env_keys["postgres"]), env_keys)
+        for name, spec in doc["services"].items():
+            self.assertNotIn("labels", spec, name)
+            self.assertNotIn("command", spec, name)
+            self.assertNotIn("entrypoint", spec, name)
+            for value in (spec.get("environment") or {}).values():
+                found, bad = _interpolations(str(value))
+                self.assertEqual(bad, [], name)
+                self.assertTrue(found <= {"POSTGRES_PASSWORD"}, "%s: %s" % (name, sorted(found)))
+
+    def test_compose_discovery_is_pinned(self):
+        # r13 S15: with `-f` compose reads only the named file (it neither discovers a sibling
+        # compose.yaml or override file nor honours COMPOSE_FILE; Docker Compose v5.6.0), so the
+        # scripts pin it; the infra directory holds exactly one compose file and no `.env`; and
+        # neither script exports or reads a COMPOSE_* variable except the two derived ones.
+        for path, dir_line in ((SMOKE, 'COMPOSE_DIR="$PWD"'), (ENVELOPE, 'COMPOSE_DIR="$PWD/../pgbouncer"')):
+            code = [ln.strip() for ln in _code_lines(path) if ln.strip()]
+            self.assertEqual(code.count(dir_line), 1, "%s: COMPOSE_DIR assignment" % path.name)
+            pin = 'COMPOSE_FILE_PINNED="$COMPOSE_DIR/docker-compose.yml"'
+            self.assertEqual(code.count(pin), 1, "%s: COMPOSE_FILE_PINNED assignment" % path.name)
+            at = code.index(dir_line)
+            self.assertEqual(code.count('cd "$(dirname "$0")"'), 1, path.name)
+            self.assertLess(code.index('cd "$(dirname "$0")"'), at, "%s: COMPOSE_DIR must follow the cd" % path.name)
+            self.assertEqual(code[at + 1], pin, path.name)
+            body = "\n".join(code)
+            self.assertEqual(_compose_pin_refusals(body), [], path.name)
+            self.assertGreaterEqual(len(re.findall(r"\bdocker compose\b", body)), 3, path.name)
+            first = re.search(r"\bdocker compose\b", body)
+            self.assertGreater(first.start(), body.index(pin), "%s: compose call before the pin" % path.name)
+        self.assertEqual(_infra_dir_refusals(sorted(p.name for p in PGB.iterdir())), [])
+
+    def test_compose_discovery_selftest(self):
+        ok = 'x docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$P" up'
+        self.assertEqual(_compose_pin_refusals(ok), [])
+        for row, text in {
+            "no-f": 'docker compose -p "$P" up',
+            "other-f": 'docker compose -f ./x.yml --project-directory "$COMPOSE_DIR" up',
+            "f-after-p": 'docker compose -p "$P" -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" up',
+            "no-project-directory": 'docker compose -f "$COMPOSE_FILE_PINNED" -p "$P" up',
+            "v1-binary": 'docker-compose -f "$COMPOSE_FILE_PINNED" up',
+            "export-file": 'export COMPOSE_FILE=/x/decoy.yml\n' + ok,
+            "read-file": 'echo "$COMPOSE_FILE"\n' + ok,
+            "separator": 'COMPOSE_PATH_SEPARATOR=: ' + ok,
+            "project-name": 'COMPOSE_PROJECT_NAME=x ' + ok,
+            "second-pin": 'COMPOSE_FILE_PINNED="$COMPOSE_DIR/x.yml"\nCOMPOSE_FILE_PINNED=/other.yml\n' + ok,
+            "export-dir": 'export COMPOSE_DIR\n' + ok,
+        }.items():
+            self.assertTrue(_compose_pin_refusals(text), "row %s is not refused" % row)
+        listing = sorted(INFRA_ALLOWED)
+        self.assertEqual(_infra_dir_refusals(listing + [".userlist.generated.r1.txt"]), [])
+        for row, extra in {
+            "override-yaml": "compose.override.yaml",
+            "override-yml": "docker-compose.override.yml",
+            "compose-yaml": "compose.yaml",
+            "docker-compose-yaml": "docker-compose.yaml",
+            "dotenv": ".env",
+            "named-env": "smoke.env",
+            "stray": "notes.txt",
+        }.items():
+            self.assertTrue(_infra_dir_refusals(listing + [extra]), "row %s is not refused" % row)
+        self.assertTrue(_infra_dir_refusals([n for n in listing if n != "docker-compose.yml"]), "no compose file")
 
     def test_scripts_generate_random_password(self):
         for path in SCRIPTS:
@@ -844,21 +1045,22 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
     def _close_group(stack, out, tail):
         """Pop the top group and, for ( ) { } and do..done, record whether it can be neutralised."""
         group = stack.pop()
-        if group["kind"] in ("p", "case"):
+        if group["kind"] == "p":
             return
         sub_fail = group["fail"] and group["kind"] == "("
-        piped = bool(GROUP_OR_NEUTRAL.match(tail) or GROUP_PIPED.match(tail))
-        group["bad"] = group["fail"] and (sub_fail or piped)
-        group["why"] = "subshell" if sub_fail else "closes with or-true or in a pipeline"
+        unsafe = not GROUP_CLOSER_OK.match(tail)
+        group["bad"] = group["fail"] and (sub_fail or unsafe)
+        group["why"] = "subshell" if sub_fail else "a token other than end of line, ; ;; && or a closer follows it"
         out.append(("%s %s%s" % (group["at"], "$" if group["sub"] else "", group["kind"]), group))
 
     @staticmethod
     def _groups(lines, name):
-        """r11 Q15 + r12 N2/N5: every ( ) { } and do..done group over the code lines (case..esac
-        is tracked so a pattern paren pops nothing), across lines, outside quotes, comments and
-        heredoc bodies; returns (location, group). group["bad"] is set when a FAIL echo sits inside
-        a subshell, or in a group that closes with `|| true`, `|| :` or `|| echo ...`, or is a
-        pipeline element followed by `| ... || true`. A closer with no opener RAISES (fail closed)."""
+        """r11 Q15 + r12 N2/N5 + r13 K2: every ( ) { } do..done if..fi (elif and else arms belong to
+        the if) and case..esac group over the code lines (a case pattern paren pops nothing),
+        across lines, outside quotes, comments and heredoc bodies; returns (location, group).
+        group["bad"] is set when a FAIL echo sits inside a subshell, or in a group whose closer is
+        followed by anything but end of line, `;`, `;;`, `&&` or an enclosing closer (r13 K3: a
+        redirect, a pipe, `||`, a lone `&`). A closer with no opener RAISES (fail closed)."""
         out, stack, heredoc, in_sq = [], [], None, False
         for n, raw in enumerate(lines):
             if heredoc:
@@ -903,10 +1105,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                     after = ln[i + len(word) : i + len(word) + 1]
                     step = len(word)
                     if after == "" or after in " \t;&|()":
-                        if word in ("do", "case"):
+                        if word in ("do", "case", "if"):
                             stack.append({"kind": word, "sub": False, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
-                        elif word in ("done", "esac"):
-                            if top != {"done": "do", "esac": "case"}[word]:
+                        elif word in ("done", "esac", "fi"):
+                            if top != {"done": "do", "esac": "case", "fi": "if"}[word]:
                                 raise AssertionError("%s: line %d col %d: %s with no matching opener" % (name, n + 1, i + 1, word))
                             PgbouncerSmokeComposeTest._close_group(stack, out, ln[i + len(word) :])
                 i += step
@@ -930,8 +1132,29 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # r12 N2: a loop is a group (F3 bad, F3b legit); N5: a case pattern paren pops nothing (F11 bad)
         self.assertEqual(bad(["cat x | while read l; do", 'echo "FAIL: a" >&2; exit 1', "done || true"]), [True])
         self.assertEqual(bad(["cat x | while read l; do", 'echo "FAIL: a" >&2; exit 1', "done"]), [False])
-        self.assertEqual(bad(["( case $x in", '0) echo "FAIL: a" >&2; exit 1 ;;', "esac ) || echo ok"]), [True])
-        self.assertEqual(bad(['case $x in', '0) echo "FAIL: a" >&2; exit 1 ;;', "esac"]), [])
+        self.assertEqual(bad(["( case $x in", '0) echo "FAIL: a" >&2; exit 1 ;;', "esac ) || echo ok"]), [False, True])
+        self.assertEqual(bad(['case $x in', '0) echo "FAIL: a" >&2; exit 1 ;;', "esac"]), [False])
+        # r13 K2: if..fi (elif and else arms included) and case..esac are groups the closer rule covers
+        fail = 'echo "FAIL: a" >&2; exit 1'
+        self.assertEqual(bad(["cat x | if true; then", fail, "fi || true"]), [True])
+        self.assertEqual(bad(["cat x | if true; then :; elif false; then", fail, "else :; fi || true"]), [True])
+        self.assertEqual(bad(["cat x | case $x in", "0) " + fail + " ;;", "esac || true"]), [True])
+        self.assertEqual(bad(["if true; then", fail, "fi"]), [False])
+        self.assertEqual(bad(["if true; then", "if false; then", fail, "fi", "fi"]), [False, False])
+        # r13 K3 + S17: a redirect, a pipe, `||` with anything, a lone `&` after the closer are refused;
+        # end of line, `;`, `&&`, `;;`, an enclosing closer are not.
+        loop = ["cat x | while read l; do", fail]
+        for tail in ("done 2>&1 || true", "done </dev/null | cat || true", "done || printf ok", "done || /bin/true",
+                     "done || command true", "done &", "done | cat", "done > /dev/null", "done >> x", "done &> x", "done 2> x",
+                     "done < x", "done || :", "done || echo ok", "done ;&"):
+            self.assertEqual(bad(loop + [tail]), [True], tail)
+        for tail in ("done", "done;", "done && :", "done ; :"):
+            self.assertEqual(bad(loop + [tail]), [False], tail)
+        self.assertEqual(bad(["{ " + fail + "; } 2>&1 || true"]), [True])
+        self.assertEqual(bad(["{ " + fail + "; } | cat || /bin/true"]), [True])
+        self.assertEqual(bad(["{ " + fail + "; } &"]), [True])
+        self.assertEqual(bad(["{ " + fail + "; } && :"]), [False])
+        self.assertEqual(bad(["if true; then", "{ " + fail + "; }", "fi"]), [False, False])
         for unmatched in (["echo a )"], ["echo a }"], ["done"], ["esac"], ["case x in", "a) : ;;"], ["do : "]):
             with self.assertRaises(AssertionError, msg=unmatched):
                 self._groups(unmatched, "t")
@@ -940,6 +1163,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             "; exit() { :; }", "&& cleanup() { :; }", "|| alias x=y", "{ exit() { :; }", "( exit() { :; }", "true | exit() { :; }",
             "if true; then exit() { :; }; fi", "do exit() { :; }", "&& ! exit() { :; }", "else function exit { :; }",
             "elif true; then alias exit=true", "then cleanup() { :; }", "time exit() { :; }", "! exit() { :; }",
+            # r13 K1 + S16: after a case pattern paren and after the if, while and until keywords
+            "case $x in *) exit() { :; } ;; esac", "case 1 in 1) function exit { :; } ;; esac", "case 1 in 1) alias exit=true ;; esac",
+            "if exit() { :; }; then", "while exit() { :; }; do", "until exit() { :; }; do", "if function exit { :; }; then",
+            "while alias exit=true; do", "until cleanup() { :; }; do",
         ):
             self.assertTrue(FUNCTION_DEF.search(text) or ALIAS_DEF.search(text), text)
         self.assertFalse(FUNCTION_DEF.search('x="$(date)"') or ALIAS_DEF.search("echo alias_set"))

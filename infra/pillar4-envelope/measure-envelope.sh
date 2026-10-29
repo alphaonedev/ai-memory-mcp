@@ -61,7 +61,6 @@ export POSTGRES_PASSWORD="$PW"
 PGBOUNCER_UID="$(id -u)"
 PGBOUNCER_GID="$(id -g)"
 export PGBOUNCER_UID PGBOUNCER_GID
-POOL_COMPOSE="../pgbouncer/docker-compose.yml"
 # Per-run suffix (#4734): the compose project, container names and the userlist
 # file are derived from it so two concurrent runs never recreate each other's
 # containers and one trap only removes its own project. Override with
@@ -96,11 +95,18 @@ RESULTS_DIR="${RESULTS_DIR:-./.local-runs/envelope-$$}"
 mkdir -p "$RESULTS_DIR"
 DAEMON_PID=""
 
+# Compose is pinned (#4734 r13): every `docker compose` call passes -f of this one file and
+# --project-directory of its directory, so a compose.override file, a compose.yaml, a .env
+# that sets COMPOSE_FILE or an inherited COMPOSE_FILE is never read. With -f given, compose
+# does not discover files and ignores COMPOSE_FILE (tested with Docker Compose v5.6.0).
+COMPOSE_DIR="$PWD/../pgbouncer"
+COMPOSE_FILE_PINNED="$COMPOSE_DIR/docker-compose.yml"
+
 cleanup() {
   rc=$?
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
   # POSTGRES_PASSWORD is exported above, so interpolation cannot fail here.
-  docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }
+  docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }
   if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then
     echo "FATAL: compose project $PROJECT still running after teardown" >&2
     rc=1
@@ -125,7 +131,7 @@ BIN="$(cd ../.. && echo "$PWD/target/release/ai-memory")"
 # ── 2. Bring up the 4.B pooled stack ─────────────────────────────────────
 echo "[2/5] bringing up postgres+AGE + pgbouncer (4.B stack) ..."
 PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"
-POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait postgres
+POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait postgres
 # SCRAM end to end (#4732): bring up postgres first (default scram-sha-256
 # auth), then render the pooler userlist from the role's own stored SCRAM
 # verifier. pgbouncer 1.23 uses SCRAM when the userlist entry is a
@@ -142,7 +148,7 @@ esac
 # 0644 userlist would otherwise keep its mode (N4).
 rm -f "$USERLIST"
 (umask 077; printf '%s\n' "$VERIFIER_ROW" > "$USERLIST")
-POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait
+POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait
 
 # ── 3. schema-init + serve THROUGH the pooler ────────────────────────────
 echo "[3/5] schema-init + serve (admission cap=${ADMISSION_CAP}) through pgbouncer:6432 ..."

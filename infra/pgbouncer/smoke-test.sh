@@ -74,10 +74,17 @@ PROJECT="ai-memory-pgbouncer-smoke-$RUN"
 PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"
 USERLIST=".userlist.generated.$RUN.txt"
 
+# Compose is pinned (#4734 r13): every `docker compose` call passes -f of this one file and
+# --project-directory of its directory, so a compose.override file, a compose.yaml, a .env
+# that sets COMPOSE_FILE or an inherited COMPOSE_FILE is never read. With -f given, compose
+# does not discover files and ignores COMPOSE_FILE (tested with Docker Compose v5.6.0).
+COMPOSE_DIR="$PWD"
+COMPOSE_FILE_PINNED="$COMPOSE_DIR/docker-compose.yml"
+
 cleanup() {
   rc=$?
   # POSTGRES_PASSWORD is exported above, so interpolation cannot fail here.
-  docker compose -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }
+  docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }
   if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then
     echo "FATAL: compose project $PROJECT still running after teardown" >&2
     rc=1
@@ -88,7 +95,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[1/4] bringing up postgres+AGE, then pgbouncer with a SCRAM userlist ..."
-POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait postgres
+POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait postgres
 # SCRAM end to end (#4732): bring up postgres first (default scram-sha-256
 # auth), then render the pooler userlist from the role's own stored SCRAM
 # verifier. pgbouncer 1.23 uses SCRAM when the userlist entry is a
@@ -105,7 +112,7 @@ esac
 # 0644 userlist would otherwise keep its mode (N4).
 rm -f "$USERLIST"
 (umask 077; printf '%s\n' "$VERIFIER_ROW" > "$USERLIST")
-POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait
+POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait
 
 # psql THROUGH the pooler is run from inside the postgres container (it has
 # psql and shares the compose network, so `pgbouncer` resolves).

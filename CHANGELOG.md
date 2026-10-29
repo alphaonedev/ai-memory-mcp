@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   top-level key besides `name` and `services` are refused); a definition after `then`, `do`, `else`, `elif`,
   `time` or `!` is read; the group scan tracks loops and `case`, and refuses a closer with no opener; a trailing
   comment cannot open a heredoc; both script headers match the exit codes their script uses.
+  Round 13: the compose scan reads the decoded YAML scalars with PyYAML (the guard fails when PyYAML is
+  absent) and refuses escapes, block scalars, folded joins, multi-line flow collections and a `$` in a quoted
+  scalar; every `docker compose` call passes `-f` of the one pinned file and `--project-directory`, and the
+  infra directory may hold no override file or `.env`; a definition after a case-pattern `)` or after
+  `if`, `while` or `until` is read; the group scan tracks `if`..`fi` and `case`..`esac`, and a group with a
+  FAIL site may be followed only by end of line, `;`, `&&`, `;;`, `fi`, `done`, `esac`, `)` or `}`.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 
