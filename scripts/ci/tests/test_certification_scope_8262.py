@@ -18,6 +18,7 @@ single source of truth for what the GA candidate certifies. This guard pins:
   statement anchor or quotes the canonical paragraph verbatim, and that no
   stale "#1968 open" wording returns.
 """
+import bisect
 import pathlib
 import re
 import unicodedata
@@ -111,18 +112,37 @@ _T = "(?:" + E2E_TERM + ")"
 _STEM_RE = re.compile(_STEM, re.IGNORECASE)
 # A stem inside a path or file name token (01-secure-bootstrap.sh, docs/encryption.html) names a
 # file, not a claim. A file name token is lower case, holds only word characters, dots, slashes and
-# hyphens, and either contains a slash or ends in one of the known extensions below; "encrypted.It"
-# (a missing space) and "encrypt-everything" are words, not files. A bare "secure" or
-# "end-to-end-encrypted" in the same sentence is still a stem. Each token is classified once.
+# hyphens, and is one of: a token ending in a known extension; a bare known file name (Cargo.toml,
+# README.md, CHANGELOG.md, ROADMAP.md, LICENSE); a token with a slash that starts with ./, ../, /, a
+# repository top-level directory, a host name (first segment holds a dot), a directory (trailing
+# slash) or a dotted segment (deploy/asi-hard.env, cert-1/posture.out). A slash token whose
+# segments are all words of this scan (encrypted/sealed, encrypted/signed) is a prose alternation,
+# never a file. "encrypted.It" (a missing space) and "encrypt-everything" are words, not files. A
+# bare "secure" or "end-to-end-encrypted" in the same sentence is still a stem. Each token is
+# classified once.
 _FILE_EXTS = (".md", ".sh", ".py", ".rs", ".html", ".toml", ".yml", ".yaml", ".json", ".txt", ".lock")
+_DOTTED_SEGMENT_RE = re.compile(r"[\w-]\.[a-z]")
+_FILE_BARE = frozenset(["Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "ROADMAP.md", "LICENSE"])
+_FILE_ROOTS = ("./", "../", "/", "docs/", "src/", "scripts/", "tests/", "migrations/", "infra/",
+               "benches/", "examples/", "cookbook/", "tools/", ".github/")
+_SCAN_WORDS = frozenset(["encrypted", "sealed", "signed", "certified", "deferred", "scope", "live",
+                         "landed"])
 _FILE_CHARS_RE = re.compile(r"[\w./-]+")
 _TOKEN_EDGE = "()[]{}<>\"',;:!?"
 
 
 def _is_file_token(token):
-    token = token.strip(_TOKEN_EDGE)
-    return (token == token.lower() and _FILE_CHARS_RE.fullmatch(token) is not None
-            and ("/" in token or token.endswith(_FILE_EXTS)))
+    token = token.strip(_TOKEN_EDGE).rstrip(".").strip(_TOKEN_EDGE)
+    if token in _FILE_BARE:
+        return True
+    if token != token.lower() or _FILE_CHARS_RE.fullmatch(token) is None:
+        return False
+    if token.endswith(_FILE_EXTS):
+        return True
+    if "/" not in token or all(seg in _SCAN_WORDS for seg in token.split("/")):
+        return False
+    return (token.startswith(_FILE_ROOTS) or token.endswith("/") or "." in token.split("/", 1)[0]
+            or _DOTTED_SEGMENT_RE.search(token) is not None)
 
 
 def _has_claim_stem(sent):
@@ -135,6 +155,31 @@ def _strip_cf(text):
     if text.isascii():
         return text
     return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
+# Cyrillic and Greek look-alike letters are mapped to Latin once, with NFKC, before any scan
+# ("sc" + Cyrillic o + "pe" is "scope"). Code points are written as integers so the source stays ASCII.
+_CONFUSABLE_PAIRS = (
+    (0x0430, "a"), (0x0435, "e"), (0x043E, "o"), (0x0440, "p"), (0x0441, "c"), (0x0445, "x"),
+    (0x0443, "y"), (0x0456, "i"), (0x0458, "j"), (0x0501, "d"), (0x0475, "v"), (0x0455, "s"),
+    (0x04BB, "h"), (0x051B, "q"), (0x051D, "w"), (0x04CF, "l"),
+    (0x0410, "A"), (0x0412, "B"), (0x0415, "E"), (0x041A, "K"), (0x041C, "M"), (0x041D, "H"),
+    (0x041E, "O"), (0x0420, "P"), (0x0421, "C"), (0x0422, "T"), (0x0425, "X"), (0x0405, "S"),
+    (0x0406, "I"), (0x0408, "J"),
+    (0x03BF, "o"), (0x03BD, "v"), (0x03C1, "p"), (0x03C4, "t"), (0x03C5, "u"), (0x03BA, "k"),
+    (0x03B9, "i"), (0x03B1, "a"), (0x03B5, "e"),
+    (0x0391, "A"), (0x0392, "B"), (0x0395, "E"), (0x0396, "Z"), (0x0397, "H"), (0x0399, "I"),
+    (0x039A, "K"), (0x039C, "M"), (0x039D, "N"), (0x039F, "O"), (0x03A1, "P"), (0x03A4, "T"),
+    (0x03A5, "Y"), (0x03A7, "X"),
+)
+_CONFUSABLES = dict(_CONFUSABLE_PAIRS)
+
+
+def _normalise(text):
+    """Format characters dropped, NFKC applied, Cyrillic and Greek look-alikes mapped to Latin."""
+    if text.isascii():
+        return text
+    return unicodedata.normalize("NFKC", _strip_cf(text)).translate(_CONFUSABLES)
 
 
 E2E_ABBR_RE = re.compile(E2E_ABBR)
@@ -150,7 +195,7 @@ class _E2EGate:
 
     @staticmethod
     def search(unit):
-        unit = _strip_cf(unit)
+        unit = _normalise(unit)
         if E2E_SLUG_RE.search(unit) or E2E_ABBR_RE.search(unit):
             return True
         for sent in SENTENCE_SPLIT_RE.split(_plain(unit)):
@@ -210,23 +255,41 @@ _DEFER = (r"\b(?:is|are|was|were|be|been|being|remains?|remained|gets?|got)\s+(?
           + _PAST + r"\b|\b" + _PAST + r"\s+(?:to|until|till|past|beyond|after|post|for)\b"
           r"|\b(?:defers?|postpones?|punts?)\b|\bdeferred\s+set\b")
 _MOVE = (r"\b(?:slip|push|mov|punt|defer|postpon|land|ship|come|arriv|plann|schedul|target|slat"
-         r"|aim|due|retarget|re-target)\w*\b")
+         r"|aim|due|retarget|re-target|expect)\w*\b")
 _REMOVED = r"\bremoved\s+from\s+(?:the |ga |v1\.0\.0 |\w+ ){0,3}scope\b"
-_EXCLUDE = (r"\b(?:not|never|no\s+longer)\b(?:\W+\w+){0,3}?\W+"
-            r"(?:part\s+of|in|included\s+in|ship\w*|land\w*)\b[^.;]{0,30}?\b(?:v1\.0\.0|GA)\b"
-            r"|\bexclud\w*\s+from\b|\bdescoped\b"
+_NOT_GA = (r"\b(?:not|never|no\s+longer)\b(?:\W+\w+){0,3}?\W+"
+          r"(?:part\s+of|in|included\s+in|ship\w*|land\w*)\b[^.;]{0,30}?\b(?:v1\.0\.0|GA)\b")
+_NOT_GA_RE = re.compile(_NOT_GA, re.IGNORECASE)
+_GA_WORD_RE = re.compile(r"\bGA\b|v1\.0\.0", re.IGNORECASE)
+_EXCLUDE = (r"\bexclud\w*\s+from\b|\bdescoped\b"
             r"|\b(?:planned|scheduled|targeted|slated|tracked)\s+for\s+(?:\w+\s+){0,2}" + _LATER
-            + r"|\ban?\s+" + _LATER + r"\s+(?:item|feature|deliverable|milestone|target)\b")
-UNDER_RE = re.compile(_DEFER + "|" + _MOVE + r"(?:\W+\w+){0,4}?\W+" + _LATER + "|" + _REMOVED
-                      + "|" + _EXCLUDE, re.IGNORECASE)
+            + r"|\b(?:an?\s+)?" + _LATER + r"\s+(?:item|feature|deliverable|milestone|target)s?\b"
+            # Moved out of, dropped from, cut from GA or v1.0.0; missing or not making it; out of GA.
+            + r"|\b(?:moved|pushed|dropped|cut|taken|pulled|removed|bumped)\s+(?:out\s+of|from|off)"
+            r"\s+(?:\w+\s+){0,3}?(?:v1\.0\.0|GA)\b"
+            + r"|\b(?:miss(?:es|ed)?|(?:will|does|did|do|would)\s+not\s+make|won't\s+make"
+            r"|fail(?:s|ed)?\s+to\s+make)\s+(?:the\s+)?(?:v1\.0\.0\s+)?(?:GA|v1\.0\.0)\b"
+            + r"|\b(?:out\s+of|outside)\s+(?:the\s+)?(?:v1\.0\.0\s+)?(?:GA|v1\.0\.0)\b")
+UNDER_RE = re.compile(_DEFER + "|" + _REMOVED + "|" + _EXCLUDE, re.IGNORECASE)
+# The move branch runs only on a sentence that holds a later-version token (cheap gate first).
+MOVE_LATER_RE = re.compile(_MOVE + r"(?:\W+\w+){0,10}?\W+" + _LATER, re.IGNORECASE)
 # Subjects: the end-to-end term, content encryption, #8278, and variant A or B (upper case letter).
 UNDER_SUBJECT_RE = re.compile(E2E_TERM + r"|content\s+encryption|#8278|(?-i:\b[Vv]ariants?\s+[AB]\b)",
                               re.IGNORECASE)
 NAMED_SUBJECT_RE = re.compile(r"#8278|(?-i:\b[Vv]ariants?\s+[AB]\b)", re.IGNORECASE)
 _NAMED_DEFER = re.compile(r"\b(?:deferr(?:ed|al)|postponed|descoped?)\b(?!-)", re.IGNORECASE)
+_LATER_RE = re.compile(_LATER, re.IGNORECASE)
+# A scope sentence with a carve-out is a narrowing: except / save for / other than / apart from /
+# excluding, "for variant A only", "but variant B is not", "until v1.1". Refused in every file.
+SCOPE_WORD_RE = re.compile(r"\bscope\b|\bGA\b|v1\.0\.0", re.IGNORECASE)
+CARVE_RE = re.compile(r"\b(?:except|save\s+for|other\s+than|apart\s+from|excluding)\b"
+                      r"|\bbut\b[^.;]{0,60}?\b(?:is|are|was|were)\s+not\b"
+                      r"|(?-i:\bvariants?\s+[AB]\s+only\b|\bonly\s+(?:for\s+|in\s+)?variants?\s+[AB]\b)"
+                      r"|\buntil\s+" + _LATER, re.IGNORECASE)
 # The dated supersession note, ROADMAP.md:986: "(Superseded by #8278 on 2026-10-28: federation
 # content encryption was removed from this deferred set and is in v1.0.0 GA scope." Only this whole
-# true clause is exempt, only in ROADMAP.md, and only after the negated form is refused.
+# true sentence (ROADMAP_EXEMPT, exact after whitespace normalisation) is exempt, only in ROADMAP.md,
+# and only after the negated form is refused; any text before or after it is scanned in full.
 DEFERRED_CLAUSE = ("federation content encryption was removed from this deferred set "
                    "and is in v1.0.0 GA scope")
 ROADMAP_REL = "ROADMAP.md"
@@ -237,16 +300,70 @@ NEG_REMOVED_RE = re.compile(r"\b(?:not|never)\b(?:\W+\w+){0,2}?\W+removed\s+from
 SENTENCE_SPLIT_RE = re.compile(r"(?<!\b[eE]\.g)(?<!\b[iI]\.e)(?<!\b[eE][tT][cC])[.;]\s")
 
 
-def _underclaims(sent, rel=None):
-    """True for a sentence about the term or #8278 that defers it or puts it out of GA scope."""
-    if NEG_REMOVED_RE.search(sent):
+# The exempt ROADMAP sentence, whole: sentence boundary to sentence boundary after whitespace
+# normalisation. Any leading or trailing text makes it a different sentence, which is scanned in full.
+ROADMAP_EXEMPT = "(Superseded by #8278 on 2026-10-28: " + DEFERRED_CLAUSE
+
+
+def _underclaims(sent, rel=None, strict=False):
+    """True for a sentence about the term or #8278 that defers it or puts it out of GA scope.
+    A table row, and any statement sentence (strict), also refuses a named subject plus a later
+    version; a scope sentence with a carve-out is refused everywhere."""
+    if "removed" in sent.lower() and NEG_REMOVED_RE.search(sent):
         return True
+    if rel == ROADMAP_REL and _flat(sent).strip() == ROADMAP_EXEMPT:
+        return False
     if not UNDER_SUBJECT_RE.search(sent):
         return False
-    if rel == ROADMAP_REL:
-        sent = sent.replace(DEFERRED_CLAUSE, "")
+    named_later = ((strict or sent.lstrip().startswith("|")) and NAMED_SUBJECT_RE.search(sent)
+                   and _LATER_RE.search(sent))
     return bool(UNDER_RE.search(sent) or any(rx.search(sent) for rx in SCOPE_REFUSED[:2])
-                or (NAMED_SUBJECT_RE.search(sent) and _NAMED_DEFER.search(sent)))
+                or (_LATER_RE.search(sent) and MOVE_LATER_RE.search(sent))
+                or (_GA_WORD_RE.search(sent) and _NOT_GA_RE.search(sent))
+                or (NAMED_SUBJECT_RE.search(sent) and _NAMED_DEFER.search(sent))
+                or (SCOPE_WORD_RE.search(sent) and CARVE_RE.search(sent)) or named_later)
+
+
+# Over-claims keyed on the same subjects as the under-claims (#8278, variant A or B, content
+# encryption): a landed, shipped, live, certified, enabled, available or encrypted predicate, or a
+# plaintext or reader consequence, unless a condition or a negation stands in the 40 characters
+# before it ("only when #8278 has landed", "is not live today").
+OVERCLAIM_SUBJECT_RE = re.compile(r"#8278|(?-i:\b[Vv]ariants?\s+[AB]\b)|content\s+encryption",
+                                  re.IGNORECASE)
+OVERCLAIM_PRED_RE = re.compile(
+    r"\b(?:landed|shipped|merged|certified|completed?|done|live|available|enabled|encrypts?|encrypted"
+    r"|on\s+by\s+default|in\s+GA(?!\s+scope))\b"
+    r"|\bno\s+longer\s+(?:store|see|hold)\w*\s+plaintext\b|\bpeers\s+cannot\s+read\b", re.IGNORECASE)
+OVERCLAIM_HEDGE_RE = re.compile(r"\b(?:not|never|nor|until|unless|once|when|if|before|after|pending|yet"
+                                r"|cannot)\b|\bno\b(?!\s+longer)", re.IGNORECASE)
+HEDGE_WINDOW = 40
+SUBJECT_REACH = 70
+
+
+def _overclaims(sent):
+    """True for a sentence that states #8278, variant A or B or content encryption as fact: a
+    predicate within SUBJECT_REACH characters of a subject (either order) and not hedged."""
+    spans = [(m.start(), m.end()) for m in OVERCLAIM_SUBJECT_RE.finditer(sent)]
+    if not spans:
+        return False
+    firsts = [s for s, _ in spans]
+    for m in OVERCLAIM_PRED_RE.finditer(sent):
+        if OVERCLAIM_HEDGE_RE.search(sent[max(0, m.start() - HEDGE_WINDOW):m.start()]):
+            continue
+        k = bisect.bisect_right(firsts, m.start())
+        before = m.start() - spans[k - 1][1] if k else SUBJECT_REACH + 1
+        after = spans[k][0] - m.end() if k < len(spans) else SUBJECT_REACH + 1
+        if min(before, after) <= SUBJECT_REACH:
+            return True
+    return False
+
+
+def _sentence_problem(sent, rel=None, statement=False):
+    """The one sentence check shared by the docs scan, the statement scan and the self-tests."""
+    if _underclaims(sent, rel, strict=statement):
+        return "under-claim"
+    return "over-claim" if _overclaims(sent) else None
+
 
 LANDING = "landed on release/v1.0.0"
 # The one pointer sentence quoted in every file that mentions end-to-end content encryption.
@@ -322,7 +439,7 @@ def _items(body):
 def _plain(text):
     """Flatten and drop markdown emphasis, backticks and link targets before wording scans."""
     text = re.sub(r"\]\([^)]*\)", "]", text)
-    return _flat(re.sub(r"[*`]", "", _strip_cf(text)))
+    return _flat(re.sub(r"[*`]", "", _normalise(text)))
 
 
 # The statement is scanned like every other place, except for the two true sentences it exists to
@@ -435,11 +552,11 @@ class CertificationScope8262(unittest.TestCase):
 
     def _scoped_text(self, rel):
         """The part of a file this guard scans: outside the statement, history lines removed."""
-        return "\n".join(ln for ln in self._text(rel).splitlines()
+        return "\n".join(ln for ln in _normalise(self._text(rel)).splitlines()
                          if not HISTORY_LINE_RE.match(ln))
 
     def _history(self, rel):
-        return [ln for ln in self._text(rel).splitlines() if HISTORY_LINE_RE.match(ln)]
+        return [ln for ln in _normalise(self._text(rel)).splitlines() if HISTORY_LINE_RE.match(ln)]
 
     def _text(self, rel):
         text = _read(rel)
@@ -457,9 +574,9 @@ class CertificationScope8262(unittest.TestCase):
             self.assertIsNone(STALE_RE.search(text), rel + " carries a stale '#1968 open' claim")
             for unit in _units(text):
                 for sent in SENTENCE_SPLIT_RE.split(_plain(unit)):
-                    self.assertFalse(_underclaims(sent, rel),
-                                     "end-to-end scope pushed past v1.0.0 (under-claim) in "
-                                     + rel + ": " + sent[:100])
+                    self.assertIsNone(_sentence_problem(sent, rel),
+                                      "end-to-end scope under-claim or over-claim in "
+                                      + rel + ": " + sent[:100])
                 if not E2E_GATE.search(unit):
                     continue
                 raw = _flat(unit)
@@ -485,7 +602,8 @@ class CertificationScope8262(unittest.TestCase):
         for unit in _units(_subsection()):
             plain = _neutral_statement(_plain(unit))
             for sent in SENTENCE_SPLIT_RE.split(plain):
-                self.assertFalse(_underclaims(sent), "statement under-claim: " + sent[:100])
+                self.assertIsNone(_sentence_problem(sent, statement=True),
+                                  "statement under-claim or over-claim: " + sent[:100])
             if E2E_GATE.search(plain):
                 self._refuse_overclaim(plain, "statement: " + plain[:100], landing_ok=False)
 
@@ -621,7 +739,7 @@ class CertificationScope8262(unittest.TestCase):
         # The dated ROADMAP supersession note is a true statement, not an under-claim: exempt as the
         # whole clause, in ROADMAP.md only, and never in its negated or conjoined forms.
         note = ("(Superseded by #8278 on 2026-10-28: federation content encryption was removed "
-                "from this deferred set and is in v1.0.0 GA scope.")
+                "from this deferred set and is in v1.0.0 GA scope. Next sentence.")
         self.assertFalse(any(_underclaims(s, ROADMAP_REL) for s in SENTENCE_SPLIT_RE.split(note)))
         self.assertTrue(_underclaims(note, "SECURITY.md"), "the exemption is ROADMAP.md only")
         for s in ["#8278 was not removed from this deferred set.",
@@ -662,6 +780,116 @@ class CertificationScope8262(unittest.TestCase):
         self.assertIsNone(HISTORY_LINE_RE.match("2026-10-29: new dated line"))
         for s in ["#1968 is still unresolved.", "#1968 remains open.", "Open item #1968."]:
             self.assertIsNotNone(STALE_RE.search(s), s)
+
+    def _statement_rows(self, sentence):
+        """The sentence as a statement sentence, before the canon, after it and as a paragraph."""
+        canon = _plain(E2E_CANON)
+        for text in (sentence + " " + canon, canon + " " + sentence, canon + "\n\n" + sentence):
+            plain = _neutral_statement(_plain(text))
+            yield any(_sentence_problem(s, statement=True) for s in SENTENCE_SPLIT_RE.split(plain))
+
+    def test_overclaims_are_keyed_on_the_scope_subjects(self):
+        # Round 10 (security MEDIUM 1): #8278, variant A or B and content encryption are refused
+        # with a landed, shipped, live, certified, enabled, available or encrypted predicate even
+        # when no end-to-end term is present, in every file and in the statement.
+        refused = ["#8278 has landed on release/v1.0.0 with its tests green.",
+                   "Variants A and B are now live.",
+                   "Content encryption for federation (#8278) is live.",
+                   "#8278 shipped, so peers no longer store plaintext.",
+                   "#8278 is merged.", "#8278 is certified.", "Variant A is complete.",
+                   "Variant B is completed.", "Content encryption is done.",
+                   "Content encryption is in GA.", "Content encryption is available.",
+                   "Variant B is on by default.", "Content encryption is enabled by default.",
+                   "Federation content encryption encrypts every row.",
+                   "With #8278 peers cannot read content.", "Live: #8278.",
+                   "Shipped in v1.0.0: variants A and B."]
+        for s in refused:
+            self.assertEqual(_sentence_problem(s), "over-claim", s)
+            self.assertEqual(_sentence_problem(s, statement=True), "over-claim", s)
+            self.assertTrue(all(self._statement_rows(s)), s)
+        # A condition or a negation before the predicate is the true statement, not an over-claim.
+        for s in ["Content encryption is not live today.", "#8278 is in v1.0.0 GA scope.",
+                  "The certification is issued only when #8278 has landed on release/v1.0.0 "
+                  "with its tests green.",
+                  "Until #8278 lands, peers replicate and store plaintext content.",
+                  "Peers are still plaintext; #8278 has not shipped."]:
+            self.assertIsNone(_sentence_problem(s), s)
+        # A predicate far from every subject is about something else (a measured table row).
+        self.assertFalse(_overclaims("The content encryption status is stated only in the scope "
+                                     "statement, which links the tracking issue and the rest of the "
+                                     "audit trail, so the transport shipped plaintext."))
+
+    def test_scope_carve_outs_are_refused_everywhere(self):
+        # Round 10 (security LOW 1 = code LOW 3): a scope sentence with a carve-out is a narrowing.
+        refused = ["#8278 is in v1.0.0 GA scope, except variant B.",
+                   "#8278 is in v1.0.0 GA scope, but variant B is not.",
+                   "Federation content encryption is in v1.0.0 GA scope for variant A only.",
+                   "#8278 is in v1.0.0 GA scope, only for variant A.",
+                   "#8278 is in v1.0.0 GA scope until v1.1.",
+                   "#8278 is in GA scope save for variant B.",
+                   "#8278 is in GA scope other than variant B.",
+                   "#8278 is in GA scope apart from variant B."]
+        for s in refused:
+            for rel in (None, "SECURITY.md", ROADMAP_REL):
+                self.assertTrue(_underclaims(s, rel), (rel, s))
+            self.assertTrue(all(self._statement_rows(s)), s)
+        # The ROADMAP exemption is the whole sentence: text before or after it, even a carve-out,
+        # puts the sentence back into the scan.
+        for tail in [", except variant B.", " for variant A only.", ", but variant B is not.",
+                     " until v1.1.", ", save for variant B.", ", other than variant B."]:
+            self.assertTrue(_underclaims(ROADMAP_EXEMPT + tail, ROADMAP_REL), tail)
+        self.assertTrue(_underclaims("Note: " + ROADMAP_EXEMPT, ROADMAP_REL))
+        self.assertFalse(_underclaims(ROADMAP_EXEMPT, ROADMAP_REL))
+        self.assertFalse(_underclaims("  " + ROADMAP_EXEMPT.replace(" ", "  ") + " ", ROADMAP_REL))
+
+    def test_underclaim_exclusion_and_scheduling_forms(self):
+        # Round 10 (code LOW 2): exclusion, drop, miss and later-version wordings; a table row with
+        # the subject and a later version; statement sentences with a named subject and a later one.
+        refused = ["#8278 was moved out of GA.", "#8278 was dropped from GA.",
+                   "#8278 was cut from v1.0.0.", "#8278 will not make GA.", "#8278 misses GA.",
+                   "#8278 slips (per the operator ruling of 2026-10-28) to v1.1.",
+                   "#8278 is planned, per the operator ruling, for v1.1.",
+                   "| Federation end-to-end content encryption | v1.1 item |",
+                   "#8278 is out of GA.", "| #8278 | v1.1 |", "| #8278 | after GA |",
+                   "#8278 is expected in v1.1.", "#8278 is not expected before v1.1.",
+                   "Variant B was dropped from v1.0.0.", "#8278 is pushed out of the GA release.",
+                   "Variants A and B will not make v1.0.0."]
+        for s in refused:
+            self.assertTrue(_sentence_problem(s, statement=True), s)
+        for s in refused:
+            self.assertTrue(_sentence_problem(s), s)
+        # Accepted: a pronoun, an unrelated later version, and the true landing sentence.
+        for s in ["It will not make GA.", "Other items were dropped from v1.0.0.",
+                  "#8278 landed on release/v1.0.0 for GA."]:
+            self.assertFalse(_underclaims(s), s)
+
+    def test_file_tokens_and_confusables(self):
+        # Round 10 (code LOW 1): encrypted/sealed and encrypted/signed are prose alternations.
+        for s in ["Federation content is end-to-end encrypted/sealed and certified for v1.0.0.",
+                  "Federation content is end-to-end encrypted/signed today."]:
+            self.assertTrue(E2E_GATE.search(s), s)
+        for tok in ["encrypted/sealed", "encrypted/signed", "secure/ops", "sealed/signed",
+                    "(encrypted/sealed)", "encrypted.It"]:
+            self.assertFalse(_is_file_token(tok), tok)
+        for tok in ["docs/encryption.html", "src/encryption/mod.rs", "scripts/secure-demo",
+                    "src/encryption/", "01-secure-bootstrap.sh", "Cargo.toml", "README.md",
+                    "(docs/encrypt.md).", "deploy/asi-hard.env", "cert-1/posture-x.out",
+                    "github.com/alphaonedev/ai-memory-mcp/security", "./secure-demo",
+                    "../docs/encryption.md", "/etc/secure", "tests/secure"]:
+            self.assertTrue(_is_file_token(tok), tok)
+        # Round 10 (security INFO): Cyrillic and Greek look-alikes are mapped to Latin once.
+        cyr_o, cyr_e, grk_o = chr(0x043E), chr(0x0435), chr(0x03BF)
+        for s in ["#8278 is out of the GA sc" + cyr_o + "pe.", "#8278 is d" + cyr_e + "ferred to v1.1.",
+                  "Variants A and B are out of sc" + grk_o + "pe."]:
+            self.assertTrue(_plain(s).isascii(), s)
+            self.assertTrue(_underclaims(_plain(s)), s)
+            self.assertTrue(all(self._statement_rows(s)), s)
+        over = "Federation content is end-to-end encrypted and " + chr(0x0441) + "ertified."
+        e2e = "Federation " + chr(0x0415) + "2" + chr(0x0415) + " is live and certified"
+        for s in (over, e2e):
+            self.assertTrue(E2E_GATE.search(s), s)
+            self.assertTrue(any(rx.search(_plain(s)) for rx in SCOPE_REFUSED), s)
+        self.assertTrue(E2E_GATE.search("Federation " + chr(0x0415) + "2" + chr(0x0415) + " is encrypted."))
 
     def test_term_is_spelled_once_and_covers_every_dash(self):
         src = pathlib.Path(__file__).read_text(encoding="utf-8")
