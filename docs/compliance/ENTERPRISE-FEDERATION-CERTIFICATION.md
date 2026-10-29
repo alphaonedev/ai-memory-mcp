@@ -892,6 +892,14 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 - Provenance links refuse a cycle-closing edge, including equal-instant pairs ([#3041](https://github.com/alphaonedev/ai-memory-mcp/issues/3041), closed;
   `src/storage/mod.rs:9512-9514`).
 - Encryption in transit ([#3824](https://github.com/alphaonedev/ai-memory-mcp/issues/3824)) and setup simplicity ([#3830](https://github.com/alphaonedev/ai-memory-mcp/issues/3830)) are closed as met.
+- Quarantine of unattributed inbound writes on Production, Federated and Hive ([#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967), closed;
+  landed by PR [#8269](https://github.com/alphaonedev/ai-memory-mcp/pull/8269) as merge `ffc54bd50`, `file:line` at that SHA): the `federated`,
+  `hive` and `production` shapes pin `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` on at boot when it is unset
+  (`src/config/shape.rs:198-202`, `:672-684`). On `federated` and `hive` a non-truthy value refuses boot (a
+  FLOOR, `src/config/shape.rs:616-633`); on `production` the always-engaged `asi-hard` floor refuses it
+  (`src/security_profile.rs:426-430`). The `/sync/push` reader shares that truthiness grammar
+  (`src/federation/receive_auth.rs:645-649`). `singleton` and `team` keep the permissive default unless
+  `asi-hard` is selected.
 
 **In scope for v1.0.0 GA, certification issued on landing (not certified today):**
 
@@ -906,8 +914,6 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 when its issue closes with a landed SHA on the GA candidate. At the pinned SHA the default is the
 permissive one named here, so a reader must not assume the control:
 
-- Quarantine of unattributed inbound writes on Production, Federated and Hive ([#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967), open): the
-  default is permissive today (`src/federation/receive_auth.rs:642-646`).
 - Cert-to-peer binding enforced ([#8260](https://github.com/alphaonedev/ai-memory-mcp/issues/8260), open): the default is `warn` (`src/tls.rs:474`) and a mismatch
   is allowed (`src/handlers/federation_receive.rs:199-202`).
 - Refusal of Claimed (header-asserted) identity on Production, Federated and Hive ([#8265](https://github.com/alphaonedev/ai-memory-mcp/issues/8265), open): the

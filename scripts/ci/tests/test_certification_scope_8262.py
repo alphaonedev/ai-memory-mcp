@@ -60,6 +60,9 @@ entries of EXEMPT_CHARS: every Cf, Mn, Me, Zl and Zp character; every Zs charact
 U+0020; every Cc character other than tab and line feed; and every non-ASCII letter left after
 normalisation that is not in the measured LETTER_CENSUS. An HTML comment whose folded content
 carries a subject token or a paired stem is refused, except the measured COMMENT_EXEMPT entries.
+The one-line HTML heading element is the only HTML heading form read (round 14, fail closed): an
+"<h1>" to "<h6>" open tag outside fenced code on any other line (split over lines, wrapped in
+another element, or followed by more markup) is refused with its file:line.
 
 CHANGELOG.md is gated from the top down to the line that starts with STOP_HEADING (the
 ## [0.10.0] release heading); only [Unreleased] and [1.0.0] headings may come before it, and none
@@ -172,9 +175,10 @@ IN_ITEMS = {
     "rustls is at the audited version": (3821,),
     "Provenance links refuse a cycle-closing edge": (3041,),
     "Encryption in transit": (3824, 3830),
+    # Round 14: #2967 closed by PR #8269 (merge ffc54bd50); the item moved here from UNLANDED_ITEMS.
+    "Quarantine of unattributed inbound writes": (2967, 8269),
 }
 UNLANDED_ITEMS = {
-    "Quarantine of unattributed inbound writes": 2967,
     "Cert-to-peer binding enforced": 8260,
     "Refusal of Claimed (header-asserted) identity": 8265,
 }
@@ -333,6 +337,9 @@ _SETEXT_RE = re.compile(r"( *)(?:=+|-+)[ \t]*$")
 _BREAK_RE = re.compile(r" {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$")
 _LEAD_ITEM_RE = re.compile(r" {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+")
 _HTML_HEADING_RE = re.compile(r"[ \t]*<h([1-6])(?:\s[^<>]*)?>[^\n]*</h\1\s*>[ \t]*$", re.IGNORECASE)
+# Round 14: any HTML heading open tag ("<h1>" to "<h6>", then whitespace, ">", "/" or the end of
+# the line); outside fenced code it must sit on a line _line_heading() reads as a heading.
+_HTML_HEADING_OPEN_RE = re.compile(r"<h[1-6](?:[\s>/]|$)", re.IGNORECASE)
 _FENCE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})")
 _DELIM_PREFIX_RE = re.compile(r"[ \t]*(?:>[ \t]*)*")
 _DELIM_CHARS = frozenset("|-: \t")
@@ -504,6 +511,17 @@ def _line_heading(body):
         return True
     item = _LEAD_ITEM_RE.match(body)
     return bool(item) and bool(_ATX_RE.match(body[item.end():]) or _HTML_HEADING_RE.match(body[item.end():]))
+
+
+def html_heading_misuse(text):
+    """1-based line numbers of the lines outside fenced code that open an HTML heading element
+    ("<h1>" to "<h6>") but are not the one-line heading form _line_heading() reads (round 14: a
+    split, wrapped or trailed element is refused rather than read without heading context)."""
+    lines = [normalise(x) for x in text.split("\n")]
+    fenced = _fence_flags(lines)
+    return [n + 1 for n, line in enumerate(lines)
+            if not fenced[n] and _HTML_HEADING_OPEN_RE.search(line)
+            and not _line_heading(_quote_split(line)[1])]
 
 
 def _setext_under(cur, line, prev_fenced):
@@ -880,6 +898,21 @@ class CertificationScope8262(unittest.TestCase):
             text = _read(rel)
             for comment in comments:
                 self.assertEqual(text.count(comment), 1, rel + " lost or repeated an exempt comment")
+
+    def test_html_heading_only_in_one_line_form(self):
+        bad = ["%s:%d" % (rel, n) for rel in SINGLE_SOURCE_FILES
+               for n in html_heading_misuse(scoped_text(rel, _read(rel)))]
+        self.assertEqual(bad, [], "an HTML heading element outside the one-line form (open and close tag "
+                         "alone on one line) gives no heading context and is refused: " + ", ".join(bad[:10]))
+        # Synthetic: the six refused spellings, the accepted one-line forms, and fenced code.
+        for text in ("<h2>\nFederation\n</h2>", '<h2\nclass="x">Federation</h2>',
+                     "<h2>Federation</h2><!-- x -->", "<h2>Federation</h2><span></span>",
+                     "<div><h2>Federation</h2></div>", "Text <H3>Peer</H3> here", "<h6/>"):
+            self.assertTrue(html_heading_misuse(text), text)
+        for text in ("<h2>Federation</h2>", '  <h3 class="x">Sync</h3>  ', "<H4>Peer</H4>", "- <h2>Notes</h2>",
+                     "> <h2>Notes</h2>", "```\n<h2>\nFederation\n</h2>\n```", "~~~\n<div><h2>X</h2></div>\n~~~",
+                     "<hr>", "<header>", "<h7>x</h7>", "<html>"):
+            self.assertEqual(html_heading_misuse(text), [], text)
 
     def test_changelog_gate_is_the_current_release_section(self):
         raw = _read(CHANGELOG_REL)
