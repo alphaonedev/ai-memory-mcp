@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PGBOUNCER_GID`; function, cleanup and alias definitions are read after `;`, `&&`, `||`, `{`, `(` and `|`;
   a FAIL site inside a subshell or a group closed by `|| true` is refused by a group-depth scan; both
   script headers and READMEs carry one exit-code table and one identical set -e caveat.
+  Round 12: compose interpolation follows the escape rule (an odd dollar run before a name counts; a run of
+  three or more, YAML anchors, aliases, merge keys, `extends`, `include`, `secrets`, `configs`, `env_file` and any
+  top-level key besides `name` and `services` are refused); a definition after `then`, `do`, `else`, `elif`,
+  `time` or `!` is read; the group scan tracks loops and `case`, and refuses a closer with no opener; a trailing
+  comment cannot open a heredoc; both script headers match the exit codes their script uses.
 
 ### Security (#7112 — event-listener thread-safety advisory)
 

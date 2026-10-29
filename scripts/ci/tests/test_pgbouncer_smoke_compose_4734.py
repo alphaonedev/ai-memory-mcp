@@ -46,6 +46,12 @@ compose file names POSTGRES_PASSWORD exactly once (postgres.environment) and has
 env_file; every psql_pooled call carries the FAIL-and-exit-1 or-branch; a `) || true`
 subshell, a function named like a builtin or any function outside the pinned set, a
 second cleanup() or trap, a negated .gitignore line and a fake heredoc opener are refused.
+r12: compose interpolation follows the escape rule (an odd run of dollars before a name is an
+interpolation, a run of three or more is refused); YAML anchors, aliases and merge keys, the keys
+extends/include/secrets/configs/env_file and any top-level key besides name and services are refused;
+a definition after then/do/else/elif/time/`!` is read as a definition; the group scan tracks do..done
+and case..esac and RAISES on a closer with no opener; a trailing comment holds no heredoc opener; both
+script headers are pinned to the exit codes the script uses (code 1 from its rc=1 site).
 """
 import fnmatch
 import pathlib
@@ -178,8 +184,9 @@ PINNED_FUNCTIONS = {
     SMOKE: {"cleanup", "psql_pooled"},
     ENVELOPE: {"cleanup", "need", "now_ms", "worker"},
 }
-# r11 Q14: a definition is a command word, so it is read at line start and after ; && || { ( |.
-CMD_START = r"(?:^|[;&|{(])\s*"
+# r11 Q14 / r12 N3+S13: a definition is a command word, so it is read at line start, after
+# ; && || { ( | and after the reserved words then do else elif time and the `!` negation.
+CMD_START = r"(?:^|[;&|{(]|(?<![\w$\[\\])!|(?<![\w.:$-])(?:then|do|else|elif|time)(?![\w.:-]))\s*"
 FUNCTION_DEF = re.compile(
     CMD_START
     + r"(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\)(?=\s*(?:\{|\(|\[\[|(?:if|for|while|until|case|select)\b))|([\w:-]+)\s*\(\)\s*$)"
@@ -192,6 +199,12 @@ GROUP_OR_NEUTRAL = re.compile(r"\s*\"?\s*\|\|\s*(?:true\b|:(?![\w-])|echo\b)")
 GROUP_PIPED = re.compile(r"\s*\"?\s*\|(?!\|).*\|\|\s*(?:true\b|:(?![\w-])|echo\b)")
 CAVEAT = re.compile(r"Any other non-zero status[^.]*\.")
 COMPOSE_NAMES = {"AI_MEMORY_SMOKE_RUN", "POSTGRES_PASSWORD", "PGBOUNCER_UID", "PGBOUNCER_GID"}
+# r12 S12: compose features that can move a second secret into a container.
+DOLLAR_RUN = re.compile(r"(\$+)\{?([A-Za-z_]\w*)?")
+YAML_ANCHOR_ALIAS = re.compile(r"(?:^|[\s,\[{:])[&*][A-Za-z0-9_-]+", re.M)
+YAML_MERGE_KEY = re.compile(r"""(?m)^\s*(?:-\s*)?["']?<<["']?\s*:""")
+COMPOSE_BANNED_KEYS = re.compile(r"""(?<![\w.-])["']?(?:extends|include|secrets|configs|env_file)["']?\s*:""")
+COMPOSE_TOP_KEY = re.compile(r"""^["']?([\w-]+)["']?\s*:""")
 OR_TRUE_AFTER_GROUP = re.compile(r"\)\s*\|\|\s*(?:true|:)(?![\w-])")
 PSQL_POOLED_DEF = 'docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"'
 GITIGNORE = PGB / ".gitignore"
@@ -313,6 +326,36 @@ def _compose_code(path=COMPOSE):
     return "\n".join(_strip_comment(ln) for ln in path.read_text().splitlines())
 
 
+def _compose_scan(text):
+    """r12 S12: (interpolated names, refusals) of comment-free compose text. A run of dollars
+    escapes in pairs, so an ODD run followed by a name is an interpolation (r12 N1); a run of
+    three or more is refused outright, as are YAML anchors, aliases, merge keys, the keys
+    extends/include/secrets/configs/env_file and any top-level key besides name and services."""
+    names, problems = set(), []
+    for m in DOLLAR_RUN.finditer(text):
+        if len(m.group(1)) >= 3:
+            problems.append("a run of %d dollars (escape plus interpolation)" % len(m.group(1)))
+        if len(m.group(1)) % 2 == 1 and m.group(2):
+            names.add(m.group(2))
+    if YAML_ANCHOR_ALIAS.search(text):
+        problems.append("YAML anchor or alias")
+    if YAML_MERGE_KEY.search(text):
+        problems.append("YAML merge key")
+    for m in COMPOSE_BANNED_KEYS.finditer(text):
+        problems.append("banned key %s" % m.group(0).strip("\"' :"))
+    tops = set()
+    for ln in text.splitlines():
+        if ln.strip() and not ln[0].isspace():
+            key = COMPOSE_TOP_KEY.match(ln)
+            if key is None:
+                problems.append("top-level line that is not a key: %r" % ln[:20])
+            else:
+                tops.add(key.group(1))
+    if tops != {"name", "services"}:
+        problems.append("top-level keys %s differ from name, services" % sorted(tops))
+    return names, problems
+
+
 def _joined(path):
     return re.sub(r"\\\n\s*", " ", "\n".join(_code_lines(path)))
 
@@ -387,7 +430,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         )
         # r11 S11: compose interpolates every exported variable and the smoke also
         # exports PGPASSWORD (same secret); only these four names may be interpolated.
-        names = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)", text))
+        names, problems = _compose_scan(text)
+        self.assertEqual(problems, [], "compose uses a form that can move a secret: %r" % problems)
         self.assertEqual(names, COMPOSE_NAMES, "compose may interpolate only %s" % sorted(COMPOSE_NAMES))
         services = _services()
         self.assertRegex(services["postgres"]["environment"].get("POSTGRES_PASSWORD", ""), REQUIRED_PW)
@@ -395,6 +439,39 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             if name != "postgres":
                 self.assertNotIn("POSTGRES_PASSWORD", "".join(spec["environment"].values()), name)
         self.assertNotRegex(text, r"(?m)^\s*-?\s*env_file\s*:", "no service may set env_file")
+
+    def test_compose_scan_selftest(self):
+        # r12 S12 + N1: rows R1 R1b (three-dollar escape), R2 (alias), R5 R6 (top-level secrets and
+        # configs), R7 (extends), R12 (include), F1 F1b (escaped dollar then a second name) are refused;
+        # F2b (a literal escaped `$$HOME`) and R11 (a .env file, no effect) are not.
+        base = _compose_code()
+        port = '    ports:\n      - "127.0.0.1:6432:6432"'
+        self.assertEqual(_compose_scan(base)[1], [])
+        legit = base.replace(port, "    environment:\n      SMOKE_NOTE: $$HOME\n" + port, 1)
+        self.assertEqual(_compose_scan(legit), (COMPOSE_NAMES, []))
+        rows = {
+            "R1": "    environment:\n      X: $$$PGPASSWORD\n",
+            "R1b": "    environment:\n      X: $$${PGPASSWORD}\n",
+            "F1": "    environment:\n      - X=$$$PGPASSWORD\n",
+            "F1b": "    labels:\n      - x=$$${PGPASSWORD}\n",
+            "R2": "    x-a: &a ${PGPASSWORD}\n    labels:\n      smoke.copy: *a\n",
+            "R4": "    <<: *a\n",
+            "R7": "    extends:\n      file: other.yml\n      service: s\n",
+            "R3": "    env_file: .smoke.env\n",
+        }
+        for row, extra in rows.items():
+            names, problems = _compose_scan(base.replace(port, extra + port, 1))
+            self.assertTrue(problems or names != COMPOSE_NAMES, "row %s is not refused" % row)
+        top = {
+            "R12": "include:\n  - other.yml\n",
+            "R5": "secrets:\n  s:\n    environment: PGPASSWORD\n",
+            "R6": "configs:\n  c:\n    environment: PGPASSWORD\n",
+        }
+        for row, extra in top.items():
+            self.assertTrue(_compose_scan(base.rstrip("\n") + "\n" + extra)[1], "row %s is not refused" % row)
+        # N1 parity alone (no run of three): an odd run is an interpolation, an even run is not.
+        self.assertEqual(_compose_scan("a: $$$$HOME\nb: $${HOME}\nc: ${HOME}")[0], {"HOME"})
+        self.assertEqual(_compose_scan("a: $$HOME")[0], set())
 
     def test_scripts_generate_random_password(self):
         for path in SCRIPTS:
@@ -754,7 +831,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 ln,
             )
             targets.extend(t.rstrip(");&|") for t in REDIRECT.findall(plain))
-            for tok in HEREDOC_TOKEN.finditer(ln):
+            for tok in HEREDOC_TOKEN.finditer(_strip_comment(ln)):  # r12 N4: a comment holds no opener
                 word = tok.group(1) or tok.group(2) or tok.group(3)
                 if word:
                     heredoc = word
@@ -764,11 +841,24 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         return targets
 
     @staticmethod
+    def _close_group(stack, out, tail):
+        """Pop the top group and, for ( ) { } and do..done, record whether it can be neutralised."""
+        group = stack.pop()
+        if group["kind"] in ("p", "case"):
+            return
+        sub_fail = group["fail"] and group["kind"] == "("
+        piped = bool(GROUP_OR_NEUTRAL.match(tail) or GROUP_PIPED.match(tail))
+        group["bad"] = group["fail"] and (sub_fail or piped)
+        group["why"] = "subshell" if sub_fail else "closes with or-true or in a pipeline"
+        out.append(("%s %s%s" % (group["at"], "$" if group["sub"] else "", group["kind"]), group))
+
+    @staticmethod
     def _groups(lines, name):
-        """r11 Q15: every ( ) and { } group over the code lines, across lines, outside
-        quotes, comments and heredoc bodies; returns (location, group). group["bad"] is set
-        when a FAIL echo sits inside a subshell, or in a group that closes with `|| true`,
-        `|| :` or `|| echo ...`, or is a pipeline element followed by `| ... || true`."""
+        """r11 Q15 + r12 N2/N5: every ( ) { } and do..done group over the code lines (case..esac
+        is tracked so a pattern paren pops nothing), across lines, outside quotes, comments and
+        heredoc bodies; returns (location, group). group["bad"] is set when a FAIL echo sits inside
+        a subshell, or in a group that closes with `|| true`, `|| :` or `|| echo ...`, or is a
+        pipeline element followed by `| ... || true`. A closer with no opener RAISES (fail closed)."""
         out, stack, heredoc, in_sq = [], [], None, False
         for n, raw in enumerate(lines):
             if heredoc:
@@ -801,15 +891,24 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                     in_sq = True
                 elif ch in "({":
                     stack.append({"kind": ch, "sub": False, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
-                elif (ch == ")" and top == "(") or (ch == "}" and top in ("{", "p")):
-                    group = stack.pop()
-                    if group["kind"] != "p":
-                        tail = ln[i + 1 :]
-                        sub_fail = group["fail"] and group["kind"] == "("
-                        piped = bool(GROUP_OR_NEUTRAL.match(tail) or GROUP_PIPED.match(tail))
-                        group["bad"] = group["fail"] and (sub_fail or piped)
-                        group["why"] = "subshell" if sub_fail else "closes with or-true or in a pipeline"
-                        out.append(("%s %s%s" % (group["at"], "$" if group["sub"] else "", group["kind"]), group))
+                elif ch == ")" and top == "case":
+                    pass  # r12 N5: a case pattern paren closes no group
+                elif ch in ")}" and not ((ch == ")" and top == "(") or (ch == "}" and top in ("{", "p"))):
+                    raise AssertionError("%s: line %d col %d: closing %s with no matching opener" % (name, n + 1, i + 1, ch))
+                elif ch in ")}":
+                    close = ln[i + 1 :]
+                    PgbouncerSmokeComposeTest._close_group(stack, out, close)
+                elif ch.isalpha() and (i == 0 or ln[i - 1] in " \t;&|(){}`"):
+                    word = re.match(r"[A-Za-z]+", ln[i:]).group()
+                    after = ln[i + len(word) : i + len(word) + 1]
+                    step = len(word)
+                    if after == "" or after in " \t;&|()":
+                        if word in ("do", "case"):
+                            stack.append({"kind": word, "sub": False, "fail": False, "at": "line %d col %d" % (n + 1, i + 1)})
+                        elif word in ("done", "esac"):
+                            if top != {"done": "do", "esac": "case"}[word]:
+                                raise AssertionError("%s: line %d col %d: %s with no matching opener" % (name, n + 1, i + 1, word))
+                            PgbouncerSmokeComposeTest._close_group(stack, out, ln[i + len(word) :])
                 i += step
             if not in_sq:
                 for tok in HEREDOC_TOKEN.finditer(ln):
@@ -828,10 +927,23 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertEqual(bad(['( cd x', 'echo "FAIL: a" >&2; exit 1', ') || echo ok']), [True])
         self.assertEqual(bad(['{ echo "FAIL: a" >&2; exit 1; } | cat || true']), [True])
         self.assertEqual(bad(['{ echo "FAIL: a" >&2; exit 1; }']), [False])
+        # r12 N2: a loop is a group (F3 bad, F3b legit); N5: a case pattern paren pops nothing (F11 bad)
+        self.assertEqual(bad(["cat x | while read l; do", 'echo "FAIL: a" >&2; exit 1', "done || true"]), [True])
+        self.assertEqual(bad(["cat x | while read l; do", 'echo "FAIL: a" >&2; exit 1', "done"]), [False])
+        self.assertEqual(bad(["( case $x in", '0) echo "FAIL: a" >&2; exit 1 ;;', "esac ) || echo ok"]), [True])
+        self.assertEqual(bad(['case $x in', '0) echo "FAIL: a" >&2; exit 1 ;;', "esac"]), [])
+        for unmatched in (["echo a )"], ["echo a }"], ["done"], ["esac"], ["case x in", "a) : ;;"], ["do : "]):
+            with self.assertRaises(AssertionError, msg=unmatched):
+                self._groups(unmatched, "t")
         self.assertEqual(bad(['x="$(psql <<\'SQL\'', 'echo ) {', 'SQL', ')" || { echo "FAIL: a" >&2; exit 1; }']), [False, False])
-        for text in ("; exit() { :; }", "&& cleanup() { :; }", "|| alias x=y", "{ exit() { :; }", "( exit() { :; }", "true | exit() { :; }"):
+        for text in (
+            "; exit() { :; }", "&& cleanup() { :; }", "|| alias x=y", "{ exit() { :; }", "( exit() { :; }", "true | exit() { :; }",
+            "if true; then exit() { :; }; fi", "do exit() { :; }", "&& ! exit() { :; }", "else function exit { :; }",
+            "elif true; then alias exit=true", "then cleanup() { :; }", "time exit() { :; }", "! exit() { :; }",
+        ):
             self.assertTrue(FUNCTION_DEF.search(text) or ALIAS_DEF.search(text), text)
         self.assertFalse(FUNCTION_DEF.search('x="$(date)"') or ALIAS_DEF.search("echo alias_set"))
+        self.assertFalse(FUNCTION_DEF.search("echo undo() x") or FUNCTION_DEF.search("*[!a-z0-9_-]*) echo x"))
 
     def test_redirect_scan_heredoc_opener_is_anchored(self):
         # r10 Q11: arithmetic `<<` and a here-string are not heredocs; an opener
@@ -871,13 +983,18 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 found.append(hits[0])
         self.assertEqual(len(set(found)), 1, "the caveat sentence differs between the four docs: %r" % sorted(set(found)))
 
-    def test_smoke_header_lists_exactly_the_exit_codes_used(self):
-        # r11 Q13: one header row per code: 0 plus every `exit N` on a code line.
-        used = {int(c) for ln in _code_lines(SMOKE) for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)}
-        header = [ln for ln in SMOKE.read_text().splitlines()[:50] if ln.startswith("#")]
-        rows = [int(m.group(1)) for m in (re.match(r"^#\s{2,}(\d+)\s{2,}\S", ln) for ln in header) if m]
-        self.assertEqual(rows, sorted(set(rows)), "the header rows must be unique and ascending")
-        self.assertEqual(set(rows), used | {0}, "smoke header exit table differs from the exit codes the script uses")
+    def test_headers_list_exactly_the_exit_codes_used(self):
+        # r11 Q13 + r12 N6: one header row per code, in BOTH scripts: 0 plus every `exit N` on a
+        # code line plus 1 when a code line assigns `rc=1` (the teardown status cleanup() exits with).
+        for path in SCRIPTS:
+            code = _code_lines(path)
+            used = {int(c) for ln in code for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)}
+            if any(re.search(r"(?<![\w-])rc=1(?![\w-])", ln) for ln in code):
+                used.add(1)
+            header = [ln for ln in path.read_text().splitlines()[:50] if ln.startswith("#")]
+            rows = [int(m.group(1)) for m in (re.match(r"^#\s{2,}(\d+)\s{2,}\S", ln) for ln in header) if m]
+            self.assertEqual(rows, sorted(set(rows)), "%s: the header rows must be unique and ascending" % path.name)
+            self.assertEqual(set(rows), used | {0}, "%s: header exit table differs from the exit codes the script uses" % path.name)
 
     def _assert_exec_surface(self, path):
         """r9 S7: tracing, bare builtins, dump commands, container metadata,
