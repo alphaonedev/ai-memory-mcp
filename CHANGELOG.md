@@ -99,7 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read fails closed; the line alignment splits on newline only and refuses every Unicode or ASCII line
   separator and a lone carriage return, naming the script, line and character column; and the two bash
   agreement selftests (`test_shell_comment_prepass_agrees_with_bash` and
-  `test_shell_word_readers_agree_with_bash`) are the contract.
+  `test_shell_word_readers_agree_with_bash`) are the contract. Round 20: NUL bytes and C0 control
+  characters, `$(` or backquote expansions inside an unquoted heredoc body, a heredoc opened inside a
+  backquote substitution (or a body line inside a command substitution that only starts with the
+  delimiter) and invalid UTF-8 are refused by name before any reader; the redirect and group scans consume
+  the heredoc bodies of one pre-pass over the raw script text; and the shell-word problems name the line.
 
 ### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
 
