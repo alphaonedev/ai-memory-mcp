@@ -1083,23 +1083,32 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
 
     def test_compose_word_pin_and_daemon_selection_selftest(self):
         # r15 S20: R1-R10 are the reviewer's ten S20/S21 GREEN/GREEN shapes rebuilt from the finding text
-        # (static quoting, escapes, attached values, a profile, a brace word, ANSI-C quoting, a respelt
-        # command word, and the local-proxy DOCKER_HOST prefix); each is refused now, raw text or words.
+        # (constructed equivalents: escapes, an attached short value, a short project name, a profile, a brace
+        # word, ANSI-C quoting, a respelt command word, and the local-proxy DOCKER_HOST prefix), each one a
+        # spelling the round-14 check accepted; each is refused now, raw text or words. The quoted forms the
+        # round-14 check already refused after quote removal stay as own rows.
         ok = 'x docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up'
         for legit in (ok, ok + " -d --wait postgres", ok + " down -v >/dev/null || { echo x; }", ok + " up 2>&1 | cat", "need docker", 'docker ps -aq --filter "label=x"'):
             self.assertEqual(_compose_pin_refusals(legit), [], legit)
             self.assertEqual(_daemon_selection_refusals(legit), [], legit)
         refused = {
-            "R1-single-quoted-flag": ok + " '-f' ./extra.yml",
-            "R2-double-quoted-flag": ok + ' "-f" ./extra.yml',
+            "R1-escaped-long-flag": ok + " --fi\\le ./extra.yml",
+            "R2-escaped-profile": ok + " --profi\\le extra",
             "R3-escaped-flag": ok + " -\\f ./extra.yml",
-            "R4-attached-short-value": ok + " -f./extra.yml",
-            "R5-attached-equals-value": ok + " -f=./extra.yml",
-            "R6-split-long-flag": ok + " --fi''le=./extra.yml",
+            "R4-attached-short-value": ok + " -fextra.yml",
+            "R5-short-project-name": ok + " -p other",
+            "R6-escaped-project-directory": ok + " --project-director\\y ./other",
             "R7-profile": ok + " --profile extra",
-            "R8-brace-word": ok + " {-f,./extra.yml}",
+            "R8-brace-word": ok + " -{f,} ./extra.yml",
             "R9-ansi-c-flag": ok + " $'-f' ./extra.yml",
             "R10-local-proxy-prefix": "DOCKER_HOST=tcp://127.0.0.1:2399 " + ok,
+            "own-single-quoted-flag": ok + " '-f' ./extra.yml",
+            "own-double-quoted-flag": ok + ' "-f" ./extra.yml',
+            "own-attached-dot-value": ok + " -f./extra.yml",
+            "own-attached-equals-value": ok + " -f=./extra.yml",
+            "own-split-long-flag": ok + " --fi''le=./extra.yml",
+            "own-brace-pair": ok + " {-f,./extra.yml}",
+            "own-quoted-short-project": ok + ' -p"other"',
             "own-quoted-compose-other-file": 'docker "compose" -f ./x.yml up',
             "own-escaped-compose-other-file": "docker co\\mpose -f ./x.yml up",
             "own-quoted-docker-global-flag": '"docker" --host x compose -f "$COMPOSE_FILE_PINNED" up',
