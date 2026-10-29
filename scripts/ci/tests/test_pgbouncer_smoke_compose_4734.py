@@ -87,6 +87,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import types
 import unittest
 
 import yaml  # r13 S14: required (the guard FAILS, never skips, without it); compose is scanned decoded
@@ -220,8 +221,6 @@ FUNCTION_DEF = re.compile(
 )
 CLEANUP_DEF = re.compile(CMD_START + r"(?:function\s+cleanup\b|cleanup\s*\(\))")
 ALIAS_DEF = re.compile(CMD_START + r"alias\s")
-# r11 Q16: an escaped `<` before `<word` is an input redirect, not a heredoc opener.
-HEREDOC_TOKEN = re.compile(r"\"[^\"]*\"|'[^']*'|(?<![<\\])<<(?!<)-?\s*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))")
 # r13 K3+S17 / r14 K5: what may follow the closer of a group that holds a FAIL site: end of line, `;`,
 # `;;` (not `;&` or `;;&`), or the closer of an enclosing group (`)`, `}`, fi, done, esac; that group
 # holds the same FAIL site and is judged by its own tail). `&&` is NOT accepted: bash ignores set -e for
@@ -422,15 +421,28 @@ def _services():
     return _yaml_parse(text)
 
 
+def _script_text(path):
+    """r19 S25: a script's text as bash reads it: the bytes decoded as UTF-8 with no newline translation.
+    Path.read_text() turns a lone \\r (and \\r\\n) into a newline, which bash does not, so a lone \\r would
+    reach the pre-pass as a line break and a `#` after it would hide code bash runs; read this way the
+    pre-pass sees the \\r and refuses it."""
+    return path.read_bytes().decode("utf-8")
+
+
 def _code_lines(path):
     """The lines of a script without its whole-line comments. r16 K11: a line is a comment only when the
     shared pre-pass (_strip_shell_comments) removes all of it, so a `#` line inside a quoted string or a
-    heredoc body stays; a script the pre-pass cannot read fails the guard."""
-    text = path.read_text()
+    heredoc body stays; a script the pre-pass cannot read fails the guard. r19 S25: both texts split on a
+    newline only (the pre-pass refuses every other character str.splitlines() reads as a line break), and
+    a line count that differs fails the guard instead of letting zip drop the tail."""
+    text = _script_text(path)
     code, problem = _strip_shell_comments(text, path.name)  # r18 K15: the problem names script, line and column
     if problem:
         raise AssertionError(problem)
-    return [ln for ln, kept in zip(text.splitlines(), code.splitlines()) if not (ln.lstrip().startswith("#") and not kept.strip())]
+    lines, kept_lines = text.split("\n"), code.split("\n")
+    if len(lines) != len(kept_lines):
+        raise AssertionError("%s: the comment pre-pass kept %d lines of %d; the line alignment is lost" % (path.name, len(kept_lines), len(lines)))
+    return [ln for ln, kept in zip(lines, kept_lines) if not (ln.lstrip().startswith("#") and not kept.strip())]
 
 
 def _sql_statements(path):
@@ -560,7 +572,7 @@ def _command_tail(text):
     return text
 
 
-def _compose_pin_refusals(body):
+def _compose_pin_refusals(body, name="text"):
     """r13 S15 + r14 S19: refusals for the code of one script. EVERY compose invocation (`docker`, then
     only the word compose: a global docker flag in between is refused) is followed by the pinned
     -f and --project-directory, and the rest of that command (a backslash continuation included) carries
@@ -569,8 +581,8 @@ def _compose_pin_refusals(body):
     COMPOSE_PATH_SEPARATOR, COMPOSE_PROJECT_NAME are neither read nor exported), no export of those two,
     and each assigned at most once."""
     problems = []
-    words, problem = _shell_words(body)
-    code, _ = _strip_shell_comments(body)  # r16 K11: the text count reads the same comment-free code
+    words, problem = _shell_words(body, name)
+    code, _ = _strip_shell_comments(body, name)  # r16 K11: the text count reads the same comment-free code
     body = re.sub(r"\\\n\s*", " ", body)
     if problem:
         problems.append(problem)
@@ -664,43 +676,104 @@ DAEMON_SELECTION_NAME = re.compile(r"DOCKER_\w*")
 # (`echo case`, `: $(: case)`, `case esac in`) they are plain words and never touch the stack. Inside
 # `$((...))`, `((...))`, `[[ ... ]]`, a regex or extglob group and a backquote pair a `#` is text
 # (base#digits, regex and pattern text). A `#` inside a word (${x#y}, $#, a#b, --flag=#), after a
-# backslash, or inside '...', "...", $'...' or ${...} is text. A heredoc body starts after the LOGICAL line
-# of its opener ends (a `\`-newline continuation and a multi-line quoted string belong to that line); each
-# opener on the line takes its body in order, copied unchanged. Fail closed: a quote, backquote,
+# backslash, or inside '...', "...", $'...' or ${...} is text. r19 K16 / S26: the pre-pass also EMITS the
+# heredoc openers and is their only reader (the redirect scan, the group scan and _shell_words take its list,
+# so no second lexer can read an opener the pass does not see). An opener is a `<<` (or `<<-`, which strips
+# leading tabs from the body and terminator lines) that the pass reads as an unquoted redirection operator
+# in code: never inside "...", '...', $'...', ${...}, $((...)), ((...)) or [[ ... ]], and never `<<<` (a
+# here-string). Its delimiter is the next word after bash quote removal ('E', "E", \E and E'F' read as E, E,
+# E and EF). A delimiter with a character outside [A-Za-z0-9_-] after quote removal, an empty one, one
+# holding a backslash-newline or a newline inside quotes, a `<<` the pass cannot place (in a case head or
+# pattern, an array assignment, an extglob or regex group, [[ ]] or an open [ ] subscript of the word it
+# ends) and the deprecated $[ ] arithmetic fail closed. A heredoc body starts after the LOGICAL line of its
+# opener ends (a `\`-newline continuation and a multi-line quoted string belong to that line); each opener
+# on the line takes its body in order, copied unchanged, and the body ends at the first line equal to the
+# delimiter (for `<<-` once its leading tabs are removed), never at a line that only strips to it. r19 S25:
+# only a newline ends a line here; a vertical tab, a form feed, \x1c, \x1d, \x1e, \x85, U+2028, U+2029 or a
+# lone \r anywhere in the text is a problem, because str.splitlines() reads each one as a line break and a
+# reader that split on it would lose its alignment with the code lines; the scripts are read with no
+# newline translation (_script_text), so a lone \r reaches this check. Fail closed: a quote, backquote,
 # substitution, bracket, `[[`, case or heredoc still open at the end of the text, an arithmetic `$((` or
 # `((` closed by a lone `)`, an unmatched `)` (also one an open case cannot place) and an `esac` keyword
-# with no open case arm are a problem, never a guess; every problem names the
-# script, the 1-based line and the 1-based column of the offending character (`smoke-test.sh: line 54 col
-# 22: ...`). A single quote directly inside ${...} inside double quotes is refused (bash reads it as text
-# there and as a quote outside double quotes). The bash agreement selftest
-# (test_shell_comment_prepass_agrees_with_bash) is the contract: each of its rows runs in bash and the
-# pre-pass keeps the row's `echo RAN` exactly when bash runs it. The comment text is removed, the newline
-# kept, so line numbers do not move. History: before round 16 shlex read the comment text as code
-# (commenters off); in round 16 any `)` and a closing backquote began a word; in rounds 16-17 every plain
-# `(` was a subshell, so a `#` after an array assignment, a regex group or an extglob group hid the rest of
-# a line that bash runs.
+# with no open case arm are a problem, never a guess; every problem names the script, the 1-based line and
+# the 1-based character column of the offending character, a multibyte character counting 1
+# (`smoke-test.sh: line 54 col 22: ...`). A single quote directly inside ${...} inside double quotes is
+# refused (bash reads it as text there and as a quote outside double quotes). The two bash agreement
+# selftests are the contract: in test_shell_comment_prepass_agrees_with_bash each row runs in bash and bash
+# prints exactly the `echo` markers the pre-pass keeps outside heredoc bodies, and in
+# test_shell_word_readers_agree_with_bash _shell_words reads exactly the marker words bash executes. The
+# comment text is removed, the newline kept, so line numbers do not move. History: before round 16 shlex
+# read the comment text as code (commenters off); in round 16 any `)` and a closing backquote began a word;
+# in rounds 16-17 every plain `(` was a subshell, so a `#` after an array assignment, a regex group or an
+# extglob group hid the rest of a line that bash runs; through round 18 a second regex lexer found the
+# heredoc openers, read the `<<` after an escaped double quote, in $(( )), (( )), $[ ] and ${x/<<w/} as an
+# opener and knew only \w+ delimiters, so a phantom heredoc could hide code that bash runs.
 COMMENT_WORD_BREAK = " \t\n;&|()<>"
 WORD_BRACKETS = ("$(", "<(", "=(", "w(")  # `<(` stands for <( and >(; `=(` an array assignment; `w(` any other word paren
 ARITH_BRACKETS = ("$((", "((", "a(")  # `a(` is a plain paren inside arithmetic
 CMD_CONTEXTS = ("", "(", "$(", "<(", "`", "case-arm")  # r18 K13: the contexts where a command (and an OPERATOR `(`) can start
 NO_COMMENT_CONTEXTS = ("[[", "w(")  # r18 K13: inside [[ ]] and a regex or extglob group a `#` is text
 SHELL_KEYWORD = re.compile(r"(case|esac|then|do|else|elif|if|while|until|for|time|in|\[\[|\]\]|!(?=\s)|\{(?=\s))(?=[\s;&|()<>`]|$)")
+HEREDOC_DELIMITER = re.compile(r"[A-Za-z0-9_-]+\Z")  # r19 K16 / S26: a delimiter after quote removal
+# r19 S25: the characters str.splitlines() reads as a line break besides "\n" (and a lone "\r")
+LINE_BREAK_LOOKALIKE = re.compile("[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]|\r(?!\n)")
 
 
 def _line_col(text, at):
-    """r18 K15: the 1-based (line, column) of offset `at` in text."""
+    """r18 K15, r19: the 1-based (line, character column) of offset `at` in text; a multibyte character counts 1."""
     return text.count("\n", 0, at) + 1, at - (text.rfind("\n", 0, at) + 1) + 1
 
 
-def _strip_shell_comments(text, name="text"):
-    """r16 K11, r18 K13 / S24, K14, K15: (comment-free text, problem or None); the rule is the comment block
-    above. A problem reads `<name>: line L col C: <what>` (1-based, the offending character)."""
-    out, stack, where, i, n = [], [], [], 0, len(text)
-    word_start, cmd_pos, keep, line_start = True, True, 0, 0  # keep: out[:keep] is never stripped as trailing blanks
+def _heredoc_delimiter(text, i):
+    """r19 K16 / S26: (end, delimiter) of the heredoc word that starts at text[i], the delimiter after bash
+    quote removal; the delimiter is None for a word holding a backslash-newline, a newline inside quotes or
+    an open quote. The word ends at an unquoted blank, newline or operator character."""
+    word, n = [], len(text)
+    while i < n and text[i] not in COMMENT_WORD_BREAK:
+        ch = text[i]
+        if ch == "\\":
+            if text[i + 1 : i + 2] in ("", "\n"):
+                return i, None
+            word.append(text[i + 1])
+            i += 2
+            continue
+        if ch not in "'\"":
+            word.append(ch)
+            i += 1
+            continue
+        j = i + 1
+        while j < n and text[j] != ch:
+            if text[j] == "\n":
+                return i, None
+            if ch == '"' and text[j] == "\\" and text[j + 1 : j + 2] in ('"', "\\", "$", "`"):
+                j += 1
+            word.append(text[j])
+            j += 1
+        if j >= n:
+            return i, None
+        i = j + 1
+    return i, "".join(word)
 
-    def problem(at, what, src=text):
-        line, col = _line_col(src, at)
-        return None, "%s: line %d col %d: %s" % (name, line, col, what)
+
+def _shell_prepass(text, name="text"):
+    """r16 K11, r18 K13 / S24, K14, K15, r19 K16 / S25 / S26: (comment-free text, problem or None, heredocs);
+    the rule is the comment block above. heredocs holds one (opener offset in text, delimiter, strip-tabs
+    flag, body start, body end) per heredoc in order; the body span covers the body and terminator lines,
+    in offsets of the comment-free text. A problem reads `<name>: line L col C: <what>` (1-based line and
+    character column of the offending character)."""
+    out, stack, where, i, n = [], [], [], 0, len(text)
+    word_start, cmd_pos, keep = True, True, 0  # keep: out[:keep] is never stripped as trailing blanks
+    pending, heredocs = [], []  # r19 K16: the openers read on the current logical line; the bodies read
+
+    def problem(at, what):
+        line, col = _line_col(text, at)
+        return None, "%s: line %d col %d: %s" % (name, line, col, what), None
+
+    lookalike = LINE_BREAK_LOOKALIKE.search(text)
+    if lookalike:
+        found = lookalike.group()
+        what = "a lone \\r" if found == "\r" else "U+%04X" % ord(found)
+        return problem(lookalike.start(), "%s, which str.splitlines() reads as a line break (only a newline ends a line here)" % what)
 
     def push(kind, at):
         stack.append(kind)
@@ -832,6 +905,36 @@ def _strip_shell_comments(text, name="text"):
             i = j
             word_start, cmd_pos = True, False
             continue
+        if ch == "$" and nxt == "[":
+            return problem(i, "the deprecated $[ ] arithmetic (the pass reads $(( )) only)")
+        if ch == "<" and nxt == "<":
+            # r19 K16 / S26: a heredoc opener is a `<<` the pass reads as an unquoted redirection operator in code
+            if text[i + 2 : i + 3] == "<":
+                out.extend("<<<")  # a here-string: no body
+                i += 3
+                word_start = True
+                continue
+            k = len(out)
+            while k and out[k - 1] not in COMMENT_WORD_BREAK:
+                k -= 1
+            ending = "".join(out[k:])
+            if ending.count("[") > ending.count("]"):
+                return problem(i, "a << inside an open [ ] subscript the pass cannot place")
+            if top not in CMD_CONTEXTS:
+                return problem(i, "a << the pass cannot place (inside %s)" % top)
+            j = i + 2
+            strip_tabs = text[j : j + 1] == "-"
+            j += int(strip_tabs)
+            while j < n and text[j] in " \t":
+                j += 1
+            end, word = _heredoc_delimiter(text, j)
+            if not word or not HEREDOC_DELIMITER.match(word):
+                return problem(i, "a heredoc delimiter that is empty, unreadable or holds a character outside [A-Za-z0-9_-] after quote removal (%r)" % text[j : max(end, j + 1)])
+            pending.append((i, word, strip_tabs))
+            out.extend(text[i:end])
+            i = end
+            word_start = False
+            continue
         if word_start and ch not in COMMENT_WORD_BREAK:
             cmd_pos = False  # a word begins, so the command is named and no OPERATOR `(` follows it
         prev = out[-1] if out and len(out) > keep else ""
@@ -893,44 +996,54 @@ def _strip_shell_comments(text, name="text"):
         out.append(ch)
         i += 1
         word_start = begins
-        if ch == "\n":
-            # r18 S24 note: the heredoc bodies start after the LOGICAL line of their openers ends
-            logical = re.sub(r"\(\(.*?\)\)", lambda m: " " * len(m.group()), "".join(out[line_start:]))
-            for tok in HEREDOC_TOKEN.finditer(logical):
-                word = tok.group(1) or tok.group(2) or tok.group(3)
-                if not word:
-                    continue
+        if ch == "\n" and pending:
+            # r18 S24 note: the heredoc bodies start after the LOGICAL line of their openers ends; r19 K16: the
+            # openers are the ones this pass emitted on that line, and a body ends only at an exact terminator
+            for at, word, strip_tabs in pending:
+                start = len(out)
                 while True:
                     if i >= n:
-                        return problem(line_start + tok.start(), "heredoc %s is never closed" % word, "".join(out))
+                        return problem(at, "heredoc %s is never closed" % word)
                     j = text.find("\n", i)
                     j = n if j < 0 else j
                     body = text[i:j]
                     out.extend(text[i : j + 1])
                     i = j + 1
-                    if body.strip() == word:
+                    if (body.lstrip("\t") if strip_tabs else body) == word:
                         break
-                keep = len(out)
-            line_start = len(out)
+                heredocs.append((at, word, strip_tabs, start, len(out)))
+            del pending[:]
+            keep = len(out)
+    if pending:
+        return problem(pending[0][0], "heredoc %s is never closed" % pending[0][1])
     if stack:
         return problem(where[-1], "a quote, backquote, substitution, bracket or case left open at the end of the text (%s)" % " ".join(stack))
-    return "".join(out), None
+    return "".join(out), None, heredocs
 
 
-def _drop_heredoc_bodies(text):
-    """r15 S20: the code text without heredoc bodies; (text, open terminator or None)."""
-    kept, heredoc = [], None
-    for ln in text.split("\n"):
-        if heredoc is not None:
-            heredoc = None if ln.strip() == heredoc else heredoc
-            continue
-        kept.append(ln)
-        for tok in HEREDOC_TOKEN.finditer(ln):
-            word = tok.group(1) or tok.group(2) or tok.group(3)
-            if word:
-                heredoc = word
-                break
-    return "\n".join(kept), heredoc
+def _strip_shell_comments(text, name="text"):
+    """r16 K11 ... r19: (comment-free text, problem or None) from the shared pre-pass (_shell_prepass)."""
+    code, problem, _ = _shell_prepass(text, name)
+    return code, problem
+
+
+def _drop_heredoc_bodies(code, heredocs):
+    """r15 S20, r19 K16: the comment-free code without the heredoc bodies and terminator lines that
+    _shell_prepass emitted for it."""
+    kept, at = [], 0
+    for _, _, _, start, end in heredocs:
+        kept.append(code[at:start])
+        at = end
+    kept.append(code[at:])
+    return "".join(kept)
+
+
+def _heredoc_lines(code, heredocs):
+    """r19 K16: the 0-based line numbers of the comment-free code that are heredoc body or terminator lines."""
+    lines = set()
+    for _, _, _, start, end in heredocs:
+        lines.update(range(code.count("\n", 0, start), code.count("\n", 0, end - 1) + 1))
+    return lines
 
 
 def _ansi_or_locale_quote(code):
@@ -952,20 +1065,19 @@ def _ansi_or_locale_quote(code):
     return False
 
 
-def _shell_words(body):
+def _shell_words(body, name="text"):
     """r15 S20: (words, problem) for code text: shlex in posix mode, comments removed, operators split out
     (a newline outside quotes is an operator token), after the heredoc bodies are dropped and the
     backslash continuations joined. An unreadable text is a problem, never an empty word list.
     r16 K11: comments are removed first by _strip_shell_comments (the shared pre-pass), so shlex reads code
-    only; commenters stay off because a `#` left after the pre-pass is text (${x#y}, $#, a#b, "#")."""
-    body, problem = _strip_shell_comments(body)
+    only; commenters stay off because a `#` left after the pre-pass is text (${x#y}, $#, a#b, "#").
+    r19 K16: the heredoc bodies dropped are the ones the pre-pass emitted; r19: every problem names the script."""
+    code, problem, heredocs = _shell_prepass(body, name)
     if problem:
         return None, problem
-    code, open_heredoc = _drop_heredoc_bodies(body)
-    if open_heredoc is not None:
-        return None, "heredoc %s is never closed" % open_heredoc
+    code = _drop_heredoc_bodies(code, heredocs)
     if _ansi_or_locale_quote(code):
-        return None, "ANSI-C or locale quoting ($' or $\")"
+        return None, "%s: ANSI-C or locale quoting ($' or $\")" % name
     lex = shlex.shlex(re.sub(r"\\\n", " ", code), posix=True, punctuation_chars=SHELL_OPERATOR_CHARS)
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
@@ -973,7 +1085,7 @@ def _shell_words(body):
     try:
         return list(lex), None
     except ValueError as exc:
-        return None, "the shell words cannot be read: %s" % exc
+        return None, "%s: the shell words cannot be read: %s" % (name, exc)
 
 
 def _is_operator(word):
@@ -1021,14 +1133,14 @@ def _compose_word_refusals(words):
     return problems, calls
 
 
-def _daemon_selection_refusals(body):
+def _daemon_selection_refusals(body, name="text"):
     """r15 S21: refusals for a DOCKER_ name or a docker context call in one script, raw and as words."""
     problems = []
     if DAEMON_SELECTION_NAME.search(body):
         problems.append("names a DOCKER_ daemon or config selection variable")
     if re.search(r"\bdocker\s+context\b", body):
         problems.append("runs docker context")
-    words, problem = _shell_words(body)
+    words, problem = _shell_words(body, name)
     if problem:
         return problems + [problem]
     for k, w in enumerate(words):
@@ -1045,7 +1157,7 @@ def _joined(path):
 
 def _norm_lines(path):
     """Joined code lines with whitespace runs collapsed, blank lines dropped."""
-    return [" ".join(ln.split()) for ln in _joined(path).splitlines() if ln.strip()]
+    return [" ".join(ln.split()) for ln in _joined(path).split("\n") if ln.strip()]
 
 
 class ComposeParity(unittest.TestCase):
@@ -1061,7 +1173,7 @@ class ComposeParity(unittest.TestCase):
 DECLARATION_WORDS = ("local", "declare", "typeset", "readonly", "export")
 
 
-def _self_referencing_declarations(lines):
+def _self_referencing_declarations(lines, script="text"):
     """r15: a declaration builtin expands all its words before it assigns any, so a word that reads a name
     assigned earlier in the SAME command sees the old (under set -u: unbound) value. Returns the offending
     (line number, name) pairs; a line shlex cannot split is returned as (n, "unparsable")."""
@@ -1070,7 +1182,7 @@ def _self_referencing_declarations(lines):
         stripped = raw.strip()
         if stripped.split(" ", 1)[0] not in DECLARATION_WORDS:
             continue
-        code, problem = _strip_shell_comments(stripped)  # r16 K11: the shared comment pre-pass first
+        code, problem = _strip_shell_comments(stripped, script)  # r16 K11: the shared comment pre-pass first
         try:
             if problem:
                 raise ValueError(problem)
@@ -1164,9 +1276,9 @@ def _wait_check_ok(words, k, name):
     return echo and any(re.match(r"^[1-9]\d*$", x) for x in exits)
 
 
-def _wait_refusals(body):
+def _wait_refusals(body, name="text"):
     """r16 K9: refusals for the wait sites of one script (the rule above), read on the shell words."""
-    words, problem = _shell_words(body)
+    words, problem = _shell_words(body, name)
     if problem:
         return [problem]
     problems = []
@@ -1489,8 +1601,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertLess(code.index('cd "$(dirname "$0")"'), at, "%s: COMPOSE_DIR must follow the cd" % path.name)
             self.assertEqual(code[at + 1], pin, path.name)
             body = "\n".join(code)
-            self.assertEqual(_compose_pin_refusals(body), [], path.name)
-            self.assertEqual(_daemon_selection_refusals(body), [], path.name)
+            self.assertEqual(_compose_pin_refusals(body, path.name), [], path.name)
+            self.assertEqual(_daemon_selection_refusals(body, path.name), [], path.name)
             self.assertGreaterEqual(len(re.findall(r"\bdocker compose\b", body)), 3, path.name)
             first = re.search(r"\bdocker compose\b", body)
             self.assertGreater(first.start(), body.index(pin), "%s: compose call before the pin" % path.name)
@@ -1746,7 +1858,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         )
         for path in SCRIPTS:
             text = _joined(path)
-            downs = [ln for ln in text.splitlines() if "docker compose" in ln and " down " in ln]
+            downs = [ln for ln in text.split("\n") if "docker compose" in ln and " down " in ln]
             self.assertTrue(downs, path.name)
             for ln in downs:
                 self.assertNotRegex(ln, swallow, "%s: down failure must be loud: %s" % (path.name, ln))
@@ -1780,12 +1892,12 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # argv for the named spellings; the r7 allowlist test covers every other line.
         for path in SCRIPTS:
             text = _joined(path)
-            cmds = [ln for ln in text.splitlines() if DOCKER_EXEC_RUN.search(ln)]
+            cmds = [ln for ln in text.split("\n") if DOCKER_EXEC_RUN.search(ln)]
             self.assertTrue(any(re.search(r"\bdocker exec\b", ln) for ln in cmds), path.name)
             for ln in cmds:
                 self.assertNotRegex(ln, r"PGPASSWORD=", "%s: %s" % (path.name, ln))
                 self.assertNotRegex(ln, PW_SPELLING, "%s: %s" % (path.name, ln))
-            for ln in text.splitlines():
+            for ln in text.split("\n"):
                 if re.match(r"^\s*\w*URL=", ln) and path == SMOKE:
                     self.assertNotRegex(ln, PW_SPELLING, ln)
             if path == ENVELOPE:
@@ -1897,7 +2009,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertEqual(big.count(65), 2, "%s: exit 65 sites" % path.name)
             big = [c for c in big if c != 65] + [65]
             self.assertEqual(len(big), len(set(big)), "%s: exit code reused: %r" % (path.name, big))
-            header = "\n".join(ln for ln in path.read_text().splitlines()[:50] if ln.startswith("#"))
+            header = "\n".join(ln for ln in path.read_text().split("\n")[:50] if ln.startswith("#"))
             readme = README_FOR[path].read_text()
             for c in big:
                 self.assertRegex(header, r"\b%d\b" % c, "%s: exit %d missing from the header" % (path.name, c))
@@ -1940,7 +2052,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 found = [ln for ln in code if ln.startswith(var + "=")]
                 self.assertEqual(len(found), 1, "%s: %s" % (path.name, var))
                 self.assertRegex(found[0], r'^%s="ai-memory-pgbouncer-[^"]*\$RUN[^"]*"$' % var, "%s: %s is not per-run" % (path.name, found[0]))
-            for ln in _joined(path).splitlines():
+            for ln in _joined(path).split("\n"):
                 if re.search(r"\bdocker compose\b", ln) and not ln.lstrip().startswith("echo"):
                     self.assertIn('-p "$PROJECT"', ln, "%s: compose call without the per-run project: %s" % (path.name, ln))
         compose = _compose_code()
@@ -1987,31 +2099,23 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
     @staticmethod
     def _scan_redirects(lines, name):
         """Redirect targets outside heredoc bodies; quoted text is neutralised
-        to `Q<content>` (with `>` and `<` blanked) so a quoted target survives."""
-        targets, heredoc = [], None
-        code, problem = _strip_shell_comments("\n".join(lines), name)  # r16 K11: the shared comment pre-pass
+        to `Q<content>` (with `>` and `<` blanked) so a quoted target survives. r19 K16: the heredoc
+        bodies are the ones the shared pre-pass emitted (a comment or a quoted `<<` holds no opener)."""
+        targets = []
+        code, problem, heredocs = _shell_prepass("\n".join(lines), name)  # r16 K11: the shared comment pre-pass
         if problem:
             raise AssertionError("%s; the redirect scan would be blind" % problem)
-        for ln, kept in zip(lines, code.split("\n")):
-            kept = re.sub(r"\(\(.*?\)\)", " ", kept)
-            ln = ln if heredoc else re.sub(r"\(\(.*?\)\)", " ", ln)  # arithmetic is not a redirect or heredoc
-            if heredoc:
-                if ln == heredoc:
-                    heredoc = None
+        body_lines = _heredoc_lines(code, heredocs)
+        for k, ln in enumerate(lines):
+            if k in body_lines:
                 continue
+            ln = re.sub(r"\(\(.*?\)\)", " ", ln)  # arithmetic is not a redirect
             plain = re.sub(
                 r"\"([^\"]*)\"|'([^']*)'",
                 lambda m: "Q" + re.sub(r"[<>]", "_", m.group(1) if m.group(1) is not None else m.group(2)),
                 ln,
             )
             targets.extend(t.rstrip(");&|") for t in REDIRECT.findall(plain))
-            for tok in HEREDOC_TOKEN.finditer(kept):  # r12 N4 + r16 K11: a comment holds no opener
-                word = tok.group(1) or tok.group(2) or tok.group(3)
-                if word:
-                    heredoc = word
-                    break
-        if heredoc is not None:
-            raise AssertionError("%s: heredoc terminator %s never found; the redirect scan would be blind" % (name, heredoc))
         return targets
 
     @staticmethod
@@ -2057,13 +2161,14 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         use of a function in fail_funcs is a call record, bad unless it is at statement position; it
         marks every enclosing group FAIL-bearing. A closer with no opener, a `then` or `do` with no open
         head, and a head left open RAISE (fail closed)."""
-        out, stack, heredoc, in_sq = [], [], None, False
+        out, stack, in_sq = [], [], False
         words, loops, cond = [], [], []  # words: !, | && || on the current command; cond: open heads
         pending_func = None
-        code, problem = _strip_shell_comments("\n".join(lines), name)  # r16 K11: the shared comment pre-pass
+        code, problem, heredocs = _shell_prepass("\n".join(lines), name)  # r16 K11: the shared comment pre-pass
         if problem:
             raise AssertionError("%s; the group scan would be blind" % problem)
         lines = code.split("\n")
+        body_lines = _heredoc_lines(code, heredocs)  # r19 K16: the bodies the pre-pass emitted
 
         def cond_words():
             return [c["word"] for c in cond if c["word"] in CONDITION_WORDS]
@@ -2088,8 +2193,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             cond.pop()
 
         for n, raw in enumerate(lines):
-            if heredoc:
-                heredoc = None if raw == heredoc else heredoc
+            if n in body_lines:
                 continue
             ln = re.sub(r"\(\(.*?\)\)", lambda m: " " * len(m.group()), raw)  # r16 K11: comments already gone
             fail = FAIL_ECHO.search(ln)
@@ -2204,13 +2308,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                     words.clear()
                 m = FUNC_BODY_PREFIX.search(ln)
                 pending_func = (m.group(1) or m.group(2)) if m else None
-                for tok in HEREDOC_TOKEN.finditer(ln):
-                    word = tok.group(1) or tok.group(2) or tok.group(3)
-                    if word:
-                        heredoc = word
-                        break
-        if heredoc is not None or in_sq or stack or cond:
-            raise AssertionError("%s: the group scan lost sync (heredoc %r, open groups %d, open heads %d)" % (name, heredoc, len(stack), len(cond)))
+        if in_sq or stack or cond:
+            raise AssertionError("%s: the group scan lost sync (open groups %d, open heads %d)" % (name, len(stack), len(cond)))
         return out
 
     def test_group_scan_selftest(self):
@@ -2353,7 +2452,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 self.assertFalse(g["bad"], "%s: %s" % (path.name, where))
                 if g["fail"]:
                     self.assertFalse(_context_bad(g["ctx"]), "%s: %s" % (path.name, where))
-            comment = " ".join(ln.lstrip("# ").strip() for ln in path.read_text().splitlines() if ln.lstrip().startswith("#"))
+            comment = " ".join(ln.lstrip("# ").strip() for ln in path.read_text().split("\n") if ln.lstrip().startswith("#"))
             self.assertIn("compose still reads a .env in that directory for interpolation", comment, path.name)
             self.assertIn("the environment outranks .env", comment, path.name)
             self.assertNotIn("a .env that sets COMPOSE_FILE", comment, path.name)
@@ -2457,9 +2556,9 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             lines = _norm_lines(path)
             self.assertEqual(_reaping_pin_refusals(path, lines), [], path.name)
             body = "\n".join(ln.strip() for ln in _code_lines(path) if ln.strip())
-            self.assertEqual(_wait_refusals(body), [], path.name)
+            self.assertEqual(_wait_refusals(body, path.name), [], path.name)
         body = "\n".join(ln.strip() for ln in _code_lines(ENVELOPE) if ln.strip())
-        words, _ = _shell_words(body)
+        words, _ = _shell_words(body, ENVELOPE.name)
         self.assertEqual(sum(1 for k, w in enumerate(words) if w == "wait" and words[k - 1] in WAIT_COMMAND_PREV), 1)
 
     def test_wait_sites_selftest(self):
@@ -2491,8 +2590,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         }
         for row, (old, new) in rows.items():
             text = real.replace(old, new, 1)
-            body = "\n".join(ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
-            lines = [" ".join(ln.split()) for ln in re.sub(r"\\\n\s*", " ", body).splitlines() if ln.strip()]
+            body = "\n".join(ln.strip() for ln in text.split("\n") if ln.strip() and not ln.lstrip().startswith("#"))
+            lines = [" ".join(ln.split()) for ln in re.sub(r"\\\n\s*", " ", body).split("\n") if ln.strip()]
             self.assertTrue(_wait_refusals(body) or _reaping_pin_refusals(ENVELOPE, lines), "row %s is not refused" % row)
             self.assertTrue(_wait_refusals(body), "row %s: the wait rule alone must refuse it" % row)
         legit = {
@@ -2568,6 +2667,24 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
     )
     # r18: a comment inside an array assignment is a comment (bash runs the line after it)
     BASH_RUNS_AFTER_COMMENT = ("a=(x #c\n); echo RAN",)
+    # r19 K16 / S26: heredoc rows; bash runs every `echo` marker outside a heredoc body and none inside one
+    BASH_HEREDOC_ROWS = (
+        ': "a\\"<<E"\necho RAN\n: <<E\nx\nE',  # K16: an escaped double quote, then a quoted `<<E`
+        'x=$(: "a\\"<<E"\necho RAN\n)\necho "$x"',  # the same inside a command substitution (M13 shape)
+        ": <<E'F'\nE\n: <<true\nEF\necho RAN\ntrue",  # a quote-split delimiter reads as EF
+        ": <<'E-'\n: <<true\nE-\necho RAN\ntrue",  # a quoted delimiter holding `-`
+        ": <<true-x\nbody\ntrue-x\necho RAN\ntrue",  # an unquoted delimiter holding `-`
+        ": <<E\n\tE\n: <<true\nE\necho RAN\ntrue",  # a tab-indented E does not end a `<<E` body
+        ": ${x/<<true/}\necho RAN\ntrue",  # `<<` in a parameter expansion
+        "x=$((1<<true))\necho RAN\ntrue",  # `<<` in an arithmetic substitution
+        "((y=1<<true))\necho RAN\ntrue",  # `<<` in an arithmetic command
+        ": <<-E\n\tbody\n\tE\necho RAN",  # `<<-` strips the terminator's tabs
+        ': <<"E"\necho RAN\nE\necho RAN',  # a body line bash does not run
+        ": <<'E'\n# x <<true\nexport DOCKER_HOST=x; echo RAN\nE\necho RAN",  # a body holding #, << and a DOCKER_ name
+        'cat <<<"here string" >/dev/null\necho RAN',  # a here-string has no body
+        "x=$((1<<2)); ((y=1<<3)); : ${x/<<w/}; echo RAN",
+        "cat <<E >/dev/null; echo RAN\n# body\nE\necho END",  # the rest of the opener line runs
+    )
 
     def test_shell_comment_prepass_bracket_selftest(self):
         # r17 K12 / S23: a `)` that closes $( $(( <( >( and a closing backquote never begin a word, so a `#`
@@ -2634,16 +2751,143 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         if bash is None:
             self.skipTest("bash not installed")
         # r18: this test is the contract of the rule block above _strip_shell_comments; a fail-closed problem
-        # on a row counts as not keeping `echo RAN`
-        for text in self.BASH_RUNS_AFTER + self.BASH_COMMENT_AFTER + self.BASH_RUNS_AFTER_COMMENT:
+        # on a row counts as keeping no marker. r19: bash's FULL stdout must equal the markers the pre-pass
+        # keeps outside heredoc bodies, in order (no row may print anything else)
+        for text in self.BASH_RUNS_AFTER + self.BASH_COMMENT_AFTER + self.BASH_RUNS_AFTER_COMMENT + self.BASH_HEREDOC_ROWS:
             run = subprocess.run([bash, "--norc", "--noprofile", "-c", text], capture_output=True, text=True, timeout=10, check=False)
-            self.assertEqual("echo RAN" in (_strip_shell_comments(text)[0] or ""), "RAN" in run.stdout, text)
+            code, problem, heredocs = _shell_prepass(text)
+            kept = "" if problem else _drop_heredoc_bodies(code, heredocs)
+            expected = "".join(m.group(1) + "\n" for m in re.finditer(r"(?<![\w\"'])echo (RAN|END)(?![\w:])", kept))
+            self.assertEqual(run.stdout, expected, text)
+
+    # r19 K16 / S25 / S26: rows for test_shell_word_readers_agree_with_bash, tag: (text, refused). Every row is
+    # inert (`:`, true, echo, cat to /dev/null) and prints RAN:<tag> markers for the commands bash executes;
+    # refused rows must fail closed with a problem naming the row, every other row must not.
+    WORD_READER_ROWS = {
+        "k16": (': "a\\"<<E"\necho RAN:k16\ncat <<E >/dev/null\nx\nE', False),
+        "m10": (': "a\\"<<E"\nec""ho RAN:m10\ncat <<E >/dev/null\nx\nE', False),
+        "m12": (': "a\\"<<E"\nexport D""OCKER_HOST=x; echo RAN:m12\ncat <<E >/dev/null\nx\nE', False),
+        "m13": ('x=$(: "a\\"<<E"\necho RAN:m13\ncat <<E\nx\nE\n)\necho "$x"', False),
+        "arithsub": ("x=$((1<<true))\necho RAN:arithsub\ntrue", False),
+        "arithcmd": ("((y=1<<true))\necho RAN:arithcmd\ntrue", False),
+        "arith": (": $[1<<true]\necho RAN:arith\ntrue", True),
+        "param": (": ${x/<<true/}\necho RAN:param\ntrue", False),
+        "dashdelim": (": <<true-x\nbody\ntrue-x\necho RAN:dashdelim\ntrue", False),
+        "quotesplit": (": <<E'F'\nE\n: <<true\nEF\necho RAN:quotesplit\ntrue", False),
+        "quoteddash": (": <<'E-'\n: <<true\nE-\necho RAN:quoteddash\ntrue", False),
+        "tabterm": (": <<E\n\tE\n: <<true\nE\necho RAN:tabterm\ntrue", False),
+        "striptabs": ("cat <<-E >/dev/null\n\tbody\n\tE\necho RAN:striptabs", False),
+        "dq": ('cat <<"E" >/dev/null\necho RAN:dqbody\nE\necho RAN:dq', False),
+        "sq": ("cat <<'E' >/dev/null\necho RAN:sqbody\nE\necho RAN:sq", False),
+        "herestring": ('cat <<<"here string" >/dev/null\necho RAN:herestring', False),
+        "shift": ("x=$((1<<2))\necho RAN:shift", False),
+        "arithshift": ("((y=1<<3))\necho RAN:arithshift", False),
+        "paramshift": (": ${x/<<w/}\necho RAN:paramshift", False),
+        "body": ("cat <<E >/dev/null\n# x <<true\nexport DOCKER_HOST=x; echo RAN:body\nE\necho RAN:legit", False),
+    }
+
+    def test_shell_word_readers_agree_with_bash(self):
+        # r19 K16 / S26: _shell_words (so the compose word pin, the daemon-selection reader and the wait rule)
+        # reads exactly the marker words bash executes: none hidden by a phantom heredoc, none read from a body
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash not installed")
+        for tag, (text, refused) in self.WORD_READER_ROWS.items():
+            run = subprocess.run([bash, "--norc", "--noprofile", "-c", text], capture_output=True, text=True, timeout=10, check=False)
+            ran = sorted(ln for ln in run.stdout.split("\n") if ln.startswith("RAN:"))
+            self.assertTrue(ran, "row %s: bash runs no marker" % tag)
+            words, problem = _shell_words(text, "row-%s" % tag)
+            if refused:
+                self.assertIsNotNone(problem, "row %s must fail closed" % tag)
+                self.assertRegex(problem, r"^row-%s: line \d+ col \d+: " % tag)
+                continue
+            self.assertIsNone(problem, "row %s" % tag)
+            self.assertEqual(sorted(w for w in words if w.startswith("RAN:")), ran, "row %s" % tag)
+
+    def test_shell_words_problem_names_the_script_selftest_8270_r19(self):
+        # r19: a problem only _shell_words finds (the pre-pass reads $'a' and a trailing backslash) names the
+        # script, and the readers that call it (compose pin, daemon selection, wait rule) pass the name through
+        ansi = "smoke-test.sh: ANSI-C or locale quoting ($' or $\")"
+        self.assertEqual(_shell_words("x=$'a'\n", "smoke-test.sh")[1], ansi)
+        self.assertIn(ansi, _compose_pin_refusals("x=$'a'\n", "smoke-test.sh"))
+        self.assertIn(ansi, _daemon_selection_refusals("x=$'a'\n", "smoke-test.sh"))
+        self.assertEqual(_wait_refusals("x=$'a'\n", "smoke-test.sh"), [ansi])
+        self.assertTrue(_shell_words("echo a\\", "measure-envelope.sh")[1].startswith("measure-envelope.sh: the shell words cannot be read"))
+        self.assertEqual(_self_referencing_declarations(["local a=`x"], "smoke-test.sh"), [(1, "unparsable")])
+
+    def test_line_separator_characters_fail_closed_selftest_8270_r19(self):
+        # r19 S25: only a newline ends a line. Every other character str.splitlines() reads as a line break, and a
+        # lone \r, is a problem naming the script, line and character column (a multibyte character counts 1),
+        # for the pre-pass, _shell_words and _code_lines alike; CRLF line ends stay readable
+        for ch in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r"):
+            what = "a lone \\r" if ch == "\r" else "U+%04X" % ord(ch)
+            text = "true\nx=1 # \u00e9%sb\nexport DOCKER_HOST=x\n" % ch
+            expected = "smoke-test.sh: line 2 col 8: %s, which str.splitlines() reads as a line break (only a newline ends a line here)" % what
+            self.assertEqual(_strip_shell_comments(text, "smoke-test.sh")[1], expected, repr(ch))
+            self.assertEqual(_shell_words(text, "smoke-test.sh")[1], expected, repr(ch))
+            with self.assertRaises(AssertionError) as caught:
+                _code_lines(types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda text=text: text.encode("utf-8")))
+            self.assertEqual(str(caught.exception), expected, repr(ch))
+        self.assertIsNone(_strip_shell_comments("true\r\necho x\r\n", "smoke-test.sh")[1])
+        # a lone \r reaches the pre-pass (the script is read with no newline translation) and is refused there;
+        # Path.read_text() would have turned it into a newline and the `#` after it into a comment bash never sees
+        raw = types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda: b"true\r# ; export DOCKER_HOST=x\n")
+        self.assertEqual(_script_text(raw), "true\r# ; export DOCKER_HOST=x\n")
+        with self.assertRaises(AssertionError) as caught:
+            _code_lines(raw)
+        self.assertIn("smoke-test.sh: line 1 col 5: a lone \\r", str(caught.exception))
+        self.assertEqual(_strip_shell_comments("\u00e9 `x\n", "smoke-test.sh")[1],
+                         "smoke-test.sh: line 1 col 3: a quote, backquote, substitution, bracket or case left open at the end of the text (`)")
+
+    def test_heredoc_openers_come_from_the_prepass_selftest_8270_r19(self):
+        # r19 K16 / S26: the pre-pass emits the heredoc openers (offset, delimiter after quote removal, strip-tabs
+        # flag, body span); there is no second opener lexer, and every reader takes the emitted list
+        self.assertNotIn("HEREDOC_TOKEN", globals())
+
+        def openers(text):
+            code, problem, heredocs = _shell_prepass(text, "t.sh")
+            self.assertIsNone(problem, text)
+            return [(word, tabs) for _, word, tabs, _, _ in heredocs]
+
+        for text, expected in (
+            ("cat <<E\nb\nE\n", [("E", False)]),
+            ("cat <<-'E' >x\n\tb\n\tE\n", [("E", True)]),
+            ('cat <<"E"\nb\nE\n', [("E", False)]),
+            ("cat <<\\E\nb\nE\n", [("E", False)]),
+            ("cat <<E'F'\nE\nEF\n", [("EF", False)]),
+            ("cat <<'E-'\nE\nE-\n", [("E-", False)]),
+            ("cat <<true-x\ntrue\ntrue-x\n", [("true-x", False)]),
+            ("cat <<A; cat <<B\na\nA\nb\nB\n", [("A", False), ("B", False)]),
+            ('x="$(cat <<E\nb\nE\n)"\n', [("E", False)]),
+        ):
+            self.assertEqual(openers(text), expected, text)
+        for text in ("x=$((1<<2))", "((y=1<<3))", ": ${x/<<w/}", 'cat <<<"here string"', ': "a\\"<<E"', ": '<<E'",
+                     "cat \\<<word", 'x="$(( 1 << 2 ))"', "[[ a < b ]]", "echo '<<E'"):
+            self.assertEqual(openers(text + "\necho x\n"), [], text)
+        # a body ends only at an exact terminator line; the readers drop exactly the emitted span
+        code, problem, heredocs = _shell_prepass("cat <<E\n\tE\nE \nE\necho x\n", "t.sh")
+        self.assertIsNone(problem)
+        self.assertEqual(_drop_heredoc_bodies(code, heredocs), "cat <<E\necho x\n")
+        self.assertEqual(_heredoc_lines(code, heredocs), {1, 2, 3})
+        # fail closed, naming script, line and character column: openers the pass cannot place or read, and
+        # (round-18 refusals kept) a function body holding a case, and a delimiter holding `)`
+        for text in (": $[1<<2]", "a[1<<x ]=y\nx\n", "case a in <<E) : ;; esac\nE\n", "a=(<<E)\nE\n", "[[ <<E ]]\nE\n",
+                     ": <<'E)'\nE)\n", "cat <<$x\n$x\n", "cat <<\n", "cat <<'E\nE'\n", "cat <<\\\nE\nE\n", "cat <<E\nno end\n",
+                     "cat <<E", "f() { case a in a) : ;; esac; }"):
+            got = _shell_prepass(text, "t.sh")[1]
+            self.assertIsNotNone(got, "fail closed: %r" % text)
+            self.assertRegex(got, r"^t\.sh: line \d+ col \d+: ", text)
+        # the redirect scan, the group scan and the word readers take the emitted openers
+        self.assertEqual(self._scan_redirects(["cat <<E'F' > a.txt", "E", "echo b > c.txt", "EF", "echo d > e.txt"], "t"), ["a.txt", "e.txt"])
+        self.assertEqual(self._groups([": <<true-x", '{ echo "FAIL: a" >&2; exit 1; } | cat', "true-x"], "t"), [])
+        self.assertTrue(_daemon_selection_refusals(': "a\\"<<E"\nexport D""OCKER_HOST=x\ncat <<E >/dev/null\nx\nE'))
+        self.assertTrue(_compose_pin_refusals(': "a\\"<<E"\ndocker compose -f ./decoy.yml up\ncat <<E >/dev/null\nx\nE'))
 
     def test_declarations_do_not_read_their_own_names(self):
         # r15: `local out="$2" bodyf="${out}.body"` expanded "${out}" before `local` assigned it; under
         # set -u every envelope worker exited at its first line, and the old `wait ... || true` hid it.
         for path in (SMOKE, ENVELOPE):
-            self.assertEqual(_self_referencing_declarations(_norm_lines(path)), [], path.name)
+            self.assertEqual(_self_referencing_declarations(_norm_lines(path), path.name), [], path.name)
         check = _self_referencing_declarations
         self.assertEqual(check(['  local a="$1" b="${a}.x"']), [(1, "a")])
         self.assertEqual(check(["  local a=1 b=$a"]), [(1, "a")])
@@ -2696,7 +2940,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # script headers and both READMEs.
         found = []
         for path in SCRIPTS:
-            lead = path.read_text().splitlines()[:50]
+            lead = path.read_text().split("\n")[:50]
             header = " ".join(ln.lstrip("# ").strip() for ln in lead if ln.startswith("#"))
             readme = README_FOR[path].read_text()
             for where, text in ((path.name + " header", header), (path.name + " README", readme)):
@@ -2713,7 +2957,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             used = {int(c) for ln in code for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)}
             if any(re.search(r"(?<![\w-])rc=1(?![\w-])", ln) for ln in code):
                 used.add(1)
-            header = [ln for ln in path.read_text().splitlines()[:50] if ln.startswith("#")]
+            header = [ln for ln in path.read_text().split("\n")[:50] if ln.startswith("#")]
             rows = [int(m.group(1)) for m in (re.match(r"^#\s{2,}(\d+)\s{2,}\S", ln) for ln in header) if m]
             self.assertEqual(rows, sorted(set(rows)), "%s: the header rows must be unique and ascending" % path.name)
             self.assertEqual(set(rows), used | {0}, "%s: header exit table differs from the exit codes the script uses" % path.name)
@@ -2861,7 +3105,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # a failed stack bring-up (including the concurrent-run bind failure) and
         # a failed teardown, in each script header and each README.
         for path in SCRIPTS:
-            header = " ".join(ln.lstrip("# ").strip() for ln in path.read_text().splitlines()[:50] if ln.startswith("#"))
+            header = " ".join(ln.lstrip("# ").strip() for ln in path.read_text().split("\n")[:50] if ln.startswith("#"))
             readme = " ".join(README_FOR[path].read_text().split())
             for where, text in (("header", header), ("README", readme)):
                 self.assertRegex(text, r"\b1\b[^;]*bring-up[^;]*teardown", "%s %s: exit code 1 must name bring-up and teardown" % (path.name, where))

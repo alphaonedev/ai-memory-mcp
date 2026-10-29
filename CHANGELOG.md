@@ -93,7 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`a=(`, `a+=(`), of an extglob pattern and every `(` inside `[[ ]]` is part of a word, so a `#` right
   after its `)` is text; `case` and `esac` are keywords only in command position, an `esac` or a `)` the
   pass cannot place fails closed, every problem names the script, line and column, and the bash agreement
-  selftest (`test_shell_comment_prepass_agrees_with_bash`) is the contract for this rule.
+  selftest (`test_shell_comment_prepass_agrees_with_bash`) is the contract for this rule. Round 19: the
+  heredoc openers come from the pre-pass's own quote, arithmetic and parameter-expansion state (no second
+  lexer), with the full delimiter after quote removal, and a `<<` or a delimiter the pass cannot place or
+  read fails closed; the line alignment splits on newline only and refuses every Unicode or ASCII line
+  separator and a lone carriage return, naming the script, line and character column; and the two bash
+  agreement selftests (`test_shell_comment_prepass_agrees_with_bash` and
+  `test_shell_word_readers_agree_with_bash`) are the contract.
 
 ### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
 
