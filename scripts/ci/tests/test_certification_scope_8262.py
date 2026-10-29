@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Doc-pin for the v1.0.0 GA certification scope statement (#8262): a pinned-unit allowlist.
 
-Design (round 11, 3-agent vote 6def5ab6, choice B; conductor amendment memory db2a250b). The
-end-to-end content encryption scope is stated once, in the certification scope statement of
+Design (round 11, 3-agent vote 6def5ab6, choice B; conductor amendment memory db2a250b; round 12
+closes the listed scanner gaps without changing the design). The end-to-end content encryption
+scope is stated once, in the certification scope statement of
 docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md. Every unit of the gated files that names
 that subject is pinned verbatim in a closed table (the sidecar JSON PINS_REL), checked in both
 directions: a gated unit that is not in the table fails (unpinned), and a pin that is not found
@@ -11,36 +12,48 @@ changed sentence about the subject is a changed pin, and the review pair reads t
 named review step. This follows the repository precedent for protected content (closed pinned
 sets in test_ci_select_gating_8240.py and test_pg_isolated_binary.py, CODE_STYLE.md:466-467).
 
-Units. A file is NFKC-normalised and passed through the Cyrillic/Greek confusable map once. It is
-split into blank-line blocks; each table row (a line starting with "|") is its own unit and each
-list item (a line starting with "-", "*", "+" or "N." / "N)") starts a new paragraph. Inside a
-paragraph the splitter ends a sentence at ".", "!" or "?" plus up to four closers (quote, ")",
-"]", "*", "_", backtick) plus whitespace; it is one bounded regex, linear and deterministic. A
-sentence is subject-bearing when it carries a subject token, or a paired stem while it or a
-neighbour carries a pair word. The unit is that sentence plus one sentence on each side, inside
-the paragraph; overlapping or touching windows merge. A paragraph whose subject token straddles
-a sentence boundary is gated whole. Unit text is compared with whitespace runs collapsed, so a
-reflow is not a change. Every raw surface is covered because units are cut from the raw text:
-markdown prose, table rows, list items, fenced code, reference-link definitions, footnotes, HTML
-comments, and in docs/encryption.html text nodes and every attribute (title, alt, data-*,
-aria-label).
+Units. Each line is NFKC-normalised and passed through the Cyrillic/Greek confusable map once.
+Block structure follows CommonMark/GFM: a line is blank only when it holds nothing but U+0020 and
+U+0009 (measured on the raw line, so NBSP, U+3000 and form feed never end a paragraph); an ATX
+heading line ("#" to "######" plus a space, outside a fenced code block) always ends the current
+paragraph and is never part of a unit; a pipe line starts a table only when the next line is a
+delimiter row, and each table row is its own unit; a list item starts a new paragraph, except an
+ordered item numbered other than 1, which cannot interrupt a paragraph that did not start with a
+list item. Inside a paragraph the splitter ends a sentence at ".", "!" or "?" plus up to four
+closers (quote, ")", "]", "*", "_", backtick) plus whitespace; it is one bounded regex, linear and
+deterministic. A sentence is subject-bearing when it carries a subject token, or a paired stem
+while a pair word is in context. The context is the whole paragraph (for a table row: the row and
+the table's header row) plus the nearest preceding heading at any level. The unit is that sentence
+plus one sentence on each side, inside the paragraph; overlapping or touching windows merge. A
+paragraph whose subject straddles a sentence boundary is gated whole. Unit text is compared with
+whitespace runs collapsed, so a reflow is not a change. Units are cut from the text, so every
+surface is covered: markdown prose, table rows, list items, fenced code, reference-link
+definitions, footnotes, HTML comments, and in docs/encryption.html text nodes and every attribute.
 
-Subject tokens (matched case-insensitively on two views of a sentence: the raw text and the text
-with tags and markdown emphasis removed; entities unescaped, NFKD, marks and format characters
-dropped): 8278 in any form (#8278, issue 8278, the URL); variant A, variant B, variants A and B,
-both variants; end-to-end with any separator (any dash class, spaces) and E2E/E2EE; X25519; scope
-key, scope-key, per-namespace key; unreadable to relays or peers; payload confidentiality. Paired
-stems encrypt, decrypt, seal, envelope, wrap, ciphertext, plaintext and content encryption are
-subjects only when the window also carries federation/federated, peer, relay, replica or sync;
-inside the certification scope statement subsection (HEADING to the next "---" rule) the pair word
-is implied, so every paired stem there is gated.
+Headings. A heading line that carries a subject token, or a paired stem with a pair word in the
+heading itself, in the nearest preceding heading or implied by the statement subsection, is
+pinned verbatim in the separate "headings" table of the sidecar, checked in both directions.
 
-Characters. Every Cf, Mn and Me character in the raw file, and every non-Latin letter left after
-normalisation, is refused anywhere in a gated file, except the measured (path, code point, count)
-entries of EXEMPT_CHARS.
+Subject tokens (matched case-insensitively on three views of a sentence: the folded text; the
+folded text with tags and markdown emphasis removed; and the rendered view, which removes HTML
+comments and tags, unescapes entities and collapses markdown links and images to their text;
+every view drops marks and format characters after NFKD): 8278 in any form (#8278, issue 8278,
+the URL); variant A, variant B, variants A and B, both variants; end-to-end with any separator
+(any dash class, spaces) and E2E/E2EE; X25519; scope key, scope-key, per-namespace key;
+unreadable to relays or peers; payload confidentiality. Paired stems encrypt, decrypt, seal,
+envelope, wrap, ciphertext, plaintext and content encryption are subjects only with a pair word
+(federation/federated, peer, relay, replica or sync) in context; inside the certification scope
+statement subsection (HEADING to the next "---" rule) the pair word is implied.
 
-CHANGELOG.md is gated from the top down to the first released-version heading (a "## [" heading
-that carries a release date); the released sections below it are frozen history and exempt.
+Characters. Refused anywhere in a gated file, except the measured (path, code point, count)
+entries of EXEMPT_CHARS: every Cf, Mn, Me, Zl and Zp character; every Zs character other than
+U+0020; every Cc character other than tab and line feed; and every non-ASCII letter left after
+normalisation that is not in the measured LETTER_CENSUS. An HTML comment whose folded content
+carries a subject token or a paired stem is refused, except the measured COMMENT_EXEMPT entries.
+
+CHANGELOG.md is gated from the top down to the line that starts with STOP_HEADING (the
+## [0.10.0] release heading); only [Unreleased] and [1.0.0] headings may come before it, and none
+of them may carry a release date. The released sections below it are frozen history and exempt.
 
 Accepted residual (refinement 7, verbatim): a claim with no subject token outside any pinned unit
 passes, and a PR can pin in a bad sentence. Mitigation: the broad vocabulary above, and the review
@@ -75,14 +88,35 @@ SINGLE_SOURCE_FILES = [CERT_REL, "docs/federation.md", "SECURITY.md",
                        "docs/enterprise-deployment.md", "docs/federation-identity.md",
                        "ROADMAP.md", "docs/production-deployment.md",
                        "docs/reference/ARCHITECTURE_REFERENCE.md"]
+# The CHANGELOG gate stops at the first line that starts with this heading (U+2014 em dash).
+STOP_HEADING = "## [0.10.0] — 2026-07-12"
+GATED_RELEASE_PREFIX = "## [1.0.0]"
 # Measured refused characters that are legitimate: {path: {code point: count}}. U+FE0F is the
 # emoji presentation selector, U+03BC the NFKC form of the micro sign, U+03A3 a summation sign.
+# Round 12 measured zero Zs (other than U+0020), Zl, Zp and Cc (other than tab and line feed)
+# characters in every gated file, so no separator entry is needed.
 EXEMPT_CHARS = {
     "SECURITY.md": {0xFE0F: 1},
     CHANGELOG_REL: {0xFE0F: 2, 0x03BC: 5},
     "docs/enterprise-deployment.md": {0xFE0F: 4, 0x03A3: 2},
     "docs/federation-identity.md": {0xFE0F: 1},
     "docs/reference/ARCHITECTURE_REFERENCE.md": {0xFE0F: 1},
+}
+# Measured census of the non-ASCII letters left after normalisation in the whole of each gated
+# file (round 12): {path: {code point: count}}. These are the only non-ASCII letters a gated file
+# may carry besides EXEMPT_CHARS; every other letter is refused. Look-alikes stay out on purpose:
+# U+0131 dotless i, U+0251 Latin alpha and the small capitals U+1D00-U+1D2B are not listed.
+LETTER_CENSUS = {
+    CHANGELOG_REL: {0x00EF: 1},  # LATIN SMALL LETTER I WITH DIAERESIS
+    "ROADMAP.md": {0x00F6: 1},  # LATIN SMALL LETTER O WITH DIAERESIS
+}
+LETTER_ALLOW = frozenset(cp for counts in LETTER_CENSUS.values() for cp in counts)
+LOOKALIKE_LETTERS = (0x0131, 0x0251) + tuple(range(0x1D00, 0x1D2C))
+# Measured HTML comments whose content carries the vocabulary and that are legitimate: the
+# licence header of docs/encryption.html ("Encryption atlas" carries the stem encrypt).
+COMMENT_EXEMPT = {
+    HTML_REL: ("<!--\n  Copyright 2026 AlphaOne LLC\n  SPDX-License-Identifier: Apache-2.0\n"
+               "  Encryption atlas — at-rest, in-transit, and integrity surface.\n-->",),
 }
 TRUST_FILES = ["docs/enterprise-deployment.md", "docs/federation-identity.md"]
 TRUST_PARA = "> Peers are **authenticated but NOT trusted"
@@ -179,7 +213,9 @@ _CONFUSABLE_PAIRS = (
     (0x03A5, "Y"), (0x03A7, "X"),
 )
 _CONFUSABLES = dict(_CONFUSABLE_PAIRS)
-_REFUSED_CATEGORIES = ("Cf", "Mn", "Me")
+_REFUSED_CATEGORIES = ("Cf", "Mn", "Me", "Zl", "Zp")
+_ALLOWED_SPACE = " "
+_ALLOWED_CONTROLS = ("\t", "\n")
 
 
 def normalise(text):
@@ -189,23 +225,36 @@ def normalise(text):
     return unicodedata.normalize("NFKC", text).translate(_CONFUSABLES)
 
 
+def _refused_raw(ch):
+    cat = unicodedata.category(ch)
+    return (cat in _REFUSED_CATEGORIES or (cat == "Zs" and ch != _ALLOWED_SPACE)
+            or (cat == "Cc" and ch not in _ALLOWED_CONTROLS))
+
+
 def refused_chars(raw):
-    """{code point: count} of Cf/Mn/Me characters in the raw text and non-Latin letters after
-    normalisation; one pass over the distinct characters of each."""
+    """{code point: count} of the refused characters: separators, controls and Cf/Mn/Me in the raw
+    text, and letters outside ASCII and LETTER_ALLOW after normalisation; one pass over the
+    distinct characters of each."""
     out = {}
+    for ch in set(raw):
+        if _refused_raw(ch):
+            out[ord(ch)] = raw.count(ch)
     if raw.isascii():
         return out
-    for ch in set(raw):
-        if unicodedata.category(ch) in _REFUSED_CATEGORIES:
-            out[ord(ch)] = raw.count(ch)
     norm = normalise(raw)
     for ch in set(norm):
         if ch.isascii() or ord(ch) in out:
             continue
         cat = unicodedata.category(ch)
-        if cat in _REFUSED_CATEGORIES or (cat[0] == "L" and not unicodedata.name(ch, "").startswith("LATIN")):
+        if cat in _REFUSED_CATEGORIES or (cat[0] == "L" and ord(ch) not in LETTER_ALLOW):
             out[ord(ch)] = norm.count(ch)
     return out
+
+
+def letter_census(raw):
+    """{code point: count} of the allowed non-ASCII letters after normalisation."""
+    norm = normalise(raw)
+    return {ord(ch): norm.count(ch) for ch in set(norm) if ord(ch) in LETTER_ALLOW}
 
 
 # ---- subject vocabulary ----
@@ -224,9 +273,12 @@ _SUBJECTS = [
     r"per" + _SEP + r"namespace" + _SEP + r"keys?(?![a-z0-9])",
     r"unreadable" + _SEP + r"to" + _SEP + r"(?:relay|peer)",
     r"payload" + _SEP + r"confidential",
+    # Round 12: "content encryption" is a subject, not a paired stem: a version cell or deferral
+    # next to it reads as a #8278 claim with no pair word anywhere (code verdict row c7-N5).
+    r"content" + _SEP + r"encrypt",
 ]
 _STEMS = [r"encrypt", r"decrypt", r"seal", r"envelope", r"wrap", r"cipher" + _SEP + r"text",
-          r"plain" + _SEP + r"text", r"content" + _SEP + r"encrypt"]
+          r"plain" + _SEP + r"text"]
 _PAIRS = [r"federat", r"peer", r"relay", r"replica", r"sync(?<![a-z]sync)"]
 SUBJECT_RES = [re.compile(x) for x in _SUBJECTS]
 STEM_RES = [re.compile(x) for x in _STEMS]
@@ -238,12 +290,28 @@ def _any(patterns, views):
 
 
 _TAG_RE = re.compile(r"<[^<>]*>")
+# CommonMark raw HTML: open and closing tags, declarations. A quoted attribute value is bounded so a
+# failed match cannot rescan the rest of the paragraph from every "<".
+_OPEN_TAG_RE = re.compile(r"<[a-z][a-z0-9-]*(?:\s+[a-z_:][a-z0-9_.:-]*(?:\s*=\s*(?:[^\s\"'=<>`]+"
+                          r"|'[^'\n]{0,512}'|\"[^\"\n]{0,512}\"))?)*\s*/?>", re.IGNORECASE)
+_CLOSE_TAG_RE = re.compile(r"</[a-z][a-z0-9-]*\s*>|<![a-z][^<>]*>", re.IGNORECASE)
+_LINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)")
+_REFLINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\[[^\[\]\n]*\]")
 _MARKUP_RE = re.compile(r"[*_`~\\]")
 _SENT_END_RE = re.compile(r"[.!?][\"')\]*_`]{0,4}\s+")
-_ITEM_RE = re.compile(r"[ \t]*(?:>[ \t]*)*(?:[-*+]|\d{1,3}[.)])[ \t]")
+_ITEM_RE = re.compile(r"[ \t]*(?:>[ \t]*)*(?:[-*+]|(\d{1,9})[.)])[ \t]")
 _ROW_RE = re.compile(r"[ \t]*(?:>[ \t]*)*\|")
+_MARKER_ONLY_RE = re.compile(r"(?:>[ \t]*)*\d{1,9}[.)]")
+_ATX_RE = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
+_FENCE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})")
+_DELIM_PREFIX_RE = re.compile(r"[ \t]*(?:>[ \t]*)*")
+_DELIM_CHARS = frozenset("|-: \t")
 _WS_RE = re.compile(r"\s+")
-_RELEASED_RE = re.compile(r"^## \[[^\]\n]*\][^\n]*\d{4}-\d{2}-\d{2}", re.MULTILINE)
+_RELEASE_HEADING_RE = re.compile(r"^## \[\d+\.\d+\.\d+\]")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_COMMENT_OPEN = "<!--"
+_COMMENT_CLOSE = "-->"
+_EMPTY_COMMENTS = ("<!-->", "<!--->")
 
 
 class _DropMarks(dict):
@@ -266,44 +334,93 @@ def fold(text):
     return text.lower()
 
 
+def html_comments(text):
+    """(offset, comment text) for every HTML comment; an unterminated one runs to the end.
+    A find() loop, linear in the text."""
+    out, pos = [], 0
+    while True:
+        start = text.find(_COMMENT_OPEN, pos)
+        if start < 0:
+            return out
+        short = [c for c in _EMPTY_COMMENTS if text.startswith(c, start)]
+        if short:
+            end = start + len(short[0])
+        else:
+            close = text.find(_COMMENT_CLOSE, start + len(_COMMENT_OPEN))
+            end = len(text) if close < 0 else close + len(_COMMENT_CLOSE)
+        out.append((start, text[start:end]))
+        pos = end
+
+
+def _strip_comments(text):
+    if _COMMENT_OPEN not in text:
+        return text
+    parts, pos = [], 0
+    for start, comment in html_comments(text):
+        parts.append(text[pos:start])
+        pos = start + len(comment)
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def rendered(text):
+    """Rendered view: HTML comments and tags removed, entities unescaped, NFKD folded, markdown
+    links and images collapsed to their text, remaining brackets and emphasis removed."""
+    if "<" in text:
+        text = _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(text)))
+    text = fold(text)
+    if "[" in text:
+        text = _REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", text)).replace("[", "").replace("]", "")
+    return _MARKUP_RE.sub("", text)
+
+
 def _views(text):
-    """The raw view and the view with tags and markdown emphasis removed."""
+    """The folded view, the folded view with tags and emphasis removed, and the rendered view."""
     raw = fold(text)
-    return raw, _MARKUP_RE.sub("", _TAG_RE.sub("", raw))
+    return raw, _MARKUP_RE.sub("", _TAG_RE.sub("", raw)), rendered(text)
 
 
 def _has_subject(views):
     return _any(SUBJECT_RES, views)
 
 
-def _paragraphs(lines):
-    """(line index, text) per paragraph of a blank-line block: table rows alone, list items split."""
-    out, cur, first = [], [], 0
-    for i, line in enumerate(lines):
-        if _ROW_RE.match(line):
-            if cur:
-                out.append((first, "\n".join(cur)))
-                cur = []
-            out.append((i, line))
+def _is_delimiter_row(line):
+    """A GFM table delimiter row: only pipes, dashes, colons and blanks, with a pipe and a dash."""
+    body = line[_DELIM_PREFIX_RE.match(line).end():]
+    return "|" in body and "-" in body and set(body) <= _DELIM_CHARS
+
+
+def _is_blank(raw_line):
+    """CommonMark blank line: nothing but U+0020 and U+0009."""
+    return raw_line.strip(" \t") == ""
+
+
+def _fence_flags(lines):
+    """Per line: True when it opens, closes or sits inside a fenced code block (a heading there is
+    code, not a heading). An unclosed fence runs to the end."""
+    flags, fence = [], None
+    for line in lines:
+        m = _FENCE_RE.match(line)
+        if fence is None:
+            if m:
+                fence = m.group(1)
+            flags.append(fence is not None)
             continue
-        if cur and _ITEM_RE.match(line):
-            out.append((first, "\n".join(cur)))
-            cur = []
-        if not cur:
-            first = i
-        cur.append(line)
-    if cur:
-        out.append((first, "\n".join(cur)))
-    return out
+        flags.append(True)
+        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not line[m.end():].strip():
+            fence = None
+    return flags
 
 
-def _windows(para, implied_pair=False):
-    """(start, end) spans of the subject-bearing sentence windows of one paragraph; implied_pair
-    treats every sentence as carrying a pair word (the scope statement is about federation)."""
+def _windows(para, pair_context, row=False):
+    """(start, end) spans of the subject-bearing sentence windows of one paragraph. pair_context
+    says a pair word is in context outside the paragraph (the statement subsection, the nearest
+    preceding heading, or a table's header row)."""
     whole = _views(para)
-    if not _has_subject(whole) and not (_any(STEM_RES, whole) if implied_pair else _paired(whole)):
+    paired = pair_context or _any(PAIR_RES, whole)
+    if not _has_subject(whole) and not (paired and _any(STEM_RES, whole)):
         return []
-    if _ROW_RE.match(para):
+    if row:
         return [(0, len(para))]
     spans, start = [], 0
     for m in _SENT_END_RE.finditer(para):
@@ -311,17 +428,24 @@ def _windows(para, implied_pair=False):
         start = m.end()
     if start < len(para):
         spans.append((start, len(para)))
+    # An ordered-list marker ("2.") is not a sentence: it joins the sentence after it.
+    joined = []
+    for a, b in spans:
+        if joined and _MARKER_ONLY_RE.fullmatch(para[joined[-1][0]:joined[-1][1]].strip()):
+            joined[-1] = (joined[-1][0], b)
+        else:
+            joined.append((a, b))
+    spans = joined
     if len(spans) == 1:
         return [(0, len(para))]
-    views = [_views(para[a:b]) for a, b in spans]
-    pair = [implied_pair or _any(PAIR_RES, vs) for vs in views]
     hits = []
-    for i, vs in enumerate(views):
-        near = any(pair[max(0, i - 1):i + 2])
-        if _has_subject(vs) or (near and _any(STEM_RES, vs)):
+    for i, (a, b) in enumerate(spans):
+        views = _views(para[a:b])
+        if _has_subject(views) or (paired and _any(STEM_RES, views)):
             hits.append(i)
     if not hits:
-        return [(0, len(para))] if _has_subject(whole) else []
+        # The subject or the stem straddles a sentence boundary: gate the paragraph whole.
+        return [(0, len(para))]
     out = []
     for i in hits:
         lo, hi = max(0, i - 1), min(len(spans) - 1, i + 1)
@@ -332,56 +456,149 @@ def _windows(para, implied_pair=False):
     return [(spans[a][0], spans[b][1]) for a, b in out]
 
 
-def _paired(views):
-    return _any(STEM_RES, views) and _any(PAIR_RES, views)
+def _heading_gated(line, pair_context):
+    views = _views(line)
+    return _has_subject(views) or (_any(STEM_RES, views) and (pair_context or _any(PAIR_RES, views)))
 
 
-def scoped_text(rel, raw):
-    """The gated part of a file: CHANGELOG.md down to the first released-version heading."""
-    if rel == CHANGELOG_REL:
-        m = _RELEASED_RE.search(raw)
-        return raw[:m.start()] if m else raw
-    return raw
+def _scan(raw, implied=False, first_line=1):
+    """Cut raw text into blocks. Returns (paragraphs, headings): paragraphs are
+    (first index, normalised lines, pair context, is row); headings are (index, normalised line,
+    pair context). implied is True (every line is in the statement subsection), False, or an
+    inclusive (first, last) line-index range."""
+    raw_lines = raw.split("\n")
+    lines = [normalise(x) for x in raw_lines]
+    if any("\n" in x for x in lines):
+        raise AssertionError("normalisation produced a line break")
+    if implied is True:
+        lo, hi = 0, len(lines) - 1
+    elif implied:
+        lo, hi = implied
+    else:
+        lo, hi = -1, -2
+    paras, heads = [], []
+    fenced = _fence_flags(lines)
+    cur = []  # [first index, lines, starts with a list item, implied]
+    state = {"head_pair": False, "header_pair": None}
+
+    def flush():
+        if cur:
+            paras.append((cur[0], cur[1], cur[3] or state["head_pair"], False))
+            del cur[:]
+
+    for i, line in enumerate(lines):
+        imp = lo <= i <= hi
+        if cur and cur[3] != imp:
+            flush()
+            state["header_pair"] = None
+        if _is_blank(raw_lines[i]):
+            flush()
+            state["header_pair"] = None
+            continue
+        if not fenced[i] and _ATX_RE.match(line):
+            flush()
+            state["header_pair"] = None
+            heads.append((i, line, imp or state["head_pair"]))
+            state["head_pair"] = _any(PAIR_RES, _views(line))
+            continue
+        context = imp or state["head_pair"]
+        if state["header_pair"] is not None:
+            if _ROW_RE.match(line):
+                paras.append((i, [line], context or state["header_pair"], True))
+                continue
+            state["header_pair"] = None
+        if (_ROW_RE.match(line) and i + 1 < len(lines) and not _is_blank(raw_lines[i + 1])
+                and _is_delimiter_row(lines[i + 1])):
+            flush()
+            state["header_pair"] = _any(PAIR_RES, _views(line))
+            paras.append((i, [line], context, True))
+            continue
+        item = _ITEM_RE.match(line)
+        # An empty item never interrupts a paragraph; an ordered one only when it is numbered 1,
+        # unless the paragraph is itself a list item (then it is the next item).
+        if (cur and item and line[item.end():].strip(" \t")
+                and (cur[2] or item.group(1) is None or item.group(1).lstrip("0") == "1")):
+            flush()
+        if not cur:
+            cur.extend([i, [], bool(item), imp])
+        cur[1].append(line)
+    flush()
+    return paras, heads
+
+
+def _units(paras, first_line):
+    out = []
+    for index, plines, context, row in paras:
+        para = "\n".join(plines)
+        first, pos = first_line + index, 0
+        for a, b in _windows(para, context, row):
+            first += para.count("\n", pos, a)
+            last = first + para.count("\n", a, b)
+            out.append((first, last, _WS_RE.sub(" ", para[a:b]).strip()))
+            first, pos = last, b
+    return out
 
 
 def gated_units(text, implied_pair=False, first_line=1):
-    """(first line, last line, collapsed text) for every gated unit of normalised text."""
-    out, block, start = [], [], 0
-    for number, line in enumerate(text.split("\n") + [""], first_line):
-        if line.strip():
-            if not block:
-                start = number
-            block.append(line)
-            continue
-        if not block:
-            continue
-        for line_index, para in _paragraphs(block):
-            first, pos = start + line_index, 0
-            for a, b in _windows(para, implied_pair):
-                first += para.count("\n", pos, a)
-                last = first + para.count("\n", a, b)
-                out.append((first, last, _WS_RE.sub(" ", para[a:b]).strip()))
-                first, pos = last, b
-        block = []
-    return out
+    """(first line, last line, collapsed normalised text) for every gated unit of the text."""
+    return _units(_scan(text, implied_pair, first_line)[0], first_line)
+
+
+def gated_headings(text, implied_pair=False, first_line=1):
+    """(line, collapsed normalised heading) for every heading that must be pinned."""
+    return [(first_line + i, _WS_RE.sub(" ", line).strip())
+            for i, line, context in _scan(text, implied_pair, first_line)[1] if _heading_gated(line, context)]
+
+
+def _stop_offset(raw):
+    """Offset of the first line that starts with STOP_HEADING, or -1."""
+    pos = 0
+    while True:
+        at = raw.find(STOP_HEADING, pos)
+        if at < 0:
+            return -1
+        tail = raw[at + len(STOP_HEADING):at + len(STOP_HEADING) + 1]
+        if (at == 0 or raw[at - 1] == "\n") and tail in ("", "\n", " "):
+            return at
+        pos = at + 1
+
+
+def scoped_text(rel, raw):
+    """The gated part of a file: CHANGELOG.md down to the STOP_HEADING line (all of it if absent)."""
+    if rel == CHANGELOG_REL:
+        at = _stop_offset(raw)
+        return raw[:at] if at >= 0 else raw
+    return raw
+
+
+def _implied_range(rel, text):
+    """Inclusive line-index range of the scope statement subsection (HEADING to the "---" rule)."""
+    if rel != CERT_REL:
+        return False
+    a = text.find(HEADING)
+    if a < 0:
+        return False
+    b = text.find("\n---\n", a)
+    return text.count("\n", 0, a), text.count("\n", 0, b if b >= 0 else len(text))
 
 
 def file_units(rel, raw):
     """Units of one gated file; inside the scope statement subsection the pair word is implied."""
-    text = normalise(scoped_text(rel, raw))
-    if rel != CERT_REL or HEADING not in text:
-        return gated_units(text)
-    a = text.index(HEADING)
-    b = text.find("\n---\n", a)
-    b = len(text) if b < 0 else b
-    head_line = text.count("\n", 0, a) + 1
-    tail_line = head_line + text.count("\n", a, b)
-    return (gated_units(text[:a]) + gated_units(text[a:b], True, head_line)
-            + gated_units(text[b:], False, tail_line))
+    text = scoped_text(rel, raw)
+    return gated_units(text, _implied_range(rel, text))
+
+
+def file_headings(rel, raw):
+    text = scoped_text(rel, raw)
+    return gated_headings(text, _implied_range(rel, text))
 
 
 def current_units(root=ROOT):
     return {rel: file_units(rel, (root / rel).read_text(encoding="utf-8")) for rel in SINGLE_SOURCE_FILES}
+
+
+def current_headings(root=ROOT):
+    return {rel: file_headings(rel, (root / rel).read_text(encoding="utf-8")) for rel in SINGLE_SOURCE_FILES}
 
 
 def load_pins(root=ROOT):
@@ -389,12 +606,18 @@ def load_pins(root=ROOT):
     return [(p["file"], p["text"]) for p in data["pins"]]
 
 
-def emit_pins(units):
-    lines = ['{"issue": 8262, "vote": "6def5ab6", "pins": [']
+def load_heading_pins(root=ROOT):
+    data = json.loads((root / PINS_REL).read_text(encoding="utf-8"))
+    return [(p["file"], p["text"]) for p in data["headings"]]
+
+
+def emit_pins(units, headings):
     rows = [json.dumps({"file": rel, "text": u[2]}, ensure_ascii=True)
             for rel in SINGLE_SOURCE_FILES for u in units[rel]]
-    lines.append(",\n".join(rows))
-    lines.append("]}")
+    heads = [json.dumps({"file": rel, "text": h[1]}, ensure_ascii=True)
+             for rel in SINGLE_SOURCE_FILES for h in headings[rel]]
+    lines = ['{"issue": 8262, "vote": "6def5ab6", "pins": [', ",\n".join(rows),
+             '], "headings": [', ",\n".join(heads), "]}"]
     return "\n".join(lines) + "\n"
 
 
@@ -486,6 +709,8 @@ class CertificationScope8262(unittest.TestCase):
     def setUpClass(cls):
         cls.units = current_units()
         cls.pins = load_pins()
+        cls.headings = current_headings()
+        cls.heading_pins = load_heading_pins()
 
     # ---- the allowlist, both directions ----
     def test_pin_table_is_well_formed(self):
@@ -510,6 +735,24 @@ class CertificationScope8262(unittest.TestCase):
                for rel, text in self.pins if seen[(rel, text)] != 1]
         self.assertEqual(bad, [], "\n".join(bad[:5]))
 
+    def test_no_unit_holds_a_heading_line(self):
+        for rel, units in self.units.items():
+            lines = [normalise(x) for x in scoped_text(rel, _read(rel)).split("\n")]
+            fenced = _fence_flags(lines)
+            bad = ["%s:%d" % (rel, n) for first, last, _ in units for n in range(first, last + 1)
+                   if not fenced[n - 1] and _ATX_RE.match(lines[n - 1])]
+            self.assertEqual(bad, [], "heading line inside a unit: " + ", ".join(bad[:5]))
+
+    def test_every_gated_heading_is_pinned_exactly_once(self):
+        self.assertEqual(len(self.heading_pins), len(set(self.heading_pins)), "the heading table repeats a pin")
+        seen = collections.Counter((rel, h[1]) for rel, heads in self.headings.items() for h in heads)
+        unpinned = ["%s:%d unpinned heading: %s" % (rel, h[0], h[1]) for rel, heads in self.headings.items()
+                    for h in heads if (rel, h[1]) not in set(self.heading_pins)]
+        self.assertEqual(unpinned, [], "\n".join(unpinned[:5]))
+        stale = ["%s heading pin found %d times (want 1): %s" % (rel, seen[(rel, text)], text)
+                 for rel, text in self.heading_pins if seen[(rel, text)] != 1]
+        self.assertEqual(stale, [], "\n".join(stale[:5]))
+
     def test_statement_canonical_paragraph_is_pinned(self):
         hit = [t for r, t in self.pins if r == CERT_REL and E2E_CANON in t]
         self.assertEqual(len(hit), 1, "the canonical paragraph is not in exactly one CERT pin")
@@ -520,20 +763,106 @@ class CertificationScope8262(unittest.TestCase):
             self.assertEqual(got, EXEMPT_CHARS.get(rel, {}), "%s refused characters: %s" % (
                 rel, {"U+%04X" % k: v for k, v in sorted(got.items())}))
 
+    def test_gated_files_letters_match_the_census(self):
+        for rel in SINGLE_SOURCE_FILES:
+            self.assertEqual(letter_census(_read(rel)), LETTER_CENSUS.get(rel, {}), rel + " letter census drifted")
+        self.assertEqual([cp for cp in LOOKALIKE_LETTERS if cp in LETTER_ALLOW], [],
+                         "a look-alike letter is in the allowlist")
+
+    def test_gated_files_refuse_comments_with_vocabulary(self):
+        for rel in SINGLE_SOURCE_FILES:
+            text = scoped_text(rel, _read(rel))
+            bad = [comment[:200] for _, comment in html_comments(text)
+                   if comment not in COMMENT_EXEMPT.get(rel, ())
+                   and (_has_subject(_views(comment)) or _any(STEM_RES, _views(comment)))]
+            self.assertEqual(bad, [], rel + " carries an HTML comment with the subject vocabulary")
+        for rel, comments in COMMENT_EXEMPT.items():
+            text = _read(rel)
+            for comment in comments:
+                self.assertEqual(text.count(comment), 1, rel + " lost or repeated an exempt comment")
+
     def test_changelog_gate_is_the_current_release_section(self):
         raw = _read(CHANGELOG_REL)
+        lines = raw.split("\n")
+        stops = [i for i, ln in enumerate(lines) if ln == STOP_HEADING or ln.startswith(STOP_HEADING + " ")]
+        self.assertEqual(len(stops), 1, "the CHANGELOG stop heading must appear exactly once")
         scoped = scoped_text(CHANGELOG_REL, raw)
-        self.assertIn("## [Unreleased]", scoped)
+        self.assertEqual(scoped.count("\n"), stops[0], "the gate must end right above the stop heading")
+        before = lines[:stops[0]]
+        self.assertIn("## [Unreleased]", before)
         self.assertIn("### Docs (#8262", scoped)
-        self.assertRegex(raw[len(scoped):].split("\n", 1)[0], r"^## \[\d+\.\d+\.\d+\]")
+        released = [ln for ln in before if _RELEASE_HEADING_RE.match(ln)]
+        bad = [ln for ln in released if not ln.startswith(GATED_RELEASE_PREFIX) or _DATE_RE.search(ln)]
+        self.assertEqual(bad, [], "a released-version heading sits inside the gated CHANGELOG section")
+        self.assertTrue(released, "the [1.0.0] heading is missing from the gated section")
+
+    def test_round12_block_rules_on_synthetic_text(self):
+        def texts(raw, implied=False):
+            return [u[2] for u in gated_units(raw, implied)]
+        # Headings end the paragraph and never sit in a unit; a subject heading is a heading pin.
+        self.assertEqual(texts("Intro about X25519.\n## Next\nMore."), ["Intro about X25519."])
+        self.assertEqual(gated_headings("## X25519 keys\nIt is fine."), [(1, "## X25519 keys")])
+        self.assertEqual(gated_headings("```\n# X25519 note\n```"), [])
+        # Pair context: the paragraph, the table header row, the nearest preceding heading.
+        self.assertEqual(texts("| Federation feature | Version |\n|---|---|\n| Content encryption | v1.1 |"),
+                         ["| Content encryption | v1.1 |"])
+        self.assertEqual(texts("Peers replicate over mTLS. This is the transport today. "
+                               "Content encryption is deferred to v1.1."),
+                         ["This is the transport today. Content encryption is deferred to v1.1."])
+        self.assertEqual(texts("## Federation roadmap\n\nContent encryption is deferred to v1.1."),
+                         ["Content encryption is deferred to v1.1."])
+        self.assertEqual(texts("Federation is mTLS. It moved to v1.1. That was the release decision. "
+                               "Content encryption now ships later."),
+                         ["That was the release decision. Content encryption now ships later."])
+        self.assertEqual(texts("- Federation is mTLS today.\n| Content encryption | v1.1 |"),
+                         ["- Federation is mTLS today. | Content encryption | v1.1 |"])
+        self.assertEqual(texts("## Notes\n\nContent encryption is deferred to v1.1."),
+                         ["Content encryption is deferred to v1.1."])
+        self.assertEqual(texts("## OSS commitment\n\n| Content encryption | v1.1 |"), ["| Content encryption | v1.1 |"])
+        self.assertEqual(texts("## Notes\n\nThe envelope is deferred to v1.1."), [])
+        # Paragraph ends: only U+0020/U+0009 lines are blank; lazy pipe and ordered lines continue.
+        para = "Keys are X25519 pairs."
+        for sep in (" ", "　", "\x0c"):
+            got = texts(para + "\n" + sep + "\nIt is deferred to v1.1.")
+            self.assertEqual(len(got), 1, repr(sep))
+            self.assertTrue(got[0].startswith(para) and got[0].endswith("It is deferred to v1.1."), repr(sep))
+            self.assertIn(ord(sep), refused_chars(para + sep))
+        self.assertEqual(texts(para + "\n| It is deferred to v1.1."), [para + " | It is deferred to v1.1."])
+        self.assertEqual(texts(para + "\n2. It is deferred to v1.1."), [para + " 2. It is deferred to v1.1."])
+        self.assertEqual(texts(para + "\n1. It is deferred to v1.1."), [para])
+        self.assertEqual(texts(para + "\n \t\nIt is deferred to v1.1."), [para])
+        stmt = HEADING + "\n\nContent encryption is pending.\n| That condition was waived.\n\n---\n"
+        self.assertEqual([u[2] for u in file_units(CERT_REL, stmt)],
+                         ["Content encryption is pending. | That condition was waived."])
+        stmt = HEADING + "\n\nContent encryption is pending.\n \nThat condition was waived.\n\n---\n"
+        self.assertEqual(len(file_units(CERT_REL, stmt)), 1)
+        self.assertIn("waived", file_units(CERT_REL, stmt)[0][2])
+
+    def test_round12_character_and_markup_rules_on_synthetic_text(self):
+        for word, cp in (("Varıants A and B", 0x0131), ("Vɑriant B", 0x0251),
+                         ("Variant ᴀ", 0x1D00), ("variant ʙ", 0x0299)):
+            self.assertIn(cp, refused_chars(word), word)
+        for cp in (0x2028, 0x2029, 0x00A0, 0x3000, 0x2007, 0x000C, 0x000D, 0x000B):
+            self.assertIn(cp, refused_chars("x" + chr(cp) + "y"), "U+%04X" % cp)
+        self.assertEqual(refused_chars("a b\tc\nd"), {})
+        for text in ("#82[78](#scope) is deferred to v1.1.", "[End](#scope)-to-end content protection is late.",
+                     "#82<!-- > -->78 is deferred to v1.1.", "#82<b title=\">\"></b>78 is deferred to v1.1.",
+                     "![X2](a.png)5519 keys are late.", "#82[78][ref] is deferred."):
+            self.assertTrue(gated_units(text), text)
+        self.assertEqual([u[2] for u in gated_units("See [#8278](https://example.org/8278) for variants.")],
+                         ["See [#8278](https://example.org/8278) for variants."])
+        self.assertEqual(gated_units("A [plain link](https://example.org/x) only."), [])
+        self.assertEqual([c for _, c in html_comments("a <!-- x --> b <!--> c <!-- open")],
+                         ["<!-- x -->", "<!-->", "<!-- open"])
 
     def test_unit_rules_on_synthetic_text(self):
         para = "One. Two. #8278 is here. Four. Five."
         self.assertEqual([u[2] for u in gated_units(para)], ["Two. #8278 is here. Four."])
-        self.assertEqual(gated_units("| a | Variant-B | x |\n| b | c |"), [(1, 1, "| a | Variant-B | x |")])
+        self.assertEqual(gated_units("| a | Variant-B | x |\n|---|---|---|\n| b | c |"), [(1, 1, "| a | Variant-B | x |")])
         self.assertEqual(len(gated_units("- end to end\n- other item")), 1)
-        self.assertEqual(gated_units("Content encryption is on."), [])
-        self.assertEqual(gated_units("Content encryption is on.", True, 7), [(7, 7, "Content encryption is on.")])
+        self.assertEqual(gated_units("Content encryption is on."), [(1, 1, "Content encryption is on.")])
+        self.assertEqual(gated_units("The envelope is on."), [])
+        self.assertEqual(gated_units("The envelope is on.", True, 7), [(7, 7, "The envelope is on.")])
         stmt = file_units(CERT_REL, HEADING + "\n\nOnce again, content encryption is enabled.\n\n---\n\nIt is on.\n")
         self.assertEqual(stmt, [(3, 3, "Once again, content encryption is enabled.")])
         self.assertEqual(len(gated_units("Rows are sealed. Peers read them.")), 1)
@@ -656,6 +985,6 @@ class CertificationScope8262(unittest.TestCase):
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--emit-pins"]:
-        sys.stdout.write(emit_pins(current_units()))
+        sys.stdout.write(emit_pins(current_units(), current_headings()))
         sys.exit(0)
     unittest.main()
