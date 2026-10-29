@@ -34,9 +34,19 @@
 //!   random wrap nonces never share a key across records.
 //! * Both AEAD operations authenticate the same binding string
 //!   `version || key_id || epoch || len32(memory_id) || memory_id ||
-//!   len32(namespace) || namespace`, prefixed by a one-byte role (DEK wrap or
-//!   content). Swapping ciphertext between rows, renaming the namespace or
-//!   editing the key id / epoch fails authentication.
+//!   len32(namespace) || namespace || row_version`, prefixed by a one-byte
+//!   role (DEK wrap or content). `row_version` is the row's optimistic
+//!   concurrency counter (`Memory::version`, i64 big-endian). Swapping
+//!   ciphertext between rows, renaming the namespace, editing the key id /
+//!   epoch, or presenting an older envelope of the same row under a newer row
+//!   version fails authentication.
+//! * Every version-bumping write of a `0x05` row therefore re-seals it (the
+//!   E2 writer path). The binding stops an old envelope being replayed under
+//!   the current version; refusing a whole row rolled back to an older
+//!   version needs the receiver's monotonic version compare (E2).
+//! * The symmetric key gives confidentiality and row binding, not writer
+//!   authenticity: any reader of the namespace can produce a valid envelope.
+//!   Writer authenticity is record signing (E2), design section 2.
 //!
 //! ## Crypto-erase
 //!
@@ -219,11 +229,27 @@ pub struct RecordBinding<'a> {
     pub memory_id: &'a str,
     /// The memory row namespace.
     pub namespace: &'a str,
+    /// The row version the envelope was sealed at (`Memory::version`, the
+    /// optimistic-concurrency counter every mutation bumps).
+    pub row_version: i64,
+}
+
+impl<'a> RecordBinding<'a> {
+    /// The binding of row `memory_id` in `namespace` at `row_version`.
+    #[must_use]
+    pub fn new(memory_id: &'a str, namespace: &'a str, row_version: i64) -> Self {
+        Self {
+            memory_id,
+            namespace,
+            row_version,
+        }
+    }
 }
 
 /// Typed failures of the `0x05` envelope. Every one is a refusal: nothing
 /// opens, nothing is substituted.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScopeEnvelopeError {
     /// The buffer is shorter than the fixed header plus one tag.
     Truncated {
@@ -321,10 +347,32 @@ fn refuse(err: ScopeEnvelopeError) -> anyhow::Error {
     anyhow::Error::new(err)
 }
 
+/// `N` bytes from the OS CSPRNG, built element by element from 64-bit draws
+/// so no constant-initialised buffer ever reaches a key, nonce or salt.
 fn random_array<const N: usize>() -> [u8; N] {
-    let mut out = [0u8; N];
-    OsRng.fill_bytes(&mut out);
-    out
+    let mut draws = std::iter::repeat_with(|| OsRng.next_u64().to_le_bytes()).flatten();
+    std::array::from_fn(|_| draws.next().unwrap_or_default())
+}
+
+/// The per-record random inputs of one seal. Zeroized on drop: the DEK is
+/// secret and the rest is no longer needed once the envelope is written.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct SealMaterial {
+    salt: [u8; WRAP_SALT_LEN],
+    wrap_nonce: [u8; NONCE_LEN],
+    inner_nonce: [u8; NONCE_LEN],
+    dek: [u8; RECORD_DEK_LEN],
+}
+
+impl SealMaterial {
+    fn random() -> Self {
+        Self {
+            salt: random_array(),
+            wrap_nonce: random_array(),
+            inner_nonce: random_array(),
+            dek: random_array(),
+        }
+    }
 }
 
 /// Read the key reference out of a `0x05` header (version and length are
@@ -349,10 +397,18 @@ pub fn parse_scope_header(envelope: &[u8]) -> Result<ScopeKeyRef> {
             need: SCOPE_ENVELOPE_MIN_LEN,
         }));
     }
-    let mut id = [0u8; SCOPE_KEY_ID_LEN];
-    id.copy_from_slice(&envelope[OFF_KEY_ID..OFF_EPOCH]);
-    let mut epoch = [0u8; EPOCH_LEN];
-    epoch.copy_from_slice(&envelope[OFF_EPOCH..OFF_SALT]);
+    let truncated = |_| {
+        refuse(ScopeEnvelopeError::Truncated {
+            len: envelope.len(),
+            need: SCOPE_ENVELOPE_MIN_LEN,
+        })
+    };
+    let id: [u8; SCOPE_KEY_ID_LEN] = envelope[OFF_KEY_ID..OFF_EPOCH]
+        .try_into()
+        .map_err(truncated)?;
+    let epoch: [u8; EPOCH_LEN] = envelope[OFF_EPOCH..OFF_SALT]
+        .try_into()
+        .map_err(truncated)?;
     Ok(ScopeKeyRef {
         key_id: ScopeKeyId(id),
         epoch: u32::from_be_bytes(epoch),
@@ -366,10 +422,18 @@ fn push_len_prefixed(out: &mut Vec<u8>, field: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Length of the big-endian row-version field of the binding.
+const ROW_VERSION_LEN: usize = 8;
+
 /// The AAD of one AEAD operation: role byte, then the binding string.
 fn binding_aad(role: u8, key_ref: ScopeKeyRef, binding: RecordBinding<'_>) -> Result<Vec<u8>> {
     let mut aad = Vec::with_capacity(
-        2 + SCOPE_KEY_ID_LEN + EPOCH_LEN + 8 + binding.memory_id.len() + binding.namespace.len(),
+        2 + SCOPE_KEY_ID_LEN
+            + EPOCH_LEN
+            + 8
+            + binding.memory_id.len()
+            + binding.namespace.len()
+            + ROW_VERSION_LEN,
     );
     aad.push(role);
     aad.push(SCOPE_ENVELOPE_VERSION);
@@ -377,22 +441,20 @@ fn binding_aad(role: u8, key_ref: ScopeKeyRef, binding: RecordBinding<'_>) -> Re
     aad.extend_from_slice(&key_ref.epoch.to_be_bytes());
     push_len_prefixed(&mut aad, binding.memory_id.as_bytes())?;
     push_len_prefixed(&mut aad, binding.namespace.as_bytes())?;
+    aad.extend_from_slice(&binding.row_version.to_be_bytes());
     Ok(aad)
 }
 
-/// The per-record DEK-wrap key. The caller zeroizes the result.
-fn derive_wrap_key(
-    secret: &[u8; SCOPE_KEY_LEN],
-    salt: &[u8],
-    key_ref: ScopeKeyRef,
-) -> Result<[u8; AEAD_KEY_LEN]> {
+/// The per-record DEK-wrap key, expanded straight into the cipher key type.
+/// The caller zeroizes the result.
+fn derive_wrap_key(secret: &[u8; SCOPE_KEY_LEN], salt: &[u8], key_ref: ScopeKeyRef) -> Result<Key> {
     let hk = Hkdf::<Sha256>::new(Some(salt), secret);
     let mut info = Vec::with_capacity(DEK_WRAP_INFO.len() + SCOPE_KEY_ID_LEN + EPOCH_LEN);
     info.extend_from_slice(DEK_WRAP_INFO);
     info.extend_from_slice(&key_ref.key_id.0);
     info.extend_from_slice(&key_ref.epoch.to_be_bytes());
-    let mut okm = [0u8; AEAD_KEY_LEN];
-    hk.expand(&info, &mut okm)
+    let mut okm = Key::default();
+    hk.expand(&info, okm.as_mut_slice())
         .map_err(|e| anyhow!("HKDF expand of the scope DEK-wrap key failed: {e}"))?;
     Ok(okm)
 }
@@ -403,6 +465,17 @@ fn derive_wrap_key(
 /// [`ScopeEnvelopeError::NamespaceMismatch`] when the row is not in the key's
 /// namespace, [`ScopeEnvelopeError::BindingTooLong`], or an AEAD failure.
 pub fn seal_scoped(content: &str, key: &ScopeKey, binding: RecordBinding<'_>) -> Result<Vec<u8>> {
+    seal_with_material(content, key, binding, &SealMaterial::random())
+}
+
+/// The deterministic core of [`seal_scoped`]: every random input comes from
+/// `material`, so the known-answer test can pin the exact bytes.
+fn seal_with_material(
+    content: &str,
+    key: &ScopeKey,
+    binding: RecordBinding<'_>,
+    material: &SealMaterial,
+) -> Result<Vec<u8>> {
     if binding.namespace != key.namespace() {
         return Err(refuse(ScopeEnvelopeError::NamespaceMismatch {
             row: binding.namespace.to_string(),
@@ -412,30 +485,25 @@ pub fn seal_scoped(content: &str, key: &ScopeKey, binding: RecordBinding<'_>) ->
     let key_ref = key.key_ref();
     let wrap_aad = binding_aad(AAD_ROLE_DEK_WRAP, key_ref, binding)?;
     let content_aad = binding_aad(AAD_ROLE_CONTENT, key_ref, binding)?;
-    let salt: [u8; WRAP_SALT_LEN] = random_array();
-    let wrap_nonce: [u8; NONCE_LEN] = random_array();
-    let inner_nonce: [u8; NONCE_LEN] = random_array();
 
-    let mut dek: [u8; RECORD_DEK_LEN] = random_array();
-    let mut wrap_key = derive_wrap_key(key.secret_bytes(), &salt, key_ref)?;
-    let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(&wrap_key));
-    wrap_key.zeroize();
+    let mut wrap_key = derive_wrap_key(key.secret_bytes(), &material.salt, key_ref)?;
+    let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
+    wrap_key.as_mut_slice().zeroize();
     let wrapped = wrap_cipher.encrypt(
-        Nonce::from_slice(&wrap_nonce),
+        Nonce::from_slice(&material.wrap_nonce),
         Payload {
-            msg: &dek,
+            msg: &material.dek,
             aad: &wrap_aad,
         },
     );
-    let content_cipher = ChaCha20Poly1305::new(Key::from_slice(&dek));
-    dek.zeroize();
+    let content_cipher = ChaCha20Poly1305::new(Key::from_slice(&material.dek));
     let wrapped = wrapped.map_err(|e| anyhow!("scope DEK wrap failed: {e}"))?;
     if wrapped.len() != WRAPPED_DEK_LEN {
         return Err(refuse(ScopeEnvelopeError::DekLength));
     }
     let inner_ct = content_cipher
         .encrypt(
-            Nonce::from_slice(&inner_nonce),
+            Nonce::from_slice(&material.inner_nonce),
             Payload {
                 msg: content.as_bytes(),
                 aad: &content_aad,
@@ -447,10 +515,10 @@ pub fn seal_scoped(content: &str, key: &ScopeKey, binding: RecordBinding<'_>) ->
     out.push(SCOPE_ENVELOPE_VERSION);
     out.extend_from_slice(&key_ref.key_id.0);
     out.extend_from_slice(&key_ref.epoch.to_be_bytes());
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&wrap_nonce);
+    out.extend_from_slice(&material.salt);
+    out.extend_from_slice(&material.wrap_nonce);
     out.extend_from_slice(&wrapped);
-    out.extend_from_slice(&inner_nonce);
+    out.extend_from_slice(&material.inner_nonce);
     out.extend_from_slice(&inner_ct);
     Ok(out)
 }
@@ -494,8 +562,8 @@ fn open_with_secret(
     let inner_ct = &envelope[SCOPE_HEADER_LEN..];
 
     let mut wrap_key = derive_wrap_key(secret, salt, key_ref)?;
-    let wrap_cipher = ChaCha20Poly1305::new(Key::from_slice(&wrap_key));
-    wrap_key.zeroize();
+    let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
+    wrap_key.as_mut_slice().zeroize();
     let mut dek = wrap_cipher
         .decrypt(
             Nonce::from_slice(wrap_nonce),
@@ -520,15 +588,21 @@ fn open_with_secret(
             },
         )
         .map_err(|_| refuse(ScopeEnvelopeError::Authentication))?;
-    String::from_utf8(plaintext).map_err(|_| refuse(ScopeEnvelopeError::NotUtf8))
+    String::from_utf8(plaintext).map_err(|e| {
+        // The bytes decrypted fine: they are plaintext and must not linger.
+        let mut bytes = e.into_bytes();
+        bytes.zeroize();
+        refuse(ScopeEnvelopeError::NotUtf8)
+    })
 }
 
 /// Open a `0x05` envelope as `reader`: look the named key up in `store`,
 /// unwrap the reader's stanza with its KEK, then open.
 ///
 /// # Errors
-/// The key is unknown to the store, `reader` holds no stanza for it, the
-/// stanza does not unwrap, or [`open_scoped`] refuses.
+/// The key is unknown to the store (typed
+/// [`store::ScopeKeyStoreError::UnknownKey`]), `reader` holds no stanza for
+/// it, the stanza does not unwrap, or [`open_scoped`] refuses.
 pub fn open_content_scoped_in(
     envelope: &[u8],
     reader: &Keypair,
@@ -555,7 +629,7 @@ pub fn open_content_scoped(
     binding: RecordBinding<'_>,
 ) -> Result<String> {
     let reader = super::load_keypair(agent_id)?.ok_or_else(|| super::key_absent_error(agent_id))?;
-    let store = store::FileScopeKeyStore::new(super::keypair_persist_dir()?);
+    let store = store::FileScopeKeyStore::open(super::keypair_persist_dir()?, agent_id)?;
     open_content_scoped_in(envelope, &reader, &store, binding)
 }
 

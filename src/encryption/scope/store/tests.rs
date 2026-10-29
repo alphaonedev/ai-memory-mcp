@@ -1,8 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #8278 (E1) — scope-key store, stanza and escrow tests. TEST material only:
-//! every key here is generated at random inside the test.
+//! #8278 (E1) — scope-key store, stanza, escrow, audit-log and cache tests.
+//! TEST material only: every key here is generated at random inside the test.
 
 use super::*;
 use crate::encryption::scope::{
@@ -20,6 +20,12 @@ fn sandbox() -> tempfile::TempDir {
             .expect("chmod sandbox");
     }
     t
+}
+
+const ACTOR: &str = "node-test-8278";
+
+fn open_store(dir: &Path) -> FileScopeKeyStore {
+    FileScopeKeyStore::open(dir.to_path_buf(), ACTOR).expect("open store")
 }
 
 /// A random TEST node keypair (never written to disk, never cached).
@@ -46,10 +52,7 @@ fn store_refusal(err: &anyhow::Error) -> ScopeKeyStoreError {
 }
 
 fn row<'a>(memory_id: &'a str, namespace: &'a str) -> RecordBinding<'a> {
-    RecordBinding {
-        memory_id,
-        namespace,
-    }
+    RecordBinding::new(memory_id, namespace, 1)
 }
 
 const NS: &str = "test/e2e-store-8278";
@@ -62,27 +65,30 @@ fn minted(store: &FileScopeKeyStore, readers: &[&Keypair]) -> ScopeKeyRecord {
     }
 }
 
+fn kek_fp(node: &Keypair) -> String {
+    ReaderKek::from_keypair(node).fingerprint()
+}
+
 #[test]
 fn scope_key_mint_writes_private_record_with_escrow_8278() {
     let dir = sandbox();
     let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let node = test_node("node-a");
     let record = minted(&store, &[&node]);
     assert_eq!(record.epoch, 1);
     assert_eq!(record.namespace, NS);
     assert_eq!(record.recipients.len(), 1);
     assert!(record.superseded_at.is_none());
-    let path = store.record_path(NS, 1);
-    assert!(path.starts_with(dir.path().join(SCOPE_KEY_SUBDIR)));
     #[cfg(unix)]
-    {
+    for path in [store.record_path(NS, 1), store.audit_path(NS)] {
         use std::os::unix::fs::PermissionsExt as _;
+        assert!(path.starts_with(dir.path().join(SCOPE_KEY_SUBDIR)));
         let mode = std::fs::metadata(&path)
-            .expect("record")
+            .expect("ledger file")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600, "record file must be owner-only");
+        assert_eq!(mode & 0o777, 0o600, "{} must be owner-only", path.display());
     }
     assert_eq!(store.load_current(NS).expect("load"), Some(record.clone()));
     assert_eq!(
@@ -96,7 +102,7 @@ fn scope_key_mint_writes_private_record_with_escrow_8278() {
 #[test]
 fn scope_key_mint_refused_without_recovery_key_8278() {
     let dir = sandbox();
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let node = test_node("node-a");
     let err = store
         .mint(NS, &[ReaderKek::from_keypair(&node)])
@@ -110,6 +116,7 @@ fn scope_key_mint_refused_without_recovery_key_8278() {
         None,
         "nothing written"
     );
+    assert!(store.audit_log(NS).expect("audit").is_empty());
     let err = store.mint(NS, &[]).expect_err("no reader, no mint");
     assert!(matches!(
         store_refusal(&err),
@@ -121,7 +128,7 @@ fn scope_key_mint_refused_without_recovery_key_8278() {
 fn scope_key_mint_is_idempotent_and_serialised_8278() {
     let dir = sandbox();
     let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let node = test_node("node-a");
     let reader = ReaderKek::from_keypair(&node);
     let outcomes: Vec<MintOutcome> = std::thread::scope(|s| {
@@ -144,13 +151,14 @@ fn scope_key_mint_is_idempotent_and_serialised_8278() {
         .collect();
     assert_eq!(ids.len(), 1, "every caller sees the one key");
     assert_eq!(store.history(NS).expect("history").len(), 1);
+    assert_eq!(store.ledger_head(NS).expect("head"), LedgerHead(1));
 }
 
 #[test]
 fn scope_key_reader_opens_non_reader_cannot_8278() {
     let dir = sandbox();
     let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let reader = test_node("node-reader");
     let outsider = test_node("node-outsider");
     let record = minted(&store, &[&reader]);
@@ -169,10 +177,50 @@ fn scope_key_reader_opens_non_reader_cannot_8278() {
 }
 
 #[test]
+fn scope_open_unknown_key_is_typed_unknown_key_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    let reader = test_node("node-reader");
+    let record = minted(&store, &[&reader]);
+    // An epoch the ledger does not hold, in a namespace it does.
+    let future = ScopeKey::generate(
+        NS,
+        ScopeKeyRef {
+            key_id: ScopeKeyId::random(),
+            epoch: record.epoch + 1,
+        },
+    );
+    let sealed = seal_scoped("future epoch", &future, row("mem-u", NS)).expect("seal");
+    let err = open_content_scoped_in(&sealed, &reader, &store, row("mem-u", NS))
+        .expect_err("unknown epoch must not open");
+    assert!(matches!(
+        store_refusal(&err),
+        ScopeKeyStoreError::UnknownKey { .. }
+    ));
+    // A namespace with no ledger at all.
+    let other = "test/no-ledger-8278";
+    let stray = ScopeKey::generate(
+        other,
+        ScopeKeyRef {
+            key_id: ScopeKeyId::random(),
+            epoch: 1,
+        },
+    );
+    let sealed = seal_scoped("no ledger", &stray, row("mem-v", other)).expect("seal");
+    let err = open_content_scoped_in(&sealed, &reader, &store, row("mem-v", other))
+        .expect_err("no ledger must not open");
+    assert!(matches!(
+        store_refusal(&err),
+        ScopeKeyStoreError::UnknownKey { .. }
+    ));
+}
+
+#[test]
 fn scope_key_add_then_remove_reader_8278() {
     let dir = sandbox();
     let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let first = test_node("node-first");
     let second = test_node("node-second");
     let record = minted(&store, &[&first]);
@@ -212,7 +260,7 @@ fn scope_key_add_then_remove_reader_8278() {
         RecipientChange::Absent
     );
     let err = store
-        .remove_recipient(NS, 1, &ReaderKek::from_keypair(&first).fingerprint())
+        .remove_recipient(NS, 1, &kek_fp(&first))
         .expect_err("last reader stays");
     assert!(matches!(
         store_refusal(&err),
@@ -224,7 +272,7 @@ fn scope_key_add_then_remove_reader_8278() {
 fn scope_key_add_recipient_refuses_a_key_failing_the_check_8278() {
     let dir = sandbox();
     let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let first = test_node("node-first");
     let record = minted(&store, &[&first]);
     let forged = ScopeKey::generate(NS, record.key_ref().expect("ref"));
@@ -235,13 +283,14 @@ fn scope_key_add_recipient_refuses_a_key_failing_the_check_8278() {
         store_refusal(&err),
         ScopeKeyStoreError::StanzaBindingMismatch { .. }
     ));
+    assert_eq!(store.ledger_head(NS).expect("head"), LedgerHead(1));
 }
 
 #[test]
 fn scope_key_supersede_keeps_old_rows_on_old_key_8278() {
     let dir = sandbox();
     let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let stays = test_node("node-stays");
     let revoked = test_node("node-revoked");
     let first = minted(&store, &[&stays, &revoked]);
@@ -292,19 +341,54 @@ fn scope_key_supersede_keeps_old_rows_on_old_key_8278() {
 }
 
 #[test]
+fn scope_key_supersede_refuses_a_changed_recovery_key_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    let node = test_node("node-a");
+    minted(&store, &[&node]);
+    // Another recovery key now enrolled (the explicit rotation path, #3717,
+    // is the only legitimate way; this simulates its file landing).
+    let other = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+    crate::identity::keypair::write_with_mode(
+        &escrow::recovery_pub_path(dir.path()),
+        other.as_bytes(),
+        0o644,
+    )
+    .expect("replace TEST recovery key");
+    let err = store
+        .supersede(NS, &[ReaderKek::from_keypair(&node)])
+        .expect_err("escrow chain must not fork");
+    assert!(matches!(
+        store_refusal(&err),
+        ScopeKeyStoreError::RecoveryKeyChanged { .. }
+    ));
+    assert_eq!(
+        store.history(NS).expect("history").len(),
+        1,
+        "nothing written"
+    );
+    assert_eq!(store.ledger_head(NS).expect("head"), LedgerHead(1));
+}
+
+#[test]
 fn scope_key_escrow_recover_round_trip_8278() {
     let dir = sandbox();
     let recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let lost = test_node("node-lost");
     let record = minted(&store, &[&lost]);
     let original = record.unwrap_for(&lost).expect("unwrap");
     let sealed =
         seal_scoped("survives a lost node key", &original, row("mem-3", NS)).expect("seal");
 
+    // The real recovery path: the recovery private key alone yields a scope
+    // key that opens the content row.
     let recovered = record.recover_with(&recovery).expect("escrow recover");
-    assert_eq!(recovered.secret_bytes(), original.secret_bytes());
-    assert_eq!(recovered.key_ref(), original.key_ref());
+    assert_eq!(
+        open_scoped(&sealed, &recovered, row("mem-3", NS)).expect("recovered key opens the row"),
+        "survives a lost node key"
+    );
     // Re-grant to the node's replacement KEK, which then opens the row.
     let replacement = test_node("node-lost");
     assert_eq!(
@@ -328,8 +412,8 @@ fn scope_key_escrow_recover_round_trip_8278() {
 #[test]
 fn scope_key_stanza_moved_between_records_refused_8278() {
     let dir = sandbox();
-    let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
     let node = test_node("node-a");
     let reader = ReaderKek::from_keypair(&node);
     let a = store
@@ -351,34 +435,233 @@ fn scope_key_stanza_moved_between_records_refused_8278() {
         store_refusal(&err),
         ScopeKeyStoreError::StanzaBindingMismatch { .. }
     ));
+    // The escrow stanza of `a`, opened with the genuinely enrolled recovery
+    // key: it decrypts, and the id binding refuses it.
     b.escrow.wrapped = a.escrow.wrapped.clone();
     let err = b
-        .recover_with(&enrol_test_recovery_noop(&a))
-        .expect_err("recovery fingerprint gate first");
+        .recover_with(&recovery)
+        .expect_err("escrow stanza of another namespace");
     assert!(matches!(
         store_refusal(&err),
-        ScopeKeyStoreError::RecoveryKeyMismatch { .. }
+        ScopeKeyStoreError::StanzaBindingMismatch { .. }
     ));
 }
 
-/// A random recovery secret that is NOT the enrolled one.
-fn enrol_test_recovery_noop(_record: &ScopeKeyRecord) -> StaticSecret {
-    StaticSecret::random_from_rng(OsRng)
+#[test]
+fn scope_key_audit_records_every_mutation_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    let first = test_node("node-first");
+    let second = test_node("node-second");
+    let record = minted(&store, &[&first]);
+    let key = record.unwrap_for(&first).expect("unwrap");
+    store
+        .add_recipient(&key, &ReaderKek::from_keypair(&second))
+        .expect("add");
+    store
+        .remove_recipient(NS, 1, &kek_fp(&second))
+        .expect("remove");
+    let next = store
+        .supersede(NS, &[ReaderKek::from_keypair(&first)])
+        .expect("supersede");
+
+    let log = store.audit_log(NS).expect("audit");
+    let shape: Vec<(u64, AuditAction, u32, u32, u32, Option<String>)> = log
+        .iter()
+        .map(|e| {
+            (
+                e.seq,
+                e.action,
+                e.epoch,
+                e.previous_epoch,
+                e.new_epoch,
+                e.subject.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (1, AuditAction::Mint, 1, 0, 1, None),
+            (2, AuditAction::AddRecipient, 1, 1, 1, Some(kek_fp(&second))),
+            (
+                3,
+                AuditAction::RemoveRecipient,
+                1,
+                1,
+                1,
+                Some(kek_fp(&second))
+            ),
+            (4, AuditAction::Supersede, 2, 1, 2, None),
+        ],
+        "one entry per mutation, in order"
+    );
+    for entry in &log {
+        assert_eq!(entry.actor, ACTOR);
+        assert_eq!(entry.namespace, NS);
+        assert_eq!(
+            entry.recovery_fingerprint,
+            record.escrow.recovery_fingerprint
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&entry.at).is_ok());
+    }
+    assert!(log[0].prev_sha256.is_empty());
+    assert!(
+        log[1..].iter().all(|e| e.prev_sha256.len() == 64),
+        "hash chained"
+    );
+    assert_eq!(log[1].recipients.len(), 2);
+    assert_eq!(log[3].recipients, vec![kek_fp(&first)]);
+    assert_eq!(store.ledger_head(NS).expect("head"), LedgerHead(4));
+    // The cold store replays to the same log and records.
+    let fresh = open_store(dir.path());
+    assert_eq!(fresh.audit_log(NS).expect("replayed"), log);
+    assert_eq!(fresh.load_current(NS).expect("current"), Some(next));
+}
+
+#[test]
+fn scope_key_audit_refuses_a_wrong_previous_epoch_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    let node = test_node("node-a");
+    let record = minted(&store, &[&node]);
+    let mut ledger = store.load_namespace_locked(NS).expect("ledger");
+    let mut next = record.clone();
+    next.epoch = 2;
+    let change = Change {
+        action: AuditAction::Supersede,
+        actor: ACTOR,
+        record: &next,
+        subject: None,
+        at: now_rfc3339(),
+    };
+    let good = ledger.entry_for(&change);
+    assert_eq!(good.previous_epoch, 1, "the entry points at the head");
+
+    let mut stale = good.clone();
+    stale.previous_epoch = 0;
+    assert!(matches!(
+        ledger.append(stale.clone()),
+        Err(ScopeKeyStoreError::AuditChainMismatch { .. })
+    ));
+    let mut skipped = good.clone();
+    skipped.seq += 1;
+    assert!(matches!(
+        ledger.append(skipped),
+        Err(ScopeKeyStoreError::AuditChainMismatch { .. })
+    ));
+    assert_eq!(ledger.head(), LedgerHead(1), "refusals append nothing");
+
+    // The same entry landing on disk outside the store fails closed on load.
+    let line = serde_json::to_string(&stale).expect("line");
+    store
+        .append_audit_line(NS, &line)
+        .expect("append TEST line");
+    store.refresh_from_ledger().expect("refresh");
+    assert!(matches!(
+        store_refusal(&store.history(NS).expect_err("broken chain")),
+        ScopeKeyStoreError::AuditChainMismatch { .. }
+    ));
+    assert!(
+        store.namespace_is_e2e(NS),
+        "an unreadable ledger stays end-to-end"
+    );
+}
+
+#[test]
+fn scope_key_namespace_is_e2e_iff_ledger_has_an_epoch_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let store = open_store(dir.path());
+    assert!(!store.namespace_is_e2e(NS), "no ledger: not end-to-end");
+    let node = test_node("node-a");
+    minted(&store, &[&node]);
+    assert!(store.namespace_is_e2e(NS), "one epoch: end-to-end");
+    assert!(!store.namespace_is_e2e("test/plain-8278"));
+    assert!(
+        open_store(dir.path()).namespace_is_e2e(NS),
+        "cold store agrees"
+    );
+}
+
+#[test]
+fn scope_key_store_writes_through_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let writer = open_store(dir.path());
+    let node = test_node("node-a");
+    let record = minted(&writer, &[&node]);
+    // The mutating store answers from its cache at once: no reload.
+    assert_eq!(
+        writer.load_current(NS).expect("cached"),
+        Some(record.clone())
+    );
+    assert_eq!(writer.ledger_head(NS).expect("head"), LedgerHead(1));
+    // The files already hold it: a store opened afterwards sees the same.
+    let later = open_store(dir.path());
+    assert_eq!(later.load_current(NS).expect("cold"), Some(record));
+    assert_eq!(later.ledger_head(NS).expect("head"), LedgerHead(1));
+}
+
+#[test]
+fn scope_key_stale_cache_refuses_sealed_foreign_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let stale = open_store(dir.path());
+    let writer = open_store(dir.path());
+    let node = test_node("node-a");
+    let record = minted(&writer, &[&node]);
+    let key_ref = record.key_ref().expect("ref");
+    let required = writer.ledger_head(NS).expect("head");
+
+    let err = stale
+        .load_by_key_id_fresh(NS, &key_ref, required)
+        .expect_err("a cache older than the required head must not answer");
+    assert_eq!(
+        store_refusal(&err),
+        ScopeKeyStoreError::SealedForeign {
+            namespace: NS.to_string(),
+            cached_head: 0,
+            required_head: 1,
+        }
+    );
+    stale.refresh_from_ledger().expect("refresh");
+    assert_eq!(
+        stale
+            .load_by_key_id_fresh(NS, &key_ref, required)
+            .expect("fresh now"),
+        Some(record)
+    );
 }
 
 #[test]
 fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
     let dir = sandbox();
     let _recovery = enrol_test_recovery(dir.path());
-    let store = FileScopeKeyStore::new(dir.path().to_path_buf());
+    let store = open_store(dir.path());
     let node = test_node("node-a");
     let record = minted(&store, &[&node]);
     let path = store.record_path(NS, 1);
+    let refreshed_refusal = |what: &str| {
+        store.refresh_from_ledger().expect("refresh");
+        store_refusal(&store.load_current(NS).expect_err(what))
+    };
+    let restore = || {
+        store.write_record(&record).expect("restore");
+        store.refresh_from_ledger().expect("refresh");
+        assert_eq!(
+            store.load_current(NS).expect("healed"),
+            Some(record.clone())
+        );
+    };
 
     // A record whose key id was rewritten no longer matches an envelope's key.
     let mut forged = record.clone();
     forged.key_id = ScopeKeyId::random().to_hex();
     store.write_record(&forged).expect("write forged");
+    store.refresh_from_ledger().expect("refresh");
     let err = store
         .load_by_key_id(NS, &record.key_ref().expect("ref"))
         .expect_err("divergent key id");
@@ -386,38 +669,80 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
         store_refusal(&err),
         ScopeKeyStoreError::KeyIdMismatch { .. }
     ));
-    store.write_record(&record).expect("restore");
+    restore();
+
+    // A reader added outside the store disagrees with the audit log.
+    let mut widened = record.clone();
+    widened.recipients.push(RecipientStanza {
+        agent_id: "node-intruder".to_string(),
+        kek_fingerprint: kek_fp(&test_node("node-intruder")),
+        wrapped: record.recipients[0].wrapped.clone(),
+    });
+    store.write_record(&widened).expect("write widened");
+    assert!(matches!(
+        refreshed_refusal("reader set off the log"),
+        ScopeKeyStoreError::AuditChainMismatch { .. }
+    ));
+    restore();
 
     // Malformed JSON.
     crate::identity::keypair::write_with_mode(&path, b"{not json", 0o600).expect("write junk");
     assert!(matches!(
-        store_refusal(&store.load_current(NS).expect_err("junk")),
+        refreshed_refusal("junk"),
         ScopeKeyStoreError::RecordCorrupt { .. }
     ));
-    store.write_record(&record).expect("restore");
+    restore();
 
-    // Group/other access.
+    // Group/other access, and a link in place of the file.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert!(matches!(
-            store_refusal(&store.load_current(NS).expect_err("loose mode")),
+            refreshed_refusal("loose mode"),
             ScopeKeyStoreError::RecordCorrupt { .. }
         ));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let moved = dir.path().join("moved-record-8278.json");
+        std::fs::rename(&path, &moved).expect("move record");
+        std::os::unix::fs::symlink(&moved, &path).expect("link record");
+        assert!(matches!(
+            refreshed_refusal("symlinked record"),
+            ScopeKeyStoreError::RecordCorrupt { .. }
+        ));
+        std::fs::remove_file(&path).expect("remove link");
+        std::fs::rename(&moved, &path).expect("move back");
+        restore();
     }
+
+    // An audit line removed (the log no longer accounts for the record).
+    let audit = store.audit_path(NS);
+    let log = std::fs::read(&audit).expect("audit bytes");
+    crate::identity::keypair::write_with_mode(&audit, b"", 0o600).expect("truncate audit");
+    assert!(matches!(
+        refreshed_refusal("emptied audit log"),
+        ScopeKeyStoreError::RecordCorrupt { .. } | ScopeKeyStoreError::AuditChainMismatch { .. }
+    ));
+    crate::identity::keypair::write_with_mode(&audit, &log, 0o600).expect("restore audit");
+    restore();
 
     // A missing generation is a lost key, never flattened.
     let mut third = record.clone();
     third.epoch = 3;
     store.write_record(&third).expect("write epoch 3");
+    store.refresh_from_ledger().expect("refresh");
     assert!(matches!(
         store_refusal(&store.history(NS).expect_err("gap at epoch 2")),
         ScopeKeyStoreError::RecordCorrupt { .. }
     ));
     std::fs::remove_file(store.record_path(NS, 3)).expect("remove epoch 3");
-    assert_eq!(store.load_current(NS).expect("healed"), Some(record));
+    restore();
+}
+
+/// Removes the TEST namespace's files from the shared default key directory.
+fn remove_seeded(store: &FileScopeKeyStore, namespace: &str) {
+    std::fs::remove_file(store.record_path(namespace, 1)).expect("clean up TEST record");
+    std::fs::remove_file(store.audit_path(namespace)).expect("clean up TEST audit log");
 }
 
 #[test]
@@ -427,7 +752,7 @@ fn open_content_bound_opens_scope_row_from_the_key_dir_8278() {
     let agent = "scope-bound-funnel-8278";
     let kp = crate::encryption::get_or_create_keypair(agent).expect("keypair");
     let key_dir = crate::encryption::keypair_persist_dir().expect("key dir");
-    let store = FileScopeKeyStore::new(key_dir);
+    let store = FileScopeKeyStore::open(key_dir, agent).expect("open store");
     let namespace = format!("test/bound-funnel-8278-{}", ScopeKeyId::random());
     // TEST recovery key generated here and never enrolled in the shared dir.
     let recovery = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
@@ -445,18 +770,36 @@ fn open_content_bound_opens_scope_row_from_the_key_dir_8278() {
         now_rfc3339(),
     )
     .expect("record");
-    store.write_record(&record).expect("write record");
+    store.seed_minted_for_test(&record).expect("seed record");
     let sealed = seal_scoped("bound funnel", &key, row("mem-f", &namespace)).expect("seal");
-    assert_eq!(
-        crate::encryption::open_content_bound(&sealed, agent, row("mem-f", &namespace))
-            .expect("bound open"),
-        "bound funnel"
-    );
-    let err = crate::encryption::open_content_bound(&sealed, agent, row("mem-g", &namespace))
-        .expect_err("another row id");
+    let opened = crate::encryption::open_content_bound(&sealed, agent, row("mem-f", &namespace));
+    let moved = crate::encryption::open_content_bound(&sealed, agent, row("mem-g", &namespace));
+    remove_seeded(&store, &namespace);
+    assert_eq!(opened.expect("bound open"), "bound funnel");
+    let err = moved.expect_err("another row id");
     assert!(matches!(
         scope_envelope_error(&err),
         Some(ScopeEnvelopeError::Authentication)
     ));
-    std::fs::remove_file(store.record_path(&namespace, 1)).expect("clean up TEST record");
+}
+
+#[test]
+fn open_content_bound_unknown_key_is_typed_8278() {
+    let agent = "scope-bound-unknown-8278";
+    crate::encryption::get_or_create_keypair(agent).expect("keypair");
+    let namespace = format!("test/bound-unknown-8278-{}", ScopeKeyId::random());
+    let key = ScopeKey::generate(
+        &namespace,
+        ScopeKeyRef {
+            key_id: ScopeKeyId::random(),
+            epoch: 1,
+        },
+    );
+    let sealed = seal_scoped("no record", &key, row("mem-k", &namespace)).expect("seal");
+    let err = crate::encryption::open_content_bound(&sealed, agent, row("mem-k", &namespace))
+        .expect_err("a key the ledger does not hold must not open");
+    assert!(matches!(
+        store_refusal(&err),
+        ScopeKeyStoreError::UnknownKey { .. }
+    ));
 }

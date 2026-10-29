@@ -17,12 +17,31 @@
 //! silently disagree.
 //!
 //! The file store keeps `<key_dir>/scope-keys/<slug>.scope.<epoch>.json`,
-//! mode `0o600`, written stage-then-rename. `slug` is the hex of the first 16
-//! bytes of SHA-256(namespace): path-safe for any namespace text, and the
-//! namespace itself is stored in the record and verified on every load.
-//! Mutations take an exclusive `flock` on `scope-keys/.scope-keys.lock`, which
-//! serialises threads (each opens its own descriptor) and processes. The DB
-//! ledger on both backends implements the same trait (Codex SAL lane).
+//! mode `0o600`, written stage-then-rename, and one append-only, hash-chained
+//! audit log `<slug>.audit.jsonl` per namespace ([`ledger`]). `slug` is the
+//! hex of the first 16 bytes of SHA-256(namespace): path-safe for any
+//! namespace text, and the namespace itself is stored in the record and
+//! verified on every load.
+//!
+//! [`ScopeKeyStore`] is a synchronous `Send + Sync` cache contract (ruling
+//! R11, vote `6def5ab6`, option B). Lookups are pure memory behind an
+//! `RwLock`. The files are the cold store: loaded at construction
+//! ([`FileScopeKeyStore::open`]), reloaded by
+//! [`ScopeKeyStore::refresh_from_ledger`], and written through by every
+//! mutator in the same call, so there is no window where the cache and the
+//! files disagree for this process. The cache records each namespace's
+//! [`LedgerHead`]; a lookup that must be at least as fresh as a head a peer
+//! advertised refuses with [`ScopeKeyStoreError::SealedForeign`] until a
+//! refresh catches up. Mutations take an exclusive `flock` on
+//! `scope-keys/.scope-keys.lock` (loads take it shared), which serialises
+//! threads (each opens its own descriptor) and processes. Lock order is
+//! always `flock` first, cache `RwLock` second. The async ledger methods on
+//! `MemoryStore` (load, append, refresh) for both backends arrive in E2 with
+//! the Codex SAL slice.
+
+pub mod ledger;
+
+pub use ledger::{AuditAction, AuditEntry, LedgerHead};
 
 use super::{
     ISSUE_TAG, SCOPE_ENVELOPE_VERSION, SCOPE_KEY_ID_LEN, SCOPE_KEY_LEN, ScopeKey, ScopeKeyId,
@@ -35,12 +54,15 @@ use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hkdf::Hkdf;
+use ledger::{Change, NamespaceLedger};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use subtle::ConstantTimeEq as _;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// Sub-directory of the key directory holding scope-key records.
 pub const SCOPE_KEY_SUBDIR: &str = "scope-keys";
@@ -50,6 +72,8 @@ pub const SCOPE_KEY_LOCK_FILE: &str = ".scope-keys.lock";
 const RECORD_INFIX: &str = ".scope.";
 /// Suffix of a record file name.
 const RECORD_SUFFIX: &str = ".json";
+/// Suffix of a namespace's audit log (after the slug).
+const AUDIT_SUFFIX: &str = ".audit.jsonl";
 /// On-disk record format version.
 pub const SCOPE_KEY_RECORD_FORMAT: u32 = 1;
 /// Mode of record and lock files.
@@ -136,6 +160,7 @@ pub struct ScopeKeyRecord {
 
 /// Typed refusals of the scope-key store. Every one fails closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScopeKeyStoreError {
     /// No deployment recovery key is enrolled, so a scope key cannot be
     /// escrowed and is not minted.
@@ -208,6 +233,37 @@ pub enum ScopeKeyStoreError {
         /// Namespace concerned.
         namespace: String,
     },
+    /// The D4 partial-result signal: this node's ledger for the namespace is
+    /// older than the head the caller requires (a head a peer advertised), so
+    /// rows sealed under keys it may not hold yet stay sealed until a refresh
+    /// (`/keys/scope` pull, E2) catches up. Never flattened to "not a reader".
+    SealedForeign {
+        /// Namespace concerned.
+        namespace: String,
+        /// Ledger head of the local cache.
+        cached_head: u64,
+        /// Ledger head the caller required.
+        required_head: u64,
+    },
+    /// The audit log does not chain: a missing, reordered or edited entry, a
+    /// previous-epoch pointer that is not the head, or records that disagree
+    /// with the log.
+    AuditChainMismatch {
+        /// Namespace concerned.
+        namespace: String,
+        /// What is wrong.
+        detail: String,
+    },
+    /// Supersede found a recovery key other than the one the current epoch is
+    /// escrowed to; the escrow chain is not forked silently.
+    RecoveryKeyChanged {
+        /// Namespace concerned.
+        namespace: String,
+        /// Escrow fingerprint of the current epoch.
+        previous: String,
+        /// Fingerprint of the enrolled recovery key.
+        current: String,
+    },
 }
 
 impl ScopeKeyStoreError {
@@ -271,6 +327,29 @@ impl std::fmt::Display for ScopeKeyStoreError {
             Self::EpochExhausted { namespace } => write!(
                 f,
                 "{ISSUE_TAG}: namespace {namespace:?} has exhausted its epoch counter"
+            ),
+            Self::SealedForeign {
+                namespace,
+                cached_head,
+                required_head,
+            } => write!(
+                f,
+                "{ISSUE_TAG}: namespace {namespace:?} scope-key ledger is at head {cached_head}, \
+                 {required_head} is required; rows under newer keys stay sealed until the \
+                 ledger is refreshed"
+            ),
+            Self::AuditChainMismatch { namespace, detail } => write!(
+                f,
+                "{ISSUE_TAG}: scope-key audit log of namespace {namespace:?} refused: {detail}"
+            ),
+            Self::RecoveryKeyChanged {
+                namespace,
+                previous,
+                current,
+            } => write!(
+                f,
+                "{ISSUE_TAG}: namespace {namespace:?} is escrowed to recovery key {previous}, the \
+                 enrolled recovery key is {current}; refusing to fork the escrow chain"
             ),
         }
     }
@@ -382,11 +461,10 @@ impl ScopeKeyRecord {
         let mut plaintext = decrypt_bytes(&envelope, secret)?;
         let parsed = parse_stanza_plaintext(&plaintext, key_ref, &self.namespace);
         plaintext.zeroize();
-        let Some(mut secret_bytes) = parsed else {
+        let Some(secret_bytes) = parsed else {
             return Err(self.mismatch());
         };
-        let key = ScopeKey::from_parts(&self.namespace, key_ref, secret_bytes);
-        secret_bytes.zeroize();
+        let key = ScopeKey::from_parts(&self.namespace, key_ref, *secret_bytes);
         self.verify_key_check(&key)?;
         Ok(key)
     }
@@ -448,42 +526,62 @@ impl ScopeKeyRecord {
         self.unwrap_stanza(&self.escrow.wrapped, recovery_secret)
     }
 
-    /// Structural checks every load applies.
-    fn validate(&self, namespace: &str, epoch: u32) -> std::result::Result<(), String> {
+    /// Structural checks every load of the record at `path` applies: the
+    /// file name's slug and epoch must be the record's own.
+    ///
+    /// # Errors
+    /// [`ScopeKeyStoreError::RecordCorrupt`] naming `path` and the defect.
+    fn validate(
+        &self,
+        path: &Path,
+        slug: &str,
+        epoch: u32,
+    ) -> std::result::Result<(), ScopeKeyStoreError> {
+        let corrupt = |detail: String| ScopeKeyStoreError::RecordCorrupt {
+            path: path.display().to_string(),
+            detail,
+        };
         if self.format != SCOPE_KEY_RECORD_FORMAT {
-            return Err(format!("unsupported record format {}", self.format));
+            return Err(corrupt(format!(
+                "unsupported record format {}",
+                self.format
+            )));
         }
-        if self.namespace != namespace {
-            return Err("record namespace does not match its file name".to_string());
-        }
-        if self.epoch != epoch || epoch == 0 {
-            return Err(format!(
-                "record epoch {} does not match its file name",
-                self.epoch
+        if FileScopeKeyStore::slug(&self.namespace) != slug {
+            return Err(corrupt(
+                "record namespace does not match its file name".to_string(),
             ));
         }
-        ScopeKeyId::from_hex(&self.key_id).map_err(|e| e.to_string())?;
+        if self.epoch != epoch || epoch == 0 {
+            return Err(corrupt(format!(
+                "record epoch {} does not match its file name",
+                self.epoch
+            )));
+        }
+        ScopeKeyId::from_hex(&self.key_id).map_err(|e| corrupt(e.to_string()))?;
         if hex::decode(&self.key_check).map(|v| v.len()) != Ok(KEY_CHECK_LEN) {
-            return Err("key_check is not a 16-byte hex value".to_string());
+            return Err(corrupt("key_check is not a 16-byte hex value".to_string()));
         }
         chrono::DateTime::parse_from_rfc3339(&self.created_at)
-            .map_err(|e| format!("created_at: {e}"))?;
+            .map_err(|e| corrupt(format!("created_at: {e}")))?;
         if let Some(end) = &self.superseded_at {
-            chrono::DateTime::parse_from_rfc3339(end).map_err(|e| format!("superseded_at: {e}"))?;
+            chrono::DateTime::parse_from_rfc3339(end)
+                .map_err(|e| corrupt(format!("superseded_at: {e}")))?;
         }
         if self.recipients.is_empty() {
-            return Err("record has no recipient stanza".to_string());
+            return Err(corrupt("record has no recipient stanza".to_string()));
         }
         Ok(())
     }
 }
 
-/// Parse an id-bound stanza plaintext; `None` on any mismatch.
+/// Parse an id-bound stanza plaintext; `None` on any mismatch. The secret
+/// copy is zeroized when the caller drops it.
 fn parse_stanza_plaintext(
     plaintext: &[u8],
     key_ref: ScopeKeyRef,
     namespace: &str,
-) -> Option<[u8; SCOPE_KEY_LEN]> {
+) -> Option<Zeroizing<[u8; SCOPE_KEY_LEN]>> {
     let ns = namespace.as_bytes();
     let ns_len = u16::try_from(ns.len()).ok()?;
     let mut expected_head = Vec::with_capacity(1 + SCOPE_KEY_ID_LEN + 4 + 2 + ns.len());
@@ -497,9 +595,8 @@ fn parse_stanza_plaintext(
     {
         return None;
     }
-    let mut secret = [0u8; SCOPE_KEY_LEN];
-    secret.copy_from_slice(&plaintext[expected_head.len()..]);
-    Some(secret)
+    let secret: [u8; SCOPE_KEY_LEN] = plaintext[expected_head.len()..].try_into().ok()?;
+    Some(Zeroizing::new(secret))
 }
 
 /// Build the record for a freshly generated key.
@@ -573,10 +670,13 @@ pub enum RecipientChange {
     Absent,
 }
 
-/// The scope-key ledger contract. The file store below implements it; the
-/// SAL DB ledger on both backends implements it next (Codex lane), so the
-/// envelope code never depends on where records live.
-pub trait ScopeKeyStore {
+/// The scope-key ledger contract: a synchronous `Send + Sync` cache (ruling
+/// R11). Lookups answer from memory; every mutator writes through to the
+/// cold store in the same call and appends one audit entry (ruling R3). The
+/// file store below implements it; the async ledger methods on `MemoryStore`
+/// for both backends arrive in E2 (Codex SAL slice), so the envelope code
+/// never depends on where records live.
+pub trait ScopeKeyStore: Send + Sync {
     /// First write in an end-to-end namespace: mint, escrow and record the
     /// epoch-1 key sealed to `readers`, or return the existing current record.
     ///
@@ -588,13 +688,13 @@ pub trait ScopeKeyStore {
     /// Every generation of `namespace`, ascending, dense from epoch 1.
     ///
     /// # Errors
-    /// A corrupt record or a gap in the epochs (never flattened to empty).
+    /// A corrupt record or audit log (never flattened to empty).
     fn history(&self, namespace: &str) -> Result<Vec<ScopeKeyRecord>>;
 
     /// The record of one epoch.
     ///
     /// # Errors
-    /// A corrupt record.
+    /// A corrupt record or audit log.
     fn load_epoch(&self, namespace: &str, epoch: u32) -> Result<Option<ScopeKeyRecord>>;
 
     /// The current (highest-epoch) record.
@@ -624,6 +724,55 @@ pub trait ScopeKeyStore {
         }
     }
 
+    /// [`Self::load_by_key_id`] that must answer from a ledger at least as
+    /// fresh as `required` (the head a peer advertised on sync or
+    /// `/keys/scope`). A cache older than that fails closed.
+    ///
+    /// # Errors
+    /// [`ScopeKeyStoreError::SealedForeign`] while the cache head is older
+    /// than `required`; otherwise as [`Self::load_by_key_id`].
+    fn load_by_key_id_fresh(
+        &self,
+        namespace: &str,
+        key: &ScopeKeyRef,
+        required: LedgerHead,
+    ) -> Result<Option<ScopeKeyRecord>> {
+        let cached = self.ledger_head(namespace)?;
+        if cached < required {
+            return Err(refuse(ScopeKeyStoreError::SealedForeign {
+                namespace: namespace.to_string(),
+                cached_head: cached.0,
+                required_head: required.0,
+            }));
+        }
+        self.load_by_key_id(namespace, key)
+    }
+
+    /// Whether `namespace` is end-to-end: its ledger holds at least one epoch
+    /// (ruling R1). A namespace whose ledger cannot be read answers `true`
+    /// (fail closed: no plaintext or per-node path opens for it). E2 enforces
+    /// that no non-`0x05` representation is sent or accepted for it.
+    fn namespace_is_e2e(&self, namespace: &str) -> bool;
+
+    /// The ledger head (audit entry count) this store holds for `namespace`;
+    /// zero when it has no ledger.
+    ///
+    /// # Errors
+    /// A corrupt record or audit log.
+    fn ledger_head(&self, namespace: &str) -> Result<LedgerHead>;
+
+    /// The audit log of `namespace`, oldest first.
+    ///
+    /// # Errors
+    /// A corrupt record or audit log.
+    fn audit_log(&self, namespace: &str) -> Result<Vec<AuditEntry>>;
+
+    /// Reload the whole cache from the cold store.
+    ///
+    /// # Errors
+    /// The scope-key directory cannot be listed or locked.
+    fn refresh_from_ledger(&self) -> Result<()>;
+
     /// Seal `key` (already unwrapped by a current holder, or recovered from
     /// escrow) to `reader` and add the stanza to its record.
     ///
@@ -649,27 +798,57 @@ pub trait ScopeKeyStore {
     ///
     /// # Errors
     /// No current record, [`ScopeKeyStoreError::EscrowUnavailable`],
+    /// [`ScopeKeyStoreError::RecoveryKeyChanged`],
     /// [`ScopeKeyStoreError::NoRecipients`], or I/O.
     fn supersede(&self, namespace: &str, readers: &[ReaderKek]) -> Result<ScopeKeyRecord>;
 }
 
+/// One cache slot: a namespace's verified ledger, or the refusal its cold
+/// store produced (kept so every lookup of that namespace fails closed).
+type Slot = std::result::Result<NamespaceLedger, ScopeKeyStoreError>;
+
 /// The file-backed [`ScopeKeyStore`] under a key directory.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FileScopeKeyStore {
     key_dir: PathBuf,
+    /// Agent id recorded as the actor of this process's mutations.
+    actor: String,
+    /// Namespace slug to slot.
+    cache: RwLock<HashMap<String, Slot>>,
 }
 
-/// Holds the exclusive lock until dropped (closing the descriptor releases
-/// the `flock`).
+/// Holds a `flock` until dropped (closing the descriptor releases it).
 struct StoreLock {
     _file: std::fs::File,
 }
 
+/// The record epochs and the audit-log presence of one slug on disk.
+#[derive(Default)]
+struct SlugFiles {
+    epochs: Vec<u32>,
+    audit: bool,
+}
+
+fn poisoned() -> anyhow::Error {
+    anyhow!("{ISSUE_TAG}: the scope-key cache lock is poisoned; refusing to answer from it")
+}
+
 impl FileScopeKeyStore {
-    /// A store rooted at `key_dir` (the agent key directory).
-    #[must_use]
-    pub fn new(key_dir: PathBuf) -> Self {
-        Self { key_dir }
+    /// Open the store rooted at `key_dir` (the agent key directory) for the
+    /// process agent `actor`, loading every namespace's ledger into memory.
+    /// A namespace whose files are corrupt is kept as a refusal, so its
+    /// lookups fail closed while the others work.
+    ///
+    /// # Errors
+    /// The scope-key directory cannot be listed, locked or is insecure.
+    pub fn open(key_dir: PathBuf, actor: &str) -> Result<Self> {
+        let store = Self {
+            key_dir,
+            actor: actor.to_string(),
+            cache: RwLock::new(HashMap::new()),
+        };
+        store.refresh_from_ledger()?;
+        Ok(store)
     }
 
     /// `<key_dir>/scope-keys`.
@@ -688,13 +867,25 @@ impl FileScopeKeyStore {
     /// The record file of `(namespace, epoch)`.
     #[must_use]
     pub fn record_path(&self, namespace: &str, epoch: u32) -> PathBuf {
-        self.scope_dir().join(format!(
-            "{}{RECORD_INFIX}{epoch}{RECORD_SUFFIX}",
-            Self::slug(namespace)
-        ))
+        self.slug_record_path(&Self::slug(namespace), epoch)
     }
 
-    fn lock(&self) -> Result<StoreLock> {
+    fn slug_record_path(&self, slug: &str, epoch: u32) -> PathBuf {
+        self.scope_dir()
+            .join(format!("{slug}{RECORD_INFIX}{epoch}{RECORD_SUFFIX}"))
+    }
+
+    /// The audit log of `namespace`.
+    #[must_use]
+    pub fn audit_path(&self, namespace: &str) -> PathBuf {
+        self.slug_audit_path(&Self::slug(namespace))
+    }
+
+    fn slug_audit_path(&self, slug: &str) -> PathBuf {
+        self.scope_dir().join(format!("{slug}{AUDIT_SUFFIX}"))
+    }
+
+    fn open_lock_file(&self) -> Result<std::fs::File> {
         let path = self.scope_dir().join(SCOPE_KEY_LOCK_FILE);
         crate::identity::keypair::ensure_parent(&path)?;
         crate::identity::keypair::enforce_key_path_chain_secure(&self.key_dir, &path)?;
@@ -704,40 +895,72 @@ impl FileScopeKeyStore {
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(MODE_PRIVATE);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
-        let file = options
+        options
             .open(&path)
-            .with_context(|| format!("opening scope-key lock {}", path.display()))?;
+            .with_context(|| format!("opening scope-key lock {}", path.display()))
+    }
+
+    /// The exclusive lock every mutation holds.
+    fn lock(&self) -> Result<StoreLock> {
+        let file = self.open_lock_file()?;
         file.lock()
-            .with_context(|| format!("locking scope-key lock {}", path.display()))?;
+            .context("locking the scope-key lock exclusively")?;
         Ok(StoreLock { _file: file })
     }
 
-    fn corrupt(path: &Path, detail: impl Into<String>) -> anyhow::Error {
-        refuse(ScopeKeyStoreError::RecordCorrupt {
-            path: path.display().to_string(),
-            detail: detail.into(),
-        })
+    /// The shared lock a load holds (no writer can be mid-append).
+    fn lock_shared(&self) -> Result<StoreLock> {
+        let file = self.open_lock_file()?;
+        file.lock_shared()
+            .context("locking the scope-key lock shared")?;
+        Ok(StoreLock { _file: file })
     }
 
-    fn read_record(&self, namespace: &str, epoch: u32) -> Result<Option<ScopeKeyRecord>> {
-        let path = self.record_path(namespace, epoch);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
+    fn corrupt(path: &Path, detail: impl Into<String>) -> ScopeKeyStoreError {
+        ScopeKeyStoreError::RecordCorrupt {
+            path: path.display().to_string(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Read a private file: chain check first, then open without following a
+    /// link, then `fstat` the open descriptor (regular file, owner-only mode)
+    /// and read from that same descriptor, so the bytes read are the bytes
+    /// checked.
+    fn read_private(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Option<Vec<u8>>, ScopeKeyStoreError> {
+        use std::io::Read as _;
+        crate::identity::keypair::enforce_key_path_chain_secure(&self.key_dir, path)
+            .map_err(|e| Self::corrupt(path, format!("insecure key directory chain: {e:#}")))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = match options.open(path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Self::corrupt(&path, format!("unreadable: {e}"))),
+            Err(e) => return Err(Self::corrupt(path, format!("unreadable: {e}"))),
         };
-        crate::identity::keypair::enforce_key_path_chain_secure(&self.key_dir, &path)?;
+        let meta = file
+            .metadata()
+            .map_err(|e| Self::corrupt(path, format!("unreadable metadata: {e}")))?;
+        if !meta.is_file() {
+            return Err(Self::corrupt(path, "not a regular file"));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path)
-                .map_err(|e| Self::corrupt(&path, format!("unreadable metadata: {e}")))?
-                .permissions()
-                .mode();
+            let mode = meta.permissions().mode();
             if mode & 0o077 != 0 {
                 return Err(Self::corrupt(
-                    &path,
+                    path,
                     format!(
                         "mode {:o} grants group/other access (expected 600)",
                         mode & 0o777
@@ -745,11 +968,24 @@ impl FileScopeKeyStore {
                 ));
             }
         }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| Self::corrupt(path, format!("unreadable: {e}")))?;
+        Ok(Some(bytes))
+    }
+
+    fn read_record(
+        &self,
+        slug: &str,
+        epoch: u32,
+    ) -> std::result::Result<Option<ScopeKeyRecord>, ScopeKeyStoreError> {
+        let path = self.slug_record_path(slug, epoch);
+        let Some(bytes) = self.read_private(&path)? else {
+            return Ok(None);
+        };
         let record: ScopeKeyRecord = serde_json::from_slice(&bytes)
             .map_err(|e| Self::corrupt(&path, format!("malformed: {e}")))?;
-        record
-            .validate(namespace, epoch)
-            .map_err(|detail| Self::corrupt(&path, detail))?;
+        record.validate(&path, slug, epoch)?;
         Ok(Some(record))
     }
 
@@ -762,35 +998,192 @@ impl FileScopeKeyStore {
             .with_context(|| format!("writing scope-key record {}", path.display()))
     }
 
-    /// The epochs present on disk for `namespace`, ascending.
-    fn epochs_on_disk(&self, namespace: &str) -> Result<Vec<u32>> {
+    /// Append one line to the audit log: owner-only, never through a link,
+    /// `O_APPEND`, flushed to disk before the call returns.
+    fn append_audit_line(&self, namespace: &str, line: &str) -> Result<()> {
+        use std::io::Write as _;
+        let path = self.audit_path(namespace);
+        crate::identity::keypair::ensure_parent(&path)?;
+        crate::identity::keypair::enforce_key_path_chain_secure(&self.key_dir, &path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(MODE_PRIVATE);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("opening scope-key audit log {}", path.display()))?;
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("appending to scope-key audit log {}", path.display()))
+    }
+
+    /// Every slug with files on disk (`only` narrows it to one), with its
+    /// record epochs ascending.
+    fn scan(&self, only: Option<&str>) -> Result<BTreeMap<String, SlugFiles>> {
         let dir = self.scope_dir();
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(Self::corrupt(&dir, format!("unreadable directory: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => {
+                return Err(refuse(Self::corrupt(
+                    &dir,
+                    format!("unreadable directory: {e}"),
+                )));
+            }
         };
-        let prefix = format!("{}{RECORD_INFIX}", Self::slug(namespace));
-        let mut epochs = Vec::new();
+        let mut slugs: BTreeMap<String, SlugFiles> = BTreeMap::new();
         for entry in entries {
-            let entry = entry.map_err(|e| Self::corrupt(&dir, format!("directory entry: {e}")))?;
+            let entry =
+                entry.map_err(|e| refuse(Self::corrupt(&dir, format!("directory entry: {e}"))))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
-            let Some(rest) = name
-                .strip_prefix(&prefix)
-                .and_then(|r| r.strip_suffix(RECORD_SUFFIX))
+            if let Some(slug) = name.strip_suffix(AUDIT_SUFFIX) {
+                if only.is_none_or(|o| o == slug) {
+                    slugs.entry(slug.to_string()).or_default().audit = true;
+                }
+                continue;
+            }
+            let Some((slug, rest)) = name
+                .strip_suffix(RECORD_SUFFIX)
+                .and_then(|r| r.split_once(RECORD_INFIX))
             else {
                 continue;
             };
-            let epoch: u32 = rest
-                .parse()
-                .map_err(|_| Self::corrupt(&entry.path(), "epoch in file name is not a number"))?;
-            epochs.push(epoch);
+            if only.is_some_and(|o| o != slug) {
+                continue;
+            }
+            let epoch: u32 = rest.parse().map_err(|_| {
+                refuse(Self::corrupt(
+                    &entry.path(),
+                    "epoch in file name is not a number",
+                ))
+            })?;
+            slugs
+                .entry(slug.to_string())
+                .or_default()
+                .epochs
+                .push(epoch);
         }
-        epochs.sort_unstable();
-        Ok(epochs)
+        for files in slugs.values_mut() {
+            files.epochs.sort_unstable();
+        }
+        Ok(slugs)
+    }
+
+    /// Load and verify one slug's ledger from its files.
+    fn load_slug(&self, slug: &str, files: &SlugFiles) -> Slot {
+        let mut records = Vec::with_capacity(files.epochs.len());
+        for (index, epoch) in files.epochs.iter().enumerate() {
+            let expected = u32::try_from(index + 1).ok();
+            if expected != Some(*epoch) {
+                return Err(Self::corrupt(
+                    &self.slug_record_path(slug, *epoch),
+                    format!(
+                        "epochs are not dense from 1 (found {epoch} at position {})",
+                        index + 1
+                    ),
+                ));
+            }
+            let Some(record) = self.read_record(slug, *epoch)? else {
+                return Err(Self::corrupt(
+                    &self.slug_record_path(slug, *epoch),
+                    "record vanished while loading",
+                ));
+            };
+            if records
+                .first()
+                .is_some_and(|first: &ScopeKeyRecord| first.namespace != record.namespace)
+            {
+                return Err(Self::corrupt(
+                    &self.slug_record_path(slug, *epoch),
+                    "records of one slug name different namespaces",
+                ));
+            }
+            records.push(record);
+        }
+        let audit_path = self.slug_audit_path(slug);
+        let log = match self.read_private(&audit_path)? {
+            Some(bytes) => String::from_utf8(bytes)
+                .map_err(|_| Self::corrupt(&audit_path, "audit log is not UTF-8"))?,
+            None => String::new(),
+        };
+        if records.is_empty() != log.is_empty() {
+            return Err(Self::corrupt(
+                &audit_path,
+                "records and audit log must exist together",
+            ));
+        }
+        NamespaceLedger::replay(records, &log)
+    }
+
+    /// The verified ledger of `namespace` straight from disk (the caller
+    /// holds the exclusive lock).
+    fn load_namespace_locked(&self, namespace: &str) -> Result<NamespaceLedger> {
+        let slug = Self::slug(namespace);
+        let scanned = self.scan(Some(&slug))?;
+        let ledger = match scanned.get(&slug) {
+            Some(files) => self.load_slug(&slug, files).map_err(refuse)?,
+            None => NamespaceLedger::default(),
+        };
+        if ledger.namespace().is_some_and(|ns| ns != namespace) {
+            return Err(refuse(Self::corrupt(
+                &self.record_path(namespace, 1),
+                "slug collision: the record names another namespace",
+            )));
+        }
+        Ok(ledger)
+    }
+
+    /// Answer from the cached ledger of `namespace` (`None`: no ledger).
+    fn with_ledger<T>(
+        &self,
+        namespace: &str,
+        read: impl FnOnce(Option<&NamespaceLedger>) -> Result<T>,
+    ) -> Result<T> {
+        let cache = self.cache.read().map_err(|_| poisoned())?;
+        match cache.get(&Self::slug(namespace)) {
+            None => read(None),
+            Some(Err(refusal)) => Err(refuse(refusal.clone())),
+            Some(Ok(ledger)) if ledger.namespace().is_some_and(|ns| ns != namespace) => {
+                Err(refuse(Self::corrupt(
+                    &self.record_path(namespace, 1),
+                    "slug collision: the record names another namespace",
+                )))
+            }
+            Some(Ok(ledger)) => read(Some(ledger)),
+        }
+    }
+
+    /// Write-through: append the audit entry for `change` to `ledger`
+    /// (verified against the head), write `records`, append the line, then
+    /// install the ledger in the cache. The caller holds the exclusive lock,
+    /// so the order is always `flock` then the cache lock.
+    fn commit(
+        &self,
+        namespace: &str,
+        mut ledger: NamespaceLedger,
+        change: &Change<'_>,
+        records: &[&ScopeKeyRecord],
+    ) -> Result<()> {
+        let entry = ledger.entry_for(change);
+        let line = ledger.append(entry).map_err(refuse)?;
+        for record in records {
+            self.write_record(record)?;
+            ledger.put_record((*record).clone());
+        }
+        self.append_audit_line(namespace, &line)?;
+        let mut cache = self.cache.write().map_err(|_| poisoned())?;
+        cache.insert(Self::slug(namespace), Ok(ledger));
+        Ok(())
     }
 
     fn recovery_pubkey(&self, namespace: &str) -> Result<PublicKey> {
@@ -811,13 +1204,39 @@ impl FileScopeKeyStore {
         }
     }
 
-    fn require_record(&self, namespace: &str, epoch: u32) -> Result<ScopeKeyRecord> {
-        self.read_record(namespace, epoch)?.ok_or_else(|| {
-            refuse(ScopeKeyStoreError::UnknownKey {
+    fn require_record(
+        ledger: &NamespaceLedger,
+        namespace: &str,
+        epoch: u32,
+    ) -> Result<ScopeKeyRecord> {
+        let index = usize::try_from(epoch.saturating_sub(1)).unwrap_or(usize::MAX);
+        match ledger.records.get(index) {
+            Some(record) if epoch > 0 => Ok(record.clone()),
+            _ => Err(refuse(ScopeKeyStoreError::UnknownKey {
                 namespace: namespace.to_string(),
                 key: format!("epoch{epoch}"),
-            })
-        })
+            })),
+        }
+    }
+}
+
+#[cfg(test)]
+impl FileScopeKeyStore {
+    /// TEST only: record `record` as an epoch-1 mint (record file plus its
+    /// audit entry) without the escrow enrolment `mint` requires, so a test
+    /// can seed the shared default key directory without enrolling a
+    /// recovery key there.
+    fn seed_minted_for_test(&self, record: &ScopeKeyRecord) -> Result<()> {
+        let _lock = self.lock()?;
+        let ledger = self.load_namespace_locked(&record.namespace)?;
+        let change = Change {
+            action: AuditAction::Mint,
+            actor: &self.actor,
+            record,
+            subject: None,
+            at: record.created_at.clone(),
+        };
+        self.commit(&record.namespace, ledger, &change, &[record])
     }
 }
 
@@ -825,8 +1244,9 @@ impl ScopeKeyStore for FileScopeKeyStore {
     fn mint(&self, namespace: &str, readers: &[ReaderKek]) -> Result<MintOutcome> {
         Self::require_readers(namespace, readers)?;
         let _lock = self.lock()?;
-        if let Some(current) = self.history(namespace)?.pop() {
-            return Ok(MintOutcome::Existing(current));
+        let ledger = self.load_namespace_locked(namespace)?;
+        if let Some(current) = ledger.records.last() {
+            return Ok(MintOutcome::Existing(current.clone()));
         }
         let recovery = self.recovery_pubkey(namespace)?;
         let key_ref = ScopeKeyRef {
@@ -835,37 +1255,78 @@ impl ScopeKeyStore for FileScopeKeyStore {
         };
         let key = ScopeKey::generate(namespace, key_ref);
         let record = build_record(&key, readers, &recovery, now_rfc3339())?;
-        self.write_record(&record)?;
+        let change = Change {
+            action: AuditAction::Mint,
+            actor: &self.actor,
+            record: &record,
+            subject: None,
+            at: record.created_at.clone(),
+        };
+        self.commit(namespace, ledger, &change, &[&record])?;
         Ok(MintOutcome::Minted(record))
     }
 
     fn history(&self, namespace: &str) -> Result<Vec<ScopeKeyRecord>> {
-        let epochs = self.epochs_on_disk(namespace)?;
-        let mut records = Vec::with_capacity(epochs.len());
-        for (index, epoch) in epochs.iter().enumerate() {
-            let expected = u32::try_from(index + 1).ok();
-            if expected != Some(*epoch) {
-                return Err(Self::corrupt(
-                    &self.record_path(namespace, *epoch),
-                    format!(
-                        "epochs are not dense from 1 (found {epoch} at position {})",
-                        index + 1
-                    ),
-                ));
-            }
-            records.push(self.require_record(namespace, *epoch)?);
-        }
-        Ok(records)
+        self.with_ledger(namespace, |ledger| {
+            Ok(ledger.map(|l| l.records.clone()).unwrap_or_default())
+        })
     }
 
     fn load_epoch(&self, namespace: &str, epoch: u32) -> Result<Option<ScopeKeyRecord>> {
-        self.read_record(namespace, epoch)
+        self.with_ledger(namespace, |ledger| {
+            let index = usize::try_from(epoch.saturating_sub(1)).unwrap_or(usize::MAX);
+            Ok(ledger
+                .filter(|_| epoch > 0)
+                .and_then(|l| l.records.get(index).cloned()))
+        })
+    }
+
+    fn namespace_is_e2e(&self, namespace: &str) -> bool {
+        let Ok(cache) = self.cache.read() else {
+            return true;
+        };
+        match cache.get(&Self::slug(namespace)) {
+            None => false,
+            Some(Err(_)) => true,
+            Some(Ok(ledger)) => !ledger.records.is_empty(),
+        }
+    }
+
+    fn ledger_head(&self, namespace: &str) -> Result<LedgerHead> {
+        self.with_ledger(namespace, |ledger| {
+            Ok(ledger.map(NamespaceLedger::head).unwrap_or_default())
+        })
+    }
+
+    fn audit_log(&self, namespace: &str) -> Result<Vec<AuditEntry>> {
+        self.with_ledger(namespace, |ledger| {
+            Ok(ledger.map(|l| l.audit.clone()).unwrap_or_default())
+        })
+    }
+
+    fn refresh_from_ledger(&self) -> Result<()> {
+        let mut fresh = HashMap::new();
+        {
+            let _lock = if self.scope_dir().exists() {
+                Some(self.lock_shared()?)
+            } else {
+                None
+            };
+            for (slug, files) in self.scan(None)? {
+                let slot = self.load_slug(&slug, &files);
+                fresh.insert(slug, slot);
+            }
+            let mut cache = self.cache.write().map_err(|_| poisoned())?;
+            *cache = fresh;
+        }
+        Ok(())
     }
 
     fn add_recipient(&self, key: &ScopeKey, reader: &ReaderKek) -> Result<RecipientChange> {
         let _lock = self.lock()?;
-        let key_ref = key.key_ref();
-        let mut record = self.require_record(key.namespace(), key_ref.epoch)?;
+        let namespace = key.namespace();
+        let ledger = self.load_namespace_locked(namespace)?;
+        let mut record = Self::require_record(&ledger, namespace, key.key_ref().epoch)?;
         record.verify_key_check(key)?;
         let fingerprint = reader.fingerprint();
         if record.is_reader(&fingerprint) {
@@ -873,10 +1334,17 @@ impl ScopeKeyStore for FileScopeKeyStore {
         }
         record.recipients.push(RecipientStanza {
             agent_id: reader.agent_id.clone(),
-            kek_fingerprint: fingerprint,
+            kek_fingerprint: fingerprint.clone(),
             wrapped: wrap_scope_key(key, &reader.public)?,
         });
-        self.write_record(&record)?;
+        let change = Change {
+            action: AuditAction::AddRecipient,
+            actor: &self.actor,
+            record: &record,
+            subject: Some(fingerprint),
+            at: now_rfc3339(),
+        };
+        self.commit(namespace, ledger, &change, &[&record])?;
         Ok(RecipientChange::Added)
     }
 
@@ -887,7 +1355,8 @@ impl ScopeKeyStore for FileScopeKeyStore {
         kek_fingerprint: &str,
     ) -> Result<RecipientChange> {
         let _lock = self.lock()?;
-        let mut record = self.require_record(namespace, epoch)?;
+        let ledger = self.load_namespace_locked(namespace)?;
+        let mut record = Self::require_record(&ledger, namespace, epoch)?;
         if !record.is_reader(kek_fingerprint) {
             return Ok(RecipientChange::Absent);
         }
@@ -900,21 +1369,37 @@ impl ScopeKeyStore for FileScopeKeyStore {
         record
             .recipients
             .retain(|s| s.kek_fingerprint != kek_fingerprint);
-        self.write_record(&record)?;
+        let change = Change {
+            action: AuditAction::RemoveRecipient,
+            actor: &self.actor,
+            record: &record,
+            subject: Some(kek_fingerprint.to_string()),
+            at: now_rfc3339(),
+        };
+        self.commit(namespace, ledger, &change, &[&record])?;
         Ok(RecipientChange::Removed)
     }
 
     fn supersede(&self, namespace: &str, readers: &[ReaderKek]) -> Result<ScopeKeyRecord> {
         Self::require_readers(namespace, readers)?;
         let _lock = self.lock()?;
-        let Some(mut current) = self.history(namespace)?.pop() else {
+        let ledger = self.load_namespace_locked(namespace)?;
+        let Some(mut current) = ledger.records.last().cloned() else {
             return Err(refuse(ScopeKeyStoreError::UnknownKey {
                 namespace: namespace.to_string(),
                 key: "current".to_string(),
             }));
         };
         let recovery = self.recovery_pubkey(namespace)?;
-        let epoch = current.epoch.checked_add(1).ok_or_else(|| {
+        let recovery_fingerprint = fingerprint_public_bytes(recovery.as_bytes());
+        if recovery_fingerprint != current.escrow.recovery_fingerprint {
+            return Err(refuse(ScopeKeyStoreError::RecoveryKeyChanged {
+                namespace: namespace.to_string(),
+                previous: current.escrow.recovery_fingerprint.clone(),
+                current: recovery_fingerprint,
+            }));
+        }
+        let epoch = ledger.current_epoch().checked_add(1).ok_or_else(|| {
             refuse(ScopeKeyStoreError::EpochExhausted {
                 namespace: namespace.to_string(),
             })
@@ -928,11 +1413,18 @@ impl ScopeKeyStore for FileScopeKeyStore {
             },
         );
         let next = build_record(&key, readers, &recovery, boundary.clone())?;
-        // New generation first: a crash between the two writes leaves the old
-        // window open-ended, never a namespace with no current key.
-        self.write_record(&next)?;
-        current.superseded_at = Some(boundary);
-        self.write_record(&current)?;
+        current.superseded_at = Some(boundary.clone());
+        let change = Change {
+            action: AuditAction::Supersede,
+            actor: &self.actor,
+            record: &next,
+            subject: None,
+            at: boundary,
+        };
+        // New generation first: a crash before the audit line lands leaves a
+        // record the log does not account for, which the next load refuses
+        // (fail closed), never a namespace with no current key.
+        self.commit(namespace, ledger, &change, &[&next, &current])?;
         Ok(next)
     }
 }
