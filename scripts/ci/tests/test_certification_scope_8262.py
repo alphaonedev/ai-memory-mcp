@@ -20,6 +20,7 @@ single source of truth for what the GA candidate certifies. This guard pins:
 """
 import pathlib
 import re
+import unicodedata
 import unittest
 from html import unescape
 
@@ -101,14 +102,34 @@ E2E_ABBR = r"\bE2EE?\b"
 E2E_TERM = "end" + E2E_SEP + "+to" + E2E_SEP + "+end|" + E2E_ABBR
 E2E_TERM_RE = re.compile(E2E_TERM, re.IGNORECASE)
 _STEM = r"(?:encrypt|seal|confiden|protect|secur)"
-# One character of a sentence window: anything but a sentence end. The period inside a version
-# number (digit, dot, digit, as in v1.0.0) does not end the window.
+# One character of a live/certified or at-GA window (SCOPE_REFUSED, FUTURE_RE): anything but a
+# period or semicolon; the period inside a version number (digit, dot, digit, as in v1.0.0) passes.
+# The term-and-stem pair gate does NOT use this window: it splits the plain text with
+# SENTENCE_SPLIT_RE and looks for both in one sentence.
 _W = r"(?:[^.;]|(?<=\d)\.(?=\d))"
 _T = "(?:" + E2E_TERM + ")"
-# The term and an encryption stem in one sentence, either order, any distance, across commas,
-# parentheses and table cells. The unit (paragraph, table row, HTML block) bounds the search, the
-# sentence bounds the window; a term in one sentence and a stem in the next stays ungated.
-E2E_PAIR_RE = re.compile(_T + _W + "*" + _STEM + "|" + _STEM + _W + "*" + _T, re.IGNORECASE)
+_STEM_RE = re.compile(_STEM, re.IGNORECASE)
+# A stem inside a path or file name token (01-secure-bootstrap.sh, docs/encryption.html) names a
+# file, not a claim: the whitespace-delimited token that holds it is a name that ends in a short
+# file extension. A bare "secure" or "end-to-end-encrypted" in the same sentence is still a stem.
+_FILENAME_RE = re.compile(r"^[\w./-]+\.[A-Za-z0-9]{1,4}$")
+_TOKEN_EDGE = "()[]{}<>\"',;:!?"
+
+
+def _is_claim_stem(sent, match):
+    left = sent.rfind(" ", 0, match.start()) + 1
+    right = sent.find(" ", match.end())
+    token = sent[left:right if right >= 0 else len(sent)].strip(_TOKEN_EDGE)
+    return _FILENAME_RE.match(token) is None
+
+
+def _strip_cf(text):
+    """Drop every Unicode format character (category Cf: U+00AD, U+200B..U+200D, U+2060, U+FEFF)."""
+    if text.isascii():
+        return text
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
 E2E_ABBR_RE = re.compile(E2E_ABBR)
 E2E_SLUG_RE = re.compile(r"#1968|end-to-end-content", re.IGNORECASE)
 SOFT_HYPHEN = "\u00ad"
@@ -116,13 +137,20 @@ SOFT_HYPHEN = "\u00ad"
 
 class _E2EGate:
     """A unit is scanned when it names #1968 or the content slug, the uppercase E2E/E2EE
-    abbreviation, or the term and an encryption stem in one sentence in either order."""
+    abbreviation, or when one sentence of its plain text (split by SENTENCE_SPLIT_RE) holds the
+    term and an encryption stem, in either order, at any distance. Format characters are
+    stripped first; a stem inside a file name token does not count."""
 
     @staticmethod
     def search(unit):
-        unit = unit.replace(SOFT_HYPHEN, "")
-        return bool(E2E_SLUG_RE.search(unit) or E2E_ABBR_RE.search(unit)
-                    or E2E_PAIR_RE.search(unit))
+        unit = _strip_cf(unit)
+        if E2E_SLUG_RE.search(unit) or E2E_ABBR_RE.search(unit):
+            return True
+        for sent in SENTENCE_SPLIT_RE.split(_plain(unit)):
+            if E2E_TERM_RE.search(sent) and any(_is_claim_stem(sent, m)
+                                                for m in _STEM_RE.finditer(sent)):
+                return True
+        return False
 
 
 E2E_GATE = _E2EGate
@@ -147,7 +175,7 @@ SCOPE_REFUSED = [
     re.compile(E + _W + r"{0,60}\b(?:is|are)\s+(?:provided|supported|enabled|available|"
                r"shipped|implemented)", re.IGNORECASE),
     re.compile(r"\b(?:provides?|supports?|offers?)\s+(?:\w+\s+){0,2}" + E, re.IGNORECASE),
-    re.compile(r"(?:encrypt|protect|seal|secur)\w*\s+(?:\w+\s+){0,2}" + E
+    re.compile(_STEM + r"\w*\s+(?:\w+\s+){0,2}" + E
                + _W + r"{0,50}(?<!not )\b(?:live|certified)\b", re.IGNORECASE),
     re.compile(r"(?<!not )\b(?:live|certified)\b" + _W + "{0,50}" + E + "|"
                + E + _W + r"{0,50}(?<!not )\b(?:live|certified)\b", re.IGNORECASE),
@@ -156,20 +184,37 @@ SCOPE_REFUSED = [
 FUTURE_RE = re.compile(r"\b(?:will|shall|to)\s+be\s+(?:\w+\s+){0,3}" + E
                        + r"|" + E + _W + r"{0,40}\bat\s+GA\b|\bencrypted\s+at\s+GA\b"
                        + r"|\bships?\s+(?:with|in|at)\s+GA\b|\bat\s+GA\b", re.IGNORECASE)
-# Under-claim wording: a sentence naming the term or #8278 that defers it to any later version or
-# to after GA (sentence-bounded, so the ROADMAP ruling paragraph that postpones other items to v1.x
-# stays clean), or that puts it outside the GA scope.
-_LATER = (r"(?:v1\.[1-9x]\d*|v[2-9](?:\.\d+)*|\blater\b|\bafter\s+GA\b|post-GA)")
-_DEFER = r"\b(?:deferred|postponed|slipped)\b"
-UNDER_RE = re.compile(_DEFER + ".*?" + _LATER + "|" + _LATER + ".*?" + _DEFER, re.IGNORECASE)
-UNDER_SUBJECT_RE = re.compile(E2E_TERM + r"|#8278", re.IGNORECASE)
+# Under-claim wording: a sentence about the term, #8278 or variant A/B (UNDER_SUBJECT_RE) that uses
+# a postponement verb is refused whatever the target; a move verb followed by a later version, after
+# GA or the next release, or "removed from ... scope", is refused too; so is the GA scope
+# exclusion (SCOPE_REFUSED[:2]). The sentence bounds the scan, so the ROADMAP ruling paragraph that
+# postpones other items to v1.x stays clean; only "removed from this deferred set" (the dated
+# ROADMAP supersession note) is exempt, while "in this deferred set" is a postponement.
+# _LATER is any version other than v1.0.0, later, after GA, post GA, or a next/future release.
+_LATER = (r"(?:\bv(?:1\.0\.[1-9]\d*|1\.[1-9x]\d*|1\d+|[2-9]\d*)(?:\.\d+)*"
+          r"|\blater\b|\bafter\s+GA\b|\bpost[\s-]*GA\b"
+          r"|\b(?:next|future)\s+(?:\w+\s+)?release\b)")
+_PAST = r"(?:deferred|postponed|slipped)"
+# Predicate use only (is/was/remains ... deferred, deferred until/post, defers/postpones it);
+# an attributive "deferred graph projection" does not postpone the subject.
+_DEFER = (r"\b(?:is|are|was|were|be|been|being|remains?|remained|gets?|got)\s+(?:\w+\s+){0,2}"
+          + _PAST + r"\b|\b" + _PAST + r"\s+(?:to|until|till|past|beyond|after|post|for)\b"
+          r"|\b(?:defers?|postpones?|punts?)\b|\bdeferred\s+set\b")
+_MOVE = r"\b(?:slip|push|mov|punt|defer|postpon|land|ship|come|arriv)\w*\b"
+_REMOVED = r"\bremoved\s+from\s+(?:the |ga |v1\.0\.0 |\w+ ){0,3}scope\b"
+UNDER_RE = re.compile(_DEFER + "|" + _MOVE + r"(?:\W+\w+){0,4}?\W+" + _LATER + "|" + _REMOVED,
+                      re.IGNORECASE)
+# Subjects: the end-to-end term, #8278, and variant A or B (upper case letter only).
+UNDER_SUBJECT_RE = re.compile(E2E_TERM + r"|#8278|(?-i:\b[Vv]ariants?\s+[AB]\b)", re.IGNORECASE)
+DEFERRED_SET = "removed from this deferred set"
 # The one sentence splitter: a period or semicolon plus whitespace ends a sentence, except after
-# "e.g", "i.e" and "etc". Version numbers and URLs never split (no whitespace follows their periods).
-SENTENCE_SPLIT_RE = re.compile(r"(?<!\be\.g)(?<!\bi\.e)(?<!\betc)[.;]\s")
+# "e.g", "i.e" and "etc" in any case. A period with no whitespace after it (v1.x, a URL) never splits.
+SENTENCE_SPLIT_RE = re.compile(r"(?<!\b[eE]\.g)(?<!\b[iI]\.e)(?<!\b[eE][tT][cC])[.;]\s")
 
 
 def _underclaims(sent):
     """True for a sentence about the term or #8278 that defers it or puts it out of GA scope."""
+    sent = sent.replace(DEFERRED_SET, "")
     return bool(UNDER_SUBJECT_RE.search(sent)
                 and (UNDER_RE.search(sent) or any(rx.search(sent) for rx in SCOPE_REFUSED[:2])))
 
@@ -247,7 +292,7 @@ def _items(body):
 def _plain(text):
     """Flatten and drop markdown emphasis, backticks and link targets before wording scans."""
     text = re.sub(r"\]\([^)]*\)", "]", text)
-    return _flat(re.sub(r"[*`]", "", text.replace(SOFT_HYPHEN, "")))
+    return _flat(re.sub(r"[*`]", "", _strip_cf(text)))
 
 
 def _units(text):
@@ -470,20 +515,56 @@ class CertificationScope8262(unittest.TestCase):
                  "End-to-end delivery across the whole mesh of configured peers is protected by mTLS.",
                  "Federation is en\u00add-to-end encrypted.",
                  "Federation is end\ufe63to\ufe63end encrypted.",
-                 "Federation is end\uff0dto\uff0dend encrypted."]
+                 "Federation is end\uff0dto\uff0dend encrypted.",
+                 # One sentence is the plain text between sentence ends; e.g., i.e., etc. and the
+                 # periods of v1.x or a URL do not end it.
+                 "Federation content is end-to-end, e.g. across relays, encrypted and certified for v1.0.0.",
+                 "Federation content is sealed, i.e. end-to-end, and certified for v1.0.0.",
+                 "Federation content is end-to-end for rows, links, etc. and encrypted and certified.",
+                 "End-to-end content for v1.x is encrypted and certified.",
+                 "End-to-end (e.g. across relays) encrypted and certified.",
+                 "Federation is end-to-end across relays, peers etc. and is encrypted and certified.",
+                 "Federation is [end-to-end](docs/federation.md) encrypted and certified for v1.0.0.",
+                 "Federation is end-to-end https://example.org/a.b/c encrypted and certified.",
+                 # A bare word in the same sentence as a file name is still a stem.
+                 "Run 01-secure-bootstrap.sh for the end-to-end demo, which is secure.",
+                 # Format characters inside the term are invisible and stripped.
+                 "Federation is end\u200b-to-end encrypted and certified.",
+                 "Federation is end-to\u200d-end encrypted and certified.",
+                 "Federation is end-\u2060to-end encrypted and certified."]
         for s in gated:
             self.assertTrue(E2E_GATE.search(s), s)
-        # U+2043 is a list marker, not a word joiner: it is not a separator by decision.
+        # U+2043 is a list marker, not a word joiner: it is not a separator by decision. U+2E3A,
+        # U+30FC and U+FF70 are not Latin word joiners and are not separators either.
         for s in ["Tested end-to-end in CI.", "The end-to-end suite passes.",
                   "Federation is end\u2043to\u2043end encrypted.",
-                  "Federation travels end-to-end. It is encrypted and certified."]:
+                  "Federation is end\u2e3ato\u2e3aend encrypted.",
+                  "Federation is end\u30fcto\u30fcend encrypted.",
+                  "Federation is end\uff70to\uff70end encrypted.",
+                  "Federation travels end-to-end. It is encrypted and certified.",
+                  "Federation is encrypted (mTLS; end-to-end) and certified.",
+                  "01-secure-bootstrap.sh is a runnable end-to-end demo.",
+                  "See docs/encryption.html for the end-to-end demo."]:
             self.assertFalse(E2E_GATE.search(s), s)
         for s in ["End-to-end content encryption is deferred until v1.x.", "#8278 postponed to v1.x.",
                   "E2EE slipped to post-GA.", "#8278 is out of the GA scope.",
                   "#8278 is not in scope for v1.0.0.", "#8278 is deferred until v2.0.",
                   "#8278 is deferred until v1.2.", "#8278 is postponed until after GA.",
-                  "#8278 is postponed until a later release."]:
+                  "#8278 is postponed until a later release.",
+                  "#8278 is deferred post GA.", "#8278 is postponed to post GA.",
+                  "#8278 is postponed to v10.0.", "#8278 is slipped to v1.0.1.",
+                  "#8278 is postponed to the next release.", "#8278 is deferred.",
+                  "Variant B is slipped to v1.1.", "Variants A and B were postponed.",
+                  "#8278, E.g. variant B, slipped to v1.1.",
+                  "#8278, I.E. variant B, slipped to v1.1.",
+                  "#8278 was removed from the v1.0.0 GA scope.",
+                  "#8278 is kept in this deferred set.", "#8278 moves to a future release.", "E2EE is pushed to v1.0.2."]:
             self.assertTrue(_underclaims(s), s)
+        # Accepted boundaries: a pronoun subject, a postponement of something else, a deferred noun.
+        for s in ["It is postponed to v1.1.", "Other items are postponed to v1.x.",
+                  "A deferred graph projection ships beside end-to-end content encryption.",
+                  "#8278 landed on release/v1.0.0 for GA."]:
+            self.assertFalse(_underclaims(s), s)
         # The dated ROADMAP supersession note is a true statement, not an under-claim.
         note = ("(Superseded by #8278 on 2026-10-28: federation content encryption was removed "
                 "from this deferred set and is in v1.0.0 GA scope.")
@@ -508,6 +589,10 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(src.count(bs + "u2010"), 1, "a second class spells U+2010")
         self.assertEqual(len(re.findall(r"\[-[^\]]*" + bs + bs + "u[0-9A-Fa-f]{4}", src)), 1)
         self.assertTrue(src.isascii(), "a literal non-ASCII separator in the guard")
+        # The stem alternation is spelled once (_STEM); a second narrower literal fails here.
+        self.assertEqual(src.count("(?:encrypt" + "|"), 1, "a second stem alternation literal")
+        self.assertEqual(src.count("encrypt" + "|"), 1, "a second stem alternation literal")
+        self.assertEqual(src.count("|seal" + "|"), 1, "a second stem alternation literal")
         for code in [0x2D, 0x20, 0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2212,
                      0xFE63, 0xFF0D]:
             sep = chr(code)
