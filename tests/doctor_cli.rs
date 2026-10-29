@@ -38,7 +38,16 @@ use common::free_port;
 use rusqlite::params;
 use tempfile::TempDir;
 
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+// CI's `cargo llvm-cov` instrumentation inflates startup time by 3-5x.
+// As in serve_integration.rs, 60s leaves headroom across supported CI surfaces
+// and under runner load (#3615, #8287). This TLS probe cannot use the shared
+// plain-HTTP readiness helper (#3705).
+const SPAWN_TIMEOUT: Duration = Duration::from_mins(1);
+
+#[test]
+fn spawn_timeout_is_sixty_seconds_8287() {
+    assert_eq!(SPAWN_TIMEOUT, Duration::from_secs(60));
+}
 
 /// Number of times [`spawn_serve`] re-rolls the ephemeral port when the
 /// daemon child loses the `free_port()` TOCTOU race and exits with a bind
