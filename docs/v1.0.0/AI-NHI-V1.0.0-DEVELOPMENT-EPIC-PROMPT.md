@@ -63,7 +63,7 @@ Execute ROADMAP.md **§27 v1.0.0 Program** to completion and cut the **v1.0.0 GA
 
 **Gate 3 — the §1 endgame sequence, then the cut.**
 
-**P2/v1.x residue** (scoped-ciphertext federation, belief-preserving merge, corroboration field, fork/merge/delegation identity, catch-up tombstone feed): touch ONLY with a recorded ruling; never silently.
+**P2/v1.x residue** (belief-preserving merge, corroboration field, fork/merge/delegation identity, catch-up tombstone feed): touch ONLY with a recorded ruling; never silently. (Scoped-ciphertext federation is superseded by #8278 and in v1.0.0 GA scope.)
 
 ## 4. GA cut procedure (the v0.9.0 recipe, upgraded)
 
