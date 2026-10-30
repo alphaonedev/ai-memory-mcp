@@ -21,7 +21,20 @@
       "src/**", "tests/**", "benches/**", "crates/**", "examples/**", "migrations/**",
       "**/Cargo.toml", "**/Cargo.lock", "**/build.rs", "**/rust-toolchain*", "**/deny.toml",
       ".github/**", "**/Dockerfile*", "**/*.sh", "scripts/*.py", "scripts/qc-allowlists/**",
-      "scripts/test/**", "scripts/ci/*", "scripts/ci/impact/**"
+      "scripts/test/**", "scripts/ci/*", "scripts/ci/impact/**",
+      "scripts/ci/tests/test_pg_isolated_binary.py"
+    ],
+    "ci_tree_globs": [".github/**", "scripts/ci/**"],
+    "ci_tree_exempt_globs": ["scripts/ci/tests/**"],
+    "full_ci_events": ["push", "merge_group"],
+    "full_ci_base_names": ["main", "develop"],
+    "full_ci_base_prefixes": ["release/"],
+    "walk_guards": [
+      {
+        "rust": "tests/issue_3627_retired_llm_alias.rs",
+        "guard": "scripts/ci/tests/test_retired_alias_walk_3627.py",
+        "roots": ["docs", "scripts/ci/tests", "changelog.d"]
+      }
     ],
     "test_read_globs": [
       "CLAUDE.md", "CONTRIBUTING.md", "PERFORMANCE.md", "README.md", "ROADMAP.md",
@@ -37,7 +50,10 @@
       "docs/v0.7.0/mtp-bench-2026-05-17.md", "docs/v070-changelog.html",
       "docs/whats-new-v08.html",
       "docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md",
-      "scripts/ci/tests/test_codeql_6163.py"
+      "scripts/ci/tests/test_codeql_6163.py",
+      "conformance/**",
+      "scripts/ci/tests/test_check_cert_expiry_corpus.py",
+      "scripts/ci/tests/test_ci_select_gating_8240.py"
     ]
   },
   "job_map": {

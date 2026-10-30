@@ -13,7 +13,7 @@ GITHUB_OUTPUT:
 
 The skip set lives in rules.json under "cargo_skip" and is the ONLY source: the
 workflow reads it through this module and the guard test
-(scripts/ci/tests/test_impact_cargo_skip_8322.py) proves that no path a Rust
+(its file name carries the issue number, under scripts/ci/tests) proves that no path a Rust
 test or source file can open is inside it. A path is skippable only when it
 matches a skip glob and matches neither a never-skip glob nor a test-read glob.
 Anything unexpected (no paths, unreadable rules, a git error) fails closed:
@@ -25,7 +25,10 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Appended, never first: a scripts/ci module named like a stdlib module must not
+# shadow it (security F1, #8328). The workflow also runs this file from the base
+# tree, so the PR head cannot supply the decider at all.
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from impact import common  # noqa: E402
 
@@ -38,15 +41,28 @@ REASON_ERROR = "classifier-error-fail-closed"
 REASON_DOCS = "docs-only"
 REASON_TESTS = "no-rust-observable-paths"
 REASON_RUST = "rust-observable-path"
+REASON_EVENT = "push-event-full-ci"
+REASON_BASE = "protected-base-full-ci"
+REASON_CI_TREE = "ci-tree-edited-full-ci"
+GLOB_LISTS = ("skip_globs", "docs_globs", "never_skip_globs", "test_read_globs",
+              "ci_tree_globs", "ci_tree_exempt_globs", "full_ci_events",
+              "full_ci_base_names", "full_ci_base_prefixes")
 
 
 def load_section(rules_path: Optional[Path] = None) -> dict:
     """Return the validated cargo_skip section of rules.json."""
     section = common.load_rules(rules_path)[SECTION]
-    for key in ("version", "skip_globs", "docs_globs", "never_skip_globs",
-                "test_read_globs"):
+    for key in ("version", "walk_guards") + GLOB_LISTS:
         if key not in section:
             raise ValueError("rules.json cargo_skip lacks %s" % key)
+    guards = section["walk_guards"]
+    if not isinstance(guards, list) or not all(
+            isinstance(g, dict) and {"rust", "guard", "roots"} <= set(g) for g in guards):
+        raise TypeError("rules.json cargo_skip.walk_guards must list rust/guard/roots objects")
+    for key in GLOB_LISTS:
+        value = section[key]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise TypeError("rules.json cargo_skip.%s must be a list of strings" % key)
     return section
 
 
@@ -71,11 +87,35 @@ def is_skippable(section: dict, path: str) -> bool:
     return matches_any(section["skip_globs"], path) and not blocked(section, path)
 
 
-def classify(section: dict, paths: List[str]) -> Dict[str, str]:
+def full_ci_reason(section: dict, event_name: str, base_ref: str) -> Optional[str]:
+    """Return the reason a run must be full whatever the diff, else None.
+
+    Every push event and every pull request into a protected base (release
+    branches, main, develop) runs the whole pipeline (3-agent vote 6def5ab6
+    point 7; code review r1 F2, #8328).
+    """
+    if event_name in section["full_ci_events"]:
+        return REASON_EVENT
+    if base_ref and (base_ref in section["full_ci_base_names"]
+                     or any(base_ref.startswith(p)
+                            for p in section["full_ci_base_prefixes"])):
+        return REASON_BASE
+    return None
+
+
+def classify(section: dict, paths: List[str], event_name: str = "",
+             base_ref: str = "") -> Dict[str, str]:
     """Return the three output values for the changed `paths`."""
     version = "cargo_skip-rules-v%s" % section["version"]
+    forced = full_ci_reason(section, event_name, base_ref)
+    if forced:
+        return verdict(FALSE, FALSE, "%s %s" % (forced, version))
     if not paths:
         return verdict(FALSE, FALSE, "%s %s" % (REASON_EMPTY, version))
+    for path in paths:
+        if (matches_any(section["ci_tree_globs"], path)
+                and not matches_any(section["ci_tree_exempt_globs"], path)):
+            return verdict(FALSE, FALSE, "%s %s %s" % (REASON_CI_TREE, path, version))
     docs_only = all(is_doc(section, p) for p in paths)
     skip = all(is_skippable(section, p) for p in paths)
     if docs_only:
@@ -115,7 +155,7 @@ def emit(values: Dict[str, str]) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Classify the diff; always exit 0 with a fail-closed verdict on error."""
+    """Classify the diff; exit 0 with a fail-closed verdict on error, exit 1 on a wrong rules shape."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--rules", default=str(common.RULES_PATH))
     parser.add_argument("--repo", default=".")
@@ -123,6 +163,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--stdin", action="store_true",
                         help="read newline-separated changed paths from stdin")
+    parser.add_argument("--event-name", default="",
+                        help="github.event_name; a push always runs the full pipeline")
+    parser.add_argument("--base-ref", default="",
+                        help="github.base_ref; release/*, main and develop run in full")
     args = parser.parse_args(argv)
     try:
         section = load_section(Path(args.rules))
@@ -132,7 +176,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             paths = diff_paths(Path(args.repo), args.base, args.head)
         else:
             parser.error("give --stdin or --base")
-        emit(classify(section, paths))
+        emit(classify(section, paths, args.event_name, args.base_ref))
+    except TypeError as exc:
+        # A structurally wrong rules file (null, a non-list glob set): say so
+        # and exit 1 with no verdict; the workflow then keeps both outputs false.
+        common.log("cargo_skip: invalid rules shape: %s" % exc)
+        return common.EXIT_FAIL
     except (OSError, ValueError, KeyError, RuntimeError,
             subprocess.SubprocessError) as exc:
         common.log("cargo_skip: %s" % exc)

@@ -160,7 +160,7 @@
 #   (c) the carrying workflow's `pull_request` trigger exists and has NO
 #       `paths:` / `paths-ignore:` filter.
 #   (b3) in ANY job with `needs: classify` and NO job-level `if:`, EVERY step
-#       carries a `docs_only` (or #8322 `cargo_skip`, a superset) guard. One unguarded step silently runs the
+#       carries a `docs_only` (or #8322 `outputs.cargo_skip == / != 'true'`, a superset) guard; `cargo_skip_reason` is no guard (#8328). One unguarded step silently runs the
 #       heavy work on docs-only PRs (or, worse, half-runs it). The single
 #       structural exemption is a bare `actions/checkout@*` step, which is
 #       what the `check` job's proven pattern does.
@@ -630,7 +630,7 @@ parse_workflows() {
             if (in_steps && ind == 6 && substr(body, 1, 2) == "- ") {
                 flushstep()
                 cur_step = ++stepno[job]
-                if (key == "if") { s_hasif = 1; if (rawval ~ /docs_only|cargo_skip/) s_guard = 1 }
+                if (key == "if") { s_hasif = 1; if (rawval ~ /docs_only|outputs\.cargo_skip[ \t]*[!=]=[ \t]*.(true|false)/) s_guard = 1 }
                 else if (key == "uses") s_uses = scalar(rawval)
                 else if (key == "name") s_name = scalar(rawval)
                 if (isblock) blockind = ind
@@ -638,7 +638,7 @@ parse_workflows() {
             }
 
             if (in_steps && ind == 8 && cur_step > 0) {
-                if (key == "if") { s_hasif = 1; if (rawval ~ /docs_only|cargo_skip/) s_guard = 1 }
+                if (key == "if") { s_hasif = 1; if (rawval ~ /docs_only|outputs\.cargo_skip[ \t]*[!=]=[ \t]*.(true|false)/) s_guard = 1 }
                 else if (key == "uses") s_uses = scalar(rawval)
                 else if (key == "name") s_name = scalar(rawval)
                 if (isblock) blockind = ind

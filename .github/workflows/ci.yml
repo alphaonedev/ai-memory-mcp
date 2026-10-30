@@ -541,39 +541,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { persist-credentials: false, fetch-depth: 2 }
-      - name: Test impact selector security fallbacks
-        run: python3 scripts/test/test_ci_test_impact.py
-      - name: Workflow concurrency invariants (#6340)
-        run: python3 scripts/test/test_workflow_concurrency_6340.py
-      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
-      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
-      - name: Resolve the corpus ratchet base (#7987)
-        env:
-          PR_BASE_REF: ${{ github.base_ref }}
-        run: |
-          if [ -n "$PR_BASE_REF" ]; then
-            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
-              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
-              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-              git fetch --no-tags --deepen=200 origin HEAD || true
-            fi
-            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
-          else
-            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
-          fi
-      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
-      - name: Fetch the corpus replay objects (#7988)
-        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
-      - name: Shard partition and wiring unit tests (#6344)
-        run: python3 -m unittest discover -s scripts/ci/tests
-      - name: AGE self-heal helper unit test (#6161)
-        run: python3 scripts/test/test_ensure_age_extension_6161.py
-      # #7160 - scripts/test/ is outside the discovery root above; run the
-      # sweep script tests (including the Linux-only O_PATH test, which this
-      # ubuntu-latest job is where it executes) and the sweep workflow pin.
-      - name: Target sweep unit tests (#7160)
-        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
+      # #8328 (security F1): `cls` is the FIRST step after checkout. Every step
+      # below executes code from the PR tree, so none of them may run before the
+      # classify decision is written; `cls` also loads its decider from the
+      # merge-base tree, never from the PR head.
       - id: cls
         shell: bash
         env:
@@ -585,6 +556,7 @@ jobs:
           PR_BEFORE: ${{ github.event.before }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_ACTION: ${{ github.event.action }}
+          PR_BASE_REF: ${{ github.base_ref }}
         run: |
           # TWO SEPARATE BASES (#2496). Sharing one was the defect.
           #
@@ -716,18 +688,34 @@ jobs:
           # scripts/ci/impact/rules.json `cargo_skip` (read by
           # scripts/ci/impact/cargo_skip.py). docs_only is the docs/**|*.md set
           # MINUS every doc a Rust test reads; cargo_skip additionally allows
-          # scripts/ci/tests/**. A PR that edits the classifier itself or the
-          # workflow can never weaken its own judgement: those paths force the
-          # full pipeline here, before the helper is consulted. Any helper
-          # error or missing line fails CLOSED (both false).
+          # scripts/ci/tests/**.
+          #
+          # #8328 (security F1): the decider is loaded from the MERGE-BASE tree
+          # (git show <merge-base>:<path>), never from the PR head, and it runs
+          # with -I from a directory outside the workspace. A PR therefore cannot
+          # edit, shadow or pre-empt its own judgement. When the base tree has no
+          # classifier yet, both verdicts fail CLOSED (false). Any change under
+          # .github/ or scripts/ci/ (outside scripts/ci/tests/) is a full run.
+          # The verdict lines are written at the END of this step, after the only
+          # PR-tree command it runs (scripts/ci-test-impact.sh).
           docs_only=false
           cargo_skip=false
           cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
+          trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
+          trust_impact="$trust_dir/scripts/ci/impact"
+          trust_ref=$(git merge-base HEAD "$cls_base" 2>/dev/null || echo "$cls_base")
+          mkdir -p "$trust_impact"
+          trusted=true
+          for trust_file in __init__.py common.py cargo_skip.py rules.json; do
+            git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
+          done
           skip_out="${RUNNER_TEMP:-.}/cargo-skip.out"
           : > "$skip_out"
-          if echo "$changed" | grep -qE '^(scripts/ci/impact/|\.github/)'; then
+          if [ "$trusted" != "true" ]; then
+            cargo_skip_reason="trusted-classifier-missing-in-base-fail-closed cargo_skip-rules"
+          elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
             cargo_skip_reason="classifier-or-workflow-edited-fail-closed cargo_skip-rules"
-          elif echo "$changed" | python3 -I scripts/ci/impact/cargo_skip.py --stdin > "$skip_out"; then
+          elif echo "$changed" | python3 -I "$trust_impact/cargo_skip.py" --stdin --rules "$trust_impact/rules.json" --event-name "$EVENT_NAME" --base-ref "$PR_BASE_REF" > "$skip_out"; then
             if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ] && [ "$(grep -c '^cargo_skip=' "$skip_out")" = "1" ] && [ "$(grep -c '^cargo_skip_reason=' "$skip_out")" = "1" ]; then
               docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
               cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
@@ -743,9 +731,6 @@ jobs:
           else
             echo "::notice::cargo_skip=false ($cargo_skip_reason) - running full pipeline"
           fi
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          echo "cargo_skip=$cargo_skip" >> "$GITHUB_OUTPUT"
-          echo "cargo_skip_reason=$cargo_skip_reason" >> "$GITHUB_OUTPUT"
           echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
           echo "$changed"
 
@@ -793,6 +778,43 @@ jobs:
           else
             cat "$impact_out" >> "$GITHUB_OUTPUT"
           fi
+          # #8328: written last, after every command that ran PR-tree code.
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "cargo_skip=$cargo_skip" >> "$GITHUB_OUTPUT"
+          echo "cargo_skip_reason=$cargo_skip_reason" >> "$GITHUB_OUTPUT"
+      - name: Test impact selector security fallbacks
+        run: python3 scripts/test/test_ci_test_impact.py
+      - name: Workflow concurrency invariants (#6340)
+        run: python3 scripts/test/test_workflow_concurrency_6340.py
+      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
+      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
+      - name: Resolve the corpus ratchet base (#7987)
+        env:
+          PR_BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$PR_BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
+              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
+              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+              git fetch --no-tags --deepen=200 origin HEAD || true
+            fi
+            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
+          else
+            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
+          fi
+      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
+      - name: Fetch the corpus replay objects (#7988)
+        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      - name: Shard partition and wiring unit tests (#6344)
+        run: python3 -m unittest discover -s scripts/ci/tests
+      - name: AGE self-heal helper unit test (#6161)
+        run: python3 scripts/test/test_ensure_age_extension_6161.py
+      # #7160 - scripts/test/ is outside the discovery root above; run the
+      # sweep script tests (including the Linux-only O_PATH test, which this
+      # ubuntu-latest job is where it executes) and the sweep workflow pin.
+      - name: Target sweep unit tests (#7160)
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
   # need to run on macOS where it just duplicates work and burns

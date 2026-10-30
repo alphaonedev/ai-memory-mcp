@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from impact import common  # noqa: E402
 
@@ -46,6 +46,11 @@ GLOB_STEM = re.compile(r"([A-Za-z0-9_.@+/-]+)/[*?\[]")
 EXEC_MARK = re.compile(r"Command\b|process::")
 PY_IMPORT = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
 TESTS_DIR = "scripts/ci/tests/"
+# Every step script of a workflow or composite action is a read (security F2,
+# #8328): the cargo legs run them, so a skippable path they name is a hole.
+WORKFLOW_ROOTS = (".github/workflows/", ".github/actions/")
+WORKFLOW_SUFFIXES = (".yml", ".yaml")
+UNITTEST_MODULE = re.compile(r"-m\s+unittest(?:\s+-[A-Za-z]+)*\s+([A-Za-z0-9_]+)")
 ROOT_MARK = re.compile(
     r"CARGO_MANIFEST_DIR|repo_root|project_root|workspace_root")
 LEADING_DOTS = ("./", "../")
@@ -78,8 +83,14 @@ def normalise(text: str) -> str:
     return value.strip("/")
 
 
-def candidates_of(text: str, is_rust: bool) -> Set[str]:
-    """Return the path candidates of one source text (see the module doc)."""
+def candidates_of(text: str, is_rust: bool,
+                  top_dirs: Optional[Set[str]] = None) -> Set[str]:
+    """Return the path candidates of one source text (see the module doc).
+
+    A Rust literal that is exactly a tracked top-level directory name (a const
+    array of walk roots, a `.join(root)` argument) is a directory read.
+    """
+    top_dirs = top_dirs or set()
     out: Set[str] = set()
 
     def add(item: str, bare_dir: bool) -> None:
@@ -89,8 +100,13 @@ def candidates_of(text: str, is_rust: bool) -> Set[str]:
                 out.add((DIR_MARK if bare_dir else "") + norm)
 
     if is_rust:
+        # A top-level name inside a multi-part chain is only the first component
+        # of a longer path (.join("docs").join("integrations")), not a root walk.
+        chained = [(m.start(), m.end()) for m in CHAIN.finditer(text)
+                   if len(RUST_LITERAL.findall(m.group(0))) > 1]
         for match in RUST_LITERAL.finditer(text):
             item = match.group(1)
+            in_chain = any(lo <= match.start() < hi for lo, hi in chained)
             fragments = [f for f in PLACEHOLDER.split(item) if f]
             templated = len(fragments) != 1 or fragments[0] != item
             for fragment in fragments:
@@ -101,7 +117,7 @@ def candidates_of(text: str, is_rust: bool) -> Set[str]:
                         if "/" in word or NAME_MARK in word:
                             add(word, False)
                 else:
-                    add(fragment, templated)
+                    add(fragment, templated or (fragment in top_dirs and not in_chain))
         for match in CHAIN.finditer(text):
             parts = [normalise(p) for p in RUST_LITERAL.findall(match.group(0))]
             add("/".join(p for p in parts if p), True)
@@ -112,6 +128,8 @@ def candidates_of(text: str, is_rust: bool) -> Set[str]:
         for stem in GLOB_STEM.findall(text):
             add(stem, True)
         for module in PY_IMPORT.findall(text):
+            add(module + ".py", False)
+        for module in UNITTEST_MODULE.findall(text):
             add(module + ".py", False)
     return out
 
@@ -160,13 +178,37 @@ def read_text(repo: Path, rel: str) -> str:
         return ""
 
 
-def referenced_paths(repo: Path, paths: Optional[List[str]] = None) -> Dict[str, str]:
-    """Return {referenced path: first referrer} reachable from the Rust files."""
+def guarded_map(section: dict) -> Dict[str, List[str]]:
+    """Return {rust source: guarded roots} from the cargo_skip walk_guards."""
+    return {g["rust"]: list(g["roots"]) for g in section["walk_guards"]}
+
+
+def is_workflow(path: str) -> bool:
+    """Return True for a workflow or composite-action YAML file."""
+    return path.endswith(WORKFLOW_SUFFIXES) and path.startswith(WORKFLOW_ROOTS)
+
+
+def under_any(path: str, roots: Iterable[str]) -> bool:
+    """Return True when `path` is a root or lies under one."""
+    return any(path == root or path.startswith(root.rstrip("/") + "/")
+               for root in roots)
+
+
+def referenced_paths(repo: Path, paths: Optional[List[str]] = None,
+                     guarded: Optional[Dict[str, List[str]]] = None) -> Dict[str, str]:
+    """Return {referenced path: first referrer} reachable from the Rust files.
+
+    `guarded` maps a Rust source to the walk roots whose scan a Python guard
+    mirrors on every PR (rules.json cargo_skip.walk_guards): hits under those
+    roots are not reported for that source.
+    """
     paths = paths if paths is not None else tracked_files(repo)
+    guarded = guarded or {}
     index = PathIndex(paths)
+    top_dirs = {p.split("/")[0] for p in paths if "/" in p}
     referenced: Dict[str, str] = {}
     scanned: Set[str] = set()
-    queue = [p for p in paths if p.endswith(RUST_SUFFIX)]
+    queue = [p for p in paths if p.endswith(RUST_SUFFIX) or is_workflow(p)]
     while queue:
         source = queue.pop()
         if source in scanned:
@@ -181,11 +223,13 @@ def referenced_paths(repo: Path, paths: Optional[List[str]] = None) -> Dict[str,
         # A script is followed only when something that can run it names it: a
         # Rust file that spawns processes, or another followed script.
         runs_scripts = not is_rust or bool(EXEC_MARK.search(text))
-        for candidate in candidates_of(text, is_rust):
+        for candidate in candidates_of(text, is_rust, top_dirs):
             if (not rooted and candidate.startswith(DIR_MARK)
                     and "/" not in candidate[len(DIR_MARK):]):
                 continue
             for hit in index.resolve(candidate):
+                if source in guarded and under_any(hit, guarded[source]):
+                    continue
                 # A followed script contributes only scripts and its exact
                 # scripts/ci/tests modules: its prose and glob mentions of docs
                 # are read by the docs gates (their own CI jobs), not by cargo.

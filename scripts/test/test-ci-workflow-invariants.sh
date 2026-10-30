@@ -265,9 +265,14 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BA
 F="$SCRATCH/s7"; build_fixture "$F" docs docs
 C1="$(git -C "$F" rev-parse HEAD~1)"
 OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=push PR_ACTION="" PR_BASE_SHA="" PR_BEFORE="$C1")"
-[ "$(getout "$OUT" docs_only)" = "true" ] \
-    && ok "s7 push event still classifies its own delta (no PR base exists)" \
-    || bad "s7 push event" "got docs_only=$(getout "$OUT" docs_only)"
+# #8328 (code review r1 F2): a push event always runs the full pipeline, so a
+# docs-shaped delta no longer short-circuits either verdict.
+[ "$(getout "$OUT" docs_only)" = "false" ] \
+    && [ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && case "$(getout "$OUT" cargo_skip_reason)" in push-event-full-ci*) true ;; *) false ;; esac \
+    && ok "s7 push event forces docs_only=false and cargo_skip=false (push-event-full-ci)" \
+    || bad "s7 push event must force the full pipeline" \
+           "docs_only=$(getout "$OUT" docs_only) cargo_skip=$(getout "$OUT" cargo_skip) reason=$(getout "$OUT" cargo_skip_reason)"
 
 # --- Scenario 8: unknown event fails closed.
 F="$SCRATCH/s8"; build_fixture "$F" code docs
@@ -323,6 +328,58 @@ O3="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=opened PR_BASE_SHA
 [ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$O2" cargo_skip)" = "false" ] && [ "$(getout "$O3" cargo_skip)" = "false" ] \
     && ok "s13 empty diff, merge_group and unresolvable base all fail closed: cargo_skip=false (#8322)" \
     || bad "s13 fail-closed cargo_skip" "empty=$(getout "$OUT" cargo_skip) merge_group=$(getout "$O2" cargo_skip) zero-base=$(getout "$O3" cargo_skip)"
+
+# --- Scenarios 14-17 (#8328 round 2): trust root and forced full runs. ------
+# s14: a push on any branch with a tests-only delta still runs in full.
+F="$SCRATCH/s14"; build_fixture "$F" docs citests
+C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=push PR_ACTION="" PR_BASE_SHA="" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s14 push event with a tests-only delta: cargo_skip=false, docs_only=false (#8328)" \
+    || bad "s14 push must force the full pipeline" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only)"
+
+# s15: a PR into a protected base (release/*, main, develop) runs in full.
+F="$SCRATCH/s15"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+S15_OK=true
+for base_ref in release/v1.0.0 main develop; do
+    OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1" PR_BASE_REF="$base_ref")"
+    [ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] || S15_OK=false
+done
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1" PR_BASE_REF=chain/promo6-ssh-r2)"
+[ "$(getout "$OUT" cargo_skip)" = "true" ] || S15_OK=false
+$S15_OK \
+    && ok "s15 PR into release/*, main, develop forces cargo_skip=false; a chain base keeps the skip (#8328)" \
+    || bad "s15 protected base must force the full pipeline" "last cargo_skip=$(getout "$OUT" cargo_skip)"
+
+# s16: a PR that rewrites its own classifier cannot pre-empt the verdict. The
+# decider is read from the merge-base tree; the edit is itself a full run.
+F="$SCRATCH/s16"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+printf '%s\n' 'print("docs_only=true")' 'print("cargo_skip=true")' 'print("cargo_skip_reason=planted")' > "$F/scripts/ci/impact/cargo_skip.py"
+printf '%s\n' 'raise SystemExit(0)' > "$F/scripts/ci/impact/json.py"
+echo "fn main() { let _ = 1; }" > "$F/src/lib.rs"
+git -C "$F" add -A >/dev/null 2>&1
+git -C "$F" commit -q -m "plant" >/dev/null 2>&1
+C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s16 a PR rewriting its classifier and planting a stdlib shadow still gets cargo_skip=false (#8328)" \
+    || bad "s16 planted classifier must not decide" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only) reason=$(getout "$OUT" cargo_skip_reason)"
+
+# s17: only the base tree is trusted: a base without the classifier fails closed.
+F="$SCRATCH/s17"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+git -C "$F" rm -q -r scripts/ci/impact >/dev/null 2>&1
+git -C "$F" commit -q -m "drop" >/dev/null 2>&1
+S17_BASE="$(git -C "$F" rev-parse HEAD)"
+echo "s17 doc" >> "$F/docs/a.md"
+git -C "$F" commit -q -am "s17 pr" >/dev/null 2>&1
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$S17_BASE" PR_BEFORE="")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && case "$(getout "$OUT" cargo_skip_reason)" in trusted-classifier-missing-in-base*) true ;; *) false ;; esac \
+    && ok "s17 a base tree without the classifier fails closed (trusted-classifier-missing-in-base)" \
+    || bad "s17 missing base classifier must fail closed" "cargo_skip=$(getout "$OUT" cargo_skip) reason=$(getout "$OUT" cargo_skip_reason)"
 
 # --- Regression leg: the PRE-FIX block MUST mis-classify scenario 1. --------
 # Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP. A

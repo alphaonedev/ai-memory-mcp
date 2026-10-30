@@ -195,7 +195,8 @@ class SkipSetAgainstReadSet(unittest.TestCase):
     def setUpClass(cls):
         cls.section = cargo_skip.load_section()
         cls.tracked = read_set.tracked_files(REPO)
-        cls.referenced = read_set.referenced_paths(REPO, cls.tracked)
+        cls.referenced = read_set.referenced_paths(
+            REPO, cls.tracked, read_set.guarded_map(cls.section))
 
     def test_scanner_finds_the_known_readers(self):
         for known in ("CLAUDE.md", "docs/API_REFERENCE.md", "README.md"):
