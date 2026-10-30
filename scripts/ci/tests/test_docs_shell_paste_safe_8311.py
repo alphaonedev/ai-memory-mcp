@@ -428,7 +428,7 @@ class Frames(list):
 
 
 LOOK_STOPS = {
-    None: re.compile(r"[()'\"\\`]|\$\((?!\()|\$'"),
+    None: re.compile(r"\$\$|[()'\"\\`]|\$\((?!\()|\$'"),  # `$$` first: the PID
     "'": re.compile(r"'"),
     "$'": re.compile(r"['\\]"),  # ANSI-C: a backslash escapes the next character
     '"': re.compile(r'["\\`]|\$\((?!\()'),
@@ -440,7 +440,8 @@ class Lookahead:
     as bash does (parse_dparen, parse_arith_cmd): the text after the opener
     up to the `)` that closes its inner `(` (parens counted, quotes and
     backslashes skipped; inside an ANSI-C `$'..'` a backslash escapes the
-    quote, as in QUOTES) must be followed at once by `)`; otherwise bash
+    quote, as in QUOTES, and a `$$` is the PID parameter, so the quote
+    after it is plain) must be followed at once by `)`; otherwise bash
     re-reads `((` as two nested subshells and `$((` as `$( (..) )`.
     bash's scan reads a backtick span or a `$( )` as commands (fresh
     quoting, `#` comments), which a paren count cannot follow, so a
@@ -484,6 +485,8 @@ class Lookahead:
                 ch, col = m.group(), m.end()
                 if ch == "\\":
                     col += 1
+                elif ch == "$$":
+                    pass  # the PID parameter, read before any quote after it
                 elif ch == "$'":
                     quote = ch  # only LOOK_STOPS[None] matches it
                 elif ch == "`" or ch.startswith("$("):
@@ -602,6 +605,8 @@ def lex_operator(line, i, stack, top, ahead):
     in a code frame. Returns the characters used (0 for none)."""
     ch = line[i]
     if ch == "$":
+        if line.startswith("$$", i):
+            return 2  # the PID parameter: a quote after it opens no `$'`
         if line.startswith("$'", i):
             stack.append("$'")
             return 2
@@ -1225,9 +1230,13 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # S17: bash's scan reads a backtick span or a `$( )` as commands, so
         # a paren run inside one is no `))`; the lookahead answers subshell.
         # S18: inside an ANSI-C `$'..'` a backslash escapes the quote, so a
-        # paren run after `\'` is still inside the string. Each row carries
-        # the lines bash 5.2 runs (`bash -c`, echo markers) and the hits.
+        # paren run after `\'` is still inside the string. F1: bash reads
+        # `$$` as the PID parameter first, so the quote after it is a plain
+        # one, where `\'` ends the string. Each row carries the lines bash
+        # 5.2 runs (`bash -c`, echo markers) and the hits.
         probes = (
+            (["echo $$'\\'; echo L1 # c'"], [1], "L1"),
+            (["(( $$'\\'); echo L1 # c'))", ")"], [1], "L1"),
             (["(( `echo ))`; echo L1 # c", ") )"], [1], "L1"),
             (["(( \"$(echo '\"))')\"; echo L1 # c", ") )"], [1], "L1"),
             (["(( $(: # )))", "); echo L2 # c", ") )"], [1, 2], "L2"),
@@ -1257,6 +1266,7 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         shapes = (
             ("x ${", 20000), ("cat <<E", 0), ("((", 0), ("(( `", 0), ("(( $(", 0),
             ("(( $'\\'", 0),  # S18: an escaped quote in an ANSI-C string
+            ("(( $$'\\'", 0),  # F1: a double dollar, then a plain quote
         )
         for line, want in shapes:
             began = time.monotonic()
