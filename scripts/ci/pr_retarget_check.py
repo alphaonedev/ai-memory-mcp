@@ -26,6 +26,7 @@ live path (no ``--json-dir``) through a stub ``gh`` placed first on PATH.
 """
 import argparse
 import json
+from datetime import datetime
 import os
 import subprocess
 import sys
@@ -39,6 +40,9 @@ MAX_PAGES_DEFAULT = 200
 
 def resolve_max_pages(raw):
     """Page cap from a raw ``PR_RETARGET_MAX_PAGES`` value; it may only LOWER the default (test hook, fails closed).
+
+    ``int()`` accepts surrounding whitespace, so ``" 2 "`` lowers the cap to 2; kept on purpose (round 6,
+    REVIEW-8332-code-r5 I1): a lowered cap only refuses sooner, and the test pins it.
 
     decision (round 4, REVIEW-8332-security-r3 S6): the cap branch is tested through this override
     instead of generating 20,000 events. A larger, non-positive or unparsable value is ignored, so the
@@ -57,6 +61,7 @@ def _max_pages():
 
 MAX_PAGES = _max_pages()
 RUN_LIMIT = 100
+STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 class ToolError(Exception):
@@ -119,6 +124,21 @@ def fetch_runs(repo, head, workflow, json_dir):
     return runs
 
 
+def parse_stamp(raw, what):
+    """A GitHub ISO-8601 UTC stamp as a datetime; anything else is a ToolError (exit 70).
+
+    decision (round 6, REVIEW-8332-code-r5 F2, REVIEW-8332-security-r5 S11): stamps are parsed and
+    compared as datetimes, never as strings, so a padded or space-separated stamp cannot sort below a
+    canonical one and be ignored. An unparsable stamp refuses; it is never skipped.
+    """
+    if not isinstance(raw, str) or not raw:
+        raise ToolError(f"{what} has no created_at")
+    try:
+        return datetime.strptime(raw, STAMP_FORMAT)
+    except ValueError:
+        raise ToolError(f"{what} has an unparsable created_at {raw!r}")
+
+
 def check(repo, pr, head, json_dir):
     events = fetch_timeline(repo, pr, json_dir)
     changes = [e for e in events if isinstance(e, dict) and e.get("event") == "base_ref_changed"]
@@ -127,16 +147,13 @@ def check(repo, pr, head, json_dir):
         return EX_OK
     # decision (round 5, REVIEW-8332-code-r4 F1, REVIEW-8332-security-r4 S8): ANY base change without a
     # usable created_at refuses (exit 70); dropping it would compare the runs against an older retarget.
-    for event in changes:
-        raw_stamp = event.get("created_at")
-        if not isinstance(raw_stamp, str) or not raw_stamp.strip():
-            raise ToolError("base_ref_changed event has no created_at")
-    stamp = max(e["created_at"] for e in changes)
+    latest = max(parse_stamp(e.get("created_at"), "base_ref_changed event") for e in changes)
+    stamp = latest.strftime(STAMP_FORMAT)
     stale = False
     ids = []
     for workflow in WORKFLOWS:
-        runs = fetch_runs(repo, head, workflow, json_dir)
-        newer = [r for r in runs if isinstance(r, dict) and str(r.get("createdAt", "")) > stamp]
+        runs = [r for r in fetch_runs(repo, head, workflow, json_dir) if isinstance(r, dict)]
+        newer = [r for r in runs if parse_stamp(r.get("createdAt"), f"{workflow} run") > latest]
         if not newer:
             print(f"REFUSE: base retargeted at {stamp} after the latest pull_request run of {workflow}; "
                   "push a new head so CI classifies against the current base (#7072, #8332)")

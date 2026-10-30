@@ -15,9 +15,14 @@ The rules this guard pins (a ratchet over EVERY workflow):
    flow-mapping ``on: {pull_request: {types: [..]}}``), except claude-md-rule-compare.yml
    (a one-entry allow-list; its ``cancel-in-progress`` guard is pinned by rule 2). The
    scan is stdlib only (PyYAML is not installed on every runner and no other workflow
-   test imports it), so it fails closed: a workflow whose ``on:`` section it cannot read
-   (no ``on`` key, an anchor or alias in it) is a failure, and any ``edited`` word inside a
-   pull_request(_target) trigger body counts as listed.
+   test imports it): ONE quote-aware scanner (``_Scanner``) reads every line, carrying the
+   quote, flow-depth and block-scalar state across lines, and it fails closed: a workflow
+   whose ``on:`` section it cannot fully account for (no or a second ``on`` key, an anchor,
+   alias or tag, an open quote or flow, an early-closing flow, an unrecognised line, a
+   column-0 line after the section that is not a workflow key) is refused by name, and any
+   ``edited`` word inside a pull_request(_target) trigger body counts as listed. The
+   ``ORACLE`` table pins every shape from rounds 3-6; where PyYAML is importable a
+   differential test checks the table against it.
 2. Where ``edited`` is listed, every ``cancel-in-progress`` key at ANY indent (a
    job-level concurrency block too) is the literal ``false``, the guard
    ``${{ github.event_name == 'pull_request' }}``, the body-only guard
@@ -32,11 +37,13 @@ The rules this guard pins (a ratchet over EVERY workflow):
 
 Stdlib only. Run: ``python3 -I scripts/test/test_workflow_edited_cancel_8332.py``.
 """
+import importlib.util
 import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRATCH = ROOT / ".local-runs"
@@ -53,118 +60,205 @@ ACTIVITY_TYPES = {"assigned", "unassigned", "labeled", "unlabeled", "opened", "e
                   "synchronize", "converted_to_draft", "locked", "unlocked", "enqueued", "dequeued",
                   "milestoned", "demilestoned", "ready_for_review", "review_requested",
                   "review_request_removed", "auto_merge_enabled", "auto_merge_disabled"}
-ON_KEY_RE = re.compile(r"""^(?:on|"on"|'on')[ \t]*:(.*)$""")
-ANCHOR_RE = re.compile(r"(?:^|[\s\[{,:])[&*][A-Za-z_]|<<\s*:")
+ON_KEY_RE = re.compile(r"""^(?:on|"on"|'on')[ \t]*:(?:[ \t]+(.*))?$""")
+TOP_KEY_RE = re.compile(r"""^(["']?)(?:name|run-name|on|permissions|env|defaults|concurrency|jobs)\1[ \t]*:(?:[ \t]|$)""")
+ANCHOR_RE = re.compile(r"(?:^|[\s\[{,:])[&*!][A-Za-z_!<]|<<\s*:|(?:^|[\s\[{,])\?(?:\s|$)")
+BLOCK_SCALAR_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)[|>][1-9+-]*$")
 CANCEL_RE = re.compile(r"^[ \t]*cancel-in-progress:[ \t]*(.*?)[ \t]*$", re.M)
 CONCURRENCY_RE = re.compile(r"^[ \t]*concurrency:", re.M)
+WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 
 class ParseFailure(Exception):
     """The workflow trigger section cannot be read; the caller fails closed."""
 
 
-def _strip(line: str) -> str:
-    return re.sub(r"(^|\s)#.*$", "", line).rstrip()
+class Line(NamedTuple):
+    """One scanned line: comments cut, quoted and block-scalar text reduced to words (see ``scan``)."""
+
+    text: str  # structure text; inside quotes only word characters survive (others become spaces)
+    cont: bool  # starts inside a quoted scalar or is block-scalar content: never a key line
+    depth: int  # flow-collection depth BEFORE this line
 
 
 def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
-QUOTED_RE = re.compile(r"""\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*'""")
+def _words(raw: str) -> str:
+    """Block-scalar content: keep the indent and the word characters only (no brackets, colons or quotes)."""
+    body = raw.lstrip(" ")
+    return " " * (len(raw) - len(body)) + "".join(c if c in WORD_CHARS else " " for c in body)
 
 
-def _bracket_delta(line: str) -> int:
-    """Net flow-bracket depth of one line, ignoring quoted strings and ``#`` comments outside quotes.
+class _Scanner:
+    """The ONE quote-aware, stateful YAML line scanner of this guard (round 6).
 
-    decision (round 5, REVIEW-8332-code-r4 F2, REVIEW-8332-security-r4 S7): a quoted value such as
-    ``"release/}"`` must not end the join early, or a later ``types: [edited]`` is never read.
+    decision (round 6, REVIEW-8332-security-r5 S9/S10, REVIEW-8332-code-r5 F1): rounds 3, 4 and 5 each
+    failed open on a new shape (quoted keys, quoted brackets, then a quoted space-# and an apostrophe in
+    a plain scalar) because comments, quotes and brackets were handled by separate per-line regexes. One
+    scanner now walks every character once, carrying the quote state, the flow depth and the block-scalar
+    state across lines. A quoted scalar opens only at a scalar start (line start, after ``[ { ,``, after
+    ``:``/``-``/``?`` followed by whitespace), as in YAML; ``''`` and backslash escapes are honoured; a ``#``
+    starts a comment only outside quotes and after whitespace or at line start; flow brackets count only
+    in flow context or at a scalar start (``${{ }}`` in a plain scalar is text); a ``|``/``>`` block scalar's
+    lines are reduced to words. An open quote or an open flow collection at the end of the file is a
+    ParseFailure.
     """
-    bare = QUOTED_RE.sub("", line)
-    bare = re.sub(r"(^|\s)#.*$", "", bare)
-    return sum(bare.count(c) for c in "{[") - sum(bare.count(c) for c in "}]")
+
+    def __init__(self):
+        self.quote = ""
+        self.depth = 0
+        self.block = -1  # indent of the line that opened a block scalar, or -1
+
+    def _quoted(self, raw: str, i: int, out: list) -> int:
+        """Consume one character inside a quoted scalar; return the next index."""
+        c = raw[i]
+        if self.quote == '"' and c == "\\":
+            out.append("  " if i + 1 < len(raw) else " ")
+            return i + 2
+        if c == self.quote:
+            if self.quote == "'" and raw[i + 1:i + 2] == "'":
+                out.append("  ")
+                return i + 2
+            self.quote = ""
+            out.append(c)
+            return i + 1
+        out.append(c if c in WORD_CHARS else " ")
+        return i + 1
+
+    def _plain(self, raw: str, i: int, out: list, start: bool) -> bool:
+        """Account for one character outside quotes; return the new scalar-start state."""
+        c, nxt = raw[i], raw[i + 1:i + 2]
+        out.append(c)
+        if c in "\"'" and start:
+            self.quote = c
+            return False
+        if c in "[{" and (start or self.depth):
+            self.depth += 1
+            return True
+        if c in "]}" and self.depth:
+            self.depth -= 1
+            return False
+        if c == "," and self.depth:
+            return True
+        if c in "-?":
+            return start and nxt in ("", " ", "\t")
+        if c == ":":  # a key separator; a JSON-like "key":"value" in flow opens the value at once
+            return nxt in ("", " ", "\t") or (raw[i - 1] in "\"'" and nxt in ("\"", "'"))
+        return start if c in " \t" else False
+
+    def line(self, raw: str) -> Line:
+        """Scan one raw line and return its Line record."""
+        depth, cont = self.depth, bool(self.quote)
+        if self.block >= 0 and (not raw.strip() or _indent(raw) > self.block):
+            return Line(_words(raw), True, depth)
+        self.block = -1
+        out, i, start = [], 0, not cont
+        while i < len(raw):
+            if self.quote:
+                i = self._quoted(raw, i, out)
+                continue
+            if raw[i] == "#" and (i == 0 or raw[i - 1] in " \t"):
+                break
+            start = self._plain(raw, i, out, start)
+            i += 1
+        text = "".join(out).rstrip()
+        if not self.quote and not self.depth and BLOCK_SCALAR_RE.search(text):
+            self.block = _indent(raw)
+        return Line(text, cont, depth)
 
 
-def _join_flow(first: str, remaining: list) -> str:
-    """Join a flow collection to its closing brace across lines; fail closed when it never closes.
+def scan(text: str) -> list:
+    """Every line of a workflow as a Line; ParseFailure on a quote or flow still open at the end."""
+    sc = _Scanner()
+    lines = []
+    for raw in text.splitlines():
+        lines.append(sc.line(raw))
+    if sc.quote:
+        raise ParseFailure("unterminated quoted scalar")
+    if sc.depth:
+        raise ParseFailure("unclosed flow collection; the `on:` section cannot be bounded")
+    return lines
 
-    decision (round 4, REVIEW-8332-security-r3 S5): join (not refuse) a multi-line flow, because
-    that is valid YAML; an UNCLOSED flow is refused by name via ParseFailure.
-    decision (round 5, REVIEW-8332-security-r4 S7): when the join ends while indented lines of the
-    `on:` section are still unread, the file is refused by name (a short join could hide `edited`).
+
+def _on_section(lines: list):
+    """Locate the one top-level ``on:`` key: (its inline value, its section lines).
+
+    The section runs to the next line at column 0 outside any flow collection and quoted scalar.
+    decision (round 6, REVIEW-8332-security-r5 S10): that next column-0 line must be a top-level
+    workflow key; anything else means the scanner lost track of the ``on:`` section, so the file is
+    refused by name rather than read short. A second top-level ``on:`` is refused too.
     """
-    pieces = [first]
-    depth = _bracket_delta(first)
-    lines = list(remaining)
-    while depth > 0:
-        if not lines:
-            raise ParseFailure("unclosed flow collection in the `on:` section")
-        nxt = lines.pop(0)
-        pieces.append(nxt)
-        depth += _bracket_delta(nxt)
-    for left in lines:
-        if left and not left[0].isspace():
+    keys = [i for i, ln in enumerate(lines) if not ln.cont and not ln.depth and ON_KEY_RE.match(ln.text)]
+    if not keys:
+        raise ParseFailure("no top-level `on:` key")
+    if len(keys) > 1:
+        raise ParseFailure("more than one top-level `on:` key")
+    start = keys[0]
+    end = start + 1
+    while end < len(lines):
+        ln = lines[end]
+        if ln.text.strip() and not ln.cont and not ln.depth and not ln.text[0].isspace():
+            if not TOP_KEY_RE.match(ln.text):
+                raise ParseFailure(f"line {end + 1} at column 0 after the `on:` section is not a top-level key")
             break
-        if left.strip():
-            raise ParseFailure("flow collection ended before the `on:` section did (unread indented lines)")
-    return "\n".join(pieces)
+        end += 1
+    rest = (ON_KEY_RE.match(lines[start].text).group(1) or "").strip()
+    return rest, [ln for ln in lines[start + 1:end] if ln.text.strip()]
+
+
+def _flow_body(rest: str, section: list) -> str:
+    """The whole flow collection of the ``on:`` section; it must close on the section's last line."""
+    tail = section if rest else section[1:]
+    if any(not ln.depth for ln in tail):
+        raise ParseFailure("flow collection ended before the `on:` section did (unread lines)")
+    return "\n".join(([rest] if rest else []) + [ln.text for ln in section])
+
+
+def _block_triggers(section: list) -> dict:
+    """Map each pull_request(_target) key of a block-form ``on:`` section to its body text."""
+    out, current = {}, None
+    child = _indent(section[0].text)
+    for ln in section:
+        x, ind = ln.text, _indent(ln.text)
+        if ln.cont or ln.depth or ind > child:
+            if current in KINDS:
+                out[current] += "\n" + x
+            continue
+        m = re.match(rf"""^ {{{child}}}(?:-[ \t]+)?(["']?)([\w-]+)\1[ \t]*:(?:[ \t]+(.*))?$""", x)
+        seq = re.match(rf"""^ {{{child}}}-[ \t]+(["']?)([\w-]+)\1$""", x)
+        if ind < child or not (m or seq):
+            raise ParseFailure(f"unrecognised line in the `on:` section: {x.strip()[:40]!r}")
+        current = (m or seq).group(2)
+        if current in KINDS:
+            out[current] = (m.group(3) or "") if m else ""
+    return out
 
 
 def triggers(text: str) -> dict:
     """Map each pull_request(_target) trigger found in ``on:`` to its body text.
 
-    Raises ParseFailure when ``on:`` is missing or uses an anchor or alias.
+    Raises ParseFailure (the caller fails closed) for anything the scanner cannot account for: no or a
+    second ``on:`` key, an anchor, alias, tag or explicit key, an open quote or flow, a flow that closes
+    early, a scalar ``on:`` value with more lines under it, an unrecognised trigger-level line, or a
+    column-0 line after the section that is not a workflow key.
     """
-    lines = [_strip(x) for x in text.splitlines()]
-    start = next((i for i, x in enumerate(lines) if ON_KEY_RE.match(x)), None)
-    if start is None:
-        raise ParseFailure("no top-level `on:` key")
-    rest = ON_KEY_RE.match(lines[start]).group(1).strip()
-    section = []
-    for x in lines[start + 1:]:
-        if x and not x[0].isspace():
-            break
-        if x.strip():
-            section.append(x)
-    if ANCHOR_RE.search("\n".join([rest] + section)):
-        raise ParseFailure("anchor or alias in the `on:` section")
-    out = {}
-    after = lines[start + 1:]
-    flow, remaining = "", after
-    if rest[:1] in ("{", "["):
-        flow = rest
-    elif not rest and section and section[0].strip()[:1] in ("{", "["):
-        idx = next(i for i, x in enumerate(after) if x.strip())
-        flow, remaining = section[0].strip(), after[idx + 1:]
-    if flow:  # a flow mapping or sequence, possibly spread over several lines: join to its closing brace
-        flow = _join_flow(flow, remaining)
-        if ANCHOR_RE.search(flow):
-            raise ParseFailure("anchor or alias in the `on:` section")
-        rest = flow
-    if rest:  # inline scalar, flow sequence or flow mapping: the whole text is the body
-        for kind in KINDS:
-            if re.search(rf"""(?<![\w-]){kind}(?![\w-])""", rest):
-                out[kind] = rest
-        return out
-    if not section:
+    rest, section = _on_section(scan(text))
+    if ANCHOR_RE.search("\n".join([rest] + [ln.text for ln in section])):
+        raise ParseFailure("anchor, alias, tag or explicit key in the `on:` section")
+    first = rest or (section[0].text.strip() if section else "")
+    if first[:1] in ("{", "["):
+        body = _flow_body(rest, section)
+    elif rest:
+        if section:
+            raise ParseFailure("scalar `on:` value followed by more lines")
+        body = rest
+    elif section:
+        return _block_triggers(section)
+    else:
         raise ParseFailure("empty `on:` section")
-    child = _indent(section[0])
-    current = None
-    for x in section:
-        ind = _indent(x)
-        m = re.match(rf"""^ {{{child}}}(?:-[ \t]+)?["']?([\w-]+)["']?[ \t]*:(.*)$""", x) if ind == child else None
-        seq = re.match(rf"""^ {{{child}}}-[ \t]+["']?([\w-]+)["']?[ \t]*$""", x) if ind == child else None
-        if seq:
-            current = seq.group(1)
-            if current in KINDS:
-                out[current] = ""
-        elif m:
-            current = m.group(1)
-            if current in KINDS:
-                out[current] = m.group(2)
-        elif ind > child and current in KINDS:
-            out[current] += "\n" + x
-    return out
+    return {kind: body for kind in KINDS if re.search(rf"""(?<![\w-]){kind}(?![\w-])""", body)}
 
 
 def pr_types(text: str, kinds=KINDS) -> set:
@@ -416,6 +510,133 @@ class BodyOnlyEditNeverCancels8332(unittest.TestCase):
         out = target_extras(texts)
         self.assertEqual(len(out), 1)
         self.assertIn("#8337", out[0])
+
+
+EDITED, CLEAN, REFUSE = "edited", "clean", "refuse"
+CANCEL_TRUE = "concurrency:\n  group: g\n  cancel-in-progress: true\n"
+APOSTROPHE_COL0 = ("on: {workflow_dispatch: {inputs: {mode: {description: it's a mode, type: choice, "
+                   "options: ['a', 'b']}}},\nKIND: {types: [edited]}}\n")
+# The oracle: every trigger shape that made the ratchet fail open in rounds 3-6, with what it must read.
+# EDITED = edited listed under a pull_request(_target) trigger; CLEAN = not listed; REFUSE = refused by name.
+ORACLE = (
+    ("r3 double-quoted block key", 'on:\n  "pull_request":\n    types: [opened, edited]\n', EDITED),
+    ("r3 single-quoted key, quoted sequence item", "on:\n  'pull_request':\n    types:\n      - 'edited'\n", EDITED),
+    ("r3 quoted flow key", 'on: {"pull_request": {types: [edited]}}\n', EDITED),
+    ("r3 two-line flow", "on: {pull_request: {types: [opened,\n  edited]}}\n", EDITED),
+    ("r3 three-line flow", "on: {\n  pull_request: {types: [opened, edited]}\n}\n", EDITED),
+    ("r3 five-line flow", "on: {\n  pull_request: {\n    types: [opened,\n      edited]\n  }\n}\n", EDITED),
+    ("r3 unclosed flow", "on: {\n  pull_request: {types: [opened, edited]\n", REFUSE),
+    ("r3 Edited", "on:\n  pull_request:\n    types: [opened, Edited]\n", EDITED),
+    ("r3 EDITED", "on:\n  pull_request:\n    types: [opened, EDITED]\n", EDITED),
+    ("r3 list form", "on: [pull_request]\n", CLEAN),
+    ("r3 comment lines holding edited", "on:\n  pull_request:\n    # edited\n    types: [opened]  # edited\n", CLEAN),
+    ("r4 double-quoted } in a multi-line flow",
+     'on: {\n  pull_request: {branches: ["rel}x"],\n    types: [edited]}\n}\n', EDITED),
+    ("r4 single-quoted ] in a multi-line flow",
+     "on: {\n  pull_request: {branches: ['rel]x'],\n    types: [edited]}\n}\n", EDITED),
+    ("r4 short join, indented lines left", "on: {pull_request: {types: [opened]}}\n  types: [edited]\njobs: {}\n", REFUSE),
+    ("r5 real comment holding } after the flow", "on: {pull_request: {types: [opened]}}  # }\njobs: {}\n", CLEAN),
+    ("r5 real comment holding } inside a multi-line flow",
+     "on: {\n  pull_request: {types: [opened]}, # }\n  pull_request_target: {types: [edited]}\n}\n", EDITED),
+    ("r5 quoted scalar spanning lines with }}}", 'on: {pull_request: {branches: ["a\n  }}}"], types: [edited]}}\n', EDITED),
+    ("r6 quoted space-# dq, block key inline flow", 'on:\n  pull_request: {paths: ["docs #x"], types: [edited]}\n', EDITED),
+    ("r6 quoted space-# sq, block key inline flow", "on:\n  pull_request: {paths: ['docs #x'], types: [edited]}\n", EDITED),
+    ("r6 quoted space-#, multi-line flow", 'on: {pull_request: {paths: ["docs #x"], types: [\n  edited]}}\n', EDITED),
+    ("r6 quoted space-#, single-line flow", 'on: {pull_request: {paths: ["docs #x"], types: [edited]}}\n', EDITED),
+    ("r6 quoted space-#, no edited", 'on:\n  pull_request: {paths: ["docs #x"], types: [opened]}\n', CLEAN),
+    ("r6 escaped double quote then space-#", 'on:\n  pull_request: {branches: ["a\\" #x"], types: [edited]}\n', EDITED),
+    ("r6 doubled single quote then space-#", "on:\n  pull_request: {branches: ['it''s #x'], types: [edited]}\n", EDITED),
+    ("r6 apostrophe in a plain scalar, column-0 continuation",
+     APOSTROPHE_COL0.replace("KIND", "pull_request"), EDITED),
+    ("r6 apostrophe in a plain scalar, column-0 continuation, target",
+     APOSTROPHE_COL0.replace("KIND", "pull_request_target"), EDITED),
+    ("r6 column-0 continuation", "on: {push: {branches: [main]},\npull_request: {types: [edited]}}\n", EDITED),
+    ("r6 apostrophe and quotes in a block plain scalar",
+     "on:\n  workflow_dispatch:\n    inputs:\n      x:\n        description: it's a 'mode' [\n"
+     "  pull_request:\n    types: [edited]\n", EDITED),
+    ("r6 block scalar holding quotes and brackets",
+     "on:\n  workflow_dispatch:\n    inputs:\n      x:\n        description: |\n          it's [edited { \"#\n"
+     "  pull_request:\n    types: [opened]\n", CLEAN),
+    ("r6 column-0 non-key after the on: section", "on:\n  pull_request:\n    types: [opened]\ntypes: [edited]\n", REFUSE),
+    ("r6 unterminated quoted scalar", 'on:\n  pull_request:\n    branches: ["a\n    types: [edited]\n', REFUSE),
+    ("r6 second top-level on: key", "on:\n  push:\non:\n  pull_request:\n    types: [edited]\n", REFUSE),
+    ("r6 whole-document flow mapping", '{"on": {"pull_request": {"types": ["edited"]}}}\n', REFUSE),
+)
+
+
+def oracle_verdict(name: str, text: str) -> str:
+    """The scanner's reading of one oracle shape: EDITED, CLEAN or REFUSE (by name)."""
+    out = edited_listed(name, text)
+    if not out:
+        return CLEAN
+    return REFUSE if "cannot parse" in out[0] and name in out[0] else EDITED
+
+
+def yaml_verdict(yaml_mod, text: str) -> str:
+    """PyYAML's reading: a pull_request(_target) trigger with a types key and the word edited in it."""
+    data = yaml_mod.safe_load(text)
+    on = data.get("on", data.get(True)) if isinstance(data, dict) else None
+    for kind in KINDS:
+        body = on.get(kind) if isinstance(on, dict) else None
+        if isinstance(body, dict) and "types" in body:
+            stack, words = [body], set()
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    stack.extend(list(item.keys()) + list(item.values()))
+                elif isinstance(item, list):
+                    stack.extend(item)
+                elif isinstance(item, str):
+                    words |= set(re.findall(r"[a-z_]+", item.lower()))
+            if "edited" in words:
+                return EDITED
+    return CLEAN
+
+
+class EditedRatchetOracle8332(unittest.TestCase):
+    """Round 6 (REVIEW-8332-security-r5 S9/S10, REVIEW-8332-code-r5 F1): the oracle that ends the class."""
+
+    def test_oracle_table(self):
+        for name, text, want in ORACLE:
+            with self.subTest(name):
+                fname = re.sub(r"\W+", "-", name) + ".yml"
+                self.assertEqual(oracle_verdict(fname, text), want, text)
+                if want == REFUSE:
+                    self.assertEqual(len(cancel_violations(fname, text)), 1, text)
+                    self.assertEqual(len(target_extras({fname: text})), 1, text)
+                elif want == EDITED:
+                    self.assertGreaterEqual(len(cancel_violations(fname, text + CANCEL_TRUE)), 1, text)
+
+    def test_mutation_apostrophe_and_column0_continuation(self):
+        for kind in KINDS:
+            text = APOSTROPHE_COL0.replace("KIND", kind)
+            self.assertEqual(oracle_verdict("apos.yml", text), EDITED, text)
+            self.assertEqual(len(cancel_violations("apos.yml", text + CANCEL_TRUE)), 1, text)
+        tgt = APOSTROPHE_COL0.replace("KIND", "pull_request_target")
+        self.assertEqual(len(target_extras({"apos.yml": tgt})), 1)
+        out = edited_listed("col0.yml", "on:\n  pull_request:\n    types: [opened]\ntypes: [edited]\n")
+        self.assertEqual(len(out), 1)
+        self.assertIn("col0.yml", out[0])
+        self.assertIn("not a top-level key", out[0])
+
+    def test_mutation_quoted_space_hash(self):
+        for q in ('"', "'"):
+            for text in (f"on:\n  pull_request: {{paths: [{q}docs #x{q}], types: [edited]}}\n",
+                         f"on: {{pull_request: {{paths: [{q}docs #x{q}], types: [\n  edited]}}}}\n",
+                         f"on: {{pull_request: {{paths: [{q}docs #x{q}], types: [edited]}}}}\n"):
+                self.assertEqual(oracle_verdict("hash.yml", text), EDITED, text)
+            ok = f"on:\n  pull_request: {{paths: [{q}docs #x{q}], types: [opened]}}\n"
+            self.assertEqual(oracle_verdict("hash.yml", ok), CLEAN, ok)
+            self.assertTrue(has_trigger(ok, "pull_request"))
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not importable on this interpreter")
+    def test_oracle_matches_pyyaml(self):
+        import yaml
+        for name, text, want in ORACLE:
+            if want == REFUSE:
+                continue  # a refusal is the fail-closed answer whatever YAML reads
+            with self.subTest(name):
+                self.assertEqual(yaml_verdict(yaml, text), want, text)
 
 
 if __name__ == "__main__":

@@ -229,6 +229,8 @@ class LivePath(unittest.TestCase):
             self.assertEqual(RETARGET.resolve_max_pages(raw), default, repr(raw))
         for raw, want in (("2", 2), ("199", 199), ("1", 1)):
             self.assertEqual(RETARGET.resolve_max_pages(raw), want, raw)
+        # Round 6 (REVIEW-8332-code-r5 I1): int() strips whitespace; a padded value still only LOWERS the cap.
+        self.assertEqual(RETARGET.resolve_max_pages(" 2 "), 2)
 
     def test_j2_raised_cap_override_still_stops_at_the_default_through_the_script(self):
         # Live path: a one-page timeline, a 99999 override; the answer is unchanged (cap not raised).
@@ -238,15 +240,32 @@ class LivePath(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_h2(self):
-        for events in ([change("2026-10-30T10:00:00Z"), {"event": "base_ref_changed"}],
-                       [{"event": "base_ref_changed"}, change("2026-10-30T10:00:00Z")],
-                       [change("2026-10-30T10:00:00Z"), {"event": "base_ref_changed", "created_at": ""}],
-                       [change("2026-10-30T10:00:00Z"), {"event": "base_ref_changed", "created_at": None}]):
+        # Every base-change stamp must parse (round 6, REVIEW-8332-code-r5 F2, REVIEW-8332-security-r5 S11):
+        # a padded or space-separated later stamp sorted below the canonical 10:00 one as a string.
+        stamped = change("2026-10-30T10:00:00Z")
+        for events, why in (([stamped, {"event": "base_ref_changed"}], "no created_at"),
+                            ([{"event": "base_ref_changed"}, stamped], "no created_at"),
+                            ([stamped, {"event": "base_ref_changed", "created_at": ""}], "no created_at"),
+                            ([stamped, {"event": "base_ref_changed", "created_at": None}], "no created_at"),
+                            ([stamped, change("   ")], "unparsable created_at"),
+                            ([stamped, change(" 2026-10-30T13:00:00Z")], "unparsable created_at"),
+                            ([stamped, change("2026-10-30 13:00:00Z")], "unparsable created_at"),
+                            ([stamped, change("garbage")], "unparsable created_at")):
             self.put("timeline_page1", events)
             self.runs(T_AFTER, T_AFTER)
             r = self.run_live()
             self.assertEqual(r.returncode, 70, f"{events}: {r.stdout}{r.stderr}")
-            self.assertIn("no created_at", r.stderr)
+            self.assertIn(why, r.stderr)
+
+    def test_h3_unparsable_run_stamp_is_a_tool_error(self):
+        # An unparsable run createdAt is refused, never skipped, even beside a valid newer run.
+        self.put("timeline_page1", [change(T_CHANGE)])
+        for bad in (" 2026-10-30T15:00:00Z", "2026-10-30 15:00:00Z", None):
+            self.put("runs_ci.yml", runs_at(T_AFTER) + [{"databaseId": 8, "createdAt": bad}])
+            self.put("runs_coverage.yml", runs_at(T_AFTER))
+            r = self.run_live()
+            self.assertEqual(r.returncode, 70, f"{bad!r}: {r.stdout}{r.stderr}")
+            self.assertIn("ci.yml run has", r.stderr)
 
     def test_f_run_in_the_same_second_is_not_newer(self):
         self.put("timeline_page1", [change(T_CHANGE)])
