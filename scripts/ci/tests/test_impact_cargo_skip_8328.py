@@ -24,6 +24,14 @@ Round 3 (REVIEW-8328-code-r2 F1/F2/F3, REVIEW-8328-security-r2 F1/F2, #8338):
 8. The trust block never reads a workspace copy of the classifier, not even as
    a fallback.
 9. Every walk guard is unskippable; the mirror roots equal the Rust roots.
+
+Round 4 (REVIEW-8328-code-r3 F1/F2/INFO-2, REVIEW-8328-security-r3 F1/F2/INFO-a):
+
+10. The test consumer is the boundary for the skip sentinel: `__SKIP__` never
+    selects a no-op there, whatever the docs_only verdict says.
+11. The impact step's stdout defuse and its log truncation are exercised with
+    selector stdout (not only selector output-file lines), under the runner's
+    `-eo pipefail` flags.
 """
 import json
 import os
@@ -55,6 +63,11 @@ STEP_HEADER = re.compile(r"^      - ")
 RUN_HEADER = re.compile(r"^        run: \|\s*$")
 TIMEOUT_S = 120
 RUN_INDENT = 10
+# The flags the hosted runner gives a `shell: bash` step (errexit + pipefail).
+RUNNER_BASH = ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c"]
+TEST_STEP_NAME = "- name: Run tests (impact-aware)"
+BOUNDARY_BEGIN = "# consumer-boundary-begin"
+BOUNDARY_END = "# consumer-boundary-end"
 
 
 def job_lines(path: Path, job: str):
@@ -271,8 +284,13 @@ class ImpactStepOutputAllowList(unittest.TestCase):
     SELECTED = ["test_impact=alpha_test beta_test", "test_impact_count=2",
                 "test_impact_total=40", "test_impact_reason=impact-selected:2/40 (95%-skip)"]
 
-    def run_step(self, selector_lines, docs_only="false", forced="", rc=0):
-        """Run the step in a scratch repo; return (outputs dict, selector ran)."""
+    def run_step(self, selector_lines, docs_only="false", forced="", rc=0,
+                 stdout_lines=(), stdout_repeat=0):
+        """Run the step in a scratch repo; return (outputs, selector ran, stdout).
+
+        `selector_lines` go to the selector's output file; `stdout_lines` and
+        `stdout_repeat` numbered noise lines go to its stdout instead.
+        """
         work = scratch_dir()
         try:
             (work / "scripts").mkdir()
@@ -280,6 +298,9 @@ class ImpactStepOutputAllowList(unittest.TestCase):
             ran = work / "selector-ran"
             body = ['#!/usr/bin/env bash', 'touch "%s"' % ran]
             body += ["printf '%%s\\n' '%s' >> \"$GITHUB_OUTPUT\"" % line for line in selector_lines]
+            body += ["printf '%%s\\n' '%s'" % line for line in stdout_lines]
+            if stdout_repeat:
+                body += ['for i in $(seq 1 %d); do echo "selector noise line $i"; done' % stdout_repeat]
             body += ['exit %d' % rc]
             script.write_text("\n".join(body) + "\n")
             out = work / "step-output"
@@ -287,7 +308,7 @@ class ImpactStepOutputAllowList(unittest.TestCase):
             env = dict(os.environ, GITHUB_OUTPUT=str(out), RUNNER_TEMP=str(work),
                        CLS_BASE="base", IMPACT_BASE="base", DOCS_ONLY=docs_only,
                        IMPACT_FORCED_REASON=forced)
-            res = subprocess.run(["bash", "-e", "-c", step_by_id(CI_YML, "impact")[2]],
+            res = subprocess.run(RUNNER_BASH + [step_by_id(CI_YML, "impact")[2]],
                                  cwd=str(work), env=env, capture_output=True, text=True,
                                  timeout=TIMEOUT_S)
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -354,8 +375,79 @@ class ImpactStepOutputAllowList(unittest.TestCase):
         self.assert_degraded(values, "empty-diff-fail-closed")
 
     def test_selector_stdout_cannot_inject_a_workflow_command(self):
-        _, _, stdout = self.run_step(self.SELECTED + ["::set-output name=x::y"])
-        self.assertNotIn("\n::set-output", "\n" + stdout)
+        values, _, stdout = self.run_step(self.SELECTED, stdout_lines=[
+            "::set-output name=x::y", "::add-mask::z", "plain ok line"])
+        for line in stdout.splitlines():
+            self.assertFalse(line.startswith("::"), "undefused workflow command: %r" % line)
+        self.assertIn(": :set-output name=x: :y", stdout)
+        self.assertIn(": :add-mask: :z", stdout)
+        self.assertIn("plain ok line", stdout)
+        self.assertEqual(values["test_impact"], "alpha_test beta_test")
+        self.assertEqual(values["test_impact_reason"], "impact-selected:2/40 (95%-skip)")
+
+    def test_long_selector_log_does_not_fail_the_step(self):
+        for count in (300, 20000):
+            values, _, stdout = self.run_step(self.SELECTED, stdout_repeat=count)
+            self.assertEqual(values["test_impact"], "alpha_test beta_test", count)
+            self.assertIn("selector noise line 200", stdout)
+            self.assertNotIn("selector noise line 201", stdout)
+
+
+class ConsumerBoundary(unittest.TestCase):
+    """The test consumer never honours `__SKIP__` (REVIEW-8328-*-r3 F1)."""
+
+    @staticmethod
+    def consumer_step_body():
+        lines = job_lines(CI_YML, "check")
+        for index, first in step_starts(lines):
+            if first == TEST_STEP_NAME:
+                return step_run_body(lines, index)
+        raise AssertionError("no Run tests (impact-aware) step in the check job")
+
+    def boundary_block(self):
+        body = self.consumer_step_body()
+        self.assertIn(BOUNDARY_BEGIN, body)
+        return body[body.index(BOUNDARY_BEGIN):body.index(BOUNDARY_END)]
+
+    def resolve(self, impact, docs_only):
+        """Run the boundary block; return (final TEST_IMPACT, stdout)."""
+        script = "set -u\n%s\necho \"RESULT=$TEST_IMPACT\"\n" % self.boundary_block()
+        env = dict(os.environ, TEST_IMPACT=impact, DOCS_ONLY=docs_only)
+        res = subprocess.run(RUNNER_BASH + [script], env=env, capture_output=True,
+                             text=True, timeout=TIMEOUT_S)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        result = [l for l in res.stdout.splitlines() if l.startswith("RESULT=")][0]
+        return result[len("RESULT="):], res.stdout
+
+    def test_skip_reaches_the_full_suite_branch_whatever_docs_only_says(self):
+        for docs_only in ("false", "true", "", "True"):
+            final, out = self.resolve("__SKIP__", docs_only)
+            self.assertEqual(final, "__ALL__", docs_only)
+            self.assertIn("impact-skip-overridden-at-consumer", out)
+            self.assertIn("decision:", out)
+
+    def test_other_selections_pass_through_untouched(self):
+        for impact in ("__ALL__", "alpha_test beta_test"):
+            final, out = self.resolve(impact, "false")
+            self.assertEqual(final, impact)
+            self.assertNotIn("overridden", out)
+
+    def test_step_has_no_skip_arm_and_receives_docs_only(self):
+        body = self.consumer_step_body()
+        self.assertNotRegex(body, r"__SKIP__\)")
+        text = CI_YML.read_text()
+        self.assertIn("DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}", text)
+        self.assertLess(body.index(BOUNDARY_END), body.index('case "${TEST_IMPACT:-__ALL__}" in'))
+
+    def test_every_test_impact_consumer_is_the_guarded_step(self):
+        """s19 twin: any workflow reading the output is the guarded test step."""
+        readers = []
+        for path in sorted(WORKFLOW_DIR.glob("*.yml")):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if "classify.outputs.test_impact }}" in line:
+                    readers.append((path.name, line.strip()))
+            self.assertNotRegex(path.read_text(), r"__SKIP__\)", path.name)
+        self.assertEqual(readers, [("ci.yml", "TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}")])
 
 
 class NoWorkspaceFirstOnSysPath(unittest.TestCase):

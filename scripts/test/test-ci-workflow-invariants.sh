@@ -177,7 +177,7 @@ run_cls() {
         cd "$dir"
         : > .gh_output
         rm -f .impact_base_received
-        env GITHUB_OUTPUT="$PWD/.gh_output" "$@" bash "$block" 2>/dev/null || true
+        env GITHUB_OUTPUT="$PWD/.gh_output" "$@" bash --noprofile --norc -eo pipefail "$block" 2>/dev/null || true
         cat .gh_output
         if [ -n "${IMPACT_BLOCK:-}" ]; then
             local cls_out
@@ -188,7 +188,7 @@ run_cls() {
                 IMPACT_BASE="$(getout "$cls_out" impact_base)" \
                 DOCS_ONLY="$(getout "$cls_out" docs_only)" \
                 IMPACT_FORCED_REASON="$(getout "$cls_out" impact_forced_reason)" \
-                bash -e "$IMPACT_BLOCK" > /dev/null 2>&1 || true
+                bash --noprofile --norc -eo pipefail "$IMPACT_BLOCK" > /dev/null 2>&1 || true
             cat .gh_output_impact
             if [ -f .impact_base_received ]; then
                 echo "impact_base_received=$(cat .impact_base_received)"
@@ -456,6 +456,42 @@ case "$CLS_ONLY" in
     *test_impact*) bad "s18 the cls step must not emit test_impact keys" "$(printf '%s' "$CLS_ONLY" | grep test_impact | head -1)" ;;
     *) ok "s18 the cls step output carries no test_impact key (they come from the impact step)" ;;
 esac
+
+# s19 (#8338 class, REVIEW-8328-code-r3 F1 / REVIEW-8328-security-r3 F1): the
+# consumer is the boundary. The only reader of the test_impact output is the
+# cargo_skip-gated `Run tests (impact-aware)` step; it has no `__SKIP__` arm,
+# and its boundary block maps the sentinel to the full suite whatever the
+# docs_only value says. Any new reader or any `__SKIP__` arm breaks this row.
+READERS="$(grep -c 'classify\.outputs\.test_impact }}' "$CI_YML")"
+SKIP_ARMS="$(grep -c '__SKIP__)' "$CI_YML" "$ROOT"/.github/workflows/coverage.yml | grep -vc ':0$' || true)"
+sed -n '/# consumer-boundary-begin/,/# consumer-boundary-end/p' "$CI_YML" | sed 's/^          //' > "$SCRATCH/consumer-boundary.sh"
+printf '%s\n' 'echo "RESULT=$TEST_IMPACT"' >> "$SCRATCH/consumer-boundary.sh"
+S19_OK=true
+for s19_docs in false true ""; do
+    S19_OUT="$(env TEST_IMPACT=__SKIP__ DOCS_ONLY="$s19_docs" bash --noprofile --norc -eo pipefail "$SCRATCH/consumer-boundary.sh" 2>&1 || true)"
+    case "$S19_OUT" in
+        *impact-skip-overridden-at-consumer*RESULT=__ALL__) ;;
+        *) S19_OK=false ;;
+    esac
+done
+[ "$READERS" = "1" ] && [ "$SKIP_ARMS" = "0" ] && [ "$S19_OK" = "true" ] \
+    && ok "s19 every test_impact consumer maps __SKIP__ to the full suite (one reader, no skip arm, boundary block resolves to __ALL__)" \
+    || bad "s19 the test consumer must never honour __SKIP__" "readers=$READERS skip_arms=$SKIP_ARMS boundary_ok=$S19_OK"
+
+# s20 (REVIEW-8328-code-r3 F2, REVIEW-8328-security-r3 F2/INFO-a): the impact
+# step defuses workflow commands in the selector's STDOUT, and a long selector
+# log (the `head` SIGPIPE under pipefail) does not fail the step.
+F="$SCRATCH/s20"; mkdir -p "$F/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "::set-output name=x::y"' 'for i in $(seq 1 20000); do echo "noise $i"; done' \
+    'printf "%s\n" "test_impact=a_test" "test_impact_count=1" "test_impact_total=2" "test_impact_reason=r" >> "$GITHUB_OUTPUT"' > "$F/scripts/ci-test-impact.sh"
+S20_RC=0
+S20_STDOUT="$(cd "$F" && : > out && env GITHUB_OUTPUT="$F/out" RUNNER_TEMP="$F" CLS_BASE=b IMPACT_BASE=b DOCS_ONLY=false IMPACT_FORCED_REASON= \
+    bash --noprofile --norc -eo pipefail "$IMPACT_BLOCK" 2>&1)" || S20_RC=$?
+S20_RAW="$(printf '%s\n' "$S20_STDOUT" | grep -c '^::' || true)"
+S20_DEFUSED="$(printf '%s\n' "$S20_STDOUT" | grep -c '^: :set-output name=x: :y$' || true)"
+[ "$S20_RC" = "0" ] && [ "$S20_RAW" = "0" ] && [ "$S20_DEFUSED" = "1" ] && [ "$(getout "$(cat "$F/out")" test_impact)" = "a_test" ] \
+    && ok "s20 selector stdout is defused (no line starts with a double colon) and a 20000-line log does not fail the step" \
+    || bad "s20 defuse or truncation broken" "rc=$S20_RC raw=$S20_RAW defused=$S20_DEFUSED"
 
 # --- Regression leg: the PRE-FIX block MUST mis-classify scenario 1. --------
 # Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP. A
