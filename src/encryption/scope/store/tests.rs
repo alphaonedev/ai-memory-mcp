@@ -962,9 +962,10 @@ fn scope_key_namespace_marker_fails_closed_on_unreadable_key_dir_8278() {
             let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
         }
     }
-    // SAFETY: `geteuid` has no preconditions and only reads a process property.
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipped: root ignores directory modes, so mode 0o000 cannot deny the read");
+    if running_as_root() {
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o000 cannot deny the read"
+        );
         return;
     }
     let dir = sandbox();
@@ -1053,7 +1054,9 @@ fn scope_key_namespace_marker_fails_closed_on_dangling_key_dir_link_8278() {
 #[test]
 fn scope_key_namespace_marker_fails_closed_when_the_lock_fails_8278() {
     if running_as_root() {
-        eprintln!("skipped: root ignores directory modes, so mode 0o000 cannot deny the lock");
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o000 cannot deny the lock"
+        );
         return;
     }
     let dir = sandbox();
@@ -1069,7 +1072,9 @@ fn scope_key_namespace_marker_fails_closed_when_the_lock_fails_8278() {
 #[test]
 fn scope_key_namespace_marker_fails_closed_when_the_listing_fails_8278() {
     if running_as_root() {
-        eprintln!("skipped: root ignores directory modes, so mode 0o300 cannot deny the listing");
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o300 cannot deny the listing"
+        );
         return;
     }
     let dir = sandbox();
