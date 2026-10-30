@@ -1190,11 +1190,11 @@ pub fn crypto_erase_marker() -> Vec<u8> {
 /// can be DESTROYED to crypto-erase the record?
 ///
 /// `true` exactly for the versions in [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`]
-/// (the `0x03` per-record and the `0x05` scope envelope today). Legacy `0x02` per-agent rows
-/// (content sealed directly to the shared agent key — no per-record key to
-/// destroy) return `false`: they are the HONEST-LIMIT case (row-delete +
-/// tombstone only, NOT crypto-erasable). An empty / already-erased (`0x04`)
-/// envelope also returns `false`.
+/// (the `0x03` per-record and the `0x05` scope envelope today). Legacy
+/// `0x02` per-agent rows (content sealed directly to the shared agent key —
+/// no per-record key to destroy) return `false`: they are the HONEST-LIMIT
+/// case (row-delete + tombstone only, NOT crypto-erasable). An empty /
+/// already-erased (`0x04`) envelope also returns `false`.
 ///
 /// #8278 — a `0x05` scope envelope is erasable too: its per-record DEK exists
 /// only wrapped inside the envelope, so the `0x04` rewrite destroys it even
@@ -1927,5 +1927,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #8315 (row 4): every tracked markdown doc that describes the
+    /// crypto-erase scope lists every erasable envelope version byte the code
+    /// reports ([`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`]), so an erase-describing
+    /// doc anywhere under `docs/` that names one byte as the whole set is
+    /// caught, not only the six anchors of
+    /// [`doc_erase_scope_names_erasable_versions_8278`]. The census is
+    /// `git ls-files -- docs` (tracked files, no committed list to rot): a
+    /// markdown file is in scope when it mentions crypto erase AND names at
+    /// least one erasable byte (a doc that names no byte makes no claim about
+    /// the set). Dated adjudication records under `docs/reviews/` and
+    /// `docs/audit/` describe a past tree and are skipped, the exclusion
+    /// `scripts/check-docs-vs-ssot.sh` applies to the same directories.
+    #[test]
+    fn docs_describing_erase_list_every_erasable_version_8315() {
+        const ERASE_PHRASES: [&str; 3] = [
+            "crypto-erase",
+            "crypto erase",
+            "envelope_is_crypto_erasable",
+        ];
+        const DATED_RECORDS: [&str; 2] = ["docs/reviews/", "docs/audit/"];
+        const ERASE_DOC: &str = "docs/security/crypto-erase.md";
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let listing = std::process::Command::new("git")
+            .args(["ls-files", "--", "docs"])
+            .current_dir(root)
+            .output()
+            .expect("run `git ls-files -- docs`");
+        assert!(
+            listing.status.success(),
+            "`git ls-files -- docs` failed: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&listing.stdout);
+        let bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect();
+        let mut census: Vec<&str> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for rel in stdout.lines() {
+            if !rel.ends_with(".md") || DATED_RECORDS.iter().any(|dir| rel.starts_with(dir)) {
+                continue;
+            }
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: read: {e}"));
+            let flat = text.to_lowercase();
+            if !ERASE_PHRASES.iter().any(|phrase| flat.contains(phrase))
+                || !bytes.iter().any(|byte| flat.contains(byte.as_str()))
+            {
+                continue;
+            }
+            census.push(rel);
+            let missing: Vec<&str> = bytes
+                .iter()
+                .filter(|byte| !flat.contains(byte.as_str()))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                failures.push(format!(
+                    "{rel}: describes crypto erase but does not list {}",
+                    missing.join(", ")
+                ));
+            }
+        }
+        assert!(
+            census.contains(&ERASE_DOC),
+            "the census must reach {ERASE_DOC}; it found {census:?}"
+        );
+        assert!(
+            failures.is_empty(),
+            "#8315: every erase-describing doc must list every byte of \
+             CRYPTO_ERASABLE_ENVELOPE_VERSIONS ({}); census {census:?}:\n{}",
+            bytes.join(", "),
+            failures.join("\n")
+        );
     }
 }
