@@ -1368,8 +1368,9 @@ mod tests {
     }
 
     /// The one key-directory fixture for this module (#8316): a private temp
-    /// dir born `0o700` whatever the ambient umask. `tempfile::tempdir()` on
-    /// its own inherits the umask, so under `umask 0002` it comes out `0775`
+    /// dir created `0o700` (mkdir mode, no later chmod) whatever the ambient
+    /// umask. `tempfile::tempdir()` on its own inherits the umask, so under
+    /// `umask 0002` it comes out `0775`
     /// and the #3198 chain check correctly refuses it; the two #228 tests
     /// below used it directly and went red on every `0002` host (#8316).
     /// Delegates to the crate-wide #3705 fixture so there is a single owner.
@@ -1427,61 +1428,81 @@ mod tests {
     /// is `0002`, and the loader accepts it. Pins the fix for the two tests
     /// above: under `umask 0002` a bare `tempfile::tempdir()` is `0775`, the
     /// #3198 chain check refuses it, and both tests went red for the wrong
-    /// reason. The umask is widened only around the fixture call and restored
-    /// on `Drop` (panic-safe) so sibling tests never observe it.
+    /// reason. The umask is process-wide, so it is set ONLY in a re-launched
+    /// child copy of this test binary running this one test (the pattern of
+    /// `journal_spool_creation_is_private_with_permissive_umask`); the
+    /// multi-threaded parent never changes its own umask, so no sibling test
+    /// can observe it (#8331 class).
     #[cfg(unix)]
     #[test]
     fn keypair_fixture_dir_is_0700_under_umask_0002_8316() {
         use std::os::unix::fs::PermissionsExt;
 
-        struct UmaskGuard(libc::mode_t);
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                // SAFETY: `umask` has no preconditions, cannot fail and only
-                // sets the process file-mode creation mask (UNSAFE-01 class).
-                unsafe {
-                    libc::umask(self.0);
-                }
-            }
-        }
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_KEYPAIR_UMASK_ROLE";
+        const MARKER_ENV: &str = "AI_MEMORY_TEST_KEYPAIR_UMASK_MARKER";
+        const TEST_PATH: &str =
+            "encryption::tests::keypair_fixture_dir_is_0700_under_umask_0002_8316";
 
-        let dir = {
-            // SAFETY: as above; the returned prior mask is restored by the guard.
-            let _widened = UmaskGuard(unsafe { libc::umask(0o002) });
-            let control = tempfile::tempdir().expect("control tempdir");
-            let control_mode = std::fs::metadata(control.path())
-                .expect("stat control dir")
+        let mode_of = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("stat dir")
                 .permissions()
                 .mode()
-                & 0o777;
-            assert_eq!(
-                control_mode, 0o775,
-                "#8316 precondition: umask 0002 is in force, a bare tempdir is 0775"
-            );
-            secure_tmp_key_dir()
+                & 0o777
         };
 
-        let mode = std::fs::metadata(dir.path())
-            .expect("stat fixture dir")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "#8316: the fixture dir must be 0700 whatever the umask, got {mode:o}"
-        );
+        if std::env::var_os(ROLE_ENV).is_some() {
+            // Child: a single-test process, so the umask change has no sibling.
+            // SAFETY: `umask` has no preconditions, cannot fail and only sets
+            // this process's file-mode creation mask.
+            unsafe {
+                libc::umask(0o002);
+            }
+            let control = tempfile::tempdir().expect("control tempdir");
+            assert_eq!(
+                mode_of(control.path()),
+                0o775,
+                "#8316 precondition: umask 0002 is in force, so a bare tempdir is 0775 \
+                 (a failure here means the temp parent carries a POSIX default ACL \
+                 that overrides the umask, not that the fixture is wrong)"
+            );
+            let dir = secure_tmp_key_dir();
+            assert_eq!(
+                mode_of(dir.path()),
+                0o700,
+                "#8316: the fixture dir must be 0700 whatever the umask"
+            );
+            let agent = "umask-0002-agent-8316";
+            let minted = get_or_create_keypair_in(agent, dir.path())
+                .expect("#8316: mint + persist into a fixture dir created under umask 0002");
+            clear_keypair_cache();
+            let loaded = load_keypair_in(agent, dir.path())
+                .expect("#8316: the #3198 chain check accepts the 0700 fixture dir")
+                .expect("#8316: the persisted keypair is found");
+            assert_eq!(
+                minted.secret.to_bytes(),
+                loaded.secret.to_bytes(),
+                "#8316: the keypair round-trips from a fixture dir created under umask 0002"
+            );
+            let marker = std::env::var_os(MARKER_ENV).expect("marker path");
+            std::fs::write(marker, b"ran").expect("write child-ran marker");
+            return;
+        }
 
-        let agent = "umask-0002-agent-8316";
-        let minted = get_or_create_keypair_in(agent, dir.path())
-            .expect("#8316: mint + persist into a fixture dir created under umask 0002");
-        clear_keypair_cache();
-        let loaded = load_keypair_in(agent, dir.path())
-            .expect("#8316: the #3198 chain check accepts the 0700 fixture dir")
-            .expect("#8316: the persisted keypair is found");
-        assert_eq!(
-            minted.secret.to_bytes(),
-            loaded.secret.to_bytes(),
-            "#8316: the keypair round-trips from a fixture dir created under umask 0002"
+        let scratch = secure_tmp_key_dir();
+        let marker = scratch.path().join("child-ran");
+        let status = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .arg("--exact")
+            .arg(TEST_PATH)
+            .arg("--nocapture")
+            .env(ROLE_ENV, "child")
+            .env(MARKER_ENV, &marker)
+            .status()
+            .expect("re-launch the test binary");
+        assert!(status.success(), "#8316: the umask-0002 child run failed");
+        assert!(
+            marker.exists(),
+            "#8316: the child must run the test body, not match zero tests"
         );
     }
 
