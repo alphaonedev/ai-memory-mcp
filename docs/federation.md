@@ -3,8 +3,8 @@ layout: doc
 ---
 # Federation hardening (mTLS + X-API-Key + peer attestation)
 
-> ## Certified trust boundary (canonical)
->
+## Certified trust boundary (canonical)
+
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
 > Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
@@ -622,11 +622,11 @@ local namespace cap, even if the sending peer's local cap is higher.
    failed to parse private key as RSA, ECDSA, or EdDSA`). Re-encoding with
    `openssl pkcs8 -topk8` does not help — the explicit parameters survive.
    Generate with OpenSSL 3 and force the named-curve encoding:
-   ```bash
-   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-       -pkeyopt ec_param_enc:named_curve -nodes \
-       -keyout peer.key -out peer.crt -days 365 -subj "/CN=peer-node-1"
-   ```
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -pkeyopt ec_param_enc:named_curve -nodes \
+    -keyout peer.key -out peer.crt -days 365 -subj "/CN=peer-node-1"
+```
    (a P-256 PKCS#8 key is about 241 bytes), or use an RSA or Ed25519 key.
 2. **Populate `peer-fingerprints.allow`.** One fingerprint per line.
    Inline comments (`# label`) and `:` separators tolerated.
@@ -641,13 +641,13 @@ local namespace cap, even if the sending peer's local cap is higher.
    [`docs/enterprise-deployment.md` §8.4 / §8.6](enterprise-deployment.html)
    prescribe for a swarm — restated here so this checklist is a complete
    single turnkey path:
-   ```bash
-   # On the peer (one-time, if it has no keypair): writes bob@host2.pub
-   # under its key dir.
-   ai-memory identity generate --agent-id bob@host2
-   # Exchange bob@host2.pub out-of-band, then on THIS receiving daemon:
-   ai-memory identity import --agent-id bob@host2 --pub bob@host2.pub
-   ```
+```bash
+# On the peer (one-time, if it has no keypair): writes bob@host2.pub
+# under its key dir.
+ai-memory identity generate --agent-id bob@host2
+# Exchange bob@host2.pub out-of-band, then on THIS receiving daemon:
+ai-memory identity import --agent-id bob@host2 --pub bob@host2.pub
+```
    `import` writes a public-only `<agent_id>.pub` (no private half); the
    receive path resolves it via
    [`identity::verify::lookup_peer_public_key`](../src/identity/verify.rs).

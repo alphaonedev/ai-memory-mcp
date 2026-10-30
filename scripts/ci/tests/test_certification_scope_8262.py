@@ -12,6 +12,33 @@ changed sentence about the subject is a changed pin, and the review pair reads t
 named review step. This follows the repository precedent for protected content (closed pinned
 sets in test_ci_select_gating_8240.py and test_pg_isolated_binary.py, CODE_STYLE.md:466-467).
 
+Guard grammar (markdown subset). Round 18, decision B: the hand lexer below cannot converge on
+CommonMark, and a mis-parse there fails open, so every gated markdown file must first parse in this
+documented subset (grammar_problems(), block_text_problems()); anything outside it is refused as
+"unsupported markdown construct: <construct> at <file>:<line>". docs/encryption.html is read as
+HTML and is not in the subset. The rules:
+  1. A refusal names the construct and its file:line; there is no partial reading of a refused line.
+  2. Headings are live only as ATX headings at column 0 outside every container. A heading-like line
+     (up to three spaces then "#") that is indented, in a block quote, in a list item or in an HTML
+     block is refused, and in the certification file also inside a fence. A setext underline (a
+     line of only "=" or "-" directly under text) is refused; a "---" rule needs a blank line above.
+  3. Containers sit at top level only. A fence opens and closes at column 0 (closer: the same
+     character, at least as long, nothing after it); an indented, quoted or in-item fence opener, a
+     fence-like line inside a fence and an unclosed fence are refused. A block quote is one level
+     at column 0 and may not carry a fence, a heading-like line, a list item, an HTML block or
+     indented code; lazy continuation is refused. An HTML block line is refused except a one-line
+     "<!-- ... -->" comment and the measured README.md lines of HTML_BLOCK_ALLOW, each followed only
+     by a blank line or another allowed line. YAML front matter is read only at the top of a file.
+  4. The IN, PENDING, UNLANDED and NOT statement blocks hold only list items ("-", "*", "+" or an
+     ordered marker at column 0) and blank lines: one child level (2-4 spaces), continuation lines
+     at the item content column, no second paragraph, no other block; every item is digest-pinned.
+  5. Blank means empty or ASCII spaces only. Non-ASCII whitespace (NBSP, U+2000-U+200B, U+202F,
+     U+205F, U+3000, U+FEFF) is refused anywhere, and a tab outside a fence is refused.
+  6. Mentions of the short trust-peer token in identifier form (trust_peer, trust-peer, any case)
+     count wherever they stand, containers ignored: table cells, after a colon, fenced code.
+The lexer and the unit rules below then read only subset input. The subset is summarised for
+maintainers in scripts/ci/tests/data/README.md, next to the pin table.
+
 Units. Each line is NFKC-normalised and passed through the Cyrillic/Greek confusable map once.
 Block structure follows CommonMark/GFM: a line is blank only when it holds nothing but U+0020 and
 U+0009 (measured on the raw line, so NBSP, U+3000 and form feed never end a paragraph). Code is
@@ -186,6 +213,8 @@ IN_ITEMS = {
     # Round 14: #2967 closed by PR #8269 (merge ffc54bd50); the item moved here from UNLANDED_ITEMS.
     "Quarantine of unattributed inbound writes": (2967, 8269),
 }
+# Round 18 (security r16 MEDIUM-1): the PENDING block is one reviewed item, digest-pinned like the others.
+PENDING_ITEMS = {"Federation end-to-end content encryption, variants A and B": ()}
 UNLANDED_ITEMS = {
     "Cert-to-peer binding enforced": 8260,
     "Refusal of Claimed (header-asserted) identity": 8265,
@@ -195,6 +224,8 @@ UNLANDED_ITEMS = {
 # flattened text is pinned by mention_key() digest, so a two-space continuation cannot add a claim.
 BLOCK_LEADS = {
     B_IN: ("",),
+    B_PENDING: ("",),
+    B_NOT: (" (each is named so the certified claim is unambiguous):**",),
     B_UNLANDED: (" Each is claimed only",
                  "when its issue closes with a landed SHA on the GA candidate. At the pinned SHA the default is the",
                  "permissive one named here, so a reader must not assume the control:"),
@@ -210,6 +241,13 @@ BLOCK_ITEM_DIGESTS = {
     'Quarantine of unattributed inbound writes': '112a0bacc2dfa45c',
     'Cert-to-peer binding enforced': 'e21ade2059229f64',
     'Refusal of Claimed (header-asserted) identity': 'e190e173786b5f3a',
+    # Round 18 (security r16 MEDIUM-1): the PENDING and NOT items are digest-pinned too.
+    'Federation end-to-end content encryption, variants A and B': '2d74f6fe90ff2bf0',
+    'Postgres-native TDE': 'be7c09b24f64c37c',
+    'Curator namespace-scoped mode': '408fc1775a841aca',
+    'Batman Form 2': 'fac521e10099a1c6',
+    'Top-shelf encryption documentation': 'fd2e106e993f5212',
+    'Singleton and Team shapes': 'a8ad0089d42dbdc3',
 }
 # A two-space continuation line that would open a block (indented code, quote, heading, list item,
 # fence, HTML, table row, setext underline or thematic break) instead of continuing the paragraph.
@@ -435,8 +473,11 @@ _DELIM_CHARS = frozenset("|-: \t")
 _WS_RE = re.compile(r"\s+")
 # Round 16 (R3): the sync trust-peer bypass in any spelling the folded views read. Round 17 (code
 # r13 LOW-1, security r15 LOW-1): also the short name, a standalone trust-peer token set to a truthy
-# value by an assignment or "to".
+# value by an assignment or "to". Round 18 (code r14 LOW-1): the short name in identifier form
+# (trust_peer, trust-peer, any case) anywhere, whatever follows it: a table cell, a colon, "set to",
+# "Enable", fenced code. Prose ("trust peer-supplied", "TRUST_PEER_LIMIT") is not the token.
 TRUST_PEER_RE = re.compile(r"sync[^a-z0-9]{0,4}trust[^a-z0-9]{0,4}peer"
+                           r"|(?<![a-z0-9])trust[_-]peer(?![a-z0-9_-])"
                            r"|(?<![a-z0-9])trust[^a-z0-9]{0,4}peer(?![a-z0-9])[^a-z0-9]{0,4}"
                            r"(?:=|to(?![a-z0-9]))[^a-z0-9]{0,4}(?:1|true|on|yes)(?![a-z0-9])")
 # Round 17: a census unit starts at a table row or a list item; a table row is a unit of its own.
@@ -1054,13 +1095,17 @@ def _blocks():
 
 
 def _items(body):
+    """Items of a statement block: a column-0 item line plus every indented line below it (a child
+    item and its continuations fold into the parent, round 18); column-0 text ends the item."""
     items, cur = [], None
     for ln in body.splitlines():
-        if ln.startswith("- "):
+        if _GB_MARKER_RE.match(ln):
             cur = [ln]
             items.append(cur)
-        elif cur is not None and ln.startswith("  "):
+        elif cur is not None and ln.startswith(" "):
             cur.append(ln)
+        elif ln.strip(" "):
+            cur = None
     return [" ".join(part.strip() for part in i) for i in items]
 
 
@@ -1137,56 +1182,315 @@ def mention_key(sentence):
     return hashlib.sha256(sentence.encode("utf-8")).hexdigest()[:16]
 
 
+# ---- round 18: the markdown subset the guard parses (decision B, vote 6def5ab6, ai-memory 1795854b) ----
+# The hand lexer reads only the subset named in the docstring section "Guard grammar (markdown subset)";
+# every other construct is refused with "unsupported markdown construct: <construct> at <file>:<line>".
+GRAMMAR_MESSAGE = "unsupported markdown construct: %s at %s:%d"
+# Rule 3: the measured HTML block allow-list. CERT holds one HTML block (line 1, a one-line comment), so
+# the CERT entry is the one-line comment form, which also covers the 25 one-line comments of CHANGELOG.md.
+# README.md holds 47 HTML block lines (21 distinct, logo, title and the <details> sections); they are
+# accepted only as these exact lines, and an accepted HTML line is followed only by a blank line or
+# another accepted line, so no markdown line ever sits inside an HTML block.
+HTML_BLOCK_ALLOW = {
+    "README.md": frozenset((
+        '<p align="center">',
+        '  <img src="docs/ai-memory-logo.jpg" alt="ai-memory logo" width="200">',
+        '</p>',
+        '<h1 align="center">ai-memory</h1>',
+        '<p align="center"><em>universal AI memory</em></p>',
+        '<details>',
+        '<summary>Federation #3582 old-contract fixture census (rule e)</summary>',
+        '</details>',
+        '<summary><strong>Claude Code</strong> (Anthropic)</summary>',
+        '<summary><strong>OpenAI Codex CLI</strong></summary>',
+        '<summary><strong>Google Gemini CLI</strong></summary>',
+        '<summary><strong>Cursor IDE</strong></summary>',
+        '<summary><strong>Windsurf</strong> (Codeium)</summary>',
+        '<summary><strong>Continue.dev</strong></summary>',
+        '<summary><strong>Grok CLI</strong> (AlphaOne fork — deep integration with auto-recall)</summary>',
+        '<summary><strong>xAI Grok API</strong> (API-level, remote MCP)</summary>',
+        '<summary><strong>META Llama</strong> (via Llama Stack)</summary>',
+        '<summary><strong>OpenClaw</strong></summary>',
+        '<summary><strong>Any other MCP client</strong></summary>',
+        '  <img src="docs/architecture.svg" alt="ai-memory architecture diagram" width="900">',
+        '  <img src="docs/benchmark.svg" alt="LongMemEval benchmark results" width="820">',
+    )),
+}
+# Rule 5: whitespace other than U+0020 that a renderer may treat as a space or a break.
+_G_NONASCII_WS = frozenset("\u0085\u00A0\u1680\u180E\u2028\u2029\u202F\u205F\u3000\uFEFF"
+                           + "".join(chr(c) for c in range(0x2000, 0x200C)))
+_G_ITEM_RE = re.compile(r" *(?:[-*+]|\d{1,9}[.)])(?: +|$)")
+_G_HEADLIKE_RE = re.compile(r"#{1,6}(?:[ \t]|$)")
+_G_FENCE_RE = re.compile(r"`{3,}|~{3,}")
+_G_CLOSER_RE = re.compile(r"(`{3,}|~{3,}) *$")
+_G_SETEXT_RE = re.compile(r" *(?:=+|-+) *$")
+_G_HTML_RE = re.compile(r"<[a-z/!?]", re.IGNORECASE)
+_G_AUTOLINK_RE = re.compile(r"<(?:[a-z][a-z0-9+.-]{1,31}:[^\s<>]*|[^\s@<>]+@[^\s@<>]+)>", re.IGNORECASE)
+_G_COMMENT_LINE_RE = re.compile(r"<!--(?:(?!-->|<!--).)*--> *$")
+_G_FRONT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*: \S.*$")
+_G_REFDEF_RE = re.compile(r" *\[[^\]\n]+\]:")
+# Rule 4: a gated-block item marker at the start of the (unindented) text, one space, then text.
+_GB_MARKER_RE = re.compile(r"(?:[-*+]|\d{1,9}[.)]) (?=[^ ])")
+_GB_NAMES = ((B_IN, "IN"), (B_PENDING, "PENDING"), (B_UNLANDED, "UNLANDED"), (B_NOT, "NOT"))
+
+
+def _g_html_start(s):
+    return _G_HTML_RE.match(s) is not None and _G_AUTOLINK_RE.match(s) is None
+
+
+def _g_inner(s):
+    """The text after a run of list markers at the start of s, or None when s opens no list item."""
+    m = _G_ITEM_RE.match(s)
+    if not m:
+        return None
+    while m:
+        s = s[m.end():]
+        m = _G_ITEM_RE.match(s)
+    return s
+
+
+def _g_front_matter(lines):
+    """Lines of a Jekyll front matter block ("---", key: value lines, "---") at the top of a file, or 0."""
+    if not lines or lines[0] != "---":
+        return 0
+    for k in range(1, len(lines)):
+        if lines[k] == "---":
+            return k + 1 if k > 1 else 0
+        if not _G_FRONT_RE.match(lines[k]):
+            return 0
+    return 0
+
+
+def _g_quote_problem(ln, prev):
+    """The refused construct on a column-0 block quote line, or None (rules 2 and 3)."""
+    rest = ln[1:]
+    rest = rest[1:] if rest.startswith(" ") else rest
+    body = rest.lstrip(" ")
+    if body.startswith(">"):
+        return "nested block quote"
+    if _G_FENCE_RE.match(body):
+        return "fence in a block quote"
+    if _G_HEADLIKE_RE.match(body):
+        return "heading-like line in a block quote"
+    if _g_inner(body) is not None:
+        return "list item in a block quote"
+    if _g_html_start(body):
+        return "HTML block in a block quote"
+    if body and len(rest) - len(body) >= 4:
+        return "indented code in a block quote"
+    if body and prev == "quote" and _G_SETEXT_RE.match(body):
+        return "setext underline in a block quote"
+    return None
+
+
+def _g_line_problem(ln, prev, allow):
+    """(refused construct or None, line kind) for a non-blank line outside a fence and outside a quote."""
+    lead = len(ln) - len(ln.lstrip(" "))
+    s = ln[lead:]
+    inner = _g_inner(s)
+    if lead and s.startswith(">"):
+        return "indented block quote", "text"
+    if inner is not None:
+        for test, name in ((lambda x: x.startswith(">"), "block quote in a list item"),
+                           (_G_FENCE_RE.match, "fence in a list item"),
+                           (_G_HEADLIKE_RE.match, "heading-like line in a list item"),
+                           (_g_html_start, "HTML block in a list item")):
+            if test(inner):
+                return name, "text"
+    if _G_FENCE_RE.match(s):
+        if lead:
+            return "indented fence opener", "text"
+        run = _G_FENCE_RE.match(s).group()
+        if run[0] == "`" and "`" in s[len(run):]:
+            return "backtick in a fence info string", "text"
+        return None, "fence"
+    if _G_HEADLIKE_RE.match(s):
+        return ("indented heading-like line" if lead else None), "heading"
+    if _g_html_start(s):
+        if ln in allow:
+            return None, "html"
+        if lead or not _G_COMMENT_LINE_RE.match(s):
+            return "HTML block", "text"
+        return None, "text"
+    if prev != "blank" and _G_SETEXT_RE.match(ln):
+        return "setext underline", "text"
+    return None, "text"
+
+
+def grammar_problems(rel, text):
+    """Round 18 (decision B): every line of a gated markdown file is in the guard's subset, or it is
+    refused as "unsupported markdown construct: <construct> at <file>:<line>" (fail closed)."""
+    out = []
+
+    def refuse(construct, n):
+        out.append(GRAMMAR_MESSAGE % (construct, rel, n))
+
+    allow = HTML_BLOCK_ALLOW.get(rel, frozenset())
+    lines = text.split("\n")
+    skip = _g_front_matter(lines)
+    fence, prev = None, "blank"
+    for n, ln in enumerate(lines, 1):
+        ws = [ch for ch in ln if ch in _G_NONASCII_WS]
+        if ws:
+            refuse("non-ASCII whitespace U+%04X" % ord(ws[0]), n)
+        if n <= skip:
+            continue
+        if fence is not None:
+            m = _G_CLOSER_RE.match(ln)
+            if m and ln[0] == fence[0] and len(m.group(1)) >= fence[1]:
+                fence, prev = None, "text"
+                continue
+            body = ln.lstrip(" \t>")
+            run = _G_FENCE_RE.match(body)
+            if run and run.group()[0] == fence[0] and len(run.group()) >= fence[1]:
+                refuse("fence-like line inside a fence", n)
+            elif rel == CERT_REL and _G_HEADLIKE_RE.match(body):
+                refuse("heading-like line inside a fence", n)
+            continue
+        if not ln.strip(" "):
+            prev = "blank"
+            continue
+        if "\t" in ln:
+            refuse("tab outside a fence", n)
+        if prev == "html" and ln not in allow:
+            refuse("heading-like line in an HTML block" if _G_HEADLIKE_RE.match(ln.lstrip(" "))
+                   else "markdown inside an HTML block", n)
+        if ln.startswith(">"):
+            problem = _g_quote_problem(ln, prev)
+            if problem:
+                refuse(problem, n)
+            prev = "quote" if ln[1:].strip(" ") else "quote-blank"
+            continue
+        if prev == "quote":
+            refuse("lazy block-quote continuation", n)
+        problem, kind = _g_line_problem(ln, prev, allow)
+        if problem:
+            refuse(problem, n)
+        if kind == "fence" and not problem:
+            run = _G_FENCE_RE.match(ln).group()
+            fence = (run[0], len(run), n)
+        prev = kind
+    if fence is not None:
+        refuse("unclosed fence", fence[2])
+    return out
+
+
+def _gb_opens_block(rest):
+    """True when item or continuation text would open a block instead of continuing inline text."""
+    return bool(rest[:1] in (">", "|", " ") or _G_HEADLIKE_RE.match(rest) or _G_ITEM_RE.match(rest)
+                or _G_FENCE_RE.match(rest) or _g_html_start(rest) or _G_REFDEF_RE.match(rest)
+                or _G_SETEXT_RE.match(rest) or _BREAK_RE.match(rest))
+
+
+def _gb_toplevel(s, prev):
+    """The construct a column-0 non-item line of a gated block is."""
+    if s.startswith(">"):
+        return "block quote"
+    if s.startswith("|"):
+        return "table row"
+    if _G_FENCE_RE.match(s):
+        return "fence"
+    if _G_HEADLIKE_RE.match(s):
+        return "heading-like line"
+    if _g_html_start(s):
+        return "HTML block"
+    return "lazy continuation" if prev in ("item", "cont") else "paragraph"
+
+
+def _gb_body_problems(body, first, name, rel):
+    """Rule 4 on the lines of one gated block after its fixed lead (body[k] is file line first + k + 1)."""
+    out, prev, parent, child, cur = [], "blank", None, None, None
+    for k, ln in enumerate(body):
+        if not ln.strip(" "):
+            prev = "blank"
+            continue
+        construct = None
+        lead = len(ln) - len(ln.lstrip(" "))
+        s = ln[lead:]
+        m = _GB_MARKER_RE.match(s)
+        if "\t" in ln:
+            construct = "tab"
+        elif m and lead == 0:
+            parent, child = m.end(), None
+            cur = parent
+            construct = "nested block in an item" if _gb_opens_block(s[m.end():]) else None
+        elif m and child is not None and lead >= child:
+            construct = "deeper nesting"
+        elif m and parent is not None and parent <= lead <= 4:
+            child = lead + m.end()
+            cur = child
+            construct = "nested block in an item" if _gb_opens_block(s[m.end():]) else None
+        elif m:
+            construct = "list item at an unsupported indentation"
+        elif lead == 0:
+            construct = _gb_toplevel(s, prev)
+        elif cur is not None and prev in ("item", "cont") and lead == cur:
+            construct = "nested block in an item" if _gb_opens_block(s) else None
+        elif cur is not None and prev == "blank":
+            construct = "second item paragraph"
+        else:
+            construct = "continuation at an unsupported indentation"
+        if construct:
+            out.append(GRAMMAR_MESSAGE % ("%s in the %s block" % (construct, name), rel, first + k + 1))
+            prev = "bad"
+        else:
+            prev = "item" if m else "cont"
+    return out
+
+
 def block_text_problems(rel, text):
-    """Round 17 (security r15 MEDIUM-1): every line of the IN and UNLANDED blocks is the fixed lead,
-    a blank line, a `- ` item line, or a two-space continuation directly under an item line or
-    another continuation. Anything else (block quote, lazy continuation, indented continuation,
-    paragraph, nested block) is named: "<file>: line N: non-item text inside the <block> block"."""
+    """Round 18 rule 4 (security r16 MEDIUM-1): each of the four statement blocks is its fixed lead
+    (BLOCK_LEADS, one entry per line, the first entry is the rest of the marker line), one blank line,
+    then only list items and blank lines: a "-", "*", "+" or ordered marker at column 0 plus one space
+    and inline text, at most one nesting level (a child item indented from the parent's content column
+    up to 4 spaces), continuation lines directly under an item or continuation at exactly that item's
+    content column. The NOT block ends at the STATEMENT_END rule. Anything else is refused as
+    "unsupported markdown construct: <construct> in the <block> block at <file>:<line>"."""
     lines = text.split("\n")
     starts = {}
     for marker in BLOCK_MARKERS:
         hit = [n for n, ln in enumerate(lines) if ln.startswith(marker)]
         if len(hit) != 1:
-            return ["%s: block marker must start exactly one line: %s" % (rel, marker)]
+            return [GRAMMAR_MESSAGE % ("block marker not on exactly one line: " + marker, rel, 1)]
         starts[marker] = hit[0]
-    order = sorted(starts.values())
+    end = text.find(STATEMENT_END)
+    stop_last = text.count("\n", 0, end) + 1 if end >= 0 and text.count(STATEMENT_END) == 1 else len(lines)
     out = []
-    for marker, name in ((B_IN, "IN"), (B_UNLANDED, "UNLANDED")):
+    for marker, name in _GB_NAMES:
         first = starts[marker]
-        later = [n for n in order if n > first]
-        stop = later[0] if later else len(lines)
+        later = [n for n in starts.values() if n > first]
+        stop = min(later) if later else (stop_last if stop_last > first else len(lines))
         lead = BLOCK_LEADS[marker]
         body = [lines[first][len(marker):]] + lines[first + 1:stop]
-        end = next((k for k in range(1, len(body)) if not body[k].strip()), len(body))
-        bad = [k for k in range(max(end, len(lead))) if k >= end or k >= len(lead) or body[k] != lead[k]]
-        if bad:
-            out.append("%s: line %d: non-item text inside the %s block" % (rel, first + bad[0] + 1, name))
-        prev = "blank"
-        for k in range(end, len(body)):
-            ln = body[k]
-            if not ln.strip():
-                ok, prev = True, "blank"
-            elif ln.startswith("- ") and ln[2:3].strip():
-                ok, prev = True, "item"
-            elif ln.startswith("  ") and prev in ("item", "cont") and not _CONT_BLOCK_RE.match(ln):
-                ok, prev = True, "cont"
-            else:
-                ok, prev = False, "bad"
-            if not ok:
-                out.append("%s: line %d: non-item text inside the %s block" % (rel, first + k + 1, name))
+        bad = next((k for k in range(len(lead)) if k >= len(body) or body[k] != lead[k]), None)
+        if bad is None and len(body) > len(lead) and body[len(lead)].strip(" "):
+            bad = len(lead)
+        if bad is not None:
+            out.append(GRAMMAR_MESSAGE % ("text after the block marker in the %s block" % name, rel,
+                                          first + bad + 1))
+        out.extend(_gb_body_problems(body[len(lead) + 1:], first + len(lead) + 1, name, rel))
     return out
 
 
+BLOCK_ITEMS = ((B_IN, IN_ITEMS), (B_PENDING, PENDING_ITEMS), (B_UNLANDED, UNLANDED_ITEMS), (B_NOT, NOT_ITEMS))
+
+
 def block_item_problems(text_blocks):
-    """Round 17: every IN and UNLANDED item's flattened text matches its reviewed digest."""
+    """Round 17, widened in round 18 (security MEDIUM-1): every item of the four statement blocks
+    matches exactly one reviewed key, every key is matched once, and the item's flattened text
+    (children folded in) matches its reviewed digest."""
     out = []
-    for marker, expected in ((B_IN, IN_ITEMS), (B_UNLANDED, UNLANDED_ITEMS)):
-        for item in _items(text_blocks[marker]):
+    for marker, expected in BLOCK_ITEMS:
+        items = _items(text_blocks[marker])
+        for item in items:
             keys = [key for key in expected if key in item]
             if len(keys) != 1:
                 out.append("item matches %d keys: %s" % (len(keys), item[:60]))
             elif mention_key(item) != BLOCK_ITEM_DIGESTS[keys[0]]:
                 out.append("item text changed without review: %s (%s)" % (keys[0], mention_key(item)))
+        for key in expected:
+            if sum(key in item for item in items) != 1:
+                out.append("item missing or duplicated: %s" % key)
     return out
 
 
@@ -1558,47 +1862,162 @@ class CertificationScope8262(unittest.TestCase):
         self.assertIn("#1968", body)
 
     def test_block_text_is_items_only_8262(self):
-        # Round 17 (security r15 MEDIUM-1, D2): the IN and UNLANDED blocks hold items only, and each
-        # item's whole flattened text is pinned, so no claim rides in them unreviewed.
+        # Round 17 (security r15 MEDIUM-1, D2), widened in round 18 (security r16 MEDIUM-1, rule 4): the
+        # IN, PENDING, UNLANDED and NOT blocks hold items only, and each item's whole flattened text is
+        # pinned, so no claim rides in them unreviewed.
         text = CERT.read_text(encoding="utf-8")
         self.assertEqual(block_text_problems(CERT_REL, text), [])
         self.assertEqual(block_item_problems(_blocks()), [])
         lines = text.split("\n")
         at = {m: next(n for n, ln in enumerate(lines) if ln.startswith(m)) for m in BLOCK_MARKERS}
+        rule = lines.index("---", at[B_NOT])  # the STATEMENT_END rule that closes the NOT block
         tde = "Postgres-native TDE is claimed for v1.0.0."
         last = at[B_PENDING] - 2  # the last line of the last IN item (0-based)
-        u_last = at[B_NOT] - 2  # the last line of the last UNLANDED item (0-based)
+        p_last = at[B_UNLANDED] - 2  # the last line of the PENDING item
+        u_last = at[B_NOT] - 2  # the last line of the last UNLANDED item
+        n_last = rule - 2  # the last line of the last NOT item
 
         def problems(pos, add):
-            return block_text_problems(CERT_REL, "\n".join(lines[:pos] + add + lines[pos:]))
+            return block_text_problems(CERT_REL, "\n".join(lines[:pos] + add + lines[pos:]))[:1]
 
-        def named(n, name):
-            return ["%s: line %d: non-item text inside the %s block" % (CERT_REL, n, name)]
-        cases = (  # (0-based insert position, inserted lines, the refused 1-based line, block)
-            (last + 1, ["> " + tde], last + 2, "IN"),              # block quote
-            (last + 1, [tde], last + 2, "IN"),                     # lazy continuation
-            (last + 1, ["    " + tde], last + 2, "IN"),            # indented continuation
-            (last + 1, ["", tde], last + 3, "IN"),                 # bare paragraph
-            (last + 1, ["  > " + tde], last + 2, "IN"),            # quote in the item
-            (last + 1, ["  - " + tde], last + 2, "IN"),            # nested item
-            (last + 1, ["", "  " + tde], last + 3, "IN"),          # second item paragraph
-            (at[B_IN] + 1, [tde], at[B_IN] + 2, "IN"),             # lead text
-            (u_last + 1, ["> " + tde], u_last + 2, "UNLANDED"),
-            (u_last + 1, [tde], u_last + 2, "UNLANDED"),
-            (at[B_UNLANDED] + 1, [tde], at[B_UNLANDED] + 2, "UNLANDED"),
+        def named(n, construct, name):
+            return [GRAMMAR_MESSAGE % ("%s in the %s block" % (construct, name), CERT_REL, n)]
+        cases = (  # (0-based insert position, inserted lines, the refused 1-based line, construct, block)
+            (last + 1, ["> " + tde], last + 2, "block quote", "IN"),
+            (last + 1, [tde], last + 2, "lazy continuation", "IN"),
+            (last + 1, ["    " + tde], last + 2, "continuation at an unsupported indentation", "IN"),
+            (last + 1, ["", tde], last + 3, "paragraph", "IN"),
+            (last + 1, ["  > " + tde], last + 2, "nested block in an item", "IN"),
+            (last + 1, ["  # " + tde], last + 2, "nested block in an item", "IN"),
+            (last + 1, ["", "  " + tde], last + 3, "second item paragraph", "IN"),
+            (last + 1, ["  - nested", "    - " + tde], last + 3, "deeper nesting", "IN"),
+            (last + 1, ["     - " + tde], last + 2, "list item at an unsupported indentation", "IN"),
+            (last + 1, ["  \t" + tde], last + 2, "tab", "IN"),
+            (at[B_IN] + 1, [tde], at[B_IN] + 2, "text after the block marker", "IN"),
+            (p_last + 1, ["", tde], p_last + 3, "paragraph", "PENDING"),
+            (p_last + 1, ["> " + tde], p_last + 2, "block quote", "PENDING"),
+            (p_last + 1, [tde], p_last + 2, "lazy continuation", "PENDING"),
+            (u_last + 1, ["> " + tde], u_last + 2, "block quote", "UNLANDED"),
+            (u_last + 1, [tde], u_last + 2, "lazy continuation", "UNLANDED"),
+            (at[B_UNLANDED] + 1, [tde], at[B_UNLANDED] + 2, "text after the block marker", "UNLANDED"),
+            (n_last + 1, ["", tde], n_last + 3, "paragraph", "NOT"),
+            (n_last + 1, ["> " + tde], n_last + 2, "block quote", "NOT"),
+            (n_last + 1, [tde], n_last + 2, "lazy continuation", "NOT"),
+            (n_last + 1, ["", "| " + tde + " |"], n_last + 3, "table row", "NOT"),
+            (n_last + 1, ["", "```", tde, "```"], n_last + 3, "fence", "NOT"),
+            (n_last + 1, ["", "<p>" + tde + "</p>"], n_last + 3, "HTML block", "NOT"),
         )
-        for pos, add, n, name in cases:
-            self.assertEqual(problems(pos, add), named(n, name), n)
-        # A legal two-space continuation is still refused when it changes an item's text.
-        new = list(lines)
-        new.insert(last + 1, "  " + tde)
+        for pos, add, n, construct, name in cases:
+            self.assertEqual(problems(pos, add), named(n, construct, name), (construct, name))
+        # In-subset controls: a two-space continuation and a one-level child item parse, and the item
+        # digest still refuses the changed item text.
+        for add in (["  " + tde], ["  - " + tde], ["  1. " + tde]):
+            new = lines[:last + 1] + add + lines[last + 1:]
+            self.assertEqual(block_text_problems(CERT_REL, "\n".join(new)), [], add)
+            sec = "\n".join(new)
+            body = sec[sec.index(B_IN):sec.index(B_PENDING)].split("\n", 1)[1]
+            blocks = dict(_blocks())
+            blocks[B_IN] = body
+            self.assertEqual(block_item_problems(blocks),
+                             ["item text changed without review: Quarantine of unattributed inbound writes (%s)"
+                              % mention_key(_items(body)[-1])])
+        # The NOT and PENDING items are digest-pinned (round 18): one more NOT item is refused.
+        new = lines[:n_last + 1] + ["- " + tde] + lines[n_last + 1:]
         self.assertEqual(block_text_problems(CERT_REL, "\n".join(new)), [])
-        sec = "\n".join(new)
-        start = sec.index(B_IN)
-        body = sec[start:sec.index(B_PENDING)].split("\n", 1)[1]
-        self.assertEqual(block_item_problems({B_IN: body, B_UNLANDED: _blocks()[B_UNLANDED]}),
-                         ["item text changed without review: Quarantine of unattributed inbound writes (%s)"
-                          % mention_key(_items(body)[-1])])
+        blocks = dict(_blocks())
+        blocks[B_NOT] = blocks[B_NOT].rstrip("\n") + "\n- " + tde + "\n"
+        self.assertEqual(block_item_problems(blocks),
+                         ["item text changed without review: Postgres-native TDE (%s)" % mention_key("- " + tde),
+                          "item missing or duplicated: Postgres-native TDE"])
+
+    def test_gated_files_parse_in_the_markdown_subset_8262(self):
+        # Round 18 (decision B): every gated markdown file parses in the documented subset; the
+        # refusal names the construct and its file:line.
+        bad = [p for rel in SINGLE_SOURCE_FILES if rel != HTML_REL
+               for p in grammar_problems(rel, scoped_text(rel, _read(rel)))]
+        self.assertEqual(bad, [], "\n".join(bad[:20]))
+        readme = _read("README.md").split("\n")
+        self.assertEqual(sorted(HTML_BLOCK_ALLOW["README.md"] - set(readme)), [],
+                         "an HTML allow-list line is gone from README.md; shrink the list")
+
+    def test_markdown_subset_boundary_rows_8262(self):
+        # Round 18: one refused row per grammar rule and an in-subset control beside it.
+        def got(text, rel="README.md"):
+            return [p[len("unsupported markdown construct: "):].rsplit(" at ", 1)[0]
+                    for p in grammar_problems(rel, text)]
+        self.assertEqual(grammar_problems("README.md", "> > x"),
+                         ["unsupported markdown construct: nested block quote at README.md:1"])  # rule 1
+        rows = (
+            # rule 2: heading liveness
+            ("# Federation\n\ntext", [], "README.md"),
+            ("    # Federation", ["indented heading-like line"], "README.md"),
+            (" # Federation", ["indented heading-like line"], "README.md"),
+            ("```\n# Federation\n```", ["heading-like line inside a fence"], CERT_REL),
+            ("```\n# comment\n```", [], "README.md"),
+            ("> # Federation", ["heading-like line in a block quote"], "README.md"),
+            ("- # Federation", ["heading-like line in a list item"], "README.md"),
+            ("<details>\n## Federation", ["heading-like line in an HTML block"], "README.md"),
+            ("text\n===", ["setext underline"], "README.md"),
+            ("text\n---", ["setext underline"], "README.md"),
+            ("- item\n    ---", ["setext underline"], "README.md"),
+            ("text\n\n---", [], "README.md"),
+            ("> text\n> ---", ["setext underline in a block quote"], "README.md"),
+            # rule 3: containers only at top level
+            ("```\ncode\n```", [], "README.md"),
+            ("~~~~\n```\n~~~~", [], "README.md"),
+            ("  ```\ncode", ["indented fence opener"], "README.md"),
+            ("```\ncode", ["unclosed fence"], "README.md"),
+            ("````\n```\n````", [], "README.md"),
+            ("```\n```` x\n```", ["fence-like line inside a fence"], "README.md"),
+            ("```\n````\n", [], "README.md"),
+            ("```\nx\n  ```\n```", ["fence-like line inside a fence"], "README.md"),
+            ("``` a`b", ["backtick in a fence info string"], "README.md"),
+            ("> ```", ["fence in a block quote"], "README.md"),
+            ("- ```", ["fence in a list item"], "README.md"),
+            ("1. ~~~", ["fence in a list item"], "README.md"),
+            ("  > x", ["indented block quote"], "README.md"),
+            ("- > x", ["block quote in a list item"], "README.md"),
+            ("> - x", ["list item in a block quote"], "README.md"),
+            ("> x\ny", ["lazy block-quote continuation"], "README.md"),
+            ("> x\n\ny", [], "README.md"),
+            ("> x\n>\ny", [], "README.md"),
+            (">     code", ["indented code in a block quote"], "README.md"),
+            ("<div>\nx", ["HTML block"], "README.md"),
+            ("<!-- note -->\n\nx", [], CERT_REL),
+            ("<!-- a\nb -->", ["HTML block"], CERT_REL),
+            ("<https://example.com> is a link", [], "README.md"),
+            ("> <div>", ["HTML block in a block quote"], "README.md"),
+            ("- <div>", ["HTML block in a list item"], "README.md"),
+            ("<details>\n\nx", [], "README.md"),
+            ("<details>\ntext", ["markdown inside an HTML block"], "README.md"),
+            ("<details>", ["HTML block"], CERT_REL),
+            ("---\nlayout: doc\n---\n# Title", [], "README.md"),
+            ("x\n---\nlayout: doc", ["setext underline"], "README.md"),
+            # rule 5: whitespace
+            ("a\u00A0b", ["non-ASCII whitespace U+00A0"], "README.md"),
+            ("a\u2007b", ["non-ASCII whitespace U+2007"], "README.md"),
+            ("a\u200Bb", ["non-ASCII whitespace U+200B"], "README.md"),
+            ("\uFEFFx", ["non-ASCII whitespace U+FEFF"], "README.md"),
+            ("a\u3000b", ["non-ASCII whitespace U+3000"], "README.md"),
+            ("a\tb", ["tab outside a fence"], "README.md"),
+            ("x\n\t\ny", ["tab outside a fence"], "README.md"),
+            ("```\na\tb\n```", [], "README.md"),
+            ("x\n   \ny", [], "README.md"),
+        )
+        for text, want, rel in rows:
+            self.assertEqual(got(text, rel), want, (text, rel))
+
+    def test_trust_peer_identifier_forms_8262(self):
+        # Round 18 (code r14 LOW-1): the short trust-peer token in identifier form is a mention
+        # wherever it stands; the five reviewer spellings first, then two more.
+        for text in ("| TRUST_PEER | 1 | enables sync |", "```yaml\ntrust_peer: yes\n```",
+                     "Recommended: TRUST_PEER: 1 on every peer.", "TRUST_PEER should be set to 1 on every peer.",
+                     "Enable TRUST_PEER on every peer.",
+                     "Turn on `trust-peer` for every peer.", "| Trust_Peer | enabled |"):
+            self.assertEqual(len(trust_peer_units("README.md", text)), 1, text)
+        for text in ("Trust peer-supplied sync metadata.", "Set TRUST_PEER_LIMIT to 1.", "The trust peer is one.",
+                     "A trust-peer-supplied value.", "Distrust_peer is a word.", "Read trustpeers.md."):
+            self.assertEqual(trust_peer_units("README.md", text), [], text)
 
     def test_unlanded_block_items(self):
         body = _blocks()[B_UNLANDED]

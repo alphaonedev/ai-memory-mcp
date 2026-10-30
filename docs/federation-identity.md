@@ -3,8 +3,8 @@ layout: doc
 ---
 # Federation identity at scale — enterprise zero-touch trust
 
-> ## Certified trust boundary (canonical)
->
+## Certified trust boundary (canonical)
+
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
 > Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
@@ -364,11 +364,11 @@ Field reference:
   Net effect: weakening the fleet requires **adding two greppable lines**,
   never deleting one.
 
-  ```yaml
-  enforcement:
-    require_sig: false
-    disable_reason: staged peer key enrollment window, ticket OPS-42
-  ```
+```yaml
+enforcement:
+  require_sig: false
+  disable_reason: staged peer key enrollment window, ticket OPS-42
+```
 
 ---
 
@@ -445,10 +445,11 @@ required.
 > ⚠️ **This does not describe the lane the shipped runbooks use.** Two
 > other identity lanes carry NO expiry and NO hot-reload:
 >
-> - the legacy per-peer `.pub` enrollment lane, and
-> - the **mTLS fingerprint allowlist** — the lane
->   [`docs/federation.md`](federation.html) §"Cert-revocation procedure"
->   actually prescribes.
+> the legacy per-peer `.pub` enrollment lane, and
+>
+> the **mTLS fingerprint allowlist** — the lane
+> [`docs/federation.md`](federation.html) §"Cert-revocation procedure"
+> actually prescribes.
 >
 > Revoking on the allowlist lane means editing
 > `peer-fingerprints.allow` **and restarting the daemon**: there is no
@@ -575,11 +576,11 @@ These are the load-bearing checks, each pinned end-to-end in
    `require_sig: false` **and** a non-empty `disable_reason`, or the
    inventory will not load:
 
-   ```yaml
-   enforcement:
-     require_sig: false
-     disable_reason: enrolling region/sfo peer keys, ticket OPS-42
-   ```
+```yaml
+enforcement:
+  require_sig: false
+  disable_reason: enrolling region/sfo peer keys, ticket OPS-42
+```
 
    The reconciler honours that by emitting `DisableStrictEnforcement`.
    Close the window by restoring `require_sig: true` **and deleting the

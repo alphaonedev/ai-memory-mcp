@@ -3,8 +3,8 @@ layout: doc
 ---
 # Enterprise deployment topologies for ai-memory v1.0.0
 
-> ## Certified trust boundary (canonical)
->
+## Certified trust boundary (canonical)
+
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
 > Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
@@ -835,12 +835,12 @@ PgBouncer.
 > transaction-mode PgBouncer, you MUST also pin the envelope at the
 > Postgres role level so every backend inherits it as its server
 > default:**
->
-> ```sql
-> ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
-> ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
-> ```
->
+
+```sql
+ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
+ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
+```
+
 > Keep the two values in lockstep with the compiled
 > `DEFAULT_STATEMENT_TIMEOUT_SECS` / `DEFAULT_LOCK_TIMEOUT_SECS` (or
 > your `postgres_statement_timeout_secs` override) so the direct-connect

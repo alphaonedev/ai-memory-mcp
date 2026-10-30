@@ -317,8 +317,10 @@ cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
 This compiles the binary and puts it in your PATH. It takes a minute or two.
 
 > **Build dependencies for source builds:**
-> - Ubuntu/Debian: `sudo apt-get install build-essential pkg-config`
-> - Fedora/RHEL: `sudo dnf install gcc pkg-config`
+>
+> Ubuntu/Debian: `sudo apt-get install build-essential pkg-config`
+>
+> Fedora/RHEL: `sudo dnf install gcc pkg-config`
 
 **Step 3: Connect your AI**
 
@@ -396,15 +398,15 @@ Export `XAI_API_KEY` in your shell rc (`.zshrc` / `.bashrc`); the MCP config sta
 Verify: `ai-memory boot --quiet --limit 1` should report `llm=xai:grok-4.3`. Canonical schema reference: [`docs/CONFIG_SCHEMA.md`](docs/CONFIG_SCHEMA.md).
 
 > **Override path — `env:` block.** Adding an `env:` block to the MCP config with `AI_MEMORY_LLM_BACKEND` / `_API_KEY` / `_MODEL` still works and takes precedence over `config.toml` — useful for CI / per-session tweaks:
->
-> ```json
-> "env": {
->   "AI_MEMORY_LLM_BACKEND": "xai",
->   "AI_MEMORY_LLM_API_KEY": "xai-...",
->   "AI_MEMORY_LLM_MODEL": "grok-4.3"
-> }
-> ```
->
+
+```json
+"env": {
+  "AI_MEMORY_LLM_BACKEND": "xai",
+  "AI_MEMORY_LLM_API_KEY": "xai-...",
+  "AI_MEMORY_LLM_MODEL": "grok-4.3"
+}
+```
+
 > MCP clients spawn the server as a fresh subprocess with only the `env:` keys from the MCP config — shell exports in `.zshrc` / `.bashrc` don't reach it. The `[llm]` config-file path above retires this paper-cut (every surface reads the same file). **Inline API keys in `config.toml` are rejected at parse time** — use `api_key_env` or `api_key_file`. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146). Full per-backend recipes: [`docs/integrations/llm-backends.md`](docs/integrations/llm-backends.md).
 
 > **Tier flag:** The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. Smart and autonomous tiers need an LLM backend — **post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** that is any of: local [Ollama](https://ollama.com), xAI Grok, OpenAI, Anthropic, Google Gemini, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp server — selected via `AI_MEMORY_LLM_BACKEND`. The `--tier` flag **must** be passed in the args — the `config.toml` tier setting is not used when the MCP server is launched by an AI client.
@@ -826,12 +828,12 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (103 route registrations
 ### Quality
 - **15,885 test attributes under `src/` and `tests/`** at commit `626f52a482ebf42afe029917442250d225e8e352` — **9,429** under `src/` (8,130 `#[test]` + 1,299 `#[tokio::test...]`) and **6,456** under `tests/` (3,806 `#[test]` + 2,650 `#[tokio::test...]`), grown from the v0.6.4-era ~2,400-test baseline. This is a source-attribute count, not executed-test evidence. Re-derivable in four commands:
 
-  ```bash
-  rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 8130
-  rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1299
-  rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 3806
-  rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 2650
-  ```
+```bash
+rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 8130
+rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1299
+rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 3806
+rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 2650
+```
 
   The `#[tokio::test` prefix (no closing bracket) is deliberate — it also counts `#[tokio::test(flavor = "multi_thread")]`, which is a test. This is a count of test *attributes*, not of test cases executed by any one `cargo test` invocation. Re-derive before citing; the numbers move every release.
 - **Line coverage is held above the 90% workspace floor** enforced by `coverage/thresholds.toml` `[global].min_line_coverage`, plus a per-module floor for every module (see [Coverage Floor](#coverage-floor-hard-ci-gate)). Net-new v0.6.4 modules measured 100% (`sizes.rs`), 99.50% (`profile.rs`), 97.58% (`cli/audit.rs`), 97.05% (`cli/doctor.rs`), 92.56% (`handlers.rs`), 92.26% (`cli/install.rs`). v0.6.3.x baselines (1,809 / 93.08% and 1,886 / 93.84%) remain frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.4 metrics in the release notes and on the [test-hub campaign](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md). Empirical NHI discovery acceptance proven separately by the Discovery Gate (T1–T4 matrix vs. live xAI Grok 4.3, 6/6 PASS, **GATE GREEN**) — see the [Evidence Hub](https://alphaonedev.github.io/ai-memory-mcp/evidence/) (the `ai-memory-discovery-gate` Pages site is retired per #2034).

@@ -112,9 +112,9 @@ To restore one:
 2. Check the dump against the checksum you recorded, from a copy of the checksum that the backup host could not have rewritten. `ai-memory` does not sign Postgres dumps, so this record is your trust anchor.
 3. Restore into the cluster, which must have the `age` and `vector` extensions installed at the versions the dump was taken with:
 
-   ```bash
-   pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
-   ```
+```bash
+pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
+```
 
 4. Start ONE daemon on a binary at least as new as the one that took the dump. A binary older than the restored schema refuses to open it ([#2445](https://github.com/alphaonedev/ai-memory-mcp/issues/2445)). Verify the data before starting the rest of the fleet.
 
