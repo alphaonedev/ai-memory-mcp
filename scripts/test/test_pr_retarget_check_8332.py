@@ -250,7 +250,13 @@ class LivePath(unittest.TestCase):
                             ([stamped, change("   ")], "unparsable created_at"),
                             ([stamped, change(" 2026-10-30T13:00:00Z")], "unparsable created_at"),
                             ([stamped, change("2026-10-30 13:00:00Z")], "unparsable created_at"),
-                            ([stamped, change("garbage")], "unparsable created_at")):
+                            ([stamped, change("garbage")], "unparsable created_at"),
+                            # round 7 (REVIEW-8332-code-r6 INFO-1): strptime alone accepted these three
+                            ([stamped, change("2026-10-30t13:00:00z")], "unparsable created_at"),
+                            ([stamped, change("2026-10-30T3:00:00Z")], "unparsable created_at"),
+                            ([stamped, change("\u0662\u0660\u0662\u0666-10-30T13:00:00Z")], "unparsable created_at"),
+                            # round 7 (REVIEW-8332-security-r6 INFO): a number is named as such, not as missing
+                            ([stamped, {"event": "base_ref_changed", "created_at": 1793365200}], "int created_at")):
             self.put("timeline_page1", events)
             self.runs(T_AFTER, T_AFTER)
             r = self.run_live()
@@ -260,7 +266,7 @@ class LivePath(unittest.TestCase):
     def test_h3_unparsable_run_stamp_is_a_tool_error(self):
         # An unparsable run createdAt is refused, never skipped, even beside a valid newer run.
         self.put("timeline_page1", [change(T_CHANGE)])
-        for bad in (" 2026-10-30T15:00:00Z", "2026-10-30 15:00:00Z", None):
+        for bad in (" 2026-10-30T15:00:00Z", "2026-10-30 15:00:00Z", None, "2026-10-30t15:00:00z"):
             self.put("runs_ci.yml", runs_at(T_AFTER) + [{"databaseId": 8, "createdAt": bad}])
             self.put("runs_coverage.yml", runs_at(T_AFTER))
             r = self.run_live()

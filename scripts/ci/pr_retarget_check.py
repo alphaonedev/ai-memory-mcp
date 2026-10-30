@@ -28,6 +28,7 @@ import argparse
 import json
 from datetime import datetime
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +63,7 @@ def _max_pages():
 MAX_PAGES = _max_pages()
 RUN_LIMIT = 100
 STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+STAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 
 class ToolError(Exception):
@@ -72,13 +74,13 @@ def gh_json(args):
     try:
         proc = subprocess.run(["gh"] + args, capture_output=True, text=True, check=False)
     except OSError as exc:
-        raise ToolError(f"cannot run gh: {exc}")
+        raise ToolError(f"cannot run gh: {exc}") from exc
     if proc.returncode != 0:
         raise ToolError(f"gh {' '.join(args[:2])} failed rc={proc.returncode}: {proc.stderr.strip()[:300]}")
     try:
         return json.loads(proc.stdout)
     except ValueError as exc:
-        raise ToolError(f"gh returned invalid JSON: {exc}")
+        raise ToolError(f"gh returned invalid JSON: {exc}") from exc
 
 
 def load_fixture(json_dir, name, required=True):
@@ -90,7 +92,7 @@ def load_fixture(json_dir, name, required=True):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:
-        raise ToolError(f"fixture {name} is not JSON: {exc}")
+        raise ToolError(f"fixture {name} is not JSON: {exc}") from exc
 
 
 def fetch_timeline(repo, pr, json_dir):
@@ -130,13 +132,22 @@ def parse_stamp(raw, what):
     decision (round 6, REVIEW-8332-code-r5 F2, REVIEW-8332-security-r5 S11): stamps are parsed and
     compared as datetimes, never as strings, so a padded or space-separated stamp cannot sort below a
     canonical one and be ignored. An unparsable stamp refuses; it is never skipped.
+
+    decision (round 7, REVIEW-8332-code-r6 INFO-1, REVIEW-8332-security-r6 INFO): ``strptime`` alone
+    accepts a lowercase ``t``/``z``, single-digit fields and non-ASCII digits, so the exact GitHub shape
+    is checked first (ASCII digits, a full match); anything else refuses. A non-string value is named
+    by its kind instead of being reported as missing.
     """
-    if not isinstance(raw, str) or not raw:
+    if raw is None or raw == "":
         raise ToolError(f"{what} has no created_at")
+    if not isinstance(raw, str):
+        raise ToolError(f"{what} has a {type(raw).__name__} created_at, not a string")
+    if not STAMP_RE.fullmatch(raw):
+        raise ToolError(f"{what} has an unparsable created_at {raw!r}")
     try:
         return datetime.strptime(raw, STAMP_FORMAT)
-    except ValueError:
-        raise ToolError(f"{what} has an unparsable created_at {raw!r}")
+    except ValueError as exc:
+        raise ToolError(f"{what} has an unparsable created_at {raw!r}") from exc
 
 
 def check(repo, pr, head, json_dir):
