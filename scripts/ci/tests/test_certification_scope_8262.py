@@ -23,19 +23,24 @@ HTML and is not in the subset. The rules:
      block is refused, and in the certification file also inside a fence. A setext underline (a
      line of only "=" or "-" directly under text) is refused; a "---" rule needs a blank line above.
   3. Containers sit at top level only. A fence opens and closes at column 0 (closer: the same
-     character, at least as long, nothing after it); an indented, quoted or in-item fence opener, a
-     fence-like line inside a fence and an unclosed fence are refused. A block quote is one level
-     at column 0 and may not carry a fence, a heading-like line, a list item, an HTML block or
-     indented code; lazy continuation is refused. An HTML block line is refused except a one-line
-     "<!-- ... -->" comment and the measured README.md lines of HTML_BLOCK_ALLOW, each followed only
-     by a blank line or another allowed line. YAML front matter is read only at the top of a file.
+     character, at least as long, nothing after it). Four refusals are enforced: an HTML block or
+     indented code inside a block quote; a fence-like line inside a fence; a backtick in a fence
+     info string; front matter below the top of the file. An indented, quoted or in-item fence
+     opener and an unclosed fence are refused too. A block quote is one level at column 0 and may
+     not carry a fence, a heading-like line, a list item, an HTML block or indented code; lazy
+     continuation is refused. An HTML block line is refused except a one-line "<!-- ... -->" comment
+     and the measured README.md lines of HTML_BLOCK_ALLOW, each followed only by a blank line or
+     another allowed line. YAML front matter is read only at the top of a file.
   4. The IN, PENDING, UNLANDED and NOT statement blocks hold only list items ("-", "*", "+" or an
      ordered marker at column 0) and blank lines: one child level (2-4 spaces), continuation lines
      at the item content column, no second paragraph, no other block; every item is digest-pinned.
-  5. Blank means empty or ASCII spaces only. Non-ASCII whitespace (NBSP, U+2000-U+200B, U+202F,
-     U+205F, U+3000, U+FEFF) is refused anywhere, and a tab outside a fence is refused.
+  5. Blank means empty or ASCII spaces only. Non-ASCII whitespace (U+0085, NBSP, U+1680, U+180E,
+     U+2000-U+200B, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF) is refused anywhere, and a tab
+     outside a fence, YAML front matter included, is refused.
   6. Mentions of the short trust-peer token in identifier form (trust_peer, trust-peer, any case)
-     count wherever they stand, containers ignored: table cells, after a colon, fenced code.
+     count wherever they stand, containers ignored: table cells, after a colon, fenced code. A
+     markdown escape or emphasis, code or strike markup inside the token does not hide it
+     (TRUST\\_PEER, TRUST_**PEER**, TRUST_`PEER`); an underscore between two word characters stays.
 The lexer and the unit rules below then read only subset input. The subset is summarised for
 maintainers in scripts/ci/tests/data/README.md, next to the pin table.
 
@@ -249,10 +254,6 @@ BLOCK_ITEM_DIGESTS = {
     'Top-shelf encryption documentation': 'fd2e106e993f5212',
     'Singleton and Team shapes': 'a8ad0089d42dbdc3',
 }
-# A two-space continuation line that would open a block (indented code, quote, heading, list item,
-# fence, HTML, table row, setext underline or thematic break) instead of continuing the paragraph.
-_CONT_BLOCK_RE = re.compile(r"  (?:[ \t]|>|#{1,6}(?:[ \t]|$)|[-*+](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)"
-                            r"|`{3,}|~{3,}|<|\||[-=_*][-=_* \t]*$)")
 NOT_ITEMS = {
     "Postgres-native TDE": 8284,
     "Curator namespace-scoped mode": 8264,
@@ -461,6 +462,7 @@ _HTML_HEADING_OPEN_RE = re.compile(r"<h[1-6](?:[\s>/]|$)", re.IGNORECASE)
 # a list marker, and the prefix whose tabs expand to four-column stops.
 _FENCE_RUN_RE = re.compile(r"(`{3,}|~{3,})")
 _FENCE_CLOSE_RE = re.compile(r"(`{3,}|~{3,})[ \t]*$")
+_SPACES_RE = re.compile(r" *")
 _MARKER_RE = re.compile(r"(?:[-*+]|(\d{1,9})[.)])(?=[ \t]|$)")
 _LEAD_PREFIX_RE = re.compile(r"[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+[ \t>]*)*")
 # The permissive second reading the backstop compares with (the round-14 form plus list markers):
@@ -668,18 +670,24 @@ def _lex(lines):
             bodies.append(body)
             continue
         col, indented = ind, False
+        # Round 19 (code r15 INFO-2): one pass per line. A thematic break needs the whole rest of the
+        # line to be one marker character and blanks, so it is tried only from break_from on; the text
+        # after a marker is measured by position, never sliced.
+        edge = rest.rstrip(" \t")[-1:]
+        break_from = len(rest.rstrip(" \t" + edge)) if edge in ("-", "*", "_") else len(rest) + 1
+        last_text = len(rest.rstrip(" \t"))
         while True:
             m = _MARKER_RE.match(rest, col)
-            if not m or _BREAK_RE.match(rest[col:]):
+            if not m or (col >= break_from and _BREAK_RE.match(rest, col)):
                 break
-            after = rest[m.end():]
-            if (para and not popped and (not after.strip(" \t")
+            bare = m.end() >= last_text
+            if (para and not popped and (bare
                                          or (m.group(1) is not None and m.group(1).lstrip("0") != "1"))):
                 break  # an empty item, or one numbered other than 1, does not interrupt a paragraph
-            gap = len(after) - len(after.lstrip(" "))
-            width = 1 if not after.strip(" \t") or gap > 4 else gap
+            gap = _SPACES_RE.match(rest, m.end()).end() - m.end()
+            width = 1 if bare or gap > 4 else gap
             items.append((depth, m.end() + width))
-            indented, col, para, popped = gap > 4 and bool(after.strip(" \t")), m.end() + width, False, True
+            indented, col, para, popped = gap > 4 and not bare, m.end() + width, False, True
             if indented:
                 break
         text = rest[col:]
@@ -1175,7 +1183,20 @@ def _mention_views(text):
         out = fold(out)
     if "[" in out:
         out = _REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", out)).replace("[", "").replace("]", "")
-    return low, _MARKUP_RE.sub("", _TAG_RE.sub("", low)), _MARKUP_RE.sub("", out)
+    return low, _MARKUP_RE.sub("", _TAG_RE.sub("", low)), _MARKUP_RE.sub("", out), _keep_underscores(out)
+
+
+_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+_EMPH_RE = re.compile(r"[*`~]")
+_EDGE_US_RE = re.compile(r"(?<![a-z0-9])_+|_+(?![a-z0-9])")
+
+
+def _keep_underscores(text):
+    """Round 19 (security r17 LOW-1): the rendered view with markdown backslash escapes undone and the
+    emphasis and code delimiters (*, backtick, ~, and underscores that are not inside a word) removed, an
+    underscore between two word characters kept: TRUST\\_PEER, TRUST_**PEER** and TRUST_`PEER` read as
+    trust_peer."""
+    return _EDGE_US_RE.sub("", _EMPH_RE.sub("", _ESCAPE_RE.sub(r"\1", text)))
 
 
 def mention_key(sentence):
@@ -1226,7 +1247,9 @@ _G_CLOSER_RE = re.compile(r"(`{3,}|~{3,}) *$")
 _G_SETEXT_RE = re.compile(r" *(?:=+|-+) *$")
 _G_HTML_RE = re.compile(r"<[a-z/!?]", re.IGNORECASE)
 _G_AUTOLINK_RE = re.compile(r"<(?:[a-z][a-z0-9+.-]{1,31}:[^\s<>]*|[^\s@<>]+@[^\s@<>]+)>", re.IGNORECASE)
-_G_COMMENT_LINE_RE = re.compile(r"<!--(?:(?!-->|<!--).)*--> *$")
+# Round 19: a whole single-line comment, anchored at both ends; the body holds no "--" run, so a nested
+# "<!--" and a second "-->" are not the comment (the line is then refused as an HTML block).
+_G_COMMENT_LINE_RE = re.compile(r"^<!--(?:[^-]|-(?!-))*-->$")
 _G_FRONT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*: \S.*$")
 _G_REFDEF_RE = re.compile(r" *\[[^\]\n]+\]:")
 # Rule 4: a gated-block item marker at the start of the (unindented) text, one space, then text.
@@ -1334,6 +1357,8 @@ def grammar_problems(rel, text):
         if ws:
             refuse("non-ASCII whitespace U+%04X" % ord(ws[0]), n)
         if n <= skip:
+            if "\t" in ln:
+                refuse("tab outside a fence", n)
             continue
         if fence is not None:
             m = _G_CLOSER_RE.match(ln)
@@ -2006,6 +2031,65 @@ class CertificationScope8262(unittest.TestCase):
         )
         for text, want, rel in rows:
             self.assertEqual(got(text, rel), want, (text, rel))
+
+    def test_trust_peer_markup_spellings_8262(self):
+        # Round 19 (security r17 LOW-1, rule 6): an escape or emphasis around the second half of the
+        # identifier does not hide it; the intra-word underscore is kept by the fourth mention view.
+        for token in ("TRUST\\_PEER", "TRUST_**PEER**", "**TRUST**_PEER", "TRUST_`PEER`", "TRUST_~~PEER~~",
+                      "__TRUST_PEER__", "*TRUST*\\_PEER"):
+            for text in ("Enable %s on every peer." % token, "| %s | 1 |" % token):
+                self.assertEqual(len(trust_peer_units("README.md", text)), 1, text)
+        for token in ("TRUST_PEERS_ARE_LISTED", "TRUST\\_PEER\\_LIMIT", "TRUST_**PEER**_LIMIT", "trustpeer"):
+            text = "Enable %s on every peer." % token
+            self.assertEqual(trust_peer_units("README.md", text), [], text)
+
+    def test_front_matter_tab_and_comment_rows_8262(self):
+        # Round 19 (code r15 LOW-1, LOW-3): rule 5 covers YAML front matter; the one-line comment match
+        # is anchored and refuses everything else as an HTML block.
+        def got(text, rel="README.md"):
+            return [p[len("unsupported markdown construct: "):] for p in grammar_problems(rel, text)]
+        self.assertEqual(got("---\nlayout: a\tb\n---\n# T"),
+                         ["tab outside a fence at README.md:2"])
+        self.assertEqual(got("---\nlayout: a b\n---\n# T\n\n```\na\tb\n```"), [])
+        self.assertEqual(got("<!-- note -->\n\nx"), [])
+        for text in ("<!-- a\nb -->", "<!-- a --> text", "<!-- a <!-- b -->", "<!-- a --> <!-- b -->", "<!-->",
+                     "<!-- a --->", "<!-- a -- b -->", "<!-- a --> "):
+            self.assertTrue(got(text), text)
+            self.assertIn("HTML block", got(text)[0], text)
+
+    def test_grammar_rules_3_and_5_match_the_readme_8262(self):
+        # Round 19 (code r15 LOW-5, INFO-1): the README and the docstring state rules 3 and 5 alike, and
+        # the rule 5 code points are the ones the code refuses.
+        doc = " ".join((__doc__ or "").split()) + " "
+        readme = " ".join(_read("scripts/ci/tests/data/README.md").split()) + " "
+        for num, nxt in ((3, 4), (5, 6)):
+            want = re.search(r" %d\. (.*?) %d\. " % (num, nxt), doc)
+            have = re.search(r" %d\. (.*?) %d\. " % (num, nxt), readme)
+            self.assertTrue(want and have, num)
+            self.assertEqual(want.group(1), have.group(1), "rule %d differs" % num)
+        points = set()
+        for text in (doc, readme):
+            m = re.search(r" 5\. (.*?) 6\. ", text).group(1)
+            found = set()
+            for lo, hi in re.findall(r"U\+([0-9A-F]{4})(?:-U\+([0-9A-F]{4}))?", m):
+                found.update(range(int(lo, 16), int(hi or lo, 16) + 1))
+            found.add(0xA0)
+            points.add(frozenset(found))
+        self.assertEqual(points, {frozenset(ord(c) for c in _G_NONASCII_WS)})
+
+    def test_lexer_is_linear_on_single_line_marker_runs_8262(self):
+        # Round 19 (code r15 INFO-2): a single line of nested list or quote markers was quadratic in
+        # _lex() (a thematic-break match and a slice of the rest of the line per marker). Each row stays
+        # under a 2 s ceiling; the unit text is unchanged.
+        import time
+        rows = (("- " * 5000 + "x"), ("> " * 5000 + "x"), ("1. " * 3400 + "x"), ("- " * 100000 + "x"),
+                ("- * " * 50000 + "x"), ("- " * 100000), ("* " * 100000 + "-"))
+        for text in rows:
+            start = time.perf_counter()
+            gated_units(text)
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 2.0, "%d chars took %.2f s" % (len(text), elapsed))
+        self.assertEqual(gated_units("- - x\n"), [])
 
     def test_trust_peer_identifier_forms_8262(self):
         # Round 18 (code r14 LOW-1): the short trust-peer token in identifier form is a mention
