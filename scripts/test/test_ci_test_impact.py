@@ -34,7 +34,7 @@ class TestCiTestImpact(unittest.TestCase):
         self.run_command("git", "init", "-q")
         # Token overlap would miss this explicitly named acceptance target.
         self.commit({
-            ".gitignore": "output\nci-test-impact.out\n",
+            ".gitignore": "output\noutput-impact\nci-test-impact.out\nci-test-impact.log\ncargo-skip.out\nimpact-trusted/\n",
             "Cargo.toml": '[[test]]\nname = "acceptance_nhi_sqlite"\n'
                           'path = "tests/acceptance/acceptance_nhi_sqlite.rs"\n',
             "tests/acceptance/acceptance_nhi_sqlite.rs": "// fixture\n",
@@ -153,23 +153,42 @@ class TestCiTestImpact(unittest.TestCase):
         self.assertEqual(result["docs_only"], "false")
         self.assertEqual(result["test_impact"], "cli_subcommand_count_invariant")
 
-    def classify(self, previous):
-        (self.repo / "output").unlink(missing_ok=True)
+    def step_body(self, step_id):
+        """Return the dedented run body of a classify-job step of ci.yml."""
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        step = workflow.split("      - id: cls\n", 1)[1]
+        step = workflow.split("      - id: %s\n" % step_id, 1)[1]
         body = step.split("        run: |\n", 1)[1]
         lines = []
         for line in body.splitlines():
             if line and not line.startswith("          "):
                 break
             lines.append(line[10:])
-        self.assertTrue(lines, "classifier extraction must not be vacuous")
-        self.run_command("bash", "-e", "-o", "pipefail", "-c", "\n".join(lines), env={
+        self.assertTrue(lines, "%s extraction must not be vacuous" % step_id)
+        return "\n".join(lines)
+
+    @staticmethod
+    def parse(path):
+        return dict(line.split("=", 1) for line in path.read_text().splitlines())
+
+    def classify(self, previous):
+        """Run the cls step, then the impact step it feeds (#8328 round 3)."""
+        (self.repo / "output").unlink(missing_ok=True)
+        (self.repo / "output-impact").unlink(missing_ok=True)
+        self.run_command("bash", "-e", "-o", "pipefail", "-c", self.step_body("cls"), env={
             **self.env, "EVENT_NAME": "pull_request", "PR_ACTION": "synchronize",
             "PR_BEFORE": previous, "PR_BASE_SHA": self.base,
             "RUNNER_TEMP": str(self.repo),
         })
-        return dict(line.split("=", 1) for line in (self.repo / "output").read_text().splitlines())
+        verdict = self.parse(self.repo / "output")
+        self.assertNotIn("test_impact", verdict, "cls must not emit selector keys")
+        self.run_command("bash", "-e", "-o", "pipefail", "-c", self.step_body("impact"), env={
+            **self.env, "GITHUB_OUTPUT": str(self.repo / "output-impact"),
+            "CLS_BASE": verdict.get("cls_base", ""), "IMPACT_BASE": verdict.get("impact_base", ""),
+            "DOCS_ONLY": verdict["docs_only"],
+            "IMPACT_FORCED_REASON": verdict.get("impact_forced_reason", ""),
+            "RUNNER_TEMP": str(self.repo),
+        })
+        return {**verdict, **self.parse(self.repo / "output-impact")}
 
 
 if __name__ == "__main__":

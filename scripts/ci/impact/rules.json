@@ -22,7 +22,8 @@
       "**/Cargo.toml", "**/Cargo.lock", "**/build.rs", "**/rust-toolchain*", "**/deny.toml",
       ".github/**", "**/Dockerfile*", "**/*.sh", "scripts/*.py", "scripts/qc-allowlists/**",
       "scripts/test/**", "scripts/ci/*", "scripts/ci/impact/**",
-      "scripts/ci/tests/test_pg_isolated_binary.py"
+      "scripts/ci/tests/test_pg_isolated_binary.py",
+      "scripts/ci/tests/test_retired_alias_walk_3627.py"
     ],
     "ci_tree_globs": [".github/**", "scripts/ci/**"],
     "ci_tree_exempt_globs": ["scripts/ci/tests/**"],
@@ -33,7 +34,7 @@
       {
         "rust": "tests/issue_3627_retired_llm_alias.rs",
         "guard": "scripts/ci/tests/test_retired_alias_walk_3627.py",
-        "roots": ["docs", "scripts/ci/tests", "changelog.d"]
+        "roots": ["src", "tools", "tests", "scripts", "docs", "changelog.d"]
       }
     ],
     "test_read_globs": [

@@ -14,6 +14,16 @@ Findings covered (REVIEW-8328-code-r1 F1/F2, REVIEW-8328-security-r1 F1/F2):
 4. Forced full runs: a push event and a protected base ref force false.
 5. Rules shape: a null or wrong-shaped rules.json exits 1 with a message.
 6. Rule b3 no longer accepts cargo_skip_reason as a guard.
+
+Round 3 (REVIEW-8328-code-r2 F1/F2/F3, REVIEW-8328-security-r2 F1/F2, #8338):
+
+7. The cls step runs no workspace command and appends no PR-produced file to
+   its output file; the PR-tree selector runs in the separate `impact` step with
+   its own output file, copies only allow-listed lines, and degrades to the
+   full selection on anything else (a multi-line value opener included).
+8. The trust block never reads a workspace copy of the classifier, not even as
+   a fallback.
+9. Every walk guard is unskippable; the mirror roots equal the Rust roots.
 """
 import json
 import os
@@ -44,6 +54,7 @@ JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 STEP_HEADER = re.compile(r"^      - ")
 RUN_HEADER = re.compile(r"^        run: \|\s*$")
 TIMEOUT_S = 120
+RUN_INDENT = 10
 
 
 def job_lines(path: Path, job: str):
@@ -77,18 +88,45 @@ def step_run_body(lines, start):
             in_run = True
             continue
         if in_run:
+            if line.strip() and not line.startswith(" " * RUN_INDENT):
+                break  # a step-level comment or key ends the block scalar
             body.append(line)
     return "\n".join(body)
 
 
-def cls_step(path: Path):
-    """Return (steps, index of the cls step, its run body) for the classify job."""
+def step_by_id(path: Path, step_id: str):
+    """Return (steps, index of the step, its run body) for a classify-job step."""
     lines = job_lines(path, "classify")
     steps = step_starts(lines)
     for pos, (index, first) in enumerate(steps):
-        if first == "- id: cls":
+        if first == "- id: %s" % step_id:
             return steps, pos, step_run_body(lines, index)
-    raise AssertionError("no cls step in the classify job of %s" % path.name)
+    raise AssertionError("no %s step in the classify job of %s" % (step_id, path.name))
+
+
+def cls_step(path: Path):
+    """Return (steps, index of the cls step, its run body) for the classify job."""
+    return step_by_id(path, "cls")
+
+
+def code_lines(body: str):
+    """Return the non-comment, non-blank lines of a run body."""
+    return [line for line in body.splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def trust_block(body: str) -> str:
+    """Return the cls lines from the trust directory setup to the verdict case."""
+    start = body.index("trust_dir=")
+    end = body.index('case "$docs_only$cargo_skip" in')
+    return body[start:end]
+
+
+# Forms of the scripts/ci/impact path the trust block may contain: the
+# merge-base tree read, and the scratch directory the extract lands in.
+TRUST_PATH_FORMS = ('"${trust_ref}:scripts/ci/impact/${trust_file}"',
+                    'trust_impact="$trust_dir/scripts/ci/impact"',
+                    '"$trust_dir/scripts/ci/impact"')
 
 
 def scratch_dir() -> Path:
@@ -140,14 +178,31 @@ class TrustRootWorkflow(unittest.TestCase):
         self.assertNotIn("--rules scripts/ci/impact/rules.json", body)
         self.assertNotRegex(body, r"python3?\s+(-I\s+)?scripts/ci/impact/")
 
-    def test_verdict_lines_are_the_last_writes_of_the_step(self):
+    def test_trust_block_has_no_workspace_impact_path_at_all(self):
+        """REVIEW-8328-code-r2 F2: not even a silent fallback to the workspace copy."""
+        block = trust_block(cls_step(CI_YML)[2])
+        residue = "\n".join(code_lines(block))
+        for form in TRUST_PATH_FORMS:
+            residue = residue.replace(form, "")
+        self.assertNotIn("scripts/ci/impact", residue,
+                         "the trust block names a workspace classifier path")
+        for token in ("$GITHUB_WORKSPACE", "./scripts", "cp ", "ln ", "source ", "mv "):
+            self.assertNotIn(token, residue, "trust block uses %r" % token)
+
+    def test_base_tree_extract_failure_only_marks_untrusted(self):
+        block = trust_block(cls_step(CI_YML)[2])
+        shows = [line for line in block.splitlines() if "git show" in line]
+        self.assertEqual(len(shows), 1, shows)
+        self.assertTrue(shows[0].rstrip().endswith("|| trusted=false"),
+                        "a failed extract must only mark the classifier untrusted: %s" % shows[0])
+        self.assertIn('if [ "$trusted" != "true" ]; then', block)
+        self.assertIn("trusted-classifier-missing-in-base-fail-closed", block)
+
+    def test_verdict_lines_are_written_once_by_the_cls_step(self):
         _, _, body = cls_step(CI_YML)
-        last_impact = body.rindex("ci-test-impact.sh")
         for key in ("docs_only", "cargo_skip", "cargo_skip_reason"):
             marker = 'echo "%s=$%s" >> "$GITHUB_OUTPUT"' % (key, key)
             self.assertEqual(body.count(marker), 1, key)
-            self.assertGreater(body.index(marker), last_impact,
-                               "%s must be written after the PR-tree command ran" % key)
 
     def test_ci_tree_edit_is_checked_in_the_workflow(self):
         _, _, body = cls_step(CI_YML)
@@ -160,6 +215,147 @@ class TrustRootWorkflow(unittest.TestCase):
         self.assertIn("python3 -I \"$trust_impact/cargo_skip.py\"", body)
         self.assertNotIn("grep -qvE '^(docs/|.*\\.md$)'", body)
         self.assertNotRegex(body, r"python3?\s+(-I\s+)?scripts/ci/impact/")
+
+
+class ClsStepRunsNoWorkspaceCommand(unittest.TestCase):
+    """Round 3 F1 (#8338 class): nothing PR-produced reaches the verdict file."""
+
+    ALLOWED_PATH_TEXT = ("'^(\\.github/|scripts/ci/)'", "'^scripts/ci/tests/'")
+
+    def test_cls_body_names_no_workspace_path(self):
+        _, _, body = cls_step(CI_YML)
+        residue = "\n".join(code_lines(body))
+        for form in TRUST_PATH_FORMS + self.ALLOWED_PATH_TEXT:
+            residue = residue.replace(form, "")
+        self.assertNotIn("scripts/", residue, "cls names a workspace path outside the trust block")
+        for token in ("ci-test-impact", "chmod", "$GITHUB_WORKSPACE", "./scripts"):
+            self.assertNotIn(token, body, "cls must not run or touch %s" % token)
+
+    def test_cls_appends_no_produced_file_to_the_output(self):
+        _, _, body = cls_step(CI_YML)
+        writers = [line for line in code_lines(body) if "GITHUB_OUTPUT" in line]
+        self.assertTrue(writers)
+        plain = re.compile(r'^\s*echo "[a-z_]+=[^"]*" >> "\$GITHUB_OUTPUT"$')
+        for line in writers:
+            self.assertRegex(line, plain, "cls writes the output file only with a plain echo")
+        self.assertNotRegex(body, r"\b(cat|tee|cp|sed|awk)\b[^\n]*GITHUB_OUTPUT")
+        self.assertNotIn("GITHUB_OUTPUT=", body)
+
+    def test_cls_emits_no_test_impact_key(self):
+        _, _, body = cls_step(CI_YML)
+        self.assertNotIn("test_impact=", body)
+        self.assertNotRegex(body, r"echo \"test_impact")
+
+    def test_impact_step_follows_cls_and_owns_the_test_impact_outputs(self):
+        steps, cls_pos, _ = cls_step(CI_YML)
+        _, impact_pos, body = step_by_id(CI_YML, "impact")
+        self.assertEqual(impact_pos, cls_pos + 1)
+        self.assertIn("scripts/ci-test-impact.sh", body)
+        text = CI_YML.read_text()
+        for key in ("test_impact", "test_impact_count", "test_impact_total", "test_impact_reason"):
+            self.assertIn("      %s: ${{ steps.impact.outputs.%s }}" % (key, key), text)
+            self.assertNotIn("steps.cls.outputs.%s }}" % key, text)
+
+    def test_impact_step_copies_only_allow_listed_lines(self):
+        _, _, body = step_by_id(CI_YML, "impact")
+        self.assertIn("allow_re=", body)
+        self.assertIn("test_impact|test_impact_count|test_impact_total", body)
+        self.assertIn("impact-output-rejected-fail-closed", body)
+        self.assertEqual(body.count('cat "$impact_out" >> "$GITHUB_OUTPUT"'), 1)
+
+
+class ImpactStepOutputAllowList(unittest.TestCase):
+    """Run the real `impact` step body against hostile selector output (#8338 class)."""
+
+    OPENER = "<" + "<"
+    SELECTED = ["test_impact=alpha_test beta_test", "test_impact_count=2",
+                "test_impact_total=40", "test_impact_reason=impact-selected:2/40 (95%-skip)"]
+
+    def run_step(self, selector_lines, docs_only="false", forced="", rc=0):
+        """Run the step in a scratch repo; return (outputs dict, selector ran)."""
+        work = scratch_dir()
+        try:
+            (work / "scripts").mkdir()
+            script = work / "scripts" / "ci-test-impact.sh"
+            ran = work / "selector-ran"
+            body = ['#!/usr/bin/env bash', 'touch "%s"' % ran]
+            body += ["printf '%%s\\n' '%s' >> \"$GITHUB_OUTPUT\"" % line for line in selector_lines]
+            body += ['exit %d' % rc]
+            script.write_text("\n".join(body) + "\n")
+            out = work / "step-output"
+            out.write_text("")
+            env = dict(os.environ, GITHUB_OUTPUT=str(out), RUNNER_TEMP=str(work),
+                       CLS_BASE="base", IMPACT_BASE="base", DOCS_ONLY=docs_only,
+                       IMPACT_FORCED_REASON=forced)
+            res = subprocess.run(["bash", "-e", "-c", step_by_id(CI_YML, "impact")[2]],
+                                 cwd=str(work), env=env, capture_output=True, text=True,
+                                 timeout=TIMEOUT_S)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            values = {}
+            for line in out.read_text().splitlines():
+                key, _, value = line.partition("=")
+                values[key] = value
+            return values, ran.exists(), res.stdout
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
+
+    def assert_degraded(self, values, reason):
+        self.assertEqual(values["test_impact"], "__ALL__")
+        self.assertEqual(values["test_impact_count"], "ALL")
+        self.assertEqual(values["test_impact_total"], "ALL")
+        self.assertEqual(values["test_impact_reason"], reason)
+
+    def test_well_formed_selection_passes_through(self):
+        values, ran, _ = self.run_step(self.SELECTED)
+        self.assertTrue(ran)
+        self.assertEqual(values["test_impact"], "alpha_test beta_test")
+        self.assertEqual(values["test_impact_reason"], "impact-selected:2/40 (95%-skip)")
+
+    def test_multiline_value_opener_degrades_to_all(self):
+        for opener in ("test_impact" + self.OPENER + "EOF", "x" + self.OPENER + "docs_only=true",
+                       "test_impact_reason" + self.OPENER + "cargo_skip=true"):
+            values, ran, _ = self.run_step(self.SELECTED + [opener])
+            self.assertTrue(ran)
+            self.assert_degraded(values, "impact-output-rejected-fail-closed")
+            self.assertNotIn("docs_only", values)
+            self.assertNotIn("cargo_skip", values)
+
+    def test_foreign_key_and_blank_line_degrade_to_all(self):
+        for extra in ("docs_only=true", "cargo_skip=true", "PATH=/x", ""):
+            values, _, _ = self.run_step(self.SELECTED + [extra])
+            self.assert_degraded(values, "impact-output-rejected-fail-closed")
+            self.assertNotIn("docs_only", values)
+
+    def test_disallowed_value_character_degrades_to_all(self):
+        values, _, _ = self.run_step(["test_impact=a;b"] + self.SELECTED[1:])
+        self.assert_degraded(values, "impact-output-rejected-fail-closed")
+
+    def test_missing_or_duplicate_key_degrades_to_all(self):
+        values, _, _ = self.run_step(self.SELECTED[:3])
+        self.assert_degraded(values, "impact-output-rejected-fail-closed")
+        values, _, _ = self.run_step(self.SELECTED + ["test_impact=__SKIP__"])
+        self.assert_degraded(values, "impact-output-rejected-fail-closed")
+
+    def test_skip_is_honoured_only_when_docs_only(self):
+        skip = ["test_impact=__SKIP__", "test_impact_count=0", "test_impact_total=0",
+                "test_impact_reason=docs-only"]
+        values, _, _ = self.run_step(skip, docs_only="false")
+        self.assert_degraded(values, "impact-skip-overridden-not-docs-only")
+        values, _, _ = self.run_step(skip, docs_only="true")
+        self.assertEqual(values["test_impact"], "__SKIP__")
+
+    def test_selector_failure_degrades_to_all(self):
+        values, _, _ = self.run_step(self.SELECTED, rc=3)
+        self.assert_degraded(values, "impact-selector-failed-fail-closed")
+
+    def test_early_exit_reason_runs_no_selector(self):
+        values, ran, _ = self.run_step(self.SELECTED, forced="empty-diff-fail-closed")
+        self.assertFalse(ran, "a forced full selection must not run the PR-tree selector")
+        self.assert_degraded(values, "empty-diff-fail-closed")
+
+    def test_selector_stdout_cannot_inject_a_workflow_command(self):
+        _, _, stdout = self.run_step(self.SELECTED + ["::set-output name=x::y"])
+        self.assertNotIn("\n::set-output", "\n" + stdout)
 
 
 class NoWorkspaceFirstOnSysPath(unittest.TestCase):
@@ -309,6 +505,35 @@ class RustScannerWalks(unittest.TestCase):
         leaked = sorted(p for p in refs if cargo_skip.is_skippable(self.section, p))
         self.assertEqual(leaked, [], "skippable paths a Rust file or step reads: %s" % leaked[:20])
 
+    def test_every_walk_guard_is_unskippable(self):
+        """REVIEW-8328-code-r2 F3: the stand-in for a skipped Rust test is never skipped."""
+        guards = cargo_skip.guard_paths(self.section)
+        self.assertTrue(guards)
+        for guard in guards:
+            self.assertIn(guard, self.section["never_skip_globs"], guard)
+            self.assertFalse(cargo_skip.is_skippable(self.section, guard), guard)
+            got = cargo_skip.classify(self.section, [guard])
+            self.assertEqual((got["docs_only"], got["cargo_skip"]), ("false", "false"), guard)
+            got = cargo_skip.classify(self.section, [guard, "docs/ADMIN_GUIDE.md"])
+            self.assertEqual((got["docs_only"], got["cargo_skip"]), ("false", "false"), guard)
+
+    def test_a_derived_guard_is_unskippable_even_when_unlisted(self):
+        section = json.loads(json.dumps(self.section))
+        section["never_skip_globs"] = [g for g in section["never_skip_globs"]
+                                       if "retired_alias" not in g]
+        guard = section["walk_guards"][0]["guard"]
+        self.assertTrue(cargo_skip.blocked(section, guard))
+        self.assertFalse(cargo_skip.is_skippable(section, guard))
+
+    def test_mirror_roots_cover_every_rust_root_for_skippable_notes(self):
+        rust = (REPO / "tests" / "issue_3627_retired_llm_alias.rs").read_text()
+        match = re.search(r"const SCANNED_ROOTS:[^=]*=\s*(.*?);\n", rust, re.S)
+        rust_roots = re.findall(r'"([^"]+)"', match.group(1))
+        mirrored = self.section["walk_guards"][0]["roots"]
+        self.assertEqual(sorted(mirrored), sorted(rust_roots))
+        for note in ("tools/x.md", "scripts/x.md"):
+            self.assertTrue(read_set.under_any(note, mirrored), note)
+
     def test_conformance_tree_is_not_skippable(self):
         self.assertFalse(cargo_skip.is_skippable(self.section, "conformance/ROSETTA.md"))
 
@@ -322,10 +547,12 @@ class ForcedFullRuns(unittest.TestCase):
         cls.tests_only = ["scripts/ci/tests/test_x.py"]
 
     def test_push_event_forces_false(self):
-        for event in ("push", "merge_group"):
+        labels = {"push": cargo_skip.REASON_EVENT, "merge_group": cargo_skip.REASON_MERGE_GROUP}
+        for event, label in labels.items():
             got = cargo_skip.classify(self.section, ["docs/ADMIN_GUIDE.md"], event, "")
             self.assertEqual((got["docs_only"], got["cargo_skip"]), ("false", "false"), event)
-            self.assertIn(cargo_skip.REASON_EVENT, got["cargo_skip_reason"])
+            self.assertIn(label, got["cargo_skip_reason"])
+        self.assertNotEqual(cargo_skip.REASON_EVENT, cargo_skip.REASON_MERGE_GROUP)
 
     def test_protected_base_ref_forces_false(self):
         for base in ("release/v1.0.0", "release/v2", "main", "develop"):

@@ -42,6 +42,7 @@ REASON_DOCS = "docs-only"
 REASON_TESTS = "no-rust-observable-paths"
 REASON_RUST = "rust-observable-path"
 REASON_EVENT = "push-event-full-ci"
+REASON_MERGE_GROUP = "merge-group-full-ci"
 REASON_BASE = "protected-base-full-ci"
 REASON_CI_TREE = "ci-tree-edited-full-ci"
 GLOB_LISTS = ("skip_globs", "docs_globs", "never_skip_globs", "test_read_globs",
@@ -71,10 +72,21 @@ def matches_any(globs: Iterable[str], path: str) -> bool:
     return any(common.match_glob(glob, path) for glob in globs)
 
 
+def guard_paths(section: dict) -> List[str]:
+    """Return the walk-guard test paths: the files that stand in for a skipped Rust test."""
+    return [guard["guard"] for guard in section["walk_guards"]]
+
+
 def blocked(section: dict, path: str) -> bool:
-    """Return True when `path` can never be skipped (never-skip or test-read)."""
+    """Return True when `path` can never be skipped (never-skip, test-read or a walk guard).
+
+    A walk guard is derived here as well as listed in never_skip_globs: the
+    file that replaces a skipped Rust test must never be skippable itself
+    (REVIEW-8328-code-r2 F3).
+    """
     return (matches_any(section["never_skip_globs"], path)
-            or matches_any(section["test_read_globs"], path))
+            or matches_any(section["test_read_globs"], path)
+            or path in guard_paths(section))
 
 
 def is_doc(section: dict, path: str) -> bool:
@@ -95,7 +107,7 @@ def full_ci_reason(section: dict, event_name: str, base_ref: str) -> Optional[st
     point 7; code review r1 F2, #8328).
     """
     if event_name in section["full_ci_events"]:
-        return REASON_EVENT
+        return REASON_MERGE_GROUP if event_name == "merge_group" else REASON_EVENT
     if base_ref and (base_ref in section["full_ci_base_names"]
                      or any(base_ref.startswith(p)
                             for p in section["full_ci_base_prefixes"])):

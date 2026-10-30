@@ -534,10 +534,10 @@ jobs:
       # The consumer ALWAYS runs `cargo test --lib` regardless of this
       # value; impact selection optimises only the slow tests/*.rs
       # integration binaries (~5-15s setup per binary).
-      test_impact: ${{ steps.cls.outputs.test_impact }}
-      test_impact_count: ${{ steps.cls.outputs.test_impact_count }}
-      test_impact_total: ${{ steps.cls.outputs.test_impact_total }}
-      test_impact_reason: ${{ steps.cls.outputs.test_impact_reason }}
+      test_impact: ${{ steps.impact.outputs.test_impact }}
+      test_impact_count: ${{ steps.impact.outputs.test_impact_count }}
+      test_impact_total: ${{ steps.impact.outputs.test_impact_total }}
+      test_impact_reason: ${{ steps.impact.outputs.test_impact_reason }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { persist-credentials: false, fetch-depth: 2 }
@@ -597,10 +597,7 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip_reason=merge-group-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=merge_group-full-pipeline" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=merge_group-full-pipeline" >> "$GITHUB_OUTPUT"
             echo "::notice::merge_group event — running the full pipeline (not docs-only)"
             exit 0
           fi
@@ -624,10 +621,7 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip_reason=base-unresolvable-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=base-unreachable" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=base-unreachable" >> "$GITHUB_OUTPUT"
             echo "::notice::cannot resolve classification base commit ($cls_base) — running full pipeline"
             exit 0
           fi
@@ -650,10 +644,7 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip_reason=base-fetch-failed-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=base-fetch-failed" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=base-fetch-failed" >> "$GITHUB_OUTPUT"
             echo "::notice::cannot fetch classification base tree ($cls_base) after retry — running full pipeline"
             exit 0
           fi
@@ -677,10 +668,7 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
             echo "cargo_skip_reason=empty-diff-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=empty-diff-fail-closed" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=empty-diff-fail-closed" >> "$GITHUB_OUTPUT"
             echo "::notice::no net diff vs classification base — failing CLOSED (full pipeline), NOT docs-only"
             exit 0
           fi
@@ -696,8 +684,8 @@ jobs:
           # edit, shadow or pre-empt its own judgement. When the base tree has no
           # classifier yet, both verdicts fail CLOSED (false). Any change under
           # .github/ or scripts/ci/ (outside scripts/ci/tests/) is a full run.
-          # The verdict lines are written at the END of this step, after the only
-          # PR-tree command it runs (scripts/ci-test-impact.sh).
+          # This step runs no workspace command at all (round 3): the selector
+          # that executes PR-tree code is the separate `impact` step below.
           docs_only=false
           cargo_skip=false
           cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
@@ -734,19 +722,55 @@ jobs:
           echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
           echo "$changed"
 
-          # v0.7.0 Task #12 (#1399) — compute test-impact set.
-          # Always runs; the consumer steps decide whether to honor
-          # the output based on docs_only. The script is self-contained
-          # POSIX-compatible bash; full discipline + foundational list
-          # documented inline in scripts/ci-test-impact.sh.
-          # Token SELECTION uses $impact_base (may be the incremental
-          # previous head). The foundational safety check uses $cls_base
-          # so a follow-up commit cannot hide an earlier security change.
+          # #8328 round 3 (REVIEW-8328-code-r2 F1, REVIEW-8328-security-r2 F1,
+          # #8338): this step runs NO command from the workspace, so nothing a
+          # PR tree contains can reach the file that carries these verdicts.
+          # The test-impact selector (a PR-tree script) runs in the next step,
+          # `impact`, with its own output file; the two bases are handed over
+          # as step outputs because the selection base is resolved here.
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "cargo_skip=$cargo_skip" >> "$GITHUB_OUTPUT"
+          echo "cargo_skip_reason=$cargo_skip_reason" >> "$GITHUB_OUTPUT"
+          echo "cls_base=$cls_base" >> "$GITHUB_OUTPUT"
+          echo "impact_base=$impact_base" >> "$GITHUB_OUTPUT"
+      # v0.7.0 Task #12 (#1399) - compute the test-impact set. Always runs; the
+      # consumer steps decide whether to honour the output based on docs_only.
+      # scripts/ci-test-impact.sh is self-contained bash; its discipline and the
+      # foundational list are documented inline there. Token SELECTION uses the
+      # impact base (may be the incremental previous head). The foundational
+      # safety check uses the classification base so a follow-up commit cannot
+      # hide an earlier security change.
+      #
+      # #8328 round 3: this is the ONLY step that runs the PR-tree selector, and
+      # it is separate from `cls` so the selector can never write, truncate or
+      # re-delimit the verdict file (workflow output-file injection, #8338). The
+      # selector writes to a scratch file; only allow-listed lines are copied to
+      # the real output, and anything else degrades to the full selection.
+      - id: impact
+        shell: bash
+        env:
+          CLS_BASE: ${{ steps.cls.outputs.cls_base }}
+          IMPACT_BASE: ${{ steps.cls.outputs.impact_base }}
+          DOCS_ONLY: ${{ steps.cls.outputs.docs_only }}
+          IMPACT_FORCED_REASON: ${{ steps.cls.outputs.impact_forced_reason }}
+        run: |
+          emit_all() {
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=$1" >> "$GITHUB_OUTPUT"
+          }
+          # An early exit of `cls` (merge_group, unresolvable base, empty diff)
+          # already decided: full selection, no PR-tree command.
+          if [ -n "$IMPACT_FORCED_REASON" ]; then
+            emit_all "$IMPACT_FORCED_REASON"
+            exit 0
+          fi
           chmod +x scripts/ci-test-impact.sh
           # SECOND-ORDER FAIL-OPEN, closed here (#2496). Splitting the two
           # bases is NECESSARY BUT NOT SUFFICIENT, and this was caught by
           # probing the fix's own CI run rather than by reading it. The
-          # `__SKIP__` sentinel is a DOCS-ONLY VERDICT — the consumer steps
+          # `__SKIP__` sentinel is a DOCS-ONLY VERDICT - the consumer steps
           # (`Run tests (impact-aware)` in `check`, `pg_test` in
           # `postgres-feature`) treat it as "no-op the test step". But
           # `ci-test-impact.sh` derives it from the INCREMENTAL base, so on a
@@ -754,34 +778,48 @@ jobs:
           # even with `docs_only=false`. Measured on this very fix's first
           # run (head 13f0b53d, a CHANGELOG-only last commit over 9 non-docs
           # files): every heavy gate correctly RAN, and `Check (macos-latest)`
-          # then logged `TEST_IMPACT: __SKIP__` / `docs-only diff — test step
-          # is a no-op` — compilation and clippy were restored while
+          # then logged `TEST_IMPACT: __SKIP__` / `docs-only diff - test step
+          # is a no-op` - compilation and clippy were restored while
           # `cargo test` still ran ZERO tests. So the impact lane carried its
           # own copy of the same fail-open one layer down.
           #
           # A verdict the classifier did not reach must never be inferred from
           # a narrower diff: `__SKIP__` is honoured ONLY when `docs_only` is
           # genuinely true, and otherwise degrades to `__ALL__` (run more, not
-          # fewer). The script is run with GITHUB_OUTPUT redirected to scratch
-          # so its emission is inspected BEFORE it can reach the real outputs
-          # — the guard is structural, not a hope that a later duplicate key
-          # wins.
+          # fewer). The selector runs with GITHUB_OUTPUT redirected to scratch
+          # so its emission is inspected BEFORE it can reach the real outputs.
+          # Its stdout is captured too (never streamed raw into the log, where a
+          # workflow command could be smuggled in).
           impact_out="${RUNNER_TEMP:-.}/ci-test-impact.out"
+          impact_log="${RUNNER_TEMP:-.}/ci-test-impact.log"
           : > "$impact_out"
-          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$impact_base" "HEAD" "$cls_base"
-          if [ "$docs_only" != "true" ] && grep -q '^test_impact=__SKIP__$' "$impact_out"; then
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=impact-skip-overridden-not-docs-only" >> "$GITHUB_OUTPUT"
-            echo "::notice::impact selection returned __SKIP__ from the incremental base ($impact_base) but the PR is NOT docs-only — overriding to __ALL__ (fail closed)"
+          : > "$impact_log"
+          selector_rc=0
+          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$IMPACT_BASE" "HEAD" "$CLS_BASE" > "$impact_log" 2>&1 || selector_rc=$?
+          sed 's/::/: :/g' "$impact_log" | head -n 200
+          # Allow-list: four keys, plain values. Any other line (a multi-line
+          # value opener, a blank line, a foreign key, a control character)
+          # makes the whole emission untrusted. The reason may also carry the
+          # parentheses and percent sign of the selector's own summary text.
+          allow_re='^(test_impact|test_impact_count|test_impact_total)=[A-Za-z0-9_.,:/ +-]*$|^test_impact_reason=[A-Za-z0-9_.,:/ ()%+-]*$'
+          stray_rc=0
+          grep -aEv "$allow_re" "$impact_out" > /dev/null || stray_rc=$?
+          keys_ok=true
+          for impact_key in test_impact test_impact_count test_impact_total test_impact_reason; do
+            [ "$(grep -ac "^${impact_key}=" "$impact_out")" = "1" ] || keys_ok=false
+          done
+          if [ "$selector_rc" != "0" ]; then
+            emit_all "impact-selector-failed-fail-closed"
+            echo "::notice::impact selector exited $selector_rc - full selection (fail closed)"
+          elif [ "$stray_rc" != "1" ] || [ "$keys_ok" != "true" ]; then
+            emit_all "impact-output-rejected-fail-closed"
+            echo "::notice::impact selector output failed the allow-list - full selection (fail closed)"
+          elif [ "$DOCS_ONLY" != "true" ] && grep -aq '^test_impact=__SKIP__$' "$impact_out"; then
+            emit_all "impact-skip-overridden-not-docs-only"
+            echo "::notice::impact selection returned __SKIP__ from the incremental base ($IMPACT_BASE) but the PR is NOT docs-only - overriding to __ALL__ (fail closed)"
           else
             cat "$impact_out" >> "$GITHUB_OUTPUT"
           fi
-          # #8328: written last, after every command that ran PR-tree code.
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          echo "cargo_skip=$cargo_skip" >> "$GITHUB_OUTPUT"
-          echo "cargo_skip_reason=$cargo_skip_reason" >> "$GITHUB_OUTPUT"
       - name: Test impact selector security fallbacks
         run: python3 scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)

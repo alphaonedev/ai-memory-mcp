@@ -120,6 +120,15 @@ class RetiredAliasWalk3627(unittest.TestCase):
                 "walk_guards root %s is not under a SCANNED_ROOTS entry of %s"
                 % (root, RUST_TEST))
 
+    def test_guarded_roots_equal_the_rust_roots(self):
+        """Reverse direction (REVIEW-8328-security-r2 F2): no Rust root is unmirrored.
+
+        A root the Rust walk reads but the mirror skips would let a skippable
+        file there (a note under tools/ or scripts/) bypass both walks.
+        """
+        self.assertEqual(sorted(self.roots), sorted(scanned_roots(self.text)),
+                         "rules.json walk_guards roots must equal SCANNED_ROOTS of %s" % RUST_TEST)
+
     def test_carve_outs_are_real_files(self):
         for rel in sorted(carve_outs(self.text)):
             self.assertTrue((REPO / rel).is_file(), "stale carve-out: %s" % rel)

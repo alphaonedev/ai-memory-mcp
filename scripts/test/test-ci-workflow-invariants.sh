@@ -65,9 +65,9 @@ bad()  { printf '  FAIL  %s\n         %s\n' "$1" "$2" >&2; FAIL=$((FAIL + 1)); }
 # Pull the `run: |` body of the `classify` job's `- id: cls` step, dedented.
 # Fails loudly if the step cannot be located — an extraction that silently
 # returns nothing would make every assertion below vacuous.
-extract_cls() {
-    awk '
-      /^      - id: cls$/ { instep = 1; next }
+extract_step() {
+    awk -v id="$2" '
+      $0 == "      - id: " id { instep = 1; next }
       instep && /^        run: \|$/ { inrun = 1; next }
       inrun {
         if ($0 == "") { print ""; next }
@@ -76,6 +76,7 @@ extract_cls() {
       }
     ' "$1"
 }
+extract_cls() { extract_step "$1" cls; }
 
 # ---------------------------------------------------------------------------
 # Fixture builder. Creates a repo whose history is:
@@ -118,13 +119,17 @@ build_fixture() {
         cat > scripts/ci-test-impact.sh <<'STUB'
 #!/usr/bin/env bash
 echo "impact_base_received=$1"
-echo "impact_base_received=$1" >> "$GITHUB_OUTPUT"
+echo "$1" > .impact_base_received
 inc="$(git diff --name-only "$1" HEAD)"
 if [ -n "$inc" ] && ! printf '%s\n' "$inc" | grep -qvE '^(docs/|.*\.md$)'; then
   echo "test_impact=__SKIP__" >> "$GITHUB_OUTPUT"
+  echo "test_impact_count=0" >> "$GITHUB_OUTPUT"
+  echo "test_impact_total=0" >> "$GITHUB_OUTPUT"
   echo "test_impact_reason=docs-only" >> "$GITHUB_OUTPUT"
 else
   echo "test_impact=__STUB__" >> "$GITHUB_OUTPUT"
+  echo "test_impact_count=1" >> "$GITHUB_OUTPUT"
+  echo "test_impact_total=1" >> "$GITHUB_OUTPUT"
   echo "test_impact_reason=stub" >> "$GITHUB_OUTPUT"
 fi
 STUB
@@ -160,13 +165,35 @@ STUB
 # any same-named key a sub-script merely echoed to the log. Stdout is included
 # because the impact script reports there too, and the second-order guard
 # deliberately does NOT forward its scratch keys to the real outputs.
+#
+# Round 3 (#8328, #8338): the test-impact selector runs in its own `impact`
+# step with its own output file. When IMPACT_BLOCK names that step body, it is
+# run after the cls block with the cls step outputs as its env (as the workflow
+# wires them), and its output file is printed after the cls one. A frozen
+# historical block is run with IMPACT_BLOCK empty.
 run_cls() {
     local dir="$1" block="$2"; shift 2
     (
         cd "$dir"
         : > .gh_output
+        rm -f .impact_base_received
         env GITHUB_OUTPUT="$PWD/.gh_output" "$@" bash "$block" 2>/dev/null || true
         cat .gh_output
+        if [ -n "${IMPACT_BLOCK:-}" ]; then
+            local cls_out
+            cls_out="$(cat .gh_output)"
+            : > .gh_output_impact
+            env GITHUB_OUTPUT="$PWD/.gh_output_impact" \
+                CLS_BASE="$(getout "$cls_out" cls_base)" \
+                IMPACT_BASE="$(getout "$cls_out" impact_base)" \
+                DOCS_ONLY="$(getout "$cls_out" docs_only)" \
+                IMPACT_FORCED_REASON="$(getout "$cls_out" impact_forced_reason)" \
+                bash -e "$IMPACT_BLOCK" > /dev/null 2>&1 || true
+            cat .gh_output_impact
+            if [ -f .impact_base_received ]; then
+                echo "impact_base_received=$(cat .impact_base_received)"
+            fi
+        fi
     )
 }
 
@@ -177,6 +204,12 @@ trap 'rm -rf "$SCRATCH"' EXIT
 
 BLOCK="$SCRATCH/cls-fixed.sh"
 extract_cls "$CI_YML" > "$BLOCK"
+IMPACT_BLOCK="$SCRATCH/impact-fixed.sh"
+extract_step "$CI_YML" impact > "$IMPACT_BLOCK"
+if ! grep -q 'allow_re=' "$IMPACT_BLOCK"; then
+    echo "EXTRACTION FAILED: could not find the impact step block in $CI_YML" >&2
+    exit 2
+fi
 if ! grep -q 'cls_base' "$BLOCK"; then
     echo "EXTRACTION FAILED: could not find the two-base classifier block in $CI_YML" >&2
     echo "(the test harness is broken, not the workflow — fix extract_cls)" >&2
@@ -381,6 +414,49 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BA
     && ok "s17 a base tree without the classifier fails closed (trusted-classifier-missing-in-base)" \
     || bad "s17 missing base classifier must fail closed" "cargo_skip=$(getout "$OUT" cargo_skip) reason=$(getout "$OUT" cargo_skip_reason)"
 
+# s17b (REVIEW-8328-code-r2 F2): a base WITHOUT the classifier, a PR tree WITH one.
+# The workspace copy must never stand in for the missing base-tree copy.
+F="$SCRATCH/s17b"; build_fixture "$F" docs citests
+S17B_DONOR="$(git -C "$F" rev-parse HEAD)"
+git -C "$F" rm -q -r scripts/ci/impact >/dev/null 2>&1
+git -C "$F" commit -q -m "drop" >/dev/null 2>&1
+S17B_BASE="$(git -C "$F" rev-parse HEAD)"
+git -C "$F" checkout -q "$S17B_DONOR" -- scripts/ci/impact >/dev/null 2>&1
+echo "s17b doc" >> "$F/docs/a.md"
+git -C "$F" add -A >/dev/null 2>&1
+git -C "$F" commit -q -m "s17b pr: workspace has a classifier the base lacks" >/dev/null 2>&1
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$S17B_BASE" PR_BEFORE="")"
+[ -f "$F/scripts/ci/impact/cargo_skip.py" ] \
+    && [ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && [ "$(getout "$OUT" cargo_skip_reason)" = "trusted-classifier-missing-in-base-fail-closed cargo_skip-rules" ] \
+    && ok "s17b base lacks the classifier while the workspace has one: reason trusted-classifier-missing-in-base-fail-closed" \
+    || bad "s17b a workspace classifier must not replace a missing base-tree classifier" \
+           "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only) reason=$(getout "$OUT" cargo_skip_reason)"
+
+# s18 (#8338 class, REVIEW-8328-code-r2 F1): the two-step shape. The selector
+# script of the PR tree emits a multi-line value opener; the cls verdict is
+# written by a step that never ran it, so it stays authoritative, and the
+# selector output degrades to the full selection.
+F="$SCRATCH/s18"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "%s\n" "x<""<EOF" >> "$GITHUB_OUTPUT"' \
+    'printf "%s\n" "docs_only=true" "cargo_skip=true" >> "$GITHUB_OUTPUT"' > "$F/scripts/ci-test-impact.sh"
+git -C "$F" add -A >/dev/null 2>&1
+git -C "$F" commit -q -m "s18 selector edit" >/dev/null 2>&1
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" docs_only)" = "false" ] && [ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && [ "$(getout "$OUT" test_impact)" = "__ALL__" ] \
+    && [ "$(getout "$OUT" test_impact_reason)" = "impact-output-rejected-fail-closed" ] \
+    && ok "s18 a selector emitting a multi-line opener cannot change cls verdicts (false/false) and degrades to __ALL__" \
+    || bad "s18 hostile selector output must leave the verdicts and degrade" \
+           "docs_only=$(getout "$OUT" docs_only) cargo_skip=$(getout "$OUT" cargo_skip) impact=$(getout "$OUT" test_impact) reason=$(getout "$OUT" test_impact_reason)"
+CLS_ONLY="$(IMPACT_BLOCK= run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+case "$CLS_ONLY" in
+    *test_impact*) bad "s18 the cls step must not emit test_impact keys" "$(printf '%s' "$CLS_ONLY" | grep test_impact | head -1)" ;;
+    *) ok "s18 the cls step output carries no test_impact key (they come from the impact step)" ;;
+esac
+
 # --- Regression leg: the PRE-FIX block MUST mis-classify scenario 1. --------
 # Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP. A
 # regression leg that can quietly opt out is not evidence of anything.
@@ -392,12 +468,12 @@ elif ! grep -qE '^\s*base="\$PR_BEFORE"' "$BASELINE_FILE"; then
 else
     F="$SCRATCH/r1"; build_fixture "$F" code docs
     B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
-    OUT="$(run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+    OUT="$(IMPACT_BLOCK= run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
     [ "$(getout "$OUT" docs_only)" = "true" ] \
         && ok "regression: the frozen PRE-FIX block DOES mis-classify s1 as docs-only — the test is load-bearing" \
         || bad "regression leg did not reproduce the defect" \
                "got docs_only=$(getout "$OUT" docs_only) — extraction may be silently broken, making every assertion above vacuous"
-    OUT="$(run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$(git -C "$F" rev-parse HEAD)")"
+    OUT="$(IMPACT_BLOCK= run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$(git -C "$F" rev-parse HEAD)")"
     [ "$(getout "$OUT" docs_only)" = "true" ] \
         && ok "regression: the frozen PRE-FIX block ALSO classified an empty diff as docs-only" \
         || bad "regression: pre-fix empty-diff arm" "got docs_only=$(getout "$OUT" docs_only)"
