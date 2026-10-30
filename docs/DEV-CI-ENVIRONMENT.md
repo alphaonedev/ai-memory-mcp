@@ -174,7 +174,8 @@ cd pg-age-stack && docker compose up -d      # brings up the certified pg+AGE+pg
 # start/stop the native pg cluster (operator-local cluster name)
 sudo pg_ctlcluster 18 <cluster> start|stop|restart
 pg_lsclusters
-sudo -u postgres psql -p 5445 -d <test-db>    # local socket (trust)
+# connect over the local socket (trust auth):
+sudo -u postgres psql -p 5445 -d <test-db>
 # rebuild from scratch: operator-local linux-native-tier.sh
 ```
 
@@ -189,15 +190,42 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 **AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
 Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
 them (CI then fails with `extension "age" is not available`). A brew-independent
-copy now lives in `<pg-age-stack>/age-1.8.0/{share,lib}`. On the macos-fed node the
-"Configure enterprise-fed tier" step runs `scripts/ci/ensure-age-extension.py`
-before `CREATE EXTENSION`:
+copy now lives in `<pg-age-stack>/age-1.8.0-06ce678d/{share,lib}` (the suffix is the
+upstream apache/age commit the build carries; the build recipe, the pin rule and the
+tier restart are in `DEVELOPER_SETUP_NOTES.md`, "macos-fed AGE build", #8282). On the
+macos-fed node the "Configure enterprise-fed tier" step runs
+`scripts/ci/ensure-age-extension.py` before `CREATE EXTENSION`:
 
 - **Manifest.** It installs exactly five files, each pinned to a sha256 in the
   script's `MANIFEST`: `age.dylib` (into `pg_config --pkglibdir`) and
   `age.control`, `age--1.8.0.sql`, `age--1.7.0--1.8.0.sql`, `age--1.6.0--1.7.0.sql`
   (into `pg_config --sharedir`/extension). Nothing else in the source directory
-  is read or copied. Rebuilding AGE means updating those pins in the same change.
+  is read or copied. Rebuilding AGE means updating those pins in the same change,
+  and the `age.dylib` pin must never go back to the stock 1.8.0 bytes: the helper
+  installs whatever the pin names, so a stock pin reinstalls the apache/age#2580
+  lock leak over the patched library (that is how #8282 followed #7162).
+  `REFUSED_SHAS` names the stock dylib digest; an AGE rebuild adds the superseded
+  digest to it. Two cases, in the order the helper checks them: (1) an INSTALLED
+  file whose digest is refused is never healthy (`installed_ok`), so the helper
+  reinstalls it from the pinned source and exits 0; (2) a SOURCE file whose
+  digest is refused is rejected by name, `age source rejected: <path> refused:
+  stock apache/age 1.8.0 carries issue 2580 (issue 8282)`, exit 2, nothing
+  written, even when a `MANIFEST` pins it (`read_source`). A head whose helper
+  still pins stock exits 2 with nothing written: `age source incomplete: <path>
+  is missing` when its `DEFAULT_AGE_DIR` is the retired stock dir
+  (`load_sources`, before any pin is compared), or `age source rejected: <path>
+  does not match its pinned sha256` when it is the `06ce678d` dir whose source
+  holds the patched bytes (the pin comparison in `read_source`; `REFUSED_SHAS`
+  is consulted for source and installed digests, not for the pin).
+- **Fail closed (#8282).** The stock source directory on the macos-fed node was
+  retired on 2026-10-29 (renamed `age-1.8.0.retired-8282`; 3-agent vote
+  (6def5ab6) 3-0) after a job whose helper still pinned stock rewrote the stock
+  library onto disk 31 minutes after the patched install. A head whose helper
+  still pins stock exits 2 on that node and its `Check (macos-fed,enterprise-fed)`
+  row is red, attributed to issue 8282, until the head carries the new pin;
+  re-runs of older workflow runs keep their old merge sha and stay red by
+  design. Before and after any tier restart the installed `age.dylib` sha must
+  equal the pin (`DEVELOPER_SETUP_NOTES.md`, "macos-fed AGE build").
 - **Health check.** AGE counts as present only when `pg_available_extensions`
   lists `age` (that view reflects `age.control` alone) AND all five files are at
   their destinations as regular files with the pinned hashes, none of them group-
