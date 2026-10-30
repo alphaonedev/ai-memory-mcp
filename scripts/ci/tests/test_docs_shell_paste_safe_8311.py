@@ -431,7 +431,7 @@ LOOK_STOPS = {
     None: re.compile(r"\$\$|[()'\"\\`]|\$\((?!\()|\$'"),  # `$$` first: the PID
     "'": re.compile(r"'"),
     "$'": re.compile(r"['\\]"),  # ANSI-C: a backslash escapes the next character
-    '"': re.compile(r'["\\`]|\$\((?!\()'),
+    '"': re.compile(r'\$\$|["\\`]|\$\((?!\()'),  # `$$` first: the PID
 }
 
 
@@ -440,10 +440,12 @@ class Lookahead:
     as bash does (parse_dparen, parse_arith_cmd): the text after the opener
     up to the `)` that closes its inner `(` (parens counted, quotes and
     backslashes skipped; inside an ANSI-C `$'..'` a backslash escapes the
-    quote, as in QUOTES, and a `$$` is the PID parameter, so the quote
-    after it is plain, also when a backslash-newline splits it, as bash
-    drops that first) must be followed at once by `)`; otherwise bash
-    re-reads `((` as two nested subshells and `$((` as `$( (..) )`.
+    quote, as in QUOTES, and a `$$`, in code or in "...", is the PID
+    parameter, so the quote after it is plain, also when a backslash-newline
+    splits it, as bash drops that first; a lone `$` split that way from a
+    quote opens `$'`, and from a `(` a `$(`) must be followed at once by
+    `)`; otherwise bash re-reads `((` as two nested subshells and `$((` as
+    `$( (..) )`.
     bash's scan reads a backtick span or a `$( )` as commands (fresh
     quoting, `#` comments), which a paren count cannot follow, so a
     backtick or a `$(` that is not `$((`, in code or in double quotes,
@@ -477,8 +479,13 @@ class Lookahead:
         lone = False  # the last line ended in a lone `$` and a backslash
         while k < len(self.lines):
             line = self.lines[k]
-            if lone and quote is None and line.startswith("$"):
-                col, left = 1, left - 1  # the second `$` of a split `$$`
+            if lone:  # bash joins the lone `$` with this line's start
+                pair = self.joined(line, quote)
+                if pair is None:
+                    self.budget += left
+                    return False  # a split `$(`: command substitution
+                col, quote = pair
+                left -= col
             lone, used = False, -1  # used: the column after a `$$` or `\x`
             while True:
                 m = LOOK_STOPS[quote].search(line, col)
@@ -513,6 +520,23 @@ class Lookahead:
             k, col, left = k + 1, 0, left - 1
         self.budget += max(left, 0)
         return False  # no closing paren before the fence (or line) end
+
+    @staticmethod
+    def joined(line, quote):
+        """Read a lone `$` that ended the last line before a backslash with
+        the start of `line`, as bash does once it drops the backslash-newline:
+        returns (col to read from, quote), or None for a `$(` (a command
+        substitution: subshell). `$$` is the PID; in code a quote after it
+        opens an ANSI-C `$'`; in '..' or $'..' the `$` was literal."""
+        if quote not in (None, '"') or not line:
+            return 0, quote
+        if line[0] == "(" and not line.startswith("(("):
+            return None
+        if line[0] == "$":
+            return 1, quote
+        if line[0] == "'" and quote is None:
+            return 1, "$'"
+        return 0, quote
 
 
 def parse_heredoc_word(line, start):
@@ -600,8 +624,10 @@ def lex_quoted(line, i, stack, ahead):
         if ch == "`":
             stack.append("`")  # command substitution: lexed as code
             used = 1
-        elif line.startswith("$$", i) and not line.startswith(("$$(", "$${"), i):
-            return i + 2, "x"  # the PID: bash opens no `$[` at its second `$`
+        elif line.startswith("$$", i):
+            # The PID: bash's parser opens no `$(`, `${` or `$[` at the
+            # second `$` (`bash -n` accepts "$$(" whole).
+            return i + 2, "x"
         else:
             used = open_expansion(line, i, stack, ahead)
     if used:
@@ -670,7 +696,7 @@ def lex_line(line, stack, prev="\n", ahead=None):
     ahead = ahead or Lookahead([line], True).at(0)
     heredocs = []
     comment = None
-    i, prev = pid_tail(line, stack, prev)
+    i, prev = pid_tail(line, stack, prev, ahead)
     n = len(line)
     while i < n:
         ch = line[i]
@@ -720,18 +746,24 @@ def lex_line(line, stack, prev="\n", ahead=None):
     return comment, heredocs, False, prev
 
 
-def pid_tail(line, stack, prev):
+def pid_tail(line, stack, prev, ahead):
     """bash drops a backslash-newline before it lexes, so a lone `$` right
-    before the backslash (`prev`) and a `$` that starts this line are one
-    `$$`, the PID. Returns (index to lex from, prev): 1 when this line's
-    `$` is the second half of the PID. In '..' or $'..' a `$` is literal;
-    in "..." bash opens `$(` or `${` at the second `$` (lex_quoted)."""
+    before the backslash (`prev`) joins the first character of this line:
+    with a `$` it is the PID `$$`; in code a quote makes an ANSI-C `$'`;
+    in code or in "..." a `(`, `{` or `[` opens `$(`, `${` or `$[`.
+    Returns (index to lex from, prev). In '..' or $'..' a `$` is literal."""
     top = stack[-1] if stack else None
-    if prev != "$" or not line.startswith("$") or top in ("'", "$'"):
+    if prev != "$" or not line or top in ("'", "$'"):
         return 0, prev
-    if top == '"' and line.startswith(("$(", "${")):
+    if line[0] == "$":
+        return 1, "x"
+    if line[0] == "'" and top != '"':
+        stack.append("$'")
+        return 1, "'"
+    if line[0] not in "({[":
         return 0, prev
-    return 1, "x"
+    used = open_expansion("$" + line, 0, stack, lambda col: ahead(col - 1))
+    return used - 1, line[used - 2]
 
 
 def backtick_end(line, i):
@@ -1257,8 +1289,8 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # `$$` as the PID parameter first, so the quote after it is a plain
         # one, where `\'` ends the string. G2: bash drops a backslash-newline
         # before it lexes, so a lone `$` before it and a `$` that starts the
-        # next line are one `$$`. G1: in "...", `$$` is the PID unless `(`
-        # or `{` follows. Each row carries the lines bash 5.2 runs (`bash
+        # next line are one `$$`. G1: in "...", `$$` is the PID before `[`
+        # too (C1 below). Each row carries the lines bash 5.2 runs (`bash
         # -c`, echo markers) and the hits.
         probes = (
             (["echo $$'\\'; echo L1 # c'"], [1], "L1"),
@@ -1268,11 +1300,6 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             (["echo a$\\", "$'\\'; echo L2 # c'"], [2], "L2"),
             (['echo "$$["; echo L1 # c "]"'], [1], "L1"),
             (['echo "$\\', '$["; echo L2 # c "]"'], [2], "L2"),
-            # A `$$` before the backslash, or an escaped `$`, pairs with
-            # nothing; a plain quote after a split `$` fails closed.
-            (["echo $$\\", "$'\\'; echo L2 # c'"], [], "none"),
-            (['echo "\\$\\', '$["; echo L2 # c "]"'], [], "none"),
-            (["echo $\\", "'\\'; echo L2 # c'"], [2], "none"),
             (["(( `echo ))`; echo L1 # c", ") )"], [1], "L1"),
             (["(( \"$(echo '\"))')\"; echo L1 # c", ") )"], [1], "L1"),
             (["(( $(: # )))", "); echo L2 # c", ") )"], [1, 2], "L2"),
@@ -1282,6 +1309,44 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             # Arithmetic, `$((` in quotes and an ANSI-C operand stay clean.
             (["(( n > 0 )) && echo \")\"", 'echo "$(( 1 + 2 ))"'], [], "3"),
             (["(( x == $'\\'' )) || echo ok"], [], "ok"),
+        )
+        for lines, want, bash_runs in probes:
+            with self.subTest(lines=lines, bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
+
+    def test_8311_parse_closes_string_not_expansion(self):
+        # C1: bash runs a trailing comment whenever its PARSE closes the
+        # string, whether or not the word is ever expanded: in "..." `$$`
+        # is always the PID and the parser (`bash -n`, rc 0) opens no `$(`,
+        # `${` or `$[` at its second `$`. S20: a lone `$` before a
+        # backslash-newline joins the first character of the next line: a
+        # quote makes an ANSI-C `$'` in code, and a `(` or `{` opens `$(`
+        # or `${` in code or in "...". Each row carries the lines bash 5.2
+        # runs (`bash -c`, echo markers) and the hits.
+        probes = (
+            # C1: the quoted PID before `(` or `{` in a word bash never
+            # expands: a short-circuited list, `$( )`, a re-read `((`, and
+            # split across a continuation.
+            (['false && echo "$$("; echo L1 # c ")"'], [1], "L1"),
+            (['true || echo "$${"; echo L1 # c "}"'], [1], "L1"),
+            (['echo $(echo "$$("); echo L1 # c ")")'], [1], "L1"),
+            (['(( echo "$$(" ) ); echo L1 # c ")"'], [1], "L1"),
+            (['false && (( "$$(" )); echo L1 # c ")"'], [1], "L1"),
+            (['false && echo "$\\', '$("; echo L2 # c ")"'], [2], "L2"),
+            (['false && echo "$\\', '${"; echo L2 # c "}"'], [2], "L2"),
+            # S20: a lone `$`, a continuation, then a quote (code) or a
+            # `(` or `{` (in "...").
+            (["echo $\\", "'\\''; echo L2 # c '"], [2], "L2"),
+            (["echo a$\\", "'\\''; echo L2 # c '"], [2], "L2"),
+            (["(( $\\", "'\\'')); echo L2 # c '))"], [2], "L2"),
+            (["x=$(echo $\\", "'\\''); echo L2 # c ')"], [2], "L2"),
+            (['echo "$\\', "(echo '\"')\"; echo L2 # c '\"\""], [2], "L2"),
+            (['echo "$\\', "{x:-'\"'}\"; echo L2 # c '\"\""], [2], "L2"),
+            # A `$$` before the backslash, or an escaped `$`, pairs with
+            # nothing; a split `$'` hides the comment in its string.
+            (["echo $$\\", "$'\\'; echo L2 # c'"], [], "none"),
+            (['echo "\\$\\', '$["; echo L2 # c "]"'], [], "none"),
+            (["echo $\\", "'\\'; echo L2 # c'"], [], "none"),
         )
         for lines, want, bash_runs in probes:
             with self.subTest(lines=lines, bash_runs=bash_runs):
@@ -1306,10 +1371,12 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             ("$\\", 0),  # G2: a `$$` split by a continuation on every line
             ("$ (( $\\", 0),  # G2: the same in the `((` lookahead
             ('echo "$$["; ls # c "]"', 20000),  # G1: the PID before `[`
+            ('false && echo "$$("; ls # c ")"', 20000),  # C1: never expanded
+            ("ls $\\\n'\\''; ls # c '", 10000),  # S20: a split `$'`, two lines
         )
         for line, want in shapes:
             began = time.monotonic()
-            got = scan_block(1, [line] * 20000)
+            got = scan_block(1, line.split("\n") * (20000 // len(line.split("\n"))))
             spent = time.monotonic() - began
             self.assertEqual(len(got), want, line)
             self.assertLess(spent, SCAN_BUDGET_S, line)
