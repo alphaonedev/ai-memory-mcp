@@ -7,7 +7,8 @@ AGE on the macos-fed node is a hand-built install whose files live inside the
 Homebrew-managed ``postgresql@18`` share/lib trees.  A ``brew upgrade`` relinks
 those trees and drops the AGE files, so ``CREATE EXTENSION age`` fails.  A
 brew-independent copy lives in a node-local directory (default
-``~/pg-age-stack/age-1.8.0`` with ``share/`` and ``lib/``).
+``~/pg-age-stack/age-1.8.0-06ce678d`` with ``share/`` and ``lib/``; the suffix
+is the upstream apache/age commit the build carries, see ``MANIFEST``).
 
 The files installed are fixed by ``MANIFEST``: exactly five names, each pinned
 to a sha256.  Nothing else in the source directory is ever read or copied.
@@ -144,7 +145,7 @@ EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
 
 DEFAULT_URL_FILE = Path.home() / ".ai-memory-ci-fed-url"
-DEFAULT_AGE_DIR = Path.home() / "pg-age-stack" / "age-1.8.0"
+DEFAULT_AGE_DIR = Path.home() / "pg-age-stack" / "age-1.8.0-06ce678d"
 DEFAULT_PG_CONFIG = "/opt/homebrew/opt/postgresql@18/bin/pg_config"
 DEFAULT_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
 PROBE_TIMEOUT_SECONDS = 60
@@ -199,13 +200,33 @@ TEMP_SUFFIX = ".age-restore"
 # "lib" entries go to `pg_config --pkglibdir`, "share" entries to
 # `pg_config --sharedir`/extension.  lib is listed (and installed) first so the
 # control file never appears ahead of its module.
+#
+# The dylib pin is the node's build of release/PG18/1.8.0 plus upstream commit
+# 06ce678d74210539705c77e2dc7c9fa861e2a331 (apache/age#2580 / #2581: no catalog
+# read in is_age_extension_exists() outside a live transaction).  Stock 1.8.0
+# leaks fast-path locks on the ROLLBACK of a failed transaction and every
+# later backend on that PGPROC fails to connect with "failed to re-find shared
+# lock object" (#7162, #8282).  A pin on the stock bytes makes this helper
+# REINSTALL the defect over the patched library (that is how #8282 happened),
+# so the pin and DEFAULT_AGE_DIR change together with every AGE rebuild and the
+# superseded dylib digest joins REFUSED_SHAS; the recipe is in
+# docs/DEVELOPER_SETUP_NOTES.md ("macos-fed AGE build").
 MANIFEST = (
-    ("lib", "age.dylib", "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927"),
+    ("lib", "age.dylib", "b6b5c442331cc45596e9be2e24172a51329ff69e7d08bbeb66ec970bacd08adf"),
     ("share", "age--1.6.0--1.7.0.sql", "3f63301c461e2ad3e952f1ead68d380ddadfe004b147ca81606ad63301e0514f"),
     ("share", "age--1.7.0--1.8.0.sql", "9b04323cc00cd57a9d28adc43c01f5de43d236c26d3e1a17682bc3ce039e35af"),
     ("share", "age--1.8.0.sql", "f6c2d353997a4479d1be63d0e0afc4a58fb2e0826d46f9d6d5a0e46d69441d4d"),
     ("share", "age.control", "432d43d2c9e27534c95a8061c968a3334216c6b44de111ed4466693a7fc15f09"),
 )
+
+# Digests this helper refuses whatever MANIFEST pins (#8282): a source file with one
+# of them is rejected by name and exits 2 without a write, and an installed file
+# with one of them never counts as healthy.  An older head whose MANIFEST still
+# pins such a build therefore fails closed instead of reinstalling the defect.
+REFUSED_SHAS = frozenset({
+    "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927",  # stock age.dylib 1.8.0, apache/age#2580
+})
+REFUSED_REASON = "refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)"
 
 
 class HelperError(Exception):
@@ -601,7 +622,11 @@ def installed_ok(dests):
     #7016: right bytes are not enough; a writable age.dylib in pkglibdir lets any local user replace code the
     postgres backend loads, so it counts as not installed and the restore rewrites it with the source's mode.
     """
-    return all(sha256_of_regular_file(dests[sub] / name, refuse_writable=True) == pin for sub, name, pin in MANIFEST)
+    for sub, name, pin in MANIFEST:
+        digest = sha256_of_regular_file(dests[sub] / name, refuse_writable=True)
+        if digest is None or digest in REFUSED_SHAS or digest != pin:  # #8282: a refused build is never healthy
+            return False
+    return True
 
 
 def healthy(args, dests, url):
@@ -650,7 +675,10 @@ def read_source(path, pin):
         raise HelperError(f"age source unreadable: {path} ({exc.strerror})", EXIT_BAD_INPUT)
     finally:
         os.close(fd)
-    if hashlib.sha256(data).hexdigest() != pin:
+    digest = hashlib.sha256(data).hexdigest()
+    if digest in REFUSED_SHAS:  # #8282: refused even when MANIFEST pins it
+        raise HelperError(f"age source rejected: {path} {REFUSED_REASON}", EXIT_BAD_INPUT)
+    if digest != pin:
         raise HelperError(f"age source rejected: {path} does not match its pinned sha256", EXIT_BAD_INPUT)
     return data, stat.S_IMODE(st.st_mode)
 
