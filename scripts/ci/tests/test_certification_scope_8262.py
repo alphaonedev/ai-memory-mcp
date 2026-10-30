@@ -1194,13 +1194,15 @@ def _fold_mention(text):
 
 
 def _mention_views(text):
-    """The views of _mention_views_core(); round 23 (security r22 LOW-1): when the line holds an HTML
-    comment opener, also the views of the line with the comment delimiters blanked, so a markdown
-    spelling of the identifier inside a one-line comment reads as it does outside one. The union
-    never counts fewer than the core views alone."""
+    """Views of _mention_views_core(), plus the views of the folded line with comment delimiters
+    and angle brackets blanked (rounds 23, 24), so markdown spellings of the identifier read as
+    they do outside a comment or inside a tag attribute. Never counts fewer than the core views."""
     views = _mention_views_core(text)
-    if "<!--" in text:
-        views += _mention_views_core(text.replace("<!--", " ").replace("-->", " "))
+    low = _fold_mention(text)
+    if "<!--" in low:
+        views += _mention_views_core(low.replace("<!--", " ").replace("-->", " "))
+    if "<" in low or ">" in low:
+        views += _mention_views_core(low.replace("<", " ").replace(">", " "))
     return views
 
 
@@ -2151,6 +2153,49 @@ class CertificationScope8262(unittest.TestCase):
             self.assertEqual(count(text), 0, text)
         self.assertEqual(count("Enable <!-- **TRUST**_PEER --> now."), 1)
         self.assertEqual(count("Enable <!-- **TRUST**_PEERS --> now."), 0)
+        # Round 24 (code r23 LOW-1, security r23 LOW-1): a comment delimiter spelled as a character
+        # reference or an NFKD-compatibility form is visible text, not a comment, so the markdown
+        # spelling between the delimiters counts as it does outside one.
+        delimiters = (("entity-named", "&lt;!--", "--&gt;"), ("entity-numeric", "&#60;!--", "--&#62;"),
+                      ("entity-hex", "&#x3c;!--", "--&#x3e;"), ("fullwidth", "＜!--", "--＞"),
+                      ("small-form", "﹤!--", "--﹥"))
+        spellings = ("**TRUST**_PEER", "TRUST_`PEER`", "TRUST\\_PEER", "`TRUST`-PEER",
+                     "[TRUST](https://example.com/a)-PEER", "TRUST<b>_</b>PEER", "TRUST–**PEER**")
+        wrappers = ("Enable %s now.", "| Mode | Note |\n| --- | --- |\n| a | %s |", "- %s")
+        for kind, opener, closer in delimiters:
+            for row in spellings:
+                for wrap in wrappers:
+                    text = wrap % ("%s %s %s" % (opener, row, closer))
+                    self.assertEqual(count(text), 1, "%s delimiters: %r" % (kind, text))
+        # Controls: a longer word, and an identifier split across an entity-spelled delimiter, stay 0.
+        for kind, opener, closer in delimiters:
+            for text in ("Enable %s TRUST_PEERS %s now." % (opener, closer),
+                         "Enable %s **TRUST**_PEERS %s now." % (opener, closer),
+                         "Enable TRUST%s _ %sPEER now." % (opener, closer),
+                         "Enable %s TRUST_ %sPEER now." % (opener, closer)):
+                self.assertEqual(count(text), 0, "%s delimiters: %r" % (kind, text))
+        # Round 24 (security r23 LOW-2): a markdown spelling inside an HTML attribute value is source
+        # text a reader can see, so it counts; the tag around it does not hide it.
+        attributes = ('Enable <b title="**TRUST**_PEER">x</b> now.',
+                      'Enable <b title="TRUST_`PEER`">x</b> now.',
+                      'Enable <b title="`TRUST`-PEER">x</b> now.',
+                      'Enable <b title="TRUST\\_PEER">x</b> now.',
+                      'Enable <b title="**TRUST**–PEER">x</b> now.',
+                      'Enable <a href="https://example.com/a" title="**TRUST**_PEER">x</a> now.',
+                      'Enable <a href="https://example.com/a" title="TRUST_`PEER`">x</a> now.',
+                      'Enable <a href="https://example.com/a" title="TRUST\\_PEER">x</a> now.',
+                      'Enable &lt;b title="**TRUST**_PEER"&gt;x&lt;/b&gt; now.',
+                      'Enable &lt;b title="TRUST\\_PEER"&gt;x&lt;/b&gt; now.')
+        for text in attributes:
+            for wrap in ("%s", "| Mode | Note |\n| --- | --- |\n| a | %s |", "- %s"):
+                self.assertEqual(count(wrap % text), 1, "attribute value: %r" % (wrap % text))
+        # Controls: the identifier split across a tag, an attribute boundary or a comment stays 0.
+        for text in ("TRUST<b>x</b>_PEER", "TRUST <b>_</b> PEER", "TRUST<br>PEER", "TRUST<!-- _ -->PEER",
+                     'Enable <b title="TRUST">_PEER</b> now.',
+                     'Enable <b title="**TRUST**_PEERS">x</b> now.'):
+            self.assertEqual(count(text), 0, "control: %r" % text)
+        # The tag-wrapped underscore joins the halves once the tags are removed (rounds 16 and later).
+        self.assertEqual(count("Enable TRUST<b>_</b>PEER now."), 1)
 
     def test_trust_peer_dash_position_matrix_8262(self):
         # Round 22 (code r21 MEDIUM-1): every dash of the class, in every position relative to a
@@ -2198,6 +2243,20 @@ class CertificationScope8262(unittest.TestCase):
             grammar_problems("README.md", text)
             elapsed = time.perf_counter() - start
             self.assertLess(elapsed, 2.0, "%d chars took %.2f s" % (len(text), elapsed))
+
+    def test_mention_views_are_linear_8262(self):
+        # Round 24 (code r23 INFO-2): the mention views of a 100 KB line that holds comment delimiters,
+        # entity-spelled delimiters, attributes and the identifier stay under a 2 s ceiling. The
+        # asserted number is the in-test elapsed time of _mention_views() alone.
+        import time
+        unit = '<!-- a --> &lt;!-- **TRUST**_PEER --&gt; <b title="TRUST\\_PEER">x</b> '
+        for text in (unit * (100000 // len(unit)), "<" * 100000, "<!--" * 25000 + "TRUST_PEER"):
+            start = time.perf_counter()
+            views = _mention_views(text)
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 2.0, "%d chars took %.3f s" % (len(text), elapsed))
+            self.assertTrue(views)
+            self.assertTrue(any(TRUST_PEER_RE.search(v) for v in views) or "TRUST" not in text, text[:40])
 
     def test_grammar_rules_3_and_5_match_the_readme_8262(self):
         # Round 19 (code r15 LOW-5, INFO-1): the README and the docstring state rules 3 and 5 alike, and
