@@ -428,9 +428,9 @@ class Frames(list):
 
 
 LOOK_STOPS = {
-    None: re.compile(r"[()'\"\\]"),
+    None: re.compile(r"[()'\"\\`]|\$\((?!\()"),
     "'": re.compile(r"'"),
-    '"': re.compile(r'["\\]'),
+    '"': re.compile(r'["\\`]|\$\((?!\()'),
 }
 
 
@@ -440,6 +440,10 @@ class Lookahead:
     up to the `)` that closes its inner `(` (parens counted, quotes and
     backslashes skipped) must be followed at once by `)`; otherwise bash
     re-reads `((` as two nested subshells and `$((` as `$( (..) )`.
+    bash's scan reads a backtick span or a `$( )` as commands (fresh
+    quoting, `#` comments), which a paren count cannot follow, so a
+    backtick or a `$(` that is not `$((`, in code or in double quotes,
+    answers subshell (fails closed).
 
     Bounded: one lookahead reads at most LOOKAHEAD_CAP characters, and all
     lookaheads over one fence share a budget of its length plus the cap, so
@@ -477,6 +481,9 @@ class Lookahead:
                 ch, col = m.group(), m.end()
                 if ch == "\\":
                     col += 1
+                elif ch == "`" or ch.startswith("$"):
+                    self.budget += left
+                    return False  # command substitution: subshell
                 elif quote is not None or ch in "'\"":
                     quote = None if quote is not None else ch
                 elif ch == "(":
@@ -1209,6 +1216,19 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # A lookahead that hits its cap answers subshell (fails closed).
         self.assertEqual(scan_block(1, ["((" + "x" * LOOKAHEAD_CAP, "ls # c", "))"]), [(2, TRAIL)])
 
+    def test_8311_dparen_lookahead_stops_at_substitution(self):
+        # S17: bash's scan reads a backtick span or a `$( )` as commands, so
+        # a paren run inside one is no `))`; the lookahead answers subshell.
+        self.assertEqual(scan_block(1, ["(( `echo ))`; echo L1 # c", ") )"]), [(1, TRAIL)])
+        self.assertEqual(
+            scan_block(1, ["(( \"$(echo '\"))')\"; echo L1 # c", ") )"]), [(1, TRAIL)]
+        )
+        self.assertEqual(
+            [h[0] for h in scan_block(1, ["(( $(: # )))", "); echo L2 # c", ") )"])], [1, 2]
+        )
+        # Arithmetic without a substitution, and `$((` in quotes, stay clean.
+        self.assertEqual(scan_block(1, ["(( n > 0 )) && echo \")\"", 'echo "$(( 1 + 2 ))"']), [])
+
     def test_8311_backtick_closes_through_quotes(self):
         # S15: bash ends a backtick substitution at the first unescaped
         # backtick, whatever quote is open inside it.
@@ -1221,7 +1241,8 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # S13: a fence left open by every line, and a fence of unterminated
         # heredocs, each scan in linear time and stay fail closed. S14: the
         # `((` lookahead shares one budget per fence, so it stays linear.
-        for line, want in (("x ${", 20000), ("cat <<E", 0), ("((", 0)):
+        shapes = (("x ${", 20000), ("cat <<E", 0), ("((", 0), ("(( `", 0), ("(( $(", 0))
+        for line, want in shapes:
             began = time.monotonic()
             got = scan_block(1, [line] * 20000)
             spent = time.monotonic() - began
