@@ -528,9 +528,21 @@ TRUST_PEER_RE = re.compile(r"sync[^a-z0-9]{0,4}trust[^a-z0-9]{0,4}peer"
                            r"|(?<![a-z0-9])trust[_-]peer(?![a-z0-9_-])"
                            r"|(?<![a-z0-9])trust[^a-z0-9]{0,4}peer(?![a-z0-9])[^a-z0-9]{0,4}"
                            r"(?:=|to(?![a-z0-9]))[^a-z0-9]{0,4}(?:1|true|on|yes)(?![a-z0-9])")
-# Round 17: a census unit starts at a table row or a list item; a table row is a unit of its own.
+# Round 17: a table row is a census unit of its own. Round 30: a unit starts only where CommonMark
+# starts a new block (_interrupts_paragraph), no longer at every pipe line or list marker.
 _TABLE_ROW_RE = re.compile(r"[ \t>]*\|")
-_LIST_ITEM_RE = re.compile(r"[ \t>]*(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
+# Round 30: a delimiter-row cell (GFM 4.10), and the start of a fence or of a possible HTML block
+# (after one, the lines of a census unit are not read as paragraph text). Inside a paragraph only
+# the HTML block kinds 1 to 6 (CommonMark 4.6) can start one; kind 7 cannot interrupt a paragraph.
+_DELIM_CELL_RE = re.compile(r"[ \t]*:?-+:?[ \t]*$")
+_OPAQUE_RE = re.compile(r"`{3,}|~{3,}|<")
+_OPAQUE_INTERRUPT_RE = re.compile(
+    r"`{3,}|~{3,}|<(?:pre|script|style|textarea)(?:[ \t>]|$)|<!--|<\?|<![a-z]|<!\[CDATA\["
+    r"|</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd"
+    r"|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset"
+    r"|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol"
+    r"|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr"
+    r"|track|ul)(?:[ \t>]|/>|$)", re.IGNORECASE)
 _RELEASE_HEADING_RE = re.compile(r"^## \[\d+\.\d+\.\d+\]")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _COMMENT_OPEN = "<!--"
@@ -599,9 +611,9 @@ def _strip_raw_html(text):
 
 
 def _strip_tags_first(text):
-    """Round 29 (code r28 LOW-1): the round-27 reading, comments first, then open tags, then closing
-    tags, declarations, PI and CDATA sections. A tag inside a PI or CDATA body goes before the body's
-    own ">" can end it, so the halves around the section join (an over-count at most)."""
+    """Round 29 (code r28 LOW-1): the round-27 reading, comments first, then open tags, then
+    closing tags, declarations, PI and CDATA sections. A tag inside a PI or CDATA body goes before
+    the body's own ">" can end it, so the halves around the section join (an over-count at most)."""
     return _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(text))) if "<" in text else text
 
 
@@ -1211,15 +1223,156 @@ def trust_peer_mentions(root=ROOT):
             for unit in trust_peer_units(rel, (root / rel).read_text(encoding="utf-8"))]
 
 
+def _container(line, items=False, outer=None):
+    """Round 30: (block-quote depth, column after the container markers, column of the text, line,
+    item content columns) of a line whose prefix tabs are expanded (CommonMark 2.2). A block-quote
+    marker is read after at most three spaces (5.1). With items=True (the line that opens a unit) a
+    list marker with content is read too (5.2), and the text column is the item's content column
+    (one past the marker when five or more spaces follow it). outer is the paragraph of the unit
+    before at the same depth: the line sits inside each of its items whose content column it
+    reaches, so its own marker is read from the innermost of those."""
+    line = _expand_lead(line)
+    pos = depth = 0
+    chain, inherited = (), outer is None
+    while True:
+        quote = _QUOTE_MARK_RE.match(line, pos)
+        if quote:
+            depth, pos = depth + 1, quote.end()
+            continue
+        lead = _SPACES_RE.match(line, pos).end()
+        if not inherited:
+            inherited = True
+            if outer[0] == depth:
+                chain = tuple(c for c in outer[4] if c <= lead)
+                pos = max((pos,) + chain)
+        item = _MARKER_RE.match(line, lead) if items and lead - pos < 4 else None
+        if item is None or not line[item.end():].strip(" \t"):
+            break
+        gap = _SPACES_RE.match(line, item.end()).end() - item.end()
+        pos = item.end() + (gap if 0 < gap <= 4 else 1)
+        chain += (pos,)
+    return depth, pos, _SPACES_RE.match(line, pos).end(), line, chain
+
+
+def _cells(row):
+    """Round 30: the cells of a GFM table row (4.10) with its container prefix removed: split at
+    every pipe not escaped by an odd run of backslashes, one leading and one trailing
+    pipe dropped."""
+    row = row.strip(" \t")
+    cuts, run = [], 0
+    for at, ch in enumerate(row):
+        if ch == "|" and run % 2 == 0:
+            cuts.append(at)
+        run = run + 1 if ch == "\\" else 0
+    bounds = [-1] + cuts + [len(row)]
+    cells = [row[a + 1:b] for a, b in zip(bounds, bounds[1:])]
+    if cuts and cuts[0] == 0:
+        cells = cells[1:]
+    if cuts and cuts[-1] == len(row) - 1 and cells:
+        cells = cells[:-1]
+    return cells
+
+
+def _table_header(line, paragraph, next_line):
+    """Round 30: True when line is the header row of a GFM table (4.10) that interrupts the
+    paragraph: next_line is a delimiter row with as many cells, and both lines sit at the
+    paragraph's block-quote depth, not left of its text and fewer than four columns past its
+    container markers."""
+    if next_line is None:
+        return False
+    depth, end, col = paragraph[:3]
+    rows = []
+    for ln in (line, next_line):
+        d, _, at, text, _ = _container(ln)
+        if d != depth or not col <= at < end + 4:
+            return False
+        rows.append(text[at:])
+    if not rows[0].startswith("|") or "|" not in rows[1]:
+        return False
+    marks = _cells(rows[1])
+    return (bool(marks) and all(_DELIM_CELL_RE.match(c) for c in marks)
+            and len(_cells(rows[0])) == len(marks))
+
+
+def _interrupts_paragraph(line, paragraph, next_line):
+    """Round 30 (security r29 MEDIUM-1 and LOW-1, code r29 MEDIUM-1): True when line, read as the
+    next line of a census unit, starts a new block in CommonMark 0.31.2 with the GFM table
+    extension, so a new unit starts there. paragraph is (block-quote depth, column after the
+    container markers, text column, plain, item content columns) of the paragraph the unit opened,
+    plain False once a line of the unit is not read as its paragraph text, or None inside a fence or
+    after a line that may open an HTML block (nothing interrupts those). When the paragraph is the
+    text of a list item, a list marker left of the item's content column, fewer than four columns
+    past the innermost container the line reaches, closes the item and opens the next one (5.2, 5.3:
+    any marker, empty or not, any number). Otherwise, after the line's block-quote markers and fewer
+    than four spaces past the paragraph's container (4.4: indented code cannot interrupt a
+    paragraph), only these interrupt:
+      - a list item with content whose marker is a bullet or the ordered number 1. CommonMark 5.2:
+        "In order for a sequence of lines to constitute a list item, ... when the first list item in
+        a list interrupts a paragraph ... (a) the lines Ls must not begin with a blank line, and (b)
+        if the list item is ordered, the start number must be 1."
+      - the header row of a table (_table_header): GFM 4.10 needs the delimiter row after it.
+    Every other line stays in the unit: an ordered item numbered other than 1, an empty item, a pipe
+    line with no delimiter row, a marker four or more columns in, and each of these after "> " or
+    inside a list item. Where a renderer may still start a block (a lazy line whose block-quote
+    depth differs, a list item whose container was opened before a blank line), the line stays too:
+    a larger unit changes its key on any edit and counts at most one more, the fail-closed
+    direction."""
+    if paragraph is None:
+        return False
+    depth, end, at, text, _ = _container(line)
+    if depth != paragraph[0]:
+        return False
+    item = _MARKER_RE.match(text, at)
+    chain = paragraph[4]
+    inner = bool(chain) and chain[-1] == paragraph[1]
+    if inner and at < paragraph[1]:
+        return item is not None and at - max((end,) + tuple(c for c in chain if c <= at)) < 4
+    if at - (paragraph[1] if inner else end) >= 4:
+        return False
+    if item:
+        number = item.group(1)
+        return bool(text[item.end():].strip(" \t")) and (number is None or int(number) == 1)
+    return paragraph[3] and _table_header(line, paragraph, next_line)
+
+
 def _census_units(para):
-    units = []
-    for ln in para.split("\n"):
-        row = _TABLE_ROW_RE.match(ln) is not None
-        if not units or row or _LIST_ITEM_RE.match(ln) or units[-1][0]:
-            units.append((row, [ln]))
+    """Round 17: the census units of a paragraph block: a unit starts at a list item or a table row.
+    Round 30: only where CommonMark starts a new block (_interrupts_paragraph), and after each row
+    of a table; every other line, and the plain lines after it, stays in the unit before it. Inside
+    a fence nothing starts a unit; after its closing fence the unit's list item boundaries apply
+    again (not a table header: the unit's lines are no longer one paragraph)."""
+    lines = para.split("\n")
+    units, table, paragraph, fence = [], False, None, None
+    for i, ln in enumerate(lines):
+        nxt = lines[i + 1] if i + 1 < len(lines) else None
+        if fence is not None:
+            units[-1].append(ln)
+            _, end, col, text, _ = _container(ln)
+            close = _FENCE_CLOSE_RE.match(text, col) if col - end < 4 else None
+            if close and close.group(1)[0] == fence[0][0] and len(close.group(1)) >= len(fence[0]):
+                paragraph, fence = fence[1], None
+            continue
+        if not units or table or _interrupts_paragraph(ln, paragraph, nxt):
+            depth, end, col, text, chain = _container(ln, True, paragraph)
+            paragraph = (depth, end, col, True, chain)
+            row = _TABLE_ROW_RE.match(ln) is not None or _is_delimiter_row(ln)
+            table = (table and row) or _table_header(ln, paragraph, nxt)
+            units.append([ln])
+            opaque = _OPAQUE_RE
         else:
-            units[-1][1].append(ln)
-    return ["\n".join(lines) for _, lines in units]
+            opaque = _OPAQUE_INTERRUPT_RE
+            units[-1].append(ln)
+            if paragraph is None:
+                continue
+            depth, end, col, text, _ = _container(ln)
+            if paragraph[3] and not (depth == paragraph[0] and col >= paragraph[2] and (
+                    col - end >= 4 or _MARKER_RE.match(text, col) or not _block_start(text[col:]))):
+                paragraph = paragraph[:3] + (False, paragraph[4])
+        if opaque.match(text, col):
+            run = _FENCE_RUN_RE.match(text, col)
+            fence = (run.group(1), paragraph[:3] + (False, paragraph[4])) if run else None
+            paragraph, table = None, False
+    return ["\n".join(unit) for unit in units]
 
 
 def _names_trust_peer(unit):
@@ -1236,21 +1389,13 @@ def trust_peer_units(rel, raw):
         text = _html_text(text)
     out = []
     for para in re.split(r"\n[ \t>]*\n", text):
-        rest = []
+        # Round 30 (security r29 MEDIUM-1 and LOW-1, code r29 MEDIUM-1): a line CommonMark keeps in
+        # the paragraph no longer starts a unit (_census_units), so a raw HTML section or link title
+        # that spans one is read whole inside its unit. The round-29 joined reading of the units
+        # that name nothing is gone: every unit boundary is now a line that starts a new block, and
+        # a reading joined across one counts a fragment a browser never shows.
         for unit in _census_units(para):
             flat = _names_trust_peer(unit)
-            if flat:
-                out.append(flat)
-            else:
-                rest.append(unit)
-        # Round 29 (security r28 MEDIUM-1): a unit starts at any line shaped like a list item or table
-        # row, but CommonMark keeps many such lines in the paragraph (an ordered item not starting at 1,
-        # an empty bullet, a pipe line with no delimiter row, a dash indented four spaces, the same after
-        # a quote marker or inside a list item), so a raw HTML section or link title that spans one is
-        # whole to a browser. The units that name nothing are read again joined, as one unit (when no
-        # unit names the bypass, that is the whole paragraph), as written and unquoted.
-        if len(rest) > 1:
-            flat = _names_trust_peer("\n".join(rest))
             if flat:
                 out.append(flat)
     return out
@@ -2442,13 +2587,29 @@ class CertificationScope8262(unittest.TestCase):
                     self.assertEqual(count(text), 1, "paragraph whole: %r" % text)
         # 6 shapes x 5 sections x 5 containers; no row repeats.
         self.assertEqual(len(rows), 150)
-        # A unit that names the identifier does not hide a split one next to it: the units that name
-        # nothing are read joined, and a match there is a census unit of its own. When the naming unit
-        # sits inside the section, the joined reading still counts (one more than a browser shows).
+        # A unit that names the identifier does not hide a split one next to it: the lines that do
+        # not interrupt the paragraph are one unit with it, and a match there counts. Round 30: a
+        # mention inside the section is one unit with the halves around it, as the browser shows
+        # one paragraph ("Enable TRUST_PEER now."), so the row counts 1 where the round-29 joined
+        # reading counted 2.
         mixed = "Enable TRUST<!--a\n2. x\nb-->_PEER now.\n- Set TRUST_PEER to 1."
         self.assertEqual(count(mixed), 2, mixed)
         hidden = "Enable TRUST<!--a\n2. Set TRUST_PEER to 1.\n7) y\nb-->_PEER now."
-        self.assertEqual(count(hidden), 2, hidden)
+        self.assertEqual(count(hidden), 1, hidden)
+        # Round 30 (code r29 MEDIUM-1, security r29 LOW-1): a line that interrupts the paragraph (a
+        # bullet with content, the ordered item 1, a table header with its delimiter row) ends it,
+        # so the halves are two fragments to a browser and two census units: no mention.
+        cut = ("- x", "* x", "+ x", "1. x", "| a | b |{NL}| - | - |")
+        rows = set()
+        for shape in cut:
+            for section in sections:
+                for outer, nl in containers:
+                    text = outer % section.replace("{L}", shape).replace("{NL}", nl)
+                    rows.add(text)
+                    self.assertEqual(count(text), 0, "interrupted: %r" % text)
+                    self.assertGreaterEqual(len(_census_units(text)), 2, "interrupted: %r" % text)
+        # 5 shapes x 5 sections x 5 containers; no row repeats.
+        self.assertEqual(len(rows), 125)
         # Controls: a visible character left between the halves still splits them; a paragraph with no
         # identifier stays 0.
         for text in ("Enable TRUST<!--a\n2. x\nb--> _PEER now.", "Enable TRUST<?a\n| a | b |\nb>?>_PEER now.",
@@ -2460,6 +2621,37 @@ class CertificationScope8262(unittest.TestCase):
                      '- Enable [TRUST](/u "a) b" )_PEER now.'):
             self.assertEqual(count(text), 1, "link title with ')': %r" % text)
         self.assertEqual(count('Enable [TRUST](/u "a)b") _PEER now.'), 0)
+
+    def test_census_unit_keeps_lines_that_do_not_interrupt_8262(self):
+        # Round 30 (security r29 MEDIUM-1): a line CommonMark keeps in the paragraph (an ordered
+        # item not numbered 1, an empty bullet, a pipe line with no delimiter row, a dash four
+        # columns in), plain, after "> " and inside a task-list item, is read with the reviewed unit
+        # before it, and so are the plain lines after it: any text appended there changes the key.
+        reviewed = "`AI_MEMORY_FED_SYNC_TRUST_PEER` unset (only test harnesses set it)."
+        kept = ("| except on staging |", "  | except on staging |", "2. except on staging",
+                "7) except on staging", "*", "+", "    - except on staging")
+        containers = (("%s", "\n"), ("> %s", "\n> "), ("- [ ] %s", "\n  "))
+        rows = set()
+        for shape in kept:
+            for outer, nl in containers:
+                text = outer % reviewed + nl + shape + nl + "and on every peer."
+                rows.add(text)
+                self.assertEqual(trust_peer_units("README.md", text), [_flat(text).strip()],
+                                 "unit key misses an appended line: %r" % text)
+        # The second half of an identifier on such a line, after a reviewed unit that ends in the
+        # first half, is one unit with it: the visible "TRUST_PEER to 1" moves the key.
+        edge = "Keep `AI_MEMORY_FED_SYNC_TRUST_PEER` unset; never set TRUST<!--a"
+        halves = ("2. b-->_PEER to 1.", "7) b-->_PEER to 1.", "| b-->_PEER to 1. |",
+                  "  | b-->_PEER to 1. |", "    - b-->_PEER to 1.", "*{NL}b-->_PEER to 1.",
+                  "+{NL}b-->_PEER to 1.")
+        for half in halves:
+            for outer, nl in containers:
+                text = outer % edge + nl + half.replace("{NL}", nl)
+                rows.add(text)
+                self.assertEqual(trust_peer_units("README.md", text), [_flat(text).strip()],
+                                 "split identifier outside the unit: %r" % text)
+        # (7 kept shapes + 7 halves) x 3 containers; no row repeats.
+        self.assertEqual(len(rows), 42)
 
     def test_trust_peer_dash_position_matrix_8262(self):
         # Round 22 (code r21 MEDIUM-1): every dash of the class, in every position relative to a
@@ -2882,9 +3074,14 @@ class CertificationScope8262(unittest.TestCase):
         # read with it, and one table row is never joined with the next.
         para = "The bypass is `AI_MEMORY_FED_SYNC_TRUST_PEER`. Set it only for trusted peers."
         self.assertEqual(trust_peer_units("README.md", para), [para])
-        rows = "| a | `AI_MEMORY_FED_SYNC_TRUST_PEER` | x |\n| b | other | y |\n- item\n- `SYNC_TRUST_PEER` item"
+        rows = ("| a | `AI_MEMORY_FED_SYNC_TRUST_PEER` | x |\n| - | - | - |\n| b | other | y |\n"
+                "- item\n- `SYNC_TRUST_PEER` item")
         self.assertEqual(trust_peer_units("README.md", rows),
                          ["| a | `AI_MEMORY_FED_SYNC_TRUST_PEER` | x |", "- `SYNC_TRUST_PEER` item"])
+        # Round 30: with no delimiter row the pipe lines are paragraph text (GFM 4.10), one unit.
+        rows = "| a | `AI_MEMORY_FED_SYNC_TRUST_PEER` | x |\n| b | other | y |\n- item"
+        self.assertEqual(trust_peer_units("README.md", rows),
+                         ["| a | `AI_MEMORY_FED_SYNC_TRUST_PEER` | x | | b | other | y |"])
 
     def test_pointers_present(self):
         for rel in POINTERS:
