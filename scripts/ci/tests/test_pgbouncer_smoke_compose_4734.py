@@ -82,12 +82,14 @@ a later statement-position check that reaches a FAIL exit; the exact group count
 their failure message names the constant and the lockstep remedy.
 """
 import fnmatch
+import inspect
 import pathlib
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 
@@ -107,7 +109,7 @@ EXIT_ZERO = re.compile(r"(?<![\w-])exit\s+[\"']?0+[\"']?(?![\w])")
 DOCKER_EXEC_RUN = re.compile(r"\bdocker\b.*\s(?:exec|run)\s")
 PW_TOKEN = re.compile(r"\b(?:PW|POSTGRES_PASSWORD|PGPASSWORD)\b")
 PW_BY_NAME = re.compile(r"-e PGPASSWORD(?![=\w])")
-BANNED_INDIRECTION = re.compile(r"\bprintf -v\b|\$\{!|\bev" + r"al\b")
+BANNED_INDIRECTION = re.compile(r"\bprintf -v\b|\$\{!|\$\{[^}]*@P\}|\bev" + r"al\b")  # r21 S30: and ${var@P}
 FAIL_ECHO = re.compile(r"\becho\b.*\b(?:FAIL|FATAL):")
 EXIT_SAME_LINE = re.compile(r">&2; exit [1-9]\d*(?: ;;|;? \}(?:;? \})?|;)?$")
 EXIT_NEXT_LINE = re.compile(r"^exit [1-9]\d*$")
@@ -427,8 +429,12 @@ def _script_text(path):
     Path.read_text() turns a lone \\r (and \\r\\n) into a newline, which bash does not, so a lone \\r would
     reach the pre-pass as a line break and a `#` after it would hide code bash runs; read this way the
     pre-pass sees the \\r and refuses it. r20 K20 / S29: bytes that are not UTF-8 fail closed by name
-    (`<script>: line L col C: invalid UTF-8 byte 0xNN`, the column counting the characters before the byte)."""
+    (`<script>: line L col C: invalid UTF-8 byte 0xNN`, the column counting the characters before the byte).
+    r21 INFO-r17-b: a leading byte-order mark is refused by name before the UTF-8 check (bash reads it as part
+    of the first word; every reader here would read it as text)."""
     data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise AssertionError("%s: line 1 col 1: a byte-order mark" % path.name)
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -436,6 +442,12 @@ def _script_text(path):
         line_start = head.rfind(b"\n") + 1
         col = len(head[line_start:].decode("utf-8", errors="replace")) + 1
         raise AssertionError("%s: line %d col %d: invalid UTF-8 byte 0x%02x" % (path.name, head.count(b"\n") + 1, col, data[exc.start])) from None
+
+
+def _script_header(path):
+    """r21 (security INFO): the first 50 lines of a script for the prose checks, read through _script_text, so a
+    script that is not UTF-8 (or starts with a byte-order mark) fails by name, never with a raw decode error."""
+    return _script_text(path).split("\n")[:50]
 
 
 def _code_lines(path):
@@ -718,6 +730,13 @@ DAEMON_SELECTION_NAME = re.compile(r"DOCKER_\w*")
 # runs it; a `${...}` runs a command only through one of the two); S27 a heredoc opened inside a backquote
 # pair, and a body line of a heredoc opened inside $( ) or <( ) that starts with the delimiter without being
 # exactly it (bash ends such a body at `E)` or `E )`; the pass does not copy that rule, it refuses the line).
+# r21, refused by name as well: K21 a body line of an unquoted-delimiter heredoc that ends in an odd run of
+# backslashes (bash removes the backslash-newline before it compares the terminator, so its next line is body
+# text in bash; the pass refuses the join instead of copying it; a quoted delimiter keeps the backslash); S30
+# the prompt transformation ${var@P} anywhere in the text, and command text stored as data: a `$(` (so also
+# `$((`) or a backquote that bash keeps as literal characters of a word in code (single-quoted, escaped, or
+# assembled across quotes as in '$''('), an escaped one in an unquoted body and any one in a quoted body,
+# because an eval-class expansion ($((p)), ${b[p]}, ${p@P}) runs the command text a variable holds.
 # The comment text is removed, the newline kept, so line numbers do not move. History: before round 16 shlex
 # read the comment text as code (commenters off); in round 16 any `)` and a closing backquote began a word;
 # in rounds 16-17 every plain `(` was a subshell, so a `#` after an array assignment, a regex group or an
@@ -737,6 +756,12 @@ LINE_BREAK_LOOKALIKE = re.compile("[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]|\r(?!\
 CONTROL_CHARACTER = re.compile("[\x00-\x08\x0e-\x1b\x1f]")
 REFUSED_CHARACTER = re.compile("%s|%s" % (LINE_BREAK_LOOKALIKE.pattern, CONTROL_CHARACTER.pattern))
 SUBSTITUTION_CONTEXTS = ("$(", "<(")  # r20 S27: bash may end a heredoc body opened in one at an `E)` line
+# r21 S30: the prompt transformation ${var@P} runs a command substitution held in the value; bash removes a
+# backslash-newline inside the word before it parses it, so the pattern skips those too
+PROMPT_TRANSFORM = re.compile(r"@(?:\\\n)*P(?:\\\n)*\}")
+EXPANDING_DOLLAR = re.compile(r"[A-Za-z0-9_@*#?!$-]")  # r21 S30: a `$` before one of these starts an expansion
+COMMAND_TEXT = re.compile(r"\$\(|`")  # r21 S30: a `$(` (so also `$((`) or a backquote
+STORED_DATA = "command text stored as data"
 
 
 def _line_col(text, at):
@@ -784,6 +809,7 @@ def _shell_prepass(text, name="text"):
     out, stack, where, i, n = [], [], [], 0, len(text)
     word_start, cmd_pos, keep = True, True, 0  # keep: out[:keep] is never stripped as trailing blanks
     pending, heredocs = [], []  # r19 K16: the openers read on the current logical line; the bodies read
+    dollar = None  # r21 S30: the offset of a `$` that bash keeps as a literal character of the word being read
 
     def problem(at, what):
         line, col = _line_col(text, at)
@@ -798,6 +824,9 @@ def _shell_prepass(text, name="text"):
             return problem(refused.start(), "a control character U+%04X" % ord(found))
         what = "a lone \\r" if found == "\r" else "U+%04X" % ord(found)
         return problem(refused.start(), "%s, which str.splitlines() reads as a line break (only a newline ends a line here)" % what)
+    prompt = PROMPT_TRANSFORM.search(text)  # r21 S30: anywhere in the text (code, any body, a comment)
+    if prompt:
+        return problem(prompt.start(), "an eval-class expansion (${var@P})")
 
     def push(kind, at):
         stack.append(kind)
@@ -810,13 +839,22 @@ def _shell_prepass(text, name="text"):
     while i < n:
         ch, nxt = text[i], text[i + 1 : i + 2]
         top = stack[-1] if stack else ""
+        # r21 S30: a literal `$` followed by a literal `(` in the quote-removed word, or a literal backquote, is
+        # command text bash keeps as data (an eval-class expansion such as $((p)) or ${b[p]} can run it later)
+        held, dollar = dollar, None
         if top == "'":
+            if ch == "`" or (ch == "(" and held is not None):
+                return problem(i if ch == "`" else held, STORED_DATA)
+            dollar = i if ch == "$" else held if ch == "'" else None
             out.append(ch)
             i += 1
             if ch == "'":
                 pop()
             continue
         if ch == "\\":
+            if nxt == "`" or (nxt == "(" and held is not None and top != '"'):
+                return problem(i + 1 if nxt == "`" else held, STORED_DATA)
+            dollar = i + 1 if nxt == "$" else held if nxt == "\n" else None
             out.extend(text[i : i + 2])
             i += 2
             keep = len(out)
@@ -868,6 +906,12 @@ def _shell_prepass(text, name="text"):
                 out.append(ch)
                 i += 1
                 continue
+            if ch == "(" and held is not None:
+                return problem(held, STORED_DATA)
+            if ch == "$" and not EXPANDING_DOLLAR.match(nxt):
+                dollar = i
+            elif ch == '"' or (top == "${" and ch == "'"):
+                dollar = held  # a quote that is removed: the word value runs on
             if top == '"' and ch == '"':
                 pop()
             elif top == "${" and ch == "}":
@@ -967,6 +1011,12 @@ def _shell_prepass(text, name="text"):
         if word_start and ch not in COMMENT_WORD_BREAK:
             cmd_pos = False  # a word begins, so the command is named and no OPERATOR `(` follows it
         prev = out[-1] if out and len(out) > keep else ""
+        if ch == "(" and held is not None:
+            return problem(held, STORED_DATA)
+        if ch == "$" and not EXPANDING_DOLLAR.match(nxt):
+            dollar = i
+        elif ch in "'\"":
+            dollar = held  # an opening quote is removed: the word value runs on
         if ch in ";&|\n" and top in CMD_CONTEXTS and not (ch == "&" and prev in ("<", ">")):
             cmd_pos = True
         # r17 K12: only a `)` that pops an OPERATOR bracket begins a word; r18 K13: only a `(` at a word start
@@ -1043,9 +1093,17 @@ def _shell_prepass(text, name="text"):
                         break
                     if in_substitution and line.startswith(word):
                         return problem(i + len(body) - len(line), "a heredoc body line inside a command substitution that starts with the delimiter %s (bash may end the body there)" % word)
-                    expansion = None if quoted else re.search(r"\$\(|`", body)
-                    if expansion:
-                        return problem(i + expansion.start(), "an expansion inside an unquoted heredoc body (bash runs it)")
+                    if not quoted and (len(body) - len(body.rstrip("\\"))) % 2:
+                        # r21 K21: bash removes a backslash-newline in an unquoted body before it compares the
+                        # terminator, so the next line is body text in bash; the join is refused, never copied
+                        return problem(i + len(body) - 1, "a backslash-newline inside an unquoted heredoc body")
+                    found = COMMAND_TEXT.search(body)
+                    if found:
+                        # r20 K18 / r21 S30: in an unquoted body bash runs an unescaped one; an escaped one, and
+                        # any one in a quoted body (p=$(cat <<'E' ...) stores it), is command text kept as data
+                        before = body[: found.start()]
+                        escaped = quoted or (len(before) - len(before.rstrip("\\"))) % 2
+                        return problem(i + found.start(), STORED_DATA if escaped else "an expansion inside an unquoted heredoc body (bash runs it)")
                     out.extend(text[i : j + 1])
                     i = j + 1
                 heredocs.append((at, word, strip_tabs, start, len(out)))
@@ -1077,9 +1135,15 @@ def _drop_heredoc_bodies(code, heredocs):
 
 def _heredoc_lines(code, heredocs):
     """r19 K16: the 0-based line numbers of the comment-free code that are heredoc body or terminator lines."""
-    lines = set()
+    lines, at, line = set(), 0, 0  # r21 K22: one forward pass; line is the 0-based line of offset `at`
     for _, _, _, start, end in heredocs:
-        lines.update(range(code.count("\n", 0, start), code.count("\n", 0, end - 1) + 1))
+        if start < at:  # the pre-pass emits the spans in order; recount from the top if one ever is not
+            at, line = 0, 0
+        line += code.count("\n", at, start)
+        first = line
+        line += code.count("\n", start, end - 1)
+        at = end - 1
+        lines.update(range(first, line + 1))
     return lines
 
 
@@ -1236,7 +1300,7 @@ def _logical_lines(text, name="text"):
     if len(raw) != len(kept):
         raise AssertionError("%s: the comment pre-pass kept %d lines of %d; the line alignment is lost" % (name, len(kept), len(raw)))
     bodies = _heredoc_lines(code, heredocs)
-    out, pending = [], None
+    out, pending = [], None  # r21 K22: pending holds the pieces of a continued line, joined once (linear)
     for k, (ln, kept_ln) in enumerate(zip(raw, kept)):
         if k in bodies:
             if pending is not None:
@@ -1248,13 +1312,21 @@ def _logical_lines(text, name="text"):
         if pending is not None:
             if not ln.strip():
                 continue
-            ln, kept_ln, pending = pending[0] + " " + ln.lstrip(), pending[1] + " " + kept_ln.lstrip(), None
-        if ln.endswith("\\") and k + 1 < len(raw):
-            pending = (ln[:-1], kept_ln[:-1] if kept_ln.endswith("\\") else kept_ln)
+            pieces, kept_pieces = pending
+            pieces.append(ln.lstrip())
+            kept_pieces.append(kept_ln.lstrip())
+            pending = None
+        else:
+            pieces, kept_pieces = [ln], [kept_ln]
+        if pieces[-1].endswith("\\") and k + 1 < len(raw):
+            pieces[-1] = pieces[-1][:-1]
+            if kept_pieces[-1].endswith("\\"):
+                kept_pieces[-1] = kept_pieces[-1][:-1]
+            pending = (pieces, kept_pieces)
             continue
-        out.append((ln, kept_ln, False))
+        out.append((" ".join(pieces), " ".join(kept_pieces), False))
     if pending is not None:
-        out.append((pending[0] + " ", pending[1] + " ", False))
+        out.append((" ".join(pending[0]) + " ", " ".join(pending[1]) + " ", False))
     return out
 
 
@@ -2916,7 +2988,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         "ub": ("exec 3>&1\ncat <<E >/dev/null\n$(echo RAN:ub >&3)\nE\necho RAN:after", "an expansion inside an unquoted heredoc body"),
         "ubq": ("exec 3>&1\ncat <<E >/dev/null\n`echo RAN:ubq >&3`\nE\necho RAN:after", "an expansion inside an unquoted heredoc body"),
         "ubp": ("exec 3>&1\ncat <<E >/dev/null\n${x:=$(echo RAN:ubp >&3)}\nE\necho RAN:after", "an expansion inside an unquoted heredoc body"),
-        "ubquoted": ("exec 3>&1\ncat <<'E' >/dev/null\n$(echo RAN:no >&3)\nE\necho RAN:ubquoted", False),
+        "ubquoted": ("exec 3>&1\ncat <<'E' >/dev/null\n${x:=y} $HOME \\\nE\necho RAN:ubquoted", False),  # r21: no command text
         # r20 S27: inside a command substitution bash may end a body at a line that only STARTS with the
         # delimiter (`E)`, or `E` + backquote); a backquote opener and such a body line are refused by name
         "s27bq": ("x=`cat <<E\nb\nE`\necho RAN:s27bq\nE\n`\necho RAN:after", "a heredoc opened inside a command substitution"),
@@ -3110,6 +3182,133 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
                 subprocess.run(["bash", "--norc", "--noprofile", "-c", text], cwd=directory, capture_output=True, timeout=10, check=False)
                 self.assertTrue((pathlib.Path(directory) / "leak.txt").exists(), "bash runs the redirect after the terminator")
 
+    def _bash_file_markers(self, rows):
+        """r21: run each row as a script FILE (`bash --norc --noprofile FILE`) in a scratch directory under
+        .local-runs; {tag: sorted RAN: words bash printed}."""
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash not installed")
+        scratch = REPO / ".local-runs" / "pgbouncer-4734-tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        ran = {}
+        with tempfile.TemporaryDirectory(dir=str(scratch)) as directory:
+            for tag, text in rows.items():
+                script = pathlib.Path(directory) / ("%s.sh" % tag)
+                script.write_bytes(text.encode("utf-8"))
+                run = subprocess.run([bash, "--norc", "--noprofile", str(script)], cwd=directory, capture_output=True, text=True, timeout=10, check=False)
+                ran[tag] = sorted(ln.split()[0] for ln in run.stdout.split("\n") if ln.startswith("RAN:"))
+        return ran
+
+    def _assert_rows_against_bash(self, refused, controls):
+        """r21: every refused row fails closed by the named problem at its line and column while bash runs its
+        hidden marker; every control reads, and _shell_words reads exactly the marker words bash runs."""
+        ran = self._bash_file_markers(dict([(t, v[0]) for t, v in refused.items()] + list(controls.items())))
+        for tag, (text, what, (line, col)) in refused.items():
+            self.assertIn("RAN:%s" % tag, ran[tag], "row %s: bash runs the hidden marker" % tag)
+            expected = "row-%s: line %d col %d: %s" % (tag, line, col, what)
+            self.assertEqual(_shell_prepass(text, "row-%s" % tag)[1], expected, tag)
+            self.assertEqual(_shell_words(text, "row-%s" % tag)[1], expected, tag)
+        for tag, text in controls.items():
+            words, problem = _shell_words(text, "row-%s" % tag)
+            self.assertIsNone(problem, tag)
+            self.assertEqual(sorted(w for w in words if w.startswith("RAN:")), ran[tag], tag)
+
+    def test_unquoted_heredoc_backslash_newline_fails_closed_selftest_8270_r21(self):
+        # r21 K21: in an unquoted-delimiter body bash removes a backslash-newline before it compares the
+        # terminator, so `x\` + `E` is one body line `xE` there and the `: <<'true'` after it is body text; the
+        # pass ended the body at that `E`, read `: <<'true'` as an opener and hid the decoy line bash runs
+        tail = ": <<'true'\nE\n%s\ntrue\necho RAN:after\n"
+        refused = {
+            "decoy": ("cat <<E >/dev/null\nx\\\nE\n" + tail % "echo RAN:decoy compose -f ./decoy.yml config", (2, 2)),
+            "dash": ("cat <<-E >/dev/null\n\tx\\\n\tE\n" + tail % "echo RAN:dash compose -f ./decoy.yml config", (2, 3)),
+            "envelope": ("cat <<SQL >/dev/null\nselect 1;\\\nSQL\n: <<'true'\nSQL\necho RAN:envelope --project-directory /x\ntrue\n", (2, 10)),
+            "dockerhost": ("cat <<E >/dev/null\nx\\\nE\n" + tail % "export DOCKER_HOST=x; echo RAN:dockerhost", (2, 2)),
+            "odd3": ("cat <<E >/dev/null\nx\\\\\\\nE\n" + tail % "echo RAN:odd3", (2, 4)),
+        }
+        refused = dict((t, (text, "a backslash-newline inside an unquoted heredoc body", at)) for t, (text, at) in refused.items())
+        controls = {  # bash keeps the backslash under a quoted delimiter, and `\\` is an escaped backslash
+            "quoted": "cat <<'E' >/dev/null\nx\\\nE\n" + tail % "echo RAN:quoted",
+            "dquoted": 'cat <<"E" >/dev/null\nx\\\nE\n' + tail % "echo RAN:dquoted",
+            "even": "cat <<E >/dev/null\nx\\\\\nE\n" + tail % "echo RAN:even",
+            "code": "true \\\n  && echo RAN:code\ncat <<E >/dev/null\nx\nE\n",
+        }
+        self._assert_rows_against_bash(refused, controls)
+
+    def test_command_text_stored_as_data_fails_closed_selftest_8270_r21(self):
+        # r21 S30: bash runs a command substitution held in a variable's value through ${p@P} and through an
+        # arithmetic evaluation of an array subscript ($((p)), ${b[p]} with p='b[$(...)]'); the ${var@P} form is
+        # refused by name anywhere, and the command text is refused at the site where it enters the script
+        prompt, data = "an eval-class expansion (${var@P})", "command text stored as data"
+        refused = {
+            "codeP": ("exec 3>&1\np='$(echo RAN:codeP >&3)'\n: \"${p@P}\"\n", prompt, (3, 7)),
+            "bodyP": ("exec 3>&1\np='$(echo RAN:bodyP >&3)'\ncat <<E >/dev/null\n${p@P}\nE\n", prompt, (4, 4)),
+            "contP": ("exec 3>&1\np='$(echo RAN:contP >&3)'\n: \"${p@\\\nP}\"\n", prompt, (3, 7)),
+            "codeArith": ("exec 3>&1\np='b[$(echo RAN:codeArith >&3)]'\n: $((p))\n", data, (2, 6)),
+            "bodyArith": ("exec 3>&1\np='b[$(echo RAN:bodyArith >&3)]'\ncat <<E >/dev/null\n${b[p]}\nE\n", data, (2, 6)),
+            "qbodyArith": ("exec 3>&1\np=$(cat <<'E'\nb[$(echo RAN:qbodyArith >&3)]\nE\n)\n: $((p))\n", data, (3, 3)),
+            "ubodyEsc": ("exec 3>&1\np=$(cat <<E\nb[\\$(echo RAN:ubodyEsc >&3)]\nE\n)\n: $((p))\n", data, (3, 4)),
+            "concat": ("exec 3>&1\np='b[$''(echo RAN:concat >&3)]'\n: $((p))\n", data, (2, 6)),
+            "escaped": ("exec 3>&1\np=b[\\$\\(echo' RAN:escaped >&3)]'\n: $((p))\n", data, (2, 6)),
+            "dqEsc": ("exec 3>&1\np=\"b[\\$(echo RAN:dqEsc >&3)]\"\n: $((p))\n", data, (2, 7)),
+            "backquote": ("exec 3>&1\np='b[`echo RAN:backquote >&3`]'\n: $((p))\n", data, (2, 6)),
+        }
+        controls = {  # literal text, an expanded arithmetic and command substitution, a `$` kept before no `(`
+            "lit": "p='literal text'\nx=$((1+2))\necho RAN:lit \"$p\" \"$x\"\n",
+            "sub": "echo RAN:sub \"$(printf '%s' x)\" '$x' '$' \"$\"\n",
+            "dqParen": "echo RAN:dqParen \"$\\(x)\" '(' \"$x(\"\n",
+        }
+        self._assert_rows_against_bash(refused, controls)
+        self.assertRegex(": ${p@P}", BANNED_INDIRECTION)  # the password allowlist names the form as well
+
+    def test_byte_order_mark_fails_closed_by_name_selftest_8270_r21(self):
+        # r21 INFO-r17-b: a byte-order mark at offset 0 is refused by name before the UTF-8 check, for every
+        # reader that takes the script text; a U+FEFF later in the text is a character like any other
+        raw = types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda: b"\xef\xbb\xbf#!/usr/bin/env bash\nset -eu\n")
+        for reader in (_script_text, _script_header, _code_lines, _norm_lines):
+            with self.assertRaises(AssertionError) as caught:
+                reader(raw)
+            self.assertEqual(str(caught.exception), "smoke-test.sh: line 1 col 1: a byte-order mark", reader.__name__)
+        bom_bad_utf8 = types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda: b"\xef\xbb\xbf\xff\n")
+        with self.assertRaises(AssertionError) as caught:
+            _script_text(bom_bad_utf8)
+        self.assertEqual(str(caught.exception), "smoke-test.sh: line 1 col 1: a byte-order mark")
+        later = types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda: b"true\n\xef\xbb\xbf\n")
+        self.assertEqual(_script_text(later), "true\n﻿\n")
+
+    def test_prose_checks_read_the_script_by_name_selftest_8270_r21(self):
+        # r21 (security INFO): the two prose checks read the script header through _script_header, so a script
+        # that is not UTF-8 fails by name there too, never with a raw UnicodeDecodeError
+        scratch = REPO / ".local-runs" / "pgbouncer-4734-tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(scratch)) as directory:
+            bad = pathlib.Path(directory) / "smoke-test.sh"
+            bad.write_bytes(b"#!/usr/bin/env bash\n# exit 1 \xff\n")
+            with self.assertRaises(AssertionError) as caught:
+                _script_header(bad)
+            self.assertEqual(str(caught.exception), "smoke-test.sh: line 2 col 10: invalid UTF-8 byte 0xff")
+        for path in SCRIPTS:
+            self.assertEqual(_script_header(path), path.read_text().split("\n")[:50], path.name)
+        for test in (self.test_exit_code_one_is_documented_with_bring_up_and_teardown, self.test_exit_status_caveat_is_identical_in_the_four_docs):
+            source = inspect.getsource(test)
+            self.assertIn("_script_header(path)", source, test.__name__)
+            self.assertNotIn("path.read_text()", source, test.__name__)
+
+    def test_prepass_and_norm_lines_are_linear_8270_r21(self):
+        # r21 K22: _heredoc_lines counts newlines in one forward pass and _logical_lines joins each continued line
+        # once, so 40,000 continuation lines and 40,000 one-line heredocs each read well inside the budget (2.0 s
+        # on python3.9 under a loaded CI runner; at 40,000 rows the quadratic forms took 1.4 s and 16.4 s on python3.9)
+        rows = (
+            ("continuation", "echo a \\\n" * 40000 + "echo end\n", 1, set()),
+            ("heredocs", "cat <<E >/dev/null\nx\nE\n" * 40000, 120000, set(range(120000)) - set(range(0, 120000, 3))),
+        )
+        for label, text, count, bodies in rows:
+            started = time.perf_counter()
+            lines = _norm_text_lines(text, "t.sh")
+            took = time.perf_counter() - started
+            self.assertLess(took, 2.0, "%s: _norm_text_lines took %.3f s for 40,000 rows" % (label, took))
+            self.assertEqual((len(lines), lines.bodies), (count, bodies), label)
+        self.assertEqual(list(_norm_text_lines("echo a \\\n" * 3 + "echo end\n", "t.sh")), ["echo a echo a echo a echo end"])
+
     def test_declarations_do_not_read_their_own_names(self):
         # r15: `local out="$2" bodyf="${out}.body"` expanded "${out}" before `local` assigned it; under
         # set -u every envelope worker exited at its first line, and the old `wait ... || true` hid it.
@@ -3167,7 +3366,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # script headers and both READMEs.
         found = []
         for path in SCRIPTS:
-            lead = path.read_text().split("\n")[:50]
+            lead = _script_header(path)
             header = " ".join(ln.lstrip("# ").strip() for ln in lead if ln.startswith("#"))
             readme = README_FOR[path].read_text()
             for where, text in ((path.name + " header", header), (path.name + " README", readme)):
@@ -3332,7 +3531,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # a failed stack bring-up (including the concurrent-run bind failure) and
         # a failed teardown, in each script header and each README.
         for path in SCRIPTS:
-            header = " ".join(ln.lstrip("# ").strip() for ln in path.read_text().split("\n")[:50] if ln.startswith("#"))
+            header = " ".join(ln.lstrip("# ").strip() for ln in _script_header(path) if ln.startswith("#"))
             readme = " ".join(README_FOR[path].read_text().split())
             for where, text in (("header", header), ("README", readme)):
                 self.assertRegex(text, r"\b1\b[^;]*bring-up[^;]*teardown", "%s %s: exit code 1 must name bring-up and teardown" % (path.name, where))

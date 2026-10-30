@@ -104,6 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backquote substitution (or a body line inside a command substitution that only starts with the
   delimiter) and invalid UTF-8 are refused by name before any reader; the redirect and group scans consume
   the heredoc bodies of one pre-pass over the raw script text; and the shell-word problems name the line.
+  Round 21: a backslash-newline inside an unquoted heredoc body, command text stored as data (a `$(` or
+  backquote kept literal in a value that an eval-class expansion can run later) and `${var@P}` are refused
+  by name; the pre-pass line mapping and the continuation joiner are linear; and a byte-order mark is named.
 
 ### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
 
