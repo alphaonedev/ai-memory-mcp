@@ -827,7 +827,17 @@ pub struct FileScopeKeyStore {
 
 /// Most distinct slugs `marker_warned` remembers (#8315, code F3): a store
 /// that keeps missing broken key dirs for ever-new namespaces must not grow
-/// the set without bound. Past the cap a new slug is logged at debug only.
+/// the set without bound. Past the cap a new slug is logged at debug only,
+/// after one `warn` that the set is full (REVIEW-8323-security-r2 INFO-2).
+///
+/// decision: 1024 over a larger or unbounded set because a slug is
+/// `SLUG_BYTES * 2` = 32 hex characters, so a full set is about 1024 * 100
+/// bytes (roughly 100 KiB, computed from `SLUG_BYTES` and the `String` and
+/// hash-slot overhead, not measured on a deployment) per store: bounded
+/// memory per process, while every namespace past it already costs a record
+/// file and a cached ledger far larger than its set entry, so no real
+/// deployment is expected to reach the cap before that cost is the problem
+/// (REVIEW-8323-security-r2 INFO-3).
 const MARKER_WARNED_CAP: usize = 1024;
 
 /// How `note_marker_failure` classifies one marker reload failure.
@@ -1230,7 +1240,8 @@ impl FileScopeKeyStore {
     /// `SealedForeign` refusal and the subscription spans already carry it);
     /// a poisoned warned-set lock answers "first", so a poisoned lock warns
     /// rather than going quiet. The set holds at most [`MARKER_WARNED_CAP`]
-    /// slugs; past it new slugs log at debug (code F3).
+    /// slugs; past it one `warn` notes the saturation and new slugs log at
+    /// debug (code F3).
     fn log_marker_reload_failure(&self, namespace: &str, slug: &str, error: &anyhow::Error) {
         let kind = error
             .root_cause()
@@ -1253,8 +1264,12 @@ impl FileScopeKeyStore {
                 "scope-key namespace marker reload failed again; answering end-to-end"
             ),
             MarkerFailureLog::Saturated => {
+                // decision: the one saturation notice is a `warn` over
+                // `debug` because from here on new namespaces log at debug,
+                // so an operator needs one visible line that the first-failure
+                // warnings have stopped (REVIEW-8323-security-r2 INFO-2).
                 if !self.marker_warned_full_logged.swap(true, Ordering::Relaxed) {
-                    tracing::debug!(
+                    tracing::warn!(
                         cap = MARKER_WARNED_CAP,
                         "scope-key marker warned-set is full; later new namespaces log at debug only"
                     );
