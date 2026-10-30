@@ -79,7 +79,8 @@ reader (shlex words, the compose call text count, declarations, the redirect and
 lines), so a quote inside a trailing comment no longer opens a quote; the envelope worker-status block is
 pinned exactly (REAPING_PINS) and every wait in both scripts is a statement or `wait "$p" || NAME=$?` with
 a later statement-position check that reaches a FAIL exit; the exact group counts are named constants and
-their failure message names the constant and the lockstep remedy.
+their failure message is the content-pin text: a mismatch demands a full code and security review of
+the file's diff before the pin moves.
 """
 import ast
 import fnmatch
@@ -810,7 +811,7 @@ CONTROL_CHARACTER = re.compile("[\x00-\x08\x0e-\x1b\x1f]")
 REFUSED_CHARACTER = re.compile("%s|%s" % (LINE_BREAK_LOOKALIKE.pattern, CONTROL_CHARACTER.pattern))
 SUBSTITUTION_CONTEXTS = ("$(", "<(")  # r20 S27: bash may end a heredoc body opened in one at an `E)` line
 # r21 S30: the prompt transformation ${var@P} runs a command substitution held in the value; bash removes a
-# backslash-newline inside the word before it parses it, so the pattern skips those too; r22 decision 1 (K23):
+# backslash-newline inside the word before it parses it, so _prompt_transform removes those before the search; r22 decision 1 (K23):
 # every transformation letter is refused by name (@E decodes escapes into `$(` text, @Q/@A/@a and the rest
 # are refused with it, so no letter is a reviewed exception)
 # r23 decision 3 (K30): the `@` must follow the parameter (a name, a positional or special parameter, with
@@ -2984,7 +2985,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
 
     def test_count_pin_message_names_the_constant_selftest(self):
         # r16 K10: a deliberate miscount (one extra FAIL-bearing group, the code r12 legit row c6) fails with a
-        # message that names the script, the constant and the lockstep remedy.
+        # message that names the script, the constant and the content-pin review demand (PIN_REVIEW).
         lines = _norm_lines(SMOKE) + ['if true; then :; fi; true || { echo "FAIL: one" >&2; exit 1; }']
         with self.assertRaises(AssertionError) as caught:
             self._assert_counts(SMOKE.name, self._groups(lines, SMOKE.name), "SMOKE")
@@ -3661,7 +3662,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # r22 decision 1 (K23): bash's parameter transformations ${var@X} are an eval class: @P expands a
         # command substitution held in the value, @E decodes escapes into `$(` text that a later arithmetic
         # evaluation runs, @Q/@A/@a/@k/@K/@L/@U/@u the rest. Every letter is refused by name, at the `@`, so no
-        # letter is a reviewed exception; the pattern skips a backslash-newline bash removes before it parses.
+        # letter is a reviewed exception; _prompt_transform removes a backslash-newline bash removes before it parses.
         prompt = "a parameter transformation (${var@%s})"
         refused = {  # @P and @E run the hidden marker in bash; _assert_rows_against_bash proves both readers
             "tP": ("exec 3>&1\np='$(echo RAN:tP >&3)'\n: \"${p@P}\"\n", prompt % "P", (3, 7)),
@@ -4129,6 +4130,16 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             for where, text in (("header", header), ("README", readme)):
                 self.assertRegex(text, r"\b1\b[^;]*bring-up[^;]*teardown", "%s %s: exit code 1 must name bring-up and teardown" % (path.name, where))
         self.assertRegex(" ".join(README_FOR[SMOKE].read_text().split()), r"\b1\b[^;]*bind failure")
+
+
+    def test_guard_prose_never_names_the_retired_lockstep_remedy_4734_r24(self):
+        # r24 decision 1 (code L1): the count-failure message is the content-pin text since round 23, so the
+        # retired remedy wording stays out of this file's own prose. The needle is built in two halves so the
+        # body itself holds no occurrence; the row's own name is the one allowed occurrence.
+        needle = "lock" + "step"
+        own_name = "test_guard_prose_never_names_the_retired_%s_remedy_4734_r24" % needle
+        source = pathlib.Path(__file__).read_text()
+        self.assertEqual(source.replace(own_name, "").count(needle), 0)
 
 
 if __name__ == "__main__":
