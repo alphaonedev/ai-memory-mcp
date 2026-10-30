@@ -190,6 +190,31 @@ UNLANDED_ITEMS = {
     "Cert-to-peer binding enforced": 8260,
     "Refusal of Claimed (header-asserted) identity": 8265,
 }
+# Round 17 (security r15 MEDIUM-1): the IN and UNLANDED blocks are item lists. The text on and
+# below each marker line before the first item is fixed (one entry per line), and every item's
+# flattened text is pinned by mention_key() digest, so a two-space continuation cannot add a claim.
+BLOCK_LEADS = {
+    B_IN: ("",),
+    B_UNLANDED: (" Each is claimed only",
+                 "when its issue closes with a landed SHA on the GA candidate. At the pinned SHA the default is the",
+                 "permissive one named here, so a reader must not assume the control:"),
+}
+BLOCK_ITEM_DIGESTS = {
+    'Federation transport is mTLS': '7af9d4a0e5ebfcab',
+    '`sync/since` is peer-scoped': '5eaba80d5479ca12',
+    'Every shape requires TLS': 'f2f1cd1890c59733',
+    'At-rest AEAD envelope encryption': 'c6b56fdd1c512bc0',
+    'rustls is at the audited version': '2923917ac923eb56',
+    'Provenance links refuse a cycle-closing edge': '77db717d70bf2e19',
+    'Encryption in transit': 'b4c8bff1f661e05a',
+    'Quarantine of unattributed inbound writes': '112a0bacc2dfa45c',
+    'Cert-to-peer binding enforced': 'e21ade2059229f64',
+    'Refusal of Claimed (header-asserted) identity': 'e190e173786b5f3a',
+}
+# A two-space continuation line that would open a block (indented code, quote, heading, list item,
+# fence, HTML, table row, setext underline or thematic break) instead of continuing the paragraph.
+_CONT_BLOCK_RE = re.compile(r"  (?:[ \t]|>|#{1,6}(?:[ \t]|$)|[-*+](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)"
+                            r"|`{3,}|~{3,}|<|\||[-=_*][-=_* \t]*$)")
 NOT_ITEMS = {
     "Postgres-native TDE": 8284,
     "Curator namespace-scoped mode": 8264,
@@ -239,30 +264,28 @@ SYNC_SINCE_PINS = [
 CURATOR_NOT_CLAIMED = (
     "- Curator namespace-scoped mode: the curator daemon is root-equivalent (cross-tenant `for_admin` reads, "
     "`src/curator/reflection_pass.rs:125-127`; [#8264](" + ISSUE_URL + "8264), open, operator milestone decision).")
-# Round 16 (R3, security r14): every sentence of a gated file that names the sync trust-peer bypass,
-# as (path, mention_key(sentence)). A new or reworded mention (one that endorses setting the bypass,
-# for one) fails until a reviewer reads it and the table changes in this source, never in the sidecar.
+# Round 16 (R3, security r14): every census unit of a gated file that names the sync trust-peer bypass,
+# as (path, mention_key(unit)); round 17: the unit is the paragraph, list item or table row. A new or
+# reworded mention (one that endorses setting the bypass, for one) fails until a reviewer reads it and
+# the table changes in this source, never in the sidecar.
 TRUST_PEER_MENTIONS = [
-    (CERT_REL, "9093b9e0395301a8"),  # - `sync/since` is peer-scoped while the operator
-    (CERT_REL, "658752ca4236ef35"),  # The other 10 of 20 are PASS on the bare leg beca
-    ("docs/federation.md", "02d8dc5536c43023"),  # | | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (den
-    ("docs/federation.md", "d1c14ba729644f29"),  # Constants: the `*_ENV` consts in [`src/federatio
-    ("docs/federation.md", "1e3cadf87236a464"),  # Bypass detection: `trust_body_agent_id_bypass()`
-    (CHANGELOG_REL, "31a6102267320f00"),  # REFUTED and deliberately not changed: `peer_atte
-    (CHANGELOG_REL, "fa9e176818529e2b"),  # New module `src/enterprise_federation_posture.rs
-    (CHANGELOG_REL, "03f78c7040e51ccd"),  # Also folded in: the peer-enrollment / per-messag
-    (CHANGELOG_REL, "e76de8af5a02cfd4"),  # Its `scope_for(peer) == None` arm falls through
-    (CHANGELOG_REL, "fe6446ba07263189"),  # - **Docs / infra:** env-table rows **147** (dele
-    (CHANGELOG_REL, "c35fb77b27574a54"),  # Both files build their OWN router: `tests/l07_3_
-    (CHANGELOG_REL, "4011f12379944e23"),  # The file builds its OWN router with `AI_MEMORY_F
-    (CHANGELOG_REL, "7af8794440e35ac2"),  # The file builds its OWN router with `AI_MEMORY_F
-    (CHANGELOG_REL, "fe49ea88d2dcb019"),  # Calling `namespace_allowed` verbatim (as the del
-    ("docs/enterprise-deployment.md", "3cde5f24d90f3f48"),  # - [ ] `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` and `A
-    ("docs/federation-identity.md", "489a01f13977c5a4"),  # | | `AI_MEMORY_FED_SYNC_TRUST_PEER` / `AI_MEMORY
-    ("docs/reference/ARCHITECTURE_REFERENCE.md", "e7008bc70774ac95"),  # | | 25 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | bool
-    ("docs/reference/ARCHITECTURE_REFERENCE.md", "c0ce05541ec23938"),  # **[REACH TRUTH-FIX #2488/#2491, v1.0.0]** This k
-    ("docs/reference/ARCHITECTURE_REFERENCE.md", "05a8ec0a5b0d07cb"),  # Two documented behaviour flips this implies, nei
-    ("docs/reference/ARCHITECTURE_REFERENCE.md", "a7f6819833eef54c"),  # Note `AI_MEMORY_FED_SYNC_TRUST_PEER=1` (#25) doe
+    (CERT_REL, '5eaba80d5479ca12'),  # - `sync/since` is peer-scoped while the operator
+    (CERT_REL, '658752ca4236ef35'),  # The other 10 of 20 are PASS on the bare leg beca
+    ('docs/federation.md', '9114c40302e2a16b'),  # | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (deny)
+    ('docs/federation.md', 'd1c14ba729644f29'),  # Constants: the `*_ENV` consts in [`src/federatio
+    ('docs/federation.md', '47076363d44ce9d9'),  # The default posture is **strict**: an inbound wr
+    (CHANGELOG_REL, 'ededac0dd5ece961'),  # REFUTED and deliberately not changed: `peer_atte
+    (CHANGELOG_REL, 'a3e838fe6f0023a8'),  # - **`ai-memory doctor --posture enterprise-feder
+    (CHANGELOG_REL, '929585960b7f29d5'),  # - **sqlite — silently LOSSY (#2491).** The `#193
+    (CHANGELOG_REL, 'b1edf98c903951cd'),  # - **Docs / infra:** env-table rows **147** (dele
+    (CHANGELOG_REL, 'e8d596cf45dc4483'),  # - **Tests:** `tests/federation_delete_ns_scope_2
+    (CHANGELOG_REL, '3219eca3461cf74b'),  # - **Tests:** `tests/federation_pending_ns_scope_
+    (CHANGELOG_REL, 'a8dab141ae69592a'),  # - **Tests:** `tests/federation_ns_meta_scope_247
+    (CHANGELOG_REL, 'bd39f313d589d398'),  # - **The federated inbound WRITE lane is namespac
+    ('docs/enterprise-deployment.md', 'd54f2b0e1a3a798b'),  # - [ ] `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` and `A
+    ('docs/federation-identity.md', 'd38d59bf99575bfb'),  # | `AI_MEMORY_FED_SYNC_TRUST_PEER` / `AI_MEMORY_F
+    ('docs/reference/ARCHITECTURE_REFERENCE.md', '29a27e586033795a'),  # | 25 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | bool (`
+    ('docs/reference/ARCHITECTURE_REFERENCE.md', 'bdb3764974a9ef48'),  # | 147 | `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SC
 ]
 
 # ---- normalisation and character refusal ----
@@ -385,6 +408,7 @@ _ATX_RE = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
 # Round 13 (CommonMark): blockquote markers, a setext underline, a thematic break, a list marker
 # before an ATX heading, and an HTML heading element on one line.
 _QUOTE_RE = re.compile(r"(?: {0,3}>[ \t]?)*")
+_QUOTE_MARK_RE = re.compile(r"( {0,3})>[ \t]?")  # round 17: one blockquote marker, the spaces before it
 _SETEXT_RE = re.compile(r"( *)(?:=+|-+)[ \t]*$")
 _BREAK_RE = re.compile(r" {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$")
 _LEAD_ITEM_RE = re.compile(r" {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+")
@@ -409,8 +433,15 @@ _ALT_CLOSE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})[ \t]*$")
 _DELIM_PREFIX_RE = re.compile(r"[ \t]*(?:>[ \t]*)*")
 _DELIM_CHARS = frozenset("|-: \t")
 _WS_RE = re.compile(r"\s+")
-# Round 16 (R3): the sync trust-peer bypass in any spelling the folded views read.
-TRUST_PEER_RE = re.compile(r"sync[^a-z0-9]{0,4}trust[^a-z0-9]{0,4}peer")
+# Round 16 (R3): the sync trust-peer bypass in any spelling the folded views read. Round 17 (code
+# r13 LOW-1, security r15 LOW-1): also the short name, a standalone trust-peer token set to a truthy
+# value by an assignment or "to".
+TRUST_PEER_RE = re.compile(r"sync[^a-z0-9]{0,4}trust[^a-z0-9]{0,4}peer"
+                           r"|(?<![a-z0-9])trust[^a-z0-9]{0,4}peer(?![a-z0-9])[^a-z0-9]{0,4}"
+                           r"(?:=|to(?![a-z0-9]))[^a-z0-9]{0,4}(?:1|true|on|yes)(?![a-z0-9])")
+# Round 17: a census unit starts at a table row or a list item; a table row is a unit of its own.
+_TABLE_ROW_RE = re.compile(r"[ \t>]*\|")
+_LIST_ITEM_RE = re.compile(r"[ \t>]*(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
 _RELEASE_HEADING_RE = re.compile(r"^## \[\d+\.\d+\.\d+\]")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _COMMENT_OPEN = "<!--"
@@ -542,15 +573,25 @@ def _lex(lines):
     when its container ends: a line with fewer blockquote markers, or a non-blank line indented less
     than the list item's content column. Outside a paragraph a line 4+ spaces past the container is
     indented code. A list item ends at a non-blank line indented less than its content column unless
-    the line continues a paragraph lazily."""
+    the line continues a paragraph lazily. A line with more blockquote markers than the fence's
+    depth is fence content only when its first extra marker sits at or past the item's content column
+    (round 17)."""
     code, bodies, unclosed, indented_code = [], [], [], set()
     items = []  # (blockquote depth, content column) of each open list item, outermost first
     fence = None  # [character, length, depth, container column, opening line]
     para = False
     for n, raw in enumerate(lines):
-        depth, rest = _quote_split(_expand_lead(raw))
+        line = _expand_lead(raw)
+        depth, rest = _quote_split(line)
         blank = not rest.strip(" \t")
         ind = len(rest) - len(rest.lstrip(" "))
+        if fence is not None and depth > fence[2] and fence[3] > 0:
+            # Round 17 (code r13 MEDIUM-1): a deeper blockquote marker left of the list item's content
+            # column is not item content: the item ends, its fence closes, the line is a new block.
+            gap = _quote_gap(line, fence[2])
+            if gap is not None and gap < fence[3]:
+                items = [it for it in items if it[0] < fence[2] or (it[0] == fence[2] and it[1] <= gap)]
+                fence = None
         if fence is not None:
             if depth > fence[2] or (depth == fence[2] and (blank or ind >= fence[3])):
                 body = rest[fence[3]:] if depth == fence[2] else rest
@@ -618,20 +659,44 @@ def _lex(lines):
     return code, bodies, unclosed, indented_code
 
 
+def _quote_gap(line, depth):
+    """Spaces before the blockquote marker that follows the first depth markers of line (tabs in its
+    prefix already expanded); None when the line has no further marker."""
+    pos = 0
+    for _ in range(depth):
+        m = _QUOTE_MARK_RE.match(line, pos)
+        if not m:
+            return None
+        pos = m.end()
+    m = _QUOTE_MARK_RE.match(line, pos)
+    return len(m.group(1)) if m else None
+
+
 def _alt_fence_flags(lines):
     """Per line: True inside a fence under the permissive second reading (_ALT_OPEN_RE and
-    _ALT_CLOSE_RE, no container or indent rule). The fail-closed backstop in _scan() compares it
-    with _lex(): where the two readings disagree, a heading never resets the pair context."""
-    flags, fence = [], None
+    _ALT_CLOSE_RE, no list or indent rule). The fail-closed backstop in _scan() compares it
+    with _lex(): where the two readings disagree, a heading never resets the pair context.
+    Round 17 (code r13 MEDIUM-1, mirrored from _lex()): a fence whose opener sits past column 0
+    after its blockquote markers closes on a deeper blockquote marker left of that column, and the
+    line is read again as a possible opener."""
+    flags, fence = [], None  # fence = (run, blockquote depth, opener column after the markers)
     for line in lines:
+        if fence is not None and fence[2] > 0:
+            wide = _expand_lead(line)
+            if _quote_split(wide)[0] > fence[1]:
+                gap = _quote_gap(wide, fence[1])
+                if gap is not None and gap < fence[2]:
+                    fence = None
         if fence is None:
             m = _ALT_OPEN_RE.match(line)
-            fence = m.group(1) if m else None
+            if m:
+                depth, lead = _quote_split(_expand_lead(line[:m.start(1)]))
+                fence = (m.group(1), depth, len(lead))
             flags.append(fence is not None)
             continue
         flags.append(True)
         m = _ALT_CLOSE_RE.match(line)
-        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+        if m and m.group(1)[0] == fence[0][0] and len(m.group(1)) >= len(fence[0]):
             fence = None
     return flags
 
@@ -1021,24 +1086,36 @@ def _changelog_entry(text):
 
 
 def trust_peer_mentions(root=ROOT):
-    """(path, sentence) for every sentence of a gated file that names the sync trust-peer bypass, in
-    any spelling the folded views read (round 16, R3). Paragraphs are flattened; an HTML page is read
-    as its plain text."""
-    return [(rel, sent) for rel in SINGLE_SOURCE_FILES
-            for sent in trust_peer_sentences(rel, (root / rel).read_text(encoding="utf-8"))]
+    """(path, unit) for every census unit of a gated file that names the sync trust-peer bypass, in
+    any spelling the folded views read (round 16, R3). Round 17 (code r13 LOW-1, security r15 LOW-1):
+    the unit is the paragraph, list item or table row holding the match, flattened, so a sentence
+    next to a reviewed mention (a conditional endorsement that does not repeat the name) is reviewed
+    with it. An HTML page is read as its plain text."""
+    return [(rel, unit) for rel in SINGLE_SOURCE_FILES
+            for unit in trust_peer_units(rel, (root / rel).read_text(encoding="utf-8"))]
 
 
-def trust_peer_sentences(rel, raw):
+def _census_units(para):
+    units = []
+    for ln in para.split("\n"):
+        row = _TABLE_ROW_RE.match(ln) is not None
+        if not units or row or _LIST_ITEM_RE.match(ln) or units[-1][0]:
+            units.append((row, [ln]))
+        else:
+            units[-1][1].append(ln)
+    return ["\n".join(lines) for _, lines in units]
+
+
+def trust_peer_units(rel, raw):
     text = scoped_text(rel, raw)
     if rel == HTML_REL:
         text = _html_text(text)
     out = []
     for para in re.split(r"\n[ \t>]*\n", text):
-        para = _flat(para).strip()
-        if not any(TRUST_PEER_RE.search(v) for v in _mention_views(para)):
-            continue
-        sents = [s for s in _SENT_END_RE.split(para) if any(TRUST_PEER_RE.search(v) for v in _mention_views(s))]
-        out.extend(sents or [para])  # a mention split across sentences is kept as its paragraph
+        for unit in _census_units(para):
+            unit = _flat(unit).strip()
+            if unit and any(TRUST_PEER_RE.search(v) for v in _mention_views(unit)):
+                out.append(unit)
     return out
 
 
@@ -1058,6 +1135,59 @@ def _mention_views(text):
 
 def mention_key(sentence):
     return hashlib.sha256(sentence.encode("utf-8")).hexdigest()[:16]
+
+
+def block_text_problems(rel, text):
+    """Round 17 (security r15 MEDIUM-1): every line of the IN and UNLANDED blocks is the fixed lead,
+    a blank line, a `- ` item line, or a two-space continuation directly under an item line or
+    another continuation. Anything else (block quote, lazy continuation, indented continuation,
+    paragraph, nested block) is named: "<file>: line N: non-item text inside the <block> block"."""
+    lines = text.split("\n")
+    starts = {}
+    for marker in BLOCK_MARKERS:
+        hit = [n for n, ln in enumerate(lines) if ln.startswith(marker)]
+        if len(hit) != 1:
+            return ["%s: block marker must start exactly one line: %s" % (rel, marker)]
+        starts[marker] = hit[0]
+    order = sorted(starts.values())
+    out = []
+    for marker, name in ((B_IN, "IN"), (B_UNLANDED, "UNLANDED")):
+        first = starts[marker]
+        later = [n for n in order if n > first]
+        stop = later[0] if later else len(lines)
+        lead = BLOCK_LEADS[marker]
+        body = [lines[first][len(marker):]] + lines[first + 1:stop]
+        end = next((k for k in range(1, len(body)) if not body[k].strip()), len(body))
+        bad = [k for k in range(max(end, len(lead))) if k >= end or k >= len(lead) or body[k] != lead[k]]
+        if bad:
+            out.append("%s: line %d: non-item text inside the %s block" % (rel, first + bad[0] + 1, name))
+        prev = "blank"
+        for k in range(end, len(body)):
+            ln = body[k]
+            if not ln.strip():
+                ok, prev = True, "blank"
+            elif ln.startswith("- ") and ln[2:3].strip():
+                ok, prev = True, "item"
+            elif ln.startswith("  ") and prev in ("item", "cont") and not _CONT_BLOCK_RE.match(ln):
+                ok, prev = True, "cont"
+            else:
+                ok, prev = False, "bad"
+            if not ok:
+                out.append("%s: line %d: non-item text inside the %s block" % (rel, first + k + 1, name))
+    return out
+
+
+def block_item_problems(text_blocks):
+    """Round 17: every IN and UNLANDED item's flattened text matches its reviewed digest."""
+    out = []
+    for marker, expected in ((B_IN, IN_ITEMS), (B_UNLANDED, UNLANDED_ITEMS)):
+        for item in _items(text_blocks[marker]):
+            keys = [key for key in expected if key in item]
+            if len(keys) != 1:
+                out.append("item matches %d keys: %s" % (len(keys), item[:60]))
+            elif mention_key(item) != BLOCK_ITEM_DIGESTS[keys[0]]:
+                out.append("item text changed without review: %s (%s)" % (keys[0], mention_key(item)))
+    return out
 
 
 def _check_items(case, body, expected):
@@ -1337,6 +1467,19 @@ class CertificationScope8262(unittest.TestCase):
         )
         for raw in claimed:
             self.assertEqual(texts(raw + claim), [claim], raw)
+        # Round 17 (code r13 MEDIUM-1): a deeper blockquote marker left of the list item's content
+        # column ends the item, so its fence closes and the quoted heading is read.
+        close = "\n\n     ```"
+        for body, tail in (("- item\n\n  ```\n> ## Federation\n\n", ""),
+                           ("- item\n\n  ```\n> ## Federation\n\n", close),
+                           ("- item\n\n  ```\n > ## Federation\n\n", close),
+                           ("- item\n\n  ```\n> <h2>Federation</h2>\n\n", close),
+                           ("1. item\n\n   ```\n> ## Federation\n\n", close),
+                           ("> - item\n>\n>   ```\n> > ## Federation\n\n", close)):
+            raw = notes + body + claim + tail
+            self.assertEqual(texts(raw), [claim], raw)
+        # A quote marker at or past the content column stays fence content.
+        self.assertEqual(texts(notes + "- item\n\n  ```\n  > ## Federation\n\n  " + claim + "\n  ```"), [])
         # A real fence inside a list item hides the heading in it (no claim under Federation).
         for head, tail in (("- item\n\n    ```\n  ", "\n    ```"), ("- ```\n  ", "\n  ```")):
             raw = notes + head + "## Federation\n\n  " + claim + tail
@@ -1414,6 +1557,49 @@ class CertificationScope8262(unittest.TestCase):
         self.assertIn(SUPERSEDED_FACT, body)
         self.assertIn("#1968", body)
 
+    def test_block_text_is_items_only_8262(self):
+        # Round 17 (security r15 MEDIUM-1, D2): the IN and UNLANDED blocks hold items only, and each
+        # item's whole flattened text is pinned, so no claim rides in them unreviewed.
+        text = CERT.read_text(encoding="utf-8")
+        self.assertEqual(block_text_problems(CERT_REL, text), [])
+        self.assertEqual(block_item_problems(_blocks()), [])
+        lines = text.split("\n")
+        at = {m: next(n for n, ln in enumerate(lines) if ln.startswith(m)) for m in BLOCK_MARKERS}
+        tde = "Postgres-native TDE is claimed for v1.0.0."
+        last = at[B_PENDING] - 2  # the last line of the last IN item (0-based)
+        u_last = at[B_NOT] - 2  # the last line of the last UNLANDED item (0-based)
+
+        def problems(pos, add):
+            return block_text_problems(CERT_REL, "\n".join(lines[:pos] + add + lines[pos:]))
+
+        def named(n, name):
+            return ["%s: line %d: non-item text inside the %s block" % (CERT_REL, n, name)]
+        cases = (  # (0-based insert position, inserted lines, the refused 1-based line, block)
+            (last + 1, ["> " + tde], last + 2, "IN"),              # block quote
+            (last + 1, [tde], last + 2, "IN"),                     # lazy continuation
+            (last + 1, ["    " + tde], last + 2, "IN"),            # indented continuation
+            (last + 1, ["", tde], last + 3, "IN"),                 # bare paragraph
+            (last + 1, ["  > " + tde], last + 2, "IN"),            # quote in the item
+            (last + 1, ["  - " + tde], last + 2, "IN"),            # nested item
+            (last + 1, ["", "  " + tde], last + 3, "IN"),          # second item paragraph
+            (at[B_IN] + 1, [tde], at[B_IN] + 2, "IN"),             # lead text
+            (u_last + 1, ["> " + tde], u_last + 2, "UNLANDED"),
+            (u_last + 1, [tde], u_last + 2, "UNLANDED"),
+            (at[B_UNLANDED] + 1, [tde], at[B_UNLANDED] + 2, "UNLANDED"),
+        )
+        for pos, add, n, name in cases:
+            self.assertEqual(problems(pos, add), named(n, name), n)
+        # A legal two-space continuation is still refused when it changes an item's text.
+        new = list(lines)
+        new.insert(last + 1, "  " + tde)
+        self.assertEqual(block_text_problems(CERT_REL, "\n".join(new)), [])
+        sec = "\n".join(new)
+        start = sec.index(B_IN)
+        body = sec[start:sec.index(B_PENDING)].split("\n", 1)[1]
+        self.assertEqual(block_item_problems({B_IN: body, B_UNLANDED: _blocks()[B_UNLANDED]}),
+                         ["item text changed without review: Quarantine of unattributed inbound writes (%s)"
+                          % mention_key(_items(body)[-1])])
+
     def test_unlanded_block_items(self):
         body = _blocks()[B_UNLANDED]
         _check_items(self, body, UNLANDED_ITEMS)
@@ -1445,7 +1631,7 @@ class CertificationScope8262(unittest.TestCase):
         self.assertTrue(any("deferred-v1.x" in i for i in items))
 
     def test_trust_peer_bypass_never_endorsed_8262(self):
-        # Round 16 (R3): the sync trust-peer bypass is named only by the reviewed sentences in
+        # Round 16 (R3): the sync trust-peer bypass is named only by the reviewed census units in
         # TRUST_PEER_MENTIONS, both directions, in every gated file.
         mentions = trust_peer_mentions()
         found = collections.Counter((rel, mention_key(s)) for rel, s in mentions)
@@ -1457,9 +1643,29 @@ class CertificationScope8262(unittest.TestCase):
         # Synthetic: every spelling the folded views read is a mention; an unrelated sentence is not.
         for text in ("Set `AI_MEMORY_FED_SYNC_TRUST_PEER=1` on every peer.", "Enable sync-trust-peer.",
                      "Turn on SYNC&#95;TRUST&#95;PEER for speed.", "<p>Set sync trust peer to 1.</p>"):
-            self.assertEqual(len(trust_peer_sentences(HTML_REL if text.startswith("<") else "README.md", text)),
+            self.assertEqual(len(trust_peer_units(HTML_REL if text.startswith("<") else "README.md", text)),
                              1, text)
-        self.assertEqual(trust_peer_sentences("README.md", "Peers sync and trust the mesh."), [])
+        self.assertEqual(trust_peer_units("README.md", "Peers sync and trust the mesh."), [])
+
+    def test_trust_peer_short_name_and_census_unit_8262(self):
+        # Round 17 (code r13 LOW-1, security r15 LOW-1, D3): the short name set to a truthy value is a
+        # mention, and the census unit is the paragraph, list item or table row holding the match.
+        for text in ("Set TRUST_PEER to 1 for every trusted peer.", "Export `TRUST_PEER=true` first.",
+                     "Operators set TRUST_PEER to 1 for a full dump on every peer.", "Use trust-peer = yes.",
+                     "<p>Set TRUST_PEER to on.</p>"):
+            self.assertEqual(len(trust_peer_units(HTML_REL if text.startswith("<") else "README.md", text)),
+                             1, text)
+        for text in ("Trust peer-supplied sync metadata.",
+                     "Set TRUST_PEER_LIMIT to 1.", "Distrust peer to 1 of them.", "The trust peer is one.",
+                     "<!-- set AI_MEMORY_FED_SYNC_TRUST_PEER=1 -->"):
+            self.assertEqual(trust_peer_units(HTML_REL if text.startswith("<!") else "README.md", text), [], text)
+        # The unit is the paragraph, list item or table row: a sentence next to a reviewed mention is
+        # read with it, and one table row is never joined with the next.
+        para = "The bypass is `AI_MEMORY_FED_SYNC_TRUST_PEER`. Set it only for trusted peers."
+        self.assertEqual(trust_peer_units("README.md", para), [para])
+        rows = "| a | `AI_MEMORY_FED_SYNC_TRUST_PEER` | x |\n| b | other | y |\n- item\n- `SYNC_TRUST_PEER` item"
+        self.assertEqual(trust_peer_units("README.md", rows),
+                         ["| a | `AI_MEMORY_FED_SYNC_TRUST_PEER` | x |", "- `SYNC_TRUST_PEER` item"])
 
     def test_pointers_present(self):
         for rel in POINTERS:
