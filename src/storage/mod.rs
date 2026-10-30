@@ -6429,7 +6429,8 @@ fn purge_and_tombstone_forget(
             params![id, ns, now, agent_id, signature],
         )?;
         // #1956 [R56] — CRYPTO-ERASE + erasure attestation IN THIS tx, BEFORE
-        // the forget DELETE. For an encrypted per-record (0x03) row this
+        // the forget DELETE. For a crypto-erasable row (0x03 per-record or
+        // 0x05 scope, `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) this
         // DESTROYS the per-record envelope key so the ciphertext is
         // cryptographically unrecoverable even by a KEK holder (belt-and-
         // suspenders on top of the row delete); for a plaintext / legacy-0x02
@@ -6786,7 +6787,8 @@ pub fn forget_scrub_cid_genesis(conn: &Connection, id: &str) -> Result<()> {
 /// commits to, and the honest crypto-erase-vs-delete boundary.
 ///
 /// * [`KeyDestroyed`](ErasureKind::KeyDestroyed) — the row carried an
-///   encrypted per-record (`0x03`) envelope whose wrapped DEK was DESTROYED
+///   crypto-erasable envelope (`0x03` per-record or `0x05` scope, the SSOT
+///   `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) whose wrapped DEK was DESTROYED
 ///   before deletion, so the ciphertext is cryptographically unrecoverable
 ///   even by a holder of the master KEK. This is the ATTESTABLE guarantee
 ///   (conditional on at-rest encryption having been enabled when the row was
@@ -6858,8 +6860,9 @@ pub fn crypto_erase_signable_bytes(
 
 /// #1956 [R56] — CRYPTO-ERASE an encrypted record's per-record envelope key.
 ///
-/// Reads the row's `encrypted_envelope`; when it is a per-record (`0x03`)
-/// envelope, OVERWRITES it with the destroy marker (`crate::encryption::crypto_erase_marker`),
+/// Reads the row's `encrypted_envelope`; when it is a crypto-erasable envelope
+/// (`0x03` per-record or `0x05` scope, the SSOT
+/// `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`), OVERWRITES it with the destroy marker (`crate::encryption::crypto_erase_marker`),
 /// destroying the embedded wrapped DEK so the ciphertext is permanently
 /// unrecoverable. Returns `true` when a key was destroyed, `false` when the
 /// row is plaintext (NULL envelope) or a legacy `0x02` per-agent envelope
@@ -17713,6 +17716,9 @@ fn restored_cid_stamp(
         params![id],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
     )?;
+    // #8278 (code review r2 I-c): E2 routes a 0x05 row through
+    // `open_content_bound` and refuses instead of falling back to the stored
+    // content; E1 writes no 0x05 rows, so this fallback never sees one.
     let plaintext = match envelope {
         Some(env) => crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content),
         None => raw_content,

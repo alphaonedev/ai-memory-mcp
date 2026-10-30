@@ -1,11 +1,13 @@
 # ai-memory PgBouncer auth template (v0.8.0 Pillar-4 4.B, #1736).
 #
-# Format: "<user>" "<md5-hash-or-plaintext>"
-# For auth_type=md5 the second field is: 'md5' + md5(password + username).
-# Generate without echoing the password into shell history, e.g.:
-#   PW=...; printf 'md5%s\n' "$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
+# Format: "<user>" "<SCRAM-SHA-256 verifier>"
+# Use the role's stored SCRAM-SHA-256 verifier (pg_authid.rolpassword) so the
+# pooler authenticates clients and the backend with SCRAM end to end (#4732).
+# Never store a plaintext password here. Read the verifier from a superuser
+# psql session without echoing it into shell history:
+#   SELECT format('"%s" "%s"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory';
 #
-# The smoke-test stack (docker-compose.yml) injects this from POSTGRES_PASSWORD;
-# in production, render this file from your secret store (mode 0400) — do NOT
-# commit a real credential. Replace the placeholder below.
-"ai_memory" "md5REPLACE_WITH_MD5_OF_PASSWORD_PLUS_USERNAME"
+# The smoke-test stack (docker-compose.yml) renders this file at run time from
+# the role's verifier (mode 0600); in production, render it from your secret
+# store (mode 0400) -- do NOT commit a real credential. Replace the placeholder.
+"ai_memory" "SCRAM-SHA-256$4096:REPLACE_WITH_SALT$REPLACE_WITH_STOREDKEY:REPLACE_WITH_SERVERKEY"
