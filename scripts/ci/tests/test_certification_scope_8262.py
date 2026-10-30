@@ -453,8 +453,10 @@ _OPEN_TAG_RE = re.compile(r"<[a-z][a-z0-9-]*(?:%s)*\s*/?>" % _ATTR, re.IGNORECAS
 # closer "?>" or "]]>", so both alternatives end there; the text after that ">" is visible. A PI or
 # CDATA whose closer never comes is literal text to CommonMark, and stripping it can only join
 # halves (an over-count, the fail-closed direction). These two bounds are two above the grammar
-# bound, so a round-26 body (512 characters plus its "?" or "]]") is still stripped and no line counts
-# fewer than at round 26; the grammar refuses past RAW_HTML_BODY_MAX, so the census reads more.
+# bound, so a round-26 body (512 characters plus its "?" or "]]") is still stripped; the grammar refuses
+# past RAW_HTML_BODY_MAX, so the census reads more. Round 29 (code r28 LOW-1): the round-27 tags-first
+# reading (_strip_tags_first) stays a view next to the leftmost-first pass, so no line counts fewer
+# than at round 27 (measured on the round-29 corpus: 0 lines).
 _CLOSE_TAG_RE = re.compile(r"</[a-z][a-z0-9-]*\s*>|<![a-z][^<>]*>|<\?[^>]{0,%d}>"
                            r"|<!\[CDATA\[[^>]{0,%d}>" % ((RAW_HTML_BODY_MAX + 2,) * 2), re.IGNORECASE)
 # Round 27: a PI or CDATA body, or a quoted attribute value of an open tag, longer than the bound.
@@ -477,6 +479,11 @@ _RAW_HTML_RE = re.compile(r"<!-->|<!--->|<!--.*?(?:-->|\Z)|%s|%s" % (_CLOSE_TAG_
 _QUOTE_PREFIX_RE = re.compile(r"^(?:[ \t]*>[ \t]?)+", re.MULTILINE)
 _LINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)")
 _REFLINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\[[^\[\]\n]*\]")
+# Round 29 (security r28 MEDIUM-1): a quoted link title may hold ")" (a "7)" line joined into it, or
+# literal text), which ends _LINK_RE early while a browser hides the whole title. This removes a
+# quoted title after the destination for one extra view; an unterminated title runs to the end of
+# the text, so every failed start stops at the destination's first blank or parenthesis (linear).
+_LINK_TITLE_RE = re.compile(r"\]\(([^()\s]*)\s+(?:\"[^\"]*(?:\"|\Z)|'[^']*(?:'|\Z))\s*\)?")
 _MARKUP_RE = re.compile(r"[*_`~\\]")
 _SENT_END_RE = re.compile(r"[.!?][\"')\]*_`]{0,4}\s+")
 _ITEM_RE = re.compile(r"[ \t]*(?:>[ \t]*)*(?:[-*+]|(\d{1,9})[.)])[ \t]")
@@ -589,6 +596,13 @@ def _strip_comments(text):
 def _strip_raw_html(text):
     """Round 28: text with its raw HTML removed in one leftmost-first pass (_RAW_HTML_RE)."""
     return _RAW_HTML_RE.sub("", text) if "<" in text else text
+
+
+def _strip_tags_first(text):
+    """Round 29 (code r28 LOW-1): the round-27 reading, comments first, then open tags, then closing
+    tags, declarations, PI and CDATA sections. A tag inside a PI or CDATA body goes before the body's
+    own ">" can end it, so the halves around the section join (an over-count at most)."""
+    return _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(text))) if "<" in text else text
 
 
 def _unquoted(text):
@@ -1208,17 +1222,36 @@ def _census_units(para):
     return ["\n".join(lines) for _, lines in units]
 
 
+def _names_trust_peer(unit):
+    """The flattened unit if it names the bypass, read as written and, round 28, with its
+    block-quote markers removed; otherwise ""."""
+    flat, bare = _flat(unit).strip(), _flat(_unquoted(unit)).strip()
+    views = _mention_views(flat) + (_mention_views(bare) if bare != flat else ())
+    return flat if flat and any(TRUST_PEER_RE.search(v) for v in views) else ""
+
+
 def trust_peer_units(rel, raw):
     text = scoped_text(rel, raw)
     if rel == HTML_REL:
         text = _html_text(text)
     out = []
     for para in re.split(r"\n[ \t>]*\n", text):
+        rest = []
         for unit in _census_units(para):
-            # Round 28: the unit is read as written and with its block-quote markers removed.
-            flat, bare = _flat(unit).strip(), _flat(_unquoted(unit)).strip()
-            views = _mention_views(flat) + (_mention_views(bare) if bare != flat else ())
-            if flat and any(TRUST_PEER_RE.search(v) for v in views):
+            flat = _names_trust_peer(unit)
+            if flat:
+                out.append(flat)
+            else:
+                rest.append(unit)
+        # Round 29 (security r28 MEDIUM-1): a unit starts at any line shaped like a list item or table
+        # row, but CommonMark keeps many such lines in the paragraph (an ordered item not starting at 1,
+        # an empty bullet, a pipe line with no delimiter row, a dash indented four spaces, the same after
+        # a quote marker or inside a list item), so a raw HTML section or link title that spans one is
+        # whole to a browser. The units that name nothing are read again joined, as one unit (when no
+        # unit names the bypass, that is the whole paragraph), as written and unquoted.
+        if len(rest) > 1:
+            flat = _names_trust_peer("\n".join(rest))
+            if flat:
                 out.append(flat)
     return out
 
@@ -1285,18 +1318,29 @@ def _mention_views_core(text):
     the last step of every returned view, so a dash that only comes to sit between the halves once
     comments, tags, links or emphasis are gone is read the same way."""
     low = _fold_mention(text)
-    out = low
-    out = _strip_raw_html(out)
-    # Round 26 (code r25 INFO-1): this second decode turns a double-encoded pair such as
-    # "&amp;lt;!-- --&amp;gt;" into markup, one decode more than a renderer makes (it shows the pair
-    # as the visible text "&lt;!-- --&gt;"). A mention found only through it is an over-count, the
-    # fail-closed direction, and is left as it is.
-    if "&" in out:
-        out = _fold_mention(out)
-    if "[" in out:
-        out = _REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", out)).replace("[", "").replace("]", "")
-    views = (low, _MARKUP_RE.sub("", _TAG_RE.sub("", low)), _MARKUP_RE.sub("", out),
-             _keep_underscores(out))
+    outs = [_strip_raw_html(low)]
+    # Round 29 (code r28 LOW-1): the round-27 tags-first strip is read too when it differs, so every
+    # round-27 view is a view here and the views of this head only add counts.
+    if "<" in low:
+        alt = _strip_tags_first(low)
+        if alt != outs[0]:
+            outs.append(alt)
+    views = [low, _MARKUP_RE.sub("", _TAG_RE.sub("", low))]
+    for out in outs:
+        # Round 26 (code r25 INFO-1): this second decode turns a double-encoded pair such as
+        # "&amp;lt;!-- --&amp;gt;" into markup, one decode more than a renderer makes (it shows the
+        # pair as the visible text "&lt;!-- --&gt;"). A mention found only through it is an
+        # over-count, the fail-closed direction, and is left as it is.
+        if "&" in out:
+            out = _fold_mention(out)
+        links = [out]
+        if "[" in out:
+            # Round 29: with its quoted link titles removed too, as an extra reading (views only add).
+            titled = _LINK_TITLE_RE.sub(r"](\1)", out) if "](" in out else out
+            links = [_REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", link)).replace("[", "").replace("]", "")
+                     for link in ((out, titled) if titled != out else (out,))]
+        for link in links:
+            views += [_MARKUP_RE.sub("", link), _keep_underscores(link)]
     return tuple(_TRUST_DASH_RE.sub("-", view) for view in views)
 
 
@@ -2369,6 +2413,53 @@ class CertificationScope8262(unittest.TestCase):
         for text in ("> Enable TRUST<?a\n> b>?>_PEER now.", "> Enable TRUST<?a\n> b> _PEER now.",
                      "> Enable TRUST\n> _PEER now.", "> Enable TRUST<?a\n> b>_PEERS?> now."):
             self.assertEqual(count(text), 0, "control: %r" % text)
+        # Round 29 (code r28 LOW-1): the round-27 tags-first reading stays a view, so a PI or CDATA body that
+        # holds an open tag (and a comment) and sits between the halves still joins them, as at round 27.
+        for inner in ("TRUST<?a<b>?>_PEER", "TRUST<![CDATA[a<b>]]>_PEER", "TRUST<?a<b><!--c-->?>_PEER",
+                      "TRUST&lt;?a&lt;b&gt;?&gt;_PEER"):
+            for wrap in wrappers + ("Enable **x** %s now.", "Enable &lt;!-- %s --&gt; now."):
+                self.assertEqual(count(wrap % inner), 1, "tags-first reading: %r" % (wrap % inner))
+
+    def test_census_reads_a_paragraph_whole_8262(self):
+        # Round 29 (security r28 MEDIUM-1): CommonMark keeps these lines in the paragraph (none may
+        # interrupt one), so a raw HTML section or a link title that spans one is whole to a browser and
+        # the halves around it join. The census starts a unit at each of them and must read the
+        # paragraph whole when no unit names the identifier.
+        def count(text):
+            return len(trust_peer_units("README.md", text))
+        shapes = ("2. x", "7) x", "*", "+", "| a | b |", "    - x")
+        sections = ("TRUST<?a{NL}{L}{NL}b>_PEER", "TRUST<![CDATA[a{NL}{L}{NL}b>_PEER",
+                    "TRUST<!--a{NL}{L}{NL}b-->_PEER", 'TRUST<b title="a{NL}{L}{NL}b">_PEER',
+                    '[TRUST](/u "a{NL}{L}{NL}b")_PEER')
+        containers = (("Enable %s now.", "\n"), ("> Enable %s now.", "\n> "), ("- Enable %s now.", "\n  "),
+                      ("> > Enable %s now.", "\n> > "), ("- > Enable %s now.", "\n  > "))
+        rows = set()
+        for shape in shapes:
+            for section in sections:
+                for outer, nl in containers:
+                    text = outer % section.replace("{L}", shape).replace("{NL}", nl)
+                    rows.add(text)
+                    self.assertEqual(count(text), 1, "paragraph whole: %r" % text)
+        # 6 shapes x 5 sections x 5 containers; no row repeats.
+        self.assertEqual(len(rows), 150)
+        # A unit that names the identifier does not hide a split one next to it: the units that name
+        # nothing are read joined, and a match there is a census unit of its own. When the naming unit
+        # sits inside the section, the joined reading still counts (one more than a browser shows).
+        mixed = "Enable TRUST<!--a\n2. x\nb-->_PEER now.\n- Set TRUST_PEER to 1."
+        self.assertEqual(count(mixed), 2, mixed)
+        hidden = "Enable TRUST<!--a\n2. Set TRUST_PEER to 1.\n7) y\nb-->_PEER now."
+        self.assertEqual(count(hidden), 2, hidden)
+        # Controls: a visible character left between the halves still splits them; a paragraph with no
+        # identifier stays 0.
+        for text in ("Enable TRUST<!--a\n2. x\nb--> _PEER now.", "Enable TRUST<?a\n| a | b |\nb>?>_PEER now.",
+                     "Enable [TRUST](/u \"a\n*\nb\") _PEER now.", "Enable TRUST\n2. x\n_PEER now.",
+                     "Enable trust<!--a\n7) x\nb-->_peers now."):
+            self.assertEqual(count(text), 0, "control: %r" % text)
+        # A quoted link title that holds ")" on one line is hidden whole by a browser too.
+        for text in ('Enable [TRUST](/u "a)b")_PEER now.', "Enable [TRUST](/u 'a)b')_PEER now.",
+                     '- Enable [TRUST](/u "a) b" )_PEER now.'):
+            self.assertEqual(count(text), 1, "link title with ')': %r" % text)
+        self.assertEqual(count('Enable [TRUST](/u "a)b") _PEER now.'), 0)
 
     def test_trust_peer_dash_position_matrix_8262(self):
         # Round 22 (code r21 MEDIUM-1): every dash of the class, in every position relative to a
@@ -2593,6 +2684,20 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(len(bodies28), 31)
         self.assertEqual(len(axis28), 186)
         axis |= axis28
+        # Round 29 (security r28 MEDIUM-1): a section that spans a line CommonMark keeps in the paragraph
+        # (an ordered item not at 1, an empty bullet, a pipe line, a dash indented four spaces), at the top
+        # level, in a block quote and in a list item. The link-title rows are in
+        # test_census_reads_a_paragraph_whole_8262 (this renderer has no link step).
+        axis29 = {outer % section.replace("{L}", shape).replace("{NL}", nl)
+                  for shape in ("2. x", "7) x", "*", "+", "| a | b |", "    - x")
+                  for section in ("TRUST<?a{NL}{L}{NL}b>_PEER", "TRUST<![CDATA[a{NL}{L}{NL}b>_PEER",
+                                  "TRUST<!--a{NL}{L}{NL}b-->_PEER", 'TRUST<b title="a{NL}{L}{NL}b">_PEER')
+                  for outer, nl in (("Enable %s now.", "\n"), ("> Enable %s now.", "\n> "),
+                                    ("- Enable %s now.", "\n  "), ("> > Enable %s now.", "\n> > "),
+                                    ("- > Enable %s now.", "\n  > "))}
+        # 6 shapes x 4 sections x 5 outer forms; no line repeats.
+        self.assertEqual(len(axis29), 120)
+        axis |= axis29
         corpus += sorted(axis)
         # Round 28 (code r27 INFO-1): the timed loop reads every second line (the round-28 readings ran
         # up to 2.09 s over the whole corpus under load); every line is still compared below.
@@ -2652,7 +2757,9 @@ class CertificationScope8262(unittest.TestCase):
         # asserted number is the in-test elapsed time of _mention_views() alone.
         import time
         unit = '<!-- a --> &lt;!-- **TRUST**_PEER --&gt; <b title="TRUST\\_PEER">x</b> '
-        for text in (unit * (100000 // len(unit)), "<" * 100000, "<!--" * 25000 + "TRUST_PEER"):
+        # Round 29: link-title openers with no closing quote or no blank (_LINK_TITLE_RE stays linear).
+        for text in (unit * (100000 // len(unit)), "<" * 100000, "<!--" * 25000 + "TRUST_PEER",
+                     "[x](a '" * 14000 + "TRUST_PEER", "](a " * 25000 + "TRUST_PEER", '](a "b ' * 12000):
             start = time.perf_counter()
             views = _mention_views(text)
             elapsed = time.perf_counter() - start
