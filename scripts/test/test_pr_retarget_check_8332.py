@@ -255,8 +255,10 @@ class LivePath(unittest.TestCase):
                             ([stamped, change("2026-10-30t13:00:00z")], "unparsable created_at"),
                             ([stamped, change("2026-10-30T3:00:00Z")], "unparsable created_at"),
                             ([stamped, change("\u0662\u0660\u0662\u0666-10-30T13:00:00Z")], "unparsable created_at"),
-                            # round 7 (REVIEW-8332-security-r6 INFO): a number is named as such, not as missing
-                            ([stamped, {"event": "base_ref_changed", "created_at": 1793365200}], "int created_at")):
+                            # round 7 (REVIEW-8332-security-r6 INFO): a number is named as such, not as missing;
+                            # round 8 (REVIEW-8332-code-r7 INFO-1): the kind is named without an article
+                            ([stamped, {"event": "base_ref_changed", "created_at": 1793365200}],
+                             "created_at of kind int")):
             self.put("timeline_page1", events)
             self.runs(T_AFTER, T_AFTER)
             r = self.run_live()

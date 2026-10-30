@@ -19,11 +19,12 @@ The rules this guard pins (a ratchet over EVERY workflow):
    quote, flow-depth, block-scalar and plain-scalar state across lines. It is a whitelist
    (round 7): a workflow whose ``on:`` section holds any line it does not model (no or a
    second ``on`` key, an anchor, alias or tag, an open quote or flow, an early-closing flow,
-   a multi-line plain scalar, a double-quoted escape other than backslash-quote and
-   backslash-backslash, an unrecognised line, a pull_request word on a continuation line of
-   another trigger, a column-0 line after the section that is not a workflow key) is refused
+   a multi-line plain scalar, a plain value on the line below its key or dash (round 8), a
+   double-quoted escape other than backslash-quote and backslash-backslash, an unrecognised
+   line, a duplicate trigger key, a pull_request word on a continuation line of another
+   trigger, a column-0 line after the section that is not a workflow key) is refused
    by name, never read as a 0, and any ``edited`` word inside a pull_request(_target)
-   trigger body counts as listed. The ``ORACLE`` table pins every shape from rounds 3-7;
+   trigger body counts as listed. The ``ORACLE`` table pins every shape from rounds 3-8;
    where PyYAML is importable a differential test checks the table, and variants of it,
    against it.
 2. Where ``edited`` is listed, every ``cancel-in-progress`` key at ANY indent (a
@@ -65,8 +66,18 @@ ACTIVITY_TYPES = {"assigned", "unassigned", "labeled", "unlabeled", "opened", "e
                   "review_request_removed", "auto_merge_enabled", "auto_merge_disabled"}
 ON_KEY_RE = re.compile(r"""^(?:on|"on"|'on')[ \t]*:(?:[ \t]+(.*))?$""")
 TOP_KEY_RE = re.compile(r"""^(["']?)(?:name|run-name|on|permissions|env|defaults|concurrency|jobs)\1[ \t]*:(?:[ \t]|$)""")
-# An anchor, alias, tag (a bare `!` too), merge key or explicit key anywhere in the `on:` section is refused.
-ANCHOR_RE = re.compile(r"(?:^|[\s\[{,:])(?:[&*][^\s\[\]{},]|!)|<<\s*:|(?:^|[\s\[{,])\?(?:\s|$)")
+# An anchor, alias, tag (a bare `!` too), merge key or explicit key anywhere in the `on:` section is refused,
+# each by its own name (round 8, REVIEW-8332-code-r7 INFO-2).
+PROPERTY_RES = (
+    ("an anchor (`&`)", re.compile(r"(?:^|[\s\[{,:])&[^\s\[\]{},]")),
+    ("an alias (`*`)", re.compile(r"(?:^|[\s\[{,:])\*[^\s\[\]{},]")),
+    ("a tag (`!`)", re.compile(r"(?:^|[\s\[{,:])!")),
+    ("a merge key (`<<`)", re.compile(r"<<\s*:")),
+    ("an explicit key (`?`)", re.compile(r"(?:^|[\s\[{,])\?(?:\s|$)")),
+)
+READ_ESCAPES = '(only \\" and \\\\ are read)'
+NEXT_LINE_PLAIN = "plain scalar value on the line below its key or dash"
+PAST_COMMENT = "a line continues a plain scalar past a comment, which YAML does not allow"
 # A block scalar header; a tag or anchor may stand before the indicator (`key: !t |`, `- &a >-`).
 BLOCK_SCALAR_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)(?:[&!][^ \t]*[ \t]+)*[|>][1-9+-]*$")
 PR_WORD_RE = re.compile(r"(?<![\w-])pull_request(?:_target)?(?![\w-])")
@@ -87,7 +98,7 @@ class Line(NamedTuple):
     cont: bool  # starts inside a quoted scalar, continues a plain scalar or is block-scalar content: never a key
     depth: int  # flow-collection depth BEFORE this line
     plain: bool  # continues a multi-line plain scalar (refused inside the `on:` section)
-    bad: str  # why this line cannot be read exactly (an unmodelled double-quoted escape), or ""
+    bad: str  # why this line cannot be read exactly (an unmodelled escape, a next-line plain value), or ""
 
 
 def _indent(line: str) -> int:
@@ -120,6 +131,15 @@ class _Scanner:
     spell a word the scanner never sees, so it is marked ``bad`` rather than decoded. An anchor, alias or
     tag token at a scalar start is copied whole and keeps the scalar start, so a tagged block scalar is
     still a block scalar. An open quote or flow collection at the end of the file is a ParseFailure.
+
+    decision (round 8, REVIEW-8332-code-r7 F1, REVIEW-8332-security-r7 S14): a value may start on the line
+    BELOW its key or bare dash; YAML owns it by that key's (or dash's) column, so a line that ends with an
+    empty value carries its owner column to the next content line, which uses it as the parent of its plain
+    scalar or block scalar. A continuation at the value's own column is then a continuation (no scalar
+    start, never a quote opener), as in YAML. A plain value that starts on the line below is marked ``bad``
+    too, so the ``on:`` section refuses it by name (no workflow uses that shape there). A comment (trailing
+    or on its own line) ends a plain scalar in YAML, so a deeper line after it that the scanner would read
+    as a continuation is not YAML at all: ``scan`` refuses the whole file by name.
     """
 
     def __init__(self):
@@ -131,6 +151,9 @@ class _Scanner:
         self.pparent = 0  # the parent column of the plain scalar being read
         self.tok = 0  # column where the current token began
         self.inplain = False  # a plain scalar is being read
+        self.owner = None  # column of a key or `-` whose empty value starts on the next content line
+        self.cut = False  # the open plain scalar was ended by a comment: YAML continues it no further
+        self.invalid = ""  # why this line is not YAML at all (the whole file is refused), or ""
         self.bad = ""
 
     def _quoted(self, raw: str, i: int, out: list) -> int:
@@ -139,7 +162,8 @@ class _Scanner:
         if self.quote == '"' and c == "\\":
             esc = raw[i + 1:i + 2]
             if esc not in ('"', "\\") and not self.bad:
-                self.bad = f"double-quoted escape \\{esc}" if esc else "escaped line break in a double-quoted scalar"
+                what = f"double-quoted escape \\{esc}" if esc else "escaped line break in a double-quoted scalar"
+                self.bad = f"{what} {READ_ESCAPES}"
             out.append("  " if esc else " ")
             return i + 2
         if c == self.quote:
@@ -211,18 +235,48 @@ class _Scanner:
             self.plain = None
         return not ends
 
+    def _take_owner(self, raw: str):
+        """The owner column of a value that starts on this line below its key or dash, or None.
+
+        A blank or comment line keeps the carried column; any other line consumes it.
+        """
+        body = raw.lstrip(" \t")
+        if not body or body[0] == "#":
+            return None
+        owner, self.owner = self.owner, None
+        if owner is None or self.quote or self.depth or _indent(raw) <= owner:
+            return None
+        return owner
+
+    def _settle(self, text: str, owner, start: bool, cut: bool) -> None:
+        """Carry a scanned line's plain-scalar, comment and owner state to the next line."""
+        if not text.strip():
+            self.cut = self.cut or (cut and self.plain is not None)  # a comment line ends an open plain scalar
+            return
+        self.plain = (-1 if self.depth else self.pparent) if self.inplain and not self.quote else None
+        self.cut = cut and self.plain is not None
+        self.owner = self.parent if start and not self.quote and not self.depth else None
+        if owner is not None and self.inplain and not self.quote and self.pparent == owner and not self.bad:
+            self.bad = NEXT_LINE_PLAIN
+
     def line(self, raw: str) -> Line:
         """Scan one raw line and return its Line record."""
         depth, cont = self.depth, bool(self.quote)
         if self.block >= 0 and (not raw.strip() or _indent(raw) > self.block):
             return Line(_words(raw), True, depth, False, "")
-        self.block, self.bad, self.parent = -1, "", _indent(raw)
+        self.block, self.bad = -1, ""
+        owner = self._take_owner(raw)
+        self.parent = _indent(raw) if owner is None else owner
+        was_cut = self.cut
         pcont = self.inplain = self._continues(raw)
-        out, i, start = [], 0, not (cont or pcont)
+        self.invalid = PAST_COMMENT if pcont and was_cut else ""
+        out, i, cut = [], 0, False
+        start = not (cont or pcont)
         while i < len(raw):
             if self.quote:
                 i = self._quoted(raw, i, out)
             elif raw[i] == "#" and (i == 0 or raw[i - 1] in " \t"):
+                cut = True
                 break
             elif start and raw[i] in "&!*":
                 start = raw[i] != "*"  # an anchor or tag keeps the scalar start; an alias is a whole node
@@ -231,8 +285,7 @@ class _Scanner:
                 start = self._plain(raw, i, out, start)
                 i += 1
         text = "".join(out).rstrip()
-        if text.strip():
-            self.plain = (-1 if self.depth else self.pparent) if self.inplain and not self.quote else None
+        self._settle(text, owner, start, cut)
         if not self.quote and not self.depth and BLOCK_SCALAR_RE.search(text):
             self.block = self.parent
         return Line(text, cont or pcont, depth, pcont, self.bad)
@@ -242,8 +295,10 @@ def scan(text: str) -> list:
     """Every line of a workflow as a Line; ParseFailure on a quote or flow still open at the end."""
     sc = _Scanner()
     lines = []
-    for raw in text.splitlines():
+    for n, raw in enumerate(text.splitlines(), 1):
         lines.append(sc.line(raw))
+        if sc.invalid:
+            raise ParseFailure(f"line {n}: {sc.invalid}")
     if sc.quote:
         raise ParseFailure("unterminated quoted scalar")
     if sc.depth:
@@ -259,7 +314,9 @@ def _on_section(lines: list):
     workflow key; anything else means the scanner lost track of the ``on:`` section, so the file is
     refused by name rather than read short. A second top-level ``on:`` is refused too.
     decision (round 7, REVIEW-8332-code-r6 F1/F2, REVIEW-8332-security-r6 S12): a line of the section
-    the scanner marked (a multi-line plain scalar, an unmodelled double-quoted escape) is refused by name.
+    the scanner marked (a multi-line plain scalar, an unmodelled double-quoted escape) is refused by name;
+    round 8 (REVIEW-8332-code-r7 F1, REVIEW-8332-security-r7 S14) adds a plain value that starts on the
+    line below its key or dash.
     """
     keys = [i for i, ln in enumerate(lines) if not ln.cont and not ln.depth and ON_KEY_RE.match(ln.text)]
     if not keys:
@@ -277,7 +334,7 @@ def _on_section(lines: list):
         end += 1
     for n, ln in enumerate(lines[start:end], start + 1):
         if ln.bad:
-            raise ParseFailure(f"line {n}: {ln.bad} in the `on:` section (only \\\" and \\\\ are read)")
+            raise ParseFailure(f"line {n}: {ln.bad} in the `on:` section")
         if ln.plain:
             raise ParseFailure(f"line {n}: multi-line plain scalar in the `on:` section")
     rest = (ON_KEY_RE.match(lines[start].text).group(1) or "").strip()
@@ -297,9 +354,10 @@ def _block_triggers(section: list) -> dict:
 
     decision (round 7, REVIEW-8332-code-r6 F1): a second layer behind the scanner: a continuation or
     open-flow line that holds a pull_request(_target) word while the current trigger is neither is
-    refused by name, whatever YAML reads there.
+    refused by name, whatever YAML reads there. Round 8 (REVIEW-8332-code-r7 INFO-3): a trigger key
+    that appears twice is refused by name; the last one never wins silently.
     """
-    out, current = {}, None
+    out, current, seen = {}, None, set()
     child = _indent(section[0].text)
     for ln in section:
         x, ind = ln.text, _indent(ln.text)
@@ -314,6 +372,10 @@ def _block_triggers(section: list) -> dict:
         if ind < child or not (m or seq):
             raise ParseFailure(f"unrecognised line in the `on:` section: {x.strip()[:40]!r}")
         current = (m or seq).group(2)
+        if m and current in seen:
+            raise ParseFailure(f"duplicate trigger key `{current}` in the `on:` section")
+        if m:
+            seen.add(current)
         if current in KINDS:
             out[current] = (m.group(3) or "") if m else ""
     return out
@@ -323,14 +385,17 @@ def triggers(text: str) -> dict:
     """Map each pull_request(_target) trigger found in ``on:`` to its body text.
 
     Raises ParseFailure (the caller fails closed) for anything the scanner cannot account for: no or a
-    second ``on:`` key, an anchor, alias, tag or explicit key, an open quote or flow, a flow that closes
-    early, a scalar ``on:`` value with more lines under it, a multi-line plain scalar, an unmodelled
-    double-quoted escape, an unrecognised trigger-level line, a pull_request word on a continuation line
+    second ``on:`` key, an anchor, alias, tag, merge key or explicit key (each named), an open quote or
+    flow, a flow that closes early, a scalar ``on:`` value with more lines under it, a multi-line plain
+    scalar, a plain value on the line below its key or dash, an unmodelled double-quoted escape, an
+    unrecognised trigger-level line, a duplicate trigger key, a pull_request word on a continuation line
     of another trigger, or a column-0 line after the section that is not a workflow key.
     """
     rest, section = _on_section(scan(text))
-    if ANCHOR_RE.search("\n".join([rest] + [ln.text for ln in section])):
-        raise ParseFailure("anchor, alias, tag or explicit key in the `on:` section")
+    joined = "\n".join([rest] + [ln.text for ln in section])
+    for what, prop in PROPERTY_RES:
+        if prop.search(joined):
+            raise ParseFailure(f"{what} in the `on:` section")
     first = rest or (section[0].text.strip() if section else "")
     if first[:1] in ("{", "["):
         body = _flow_body(rest, section)
@@ -601,7 +666,25 @@ CANCEL_TRUE = "concurrency:\n  group: g\n  cancel-in-progress: true\n"
 APOSTROPHE_COL0 = ("on: {workflow_dispatch: {inputs: {mode: {description: it's a mode, type: choice, "
                    "options: ['a', 'b']}}},\nKIND: {types: [edited]}}\n")
 WD = "on:\n  workflow_dispatch:\n    inputs:\n      x:\n"
-# The oracle: every trigger shape that made the ratchet fail open in rounds 3-7, with what it must read.
+# Round 8 (REVIEW-8332-code-r7 F1, REVIEW-8332-security-r7 S14): a value that starts on the line BELOW its
+# key or bare dash. Each shape is built under both owners: (owner, prefix, the value's column). ``{v}`` is
+# the value's column, ``{m}`` a column between the owner and the value (still owned by the key or dash).
+NEXT_OWNERS = (("key", WD + "        description:\n", 10), ("bare dash", WD + "        options:\n          -\n", 12))
+PR_EDITED = "  pull_request:\n    types: [edited]"
+NEXT_SHAPES = (
+    ("single-quote continuation", "{v}run the\n{v}'mode\n", PR_EDITED + "  # it's\n", REFUSE),
+    ("single-quote continuation, target", "{v}run the\n{v}'mode\n",
+     "  pull_request_target:\n    types: [edited]  # it's\n", REFUSE),
+    ("double-quote continuation", '{v}run the\n{v}"mode\n', PR_EDITED + '  # "\n', REFUSE),
+    ("bracket continuation", "{v}run the\n{v}[mode\n", PR_EDITED + "\n    branches: main]\n", REFUSE),
+    ("escaped trigger key inside a single-quote continuation", "{v}run the\n{v}'mode\n",
+     '  "pull_r\\x65quest":\n    types: [edited]  # \'\n', REFUSE),
+    ("escaped target key inside a single-quote continuation", "{v}run the\n{v}'mode\n",
+     '  "pull_r\\x65quest_target":\n    types: [edited]  # \'\n', REFUSE),
+    ("block indicator on its own line, content to its left", "{v}|\n{m}'mode\n", PR_EDITED + "  # it's\n",
+     EDITED),
+)
+# The oracle: every trigger shape that made the ratchet fail open in rounds 3-8, with what it must read.
 # EDITED = edited listed under a pull_request(_target) trigger; CLEAN = not listed; REFUSE = refused by name.
 # An optional fourth field is a text the refusal or listing message must contain.
 ORACLE = (
@@ -669,7 +752,7 @@ ORACLE = (
      REFUSE, "multi-line plain scalar"),
     ("r7 tagged block scalar whose content starts with a quote",
      WD + "        description: ! |\n          'mode\n  pull_request:\n    types: [edited]  # it's\n",
-     REFUSE, "anchor, alias, tag"),
+     REFUSE, "a tag (`!`)"),
     # round 7, REVIEW-8332-code-r6 F2: an escape could spell an activity word the scanner never saw.
     ("r7 hex escape spells edited", 'on:\n  pull_request:\n    types: ["\\x65dited"]\n', REFUSE, "escape \\x"),
     ("r7 4-digit unicode escape spells edited", 'on:\n  pull_request:\n    types: ["\\u0065dited"]\n',
@@ -687,7 +770,7 @@ ORACLE = (
     ("r7 unterminated quote, no bracket",
      "on:\n  push:\n    branches: 'main\n  pull_request:\n    types: [edited]\n", REFUSE, "unterminated quoted scalar"),
     ("r7 alias in types to an anchor in env",
-     "env:\n  T: &t edited\non:\n  pull_request:\n    types: [*t]\n", REFUSE, "anchor, alias, tag"),
+     "env:\n  T: &t edited\non:\n  pull_request:\n    types: [*t]\n", REFUSE, "an alias (`*`)"),
     # round 7: the continuation-attribution mutant (REVIEW-8332-security-r6 INFO), the tag before a block
     # indicator or a quote, the second layer, and a one-line plain value that must not be read as continuing.
     ("r7 quoted scalar spanning lines in a block trigger's flow value",
@@ -701,6 +784,39 @@ ORACLE = (
      REFUSE, "continuation line under the `push` trigger"),
     ("r7 one-line plain value under a deeper key, then a trigger",
      WD + "        description: it's a [mode\n        required: false\n  pull_request:\n    types: [edited]\n", EDITED),
+    # round 8, REVIEW-8332-code-r7 F2 / REVIEW-8332-security-r7 INFO (OWN-B): the second layer, reached
+    # outside any flow bracket (a quoted continuation) and at flow depth with no continuation.
+    ("r8 pull_request word on a single-quoted continuation outside brackets",
+     "on:\n  workflow_dispatch:\n  push:\n    branches: 'a\n  pull_request:\n    types: [edited] b'\n",
+     REFUSE, "continuation line under the `push` trigger"),
+    ("r8 pull_request word on a double-quoted continuation outside brackets",
+     'on:\n  workflow_dispatch:\n  push:\n    branches: "a\n  pull_request:\n    types: [edited] b"\n',
+     REFUSE, "continuation line under the `push` trigger"),
+    ("r8 pull_request word at flow depth under another trigger",
+     "on:\n  push: {branches: [a,\n    pull_request]}\n  pull_request:\n    types: [opened]\n",
+     REFUSE, "continuation line under the `push` trigger"),
+    # round 8, REVIEW-8332-code-r7 F1: outside `on:` a next-line plain value is read, not refused.
+    ("r8 next-line plain value with a quote continuation before on:",
+     "env:\n  X:\n    a\n    'b\non:\n  pull_request:\n    types: [edited]\n", EDITED),
+    # round 8: a comment ends a plain scalar in YAML, so a deeper line after it is not YAML (found by the
+    # trailing-comment differential variant of the row above); the whole file is refused by name.
+    ("r8 deeper line after a plain value cut by a trailing comment",
+     "env:\n  X: a  # c\n    'b\non:\n  pull_request:\n    types: [edited]  # '\n", REFUSE, PAST_COMMENT),
+    ("r8 deeper line after a comment line inside a plain value",
+     "env:\n  X:\n    a\n    # c\n    b\non:\n  pull_request:\n    types: [edited]\n", REFUSE, PAST_COMMENT),
+    # round 8, REVIEW-8332-code-r7 INFO-2 / INFO-3: each property is named; a duplicate trigger key refuses.
+    ("r8 anchor on a trigger", "on:\n  pull_request: &p\n    types: [opened]\n", REFUSE, "an anchor (`&`)"),
+    ("r8 merge key in a trigger", "on:\n  pull_request:\n    <<: {types: [edited]}\n", REFUSE,
+     "a merge key (`<<`)"),
+    ("r8 explicit trigger key", "on:\n  ? pull_request\n  : {types: [edited]}\n", REFUSE, "an explicit key (`?`)"),
+    ("r8 duplicate trigger key, the last one clean",
+     "on:\n  pull_request:\n    types: [edited]\n  pull_request:\n    types: [opened]\n",
+     REFUSE, "duplicate trigger key `pull_request`"),
+) + tuple(
+    (f"r8 next-line value under a {owner}: {name}",
+     prefix + value.format(v=" " * col, m=" " * (col - 1)) + trigger, want,
+     *([NEXT_LINE_PLAIN] if want == REFUSE else []))
+    for owner, prefix, col in NEXT_OWNERS for name, value, trigger, want in NEXT_SHAPES
 )
 # Round 7 differential variants: each keeps the YAML meaning of a row, or makes it invalid (then only a
 # refusal is accepted): a trailing comment on every line, a doubled-quote key before ``on:``, one more

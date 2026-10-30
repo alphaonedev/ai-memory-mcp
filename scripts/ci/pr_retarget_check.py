@@ -141,7 +141,7 @@ def parse_stamp(raw, what):
     if raw is None or raw == "":
         raise ToolError(f"{what} has no created_at")
     if not isinstance(raw, str):
-        raise ToolError(f"{what} has a {type(raw).__name__} created_at, not a string")
+        raise ToolError(f"{what} has a created_at of kind {type(raw).__name__}, not a string")
     if not STAMP_RE.fullmatch(raw):
         raise ToolError(f"{what} has an unparsable created_at {raw!r}")
     try:
