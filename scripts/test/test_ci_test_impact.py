@@ -12,6 +12,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SELECTOR = ROOT / "scripts/ci-test-impact.sh"
+IMPACT_DIR = ROOT / "scripts/ci/impact"
+IMPACT_FILES = ("__init__.py", "common.py", "cargo_skip.py", "rules.json")
 
 
 class TestCiTestImpact(unittest.TestCase):
@@ -38,6 +40,9 @@ class TestCiTestImpact(unittest.TestCase):
             "tests/acceptance/acceptance_nhi_sqlite.rs": "// fixture\n",
             "tests/cli_subcommand_count_invariant.rs": "// fixture\n",
             "scripts/ci-test-impact.sh": SELECTOR.read_text(),
+            # #8322: the cls block calls the real cargo_skip classifier.
+            **{"scripts/ci/impact/" + name: (IMPACT_DIR / name).read_text()
+               for name in IMPACT_FILES},
         })
         self.base = self.run_command("git", "rev-parse", "HEAD").strip()
 

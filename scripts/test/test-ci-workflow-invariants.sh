@@ -98,6 +98,14 @@ build_fixture() {
         echo "# readme" > README.md
         echo "# claude" > CLAUDE.md
         echo "# doc" > docs/a.md
+        # #8322: the cls block now calls scripts/ci/impact/cargo_skip.py, so the
+        # fixture carries the REAL helper and rules (never a stub: the skip set
+        # is the thing under test).
+        mkdir -p scripts/ci/impact scripts/ci/tests
+        cp "$ROOT/scripts/ci/impact/__init__.py" "$ROOT/scripts/ci/impact/common.py" \
+           "$ROOT/scripts/ci/impact/cargo_skip.py" "$ROOT/scripts/ci/impact/rules.json" \
+           scripts/ci/impact/
+        echo "# ci test" > scripts/ci/tests/test_fixture.py
         # Passthrough stub: records the base it was handed, then emits the
         # outputs the real script would. Asserting on this is how we prove the
         # SELECTION base stayed incremental while CLASSIFICATION widened.
@@ -133,7 +141,9 @@ STUB
 
         case "$c2_kind" in
             code)    echo "// c2 code" >> src/lib.rs ;;
-            docs)    echo "c2 docs" >> CLAUDE.md ;;
+            docs)    echo "c2 docs" >> docs/b.md ;;
+            claude)  echo "c2 claude" >> CLAUDE.md ;;
+            citests) echo "c2 citest" >> scripts/ci/tests/test_fixture.py ;;
             revert)  git revert --no-edit HEAD >/dev/null 2>&1 ;;
             empty)   : ;;
         esac
@@ -278,6 +288,41 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=merge_group PR_ACTION="" PR_BASE_SHA="" 
     && ok "s9 merge_group runs the full pipeline (docs_only=false, __ALL__) — no docs-only short-circuit" \
     || bad "s9 merge_group must run everything" \
            "docs_only=$(getout "$OUT" docs_only) impact=$(getout "$OUT" test_impact) reason=$(getout "$OUT" test_impact_reason)"
+
+# --- Scenarios 10-13 (#8322): cargo_skip, the superset verdict the cargo legs
+# consume. docs_only is now tightened to docs no Rust test reads.
+F="$SCRATCH/s10"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "true" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s10 docs + scripts/ci/tests-only PR: cargo_skip=true, docs_only=false (#8322)" \
+    || bad "s10 cargo_skip on tests-only diff" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only)"
+[ "$(getout "$OUT" test_impact)" != "__SKIP__" ] \
+    && ok "s10 __SKIP__ is not honoured unless docs_only is true (second-order guard intact)" \
+    || bad "s10 __SKIP__ leak" "got test_impact=$(getout "$OUT" test_impact)"
+
+F="$SCRATCH/s11"; build_fixture "$F" docs claude
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s11 a PR touching CLAUDE.md (read by Rust tests) stays on full CI: cargo_skip=false, docs_only=false (#8322)" \
+    || bad "s11 test-read doc must not skip" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only)"
+
+F="$SCRATCH/s12"; build_fixture "$F" code docs
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && ok "s12 a PR with src/ in the whole-PR diff keeps cargo_skip=false (classification base = PR base)" \
+    || bad "s12 src diff must not skip" "cargo_skip=$(getout "$OUT" cargo_skip)"
+
+F="$SCRATCH/s13"; build_fixture "$F" code revert
+B="$(git -C "$F" rev-parse HEAD~2)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$B")"
+O2="$(run_cls "$F" "$BLOCK" EVENT_NAME=merge_group PR_ACTION="" PR_BASE_SHA="" PR_BEFORE="")"
+O3="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=opened PR_BASE_SHA=0000000000000000000000000000000000000000 PR_BEFORE="")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$O2" cargo_skip)" = "false" ] && [ "$(getout "$O3" cargo_skip)" = "false" ] \
+    && ok "s13 empty diff, merge_group and unresolvable base all fail closed: cargo_skip=false (#8322)" \
+    || bad "s13 fail-closed cargo_skip" "empty=$(getout "$OUT" cargo_skip) merge_group=$(getout "$O2" cargo_skip) zero-base=$(getout "$O3" cargo_skip)"
 
 # --- Regression leg: the PRE-FIX block MUST mis-classify scenario 1. --------
 # Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP. A
