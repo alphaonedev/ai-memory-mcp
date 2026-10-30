@@ -112,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the linear readers are proven by a CPU-time growth ratio rather than a wall-clock budget; and a code-line
   refusal names the raw script line.
 
+### Fixed (#8301 / #8305 — the shared-namespace-claims self-test derives its ceilings and cleans up after itself)
+
+- **`scripts/check-shared-namespace-claims.sh --self-test` no longer goes red when `src/storage/migrations.rs` grows, and a killed run no longer poisons the next one.** Case 2 hardcoded the `migrations.rs` ceiling candidates (`7_440`, `7_400`); once the file outgrew them no candidate reported `PASSES` and the self-test failed for a reason unrelated to the gate. The fixture now measures the file at the base, projects the merge-result size, derives every candidate from that measurement, renders the gate's digit-group format with the same `python3` formatter the gate uses, and ties each verdict to its fixture. It aborts by name when `migrations.rs` is missing or empty, or when the `llm.rs` negative control would be a no-op. The fixture worktrees and branches are named per run (`fixture/3152-dup-v2-<pid>-<epoch>`), removed by an `EXIT`/`INT`/`TERM` trap, and `git worktree prune` runs before the first fixture, so concurrent worktrees no longer collide on the shared git directory. The gate script itself is not wired into a workflow (it is listed in `scripts/qc-allowlists/gates-not-wired.txt`); the self-test is wired through the guard `scripts/ci/tests/test_shared_namespace_claims_selftest_8301.py`, which the classify job's `unittest discover` runs, and the guard refuses any ceiling in the fixture that is not derived from the measured size.
+
 ### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
 
 - **`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` now follows the `[deployment]
