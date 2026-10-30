@@ -1995,6 +1995,24 @@ FUNCTION_BODIES = {  # r15 K8: the whole body of each function, as _norm_lines r
 }
 
 
+def _exit_65_variables(lines):
+    """One (variable, 1-based line) pair per `exit 65` site; the FATAL match nearest the exit wins (#8313)."""
+    sites = []
+    for k, ln in enumerate(lines):
+        if not re.search(r"(?<![\w-])exit\s+65\b", ln):
+            continue
+        window = " ".join(lines[max(0, k - 1) : k + 1])
+        matches = re.findall(r"FATAL: ([A-Z][A-Z0-9_]*) ", window)
+        sites.append((matches[-1] if matches else None, k + 1))
+    return sites
+
+
+def _readme_exit_65_clause(readme):
+    """The README text after `65` up to the next code token, a sentence end or the end of text."""
+    found = re.search(r"\b65\b(.*?)(?:[,;] \d{2} |\. |\Z)", readme)
+    return found.group(0) if found else None
+
+
 class PgbouncerSmokeComposeTest(unittest.TestCase):
     def test_every_publish_is_loopback_only(self):
         services = _services()
@@ -2598,23 +2616,34 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # #8313: each script's README exit-65 text names the variable of every FATAL message that precedes
         # an `exit 65` site (found by parsing the script), so a new validation cannot ship undocumented.
         for path in SCRIPTS:
-            code = [ln.strip() for ln in _code_lines(path)]
-            names = []
-            for k, ln in enumerate(code):
-                if not re.search(r"(?<![\w-])exit\s+65\b", ln):
-                    continue
-                window = " ".join(code[max(0, k - 1) : k + 1])
-                found = re.search(r"FATAL: ([A-Z][A-Z0-9_]*) ", window)
-                self.assertTrue(found, "%s: exit 65 site without a FATAL message naming its variable" % path.name)
-                if found.group(1) not in names:
-                    names.append(found.group(1))
-            self.assertTrue(names, "%s: no exit 65 sites parsed" % path.name)
-            readme = " ".join(README_FOR[path].read_text().split())
-            clause = re.search(r"\b65\b(.*?)(?:, \d{2} |\. |$)", readme)
-            self.assertTrue(clause, "%s: README has no exit 65 text" % path.name)
-            text = clause.group(0)
-            for name in names:
-                self.assertIn(name, text, "%s: README exit 65 text does not name %s" % (path.name, name))
+            sites = _exit_65_variables([ln.strip() for ln in _code_lines(path)])
+            self.assertTrue(sites, "%s: no exit 65 sites parsed" % path.name)
+            for name, line in sites:
+                self.assertIsNotNone(name, "%s: exit 65 site (line %d) without a FATAL message naming its variable" % (path.name, line))
+            text = _readme_exit_65_clause(" ".join(README_FOR[path].read_text().split()))
+            self.assertIsNotNone(text, "%s: README has no exit 65 text" % path.name)
+            for name, line in sites:
+                self.assertIn(name, text, "%s: README exit 65 text does not name %s (line %d)" % (path.name, name, line))
+
+    def test_exit_65_readme_guard_selftest_8313_r2(self):
+        # Adjacent one-liners: every site is credited with its own FATAL message, none to the line above.
+        two = [
+            'a) echo "FATAL: AAA must be x" >&2; exit 65 ;;',
+            'b) echo "FATAL: BBB must be y" >&2; exit 65 ;;',
+        ]
+        self.assertEqual(_exit_65_variables(two), [("AAA", 1), ("BBB", 2)])
+        # A FATAL on the line above still counts for a bare `exit 65`; a site with none is reported.
+        self.assertEqual(_exit_65_variables(['echo "FATAL: CCC bad" >&2', "exit 65"]), [("CCC", 2)])
+        self.assertEqual(_exit_65_variables(["exit 65"]), [(None, 1)])
+        # Clause end: ", NN ", "; NN ", ". " and end of text; "over 64 characters" does not end it.
+        clause = _readme_exit_65_clause
+        self.assertEqual(clause("65 bad AAA, 73 other BBB"), "65 bad AAA, 73 ")
+        self.assertEqual(clause("65 bad AAA. Then BBB"), "65 bad AAA. ")
+        self.assertEqual(clause("65 bad AAA"), "65 bad AAA")
+        self.assertEqual(clause("65 AAA over 64 characters, 69 BBB"), "65 AAA over 64 characters, 69 ")
+        self.assertIsNone(clause("no code here"))
+        # A name documented under another code behind a semicolon must not satisfy the guard.
+        self.assertNotIn("BBB", clause("65 bad AAA; 73 no verifier BBB. end"))
 
     def test_pool_mode_step_asserts_effective_config(self):
         # r4 P6: [4/4] reads SHOW CONFIG and fails non-zero on a mismatch.
