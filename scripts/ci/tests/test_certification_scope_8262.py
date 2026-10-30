@@ -312,21 +312,23 @@ CURATOR_NOT_CLAIMED = (
 # Round 16 (R3, security r14): every census unit of a gated file that names the sync trust-peer bypass,
 # as (path, mention_key(unit)); round 17: the unit is the paragraph, list item or table row. A new or
 # reworded mention (one that endorses setting the bypass, for one) fails until a reviewer reads it and
-# the table changes in this source, never in the sidecar.
+# the table changes in this source, never in the sidecar. Round 31: three CHANGELOG units re-keyed
+# (c00c189f, 745185d8, ab535e1c); each lost only the ATX heading that follows it with no blank line,
+# now a block of its own (_starts_block); the text was re-read.
 TRUST_PEER_MENTIONS = [
     (CERT_REL, '5eaba80d5479ca12'),  # - `sync/since` is peer-scoped while the operator
     (CERT_REL, '658752ca4236ef35'),  # The other 10 of 20 are PASS on the bare leg beca
     ('docs/federation.md', '9114c40302e2a16b'),  # | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (deny)
     ('docs/federation.md', 'd1c14ba729644f29'),  # Constants: the `*_ENV` consts in [`src/federatio
     ('docs/federation.md', '47076363d44ce9d9'),  # The default posture is **strict**: an inbound wr
-    (CHANGELOG_REL, 'ededac0dd5ece961'),  # REFUTED and deliberately not changed: `peer_atte
-    (CHANGELOG_REL, 'a3e838fe6f0023a8'),  # - **`ai-memory doctor --posture enterprise-feder
+    (CHANGELOG_REL, 'c00c189f9edbbc01'),  # REFUTED and deliberately not changed: `peer_atte
+    (CHANGELOG_REL, '745185d8613bdd20'),  # - **`ai-memory doctor --posture enterprise-feder
     (CHANGELOG_REL, '929585960b7f29d5'),  # - **sqlite — silently LOSSY (#2491).** The `#193
     (CHANGELOG_REL, 'b1edf98c903951cd'),  # - **Docs / infra:** env-table rows **147** (dele
     (CHANGELOG_REL, 'e8d596cf45dc4483'),  # - **Tests:** `tests/federation_delete_ns_scope_2
     (CHANGELOG_REL, '3219eca3461cf74b'),  # - **Tests:** `tests/federation_pending_ns_scope_
     (CHANGELOG_REL, 'a8dab141ae69592a'),  # - **Tests:** `tests/federation_ns_meta_scope_247
-    (CHANGELOG_REL, 'bd39f313d589d398'),  # - **The federated inbound WRITE lane is namespac
+    (CHANGELOG_REL, 'ab535e1c0d3f34ef'),  # - **The federated inbound WRITE lane is namespac
     ('docs/enterprise-deployment.md', 'd54f2b0e1a3a798b'),  # - [ ] `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` and `A
     ('docs/federation-identity.md', 'd38d59bf99575bfb'),  # | `AI_MEMORY_FED_SYNC_TRUST_PEER` / `AI_MEMORY_F
     ('docs/reference/ARCHITECTURE_REFERENCE.md', '29a27e586033795a'),  # | 25 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | bool (`
@@ -543,6 +545,12 @@ _OPAQUE_INTERRUPT_RE = re.compile(
     r"|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol"
     r"|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr"
     r"|track|ul)(?:[ \t>]|/>|$)", re.IGNORECASE)
+# Round 31 (security r30 LOW-1, code r30 LOW-1): the HTML block starts that interrupt a paragraph on
+# GitHub (cmark-gfm, checked with POST /markdown): kinds 1-6 above less "search" (not in its kind-6
+# list) and less "<!" plus a lowercase letter (its kind 4 needs an uppercase one). Fences are read
+# apart (_starts_block); a line this misses stays in the unit, the fail-closed direction.
+_HTML_CUT_RE = re.compile(r"(?![`~]|<!(?-i:[a-z])|</?search(?:[ \t>]|/>|$))(?:%s)"
+                          % _OPAQUE_INTERRUPT_RE.pattern, re.IGNORECASE)
 _RELEASE_HEADING_RE = re.compile(r"^## \[\d+\.\d+\.\d+\]")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _COMMENT_OPEN = "<!--"
@@ -1277,7 +1285,9 @@ def _table_header(line, paragraph, next_line):
     """Round 30: True when line is the header row of a GFM table (4.10) that interrupts the
     paragraph: next_line is a delimiter row with as many cells, and both lines sit at the
     paragraph's block-quote depth, not left of its text and fewer than four columns past its
-    container markers."""
+    container markers. Round 31: the header needs a pipe, not a leading one ("a | b" over "--|--"
+    is a table); a delimiter line that is a bullet item with content ("- | -", "- |") is a list
+    item, as list-item starts are tried before the table extension (security r30 MEDIUM-1)."""
     if next_line is None:
         return False
     depth, end, col = paragraph[:3]
@@ -1287,11 +1297,28 @@ def _table_header(line, paragraph, next_line):
         if d != depth or not col <= at < end + 4:
             return False
         rows.append(text[at:])
-    if not rows[0].startswith("|") or "|" not in rows[1]:
+    bullet = _MARKER_RE.match(rows[1])
+    if bullet and bullet.group(1) is None and rows[1][bullet.end():].strip(" \t"):
+        return False
+    if "|" not in rows[0] or "|" not in rows[1]:
         return False
     marks = _cells(rows[1])
     return (bool(marks) and all(_DELIM_CELL_RE.match(c) for c in marks)
             and len(_cells(rows[0])) == len(marks))
+
+
+def _starts_block(text, at):
+    """Round 31 (security r30 LOW-1, code r30 LOW-1): True when text at column at (0-3 columns past
+    its container) starts a block that interrupts any paragraph: an ATX heading (CommonMark 4.2), a
+    thematic break of "*" or "_" (4.1; a dash run under a paragraph is a setext underline, 4.3), a
+    fence (4.5) unless a backtick fence's info string holds a backtick, or an HTML block start of
+    kinds 1-6 (4.6, _HTML_CUT_RE). Kind 7 cannot interrupt a paragraph."""
+    run = _FENCE_RUN_RE.match(text, at)
+    if run:
+        return not (run.group(1)[0] == "`" and "`" in text[run.end():])
+    rule = _BREAK_RE.match(text, at)
+    return bool(_ATX_RE.match(text, at) or (rule and rule.group(1) != "-")
+                or _HTML_CUT_RE.match(text, at))
 
 
 def _interrupts_paragraph(line, paragraph, next_line):
@@ -1311,6 +1338,9 @@ def _interrupts_paragraph(line, paragraph, next_line):
         a list interrupts a paragraph ... (a) the lines Ls must not begin with a blank line, and (b)
         if the list item is ordered, the start number must be 1."
       - the header row of a table (_table_header): GFM 4.10 needs the delimiter row after it.
+      - round 31 (security r30 LOW-1, code r30 LOW-1): a line that always interrupts a paragraph
+        (_starts_block), also left of an item's content column or at a shallower block-quote
+        depth, as such a line is never a lazy continuation.
     Every other line stays in the unit: an ordered item numbered other than 1, an empty item, a pipe
     line with no delimiter row, a marker four or more columns in, and each of these after "> " or
     inside a list item. Where a renderer may still start a block (a lazy line whose block-quote
@@ -1321,17 +1351,21 @@ def _interrupts_paragraph(line, paragraph, next_line):
         return False
     depth, end, at, text, _ = _container(line)
     if depth != paragraph[0]:
-        return False
+        return depth < paragraph[0] and at - end < 4 and _starts_block(text, at)
     item = _MARKER_RE.match(text, at)
     chain = paragraph[4]
     inner = bool(chain) and chain[-1] == paragraph[1]
     if inner and at < paragraph[1]:
-        return item is not None and at - max((end,) + tuple(c for c in chain if c <= at)) < 4
+        if at - max((end,) + tuple(c for c in chain if c <= at)) >= 4:
+            return False
+        return item is not None or _starts_block(text, at)
     if at - (paragraph[1] if inner else end) >= 4:
         return False
     if item:
         number = item.group(1)
         return bool(text[item.end():].strip(" \t")) and (number is None or int(number) == 1)
+    if _starts_block(text, at):
+        return True
     return paragraph[3] and _table_header(line, paragraph, next_line)
 
 
@@ -2610,6 +2644,39 @@ class CertificationScope8262(unittest.TestCase):
                     self.assertGreaterEqual(len(_census_units(text)), 2, "interrupted: %r" % text)
         # 5 shapes x 5 sections x 5 containers; no row repeats.
         self.assertEqual(len(rows), 125)
+        # Round 31 (security r30 LOW-1, code r30 LOW-1): an ATX heading, a "*" or "_" rule, a fence,
+        # an HTML block start of kinds 1-6 and a table with a pipe-less header interrupt a paragraph
+        # too (GitHub renders two fragments), in an ordered item as well; the line after a closed
+        # fence or HTML block is read as before.
+        blocks = ("# x", "***", "___", "```{NL}x{NL}```", "~~~{NL}x{NL}~~~", "<div>", "<pre>",
+                  "<!-- c -->", "<?p ?>", "<!DOCTYPE x>", "<![CDATA[ c ]]>", "a | b{NL}--|--")
+        boxes = (("Enable %s now.", "\n"), ("> Enable %s now.", "\n> "),
+                 ("- [ ] Enable %s now.", "\n  "), ("1. Enable %s now.", "\n   "))
+        rows = set()
+        for shape in blocks:
+            for section in sections:
+                for outer, nl in boxes:
+                    text = outer % section.replace("{L}", shape).replace("{NL}", nl)
+                    rows.add(text)
+                    self.assertEqual(count(text), 0, "interrupted: %r" % text)
+                    self.assertGreaterEqual(len(_census_units(text)), 2, "interrupted: %r" % text)
+        # 12 shapes x 5 sections x 4 containers; no row repeats.
+        self.assertEqual(len(rows), 240)
+        # Such a line is never a lazy continuation: left of an item's text or at a shallower
+        # block-quote depth it still ends the paragraph.
+        split = "%sEnable TRUST<!--a\n%s\nb-->_PEER now."
+        for lead, line in (("> ", "___"), ("> ", "# x"), ("- ", "# x"), ("1. ", "<div>"),
+                           ("- [ ] ", "```")):
+            text = split % (lead, line)
+            self.assertEqual(count(text), 0, "interrupted, lazy position: %r" % text)
+        # decision: an HTML block of kind 7 (a lone open or close tag), "<search>" and "<!" plus
+        # a lowercase letter do not interrupt a paragraph on GitHub, nor do an indented or escaped
+        # "#", a backtick fence whose info string holds a backtick, or a pipe line whose delimiter
+        # row has another cell count; the halves stay one unit.
+        for line in ("<span>", "<search>", "<!doctype x>", "    # x", "\\# x", "``` a`b",
+                     "|a|b|\n|-|"):
+            text = split % ("", line)
+            self.assertEqual(count(text), 1, "joined: %r" % text)
         # Controls: a visible character left between the halves still splits them; a paragraph with no
         # identifier stays 0.
         for text in ("Enable TRUST<!--a\n2. x\nb--> _PEER now.", "Enable TRUST<?a\n| a | b |\nb>?>_PEER now.",
@@ -2650,8 +2717,31 @@ class CertificationScope8262(unittest.TestCase):
                 rows.add(text)
                 self.assertEqual(trust_peer_units("README.md", text), [_flat(text).strip()],
                                  "split identifier outside the unit: %r" % text)
-        # (7 kept shapes + 7 halves) x 3 containers; no row repeats.
-        self.assertEqual(len(rows), 42)
+        # Round 31 (security r30 MEDIUM-1): a delimiter line that is a bullet item with content
+        # ("- | -", "- |") is a list item, as list-item starts are tried before the table extension:
+        # the pipe line above it stays in the reviewed paragraph, which the list item then ends.
+        boxes = (("%s", "\n"), ("- [ ] %s", "\n  "), ("1. %s", "\n   "))
+        tables = (("| x | y |", "- | -"), ("| x |", "- |"), ("| x |", "-\t|"))
+        for header, rule in tables:
+            for outer, nl in boxes:
+                kept_part = outer % reviewed + nl + header
+                text = kept_part + nl + rule
+                rows.add(text)
+                self.assertEqual(trust_peer_units("README.md", text), [_flat(kept_part).strip()],
+                                 "a bullet delimiter line read as a table: %r" % text)
+        # The same with the second half of an identifier on the pipe line counts once.
+        for outer, nl in boxes:
+            text = outer % "Never set TRUST<!--a" + nl + "| b-->_PEER to 1. |" + nl + "- |"
+            rows.add(text)
+            self.assertEqual(len(trust_peer_units("README.md", text)), 1,
+                             "split identifier: %r" % text)
+        # After "> " the guard grammar refuses the delimiter line (a list item inside a block
+        # quote is outside the subset), so that container stays refused rather than read.
+        quoted = "> %s\n> | x | y |\n> - | -" % reviewed
+        self.assertNotEqual(grammar_problems("README.md", quoted), [], quoted)
+        # (7 kept shapes + 7 halves) x 3 containers
+        # + (3 bullet delimiters + 1 split) x 3 containers; no row repeats.
+        self.assertEqual(len(rows), 54)
 
     def test_trust_peer_dash_position_matrix_8262(self):
         # Round 22 (code r21 MEDIUM-1): every dash of the class, in every position relative to a
