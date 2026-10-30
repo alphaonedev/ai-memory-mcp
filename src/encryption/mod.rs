@@ -1367,6 +1367,16 @@ mod tests {
         keypair_cache().lock().expect("cache lock").clear();
     }
 
+    /// The one key-directory fixture for this module (#8316): a private temp
+    /// dir born `0o700` whatever the ambient umask. `tempfile::tempdir()` on
+    /// its own inherits the umask, so under `umask 0002` it comes out `0775`
+    /// and the #3198 chain check correctly refuses it; the two #228 tests
+    /// below used it directly and went red on every `0002` host (#8316).
+    /// Delegates to the crate-wide #3705 fixture so there is a single owner.
+    fn secure_tmp_key_dir() -> tempfile::TempDir {
+        crate::identity::test_key_dir::private_tempdir()
+    }
+
     #[test]
     fn decrypt_survives_keypair_cache_clear_via_disk_persistence() {
         // #228 Part 1 — the per-agent X25519 keypair persists to disk, so
@@ -1374,7 +1384,7 @@ mod tests {
         // encrypted before the restart. Without persistence the cleared
         // cache would mint a fresh key and every prior ciphertext would be
         // permanently undecryptable.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = secure_tmp_key_dir();
         let agent = "persist-restart-agent";
         let kp1 = get_or_create_keypair_in(agent, dir.path()).expect("generate + persist");
         let env = encrypt("survives a restart", &kp1.public).expect("encrypt");
@@ -1398,7 +1408,7 @@ mod tests {
         // `.x25519.priv` is refused, not silently used (mirrors the
         // Ed25519 keystore's S4-LOW1 guard).
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = secure_tmp_key_dir();
         let agent = "lax-mode-agent";
         let _kp = get_or_create_keypair_in(agent, dir.path()).expect("persist");
         clear_keypair_cache();
@@ -1410,6 +1420,68 @@ mod tests {
         assert!(
             format!("{err}").contains("insecure mode"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// #8316 — the fixture directory is `0o700` even when the process umask
+    /// is `0002`, and the loader accepts it. Pins the fix for the two tests
+    /// above: under `umask 0002` a bare `tempfile::tempdir()` is `0775`, the
+    /// #3198 chain check refuses it, and both tests went red for the wrong
+    /// reason. The umask is widened only around the fixture call and restored
+    /// on `Drop` (panic-safe) so sibling tests never observe it.
+    #[cfg(unix)]
+    #[test]
+    fn keypair_fixture_dir_is_0700_under_umask_0002_8316() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                // SAFETY: `umask` has no preconditions, cannot fail and only
+                // sets the process file-mode creation mask (UNSAFE-01 class).
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+
+        let dir = {
+            // SAFETY: as above; the returned prior mask is restored by the guard.
+            let _widened = UmaskGuard(unsafe { libc::umask(0o002) });
+            let control = tempfile::tempdir().expect("control tempdir");
+            let control_mode = std::fs::metadata(control.path())
+                .expect("stat control dir")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                control_mode, 0o775,
+                "#8316 precondition: umask 0002 is in force, a bare tempdir is 0775"
+            );
+            secure_tmp_key_dir()
+        };
+
+        let mode = std::fs::metadata(dir.path())
+            .expect("stat fixture dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "#8316: the fixture dir must be 0700 whatever the umask, got {mode:o}"
+        );
+
+        let agent = "umask-0002-agent-8316";
+        let minted = get_or_create_keypair_in(agent, dir.path())
+            .expect("#8316: mint + persist into a fixture dir created under umask 0002");
+        clear_keypair_cache();
+        let loaded = load_keypair_in(agent, dir.path())
+            .expect("#8316: the #3198 chain check accepts the 0700 fixture dir")
+            .expect("#8316: the persisted keypair is found");
+        assert_eq!(
+            minted.secret.to_bytes(),
+            loaded.secret.to_bytes(),
+            "#8316: the keypair round-trips from a fixture dir created under umask 0002"
         );
     }
 
@@ -1733,17 +1805,6 @@ mod tests {
     }
 
     // ----- #3718 — a read never mints ---------------------------------
-
-    fn secure_tmp_key_dir() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("scratch key dir under TMPDIR");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-                .expect("chmod 0700");
-        }
-        dir
-    }
 
     fn names(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
