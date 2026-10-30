@@ -22,25 +22,31 @@ sides), and the text of a heredoc body are not flagged.
 
 Two grammars are modelled, each with the standard library only:
 
-* Markdown, per CommonMark: lines end only at `\\n`, `\\r\\n` or `\\r`;
-  block quote and list item containers are followed, so a fence inside
-  `> ` is scanned; a fence opens at most three columns into its container
-  and closes only on a run of the same character, at least as long, at most
-  three columns in, with nothing after it but blanks; up to the opening
-  fence's indent is removed from each content line. What is scanned is the
-  text a reader copies out of the rendered page.
+* Markdown, per CommonMark: lines end only at `\\n`, `\\r\\n` or `\\r`
+  (2.1); tabs stop every four columns (2.2); block quote (5.1) and list
+  item (5.2) containers are followed, so a fence inside `> ` is scanned; a
+  fence (4.5) opens at most three columns into its container and closes
+  only on a run of the same character, at least as long, at most three
+  columns in, with nothing after it but blanks; up to the opening fence's
+  indent is removed from each content line. HTML blocks (4.6) are followed
+  with the start and end table of the renderer the docs are read through
+  (markdown-it / cmark-gfm): a fence-like line inside one opens nothing.
+  What is scanned is the text a reader copies out of the rendered page.
 * Shell, per bash: one lexer, shared by the heredoc and comment checks,
-  carries quote (`'..'`, `"..."`, `$'..'`, backticks) and expansion
-  (`$( )`, `${ }`, `$(( ))`, `(( ))`, `$[ ]`) state across lines and
-  joins backslash-continued lines. A `#` starts a comment only at the start
-  of a word and outside quotes and `${ }` / arithmetic; a heredoc operator
-  counts only where a command could be (not in quotes, a comment, `${ }`
-  or arithmetic, and not `<<<`). Its body starts after the whole logical
-  line and ends only on the exact terminator line (`<<-` drops leading
-  tabs; an unquoted word joins backslash-continued body lines first). A
-  heredoc whose terminator never appears is not trusted: its would-be body
-  is scanned as normal lines. Every doubt is resolved by scanning, never by
-  skipping.
+  carries quote (`'..'`, `"..."`, `$'..'`), command substitution (`$( )`
+  and backticks, both lexed as code) and expansion (`${ }`, `$(( ))`,
+  `(( ))`, `$[ ]`) state across lines and joins backslash-continued lines.
+  A `#` starts a comment only at the start of a word and outside quotes and
+  `${ }` / arithmetic; a heredoc operator counts only where a command could
+  be (not in quotes, a comment, `${ }` or arithmetic, not inside backticks,
+  and not `<<<`). Its body starts after the whole logical line and ends
+  only on the exact terminator line (`<<-` drops leading tabs; an unquoted
+  word joins backslash-continued body lines first). A heredoc whose
+  terminator never appears is not trusted: its would-be body is scanned as
+  normal lines. Once a frame is found still open at the end of the fence,
+  the rest of the fence is scanned one physical line at a time with no
+  heredoc skip, so the work stays linear. Every doubt is resolved by
+  scanning, never by skipping.
 
 OPT-OUT MARKER (one, explicit): a fence whose FIRST line is exactly
 `# not-for-paste` is documentation of a script body, not a paste target; the
@@ -49,8 +55,10 @@ using the marker wherever the block is meant to be pasted.
 
 Run: python3 -I -m unittest discover -s scripts/ci/tests -p test_docs_shell_paste_safe_8311.py
 """
+import bisect
 import pathlib
 import re
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -67,6 +75,35 @@ THEMATIC_RE = re.compile(r"[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 ATX_RE = re.compile(r"[ \t]*#{1,6}(?:[ \t]|$)")
 SETEXT_RE = re.compile(r"[ \t]*(?:=+|-+)[ \t]*$")
 TAB = 4
+
+# CommonMark 4.6 HTML blocks, as markdown-it 2.2.0 and cmark-gfm read them
+# (the renderers the docs are read through): (type, start, end). Types 1-5
+# end on the line holding the end marker; types 6-7 end before a blank line.
+HTML_TAGS = (
+    "address article aside base basefont blockquote body caption center col "
+    "colgroup dd details dialog dir div dl dt fieldset figcaption figure footer "
+    "form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li "
+    "link main menu menuitem nav noframes ol optgroup option p param section "
+    "source summary table tbody td tfoot th thead title tr track ul"
+).split()
+HTML_ATTR = (
+    r"""(?:\s+[a-zA-Z_:][a-zA-Z0-9:._-]*"""
+    r"""(?:\s*=\s*(?:[^"'=<>`\x00-\x20]+|'[^']*'|"[^"]*"))?)"""
+)
+HTML_TAG = (
+    r"(?:<[A-Za-z][A-Za-z0-9\-]*" + HTML_ATTR + r"*\s*/?>|</[A-Za-z][A-Za-z0-9\-]*\s*>)"
+)
+HTML_BLANK_RE = re.compile(r"^[ \t]*$")
+HTML_BLOCKS = (
+    (1, re.compile(r"<(?:script|pre|style|textarea)(?=\s|>|$)", re.I),
+     re.compile(r"</(?:script|pre|style|textarea)>", re.I)),
+    (2, re.compile(r"<!--"), re.compile(r"-->")),
+    (3, re.compile(r"<\?"), re.compile(r"\?>")),
+    (4, re.compile(r"<![A-Z]"), re.compile(r">")),
+    (5, re.compile(r"<!\[CDATA\["), re.compile(r"\]\]>")),
+    (6, re.compile(r"</?(?:%s)(?=\s|/?>|$)" % "|".join(HTML_TAGS), re.I), HTML_BLANK_RE),
+    (7, re.compile(HTML_TAG + r"\s*$"), HTML_BLANK_RE),
+)
 
 
 def split_lines(text):
@@ -162,6 +199,19 @@ def fence_closes(text, col, char, run):
     return re.fullmatch(re.escape(char) + "{%d,}[ \t]*" % run, text[i:]) is not None
 
 
+def html_start(text, col, para):
+    """Return the end pattern of the HTML block (CommonMark 4.6) that `text`
+    starts, or None. With `para` set, only types 1-6 count (type 7 cannot
+    interrupt a paragraph)."""
+    width, i = lead_width(text, col)
+    if width > 3 or text[i:i + 1] != "<":
+        return None
+    for kind, start, end in HTML_BLOCKS:
+        if start.match(text, i):
+            return None if kind == 7 and para else end
+    return None
+
+
 def starts_block(text, col):
     """True when `text` cannot be a lazy paragraph continuation line. The
     innermost matched container is not the paragraph, so any list marker
@@ -170,7 +220,65 @@ def starts_block(text, col):
         return True
     if lead_width(text, col)[0] <= 3 and (THEMATIC_RE.match(text) or ATX_RE.match(text)):
         return True
+    if html_start(text, col, True) is not None:
+        return True
     return list_marker(text, col, False) is not None
+
+
+def match_containers(stack, line):
+    """Match `line` against the open containers, outermost first:
+    ["q", 0, False] a block quote; ["li", width, empty] a list item, `empty`
+    while it holds only the blank rest of its marker line.
+
+    Returns (rest, col, matched): the text after the matched container
+    prefixes, its column, and how many containers matched."""
+    rest, col = line, 0
+    matched = 0
+    for entry in stack:
+        kind, width, empty = entry
+        if kind == "q":
+            got = quote_marker(rest, col)
+            if got is None:
+                break
+            rest, col = got
+        elif not rest.strip():
+            if empty:
+                break  # an item begins with at most one blank line
+            rest, col = strip_cols(rest, col, width)
+        else:
+            if lead_width(rest, col)[0] < width:
+                break
+            rest, col = strip_cols(rest, col, width)
+            entry[2] = False
+        matched += 1
+    return rest, col, matched
+
+
+def open_containers(stack, rest, col, para):
+    """Open every block quote and list item that starts `rest`.
+
+    Returns (rest, col, para) after their markers."""
+    while True:
+        got = quote_marker(rest, col)
+        if got is not None:
+            rest, col = got
+            stack.append(["q", 0, False])
+            para = False
+            continue
+        got = list_marker(rest, col, para)
+        if got is not None:
+            rest, col, width = got
+            stack.append(["li", width, not rest.strip()])
+            para = False
+            continue
+        return rest, col, para
+
+
+def html_item_blank(stack, rest):
+    """True for a blank line inside a list item. CommonMark and cmark keep an
+    HTML block of types 1-5 open across it; markdown-it ends the block there,
+    so the guard ends it too and reads a later fence (fails closed)."""
+    return not rest.strip() and any(entry[0] == "li" for entry in stack)
 
 
 def fences(text):
@@ -178,33 +286,15 @@ def fences(text):
 
     Content lines are what CommonMark renders: container prefixes and up to
     the opening fence's indent removed."""
-    # Open containers: ["q", 0, False] block quote; ["li", width, empty] list
-    # item, `empty` while it holds only the blank rest of its marker line.
-    stack = []
+    stack = []  # open containers, as match_containers() describes them
     fence = None
+    html = None  # end pattern of the open HTML block
     para = False
     for no, line in enumerate(split_lines(text), 1):
-        rest, col = line, 0
-        matched = 0
-        for entry in stack:
-            kind, width, empty = entry
-            if kind == "q":
-                got = quote_marker(rest, col)
-                if got is None:
-                    break
-                rest, col = got
-            elif not rest.strip():
-                if empty:
-                    break  # an item begins with at most one blank line
-                rest, col = strip_cols(rest, col, width)
-            else:
-                if lead_width(rest, col)[0] < width:
-                    break
-                rest, col = strip_cols(rest, col, width)
-                entry[2] = False
-            matched += 1
+        rest, col, matched = match_containers(stack, line)
+        whole = matched == len(stack)
         if fence is not None:
-            if matched == len(stack):
+            if whole:
                 if fence_closes(rest, col, fence[0], fence[1]):
                     yield fence[3], fence[4], fence[5]
                     fence = None
@@ -216,25 +306,18 @@ def fences(text):
             yield fence[3], fence[4], fence[5]
             fence = None
             para = False
+        if html is not None:
+            if whole:
+                if html.search(rest) or html_item_blank(stack, rest):
+                    html = None  # its end line (types 1-5) or a blank line
+                continue
+            html = None  # an HTML block ends with its container
         if matched < len(stack):
             if para and not starts_block(rest, col):
                 continue  # lazy paragraph continuation line
             del stack[matched:]
             para = False
-        while True:
-            got = quote_marker(rest, col)
-            if got is not None:
-                rest, col = got
-                stack.append(["q", 0, False])
-                para = False
-                continue
-            got = list_marker(rest, col, para)
-            if got is not None:
-                rest, col, width = got
-                stack.append(["li", width, not rest.strip()])
-                para = False
-                continue
-            break
+        rest, col, para = open_containers(stack, rest, col, para)
         if not rest.strip():
             para = False
             continue
@@ -242,6 +325,11 @@ def fences(text):
         if opened:
             char, run, indent, lang = opened
             fence = [char, run, indent, lang, no + 1, []]
+            para = False
+            continue
+        end = html_start(rest, col, para)
+        if end is not None:
+            html = None if end.search(rest) else end
             para = False
             continue
         if lead_width(rest, col)[0] > 3:
@@ -258,9 +346,11 @@ def fences(text):
 
 HEREDOC_RE = re.compile(r"<<(-?)[ \t]*(?=[A-Za-z_'\"\\])")
 WORD_END = " \t;&|<>()"
-WORD_START = " \t;&|()<>\n"  # a `#` after one of these starts a comment
-QUOTES = ("'", '"', "$'", "`")
-CODE = (None, "(")  # frames where a command (and so a heredoc or comment) can be
+WORD_START = " \t;&|()<>\n`"  # a `#` after one of these starts a comment
+QUOTES = ("'", '"', "$'", "`")  # open at line end: defer the heredoc skip
+CODE = (None, "(", "`")  # frames where a command (and so a heredoc or comment) can be
+OPEN_REASON = "quote or expansion still open at the end of the fence"
+TRAIL = "trailing comment on a command line"
 
 
 def parse_heredoc_word(line, start):
@@ -304,6 +394,81 @@ def open_expansion(line, i, stack):
     return 0
 
 
+def lex_quoted(line, i, stack):
+    """One step inside a `'..'`, `"..."` or `$'..'` frame at `i`. Returns
+    (next index, prev), or None when a backslash continues the line."""
+    top, ch = stack[-1], line[i]
+    if top == "'":
+        if ch == "'":
+            stack.pop()
+        return i + 1, ch
+    if ch == "\\":
+        if i + 1 == len(line):
+            return None
+        return i + 2, line[i + 1]
+    if ch == ("'" if top == "$'" else top):
+        stack.pop()
+        return i + 1, ch
+    used = 0
+    if top == '"':
+        if ch == "`":
+            stack.append("`")  # command substitution: lexed as code
+            used = 1
+        else:
+            used = open_expansion(line, i, stack)
+    if used:
+        return i + used, line[i + used - 1]
+    return i + 1, ch
+
+
+def lex_operator(line, i, stack, top):
+    """Open or close a quote, substitution, expansion or group frame at `i`
+    in a code frame. Returns the characters used (0 for none)."""
+    ch = line[i]
+    if line.startswith("$'", i):
+        stack.append("$'")
+        return 2
+    if line.startswith('$"', i):
+        stack.append('"')
+        return 2
+    if ch == "`" and top == "`":
+        stack.pop()
+        return 1
+    if ch in "'\"`":
+        stack.append(ch)
+        return 1
+    used = open_expansion(line, i, stack)
+    if used:
+        return used
+    if top in CODE and line.startswith("((", i):
+        stack.append("((")
+        return 2
+    if ch == "(" and top in (None, "(", "((", "`"):
+        stack.append("(")
+        return 1
+    if ch == ")" and top == "(":
+        stack.pop()
+        return 1
+    if top == "((" and line.startswith("))", i):
+        stack.pop()
+        return 2
+    if ch == ")" and top == "((":
+        # `((cmd) || cmd)`: the inner subshell closed, so the outer frame
+        # is a subshell (code), as bash re-reads it.
+        stack[-1] = "("
+        return 1
+    if ch == "}" and top == "${":
+        stack.pop()
+        return 1
+    if ch == "[" and top == "$[":
+        stack.append("$[")
+        return 1
+    if ch == "]" and top == "$[":
+        stack.pop()
+        return 1
+    return 0
+
+
 def lex_line(line, stack, prev="\n"):
     """Lex one physical line with the bash quoting and expansion rules,
     continuing (and updating) the open-frame `stack`. `prev` is the
@@ -311,87 +476,47 @@ def lex_line(line, stack, prev="\n"):
     continued the previous line). Returns (comment index or None,
     [(word, strips_tabs, quoted)] heredocs opened, continued, prev)."""
     heredocs = []
+    comment = None
     i = 0
     n = len(line)
     while i < n:
         ch = line[i]
         top = stack[-1] if stack else None
-        if top == "'":
-            if ch == "'":
-                stack.pop()
-            prev = ch
-            i += 1
+        if top in ("'", '"', "$'"):
+            step = lex_quoted(line, i, stack)
+            if step is None:
+                return comment, heredocs, True, prev
+            i, prev = step
             continue
-        if top in ('"', "$'", "`"):
-            if ch == "\\":
-                if i + 1 == n:
-                    return None, heredocs, True, prev
-                prev = line[i + 1]
-                i += 2
-                continue
-            if ch == ("'" if top == "$'" else top):
-                stack.pop()
-                prev = ch
-                i += 1
-                continue
-            used = open_expansion(line, i, stack) if top == '"' else 0
-            if used:
-                prev = line[i + used - 1]
-                i += used
-            else:
-                prev = ch
-                i += 1
-            continue
-        # Code frames: top level, $( ), ${ }, (( )), $[ ].
+        # Code frames: top level, $( ), backticks, ${ }, (( )), $[ ].
         if ch == "\\":
             if i + 1 == n:
-                return None, heredocs, True, prev
+                return comment, heredocs, True, prev
             prev = "x"  # an escaped character is part of a word
             i += 2
             continue
-        used = 0
-        if line.startswith("$'", i):
-            stack.append("$'")
-            used = 2
-        elif line.startswith('$"', i):
-            stack.append('"')
-            used = 2
-        elif ch in "'\"`":
-            stack.append(ch)
-            used = 1
-        else:
-            used = open_expansion(line, i, stack)
-        if not used:
-            if top in CODE and line.startswith("((", i):
-                stack.append("((")
-                used = 2
-            elif ch == "(" and top in (None, "(", "(("):
-                stack.append("(")
-                used = 1
-            elif ch == ")" and top == "(":
-                stack.pop()
-                used = 1
-            elif top == "((" and line.startswith("))", i):
-                stack.pop()
-                used = 2
-            elif ch == "}" and top == "${":
-                stack.pop()
-                used = 1
-            elif ch == "[" and top == "$[":
-                stack.append("$[")
-                used = 1
-            elif ch == "]" and top == "$[":
-                stack.pop()
-                used = 1
+        used = lex_operator(line, i, stack, top)
         if not used and top in CODE:
             if ch == "#" and prev in WORD_START:
-                return i, heredocs, False, prev
+                comment = i if comment is None else comment
+                # A comment inside backticks ends at the closing backtick,
+                # which bash finds before it reads the substitution.
+                end = backtick_end(line, i) if "`" in stack else -1
+                if end < 0:
+                    return comment, heredocs, False, prev
+                while stack.pop() != "`":
+                    pass
+                prev = "`"
+                i = end + 1
+                continue
             if line.startswith("<<<", i):
                 used = 3
             elif line.startswith("<<", i):
                 m = HEREDOC_RE.match(line, i)
                 word, end, quoted = parse_heredoc_word(line, m.end()) if m else ("", i, False)
-                if word:
+                # Inside backticks bash re-reads the substitution text alone,
+                # so the outer lines are never its body: no skip there.
+                if word and "`" not in stack:
                     heredocs.append((word, bool(m.group(1)), quoted))
                     prev = "x"
                     i = end
@@ -400,30 +525,83 @@ def lex_line(line, stack, prev="\n"):
         used = used or 1
         prev = line[i + used - 1]
         i += used
-    return None, heredocs, False, prev
+    return comment, heredocs, False, prev
 
 
-def skip_heredocs(lines, start, pending):
+def backtick_end(line, i):
+    """Index of the first unescaped backtick at or after `i`, or -1."""
+    while i < len(line):
+        if line[i] == "`":
+            return i
+        i += 2 if line[i] == "\\" else 1
+    return -1
+
+
+class Terminators:
+    """Index of the heredoc terminator candidates of one fence body, so an
+    unterminated heredoc costs a lookup, not a scan to the end of the fence.
+
+    A body line group is a run of lines joined by backslash continuation
+    (only for an unquoted delimiter); groups end at the same lines from any
+    start that is itself a group start."""
+
+    def __init__(self, lines):
+        self.lines = lines
+        self.cache = {}
+
+    def joined(self, k, strips_tabs, quoted):
+        """Return (text, last index) of the group that starts at line `k`."""
+        lines = self.lines
+        last = k
+        # `<<-` drops the leading tabs of the line; an unquoted delimiter
+        # makes bash join backslash-continued body lines (whose own tabs
+        # stay) before the exact compare.
+        text = lines[k].lstrip("\t") if strips_tabs else lines[k]
+        while not quoted and last + 1 < len(lines) and trailing_backslash(text):
+            last += 1
+            text = text[:-1] + lines[last]
+        return text, last
+
+    def table(self, strips_tabs, quoted):
+        """{group text: ([group start], [group end])} for one heredoc mode."""
+        key = (strips_tabs, quoted)
+        if key not in self.cache:
+            out = {}
+            k = 0
+            while k < len(self.lines):
+                text, last = self.joined(k, strips_tabs, quoted)
+                starts, ends = out.setdefault(text, ([], []))
+                starts.append(k)
+                ends.append(last)
+                k = last + 1
+            self.cache[key] = out
+        return self.cache[key]
+
+    def find(self, word, strips_tabs, quoted, j):
+        """Index of the last line of the first group from `j` that equals
+        `word`, or None."""
+        lines = self.lines
+        if j >= len(lines):
+            return None
+        if not quoted and j > 0 and trailing_backslash(lines[j - 1]):
+            # `j` is inside a continued run: its first group is its own.
+            text, last = self.joined(j, strips_tabs, quoted)
+            if text == word:
+                return last
+            j = last + 1
+        starts, ends = self.table(strips_tabs, quoted).get(word, ((), ()))
+        at = bisect.bisect_left(starts, j)
+        return ends[at] if at < len(starts) else None
+
+
+def skip_heredocs(lines, start, pending, index=None):
     """Return the index after the last terminator of `pending` heredocs whose
     bodies start at `start`. A heredoc with no terminator is not trusted:
     scanning resumes where its body would have started."""
+    index = index or Terminators(lines)
     j = start
     for word, strips_tabs, quoted in pending:
-        found = None
-        k = j
-        while k < len(lines):
-            last = k
-            # `<<-` drops the leading tabs of the line; an unquoted delimiter
-            # makes bash join backslash-continued body lines (whose own tabs
-            # stay) before the exact compare.
-            text = lines[k].lstrip("\t") if strips_tabs else lines[k]
-            while not quoted and last + 1 < len(lines) and trailing_backslash(text):
-                last += 1
-                text = text[:-1] + lines[last]
-            if text == word:
-                found = last
-                break
-            k = last + 1
+        found = index.find(word, strips_tabs, quoted, j)
         if found is None:
             return j
         j = found + 1
@@ -436,33 +614,19 @@ def trailing_backslash(text):
     return run % 2 == 1
 
 
-def scan_block(first_no, body, indent=""):
-    """Return [(line_no, reason)] for one shell fence body. `indent` is the
-    opening fence's indent for a raw body; up to that many columns are
-    removed from each line first (fences() has already done so)."""
-    lines = [strip_cols(raw, 0, len(indent))[0] for raw in body]
-    if lines and lines[0].strip() == MARKER:
-        return []
-    kinds = []  # (line_no, "command" | "comment", text)
-    hits = []
+def scan_logical(lines, first_no, kinds, hits):
+    """Scan `lines` as bash reads them: logical lines, frames carried across
+    lines, heredoc bodies skipped. Appends to `kinds` and `hits`; returns
+    the index of the logical line still holding an open quote or expansion
+    at the end of the fence, or None."""
+    index = Terminators(lines)
     i = 0
     stack = []
     cont = False
     prev = "\n"
     pending = []
     start = None  # index of the first line of the current logical line
-    while True:
-        if i >= len(lines):
-            if any(f != "(" for f in stack):
-                # (d): a quote or expansion is still open. Skip nothing:
-                # flag the line it opened on and rescan the lines after it.
-                no = first_no + start
-                kinds = [k for k in kinds if k[0] <= no]
-                hits = [h for h in hits if h[0] <= no]
-                hits.append((no, "quote or expansion still open at the end of the fence"))
-                i, stack, cont, prev, pending = start + 1, [], False, "\n", []
-                continue
-            break
+    while i < len(lines):
         raw = lines[i]
         no = first_no + i
         if not stack and not cont:
@@ -479,7 +643,7 @@ def scan_block(first_no, body, indent=""):
             prev = "\n"
         at, docs, cont, prev = lex_line(raw, stack, prev)
         if at is not None:
-            hits.append((no, "trailing comment on a command line"))
+            hits.append((no, TRAIL))
         pending.extend(docs)
         i += 1
         if cont or (stack and stack[-1] in QUOTES):
@@ -488,18 +652,66 @@ def scan_block(first_no, body, indent=""):
             continue
         prev = "\n"
         if pending:
-            i = skip_heredocs(lines, i, pending)
+            i = skip_heredocs(lines, i, pending, index)
             pending = []
+    return start if any(f != "(" for f in stack) else None
+
+
+def scan_physical(lines, first_no, begin, kinds, hits):
+    """Scan `lines[begin:]` one physical line at a time with a fresh frame
+    stack each, and skip no heredoc. Linear, and fails closed: used once a
+    frame was left open, when the logical reading can no longer be trusted.
+    A line that leaves a frame (other than a subshell) open is flagged."""
+    for i in range(begin, len(lines)):
+        no = first_no + i
+        s = lines[i].strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            kinds.append((no, "comment", s))
+            continue
+        kinds.append((no, "command", s))
+        stack = []
+        at = lex_line(lines[i], stack)[0]
+        if at is not None:
+            hits.append((no, TRAIL))
+        if any(f != "(" for f in stack):
+            hits.append((no, OPEN_REASON))
+
+
+def comment_hits(kinds):
+    """Classes (b) and (c) over the classified lines of one fence."""
+    cmds = [idx for idx, (_, kind, _) in enumerate(kinds) if kind == "command"]
+    out = []
     for idx, (no, kind, s) in enumerate(kinds):
         if kind == "command" or s.startswith("#!"):
             continue
         if "`" in s or "$(" in s:
-            hits.append((no, "comment line holds a backtick or $("))
-        else:
-            before = any(k == "command" for _, k, _ in kinds[:idx])
-            after = any(k == "command" for _, k, _ in kinds[idx + 1:])
-            if before and after:
-                hits.append((no, "comment line between two commands"))
+            out.append((no, "comment line holds a backtick or $("))
+        elif cmds and cmds[0] < idx < cmds[-1]:
+            out.append((no, "comment line between two commands"))
+    return out
+
+
+def scan_block(first_no, body, indent=""):
+    """Return [(line_no, reason)] for one shell fence body. `indent` is the
+    opening fence's indent for a raw body; up to that many columns are
+    removed from each line first (fences() has already done so)."""
+    lines = [strip_cols(raw, 0, len(indent))[0] for raw in body]
+    if lines and lines[0].strip() == MARKER:
+        return []
+    kinds = []  # (line_no, "command" | "comment", text)
+    hits = []
+    start = scan_logical(lines, first_no, kinds, hits)
+    if start is not None:
+        # (d): a quote or expansion is still open. Skip nothing: flag the
+        # line it opened on and rescan the lines after it.
+        no = first_no + start
+        kinds = [k for k in kinds if k[0] <= no]
+        hits = [h for h in hits if h[0] <= no]
+        hits.append((no, OPEN_REASON))
+        scan_physical(lines, first_no, start + 1, kinds, hits)
+    hits.extend(comment_hits(kinds))
     return sorted(hits, key=lambda h: h[0])
 
 
@@ -549,7 +761,7 @@ def current_counts():
     return counts, detail
 
 
-TRAIL = "trailing comment on a command line"
+SCAN_BUDGET_S = 2.0  # a 20000-line fence of any shape scans within this
 
 
 class DocsShellPasteSafe8311(unittest.TestCase):
@@ -721,6 +933,55 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             scan_block(1, ["cat <<A <<B", "a # x", "A", "b # y", "B", "ls # hazard"]), [(6, TRAIL)]
         )
         self.assertEqual(scan_block(1, ["x=$(cat <<EOF", "a # b", "EOF", ")", "ls"]), [])
+
+    def test_8311_html_blocks_open_no_fence(self):
+        # C3: a fence-like line inside an HTML block (CommonMark 4.6) opens
+        # nothing, so the real bash fence after the block is scanned.
+        comment = "<!--\n```\n-->\n\n```bash\nls # hazard\n```\n"
+        self.assertEqual(scan_text(comment), [(6, TRAIL)])
+        div = "<div>\n```\n\n```bash\nls # hazard\n```\n"
+        self.assertEqual(scan_text(div), [(5, TRAIL)])
+        # An HTML block that ends on its start line, or with its container.
+        self.assertEqual(scan_text("<!-- x -->\n```bash\nls # hazard\n```\n"), [(3, TRAIL)])
+        quoted = "> <!--\n> ```\n\n```bash\nls # hazard\n```\n"
+        self.assertEqual(scan_text(quoted), [(5, TRAIL)])
+        # In a list item a blank line ends it, as markdown-it reads it.
+        item = "- <!--\n\n  ```bash\n  ls # hazard\n  ```\n"
+        self.assertEqual(scan_text(item), [(4, TRAIL)])
+        # A details block with no blank line holds the fence lines: the page
+        # shows no code block, so there is nothing to paste.
+        details = "<details>\n<summary>x</summary>\n```bash\nls # c\n```\n</details>\n"
+        self.assertEqual(scan_text(details), [])
+        # A lone tag starts an HTML block (type 7), except after a paragraph.
+        self.assertEqual(scan_text("<b>\n```bash\na # b\n```\n"), [])
+        self.assertEqual(scan_text("x\n<b>\n```bash\na # b\n```\n"), [(4, TRAIL)])
+
+    def test_8311_backticks_and_subshells_are_code(self):
+        # S11: a backtick substitution is lexed as code, bare or in "...".
+        self.assertEqual(scan_block(1, ["echo `ls # c`"]), [(1, TRAIL)])
+        self.assertEqual(scan_block(1, ['echo "`ls # c`"']), [(1, TRAIL)])
+        self.assertEqual(scan_block(1, ["x=`echo a", "ls # hazard", "echo b`"]), [(2, TRAIL)])
+        self.assertEqual(scan_block(1, ["x=`", "ls # hazard", "`"]), [(2, TRAIL)])
+        self.assertEqual(scan_block(1, ["echo \"today `date`\" '`#'", "ls"]), [])
+        # A heredoc inside backticks has no body outside them.
+        self.assertEqual(scan_block(1, ["x=`cat <<EOF`", "ls # hazard", "EOF"]), [(2, TRAIL)])
+        # S12: `((cmd) || cmd)` is two subshells once the inner one closes.
+        self.assertEqual(scan_block(1, ["((cd . && ls) || echo fail) # done))"]), [(1, TRAIL)])
+        self.assertEqual(
+            scan_block(1, ["((cd . && ls) || echo fail)", "ls # hazard", "echo b # c))"]),
+            [(2, TRAIL), (3, TRAIL)],
+        )
+        self.assertEqual(scan_block(1, ["echo $(( (1+2) << 3 ))", "(( (a+b) > 2 ))", "ls"]), [])
+
+    def test_8311_scan_work_is_linear(self):
+        # S13: a fence left open by every line, and a fence of unterminated
+        # heredocs, each scan in linear time and stay fail closed.
+        for line, want in (("x ${", 20000), ("cat <<E", 0)):
+            began = time.monotonic()
+            got = scan_block(1, [line] * 20000)
+            spent = time.monotonic() - began
+            self.assertEqual(len(got), want, line)
+            self.assertLess(spent, SCAN_BUDGET_S, line)
 
 
 if __name__ == "__main__":
