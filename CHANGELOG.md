@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#4734 — pgbouncer smoke stack binds loopback and takes its password from env)
+
+- `infra/pgbouncer/docker-compose.yml` publishes the pooler as `127.0.0.1:6432:6432`
+  (was all interfaces) and requires `POSTGRES_PASSWORD` (was a fixed public
+  fallback); `smoke-test.sh` generates a random password when none is supplied.
+  `infra/pillar4-envelope/measure-envelope.sh` drops its fixed fallback the same way, both
+  scripts write the generated userlist owner-only (#4735), pass the password to
+  `docker exec` by variable name, and tear down loudly. The compose and password parts of the
+  original fix `aafd15ec3` (never on the chain) are re-applied by hand; its TLS, SCRAM and
+  admin-split parts are not.
+  The postgres image is pinned (`apache/age:release_PG16_1.6.0`) and the pooler runs as the
+  invoking uid (`PGBOUNCER_UID`/`PGBOUNCER_GID`, required by compose) so the 0600 userlist stays
+  readable; both scripts refuse to run as root (PgBouncer refuses uid 0).
+  Authentication is SCRAM-SHA-256 end to end (#4732 smoke path): the userlist is the role's own
+  stored SCRAM verifier, read after postgres is up; there is no md5 anywhere in the smoke stack,
+  and `pgbouncer.ini` pins `auth_type = scram-sha-256`. The userlist write removes a leftover file
+  first (umask only applies to a new file), and the postgres healthcheck probes `127.0.0.1`.
+  Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py` (no md5, root guard, parsed SQL,
+  loud teardown, trap and exit status, argv password check on every `docker exec`, `token_hex(>=16)`,
+  non-SCRAM refusal, `auth_type` pin).
+  Round 6: the compose project, container names and userlist file are per run
+  (`AI_MEMORY_SMOKE_RUN`, default date-and-pid) so concurrent smokes never recreate each other's
+  containers and a trap only removes its own project; the `[4/4]` step now asserts
+  `pool_mode = transaction` and `auth_type = scram-sha-256` from `SHOW CONFIG` and fails non-zero on a
+  mismatch; the envelope verifier refusal exits 73 (72 stays "no knee"); the pgbouncer.ini and README
+  wording now states that the pin refuses md5 entries but a plain-text entry is still accepted.
+  Round 7: the guard requires an explicit non-zero exit after every FAIL/FATAL echo and pins every
+  step marker, treats the password variable as an allowlist (the smoke refuses a pooled URL that
+  carries a password, exit 74), pins the exact refusing catch-all arms and the gitignore pattern for the
+  per-run userlist; exit code 1 is documented as also covering stack bring-up and teardown failures.
+  Rounds 8-11: a bad `AI_MEMORY_SMOKE_RUN` exits 65 (class `[a-z0-9_-]` and a 64-character bound); a
+  password-bearing pooled URL exits 74 before any password is set and before the first docker line; a
+  failed psql step now exits 1 with a FAIL line that names it (it was psql's own 3). The guard refuses
+  dump words anywhere on a code line, the compose password more than once or via env_file, a second
+  cleanup definition or trap, a negated gitignore line and a mis-anchored heredoc opener. Round 11: the
+  compose file may interpolate only `AI_MEMORY_SMOKE_RUN`, `POSTGRES_PASSWORD` (once), `PGBOUNCER_UID` and
+  `PGBOUNCER_GID`; function, cleanup and alias definitions are read after `;`, `&&`, `||`, `{`, `(` and `|`;
+  a FAIL site inside a subshell or a group closed by `|| true` is refused by a group-depth scan; both
+  script headers and READMEs carry one exit-code table and one identical set -e caveat.
+  Round 12: compose interpolation follows the escape rule (an odd dollar run before a name counts; a run of
+  three or more, YAML anchors, aliases, merge keys, `extends`, `include`, `secrets`, `configs`, `env_file` and any
+  top-level key besides `name` and `services` are refused); a definition after `then`, `do`, `else`, `elif`,
+  `time` or `!` is read; the group scan tracks loops and `case`, and refuses a closer with no opener; a trailing
+  comment cannot open a heredoc; both script headers match the exit codes their script uses.
+  Round 13: the compose scan reads the decoded YAML scalars with PyYAML (the guard fails when PyYAML is
+  absent) and refuses escapes, block scalars, folded joins, multi-line flow collections and a `$` in a quoted
+  scalar; every `docker compose` call passes `-f` of the one pinned file and `--project-directory`, and the
+  infra directory may hold no override file or `.env`; a definition after a case-pattern `)` or after
+  `if`, `while` or `until` is read; the group scan tracks `if`..`fi` and `case`..`esac`, and a group with a
+  FAIL site may be followed only by end of line, `;`, `;;`, `fi`, `done`, `esac`, `)` or `}` (round 13 also
+  accepted `&&`; round 14 removes it).
+  Round 14: a group with a FAIL site is refused when `&&` follows its closer (`done && :` ran the failure
+  inside a list) or when it sits in condition position (after `if`, `elif`, `while`, `until`, `!`, or piped
+  after `&&` or `||`), because `set -e` ignores a failure there; the decoded-YAML scan refuses any explicit
+  tag (`!!binary`, `!!str`, a verbatim or local tag) on a scalar, mapping or sequence, since compose decodes it
+  before it interpolates; every `docker ... compose` invocation is matched, a global docker flag between the
+  two words is refused, and after the pinned `-f` and `--project-directory` no further `-f`, `--file`,
+  `--project-directory`, `--env-file` or `--project-name` path may follow on the same command; the pin
+  comments now state that compose still reads a `.env` in the project directory for interpolation, which has
+  no effect because the script exports every interpolated name and the guard refuses a tracked `.env`.
+  Round 15: the group scan models shell condition state: after `if`, `elif`, `while`, `until` or `!` the
+  scanner stays in condition context until the matching `then` or `do`, across `;`, newlines, comments and
+  blank lines, and refuses a group with a FAIL site opened there; a function whose body holds a FAIL site
+  is judged at each call site, which must be in statement position, and the whole body of `psql_pooled`,
+  `need`, `now_ms` and `worker` is pinned; `measure-envelope.sh` now exits 1 when a load worker exits
+  non-zero and `psql_pooled` returns non-zero to its caller on failure; each `docker compose` command is
+  read as shell words, so no later `-f`, `--file`, `--project-directory`, `--env-file`, `--project-name`,
+  `-p` or `--profile` may follow the pin in any quoting, and the envelope directory may hold only its listed
+  files; both scripts refuse every daemon-selection variable (`DOCKER_HOST`, `DOCKER_CONTEXT`,
+  `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`, `DOCKER_API_VERSION`) and `docker context`.
+  Propagating the worker status exposed #8299: `worker()` read `${out}` in the same `local` that assigned it, so
+  under `set -u` every worker had exited at its first line since #1737 and the harness could only report no
+  knee; `bodyf` now has its own `local`, and the guard refuses a declaration that reads its own names.
+  Round 16: one quote-aware pass removes shell comments before every shell reader of the guard, so a quote
+  inside a trailing comment can no longer hide a compose call from the word pin; the envelope worker-status
+  lines are pinned exactly and every `wait` must reach a FAIL exit; and an exact group-count failure names
+  its constant and the lockstep remedy. The pass removes a comment by this rule: a `#` that begins a word
+  outside single and double quotes, heredocs, command and arithmetic substitutions, process substitutions
+  and backquotes starts a comment to the end of the line; an unterminated quote or backquote in code fails
+  closed. Round 17: a `)` that closes `$(`, `$((`, `<(` or `>(`, and a closing backquote, no longer begin a
+  word, so a `#` directly after one is text and the rest of that line stays visible to the pin readers; a
+  `)` that closes a plain subshell, an arithmetic command or a case pattern still does. Round 18: a `(`
+  opens a subshell or arithmetic-command bracket only in command position; the `(` of an array assignment
+  (`a=(`, `a+=(`), of an extglob pattern and every `(` inside `[[ ]]` is part of a word, so a `#` right
+  after its `)` is text; `case` and `esac` are keywords only in command position, an `esac` or a `)` the
+  pass cannot place fails closed, every problem names the script, line and column, and the bash agreement
+  selftest (`test_shell_comment_prepass_agrees_with_bash`) is the contract for this rule. Round 19: the
+  heredoc openers come from the pre-pass's own quote, arithmetic and parameter-expansion state (no second
+  lexer), with the full delimiter after quote removal, and a `<<` or a delimiter the pass cannot place or
+  read fails closed; the line alignment splits on newline only and refuses every Unicode or ASCII line
+  separator and a lone carriage return, naming the script, line and character column; and the two bash
+  agreement selftests (`test_shell_comment_prepass_agrees_with_bash` and
+  `test_shell_word_readers_agree_with_bash`) are the contract. Round 20: NUL bytes and C0 control
+  characters, `$(` or backquote expansions inside an unquoted heredoc body, a heredoc opened inside a
+  backquote substitution (or a body line inside a command substitution that only starts with the
+  delimiter) and invalid UTF-8 are refused by name before any reader; the redirect and group scans consume
+  the heredoc bodies of one pre-pass over the raw script text; and the shell-word problems name the line.
+  Round 21: a backslash-newline inside an unquoted heredoc body, command text stored as data (a `$(` or
+  backquote kept literal in a value that an eval-class expansion can run later) and `${var@P}` are refused
+  by name; the pre-pass line mapping and the continuation joiner are linear; and a byte-order mark is named.
+  Round 22: a parameter transformation (`${var@X}`), arithmetic on a runtime-joined value that is not a
+  number literal, a nested shell interpreter and a backslash-newline that splits a word are refused by name;
+  the linear readers are proven by a CPU-time growth ratio rather than a wall-clock budget; and a code-line
+  refusal names the raw script line.
+  Round 23: the six guarded smoke files are content-pinned, and a pin mismatch names the file and requires a
+  full review of its diff before the pin moves; `${v:-a@b}` defaults are no longer refused as
+  transformations; and measure-envelope.sh validates its numeric environment inputs as digits-only.
+
 ### Fixed (#8301 / #8305 — the shared-namespace-claims self-test derives its ceilings and cleans up after itself)
 
 - **`scripts/check-shared-namespace-claims.sh --self-test` no longer goes red when `src/storage/migrations.rs` grows, and a killed run no longer poisons the next one.** Case 2 hardcoded the `migrations.rs` ceiling candidates (`7_440`, `7_400`); once the file outgrew them no candidate reported `PASSES` and the self-test failed for a reason unrelated to the gate. The fixture now measures the file at the base, projects the merge-result size, derives every candidate from that measurement, renders the gate's digit-group format with the same `python3` formatter the gate uses, and ties each verdict to its fixture. It aborts by name when `migrations.rs` is missing or empty, or when the `llm.rs` negative control would be a no-op. The fixture worktrees and branches are named per run (`fixture/3152-dup-v2-<pid>-<epoch>`), removed by an `EXIT`/`INT`/`TERM` trap, and `git worktree prune` runs before the first fixture, so concurrent worktrees no longer collide on the shared git directory. The gate script itself is not wired into a workflow (it is listed in `scripts/qc-allowlists/gates-not-wired.txt`); the self-test is wired through the guard `scripts/ci/tests/test_shared_namespace_claims_selftest_8301.py`, which the classify job's `unittest discover` runs, and the guard refuses any ceiling in the fixture that is not derived from the measured size.

@@ -24,26 +24,69 @@
 # it on a Docker-capable host. The local dev socket is permission-denied.
 #
 #   cd infra/pillar4-envelope
-#   POSTGRES_PASSWORD=secret ./measure-envelope.sh
+#   ./measure-envelope.sh                  (random password generated)
+#   POSTGRES_PASSWORD=<generated> ./measure-envelope.sh
 #
-# Exit 0 = a knee was found and printed (the measured X). Exit non-zero = the
-# stack failed to come up or no knee was reached within CONCURRENCY_STEPS (X is
-# then ">= the last step" — raise MAX concurrency and re-run).
+# Exit codes:
+#   0   a knee was found and printed (the measured X)
+#   1   a load worker exited non-zero (the FAIL line names the step), the stack
+#       bring-up failed (including the bind failure when another run holds
+#       127.0.0.1:6432) or the teardown failed
+#   64  run as root
+#   65  bad AI_MEMORY_SMOKE_RUN, or STEP_DURATION_SECS not digits only
+#   69  a required tool is missing
+#   70  the fresh binary was not built
+#   71  the daemon did not become healthy
+#   72  no knee within CONCURRENCY_STEPS (a capacity result: X is >= the last
+#       step; raise the ceiling and re-run)
+#   73  the role has no SCRAM-SHA-256 verifier (an auth failure, not a capacity result)
+# Any other non-zero status is the failing command's own, under set -e.
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# PgBouncer refuses to run as root (#4734). The pooler runs as the invoking
+# uid so the owner-only userlist stays readable, so fail fast with a clear
+# message instead of a container that exits at start.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "FATAL: run this script as a non-root user (PgBouncer refuses to run as root)" >&2
+  exit 64
+fi
+
 # ── Tunables (env-overridable) ───────────────────────────────────────────
-PW="${POSTGRES_PASSWORD:-ai_memory_envelope}"
-POOL_COMPOSE="../pgbouncer/docker-compose.yml"
-PROJECT="ai-memory-4d-envelope"
+# No fixed fallback (#4734): generate a random per-run password when unset.
+PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
+export POSTGRES_PASSWORD="$PW"
+# The pooler runs as the invoking user so the 0600 userlist stays readable.
+PGBOUNCER_UID="$(id -u)"
+PGBOUNCER_GID="$(id -g)"
+export PGBOUNCER_UID PGBOUNCER_GID
+# Per-run suffix (#4734): the compose project, container names and the userlist
+# file are derived from it so two concurrent runs never recreate each other's
+# containers and one trap only removes its own project. Override with
+# AI_MEMORY_SMOKE_RUN=<[a-z0-9_-]+> (tests); the stable prefix is ai-memory-pgbouncer-.
+RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"
+case "$RUN" in
+  ''|*[!a-z0-9_-]*) echo "FATAL: AI_MEMORY_SMOKE_RUN must match [a-z0-9_-]+" >&2; exit 65 ;;
+esac
+if [ "${#RUN}" -gt 64 ]; then
+  echo "FATAL: AI_MEMORY_SMOKE_RUN must be at most 64 characters" >&2
+  exit 65
+fi
+export AI_MEMORY_SMOKE_RUN="$RUN"
+PROJECT="ai-memory-pgbouncer-envelope-$RUN"
+USERLIST="../pgbouncer/.userlist.generated.$RUN.txt"
 DAEMON_PORT="${DAEMON_PORT:-9077}"
 DAEMON_HOST="127.0.0.1"
 POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"
 # Concurrency ramp. Geometric so the knee is bracketed without 1000 steps.
 CONCURRENCY_STEPS="${CONCURRENCY_STEPS:-8 16 32 64 128 256 512 1024}"
 STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"
+# The ramp arithmetic reads STEP_DURATION_SECS, so it must be digits only (#4734 r23).
+case "$STEP_DURATION_SECS" in
+  ''|*[!0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;
+esac
 # Knee thresholds. P95 budget mirrors the recall p95 budget the codebase
 # defends elsewhere (35 ms hot-path) plus headroom for the write+AGE mix.
 P95_BUDGET_MS="${P95_BUDGET_MS:-250}"
@@ -57,10 +100,27 @@ RESULTS_DIR="${RESULTS_DIR:-./.local-runs/envelope-$$}"
 mkdir -p "$RESULTS_DIR"
 DAEMON_PID=""
 
+# Compose is pinned (#4734 r13): every `docker compose` call passes -f of this one file and
+# --project-directory of its directory, so a compose.override file, a compose.yaml, or a
+# COMPOSE_FILE set in a .env or inherited is never read. With -f given, compose does not discover
+# files and ignores COMPOSE_FILE (tested with Docker Compose v5.6.0). With --project-directory,
+# compose still reads a .env in that directory for interpolation (same version); that has no effect
+# here, because this script exports every name the compose file interpolates (the environment
+# outranks .env) and the guard refuses a tracked .env in the infra directory.
+COMPOSE_DIR="$PWD/../pgbouncer"
+COMPOSE_FILE_PINNED="$COMPOSE_DIR/docker-compose.yml"
+
 cleanup() {
+  rc=$?
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
-  docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null 2>&1 || true
-  rm -f "../pgbouncer/.userlist.generated.txt" "${STORE_URL_FILE:-}"
+  # POSTGRES_PASSWORD is exported above, so interpolation cannot fail here.
+  docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" down -v >/dev/null || { echo "WARN: compose down failed" >&2; rc=1; }
+  if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then
+    echo "FATAL: compose project $PROJECT still running after teardown" >&2
+    rc=1
+  fi
+  rm -f "$USERLIST" "${STORE_URL_FILE:-}"
+  exit "$rc"
 }
 trap cleanup EXIT
 
@@ -78,10 +138,25 @@ BIN="$(cd ../.. && echo "$PWD/target/release/ai-memory")"
 
 # ── 2. Bring up the 4.B pooled stack ─────────────────────────────────────
 echo "[2/5] bringing up postgres+AGE + pgbouncer (4.B stack) ..."
-# Render the pooler's md5 userlist from the password (same as 4.B smoke-test).
-md5hash="$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
-printf '"ai_memory" "md5%s"\n' "$md5hash" > "../pgbouncer/.userlist.generated.txt"
-POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait
+PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"
+POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait postgres
+# SCRAM end to end (#4732): bring up postgres first (default scram-sha-256
+# auth), then render the pooler userlist from the role's own stored SCRAM
+# verifier. pgbouncer 1.23 uses SCRAM when the userlist entry is a
+# SCRAM secret and passes it through to the backend. The verifier
+# (not the password) travels over docker exec stdout straight into a file
+# created under umask 077 (#4735); the password never appears in argv.
+VERIFIER_ROW="$(docker exec "$PG_CONTAINER" \
+  psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
+case "$VERIFIER_ROW" in
+  '"ai_memory" "SCRAM-SHA-256$'*) ;;
+  *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;
+esac
+# Remove any leftover file first: umask only applies to a NEW file, so a stale
+# 0644 userlist would otherwise keep its mode (N4).
+rm -f "$USERLIST"
+(umask 077; printf '%s\n' "$VERIFIER_ROW" > "$USERLIST")
+POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait
 
 # ── 3. schema-init + serve THROUGH the pooler ────────────────────────────
 echo "[3/5] schema-init + serve (admission cap=${ADMISSION_CAP}) through pgbouncer:6432 ..."
@@ -110,7 +185,10 @@ curl -fsS "http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1/health" >/dev/null 2>&1 \
 BASE="http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1"
 now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 worker() {
-  local wid="$1" out="$2" deadline="$3" n=0 prev_id="" bodyf="${out}.body"
+  local wid="$1" out="$2" deadline="$3" n=0 prev_id=""
+  # A separate `local`: bash expands every word of one `local` before it assigns any, so
+  # "${out}" on the line above would be unbound under set -u and the worker would exit at once.
+  local bodyf="${out}.body"
   while [ "$(date +%s)" -lt "$deadline" ]; do
     n=$((n+1))
     local agent="env-w${wid}" title="w${wid}-m${n}"
@@ -159,7 +237,9 @@ for conc in $CONCURRENCY_STEPS; do
     worker "$w" "$step_out/w${w}.txt" "$deadline" &
     pids+=($!)
   done
-  for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+  worker_rc=0
+  for p in "${pids[@]}"; do wait "$p" || worker_rc=$?; done
+  [ "$worker_rc" -eq 0 ] || { echo "FAIL: a load worker exited with status $worker_rc at concurrency $conc" >&2; exit 1; }
 
   # Aggregate this step.
   read -r p50 p95 p99 shed reqs < <(cat "$step_out"/w*.txt 2>/dev/null | python3 -c '
