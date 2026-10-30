@@ -48,8 +48,9 @@ on:
     branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "rehearsal/**", "chain/**"]
     # #8332: `edited` is NOT listed. A title or body edit fires it and, with
     # cancel-in-progress, restarted every required check from zero. A base
-    # retarget (the #7072 case) is handled by pr-retarget.yml, which dispatches
-    # this workflow (full matrix) on the head.
+    # retarget is landed only after a new head push (the push fires an ordinary
+    # pull_request run that classifies against the new base, #7072), enforced by
+    # scripts/ci/pr_retarget_check.py at landing.
     types: [opened, synchronize, reopened]
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]

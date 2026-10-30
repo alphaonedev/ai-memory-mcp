@@ -7,8 +7,9 @@
 (opened, synchronize, reopened), so retargeting a PR base (an ``edited`` event)
 queued no run. #8332 moved that case: listing ``edited`` there also fired for every
 title or body edit and cancelled the running checks, so ci.yml and coverage.yml no
-longer list ``edited`` and pr-retarget.yml (``edited`` plus a ``changes.base`` job
-guard) dispatches both on the head when the base changes.
+longer list ``edited``; a base retarget is landed only after a new head push (an
+ordinary ``pull_request`` run classifies against the new base), enforced at landing by
+scripts/ci/pr_retarget_check.py.
 
 Stdlib only. Run: ``python3 -I scripts/test/test_workflow_edited_7072.py``
 or ``python3 -I -m unittest`` with the file path loaded by the repo runner.
@@ -44,11 +45,6 @@ class PullRequestEdited7072(unittest.TestCase):
 
     def test_coverage_yml_types_exclude_edited(self):
         self.assertEqual(_pr_types(_read("coverage.yml")), REQUIRED_TYPES)
-
-    def test_retarget_workflow_covers_the_base_change(self):
-        text = _read("pr-retarget.yml")
-        self.assertEqual(_pr_types(text.replace("  pull_request_target:", "  pull_request:")), {"edited"})
-        self.assertIn("github.event.changes.base != null", text)
 
 
 if __name__ == "__main__":

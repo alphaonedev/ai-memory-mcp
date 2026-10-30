@@ -812,7 +812,8 @@ if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci
 # SECTION H — #8332: a body-only PR edit never cancels or restarts the required
 # checks. Any workflow that lists `edited` on a pull_request(_target) trigger
 # must carry the body-only guard on cancel-in-progress; ci.yml and coverage.yml
-# do not list `edited` (their base-retarget case lives in pr-retarget.yml).
+# do not list `edited` (a base retarget lands only after a new head push, checked by
+# scripts/ci/pr_retarget_check.py).
 # The checks live in Python: scripts/test/test_workflow_edited_cancel_8332.py.
 # ===========================================================================
 if python3 -I "$ROOT/scripts/test/test_workflow_edited_cancel_8332.py" >"$SCRATCH/h-8332.out" 2>&1; then

@@ -118,9 +118,13 @@ GitHub retains the full history identically to hosted runs:
 - **Artifacts** — JUnit XML + coverage uploaded per run for durable, audit-grade
   evidence bundles beyond the log window.
 
-### PR edits never cancel checks; base retargets re-run (#8332)
+### PR edits never cancel checks; a base retarget lands after a new head push (#8332)
 
-A title or body edit of a pull request never cancels or restarts a running check. `ci.yml` and `coverage.yml` do not list `edited` in their `pull_request` types, and `claude-md-rule-compare.yml` (which keeps `edited`) sets `cancel-in-progress` to `${{ github.event.action != 'edited' }}`, so an edit runs a real comparison without cancelling the running one. A base retarget does re-run: `pr-retarget.yml` fires on `edited`, and only when the event carries `changes.base` it dispatches `ci.yml` and `coverage.yml` on the head branch, a non-`pull_request` run that classifies fail-closed and runs the full matrix, so every required context is reported by a real run on that head (a fork head cannot be dispatched, so that job fails visibly). A new push (`synchronize`) still cancels the older run. No required-context job is skipped by an `if`, because a skipped required context is counted as passing. Pinned by `scripts/test/test_workflow_edited_cancel_8332.py` (section H of `scripts/test/test-ci-workflow-invariants.sh`).
+A title or body edit of a pull request never cancels or restarts a running check. `ci.yml` and `coverage.yml` do not list `edited` in their `pull_request` types, so a body-only edit fires nothing. `claude-md-rule-compare.yml` is the one workflow that keeps `edited`; its `cancel-in-progress` is `${{ github.event.action != 'edited' }}`, so an edit runs a comparison without cancelling the running one. A new push (`synchronize`) still cancels the older run. No required-context job is skipped by an `if`, because a skipped required context is counted as passing.
+
+A base retarget fires no run by itself, so it is handled at landing: a pull request whose base changed is landed only after a new head push, because a push fires an ordinary `pull_request` run that classifies against the new base (#7072). The landing tool runs `scripts/ci/pr_retarget_check.py` and refuses on exit 65 when the base changed after the latest `pull_request` run of `ci.yml` or `coverage.yml` on the head. `pull_request_target` workflows that exist only on a chain or release base do not run (#8337), which is why no retarget workflow is used.
+
+Pinned by `scripts/test/test_workflow_edited_cancel_8332.py` (section H of `scripts/test/test-ci-workflow-invariants.sh`) and `scripts/test/test_pr_retarget_check_8332.py`.
 
 ---
 
