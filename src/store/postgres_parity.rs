@@ -197,8 +197,10 @@ pub(crate) async fn export_memories_keyset(
 /// the erase + attestation + tombstone + delete commit or roll back as one
 /// unit. For each victim it:
 ///
-/// 1. **crypto-erases** the per-record (`0x03`) envelope key, making the
-///    ciphertext unrecoverable even by a holder of the master KEK. Legacy
+/// 1. **crypto-erases** the per-record envelope key of every envelope whose
+///    version is in `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`
+///    (`0x03` and `0x05` today, #8278), making the ciphertext unrecoverable
+///    even by a holder of the master KEK or the namespace scope key. Legacy
 ///    `0x02` per-agent rows have no per-record key — the honest limit,
 ///    recorded as `RowDeletedTombstoned` rather than `KeyDestroyed`.
 /// 2. **scrubs the `cid_genesis` pre-image** (erasure invariant parity with

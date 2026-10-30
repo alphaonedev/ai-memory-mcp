@@ -802,7 +802,9 @@ const SQL_SELECT_NS_VERSION_AGENT_BY_ID: &str =
     "SELECT namespace, version, metadata->>'agent_id' FROM memories WHERE id = $1";
 /// #3192 — destroy the per-record envelope key for one crypto-erasable row.
 /// `$3` binds [`crate::encryption::crypto_erasable_envelope_version_codes`]
-/// (`0x03` and `0x05`, #8278 R16), the SSOT the SQLite twin also reads.
+/// (`0x03` and `0x05`, #8278 R16), the codes of
+/// `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`, the SSOT the
+/// SQLite twin also reads.
 const SQL_CRYPTO_ERASE_ENVELOPE_BY_ID: &str = "UPDATE memories SET encrypted_envelope = $2 \
      WHERE id = $1 AND encrypted_envelope IS NOT NULL \
        AND get_byte(encrypted_envelope, 0) = ANY($3::int[]) \

@@ -981,6 +981,120 @@ fn scope_key_namespace_marker_fails_closed_on_unreadable_key_dir_8278() {
     );
 }
 
+/// Sets a directory mode and restores `0o700` on drop, so a failing
+/// assertion never leaves the sandbox untraversable.
+#[cfg(unix)]
+struct DirModeGuard(PathBuf);
+
+#[cfg(unix)]
+impl DirModeGuard {
+    fn set(dir: PathBuf, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
+            .expect("set the scope-key dir mode");
+        Self(dir)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirModeGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// `true` when the test runs as root, which ignores directory modes.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid` has no preconditions and only reads a process property.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// A store opened (and asked) before another store minted `NS` in `dir`, so
+/// its next marker query is a cold cache miss.
+fn cold_store_after_mint(dir: &Path) -> FileScopeKeyStore {
+    let early = open_store(dir);
+    assert!(!early.namespace_is_e2e(NS), "no ledger yet");
+    minted(&open_store(dir), &[&test_node("node-a")]);
+    early
+}
+
+/// Asserts the cold marker of `NS` fails closed on an error branch: the
+/// answer is end-to-end and the reload itself refuses (never `Ok(false)`).
+fn assert_marker_refuses(store: &FileScopeKeyStore, case: &str) {
+    assert!(store.namespace_is_e2e(NS), "{case}: must answer end-to-end");
+    let reload = store.reload_marker(&FileScopeKeyStore::slug(NS));
+    assert!(
+        reload.is_err(),
+        "{case}: the reload must refuse: {reload:?}"
+    );
+}
+
+/// Security r4 S5: the key dir replaced by a dangling link is not "absent"
+/// (`symlink_metadata` sees the link); taking the lock then refuses.
+#[cfg(unix)]
+#[test]
+fn scope_key_namespace_marker_fails_closed_on_dangling_key_dir_link_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = cold_store_after_mint(dir.path());
+    let scope_dir = early.scope_dir();
+    std::fs::rename(&scope_dir, dir.path().join("scope-keys-moved"))
+        .expect("move the key dir away");
+    std::os::unix::fs::symlink(dir.path().join("absent-target"), &scope_dir)
+        .expect("dangling link in the key dir's place");
+    assert_marker_refuses(&early, "dangling link");
+}
+
+/// Security r4 S5: a key dir whose lock cannot be taken (mode 0o000, the
+/// parent stays traversable) answers end-to-end.
+#[cfg(unix)]
+#[test]
+fn scope_key_namespace_marker_fails_closed_when_the_lock_fails_8278() {
+    if running_as_root() {
+        eprintln!("skipped: root ignores directory modes, so mode 0o000 cannot deny the lock");
+        return;
+    }
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = cold_store_after_mint(dir.path());
+    let _mode = DirModeGuard::set(early.scope_dir(), 0o000);
+    assert_marker_refuses(&early, "lock failure");
+}
+
+/// Security r4 S5: a key dir that can be locked but not listed (mode 0o300:
+/// write and search, no read) answers end-to-end.
+#[cfg(unix)]
+#[test]
+fn scope_key_namespace_marker_fails_closed_when_the_listing_fails_8278() {
+    if running_as_root() {
+        eprintln!("skipped: root ignores directory modes, so mode 0o300 cannot deny the listing");
+        return;
+    }
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = cold_store_after_mint(dir.path());
+    let _mode = DirModeGuard::set(early.scope_dir(), 0o300);
+    assert_marker_refuses(&early, "listing failure");
+}
+
+/// Security r4 S5: a garbled audit ledger read on a cold cache miss answers
+/// end-to-end (the failed verification is cached as a refusal).
+#[test]
+fn scope_key_namespace_marker_fails_closed_on_a_garbled_ledger_8278() {
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = cold_store_after_mint(dir.path());
+    crate::identity::keypair::write_with_mode(&early.audit_path(NS), b"not an audit line\n", 0o600)
+        .expect("garble the audit log");
+    assert!(early.namespace_is_e2e(NS), "garbled ledger: end-to-end");
+    assert!(
+        matches!(early.reload_marker(&FileScopeKeyStore::slug(NS)), Ok(true)),
+        "garbled ledger: the reload answers end-to-end"
+    );
+}
+
 /// The ledger of `NS` straight from disk, with its current record.
 fn disk_ledger(store: &FileScopeKeyStore) -> (NamespaceLedger, ScopeKeyRecord) {
     let ledger = store.load_namespace_locked(NS).expect("ledger");

@@ -1147,8 +1147,14 @@ impl FileScopeKeyStore {
     /// other error reading it (EACCES, EIO, ELOOP) is returned, so the
     /// caller's fail-closed answer applies (code r3 F2, ERRORS-06).
     /// `symlink_metadata` reports a link in the key dir's place itself rather
-    /// than following it (a dangling link is not "absent"), and taking the
-    /// lock below then fails closed on the link.
+    /// than following it, so a dangling link is not "absent": taking the lock
+    /// below then fails closed on it. A link whose target is a directory the
+    /// owner controls (it passes the ownership and mode checks) is followed
+    /// like that directory, and an empty target answers "not end-to-end".
+    /// Taking the lock runs `ensure_parent`, which recreates a key dir that
+    /// was removed between this probe and the lock (mode 0700); the scan of
+    /// that fresh, empty dir then answers "not end-to-end", the same answer
+    /// a key dir that is absent at the probe gives.
     fn reload_marker(&self, slug: &str) -> Result<bool> {
         let scope_dir = self.scope_dir();
         match std::fs::symlink_metadata(&scope_dir) {
@@ -1345,7 +1351,15 @@ impl ScopeKeyStore for FileScopeKeyStore {
             }
         }
         // R17: a miss re-reads the cold store; a read error is end-to-end.
-        self.reload_marker(&slug).unwrap_or(true)
+        // R4-I3: the fail-closed answer is logged with its cause (operation
+        // and error only, never key material), per ERRORS-18.
+        self.reload_marker(&slug)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    "scope-key namespace marker reload failed; answering end-to-end: {e:#}"
+                );
+            })
+            .unwrap_or(true)
     }
 
     fn ledger_head(&self, namespace: &str) -> Result<LedgerHead> {
@@ -1360,6 +1374,11 @@ impl ScopeKeyStore for FileScopeKeyStore {
         })
     }
 
+    /// Keeps `exists()` rather than the marker's `symlink_metadata` probe
+    /// (R4-I2) because the later open fails closed: an unreadable key dir
+    /// errors at the lock or at the scan's `read_dir`, and a slug left out
+    /// of the refreshed cache is re-probed by `reload_marker` on its next
+    /// `namespace_is_e2e` miss.
     fn refresh_from_ledger(&self) -> Result<()> {
         let mut fresh = HashMap::new();
         {

@@ -140,12 +140,17 @@ pub const ENVELOPE_VERSION: u8 = 0x02;
 /// cannot recover it. The legacy `0x02` per-agent scheme has NO per-record
 /// key to destroy, so `0x02` rows are NOT crypto-erasable (they can only
 /// be row-deleted + tombstoned — the honest boundary documented on
-/// [`envelope_is_crypto_erasable`]).
+/// [`envelope_is_crypto_erasable`]). `0x03` is one member of the erasable
+/// set; [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] is the authority for which
+/// envelope versions a crypto erase destroys (`0x03` and the `0x05` scope
+/// envelope today, #8278).
 pub const RECORD_ENVELOPE_VERSION: u8 = 0x03;
 
 /// v1.0.0 (#1956 [P1][R56]) — the CRYPTO-ERASED tombstone marker. A
-/// `crypto_erase` rewrites a per-record (`0x03`) `encrypted_envelope` to
-/// the single byte `[0x04]`: the wrapped DEK is destroyed, so the prior
+/// `crypto_erase` rewrites an `encrypted_envelope` whose version is in
+/// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] (the `0x03` per-record and the
+/// `0x05` scope envelope today, #8278) to the single byte `[0x04]`: the
+/// wrapped per-record DEK is destroyed, so the prior
 /// ciphertext is unrecoverable. A read of a `0x04` envelope fails-closed
 /// with a clear "crypto-erased" error rather than a generic decrypt
 /// failure. Distinct from a NULL envelope (never-encrypted / plaintext row).
@@ -1181,10 +1186,11 @@ pub fn crypto_erase_marker() -> Vec<u8> {
     vec![ERASED_ENVELOPE_VERSION]
 }
 
-/// #1956 [R56] — is this `encrypted_envelope` a per-record (`0x03`) envelope
-/// whose embedded wrapped DEK can be DESTROYED to crypto-erase the record?
+/// #1956 [R56] — is this `encrypted_envelope` one whose embedded wrapped DEK
+/// can be DESTROYED to crypto-erase the record?
 ///
-/// `true` ONLY for the `0x03` per-record scheme. Legacy `0x02` per-agent rows
+/// `true` exactly for the versions in [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`]
+/// (the `0x03` per-record and the `0x05` scope envelope today). Legacy `0x02` per-agent rows
 /// (content sealed directly to the shared agent key — no per-record key to
 /// destroy) return `false`: they are the HONEST-LIMIT case (row-delete +
 /// tombstone only, NOT crypto-erasable). An empty / already-erased (`0x04`)
@@ -1845,5 +1851,81 @@ mod tests {
         assert!(detail.starts_with(KeyAbsent::CLASS) && !detail.contains("decrypt failed"));
         let aead = anyhow!("per-record content decrypt failed (authentication): aead::Error");
         assert!(read_failure_detail(&aead).starts_with("decrypt failed: "));
+    }
+
+    /// The `///` block directly above the first line of `text` that starts
+    /// with `anchor` (attribute lines skipped), joined with single spaces.
+    fn doc_block_before(text: &str, anchor: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(anchor))?;
+        let mut doc: Vec<&str> = Vec::new();
+        for line in lines[..at].iter().rev() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("///") {
+                doc.push(rest.trim());
+            } else if !trimmed.starts_with("#[") {
+                break;
+            }
+        }
+        doc.reverse();
+        (!doc.is_empty()).then(|| doc.join(" "))
+    }
+
+    /// #8278 (code r4 R4-F1, security r4 S4): every doc comment that describes
+    /// the crypto-erase scope names the SSOT
+    /// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] (0x03 and 0x05 today) instead of
+    /// describing one version byte as the whole erasable set.
+    #[test]
+    fn doc_erase_scope_names_erasable_versions_8278() {
+        const SSOT: &str = "CRYPTO_ERASABLE_ENVELOPE_VERSIONS";
+        const SINGLE_VERSION_PHRASES: [&str; 4] = [
+            "only 0x03",
+            "0x03 only",
+            "0x03 envelopes only",
+            "only for the 0x03",
+        ];
+        let sites: [(&str, &str, &[&str]); 3] = [
+            (
+                "src/encryption/mod.rs",
+                include_str!("mod.rs"),
+                &[
+                    "pub const RECORD_ENVELOPE_VERSION",
+                    "pub const ERASED_ENVELOPE_VERSION",
+                    "pub fn envelope_is_crypto_erasable",
+                ],
+            ),
+            (
+                "src/store/postgres_parity.rs",
+                include_str!("../store/postgres_parity.rs"),
+                &["pub(crate) async fn evict_tombstone_and_erase_in_tx"],
+            ),
+            (
+                "src/store/postgres.rs",
+                include_str!("../store/postgres.rs"),
+                &[
+                    "const SQL_CRYPTO_ERASE_ENVELOPE_BY_ID",
+                    "async fn pg_tombstone_and_erase_in_tx",
+                ],
+            ),
+        ];
+        for (file, text, anchors) in sites {
+            for anchor in anchors {
+                let doc = doc_block_before(text, anchor)
+                    .unwrap_or_else(|| panic!("{file}: no doc comment above `{anchor}`"));
+                assert!(
+                    doc.contains(SSOT),
+                    "{file}: the doc of `{anchor}` describes crypto erase and must name {SSOT}"
+                );
+                let flat = doc.to_lowercase().replace('`', "");
+                for phrase in SINGLE_VERSION_PHRASES {
+                    assert!(
+                        !flat.contains(phrase),
+                        "{file}: the doc of `{anchor}` says `{phrase}`"
+                    );
+                }
+            }
+        }
     }
 }
