@@ -330,12 +330,17 @@ dylib digest joins it) in the helper, the matching assertions in
 **Install and restart.** Never copy over the installed `age.dylib` in place while
 the postmaster has it mapped: an in-place overwrite changes the pages under the
 running backends. Install by a same-directory temp file plus rename (what the
-helper does), or run the helper from a checkout that carries the new pin:
+helper does), or run the helper from a checkout that carries the new pin. Remove
+any leftover `age.dylib.new` first: `cp` writes through a symlink at the
+destination name. The `shasum` output must equal the `age.dylib` pin in the
+helper before the `mv`. The command lines carry no trailing comments: the
+node's interactive shell is zsh 5.9 without `interactivecomments`, so a pasted
+`# ...` becomes operands of the command (for `rm -f`, file names to delete).
 
-    rm -f <pkglibdir>/age.dylib.new   # a pre-existing symlink at that name would be written through
+    rm -f <pkglibdir>/age.dylib.new
     cp <pg-age-stack>/age-1.8.0-<commit>/lib/age.dylib <pkglibdir>/age.dylib.new
     chmod 0755 <pkglibdir>/age.dylib.new
-    shasum -a 256 <pkglibdir>/age.dylib.new   # must equal the age.dylib pin in the helper
+    shasum -a 256 <pkglibdir>/age.dylib.new
     mv <pkglibdir>/age.dylib.new <pkglibdir>/age.dylib
 
 `<pkglibdir>` is `pg_config --pkglibdir`; keep the old library next to it under a

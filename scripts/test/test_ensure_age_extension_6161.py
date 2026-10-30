@@ -1873,6 +1873,29 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertIn("refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)", r.stderr)
         self.assert_nothing_installed()  # I1 (#8282): disk unchanged (still empty), no temp file left
 
+    def test_refused_source_leaves_an_unhealthy_install_untouched_8282(self):
+        # R3-I2 (#8282): an installed dylib that is neither refused nor the pin (unhealthy) next to a
+        # refused source: the helper exits 2 before any write, so the file keeps its bytes, mode and
+        # inode, the share files are untouched, and no temp file of any name is left in either dest.
+        self.install_good()
+        older = b"older patched age.dylib bytes"
+        installed = self.lib / "age.dylib"
+        installed.write_bytes(older)
+        installed.chmod(0o750)
+        before = installed.stat()
+        self.refused = [sha(DYLIB)]
+        self.assertNotIn(sha(older), self.refused)
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source rejected: " + str(self.age / "lib" / "age.dylib"))
+        after = installed.stat()
+        self.assertEqual(sha(installed.read_bytes()), sha(older))
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o750)
+        self.assertEqual(after.st_ino, before.st_ino)
+        self.assertEqual(sorted(p.name for p in self.lib.iterdir()), ["age.dylib"])
+        self.assertEqual(sorted(p.name for p in self.ext.iterdir()), sorted(SHARE_FILES))
+        for name in SHARE_FILES:
+            self.assertEqual((self.ext / name).read_bytes(), self.src[("share", name)])
+
     def test_refused_installed_file_matching_a_refused_pin_is_not_healthy_8282(self):
         # Pinned and installed stock used to count as healthy (exit 0); it is refused now, and the
         # installed files are left exactly as they were (no write, no removal).

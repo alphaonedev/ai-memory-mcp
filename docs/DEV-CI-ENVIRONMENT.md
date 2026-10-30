@@ -174,7 +174,8 @@ cd pg-age-stack && docker compose up -d      # brings up the certified pg+AGE+pg
 # start/stop the native pg cluster (operator-local cluster name)
 sudo pg_ctlcluster 18 <cluster> start|stop|restart
 pg_lsclusters
-sudo -u postgres psql -p 5445 -d <test-db>    # local socket (trust)
+# connect over the local socket (trust auth):
+sudo -u postgres psql -p 5445 -d <test-db>
 # rebuild from scratch: operator-local linux-native-tier.sh
 ```
 
@@ -209,10 +210,13 @@ macos-fed node the "Configure enterprise-fed tier" step runs
   reinstalls it from the pinned source and exits 0; (2) a SOURCE file whose
   digest is refused is rejected by name, `age source rejected: <path> refused:
   stock apache/age 1.8.0 carries issue 2580 (issue 8282)`, exit 2, nothing
-  written, even when a `MANIFEST` pins it (`read_source`). A head that pins
-  stock while its source dir holds the patched bytes gets `age source rejected:
-  <path> does not match its pinned sha256`, exit 2, nothing written: the pin
-  comparison does not consult `REFUSED_SHAS`.
+  written, even when a `MANIFEST` pins it (`read_source`). A head whose helper
+  still pins stock exits 2 with nothing written: `age source incomplete: <path>
+  is missing` when its `DEFAULT_AGE_DIR` is the retired stock dir
+  (`load_sources`, before any pin is compared), or `age source rejected: <path>
+  does not match its pinned sha256` when it is the `06ce678d` dir whose source
+  holds the patched bytes (the pin comparison in `read_source`; `REFUSED_SHAS`
+  is consulted for source and installed digests, not for the pin).
 - **Fail closed (#8282).** The stock source directory on the macos-fed node was
   retired on 2026-10-29 (renamed `age-1.8.0.retired-8282`; 3-agent vote
   (6def5ab6) 3-0) after a job whose helper still pinned stock rewrote the stock
