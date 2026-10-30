@@ -15,15 +15,19 @@ Scanned: README.md and every docs/**/*.md. Flagged inside a shell fence:
   (b) a full-line comment containing a backtick or `$(`;
   (c) a full-line `#` comment that sits between two command lines.
 
-A leading `#!` line, comment-only fences (no command line at all) and the
-text of a heredoc body are not flagged.
+A leading `#!` line, a comment-only fence whose comments hold no backtick
+or `$(` (class (b) is still flagged there; class (c) needs commands on both
+sides), and the text of a heredoc body are not flagged. A heredoc operator
+inside quotes or `$(( ))`, a here-string `<<<` and an arithmetic shift do not
+open a heredoc; a heredoc whose terminator never appears before the closing
+fence is not trusted: its would-be body is scanned as normal lines.
 
 OPT-OUT MARKER (one, explicit): a fence whose FIRST line is exactly
 `# not-for-paste` is documentation of a script body, not a paste target; the
 guard skips that fence. Move comments above the fence as prose instead of
 using the marker wherever the block is meant to be pasted.
 
-Run: python3 -I -m unittest scripts/ci/tests/test_docs_shell_paste_safe_8311.py
+Run: python3 -I -m unittest discover -s scripts/ci/tests -p test_docs_shell_paste_safe_8311.py
 """
 import pathlib
 import re
@@ -33,7 +37,43 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 SHELL_LANGS = {"bash", "sh", "zsh", "console", "shell"}
 MARKER = "# not-for-paste"
 FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)")
-HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+HEREDOC_RE = re.compile(
+    r"(?<!<)<<(?!<)-?\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1"
+)
+
+
+def heredoc_word(line):
+    """Return the heredoc terminator word opened by `line`, else None.
+
+    Quote and `$(( ))` tracking mirrors `trailing_comment`: an operator inside
+    quotes or arithmetic is not a heredoc; `<<<` is a here-string."""
+    quote = None
+    arith = 0
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"`":
+            quote = ch
+        elif line.startswith("((", i):
+            arith += 1
+            i += 1
+        elif line.startswith("))", i) and arith:
+            arith -= 1
+            i += 1
+        elif line.startswith("<<", i) and not arith:
+            m = HEREDOC_RE.match(line, i)
+            if m:
+                return m.group(2)
+            i += 1
+        i += 1
+    return None
 
 
 def trailing_comment(line):
@@ -87,25 +127,22 @@ def scan_block(first_no, body):
     if body and body[0].strip() == MARKER:
         return []
     kinds = []
-    heredoc = None
+    skip_to = -1
     for off, raw in enumerate(body):
         no = first_no + off
         s = raw.strip()
-        if heredoc:
-            if s == heredoc:
-                heredoc = None
-            continue
-        if not s:
+        if off <= skip_to or not s:
             continue
         if s.startswith("#"):
             kinds.append((no, "comment", s))
             continue
         kinds.append((no, "command", s))
-        m = HEREDOC_RE.search(s)
-        if m:
-            heredoc = m.group(2)
-    if not any(k == "command" for _, k, _ in kinds):
-        return []
+        word = heredoc_word(s)
+        if word:
+            for end in range(off + 1, len(body)):
+                if body[end].strip() == word:
+                    skip_to = end
+                    break
     out = []
     for idx, (no, kind, s) in enumerate(kinds):
         if kind == "command":
@@ -207,6 +244,21 @@ class DocsShellPasteSafe8311(unittest.TestCase):
                 "comment line holds a backtick or $(",
             },
         )
+        # S1: class (b) in a comment-only fence.
+        self.assertEqual(len(scan_block(1, ["# run `id` first"])), 1)
+        self.assertEqual(len(scan_block(1, ["# a", "# $(id)"])), 1)
+        # S2/F2: a false heredoc must not hide the next line's hazard.
+        for first in (
+            "cat <<<word",
+            "echo $((1<<FOO))",
+            'echo "<<EOF"',
+            "echo '<<EOF'",
+        ):
+            self.assertEqual(len(scan_block(1, [first, "a # b"])), 1, first)
+        # An unterminated heredoc is rescanned as normal lines.
+        self.assertEqual(len(scan_block(1, ["cat <<EOF", "a # b"])), 1)
+        # `<<\EOF` is a quoted-word heredoc: its body is not flagged.
+        self.assertEqual(scan_block(1, ["cat <<\\EOF", "a # b", "EOF", "ls"]), [])
 
     def test_8311_scanner_ignores_safe_shapes(self):
         self.assertEqual(scan_block(1, ["# only a comment", "# another"]), [])
