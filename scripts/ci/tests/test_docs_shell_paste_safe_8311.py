@@ -428,8 +428,9 @@ class Frames(list):
 
 
 LOOK_STOPS = {
-    None: re.compile(r"[()'\"\\`]|\$\((?!\()"),
+    None: re.compile(r"[()'\"\\`]|\$\((?!\()|\$'"),
     "'": re.compile(r"'"),
+    "$'": re.compile(r"['\\]"),  # ANSI-C: a backslash escapes the next character
     '"': re.compile(r'["\\`]|\$\((?!\()'),
 }
 
@@ -438,7 +439,8 @@ class Lookahead:
     """Decide arithmetic or subshell when a `((` or `$((` opener is pushed,
     as bash does (parse_dparen, parse_arith_cmd): the text after the opener
     up to the `)` that closes its inner `(` (parens counted, quotes and
-    backslashes skipped) must be followed at once by `)`; otherwise bash
+    backslashes skipped; inside an ANSI-C `$'..'` a backslash escapes the
+    quote, as in QUOTES) must be followed at once by `)`; otherwise bash
     re-reads `((` as two nested subshells and `$((` as `$( (..) )`.
     bash's scan reads a backtick span or a `$( )` as commands (fresh
     quoting, `#` comments), which a paren count cannot follow, so a
@@ -448,8 +450,9 @@ class Lookahead:
     Bounded: one lookahead reads at most LOOKAHEAD_CAP characters, and all
     lookaheads over one fence share a budget of its length plus the cap, so
     the work stays linear. A lookahead that reaches the fence end (or the
-    line end, with `single`), the cap or the budget answers subshell: code,
-    where a comment is seen, which fails closed."""
+    line end, with `single`), the cap or the budget, in any quote state
+    (ANSI-C included), answers subshell: code, where a comment is seen,
+    which fails closed."""
 
     def __init__(self, lines, single=False):
         self.lines = lines
@@ -481,7 +484,9 @@ class Lookahead:
                 ch, col = m.group(), m.end()
                 if ch == "\\":
                     col += 1
-                elif ch == "`" or ch.startswith("$"):
+                elif ch == "$'":
+                    quote = ch  # only LOOK_STOPS[None] matches it
+                elif ch == "`" or ch.startswith("$("):
                     self.budget += left
                     return False  # command substitution: subshell
                 elif quote is not None or ch in "'\"":
@@ -1219,15 +1224,23 @@ class DocsShellPasteSafe8311(unittest.TestCase):
     def test_8311_dparen_lookahead_stops_at_substitution(self):
         # S17: bash's scan reads a backtick span or a `$( )` as commands, so
         # a paren run inside one is no `))`; the lookahead answers subshell.
-        self.assertEqual(scan_block(1, ["(( `echo ))`; echo L1 # c", ") )"]), [(1, TRAIL)])
-        self.assertEqual(
-            scan_block(1, ["(( \"$(echo '\"))')\"; echo L1 # c", ") )"]), [(1, TRAIL)]
+        # S18: inside an ANSI-C `$'..'` a backslash escapes the quote, so a
+        # paren run after `\'` is still inside the string. Each row carries
+        # the lines bash 5.2 runs (`bash -c`, echo markers) and the hits.
+        probes = (
+            (["(( `echo ))`; echo L1 # c", ") )"], [1], "L1"),
+            (["(( \"$(echo '\"))')\"; echo L1 # c", ") )"], [1], "L1"),
+            (["(( $(: # )))", "); echo L2 # c", ") )"], [1, 2], "L2"),
+            (["(( $'\\')) '; echo L1 # c", ") )"], [1], "L1"),
+            (["(( $'\\')) '", "echo L2 # c", ") )"], [2], "L2"),
+            (["(( $')) '; echo L1 # c", ") )"], [1], "L1"),
+            # Arithmetic, `$((` in quotes and an ANSI-C operand stay clean.
+            (["(( n > 0 )) && echo \")\"", 'echo "$(( 1 + 2 ))"'], [], "3"),
+            (["(( x == $'\\'' )) || echo ok"], [], "ok"),
         )
-        self.assertEqual(
-            [h[0] for h in scan_block(1, ["(( $(: # )))", "); echo L2 # c", ") )"])], [1, 2]
-        )
-        # Arithmetic without a substitution, and `$((` in quotes, stay clean.
-        self.assertEqual(scan_block(1, ["(( n > 0 )) && echo \")\"", 'echo "$(( 1 + 2 ))"']), [])
+        for lines, want, bash_runs in probes:
+            with self.subTest(lines=lines, bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
 
     def test_8311_backtick_closes_through_quotes(self):
         # S15: bash ends a backtick substitution at the first unescaped
@@ -1241,7 +1254,10 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # S13: a fence left open by every line, and a fence of unterminated
         # heredocs, each scan in linear time and stay fail closed. S14: the
         # `((` lookahead shares one budget per fence, so it stays linear.
-        shapes = (("x ${", 20000), ("cat <<E", 0), ("((", 0), ("(( `", 0), ("(( $(", 0))
+        shapes = (
+            ("x ${", 20000), ("cat <<E", 0), ("((", 0), ("(( `", 0), ("(( $(", 0),
+            ("(( $'\\'", 0),  # S18: an escaped quote in an ANSI-C string
+        )
         for line, want in shapes:
             began = time.monotonic()
             got = scan_block(1, [line] * 20000)
