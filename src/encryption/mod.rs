@@ -1393,9 +1393,8 @@ mod tests {
         clear_keypair_cache(); // modeled restart — cache gone
 
         let kp2 = get_or_create_keypair_in(agent, dir.path()).expect("load from disk");
-        assert_eq!(
-            kp1.secret.to_bytes(),
-            kp2.secret.to_bytes(),
+        assert!(
+            kp1.secret.to_bytes() == kp2.secret.to_bytes(),
             "#228: the keypair MUST round-trip from disk after a cache clear"
         );
         let recovered = decrypt(&env, &kp2.secret).expect("decrypt after restart");
@@ -1479,9 +1478,8 @@ mod tests {
             let loaded = load_keypair_in(agent, dir.path())
                 .expect("#8316: the #3198 chain check accepts the 0700 fixture dir")
                 .expect("#8316: the persisted keypair is found");
-            assert_eq!(
-                minted.secret.to_bytes(),
-                loaded.secret.to_bytes(),
+            assert!(
+                minted.secret.to_bytes() == loaded.secret.to_bytes(),
                 "#8316: the keypair round-trips from a fixture dir created under umask 0002"
             );
             let marker = std::env::var_os(MARKER_ENV).expect("marker path");
@@ -1513,7 +1511,10 @@ mod tests {
         let a = get_or_create_keypair(agent).expect("first generate");
         let b = get_or_create_keypair(agent).expect("second fetch");
         assert_eq!(a.public.as_bytes(), b.public.as_bytes());
-        assert_eq!(a.secret.to_bytes(), b.secret.to_bytes());
+        assert!(
+            a.secret.to_bytes() == b.secret.to_bytes(),
+            "the cached keypair keeps the same secret"
+        );
     }
 
     #[test]
@@ -1609,15 +1610,17 @@ mod tests {
         let shared_a = alice.secret.diffie_hellman(&bob.public);
         let shared_b = bob.secret.diffie_hellman(&alice.public);
         // ECDH symmetry precondition.
-        assert_eq!(shared_a.as_bytes(), shared_b.as_bytes());
+        assert!(
+            shared_a.as_bytes() == shared_b.as_bytes(),
+            "ECDH symmetry: both sides derive the same shared secret"
+        );
 
         let key1 = derive_aead_key(&shared_a);
         let key2 = derive_aead_key(&shared_b);
-        assert_eq!(key1, key2, "HKDF derivation must be deterministic");
+        assert!(key1 == key2, "HKDF derivation must be deterministic");
         assert_eq!(key1.len(), AEAD_KEY_LEN);
-        assert_ne!(
-            &key1,
-            shared_a.as_bytes(),
+        assert!(
+            key1.as_slice() != shared_a.as_bytes(),
             "derived key must not be the raw shared secret (HKDF must transform it)"
         );
     }
