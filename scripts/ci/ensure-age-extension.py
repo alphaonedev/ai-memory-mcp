@@ -208,8 +208,9 @@ TEMP_SUFFIX = ".age-restore"
 # later backend on that PGPROC fails to connect with "failed to re-find shared
 # lock object" (#7162, #8282).  A pin on the stock bytes makes this helper
 # REINSTALL the defect over the patched library (that is how #8282 happened),
-# so the pin and DEFAULT_AGE_DIR change together with every AGE rebuild; the
-# recipe is in docs/DEVELOPER_SETUP_NOTES.md ("macos-fed AGE build").
+# so the pin and DEFAULT_AGE_DIR change together with every AGE rebuild and the
+# superseded dylib digest joins REFUSED_SHAS; the recipe is in
+# docs/DEVELOPER_SETUP_NOTES.md ("macos-fed AGE build").
 MANIFEST = (
     ("lib", "age.dylib", "b6b5c442331cc45596e9be2e24172a51329ff69e7d08bbeb66ec970bacd08adf"),
     ("share", "age--1.6.0--1.7.0.sql", "3f63301c461e2ad3e952f1ead68d380ddadfe004b147ca81606ad63301e0514f"),
@@ -217,6 +218,15 @@ MANIFEST = (
     ("share", "age--1.8.0.sql", "f6c2d353997a4479d1be63d0e0afc4a58fb2e0826d46f9d6d5a0e46d69441d4d"),
     ("share", "age.control", "432d43d2c9e27534c95a8061c968a3334216c6b44de111ed4466693a7fc15f09"),
 )
+
+# Digests this helper refuses whatever MANIFEST pins (#8282): a source file with one
+# of them is rejected by name and exits 2 without a write, and an installed file
+# with one of them never counts as healthy.  An older head whose MANIFEST still
+# pins such a build therefore fails closed instead of reinstalling the defect.
+REFUSED_SHAS = frozenset({
+    "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927",  # stock age.dylib 1.8.0, apache/age#2580
+})
+REFUSED_REASON = "refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)"
 
 
 class HelperError(Exception):
@@ -612,7 +622,11 @@ def installed_ok(dests):
     #7016: right bytes are not enough; a writable age.dylib in pkglibdir lets any local user replace code the
     postgres backend loads, so it counts as not installed and the restore rewrites it with the source's mode.
     """
-    return all(sha256_of_regular_file(dests[sub] / name, refuse_writable=True) == pin for sub, name, pin in MANIFEST)
+    for sub, name, pin in MANIFEST:
+        digest = sha256_of_regular_file(dests[sub] / name, refuse_writable=True)
+        if digest is None or digest in REFUSED_SHAS or digest != pin:  # #8282: a refused build is never healthy
+            return False
+    return True
 
 
 def healthy(args, dests, url):
@@ -661,7 +675,10 @@ def read_source(path, pin):
         raise HelperError(f"age source unreadable: {path} ({exc.strerror})", EXIT_BAD_INPUT)
     finally:
         os.close(fd)
-    if hashlib.sha256(data).hexdigest() != pin:
+    digest = hashlib.sha256(data).hexdigest()
+    if digest in REFUSED_SHAS:  # #8282: refused even when MANIFEST pins it
+        raise HelperError(f"age source rejected: {path} {REFUSED_REASON}", EXIT_BAD_INPUT)
+    if digest != pin:
         raise HelperError(f"age source rejected: {path} does not match its pinned sha256", EXIT_BAD_INPUT)
     return data, stat.S_IMODE(st.st_mode)
 

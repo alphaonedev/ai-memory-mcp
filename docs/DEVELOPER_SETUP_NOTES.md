@@ -281,10 +281,34 @@ macos-fed node runs its own build.
 Stage the result in a NEW node-local directory named after the upstream commit,
 `<pg-age-stack>/age-1.8.0-<commit>/{lib/age.dylib, share/age.control,
 share/age--1.8.0.sql, share/age--1.7.0--1.8.0.sql, share/age--1.6.0--1.7.0.sql}`
-(files 0644, dirs 0755, owned by the runner uid, no symlinks; the SQL files are
-unchanged by the patch, copy them from the previous directory). Keep the previous
-directory: jobs on older branches still carry the older pin and source path, and
-the self-heal exits 2 (job red) when its source does not match its pin.
+(files 0644, the dylib 0755, dirs 0755, owned by the runner uid, never group- or
+world-writable, no symlinks; the SQL files are unchanged by the patch, copy them
+from the previous directory). Then retire the previous directory by renaming it
+out of the helper's default path (`age-1.8.0.retired-8282` on the macos-fed node):
+the self-heal installs whatever its `MANIFEST` pins from the directory its
+`DEFAULT_AGE_DIR` names, so a source directory that still holds the stock bytes
+lets every job whose checked-out helper still pins stock put the defect back on
+disk.
+
+**Fail closed (decided 2026-10-29).** The stock source directory on the macos-fed
+node was retired on 2026-10-29 (renamed `age-1.8.0.retired-8282`) by conductor
+decision, 3-agent vote (6def5ab6) 3-0: 31 minutes after the patched library was
+installed, the `Configure enterprise-fed tier` step of a job whose helper still
+pinned stock rewrote the stock `age.dylib` onto disk, and one unplanned restart of
+the tier, which five runner slots share, would have reproduced the leak. The
+consequences are by design:
+
+- A head whose helper still pins the stock sha exits 2 on this node (`age source
+  incomplete: ... is missing` for a head before `REFUSED_SHAS`, `age source
+  rejected: ... refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)`
+  for a head that carries it) and its `Check (macos-fed,enterprise-fed)` row is
+  red. That red is attributed to issue 8282 until the head carries this change.
+- Once this change is on the chain every `refs/pull/N/merge` ref carries the new
+  pin. Re-runs of older workflow runs keep their old merge sha and stay red by
+  design: rebase the branch instead of retrying the run.
+- `REFUSED_SHAS` in the helper names the stock dylib digest: a source or installed
+  file with that digest is refused by name and never installed, even when a
+  `MANIFEST` pins it.
 
 **Pin rule.** `scripts/ci/ensure-age-extension.py` installs the five files its
 `MANIFEST` pins, on every enterprise-fed job, whenever the installed bytes differ.
@@ -293,19 +317,35 @@ stock 1.8.0 bytes (`8ecfc082...`) reinstalls the #2580 defect over a patched
 library, which is exactly how #8282 followed the #7162 fix (the helper restored
 stock on 2026-10-22, the next tier restart on 2026-10-25 loaded it, and the
 connect failures were back on 2026-10-28). Every AGE rebuild changes, in one
-commit, the `age.dylib` pin and `DEFAULT_AGE_DIR` in the helper, the matching
-assertions in `scripts/test/test_ensure_age_extension_6161.py`, and this section.
+commit, the `age.dylib` pin, `DEFAULT_AGE_DIR` and `REFUSED_SHAS` (the superseded
+dylib digest joins it) in the helper, the matching assertions in
+`scripts/test/test_ensure_age_extension_6161.py`, and this section.
 
-**Install and restart.** Copy the new `age.dylib` over `pg_config --pkglibdir`/age.dylib
-(keep the old one next to it with a suffix), then restart the tier when no
-enterprise-fed job is running on any runner slot of the node:
+**Install and restart.** Never copy over the installed `age.dylib` in place while
+the postmaster has it mapped: an in-place overwrite changes the pages under the
+running backends. Install by a same-directory temp file plus rename (what the
+helper does), or run the helper from a checkout that carries the new pin:
+
+    cp <pg-age-stack>/age-1.8.0-<commit>/lib/age.dylib <pkglibdir>/age.dylib.new
+    chmod 0755 <pkglibdir>/age.dylib.new
+    shasum -a 256 <pkglibdir>/age.dylib.new   # must equal the age.dylib pin in the helper
+    mv <pkglibdir>/age.dylib.new <pkglibdir>/age.dylib
+
+`<pkglibdir>` is `pg_config --pkglibdir`; keep the old library next to it under a
+suffix if a reproduction needs it. The mandatory check, BEFORE the restart and
+again AFTER it: `shasum -a 256 <pkglibdir>/age.dylib` must equal the `age.dylib`
+pin in `scripts/ci/ensure-age-extension.py`. Never restart on a mismatch; restore
+the pinned file first. Then, when no enterprise-fed job is running on any runner
+slot of the node:
 
     launchctl kickstart -k gui/<uid>/dev.alphaone.pg-age-stack
 
 A `SIGHUP` is not enough: a library in `shared_preload_libraries` is loaded once by
 the postmaster. Verify `select extversion from pg_extension where extname='age'`
-(1.8.0), that `lsof -p <postmaster pid>` maps the new `age.dylib`, and that the
-server log stays free of both messages above.
+(1.8.0), repeat the sha check, and watch that the server log stays free of both
+messages above. `lsof -p <postmaster pid>` proves only that the postmaster maps a
+file at that path; stock and patched share the path, so it cannot tell them apart
+and the sha check is the test.
 
 **Reproduction (same scenario as the CI failure, on a throwaway cluster).** Start a
 scratch cluster with `shared_preload_libraries = 'age'` and a `dynamic_library_path`

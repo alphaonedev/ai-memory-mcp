@@ -161,6 +161,8 @@ spec.loader.exec_module(mod)
 with open(sys.argv[2]) as fh:
     cfg = json.load(fh)
 mod.MANIFEST = tuple(tuple(row) for row in cfg["manifest"])
+if cfg.get("refused") is not None:
+    mod.REFUSED_SHAS = frozenset(cfg["refused"])
 if cfg.get("uid") is not None:
     mod.running_uid = lambda: cfg["uid"]
 sys.exit(mod.main(sys.argv[3:]))
@@ -303,6 +305,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.harness = self.base / "harness.py"
         self.harness.write_text(HARNESS)
         self.uid = None
+        self.refused = None
 
     # ---- helpers -------------------------------------------------------
     def manifest(self):
@@ -311,7 +314,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
 
     def cmd(self, age_dir=None):
         cfg = self.base / "cfg.json"
-        cfg.write_text(json.dumps({"manifest": self.manifest(), "uid": self.uid}))
+        cfg.write_text(json.dumps({"manifest": self.manifest(), "uid": self.uid, "refused": self.refused}))
         return [
             sys.executable, "-I", str(self.harness), str(SCRIPT), str(cfg),
             "--url-file", str(self.url_file),
@@ -696,7 +699,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             f"postgres://ciuser@127.0.0.1:5445/cidb?application_name=ci=password={PW_MARKER}",
             # R5-F3: the extra '=' sits in a later segment (a first-segment-only check misses it).
             f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&application_name=ci;password={PW_MARKER}",
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&connect_timeout=5&application_name=ci=x=y",
+            "postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&connect_timeout=5&application_name=ci=x=y",
         ):
             with self.subTest(url=url.replace(PW_MARKER, "<M>")):
                 self.assert_url_refused(url)
@@ -1854,6 +1857,41 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertIn(str(home / "pg-age-stack" / "age-1.8.0-06ce678d"), r.stderr)
         self.assert_nothing_installed()
 
+    # ---- #8282: refused builds ------------------------------------------
+    def test_refused_shas_name_the_stock_dylib_and_no_pin_8282(self):
+        # The stock 1.8.0 age.dylib carries apache/age#2580; no MANIFEST pin may be a refused digest.
+        mod = load_module()
+        self.assertEqual(mod.REFUSED_SHAS,
+                         frozenset({"8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927"}))
+        self.assertEqual([name for _, name, pin in mod.MANIFEST if pin in mod.REFUSED_SHAS], [])
+
+    def test_refused_source_is_rejected_by_name_and_never_installed_8282(self):
+        # A MANIFEST that pins a refused digest (the stock pin of older heads) must not reinstall the defect.
+        self.refused = [sha(DYLIB)]
+        r = self.run_script()
+        self.assert_fails(r, 2, "age source rejected: " + str(self.age / "lib" / "age.dylib"))
+        self.assertIn("refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)", r.stderr)
+
+    def test_refused_installed_file_matching_a_refused_pin_is_not_healthy_8282(self):
+        # Pinned and installed stock used to count as healthy (exit 0); it is refused now, and the
+        # installed files are left exactly as they were (no write, no removal).
+        self.refused = [sha(DYLIB)]
+        self.install_good()
+        r = self.run_script()
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)", r.stderr)
+        self.assertEqual((self.lib / "age.dylib").read_bytes(), DYLIB)
+        self.assert_no_temp_files()
+
+    def test_refused_installed_file_is_replaced_from_a_good_source_8282(self):
+        stock = b"stock age.dylib 1.8.0 bytes"
+        self.refused = [sha(stock)]
+        self.install_good()
+        (self.lib / "age.dylib").write_bytes(stock)
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assert_restored()
+
     def test_manifest_pins_exactly_the_five_age_files(self):
         mod = load_module()
         rows = list(mod.MANIFEST)
@@ -1868,8 +1906,6 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # 1.8.0 bytes (8ecfc082...), which carry the apache/age#2580 lock leak.
         self.assertEqual(dict(((s, n), p) for s, n, p in rows)[("lib", "age.dylib")],
                          "b6b5c442331cc45596e9be2e24172a51329ff69e7d08bbeb66ec970bacd08adf")
-        self.assertNotEqual(dict(((s, n), p) for s, n, p in rows)[("lib", "age.dylib")],
-                            "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927")
 
 
     def test_a_stop_recorded_during_handler_install_spawns_no_psql_6846(self):
