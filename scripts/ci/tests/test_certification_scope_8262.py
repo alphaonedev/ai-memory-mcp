@@ -29,8 +29,9 @@ HTML and is not in the subset. The rules:
      opener and an unclosed fence are refused too. A block quote is one level at column 0 and may
      not carry a fence, a heading-like line, a list item, an HTML block or indented code; lazy
      continuation is refused. An HTML block line is refused except a one-line "<!-- ... -->" comment
-     and the measured README.md lines of HTML_BLOCK_ALLOW, each followed only by a blank line or
-     another allowed line. YAML front matter is read only at the top of a file.
+     (exactly one comment per line, nothing before the opener or after the closer, no "--" inside,
+     no nested "<!--"; "--->" and "<!-- -- -->" are refused) and the measured README.md lines of
+     HTML_BLOCK_ALLOW, each followed only by a blank line or another allowed line. YAML front matter is read only at the top of a file.
   4. The IN, PENDING, UNLANDED and NOT statement blocks hold only list items ("-", "*", "+" or an
      ordered marker at column 0) and blank lines: one child level (2-4 spaces), continuation lines
      at the item content column, no second paragraph, no other block; every item is digest-pinned.
@@ -1172,10 +1173,16 @@ def trust_peer_units(rel, raw):
     return out
 
 
+# Round 20 (security r19 LOW-1): the dashes that rounds 6-7 treat as separators for the end-to-end term
+# (U+2010-U+2015, U+2212) and the other dash forms are the "-" of the trust-peer identifier.
+_UNICODE_DASH_RE = re.compile("[\u2010-\u2015\u2212\uFE58\u2E3A]")
+
+
 def _mention_views(text):
     """_views() with one fold: the folded view, it without tags and emphasis, and a rendered view
-    (comments, tags and link syntax removed after unescaping, folded again if an entity remains)."""
-    low = fold(text)
+    (comments, tags and link syntax removed after unescaping, folded again if an entity remains).
+    A Unicode dash is read as "-" first (round 20)."""
+    low = fold(_UNICODE_DASH_RE.sub("-", text))
     out = low
     if "<" in out:
         out = _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(out)))
@@ -1247,9 +1254,11 @@ _G_CLOSER_RE = re.compile(r"(`{3,}|~{3,}) *$")
 _G_SETEXT_RE = re.compile(r" *(?:=+|-+) *$")
 _G_HTML_RE = re.compile(r"<[a-z/!?]", re.IGNORECASE)
 _G_AUTOLINK_RE = re.compile(r"<(?:[a-z][a-z0-9+.-]{1,31}:[^\s<>]*|[^\s@<>]+@[^\s@<>]+)>", re.IGNORECASE)
-# Round 19: a whole single-line comment, anchored at both ends; the body holds no "--" run, so a nested
-# "<!--" and a second "-->" are not the comment (the line is then refused as an HTML block).
-_G_COMMENT_LINE_RE = re.compile(r"^<!--(?:[^-]|-(?!-))*-->$")
+# Round 19/20: a whole single-line comment, anchored at both ends; the body holds no "--" run and no
+# "<!--" (a "<" is allowed only when it does not open one), so a nested opener, even one that shares its
+# dashes with the closer ("<!-- a <!-->"), and a second "-->" are not the comment (the line is then
+# refused as an HTML block).
+_G_COMMENT_LINE_RE = re.compile(r"^<!--(?:[^-<]|<(?!!--)|-(?!-))*-->$")
 _G_FRONT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*: \S.*$")
 _G_REFDEF_RE = re.compile(r" *\[[^\]\n]+\]:")
 # Rule 4: a gated-block item marker at the start of the (unindented) text, one space, then text.
@@ -2039,7 +2048,12 @@ class CertificationScope8262(unittest.TestCase):
                       "__TRUST_PEER__", "*TRUST*\\_PEER"):
             for text in ("Enable %s on every peer." % token, "| %s | 1 |" % token):
                 self.assertEqual(len(trust_peer_units("README.md", text)), 1, text)
-        for token in ("TRUST_PEERS_ARE_LISTED", "TRUST\\_PEER\\_LIMIT", "TRUST_**PEER**_LIMIT", "trustpeer"):
+        # Round 20 (security r19 LOW-1): a Unicode dash between the halves is the same identifier.
+        for dash in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\u2E3A":
+            text = "Enable TRUST%sPEER on every peer." % dash
+            self.assertEqual(len(trust_peer_units("README.md", text)), 1, "U+%04X" % ord(dash))
+        for token in ("TRUST_PEERS_ARE_LISTED", "TRUST\\_PEER\\_LIMIT", "TRUST_**PEER**_LIMIT", "trustpeer",
+                      "TRUST\u2013PEERS"):
             text = "Enable %s on every peer." % token
             self.assertEqual(trust_peer_units("README.md", text), [], text)
 
@@ -2053,9 +2067,23 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(got("---\nlayout: a b\n---\n# T\n\n```\na\tb\n```"), [])
         self.assertEqual(got("<!-- note -->\n\nx"), [])
         for text in ("<!-- a\nb -->", "<!-- a --> text", "<!-- a <!-- b -->", "<!-- a --> <!-- b -->", "<!-->",
-                     "<!-- a --->", "<!-- a -- b -->", "<!-- a --> "):
+                     "<!-- a --->", "<!-- a -- b -->", "<!-- a --> ", "<!-- a <!-->", "<!--<!-->"):
             self.assertTrue(got(text), text)
             self.assertIn("HTML block", got(text)[0], text)
+        for text in ("<!-- note -->", "<!---->", "<!-- a < b -->", "<!-- <b> -->", "<!-- a - b -->"):
+            self.assertEqual(got(text + "\n\nx"), [], text)
+
+    def test_comment_pattern_is_linear_8262(self):
+        # Round 20 (code r19 MEDIUM-1): the one-line comment pattern refuses a nested opener at the
+        # character level. Worst case for its alternation is a "<" followed by "!-" runs, 100 KB on one
+        # line, closed and unclosed; each stays under a 2 s ceiling.
+        import time
+        for text in ("<!--" + "<!-" * 33400, "<!--" + "<!-" * 33400 + "-->", "<!--" + "<!" * 50000 + "-->",
+                     "<!--" + "<" * 100000 + "-->"):
+            start = time.perf_counter()
+            grammar_problems("README.md", text)
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 2.0, "%d chars took %.2f s" % (len(text), elapsed))
 
     def test_grammar_rules_3_and_5_match_the_readme_8262(self):
         # Round 19 (code r15 LOW-5, INFO-1): the README and the docstring state rules 3 and 5 alike, and
@@ -2080,7 +2108,9 @@ class CertificationScope8262(unittest.TestCase):
     def test_lexer_is_linear_on_single_line_marker_runs_8262(self):
         # Round 19 (code r15 INFO-2): a single line of nested list or quote markers was quadratic in
         # _lex() (a thematic-break match and a slice of the rest of the line per marker). Each row stays
-        # under a 2 s ceiling; the unit text is unchanged.
+        # under a 10 s ceiling; the unit text is unchanged. Round 20 (security r19 INFO-1): the ceiling
+        # was 2 s; the lexer measured 0.04-1.19 s at nice 19 under load, and the round-18 lexer took
+        # 518-587 s on the same input, so 10 s still proves linearity with a 50x margin.
         import time
         rows = (("- " * 5000 + "x"), ("> " * 5000 + "x"), ("1. " * 3400 + "x"), ("- " * 100000 + "x"),
                 ("- * " * 50000 + "x"), ("- " * 100000), ("* " * 100000 + "-"))
@@ -2088,7 +2118,7 @@ class CertificationScope8262(unittest.TestCase):
             start = time.perf_counter()
             gated_units(text)
             elapsed = time.perf_counter() - start
-            self.assertLess(elapsed, 2.0, "%d chars took %.2f s" % (len(text), elapsed))
+            self.assertLess(elapsed, 10.0, "%d chars took %.2f s" % (len(text), elapsed))
         self.assertEqual(gated_units("- - x\n"), [])
 
     def test_trust_peer_identifier_forms_8262(self):

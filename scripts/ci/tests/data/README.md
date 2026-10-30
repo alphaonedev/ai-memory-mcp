@@ -22,8 +22,10 @@ guard docstring under "Guard grammar (markdown subset)". In short:
    string; front matter below the top of the file. An indented, quoted or in-item fence opener and
    an unclosed fence are refused too. A block quote is one level at column 0 and may not carry a
    fence, a heading-like line, a list item, an HTML block or indented code; lazy continuation is
-   refused. An HTML block line is refused except a one-line "<!-- ... -->" comment and the measured
-   README.md lines of HTML_BLOCK_ALLOW, each followed only by a blank line or another allowed line.
+   refused. An HTML block line is refused except a one-line "<!-- ... -->" comment (exactly one comment
+   per line, nothing before the opener or after the closer, no "--" inside, no nested "<!--"; "--->" and
+   "<!-- -- -->" are refused) and the measured README.md lines of HTML_BLOCK_ALLOW, each followed only by
+   a blank line or another allowed line.
    YAML front matter is read only at the top of a file.
 4. The IN, PENDING, UNLANDED and NOT statement blocks hold list items and blank lines only, one
    child level deep, and every item is digest-pinned.
