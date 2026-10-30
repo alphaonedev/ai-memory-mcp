@@ -107,6 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Round 21: a backslash-newline inside an unquoted heredoc body, command text stored as data (a `$(` or
   backquote kept literal in a value that an eval-class expansion can run later) and `${var@P}` are refused
   by name; the pre-pass line mapping and the continuation joiner are linear; and a byte-order mark is named.
+  Round 22: a parameter transformation (`${var@X}`), arithmetic on a runtime-joined value that is not a
+  number literal, a nested shell interpreter and a backslash-newline that splits a word are refused by name;
+  the linear readers are proven by a CPU-time growth ratio rather than a wall-clock budget; and a code-line
+  refusal names the raw script line.
 
 ### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
 

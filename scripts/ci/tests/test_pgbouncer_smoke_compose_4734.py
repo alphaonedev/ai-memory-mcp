@@ -82,6 +82,8 @@ a later statement-position check that reaches a FAIL exit; the exact group count
 their failure message names the constant and the lockstep remedy.
 """
 import fnmatch
+import hashlib
+import os
 import inspect
 import pathlib
 import re
@@ -109,7 +111,7 @@ EXIT_ZERO = re.compile(r"(?<![\w-])exit\s+[\"']?0+[\"']?(?![\w])")
 DOCKER_EXEC_RUN = re.compile(r"\bdocker\b.*\s(?:exec|run)\s")
 PW_TOKEN = re.compile(r"\b(?:PW|POSTGRES_PASSWORD|PGPASSWORD)\b")
 PW_BY_NAME = re.compile(r"-e PGPASSWORD(?![=\w])")
-BANNED_INDIRECTION = re.compile(r"\bprintf -v\b|\$\{!|\$\{[^}]*@P\}|\bev" + r"al\b")  # r21 S30: and ${var@P}
+BANNED_INDIRECTION = re.compile(r"\bprintf -v\b|\$\{!|\$\{[^}]*@[A-Za-z]\}|\bev" + r"al\b")  # r21 S30, r22: and every ${var@X}
 FAIL_ECHO = re.compile(r"\becho\b.*\b(?:FAIL|FATAL):")
 EXIT_SAME_LINE = re.compile(r">&2; exit [1-9]\d*(?: ;;|;? \}(?:;? \})?|;)?$")
 EXIT_NEXT_LINE = re.compile(r"^exit [1-9]\d*$")
@@ -450,7 +452,7 @@ def _script_header(path):
     return _script_text(path).split("\n")[:50]
 
 
-def _code_lines(path):
+def _code_lines(path, keep=False):
     """The lines of a script without its whole-line comments. r16 K11: a line is a comment only when the
     shared pre-pass (_strip_shell_comments) removes all of it, so a `#` line inside a quoted string or a
     heredoc body stays; a script the pre-pass cannot read fails the guard. r19 S25: both texts split on a
@@ -463,7 +465,16 @@ def _code_lines(path):
     lines, kept_lines = text.split("\n"), code.split("\n")
     if len(lines) != len(kept_lines):
         raise AssertionError("%s: the comment pre-pass kept %d lines of %d; the line alignment is lost" % (path.name, len(kept_lines), len(lines)))
+    if keep:  # r22 decision 6: a whole-line comment stays as an empty line, so the list index is the raw line
+        return ["" if ln.lstrip().startswith("#") and not kept.strip() else ln for ln, kept in zip(lines, kept_lines)]
     return [ln for ln, kept in zip(lines, kept_lines) if not (ln.lstrip().startswith("#") and not kept.strip())]
+
+
+def _code_body(path):
+    """r22 decision 6 (INFO-r18-c): the stripped code text the word readers re-lex for the wait-site, compose-pin
+    and daemon-selection refusals, one line per raw line (a whole-line comment or a blank line is an empty line),
+    so a refusal names the raw line of the script."""
+    return "\n".join(ln.strip() for ln in _code_lines(path, keep=True))
 
 
 def _sql_statements(path):
@@ -757,8 +768,10 @@ CONTROL_CHARACTER = re.compile("[\x00-\x08\x0e-\x1b\x1f]")
 REFUSED_CHARACTER = re.compile("%s|%s" % (LINE_BREAK_LOOKALIKE.pattern, CONTROL_CHARACTER.pattern))
 SUBSTITUTION_CONTEXTS = ("$(", "<(")  # r20 S27: bash may end a heredoc body opened in one at an `E)` line
 # r21 S30: the prompt transformation ${var@P} runs a command substitution held in the value; bash removes a
-# backslash-newline inside the word before it parses it, so the pattern skips those too
-PROMPT_TRANSFORM = re.compile(r"@(?:\\\n)*P(?:\\\n)*\}")
+# backslash-newline inside the word before it parses it, so the pattern skips those too; r22 decision 1 (K23):
+# every transformation letter is refused by name (@E decodes escapes into `$(` text, @Q/@A/@a and the rest
+# are refused with it, so no letter is a reviewed exception)
+PROMPT_TRANSFORM = re.compile(r"@(?:\\\n)*([A-Za-z])(?:\\\n)*\}")
 EXPANDING_DOLLAR = re.compile(r"[A-Za-z0-9_@*#?!$-]")  # r21 S30: a `$` before one of these starts an expansion
 COMMAND_TEXT = re.compile(r"\$\(|`")  # r21 S30: a `$(` (so also `$((`) or a backquote
 STORED_DATA = "command text stored as data"
@@ -800,6 +813,262 @@ def _heredoc_delimiter(text, i):
     return i, "".join(word)
 
 
+# r22 decision 4 (S33): a nested interpreter in command position runs a program text (a `-c` string, a `-s`
+# heredoc body, a sourced file) that every reader here sees as one quoted word or a quoted body
+NESTED_SHELLS = frozenset(("bash", "sh", "dash", "zsh", "ksh", "ash", "mksh", "rbash", "yash", "posh"))
+COMMAND_WRAPPERS = frozenset(("env", "exec", "command", "builtin", "nohup", "nice", "ionice", "time", "timeout", "sudo", "xargs", "watch"))
+ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+NESTED_INTERPRETER = "a nested shell interpreter"
+SPLIT_WORD_BSNL = "a backslash-newline that splits a word"  # r22 decision 3 (S31)
+# r22 decision 2 (S32): bash evaluates the VALUE of a variable named in an arithmetic sink as an expression
+# again, so a value assembled at run time (p="b[${x}(...)]", q="${p@E}") runs its command text there; a sink
+# operand must be provably a number. The sinks: $(( )), (( )) (also for (( )) / while (( ))), let, declare -i /
+# typeset -i / local -i, the [[ ]] -eq -ne -lt -le -gt -ge operands, array subscripts (${name[expr]},
+# name[expr]=, unset name[expr]) and substring offsets and lengths (${s:expr}, ${s:expr:expr}). The [ ] and
+# test forms are not sinks: bash does not evaluate their operands (it reports `integer expression expected`).
+ARITH_SINK = "arithmetic on a value that is not a number literal"
+SHELL_NUMERIC_NAMES = frozenset(("LINENO", "SECONDS", "RANDOM", "EUID", "UID"))
+SHELL_NUMERIC_SPECIAL = frozenset("?#$!")
+ENV_NUMERIC_DEFAULTS = frozenset(("STEP_DURATION_SECS",))
+"""r22 decision 2c: the names whose `${NAME:-<digits>}` default counts as a number. The guard models the
+script's own content, not the invoking environment: the CI workflow owns that environment, and a person who
+sets their own environment already has a shell. Any other `${X:-...}`, `${X-...}`, positional parameter or
+`read` value that reaches a sink is refused by name."""
+FUNC_NUMERIC = {"now_ms": "9a85ef3cf712502a8fcbd75f0c7d519cd7f9f2a1b3f74c3821237d615f27df50"}
+"""r22 decision 2d: a script-defined function is a numeric source only when its name and the sha256 of its
+definition text (from `name() {` to its closing brace, comments removed) are pinned here."""
+NUMERIC_COMMANDS = frozenset(("date +%s",))  # r22 decision 2d: the census of numeric $( ) command texts
+NUMBER_LITERAL = re.compile(r"(?:0[xX][0-9A-Fa-f]+|[0-9]+(?:#[0-9A-Za-z@_]+)?)\Z")
+ARITH_COMPARE = frozenset(("-eq", "-ne", "-lt", "-le", "-gt", "-ge"))
+ARITH_TOKEN = re.compile(r"\$\(|\$\{|\$[A-Za-z_][A-Za-z0-9_]*|\$.|[A-Za-z_][A-Za-z0-9_]*|[0-9][A-Za-z0-9_#@]*|.", re.S)
+SUBSTRING = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]|[@*])(?:\[[^\]\n]*\])?:(?![-=?+])")
+SUBSCRIPT_USE = re.compile(r"\$\{[#!]?[A-Za-z_][A-Za-z0-9_]*\[")
+COMMAND_WORD_START = r"(?:^|(?<=[\s;&|(){}]))"
+SUBSCRIPT_WRITE = re.compile(COMMAND_WORD_START + r"(?:unset\s+['\"]?)?[A-Za-z_][A-Za-z0-9_]*\[", re.M)
+ARITH_COMMAND = re.compile(r"(?<![$\w)])\(\(")
+LET_OR_INTEGER = re.compile(COMMAND_WORD_START + r"(?:let|(?:declare|typeset|local)\s+-[A-Za-z]*i[A-Za-z]*)(?=[ \t])", re.M)
+
+
+def _nested_interpreter(text, i):
+    """r22 decision 4: the offset of a nested interpreter word in the simple command that starts at text[i]
+    (after any assignment words: the command word, a word after a wrapper, or `source` / `.` with an
+    argument), else None."""
+    words, n = [], len(text)
+    while len(words) < 64:
+        while i < n and (text[i] in " \t" or text.startswith("\\\n", i)):
+            i += 2 if text[i] == "\\" else 1
+        if i >= n or text[i] in ";&|\n()<>`#":
+            break
+        end, word = _heredoc_delimiter(text, i)
+        if word is None or end == i:
+            break
+        words.append((i, word.replace("$", "")))
+        i = end
+    k = 0
+    while k < len(words) and ASSIGNMENT_WORD.match(words[k][1]):
+        k += 1
+    if k == len(words):
+        return None
+    at, first = words[k][0], words[k][1].rsplit("/", 1)[-1]
+    if first in NESTED_SHELLS or (first in ("source", ".") and len(words) > k + 1):
+        return at
+    if first == "busybox" and len(words) > k + 1 and words[k + 1][1] in NESTED_SHELLS:
+        return at
+    if first in COMMAND_WRAPPERS:
+        for at, word in words[k + 1 :]:
+            if any(part.rsplit("/", 1)[-1] in NESTED_SHELLS for part in word.split()):
+                return at
+    return None
+
+
+def _close_of(masked, i, opener, closer):
+    """r22: the offset just past the bracket that closes the one opened at masked[i] (depth counting over the
+    masked text, where quoted literal text is blank), or len(masked) when it never closes."""
+    depth, n = 0, len(masked)
+    while i < n:
+        ch = masked[i]
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+class _ArithSinks:
+    """r22 decision 2: the sink scan over the comment-free text `raw` and `masked`, the same text with
+    single-quoted text and quoted heredoc bodies blanked (same offsets); first() is the offset of the first
+    refused operand, or None."""
+
+    def __init__(self, raw, masked):
+        self.raw, self.masked, self.cache, self.spans = raw, masked, {}, None
+
+    def func_numeric(self, name):
+        pinned = FUNC_NUMERIC.get(name)
+        if pinned is None:
+            return False
+        found = list(re.finditer(COMMAND_WORD_START + re.escape(name) + r"\(\)[ \t]*\{", self.masked, re.M))
+        for m in found:
+            end = _close_of(self.masked, m.end() - 1, "{", "}")
+            if hashlib.sha256(self.raw[m.start() : end].encode("utf-8")).hexdigest() != pinned:
+                return False
+        return bool(found)
+
+    def command_numeric(self, start, end):
+        inner = self.raw[start:end].strip()
+        return inner in NUMERIC_COMMANDS or self.func_numeric(inner)
+
+    def skip_expansion(self, i):
+        """the offset past the $( ) or ${ } that starts at masked[i]"""
+        opener = self.masked[i + 1]
+        return _close_of(self.masked, i + 1, opener, ")" if opener == "(" else "}")
+
+    def value_end(self, i):
+        """the end of the assignment value word that starts at masked[i]"""
+        masked, n, quote = self.masked, len(self.masked), None
+        while i < n:
+            ch = masked[i]
+            if ch == "$" and masked[i + 1 : i + 2] in ("(", "{"):
+                i = self.skip_expansion(i)
+                continue
+            if ch == "\\":
+                i += 2
+                continue
+            if quote:
+                quote = None if ch == quote else quote
+            elif ch in " \t\n;&|)":
+                return i
+            elif ch in "'\"":
+                quote = ch
+            i += 1
+        return n
+
+    def value_numeric(self, start, end, seen):
+        value = self.raw[start:end]
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value, start = value[1:-1], start + 1
+        if NUMBER_LITERAL.match(value):
+            return True
+        if value.startswith("$(") and self.skip_expansion(start) == start + len(value):
+            if value.startswith("$(("):
+                return True  # an arithmetic result is a number; its own operands are a sink checked on their own
+            return self.command_numeric(start + 2, start + len(value) - 1)
+        m = re.match(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\}|([?#$!]))\Z", value)
+        if m:
+            return bool(m.group(3)) or self.var_numeric(m.group(1) or m.group(2), seen)
+        m = re.match(r"\$\{(?:#[A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\])?|([A-Za-z_][A-Za-z0-9_]*):-[0-9]+)\}\Z", value)
+        return bool(m) and (m.group(1) is None or m.group(1) in ENV_NUMERIC_DEFAULTS)
+
+    def var_numeric(self, name, seen=frozenset()):
+        """every assignment of `name` in the script is provably a number (and there is at least one)"""
+        if name in SHELL_NUMERIC_NAMES or name in seen:
+            return True  # a self-reference adds no new value: the other assignments decide
+        if name in self.cache:
+            return self.cache[name]
+        masked, writes, result = self.masked, 0, True
+        reader = COMMAND_WORD_START + r"(?:read|mapfile|readarray|getopts|for(?![ \t]*\(\()|select)\b[^;&|\n]*?(?<![\w$])%s(?!\w)"
+        if re.search(reader % re.escape(name), masked, re.M):
+            result = False
+        for m in re.finditer(COMMAND_WORD_START + re.escape(name) + r"(\[[^\]\n]*\])?\+?=", masked, re.M):
+            writes += 1
+            if any(start <= m.start() < end for start, end in self.arithmetic()):
+                continue  # an assignment inside $(( )), (( )) or let stores a number; its operands are a sink
+            numeric = m.group(1) is None and masked[m.end() : m.end() + 1] != "("
+            if not numeric or not self.value_numeric(m.end(), self.value_end(m.end()), seen | {name}):
+                result = False
+                break
+        self.cache[name] = result and writes > 0
+        return self.cache[name]
+
+    def expression(self, start, end):
+        """the offset of the first refused operand in the arithmetic text masked[start:end], or None"""
+        masked, i = self.masked, start
+        while i < end:
+            m = ARITH_TOKEN.match(masked, i, end)
+            tok = m.group()
+            if tok in ("$(", "${"):
+                close = self.skip_expansion(i)
+                body = self.raw[i + 2 : close - 1]
+                if tok == "$(" and body.startswith("(") and body.endswith(")"):
+                    bad = self.expression(i + 3, close - 2)
+                    if bad is not None:
+                        return bad
+                elif tok == "$(":
+                    if not self.command_numeric(i + 2, close - 1):
+                        return i
+                elif re.match(r"(?:#[A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\])?|[?#$!])\Z", body):
+                    pass
+                elif re.match(r"[A-Za-z_][A-Za-z0-9_]*\Z", body):
+                    if not self.var_numeric(body):
+                        return i
+                else:
+                    default = re.match(r"([A-Za-z_][A-Za-z0-9_]*):-[0-9]+\Z", body)
+                    if not (default and default.group(1) in ENV_NUMERIC_DEFAULTS):
+                        return i
+                i = close
+                continue
+            if tok[0] == "$":
+                rest = tok[1:]
+                if rest not in SHELL_NUMERIC_SPECIAL and not (re.match(r"[A-Za-z_]", rest) and self.var_numeric(rest)):
+                    return i
+            elif tok in ("`", "\\"):
+                return i
+            elif re.match(r"[A-Za-z_]", tok):
+                if not self.var_numeric(tok):
+                    return i
+            elif tok[0].isdigit() and not NUMBER_LITERAL.match(tok):
+                return i
+            i = m.end()
+        return None
+
+    def arithmetic(self):
+        """(start, end) of every $(( )), (( )) and let / declare -i expression (where an assignment stores a number)"""
+        if self.spans is None:
+            self.spans = self.sinks(arithmetic_only=True)
+        return self.spans
+
+    def sinks(self, arithmetic_only=False):
+        """(start, end) of every sink expression in the masked text, in text order"""
+        masked, spans = self.masked, []
+        for m in re.finditer(r"\$\(\(", masked):
+            spans.append((m.end(), _close_of(masked, m.start() + 1, "(", ")") - 2))
+        for m in ARITH_COMMAND.finditer(masked):
+            spans.append((m.end(), _close_of(masked, m.start(), "(", ")") - 2))
+        for m in LET_OR_INTEGER.finditer(masked):
+            end = m.end()
+            while end < len(masked) and masked[end] not in ";&|\n":
+                end += 1
+            for w in re.finditer(r"[^\s=]+=(\S+)|(\S+)", masked[m.end() : end]):
+                group = 1 if w.group(1) is not None else 2
+                spans.append((m.end() + w.start(group), m.end() + w.end(group)) if group == 2 or not arithmetic_only else (m.end() + w.start(), m.end() + w.end()))
+        if arithmetic_only:
+            return spans
+        for m in re.finditer(r"(?<![\w$])\[\[(?=[ \t])", masked):
+            close = masked.find("]]", m.end())
+            close = len(masked) if close < 0 else close
+            words = [(m.end() + w.start(), m.end() + w.end()) for w in re.finditer(r"\S+", masked[m.end() : close])]
+            for k, (ws, we) in enumerate(words):
+                if masked[ws:we] in ARITH_COMPARE:
+                    spans.extend(words[side] for side in (k - 1, k + 1) if 0 <= side < len(words))
+        for pattern in (SUBSCRIPT_USE, SUBSCRIPT_WRITE):
+            for m in pattern.finditer(masked):
+                close = _close_of(masked, m.end() - 1, "[", "]")
+                if masked[m.end() : close - 1].strip() not in ("@", "*"):
+                    spans.append((m.end(), close - 1))
+        for m in SUBSTRING.finditer(masked):
+            spans.append((m.end(), _close_of(masked, m.start() + 1, "{", "}") - 1))
+        return sorted(spans)
+
+    def first(self):
+        for start, end in self.sinks():
+            bad = self.expression(start, end)
+            if bad is not None:
+                return bad
+        return None
+
+
 def _shell_prepass(text, name="text"):
     """r16 K11, r18 K13 / S24, K14, K15, r19 K16 / S25 / S26: (comment-free text, problem or None, heredocs);
     the rule is the comment block above. heredocs holds one (opener offset in text, delimiter, strip-tabs
@@ -810,6 +1079,7 @@ def _shell_prepass(text, name="text"):
     word_start, cmd_pos, keep = True, True, 0  # keep: out[:keep] is never stripped as trailing blanks
     pending, heredocs = [], []  # r19 K16: the openers read on the current logical line; the bodies read
     dollar = None  # r21 S30: the offset of a `$` that bash keeps as a literal character of the word being read
+    opened, literal = [], []  # r22 decision 2: out offsets of the open brackets; single-quoted and quoted-body spans
 
     def problem(at, what):
         line, col = _line_col(text, at)
@@ -826,15 +1096,19 @@ def _shell_prepass(text, name="text"):
         return problem(refused.start(), "%s, which str.splitlines() reads as a line break (only a newline ends a line here)" % what)
     prompt = PROMPT_TRANSFORM.search(text)  # r21 S30: anywhere in the text (code, any body, a comment)
     if prompt:
-        return problem(prompt.start(), "an eval-class expansion (${var@P})")
+        return problem(prompt.start(), "a parameter transformation (${var@%s})" % prompt.group(1))
 
     def push(kind, at):
         stack.append(kind)
         where.append(at)
+        opened.append(len(out))
 
     def pop():
         where.pop()
-        return stack.pop()
+        start, kind = opened.pop(), stack.pop()
+        if kind in ("'", "$'"):
+            literal.append((start, len(out)))
+        return kind
 
     while i < n:
         ch, nxt = text[i], text[i + 1 : i + 2]
@@ -852,6 +1126,10 @@ def _shell_prepass(text, name="text"):
                 pop()
             continue
         if ch == "\\":
+            if nxt == "\n" and top != "$'" and i and text[i - 1] not in " \t\n":
+                # r22 decision 3 (S31): bash removes a backslash-newline, so the characters on both sides
+                # are one word there (d\<newline>ocker is `docker`); only one after a blank is a line join
+                return problem(i, SPLIT_WORD_BSNL)
             if nxt == "`" or (nxt == "(" and held is not None and top != '"'):
                 return problem(i + 1 if nxt == "`" else held, STORED_DATA)
             dollar = i + 1 if nxt == "$" else held if nxt == "\n" else None
@@ -1009,6 +1287,10 @@ def _shell_prepass(text, name="text"):
             word_start = False
             continue
         if word_start and ch not in COMMENT_WORD_BREAK:
+            if cmd_pos and top in CMD_CONTEXTS:
+                nested = _nested_interpreter(text, i)  # r22 decision 4 (S33)
+                if nested is not None:
+                    return problem(nested, NESTED_INTERPRETER)
             cmd_pos = False  # a word begins, so the command is named and no OPERATOR `(` follows it
         prev = out[-1] if out and len(out) > keep else ""
         if ch == "(" and held is not None:
@@ -1107,13 +1389,23 @@ def _shell_prepass(text, name="text"):
                     out.extend(text[i : j + 1])
                     i = j + 1
                 heredocs.append((at, word, strip_tabs, start, len(out)))
+                if quoted:
+                    literal.append((start, len(out)))
             del pending[:]
             keep = len(out)
     if pending:
         return problem(pending[0][0], "heredoc %s is never closed" % pending[0][1])
     if stack:
         return problem(where[-1], "a quote, backquote, substitution, bracket or case left open at the end of the text (%s)" % " ".join(stack))
-    return "".join(out), None, heredocs
+    clean, pieces, at = "".join(out), [], 0
+    for start, end in sorted(literal):  # r22 decision 2: the arithmetic sinks, over code and unquoted bodies
+        if start >= at:
+            pieces.extend((clean[at:start], re.sub("[^\n]", " ", clean[start:end])))
+            at = end
+    bad = _ArithSinks(clean, "".join(pieces) + clean[at:]).first()
+    if bad is not None:
+        return None, "%s: line %d col %d: %s" % ((name,) + _line_col(clean, bad) + (ARITH_SINK,)), None
+    return clean, None, heredocs
 
 
 def _strip_shell_comments(text, name="text"):
@@ -1806,7 +2098,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertEqual(code.count('cd "$(dirname "$0")"'), 1, path.name)
             self.assertLess(code.index('cd "$(dirname "$0")"'), at, "%s: COMPOSE_DIR must follow the cd" % path.name)
             self.assertEqual(code[at + 1], pin, path.name)
-            body = "\n".join(code)
+            body = _code_body(path)  # r22 decision 6: the refusals name the raw line
             self.assertEqual(_compose_pin_refusals(body, path.name), [], path.name)
             self.assertEqual(_daemon_selection_refusals(body, path.name), [], path.name)
             self.assertGreaterEqual(len(re.findall(r"\bdocker compose\b", body)), 3, path.name)
@@ -2754,9 +3046,9 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         for path in SCRIPTS:
             lines = _norm_lines(path)
             self.assertEqual(_reaping_pin_refusals(path, lines), [], path.name)
-            body = "\n".join(ln.strip() for ln in _code_lines(path) if ln.strip())
+            body = _code_body(path)  # r22 decision 6: the refusals name the raw line
             self.assertEqual(_wait_refusals(body, path.name), [], path.name)
-        body = "\n".join(ln.strip() for ln in _code_lines(ENVELOPE) if ln.strip())
+        body = _code_body(ENVELOPE)
         words, _ = _shell_words(body, ENVELOPE.name)
         self.assertEqual(sum(1 for k, w in enumerate(words) if w == "wait" and words[k - 1] in WAIT_COMMAND_PREV), 1)
 
@@ -2875,8 +3167,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         ": <<true-x\nbody\ntrue-x\necho RAN\ntrue",  # an unquoted delimiter holding `-`
         ": <<E\n\tE\n: <<true\nE\necho RAN\ntrue",  # a tab-indented E does not end a `<<E` body
         ": ${x/<<true/}\necho RAN\ntrue",  # `<<` in a parameter expansion
-        "x=$((1<<true))\necho RAN\ntrue",  # `<<` in an arithmetic substitution
-        "((y=1<<true))\necho RAN\ntrue",  # `<<` in an arithmetic command
+        "true=1\nx=$((1<<true))\necho RAN\ntrue",  # `<<` in an arithmetic substitution (r22: `true` holds a number,
+        "true=1\n((y=1<<true))\necho RAN\ntrue",  # an unassigned name at a sink is refused); `<<` in an arithmetic command
         ": <<-E\n\tbody\n\tE\necho RAN",  # `<<-` strips the terminator's tabs
         ': <<"E"\necho RAN\nE\necho RAN',  # a body line bash does not run
         ": <<'E'\n# x <<true\nexport DOCKER_HOST=x; echo RAN\nE\necho RAN",  # a body holding #, << and a DOCKER_ name
@@ -2967,8 +3259,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         "m10": (': "a\\"<<E"\nec""ho RAN:m10\ncat <<E >/dev/null\nx\nE', False),
         "m12": (': "a\\"<<E"\nexport D""OCKER_HOST=x; echo RAN:m12\ncat <<E >/dev/null\nx\nE', False),
         "m13": ('x=$(: "a\\"<<E"\necho RAN:m13\ncat <<E\nx\nE\n)\necho "$x"', False),
-        "arithsub": ("x=$((1<<true))\necho RAN:arithsub\ntrue", False),
-        "arithcmd": ("((y=1<<true))\necho RAN:arithcmd\ntrue", False),
+        "arithsub": ("true=1\nx=$((1<<true))\necho RAN:arithsub\ntrue", False),  # r22: `true` holds a number
+        "arithcmd": ("true=1\n((y=1<<true))\necho RAN:arithcmd\ntrue", False),
         "arith": (": $[1<<true]\necho RAN:arith\ntrue", True),
         "param": (": ${x/<<true/}\necho RAN:param\ntrue", False),
         "dashdelim": (": <<true-x\nbody\ntrue-x\necho RAN:dashdelim\ntrue", False),
@@ -3238,7 +3530,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # r21 S30: bash runs a command substitution held in a variable's value through ${p@P} and through an
         # arithmetic evaluation of an array subscript ($((p)), ${b[p]} with p='b[$(...)]'); the ${var@P} form is
         # refused by name anywhere, and the command text is refused at the site where it enters the script
-        prompt, data = "an eval-class expansion (${var@P})", "command text stored as data"
+        prompt, data = "a parameter transformation (${var@P})", "command text stored as data"  # r22: the transformation wording
         refused = {
             "codeP": ("exec 3>&1\np='$(echo RAN:codeP >&3)'\n: \"${p@P}\"\n", prompt, (3, 7)),
             "bodyP": ("exec 3>&1\np='$(echo RAN:bodyP >&3)'\ncat <<E >/dev/null\n${p@P}\nE\n", prompt, (4, 4)),
@@ -3293,19 +3585,166 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertIn("_script_header(path)", source, test.__name__)
             self.assertNotIn("path.read_text()", source, test.__name__)
 
+    def test_parameter_transformations_refused_by_name_selftest_8270_r22(self):
+        # r22 decision 1 (K23): bash's parameter transformations ${var@X} are an eval class: @P expands a
+        # command substitution held in the value, @E decodes escapes into `$(` text that a later arithmetic
+        # evaluation runs, @Q/@A/@a/@k/@K/@L/@U/@u the rest. Every letter is refused by name, at the `@`, so no
+        # letter is a reviewed exception; the pattern skips a backslash-newline bash removes before it parses.
+        prompt = "a parameter transformation (${var@%s})"
+        refused = {  # @P and @E run the hidden marker in bash; _assert_rows_against_bash proves both readers
+            "tP": ("exec 3>&1\np='$(echo RAN:tP >&3)'\n: \"${p@P}\"\n", prompt % "P", (3, 7)),
+            "tPcont": ("exec 3>&1\np='$(echo RAN:tPcont >&3)'\n: \"${p@\\\nP}\"\n", prompt % "P", (3, 7)),
+            "tE": ("exec 3>&1\np='b[\\x24(echo RAN:tE >&3)]'\nq=\"${p@E}\"\n: $((q))\n", prompt % "E", (3, 7)),
+        }
+        self._assert_rows_against_bash(refused, {})
+        for letter in "QAakKLUu":  # the transformations that reshape the value (no command runs; a direct proof)
+            text = ": \"${p@%s}\"\n" % letter
+            self.assertEqual(_shell_prepass(text, "row-t%s" % letter)[1], "row-t%s: line 1 col 7: %s" % (letter, prompt % letter))
+            self.assertRegex(text, BANNED_INDIRECTION)  # the password allowlist names every letter too
+
+    def test_runtime_arithmetic_sinks_refused_by_name_selftest_8270_r22(self):
+        # r22 decision 2 (S32, #8285 INFO-r18-a): bash evaluates the VALUE of a variable at an arithmetic sink
+        # as an expression again, so a value assembled at run time (p="b[${x}($(...))]", q="${p@E}") runs its
+        # command text there. A sink operand must be provably a number. Rulings 2a-2e: `[ ]` and `test` are not
+        # sinks (bash evaluates no operand); the sinks are $(( )), (( )), let / declare -i, the [[ -eq ]] operands,
+        # array subscripts and substring offsets; the shell's own numeric parameters, a pinned ${NAME:-digits}
+        # default and a pinned function are numbers; anything else reaching a sink is refused by name.
+        what = "arithmetic on a value that is not a number literal"
+        decoy = "echo RAN:%s compose -f ./decoy.yml config >&3"
+        refused = {
+            "s_join_brace": ("exec 3>&1\nx='$'\np=\"b[${x}($(%s))]\"\n: $((p))\n" % (decoy % "s_join_brace"), what, (4, 6)),
+            "s_join_plain": ("exec 3>&1\nx='$'\np=\"b[$x($(%s))]\"\n: $((p))\n" % (decoy % "s_join_plain"), what, (4, 6)),
+            "s_dbrack": ("exec 3>&1\nx='$'\np=\"b[${x}($(%s))]\"\n[[ $p -eq 0 ]]\n" % (decoy % "s_dbrack"), what, (4, 4)),
+            "s_substr": ("exec 3>&1\nx='$'\np=\"$(%s)1\"\ns=abcdef\n: ${s:p}\n" % (decoy % "s_substr"), what, (5, 7)),
+            "d4_atE": ("exec 3>&1\np='b[\\x24(%s)]'\nq=\"${p@E}\"\n: $((q))\n" % (decoy % "d4_atE"), "a parameter transformation (${var@E})", (3, 7)),
+        }
+        controls = {  # 2a: a `[ ]` test runs nothing; 2b: a special parameter; 2c: the pinned env default
+            "c_test_bracket": "p=0\n[ \"$p\" -eq 0 ] && echo RAN:c_test_bracket\n",
+            "c_test_word": "p=0\ntest \"$p\" -eq 0 && echo RAN:c_test_word\n",
+            "c_special": "n=$#\n: $((n+1))\necho RAN:c_special\n",
+            "c_lineno": ": $((LINENO+1))\necho RAN:c_lineno\n",
+            "c_envdefault": "d=$(( ${STEP_DURATION_SECS:-20} + 1 ))\necho RAN:c_envdefault\n",
+            "c_selfnum": "n=0\nn=$((n+1))\necho RAN:c_selfnum\n",
+        }
+        self._assert_rows_against_bash(refused, controls)
+        # 2d: a script function is numeric only when its name and the sha256 of its body are pinned; the real
+        # now_ms body is pinned, a changed body or an unpinned function at a sink is refused by name
+        self.assertEqual(sorted(FUNC_NUMERIC), ["now_ms"])
+        now_ms = re.search(r"^now_ms\(\) \{.*\}$", ENVELOPE.read_text(), re.M).group()
+        self.assertEqual(FUNC_NUMERIC["now_ms"], hashlib.sha256(now_ms.encode("utf-8")).hexdigest())
+        changed = "%s\nt0=$(now_ms)\n: $((t0+1))\n" % now_ms.replace("1000", "1001")
+        self.assertEqual(_shell_prepass(changed, "e")[1], "e: line 3 col 6: " + what)
+        unpinned = "f() { echo x; }\nt0=$(f)\n: $((t0+1))\n"
+        self.assertEqual(_shell_prepass(unpinned, "e")[1], "e: line 3 col 6: " + what)
+        # 2c: ENV_NUMERIC_DEFAULTS is a pinned set, with a docstring stating the guard models the script's own
+        # content, not the invoking environment; any other ${X:-...} or positional reaching a sink is refused
+        self.assertEqual(sorted(ENV_NUMERIC_DEFAULTS), ["STEP_DURATION_SECS"])
+        self.assertIn("models the script's own content", pathlib.Path(inspect.getfile(type(self))).read_text())
+        self.assertEqual(_shell_prepass(": $(( ${OTHER:-5} + 1 ))\n", "e")[1], "e: line 1 col 7: " + what)
+        self.assertEqual(_shell_prepass(': $(( "$3" + 1 ))\n', "e")[1], "e: line 1 col 8: " + what)
+
+    def test_nested_shell_interpreters_refused_by_name_selftest_8270_r22(self):
+        # r22 decision 4 (S33, #8285 INFO-r18-b): an interpreter word in command position (bash/sh/dash/zsh/
+        # ksh/busybox sh, bare, an absolute path or through env/exec/command/.../timeout/sudo/xargs; after a
+        # pipe, &&, ||, ;, ( or {) carries a program text (a -c string, a -s heredoc body, a sourced file) that
+        # every reader here reads as one quoted word or a quoted body. `source` and `.` with an argument too.
+        what = "a nested shell interpreter"
+        refused = {
+            "n_bash_c": ("bash -c 'echo RAN:n_bash_c compose -f ./decoy.yml config'\n", what, (1, 1)),
+            "n_bash_s": ("bash -s <<'B'\necho RAN:n_bash_s compose -f ./decoy.yml config\nB\n", what, (1, 1)),
+            "n_shell_c": ("sh -c 'echo RAN:n_shell_c compose -f ./decoy.yml config'\n", what, (1, 1)),
+            "S30-own-bash-s-plain": ("bash -s <<'B'\nc=compose\necho RAN:S30-own-bash-s-plain $c -f ./decoy.yml config\nB\n", what, (1, 1)),
+            "n_env_bash": ("env X=1 bash -c 'echo RAN:n_env_bash'\n", what, (1, 9)),
+            "n_abspath": ("/bin/sh -c 'echo RAN:n_abspath'\n", what, (1, 1)),
+            "n_busybox": ("busybox sh -c 'echo RAN:n_busybox compose -f ./decoy.yml config'\n", what, (1, 1)),
+            "n_pipe_sh": ("true | sh -c 'echo RAN:n_pipe_sh'\n", what, (1, 8)),
+            "n_source": (": > ./sub.sh\n. ./sub.sh && echo RAN:n_source\n", what, (2, 1)),
+        }
+        controls = {  # a comment mentioning bash and the shebang are not command words
+            "c_comment_bash": "#!/usr/bin/env bash\n# run bash here to test\necho RAN:c_comment_bash\n",
+        }
+        self._assert_rows_against_bash(refused, controls)
+
+    def test_word_splitting_backslash_newline_refused_selftest_8270_r22(self):
+        # r22 decision 3 (S31): bash removes a backslash-newline, so the characters on both sides are one word
+        # there (d\<newline>ocker is `docker`, d$\<newline>'ocker' is `docker` via an ANSI/locale quote); every
+        # reader here reads two words and sees no `docker`. The pre-pass refuses it by name, at the backslash,
+        # before any reader runs, UNLESS the preceding character is a blank (a line continuation) or line start.
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash not installed")
+        refused = {  # each reconstructs `docker compose -f ./decoy.yml config`; the shim stands in for docker
+            "s_bsnl_word_docker": ("d\\\nocker compose -f ./decoy.yml config\n", (1, 2)),
+            "s_bsnl_ansi_docker": ("d$\\\n'ocker' compose -f ./decoy.yml config\n", (1, 3)),
+            "s_bsnl_locale_docker": ("d$\\\n\"ocker\" compose -f ./decoy.yml config\n", (1, 3)),
+            "s_bsnl_ansi": ("doc$\\\n'ker' compose -f ./decoy.yml config\n", (1, 5)),
+        }
+        controls = {  # a backslash-newline after a blank (a line join), in single quotes, an even run, K21-quoted
+            "c_bsnl_linejoin": "docker compose \\\n  -f \"$f\" config >/dev/null 2>&1; echo RAN:c_bsnl_linejoin\n",
+            "c_bsnl_squote": "p='a\\\nb'\necho RAN:c_bsnl_squote\n",
+            "c_bsnl_even": "echo RAN:c_bsnl_even a\\\\\nb\n",
+            "K21-control-quoted": "cat <<'E' >/dev/null\nx\\\nE\necho RAN:K21-control-quoted\n",
+        }
+        scratch = REPO / ".local-runs" / "pgbouncer-4734-tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(scratch)) as directory:
+            shim = pathlib.Path(directory) / "shim"
+            shim.mkdir()
+            (shim / "docker").write_text("#!/bin/sh\necho RAN:docker \"$@\"\n")
+            (shim / "docker").chmod(0o755)
+            env = dict(os.environ, PATH="%s:%s" % (shim, os.environ["PATH"]))
+
+            def run(text):
+                script = pathlib.Path(directory) / "row.sh"
+                script.write_text(text)
+                proc = subprocess.run([bash, "--norc", "--noprofile", str(script)], cwd=directory, env=env, capture_output=True, text=True, timeout=10, check=False)
+                return proc.stdout + proc.stderr
+
+            for tag, (text, (line, col)) in refused.items():
+                out = run(text)
+                self.assertIn("RAN:docker compose -f ./decoy.yml config", out, "row %s: bash reconstructs the docker word" % tag)
+                expected = "row-%s: line %d col %d: a backslash-newline that splits a word" % (tag, line, col)
+                self.assertEqual(_shell_prepass(text, "row-%s" % tag)[1], expected, tag)
+                self.assertEqual(_shell_words(text, "row-%s" % tag)[1], expected, tag)
+            for tag, text in controls.items():
+                self.assertIn("RAN:%s" % tag, run(text), tag)
+                words, problem = _shell_words(text, "row-%s" % tag)
+                self.assertIsNone(problem, tag)
+                self.assertNotIn("RAN:docker", "".join(words), tag)
+
+    def test_code_line_refusals_name_the_raw_line_selftest_8270_r22(self):
+        # r22 decision 6 (INFO-r18-c): the wait-site and environment-dump checks re-lex a stripped code text; a
+        # body line `x\ ` (a trailing blank, so bash does NOT remove the newline) or `x\` + CR reads, once the
+        # blank is stripped, as a backslash-newline the pre-pass refuses (fail-closed). _code_lines now keeps
+        # the raw line positions (a whole-line comment becomes an empty line), so the refusal names the raw line
+        # of the body (120 here), not a derived-text line (54 on b97ca5e40). Both rows stay RED either way.
+        text = (SMOKE).read_text().split("\n")
+        self.assertEqual(text[118], "", "smoke-test.sh line 119 is blank")
+        for tag, body_line in (("K21-own-bs-space", "x\\ "), ("K21-own-crlf", "x\\\r")):
+            lines = list(text)
+            lines[118:119] = ["cat <<E >/dev/null", body_line, "E"]
+            injected = "\n".join(lines)
+            raw = types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda injected=injected: injected.encode("utf-8"))
+            body = _code_body(raw)
+            self.assertEqual(_wait_refusals(body, "smoke-test.sh"), ["smoke-test.sh: line 120 col 2: a backslash-newline inside an unquoted heredoc body"], tag)
+
     def test_prepass_and_norm_lines_are_linear_8270_r21(self):
         # r21 K22: _heredoc_lines counts newlines in one forward pass and _logical_lines joins each continued line
-        # once, so 40,000 continuation lines and 40,000 one-line heredocs each read well inside the budget (2.0 s
-        # on python3.9 under a loaded CI runner; at 40,000 rows the quadratic forms took 1.4 s and 16.4 s on python3.9)
+        # once. r22 decision 5 (K24): the bound is the CPU-time growth from 10,000 to 40,000 rows, not a wall-clock
+        # budget a loaded runner can miss: a linear reader grows about 4x, a quadratic one about 16x, the bound is 8x
         rows = (
-            ("continuation", "echo a \\\n" * 40000 + "echo end\n", 1, set()),
-            ("heredocs", "cat <<E >/dev/null\nx\nE\n" * 40000, 120000, set(range(120000)) - set(range(0, 120000, 3))),
+            ("continuation", lambda k: "echo a \\\n" * k + "echo end\n", 1, set()),
+            ("heredocs", lambda k: "cat <<E >/dev/null\nx\nE\n" * k, 120000, set(range(120000)) - set(range(0, 120000, 3))),
         )
-        for label, text, count, bodies in rows:
-            started = time.perf_counter()
-            lines = _norm_text_lines(text, "t.sh")
-            took = time.perf_counter() - started
-            self.assertLess(took, 2.0, "%s: _norm_text_lines took %.3f s for 40,000 rows" % (label, took))
+        for label, make, count, bodies in rows:
+            took = {}
+            for k in (10000, 40000):
+                text = make(k)
+                started = time.process_time()
+                lines = _norm_text_lines(text, "t.sh")
+                took[k] = max(time.process_time() - started, 1e-6)
+            ratio = took[40000] / max(took[10000], 1e-3)
+            self.assertLess(ratio, 8.0, "%s: _norm_text_lines CPU time grew %.1fx from 10,000 to 40,000 rows (%.3f s, %.3f s)" % (label, ratio, took[10000], took[40000]))
             self.assertEqual((len(lines), lines.bodies), (count, bodies), label)
         self.assertEqual(list(_norm_text_lines("echo a \\\n" * 3 + "echo end\n", "t.sh")), ["echo a echo a echo a echo end"])
 
