@@ -823,6 +823,15 @@ else
         "$(grep -E '^(FAIL|ERROR)|AssertionError|lists .edited.' "$SCRATCH/h-8332.out" | head -12)"
 fi
 
+# The retarget check (live gh path through a stub gh, exit 0/65/70) runs here too: this script is
+# the CI step (c8-precheck.yml) that executes it (REVIEW-8332-code-r2 F2).
+if python3 -I "$ROOT/scripts/test/test_pr_retarget_check_8332.py" >"$SCRATCH/h-8332-retarget.out" 2>&1; then
+    ok "H: the base-retarget landing check refuses stale, fails closed on gh errors (#8332)"
+else
+    bad "H: scripts/ci/pr_retarget_check.py live-path test failed (#8332)" \
+        "$(grep -E '^(FAIL|ERROR)|AssertionError' "$SCRATCH/h-8332-retarget.out" | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"

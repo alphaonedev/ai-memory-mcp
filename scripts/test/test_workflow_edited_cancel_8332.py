@@ -11,8 +11,13 @@ started them again from zero.
 The rules this guard pins (a ratchet over EVERY workflow):
 
 1. No workflow lists ``edited`` under a ``pull_request`` or ``pull_request_target``
-   ``types`` list, except claude-md-rule-compare.yml (a one-entry allow-list; its
-   ``cancel-in-progress`` guard is pinned by rule 2).
+   trigger, in ANY YAML form (inline ``types: [..]``, a block sequence ``- edited``, or a
+   flow-mapping ``on: {pull_request: {types: [..]}}``), except claude-md-rule-compare.yml
+   (a one-entry allow-list; its ``cancel-in-progress`` guard is pinned by rule 2). The
+   scan is stdlib only (PyYAML is not installed on every runner and no other workflow
+   test imports it), so it fails closed: a workflow whose ``on:`` section it cannot read
+   (no ``on`` key, an anchor or alias in it) is a failure, and any ``edited`` word inside a
+   pull_request(_target) trigger body counts as listed.
 2. Where ``edited`` is listed, every ``cancel-in-progress`` key at ANY indent (a
    job-level concurrency block too) is the literal ``false``, the guard
    ``${{ github.event_name == 'pull_request' }}``, the body-only guard
@@ -41,26 +46,88 @@ ACCEPTED_GUARDS = (
     "github.event_name == 'pull_request'",
     "github.event.action != 'edited'",
 )
-TRIGGER_RE = re.compile(r"^  (pull_request|pull_request_target):\s*\n((?:    .*\n|\s*\n|  #.*\n)+)", re.M)
-TYPES_RE = re.compile(r"^    types: \[([^\]]*)\]\s*$", re.M)
+KINDS = ("pull_request", "pull_request_target")
+ACTIVITY_TYPES = {"assigned", "unassigned", "labeled", "unlabeled", "opened", "edited", "closed", "reopened",
+                  "synchronize", "converted_to_draft", "locked", "unlocked", "enqueued", "dequeued",
+                  "milestoned", "demilestoned", "ready_for_review", "review_requested",
+                  "review_request_removed", "auto_merge_enabled", "auto_merge_disabled"}
+ON_KEY_RE = re.compile(r"""^(?:on|"on"|'on')[ \t]*:(.*)$""")
+ANCHOR_RE = re.compile(r"(?:^|[\s\[{,:])[&*][A-Za-z_]|<<\s*:")
 CANCEL_RE = re.compile(r"^[ \t]*cancel-in-progress:[ \t]*(.*?)[ \t]*$", re.M)
 CONCURRENCY_RE = re.compile(r"^[ \t]*concurrency:", re.M)
 
 
-def pr_types(text: str, kinds=("pull_request", "pull_request_target")) -> set:
-    """Union of the activity types of every listed pull_request(_target) trigger."""
+class ParseFailure(Exception):
+    """The workflow trigger section cannot be read; the caller fails closed."""
+
+
+def _strip(line: str) -> str:
+    return re.sub(r"(^|\s)#.*$", "", line).rstrip()
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def triggers(text: str) -> dict:
+    """Map each pull_request(_target) trigger found in ``on:`` to its body text.
+
+    Raises ParseFailure when ``on:`` is missing or uses an anchor or alias.
+    """
+    lines = [_strip(x) for x in text.splitlines()]
+    start = next((i for i, x in enumerate(lines) if ON_KEY_RE.match(x)), None)
+    if start is None:
+        raise ParseFailure("no top-level `on:` key")
+    rest = ON_KEY_RE.match(lines[start]).group(1).strip()
+    section = []
+    for x in lines[start + 1:]:
+        if x and not x[0].isspace():
+            break
+        if x.strip():
+            section.append(x)
+    if ANCHOR_RE.search("\n".join([rest] + section)):
+        raise ParseFailure("anchor or alias in the `on:` section")
+    out = {}
+    if rest:  # inline scalar, flow sequence or flow mapping: the whole text is the body
+        for kind in KINDS:
+            if re.search(rf"(?<![\w-]){kind}(?![\w-])", rest):
+                out[kind] = rest
+        return out
+    if not section:
+        raise ParseFailure("empty `on:` section")
+    child = _indent(section[0])
+    current = None
+    for x in section:
+        ind = _indent(x)
+        m = re.match(rf"^ {{{child}}}(?:-[ \t]+)?([\w-]+)[ \t]*:(.*)$", x) if ind == child else None
+        seq = re.match(rf"^ {{{child}}}-[ \t]+([\w-]+)[ \t]*$", x) if ind == child else None
+        if seq:
+            current = seq.group(1)
+            if current in KINDS:
+                out[current] = ""
+        elif m:
+            current = m.group(1)
+            if current in KINDS:
+                out[current] = m.group(2)
+        elif ind > child and current in KINDS:
+            out[current] += "\n" + x
+    return out
+
+
+def pr_types(text: str, kinds=KINDS) -> set:
+    """Activity types named in the body of every listed pull_request(_target) trigger.
+
+    Over-approximates (any activity word in the body, whatever the YAML form): fail closed.
+    """
     out = set()
-    for m in TRIGGER_RE.finditer(text):
-        if m.group(1) not in kinds:
-            continue
-        t = TYPES_RE.search(m.group(2))
-        if t:
-            out |= {x.strip().strip("'\"") for x in t.group(1).split(",") if x.strip()}
+    for kind, body in triggers(text).items():
+        if kind in kinds and re.search(r"\btypes\b", body):
+            out |= set(re.findall(r"[a-z_]+", body)) & ACTIVITY_TYPES
     return out
 
 
 def has_trigger(text: str, kind: str) -> bool:
-    return any(m.group(1) == kind for m in TRIGGER_RE.finditer(text))
+    return kind in triggers(text)
 
 
 def guard_ok(value: str) -> bool:
@@ -79,7 +146,10 @@ def guard_ok(value: str) -> bool:
 
 def cancel_violations(name: str, text: str) -> list:
     """Problems for one workflow file's text (empty list = compliant)."""
-    triggered = has_trigger(text, "pull_request") or has_trigger(text, "pull_request_target")
+    try:
+        triggered = bool(triggers(text))
+    except ParseFailure as exc:
+        return [f"{name}: cannot parse the trigger section ({exc}); failing closed"]
     if not triggered:
         return []
     problems = []
@@ -94,14 +164,25 @@ def cancel_violations(name: str, text: str) -> list:
 
 
 def edited_listed(name: str, text: str) -> list:
-    if "edited" in pr_types(text) and name not in EDITED_ALLOW:
+    try:
+        listed = "edited" in pr_types(text)
+    except ParseFailure as exc:
+        return [f"{name}: cannot parse the trigger section ({exc}); failing closed"]
+    if listed and name not in EDITED_ALLOW:
         return [f"{name}: lists `edited` under pull_request(_target) types (#8332)"]
     return []
 
 
 def target_extras(texts: dict) -> list:
-    extra = sorted(n for n, t in texts.items() if has_trigger(t, "pull_request_target") and n not in TARGET_ALLOW)
-    return [f"{n}: second pull_request_target workflow; none has ever run in this repository (#8337)" for n in extra]
+    extra, broken = [], []
+    for n, t in sorted(texts.items()):
+        try:
+            if has_trigger(t, "pull_request_target") and n not in TARGET_ALLOW:
+                extra.append(n)
+        except ParseFailure as exc:
+            broken.append(f"{n}: cannot parse the trigger section ({exc}); failing closed")
+    return broken + [f"{n}: second pull_request_target workflow; none has ever run in this repository (#8337)"
+                     for n in extra]
 
 
 def _all():
@@ -184,6 +265,33 @@ class BodyOnlyEditNeverCancels8332(unittest.TestCase):
     def test_mutation_edited_under_pull_request_target(self):
         bad = BASE_BAD.replace("  pull_request:", "  pull_request_target:")
         self.assertEqual(len(edited_listed("m.yml", bad)), 1)
+
+    def test_mutation_edited_as_block_sequence(self):
+        bad = ("on:\n  pull_request:\n    types:\n      - opened\n      - edited\n"
+               "concurrency:\n  group: g\n  cancel-in-progress: false\n")
+        self.assertEqual(len(edited_listed("m.yml", bad)), 1)
+        self.assertIn("edited", pr_types(bad))
+
+    def test_mutation_edited_in_flow_mapping_trigger(self):
+        bad = "on: {pull_request: {types: [opened, edited]}}\n"
+        self.assertEqual(len(edited_listed("m.yml", bad)), 1)
+        tgt = "on: {pull_request_target: {types: [edited]}}\n"
+        self.assertEqual(len(edited_listed("m.yml", tgt)), 1)
+        self.assertEqual(len(target_extras({"m.yml": tgt})), 1)
+
+    def test_block_and_flow_forms_without_edited_pass(self):
+        for good in ("on:\n  pull_request:\n    types:\n      - opened\n      - synchronize\n",
+                     "on: {pull_request: {types: [opened, synchronize]}}\n",
+                     "on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n"):
+            self.assertEqual(edited_listed("ok.yml", good), [], good)
+
+    def test_mutation_parse_failure_fails_closed(self):
+        for bad in ("name: x\njobs: {}\n",
+                    "on: &t\n  pull_request:\n    types: *x\n",
+                    "on:\n"):
+            self.assertEqual(len(edited_listed("m.yml", bad)), 1, bad)
+            self.assertEqual(len(cancel_violations("m.yml", bad)), 1, bad)
+            self.assertEqual(len(target_extras({"m.yml": bad})), 1, bad)
 
     def test_mutation_second_pull_request_target_workflow(self):
         texts = dict(_all())

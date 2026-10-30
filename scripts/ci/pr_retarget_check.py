@@ -15,9 +15,14 @@ change time T; when BOTH ci.yml and coverage.yml have a ``pull_request``-event r
 
 Exit codes: 0 ok, 65 refuse, 70 tool error (gh failure, bad JSON, missing fixture).
 
+decision (round 3, REVIEW-8332-code-r2 I1): the REST timeline carries no ref names (``current_ref`` is
+GraphQL-only), so the old compare-against-the-current-base branch was dead and is removed; the rule
+above is the whole check. A run created in the same second as the retarget is NOT newer (``>``), which
+refuses: the fail-closed direction.
+
 ``--json-dir DIR`` reads ``timeline.json`` (a JSON list of events) and ``runs.json``
-(``{"ci.yml": [...], "coverage.yml": [...]}``) instead of calling gh, and optionally
-``pr.json`` (``{"baseRefName": ...}``); this is how the unit test runs offline.
+(``{"ci.yml": [...], "coverage.yml": [...]}``) instead of calling gh. The unit test also runs the
+live path (no ``--json-dir``) through a stub ``gh`` placed first on PATH.
 """
 import argparse
 import json
@@ -29,6 +34,7 @@ EX_OK, EX_REFUSE, EX_TOOL = 0, 65, 70
 WORKFLOWS = ("ci.yml", "coverage.yml")
 PAGE = 100
 MAX_PAGES = 200
+RUN_LIMIT = 100
 
 
 class ToolError(Exception):
@@ -85,18 +91,10 @@ def fetch_runs(repo, head, workflow, json_dir):
             raise ToolError(f"runs.json has no list for {workflow}")
         return runs
     runs = gh_json(["run", "list", "--repo", repo, "--commit", head, "--event", "pull_request",
-                    "--workflow", workflow, "--json", "databaseId,createdAt,conclusion,status"])
+                    "--workflow", workflow, "--limit", str(RUN_LIMIT), "--json", "databaseId,createdAt,conclusion,status"])
     if not isinstance(runs, list):
         raise ToolError("gh run list did not return a list")
     return runs
-
-
-def current_base(repo, pr, json_dir):
-    if json_dir:
-        data = load_fixture(json_dir, "pr.json", required=False)
-        return data.get("baseRefName") if isinstance(data, dict) else None
-    data = gh_json(["pr", "view", str(pr), "--repo", repo, "--json", "baseRefName"])
-    return data.get("baseRefName") if isinstance(data, dict) else None
 
 
 def check(repo, pr, head, json_dir):
@@ -109,13 +107,6 @@ def check(repo, pr, head, json_dir):
     stamp = str(latest.get("created_at", ""))
     if not stamp:
         raise ToolError("base_ref_changed event has no created_at")
-    wanted = latest.get("current_ref")
-    if wanted:
-        actual = current_base(repo, pr, json_dir)
-        if actual and actual != wanted:
-            print(f"REFUSE: timeline base {wanted} differs from the current base {actual}; "
-                  "push a new head so CI classifies against the current base (#7072, #8332)")
-            return EX_REFUSE
     stale = False
     ids = []
     for workflow in WORKFLOWS:
