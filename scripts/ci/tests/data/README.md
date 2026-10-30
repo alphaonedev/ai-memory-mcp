@@ -33,7 +33,9 @@ guard docstring under "Guard grammar (markdown subset)". In short:
 5. Blank means empty or ASCII spaces only. Non-ASCII whitespace (U+0085, NBSP, U+1680, U+180E,
    U+2000-U+200B, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF) is refused anywhere, and a tab
    outside a fence, YAML front matter included, is refused.
-6. The short trust-peer token in identifier form is a mention wherever it stands.
+6. The short trust-peer token in identifier form is a mention wherever it stands. A processing
+   instruction or CDATA body (to its first ">") or a quoted attribute value longer than 512
+   characters is refused, so the census reads every accepted line in full.
 
 This summary lives here rather than in the certification file because that file is gated: its
 units are pinned, so a guard-maintenance section there would churn the pin table and put tooling

@@ -44,6 +44,8 @@ HTML and is not in the subset. The rules:
      count wherever they stand, containers ignored: table cells, after a colon, fenced code. A
      markdown escape or emphasis, code or strike markup inside the token does not hide it
      (TRUST\\_PEER, TRUST_**PEER**, TRUST_`PEER`); an underscore between two word characters stays.
+     A processing instruction or CDATA body (to its first ">") or a quoted attribute value longer
+     than 512 characters is refused (round 27), so the census reads every accepted line in full.
 The lexer and the unit rules below then read only subset input. The subset is summarised for
 maintainers in scripts/ci/tests/data/README.md, next to the pin table.
 
@@ -435,16 +437,32 @@ def _any(patterns, views):
 
 
 _TAG_RE = re.compile(r"<[^<>]*>")
-# CommonMark raw HTML: open and closing tags, declarations. A quoted attribute value is bounded so a
-# failed match cannot rescan the rest of the paragraph from every "<".
-_OPEN_TAG_RE = re.compile(r"<[a-z][a-z0-9-]*(?:\s+[a-z_:][a-z0-9_.:-]*(?:\s*=\s*(?:[^\s\"'=<>`]+"
-                          r"|'[^'\n]{0,512}'|\"[^\"\n]{0,512}\"))?)*\s*/?>", re.IGNORECASE)
+# Round 27 (code r26 LOW-1, decision (a)): the most characters a raw HTML body may hold, counted from
+# its opener to its first terminator. The patterns below are bounded at it so a failed match cannot
+# rescan the rest of the paragraph from every "<"; grammar_problems() refuses a longer body
+# (_LONG_BODY_RE), so a bound never hides a section the census would have to strip.
+RAW_HTML_BODY_MAX = 512
+_ATTR_NAME = r"\s+[a-z_:][a-z0-9_.:-]*"
+_ATTR = _ATTR_NAME + r"(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^'\n]{0,%d}'|\"[^\"\n]{0,%d}\"))?" % (
+    RAW_HTML_BODY_MAX, RAW_HTML_BODY_MAX)
+# CommonMark raw HTML: open and closing tags, declarations, quoted attribute values bounded.
+_OPEN_TAG_RE = re.compile(r"<[a-z][a-z0-9-]*(?:%s)*\s*/?>" % _ATTR, re.IGNORECASE)
 # Round 26 (security r25 LOW-1): a processing instruction "<?...?>" and a CDATA section
-# "<![CDATA[...]]>" are raw HTML a browser hides too (as a bogus comment that ends at the first ">").
-# Both bodies are bounded (512 characters) and non-greedy and hold no ">", so the match ends where
-# both CommonMark and a browser end it, and a failed match cannot rescan the line.
-_CLOSE_TAG_RE = re.compile(r"</[a-z][a-z0-9-]*\s*>|<![a-z][^<>]*>|<\?[^>]{0,512}?\?>"
-                           r"|<!\[CDATA\[[^>]{0,512}?\]\]>", re.IGNORECASE)
+# "<![CDATA[...]]>" are raw HTML a browser hides too, as a bogus comment. Round 27 (security r26
+# LOW-1): a browser ends that bogus comment at the FIRST ">", which may come before the CommonMark
+# closer "?>" or "]]>", so both alternatives end there; the text after that ">" is visible. A PI or
+# CDATA whose closer never comes is literal text to CommonMark, and stripping it can only join
+# halves (an over-count, the fail-closed direction). These two bounds are two above the grammar
+# bound, so a round-26 body (512 characters plus its "?" or "]]") is still stripped and no line counts
+# fewer than at round 26; the grammar refuses past RAW_HTML_BODY_MAX, so the census reads more.
+_CLOSE_TAG_RE = re.compile(r"</[a-z][a-z0-9-]*\s*>|<![a-z][^<>]*>|<\?[^>]{0,%d}>"
+                           r"|<!\[CDATA\[[^>]{0,%d}>" % ((RAW_HTML_BODY_MAX + 2,) * 2), re.IGNORECASE)
+# Round 27: a PI or CDATA body, or a quoted attribute value of an open tag, longer than the bound.
+# Each alternative reads at most RAW_HTML_BODY_MAX + 1 characters past its opener, so it is linear.
+_LONG_BODY_RE = re.compile(r"<\?[^>]{%d}|<!\[CDATA\[[^>]{%d}|<[a-z][a-z0-9-]*(?:%s)*%s\s*=\s*"
+                           r"(?:'[^'\n]{%d}|\"[^\"\n]{%d})" % ((RAW_HTML_BODY_MAX + 1,) * 2 + (_ATTR, _ATTR_NAME)
+                                                              + (RAW_HTML_BODY_MAX + 1,) * 2),
+                           re.IGNORECASE)
 _LINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)")
 _REFLINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\[[^\[\]\n]*\]")
 _MARKUP_RE = re.compile(r"[*_`~\\]")
@@ -1277,6 +1295,8 @@ def mention_key(sentence):
 # The hand lexer reads only the subset named in the docstring section "Guard grammar (markdown subset)";
 # every other construct is refused with "unsupported markdown construct: <construct> at <file>:<line>".
 GRAMMAR_MESSAGE = "unsupported markdown construct: %s at %s:%d"
+# Rule 6 (round 27): the construct named when a raw HTML body runs past the census bound.
+LONG_BODY_CONSTRUCT = "raw HTML body longer than %d characters" % RAW_HTML_BODY_MAX
 # Rule 3: the measured HTML block allow-list. CERT holds one HTML block (line 1, a one-line comment), so
 # the CERT entry is the one-line comment form, which also covers the 25 one-line comments of CHANGELOG.md.
 # README.md holds 47 HTML block lines (21 distinct, logo, title and the <details> sections); they are
@@ -1471,6 +1491,16 @@ def grammar_problems(rel, text):
         prev = kind
     if fence is not None:
         refuse("unclosed fence", fence[2])
+    # Round 27 (code r26 LOW-1, decision (a)): a raw HTML body longer than RAW_HTML_BODY_MAX is refused
+    # (fail closed, vote 1795854b) instead of read past the census bound. It is found on the text with
+    # newlines as spaces (the census flattens a unit) and on its folded form (the census decodes before
+    # it strips), and refused once per line, at the line its opener is on.
+    found = set()
+    for form in (text, fold(text)):
+        for m in _LONG_BODY_RE.finditer(form.replace("\n", " ")):
+            found.add(min(form.count("\n", 0, m.start()) + 1, len(lines)))
+    for n in sorted(found):
+        refuse(LONG_BODY_CONSTRUCT, n)
     return out
 
 
@@ -2262,6 +2292,18 @@ class CertificationScope8262(unittest.TestCase):
         for text in ("Enable TRUST<?x?>_PEERS now.", "Enable TRUST<?x?> PEER now.",
                      "Enable TRUST<![CDATA[x]]> PEER now.", "Enable TRUST<?a>b?>_PEER now."):
             self.assertEqual(count(text), 0, "control: %r" % text)
+        # Round 27 (security r26 LOW-1): a browser ends a PI or CDATA section at its FIRST ">", even
+        # when the CommonMark closer "?>" or "]]>" comes later, so the halves join across that ">",
+        # at the split and with the ">" as the first character of the body, inside an entity pair too.
+        for inner in ("TRUST<?a>_PEER?>", "TRUST<?>_PEER?>", "TRUST_<?a>PEER?>", "TRUST_<?>PEER x ?>",
+                      "TRUST<![CDATA[a>_PEER]]>", "TRUST<![CDATA[>_PEER]]>", "TRUST_<![CDATA[a>PEER]]>",
+                      "TRUST_<![CDATA[>PEER x ]]>", "**TRUST**<?a>_PEER?>", "TRUST<?a>–PEER?>"):
+            for wrap in wrappers + ("Enable &lt;!-- %s --&gt; now.",):
+                self.assertEqual(count(wrap % inner), 1, "PI or CDATA with an inner >: %r" % (wrap % inner))
+        # Controls: the text after the first ">" is visible, so a closer between the halves splits them.
+        for text in ("Enable TRUST<?a>?>_PEER now.", "Enable TRUST<![CDATA[a>]]>_PEER now.",
+                     "Enable TRUST<?a>_PEERS?> now.", "Enable TRUST<?a> b>_PEER?> now."):
+            self.assertEqual(count(text), 0, "control: %r" % text)
         # The tag-wrapped underscore joins the halves once the tags are removed (rounds 16 and later).
         self.assertEqual(count("Enable TRUST<b>_</b>PEER now."), 1)
 
@@ -2283,6 +2325,56 @@ class CertificationScope8262(unittest.TestCase):
                     self.assertEqual(len(trust_peer_units("README.md", text)), 1,
                                      "U+%04X %r" % (ord(dash), text))
 
+    def test_long_raw_html_bodies_are_refused_8262(self):
+        # Round 27 (code r26 LOW-1, decision (a)): the census patterns bound a PI or CDATA body (up to
+        # its first ">") and a quoted attribute value at 512 characters, so a longer one would hide a
+        # split identifier from the census while a browser still hides the section. The grammar refuses
+        # every such line instead, so a line it accepts is one the census reads as a browser shows it.
+        construct = "raw HTML body longer than 512 characters"
+
+        def got(text):
+            return [p[len("unsupported markdown construct: "):].rsplit(" at ", 1)[0]
+                    for p in grammar_problems("README.md", text)]
+        # The size counts the characters between the opener and the first terminator: for a PI it
+        # includes the "?" of "?>", for CDATA the "]]" of "]]>".
+        sections = (("PI", "<?%s?>", 1), ("CDATA", "<![CDATA[%s]]>", 2), ("double-quoted", '<b title="%s">', 0),
+                    ("single-quoted", "<b title='%s'>", 0))
+        outers = ("Enable %s now.", "Enable &lt;!-- %s --&gt; now.", "Enable &#60;!-- %s --&#62; now.",
+                  "| Mode | Note |\n| --- | --- |\n| a | %s |", "- Enable %s now.")
+        for kind, section, closer in sections:
+            for size in (2, 511, 512, 513, 600, 2000):
+                for split in ("TRUST%s_PEER", "TRUST_%sPEER"):
+                    for outer in outers:
+                        text = outer % (split % (section % ("x" * (size - closer))))
+                        if size <= 512:
+                            self.assertEqual(got(text), [], "%s %d accepted: %r" % (kind, size, text[:60]))
+                            self.assertEqual(len(trust_peer_units("README.md", text)), 1,
+                                             "%s %d counts: %r" % (kind, size, text[:60]))
+                        else:
+                            self.assertEqual(got(text), [construct], "%s %d refused: %r" % (kind, size, text[:60]))
+        # A body that a newline wraps is one body to the census (units are flattened) and to the grammar;
+        # a refusal names the line the section opens on.
+        for section in ("<?%s>", "<![CDATA[%s>", '<b title="%s">', "<b title='%s'>"):
+            text = "Enable TRUST%s_PEER now." % (section % ("x" * 300 + "\n" + "x" * 300))
+            self.assertEqual(grammar_problems("README.md", "intro\n\n" + text),
+                             ["unsupported markdown construct: %s at README.md:3" % construct], text[:40])
+        # Controls: a long line with no raw HTML body, a long quoted string outside a tag, a section whose
+        # ">" comes early, and long text after a closed attribute value are accepted.
+        for text in ("Enable " + "x" * 2000 + " now.", 'He said "%s" twice.' % ("x" * 600),
+                     "Enable TRUST<?a>_PEER%s?> now." % ("x" * 600), 'Enable <b title="a">%s</b> now.' % ("x" * 600),
+                     "Enable TRUST<![CDATA[a>_PEER %s]]> now." % ("x" * 600)):
+            self.assertEqual(got(text), [], text[:40])
+        self.assertEqual(len(trust_peer_units("README.md", "Enable TRUST<?a>_PEER%s?> now." % ("x" * 600))), 0)
+        self.assertEqual(len(trust_peer_units("README.md", "Enable TRUST<?a>_PEER %s?> now." % ("x" * 600))), 1)
+        # The refusal pattern is linear: 100 KB of openers with no terminator stays under 2 s.
+        import time
+        for text in ("<?" * 50000, "<![CDATA[" * 11000, '<b title="' * 10000, "<b title='" * 10000,
+                     '<b a="x"' * 12500):
+            start = time.perf_counter()
+            grammar_problems("README.md", text)
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 2.0, "%d chars took %.3f s" % (len(text), elapsed))
+
     def test_mention_census_is_fail_closed_against_reference_renderer_8262(self):
         # Round 25 (code r24 LOW-1, security r24 LOW-1): an independent reference renderer, written
         # here without the guard's helpers, decides whether the rendered text shows the identifier
@@ -2291,9 +2383,11 @@ class CertificationScope8262(unittest.TestCase):
         comment_re = re.compile(r"<!-->|<!--->|<!--.*?-->", re.S)
         # Round 26 (security r25 LOW-1): the tag step also removes what a browser hides as a bogus
         # comment: a declaration, a processing instruction and a CDATA section, each up to its ">".
+        # Round 27 (security r26 LOW-1): up to its FIRST ">", which may come before "?>" or "]]>".
         tag_re = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>|<[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:]"
                             r"[\w.:-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*\s*/?>"
-                            r"|<![A-Za-z][^>]*>|<\?[^>]*\?>|<!\[CDATA\[[^>]*\]\]>")
+                            r"|<![A-Za-z][^>]*>|<\?[^>]*>|<!\[CDATA\[[^>]*>")
+        value_re = re.compile(r"=\s*(\"[^\"]*\"|'[^']*')")
         dashes = "".join(chr(c) for c in range(sys.maxunicode + 1)
                          if c == 0x2D or c == 0x2212 or unicodedata.category(chr(c)) == "Pd")
         halves_re = re.compile("(trust)[%s](peer)" % re.escape(dashes), re.IGNORECASE)
@@ -2314,6 +2408,25 @@ class CertificationScope8262(unittest.TestCase):
                 out = re.sub(r"(?<![0-9A-Za-z])_+|_+(?![0-9A-Za-z])", "", re.sub(r"__+", "", out))
                 seen = max(seen, 1 if ident_re.search(halves_re.sub(r"\1_\2", out).lower()) else 0)
             return seen
+
+        def refused(text):
+            # Round 27 (code r26 LOW-1): the guard's grammar refuses a PI or CDATA body (up to its first
+            # ">") or a quoted attribute value longer than 512 characters, before and after one decode.
+            # Found here with str.find and the renderer's own tag pattern, not the guard's patterns.
+            for form in (text, unicodedata.normalize("NFKC", html.unescape(text))):
+                form = form.replace("\n", " ")
+                low = form.lower()
+                for opener in ("<?", "<![cdata["):
+                    at = low.find(opener)
+                    while at >= 0:
+                        end = low.find(">", at)
+                        if (len(low) if end < 0 else end) - at - len(opener) > 512:
+                            return True
+                        at = low.find(opener, at + 1)
+                if any(len(value) - 2 > 512 for tag in tag_re.finditer(form)
+                       for value in value_re.findall(tag.group())):
+                    return True
+            return False
 
         spellings = (("<", ">"), ("&lt;", "&gt;"), ("&#60;", "&#62;"), ("&#x3c;", "&#x3e;"),
                      ("\uff1c", "\uff1e"), ("\ufe64", "\ufe65"), ("&amp;lt;", "&amp;gt;"))
@@ -2348,11 +2461,41 @@ class CertificationScope8262(unittest.TestCase):
         # "`TRUST`_PEER" split and the code-span spelling of "TRUST_PEER" are one line, so 45 repeat.
         self.assertEqual(len(splits), 69)
         self.assertEqual(len(corpus), 9270)
+        # Round 27 (security r26 LOW-1, code r26 LOW-1): the body axis. Body length 0, 512, 513 and 600
+        # for a PI, a CDATA section and a double- and single-quoted attribute value, and a body that
+        # holds a ">" (the browser ends a PI or CDATA section there), at both split positions.
+        bodies = []
+        for size in (0, 512, 513, 600):
+            pad = "x" * size
+            for section in ("<?%s?>", "<![CDATA[%s]]>", '<b title="%s">', "<b title='%s'>"):
+                bodies += ["TRUST%s_PEER" % (section % pad), "TRUST_%sPEER" % (section % pad)]
+            bodies += ["TRUST<?%s>_PEER?>" % pad, "TRUST_<?%s>PEER ?>" % pad, "TRUST_<?>%sPEER?>" % pad,
+                       "TRUST<?%s>?>_PEER" % pad, "TRUST<![CDATA[%s>_PEER]]>" % pad,
+                       "TRUST_<![CDATA[%s>PEER ]]>" % pad, "TRUST<![CDATA[%s>]]>_PEER" % pad,
+                       'TRUST<b title="%s>">_PEER' % pad]
+        axis = set()
+        for spelt in bodies:
+            axis.add("Enable %s now." % spelt)
+            for lt, gt in spellings:
+                axis.add("Enable %s now." % ("%s!-- %s --%s" % (lt, spelt, gt)))
+                axis.add("Enable %s now." % ("%s!-- note --%s %s" % (lt, gt, spelt)))
+        # 4 sizes x 16 bodies x 15 outer forms; no line repeats.
+        self.assertEqual(len(bodies), 64)
+        self.assertEqual(len(axis), 960)
+        corpus += sorted(axis)
         start = time.perf_counter()
         rows = [(text, oracle(text), len(trust_peer_units("README.md", text))) for text in corpus]
         elapsed = time.perf_counter() - start
         self.assertLess(elapsed, 2.0, "%d lines took %.3f s" % (len(corpus), elapsed))
-        fewer = [text for text, shown, count in rows if count < shown]
+        # A line the grammar refuses is not read; the renderer's own refusal rule must name exactly
+        # the lines the grammar refuses for a long body, and every other line is compared.
+        long_body = "raw HTML body longer than 512 characters"
+        grammar = {text: any(long_body in p for p in grammar_problems("README.md", text))
+                   for text in sorted(axis)}
+        mismatch = [text[:60] for text in sorted(axis) if grammar[text] != refused(text)]
+        self.assertEqual(mismatch[:3], [], "%d axis lines: grammar and renderer refusal differ" % len(mismatch))
+        self.assertGreater(sum(grammar.values()), 300)
+        fewer = [text for text, shown, count in rows if count < shown and not refused(text)]
         self.assertEqual(fewer[:3], [], "%d of %d lines count fewer than the reference renderer shows"
                          % (len(fewer), len(corpus)))
         # The oracle is not vacuous: it sees the identifier on some lines and not on others.
