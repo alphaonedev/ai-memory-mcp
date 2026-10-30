@@ -13,6 +13,7 @@ Lives under scripts/ci/tests so the CI discover root runs it.
 Python 3.9 compatible, standard library only.
 """
 
+import errno
 import os
 import re
 import shutil
@@ -60,28 +61,65 @@ def markdown_files(root):
                     yield path
 
 
-def exists_inside(root, candidate):
-    """True when ``candidate`` resolves to an existing path inside ``root``."""
+def inside_state(root, candidate):
+    """Return ``(state, detail)`` for ``candidate`` against ``root``.
+
+    ``state`` is ``"file"`` or ``"dir"`` when the path exists and its real
+    location is inside ``root``, ``"missing"`` when it does not exist or leaves
+    the root, and ``"unresolvable"`` (``detail`` = errno name) when the
+    operating system refuses the path, for example a segment longer than
+    NAME_MAX.
+    """
     try:
         real = candidate.resolve()
         real.relative_to(root.resolve())
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return real.exists()
+        if real.is_dir():
+            return "dir", ""
+        if real.exists():
+            return "file", ""
+    except OSError as err:
+        return "unresolvable", errno.errorcode.get(err.errno, "EIO")
+    except (RuntimeError, ValueError):
+        pass
+    return "missing", ""
 
 
-def climbs_out_of_root(root, source, target_path):
-    """True when ``target_path``, joined lexically to ``source``'s directory, leaves ``root``.
+def exists_inside(root, candidate):
+    """True when ``candidate`` resolves to an existing path inside ``root``."""
+    return inside_state(root, candidate)[0] in ("file", "dir")
 
-    Pure string normalisation with no filesystem access, so a climb that
-    re-enters the checkout through its own directory name is still refused
-    on every host.
+
+def is_protocol_relative(target_path):
+    """True for a ``//`` target: a browser reads its first segment as a host."""
+    return target_path.startswith("//")
+
+
+def normalised_path(root, source, target_path):
+    """Lexically normalised, root-relative form of ``target_path`` (no filesystem access).
+
+    A single leading ``/`` joins the target to the repository root; any other
+    target joins to ``source``'s directory. ``..`` is resolved by string
+    normalisation only, because a browser never resolves it through a
+    directory symlink.
     """
     if target_path.startswith("/"):
         joined = target_path.lstrip("/")
     else:
         joined = os.path.join(str(source.parent.relative_to(root)), target_path)
-    normal = os.path.normpath(joined)
+    return os.path.normpath(joined)
+
+
+def climbs_out_of_root(root, source, target_path):
+    """True when ``target_path``, joined lexically, leaves ``root``.
+
+    A target with one leading ``/`` is joined to the repository root; any
+    other target is joined to ``source``'s directory. A ``//`` target is not
+    handled here: ``is_protocol_relative`` refuses it before this is called.
+    Pure string normalisation with no filesystem access, so a climb that
+    re-enters the checkout through its own directory name is still refused
+    on every host.
+    """
+    normal = normalised_path(root, source, target_path)
     return normal == ".." or normal.startswith(".." + os.sep)
 
 
@@ -103,29 +141,46 @@ def relative_links(path):
             yield number, target
 
 
+def link_problem(root, path, target_path):
+    """Return None when the link resolves, else the reason it is broken ("" = missing)."""
+    if is_protocol_relative(target_path):
+        return "protocol-relative target"
+    if climbs_out_of_root(root, path, target_path):
+        return ""
+    resolved = root / normalised_path(root, path, target_path)
+    state, detail = inside_state(root, resolved)
+    if state == "unresolvable":
+        return "unresolvable target: " + detail
+    if state == "missing" and resolved.suffix == ".html":
+        # The docs site renders each page as .html; a link to the
+        # rendered form of an existing .md page is not broken.
+        if exists_inside(root, resolved.with_suffix(".md")):
+            return None
+    if state == "missing":
+        return ""
+    if state == "file" and target_path.endswith("/"):
+        return "trailing slash on a file target"
+    return None
+
+
 def broken_links(root):
-    """Return a list of ``file:line target`` strings for unresolved links."""
+    """Return a list of ``file:line target`` strings for unresolved links.
+
+    A link broken for a named reason carries ``(reason)`` after the target.
+    """
     broken = []
     for path in markdown_files(root):
         for number, target in relative_links(path):
             target_path = target.split("#", 1)[0].split("?", 1)[0]
             if not target_path:
                 continue
-            if climbs_out_of_root(root, path, target_path):
-                broken.append("%s:%d %s" % (path.relative_to(root), number, target))
+            problem = link_problem(root, path, target_path)
+            if problem is None:
                 continue
-            if target_path.startswith("/"):
-                resolved = root / target_path.lstrip("/")
-            else:
-                resolved = path.parent / target_path
-            if resolved.suffix == ".html" and exists_inside(
-                root, resolved.with_suffix(".md")
-            ):
-                # The docs site renders each page as .html; a link to the
-                # rendered form of an existing .md page is not broken.
-                continue
-            if not exists_inside(root, resolved):
-                broken.append("%s:%d %s" % (path.relative_to(root), number, target))
+            entry = "%s:%d %s" % (path.relative_to(root), number, target)
+            if problem:
+                entry += " (%s)" % problem
+            broken.append(entry)
     return broken
 
 
@@ -194,6 +249,43 @@ class LinkContainmentTest(unittest.TestCase):
         (self.guarded / "page.md").write_text("# page\n", encoding="utf-8")
         self.write("a.md", "[x](page.html)\n")
         self.assertEqual(broken_links(self.root), [])
+
+    def test_protocol_relative_target_is_broken(self):
+        (self.root / "README.md").write_text("# root\n", encoding="utf-8")
+        self.write("a.md", "[a](//README.md)\n[b](///README.md)\n[c](/README.md)\n")
+        self.assertEqual(
+            broken_links(self.root),
+            [
+                "docs/security/a.md:1 //README.md (protocol-relative target)",
+                "docs/security/a.md:2 ///README.md (protocol-relative target)",
+            ],
+        )
+
+    def test_dotdot_after_directory_symlink_is_lexical(self):
+        (self.root / "sub" / "deep").mkdir(parents=True)
+        (self.root / "sub" / "x.md").write_text("# x\n", encoding="utf-8")
+        (self.root / "README.md").write_text("# root\n", encoding="utf-8")
+        (self.root / "inlink").symlink_to(self.root / "sub" / "deep", target_is_directory=True)
+        self.write("a.md", "[a](../../inlink/../x.md)\n[b](../../inlink/../README.md)\n")
+        self.assertEqual(
+            broken_links(self.root), ["docs/security/a.md:1 ../../inlink/../x.md"]
+        )
+
+    def test_unresolvable_target_is_broken_by_name(self):
+        target = "a" * 300 + ".md"
+        self.write("a.md", "[a](%s)\n" % target)
+        self.assertEqual(
+            broken_links(self.root),
+            ["docs/security/a.md:1 %s (unresolvable target: ENAMETOOLONG)" % target],
+        )
+
+    def test_trailing_slash_must_name_a_directory(self):
+        (self.root / "README.md").write_text("# root\n", encoding="utf-8")
+        self.write("a.md", "[a](../../docs/)\n[b](../../README.md/)\n")
+        self.assertEqual(
+            broken_links(self.root),
+            ["docs/security/a.md:2 ../../README.md/ (trailing slash on a file target)"],
+        )
 
 
 if __name__ == "__main__":
