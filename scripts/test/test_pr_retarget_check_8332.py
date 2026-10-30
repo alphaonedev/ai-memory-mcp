@@ -97,9 +97,22 @@ class LivePath(unittest.TestCase):
         self.put("runs_ci.yml", runs_at(ci))
         self.put("runs_coverage.yml", runs_at(cov))
 
-    def run_live(self):
-        env = dict(os.environ, PATH=str(STUB_BIN) + os.pathsep + os.environ.get("PATH", ""),
-                   GH_STUB_DIR=str(self.stub))
+    def child_env(self, extra=None) -> dict:
+        """Environment built from scratch: no inherited gh credentials, host or config."""
+        env = {"PATH": os.pathsep.join([str(STUB_BIN), "/usr/bin", "/bin"]),
+               "HOME": str(self.stub), "GH_STUB_DIR": str(self.stub)}
+        env.update(extra or {})
+        for banned in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GH_HOST", "GH_CONFIG_DIR"):
+            self.assertNotIn(banned, env)
+        return env
+
+    def run_live(self, extra=None):
+        env = self.child_env(extra)
+        found = shutil.which("gh", path=env["PATH"])
+        stub = STUB_BIN / "gh"
+        self.assertIsNotNone(found, "gh does not resolve on the child PATH")
+        self.assertEqual(Path(found).resolve(), stub.resolve(), f"{self.id()}: gh is not the stub")
+        self.assertTrue(os.access(stub, os.X_OK), f"{self.id()}: the stub gh is not executable")
         return subprocess.run(
             [sys.executable, "-I", str(SCRIPT), "--repo", "o/r", "--pr", "1", "--head", HEAD],
             capture_output=True, text=True, check=False, env=env)
@@ -131,6 +144,7 @@ class LivePath(unittest.TestCase):
         r = self.run_live()
         self.assertEqual(r.returncode, 70, r.stdout + r.stderr)
         self.assertNotIn("no base change", r.stdout)
+        self.assertEqual(self.requests(), ["timeline_page1"])
 
     def test_c2_gh_nonzero_on_runs_is_a_tool_error(self):
         self.put("timeline_page1", [change(T_CHANGE)])
@@ -138,19 +152,60 @@ class LivePath(unittest.TestCase):
         (self.stub / "runs_coverage.yml.rc").write_text("4")
         r = self.run_live()
         self.assertEqual(r.returncode, 70, r.stdout + r.stderr)
+        self.assertEqual(self.requests(), ["timeline_page1", "runs_ci.yml", "runs_coverage.yml"])
 
     def test_d_gh_non_json_is_a_tool_error(self):
         self.put("timeline_page1", "<html>rate limited</html>", "raw")
         r = self.run_live()
         self.assertEqual(r.returncode, 70, r.stdout + r.stderr)
         self.assertNotIn("no base change", r.stdout)
+        self.assertEqual(self.requests(), ["timeline_page1"])
 
-    def test_e_two_base_changes_use_the_latest(self):
+    def test_e_two_base_changes_newest_first_use_the_latest(self):
         self.put("timeline_page1", [change(T_AFTER), change(T_BEFORE)])
         self.runs("2026-10-30T13:00:00Z", "2026-10-30T13:00:00Z")
         r = self.run_live()
         self.assertEqual(r.returncode, 65, r.stdout + r.stderr)
         self.assertIn(f"REFUSE: base retargeted at {T_AFTER}", r.stdout)
+
+    def test_e2_two_base_changes_oldest_first_use_the_latest(self):
+        # The REST timeline is oldest first: the latest change is the LAST one listed.
+        self.put("timeline_page1", [change(T_BEFORE), change(T_AFTER)])
+        self.runs("2026-10-30T13:00:00Z", "2026-10-30T13:00:00Z")
+        r = self.run_live()
+        self.assertEqual(r.returncode, 65, r.stdout + r.stderr)
+        self.assertIn(f"REFUSE: base retargeted at {T_AFTER}", r.stdout)
+
+    def test_g_non_list_timeline_page_is_a_tool_error(self):
+        self.put("timeline_page1", {"message": "Server Error"})
+        r = self.run_live()
+        self.assertEqual(r.returncode, 70, r.stdout + r.stderr)
+        self.assertNotIn("no base change", r.stdout)
+        self.assertIn("not a list", r.stderr)
+
+    def test_h_base_change_without_created_at_is_a_tool_error(self):
+        self.put("timeline_page1", [{"event": "base_ref_changed"}])
+        self.runs(T_AFTER, T_AFTER)
+        r = self.run_live()
+        self.assertEqual(r.returncode, 70, r.stdout + r.stderr)
+        self.assertIn("no created_at", r.stderr)
+
+    def test_i_page_cap_is_a_tool_error(self):
+        # The cap is lowered to 2 through PR_RETARGET_MAX_PAGES; the change sits on page 3.
+        self.put("timeline_page1", filler(PAGE))
+        self.put("timeline_page2", filler(PAGE))
+        self.put("timeline_page3", [change(T_CHANGE)])
+        self.runs(T_BEFORE, T_BEFORE)
+        r = self.run_live({"PR_RETARGET_MAX_PAGES": "2"})
+        self.assertEqual(r.returncode, 70, r.stdout + r.stderr)
+        self.assertIn("page cap", r.stderr)
+        self.assertEqual(self.requests(), ["timeline_page1", "timeline_page2"])
+
+    def test_j_page_cap_override_cannot_raise_the_cap(self):
+        self.put("timeline_page1", [change(T_CHANGE)])
+        self.runs(T_AFTER, T_AFTER)
+        r = self.run_live({"PR_RETARGET_MAX_PAGES": "99999"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_f_run_in_the_same_second_is_not_newer(self):
         self.put("timeline_page1", [change(T_CHANGE)])

@@ -34,10 +34,12 @@ Stdlib only. Run: ``python3 -I scripts/test/test_workflow_edited_cancel_8332.py`
 """
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+SCRATCH = ROOT / ".local-runs"
 WF = ROOT / ".github" / "workflows"
 NO_EDITED = ("ci.yml", "coverage.yml")
 EDITED_ALLOW = {"claude-md-rule-compare.yml"}
@@ -69,6 +71,24 @@ def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
+def _join_flow(first: str, remaining: list) -> str:
+    """Join a flow collection to its closing brace across lines; fail closed when it never closes.
+
+    decision (round 4, REVIEW-8332-security-r3 S5): join (not refuse) a multi-line flow, because
+    that is valid YAML; an UNCLOSED flow is refused by name via ParseFailure.
+    """
+    pieces = [first]
+    depth = sum(first.count(c) for c in "{[") - sum(first.count(c) for c in "}]")
+    lines = list(remaining)
+    while depth > 0:
+        if not lines:
+            raise ParseFailure("unclosed flow collection in the `on:` section")
+        nxt = lines.pop(0)
+        pieces.append(nxt)
+        depth += sum(nxt.count(c) for c in "{[") - sum(nxt.count(c) for c in "}]")
+    return "\n".join(pieces)
+
+
 def triggers(text: str) -> dict:
     """Map each pull_request(_target) trigger found in ``on:`` to its body text.
 
@@ -88,9 +108,21 @@ def triggers(text: str) -> dict:
     if ANCHOR_RE.search("\n".join([rest] + section)):
         raise ParseFailure("anchor or alias in the `on:` section")
     out = {}
+    after = lines[start + 1:]
+    flow, remaining = "", after
+    if rest[:1] in ("{", "["):
+        flow = rest
+    elif not rest and section and section[0].strip()[:1] in ("{", "["):
+        idx = next(i for i, x in enumerate(after) if x.strip())
+        flow, remaining = section[0].strip(), after[idx + 1:]
+    if flow:  # a flow mapping or sequence, possibly spread over several lines: join to its closing brace
+        flow = _join_flow(flow, remaining)
+        if ANCHOR_RE.search(flow):
+            raise ParseFailure("anchor or alias in the `on:` section")
+        rest = flow
     if rest:  # inline scalar, flow sequence or flow mapping: the whole text is the body
         for kind in KINDS:
-            if re.search(rf"(?<![\w-]){kind}(?![\w-])", rest):
+            if re.search(rf"""(?<![\w-]){kind}(?![\w-])""", rest):
                 out[kind] = rest
         return out
     if not section:
@@ -99,8 +131,8 @@ def triggers(text: str) -> dict:
     current = None
     for x in section:
         ind = _indent(x)
-        m = re.match(rf"^ {{{child}}}(?:-[ \t]+)?([\w-]+)[ \t]*:(.*)$", x) if ind == child else None
-        seq = re.match(rf"^ {{{child}}}-[ \t]+([\w-]+)[ \t]*$", x) if ind == child else None
+        m = re.match(rf"""^ {{{child}}}(?:-[ \t]+)?["']?([\w-]+)["']?[ \t]*:(.*)$""", x) if ind == child else None
+        seq = re.match(rf"""^ {{{child}}}-[ \t]+["']?([\w-]+)["']?[ \t]*$""", x) if ind == child else None
         if seq:
             current = seq.group(1)
             if current in KINDS:
@@ -122,7 +154,7 @@ def pr_types(text: str, kinds=KINDS) -> set:
     out = set()
     for kind, body in triggers(text).items():
         if kind in kinds and re.search(r"\btypes\b", body):
-            out |= set(re.findall(r"[a-z_]+", body)) & ACTIVITY_TYPES
+            out |= set(re.findall(r"[a-z_]+", body.lower())) & ACTIVITY_TYPES
     return out
 
 
@@ -185,8 +217,10 @@ def target_extras(texts: dict) -> list:
                      for n in extra]
 
 
-def _all():
-    return {p.name: p.read_text(encoding="utf-8") for p in sorted(WF.glob("*.yml"))}
+def _all(directory=WF):
+    """Every workflow text, ``*.yml`` and ``*.yaml`` (GitHub reads both; test_workflow_pr_triggers_5447 too)."""
+    paths = sorted(list(directory.glob("*.yml")) + list(directory.glob("*.yaml")))
+    return {p.name: p.read_text(encoding="utf-8") for p in paths}
 
 
 BASE_BAD = (
@@ -292,6 +326,50 @@ class BodyOnlyEditNeverCancels8332(unittest.TestCase):
             self.assertEqual(len(edited_listed("m.yml", bad)), 1, bad)
             self.assertEqual(len(cancel_violations("m.yml", bad)), 1, bad)
             self.assertEqual(len(target_extras({"m.yml": bad})), 1, bad)
+
+    def test_mutation_quoted_trigger_keys(self):
+        for q in ('"', "'"):
+            block = f"on:\n  {q}pull_request{q}:\n    types: [opened, edited]\n"
+            self.assertEqual(len(edited_listed("m.yml", block)), 1, block)
+            seq = f"on:\n  {q}pull_request{q}:\n    types:\n      - {q}edited{q}\n"
+            self.assertEqual(len(edited_listed("m.yml", seq)), 1, seq)
+            tgt = f"on:\n  {q}pull_request_target{q}:\n    types: [edited]\n"
+            self.assertEqual(len(target_extras({"m.yml": tgt})), 1, tgt)
+            flow = f"on: {{{q}pull_request{q}: {{types: [edited]}}}}\n"
+            self.assertEqual(len(edited_listed("m.yml", flow)), 1, flow)
+
+    def test_mutation_multiline_flow_mapping(self):
+        for bad in ("on: {\n  pull_request: {\n    types: [opened,\n      edited]\n  }\n}\n",
+                    "on:\n  {\n  pull_request: {types: [opened, edited]}\n  }\nname: x\n",
+                    "on: [push,\n  pull_request]\n"):
+            if "edited" in bad:
+                self.assertEqual(len(edited_listed("m.yml", bad)), 1, bad)
+            self.assertTrue(has_trigger(bad, "pull_request"), bad)
+        tgt = "on: {\n  pull_request_target: {types: [edited]}\n}\n"
+        self.assertEqual(len(target_extras({"m.yml": tgt})), 1)
+        ok = "on: {\n  pull_request: {types: [opened, synchronize]}\n}\njobs: {}\n"
+        self.assertEqual(edited_listed("ok.yml", ok), [])
+
+    def test_mutation_unclosed_flow_is_refused_by_name(self):
+        bad = "on: {\n  pull_request: {types: [opened, edited]\n"
+        out = edited_listed("unclosed.yml", bad)
+        self.assertEqual(len(out), 1)
+        self.assertIn("unclosed.yml", out[0])
+        self.assertIn("unclosed flow", out[0])
+
+    def test_mutation_capitalised_edited(self):
+        bad = BASE_BAD.replace("edited]", "Edited]")
+        self.assertEqual(len(edited_listed("m.yml", bad)), 1)
+
+    def test_yaml_extension_workflows_are_scanned(self):
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as tmp:
+            d = Path(tmp)
+            (d / "a.yml").write_text("on:\n  push:\n", encoding="utf-8")
+            (d / "b.yaml").write_text(BASE_BAD, encoding="utf-8")
+            texts = _all(d)
+            self.assertEqual(sorted(texts), ["a.yml", "b.yaml"])
+            self.assertEqual(len(edited_listed("b.yaml", texts["b.yaml"])), 1)
 
     def test_mutation_second_pull_request_target_workflow(self):
         texts = dict(_all())

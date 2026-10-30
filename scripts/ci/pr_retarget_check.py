@@ -26,6 +26,7 @@ live path (no ``--json-dir``) through a stub ``gh`` placed first on PATH.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +34,24 @@ from pathlib import Path
 EX_OK, EX_REFUSE, EX_TOOL = 0, 65, 70
 WORKFLOWS = ("ci.yml", "coverage.yml")
 PAGE = 100
-MAX_PAGES = 200
+MAX_PAGES_DEFAULT = 200
+
+
+def _max_pages():
+    """Page cap; ``PR_RETARGET_MAX_PAGES`` may only LOWER it (test hook, fails closed).
+
+    decision (round 4, REVIEW-8332-security-r3 S6): the cap branch is tested through this env var
+    instead of generating 20,000 events. A larger or unparsable value is ignored, so the override
+    can only make the check refuse sooner, never read past the default cap.
+    """
+    try:
+        value = int(os.environ.get("PR_RETARGET_MAX_PAGES", ""))
+    except ValueError:
+        return MAX_PAGES_DEFAULT
+    return value if 1 <= value < MAX_PAGES_DEFAULT else MAX_PAGES_DEFAULT
+
+
+MAX_PAGES = _max_pages()
 RUN_LIMIT = 100
 
 
