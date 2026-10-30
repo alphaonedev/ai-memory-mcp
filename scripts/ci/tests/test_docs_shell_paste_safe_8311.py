@@ -401,6 +401,12 @@ class Frames(list):
         self.ticks = 0
         self.rereads = 0
 
+    def __eq__(self, other):
+        # ticks and rereads are derived from the items, so list equality is exact
+        return list.__eq__(self, other)
+
+    __hash__ = None
+
     def append(self, frame):
         list.append(self, frame)
         if frame == "`":
