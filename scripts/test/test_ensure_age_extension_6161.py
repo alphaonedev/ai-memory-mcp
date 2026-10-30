@@ -1871,6 +1871,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         r = self.run_script()
         self.assert_fails(r, 2, "age source rejected: " + str(self.age / "lib" / "age.dylib"))
         self.assertIn("refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)", r.stderr)
+        self.assert_nothing_installed()  # I1 (#8282): disk unchanged (still empty), no temp file left
 
     def test_refused_installed_file_matching_a_refused_pin_is_not_healthy_8282(self):
         # Pinned and installed stock used to count as healthy (exit 0); it is refused now, and the

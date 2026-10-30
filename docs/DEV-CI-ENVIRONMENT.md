@@ -203,9 +203,16 @@ macos-fed node the "Configure enterprise-fed tier" step runs
   and the `age.dylib` pin must never go back to the stock 1.8.0 bytes: the helper
   installs whatever the pin names, so a stock pin reinstalls the apache/age#2580
   lock leak over the patched library (that is how #8282 followed #7162).
-  `REFUSED_SHAS` names the stock dylib digest: a source or installed file with
-  that digest is refused by name (exit 2, nothing written) even when a
-  `MANIFEST` pins it, and an AGE rebuild adds the superseded digest to it.
+  `REFUSED_SHAS` names the stock dylib digest; an AGE rebuild adds the superseded
+  digest to it. Two cases, in the order the helper checks them: (1) an INSTALLED
+  file whose digest is refused is never healthy (`installed_ok`), so the helper
+  reinstalls it from the pinned source and exits 0; (2) a SOURCE file whose
+  digest is refused is rejected by name, `age source rejected: <path> refused:
+  stock apache/age 1.8.0 carries issue 2580 (issue 8282)`, exit 2, nothing
+  written, even when a `MANIFEST` pins it (`read_source`). A head that pins
+  stock while its source dir holds the patched bytes gets `age source rejected:
+  <path> does not match its pinned sha256`, exit 2, nothing written: the pin
+  comparison does not consult `REFUSED_SHAS`.
 - **Fail closed (#8282).** The stock source directory on the macos-fed node was
   retired on 2026-10-29 (renamed `age-1.8.0.retired-8282`; 3-agent vote
   (6def5ab6) 3-0) after a job whose helper still pinned stock rewrote the stock

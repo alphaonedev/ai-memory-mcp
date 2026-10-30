@@ -298,17 +298,23 @@ pinned stock rewrote the stock `age.dylib` onto disk, and one unplanned restart 
 the tier, which five runner slots share, would have reproduced the leak. The
 consequences are by design:
 
-- A head whose helper still pins the stock sha exits 2 on this node (`age source
-  incomplete: ... is missing` for a head before `REFUSED_SHAS`, `age source
-  rejected: ... refused: stock apache/age 1.8.0 carries issue 2580 (issue 8282)`
-  for a head that carries it) and its `Check (macos-fed,enterprise-fed)` row is
-  red. That red is attributed to issue 8282 until the head carries this change.
+- A head whose helper still pins the stock sha exits 2 on this node and its
+  `Check (macos-fed,enterprise-fed)` row is red: `age source incomplete: ... is
+  missing` when its `DEFAULT_AGE_DIR` is the retired stock dir, or `age source
+  rejected: <dir>/lib/age.dylib does not match its pinned sha256` when it is the
+  `06ce678d` dir (the pin comparison in `read_source`; `REFUSED_SHAS` is consulted
+  for source and installed digests, not for the pin). That red is attributed to
+  issue 8282 until the head carries this change.
 - Once this change is on the chain every `refs/pull/N/merge` ref carries the new
   pin. Re-runs of older workflow runs keep their old merge sha and stay red by
   design: rebase the branch instead of retrying the run.
-- `REFUSED_SHAS` in the helper names the stock dylib digest: a source or installed
-  file with that digest is refused by name and never installed, even when a
-  `MANIFEST` pins it.
+- `REFUSED_SHAS` in the helper names the stock dylib digest. Two cases, in the
+  order the helper checks them: (1) an INSTALLED file whose digest is refused is
+  never healthy (`installed_ok`), so the helper reinstalls it from the pinned
+  source and exits 0; (2) a SOURCE file whose digest is refused is rejected by
+  name, `age source rejected: <path> refused: stock apache/age 1.8.0 carries
+  issue 2580 (issue 8282)`, exit 2, nothing written, even when a `MANIFEST` pins
+  it (`read_source`).
 
 **Pin rule.** `scripts/ci/ensure-age-extension.py` installs the five files its
 `MANIFEST` pins, on every enterprise-fed job, whenever the installed bytes differ.
@@ -326,6 +332,7 @@ the postmaster has it mapped: an in-place overwrite changes the pages under the
 running backends. Install by a same-directory temp file plus rename (what the
 helper does), or run the helper from a checkout that carries the new pin:
 
+    rm -f <pkglibdir>/age.dylib.new   # a pre-existing symlink at that name would be written through
     cp <pg-age-stack>/age-1.8.0-<commit>/lib/age.dylib <pkglibdir>/age.dylib.new
     chmod 0755 <pkglibdir>/age.dylib.new
     shasum -a 256 <pkglibdir>/age.dylib.new   # must equal the age.dylib pin in the helper
