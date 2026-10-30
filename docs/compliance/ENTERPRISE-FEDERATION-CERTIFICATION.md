@@ -1436,8 +1436,14 @@ control is the SOLE decisive gate.
 This certification does **NOT** cover, and a Fortune-500 that needs any of the
 following should **not** treat v1.0.0 as sufficient:
 
-- **No end-to-end content encryption at the pinned SHA.** Every in-scope federation peer reads
+- **No end-to-end content encryption across federation.** This revision ships only slice E1 of
+  [#8278](https://github.com/alphaonedev/ai-memory-mcp/issues/8278): the `0x05` scope envelope and
+  the scope-key store with its hash-chained audit log and recovery escrow (`src/encryption/scope.rs`),
+  with no sync path, so no `0x05` row leaves the node and every in-scope federation peer reads
   your memory content in **plaintext** (`src/encryption/mod.rs`). Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262).
+  This certification excludes the rest of #8278 (slice E2: the federation sync path, the
+  `/keys/scope` key pull, withholding of `0x05` embeddings from non-readers, record signing and
+  scope-key rotation).
   SQLCipher protects data at rest on each node; it does **not** protect content
   in transit-to-peer beyond the TLS/mTLS transport, and an allowlisted peer sees
   cleartext. The per-content X25519/ChaCha envelope (`AI_MEMORY_ENCRYPT_AT_REST`)

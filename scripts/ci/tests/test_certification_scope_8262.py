@@ -439,7 +439,12 @@ _TAG_RE = re.compile(r"<[^<>]*>")
 # failed match cannot rescan the rest of the paragraph from every "<".
 _OPEN_TAG_RE = re.compile(r"<[a-z][a-z0-9-]*(?:\s+[a-z_:][a-z0-9_.:-]*(?:\s*=\s*(?:[^\s\"'=<>`]+"
                           r"|'[^'\n]{0,512}'|\"[^\"\n]{0,512}\"))?)*\s*/?>", re.IGNORECASE)
-_CLOSE_TAG_RE = re.compile(r"</[a-z][a-z0-9-]*\s*>|<![a-z][^<>]*>", re.IGNORECASE)
+# Round 26 (security r25 LOW-1): a processing instruction "<?...?>" and a CDATA section
+# "<![CDATA[...]]>" are raw HTML a browser hides too (as a bogus comment that ends at the first ">").
+# Both bodies are bounded (512 characters) and non-greedy and hold no ">", so the match ends where
+# both CommonMark and a browser end it, and a failed match cannot rescan the line.
+_CLOSE_TAG_RE = re.compile(r"</[a-z][a-z0-9-]*\s*>|<![a-z][^<>]*>|<\?[^>]{0,512}?\?>"
+                           r"|<!\[CDATA\[[^>]{0,512}?\]\]>", re.IGNORECASE)
 _LINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)")
 _REFLINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\[[^\[\]\n]*\]")
 _MARKUP_RE = re.compile(r"[*_`~\\]")
@@ -1204,11 +1209,22 @@ def _mention_views(text):
     views of the raw line with its literal comments removed (security r24 LOW-1) and with its
     literal delimiters blanked (code r24 LOW-1) are read too. The core still decodes before it
     strips, so a split such as TRUST&lt;!-- --&gt;_PEER counts 1 while a renderer shows no
-    contiguous identifier: an over-count, which fails closed and is left as it is."""
-    views = _mention_views_core(text)
+    contiguous identifier: an over-count, which fails closed and is left as it is.
+
+    Round 26 (code r25 LOW-1): the line with its literal comments removed gets the folded
+    comment-blank and angle-blank views too (_folded_views), so a bold or code-span spelling inside
+    a decoded pair that a literal comment splits reads as it does without the literal comment."""
+    views = _folded_views(text)
     if "<!--" in text:
-        views += _mention_views_core(_strip_comments(text))
+        views += _folded_views(_strip_comments(text))
         views += _mention_views_core(text.replace("<!--", " ").replace("-->", " "))
+    return views
+
+
+def _folded_views(text):
+    """Round 26: the core views of a line, plus the core views of its folded form with comment
+    delimiters blanked and with angle brackets blanked (rounds 23, 24)."""
+    views = _mention_views_core(text)
     low = _fold_mention(text)
     if "<!--" in low:
         views += _mention_views_core(low.replace("<!--", " ").replace("-->", " "))
@@ -1227,6 +1243,10 @@ def _mention_views_core(text):
     out = low
     if "<" in out:
         out = _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(out)))
+    # Round 26 (code r25 INFO-1): this second decode turns a double-encoded pair such as
+    # "&amp;lt;!-- --&amp;gt;" into markup, one decode more than a renderer makes (it shows the pair
+    # as the visible text "&lt;!-- --&gt;"). A mention found only through it is an over-count, the
+    # fail-closed direction, and is left as it is.
     if "&" in out:
         out = _fold_mention(out)
     if "[" in out:
@@ -2223,6 +2243,25 @@ class CertificationScope8262(unittest.TestCase):
                      "Enable &lt;!-- TRUST<!-- x --> PEER --&gt; now.",
                      "Enable TRUST<!-- _ -->PEER now.", "Enable TRUST&lt;!-- _ --&gt;PEER now."):
             self.assertEqual(count(text), 0, "control: %r" % text)
+        # Round 26 (code r25 LOW-1): a bold or code-span spelling inside a decoded pair that a literal
+        # comment splits counts as the plain spelling does.
+        for kind, opener, closer in delimiters:
+            for inner in ("**TRUST**<!-- x -->_PEER", "**TRUST**<!-- -->_PEER", "**TRUST**_<!-- x -->PEER",
+                          "`TRUST`<!-- x -->_PEER", "`TRUST`_<!-- x -->PEER"):
+                for wrap in wrappers:
+                    text = wrap % ("%s %s %s" % (opener, inner, closer))
+                    self.assertEqual(count(text), 1, "%s pair, marked-up half: %r" % (kind, text))
+        # Round 26 (security r25 LOW-1): a processing instruction or a CDATA section inside the
+        # identifier is hidden by a browser, so the halves join.
+        for inner in ("TRUST<?x?>_PEER", "TRUST_<?x?>PEER", "TRUST<??>_PEER", "TRUST<?php echo 1 ?>_PEER",
+                      "TRUST<![CDATA[x]]>_PEER", "TRUST_<![CDATA[x]]>PEER", "TRUST<![CDATA[]]>_PEER",
+                      "**TRUST**<?x?>_PEER", "TRUST<?x?>–PEER", "TRUST<![cdata[x]]>_PEER"):
+            for wrap in wrappers:
+                self.assertEqual(count(wrap % inner), 1, "PI or CDATA: %r" % (wrap % inner))
+        # Controls: a longer word, and a split that leaves a space or a visible ">" between the halves.
+        for text in ("Enable TRUST<?x?>_PEERS now.", "Enable TRUST<?x?> PEER now.",
+                     "Enable TRUST<![CDATA[x]]> PEER now.", "Enable TRUST<?a>b?>_PEER now."):
+            self.assertEqual(count(text), 0, "control: %r" % text)
         # The tag-wrapped underscore joins the halves once the tags are removed (rounds 16 and later).
         self.assertEqual(count("Enable TRUST<b>_</b>PEER now."), 1)
 
@@ -2250,8 +2289,11 @@ class CertificationScope8262(unittest.TestCase):
         # contiguous; the census must count every such line (counting more is allowed, fewer never).
         import time
         comment_re = re.compile(r"<!-->|<!--->|<!--.*?-->", re.S)
+        # Round 26 (security r25 LOW-1): the tag step also removes what a browser hides as a bogus
+        # comment: a declaration, a processing instruction and a CDATA section, each up to its ">".
         tag_re = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>|<[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:]"
-                            r"[\w.:-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*\s*/?>")
+                            r"[\w.:-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*\s*/?>"
+                            r"|<![A-Za-z][^>]*>|<\?[^>]*\?>|<!\[CDATA\[[^>]*\]\]>")
         dashes = "".join(chr(c) for c in range(sys.maxunicode + 1)
                          if c == 0x2D or c == 0x2212 or unicodedata.category(chr(c)) == "Pd")
         halves_re = re.compile("(trust)[%s](peer)" % re.escape(dashes), re.IGNORECASE)
@@ -2284,16 +2326,28 @@ class CertificationScope8262(unittest.TestCase):
         splits += ["TRUST<b>_</b>PEER", "TRUST&lt;b&gt;_&lt;/b&gt;PEER", "TRUST<br>PEER", "TRUST<br>_PEER",
                    '<b title="TRUST_PEER">x</b>', '<b title="TRUST">_PEER</b>', '<b title="x">TRUST</b>_PEER',
                    "TRUST`_`PEER", "`TRUST`_PEER", "TRUST\\_PEER"]
+        # Round 26 (security r25 LOW-1): processing instructions and CDATA sections between the halves,
+        # literal and entity-spelled.
+        splits += ["TRUST<?x?>_PEER", "TRUST_<?x?>PEER", "TRUST<![CDATA[x]]>_PEER", "TRUST_<![CDATA[x]]>PEER",
+                   "TRUST&lt;?x?&gt;_PEER", "TRUST&lt;![CDATA[x]]&gt;_PEER"]
         lines = ("Enable %s now.", "| Mode | Note |\n| --- | --- |\n| a | %s |", "- Enable %s now.")
+        # Round 26 (code r25 LOW-1): the identifier-spelling axis, plain, bold and code span, makes the
+        # corpus the full cross product of split, spelling, outer form and line wrapper.
+        idents = ("TRUST", "**TRUST**", "`TRUST`")
         corpus = set()
         for split in splits:
-            for line in lines:
-                corpus.add(line % split)
-                for lt, gt in spellings:
-                    corpus.add(line % ("%s!-- %s --%s" % (lt, split, gt)))
-                    corpus.add(line % ("%s!-- note --%s %s" % (lt, gt, split)))
+            for ident in idents:
+                for line in lines:
+                    spelt = split.replace("TRUST", ident, 1)
+                    corpus.add(line % spelt)
+                    for lt, gt in spellings:
+                        corpus.add(line % ("%s!-- %s --%s" % (lt, spelt, gt)))
+                        corpus.add(line % ("%s!-- note --%s %s" % (lt, gt, spelt)))
         corpus = sorted(corpus)
-        self.assertEqual(len(corpus), 2835)
+        # 69 splits x 3 spellings x 3 line wrappers x 15 outer forms is 9315 lines; the plain
+        # "`TRUST`_PEER" split and the code-span spelling of "TRUST_PEER" are one line, so 45 repeat.
+        self.assertEqual(len(splits), 69)
+        self.assertEqual(len(corpus), 9270)
         start = time.perf_counter()
         rows = [(text, oracle(text), len(trust_peer_units("README.md", text))) for text in corpus]
         elapsed = time.perf_counter() - start
