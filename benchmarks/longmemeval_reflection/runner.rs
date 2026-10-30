@@ -346,8 +346,8 @@ impl RunReport {
 
     /// Render a human-readable markdown summary suitable for paste
     /// into a PR or issue comment. Only the bench binary calls this;
-    /// the integration-test wrapper checks `RunReport::check_targets`
-    /// directly, so we suppress `dead_code` when the runner is pulled
+    /// the integration-test wrapper calls `RunReport::check_targets_with`
+    /// (strict only under `AI_MEMORY_BENCH_STRICT=1`), so we suppress `dead_code` when the runner is pulled
     /// in from the test crate via `#[path]`.
     #[must_use]
     #[allow(dead_code)]

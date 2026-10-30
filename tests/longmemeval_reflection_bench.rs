@@ -24,6 +24,7 @@
 //! them here ensures the unit-test gate covers them.
 
 use ai_memory::models::MemoryKind;
+use std::io::Write as _;
 
 #[path = "../benchmarks/longmemeval_reflection/dataset.rs"]
 mod dataset;
@@ -124,9 +125,14 @@ fn smoke_run_meets_targets() {
     let report = run(&scenarios, &llm, &judge, true).expect("smoke run");
     let strict = std::env::var("AI_MEMORY_BENCH_STRICT").as_deref() == Ok("1");
     if !strict && report.throughput_per_min < runner::THROUGHPUT_FLOOR_PER_MIN {
-        println!(
-            "::notice::longmemeval_reflection throughput_per_min = {:.2} below the 10/min floor (advisory; set AI_MEMORY_BENCH_STRICT=1 to enforce)",
-            report.throughput_per_min
+        // Raw stdout handle: libtest captures `println!` of a passing
+        // test, which would hide the notice from the CI log (#8318).
+        // The leading newline puts the workflow command at column 0.
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "\n::notice::longmemeval_reflection throughput_per_min = {:.2} below the {:.0}/min floor (advisory; set AI_MEMORY_BENCH_STRICT=1 to enforce)",
+            report.throughput_per_min,
+            runner::THROUGHPUT_FLOOR_PER_MIN
         );
     }
     match report.check_targets_with(strict) {
