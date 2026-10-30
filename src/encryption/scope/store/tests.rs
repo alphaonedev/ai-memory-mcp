@@ -1251,3 +1251,52 @@ fn scope_key_marker_miss_warning_drops_paths_and_warns_once_8315() {
         "the second miss logs at debug; captured:\n{captured}"
     );
 }
+
+/// #8315 (code F3): the warn-once set is bounded. Drives more distinct
+/// failing namespaces than the cap through the logger and checks the set
+/// never outgrows the cap.
+#[test]
+fn marker_warned_set_is_bounded_8315() {
+    let dir = sandbox();
+    let store = open_store(dir.path());
+    let error = anyhow::anyhow!("synthetic reload failure");
+    for n in 0..(MARKER_WARNED_CAP * 2) {
+        let ns = format!("ns-{n}");
+        store.log_marker_reload_failure(&ns, &FileScopeKeyStore::slug(&ns), &error);
+    }
+    let len = store.marker_warned.lock().expect("warned set").len();
+    assert_eq!(len, MARKER_WARNED_CAP, "the warn-once set stops at the cap");
+    assert!(
+        store.marker_warned_full_logged.load(Ordering::Relaxed),
+        "saturation is reported once"
+    );
+}
+
+/// #8315 (code F3): the cap classification itself. A slug already in the set
+/// stays a repeat even when the set is full; a new slug past the cap is
+/// saturated and is not inserted.
+#[test]
+fn note_marker_failure_caps_the_set_8315() {
+    let mut warned = HashSet::new();
+    assert_eq!(
+        note_marker_failure(&mut warned, "a", 2),
+        MarkerFailureLog::First
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "a", 2),
+        MarkerFailureLog::Repeat
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "b", 2),
+        MarkerFailureLog::First
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "c", 2),
+        MarkerFailureLog::Saturated
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "b", 2),
+        MarkerFailureLog::Repeat
+    );
+    assert_eq!(warned.len(), 2, "a saturated slug is not inserted");
+}

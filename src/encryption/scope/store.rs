@@ -59,6 +59,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 use subtle::ConstantTimeEq as _;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -816,8 +817,40 @@ pub struct FileScopeKeyStore {
     /// Namespace slug to slot.
     cache: RwLock<HashMap<String, Slot>>,
     /// Slugs whose marker reload has already failed once (#8315): the first
-    /// failure warns, later ones for the same slug log at debug.
+    /// failure warns, later ones for the same slug log at debug. Bounded by
+    /// [`MARKER_WARNED_CAP`].
     marker_warned: Mutex<HashSet<String>>,
+    /// Set once the saturation of `marker_warned` has been logged, so the
+    /// notice is emitted once per store.
+    marker_warned_full_logged: AtomicBool,
+}
+
+/// Most distinct slugs `marker_warned` remembers (#8315, code F3): a store
+/// that keeps missing broken key dirs for ever-new namespaces must not grow
+/// the set without bound. Past the cap a new slug is logged at debug only.
+const MARKER_WARNED_CAP: usize = 1024;
+
+/// How `note_marker_failure` classifies one marker reload failure.
+#[derive(Debug, PartialEq, Eq)]
+enum MarkerFailureLog {
+    /// First failure of this slug: warn.
+    First,
+    /// Already seen: debug.
+    Repeat,
+    /// Set full and the slug is new: debug, and the saturation is reportable.
+    Saturated,
+}
+
+/// Record `slug` in `warned`, never growing it past `cap` entries.
+fn note_marker_failure(warned: &mut HashSet<String>, slug: &str, cap: usize) -> MarkerFailureLog {
+    if warned.contains(slug) {
+        MarkerFailureLog::Repeat
+    } else if warned.len() >= cap {
+        MarkerFailureLog::Saturated
+    } else {
+        warned.insert(slug.to_string());
+        MarkerFailureLog::First
+    }
 }
 
 /// Holds a `flock` until dropped (closing the descriptor releases it).
@@ -859,6 +892,7 @@ impl FileScopeKeyStore {
             actor: actor.to_string(),
             cache: RwLock::new(HashMap::new()),
             marker_warned: Mutex::new(HashSet::new()),
+            marker_warned_full_logged: AtomicBool::new(false),
         };
         store.refresh_from_ledger()?;
         Ok(store)
@@ -1195,29 +1229,42 @@ impl FileScopeKeyStore {
     /// new information. The namespace label is a `config`-class value (the
     /// `SealedForeign` refusal and the subscription spans already carry it);
     /// a poisoned warned-set lock answers "first", so a poisoned lock warns
-    /// rather than going quiet.
+    /// rather than going quiet. The set holds at most [`MARKER_WARNED_CAP`]
+    /// slugs; past it new slugs log at debug (code F3).
     fn log_marker_reload_failure(&self, namespace: &str, slug: &str, error: &anyhow::Error) {
         let kind = error
             .root_cause()
             .downcast_ref::<std::io::Error>()
             .map_or_else(|| "other".to_string(), |io| format!("{:?}", io.kind()));
-        let first = self
+        let outcome = self
             .marker_warned
             .lock()
-            .map(|mut warned| warned.insert(slug.to_string()))
-            .unwrap_or(true);
-        if first {
-            tracing::warn!(
+            .map(|mut warned| note_marker_failure(&mut warned, slug, MARKER_WARNED_CAP))
+            .unwrap_or(MarkerFailureLog::First);
+        match outcome {
+            MarkerFailureLog::First => tracing::warn!(
                 namespace,
                 kind,
                 "scope-key namespace marker reload failed; answering end-to-end"
-            );
-        } else {
-            tracing::debug!(
+            ),
+            MarkerFailureLog::Repeat => tracing::debug!(
                 namespace,
                 kind,
                 "scope-key namespace marker reload failed again; answering end-to-end"
-            );
+            ),
+            MarkerFailureLog::Saturated => {
+                if !self.marker_warned_full_logged.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(
+                        cap = MARKER_WARNED_CAP,
+                        "scope-key marker warned-set is full; later new namespaces log at debug only"
+                    );
+                }
+                tracing::debug!(
+                    namespace,
+                    kind,
+                    "scope-key namespace marker reload failed; answering end-to-end"
+                );
+            }
         }
     }
 

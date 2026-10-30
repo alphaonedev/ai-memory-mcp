@@ -1929,33 +1929,77 @@ mod tests {
         }
     }
 
-    /// #8315 (row 4): every tracked markdown doc that describes the
-    /// crypto-erase scope lists every erasable envelope version byte the code
-    /// reports ([`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`]), so an erase-describing
-    /// doc anywhere under `docs/` that names one byte as the whole set is
-    /// caught, not only the six anchors of
-    /// [`doc_erase_scope_names_erasable_versions_8278`]. The census is
-    /// `git ls-files -- docs` (tracked files, no committed list to rot): a
-    /// markdown file is in scope when it mentions crypto erase AND names at
-    /// least one erasable byte (a doc that names no byte makes no claim about
-    /// the set). Dated adjudication records under `docs/reviews/` and
-    /// `docs/audit/` describe a past tree and are skipped, the exclusion
-    /// `scripts/check-docs-vs-ssot.sh` applies to the same directories.
-    #[test]
-    fn docs_describing_erase_list_every_erasable_version_8315() {
-        const ERASE_PHRASES: [&str; 3] = [
-            "crypto-erase",
-            "crypto erase",
-            "envelope_is_crypto_erasable",
-        ];
-        const DATED_RECORDS: [&str; 2] = ["docs/reviews/", "docs/audit/"];
-        const ERASE_DOC: &str = "docs/security/crypto-erase.md";
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let listing = std::process::Command::new("git")
-            .args(["ls-files", "--", "docs"])
+    /// Stems that mark a doc as describing the crypto-erase scope, matched on
+    /// the lowercased text: `crypto-eras` covers crypto-erase, crypto-erasable
+    /// and crypto-erasure; `crypto eras` the spaced forms; `crypto_eras` the
+    /// identifiers (`envelope_is_crypto_erasable`,
+    /// `CRYPTO_ERASABLE_ENVELOPE_VERSIONS`); `cryptographic eras` the long
+    /// form (#8315, REVIEW-8323-code-r1 F2, REVIEW-8323-security-r1 L1).
+    const DOCS_CENSUS_ERASE_PHRASES: [&str; 4] = [
+        "crypto-eras",
+        "crypto eras",
+        "crypto_eras",
+        "cryptographic eras",
+    ];
+    /// Dated adjudication records describe a past tree and are skipped.
+    const DOCS_CENSUS_DATED_RECORDS: [&str; 2] = ["docs/reviews/", "docs/audit/"];
+    /// The doc the census must always reach inside a real checkout.
+    const DOCS_CENSUS_ERASE_DOC: &str = "docs/security/crypto-erase.md";
+    /// Printed when the census cannot run outside a checkout of this crate.
+    const DOCS_CENSUS_SKIP_REASON: &str = "not a git checkout of this crate (crates.io package or vendored tree); the docs census needs the tracked docs/ tree";
+
+    /// What one census run found: the docs it covered and the docs that
+    /// describe crypto erase without listing every erasable byte.
+    struct DocsCensus {
+        census: Vec<String>,
+        failures: Vec<String>,
+    }
+
+    /// Run `git <args>` in `root` with the repository-selecting environment
+    /// removed, so a hook-set `GIT_DIR` cannot redirect the census.
+    fn docs_census_git(
+        root: &std::path::Path,
+        args: &[&str],
+    ) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("git")
+            .args(args)
             .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
-            .expect("run `git ls-files -- docs`");
+    }
+
+    /// The #8315 row-4 census over the tracked docs of the checkout at
+    /// `root`. `Err(reason)` is a skip, returned only when `root` is not a git
+    /// checkout of this crate (no `docs/security/crypto-erase.md`, no `.git`,
+    /// git cannot start or fails, or the git toplevel is another tree, as in a
+    /// tree vendored inside a different repository): a crates.io package ships
+    /// `src/**` but not `docs/`. Inside a real checkout every failure is a
+    /// panic or a reported failure, never a skip. Only `.md` files are read:
+    /// the 76 tracked `.html` files are docs-site pages (redirect shells and
+    /// indexes), the authored erase-scope claims live in the markdown, and
+    /// the one html page matching the erase stems names no erasable byte
+    /// (excluded deliberately, not by omission).
+    fn docs_census_8315(root: &std::path::Path) -> Result<DocsCensus, String> {
+        if !root.join(DOCS_CENSUS_ERASE_DOC).is_file() || !root.join(".git").exists() {
+            return Err(DOCS_CENSUS_SKIP_REASON.to_string());
+        }
+        let toplevel = match docs_census_git(root, &["rev-parse", "--show-toplevel"]) {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            Ok(_) | Err(_) => return Err(DOCS_CENSUS_SKIP_REASON.to_string()),
+        };
+        match (
+            std::fs::canonicalize(&toplevel),
+            std::fs::canonicalize(root),
+        ) {
+            (Ok(top), Ok(here)) if top == here => {}
+            _ => return Err(DOCS_CENSUS_SKIP_REASON.to_string()),
+        }
+        let listing =
+            docs_census_git(root, &["ls-files", "--", "docs"]).expect("run `git ls-files -- docs`");
         assert!(
             listing.status.success(),
             "`git ls-files -- docs` failed: {}",
@@ -1966,21 +2010,27 @@ mod tests {
             .iter()
             .map(|version| format!("0x{version:02x}"))
             .collect();
-        let mut census: Vec<&str> = Vec::new();
+        let mut census: Vec<String> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         for rel in stdout.lines() {
-            if !rel.ends_with(".md") || DATED_RECORDS.iter().any(|dir| rel.starts_with(dir)) {
+            if !rel.ends_with(".md")
+                || DOCS_CENSUS_DATED_RECORDS
+                    .iter()
+                    .any(|dir| rel.starts_with(dir))
+            {
                 continue;
             }
             let text = std::fs::read_to_string(root.join(rel))
                 .unwrap_or_else(|e| panic!("{rel}: read: {e}"));
             let flat = text.to_lowercase();
-            if !ERASE_PHRASES.iter().any(|phrase| flat.contains(phrase))
+            if !DOCS_CENSUS_ERASE_PHRASES
+                .iter()
+                .any(|phrase| flat.contains(phrase))
                 || !bytes.iter().any(|byte| flat.contains(byte.as_str()))
             {
                 continue;
             }
-            census.push(rel);
+            census.push(rel.to_string());
             let missing: Vec<&str> = bytes
                 .iter()
                 .filter(|byte| !flat.contains(byte.as_str()))
@@ -1993,16 +2043,125 @@ mod tests {
                 ));
             }
         }
+        Ok(DocsCensus { census, failures })
+    }
+
+    /// #8315 (row 4): every tracked markdown doc that describes the
+    /// crypto-erase scope lists every erasable envelope version byte the code
+    /// reports ([`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`]), so an erase-describing
+    /// doc anywhere under `docs/` that names one byte as the whole set is
+    /// caught, not only the six anchors of
+    /// [`doc_erase_scope_names_erasable_versions_8278`]. The census is
+    /// `git ls-files -- docs` (tracked files, no committed list to rot): a
+    /// markdown file is in scope when it mentions crypto erase AND names at
+    /// least one erasable byte (a doc that names no byte makes no claim about
+    /// the set). Dated adjudication records under `docs/reviews/` and
+    /// `docs/audit/` describe a past tree and are skipped, the exclusion
+    /// `scripts/check-docs-vs-ssot.sh` applies to the same directories. Only
+    /// `.md` files are read; the 76 tracked `.html` files are skipped (see
+    /// [`docs_census_8315`]). Outside a git checkout of this crate the test
+    /// prints one `skipped: <reason>` line and returns.
+    #[test]
+    fn docs_describing_erase_list_every_erasable_version_8315() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let found = match docs_census_8315(root) {
+            Ok(found) => found,
+            Err(reason) => {
+                eprintln!("skipped: {reason}");
+                return;
+            }
+        };
+        let bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect();
         assert!(
-            census.contains(&ERASE_DOC),
-            "the census must reach {ERASE_DOC}; it found {census:?}"
+            found.census.iter().any(|rel| rel == DOCS_CENSUS_ERASE_DOC),
+            "the census must reach {DOCS_CENSUS_ERASE_DOC}; it found {:?}",
+            found.census
         );
         assert!(
-            failures.is_empty(),
+            found.failures.is_empty(),
             "#8315: every erase-describing doc must list every byte of \
-             CRYPTO_ERASABLE_ENVELOPE_VERSIONS ({}); census {census:?}:\n{}",
+             CRYPTO_ERASABLE_ENVELOPE_VERSIONS ({}); census {:?}:\n{}",
             bytes.join(", "),
-            failures.join("\n")
+            found.census,
+            found.failures.join("\n")
+        );
+    }
+
+    /// #8315 (REVIEW-8323-code-r1 F1 / security M1): outside a git checkout of
+    /// this crate the census skips with a reason instead of panicking: an
+    /// empty tree, a tree with the doc but no `.git`, and a tree whose `.git`
+    /// is not a repository (git then finds another toplevel, or none).
+    #[test]
+    fn docs_census_skips_outside_a_checkout_8315() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let reason = docs_census_8315(empty.path())
+            .err()
+            .expect("empty tree skips");
+        assert!(reason.contains("not a git checkout"), "{reason}");
+
+        let docs_only = tempfile::tempdir().expect("tempdir");
+        let doc = docs_only.path().join(DOCS_CENSUS_ERASE_DOC);
+        std::fs::create_dir_all(doc.parent().expect("doc parent")).expect("mkdir docs");
+        std::fs::write(&doc, "crypto-erase 0x03 only").expect("write doc");
+        assert!(docs_census_8315(docs_only.path()).is_err(), "no .git skips");
+
+        std::fs::create_dir(docs_only.path().join(".git")).expect("fake .git");
+        assert!(
+            docs_census_8315(docs_only.path()).is_err(),
+            "a .git that is not a repository skips"
+        );
+    }
+
+    /// #8315 (REVIEW-8323-code-r1 F1 and F2 / security M1 and L1): inside a
+    /// real checkout the census still runs and still fails, and it now
+    /// catches a doc that says only "crypto-erasable" (the doc vocabulary
+    /// itself, which the old `crypto-erase` stems missed).
+    #[test]
+    fn docs_census_asserts_inside_a_checkout_8315() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let init = docs_census_git(repo.path(), &["init", "-q"]).expect("git init");
+        assert!(init.status.success(), "git init failed");
+        let all_bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect();
+        let doc = repo.path().join(DOCS_CENSUS_ERASE_DOC);
+        std::fs::create_dir_all(doc.parent().expect("doc parent")).expect("mkdir docs");
+        std::fs::write(&doc, format!("crypto-erase: {}", all_bytes.join(", "))).expect("erase doc");
+        for (name, text) in [
+            (
+                "docs/probe-a.md",
+                "Only 0x03 envelopes are crypto-erasable.",
+            ),
+            ("docs/probe-b.md", "Only 0x03 rows pass crypto_erasable()."),
+            ("docs/probe-c.md", "Cryptographic erasure covers only 0x03."),
+            ("docs/probe-d.md", "Crypto-erasure applies to 0x03 alone."),
+            ("docs/probe-e.md", "Crypto erase is listed for 0x03 only."),
+        ] {
+            std::fs::write(repo.path().join(name), text).expect("probe doc");
+        }
+        let add = docs_census_git(repo.path(), &["add", "docs"]).expect("git add");
+        assert!(add.status.success(), "git add failed");
+        let found = docs_census_8315(repo.path()).expect("a real checkout is not skipped");
+        assert!(found.census.iter().any(|rel| rel == DOCS_CENSUS_ERASE_DOC));
+        for name in ["a", "b", "c", "d", "e"] {
+            let rel = format!("docs/probe-{name}.md");
+            assert!(
+                found.failures.iter().any(|f| f.starts_with(&rel)),
+                "{rel} must fail the census; failures: {:?}",
+                found.failures
+            );
+        }
+        assert!(
+            !found
+                .failures
+                .iter()
+                .any(|f| f.starts_with(DOCS_CENSUS_ERASE_DOC)),
+            "the complete doc must pass: {:?}",
+            found.failures
         );
     }
 }
