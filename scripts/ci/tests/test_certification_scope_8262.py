@@ -1194,6 +1194,17 @@ def _fold_mention(text):
 
 
 def _mention_views(text):
+    """The views of _mention_views_core(); round 23 (security r22 LOW-1): when the line holds an HTML
+    comment opener, also the views of the line with the comment delimiters blanked, so a markdown
+    spelling of the identifier inside a one-line comment reads as it does outside one. The union
+    never counts fewer than the core views alone."""
+    views = _mention_views_core(text)
+    if "<!--" in text:
+        views += _mention_views_core(text.replace("<!--", " ").replace("-->", " "))
+    return views
+
+
+def _mention_views_core(text):
     """_views() with one fold: the folded view, it without tags and emphasis, and a rendered view
     (comments, tags and link syntax removed after unescaping, folded again if an entity remains).
     A dash between "trust" and "peer" is read as "-" after each fold (round 21) and, round 22, as
@@ -2122,6 +2133,24 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(count("Enable XTRUST<!-- x -->–PEER now."), 0)
         self.assertEqual(count("Enable TRUST<!-- x -->–PEER—now."), 1)
         self.assertEqual(count("Enable TRUST<!-- x --> PEER now."), 0)
+        # Round 23 (security r22 LOW-1): a markdown spelling of the identifier inside a one-line HTML
+        # comment counts as it does outside one. The comment-blanked views are read as well.
+        interior = ("**TRUST**_PEER", "TRUST_`PEER`", "TRUST\\_PEER", "[TRUST](https://example.com/a)_PEER",
+                    "TRUST<b>_</b>PEER")
+        dashed = tuple(row.replace("_", "–", 1) for row in interior)
+        self.assertEqual(len(dashed), len(interior))
+        for row in interior + dashed:
+            for wrap in ("<!-- %s -->", "| Mode | Note |\n| --- | --- |\n| a | <!-- %s --> |",
+                         "- <!-- %s -->", "Enable <!-- %s --> now."):
+                self.assertEqual(count(wrap % row), 1, wrap % row)
+        # Controls: a longer word, a missing half, an identifier split across the comment delimiter
+        # (no half is complete on either view), and the neighbouring characters survive.
+        for text in ("<!-- TRUST_PEERS -->", "<!-- **TRUST**_PEERS -->", "<!-- XTRUST_`PEER` -->",
+                     "<!-- TRUST_ -->PEER", "TRUST<!-- _ -->PEER", "<!-- TRUST --><!-- _PEER -->",
+                     "<!-- TRUST<!-- -->_PEER -->", "<!-- TRUST *-* PEER -->"):
+            self.assertEqual(count(text), 0, text)
+        self.assertEqual(count("Enable <!-- **TRUST**_PEER --> now."), 1)
+        self.assertEqual(count("Enable <!-- **TRUST**_PEERS --> now."), 0)
 
     def test_trust_peer_dash_position_matrix_8262(self):
         # Round 22 (code r21 MEDIUM-1): every dash of the class, in every position relative to a
