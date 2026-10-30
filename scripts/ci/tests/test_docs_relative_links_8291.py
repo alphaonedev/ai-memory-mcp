@@ -1,12 +1,17 @@
 """Guard for #8291: every relative markdown link in the public docs resolves.
 
 Walks CHANGELOG.md, SECURITY.md, README.md, CLAUDE.md and the docs
-subtrees in GUARDED_DOCS_SUBDIRS, skips fenced code blocks and inline code spans (so grammar examples are not
-read as links), and asserts that each relative link target exists inside the
-checkout. A target that resolves outside the repository root (a ``..`` climb or
-a symlinked directory pointing out) is broken for every reader of the
-repository, and a markdown file reached through a symlink is content outside
-the checkout, so both are refused.
+subtrees in GUARDED_DOCS_SUBDIRS, skips fenced code blocks and inline code
+spans (so grammar examples are not read as links), and asserts that each
+relative link target exists inside the checkout.
+
+Symlink behaviour: a markdown source that is itself a symlink is skipped.
+Directory symlinks are followed for existence, and containment is decided by
+``resolve()`` against the root, so a symlink that points outside the checkout
+is broken, while a link to a symlinked markdown file that stays inside the
+checkout resolves. A protocol-relative ``//host/x`` target is refused, and ``..`` is
+normalised lexically (never through a directory symlink), so a climb out of
+the root is refused on every host.
 
 Lives under scripts/ci/tests so the CI discover root runs it.
 
@@ -17,6 +22,7 @@ import errno
 import os
 import re
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +36,7 @@ GUARDED_DOCS_SUBDIRS = ("docs/security",)
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 CODE_SPAN_RE = re.compile(r"(`+)(.+?)\1")
 LINK_RE = re.compile(r"\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+TRAILING_SLASH_REASON = "trailing slash on a file target"
 EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "#", "tel:", "ftp://")
 
 
@@ -65,21 +72,28 @@ def inside_state(root, candidate):
     """Return ``(state, detail)`` for ``candidate`` against ``root``.
 
     ``state`` is ``"file"`` or ``"dir"`` when the path exists and its real
-    location is inside ``root``, ``"missing"`` when it does not exist or leaves
-    the root, and ``"unresolvable"`` (``detail`` = errno name) when the
-    operating system refuses the path, for example a segment longer than
-    NAME_MAX.
+    location is inside ``root``, ``"missing"`` when it does not exist (ENOENT,
+    ENOTDIR) or leaves the root, and ``"unresolvable"`` (``detail`` = errno
+    name, or ``OSError`` when the error carries none) when the operating
+    system refuses the path, for example a segment longer than NAME_MAX or a
+    symlink loop. ``os.stat`` is probed directly because ``Path.is_dir`` and
+    ``Path.exists`` swallow those errors on Python 3.14.
     """
     try:
         real = candidate.resolve()
         real.relative_to(root.resolve())
-        if real.is_dir():
-            return "dir", ""
-        if real.exists():
-            return "file", ""
+        mode = os.stat(str(real)).st_mode
+        return ("dir" if stat.S_ISDIR(mode) else "file"), ""
+    except (FileNotFoundError, NotADirectoryError):
+        pass
     except OSError as err:
-        return "unresolvable", errno.errorcode.get(err.errno, "EIO")
-    except (RuntimeError, ValueError):
+        if err.errno is None:
+            return "unresolvable", "OSError"
+        return "unresolvable", errno.errorcode.get(err.errno, "OSError")
+    except RuntimeError:
+        # Python < 3.13 reports a symlink loop from resolve() as RuntimeError.
+        return "unresolvable", "ELOOP"
+    except ValueError:
         pass
     return "missing", ""
 
@@ -141,8 +155,17 @@ def relative_links(path):
             yield number, target
 
 
+def is_directory_form(target_path):
+    """True when the raw target ends in ``/``, ``/.`` or ``/..`` (it names a directory)."""
+    return target_path.split("/")[-1] in ("", ".", "..")
+
+
 def link_problem(root, path, target_path):
-    """Return None when the link resolves, else the reason it is broken ("" = missing)."""
+    """Return None when the link resolves, else the reason it is broken ("" = missing).
+
+    The trailing-slash rule uses the directory form of the raw target and runs
+    before the ``.html`` sibling check.
+    """
     if is_protocol_relative(target_path):
         return "protocol-relative target"
     if climbs_out_of_root(root, path, target_path):
@@ -151,15 +174,16 @@ def link_problem(root, path, target_path):
     state, detail = inside_state(root, resolved)
     if state == "unresolvable":
         return "unresolvable target: " + detail
+    directory_form = is_directory_form(target_path)
+    if state == "file" and directory_form:
+        return TRAILING_SLASH_REASON
     if state == "missing" and resolved.suffix == ".html":
         # The docs site renders each page as .html; a link to the
         # rendered form of an existing .md page is not broken.
         if exists_inside(root, resolved.with_suffix(".md")):
-            return None
+            return TRAILING_SLASH_REASON if directory_form else None
     if state == "missing":
         return ""
-    if state == "file" and target_path.endswith("/"):
-        return "trailing slash on a file target"
     return None
 
 
@@ -196,7 +220,7 @@ class DocsRelativeLinksTest(unittest.TestCase):
 
 
 class LinkContainmentTest(unittest.TestCase):
-    """#8291: link targets are confined to the checkout; symlinks are not followed."""
+    """#8291: link targets are confined to the checkout by resolve(); a symlinked .md source is skipped."""
 
     def setUp(self):
         scratch = REPO_ROOT / ".local-runs"
@@ -286,6 +310,51 @@ class LinkContainmentTest(unittest.TestCase):
             broken_links(self.root),
             ["docs/security/a.md:2 ../../README.md/ (trailing slash on a file target)"],
         )
+
+    def test_symlink_loop_and_missing_errno_keep_their_reason_8291_r5(self):
+        (self.guarded / "loop").symlink_to("loop")
+        self.write("a.md", "[a](loop)\n[b](nope.md)\n[c](a.md/x)\n")
+        self.assertEqual(
+            broken_links(self.root),
+            [
+                "docs/security/a.md:1 loop (unresolvable target: ELOOP)",
+                "docs/security/a.md:2 nope.md",
+                "docs/security/a.md:3 a.md/x",
+            ],
+        )
+        real_stat = os.stat
+
+        def no_errno(path, *args, **kwargs):
+            raise OSError("no errno")
+
+        os.stat = no_errno
+        try:
+            state = inside_state(self.root, self.guarded / "a.md")
+        finally:
+            os.stat = real_stat
+        self.assertEqual(state, ("unresolvable", "OSError"))
+
+    def test_trailing_slash_rule_survives_dot_segments_and_html_siblings_8291_r5(self):
+        (self.root / "README.md").write_text("# root\n", encoding="utf-8")
+        (self.guarded / "page.md").write_text("# page\n", encoding="utf-8")
+        targets = ["../../README.md/.", "../../README.md/x/..", "page.html/"]
+        self.write("a.md", "".join("[l](%s)\n" % t for t in targets))
+        self.assertEqual(
+            broken_links(self.root),
+            [
+                "docs/security/a.md:%d %s (trailing slash on a file target)" % (n, t)
+                for n, t in enumerate(targets, start=1)
+            ],
+        )
+
+
+class DocstringStatesBehaviourTest(unittest.TestCase):
+    """#8291: the module docstring names the real symlink and path behaviour."""
+
+    def test_docstring_names_each_behaviour(self):
+        doc = (__doc__ or "").lower()
+        for word in ("symlink", "//", "..", "resolve"):
+            self.assertIn(word, doc)
 
 
 if __name__ == "__main__":
