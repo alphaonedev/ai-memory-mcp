@@ -1166,3 +1166,83 @@ fn scope_key_record_with_another_recovery_fingerprint_is_refused_8278() {
         ScopeKeyStoreError::AuditChainMismatch { .. }
     ));
 }
+
+/// #8315 (row 2, PR #8279 round-5 residue): the cache-miss warning names the
+/// namespace label and the error kind only, never the key-directory path or
+/// an entry path (which carries the namespace hash), and a second miss of the
+/// same key logs at debug instead of warning again. Captures `tracing` output
+/// through a thread-local subscriber, so it runs alone in a re-exec'd child
+/// (#4090).
+#[cfg(unix)]
+#[test]
+fn scope_key_marker_miss_warning_drops_paths_and_warns_once_8315() {
+    if crate::test_support::run_env_isolated_child_or_spawn(
+        "encryption::scope::store::tests::scope_key_marker_miss_warning_drops_paths_and_warns_once_8315",
+    ) {
+        return;
+    }
+    if running_as_root() {
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o000 cannot deny the lock"
+        );
+        return;
+    }
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = SharedBuf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = cold_store_after_mint(dir.path());
+    let _mode = DirModeGuard::set(early.scope_dir(), 0o000);
+    assert!(early.namespace_is_e2e(NS), "first miss answers end-to-end");
+    assert!(early.namespace_is_e2e(NS), "second miss answers end-to-end");
+
+    let captured = String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+    let warnings: Vec<&str> = captured
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains("marker reload failed"))
+        .collect();
+    let Some((first, rest)) = warnings.split_first() else {
+        panic!("the first miss must warn; captured:\n{captured}");
+    };
+    assert!(
+        rest.is_empty(),
+        "a second miss of the same key must not warn again: {rest:?}"
+    );
+    let key_dir = dir.path().display().to_string();
+    assert!(
+        !first.contains(&key_dir),
+        "the warning must not carry the key-directory path: {first}"
+    );
+    assert!(
+        !first.contains(&FileScopeKeyStore::slug(NS)),
+        "the warning must not carry the namespace hash: {first}"
+    );
+    assert!(
+        first.contains(NS) && first.contains("PermissionDenied"),
+        "the warning names the namespace label and the error kind: {first}"
+    );
+    assert!(
+        captured
+            .lines()
+            .any(|line| line.contains("DEBUG") && line.contains("marker reload failed again")),
+        "the second miss logs at debug; captured:\n{captured}"
+    );
+}

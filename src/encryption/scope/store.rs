@@ -57,9 +57,9 @@ use hkdf::Hkdf;
 use ledger::{Change, NamespaceLedger};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use subtle::ConstantTimeEq as _;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -815,6 +815,9 @@ pub struct FileScopeKeyStore {
     actor: String,
     /// Namespace slug to slot.
     cache: RwLock<HashMap<String, Slot>>,
+    /// Slugs whose marker reload has already failed once (#8315): the first
+    /// failure warns, later ones for the same slug log at debug.
+    marker_warned: Mutex<HashSet<String>>,
 }
 
 /// Holds a `flock` until dropped (closing the descriptor releases it).
@@ -855,6 +858,7 @@ impl FileScopeKeyStore {
             key_dir,
             actor: actor.to_string(),
             cache: RwLock::new(HashMap::new()),
+            marker_warned: Mutex::new(HashSet::new()),
         };
         store.refresh_from_ledger()?;
         Ok(store)
@@ -1182,6 +1186,41 @@ impl FileScopeKeyStore {
         Ok(e2e)
     }
 
+    /// #8315: log a marker reload failure without the paths its error chain
+    /// carries. Warns on the first failure of `slug`, logs at debug on every
+    /// later one, so a store that keeps missing a broken key dir does not
+    /// warn on every query. The warned set is per store (the `config.rs`
+    /// one-shot idiom is a process-global `Once`) because the cache the miss
+    /// falls through is per store too, and a second store's first miss is
+    /// new information. The namespace label is a `config`-class value (the
+    /// `SealedForeign` refusal and the subscription spans already carry it);
+    /// a poisoned warned-set lock answers "first", so a poisoned lock warns
+    /// rather than going quiet.
+    fn log_marker_reload_failure(&self, namespace: &str, slug: &str, error: &anyhow::Error) {
+        let kind = error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .map_or_else(|| "other".to_string(), |io| format!("{:?}", io.kind()));
+        let first = self
+            .marker_warned
+            .lock()
+            .map(|mut warned| warned.insert(slug.to_string()))
+            .unwrap_or(true);
+        if first {
+            tracing::warn!(
+                namespace,
+                kind,
+                "scope-key namespace marker reload failed; answering end-to-end"
+            );
+        } else {
+            tracing::debug!(
+                namespace,
+                kind,
+                "scope-key namespace marker reload failed again; answering end-to-end"
+            );
+        }
+    }
+
     /// The verified ledger of `namespace` straight from disk (the caller
     /// holds the exclusive lock).
     fn load_namespace_locked(&self, namespace: &str) -> Result<NamespaceLedger> {
@@ -1351,14 +1390,13 @@ impl ScopeKeyStore for FileScopeKeyStore {
             }
         }
         // R17: a miss re-reads the cold store; a read error is end-to-end.
-        // R4-I3: the fail-closed answer is logged with its cause (operation
-        // and error only, never key material), per ERRORS-18.
+        // R4-I3 / #8315: the fail-closed answer is logged with the namespace
+        // label and the root cause's kind only: never the key-directory or an
+        // entry path (which carries the namespace hash), never key material
+        // or ledger contents (ERRORS-18). The first miss of a slug warns;
+        // later misses of the same slug log at debug.
         self.reload_marker(&slug)
-            .inspect_err(|e| {
-                tracing::warn!(
-                    "scope-key namespace marker reload failed; answering end-to-end: {e:#}"
-                );
-            })
+            .inspect_err(|e| self.log_marker_reload_failure(namespace, &slug, e))
             .unwrap_or(true)
     }
 
