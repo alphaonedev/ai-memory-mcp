@@ -30,8 +30,10 @@ HTML and is not in the subset. The rules:
      not carry a fence, a heading-like line, a list item, an HTML block or indented code; lazy
      continuation is refused. An HTML block line is refused except a one-line "<!-- ... -->" comment
      (exactly one comment per line, nothing before the opener or after the closer, no "--" inside,
-     no nested "<!--"; "--->" and "<!-- -- -->" are refused) and the measured README.md lines of
-     HTML_BLOCK_ALLOW, each followed only by a blank line or another allowed line. YAML front matter is read only at the top of a file.
+     no nested "<!--"; "--->" is refused except as the close of the empty comment "<!---->", which
+     is accepted; "<!-- -- -->" is refused) and the measured README.md lines of HTML_BLOCK_ALLOW,
+     each followed only by a blank line or another allowed line. YAML front matter is read only at
+     the top of a file.
   4. The IN, PENDING, UNLANDED and NOT statement blocks hold only list items ("-", "*", "+" or an
      ordered marker at column 0) and blank lines: one child level (2-4 spaces), continuation lines
      at the item content column, no second paragraph, no other block; every item is digest-pinned.
@@ -61,19 +63,20 @@ list marker); a setext heading (the paragraph above a line of only "=" or only "
 blockquote depth, indented under a list item when the paragraph is one; the paragraph lines plus
 the underline are the heading); and an HTML heading element <h1> to <h6> opened and closed on one
 line. A thematic break ("---", "***" or "___", spaces allowed, not under paragraph text when it is
-dashes) ends the paragraph; it is not a heading and does not end a section. A pipe line starts a table only when the next line is a
-delimiter row, and each table row is its own unit; a list item starts a new paragraph, except an
-ordered item numbered other than 1, which cannot interrupt a paragraph that did not start with a
-list item. Inside a paragraph the splitter ends a sentence at ".", "!" or "?" plus up to four
-closers (quote, ")", "]", "*", "_", backtick) plus whitespace; it is one bounded regex, linear and
-deterministic. A sentence is subject-bearing when it carries a subject token, or a paired stem
-while a pair word is in context. The context is the whole paragraph (for a table row: the row and
-the table's header row) plus the nearest preceding heading (any of the three forms) at any level. The unit is that sentence
-plus one sentence on each side, inside the paragraph; overlapping or touching windows merge. A
-paragraph whose subject straddles a sentence boundary is gated whole. Unit text is compared with
-whitespace runs collapsed, so a reflow is not a change. Units are cut from the text, so every
-surface is covered: markdown prose, table rows, list items, fenced code, reference-link
-definitions, footnotes, HTML comments, and in docs/encryption.html text nodes and every attribute.
+dashes) ends the paragraph; it is not a heading and does not end a section. A pipe line starts a
+table only when the next line is a delimiter row, and each table row is its own unit; a list item
+starts a new paragraph, except an ordered item numbered other than 1, which cannot interrupt a
+paragraph that did not start with a list item. Inside a paragraph the splitter ends a sentence at
+".", "!" or "?" plus up to four closers (quote, ")", "]", "*", "_", backtick) plus whitespace; it is
+one bounded regex, linear and deterministic. A sentence is subject-bearing when it carries a subject
+token, or a paired stem while a pair word is in context. The context is the whole paragraph (for a
+table row: the row and the table's header row) plus the nearest preceding heading (any of the three
+forms) at any level. The unit is that sentence plus one sentence on each side, inside the paragraph;
+overlapping or touching windows merge. A paragraph whose subject straddles a sentence boundary is
+gated whole. Unit text is compared with whitespace runs collapsed, so a reflow is not a change.
+Units are cut from the text, so every surface is covered: markdown prose, table rows, list items,
+fenced code, reference-link definitions, footnotes, HTML comments, and in docs/encryption.html text
+nodes and every attribute.
 
 Headings. A heading line that carries a subject token, or a paired stem with a pair word in the
 heading itself, in the nearest preceding heading or implied by the statement subsection, is
@@ -611,15 +614,15 @@ def _lex(lines):
 
     The container is the blockquote depth plus the content column of the innermost open list item
     at that depth. A fence opens on 0-3 spaces relative to the container, also right after a list
-    marker ("- ```"), never with a backtick in a backtick fence's info string. It closes on a line at
-    the same depth, 0-3 spaces relative to the container, of the same character, at least as long,
-    with only whitespace after it; a deeper-quoted or 4+-indented line is content. It also closes
-    when its container ends: a line with fewer blockquote markers, or a non-blank line indented less
-    than the list item's content column. Outside a paragraph a line 4+ spaces past the container is
-    indented code. A list item ends at a non-blank line indented less than its content column unless
-    the line continues a paragraph lazily. A line with more blockquote markers than the fence's
-    depth is fence content only when its first extra marker sits at or past the item's content column
-    (round 17)."""
+    marker ("- ```"), never with a backtick in a backtick fence's info string. It closes on a line
+    at the same depth, 0-3 spaces relative to the container, of the same character, at least as
+    long, with only whitespace after it; a deeper-quoted or 4+-indented line is content. It also
+    closes when its container ends: a line with fewer blockquote markers, or a non-blank line
+    indented less than the list item's content column. Outside a paragraph a line 4+ spaces past
+    the container is indented code. A list item ends at a non-blank line indented less than its
+    content column unless the line continues a paragraph lazily. A line with more blockquote
+    markers than the fence's depth is fence content only when its first extra marker sits at or
+    past the item's content column (round 17)."""
     code, bodies, unclosed, indented_code = [], [], [], set()
     items = []  # (blockquote depth, content column) of each open list item, outermost first
     fence = None  # [character, length, depth, container column, opening line]
@@ -835,9 +838,9 @@ def _line_heading(body):
 
 
 def html_heading_misuse(text, markdown=True):
-    """1-based line numbers of the lines outside code (fenced or indented) that open an HTML heading element
-    ("<h1>" to "<h6>") but are not the one-line heading form _line_heading() reads (round 14: a
-    split, wrapped or trailed element is refused rather than read without heading context)."""
+    """1-based line numbers of the lines outside code (fenced or indented) that open an HTML heading
+    element ("<h1>" to "<h6>") but are not the one-line heading form _line_heading() reads (round
+    14: a split, wrapped or trailed element is refused rather than read without heading context)."""
     lines = [normalise(x) for x in text.split("\n")]
     code, bodies, _, _ = _reading(lines, markdown)
     return [n + 1 for n, line in enumerate(lines)
@@ -1141,10 +1144,10 @@ def _changelog_entry(text):
 
 def trust_peer_mentions(root=ROOT):
     """(path, unit) for every census unit of a gated file that names the sync trust-peer bypass, in
-    any spelling the folded views read (round 16, R3). Round 17 (code r13 LOW-1, security r15 LOW-1):
-    the unit is the paragraph, list item or table row holding the match, flattened, so a sentence
-    next to a reviewed mention (a conditional endorsement that does not repeat the name) is reviewed
-    with it. An HTML page is read as its plain text."""
+    any spelling the folded views read (round 16, R3). Round 17 (code r13 LOW-1, security r15
+    LOW-1): the unit is the paragraph, list item or table row holding the match, flattened, so a
+    sentence next to a reviewed mention (a conditional endorsement that does not repeat the name)
+    is reviewed with it. An HTML page is read as its plain text."""
     return [(rel, unit) for rel in SINGLE_SOURCE_FILES
             for unit in trust_peer_units(rel, (root / rel).read_text(encoding="utf-8"))]
 
@@ -1173,21 +1176,31 @@ def trust_peer_units(rel, raw):
     return out
 
 
-# Round 20 (security r19 LOW-1): the dashes that rounds 6-7 treat as separators for the end-to-end term
-# (U+2010-U+2015, U+2212) and the other dash forms are the "-" of the trust-peer identifier.
-_UNICODE_DASH_RE = re.compile("[\u2010-\u2015\u2212\uFE58\u2E3A]")
+# Round 21 (code r20 MEDIUM-1, security r20 LOW-1, code r20 LOW-1): the dash that spells the "-" of
+# the trust-peer identifier is every code point of Unicode category Pd plus U+2212 MINUS SIGN, derived
+# from unicodedata at import time. Only a dash BETWEEN "trust" and "peer" is rewritten, after each
+# entity-decoding fold(); a dash after the identifier is left alone so the lookahead of TRUST_PEER_RE
+# still sees it.
+_DASH_CLASS = "".join(re.escape(chr(c)) for c in range(sys.maxunicode + 1)
+                      if c == 0x2212 or unicodedata.category(chr(c)) == "Pd")
+_TRUST_DASH_RE = re.compile("(?<=trust)[%s](?=peer)" % _DASH_CLASS)
+
+
+def _fold_mention(text):
+    """fold() followed by the narrow trust-peer dash fold (round 21)."""
+    return _TRUST_DASH_RE.sub("-", fold(text))
 
 
 def _mention_views(text):
     """_views() with one fold: the folded view, it without tags and emphasis, and a rendered view
     (comments, tags and link syntax removed after unescaping, folded again if an entity remains).
-    A Unicode dash is read as "-" first (round 20)."""
-    low = fold(_UNICODE_DASH_RE.sub("-", text))
+    A dash between "trust" and "peer" is read as "-" after each fold (round 21)."""
+    low = _fold_mention(text)
     out = low
     if "<" in out:
         out = _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(out)))
     if "&" in out:
-        out = fold(out)
+        out = _fold_mention(out)
     if "[" in out:
         out = _REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", out)).replace("[", "").replace("]", "")
     return low, _MARKUP_RE.sub("", _TAG_RE.sub("", low)), _MARKUP_RE.sub("", out), _keep_underscores(out)
@@ -1199,10 +1212,10 @@ _EDGE_US_RE = re.compile(r"(?<![a-z0-9])_+|_+(?![a-z0-9])")
 
 
 def _keep_underscores(text):
-    """Round 19 (security r17 LOW-1): the rendered view with markdown backslash escapes undone and the
-    emphasis and code delimiters (*, backtick, ~, and underscores that are not inside a word) removed, an
-    underscore between two word characters kept: TRUST\\_PEER, TRUST_**PEER** and TRUST_`PEER` read as
-    trust_peer."""
+    """Round 19 (security r17 LOW-1): the rendered view with markdown backslash escapes undone and
+    the emphasis and code delimiters (*, backtick, ~, and underscores that are not inside a word)
+    removed, an underscore between two word characters kept: TRUST\\_PEER, TRUST_**PEER** and
+    TRUST_`PEER` read as trust_peer."""
     return _EDGE_US_RE.sub("", _EMPH_RE.sub("", _ESCAPE_RE.sub(r"\1", text)))
 
 
@@ -1474,11 +1487,12 @@ def _gb_body_problems(body, first, name, rel):
 
 def block_text_problems(rel, text):
     """Round 18 rule 4 (security r16 MEDIUM-1): each of the four statement blocks is its fixed lead
-    (BLOCK_LEADS, one entry per line, the first entry is the rest of the marker line), one blank line,
-    then only list items and blank lines: a "-", "*", "+" or ordered marker at column 0 plus one space
-    and inline text, at most one nesting level (a child item indented from the parent's content column
-    up to 4 spaces), continuation lines directly under an item or continuation at exactly that item's
-    content column. The NOT block ends at the STATEMENT_END rule. Anything else is refused as
+    (BLOCK_LEADS, one entry per line, the first entry is the rest of the marker line), one blank
+    line, then only list items and blank lines: a "-", "*", "+" or ordered marker at column 0 plus
+    one space and inline text, at most one nesting level (a child item indented from the parent's
+    content column up to 4 spaces), continuation lines directly under an item or continuation at
+    exactly that item's content column. The NOT block ends at the STATEMENT_END rule. Anything
+    else is refused as
     "unsupported markdown construct: <construct> in the <block> block at <file>:<line>"."""
     lines = text.split("\n")
     starts = {}
@@ -2057,6 +2071,34 @@ class CertificationScope8262(unittest.TestCase):
             text = "Enable %s on every peer." % token
             self.assertEqual(trust_peer_units("README.md", text), [], text)
 
+    def test_trust_peer_dash_between_halves_only_8262(self):
+        # Round 21 (code r20 MEDIUM-1, security r20 LOW-1, code r20 LOW-1): only the dash between
+        # "trust" and "peer" is read as "-"; a dash after the identifier stays visible to the
+        # lookahead, and the identifier is a mention whatever follows it.
+        def count(text, rel="README.md"):
+            return len(trust_peer_units(rel, text))
+        after = ("Never enable TRUST_PEER—it disables the attribution gate.",
+                 "Set TRUST_PEER–only for a lab mesh.")
+        for text in after:
+            self.assertEqual(count(text), 1, text)
+            self.assertEqual(count("| Mode | Note |\n| --- | --- |\n| a | %s |" % text), 1, text)
+            self.assertEqual(count("- %s" % text), 1, text)
+        self.assertEqual(count("Enable TRUST–PEER—now."), 1)
+        self.assertEqual(count("Enable TRUST–PEERS now."), 0)
+        for spelling in ("&ndash;", "&mdash;", "&minus;", "&hyphen;", "&dash;", "&horbar;", "&#8208;",
+                         "&#x2010;", "&#8211;", "&#8212;", "&#8722;", "︱", "︲"):
+            self.assertEqual(count("Enable TRUST%sPEER now." % spelling), 1, spelling)
+        everyone = [chr(c) for c in range(0x110000)
+                    if unicodedata.category(chr(c)) == "Pd" or c == 0x2212]
+        self.assertGreater(len(everyone), 20)
+        for dash in everyone:
+            self.assertEqual(count("Enable TRUST%sPEER now." % dash), 1, "U+%04X" % ord(dash))
+        # Controls: a dash elsewhere in the line is not rewritten; ASCII is unchanged; a dash inside
+        # an HTML comment reads as the same spelling outside it.
+        self.assertEqual(count("A re‐check of the mesh and a peer—note."), 0)
+        self.assertEqual(count("Enable TRUST_PEER now."), 1)
+        self.assertEqual(count("<!-- TRUST–PEER -->"), count("<!-- TRUST_PEER -->"))
+
     def test_front_matter_tab_and_comment_rows_8262(self):
         # Round 19 (code r15 LOW-1, LOW-3): rule 5 covers YAML front matter; the one-line comment match
         # is anchored and refuses everything else as an HTML block.
@@ -2067,7 +2109,8 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(got("---\nlayout: a b\n---\n# T\n\n```\na\tb\n```"), [])
         self.assertEqual(got("<!-- note -->\n\nx"), [])
         for text in ("<!-- a\nb -->", "<!-- a --> text", "<!-- a <!-- b -->", "<!-- a --> <!-- b -->", "<!-->",
-                     "<!-- a --->", "<!-- a -- b -->", "<!-- a --> ", "<!-- a <!-->", "<!--<!-->"):
+                     "<!-- a --->", "<!-- a -- b -->", "<!-- a --> ", "<!-- a <!-->", "<!--<!-->",
+                     "<!--->"):
             self.assertTrue(got(text), text)
             self.assertIn("HTML block", got(text)[0], text)
         for text in ("<!-- note -->", "<!---->", "<!-- a < b -->", "<!-- <b> -->", "<!-- a - b -->"):
@@ -2095,6 +2138,10 @@ class CertificationScope8262(unittest.TestCase):
             have = re.search(r" %d\. (.*?) %d\. " % (num, nxt), readme)
             self.assertTrue(want and have, num)
             self.assertEqual(want.group(1), have.group(1), "rule %d differs" % num)
+            if num == 3:
+                # Round 21 (code r20 INFO-1): the empty-comment exception is stated on both sides.
+                self.assertIn('"--->" is refused except as the close of the empty comment "<!---->", '
+                              'which is accepted', want.group(1))
         points = set()
         for text in (doc, readme):
             m = re.search(r" 5\. (.*?) 6\. ", text).group(1)
