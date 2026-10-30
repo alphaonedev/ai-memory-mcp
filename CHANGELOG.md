@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security (#4734 — pgbouncer smoke stack binds loopback and takes its password from env)
 
+- #8312: consume both smoke scripts with a strict shell subset, refuse K25–K29 and INFO-5 constructs by name, and validate decimal knee thresholds before use.
 - `infra/pgbouncer/docker-compose.yml` publishes the pooler as `127.0.0.1:6432:6432`
   (was all interfaces) and requires `POSTGRES_PASSWORD` (was a fixed public
   fallback); `smoke-test.sh` generates a random password when none is supplied.
