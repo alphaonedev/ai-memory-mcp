@@ -328,12 +328,12 @@ PW_ASSIGN = re.compile(
 # files the two scripts read with `source` or `.`: `grep -n -E 'source |^\s*\. '` over both prints nothing
 # (0 sourced files), so the six files below are the whole set.
 PINNED_CONTENT = {
-    "infra/pgbouncer/smoke-test.sh": "f15b73365c7366c98fb8bac2a355eae54633ef8db1aa8ca4f1bc05bbe3d522e1",
+    "infra/pgbouncer/smoke-test.sh": "e5a41b2b2a2dc2166c067a30bdaea370f0991dc0141956647ac4355602db3aa7",
     "infra/pgbouncer/docker-compose.yml": "1959fb75885c25d6fea5029ed23c7619703c66697eb634795f84f0268f913d18",
     "infra/pgbouncer/pgbouncer.ini": "3aaabe9d6c683f0b6d3e47061d0de9543059283ea195b7a380c22de13c628946",
     "infra/pgbouncer/userlist.txt": "c6f9bb4ae05b289be2749dd528075c0dc885a2653578bab9a26c51c59c591e9a",
     "infra/pgbouncer/role-defaults.sql": "1ba2789501d6fbcf245a3cab8cc2811d04f7fb198c10d9edc7e9f8cccc3bac20",
-    "infra/pillar4-envelope/measure-envelope.sh": "d17d0c7c1cdc293a1803d2e79241cde6fbbeb9f04371ee506367026ff4b9fa8c",
+    "infra/pillar4-envelope/measure-envelope.sh": "9e66542eddf125a5b9dc40dae4ee7906631c43de9d89b7d54c2c989cdad54087",
 }
 PIN_REVIEW = "requires a full code and security review of its diff before the pin moves (#4734)"
 
@@ -2950,7 +2950,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             big = sorted(c for c in codes if c >= 64)
             # 65 has one meaning (a bad input value) at pinned sites: AI_MEMORY_SMOKE_RUN's character class
             # and 64-character bound, plus the envelope's integer and decimal numeric checks (#8312).
-            self.assertEqual(big.count(65), 3 if path == ENVELOPE else 2, "%s: exit 65 sites" % path.name)
+            self.assertEqual(big.count(65), 5 if path == ENVELOPE else 2, "%s: exit 65 sites" % path.name)
             big = [c for c in big if c != 65] + [65]
             self.assertEqual(len(big), len(set(big)), "%s: exit code reused: %r" % (path.name, big))
             header = "\n".join(ln for ln in path.read_text().split("\n")[:50] if ln.startswith("#"))
@@ -3333,8 +3333,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
     SMOKE_GROUPS_EXPECTED = 34
     SMOKE_FAIL_GROUPS_EXPECTED = 15
     SMOKE_FAIL_CALLS_EXPECTED = 0
-    ENVELOPE_GROUPS_EXPECTED = 59  # r23 decision 4: the digits-only STEP_DURATION_SECS case
-    ENVELOPE_FAIL_GROUPS_EXPECTED = 13  # r23 decision 4: the digits-only case arm carries a FATAL exit
+    ENVELOPE_GROUPS_EXPECTED = 61  # #8312: two decimal-threshold validation cases
+    ENVELOPE_FAIL_GROUPS_EXPECTED = 15  # #8312: both threshold cases carry a FATAL exit
     ENVELOPE_FAIL_CALLS_EXPECTED = 4
 
     @staticmethod

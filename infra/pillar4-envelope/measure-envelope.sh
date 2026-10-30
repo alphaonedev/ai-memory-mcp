@@ -33,7 +33,7 @@
 #       bring-up failed (including the bind failure when another run holds
 #       127.0.0.1:6432) or the teardown failed
 #   64  run as root
-#   65  bad AI_MEMORY_SMOKE_RUN, or STEP_DURATION_SECS not digits only
+#   65  bad AI_MEMORY_SMOKE_RUN, STEP_DURATION_SECS, P95_BUDGET_MS or SHED_RATE_KNEE
 #   69  a required tool is missing
 #   70  the fresh binary was not built
 #   71  the daemon did not become healthy
@@ -90,7 +90,14 @@ esac
 # Knee thresholds. P95 budget mirrors the recall p95 budget the codebase
 # defends elsewhere (35 ms hot-path) plus headroom for the write+AGE mix.
 P95_BUDGET_MS="${P95_BUDGET_MS:-250}"
-SHED_RATE_KNEE="${SHED_RATE_KNEE:-0.01}"   # 1% of requests shed with 503
+case "$P95_BUDGET_MS" in
+  ''|*[!0-9.]*|*.*.*|.) echo "FATAL: P95_BUDGET_MS must be a decimal number" >&2; exit 65 ;;
+esac
+# Fraction of requests shed with 503; the default is 1%.
+SHED_RATE_KNEE="${SHED_RATE_KNEE:-0.01}"
+case "$SHED_RATE_KNEE" in
+  ''|*[!0-9.]*|*.*.*|.) echo "FATAL: SHED_RATE_KNEE must be a decimal number" >&2; exit 65 ;;
+esac
 # Admission cap: set so the daemon sheds rather than queues unboundedly under
 # overload, making the knee observable as 503s (4.A). 0 disables (pure latency
 # knee). Default leaves it generous so latency is the primary signal.
@@ -146,8 +153,7 @@ POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-direc
 # SCRAM secret and passes it through to the backend. The verifier
 # (not the password) travels over docker exec stdout straight into a file
 # created under umask 077 (#4735); the password never appears in argv.
-VERIFIER_ROW="$(docker exec "$PG_CONTAINER" \
-  psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
+VERIFIER_ROW="$(docker exec "$PG_CONTAINER" psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
 case "$VERIFIER_ROW" in
   '"ai_memory" "SCRAM-SHA-256$'*) ;;
   *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;
@@ -166,17 +172,14 @@ echo "[3/5] schema-init + serve (admission cap=${ADMISSION_CAP}) through pgbounc
 # channel (src/cli/schema_init.rs store_url is a required argv String, #4600).
 STORE_URL_FILE="$RESULTS_DIR/.store-url"
 ( umask 077; printf '%s\n' "$POOLED_URL" >"$STORE_URL_FILE" )
-AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_MAX_INFLIGHT_REQUESTS="$ADMISSION_CAP" \
-  "$BIN" serve --host "$DAEMON_HOST" --port "$DAEMON_PORT" \
-  >"$RESULTS_DIR/daemon.log" 2>&1 &
+AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_MAX_INFLIGHT_REQUESTS="$ADMISSION_CAP" "$BIN" serve --host "$DAEMON_HOST" --port "$DAEMON_PORT" >"$RESULTS_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 # Wait for readiness (/api/v1/health is admission-control EXEMPT — 4.A).
 for _ in $(seq 1 30); do
   if curl -fsS "http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1/health" >/dev/null 2>&1; then break; fi
   sleep 1
 done
-curl -fsS "http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1/health" >/dev/null 2>&1 \
-  || { echo "FATAL: daemon did not become healthy; see $RESULTS_DIR/daemon.log" >&2; exit 71; }
+curl -fsS "http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1/health" >/dev/null 2>&1 || { echo "FATAL: daemon did not become healthy; see $RESULTS_DIR/daemon.log" >&2; exit 71; }
 
 # ── 4. One worker = one simulated agent doing the op mix for the duration ─
 # A worker loops: store -> link(to a prior id) -> recall, recording each
@@ -195,9 +198,7 @@ worker() {
     local t0 code t1 cur_id
     # store (capture the created id so the link op has a real edge to write)
     t0=$(now_ms)
-    code=$(curl -s -o "$bodyf" -w '%{http_code}' -X POST "$BASE/memories" \
-      -H 'content-type: application/json' -H "x-agent-id: $agent" \
-      -d "{\"title\":\"$title\",\"content\":\"envelope load $title\",\"namespace\":\"envelope\",\"tier\":\"short\"}" 2>/dev/null || echo "000")
+    code=$(curl -s -o "$bodyf" -w '%{http_code}' -X POST "$BASE/memories" -H 'content-type: application/json' -H "x-agent-id: $agent" -d "{\"title\":\"$title\",\"content\":\"envelope load $title\",\"namespace\":\"envelope\",\"tier\":\"short\"}" 2>/dev/null || echo "000")
     t1=$(now_ms)
     echo "store $code $((t1-t0))" >> "$out"
     cur_id=$(python3 -c 'import json,sys
@@ -207,17 +208,14 @@ except Exception: print("")' "$bodyf" 2>/dev/null || echo "")
     # bound; PgBouncer fixes fan-in, NOT AGE write concurrency).
     if [ -n "$prev_id" ] && [ -n "$cur_id" ]; then
       t0=$(now_ms)
-      code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/links" \
-        -H 'content-type: application/json' -H "x-agent-id: $agent" \
-        -d "{\"source_id\":\"$prev_id\",\"target_id\":\"$cur_id\",\"relation\":\"related_to\"}" 2>/dev/null || echo "000")
+      code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/links" -H 'content-type: application/json' -H "x-agent-id: $agent" -d "{\"source_id\":\"$prev_id\",\"target_id\":\"$cur_id\",\"relation\":\"related_to\"}" 2>/dev/null || echo "000")
       t1=$(now_ms)
       echo "link $code $((t1-t0))" >> "$out"
     fi
     [ -n "$cur_id" ] && prev_id="$cur_id"
     # recall (read-path; FTS + reranker)
     t0=$(now_ms)
-    code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/recall?q=envelope&namespace=envelope&limit=5" \
-      -H "x-agent-id: $agent" 2>/dev/null || echo "000")
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/recall?q=envelope&namespace=envelope&limit=5" -H "x-agent-id: $agent" 2>/dev/null || echo "000")
     t1=$(now_ms)
     echo "recall $code $((t1-t0))" >> "$out"
   done
