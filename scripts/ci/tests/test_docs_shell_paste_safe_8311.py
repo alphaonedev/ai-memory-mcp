@@ -19,7 +19,9 @@ A leading `#!` line, a comment-only fence whose comments hold no backtick
 or `$(` (class (b) is still flagged there; class (c) needs commands on both
 sides), and the text of a heredoc body are not flagged. A heredoc operator
 inside quotes or `$(( ))`, a here-string `<<<` and an arithmetic shift do not
-open a heredoc; a heredoc whose terminator never appears before the closing
+open a heredoc (nor does `$[ ]`); a heredoc ends only on its exact terminator
+line (fence indent removed, `<<-` tabs removed; the delimiter word is parsed
+whole, quotes and backslashes dropped); a heredoc whose terminator never appears before the closing
 fence is not trusted: its would-be body is scanned as normal lines.
 
 OPT-OUT MARKER (one, explicit): a fence whose FIRST line is exactly
@@ -37,18 +39,47 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 SHELL_LANGS = {"bash", "sh", "zsh", "console", "shell"}
 MARKER = "# not-for-paste"
 FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)")
-HEREDOC_RE = re.compile(
-    r"(?<!<)<<(?!<)-?\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1"
-)
+HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*(?=[A-Za-z_'\"\\])")
+WORD_END = " \t;&|<>()"
+
+
+def parse_heredoc_word(line, start):
+    """Parse the delimiter word at `start`: it runs to whitespace or a shell
+    metachar outside quotes, and quote characters and backslashes are dropped
+    (`E"OF"` and `\\EOF` both give `EOF`, as in bash). Returns the word."""
+    out = []
+    quote = None
+    i = start
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                out.append(ch)
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "\\":
+            i += 1
+            if i < len(line):
+                out.append(line[i])
+        elif ch in WORD_END:
+            break
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def heredoc_word(line):
-    """Return the heredoc terminator word opened by `line`, else None.
+    """Return (terminator word, strips_tabs) opened by `line`, else None.
 
-    Quote and `$(( ))` tracking mirrors `trailing_comment`: an operator inside
-    quotes or arithmetic is not a heredoc; `<<<` is a here-string."""
+    Quote, `$(( ))` and legacy `$[ ]` tracking mirrors `trailing_comment`: an
+    operator inside quotes or arithmetic is not a heredoc; `<<<` is a
+    here-string. `strips_tabs` is True for the `<<-` form."""
     quote = None
     arith = 0
+    brk = 0
     i = 0
     while i < len(line):
         ch = line[i]
@@ -67,10 +98,19 @@ def heredoc_word(line):
         elif line.startswith("))", i) and arith:
             arith -= 1
             i += 1
-        elif line.startswith("<<", i) and not arith:
+        elif line.startswith("$[", i):
+            brk += 1
+            i += 1
+        elif ch == "[" and brk:
+            brk += 1
+        elif ch == "]" and brk:
+            brk -= 1
+        elif line.startswith("<<", i) and not arith and not brk:
             m = HEREDOC_RE.match(line, i)
             if m:
-                return m.group(2)
+                word = parse_heredoc_word(line, m.end())
+                if word:
+                    return word, bool(m.group(1))
             i += 1
         i += 1
     return None
@@ -104,7 +144,7 @@ def trailing_comment(line):
 
 
 def fences(text):
-    """Yield (lang, first_body_line_no, [lines]) for each fenced block."""
+    """Yield (lang, first_body_line_no, [lines], fence_indent) per block."""
     lines = text.splitlines()
     i = 0
     while i < len(lines):
@@ -112,17 +152,27 @@ def fences(text):
         if not m:
             i += 1
             continue
-        marker, lang = m.group(2), m.group(3).lower()
+        indent, marker, lang = m.group(1), m.group(2), m.group(3).lower()
         body = []
         j = i + 1
         while j < len(lines) and not lines[j].strip().startswith(marker):
             body.append(lines[j])
             j += 1
-        yield lang, i + 2, body
+        yield lang, i + 2, body, indent
         i = j + 1
 
 
-def scan_block(first_no, body):
+def ends_heredoc(raw, word, strips_tabs, indent):
+    """True when `raw` is the exact terminator line of a heredoc: at most the
+    fence indent is removed, then (for `<<-`) leading tabs only."""
+    if indent and raw.startswith(indent):
+        raw = raw[len(indent):]
+    if strips_tabs:
+        raw = raw.lstrip("\t")
+    return raw == word
+
+
+def scan_block(first_no, body, indent=""):
     """Return [(line_no, reason)] for one shell fence body."""
     if body and body[0].strip() == MARKER:
         return []
@@ -137,10 +187,11 @@ def scan_block(first_no, body):
             kinds.append((no, "comment", s))
             continue
         kinds.append((no, "command", s))
-        word = heredoc_word(s)
-        if word:
+        opened = heredoc_word(s)
+        if opened:
+            word, strips_tabs = opened
             for end in range(off + 1, len(body)):
-                if body[end].strip() == word:
+                if ends_heredoc(body[end], word, strips_tabs, indent):
                     skip_to = end
                     break
     out = []
@@ -164,9 +215,9 @@ def scan_file(path):
     rel = path.relative_to(ROOT).as_posix()
     found = []
     text = path.read_text(encoding="utf-8", errors="replace")
-    for lang, first_no, body in fences(text):
+    for lang, first_no, body, indent in fences(text):
         if lang in SHELL_LANGS:
-            for no, why in scan_block(first_no, body):
+            for no, why in scan_block(first_no, body, indent):
                 found.append("%s:%d: %s" % (rel, no, why))
     return found
 
@@ -259,6 +310,34 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         self.assertEqual(len(scan_block(1, ["cat <<EOF", "a # b"])), 1)
         # `<<\EOF` is a quoted-word heredoc: its body is not flagged.
         self.assertEqual(scan_block(1, ["cat <<\\EOF", "a # b", "EOF", "ls"]), [])
+
+    def test_8311_heredoc_ends_only_on_exact_terminator(self):
+        # S3: an indented or space-padded line is not a terminator, so the
+        # second heredoc stays inside the first and the hazard is seen.
+        pad_in = ["data <<X", "EOF", "ls # hazard", "X"]
+        for opener, mid in (
+            ("cat <<EOF", " EOF"),
+            ("cat <<EOF", "EOF "),
+            ('cat <<E"OF"', "E"),
+            ('cat <<E"OF"', " EOF"),
+        ):
+            body = [opener, mid] + pad_in
+            self.assertEqual(len(scan_block(1, body)), 1, body)
+        # An unterminated heredoc is rescanned (the padded line is a command).
+        self.assertEqual(len(scan_block(1, ["cat <<EOF", " EOF", "ls # hazard"])), 1)
+        # S4: legacy `$[ ]` arithmetic opens no heredoc.
+        self.assertEqual(len(scan_block(1, ["echo $[1<<FOO]", "ls # hazard", "FOO"])), 1)
+
+    def test_8311_heredoc_terminator_forms_stay_clean(self):
+        # A list-indented fence: the terminator carries only the fence indent.
+        self.assertEqual(
+            scan_block(1, ["cat <<EOF", "a # b", "  EOF", "ls"], "  "), []
+        )
+        # `EOFX` never ends an `EOF` heredoc; quoted words reduce to `EOF`.
+        self.assertEqual(scan_block(1, ["cat <<EOF", "a # b", "EOFX", "EOF", "ls"]), [])
+        self.assertEqual(scan_block(1, ['cat <<E"OF"', "a # b", "EOF", "ls"]), [])
+        # `<<-` strips leading tabs only.
+        self.assertEqual(scan_block(1, ["cat <<-EOF", "a # b", "\t\tEOF", "ls"]), [])
 
     def test_8311_scanner_ignores_safe_shapes(self):
         self.assertEqual(scan_block(1, ["# only a comment", "# another"]), [])
