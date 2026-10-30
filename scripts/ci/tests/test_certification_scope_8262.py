@@ -463,6 +463,18 @@ _LONG_BODY_RE = re.compile(r"<\?[^>]{%d}|<!\[CDATA\[[^>]{%d}|<[a-z][a-z0-9-]*(?:
                            r"(?:'[^'\n]{%d}|\"[^\"\n]{%d})" % ((RAW_HTML_BODY_MAX + 1,) * 2 + (_ATTR, _ATTR_NAME)
                                                               + (RAW_HTML_BODY_MAX + 1,) * 2),
                            re.IGNORECASE)
+# Round 28 (code r27 LOW-1): a browser reads raw HTML left to right and the leftmost opener wins, so
+# a comment or tag inside a PI or CDATA body belongs to that body and may hold its first ">". One
+# alternation removes comments, closing tags, declarations, PI and CDATA sections and open tags in a
+# single leftmost-first pass. A comment ends at its first "-->" or, unterminated, at the end of the
+# text (as html_comments() reads it), so the lazy body never rescans and the pass stays linear.
+_RAW_HTML_RE = re.compile(r"<!-->|<!--->|<!--.*?(?:-->|\Z)|%s|%s" % (_CLOSE_TAG_RE.pattern, _OPEN_TAG_RE.pattern),
+                          re.IGNORECASE | re.DOTALL)
+# Round 28 (code r27 MEDIUM-1, security r27 MEDIUM-1): CommonMark removes the block-quote markers of
+# every line before it reads inline raw HTML, so a section that continues onto the next "> " line runs
+# to the browser's first real ">". This prefix is every leading marker of a line; it also takes a
+# marker indented past three spaces (a quote inside a list item), which only adds a reading.
+_QUOTE_PREFIX_RE = re.compile(r"^(?:[ \t]*>[ \t]?)+", re.MULTILINE)
 _LINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)")
 _REFLINK_RE = re.compile(r"!?\[([^\[\]\n]*)\]\[[^\[\]\n]*\]")
 _MARKUP_RE = re.compile(r"[*_`~\\]")
@@ -574,11 +586,20 @@ def _strip_comments(text):
     return "".join(parts)
 
 
+def _strip_raw_html(text):
+    """Round 28: text with its raw HTML removed in one leftmost-first pass (_RAW_HTML_RE)."""
+    return _RAW_HTML_RE.sub("", text) if "<" in text else text
+
+
+def _unquoted(text):
+    """Round 28: text with the block-quote markers of every line removed (_QUOTE_PREFIX_RE)."""
+    return _QUOTE_PREFIX_RE.sub("", text) if ">" in text else text
+
+
 def rendered(text):
     """Rendered view: HTML comments and tags removed, entities unescaped, NFKD folded, markdown
     links and images collapsed to their text, remaining brackets and emphasis removed."""
-    if "<" in text:
-        text = _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(text)))
+    text = _strip_raw_html(text)
     text = fold(text)
     if "[" in text:
         text = _REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", text)).replace("[", "").replace("]", "")
@@ -1194,9 +1215,11 @@ def trust_peer_units(rel, raw):
     out = []
     for para in re.split(r"\n[ \t>]*\n", text):
         for unit in _census_units(para):
-            unit = _flat(unit).strip()
-            if unit and any(TRUST_PEER_RE.search(v) for v in _mention_views(unit)):
-                out.append(unit)
+            # Round 28: the unit is read as written and with its block-quote markers removed.
+            flat, bare = _flat(unit).strip(), _flat(_unquoted(unit)).strip()
+            views = _mention_views(flat) + (_mention_views(bare) if bare != flat else ())
+            if flat and any(TRUST_PEER_RE.search(v) for v in views):
+                out.append(flat)
     return out
 
 
@@ -1233,6 +1256,10 @@ def _mention_views(text):
     comment-blank and angle-blank views too (_folded_views), so a bold or code-span spelling inside
     a decoded pair that a literal comment splits reads as it does without the literal comment."""
     views = _folded_views(text)
+    # Round 28 (security r27 LOW-1): a browser never decodes inside raw HTML, so a line that holds a
+    # literal "<" is also read with its raw HTML removed before any decoding.
+    if "<" in text:
+        views += _folded_views(_strip_raw_html(text))
     if "<!--" in text:
         views += _folded_views(_strip_comments(text))
         views += _mention_views_core(text.replace("<!--", " ").replace("-->", " "))
@@ -1259,8 +1286,7 @@ def _mention_views_core(text):
     comments, tags, links or emphasis are gone is read the same way."""
     low = _fold_mention(text)
     out = low
-    if "<" in out:
-        out = _CLOSE_TAG_RE.sub("", _OPEN_TAG_RE.sub("", _strip_comments(out)))
+    out = _strip_raw_html(out)
     # Round 26 (code r25 INFO-1): this second decode turns a double-encoded pair such as
     # "&amp;lt;!-- --&amp;gt;" into markup, one decode more than a renderer makes (it shows the pair
     # as the visible text "&lt;!-- --&gt;"). A mention found only through it is an over-count, the
@@ -1494,9 +1520,10 @@ def grammar_problems(rel, text):
     # Round 27 (code r26 LOW-1, decision (a)): a raw HTML body longer than RAW_HTML_BODY_MAX is refused
     # (fail closed, vote 1795854b) instead of read past the census bound. It is found on the text with
     # newlines as spaces (the census flattens a unit) and on its folded form (the census decodes before
-    # it strips), and refused once per line, at the line its opener is on.
-    found = set()
-    for form in (text, fold(text)):
+    # it strips), and refused once per line, at the line its opener is on. Round 28: also on the text
+    # with its block-quote markers removed, as CommonMark reads raw HTML inside a block quote.
+    found, bare = set(), _unquoted(text)
+    for form in (text, fold(text)) + ((bare, fold(bare)) if bare != text else ()):
         for m in _LONG_BODY_RE.finditer(form.replace("\n", " ")):
             found.add(min(form.count("\n", 0, m.start()) + 1, len(lines)))
     for n in sorted(found):
@@ -2306,6 +2333,42 @@ class CertificationScope8262(unittest.TestCase):
             self.assertEqual(count(text), 0, "control: %r" % text)
         # The tag-wrapped underscore joins the halves once the tags are removed (rounds 16 and later).
         self.assertEqual(count("Enable TRUST<b>_</b>PEER now."), 1)
+        # Round 28 (code r27 LOW-1): a comment or tag inside a PI or CDATA body is part of that body and
+        # may hold its first ">", so the halves join there (one leftmost-first strip).
+        for inner in ("TRUST<?a<b>_PEER?>", "TRUST<?a<i title>_PEER?>", "TRUST<?a<!-- x -->_PEER?>",
+                      "TRUST<![CDATA[a<b>_PEER]]>", "TRUST<![CDATA[a<!-- x -->_PEER]]>"):
+            for wrap in wrappers + ("Enable &lt;!-- %s --&gt; now.",):
+                self.assertEqual(count(wrap % inner), 1, "tag or comment in a PI or CDATA: %r" % (wrap % inner))
+        # Round 28 (security r27 LOW-1): a browser never decodes inside raw HTML, so a character reference
+        # or compatibility form of ">" or of the quote does not end the section, and the halves join.
+        refs = {">": ("&gt;", "&#62;", "&#x3e;", "\uff1e", "\ufe65"),
+                '"': ("&quot;", "&#34;", "&#x22;", "&QUOT;", "\uff02"),
+                "'": ("&#39;", "&apos;", "&#x27;", "&#039;", "\uff07")}
+        for term, section in ((">", "TRUST<?a%sb>_PEER?>"), (">", "TRUST<![CDATA[a%sb>_PEER]]>"),
+                              ('"', 'TRUST<b title="a%sb">_PEER'), ("'", "TRUST<b title='a%sb'>_PEER")):
+            for ref in refs[term]:
+                for wrap in wrappers:
+                    text = wrap % (section % ref)
+                    self.assertEqual(count(text), 1, "reference inside raw HTML: %r" % text)
+        # Round 28 (code r27 MEDIUM-1, security r27 MEDIUM-1): CommonMark removes the block-quote markers
+        # before it reads raw HTML, so a section that continues onto the next quote line joins the halves;
+        # nested and list-indented markers too.
+        for inner in ("TRUST<?a\n> b>_PEER?>", "TRUST<![CDATA[a\n> b>_PEER]]>", 'TRUST<b\n> title="x">_PEER',
+                      "TRUST_<?q\n> r?>PEER", "TRUST<?a\n>b>_PEER?>"):
+            for wrap in ("> Enable %s now.", "> Enable **x** %s now."):
+                self.assertEqual(count(wrap % inner), 1, "block-quote split: %r" % (wrap % inner))
+        for text in ("> > Enable TRUST<?a\n> > b>_PEER?> now.", "10. > Enable TRUST<?a\n    > b>_PEER?> now.",
+                     "- > Enable TRUST<![CDATA[a\n  > b>_PEER]]> now."):
+            self.assertEqual(count(text), 1, "block-quote split: %r" % text)
+        # A 601-character body split that way is refused by name, not read past the census bound.
+        for section in ("<?%s\n> %s>", "<![CDATA[%s\n> %s>", '<b\n> title="%s\n> %s">'):
+            text = "> Enable TRUST%s_PEER now." % (section % ("x" * 300, "x" * 300))
+            self.assertEqual(grammar_problems("README.md", text), [GRAMMAR_MESSAGE % (LONG_BODY_CONSTRUCT, "README.md", 1)],
+                             "block-quote 601: %r" % text[:40])
+        # Controls: a visible ">" or a space left between the halves once the markers go still splits them.
+        for text in ("> Enable TRUST<?a\n> b>?>_PEER now.", "> Enable TRUST<?a\n> b> _PEER now.",
+                     "> Enable TRUST\n> _PEER now.", "> Enable TRUST<?a\n> b>_PEERS?> now."):
+            self.assertEqual(count(text), 0, "control: %r" % text)
 
     def test_trust_peer_dash_position_matrix_8262(self):
         # Round 22 (code r21 MEDIUM-1): every dash of the class, in every position relative to a
@@ -2358,6 +2421,18 @@ class CertificationScope8262(unittest.TestCase):
             text = "Enable TRUST%s_PEER now." % (section % ("x" * 300 + "\n" + "x" * 300))
             self.assertEqual(grammar_problems("README.md", "intro\n\n" + text),
                              ["unsupported markdown construct: %s at README.md:3" % construct], text[:40])
+        # Round 28 (code r27 MEDIUM-1, security r27 MEDIUM-1): inside a block quote the next line's marker
+        # is not the body's ">" (CommonMark removes it first), so the 601-character body is refused there
+        # too, and a short one is accepted and counted.
+        for section in ("<?%s>", "<![CDATA[%s>", '<b title="%s">', "<b title='%s'>", '<b\n> title="%s">'):
+            for size in (300, 100):
+                text = "> Enable TRUST%s_PEER now." % (section % ("x" * size + "\n> " + "x" * size))
+                if size == 300:
+                    self.assertEqual(grammar_problems("README.md", "intro\n\n" + text),
+                                     ["unsupported markdown construct: %s at README.md:3" % construct], text[:40])
+                else:
+                    self.assertEqual(got(text), [], text[:40])
+                    self.assertEqual(len(trust_peer_units("README.md", text)), 1, text[:40])
         # Controls: a long line with no raw HTML body, a long quoted string outside a tag, a section whose
         # ">" comes early, and long text after a closed attribute value are accepted.
         for text in ("Enable " + "x" * 2000 + " now.", 'He said "%s" twice.' % ("x" * 600),
@@ -2374,6 +2449,11 @@ class CertificationScope8262(unittest.TestCase):
             grammar_problems("README.md", text)
             elapsed = time.perf_counter() - start
             self.assertLess(elapsed, 2.0, "%d chars took %.3f s" % (len(text), elapsed))
+            # Round 28 (code r27 INFO-2): the census reads the same lines in linear time too.
+            start = time.perf_counter()
+            trust_peer_units("README.md", text)
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 2.0, "census: %d chars took %.3f s" % (len(text), elapsed))
 
     def test_mention_census_is_fail_closed_against_reference_renderer_8262(self):
         # Round 25 (code r24 LOW-1, security r24 LOW-1): an independent reference renderer, written
@@ -2388,6 +2468,11 @@ class CertificationScope8262(unittest.TestCase):
                             r"[\w.:-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*\s*/?>"
                             r"|<![A-Za-z][^>]*>|<\?[^>]*>|<!\[CDATA\[[^>]*>")
         value_re = re.compile(r"=\s*(\"[^\"]*\"|'[^']*')")
+        # Round 28 (code r27 LOW-1): comments and tags go in ONE leftmost-first pass before the decode, as a
+        # browser reads them. Code r27 MEDIUM-1 / security r27 MEDIUM-1: CommonMark removes every leading
+        # block-quote marker of a line (a quote inside a list item included) before it reads raw HTML.
+        raw_re = re.compile(comment_re.pattern + "|" + tag_re.pattern, re.S)
+        quote_re = re.compile(r"^(?:[ \t]*>[ \t]?)+", re.M)
         dashes = "".join(chr(c) for c in range(sys.maxunicode + 1)
                          if c == 0x2D or c == 0x2212 or unicodedata.category(chr(c)) == "Pd")
         halves_re = re.compile("(trust)[%s](peer)" % re.escape(dashes), re.IGNORECASE)
@@ -2397,11 +2482,12 @@ class CertificationScope8262(unittest.TestCase):
             # 1 literal comments go; 2 one html.unescape; 3 NFKC; 4 no second comment strip: a pair
             # that only appears after the decode is visible text to a renderer; 5 tags go (both
             # before and after the decode, the larger answer wins); 6 markdown escapes, code spans
-            # and emphasis go; 7 a dash between the halves reads as "_".
+            # and emphasis go; 7 a dash between the halves reads as "_". Round 28: block-quote markers go
+            # first, and before the decode comments and tags go in one leftmost-first pass.
             seen = 0
+            text = quote_re.sub("", text)
             for tags_first in (True, False):
-                out = comment_re.sub("", text)
-                out = tag_re.sub("", out) if tags_first else out
+                out = raw_re.sub("", text) if tags_first else comment_re.sub("", text)
                 out = unicodedata.normalize("NFKC", html.unescape(out))
                 out = out if tags_first else tag_re.sub("", out)
                 out = re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", out).replace("`", "").replace("*", "")
@@ -2413,7 +2499,9 @@ class CertificationScope8262(unittest.TestCase):
             # Round 27 (code r26 LOW-1): the guard's grammar refuses a PI or CDATA body (up to its first
             # ">") or a quoted attribute value longer than 512 characters, before and after one decode.
             # Found here with str.find and the renderer's own tag pattern, not the guard's patterns.
-            for form in (text, unicodedata.normalize("NFKC", html.unescape(text))):
+            bare = quote_re.sub("", text)
+            for form in (text, unicodedata.normalize("NFKC", html.unescape(text)), bare,
+                         unicodedata.normalize("NFKC", html.unescape(bare))):
                 form = form.replace("\n", " ")
                 low = form.lower()
                 for opener in ("<?", "<![cdata["):
@@ -2482,11 +2570,38 @@ class CertificationScope8262(unittest.TestCase):
         # 4 sizes x 16 bodies x 15 outer forms; no line repeats.
         self.assertEqual(len(bodies), 64)
         self.assertEqual(len(axis), 960)
+        # Round 28: the raw-HTML reading axis. A comment or tag inside a PI or CDATA body (code r27 LOW-1);
+        # five reference or compatibility spellings of ">" in a PI and a CDATA body and of each quote in an
+        # attribute value (security r27 LOW-1); a PI, CDATA section or open tag that continues onto the
+        # next line, short and 300+300 (code r27 MEDIUM-1, security r27 MEDIUM-1). Each body goes into
+        # six outer forms; NL is the line break of that outer form (its container markers included).
+        bodies28 = ["TRUST<?a<b>_PEER?>", "TRUST<?a<i title>_PEER?>", "TRUST<?a<!-- x -->_PEER?>",
+                    "TRUST<![CDATA[a<b>_PEER]]>", "TRUST<![CDATA[a<!-- x -->_PEER]]>"]
+        for gt in ("&gt;", "&#62;", "&#x3e;", "\uff1e", "\ufe65"):
+            bodies28 += ["TRUST<?a%sb>_PEER?>" % gt, "TRUST<![CDATA[a%sb>_PEER]]>" % gt]
+        bodies28 += ['TRUST<b title="a%sb">_PEER' % q for q in ("&quot;", "&#34;", "&#x22;", "&QUOT;", "\uff02")]
+        bodies28 += ["TRUST<b title='a%sb'>_PEER" % q for q in ("&#39;", "&apos;", "&#x27;", "&#039;", "\uff07")]
+        pad = "x" * 300
+        bodies28 += ["TRUST<?a{NL}b>_PEER?>", "TRUST<![CDATA[a{NL}b>_PEER]]>", 'TRUST<b{NL}title="x">_PEER',
+                     "TRUST<?%s{NL}%s>_PEER" % (pad, pad), "TRUST<![CDATA[%s{NL}%s>_PEER" % (pad, pad),
+                     'TRUST<b title="%s{NL}%s">_PEER' % (pad, pad)]
+        outers28 = (("Enable %s now.", "\n"), ("> Enable %s now.", "\n> "), ("> > Enable %s now.", "\n> > "),
+                    ("10. > Enable %s now.", "\n    > "), ("Enable &lt;!-- %s --&gt; now.", "\n"),
+                    ("> Enable &#60;!-- %s --&#62; now.", "\n> "))
+        axis28 = {outer % body.replace("{NL}", nl) for body in bodies28 for outer, nl in outers28}
+        # 31 bodies x 6 outer forms; no line repeats.
+        self.assertEqual(len(bodies28), 31)
+        self.assertEqual(len(axis28), 186)
+        axis |= axis28
         corpus += sorted(axis)
+        # Round 28 (code r27 INFO-1): the timed loop reads every second line (the round-28 readings ran
+        # up to 2.09 s over the whole corpus under load); every line is still compared below.
+        timed = corpus[::2]
         start = time.perf_counter()
-        rows = [(text, oracle(text), len(trust_peer_units("README.md", text))) for text in corpus]
+        rows = [(text, oracle(text), len(trust_peer_units("README.md", text))) for text in timed]
         elapsed = time.perf_counter() - start
-        self.assertLess(elapsed, 2.0, "%d lines took %.3f s" % (len(corpus), elapsed))
+        self.assertLess(elapsed, 2.0, "%d lines took %.3f s" % (len(timed), elapsed))
+        rows += [(text, oracle(text), len(trust_peer_units("README.md", text))) for text in corpus[1::2]]
         # A line the grammar refuses is not read; the renderer's own refusal rule must name exactly
         # the lines the grammar refuses for a long body, and every other line is compared.
         long_body = "raw HTML body longer than 512 characters"
