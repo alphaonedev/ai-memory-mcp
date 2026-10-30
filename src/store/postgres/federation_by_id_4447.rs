@@ -720,6 +720,9 @@ impl PostgresStore {
                     .fetch_one(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("archive_restore load plaintext for cid", e))?;
+                    // #8278 (code review r2 I-c): E2 routes a 0x05 row through
+                    // `open_content_bound` and refuses instead of falling back to
+                    // the stored content; E1 writes no 0x05 rows.
                     let plaintext = match envelope {
                         Some(env) => {
                             crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content)
