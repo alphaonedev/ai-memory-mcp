@@ -107,16 +107,66 @@ fn judge_endpoints() {
 
 /// End-to-end: deterministic stub + judge → every spec gate passes on
 /// a six-scenario smoke run. This is the CI signal for L3-1.
+///
+/// The `throughput_per_min` row is a HARD gate in the bench binary
+/// (`cargo bench --bench longmemeval_reflection`) and here only under
+/// `AI_MEMORY_BENCH_STRICT=1`; by default it is ADVISORY in this
+/// integration test (#8318): a wall-clock floor measured on a shared
+/// CI runner is a load signal, not a correctness signal (the gate
+/// failed at 4.94/min on a 14-core host at load ~14 with every
+/// coverage / accuracy / depth gate green). A miss prints a
+/// `::notice::` line instead of failing the test.
 #[test]
 fn smoke_run_meets_targets() {
     let scenarios = generate_scenarios();
     let llm = DeterministicLlmStub::from_scenarios(&scenarios);
     let judge = DeterministicJudge::default();
     let report = run(&scenarios, &llm, &judge, true).expect("smoke run");
-    match report.check_targets() {
+    let strict = std::env::var("AI_MEMORY_BENCH_STRICT").as_deref() == Ok("1");
+    if !strict && report.throughput_per_min < runner::THROUGHPUT_FLOOR_PER_MIN {
+        println!(
+            "::notice::longmemeval_reflection throughput_per_min = {:.2} below the 10/min floor (advisory; set AI_MEMORY_BENCH_STRICT=1 to enforce)",
+            report.throughput_per_min
+        );
+    }
+    match report.check_targets_with(strict) {
         Ok(()) => {}
         Err(fails) => panic!("smoke run failed gates: {fails:?}\nreport={report:#?}"),
     }
+}
+
+/// Regression for #8318: a report whose ONLY miss is the throughput
+/// floor passes the advisory gate and fails the strict gate with
+/// exactly one message naming the measured value.
+#[test]
+fn throughput_floor_advisory_unless_strict_8318() {
+    let report = runner::RunReport {
+        scenarios_total: 6,
+        scenarios_with_depth_2: 3,
+        coverage_d1: 1.0,
+        accuracy_d1: 1.0,
+        coverage_d2: 1.0,
+        accuracy_d2: 1.0,
+        depth_violations: 0,
+        sig_verify_rate: 1.0,
+        throughput_per_min: 4.94,
+        wall_seconds: 72.87,
+        started_at: "2026-10-30T00:00:00Z".to_owned(),
+        completed_at: "2026-10-30T00:01:12Z".to_owned(),
+        scenarios: Vec::new(),
+    };
+    assert_eq!(report.check_targets_with(false), Ok(()));
+    let fails = report
+        .check_targets_with(true)
+        .expect_err("strict gate must fail on a throughput miss");
+    assert_eq!(fails.len(), 1, "exactly one gate miss: {fails:?}");
+    assert!(
+        fails[0].starts_with("throughput_per_min = 4.94"),
+        "unexpected message: {}",
+        fails[0]
+    );
+    // `check_targets` keeps the hard floor for the bench binary.
+    assert_eq!(report.check_targets(), Err(fails));
 }
 
 /// Snapshot equivalence: the committed `data/scenarios.jsonl` must

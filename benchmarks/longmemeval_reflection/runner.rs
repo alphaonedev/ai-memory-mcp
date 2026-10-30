@@ -55,6 +55,15 @@
 //! | `sig_verify_rate`   | Fraction of reflection memories whose `metadata.agent_id` is non-empty (sig stamp). | 1.0 |
 //! | `throughput_per_min`| `60 * SCENARIO_COUNT / wall_seconds`.                                               | ≥ 10 |
 //!
+//! The `throughput_per_min` row is a HARD gate in the bench binary
+//! (`cargo bench --bench longmemeval_reflection`) and in the
+//! integration test under `AI_MEMORY_BENCH_STRICT=1`; in the
+//! integration test (`tests/longmemeval_reflection_bench.rs`) it is
+//! ADVISORY by default (#8318): a wall-clock floor on a shared CI
+//! runner measures host load, not correctness (it failed at 4.94/min
+//! on a 14-core runner at load ~14 with every other gate green). The
+//! split lives in [`RunReport::check_targets_with`].
+//!
 //! ## CI stub vs publish-time real LLM
 //!
 //! The default [`DeterministicJudge`] mirrors the canonical pattern
@@ -274,11 +283,33 @@ pub struct RunReport {
     pub scenarios: Vec<ScenarioOutcome>,
 }
 
+/// Spec floor for `throughput_per_min` (issue #674). Hard in the bench
+/// binary; advisory in the integration test unless
+/// `AI_MEMORY_BENCH_STRICT=1` (#8318).
+pub const THROUGHPUT_FLOOR_PER_MIN: f64 = 10.0;
+
 impl RunReport {
-    /// Spec gates from issue #674. `Ok(())` when every gate passes;
-    /// `Err(reason)` lists every violated gate. The bench's main
-    /// function maps this onto a non-zero exit when any gate fails.
+    /// Spec gates from issue #674 with the throughput floor HARD.
+    /// `Ok(())` when every gate passes; `Err(reason)` lists every
+    /// violated gate. The bench's main function maps this onto a
+    /// non-zero exit when any gate fails. Equivalent to
+    /// `check_targets_with(true)`; the bench binary keeps the hard
+    /// floor without reading the environment.
     pub fn check_targets(&self) -> std::result::Result<(), Vec<String>> {
+        self.check_targets_with(true)
+    }
+
+    /// Spec gates from issue #674. The coverage / accuracy /
+    /// depth-violation / signature gates are always hard. The
+    /// `throughput_per_min` floor ([`THROUGHPUT_FLOOR_PER_MIN`]) is
+    /// hard only when `strict_throughput` is true; otherwise a miss is
+    /// NOT a failure and the caller reports it as advisory (#8318: the
+    /// integration test prints a `::notice::` line with the measured
+    /// value).
+    pub fn check_targets_with(
+        &self,
+        strict_throughput: bool,
+    ) -> std::result::Result<(), Vec<String>> {
         let mut fails = Vec::new();
         if self.coverage_d1 < 0.80 {
             fails.push(format!("coverage_d1 = {:.3} < 0.80", self.coverage_d1));
@@ -304,9 +335,9 @@ impl RunReport {
                 self.sig_verify_rate
             ));
         }
-        if self.throughput_per_min < 10.0 {
+        if strict_throughput && self.throughput_per_min < THROUGHPUT_FLOOR_PER_MIN {
             fails.push(format!(
-                "throughput_per_min = {:.2} < 10",
+                "throughput_per_min = {:.2} < {THROUGHPUT_FLOOR_PER_MIN:.0}",
                 self.throughput_per_min
             ));
         }
