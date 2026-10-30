@@ -8,10 +8,11 @@ relative link target exists inside the checkout.
 Symlink behaviour: a markdown source that is itself a symlink, or that lies
 under a symlinked directory (``has_symlink_component``), is skipped as a
 source. Directory symlinks are followed for existence, and containment is
-decided by ``resolve()`` against the root, so a symlink that points outside
-the checkout is broken, while a link to a symlinked markdown file that stays
-inside the checkout resolves. Existence is probed on the raw target with
-``os.stat`` so the kernel's symlink hop limit applies. A protocol-relative
+decided by ``resolve(strict=True)`` against the root, so a symlink that points
+outside the checkout is broken, while a link to a symlinked markdown file that
+stays inside the checkout resolves. Existence is probed on the raw target with
+``os.stat`` so the kernel's symlink hop limit applies, and the kernel must agree
+with the resolved path on identity (``os.path.samestat``). A protocol-relative
 `//` target (``//host/x``) is refused, and `..` is normalised lexically
 (never through a directory symlink), so a climb out of the root is refused on
 every host.
@@ -71,23 +72,43 @@ def markdown_files(root):
                     yield path
 
 
+def raw_failure_label(candidate):
+    """Errno name of the kernel's answer for the raw ``candidate``, else ``RuntimeError``."""
+    try:
+        os.stat(str(candidate))
+    except OSError as err:
+        return errno.errorcode.get(err.errno, "OSError") if err.errno is not None else "OSError"
+    return "RuntimeError"
+
+
 def inside_state(root, candidate):
     """Return ``(state, detail)`` for ``candidate`` against ``root``.
 
     ``state`` is ``"file"`` or ``"dir"`` when the path exists and its real
     location is inside ``root``, ``"missing"`` when it does not exist (ENOENT,
     ENOTDIR) or leaves the root, and ``"unresolvable"`` (``detail`` = errno
-    name, or ``OSError`` when the error carries none) when the operating
-    system refuses the path, for example a segment longer than NAME_MAX or a
-    symlink loop. ``os.stat`` is probed directly on the raw ``candidate`` (not
-    the ``resolve()`` result) so the kernel's symlink hop limit is honoured
-    and because ``Path.is_dir`` and ``Path.exists`` swallow those errors on
-    Python 3.14; ``resolve()`` decides containment only.
+    name, ``OSError`` when the error carries none, or ``MISMATCH``) when the
+    operating system refuses the path or the two views of it disagree.
+
+    Three steps, each fail-closed:
+
+    1. Containment: ``candidate.resolve(strict=True)`` must sit inside
+       ``root.resolve()``. Strict resolution raises on a failing lstat or
+       readlink of any prefix (for example one past PATH_MAX) instead of
+       carrying on lexically, so the returned path holds no symlink.
+    2. Existence: ``os.stat`` on the raw ``candidate`` is the kernel's answer
+       and honours its symlink hop limit; ``Path.is_dir`` and ``Path.exists``
+       swallow those errors on Python 3.14, so they are not used.
+    3. Identity: the raw stat and the stat of the resolved path must be the
+       same file (``os.path.samestat``); a disagreement is ``MISMATCH``.
     """
     try:
-        candidate.resolve().relative_to(root.resolve())
-        mode = os.stat(str(candidate)).st_mode
-        return ("dir" if stat.S_ISDIR(mode) else "file"), ""
+        real = candidate.resolve(strict=True)
+        real.relative_to(root.resolve())
+        raw = os.stat(str(candidate))
+        if not os.path.samestat(raw, os.stat(str(real))):
+            return "unresolvable", "MISMATCH"
+        return ("dir" if stat.S_ISDIR(raw.st_mode) else "file"), ""
     except (FileNotFoundError, NotADirectoryError):
         pass
     except OSError as err:
@@ -96,10 +117,11 @@ def inside_state(root, candidate):
         return "unresolvable", errno.errorcode.get(err.errno, "OSError")
     except RuntimeError as err:
         # Python < 3.13 reports a symlink loop from resolve() as RuntimeError
-        # ("Symlink loop ..."); any other RuntimeError keeps its own label.
+        # ("Symlink loop ..."). Any other RuntimeError (RecursionError on a very
+        # long chain) takes the kernel's errno for the raw target, else its own label.
         if "Symlink loop" in str(err):
             return "unresolvable", "ELOOP"
-        return "unresolvable", "RuntimeError"
+        return "unresolvable", raw_failure_label(candidate)
     except ValueError:
         pass
     return "missing", ""
@@ -380,10 +402,12 @@ class LinkContainmentTest(unittest.TestCase):
     def test_runtime_error_from_resolve_is_labelled_by_kind_8291_r6(self):
         real_resolve = Path.resolve
         self.write("a.md", "[a](x.md)\n")
+        (self.guarded / "x.md").write_text("# x\n", encoding="utf-8")
+        (self.guarded / "spin").symlink_to("spin")
 
         def raising(message):
             def resolve(self, *args, **kwargs):
-                if self.name == "x.md":
+                if self.name in ("x.md", "spin"):
                     raise RuntimeError(message)
                 return real_resolve(self, *args, **kwargs)
 
@@ -394,14 +418,96 @@ class LinkContainmentTest(unittest.TestCase):
             loop = inside_state(self.root, self.guarded / "x.md")
             Path.resolve = raising("maximum recursion depth exceeded")
             other = inside_state(self.root, self.guarded / "x.md")
+            kernel = inside_state(self.root, self.guarded / "spin")
             broken = broken_links(self.root)
         finally:
             Path.resolve = real_resolve
         self.assertEqual(loop, ("unresolvable", "ELOOP"))
         self.assertEqual(other, ("unresolvable", "RuntimeError"))
+        # decision 3 (8291 r7): a non-loop RuntimeError takes the kernel's errno.
+        self.assertEqual(kernel, ("unresolvable", "ELOOP"))
         self.assertEqual(
             broken, ["docs/security/a.md:1 x.md (unresolvable target: RuntimeError)"]
         )
+
+    def test_deep_chain_is_eloop_on_every_interpreter_8291_r7(self):
+        last = self.chain(1200)
+        self.write("a.md", "[a](%s)\n" % last)
+        self.assertEqual(
+            broken_links(self.root),
+            ["docs/security/a.md:1 %s (unresolvable target: ELOOP)" % last],
+        )
+
+    def test_target_reachable_by_two_in_root_paths_resolves_8291_r7(self):
+        (self.root / "sub").mkdir()
+        (self.root / "sub" / "x.md").write_text("# x\n", encoding="utf-8")
+        (self.root / "inlink").symlink_to(self.root / "sub", target_is_directory=True)
+        (self.guarded / "alias.md").symlink_to(self.root / "sub" / "x.md")
+        self.write("a.md", "[a](../../inlink/x.md)\n[b](../../sub/x.md)\n[c](alias.md)\n")
+        self.assertEqual(broken_links(self.root), [])
+        self.assertEqual(inside_state(self.root, self.root / "inlink" / "x.md"), ("file", ""))
+
+    def test_identity_disagreement_is_unresolvable_mismatch_8291_r7(self):
+        (self.guarded / "real.md").write_text("# real\n", encoding="utf-8")
+        real_samestat = os.path.samestat
+        os.path.samestat = lambda first, second: False
+        try:
+            state = inside_state(self.root, self.guarded / "real.md")
+        finally:
+            os.path.samestat = real_samestat
+        self.assertEqual(state, ("unresolvable", "MISMATCH"))
+
+    def test_resolution_past_path_max_never_reports_an_outside_target_8291_r7(self):
+        if os.mkdir not in os.supports_dir_fd or os.symlink not in os.supports_dir_fd:
+            self.skipTest("dir_fd unsupported")
+        (self.outside / "y.md").write_text("# y\n", encoding="utf-8")
+        self.long_prefix_tree()
+        spellings = ["L/M/out", "L/M/outd/y.md", "L/M/outd/", "L/M/outd///", "L/M/outd/y.md/.."]
+        self.write("a.md", "".join("[l](../../%s)\n" % t for t in spellings))
+        self.assertEqual(
+            broken_links(self.root),
+            [
+                "docs/security/a.md:%d ../../%s (unresolvable target: ENAMETOOLONG)" % (n, t)
+                for n, t in enumerate(spellings, start=1)
+            ],
+        )
+        state = inside_state(self.root, self.root / "L" / "M" / "out")
+        self.assertEqual(state, ("unresolvable", "ENAMETOOLONG"))
+
+    def long_prefix_tree(self):
+        """Build root/L and root/L/M so the resolved prefix of L/M/out passes PATH_MAX.
+
+        The raw target ``L/M/out`` is short, but user-space resolution expands it past
+        PATH_MAX, while the kernel follows ``out`` and ``outd`` to the outside directory.
+        """
+        names = [("%d" % n).ljust(250, "n") for n in range(9)]
+        (self.root / "L").symlink_to(os.path.join(*names))
+        root_fd = os.open(str(self.root), os.O_RDONLY)
+        try:
+            x_fd = self.descend(root_fd, names)
+        finally:
+            os.close(root_fd)
+        try:
+            os.symlink(os.path.join(*names), "M", dir_fd=x_fd)
+            y_fd = self.descend(x_fd, names)
+        finally:
+            os.close(x_fd)
+        try:
+            os.symlink(str(self.outside / "secret.txt"), "out", dir_fd=y_fd)
+            os.symlink(str(self.outside), "outd", dir_fd=y_fd)
+        finally:
+            os.close(y_fd)
+
+    @staticmethod
+    def descend(parent_fd, names):
+        """mkdir each of ``names`` below ``parent_fd``; return an fd for the deepest one."""
+        fd = os.dup(parent_fd)
+        for name in names:
+            os.mkdir(name, dir_fd=fd)
+            child = os.open(name, os.O_RDONLY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
 
 
 class DocstringStatesBehaviourTest(unittest.TestCase):
