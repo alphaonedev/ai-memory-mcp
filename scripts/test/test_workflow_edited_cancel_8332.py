@@ -71,21 +71,42 @@ def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
+QUOTED_RE = re.compile(r"""\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*'""")
+
+
+def _bracket_delta(line: str) -> int:
+    """Net flow-bracket depth of one line, ignoring quoted strings and ``#`` comments outside quotes.
+
+    decision (round 5, REVIEW-8332-code-r4 F2, REVIEW-8332-security-r4 S7): a quoted value such as
+    ``"release/}"`` must not end the join early, or a later ``types: [edited]`` is never read.
+    """
+    bare = QUOTED_RE.sub("", line)
+    bare = re.sub(r"(^|\s)#.*$", "", bare)
+    return sum(bare.count(c) for c in "{[") - sum(bare.count(c) for c in "}]")
+
+
 def _join_flow(first: str, remaining: list) -> str:
     """Join a flow collection to its closing brace across lines; fail closed when it never closes.
 
     decision (round 4, REVIEW-8332-security-r3 S5): join (not refuse) a multi-line flow, because
     that is valid YAML; an UNCLOSED flow is refused by name via ParseFailure.
+    decision (round 5, REVIEW-8332-security-r4 S7): when the join ends while indented lines of the
+    `on:` section are still unread, the file is refused by name (a short join could hide `edited`).
     """
     pieces = [first]
-    depth = sum(first.count(c) for c in "{[") - sum(first.count(c) for c in "}]")
+    depth = _bracket_delta(first)
     lines = list(remaining)
     while depth > 0:
         if not lines:
             raise ParseFailure("unclosed flow collection in the `on:` section")
         nxt = lines.pop(0)
         pieces.append(nxt)
-        depth += sum(nxt.count(c) for c in "{[") - sum(nxt.count(c) for c in "}]")
+        depth += _bracket_delta(nxt)
+    for left in lines:
+        if left and not left[0].isspace():
+            break
+        if left.strip():
+            raise ParseFailure("flow collection ended before the `on:` section did (unread indented lines)")
     return "\n".join(pieces)
 
 
@@ -349,6 +370,24 @@ class BodyOnlyEditNeverCancels8332(unittest.TestCase):
         self.assertEqual(len(target_extras({"m.yml": tgt})), 1)
         ok = "on: {\n  pull_request: {types: [opened, synchronize]}\n}\njobs: {}\n"
         self.assertEqual(edited_listed("ok.yml", ok), [])
+
+    def test_mutation_quoted_bracket_in_multiline_flow(self):
+        # A quoted `}` or `]` must not end the join early (REVIEW-8332-security-r4 S7).
+        for q in ('"', "'"):
+            for br in ("}", "]", "}]"):
+                bad = (f"on: {{\n  pull_request: {{branches: [{q}rel{br}x{q}],\n"
+                       "    types: [edited]}\n}\njobs: {}\n")
+                self.assertEqual(len(edited_listed("m.yml", bad)), 1, bad)
+        short = "on: {pull_request: {types: [opened]}}\n  types: [edited]\njobs: {}\n"
+        out = edited_listed("short.yml", short)
+        self.assertEqual(len(out), 1)
+        self.assertIn("short.yml", out[0])
+
+    def test_quoted_value_without_brackets_still_joins(self):
+        ok = ('on: {\n  pull_request: {branches: ["release/v1", \'main\'],\n'
+              "    types: [opened, synchronize]}\n}\njobs: {}\n")
+        self.assertEqual(edited_listed("ok.yml", ok), [])
+        self.assertTrue(has_trigger(ok, "pull_request"))
 
     def test_mutation_unclosed_flow_is_refused_by_name(self):
         bad = "on: {\n  pull_request: {types: [opened, edited]\n"

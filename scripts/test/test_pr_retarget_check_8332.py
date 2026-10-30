@@ -10,6 +10,7 @@ loop and the gh failure handling execute for real; no network call is made.
 
 Stdlib only. Run: ``python3 -I scripts/test/test_pr_retarget_check_8332.py``.
 """
+import importlib.util
 import json
 import os
 import shutil
@@ -25,10 +26,21 @@ FIX = ROOT / "scripts" / "test" / "fixtures" / "pr_retarget_check_8332"
 HEAD = "b" * 40
 STUB_BIN = FIX / "stub_bin"
 SCRATCH = ROOT / ".local-runs"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("pr_retarget_check_under_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 PAGE = 100
 T_CHANGE = "2026-10-30T12:00:00Z"
 T_BEFORE = "2026-10-30T10:00:00Z"
 T_AFTER = "2026-10-30T14:00:00Z"
+
+
+RETARGET = _load_module()
 
 
 def run_check(case: str):
@@ -88,6 +100,13 @@ class LivePath(unittest.TestCase):
         self.stub = SCRATCH / f"stub-{uuid.uuid4().hex[:8]}"
         self.stub.mkdir()
         self.addCleanup(shutil.rmtree, self.stub, True)
+        # decision (round 5, REVIEW-8332-code-r4 INFO, REVIEW-8332-security-r4 INFO): the child PATH is the
+        # stub dir plus a scratch bin holding only the two symlinks the stub's `env python3` shebang needs,
+        # so no real gh exists anywhere on it; /usr/bin and /bin are left out.
+        self.sysbin = self.stub / "bin"
+        self.sysbin.mkdir()
+        (self.sysbin / "python3").symlink_to(sys.executable)
+        (self.sysbin / "env").symlink_to(shutil.which("env"))
 
     def put(self, key: str, value, suffix: str = "json"):
         text = json.dumps(value) if suffix == "json" else value
@@ -99,7 +118,7 @@ class LivePath(unittest.TestCase):
 
     def child_env(self, extra=None) -> dict:
         """Environment built from scratch: no inherited gh credentials, host or config."""
-        env = {"PATH": os.pathsep.join([str(STUB_BIN), "/usr/bin", "/bin"]),
+        env = {"PATH": os.pathsep.join([str(STUB_BIN), str(self.sysbin)]),
                "HOME": str(self.stub), "GH_STUB_DIR": str(self.stub)}
         env.update(extra or {})
         for banned in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GH_HOST", "GH_CONFIG_DIR"):
@@ -113,6 +132,7 @@ class LivePath(unittest.TestCase):
         self.assertIsNotNone(found, "gh does not resolve on the child PATH")
         self.assertEqual(Path(found).resolve(), stub.resolve(), f"{self.id()}: gh is not the stub")
         self.assertTrue(os.access(stub, os.X_OK), f"{self.id()}: the stub gh is not executable")
+        self.assertEqual([p for p in sorted(self.sysbin.iterdir())], [self.sysbin / "env", self.sysbin / "python3"])
         return subprocess.run(
             [sys.executable, "-I", str(SCRIPT), "--repo", "o/r", "--pr", "1", "--head", HEAD],
             capture_output=True, text=True, check=False, env=env)
@@ -202,10 +222,31 @@ class LivePath(unittest.TestCase):
         self.assertEqual(self.requests(), ["timeline_page1", "timeline_page2"])
 
     def test_j_page_cap_override_cannot_raise_the_cap(self):
+        # The resolution function itself: the override may only LOWER the default cap.
+        default = RETARGET.MAX_PAGES_DEFAULT
+        self.assertEqual(default, 200)
+        for raw in ("201", "99999", "0", "-3", "garbage", "", "200", "2.5", None):
+            self.assertEqual(RETARGET.resolve_max_pages(raw), default, repr(raw))
+        for raw, want in (("2", 2), ("199", 199), ("1", 1)):
+            self.assertEqual(RETARGET.resolve_max_pages(raw), want, raw)
+
+    def test_j2_raised_cap_override_still_stops_at_the_default_through_the_script(self):
+        # Live path: a one-page timeline, a 99999 override; the answer is unchanged (cap not raised).
         self.put("timeline_page1", [change(T_CHANGE)])
         self.runs(T_AFTER, T_AFTER)
         r = self.run_live({"PR_RETARGET_MAX_PAGES": "99999"})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_h2(self):
+        for events in ([change("2026-10-30T10:00:00Z"), {"event": "base_ref_changed"}],
+                       [{"event": "base_ref_changed"}, change("2026-10-30T10:00:00Z")],
+                       [change("2026-10-30T10:00:00Z"), {"event": "base_ref_changed", "created_at": ""}],
+                       [change("2026-10-30T10:00:00Z"), {"event": "base_ref_changed", "created_at": None}]):
+            self.put("timeline_page1", events)
+            self.runs(T_AFTER, T_AFTER)
+            r = self.run_live()
+            self.assertEqual(r.returncode, 70, f"{events}: {r.stdout}{r.stderr}")
+            self.assertIn("no created_at", r.stderr)
 
     def test_f_run_in_the_same_second_is_not_newer(self):
         self.put("timeline_page1", [change(T_CHANGE)])

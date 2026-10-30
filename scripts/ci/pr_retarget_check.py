@@ -37,18 +37,22 @@ PAGE = 100
 MAX_PAGES_DEFAULT = 200
 
 
-def _max_pages():
-    """Page cap; ``PR_RETARGET_MAX_PAGES`` may only LOWER it (test hook, fails closed).
+def resolve_max_pages(raw):
+    """Page cap from a raw ``PR_RETARGET_MAX_PAGES`` value; it may only LOWER the default (test hook, fails closed).
 
-    decision (round 4, REVIEW-8332-security-r3 S6): the cap branch is tested through this env var
-    instead of generating 20,000 events. A larger or unparsable value is ignored, so the override
-    can only make the check refuse sooner, never read past the default cap.
+    decision (round 4, REVIEW-8332-security-r3 S6): the cap branch is tested through this override
+    instead of generating 20,000 events. A larger, non-positive or unparsable value is ignored, so the
+    override can only make the check refuse sooner, never read past the default cap.
     """
     try:
-        value = int(os.environ.get("PR_RETARGET_MAX_PAGES", ""))
-    except ValueError:
+        value = int(raw)
+    except (TypeError, ValueError):
         return MAX_PAGES_DEFAULT
     return value if 1 <= value < MAX_PAGES_DEFAULT else MAX_PAGES_DEFAULT
+
+
+def _max_pages():
+    return resolve_max_pages(os.environ.get("PR_RETARGET_MAX_PAGES", ""))
 
 
 MAX_PAGES = _max_pages()
@@ -121,10 +125,13 @@ def check(repo, pr, head, json_dir):
     if not changes:
         print("retarget-check: no base change")
         return EX_OK
-    latest = max(changes, key=lambda e: str(e.get("created_at", "")))
-    stamp = str(latest.get("created_at", ""))
-    if not stamp:
-        raise ToolError("base_ref_changed event has no created_at")
+    # decision (round 5, REVIEW-8332-code-r4 F1, REVIEW-8332-security-r4 S8): ANY base change without a
+    # usable created_at refuses (exit 70); dropping it would compare the runs against an older retarget.
+    for event in changes:
+        raw_stamp = event.get("created_at")
+        if not isinstance(raw_stamp, str) or not raw_stamp.strip():
+            raise ToolError("base_ref_changed event has no created_at")
+    stamp = max(e["created_at"] for e in changes)
     stale = False
     ids = []
     for workflow in WORKFLOWS:
