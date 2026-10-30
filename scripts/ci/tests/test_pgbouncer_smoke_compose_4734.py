@@ -81,6 +81,12 @@ pinned exactly (REAPING_PINS) and every wait in both scripts is a statement or `
 a later statement-position check that reaches a FAIL exit; the exact group counts are named constants and
 their failure message is the content-pin text: a mismatch demands a full code and security review of
 the file's diff before the pin moves.
+#8312: a closed shell grammar now consumes every physical line before the
+execution-surface semantic pins. Unknown syntax always refuses by name; the
+older scanners are semantic checks and regression oracles, not the language
+acceptance gate. Continuations are simplified in the scripts. Embedded SQL and
+Python are complete literal productions. The r23 content pins still require
+review of every script change. Decimal knee thresholds validate before use.
 """
 import ast
 import fnmatch
@@ -127,23 +133,7 @@ RUN_LENGTH_BOUND = [
     "exit 65",
     "fi",
 ]
-ENV_DUMPERS = re.compile(
-    r"(?:^|[;&|(`]|\$\(|\b(?:then|do|else|command|exec|xargs|sudo|nohup|nice|time)\s|/)\s*env\b(?!-)|--env-file|\bprintenv\b|\bexport\s+-p\b|\bdeclare\s+-[a-zA-Z]*[xp]\b|\btypeset\s+-[a-zA-Z]*[xp]\b"
-    r"|/proc/(?:self|thread-self|\$\$|\$\{?BASHPID\}?|\d+)/environ|\bcompgen\s+-[a-zA-Z]*[ev]\b|\bset\s*$|\bexport\s*$|\btee\b"
-)
 REDIRECT = re.compile(r"(?<![-<=>])(?:\d?(?:>>?|<>)|&>)(?!&\d)\s*(\S+)")
-SHELL_TRACE = re.compile(
-    r"(?<![\w-])set\s+(?:-\S*\s+)*?(?:-[a-zA-Z]*[xv][a-zA-Z]*(?![\w-])|-[a-zA-Z]*o\s+[\"']?(?:xtrace|verbose))"
-)
-# r10 S9: matched on a line with `\`, `"` and `'` deleted, anywhere on the line.
-DUMP_WORD = re.compile(r"(?<![\w-])(?:env|printenv|declare|typeset)(?![\w-])")
-BARE_SET = re.compile(r"\bset\s*(?:$|[;&|)])")
-BARE_EXPORT = re.compile(r"\bexport\s*(?:$|[;&|)])")
-LOCAL_NAMEREF = re.compile(r"\blocal\s+-[a-zA-Z]*n")
-PSQL_META = re.compile(r"^\s*\\")
-EXEC_DUMP = re.compile(r"\bdocker\b.*\bexec\b.*\s[\"']?(?:env|printenv|set|export|declare|typeset)[\"']?(?:\s|$)")
-DOCKER_DISCLOSE = re.compile(r"\bdocker\b.*\binspect\b|\bdocker\b.*\bcompose\b.*\bconfig\b|\bdocker-compose\b.*\bconfig\b")
-ENVIRON_WORD = re.compile(r"\benviron\b|\bENVIRON\b|\bgetenv\b")
 INTERPRETER = re.compile(r"\b(?:python[0-9.]*|awk|gawk|mawk|nawk|perl|ruby|node|php|lua)\b")
 PW_GEN = """PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}\""""
 INTERPRETER_SITES = {
@@ -893,12 +883,13 @@ SPLIT_WORD_BSNL = "a backslash-newline that splits a word"  # r22 decision 3 (S3
 ARITH_SINK = "arithmetic on a value that is not a number literal"
 SHELL_NUMERIC_NAMES = frozenset(("LINENO", "SECONDS", "RANDOM", "EUID", "UID"))
 SHELL_NUMERIC_SPECIAL = frozenset("?#$!")
-ENV_NUMERIC_DEFAULTS = frozenset(("STEP_DURATION_SECS",))
-"""r22 decision 2c: the names whose `${NAME:-<digits>}` default counts as a number. The guard models the
+ENV_NUMERIC_DEFAULTS = frozenset(("STEP_DURATION_SECS", "P95_BUDGET_MS", "SHED_RATE_KNEE"))
+ENV_INTEGER_DEFAULTS = frozenset(("STEP_DURATION_SECS",))
+"""Validated numeric defaults; only ENV_INTEGER_DEFAULTS may feed Bash arithmetic. The guard models the
 script's own content, not the invoking environment: the CI workflow owns that environment, and a person who
 sets their own environment already has a shell. Any other `${X:-...}`, `${X-...}`, positional parameter or
 `read` value that reaches a sink is refused by name. r23 decision 4: that trust rests on two things the
-guard checks, the digits-only `case` validation measure-envelope.sh runs right after the NAME="${NAME:-<digits>}"
+guard checks, the integer or decimal `case` validation measure-envelope.sh runs right after the NAME="${NAME:-<digits>}"
 self-default line of every name here (ENV_NUMERIC_VALIDATION, asserted by
 test_env_numeric_defaults_are_validated_digits_only_4734_r23), and the content pin of the script
 (PINNED_CONTENT), so neither line can change without a full review of the diff."""
@@ -909,7 +900,13 @@ ENV_NUMERIC_VALIDATION = (
     "  ''|*[!0-9]*) echo \"FATAL: {name} must be digits only\" >&2; exit 65 ;;\n"
     "esac\n"
 )
-ENV_NUMERIC_DEFAULT_VALUES = {"STEP_DURATION_SECS": "20"}  # r23 decision 4: the self-default of each name
+ENV_NUMERIC_DEFAULT_VALUES = {"STEP_DURATION_SECS": "20", "P95_BUDGET_MS": "250", "SHED_RATE_KNEE": "0.01"}  # r23 decision 4: the self-default of each name
+ENV_DECIMAL_VALIDATION = (
+    '{name}="${{{name}:-{default}}}"\n'
+    'case "${name}" in\n'
+    "  ''|*[!0-9.]*|*.*.*|.) echo \"FATAL: {name} must be a decimal number\" >&2; exit 65 ;;\n"
+    "esac\n"
+)
 FUNC_NUMERIC = {"now_ms": "9a85ef3cf712502a8fcbd75f0c7d519cd7f9f2a1b3f74c3821237d615f27df50"}
 """r22 decision 2d: a script-defined function is a numeric source only when its name and the sha256 of its
 definition text (from `name() {` to its closing brace, comments removed) are pinned here."""
@@ -1035,7 +1032,7 @@ class _ArithSinks:
         if m:
             return bool(m.group(3)) or self.var_numeric(m.group(1) or m.group(2), seen)
         m = re.match(r"\$\{(?:#[A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\])?|([A-Za-z_][A-Za-z0-9_]*):-[0-9]+)\}\Z", value)
-        return bool(m) and (m.group(1) is None or m.group(1) in ENV_NUMERIC_DEFAULTS)
+        return bool(m) and (m.group(1) is None or m.group(1) in ENV_INTEGER_DEFAULTS)
 
     def var_numeric(self, name, seen=frozenset()):
         """every assignment of `name` in the script is provably a number (and there is at least one)"""
@@ -1081,7 +1078,7 @@ class _ArithSinks:
                         return i
                 else:
                     default = re.match(r"([A-Za-z_][A-Za-z0-9_]*):-[0-9]+\Z", body)
-                    if not (default and default.group(1) in ENV_NUMERIC_DEFAULTS):
+                    if not (default and default.group(1) in ENV_INTEGER_DEFAULTS):
                         return i
                 i = close
                 continue
@@ -1995,6 +1992,379 @@ FUNCTION_BODIES = {  # r15 K8: the whole body of each function, as _norm_lines r
 }
 
 
+# #8312: closed shell grammar, following the subset-before-semantics precedent
+# of #8262 (vote 1795854b). Regexes below are whole-production recognisers,
+# never a blocklist: an unmatched byte refuses the entire statement. The older
+# scanners below remain semantic diagnostics and regression oracles; they do
+# not decide which shell language is accepted. Content pins remain the gate
+# under vote 6def5ab6 / decision 7b9d9baf.
+#
+# script := (blank | comment | literal-block | statement)* EOF
+# statement := fixed-command | fixed-assignment | numeric-assignment |
+#              safe-echo | fixed-condition | fixed-loop | closer
+# Complex interpreter calls and quoted SQL bodies are complete literal
+# productions, including both delimiters; their interior is never shell-lexed.
+# No production accepts a general command word, arbitrary function definition,
+# arbitrary redirection, arithmetic builtin, assignment builtin or wrapper.
+# Whitespace is ASCII space/tab; only LF ends a line. A continuation
+# has no production. A trailing comment follows a COMPLETE production.
+# Arithmetic is decimal literals and + or - over names written by a numeric
+# production earlier in the same scope. No shell numeric name is trusted.
+# The guard models the script's own content, not the invoking environment.
+GRAMMAR_MESSAGE_8312 = "%s: line %d: unsupported shell construct: %s"
+G_SAFE_REFS = frozenset((
+    "RUN", "PROJECT", "PG_CONTAINER", "COMPOSE_DIR", "COMPOSE_FILE_PINNED",
+    "RESULTS_DIR", "DAEMON_PID", "DAEMON_HOST", "DAEMON_PORT", "ADMISSION_CAP",
+    "CONCURRENCY_STEPS", "STEP_DURATION_SECS", "P95_BUDGET_MS", "SHED_RATE_KNEE",
+    "path_count", "st", "pool_mode", "auth_type", "rc", "wid", "n", "out",
+    "bodyf", "agent", "title", "t0", "t1", "code", "cur_id", "prev_id",
+    "conc", "step_out", "worker_rc", "p50", "p95", "p99", "shed", "reqs",
+    "KNEE", "last", "BIN",
+))
+G_CONCURRENCY_STEPS = (8, 16, 32, 64, 128, 256, 512, 1024)
+G_FIXED_ASSIGNMENTS = (
+    'PGBOUNCER_UID="$(id -u)"', 'PGBOUNCER_GID="$(id -g)"',
+    'RUN="${AI_MEMORY_SMOKE_RUN:-$(date +%s)-$$}"',
+    'PROJECT="ai-memory-pgbouncer-smoke-$RUN"',
+    'PROJECT="ai-memory-pgbouncer-envelope-$RUN"',
+    'PG_CONTAINER="ai-memory-pgbouncer-$RUN-postgres"',
+    'USERLIST=".userlist.generated.$RUN.txt"',
+    'USERLIST="../pgbouncer/.userlist.generated.$RUN.txt"',
+    'COMPOSE_DIR="$PWD"', 'COMPOSE_DIR="$PWD/../pgbouncer"',
+    'COMPOSE_FILE_PINNED="$COMPOSE_DIR/docker-compose.yml"',
+    'DAEMON_PORT="${DAEMON_PORT:-9077}"', 'DAEMON_HOST="127.0.0.1"',
+    'CONCURRENCY_STEPS="${CONCURRENCY_STEPS:-%s}"' % ' '.join(str(n) for n in G_CONCURRENCY_STEPS),
+    'ADMISSION_CAP="${AI_MEMORY_MAX_INFLIGHT_REQUESTS:-0}"',
+    'RESULTS_DIR="${RESULTS_DIR:-./.local-runs/envelope-$$}"',
+    'DAEMON_PID=""', 'DAEMON_PID=$!', 'STORE_URL_FILE="$RESULTS_DIR/.store-url"',
+    'BIN="$(cd ../.. && echo "$PWD/target/release/ai-memory")"',
+    'BASE="http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1"',
+    'step_out="$RESULTS_DIR/step-${conc}"', 'KNEE=""', 'KNEE="$conc"',
+    'pids=()', 'pids+=($!)', 'worker_rc=0', 'rc=$?', 'rc=1',
+    'local wid="$1" out="$2" deadline="$3" n=0 prev_id=""',
+    'local bodyf="${out}.body"',
+    'local agent="env-w${wid}" title="w${wid}-m${n}"',
+    'local t0 code t1 cur_id',
+    'last=$(printf \'%s\\n\' $CONCURRENCY_STEPS | tail -1)',
+)
+G_FIXED_COMMANDS = (
+    'set -euo pipefail', 'cd "$(dirname "$0")"',
+    'export POSTGRES_PASSWORD="$PW"', 'export PGPASSWORD="$PW"',
+    'export PGBOUNCER_UID PGBOUNCER_GID', 'export AI_MEMORY_SMOKE_RUN="$RUN"',
+    'trap cleanup EXIT',
+    'rm -f "$USERLIST"', 'rm -f "$USERLIST" "${STORE_URL_FILE:-}"',
+    'rm -f "$bodyf"', 'mkdir -p "$RESULTS_DIR"',
+    'rm -rf "$step_out"; mkdir -p "$step_out"',
+    '(umask 077; printf \'%s\\n\' "$VERIFIER_ROW" > "$USERLIST")',
+    '( umask 077; printf \'%s\\n\' "$POOLED_URL" >"$STORE_URL_FILE" )',
+    '[ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true',
+    '[ -n "$cur_id" ] && prev_id="$cur_id"',
+    '( cd ../.. && cargo build --release --features sal-postgres --quiet )',
+    '"$BIN" schema-init --store-url "$POOLED_URL"',
+    'worker "$w" "$step_out/w${w}.txt" "$deadline" &',
+    'sleep 1', 'break', 'echo', 'exit "$rc"',
+    'printf \'%-8s %8s %8s %8s %10s %8s\\n\' "CONC" "p50ms" "p95ms" "p99ms" "shed%" "reqs"',
+    'printf \'%-8s %8s %8s %8s %10s %8s\\n\' "$conc" "$p50" "$p95" "$p99" "$shed" "$reqs"',
+)
+G_CONDITIONS = (
+    'if [ "$(id -u)" -eq 0 ]; then',
+    'if [ "${#RUN}" -gt 64 ]; then',
+    'if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then',
+    'if [ "${path_count:-0}" -lt 1 ]; then',
+    'if [ "$st" != "30s" ]; then',
+    'if [ "$pool_mode" != "transaction" ]; then',
+    'if [ "$auth_type" != "scram-sha-256" ]; then',
+    'if [ -n "$prev_id" ] && [ -n "$cur_id" ]; then',
+    'if [ "$over_p95" = "1" ] || [ "$over_shed" = "1" ]; then',
+    'if [ -n "$KNEE" ]; then',
+)
+G_LOOPS = (
+    'for _ in $(seq 1 30); do', 'for conc in $CONCURRENCY_STEPS; do',
+    'for w in $(seq 1 "$conc"); do',
+    'while [ "$(date +%s)" -lt "$deadline" ]; do',
+)
+G_HEALTH = 'curl -fsS "http://${DAEMON_HOST}:${DAEMON_PORT}/api/v1/health" >/dev/null 2>&1'
+G_NOW_MS = "now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }"
+# Fixed compound commands are terminal productions, not a wildcard for the
+# command's arguments or a prefix match. Each embedded interpreter is literal.
+G_COMPOUND_COMMANDS = (
+    PW_GEN, POOLED_URL_LITERAL, POOLED_URL_ENVELOPE, PSQL_POOLED_DEF,
+    *INTERPRETER_SITES[SMOKE][1:],
+    *INTERPRETER_SITES[ENVELOPE][-2:],
+    *[line for line in FUNCTION_BODIES[ENVELOPE]['worker'] if line.startswith('code=$(curl ')],
+    FUNCTION_BODIES[ENVELOPE]['need'][0],
+    'path_count="$(printf \'%s\' "$path_count" | tr -dc \'0-9\')"',
+    'for p in "${pids[@]}"; do wait "$p" || worker_rc=$?; done',
+    REAPING_PINS[ENVELOPE][-1],
+    CLEANUP_BODY[SMOKE][1],
+    'POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait postgres',
+    'POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-directory "$COMPOSE_DIR" -p "$PROJECT" up -d --wait',
+    'AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_MAX_INFLIGHT_REQUESTS="$ADMISSION_CAP" "$BIN" serve --host "$DAEMON_HOST" --port "$DAEMON_PORT" >"$RESULTS_DIR/daemon.log" 2>&1 &',
+    'if ' + G_HEALTH + '; then break; fi',
+    G_HEALTH + ' || { echo "FATAL: daemon did not become healthy; see $RESULTS_DIR/daemon.log" >&2; exit 71; }',
+    '[ -x "$BIN" ] || { echo "FATAL: built binary not found at $BIN" >&2; exit 70; }',
+    'st="$(psql_pooled -c \'SHOW statement_timeout;\')" || { echo "FAIL: SHOW statement_timeout through the pooler failed" >&2; exit 1; }',
+    'cfg="$(docker exec -e PGPASSWORD "$PG_CONTAINER" psql "postgres://ai_memory@pgbouncer:6432/pgbouncer" -tA -c \'SHOW CONFIG;\')" || { echo "FAIL: SHOW CONFIG on the pooler admin console failed" >&2; exit 1; }',
+    'VERIFIER_ROW="$(docker exec "$PG_CONTAINER" psql -U ai_memory -d ai_memory -tA -c "SELECT format(\'\\"%s\\" \\"%s\\"\', rolname, rolpassword) FROM pg_authid WHERE rolname = \'ai_memory\'")"',
+)
+G_SQL_PREFIX = ('BEGIN;', "LOAD 'age';", 'SET LOCAL search_path = ag_catalog, "$user", public;')
+G_LITERAL_BLOCKS = (
+    ('verifier-case', ('case "$VERIFIER_ROW" in', '\'"ai_memory" "SCRAM-SHA-256$\'*) ;;',
+     '*) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;', 'esac')),
+    ('run-name-case', ('case "$RUN" in', RUN_CASE_ARM, 'esac')),
+    ('password-free-url-case', ('case "${POOLED_URL#*://}" in',
+     '*:*@*) echo "FATAL: POOLED_URL must not carry a password in its userinfo" >&2; exit 74 ;;', 'esac')),
+    ('integer-default-validation', (
+     'STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"',
+     'case "$STEP_DURATION_SECS" in',
+     '\'\'|*[!0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;', 'esac')),
+    *(("decimal-validation-" + name, tuple(ENV_DECIMAL_VALIDATION.format(
+        name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name]).rstrip("\n").split("\n")))
+      for name in ("P95_BUDGET_MS", "SHED_RATE_KNEE")),
+    ('sql-create-heredoc', (
+     'psql_pooled <<\'SQL\' || { echo "FAIL: AGE cypher transaction through the pooler failed" >&2; exit 1; }',
+     *G_SQL_PREFIX, "SELECT create_graph('pgbouncer_smoke');",
+     "SELECT * FROM cypher('pgbouncer_smoke', $$ MERGE (a:N {id:'a'}) MERGE (b:N {id:'b'}) MERGE (a)-[:E]->(b) RETURN a $$) AS (a agtype);", 'COMMIT;', 'SQL')),
+    ('sql-count-heredoc', ('path_count="$(psql_pooled <<\'SQL\'', *G_SQL_PREFIX,
+     "SELECT count(*) FROM cypher('pgbouncer_smoke', $$ MATCH (a:N {id:'a'})-[:E]->(b:N {id:'b'}) RETURN a $$) AS (a agtype);",
+     'COMMIT;', 'SQL', ')" || { echo "FAIL: AGE edge lookup through the pooler failed" >&2; exit 1; }')),
+    ('json-id-program', ("cur_id=$(python3 -c 'import json,sys",
+     'try: print(json.load(open(sys.argv[1])).get("id",""))',
+     'except Exception: print("")\' "$bodyf" 2>/dev/null || echo "")')),
+    ('aggregate-program', ("read -r p50 p95 p99 shed reqs < <(cat \"$step_out\"/w*.txt 2>/dev/null | python3 -c '",
+     'import sys', 'lat=[]; shed=0; tot=0', 'for line in sys.stdin:',
+     '    parts=line.split()', '    if len(parts)!=3: continue', '    _,code,ms=parts',
+     '    tot+=1', '    if code=="503": shed+=1', '    try: lat.append(int(ms))',
+     '    except ValueError: pass', 'lat.sort()', 'def pct(p):', '    if not lat: return 0',
+     '    i=min(len(lat)-1, int(p/100.0*len(lat)))', '    return lat[i]',
+     'sr = (shed/tot) if tot else 0.0', 'print(pct(50), pct(95), pct(99), f"{sr:.4f}", tot)', "')")),
+)
+G_REF = re.compile(r'\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(:-<unreported>)?\}|([A-Za-z_][A-Za-z0-9_]*))')
+G_ARITH_TOKEN = re.compile(r'[0-9]+|[A-Za-z_][A-Za-z0-9_]*|[+-]')
+G_ECHO = re.compile(r'echo ("(?:[^"\\\n]|\\["\\])*")(?: (>&2|>> "\$out"))?')
+G_REFUSED_CONTROL = re.compile(r'[\x00-\x08\x0b-\x1f\x7f\x85\u2028\u2029\ufeff]')
+
+
+def _grammar_arithmetic(expr, numeric):
+    """A small additive grammar; quotes, substitutions and other sinks have no production."""
+    tokens = G_ARITH_TOKEN.findall(expr)
+    if ''.join(tokens) != re.sub(r'[ \t]', '', expr) or not tokens:
+        return False
+    operand = True
+    for token in tokens:
+        if operand:
+            if not (token.isascii() and token.isdecimal()) and token not in numeric:
+                return False
+        elif token not in ('+', '-'):
+            return False
+        operand = not operand
+    return not operand
+
+
+def _grammar_echo(word, numeric):
+    """Double-quoted text with non-secret references, never shell program text."""
+    i, end = 1, len(word) - 1
+    while i < end:
+        if word[i] in '`\\':
+            return False
+        if word.startswith('$((', i):
+            stop = word.find('))', i + 3)
+            if stop < 0 or not _grammar_arithmetic(word[i + 3:stop], numeric):
+                return False
+            i = stop + 2
+        elif word.startswith('${CONCURRENCY_STEPS// /, }', i):
+            i += len('${CONCURRENCY_STEPS// /, }')
+        elif word[i] == '$':
+            match = G_REF.match(word, i)
+            if match is None or (match.group(1) or match.group(3)) not in G_SAFE_REFS:
+                return False
+            i = match.end()
+        else:
+            i += 1
+    return i == end
+
+
+def _grammar_refusal(line):
+    """Diagnostic selection ONLY. Every non-production refuses, regardless of this name list."""
+    if '$[' in line:
+        return 'deprecated arithmetic'
+    if ':=' in line or line.startswith(('P95_BUDGET_MS=', 'SHED_RATE_KNEE=', 'unset ', 'export ', 'readonly ', 'STEP_DURATION_SECS=', 'SECONDS=', 'RANDOM=', 'LINENO=')):
+        return 'numeric provenance'
+    if line.startswith(('let ', '[[ ', 'test -v ', 'read ', 'declare ', 'typeset ', 'local ')):
+        return 'arithmetic sink'
+    if re.match(r'(?:function[ \t]+|[A-Za-z_][A-Za-z0-9_]*[ \t]*\()', line):
+        return 'function definition'
+    try:
+        words = shlex.split(line)
+        first = words[0].rsplit('/', 1)[-1] if words else ''
+    except ValueError:
+        words, first = [], ''
+    if first in ('stdbuf', 'setsid', 'flock', 'taskset', 'find'):
+        return 'command wrapper'
+    if first in NESTED_SHELLS or first in ('.', 'source') or (
+            first in ('env', 'exec', 'command', 'timeout', 'sudo', 'xargs') and
+            any(word.rsplit('/', 1)[-1] in NESTED_SHELLS for word in words[1:])):
+        return NESTED_INTERPRETER
+    if '$(' in line:
+        return 'command substitution or arithmetic operand'
+    if line.endswith('\\'):
+        return 'line continuation'
+    if '<<' in line:
+        return 'heredoc outside a literal production'
+    return 'unrecognised statement'
+
+
+def _grammar_units(text):
+    """Physical LF lines only: continuations have no production."""
+    return list(enumerate(text.split('\n'), 1))
+
+
+def shell_grammar_problems(text, name='text', trace=None):
+    """Consume the complete script in a closed grammar; no production means a named refusal.
+
+    `trace`, when supplied, receives (raw line, production name) for the consumed
+    units, including comments and every literal-block line. No subprocess runs.
+    """
+    def refused(n, what):
+        return [GRAMMAR_MESSAGE_8312 % (name, n, what)]
+    control = G_REFUSED_CONTROL.search(text)
+    if control:
+        return refused(text.count('\n', 0, control.start()) + 1, 'control character U+%04X' % ord(control.group()))
+    units = _grammar_units(text)
+    stack, numeric, defined = [], set(), set()
+    i = 0
+    while i < len(units):
+        n, raw = units[i]
+        line = raw.strip(' \t')
+        production, consumed = None, 1
+        if not line or line.startswith('#'):
+            production = 'comment' if line else 'blank'
+        else:
+            # Match full literal programs before any whitespace or comment rule
+            # can rewrite their body. Only outer shell indentation is flexible.
+            for label, block in G_LITERAL_BLOCKS:
+                if stack and 'validation' in label:
+                    continue
+                j, matched = i, []
+                for k, wanted in enumerate(block):
+                    if label == 'integer-default-validation':
+                        while j < len(units) and units[j][1].lstrip(' \t').startswith('#'):
+                            matched.append(j)
+                            j += 1
+                    if j >= len(units):
+                        break
+                    got = units[j][1]
+                    if (label == 'aggregate-program' and k not in (0, len(block) - 1)) or (
+                            label == 'json-id-program' and k > 0) or wanted == 'SQL':
+                        equal = got == wanted
+                    else:
+                        equal = got.strip(' \t') == wanted.strip(' \t')
+                    if not equal:
+                        break
+                    matched.append(j)
+                    j += 1
+                else:
+                    production, consumed = label, j - i
+                    if label == 'integer-default-validation':
+                        numeric.add('STEP_DURATION_SECS')
+                    elif label.startswith('decimal-validation-'):
+                        defined.add(label)
+                    break
+            if production is None:
+                # A comment can follow a complete production, but is never
+                # stripped from inside a word or an incomplete quoted program.
+                candidates = [line]
+                candidates += [line[:m.start()] for m in re.finditer(r'[ \t]+#', line)]
+                for candidate in candidates:
+                    production = _grammar_statement(candidate, numeric, defined, stack)
+                    if production:
+                        break
+        if production is None:
+            return refused(n, _grammar_refusal(line))
+        if trace is not None:
+            trace.extend((units[k][0], production) for k in range(i, i + consumed))
+        i += consumed
+    if stack:
+        return refused(len(text.split('\n')), 'unclosed ' + stack[-1][0])
+    return []
+
+
+def _grammar_statement(line, numeric, defined, stack):
+    """Recognise one COMPLETE production; update state only after a successful match."""
+    if line == G_NOW_MS:
+        if stack or 'now_ms' in defined:
+            return None
+        defined.add('now_ms')
+        return 'numeric-clock-function'
+    if line in ('cleanup() {', 'psql_pooled() {', 'worker() {'):
+        fname = line.split('(', 1)[0]
+        if stack or fname in defined:
+            return None
+        defined.add(fname)
+        stack.append(('function', set(numeric)))
+        return 'function-open'
+    if line in G_CONDITIONS:
+        stack.append(('if', set(numeric)))
+        return 'condition-open'
+    if line in G_LOOPS:
+        stack.append(('loop', set(numeric)))
+        return 'loop-open'
+    if line == 'else':
+        if not stack or stack[-1][0] != 'if':
+            return None
+        _, before = stack.pop()
+        numeric.intersection_update(before)
+        stack.append(('else', before))
+        return 'else'
+    if line in ('fi', 'done', '}'):
+        want = {'fi': 'if', 'done': 'loop', '}': 'function'}[line]
+        if not stack or (stack[-1][0] != want and not (want == 'if' and stack[-1][0] == 'else')):
+            return None
+        _, before = stack.pop()
+        numeric.intersection_update(before)
+        return 'close-' + want
+    if line in G_FIXED_ASSIGNMENTS:
+        if line.startswith('local ') and not any(kind == 'function' for kind, _ in stack):
+            return None
+        if line.startswith('local wid='):
+            numeric.add('n')
+        return 'fixed-assignment'
+    if line in G_FIXED_COMMANDS:
+        return 'fixed-command'
+    if line in G_COMPOUND_COMMANDS:
+        if line.startswith('need()'):
+            if stack or 'need' in defined:
+                return None
+            defined.add('need')
+        for name in ('P95_BUDGET_MS', 'SHED_RATE_KNEE'):
+            if '$' + name in line and 'decimal-validation-' + name not in defined:
+                return None
+        return 'literal-command'
+    if 'need' in defined and re.fullmatch(r'need (?:docker|curl|cargo|python3)', line):
+        return 'tool-requirement'
+    if re.fullmatch(r'exit (?:0|1|64|65|69|70|71|72|73|74)', line):
+        return 'literal-exit'
+    match = re.fullmatch(r'(n|t0|t1|deadline)=([0-9]+)', line)
+    if match:
+        numeric.add(match.group(1))
+        return 'numeric-literal-assignment'
+    match = re.fullmatch(r'(t0|t1)=\$\(now_ms\)', line)
+    if match and 'now_ms' in defined:
+        numeric.add(match.group(1))
+        return 'numeric-clock-assignment'
+    match = re.fullmatch(r'(n|t0|t1|deadline)=\$\(\((.*)\)\)', line)
+    if match:
+        expr = match.group(2).replace('$(date +%s)', '0')
+        if _grammar_arithmetic(expr, numeric):
+            numeric.add(match.group(1))
+            return 'numeric-additive-assignment'
+        return None
+    match = G_ECHO.fullmatch(line)
+    if match and _grammar_echo(match.group(1), numeric):
+        return 'safe-echo'
+    return None
+
+
 class PgbouncerSmokeComposeTest(unittest.TestCase):
     def test_every_publish_is_loopback_only(self):
         services = _services()
@@ -2579,7 +2949,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             codes = [int(c) for ln in code for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)]
             big = sorted(c for c in codes if c >= 64)
             # 65 has one meaning (a bad input value) at pinned sites: AI_MEMORY_SMOKE_RUN's character class
-            # and 64-character bound, plus (r23 decision 4) the envelope's digits-only STEP_DURATION_SECS check.
+            # and 64-character bound, plus the envelope's integer and decimal numeric checks (#8312).
             self.assertEqual(big.count(65), 3 if path == ENVELOPE else 2, "%s: exit 65 sites" % path.name)
             big = [c for c in big if c != 65] + [65]
             self.assertEqual(len(big), len(set(big)), "%s: exit code reused: %r" % (path.name, big))
@@ -3683,23 +4053,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # array subscripts and substring offsets; the shell's own numeric parameters, a pinned ${NAME:-digits}
         # default and a pinned function are numbers; anything else reaching a sink is refused by name.
         what = "arithmetic on a value that is not a number literal"
-        decoy = "echo RAN:%s compose -f ./decoy.yml config >&3"
-        refused = {
-            "s_join_brace": ("exec 3>&1\nx='$'\np=\"b[${x}($(%s))]\"\n: $((p))\n" % (decoy % "s_join_brace"), what, (4, 6)),
-            "s_join_plain": ("exec 3>&1\nx='$'\np=\"b[$x($(%s))]\"\n: $((p))\n" % (decoy % "s_join_plain"), what, (4, 6)),
-            "s_dbrack": ("exec 3>&1\nx='$'\np=\"b[${x}($(%s))]\"\n[[ $p -eq 0 ]]\n" % (decoy % "s_dbrack"), what, (4, 4)),
-            "s_substr": ("exec 3>&1\nx='$'\np=\"$(%s)1\"\ns=abcdef\n: ${s:p}\n" % (decoy % "s_substr"), what, (5, 7)),
-            "d4_atE": ("exec 3>&1\np='b[\\x24(%s)]'\nq=\"${p@E}\"\n: $((q))\n" % (decoy % "d4_atE"), "a parameter transformation (${var@E})", (3, 7)),
-        }
-        controls = {  # 2a: a `[ ]` test runs nothing; 2b: a special parameter; 2c: the pinned env default
-            "c_test_bracket": "p=0\n[ \"$p\" -eq 0 ] && echo RAN:c_test_bracket\n",
-            "c_test_word": "p=0\ntest \"$p\" -eq 0 && echo RAN:c_test_word\n",
-            "c_special": "n=$#\n: $((n+1))\necho RAN:c_special\n",
-            "c_lineno": ": $((LINENO+1))\necho RAN:c_lineno\n",
-            "c_envdefault": "d=$(( ${STEP_DURATION_SECS:-20} + 1 ))\necho RAN:c_envdefault\n",
-            "c_selfnum": "n=0\nn=$((n+1))\necho RAN:c_selfnum\n",
-        }
-        self._assert_rows_against_bash(refused, controls)
+        for label, construct, refusal in GRAMMAR_REFUSAL_ROWS:
+            if label.startswith(("K25", "K26", "K29")):
+                with self.subTest(label=label):
+                    self.assertIn(refusal, "\n".join(shell_grammar_problems(construct, label)))
         # 2d: a script function is numeric only when its name and the sha256 of its body are pinned; the real
         # now_ms body is pinned, a changed body or an unpinned function at a sink is refused by name
         self.assertEqual(sorted(FUNC_NUMERIC), ["now_ms"])
@@ -3712,7 +4069,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertEqual(_shell_prepass(unpinned, "e")[1], "e: line 3 col 6: " + what)
         # 2c: ENV_NUMERIC_DEFAULTS is a pinned set, with a docstring stating the guard models the script's own
         # content, not the invoking environment; any other ${X:-...} or positional reaching a sink is refused
-        self.assertEqual(sorted(ENV_NUMERIC_DEFAULTS), ["STEP_DURATION_SECS"])
+        self.assertEqual(sorted(ENV_NUMERIC_DEFAULTS), ["P95_BUDGET_MS", "SHED_RATE_KNEE", "STEP_DURATION_SECS"])
         self.assertIn("models the script's own content", pathlib.Path(inspect.getfile(type(self))).read_text())
         self.assertEqual(_shell_prepass(": $(( ${OTHER:-5} + 1 ))\n", "e")[1], "e: line 1 col 7: " + what)
         self.assertEqual(_shell_prepass(': $(( "$3" + 1 ))\n', "e")[1], "e: line 1 col 8: " + what)
@@ -3791,16 +4148,17 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # body line `x\ ` (a trailing blank, so bash does NOT remove the newline) or `x\` + CR reads, once the
         # blank is stripped, as a backslash-newline the pre-pass refuses (fail-closed). _code_lines now keeps
         # the raw line positions (a whole-line comment becomes an empty line), so the refusal names the raw line
-        # of the body (120 here), not a derived-text line (54 on b97ca5e40). Both rows stay RED either way.
+        # of the inserted body, not a derived-text line. Both rows stay RED either way.
         text = (SMOKE).read_text().split("\n")
-        self.assertEqual(text[118], "", "smoke-test.sh line 119 is blank")
+        insertion = text.index("# psql THROUGH the pooler is run from inside the postgres container (it has") - 1
+        self.assertEqual(text[insertion], "", "insertion point is a blank physical line")
         for tag, body_line in (("K21-own-bs-space", "x\\ "), ("K21-own-crlf", "x\\\r")):
             lines = list(text)
-            lines[118:119] = ["cat <<E >/dev/null", body_line, "E"]
+            lines[insertion:insertion + 1] = ["cat <<E >/dev/null", body_line, "E"]
             injected = "\n".join(lines)
             raw = types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda injected=injected: injected.encode("utf-8"))
             body = _code_body(raw)
-            self.assertEqual(_wait_refusals(body, "smoke-test.sh"), ["smoke-test.sh: line 120 col 2: a backslash-newline inside an unquoted heredoc body"], tag)
+            self.assertEqual(_wait_refusals(body, "smoke-test.sh"), ["smoke-test.sh: line %d col 2: a backslash-newline inside an unquoted heredoc body" % (insertion + 2)], tag)
 
     def test_guarded_files_content_pinned_4734_r23(self):
         # r23 decision 1 (vote C, memory 7b9d9baf): the content pins are the gate; the classifier is defence in
@@ -3863,11 +4221,12 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         text = ENVELOPE.read_text()
         self.assertEqual(sorted(ENV_NUMERIC_DEFAULT_VALUES), sorted(ENV_NUMERIC_DEFAULTS))
         for name in sorted(ENV_NUMERIC_DEFAULTS):
-            block = ENV_NUMERIC_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+            template = ENV_NUMERIC_VALIDATION if name in ENV_INTEGER_DEFAULTS else ENV_DECIMAL_VALIDATION
+            block = template.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
             self.assertEqual(text.count(block), 1, name)
             code_before = "\n".join(ln for ln in text[: text.index(block)].split("\n") if not ln.lstrip().startswith("#"))
             self.assertNotIn(name, code_before, "%s is read before its validation" % name)
-            self.assertNotIn("$" + name, block.split("\n")[3], "the FATAL line must not echo the value of %s" % name)
+            self.assertNotIn("$" + name, next(line for line in block.split("\n") if "FATAL:" in line), "the FATAL line must not echo the value of %s" % name)
 
     def test_transformation_refusal_anchors_to_the_parameter_4734_r23(self):
         # r23 decision 3 (K30): an `@` inside a default value word is text, not a transformation; ${v@Q},
@@ -3943,17 +4302,13 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # r11 Q16 (D7): an escaped `<` makes `<<word` an input redirect, so the next line is code.
         self.assertEqual(scan(["cat \\<<word > a.txt", "echo b > c.txt"], "t"), ["a.txt", "c.txt"])
 
-    def test_dump_word_patterns_selftest(self):
-        # r10 S9: the words are refused anywhere once quotes and backslashes are deleted;
-        # env-w${wid} (a file-name prefix) and uppercase SQL SET LOCAL are not hits.
-        strip = lambda s: re.sub(r"[\\\"']", "", s)  # noqa: E731
-        for bad in ("timeout 5 env", "sh -c env", "e\"\"nv", "\\env", "builtin declare -x", "bash -c 'set'", "x; export"):
-            s = strip(bad)
-            self.assertTrue(DUMP_WORD.search(s) or BARE_SET.search(s) or BARE_EXPORT.search(s), bad)
-        self.assertTrue(LOCAL_NAMEREF.search("local -n ref=x"))
-        for ok in ("w${wid} env-w${wid}.txt", "SET LOCAL search_path = a, b", "set -euo pipefail", "envelope"):
-            s = strip(ok)
-            self.assertFalse(DUMP_WORD.search(s) or BARE_SET.search(s) or BARE_EXPORT.search(s), ok)
+    def test_dump_constructs_have_no_grammar_production_8312(self):
+        for text in ("timeout 5 env", "sh -c env", 'e""nv', "\\env", "builtin declare -x",
+                     "bash -c 'set'", "x; export", "local -n ref=x", "set -x", "set", "export",
+                     "docker inspect plain", "docker compose config", "cat /proc/self/environ"):
+            with self.subTest(text=text):
+                self.assertTrue(shell_grammar_problems(text), text)
+        self.assertEqual(shell_grammar_problems('set -euo pipefail\necho "envelope"'), [])
 
     def test_exit_status_caveat_is_identical_in_the_four_docs(self):
         # r11 Q13: one caveat sentence, identical (whitespace collapsed) in both
@@ -3983,21 +4338,10 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self.assertEqual(set(rows), used | {0}, "%s: header exit table differs from the exit codes the script uses" % path.name)
 
     def _assert_exec_surface(self, path):
-        """r9 S7: tracing, bare builtins, dump commands, container metadata,
-        interpreter call sites and the redirect-target variables are pinned."""
+        """#8312: closed grammar first, then interpreter and redirect-target semantic pins."""
         name = path.name
+        self.assertEqual(shell_grammar_problems(_script_text(path), name), [])
         lines = _norm_lines(path)
-        for ln in lines:
-            self.assertNotRegex(ln, SHELL_TRACE, "%s: shell tracing prints expanded secrets: %s" % (name, ln))
-            bare = re.sub(r"[\\\"']", "", ln)
-            self.assertNotRegex(bare, DUMP_WORD, "%s: env/printenv/declare/typeset word on a code line: %s" % (name, ln))
-            self.assertNotRegex(bare, BARE_SET, "%s: bare set lists the environment: %s" % (name, ln))
-            self.assertNotRegex(bare, BARE_EXPORT, "%s: bare export lists the environment: %s" % (name, ln))
-            self.assertNotRegex(bare, LOCAL_NAMEREF, "%s: local -n nameref can read the password: %s" % (name, ln))
-            self.assertNotRegex(ln, PSQL_META, "%s: psql backslash command (shell escape) in a heredoc: %s" % (name, ln))
-            self.assertNotRegex(ln, EXEC_DUMP, "%s: docker exec of an environment dumper: %s" % (name, ln))
-            self.assertNotRegex(ln, DOCKER_DISCLOSE, "%s: docker inspect/compose config discloses env: %s" % (name, ln))
-            self.assertNotRegex(ln, ENVIRON_WORD, "%s: environ access: %s" % (name, ln))
         sites = [ln for ln in lines if INTERPRETER.search(ln)]
         self.assertEqual(sites, INTERPRETER_SITES[path], "%s: interpreter call sites differ from the allowlist" % name)
         for var in ("USERLIST", "STORE_URL_FILE", "RESULTS_DIR", "out"):
@@ -4015,8 +4359,6 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # targets the userlist, the envelope store-url file, the daemon log, the
         # per-worker result file or /dev/null.
         for path in SCRIPTS:
-            for ln in _norm_lines(path):
-                self.assertNotRegex(ln, ENV_DUMPERS, "%s: command can dump the whole environment: %s" % (path.name, ln))
             self._assert_exec_surface(path)
             targets = self._redirect_targets(path)
             self.assertGreaterEqual(len(targets), 2, "%s: redirect scan found nothing" % path.name)
@@ -4140,6 +4482,140 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         own_name = "test_guard_prose_never_names_the_retired_%s_remedy_4734_r24" % needle
         source = pathlib.Path(__file__).read_text()
         self.assertEqual(source.replace(own_name, "").count(needle), 0)
+
+
+# #8312: plain construct classes, never executed injection payloads.
+GRAMMAR_REFUSAL_ROWS = (
+    ("K25-let-single", "let 'n=1'", "arithmetic sink"),
+    ("K25-let-double", 'let "n=1"', "arithmetic sink"),
+    ("K25-compare", '[[ "1" -eq "1" ]]', "arithmetic sink"),
+    ("K25-unset", "unset 'a[1]'", "numeric provenance"),
+    ("K25-test-v", "test -v 'a[1]'", "arithmetic sink"),
+    ("K25-read", "read 'a[1]'", "arithmetic sink"),
+    ("K26-default-assign", ': "${n:=1}"', "numeric provenance"),
+    ("K26-export", 'export "n=1"', "numeric provenance"),
+    ("K26-readonly", 'readonly "n=1"', "numeric provenance"),
+    ("K26-unset-numeric", 'unset SECONDS', "numeric provenance"),
+    ("K26-write-default", 'STEP_DURATION_SECS=1', "numeric provenance"),
+    ("K27-keyword", 'function now_ms { :; }', "function definition"),
+    ("K27-spaced", 'now_ms () { :; }', "function definition"),
+    ("K27-newline", 'now_ms()\n{ :; }', "function definition"),
+    ("K28-stdbuf", 'stdbuf -oL true', "command wrapper"),
+    ("K28-setsid", 'setsid true', "command wrapper"),
+    ("K28-flock", 'flock 9 true', "command wrapper"),
+    ("K28-taskset", 'taskset -c 0 true', "command wrapper"),
+    ("K28-find", r'find . -exec true {} \;', "command wrapper"),
+    ("K29-live-substitution", 'n="$(printf 1)"', "command substitution"),
+    ("INFO5-flags", 'local -r -i n=1', "arithmetic sink"),
+    ("INFO5-later-flag", 'declare n -i', "arithmetic sink"),
+    ("INFO5-legacy-quoted", 'echo "$[1+1]"', "deprecated arithmetic"),
+    ("INFO5-normalised-word", "'sh' -c ':'", "a nested shell interpreter"),
+    ("unknown-command", 'unexpected_command', "unrecognised statement"),
+)
+
+
+class StrictSubsetGrammar8312(unittest.TestCase):
+    def test_plain_accept_rows_8312(self):
+        rows = (
+            '# a comment mentioning sh, let, stdbuf and $()\n',
+            'set -euo pipefail\necho "plain text" # trailing comment\n',
+            'n=0\nn=$((n+1))\necho "count $n"\n',
+            G_NOW_MS + '\nt0=$(now_ms)\nt1=$(now_ms)\necho "elapsed $((t1-t0))"\n',
+            'n=0\nif [ "$(id -u)" -eq 0 ]; then\nn=1\nelse\nn=2\nfi\nn=$((n+1))\n',
+        )
+        for text in rows:
+            with self.subTest(text=text):
+                self.assertEqual(shell_grammar_problems(text), [])
+
+    def test_structure_and_definite_numeric_provenance_8312(self):
+        rows = (
+            'n=$((n+1))',
+            'n=$((SECONDS+1))',
+            'if [ "$(id -u)" -eq 0 ]; then\nn=0\nfi\nn=$((n+1))',
+            'for _ in $(seq 1 30); do\nn=0\ndone\nn=$((n+1))',
+            'worker() {\nn=0\n}\nn=$((n+1))',
+            't0=$(now_ms)',
+            G_NOW_MS + '\n' + G_NOW_MS,
+            'if [ "$(id -u)" -eq 0 ]; then\nelse\nelse\nfi',
+            'for _ in $(seq 1 30); do\nfi',
+            'cleanup() {\nworker() {\n}\n}',
+            'cleanup() {',
+            'echo "plain"; unknown_command',
+            'echo "plain" \\ \nunknown_command',
+            'echo "plain" \\\nunknown_command',
+            'echo "plain"\r\n',
+            'echo "plain"\x00',
+            'echo "plain"\u2028unknown_command',
+            'echo "$PW"',
+            'echo "$POSTGRES_PASSWORD"',
+            'echo "$POOLED_URL"',
+        )
+        for text in rows:
+            with self.subTest(text=text):
+                self.assertTrue(shell_grammar_problems(text), text)
+
+    def test_literal_programs_consume_exact_delimiters_and_bodies_8312(self):
+        programs = dict(G_LITERAL_BLOCKS)
+        for label, old, new in (
+            ('sql-create-heredoc', 'SQL', ' SQL'),
+            ('sql-create-heredoc', "SELECT create_graph('pgbouncer_smoke');", 'SELECT 1;'),
+            ('json-id-program', 'try: print(json.load(open(sys.argv[1])).get("id",""))', ' print("plain")'),
+            ('aggregate-program', '    parts=line.split()', 'parts=line.split()'),
+        ):
+            text = '\n'.join(programs[label])
+            with self.subTest(label=label):
+                self.assertEqual(shell_grammar_problems(text), [])
+                self.assertTrue(shell_grammar_problems(text.replace(old, new)), label)
+
+    def test_decimal_validation_refuses_bad_values_without_echo_8312(self):
+        bash = shutil.which('bash')
+        self.assertIsNotNone(bash, 'bash is required for numeric-validation parity')
+        for name in ('P95_BUDGET_MS', 'SHED_RATE_KNEE'):
+            block = ENV_DECIMAL_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+            # Execute only the checked validation production, never a supplied command.
+            for value, status in (('0', 0), ('250', 0), ('0.01', 0), ('.5', 0), ('5.', 0),
+                                  ('.', 65), ('1.2.3', 65), ('-1', 65), ('1e2', 65), ('bad-value', 65)):
+                with self.subTest(name=name, value=value):
+                    proc = subprocess.run([bash, '--norc', '--noprofile', '-c', block],
+                                          env={name: value}, capture_output=True, text=True, timeout=10, check=False)
+                    self.assertEqual(proc.returncode, status)
+                    self.assertEqual(proc.stdout, '')
+                    if status:
+                        self.assertNotIn(value, proc.stderr)
+                        self.assertIn('FATAL: ' + name, proc.stderr)
+
+    def test_threshold_use_requires_prior_validation_8312(self):
+        for name, call in zip(('P95_BUDGET_MS', 'SHED_RATE_KNEE'), INTERPRETER_SITES[ENVELOPE][-2:]):
+            block = ENV_DECIMAL_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+            with self.subTest(name=name):
+                self.assertEqual(shell_grammar_problems(block + call), [])
+                self.assertTrue(shell_grammar_problems(call + '\n' + block))
+                self.assertTrue(shell_grammar_problems(block + name + '=1\n' + call))
+
+    def test_refuses_construct_classes_by_name_8312(self):
+        for tag, text, what in GRAMMAR_REFUSAL_ROWS:
+            with self.subTest(tag=tag):
+                problems = shell_grammar_problems(text + "\n", "row.sh")
+                self.assertTrue(problems, tag)
+                self.assertIn(what, problems[0], tag)
+                self.assertRegex(problems[0], r"row\.sh: line \d+: unsupported shell construct: ")
+
+    def test_decimal_thresholds_validate_before_use_8312(self):
+        text = ENVELOPE.read_text()
+        for name in ("P95_BUDGET_MS", "SHED_RATE_KNEE"):
+            with self.subTest(name=name):
+                self.assertIn('case "$%s" in' % name, text)
+                validation = text.index('case "$%s" in' % name)
+                first_use = text.index('$%s ' % name)
+                self.assertLess(validation, first_use)
+
+    def test_every_real_code_line_has_a_production_8312(self):
+        for path in SCRIPTS:
+            text = _script_text(path)
+            trace = []
+            self.assertEqual(shell_grammar_problems(text, path.name, trace), [])
+            self.assertEqual([number for number, _ in trace], list(range(1, len(text.split("\n")) + 1)))
+            self.assertTrue(all(production for _, production in trace))
 
 
 if __name__ == "__main__":
