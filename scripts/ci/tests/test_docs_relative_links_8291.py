@@ -13,6 +13,7 @@ Lives under scripts/ci/tests so the CI discover root runs it.
 Python 3.9 compatible, standard library only.
 """
 
+import os
 import re
 import shutil
 import tempfile
@@ -69,6 +70,21 @@ def exists_inside(root, candidate):
     return real.exists()
 
 
+def climbs_out_of_root(root, source, target_path):
+    """True when ``target_path``, joined lexically to ``source``'s directory, leaves ``root``.
+
+    Pure string normalisation with no filesystem access, so a climb that
+    re-enters the checkout through its own directory name is still refused
+    on every host.
+    """
+    if target_path.startswith("/"):
+        joined = target_path.lstrip("/")
+    else:
+        joined = os.path.join(str(source.parent.relative_to(root)), target_path)
+    normal = os.path.normpath(joined)
+    return normal == ".." or normal.startswith(".." + os.sep)
+
+
 def relative_links(path):
     """Yield ``(line_number, target)`` for each relative link in ``path``."""
     in_fence = False
@@ -94,6 +110,9 @@ def broken_links(root):
         for number, target in relative_links(path):
             target_path = target.split("#", 1)[0].split("?", 1)[0]
             if not target_path:
+                continue
+            if climbs_out_of_root(root, path, target_path):
+                broken.append("%s:%d %s" % (path.relative_to(root), number, target))
                 continue
             if target_path.startswith("/"):
                 resolved = root / target_path.lstrip("/")
@@ -148,6 +167,12 @@ class LinkContainmentTest(unittest.TestCase):
             broken_links(self.root),
             ["docs/security/a.md:1 ../../../outside/secret.txt"],
         )
+
+    def test_parent_climb_out_and_back_in_is_broken(self):
+        (self.root / "README.md").write_text("# root\n", encoding="utf-8")
+        target = "../../../root/README.md"
+        self.write("a.md", "[x](%s)\n" % target)
+        self.assertEqual(broken_links(self.root), ["docs/security/a.md:1 " + target])
 
     def test_symlinked_directory_out_of_root_is_broken(self):
         (self.guarded / "link").symlink_to(self.outside, target_is_directory=True)
