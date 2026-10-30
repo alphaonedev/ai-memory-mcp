@@ -33,7 +33,7 @@
 #       bring-up failed (including the bind failure when another run holds
 #       127.0.0.1:6432) or the teardown failed
 #   64  run as root
-#   65  bad AI_MEMORY_SMOKE_RUN
+#   65  bad AI_MEMORY_SMOKE_RUN, or STEP_DURATION_SECS not digits only
 #   69  a required tool is missing
 #   70  the fresh binary was not built
 #   71  the daemon did not become healthy
@@ -83,6 +83,10 @@ POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"
 # Concurrency ramp. Geometric so the knee is bracketed without 1000 steps.
 CONCURRENCY_STEPS="${CONCURRENCY_STEPS:-8 16 32 64 128 256 512 1024}"
 STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"
+# The ramp arithmetic reads STEP_DURATION_SECS, so it must be digits only (#4734 r23).
+case "$STEP_DURATION_SECS" in
+  ''|*[!0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;
+esac
 # Knee thresholds. P95 budget mirrors the recall p95 budget the codebase
 # defends elsewhere (35 ms hot-path) plus headroom for the write+AGE mix.
 P95_BUDGET_MS="${P95_BUDGET_MS:-250}"

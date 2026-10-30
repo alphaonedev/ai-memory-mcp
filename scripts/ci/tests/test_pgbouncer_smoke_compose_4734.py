@@ -81,6 +81,7 @@ pinned exactly (REAPING_PINS) and every wait in both scripts is a statement or `
 a later statement-position check that reaches a FAIL exit; the exact group counts are named constants and
 their failure message names the constant and the lockstep remedy.
 """
+import ast
 import fnmatch
 import hashlib
 import os
@@ -328,6 +329,47 @@ REQUIRED_PW = re.compile(r"^\$\{POSTGRES_PASSWORD:\?[^}]+\}$")
 PW_ASSIGN = re.compile(
     r"""^PW="\$\{POSTGRES_PASSWORD:-\$\(python3 -c 'import secrets; print\(secrets\.token_hex\((?:1[6-9]|[2-9]\d|\d{3,})\)\)'\)\}"$"""
 )
+
+
+# r23 decision 1 (vote C, memory 7b9d9baf): the content pins are the gate; the classifier is defence in depth.
+# Each guarded file is pinned by the sha256 of its bytes; a mismatch names the file and both digests, and an
+# edit of a pinned file needs a full code and security review of its diff before its pin moves. Census of
+# files the two scripts read with `source` or `.`: `grep -n -E 'source |^\s*\. '` over both prints nothing
+# (0 sourced files), so the six files below are the whole set.
+PINNED_CONTENT = {
+    "infra/pgbouncer/smoke-test.sh": "f15b73365c7366c98fb8bac2a355eae54633ef8db1aa8ca4f1bc05bbe3d522e1",
+    "infra/pgbouncer/docker-compose.yml": "1959fb75885c25d6fea5029ed23c7619703c66697eb634795f84f0268f913d18",
+    "infra/pgbouncer/pgbouncer.ini": "3aaabe9d6c683f0b6d3e47061d0de9543059283ea195b7a380c22de13c628946",
+    "infra/pgbouncer/userlist.txt": "c6f9bb4ae05b289be2749dd528075c0dc885a2653578bab9a26c51c59c591e9a",
+    "infra/pgbouncer/role-defaults.sql": "1ba2789501d6fbcf245a3cab8cc2811d04f7fb198c10d9edc7e9f8cccc3bac20",
+    "infra/pillar4-envelope/measure-envelope.sh": "d17d0c7c1cdc293a1803d2e79241cde6fbbeb9f04371ee506367026ff4b9fa8c",
+}
+PIN_REVIEW = "requires a full code and security review of its diff before the pin moves (#4734)"
+
+
+def _pin_mismatch(path, what, actual, expected):
+    """r23 decision 1/2: the one shape of every pin failure (content digest, group counts, function body)."""
+    return "%s: %s %s does not match the pinned %s; an edit of this file %s" % (path, what, actual, expected, PIN_REVIEW)
+
+
+def _content_digest(root, relative):
+    """r23 decision 1: the sha256 hex of root/relative, or None when the file is missing."""
+    try:
+        return hashlib.sha256((pathlib.Path(root) / relative).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def _content_pin_problems(root, pins=None):
+    """r23 decision 1: one problem per pinned file under root whose bytes do not match its pin, in pin order."""
+    problems = []
+    for relative, expected in (PINNED_CONTENT if pins is None else pins).items():
+        actual = _content_digest(root, relative)
+        if actual is None:
+            problems.append("%s: pinned file is missing (#4734)" % relative)
+        elif actual != expected:
+            problems.append(_pin_mismatch(relative, "content digest", actual, expected))
+    return problems
 
 
 def _strip_comment(line):
@@ -771,10 +813,31 @@ SUBSTITUTION_CONTEXTS = ("$(", "<(")  # r20 S27: bash may end a heredoc body ope
 # backslash-newline inside the word before it parses it, so the pattern skips those too; r22 decision 1 (K23):
 # every transformation letter is refused by name (@E decodes escapes into `$(` text, @Q/@A/@a and the rest
 # are refused with it, so no letter is a reviewed exception)
-PROMPT_TRANSFORM = re.compile(r"@(?:\\\n)*([A-Za-z])(?:\\\n)*\}")
+# r23 decision 3 (K30): the `@` must follow the parameter (a name, a positional or special parameter, with
+# an optional subscript and a `#` or `!` prefix) directly, so a default value word such as ${v:-a@b} is
+# text, not a transformation; the search runs on the text with every backslash-newline removed (bash
+# removes them before it parses the word) and maps the offset of the `@` back to the raw text
+PROMPT_TRANSFORM = re.compile(r"\$\{[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]\n]*\])?(@)([A-Za-z])")
+BSNL = "\\\n"
 EXPANDING_DOLLAR = re.compile(r"[A-Za-z0-9_@*#?!$-]")  # r21 S30: a `$` before one of these starts an expansion
 COMMAND_TEXT = re.compile(r"\$\(|`")  # r21 S30: a `$(` (so also `$((`) or a backquote
 STORED_DATA = "command text stored as data"
+
+
+def _prompt_transform(text):
+    """r23 decision 3: (raw offset of the `@`, transformation letter) of the first ${param@X} in text, read
+    with every backslash-newline removed as bash does, else None."""
+    pieces = text.split(BSNL)
+    found = PROMPT_TRANSFORM.search("".join(pieces))
+    if found is None:
+        return None
+    at, removed = found.start(1), 0
+    for piece in pieces:
+        if at < len(piece):
+            break
+        at -= len(piece)
+        removed += len(piece) + len(BSNL)
+    return removed + at, found.group(2)
 
 
 def _line_col(text, at):
@@ -833,7 +896,19 @@ ENV_NUMERIC_DEFAULTS = frozenset(("STEP_DURATION_SECS",))
 """r22 decision 2c: the names whose `${NAME:-<digits>}` default counts as a number. The guard models the
 script's own content, not the invoking environment: the CI workflow owns that environment, and a person who
 sets their own environment already has a shell. Any other `${X:-...}`, `${X-...}`, positional parameter or
-`read` value that reaches a sink is refused by name."""
+`read` value that reaches a sink is refused by name. r23 decision 4: that trust rests on two things the
+guard checks, the digits-only `case` validation measure-envelope.sh runs right after the NAME="${NAME:-<digits>}"
+self-default line of every name here (ENV_NUMERIC_VALIDATION, asserted by
+test_env_numeric_defaults_are_validated_digits_only_4734_r23), and the content pin of the script
+(PINNED_CONTENT), so neither line can change without a full review of the diff."""
+ENV_NUMERIC_VALIDATION = (
+    '{name}="${{{name}:-{default}}}"\n'
+    "# The ramp arithmetic reads {name}, so it must be digits only (#4734 r23).\n"
+    'case "${name}" in\n'
+    "  ''|*[!0-9]*) echo \"FATAL: {name} must be digits only\" >&2; exit 65 ;;\n"
+    "esac\n"
+)
+ENV_NUMERIC_DEFAULT_VALUES = {"STEP_DURATION_SECS": "20"}  # r23 decision 4: the self-default of each name
 FUNC_NUMERIC = {"now_ms": "9a85ef3cf712502a8fcbd75f0c7d519cd7f9f2a1b3f74c3821237d615f27df50"}
 """r22 decision 2d: a script-defined function is a numeric source only when its name and the sha256 of its
 definition text (from `name() {` to its closing brace, comments removed) are pinned here."""
@@ -1094,9 +1169,9 @@ def _shell_prepass(text, name="text"):
             return problem(refused.start(), "a control character U+%04X" % ord(found))
         what = "a lone \\r" if found == "\r" else "U+%04X" % ord(found)
         return problem(refused.start(), "%s, which str.splitlines() reads as a line break (only a newline ends a line here)" % what)
-    prompt = PROMPT_TRANSFORM.search(text)  # r21 S30: anywhere in the text (code, any body, a comment)
+    prompt = _prompt_transform(text)  # r21 S30: anywhere in the text (code, any body, a comment)
     if prompt:
-        return problem(prompt.start(), "a parameter transformation (${var@%s})" % prompt.group(1))
+        return problem(prompt[0], "a parameter transformation (${var@%s})" % prompt[1])
 
     def push(kind, at):
         stack.append(kind)
@@ -2502,9 +2577,9 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             code = [ln.strip() for ln in _code_lines(path)]
             codes = [int(c) for ln in code for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)]
             big = sorted(c for c in codes if c >= 64)
-            # 65 has one meaning (bad AI_MEMORY_SMOKE_RUN) at two pinned sites:
-            # the character class and the 64-character bound.
-            self.assertEqual(big.count(65), 2, "%s: exit 65 sites" % path.name)
+            # 65 has one meaning (a bad input value) at pinned sites: AI_MEMORY_SMOKE_RUN's character class
+            # and 64-character bound, plus (r23 decision 4) the envelope's digits-only STEP_DURATION_SECS check.
+            self.assertEqual(big.count(65), 3 if path == ENVELOPE else 2, "%s: exit 65 sites" % path.name)
             big = [c for c in big if c != 65] + [65]
             self.assertEqual(len(big), len(set(big)), "%s: exit code reused: %r" % (path.name, big))
             header = "\n".join(ln for ln in path.read_text().split("\n")[:50] if ln.startswith("#"))
@@ -2882,21 +2957,18 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertFalse(FUNCTION_DEF.search("echo undo() x") or FUNCTION_DEF.search("*[!a-z0-9_-]*) echo x"))
 
     # r16 K10: the exact group counts of the groups listing, one constant per number. A script edit that moves
-    # one fails with _count_pin_message, which names the script, both numbers, the constant and the remedy.
+    # one fails with _count_pin_message, which names the script, both numbers and the constant; r23 decision 2:
+    # in the content-pin shape, an edit of the file needs a full review of its diff before a pin moves.
     SMOKE_GROUPS_EXPECTED = 34
     SMOKE_FAIL_GROUPS_EXPECTED = 15
     SMOKE_FAIL_CALLS_EXPECTED = 0
-    ENVELOPE_GROUPS_EXPECTED = 58
-    ENVELOPE_FAIL_GROUPS_EXPECTED = 12
+    ENVELOPE_GROUPS_EXPECTED = 59  # r23 decision 4: the digits-only STEP_DURATION_SECS case
+    ENVELOPE_FAIL_GROUPS_EXPECTED = 13  # r23 decision 4: the digits-only case arm carries a FATAL exit
     ENVELOPE_FAIL_CALLS_EXPECTED = 4
 
     @staticmethod
     def _count_pin_message(script, what, measured, pinned, constant):
-        return (
-            "%s: %s measured %d, pinned %d in %s; if the script edit is intended, update %s in this test in the same "
-            "commit and record the new count in the PR body Round section (the pin and the script change in lockstep)"
-            % (script, what, measured, pinned, constant, constant)
-        )
+        return _pin_mismatch(script, what, measured, "%s %d" % (constant, pinned))
 
     def _assert_counts(self, name, out, prefix):
         groups = [(w, g) for w, g in out if g["kind"] != "call"]
@@ -2918,12 +2990,12 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             self._assert_counts(SMOKE.name, self._groups(lines, SMOKE.name), "SMOKE")
         text = str(caught.exception)
         groups = [g for _, g in self._groups(lines, SMOKE.name) if g["kind"] != "call"]
-        measured = "measured %d, pinned %d" % (len(groups), self.SMOKE_GROUPS_EXPECTED)
-        for part in ("smoke-test.sh", "SMOKE_GROUPS_EXPECTED", "lockstep", measured, "PR body Round section"):
+        measured = "group count %d does not match the pinned SMOKE_GROUPS_EXPECTED %d" % (len(groups), self.SMOKE_GROUPS_EXPECTED)
+        for part in ("smoke-test.sh: ", measured, PIN_REVIEW):
             self.assertIn(part, text)
-        msg = self._count_pin_message("measure-envelope.sh", "group count", 59, 58, "ENVELOPE_GROUPS_EXPECTED")
-        self.assertIn("ENVELOPE_GROUPS_EXPECTED", msg)
-        self.assertIn("lockstep", msg)
+        msg = self._count_pin_message("measure-envelope.sh", "group count", 60, 59, "ENVELOPE_GROUPS_EXPECTED")
+        self.assertEqual(msg, "measure-envelope.sh: group count 60 does not match the pinned ENVELOPE_GROUPS_EXPECTED 59; "
+                         "an edit of this file " + PIN_REVIEW)
 
     def test_real_closers_and_contexts_are_clean_and_the_dotenv_comment_is_true(self):
         # r14 K5 + K6 + INFO: on the real scripts no FAIL-bearing group is followed by `&&` or
@@ -3631,7 +3703,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # now_ms body is pinned, a changed body or an unpinned function at a sink is refused by name
         self.assertEqual(sorted(FUNC_NUMERIC), ["now_ms"])
         now_ms = re.search(r"^now_ms\(\) \{.*\}$", ENVELOPE.read_text(), re.M).group()
-        self.assertEqual(FUNC_NUMERIC["now_ms"], hashlib.sha256(now_ms.encode("utf-8")).hexdigest())
+        actual = hashlib.sha256(now_ms.encode("utf-8")).hexdigest()
+        self.assertEqual(actual, FUNC_NUMERIC["now_ms"], _pin_mismatch(ENVELOPE.name, "now_ms body digest", actual, FUNC_NUMERIC["now_ms"]))
         changed = "%s\nt0=$(now_ms)\n: $((t0+1))\n" % now_ms.replace("1000", "1001")
         self.assertEqual(_shell_prepass(changed, "e")[1], "e: line 3 col 6: " + what)
         unpinned = "f() { echo x; }\nt0=$(f)\n: $((t0+1))\n"
@@ -3727,6 +3800,87 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             raw = types.SimpleNamespace(name="smoke-test.sh", read_bytes=lambda injected=injected: injected.encode("utf-8"))
             body = _code_body(raw)
             self.assertEqual(_wait_refusals(body, "smoke-test.sh"), ["smoke-test.sh: line 120 col 2: a backslash-newline inside an unquoted heredoc body"], tag)
+
+    def test_guarded_files_content_pinned_4734_r23(self):
+        # r23 decision 1 (vote C, memory 7b9d9baf): the content pins are the gate; the classifier is defence in
+        # depth. Every guarded file matches its sha256 pin in the checkout; on a scratch copy one changed byte
+        # fails naming the file and both digests, and a removed file fails naming it missing.
+        self.assertEqual(sorted(PINNED_CONTENT), sorted([
+            "infra/pgbouncer/smoke-test.sh", "infra/pgbouncer/docker-compose.yml", "infra/pgbouncer/pgbouncer.ini",
+            "infra/pgbouncer/userlist.txt", "infra/pgbouncer/role-defaults.sql", "infra/pillar4-envelope/measure-envelope.sh",
+        ]))
+        for relative, digest in PINNED_CONTENT.items():
+            self.assertRegex(digest, r"\A[0-9a-f]{64}\Z", relative)
+        self.assertEqual(_content_pin_problems(REPO), [])
+        for path in SCRIPTS:  # the census: neither script reads another file with `source` or `.`
+            sourced = [ln for ln in path.read_text().split("\n") if re.search(r"source |^\s*\. ", ln)]
+            self.assertEqual(sourced, [], path.name)
+        scratch = REPO / ".local-runs" / "pgbouncer-4734-tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(scratch)) as directory:
+            for relative in PINNED_CONTENT:
+                copy = pathlib.Path(directory) / relative
+                copy.parent.mkdir(parents=True, exist_ok=True)
+                copy.write_bytes((REPO / relative).read_bytes())
+            self.assertEqual(_content_pin_problems(directory), [])
+            for relative, expected in PINNED_CONTENT.items():
+                copy = pathlib.Path(directory) / relative
+                original = copy.read_bytes()
+                copy.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+                actual = hashlib.sha256(copy.read_bytes()).hexdigest()
+                self.assertEqual(_content_pin_problems(directory), [
+                    "%s: content digest %s does not match the pinned %s; an edit of this file requires a full code and "
+                    "security review of its diff before the pin moves (#4734)" % (relative, actual, expected)
+                ], relative)
+                copy.unlink()
+                self.assertEqual(_content_pin_problems(directory), ["%s: pinned file is missing (#4734)" % relative], relative)
+                copy.write_bytes(original)
+            self.assertEqual(_content_pin_problems(directory), [])
+
+    def test_pin_failure_text_never_invites_moving_a_pin_4734_r23(self):
+        # r23 decision 2: no string literal in the guard tells a reader to move a pin; every pin failure says
+        # an edit needs a full code and security review of its diff first. The phrases are split here so this
+        # test's own literals do not match; the pattern also names the round-22 wording (an instruction to
+        # update a `*_EXPECTED` constant, or one formatted in with %s).
+        phrases = ("update the " + "pin", "bu" + "mp", "adjust the " + "expected")
+        invite = re.compile("up" + r"date (?:%s|[a-z0-9_]*_expected)\b")
+        source = pathlib.Path(inspect.getfile(type(self))).read_text(encoding="utf-8")
+        hits = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                lowered = node.value.lower()
+                hits.extend("line %d: %s" % (node.lineno, p) for p in phrases if p in lowered)
+                hits.extend("line %d: %s" % (node.lineno, m.group()) for m in invite.finditer(lowered))
+        self.assertEqual(hits, [])
+        self.assertIn("requires a full code and security review of its diff before the pin moves (#4734)", PIN_REVIEW)
+        self.assertIn(PIN_REVIEW, self._count_pin_message("x.sh", "group count", 2, 1, "X_EXPECTED"))
+
+    def test_env_numeric_defaults_are_validated_digits_only_4734_r23(self):
+        # r23 decision 4 (INFO-4): ENV_NUMERIC_DEFAULTS trust rests on the script's digits-only validation of each
+        # name right after its self-default line (and on the content pin of the script); the block is present
+        # once per name, before any other read of the name.
+        text = ENVELOPE.read_text()
+        self.assertEqual(sorted(ENV_NUMERIC_DEFAULT_VALUES), sorted(ENV_NUMERIC_DEFAULTS))
+        for name in sorted(ENV_NUMERIC_DEFAULTS):
+            block = ENV_NUMERIC_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+            self.assertEqual(text.count(block), 1, name)
+            code_before = "\n".join(ln for ln in text[: text.index(block)].split("\n") if not ln.lstrip().startswith("#"))
+            self.assertNotIn(name, code_before, "%s is read before its validation" % name)
+            self.assertNotIn("$" + name, block.split("\n")[3], "the FATAL line must not echo the value of %s" % name)
+
+    def test_transformation_refusal_anchors_to_the_parameter_4734_r23(self):
+        # r23 decision 3 (K30): an `@` inside a default value word is text, not a transformation; ${v@Q},
+        # ${arr[@]@Q}, ${#v@Q} and a positional ${1@P} are still refused by name at the `@`.
+        what = "a parameter transformation (${var@%s})"
+        for tag, text in (("c_default_at", ': "${v:-a@b}"\n'), ("c_default_host", ': "${v:-user@host}"\n'),
+                          ("c_replace_at", ': "${v/@/x}"\n')):
+            self.assertIsNone(_shell_prepass(text, tag)[1], tag)
+            self.assertIsNone(_shell_words(text, tag)[1], tag)
+        for tag, text, col, letter in (("t_q", ': "${v@Q}"\n', 7, "Q"), ("t_arr", ': "${arr[@]@Q}"\n', 12, "Q"),
+                                       ("t_len", ': "${#v@Q}"\n', 8, "Q"), ("t_pos", ': "${1@P}"\n', 7, "P"),
+                                       ("t_cont", ': "${v@\\\nQ}"\n', 7, "Q"), ("t_ncont", ': "${v\\\n@Q}"\n', 1, "Q")):
+            line = 2 if tag == "t_ncont" else 1
+            self.assertEqual(_shell_prepass(text, tag)[1], "%s: line %d col %d: %s" % (tag, line, col, what % letter), tag)
 
     def test_prepass_and_norm_lines_are_linear_8270_r21(self):
         # r21 K22: _heredoc_lines counts newlines in one forward pass and _logical_lines joins each continued line

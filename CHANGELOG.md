@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number literal, a nested shell interpreter and a backslash-newline that splits a word are refused by name;
   the linear readers are proven by a CPU-time growth ratio rather than a wall-clock budget; and a code-line
   refusal names the raw script line.
+  Round 23: the six guarded smoke files are content-pinned, and a pin mismatch names the file and requires a
+  full review of its diff before the pin moves; `${v:-a@b}` defaults are no longer refused as
+  transformations; and measure-envelope.sh validates its numeric environment inputs as digits-only.
 
 ### Fixed (#8301 / #8305 — the shared-namespace-claims self-test derives its ceilings and cleans up after itself)
 
