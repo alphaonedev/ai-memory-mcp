@@ -993,7 +993,8 @@ def _stop_offset(raw):
 
 
 def scoped_text(rel, raw):
-    """The gated part of a file: CHANGELOG.md down to the STOP_HEADING line (all of it if absent)."""
+    """The gated part of a file: CHANGELOG.md down to the STOP_HEADING line (all of it if
+    absent)."""
     if rel == CHANGELOG_REL:
         at = _stop_offset(raw)
         return raw[:at] if at >= 0 else raw
@@ -1180,7 +1181,8 @@ def trust_peer_units(rel, raw):
 # the trust-peer identifier is every code point of Unicode category Pd plus U+2212 MINUS SIGN, derived
 # from unicodedata at import time. Only a dash BETWEEN "trust" and "peer" is rewritten, after each
 # entity-decoding fold(); a dash after the identifier is left alone so the lookahead of TRUST_PEER_RE
-# still sees it.
+# still sees it. Round 22: the class has 26, 27 and 28 code points on Python 3.9, 3.12 and 3.14
+# (the Unicode database moves); no measured row depends on the size.
 _DASH_CLASS = "".join(re.escape(chr(c)) for c in range(sys.maxunicode + 1)
                       if c == 0x2212 or unicodedata.category(chr(c)) == "Pd")
 _TRUST_DASH_RE = re.compile("(?<=trust)[%s](?=peer)" % _DASH_CLASS)
@@ -1194,7 +1196,9 @@ def _fold_mention(text):
 def _mention_views(text):
     """_views() with one fold: the folded view, it without tags and emphasis, and a rendered view
     (comments, tags and link syntax removed after unescaping, folded again if an entity remains).
-    A dash between "trust" and "peer" is read as "-" after each fold (round 21)."""
+    A dash between "trust" and "peer" is read as "-" after each fold (round 21) and, round 22, as
+    the last step of every returned view, so a dash that only comes to sit between the halves once
+    comments, tags, links or emphasis are gone is read the same way."""
     low = _fold_mention(text)
     out = low
     if "<" in out:
@@ -1203,7 +1207,9 @@ def _mention_views(text):
         out = _fold_mention(out)
     if "[" in out:
         out = _REFLINK_RE.sub(r"\1", _LINK_RE.sub(r"\1", out)).replace("[", "").replace("]", "")
-    return low, _MARKUP_RE.sub("", _TAG_RE.sub("", low)), _MARKUP_RE.sub("", out), _keep_underscores(out)
+    views = (low, _MARKUP_RE.sub("", _TAG_RE.sub("", low)), _MARKUP_RE.sub("", out),
+             _keep_underscores(out))
+    return tuple(_TRUST_DASH_RE.sub("-", view) for view in views)
 
 
 _ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
@@ -1295,7 +1301,8 @@ def _g_inner(s):
 
 
 def _g_front_matter(lines):
-    """Lines of a Jekyll front matter block ("---", key: value lines, "---") at the top of a file, or 0."""
+    """Lines of a Jekyll front matter block ("---", key: value lines, "---") at the top of a
+    file, or 0."""
     if not lines or lines[0] != "---":
         return 0
     for k in range(1, len(lines)):
@@ -1329,7 +1336,8 @@ def _g_quote_problem(ln, prev):
 
 
 def _g_line_problem(ln, prev, allow):
-    """(refused construct or None, line kind) for a non-blank line outside a fence and outside a quote."""
+    """(refused construct or None, line kind) for a non-blank line outside a fence and outside
+    a quote."""
     lead = len(ln) - len(ln.lstrip(" "))
     s = ln[lead:]
     inner = _g_inner(s)
@@ -1445,7 +1453,8 @@ def _gb_toplevel(s, prev):
 
 
 def _gb_body_problems(body, first, name, rel):
-    """Rule 4 on the lines of one gated block after its fixed lead (body[k] is file line first + k + 1)."""
+    """Rule 4 on the lines of one gated block after its fixed lead (body[k] is file line
+    first + k + 1)."""
     out, prev, parent, child, cur = [], "blank", None, None, None
     for k, ln in enumerate(body):
         if not ln.strip(" "):
@@ -2098,6 +2107,39 @@ class CertificationScope8262(unittest.TestCase):
         self.assertEqual(count("A re‐check of the mesh and a peer—note."), 0)
         self.assertEqual(count("Enable TRUST_PEER now."), 1)
         self.assertEqual(count("<!-- TRUST–PEER -->"), count("<!-- TRUST_PEER -->"))
+        # Round 22 (code r21 MEDIUM-1, security r21 LOW-1): a dash that sits between the halves only
+        # once a comment, tag or link is removed is read as "-" too.
+        for text in ("Enable TRUST<!-- x -->–PEER now.", "Enable TRUST–<!-- x -->PEER now.",
+                     "Enable TRUST<!---->—PEER now.", "Enable TRUST&ndash;<!-- x -->PEER now.",
+                     "Enable TRUST<b>–</b>PEER now.", "Enable TRUST–<br>PEER now.",
+                     "Enable [TRUST–PEER](https://example.com/a) now.",
+                     "Enable [TRUST](https://example.com/a)–PEER now.",
+                     "Enable TRUST<!-- x -->–<!-- y -->PEER now.", "Enable **TRUST**–PEER now."):
+            for wrap in ("%s", "| Mode | Note |\n| --- | --- |\n| a | %s |", "- %s", "*%s*"):
+                self.assertEqual(count(wrap % text), 1, wrap % text)
+        # Controls: the neighbouring characters survive, so a longer word is still not the identifier.
+        self.assertEqual(count("Enable TRUST<!-- x -->–PEERS now."), 0)
+        self.assertEqual(count("Enable XTRUST<!-- x -->–PEER now."), 0)
+        self.assertEqual(count("Enable TRUST<!-- x -->–PEER—now."), 1)
+        self.assertEqual(count("Enable TRUST<!-- x --> PEER now."), 0)
+
+    def test_trust_peer_dash_position_matrix_8262(self):
+        # Round 22 (code r21 MEDIUM-1): every dash of the class, in every position relative to a
+        # comment, tag or link and in every wrapper, spells the identifier; none counts fewer than
+        # the plain dash between the halves.
+        positions = ("TRUST%sPEER", "TRUST<!-- x -->%sPEER", "TRUST%s<!-- x -->PEER",
+                     "TRUST<b>%s</b>PEER", "TRUST%s<br>PEER", "[TRUST%sPEER](https://example.com/a)",
+                     "[TRUST](https://example.com/a)%sPEER")
+        wrappers = ("Enable %s now.", "| Mode | Note |\n| --- | --- |\n| a | %s |", "- %s", "*%s*")
+        dashes = [chr(c) for c in range(sys.maxunicode + 1)
+                  if unicodedata.category(chr(c)) == "Pd" or c == 0x2212]
+        self.assertGreater(len(dashes), 20)
+        for dash in dashes:
+            for position in positions:
+                for wrap in wrappers:
+                    text = wrap % (position % dash)
+                    self.assertEqual(len(trust_peer_units("README.md", text)), 1,
+                                     "U+%04X %r" % (ord(dash), text))
 
     def test_front_matter_tab_and_comment_rows_8262(self):
         # Round 19 (code r15 LOW-1, LOW-3): rule 5 covers YAML front matter; the one-line comment match
