@@ -114,6 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Round 23: the six guarded smoke files are content-pinned, and a pin mismatch names the file and requires a
   full review of its diff before the pin moves; `${v:-a@b}` defaults are no longer refused as
   transformations; and measure-envelope.sh validates its numeric environment inputs as digits-only.
+  The envelope README now documents the digits-only STEP_DURATION_SECS refusal under exit 65 beside the
+  bad AI_MEMORY_SMOKE_RUN case, and a guard row keeps the README naming every exit-65 variable (#8313).
 
 ### Fixed (#8301 / #8305 — the shared-namespace-claims self-test derives its ceilings and cleans up after itself)
 

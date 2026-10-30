@@ -2594,6 +2594,28 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertTrue(verifier and knee)
         self.assertNotEqual(verifier.group(1), knee.group(1))
 
+    def test_readme_documents_every_exit_65_condition_8313(self):
+        # #8313: each script's README exit-65 text names the variable of every FATAL message that precedes
+        # an `exit 65` site (found by parsing the script), so a new validation cannot ship undocumented.
+        for path in SCRIPTS:
+            code = [ln.strip() for ln in _code_lines(path)]
+            names = []
+            for k, ln in enumerate(code):
+                if not re.search(r"(?<![\w-])exit\s+65\b", ln):
+                    continue
+                window = " ".join(code[max(0, k - 1) : k + 1])
+                found = re.search(r"FATAL: ([A-Z][A-Z0-9_]*) ", window)
+                self.assertTrue(found, "%s: exit 65 site without a FATAL message naming its variable" % path.name)
+                if found.group(1) not in names:
+                    names.append(found.group(1))
+            self.assertTrue(names, "%s: no exit 65 sites parsed" % path.name)
+            readme = " ".join(README_FOR[path].read_text().split())
+            clause = re.search(r"\b65\b(.*?)(?:, \d{2} |\. |$)", readme)
+            self.assertTrue(clause, "%s: README has no exit 65 text" % path.name)
+            text = clause.group(0)
+            for name in names:
+                self.assertIn(name, text, "%s: README exit 65 text does not name %s" % (path.name, name))
+
     def test_pool_mode_step_asserts_effective_config(self):
         # r4 P6: [4/4] reads SHOW CONFIG and fails non-zero on a mismatch.
         text = _joined(SMOKE)
