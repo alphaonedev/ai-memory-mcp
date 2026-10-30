@@ -53,7 +53,8 @@ jobs:
     name: "Postgres ignored tests (sal-postgres --ignored)"
     runs-on: [self-hosted, linux-fed]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    timeout-minutes: 60
+    # #8303: compile 24 min + soak 20 min on an idle host, 37+ min under load; 60 min had no headroom.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -109,7 +110,9 @@ jobs:
           echo "::notice::[#3274] ignored pg tests pointed at ephemeral db $CI_FED_DB on $RUNNER_NAME"
 
       - name: cargo test --features sal-postgres -- --ignored
+        timeout-minutes: 100
         run: |
+          date -u +'%Y-%m-%dT%H:%M:%SZ ignored-tests start'
           set -euo pipefail
           # #3552 non-vacuity: list first, then run, then FAIL if executed
           # < listed or < the committed ratchet (or if any skip: line
@@ -125,6 +128,7 @@ jobs:
           set -e
           bash scripts/check-cert-leg-nonvacuity.sh \
             --leg postgres-ignored --log "$TEST_OUT" --listed "$LISTED"
+          date -u +'%Y-%m-%dT%H:%M:%SZ ignored-tests end'
           exit "$rc"
 
       - name: Cleanup enterprise-fed ephemeral db
