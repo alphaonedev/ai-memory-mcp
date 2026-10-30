@@ -1310,14 +1310,17 @@ def _table_header(line, paragraph, next_line):
 def _starts_block(text, at):
     """Round 31 (security r30 LOW-1, code r30 LOW-1): True when text at column at (0-3 columns past
     its container) starts a block that interrupts any paragraph: an ATX heading (CommonMark 4.2), a
-    thematic break of "*" or "_" (4.1; a dash run under a paragraph is a setext underline, 4.3), a
+    thematic break (4.1) of "*" or "_", or a dash run with an internal space or tab (round 32: it
+    cannot be a setext underline, 4.3, so it is a break; a plain dash run under a paragraph is a
+    setext underline and is left in the unit, the over-counting direction), a
     fence (4.5) unless a backtick fence's info string holds a backtick, or an HTML block start of
     kinds 1-6 (4.6, _HTML_CUT_RE). Kind 7 cannot interrupt a paragraph."""
     run = _FENCE_RUN_RE.match(text, at)
     if run:
         return not (run.group(1)[0] == "`" and "`" in text[run.end():])
     rule = _BREAK_RE.match(text, at)
-    return bool(_ATX_RE.match(text, at) or (rule and rule.group(1) != "-")
+    return bool(_ATX_RE.match(text, at)
+                or (rule and (rule.group(1) != "-" or not _SETEXT_RE.match(text, at)))
                 or _HTML_CUT_RE.match(text, at))
 
 
@@ -2662,6 +2665,30 @@ class CertificationScope8262(unittest.TestCase):
                     self.assertGreaterEqual(len(_census_units(text)), 2, "interrupted: %r" % text)
         # 12 shapes x 5 sections x 4 containers; no row repeats.
         self.assertEqual(len(rows), 240)
+        # Round 32 (code r31 LOW-1, security r31 LOW-1): a dash run with internal spaces or tabs
+        # cannot be a setext underline (CommonMark 4.3), so it is a thematic break that ends the
+        # paragraph: GitHub renders "<p>Enable TRUST</p><hr><p>_PEER now.</p>" for each of these
+        # (two fragments, no mention), and the census must not join the halves.
+        rules = ("-- -", "--- -", "-- --", "-- - -", "--  --", "- - -", "--\t-")
+        rows = set()
+        for shape in rules:
+            for section in sections:
+                for outer, nl in boxes:
+                    text = outer % section.replace("{L}", shape).replace("{NL}", nl)
+                    rows.add(text)
+                    self.assertEqual(count(text), 0, "interrupted: %r" % text)
+                    self.assertGreaterEqual(len(_census_units(text)), 2, "interrupted: %r" % text)
+        # 7 shapes x 5 sections x 4 containers; no row repeats.
+        self.assertEqual(len(rows), 140)
+        for shape in rules:
+            text = "Enable TRUST<?a\n%s\nb>_PEER now." % shape
+            self.assertEqual(count(text), 0, "split identifier: %r" % text)
+        # decision: a dash run with no internal space ("--", "---", "-----") is a setext underline
+        # (GitHub renders an h2 "Enable TRUST" then "_PEER now."); the reading stays the joined,
+        # over-counting one, the fail-closed direction.
+        for shape in ("--", "---", "------"):
+            text = "Enable TRUST<?a\n%s\nb>_PEER now." % shape
+            self.assertEqual(count(text), 1, "setext underline: %r" % text)
         # Such a line is never a lazy continuation: left of an item's text or at a shallower
         # block-quote depth it still ends the paragraph.
         split = "%sEnable TRUST<!--a\n%s\nb-->_PEER now."
