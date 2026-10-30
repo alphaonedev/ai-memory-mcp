@@ -5,13 +5,16 @@ subtrees in GUARDED_DOCS_SUBDIRS, skips fenced code blocks and inline code
 spans (so grammar examples are not read as links), and asserts that each
 relative link target exists inside the checkout.
 
-Symlink behaviour: a markdown source that is itself a symlink is skipped.
-Directory symlinks are followed for existence, and containment is decided by
-``resolve()`` against the root, so a symlink that points outside the checkout
-is broken, while a link to a symlinked markdown file that stays inside the
-checkout resolves. A protocol-relative ``//host/x`` target is refused, and ``..`` is
-normalised lexically (never through a directory symlink), so a climb out of
-the root is refused on every host.
+Symlink behaviour: a markdown source that is itself a symlink, or that lies
+under a symlinked directory (``has_symlink_component``), is skipped as a
+source. Directory symlinks are followed for existence, and containment is
+decided by ``resolve()`` against the root, so a symlink that points outside
+the checkout is broken, while a link to a symlinked markdown file that stays
+inside the checkout resolves. Existence is probed on the raw target with
+``os.stat`` so the kernel's symlink hop limit applies. A protocol-relative
+`//` target (``//host/x``) is refused, and `..` is normalised lexically
+(never through a directory symlink), so a climb out of the root is refused on
+every host.
 
 Lives under scripts/ci/tests so the CI discover root runs it.
 
@@ -76,13 +79,14 @@ def inside_state(root, candidate):
     ENOTDIR) or leaves the root, and ``"unresolvable"`` (``detail`` = errno
     name, or ``OSError`` when the error carries none) when the operating
     system refuses the path, for example a segment longer than NAME_MAX or a
-    symlink loop. ``os.stat`` is probed directly because ``Path.is_dir`` and
-    ``Path.exists`` swallow those errors on Python 3.14.
+    symlink loop. ``os.stat`` is probed directly on the raw ``candidate`` (not
+    the ``resolve()`` result) so the kernel's symlink hop limit is honoured
+    and because ``Path.is_dir`` and ``Path.exists`` swallow those errors on
+    Python 3.14; ``resolve()`` decides containment only.
     """
     try:
-        real = candidate.resolve()
-        real.relative_to(root.resolve())
-        mode = os.stat(str(real)).st_mode
+        candidate.resolve().relative_to(root.resolve())
+        mode = os.stat(str(candidate)).st_mode
         return ("dir" if stat.S_ISDIR(mode) else "file"), ""
     except (FileNotFoundError, NotADirectoryError):
         pass
@@ -90,9 +94,12 @@ def inside_state(root, candidate):
         if err.errno is None:
             return "unresolvable", "OSError"
         return "unresolvable", errno.errorcode.get(err.errno, "OSError")
-    except RuntimeError:
-        # Python < 3.13 reports a symlink loop from resolve() as RuntimeError.
-        return "unresolvable", "ELOOP"
+    except RuntimeError as err:
+        # Python < 3.13 reports a symlink loop from resolve() as RuntimeError
+        # ("Symlink loop ..."); any other RuntimeError keeps its own label.
+        if "Symlink loop" in str(err):
+            return "unresolvable", "ELOOP"
+        return "unresolvable", "RuntimeError"
     except ValueError:
         pass
     return "missing", ""
@@ -220,7 +227,7 @@ class DocsRelativeLinksTest(unittest.TestCase):
 
 
 class LinkContainmentTest(unittest.TestCase):
-    """#8291: link targets are confined to the checkout by resolve(); a symlinked .md source is skipped."""
+    """#8291: targets are confined by `resolve`; a `symlink` .md source is skipped; `//` is refused and `..` is lexical."""
 
     def setUp(self):
         scratch = REPO_ROOT / ".local-runs"
@@ -347,14 +354,73 @@ class LinkContainmentTest(unittest.TestCase):
             ],
         )
 
+    def chain(self, length):
+        """Build ``length`` chained symlinks c1 -> real.md, c2 -> c1, ... in the guarded dir."""
+        (self.guarded / "real.md").write_text("# real\n", encoding="utf-8")
+        previous = "real.md"
+        for index in range(1, length + 1):
+            name = "c%d" % index
+            (self.guarded / name).symlink_to(previous)
+            previous = name
+        return previous
+
+    def test_symlink_chain_past_kernel_limit_is_unresolvable_8291_r6(self):
+        last = self.chain(41)
+        self.write("a.md", "[a](%s)\n" % last)
+        self.assertEqual(
+            broken_links(self.root),
+            ["docs/security/a.md:1 %s (unresolvable target: ELOOP)" % last],
+        )
+
+    def test_symlink_chain_at_kernel_limit_resolves_8291_r6(self):
+        last = self.chain(40)
+        self.write("a.md", "[a](%s)\n" % last)
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_runtime_error_from_resolve_is_labelled_by_kind_8291_r6(self):
+        real_resolve = Path.resolve
+        self.write("a.md", "[a](x.md)\n")
+
+        def raising(message):
+            def resolve(self, *args, **kwargs):
+                if self.name == "x.md":
+                    raise RuntimeError(message)
+                return real_resolve(self, *args, **kwargs)
+
+            return resolve
+
+        try:
+            Path.resolve = raising("Symlink loop from '/x'")
+            loop = inside_state(self.root, self.guarded / "x.md")
+            Path.resolve = raising("maximum recursion depth exceeded")
+            other = inside_state(self.root, self.guarded / "x.md")
+            broken = broken_links(self.root)
+        finally:
+            Path.resolve = real_resolve
+        self.assertEqual(loop, ("unresolvable", "ELOOP"))
+        self.assertEqual(other, ("unresolvable", "RuntimeError"))
+        self.assertEqual(
+            broken, ["docs/security/a.md:1 x.md (unresolvable target: RuntimeError)"]
+        )
+
 
 class DocstringStatesBehaviourTest(unittest.TestCase):
-    """#8291: the module docstring names the real symlink and path behaviour."""
+    """#8291: the module and containment docstrings name the real symlink and path behaviour."""
 
     def test_docstring_names_each_behaviour(self):
-        doc = (__doc__ or "").lower()
-        for word in ("symlink", "//", "..", "resolve"):
-            self.assertIn(word, doc)
+        docs = {
+            "module": __doc__ or "",
+            "LinkContainmentTest": LinkContainmentTest.__doc__ or "",
+        }
+        for owner, doc in docs.items():
+            lowered = doc.lower()
+            for word in ("symlink", "resolve"):
+                self.assertIn(word, lowered, owner)
+            for token in ("`//`", "`..`"):
+                self.assertIn(token, doc, owner)
+        self.assertIn("has_symlink_component", docs["module"])
+        flat = " ".join(docs["module"].split())
+        self.assertIn("lies under a symlinked directory", flat)
 
 
 if __name__ == "__main__":
