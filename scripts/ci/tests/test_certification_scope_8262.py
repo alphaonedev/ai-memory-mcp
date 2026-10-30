@@ -1196,8 +1196,19 @@ def _fold_mention(text):
 def _mention_views(text):
     """Views of _mention_views_core(), plus the views of the folded line with comment delimiters
     and angle brackets blanked (rounds 23, 24), so markdown spellings of the identifier read as
-    they do outside a comment or inside a tag attribute. Never counts fewer than the core views."""
+    they do outside a comment or inside a tag attribute. Never counts fewer than the core views.
+
+    Round 25: a renderer removes literal comments before it decodes anything; a pair spelled with
+    character references or NFKD forms becomes visible text after one decode and is no comment;
+    a double-encoded pair stays visible as "&lt;!--". So, for a line with a literal "<!--", the
+    views of the raw line with its literal comments removed (security r24 LOW-1) and with its
+    literal delimiters blanked (code r24 LOW-1) are read too. The core still decodes before it
+    strips, so a split such as TRUST&lt;!-- --&gt;_PEER counts 1 while a renderer shows no
+    contiguous identifier: an over-count, which fails closed and is left as it is."""
     views = _mention_views_core(text)
+    if "<!--" in text:
+        views += _mention_views_core(_strip_comments(text))
+        views += _mention_views_core(text.replace("<!--", " ").replace("-->", " "))
     low = _fold_mention(text)
     if "<!--" in low:
         views += _mention_views_core(low.replace("<!--", " ").replace("-->", " "))
@@ -2194,6 +2205,24 @@ class CertificationScope8262(unittest.TestCase):
                      'Enable <b title="TRUST">_PEER</b> now.',
                      'Enable <b title="**TRUST**_PEERS">x</b> now.'):
             self.assertEqual(count(text), 0, "control: %r" % text)
+        # Round 25 (security r24 LOW-1): a literal comment inside a decoded delimiter pair is removed
+        # before the decode, as a renderer does, so the halves join. Code r24 LOW-1: a decoded inner
+        # comment inside a literal comment still joins the halves, as it did at round 23.
+        wrappers = ("Enable %s now.", "| Mode | Note |\n| --- | --- |\n| a | %s |", "- Enable %s now.")
+        for kind, opener, closer in delimiters:
+            for inner in ("TRUST<!-- x -->_PEER", "TRUST<!-- -->_PEER", "TRUST_<!-- x -->PEER",
+                          "TRUST<!-- a -->_<!-- b -->PEER"):
+                for wrap in wrappers:
+                    text = wrap % ("%s %s %s" % (opener, inner, closer))
+                    self.assertEqual(count(text), 1, "%s pair, literal comment: %r" % (kind, text))
+            for wrap in wrappers:
+                text = wrap % ("<!-- TRUST%s %s_PEER -->" % (opener, closer))
+                self.assertEqual(count(text), 1, "%s comment in a literal one: %r" % (kind, text))
+        # Controls: a longer word and a split that no view joins stay 0.
+        for text in ("Enable &lt;!-- TRUST<!-- x -->_PEERS --&gt; now.",
+                     "Enable &lt;!-- TRUST<!-- x --> PEER --&gt; now.",
+                     "Enable TRUST<!-- _ -->PEER now.", "Enable TRUST&lt;!-- _ --&gt;PEER now."):
+            self.assertEqual(count(text), 0, "control: %r" % text)
         # The tag-wrapped underscore joins the halves once the tags are removed (rounds 16 and later).
         self.assertEqual(count("Enable TRUST<b>_</b>PEER now."), 1)
 
@@ -2214,6 +2243,67 @@ class CertificationScope8262(unittest.TestCase):
                     text = wrap % (position % dash)
                     self.assertEqual(len(trust_peer_units("README.md", text)), 1,
                                      "U+%04X %r" % (ord(dash), text))
+
+    def test_mention_census_is_fail_closed_against_reference_renderer_8262(self):
+        # Round 25 (code r24 LOW-1, security r24 LOW-1): an independent reference renderer, written
+        # here without the guard's helpers, decides whether the rendered text shows the identifier
+        # contiguous; the census must count every such line (counting more is allowed, fewer never).
+        import time
+        comment_re = re.compile(r"<!-->|<!--->|<!--.*?-->", re.S)
+        tag_re = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>|<[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:]"
+                            r"[\w.:-]*(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*\s*/?>")
+        dashes = "".join(chr(c) for c in range(sys.maxunicode + 1)
+                         if c == 0x2D or c == 0x2212 or unicodedata.category(chr(c)) == "Pd")
+        halves_re = re.compile("(trust)[%s](peer)" % re.escape(dashes), re.IGNORECASE)
+        ident_re = re.compile(r"(?<![0-9a-z])trust_peer(?![0-9a-z])")
+
+        def oracle(text):
+            # 1 literal comments go; 2 one html.unescape; 3 NFKC; 4 no second comment strip: a pair
+            # that only appears after the decode is visible text to a renderer; 5 tags go (both
+            # before and after the decode, the larger answer wins); 6 markdown escapes, code spans
+            # and emphasis go; 7 a dash between the halves reads as "_".
+            seen = 0
+            for tags_first in (True, False):
+                out = comment_re.sub("", text)
+                out = tag_re.sub("", out) if tags_first else out
+                out = unicodedata.normalize("NFKC", html.unescape(out))
+                out = out if tags_first else tag_re.sub("", out)
+                out = re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", out).replace("`", "").replace("*", "")
+                out = re.sub(r"(?<![0-9A-Za-z])_+|_+(?![0-9A-Za-z])", "", re.sub(r"__+", "", out))
+                seen = max(seen, 1 if ident_re.search(halves_re.sub(r"\1_\2", out).lower()) else 0)
+            return seen
+
+        spellings = (("<", ">"), ("&lt;", "&gt;"), ("&#60;", "&#62;"), ("&#x3c;", "&#x3e;"),
+                     ("\uff1c", "\uff1e"), ("\ufe64", "\ufe65"), ("&amp;lt;", "&amp;gt;"))
+        splits = ["TRUSTPEER", "TRUST_PEER", "TRUST\u2013PEER", "TRUST\u2014PEER"]
+        for lt, gt in spellings:
+            for body in (" ", " x ", ""):
+                splits += ["TRUST%s!--%s--%s_PEER" % (lt, body, gt),
+                           "TRUST_%s!--%s--%sPEER" % (lt, body, gt)]
+            splits.append("TRUST%s!-- --%sPEER" % (lt, gt))
+        splits += ["TRUST<b>_</b>PEER", "TRUST&lt;b&gt;_&lt;/b&gt;PEER", "TRUST<br>PEER", "TRUST<br>_PEER",
+                   '<b title="TRUST_PEER">x</b>', '<b title="TRUST">_PEER</b>', '<b title="x">TRUST</b>_PEER',
+                   "TRUST`_`PEER", "`TRUST`_PEER", "TRUST\\_PEER"]
+        lines = ("Enable %s now.", "| Mode | Note |\n| --- | --- |\n| a | %s |", "- Enable %s now.")
+        corpus = set()
+        for split in splits:
+            for line in lines:
+                corpus.add(line % split)
+                for lt, gt in spellings:
+                    corpus.add(line % ("%s!-- %s --%s" % (lt, split, gt)))
+                    corpus.add(line % ("%s!-- note --%s %s" % (lt, gt, split)))
+        corpus = sorted(corpus)
+        self.assertEqual(len(corpus), 2835)
+        start = time.perf_counter()
+        rows = [(text, oracle(text), len(trust_peer_units("README.md", text))) for text in corpus]
+        elapsed = time.perf_counter() - start
+        self.assertLess(elapsed, 2.0, "%d lines took %.3f s" % (len(corpus), elapsed))
+        fewer = [text for text, shown, count in rows if count < shown]
+        self.assertEqual(fewer[:3], [], "%d of %d lines count fewer than the reference renderer shows"
+                         % (len(fewer), len(corpus)))
+        # The oracle is not vacuous: it sees the identifier on some lines and not on others.
+        self.assertGreater(sum(shown for _, shown, _ in rows), 600)
+        self.assertGreater(sum(1 - shown for _, shown, _ in rows), 600)
 
     def test_front_matter_tab_and_comment_rows_8262(self):
         # Round 19 (code r15 LOW-1, LOW-3): rule 5 covers YAML front matter; the one-line comment match
