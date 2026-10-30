@@ -808,6 +808,20 @@ fi
 # ===========================================================================
 if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
 
+# ===========================================================================
+# SECTION H — #8332: a body-only PR edit never cancels or restarts the required
+# checks. Any workflow that lists `edited` on a pull_request(_target) trigger
+# must carry the body-only guard on cancel-in-progress; ci.yml and coverage.yml
+# do not list `edited` (their base-retarget case lives in pr-retarget.yml).
+# The checks live in Python: scripts/test/test_workflow_edited_cancel_8332.py.
+# ===========================================================================
+if python3 -I "$ROOT/scripts/test/test_workflow_edited_cancel_8332.py" >"$SCRATCH/h-8332.out" 2>&1; then
+    ok "H: a body-only PR edit never cancels or restarts a required check (#8332)"
+else
+    bad "H: a workflow lists 'edited' with cancel-in-progress and no body-only guard (#8332)" \
+        "$(grep -E '^(FAIL|ERROR)|AssertionError|lists .edited.' "$SCRATCH/h-8332.out" | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"

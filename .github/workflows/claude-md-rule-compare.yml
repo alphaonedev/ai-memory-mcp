@@ -46,9 +46,11 @@ on:
 permissions:
   contents: read
 
+# #8332: a title or body edit never cancels a running comparison; a base retarget
+# and a body edit each get a real (cheap) comparison run.
 concurrency:
   group: claude-md-rule-compare-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event.action != 'edited' }}
 
 jobs:
   compare:

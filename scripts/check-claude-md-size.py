@@ -1759,7 +1759,7 @@ COMPARE_WORKFLOW_LINES = (
     "contents: read",
     "concurrency:",
     "group: claude-md-rule-compare-${{ github.event.pull_request.number }}",
-    "cancel-in-progress: true",
+    "cancel-in-progress: ${{ github.event.action != 'edited' }}",
     "jobs:",
     "compare:",
     "name: CLAUDE.md rule-change comparison",
