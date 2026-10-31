@@ -24,15 +24,18 @@ The rules this guard pins (a ratchet over EVERY workflow):
    line, a duplicate trigger key, a pull_request word on a continuation line of another
    trigger, a column-0 line after the section that is not a workflow key) is refused
    by name, never read as a 0, and any ``edited`` word inside a pull_request(_target)
-   trigger body counts as listed. The ``ORACLE`` table pins every shape from rounds 3-8;
-   where PyYAML is importable a differential test checks the table, and variants of it,
-   against it.
-2. Where ``edited`` is listed, every ``cancel-in-progress`` key at ANY indent (a
-   job-level concurrency block too) is the literal ``false``, the guard
+   trigger body counts as listed. An anchor, tag or alias written on a mapping key ANYWHERE
+   in the file is refused by name (round 9): the scanner does not model that key's column.
+   The ``ORACLE`` table pins every shape from rounds 3-9; where PyYAML is importable a
+   differential test checks the table, and variants of it, against it.
+2. ``cancel-in-progress`` is read only as a direct child of a block ``concurrency:`` key
+   (top-level or job-level), through the scanner (round 9); a flow-form or tagged
+   ``concurrency`` value, and a ``cancel-in-progress`` or ``concurrency`` key anywhere else,
+   are refused by name. Where ``edited`` is listed, every such key is the literal ``false``, the guard
    ``${{ github.event_name == 'pull_request' }}``, the body-only guard
    ``${{ github.event.action != 'edited' }}``, or one of those guards joined by ``&&``
    to another clause. An ``||`` form is rejected. A workflow with a pull_request(_target)
-   trigger and a concurrency block without the key is a violation.
+   trigger and a concurrency block without the key is a violation; ``CANCEL_ORACLE`` pins the shapes.
 3. The only ``pull_request_target`` workflow is claude-md-rule-compare.yml. A second one
    is a failure: no ``pull_request_target`` workflow has ever run in this repository
    (#8337), so a new one would never fire before it lands on the default branch.
@@ -82,8 +85,12 @@ PAST_COMMENT = "a line continues a plain scalar past a comment, which YAML does 
 BLOCK_SCALAR_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)(?:[&!][^ \t]*[ \t]+)*[|>][1-9+-]*$")
 PR_WORD_RE = re.compile(r"(?<![\w-])pull_request(?:_target)?(?![\w-])")
 SEPARATORS = ("", " ", "\t")
-CANCEL_RE = re.compile(r"^[ \t]*cancel-in-progress:[ \t]*(.*?)[ \t]*$", re.M)
-CONCURRENCY_RE = re.compile(r"^[ \t]*concurrency:", re.M)
+PROPERTY_KEY = "an anchor, tag or alias on a mapping key (the scanner does not model that key's column)"
+# Round 9 (REVIEW-8332-security-r8 S17): a scanned key line, its key column (group 1 is the indent plus any
+# dashes), and a `cancel-in-progress` or `concurrency` key token anywhere in a scanned line.
+KEY_LINE_RE = re.compile(r"""^((?: *-[ \t]+)* *)(["']?)([\w-]+)\2[ \t]*:(?:[ \t]+(.*))?$""")
+CANCEL_KEY, CONCURRENCY_KEY = "cancel-in-progress", "concurrency"
+TOKEN_RES = {key: re.compile(rf"""(?<![\w-])(["']?){key}\1[ \t]*:""") for key in (CANCEL_KEY, CONCURRENCY_KEY)}
 WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 
@@ -140,6 +147,13 @@ class _Scanner:
     too, so the ``on:`` section refuses it by name (no workflow uses that shape there). A comment (trailing
     or on its own line) ends a plain scalar in YAML, so a deeper line after it that the scanner would read
     as a continuation is not YAML at all: ``scan`` refuses the whole file by name.
+
+    decision (round 9, REVIEW-8332-security-r8 S16): an anchor or tag written before a mapping key, or an
+    alias used as a key, starts the key node at the property's column, while the scanner records the
+    key's own token column as the parent of its value; a continuation between the two columns could then
+    open a quote only the scanner sees. No workflow writes a property on a key (23 workflows, 0 hits), so
+    ``scan`` refuses the whole file by name (whitelist-first) rather than modelling that column; a property
+    whose token holds a ``:`` (an alias read as a key by YAML parsers) is refused the same way.
     """
 
     def __init__(self):
@@ -155,6 +169,8 @@ class _Scanner:
         self.cut = False  # the open plain scalar was ended by a comment: YAML continues it no further
         self.invalid = ""  # why this line is not YAML at all (the whole file is refused), or ""
         self.bad = ""
+        self.pendprop = False  # an anchor or tag at this scalar start waits for its node's token
+        self.keyprop = False  # the current token carries a property or is an alias (a key there is refused)
 
     def _quoted(self, raw: str, i: int, out: list) -> int:
         """Consume one character inside a quoted scalar; return the next index."""
@@ -181,6 +197,9 @@ class _Scanner:
         j = i
         while j < len(raw) and raw[j] not in " \t,[]{}":
             j += 1
+        if ":" in raw[i:j]:
+            self.invalid = PROPERTY_KEY
+        self.pendprop, self.keyprop = raw[i] != "*", raw[i] == "*"
         out.append(raw[i:j])
         return j
 
@@ -198,9 +217,11 @@ class _Scanner:
             return False
         if c == ":" and (nxt in SEPARATORS or (raw[i - 1:i] in ('"', "'") and nxt in ('"', "'"))):
             # a key separator; a JSON-like "key":"value" in flow opens the value at once
+            if self.keyprop:
+                self.invalid = PROPERTY_KEY
             if not self.depth:
                 self.parent = self.tok
-            self.inplain = False
+            self.inplain = self.keyprop = False
             return True
         if not start:
             if c in "[{" and self.depth:
@@ -209,6 +230,7 @@ class _Scanner:
                 return True
             return False
         self.tok = i
+        self.keyprop, self.pendprop = self.pendprop, False
         if c in "\"'":
             self.quote = c
         elif c in "[{":
@@ -272,6 +294,7 @@ class _Scanner:
         self.invalid = PAST_COMMENT if pcont and was_cut else ""
         out, i, cut = [], 0, False
         start = not (cont or pcont)
+        self.pendprop = self.keyprop = False
         while i < len(raw):
             if self.quote:
                 i = self._quoted(raw, i, out)
@@ -280,7 +303,7 @@ class _Scanner:
                 break
             elif start and raw[i] in "&!*":
                 start = raw[i] != "*"  # an anchor or tag keeps the scalar start; an alias is a whole node
-                i = self._property(raw, i, out)
+                i = self._property(raw, i, out)  # a key token after it is refused (round 9)
             else:
                 start = self._plain(raw, i, out, start)
                 i += 1
@@ -440,6 +463,46 @@ def guard_ok(value: str) -> bool:
     return any(clause.strip() in ACCEPTED_GUARDS for clause in expr.split("&&"))
 
 
+def _concurrency_key(m, n: int, blocks: list):
+    """A block ``concurrency:`` key line: open its mapping (key column, cancel values), or record a scalar."""
+    value = m.group(4) or ""
+    if value[:1] in ("{", "[", "&", "!", "*", "|", ">"):
+        raise ParseFailure(f"line {n}: a flow-form, tagged, anchored, aliased or block-scalar `concurrency` value")
+    blocks.append([])
+    return None if value else (len(m.group(1)), blocks[-1])
+
+
+def concurrency_blocks(text: str) -> list:
+    """The ``cancel-in-progress`` values of every ``concurrency`` mapping, one list per mapping.
+
+    decision (round 9, REVIEW-8332-security-r8 S17): a key is read only as a DIRECT child of a block
+    ``concurrency:`` key (its owner column, as the scanner reads it), never by counting raw lines: a
+    flow-form ``concurrency`` value and any other ``cancel-in-progress`` or ``concurrency`` key token
+    (in a flow collection, a plain scalar, a deeper line, another mapping such as a job ``env:``) is
+    refused by name. A scalar ``concurrency`` value is a mapping with no ``cancel-in-progress`` key.
+    """
+    raws, blocks, cur, child = text.splitlines(), [], None, None
+    for n, ln in enumerate(scan(text), 1):
+        x = ln.text
+        if not x.strip():
+            continue
+        m = None if ln.cont or ln.depth else KEY_LINE_RE.match(x)
+        if cur is not None and not ln.cont and not ln.depth and _indent(x) <= cur[0]:
+            cur = None
+        used = {CANCEL_KEY: 0, CONCURRENCY_KEY: 0}
+        if cur is not None and m and child in (None, len(m.group(1))):
+            child = len(m.group(1))
+            if m.group(3) == CANCEL_KEY:
+                cur[1].append(raws[n - 1][m.start(4):len(x)].strip() if m.group(4) else "")
+                used[CANCEL_KEY] = 1
+        if m and m.group(3) == CONCURRENCY_KEY:
+            cur, child, used[CONCURRENCY_KEY] = _concurrency_key(m, n, blocks), None, 1
+        for key, token in TOKEN_RES.items():
+            if len(token.findall(x)) > used[key]:
+                raise ParseFailure(f"line {n}: a `{key}` key outside a block `concurrency:` mapping's direct children")
+    return blocks
+
+
 def cancel_violations(name: str, text: str) -> list:
     """Problems for one workflow file's text (empty list = compliant)."""
     try:
@@ -448,12 +511,15 @@ def cancel_violations(name: str, text: str) -> list:
         return [f"{name}: cannot parse the trigger section ({exc}); failing closed"]
     if not triggered:
         return []
+    try:
+        blocks = concurrency_blocks(text)
+    except ParseFailure as exc:
+        return [f"{name}: cannot parse the concurrency keys ({exc}); failing closed"]
     problems = []
-    keys = CANCEL_RE.findall(text)
-    if len(CONCURRENCY_RE.findall(text)) > len(keys):
+    if any(not keys for keys in blocks):
         problems.append(f"{name}: a concurrency block has no cancel-in-progress key")
     if "edited" in pr_types(text):
-        for value in keys:
+        for value in (v for keys in blocks for v in keys):
             if not guard_ok(value):
                 problems.append(f"{name}: lists `edited` with cancel-in-progress `{value}` and no accepted guard")
     return problems
@@ -669,8 +735,19 @@ WD = "on:\n  workflow_dispatch:\n    inputs:\n      x:\n"
 # Round 8 (REVIEW-8332-code-r7 F1, REVIEW-8332-security-r7 S14): a value that starts on the line BELOW its
 # key or bare dash. Each shape is built under both owners: (owner, prefix, the value's column). ``{v}`` is
 # the value's column, ``{m}`` a column between the owner and the value (still owned by the key or dash).
-NEXT_OWNERS = (("key", WD + "        description:\n", 10), ("bare dash", WD + "        options:\n          -\n", 12))
+# Round 9 (REVIEW-8332-code-r8 F1): the carried owner column survives a blank or comment line between the
+# key or dash and its value, so every shape also runs through those three owners.
+NEXT_OWNERS = (("key", WD + "        description:\n", 10), ("bare dash", WD + "        options:\n          -\n", 12),
+               ("key, comment line", WD + "        description:\n        # note\n", 10),
+               ("key, blank line", WD + "        description:\n\n", 10),
+               ("bare dash, comment line", WD + "        options:\n          -\n          # note\n", 12))
 PR_EDITED = "  pull_request:\n    types: [edited]"
+# Round 9 (REVIEW-8332-security-r8 S16): ``{p}`` is a property written before a key outside ``on:``; the
+# real ``on:`` follows, and a later quoted run value holds a column-0 line.
+COL0_TAIL = "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'x\non:\n  push:\n    branches: [y]'\n"
+PROPERTY_ON_KEY = "env:\n  A: &a k\n  {p}: run\n    'mode\n" + "on:\n" + PR_EDITED + "\n" + COL0_TAIL
+PROPERTY_ON_KEY_DASH = ("env:\n  A: &a k\n  L:\n    - {p}: run\n        'mode\n" + "on:\n" + PR_EDITED + "\n"
+                        + COL0_TAIL)
 NEXT_SHAPES = (
     ("single-quote continuation", "{v}run the\n{v}'mode\n", PR_EDITED + "  # it's\n", REFUSE),
     ("single-quote continuation, target", "{v}run the\n{v}'mode\n",
@@ -812,6 +889,20 @@ ORACLE = (
     ("r8 duplicate trigger key, the last one clean",
      "on:\n  pull_request:\n    types: [edited]\n  pull_request:\n    types: [opened]\n",
      REFUSE, "duplicate trigger key `pull_request`"),
+    # round 9, REVIEW-8332-code-r8 INFO-1 / REVIEW-8332-security-r8 INFO-1: the owner is taken only by a
+    # deeper line; a sibling key or a dash at the key's own column is not the key's value.
+    ("r9 sibling key at the column of an empty-valued key",
+     WD + "        description:\n        required: false\n  pull_request:\n    types: [edited]\n", EDITED),
+    ("r9 dash at the column of an empty-valued key", "on:\n  pull_request:\n    types:\n    - edited\n", EDITED),
+    # round 9, REVIEW-8332-security-r8 S16: a property on a VALUE (here a whole mapping) is not on its key.
+    ("r9 anchor ending the line of a mapping value before on:",
+     "env: &e\n  X: run\n    'mode\non:\n  pull_request:\n    types: [edited]\n", EDITED),
+) + tuple(
+    # round 9, REVIEW-8332-security-r8 S16: a property on a mapping key outside `on:` (anchor, tag, alias),
+    # with a column-0 line inside a later quoted value, at top level and under a bare dash.
+    (f"r9 {what} on a key before on:{where}", text.format(p=prop), REFUSE, PROPERTY_KEY)
+    for what, prop in (("anchor", "&a X"), ("tag", "!!str X"), ("alias", "*a "), ("alias with no space", "*a"))
+    for where, text in (("", PROPERTY_ON_KEY), (", under a bare dash", PROPERTY_ON_KEY_DASH))
 ) + tuple(
     (f"r8 next-line value under a {owner}: {name}",
      prefix + value.format(v=" " * col, m=" " * (col - 1)) + trigger, want,
@@ -826,6 +917,44 @@ VARIANTS = (
     ("doubled-quote escape", lambda t: "name: 'it''s \"q\" #x'\n" + t),
     ("extra indentation", lambda t: "".join(" " * _indent(ln) + ln + "\n" for ln in t.splitlines())),
     ("column-0 continuation", lambda t: "run-name: 'a\nb [c # d'\n" + t),
+)
+
+
+# Round 9 (REVIEW-8332-security-r8 S17): the cancel-in-progress binding, read for the allow-listed workflow
+# (it lists edited). The third field is a text the first problem must contain, or None for compliant.
+CANCEL_HEAD = "name: c\non:\n  pull_request_target:\n    types: [opened, edited]\n"
+CANCEL_JOB = "jobs:\n  j:\n    runs-on: ubuntu-latest\n"
+CANCEL_ORACLE = (
+    ("r9 flow-form concurrency with a decoy key in a job env",
+     CANCEL_HEAD + "concurrency: {group: g, cancel-in-progress: true}\n" + CANCEL_JOB
+     + "    env:\n      cancel-in-progress: false\n", "flow-form"),
+    ("r9 decoy key in a job env, block concurrency without the key",
+     CANCEL_HEAD + "concurrency:\n  group: g\n" + CANCEL_JOB + "    env:\n      cancel-in-progress: false\n",
+     "outside a block `concurrency:`"),
+    ("r9 flow-form job concurrency with a decoy key in the job env",
+     CANCEL_HEAD + CANCEL_JOB + "    concurrency: {group: j, cancel-in-progress: true}\n"
+     "    env:\n      cancel-in-progress: false\n", "flow-form"),
+    ("r9 decoy key in a flow env, block concurrency without the key",
+     CANCEL_HEAD + "concurrency:\n  group: g\n" + CANCEL_JOB + "    env: {cancel-in-progress: false}\n",
+     "outside a block `concurrency:`"),
+    ("r9 key one level deeper than the concurrency children",
+     CANCEL_HEAD + "concurrency:\n  group:\n    cancel-in-progress: false\n  cancel-in-progress: true\n" + CANCEL_JOB,
+     "outside a block `concurrency:`"),
+    ("r9 decoy key in a top-level env after a block concurrency without the key",
+     CANCEL_HEAD + "concurrency:\n  group: g\nenv:\n  cancel-in-progress: false\n" + CANCEL_JOB,
+     "outside a block `concurrency:`"),
+    ("r9 key only one level deeper than the concurrency children",
+     CANCEL_HEAD + "concurrency:\n  group:\n    cancel-in-progress: false\n" + CANCEL_JOB,
+     "outside a block `concurrency:`"),
+    ("r9 top-level block concurrency, true, allow-listed workflow",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: true\n" + CANCEL_JOB,
+     "cancel-in-progress `true`"),
+    ("r9 job-level block concurrency, true, under a top-level false",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + "    concurrency:\n      group: j\n      cancel-in-progress: true\n", "cancel-in-progress `true`"),
+    ("r9 top-level and job-level block concurrency, both guarded",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: ${{ github.event.action != 'edited' }}\n"
+     + CANCEL_JOB + "    concurrency:\n      group: j\n      cancel-in-progress: false  # f\n", None),
 )
 
 
@@ -896,6 +1025,31 @@ class EditedRatchetOracle8332(unittest.TestCase):
             ok = f"on:\n  pull_request: {{paths: [{q}docs #x{q}], types: [opened]}}\n"
             self.assertEqual(oracle_verdict("hash.yml", ok), CLEAN, ok)
             self.assertTrue(has_trigger(ok, "pull_request"))
+
+    def test_cancel_oracle(self):
+        """Round 9 (REVIEW-8332-security-r8 S17): cancel-in-progress is bound to its concurrency block."""
+        for name, text, message in CANCEL_ORACLE:
+            with self.subTest(name):
+                self.assertIn("edited", pr_types(text), text)
+                out = cancel_violations("claude-md-rule-compare.yml", text)
+                if message is None:
+                    self.assertEqual(out, [], text)
+                else:
+                    self.assertEqual(len(out), 1, text)
+                    self.assertIn(message, out[0], text)
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not importable on this interpreter")
+    def test_cancel_oracle_matches_pyyaml(self):
+        """Every compliant CANCEL_ORACLE row: PyYAML reads each concurrency cancel value as false or a guard,
+        and every refused or violating row holds a true or a missing key somewhere (round 9)."""
+        import yaml
+        for name, text, message in CANCEL_ORACLE:
+            with self.subTest(name):
+                data = yaml.safe_load(text)
+                found = [data.get("concurrency")] + [j.get("concurrency") for j in data["jobs"].values()]
+                values = [c.get(CANCEL_KEY) for c in found if isinstance(c, dict)]
+                compliant = bool(values) and all(v is False or guard_ok(str(v)) for v in values)
+                self.assertEqual(compliant, message is None, text)
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not importable on this interpreter")
     def test_oracle_matches_pyyaml(self):
