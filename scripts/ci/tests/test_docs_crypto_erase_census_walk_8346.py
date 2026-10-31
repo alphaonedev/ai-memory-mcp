@@ -267,7 +267,8 @@ sibling reader divergence, sibling pattern divergence, verbatim quoted TOML keys
   The reader list (each calls the helper with its own file name): `read_lib_whole` (src/lib.rs), `reject_import_target` (a use
   target file), `reject_module_file` (a module file declared before `mod encryption;`, now before its `macro_use`
   early return), `reject_tree_file` (every `.rs` under src/encryption except mod.rs; it never rejected Unicode in
-  round 15), `Census.__init__` (mod.rs) and the secondary lib.rs scans (`lib_prefix_modules`,
+  round 15), `reject_rebinding` (mod.rs, the first reader `Census.__init__` runs), `Census.__init__` (mod.rs) and the
+  secondary lib.rs scans (`lib_prefix_modules`,
   `local_import_targets`, `reject_import_targets`, `reject_crate_level`). A reader added later must call it too; a test
   requires the call and forbids a private copy.
 * Sibling pattern divergence, the shared macro-call fragments: `RAW`, `SEGMENT`, `MACRO_LOOKBEHIND`,
@@ -299,6 +300,20 @@ strict TOML key spellings.
   (`'pa'th`, `pa"th"`, `"pa"ste`, a no-break space, U+3000, U+2028, a carriage return, two quoted runs) raise an
   error that names the manifest (`Cargo.toml`).
 * The remedy text says to run from the repository root and that delete-and-checkout drops uncommitted edits.
+
+Round 18 (PR #8349; security r17 LOW-1/INFO-1/INFO-2, code r17 LOW-1; one new issue). Round 17 closed "strict TOML key
+spellings" but the reader still accepted spellings tomllib refuses. The class (still counted as the 40th) is now closed:
+* Empty and control-character key segments (`toml_segment`, `BARE_KEY`, `KEY_CONTROL`): a bare run is non-empty
+  (`a..b`, `.a`, `a.`, the empty key and a key of spaces raise "a TOML key segment is empty"), a quoted key holds no
+  newline, C0 control or DEL (a tab is legal; a named error), and a newline between segments raises "a TOML key
+  segment holds a line break" (the multi-line inline table check keeps its message); whitespace
+  outside quotes is a space or a tab only. A test compares 46 spellings with Python's tomllib: 0 disagreements. A
+  quoted empty key (`""`) stays valid.
+* One copy of the non-ASCII check, every spelling: the one-copy test counts the regex AND the other spellings (`ord(c)
+  > 127`, `isascii(`, the hex escapes 7f and 80, `>= 128`, `encode("ascii")`) in the source of every module-level function but
+  `reject_unicode_space`, and a self-check shows it catches a private `ord()` copy in `reject_rebinding`.
+* Reader list: `masked_ascii_source` and the module list name `reject_rebinding` (mod.rs, the first reader
+  `Census.__init__` runs).
 """
 import contextlib
 import functools
@@ -1811,8 +1826,8 @@ def masked_ascii_source(clean, rel):
     order is fixed: mask the literals, then reject Unicode whitespace and any non-ASCII character outside a comment
     or literal (a look-alike identifier), then hand the masked text to the reader. `rel` names the file in the error.
     Readers: `read_lib_whole` (src/lib.rs), `reject_import_target` (a use target), `reject_module_file` (a module
-    declared before `mod encryption;`), `reject_tree_file` (every file below src/encryption/), `Census.__init__`
-    (mod.rs) and the secondary lib.rs scans (`lib_prefix_modules`, `local_import_targets`, `reject_import_targets`,
+    declared before `mod encryption;`), `reject_tree_file` (every file below src/encryption/), `reject_rebinding`
+    (mod.rs, the first reader `Census.__init__` runs), `Census.__init__` (mod.rs) and the secondary lib.rs scans (`lib_prefix_modules`, `local_import_targets`, `reject_import_targets`,
     `reject_crate_level`). None keeps a private copy of the sequence.
     """
     masked = mask_literals(clean)
@@ -2081,7 +2096,9 @@ NEXTEST_KEYS = frozenset({"retries", "fail-fast", "slow-timeout", "status-level"
                           "test-threads", "path", "period", "terminate-after"})
 
 
-BARE_KEY = re.compile(r"[A-Za-z0-9_-]*")
+BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+# The characters TOML forbids inside a quoted key: C0 controls other than the tab, and DEL (a tab stays legal).
+KEY_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f]")
 
 
 def toml_segment(runs, where, text):
@@ -2089,20 +2106,35 @@ def toml_segment(runs, where, text):
     bare character) pairs, or raise a named error that names `where` (the manifest or config file).
 
     Whitespace OUTSIDE the quotes around a segment is not part of the key (`a . b`), and only a space or a tab counts
-    as whitespace there (plus a newline, which the multi-line inline table check names on its own); whitespace INSIDE the quotes is (r16, security r15 INFO-1: `' path'` is the key ` path`,
+    as whitespace there (a newline is not: it raises the named line-break error below); whitespace INSIDE the
+    quotes is (r16, security r15 INFO-1: `' path'` is the key ` path`,
     never `path`, and Cargo rejects it). r17 (security r16 INFO-1, code r16 INFO-3): a segment is ONE quoted run or ONE
     bare run, never a mix (`'pa'th`, `pa"th"`, `"pa"ste` and `"a" "b"` are invalid TOML, tomllib refuses them), and a
     bare run holds only `[A-Za-z0-9_-]` (U+00A0, U+3000, U+2028, a carriage return and `*` are not TOML whitespace or
-    bare key characters), so every spelling this reader accepts is one tomllib and cargo accept as well.
+    bare key characters). r18 (security r17 LOW-1, code r17 LOW-1): a bare run is NON-empty (`a..b`, `.a`, `a.` and
+    the empty key hold an empty segment, tomllib refuses them; a quoted `""` or `''` stays a valid empty key), a
+    quoted key holds no control character (a newline, a C0 control or DEL; a tab is legal), and a newline between
+    segments is refused, so every spelling this reader accepts is one tomllib and cargo accept as well (a test
+    compares 46 spellings with tomllib, 0 disagreements).
     """
     quoted = [value for kind, value in runs if kind == "q"]
-    bare = "".join(value for kind, value in runs if kind == "b").strip(" \t\n")
+    bare = "".join(value for kind, value in runs if kind == "b").strip(" \t")
     if quoted and (len(quoted) > 1 or bare):
         raise AssertionError("%s: a TOML key segment mixes quoted and bare text, or holds two quoted runs: %r "
                              "(a quote inside a bare key, text after a closing quote; TOML and cargo reject it)"
                              % (where, text))
     if quoted:
+        if KEY_CONTROL.search(quoted[0]) is not None:
+            raise AssertionError("%s: a TOML key segment holds a control character inside its quotes: %r (TOML "
+                                 "and cargo reject it)" % (where, text))
         return quoted[0]
+    if "\n" in bare:
+        raise AssertionError("%s: a TOML key segment holds a line break: %r (a newline between key segments, or a "
+                             "multi-line inline table; TOML and cargo reject the first, the pinned value is one line)"
+                             % (where, text))
+    if not bare:
+        raise AssertionError("%s: a TOML key segment is empty: %r (an empty bare key, `a..b`, `.a`, `a.`; TOML and "
+                             "cargo reject it, only a quoted `\"\"` is an empty key)" % (where, text))
     if BARE_KEY.fullmatch(bare) is None:
         raise AssertionError("%s: a bare TOML key segment holds a character outside [A-Za-z0-9_-]: %r (TOML and "
                              "cargo reject it; a quoted key keeps any character)" % (where, text))
@@ -5294,6 +5326,24 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     census = Census(self.text, overrides=self.tree_overrides(rel, code))
                     self.assertEqual(self.census_signature(census), live)
 
+    # every spelling of a non-ASCII check: the regex class, the hex escapes of DEL and the first non-ASCII code point,
+    # `isascii(`, the `> 127` / `>= 128` / `> 0x7f` comparisons and an ascii encode
+    PRIVATE_NON_ASCII = re.compile(r"\\x7f|\\x80|isascii\(|>\s*127\b|>=\s*128\b|>\s*0x7f\b|encode\(\s*[\"']ascii",
+                                   re.IGNORECASE)
+
+    def private_non_ascii_spellings(self, source):
+        """Return every spelling of a non-ASCII check found in the source text `source` of one function."""
+        return self.PRIVATE_NON_ASCII.findall(source)
+
+    def module_functions(self):
+        """Return every module-level function of this file (cached readers unwrapped), once each, by name."""
+        found = {}
+        for value in vars(sys.modules[__name__]).values():
+            target = inspect.unwrap(value) if callable(value) else value
+            if inspect.isfunction(target) and target.__module__ == __name__:
+                found[target.__name__] = target
+        return [found[name] for name in sorted(found)]
+
     def test_every_file_class_reader_calls_the_one_shared_helper_8346(self):
         """r16: no reader keeps a private mask-and-reject sequence; each passes its own file name to the one helper."""
         self.assertIn("masked_ascii_source", globals())
@@ -5309,6 +5359,21 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         whole = inspect.getsource(sys.modules[__name__])
         self.assertEqual(whole.count("[^" + "\\x00-" + "\\x7f]"), 1)
         self.assertIn("[^" + "\\x00-" + "\\x7f]", inspect.getsource(reject_unicode_space))
+        # r18 (security r17 INFO-1): every OTHER spelling of a private non-ASCII check is absent from every function
+        self.assertIn("reject_rebinding", masked_ascii_source.__doc__)
+        for function in self.module_functions():
+            if function.__name__ == "reject_unicode_space":
+                self.assertTrue(self.private_non_ascii_spellings(inspect.getsource(function)))
+                continue
+            with self.subTest(private_copy_in=function.__name__):
+                self.assertEqual(self.private_non_ascii_spellings(inspect.getsource(function)), [])
+        base = inspect.getsource(reject_rebinding)
+        for copy in ("    if any(ord(c) > 127 for c in masked):\n        raise AssertionError(1)\n",
+                     "    if not masked.isascii():\n        raise AssertionError(1)\n",
+                     "    masked.encode('ascii')\n", "    if re.search(r'[\\x80-\\U0010ffff]', masked):\n        pass\n",
+                     "    if max(map(ord, masked)) >= 128:\n        pass\n", "    if re.search(r'[^\\x00-\\x7F]', masked):\n        pass\n"):
+            with self.subTest(self_check=copy):
+                self.assertTrue(self.private_non_ascii_spellings(base + copy))
         # the helper is the only caller of `reject_unicode_space` in the whole module
         self.assertEqual(len(re.findall(r"reject_unicode" + r"_space\(", inspect.getsource(sys.modules[__name__]))), 2)
         seen = []
@@ -5444,9 +5509,74 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         self.refused(r"Cargo\.toml: a TOML key segment mixes", self.manifest_replaced(live, 'pa"ste" = { path = "vendor/paste" }'))
         # controls: every valid spelling stays exactly as before
         for text, expected in (("a-b_C9", ("a-b_C9",)), (" a \t. b ", ("a", "b")), ('"a" . \'b c\'', ("a", "b c")),
-                               ("'\u00a0x'", ("\u00a0x",)), ("", ("",))):
+                               ("'\u00a0x'", ("\u00a0x",)), ('""', ("",)), ("''", ("",)), ("'a\tb'", ("a\tb",))):
             with self.subTest(valid=text):
                 self.assertEqual(toml_dotted(text, MANIFEST), expected)
+
+    # r18 (security r17 LOW-1, code r17 LOW-1): empty segments and control characters the reader used to accept
+    EMPTY_OR_CONTROL_KEYS = ("", "a..b", ".a", "a.", " . ", "a . . b", '"a\x01b"', "'a\x7fb'", '"a\nb"', "a\n.b")
+
+    def test_empty_and_control_character_toml_key_segments_are_refused_8346(self):
+        """r18: an empty bare segment and a control character in a quoted key raise a named error that names the
+        manifest; a quoted empty key and a tab inside quotes stay valid."""
+        for key in self.EMPTY_OR_CONTROL_KEYS:
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: a TOML key segment (?:is empty|holds a "
+                                                            r"control character|holds a line break|mixes)|^Cargo\.toml: a bare"):
+                    toml_dotted(key, MANIFEST)
+        for key in ("", "a..b", ".a", "a.", " . "):
+            with self.subTest(empty=key):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: a TOML key segment is empty"):
+                    toml_dotted(key, MANIFEST)
+        for key in ("a\n.b", "a .\nb"):
+            with self.subTest(line_break=key):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: a TOML key segment holds a line break"):
+                    toml_dotted(key, MANIFEST)
+        for key in ('"a\x01b"', "'a\x7fb'", '"a\nb"', '"a\x00b"', "'a\x1fb'"):
+            with self.subTest(control=key):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: a TOML key segment holds a control"):
+                    toml_dotted(key, MANIFEST)
+        for code, shown in (('[package.metadata.r18x]\na..b = 1', r"Cargo\.toml: a TOML key segment is empty"),
+                            ('[package.metadata.r18x]\n"a\x01b" = 1', r"Cargo\.toml: a TOML key segment holds a control"),
+                            ('[package.metadata.]\na = 1', r"Cargo\.toml: a TOML key segment is empty"),
+                            ('[dependencies]\nversion. = "1"', r"Cargo\.toml: a TOML key segment is empty")):
+            with self.subTest(manifest=code):
+                self.refused(shown, self.manifest_with(code))
+
+    # 46 key spellings with the verdict Python's tomllib gives them (checked live below when tomllib exists)
+    TOML_KEY_ORACLE = (
+        ("a", True), ("a-b_C9", True), ("1", True), ("-", True), ("_", True), ("a.b", True), (" a . b ", True),
+        ("a . b . c", True), ('"a"', True), ("'a'", True), ('""', True), ("''", True), ('"a b"', True),
+        ("'a b'", True), ('"a.b"', True), ("'a.b'", True), ('"a" . \'b\'', True), ("'a\tb'", True),
+        ("'\u00a0x'", True), ('"\u00e9"', True), ("a . 'b' . c", True), ('"a"."b"', True), ("' path'", True),
+        ('"path "', True),
+        ("", False), ("a..b", False), ("a.", False), (".a", False), (" . ", False), ("a . . b", False),
+        ('"a\x01b"', False), ("'a\x7fb'", False), ('"a\nb"', False), ("a\n.b", False), ("a .\nb", False),
+        ('"a\x00b"', False), ("'a\x1fb'", False), ("a*", False), ("\u00e9", False), ("a b", False), ("a!", False),
+        ("'pa'th", False), ('pa"th"', False), ('"pa"ste', False), ("\u00a0path", False), ("path\r", False))
+
+    def test_toml_key_reader_agrees_with_tomllib_on_46_spellings_8346(self):
+        """r18: the strict key reader accepts exactly the spellings tomllib accepts (0 disagreements)."""
+        self.assertEqual(len(self.TOML_KEY_ORACLE), 46)
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        for key, valid in self.TOML_KEY_ORACLE:
+            with self.subTest(key=key):
+                if tomllib is not None:
+                    try:
+                        tomllib.loads("%s = 1\n" % key)
+                        oracle = True
+                    except tomllib.TOMLDecodeError:
+                        oracle = False
+                    self.assertEqual(oracle, valid, "oracle table drifted from tomllib")
+                try:
+                    toml_dotted(key, MANIFEST)
+                    accepted = True
+                except AssertionError:
+                    accepted = False
+                self.assertEqual(accepted, valid)
 
     def test_round_17_classes_are_documented_and_counted(self):
         """the docstring and CLOSED_CLASSES list the round 17 class the code enforces (40 in all)."""
@@ -5457,6 +5587,14 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         self.assertNotIn("`INCLUDE_EXACT`", __doc__)
         self.assertEqual(len(CLOSED_CLASSES), 40)
         self.assertEqual(len(set(CLOSED_CLASSES)), 40)
+
+    def test_round_18_changes_are_documented_8346(self):
+        """r18: the docstring names the round and each fix; the helper's reader list names `reject_rebinding`."""
+        for phrase in ("Round 18", "KEY_CONTROL", "a TOML key segment is empty", "46 spellings", "every spelling",
+                       "reject_rebinding"):
+            self.assertIn(phrase, __doc__)
+        self.assertIn("reject_rebinding", masked_ascii_source.__doc__)
+        self.assertNotIn("plus a newline", toml_segment.__doc__)
 
     def test_round_16_classes_are_documented_and_counted(self):
         """the docstring and CLOSED_CLASSES list the round 16 classes the code enforces (39 after round 16)."""
