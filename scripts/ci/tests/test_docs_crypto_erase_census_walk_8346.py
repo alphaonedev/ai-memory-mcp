@@ -6,10 +6,12 @@ runs `git ls-files -- docs` and reads every tracked .md and .html doc. A PR that
 touches only docs/** gets cargo_skip=true, so that Rust test never runs on it.
 This file runs the SAME census from the Classify job on every PR (rules.json
 `cargo_skip.walk_guards`, the pair shape of #3627). The phrases, the dated-record
-carve-outs, the erase doc and the erasable version bytes are parsed from the Rust
-source, so a change to the census moves the mirror.
+carve-outs, the erase doc, the erasable version bytes, the file-type filter, the
+`git ls-files` folder and the list sizes are parsed from the Rust source (a value
+that cannot be parsed fails loudly), so a change to the census moves the mirror.
 """
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,7 +28,7 @@ SCRATCH = REPO / ".local-runs"
 
 def read(rel):
     """Return the text of a tracked source file."""
-    return (REPO / rel).read_text()
+    return (REPO / rel).read_text(encoding="utf-8")
 
 
 def const_body(text, name):
@@ -40,6 +42,43 @@ def const_body(text, name):
 def strings(body):
     """Return the string literals of a Rust const body, in order."""
     return re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+
+
+def const_len(text, name):
+    """Return N from the declared type `const <name>: [&str; N]`."""
+    match = re.search(r"const %s:\s*\[&str;\s*(\d+)\s*\]" % re.escape(name), text)
+    if match is None:
+        raise AssertionError("%s no longer declares %s as [&str; N]" % (RUST_SRC, name))
+    return int(match.group(1))
+
+
+def string_list(text, name):
+    """Return the string literals of const <name>; fail unless there are exactly N."""
+    found = strings(const_body(text, name))
+    declared = const_len(text, name)
+    if len(found) != declared:
+        raise AssertionError("%s: %s declares [&str; %d] but %d plain string literals were parsed"
+                             % (RUST_SRC, name, declared, len(found)))
+    return found
+
+
+def census_filter(text):
+    """Return the `ends_with` suffixes the Rust census reads (the `.md`/`.html` filter)."""
+    match = re.search(r"for rel in stdout\.lines\(\) \{\s*if !\((.*?)\)\s*\|\|\s*DOCS_CENSUS_DATED_RECORDS",
+                      text, re.S)
+    suffixes = re.findall(r'rel\.ends_with\("([^"]+)"\)', match.group(1)) if match else []
+    if not suffixes:
+        raise AssertionError('%s no longer filters the census by `rel.ends_with("..")`' % RUST_SRC)
+    return tuple(suffixes)
+
+
+def census_folder(text):
+    """Return the folder of the census `git ls-files -- <folder>` call."""
+    match = re.search(r'docs_census_git_on\(\s*root,\s*&\["ls-files",\s*"--",\s*"([^"]+)"\s*\]', text)
+    if match is None:
+        raise AssertionError("%s no longer runs `git ls-files -- <folder>` through docs_census_git_on"
+                             % RUST_SRC)
+    return match.group(1)
 
 
 def erasable_bytes(text):
@@ -67,14 +106,16 @@ class Census:
     """The predicates of docs_census_8315_on, parsed from the Rust source."""
 
     def __init__(self, text):
-        self.phrases = strings(const_body(text, "DOCS_CENSUS_ERASE_PHRASES"))
-        self.dated = strings(const_body(text, "DOCS_CENSUS_DATED_RECORDS"))
+        self.phrases = string_list(text, "DOCS_CENSUS_ERASE_PHRASES")
+        self.dated = string_list(text, "DOCS_CENSUS_DATED_RECORDS")
+        self.suffixes = census_filter(text)
+        self.folder = census_folder(text)
         self.erase_doc = strings(const_body(text, "DOCS_CENSUS_ERASE_DOC"))[0]
         self.bytes = erasable_bytes(text)
 
     def reads(self, rel):
         """True when the Rust census reads `rel` at all (extension, not a dated record)."""
-        return rel.endswith((".md", ".html")) and not any(rel.startswith(d) for d in self.dated)
+        return rel.endswith(self.suffixes) and not any(rel.startswith(d) for d in self.dated)
 
     def judge(self, rel, text):
         """Return (in_census, failure or None) for one tracked doc."""
@@ -102,10 +143,16 @@ class Census:
         return census, failures
 
 
-def tracked_docs():
-    """Return `git ls-files -- docs`, as the Rust census does."""
-    out = subprocess.run(["git", "ls-files", "--", "docs"], cwd=str(REPO), check=True,
-                         stdout=subprocess.PIPE, universal_newlines=True)
+def git_env():
+    """Return the environment without the overrides the Rust census removes."""
+    drop = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+def tracked_docs(folder):
+    """Return `git ls-files -- <folder>`, as the Rust census does."""
+    out = subprocess.run(["git", "ls-files", "--", folder], cwd=str(REPO), check=True,
+                         stdout=subprocess.PIPE, universal_newlines=True, env=git_env())
     return out.stdout.splitlines()
 
 
@@ -116,13 +163,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     def setUpClass(cls):
         cls.text = read(RUST_SRC)
         cls.census = Census(cls.text)
-        cls.listing = tracked_docs()
+        cls.listing = tracked_docs(cls.census.folder)
 
     def test_census_constants_were_parsed(self):
         self.assertEqual(self.census.erase_doc, "docs/security/crypto-erase.md")
         self.assertEqual(self.census.bytes, ["0x03", "0x05"])
         self.assertGreaterEqual(len(self.census.phrases), 4)
         self.assertEqual(self.census.dated, ["docs/reviews/", "docs/audit/"])
+        self.assertEqual(self.census.suffixes, (".md", ".html"))
+        self.assertEqual(self.census.folder, "docs")
 
     def test_live_tree_passes_the_census(self):
         self.assertGreater(len(self.listing), 100)
@@ -165,6 +214,8 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     def test_rules_json_carries_the_walk_guard_entry(self):
         entry = rules_entry()
         self.assertEqual(entry["roots"], ["docs"])
+        self.assertEqual(entry["roots"], [self.census.folder],
+                         "rules.json roots must equal the folder the Rust census lists")
         self.assertEqual(entry["guard"], "scripts/ci/tests/test_docs_crypto_erase_census_walk_8346.py")
         self.assertTrue((REPO / entry["guard"]).is_file())
 
