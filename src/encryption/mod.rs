@@ -2176,11 +2176,11 @@ mod tests {
             root.join(DOCS_CENSUS_ERASE_DOC).is_file(),
             "inside a git checkout the census must reach {DOCS_CENSUS_ERASE_DOC}, but it is missing or not a file"
         );
-        let listing = docs_census_git_on(root, &["ls-files", "--", "docs"], path)
-            .expect("run `git ls-files -- docs`");
+        let listing = docs_census_git_on(root, &["ls-files", "-z", "--", "docs"], path)
+            .expect("run `git ls-files -z -- docs`");
         assert!(
             listing.status.success(),
-            "`git ls-files -- docs` failed: {}",
+            "`git ls-files -z -- docs` failed: {}",
             String::from_utf8_lossy(&listing.stderr)
         );
         let stdout = String::from_utf8_lossy(&listing.stdout);
@@ -2190,7 +2190,7 @@ mod tests {
             .collect();
         let mut census: Vec<String> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
-        for rel in stdout.lines() {
+        for rel in stdout.split('\0').filter(|rel| !rel.is_empty()) {
             if !(rel.ends_with(".md") || rel.ends_with(".html"))
                 || DOCS_CENSUS_DATED_RECORDS
                     .iter()
@@ -2230,7 +2230,7 @@ mod tests {
     /// doc anywhere under `docs/` that names one byte as the whole set is
     /// caught, not only the six anchors of
     /// [`doc_erase_scope_names_erasable_versions_8278`]. The census is
-    /// `git ls-files -- docs` (tracked files, no committed list to rot): a
+    /// `git ls-files -z -- docs` (tracked files, no committed list to rot): a
     /// doc is in scope when it mentions crypto erase AND names at
     /// least one erasable byte (a doc that names no byte makes no claim about
     /// the set). Dated adjudication records under `docs/reviews/` and
@@ -2352,6 +2352,45 @@ mod tests {
                 .any(|f| f.starts_with(DOCS_CENSUS_ERASE_DOC)),
             "the complete doc must pass: {:?}",
             found.failures
+        );
+    }
+
+    #[test]
+    fn docs_census_audits_quoted_non_ascii_paths_8350() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert!(docs_census_git_init(repo.path()), "git is required");
+        // Pin quoting in this fixture without changing the caller's git config.
+        let config = repo.path().join(".git/config");
+        let mut settings = std::fs::read_to_string(&config).expect("fixture config");
+        settings.push_str("\n[core]\nquotePath = true\n");
+        std::fs::write(config, settings).expect("pin fixture quoting");
+        let bytes = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let doc = repo.path().join(DOCS_CENSUS_ERASE_DOC);
+        std::fs::create_dir_all(doc.parent().expect("doc parent")).expect("mkdir docs");
+        std::fs::write(doc, format!("crypto-erase: {bytes}")).expect("complete erase doc");
+        let rel = "docs/caf\u{e9}-note.md";
+        std::fs::write(
+            repo.path().join(rel),
+            "Only 0x03 envelopes are crypto-erasable.",
+        )
+        .expect("incomplete erase doc");
+        let add = docs_census_git(repo.path(), &["add", "docs"]).expect("git add");
+        assert!(add.status.success(), "git add failed");
+        let found = docs_census_8315_with(repo.path(), true).expect("census must run");
+        assert!(
+            found.census.iter().any(|path| path == rel),
+            "quoted doc was skipped"
+        );
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.starts_with(rel)),
+            "the quoted doc must fail the erase check"
         );
     }
 
