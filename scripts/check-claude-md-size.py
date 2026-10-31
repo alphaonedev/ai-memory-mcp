@@ -150,7 +150,7 @@ INDEX_SECTIONS = (
 # must be present exactly once: reworded, re-pointed, dropped, duplicated or added entries all fail.
 # code-R3-F3: sha256 of the exact index lines (both sections, in file order, joined by a newline), so the cited
 # range and the quote text are pinned together. Also pinned in SELF_TEST_PINNED_LIMITS: a change is two edits.
-INDEX_ENTRIES_SHA256 = "de11dd7af07f6e340e2c7d7a75b451f4e41c67cd66548d59165cf7c81c19b6f7"
+INDEX_ENTRIES_SHA256 = "ec7e010be10424b3eb22f2a34910015dad1b5b6cb6e6279b99e48ffa130e4186"
 INDEX_QUOTE_PINS = (
     ("ARCHITECTURE_REFERENCE",
      "123b8bbe696bb26fa77c2bf30545c3c5768b73904280534c126f74f88546ccd4"),
@@ -1531,7 +1531,7 @@ SELF_TEST_PINNED_LIMITS = {
     "INDEX_MIN_QUOTE_CHARS": 20,
     # sha256 of the exact index lines (both sections, file order, newline-joined): a changed range or quote is a
     # deliberate edit.
-    "INDEX_ENTRIES_SHA256": "de11dd7af07f6e340e2c7d7a75b451f4e41c67cd66548d59165cf7c81c19b6f7",
+    "INDEX_ENTRIES_SHA256": "ec7e010be10424b3eb22f2a34910015dad1b5b6cb6e6279b99e48ffa130e4186",
     # sha256 of the sorted "<file> <quote sha256>" index pin lines: any pinned quote change is a deliberate edit.
     "INDEX_QUOTE_PINS_SHA256": "9d4c301ad7f479615115f9605e0ea6d1d86d0ea04b653c08bedb4ed72986eaeb",
     "REFERENCE_SUBSECTIONS ARCHITECTURE_REFERENCE": 9,
