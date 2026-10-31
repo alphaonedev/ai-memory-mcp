@@ -18,15 +18,16 @@
 //! On the fixed branch both pass.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ai_memory::config::{AdminConfig, AppConfig};
 use ai_memory::daemon_runtime::{ServeArgs, bootstrap_serve, serve_http_with_shutdown_future};
 use tokio::sync::Notify;
 
+mod common;
+
 const ADMIN: &str = "ops:admin-3427";
 const API_KEY: &str = "k-3427-fixture";
-const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn serve_args(port: u16) -> ServeArgs {
     ServeArgs {
@@ -108,17 +109,9 @@ async fn boot() -> Daemon {
         .await;
     });
     let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + READY_TIMEOUT;
-    loop {
-        if let Ok(resp) = client.get(format!("{base}/api/v1/health")).send().await
-            && resp.status().is_success()
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "daemon never became ready");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    common::wait_for_http_ready(&addr, common::IN_PROCESS_READY_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("daemon never became ready: {e}"));
     Daemon {
         base,
         shutdown,
@@ -156,7 +149,7 @@ async fn seed(client: &reqwest::Client, base: &str, namespace: &str, title: &str
 #[tokio::test(flavor = "multi_thread")]
 async fn export_namespace_filter_is_honoured_3427_head() {
     let d = boot().await;
-    let client = reqwest::Client::new();
+    let client = common::bounded_test_client();
     seed(&client, &d.base, "ns-a-3427", "in-a").await;
     seed(&client, &d.base, "ns-b-3427", "in-b").await;
     let resp = client
@@ -185,7 +178,7 @@ async fn export_namespace_filter_is_honoured_3427_head() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bulk_invalid_kind_is_validation_failed_3427_head() {
     let d = boot().await;
-    let client = reqwest::Client::new();
+    let client = common::bounded_test_client();
     let resp = client
         .post(format!("{}/api/v1/memories/bulk", d.base))
         .header("x-agent-id", ADMIN)

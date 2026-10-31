@@ -5,7 +5,7 @@ layout: doc
 
 This guide documents the CLI's main workflows and selected flags.
 `ai-memory <command> --help` is the complete generated flag inventory;
-the CLAUDE.md environment table is an index, with any omissions stated
+the docs/reference/ARCHITECTURE_REFERENCE.md environment table is an index, with any omissions stated
 explicitly. Some declared flags are deliberately not restated here —
 `--help` is authoritative for the full per-command set (#4240).
 
@@ -1606,7 +1606,7 @@ default) — an anonymous principal is refused. **Both backends:** on a
 leg keeps the [#2572](https://github.com/alphaonedev/ai-memory-mcp/issues/2572)
 funnel, so a build without `sal` still REFUSES a Postgres store rather
 than phantom-write to a throwaway SQLite file. See the §"Agent Identity"
-durable-stamp posture in `CLAUDE.md` for why this precedes enabling
+durable-stamp posture in `docs/reference/ARCHITECTURE_REFERENCE.md` for why this precedes enabling
 enforced reads.
 
 ### `identity` — Ed25519 keypair management (H-track)

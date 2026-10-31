@@ -31,8 +31,8 @@
 # §"Certified versions" retains as a "tested alternate matrix
 # (`infra/lan-parity-test/`)". It is NOT the certified triple and does not
 # certify one: coverage is a Rust line-coverage measurement, not cert evidence.
-# The ONE TRUE CERTIFIED triple — PostgreSQL 18.4 + Apache AGE 1.7.0 +
-# pgvector 0.8.6 — is exercised in-PR by `.github/workflows/cert-postgres-age.yml`
+# The ONE TRUE CERTIFIED triple — PostgreSQL 18.6 + Apache AGE 1.8.0 +
+# pgvector 0.8.7 — is exercised in-PR by `.github/workflows/cert-postgres-age.yml`
 # (#2548), so CI runs BOTH stacks the SSOT documents and neither is drift:
 # canonical here would risk this required coverage gate on a PG-major flip it
 # does not measure, while the cert job proves the canonical tier separately.
@@ -40,8 +40,18 @@
 name: Per-Module Coverage Thresholds
 
 on:
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam"]
+    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "rehearsal/**", "chain/**"]
+    # #8332: `edited` is NOT listed. A title or body edit fires it and, with
+    # cancel-in-progress, restarted every required check from zero. A base
+    # retarget is landed only after a new head push (the push fires an ordinary
+    # pull_request run that classifies against the new base, #7072), enforced by
+    # scripts/ci/pr_retarget_check.py at landing.
+    types: [opened, synchronize, reopened]
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
   # Merge Queue (#3089) — `Per-Module Coverage Thresholds` (+ the sibling
@@ -72,7 +82,7 @@ permissions:
 # rationale + the prior unsafe-key incident that motivated this shape.
 concurrency:
   group: cov-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -105,9 +115,12 @@ jobs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with: { fetch-depth: 2 }
+        with: { persist-credentials: false, fetch-depth: 2 }
       - id: cls
         shell: bash
+        env:
+          COV_EVENT_NAME: ${{ github.event_name }}
+          COV_BASE_REF: ${{ github.base_ref }}
         run: |
           # LOAD-BEARING (#2496): on `pull_request` this base is the PR
           # BASE, spanning the WHOLE PR — NOT `github.event.before` (the
@@ -164,13 +177,38 @@ jobs:
             echo "::notice::no net diff vs base — failing CLOSED (full coverage sweep), NOT docs-only"
             exit 0
           fi
-          # docs-only iff every changed file matches docs/** OR *.md anywhere
-          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::changed files include non-docs paths — running full pipeline"
+          # #8328: the old shape (docs/** or *.md anywhere is docs-only) treated
+          # docs that Rust tests read as skippable, so the llvm-cov sweep was
+          # skipped on a diff those tests observe. docs_only now comes from the
+          # same decider as ci.yml (scripts/ci/impact/cargo_skip.py), loaded from
+          # the MERGE-BASE tree and run with -I from outside the workspace, so a
+          # PR cannot edit its own judgement. Anything unexpected is false.
+          docs_only=false
+          trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
+          trust_impact="$trust_dir/scripts/ci/impact"
+          trust_ref=$(git merge-base HEAD "$base" 2>/dev/null || echo "$base")
+          mkdir -p "$trust_impact"
+          trusted=true
+          for trust_file in __init__.py common.py cargo_skip.py rules.json; do
+            git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
+          done
+          skip_out="${RUNNER_TEMP:-.}/cov-skip.out"
+          : > "$skip_out"
+          if [ "$trusted" != "true" ]; then
+            echo "::notice::trusted classifier missing in base — running full pipeline"
+          elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
+            echo "::notice::classifier or workflow edited — running full pipeline"
+          elif echo "$changed" | python3 -I "$trust_impact/cargo_skip.py" --stdin --rules "$trust_impact/rules.json" --event-name "$COV_EVENT_NAME" --base-ref "$COV_BASE_REF" > "$skip_out"; then
+            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ]; then
+              docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
+            fi
+          fi
+          case "$docs_only" in true|false) ;; *) docs_only=false ;; esac
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          if [ "$docs_only" = "true" ]; then
+            echo "::notice::all changed files are docs no Rust test reads — skipping heavy llvm-cov sweep"
           else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::all changed files are docs-only — skipping heavy llvm-cov sweep"
+            echo "::notice::running the full coverage pipeline"
           fi
 
   per-module-thresholds:
@@ -182,7 +220,7 @@ jobs:
     # download on the semantic-tier CLI recall path) fails fast instead of
     # pinning a runner for hours. Root cause fixed in
     # embeddings::Embedder::download_within; this is the backstop.
-    timeout-minutes: 75
+    timeout-minutes: 110
     # #3591 — `Post coverage to PR (sticky)` uses
     # marocchino/sticky-pull-request-comment (creates/updates a PR comment).
     # Job-level permissions replace the workflow default, so contents: read
@@ -192,7 +230,7 @@ jobs:
       pull-requests: write
     # Live PG + Apache AGE 1.6.0 (graph extension on PostgreSQL 16) — the
     # DOCUMENTED ALTERNATE matrix (#2512; see the header note above). The
-    # certified triple (PG 18.4 + AGE 1.7.0 + pgvector 0.8.6) is exercised
+    # certified triple (PG 18.6 + AGE 1.8.0 + pgvector 0.8.7) is exercised
     # by `.github/workflows/cert-postgres-age.yml`, not here.
     #
     # #3705 — this used to be a `services:` container. A service container
@@ -235,6 +273,8 @@ jobs:
       CARGO_PROFILE_DEV_LTO: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Free disk + add swap (#1148 belt-and-suspenders, aggressive)
         run: |
@@ -588,7 +628,7 @@ jobs:
         # sal-postgres suite at `--test-threads=1` for the same per-DDL
         # serialisation + llvm-cov-memory reasons. Coverage line/region
         # counts are thread-count-independent, so the per-module thresholds
-        # are unaffected; the 75-minute job timeout absorbs the serial run.
+        # are unaffected; the 110-minute job timeout (#7070) absorbs the serial run.
 
       - name: Enforce per-module thresholds
         id: thresholds

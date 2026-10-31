@@ -309,6 +309,12 @@ mod capability_from_headers_tests {
     /// 403, never collapse to "absent = bare ACL".
     #[test]
     fn presented_non_utf8_capability_header_is_403() {
+        // #6119: this test appends to the process-global forensic sink; it holds
+        // only the forensic sink lock. It never reads capability config, so no
+        // capability-config lock is taken.
+        let _sink = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let headers =
             headers_with(HeaderValue::from_bytes(&[0x80, 0x81]).expect("raw header bytes"));
         let err = capability_from_headers(&headers, "test-actor")
@@ -362,6 +368,11 @@ mod capability_from_headers_tests {
     /// the `map_err` arm — never downgrade to anonymous/bare ACL.
     #[test]
     fn presented_utf8_garbage_is_403_when_capabilities_enabled() {
+        // #6119: this test appends to the process-global forensic sink; hold the
+        // sink lock FIRST, then the capability-config lock (order: forensic -> cap).
+        let _sink = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _cap = crate::config::lock_capability_config_for_test();
         crate::config::set_active_capability_config(enabled_cfg());
         let err = capability_from_headers(
@@ -377,6 +388,11 @@ mod capability_from_headers_tests {
     /// presented-but-unusable credential (not "omitted").
     #[test]
     fn presented_wrong_version_envelope_is_403_when_enabled() {
+        // #6119: this test appends to the process-global forensic sink; hold the
+        // sink lock FIRST, then the capability-config lock (order: forensic -> cap).
+        let _sink = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _cap = crate::config::lock_capability_config_for_test();
         crate::config::set_active_capability_config(enabled_cfg());
         let err = capability_from_headers(

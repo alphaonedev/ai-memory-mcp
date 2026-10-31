@@ -6155,7 +6155,7 @@ mod tests {
         assert_eq!(d.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(d.min_connections, DEFAULT_MIN_CONNECTIONS);
         assert_eq!(d.acquire_timeout_secs, DEFAULT_ACQUIRE_TIMEOUT_SECS);
-        // Documented compiled defaults (CLAUDE.md env table + enterprise
+        // Documented compiled defaults (ARCHITECTURE_REFERENCE.md env table + enterprise
         // deployment §5.6): min=2, max=16, acquire-timeout=30s.
         assert_eq!(d.max_connections, 16);
         assert_eq!(d.min_connections, 2);
@@ -7605,7 +7605,7 @@ mod tests {
                 assert_eq!(capability, "BIND_AGENT_API_KEY");
             }
             Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
-            Ok(outcome) => panic!("default bind_agent_api_key must error, got {outcome:?}"),
+            Ok(_) => panic!("default bind_agent_api_key must error, got an Ok outcome"),
         }
 
         // resolve default → Ok(None): no per-agent keys enrolled.

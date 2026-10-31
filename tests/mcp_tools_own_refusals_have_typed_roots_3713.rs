@@ -23,12 +23,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "serde_json error text is foreign; opaque is correct",
     ),
     (
-        "skill_promote.rs",
-        ".map_err(anyhow::Error::msg)?;",
-        "register_core returns a MIXED population (own refusals + serde/std::io text); \
-         a typed root here would leak paths — type register_core's error (follow-up)",
-    ),
-    (
         "capture_turn.rs",
         ".map_err(anyhow::Error::msg)?",
         "capture_turn_idempotent_auto returns Result<_, String> built by idempotent_err(ERR_*, e) with \

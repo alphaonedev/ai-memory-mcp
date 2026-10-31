@@ -370,7 +370,7 @@ pub(crate) fn handle_skill_promote_for_caller(
         &resources,
         active_keypair,
     )
-    .map_err(anyhow::Error::msg)?;
+    .map_err(register_core_error)?;
 
     let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
 
@@ -461,6 +461,26 @@ impl McpTool for SkillPromoteFromReflectionTool {
     }
     fn family() -> &'static str {
         crate::profile::Family::Other.name()
+    }
+}
+
+/// Suffix of the one first-party refusal `register_core` raises as a bare
+/// `String` (`skill lineage '<ns>/<name>' is retired; ...`, #2024).
+const RETIRED_LINEAGE_REFUSAL_SUFFIX: &str = "is retired; unretire before re-registering";
+
+/// #6133 - lift a `register_core` string error onto the typed `anyhow` chain.
+///
+/// The retired-lineage refusal is our own actionable text, so it is planted
+/// as a typed `refusal` (copying the precedent at the minimum-depth refusal
+/// above) and reaches the caller verbatim on MCP and HTTP. Every other
+/// `register_core` string stays untyped: it is either already-sanitized
+/// `mcp_foreign_err` output or foreign serialization / compression text,
+/// and must keep classifying as foreign so it is withheld (ERRORS-15).
+fn register_core_error(msg: String) -> anyhow::Error {
+    if msg.starts_with("skill lineage '") && msg.ends_with(RETIRED_LINEAGE_REFUSAL_SUFFIX) {
+        crate::errors::refusal(msg)
+    } else {
+        anyhow::Error::msg(msg)
     }
 }
 
@@ -590,6 +610,47 @@ mod tests {
         assert!(
             err.contains("memory_kind='observation'"),
             "must surface kind mismatch: {err}",
+        );
+    }
+
+    /// #6133: the retired-lineage refusal is first-party text. Promote, retire
+    /// the lineage, promote again - the caller text (MCP wire text, which the
+    /// HTTP route shares) is the refusal verbatim, never `internal storage
+    /// error`.
+    #[test]
+    fn issue_6133_retired_lineage_refusal_reaches_the_caller_verbatim() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
+        let (conn, _dir) = open_db();
+        let obs_id = insert_observation(&conn, "source", "ns");
+        let refl_id = make_reflection(&conn, &[obs_id], "ns");
+        let params = sjson!({
+            "reflection_id": refl_id,
+            "skill_name": "retire-me",
+            "skill_description": "desc",
+        });
+        handle_skill_promote_from_reflection(&conn, &params, None).expect("first promote");
+        conn.execute(
+            "UPDATE skills SET retired_at = 1 WHERE namespace = 'ns' AND name = 'retire-me'",
+            [],
+        )
+        .expect("retire lineage");
+        let err = handle_skill_promote_from_reflection(&conn, &params, None)
+            .expect_err("a retired lineage refuses");
+        assert_eq!(
+            crate::mcp::error_text::mcp_foreign_err("issue_6133", err),
+            "skill lineage 'ns/retire-me' is retired; unretire before re-registering"
+        );
+    }
+
+    /// #6133: only the retired-lineage text is lifted to a typed refusal; any
+    /// other `register_core` string (foreign serialization text) stays foreign.
+    #[test]
+    fn issue_6133_other_register_core_strings_stay_foreign() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
+        let foreign = register_core_error("zstd compress error: /srv/tenant/x EACCES".into());
+        assert_eq!(
+            crate::mcp::error_text::mcp_foreign_err("issue_6133", foreign),
+            crate::mcp::error_text::DB_ERROR_TEXT
         );
     }
 

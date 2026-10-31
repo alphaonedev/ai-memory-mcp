@@ -42,13 +42,13 @@ No cloud account, no Docker, no network egress, no `sudo`. Prereqs are
 `openssl`, `curl`, `jq`, `sqlite3`. The kit writes only inside its own
 directory and cleans up after itself — including on Ctrl-C.
 
-**Honest by construction.** The lab runs **16 of the 17** `asi-hard` posture
-knobs at their hard floor and tells you exactly why the seventeenth is missing:
-`AI_MEMORY_REQUIRE_ROLLBACK_CHECK` cannot cold-boot a fresh node (no off-table
-head anchor exists yet — [#2942](https://github.com/alphaonedev/ai-memory-mcp/issues/2942)),
-so the kit *demonstrates* that limitation with a captured exit code rather than
-papering over it. It also re-derives the pinned-knob set from
-`src/security_profile.rs` on every run and goes red if the kit and the code
+**Honest by construction.** The lab runs every `asi-hard` posture
+knob at its hard floor, all of them. One knob,
+`AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, could not cold-boot a fresh node on older builds (no off-table
+head anchor — [#2942](https://github.com/alphaonedev/ai-memory-mcp/issues/2942), fixed by PR #3096),
+so the kit boots a node under the full profile on every run and requires it to come up (a refusal
+is a failure; a timeout kill of a healthy node is never counted as a refusal). It also re-derives
+the pinned-knob set from `src/security_profile.rs` on every run and goes red if the kit and the code
 ever disagree.
 
 Equally honest about scope: this is a **functional demonstration**, not a

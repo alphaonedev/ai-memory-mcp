@@ -35,7 +35,7 @@ Every enterprise-fed test tier runs the identical certified stack:
 |---|---|
 | PostgreSQL | **18.6** |
 | Apache AGE | **1.8.0** |
-| pgvector | **0.8.6** |
+| pgvector | **0.8.7** |
 
 **TLS is mandatory on every tier, both nodes** — no customer permits unencrypted
 traffic to/from PostgreSQL. Each tier enforces:
@@ -63,7 +63,7 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 ### 3.1 Linux node (self-hosted `linux-fed`)
 
 - **OS:** Linux x86_64 (Ubuntu/Pop!_OS noble-class)
-- **Data tier:** **native** (pgdg apt pg18.6 + pgvector 0.8.6; **AGE 1.8.0 built
+- **Data tier:** **native** (pgdg apt pg18.6 + pgvector 0.8.7; **AGE 1.8.0 built
   from source** — AGE is not packaged in pgdg apt)
   - Cluster listens on `127.0.0.1:5445`
   - TLS certs operator-local (postgres-owned; CA reused from `pg-age-stack/certs`)
@@ -74,7 +74,7 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 ### 3.2 macOS node (self-hosted `macos-fed`)
 
 - **OS:** macOS arm64 (Apple Silicon)
-- **Data tier:** **native** (Homebrew `postgresql@18` 18.6 + pgvector 0.8.6 built
+- **Data tier:** **native** (Homebrew `postgresql@18` 18.6 + pgvector 0.8.7 built
   from source; **AGE 1.8.0 built from source**, branch `release/PG18/1.8.0`)
   - Cluster listens on `127.0.0.1:5445`
   - Certs / env / init script live under the operator-local `pg-age-stack/` tree
@@ -91,7 +91,7 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 
 **Test matrix — self-hosted 2×2:**
 
-|                     | sqlite (local/default) | enterprise-fed (pg18.6+AGE1.8.0+pgvector0.8.6, TLS) |
+|                     | sqlite (local/default) | enterprise-fed (pg18.6+AGE1.8.0+pgvector0.8.7, TLS) |
 |---------------------|:----------------------:|:---------------------------------------------------:|
 | **Linux** (f2)      | ✓ self-hosted          | ✓ self-hosted (native `:5445`)                      |
 | **macOS** (f1)      | ✓ self-hosted          | ✓ self-hosted (native `:5445`)                      |
@@ -117,6 +117,14 @@ GitHub retains the full history identically to hosted runs:
 - **Logs** — uploaded to GitHub (90-day default).
 - **Artifacts** — JUnit XML + coverage uploaded per run for durable, audit-grade
   evidence bundles beyond the log window.
+
+### PR edits never cancel checks; a base retarget lands after a new head push (#8332)
+
+A title or body edit of a pull request never cancels or restarts a running check. `ci.yml` and `coverage.yml` do not list `edited` in their `pull_request` types, so a body-only edit fires nothing. `claude-md-rule-compare.yml` is the one workflow that keeps `edited`; its `cancel-in-progress` is `${{ github.event.action != 'edited' }}`, so an edit runs a comparison without cancelling the running one. A new push (`synchronize`) still cancels the older run. No required-context job is skipped by an `if`, because a skipped required context is counted as passing.
+
+A base retarget fires no run by itself, so it is handled at landing: a pull request whose base changed is landed only after a new head push, because a push fires an ordinary `pull_request` run that classifies against the new base (#7072). The landing tool runs `scripts/ci/pr_retarget_check.py` and refuses on exit 65 when the base changed after the latest `pull_request` run of `ci.yml` or `coverage.yml` on the head. `pull_request_target` workflows that exist only on a chain or release base do not run (#8337), which is why no retarget workflow is used.
+
+Pinned by `scripts/test/test_workflow_edited_cancel_8332.py` and `scripts/test/test_pr_retarget_check_8332.py`, both run in section H of `scripts/test/test-ci-workflow-invariants.sh` (the `c8-precheck.yml` invariants step). The retarget test runs the live path through a stub `gh`; the `edited` ratchet fails closed on a trigger section it cannot parse.
 
 ---
 
@@ -157,12 +165,13 @@ The containerized certified stack is retained as a **dormant reproduction
 artifact** so a reviewer can spin up an equivalent enterprise-fed environment:
 
 - Compose: `pg-age-stack/docker-compose.yml` + `pg-age-stack/Dockerfile`
-- Image (kept): `ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.6`
+- Image (kept): `ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.7`
 - Deploy recipe (SSOT for the triple): `deploy/docker-1461/`
 
+A reviewer reproduces the enterprise-fed tier via docker; this brings up the certified pg+AGE+pgvector stack:
+
 ```bash
-# reviewer: reproduce the enterprise-fed tier via docker
-cd pg-age-stack && docker compose up -d      # brings up the certified pg+AGE+pgvector
+cd pg-age-stack && docker compose up -d
 ```
 
 ---
@@ -170,12 +179,12 @@ cd pg-age-stack && docker compose up -d      # brings up the certified pg+AGE+pg
 ## 8. Runbook
 
 ### Linux native tier
+Start, stop or restart the native pg cluster (operator-local cluster name), list the clusters, then connect over the local socket (trust auth). A from-scratch rebuild uses the operator-local `linux-native-tier.sh`.
+
 ```bash
-# start/stop the native pg cluster (operator-local cluster name)
 sudo pg_ctlcluster 18 <cluster> start|stop|restart
 pg_lsclusters
-sudo -u postgres psql -p 5445 -d <test-db>    # local socket (trust)
-# rebuild from scratch: operator-local linux-native-tier.sh
+sudo -u postgres psql -p 5445 -d <test-db>
 ```
 
 ### macOS native tier
@@ -186,13 +195,119 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 # rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
+**AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
+Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
+them (CI then fails with `extension "age" is not available`). A brew-independent
+copy now lives in `<pg-age-stack>/age-1.8.0-06ce678d/{share,lib}` (the suffix is the
+upstream apache/age commit the build carries; the build recipe, the pin rule and the
+tier restart are in `DEVELOPER_SETUP_NOTES.md`, "macos-fed AGE build", #8282). On the
+macos-fed node the "Configure enterprise-fed tier" step runs
+`scripts/ci/ensure-age-extension.py` before `CREATE EXTENSION`:
+
+- **Manifest.** It installs exactly five files, each pinned to a sha256 in the
+  script's `MANIFEST`: `age.dylib` (into `pg_config --pkglibdir`) and
+  `age.control`, `age--1.8.0.sql`, `age--1.7.0--1.8.0.sql`, `age--1.6.0--1.7.0.sql`
+  (into `pg_config --sharedir`/extension). Nothing else in the source directory
+  is read or copied. Rebuilding AGE means updating those pins in the same change,
+  and the `age.dylib` pin must never go back to the stock 1.8.0 bytes: the helper
+  installs whatever the pin names, so a stock pin reinstalls the apache/age#2580
+  lock leak over the patched library (that is how #8282 followed #7162).
+  `REFUSED_SHAS` names the stock dylib digest; an AGE rebuild adds the superseded
+  digest to it. Two cases, in the order the helper checks them: (1) an INSTALLED
+  file whose digest is refused is never healthy (`installed_ok`), so the helper
+  reinstalls it from the pinned source and exits 0; (2) a SOURCE file whose
+  digest is refused is rejected by name, `age source rejected: <path> refused:
+  stock apache/age 1.8.0 carries issue 2580 (issue 8282)`, exit 2, nothing
+  written, even when a `MANIFEST` pins it (`read_source`). A head whose helper
+  still pins stock exits 2 with nothing written: `age source incomplete: <path>
+  is missing` when its `DEFAULT_AGE_DIR` is the retired stock dir
+  (`load_sources`, before any pin is compared), or `age source rejected: <path>
+  does not match its pinned sha256` when it is the `06ce678d` dir whose source
+  holds the patched bytes (the pin comparison in `read_source`; `REFUSED_SHAS`
+  is consulted for source and installed digests, not for the pin).
+- **Fail closed (#8282).** The stock source directory on the macos-fed node was
+  retired on 2026-10-29 (renamed `age-1.8.0.retired-8282`; 3-agent vote
+  (6def5ab6) 3-0) after a job whose helper still pinned stock rewrote the stock
+  library onto disk 31 minutes after the patched install. A head whose helper
+  still pins stock exits 2 on that node and its `Check (macos-fed,enterprise-fed)`
+  row is red, attributed to issue 8282, until the head carries the new pin;
+  re-runs of older workflow runs keep their old merge sha and stay red by
+  design. Before and after any tier restart the installed `age.dylib` sha must
+  equal the pin (`DEVELOPER_SETUP_NOTES.md`, "macos-fed AGE build").
+- **Health check.** AGE counts as present only when `pg_available_extensions`
+  lists `age` (that view reflects `age.control` alone) AND all five files are at
+  their destinations as regular files with the pinned hashes, none of them group-
+  or world-writable (#7016). A lost, stale or writable `age.dylib` or SQL file is
+  therefore restored with its source's mode (#6898), not reported as healthy.
+- **Source validation.** Before any write, the source dir, `share/`, `lib/` and
+  each file must be real (no symlinks), owned by the runner's uid and not group-
+  or world-writable, and each file's bytes (read through an `O_NOFOLLOW` fd) must
+  match its pin. Any failure exits 2 with one `ensure-age-extension: ...` line and
+  writes nothing.
+- **Install.** `lib` is installed before `share`, so the control file never
+  appears ahead of its module. Each file goes through a per-process `mkstemp`
+  temp file, `fsync` and an atomic `os.replace`, so the three macos-fed runner
+  instances can restore concurrently. On a write error the temp file is removed;
+  if another runner has meanwhile made AGE healthy the run passes, otherwise it
+  exits 1. Files already written stay in place: each carries its pinned bytes,
+  and removing one could undo a restore another runner has already verified.
+- **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
+  psql's argv carries no password, and neither form is printed. Only the
+  password is moved off argv: allowed path- and name-valued keys (`sslrootcert`,
+  `sslcert`, `sslkey`, `sslcrl`, `sslcrldir`, `passfile`,
+  `krbsrvname`, `requirepeer`) stay in the URL on psql's argv. The URL is refused
+  with exit 2 and one stderr line (no value printed) when it does not start with
+  the exact lowercase `postgres://` or `postgresql://`; holds a TAB, CR, LF or NUL
+  (VT, FF, DEL and NBSP pass, as in libpq), a raw space, a `#`, a `%` not followed by two hex digits or `%00`;
+  has more than one `@` in the host part, an `@` after it, or an empty host part
+  (`postgres:///db...`); or its query has an empty segment (one trailing `&` is
+  accepted), a segment without exactly one `=`, or a key not on
+  `ALLOWED_QUERY_KEYS`. These are libpq's own refusals plus fail-closed cases
+  where urllib and libpq could split the URL differently; a URL the helper
+  accepts is read the same way by libpq. Decoding is percent-decoding only:
+  `%XX` becomes one raw byte (`%FF` reaches `PGPASSWORD` as byte 0xFF) and `+`
+  stays a plus. A socket directory given as `?host=%2F...` or as a
+  percent-encoded host works, also with a userinfo password and an empty host
+  (`postgres://:pw@/db?host=%2Fdir`). The URL psql receives drops the password
+  and keeps every other segment as written. `ALLOWED_QUERY_KEYS` is a
+  case-sensitive allowlist that is a subset of the non-secret libpq parameters
+  (`sslmode`, `application_name`, `connect_timeout`, `sslnegotiation`,
+  `min_protocol_version`, ...). Secrets (`sslpassword`, `oauth_client_secret`,
+  `scram_client_key`, `scram_server_key`, which libpq cannot take from the
+  environment) and keys that change the auth mechanism or session mode
+  (`gsslib`, `gssdelegation`, `replication`, `oauth_issuer`, `oauth_client_id`,
+  `oauth_scope`) are refused by name, as is `service` (#6345: libpq reads a
+  `pg_service.conf` entry before `PGPASSWORD`, so its password would beat the
+  moved one; psql also runs without `PGSERVICE`/`PGSERVICEFILE`); `ssl=true` (a JDBC alias that libpq maps to `sslmode=require`) is refused so the TLS mode is always spelled `sslmode`; `sslkeylogfile` (writes TLS session secrets to a file) and `require_auth` (changes the accepted authentication methods) are refused by name as well.
+  A refusal names a key only when it is a known libpq keyword (an unlisted key
+  can be the tail of a password that held a raw `&`), never a value. psql runs
+  with `PGCONNECT_TIMEOUT=15` and a 60 s limit; a URL `connect_timeout` must be an
+  integer in 1..60 (#6338), but that timeout bounds only the connect phase of one host and
+  psql 18.6 catches SIGALRM, so it is not the orphan bound. psql runs under a stdlib
+  supervisor that holds the read end of a pipe the helper holds the write end of: when
+  the helper dies for any reason, SIGKILL included, the supervisor kills psql within
+  0.2 s regardless of the host count (#6517, #6505); the supervisor also enforces its own
+  65 s deadline, which covers a SIGSTOPped helper. Only the loss of the helper AND the
+  supervisor together leaves psql unbounded after authentication: the connect timeout ends only
+  the connect phase, and nothing ends an authenticated psql until the server closes the
+  connection (#6673). Any catchable signal valid on the
+  platform (except default-ignored, job-control and fault signals) stops the psql child,
+  also when it arrives while it is being spawned (#6337, #6504), and exits 1 with one
+  `ensure-age-extension: interrupted` line. Only a `0` or `1` answer counts: a psql that exits
+  non-zero or prints anything else fails the run with no restore (#6677). A supervisor killed by a signal is reported as `the psql supervisor was killed by signal N` (#6728).
+
+- **Database, TLS and psql environment (#6181, #6871, #6676, #7982).** The helper passes the database name to psql through `PGDATABASE`, so its argv carries no path component. A tier URL that names no database is refused with exit 2 before any restore or psql call (the database is read as libpq reads it: the last `dbname` query value wins over the path, so `/db?dbname=` names none, #6871), and psql's environment is an allowlist: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*` and `TZ` from the caller, then the helper's own `PGPASSWORD`, `PGDATABASE` and `PGCONNECT_TIMEOUT`; no caller `PG*` variable reaches psql (redirect `PGHOST` `PGHOSTADDR` `PGPORT` `PGLOADBALANCEHOSTS`; transport `PGSSLMODE` `PGREQUIRESSL` `PGGSSENCMODE` `PGCHANNELBINDING` `PGSSLROOTCERT` `PGSSLCRL` `PGSSLNEGOTIATION` `PGREQUIREAUTH` `PGMINPROTOCOLVERSION` `PGMAXPROTOCOLVERSION`; credentials `PGUSER` `PGPASSWORD` `PGPASSFILE` `PGSSLCERT` `PGSSLKEY`; target `PGDATABASE` `PGOPTIONS` `PGTARGETSESSIONATTRS`) (#6676). The tier URL must carry exactly one `sslmode=verify-full` and exactly one non-empty `sslrootcert`; any other value, a missing or repeated `sslmode`, or a missing `sslrootcert` is refused with exit 2 before any restore or psql call, so the tier password is never sent without certificate and hostname verification. The refusal names the key only, never a value or the URL.
+
+It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
+CI always uses the default node path, and there is no environment override.
+Keep `postgresql@18` and `pgvector` brew-pinned on the node regardless.
+
 ### Self-hosted runners
 ```bash
-# status (names/ids are not published here)
 gh api repos/alphaonedev/ai-memory-mcp/actions/runners --jq '.runners[]|"\(.name) [\(.status)]"'
-# service control: the runner `svc.sh` lives in the operator-local
-# actions-runner install dir on each node — not in this repo.
 ```
+
+The command lists runner status (names and ids are not published here). Service control: the runner `svc.sh` lives in the operator-local actions-runner install dir on each node, not in this repo.
 
 ---
 
@@ -210,7 +325,7 @@ stubs. Fix by symlinking each to the keg subdir
 `PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config`. Also install brew
 `bison`+`flex` (Apple's bison 2.3 is too old).
 
-**Linux:** pgdg apt provides pg18.6 + pgvector 0.8.6 (`noble-pgdg`); AGE must be
+**Linux:** pgdg apt provides pg18.6 + pgvector 0.8.7 (`noble-pgdg`); AGE must be
 built from source (`release/PG18/1.8.0`) with the same BISONFLAGS patch.
 
 **Rust on a CI node must be rustup-managed, never Homebrew (2026-08-22):**

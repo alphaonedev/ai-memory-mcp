@@ -144,3 +144,29 @@ pub(super) async fn admit_bind_in_tx(
     }
     Ok(())
 }
+
+/// #4715 — every stored explicit `parent_namespace` chain already past the
+/// governance bound, read from any pool (the doctor probe builds its own
+/// one-connection pool). The decision is the one shared
+/// `governance::bind_chain_depth::over_depth_chains` (root segments only, every
+/// hop counted), so the backends cannot disagree.
+///
+/// # Errors
+///
+/// The sqlx failure (never reported as "no over-depth chain").
+pub async fn list_over_depth_chains_pg(
+    pool: &sqlx::PgPool,
+) -> Result<Vec<crate::governance::bind_chain_depth::OverDepthChain>, sqlx::Error> {
+    use crate::governance::bind_chain_depth::{LinkRow, over_depth_chains};
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT namespace, parent_namespace FROM namespace_meta \
+         WHERE parent_namespace IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let links: Vec<LinkRow> = rows
+        .into_iter()
+        .map(|(namespace, parent)| LinkRow { namespace, parent })
+        .collect();
+    Ok(over_depth_chains(&links))
+}

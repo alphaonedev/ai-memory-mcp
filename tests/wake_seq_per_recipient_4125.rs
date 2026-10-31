@@ -29,7 +29,7 @@ use ai_memory::write_events::{AgentNotified, agent_notified_wake};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
-fn uid(prefix: &str) -> String {
+fn fresh_name(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
@@ -64,8 +64,8 @@ async fn watermark_for(rx: &mut Receiver<InboxEvent>, recipient: &str) -> u64 {
 /// sees a plain `Wake` (no gap), not a `Gap` sized by A's traffic.
 #[tokio::test]
 async fn another_recipients_wakes_never_move_my_watermark_4125() {
-    let a = uid("ai:a4125");
-    let b = uid("ai:b4125");
+    let a = fresh_name("ai:a4125");
+    let b = fresh_name("ai:b4125");
     let mut rx = subscribe();
 
     notify_wake(&b, "b-1");
@@ -95,7 +95,7 @@ async fn another_recipients_wakes_never_move_my_watermark_4125() {
 /// and the client tracker must count it as missed wakes (one catch-up read).
 #[tokio::test]
 async fn a_lagged_receiver_still_sees_the_gap_in_the_recipients_own_sequence_4125() {
-    let a = uid("ai:lag4125");
+    let a = fresh_name("ai:lag4125");
     let mut rx = subscribe();
 
     notify_wake(&a, "a-0");
@@ -134,8 +134,8 @@ async fn a_lagged_receiver_still_sees_the_gap_in_the_recipients_own_sequence_412
 /// Cell 1 through the real sqlite notify funnel (`memory_notify` on MCP).
 #[tokio::test]
 async fn sqlite_notify_to_another_recipient_never_moves_my_watermark_4125() {
-    let a = uid("ai:sqa4125");
-    let b = uid("ai:sqb4125");
+    let a = fresh_name("ai:sqa4125");
+    let b = fresh_name("ai:sqb4125");
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("wake-4125.db");
     let conn = ai_memory::db::open(&db_path).expect("open");
@@ -180,8 +180,8 @@ async fn postgres_notify_to_another_recipient_never_moves_my_watermark_4125() {
         .await
         .expect("connect postgres");
     let ctx = CallerContext::for_agent("ai:pg4125-sender");
-    let a = uid("ai:pga4125");
-    let b = uid("ai:pgb4125");
+    let a = fresh_name("ai:pga4125");
+    let b = fresh_name("ai:pgb4125");
     let mut rx = subscribe();
 
     store

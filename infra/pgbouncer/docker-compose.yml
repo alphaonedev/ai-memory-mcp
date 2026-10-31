@@ -17,14 +17,16 @@ name: ai-memory-pgbouncer-smoke
 
 services:
   postgres:
-    image: apache/age:PG16_latest
-    container_name: ai-memory-pgbouncer-postgres
+    image: apache/age:release_PG16_1.6.0
+    container_name: ai-memory-pgbouncer-${AI_MEMORY_SMOKE_RUN:?set AI_MEMORY_SMOKE_RUN (the smoke scripts export a per-run suffix)}-postgres
     environment:
       POSTGRES_USER: ai_memory
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_memory_smoke}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (smoke-test.sh generates one; see README)}
       POSTGRES_DB: ai_memory
+    # -h 127.0.0.1: the image's temporary init server listens on the unix socket
+    # only, so a TCP probe cannot report ready before role-defaults.sql ran (N5).
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ai_memory -d ai_memory"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -35,17 +37,24 @@ services:
 
   pgbouncer:
     image: edoburu/pgbouncer:v1.23.1-p2
-    container_name: ai-memory-pgbouncer
+    container_name: ai-memory-pgbouncer-${AI_MEMORY_SMOKE_RUN:?set AI_MEMORY_SMOKE_RUN (the smoke scripts export a per-run suffix)}
     depends_on:
       postgres:
         condition: service_healthy
+    # Run as the invoking host user so the owner-only (0600) userlist bind
+    # mount stays readable without widening its mode (image default uid 70
+    # cannot open a 0600 file owned by another uid). The smoke scripts export
+    # both values before any compose call.
+    user: "${PGBOUNCER_UID:?set PGBOUNCER_UID (smoke-test.sh exports id -u)}:${PGBOUNCER_GID:?set PGBOUNCER_GID (smoke-test.sh exports id -g)}"
     ports:
-      - "6432:6432"
-    # The smoke test renders userlist.txt from POSTGRES_PASSWORD (see
-    # smoke-test.sh) so the committed placeholder never needs a real secret.
+      - "127.0.0.1:6432:6432"
+    # SCRAM end to end (#4732): the smoke test renders userlist.txt from the
+    # role's own stored SCRAM-SHA-256 verifier (read from pg_authid once the
+    # postgres service is up, see smoke-test.sh), so the committed placeholder
+    # never needs a real secret and the backend keeps its default SCRAM auth.
     volumes:
       - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./.userlist.generated.txt:/etc/pgbouncer/userlist.txt:ro
+      - ./.userlist.generated.${AI_MEMORY_SMOKE_RUN:?set AI_MEMORY_SMOKE_RUN}.txt:/etc/pgbouncer/userlist.txt:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ai_memory -d ai_memory || exit 1"]
       interval: 3s

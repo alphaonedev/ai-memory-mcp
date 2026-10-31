@@ -53,12 +53,16 @@ mTLS-enforced `/sync` lane are not counted.
 > `{"error": "missing or invalid API key"}`** — the same body a caller
 > with no credential at all gets.
 >
-> **Migration.** Move the credential from the query string to the header:
+> **Migration.** Move the credential from the query string to the header.
+> Before (v0.7.0 – v0.10.0), now answered with 401:
 >
 > ```bash
-> # before (v0.7.0 – v0.10.0) — now 401
 > curl "https://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
-> # after (v1.0.0)
+> ```
+>
+> After (v1.0.0):
+>
+> ```bash
 > curl -H "x-api-key: $KEY" https://127.0.0.1:9077/api/v1/memories
 > ```
 >
@@ -502,7 +506,7 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_query_embed_cache_hits_total` | counter | Query-embedding cache hits (#2577). |
 | `ai_memory_embed_task_failed_total{surface}` | counter | HTTP-path embed/rerank tasks run on the blocking pool that did not complete (a panic or runtime shutdown), by surface (`bulk`, `create`, `update`, `check_duplicate`, `recall`, `rerank`, `smart_load`, `reflect`). Each request degraded as on an embed failure or failed closed; any increment is a bug to investigate (#4089). |
 | `ai_memory_corrupt_provenance_rows_total{column}` | counter | Rows skipped by a discovery scan because a provenance column would not open (e.g. `encrypted_envelope`, #2383). |
-| `ai_memory_fed_quarantined_unattributed_total` | counter | Inbound relayed memories quarantined by the route-IN provenance gate (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, #2966). Always zero when the quarantine knob is off (the default); a non-zero rate means a peer is relaying provenance-less content this node is black-holing until dequarantine. Pairs with the `federation.quarantine.unattributed` WARN. |
+| `ai_memory_fed_quarantined_unattributed_total` | counter | Inbound relayed memories quarantined by the route-IN provenance gate (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, #2966). Always zero when the quarantine knob is off (the singleton and team shapes unless set; the federated, hive and production shapes force it on); a non-zero rate means a peer is relaying provenance-less content this node is black-holing until dequarantine. Pairs with the `federation.quarantine.unattributed` WARN. |
 | `ai_memory_operator_dequarantined_total` | counter | The route-OUT twin (#2402): quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release`. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change; a no-op release does not increment. Pairs with the `quarantine.operator_release` WARN. |
 | `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_size` | counter, gauge | Vector-index pressure; see `AI_MEMORY_VECTOR_INDEX_CAPACITY`. |
 | `ai_memory_federation_push_dlq_depth`, `..._quarantined_by_cause_total{cause}` | gauge, counter | Federation push-DLQ backlog and its cause breakdown. |

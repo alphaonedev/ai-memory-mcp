@@ -14,6 +14,7 @@ Deleting a memory does three things, gated on the record's at-rest class:
 | Record class | On delete | Guarantee |
 |---|---|---|
 | **Encrypted, per-record envelope (`0x03`)** | The per-record Data Encryption Key (DEK) is **destroyed** (the `encrypted_envelope` BLOB is overwritten with the `0x04` erased marker), then the row is deleted + tombstoned | **Crypto-erased** — the ciphertext is cryptographically unrecoverable, even by a holder of the master key |
+| **Encrypted, scope envelope (`0x05`, #8278)** | The per-record DEK (wrapped under the namespace scope key instead of the per-agent key) is **destroyed** the same way (the `encrypted_envelope` BLOB is overwritten with the `0x04` erased marker), then the row is deleted + tombstoned | **Crypto-erased** — unrecoverable even by a holder of the namespace scope key; the erasable set is `CRYPTO_ERASABLE_ENVELOPE_VERSIONS` (`0x03` and `0x05`), read by `envelope_is_crypto_erasable` |
 | **Plaintext at rest** (encryption disabled) | Row-deleted + tombstoned | **Deleted** — NOT crypto-erased; a plaintext row can only be removed, not cryptographically shredded |
 | **Legacy per-agent envelope (`0x02`)** | Row-deleted + tombstoned | **Deleted, NOT crypto-erased** — the `0x02` scheme sealed content directly to a *shared* per-agent key, so there is no per-record key to destroy (see below) |
 
@@ -42,7 +43,8 @@ Because the DEK is random and only ever persisted in wrapped form,
 ciphertext — unrecoverable, even to a holder of the master KEK.** That is
 the cryptographic erasure primitive.
 
-New encrypted writes use `0x03` automatically. Rows written before this
+New encrypted writes use `0x03` automatically (`0x05` in a namespace with
+a scope key, #8278). Rows written before this
 change carry the legacy `0x02` envelope and are, honestly, NOT
 crypto-erasable — they fall back to row-delete + tombstone.
 
@@ -74,7 +76,7 @@ by `verify-audit-trail` like every other signed event. The event carries
 
 ## ATTESTABLE vs ESTIMABLE — the honest limits
 
-- **ATTESTABLE** (cryptographically enforced): for a `0x03` row, key
+- **ATTESTABLE** (cryptographically enforced): for a `0x03` or `0x05` row, key
   destruction + the signed erasure event are real, verifiable facts. After
   erasure the ciphertext cannot be decrypted from the live store by anyone,
   KEK-holder included.

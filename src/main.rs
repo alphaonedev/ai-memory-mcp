@@ -355,7 +355,7 @@ fn main() -> Result<()> {
 
     // PR-5 (issue #487): bootstrap operational logging + security
     // audit trail. Both are default-OFF; init returns silently when
-    // disabled. The `_log_guard` MUST stay in scope for the lifetime
+    // disabled. The `log_guard` MUST stay in scope for the lifetime
     // of the process — when dropped it flushes the non-blocking
     // tracing writer to disk.
     //
@@ -363,7 +363,7 @@ fn main() -> Result<()> {
     // selected sink cannot be initialised gets a refusal, not a process
     // that runs while its collector receives nothing. `doctor` is the one
     // exception, so the failure stays diagnosable (the #2386 precedent).
-    let _log_guard = match logging::init_file_logging(&app_config.effective_logging()) {
+    let log_guard = match logging::init_file_logging(&app_config.effective_logging()) {
         Ok(guard) => guard,
         Err(e) if is_doctor => {
             eprintln!(
@@ -456,18 +456,35 @@ fn main() -> Result<()> {
 
     // #1889 — build the async runtime AFTER all env seeding is done, then hand
     // off to the daemon body. Mirrors the `#[tokio::main]` default (multi-thread
-    // scheduler, all drivers enabled). `_log_guard` stays in scope across the
+    // scheduler, all drivers enabled). `log_guard` stays in scope across the
     // whole `block_on` so the non-blocking tracing writer flushes on exit.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let result = runtime.block_on(daemon_runtime::run(cli, &app_config, audit_pubkey.as_ref()));
+    // #4347 — a signal stopped `mcp` and its exit drain already ran. Exit with
+    // the conventional 128 + signal code before the runtime drops: the stdio
+    // reader is an uncancellable blocking read that would stall the drop.
+    if let Some(stop) = result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<ai_memory::mcp::shutdown::SignalExit>())
+    {
+        let code = stop.code();
+        // #4347 F-2 — non-unix has no `atexit` hook, so run the follow-up
+        // drain barrier here (unix runs the same function from its hook).
+        #[cfg(not(unix))]
+        // The outcome is logged inside the hook.
+        let _ = ai_memory::governance::audit::exit_drain_hook();
+        // `process::exit` skips destructors: flush the buffered file log.
+        drop(log_guard);
+        std::process::exit(code);
+    }
     // #4319 — on unix the exit drain is an `atexit` hook (it also covers every
     // `std::process::exit` inside the commands); elsewhere drain here, bounded.
     #[cfg(not(unix))]
-    let _ = ai_memory::governance::audit::drain_bounded(
-        ai_memory::governance::audit::EXIT_DRAIN_BUDGET,
-    );
+    // The outcome is logged inside the hook.
+    let _ = ai_memory::governance::audit::exit_drain_hook();
     if result.as_ref().err().is_some_and(|error| {
         error
             .downcast_ref::<daemon_runtime::FatalShutdownError>()

@@ -3,11 +3,11 @@ layout: doc
 ---
 # Federation hardening (mTLS + X-API-Key + peer attestation)
 
-> ## Certified trust boundary (canonical)
->
+## Certified trust boundary (canonical)
+
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
-> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
 
 > **Looking for zero-touch trust?** This document covers the
 > **transport/identity hardening** layer — mTLS allowlist, X-API-Key, and
@@ -261,7 +261,7 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   namespace. A declared nonempty scope is always enforced. The default-on
   `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` also refuses an absent
   allowlist or an enrolled peer with no namespaces. See env row 147 in
-  `CLAUDE.md` and the Standard opt-out contract above.
+  `docs/reference/ARCHITECTURE_REFERENCE.md` and the Standard opt-out contract above.
 
 > ✅ **Inbound write lanes are namespace-confined.**
 > Every inbound write lane routes through the shared
@@ -486,8 +486,7 @@ independently — these are layered on top.
 - **Outbound server-cert verification is fail-closed
   ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448)).**
   Federation replicates **plaintext** memory content (it is NOT
-  end-to-end encrypted —
-  [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)), so
+  end-to-end encrypted; see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)), so
   an unverified peer *server* certificate is a direct content-disclosure
   surface for an adversary in DNS or BGP position. The mTLS control cuts
   the other way: the peer fingerprint-pinning **our** client cert
@@ -623,11 +622,11 @@ local namespace cap, even if the sending peer's local cap is higher.
    failed to parse private key as RSA, ECDSA, or EdDSA`). Re-encoding with
    `openssl pkcs8 -topk8` does not help — the explicit parameters survive.
    Generate with OpenSSL 3 and force the named-curve encoding:
-   ```bash
-   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-       -pkeyopt ec_param_enc:named_curve -nodes \
-       -keyout peer.key -out peer.crt -days 365 -subj "/CN=peer-node-1"
-   ```
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -pkeyopt ec_param_enc:named_curve -nodes \
+    -keyout peer.key -out peer.crt -days 365 -subj "/CN=peer-node-1"
+```
    (a P-256 PKCS#8 key is about 241 bytes), or use an RSA or Ed25519 key.
 2. **Populate `peer-fingerprints.allow`.** One fingerprint per line.
    Inline comments (`# label`) and `:` separators tolerated.
@@ -642,13 +641,13 @@ local namespace cap, even if the sending peer's local cap is higher.
    [`docs/enterprise-deployment.md` §8.4 / §8.6](enterprise-deployment.html)
    prescribe for a swarm — restated here so this checklist is a complete
    single turnkey path:
-   ```bash
-   # On the peer (one-time, if it has no keypair): writes bob@host2.pub
-   # under its key dir.
-   ai-memory identity generate --agent-id bob@host2
-   # Exchange bob@host2.pub out-of-band, then on THIS receiving daemon:
-   ai-memory identity import --agent-id bob@host2 --pub bob@host2.pub
-   ```
+```bash
+# On the peer (one-time, if it has no keypair): writes bob@host2.pub
+# under its key dir.
+ai-memory identity generate --agent-id bob@host2
+# Exchange bob@host2.pub out-of-band, then on THIS receiving daemon:
+ai-memory identity import --agent-id bob@host2 --pub bob@host2.pub
+```
    `import` writes a public-only `<agent_id>.pub` (no private half); the
    receive path resolves it via
    [`identity::verify::lookup_peer_public_key`](../src/identity/verify.rs).
@@ -928,13 +927,22 @@ peer from **authoring as other agents** and from **pulling unrelated
 namespaces**. Those verbs are contained, and since #2489/#2480 so are the
 link, signal and pull-accept lanes (enrolled posture). What remains
 uncontained: the peer can read the plaintext of everything replicated
-to it — federation is **not** end-to-end encrypted
-([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968); see
-§"At-rest encryption and federation" below).
+to it. Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262).
+See also §"At-rest encryption and federation" below.
 
-**Opt-in quarantine of provenance-less inbound content
-([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948)).**
-`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (default `false`, opt-in) route-IN
+**Quarantine of provenance-less inbound content, forced ON by the federating
+shapes
+([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948),
+[#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967)).**
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` is pinned ON by the `[deployment]
+shape` on `federated`, `hive` and `production` when unset. On `federated` and
+`hive` a non-truthy value is a floor violation and refuses boot; on
+`production` the always-engaged `asi-hard` posture refuses a non-truthy value
+the same way, so no hardened shape can run with it off. It stays `false`
+(permissive, listed by `ai-memory config show`) only on `singleton` and
+`team` unless `asi-hard` is selected there too. One truthiness grammar
+(`1`, `true`, `yes`, `on`, case-insensitive after trim) is shared by the
+shape floor, the `asi-hard` floor and the `/sync/push` receive reader. Route-IN
 quarantines any inbound relayed memory that did NOT reach
 `attest_level=agent_attested` (no verified per-write content signature —
 it would otherwise land `claimed`): the row is stored with the system-only
@@ -945,7 +953,7 @@ onward — it is hidden AND black-holed until dequarantine** (either
 automatically when a re-received copy later verifies `agent_attested`, or
 by operator dequarantine). Each quarantine increments
 `ai_memory_fed_quarantined_unattributed_total` and emits one WARN; the
-counter is always zero when the knob is off (the default), so a non-zero
+counter is always zero when the knob is off (the singleton and team shapes unless set; the federated, hive and production shapes force it on), so a non-zero
 value means a peer is relaying provenance-less content this node is
 black-holing.
 
@@ -960,7 +968,7 @@ in-domain confinement primitive is `PeerScope.allowed_namespaces`,
 **which every inbound write lane now consults under an enrolled
 posture (#2489/#2480)**. The residual reason this is not a
 mutually-distrusting-tenant boundary is that federation replicates
-plaintext (#1968) and `trust_domain` is credential-replay scope only.
+plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)) and `trust_domain` is credential-replay scope only.
 For heterogeneous trust,
 §8.8 of `docs/enterprise-deployment.md` gives the correct answer:
 **use multiple disjoint swarms**, not one mesh with scopes.

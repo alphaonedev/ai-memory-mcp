@@ -175,9 +175,7 @@ pub fn merge_inbound_authorized(
             write_txn.commit()?;
             insert_if_newer(conn, inbound)
         }
-        Err(e) => {
-            write_txn.rollback();
-            Err(e)
-        }
+        // #4116 — settle deferred escalations, then report the REAL outcome.
+        Err(e) => Err(write_txn.rollback_resolving(e)),
     }
 }

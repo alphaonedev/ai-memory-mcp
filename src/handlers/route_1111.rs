@@ -1113,6 +1113,11 @@ pub async fn handle_export_reflection_http(
             if let Some(own) = e.downcast_ref::<crate::errors::OwnText>() {
                 return err_response(own.to_string());
             }
+            // #4622 - a hidden or missing member is the typed `ReflectionNotFound`
+            // root (same 400 text as before; the type is not an `OwnText`).
+            if let Some(rnf) = e.downcast_ref::<crate::errors::ReflectionNotFound>() {
+                return err_response(rnf.to_string());
+            }
             if let Some(crate::storage::StorageError::InvalidArgument { reason }) =
                 e.downcast_ref::<crate::storage::StorageError>()
             {
@@ -1843,11 +1848,22 @@ pub async fn handle_subscription_dlq_list_http(
         Err(e) => return err_response(e),
     };
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_subscription_dlq_list(&lock.0, &body, Some(&caller));
+    // #7501 / #7542: admins see every failed-lookup row, everyone else their
+    // own. The widening is a privilege grant, so it needs the TRUSTED admin
+    // predicate (allowlisted name AND request authn or explicit header trust
+    // AND key attestation under `enforce`), never the bare allowlist match: the
+    // X-Agent-Id header is self-asserted on a keyless daemon (#1582).
+    let admin_ids: Vec<String> =
+        if crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller) {
+            vec![caller.clone()]
+        } else {
+            Vec::new()
+        };
+    let result = crate::mcp::handle_subscription_dlq_list_for(&lock.0, &body, &caller, &admin_ids);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => err_response(e),
+        Err(e) => err_response(String::from(e)),
     }
 }
 

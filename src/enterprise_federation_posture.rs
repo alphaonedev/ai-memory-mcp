@@ -59,7 +59,7 @@
 //!
 //! - `AI_MEMORY_FED_PERMISSIONS_MODE=enforce` — no `AI_MEMORY_FED_*`
 //!   permissions-mode knob exists. The real K3/K9 governance gate is
-//!   `AI_MEMORY_PERMISSIONS_MODE` (CLAUDE.md env-table row #10,
+//!   `AI_MEMORY_PERMISSIONS_MODE` (`ARCHITECTURE_REFERENCE.md` env-table row #10,
 //!   `crate::config::AppConfig::effective_permissions_mode`), which
 //!   this module checks resolves to [`crate::config::PermissionsMode::Enforce`].
 //! - `AI_MEMORY_FED_GOVERNANCE_FAIL_OPEN_ON_ERROR=0` — no `FED_`-prefixed
@@ -89,6 +89,9 @@
 
 use crate::config::{AppConfig, PermissionsMode};
 use crate::federation::peer_attestation::{PEER_ATTESTATION_ENV, PeerScope};
+// The house truthy grammar (`1`/`true`/`yes`/`on`, case-insensitive, trimmed),
+// shared crate-wide (#3200, #2967); this module keeps no private copy.
+use crate::security_profile::is_truthy;
 use std::collections::HashMap;
 
 /// #3553 — the `PRAGMA synchronous` posture row (check #21) and its test.
@@ -187,15 +190,6 @@ fn check(
             remediation.to_string()
         },
     }
-}
-
-/// The house truthy grammar (`1`/`true`/`yes`/`on`, case-insensitive,
-/// trimmed) shared by every `AI_MEMORY_*` boolean knob in this crate.
-fn is_truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 /// #3061 — best-effort machine check that a `postgres://` DSN pins libpq's
@@ -521,8 +515,8 @@ pub fn evaluate_with_live(
 
     // ---- 13. AI_MEMORY_FED_SYNC_TRUST_PEER — MUST BE UNSET ---------
     // NB1 fix — call the REAL reader (`peer_attestation::sync_trust_peer_bypass`,
-    // exact-literal `"1"` match, `src/federation/peer_attestation.rs:366`)
-    // instead of the broader local `is_truthy` grammar (`1`/`true`/`yes`/`on`).
+    // exact-literal `"1"` match, `src/federation/peer_attestation.rs`)
+    // instead of the broader shared `security_profile::is_truthy` grammar (`1`/`true`/`yes`/`on`).
     // The real gate trips ONLY on the literal `1`, so e.g. `=true` never
     // opens the bypass in production but `must_be_unset_env`'s truthy
     // grammar would have false-FAILED this check against a compliant env.

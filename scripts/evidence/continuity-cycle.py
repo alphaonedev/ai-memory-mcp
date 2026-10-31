@@ -80,7 +80,7 @@ def wait_health(base: str, timeout_s: float) -> float:
             if status == 200:
                 return (time.monotonic() - t0) * 1000.0
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-            pass
+            status = None  # the daemon is not up yet; the sleep below spaces the next attempt
         time.sleep(0.05)
     raise SystemExit(f"health did not return 200 within {timeout_s}s")
 

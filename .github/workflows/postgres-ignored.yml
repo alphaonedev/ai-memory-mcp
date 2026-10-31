@@ -10,7 +10,7 @@
 #
 # THIS JOB. Runs ONLY the ignored tests (`--ignored`, not a full-suite
 # `--include-ignored` duplicate of the already-required enterprise-fed
-# Check). Same native pg18.6+AGE1.8.0+pgvector0.8.6 tier, same
+# Check). Same native pg18.6+AGE1.8.0+pgvector0.8.7 tier, same
 # per-job ephemeral db pattern as cert-postgres-age.yml.
 #
 # RUNNER PLACEMENT — self-hosted linux-fed (pg-tier). Needs :5445.
@@ -22,8 +22,12 @@
 name: Postgres ignored tests (#3274)
 
 on:
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: ["release/**"]
+    branches: ["release/**", "rehearsal/**", "chain/**"]
   push:
     branches: ["release/**"]
   workflow_dispatch:
@@ -33,10 +37,13 @@ permissions:
 
 concurrency:
   group: pg-ignored-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # #7160 - size cap for the persistent self-hosted target/debug build state
+  # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
+  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
@@ -46,9 +53,12 @@ jobs:
     name: "Postgres ignored tests (sal-postgres --ignored)"
     runs-on: [self-hosted, linux-fed]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    timeout-minutes: 60
+    # #8303: compile 24 min + soak 20 min on an idle host, 37+ min under load; 60 min had no headroom.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
         if: runner.environment != 'github-hosted'
@@ -100,7 +110,9 @@ jobs:
           echo "::notice::[#3274] ignored pg tests pointed at ephemeral db $CI_FED_DB on $RUNNER_NAME"
 
       - name: cargo test --features sal-postgres -- --ignored
+        timeout-minutes: 100
         run: |
+          date -u +'%Y-%m-%dT%H:%M:%SZ ignored-tests start'
           set -euo pipefail
           # #3552 non-vacuity: list first, then run, then FAIL if executed
           # < listed or < the committed ratchet (or if any skip: line
@@ -116,6 +128,7 @@ jobs:
           set -e
           bash scripts/check-cert-leg-nonvacuity.sh \
             --leg postgres-ignored --log "$TEST_OUT" --listed "$LISTED"
+          date -u +'%Y-%m-%dT%H:%M:%SZ ignored-tests end'
           exit "$rc"
 
       - name: Cleanup enterprise-fed ephemeral db
@@ -141,3 +154,9 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #7160 - cap the persistent self-hosted target/debug (workspace-local,
+      # oldest-mtime first). Last step so it never races a running build.
+      - name: Sweep target/debug to the size cap (self-hosted)
+        if: always() && runner.environment == 'self-hosted'
+        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}

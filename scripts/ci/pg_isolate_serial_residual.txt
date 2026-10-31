@@ -1,0 +1,5 @@
+# Test binaries that stay serial on the shared database even with
+# AI_MEMORY_TEST_PG_ISOLATE=1 (#6383 / #6386). One binary name per line.
+# Cross-process state a per-binary database cannot isolate belongs here.
+# Ceilings only fall: remove a name when its binary no longer needs it.
+a2a_campaign_round1

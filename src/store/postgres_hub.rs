@@ -63,8 +63,10 @@ impl PostgresStore {
     ) -> Result<()> {
         self.gate_record_stop().await?;
         let mut tx = self.pool().begin().await?;
+        // #7241 - the audit anchors are emitted only after the COMMIT below.
+        let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
         for event in crate::identity::hub_cache::events(previous, next)? {
-            pg_append_signed_event_with_chain_in_tx(
+            let appended = pg_append_signed_event_with_chain_in_tx(
                 &mut tx,
                 PgSignedEventInsert {
                     id: &event.id,
@@ -78,8 +80,9 @@ impl PostgresStore {
                 },
             )
             .await?;
+            anchor = anchor.merge(appended);
         }
-        tx.commit().await?;
+        crate::store::postgres::pg_commit_and_emit(tx, anchor).await?;
         Ok(())
     }
 }

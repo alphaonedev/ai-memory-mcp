@@ -12,16 +12,41 @@
 #
 # This cannot be prevented inside a branch. It is a merge property. So the
 # rule has two halves:
-#   DECLARE  — a commit that changes a `.len()` count assertion says so in its
-#              message, so the merger knows a shared count moved:
-#                  Count: doctor sections 18 -> 19 (adds "Logging pipeline")
-#              (`# count: ...` is accepted too — but note `git commit` strips
-#              `#`-prefixed lines unless --cleanup=verbatim, which is why the
-#              trailer form is preferred.)
+#   DECLARE  — a commit that changes a `.len()` count assertion says so, in a
+#              trailer of its OWN message, so the merger knows a shared count moved:
+#                  Count: <what> <old> -> <new> (<why>)
+#              several changes may share one line, separated by ", ":
+#                  Count: doctor sections 18 -> 19, hooks 4 -> 5 (adds a section and a hook)
 #   RE-DERIVE — the merger sets the merged assertion from the ARITHMETIC over
 #              every declaration in the chain, never from whichever number
 #              survived the merge. That half is the rehearsal lane's job.
 # This gate enforces DECLARE.
+#
+# DECLARATION RULES (5-agent vote (4d3ea1c5), decision memory
+# 0b54a489-d788-48bc-83b3-3653e7a5ed4b; #5499 #5517 #5518):
+#   * A declaration is read ONLY from the TRAILER BLOCK, the last paragraph of a
+#     message, as `git interpret-trailers --parse` sees it. Prose that happens to
+#     contain `count:`, a declaration line in the middle of the body, a `# count:`
+#     line and a declaration in the subject line are NOT declarations.
+#   * <old> and <new> must equal the gate's own finding, and <what> must name the
+#     assertion (every word of <what> occurs, case-insensitively, in the file path
+#     or the asserted expression). EVERY changed assertion of the commit must be
+#     covered; a declaration that covers only some of them leaves the commit red.
+#     Several correct declarations (own line plus later ones) are unioned.
+#   * LATE DECLARATION. A missed declaration cannot be added by rewriting the
+#     history (force-push and rebase are forbidden), so a LATER commit of the same
+#     range may declare for the offender, in its own trailer block:
+#         Count-Declared: <40-char sha> <what> <old> -> <new> (<why>)
+#     The sha must be the full 40 lowercase hex characters, must be inside the
+#     range being checked, and must be an ancestor of the declaring commit (a
+#     declaration cannot reach backwards or sideways). Declarations are read from
+#     merge commits too; only non-merge commits are offenders.
+#   * A malformed, mismatched, out-of-range or non-ancestor declaration NEVER
+#     satisfies an offender and is REPORTED on stderr (`IGNORED`), but it is not
+#     red by itself: a bad trailer cannot be removed without a rebase, and
+#     making it fatal would recreate the trap. An offender is green ONLY by an
+#     exact match, so the gate stays fail-closed. An offender outside the range
+#     (a stacked PR) is neither examined nor required.
 #
 # HOW A CHANGE IS FOUND — whole-file, not diff-line. rustfmt splits any
 # `assert_eq!` past ~100 columns onto three lines, so the number sits on a line
@@ -35,6 +60,13 @@
 # The named-const spelling — `assert_eq!(x.len(), EXPECTED)` with
 # `const EXPECTED: usize = 19;` — is resolved the same way: a const that a
 # count assertion names, whose literal moved, is a count change.
+#
+# FILE LISTING (#5518) — `git diff-tree -M -C --find-copies-harder`. A renamed or
+# copied file is compared with its SOURCE path, so rename-plus-bump and
+# copy-plus-bump stay red. An assertion is skipped as new (no earlier count
+# exists to drift from; #5499) only when its file has status A in that same
+# commit AND the asserted expression or constant exists in no other file of the
+# parent tree. A new assertion in an EXISTING file stays red until declared.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 RANGE="HEAD~1..HEAD"; SELF_TEST=0
@@ -42,30 +74,47 @@ while [ $# -gt 0 ]; do case "$1" in
   --range) RANGE=$2; shift 2;; --self-test) SELF_TEST=1; shift;;
   *) echo "usage: $0 [--range A..B | --self-test]" >&2; exit 2;; esac; done
 
-NOTE_RE='(^|[[:space:]#])[Cc]ount:'
+# gate_py check <A..B>   — findings on stdout, IGNORED reports on stderr, rc 1 on any red.
+# gate_py selftest       — builds scratch repositories under .local-runs/count-selftest.
+gate_py() {
+  python3 - "$@" <<'PY'
+import os, re, shutil, subprocess, sys
 
-# count_changes <commit> — prints one line per changed count assertion:
-#   <file>  <expr>.len()  <old> -> <new>
-count_changes() {
-  local c=$1
-  python3 - "$c" <<'PY'
-import re, subprocess, sys
-c = sys.argv[1]
-def git(*a):
-    r = subprocess.run(['git', *a], capture_output=True, text=True)
+REPO = None                      # directory every git call runs in (None = the current one)
+DIFF_FLAGS = ['-M', '-C', '--find-copies-harder']
+FULL_SHA = re.compile(r'^[0-9a-f]{40}$')
+ITEM_RE = re.compile(r'^(?P<what>\S.*?)\s+(?P<old>\(none\)|[0-9][0-9,]*)\s*->\s*(?P<new>\(none\)|[0-9][0-9,]*)$')
+WHY_RE = re.compile(r'\s*\((?!none\))[^()]*\)\s*$')
+
+
+def git(*a, inp=None):
+    kw = {'input': inp} if inp is not None else {'stdin': subprocess.DEVNULL}
+    r = subprocess.run(['git', *a], cwd=REPO, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', **kw)
     return r.stdout if r.returncode == 0 else ''
-files = [f for f in git('show', '--format=', '--name-only', c).split('\n')
-         if f and (f.startswith('src/') or f.startswith('tests/')) and f.endswith('.rs')]
+
+
+def git_rc(*a):
+    return subprocess.run(['git', *a], cwd=REPO, capture_output=True, stdin=subprocess.DEVNULL).returncode
+
+
 LIT = re.compile(r'"(?:[^"\\]|\\.)*"', re.S)
+
+
 def clean(t):
     t = re.sub(r'//[^\n]*', '', t)                       # line comments
     return LIT.sub('""', t)                              # string literals are not code
+
+
 # assert!(...) / assert_eq!(...) whose LEFT side is `<expr>.len()` / `.count()` and whose
 # RIGHT side is a numeric literal or an UPPER_CASE const — across line breaks.
 ASSERT = re.compile(
     r'assert(?:_eq)?!\s*\(\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*,\s*(?P<rhs>[0-9][0-9_]*|[A-Z][A-Z0-9_]{2,})\s*[,)]', re.S)
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]{2,})\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[0-9][0-9_]*)\s*;')
+
+
 def extract(text):
+    """-> ({expr-key: {literal, ...}}, {const names defined})"""
     text = clean(text)
     consts = {m.group('name'): m.group('val').replace('_', '') for m in CONST.finditer(text)}
     out = {}
@@ -76,89 +125,459 @@ def extract(text):
         if val is None: continue                         # a const defined elsewhere: not a literal count
         if not rhs[0].isdigit(): expr += f' [{rhs}]'        # name the const the count is spelled through
         out.setdefault(expr, set()).add(val)
+    return out, set(consts)
+
+
+def eligible(p):
+    return (p.startswith('src/') or p.startswith('tests/')) and p.endswith('.rs')
+
+
+def read_blobs(specs):
+    """One `git cat-file --batch` for many `<rev>:<path>` specs -> {spec: text}."""
+    specs = [s for s in specs if '\n' not in s]
+    if not specs: return {}
+    p = subprocess.run(['git', 'cat-file', '--batch'], cwd=REPO, input=('\n'.join(specs) + '\n').encode(),
+                       capture_output=True)
+    buf, pos, out = p.stdout, 0, {}
+    for s in specs:
+        nl = buf.find(b'\n', pos)
+        if nl < 0: break
+        hdr = buf[pos:nl].split(); pos = nl + 1
+        if len(hdr) == 3 and hdr[1] == b'blob':
+            size = int(hdr[2]); out[s] = buf[pos:pos + size].decode('utf-8', 'replace'); pos += size + 1
     return out
-for f in files:
-    old = extract(git('show', f'{c}^:{f}')); new = extract(git('show', f'{c}:{f}'))
-    for expr in sorted(set(old) | set(new)):
-        o, n = old.get(expr, set()), new.get(expr, set())
-        if o != n:
-            print(f"  {f}  {expr}  {','.join(sorted(o)) or '(none)'} -> {','.join(sorted(n)) or '(none)'}")
+
+
+_PARENT_INDEX = {}
+
+
+def parent_index(parent):
+    """Every count-assertion key and every const name that exists in ANY eligible file of the parent tree."""
+    if parent in _PARENT_INDEX: return _PARENT_INDEX[parent]
+    paths = [p for p in git('ls-tree', '-r', '--name-only', parent, '--', 'src', 'tests').split('\n') if eligible(p)]
+    keys, names = set(), set()
+    for text in read_blobs([f'{parent}:{p}' for p in paths]).values():
+        ex, cn = extract(text)
+        for k in ex:
+            keys.add(k); keys.add(k.split(' [', 1)[0])
+        names |= cn
+    _PARENT_INDEX[parent] = (keys, names)
+    return keys, names
+
+
+def exists_elsewhere(parent, expr):
+    keys, names = parent_index(parent)
+    if expr in keys or expr.split(' [', 1)[0] in keys: return True
+    return '[' in expr and expr.rsplit('[', 1)[1].rstrip(']') in names
+
+
+def changed_files(c):
+    """-> [(status, old_path or None, new_path or None)] with rename and copy detection (#5518)."""
+    toks = git('diff-tree', '--root', *DIFF_FLAGS, '-l0', '-r', '--no-commit-id', '--name-status', '-z', c).split('\0')
+    out, i = [], 0
+    while i < len(toks) and toks[i]:
+        st = toks[i][0]
+        if st in 'RC':
+            out.append((st, toks[i + 1], toks[i + 2])); i += 3
+        else:
+            p = toks[i + 1] if i + 1 < len(toks) else ''
+            out.append((st, None if st == 'A' else p, None if st == 'D' else p)); i += 2
+    return out
+
+
+def count_changes(c):
+    """-> [(file, expr, old, new)] one per changed count assertion of commit c."""
+    parent = git('rev-parse', '--verify', '--quiet', c + '^').strip()
+    entries = [e for e in changed_files(c)
+               if (e[1] and eligible(e[1])) or (e[2] and eligible(e[2]))]
+    specs = [f'{parent}:{e[1]}' for e in entries if parent and e[1]] + [f'{c}:{e[2]}' for e in entries if e[2]]
+    blobs = read_blobs(list(dict.fromkeys(specs)))
+    hits = []
+    for st, op, np_ in entries:
+        old, _ = extract(blobs.get(f'{parent}:{op}', '') if (parent and op) else '')
+        new, _ = extract(blobs.get(f'{c}:{np_}', '') if np_ else '')
+        for expr in sorted(set(old) | set(new)):
+            o, n = old.get(expr, set()), new.get(expr, set())
+            if o == n: continue
+            if st == 'A' and not exists_elsewhere(parent, expr):
+                continue                                 # a brand-new assertion in a brand-new file (#5499)
+            hits.append((np_ or op, expr, ','.join(sorted(o)) or '(none)', ','.join(sorted(n)) or '(none)'))
+    return hits
+
+
+def trailers(msg):
+    """-> [(key, value)] from the trailer block (last paragraph) only."""
+    if 'count' not in msg.lower(): return []
+    out = []
+    for line in git('interpret-trailers', '--parse', inp=msg.rstrip('\n') + '\n').split('\n'):
+        k, sep, v = line.partition(':')
+        if sep and k.strip(): out.append((k.strip(), v.strip()))
+    return out
+
+
+def parse_items(s):
+    """`<what> <old> -> <new>[, <what> <old> -> <new> ...] [(<why>)]` -> [(what, old, new)] or None."""
+    s = WHY_RE.sub('', s.strip(), count=1)
+    items = []
+    for part in re.split(r',\s+', s):
+        m = ITEM_RE.match(part.strip())
+        if not m: return None
+        items.append((m.group('what'), m.group('old'), m.group('new')))
+    return items or None
+
+
+def item_matches(item, hit):
+    what, old, new = item
+    hay = (hit[0] + ' ' + hit[1]).lower()
+    return old == hit[2] and new == hit[3] and all(w in hay for w in what.lower().split())
+
+
+def short(c):
+    return c[:9]
+
+
+def check_range(rng):
+    """-> (rc, stdout lines, stderr lines)"""
+    out, err = [], []
+    commits, msgs = [], {}
+    for rec in git('log', '-z', '--format=%H%x1f%B', rng).split('\0'):
+        h, _, body = rec.partition('\x1f'); h = h.strip()
+        if h: commits.append(h); msgs[h] = body
+    in_range = set(commits)
+    # Only non-merge commits are offenders. diff-tree without -m prints nothing for a merge, so --no-merges is also
+    # what a future -m would need; the self-test leg 'merge commit whose tree moves a shared count' pins the pair (#5499).
+    offenders = git('rev-list', '--no-merges', rng).split()
+    hits = {}
+    for c in offenders:
+        h = count_changes(c)
+        if h: hits[c] = h
+    accepted = {}                                         # offender sha -> [items that match a hit]
+    for d in commits:                                     # merge commits included
+        for key, val in trailers(msgs[d]):
+            if key.lower() != 'count-declared': continue
+            m = re.match(r'^(\S+)\s+(.+)$', val)
+            sha = m.group(1) if m else val
+            why = None
+            if not m: why = 'malformed (want: <40-char sha> <what> <old> -> <new> (<why>))'
+            elif not FULL_SHA.match(sha): why = f'{sha!r} is not a full 40-character lowercase sha'
+            elif sha not in in_range: why = f'{short(sha)} is outside the range {rng} (a stacked-PR offender is not checked here)'
+            elif git_rc('merge-base', '--is-ancestor', sha, d) != 0: why = f'{short(sha)} is not an ancestor of the declaring commit'
+            elif sha not in hits: why = f'{short(sha)} changes no count assertion'
+            else:
+                items = parse_items(m.group(2))
+                if items is None: why = 'malformed items (want: <what> <old> -> <new>[, ...] (<why>))'
+            if why:
+                err.append(f'count-assertion-declared: IGNORED Count-Declared in {short(d)}: {why}'); continue
+            for it in items:
+                if any(item_matches(it, h) for h in hits[sha]): accepted.setdefault(sha, []).append(it)
+                else: err.append(f'count-assertion-declared: IGNORED Count-Declared in {short(d)}: "{it[0]} {it[1]} -> {it[2]}" matches no change of {short(sha)}')
+    rc = 0
+    for c in offenders:
+        if c not in hits: continue
+        own = []
+        for key, val in trailers(msgs[c]):
+            if key.lower() != 'count': continue
+            items = parse_items(val)
+            if items is None: err.append(f'count-assertion-declared: IGNORED Count in {short(c)}: malformed (want: <what> <old> -> <new>[, ...] (<why>))'); continue
+            for it in items:
+                if any(item_matches(it, h) for h in hits[c]): own.append(it)
+                else: err.append(f'count-assertion-declared: IGNORED Count in {short(c)}: "{it[0]} {it[1]} -> {it[2]}" matches no change of this commit')
+        declared = own + accepted.get(c, [])
+        if all(any(item_matches(it, h) for it in declared) for h in hits[c]): continue
+        subj = msgs[c].split('\n', 1)[0]
+        out.append(f'  {short(c)}  {subj[:70]}')
+        for h in hits[c][:8]: out.append(f'      {h[0]}  {h[1]}  {h[2]} -> {h[3]}')
+        rc = 1
+    return rc, out, err
+
+
+# ----------------------------------------------------------------------------- self-test
+GENV = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_AUTHOR_NAME='g', GIT_AUTHOR_EMAIL='g@x', GIT_COMMITTER_NAME='g', GIT_COMMITTER_EMAIL='g@x')
+PAD = ''.join('// pad %d\n' % i for i in range(20))
+
+
+def f_rs(n): return PAD + 'fn a() { assert_eq!(sections.len(), %s); }\n' % n
+def multi_rs(n): return 'fn b() {\n    assert_eq!(\n        report.minimal_sections_with_a_deliberately_long_name.len(),\n        %s\n    );\n}\n' % n
+def named_rs(n): return 'const EXPECTED_SECTIONS: usize = %s;\nfn c() { assert_eq!(report.sections.len(), EXPECTED_SECTIONS); }\n' % n
+def ctrl_rs(n, m): return 'fn d() { let n = %s; assert_eq!(items.len(), n); assert!(msg.contains("len() = %s")); }\n' % (n, m)
+OTHER_RS = 'fn o() { assert_eq!(shared.len(), 7); }\n'
+K7_RS = 'fn k() { assert_eq!(fired.len(), 2); }\n'
+
+
+class Scratch:
+    def __init__(self, path):
+        self.p = path; os.makedirs(path)
+        self.g('init', '-q', '-b', 'main'); self.g('config', 'commit.gpgsign', 'false')
+        self.tick = 0
+
+    def g(self, *a, inp=None):
+        r = subprocess.run(['git', *a], cwd=self.p, input=inp, capture_output=True, text=True, env=GENV)
+        if r.returncode != 0: raise RuntimeError('git %s: %s' % (' '.join(a), r.stderr))
+        return r.stdout.strip()
+
+    def w(self, rel, text):
+        fp = os.path.join(self.p, rel); os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, 'w') as f: f.write(text)
+
+    def commit(self, msg):
+        self.g('add', '-A', '--', '.'); self.g('commit', '-q', '--cleanup=verbatim', '-F', '-', inp=msg)
+        return self.g('rev-parse', 'HEAD')
+
+    def base(self):
+        self.w('tests/f.rs', f_rs(18)); self.w('tests/multi.rs', multi_rs(5)); self.w('tests/named.rs', named_rs(18))
+        self.w('tests/ctrl.rs', ctrl_rs(3, 4)); self.w('tests/other.rs', OTHER_RS); self.w('tests/k7.rs', K7_RS)
+        self.w('notes.txt', '0\n')
+        return self.commit('base')
+
+    def touch(self, msg):                                 # a commit with no .rs change
+        self.tick += 1; self.w('notes.txt', '%d\n' % self.tick); return self.commit(msg)
+
+
+def selftest():
+    global REPO
+    root = '.local-runs/count-selftest'; shutil.rmtree(root, ignore_errors=True); os.makedirs(root)
+    state = {'bad': 0, 'n': 0}
+
+    def case(label, build, red, needles=(), errs=(), noerrs=()):
+        state['n'] += 1
+        global REPO
+        s = Scratch(os.path.join(root, 'c%02d' % state['n']))
+        b = s.base(); rng = build(s, b)
+        REPO = s.p
+        try:
+            rc, out, err = check_range(rng)
+        finally:
+            REPO = None
+        o, e = '\n'.join(out), '\n'.join(err)
+        ok = (rc == (1 if red else 0)) and all(x in o for x in needles) and all(x in e for x in errs) and not any(x in e for x in noerrs)
+        if red and not needles and not out: ok = False
+        if ok: print('  ok   %s: %s' % ('RED  ' if red else 'GREEN', label))
+        else:
+            state['bad'] = 1
+            print('  [FAIL] expected %s: %s\n    rc=%s needles=%s errs=%s\n    stdout=%s\n    stderr=%s' % ('RED' if red else 'GREEN', label, rc, list(needles), list(errs), o, e))
+
+    D = 'Count-Declared: '
+    def msg(subject, trailer=None, prose=None):
+        m = subject
+        if prose: m += '\n\n' + prose
+        if trailer: m += '\n\n' + trailer
+        return m + '\n'
+    def late(off, items, sha=None):
+        return D + (sha or off) + ' ' + items
+    def bump_f(s, n=19): s.w('tests/f.rs', f_rs(n))
+    def two_hits(s): s.w('tests/f.rs', f_rs(19)); s.w('tests/multi.rs', multi_rs(6))
+    S_FF = 'sections 18 -> 19 (fixture)'
+
+    # ---- the original fixtures (no history dependency) ---------------------------------------
+    def c_single(s, b): bump_f(s); s.commit('test: bump sections'); return b + '..HEAD'
+    case('single-line undeclared bump', c_single, True, ['sections.len()  18 -> 19'])
+    def c_multi(s, b): s.w('tests/multi.rs', multi_rs(6)); s.commit('test: bump minimal sections (multi-line)'); return b + '..HEAD'
+    case('rustfmt three-line shape, only the number line in the diff', c_multi, True, ['long_name.len()  5 -> 6'])
+    def c_named(s, b): s.w('tests/named.rs', named_rs(19)); s.commit('test: bump named const'); return b + '..HEAD'
+    case('named-const bump (assert names the const, the const literal moved)', c_named, True, ['EXPECTED_SECTIONS'])
+    def c_ctrl(s, b): s.w('tests/ctrl.rs', ctrl_rs(4, 5)); s.commit('test: control edits'); return b + '..HEAD'
+    case('variable rhs + a string literal mentioning len() are not count changes', c_ctrl, False)
+    def c_decl3(s, b):
+        s.w('tests/f.rs', f_rs(19)); s.w('tests/multi.rs', multi_rs(6)); s.w('tests/named.rs', named_rs(19))
+        s.commit(msg('test: bump all three, declared', 'Count: sections 18 -> 19, minimal 5 -> 6, EXPECTED_SECTIONS 18 -> 19 (fixture)')); return b + '..HEAD'
+    case('the same three shapes, declared with a Count: trailer', c_decl3, False)
+
+    # ---- #5518: rename and copy detection, new-file skip -------------------------------------
+    def c_rename(s, b):
+        s.g('mv', 'tests/f.rs', 'tests/g.rs'); s.w('tests/g.rs', f_rs(19)); s.commit('test: move and bump'); return b + '..HEAD'
+    case('rename plus bump is compared with its source', c_rename, True, ['sections.len()  18 -> 19'])
+    def c_rename_d(s, b):
+        s.g('mv', 'tests/f.rs', 'tests/g.rs'); s.w('tests/g.rs', f_rs(19)); s.commit(msg('test: move and bump', 'Count: sections 18 -> 19 (moved)')); return b + '..HEAD'
+    case('rename plus bump, declared against the source values', c_rename_d, False)
+    def c_copy(s, b):
+        s.w('tests/g.rs', f_rs(19)); s.commit('test: copy and bump'); return b + '..HEAD'
+    case('copy plus bump is compared with its source', c_copy, True, ['sections.len()  18 -> 19'])
+    def c_pure_rename(s, b):
+        s.g('mv', 'tests/f.rs', 'tests/g.rs'); s.commit('test: move only'); return b + '..HEAD'
+    case('a pure rename moves no count', c_pure_rename, False)
+    def c_exist_new(s, b):
+        s.w('tests/f.rs', f_rs(18) + 'fn z() { assert_eq!(builds.len(), 1); }\n'); s.commit('test: new assertion, existing file'); return b + '..HEAD'
+    case('a new assertion in an EXISTING file stays red', c_exist_new, True, ['builds.len()  (none) -> 1'])
+    def c_newfile(s, b):
+        s.w('tests/new_pin.rs', 'fn t() { assert_eq!(builds.len(), 1); }\n'); s.w('changelog.d/1.fixed.md', 'x\n'); s.commit('test: new file'); return b + '..HEAD'
+    case('a new file with a new assertion, same commit, is green', c_newfile, False)
+    def c_newfile_dup(s, b):
+        s.w('tests/new_pin.rs', 'fn t() { assert_eq!(shared.len(), 9); }\n'); s.commit('test: new file, expression exists elsewhere'); return b + '..HEAD'
+    case('a new file whose expression exists in another file stays red', c_newfile_dup, True, ['shared.len()  (none) -> 9'])
+    def c_newfile_const(s, b):
+        s.w('tests/new_pin.rs', 'const EXPECTED_SECTIONS: usize = 9;\nfn t() { assert_eq!(fresh.len(), EXPECTED_SECTIONS); }\n'); s.commit('test: new file, const exists elsewhere'); return b + '..HEAD'
+    case('a new file naming a const that exists in another file stays red', c_newfile_const, True, ['EXPECTED_SECTIONS'])
+
+    # ---- #5517: the own Count: line must match the diff --------------------------------------
+    def c_own_ok(s, b): bump_f(s); s.commit(msg('test: bump', 'Count: sections 18 -> 19 (fixture)')); return b + '..HEAD'
+    case('own Count: trailer matching the diff', c_own_ok, False)
+    def c_prose(s, b): bump_f(s); s.commit(msg('test: bump', None, 'the row count: stays readable')); return b + '..HEAD'
+    case('prose containing count: is not a declaration', c_prose, True, ['sections.len()  18 -> 19'])
+    def c_hash(s, b): bump_f(s); s.commit(msg('test: bump', None, '# count: sections 18 -> 19')); return b + '..HEAD'
+    case('a # count: line is not a declaration', c_hash, True)
+    def c_own_oldbad(s, b): bump_f(s); s.commit(msg('test: bump', 'Count: sections 17 -> 19 (fixture)')); return b + '..HEAD'
+    case('own Count: with a wrong old', c_own_oldbad, True, ['18 -> 19'], ['matches no change of this commit'])
+    def c_own_newbad(s, b): bump_f(s); s.commit(msg('test: bump', 'Count: sections 18 -> 20 (fixture)')); return b + '..HEAD'
+    case('own Count: with a wrong new', c_own_newbad, True, ['18 -> 19'])
+    def c_own_wrongwhat(s, b): bump_f(s); s.commit(msg('test: bump', 'Count: zzz 18 -> 19 (fixture)')); return b + '..HEAD'
+    case('own Count: naming a different assertion', c_own_wrongwhat, True)
+    def c_own_partial(s, b): two_hits(s); s.commit(msg('test: bump two', 'Count: sections 18 -> 19 (fixture)')); return b + '..HEAD'
+    case('own Count: covering one of two hits', c_own_partial, True, ['long_name.len()  5 -> 6'])
+    def c_own_outside(s, b): bump_f(s); s.commit('test: bump\n\nCount: sections 18 -> 19 (fixture)\n\nclosing prose follows the line\n'); return b + '..HEAD'
+    case('own Count: line outside the trailer block (prose after it)', c_own_outside, True)
+    def c_own_subject(s, b): bump_f(s); s.commit('Count: sections 18 -> 19 (fixture)'); return b + '..HEAD'
+    case('own Count: as the subject line only', c_own_subject, True)
+    def c_own_delete(s, b): s.w('tests/f.rs', PAD + 'fn a() {}\n'); s.commit(msg('test: drop', 'Count: sections 18 -> (none) (removed)')); return b + '..HEAD'
+    case('own Count: for a removed assertion, 18 -> (none)', c_own_delete, False)
+
+    # ---- #5499: late declaration -------------------------------------------------------------
+    def offender(s, b, two=False):
+        (two_hits if two else bump_f)(s); return s.commit('test: bump without a declaration')
+    def c_late_ok(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF))); return b + '..HEAD'
+    case('late declaration naming the offender', c_late_ok, False)
+    def c_late_badsha(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF, sha=o[:-1] + ('0' if o[-1] != '0' else '1')))); return b + '..HEAD'
+    case('late declaration with a wrong sha', c_late_badsha, True, ['sections.len()  18 -> 19'], ['IGNORED'])
+    def c_late_oldbad(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, 'sections 17 -> 19 (fixture)'))); return b + '..HEAD'
+    case('late declaration with a wrong old', c_late_oldbad, True, ['18 -> 19'], ['matches no change of'])
+    def c_late_newbad(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, 'sections 18 -> 20 (fixture)'))); return b + '..HEAD'
+    case('late declaration with a wrong new', c_late_newbad, True, ['18 -> 19'], ['matches no change of'])
+    def c_late_whatbad(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, 'zzz 18 -> 19 (fixture)'))); return b + '..HEAD'
+    case('late declaration naming a different assertion', c_late_whatbad, True, ['18 -> 19'])
+    def c_late_abbrev(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF, sha=o[:12]))); return b + '..HEAD'
+    case('late declaration with an abbreviated sha', c_late_abbrev, True, ['18 -> 19'], ['40-character'])
+    def c_late_partial(s, b):
+        o = offender(s, b, two=True); s.touch(msg('docs: declare', late(o, S_FF))); return b + '..HEAD'
+    case('late declaration covering one of two hits', c_late_partial, True, ['long_name.len()  5 -> 6'])
+    def c_late_union(s, b):
+        o = offender(s, b, two=True)
+        s.touch(msg('docs: declare one', late(o, S_FF))); s.touch(msg('docs: declare two', late(o, 'minimal 5 -> 6 (fixture)'))); return b + '..HEAD'
+    case('two correct declarations that together cover both hits', c_late_union, False)
+    def c_late_both(s, b):
+        o = offender(s, b, two=True); s.touch(msg('docs: declare', late(o, 'sections 18 -> 19, minimal 5 -> 6 (fixture)'))); return b + '..HEAD'
+    case('one late declaration covering both hits', c_late_both, False)
+    def c_late_earlier(s, b):                             # the declaring commit is NOT a descendant of the offender
+        o = offender(s, b)
+        s.g('checkout', '-q', '-b', 'side', b); s.touch(msg('docs: declare early', late(o, S_FF)))
+        s.g('checkout', '-q', 'main'); s.g('merge', '-q', '--no-ff', '-m', 'merge side', 'side'); return b + '..HEAD'
+    case('declaration in a commit that is not a descendant of the offender', c_late_earlier, True, ['18 -> 19'], ['not an ancestor'])
+    def c_evil_merge(s, b):                               # a merge whose tree moves a shared count is not an offender (only non-merge commits are)
+        s.g('checkout', '-q', '-b', 'side', b); s.w('side.txt', '1\n'); s.commit('side work')
+        s.g('checkout', '-q', 'main'); s.touch('main work')
+        s.g('merge', '-q', '--no-ff', '--no-commit', 'side'); bump_f(s); s.commit('merge side with a bump in the merge tree'); return b + '..HEAD'
+    case('merge commit whose tree moves a shared count is not an offender (#5499)', c_evil_merge, False)
+    def c_plain_same(s, b): bump_f(s); s.commit('test: same bump as a plain commit'); return b + '..HEAD'
+    case('non-merge commit with the same bump is an offender (#5499)', c_plain_same, True, ['sections.len()  18 -> 19'])
+    def c_late_merge(s, b):                               # declaration read from a MERGE commit
+        o = offender(s, b)
+        s.g('checkout', '-q', '-b', 'side', b); s.touch('docs: side work'); s.g('checkout', '-q', 'main')
+        s.g('merge', '-q', '--no-ff', '-m', msg('merge side', late(o, S_FF)), 'side'); return b + '..HEAD'
+    case('declaration carried by a merge commit', c_late_merge, False)
+    def c_late_outside(s, b):
+        o = offender(s, b); s.touch('docs: declare outside the trailer block\n\n' + late(o, S_FF) + '\n\nclosing prose after the declaration\n'); return b + '..HEAD'
+    case('declaration phrase outside the trailer block', c_late_outside, True, ['18 -> 19'])
+    def c_late_middle(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare in the body', None, late(o, S_FF) + '\nmore prose on the next line')); return b + '..HEAD'
+    case('declaration in a prose paragraph', c_late_middle, True, ['18 -> 19'])
+    def c_late_stack(s, b):                               # the offender is below the range start: neutral
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF))); return o + '..HEAD'
+    case('stacked-PR offender outside the range is neutral', c_late_stack, False, [], ['outside the range'])
+    def c_late_stack2(s, b):
+        offender(s, b); s.touch('docs: unrelated'); return 'HEAD~1..HEAD'
+    case('an undeclared offender outside the range is not required', c_late_stack2, False)
+    def c_late_badgood(s, b):
+        o = offender(s, b)
+        s.touch(msg('docs: declare badly', late(o, 'sections 17 -> 19 (fixture)'))); s.touch(msg('docs: declare correctly', late(o, S_FF))); return b + '..HEAD'
+    case('a bad declaration followed by a correct one', c_late_badgood, False, [], ['IGNORED'])
+    def c_late_nooff(s, b):
+        n = s.touch('docs: no count change'); s.touch(msg('docs: declare a non-offender', late(n, S_FF))); return b + '..HEAD'
+    case('a declaration naming a commit that changes no count is reported, not red', c_late_nooff, False, [], ['changes no count assertion'])
+    def c_late_malformed(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', D + o)); return b + '..HEAD'
+    case('a late declaration without items is malformed', c_late_malformed, True, ['18 -> 19'], ['IGNORED'])
+    def c_late_delete(s, b):
+        s.w('tests/f.rs', PAD + 'fn a() {}\n'); o = s.commit('test: drop assertion')
+        s.touch(msg('docs: declare', late(o, 'sections 18 -> (none) (removed)'))); return b + '..HEAD'
+    case('late declaration for a removed assertion, 18 -> (none)', c_late_delete, False)
+
+    def c_multival(s, b):                                 # one expression asserted with two literals: the set moves as a whole
+        s.w('tests/rec.rs', 'fn r() { assert_eq!(recs.len(), 2); assert_eq!(recs.len(), 3); }\n'); c1 = s.commit('test: new file')
+        s.w('tests/rec.rs', 'fn r() { assert_eq!(recs.len(), 3); assert_eq!(recs.len(), 4); }\n')
+        s.commit(msg('test: bump', 'Count: recs 2,3 -> 3,4 (fixture)')); return c1 + '..HEAD'
+    case('own Count: for an expression asserted with two literals, 2,3 -> 3,4', c_multival, False)
+    def c_bigrename(s, b):                                # more candidates than diff.renameLimit allows (-l0 is load-bearing)
+        s.g('config', 'diff.renameLimit', '3')
+        for i in range(8): s.w('tests/big/b%d.rs' % i, 'fn x%d() { let a = %d; }\n' % (i, i))
+        b2 = s.commit('base: many files')
+        for i in range(8): s.w('tests/big/n%d.rs' % i, 'fn y%d() { let a = %d; }\n' % (i, i + 7))
+        s.w('tests/g.rs', f_rs(19)); s.commit('test: copy and bump among many new files'); return b2 + '..HEAD'
+    case('copy plus bump in a commit with more candidates than diff.renameLimit', c_bigrename, True, ['sections.len()  18 -> 19'])
+    def c_nowhy(s, b): bump_f(s); s.commit(msg('test: bump', 'Count: sections 18 -> 19')); return b + '..HEAD'
+    case('own Count: without a (why) is still compared with the diff', c_nowhy, False)
+    def c_nowhy_none(s, b): s.w('tests/f.rs', PAD + 'fn a() {}\n'); s.commit(msg('test: drop', 'Count: sections 18 -> (none)')); return b + '..HEAD'
+    case('own Count: 18 -> (none) without a (why)', c_nowhy_none, False)
+
+    # ---- the two real carriers ---------------------------------------------------------------
+    def c_carrier_new(s, b):                              # 7bf6d358a: new test file, src edit, changelog fragment
+        s.w('src/cost/postgres.rs', 'pub fn cost() -> usize { 1 }\n'); s.w('changelog.d/3946.fixed.md', 'x\n')
+        s.w('tests/containment_relational_3946.rs', 'fn t() { assert_eq!(rewound.len(), 3); assert_eq!(stamped.len(), 2); }\n')
+        s.commit(msg('fix(#3946): read relational lineage', 'Closes #3946')); return b + '..HEAD'
+    case('carrier 7bf6d358a shape: new test file with new assertions', c_carrier_new, False)
+    def c_carrier_none(s, b):                             # d478016b7: (none) -> 1 in an existing test file
+        s.w('tests/k7.rs', K7_RS + 'fn k2() { assert_eq!(signed.len(), 1); }\n'); s.w('src/subscriptions.rs', 'pub fn s() {}\n')
+        s.commit(msg('fix(#3941): snapshot the secret', 'Closes #3941')); return b + '..HEAD'
+    case('carrier d478016b7 shape: (none) -> 1 in an existing file, undeclared', c_carrier_none, True, ['signed.len()  (none) -> 1'])
+    def c_carrier_late(s, b):
+        s.w('tests/k7.rs', K7_RS + 'fn k2() { assert_eq!(signed.len(), 1); }\n'); o = s.commit(msg('fix(#3941): snapshot the secret', 'Closes #3941'))
+        s.touch(msg('docs: declare', late(o, 'signed (none) -> 1 (new pin)'))); return b + '..HEAD'
+    case('carrier d478016b7 shape, declared late', c_carrier_late, False)
+
+    shutil.rmtree(root, ignore_errors=True)
+    return state['bad']
+
+
+mode = sys.argv[1] if len(sys.argv) > 1 else ''
+if mode == 'check':
+    rc, out, err = check_range(sys.argv[2])
+    for line in out: print(line)
+    sys.stdout.flush()
+    for line in err: print(line, file=sys.stderr)
+    sys.exit(rc)
+if mode == 'selftest':
+    sys.exit(selftest())
+sys.exit(2)
 PY
 }
 
-check_range() { # $1 = A..B ; prints findings; returns 1 on any
-  local fail=0 c
-  for c in $(git rev-list --no-merges "$1"); do
-    local hits; hits=$(count_changes "$c" | head -8)
-    [ -z "$hits" ] && continue
-    git log -1 --format=%B "$c" | grep -qE "$NOTE_RE" && continue
-    echo "  $(git rev-parse --short "$c")  $(git log -1 --format=%s "$c" | cut -c1-70)"
-    printf '%s\n' "$hits" | sed 's/^/      /' | cut -c1-140
-    fail=1
-  done
-  return $fail
-}
+check_range() { gate_py check "$1"; } # $1 = A..B ; findings on stdout, reports on stderr, rc 1 on any red
 
 if [ "$SELF_TEST" -eq 1 ]; then
-  # SELF-CONTAINED FIXTURES (no history dependency): a single-line bump, the
-  # rustfmt THREE-LINE shape where only the number's line changes, the
-  # named-const shape, and the same changes DECLARED. Scratch under
-  # .local-runs/, never /tmp.
-  T=.local-runs/count-selftest; rm -rf "$T"; mkdir -p "$T" || { echo "self-test: cannot create $T"; exit 1; }
-  (
-    cd "$T" || exit 1
-    git init -q . && git config user.name g && git config user.email g@x
-    mkdir -p tests
-    printf 'fn a() { assert_eq!(sections.len(), 18); }\n' > tests/f.rs
-    printf 'fn b() {\n    assert_eq!(\n        report.minimal_sections_with_a_deliberately_long_name.len(),\n        5\n    );\n}\n' > tests/multi.rs
-    printf 'const EXPECTED_SECTIONS: usize = 18;\nfn c() { assert_eq!(report.sections.len(), EXPECTED_SECTIONS); }\n' > tests/named.rs
-    printf 'fn d() { let n = 3; assert_eq!(items.len(), n); assert!(msg.contains("len() = 4")); }\n' > tests/ctrl.rs
-    git add -A && git commit -q -m "base"
-    # (1) single-line undeclared bump -> flagged
-    printf 'fn a() { assert_eq!(sections.len(), 19); }\n' > tests/f.rs
-    git commit -q -am "test: bump sections"
-    # (2) rustfmt three-line shape: ONLY the number's line changes -> flagged
-    printf 'fn b() {\n    assert_eq!(\n        report.minimal_sections_with_a_deliberately_long_name.len(),\n        6\n    );\n}\n' > tests/multi.rs
-    git commit -q -am "test: bump minimal sections (multi-line)"
-    # (3) named const bump -> flagged
-    printf 'const EXPECTED_SECTIONS: usize = 19;\nfn c() { assert_eq!(report.sections.len(), EXPECTED_SECTIONS); }\n' > tests/named.rs
-    git commit -q -am "test: bump named const"
-    # (4) CONTROL: a variable rhs and a string literal mentioning len() -> NOT a count change
-    printf 'fn d() { let n = 4; assert_eq!(items.len(), n); assert!(msg.contains("len() = 5")); }\n' > tests/ctrl.rs
-    git commit -q -am "test: control edits"
-    # (5) the same three shapes WITH a declaration -> pass
-    printf 'fn a() { assert_eq!(sections.len(), 20); }\n' > tests/f.rs
-    printf 'fn b() {\n    assert_eq!(\n        report.minimal_sections_with_a_deliberately_long_name.len(),\n        7\n    );\n}\n' > tests/multi.rs
-    printf 'const EXPECTED_SECTIONS: usize = 20;\nfn c() { assert_eq!(report.sections.len(), EXPECTED_SECTIONS); }\n' > tests/named.rs
-    git commit -q -am "test: bump all three, declared" -m "Count: sections 19 -> 20, minimal 6 -> 7, EXPECTED_SECTIONS 19 -> 20 (fixture)"
-  ) || { echo "count-assertion-declared self-test: FAIL — fixture setup"; rm -rf "$T"; exit 1; }
-  bad=0
-  expect_red() { # $1 range $2 needle $3 label
-    local out; out=$( cd "$T" && check_range "$1" ); local rc=$?
-    if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q -- "$2"; then echo "  [FAIL] expected RED: $3 — $out"; bad=1; else echo "  ok   RED: $3"; fi
-  }
-  expect_green() { # $1 range $2 label
-    local out; out=$( cd "$T" && check_range "$1" ); local rc=$?
-    if [ $rc -ne 0 ]; then echo "  [FAIL] expected GREEN: $2 — $out"; bad=1; else echo "  ok   GREEN: $2"; fi
-  }
-  expect_red   HEAD~5..HEAD~4 'sections.len()  18 -> 19'  'single-line undeclared bump'
-  expect_red   HEAD~4..HEAD~3 'long_name.len()  5 -> 6'    'rustfmt three-line shape, only the number line in the diff'
-  expect_red   HEAD~3..HEAD~2 'EXPECTED_SECTIONS'          'named-const bump (assert names the const, the const literal moved)'
-  expect_green HEAD~2..HEAD~1 'variable rhs + a string literal mentioning len() are not count changes'
-  expect_green HEAD~1..HEAD   'the same three shapes, declared with a Count: trailer'
-  rm -rf "$T"
+  # SELF-CONTAINED FIXTURES (no history dependency): scratch repositories under
+  # .local-runs/count-selftest, never /tmp, one per case; every case builds its own
+  # base, offender and declarations, so no case depends on another.
+  gate_py selftest; bad=$?
   # REFUSAL LEGS (Conductor ruling, #3688 c5660422072): "clean" must mean examined-and-found-nothing,
   # never could-not-look. Re-invoke this script with (a) a range whose start does not resolve and
   # (b) GIT_DIR pointed at a non-repository (the git-less-export shape): both must REFUSE, exit 2,
   # and neither may print "clean".
   SELF_PATH=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  # The detection flags are pinned by their literal text: -C implies -M and --find-copies-harder implies -C
+  # in git, so dropping one alone changes no behaviour and no fixture can tell; the three are listed
+  # explicitly because the #5518 decision names them, and this pin keeps the list whole.
+  grep -qE "DIFF_FLAGS = \\['-M', '-C', '--find-copies-harder'\\]" "$SELF_PATH" || { echo "  [FAIL] DIFF_FLAGS must list -M -C --find-copies-harder (#5518)"; bad=1; }
   r_out=$(bash "$SELF_PATH" --range nosuch-3688..HEAD 2>&1); r_rc=$?
   g_out=$(GIT_DIR=/nonexistent-3688 bash "$SELF_PATH" 2>&1); g_rc=$?
   refuse_ok=1
   { [ "$r_rc" -eq 2 ] && printf '%s' "$r_out" | grep -q REFUSED && ! printf '%s' "$r_out" | grep -q ': clean'; } || refuse_ok=0
   { [ "$g_rc" -eq 2 ] && printf '%s' "$g_out" | grep -q REFUSED && ! printf '%s' "$g_out" | grep -q ': clean'; } || refuse_ok=0
   [ "$refuse_ok" -eq 1 ] || { echo "count-assertion-declared self-test: FAIL — an uncomputable range or a non-repository did not REFUSE (rc=$r_rc/$g_rc): $r_out | $g_out"; exit 1; }
-  [ $bad -eq 0 ] && { echo "count-assertion-declared self-test: PASS (whole-file assertion sets: single-line, rustfmt multi-line and named-const bumps RED; variable rhs and string mentions GREEN; declared bumps GREEN; fixtures synthesised, no history dependency; an uncomputable range or a non-repository is REFUSED, never clean)"; exit 0; }
+  [ "$bad" -eq 0 ] && { echo "count-assertion-declared self-test: PASS (whole-file assertion sets; rename/copy-aware new-file skip; own Count: and late Count-Declared: trailers compared with the diff for every hit; fixtures synthesised, no history dependency; an uncomputable range or a non-repository is REFUSED, never clean)"; exit 0; }
   echo "count-assertion-declared self-test: FAIL"; exit 1
 fi
 
@@ -185,8 +604,11 @@ assertion without declaring it (range: $RANGE).
 Two branches that each bump the same count auto-merge to the SAME wrong number
 with no conflict (chain 12: #3124 + #3651 both wrote 19; the truth was 20). The
 merger can only re-derive the total if every bump is DECLARED. Add to the
-commit message:
+commit's trailer block (the last paragraph of the message):
     Count: <what> <old> -> <new> (<why>)
+or, from a LATER commit of the same range (the range cannot be rewritten):
+    Count-Declared: <40-char sha of the offender> <what> <old> -> <new> (<why>)
+<old> and <new> must equal the finding above for EVERY changed assertion.
 MSG
   exit 1
 fi

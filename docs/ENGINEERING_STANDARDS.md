@@ -103,7 +103,7 @@ Every PR must pass these gates before merge:
 
 Contributors are responsible for the first ten gates (four cargo + six
 script gates wired into `.github/workflows/c8-precheck.yml` — see
-[CLAUDE.md §"Lint gates (issue #1174 PR10)"](../CLAUDE.md)). Maintainers perform the
+[docs/reference/CODE_STYLE.md §"Lint gates (issue #1174 PR10)"](reference/CODE_STYLE.md)). Maintainers perform the
 functional test, security review, and documentation sync verification during PR review.
 
 ---

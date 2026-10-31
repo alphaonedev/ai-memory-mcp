@@ -30,6 +30,15 @@ use super::federation_signing_check::verify_get_signature_or_reject;
 #[cfg(feature = "sal")]
 use super::{StorageBackend, store_err_to_response};
 
+/// WARN text logged when `/sync/since` refuses a peer that has no scope
+/// allowlist row. It must name the consequence of the trust-peer bypass and
+/// must not present it as a normal remedy (#8290).
+const SYNC_SINCE_NO_SCOPE_REFUSAL: &str = "sync_since: no scope allowlist for peer; refusing to return rows. \
+     Enroll the peer in AI_MEMORY_FED_PEER_ATTESTATION. \
+     AI_MEMORY_FED_SYNC_TRUST_PEER=1 disables the scope allowlist for this endpoint, leaving mTLS \
+     as the only guarantee, and the enterprise posture check reports it as a weakening; use it \
+     only for a legacy-peer migration window.";
+
 /// #2441 — compute the honest PULL CURSOR for one `/sync/since` page.
 ///
 /// `examined` is the row set the SQL `LIMIT` returned, **before** the
@@ -293,8 +302,7 @@ pub async fn sync_since(
         tracing::warn!(
             target: crate::federation::SCOPE_TRACE_TARGET,
             peer = %peer_header.as_deref().unwrap_or(""),
-            "sync_since: no scope allowlist for peer; refusing to return rows. \
-             Set AI_MEMORY_FED_SYNC_TRUST_PEER=1 to opt out (legacy peers)."
+            "{SYNC_SINCE_NO_SCOPE_REFUSAL}"
         );
         return (
             StatusCode::OK,
@@ -574,5 +582,34 @@ mod next_since_watermark_tests {
     fn full_page_all_dropped_holds_cursor() {
         let examined: Vec<Memory> = Vec::new();
         assert_eq!(next_since_watermark(&examined, 5, 5), None);
+    }
+}
+
+#[cfg(test)]
+mod refusal_hint_8290_tests {
+    use super::SYNC_SINCE_NO_SCOPE_REFUSAL;
+
+    /// #8290: the refusal text must name the consequence of the trust-peer
+    /// bypass (mTLS becomes the only guarantee, the posture check flags it)
+    /// and must not present the flag as a normal opt-out.
+    #[test]
+    fn refusal_hint_does_not_endorse_trust_peer_bypass_8290() {
+        let text = SYNC_SINCE_NO_SCOPE_REFUSAL;
+        assert!(
+            !text.contains("opt out"),
+            "hint must not recommend the bypass: {text}"
+        );
+        assert!(
+            text.contains("disables"),
+            "hint must name the consequence: {text}"
+        );
+        assert!(
+            text.contains("mTLS"),
+            "hint must name the remaining guarantee: {text}"
+        );
+        assert!(
+            text.contains("posture"),
+            "hint must mention the posture finding: {text}"
+        );
     }
 }

@@ -308,7 +308,8 @@ pub struct Metrics {
     /// quarantined row under target `federation.quarantine.unattributed`
     /// (a quarantine is a discrete security event, logged each time).
     /// **Always zero when the
-    /// quarantine knob is OFF (the default)** — the counter only moves on
+    /// quarantine knob is OFF (the `singleton`/`team` shapes unless set; the
+    /// `federated`, `hive` and `production` shapes force it on)** — the counter only moves on
     /// an actual quarantine, so a non-zero value means a peer relayed
     /// provenance-less content that this node is now black-holing until
     /// dequarantine. Closes the #2444 silent-hide anti-pattern (the
@@ -323,6 +324,12 @@ pub struct Metrics {
     /// v1.0.0 #4304 — monotonic count of forensic appends made WITHOUT the
     /// cross-process `forensic.lock` (it could not be opened or locked).
     pub forensic_lock_unavailable: IntCounter,
+
+    /// #7281 (ERRORS-19) - monotonic count of audit anchors dropped unrecorded
+    /// because their append ran in a raw transaction with no `WriteTxn` frame.
+    /// Under-emission only, never a false verdict; non-zero names a caller
+    /// that must move onto `WriteTxn`.
+    pub audit_anchor_frameless_drop: IntCounter,
 
     /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
     /// federated memories folded into a LOCAL row of a DIFFERENT id by the
@@ -1129,6 +1136,15 @@ impl Metrics {
             &mut err,
         );
 
+        let audit_anchor_frameless_drop = int_counter(
+            &registry,
+            "ai_memory_audit_anchor_frameless_drop_total",
+            "Monotonic count of audit anchors dropped unrecorded because the append \
+             ran in a raw transaction with no WriteTxn frame (#7281). The next due \
+             append re-anchors the head; non-zero names a caller to move onto WriteTxn.",
+            &mut err,
+        );
+
         // v1.0.0 #4199 — the forensic sink was unavailable at boot (no fork).
         let forensic_sink_unavailable = int_counter(
             &registry,
@@ -1157,7 +1173,7 @@ impl Metrics {
              route-IN provenance gate (AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED): \
              an unattributed row stored with lifecycle_state=quarantined and \
              hidden from every local read/egress lane until dequarantine. \
-             Always zero when the quarantine knob is off (the default); a \
+             Always zero when the quarantine knob is off (the singleton and team shapes unless set; the federated, hive and production shapes force it on); a \
              non-zero rate means a peer is relaying provenance-less content \
              this node is black-holing. #2966.",
             &mut err,
@@ -1583,6 +1599,7 @@ impl Metrics {
             federation_quarantined_unattributed,
             forensic_sink_unavailable,
             forensic_lock_unavailable,
+            audit_anchor_frameless_drop,
             federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
@@ -1755,6 +1772,11 @@ pub fn inc_forensic_sink_unavailable() {
 /// v1.0.0 #4304 — a forensic append ran without the cross-process lock.
 pub fn inc_forensic_lock_unavailable() {
     registry().forensic_lock_unavailable.inc();
+}
+
+/// #7281 - an audit anchor was dropped unrecorded (frameless raw transaction).
+pub fn inc_audit_anchor_frameless_drop() {
+    registry().audit_anchor_frameless_drop.inc();
 }
 
 /// v1.0.0 #4304 — read [`inc_forensic_lock_unavailable`]'s counter.

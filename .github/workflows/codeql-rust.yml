@@ -13,8 +13,12 @@ name: CodeQL
 on:
   push:
     branches: [main, "release/**"]
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "rehearsal/**", "chain/**"]
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
@@ -42,6 +46,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         if: matrix.language == 'rust'

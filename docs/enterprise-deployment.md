@@ -3,11 +3,11 @@ layout: doc
 ---
 # Enterprise deployment topologies for ai-memory v1.0.0
 
-> ## Certified trust boundary (canonical)
->
+## Certified trust boundary (canonical)
+
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
-> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
 
 > **Version currency.** This document was authored against v0.7.0 and
 > carries v0.7.0-era references throughout. It has been re-adjudicated
@@ -114,7 +114,7 @@ right when a constraint listed in the "use case" column is breached.
 |---|---|---|---|---|---|---|---|---|---|
 | **T1 — Singleton** | Solo developer; 1 NHI experimentation; offline | SQLite (WAL) | One process; one host | 1 | 1 | <10 ms | none | none | `ai-memory backup --keep 48` |
 | **T2 — Multi-agent / single server** | Engineering team (≤5 agents) on a shared workstation or single VM | SQLite (WAL) shared | Many agents → one daemon | 2–10 | 1 | <15 ms | none (local mTLS optional) | none | hourly local + weekly off-host |
-| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.6 + AGE 1.8.0 + pgvector 0.8.6 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
+| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.6 + AGE 1.8.0 + pgvector 0.8.7 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
 | **T4 — Multi-rack / same DC** | Production cluster with rack-affinity routing | Postgres primary + ≥1 streaming replicas; AGE on primary | Rack-affinity W-of-N; per-rack ai-memory replicas | 50–250 | 5–15 | <50 ms (cross-rack RTT) | mandatory | rack-aware W-of-N | pg_basebackup + WAL archive + rack-tagged snapshots |
 | **T5 — Multi-DC / same region** | Multi-AZ within a region; DR ready | Postgres primary + sync replica in second DC (or async-with-RPO) + AGE | Cross-DC federation peers; quorum spans DCs | 250–1000 | 15–50 | 50–150 ms (intra-region WAN) | mandatory | cross-DC W-of-N with quorum tuned for partition | pg_basebackup + WAL ship + off-region | 
 | **T6 — Multi-region / global** | Global product; data-residency requirements | Postgres + AGE **per region**; federation peers between regions | Regional clusters federate; local-first recall | 1000+ | 50–500 | <30 ms local recall; 150–500 ms global propagation | mandatory; per-region CA | regional clusters peer via signed `X-Memory-Sig` + `X-Memory-Nonce` | regional pg snapshots + cross-region object store |
@@ -160,7 +160,7 @@ tiers.
 | FTS | FTS5 virtual table (built-in) |
 | Vector index | In-memory HNSW (rebuilt asynchronously past `REBUILD_THRESHOLD`; see `src/hnsw.rs`) |
 | Embeddings | Optional MiniLM (cross-platform); CPU-only path used on mobile and headless servers |
-| Encryption-at-rest | Off by default; opt-in via `AI_MEMORY_ENCRYPT_AT_REST=1` + sqlcipher build (env #37 in `CLAUDE.md`) |
+| Encryption-at-rest | Off by default; opt-in via `AI_MEMORY_ENCRYPT_AT_REST=1` + sqlcipher build (env #37 in `docs/reference/ARCHITECTURE_REFERENCE.md`) |
 
 ### 2.3 Process model
 
@@ -465,7 +465,7 @@ production Dockerfile. Quick summary:
 |---|---|
 | PostgreSQL | **18.6** (canonical; SSOT `deploy/docker-1461/provision/lib.sh` `EXPECTED_PG_VERSION`). PG 16 + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.8.0** (canonical extversion; SSOT `EXPECTED_AGE_VERSION`) — overlaid via a pinned pgdg apt install on top of the `apache/age:release_PG18_1.7.0` base image (the Docker Hub image ships AGE 1.7.0; the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` bumps `age.control` to 1.8.0, so `CREATE EXTENSION age` reports extversion 1.8.0) |
-| pgvector | **0.8.6** (`PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`; Rust binding crate `pgvector = "0.4"`) |
+| pgvector | **0.8.7** (`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`; Rust binding crate `pgvector = "0.4"`) |
 | ai-memory build | `cargo build --release --features sal-postgres` |
 
 Bootstrap a fresh postgres backend with:
@@ -835,12 +835,12 @@ PgBouncer.
 > transaction-mode PgBouncer, you MUST also pin the envelope at the
 > Postgres role level so every backend inherits it as its server
 > default:**
->
-> ```sql
-> ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
-> ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
-> ```
->
+
+```sql
+ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
+ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
+```
+
 > Keep the two values in lockstep with the compiled
 > `DEFAULT_STATEMENT_TIMEOUT_SECS` / `DEFAULT_LOCK_TIMEOUT_SECS` (or
 > your `postgres_statement_timeout_secs` override) so the direct-connect
@@ -1237,7 +1237,7 @@ Concurrent writes from different agents are merged via the substrate's
 CRDT-lite vector-clock merge (`src/federation/vector_clock.rs`). The
 v0.7.0 schema also carries a `version` column on the Memory struct
 (schema v45, Gap-1 optimistic concurrency for `memory_update`; field
-26 of the current 30-field struct, `CLAUDE.md §"Data Model"`).
+26 of the current 30-field struct, `docs/reference/ARCHITECTURE_REFERENCE.md §"Data Model"`).
 
 For the swarm topology:
 
@@ -1417,7 +1417,7 @@ For an operator piloting a hive in v0.7.0, the responsible shape is:
    "one per region **or per tenant**", which contradicts §8.8 of this
    same document: *"if subsets of peers should NOT see each other's
    data, the swarm shape is wrong."* Cross-cluster federation replicates
-   **plaintext** memory content ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968))
+   **plaintext** memory content (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262))
    — every inbound write lane now consults
    `PeerScope.allowed_namespaces` under an enrolled posture
    (#2489/#2480, see [`federation.md`](federation.html) §"Layer 3 — Peer
@@ -1498,7 +1498,7 @@ for the AGE from-source recipe. The bundled
 `deploy/docker-1461/Dockerfile.pg-age-vector` (#1065) does NO source
 build — it overlays pinned pgdg `.deb`s on top of the
 `apache/age:release_PG18_1.7.0` base image: the server minor is bumped to
-PG 18.6, AGE to 1.8.0 (extversion), and pgvector 0.8.6 is installed — so
+PG 18.6, AGE to 1.8.0 (extversion), and pgvector 0.8.7 is installed — so
 K8s / ECS / Cloud Run users don't have to build AGE themselves.
 
 Permissions:
@@ -1551,7 +1551,7 @@ Retention sizing reference:
 
 **Pin AGE to a specific minor.** The v1.0.0 reference builds on the
 `apache/age:release_PG18_1.7.0` base image but pins AGE to **1.8.0**
-(extversion) and pgvector to **0.8.6** via the bundled
+(extversion) and pgvector to **0.8.7** via the bundled
 `Dockerfile.pg-age-vector` apt overlay (SSOT `provision/lib.sh`
 `AGE_APT_VERSION` / `PGVECTOR_APT_VERSION`). Do not let your Postgres
 host's apt-update silently upgrade AGE across a minor — the Cypher
@@ -1971,7 +1971,7 @@ auditing against it does not conclude they are unset:
 - [ ] `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — **defaults ON** for a *detected*-stale peer policy epoch (absent/undeterminable is fail-open by design).
 
 Each has a documented staged-rollout escape hatch; see the env-var table
-in `CLAUDE.md` for the exact grammar and the per-knob caveats. Setting
+in `docs/reference/ARCHITECTURE_REFERENCE.md` for the exact grammar and the per-knob caveats. Setting
 any of them falsy is a deliberate, time-boxed rollout decision — record
 it, and flip it back.
 
@@ -1989,7 +1989,7 @@ it, and flip it back.
 ### 14.6 At-rest encryption (regulated workloads)
 
 > ⚠️ **At-rest encryption is NOT end-to-end across federation**
-> ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)).
+> (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)).
 > Federation catch-up **decrypts** content and the receiving peer
 > **re-seals under its own per-node key**, so a federated peer holds
 > **plaintext transiently at apply time**, and the ciphertext at rest on
@@ -2084,7 +2084,7 @@ configuration.
 > [`compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md);
 > where this checklist and that document disagree, the certification
 > document supersedes. Federation is **not** end-to-end encrypted
-> (#1968) — see §14.6.
+> (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)) — see §14.6.
 
 ### 14.10 Cross-references
 

@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "_comment": "First matching rule (lowest priority number) wins per path; selections are unioned over paths. Job key ALL forces the full matrix. A rust key also resolves the owning crate and its reverse-dependency closure. cell_crates names workspace crates whose change adds the cells key; this workspace has one crate (ai-memory), so the SAL and storage code is selected by cell_globs instead. The sal, sal-postgres and vectorlite cfgs are spread across 587 src/ and tests/ files (8240 F3), so every Rust source tree maps to cells; no file is excepted. scripts/ci/** and the check scripts judge CI itself, so they select ALL. Markdown compiled in by include_str!/include_bytes! is found by build_index and selects rust. The cargo_skip section (8322) is read by cargo_skip.py in the classify job: a path is skippable only when it matches skip_globs and neither never_skip_globs nor test_read_globs; test_read_globs is proven complete against the Rust sources by scripts/ci/tests/test_impact_cargo_skip_8322.py.",
+  "known_jobs": [
+    "rust", "cells", "python", "actionlint", "isolation-smoke", "docs",
+    "codeql", "signatures", "leakscan", "banned-phrases"
+  ],
+  "always_on": ["codeql", "signatures", "leakscan", "banned-phrases"],
+  "force_all_base_prefixes": ["release/"],
+  "force_all_base_names": ["main", "develop"],
+  "cell_crates": [],
+  "cell_globs": [
+    "src/**", "tests/**", "benches/**", "crates/**", "migrations/**"
+  ],
+  "tag_skip_jobs": ["dockerfile-validate"],
+  "cargo_skip": {
+    "version": 1,
+    "skip_globs": ["scripts/ci/tests/**", "docs/**", "**/*.md"],
+    "docs_globs": ["docs/**", "**/*.md"],
+    "never_skip_globs": [
+      "src/**", "tests/**", "benches/**", "crates/**", "examples/**", "migrations/**",
+      "**/Cargo.toml", "**/Cargo.lock", "**/build.rs", "**/rust-toolchain*", "**/deny.toml",
+      ".github/**", "**/Dockerfile*", "**/*.sh", "scripts/*.py", "scripts/qc-allowlists/**",
+      "scripts/test/**", "scripts/ci/*", "scripts/ci/impact/**",
+      "scripts/ci/tests/test_pg_isolated_binary.py",
+      "scripts/ci/tests/test_retired_alias_walk_3627.py"
+    ],
+    "ci_tree_globs": [".github/**", "scripts/ci/**"],
+    "ci_tree_exempt_globs": ["scripts/ci/tests/**"],
+    "full_ci_events": ["push", "merge_group"],
+    "full_ci_base_names": ["main", "develop"],
+    "full_ci_base_prefixes": ["release/"],
+    "walk_guards": [
+      {
+        "rust": "tests/issue_3627_retired_llm_alias.rs",
+        "guard": "scripts/ci/tests/test_retired_alias_walk_3627.py",
+        "roots": ["src", "tools", "tests", "scripts", "docs", "changelog.d"]
+      }
+    ],
+    "test_read_globs": [
+      "CLAUDE.md", "CONTRIBUTING.md", "PERFORMANCE.md", "README.md", "ROADMAP.md",
+      "**/README.md",
+      "docs/API_REFERENCE.md", "docs/CLI_REFERENCE.md", "docs/USER_GUIDE.md",
+      "docs/benchmarks/longmemeval-reflection.md",
+      "docs/compliance/**", "docs/contracts/**", "docs/deploy/**",
+      "docs/governance/**", "docs/integrations/**", "docs/spec/PORTABILITY-V2.md",
+      "docs/rationale/academic-context.md",
+      "docs/reviews/branch-hygiene-3x7-2026-09-18.*",
+      "docs/reviews/issue-audit-3x7-r2-2026-09-18.md",
+      "docs/reviews/opus5-1x3-baml-paw-20260919-evidence/assessor-*.md",
+      "docs/v0.7.0/mtp-bench-2026-05-17.md", "docs/v070-changelog.html",
+      "docs/whats-new-v08.html",
+      "docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md",
+      "scripts/ci/tests/test_codeql_6163.py",
+      "conformance/**",
+      "scripts/ci/tests/test_check_cert_expiry_corpus.py",
+      "scripts/ci/tests/test_ci_select_gating_8240.py",
+      "scripts/ci/tests/test_impact_cargo_skip_8328.py"
+    ]
+  },
+  "job_map": {
+    "lint": "rust",
+    "msrv": "rust",
+    "check": "rust",
+    "vectorlite-feature": "rust",
+    "mobile-cross-compile": "rust",
+    "dockerfile-validate": "rust",
+    "postgres-feature": "cells",
+    "sal-feature": "cells",
+    "actionlint": "actionlint"
+  },
+  "rules": [
+    {"priority": 4, "glob": "scripts/ci/impact/rules.json", "jobs": ["ALL"]},
+    {"priority": 5, "glob": "scripts/ci/**", "jobs": ["ALL"]},
+    {"priority": 6, "glob": "scripts/check_*.py", "jobs": ["ALL"]},
+    {"priority": 7, "glob": "scripts/check-*.py", "jobs": ["ALL"]},
+    {"priority": 10, "glob": ".github/**", "jobs": ["ALL"]},
+    {"priority": 11, "glob": "scripts/ci/isolation*", "jobs": ["ALL"]},
+    {"priority": 12, "glob": "**/Cargo.toml", "jobs": ["ALL"]},
+    {"priority": 13, "glob": "**/Cargo.lock", "jobs": ["ALL"]},
+    {"priority": 14, "glob": "**/rust-toolchain*", "jobs": ["ALL"]},
+    {"priority": 15, "glob": "**/build.rs", "jobs": ["ALL"]},
+    {"priority": 16, "glob": "**/deny.toml", "jobs": ["ALL"]},
+    {"priority": 17, "glob": "scripts/**/*.sh", "jobs": ["ALL"]},
+    {"priority": 18, "glob": "scripts/test/**", "jobs": ["ALL"]},
+    {"priority": 20, "glob": "**/*.md", "jobs": ["docs"]},
+    {"priority": 21, "glob": "docs/**", "jobs": ["docs"]},
+    {"priority": 22, "glob": "site/**", "jobs": ["docs"]},
+    {"priority": 23, "glob": "mkdocs*", "jobs": ["docs"]},
+    {"priority": 30, "glob": "src/**", "jobs": ["rust"]},
+    {"priority": 31, "glob": "crates/**", "jobs": ["rust"]},
+    {"priority": 32, "glob": "tests/**", "jobs": ["rust"]},
+    {"priority": 33, "glob": "benches/**", "jobs": ["rust"]},
+    {"priority": 40, "glob": "scripts/**", "jobs": ["python", "actionlint", "isolation-smoke"]},
+    {"priority": 41, "glob": "**/*.py", "jobs": ["python", "actionlint", "isolation-smoke"]}
+  ]
+}

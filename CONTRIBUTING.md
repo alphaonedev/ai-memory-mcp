@@ -70,7 +70,7 @@ scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BL
 
 - All ten checks must pass. CI will reject PRs that fail any of them.
   The six script/workflow gates are wired into `.github/workflows/c8-precheck.yml`
-  alongside the four cargo gates. See [CLAUDE.md §"Lint gates (issue #1174 PR10)"](CLAUDE.md)
+  alongside the four cargo gates. See [docs/reference/CODE_STYLE.md §"Lint gates (issue #1174 PR10)"](docs/reference/CODE_STYLE.md)
   for the full contract + allowlist policy.
 - `AI_MEMORY_NO_CONFIG=1` prevents loading `~/.config/ai-memory/config.toml` which may trigger embedder/LLM initialization.
 - New code must include tests. Bug fixes should include a regression test.
@@ -177,7 +177,7 @@ the standing thresholds-rise-NEVER-fall discipline.
 1. Fork the repository (external contributors) or branch directly (collaborators).
 2. Create a feature branch from `develop` (`git checkout develop && git checkout -b feature/my-change`).
 3. Make your changes, following the code style and testing guidelines above.
-4. Ensure all ten gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the six script/workflow gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh`) — see [CLAUDE.md §"Lint gates"](CLAUDE.md).
+4. Ensure all ten gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the six script/workflow gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh`) — see [CODE_STYLE.md §"Lint gates"](docs/reference/CODE_STYLE.md).
 5. Push your branch and open a pull request against `develop` (not `main`).
 6. Fill out the PR description with what changed and why.
 7. Address any review feedback.

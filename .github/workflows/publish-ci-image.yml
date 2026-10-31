@@ -2,7 +2,7 @@
 # refs #2960 / #3089).
 #
 # WHAT THIS PUBLISHES. `.github/Dockerfile.ci` — one image that bakes the
-# CERTIFIED data tier (PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6,
+# CERTIFIED data tier (PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7,
 # the ONE TRUE triple from deploy/docker-1461/provision/lib.sh) PLUS the Rust
 # CI build deps the postgres-backed jobs `apt-get install` at job start (mold,
 # build-essential, jq, sqlite3, postgresql-client). Publishing it once and
@@ -61,6 +61,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Resolve certified stack pins + image tag from deploy SSOT
         run: |

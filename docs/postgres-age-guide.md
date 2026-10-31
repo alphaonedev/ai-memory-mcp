@@ -72,11 +72,11 @@ inventory, which is frozen against regression by
 |---|---|---|
 | PostgreSQL | **18.6** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.6`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.8.0** (canonical extversion) | Targets PG 18. Installed via the pinned pgdg apt package (`postgresql-18-age=1.8.0~rc0-2.pgdg13+1`, SSOT `EXPECTED_AGE_VERSION=1.8.0`) overlaid on the `apache/age:release_PG18_1.7.0` base — `CREATE EXTENSION age` reports extversion 1.8.0. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` or the pgdg apt package (see below). |
-| pgvector | **0.8.6** (canonical) | Faster HNSW; 0.8.3 fixed HNSW-vacuuming index corruption. SSOT: `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
+| pgvector | **0.8.7** (canonical) | Faster HNSW; 0.8.3 fixed HNSW-vacuuming index corruption. SSOT: `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
 | ai-memory | v0.9.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
 > **CI evidence (#2548 / #2512).** The **one true certified triple** —
-> PostgreSQL **18.6** + Apache AGE **1.8.0** + pgvector **0.8.6** — is
+> PostgreSQL **18.6** + Apache AGE **1.8.0** + pgvector **0.8.7** — is
 > exercised **in-PR on `release/**`** by
 > `.github/workflows/cert-postgres-age.yml`, which BUILDS the bundled
 > [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -84,7 +84,7 @@ inventory, which is frozen against regression by
 > declaration source — no literal is re-typed in the workflow), runs the
 > `#[ignore]`-gated postgres cells AND the AGE-backed cells against that built
 > image, and **hard-fails on ANY drift from the exact pinned minors** —
-> PostgreSQL 18.6, Apache AGE 1.8.0, pgvector 0.8.6, not merely "PG 18" or
+> PostgreSQL 18.6, Apache AGE 1.8.0, pgvector 0.8.7, not merely "PG 18" or
 > "AGE 1.8.x" — so the certified tier is proven by execution, never merely
 > claimed (2026-08-01 cutline ruling §5.4(3): "you cannot certify a tier CI
 > does not run"; standardized to PG 18.6 / AGE 1.8.0 by operator directive
@@ -100,7 +100,7 @@ pgvector (the `sal-postgres` Cargo feature pulls `dep:pgvector` which
 maps Rust vectors to Postgres `vector` columns), the repo ships a
 ready-made stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
-(#1065). It layers pgvector `0.8.6` (precompiled .deb from the pgdg apt
+(#1065). It layers pgvector `0.8.7` (precompiled .deb from the pgdg apt
 repo) onto the `apache/age:release_PG18_1.7.0` base AND upgrades AGE to
 `1.8.0` via the pinned pgdg `postgresql-18-age` package — no source build
 needed. Use this image for any deployment that backs ai-memory onto
@@ -132,8 +132,8 @@ sudo apt update
 sudo apt install -y postgresql-18 postgresql-server-dev-18 \
                     postgresql-contrib-18 build-essential bison flex git
 
-# 2. pgvector 0.8.6 from the upstream release tag.
-git clone --depth 1 --branch v0.8.6 https://github.com/pgvector/pgvector.git
+# 2. pgvector 0.8.7 from the upstream release tag.
+git clone --depth 1 --branch v0.8.7 https://github.com/pgvector/pgvector.git
 cd pgvector
 sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install
 cd ..
@@ -188,7 +188,7 @@ services:
 ```
 
 Plan C operators running on K8s / ECS / Cloud Run build this image
-once, tag it (`pg-age-vector:PG18.6-1.8.0-pgvector0.8.6`), and reference
+once, tag it (`pg-age-vector:PG18.6-1.8.0-pgvector0.8.7`), and reference
 the tag from their workload manifests instead of the bare upstream
 image.
 
@@ -345,7 +345,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v99 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v100 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -367,7 +367,7 @@ What it does (see `src/cli/schema_init.rs`):
    true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 90`) or the `--json` report.
+   `schema_version: 100`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -1437,7 +1437,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v78 | v78 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v100 | v100 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |
@@ -1464,7 +1464,7 @@ parity test is the gate that prevents it.
 ## References
 
 - Apache AGE 1.8.0 docs: https://age.apache.org/
-- pgvector 0.8.6 docs: https://github.com/pgvector/pgvector
+- pgvector 0.8.7 docs: https://github.com/pgvector/pgvector
 - ai-memory v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html)
 - A2A campaign Pages: https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/
 - Adapter-selection design: [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.html)
