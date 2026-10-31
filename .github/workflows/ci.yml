@@ -531,10 +531,13 @@ jobs:
       #              never honours it (it maps to __ALL__, #8338 round 4)
       #   __ALL__    foundational change OR fallback (full integration suite)
       #   <names>    space-separated tests/*.rs binary names to dispatch
-      # Consumed by the `Run tests` steps in `check` + `postgres-feature`.
-      # The consumer runs `cargo test --lib` plus the named binaries for a
-      # name list, and the full suite for __ALL__ or __SKIP__ (the step only
-      # runs when cargo_skip != true, where a skip is never legitimate).
+      # The ONLY reader is the `Run tests (impact-aware)` step in `check`
+      # (its TEST_IMPACT env); no other job or workflow reads it. That step
+      # only runs when cargo_skip != true, where a skip is never legitimate:
+      # it maps __SKIP__ to the full suite, accepts a name list only when
+      # every word names an existing tests/<word>.rs (round 5), and runs the
+      # full suite for __ALL__ or any rejected value. For an accepted list it
+      # runs `cargo test --lib` plus the named binaries.
       test_impact: ${{ steps.impact.outputs.test_impact }}
       test_impact_count: ${{ steps.impact.outputs.test_impact_count }}
       test_impact_total: ${{ steps.impact.outputs.test_impact_total }}
@@ -734,8 +737,10 @@ jobs:
           echo "cargo_skip_reason=$cargo_skip_reason" >> "$GITHUB_OUTPUT"
           echo "cls_base=$cls_base" >> "$GITHUB_OUTPUT"
           echo "impact_base=$impact_base" >> "$GITHUB_OUTPUT"
-      # v0.7.0 Task #12 (#1399) - compute the test-impact set. Always runs; the
-      # consumer steps decide whether to honour the output based on docs_only.
+      # v0.7.0 Task #12 (#1399) - compute the test-impact set. Always runs. Its
+      # one consumer, `Run tests (impact-aware)` in `check`, never honours
+      # __SKIP__ and accepts only validated existing test names (the boundary
+      # block there); the docs_only check below is a second layer.
       # scripts/ci-test-impact.sh is self-contained bash; its discipline and the
       # foundational list are documented inline there. Token SELECTION uses the
       # impact base (may be the incremental previous head). The foundational
@@ -771,9 +776,9 @@ jobs:
           # SECOND-ORDER FAIL-OPEN, closed here (#2496). Splitting the two
           # bases is NECESSARY BUT NOT SUFFICIENT, and this was caught by
           # probing the fix's own CI run rather than by reading it. The
-          # `__SKIP__` sentinel is a DOCS-ONLY VERDICT - the consumer steps
-          # (`Run tests (impact-aware)` in `check`, `pg_test` in
-          # `postgres-feature`) treat it as "no-op the test step". But
+          # `__SKIP__` sentinel is a DOCS-ONLY VERDICT - the consumer steps of
+          # that time treated it as "no-op the test step" (today the one
+          # consumer, `Run tests (impact-aware)`, never does). But
           # `ci-test-impact.sh` derives it from the INCREMENTAL base, so on a
           # code PR whose last push is docs-only it still emitted `__SKIP__`
           # even with `docs_only=false`. Measured on this very fix's first
@@ -785,10 +790,13 @@ jobs:
           # own copy of the same fail-open one layer down.
           #
           # A verdict the classifier did not reach must never be inferred from
-          # a narrower diff: `__SKIP__` is honoured ONLY when `docs_only` is
-          # genuinely true, and otherwise degrades to `__ALL__` (run more, not
-          # fewer). The selector runs with GITHUB_OUTPUT redirected to scratch
-          # so its emission is inspected BEFORE it can reach the real outputs.
+          # a narrower diff: this step passes `__SKIP__` through ONLY when
+          # `docs_only` is genuinely true, and otherwise degrades it to `__ALL__`
+          # (run more, not fewer). That is a second layer: the consumer maps
+          # `__SKIP__` to the full suite either way (it only runs when cargo_skip
+          # is not true, so a skip never reaches it legitimately). The selector
+          # runs with GITHUB_OUTPUT redirected to scratch so its emission is
+          # inspected BEFORE it can reach the real outputs.
           # Its stdout is captured too (never streamed raw into the log, where a
           # workflow command could be smuggled in).
           impact_out="${RUNNER_TEMP:-.}/ci-test-impact.out"
@@ -802,7 +810,10 @@ jobs:
           # value opener, a blank line, a foreign key, a control character)
           # makes the whole emission untrusted. The reason may also carry the
           # parentheses and percent sign of the selector's own summary text.
-          allow_re='^(test_impact|test_impact_count|test_impact_total)=[A-Za-z0-9_.,:/ +-]*$|^test_impact_reason=[A-Za-z0-9_.,:/ ()%+-]*$'
+          # test_impact itself carries only test names, sentinels and spaces
+          # (round 5: no dash, so no word can become a cargo option); the
+          # consumer re-checks every name against tests/*.rs either way.
+          allow_re='^test_impact=[A-Za-z0-9_ ]*$|^(test_impact_count|test_impact_total)=[A-Za-z0-9_.,:/ +-]*$|^test_impact_reason=[A-Za-z0-9_.,:/ ()%+-]*$'
           stray_rc=0
           grep -aEv "$allow_re" "$impact_out" > /dev/null || stray_rc=$?
           keys_ok=true
@@ -1555,7 +1566,9 @@ jobs:
       #   __ALL__   → `cargo test` (full suite, the v0.6.x posture)
       #   __SKIP__  → full suite (mapped to __ALL__ at the consumer; the
       #               step is gated on cargo_skip != true, #8338 round 4)
-      #   <names>   → `cargo test --lib --test t1 --test t2 ...`
+      #   <names>   → `cargo test --lib --test t1 --test t2 ...`, only when
+      #               every word names an existing tests/<word>.rs; any
+      #               other value runs the full suite (#8338 round 5)
       # The `classify` job's foundational-fallback list (in
       # scripts/ci-test-impact.sh) HARD-FORCES __ALL__ on any change
       # to a cross-cutting surface (Cargo.toml, src/lib.rs, schema
@@ -1961,12 +1974,6 @@ jobs:
           RESULT_LOG="${RUNNER_TEMP:-/tmp}/test-output-${TIER:-sqlite}.log"
           echo "TEST_RESULT_LOG=$RESULT_LOG" >> "$GITHUB_ENV"
           run_all() {
-          echo "::group::test-impact decision"
-          echo "reason: ${TEST_IMPACT_REASON:-unset}"
-          echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
-          echo "impact: ${TEST_IMPACT:-unset}"
-          echo "::endgroup::"
-
           # #1492 hung-test watchdog. libtest has no built-in per-test
           # timeout, so a single wedged integration test (e.g. an ephemeral
           # TCP port-bind / wait_for_ready race) used to stall this step
@@ -2303,21 +2310,64 @@ jobs:
             return "$rc"
           }
 
-          # consumer-boundary-begin (#8338 class, round 4)
-          # The consumer is the trust boundary for the skip sentinel. This step
-          # only runs when cargo_skip != 'true', and docs_only implies
-          # cargo_skip, so a `__SKIP__` arriving here is never a legitimate
-          # docs-only verdict: the PR-tree selector runs in the `impact` step and
-          # a hostile one can reach that step's real output file. Map it to the
-          # full suite whatever DOCS_ONLY says (the value is logged only).
+          # consumer-boundary-begin (#8338 class, rounds 4 and 5)
+          # This step is the trust boundary for the test selection. It only runs
+          # when cargo_skip != 'true', and docs_only implies cargo_skip, so a
+          # `__SKIP__` arriving here is never a legitimate docs-only verdict: the
+          # PR-tree selector runs in the `impact` step and a hostile one can
+          # reach that step's real output file. (1) `__SKIP__` maps to the full
+          # suite whatever DOCS_ONLY says (the value is logged only). (2) Any
+          # other value except `__ALL__` must be a list of existing integration
+          # test names: only letters, digits, underscores and spaces, split with
+          # globbing off, every word matching ^[A-Za-z0-9_]+$ and naming a
+          # tests/<word>.rs file. Anything else runs the full suite: a word that
+          # starts with a dash would reach cargo as an option, a star would glob
+          # to file names, a newline would carry a second line into the log.
+          # Rejected words are counted, never echoed. Nothing above this block
+          # may read TEST_IMPACT; the decision log below prints the result only.
           # decision: consumer boundary over step isolation, because PR-tree code
           # runs inside the impact step and cannot be walled off from its outputs.
+          # decision: allow-list of existing test names over quoting alone,
+          # because a quoted word that starts with a dash is still an option to cargo.
           if [ "${TEST_IMPACT:-}" = "__SKIP__" ]; then
             echo "::notice::impact-skip-overridden-at-consumer (docs_only=${DOCS_ONLY:-unset}) - running the full suite (fail closed)"
             echo "decision: __SKIP__ is never honoured in the cargo_skip-gated test step; full suite"
             TEST_IMPACT="__ALL__"
           fi
+          impact_rejected=0
+          impact_charset=ok
+          impact_words=()
+          if [ -z "${TEST_IMPACT:-}" ] || [ "$TEST_IMPACT" = "__ALL__" ]; then
+            TEST_IMPACT="__ALL__"
+          else
+            case "$TEST_IMPACT" in
+              *[!A-Za-z0-9_\ ]*) impact_charset=rejected ;;
+            esac
+            set -f
+            IFS=$' \t\n' read -r -d '' -a impact_words <<< "$TEST_IMPACT" || true
+            set +f
+            for impact_word in ${impact_words[@]+"${impact_words[@]}"}; do
+              if ! [[ "$impact_word" =~ ^[A-Za-z0-9_]+$ ]] || [ ! -f "tests/${impact_word}.rs" ]; then
+                impact_rejected=$((impact_rejected + 1))
+              fi
+            done
+            if [ "$impact_charset" != "ok" ] || [ "$impact_rejected" -ne 0 ] || [ "${#impact_words[@]}" -eq 0 ]; then
+              echo "::notice::impact-selection-rejected-at-consumer (${impact_rejected} of ${#impact_words[@]} words rejected, charset ${impact_charset}) - running the full suite (fail closed)"
+              TEST_IMPACT="__ALL__"
+            else
+              TEST_IMPACT="${impact_words[*]}"
+            fi
+          fi
           # consumer-boundary-end
+          # Display only: the validated selection, and the three descriptive
+          # outputs with every character outside their allow-list class replaced.
+          impact_reason="${TEST_IMPACT_REASON:-unset}"
+          impact_count="${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
+          echo "::group::test-impact decision"
+          echo "reason: ${impact_reason//[!A-Za-z0-9_.,:\/ ()%+-]/?}"
+          echo "count:  ${impact_count//[!A-Za-z0-9_.,:\/ +-]/?}"
+          echo "impact: ${TEST_IMPACT}"
+          echo "::endgroup::"
           case "${TEST_IMPACT:-__ALL__}" in
             __ALL__|"")
               echo "::notice::running FULL test suite (tier=${TIER:-sqlite})"
@@ -2331,12 +2381,13 @@ jobs:
               fi
               ;;
             *)
-              # Always run --lib first (catches every inline unit test)
+              # Always run --lib first (catches every inline unit test). The
+              # names come from the validated array of the boundary block.
               echo "::notice::running cargo test --lib + impact-selected integration binaries (tier=${TIER:-sqlite})"
               if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
                 # #6344: same lib + impacted-binaries set, sharded.
                 ARGS=(--lib)
-                for t in $TEST_IMPACT; do
+                for t in "${impact_words[@]}"; do
                   ARGS+=(--test "$t")
                 done
                 run_sharded "impact-selected (sharded: ${TEST_IMPACT})" 0 "${ARGS[@]}"
@@ -2344,7 +2395,7 @@ jobs:
                 run_tests "cargo test --lib" $FEAT --lib $TAIL
                 # Dispatch each impacted tests/*.rs binary
                 ARGS=()
-                for t in $TEST_IMPACT; do
+                for t in "${impact_words[@]}"; do
                   ARGS+=(--test "$t")
                 done
                 run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL

@@ -54,7 +54,8 @@
       "scripts/ci/tests/test_codeql_6163.py",
       "conformance/**",
       "scripts/ci/tests/test_check_cert_expiry_corpus.py",
-      "scripts/ci/tests/test_ci_select_gating_8240.py"
+      "scripts/ci/tests/test_ci_select_gating_8240.py",
+      "scripts/ci/tests/test_impact_cargo_skip_8328.py"
     ]
   },
   "job_map": {

@@ -457,26 +457,23 @@ case "$CLS_ONLY" in
     *) ok "s18 the cls step output carries no test_impact key (they come from the impact step)" ;;
 esac
 
-# s19 (#8338 class, REVIEW-8328-code-r3 F1 / REVIEW-8328-security-r3 F1): the
-# consumer is the boundary. The only reader of the test_impact output is the
-# cargo_skip-gated `Run tests (impact-aware)` step; it has no `__SKIP__` arm,
-# and its boundary block maps the sentinel to the full suite whatever the
-# docs_only value says. Any new reader or any `__SKIP__` arm breaks this row.
-READERS="$(grep -c 'classify\.outputs\.test_impact }}' "$CI_YML")"
-SKIP_ARMS="$(grep -c '__SKIP__)' "$CI_YML" "$ROOT"/.github/workflows/coverage.yml | grep -vc ':0$' || true)"
-sed -n '/# consumer-boundary-begin/,/# consumer-boundary-end/p' "$CI_YML" | sed 's/^          //' > "$SCRATCH/consumer-boundary.sh"
-printf '%s\n' 'echo "RESULT=$TEST_IMPACT"' >> "$SCRATCH/consumer-boundary.sh"
-S19_OK=true
-for s19_docs in false true ""; do
-    S19_OUT="$(env TEST_IMPACT=__SKIP__ DOCS_ONLY="$s19_docs" bash --noprofile --norc -eo pipefail "$SCRATCH/consumer-boundary.sh" 2>&1 || true)"
-    case "$S19_OUT" in
-        *impact-skip-overridden-at-consumer*RESULT=__ALL__) ;;
-        *) S19_OK=false ;;
-    esac
-done
-[ "$READERS" = "1" ] && [ "$SKIP_ARMS" = "0" ] && [ "$S19_OK" = "true" ] \
-    && ok "s19 every test_impact consumer maps __SKIP__ to the full suite (one reader, no skip arm, boundary block resolves to __ALL__)" \
-    || bad "s19 the test consumer must never honour __SKIP__" "readers=$READERS skip_arms=$SKIP_ARMS boundary_ok=$S19_OK"
+# s19 (#8338 class; REVIEW-8328-*-r3 F1, REVIEW-8328-*-r4 F1/F2): the consumer
+# is the boundary, and it is tested as the WHOLE step, not an extracted block.
+# The consumer-check mode of scripts/ci/tests/test_impact_cargo_skip_8328.py
+# runs the entire `Run tests (impact-aware)` step with a fake cargo on PATH
+# for every selection shape (__SKIP__ with any docs_only, a name list, a word
+# that starts with a dash, a glob, a newline, an unknown name) and compares
+# the cargo argv with the full-suite or lib-plus-names argv. It also checks
+# the exact step if:, the single reader of test_impact in any spacing or index
+# form (if:, env:, with:), that nothing reads the selection before the
+# boundary, that no exit or return sits between the boundary and the
+# dispatch, and that the dispatch has exactly two arms.
+S19_RC=0
+S19_OUT="$(python3 -I "$ROOT/scripts/ci/tests/test_impact_cargo_skip_8328.py" consumer-check 2>&1)" || S19_RC=$?
+S19_CLEAN="$(printf '%s\n' "$S19_OUT" | grep -cE '^consumer-check rows=[1-9][0-9]* problems=0$' || true)"
+[ "$S19_RC" = "0" ] && [ "$S19_CLEAN" = "1" ] \
+    && ok "s19 the whole test step maps __SKIP__ and every unvalidated selection to the full suite and runs only existing test names (every row and shape check clean)" \
+    || bad "s19 the test consumer must run only validated existing test names" "rc=$S19_RC $(printf '%s\n' "$S19_OUT" | grep -E '^(problem|consumer-check)' | head -5 | tr '\n' ' ')"
 
 # s20 (REVIEW-8328-code-r3 F2, REVIEW-8328-security-r3 F2/INFO-a): the impact
 # step defuses workflow commands in the selector's STDOUT, and a long selector

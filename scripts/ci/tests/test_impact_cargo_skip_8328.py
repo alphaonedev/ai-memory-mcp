@@ -32,6 +32,18 @@ Round 4 (REVIEW-8328-code-r3 F1/F2/INFO-2, REVIEW-8328-security-r3 F1/F2/INFO-a)
 11. The impact step's stdout defuse and its log truncation are exercised with
     selector stdout (not only selector output-file lines), under the runner's
     `-eo pipefail` flags.
+
+Round 5 (REVIEW-8328-code-r4 F1/F2/F3, REVIEW-8328-security-r4 F1/F2/INFO):
+
+12. The consumer accepts a selection only when every word, split with
+    globbing off, matches ^[A-Za-z0-9_]+$ and names an existing tests/<word>.rs;
+    anything else runs the full suite and the words are counted, never echoed.
+    The impact allow-list carries no dash in the test_impact value class.
+13. The consumer is tested as the WHOLE step with a fake cargo on PATH (also
+    the `consumer-check` mode the invariants harness runs), with its exact if:,
+    a single reader in any spacing or index form, nothing reading the selection
+    before the boundary, and exactly two dispatch arms.
+14. The cls verdict-shape guard forces false/false on a malformed verdict.
 """
 import json
 import os
@@ -68,6 +80,21 @@ RUNNER_BASH = ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c"]
 TEST_STEP_NAME = "- name: Run tests (impact-aware)"
 BOUNDARY_BEGIN = "# consumer-boundary-begin"
 BOUNDARY_END = "# consumer-boundary-end"
+DISPATCH_CASE = 'case "${TEST_IMPACT:-__ALL__}" in'
+DISPATCH_ARM = re.compile(r"^ {12}([^ #][^)\n]*\))", re.M)
+DISPATCH_ARMS = ('__ALL__|"")', "*)")
+STEP_IF = re.compile(r"^        if:\s*(.*)$")
+CONSUMER_IF = "needs.classify.outputs.cargo_skip != 'true'"
+EXPECTED_READER = ("ci.yml", "TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}")
+REJECTED = "impact-selection-rejected-at-consumer"
+WHOLE_STEP_NAMES = ("alpha_test", "beta_test")
+# Any spacing or index form of a property access: `.name` or `['name']`.
+_PROP = r"""\s*(?:\.\s*{0}|\[\s*['"]{0}['"]\s*\])"""
+READER_RE = re.compile("needs" + _PROP.format("classify") + _PROP.format("outputs")
+                       + _PROP.format("test_impact") + r"(?![A-Za-z0-9_-])")
+# The whole outputs object (toJSON, fromJSON) is a read of every key.
+WHOLE_OUTPUTS_RE = re.compile("needs" + _PROP.format("classify") + _PROP.format("outputs")
+                              + r"(?!\s*[.\[])")
 
 
 def job_lines(path: Path, job: str):
@@ -272,7 +299,8 @@ class ClsStepRunsNoWorkspaceCommand(unittest.TestCase):
     def test_impact_step_copies_only_allow_listed_lines(self):
         _, _, body = step_by_id(CI_YML, "impact")
         self.assertIn("allow_re=", body)
-        self.assertIn("test_impact|test_impact_count|test_impact_total", body)
+        self.assertIn("^test_impact=[A-Za-z0-9_ ]*$|", body)
+        self.assertIn("(test_impact_count|test_impact_total)=", body)
         self.assertIn("impact-output-rejected-fail-closed", body)
         self.assertEqual(body.count('cat "$impact_out" >> "$GITHUB_OUTPUT"'), 1)
 
@@ -351,6 +379,15 @@ class ImpactStepOutputAllowList(unittest.TestCase):
         values, _, _ = self.run_step(["test_impact=a;b"] + self.SELECTED[1:])
         self.assert_degraded(values, "impact-output-rejected-fail-closed")
 
+    def test_test_impact_value_class_has_no_dash_or_glob(self):
+        """Round 5 F1: test_impact admits only letters, digits, underscore and space."""
+        for value in ("alpha_test --no-default-features", "alpha_test *", "alpha.test", "a/b", "a,b"):
+            values, _, _ = self.run_step(["test_impact=%s" % value] + self.SELECTED[1:])
+            self.assert_degraded(values, "impact-output-rejected-fail-closed")
+        values, _, _ = self.run_step(["test_impact=__ALL__", "test_impact_count=ALL",
+                                      "test_impact_total=ALL", "test_impact_reason=x"])
+        self.assertEqual(values["test_impact_reason"], "x")
+
     def test_missing_or_duplicate_key_degrades_to_all(self):
         values, _, _ = self.run_step(self.SELECTED[:3])
         self.assert_degraded(values, "impact-output-rejected-fail-closed")
@@ -393,28 +430,202 @@ class ImpactStepOutputAllowList(unittest.TestCase):
             self.assertNotIn("selector noise line 201", stdout)
 
 
+def test_step_lines():
+    """Return (check-job lines, index of the Run tests (impact-aware) step)."""
+    lines = job_lines(CI_YML, "check")
+    for index, first in step_starts(lines):
+        if first == TEST_STEP_NAME:
+            return lines, index
+    raise AssertionError("no Run tests (impact-aware) step in the check job")
+
+
+def consumer_step_body():
+    """Return the run body of the Run tests (impact-aware) step."""
+    lines, index = test_step_lines()
+    return step_run_body(lines, index)
+
+
+def consumer_step_ifs():
+    """Return every step-level `if:` value of the Run tests step."""
+    lines, index = test_step_lines()
+    found = []
+    for line in lines[index + 1:]:
+        if STEP_HEADER.match(line):
+            break
+        match = STEP_IF.match(line)
+        if match:
+            found.append(match.group(1).strip())
+    return found
+
+
+def consumer_readers():
+    """Return (file, stripped line) for every read of the test_impact output."""
+    readers = []
+    for path in sorted(WORKFLOW_DIR.glob("*.y*ml")):
+        for line in path.read_text().splitlines():
+            if READER_RE.search(line) or WHOLE_OUTPUTS_RE.search(line):
+                readers.append((path.name, line.strip()))
+    return readers
+
+
+def dispatch_region(body: str):
+    """Return (code before the boundary, boundary through the case line, case arms)."""
+    begin = body.index(BOUNDARY_BEGIN)
+    case = body.index(DISPATCH_CASE)
+    end = body.index("\n          esac", case)
+    arms = [m.group(1) for m in DISPATCH_ARM.finditer(body[case:end])]
+    return body[:begin], body[begin:case], arms
+
+
+def consumer_shape_problems():
+    """Return the static problems of the test consumer (empty when sound)."""
+    problems = []
+    ifs = consumer_step_ifs()
+    if ifs != [CONSUMER_IF]:
+        problems.append("Run tests if: is %r, want exactly [%r]" % (ifs, CONSUMER_IF))
+    readers = consumer_readers()
+    if readers != [EXPECTED_READER]:
+        problems.append("test_impact readers are %r, want only %r" % (readers, EXPECTED_READER))
+    body = consumer_step_body()
+    before, boundary, arms = dispatch_region(body)
+    for line in code_lines(before):
+        if "TEST_IMPACT" in line or "__SKIP__" in line:
+            problems.append("selection read before the boundary: %s" % line.strip())
+    for line in code_lines(boundary):
+        if re.search(r"\b(exit|return)\b", line):
+            problems.append("exit or return between the boundary and the dispatch: %s" % line.strip())
+    if arms != list(DISPATCH_ARMS):
+        problems.append("dispatch arms are %r, want %r" % (arms, list(DISPATCH_ARMS)))
+    for path in sorted(WORKFLOW_DIR.glob("*.y*ml")):
+        if re.search(r"__SKIP__\)", path.read_text()):
+            problems.append("a __SKIP__ case arm in %s" % path.name)
+    return problems
+
+
+FAKE_CARGO = "#!%s -I\nimport json, sys\nwith open(%r, 'a') as log:\n    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+STEP_ENV_DROP = ("TEST_IMPACT", "TEST_IMPACT_REASON", "TEST_IMPACT_COUNT", "TEST_IMPACT_TOTAL",
+                 "DOCS_ONLY", "TIER", "CI_NODE", "JOB_T0", "HOST_SEMAPHORE_HELD",
+                 "CI_PG_ISOLATE_OFF", "AI_MEMORY_TEST_PG_ISOLATE", "TEST_RESULT_LOG")
+
+
+def run_whole_step(impact, docs_only="false", tier="sqlite"):
+    """Run the WHOLE Run tests step with a fake cargo; return (rc, argv list, output).
+
+    The scratch working directory holds tests/alpha_test.rs and
+    tests/beta_test.rs, so those are the only existing test names.
+    """
+    work = scratch_dir()
+    try:
+        (work / "tests").mkdir()
+        for name in WHOLE_STEP_NAMES:
+            (work / "tests" / ("%s.rs" % name)).write_text("")
+        (work / "bin").mkdir()
+        argv_log = work / "cargo-argv.jsonl"
+        fake = work / "bin" / "cargo"
+        fake.write_text(FAKE_CARGO % (sys.executable, str(argv_log)))
+        fake.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP}
+        env.update(PATH="%s%s%s" % (work / "bin", os.pathsep, os.environ.get("PATH", "")),
+                   TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="probe",
+                   HOST_SEMAPHORE_SLOTS="0", JOB_TIMEOUT_MIN="60", AI_MEMORY_NO_CONFIG="1",
+                   RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env"))
+        res = subprocess.run(RUNNER_BASH + [consumer_step_body()], cwd=str(work), env=env,
+                             capture_output=True, text=True, timeout=TIMEOUT_S)
+        argv = []
+        if argv_log.exists():
+            argv = [json.loads(line) for line in argv_log.read_text().splitlines()]
+        return res.returncode, argv, res.stdout + res.stderr
+    finally:
+        shutil.rmtree(str(work), ignore_errors=True)
+
+
+# (label, TEST_IMPACT, DOCS_ONLY, tier, expected selection, expected notice)
+WHOLE_STEP_ROWS = (
+    ("skip-docs-false", "__SKIP__", "false", "sqlite", "full", "impact-skip-overridden-at-consumer"),
+    ("skip-docs-true", "__SKIP__", "true", "sqlite", "full", "impact-skip-overridden-at-consumer"),
+    ("skip-docs-unset", "__SKIP__", "", "sqlite", "full", "impact-skip-overridden-at-consumer"),
+    ("skip-enterprise", "__SKIP__", "false", "enterprise-fed", "full", "impact-skip-overridden-at-consumer"),
+    ("all", "__ALL__", "false", "sqlite", "full", None),
+    ("blank", "", "false", "sqlite", "full", None),
+    ("names", "alpha_test beta_test", "false", "sqlite", "names", None),
+    ("names-enterprise", "alpha_test beta_test", "false", "enterprise-fed", "names", None),
+    ("dash-word", "alpha_test --no-default-features", "false", "sqlite", "full", REJECTED),
+    ("dash-only", "--release", "false", "sqlite", "full", REJECTED),
+    ("dash-enterprise", "alpha_test --no-default-features", "false", "enterprise-fed", "full", REJECTED),
+    ("glob-word", "alpha_test *", "false", "sqlite", "full", REJECTED),
+    ("newline", "alpha_test\nbeta_test", "false", "sqlite", "full", REJECTED),
+    ("tab", "alpha_test\tbeta_test", "false", "sqlite", "full", REJECTED),
+    ("no-such-test", "alpha_test missing_test", "false", "sqlite", "full", REJECTED),
+    ("unknown-sentinel", "__NONE__", "false", "sqlite", "full", REJECTED),
+    ("spaces-only", "   ", "false", "sqlite", "full", REJECTED),
+)
+NAME_ARGS = ["--test", "alpha_test", "--test", "beta_test"]
+SHARD_BUILD = ["test", "--no-run", "--message-format=json-render-diagnostics", "--features", "sal-postgres"]
+EXPECTED_ARGV = {
+    ("sqlite", "full"): [["test", "--no-run"], ["test", "--no-fail-fast"]],
+    ("sqlite", "names"): [["test", "--no-run", "--lib"], ["test", "--no-fail-fast", "--lib"],
+                          ["test", "--no-run"] + NAME_ARGS, ["test", "--no-fail-fast"] + NAME_ARGS],
+    # enterprise-fed shards after one build; the scratch tree has no
+    # partition script, so only the build argv (the selection) is compared.
+    ("enterprise-fed", "full"): [SHARD_BUILD],
+    ("enterprise-fed", "names"): [SHARD_BUILD + ["--lib"] + NAME_ARGS],
+}
+
+
+def whole_step_problem(row):
+    """Run one WHOLE_STEP_ROWS row; return a problem string, or None."""
+    label, impact, docs_only, tier, selection, notice = row
+    rc, argv, output = run_whole_step(impact, docs_only, tier)
+    want = EXPECTED_ARGV[(tier, selection)]
+    got = argv[:1] if tier == "enterprise-fed" else argv
+    if got != want:
+        return "%s: cargo argv %r, want %r (rc %d)" % (label, argv, want, rc)
+    if tier == "sqlite" and rc != 0:
+        return "%s: step rc %d" % (label, rc)
+    if notice and notice not in output:
+        return "%s: no %s notice" % (label, notice)
+    if notice is None and "-at-consumer" in output:
+        return "%s: unexpected consumer notice" % label
+    if notice == REJECTED and ("--no-default-features" in output or "--release" in output):
+        return "%s: a rejected word was echoed" % label
+    return None
+
+
+def consumer_check_main():
+    """CLI for the s19 invariant: run every whole-step row and the shape checks."""
+    problems = consumer_shape_problems()
+    for row in WHOLE_STEP_ROWS:
+        problem = whole_step_problem(row)
+        print("row %s: %s" % (row[0], problem or "ok"))
+        if problem:
+            problems.append(problem)
+    for problem in problems:
+        print("problem: %s" % problem)
+    print("consumer-check rows=%d problems=%d" % (len(WHOLE_STEP_ROWS), len(problems)))
+    return 1 if problems else 0
+
+
 class ConsumerBoundary(unittest.TestCase):
     """The test consumer never honours `__SKIP__` (REVIEW-8328-*-r3 F1)."""
 
-    @staticmethod
-    def consumer_step_body():
-        lines = job_lines(CI_YML, "check")
-        for index, first in step_starts(lines):
-            if first == TEST_STEP_NAME:
-                return step_run_body(lines, index)
-        raise AssertionError("no Run tests (impact-aware) step in the check job")
-
     def boundary_block(self):
-        body = self.consumer_step_body()
+        body = consumer_step_body()
         self.assertIn(BOUNDARY_BEGIN, body)
         return body[body.index(BOUNDARY_BEGIN):body.index(BOUNDARY_END)]
 
     def resolve(self, impact, docs_only):
-        """Run the boundary block; return (final TEST_IMPACT, stdout)."""
-        script = "set -u\n%s\necho \"RESULT=$TEST_IMPACT\"\n" % self.boundary_block()
-        env = dict(os.environ, TEST_IMPACT=impact, DOCS_ONLY=docs_only)
-        res = subprocess.run(RUNNER_BASH + [script], env=env, capture_output=True,
-                             text=True, timeout=TIMEOUT_S)
+        """Run the boundary block in a tree with two tests; return (TEST_IMPACT, stdout)."""
+        work = scratch_dir()
+        try:
+            (work / "tests").mkdir()
+            for name in WHOLE_STEP_NAMES:
+                (work / "tests" / ("%s.rs" % name)).write_text("")
+            script = "set -u\n%s\necho \"RESULT=$TEST_IMPACT\"\n" % self.boundary_block()
+            env = dict(os.environ, TEST_IMPACT=impact, DOCS_ONLY=docs_only)
+            res = subprocess.run(RUNNER_BASH + [script], cwd=str(work), env=env,
+                                 capture_output=True, text=True, timeout=TIMEOUT_S)
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         result = [l for l in res.stdout.splitlines() if l.startswith("RESULT=")][0]
         return result[len("RESULT="):], res.stdout
@@ -430,24 +641,108 @@ class ConsumerBoundary(unittest.TestCase):
         for impact in ("__ALL__", "alpha_test beta_test"):
             final, out = self.resolve(impact, "false")
             self.assertEqual(final, impact)
-            self.assertNotIn("overridden", out)
+            self.assertNotIn("-at-consumer", out)
+
+    def test_only_existing_test_names_pass_the_boundary(self):
+        """Round 5 F1: a dash word, a glob, a newline or an unknown name gives __ALL__."""
+        for impact in ("alpha_test --no-default-features", "alpha_test *", "alpha_test\nbeta_test",
+                       "alpha_test missing_test", "__NONE__", "   "):
+            final, out = self.resolve(impact, "false")
+            self.assertEqual(final, "__ALL__", repr(impact))
+            self.assertIn(REJECTED, out, repr(impact))
+            self.assertNotIn("--no-default-features", out)
 
     def test_step_has_no_skip_arm_and_receives_docs_only(self):
-        body = self.consumer_step_body()
+        body = consumer_step_body()
         self.assertNotRegex(body, r"__SKIP__\)")
         text = CI_YML.read_text()
         self.assertIn("DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}", text)
-        self.assertLess(body.index(BOUNDARY_END), body.index('case "${TEST_IMPACT:-__ALL__}" in'))
+        self.assertLess(body.index(BOUNDARY_END), body.index(DISPATCH_CASE))
 
     def test_every_test_impact_consumer_is_the_guarded_step(self):
-        """s19 twin: any workflow reading the output is the guarded test step."""
-        readers = []
-        for path in sorted(WORKFLOW_DIR.glob("*.yml")):
-            for number, line in enumerate(path.read_text().splitlines(), 1):
-                if "classify.outputs.test_impact }}" in line:
-                    readers.append((path.name, line.strip()))
-            self.assertNotRegex(path.read_text(), r"__SKIP__\)", path.name)
-        self.assertEqual(readers, [("ci.yml", "TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}")])
+        """s19 twin: one reader in any spacing or index form, if:, env: or with:."""
+        self.assertEqual(consumer_readers(), [EXPECTED_READER])
+        for form in ("if: ${{ needs.classify.outputs['test_impact'] == 'x' }}",
+                     "X: ${{ needs . classify . outputs . test_impact }}",
+                     "with: { a: \"${{ needs['classify']['outputs'][\"test_impact\"] }}\" }",
+                     "Y: ${{ toJSON(needs.classify.outputs) }}"):
+            self.assertTrue(READER_RE.search(form) or WHOLE_OUTPUTS_RE.search(form), form)
+        self.assertIsNone(READER_RE.search("${{ needs.classify.outputs.test_impact_reason }}"))
+
+    def test_consumer_step_shape(self):
+        """Round 5 F2: exact if:, no read before the boundary, no early exit, two arms."""
+        self.assertEqual(consumer_shape_problems(), [])
+
+
+class ConsumerWholeStep(unittest.TestCase):
+    """Round 5 F1/F2: execute the WHOLE Run tests step with a fake cargo on PATH."""
+
+    def test_every_selection_shape_reaches_the_expected_cargo_argv(self):
+        for row in WHOLE_STEP_ROWS:
+            with self.subTest(row=row[0]):
+                self.assertIsNone(whole_step_problem(row))
+
+
+def run_cls_with_stub(stub_lines):
+    """Run the real cls body in a scratch repo whose base-tree classifier prints `stub_lines`."""
+    work = scratch_dir()
+    try:
+        repo = work / "repo"
+        impact = repo / "scripts" / "ci" / "impact"
+        impact.mkdir(parents=True)
+        for name in ("__init__.py", "common.py"):
+            (impact / name).write_text("")
+        (impact / "rules.json").write_text("{}\n")
+        (impact / "cargo_skip.py").write_text(
+            "import sys\nsys.stdin.read()\nsys.stdout.write(%r)\n" % "".join(l + "\n" for l in stub_lines))
+        (repo / "docs").mkdir()
+        (repo / "docs" / "a.md").write_text("a\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        git = ["git", "-c", "user.name=ci", "-c", "user.email=ci@example.invalid",
+               "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+        for args in (["init", "-q", "."], ["add", "-A"], ["commit", "-qm", "base"]):
+            subprocess.run(git + args, cwd=str(repo), env=env, check=True, timeout=TIMEOUT_S)
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), env=env, check=True,
+                              capture_output=True, text=True, timeout=TIMEOUT_S).stdout.strip()
+        (repo / "docs" / "a.md").write_text("a\nb\n")
+        subprocess.run(git + ["commit", "-qam", "pr"], cwd=str(repo), env=env, check=True, timeout=TIMEOUT_S)
+        out = work / "out"
+        out.write_text("")
+        (work / "rt").mkdir()
+        env.update(GITHUB_OUTPUT=str(out), RUNNER_TEMP=str(work / "rt"), EVENT_NAME="pull_request",
+                   PR_BEFORE="", PR_BASE_SHA=base, PR_ACTION="opened", PR_BASE_REF="chain/probe")
+        res = subprocess.run(RUNNER_BASH + [cls_step(CI_YML)[2]], cwd=str(repo), env=env,
+                             capture_output=True, text=True, timeout=TIMEOUT_S)
+        values = {}
+        for line in out.read_text().splitlines():
+            key, _, value = line.partition("=")
+            values[key] = value
+        return res.returncode, values
+    finally:
+        shutil.rmtree(str(work), ignore_errors=True)
+
+
+class ClsVerdictShapeGuard(unittest.TestCase):
+    """Round 5 F3: a malformed trusted-classifier verdict fails closed (false/false)."""
+
+    FAIL_CLOSED = "classifier-error-fail-closed cargo_skip-rules"
+
+    def test_well_formed_verdict_is_consumed(self):
+        rc, values = run_cls_with_stub(["docs_only=false", "cargo_skip=true", "cargo_skip_reason=stub-ok"])
+        self.assertEqual(rc, 0)
+        self.assertEqual((values["docs_only"], values["cargo_skip"], values["cargo_skip_reason"]),
+                         ("false", "true", "stub-ok"))
+
+    def test_malformed_verdict_forces_false_false(self):
+        for lines in (["docs_only=true", "cargo_skip=false", "cargo_skip_reason=stub"],
+                      ["docs_only=", "cargo_skip=true", "cargo_skip_reason=stub"],
+                      ["docs_only=yes", "cargo_skip=true", "cargo_skip_reason=stub"],
+                      ["docs_only=true", "docs_only=true", "cargo_skip=true", "cargo_skip_reason=stub"]):
+            with self.subTest(lines=lines):
+                rc, values = run_cls_with_stub(lines)
+                self.assertEqual(rc, 0)
+                self.assertEqual((values["docs_only"], values["cargo_skip"], values["cargo_skip_reason"]),
+                                 ("false", "false", self.FAIL_CLOSED))
 
 
 class NoWorkspaceFirstOnSysPath(unittest.TestCase):
@@ -742,4 +1037,6 @@ class RequiredContextsRuleB3(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["consumer-check"]:
+        sys.exit(consumer_check_main())
     unittest.main()
