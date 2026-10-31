@@ -56,6 +56,37 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 # ── Tunables (env-overridable) ───────────────────────────────────────────
+# Validate numeric inputs before generating run credentials or reading the clock (#8342).
+STEP_DURATION_MAX_DIGITS=6
+DECIMAL_TUNABLE_MAX_CHARS=12
+STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"
+# The ramp arithmetic reads STEP_DURATION_SECS, so it must be digits only with no leading zero (#4734 r23).
+case "$STEP_DURATION_SECS" in
+  ''|*[!0-9]*|0[0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;
+esac
+if [ "${#STEP_DURATION_SECS}" -gt "$STEP_DURATION_MAX_DIGITS" ]; then
+  echo "FATAL: STEP_DURATION_SECS must be at most $STEP_DURATION_MAX_DIGITS digits" >&2
+  exit 65
+fi
+# Knee thresholds. P95 budget mirrors the recall p95 budget the codebase
+# defends elsewhere (35 ms hot-path) plus headroom for the write+AGE mix.
+P95_BUDGET_MS="${P95_BUDGET_MS:-250}"
+case "$P95_BUDGET_MS" in
+  ''|*[!0-9.]*|*.*.*|.|0[0-9]*) echo "FATAL: P95_BUDGET_MS must be a decimal number" >&2; exit 65 ;;
+esac
+if [ "${#P95_BUDGET_MS}" -gt "$DECIMAL_TUNABLE_MAX_CHARS" ]; then
+  echo "FATAL: P95_BUDGET_MS must be at most $DECIMAL_TUNABLE_MAX_CHARS characters" >&2
+  exit 65
+fi
+# Fraction of requests shed with 503; the default is 1%.
+SHED_RATE_KNEE="${SHED_RATE_KNEE:-0.01}"
+case "$SHED_RATE_KNEE" in
+  ''|*[!0-9.]*|*.*.*|.|0[0-9]*) echo "FATAL: SHED_RATE_KNEE must be a decimal number" >&2; exit 65 ;;
+esac
+if [ "${#SHED_RATE_KNEE}" -gt "$DECIMAL_TUNABLE_MAX_CHARS" ]; then
+  echo "FATAL: SHED_RATE_KNEE must be at most $DECIMAL_TUNABLE_MAX_CHARS characters" >&2
+  exit 65
+fi
 # No fixed fallback (#4734): generate a random per-run password when unset.
 PW="${POSTGRES_PASSWORD:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 export POSTGRES_PASSWORD="$PW"
@@ -83,22 +114,6 @@ DAEMON_HOST="127.0.0.1"
 POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"
 # Concurrency ramp. Geometric so the knee is bracketed without 1000 steps.
 CONCURRENCY_STEPS="${CONCURRENCY_STEPS:-8 16 32 64 128 256 512 1024}"
-STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"
-# The ramp arithmetic reads STEP_DURATION_SECS, so it must be digits only with no leading zero (#4734 r23).
-case "$STEP_DURATION_SECS" in
-  ''|*[!0-9]*|0[0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;
-esac
-# Knee thresholds. P95 budget mirrors the recall p95 budget the codebase
-# defends elsewhere (35 ms hot-path) plus headroom for the write+AGE mix.
-P95_BUDGET_MS="${P95_BUDGET_MS:-250}"
-case "$P95_BUDGET_MS" in
-  ''|*[!0-9.]*|*.*.*|.|0[0-9]*) echo "FATAL: P95_BUDGET_MS must be a decimal number" >&2; exit 65 ;;
-esac
-# Fraction of requests shed with 503; the default is 1%.
-SHED_RATE_KNEE="${SHED_RATE_KNEE:-0.01}"
-case "$SHED_RATE_KNEE" in
-  ''|*[!0-9.]*|*.*.*|.|0[0-9]*) echo "FATAL: SHED_RATE_KNEE must be a decimal number" >&2; exit 65 ;;
-esac
 # Admission cap: set so the daemon sheds rather than queues unboundedly under
 # overload, making the knee observable as 503s (4.A). 0 disables (pure latency
 # knee). Default leaves it generous so latency is the primary signal.
