@@ -26,7 +26,9 @@ The rules this guard pins (a ratchet over EVERY workflow):
    by name, never read as a 0, and any ``edited`` word inside a pull_request(_target)
    trigger body counts as listed. An anchor, tag or alias written on a mapping key ANYWHERE
    in the file is refused by name (round 9): the scanner does not model that key's column. So are an
-   explicit key (a line led by ``?`` or a bare ``:``) and a double-quoted key holding an escape (round 10).
+   explicit key (a line led by ``?`` or a bare ``:``) and a double-quoted key holding an escape (round 10, in a
+   flow collection also with blanks before its colon, round 12), and a block scalar header with a comment flush
+   after it (``run: |#c``, round 12).
    The ``ORACLE`` table pins every shape from rounds 3-9; where PyYAML is importable a
    differential test checks the table, and variants of it, against it.
 2. ``cancel-in-progress`` is read only as a direct child of a block ``concurrency:`` key
@@ -43,6 +45,12 @@ The rules this guard pins (a ratchet over EVERY workflow):
    (#8337), so a new one would never fire before it lands on the default branch.
 4. A base retarget (#7072) is landed only after a new head push, checked at landing by
    scripts/ci/pr_retarget_check.py (tested by test_pr_retarget_check_8332.py).
+
+Linear time (rounds 10-12): every pattern this guard searches or matches per line or per file is compiled at
+module level, and the block header walk and the flush-comment check are one split and one pass each.
+``test_every_line_pattern_is_linear`` times every one of them, and ``scan``, ``cancel_violations`` and
+``edited_listed`` on a workflow carrying the line, on hostile lines of at least HOSTILE_LEN (50,000) characters:
+each call must finish under REGEX_CEILING_S.
 
 Stdlib only. Run: ``python3 -I scripts/test/test_workflow_edited_cancel_8332.py``.
 """
@@ -104,6 +112,9 @@ ADJACENT_KEY = "a colon flush against a closing quote outside a flow collection 
 NEXT_LINE_CANCEL = "a `cancel-in-progress` key with no value on its line (a value below it is not read)"
 # Round 11 (REVIEW-8332-security-r10 INFO-1): YAML folds a plain value's continuation lines into one string.
 MULTILINE_CANCEL = "a `cancel-in-progress` value continued on the next line (YAML folds it into one string)"
+# Round 12 (REVIEW-8332-security-r11 S-r11-2): libyaml and actionlint read `|#c` as a header and a comment.
+FLUSH_COMMENT_HEADER = ("a block scalar header with a comment flush after it (libyaml and actionlint read a header, "
+                        "the YAML spec and PyYAML reject it)")
 # Round 9 (REVIEW-8332-security-r8 S17): a scanned key line, its key column (group 1 is the indent plus any
 # dashes), and a `cancel-in-progress` or `concurrency` key token anywhere in a scanned line.
 # Round 10 (REVIEW-8332-security-r9 S20, REVIEW-8332-code-r9 F1): the prefix is `^( *(?:-[ \t]+)*)`; each
@@ -165,6 +176,25 @@ def _block_header(text: str) -> bool:
     return True
 
 
+def _flush_comment_header(text: str) -> bool:
+    """True when a scanned line holds a block scalar header with a comment flush after it (``run: |#c``).
+
+    decision (round 12, REVIEW-8332-security-r11 S-r11-2): libyaml and yaml.v3 (actionlint) read ``|#c`` as the
+    header ``|`` and a comment, the YAML spec and PyYAML reject it, so the scanner cannot know whether the lines
+    below are block scalar content; ``scan`` refuses the file by name (fail closed, the precedent of rounds 6-11
+    for shapes two readers disagree on) over reading it as libyaml does. The first blank-separated token led by
+    an indicator and holding a ``#`` is cut at that ``#`` and the rest of the line is tested by ``_block_header``
+    (one split and one walk: linear in the line length), so ``- run: |2#c d`` is refused and a plain scalar such
+    as ``run: echo |#c`` or ``run: a|#b`` is not.
+    """
+    pos = 0
+    for tok in text.replace("\t", " ").split(" "):
+        if tok[:1] in ("|", ">") and "#" in tok:
+            return _block_header(text[:pos + tok.index("#")])
+        pos += len(tok) + 1
+    return False
+
+
 class _Scanner:
     """The ONE quote-aware, stateful YAML line scanner of this guard (rounds 6 and 7).
 
@@ -214,6 +244,16 @@ class _Scanner:
     quote inside a plain scalar (``a":"b``) never makes the colon after it a separator or opens a quote there.
     Outside a flow collection the same flush colon (``"k":v``, ``"k":"v"``) is not YAML (PyYAML and actionlint
     reject it), so ``scan`` refuses the whole file by name rather than guess a key there.
+    (Corrected in round 12, REVIEW-8332-security-r11 INFO-1: outside a flow collection the ``a":"b`` reading
+    comes from the separator rule, which there needs a blank after the colon; the closing-quote index only
+    acts inside a flow collection.)
+
+    decision (round 12, REVIEW-8332-code-r11 F1, REVIEW-8332-security-r11 S-r11-1): inside a flow collection
+    YAML, PyYAML, libyaml and yaml.v3 also read blanks between the closing quote and the colon (``{"k" :v}``),
+    so a blank right after a closing quote carries the closing-quote index forward and the escaped-key refusal
+    sees that key too. A block scalar header followed by a comment with no blank (``run: |#c``) is read as a
+    header by libyaml and yaml.v3 (actionlint) and rejected by the YAML spec and PyYAML; ``scan`` refuses the
+    whole file by name (S-r11-2) rather than pick one reading of the lines below it.
     """
 
     def __init__(self):
@@ -271,6 +311,8 @@ class _Scanner:
         c, nxt = raw[i], raw[i + 1:i + 2]
         out.append(c)
         if c in " \t":
+            if self.depth and self.qend == i - 1:
+                self.qend = i  # round 12: a blank after a closing quote keeps the key reading in flow ("k" :v)
             return start
         if self.depth and c in "]},":
             self.inplain = False
@@ -281,9 +323,11 @@ class _Scanner:
         if c == ":" and self.qend == i - 1 and not self.depth and nxt not in SEPARATORS:
             self.invalid = ADJACENT_KEY  # block context: YAML needs a blank after the colon ("k":v is not YAML)
         if c == ":" and (nxt in SEPARATORS or (self.qend == i - 1 and self.depth)):
-            # a key separator. Right after the quote that CLOSED a quoted scalar it needs no blank in a flow
-            # collection (YAML's JSON-like key, {"k":v}, round 11 F1). A quote inside a plain scalar (a":"b)
-            # closes nothing, so its colon is text and opens no quote (round 11).
+            # a key separator. Right after the quote that CLOSED a quoted scalar, or after only blanks following
+            # it, it needs no blank in a flow collection (YAML's JSON-like key, {"k":v} and {"k" :v}, rounds 11
+            # and 12). Outside a flow collection this condition alone needs a blank after the colon, so a quote
+            # inside a plain scalar (a":"b) never makes its colon a separator there (round 12 correction: that
+            # comes from this rule, not from the closing-quote index, which only acts inside a flow collection).
             if self.keyprop:
                 self.invalid = PROPERTY_KEY
             if self.keyesc:
@@ -380,6 +424,8 @@ class _Scanner:
         text = "".join(out).rstrip()
         if not self.invalid and EXPLICIT_KEY_RE.match(text):
             self.invalid = EXPLICIT_KEY  # quoted and block-scalar text is words only: a `?` there never matches
+        if not self.invalid and not self.quote and _flush_comment_header(text):
+            self.invalid = FLUSH_COMMENT_HEADER  # quoted text has no `#` left; round 12, S-r11-2
         self._settle(text, owner, start, cut)
         if not self.quote and not self.depth and _block_header(text):
             self.block = self.parent
@@ -853,6 +899,21 @@ NEXT_SHAPES = (
 # The oracle: every trigger shape that made the ratchet fail open in rounds 3-8, with what it must read.
 # EDITED = edited listed under a pull_request(_target) trigger; CLEAN = not listed; REFUSE = refused by name.
 # An optional fourth field is a text the refusal or listing message must contain.
+# Round 12 (REVIEW-8332-security-r11 S-r11-2, probes f2, f2b, f2c, verbatim): a block scalar header with a comment
+# flush after it; libyaml and actionlint read the lines below as block content, the scanner refuses the file.
+FLUSH_HEADER_JOB = ("name: c\non:\n  pull_request_target:\n    types: [opened, edited]\njobs:\n  j:\n"
+                    "    runs-on: ubuntu-latest\n    steps:\n")
+FLUSH_HEADER_ROWS = (
+    ("f2 block scalar header with a comment flush after it hides a job concurrency block",
+     FLUSH_HEADER_JOB + '      - run: |#c\n          echo a: "x\n    concurrency:\n      group: g\n'
+     '      cancel-in-progress: true\n    env:\n      B: |#c\n        y"\n'),
+    ("f2b same with a strip indicator before the flush comment",
+     FLUSH_HEADER_JOB + '      - run: |-#c\n          echo a: "x\n    concurrency:\n      group: g\n'
+     '      cancel-in-progress: true\n    env:\n      B: >-#c\n        y"\n'),
+    ("f2c same, the block content opens a flow",
+     FLUSH_HEADER_JOB + "      - run: |#c\n          echo a: [x\n    concurrency:\n      group: g\n"
+     "      cancel-in-progress: true\n    env:\n      B: |#c\n        y]\n"),
+)
 ORACLE = (
     ("r3 double-quoted block key", 'on:\n  "pull_request":\n    types: [opened, edited]\n', EDITED),
     ("r3 single-quoted key, quoted sequence item", "on:\n  'pull_request':\n    types:\n      - 'edited'\n", EDITED),
@@ -1047,6 +1108,8 @@ ORACLE = (
     # refused as an explicit key (valid YAML, fail closed, no workflow writes it).
     ("r11 plain continuation line led by a question mark before on:",
      "env:\n  A: some plain\n    ? text\non:\n" + PR_EDITED + "\n", REFUSE, f"line 3: {EXPLICIT_KEY}"),
+    # round 12, REVIEW-8332-security-r11 S-r11-2: a flush comment after a block scalar header is refused by name.
+    *((f"r12 {name}", text, REFUSE, f"line 9: {FLUSH_COMMENT_HEADER}") for name, text in FLUSH_HEADER_ROWS),
 )
 # Round 7 differential variants: each keeps the YAML meaning of a row, or makes it invalid (then only a
 # refusal is accepted): a trailing comment on every line, a doubled-quote key before ``on:``, one more
@@ -1162,6 +1225,44 @@ CANCEL_ORACLE = (
     ("r11 block quoted key flush against a plain value in a job env",
      CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
      + '    env:\n      "a":b\n' + CANCEL_STEPS, f"cannot parse the trigger section (line 12: {ADJACENT_KEY}"),
+    # round 12, REVIEW-8332-code-r11 F1 (probes g2, g2c) and REVIEW-8332-security-r11 S-r11-1 (probes f1, f1b,
+    # verbatim): in a flow collection blanks may sit between a closing quote and its colon; the escaped key is refused.
+    ("r12 g2 flow jobs, escaped job concurrency keys, blank before the colon, true",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n"
+     'jobs: {j: {runs-on: ubuntu-latest, "concurrenc\\u0079" :{group: j, "cancel\\u002din-progress" :true},'
+     " steps: [{run: echo hi}]}}\n", f"cannot parse the trigger section (line 8: {ESCAPED_KEY}"),
+    ("r12 g2c flow form f-own1g, escaped concurrency without the key, blank before the colon",
+     "name: c\non:\n  pull_request:\n    types: [opened]\n"
+     'jobs: {j: {runs-on: ubuntu-latest, "concurrenc\\u0079" :{group: j}, steps: [{run: echo hi}]}}\n',
+     f"cannot parse the trigger section (line 5: {ESCAPED_KEY}"),
+    ("r12 f1 flow job under block jobs, escaped keys, a space before the colon, true",
+     CANCEL_HEAD + 'jobs:\n  j: {runs-on: ubuntu-latest, "concurr\\u0065ncy" :{group: g,'
+     ' "cancel-in-pro\\u0067ress" :true}, steps: [{run: echo hi}]}\n',
+     f"cannot parse the trigger section (line 6: {ESCAPED_KEY}"),
+    ("r12 f1b flow job under block jobs, escaped keys, a tab before the colon, true",
+     CANCEL_HEAD + 'jobs:\n  j: {runs-on: ubuntu-latest, "concurr\\u0065ncy"\t:{group: g,'
+     ' "cancel-in-pro\\u0067ress"\t:true}, steps: [{run: echo hi}]}\n',
+     f"cannot parse the trigger section (line 6: {ESCAPED_KEY}"),
+    # control: a quoted flow key without escapes, a blank before its colon, is read as a key and passes.
+    ("r12 quoted flow key without escapes, a blank before the colon (control)",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + '    env: {"plain-key" : value, "K" :x}\n' + CANCEL_STEPS, None),
+    # REVIEW-8332-code-r11 INFO-1: a plain flow scalar holding a colon flush against a quote (a:"b) is one scalar in
+    # YAML; neither its colon nor an earlier closed quote on the line makes it a separator, so no quote opens there.
+    ("r12 plain flow scalar holding colon-quote before job-level true",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + '    env: {A:"x, B: y}\n    concurrency:\n      group: j\n      cancel-in-progress: true\n' + CANCEL_STEPS,
+     "cancel-in-progress `true`"),
+    ("r12 closed quoted key then a plain flow scalar holding colon-quote before job-level true",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + '    env: {"A": x:"y, B: z}\n    concurrency:\n      group: j\n      cancel-in-progress: true\n'
+     + CANCEL_STEPS, "cancel-in-progress `true`"),
+    # S-r11-2: the flush-comment header rows above, and a plain scalar holding `|#` (control, not a header).
+    *((f"r12 {name}", text, f"cannot parse the trigger section (line 9: {FLUSH_COMMENT_HEADER}")
+      for name, text in FLUSH_HEADER_ROWS),
+    ("r12 plain step value holding a pipe and a hash (control)",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + "    steps:\n      - run: echo |#c\n      - run: a|#b\n", None),
 )
 # Rows refused by design although YAML reads them as compliant (fail closed; no workflow writes them):
 # the PyYAML differential pins that they are over-refusals, not misreadings.
@@ -1170,7 +1271,9 @@ OVER_REFUSALS = {"r10 cancel value on the next line, false", "r10 concurrency ke
 # YAML allows a tab before a comment; PyYAML 6 rejects it, so the differential pins that rejection instead. A
 # block "k":v is not YAML at all (round 11): the differential pins that PyYAML rejects what the scanner refuses.
 PYYAML_REJECTS = {"r10 tab before a trailing comment on a false value",
-                  "r11 block quoted key flush against a plain value in a job env"}
+                  "r11 block quoted key flush against a plain value in a job env",
+                  "r12 f1b flow job under block jobs, escaped keys, a tab before the colon, true",
+                  *(f"r12 {name}" for name, _ in FLUSH_HEADER_ROWS)}
 # Round 10 (REVIEW-8332-security-r9 S20): KEY_LINE_RE on a hostile line must finish well inside this many
 # seconds (the round-9 prefix took about 1.8 s at 22 repetitions; the linear one takes microseconds).
 REGEX_CEILING_S = 0.5
@@ -1179,7 +1282,7 @@ REGEX_CEILING_S = 0.5
 # length, so the scanner no longer runs it), and the hostile line length every line pattern is timed at.
 BLOCK_SCALAR_ORACLE_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)(?:[&!][^ \t]*[ \t]+)*[|>][1-9+-]*$")
 HOSTILE_LEN = 50_000
-BLOCK_ALPHABET, BLOCK_CORPUS_MAX_LEN = " \t:-&!a|>1", 5
+BLOCK_ALPHABET, BLOCK_CORPUS_MAX_LEN = " \t:-&!a|>10+", 5
 
 
 def _rep(unit: str) -> str:
@@ -1192,7 +1295,7 @@ def _hostile_lines() -> list:
     return [": " + _rep("!a: ") + "x", _rep(":\t&"), "-" + _rep("\t -") + "x", _rep("- ") + "k: v", _rep("!a ") + "|",
             _rep('"'), _rep("'"), _rep("a") + ":", " " * HOSTILE_LEN + "x", _rep(":"), "${{" + _rep(" ") + "}",
             _rep("&a "), _rep("cancel-in-progress"), _rep("pull_request "), _rep("{[,"), _rep('a"'), _rep("<<"),
-            _rep("types edited ")]
+            _rep("types edited "), _rep(" |") + "#"]
 
 
 def _line_checks() -> list:
@@ -1202,7 +1305,8 @@ def _line_checks() -> list:
               ("EXPLICIT_KEY_RE", EXPLICIT_KEY_RE.match), ("KEY_LINE_RE", KEY_LINE_RE.match),
               ("TYPES_WORD_RE", TYPES_WORD_RE.search), ("ACTIVITY_WORD_RE", ACTIVITY_WORD_RE.findall),
               ("GUARD_EXPR_RE", GUARD_EXPR_RE.fullmatch), ("_trigger_line_res key", key_re.match),
-              ("_trigger_line_res item", item_re.match), ("_block_header", _block_header)]
+              ("_trigger_line_res item", item_re.match), ("_block_header", _block_header),
+              ("_flush_comment_header", _flush_comment_header)]
     checks += [(f"PROPERTY_RES {what}", rx.search) for what, rx in PROPERTY_RES]
     checks += [(f"TOKEN_RES {key}", rx.findall) for key, rx in TOKEN_RES.items()]
     return checks + [(f"KIND_RES {kind}", rx.search) for kind, rx in KIND_RES.items()]
@@ -1345,7 +1449,7 @@ class EditedRatchetOracle8332(unittest.TestCase):
             try:
                 samples += [ln.text for ln in scan(text)]
             except ParseFailure:
-                pass
+                continue  # a row the scanner refuses still contributes its raw lines above
         self.assertEqual([s for s in samples if bool(BLOCK_SCALAR_ORACLE_RE.search(s)) != _block_header(s)], [])
         self.assertGreater(len(samples), len(BLOCK_ALPHABET) ** BLOCK_CORPUS_MAX_LEN)
 
