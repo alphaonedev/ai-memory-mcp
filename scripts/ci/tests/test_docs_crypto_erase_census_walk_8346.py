@@ -15,10 +15,17 @@ every search runs on that stripped text, so a stale commented-out copy of a
 declaration or of the listing call can never be read instead of the live one.
 Rust block comments nest, so the stripper counts the depth (a stray `*/` fails loudly), and every
 parsed constant name and the loop head must occur exactly once in the stripped source.
-The WHOLE census loop body (comments stripped, string literals masked, whitespace removed) and the
-erasable-bytes expression are pinned against one exact expected text, the `ends_with` filter terms
-being the only parsed variable part, so any other change to the Rust census fails loudly and names
-the drifted statement.
+Two Rust bodies are pinned statement by statement (comments stripped, whitespace removed, string
+literals kept): the WHOLE body of `docs_census_8315_on` (the repository and toplevel checks, the
+`ls-files` listing and its asserts, `stdout`, `bytes`, the accumulators, the loop and the final
+`Ok(..)`) and the WHOLE body of the `#[test]` fn that asserts on the census, plus the `#[test]`
+attribute directly above it. The `ends_with` filter terms and the `ls-files` folder are the only
+parsed variable parts. Any other change in those two bodies (an extra or shadowing statement, a
+changed assert, a rewritten `stdout`) raises AssertionError naming the drifted statement.
+Everything else is read by a value parser: the phrase, dated-record and erase-doc constants, and
+the whole `CRYPTO_ERASABLE_ENVELOPE_VERSIONS` array (`[u8; N]`, N equal to the element count, every
+element a known `*_ENVELOPE_VERSION` constant). Parsed string literals are unescaped, and a
+backslash the decoder does not know raises. Code outside those bodies is not pinned.
 """
 import json
 import os
@@ -64,6 +71,7 @@ def strip_comments(text):
     String, raw string and char literals such as `'"'` are skipped whole, so a quote inside one
     never opens a string and a comment marker inside a string is kept. A block comment that never
     closes, or a `*/` outside a comment and a literal, raises AssertionError (never read silently).
+    A `*/*` is a star followed by a comment opener (`a*/*b*/c` is `a * c` in Rust), so it is not stray.
     """
     out, pos, end = [], 0, len(text)
     while pos < end:
@@ -93,7 +101,7 @@ def strip_comments(text):
                     depth, scan = depth - 1, closer + 2
             out.append(" ")
             pos = scan
-        elif text.startswith("*/", pos):
+        elif text.startswith("*/", pos) and not text.startswith("*/*", pos):
             raise AssertionError("%s has a `*/` outside any block comment or literal" % RUST_SRC)
         else:
             out.append(text[pos])
@@ -114,12 +122,37 @@ def declared_once(masked, pattern, what):
                              % (RUST_SRC, what, count))
 
 
+ESCAPE = re.compile(r"\\(?:x([0-7][0-9a-fA-F])|u\{([0-9a-fA-F_]{1,13})\}|([nrt0\\'\"])|\n[ \t\r\n]*)")
+SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", "'": "'", '"': '"'}
+
+
+def unescape(literal):
+    """Decode the escapes of a plain Rust string literal body; any other backslash raises."""
+    def decode(m):
+        if m.group(1) is not None:
+            return chr(int(m.group(1), 16))
+        if m.group(2) is not None:
+            return chr(int(m.group(2).replace("_", ""), 16))
+        if m.group(3) is not None:
+            return SIMPLE_ESCAPES[m.group(3)]
+        return ""
+    if "\\" in ESCAPE.sub("", literal):
+        raise AssertionError("%s has a string literal with an escape the mirror cannot decode: %r"
+                             % (RUST_SRC, literal))
+    return ESCAPE.sub(decode, literal)
+
+
 def strings(body):
-    """Return the string literals (plain and raw) of a Rust fragment, in order, comments excluded."""
+    """Return the string literals (plain and raw) of a Rust fragment, in order, comments excluded.
+
+    Plain literals are decoded (an `x2d` hex escape, a `u{5f}` escape, the simple escapes, a backslash-newline
+    continuation), so the mirror holds the Rust value, not its spelling; a raw string is taken as
+    written, and a backslash the decoder does not know raises AssertionError.
+    """
     found = []
     for m in RUST_TOKEN.finditer(body):
         if m.group("str") is not None:
-            found.append(m.group("str")[1:-1])
+            found.append(unescape(m.group("str")[1:-1]))
         elif m.group("raw") is not None:
             found.append(re.fullmatch(r'b?r(#*)"(.*)"\1', m.group("raw"), re.S).group(2))
     return found
@@ -127,7 +160,7 @@ def strings(body):
 
 def const_body(clean, name):
     """Return the body of `const <name>: ... = ...;` in the comment-stripped Rust source."""
-    match = re.search(r"const %s:[^=]*=\s*(.*?);\n" % re.escape(name), clean, re.S)
+    match = re.search(r"const %s\s*:[^=]*=\s*(.*?);\n" % re.escape(name), clean, re.S)
     if match is None:
         raise AssertionError("%s no longer declares %s" % (RUST_SRC, name))
     return match.group(1)
@@ -135,7 +168,7 @@ def const_body(clean, name):
 
 def const_len(clean, name):
     """Return N from the declared type `const <name>: [&str; N]` (comment-stripped source)."""
-    match = re.search(r"const %s:\s*\[&str;\s*(\d+)\s*\]" % re.escape(name), clean)
+    match = re.search(r"const %s\s*:\s*\[&str;\s*(\d+)\s*\]" % re.escape(name), clean)
     if match is None:
         raise AssertionError("%s no longer declares %s as [&str; N]" % (RUST_SRC, name))
     return int(match.group(1))
@@ -152,34 +185,84 @@ def string_list(clean, name):
 
 
 LOOP_HEAD = "for rel in stdout.lines() {"
-ENDS_TERM = r'rel\.ends_with\(""\)'
+CENSUS_FN = "docs_census_8315_on"
+TEST_FN = "docs_describing_erase_list_every_erasable_version_8315"
+ENDS_TERM = r'rel\.ends_with\("[^"]+"\)'
 ENDS_SLOT = "<ENDS>"
-# The census loop body of docs_census_8315_on, split after every `;`, `{` and `}`, whitespace
-# removed, every string literal masked to `""`. The only variable part is the `ends_with` term
-# group (ENDS_SLOT), whose literals census_filter parses. The two `if .. { continue; }` skips
-# are chunks 1-3 and 6-8.
-LOOP_CHUNKS = (
-    "if!(" + ENDS_SLOT + ")||DOCS_CENSUS_DATED_RECORDS.iter().any(|dir|rel.starts_with(dir)){",
-    "continue;",
-    "}",
-    'lettext=std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e|panic!(""));',
-    "letflat=text.to_lowercase();",
-    "if!DOCS_CENSUS_ERASE_PHRASES.iter().any(|phrase|flat.contains(phrase))"
-    "||!bytes.iter().any(|byte|flat.contains(byte.as_str())){",
-    "continue;",
-    "}",
-    "census.push(rel.to_string());",
-    "letmissing:Vec<&str>=bytes.iter().filter(|byte|!flat.contains(byte.as_str()))"
-    ".map(String::as_str).collect();",
-    "if!missing.is_empty(){",
-    'failures.push(format!("",missing.join("")));',
-    "}",
+FOLDER_SLOT = "<FOLDER>"
+# The WHOLE body of docs_census_8315_on, split after every `;`, `{` and `}` (boundaries found on the
+# literal-masked text), whitespace removed, string literals kept (a changed message or path literal
+# is a drift too). The only variable parts are the `ends_with` term group (ENDS_SLOT) and the
+# `git ls-files` folder (FOLDER_SLOT), both parsed from the source. Every other statement, an extra
+# push, a rewritten `stdout`, a shadowing `let` or a changed `Ok(..)` raises AssertionError.
+CENSUS_FN_CHUNKS = (
+    'if!root.join(".git").exists(){',
+    'returnErr(docs_census_skip(ci,DOCS_CENSUS_NO_DOT_GIT));',
+    '}',
+    'lettoplevel=matchdocs_census_git_on(root,&["rev-parse","--show-toplevel"],path){',
+    'Ok(out)ifout.status.success()=>{',
+    'String::from_utf8_lossy(&out.stdout).trim().to_string()}',
+    'Ok(_)=>returnErr(docs_census_skip(ci,DOCS_CENSUS_TOPLEVEL_FAILED)),Err(e)=>{',
+    'returnErr(docs_census_skip(ci,&format!("{DOCS_CENSUS_GIT_NOT_RUN}:{e}"),));',
+    '}',
+    '}',
+    ';',
+    'match(std::fs::canonicalize(&toplevel),std::fs::canonicalize(root),){',
+    '(Ok(top),Ok(here))iftop==here=>{',
+    '}',
+    '_=>returnErr(docs_census_skip(ci,DOCS_CENSUS_FOREIGN_TOPLEVEL)),}',
+    'assert!(root.join(DOCS_CENSUS_ERASE_DOC).is_file(),'
+    '"insideagitcheckoutthecensusmustreach{DOCS_CENSUS_ERASE_DOC},'
+    'butitismissingornotafile");',
+    'letlisting=docs_census_git_on(root,&["ls-files","--",<FOLDER>],path)'
+    '.expect("run`gitls-files--<FOLDER>`");',
+    'assert!(listing.status.success(),"`gitls-files--<FOLDER>`failed:{}",'
+    'String::from_utf8_lossy(&listing.stderr));',
+    'letstdout=String::from_utf8_lossy(&listing.stdout);',
+    'letbytes:Vec<String>=CRYPTO_ERASABLE_ENVELOPE_VERSIONS.iter()'
+    '.map(|version|format!("0x{version:02x}")).collect();',
+    'letmutcensus:Vec<String>=Vec::new();',
+    'letmutfailures:Vec<String>=Vec::new();',
+    'forrelinstdout.lines(){',
+    'if!(<ENDS>)||DOCS_CENSUS_DATED_RECORDS.iter().any(|dir|rel.starts_with(dir)){',
+    'continue;',
+    '}',
+    'lettext=std::fs::read_to_string(root.join(rel))'
+    '.unwrap_or_else(|e|panic!("{rel}:read:{e}"));',
+    'letflat=text.to_lowercase();',
+    'if!DOCS_CENSUS_ERASE_PHRASES.iter().any(|phrase|flat.contains(phrase))'
+    '||!bytes.iter().any(|byte|flat.contains(byte.as_str())){',
+    'continue;',
+    '}',
+    'census.push(rel.to_string());',
+    'letmissing:Vec<&str>=bytes.iter().filter(|byte|!flat.contains(byte.as_str()))'
+    '.map(String::as_str).collect();',
+    'if!missing.is_empty(){',
+    'failures.push(format!("{rel}:describescryptoerasebutdoesnotlist{}",missing.join(",")'
+    '));',
+    '}',
+    '}',
+    'Ok(DocsCensus{',
+    'census,failures}',
+    ')',
 )
-# The erasable-bytes expression and the two accumulators, literals kept: the byte format is pinned.
-BYTES_PREAMBLE = (
-    "letbytes:Vec<String>=CRYPTO_ERASABLE_ENVELOPE_VERSIONS.iter()"
-    '.map(|version|format!("0x{version:02x}")).collect();'
-    "letmutcensus:Vec<String>=Vec::new();letmutfailures:Vec<String>=Vec::new();"
+# The whole body of the #[test] that asserts on the census (`found.census` / `found.failures`).
+TEST_FN_CHUNKS = (
+    'letroot=std::path::Path::new(env!("CARGO_MANIFEST_DIR"));',
+    'letfound=matchdocs_census_8315(root){',
+    'Ok(found)=>found,Err(reason)=>{',
+    'eprintln!("skipped:{reason}");',
+    'return;',
+    '}',
+    '}',
+    ';',
+    'letbytes:Vec<String>=CRYPTO_ERASABLE_ENVELOPE_VERSIONS.iter()'
+    '.map(|version|format!("0x{version:02x}")).collect();',
+    'assert!(found.census.iter().any(|rel|rel==DOCS_CENSUS_ERASE_DOC),'
+    '"thecensusmustreach{DOCS_CENSUS_ERASE_DOC};itfound{:?}",found.census);',
+    'assert!(found.failures.is_empty(),'
+    '"#8315:everyerase-describingdocmustlisteverybyteof\\CRYPTO_ERASABLE_ENVELOPE_VERSIONS({})'
+    ';census{:?}:\\n{}",bytes.join(","),found.census,found.failures.join("\\n"));',
 )
 
 
@@ -188,77 +271,69 @@ def compact(text):
     return re.sub(r"\s+", "", text)
 
 
-def census_loop(clean):
-    """Return the body of the `for rel in stdout.lines()` census loop (comment-stripped source)."""
-    start = clean.find(LOOP_HEAD)
-    if start < 0:
-        raise AssertionError("%s no longer has the `%s` census loop" % (RUST_SRC, LOOP_HEAD))
-    start += len(LOOP_HEAD)
+def fn_body(clean, name):
+    """Return (text before the fn, body between its braces) of `fn <name>` in the stripped source."""
     masked = mask_literals(clean)
-    depth = 1
+    declared_once(masked, r"\bfn %s\(" % name, "fn " + name)
+    found = re.search(r"\bfn %s\(" % name, masked)
+    start = masked.index("{", found.end())
+    depth = 0
     for pos in range(start, len(masked)):
         depth += {"{": 1, "}": -1}.get(masked[pos], 0)
         if depth == 0:
-            return clean[start:pos]
-    raise AssertionError("%s census loop has no closing brace" % RUST_SRC)
+            return clean[:found.start()], clean[start + 1:pos]
+    raise AssertionError("%s fn %s has no closing brace" % (RUST_SRC, name))
 
 
-def loop_chunks(body):
-    """Return [(pinned form, shown form)] per statement chunk of the loop body.
+def chunks(body):
+    """Return the compact statement chunks of a Rust fragment, split at `;`, `{` and `}`.
 
-    The pinned form has literals masked to `""`; the shown form keeps them, so an error names
-    the drifted clause. Boundaries are found on the masked text, so a `;`, `{` or `}` inside a
-    literal (raw strings included) never splits a chunk and never reads as code.
+    Boundaries are found on the literal-masked text, so a `;`, `{` or `}` inside a literal (raw
+    strings included) never splits a chunk and never reads as code.
     """
     masked = mask_literals(body)
-    bounds, begin = [], 0
+    out, begin = [], 0
     for m in re.finditer(r"[;{}]", masked):
-        bounds.append((begin, m.end()))
+        out.append(compact(body[begin:m.end()]))
         begin = m.end()
-    bounds.append((begin, len(masked)))
-    pairs = []
-    for lo, hi in bounds:
-        shown = compact(body[lo:hi])
-        if shown:
-            pairs.append((re.sub(r"\0+", '""', compact(masked[lo:hi])), shown))
-    return pairs
+    out.append(compact(body[begin:]))
+    return [chunk for chunk in out if chunk]
 
 
-def census_filter(clean):
-    """Pin the whole census loop body and return the `ends_with` suffixes it reads.
-
-    Every statement of the loop must equal LOOP_CHUNKS, the `ends_with` term group aside; any
-    other change (an added or tightened condition, a `?` return, a macro skip, another `continue`)
-    raises AssertionError naming the first chunk that drifted.
-    """
-    pairs = loop_chunks(census_loop(clean))
-    slot = re.compile(r"if!\((%s(\|\|%s)*)\)\|\|" % (ENDS_TERM, ENDS_TERM))
-    pinned = [slot.sub("if!(%s)||" % ENDS_SLOT, form, count=1) for form, _ in pairs]
-    for index in range(max(len(pinned), len(LOOP_CHUNKS))):
-        want = LOOP_CHUNKS[index] if index < len(LOOP_CHUNKS) else "<end of loop body>"
-        got = pinned[index] if index < len(pinned) else "<end of loop body>"
-        if got != want:
-            shown = pairs[index][1] if index < len(pairs) else "<missing>"
-            raise AssertionError("%s census loop statement %d changed, the mirror does not follow it: "
-                                 "found %r (expected %r)" % (RUST_SRC, index + 1, shown, want))
-    group = re.fullmatch(r"if!\((.*)\)\|\|DOCS_CENSUS_DATED_RECORDS.*", pairs[0][1])
-    suffixes = []
-    for term in group.group(1).split("||"):
-        literal = re.fullmatch(r'rel\.ends_with\("([^"]+)"\)', term)
-        if literal is None:
-            raise AssertionError('%s census filter term is not `rel.ends_with("<literal>")`: %r'
-                                 % (RUST_SRC, term))
-        suffixes.append(literal.group(1))
-    return tuple(suffixes)
+def pin_chunks(label, got, want):
+    """Raise AssertionError naming the first chunk of `got` that differs from `want`."""
+    for index in range(max(len(got), len(want))):
+        have = got[index] if index < len(got) else "<end of body>"
+        need = want[index] if index < len(want) else "<end of body>"
+        if have != need:
+            raise AssertionError("%s %s statement %d changed, the mirror does not follow it: "
+                                 "found %r (expected %r)" % (RUST_SRC, label, index + 1, have, need))
 
 
-def bytes_preamble(clean):
-    """Return the compact text from the census `let bytes` to the census loop head."""
-    head = clean.find(LOOP_HEAD)
-    start = clean.rfind("let bytes", 0, head)
-    if head < 0 or start < 0:
-        raise AssertionError("%s census loop is not preceded by `let bytes`" % RUST_SRC)
-    return compact(clean[start:head])
+def slotted(chunk, folder):
+    """Return `chunk` with the parsed variable parts (the folder, the ends_with terms) slotted."""
+    chunk = re.sub(r'("ls-files","--",)"[^"]+"', r"\1" + FOLDER_SLOT, chunk)
+    chunk = chunk.replace("ls-files--" + folder, "ls-files--" + FOLDER_SLOT)
+    return re.sub(r"if!\((%s(\|\|%s)*)\)\|\|" % (ENDS_TERM, ENDS_TERM),
+                  "if!(%s)||" % ENDS_SLOT, chunk, count=1)
+
+
+def census_filter(clean, folder):
+    """Pin the whole docs_census_8315_on body and return the `ends_with` suffixes it reads."""
+    _, body = fn_body(clean, CENSUS_FN)
+    got = chunks(body)
+    pin_chunks(CENSUS_FN, [slotted(chunk, folder) for chunk in got], CENSUS_FN_CHUNKS)
+    first = got[next(i for i, want in enumerate(CENSUS_FN_CHUNKS) if ENDS_SLOT in want)]
+    group = re.fullmatch(r"if!\((.*)\)\|\|DOCS_CENSUS_DATED_RECORDS.*", first)
+    return tuple(strings(term)[0] for term in group.group(1).split("||"))
+
+
+def pin_test(clean, folder):
+    """Pin the #[test] that asserts on the census: the attribute and the whole body."""
+    before, body = fn_body(clean, TEST_FN)
+    if not before.rstrip().endswith("#[test]"):
+        raise AssertionError("%s fn %s is no longer directly under `#[test]`" % (RUST_SRC, TEST_FN))
+    pin_chunks(TEST_FN, [slotted(chunk, folder) for chunk in chunks(body)], TEST_FN_CHUNKS)
 
 
 def census_folder(clean):
@@ -277,24 +352,34 @@ def census_folder(clean):
 def erasable_bytes(clean, scope_clean):
     """Return the `0x..` strings for CRYPTO_ERASABLE_ENVELOPE_VERSIONS (RECORD, SCOPE).
 
-    Also pins the `let bytes` expression of the census (`format!("0x{version:02x}")` over exactly
-    that constant, nothing chained) and the two accumulators that precede the loop.
+    The census `let bytes` expression is pinned with the rest of docs_census_8315_on. Here the whole
+    array is parsed: `[u8; N]`, every element, N equal to the element count, and every element a
+    constant name declared once as `const NAME: u8 = 0x..;` (a numeric literal such as `0x07`, an
+    expression or an unknown name raises AssertionError instead of being dropped).
     """
-    if bytes_preamble(clean) != BYTES_PREAMBLE:
-        raise AssertionError("%s census erasable-bytes expression changed, the mirror does not follow it:"
-                             " found %r (expected %r)" % (RUST_SRC, bytes_preamble(clean), BYTES_PREAMBLE))
-    match = re.search(r"CRYPTO_ERASABLE_ENVELOPE_VERSIONS: \[u8; \d+\] =\s*\[(.*?)\];", clean, re.S)
+    match = re.search(r"CRYPTO_ERASABLE_ENVELOPE_VERSIONS\s*:\s*\[u8;\s*(\d+)\s*\]\s*=\s*\[(.*?)\];",
+                      clean, re.S)
     if match is None:
-        raise AssertionError("%s no longer declares CRYPTO_ERASABLE_ENVELOPE_VERSIONS" % RUST_SRC)
-    names = re.findall(r"[A-Z_]+", match.group(1))
+        raise AssertionError("%s no longer declares CRYPTO_ERASABLE_ENVELOPE_VERSIONS as [u8; N]"
+                             % RUST_SRC)
+    elements = [compact(part) for part in match.group(2).split(",")]
+    if elements and elements[-1] == "":
+        elements.pop()
+    if len(elements) != int(match.group(1)) or "" in elements:
+        raise AssertionError("%s: CRYPTO_ERASABLE_ENVELOPE_VERSIONS declares [u8; %s] but %d elements "
+                             "were parsed: %r" % (RUST_SRC, match.group(1), len(elements), elements))
     masked = mask_literals(clean) + "\n" + mask_literals(scope_clean)
     values = {}
-    for name in names:
-        declared_once(masked, r"\bconst %s: u8 =" % re.escape(name), "const " + name)
     for src in (clean, scope_clean):
-        for name, val in re.findall(r"const ([A-Z_]+_ENVELOPE_VERSION): u8 = 0x([0-9a-fA-F]+);", src):
+        for name, val in re.findall(r"const ([A-Z_]+_ENVELOPE_VERSION)\s*:\s*u8\s*=\s*0x([0-9a-fA-F]+);",
+                                    src):
             values[name] = int(val, 16)
-    return ["0x%02x" % values[name] for name in names]
+    for element in elements:
+        if element not in values:
+            raise AssertionError("%s: CRYPTO_ERASABLE_ENVELOPE_VERSIONS element %r is not a known "
+                                 "`*_ENVELOPE_VERSION` constant" % (RUST_SRC, element))
+        declared_once(masked, r"\bconst %s\s*:\s*u8\s*=" % re.escape(element), "const " + element)
+    return ["0x%02x" % values[element] for element in elements]
 
 
 def rules_entry():
@@ -316,11 +401,12 @@ class Census:
         declared_once(masked, re.escape(LOOP_HEAD), "the `%s` census loop" % LOOP_HEAD)
         for name in ("DOCS_CENSUS_ERASE_PHRASES", "DOCS_CENSUS_DATED_RECORDS",
                      "DOCS_CENSUS_ERASE_DOC", "CRYPTO_ERASABLE_ENVELOPE_VERSIONS"):
-            declared_once(masked, r"\bconst %s:" % name, "const " + name)
+            declared_once(masked, r"\bconst %s\s*:" % name, "const " + name)
         self.phrases = string_list(clean, "DOCS_CENSUS_ERASE_PHRASES")
         self.dated = string_list(clean, "DOCS_CENSUS_DATED_RECORDS")
-        self.suffixes = census_filter(clean)
         self.folder = census_folder(clean)
+        self.suffixes = census_filter(clean, self.folder)
+        pin_test(clean, self.folder)
         self.erase_doc = strings(const_body(clean, "DOCS_CENSUS_ERASE_DOC"))[0]
         self.bytes = erasable_bytes(clean, scope_clean)
 
@@ -424,7 +510,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     def mutated(self, old, new):
         """Return the Rust source with `old` replaced by `new` (the replace must hit)."""
-        self.assertIn(old, self.text)
+        self.assertIn(old, self.text, "mutation anchor %r drifted out of the Rust source" % old)
         return self.text.replace(old, new, 1)
 
     def test_filter_rejects_a_non_literal_term(self):
@@ -529,14 +615,14 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         start = self.census_bytes_expression()
         end = self.text.index(".collect();", start)
         text = self.text[:end] + '\n            .chain(std::iter::once("0x07".to_string()))' + self.text[end:]
-        with self.assertRaisesRegex(AssertionError, r"erasable-bytes expression.*0x07"):
+        with self.assertRaisesRegex(AssertionError, r"statement \d+ changed.*0x07"):
             Census(text)
 
     def test_bytes_expression_rejects_another_byte_format(self):
         start = self.census_bytes_expression()
         end = self.text.index('"0x{version:02x}"', start)
         text = self.text[:end] + '"0x{version:02X}"' + self.text[end + len('"0x{version:02x}"'):]
-        with self.assertRaisesRegex(AssertionError, r"erasable-bytes expression.*02X"):
+        with self.assertRaisesRegex(AssertionError, r"statement \d+ changed.*02X"):
             Census(text)
 
     def test_loop_rejects_a_changed_lowercase_step(self):
@@ -558,10 +644,11 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, r'skip_unless!\(rel\.contains\("sketch"\)\)'):
             Census(text)
 
-    def test_loop_ignores_a_continue_inside_a_raw_string(self):
-        """Clause and body matching run on the literal-masked body: a raw string is not code."""
-        text = self.mutated('panic!("{rel}: read: {e}")',
-                            'panic!(r#"{rel}: read: {e} if x { continue; } for rel in stdout.lines() {"#)')
+    def test_chunks_ignore_a_continue_inside_a_raw_string(self):
+        """Chunk bounds and the fn lookup run on the literal-masked text: a raw string is not code."""
+        raw = 'panic!(r#"if x { continue; } for rel in stdout.lines() {"#);'
+        self.assertEqual(chunks("a { " + raw + " }"), ["a{", compact(raw), "}"])
+        text = self.text + '\nfn x() { let r = r#"fn docs_census_8315_on( {"#; }\n'
         self.assertEqual(Census(text).suffixes, self.census.suffixes)
 
     def test_nested_block_comment_hides_a_stale_declaration(self):
@@ -594,8 +681,108 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         masked = mask_literals(self.census.clean)
         for name in ("DOCS_CENSUS_ERASE_PHRASES", "DOCS_CENSUS_DATED_RECORDS",
                      "DOCS_CENSUS_ERASE_DOC", "CRYPTO_ERASABLE_ENVELOPE_VERSIONS"):
-            self.assertEqual(len(re.findall(r"\bconst %s:" % name, masked)), 1, name)
+            self.assertEqual(len(re.findall(r"\bconst %s\s*:" % name, masked)), 1, name)
         self.assertEqual(masked.count(LOOP_HEAD), 1)
+
+    def test_function_rejects_an_extra_failure_after_the_loop(self):
+        text = self.mutated("        Ok(DocsCensus { census, failures })",
+                            '        if census.len() < 4 {\n            failures.push("few docs".to_string());\n'
+                            "        }\n        Ok(DocsCensus { census, failures })")
+        with self.assertRaisesRegex(AssertionError, r"census\.len\(\)<4"):
+            Census(text)
+
+    def test_function_rejects_a_rewritten_stdout(self):
+        old = "let stdout = String::from_utf8_lossy(&listing.stdout);"
+        text = self.mutated(old, old[:-1] + '.replace("docs/reviews/", "docs/kept/");')
+        with self.assertRaisesRegex(AssertionError, r"docs/reviews/"):
+            Census(text)
+
+    def test_function_rejects_an_extra_listed_file(self):
+        old = "let stdout = String::from_utf8_lossy(&listing.stdout);"
+        text = self.mutated(old, old + '\n        let stdout = format!("{stdout}\\nREADME.md");')
+        with self.assertRaisesRegex(AssertionError, r"README\.md"):
+            Census(text)
+
+    def test_function_rejects_a_shadowing_let(self):
+        for old, new, shown in (
+                ("let mut census: Vec<String> = Vec::new();",
+                 "let mut census: Vec<String> = Vec::new();\n        let mut census: Vec<String> = vec![];",
+                 r"census:Vec<String>=vec!\[\]"),
+                ("let flat = text.to_lowercase();",
+                 'let flat = text.to_lowercase();\n            let flat = flat.replace("-", " ");',
+                 r"letflat=flat\.replace"),
+        ):
+            with self.subTest(shown=shown):
+                with self.assertRaisesRegex(AssertionError, shown):
+                    Census(self.mutated(old, new))
+
+    def test_function_rejects_a_changed_early_statement(self):
+        for old, new, shown in (
+                ('root.join(".git").exists()', 'root.join(".gitx").exists()', r"\.gitx"),
+                ("DOCS_CENSUS_FOREIGN_TOPLEVEL)),\n        }",
+                 "DOCS_CENSUS_FOREIGN_TOPLEVEL)),\n        }\n        let _ = 0;", r"let_=0"),
+                ("listing.status.success(),", "!listing.status.success(),", r"!listing\.status"),
+        ):
+            with self.subTest(shown=shown):
+                with self.assertRaisesRegex(AssertionError, shown):
+                    Census(self.mutated(old, new))
+
+    def test_rust_test_rejects_a_stricter_assertion(self):
+        text = self.mutated("            found.failures.is_empty(),\n",
+                            "            found.failures.is_empty() && found.census.len() >= 3,\n")
+        with self.assertRaisesRegex(AssertionError, r"census\.len\(\)>=3"):
+            Census(text)
+
+    def test_rust_test_rejects_an_ignore_attribute_and_a_dropped_assert(self):
+        text = self.mutated("    #[test]\n    fn docs_describing_erase_list_every_erasable_version_8315",
+                            "    #[test]\n    #[ignore]\n    fn docs_describing_erase_list_every_erasable_version_8315")
+        with self.assertRaisesRegex(AssertionError, r"directly under"):
+            Census(text)
+        text = self.mutated('found.census.iter().any(|rel| rel == DOCS_CENSUS_ERASE_DOC)', "true")
+        with self.assertRaisesRegex(AssertionError, r"assert!\(true"):
+            Census(text)
+
+    def test_erasable_bytes_rejects_a_literal_or_unknown_element(self):
+        old = "[RECORD_ENVELOPE_VERSION, SCOPE_ENVELOPE_VERSION];"
+        for new, shown in (("[RECORD_ENVELOPE_VERSION, 0x07];", r"element '0x07' is not a known"),
+                           ("[RECORD_ENVELOPE_VERSION, OTHER_ENVELOPE_VERSION];", r"OTHER_ENVELOPE_VERSION"),
+                           ("[RECORD_ENVELOPE_VERSION, SCOPE_ENVELOPE_VERSION, 0x07];", r"\[u8; 2\] but 3"),
+                           ("[RECORD_ENVELOPE_VERSION];", r"\[u8; 2\] but 1")):
+            with self.subTest(new=new):
+                with self.assertRaisesRegex(AssertionError, shown):
+                    Census(self.mutated(old, new))
+        with self.assertRaisesRegex(AssertionError, r"\[u8; 3\] but 2"):
+            Census(self.mutated("CRYPTO_ERASABLE_ENVELOPE_VERSIONS: [u8; 2]",
+                                "CRYPTO_ERASABLE_ENVELOPE_VERSIONS: [u8; 3]"))
+        self.assertEqual(Census(self.mutated(old, "[RECORD_ENVELOPE_VERSION, SCOPE_ENVELOPE_VERSION,];")).bytes,
+                         ["0x03", "0x05"])
+
+    def test_escapes_in_parsed_literals_are_decoded(self):
+        self.assertEqual(strings(r'"crypto\x2deras", "a\u{5f}b", "c\\d", "e\"f", "g\
+                                   h"'), ["crypto-eras", "a_b", "c\\d", 'e"f', "gh"])
+        with self.assertRaisesRegex(AssertionError, r"escape the mirror cannot decode"):
+            strings(r'"a\qb"')
+        phrase = self.mutated('"crypto-eras",', r'"crypto\x2deras",')
+        self.assertEqual(Census(phrase).phrases, self.census.phrases)
+        suffix = self.mutated('rel.ends_with(".md")', r'rel.ends_with(".m\x64")')
+        self.assertEqual(Census(suffix).suffixes, self.census.suffixes)
+
+    def test_star_slash_star_is_not_a_stray_closer(self):
+        self.assertEqual(strip_comments("a*/*b*/c"), "a* c")
+        self.assertEqual(Census(self.text + "\nfn f() { let _ = a*/*b*/c; }\n").suffixes,
+                         self.census.suffixes)
+
+    def test_spaced_const_colon_is_read_and_counted(self):
+        live = "const DOCS_CENSUS_ERASE_PHRASES: [&str; 4] = ["
+        spaced = "const DOCS_CENSUS_ERASE_PHRASES : [&str; 4] = ["
+        self.assertEqual(Census(self.mutated(live, spaced)).phrases, self.census.phrases)
+        stale = '#[cfg(any())]\n    const DOCS_CENSUS_ERASE_PHRASES: [&str; 1] = ["old one"];\n    '
+        with self.assertRaisesRegex(AssertionError, r"const DOCS_CENSUS_ERASE_PHRASES exactly once"):
+            Census(self.mutated(live, stale + spaced))
+
+    def test_mutation_anchor_that_drifts_names_itself(self):
+        with self.assertRaisesRegex(AssertionError, r"mutation anchor.*not-in-the-source"):
+            self.mutated("not-in-the-source", "x")
 
     def test_rules_json_carries_the_walk_guard_entry(self):
         entry = rules_entry()
