@@ -117,6 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed (#8291 — public docs relative links are guarded)
 
 - **Broken relative links in the public docs are repaired and guarded in CI.** `scripts/ci/tests/test_docs_relative_links_8291.py` (run by the `scripts/ci/tests` discover root) fails on any relative link in `CHANGELOG.md`, `SECURITY.md`, `README.md`, `CLAUDE.md` and `docs/security` whose target does not exist inside the checkout; markdown files that are themselves symlinks are skipped as sources; a link to a symlinked markdown file inside the checkout resolves; `..` is resolved lexically (never through a directory symlink); protocol-relative `//` targets, climbs out of the repository root, targets the operating system cannot resolve (such as an over-long name) and a trailing `/` on a file target are broken and named as such.
+  The envelope README now documents the digits-only STEP_DURATION_SECS refusal under exit 65 beside the
+  bad AI_MEMORY_SMOKE_RUN case, and a guard row keeps the README naming every exit-65 variable (#8313).
 
 ### Fixed (#8301 / #8305 — the shared-namespace-claims self-test derives its ceilings and cleans up after itself)
 
