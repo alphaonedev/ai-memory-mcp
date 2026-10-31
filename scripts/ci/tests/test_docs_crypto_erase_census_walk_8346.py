@@ -89,7 +89,28 @@ What the guard closes (`CLOSED_CLASSES`; each is a class that a round 4 to 8 rev
    `crate-type`, and an edition other than 2024 are rejected. The tracked `.cargo/` files are exactly
    `.cargo/audit.toml` (`git ls-files -z`, a git error fails closed), a `.cargo/config(.toml)` with `[env]`,
    `runner`, `rustc-wrapper`, `rustc`, `rustflags` (or `linker`, `include`, `patch`, `source`) is rejected, and
-   `.config/nextest.toml` keeps today's tables and keys (a filter or override can skip the census test).
+   `.config/nextest.toml` keeps today's tables and keys (a filter or override can skip the census test). A
+   workspace table (`[workspace]`, any key) is rejected (`default-members` or `exclude` changes what a bare `cargo test` compiles), and
+   rust-toolchain.toml is read (missing fails closed): only `[toolchain]` with `channel` equal to the current pin
+   (1.98.0) and `profile`, no `path` key, and no legacy `rust-toolchain` file.
+11. crate-local use targets: every crate-local path of the pinned `use` lines (`crate::test_support::{EnvGuard,
+   env_lock}` and `scope::{RecordBinding, SCOPE_ENVELOPE_VERSION}`) is resolved to its module file the way rustc does
+   (src/lib.rs `mod NAME;` anywhere in the file, `src/NAME.rs` or `src/NAME/mod.rs`, none or both present fails closed)
+   and that file is read as an input: no `trait` declaration (a trait imported by name adds methods that win method
+   resolution over `str::to_lowercase` or `Iterator::any`), no `pub use ... as` and no `pub use` glob, and each imported
+   name declared exactly once of any kind at the top level of the file (a nested `mod tests` that re-imports it
+   with `use super::...` is not a declaration). src/test_support.rs is declared after `pub mod encryption;`, so the
+   lib.rs prefix reader never reached it.
+12. escaped TOML keys: a backslash in a double-quoted key or header segment of Cargo.toml, rust-toolchain.toml,
+   .config/nextest.toml or a .cargo config fails closed ("an escaped TOML key is not read by this guard"): cargo decodes
+   the escape (`"std"` is the key `std`), the mirror compares raw text, and the live files carry none.
+13. impl-target spellings: the target of every `impl` is normalised before it is matched (`r#` removed from every
+   path segment, enclosing parentheses, `&`, lifetimes, `mut` and `dyn` stripped), and an own-type identifier (a type the
+   region declares) anywhere outside the region, raw or plain, is rejected, which closes `type Alias = DocsCensus;`
+   and `use DocsCensus as Other;` followed by `impl Drop for Alias`. The stricter form is used because the live count of
+   such identifiers outside the region is 0 (`OWN_TYPE_USES_OUTSIDE_REGION`), so no allow-list is needed.
+14. C-string literals: `c"..."` and `cr#"..."#` are lexed like `b"..."` and `br#"..."#`, so a declaration-shaped C string
+   is masked, never read.
 
 Everything else is read by a value parser: the phrase, dated-record and erase-doc constants,
 and the whole `CRYPTO_ERASABLE_ENVELOPE_VERSIONS` array (`const` only, `[u8; N]`, N equal to
@@ -108,11 +129,13 @@ literals) are parsed from the pinned region text, and the listing is split on NU
 fixes (a wider `env_remove` set and `-z`), and the mirror needs no second edit when that region is re-pinned.
 
 Inputs the guard reads: src/encryption/mod.rs, src/encryption/scope.rs and every file below src/encryption/, src/lib.rs
-and the module files of its prefix (`src/NAME.rs` or `src/NAME/mod.rs`), Cargo.toml, a repo-root build.rs
+and the module files of its prefix (`src/NAME.rs` or `src/NAME/mod.rs`), the module file of every crate-local use target
+(src/test_support.rs and src/encryption/scope.rs today), Cargo.toml, rust-toolchain.toml, a repo-root build.rs
 (existence), `.cargo/` (listing and config files), `.config/nextest.toml` and the tracked docs listing.
 Inputs the guard does not read: the process environment of the CI runner (including RUSTFLAGS and CARGO_* variables),
-the workflow files that choose the test command, `~/.cargo` configuration, Cargo.lock and rust-toolchain.toml; the
-first three are runner state outside the tree, the last two cannot rename a name the region resolves.
+the workflow files that choose the test command, `~/.cargo` configuration and Cargo.lock; the first three are runner
+state outside the tree (a change to a workflow file is a CI-definition change that forces a full run), and Cargo.lock
+cannot redirect a source the manifest does not declare (cargo re-resolves, or fails under `--locked`).
 """
 import functools
 import json
@@ -135,10 +158,11 @@ ENCRYPTION_DIR = "src/encryption"
 SCRATCH = REPO / ".local-runs"
 CLOSED_CLASSES = ("region text", "call graph", "declarations of any item kind", "import surface",
                   "rebinding forms", "attribute content", "module set", "crate-level macros", "region borders",
-                  "module files", "own-type impls", "build inputs")
+                  "module files", "own-type impls", "build inputs", "crate-local use targets",
+                  "escaped TOML keys", "impl-target spellings", "C-string literals", "workspace table")
 
 RUST_TOKEN = re.compile(
-    r'(?P<raw>(?<![A-Za-z0-9_])b?r(?P<h>#*)".*?"(?P=h))'
+    r'(?P<raw>(?<![A-Za-z0-9_])(?:b|c)?r(?P<h>#*)".*?"(?P=h))'
     r'|(?P<str>"(?:[^"\\]|\\.)*")'
     r"|(?P<chr>'(?:\\.[^'\n]*|[^'\\\n])')"
     r"|(?P<cmt>//[^\n]*|/\*.*?\*/)",
@@ -172,13 +196,14 @@ def input_exists(rel, overrides):
     return (REPO / rel).is_file()
 
 
+# `c"..."` and `cr#"..."#` are C-string literals (Rust 1.77+): the raw prefix is `b`, `c` or none.
 RUST_LITERAL = re.compile(
-    r'(?P<raw>(?<![A-Za-z0-9_])b?r(?P<h>#*)".*?"(?P=h))'
+    r'(?P<raw>(?<![A-Za-z0-9_])(?:b|c)?r(?P<h>#*)".*?"(?P=h))'
     r'|(?P<str>"(?:[^"\\]|\\.)*")'
     r"|(?P<chr>'(?:\\.[^'\n]*|[^'\\\n])')",
     re.S,
 )
-LEX_START = re.compile(r"[\"'/*rb]")
+LEX_START = re.compile(r"[\"'/*rbc]")
 
 
 def strip_comments(text):
@@ -388,7 +413,7 @@ def strings(body):
         if m.group("str") is not None:
             found.append(unescape(m.group("str")[1:-1]))
         elif m.group("raw") is not None:
-            found.append(re.fullmatch(r'b?r(#*)"(.*)"\1', m.group("raw"), re.S).group(2))
+            found.append(re.fullmatch(r'[bc]?r(#*)"(.*)"\1', m.group("raw"), re.S).group(2))
     return found
 
 
@@ -1117,6 +1142,26 @@ def format_arguments(region_text):
 
 
 OWN_TYPE_KINDS = ("struct", "enum", "union", "type")
+# Live count of own-type identifiers outside the region (pinned by a test): the stricter alias form needs no allow-list.
+OWN_TYPE_USES_OUTSIDE_REGION = 0
+# What may stand in front of the type path of an `impl` target: `(`, `&`, a lifetime, `mut`, `dyn`, a raw pointer, `::`.
+IMPL_TARGET_PREFIX = re.compile(r"\s*(?:\(|&|'\w+|mut\b|dyn\b|\*\s*(?:const|mut)\b|::)")
+IMPL_TARGET_PATH = re.compile(r"\s*(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)")
+
+
+def impl_target(target):
+    """Return the match whose group 1 is the last path segment naming an `impl` target, `r#` and parentheses removed.
+
+    `r#DocsCensus`, `r#self::DocsCensus`, `(DocsCensus)` and `((&DocsCensus))` all name the same type as the plain
+    spelling, so they are normalised before the name is read (#8346 round 11, security L-A).
+    """
+    target = re.sub(r"(?<!\w)r#(?=[A-Za-z_])", "", target)
+    while True:
+        prefix = IMPL_TARGET_PREFIX.match(target)
+        if prefix is None:
+            break
+        target = target[prefix.end():]
+    return IMPL_TARGET_PATH.match(target)
 
 
 def derive_external_names(region_masked, masked, region_text=""):
@@ -1174,8 +1219,7 @@ def reject_shadowing(clean, span):
         generics = {name for kind, name, pos in generic_names(masked[head.start():head.end()])}
         text = head.group(1)
         text = text[text.index(">") + 1:] if text.lstrip().startswith("<") and ">" in text else text
-        target = re.split(r"\bfor\b(?!\s*<)", text)[-1]
-        named = re.match(r"\s*&?\s*(?:'\w+\s+)?(?:mut\s+)?(?:dyn\s+)?(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", target)
+        named = impl_target(re.split(r"\bfor\b(?!\s*<)", text)[-1])
         if named is not None and named.group(1) in own_types and not span[0] <= head.start() < span[1]:
             raise AssertionError("%s has an `impl` for `%s` outside the census region, a type the region declares: "
                                  "an inherent or trait impl (`Drop`) runs code inside the pinned census"
@@ -1183,6 +1227,16 @@ def reject_shadowing(clean, span):
         if named is not None and (named.group(1) in external or named.group(1) in generics):
             raise AssertionError("%s has an `impl ... for` `%s`, a name the census region resolves outside itself "
                                  "(or a blanket impl over a generic parameter)" % (RUST_SRC, named.group(1)))
+    # Stricter form (the live count is OWN_TYPE_USES_OUTSIDE_REGION = 0, so no allow-list is needed): an own-type
+    # identifier ANYWHERE outside the region, raw (`r#DocsCensus`) or plain, is rejected. A `type Alias = DocsCensus;`
+    # or `use DocsCensus as Other;` outside the region followed by `impl Drop for Alias` runs code in the census
+    # through a name the impl-target scan never sees (#8346 round 11, security L-A).
+    for name in sorted(own_types):
+        for use in re.finditer(r"(?<!\w)%s\b" % re.escape(name), masked):
+            if not span[0] <= use.start() < span[1]:
+                raise AssertionError("%s names the type `%s` the census region declares outside the region (an alias, "
+                                     "a path or an impl target): the type may only be named by the region itself"
+                                     % (RUST_SRC, name))
     return external, region_macros(region_masked)
 
 
@@ -1465,9 +1519,18 @@ NEXTEST_KEYS = frozenset({"retries", "fail-fast", "slow-timeout", "status-level"
 
 
 def toml_dotted(text):
-    """Split a dotted TOML key or header on the dots outside quotes; each segment is stripped and unquoted."""
+    """Split a dotted TOML key or header on the dots outside quotes; each segment is stripped and unquoted.
+
+    A backslash in a double-quoted segment (or anywhere outside a literal `'...'` segment) raises: cargo decodes the
+    TOML basic-string escapes of a key (`"std"` is the key `std`), the mirror compares raw text, so every deny
+    check would fail open on an escaped spelling. The live Cargo.toml, .config/nextest.toml and .cargo/audit.toml
+    carry none, so failing closed is exact and costs nothing (#8346 round 11, code L2 / security L-B).
+    """
     parts, buf, quote = [], [], ""
     for char in text:
+        if char == "\\" and quote != "'":
+            raise AssertionError("an escaped TOML key is not read by this guard: %r (cargo decodes the escape, the "
+                                 "mirror would compare the raw spelling, so a deny check could fail open)" % text)
         if quote:
             if char == quote:
                 quote = ""
@@ -1648,8 +1711,9 @@ def reject_manifest(text, roots, overrides):
                              "checks before changing the import surface"
                              % (len(pinned), sorted(pinned), PINNED_CRATES_COUNT))
     denied = (roots | set(STD_FAMILY) | {"scope"}) - pinned
-    patches, edition = set(), None
+    patches, edition, workspace = set(), None, False
     for path, value in toml_entries(text, MANIFEST):
+        workspace = workspace or path[0] == "workspace"
         slot = dependency_slot(path)
         if slot is not None:
             name = slot[0].replace("-", "_")
@@ -1681,6 +1745,10 @@ def reject_manifest(text, roots, overrides):
         raise AssertionError("%s has `[patch.%s]` entry `%s`: only %s are allowed, a patch swaps a crate for "
                              "other code" % (MANIFEST, registry, name,
                                              ", ".join("%s.%s" % pair for pair in sorted(ALLOWED_PATCHES))))
+    if workspace:
+        raise AssertionError("%s has a `[workspace]` table: `default-members` or `exclude` there changes what a bare "
+                             "`cargo test` compiles, so the census test could drop out of the build (the manifest "
+                             "has none today)" % MANIFEST)
     if edition != PACKAGE_EDITION:
         raise AssertionError("%s edition is %r, expected %r: the edition changes name resolution and the "
                              "prelude" % (MANIFEST, edition, PACKAGE_EDITION))
@@ -1748,9 +1816,153 @@ def reject_nextest_config(overrides):
                                  % (NEXTEST_CONFIG, ".".join(path), sorted(NEXTEST_KEYS)))
 
 
+TOOLCHAIN_FILE = "rust-toolchain.toml"
+TOOLCHAIN_LEGACY = "rust-toolchain"
+TOOLCHAIN_CHANNEL = "1.98.0"
+TOOLCHAIN_KEYS = ("channel", "profile")
+
+
+def reject_toolchain(overrides):
+    """Read rust-toolchain.toml and raise unless it is today's `[toolchain]` with the channel pinned.
+
+    rustup honours a `[toolchain] path` key and any channel, so the file selects which std and rustc compile the
+    region. It is read as an input (missing fails closed): only the table `[toolchain]` with the keys `channel` (equal to
+    `TOOLCHAIN_CHANNEL`) and `profile` is allowed, no `path`. A tracked legacy `rust-toolchain` file takes precedence
+    over the .toml for rustup, so its existence fails closed too.
+    """
+    if input_exists(TOOLCHAIN_LEGACY, overrides):
+        raise AssertionError("a repo-root %s file exists: rustup reads it before %s, so the compiler could be "
+                             "chosen by a file the mirror does not parse" % (TOOLCHAIN_LEGACY, TOOLCHAIN_FILE))
+    channel = None
+    for path, value in toml_entries(read_input(TOOLCHAIN_FILE, overrides), TOOLCHAIN_FILE):
+        if value is None:
+            if path != ("toolchain",):
+                raise AssertionError("%s has the table `[%s]`: only `[toolchain]` is allowed"
+                                     % (TOOLCHAIN_FILE, ".".join(path)))
+            continue
+        if path[:1] != ("toolchain",) or len(path) != 2:
+            raise AssertionError("%s sets `%s` outside the `[toolchain]` keys" % (TOOLCHAIN_FILE, ".".join(path)))
+        if path[1] == "path":
+            raise AssertionError("%s sets `[toolchain] path`: rustup would compile the census with the toolchain "
+                                 "at that path, not the pinned one" % TOOLCHAIN_FILE)
+        if path[1] not in TOOLCHAIN_KEYS:
+            raise AssertionError("%s sets `[toolchain] %s`: only %s are allowed"
+                                 % (TOOLCHAIN_FILE, path[1], "/".join(TOOLCHAIN_KEYS)))
+        if path[1] == "channel":
+            channel = unquote(value)
+    if channel != TOOLCHAIN_CHANNEL:
+        raise AssertionError("%s channel is %r, expected %r: another channel compiles the census with another "
+                             "std and rustc" % (TOOLCHAIN_FILE, channel, TOOLCHAIN_CHANNEL))
+
+
+def local_modules(lib_masked):
+    """Return {name: declaration count} of the `mod NAME;` and `mod NAME {` items of the masked src/lib.rs."""
+    found = {}
+    for item in re.finditer(r"(?<![\w'#])mod\s+(?:r#)?([A-Za-z_]\w*)\s*([;{])", lib_masked):
+        found.setdefault(item.group(1), []).append(item.group(2))
+    return found
+
+
+def local_module_file(directory, name, overrides, owner):
+    """Resolve the out-of-line module `name` below `directory` (`NAME.rs` or `NAME/mod.rs`); fail closed otherwise."""
+    flat, nested = "%s/%s.rs" % (directory, name), "%s/%s/mod.rs" % (directory, name)
+    present = [rel for rel in (flat, nested) if input_exists(rel, overrides)]
+    if len(present) != 1:
+        raise AssertionError("%s imports from the crate-local module `%s` and %d of %s / %s exist: the mirror reads "
+                             "every module an imported name comes from and fails closed on one it cannot resolve"
+                             % (owner, name, len(present), flat, nested))
+    return present[0]
+
+
+def local_import_targets(lib_clean, overrides):
+    """Return {module file: imported names} for every crate-local path of the pinned `use` lines (`USE_SURFACE`).
+
+    `crate::NAME::item` is the module `NAME` declared once, out of line, in src/lib.rs (anywhere in the file, so
+    `crate::test_support`, which `#[cfg(test)] mod test_support;` declares AFTER `pub mod encryption;`, is found);
+    `scope::item` is src/encryption/scope.rs; `super::*` and `self::*` are mod.rs itself, which is already read.
+    Any other `super::` / `self::` path, or a module that is not declared once with `;`, fails closed.
+    """
+    lib_masked = mask_literals(lib_clean)
+    declared = local_modules(lib_masked)
+    targets = {}
+    for line in USE_SURFACE:
+        found = re.match(r"(?:pub)?use(.*);$", line)
+        tokens = USE_TOKEN.findall(found.group(1)) + [""] * 3
+        bound, _ = use_tree(tokens, 0, [])
+        for path, name in bound:
+            if path[0] == "crate" and len(path) >= 3:
+                if declared.get(path[1]) != [";"]:
+                    raise AssertionError("%s must declare `mod %s;` exactly once (found %r): `use crate::%s::...` "
+                                         "names an item of a module the mirror could not read"
+                                         % (LIB_SRC, path[1], declared.get(path[1]), path[1]))
+                begin = max(lib_masked.rfind(c, 0, re.search(r"(?<![\w'#])mod\s+(?:r#)?%s\b" % re.escape(path[1]),
+                                                              lib_masked).start()) for c in ";{}") + 1
+                header = lib_masked[begin:lib_masked.index(";", begin) + 1]
+                reject_attributes(header, LIB_SRC, CRATE_DENIED_ATTRIBUTE_WORDS)
+                rel = local_module_file("src", path[1], overrides, LIB_SRC)
+            elif path[0] == REEXPORT_PATH_ROOT and len(path) >= 2:
+                rel = local_module_file(ENCRYPTION_DIR, path[0], overrides, RUST_SRC)
+            elif path[0] in ("super", "self", "crate"):
+                raise AssertionError("%s imports `%s`, a crate-local path the mirror cannot resolve to a module file"
+                                     % (RUST_SRC, "::".join(path)))
+            else:
+                continue
+            targets.setdefault(rel, set()).add(name)
+    return targets
+
+
+def top_level(masked):
+    """Return `masked` with every character at brace depth > 0 blanked: the items a module path can name.
+
+    `crate::test_support::EnvGuard` names a top-level item of that module; a `use super::EnvGuard` inside its
+    nested `mod tests` or a `struct` in a fn body binds in its own scope only. Positions are preserved.
+    """
+    depth, out = 0, []
+    for char in masked:
+        if char == "}":
+            depth -= 1
+        out.append(char if depth <= 0 or char == "\n" else " ")
+        if char == "{":
+            depth += 1
+    return "".join(out)
+
+
+def reject_import_target(rel, text, names):
+    """Raise unless the module file `rel` cannot change what the imported `names` mean in mod.rs / `mod tests`.
+
+    `use path::{name}` imports every namespace of `name`, so a `trait name` next to the real item, with a blanket impl
+    that carries a by-value method (`to_lowercase(self)`, `any(self, ..)`) the census calls, is picked by method
+    resolution ahead of the std method while mod.rs stays byte-identical (#8346 round 11, code L1). Every `trait` of
+    the file is therefore rejected (none today), as are a `pub use ... as`, a `pub use` glob, and an imported name that
+    is not declared exactly once of any kind (item, `use` binding or `mod`) in the file.
+    """
+    masked = mask_literals(strip_comments(text))
+    for found in re.finditer(r"(?<![\w'#])trait\s+(?:r#)?([A-Za-z_]\w*)", masked):
+        raise AssertionError("%s declares `trait %s`: a trait imported with the pinned `use` line adds methods that "
+                             "method resolution picks ahead of the std ones the census calls" % (rel, found.group(1)))
+    for found in USE_STATEMENT.finditer(masked):
+        if found.group(0).lstrip().startswith("pub") and (re.search(r"\bas\b", found.group(1)) or "*" in found.group(1)):
+            raise AssertionError("%s has the re-export `%s`: a `pub use ... as` or glob can bring in an item named "
+                                 "like an imported name" % (rel, compact(found.group(0))))
+    top = top_level(masked)
+    for name in sorted(names):
+        count = (len([d for d in declared_names(top) if d[1] == name]) + len(use_bindings(top, name))
+                 + len(re.findall(r"(?<![\w'#])mod\s+(?:r#)?%s\b" % re.escape(name), top)))
+        if count != 1:
+            raise AssertionError("%s must declare the imported name `%s` exactly once of any kind, found %d"
+                                 % (rel, name, count))
+
+
+def reject_import_targets(lib_clean, overrides):
+    """Read every crate-local module the pinned `use` lines import from (see `local_import_targets`)."""
+    for rel, names in sorted(local_import_targets(lib_clean, overrides).items()):
+        reject_import_target(rel, read_input(rel, overrides), names)
+
+
 def read_build_inputs(roots, overrides):
-    """Read Cargo.toml, build.rs, `.cargo/` and `.config/`; raise when any of them can change the census."""
+    """Read Cargo.toml, rust-toolchain.toml, build.rs, `.cargo/` and `.config/`; raise when any can change the census."""
     reject_manifest(read_input(MANIFEST, overrides), roots, overrides)
+    reject_toolchain(overrides)
     reject_cargo_config(overrides)
     pin_tracked(CARGO_DIR, CARGO_TRACKED, overrides)
     pin_tracked(NEXTEST_DIR, NEXTEST_TRACKED, overrides)
@@ -1793,6 +2005,7 @@ class Census:
             reject_module_file(rel, read_input(rel, overrides), frozenset(self.region_macros))
         for rel in tree_files(overrides):
             reject_tree_file(rel, strip_comments(read_input(rel, overrides)))
+        reject_import_targets(lib_clean, overrides)
         read_build_inputs(path_roots(mask_literals(clean)[span[0]:span[1]]), overrides)
 
     def reads(self, rel):
@@ -2872,7 +3085,187 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         """code r8 INFO: the docstring claims exactly what the code checks."""
         for phrase in CLOSED_CLASSES:
             self.assertIn(phrase, __doc__)
-        self.assertEqual(len(CLOSED_CLASSES), 12)
+        self.assertEqual(len(CLOSED_CLASSES), 17)
+
+    # ---- round 11 (code r10 L1/L2/I1, security r10 L-A/L-B/I-1..I-5): one contiguous block of red-first tests ----
+
+    def census_signature(self, census):
+        """The parsed census values a decoy must leave exactly as the live source gives them."""
+        return (census.erase_doc, census.bytes, census.phrases, census.dated, census.suffixes, census.folder)
+
+    def test_crate_local_use_target_declaring_a_trait_is_rejected_and_named(self):
+        """code r10 L1: a trait next to the imported item rides in with the pinned `use` line (blanket `to_lowercase`)."""
+        support = "src/test_support.rs"
+        self.assertTrue((REPO / support).is_file())
+        for trait in ("pub(crate) trait env_lock { fn to_lowercase(self) -> Self; }\n"
+                      "impl<T> env_lock for T { fn to_lowercase(self) -> T { self } }\n",
+                      "pub(crate) trait EnvGuard { fn any(self) -> bool; }\n",
+                      "pub(crate) trait Unrelated8346 {}\n",
+                      "pub(crate) unsafe trait Marker8346 {}\n",
+                      "pub(crate) trait r#Raw8346 {}\n"):
+            with self.subTest(trait=trait):
+                with self.assertRaisesRegex(AssertionError, r"src/test_support\.rs declares `trait \w+`"):
+                    Census(self.text, overrides=self.with_module(support, "", "\n" + trait))
+        scope = "src/encryption/scope.rs"
+        for trait in ("pub trait RecordBinding { fn any(self, other: bool) -> bool; }\n",
+                      "pub(crate) trait Unrelated8346 {}\n"):
+            with self.subTest(trait=trait):
+                with self.assertRaisesRegex(AssertionError, r"src/encryption/scope\.rs declares `trait \w+`"):
+                    Census(self.text, overrides=self.with_module(scope, "", "\n" + trait))
+
+    def test_crate_local_use_target_must_declare_each_imported_name_once_at_top_level(self):
+        """code r10 L1: a second top-level declaration, a re-export with `as` or a glob in the use target is loud."""
+        support = "src/test_support.rs"
+        for code, shown in (("pub(crate) struct EnvGuard;", r"imported name `EnvGuard` exactly once.*found 2"),
+                            ("pub(crate) fn env_lock() {}", r"imported name `env_lock` exactly once.*found 2"),
+                            ("pub use std::string::String as env_lock;", r"re-export"),
+                            ("pub(crate) use std::string::*;", r"re-export")):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, shown):
+                    Census(self.text, overrides=self.with_module(support, "", "\n" + code + "\n"))
+        # an unrelated top-level item and a nested module's own `use super::{..}` are not declarations of the name
+        Census(self.text, overrides=self.with_module(support, "", "\npub(crate) struct Unrelated8346;\n"))
+        self.assertEqual(self.census_signature(Census(self.text)), self.census_signature(self.census))
+
+    def test_crate_local_module_that_cannot_be_resolved_fails_closed(self):
+        """code r10 L1: the use target's module declaration and file are read, or the guard fails closed."""
+        anchor = "#[cfg(test)]\nmod test_support;"
+        with self.assertRaisesRegex(AssertionError, r"mod test_support;.*exactly once"):
+            Census(self.text, overrides={LIB_SRC: self.lib_mutated(anchor, anchor + "\nmod test_support;")})
+        with self.assertRaisesRegex(AssertionError, r"src/test_support\.rs"):
+            Census(self.text, overrides={"src/test_support.rs": None})
+        with self.assertRaisesRegex(AssertionError, r"crate-local module `test_support`"):
+            Census(self.text, overrides={"src/test_support/mod.rs": "\n"})
+        with self.assertRaisesRegex(AssertionError, r"src/lib\.rs has the attribute `#\[path=\]`"):
+            Census(self.text, overrides={LIB_SRC: self.lib_mutated(anchor, '#[path = "sibling_8346.rs"]\n' + anchor)})
+
+    def test_escaped_toml_keys_in_cargo_toml_fail_closed(self):
+        """code r10 L2 / security r10 L-B (C2-C8): cargo decodes `\\uXXXX` in a quoted key, the mirror would not."""
+        for code in ('["d\\u0065pendencies"]\nstd = { path = "facade", package = "fakestd" }',
+                     '[dependencies]\n"st\\u0064" = { path = "facade", "package" = "fakestd" }',
+                     '[dependencies]\nstd = { path = "facade", "p\\u0061ckage" = "fakestd" }',
+                     '[dependencies]\n"st\\u0064" = { path = "facade", "p\\u0061ckage" = "fakestd" }',
+                     "[target.\"cfg(un\\u0069x)\".dependencies]\nstd = { path = \"facade\" }",
+                     '[package]\n"bu\\u0069ld" = "gen.rs"',
+                     '["r\\u0065place"]\nx = "1"',
+                     '[dependencies]\n"sha\\u0032" = { git = "https://example.invalid/sha2" }',
+                     '[dependencies]\n"tab\\tkey" = "1"'):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"an escaped TOML key is not read by this guard"):
+                    Census(self.text, overrides=self.manifest_with(code))
+
+    def test_escaped_toml_keys_in_the_cargo_and_nextest_configs_fail_closed(self):
+        """security r10 I-2 / K4: the `.cargo` denylist and the nextest allowlist share the same key reader."""
+        for rel in (".cargo/config.toml", ".cargo/config"):
+            with self.subTest(rel=rel):
+                with self.assertRaisesRegex(AssertionError, r"an escaped TOML key is not read by this guard"):
+                    Census(self.text, overrides={rel: '[build]\n"rust\\u0066lags" = ["-Cfoo"]\n'})
+        with self.assertRaisesRegex(AssertionError, r"an escaped TOML key is not read by this guard"):
+            Census(self.text, overrides={NEXTEST_CONFIG: read(NEXTEST_CONFIG) + '\n[profile.default]\n"ret\\u0072ies" = 9\n'})
+        with self.assertRaisesRegex(AssertionError, r"an escaped TOML key is not read by this guard"):
+            Census(self.text, overrides={TOOLCHAIN_FILE: '[toolchain]\n"chan\\u006eel" = "1.98.0"\n'})
+
+    def test_live_toml_inputs_carry_no_escaped_key_and_literal_keys_are_still_read(self):
+        """code r10 L2: the fail-closed rule costs the live files nothing; a single-quoted (literal) key is exact."""
+        for rel in (MANIFEST, NEXTEST_CONFIG, ".cargo/audit.toml", TOOLCHAIN_FILE):
+            with self.subTest(rel=rel):
+                self.assertIsInstance(toml_entries(read(rel), rel), list)
+        self.assertEqual(len(toml_entries("[a]\n'b\\c' = 1\n", "x.toml")), 2)
+        with self.assertRaisesRegex(AssertionError, r"escaped TOML key"):
+            toml_entries('[a]\n"b\\c" = 1\n', "x.toml")
+        Census(self.text, overrides=self.manifest_with("[package.metadata.docs]\n'raw\\key' = 1"))
+
+    def test_impl_targets_in_raw_parenthesised_and_aliased_spellings_are_rejected(self):
+        """security r10 L-A (I3-I7): the own-type and external-name scans see through `r#`, parentheses and aliases."""
+        for code, shown in (("impl Drop for r#DocsCensus {}", r"`DocsCensus`"),
+                            ("impl r#DocsCensus {}", r"`DocsCensus`"),
+                            ("type Alias8346 = DocsCensus; impl Drop for Alias8346 {}", r"`DocsCensus`"),
+                            ("impl Drop for (DocsCensus) {}", r"`DocsCensus`"),
+                            ("impl Drop for ((DocsCensus)) {}", r"`DocsCensus`"),
+                            ("impl Drop for &DocsCensus {}", r"`DocsCensus`"),
+                            ("impl Drop for &'static mut DocsCensus {}", r"`DocsCensus`"),
+                            ("impl Drop for *const DocsCensus {}", r"`DocsCensus`"),
+                            ("impl Drop for crate::r#tests::DocsCensus {}", r"`DocsCensus`"),
+                            ("use DocsCensus as Other8346;", r"`use \.\.\. as` alias"),
+                            ("use super::DocsCensus as Other8346;", r"`use \.\.\. as` alias"),
+                            ("type Alias8346 = r#DocsCensus;", r"`DocsCensus`"),
+                            ("fn helper_8346(_: &DocsCensus) {}", r"`DocsCensus`"),
+                            ("impl Drop for r#String {}", r"`impl \.\.\. for` `String`"),
+                            ("impl r#Vec<u8> {}", r"`impl \.\.\. for` `Vec`"),
+                            ("impl Drop for (r#String) {}", r"`impl \.\.\. for` `String`")):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, shown):
+                    Census(self.in_tests(code))
+        with self.assertRaisesRegex(AssertionError, r"`DocsCensus`"):
+            Census(self.in_tests("fn nested_8346() { impl Drop for (DocsCensus) {} }"))
+        Census(self.in_tests("struct Unrelated8346; impl Drop for (Unrelated8346) {} impl r#Unrelated8346 {}"))
+
+    def test_the_region_type_is_named_nowhere_outside_the_region_today(self):
+        """security r10 L-A: the stricter alias rule needs no allow-list because the live count is 0."""
+        clean = strip_comments(self.text)
+        masked = mask_literals(clean)
+        span = census_span(clean)
+        own = {n for k, n, _ in declared_names(masked[span[0]:span[1]]) if k in OWN_TYPE_KINDS}
+        self.assertIn("DocsCensus", own)
+        uses = [m.start() for name in own for m in re.finditer(r"(?<!\w)%s\b" % re.escape(name), masked)
+                if not span[0] <= m.start() < span[1]]
+        self.assertEqual(len(uses), OWN_TYPE_USES_OUTSIDE_REGION)
+
+    def test_c_string_literals_are_lexed_and_do_not_desync_the_masker(self):
+        """security r10 I-1: `cr#"..."#` and `c"..."` hold declaration-shaped text that is not code."""
+        live = self.census_signature(self.census)
+        for code in ('const DECOY_8346: &str = cr#"const DOCS_CENSUS_ERASE_DOC: &str = "x"; fn docs_census_8315() {} // \\"#;',
+                     'const DECOY_8346: &str = cr##"a "# b const RECORD_ENVELOPE_VERSION: u8 = 9;"##;',
+                     'const DECOY_8346: &str = c"const RECORD_ENVELOPE_VERSION: u8 = 9; \\" /*";',
+                     'const DECOY_8346: &str = br#"const RECORD_ENVELOPE_VERSION: u8 = 9;"#;'):
+            with self.subTest(code=code):
+                self.assertEqual(self.census_signature(Census(self.in_tests(code))), live)
+        self.assertEqual(strings('cr#"a"#'), ["a"])
+        self.assertEqual(strings('c"a"'), ["a"])
+
+    def test_workspace_table_in_cargo_toml_is_rejected_and_the_live_manifest_has_none(self):
+        """security r10 I-3: `[workspace] default-members` or `exclude` can stop a bare `cargo test` building the lib."""
+        self.assertEqual([p for p, _ in toml_entries(read(MANIFEST), MANIFEST) if p[:1] == ("workspace",)], [])
+        for code in ('[workspace]\ndefault-members = []', '[workspace]\nexclude = ["."]', '[workspace]\nmembers = []',
+                     '[workspace.package]\nversion = "1"', '[workspace]\n'):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"Cargo\.toml has a `\[workspace\]` table"):
+                    Census(self.text, overrides=self.manifest_with(code))
+
+    def test_rust_toolchain_file_is_read_and_pinned(self):
+        """security r10 I-4: rustup honours `[toolchain] path` and any channel, so the file is an input of the census."""
+        live = read(TOOLCHAIN_FILE)
+        entries = dict((p, v) for p, v in toml_entries(live, TOOLCHAIN_FILE) if v is not None)
+        self.assertEqual(unquote(entries[("toolchain", "channel")]), TOOLCHAIN_CHANNEL)
+        self.assertEqual(TOOLCHAIN_CHANNEL, "1.98.0")
+        Census(self.text, overrides={TOOLCHAIN_FILE: live})
+        for code, shown in (('[toolchain]\nchannel = "1.98.0"\npath = "/elsewhere"\n', r"`\[toolchain\] path`"),
+                            ('[toolchain]\nchannel = "1.97.0"\n', r"channel is '1\.97\.0'"),
+                            ('[toolchain]\nchannel = "nightly"\n', r"channel is 'nightly'"),
+                            ('[toolchain]\nprofile = "minimal"\n', r"channel is None"),
+                            ('[toolchain]\nchannel = "1.98.0"\ncomponents = ["rustfmt"]\n', r"`\[toolchain\] components`"),
+                            ('[toolchain]\nchannel = "1.98.0"\n[other]\nx = 1\n', r"the table `\[other\]`"),
+                            ('channel = "1.98.0"\n[toolchain]\nchannel = "1.98.0"\n', r"outside the `\[toolchain\]` keys"),
+                            ('[toolchain.sub]\nchannel = "1.98.0"\n', r"the table `\[toolchain\.sub\]`")):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, shown):
+                    Census(self.text, overrides={TOOLCHAIN_FILE: code})
+        with self.assertRaisesRegex(AssertionError, r"requires rust-toolchain\.toml as an input and it is missing"):
+            Census(self.text, overrides={TOOLCHAIN_FILE: None})
+        with self.assertRaisesRegex(AssertionError, r"a repo-root rust-toolchain file exists"):
+            Census(self.text, overrides={TOOLCHAIN_LEGACY: "stable\n"})
+
+    def test_docstring_names_the_round_11_inputs_and_classes(self):
+        """code r10 L1 / security r10 I-4: the docstring lists the new inputs and closed classes the code enforces."""
+        for phrase in ("crate-local use targets", "src/test_support.rs", "rust-toolchain.toml", "escaped TOML key",
+                       "impl-target spellings", "C-string literals", "workspace table"):
+            self.assertIn(phrase, __doc__ + " ".join(CLOSED_CLASSES))
+        for phrase in ("crate-local use targets", "escaped TOML keys", "impl-target spellings", "C-string literals",
+                       "workspace table"):
+            self.assertIn(phrase, CLOSED_CLASSES)
+            self.assertIn(phrase, __doc__)
+        for rel in ("src/test_support.rs", TOOLCHAIN_FILE):
+            self.assertIn(rel, __doc__)
 
     def test_mutation_anchor_that_drifts_names_itself(self):
         with self.assertRaisesRegex(AssertionError, r"mutation anchor.*not-in-the-source"):
