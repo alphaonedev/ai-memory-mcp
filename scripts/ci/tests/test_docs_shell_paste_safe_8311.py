@@ -42,7 +42,9 @@ Two grammars are modelled, each with the standard library only:
   A backtick substitution ends at the first unescaped backtick, whatever
   quote is open inside it. `((` and `$((` are read as arithmetic or as
   subshells when the opener is pushed, as bash's parser does, by a capped
-  lookahead that answers subshell when it cannot tell.
+  lookahead that answers subshell when it cannot tell (a `((` it cannot
+  tell still closes at a `))` inside a `${ }` or `$[ ]`, as bash's scan
+  does there).
   A `#` starts a comment only at the start of a word and outside quotes and
   `${ }` / arithmetic; a heredoc operator counts only where a command could
   be (not in quotes, a comment, `${ }` or arithmetic, not inside backticks,
@@ -385,8 +387,20 @@ QUOTES = ("'", '"', "$'", "`")  # open at line end: defer the heredoc skip
 # text is parsed again on its own, so a heredoc started in it takes no body
 # from the lines after it (bash -c runs them as commands), as in backticks.
 REREAD = "(sub"
-SUBSHELLS = ("(", REREAD)  # code frames that may stay open at the fence end
-CODE = (None, "(", "`", REREAD)  # frames where a command (heredoc, comment) can be
+# The outer frame of a `$((` that bash re-reads as `$( (..) )`. bash ends
+# it where the parens of its text balance, counted over any `${ }` or
+# `$[ ]` (a `)` inside one counts), and parses that text on its own later,
+# so a heredoc in it takes no body from the lines after it, as in REREAD.
+SCAN = "$(sub"
+# The outer frame of a `((` the lookahead could not decide (a command
+# substitution, a split `$(`, the cap or the budget). Read as a REREAD
+# (fails closed: its comments are seen), except that a `))` inside a
+# `${ }` or `$[ ]` right under it closes it, as bash's scan ends there.
+UNSURE = "(?"
+REREADS = (REREAD, SCAN, UNSURE)
+SUBSHELLS = ("(",) + REREADS  # code frames that may stay open at the fence end
+CODE = (None, "(", "`") + REREADS  # frames where a command (heredoc, comment) can be
+EXPANSIONS = ("${", "$[")  # bash's paren scans do not nest these
 LOOKAHEAD_CAP = 4096  # characters one (( or $(( opener may look ahead
 OPEN_REASON = "quote or expansion still open at the end of the fence"
 TRAIL = "trailing comment on a command line"
@@ -411,7 +425,7 @@ class Frames(list):
         list.append(self, frame)
         if frame == "`":
             self.ticks += 1
-        elif frame == REREAD:
+        elif frame in REREADS:
             self.rereads += 1
 
     def extend(self, frames):
@@ -422,14 +436,14 @@ class Frames(list):
         frame = list.pop(self)
         if frame == "`":
             self.ticks -= 1
-        elif frame == REREAD:
+        elif frame in REREADS:
             self.rereads -= 1
         return frame
 
 
 LOOK_STOPS = {
-    # `$$` first: the PID; `${ }` and `$[ ]` are tracked (Lookahead.nest)
-    None: re.compile(r"\$\$|[()'\"\\`}\]]|\$\((?!\()|\$'|\$[{\[]"),
+    # `$$` first: the PID; `${ }` and `$[ ]` are plain text, as in bash's scan
+    None: re.compile(r"\$\$|[()'\"\\`]|\$\((?!\()|\$'"),
     "'": re.compile(r"'"),
     "$'": re.compile(r"['\\]"),  # ANSI-C: a backslash escapes the next character
     # `$$` first: the PID; then `$(`, `$((`, `${` and `$[`, which nest quotes
@@ -454,16 +468,18 @@ class Lookahead:
     closed). Inside "..." bash nests a `"` that sits in a `$( )`, `$(( ))`,
     `${ }` or `$[ ]`, so the string does not close there; the lookahead
     cannot see where such an expansion ends, so any of them in "..."
-    answers subshell too (fails closed). In code bash does not nest a
-    `${ }` or `$[ ]`, so a `))` inside one closes the `((` for bash; the
-    frame lexer nests it, so there the answer is subshell (fails closed).
+    answers subshell too (fails closed). In code bash's scan does not nest
+    a `${ }` or `$[ ]`: it counts the parens inside one, so a `))` inside
+    one closes the `((`; the lookahead reads them as plain text too, and
+    the frame lexer closes them with the `((` (close_expansions).
 
     Bounded: one lookahead reads at most LOOKAHEAD_CAP characters, and all
     lookaheads over one fence share a budget of its length plus the cap, so
     the work stays linear. A lookahead that reaches the fence end (or the
     line end, with `single`), the cap or the budget, in any quote state
-    (ANSI-C included), answers subshell: code, where a comment is seen,
-    which fails closed."""
+    (ANSI-C included), or a command substitution, cannot tell (None): the
+    opener is read as a subshell, code, where a comment is seen, which
+    fails closed (UNSURE)."""
 
     def __init__(self, lines, single=False):
         self.lines = lines
@@ -471,17 +487,19 @@ class Lookahead:
         self.budget = sum(len(line) + 1 for line in lines) + LOOKAHEAD_CAP
 
     def at(self, k):
-        """The lookahead for openers on line `k`: col -> True (arithmetic)."""
+        """The lookahead for openers on line `k`: col -> True (arithmetic),
+        False (subshell) or None (cannot tell)."""
         return lambda col: self.arith(k, col)
 
     def arith(self, k, col):
         """True when the inner text that starts at lines[k][col] closes with
-        `))`, read as bash's matched-pair scan reads it. Characters between
+        `))`, read as bash's matched-pair scan reads it; False when it closes
+        with `)` and another character; None when it cannot tell. Characters between
         the ones that matter are skipped by a regex search, but count against
         the cap and the budget."""
         left = min(LOOKAHEAD_CAP, self.budget)
         self.budget -= left  # charged up front; the unused part is refunded
-        depth, nest = 0, []  # nest: the `${` and `$[` open in code
+        depth = 0
         quote = None
         lone = False  # the last line ended in a lone `$` and a backslash
         while k < len(self.lines):
@@ -493,7 +511,7 @@ class Lookahead:
                 pair = self.after_join(line, quote)
                 if pair is None:
                     self.budget += left
-                    return False  # a split `$(`: command substitution
+                    return None  # a split `$(`: command substitution
                 col, quote = pair
                 left -= col
             lone, used = False, -1  # used: the column after a `$$` or `\x`
@@ -501,7 +519,7 @@ class Lookahead:
                 m = LOOK_STOPS[quote].search(line, col)
                 left -= (m.end() if m else len(line)) - col
                 if left < 0:
-                    return False  # cap or budget reached: subshell
+                    return None  # cap or budget reached: subshell
                 if m is None:
                     break
                 ch, col = m.group(), m.end()
@@ -513,11 +531,9 @@ class Lookahead:
                     used = col  # the PID parameter, read before any quote after it
                 elif ch == "$'":
                     quote = ch  # only LOOK_STOPS[None] matches it
-                elif quote is None and ch in ("${", "$[", "}", "]"):
-                    self.nest(nest, ch)
                 elif ch[0] in "`$":  # `, $(, and in "..." $((, ${ or $[
                     self.budget += left
-                    return False  # commands or nested quotes: subshell
+                    return None  # commands or nested quotes: subshell
                 elif quote is not None or ch in "'\"":
                     quote = None if quote is not None else ch
                 elif ch == "(":
@@ -526,42 +542,31 @@ class Lookahead:
                     depth -= 1
                 else:
                     self.budget += left
-                    return not nest and line.startswith(")", col)
+                    return line.startswith(")", col)
             if self.single:
                 break
             k, col, left = k + 1, 0, left - 1
         self.budget += max(left, 0)
-        return False  # no closing paren before the fence (or line) end
+        return None  # no closing paren before the fence (or line) end
 
     @staticmethod
     def after_join(line, quote):
         """Read a lone `$` that ended the last line before a backslash with
         the start of `line`, as bash does once it drops the backslash-newline:
         returns (col to read from, quote), or None (subshell, fails closed)
-        for a `$(`, `${` or `$[`, and in "..." a `$((`, as arith answers at
-        an unsplit one in "..." (a split `${` or `$[` in code is not tracked
-        by nest). `$$` is the PID; in code a quote after it opens an ANSI-C
-        `$'`; in '..' or $'..' the `$` was literal."""
+        for a `$(`, and in "..." a `$((`, `${` or `$[`, as arith answers at
+        an unsplit one; in code a split `${` or `$[` is plain text, as an
+        unsplit one is. `$$` is the PID; in code a quote after it opens an
+        ANSI-C `$'`; in '..' or $'..' the `$` was literal."""
         if quote not in (None, '"') or not line:
             return 0, quote
-        if line[0] in "{[" or line[0] == "(" and (quote or not line.startswith("((")):
+        if quote and line[0] in "{[" or line[0] == "(" and (quote or not line.startswith("((")):
             return None
         if line[0] == "$":
             return 1, quote
         if line[0] == "'" and quote is None:
             return 1, "$'"
         return 0, quote
-
-    @staticmethod
-    def nest(stack, ch):
-        """Track a `${ }` or `$[ ]` opened in code. bash's pair scan does
-        not nest them, so a `))` inside one closes the `((` for bash, while
-        the frame lexer nests them and would read on as arithmetic: arith
-        answers subshell there (fails closed)."""
-        if ch in ("${", "$["):
-            stack.append(ch)
-        elif stack and stack[-1] == ("${" if ch == "}" else "$["):
-            stack.pop()
 
 
 def parse_heredoc_word(line, start):
@@ -599,11 +604,11 @@ def parse_heredoc_word(line, start):
 def open_expansion(line, i, stack, ahead):
     """Push `$((`, `$(`, `${` or `$[` at `i`; return the characters used.
     `$((` is arithmetic only when `ahead` (a Lookahead) says so; otherwise
-    it is `$( (..) )`, two code frames."""
+    it is `$( (..) )`, two code frames, re-read as a `((` is (SCAN)."""
     if line[i] != "$":
         return 0
     if line.startswith("$((", i):
-        stack.extend(("((",) if ahead(i + 3) else ("(", "("))
+        stack.extend(("((",) if ahead(i + 3) else (SCAN, "("))
         return 3
     for token, frame in (("$(", "("), ("${", "${"), ("$[", "$[")):
         if line.startswith(token, i):
@@ -682,14 +687,17 @@ def lex_operator(line, i, stack, top, ahead):
         return 1
     if top in CODE and line.startswith("((", i):
         # Decided at the opener, as bash's parser does (Lookahead).
-        stack.extend(("((",) if ahead(i + 2) else (REREAD, "("))
+        arith = ahead(i + 2)
+        stack.extend(("((",) if arith else (REREAD if arith is False else UNSURE, "("))
         return 2
-    if ch == "(" and top in (None, "(", "((", "`", REREAD):
+    if ch == "(" and (top in CODE or top == "(("):
         stack.append("(")
         return 1
     if ch == ")" and top in SUBSHELLS:
         stack.pop()
         return 1
+    if ch == ")" and top in EXPANSIONS:
+        return close_expansions(line, i, stack)
     if top == "((" and line.startswith("))", i):
         stack.pop()
         return 2
@@ -709,6 +717,39 @@ def lex_operator(line, i, stack, top, ahead):
         stack.pop()
         return 1
     return 0
+
+
+def close_expansions(line, i, stack):
+    """A `)` at `i` in a `${ }` or `$[ ]` frame. bash's paren scans do not
+    nest those: an arithmetic `((` or `$((` ends at the first `))`, also
+    inside one, and a `$((` re-read as `$( (..) )` (SCAN) ends where the
+    parens of its text balance, a `)` inside one counted. So under an
+    arithmetic frame, or inside a SCAN, the `)` pops the expansions with
+    the frame it closes; an arithmetic frame whose inner part closes first
+    is re-read as a subshell, as in lex_operator. A `))` right under an
+    UNSURE pair closes it too. Elsewhere (in a `$( )` or a subshell bash's
+    parser nests the expansion) the `)` is literal.
+    Returns the characters used."""
+    j = len(stack) - 1
+    while j >= 0 and stack[j] in EXPANSIONS:
+        j -= 1
+    k = j
+    while k >= 0 and stack[k] in ("(", "((", REREAD, UNSURE) + EXPANSIONS:
+        k -= 1
+    if j > 0 and stack[j - 1:j + 1] == [UNSURE, "("] and line.startswith("))", i):
+        del stack[j + 1:]  # expansions only; the pair pops so the re-read counts
+        stack.pop()
+        stack.pop()  # bash's scan ends here: arithmetic after all
+        return 2
+    if j < 0 or stack[j] != "((" and (k < 0 or stack[k] != SCAN):
+        return 0
+    del stack[j + 1:]  # expansions only: no backtick or re-read to count
+    if stack.pop() != "((":
+        return 1
+    if line.startswith("))", i):
+        return 2
+    stack.append(REREAD)
+    return 1
 
 
 def lex_line(line, stack, prev="\n", ahead=None):
@@ -1383,7 +1424,7 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # lookahead answers subshell at any of them (fails closed), also
         # when a lone `$` and a continuation split it, across bare `\` lines
         # too (I2). In code bash does not nest `${ }` or `$[ ]`, so a `))`
-        # inside one closes the `((`; the lookahead answers subshell there.
+        # inside one closes the `((` (S22, test_8311_paren_scan_ignores_expansions).
         # Each row carries what bash 5.2 does (`bash -n`, then `bash -c`
         # echo markers) and the hits.
         probes = (
@@ -1417,6 +1458,103 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             with self.subTest(lines=lines, bash_runs=bash_runs):
                 self.assertEqual([no for no, _ in scan_block(1, lines)], want)
 
+    def test_8311_paren_scan_ignores_expansions(self):
+        # S22: bash's arithmetic scan of a `((` or `$((` does not nest a
+        # `${ }` or `$[ ]`: it ends at the first `))`, also inside one, so
+        # the rest of the line is code. S23: a `$((` whose parens close
+        # apart (`) )`) is re-read as `$( (..) )`, its text paren-scanned the
+        # same way, so a spaced closer inside an open `${` or `$[` ends it.
+        # Each row carries the lines bash 5.2 runs (`bash -n`, then
+        # `bash -c` echo markers) and the hits.
+        probes = (
+            # S22 (round-12 regression): `))` inside an open expansion.
+            (["false && (( ${x:- )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( $[ )) ; echo L1 # c ]"], [1], "L1"),
+            (["false && echo $(( ${x:- )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( ${x:- ))", "echo L2 # c }"], [2], "L2"),
+            (["false && (( $[ ${y} )) ; echo L1 # c ]"], [1], "L1"),
+            (["false && (( $\\", "{x:- )) ; echo L2 # c }"], [2], "L2"),
+            (["false && (( $\\", "[ )) ; echo L2 # c ]"], [2], "L2"),
+            (["false && (( $\\", "\\", "{x:- )) ; echo L3 # c }"], [3], "L3"),
+            (["false && echo $(( $\\", "{x:- )) ; echo L2 # c }"], [2], "L2"),
+            (["false && echo $(( ${x:- ))", "echo L2 # c }"], [2], "L2"),
+            (["false && (( ${x:-$[ )) ; echo L1 # c ] }"], [1], "L1"),
+            (["(( ${x:- ))", "echo L2 # c }"], [2], "L2"),
+            # S23: a spaced closer inside an open expansion.
+            (["echo $(( ${x:- ) ) ; echo L1 # c }"], [1], "L1"),
+            (["x=$(( $[  ) )", "echo L2 # c ]"], [2], "L2"),
+            (["x=$(( ${x:- ) ) ; echo L1 # c }"], [1], "L1"),
+            (["false && echo $(( $[  ) )", "echo L2 # c ]"], [2], "L2"),
+            (["echo $(( $\\", "{x:- ) ) ; echo L2 # c }"], [2], "L2"),
+            # Controls: a plain `((` re-read uses the parser, which nests the
+            # expansion (rc 2, nothing runs); over-flags fail closed.
+            (["(( ${x:- ) ) ; echo L1 # c }"], [], "syntax error"),
+            (["(( $[ ) )", "echo L2 # c ]"], [], "syntax error"),
+            (["(( ${x:- )) ; echo L1 # c }"], [1], "aborts"),
+            (["echo $(( ${x:- ) ; echo L1 # c }"], [1], "syntax error"),
+            (["(( ${x:-1} + ${y:-2} )) && echo L1"], [], "L1"),
+            (["echo $(( ${x:-1} * $[2] ))"], [], "none"),
+            # At the end of the fence an open expansion is flagged, never a
+            # raise or a spin.
+            (["(( ${x:-"], [1], "syntax error"),
+            (["(( $\\", "{x:-"], [1], "syntax error"),
+            (["(( $\\", "\\"], [], "syntax error"),
+        )
+        for lines, want, bash_runs in probes:
+            with self.subTest(lines=lines, bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
+
+    def test_8311_undecided_dparen_closes_in_expansion(self):
+        # S22, where the `((` lookahead cannot tell (a backtick or `$( )`,
+        # or the cap): the opener is read as a subshell (UNSURE), whose
+        # parser would nest a `${ }` or `$[ ]`, but bash's scan still ends
+        # at a `))` inside one, so the rest of the line is code. Found by
+        # the round-13 probes (missed at e01eb03cc and 6101db3d0 too). Each
+        # row carries the lines bash 5.2 runs (`bash -n`, then `bash -c`
+        # echo markers) and the hits.
+        probes = (
+            (["false && (( ${x:- `)` )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( `echo` ${x:- )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( $(echo) ${x:- )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( ${x:- $(echo) )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( $[ $(echo) )) ; echo L1 # c ]"], [1], "L1"),
+            (["false && (( `echo` ${x:- ))", "echo L2 # c }"], [2], "L2"),
+            (["false && (( ${x:-" + "a" * LOOKAHEAD_CAP + " )) ; echo L1 # c }"], [1], "L1"),
+            # Controls: after the close a heredoc registers again; a single
+            # `)` stays literal (the parser nests it: rc 2, nothing runs).
+            (["false && (( `echo` ${x:- ))", "cat <<z", "echo L3 # c }", "z"], [], "none"),
+            (["(( `echo` ${x:- ) ) ; echo L1 # c }"], [], "syntax error"),
+        )
+        for lines, want, bash_runs in probes:
+            with self.subTest(lines=lines[:1], bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
+
+    def test_8311_reread_dparen_takes_no_heredoc(self):
+        # C1 (round-12 regression): a `$((` that bash answers as a subshell
+        # is re-read like a plain `((`: its text is parsed on its own later,
+        # so a `<<word` shift in it takes no body from the lines after it,
+        # and a comment on the next line runs. Each row carries the lines
+        # bash 5.2 runs (`bash -n`, then `bash -c` echo markers) and the hits.
+        probes = (
+            (["x=$(( $\\", "{y} <<z ))", "echo L3 # c", "z"], [3], "L3"),
+            (['echo "$(( "${y}" <<z ))"', "echo L2 # c", "z"], [2], "L2"),
+            (['echo $(( "${y}" <<z ))', "echo L2 # c", "z"], [2], "L2"),
+            (["echo $(( `echo 1` <<z ))", "echo L2 # c", "z"], [2], "L2"),
+            (["echo $(( $(echo 1) <<z ))", "echo L2 # c", "z"], [2], "L2"),
+            (['echo $(( "$[1]" <<z ))', "echo L2 # c", "z"], [2], "L2"),
+            (["echo $(( $\\", "[1] <<z ))", "echo L3 # c", "z"], [3], "L3"),
+            (['echo $(( "$\\', '{y}" <<z ))', "echo L3 # c", "z"], [3], "L3"),
+            # Controls: arithmetic shifts, which the round-12 guard got right.
+            (["(( x = ${y} <<z )) ; echo L1", "echo L2 # c", "z"], [2], "L1 L2"),
+            (["echo $(( ${y} <<z )) ; echo L1", "echo L2 # c", "z"], [2], "L2"),
+            (["(( x = $\\", "{y} <<z ))", "echo L3 # c", "z"], [3], "L3"),
+            (['(( x = "${y}" <<z ))', "echo L2 # c", "z"], [2], "L2"),
+            (['echo $(( "$$" <<z ))', "echo L2 # c", "z"], [2], "L2"),
+        )
+        for lines, want, bash_runs in probes:
+            with self.subTest(lines=lines, bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
+
     def test_8311_backtick_closes_through_quotes(self):
         # S15: bash ends a backtick substitution at the first unescaped
         # backtick, whatever quote is open inside it.
@@ -1440,6 +1578,9 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             ("ls $\\\n'\\''; ls # c '", 10000),  # S20: a split `$'`, two lines
             ('(( "${x:-"))"}" ; ls # c', 20000),  # S21: a quote nested in `${`
             ('(( "$\\\n{x:-"))"}" ; ls # c', 10000),  # S21: the split form
+            ("false && (( ${x:- )) ; ls # c }", 20000),  # S22: `))` in an open `${`
+            ("echo $(( ${x:- ) ) ; ls # c }", 20000),  # S23: a spaced closer
+            ("echo $(( `ls` <<z )) ; ls # c", 20000),  # C1: a re-read `$((` shift
         )
         for line, want in shapes:
             began = time.monotonic()
