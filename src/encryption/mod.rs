@@ -1367,6 +1367,17 @@ mod tests {
         keypair_cache().lock().expect("cache lock").clear();
     }
 
+    /// The one key-directory fixture for this module (#8316): a private temp
+    /// dir created `0o700` (mkdir mode, no later chmod) whatever the ambient
+    /// umask. `tempfile::tempdir()` on its own inherits the umask, so under
+    /// `umask 0002` it comes out `0775`
+    /// and the #3198 chain check correctly refuses it; the two #228 tests
+    /// below used it directly and went red on every `0002` host (#8316).
+    /// Delegates to the crate-wide #3705 fixture so there is a single owner.
+    fn secure_tmp_key_dir() -> tempfile::TempDir {
+        crate::identity::test_key_dir::private_tempdir()
+    }
+
     #[test]
     fn decrypt_survives_keypair_cache_clear_via_disk_persistence() {
         // #228 Part 1 — the per-agent X25519 keypair persists to disk, so
@@ -1374,7 +1385,7 @@ mod tests {
         // encrypted before the restart. Without persistence the cleared
         // cache would mint a fresh key and every prior ciphertext would be
         // permanently undecryptable.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = secure_tmp_key_dir();
         let agent = "persist-restart-agent";
         let kp1 = get_or_create_keypair_in(agent, dir.path()).expect("generate + persist");
         let env = encrypt("survives a restart", &kp1.public).expect("encrypt");
@@ -1382,9 +1393,8 @@ mod tests {
         clear_keypair_cache(); // modeled restart — cache gone
 
         let kp2 = get_or_create_keypair_in(agent, dir.path()).expect("load from disk");
-        assert_eq!(
-            kp1.secret.to_bytes(),
-            kp2.secret.to_bytes(),
+        assert!(
+            kp1.secret.to_bytes() == kp2.secret.to_bytes(),
             "#228: the keypair MUST round-trip from disk after a cache clear"
         );
         let recovered = decrypt(&env, &kp2.secret).expect("decrypt after restart");
@@ -1398,7 +1408,7 @@ mod tests {
         // `.x25519.priv` is refused, not silently used (mirrors the
         // Ed25519 keystore's S4-LOW1 guard).
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = secure_tmp_key_dir();
         let agent = "lax-mode-agent";
         let _kp = get_or_create_keypair_in(agent, dir.path()).expect("persist");
         clear_keypair_cache();
@@ -1413,6 +1423,87 @@ mod tests {
         );
     }
 
+    /// #8316 — the fixture directory is `0o700` even when the process umask
+    /// is `0002`, and the loader accepts it. Pins the fix for the two tests
+    /// above: under `umask 0002` a bare `tempfile::tempdir()` is `0775`, the
+    /// #3198 chain check refuses it, and both tests went red for the wrong
+    /// reason. The umask is process-wide, so it is set ONLY in a re-launched
+    /// child copy of this test binary running this one test (the pattern of
+    /// `journal_spool_creation_is_private_with_permissive_umask`); the
+    /// multi-threaded parent never changes its own umask, so no sibling test
+    /// can observe it (#8331 class).
+    #[cfg(unix)]
+    #[test]
+    fn keypair_fixture_dir_is_0700_under_umask_0002_8316() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_KEYPAIR_UMASK_ROLE";
+        const MARKER_ENV: &str = "AI_MEMORY_TEST_KEYPAIR_UMASK_MARKER";
+        const TEST_PATH: &str =
+            "encryption::tests::keypair_fixture_dir_is_0700_under_umask_0002_8316";
+
+        let mode_of = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("stat dir")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            // Child: a single-test process, so the umask change has no sibling.
+            // SAFETY: `umask` has no preconditions, cannot fail and only sets
+            // this process's file-mode creation mask.
+            unsafe {
+                libc::umask(0o002);
+            }
+            let control = tempfile::tempdir().expect("control tempdir");
+            assert_eq!(
+                mode_of(control.path()),
+                0o775,
+                "#8316 precondition: umask 0002 is in force, so a bare tempdir is 0775 \
+                 (a failure here means the temp parent carries a POSIX default ACL \
+                 that overrides the umask, not that the fixture is wrong)"
+            );
+            let dir = secure_tmp_key_dir();
+            assert_eq!(
+                mode_of(dir.path()),
+                0o700,
+                "#8316: the fixture dir must be 0700 whatever the umask"
+            );
+            let agent = "umask-0002-agent-8316";
+            let minted = get_or_create_keypair_in(agent, dir.path())
+                .expect("#8316: mint + persist into a fixture dir created under umask 0002");
+            clear_keypair_cache();
+            let loaded = load_keypair_in(agent, dir.path())
+                .expect("#8316: the #3198 chain check accepts the 0700 fixture dir")
+                .expect("#8316: the persisted keypair is found");
+            assert!(
+                minted.secret.to_bytes() == loaded.secret.to_bytes(),
+                "#8316: the keypair round-trips from a fixture dir created under umask 0002"
+            );
+            let marker = std::env::var_os(MARKER_ENV).expect("marker path");
+            std::fs::write(marker, b"ran").expect("write child-ran marker");
+            return;
+        }
+
+        let scratch = secure_tmp_key_dir();
+        let marker = scratch.path().join("child-ran");
+        let status = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .arg("--exact")
+            .arg(TEST_PATH)
+            .arg("--nocapture")
+            .env(ROLE_ENV, "child")
+            .env(MARKER_ENV, &marker)
+            .status()
+            .expect("re-launch the test binary");
+        assert!(status.success(), "#8316: the umask-0002 child run failed");
+        assert!(
+            marker.exists(),
+            "#8316: the child must run the test body, not match zero tests"
+        );
+    }
+
     #[test]
     fn keypair_round_trip_returns_same_secret() {
         // Cache-hit path: second call returns the same secret material.
@@ -1420,7 +1511,10 @@ mod tests {
         let a = get_or_create_keypair(agent).expect("first generate");
         let b = get_or_create_keypair(agent).expect("second fetch");
         assert_eq!(a.public.as_bytes(), b.public.as_bytes());
-        assert_eq!(a.secret.to_bytes(), b.secret.to_bytes());
+        assert!(
+            a.secret.to_bytes() == b.secret.to_bytes(),
+            "the cached keypair keeps the same secret"
+        );
     }
 
     #[test]
@@ -1516,15 +1610,17 @@ mod tests {
         let shared_a = alice.secret.diffie_hellman(&bob.public);
         let shared_b = bob.secret.diffie_hellman(&alice.public);
         // ECDH symmetry precondition.
-        assert_eq!(shared_a.as_bytes(), shared_b.as_bytes());
+        assert!(
+            shared_a.as_bytes() == shared_b.as_bytes(),
+            "ECDH symmetry: both sides derive the same shared secret"
+        );
 
         let key1 = derive_aead_key(&shared_a);
         let key2 = derive_aead_key(&shared_b);
-        assert_eq!(key1, key2, "HKDF derivation must be deterministic");
+        assert!(key1 == key2, "HKDF derivation must be deterministic");
         assert_eq!(key1.len(), AEAD_KEY_LEN);
-        assert_ne!(
-            &key1,
-            shared_a.as_bytes(),
+        assert!(
+            key1.as_slice() != shared_a.as_bytes(),
             "derived key must not be the raw shared secret (HKDF must transform it)"
         );
     }
@@ -1733,17 +1829,6 @@ mod tests {
     }
 
     // ----- #3718 — a read never mints ---------------------------------
-
-    fn secure_tmp_key_dir() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("scratch key dir under TMPDIR");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-                .expect("chmod 0700");
-        }
-        dir
-    }
 
     fn names(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)

@@ -2447,6 +2447,12 @@ def pre_trust_problems(text):
     return problems
 
 
+def _match_refusal(ast_diagnostic):
+    """Match fixtures still refuse on Python 3.9, before AST rules can inspect them."""
+    return (ast_diagnostic if sys.version_info >= (3, 10)
+            else "heredoc body is not valid python")
+
+
 class TrustDecisionFirst(unittest.TestCase):
     """S15: the trust decision runs before any checkout file executes.
 
@@ -2759,16 +2765,17 @@ class TrustDecisionFirst(unittest.TestCase):
         ("c1-environ-copy-store", None, 'cenv = os.environ.copy()\ncenv["A"] = "b"', C13_ENV),
         ("c1-walrus-env-copy", None, '(cenv := dict(os.environ))\ncenv["A"] = "b"', C13_ENV),
         ("c2-match-capture-module", None, "match 1:\n    case subprocess:\n        pass",
-         "match statement"),
+         _match_refusal("match statement")),
         ("c2-match-star", None, "match [1]:\n    case [run, *rest]:\n        pass",
-         "match statement"),
+         _match_refusal("match statement")),
         ("c2-match-mapping-rest", None, "match {}:\n    case {**os}:\n        pass",
-         "match statement"),
-        ("c2-match-as", None, "match 1:\n    case x as run:\n        pass", "match statement"),
+         _match_refusal("match statement")),
+        ("c2-match-as", None, "match 1:\n    case x as run:\n        pass",
+         _match_refusal("match statement")),
         ("c2-match-allowed-name", None, "match 1:\n    case git:\n        pass",
-         "match statement"),
+         _match_refusal("match statement")),
         ("c2-match-class-keyword", None, "match 1:\n    case dict(a=open):\n        pass",
-         "match statement"),
+         _match_refusal("match statement")),
         ("c3-args-assign", C13_ENV_LINE, '    args = ("show", "HEAD")\n', "argv tail"),
         ("c3-args-augassign", C13_ENV_LINE, '    args += ("show",)\n', "argv tail"),
         ("c3-args-annassign", C13_ENV_LINE, '    args: tuple = ("show",)\n', "argv tail"),
@@ -2779,7 +2786,7 @@ class TrustDecisionFirst(unittest.TestCase):
          "argv tail"),
         ("c3-args-comprehension", C13_ENV_LINE, "    [0 for args in ()]\n", "argv tail"),
         ("c3-args-match", C13_ENV_LINE, "    match 1:\n        case args:\n            pass\n",
-         "argv tail"),
+         _match_refusal("argv tail")),
         ("c3-value-reassign", "def rev_parse(spec):\n", '    spec = "HEAD"\n', "git value name"),
         ("c3-value-augassign", "def rev_parse(spec):\n", '    spec += "x"\n', "git value name"),
         ("c3-value-walrus", "def rev_parse(spec):\n", '    (spec := "HEAD")\n',
@@ -2797,6 +2804,18 @@ class TrustDecisionFirst(unittest.TestCase):
         ("c4-statement-inside-guard", 'if __name__ == "__main__":\n', '    print("in")\n',
          "__main__ guard"),
     )
+
+    def test_match_refusal_version_split_8324(self):
+        """Keep syntax rejection below 3.10 and the precise AST diagnostic above it."""
+        for version in ((3, 9), (3, 10), (3, 12)):
+            for diagnostic in ("match statement", "argv tail",
+                               "match statement outside the allow-list"):
+                with self.subTest(version=version, diagnostic=diagnostic):
+                    with unittest.mock.patch.object(sys, "version_info", version):
+                        actual = _match_refusal(diagnostic)
+                    expected = ("heredoc body is not valid python"
+                                if version == (3, 9) else diagnostic)
+                    self.assertEqual(actual, expected)
 
     def test_code_r10_every_environment_match_binding_argv_open_and_guard_form_is_red(self):
         """code r10 C1-C4: with the pin re-pinned to the mutated body, the second layer alone
@@ -3397,8 +3416,8 @@ _R11_RULES = {
     "c3-class-setitem": (13, "calls os.environ.__class__.__setitem__ outside the allow-list"),
     "c3-vars-os": (13, "calls vars outside the allow-list"),
     "c3-getattr-os": (13, "calls getattr outside the allow-list"),
-    "c4-match-in-def": (13, "match statement outside the allow-list"),
-    "c4-match-in-class": (13, "match statement outside the allow-list"),
+    "c4-match-in-def": (13, _match_refusal("match statement outside the allow-list")),
+    "c4-match-in-class": (13, _match_refusal("match statement outside the allow-list")),
     "c5-call-arg-module": (13, "bare reference to module subprocess"),
     "c5-print-os": (13, "bare reference to module os"),
     "c5-star-list": (13, "bare reference to module subprocess"),
