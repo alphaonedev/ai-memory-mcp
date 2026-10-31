@@ -331,8 +331,8 @@ class ClsStepRunsNoWorkspaceCommand(unittest.TestCase):
                     if re.match(r'\s*echo "\$%s"\s*($|\|\s*sed\b)' % var, line)]
         self.assertTrue(printers, "no log-print line for the changed-file list")
         names = "docs/::stop-commands::x\ndocs/h##[stop-commands]x"
-        script = "%s='%s'\n%s\n" % (self.changed_var(body), names, "\n".join(printers))
-        res = subprocess.run(RUNNER_BASH + [script], capture_output=True, text=True, timeout=TIMEOUT_S)
+        script = '%s="$1"\n%s\n' % (self.changed_var(body), "\n".join(printers))
+        res = subprocess.run(RUNNER_BASH + [script, "bash", names], capture_output=True, text=True, timeout=TIMEOUT_S)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("docs/: :stop-commands: :x", res.stdout)
         self.assertIn("docs/h# #[stop-commands]x", res.stdout)
