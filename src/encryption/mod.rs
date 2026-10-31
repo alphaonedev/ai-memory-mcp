@@ -1945,8 +1945,18 @@ mod tests {
     const DOCS_CENSUS_DATED_RECORDS: [&str; 2] = ["docs/reviews/", "docs/audit/"];
     /// The doc the census must always reach inside a real checkout.
     const DOCS_CENSUS_ERASE_DOC: &str = "docs/security/crypto-erase.md";
-    /// Printed when the census cannot run outside a checkout of this crate.
-    const DOCS_CENSUS_SKIP_REASON: &str = "not a git checkout of this crate (crates.io package or vendored tree); the docs census needs the tracked docs/ tree";
+    /// Appended to every skip reason: what the census needs to run.
+    const DOCS_CENSUS_SKIP_REASON: &str = "the docs census needs a git checkout of this crate and a runnable `git` (a crates.io package or a vendored tree has no tracked docs/ tree)";
+    /// Skip-table row 1: the crate root has no `.git`.
+    const DOCS_CENSUS_NO_DOT_GIT: &str = "no .git in the crate root";
+    /// Skip-table row 2: the `git` binary could not be started.
+    const DOCS_CENSUS_GIT_NOT_RUN: &str = "`git` could not run";
+    /// Skip-table row 3: `git rev-parse --show-toplevel` exited non-zero.
+    const DOCS_CENSUS_TOPLEVEL_FAILED: &str = "`git rev-parse --show-toplevel` failed";
+    /// Skip-table row 4: git resolves the crate root to another toplevel.
+    const DOCS_CENSUS_FOREIGN_TOPLEVEL: &str = "the git toplevel is another tree";
+    /// The panic prefix of every skip-table row under `CI`.
+    const DOCS_CENSUS_CI_SET: &str = "CI is set";
 
     /// What one census run found: the docs it covered and the docs that
     /// describe crypto erase without listing every erasable byte.
@@ -1961,62 +1971,113 @@ mod tests {
         root: &std::path::Path,
         args: &[&str],
     ) -> std::io::Result<std::process::Output> {
-        std::process::Command::new("git")
-            .args(args)
+        docs_census_git_on(root, args, None)
+    }
+
+    /// [`docs_census_git`] with an optional child `PATH`: `Some(dir)` makes
+    /// the child search only `dir` for `git`, so a test runs the "no `git`
+    /// binary" row of the skip table without touching this process's
+    /// environment.
+    fn docs_census_git_on(
+        root: &std::path::Path,
+        args: &[&str],
+        path: Option<&std::ffi::OsStr>,
+    ) -> std::io::Result<std::process::Output> {
+        let mut git = std::process::Command::new("git");
+        git.args(args)
             .current_dir(root)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
+            .env_remove("GIT_INDEX_FILE");
+        if let Some(path) = path {
+            git.env("PATH", path);
+        }
+        git.output()
+    }
+
+    /// Whether the `CI` environment variable is set (any value).
+    fn docs_census_ci() -> bool {
+        std::env::var_os("CI").is_some()
     }
 
     /// The #8315 row-4 census over the tracked docs of the checkout at
     /// `root`, reading the `CI` environment variable (see
-    /// [`docs_census_8315_with`]).
+    /// [`docs_census_skip`] for the skip rules).
     fn docs_census_8315(root: &std::path::Path) -> Result<DocsCensus, String> {
-        docs_census_8315_with(root, std::env::var_os("CI").is_some())
+        docs_census_8315_with(root, docs_census_ci())
     }
 
-    /// The skip reason for a tree that is not a checkout; under `ci` it
-    /// panics instead, because a skip line is invisible in a passing test's
-    /// output (REVIEW-8323-security-r2 INFO-1).
+    /// The ONE skip rule of the docs census, and its truth table. Every
+    /// tree the census cannot judge goes through this helper, so the rule
+    /// and the comments cannot disagree again (REVIEW-8323-code-r3 F2,
+    /// REVIEW-8323-security-r3 L1, ERRORS-08):
+    ///
+    /// | tree at the crate root                          | `CI` unset    | `CI` set |
+    /// |-------------------------------------------------|---------------|----------|
+    /// | 1. no `.git`                                    | skip          | panic    |
+    /// | 2. `.git` present, `git` binary cannot start    | skip          | panic    |
+    /// | 3. `.git` present, `git rev-parse` fails        | skip          | panic    |
+    /// | 4. git toplevel is another tree                 | skip          | panic    |
+    /// | 5. checkout of this crate, erase doc missing    | panic         | panic    |
+    /// | 6. checkout of this crate, `git ls-files` fails | panic         | panic    |
+    /// | 7. checkout of this crate, erase doc present    | census (`Ok`) | census   |
+    ///
+    /// Rows 1-4 call this helper: with `ci` false it returns the skip
+    /// reason (`why` plus [`DOCS_CENSUS_SKIP_REASON`]) and the test prints
+    /// one `skipped:` line; with `ci` true it panics with
+    /// [`DOCS_CENSUS_CI_SET`], because a skip line is invisible in a passing
+    /// test's output (REVIEW-8323-security-r2 INFO-1) and a CI tree with no
+    /// checkout must not pass silently. Rows 5-7 never skip. The tests that
+    /// build a checkout with `git init` apply row 2 the same way
+    /// ([`docs_census_git_init`]).
+    ///
+    /// decision: one rule for rows 1-4 (skip without `CI`, fail with `CI`)
+    /// over a per-row rule, because a packaged crate still skips on a
+    /// developer machine while a CI tree that is not a checkout of this crate
+    /// fails, and one table is all a reader has to check.
     fn docs_census_skip(ci: bool, why: &str) -> String {
-        assert!(!ci, "CI is set but the docs census cannot run: {why}");
-        DOCS_CENSUS_SKIP_REASON.to_string()
+        assert!(
+            !ci,
+            "{DOCS_CENSUS_CI_SET} but the docs census cannot run: {why}"
+        );
+        format!("{why}; {DOCS_CENSUS_SKIP_REASON}")
     }
 
-    /// Decide first whether `root` is a git checkout of this crate: `.git`
-    /// exists, `git rev-parse --show-toplevel` succeeds and its canonical
-    /// toplevel is `root`. Only a tree that is not a checkout is a skip
-    /// (`Err(reason)`): a crates.io package ships `src/**` but not `docs/`, a
-    /// vendored tree sits inside another repository. Under `ci` a git failure
-    /// (including a missing `git` binary) or a foreign toplevel panics
-    /// instead of skipping. Inside a checkout the erase doc must exist: its
-    /// absence fails with an assert naming [`DOCS_CENSUS_ERASE_DOC`], never
-    /// a skip (REVIEW-8323-code-r2 F1, ERRORS-08). Both `.md` and `.html`
-    /// files are read: `docs/encryption.html` is a full page about the
-    /// envelope, not a redirect shell (REVIEW-8323-code-r2 F2).
+    /// The census with an explicit `ci` flag; rows of the skip table in
+    /// [`docs_census_skip`]. Both `.md` and `.html` files are read:
+    /// `docs/encryption.html` is a full page about the envelope, not a
+    /// redirect shell (REVIEW-8323-code-r2 F2).
     ///
     /// decision: count `.html` over exclude it because the page that
     /// describes the envelope is authored prose that can drift like the
     /// markdown, and the census is 3 docs with 0 failures both before and
     /// after the filter change (REVIEW-8323-code-r2 F2).
     fn docs_census_8315_with(root: &std::path::Path, ci: bool) -> Result<DocsCensus, String> {
+        docs_census_8315_on(root, ci, None)
+    }
+
+    /// [`docs_census_8315_with`] with an optional child `PATH` for `git`
+    /// (see [`docs_census_git_on`]). It decides first whether `root` is a
+    /// checkout of this crate (rows 1-4), then requires the erase doc (row
+    /// 5) and the listing (row 6), then runs the census (row 7).
+    fn docs_census_8315_on(
+        root: &std::path::Path,
+        ci: bool,
+        path: Option<&std::ffi::OsStr>,
+    ) -> Result<DocsCensus, String> {
         if !root.join(".git").exists() {
-            return Err(docs_census_skip(false, "no .git in the crate root"));
+            return Err(docs_census_skip(ci, DOCS_CENSUS_NO_DOT_GIT));
         }
-        let toplevel = match docs_census_git(root, &["rev-parse", "--show-toplevel"]) {
+        let toplevel = match docs_census_git_on(root, &["rev-parse", "--show-toplevel"], path) {
             Ok(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
-            Ok(_) => {
+            Ok(_) => return Err(docs_census_skip(ci, DOCS_CENSUS_TOPLEVEL_FAILED)),
+            Err(e) => {
                 return Err(docs_census_skip(
                     ci,
-                    "`git rev-parse --show-toplevel` failed",
+                    &format!("{DOCS_CENSUS_GIT_NOT_RUN}: {e}"),
                 ));
-            }
-            Err(e) => {
-                return Err(docs_census_skip(ci, &format!("`git` could not run: {e}")));
             }
         };
         match (
@@ -2024,14 +2085,14 @@ mod tests {
             std::fs::canonicalize(root),
         ) {
             (Ok(top), Ok(here)) if top == here => {}
-            _ => return Err(docs_census_skip(ci, "the git toplevel is another tree")),
+            _ => return Err(docs_census_skip(ci, DOCS_CENSUS_FOREIGN_TOPLEVEL)),
         }
         assert!(
             root.join(DOCS_CENSUS_ERASE_DOC).is_file(),
             "inside a git checkout the census must reach {DOCS_CENSUS_ERASE_DOC}, but it is missing or not a file"
         );
-        let listing =
-            docs_census_git(root, &["ls-files", "--", "docs"]).expect("run `git ls-files -- docs`");
+        let listing = docs_census_git_on(root, &["ls-files", "--", "docs"], path)
+            .expect("run `git ls-files -- docs`");
         assert!(
             listing.status.success(),
             "`git ls-files -- docs` failed: {}",
@@ -2091,9 +2152,12 @@ mod tests {
     /// `docs/audit/` describe a past tree and are skipped, the exclusion
     /// `scripts/check-docs-vs-ssot.sh` applies to the same directories. Tracked
     /// `.md` and `.html` files are read (`docs/encryption.html` is a full page
-    /// about the envelope). Outside a git checkout of this crate, and
-    /// without `CI` set, the test prints one `skipped: <reason>` line and
-    /// returns; under `CI` it fails instead (see [`docs_census_8315_with`]).
+    /// about the envelope). The skip rules are the truth table in
+    /// [`docs_census_skip`]: a tree the census cannot judge (no `.git`, no
+    /// runnable `git`, a failing `git rev-parse`, another git toplevel)
+    /// prints one `skipped: <reason>` line and returns when `CI` is unset,
+    /// and fails when `CI` is set; inside a checkout of this crate a missing
+    /// erase doc fails either way.
     #[test]
     fn docs_describing_erase_list_every_erasable_version_8315() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2133,7 +2197,10 @@ mod tests {
         let reason = docs_census_8315_with(empty.path(), false)
             .err()
             .expect("empty tree skips");
-        assert!(reason.contains("not a git checkout"), "{reason}");
+        assert!(
+            reason.contains(DOCS_CENSUS_NO_DOT_GIT) && reason.contains(DOCS_CENSUS_SKIP_REASON),
+            "{reason}"
+        );
 
         let docs_only = tempfile::tempdir().expect("tempdir");
         let doc = docs_only.path().join(DOCS_CENSUS_ERASE_DOC);
@@ -2158,8 +2225,9 @@ mod tests {
     #[test]
     fn docs_census_asserts_inside_a_checkout_8315() {
         let repo = tempfile::tempdir().expect("tempdir");
-        let init = docs_census_git(repo.path(), &["init", "-q"]).expect("git init");
-        assert!(init.status.success(), "git init failed");
+        if !docs_census_git_init(repo.path()) {
+            return;
+        }
         let all_bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
             .iter()
             .map(|version| format!("0x{version:02x}"))
@@ -2202,16 +2270,175 @@ mod tests {
         );
     }
 
-    /// #8315 (REVIEW-8323-code-r2 F1): inside a real checkout (a fresh
-    /// `git init`) whose erase doc is missing the census fails by naming
-    /// [`DOCS_CENSUS_ERASE_DOC`]; it never prints "not a git checkout".
+    /// Make `root` a fresh git repository for an in-checkout test and
+    /// return `true`. A `git` binary that cannot start is row 2 of the skip
+    /// table in [`docs_census_skip`]: with `CI` unset it prints one
+    /// `skipped:` line and returns `false` (the test returns early), with
+    /// `CI` set it panics. A `git init` that starts and fails panics.
+    fn docs_census_git_init(root: &std::path::Path) -> bool {
+        docs_census_git_init_on(root, docs_census_ci(), None)
+    }
+
+    /// [`docs_census_git_init`] with an explicit `ci` flag and an optional
+    /// child `PATH` (see [`docs_census_git_on`]).
+    fn docs_census_git_init_on(
+        root: &std::path::Path,
+        ci: bool,
+        path: Option<&std::ffi::OsStr>,
+    ) -> bool {
+        match docs_census_git_on(root, &["init", "-q"], path) {
+            Ok(out) => {
+                assert!(
+                    out.status.success(),
+                    "`git init` failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let reason = docs_census_skip(ci, &format!("{DOCS_CENSUS_GIT_NOT_RUN}: {e}"));
+                eprintln!("skipped: {reason}");
+                false
+            }
+            Err(e) => panic!("{DOCS_CENSUS_GIT_NOT_RUN}: {e}"),
+        }
+    }
+
+    /// Run `f` and return its panic message, or `None` when it returned.
+    fn docs_census_panic_message<T>(
+        f: impl FnOnce() -> T + std::panic::UnwindSafe,
+    ) -> Option<String> {
+        let payload = std::panic::catch_unwind(f).err()?;
+        Some(
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Assert one row of the skip table: with `ci` false the census skips
+    /// with a reason naming `why`; with `ci` true it panics naming both
+    /// [`DOCS_CENSUS_CI_SET`] and `why`.
+    fn docs_census_assert_row(
+        root: &std::path::Path,
+        ci: bool,
+        path: Option<&std::ffi::OsStr>,
+        why: &str,
+    ) {
+        if ci {
+            let message = docs_census_panic_message(|| docs_census_8315_on(root, ci, path).is_ok())
+                .unwrap_or_else(|| panic!("row `{why}` with CI set must fail, not skip"));
+            assert!(
+                message.contains(DOCS_CENSUS_CI_SET) && message.contains(why),
+                "row `{why}`: {message}"
+            );
+        } else {
+            let reason = docs_census_8315_on(root, ci, path)
+                .err()
+                .unwrap_or_else(|| panic!("row `{why}` with CI unset must skip"));
+            assert!(
+                reason.contains(why) && reason.contains(DOCS_CENSUS_SKIP_REASON),
+                "row `{why}`: {reason}"
+            );
+        }
+    }
+
+    /// #8315 (REVIEW-8323-code-r3 F2, REVIEW-8323-security-r3 L1): rows 1-4
+    /// of the skip table in [`docs_census_skip`], each with `CI` unset (a
+    /// skip naming the row) and with `CI` set (a panic naming the row). Row
+    /// 2 points the child `PATH` at an empty directory. Rows 3 and 4 need a
+    /// `git` binary: without one they are row 2 of the helper that builds
+    /// them ([`docs_census_git_init`]).
     #[test]
-    #[should_panic(expected = "docs/security/crypto-erase.md")]
+    fn docs_census_skip_table_every_row_8315() {
+        let no_git_bin = tempfile::tempdir().expect("tempdir");
+        let probe = tempfile::tempdir().expect("tempdir");
+        let git_runs = docs_census_git_init(probe.path());
+        for ci in [false, true] {
+            let bare = tempfile::tempdir().expect("tempdir");
+            docs_census_assert_row(bare.path(), ci, None, DOCS_CENSUS_NO_DOT_GIT);
+
+            let no_binary = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(no_binary.path().join(".git")).expect("fake .git");
+            docs_census_assert_row(
+                no_binary.path(),
+                ci,
+                Some(no_git_bin.path().as_os_str()),
+                DOCS_CENSUS_GIT_NOT_RUN,
+            );
+            if !git_runs {
+                continue;
+            }
+
+            let broken = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                broken.path().join(".git"),
+                format!(
+                    "gitdir: {}\n",
+                    broken.path().join("missing-gitdir").display()
+                ),
+            )
+            .expect("dangling .git file");
+            docs_census_assert_row(broken.path(), ci, None, DOCS_CENSUS_TOPLEVEL_FAILED);
+
+            let outer = tempfile::tempdir().expect("tempdir");
+            assert!(docs_census_git_init(outer.path()), "git ran for the probe");
+            let nested = outer.path().join("crate");
+            std::fs::create_dir_all(nested.join(".git")).expect("nested fake .git");
+            docs_census_assert_row(&nested, ci, None, DOCS_CENSUS_FOREIGN_TOPLEVEL);
+        }
+    }
+
+    /// #8315 (REVIEW-8323-code-r3 F2, REVIEW-8323-security-r3 L1): a tree
+    /// with no `.git` (a packaged crate, or a CI tree produced without a
+    /// checkout) fails under `CI` instead of skipping.
+    #[test]
+    #[should_panic(expected = "CI is set")]
+    fn docs_census_no_dot_git_fails_under_ci_8315() {
+        let tree = tempfile::tempdir().expect("tempdir");
+        let _ = docs_census_8315_with(tree.path(), true);
+    }
+
+    /// #8315 (REVIEW-8323-code-r3 F1): the helper that builds a test
+    /// checkout treats a `git` binary that cannot start as row 2 of the skip
+    /// table: with the child `PATH` an empty directory it skips (`false`, no
+    /// repository made) when `CI` is unset and panics when `CI` is set.
+    #[test]
+    fn docs_census_git_init_without_git_binary_8315() {
+        let no_git_bin = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let stripped = Some(no_git_bin.path().as_os_str());
+        assert!(
+            !docs_census_git_init_on(repo.path(), false, stripped),
+            "no git binary with CI unset skips"
+        );
+        assert!(!repo.path().join(".git").exists(), "no repository was made");
+        let message =
+            docs_census_panic_message(|| docs_census_git_init_on(repo.path(), true, stripped))
+                .expect("no git binary with CI set must fail, not skip");
+        assert!(
+            message.contains(DOCS_CENSUS_CI_SET) && message.contains(DOCS_CENSUS_GIT_NOT_RUN),
+            "{message}"
+        );
+    }
+
+    /// #8315 (REVIEW-8323-code-r2 F1, REVIEW-8323-code-r3 F1): inside a real
+    /// checkout (a fresh `git init`) whose erase doc is missing the census
+    /// fails by naming [`DOCS_CENSUS_ERASE_DOC`]; it never skips. Without a
+    /// `git` binary and with `CI` unset the test skips at the `git init`
+    /// step instead of panicking on it.
+    #[test]
     fn docs_census_missing_anchor_doc_fails_in_a_checkout_8315() {
         let repo = tempfile::tempdir().expect("tempdir");
-        let init = docs_census_git(repo.path(), &["init", "-q"]).expect("git init");
-        assert!(init.status.success(), "git init failed");
-        let _ = docs_census_8315(repo.path());
+        if !docs_census_git_init(repo.path()) {
+            return;
+        }
+        let message = docs_census_panic_message(|| docs_census_8315(repo.path()).is_ok())
+            .expect("a checkout without the erase doc must fail, not skip");
+        assert!(message.contains(DOCS_CENSUS_ERASE_DOC), "{message}");
+        assert!(!message.contains(DOCS_CENSUS_SKIP_REASON), "{message}");
     }
 
     /// #8315 (REVIEW-8323-security-r2 INFO-1): under `CI` a tree whose `.git`
@@ -2228,8 +2455,9 @@ mod tests {
     #[test]
     fn docs_census_counts_html_pages_8315() {
         let repo = tempfile::tempdir().expect("tempdir");
-        let init = docs_census_git(repo.path(), &["init", "-q"]).expect("git init");
-        assert!(init.status.success(), "git init failed");
+        if !docs_census_git_init(repo.path()) {
+            return;
+        }
         let all_bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
             .iter()
             .map(|version| format!("0x{version:02x}"))
