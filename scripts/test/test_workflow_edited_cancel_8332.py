@@ -47,6 +47,7 @@ The rules this guard pins (a ratchet over EVERY workflow):
 Stdlib only. Run: ``python3 -I scripts/test/test_workflow_edited_cancel_8332.py``.
 """
 import importlib.util
+import itertools
 import re
 import sys
 import tempfile
@@ -84,17 +85,25 @@ PROPERTY_RES = (
 READ_ESCAPES = '(only \\" and \\\\ are read)'
 NEXT_LINE_PLAIN = "plain scalar value on the line below its key or dash"
 PAST_COMMENT = "a line continues a plain scalar past a comment, which YAML does not allow"
-# A block scalar header; a tag or anchor may stand before the indicator (`key: !t |`, `- &a >-`).
-BLOCK_SCALAR_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)(?:[&!][^ \t]*[ \t]+)*[|>][1-9+-]*$")
+# A block scalar header's indicator characters (`|` or `>`, then indentation and chomping indicators); read by
+# ``_block_header`` in one pass (round 11).
+BLOCK_INDICATORS, BLOCK_HEADER_TAIL = "|>", frozenset("123456789+-")
 PR_WORD_RE = re.compile(r"(?<![\w-])pull_request(?:_target)?(?![\w-])")
 SEPARATORS = ("", " ", "\t")
+# No quote closed on this line yet: never equal to ``i - 1`` for any index ``i >= 0`` (-1 would match a colon
+# at column 0 and refuse a plain key such as ``:x: 1``).
+NO_QUOTE_END = -2
 PROPERTY_KEY = "an anchor, tag or alias on a mapping key (the scanner does not model that key's column)"
 # Round 10 (REVIEW-8332-security-r9 S18, REVIEW-8332-code-r9 F2): an explicit key (a line whose first token,
 # after any dashes, is `?` or a bare `:`) and a double-quoted key holding any escape are refused file-wide.
 EXPLICIT_KEY_RE = re.compile(r"^[ \t]*(?:-[ \t]+)*[?:](?:[ \t]|$)")
 EXPLICIT_KEY = "an explicit key (`?`) or its bare `:` value line (the scanner does not model that key's column)"
 ESCAPED_KEY = "a double-quoted key holding an escape (the scanner does not decode a key's escapes)"
+# Round 11 (REVIEW-8332-code-r10 F1): outside a flow collection a colon flush against a closing quote is not YAML.
+ADJACENT_KEY = "a colon flush against a closing quote outside a flow collection (YAML needs a blank after it)"
 NEXT_LINE_CANCEL = "a `cancel-in-progress` key with no value on its line (a value below it is not read)"
+# Round 11 (REVIEW-8332-security-r10 INFO-1): YAML folds a plain value's continuation lines into one string.
+MULTILINE_CANCEL = "a `cancel-in-progress` value continued on the next line (YAML folds it into one string)"
 # Round 9 (REVIEW-8332-security-r8 S17): a scanned key line, its key column (group 1 is the indent plus any
 # dashes), and a `cancel-in-progress` or `concurrency` key token anywhere in a scanned line.
 # Round 10 (REVIEW-8332-security-r9 S20, REVIEW-8332-code-r9 F1): the prefix is `^( *(?:-[ \t]+)*)`; each
@@ -102,6 +111,11 @@ NEXT_LINE_CANCEL = "a `cancel-in-progress` key with no value on its line (a valu
 KEY_LINE_RE = re.compile(r"""^( *(?:-[ \t]+)*)(["']?)([\w-]+)\2[ \t]*:(?:[ \t]+(.*))?$""")
 CANCEL_KEY, CONCURRENCY_KEY = "cancel-in-progress", "concurrency"
 TOKEN_RES = {key: re.compile(rf"""(?<![\w-])(["']?){key}\1[ \t]*:""") for key in (CANCEL_KEY, CONCURRENCY_KEY)}
+# Round 11 sweep: every pattern searched per line or per file is compiled here, so the linear-time test
+# (test_every_line_pattern_is_linear) times each one on 50,000-character hostile lines.
+KIND_RES = {kind: re.compile(rf"""(?<![\w-]){kind}(?![\w-])""") for kind in KINDS}
+TYPES_WORD_RE, ACTIVITY_WORD_RE = re.compile(r"\btypes\b"), re.compile(r"[a-z_]+")
+GUARD_EXPR_RE = re.compile(r"\$\{\{(.*)\}\}")
 WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 
@@ -127,6 +141,28 @@ def _words(raw: str) -> str:
     """Block-scalar content: keep the indent and the word characters only (no brackets, colons or quotes)."""
     body = raw.lstrip(" ")
     return " " * (len(raw) - len(body)) + "".join(c if c in WORD_CHARS else " " for c in body)
+
+
+def _block_header(text: str) -> bool:
+    """True when a scanned line ends with a block scalar header (``|``, ``key: >-``, ``- &a !t |2``).
+
+    decision (round 11, REVIEW-8332-security-r10 S21, REVIEW-8332-code-r10 F2): one pass over the blank-separated
+    tokens from the END replaces a regex search that retried at every colon (quadratic in the line length). The
+    last token is the indicator; walking back, a token ending with a colon or a lone dash is the header's lead,
+    a token starting with ``&`` or ``!`` is a property before the indicator, anything else means no header, and
+    no token left means the indicator leads the line.
+    """
+    if not text or text[-1] in " \t":
+        return False  # the indicator ends the line (the scanner strips trailing blanks before this)
+    tokens = [tok for tok in text.replace("\t", " ").split(" ") if tok]
+    if tokens[-1][0] not in BLOCK_INDICATORS or not set(tokens[-1][1:]) <= BLOCK_HEADER_TAIL:
+        return False
+    for tok in reversed(tokens[:-1]):
+        if tok.endswith(":") or tok == "-":
+            return True
+        if tok[0] not in "&!":
+            return False
+    return True
 
 
 class _Scanner:
@@ -171,6 +207,13 @@ class _Scanner:
     escape spells a key (``concurrency``, ``cancel-in-progress``) the scanner never reads. Neither occurs in
     the 23 workflows, so ``scan`` refuses the whole file by name for a line whose first token (after any
     dashes) is ``?`` or a bare ``:``, and for a key separator after a double-quoted scalar holding any escape.
+
+    decision (round 11, REVIEW-8332-code-r10 F1): inside a flow collection a colon right after the quote that
+    closed a quoted scalar is a key separator with or without a blank after it (``{"k":v}``), as YAML and PyYAML
+    read it, so the escaped-key refusal sees a JSON-like key too; the closing quote is tracked by its index, so a
+    quote inside a plain scalar (``a":"b``) never makes the colon after it a separator or opens a quote there.
+    Outside a flow collection the same flush colon (``"k":v``, ``"k":"v"``) is not YAML (PyYAML and actionlint
+    reject it), so ``scan`` refuses the whole file by name rather than guess a key there.
     """
 
     def __init__(self):
@@ -189,6 +232,7 @@ class _Scanner:
         self.pendprop = False  # an anchor or tag at this scalar start waits for its node's token
         self.keyprop = False  # the current token carries a property or is an alias (a key there is refused)
         self.keyesc = False  # the current token is a double-quoted scalar holding an escape (a key there is refused)
+        self.qend = NO_QUOTE_END  # index on this line of the quote that closed the last quoted scalar
 
     def _quoted(self, raw: str, i: int, out: list) -> int:
         """Consume one character inside a quoted scalar; return the next index."""
@@ -205,7 +249,7 @@ class _Scanner:
             if self.quote == "'" and raw[i + 1:i + 2] == "'":
                 out.append("  ")
                 return i + 2
-            self.quote = ""
+            self.quote, self.qend = "", i
             out.append(c)
             return i + 1
         out.append(c if c in WORD_CHARS else " ")
@@ -234,8 +278,12 @@ class _Scanner:
                 return True
             self.depth -= 1
             return False
-        if c == ":" and (nxt in SEPARATORS or (raw[i - 1:i] in ('"', "'") and nxt in ('"', "'"))):
-            # a key separator; a JSON-like "key":"value" in flow opens the value at once
+        if c == ":" and self.qend == i - 1 and not self.depth and nxt not in SEPARATORS:
+            self.invalid = ADJACENT_KEY  # block context: YAML needs a blank after the colon ("k":v is not YAML)
+        if c == ":" and (nxt in SEPARATORS or (self.qend == i - 1 and self.depth)):
+            # a key separator. Right after the quote that CLOSED a quoted scalar it needs no blank in a flow
+            # collection (YAML's JSON-like key, {"k":v}, round 11 F1). A quote inside a plain scalar (a":"b)
+            # closes nothing, so its colon is text and opens no quote (round 11).
             if self.keyprop:
                 self.invalid = PROPERTY_KEY
             if self.keyesc:
@@ -316,6 +364,7 @@ class _Scanner:
         out, i, cut = [], 0, False
         start = not (cont or pcont)
         self.pendprop = self.keyprop = False
+        self.qend = NO_QUOTE_END
         while i < len(raw):
             if self.quote:
                 i = self._quoted(raw, i, out)
@@ -332,7 +381,7 @@ class _Scanner:
         if not self.invalid and EXPLICIT_KEY_RE.match(text):
             self.invalid = EXPLICIT_KEY  # quoted and block-scalar text is words only: a `?` there never matches
         self._settle(text, owner, start, cut)
-        if not self.quote and not self.depth and BLOCK_SCALAR_RE.search(text):
+        if not self.quote and not self.depth and _block_header(text):
             self.block = self.parent
         return Line(text, cont or pcont, depth, pcont, self.bad)
 
@@ -395,6 +444,13 @@ def _flow_body(rest: str, section: list) -> str:
     return "\n".join(([rest] if rest else []) + [ln.text for ln in section])
 
 
+def _trigger_line_res(child: int) -> tuple:
+    """The trigger-key and bare-sequence-item patterns of a block ``on:`` section whose children sit at
+    column ``child`` (one compile per section; timed by test_every_line_pattern_is_linear)."""
+    return (re.compile(rf"""^ {{{child}}}(?:-[ \t]+)?(["']?)([\w-]+)\1[ \t]*:(?:[ \t]+(.*))?$"""),
+            re.compile(rf"""^ {{{child}}}-[ \t]+(["']?)([\w-]+)\1$"""))
+
+
 def _block_triggers(section: list) -> dict:
     """Map each pull_request(_target) key of a block-form ``on:`` section to its body text.
 
@@ -405,6 +461,7 @@ def _block_triggers(section: list) -> dict:
     """
     out, current, seen = {}, None, set()
     child = _indent(section[0].text)
+    key_re, item_re = _trigger_line_res(child)
     for ln in section:
         x, ind = ln.text, _indent(ln.text)
         if ln.cont or ln.depth or ind > child:
@@ -413,8 +470,7 @@ def _block_triggers(section: list) -> dict:
             elif (ln.cont or ln.depth) and PR_WORD_RE.search(x):
                 raise ParseFailure(f"a pull_request word on a continuation line under the `{current}` trigger")
             continue
-        m = re.match(rf"""^ {{{child}}}(?:-[ \t]+)?(["']?)([\w-]+)\1[ \t]*:(?:[ \t]+(.*))?$""", x)
-        seq = re.match(rf"""^ {{{child}}}-[ \t]+(["']?)([\w-]+)\1$""", x)
+        m, seq = key_re.match(x), item_re.match(x)
         if ind < child or not (m or seq):
             raise ParseFailure(f"unrecognised line in the `on:` section: {x.strip()[:40]!r}")
         current = (m or seq).group(2)
@@ -453,7 +509,7 @@ def triggers(text: str) -> dict:
         return _block_triggers(section)
     else:
         raise ParseFailure("empty `on:` section")
-    return {kind: body for kind in KINDS if re.search(rf"""(?<![\w-]){kind}(?![\w-])""", body)}
+    return {kind: body for kind in KINDS if KIND_RES[kind].search(body)}
 
 
 def pr_types(text: str, kinds=KINDS) -> set:
@@ -463,8 +519,8 @@ def pr_types(text: str, kinds=KINDS) -> set:
     """
     out = set()
     for kind, body in triggers(text).items():
-        if kind in kinds and re.search(r"\btypes\b", body):
-            out |= set(re.findall(r"[a-z_]+", body.lower())) & ACTIVITY_TYPES
+        if kind in kinds and TYPES_WORD_RE.search(body):
+            out |= set(ACTIVITY_WORD_RE.findall(body.lower())) & ACTIVITY_TYPES
     return out
 
 
@@ -477,7 +533,7 @@ def guard_ok(value: str) -> bool:
     value = value.split(" #")[0].strip()
     if value == "false":
         return True
-    m = re.fullmatch(r"\$\{\{(.*)\}\}", value)
+    m = GUARD_EXPR_RE.fullmatch(value)
     if m is None:
         return False
     expr = m.group(1).strip()
@@ -506,12 +562,17 @@ def concurrency_blocks(text: str) -> list:
     decision (round 10, REVIEW-8332-code-r9 INFO-2/INFO-3): a ``cancel-in-progress`` key with no value on its
     line is refused by name, even when the line below holds ``false``; a ``concurrency`` key under ``with:``
     or ``env:`` is read as a block with no ``cancel-in-progress`` key (refused; no workflow writes either).
+    decision (round 11, REVIEW-8332-code-r10 INFO): a plain line continuing a ``cancel-in-progress`` value is
+    refused by name (MULTILINE_CANCEL) over reading its first line, because YAML folds both lines into one string.
     """
-    raws, blocks, cur, child = text.splitlines(), [], None, None
+    raws, blocks, cur, child, after_cancel = text.splitlines(), [], None, None, False
     for n, ln in enumerate(scan(text), 1):
         x = ln.text
         if not x.strip():
             continue
+        if ln.plain and after_cancel:
+            raise ParseFailure(f"line {n}: {MULTILINE_CANCEL}")
+        after_cancel = False
         m = None if ln.cont or ln.depth else KEY_LINE_RE.match(x)
         if cur is not None and not ln.cont and not ln.depth and _indent(x) <= cur[0]:
             cur = None
@@ -522,7 +583,7 @@ def concurrency_blocks(text: str) -> list:
                 if not m.group(4):
                     raise ParseFailure(f"line {n}: {NEXT_LINE_CANCEL}")
                 cur[1].append(raws[n - 1][m.start(4):len(x)].strip())
-                used[CANCEL_KEY] = 1
+                used[CANCEL_KEY], after_cancel = 1, True
         if m and m.group(3) == CONCURRENCY_KEY:
             cur, child, used[CONCURRENCY_KEY] = _concurrency_key(m, n, blocks), None, 1
         for key, token in TOKEN_RES.items():
@@ -964,6 +1025,28 @@ ORACLE = (
      + PR_EDITED + "\n", EDITED),
     ("r10 explicit-key text inside a block scalar",
      "jobs:\n  j:\n    steps:\n      - run: |\n          ? k\n          : v\non:\n" + PR_EDITED + "\n", EDITED),
+    # round 11, REVIEW-8332-code-r10 F1: a JSON-like quoted key flush against its value in a flow `on:`.
+    ("r11 flow on: with a JSON-adjacent escaped trigger key",
+     'on: {"pull_r\\x65quest":{types: [edited]}}\n', REFUSE, f"line 1: {ESCAPED_KEY}"),
+    ("r11 flow on: with a JSON-adjacent key holding a read escape",
+     'on: {pull_request: {types: [opened]}, "x\\"y":{types: [edited]}}\n', REFUSE, f"line 1: {ESCAPED_KEY}"),
+    ("r11 flow on: with JSON-adjacent quoted keys without escapes (control)",
+     'on: {"pull_request":{"types":[edited]}}\n', EDITED),
+    # round 11 (own probe): a quote inside a plain scalar closes nothing, so it opens no quote after a colon.
+    ("r11 plain scalar holding quote-colon-quote before on:", 'env:\n  K: a":"x\non:\n' + PR_EDITED + "\n", EDITED),
+    ("r11 plain scalar holding single-quote-colon-quote before on:",
+     "env:\n  K: a':'x\non:\n" + PR_EDITED + "\n", EDITED),
+    # round 11, REVIEW-8332-code-r10 F1 control: outside a flow collection "k":v is not YAML; refused by name.
+    ("r11 block quoted key flush against a plain value before on:", 'env:\n  "a":b\non:\n' + PR_EDITED + "\n",
+     REFUSE, f"line 2: {ADJACENT_KEY}"),
+    ("r11 block quoted key flush against a quoted value before on:", 'env:\n  "a":"b"\non:\n' + PR_EDITED + "\n",
+     REFUSE, f"line 2: {ADJACENT_KEY}"),
+    ("r11 plain key starting with a colon at column 0 before on: (control)", ":x: 1\non:\n" + PR_EDITED + "\n",
+     EDITED),
+    # round 11, REVIEW-8332-code-r10 INFO-1 / security-r10 INFO-2 pin: a plain continuation led by `? ` is
+    # refused as an explicit key (valid YAML, fail closed, no workflow writes it).
+    ("r11 plain continuation line led by a question mark before on:",
+     "env:\n  A: some plain\n    ? text\non:\n" + PR_EDITED + "\n", REFUSE, f"line 3: {EXPLICIT_KEY}"),
 )
 # Round 7 differential variants: each keeps the YAML meaning of a row, or makes it invalid (then only a
 # refusal is accepted): a trailing comment on every line, a doubled-quote key before ``on:``, one more
@@ -1050,16 +1133,88 @@ CANCEL_ORACLE = (
     ("r10 question mark and colon inside step values",
      CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
      + '    steps:\n      - run: a:b\n      - run: "x ? y : z"\n', None),
+    # round 11, REVIEW-8332-code-r10 F1 (probe e1 and a flow f-own1g): escaped JSON-like keys in a flow `jobs:`.
+    ("r11 e1 flow jobs, JSON-adjacent escaped job concurrency keys, true",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n"
+     'jobs: {j: {runs-on: ubuntu-latest, "concurrenc\\u0079":{group: j, "cancel\\u002din-progress":true},'
+     " steps: [{run: echo hi}]}}\n", f"cannot parse the trigger section (line 8: {ESCAPED_KEY}"),
+    ("r11 f-own1g flow form, pull_request without edited, JSON-adjacent escaped concurrency without the key",
+     "name: c\non:\n  pull_request:\n    types: [opened]\n"
+     'jobs: {j: {runs-on: ubuntu-latest, "concurrenc\\u0079":{group: j}, steps: [{run: echo hi}]}}\n',
+     f"cannot parse the trigger section (line 5: {ESCAPED_KEY}"),
+    # round 11 (own probe): a quote-colon-quote inside a plain env value must not hide the job concurrency.
+    ("r11 plain env value holding quote-colon-quote, job-level true",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + '    env:\n      K: a":"x\n    concurrency:\n      group: j\n      cancel-in-progress: true\n'
+     + '    steps:\n      - run: echo "hi"\n', "cancel-in-progress `true`"),
+    ("r11 plain env value holding single-quote-colon-quote, job-level true",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + "    env:\n      K: a':'x\n    concurrency:\n      group: j\n      cancel-in-progress: true\n"
+     + "    steps:\n      - run: echo 'hi'\n", "cancel-in-progress `true`"),
+    # round 11, REVIEW-8332-security-r10 INFO-1: a plain cancel value continued below is one folded string.
+    ("r11 cancel value continued on the next line",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n    x\n" + CANCEL_JOB,
+     f"line 8: {MULTILINE_CANCEL}"),
+    # controls: a JSON-like key without escapes in a flow env is read; block "k":v is refused (not YAML).
+    ("r11 JSON-adjacent quoted key without escapes in a flow env",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + '    env: {"K":x, \'L\':"y"}\n' + CANCEL_STEPS, None),
+    ("r11 block quoted key flush against a plain value in a job env",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + '    env:\n      "a":b\n' + CANCEL_STEPS, f"cannot parse the trigger section (line 12: {ADJACENT_KEY}"),
 )
 # Rows refused by design although YAML reads them as compliant (fail closed; no workflow writes them):
 # the PyYAML differential pins that they are over-refusals, not misreadings.
 OVER_REFUSALS = {"r10 cancel value on the next line, false", "r10 concurrency key under a step with:",
                  "r10 concurrency key under a job env:"}
-# YAML allows a tab before a comment; PyYAML 6 rejects it, so the differential pins that rejection instead.
-PYYAML_REJECTS = {"r10 tab before a trailing comment on a false value"}
+# YAML allows a tab before a comment; PyYAML 6 rejects it, so the differential pins that rejection instead. A
+# block "k":v is not YAML at all (round 11): the differential pins that PyYAML rejects what the scanner refuses.
+PYYAML_REJECTS = {"r10 tab before a trailing comment on a false value",
+                  "r11 block quoted key flush against a plain value in a job env"}
 # Round 10 (REVIEW-8332-security-r9 S20): KEY_LINE_RE on a hostile line must finish well inside this many
 # seconds (the round-9 prefix took about 1.8 s at 22 repetitions; the linear one takes microseconds).
 REGEX_CEILING_S = 0.5
+# Round 11 (REVIEW-8332-security-r10 S21, REVIEW-8332-code-r10 F2): the round-10 block scalar header regex, kept
+# ONLY as the differential oracle of ``_block_header`` on short generated strings (it is quadratic in the line
+# length, so the scanner no longer runs it), and the hostile line length every line pattern is timed at.
+BLOCK_SCALAR_ORACLE_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)(?:[&!][^ \t]*[ \t]+)*[|>][1-9+-]*$")
+HOSTILE_LEN = 50_000
+BLOCK_ALPHABET, BLOCK_CORPUS_MAX_LEN = " \t:-&!a|>1", 5
+
+
+def _rep(unit: str) -> str:
+    """``unit`` repeated to at least HOSTILE_LEN characters."""
+    return unit * (HOSTILE_LEN // len(unit) + 1)
+
+
+def _hostile_lines() -> list:
+    """Lines built so a backtracking pattern would retry at every position (rounds 10 and 11 shapes first)."""
+    return [": " + _rep("!a: ") + "x", _rep(":\t&"), "-" + _rep("\t -") + "x", _rep("- ") + "k: v", _rep("!a ") + "|",
+            _rep('"'), _rep("'"), _rep("a") + ":", " " * HOSTILE_LEN + "x", _rep(":"), "${{" + _rep(" ") + "}",
+            _rep("&a "), _rep("cancel-in-progress"), _rep("pull_request "), _rep("{[,"), _rep('a"'), _rep("<<"),
+            _rep("types edited ")]
+
+
+def _line_checks() -> list:
+    """(name, callable) for every pattern searched or matched per line or per file, and the block header walk."""
+    key_re, item_re = _trigger_line_res(2)
+    checks = [("ON_KEY_RE", ON_KEY_RE.match), ("TOP_KEY_RE", TOP_KEY_RE.match), ("PR_WORD_RE", PR_WORD_RE.search),
+              ("EXPLICIT_KEY_RE", EXPLICIT_KEY_RE.match), ("KEY_LINE_RE", KEY_LINE_RE.match),
+              ("TYPES_WORD_RE", TYPES_WORD_RE.search), ("ACTIVITY_WORD_RE", ACTIVITY_WORD_RE.findall),
+              ("GUARD_EXPR_RE", GUARD_EXPR_RE.fullmatch), ("_trigger_line_res key", key_re.match),
+              ("_trigger_line_res item", item_re.match), ("_block_header", _block_header)]
+    checks += [(f"PROPERTY_RES {what}", rx.search) for what, rx in PROPERTY_RES]
+    checks += [(f"TOKEN_RES {key}", rx.findall) for key, rx in TOKEN_RES.items()]
+    return checks + [(f"KIND_RES {kind}", rx.search) for kind, rx in KIND_RES.items()]
+
+
+def _scan_or_refusal(name: str, text: str) -> list:
+    """``scan`` as a (name, text) call for the timing table: [] or the refusal."""
+    try:
+        scan(text)
+    except ParseFailure as exc:
+        return [f"{name}: {exc}"]
+    return []
 
 
 def oracle_verdict(name: str, text: str) -> str:
@@ -1157,6 +1312,42 @@ class EditedRatchetOracle8332(unittest.TestCase):
         t0 = time.perf_counter()
         self.assertEqual(cancel_violations("claude-md-rule-compare.yml", text), [])
         self.assertLess(time.perf_counter() - t0, REGEX_CEILING_S)
+
+    def test_every_line_pattern_is_linear(self):
+        """Round 11 sweep (REVIEW-8332-security-r10 S21, REVIEW-8332-code-r10 F2): every pattern this guard runs per
+        line or per file, and the block header walk, finish each hostile line of at least HOSTILE_LEN characters
+        inside REGEX_CEILING_S; so do scan, cancel_violations and edited_listed on a workflow carrying it."""
+        lines = _hostile_lines()
+        for name, check in _line_checks():
+            for line in lines:
+                t0 = time.perf_counter()
+                check(line)
+                took = time.perf_counter() - t0
+                self.assertLess(took, REGEX_CEILING_S, f"{name}: {line[:12]!r} x{len(line)} took {took:.3f}s")
+        head = CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+        for line in lines:
+            for where in ("    steps:\n      - run: ", "    env:\n      A: "):
+                text = head + where + line + "\n"
+                for name, call in (("scan", _scan_or_refusal), ("cancel_violations", cancel_violations),
+                                   ("edited_listed", edited_listed)):
+                    t0 = time.perf_counter()
+                    call("claude-md-rule-compare.yml", text)
+                    took = time.perf_counter() - t0
+                    self.assertLess(took, REGEX_CEILING_S, f"{name}: {where.split()[0]} {line[:12]!r} took {took:.3f}s")
+
+    def test_block_header_matches_the_round10_regex(self):
+        """Round 11: the walk agrees with the round-10 regex on every string over BLOCK_ALPHABET up to
+        BLOCK_CORPUS_MAX_LEN characters and on every raw and scanned line of every table row and real workflow."""
+        samples = ["".join(chars) for size in range(BLOCK_CORPUS_MAX_LEN + 1)
+                   for chars in itertools.product(BLOCK_ALPHABET, repeat=size)]
+        for text in [t for _, t, *_ in ORACLE] + [t for _, t, _ in CANCEL_ORACLE] + list(_all().values()):
+            samples += text.splitlines()
+            try:
+                samples += [ln.text for ln in scan(text)]
+            except ParseFailure:
+                pass
+        self.assertEqual([s for s in samples if bool(BLOCK_SCALAR_ORACLE_RE.search(s)) != _block_header(s)], [])
+        self.assertGreater(len(samples), len(BLOCK_ALPHABET) ** BLOCK_CORPUS_MAX_LEN)
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not importable on this interpreter")
     def test_cancel_oracle_matches_pyyaml(self):
