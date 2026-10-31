@@ -105,8 +105,7 @@ POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-direc
 # SCRAM secret and passes it through to the backend. The verifier
 # (not the password) travels over docker exec stdout straight into a file
 # created under umask 077 (#4735); the password never appears in argv.
-VERIFIER_ROW="$(docker exec "$PG_CONTAINER" \
-  psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
+VERIFIER_ROW="$(docker exec "$PG_CONTAINER" psql -U ai_memory -d ai_memory -tA -c "SELECT format('\"%s\" \"%s\"', rolname, rolpassword) FROM pg_authid WHERE rolname = 'ai_memory'")"
 case "$VERIFIER_ROW" in
   '"ai_memory" "SCRAM-SHA-256$'*) ;;
   *) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;
@@ -120,8 +119,7 @@ POSTGRES_PASSWORD="$PW" docker compose -f "$COMPOSE_FILE_PINNED" --project-direc
 # psql THROUGH the pooler is run from inside the postgres container (it has
 # psql and shares the compose network, so `pgbouncer` resolves).
 psql_pooled() {
-  docker exec -i -e PGPASSWORD "$PG_CONTAINER" \
-    psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@" || return 1
+  docker exec -i -e PGPASSWORD "$PG_CONTAINER" psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@" || return 1
 }
 
 echo "[2/4] AGE cypher transaction through the pooler (transaction-mode pinning) ..."
@@ -156,16 +154,13 @@ echo "[3/4] role-default statement_timeout visible through the pooler ..."
 st="$(psql_pooled -c 'SHOW statement_timeout;')" || { echo "FAIL: SHOW statement_timeout through the pooler failed" >&2; exit 1; }
 echo "      statement_timeout = ${st}"
 if [ "$st" != "30s" ]; then
-  echo "FAIL: role-default statement_timeout did not survive the pooler (got '${st}', want '30s'). \
-Did you run role-defaults.sql / is it mounted into initdb.d?" >&2
+  echo "FAIL: role-default statement_timeout did not survive the pooler (got '${st}', want '30s'). Did you run role-defaults.sql / is it mounted into initdb.d?" >&2
   exit 1
 fi
 echo "      OK: role-default timeouts survive DISCARD ALL"
 
 echo "[4/4] pooler effective settings (SHOW CONFIG on the admin console) ..."
-cfg="$(docker exec -e PGPASSWORD "$PG_CONTAINER" \
-  psql "postgres://ai_memory@pgbouncer:6432/pgbouncer" -tA -c 'SHOW CONFIG;')" \
-  || { echo "FAIL: SHOW CONFIG on the pooler admin console failed" >&2; exit 1; }
+cfg="$(docker exec -e PGPASSWORD "$PG_CONTAINER" psql "postgres://ai_memory@pgbouncer:6432/pgbouncer" -tA -c 'SHOW CONFIG;')" || { echo "FAIL: SHOW CONFIG on the pooler admin console failed" >&2; exit 1; }
 pool_mode="$(printf '%s\n' "$cfg" | awk -F'|' '$1 == "pool_mode" { print $2 }')"
 auth_type="$(printf '%s\n' "$cfg" | awk -F'|' '$1 == "auth_type" { print $2 }')"
 echo "      pool_mode = ${pool_mode:-<unreported>}"
