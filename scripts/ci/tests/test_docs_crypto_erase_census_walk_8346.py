@@ -14,9 +14,10 @@ The Rust comments are stripped ONCE from the whole source (`Census.__init__`) an
 every search runs on that stripped text, so a stale commented-out copy of a
 declaration or of the listing call can never be read instead of the live one.
 Rust block comments nest, so the stripper counts the depth (a stray `*/` fails loudly).
-Every parsed constant name and the loop head must be declared exactly once of ANY item kind (`const`, `static`,
-`let`, `fn`, `struct`, `enum`, `union`, `type`, `trait`, `mod`, `macro_rules!`, a `use` binding or a generic
-parameter, `r#` spellings included), so a unit struct or a `type` alias with a parsed name fails loudly.
+Every parsed constant name and the loop head must be declared exactly once of ANY item kind (`const`, `static`
+and the `static ref NAME` spelling, `let`, `fn`, `struct`, `enum`, `union`, `type`, `trait`, `macro_rules!`, a `use`
+binding or a generic parameter, `r#` spellings included), so a unit struct or a `type` alias with a parsed name
+fails loudly. A `mod` item is not counted there: the modules of mod.rs are held by the module-set pin (class 7).
 
 The WHOLE contiguous census region is pinned, chunk by chunk (`CENSUS_REGION`): from
 `const DOCS_CENSUS_ERASE_PHRASES` to the end of the last census test. Comments are stripped,
@@ -47,21 +48,25 @@ between the BEGIN and END markers.
 What the guard closes (`CLOSED_CLASSES`; each is a class that a round 4 to 8 review found an instance of):
 1. region text: the whole census region is pinned chunk by chunk (above).
 2. call graph: the `docs_census_*` and `DOCS_CENSUS_*` identifiers of the comment-and-literal-masked source,
-   plus the `{name}` and `{name:...}` inline arguments of its string literals, must all be pinned names; a plain
-   word inside a string or doc text is no census identifier (#8393).
+   plus the `{name}` and `{name:...}` spans of every string literal (plain or raw), must all be pinned names; a
+   plain word inside a string or doc text is no census identifier (#8393).
 3. declarations of any item kind: each parsed name is declared exactly once of ANY kind, and no item of any
    kind (fn, struct, enum, union, type, const, static, trait, a function-local `use` binding) anywhere in mod.rs
    outside the region may be named like a name the region resolves outside itself. That set is DERIVED from the
-   region text (every identifier of it that is not a keyword, the names the pinned imports bind, and
-   `std`/`core`/`alloc`); its size is pinned (`EXTERNAL_NAMES_COUNT`); `OUTSIDE_RESOLVED` is the one name the
+   region text: every identifier of it that is not a keyword, plus the `{name}` and `{name:...}` format arguments
+   of its string literals, minus the names the region declares itself, plus the names the pinned imports bind
+   and `std`/`core`/`alloc`; its size is pinned (`EXTERNAL_NAMES_COUNT`); `OUTSIDE_RESOLVED` is the one name the
    region resolves to an item outside it.
 4. import surface: the module-level `use` lines of mod.rs and `mod tests` are pinned (`USE_SURFACE`, the
    `pub use scope::{...}` line included), and every `use` binding of a parsed constant is a declaration.
 5. rebinding forms: `macro_rules!`, `include!`, `extern crate`, a `use ... as` alias, a `trait` declaration and an
    `impl ... for` a derived external name (a blanket impl for a generic parameter too) are rejected in mod.rs.
+   An `impl` outside the region (inherent or `impl Trait for`) whose target is a type the region declares
+   (`DocsCensus`; own-type impls) is rejected too: `impl Drop for DocsCensus` would run code in the census.
 6. attribute content: every `#[...]` and `#![...]` is read as content (whitespace and comment insensitive), so
    `macro_use`, `path`, `no_implicit_prelude`, `macro_export`, `no_std` and `no_core` are rejected in any
-   spelling (`cfg_attr(test, macro_use)`, `r#path`) in mod.rs and in every `.rs` file under src/encryption/.
+   spelling (`cfg_attr(test, macro_use)`, `r#path`) in mod.rs and in every `.rs` file under src/encryption/;
+   in the src/lib.rs prefix the words are `macro_use`, `no_implicit_prelude`, `no_std`, `no_core` and `path`.
 7. module set: mod.rs holds exactly the root modules `escrow` and `scope` (out of line) and `tests` (inline),
    once each, with their headers pinned; a nested, second or out-of-line module is rejected.
 8. crate-level macros: the stripped src/lib.rs up to and including `pub mod encryption;` is scanned: a
@@ -69,17 +74,45 @@ What the guard closes (`CLOSED_CLASSES`; each is a class that a round 4 to 8 rev
    defines today), and so are `macro_use`, `no_implicit_prelude`, `no_std`, `include!` and `extern crate`; the
    declaration `pub mod encryption;` carries no attribute (no `#[path`). escrow.rs, scope.rs and the files below
    them hold no `macro_rules!`, `include!` or `macro_export`.
+   module files: every `mod NAME;` of that prefix is resolved to `src/NAME.rs` or `src/NAME/mod.rs` (none or both
+   present fails closed) and each file is read: an inner `#![...]` attribute naming `macro_use` in any spelling is
+   rejected, and so is a `macro_rules!` named like a region macro in a file that carries `macro_use` in any form
+   (the macros of a module stay inside it without `macro_use`, and `#[macro_export]` is path-scoped, not textual).
 9. region borders: the item before the region is pinned by name and kind (`REGION_BEFORE`), nothing but whitespace
    or comments lies between it and the first constant, and the closing `}` of `mod tests` follows the region
    directly, nothing inside the module after it (#8392); the parsed constant bodies are string literals only; no identifier of mod.rs is non-ASCII.
+10. build inputs: Cargo.toml is read with a read-only line parser (Python 3.9 has no tomllib) and fails closed when
+   it is missing: a dependency key (any table, inline or dotted) named `std`, `core`, `alloc`, `proc_macro`,
+   `test` or like a path root of the region, any `package =` rename, a `path`/`git`/`registry` source on a pinned
+   crate (the crates of the `use` lines plus `tempfile`, `PINNED_CRATES_COUNT`), a `[patch.*]` entry beyond the one
+   vendored `paste`, any `[replace]`, a `build =` key, a repo-root build.rs, a `[lib]` key beyond `name` and
+   `crate-type`, and an edition other than 2024 are rejected. The tracked `.cargo/` files are exactly
+   `.cargo/audit.toml` (`git ls-files -z`, a git error fails closed), a `.cargo/config(.toml)` with `[env]`,
+   `runner`, `rustc-wrapper`, `rustc`, `rustflags` (or `linker`, `include`, `patch`, `source`) is rejected, and
+   `.config/nextest.toml` keeps today's tables and keys (a filter or override can skip the census test).
 
 Everything else is read by a value parser: the phrase, dated-record and erase-doc constants,
 and the whole `CRYPTO_ERASABLE_ENVELOPE_VERSIONS` array (`const` only, `[u8; N]`, N equal to
-the element count, every element a known `*_ENVELOPE_VERSION` constant). The erasable bytes
-are a sorted set, so a reordered or repeated array that gives the same Rust census is
+the element count, every element a known `*_ENVELOPE_VERSION` constant). Every value regex runs on the
+LITERAL-MASKED source and the value is sliced from the unmasked source at the match offsets, and each value
+declaration must match exactly once there: a declaration-shaped string literal (a decoy, plain or raw) is never read.
+The erasable bytes are a sorted set, so a reordered or repeated array that gives the same Rust census is
 accepted. Parsed string literals are unescaped, and a backslash the decoder does not know
 raises. Code outside the census region is otherwise not pinned: a new item that does not change a name the
 region resolves, a macro it invokes or an attribute is free to land.
+
+The git mirror follows the region: the `git ls-files` arguments and the environment names removed (`env_remove`
+literals) are parsed from the pinned region text, and the listing is split on NUL when the arguments carry `-z`
+(else by line, as the Rust census does), so the mirror follows the region. A non-ASCII doc name is quoted by plain
+`ls-files` in both the census and the mirror; the Rust side is hardened by the shared gap that PR #8350 stage 2
+fixes (a wider `env_remove` set and `-z`), and the mirror needs no second edit when that region is re-pinned.
+
+Inputs the guard reads: src/encryption/mod.rs, src/encryption/scope.rs and every file below src/encryption/, src/lib.rs
+and the module files of its prefix (`src/NAME.rs` or `src/NAME/mod.rs`), Cargo.toml, a repo-root build.rs
+(existence), `.cargo/` (listing and config files), `.config/nextest.toml` and the tracked docs listing.
+Inputs the guard does not read: the process environment of the CI runner (including RUSTFLAGS and CARGO_* variables),
+the workflow files that choose the test command, `~/.cargo` configuration, Cargo.lock and rust-toolchain.toml; the
+first three are runner state outside the tree, the last two cannot rename a name the region resolves.
 """
 import functools
 import json
@@ -101,7 +134,8 @@ LIB_SRC = "src/lib.rs"
 ENCRYPTION_DIR = "src/encryption"
 SCRATCH = REPO / ".local-runs"
 CLOSED_CLASSES = ("region text", "call graph", "declarations of any item kind", "import surface",
-                  "rebinding forms", "attribute content", "module set", "crate-level macros", "region borders")
+                  "rebinding forms", "attribute content", "module set", "crate-level macros", "region borders",
+                  "module files", "own-type impls", "build inputs")
 
 RUST_TOKEN = re.compile(
     r'(?P<raw>(?<![A-Za-z0-9_])b?r(?P<h>#*)".*?"(?P=h))'
@@ -113,8 +147,29 @@ RUST_TOKEN = re.compile(
 
 
 def read(rel):
-    """Return the text of a tracked source file."""
-    return (REPO / rel).read_text(encoding="utf-8")
+    """Return the text of a tracked input file; a missing or unreadable one raises a named AssertionError."""
+    try:
+        return (REPO / rel).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as err:
+        raise AssertionError("the docs census mirror requires %s as an input and cannot read it (%s): it fails "
+                             "closed rather than guess what the Rust census depends on" % (rel, err))
+
+
+def read_input(rel, overrides):
+    """Return `overrides[rel]` (a scratch string; None means the file is missing) or the file `rel`."""
+    if rel in overrides:
+        if overrides[rel] is None:
+            raise AssertionError("the docs census mirror requires %s as an input and it is missing (override "
+                                 "None): it fails closed" % rel)
+        return overrides[rel]
+    return read(rel)
+
+
+def input_exists(rel, overrides):
+    """True when `rel` exists on disk or in the overrides (an override of None removes it)."""
+    if rel in overrides:
+        return overrides[rel] is not None
+    return (REPO / rel).is_file()
 
 
 RUST_LITERAL = re.compile(
@@ -170,6 +225,7 @@ def strip_comments(text):
     return "".join(out)
 
 
+@functools.lru_cache(maxsize=256)
 def mask_literals(text):
     """Replace every string, raw string and char literal by NULs of the same length."""
     return RUST_LITERAL.sub(lambda m: "\0" * len(m.group(0)), text)
@@ -183,6 +239,8 @@ KEYWORDS = frozenset("""
 # `const fn name`, `static mut NAME`, `let ref x`: the word after the item keyword is not the item name.
 ITEM_DECL = re.compile(r"(?<![\w'#])(const|static|let|fn|struct|enum|union|type|trait)\s+(?:mut\s+)?(?:r#)?"
                        r"(?!(?:fn|unsafe|extern|async|mut|ref|dyn|impl|union)\b)([A-Za-z_]\w*)")
+# `static ref NAME` (the lazy_static spelling) declares NAME although `ref` is skipped above (`let ref x` is a pattern).
+STATIC_REF_DECL = re.compile(r"(?<![\w'#])static\s+ref\s+(?:r#)?([A-Za-z_]\w*)")
 MACRO_DECL = re.compile(r"(?<![\w'#])macro_rules\s*!\s*(\S+)")
 GENERIC_OWNER = re.compile(r"(?<![\w'#])(?:(?:fn|struct|enum|union|type|trait)\s+(?:r#)?[A-Za-z_]\w*|impl)\s*<")
 IDENT = re.compile(r"(?<!\w)[A-Za-z_]\w*")
@@ -220,6 +278,7 @@ def declared_names(masked):
     parameters (an `r#` prefix is the same name). `mod` items are read by `module_items`, `use` bindings by `use_bindings`.
     """
     found = [(m.group(1), m.group(2), m.start()) for m in ITEM_DECL.finditer(masked)]
+    found += [("static", m.group(1), m.start()) for m in STATIC_REF_DECL.finditer(masked)]
     found += [("macro_rules!", m.group(1), m.start()) for m in MACRO_DECL.finditer(masked)]
     return found + generic_names(masked)
 
@@ -333,20 +392,41 @@ def strings(body):
     return found
 
 
+def masked_matches(clean, pattern, flags=0):
+    """Return the matches of `pattern` on the LITERAL-MASKED text (a string literal never matches).
+
+    The masked text has the length of `clean`, so a group's span slices the value text out of the unmasked source
+    (`clean[m.start(1):m.end(1)]`). A declaration-shaped string literal (a decoy, plain or raw) is therefore invisible
+    to every value reader, the same way it is invisible to the declared-once checks (#8346 round 10, security L1).
+    """
+    return list(re.finditer(pattern, mask_literals(clean), flags))
+
+
+def one_match(clean, pattern, what, flags=0, where=RUST_SRC):
+    """Return the single masked match of `pattern`; zero or several raise AssertionError naming `what`."""
+    found = masked_matches(clean, pattern, flags)
+    if len(found) != 1:
+        raise AssertionError("%s must declare %s exactly once in live code (outside any string literal) for the "
+                             "value reader, found %d" % (where, what, len(found)))
+    return found[0]
+
+
 def const_body(clean, name):
-    """Return the body of `const <name>: ... = ...;` in the comment-stripped Rust source."""
-    match = re.search(r"const %s\s*:[^=]*=\s*(.*?);\n" % re.escape(name), clean, re.S)
-    if match is None:
+    """Return the body of `const <name>: ... = ...;` (masked search, unmasked slice; exactly one declaration)."""
+    pattern = r"const %s\s*:[^=]*=\s*(.*?);\n" % re.escape(name)
+    if not masked_matches(clean, pattern, re.S):
         raise AssertionError("%s no longer declares %s" % (RUST_SRC, name))
-    return match.group(1)
+    match = one_match(clean, pattern, "const " + name, re.S)
+    return clean[match.start(1):match.end(1)]
 
 
 def const_len(clean, name):
-    """Return N from the declared type `const <name>: [&str; N]` (comment-stripped source)."""
-    match = re.search(r"const %s\s*:\s*\[&str;\s*(\d+)\s*\]" % re.escape(name), clean)
-    if match is None:
+    """Return N from the declared type `const <name>: [&str; N]` (masked search, exactly one declaration)."""
+    pattern = r"const %s\s*:\s*\[&str;\s*(\d+)\s*\]" % re.escape(name)
+    if not masked_matches(clean, pattern):
         raise AssertionError("%s no longer declares %s as [&str; N]" % (RUST_SRC, name))
-    return int(match.group(1))
+    match = one_match(clean, pattern, "const %s: [&str; N]" % name)
+    return int(clean[match.start(1):match.end(1)])
 
 
 def string_list(clean, name):
@@ -888,7 +968,7 @@ EXTERNAL_NAMES_COUNT = 124
 OUTSIDE_RESOLVED = ("CRYPTO_ERASABLE_ENVELOPE_VERSIONS",)
 # Attribute words that change how a name resolves or where a module's code comes from, in any spelling.
 DENIED_ATTRIBUTE_WORDS = ("macro_use", "path", "no_implicit_prelude", "macro_export", "no_std", "no_core")
-CRATE_DENIED_ATTRIBUTE_WORDS = ("macro_use", "no_implicit_prelude", "no_std", "no_core")
+CRATE_DENIED_ATTRIBUTE_WORDS = ("macro_use", "no_implicit_prelude", "no_std", "no_core", "path")
 # The forms that can rebind a name the pinned census text uses without touching its text (r7 code L2,
 # security L1). mod.rs has none of them, so the deny-list costs nothing and any new one is loud.
 REBINDING_FORMS = (
@@ -1030,17 +1110,28 @@ def region_macros(region_masked):
             if name not in KEYWORDS}
 
 
-def derive_external_names(region_masked, masked):
+def format_arguments(region_text):
+    """Return the identifiers the inline `{name}` / `{name:...}` arguments of the string literals of `region_text` name."""
+    return {arg.group(1) for body in strings(region_text) for arg in FORMAT_ARG.finditer(body)
+            if arg.group(1) is not None}
+
+
+OWN_TYPE_KINDS = ("struct", "enum", "union", "type")
+
+
+def derive_external_names(region_masked, masked, region_text=""):
     """Return the names the census region resolves outside itself, DERIVED from its text and the pinned imports.
 
     Every identifier of the region that is not a keyword and not declared inside the region itself (path roots,
     types, traits, macros, functions and methods it calls; a name the region declares is held by the declared-once
-    and call-graph checks), the names the module-level `use`
+    and call-graph checks), the inline format arguments of its string literals (`{rel}` is an identifier the compiler
+    resolves although the literal is masked), the names the module-level `use`
     lines bind (they are what `use super::*` hands `mod tests`) and the crate roots `std`, `core`, `alloc`.
     """
     # `let Some(x)` names the prelude variant `Some`, it declares nothing: only a lowercase `let` name is a binding.
     own = {name for kind, name, _ in declared_names(region_masked) if kind != "let" or name[0].islower()}
-    names = {word for word in IDENT.findall(region_masked) if word not in KEYWORDS and word != "_"} - own
+    names = {word for word in IDENT.findall(region_masked) if word not in KEYWORDS and word != "_"}
+    names = (names | {arg for arg in format_arguments(region_text) if arg not in KEYWORDS}) - own
     for match, top in use_statements(masked):
         if top:
             names.update(use_bound_names(match))
@@ -1057,7 +1148,7 @@ def reject_shadowing(clean, span):
     """
     masked = mask_literals(clean)
     region_masked = masked[span[0]:span[1]]
-    external = derive_external_names(region_masked, masked)
+    external = derive_external_names(region_masked, masked, clean[span[0]:span[1]])
     if len(external) != EXTERNAL_NAMES_COUNT:
         raise AssertionError("%s: derived external names: found %d, pinned %d (a census region edit that adds or "
                              "drops a name it resolves outside itself must be reviewed against the item names "
@@ -1075,6 +1166,9 @@ def reject_shadowing(clean, span):
             if not top and name in external:
                 raise AssertionError("%s has a function-local `use` binding of `%s`, a name the census region "
                                      "resolves outside itself" % (RUST_SRC, name))
+    # the types the region declares: an `impl` of one outside the region runs code inside the pinned census
+    # (`impl Drop for DocsCensus` fires when the pinned test drops the value, #8346 round 10 code L2)
+    own_types = {name for kind, name, _ in declared_names(region_masked) if kind in OWN_TYPE_KINDS}
     # an `impl` ITEM starts a statement (`impl Trait` in an argument or return type does not)
     for head in re.finditer(r"(?:^|[;{}\]])\s*(?:unsafe\s+)?impl\b([^{;]*)", masked):
         generics = {name for kind, name, pos in generic_names(masked[head.start():head.end()])}
@@ -1082,6 +1176,10 @@ def reject_shadowing(clean, span):
         text = text[text.index(">") + 1:] if text.lstrip().startswith("<") and ">" in text else text
         target = re.split(r"\bfor\b(?!\s*<)", text)[-1]
         named = re.match(r"\s*&?\s*(?:'\w+\s+)?(?:mut\s+)?(?:dyn\s+)?(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", target)
+        if named is not None and named.group(1) in own_types and not span[0] <= head.start() < span[1]:
+            raise AssertionError("%s has an `impl` for `%s` outside the census region, a type the region declares: "
+                                 "an inherent or trait impl (`Drop`) runs code inside the pinned census"
+                                 % (RUST_SRC, named.group(1)))
         if named is not None and (named.group(1) in external or named.group(1) in generics):
             raise AssertionError("%s has an `impl ... for` `%s`, a name the census region resolves outside itself "
                                  "(or a blanket impl over a generic parameter)" % (RUST_SRC, named.group(1)))
@@ -1114,17 +1212,38 @@ def pin_region(clean, folder):
     return tuple(strings(raw[0]))
 
 
-def census_folder(clean):
-    """Return the folder of the census `git ls-files -- <folder>` call."""
+def census_git_args(clean):
+    """Return the argument literals of the census `git ls-files ... -- <folder>` call, `ls-files` first."""
     calls = len(re.findall(r'"ls-files"', clean))
     if calls != 1:
         raise AssertionError('%s must have exactly one `"ls-files"` call site, found %d'
                              % (RUST_SRC, calls))
-    match = re.search(r'docs_census_git_on\(\s*root,\s*&\["ls-files",\s*"--",\s*"([^"]+)"\s*\]', clean)
+    match = re.search(r'docs_census_git_on\(\s*root,\s*&\[\s*("ls-files"(?:\s*,\s*"[^"]*")*)\s*,?\s*\]', clean)
     if match is None:
         raise AssertionError("%s no longer runs `git ls-files -- <folder>` through docs_census_git_on"
                              % RUST_SRC)
-    return match.group(1)
+    args = tuple(strings(match.group(1)))
+    if "--" not in args or args.index("--") != len(args) - 2:
+        raise AssertionError("%s: the `ls-files` call is not `... -- <folder>`: %r" % (RUST_SRC, args))
+    return args
+
+
+def census_folder(clean):
+    """Return the folder of the census `git ls-files -- <folder>` call."""
+    return census_git_args(clean)[-1]
+
+
+def census_env_removed(clean):
+    """Return the environment names `docs_census_git_on` removes (`env_remove("NAME")` literals), in order.
+
+    The region is pinned to its text, so this set is what the Rust census removes today; when the region
+    is re-pinned to a wider set (the shared gap filed for PR #8350 stage 2) the mirror follows it.
+    """
+    raws = [raw for compacted, raw in chunk_pairs(census_region(clean)) if compacted.startswith("git.args(args)")]
+    if len(raws) != 1:
+        raise AssertionError("%s: the `git.args(args)` statement of docs_census_git_on was found %d times, "
+                             "expected once" % (RUST_SRC, len(raws)))
+    return tuple(re.findall(r'\.env_remove\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\)', raws[0]))
 
 
 def erasable_bytes(clean, scope_clean):
@@ -1139,23 +1258,30 @@ def erasable_bytes(clean, scope_clean):
     """
     declared_name_once(mask_literals(clean), "CRYPTO_ERASABLE_ENVELOPE_VERSIONS",
                        "const CRYPTO_ERASABLE_ENVELOPE_VERSIONS")
-    match = re.search(r"\b(?:pub(?:\([^)]*\))?\s+)?const\s+CRYPTO_ERASABLE_ENVELOPE_VERSIONS\s*:"
-                      r"\s*\[u8;\s*(\d+)\s*\]\s*=\s*\[(.*?)\];", clean, re.S)
-    if match is None:
+    array = (r"\b(?:pub(?:\([^)]*\))?\s+)?const\s+CRYPTO_ERASABLE_ENVELOPE_VERSIONS\s*:"
+             r"\s*\[u8;\s*(\d+)\s*\]\s*=\s*\[(.*?)\];")
+    if not masked_matches(clean, array, re.S):
         raise AssertionError("%s no longer declares CRYPTO_ERASABLE_ENVELOPE_VERSIONS as a const [u8; N]"
                              % RUST_SRC)
-    elements = [compact(part) for part in match.group(2).split(",")]
+    match = one_match(clean, array, "const CRYPTO_ERASABLE_ENVELOPE_VERSIONS: [u8; N]", re.S)
+    length, body = clean[match.start(1):match.end(1)], clean[match.start(2):match.end(2)]
+    elements = [compact(part) for part in body.split(",")]
     if elements and elements[-1] == "":
         elements.pop()
-    if len(elements) != int(match.group(1)) or "" in elements:
+    if len(elements) != int(length) or "" in elements:
         raise AssertionError("%s: CRYPTO_ERASABLE_ENVELOPE_VERSIONS declares [u8; %s] but %d elements "
-                             "were parsed: %r" % (RUST_SRC, match.group(1), len(elements), elements))
+                             "were parsed: %r" % (RUST_SRC, length, len(elements), elements))
     masked = mask_literals(clean) + "\n" + mask_literals(scope_clean)
-    values = {}
+    values, seen = {}, {}
     for src in (clean, scope_clean):
-        for name, val in re.findall(r"const ([A-Z_]+_ENVELOPE_VERSION)\s*:\s*u8\s*=\s*0x([0-9a-fA-F]+);",
-                                    src):
-            values[name] = int(val, 16)
+        for found in masked_matches(src, r"const ([A-Z_]+_ENVELOPE_VERSION)\s*:\s*u8\s*=\s*0x([0-9a-fA-F]+);"):
+            name = src[found.start(1):found.end(1)]
+            seen[name] = seen.get(name, 0) + 1
+            values[name] = int(src[found.start(2):found.end(2)], 16)
+    for name, count in seen.items():
+        if count != 1:
+            raise AssertionError("%s: `const %s: u8` is declared %d times outside string literals, the value reader "
+                                 "needs exactly one" % (RUST_SRC, name, count))
     for element in elements:
         if element not in values:
             raise AssertionError("%s: CRYPTO_ERASABLE_ENVELOPE_VERSIONS element %r is not a known "
@@ -1247,6 +1373,52 @@ def reject_tree_file(rel, clean):
     reject_attributes(masked, rel)
 
 
+LIB_MOD_DECL = re.compile(r"(?<![\w'#])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;")
+
+
+def lib_prefix_modules(lib_clean):
+    """Return the names of the `mod NAME;` declarations of src/lib.rs before `mod encryption;` (it excluded)."""
+    masked = mask_literals(lib_clean)
+    end = masked.index(";", re.search(r"(?<![\w'#])mod\s+(?:r#)?encryption\b", masked).start()) + 1
+    return [m.group(1) for m in LIB_MOD_DECL.finditer(masked[:end]) if m.group(1) != "encryption"]
+
+
+def module_file(name, overrides):
+    """Resolve `mod NAME;` of src/lib.rs to its file (`src/NAME.rs` or `src/NAME/mod.rs`); fail closed otherwise."""
+    flat, nested = "src/%s.rs" % name, "src/%s/mod.rs" % name
+    present = [rel for rel in (flat, nested) if input_exists(rel, overrides)]
+    if len(present) != 1:
+        raise AssertionError("%s declares `mod %s;` before `mod encryption;` and %d of %s / %s exist: the mirror "
+                             "reads every module file the census can see a macro from and fails closed on one "
+                             "it cannot resolve" % (LIB_SRC, name, len(present), flat, nested))
+    return present[0]
+
+
+@functools.lru_cache(maxsize=256)
+def reject_module_file(rel, text, macros):
+    """Raise when a module declared before `mod encryption;` leaks a textual macro the census region invokes.
+
+    `#![macro_use]` as an inner attribute of the module file (any spelling: `cfg_attr`, `r#`, spaces) puts
+    the macros the module defines into the crate-root textual scope, so a `macro_rules!` named like one the
+    region invokes (`macros`) would replace it inside mod.rs. Without `macro_use` the module's macros stay
+    inside it (`#[macro_export]` is path-scoped, not textual).
+    """
+    if "macro_use" not in text:
+        return
+    clean = strip_comments(text)
+    masked = mask_literals(clean)
+    for content, pos in attributes(masked):
+        if re.match(r"#\s*!", masked[pos:]) and "macro_use" in IDENT.findall(content):
+            raise AssertionError("%s has the inner attribute `#![%s]` naming `macro_use`: the macros the module "
+                                 "defines reach the crate-root textual scope, so one the census region invokes "
+                                 "could be replaced inside mod.rs" % (rel, re.sub(r"[\s\0]+", "", content)))
+    if "macro_use" in masked:
+        for name in plain_macros(masked, rel):
+            if name in macros:
+                raise AssertionError("%s carries `macro_use` and defines the `macro_rules!` macro `%s`, which the "
+                                     "census region invokes: it could replace it inside mod.rs" % (rel, name))
+
+
 def tree_files(overrides):
     """Return the relative paths of every .rs file below src/encryption except mod.rs, plus overridden ones."""
     found = {path.relative_to(REPO).as_posix() for path in (REPO / ENCRYPTION_DIR).rglob("*.rs")}
@@ -1263,6 +1435,328 @@ def rules_entry():
     raise AssertionError("rules.json has no walk_guards entry for %s" % RUST_SRC)
 
 
+# ---- build inputs of the census: Cargo.toml, build.rs, .cargo/, .config/ (#8346 round 10) ----
+MANIFEST = "Cargo.toml"
+BUILD_SCRIPT = "build.rs"
+CARGO_DIR = ".cargo"
+CARGO_TRACKED = (".cargo/audit.toml",)
+CARGO_CONFIGS = (".cargo/config.toml", ".cargo/config")
+NEXTEST_DIR = ".config"
+NEXTEST_TRACKED = (".config/nextest.toml",)
+NEXTEST_CONFIG = ".config/nextest.toml"
+GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+# Dependency keys that name a crate of the std family: the extern prelude beats the std prelude, so one of
+# these can replace `std::fs` while mod.rs stays byte-identical (security r9 L2).
+STD_FAMILY = ("std", "core", "alloc", "proc_macro", "test")
+DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
+SOURCE_FIELDS = ("path", "git", "registry", "registry-index", "branch", "tag", "rev")
+# The patch entries Cargo.toml may carry: (registry, crate).
+ALLOWED_PATCHES = frozenset({("crates-io", "paste")})
+LIB_KEYS = ("name", "crate-type")
+PACKAGE_EDITION = "2024"
+PINNED_CRATES_COUNT = 8
+# Cargo config keys that change the compiler, the runner or the environment of the test process (L4).
+CARGO_CONFIG_DENIED = ("env", "runner", "rustc-wrapper", "rustc-workspace-wrapper", "rustc", "rustflags",
+                       "linker", "include", "patch", "source")
+NEXTEST_HEADERS = frozenset({("profile", "default"), ("profile", "default", "junit"), ("profile", "macos"),
+                             ("profile", "ci"), ("profile", "ci", "junit")})
+NEXTEST_KEYS = frozenset({"retries", "fail-fast", "slow-timeout", "status-level", "final-status-level",
+                          "test-threads", "path", "period", "terminate-after"})
+
+
+def toml_dotted(text):
+    """Split a dotted TOML key or header on the dots outside quotes; each segment is stripped and unquoted."""
+    parts, buf, quote = [], [], ""
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                buf.append(char)
+        elif char in "\"'":
+            quote = char
+        elif char == ".":
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(char)
+    if quote:
+        raise AssertionError("an unterminated quote in the TOML key %r" % text)
+    parts.append("".join(buf).strip())
+    return tuple(parts)
+
+
+def toml_split(text, separator, where):
+    """Split `text` at `separator` characters outside quotes and outside [] / {} nesting."""
+    parts, buf, quote, depth = [], [], "", 0
+    for char in text:
+        if quote:
+            buf.append(char)
+            quote = "" if char == quote else quote
+        elif char in "\"'":
+            buf.append(char)
+            quote = char
+        elif char in "[{":
+            depth += 1
+            buf.append(char)
+        elif char in "]}":
+            depth -= 1
+            buf.append(char)
+        elif char == separator and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(char)
+    if quote or depth != 0:
+        raise AssertionError("%s: an unbalanced quote or bracket in %r" % (where, text[:60]))
+    parts.append("".join(buf))
+    return parts
+
+
+def toml_logical_lines(text, where):
+    """Return the logical lines of a TOML document: comments dropped, a value spanning lines joined.
+
+    Multi-line strings are rejected (fail closed): none of the parsed files uses one.
+    """
+    lines, buf, quote, depth, pos = [], [], "", 0, 0
+    while pos < len(text):
+        char = text[pos]
+        if not quote and text.startswith(('"""', "'''"), pos):
+            raise AssertionError("%s uses a multi-line TOML string, which the read-only parser does not handle"
+                                 % where)
+        if quote:
+            if char == "\n":
+                raise AssertionError("%s has a string that does not close on its line" % where)
+            if char == "\\" and quote == '"':
+                buf.append(text[pos:pos + 2])
+                pos += 2
+                continue
+            buf.append(char)
+            quote = "" if char == quote else quote
+        elif char == "#":
+            while pos < len(text) and text[pos] != "\n":
+                pos += 1
+            continue
+        elif char in "\"'":
+            buf.append(char)
+            quote = char
+        elif char in "[{":
+            depth += 1
+            buf.append(char)
+        elif char in "]}":
+            depth -= 1
+            buf.append(char)
+        elif char == "\n" and depth <= 0:
+            lines.append("".join(buf).strip())
+            buf, depth = [], 0
+        else:
+            buf.append(char)
+        pos += 1
+    lines.append("".join(buf).strip())
+    return [line for line in lines if line]
+
+
+def toml_expand(path, value, entries):
+    """Append (path, value) and, for an inline table, the entries of its keys (recursively)."""
+    entries.append((path, value))
+    if value.startswith("{"):
+        if not value.endswith("}"):
+            raise AssertionError("an inline table that does not close: %r" % value[:60])
+        for pair in toml_split(value[1:-1], ",", "inline table"):
+            if not pair.strip():
+                continue
+            kv = toml_split(pair, "=", "inline table")
+            if len(kv) < 2:
+                raise AssertionError("an inline table entry without `=`: %r" % pair[:60])
+            toml_expand(path + toml_dotted(kv[0]), "=".join(kv[1:]).strip(), entries)
+
+
+def toml_entries(text, where):
+    """Return [(path, value)] for a TOML document; a table header is (path, None), a key its full dotted path."""
+    entries, table = [], ()
+    for line in toml_logical_lines(text, where):
+        if line.startswith("["):
+            double = line.startswith("[[")
+            close = "]]" if double else "]"
+            if not line.endswith(close):
+                raise AssertionError("%s: a table header that does not close: %r" % (where, line[:60]))
+            table = toml_dotted(line[2 if double else 1:-len(close)])
+            entries.append((table, None))
+            continue
+        kv = toml_split(line, "=", where)
+        if len(kv) < 2:
+            raise AssertionError("%s: a line that is neither a header nor `key = value`: %r" % (where, line[:60]))
+        toml_expand(table + toml_dotted(kv[0]), "=".join(kv[1:]).strip(), entries)
+    return entries
+
+
+def unquote(value):
+    """Return a TOML string value without its quotes ('' when it is not a plain string)."""
+    value = (value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return ""
+
+
+def use_roots():
+    """Return the first path segment of every pinned `use` line (`USE_SURFACE`)."""
+    roots = set()
+    for line in USE_SURFACE:
+        found = re.match(r"(?:pub)?use([A-Za-z_]\w*)::", line)
+        if found:
+            roots.add(found.group(1))
+    return roots
+
+
+def pinned_crates(roots):
+    """Return the crates the census imports: the pinned `use` lines plus `tempfile::` paths of the region.
+
+    `roots` are the path roots of the region (`path_roots`); the std family and the crate-local roots are
+    not external crates. Derived, not listed: a new crate in a `use` line or a `tempfile::` path of the
+    region changes the set, and `PINNED_CRATES_COUNT` makes that change loud.
+    """
+    crates = (use_roots() - set(STD_FAMILY) - {"crate", "super", "self", "scope"}) | (roots & {"tempfile"})
+    return frozenset(crates)
+
+
+def path_roots(region_masked):
+    """Return the first path segments (`NAME::`) of the region and of the pinned `use` lines."""
+    roots = {m.group(1) for m in re.finditer(r"(?<![\w:])([A-Za-z_]\w*)\s*::", region_masked)}
+    return frozenset((roots | use_roots()) - {"crate", "super", "self", "Self"})
+
+
+def dependency_slot(path):
+    """Return (name, field) when `path` is below a dependency table, else None."""
+    for index, group in ((0, None), (1, "workspace"), (2, "target")):
+        if len(path) > index + 1 and path[index] in DEPENDENCY_TABLES and (group is None or path[0] == group):
+            return path[index + 1], (path[index + 2] if len(path) > index + 2 else None)
+    return None
+
+
+def reject_manifest(text, roots, overrides):
+    """Read Cargo.toml (read-only line parser) and raise when it can change what the census region resolves.
+
+    Rejected: a dependency named like a path root of the region or of its `use` lines (the extern prelude
+    beats the std prelude, so `std` or `String` could name another crate), any `package =` rename, a
+    `path`/`git`/`registry` source on a crate the census imports, a patch or replace entry beyond the one
+    vendored `paste`, a `build` key or a repo-root build.rs (it can set `cargo:rustc-env`), an extra `[lib]`
+    key (`path`, `test`, `harness`) and an edition other than the one pinned.
+    """
+    pinned = pinned_crates(roots)
+    if len(pinned) != PINNED_CRATES_COUNT:
+        raise AssertionError("the pinned `use` lines import %d crates %s, expected %d: review the manifest "
+                             "checks before changing the import surface"
+                             % (len(pinned), sorted(pinned), PINNED_CRATES_COUNT))
+    denied = (roots | set(STD_FAMILY) | {"scope"}) - pinned
+    patches, edition = set(), None
+    for path, value in toml_entries(text, MANIFEST):
+        slot = dependency_slot(path)
+        if slot is not None:
+            name = slot[0].replace("-", "_")
+            if name in denied:
+                raise AssertionError("%s names a dependency `%s`: a crate with that name replaces the `%s::` "
+                                     "paths of the census region (the extern prelude beats the std prelude)"
+                                     % (MANIFEST, slot[0], name))
+            if slot[1] == "package":
+                raise AssertionError("%s renames the dependency `%s` with `package =`: the crate that answers "
+                                     "to a name the census resolves is no longer the one the key says"
+                                     % (MANIFEST, slot[0]))
+            if name in pinned and slot[1] in SOURCE_FIELDS:
+                raise AssertionError("%s gives the pinned crate `%s` a `%s` source: the census would run other "
+                                     "code than the registry crate" % (MANIFEST, slot[0], slot[1]))
+        if path[0] == "patch" and len(path) >= 3:
+            patches.add((path[1], path[2]))
+        if path[0] == "replace":
+            raise AssertionError("%s has a `[replace]` entry: it substitutes a crate the census links" % MANIFEST)
+        if path[:2] == ("package", "build"):
+            raise AssertionError("%s sets `build =`: a build script can set cargo:rustc-env such as "
+                                 "CARGO_MANIFEST_DIR, the root the census walks" % MANIFEST)
+        if path[:2] == ("package", "edition"):
+            edition = unquote(value)
+        if path[0] == "lib" and len(path) >= 2 and path[1] not in LIB_KEYS:
+            raise AssertionError("%s sets `[lib] %s`: only %s are allowed, a lib `path`, `test` or `harness` "
+                                 "redirects or disables the unit test that holds the census"
+                                 % (MANIFEST, path[1], "/".join(LIB_KEYS)))
+    for registry, name in sorted(patches - ALLOWED_PATCHES):
+        raise AssertionError("%s has `[patch.%s]` entry `%s`: only %s are allowed, a patch swaps a crate for "
+                             "other code" % (MANIFEST, registry, name,
+                                             ", ".join("%s.%s" % pair for pair in sorted(ALLOWED_PATCHES))))
+    if edition != PACKAGE_EDITION:
+        raise AssertionError("%s edition is %r, expected %r: the edition changes name resolution and the "
+                             "prelude" % (MANIFEST, edition, PACKAGE_EDITION))
+    if input_exists(BUILD_SCRIPT, overrides):
+        raise AssertionError("a repo-root %s exists: it runs before the census compiles and can set "
+                             "cargo:rustc-env" % BUILD_SCRIPT)
+
+
+def tracked_under(directory):
+    """Return the sorted tracked paths below `directory` (`git ls-files -z`); a git failure raises."""
+    try:
+        out = subprocess.run(["git", "ls-files", "-z", "--", directory], cwd=str(REPO), check=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env(GIT_ENV_DROP))
+    except (OSError, subprocess.CalledProcessError) as err:
+        raise AssertionError("`git ls-files -z -- %s` failed (%s): the mirror fails closed, it cannot tell "
+                             "which files of that directory the build reads" % (directory, err))
+    return sorted(name for name in out.stdout.decode("utf-8", errors="replace").split("\0") if name)
+
+
+def pin_tracked(directory, expected, overrides):
+    """Raise unless the tracked listing of `directory` (plus override files below it) is exactly `expected`."""
+    found = set(tracked_under(directory))
+    prefix = directory + "/"
+    for rel, source in overrides.items():
+        if rel.startswith(prefix):
+            if source is None:
+                found.discard(rel)
+            else:
+                found.add(rel)
+    if tuple(sorted(found)) != tuple(expected):
+        raise AssertionError("%s/ holds %s, expected exactly %s: a file there is read by cargo (config) or "
+                             "nextest and can change the compiler, the runner or the test environment"
+                             % (directory, sorted(found), list(expected)))
+
+
+def reject_cargo_config(overrides):
+    """Raise when a `.cargo/config(.toml)` carries a key that changes the compiler, runner or environment."""
+    for rel in CARGO_CONFIGS:
+        if rel in overrides:
+            text = overrides[rel]
+        elif (REPO / rel).is_file():
+            text = read(rel)
+        else:
+            continue
+        if text is None:
+            continue
+        for path, _ in toml_entries(text, rel):
+            if any(segment in CARGO_CONFIG_DENIED for segment in path):
+                raise AssertionError("%s has `%s`: a cargo config key that changes the compiler, the test runner "
+                                     "or the environment of the test process (CI, PATH, which git runs)"
+                                     % (rel, ".".join(path)))
+
+
+def reject_nextest_config(overrides):
+    """Allow only today's headers and keys in .config/nextest.toml (a filter or script can skip the census test)."""
+    if NEXTEST_CONFIG not in overrides and not (REPO / NEXTEST_CONFIG).is_file():
+        return
+    for path, value in toml_entries(read_input(NEXTEST_CONFIG, overrides), NEXTEST_CONFIG):
+        if value is None and path not in NEXTEST_HEADERS:
+            raise AssertionError("%s has the table `[%s]`: only %s are allowed (a filter, override or script can "
+                                 "skip or reconfigure the census test)"
+                                 % (NEXTEST_CONFIG, ".".join(path), sorted(".".join(h) for h in NEXTEST_HEADERS)))
+        if value is not None and path[-1] not in NEXTEST_KEYS:
+            raise AssertionError("%s sets `%s`: only %s are allowed"
+                                 % (NEXTEST_CONFIG, ".".join(path), sorted(NEXTEST_KEYS)))
+
+
+def read_build_inputs(roots, overrides):
+    """Read Cargo.toml, build.rs, `.cargo/` and `.config/`; raise when any of them can change the census."""
+    reject_manifest(read_input(MANIFEST, overrides), roots, overrides)
+    reject_cargo_config(overrides)
+    pin_tracked(CARGO_DIR, CARGO_TRACKED, overrides)
+    pin_tracked(NEXTEST_DIR, NEXTEST_TRACKED, overrides)
+    reject_nextest_config(overrides)
+
+
 class Census:
     """The predicates of docs_census_8315_on, parsed from the comment-stripped Rust source."""
 
@@ -1270,7 +1764,7 @@ class Census:
         """Parse `text` (mod.rs); `overrides` maps a relative path to scratch source for another file."""
         overrides = overrides or {}
         clean = strip_comments(text)
-        scope_clean = strip_comments(overrides[SCOPE_SRC] if SCOPE_SRC in overrides else read(SCOPE_SRC))
+        scope_clean = strip_comments(read_input(SCOPE_SRC, overrides))
         self.clean = clean
         reject_rebinding(clean)
         pin_modules(clean)
@@ -1283,17 +1777,23 @@ class Census:
         literals_only(clean, "DOCS_CENSUS_ERASE_PHRASES")
         literals_only(clean, "DOCS_CENSUS_DATED_RECORDS")
         literals_only(clean, "DOCS_CENSUS_ERASE_DOC", single=True)
+        self.git_args = census_git_args(clean)
         self.folder = census_folder(clean)
         self.suffixes = pin_region(clean, self.folder)
         self.erase_doc = strings(const_body(clean, "DOCS_CENSUS_ERASE_DOC"))[0]
         self.bytes = erasable_bytes(clean, scope_clean)
         pin_imports(clean)
-        self.external_names, self.region_macros = reject_shadowing(clean, census_span(clean))
-        lib_text = overrides[LIB_SRC] if LIB_SRC in overrides else read(LIB_SRC)
-        self.lib_macros = reject_crate_level(strip_comments(lib_text), frozenset(self.region_macros))
+        self.env_removed = census_env_removed(clean)
+        span = census_span(clean)
+        self.external_names, self.region_macros = reject_shadowing(clean, span)
+        lib_clean = strip_comments(read_input(LIB_SRC, overrides))
+        self.lib_macros = reject_crate_level(lib_clean, frozenset(self.region_macros))
+        for name in lib_prefix_modules(lib_clean):
+            rel = module_file(name, overrides)
+            reject_module_file(rel, read_input(rel, overrides), frozenset(self.region_macros))
         for rel in tree_files(overrides):
-            source = overrides[rel] if rel in overrides else read(rel)
-            reject_tree_file(rel, strip_comments(source))
+            reject_tree_file(rel, strip_comments(read_input(rel, overrides)))
+        read_build_inputs(path_roots(mask_literals(clean)[span[0]:span[1]]), overrides)
 
     def reads(self, rel):
         """True when the Rust census reads `rel` at all (extension, not a dated record)."""
@@ -1325,17 +1825,33 @@ class Census:
         return census, failures
 
 
-def git_env():
-    """Return the environment without the overrides the Rust census removes."""
-    drop = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+def git_env(drop):
+    """Return the environment without the names `drop` (the ones the pinned Rust census removes)."""
     return {k: v for k, v in os.environ.items() if k not in drop}
 
 
-def tracked_docs(folder):
-    """Return `git ls-files -- <folder>`, as the Rust census does."""
-    out = subprocess.run(["git", "ls-files", "--", folder], cwd=str(REPO), check=True,
-                         stdout=subprocess.PIPE, encoding="utf-8", env=git_env())
-    return out.stdout.splitlines()
+def split_listing(stdout, args):
+    """Split `git ls-files` output the way the census arguments ask: NUL-separated under `-z`, else by line.
+
+    A name with non-ASCII characters or a newline is quoted by plain `ls-files`; `-z` prints it raw. The
+    reader follows the pinned region: it only changes when the region's arguments gain `-z`.
+    """
+    text = stdout.decode("utf-8", errors="replace")
+    if "-z" in args:
+        return [name for name in text.split("\0") if name]
+    return text.splitlines()
+
+
+def tracked_docs(census):
+    """Return `git ls-files ... -- <folder>` with the arguments and environment of the pinned Rust census.
+
+    The mirror follows the region: the argument list and the removed environment names are parsed from
+    the pinned text, so re-pinning the region (PR #8350 stage 2, which hardens the Rust side) changes
+    what this reads without a second edit here.
+    """
+    out = subprocess.run(["git"] + list(census.git_args), cwd=str(REPO), check=True,
+                         stdout=subprocess.PIPE, env=git_env(census.env_removed))
+    return split_listing(out.stdout, census.git_args)
 
 
 class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
@@ -1345,7 +1861,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     def setUpClass(cls):
         cls.text = read(RUST_SRC)
         cls.census = Census(cls.text)
-        cls.listing = tracked_docs(cls.census.folder)
+        cls.listing = tracked_docs(cls.census)
 
     def test_census_constants_were_parsed(self):
         self.assertEqual(self.census.erase_doc, "docs/security/crypto-erase.md")
@@ -2038,11 +2554,325 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, re.escape(rel) + r".*" + shown):
                     Census(self.text, overrides={rel: base + "\n" + code})
 
+    # ---- round 10: module files, own-type impls, Cargo.toml, .cargo, git mirror, decoys, inputs ----
+
+    def with_module(self, rel, prefix="", suffix=""):
+        """Return Census overrides for the module file `rel`: its text with `prefix` and `suffix` added."""
+        return {rel: prefix + read(rel) + suffix}
+
+    def test_module_file_inner_macro_use_is_rejected_in_every_spelling(self):
+        """code r9 L1: `#![macro_use]` in src/approvals.rs leaks its macros to the crate root textual scope."""
+        rel = "src/approvals.rs"
+        self.assertTrue((REPO / rel).is_file())
+        macro = "\nmacro_rules! format { ($($t:tt)*) => { String::new() }; }\n"
+        for inner in ("#![macro_use]\n", "#![cfg_attr(all(), macro_use)]\n", "#! [ macro_use ]\n",
+                      "#![cfg_attr(all(), cfg_attr(all(), macro_use))]\n", "#![r#macro_use]\n"):
+            with self.subTest(inner=inner):
+                with self.assertRaisesRegex(AssertionError, r"src/approvals\.rs.*inner attribute.*macro_use"):
+                    Census(self.text, overrides=self.with_module(rel, inner, macro))
+
+    def test_module_file_macro_with_outer_macro_use_is_rejected_and_without_is_not(self):
+        """code r9 L1: a region-named macro in a file that carries `macro_use` in any form; M2 (no macro_use) is fine."""
+        rel = "src/approvals.rs"
+        macro = "\nmacro_rules! format { ($($t:tt)*) => { String::new() }; }\n"
+        with self.assertRaisesRegex(AssertionError, r"src/approvals\.rs carries `macro_use` and defines.*`format`"):
+            Census(self.text, overrides=self.with_module(rel, "", "\n#[macro_use]\nmod inner_8346 {}\n" + macro))
+        Census(self.text, overrides=self.with_module(rel, "", macro))
+        Census(self.text, overrides=self.with_module(rel, "", "\n#[macro_use]\nmod inner_8346 {}\n"
+                                                    "macro_rules! unrelated_8346 { () => {}; }\n"))
+
+    def test_every_lib_prefix_module_file_is_read(self):
+        """code r9 L1: the check covers each `mod NAME;` of the prefix, flat or `NAME/mod.rs`."""
+        lib_clean = strip_comments(read(LIB_SRC))
+        names = lib_prefix_modules(lib_clean)
+        self.assertGreater(len(names), 20, names)
+        self.assertNotIn("encryption", names)
+        for name in names:
+            self.assertRegex(module_file(name, {}), r"^src/%s(\.rs|/mod\.rs)$" % name)
+        for name in names:
+            rel = module_file(name, {})
+            with self.subTest(rel=rel):
+                with self.assertRaisesRegex(AssertionError, re.escape(rel) + r".*inner attribute.*macro_use"):
+                    Census(self.text, overrides=self.with_module(rel, "#![macro_use]\n"))
+
+    def test_unresolvable_or_ambiguous_module_file_fails_closed(self):
+        """code r9 L1: a missing module file, a missing override and a flat+nested pair all raise."""
+        anchor = "pub mod embeddings;\n"
+        lib = self.lib_mutated(anchor, "mod ghost_8346;\n" + anchor)
+        with self.assertRaisesRegex(AssertionError, r"`mod ghost_8346;`.*0 of src/ghost_8346\.rs"):
+            Census(self.text, overrides={LIB_SRC: lib})
+        with self.assertRaisesRegex(AssertionError, r"`mod approvals;`.*0 of src/approvals\.rs"):
+            Census(self.text, overrides={"src/approvals.rs": None})
+        with self.assertRaisesRegex(AssertionError, r"`mod approvals;`.*2 of src/approvals\.rs"):
+            Census(self.text, overrides={"src/approvals/mod.rs": "// both files exist\n"})
+
+    def test_path_attribute_in_the_lib_prefix_is_rejected(self):
+        """code r9 L1: `path` loads another file for a module declared before the census module."""
+        anchor = "pub mod embeddings;\n"
+        for code in ('#[path = "evil_8346.rs"]\nmod helper_8346;\n',
+                     '#[cfg_attr(all(), path = "evil_8346.rs")]\nmod helper_8346;\n'):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"src/lib\.rs.*attribute.*`path`"):
+                    Census(self.text, overrides={LIB_SRC: self.lib_mutated(anchor, code + anchor)})
+
+    def test_impl_of_a_type_the_region_declares_is_rejected(self):
+        """code r9 L2: `impl Drop for DocsCensus` or an inherent impl outside the region runs code in the census."""
+        self.assertIn("DocsCensus", {n for k, n, _ in declared_names(mask_literals(self.text)) if k == "struct"})
+        for code in ("impl Drop for DocsCensus {}", "impl DocsCensus {}",
+                     "impl<T> From<T> for DocsCensus {}",
+                     "unsafe impl Send for DocsCensus {}", "impl std::fmt::Debug for crate::tests::DocsCensus {}"):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"`impl` for `DocsCensus` outside the census region"):
+                    Census(self.in_tests(code))
+        Census(self.in_tests("struct Unrelated8346; impl Unrelated8346 {}"))
+
+    def manifest_with(self, extra):
+        """Return Census overrides for Cargo.toml: the real manifest with `extra` appended."""
+        return {MANIFEST: read(MANIFEST) + "\n" + extra + "\n"}
+
+    def test_manifest_dependency_named_like_a_path_root_is_rejected(self):
+        """code r9 L3: `std`, `core`, `alloc`, `proc_macro`, `test` or a region path root as a dependency key."""
+        for code in ('[dependencies]\nstd = { package = "facade", version = "1" }', '[dev-dependencies]\ncore = "1"',
+                     '[build-dependencies]\nalloc = "1"', "[target.'cfg(unix)'.dependencies]\nproc_macro = \"1\"",
+                     "[target.'cfg(unix)'.dev-dependencies]\ntest = \"1\"", '[dependencies.std]\nversion = "1"',
+                     '[dependencies]\nstd.version = "1"', '[dependencies]\n"std" = "1"', '[dependencies]\nString = "1"',
+                     '[dependencies]\nscope = "1"',
+                     '[dependencies]\nstd = { version = "1", optional = true }',
+                     '[workspace.dependencies]\nstd = "1"'):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"Cargo\.toml names a dependency `[^`]+`"):
+                    Census(self.text, overrides=self.manifest_with(code))
+
+    def test_manifest_package_rename_and_pinned_crate_source_are_rejected(self):
+        """code r9 L3 / security r9 L2: any `package =` rename, a path/git source on a pinned crate."""
+        for code, shown in (
+                ('[dependencies]\nwalkdir = { package = "std", version = "1" }', r"renames the dependency `walkdir`"),
+                ('[dependencies]\nunrelated = { package = "other", version = "1" }', r"renames"),
+                ('[dependencies.unrelated]\npackage = "other"', r"renames"),
+                ('[dependencies]\nx25519-dalek = { package = "other", version = "1" }', r"renames"),
+                ('[dependencies]\nsha2 = { path = "evil" }', r"pinned crate `sha2`.*`path`"),
+                ('[dependencies.rand_core]\ngit = "https://example.invalid/rand_core"', r"pinned crate `rand_core`.*`git`"),
+                ('[dev-dependencies]\ntempfile = { path = "evil" }', r"pinned crate `tempfile`.*`path`"),
+                ('[dependencies]\nanyhow = { registry = "other", version = "1" }', r"pinned crate `anyhow`.*`registry`"),
+                ('[dependencies]\nzeroize.git = "https://example.invalid/z"', r"pinned crate `zeroize`.*`git`"),
+                ('[dependencies]\nhkdf = { version = "1", rev = "abc" }', r"pinned crate `hkdf`.*`rev`"),
+                ('[dependencies]\nchacha20poly1305 = { git = "https://example.invalid/c" }',
+                 r"pinned crate `chacha20poly1305`.*`git`")):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"Cargo\.toml.*" + shown):
+                    Census(self.text, overrides=self.manifest_with(code))
+
+    def test_manifest_patch_replace_build_lib_and_edition_are_pinned(self):
+        """code r9 L3 / security r9 L2: patch beyond `paste`, [replace], build =, build.rs, [lib] keys, edition."""
+        Census(self.text, overrides=self.manifest_with('[patch.crates-io]\npaste = { path = "vendor/paste" }'))
+        for code in ('[patch.crates-io]\nsha2 = { path = "evil" }', '[patch.crates-io.tempfile]\npath = "evil"',
+                     '[patch."https://example.invalid/index"]\nanyhow = { path = "evil" }',
+                     '[patch.crates-io]\nunrelated = { path = "evil" }'):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"Cargo\.toml has `\[patch\.[^`]+\]` entry"):
+                    Census(self.text, overrides=self.manifest_with(code))
+        with self.assertRaisesRegex(AssertionError, r"`\[replace\]` entry"):
+            Census(self.text, overrides=self.manifest_with('[replace]\n"sha2:0.10.0" = { path = "evil" }'))
+        with self.assertRaisesRegex(AssertionError, r"sets `build =`"):
+            Census(self.text, overrides=self.manifest_with('[package]\nbuild = "build.rs"'))
+        with self.assertRaisesRegex(AssertionError, r"repo-root build\.rs exists"):
+            Census(self.text, overrides={BUILD_SCRIPT: "fn main() {}\n"})
+        for code, key in (('[lib]\npath = "evil.rs"', "path"), ("[lib]\ntest = false", "test"),
+                          ("[lib]\nharness = false", "harness"), ('[lib]\nedition = "2021"', "edition")):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, r"sets `\[lib\] %s`" % key):
+                    Census(self.text, overrides=self.manifest_with(code))
+        manifest = read(MANIFEST)
+        self.assertIn('edition = "2024"', manifest)
+        with self.assertRaisesRegex(AssertionError, r"edition is '2021'"):
+            Census(self.text, overrides={MANIFEST: manifest.replace('edition = "2024"', 'edition = "2021"', 1)})
+
+    def test_manifest_reader_handles_the_real_file_and_each_toml_form(self):
+        """The line parser: the real manifest parses; inline tables, dotted keys, quoted dots, multi-line arrays."""
+        entries = toml_entries(read(MANIFEST), MANIFEST)
+        paths = {path for path, _ in entries}
+        self.assertIn(("package", "edition"), paths)
+        self.assertIn(("patch", "crates-io", "paste", "path"), paths)
+        self.assertIn(("target", "cfg(unix)", "dev-dependencies"), paths)
+        sample = toml_entries('[a.\'b.c\']\nk = { x = "1", y.z = [1,\n 2] } # note\nq."r.s" = "t#u"\n', "sample")
+        self.assertIn((("a", "b.c", "k", "y", "z")), {path for path, _ in sample})
+        self.assertIn(("a", "b.c", "q", "r.s"), {path for path, _ in sample})
+        self.assertEqual(dict(sample)[("a", "b.c", "q", "r.s")], '"t#u"')
+        self.assertEqual(len(pinned_crates(path_roots(mask_literals(self.text)))), PINNED_CRATES_COUNT)
+        for broken in ('[a\nk = 1\n', 'k = "unclosed\n', 'k = """multi\nline"""\n', "just words\n"):
+            with self.subTest(broken=broken):
+                with self.assertRaises(AssertionError):
+                    toml_entries(broken, "sample")
+        with self.assertRaisesRegex(AssertionError, r"requires Cargo\.toml.*missing"):
+            Census(self.text, overrides={MANIFEST: None})
+
+    def test_cargo_config_keys_that_change_the_build_are_rejected(self):
+        """code r9 L4: an `[env]` table, runner, rustc-wrapper, rustc, rustflags (and linker, include, patch, source)."""
+        for code in ('[env]\nCI = "1"', '[build]\nrustc-wrapper = "wrap"', '[build]\nrustc = "rustc-other"',
+                     '[build]\nrustflags = ["--extern", "std=facade"]', '[target.x86_64-unknown-linux-gnu]\nrunner = "r"',
+                     '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-Cfoo"]', '[build]\nrustc-workspace-wrapper = "w"',
+                     '[target.x86_64-unknown-linux-gnu]\nlinker = "cc-other"', 'include = ["other.toml"]',
+                     '[patch.crates-io]\nsha2 = { path = "evil" }', '[source.crates-io]\nreplace-with = "mirror"'):
+            for rel in (".cargo/config.toml", ".cargo/config"):
+                with self.subTest(rel=rel, code=code):
+                    with self.assertRaisesRegex(AssertionError, re.escape(rel) + r" has `"):
+                        Census(self.text, overrides={rel: code + "\n"})
+
+    def test_cargo_directory_listing_is_pinned(self):
+        """code r9 L4: `.cargo/` tracks exactly audit.toml; a benign config still changes the pinned listing."""
+        self.assertEqual(tuple(tracked_under(CARGO_DIR)), CARGO_TRACKED)
+        self.assertEqual(CARGO_TRACKED, (".cargo/audit.toml",))
+        with self.assertRaisesRegex(AssertionError, r"\.cargo/ holds .*config\.toml"):
+            Census(self.text, overrides={".cargo/config.toml": '[alias]\nt = "test"\n'})
+        with self.assertRaisesRegex(AssertionError, r"\.cargo/ holds .*extra_8346\.toml"):
+            Census(self.text, overrides={".cargo/extra_8346.toml": "\n"})
+        with self.assertRaisesRegex(AssertionError, r"\.cargo/ holds"):
+            Census(self.text, overrides={".cargo/audit.toml": None})
+
+    def test_git_failure_while_listing_a_build_directory_fails_closed(self):
+        """code r9 L4: a git error is an AssertionError naming the directory, never an empty listing."""
+        for failure in (subprocess.CalledProcessError(128, ["git"]), OSError("no git binary")):
+            with self.subTest(failure=failure):
+                with mock.patch.object(subprocess, "run", side_effect=failure):
+                    with self.assertRaisesRegex(AssertionError, r"`git ls-files -z -- \.cargo` failed.*fails closed"):
+                        Census(self.text)
+
+    def test_nextest_config_cannot_filter_or_reconfigure_the_census_test(self):
+        """r10 adversarial: `.config/nextest.toml` keys and tables beyond today's set, and extra files."""
+        base = read(NEXTEST_CONFIG)
+        Census(self.text, overrides={NEXTEST_CONFIG: base})
+        for code, shown in (('default-filter = "none()"', r"sets `[^`]*default-filter`"),
+                            ('[profile.ci]\ndefault-filter = "not test(docs)"', r"sets `profile\.ci\.default-filter`"),
+                            ('[[profile.ci.overrides]]\nfilter = "all()"\nthreads-required = 2', r"table `\[profile\.ci\.overrides\]`"),
+                            ('[scripts.setup.x]\ncommand = "x"', r"table `\[scripts\.setup\.x\]`"),
+                            ('[profile.extra]\nretries = 1', r"table `\[profile\.extra\]`")):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(AssertionError, shown):
+                    Census(self.text, overrides={NEXTEST_CONFIG: base + "\n" + code + "\n"})
+        with self.assertRaisesRegex(AssertionError, r"\.config/ holds .*other_8346\.toml"):
+            Census(self.text, overrides={".config/other_8346.toml": "\n"})
+        self.assertEqual(tuple(tracked_under(NEXTEST_DIR)), NEXTEST_TRACKED)
+
+    def test_git_mirror_follows_the_pinned_region(self):
+        """code r9 I1: env and arguments come from the pinned text; `-z` switches to the NUL reader."""
+        self.assertEqual(self.census.env_removed, ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"))
+        self.assertEqual(self.census.git_args, ("ls-files", "--", "docs"))
+        wider = self.mutated('.env_remove("GIT_INDEX_FILE")',
+                             '.env_remove("GIT_INDEX_FILE").env_remove("GIT_CEILING_DIRECTORIES")')
+        self.assertEqual(census_env_removed(strip_comments(wider))[-1], "GIT_CEILING_DIRECTORIES")
+        zed = self.mutated('&["ls-files", "--", "docs"]', '&["ls-files", "-z", "--", "docs"]')
+        self.assertEqual(census_git_args(strip_comments(zed)), ("ls-files", "-z", "--", "docs"))
+        for text in (wider, zed):
+            with self.assertRaisesRegex(AssertionError, r"census region"):
+                Census(text)
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": "x", "GIT_DIR": "y"}):
+            self.assertNotIn("GIT_DIR", git_env(self.census.env_removed))
+            self.assertIn("GIT_CEILING_DIRECTORIES", git_env(self.census.env_removed))
+            self.assertNotIn("GIT_CEILING_DIRECTORIES", git_env(self.census.env_removed + ("GIT_CEILING_DIRECTORIES",)))
+        self.assertEqual(split_listing(b"a.md\ndocs/b.md\n", ("ls-files", "--", "docs")), ["a.md", "docs/b.md"])
+        self.assertEqual(split_listing("docs/é.md\0docs/a\nb.md\0".encode("utf-8"), ("ls-files", "-z", "--", "docs")),
+                         ["docs/é.md", "docs/a\nb.md"])
+        self.assertEqual(split_listing(b"docs/\xff.md\0", ("ls-files", "-z", "--", "docs")), ["docs/�.md"])
+
+    def test_value_readers_ignore_declarations_inside_string_literals(self):
+        """security r9 L1 (D1-D5): a decoy literal of a declaration, plain or raw, never feeds a value reader."""
+        decoys = ('const DECOY_8346: &str = "%s";\n', 'const DECOY_8346: &str = r#"%s"#;\n')
+        base = (read(RUST_SRC), read(SCOPE_SRC))
+        array = ("pub const CRYPTO_ERASABLE_ENVELOPE_VERSIONS: [u8; 2] =\n"
+                 "    [RECORD_ENVELOPE_VERSION, SCOPE_ENVELOPE_VERSION];")
+        self.assertIn(array, base[0])
+        for decoy in decoys:
+            # D1: the real array gains a third byte and a two-element decoy comes first
+            real = array.replace("[u8; 2]", "[u8; 3]").replace("SCOPE_ENVELOPE_VERSION];",
+                                                              "SCOPE_ENVELOPE_VERSION, ERASED_ENVELOPE_VERSION];")
+            text = base[0].replace(array, (decoy % array.replace("\n", " ").replace('"', "'")) + real, 1)
+            with self.subTest(case="D1", decoy=decoy):
+                self.assertEqual(erasable_bytes(strip_comments(text), strip_comments(base[1])),
+                                 ["0x03", "0x04", "0x05"])
+            # D3: RECORD_ENVELOPE_VERSION moves to 0x07 and a scope.rs literal keeps the old declaration
+            old = "pub const RECORD_ENVELOPE_VERSION: u8 = 0x03;"
+            self.assertIn(old, base[0])
+            scope = base[1] + "\n" + (decoy % "const RECORD_ENVELOPE_VERSION: u8 = 0x03;")
+            with self.subTest(case="D3", decoy=decoy):
+                self.assertEqual(erasable_bytes(strip_comments(base[0].replace(old, old.replace("0x03", "0x07"), 1)),
+                                                strip_comments(scope)), ["0x05", "0x07"])
+        for decoy in decoys:
+            # D2: five phrases against a decoy of four, D5: one dated record against a decoy of two,
+            # D4: another erase doc against a decoy of the old one (the decoy comes first in each)
+            for name, real, shown, expected in (
+                    ("DOCS_CENSUS_ERASE_PHRASES", 'const DOCS_CENSUS_ERASE_PHRASES: [&str; 5] = ["a", "b", "c", "d", "e"];',
+                     'const DOCS_CENSUS_ERASE_PHRASES: [&str; 4] = ["a", "b", "c", "d"];', ["a", "b", "c", "d", "e"]),
+                    ("DOCS_CENSUS_DATED_RECORDS", 'const DOCS_CENSUS_DATED_RECORDS: [&str; 1] = ["docs/reviews/"];',
+                     'const DOCS_CENSUS_DATED_RECORDS: [&str; 2] = ["docs/reviews/", "docs/audit/"];', ["docs/reviews/"])):
+                text = strip_comments((decoy % shown.replace('"', "'")) + real + "\n")
+                with self.subTest(case=name, decoy=decoy):
+                    self.assertEqual(string_list(text, name), expected)
+            text = strip_comments((decoy % "const DOCS_CENSUS_ERASE_DOC: &str = 'docs/old.md';")
+                                  + 'const DOCS_CENSUS_ERASE_DOC: &str = "docs/new.md";\n')
+            with self.subTest(case="D4", decoy=decoy):
+                self.assertEqual(strings(const_body(text, "DOCS_CENSUS_ERASE_DOC")), ["docs/new.md"])
+
+    def test_two_live_value_declarations_are_rejected_and_a_literal_one_does_not_count(self):
+        """security r9 L1: each value declaration must match exactly once on the masked text."""
+        twice = strip_comments('const DOCS_CENSUS_DATED_RECORDS: [&str; 1] = ["a/"];\n'
+                               'const DOCS_CENSUS_DATED_RECORDS: [&str; 1] = ["b/"];\n')
+        with self.assertRaisesRegex(AssertionError, r"exactly once in live code.*found 2"):
+            string_list(twice, "DOCS_CENSUS_DATED_RECORDS")
+        with self.assertRaisesRegex(AssertionError, r"no longer declares DOCS_CENSUS_DATED_RECORDS"):
+            string_list(strip_comments('const D: &str = "const DOCS_CENSUS_DATED_RECORDS: [&str; 1] = [\\"a/\\"];";\n'),
+                        "DOCS_CENSUS_DATED_RECORDS")
+        scope = strip_comments(read(SCOPE_SRC))
+        mod_text = strip_comments(read(RUST_SRC))
+        with self.assertRaisesRegex(AssertionError, r"`const RECORD_ENVELOPE_VERSION: u8` is declared 2 times"):
+            erasable_bytes(mod_text, scope + "\nconst RECORD_ENVELOPE_VERSION: u8 = 0x09;\n")
+
+    def test_static_ref_counts_as_a_declaration(self):
+        """security r9 I2: the lazy_static spelling `static ref NAME` declares NAME."""
+        for name in ("CRYPTO_ERASABLE_ENVELOPE_VERSIONS", "RECORD_ENVELOPE_VERSION", "DOCS_CENSUS_ERASE_DOC"):
+            for code in ("static ref %s: u8 = 0;", "static ref r#%s: u8 = 0;"):
+                with self.subTest(name=name, code=code):
+                    with self.assertRaisesRegex(AssertionError, name + r" exactly once.*found 2"):
+                        Census(self.in_tests(code % name))
+
+    def test_format_arguments_of_the_region_are_external_names(self):
+        """security r9 I1: `{name}` and `{name:?}` spans of the region's literals join the derived external set."""
+        region = 'fn t8346() { let _ = format!("{ghost_8346} {other_8346:?} {{literal}} {width:>8}"); }'
+        names = derive_external_names(mask_literals(region), mask_literals(region), region)
+        for name in ("ghost_8346", "other_8346", "width"):
+            self.assertIn(name, names)
+        self.assertNotIn("literal", names)
+        self.assertNotIn("ghost_8346", derive_external_names(mask_literals(region), mask_literals(region)))
+
+    def test_missing_or_unreadable_input_raises_a_named_error(self):
+        """security r9 I3: src/lib.rs, Cargo.toml, scope.rs, a module file or an unreadable path name themselves."""
+        for rel in (LIB_SRC, MANIFEST, SCOPE_SRC):
+            with self.subTest(rel=rel):
+                with self.assertRaisesRegex(AssertionError, r"requires %s as an input and it is missing" % re.escape(rel)):
+                    Census(self.text, overrides={rel: None})
+        with self.assertRaisesRegex(AssertionError, r"requires src/missing_8346\.rs as an input and cannot read it"):
+            read("src/missing_8346.rs")
+        with mock.patch.object(Path, "read_text", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")):
+            with self.assertRaisesRegex(AssertionError, r"cannot read it"):
+                read(LIB_SRC)
+
+    def test_docstring_names_every_read_input_and_its_claims_are_checked(self):
+        """code r9 I2/I3, security r9 I4: the docstring lists the inputs the code reads and the closed claims."""
+        for phrase in ("src/lib.rs", "module files", "Cargo.toml", ".cargo/", "build.rs", ".config/nextest.toml",
+                       "`{name}` and `{name:...}` spans of every string literal", "no_core",
+                       "minus the names the region declares itself", "the mirror follows the region",
+                       "Inputs the guard does not read"):
+            self.assertIn(phrase, __doc__)
+        for rel in (LIB_SRC, MANIFEST, BUILD_SCRIPT, NEXTEST_CONFIG, CARGO_DIR):
+            self.assertIn(rel, __doc__)
+        self.assertIn("no_core", CRATE_DENIED_ATTRIBUTE_WORDS)
+        self.assertIn("path", CRATE_DENIED_ATTRIBUTE_WORDS)
+        self.assertEqual(len(pinned_crates(path_roots(mask_literals(self.text)))), PINNED_CRATES_COUNT)
+
     def test_guard_docstring_lists_every_closed_class(self):
         """code r8 INFO: the docstring claims exactly what the code checks."""
         for phrase in CLOSED_CLASSES:
             self.assertIn(phrase, __doc__)
-        self.assertEqual(len(CLOSED_CLASSES), 9)
+        self.assertEqual(len(CLOSED_CLASSES), 12)
 
     def test_mutation_anchor_that_drifts_names_itself(self):
         with self.assertRaisesRegex(AssertionError, r"mutation anchor.*not-in-the-source"):
