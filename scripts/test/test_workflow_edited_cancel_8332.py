@@ -25,13 +25,15 @@ The rules this guard pins (a ratchet over EVERY workflow):
    trigger, a column-0 line after the section that is not a workflow key) is refused
    by name, never read as a 0, and any ``edited`` word inside a pull_request(_target)
    trigger body counts as listed. An anchor, tag or alias written on a mapping key ANYWHERE
-   in the file is refused by name (round 9): the scanner does not model that key's column.
+   in the file is refused by name (round 9): the scanner does not model that key's column. So are an
+   explicit key (a line led by ``?`` or a bare ``:``) and a double-quoted key holding an escape (round 10).
    The ``ORACLE`` table pins every shape from rounds 3-9; where PyYAML is importable a
    differential test checks the table, and variants of it, against it.
 2. ``cancel-in-progress`` is read only as a direct child of a block ``concurrency:`` key
    (top-level or job-level), through the scanner (round 9); a flow-form or tagged
    ``concurrency`` value, and a ``cancel-in-progress`` or ``concurrency`` key anywhere else,
-   are refused by name. Where ``edited`` is listed, every such key is the literal ``false``, the guard
+   are refused by name, and so is a ``cancel-in-progress`` key whose value is not on its own line (round
+   10). Where ``edited`` is listed, every such key is the literal ``false``, the guard
    ``${{ github.event_name == 'pull_request' }}``, the body-only guard
    ``${{ github.event.action != 'edited' }}``, or one of those guards joined by ``&&``
    to another clause. An ``||`` form is rejected. A workflow with a pull_request(_target)
@@ -48,6 +50,7 @@ import importlib.util
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import NamedTuple
@@ -86,9 +89,17 @@ BLOCK_SCALAR_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)(?:[&!][^ \
 PR_WORD_RE = re.compile(r"(?<![\w-])pull_request(?:_target)?(?![\w-])")
 SEPARATORS = ("", " ", "\t")
 PROPERTY_KEY = "an anchor, tag or alias on a mapping key (the scanner does not model that key's column)"
+# Round 10 (REVIEW-8332-security-r9 S18, REVIEW-8332-code-r9 F2): an explicit key (a line whose first token,
+# after any dashes, is `?` or a bare `:`) and a double-quoted key holding any escape are refused file-wide.
+EXPLICIT_KEY_RE = re.compile(r"^[ \t]*(?:-[ \t]+)*[?:](?:[ \t]|$)")
+EXPLICIT_KEY = "an explicit key (`?`) or its bare `:` value line (the scanner does not model that key's column)"
+ESCAPED_KEY = "a double-quoted key holding an escape (the scanner does not decode a key's escapes)"
+NEXT_LINE_CANCEL = "a `cancel-in-progress` key with no value on its line (a value below it is not read)"
 # Round 9 (REVIEW-8332-security-r8 S17): a scanned key line, its key column (group 1 is the indent plus any
 # dashes), and a `cancel-in-progress` or `concurrency` key token anywhere in a scanned line.
-KEY_LINE_RE = re.compile(r"""^((?: *-[ \t]+)* *)(["']?)([\w-]+)\2[ \t]*:(?:[ \t]+(.*))?$""")
+# Round 10 (REVIEW-8332-security-r9 S20, REVIEW-8332-code-r9 F1): the prefix is `^( *(?:-[ \t]+)*)`; each
+# repetition starts at a dash, so a line of dashes and blanks splits one way only and matches in linear time.
+KEY_LINE_RE = re.compile(r"""^( *(?:-[ \t]+)*)(["']?)([\w-]+)\2[ \t]*:(?:[ \t]+(.*))?$""")
 CANCEL_KEY, CONCURRENCY_KEY = "cancel-in-progress", "concurrency"
 TOKEN_RES = {key: re.compile(rf"""(?<![\w-])(["']?){key}\1[ \t]*:""") for key in (CANCEL_KEY, CONCURRENCY_KEY)}
 WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
@@ -154,6 +165,12 @@ class _Scanner:
     open a quote only the scanner sees. No workflow writes a property on a key (23 workflows, 0 hits), so
     ``scan`` refuses the whole file by name (whitelist-first) rather than modelling that column; a property
     whose token holds a ``:`` (an alias read as a key by YAML parsers) is refused the same way.
+
+    decision (round 10, REVIEW-8332-security-r9 S18, REVIEW-8332-code-r9 F2): an explicit key (``? k`` then
+    ``: v``) leaves the owner column of the value line at the key token, and a double-quoted key holding an
+    escape spells a key (``concurrency``, ``cancel-in-progress``) the scanner never reads. Neither occurs in
+    the 23 workflows, so ``scan`` refuses the whole file by name for a line whose first token (after any
+    dashes) is ``?`` or a bare ``:``, and for a key separator after a double-quoted scalar holding any escape.
     """
 
     def __init__(self):
@@ -171,12 +188,14 @@ class _Scanner:
         self.bad = ""
         self.pendprop = False  # an anchor or tag at this scalar start waits for its node's token
         self.keyprop = False  # the current token carries a property or is an alias (a key there is refused)
+        self.keyesc = False  # the current token is a double-quoted scalar holding an escape (a key there is refused)
 
     def _quoted(self, raw: str, i: int, out: list) -> int:
         """Consume one character inside a quoted scalar; return the next index."""
         c = raw[i]
         if self.quote == '"' and c == "\\":
             esc = raw[i + 1:i + 2]
+            self.keyesc = True
             if esc not in ('"', "\\") and not self.bad:
                 what = f"double-quoted escape \\{esc}" if esc else "escaped line break in a double-quoted scalar"
                 self.bad = f"{what} {READ_ESCAPES}"
@@ -219,6 +238,8 @@ class _Scanner:
             # a key separator; a JSON-like "key":"value" in flow opens the value at once
             if self.keyprop:
                 self.invalid = PROPERTY_KEY
+            if self.keyesc:
+                self.invalid = ESCAPED_KEY
             if not self.depth:
                 self.parent = self.tok
             self.inplain = self.keyprop = False
@@ -229,7 +250,7 @@ class _Scanner:
                 self.inplain = False
                 return True
             return False
-        self.tok = i
+        self.tok, self.keyesc = i, False
         self.keyprop, self.pendprop = self.pendprop, False
         if c in "\"'":
             self.quote = c
@@ -308,6 +329,8 @@ class _Scanner:
                 start = self._plain(raw, i, out, start)
                 i += 1
         text = "".join(out).rstrip()
+        if not self.invalid and EXPLICIT_KEY_RE.match(text):
+            self.invalid = EXPLICIT_KEY  # quoted and block-scalar text is words only: a `?` there never matches
         self._settle(text, owner, start, cut)
         if not self.quote and not self.depth and BLOCK_SCALAR_RE.search(text):
             self.block = self.parent
@@ -480,6 +503,9 @@ def concurrency_blocks(text: str) -> list:
     flow-form ``concurrency`` value and any other ``cancel-in-progress`` or ``concurrency`` key token
     (in a flow collection, a plain scalar, a deeper line, another mapping such as a job ``env:``) is
     refused by name. A scalar ``concurrency`` value is a mapping with no ``cancel-in-progress`` key.
+    decision (round 10, REVIEW-8332-code-r9 INFO-2/INFO-3): a ``cancel-in-progress`` key with no value on its
+    line is refused by name, even when the line below holds ``false``; a ``concurrency`` key under ``with:``
+    or ``env:`` is read as a block with no ``cancel-in-progress`` key (refused; no workflow writes either).
     """
     raws, blocks, cur, child = text.splitlines(), [], None, None
     for n, ln in enumerate(scan(text), 1):
@@ -493,7 +519,9 @@ def concurrency_blocks(text: str) -> list:
         if cur is not None and m and child in (None, len(m.group(1))):
             child = len(m.group(1))
             if m.group(3) == CANCEL_KEY:
-                cur[1].append(raws[n - 1][m.start(4):len(x)].strip() if m.group(4) else "")
+                if not m.group(4):
+                    raise ParseFailure(f"line {n}: {NEXT_LINE_CANCEL}")
+                cur[1].append(raws[n - 1][m.start(4):len(x)].strip())
                 used[CANCEL_KEY] = 1
         if m and m.group(3) == CONCURRENCY_KEY:
             cur, child, used[CONCURRENCY_KEY] = _concurrency_key(m, n, blocks), None, 1
@@ -755,9 +783,9 @@ NEXT_SHAPES = (
     ("double-quote continuation", '{v}run the\n{v}"mode\n', PR_EDITED + '  # "\n', REFUSE),
     ("bracket continuation", "{v}run the\n{v}[mode\n", PR_EDITED + "\n    branches: main]\n", REFUSE),
     ("escaped trigger key inside a single-quote continuation", "{v}run the\n{v}'mode\n",
-     '  "pull_r\\x65quest":\n    types: [edited]  # \'\n', REFUSE),
+     '  "pull_r\\x65quest":\n    types: [edited]  # \'\n', REFUSE, ESCAPED_KEY),
     ("escaped target key inside a single-quote continuation", "{v}run the\n{v}'mode\n",
-     '  "pull_r\\x65quest_target":\n    types: [edited]  # \'\n', REFUSE),
+     '  "pull_r\\x65quest_target":\n    types: [edited]  # \'\n', REFUSE, ESCAPED_KEY),
     ("block indicator on its own line, content to its left", "{v}|\n{m}'mode\n", PR_EDITED + "  # it's\n",
      EDITED),
 )
@@ -906,8 +934,36 @@ ORACLE = (
 ) + tuple(
     (f"r8 next-line value under a {owner}: {name}",
      prefix + value.format(v=" " * col, m=" " * (col - 1)) + trigger, want,
-     *([NEXT_LINE_PLAIN] if want == REFUSE else []))
-    for owner, prefix, col in NEXT_OWNERS for name, value, trigger, want in NEXT_SHAPES
+     *((msg or [NEXT_LINE_PLAIN]) if want == REFUSE else []))
+    for owner, prefix, col in NEXT_OWNERS for name, value, trigger, want, *msg in NEXT_SHAPES
+) + tuple(
+    # round 10, REVIEW-8332-security-r9 S18: an explicit key outside `on:` (top level, under env:, deeper),
+    # with a continuation between the `?` and key columns that opens a quote, then the column-0 decoy.
+    (f"r10 explicit key before on:{where}", text + "on:\n" + PR_EDITED + "\n" + COL0_TAIL, REFUSE,
+     f"line {n}: {EXPLICIT_KEY}")
+    for where, text, n in ((", top level", "? X\n: run\n 'mode\n", 1),
+                           (", under env", "env:\n  ? X\n  : run\n   'mode\n", 2),
+                           (", anchor-free, deeper", "env:\n  ? Xlongerkey\n  : run\n      'mode\n", 2))
+) + tuple(
+    # round 10, REVIEW-8332-code-r9 F2: a double-quoted key holding any escape, anywhere in the file.
+    (f"r10 double-quoted key with escape {esc} before on:", f'env:\n  "X{esc}": v\non:\n' + PR_EDITED + "\n",
+     REFUSE, f"line 2: {ESCAPED_KEY}")
+    for esc in ("\\u0058", "\\x58", "\\U00000058", "\\N", '\\"')
+) + (
+    ("r10 double-quoted key with an escape in a flow mapping before on:",
+     'env: {"\\x58": v}\non:\n' + PR_EDITED + "\n", REFUSE, f"line 1: {ESCAPED_KEY}"),
+    ("r10 explicit key after a dash before on:", "x:\n  - ? k\n    : v\non:\n" + PR_EDITED + "\n", REFUSE,
+     f"line 2: {EXPLICIT_KEY}"),
+    # a bare `:` line with no `?` (an empty implicit key): the owner column is the previous line's token.
+    ("r10 bare colon line (empty key) before on:",
+     "env:\n  Xlongerkey: a\n  : run\n      'mode\non:\n" + PR_EDITED + "\n" + COL0_TAIL, REFUSE,
+     f"line 3: {EXPLICIT_KEY}"),
+    # controls: `?` and `:` inside values, an escape in a value, a quoted key without escapes, block text
+    ("r10 question mark and colon inside values, quoted key without escapes, escaped value",
+     'env:\n  A: "x\n    ? y"\n  B: a:b\n  "plain-key": v\n  C: \'? z\'\n  D: "a\\x41 \\" ok"\non:\n'
+     + PR_EDITED + "\n", EDITED),
+    ("r10 explicit-key text inside a block scalar",
+     "jobs:\n  j:\n    steps:\n      - run: |\n          ? k\n          : v\non:\n" + PR_EDITED + "\n", EDITED),
 )
 # Round 7 differential variants: each keeps the YAML meaning of a row, or makes it invalid (then only a
 # refusal is accepted): a trailing comment on every line, a doubled-quote key before ``on:``, one more
@@ -924,6 +980,7 @@ VARIANTS = (
 # (it lists edited). The third field is a text the first problem must contain, or None for compliant.
 CANCEL_HEAD = "name: c\non:\n  pull_request_target:\n    types: [opened, edited]\n"
 CANCEL_JOB = "jobs:\n  j:\n    runs-on: ubuntu-latest\n"
+CANCEL_STEPS = "    steps:\n      - run: echo hi\n"
 CANCEL_ORACLE = (
     ("r9 flow-form concurrency with a decoy key in a job env",
      CANCEL_HEAD + "concurrency: {group: g, cancel-in-progress: true}\n" + CANCEL_JOB
@@ -955,7 +1012,54 @@ CANCEL_ORACLE = (
     ("r9 top-level and job-level block concurrency, both guarded",
      CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: ${{ github.event.action != 'edited' }}\n"
      + CANCEL_JOB + "    concurrency:\n      group: j\n      cancel-in-progress: false  # f\n", None),
+    # round 10, REVIEW-8332-code-r9 F2 (f-own1b, f-own2c, f-own1g): escaped and explicit job-level keys.
+    ("r10 f-own1b job-level escaped keys, true",
+     CANCEL_HEAD + CANCEL_JOB + '    "concurrenc\\u0079":\n      group: j\n      "cancel\\u002din-progress": true\n'
+     + CANCEL_STEPS, f"cannot parse the trigger section (line 8: {ESCAPED_KEY}"),
+    ("r10 f-own2c job-level explicit keys, true",
+     CANCEL_HEAD + CANCEL_JOB + "    ? concurrency\n    : group: j\n      ? cancel-in-progress\n      : true\n"
+     + CANCEL_STEPS, f"cannot parse the trigger section (line 8: {EXPLICIT_KEY}"),
+    ("r10 f-own1g pull_request without edited, job-level escaped concurrency without the key",
+     "name: c\non:\n  pull_request:\n    types: [opened]\n" + CANCEL_JOB + '    "concurrenc\\u0079":\n'
+     "      group: j\n" + CANCEL_STEPS, f"cannot parse the trigger section (line 8: {ESCAPED_KEY}"),
+    # round 10, REVIEW-8332-code-r9 INFO-1: the quoted arm of the stray-key pattern.
+    ("r10 quoted decoy key in a job env, block concurrency without the key",
+     CANCEL_HEAD + "concurrency:\n  group: g\n" + CANCEL_JOB + '    env:\n      "cancel-in-progress": false\n',
+     "outside a block `concurrency:`"),
+    # round 10, REVIEW-8332-code-r9 INFO-2/INFO-3: pinned over-refusals (see OVER_REFUSALS).
+    ("r10 cancel value on the next line, false",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress:\n    false\n" + CANCEL_JOB,
+     f"line 7: {NEXT_LINE_CANCEL}"),
+    ("r10 cancel value on the next line, true",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress:\n    true\n" + CANCEL_JOB,
+     f"line 7: {NEXT_LINE_CANCEL}"),
+    ("r10 concurrency key under a step with:",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + "    steps:\n      - uses: a/b@v1\n        with:\n          concurrency: 3\n",
+     "a concurrency block has no cancel-in-progress key"),
+    ("r10 concurrency key under a job env:",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + "    env:\n      concurrency: 3\n", "a concurrency block has no cancel-in-progress key"),
+    # controls: quoted keys without escapes are read; `?` and `:` inside values are text.
+    ("r10 job-level quoted keys without escapes, false",
+     CANCEL_HEAD + CANCEL_JOB + '    "concurrency":\n      group: j\n      \'cancel-in-progress\': false\n'
+     + CANCEL_STEPS, None),
+    ("r10 tab before a trailing comment on a false value",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\t# tab then comment\n" + CANCEL_JOB,
+     None),
+    ("r10 question mark and colon inside step values",
+     CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
+     + '    steps:\n      - run: a:b\n      - run: "x ? y : z"\n', None),
 )
+# Rows refused by design although YAML reads them as compliant (fail closed; no workflow writes them):
+# the PyYAML differential pins that they are over-refusals, not misreadings.
+OVER_REFUSALS = {"r10 cancel value on the next line, false", "r10 concurrency key under a step with:",
+                 "r10 concurrency key under a job env:"}
+# YAML allows a tab before a comment; PyYAML 6 rejects it, so the differential pins that rejection instead.
+PYYAML_REJECTS = {"r10 tab before a trailing comment on a false value"}
+# Round 10 (REVIEW-8332-security-r9 S20): KEY_LINE_RE on a hostile line must finish well inside this many
+# seconds (the round-9 prefix took about 1.8 s at 22 repetitions; the linear one takes microseconds).
+REGEX_CEILING_S = 0.5
 
 
 def oracle_verdict(name: str, text: str) -> str:
@@ -1030,13 +1134,29 @@ class EditedRatchetOracle8332(unittest.TestCase):
         """Round 9 (REVIEW-8332-security-r8 S17): cancel-in-progress is bound to its concurrency block."""
         for name, text, message in CANCEL_ORACLE:
             with self.subTest(name):
-                self.assertIn("edited", pr_types(text), text)
+                if message is None or "cannot parse the trigger section" not in message:
+                    self.assertIn("edited", pr_types(text), text)
                 out = cancel_violations("claude-md-rule-compare.yml", text)
                 if message is None:
                     self.assertEqual(out, [], text)
                 else:
                     self.assertEqual(len(out), 1, text)
                     self.assertIn(message, out[0], text)
+
+    def test_key_line_regex_is_linear(self):
+        """Round 10 (REVIEW-8332-security-r9 S20, REVIEW-8332-code-r9 F1, CodeQL py/redos): KEY_LINE_RE and
+        the concurrency reader finish a line of repeated dashes and blanks inside REGEX_CEILING_S."""
+        lines = ["-" + "\t -" * 22 + "x", "-" + "\t -" * 20 + "x", "-" + "  -" * 2000 + "x", "- " * 2000 + "k: v"]
+        for line in lines:
+            t0 = time.perf_counter()
+            m = KEY_LINE_RE.match(line)
+            took = time.perf_counter() - t0
+            self.assertLess(took, REGEX_CEILING_S, f"{len(line)} chars took {took:.3f}s")
+            self.assertEqual(m is not None, line.endswith("k: v"), line[:40])
+        text = CANCEL_HEAD + CANCEL_JOB + "    steps:\n      " + "-" + "\t -" * 22 + "x\n"
+        t0 = time.perf_counter()
+        self.assertEqual(cancel_violations("claude-md-rule-compare.yml", text), [])
+        self.assertLess(time.perf_counter() - t0, REGEX_CEILING_S)
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not importable on this interpreter")
     def test_cancel_oracle_matches_pyyaml(self):
@@ -1045,11 +1165,14 @@ class EditedRatchetOracle8332(unittest.TestCase):
         import yaml
         for name, text, message in CANCEL_ORACLE:
             with self.subTest(name):
+                if name in PYYAML_REJECTS:
+                    self.assertRaises(yaml.YAMLError, yaml.safe_load, text)
+                    continue
                 data = yaml.safe_load(text)
                 found = [data.get("concurrency")] + [j.get("concurrency") for j in data["jobs"].values()]
                 values = [c.get(CANCEL_KEY) for c in found if isinstance(c, dict)]
                 compliant = bool(values) and all(v is False or guard_ok(str(v)) for v in values)
-                self.assertEqual(compliant, message is None, text)
+                self.assertEqual(compliant, message is None or name in OVER_REFUSALS, text)
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not importable on this interpreter")
     def test_oracle_matches_pyyaml(self):
