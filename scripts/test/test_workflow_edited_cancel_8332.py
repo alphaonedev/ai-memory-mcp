@@ -958,6 +958,21 @@ FLUSH_HEADER_AFTER_KEY_ROWS = (
      '      group: g\n      cancel-in-progress: true\n    steps:\n      - run: echo hi\n        env:\n'
      '          B: |#c\n            y"\n', 9),
 )
+# Round 14 (REVIEW-8332-security-r13 S-r13-1 m1, m2; verbatim): the flush-comment header stands after a lone dash
+# (a matrix list item) or after a bare colon token (an input key with a blank before its colon); a stray quote in
+# the block body sits before a job-level concurrency block. Each row is red only against the mutant that drops
+# that way of setting the lead flag. (name, text, refused line)
+FLUSH_HEADER_AFTER_INDICATOR_ROWS = (
+    ("m1 matrix list item: a lone dash, then a flush-comment header",
+     "name: c\non:\n  pull_request_target:\n    types: [opened, edited]\njobs:\n  j:\n"
+     "    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        x:\n          - |#c\n"
+     '            echo a: "x\n    concurrency:\n      group: g\n      cancel-in-progress: true\n    env:\n'
+     '      B: y"\n    steps:\n      - run: echo hi\n', 11),
+    ("m2 with-input key with a blank before its colon, then a flush-comment header",
+     FLUSH_HEADER_JOB + "      - uses: example-org/example-action@v1\n        with:\n          k : |#c\n"
+     '            echo a: "x\n    concurrency:\n      group: g\n      cancel-in-progress: true\n    env:\n'
+     '      B: y"\n', 11),
+)
 ORACLE = (
     ("r3 double-quoted block key", 'on:\n  "pull_request":\n    types: [opened, edited]\n', EDITED),
     ("r3 single-quoted key, quoted sequence item", "on:\n  'pull_request':\n    types:\n      - 'edited'\n", EDITED),
@@ -1312,6 +1327,9 @@ CANCEL_ORACLE = (
       for name, text in FLUSH_HEADER_ROWS_R13),
     *((f"r13 {name}", text, f"cannot parse the trigger section (line {line}: {FLUSH_COMMENT_HEADER}")
       for name, text, line in FLUSH_HEADER_AFTER_KEY_ROWS),
+    # Round 14 (S-r13-1): a header after a lone dash or a bare colon token.
+    *((f"r14 {name}", text, f"cannot parse the trigger section (line {line}: {FLUSH_COMMENT_HEADER}")
+      for name, text, line in FLUSH_HEADER_AFTER_INDICATOR_ROWS),
     ("r12 plain step value holding a pipe and a hash (control)",
      CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
      + "    steps:\n      - run: echo |#c\n      - run: a|#b\n", None),
@@ -1327,7 +1345,8 @@ PYYAML_REJECTS = {"r10 tab before a trailing comment on a false value",
                   "r12 f1b flow job under block jobs, escaped keys, a tab before the colon, true",
                   *(f"r12 {name}" for name, _ in FLUSH_HEADER_ROWS),
                   *(f"r13 {name}" for name, _ in FLUSH_HEADER_ROWS_R13),
-                  *(f"r13 {name}" for name, _, _ in FLUSH_HEADER_AFTER_KEY_ROWS)}
+                  *(f"r13 {name}" for name, _, _ in FLUSH_HEADER_AFTER_KEY_ROWS),
+                  *(f"r14 {name}" for name, _, _ in FLUSH_HEADER_AFTER_INDICATOR_ROWS)}
 # Round 10 (REVIEW-8332-security-r9 S20): KEY_LINE_RE on a hostile line must finish well inside this many
 # seconds (the round-9 prefix took about 1.8 s at 22 repetitions; the linear one takes microseconds).
 REGEX_CEILING_S = 0.5
@@ -1339,10 +1358,14 @@ HOSTILE_LEN = 50_000
 # Round 13 (REVIEW-8332-security-r12 S-r12-1, the helper cases its fix check ran, verbatim): a scanned line and
 # whether ``_flush_comment_header`` reads a block scalar header with a flush comment on it. The last case is the
 # lane's own: a later candidate inside the comment, so a helper that keeps only the last candidate's answer fails.
+# Round 14 (REVIEW-8332-security-r13 S-r13-1, REVIEW-8332-code-r13 INFO-1, verbatim): the lone dash and the bare
+# colon token each set the lead flag (a mutant dropping either fails open); an alias does not keep it and a plain
+# word led by a dash does not set it (a mutant doing either over-refuses).
 FLUSH_HELPER_CASES = (("- run: |2#c d", True), ("run: echo |#c", False), ("run: a|#b", False),
                       ("k: &a !t |#c", True), ("x &a |#c", False), ("a |#x: |#c", True), ("k >#: |2-#c", True),
                       ("|#c", True), ("run:\t|#c", True), ("run: |0#c", False), ("a: b |#c", False),
-                      ("run: |#c |#x", True))
+                      ("run: |#c |#x", True), ("- |#c", True), ("k : |#c", True), ("k: *a |#c", False),
+                      ("run: -x |#c", False))
 BLOCK_ALPHABET, BLOCK_CORPUS_MAX_LEN = " \t:-&!a|>10+", 5
 
 
@@ -1516,7 +1539,9 @@ class EditedRatchetOracle8332(unittest.TestCase):
 
     def test_flush_comment_header_cases(self):
         """Round 13 (REVIEW-8332-security-r12 S-r12-1, REVIEW-8332-code-r12 F1): every candidate token on a line is
-        tested where a value can start (after a key colon, a dash or an anchor / tag), not only the first."""
+        tested where a value can start (after a key colon, a dash or an anchor / tag), not only the first. Round 14
+        (S-r13-1, code-r13 INFO-1): each way of setting the lead flag is pinned, and an alias or a dash-led word is
+        not one."""
         for text, want in FLUSH_HELPER_CASES:
             with self.subTest(text):
                 self.assertEqual(_flush_comment_header(text), want)
