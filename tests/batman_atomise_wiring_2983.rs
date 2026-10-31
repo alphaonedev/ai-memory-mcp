@@ -317,6 +317,37 @@ fn the_same_store_without_a_curator_reports_skipped_no_curator_2985() {
 // (ii, deferred) The bounded worker lands the atoms out-of-band.
 // ===========================================================================
 
+/// Upper bound on how long the gated provider parks. Only reached when the
+/// test body wedges without dropping the gate; failing loudly beats hanging
+/// the suite.
+const GATE_PARK_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// An atomiser provider that blocks the worker until the test drops (or
+/// signals) the paired gate sender, then yields `atomiser` (#8340).
+///
+/// Message passing per CONCURRENCY-13; the receiver sits behind a `Mutex`
+/// because the provider must be `Sync` (poison recovered per
+/// CONCURRENCY-18). A closed gate returns at once, so later jobs and the
+/// failure path never park.
+fn gated_provider(
+    atomiser: Arc<Atomiser>,
+    gate_rx: std::sync::mpsc::Receiver<()>,
+) -> ai_memory::background::atomise_worker::AtomiserProvider {
+    let gate_rx = Mutex::new(gate_rx);
+    Arc::new(move || {
+        let parked = gate_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(GATE_PARK_LIMIT);
+        assert!(
+            !matches!(parked, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "deferred_mode_lands_atoms_through_the_bounded_worker_2986: the test never \
+             released the atomise worker gate within {GATE_PARK_LIMIT:?}"
+        );
+        Some(Arc::clone(&atomiser))
+    })
+}
+
 #[test]
 fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
     permissive_attestation_for_tests();
@@ -327,11 +358,16 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
 
     let calls = Arc::new(Mutex::new(0usize));
     let atomiser = mock_atomiser(&calls);
-    let provider_atomiser = Arc::clone(&atomiser);
+    // The worker resolves its provider BEFORE `run_deferred_atomise`, so a
+    // provider parked on this gate keeps the job from landing anything until
+    // the test has made its inline-archive check (#8340). Dropping `gate` on
+    // any exit path (including an assertion failure) releases the worker.
+    let (gate, gate_rx) = std::sync::mpsc::channel::<()>();
     let (queue, worker): (AtomiseQueue, std::thread::JoinHandle<()>) =
-        ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
-            Some(Arc::clone(&provider_atomiser))
-        }))
+        ai_memory::background::atomise_worker::spawn_joinable(gated_provider(
+            Arc::clone(&atomiser),
+            gate_rx,
+        ))
         .expect("worker spawns");
 
     let resp = store_through_mcp(
@@ -356,6 +392,8 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
         immediate.is_none(),
         "deferred mode must not archive the parent inline"
     );
+    // The inline check has run: release the worker so it may drain.
+    drop(gate);
 
     // …and the single consumer drains it out-of-band. Close the queue (the
     // sole sender) and DETERMINISTICALLY await the worker draining the buffered
