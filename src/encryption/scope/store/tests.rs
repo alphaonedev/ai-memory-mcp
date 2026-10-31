@@ -962,9 +962,10 @@ fn scope_key_namespace_marker_fails_closed_on_unreadable_key_dir_8278() {
             let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
         }
     }
-    // SAFETY: `geteuid` has no preconditions and only reads a process property.
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipped: root ignores directory modes, so mode 0o000 cannot deny the read");
+    if running_as_root() {
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o000 cannot deny the read"
+        );
         return;
     }
     let dir = sandbox();
@@ -1053,7 +1054,9 @@ fn scope_key_namespace_marker_fails_closed_on_dangling_key_dir_link_8278() {
 #[test]
 fn scope_key_namespace_marker_fails_closed_when_the_lock_fails_8278() {
     if running_as_root() {
-        eprintln!("skipped: root ignores directory modes, so mode 0o000 cannot deny the lock");
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o000 cannot deny the lock"
+        );
         return;
     }
     let dir = sandbox();
@@ -1069,7 +1072,9 @@ fn scope_key_namespace_marker_fails_closed_when_the_lock_fails_8278() {
 #[test]
 fn scope_key_namespace_marker_fails_closed_when_the_listing_fails_8278() {
     if running_as_root() {
-        eprintln!("skipped: root ignores directory modes, so mode 0o300 cannot deny the listing");
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o300 cannot deny the listing"
+        );
         return;
     }
     let dir = sandbox();
@@ -1165,4 +1170,133 @@ fn scope_key_record_with_another_recovery_fingerprint_is_refused_8278() {
         store_refusal(&err),
         ScopeKeyStoreError::AuditChainMismatch { .. }
     ));
+}
+
+/// #8315 (row 2, PR #8279 round-5 residue): the cache-miss warning names the
+/// namespace label and the error kind only, never the key-directory path or
+/// an entry path (which carries the namespace hash), and a second miss of the
+/// same key logs at debug instead of warning again. Captures `tracing` output
+/// through a thread-local subscriber, so it runs alone in a re-exec'd child
+/// (#4090).
+#[cfg(unix)]
+#[test]
+fn scope_key_marker_miss_warning_drops_paths_and_warns_once_8315() {
+    if crate::test_support::run_env_isolated_child_or_spawn(
+        "encryption::scope::store::tests::scope_key_marker_miss_warning_drops_paths_and_warns_once_8315",
+    ) {
+        return;
+    }
+    if running_as_root() {
+        eprintln!(
+            "skipped: running as root; root ignores directory modes, so mode 0o000 cannot deny the lock"
+        );
+        return;
+    }
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = SharedBuf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = sandbox();
+    let _recovery = enrol_test_recovery(dir.path());
+    let early = cold_store_after_mint(dir.path());
+    let _mode = DirModeGuard::set(early.scope_dir(), 0o000);
+    assert!(early.namespace_is_e2e(NS), "first miss answers end-to-end");
+    assert!(early.namespace_is_e2e(NS), "second miss answers end-to-end");
+
+    let captured = String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+    let warnings: Vec<&str> = captured
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains("marker reload failed"))
+        .collect();
+    let Some((first, rest)) = warnings.split_first() else {
+        panic!("the first miss must warn; captured:\n{captured}");
+    };
+    assert!(
+        rest.is_empty(),
+        "a second miss of the same key must not warn again: {rest:?}"
+    );
+    let key_dir = dir.path().display().to_string();
+    assert!(
+        !first.contains(&key_dir),
+        "the warning must not carry the key-directory path: {first}"
+    );
+    assert!(
+        !first.contains(&FileScopeKeyStore::slug(NS)),
+        "the warning must not carry the namespace hash: {first}"
+    );
+    assert!(
+        first.contains(NS) && first.contains("PermissionDenied"),
+        "the warning names the namespace label and the error kind: {first}"
+    );
+    assert!(
+        captured
+            .lines()
+            .any(|line| line.contains("DEBUG") && line.contains("marker reload failed again")),
+        "the second miss logs at debug; captured:\n{captured}"
+    );
+}
+
+/// #8315 (code F3): the warn-once set is bounded. Drives more distinct
+/// failing namespaces than the cap through the logger and checks the set
+/// never outgrows the cap.
+#[test]
+fn marker_warned_set_is_bounded_8315() {
+    let dir = sandbox();
+    let store = open_store(dir.path());
+    let error = anyhow::anyhow!("synthetic reload failure");
+    for n in 0..(MARKER_WARNED_CAP * 2) {
+        let ns = format!("ns-{n}");
+        store.log_marker_reload_failure(&ns, &FileScopeKeyStore::slug(&ns), &error);
+    }
+    let len = store.marker_warned.lock().expect("warned set").len();
+    assert_eq!(len, MARKER_WARNED_CAP, "the warn-once set stops at the cap");
+    assert!(
+        store.marker_warned_full_logged.load(Ordering::Relaxed),
+        "saturation is reported once"
+    );
+}
+
+/// #8315 (code F3): the cap classification itself. A slug already in the set
+/// stays a repeat even when the set is full; a new slug past the cap is
+/// saturated and is not inserted.
+#[test]
+fn note_marker_failure_caps_the_set_8315() {
+    let mut warned = HashSet::new();
+    assert_eq!(
+        note_marker_failure(&mut warned, "a", 2),
+        MarkerFailureLog::First
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "a", 2),
+        MarkerFailureLog::Repeat
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "b", 2),
+        MarkerFailureLog::First
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "c", 2),
+        MarkerFailureLog::Saturated
+    );
+    assert_eq!(
+        note_marker_failure(&mut warned, "b", 2),
+        MarkerFailureLog::Repeat
+    );
+    assert_eq!(warned.len(), 2, "a saturated slug is not inserted");
 }
