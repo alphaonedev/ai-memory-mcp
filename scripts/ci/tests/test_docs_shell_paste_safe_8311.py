@@ -428,10 +428,12 @@ class Frames(list):
 
 
 LOOK_STOPS = {
-    None: re.compile(r"\$\$|[()'\"\\`]|\$\((?!\()|\$'"),  # `$$` first: the PID
+    # `$$` first: the PID; `${ }` and `$[ ]` are tracked (Lookahead.nest)
+    None: re.compile(r"\$\$|[()'\"\\`}\]]|\$\((?!\()|\$'|\$[{\[]"),
     "'": re.compile(r"'"),
     "$'": re.compile(r"['\\]"),  # ANSI-C: a backslash escapes the next character
-    '"': re.compile(r'\$\$|["\\`]|\$\((?!\()'),  # `$$` first: the PID
+    # `$$` first: the PID; then `$(`, `$((`, `${` and `$[`, which nest quotes
+    '"': re.compile(r'\$\$|["\\`]|\$[({\[]'),
 }
 
 
@@ -442,14 +444,19 @@ class Lookahead:
     backslashes skipped; inside an ANSI-C `$'..'` a backslash escapes the
     quote, as in QUOTES, and a `$$`, in code or in "...", is the PID
     parameter, so the quote after it is plain, also when a backslash-newline
-    splits it, as bash drops that first; a lone `$` split that way from a
-    quote opens `$'`, and from a `(` a `$(`) must be followed at once by
-    `)`; otherwise bash re-reads `((` as two nested subshells and `$((` as
-    `$( (..) )`.
+    splits it, as bash drops that first; a lone `$` split that way, also
+    across bare `\\` lines, from a quote opens `$'`, and from a `(`, `{` or
+    `[` a `$(`, `${` or `$[`) must be followed at once by `)`; otherwise
+    bash re-reads `((` as two nested subshells and `$((` as `$( (..) )`.
     bash's scan reads a backtick span or a `$( )` as commands (fresh
     quoting, `#` comments), which a paren count cannot follow, so a
-    backtick or a `$(` that is not `$((`, in code or in double quotes,
-    answers subshell (fails closed).
+    backtick or a `$(` that is not `$((`, in code, answers subshell (fails
+    closed). Inside "..." bash nests a `"` that sits in a `$( )`, `$(( ))`,
+    `${ }` or `$[ ]`, so the string does not close there; the lookahead
+    cannot see where such an expansion ends, so any of them in "..."
+    answers subshell too (fails closed). In code bash does not nest a
+    `${ }` or `$[ ]`, so a `))` inside one closes the `((` for bash; the
+    frame lexer nests it, so there the answer is subshell (fails closed).
 
     Bounded: one lookahead reads at most LOOKAHEAD_CAP characters, and all
     lookaheads over one fence share a budget of its length plus the cap, so
@@ -470,17 +477,20 @@ class Lookahead:
     def arith(self, k, col):
         """True when the inner text that starts at lines[k][col] closes with
         `))`, read as bash's matched-pair scan reads it. Characters between
-        the ones that matter are skipped by a regex search, but still count
-        against the cap and the budget."""
+        the ones that matter are skipped by a regex search, but count against
+        the cap and the budget."""
         left = min(LOOKAHEAD_CAP, self.budget)
         self.budget -= left  # charged up front; the unused part is refunded
-        depth = 0
+        depth, nest = 0, []  # nest: the `${` and `$[` open in code
         quote = None
         lone = False  # the last line ended in a lone `$` and a backslash
         while k < len(self.lines):
             line = self.lines[k]
+            if lone and line == "\\":  # a bare continuation: bash drops it too
+                k, left = k + 1, left - 2
+                continue
             if lone:  # bash joins the lone `$` with this line's start
-                pair = self.joined(line, quote)
+                pair = self.after_join(line, quote)
                 if pair is None:
                     self.budget += left
                     return False  # a split `$(`: command substitution
@@ -503,9 +513,11 @@ class Lookahead:
                     used = col  # the PID parameter, read before any quote after it
                 elif ch == "$'":
                     quote = ch  # only LOOK_STOPS[None] matches it
-                elif ch == "`" or ch.startswith("$("):
+                elif quote is None and ch in ("${", "$[", "}", "]"):
+                    self.nest(nest, ch)
+                elif ch[0] in "`$":  # `, $(, and in "..." $((, ${ or $[
                     self.budget += left
-                    return False  # command substitution: subshell
+                    return False  # commands or nested quotes: subshell
                 elif quote is not None or ch in "'\"":
                     quote = None if quote is not None else ch
                 elif ch == "(":
@@ -514,7 +526,7 @@ class Lookahead:
                     depth -= 1
                 else:
                     self.budget += left
-                    return line.startswith(")", col)
+                    return not nest and line.startswith(")", col)
             if self.single:
                 break
             k, col, left = k + 1, 0, left - 1
@@ -522,21 +534,34 @@ class Lookahead:
         return False  # no closing paren before the fence (or line) end
 
     @staticmethod
-    def joined(line, quote):
+    def after_join(line, quote):
         """Read a lone `$` that ended the last line before a backslash with
         the start of `line`, as bash does once it drops the backslash-newline:
-        returns (col to read from, quote), or None for a `$(` (a command
-        substitution: subshell). `$$` is the PID; in code a quote after it
-        opens an ANSI-C `$'`; in '..' or $'..' the `$` was literal."""
+        returns (col to read from, quote), or None (subshell, fails closed)
+        for a `$(`, `${` or `$[`, and in "..." a `$((`, as arith answers at
+        an unsplit one in "..." (a split `${` or `$[` in code is not tracked
+        by nest). `$$` is the PID; in code a quote after it opens an ANSI-C
+        `$'`; in '..' or $'..' the `$` was literal."""
         if quote not in (None, '"') or not line:
             return 0, quote
-        if line[0] == "(" and not line.startswith("(("):
+        if line[0] in "{[" or line[0] == "(" and (quote or not line.startswith("((")):
             return None
         if line[0] == "$":
             return 1, quote
         if line[0] == "'" and quote is None:
             return 1, "$'"
         return 0, quote
+
+    @staticmethod
+    def nest(stack, ch):
+        """Track a `${ }` or `$[ ]` opened in code. bash's pair scan does
+        not nest them, so a `))` inside one closes the `((` for bash, while
+        the frame lexer nests them and would read on as arithmetic: arith
+        answers subshell there (fails closed)."""
+        if ch in ("${", "$["):
+            stack.append(ch)
+        elif stack and stack[-1] == ("${" if ch == "}" else "$["):
+            stack.pop()
 
 
 def parse_heredoc_word(line, start):
@@ -1352,6 +1377,46 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             with self.subTest(lines=lines, bash_runs=bash_runs):
                 self.assertEqual([no for no, _ in scan_block(1, lines)], want)
 
+    def test_8311_lookahead_nests_expansions_as_bash(self):
+        # S21: inside "..." bash nests a `"` that sits in `${ }`, `$[ ]`,
+        # `$(( ))` or `$( )`, so the string does not close there; the `((`
+        # lookahead answers subshell at any of them (fails closed), also
+        # when a lone `$` and a continuation split it, across bare `\` lines
+        # too (I2). In code bash does not nest `${ }` or `$[ ]`, so a `))`
+        # inside one closes the `((`; the lookahead answers subshell there.
+        # Each row carries what bash 5.2 does (`bash -n`, then `bash -c`
+        # echo markers) and the hits.
+        probes = (
+            (['(( "${x:-"))"}" ; echo L1 # c', ") )"], [1], "L1"),
+            (['(( "$\\', '{x:-"))"}" ; echo L2 # c', ") )"], [2], "L2"),
+            (['echo $(( "${x:-"))"}" ; echo L1 # c', ") )"], [1], "L1"),
+            (['(( "$\\', "\\", '{x:-"))"}" ; echo L3 # c', ") )"], [3], "L3"),
+            (['(( "$\\', "\\", '(echo "))")" ; echo L3 # c', ") )"], [3], "L3"),
+            (["x=$(( ${x:-))} ; echo L1 # c", "echo L2 # d", ")"], [1, 2], "L2"),
+            (["x=$(( $\\", "{x:-))} ; echo L2 # c", "echo L3 # d", ")"], [2, 3], "L3"),
+            # The nested string closes where bash closes it.
+            (['(( "$(echo "${x:-"))"}")" ; echo L1 # c', ") )"], [1], "L1"),
+            (['(( "${x:-\'))\'}" ; echo L1 # c', ") )"], [1], "L1"),
+            (['(( x = "${y:-1}" )) ; echo L1 # c'], [1], "L1"),
+            (['(( "${x:-a}" ) ) ; echo L1 # c'], [1], "L1"),
+            # Over-flags, fail closed: bash parses the line (`bash -n` 0)
+            # and aborts at the expansion, or rejects the line (rc 2).
+            (['(( "$[ "))" ]" ; echo L1 # c', ") )"], [1], "aborts"),
+            (['(( "$(( "))" ))" ; echo L1 # c', ") )"], [1], "aborts"),
+            (['(( x == "$$(" )) ; echo L1 # c ")"'], [1], "aborts"),
+            (['(( x == "$${" )) ; echo L1 # c "}"'], [1], "aborts"),
+            (["(( ${x:-))} ; echo L1 # c", ") )"], [1], "syntax error"),
+            (["(( $[ )) ] ; echo L1 # c", ") )"], [1], "syntax error"),
+            (["(( $\\", "{x:-))} ; echo L2 # c", ") )"], [2], "syntax error"),
+            # Arithmetic with closed expansions stays clean.
+            (['(( x == "${#y}" ))', "echo ok"], [], "ok"),
+            (["echo $(( ${#a[@]} + $[1] ))", "echo ok"], [], "ok"),
+            (["echo $(( ${x:-1} + 1 )); echo L1"], [], "L1"),
+        )
+        for lines, want, bash_runs in probes:
+            with self.subTest(lines=lines, bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
+
     def test_8311_backtick_closes_through_quotes(self):
         # S15: bash ends a backtick substitution at the first unescaped
         # backtick, whatever quote is open inside it.
@@ -1373,6 +1438,8 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             ('echo "$$["; ls # c "]"', 20000),  # G1: the PID before `[`
             ('false && echo "$$("; ls # c ")"', 20000),  # C1: never expanded
             ("ls $\\\n'\\''; ls # c '", 10000),  # S20: a split `$'`, two lines
+            ('(( "${x:-"))"}" ; ls # c', 20000),  # S21: a quote nested in `${`
+            ('(( "$\\\n{x:-"))"}" ; ls # c', 10000),  # S21: the split form
         )
         for line, want in shapes:
             began = time.monotonic()
