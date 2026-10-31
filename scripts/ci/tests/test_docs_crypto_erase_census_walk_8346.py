@@ -13,7 +13,12 @@ that cannot be parsed fails loudly), so a change to the census moves the mirror.
 The Rust comments are stripped ONCE from the whole source (`Census.__init__`) and
 every search runs on that stripped text, so a stale commented-out copy of a
 declaration or of the listing call can never be read instead of the live one.
-Every `continue` clause of the census loop is mirrored or fails loudly.
+Rust block comments nest, so the stripper counts the depth (a stray `*/` fails loudly), and every
+parsed constant name and the loop head must occur exactly once in the stripped source.
+The WHOLE census loop body (comments stripped, string literals masked, whitespace removed) and the
+erasable-bytes expression are pinned against one exact expected text, the `ends_with` filter terms
+being the only parsed variable part, so any other change to the Rust census fails loudly and names
+the drifted statement.
 """
 import json
 import os
@@ -44,13 +49,69 @@ def read(rel):
     return (REPO / rel).read_text(encoding="utf-8")
 
 
-def strip_comments(text):
-    """Remove `//` and `/* */` comments; string, raw string and char literals stay intact.
+RUST_LITERAL = re.compile(
+    r'(?P<raw>(?<![A-Za-z0-9_])b?r(?P<h>#*)".*?"(?P=h))'
+    r'|(?P<str>"(?:[^"\\]|\\.)*")'
+    r"|(?P<chr>'(?:\\.[^'\n]*|[^'\\\n])')",
+    re.S,
+)
+LEX_START = re.compile(r"[\"'/*rb]")
 
-    The tokenizer knows `"..."`, `r"..."`, `r#"..."#` and char literals such as `'"'`, so a
-    quote inside one of them never opens a string and a comment marker inside a string is kept.
+
+def strip_comments(text):
+    """Remove `//` and `/* */` comments (block comments nest); literals stay intact.
+
+    String, raw string and char literals such as `'"'` are skipped whole, so a quote inside one
+    never opens a string and a comment marker inside a string is kept. A block comment that never
+    closes, or a `*/` outside a comment and a literal, raises AssertionError (never read silently).
     """
-    return RUST_TOKEN.sub(lambda m: " " if m.group("cmt") is not None else m.group(0), text)
+    out, pos, end = [], 0, len(text)
+    while pos < end:
+        found = LEX_START.search(text, pos)
+        if found is None:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:found.start()])
+        pos = found.start()
+        literal = RUST_LITERAL.match(text, pos)
+        if literal is not None:
+            out.append(literal.group(0))
+            pos = literal.end()
+        elif text.startswith("//", pos):
+            newline = text.find("\n", pos)
+            pos = end if newline < 0 else newline
+            out.append(" ")
+        elif text.startswith("/*", pos):
+            depth, scan = 1, pos + 2
+            while depth:
+                opener, closer = text.find("/*", scan), text.find("*/", scan)
+                if closer < 0:
+                    raise AssertionError("%s has a block comment that never closes" % RUST_SRC)
+                if 0 <= opener < closer:
+                    depth, scan = depth + 1, opener + 2
+                else:
+                    depth, scan = depth - 1, closer + 2
+            out.append(" ")
+            pos = scan
+        elif text.startswith("*/", pos):
+            raise AssertionError("%s has a `*/` outside any block comment or literal" % RUST_SRC)
+        else:
+            out.append(text[pos])
+            pos += 1
+    return "".join(out)
+
+
+def mask_literals(text):
+    """Replace every string, raw string and char literal by NULs of the same length."""
+    return RUST_LITERAL.sub(lambda m: "\0" * len(m.group(0)), text)
+
+
+def declared_once(masked, pattern, what):
+    """Raise unless `pattern` occurs exactly once in the literal-masked, comment-stripped source."""
+    count = len(re.findall(pattern, masked))
+    if count != 1:
+        raise AssertionError("%s must declare %s exactly once in live code, found %d"
+                             % (RUST_SRC, what, count))
 
 
 def strings(body):
@@ -91,10 +152,35 @@ def string_list(clean, name):
 
 
 LOOP_HEAD = "for rel in stdout.lines() {"
-DATED_TAIL = r"\|\|DOCS_CENSUS_DATED_RECORDS\.iter\(\)\.any\(\|dir\|rel\.starts_with\(dir\)\)"
-PHRASE_CLAUSE = ("!DOCS_CENSUS_ERASE_PHRASES.iter().any(|phrase|flat.contains(phrase))"
-                 "||!bytes.iter().any(|byte|flat.contains(byte.as_str()))")
-SKIP_CLAUSE = re.compile(r"\bif\s+(.*?)\s*\{\s*continue\s*;?\s*\}", re.S)
+ENDS_TERM = r'rel\.ends_with\(""\)'
+ENDS_SLOT = "<ENDS>"
+# The census loop body of docs_census_8315_on, split after every `;`, `{` and `}`, whitespace
+# removed, every string literal masked to `""`. The only variable part is the `ends_with` term
+# group (ENDS_SLOT), whose literals census_filter parses. The two `if .. { continue; }` skips
+# are chunks 1-3 and 6-8.
+LOOP_CHUNKS = (
+    "if!(" + ENDS_SLOT + ")||DOCS_CENSUS_DATED_RECORDS.iter().any(|dir|rel.starts_with(dir)){",
+    "continue;",
+    "}",
+    'lettext=std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e|panic!(""));',
+    "letflat=text.to_lowercase();",
+    "if!DOCS_CENSUS_ERASE_PHRASES.iter().any(|phrase|flat.contains(phrase))"
+    "||!bytes.iter().any(|byte|flat.contains(byte.as_str())){",
+    "continue;",
+    "}",
+    "census.push(rel.to_string());",
+    "letmissing:Vec<&str>=bytes.iter().filter(|byte|!flat.contains(byte.as_str()))"
+    ".map(String::as_str).collect();",
+    "if!missing.is_empty(){",
+    'failures.push(format!("",missing.join("")));',
+    "}",
+)
+# The erasable-bytes expression and the two accumulators, literals kept: the byte format is pinned.
+BYTES_PREAMBLE = (
+    "letbytes:Vec<String>=CRYPTO_ERASABLE_ENVELOPE_VERSIONS.iter()"
+    '.map(|version|format!("0x{version:02x}")).collect();'
+    "letmutcensus:Vec<String>=Vec::new();letmutfailures:Vec<String>=Vec::new();"
+)
 
 
 def compact(text):
@@ -108,7 +194,7 @@ def census_loop(clean):
     if start < 0:
         raise AssertionError("%s no longer has the `%s` census loop" % (RUST_SRC, LOOP_HEAD))
     start += len(LOOP_HEAD)
-    masked = RUST_TOKEN.sub(lambda m: "x" * len(m.group(0)), clean)
+    masked = mask_literals(clean)
     depth = 1
     for pos in range(start, len(masked)):
         depth += {"{": 1, "}": -1}.get(masked[pos], 0)
@@ -117,38 +203,62 @@ def census_loop(clean):
     raise AssertionError("%s census loop has no closing brace" % RUST_SRC)
 
 
-def census_filter(clean):
-    """Return the `ends_with` suffixes the Rust census reads (the `.md`/`.html` filter).
+def loop_chunks(body):
+    """Return [(pinned form, shown form)] per statement chunk of the loop body.
 
-    Every skip clause of the loop body is checked: the first must be exactly
-    `!(<ends_with literals>) || DOCS_CENSUS_DATED_RECORDS.iter().any(|dir| rel.starts_with(dir))`,
-    the second exactly the phrase/byte test `judge` mirrors, and no other `continue` may exist.
+    The pinned form has literals masked to `""`; the shown form keeps them, so an error names
+    the drifted clause. Boundaries are found on the masked text, so a `;`, `{` or `}` inside a
+    literal (raw strings included) never splits a chunk and never reads as code.
     """
-    body = census_loop(clean)
-    masked = RUST_TOKEN.sub(lambda m: "x" * len(m.group(0)), body)
-    clauses = [m.group(1) for m in SKIP_CLAUSE.finditer(body)]
-    continues = len(re.findall(r"\bcontinue\b", masked))
-    if len(clauses) != 2 or continues != 2:
-        raise AssertionError("%s census loop must have exactly two `continue` clauses (extension/dated"
-                             " record, phrase/byte test), found %d clauses and %d continues: %r"
-                             % (RUST_SRC, len(clauses), continues, [compact(c) for c in clauses]))
-    first = compact(clauses[0])
-    match = re.fullmatch(r"!\((.*)\)" + DATED_TAIL, first)
-    if match is None:
-        raise AssertionError("%s census skip clause is not `!(<ends_with terms>) || "
-                             "DOCS_CENSUS_DATED_RECORDS.iter().any(|dir| rel.starts_with(dir))`: %r"
-                             % (RUST_SRC, first))
-    if compact(clauses[1]) != PHRASE_CLAUSE:
-        raise AssertionError("%s census phrase/byte skip clause changed, the mirror does not follow it: %r"
-                             % (RUST_SRC, compact(clauses[1])))
+    masked = mask_literals(body)
+    bounds, begin = [], 0
+    for m in re.finditer(r"[;{}]", masked):
+        bounds.append((begin, m.end()))
+        begin = m.end()
+    bounds.append((begin, len(masked)))
+    pairs = []
+    for lo, hi in bounds:
+        shown = compact(body[lo:hi])
+        if shown:
+            pairs.append((re.sub(r"\0+", '""', compact(masked[lo:hi])), shown))
+    return pairs
+
+
+def census_filter(clean):
+    """Pin the whole census loop body and return the `ends_with` suffixes it reads.
+
+    Every statement of the loop must equal LOOP_CHUNKS, the `ends_with` term group aside; any
+    other change (an added or tightened condition, a `?` return, a macro skip, another `continue`)
+    raises AssertionError naming the first chunk that drifted.
+    """
+    pairs = loop_chunks(census_loop(clean))
+    slot = re.compile(r"if!\((%s(\|\|%s)*)\)\|\|" % (ENDS_TERM, ENDS_TERM))
+    pinned = [slot.sub("if!(%s)||" % ENDS_SLOT, form, count=1) for form, _ in pairs]
+    for index in range(max(len(pinned), len(LOOP_CHUNKS))):
+        want = LOOP_CHUNKS[index] if index < len(LOOP_CHUNKS) else "<end of loop body>"
+        got = pinned[index] if index < len(pinned) else "<end of loop body>"
+        if got != want:
+            shown = pairs[index][1] if index < len(pairs) else "<missing>"
+            raise AssertionError("%s census loop statement %d changed, the mirror does not follow it: "
+                                 "found %r (expected %r)" % (RUST_SRC, index + 1, shown, want))
+    group = re.fullmatch(r"if!\((.*)\)\|\|DOCS_CENSUS_DATED_RECORDS.*", pairs[0][1])
     suffixes = []
-    for term in match.group(1).split("||"):
+    for term in group.group(1).split("||"):
         literal = re.fullmatch(r'rel\.ends_with\("([^"]+)"\)', term)
         if literal is None:
             raise AssertionError('%s census filter term is not `rel.ends_with("<literal>")`: %r'
                                  % (RUST_SRC, term))
         suffixes.append(literal.group(1))
     return tuple(suffixes)
+
+
+def bytes_preamble(clean):
+    """Return the compact text from the census `let bytes` to the census loop head."""
+    head = clean.find(LOOP_HEAD)
+    start = clean.rfind("let bytes", 0, head)
+    if head < 0 or start < 0:
+        raise AssertionError("%s census loop is not preceded by `let bytes`" % RUST_SRC)
+    return compact(clean[start:head])
 
 
 def census_folder(clean):
@@ -164,14 +274,24 @@ def census_folder(clean):
     return match.group(1)
 
 
-def erasable_bytes(clean):
-    """Return the `0x..` strings for CRYPTO_ERASABLE_ENVELOPE_VERSIONS (RECORD, SCOPE)."""
+def erasable_bytes(clean, scope_clean):
+    """Return the `0x..` strings for CRYPTO_ERASABLE_ENVELOPE_VERSIONS (RECORD, SCOPE).
+
+    Also pins the `let bytes` expression of the census (`format!("0x{version:02x}")` over exactly
+    that constant, nothing chained) and the two accumulators that precede the loop.
+    """
+    if bytes_preamble(clean) != BYTES_PREAMBLE:
+        raise AssertionError("%s census erasable-bytes expression changed, the mirror does not follow it:"
+                             " found %r (expected %r)" % (RUST_SRC, bytes_preamble(clean), BYTES_PREAMBLE))
     match = re.search(r"CRYPTO_ERASABLE_ENVELOPE_VERSIONS: \[u8; \d+\] =\s*\[(.*?)\];", clean, re.S)
     if match is None:
         raise AssertionError("%s no longer declares CRYPTO_ERASABLE_ENVELOPE_VERSIONS" % RUST_SRC)
     names = re.findall(r"[A-Z_]+", match.group(1))
+    masked = mask_literals(clean) + "\n" + mask_literals(scope_clean)
     values = {}
-    for src in (clean, strip_comments(read(SCOPE_SRC))):
+    for name in names:
+        declared_once(masked, r"\bconst %s: u8 =" % re.escape(name), "const " + name)
+    for src in (clean, scope_clean):
         for name, val in re.findall(r"const ([A-Z_]+_ENVELOPE_VERSION): u8 = 0x([0-9a-fA-F]+);", src):
             values[name] = int(val, 16)
     return ["0x%02x" % values[name] for name in names]
@@ -190,13 +310,19 @@ class Census:
 
     def __init__(self, text):
         clean = strip_comments(text)
+        scope_clean = strip_comments(read(SCOPE_SRC))
         self.clean = clean
+        masked = mask_literals(clean)
+        declared_once(masked, re.escape(LOOP_HEAD), "the `%s` census loop" % LOOP_HEAD)
+        for name in ("DOCS_CENSUS_ERASE_PHRASES", "DOCS_CENSUS_DATED_RECORDS",
+                     "DOCS_CENSUS_ERASE_DOC", "CRYPTO_ERASABLE_ENVELOPE_VERSIONS"):
+            declared_once(masked, r"\bconst %s:" % name, "const " + name)
         self.phrases = string_list(clean, "DOCS_CENSUS_ERASE_PHRASES")
         self.dated = string_list(clean, "DOCS_CENSUS_DATED_RECORDS")
         self.suffixes = census_filter(clean)
         self.folder = census_folder(clean)
         self.erase_doc = strings(const_body(clean, "DOCS_CENSUS_ERASE_DOC"))[0]
-        self.bytes = erasable_bytes(clean)
+        self.bytes = erasable_bytes(clean, scope_clean)
 
     def reads(self, rel):
         """True when the Rust census reads `rel` at all (extension, not a dated record)."""
@@ -341,6 +467,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     def test_stale_commented_listing_call_is_not_read(self):
         """An old call with folder `doc` commented above the live `docs` call must not win."""
+        # These anchors are exact Rust texts: a rustfmt rewrap or a fifth phrase breaks this test at assertIn, loudly and never silently.
         live = 'let listing = docs_census_git_on(root, &["ls-files", "--", "docs"], path)'
         text = self.mutated(live, '// ' + live.replace('"docs"', '"doc"') + "\n        " + live)
         self.assertIn('"doc"]', text)
@@ -348,6 +475,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     def test_stale_commented_declaration_is_not_read(self):
         """An old phrase-list declaration (five stale phrases) above the live one must not win."""
+        # These anchors are exact Rust texts: a rustfmt rewrap or a fifth phrase breaks this test at assertIn, loudly and never silently.
         live = "const DOCS_CENSUS_ERASE_PHRASES: [&str; 4] = ["
         stale = ('// const DOCS_CENSUS_ERASE_PHRASES: [&str; 5] = '
                  '["old one", "old two", "old three", "old four", "old five"];\n    ')
@@ -376,6 +504,98 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     def test_ls_files_count_is_one_before_and_after_stripping(self):
         self.assertEqual(len(re.findall(r'"ls-files"', self.text)), 1)
         self.assertEqual(len(re.findall(r'"ls-files"', self.census.clean)), 1)
+
+    def test_loop_rejects_a_tightened_failure_condition(self):
+        """`|| !flat.contains("crypto-erase.md")` appended to the missing-bytes test must raise."""
+        text = self.mutated("if !missing.is_empty() {",
+                            'if !missing.is_empty() || !flat.contains("crypto-erase.md") {')
+        with self.assertRaisesRegex(AssertionError, r'crypto-erase\.md'):
+            Census(text)
+
+    def test_loop_rejects_a_tightened_phrase_clause(self):
+        text = self.mutated("|| !bytes.iter().any(|byte| flat.contains(byte.as_str()))",
+                            '|| !bytes.iter().any(|byte| flat.contains(byte.as_str()))\n'
+                            '                || flat.contains("draft-only")')
+        with self.assertRaisesRegex(AssertionError, r'draft-only'):
+            Census(text)
+
+    def census_bytes_expression(self):
+        """Return the start offset of the census `let bytes` statement in the Rust source."""
+        start = self.text.rfind("let bytes", 0, self.text.find(LOOP_HEAD))
+        self.assertGreater(start, 0)
+        return start
+
+    def test_bytes_expression_rejects_an_extra_chained_byte(self):
+        start = self.census_bytes_expression()
+        end = self.text.index(".collect();", start)
+        text = self.text[:end] + '\n            .chain(std::iter::once("0x07".to_string()))' + self.text[end:]
+        with self.assertRaisesRegex(AssertionError, r"erasable-bytes expression.*0x07"):
+            Census(text)
+
+    def test_bytes_expression_rejects_another_byte_format(self):
+        start = self.census_bytes_expression()
+        end = self.text.index('"0x{version:02x}"', start)
+        text = self.text[:end] + '"0x{version:02X}"' + self.text[end + len('"0x{version:02x}"'):]
+        with self.assertRaisesRegex(AssertionError, r"erasable-bytes expression.*02X"):
+            Census(text)
+
+    def test_loop_rejects_a_changed_lowercase_step(self):
+        for flat in ('text.to_lowercase().replace("-", " ")', "text.to_uppercase()", "text.clone()"):
+            with self.subTest(flat=flat):
+                text = self.mutated("let flat = text.to_lowercase();", "let flat = %s;" % flat)
+                with self.assertRaisesRegex(AssertionError, r"letflat=text\."):
+                    Census(text)
+
+    def test_loop_rejects_a_question_mark_early_return(self):
+        text = self.mutated('.unwrap_or_else(|e| panic!("{rel}: read: {e}"));', "?;")
+        with self.assertRaisesRegex(AssertionError, r"read_to_string\(root\.join\(rel\)\)\?;"):
+            Census(text)
+
+    def test_loop_rejects_a_skip_done_through_a_macro(self):
+        text = self.mutated("let text = std::fs::read_to_string(root.join(rel))",
+                            'skip_unless!(rel.contains("sketch"));\n'
+                            "            let text = std::fs::read_to_string(root.join(rel))")
+        with self.assertRaisesRegex(AssertionError, r'skip_unless!\(rel\.contains\("sketch"\)\)'):
+            Census(text)
+
+    def test_loop_ignores_a_continue_inside_a_raw_string(self):
+        """Clause and body matching run on the literal-masked body: a raw string is not code."""
+        text = self.mutated('panic!("{rel}: read: {e}")',
+                            'panic!(r#"{rel}: read: {e} if x { continue; } for rel in stdout.lines() {"#)')
+        self.assertEqual(Census(text).suffixes, self.census.suffixes)
+
+    def test_nested_block_comment_hides_a_stale_declaration(self):
+        """A stale phrase list inside `/* /* */ */` above the live declaration must not win."""
+        live = "const DOCS_CENSUS_ERASE_PHRASES: [&str; 4] = ["
+        stale = 'const DOCS_CENSUS_ERASE_PHRASES: [&str; 2] = ["old one", "old two"];'
+        text = self.mutated(live, "/* outer /* inner */ " + stale + " */\n    " + live)
+        census = Census(text)
+        self.assertEqual(census.phrases, self.census.phrases)
+        self.assertNotIn("old one", census.phrases)
+        self.assertEqual(strip_comments("a /* x /* y */ z */ b"), "a   b")
+
+    def test_unbalanced_block_comment_markers_fail_loudly(self):
+        with self.assertRaisesRegex(AssertionError, r"outside any block comment"):
+            Census(self.text + "\nfn stray() {} */\n")
+        with self.assertRaisesRegex(AssertionError, r"never closes"):
+            Census(self.text + "\n/* /* closed once */\n")
+        self.assertEqual(strip_comments('let s = "a */ b"; // c */'), 'let s = "a */ b";  ')
+
+    def test_duplicate_declaration_under_cfg_any_is_rejected(self):
+        """`#[cfg(any())]` removes a copy from the build; a second declaration must still raise."""
+        live = "const DOCS_CENSUS_ERASE_PHRASES: [&str; 4] = ["
+        stale = '#[cfg(any())]\n    const DOCS_CENSUS_ERASE_PHRASES: [&str; 1] = ["old one"];\n    '
+        with self.assertRaisesRegex(AssertionError, r"const DOCS_CENSUS_ERASE_PHRASES exactly once"):
+            Census(self.mutated(live, stale + live))
+        with self.assertRaisesRegex(AssertionError, r"census loop exactly once"):
+            Census(self.text + "\n#[cfg(any())]\nfn dup() { for rel in stdout.lines() { } }\n")
+
+    def test_every_parsed_name_is_declared_once_in_live_code(self):
+        masked = mask_literals(self.census.clean)
+        for name in ("DOCS_CENSUS_ERASE_PHRASES", "DOCS_CENSUS_DATED_RECORDS",
+                     "DOCS_CENSUS_ERASE_DOC", "CRYPTO_ERASABLE_ENVELOPE_VERSIONS"):
+            self.assertEqual(len(re.findall(r"\bconst %s:" % name, masked)), 1, name)
+        self.assertEqual(masked.count(LOOP_HEAD), 1)
 
     def test_rules_json_carries_the_walk_guard_entry(self):
         entry = rules_entry()
