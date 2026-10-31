@@ -182,16 +182,24 @@ def _flush_comment_header(text: str) -> bool:
     decision (round 12, REVIEW-8332-security-r11 S-r11-2): libyaml and yaml.v3 (actionlint) read ``|#c`` as the
     header ``|`` and a comment, the YAML spec and PyYAML reject it, so the scanner cannot know whether the lines
     below are block scalar content; ``scan`` refuses the file by name (fail closed, the precedent of rounds 6-11
-    for shapes two readers disagree on) over reading it as libyaml does. The first blank-separated token led by
-    an indicator and holding a ``#`` is cut at that ``#`` and the rest of the line is tested by ``_block_header``
-    (one split and one walk: linear in the line length), so ``- run: |2#c d`` is refused and a plain scalar such
-    as ``run: echo |#c`` or ``run: a|#b`` is not.
+    for shapes two readers disagree on) over reading it as libyaml does.
+
+    decision (round 13, REVIEW-8332-code-r12 F1, REVIEW-8332-security-r12 S-r12-1): every candidate token over
+    the first candidate, because libyaml reads the header wherever it stands. One forward pass over the
+    blank-separated tokens (tabs read as blanks) tests EVERY token led by an indicator and holding a ``#``: it is
+    a header when the text before its first ``#`` is the indicator plus indentation and chomping characters and
+    the token stands where a value can start (line start, after a token ending with a colon or a lone dash, with
+    only ``&anchor`` / ``!tag`` properties between). So ``X >#b: |#c`` and ``- run: |2#c d`` are refused and a
+    plain scalar such as ``run: echo |#c`` or ``run: a|#b`` is not; no candidate calls back into
+    ``_block_header``, so the pass stays linear on a line of candidates.
     """
-    pos = 0
+    lead = True  # no token yet: an indicator may lead the line
     for tok in text.replace("\t", " ").split(" "):
-        if tok[:1] in ("|", ">") and "#" in tok:
-            return _block_header(text[:pos + tok.index("#")])
-        pos += len(tok) + 1
+        if not tok:
+            continue
+        if lead and tok[0] in BLOCK_INDICATORS and "#" in tok and set(tok[1:tok.index("#")]) <= BLOCK_HEADER_TAIL:
+            return True
+        lead = tok.endswith(":") or tok == "-" or (lead and tok[0] in "&!")
     return False
 
 
@@ -914,6 +922,42 @@ FLUSH_HEADER_ROWS = (
      FLUSH_HEADER_JOB + "      - run: |#c\n          echo a: [x\n    concurrency:\n      group: g\n"
      "      cancel-in-progress: true\n    env:\n      B: |#c\n        y]\n"),
 )
+# Round 13 (REVIEW-8332-security-r12 S-r12-2 b-sp and t-tab, REVIEW-8332-code-r12 F2 p-lasthash, verbatim): the
+# round-12 helper already refuses all three; each row kills one fail-open helper mutant (last token only, a cut at
+# the last `#`, tabs not read as blanks). Refused at line 9, as the rows above.
+FLUSH_HEADER_ROWS_R13 = (
+    ("b-sp flush comment holding a blank",
+     FLUSH_HEADER_JOB + '      - run: |#c d\n          echo a: "x\n    concurrency:\n      group: g\n'
+     '      cancel-in-progress: true\n    env:\n      B: x"\n'),
+    ("p-lasthash flush comment holding two hashes",
+     FLUSH_HEADER_JOB + '      - run: |#c#d\n          echo a: "x\n    concurrency:\n      group: g\n'
+     '      cancel-in-progress: true\n    env:\n      B: x"\n'),
+    ("t-tab a tab between the key and the flush-comment header",
+     FLUSH_HEADER_JOB + '      - run:\t|#c\n          echo a: "x\n    concurrency:\n      group: g\n'
+     '      cancel-in-progress: true\n    env:\n      B: x"\n'),
+)
+# Round 13 (REVIEW-8332-security-r12 S-r12-1 o-b5, o-b6; REVIEW-8332-code-r12 F1 o1, o3; verbatim): a plain key word
+# led by an indicator and holding a `#` stands before the real flush-comment header on the same line; the round-12
+# helper stopped at the first such token and read the block body as plain lines. (name, text, refused line)
+FLUSH_HEADER_AFTER_KEY_ROWS = (
+    ("o-b5 with-input key holding ' |#x' before a flush-comment header",
+     FLUSH_HEADER_JOB + "      - uses: example-org/example-action@v1\n        with:\n          a |#x: |#c\n"
+     '            echo a: "x\n    concurrency:\n      group: g\n      cancel-in-progress: true\n    env:\n'
+     '      B: y"\n', 11),
+    ("o-b6 with-input key holding ' >#', the header written |2-#c",
+     FLUSH_HEADER_JOB + "      - uses: example-org/example-action@v1\n        with:\n          k >#: |2-#c\n"
+     '              echo a: "x\n    concurrency:\n      group: g\n      cancel-in-progress: true\n    env:\n'
+     '      B: y"\n', 11),
+    ("o1 step with-input key holding '>#', then a flush-comment header",
+     FLUSH_HEADER_JOB + "      - uses: example/act@v1\n        with:\n          X >#b: |#c\n"
+     '            echo a: "x\n    concurrency:\n      group: g\n      cancel-in-progress: true\n    env:\n'
+     '      B: |#c\n        y"\n', 11),
+    ("o3 job outputs key holding '>#', then a flush-comment header",
+     "name: c\non:\n  pull_request_target:\n    types: [opened, edited]\njobs:\n  j:\n"
+     '    runs-on: ubuntu-latest\n    outputs:\n      X >#b: |#c\n        echo a: "x\n    concurrency:\n'
+     '      group: g\n      cancel-in-progress: true\n    steps:\n      - run: echo hi\n        env:\n'
+     '          B: |#c\n            y"\n', 9),
+)
 ORACLE = (
     ("r3 double-quoted block key", 'on:\n  "pull_request":\n    types: [opened, edited]\n', EDITED),
     ("r3 single-quoted key, quoted sequence item", "on:\n  'pull_request':\n    types:\n      - 'edited'\n", EDITED),
@@ -1110,6 +1154,8 @@ ORACLE = (
      "env:\n  A: some plain\n    ? text\non:\n" + PR_EDITED + "\n", REFUSE, f"line 3: {EXPLICIT_KEY}"),
     # round 12, REVIEW-8332-security-r11 S-r11-2: a flush comment after a block scalar header is refused by name.
     *((f"r12 {name}", text, REFUSE, f"line 9: {FLUSH_COMMENT_HEADER}") for name, text in FLUSH_HEADER_ROWS),
+    # round 13, REVIEW-8332-security-r12 S-r12-2 / REVIEW-8332-code-r12 F2: the three mutant-killing rows.
+    *((f"r13 {name}", text, REFUSE, f"line 9: {FLUSH_COMMENT_HEADER}") for name, text in FLUSH_HEADER_ROWS_R13),
 )
 # Round 7 differential variants: each keeps the YAML meaning of a row, or makes it invalid (then only a
 # refusal is accepted): a trailing comment on every line, a doubled-quote key before ``on:``, one more
@@ -1260,6 +1306,12 @@ CANCEL_ORACLE = (
     # S-r11-2: the flush-comment header rows above, and a plain scalar holding `|#` (control, not a header).
     *((f"r12 {name}", text, f"cannot parse the trigger section (line 9: {FLUSH_COMMENT_HEADER}")
       for name, text in FLUSH_HEADER_ROWS),
+    # Round 13 (S-r12-2 / F2, then S-r12-1 / F1): the mutant-killing rows, and every candidate token on the line is
+    # tested, not only the first.
+    *((f"r13 {name}", text, f"cannot parse the trigger section (line 9: {FLUSH_COMMENT_HEADER}")
+      for name, text in FLUSH_HEADER_ROWS_R13),
+    *((f"r13 {name}", text, f"cannot parse the trigger section (line {line}: {FLUSH_COMMENT_HEADER}")
+      for name, text, line in FLUSH_HEADER_AFTER_KEY_ROWS),
     ("r12 plain step value holding a pipe and a hash (control)",
      CANCEL_HEAD + "concurrency:\n  group: g\n  cancel-in-progress: false\n" + CANCEL_JOB
      + "    steps:\n      - run: echo |#c\n      - run: a|#b\n", None),
@@ -1273,7 +1325,9 @@ OVER_REFUSALS = {"r10 cancel value on the next line, false", "r10 concurrency ke
 PYYAML_REJECTS = {"r10 tab before a trailing comment on a false value",
                   "r11 block quoted key flush against a plain value in a job env",
                   "r12 f1b flow job under block jobs, escaped keys, a tab before the colon, true",
-                  *(f"r12 {name}" for name, _ in FLUSH_HEADER_ROWS)}
+                  *(f"r12 {name}" for name, _ in FLUSH_HEADER_ROWS),
+                  *(f"r13 {name}" for name, _ in FLUSH_HEADER_ROWS_R13),
+                  *(f"r13 {name}" for name, _, _ in FLUSH_HEADER_AFTER_KEY_ROWS)}
 # Round 10 (REVIEW-8332-security-r9 S20): KEY_LINE_RE on a hostile line must finish well inside this many
 # seconds (the round-9 prefix took about 1.8 s at 22 repetitions; the linear one takes microseconds).
 REGEX_CEILING_S = 0.5
@@ -1282,6 +1336,13 @@ REGEX_CEILING_S = 0.5
 # length, so the scanner no longer runs it), and the hostile line length every line pattern is timed at.
 BLOCK_SCALAR_ORACLE_RE = re.compile(r"(?:^[ \t]*|:[ \t]+|(?:^|[ \t])-[ \t]+)(?:[&!][^ \t]*[ \t]+)*[|>][1-9+-]*$")
 HOSTILE_LEN = 50_000
+# Round 13 (REVIEW-8332-security-r12 S-r12-1, the helper cases its fix check ran, verbatim): a scanned line and
+# whether ``_flush_comment_header`` reads a block scalar header with a flush comment on it. The last case is the
+# lane's own: a later candidate inside the comment, so a helper that keeps only the last candidate's answer fails.
+FLUSH_HELPER_CASES = (("- run: |2#c d", True), ("run: echo |#c", False), ("run: a|#b", False),
+                      ("k: &a !t |#c", True), ("x &a |#c", False), ("a |#x: |#c", True), ("k >#: |2-#c", True),
+                      ("|#c", True), ("run:\t|#c", True), ("run: |0#c", False), ("a: b |#c", False),
+                      ("run: |#c |#x", True))
 BLOCK_ALPHABET, BLOCK_CORPUS_MAX_LEN = " \t:-&!a|>10+", 5
 
 
@@ -1295,7 +1356,7 @@ def _hostile_lines() -> list:
     return [": " + _rep("!a: ") + "x", _rep(":\t&"), "-" + _rep("\t -") + "x", _rep("- ") + "k: v", _rep("!a ") + "|",
             _rep('"'), _rep("'"), _rep("a") + ":", " " * HOSTILE_LEN + "x", _rep(":"), "${{" + _rep(" ") + "}",
             _rep("&a "), _rep("cancel-in-progress"), _rep("pull_request "), _rep("{[,"), _rep('a"'), _rep("<<"),
-            _rep("types edited "), _rep(" |") + "#"]
+            _rep("types edited "), _rep(" |") + "#", _rep(" |#"), _rep("a |#x: ")]
 
 
 def _line_checks() -> list:
@@ -1452,6 +1513,13 @@ class EditedRatchetOracle8332(unittest.TestCase):
                 continue  # a row the scanner refuses still contributes its raw lines above
         self.assertEqual([s for s in samples if bool(BLOCK_SCALAR_ORACLE_RE.search(s)) != _block_header(s)], [])
         self.assertGreater(len(samples), len(BLOCK_ALPHABET) ** BLOCK_CORPUS_MAX_LEN)
+
+    def test_flush_comment_header_cases(self):
+        """Round 13 (REVIEW-8332-security-r12 S-r12-1, REVIEW-8332-code-r12 F1): every candidate token on a line is
+        tested where a value can start (after a key colon, a dash or an anchor / tag), not only the first."""
+        for text, want in FLUSH_HELPER_CASES:
+            with self.subTest(text):
+                self.assertEqual(_flush_comment_header(text), want)
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML not importable on this interpreter")
     def test_cancel_oracle_matches_pyyaml(self):
