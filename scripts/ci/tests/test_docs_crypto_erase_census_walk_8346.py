@@ -309,12 +309,15 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   segment holds a line break" (the multi-line inline table check keeps its message); whitespace
   outside quotes is a space or a tab only. A test compares 46 spellings with Python's tomllib: 0 disagreements. A
   quoted empty key (`""`) stays valid.
-* One copy of the non-ASCII check, every spelling: the one-copy test counts the regex AND the other spellings (`ord(c)
-  > 127`, `isascii(`, the hex escapes 7f and 80, `>= 128`, `encode("ascii")`) in the source of every module-level function but
-  `reject_unicode_space`, and a self-check shows it catches a private `ord()` copy in `reject_rebinding`.
+* One copy of the non-ASCII check, in the scope the test pins: an AST scan of every module function, every method of
+  a module class that is not a TestCase (`Census.__init__` included) and the module source with the test class and
+  `reject_unicode_space` cut out (module constants included). It refuses any use of `ord`, any `.isascii`, any
+  comparison against the integer 127 or 128 in any base, a `'ascii'` constant and a string holding U+007F, U+0080 or an
+  escape of either; self-check rows prove each spelling is caught in a function, in `Census.__init__` and in a constant.
 * Reader list: `masked_ascii_source` and the module list name `reject_rebinding` (mod.rs, the first reader
   `Census.__init__` runs).
 """
+import ast
 import contextlib
 import functools
 import inspect
@@ -326,6 +329,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unicodedata
 import unittest
 from pathlib import Path
@@ -5326,23 +5330,59 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     census = Census(self.text, overrides=self.tree_overrides(rel, code))
                     self.assertEqual(self.census_signature(census), live)
 
-    # every spelling of a non-ASCII check: the regex class, the hex escapes of DEL and the first non-ASCII code point,
-    # `isascii(`, the `> 127` / `>= 128` / `> 0x7f` comparisons and an ascii encode
-    PRIVATE_NON_ASCII = re.compile(r"\\x7f|\\x80|isascii\(|>\s*127\b|>=\s*128\b|>\s*0x7f\b|encode\(\s*[\"']ascii",
-                                   re.IGNORECASE)
+    # the non-ASCII check exists once, in `reject_unicode_space`; the scan below is an AST walk, so it does not depend on
+    # how a private copy is spelled (r19: the r18 regex missed `< 128`, `<= 127`, `>= 0x80` and `\\u0080`)
+    NON_ASCII_ESCAPE = re.compile(r"\\(?:x7f|x80|u007f|u0080|U0000007f|U00000080)", re.IGNORECASE)
 
     def private_non_ascii_spellings(self, source):
-        """Return every spelling of a non-ASCII check found in the source text `source` of one function."""
-        return self.PRIVATE_NON_ASCII.findall(source)
+        """Return one label per spelling of a non-ASCII check in the Python source text `source` (docstrings skipped)."""
+        tree = ast.parse(textwrap.dedent(source))
+        skip = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body:
+                first = body[0]
+                if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                    skip.add(id(first.value))
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "ord":
+                found.append("ord")
+            elif isinstance(node, ast.Attribute) and node.attr == "isascii":
+                found.append("isascii")
+            elif isinstance(node, ast.Compare):
+                for part in [node.left] + list(node.comparators):
+                    if isinstance(part, ast.Constant) and isinstance(part.value, int) and part.value in (127, 128):
+                        found.append("compare-%d" % part.value)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
+                value = node.value
+                if value == KEY_CONTROL.pattern:
+                    continue  # the one legal DEL: the control-character class of a quoted TOML key, not an ASCII check
+                if value.lower() == "ascii" or "\x7f" in value or "\x80" in value or self.NON_ASCII_ESCAPE.search(value):
+                    found.append("constant")
+        return found
 
-    def module_functions(self):
-        """Return every module-level function of this file (cached readers unwrapped), once each, by name."""
+    def scanned_sources(self):
+        """Return {name: source} for every module function and every method of a module class that is not a TestCase,
+        plus the module source with the test class and `reject_unicode_space` cut out under the name `<module>`."""
+        module = sys.modules[__name__]
         found = {}
-        for value in vars(sys.modules[__name__]).values():
+        for name, value in vars(module).items():
             target = inspect.unwrap(value) if callable(value) else value
             if inspect.isfunction(target) and target.__module__ == __name__:
                 found[target.__name__] = target
-        return [found[name] for name in sorted(found)]
+            elif inspect.isclass(value) and value.__module__ == __name__ and not issubclass(value, unittest.TestCase):
+                for method_name, member in vars(value).items():
+                    member = getattr(member, "__func__", member)
+                    if inspect.isfunction(member):
+                        found["%s.%s" % (name, method_name)] = inspect.unwrap(member)
+        sources = {name: inspect.getsource(found[name]) for name in sorted(found)}
+        whole = ast.parse(inspect.getsource(module))
+        cut = (type(self).__name__, "reject_unicode_space")
+        whole.body = [node for node in whole.body
+                      if not (isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in cut)]
+        sources["<module>"] = ast.unparse(whole)
+        return sources
 
     def test_every_file_class_reader_calls_the_one_shared_helper_8346(self):
         """r16: no reader keeps a private mask-and-reject sequence; each passes its own file name to the one helper."""
@@ -5359,21 +5399,40 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         whole = inspect.getsource(sys.modules[__name__])
         self.assertEqual(whole.count("[^" + "\\x00-" + "\\x7f]"), 1)
         self.assertIn("[^" + "\\x00-" + "\\x7f]", inspect.getsource(reject_unicode_space))
-        # r18 (security r17 INFO-1): every OTHER spelling of a private non-ASCII check is absent from every function
+        # r19 (code r18 LOW-1, security r18 INFO-1): no private non-ASCII check in any function, any non-TestCase class
+        # method or any module constant, whatever its spelling
         self.assertIn("reject_rebinding", masked_ascii_source.__doc__)
-        for function in self.module_functions():
-            if function.__name__ == "reject_unicode_space":
-                self.assertTrue(self.private_non_ascii_spellings(inspect.getsource(function)))
+        sources = self.scanned_sources()
+        self.assertIn("Census.__init__", sources)
+        self.assertIn("<module>", sources)
+        for name, source in sources.items():
+            if name == "reject_unicode_space":
+                self.assertTrue(self.private_non_ascii_spellings(source))
                 continue
-            with self.subTest(private_copy_in=function.__name__):
-                self.assertEqual(self.private_non_ascii_spellings(inspect.getsource(function)), [])
-        base = inspect.getsource(reject_rebinding)
-        for copy in ("    if any(ord(c) > 127 for c in masked):\n        raise AssertionError(1)\n",
-                     "    if not masked.isascii():\n        raise AssertionError(1)\n",
-                     "    masked.encode('ascii')\n", "    if re.search(r'[\\x80-\\U0010ffff]', masked):\n        pass\n",
-                     "    if max(map(ord, masked)) >= 128:\n        pass\n", "    if re.search(r'[^\\x00-\\x7F]', masked):\n        pass\n"):
+            with self.subTest(private_copy_in=name):
+                self.assertEqual(self.private_non_ascii_spellings(source), [])
+        base = sources["reject_rebinding"]
+        census_base = sources["Census.__init__"]
+        copies = ("    if any(ord(c) > 127 for c in masked):\n        raise AssertionError(1)\n",
+                  "    if not masked.isascii():\n        raise AssertionError(1)\n",
+                  "    masked.encode('ascii')\n", "    if re.search(r'[\\x80-\\U0010ffff]', masked):\n        pass\n",
+                  "    if re.search('[\u0080-\U0010ffff]', masked):\n        pass\n",
+                  "    if max(map(ord, masked)) <= 127:\n        pass\n",
+                  "    if max(ord(c) for c in masked) < 128:\n        pass\n",
+                  "    if all(ord(c) <= 127 for c in masked):\n        pass\n",
+                  "    if any(ord(c) >= 0x80 for c in masked):\n        pass\n",
+                  "    if re.search(r'[^\\x00-\\x7F]', masked):\n        pass\n",
+                  "    if re.search('[\\u0080-\\U0010ffff]', masked):\n        pass\n",
+                  "    if any(len(c.encode()) > 0x7f for c in masked):\n        pass\n")
+        for copy in copies:
             with self.subTest(self_check=copy):
                 self.assertTrue(self.private_non_ascii_spellings(base + copy))
+                self.assertTrue(self.private_non_ascii_spellings(census_base + copy))
+        for constant in ("PRIVATE_8346 = re.compile('[\\x80-\\U0010ffff]')\n", "PRIVATE_8346 = re.compile('[\u0080-\U0010ffff]')\n",
+                         "PRIVATE_8346 = 127\nCHECK_8346 = lambda c: c > PRIVATE_8346 or c >= 127\n"):
+            with self.subTest(self_check_constant=constant):
+                self.assertTrue(self.private_non_ascii_spellings(sources["<module>"] + "\n" + constant))
+        self.assertEqual(self.private_non_ascii_spellings(base), [])
         # the helper is the only caller of `reject_unicode_space` in the whole module
         self.assertEqual(len(re.findall(r"reject_unicode" + r"_space\(", inspect.getsource(sys.modules[__name__]))), 2)
         seen = []
@@ -5590,11 +5649,16 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     def test_round_18_changes_are_documented_8346(self):
         """r18: the docstring names the round and each fix; the helper's reader list names `reject_rebinding`."""
-        for phrase in ("Round 18", "KEY_CONTROL", "a TOML key segment is empty", "46 spellings", "every spelling",
-                       "reject_rebinding"):
+        for phrase in ("Round 18", "KEY_CONTROL", "a TOML key segment is empty", "46 spellings", "reject_rebinding"):
             self.assertIn(phrase, __doc__)
         self.assertIn("reject_rebinding", masked_ascii_source.__doc__)
         self.assertNotIn("plus a newline", toml_segment.__doc__)
+
+    def test_round_19_one_copy_scope_is_documented_8346(self):
+        """r19: the docstring names the scope the one-copy test pins and makes no claim of every spelling."""
+        for phrase in ("in the scope the test pins", "Census.__init__", "module constants", "an AST scan"):
+            self.assertIn(phrase, __doc__)
+        self.assertNotIn("every spelling", __doc__)
 
     def test_round_16_classes_are_documented_and_counted(self):
         """the docstring and CLOSED_CLASSES list the round 16 classes the code enforces (39 after round 16)."""
