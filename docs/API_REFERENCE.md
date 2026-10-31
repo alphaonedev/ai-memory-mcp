@@ -53,12 +53,16 @@ mTLS-enforced `/sync` lane are not counted.
 > `{"error": "missing or invalid API key"}`** — the same body a caller
 > with no credential at all gets.
 >
-> **Migration.** Move the credential from the query string to the header:
+> **Migration.** Move the credential from the query string to the header.
+> Before (v0.7.0 – v0.10.0), now answered with 401:
 >
 > ```bash
-> # before (v0.7.0 – v0.10.0) — now 401
 > curl "https://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
-> # after (v1.0.0)
+> ```
+>
+> After (v1.0.0):
+>
+> ```bash
 > curl -H "x-api-key: $KEY" https://127.0.0.1:9077/api/v1/memories
 > ```
 >

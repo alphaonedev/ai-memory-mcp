@@ -63,11 +63,13 @@ replacement.
 
 **One-time per-developer setup:**
 
+`codegraph install` writes `~/.claude.json`, `~/.claude/CLAUDE.md` and `~/.claude/settings.json`; `codegraph init -i` indexes into `.codegraph/codegraph.db` (about 63 MB for v0.7.0).
+
 ```bash
 npm install -g @colbymchenry/codegraph
-codegraph install   # writes ~/.claude.json + ~/.claude/CLAUDE.md + ~/.claude/settings.json
+codegraph install
 cd /path/to/ai-memory-mcp
-codegraph init -i   # indexes into .codegraph/codegraph.db (~63 MB for v0.7.0)
+codegraph init -i
 ```
 
 The installer auto-writes a global `~/.claude/CLAUDE.md` instructing every

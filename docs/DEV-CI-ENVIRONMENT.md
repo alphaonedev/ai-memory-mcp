@@ -168,9 +168,10 @@ artifact** so a reviewer can spin up an equivalent enterprise-fed environment:
 - Image (kept): `ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.7`
 - Deploy recipe (SSOT for the triple): `deploy/docker-1461/`
 
+A reviewer reproduces the enterprise-fed tier via docker; this brings up the certified pg+AGE+pgvector stack:
+
 ```bash
-# reviewer: reproduce the enterprise-fed tier via docker
-cd pg-age-stack && docker compose up -d      # brings up the certified pg+AGE+pgvector
+cd pg-age-stack && docker compose up -d
 ```
 
 ---
@@ -178,13 +179,12 @@ cd pg-age-stack && docker compose up -d      # brings up the certified pg+AGE+pg
 ## 8. Runbook
 
 ### Linux native tier
+Start, stop or restart the native pg cluster (operator-local cluster name), list the clusters, then connect over the local socket (trust auth). A from-scratch rebuild uses the operator-local `linux-native-tier.sh`.
+
 ```bash
-# start/stop the native pg cluster (operator-local cluster name)
 sudo pg_ctlcluster 18 <cluster> start|stop|restart
 pg_lsclusters
-# connect over the local socket (trust auth):
 sudo -u postgres psql -p 5445 -d <test-db>
-# rebuild from scratch: operator-local linux-native-tier.sh
 ```
 
 ### macOS native tier
@@ -304,11 +304,10 @@ Keep `postgresql@18` and `pgvector` brew-pinned on the node regardless.
 
 ### Self-hosted runners
 ```bash
-# status (names/ids are not published here)
 gh api repos/alphaonedev/ai-memory-mcp/actions/runners --jq '.runners[]|"\(.name) [\(.status)]"'
-# service control: the runner `svc.sh` lives in the operator-local
-# actions-runner install dir on each node — not in this repo.
 ```
+
+The command lists runner status (names and ids are not published here). Service control: the runner `svc.sh` lives in the operator-local actions-runner install dir on each node, not in this repo.
 
 ---
 
