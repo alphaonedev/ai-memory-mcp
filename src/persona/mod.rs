@@ -337,13 +337,12 @@ impl<'a> PersonaGenerator<'a> {
         // narrow LLM trait every other curator pass already uses; mock
         // implementations in `llm::test_support` keep tests
         // deterministic without spinning up Ollama.
-        let llm_input: Vec<(String, String)> = sources
-            .iter()
-            .map(|m| (m.title.clone(), m.content.clone()))
-            .collect();
+        // #8443 — a persona is by definition "what the owner prefers", so it
+        // is the surface where a foreign quoted preference must never fold in.
+        let (grounded_owner, llm_input) = crate::role_grounding::summary_inputs(&sources);
         let body_md_raw = self
             .llm
-            .summarize_memories(&llm_input)
+            .summarize_memories_grounded(grounded_owner.as_deref(), &llm_input)
             .map_err(|e| PersonaError::Llm(e.to_string()))?;
         let body_md = render_body_with_footnotes(&body_md_raw, &sources);
 
@@ -371,6 +370,13 @@ impl<'a> PersonaGenerator<'a> {
                 (field_names::GENERATED_AT): now,
             }
         });
+        // #8443 — the persona inherits the folded principal of its sources.
+        crate::role_grounding::stamp_folded(
+            &mut metadata,
+            sources
+                .iter()
+                .map(|m| crate::role_grounding::content_principal(&m.metadata)),
+        );
 
         let mut persona_mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory

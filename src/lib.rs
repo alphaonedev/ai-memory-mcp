@@ -1004,6 +1004,7 @@ pub mod reranker;
 // cost-of-access gradient). `Tier::default_ttl_secs` routes through it.
 pub mod retention;
 pub mod revisions;
+pub mod role_grounding;
 pub mod secret_screen;
 // v1.0.0 #1961 (R23/R7) — the `asi-hard` hardened, no-disable security posture.
 pub mod security_profile;

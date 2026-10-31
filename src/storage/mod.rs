@@ -10734,6 +10734,9 @@ pub fn consolidate_with_expected_versions(
         // `consolidated_from_agents` for forensic attribution.
         // The consolidator's own agent_id becomes `agent_id` on the result.
         let mut source_agent_ids: Vec<String> = Vec::new();
+        // #8443 — each source's `content_principal` (None = absent), folded
+        // into the result's principal after the read loop.
+        let mut source_principals: Vec<Option<String>> = Vec::new();
         // v0.9.0 G13-mem (#1859) — per-source identity captured for the
         // disposition + CONSOLIDATE-leaf pass below: (id, cid, version,
         // namespace). Populated in this same read so the derived_from
@@ -10781,8 +10784,17 @@ pub fn consolidate_with_expected_versions(
                     // Merge metadata: later values overwrite earlier ones on key conflict.
                     // Intentionally SKIP `agent_id` to avoid last-write-wins forgery;
                     // the consolidator's id is authoritative on the result.
+                    // #8443 — the content principal is FOLDED over every source
+                    // below, never last-write-wins: a merge must not turn a
+                    // foreign source's content into owner content.
+                    source_principals.push(
+                        crate::role_grounding::content_principal(&mem.metadata).map(str::to_string),
+                    );
                     if let serde_json::Value::Object(map) = mem.metadata {
                         for (k, v) in map {
+                            if k == crate::role_grounding::META_CONTENT_PRINCIPAL {
+                                continue;
+                            }
                             if k == "agent_id" {
                                 if let serde_json::Value::String(aid) = &v
                                     && !source_agent_ids.contains(aid)
@@ -10837,6 +10849,17 @@ pub fn consolidate_with_expected_versions(
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
+        // #8443 — whose content the merged row is: owner when every source is
+        // owner content (no key), the one publisher when all foreign sources
+        // share it, otherwise `mixed`.
+        if let Some(folded) =
+            crate::role_grounding::fold_principals(source_principals.iter().map(Option::as_deref))
+        {
+            merged_metadata.insert(
+                crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
+                serde_json::Value::String(folded),
+            );
+        }
         // #3014/#3018 — stamp `attest_level="claimed"` on the tenant
         // permissive path so the consolidated row is a truthful `claimed`
         // write (global-strict already refused above; substrate/curator

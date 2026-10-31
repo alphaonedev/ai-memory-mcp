@@ -103,19 +103,21 @@ pub(super) fn handle_consolidate(
     let summary: String = if let Some(s) = params["summary"].as_str() {
         s.to_string()
     } else if let Some(llm_client) = llm {
-        let memory_pairs: Vec<(String, String)> = sources
-            .iter()
-            .map(|mem| (mem.title.clone(), mem.content.clone()))
-            .collect();
-        llm_client.summarize_memories(&memory_pairs).map_err(|e| {
-            format!(
-                "LLM summarization failed: {}",
-                crate::mcp::error_text::mcp_foreign_err(
-                    "LLM summarization failed",
-                    crate::mcp::error_text::llm(e),
+        // #8443 — ground the roles: the owner is the resolved caller (never
+        // content); each foreign source is labelled with its principal.
+        let (store_owner, memory_pairs) = crate::role_grounding::summary_inputs(&sources);
+        let owner = caller.map(str::to_string).or(store_owner);
+        llm_client
+            .summarize_memories_grounded(owner.as_deref(), &memory_pairs)
+            .map_err(|e| {
+                format!(
+                    "LLM summarization failed: {}",
+                    crate::mcp::error_text::mcp_foreign_err(
+                        "LLM summarization failed",
+                        crate::mcp::error_text::llm(e),
+                    )
                 )
-            )
-        })?
+            })?
     } else {
         return Err(
             "summary is required (or use smart/autonomous tier for auto-summarization)".into(),

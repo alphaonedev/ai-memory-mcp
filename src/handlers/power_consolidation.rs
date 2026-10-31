@@ -88,6 +88,7 @@ fn default_ns() -> String {
 /// `maybe_auto_tag`.
 async fn resolve_consolidate_summary(
     app: &AppState,
+    owner: Option<String>,
     pairs: Vec<(String, String)>,
 ) -> Result<String, Response> {
     // v1.0.0 #3380 — the `(title, content)` pairs are supplied by the CALLER of
@@ -122,7 +123,8 @@ async fn resolve_consolidate_summary(
         let Some(llm) = llm_arc.as_ref() else {
             return Ok::<String, anyhow::Error>(String::new());
         };
-        llm.summarize_memories_async(&pairs).await
+        llm.summarize_memories_grounded_async(owner.as_deref(), &pairs)
+            .await
     })
     .await;
 
@@ -451,11 +453,10 @@ pub async fn consolidate_memories(
     let summary = match body.summary.clone() {
         Some(s) if !s.is_empty() => s,
         _ => {
-            let pairs: Vec<(String, String)> = consolidate_sources
-                .iter()
-                .map(|m| (m.title.clone(), m.content.clone()))
-                .collect();
-            match resolve_consolidate_summary(&app, pairs).await {
+            // #8443 - owner is the authenticated caller; foreign rows labelled.
+            let (_, pairs) = crate::role_grounding::summary_inputs(&consolidate_sources);
+            let owner = Some(consolidate_caller_principal.clone());
+            match resolve_consolidate_summary(&app, owner, pairs).await {
                 Ok(s) => s,
                 Err(resp) => return resp,
             }

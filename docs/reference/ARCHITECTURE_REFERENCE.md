@@ -731,6 +731,15 @@ trust-all reads.
 
 - `imported_from_agent_id` — original claim preserved when `ai-memory import`
   restamps agent_id with caller's id (absent when `--trust-source` is passed)
+- `content_principal` — whose content the row is, as opposed to who wrote it
+  (#8443, arXiv 2610.38209, role grounding). The publisher agent id, or `unknown`,
+  stamped on content that did not come from the owner's own turn (`memory_share`
+  copies, `memory_notify` deliveries, untrusted `import`, mined transcripts);
+  `mixed` after a consolidation folds foreign and owner sources. Owner-direct rows
+  carry no key, and a missing key reads as owner only for rows written before this
+  change. Insert-if-absent, so a share chain keeps the first publisher. Summaries,
+  personas and reflections never fold a non-owner preference into an "owner
+  prefers" statement, and recall returns the key verbatim.
 - `consolidated_from_agents` — array of source authors, preserved on
   `memory_consolidate` (the consolidator's id becomes `agent_id`)
 - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by

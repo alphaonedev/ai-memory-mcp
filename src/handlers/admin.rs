@@ -1386,6 +1386,8 @@ pub async fn import_memories(
                     serde_json::Value::String(orig.clone()),
                 );
             }
+            // #8443 (arXiv 2610.38209) - never keep a claimed content_principal.
+            crate::role_grounding::restamp_untrusted_import(obj, original.as_deref(), &caller);
         }
         original
     };

@@ -347,11 +347,11 @@ impl<'a> ConsolidationPass<'a> {
             anyhow::bail!("summarize called on empty cluster");
         }
 
-        let input: Vec<(String, String)> = cluster
-            .iter()
-            .map(|m| (m.title.clone(), m.content.clone()))
-            .collect();
-        let summary_text = self.llm.summarize_memories(&input)?;
+        // #8443 — ground the roles: owner from the store, sources labelled.
+        let (owner, input) = crate::role_grounding::summary_inputs(cluster);
+        let summary_text = self
+            .llm
+            .summarize_memories_grounded(owner.as_deref(), &input)?;
         crate::validate::validate_content(&summary_text)?;
 
         let base_title = cluster
@@ -388,7 +388,17 @@ impl<'a> ConsolidationPass<'a> {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({}),
+            metadata: {
+                // #8443 — the proposal carries the folded content principal.
+                let mut metadata = serde_json::json!({});
+                crate::role_grounding::stamp_folded(
+                    &mut metadata,
+                    cluster
+                        .iter()
+                        .map(|m| crate::role_grounding::content_principal(&m.metadata)),
+                );
+                metadata
+            },
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,

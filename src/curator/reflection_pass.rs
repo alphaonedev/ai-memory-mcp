@@ -423,13 +423,11 @@ impl<'a> ReflectionPass<'a> {
             );
         }
 
-        let input: Vec<(String, String)> = cluster
-            .iter()
-            .map(|m| (m.title.clone(), m.content.clone()))
-            .collect();
+        // #8443 — ground the roles: owner from the store, sources labelled.
+        let (owner, input) = crate::role_grounding::summary_inputs(cluster);
         let summary_text = self
             .llm
-            .summarize_memories(&input)
+            .summarize_memories_grounded(owner.as_deref(), &input)
             .context("ReflectionPass::summarize: LLM call failed")?;
 
         let base_title = cluster
@@ -478,9 +476,19 @@ impl<'a> ReflectionPass<'a> {
             // operator-visible under enforcement. The owner stays the
             // curator for attribution (the substrate `reflect` path stamps
             // `metadata.agent_id` from `ReflectInput::agent_id`).
-            metadata: serde_json::json!({
-                "scope": crate::models::MemoryScope::Collective.as_str(),
-            }),
+            metadata: {
+                let mut metadata = serde_json::json!({
+                    "scope": crate::models::MemoryScope::Collective.as_str(),
+                });
+                // #8443 — a reflection over foreign sources is not owner content.
+                crate::role_grounding::stamp_folded(
+                    &mut metadata,
+                    cluster
+                        .iter()
+                        .map(|m| crate::role_grounding::content_principal(&m.metadata)),
+                );
+                metadata
+            },
             reflection_depth: 0,
             memory_kind: MemoryKind::Reflection,
             entity_id: None,

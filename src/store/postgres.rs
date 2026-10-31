@@ -28088,6 +28088,8 @@ impl MemoryStore for PostgresStore {
         let mut total_access: i64 = 0;
         let mut merged_metadata = serde_json::Map::new();
         let mut source_agent_ids: Vec<String> = Vec::new();
+        // #8443 — each source's `content_principal` (None = absent).
+        let mut source_principals: Vec<Option<String>> = Vec::new();
         // v0.9.0 G13-mem (#1859) — per-source content-ids captured for the
         // `metadata.derived_from_cids` record + the tombstone-path edge
         // stamps below.
@@ -28147,8 +28149,14 @@ impl MemoryStore for PostgresStore {
             let metadata: serde_json::Value =
                 row.try_get("metadata").unwrap_or(serde_json::json!({}));
             source_trust_tiers.push(crate::trust::TrustTier::of_metadata(&metadata));
+            // #8443 — fold the content principal over every source (sqlite twin).
+            source_principals
+                .push(crate::role_grounding::content_principal(&metadata).map(str::to_string));
             if let serde_json::Value::Object(map) = metadata {
                 for (k, v) in map {
+                    if k == crate::role_grounding::META_CONTENT_PRINCIPAL {
+                        continue;
+                    }
                     if k == "agent_id" {
                         if let serde_json::Value::String(aid) = &v
                             && !source_agent_ids.contains(aid)
@@ -28179,6 +28187,15 @@ impl MemoryStore for PostgresStore {
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
+        // #8443 — folded content principal (sqlite `storage::consolidate` twin).
+        if let Some(folded) =
+            crate::role_grounding::fold_principals(source_principals.iter().map(Option::as_deref))
+        {
+            merged_metadata.insert(
+                crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
+                serde_json::Value::String(folded),
+            );
+        }
         // #3014/#3018 — stamp `attest_level="claimed"` on the tenant permissive
         // path so the consolidated row is a truthful `claimed` write
         // (global-strict already refused above; substrate/curator exempt),

@@ -575,9 +575,15 @@ impl Atomiser {
         // passes `config.curator_max_retries` (3 by default), the
         // Synchronous `pre_store` path passes
         // `config.sync_curator_max_retries` (1 by default).
+        // #8443 (arXiv 2610.38209) - the owner named to the curator is the
+        // stored row's agent_id (store-resolved, never read from content).
+        let grounded_owner = source
+            .metadata
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str);
         let atoms = self
             .curator
-            .decompose(&source.content, budget, max_retries)
+            .decompose_grounded(grounded_owner, &source.content, budget, max_retries)
             .map_err(|e| match e {
                 curator::CuratorError::LlmUnavailable(d)
                 | curator::CuratorError::MalformedResponse(d) => AtomiseError::CuratorFailed(d),

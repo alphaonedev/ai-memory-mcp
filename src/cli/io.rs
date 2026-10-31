@@ -709,6 +709,15 @@ pub(crate) fn import_from_str(
                     restamped += 1;
                 }
 
+                // #8443 (arXiv 2610.38209) - an untrusted import never keeps
+                // a claimed `content_principal` (it could claim "owner"); the
+                // row is the exporter's content unless it is the caller's own.
+                crate::role_grounding::restamp_untrusted_import(
+                    obj,
+                    original.as_deref(),
+                    caller_id.as_str(),
+                );
+
                 // #2264 — the v1 wire form is unauthenticated under the
                 // default posture. Never let an imported `_agents` row seed
                 // the destination's enrolled-key lookup, and never preserve
@@ -1295,6 +1304,13 @@ pub fn mine(
                 serde_json::Value::String(format.source_tag().to_string()),
             );
         }
+        // #8443 (arXiv 2610.38209) - a mined transcript carries role labels
+        // ("user:", "assistant:") the miner did not author; the speaker is
+        // not provably the owner, so the row is stamped unknown (fail-visible).
+        crate::role_grounding::stamp_content_principal(
+            &mut metadata,
+            crate::role_grounding::PRINCIPAL_UNKNOWN,
+        );
         let mem = models::Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
             valid_from: None,

@@ -141,6 +141,23 @@ pub trait AutonomyLlm {
     /// Produce a consolidated summary of N memories.
     fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String>;
 
+    /// #8443 — summarise with the role-grounding block rendered for `owner`
+    /// (the principal of the store, never taken from content). Callers pass
+    /// sources already labelled by [`crate::role_grounding::summary_inputs`].
+    /// The default delegates to [`Self::summarize_memories`] so the stub
+    /// impls compile unchanged (the labelled sources still reach the model);
+    /// the real [`OllamaClient`] overrides it to render the pinned block.
+    ///
+    /// # Errors
+    /// Propagates the underlying LLM client error.
+    fn summarize_memories_grounded(
+        &self,
+        _owner: Option<&str>,
+        memories: &[(String, String)],
+    ) -> Result<String> {
+        self.summarize_memories(memories)
+    }
+
     /// #1393 — classify a recovered transcript turn into a refined
     /// [`crate::models::MemoryKind`] (the "decision-detector": is this
     /// observation actually a Decision / Claim / Event …?). Returns `None`
@@ -172,6 +189,13 @@ impl AutonomyLlm for OllamaClient {
     }
     fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String> {
         Self::summarize_memories(self, memories)
+    }
+    fn summarize_memories_grounded(
+        &self,
+        owner: Option<&str>,
+        memories: &[(String, String)],
+    ) -> Result<String> {
+        Self::summarize_memories_grounded(self, owner, memories)
     }
     fn classify_kind(
         &self,
@@ -649,11 +673,9 @@ fn consolidate_cluster(
         return Ok(None);
     }
 
-    let input: Vec<(String, String)> = cluster
-        .iter()
-        .map(|m| (m.title.clone(), m.content.clone()))
-        .collect();
-    let summary = llm.summarize_memories(&input)?;
+    // #8443 — ground the roles: owner from the store, sources labelled.
+    let (owner, input) = crate::role_grounding::summary_inputs(cluster);
+    let summary = llm.summarize_memories_grounded(owner.as_deref(), &input)?;
     crate::validate::validate_content(&summary)?;
     // Prefix the consolidated title so it never collides with one of
     // the source memories' (title, namespace) UNIQUE key. Source

@@ -160,6 +160,11 @@ pub fn handle_share(
         }
     }
 
+    // #8443 (arXiv 2610.38209) - the copy is authored by the receiver for
+    // write-auth, but whose-content it is stays the publisher's. Insert-if-
+    // absent so a share chain keeps the first publisher.
+    crate::role_grounding::stamp_content_principal(&mut metadata, &from_agent_id);
+
     let shared_id = uuid::Uuid::new_v4().to_string();
     let shared = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory

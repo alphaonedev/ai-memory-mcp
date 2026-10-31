@@ -77,9 +77,24 @@ authoritative; trust it.";
 /// ```
 #[must_use]
 pub fn build_shared_prefix(pipeline_variant: &str, system_prompt: &str) -> String {
+    build_shared_prefix_for(pipeline_variant, system_prompt, None)
+}
+
+/// #8443 (arXiv 2610.38209) - [`build_shared_prefix`] with the role-grounding
+/// block rendered for `owner` (the store-resolved principal; `None` renders
+/// the unidentified-owner form). Stable across the stages of one run, so the
+/// cache key stays stable.
+#[must_use]
+pub fn build_shared_prefix_for(
+    pipeline_variant: &str,
+    system_prompt: &str,
+    owner: Option<&str>,
+) -> String {
+    let grounding = crate::role_grounding::render_role_grounding(owner);
     format!(
         "[SYSTEM] You are an ingest assistant for the v0.7.0 multi-step ingest \
          substrate (variant={pipeline_variant}). {system_prompt}\n\
+         [ROLE GROUNDING] {grounding}\n\
          [TRUST INSTRUCTION] {EXPLICIT_TRUST_INSTRUCTION}\n"
     )
 }

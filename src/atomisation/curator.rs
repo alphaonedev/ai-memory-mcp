@@ -131,6 +131,22 @@ pub trait Curator: Send + Sync {
         max_atom_tokens: u32,
         max_retries: u32,
     ) -> Result<Vec<Atom>, CuratorError>;
+
+    /// #8443 (arXiv 2610.38209) - decompose with the memory owner named in
+    /// the role-grounding block of the prompt. `owner` is the principal the
+    /// store resolved (never read from `body`); `None` renders the
+    /// unidentified-owner form. The default delegates to [`Self::decompose`]
+    /// so test doubles stay valid; the LLM-backed curator overrides it.
+    fn decompose_grounded(
+        &self,
+        owner: Option<&str>,
+        body: &str,
+        max_atom_tokens: u32,
+        max_retries: u32,
+    ) -> Result<Vec<Atom>, CuratorError> {
+        let _ = owner;
+        self.decompose(body, max_atom_tokens, max_retries)
+    }
 }
 
 /// Verbatim system prompt sent to the LLM. The `{max_atom_tokens}`
@@ -140,7 +156,7 @@ pub trait Curator: Send + Sync {
 ///
 /// Lifted from the WT-1-B brief without modification so a future
 /// audit can grep this constant in source against the spec doc.
-pub const CURATOR_SYSTEM_PROMPT: &str =
+pub const CURATOR_SYSTEM_PROMPT: &str = concat!(
     "You are decomposing a long memory into atomic propositions.
 Each atom must:
 (1) Be self-contained — readable without the original context
@@ -149,12 +165,24 @@ Each atom must:
 (4) Preserve original meaning — no editorial additions
 Return JSON: { atoms: [{ text: string }] } with 2 to 10 atoms.
 If the input cannot be decomposed (already atomic, all-or-nothing),
-return { atoms: [] }.";
+return { atoms: [] }.
+
+",
+    crate::role_grounding_placeholder!(),
+);
 
 /// Render the system prompt with the supplied token budget substituted.
 #[must_use]
 pub fn render_system_prompt(max_atom_tokens: u32) -> String {
-    CURATOR_SYSTEM_PROMPT.replace("{max_atom_tokens}", &max_atom_tokens.to_string())
+    render_system_prompt_for(None, max_atom_tokens)
+}
+
+/// Render the system prompt with the token budget and the #8443
+/// role-grounding block (owner substituted) filled in.
+#[must_use]
+pub fn render_system_prompt_for(owner: Option<&str>, max_atom_tokens: u32) -> String {
+    crate::role_grounding::fill_role_grounding(CURATOR_SYSTEM_PROMPT, owner)
+        .replace("{max_atom_tokens}", &max_atom_tokens.to_string())
 }
 
 /// Try to parse one candidate response body into a [`CuratorResponse`].
@@ -461,7 +489,17 @@ impl<L: LlmGenerate + Send + Sync> Curator for LlmCurator<L> {
         max_atom_tokens: u32,
         max_retries: u32,
     ) -> Result<Vec<Atom>, CuratorError> {
-        let system = render_system_prompt(max_atom_tokens);
+        self.decompose_grounded(None, body, max_atom_tokens, max_retries)
+    }
+
+    fn decompose_grounded(
+        &self,
+        owner: Option<&str>,
+        body: &str,
+        max_atom_tokens: u32,
+        max_retries: u32,
+    ) -> Result<Vec<Atom>, CuratorError> {
+        let system = render_system_prompt_for(owner, max_atom_tokens);
         // #1866 (§11.5 B7-FC-2) — offer the `emit_atoms` tool so a
         // tool-capable model returns a schema-constrained structured
         // call. Tool-unsupporting backends (and the default `LlmGenerate`

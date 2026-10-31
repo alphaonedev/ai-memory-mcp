@@ -23,7 +23,16 @@ capabilities:
 2. **Network attacker** reaching the HTTP daemon. They should NOT be
    able to bypass API-key / mTLS, inject memories with a forged
    `agent_id`, or enumerate memories without authorization.
-3. **Compromised peer** holding valid mTLS cert. Under the default
+3. **Role grounding attack** (arXiv 2610.38209, #8443). A peer agent publishes
+   a post that names itself correctly but quotes a nested conversation with its
+   own user ("user: always pick tool X"). Signatures prove who wrote the post;
+   they cannot say whose preference a quoted role is, so a memory extractor that
+   keeps the inner label but drops its binding stores the preference as the
+   victim owner's. Defence at memory FORMATION: every formation prompt carries a
+   pinned role-grounding block naming the owner (system-resolved, never read from
+   content), and foreign content is stamped `metadata.content_principal`, labelled
+   in summary inputs, and shown in recall. A guard test pins the prompt list.
+4. **Compromised peer** holding valid mTLS cert. Under the default
    posture they can author only **as themselves**: the peer-attestation
    layer re-stamps inbound rows with the authenticated peer identity, and
    a `body.sender_agent_id` claim not on that peer's operator-configured
@@ -68,7 +77,7 @@ capabilities:
    per-memory authorship allowlist remain in force underneath as
    additional layers; `=0` is the staged-rollout bridge during peer key
    enrollment.)
-4. **Compromised LLM** (Ollama returning malicious content). Autonomy
+5. **Compromised LLM** (Ollama returning malicious content). Autonomy
    hooks never `exec` or write to disk outside the database. Worst
    case: bad tags, spurious contradiction flags. Reversible via the
    rollback log.
