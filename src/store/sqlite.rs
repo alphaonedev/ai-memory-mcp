@@ -4216,6 +4216,76 @@ impl MemoryStore for SqliteStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        self.notify_stamped(
+            ctx,
+            target_agent,
+            title,
+            payload,
+            priority,
+            tier,
+            why_trace,
+            None,
+        )
+        .await
+    }
+
+    async fn a2a_task_insert(
+        &self,
+        task: &crate::storage::a2a_tasks::A2aTaskRow,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_insert(&conn, task).map_err(box_err)
+    }
+
+    async fn a2a_task_get(
+        &self,
+        agent_id: &str,
+        id: &str,
+    ) -> StoreResult<Option<crate::storage::a2a_tasks::A2aTaskRow>> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_get(&conn, agent_id, id).map_err(box_err)
+    }
+
+    async fn a2a_task_list(
+        &self,
+        agent_id: &str,
+        filter: &crate::storage::a2a_tasks::A2aTaskFilter,
+    ) -> StoreResult<crate::storage::a2a_tasks::A2aTaskPage> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_list(&conn, agent_id, filter).map_err(box_err)
+    }
+
+    async fn a2a_task_transition(
+        &self,
+        agent_id: &str,
+        id: &str,
+        from_states: &[&str],
+        to_state: &str,
+        update: &crate::storage::a2a_tasks::A2aTaskUpdate,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_transition(
+            &conn,
+            agent_id,
+            id,
+            from_states,
+            to_state,
+            update,
+        )
+        .map_err(box_err)
+    }
+
+    async fn notify_stamped(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+        why_trace: Option<&str>,
+        system_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> StoreResult<String> {
         // #4338 — refuse an invalid recipient before any quota charge, write
         // or wake; the shared validator never echoes the value.
         crate::validate::validate_notify_target(target_agent).map_err(|e| {
@@ -4244,6 +4314,13 @@ impl MemoryStore for SqliteStore {
         // rationale here; see the trait docs).
         if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
+        // #8444 - system-stamped provenance lands at memory formation, never
+        // via a post-hoc patch. Stamps overwrite any same-named key.
+        if let Some(stamp) = system_metadata {
+            for (k, v) in stamp {
+                metadata[k.as_str()] = v.clone();
+            }
         }
         let mem = Memory {
             id: row_id,

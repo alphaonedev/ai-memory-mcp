@@ -1,0 +1,966 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #8444 - the Google Agent2Agent (A2A 1.0) standard binding, pure protocol
+//! layer: JSON-RPC 2.0 envelope, the A2A error table, request parsing, the
+//! Agent Card builder and the Task wire shape. No I/O, no auth, no storage -
+//! those live in `handlers::a2a`.
+//!
+//! The wire types and error codes come from the official Linux Foundation
+//! `a2a-lf` crate (operator-approved Option B), re-exported ONCE through
+//! [`wire`]. Dispatch, authentication, the error-to-HTTP-status mapping and
+//! storage stay first-party. No server or client trait of that project is
+//! used.
+//!
+//! # What this binding serves (shape S1, posture P1)
+//!
+//! * `GET /.well-known/agent-card.json` - the Agent Card, behind the existing
+//!   `api_key_auth` (an unauthenticated GET is `401`).
+//! * `POST /api/v1/a2a` - ONE JSON-RPC 2.0 endpoint: `SendMessage` (answered
+//!   synchronously: the call returns the COMPLETED task), `GetTask`,
+//!   `ListTasks`, `CancelTask`.
+//! * Declared unsupported, with the spec's typed errors: streaming and
+//!   subscribe (`-32004`), extended card (`-32004`), the four push
+//!   notification config methods (`-32003`).
+//!
+//! # Transport and versioning rules
+//!
+//! * S1 exposes the JSON-RPC binding ONLY. The `A2A-Version` rule
+//!   ([`check_version`]) is enforced on that binding; if a REST binding is ever
+//!   added it must call the same check so the gap cannot reappear.
+//! * A request whose body is not JSON (`-32700`) or is not a JSON-RPC request
+//!   object (`-32600`) is answered with HTTP `200` and a JSON-RPC error
+//!   envelope, as JSON-RPC 2.0 over HTTP requires; every other error uses the
+//!   status of [`http_status_for`].
+//! * `ListTasks` `pageSize` is capped at [`MAX_PAGE_SIZE`] regardless of the
+//!   caller's value; the response reports the effective size.
+
+use std::collections::HashMap;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
+use serde_json::{Map, Value};
+
+use crate::storage::a2a_tasks::A2aTaskRow;
+
+/// The ONE place the `a2a-lf` crate is named. Inside this crate `crate::a2a`
+/// is this module, so the extern crate is always reached as `::a2a`.
+pub mod wire {
+    pub use ::a2a::{
+        A2AError, AgentCapabilities, AgentCard, AgentInterface, AgentSkill, ApiKeySecurityScheme,
+        Artifact, CancelTaskRequest, GetTaskRequest, JsonRpcError, JsonRpcId, JsonRpcResponse,
+        ListTasksRequest, ListTasksResponse, Message, Part, PartContent, Role, SecurityRequirement,
+        SecurityScheme, SendMessageRequest, SendMessageResponse, TRANSPORT_PROTOCOL_JSONRPC, Task,
+        TaskState, TaskStatus, VERSION, error_code, methods,
+    };
+}
+
+use wire::{
+    A2AError, AgentCapabilities, AgentCard, AgentInterface, AgentSkill, ApiKeySecurityScheme,
+    Artifact, JsonRpcId, JsonRpcResponse, Message, Part, PartContent, Role, SecurityScheme,
+    SendMessageRequest, Task, TaskState, TaskStatus, error_code, methods,
+};
+
+/// The protocol version this binding speaks (`Major.Minor`).
+pub const A2A_PROTOCOL_VERSION: &str = wire::VERSION;
+/// Request and response header carrying the protocol version.
+pub const HEADER_A2A_VERSION: &str = "A2A-Version";
+/// JSON-RPC endpoint path.
+pub const A2A_RPC_PATH: &str = "/api/v1/a2a";
+/// Agent Card well-known path.
+pub const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+/// Inbox subject every inbound A2A message is stored under. The role and the
+/// sender are NEVER part of the subject (both are remote-influenced).
+pub const A2A_INBOX_SUBJECT: &str = "A2A SendMessage";
+/// Required `jsonrpc` member value.
+pub const JSONRPC_VERSION: &str = "2.0";
+
+/// System metadata key: the AUTHENTICATED agent id the inbound content is
+/// attributed to. Key name and value conventions are defined by #8443 (role
+/// grounding); stamped directly here until that module lands on the chain.
+pub const META_CONTENT_PRINCIPAL: &str = "content_principal"; // key defined by #8443
+/// System metadata key: the remote-chosen role string, an UNTRUSTED label.
+pub const META_A2A_ROLE: &str = "a2a_role";
+
+/// Longest accepted `messageId` / `contextId` / `taskId` / role string.
+pub const MAX_ID_LEN: usize = 128;
+/// Message of the `-32603` internal error; never carries substrate text.
+const INTERNAL_ERROR_MESSAGE: &str = "internal error";
+/// `ListTasks` default page size (spec: 1..=100, default 50).
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+/// Handler-side cap on `pageSize`: a larger request is clamped to this value
+/// (never rejected, never honoured), so one call cannot read an unbounded page.
+pub const MAX_PAGE_SIZE: usize = 100;
+
+/// Stored task states (the `TASK_STATE_*` wire strings; the storage layer
+/// keeps them as text, a unit test ties each to the crate's `TaskState`).
+pub mod state {
+    /// Accepted, not yet processing.
+    pub const SUBMITTED: &str = "TASK_STATE_SUBMITTED";
+    /// Being processed.
+    pub const WORKING: &str = "TASK_STATE_WORKING";
+    /// Finished successfully (terminal).
+    pub const COMPLETED: &str = "TASK_STATE_COMPLETED";
+    /// Finished with an error (terminal).
+    pub const FAILED: &str = "TASK_STATE_FAILED";
+    /// Canceled by the caller (terminal).
+    pub const CANCELED: &str = "TASK_STATE_CANCELED";
+    /// The states a task can still leave.
+    pub const NON_TERMINAL: [&str; 2] = [SUBMITTED, WORKING];
+
+    /// Whether `s` is terminal. An unreadable state counts as terminal
+    /// (fail closed: it can no longer be changed).
+    #[must_use]
+    pub fn is_terminal(s: &str) -> bool {
+        serde_json::from_value::<super::wire::TaskState>(serde_json::Value::String(s.to_string()))
+            .map_or(true, |t| t.is_terminal())
+    }
+}
+
+/// One A2A / JSON-RPC error: the spec code, the HTTP status this binding
+/// answers with, and the message. The wire object is produced by the crate's
+/// `A2AError::to_jsonrpc_error` (code, message, `google.rpc.ErrorInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct A2aError {
+    /// JSON-RPC error code.
+    pub code: i32,
+    /// HTTP status the binding answers with (first-party mapping).
+    pub http_status: u16,
+    /// Human-readable message (never echoes request content).
+    pub message: String,
+}
+
+/// First-party error-code to HTTP-status table. The crate's own mapping
+/// answers `501` for an unknown method; this binding answers `404`.
+#[must_use]
+pub fn http_status_for(code: i32) -> u16 {
+    match code {
+        // JSON-RPC over HTTP: a request that never became a valid call is
+        // still a delivered HTTP exchange (conformance 272).
+        error_code::PARSE_ERROR | error_code::INVALID_REQUEST => 200,
+        error_code::TASK_NOT_FOUND | error_code::METHOD_NOT_FOUND => 404,
+        error_code::INTERNAL_ERROR | error_code::INVALID_AGENT_RESPONSE => 500,
+        _ => 400,
+    }
+}
+
+impl A2aError {
+    fn new(code: i32, message: &str) -> Self {
+        Self {
+            code,
+            http_status: http_status_for(code),
+            message: message.to_string(),
+        }
+    }
+
+    /// `-32700` malformed JSON.
+    #[must_use]
+    pub fn parse_error() -> Self {
+        Self::new(error_code::PARSE_ERROR, "invalid JSON payload")
+    }
+    /// `-32600` not a valid JSON-RPC request object.
+    #[must_use]
+    pub fn invalid_request(message: &str) -> Self {
+        Self::new(error_code::INVALID_REQUEST, message)
+    }
+    /// `-32601` unknown method.
+    #[must_use]
+    pub fn method_not_found() -> Self {
+        Self::new(error_code::METHOD_NOT_FOUND, "method not found")
+    }
+    /// `-32602` invalid params.
+    #[must_use]
+    pub fn invalid_params(message: &str) -> Self {
+        Self::new(error_code::INVALID_PARAMS, message)
+    }
+    /// `-32603` internal error (HTTP 500).
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::new(error_code::INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE)
+    }
+    /// `-32001` TaskNotFound: unknown id AND another caller's id (HTTP 404).
+    #[must_use]
+    pub fn task_not_found() -> Self {
+        Self::new(error_code::TASK_NOT_FOUND, "task not found")
+    }
+    /// `-32002` TaskNotCancelable: the task is already terminal.
+    #[must_use]
+    pub fn task_not_cancelable() -> Self {
+        Self::new(
+            error_code::TASK_NOT_CANCELABLE,
+            "task is in a terminal state and cannot be canceled",
+        )
+    }
+    /// `-32003` PushNotificationNotSupported.
+    #[must_use]
+    pub fn push_not_supported() -> Self {
+        Self::new(
+            error_code::PUSH_NOTIFICATION_NOT_SUPPORTED,
+            "push notifications are not supported",
+        )
+    }
+    /// `-32004` UnsupportedOperation.
+    #[must_use]
+    pub fn unsupported_operation() -> Self {
+        Self::new(
+            error_code::UNSUPPORTED_OPERATION,
+            "this operation is not supported",
+        )
+    }
+    /// `-32005` ContentTypeNotSupported (a file part).
+    #[must_use]
+    pub fn content_type_not_supported() -> Self {
+        Self::new(
+            error_code::CONTENT_TYPE_NOT_SUPPORTED,
+            "file parts are not supported; send text or data parts",
+        )
+    }
+    /// `-32009` VersionNotSupported.
+    #[must_use]
+    pub fn version_not_supported() -> Self {
+        Self::new(
+            error_code::VERSION_NOT_SUPPORTED,
+            "unsupported A2A-Version; this server speaks 1.0",
+        )
+    }
+
+    /// The `error` member of the JSON-RPC envelope, with the
+    /// `google.rpc.ErrorInfo` detail the spec asks for.
+    #[must_use]
+    pub fn to_error_object(&self) -> wire::JsonRpcError {
+        A2AError::new(self.code, self.message.clone()).to_jsonrpc_error()
+    }
+}
+
+/// Serialise a wire value; a serialisation failure is an internal error.
+///
+/// # Errors
+///
+/// `-32603` when the value cannot be serialised.
+pub fn to_value<T: Serialize>(v: &T) -> Result<Value, A2aError> {
+    serde_json::to_value(v).map_err(|e| {
+        tracing::warn!(target: "a2a", "a2a serialisation failure: {e}");
+        A2aError::internal()
+    })
+}
+
+/// `{jsonrpc, id, error}` envelope.
+#[must_use]
+pub fn error_envelope(id: &JsonRpcId, err: &A2aError) -> Value {
+    let resp = JsonRpcResponse::error(id.clone(), err.to_error_object());
+    serde_json::to_value(resp).unwrap_or(Value::Null)
+}
+
+/// `{jsonrpc, id, result}` envelope.
+#[must_use]
+pub fn result_envelope(id: &JsonRpcId, result: Value) -> Value {
+    serde_json::to_value(JsonRpcResponse::success(id.clone(), result)).unwrap_or(Value::Null)
+}
+
+/// A parsed JSON-RPC request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RpcRequest {
+    /// Echoed request id (string, integer or null).
+    pub id: JsonRpcId,
+    /// Method name.
+    pub method: String,
+    /// `params` (an empty object when absent).
+    pub params: Value,
+}
+
+/// Parse a JSON-RPC 2.0 request body.
+///
+/// # Errors
+///
+/// `-32700` for malformed JSON and `-32600` for a body that is not a valid
+/// request object. The echoed id is `null` whenever it cannot be trusted.
+pub fn parse_rpc(body: &[u8]) -> Result<RpcRequest, (JsonRpcId, A2aError)> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| (JsonRpcId::Null, A2aError::parse_error()))?;
+    let Some(obj) = value.as_object() else {
+        return Err((
+            JsonRpcId::Null,
+            A2aError::invalid_request("request must be a JSON object"),
+        ));
+    };
+    let id = match obj.get("id") {
+        None | Some(Value::Null) => JsonRpcId::Null,
+        Some(Value::String(s)) => JsonRpcId::String(s.clone()),
+        Some(Value::Number(n)) if n.as_i64().is_some() => {
+            JsonRpcId::Number(n.as_i64().unwrap_or_default())
+        }
+        Some(_) => {
+            return Err((
+                JsonRpcId::Null,
+                A2aError::invalid_request("id must be a string, an integer or null"),
+            ));
+        }
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
+        return Err((id, A2aError::invalid_request("jsonrpc must be \"2.0\"")));
+    }
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        return Err((id, A2aError::invalid_request("method is required")));
+    };
+    let params = match obj.get("params") {
+        None | Some(Value::Null) => Value::Object(Map::new()),
+        Some(v @ Value::Object(_)) => v.clone(),
+        Some(_) => {
+            return Err((id, A2aError::invalid_params("params must be an object")));
+        }
+    };
+    Ok(RpcRequest {
+        id,
+        method: method.to_string(),
+        params,
+    })
+}
+
+/// Check the `A2A-Version` request header: absent or `1.0` is accepted. An
+/// empty value is read as `0.3` by the spec and any other value is not
+/// served.
+///
+/// # Errors
+///
+/// `-32009` for any version other than `1.0`.
+pub fn check_version(header: Option<&str>) -> Result<(), A2aError> {
+    match header.map(str::trim) {
+        None | Some(A2A_PROTOCOL_VERSION) => Ok(()),
+        Some(_) => Err(A2aError::version_not_supported()),
+    }
+}
+
+/// The served methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// `SendMessage`.
+    SendMessage,
+    /// `GetTask`.
+    GetTask,
+    /// `ListTasks`.
+    ListTasks,
+    /// `CancelTask`.
+    CancelTask,
+}
+
+/// Map a method name to a served method, or the typed refusal.
+///
+/// # Errors
+///
+/// `-32004` for streaming / subscribe / extended card, `-32003` for the push
+/// notification config methods, `-32601` for anything else.
+pub fn classify_method(name: &str) -> Result<Method, A2aError> {
+    match name {
+        methods::SEND_MESSAGE => Ok(Method::SendMessage),
+        methods::GET_TASK => Ok(Method::GetTask),
+        methods::LIST_TASKS => Ok(Method::ListTasks),
+        methods::CANCEL_TASK => Ok(Method::CancelTask),
+        methods::SEND_STREAMING_MESSAGE
+        | methods::SUBSCRIBE_TO_TASK
+        | methods::GET_EXTENDED_AGENT_CARD => Err(A2aError::unsupported_operation()),
+        methods::CREATE_PUSH_CONFIG
+        | methods::GET_PUSH_CONFIG
+        | methods::LIST_PUSH_CONFIGS
+        | methods::DELETE_PUSH_CONFIG => Err(A2aError::push_not_supported()),
+        _ => Err(A2aError::method_not_found()),
+    }
+}
+
+fn valid_label(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() <= max && s.chars().all(|c| !c.is_control())
+}
+
+/// Deserialise typed request params; any shape error is `-32602`.
+///
+/// # Errors
+///
+/// `-32602` when `params` does not match `T`.
+pub fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, A2aError> {
+    serde_json::from_value(params.clone()).map_err(|_| A2aError::invalid_params("invalid params"))
+}
+
+/// Convert an optional `historyLength` to a count. A negative value clamps
+/// to `0` (conformance 195).
+#[must_use]
+pub fn history_length(raw: Option<i32>) -> Option<usize> {
+    raw.map(|n| usize::try_from(n).unwrap_or(0))
+}
+
+/// A validated inbound message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendInput {
+    /// The message as received (stored as the task's history entry).
+    pub message: Message,
+    /// Remote-chosen role string (an UNTRUSTED label).
+    pub role: String,
+    /// Text parts concatenated in order, `data` parts as JSON text.
+    pub text: String,
+}
+
+/// Validate `SendMessage` params and flatten the message to text.
+///
+/// # Errors
+///
+/// `-32602` for a malformed message, `-32005` for a file part (`raw`, `url`
+/// or the legacy `file` member), `-32003` when push notification config is
+/// requested.
+pub fn parse_send_message(params: &Value) -> Result<SendInput, A2aError> {
+    // The crate's `Part` has no legacy `file` variant, so the refusal of file
+    // content is decided on the raw JSON before typed parsing.
+    if let Some(parts) = params
+        .get("message")
+        .and_then(|m| m.get("parts"))
+        .and_then(Value::as_array)
+    {
+        let has_file = parts
+            .iter()
+            .filter_map(Value::as_object)
+            .any(|p| p.contains_key("raw") || p.contains_key("url") || p.contains_key("file"));
+        if has_file {
+            return Err(A2aError::content_type_not_supported());
+        }
+    }
+    let req: SendMessageRequest = parse_params(params)?;
+    if req
+        .configuration
+        .as_ref()
+        .is_some_and(|c| c.task_push_notification_config.is_some())
+    {
+        return Err(A2aError::push_not_supported());
+    }
+    let message = req.message;
+    if !valid_label(&message.message_id, MAX_ID_LEN) {
+        return Err(A2aError::invalid_params("message.messageId is required"));
+    }
+    for (key, value) in [
+        ("contextId", message.context_id.as_deref()),
+        ("taskId", message.task_id.as_deref()),
+    ] {
+        if value.is_some_and(|v| !valid_label(v, MAX_ID_LEN)) {
+            return Err(A2aError::invalid_params(&format!("{key} is invalid")));
+        }
+    }
+    if message.role == Role::Unspecified {
+        return Err(A2aError::invalid_params("message.role is required"));
+    }
+    if message.parts.is_empty() {
+        return Err(A2aError::invalid_params("message.parts must not be empty"));
+    }
+    let mut chunks: Vec<String> = Vec::with_capacity(message.parts.len());
+    for part in &message.parts {
+        match &part.content {
+            PartContent::Text(t) => chunks.push(t.clone()),
+            PartContent::Data(d) => chunks.push(d.to_string()),
+            PartContent::Raw(_) | PartContent::Url(_) => {
+                return Err(A2aError::content_type_not_supported());
+            }
+        }
+    }
+    let role = match serde_json::to_value(&message.role) {
+        Ok(Value::String(s)) => s,
+        _ => return Err(A2aError::invalid_params("message.role is invalid")),
+    };
+    Ok(SendInput {
+        message,
+        role,
+        text: chunks.concat(),
+    })
+}
+
+/// The system metadata stamped onto the inbox memory at formation:
+/// `content_principal` is the AUTHENTICATED agent id (from the credential,
+/// never a header or the body) and `a2a_role` the remote-chosen role label.
+#[must_use]
+pub fn system_stamp(authenticated_agent: &str, role: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        META_CONTENT_PRINCIPAL.to_string(),
+        Value::String(authenticated_agent.to_string()),
+    );
+    m.insert(META_A2A_ROLE.to_string(), Value::String(role.to_string()));
+    m
+}
+
+/// The artifact acknowledging the stored memory.
+#[must_use]
+pub fn receipt_artifact(memory_id: &str) -> Artifact {
+    Artifact {
+        artifact_id: format!("receipt-{memory_id}"),
+        name: Some("memory-receipt".to_string()),
+        description: None,
+        parts: vec![
+            Part::text(format!("stored as memory {memory_id}")).with_media_type("text/plain"),
+        ],
+        metadata: None,
+        extensions: None,
+    }
+}
+
+/// A2A timestamp text (RFC 3339, UTC, millisecond precision).
+#[must_use]
+pub fn format_timestamp(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// The current time as A2A timestamp text.
+#[must_use]
+pub fn now_timestamp() -> String {
+    format_timestamp(Utc::now())
+}
+
+/// The typed Task for a stored row. `history_length` of `Some(n)` keeps the
+/// last `n` messages (`0` omits `history`); `None` keeps all.
+///
+/// # Errors
+///
+/// `-32603` when the stored row does not decode (never expected: rows are
+/// written by this module).
+pub fn task_from_row(
+    row: &A2aTaskRow,
+    history_length: Option<usize>,
+    include_artifacts: bool,
+) -> Result<Task, A2aError> {
+    let decode = |what: &str| {
+        tracing::warn!(target: "a2a", "stored a2a task has an unreadable {what}");
+        A2aError::internal()
+    };
+    let task_state: TaskState =
+        serde_json::from_value(Value::String(row.state.clone())).map_err(|_| decode("state"))?;
+    let timestamp = DateTime::parse_from_rfc3339(&row.status_timestamp)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|_| decode("timestamp"))?;
+    let history: Vec<Message> =
+        serde_json::from_value(row.history.clone()).map_err(|_| decode("history"))?;
+    let keep = history_length.map_or(history.len(), |n| n.min(history.len()));
+    let history = (keep > 0).then(|| history[history.len() - keep..].to_vec());
+    let artifacts = if include_artifacts {
+        let a: Vec<Artifact> =
+            serde_json::from_value(row.artifacts.clone()).map_err(|_| decode("artifacts"))?;
+        Some(a)
+    } else {
+        None
+    };
+    let metadata: HashMap<String, Value> =
+        serde_json::from_value(row.metadata.clone()).map_err(|_| decode("metadata"))?;
+    Ok(Task {
+        id: row.id.clone(),
+        context_id: row.context_id.clone(),
+        status: TaskStatus {
+            state: task_state,
+            message: None,
+            timestamp: Some(timestamp),
+        },
+        artifacts,
+        history,
+        metadata: Some(metadata),
+    })
+}
+
+/// The `https`/`http` base URL for the card, derived from the (validated)
+/// `Host` header of the already-authenticated request.
+#[must_use]
+pub fn base_url(host: Option<&str>, forwarded_proto: Option<&str>) -> String {
+    let scheme = if forwarded_proto.map(str::trim) == Some("https") {
+        "https"
+    } else {
+        "http"
+    };
+    let host = host
+        .map(str::trim)
+        .filter(|h| {
+            !h.is_empty()
+                && h.len() <= 255
+                && h.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+        })
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}")
+}
+
+/// The Agent Card. Declares exactly what is served: JSON-RPC only, no
+/// streaming, no push, no extended card, no extensions, one inbox skill, the
+/// `apiKey` (header `x-api-key`) security scheme, and no `signatures`. The
+/// description names no namespace, agent id or deployment fact.
+#[must_use]
+pub fn agent_card(base: &str) -> AgentCard {
+    let modes = || vec!["text/plain".to_string(), crate::MIME_JSON.to_string()];
+    AgentCard {
+        name: "ai-memory".to_string(),
+        description: "Persistent memory for AI agents. Messages sent to this agent are stored in the authenticated caller's memory inbox.".to_string(),
+        version: crate::PKG_VERSION.to_string(),
+        supported_interfaces: vec![AgentInterface::new(
+            format!("{base}{A2A_RPC_PATH}"),
+            wire::TRANSPORT_PROTOCOL_JSONRPC,
+        )],
+        capabilities: AgentCapabilities {
+            streaming: Some(false),
+            push_notifications: Some(false),
+            extensions: Some(Vec::new()),
+            extended_agent_card: Some(false),
+        },
+        default_input_modes: modes(),
+        default_output_modes: modes(),
+        skills: vec![AgentSkill {
+            id: "memory-inbox".to_string(),
+            name: "Memory inbox".to_string(),
+            description: "Store a message in the authenticated caller's memory inbox and track it as a task.".to_string(),
+            tags: vec!["memory".to_string(), "inbox".to_string()],
+            examples: None,
+            input_modes: None,
+            output_modes: None,
+            security_requirements: None,
+        }],
+        provider: None,
+        documentation_url: None,
+        icon_url: None,
+        security_schemes: Some(HashMap::from([(
+            "apiKey".to_string(),
+            SecurityScheme::ApiKey(ApiKeySecurityScheme {
+                location: "header".to_string(),
+                name: "x-api-key".to_string(),
+                description: Some(
+                    "Per-agent API key presented in the x-api-key request header.".to_string(),
+                ),
+            }),
+        )])),
+        security_requirements: Some(vec![HashMap::from([("apiKey".to_string(), Vec::new())])]),
+        signatures: None,
+    }
+}
+
+/// Recursively rebuild `v` with every object's keys sorted, whatever the
+/// `serde_json` map implementation is.
+fn sort_keys(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let sorted: std::collections::BTreeMap<&String, Value> =
+                m.iter().map(|(k, x)| (k, sort_keys(x))).collect();
+            Value::Object(sorted.into_iter().map(|(k, x)| (k.clone(), x)).collect())
+        }
+        Value::Array(a) => Value::Array(a.iter().map(sort_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Canonical bytes of a serialisable wire value: sorted keys, compact. The
+/// crate stores card maps in a `HashMap` (nondeterministic order), so anything
+/// signed or attested over Agent Card bytes MUST be taken from this form.
+///
+/// # Errors
+///
+/// `-32603` when the value cannot be serialised.
+pub fn canonical_bytes<T: Serialize>(v: &T) -> Result<Vec<u8>, A2aError> {
+    let value = to_value(v)?;
+    serde_json::to_vec(&sort_keys(&value)).map_err(|_| A2aError::internal())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn id(n: i64) -> JsonRpcId {
+        JsonRpcId::Number(n)
+    }
+
+    #[test]
+    fn parse_rpc_distinguishes_malformed_json_from_invalid_request() {
+        let (_, e) = parse_rpc(b"{not json").expect_err("malformed");
+        assert_eq!(e.code, -32700);
+        let (_, e) = parse_rpc(b"[1]").expect_err("array");
+        assert_eq!(e.code, -32600);
+        let (got, e) = parse_rpc(br#"{"jsonrpc":"1.0","id":7,"method":"x"}"#).expect_err("version");
+        assert_eq!((got, e.code), (id(7), -32600));
+        let (_, e) = parse_rpc(br#"{"jsonrpc":"2.0","id":1.5,"method":"x"}"#).expect_err("frac id");
+        assert_eq!(e.code, -32600);
+    }
+
+    #[test]
+    fn classify_method_table() {
+        assert_eq!(classify_method("SendMessage"), Ok(Method::SendMessage));
+        for m in [
+            "SendStreamingMessage",
+            "SubscribeToTask",
+            "GetExtendedAgentCard",
+        ] {
+            assert_eq!(classify_method(m).expect_err("unsupported").code, -32004);
+        }
+        for m in [
+            "CreateTaskPushNotificationConfig",
+            "GetTaskPushNotificationConfig",
+            "ListTaskPushNotificationConfigs",
+            "DeleteTaskPushNotificationConfig",
+        ] {
+            assert_eq!(classify_method(m).expect_err("push").code, -32003);
+        }
+        assert_eq!(classify_method("Nope").expect_err("unknown").code, -32601);
+    }
+
+    #[test]
+    fn http_status_table_is_first_party() {
+        for (code, status) in [
+            (-32001, 404),
+            (-32002, 400),
+            (-32003, 400),
+            (-32004, 400),
+            (-32005, 400),
+            (-32006, 500),
+            (-32007, 400),
+            (-32008, 400),
+            (-32009, 400),
+            (-32700, 200),
+            (-32600, 200),
+            (-32601, 404),
+            (-32602, 400),
+            (-32603, 500),
+        ] {
+            assert_eq!(http_status_for(code), status, "code {code}");
+        }
+    }
+
+    #[test]
+    fn version_header_rule() {
+        assert!(check_version(None).is_ok());
+        assert!(check_version(Some("1.0")).is_ok());
+        assert_eq!(check_version(Some("0.3")).expect_err("old").code, -32009);
+        assert_eq!(check_version(Some("")).expect_err("empty").code, -32009);
+    }
+
+    #[test]
+    fn send_message_flattens_text_and_data_and_rejects_files() {
+        let ok = json!({"message": {"messageId": "m1", "role": "ROLE_USER",
+            "parts": [{"text": "a"}, {"data": {"k": 1}}, {"text": "b"}]}});
+        let got = parse_send_message(&ok).expect("parse");
+        assert_eq!(got.text, "a{\"k\":1}b");
+        assert_eq!(got.role, "ROLE_USER");
+        for member in ["raw", "url", "file"] {
+            let bad = json!({"message": {"messageId": "m1", "role": "ROLE_USER",
+                "parts": [{member: "x"}]}});
+            assert_eq!(parse_send_message(&bad).expect_err("file").code, -32005);
+        }
+        let unknown_role = json!({"message": {"messageId": "m1", "role": "operator",
+            "parts": [{"text": "a"}]}});
+        assert_eq!(
+            parse_send_message(&unknown_role).expect_err("role").code,
+            -32602
+        );
+        let push = json!({"message": {"messageId": "m1", "role": "ROLE_USER",
+            "parts": [{"text": "a"}]},
+            "configuration": {"taskPushNotificationConfig": {"url": "https://x", "taskId": "t"}}});
+        assert_eq!(parse_send_message(&push).expect_err("push").code, -32003);
+    }
+
+    #[test]
+    fn stamp_carries_authenticated_principal_and_role_label() {
+        let m = system_stamp("alice", "ROLE_AGENT");
+        assert_eq!(m[META_CONTENT_PRINCIPAL], "alice");
+        assert_eq!(m[META_A2A_ROLE], "ROLE_AGENT");
+    }
+
+    #[test]
+    fn card_declares_only_what_is_served() {
+        let c = to_value(&agent_card("https://h.example")).expect("card");
+        assert_eq!(c["capabilities"]["streaming"], false);
+        assert_eq!(c["capabilities"]["pushNotifications"], false);
+        assert!(c.get("signatures").is_none());
+        assert_eq!(c["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
+        assert!(c["securitySchemes"].get("mtls").is_none());
+    }
+
+    #[test]
+    fn base_url_rejects_hostile_host_values() {
+        assert_eq!(
+            base_url(Some("a.example:8080"), Some("https")),
+            "https://a.example:8080"
+        );
+        assert_eq!(base_url(Some("a b/c"), None), "http://localhost");
+    }
+
+    #[test]
+    fn stored_state_strings_match_the_crate_task_state() {
+        for (s, t) in [
+            (state::SUBMITTED, TaskState::Submitted),
+            (state::WORKING, TaskState::Working),
+            (state::COMPLETED, TaskState::Completed),
+            (state::FAILED, TaskState::Failed),
+            (state::CANCELED, TaskState::Canceled),
+        ] {
+            assert_eq!(serde_json::to_value(&t).expect("ser"), json!(s));
+            assert_eq!(state::is_terminal(s), t.is_terminal());
+        }
+        assert!(
+            state::is_terminal("garbage"),
+            "unreadable state fails closed"
+        );
+    }
+
+    // --- serialisation evidence: exact wire JSON, pinned against literals
+    // --- taken from the A2A 1.0 specification examples. A future a2a-lf bump
+    // --- that changes the wire shape turns these red.
+
+    const SPEC_SEND_MESSAGE_REQUEST: &str =
+        r#"{"message":{"messageId":"msg-1","role":"ROLE_USER","parts":[{"text":"hello"}]}}"#;
+    const SPEC_TASK: &str = r#"{"id":"task-1","contextId":"ctx-1","status":{"state":"TASK_STATE_COMPLETED","timestamp":"2026-10-31T12:00:00Z"},"artifacts":[{"artifactId":"receipt-m1","name":"memory-receipt","parts":[{"text":"stored as memory m1","mediaType":"text/plain"}]}],"history":[{"messageId":"msg-1","role":"ROLE_USER","parts":[{"text":"hello"}]}],"metadata":{"storage":"ai-memory-inbox"}}"#;
+    const SPEC_AGENT_CARD: &str = r#"{"name":"ai-memory","description":"Persistent memory for AI agents. Messages sent to this agent are stored in the authenticated caller's memory inbox.","version":"@VERSION@","supportedInterfaces":[{"url":"https://h.example/api/v1/a2a","protocolBinding":"JSONRPC","protocolVersion":"1.0"}],"capabilities":{"streaming":false,"pushNotifications":false,"extensions":[],"extendedAgentCard":false},"defaultInputModes":["text/plain","application/json"],"defaultOutputModes":["text/plain","application/json"],"skills":[{"id":"memory-inbox","name":"Memory inbox","description":"Store a message in the authenticated caller's memory inbox and track it as a task.","tags":["memory","inbox"]}],"securitySchemes":{"apiKey":{"apiKeySecurityScheme":{"location":"header","name":"x-api-key","description":"Per-agent API key presented in the x-api-key request header."}}},"securityRequirements":[{"schemes":{"apiKey":{"list":[]}}}]}"#;
+
+    #[test]
+    fn pin_send_message_request_round_trips_exactly() {
+        let req: SendMessageRequest =
+            serde_json::from_str(SPEC_SEND_MESSAGE_REQUEST).expect("deserialize");
+        assert_eq!(
+            serde_json::to_string(&req).expect("serialize"),
+            SPEC_SEND_MESSAGE_REQUEST
+        );
+        let again: SendMessageRequest =
+            serde_json::from_value(serde_json::to_value(&req).expect("ser")).expect("de");
+        assert_eq!(again, req);
+    }
+
+    #[test]
+    fn pin_task_with_status_artifacts_history_round_trips_exactly() {
+        let task: Task = serde_json::from_str(SPEC_TASK).expect("deserialize");
+        assert_eq!(serde_json::to_string(&task).expect("serialize"), SPEC_TASK);
+        assert_eq!(task.status.state, TaskState::Completed);
+        let again: Task =
+            serde_json::from_value(serde_json::to_value(&task).expect("ser")).expect("de");
+        assert_eq!(again, task);
+        // The first-party receipt artifact is the one pinned above.
+        let art = receipt_artifact("m1");
+        assert_eq!(Some(vec![art]), task.artifacts);
+    }
+
+    #[test]
+    fn pin_agent_card_round_trips_exactly() {
+        // The card holds HashMap fields (upstream a2a-rs #361): compare PARSED
+        // values, never bytes.
+        let want = SPEC_AGENT_CARD.replace("@VERSION@", crate::PKG_VERSION);
+        let card = agent_card("https://h.example");
+        let got: Value = serde_json::to_value(&card).expect("serialize");
+        let want_value: Value = serde_json::from_str(&want).expect("literal parses");
+        assert_eq!(got, want_value);
+        let again: AgentCard = serde_json::from_str(&want).expect("deserialize");
+        assert_eq!(again, card);
+    }
+
+    #[test]
+    fn agent_card_canonical_bytes_are_stable_with_many_security_schemes() {
+        let scheme = |name: &str| {
+            SecurityScheme::ApiKey(ApiKeySecurityScheme {
+                location: "header".to_string(),
+                name: name.to_string(),
+                description: None,
+            })
+        };
+        let build = |names: &[&str]| {
+            let mut card = agent_card("https://h.example");
+            let mut schemes = HashMap::new();
+            for n in names {
+                schemes.insert((*n).to_string(), scheme(n));
+            }
+            // The requirement list is an ordered array; only the scheme map
+            // insertion order (hence HashMap iteration order) varies.
+            let reqs = ["k1", "k2", "k3"]
+                .iter()
+                .map(|n| HashMap::from([((*n).to_string(), Vec::new())]))
+                .collect::<Vec<HashMap<String, Vec<String>>>>();
+            card.security_schemes = Some(schemes);
+            card.security_requirements = Some(reqs);
+            card
+        };
+        let a = build(&["k1", "k2", "k3"]);
+        let b = build(&["k3", "k1", "k2"]);
+        let first = canonical_bytes(&a).expect("canonical");
+        for _ in 0..8 {
+            assert_eq!(canonical_bytes(&b).expect("canonical"), first);
+            assert_eq!(canonical_bytes(&a).expect("canonical"), first);
+        }
+    }
+
+    #[test]
+    fn negative_history_length_clamps_to_zero() {
+        assert_eq!(history_length(None), None);
+        assert_eq!(history_length(Some(-5)), Some(0));
+        assert_eq!(history_length(Some(3)), Some(3));
+    }
+
+    fn error_object_without_timestamp(e: &A2aError) -> Value {
+        let mut v = serde_json::to_value(e.to_error_object()).expect("ser");
+        v["data"][0]["metadata"]
+            .as_object_mut()
+            .expect("metadata")
+            .remove("timestamp");
+        v
+    }
+
+    #[test]
+    fn pin_error_task_not_found_32001() {
+        let got = error_object_without_timestamp(&A2aError::task_not_found());
+        assert_eq!(
+            got,
+            json!({"code": -32001, "message": "task not found", "data": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "TASK_NOT_FOUND",
+                "domain": "a2a-protocol.org",
+                "metadata": {}
+            }]})
+        );
+        let env = error_envelope(&id(1), &A2aError::task_not_found());
+        assert_eq!(env["jsonrpc"], "2.0");
+        assert_eq!(env["id"], 1);
+        assert_eq!(env["error"]["code"], -32001);
+        assert!(env.get("result").is_none());
+    }
+
+    #[test]
+    fn pin_error_unsupported_operation_32004() {
+        let got = error_object_without_timestamp(&A2aError::unsupported_operation());
+        assert_eq!(
+            got,
+            json!({"code": -32004, "message": "this operation is not supported", "data": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "UNSUPPORTED_OPERATION",
+                "domain": "a2a-protocol.org",
+                "metadata": {}
+            }]})
+        );
+    }
+
+    #[test]
+    fn round_trip_every_emitted_wire_struct() {
+        let msg = Message::new(
+            Role::Agent,
+            vec![Part::text("t"), Part::data(json!({"k": 1}))],
+        );
+        let art = receipt_artifact("m9");
+        let status = TaskStatus {
+            state: TaskState::Working,
+            message: None,
+            timestamp: Some(Utc::now()),
+        };
+        let resp = wire::ListTasksResponse {
+            tasks: vec![],
+            next_page_token: String::new(),
+            page_size: 50,
+            total_size: 0,
+        };
+        macro_rules! round_trip {
+            ($t:ty, $v:expr) => {{
+                let v: $t = $v;
+                let s = serde_json::to_string(&v).expect("ser");
+                let back: $t = serde_json::from_str(&s).expect("de");
+                assert_eq!(back, v, stringify!($t));
+            }};
+        }
+        round_trip!(Message, msg.clone());
+        round_trip!(Artifact, art);
+        round_trip!(TaskStatus, status);
+        round_trip!(wire::ListTasksResponse, resp);
+        round_trip!(AgentCard, agent_card("http://localhost"));
+        round_trip!(
+            wire::SendMessageResponse,
+            wire::SendMessageResponse::Message(msg)
+        );
+        round_trip!(wire::JsonRpcError, A2aError::internal().to_error_object());
+        round_trip!(JsonRpcId, JsonRpcId::String("x".to_string()));
+    }
+}

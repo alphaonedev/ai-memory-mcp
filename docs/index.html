@@ -377,7 +377,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <span>Local-first &middot; air-gappable</span>
       <span>Model-neutral (MCP)</span>
       <span>104 MCP tools</span>
-      <span>103 HTTP routes (89 unique paths)</span>
+      <span>105 HTTP routes (91 unique paths)</span>
       <span>91 CLI subcommands (default build; 93 with <code>sal</code> features)</span>
       <span>Ed25519 attested audit chain</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
@@ -674,8 +674,8 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
     <h2>Already running v0.6.4, v0.7.x, or v0.8.x? The upgrade is one boot.</h2>
     <p class="lede">
       v1.0.0 migrates your existing database in place. The sqlite schema steps up to
-      <strong>v100</strong> on the first <code>ai-memory serve</code> after the upgrade (a v0.8.0 DB steps
-      <strong>v70&nbsp;&rarr;&nbsp;v100</strong>; a v0.8.1 DB steps v71&nbsp;&rarr;&nbsp;v100; a v0.7.x DB steps v57&nbsp;&rarr;&nbsp;v100; a v0.6.4 DB walks the full ladder).
+      <strong>v101</strong> on the first <code>ai-memory serve</code> after the upgrade (a v0.8.0 DB steps
+      <strong>v70&nbsp;&rarr;&nbsp;v101</strong>; a v0.8.1 DB steps v71&nbsp;&rarr;&nbsp;v101; a v0.7.x DB steps v57&nbsp;&rarr;&nbsp;v101; a v0.6.4 DB walks the full ladder).
       It is <strong>non-destructive</strong> &mdash; every existing memory carries forward unchanged, archive&nbsp;&rarr;&nbsp;restore is lossless, and new
       columns default to safe values for legacy rows. Typical downtime is
       <strong>30&nbsp;seconds to 2&nbsp;minutes</strong> on a laptop-sized database.
@@ -744,7 +744,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="API_REFERENCE.html">
         <div class="label">HTTP</div>
         <h4>REST API</h4>
-        <p>103 routes (89 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <p>105 routes (91 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
         <span class="arrow">API reference &rarr;</span>
       </a>
       <a class="int-card" href="CLI_REFERENCE.html">
@@ -949,7 +949,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="lk" href="evidence.html"><strong>Evidence &mdash; frozen claims</strong><span class="desc">Every public number, pinned to a commit + test artifact. 15,951/0 (2026-05-31 final baseline, v0.7.0 tree &mdash; see evidence.html).</span></a>
       <a class="lk" href="USER_GUIDE.html"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.html"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
-      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">103 routes (89 unique paths)</span></a>
+      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">105 routes (91 unique paths)</span></a>
       <a class="lk" href="CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">91 subcommands</span></a>
       <a class="lk" href="GLOSSARY.html"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
       <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>

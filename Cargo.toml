@@ -38,6 +38,10 @@ rcgen = { version = "=0.14.7", default-features = false, features = ["pem", "rin
 x509-parser = "0.18"
 pem = "3"
 time = "0.3"
+# #8444 - the official Linux Foundation A2A crate, WIRE TYPES and ERROR CODES
+# only (operator-approved Option B, memory 9d72176d). Exact pin, default
+# features; dispatch, auth and storage stay first-party.
+a2a-lf = "=0.4.2"
 anyhow = "1"
 axum = { version = "0.8", features = ["json"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }

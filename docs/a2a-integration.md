@@ -526,6 +526,87 @@ selected as `OPENSSL3` (then issue the certificate through your normal CA):
   -pkeyopt ec_param_enc:named_curve -out "$NEW_TLS_KEY"
 ```
 
+## 10. Agent2Agent (A2A) standard binding
+
+The daemon speaks the Google Agent2Agent standard (A2A 1.0, JSON-RPC binding)
+next to its native inbox. This is shape S1 with security posture P1, decided
+by the 3-agent vote (6def5ab6) on issue #8444. Wire types and error codes come
+from the official `a2a-lf` 0.4.2 crate (operator-approved Option B); the
+server, authentication, dispatch and storage are first-party (`src/a2a.rs`,
+`src/handlers/a2a.rs`).
+
+### What is served
+
+| Route | Purpose |
+|---|---|
+| `GET /.well-known/agent-card.json` | the Agent Card |
+| `POST /api/v1/a2a` | one JSON-RPC 2.0 endpoint |
+
+Methods served on the endpoint: `SendMessage`, `GetTask`, `ListTasks`,
+`CancelTask`.
+
+Declared unsupported (the card says so and the endpoint answers precisely):
+
+- `SendStreamingMessage`, `SubscribeToTask`, `GetExtendedAgentCard` answer
+  `-32004`. Streaming is the first follow-on; the card keeps
+  `streaming:false` until it exists.
+- The four `*TaskPushNotificationConfig` methods answer `-32003`
+  (`pushNotifications:false`).
+- An unknown method answers `-32601`.
+
+S1 exposes the JSON-RPC binding only. There is no REST or gRPC binding.
+
+### Posture P1 and how a client authenticates
+
+Both routes sit behind the existing `api_key_auth`. The Agent Card is served
+only to authenticated callers: an unauthenticated `GET` answers `401` and no
+auth exemption was added. A client sends its key in the `x-api-key` header
+(the global key, or the key of an enrolled agent), matching the card's
+declared `apiKey` scheme. Every JSON-RPC method additionally requires an agent
+identity derived from that credential, fail-closed: the identity is never read
+from `X-Agent-Id` or the request body. An open server with no keys configured
+serves the card but refuses every RPC with `401`.
+
+`mtls` is left out of the card's security schemes. Declaring it would require
+widening the `/api/v1/sync/*` auth bypass in `src/handlers/transport.rs`, which
+this change does not do. No OAuth2, OIDC or JWT code was added.
+
+Tasks belong to the credential that created them. `GetTask` or `CancelTask` on
+another caller's task answers `-32001` with HTTP `404` (never `403`), so task
+ids do not leak across callers; `ListTasks` returns only the caller's tasks.
+
+### SendMessage behaviour
+
+`SendMessage` is blocking: the server stores the message, finishes the Task
+and returns it in the same response (`TASK_STATE_COMPLETED`). Text parts are
+concatenated in order, `data` parts are serialised as JSON text, and `file`
+parts are rejected with `-32005`. The message lands in the caller's
+`_inbox/<caller>` through the native notify path and wakes the inbox stream.
+Each stored message is stamped with `content_principal` (the authenticated
+agent id; the key is defined by issue #8443) and `a2a_role` (the remote role
+string, an untrusted label). A supplied `contextId` is honoured; a supplied
+`taskId` must belong to the caller and be non-terminal, else `-32001`.
+
+### Versioning and parse errors
+
+`A2A-Version` is accepted when absent or `1.0`; any other value (including an
+empty one) answers `-32009`. `A2A-Version: 1.0` is returned on every response
+the A2A handlers produce (a `401` from the shared authentication layer is
+answered before the handler runs and carries no such header).
+Malformed JSON (`-32700`) and invalid requests (`-32600`) answer HTTP `200`
+with the JSON-RPC error envelope; the remaining codes map to 4xx/5xx as listed
+in the API reference.
+
+### Bounds and known limitation
+
+- `ListTasks` `pageSize` is capped at 100 (larger values clamp).
+- Terminal tasks are retained per agent up to a fixed bound; the oldest
+  terminal tasks beyond it are pruned, active tasks never are.
+- State changes are atomic compare-and-set (SUBMITTED, WORKING, then COMPLETED,
+  FAILED or CANCELED). The compare-and-set guards state, not history: two
+  concurrent continuations on one task can lose a history append. The inbox
+  memory is the durable record of every message.
+
 Continue with the [CLI reference](CLI_REFERENCE.md),
 [messaging atlas](a2a-messaging.html), and
 [protocol home](https://alphaonedev.github.io/rust-a2a/).
