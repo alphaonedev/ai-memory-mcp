@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "First matching rule (lowest priority number) wins per path; selections are unioned over paths. Job key ALL forces the full matrix. A rust key also resolves the owning crate and its reverse-dependency closure. cell_crates names workspace crates whose change adds the cells key; this workspace has one crate (ai-memory), so the SAL and storage code is selected by cell_globs instead. The sal, sal-postgres and vectorlite cfgs are spread across 587 src/ and tests/ files (8240 F3), so every Rust source tree maps to cells; no file is excepted. scripts/ci/** and the check scripts judge CI itself, so they select ALL. Markdown compiled in by include_str!/include_bytes! is found by build_index and selects rust.",
+  "_comment": "First matching rule (lowest priority number) wins per path; selections are unioned over paths. Job key ALL forces the full matrix. A rust key also resolves the owning crate and its reverse-dependency closure. cell_crates names workspace crates whose change adds the cells key; this workspace has one crate (ai-memory), so the SAL and storage code is selected by cell_globs instead. The sal, sal-postgres and vectorlite cfgs are spread across 587 src/ and tests/ files (8240 F3), so every Rust source tree maps to cells; no file is excepted. scripts/ci/** and the check scripts judge CI itself, so they select ALL. Markdown compiled in by include_str!/include_bytes! is found by build_index and selects rust. The cargo_skip section (8322) is read by cargo_skip.py in the classify job: a path is skippable only when it matches skip_globs and neither never_skip_globs nor test_read_globs; test_read_globs is proven complete against the Rust sources by scripts/ci/tests/test_impact_cargo_skip_8322.py.",
   "known_jobs": [
     "rust", "cells", "python", "actionlint", "isolation-smoke", "docs",
     "codeql", "signatures", "leakscan", "banned-phrases"
@@ -13,6 +13,51 @@
     "src/**", "tests/**", "benches/**", "crates/**", "migrations/**"
   ],
   "tag_skip_jobs": ["dockerfile-validate"],
+  "cargo_skip": {
+    "version": 1,
+    "skip_globs": ["scripts/ci/tests/**", "docs/**", "**/*.md"],
+    "docs_globs": ["docs/**", "**/*.md"],
+    "never_skip_globs": [
+      "src/**", "tests/**", "benches/**", "crates/**", "examples/**", "migrations/**",
+      "**/Cargo.toml", "**/Cargo.lock", "**/build.rs", "**/rust-toolchain*", "**/deny.toml",
+      ".github/**", "**/Dockerfile*", "**/*.sh", "scripts/*.py", "scripts/qc-allowlists/**",
+      "scripts/test/**", "scripts/ci/*", "scripts/ci/impact/**",
+      "scripts/ci/tests/test_pg_isolated_binary.py",
+      "scripts/ci/tests/test_retired_alias_walk_3627.py"
+    ],
+    "ci_tree_globs": [".github/**", "scripts/ci/**"],
+    "ci_tree_exempt_globs": ["scripts/ci/tests/**"],
+    "full_ci_events": ["push", "merge_group"],
+    "full_ci_base_names": ["main", "develop"],
+    "full_ci_base_prefixes": ["release/"],
+    "walk_guards": [
+      {
+        "rust": "tests/issue_3627_retired_llm_alias.rs",
+        "guard": "scripts/ci/tests/test_retired_alias_walk_3627.py",
+        "roots": ["src", "tools", "tests", "scripts", "docs", "changelog.d"]
+      }
+    ],
+    "test_read_globs": [
+      "CLAUDE.md", "CONTRIBUTING.md", "PERFORMANCE.md", "README.md", "ROADMAP.md",
+      "**/README.md",
+      "docs/API_REFERENCE.md", "docs/CLI_REFERENCE.md", "docs/USER_GUIDE.md",
+      "docs/benchmarks/longmemeval-reflection.md",
+      "docs/compliance/**", "docs/contracts/**", "docs/deploy/**",
+      "docs/governance/**", "docs/integrations/**", "docs/spec/PORTABILITY-V2.md",
+      "docs/rationale/academic-context.md",
+      "docs/reviews/branch-hygiene-3x7-2026-09-18.*",
+      "docs/reviews/issue-audit-3x7-r2-2026-09-18.md",
+      "docs/reviews/opus5-1x3-baml-paw-20260919-evidence/assessor-*.md",
+      "docs/v0.7.0/mtp-bench-2026-05-17.md", "docs/v070-changelog.html",
+      "docs/whats-new-v08.html",
+      "docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md",
+      "scripts/ci/tests/test_codeql_6163.py",
+      "conformance/**",
+      "scripts/ci/tests/test_check_cert_expiry_corpus.py",
+      "scripts/ci/tests/test_ci_select_gating_8240.py",
+      "scripts/ci/tests/test_impact_cargo_skip_8328.py"
+    ]
+  },
   "job_map": {
     "lint": "rust",
     "msrv": "rust",

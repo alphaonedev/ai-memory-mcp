@@ -65,9 +65,9 @@ bad()  { printf '  FAIL  %s\n         %s\n' "$1" "$2" >&2; FAIL=$((FAIL + 1)); }
 # Pull the `run: |` body of the `classify` job's `- id: cls` step, dedented.
 # Fails loudly if the step cannot be located — an extraction that silently
 # returns nothing would make every assertion below vacuous.
-extract_cls() {
-    awk '
-      /^      - id: cls$/ { instep = 1; next }
+extract_step() {
+    awk -v id="$2" '
+      $0 == "      - id: " id { instep = 1; next }
       instep && /^        run: \|$/ { inrun = 1; next }
       inrun {
         if ($0 == "") { print ""; next }
@@ -76,6 +76,7 @@ extract_cls() {
       }
     ' "$1"
 }
+extract_cls() { extract_step "$1" cls; }
 
 # ---------------------------------------------------------------------------
 # Fixture builder. Creates a repo whose history is:
@@ -98,6 +99,14 @@ build_fixture() {
         echo "# readme" > README.md
         echo "# claude" > CLAUDE.md
         echo "# doc" > docs/a.md
+        # #8322: the cls block now calls scripts/ci/impact/cargo_skip.py, so the
+        # fixture carries the REAL helper and rules (never a stub: the skip set
+        # is the thing under test).
+        mkdir -p scripts/ci/impact scripts/ci/tests
+        cp "$ROOT/scripts/ci/impact/__init__.py" "$ROOT/scripts/ci/impact/common.py" \
+           "$ROOT/scripts/ci/impact/cargo_skip.py" "$ROOT/scripts/ci/impact/rules.json" \
+           scripts/ci/impact/
+        echo "# ci test" > scripts/ci/tests/test_fixture.py
         # Passthrough stub: records the base it was handed, then emits the
         # outputs the real script would. Asserting on this is how we prove the
         # SELECTION base stayed incremental while CLASSIFICATION widened.
@@ -110,13 +119,17 @@ build_fixture() {
         cat > scripts/ci-test-impact.sh <<'STUB'
 #!/usr/bin/env bash
 echo "impact_base_received=$1"
-echo "impact_base_received=$1" >> "$GITHUB_OUTPUT"
+echo "$1" > .impact_base_received
 inc="$(git diff --name-only "$1" HEAD)"
 if [ -n "$inc" ] && ! printf '%s\n' "$inc" | grep -qvE '^(docs/|.*\.md$)'; then
   echo "test_impact=__SKIP__" >> "$GITHUB_OUTPUT"
+  echo "test_impact_count=0" >> "$GITHUB_OUTPUT"
+  echo "test_impact_total=0" >> "$GITHUB_OUTPUT"
   echo "test_impact_reason=docs-only" >> "$GITHUB_OUTPUT"
 else
   echo "test_impact=__STUB__" >> "$GITHUB_OUTPUT"
+  echo "test_impact_count=1" >> "$GITHUB_OUTPUT"
+  echo "test_impact_total=1" >> "$GITHUB_OUTPUT"
   echo "test_impact_reason=stub" >> "$GITHUB_OUTPUT"
 fi
 STUB
@@ -133,7 +146,9 @@ STUB
 
         case "$c2_kind" in
             code)    echo "// c2 code" >> src/lib.rs ;;
-            docs)    echo "c2 docs" >> CLAUDE.md ;;
+            docs)    echo "c2 docs" >> docs/b.md ;;
+            claude)  echo "c2 claude" >> CLAUDE.md ;;
+            citests) echo "c2 citest" >> scripts/ci/tests/test_fixture.py ;;
             revert)  git revert --no-edit HEAD >/dev/null 2>&1 ;;
             empty)   : ;;
         esac
@@ -150,13 +165,35 @@ STUB
 # any same-named key a sub-script merely echoed to the log. Stdout is included
 # because the impact script reports there too, and the second-order guard
 # deliberately does NOT forward its scratch keys to the real outputs.
+#
+# Round 3 (#8328, #8338): the test-impact selector runs in its own `impact`
+# step with its own output file. When IMPACT_BLOCK names that step body, it is
+# run after the cls block with the cls step outputs as its env (as the workflow
+# wires them), and its output file is printed after the cls one. A frozen
+# historical block is run with IMPACT_BLOCK empty.
 run_cls() {
     local dir="$1" block="$2"; shift 2
     (
         cd "$dir"
         : > .gh_output
-        env GITHUB_OUTPUT="$PWD/.gh_output" "$@" bash "$block" 2>/dev/null || true
+        rm -f .impact_base_received
+        env GITHUB_OUTPUT="$PWD/.gh_output" "$@" bash --noprofile --norc -eo pipefail "$block" 2>/dev/null || true
         cat .gh_output
+        if [ -n "${IMPACT_BLOCK:-}" ]; then
+            local cls_out
+            cls_out="$(cat .gh_output)"
+            : > .gh_output_impact
+            env GITHUB_OUTPUT="$PWD/.gh_output_impact" \
+                CLS_BASE="$(getout "$cls_out" cls_base)" \
+                IMPACT_BASE="$(getout "$cls_out" impact_base)" \
+                DOCS_ONLY="$(getout "$cls_out" docs_only)" \
+                IMPACT_FORCED_REASON="$(getout "$cls_out" impact_forced_reason)" \
+                bash --noprofile --norc -eo pipefail "$IMPACT_BLOCK" > /dev/null 2>&1 || true
+            cat .gh_output_impact
+            if [ -f .impact_base_received ]; then
+                echo "impact_base_received=$(cat .impact_base_received)"
+            fi
+        fi
     )
 }
 
@@ -167,6 +204,12 @@ trap 'rm -rf "$SCRATCH"' EXIT
 
 BLOCK="$SCRATCH/cls-fixed.sh"
 extract_cls "$CI_YML" > "$BLOCK"
+IMPACT_BLOCK="$SCRATCH/impact-fixed.sh"
+extract_step "$CI_YML" impact > "$IMPACT_BLOCK"
+if ! grep -q 'allow_re=' "$IMPACT_BLOCK"; then
+    echo "EXTRACTION FAILED: could not find the impact step block in $CI_YML" >&2
+    exit 2
+fi
 if ! grep -q 'cls_base' "$BLOCK"; then
     echo "EXTRACTION FAILED: could not find the two-base classifier block in $CI_YML" >&2
     echo "(the test harness is broken, not the workflow — fix extract_cls)" >&2
@@ -255,9 +298,14 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BA
 F="$SCRATCH/s7"; build_fixture "$F" docs docs
 C1="$(git -C "$F" rev-parse HEAD~1)"
 OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=push PR_ACTION="" PR_BASE_SHA="" PR_BEFORE="$C1")"
-[ "$(getout "$OUT" docs_only)" = "true" ] \
-    && ok "s7 push event still classifies its own delta (no PR base exists)" \
-    || bad "s7 push event" "got docs_only=$(getout "$OUT" docs_only)"
+# #8328 (code review r1 F2): a push event always runs the full pipeline, so a
+# docs-shaped delta no longer short-circuits either verdict.
+[ "$(getout "$OUT" docs_only)" = "false" ] \
+    && [ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && case "$(getout "$OUT" cargo_skip_reason)" in push-event-full-ci*) true ;; *) false ;; esac \
+    && ok "s7 push event forces docs_only=false and cargo_skip=false (push-event-full-ci)" \
+    || bad "s7 push event must force the full pipeline" \
+           "docs_only=$(getout "$OUT" docs_only) cargo_skip=$(getout "$OUT" cargo_skip) reason=$(getout "$OUT" cargo_skip_reason)"
 
 # --- Scenario 8: unknown event fails closed.
 F="$SCRATCH/s8"; build_fixture "$F" code docs
@@ -279,6 +327,169 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=merge_group PR_ACTION="" PR_BASE_SHA="" 
     || bad "s9 merge_group must run everything" \
            "docs_only=$(getout "$OUT" docs_only) impact=$(getout "$OUT" test_impact) reason=$(getout "$OUT" test_impact_reason)"
 
+# --- Scenarios 10-13 (#8322): cargo_skip, the superset verdict the cargo legs
+# consume. docs_only is now tightened to docs no Rust test reads.
+F="$SCRATCH/s10"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "true" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s10 docs + scripts/ci/tests-only PR: cargo_skip=true, docs_only=false (#8322)" \
+    || bad "s10 cargo_skip on tests-only diff" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only)"
+[ "$(getout "$OUT" test_impact)" != "__SKIP__" ] \
+    && ok "s10 __SKIP__ is not honoured unless docs_only is true (second-order guard intact)" \
+    || bad "s10 __SKIP__ leak" "got test_impact=$(getout "$OUT" test_impact)"
+
+F="$SCRATCH/s11"; build_fixture "$F" docs claude
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s11 a PR touching CLAUDE.md (read by Rust tests) stays on full CI: cargo_skip=false, docs_only=false (#8322)" \
+    || bad "s11 test-read doc must not skip" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only)"
+
+F="$SCRATCH/s12"; build_fixture "$F" code docs
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && ok "s12 a PR with src/ in the whole-PR diff keeps cargo_skip=false (classification base = PR base)" \
+    || bad "s12 src diff must not skip" "cargo_skip=$(getout "$OUT" cargo_skip)"
+
+F="$SCRATCH/s13"; build_fixture "$F" code revert
+B="$(git -C "$F" rev-parse HEAD~2)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$B")"
+O2="$(run_cls "$F" "$BLOCK" EVENT_NAME=merge_group PR_ACTION="" PR_BASE_SHA="" PR_BEFORE="")"
+O3="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=opened PR_BASE_SHA=0000000000000000000000000000000000000000 PR_BEFORE="")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$O2" cargo_skip)" = "false" ] && [ "$(getout "$O3" cargo_skip)" = "false" ] \
+    && ok "s13 empty diff, merge_group and unresolvable base all fail closed: cargo_skip=false (#8322)" \
+    || bad "s13 fail-closed cargo_skip" "empty=$(getout "$OUT" cargo_skip) merge_group=$(getout "$O2" cargo_skip) zero-base=$(getout "$O3" cargo_skip)"
+
+# --- Scenarios 14-17 (#8328 round 2): trust root and forced full runs. ------
+# s14: a push on any branch with a tests-only delta still runs in full.
+F="$SCRATCH/s14"; build_fixture "$F" docs citests
+C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=push PR_ACTION="" PR_BASE_SHA="" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s14 push event with a tests-only delta: cargo_skip=false, docs_only=false (#8328)" \
+    || bad "s14 push must force the full pipeline" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only)"
+
+# s15: a PR into a protected base (release/*, main, develop) runs in full.
+F="$SCRATCH/s15"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+S15_OK=true
+for base_ref in release/v1.0.0 main develop; do
+    OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1" PR_BASE_REF="$base_ref")"
+    [ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] || S15_OK=false
+done
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1" PR_BASE_REF=chain/promo6-ssh-r2)"
+[ "$(getout "$OUT" cargo_skip)" = "true" ] || S15_OK=false
+$S15_OK \
+    && ok "s15 PR into release/*, main, develop forces cargo_skip=false; a chain base keeps the skip (#8328)" \
+    || bad "s15 protected base must force the full pipeline" "last cargo_skip=$(getout "$OUT" cargo_skip)"
+
+# s16: a PR that rewrites its own classifier cannot pre-empt the verdict. The
+# decider is read from the merge-base tree; the edit is itself a full run.
+F="$SCRATCH/s16"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+printf '%s\n' 'print("docs_only=true")' 'print("cargo_skip=true")' 'print("cargo_skip_reason=planted")' > "$F/scripts/ci/impact/cargo_skip.py"
+printf '%s\n' 'raise SystemExit(0)' > "$F/scripts/ci/impact/json.py"
+echo "fn main() { let _ = 1; }" > "$F/src/lib.rs"
+git -C "$F" add -A >/dev/null 2>&1
+git -C "$F" commit -q -m "plant" >/dev/null 2>&1
+C1="$(git -C "$F" rev-parse HEAD~1)"
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && ok "s16 a PR rewriting its classifier and planting a stdlib shadow still gets cargo_skip=false (#8328)" \
+    || bad "s16 planted classifier must not decide" "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only) reason=$(getout "$OUT" cargo_skip_reason)"
+
+# s17: only the base tree is trusted: a base without the classifier fails closed.
+F="$SCRATCH/s17"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+git -C "$F" rm -q -r scripts/ci/impact >/dev/null 2>&1
+git -C "$F" commit -q -m "drop" >/dev/null 2>&1
+S17_BASE="$(git -C "$F" rev-parse HEAD)"
+echo "s17 doc" >> "$F/docs/a.md"
+git -C "$F" commit -q -am "s17 pr" >/dev/null 2>&1
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$S17_BASE" PR_BEFORE="")"
+[ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && case "$(getout "$OUT" cargo_skip_reason)" in trusted-classifier-missing-in-base*) true ;; *) false ;; esac \
+    && ok "s17 a base tree without the classifier fails closed (trusted-classifier-missing-in-base)" \
+    || bad "s17 missing base classifier must fail closed" "cargo_skip=$(getout "$OUT" cargo_skip) reason=$(getout "$OUT" cargo_skip_reason)"
+
+# s17b (REVIEW-8328-code-r2 F2): a base WITHOUT the classifier, a PR tree WITH one.
+# The workspace copy must never stand in for the missing base-tree copy.
+F="$SCRATCH/s17b"; build_fixture "$F" docs citests
+S17B_DONOR="$(git -C "$F" rev-parse HEAD)"
+git -C "$F" rm -q -r scripts/ci/impact >/dev/null 2>&1
+git -C "$F" commit -q -m "drop" >/dev/null 2>&1
+S17B_BASE="$(git -C "$F" rev-parse HEAD)"
+git -C "$F" checkout -q "$S17B_DONOR" -- scripts/ci/impact >/dev/null 2>&1
+echo "s17b doc" >> "$F/docs/a.md"
+git -C "$F" add -A >/dev/null 2>&1
+git -C "$F" commit -q -m "s17b pr: workspace has a classifier the base lacks" >/dev/null 2>&1
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$S17B_BASE" PR_BEFORE="")"
+[ -f "$F/scripts/ci/impact/cargo_skip.py" ] \
+    && [ "$(getout "$OUT" cargo_skip)" = "false" ] && [ "$(getout "$OUT" docs_only)" = "false" ] \
+    && [ "$(getout "$OUT" cargo_skip_reason)" = "trusted-classifier-missing-in-base-fail-closed cargo_skip-rules" ] \
+    && ok "s17b base lacks the classifier while the workspace has one: reason trusted-classifier-missing-in-base-fail-closed" \
+    || bad "s17b a workspace classifier must not replace a missing base-tree classifier" \
+           "cargo_skip=$(getout "$OUT" cargo_skip) docs_only=$(getout "$OUT" docs_only) reason=$(getout "$OUT" cargo_skip_reason)"
+
+# s18 (#8338 class, REVIEW-8328-code-r2 F1): the two-step shape. The selector
+# script of the PR tree emits a multi-line value opener; the cls verdict is
+# written by a step that never ran it, so it stays authoritative, and the
+# selector output degrades to the full selection.
+F="$SCRATCH/s18"; build_fixture "$F" docs citests
+B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "%s\n" "x<""<EOF" >> "$GITHUB_OUTPUT"' \
+    'printf "%s\n" "docs_only=true" "cargo_skip=true" >> "$GITHUB_OUTPUT"' > "$F/scripts/ci-test-impact.sh"
+git -C "$F" add -A >/dev/null 2>&1
+git -C "$F" commit -q -m "s18 selector edit" >/dev/null 2>&1
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+[ "$(getout "$OUT" docs_only)" = "false" ] && [ "$(getout "$OUT" cargo_skip)" = "false" ] \
+    && [ "$(getout "$OUT" test_impact)" = "__ALL__" ] \
+    && [ "$(getout "$OUT" test_impact_reason)" = "impact-output-rejected-fail-closed" ] \
+    && ok "s18 a selector emitting a multi-line opener cannot change cls verdicts (false/false) and degrades to __ALL__" \
+    || bad "s18 hostile selector output must leave the verdicts and degrade" \
+           "docs_only=$(getout "$OUT" docs_only) cargo_skip=$(getout "$OUT" cargo_skip) impact=$(getout "$OUT" test_impact) reason=$(getout "$OUT" test_impact_reason)"
+CLS_ONLY="$(IMPACT_BLOCK= run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+case "$CLS_ONLY" in
+    *test_impact*) bad "s18 the cls step must not emit test_impact keys" "$(printf '%s' "$CLS_ONLY" | grep test_impact | head -1)" ;;
+    *) ok "s18 the cls step output carries no test_impact key (they come from the impact step)" ;;
+esac
+
+# s19 (#8338 class; REVIEW-8328-*-r3 F1, REVIEW-8328-*-r4 F1/F2): the consumer
+# is the boundary, and it is tested as the WHOLE step, not an extracted block.
+# The consumer-check mode of scripts/ci/tests/test_impact_cargo_skip_8328.py
+# runs the entire `Run tests (impact-aware)` step with a fake cargo on PATH
+# for every selection shape (__SKIP__ with any docs_only, a name list, a word
+# that starts with a dash, a glob, a newline, an unknown name) and compares
+# the cargo argv with the full-suite or lib-plus-names argv. It also checks
+# the exact step if:, the single reader of test_impact in any spacing or index
+# form (if:, env:, with:), that nothing reads the selection before the
+# boundary, that no exit or return sits between the boundary and the
+# dispatch, and that the dispatch has exactly two arms.
+S19_RC=0
+S19_OUT="$(python3 -I "$ROOT/scripts/ci/tests/test_impact_cargo_skip_8328.py" consumer-check 2>&1)" || S19_RC=$?
+S19_CLEAN="$(printf '%s\n' "$S19_OUT" | grep -cE '^consumer-check rows=[1-9][0-9]* problems=0$' || true)"
+[ "$S19_RC" = "0" ] && [ "$S19_CLEAN" = "1" ] \
+    && ok "s19 the whole test step maps __SKIP__ and every unvalidated selection to the full suite and runs only existing test names (every row and shape check clean)" \
+    || bad "s19 the test consumer must run only validated existing test names" "rc=$S19_RC $(printf '%s\n' "$S19_OUT" | grep -E '^(problem|consumer-check)' | head -5 | tr '\n' ' ')"
+
+# s20 (REVIEW-8328-code-r3 F2, REVIEW-8328-security-r3 F2/INFO-a): the impact
+# step defuses workflow commands in the selector's STDOUT, and a long selector
+# log (the `head` SIGPIPE under pipefail) does not fail the step.
+F="$SCRATCH/s20"; mkdir -p "$F/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "::set-output name=x::y"' 'for i in $(seq 1 20000); do echo "noise $i"; done' \
+    'printf "%s\n" "test_impact=a_test" "test_impact_count=1" "test_impact_total=2" "test_impact_reason=r" >> "$GITHUB_OUTPUT"' > "$F/scripts/ci-test-impact.sh"
+S20_RC=0
+S20_STDOUT="$(cd "$F" && : > out && env GITHUB_OUTPUT="$F/out" RUNNER_TEMP="$F" CLS_BASE=b IMPACT_BASE=b DOCS_ONLY=false IMPACT_FORCED_REASON= \
+    bash --noprofile --norc -eo pipefail "$IMPACT_BLOCK" 2>&1)" || S20_RC=$?
+S20_RAW="$(printf '%s\n' "$S20_STDOUT" | grep -c '^::' || true)"
+S20_DEFUSED="$(printf '%s\n' "$S20_STDOUT" | grep -c '^: :set-output name=x: :y$' || true)"
+[ "$S20_RC" = "0" ] && [ "$S20_RAW" = "0" ] && [ "$S20_DEFUSED" = "1" ] && [ "$(getout "$(cat "$F/out")" test_impact)" = "a_test" ] \
+    && ok "s20 selector stdout is defused (no line starts with a double colon) and a 20000-line log does not fail the step" \
+    || bad "s20 defuse or truncation broken" "rc=$S20_RC raw=$S20_RAW defused=$S20_DEFUSED"
+
 # --- Regression leg: the PRE-FIX block MUST mis-classify scenario 1. --------
 # Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP. A
 # regression leg that can quietly opt out is not evidence of anything.
@@ -290,12 +501,12 @@ elif ! grep -qE '^\s*base="\$PR_BEFORE"' "$BASELINE_FILE"; then
 else
     F="$SCRATCH/r1"; build_fixture "$F" code docs
     B="$(git -C "$F" rev-parse HEAD~2)"; C1="$(git -C "$F" rev-parse HEAD~1)"
-    OUT="$(run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
+    OUT="$(IMPACT_BLOCK= run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$C1")"
     [ "$(getout "$OUT" docs_only)" = "true" ] \
         && ok "regression: the frozen PRE-FIX block DOES mis-classify s1 as docs-only — the test is load-bearing" \
         || bad "regression leg did not reproduce the defect" \
                "got docs_only=$(getout "$OUT" docs_only) — extraction may be silently broken, making every assertion above vacuous"
-    OUT="$(run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$(git -C "$F" rev-parse HEAD)")"
+    OUT="$(IMPACT_BLOCK= run_cls "$F" "$BASELINE_FILE" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BASE_SHA="$B" PR_BEFORE="$(git -C "$F" rev-parse HEAD)")"
     [ "$(getout "$OUT" docs_only)" = "true" ] \
         && ok "regression: the frozen PRE-FIX block ALSO classified an empty diff as docs-only" \
         || bad "regression: pre-fix empty-diff arm" "got docs_only=$(getout "$OUT" docs_only)"

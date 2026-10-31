@@ -32,7 +32,8 @@ class LoadGateStep(unittest.TestCase):
         self.assertIsNotNone(m, 'Load gate step must be immediately before Run tests')
         body = m.group(1)
         self.assertIn("contains(matrix.runner, 'self-hosted')", body)
-        self.assertIn("needs.classify.outputs.docs_only != 'true'", body)
+        # #8322: the cargo legs gate on cargo_skip (a superset of docs_only).
+        self.assertIn("needs.classify.outputs.cargo_skip != 'true'", body)
         self.assertIn('python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"', body)
 
     def test_exactly_one_gate_step(self):

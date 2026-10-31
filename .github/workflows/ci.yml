@@ -510,60 +510,45 @@ jobs:
     # It is a toolchain-free git/bash decider — no cargo, no Postgres — so it
     # has nothing to gain from a self-hosted node and belongs on the hosted
     # pool, which has no slot contention. DO NOT re-home this job onto
-    # `self-hosted`. The `- id: cls` two-base body is UNCHANGED (frozen by
-    # scripts/test/test-ci-workflow-invariants.sh §A).
+    # `self-hosted`. The `- id: cls` two-base body is frozen by
+    # scripts/test/test-ci-workflow-invariants.sh §A; #8322 changed it
+    # deliberately in ONE place: the docs-only regex became the
+    # scripts/ci/impact/cargo_skip.py call, and every early exit also
+    # emits cargo_skip=false.
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
+      # #8322 - cargo matrix legs no-op on diffs no Rust test can observe.
+      # Superset of docs_only (also scripts/ci/tests/**), derived from
+      # scripts/ci/impact/rules.json `cargo_skip`. Consumed by step-level
+      # `if:` in `check` and `mobile-cross-compile` ONLY (never a job-level
+      # `if:` on a required matrix job: #2494/#2496).
+      cargo_skip: ${{ steps.cls.outputs.cargo_skip }}
+      cargo_skip_reason: ${{ steps.cls.outputs.cargo_skip_reason }}
       # v0.7.0 Task #12 (#1399) — test-impact selection output.
       # Possible values:
-      #   __SKIP__   docs-only diff (no Rust pipeline)
+      #   __SKIP__   docs-only diff (no Rust pipeline); the test consumer
+      #              never honours it (it maps to __ALL__, #8338 round 4)
       #   __ALL__    foundational change OR fallback (full integration suite)
       #   <names>    space-separated tests/*.rs binary names to dispatch
-      # Consumed by the `Run tests` steps in `check` + `postgres-feature`.
-      # The consumer ALWAYS runs `cargo test --lib` regardless of this
-      # value; impact selection optimises only the slow tests/*.rs
-      # integration binaries (~5-15s setup per binary).
-      test_impact: ${{ steps.cls.outputs.test_impact }}
-      test_impact_count: ${{ steps.cls.outputs.test_impact_count }}
-      test_impact_total: ${{ steps.cls.outputs.test_impact_total }}
-      test_impact_reason: ${{ steps.cls.outputs.test_impact_reason }}
+      # The ONLY reader is the `Run tests (impact-aware)` step in `check`
+      # (its TEST_IMPACT env); no other job or workflow reads it. That step
+      # only runs when cargo_skip != true, where a skip is never legitimate:
+      # it maps __SKIP__ to the full suite, accepts a name list only when
+      # every word names an existing tests/<word>.rs (round 5), and runs the
+      # full suite for __ALL__ or any rejected value. For an accepted list it
+      # runs `cargo test --lib` plus the named binaries.
+      test_impact: ${{ steps.impact.outputs.test_impact }}
+      test_impact_count: ${{ steps.impact.outputs.test_impact_count }}
+      test_impact_total: ${{ steps.impact.outputs.test_impact_total }}
+      test_impact_reason: ${{ steps.impact.outputs.test_impact_reason }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { persist-credentials: false, fetch-depth: 2 }
-      - name: Test impact selector security fallbacks
-        run: python3 scripts/test/test_ci_test_impact.py
-      - name: Workflow concurrency invariants (#6340)
-        run: python3 scripts/test/test_workflow_concurrency_6340.py
-      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
-      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
-      - name: Resolve the corpus ratchet base (#7987)
-        env:
-          PR_BASE_REF: ${{ github.base_ref }}
-        run: |
-          if [ -n "$PR_BASE_REF" ]; then
-            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
-              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
-              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-              git fetch --no-tags --deepen=200 origin HEAD || true
-            fi
-            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
-          else
-            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
-          fi
-      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
-      - name: Fetch the corpus replay objects (#7988)
-        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
-      - name: Shard partition and wiring unit tests (#6344)
-        run: python3 -m unittest discover -s scripts/ci/tests
-      - name: AGE self-heal helper unit test (#6161)
-        run: python3 scripts/test/test_ensure_age_extension_6161.py
-      # #7160 - scripts/test/ is outside the discovery root above; run the
-      # sweep script tests (including the Linux-only O_PATH test, which this
-      # ubuntu-latest job is where it executes) and the sweep workflow pin.
-      - name: Target sweep unit tests (#7160)
-        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
+      # #8328 (security F1): `cls` is the FIRST step after checkout. Every step
+      # below executes code from the PR tree, so none of them may run before the
+      # classify decision is written; `cls` also loads its decider from the
+      # merge-base tree, never from the PR head.
       - id: cls
         shell: bash
         env:
@@ -575,6 +560,7 @@ jobs:
           PR_BEFORE: ${{ github.event.before }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_ACTION: ${{ github.event.action }}
+          PR_BASE_REF: ${{ github.base_ref }}
         run: |
           # TWO SEPARATE BASES (#2496). Sharing one was the defect.
           #
@@ -613,10 +599,9 @@ jobs:
           # to a future refactor of the base-resolution block.
           if [ "$EVENT_NAME" = "merge_group" ]; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=merge_group-full-pipeline" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip_reason=merge-group-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=merge_group-full-pipeline" >> "$GITHUB_OUTPUT"
             echo "::notice::merge_group event — running the full pipeline (not docs-only)"
             exit 0
           fi
@@ -638,10 +623,9 @@ jobs:
           # base we cannot prove the diff is docs-only, so run everything.
           if [ -z "$cls_base" ] || [ "$cls_base" = "$ZERO" ] || ! git rev-parse "$cls_base" >/dev/null 2>&1; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=base-unreachable" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip_reason=base-unresolvable-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=base-unreachable" >> "$GITHUB_OUTPUT"
             echo "::notice::cannot resolve classification base commit ($cls_base) — running full pipeline"
             exit 0
           fi
@@ -662,10 +646,9 @@ jobs:
           }
           if ! fetch_base_tree "$cls_base"; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=base-fetch-failed" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip_reason=base-fetch-failed-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=base-fetch-failed" >> "$GITHUB_OUTPUT"
             echo "::notice::cannot fetch classification base tree ($cls_base) after retry — running full pipeline"
             exit 0
           fi
@@ -687,69 +670,201 @@ jobs:
             # `docs_only=true` arm let an amend-force-push neutralise
             # eight required gates on a PR that is not docs-only at all.
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=empty-diff-fail-closed" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip=false" >> "$GITHUB_OUTPUT"
+            echo "cargo_skip_reason=empty-diff-fail-closed cargo_skip-rules" >> "$GITHUB_OUTPUT"
+            echo "impact_forced_reason=empty-diff-fail-closed" >> "$GITHUB_OUTPUT"
             echo "::notice::no net diff vs classification base — failing CLOSED (full pipeline), NOT docs-only"
             exit 0
           fi
-          # docs-only iff every changed file matches docs/** OR *.md anywhere
-          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
-            docs_only=false
-            echo "::notice::code changes detected — running full pipeline"
-          else
-            docs_only=true
-            echo "::notice::docs-only diff — skipping Rust pipeline"
+          # #8322 - docs_only and cargo_skip come from ONE data source,
+          # scripts/ci/impact/rules.json `cargo_skip` (read by
+          # scripts/ci/impact/cargo_skip.py). docs_only is the docs/**|*.md set
+          # MINUS every doc a Rust test reads; cargo_skip additionally allows
+          # scripts/ci/tests/**.
+          #
+          # #8328 (security F1): the decider is loaded from the MERGE-BASE tree
+          # (git show <merge-base>:<path>), never from the PR head, and it runs
+          # with -I from a directory outside the workspace. A PR therefore cannot
+          # edit, shadow or pre-empt its own judgement. When the base tree has no
+          # classifier yet, both verdicts fail CLOSED (false). Any change under
+          # .github/ or scripts/ci/ (outside scripts/ci/tests/) is a full run.
+          # This step runs no workspace command at all (round 3): the selector
+          # that executes PR-tree code is the separate `impact` step below.
+          docs_only=false
+          cargo_skip=false
+          cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
+          trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
+          trust_impact="$trust_dir/scripts/ci/impact"
+          trust_ref=$(git merge-base HEAD "$cls_base" 2>/dev/null || echo "$cls_base")
+          mkdir -p "$trust_impact"
+          trusted=true
+          for trust_file in __init__.py common.py cargo_skip.py rules.json; do
+            git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
+          done
+          skip_out="${RUNNER_TEMP:-.}/cargo-skip.out"
+          : > "$skip_out"
+          if [ "$trusted" != "true" ]; then
+            cargo_skip_reason="trusted-classifier-missing-in-base-fail-closed cargo_skip-rules"
+          elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
+            cargo_skip_reason="classifier-or-workflow-edited-fail-closed cargo_skip-rules"
+          elif echo "$changed" | python3 -I "$trust_impact/cargo_skip.py" --stdin --rules "$trust_impact/rules.json" --event-name "$EVENT_NAME" --base-ref "$PR_BASE_REF" > "$skip_out"; then
+            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ] && [ "$(grep -c '^cargo_skip=' "$skip_out")" = "1" ] && [ "$(grep -c '^cargo_skip_reason=' "$skip_out")" = "1" ]; then
+              docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
+              cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
+              cargo_skip_reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
+            fi
           fi
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          case "$docs_only$cargo_skip" in
+            truetrue|falsetrue|falsefalse) ;;
+            *) docs_only=false; cargo_skip=false; cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules" ;;
+          esac
+          if [ "$cargo_skip" = "true" ]; then
+            echo "::notice::cargo_skip=true ($cargo_skip_reason) - cargo legs no-op"
+          else
+            echo "::notice::cargo_skip=false ($cargo_skip_reason) - running full pipeline"
+          fi
           echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
           echo "$changed"
 
-          # v0.7.0 Task #12 (#1399) — compute test-impact set.
-          # Always runs; the consumer steps decide whether to honor
-          # the output based on docs_only. The script is self-contained
-          # POSIX-compatible bash; full discipline + foundational list
-          # documented inline in scripts/ci-test-impact.sh.
-          # Token SELECTION uses $impact_base (may be the incremental
-          # previous head). The foundational safety check uses $cls_base
-          # so a follow-up commit cannot hide an earlier security change.
+          # #8328 round 3 (REVIEW-8328-code-r2 F1, REVIEW-8328-security-r2 F1,
+          # #8338): this step runs NO command from the workspace, so nothing a
+          # PR tree contains can reach the file that carries these verdicts.
+          # The test-impact selector (a PR-tree script) runs in the next step,
+          # `impact`, with its own output file; the two bases are handed over
+          # as step outputs because the selection base is resolved here.
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "cargo_skip=$cargo_skip" >> "$GITHUB_OUTPUT"
+          echo "cargo_skip_reason=$cargo_skip_reason" >> "$GITHUB_OUTPUT"
+          echo "cls_base=$cls_base" >> "$GITHUB_OUTPUT"
+          echo "impact_base=$impact_base" >> "$GITHUB_OUTPUT"
+      # v0.7.0 Task #12 (#1399) - compute the test-impact set. Always runs. Its
+      # one consumer, `Run tests (impact-aware)` in `check`, never honours
+      # __SKIP__ and accepts only validated existing test names (the boundary
+      # block there); the docs_only check below is a second layer.
+      # scripts/ci-test-impact.sh is self-contained bash; its discipline and the
+      # foundational list are documented inline there. Token SELECTION uses the
+      # impact base (may be the incremental previous head). The foundational
+      # safety check uses the classification base so a follow-up commit cannot
+      # hide an earlier security change.
+      #
+      # #8328 round 3: this is the ONLY step that runs the PR-tree selector, and
+      # it is separate from `cls` so the selector can never write, truncate or
+      # re-delimit the verdict file (workflow output-file injection, #8338). The
+      # selector writes to a scratch file; only allow-listed lines are copied to
+      # the real output, and anything else degrades to the full selection.
+      - id: impact
+        shell: bash
+        env:
+          CLS_BASE: ${{ steps.cls.outputs.cls_base }}
+          IMPACT_BASE: ${{ steps.cls.outputs.impact_base }}
+          DOCS_ONLY: ${{ steps.cls.outputs.docs_only }}
+          IMPACT_FORCED_REASON: ${{ steps.cls.outputs.impact_forced_reason }}
+        run: |
+          emit_all() {
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=$1" >> "$GITHUB_OUTPUT"
+          }
+          # An early exit of `cls` (merge_group, unresolvable base, empty diff)
+          # already decided: full selection, no PR-tree command.
+          if [ -n "$IMPACT_FORCED_REASON" ]; then
+            emit_all "$IMPACT_FORCED_REASON"
+            exit 0
+          fi
           chmod +x scripts/ci-test-impact.sh
           # SECOND-ORDER FAIL-OPEN, closed here (#2496). Splitting the two
           # bases is NECESSARY BUT NOT SUFFICIENT, and this was caught by
           # probing the fix's own CI run rather than by reading it. The
-          # `__SKIP__` sentinel is a DOCS-ONLY VERDICT — the consumer steps
-          # (`Run tests (impact-aware)` in `check`, `pg_test` in
-          # `postgres-feature`) treat it as "no-op the test step". But
+          # `__SKIP__` sentinel is a DOCS-ONLY VERDICT - the consumer steps of
+          # that time treated it as "no-op the test step" (today the one
+          # consumer, `Run tests (impact-aware)`, never does). But
           # `ci-test-impact.sh` derives it from the INCREMENTAL base, so on a
           # code PR whose last push is docs-only it still emitted `__SKIP__`
           # even with `docs_only=false`. Measured on this very fix's first
           # run (head 13f0b53d, a CHANGELOG-only last commit over 9 non-docs
           # files): every heavy gate correctly RAN, and `Check (macos-latest)`
-          # then logged `TEST_IMPACT: __SKIP__` / `docs-only diff — test step
-          # is a no-op` — compilation and clippy were restored while
+          # then logged `TEST_IMPACT: __SKIP__` / `docs-only diff - test step
+          # is a no-op` - compilation and clippy were restored while
           # `cargo test` still ran ZERO tests. So the impact lane carried its
           # own copy of the same fail-open one layer down.
           #
           # A verdict the classifier did not reach must never be inferred from
-          # a narrower diff: `__SKIP__` is honoured ONLY when `docs_only` is
-          # genuinely true, and otherwise degrades to `__ALL__` (run more, not
-          # fewer). The script is run with GITHUB_OUTPUT redirected to scratch
-          # so its emission is inspected BEFORE it can reach the real outputs
-          # — the guard is structural, not a hope that a later duplicate key
-          # wins.
+          # a narrower diff: this step passes `__SKIP__` through ONLY when
+          # `docs_only` is genuinely true, and otherwise degrades it to `__ALL__`
+          # (run more, not fewer). That is a second layer: the consumer maps
+          # `__SKIP__` to the full suite either way (it only runs when cargo_skip
+          # is not true, so a skip never reaches it legitimately). The selector
+          # runs with GITHUB_OUTPUT redirected to scratch so its emission is
+          # inspected BEFORE it can reach the real outputs.
+          # Its stdout is captured too (never streamed raw into the log, where a
+          # workflow command could be smuggled in).
           impact_out="${RUNNER_TEMP:-.}/ci-test-impact.out"
+          impact_log="${RUNNER_TEMP:-.}/ci-test-impact.log"
           : > "$impact_out"
-          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$impact_base" "HEAD" "$cls_base"
-          if [ "$docs_only" != "true" ] && grep -q '^test_impact=__SKIP__$' "$impact_out"; then
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=impact-skip-overridden-not-docs-only" >> "$GITHUB_OUTPUT"
-            echo "::notice::impact selection returned __SKIP__ from the incremental base ($impact_base) but the PR is NOT docs-only — overriding to __ALL__ (fail closed)"
+          : > "$impact_log"
+          selector_rc=0
+          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$IMPACT_BASE" "HEAD" "$CLS_BASE" > "$impact_log" 2>&1 || selector_rc=$?
+          sed -n '1,200{s/::/: :/g;p}' "$impact_log"
+          # Allow-list: four keys, plain values. Any other line (a multi-line
+          # value opener, a blank line, a foreign key, a control character)
+          # makes the whole emission untrusted. The reason may also carry the
+          # parentheses and percent sign of the selector's own summary text.
+          # test_impact itself carries only test names, sentinels and spaces
+          # (round 5: no dash, so no word can become a cargo option); the
+          # consumer re-checks every name against tests/*.rs either way.
+          allow_re='^test_impact=[A-Za-z0-9_ ]*$|^(test_impact_count|test_impact_total)=[A-Za-z0-9_.,:/ +-]*$|^test_impact_reason=[A-Za-z0-9_.,:/ ()%+-]*$'
+          stray_rc=0
+          grep -aEv "$allow_re" "$impact_out" > /dev/null || stray_rc=$?
+          keys_ok=true
+          for impact_key in test_impact test_impact_count test_impact_total test_impact_reason; do
+            [ "$(grep -ac "^${impact_key}=" "$impact_out")" = "1" ] || keys_ok=false
+          done
+          if [ "$selector_rc" != "0" ]; then
+            emit_all "impact-selector-failed-fail-closed"
+            echo "::notice::impact selector exited $selector_rc - full selection (fail closed)"
+          elif [ "$stray_rc" != "1" ] || [ "$keys_ok" != "true" ]; then
+            emit_all "impact-output-rejected-fail-closed"
+            echo "::notice::impact selector output failed the allow-list - full selection (fail closed)"
+          elif [ "$DOCS_ONLY" != "true" ] && grep -aq '^test_impact=__SKIP__$' "$impact_out"; then
+            emit_all "impact-skip-overridden-not-docs-only"
+            echo "::notice::impact selection returned __SKIP__ from the incremental base ($IMPACT_BASE) but the PR is NOT docs-only - overriding to __ALL__ (fail closed)"
           else
             cat "$impact_out" >> "$GITHUB_OUTPUT"
           fi
+      - name: Test impact selector security fallbacks
+        run: python3 scripts/test/test_ci_test_impact.py
+      - name: Workflow concurrency invariants (#6340)
+        run: python3 scripts/test/test_workflow_concurrency_6340.py
+      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
+      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
+      - name: Resolve the corpus ratchet base (#7987)
+        env:
+          PR_BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$PR_BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
+              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
+              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+              git fetch --no-tags --deepen=200 origin HEAD || true
+            fi
+            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
+          else
+            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
+          fi
+      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
+      - name: Fetch the corpus replay objects (#7988)
+        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      - name: Shard partition and wiring unit tests (#6344)
+        run: python3 -m unittest discover -s scripts/ci/tests
+      - name: AGE self-heal helper unit test (#6161)
+        run: python3 scripts/test/test_ensure_age_extension_6161.py
+      # #7160 - scripts/test/ is outside the discovery root above; run the
+      # sweep script tests (including the Linux-only O_PATH test, which this
+      # ubuntu-latest job is where it executes) and the sweep workflow pin.
+      - name: Target sweep unit tests (#7160)
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
   # need to run on macOS where it just duplicates work and burns
@@ -1189,7 +1304,7 @@ jobs:
       # from the real time left under the job `timeout-minutes`, including the
       # load-gate wait and every pre-test step.
       - name: Record job start (#6795)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.cargo_skip != 'true'
         run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
 
       # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
@@ -1203,7 +1318,7 @@ jobs:
       # contexts and rule (b1) of scripts/check-required-contexts.sh forbids a
       # job-level `if:` here (#2494 wedge class).
       - name: Fork-PR refusal (self-hosted legs never run fork code)
-        if: needs.classify.outputs.docs_only != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
+        if: needs.classify.outputs.cargo_skip != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
         run: |
           echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.leg }})."
           exit 1
@@ -1211,9 +1326,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: docs-only short-circuit
-        if: needs.classify.outputs.docs_only == 'true'
-        run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
+      # #8322 - ONE line naming the reason and the rules version. STEP-level:
+      # this is a required matrix job (rule (b1), #2494).
+      - name: cargo_skip short-circuit
+        if: needs.classify.outputs.cargo_skip == 'true'
+        env:
+          CARGO_SKIP_REASON: ${{ needs.classify.outputs.cargo_skip_reason }}
+        run: echo "::notice::cargo_skip - ${{ matrix.leg }} matrix leg is a no-op ($CARGO_SKIP_REASON)"
 
       # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
       # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,
@@ -1226,7 +1345,7 @@ jobs:
       # root is defined once, in scripts/ci/shared_cargo_target.py.
       # Self-hosted legs only (matrix.shared_target).
       - name: Per-runner cargo target (#7188)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.shared_target
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
@@ -1244,7 +1363,7 @@ jobs:
       # wrong disk). Linux self-hosted legs only: the macOS fleet hosts may lack
       # sccache.
       - name: sccache build cache (#7199)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target && runner.os == 'Linux'
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.shared_target && runner.os == 'Linux'
         run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
@@ -1286,7 +1405,7 @@ jobs:
       # BEFORE the setup-python / setup-node steps that repopulate exactly the
       # versions the #2452 conformance readers need.
       - name: Free disk before tests (hosted image only, #1407/#1405/#1387 fix)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'
         run: |
           set -eu
           echo "::group::Disk usage before cleanup"
@@ -1361,15 +1480,15 @@ jobs:
       # makes the freed space (or a non-disk root cause) visible in the log.
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'
         with:
           python-version: '3.12'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'
         with:
           node-version: '22'
       - name: Ensure python3 + node present (self-hosted; #2452 fail-closed)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment != 'github-hosted'
         shell: bash
         run: |
           command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
@@ -1379,7 +1498,7 @@ jobs:
       # FAIL CLOSED if rustup is missing on a self-hosted node — see the
       # `lint` job in ci.yml for the full rationale (#3128 / restore #3293).
       - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted' && needs.classify.outputs.docs_only != 'true'
+        if: runner.environment != 'github-hosted' && needs.classify.outputs.cargo_skip != 'true'
         shell: bash
         run: |
           test -x "$HOME/.cargo/bin/rustup" || {
@@ -1387,7 +1506,7 @@ jobs:
             exit 1
           }
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.cargo_skip != 'true'
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
@@ -1401,7 +1520,7 @@ jobs:
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — SAVE the cache only on trunk `push` events
           # (push.branches = main/develop/release/**). `pull_request` and
@@ -1427,7 +1546,7 @@ jobs:
       # nested build never flaked on ubuntu, and skipping the step there
       # keeps the tool build off the ubuntu critical path.
       - name: Prebuild t0 orchestrator (macOS e1 anti-flake, #1853)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'macos-fed'
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.node == 'macos-fed'
         shell: bash
         run: |
           set -euo pipefail
@@ -1445,8 +1564,11 @@ jobs:
       # compile-once / link-once pass). Then dispatches the slow
       # `tests/*.rs` integration binaries selectively:
       #   __ALL__   → `cargo test` (full suite, the v0.6.x posture)
-      #   __SKIP__  → no-op (docs-only diff)
-      #   <names>   → `cargo test --lib --test t1 --test t2 ...`
+      #   __SKIP__  → full suite (mapped to __ALL__ at the consumer; the
+      #               step is gated on cargo_skip != true, #8338 round 4)
+      #   <names>   → `cargo test --lib --test t1 --test t2 ...`, only when
+      #               every word names an existing tests/<word>.rs; any
+      #               other value runs the full suite (#8338 round 5)
       # The `classify` job's foundational-fallback list (in
       # scripts/ci-test-impact.sh) HARD-FORCES __ALL__ on any change
       # to a cross-cutting surface (Cargo.toml, src/lib.rs, schema
@@ -1475,7 +1597,7 @@ jobs:
       # a maintenance connection to issue CREATE/DROP DATABASE. Fail-closed:
       # a missing URL file or a failed CREATE reds the leg.
       - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
           # matrix.leg via env (never inlined into the script body) so the
@@ -1571,7 +1693,7 @@ jobs:
       # this leg is the one that has AI_MEMORY_TEST_POSTGRES_URL (minted above). The flag turns a missing
       # URL or psql into a failure instead of a silent skip.
       - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
           AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
@@ -1591,7 +1713,7 @@ jobs:
       # / quarantine #2469. If it ld-SIGBUS again → mold is still needed
       # for link and the SIGSEGV is independent. Hosted sqlite only.
       - name: Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.leg == 'ubuntu-latest,sqlite'
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.leg == 'ubuntu-latest,sqlite'
         run: |
           {
             echo "CARGO_BUILD_JOBS=1"
@@ -1630,7 +1752,7 @@ jobs:
       # `AI_MEMORY_NO_CONFIG` is likewise kept deliberately: the f1 runners set
       # it on purpose so jobs never read operator config.
       - name: Scrub inherited passphrase env (self-hosted only, issue 3539 hygiene)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment != 'github-hosted'
         run: |
           set -euo pipefail
           for name in AI_MEMORY_DB_PASSPHRASE AI_MEMORY_DB_PASSPHRASE_FILE; do
@@ -1648,11 +1770,11 @@ jobs:
       # measured load, then proceed. The helper NEVER fails on load alone.
       # Self-hosted legs only: hosted runners are dedicated VMs.
       - name: Load gate (#6795)
-        if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
+        if: needs.classify.outputs.cargo_skip != 'true' && contains(matrix.runner, 'self-hosted')
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
       - name: Run tests (impact-aware)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.cargo_skip != 'true'
         env:
           AI_MEMORY_NO_CONFIG: "1"
           TIER: ${{ matrix.tier }}
@@ -1663,6 +1785,7 @@ jobs:
           # JavaScript tooling reads as a path to the node binary.
           CI_NODE: ${{ matrix.node }}
           TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}
+          DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
@@ -1851,12 +1974,6 @@ jobs:
           RESULT_LOG="${RUNNER_TEMP:-/tmp}/test-output-${TIER:-sqlite}.log"
           echo "TEST_RESULT_LOG=$RESULT_LOG" >> "$GITHUB_ENV"
           run_all() {
-          echo "::group::test-impact decision"
-          echo "reason: ${TEST_IMPACT_REASON:-unset}"
-          echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
-          echo "impact: ${TEST_IMPACT:-unset}"
-          echo "::endgroup::"
-
           # #1492 hung-test watchdog. libtest has no built-in per-test
           # timeout, so a single wedged integration test (e.g. an ephemeral
           # TCP port-bind / wait_for_ready race) used to stall this step
@@ -2193,10 +2310,65 @@ jobs:
             return "$rc"
           }
 
+          # consumer-boundary-begin (#8338 class, rounds 4 and 5)
+          # This step is the trust boundary for the test selection. It only runs
+          # when cargo_skip != 'true', and docs_only implies cargo_skip, so a
+          # `__SKIP__` arriving here is never a legitimate docs-only verdict: the
+          # PR-tree selector runs in the `impact` step and a hostile one can
+          # reach that step's real output file. (1) `__SKIP__` maps to the full
+          # suite whatever DOCS_ONLY says (the value is logged only). (2) Any
+          # other value except `__ALL__` must be a list of existing integration
+          # test names: only letters, digits, underscores and spaces, split with
+          # globbing off, every word matching ^[A-Za-z0-9_]+$ and naming a
+          # tests/<word>.rs file. Anything else runs the full suite: a word that
+          # starts with a dash would reach cargo as an option, a star would glob
+          # to file names, a newline would carry a second line into the log.
+          # Rejected words are counted, never echoed. Nothing above this block
+          # may read TEST_IMPACT; the decision log below prints the result only.
+          # decision: consumer boundary over step isolation, because PR-tree code
+          # runs inside the impact step and cannot be walled off from its outputs.
+          # decision: allow-list of existing test names over quoting alone,
+          # because a quoted word that starts with a dash is still an option to cargo.
+          if [ "${TEST_IMPACT:-}" = "__SKIP__" ]; then
+            echo "::notice::impact-skip-overridden-at-consumer (docs_only=${DOCS_ONLY:-unset}) - running the full suite (fail closed)"
+            echo "decision: __SKIP__ is never honoured in the cargo_skip-gated test step; full suite"
+            TEST_IMPACT="__ALL__"
+          fi
+          impact_rejected=0
+          impact_charset=ok
+          impact_words=()
+          if [ -z "${TEST_IMPACT:-}" ] || [ "$TEST_IMPACT" = "__ALL__" ]; then
+            TEST_IMPACT="__ALL__"
+          else
+            case "$TEST_IMPACT" in
+              *[!A-Za-z0-9_\ ]*) impact_charset=rejected ;;
+            esac
+            set -f
+            IFS=$' \t\n' read -r -d '' -a impact_words <<< "$TEST_IMPACT" || true
+            set +f
+            for impact_word in ${impact_words[@]+"${impact_words[@]}"}; do
+              if ! [[ "$impact_word" =~ ^[A-Za-z0-9_]+$ ]] || [ ! -f "tests/${impact_word}.rs" ]; then
+                impact_rejected=$((impact_rejected + 1))
+              fi
+            done
+            if [ "$impact_charset" != "ok" ] || [ "$impact_rejected" -ne 0 ] || [ "${#impact_words[@]}" -eq 0 ]; then
+              echo "::notice::impact-selection-rejected-at-consumer (${impact_rejected} of ${#impact_words[@]} words rejected, charset ${impact_charset}) - running the full suite (fail closed)"
+              TEST_IMPACT="__ALL__"
+            else
+              TEST_IMPACT="${impact_words[*]}"
+            fi
+          fi
+          # consumer-boundary-end
+          # Display only: the validated selection, and the three descriptive
+          # outputs with every character outside their allow-list class replaced.
+          impact_reason="${TEST_IMPACT_REASON:-unset}"
+          impact_count="${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
+          echo "::group::test-impact decision"
+          echo "reason: ${impact_reason//[!A-Za-z0-9_.,:\/ ()%+-]/?}"
+          echo "count:  ${impact_count//[!A-Za-z0-9_.,:\/ +-]/?}"
+          echo "impact: ${TEST_IMPACT}"
+          echo "::endgroup::"
           case "${TEST_IMPACT:-__ALL__}" in
-            __SKIP__)
-              echo "::notice::docs-only diff — test step is a no-op"
-              ;;
             __ALL__|"")
               echo "::notice::running FULL test suite (tier=${TIER:-sqlite})"
               # $FEAT/$TAIL are UNQUOTED on purpose: on enterprise-fed they
@@ -2209,12 +2381,13 @@ jobs:
               fi
               ;;
             *)
-              # Always run --lib first (catches every inline unit test)
+              # Always run --lib first (catches every inline unit test). The
+              # names come from the validated array of the boundary block.
               echo "::notice::running cargo test --lib + impact-selected integration binaries (tier=${TIER:-sqlite})"
               if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
                 # #6344: same lib + impacted-binaries set, sharded.
                 ARGS=(--lib)
-                for t in $TEST_IMPACT; do
+                for t in "${impact_words[@]}"; do
                   ARGS+=(--test "$t")
                 done
                 run_sharded "impact-selected (sharded: ${TEST_IMPACT})" 0 "${ARGS[@]}"
@@ -2222,7 +2395,7 @@ jobs:
                 run_tests "cargo test --lib" $FEAT --lib $TAIL
                 # Dispatch each impacted tests/*.rs binary
                 ARGS=()
-                for t in $TEST_IMPACT; do
+                for t in "${impact_words[@]}"; do
                   ARGS+=(--test "$t")
                 done
                 run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
@@ -2247,7 +2420,7 @@ jobs:
       # impact-aware dispatch invariants keep their exact `cargo test` shape;
       # the captured log is the honest durable record of what ran.
       - name: Upload test results (durable audit history)
-        if: needs.classify.outputs.docs_only != 'true' && always() && env.TEST_RESULT_LOG != ''
+        if: needs.classify.outputs.cargo_skip != 'true' && always() && env.TEST_RESULT_LOG != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: test-results-${{ matrix.node }}-${{ matrix.tier }}
@@ -2261,7 +2434,7 @@ jobs:
       # only 90 chars). always(): uploaded on success, failure, cancel and
       # timeout. build.jsonl (the compile JSON, large) is not uploaded.
       - name: Upload shard logs (#6344)
-        if: always() && needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        if: always() && needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: shard-logs-${{ matrix.node }}-${{ matrix.tier }}
@@ -2276,7 +2449,7 @@ jobs:
       # by scripts/test/pg_isolated_binary.py under the shard directory. Only
       # present when the opt-in lane ran; uploaded on success AND failure.
       - name: Upload isolated-lane per-binary logs (#6383)
-        if: needs.classify.outputs.docs_only != 'true' && always() && matrix.tier == 'enterprise-fed'
+        if: needs.classify.outputs.cargo_skip != 'true' && always() && matrix.tier == 'enterprise-fed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pg-iso-logs-${{ matrix.node }}-${{ matrix.tier }}
@@ -2287,7 +2460,7 @@ jobs:
       # cargo-audit runs once (the advisory DB is platform-independent) — on
       # the `once` leg so it does not multiply across the 2x2.
       - name: Security audit
-        if: needs.classify.outputs.docs_only != 'true' && matrix.once
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
         env:
           # #3138: named pin for the cargo-audit version this job installs.
           CARGO_AUDIT_VERSION: "0.22.2"
@@ -2322,7 +2495,7 @@ jobs:
       # never correctness. `cargo clean --profile dev` touches only the
       # workspace `target/`, never a system path.
       - name: Trim target/debug before release build (hosted)
-        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'
         run: |
           set -eu
           echo "::group::Disk usage before cargo clean"
@@ -2344,7 +2517,7 @@ jobs:
       # prep `cargo clean` step above is already ubuntu-only.
 
       - name: Build release (once leg — release-profile smoke)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.once
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
         run: cargo build --release
 
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
@@ -2355,7 +2528,7 @@ jobs:
         # always() so a failed/cancelled test run still reclaims the db, but
         # still docs_only-guarded (rule (b3)): on a docs-only run the configure
         # step is skipped, no db is created, so there is nothing to drop.
-        if: always() && needs.classify.outputs.docs_only != 'true'
+        if: always() && needs.classify.outputs.cargo_skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -2396,11 +2569,11 @@ jobs:
       # #7199 - hit rate of the CI sccache server, then stop that server (same
       # SCCACHE_SERVER_PORT) unless a sibling runner's in-use marker is fresh.
       - name: sccache hit-rate summary (#7199)
-        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.cargo_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/ci/sccache_env.py --stats
 
       - name: sccache stop CI server (#7199)
-        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.cargo_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/sccache_env.py --stop --runner-name "$RUNNER_NAME_ARG"
@@ -2419,7 +2592,7 @@ jobs:
       # Never this runner's target, never outside the root shared_cargo_target.py
       # computes, never through a symlink. Bad arguments are refused with exit 2.
       - name: Prune stale runner artifacts (#7188)
-        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && matrix.shared_target && needs.classify.outputs.cargo_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
@@ -2437,11 +2610,11 @@ jobs:
       # --lock takes <root>/.evict.lock (the flock of the idle-target eviction)
       # for the sweep, waits at most 20 s and then skips with one warning and exit 0.
       - name: Sweep target/debug to the size cap (self-hosted)
-        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
+        if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
       - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
-        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
+        if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
@@ -2570,18 +2743,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: docs-only short-circuit
-        if: needs.classify.outputs.docs_only == 'true'
-        run: echo "::notice::docs-only PR — ${{ matrix.target }} cross-compile is a no-op"
+      - name: cargo_skip short-circuit
+        if: needs.classify.outputs.cargo_skip == 'true'
+        env:
+          CARGO_SKIP_REASON: ${{ needs.classify.outputs.cargo_skip_reason }}
+        run: echo "::notice::cargo_skip - ${{ matrix.target }} cross-compile is a no-op ($CARGO_SKIP_REASON)"
 
       - name: Install Rust 1.98.0 (target ${{ matrix.target }}, matches rust-toolchain.toml pin)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.cargo_skip != 'true'
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.cargo_skip != 'true'
         with:
           key: mobile-${{ matrix.target }}
 
@@ -2591,7 +2766,7 @@ jobs:
       # instead of the host's. r26d is the latest LTS at the time of
       # writing; bumps tracked alongside Rust stable cadence.
       - name: Install Android NDK r26d
-        if: needs.classify.outputs.docs_only != 'true' && matrix.target == 'aarch64-linux-android'
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.target == 'aarch64-linux-android'
         id: setup-ndk
         uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
@@ -2599,7 +2774,7 @@ jobs:
           add-to-path: false
 
       - name: Configure NDK toolchain for cargo
-        if: needs.classify.outputs.docs_only != 'true' && matrix.target == 'aarch64-linux-android'
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.target == 'aarch64-linux-android'
         shell: bash
         run: |
           set -euo pipefail
@@ -2625,7 +2800,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: cargo check (--lib --features sqlite-bundled)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.cargo_skip != 'true'
         run: |
           cargo check \
             --target ${{ matrix.target }} \

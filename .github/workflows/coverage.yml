@@ -113,6 +113,9 @@ jobs:
         with: { persist-credentials: false, fetch-depth: 2 }
       - id: cls
         shell: bash
+        env:
+          COV_EVENT_NAME: ${{ github.event_name }}
+          COV_BASE_REF: ${{ github.base_ref }}
         run: |
           # LOAD-BEARING (#2496): on `pull_request` this base is the PR
           # BASE, spanning the WHOLE PR — NOT `github.event.before` (the
@@ -169,13 +172,38 @@ jobs:
             echo "::notice::no net diff vs base — failing CLOSED (full coverage sweep), NOT docs-only"
             exit 0
           fi
-          # docs-only iff every changed file matches docs/** OR *.md anywhere
-          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::changed files include non-docs paths — running full pipeline"
+          # #8328: the old shape (docs/** or *.md anywhere is docs-only) treated
+          # docs that Rust tests read as skippable, so the llvm-cov sweep was
+          # skipped on a diff those tests observe. docs_only now comes from the
+          # same decider as ci.yml (scripts/ci/impact/cargo_skip.py), loaded from
+          # the MERGE-BASE tree and run with -I from outside the workspace, so a
+          # PR cannot edit its own judgement. Anything unexpected is false.
+          docs_only=false
+          trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
+          trust_impact="$trust_dir/scripts/ci/impact"
+          trust_ref=$(git merge-base HEAD "$base" 2>/dev/null || echo "$base")
+          mkdir -p "$trust_impact"
+          trusted=true
+          for trust_file in __init__.py common.py cargo_skip.py rules.json; do
+            git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
+          done
+          skip_out="${RUNNER_TEMP:-.}/cov-skip.out"
+          : > "$skip_out"
+          if [ "$trusted" != "true" ]; then
+            echo "::notice::trusted classifier missing in base — running full pipeline"
+          elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
+            echo "::notice::classifier or workflow edited — running full pipeline"
+          elif echo "$changed" | python3 -I "$trust_impact/cargo_skip.py" --stdin --rules "$trust_impact/rules.json" --event-name "$COV_EVENT_NAME" --base-ref "$COV_BASE_REF" > "$skip_out"; then
+            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ]; then
+              docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
+            fi
+          fi
+          case "$docs_only" in true|false) ;; *) docs_only=false ;; esac
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          if [ "$docs_only" = "true" ]; then
+            echo "::notice::all changed files are docs no Rust test reads — skipping heavy llvm-cov sweep"
           else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::all changed files are docs-only — skipping heavy llvm-cov sweep"
+            echo "::notice::running the full coverage pipeline"
           fi
 
   per-module-thresholds:
