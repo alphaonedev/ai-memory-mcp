@@ -286,7 +286,8 @@ class ClsStepRunsNoWorkspaceCommand(unittest.TestCase):
         self.assertNotIn("test_impact=", body)
         self.assertNotRegex(body, r"echo \"test_impact")
 
-    DEFANG = r"sed 's/::/: :/g'"
+    DEFANG = r"sed -e 's/::/: :/g' -e 's/##\[/# #[/g'"
+    IMPACT_DEFANG = r'''sed -n '1,200{s/::/: :/g;s/##\[/# #[/g;p}' "$impact_log"'''
     # The only consumers of the changed-file list that never reach the log.
     SILENT_SINKS = ("grep ", "python3 -I ", "wc -l")
 
@@ -318,18 +319,39 @@ class ClsStepRunsNoWorkspaceCommand(unittest.TestCase):
         self.assertGreaterEqual(seen, 4)
         self.assertIn(self.DEFANG, body)
 
+    def test_impact_log_print_carries_both_defang_expressions_8343(self):
+        _, _, body = step_by_id(CI_YML, "impact")
+        self.assertIn(self.IMPACT_DEFANG, body)
+        self.assertEqual(len(re.findall(r"s/::/: :/g", body)), 1)
+
     def test_cls_defang_executed_neutralises_a_workflow_command_in_a_file_name_8343(self):
         _, _, body = cls_step(CI_YML)
         var = re.escape(self.changed_var(body))
         printers = [line.strip() for line in code_lines(body)
                     if re.match(r'\s*echo "\$%s"\s*($|\|\s*sed\b)' % var, line)]
         self.assertTrue(printers, "no log-print line for the changed-file list")
-        name = "docs/::stop-commands::x"
-        script = "%s='%s'\n%s\n" % (self.changed_var(body), name, "\n".join(printers))
+        names = "docs/::stop-commands::x\ndocs/h##[stop-commands]x"
+        script = "%s='%s'\n%s\n" % (self.changed_var(body), names, "\n".join(printers))
         res = subprocess.run(RUNNER_BASH + [script], capture_output=True, text=True, timeout=TIMEOUT_S)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("docs/: :stop-commands: :x", res.stdout)
+        self.assertIn("docs/h# #[stop-commands]x", res.stdout)
         self.assertNotIn("::", res.stdout)
+        self.assertNotIn("##[", res.stdout)
+
+    def test_impact_defang_executed_neutralises_both_command_forms_8343(self):
+        _, _, body = step_by_id(CI_YML, "impact")
+        lines = [l.strip() for l in code_lines(body)
+                 if '"$impact_log"' in l and l.strip().startswith("sed -n")]
+        self.assertEqual(len(lines), 1, "impact prints the selector log through exactly one sed")
+        script = "impact_log=/dev/stdin\n%s\n" % lines[0]
+        text = "x ::stop-commands::tok\ny ##[add-mask]z\n"
+        res = subprocess.run(RUNNER_BASH + [script], input=text, capture_output=True, text=True,
+                             timeout=TIMEOUT_S)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("::", res.stdout)
+        self.assertNotIn("##[", res.stdout)
+        self.assertIn("y # #[add-mask]z", res.stdout)
 
     def test_impact_step_follows_cls_and_owns_the_test_impact_outputs(self):
         steps, cls_pos, _ = cls_step(CI_YML)
