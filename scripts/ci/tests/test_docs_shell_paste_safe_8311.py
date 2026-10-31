@@ -398,35 +398,60 @@ SCAN = "$(sub"
 # `${ }` or `$[ ]` right under it closes it, as bash's scan ends there.
 UNSURE = "(?"
 REREADS = (REREAD, SCAN, UNSURE)
-SUBSHELLS = ("(",) + REREADS  # code frames that may stay open at the fence end
-CODE = (None, "(", "`") + REREADS  # frames where a command (heredoc, comment) can be
+# A plain `(` that bash's paren scan counts: one opened inside an arithmetic
+# `((`, inside another counted paren, or right inside a SCAN or UNSURE pair.
+# The scan counts a `)` inside a `${ }` or `$[ ]` over it, so that `)` closes
+# it (close_expansions). A `(` the parser reads (a subshell, a `$( )`) nests
+# the expansion instead and stays "(".
+PAREN = "(n"
+SUBSHELLS = ("(", PAREN) + REREADS  # code frames that may stay open at the fence end
+CODE = (None, "(", PAREN, "`") + REREADS  # frames where a command (heredoc, comment) can be
 EXPANSIONS = ("${", "$[")  # bash's paren scans do not nest these
+# Frames close_expansions looks through, down from the expansions, for a SCAN.
+SEE_THROUGH = ("(", PAREN, "((", REREAD, UNSURE) + EXPANSIONS
+# Open frames one logical line may hold. Past it the reading is no longer
+# trusted: the line is flagged as an open one and the rest rescanned one
+# physical line at a time (fails closed). Real shell nests a few levels.
+FRAME_CAP = 256
 LOOKAHEAD_CAP = 4096  # characters one (( or $(( opener may look ahead
 OPEN_REASON = "quote or expansion still open at the end of the fence"
 TRAIL = "trailing comment on a command line"
 
 
 class Frames(list):
-    """The open-frame stack. It counts its backtick and re-read frames, so
-    "is a backtick open" costs O(1) however deep the stack grows."""
+    """The open-frame stack. It counts its backtick and re-read frames, and
+    keeps the indexes of its frames that are not expansions (bars) and of
+    those close_expansions does not look through (walls), so "is a backtick
+    open" and "which frame is under the expansions" cost O(1) however deep
+    the stack grows. Every change goes through append, pop and truncate.
+    `deep` is set once it holds more than FRAME_CAP frames."""
 
     def __init__(self):
         super().__init__()
         self.ticks = 0
         self.rereads = 0
+        self.bars = []
+        self.walls = []
+        self.deep = False
 
     def __eq__(self, other):
-        # ticks and rereads are derived from the items, so list equality is exact
+        # the counters and indexes are derived from the items, so list equality is exact
         return list.__eq__(self, other)
 
     __hash__ = None
 
     def append(self, frame):
+        at = len(self)
         list.append(self, frame)
         if frame == "`":
             self.ticks += 1
         elif frame in REREADS:
             self.rereads += 1
+        if frame not in EXPANSIONS:
+            self.bars.append(at)
+        if frame not in SEE_THROUGH:
+            self.walls.append(at)
+        self.deep = self.deep or at >= FRAME_CAP
 
     def extend(self, frames):
         for frame in frames:
@@ -434,11 +459,26 @@ class Frames(list):
 
     def pop(self):
         frame = list.pop(self)
+        at = len(self)
         if frame == "`":
             self.ticks -= 1
         elif frame in REREADS:
             self.rereads -= 1
+        if self.bars and self.bars[-1] == at:
+            self.bars.pop()
+        if self.walls and self.walls[-1] == at:
+            self.walls.pop()
         return frame
+
+    def truncate(self, size):
+        """Pop down to `size` frames (each frame is popped once: linear)."""
+        while len(self) > size:
+            self.pop()
+
+    def under(self):
+        """(j, k): the index of the top frame that is not an expansion and of
+        the top frame close_expansions does not look through, -1 for none."""
+        return self.bars[-1] if self.bars else -1, self.walls[-1] if self.walls else -1
 
 
 LOOK_STOPS = {
@@ -691,7 +731,8 @@ def lex_operator(line, i, stack, top, ahead):
         stack.extend(("((",) if arith else (REREAD if arith is False else UNSURE, "("))
         return 2
     if ch == "(" and (top in CODE or top == "(("):
-        stack.append("(")
+        counted = top in ("((", PAREN) or top == "(" and len(stack) > 1 and stack[-2] in (UNSURE, SCAN)
+        stack.append(PAREN if counted else "(")
         return 1
     if ch == ")" and top in SUBSHELLS:
         stack.pop()
@@ -724,26 +765,23 @@ def close_expansions(line, i, stack):
     nest those: an arithmetic `((` or `$((` ends at the first `))`, also
     inside one, and a `$((` re-read as `$( (..) )` (SCAN) ends where the
     parens of its text balance, a `)` inside one counted. So under an
-    arithmetic frame, or inside a SCAN, the `)` pops the expansions with
-    the frame it closes; an arithmetic frame whose inner part closes first
-    is re-read as a subshell, as in lex_operator. A `))` right under an
-    UNSURE pair closes it too. Elsewhere (in a `$( )` or a subshell bash's
-    parser nests the expansion) the `)` is literal.
-    Returns the characters used."""
-    j = len(stack) - 1
-    while j >= 0 and stack[j] in EXPANSIONS:
-        j -= 1
-    k = j
-    while k >= 0 and stack[k] in ("(", "((", REREAD, UNSURE) + EXPANSIONS:
-        k -= 1
+    arithmetic frame or a counted paren (PAREN), or inside a SCAN, the `)`
+    pops the expansions with the frame it closes; an arithmetic frame whose
+    inner part closes first is re-read as a subshell, as in lex_operator. A
+    `))` right under an UNSURE pair closes it too. Elsewhere (in a `$( )`
+    or a subshell bash's parser nests the expansion) the `)` is literal.
+    j and k come from the stack's indexes (Frames.under), not a walk, so a
+    deep stack costs O(1) per `)`. Returns the characters used."""
+    j, k = stack.under()
+    if j >= 0 and stack[j] == PAREN:
+        stack.truncate(j)  # the expansions and the paren the scan counts
+        return 1
     if j > 0 and stack[j - 1:j + 1] == [UNSURE, "("] and line.startswith("))", i):
-        del stack[j + 1:]  # expansions only; the pair pops so the re-read counts
-        stack.pop()
-        stack.pop()  # bash's scan ends here: arithmetic after all
+        stack.truncate(j - 1)  # the expansions, then the pair: arithmetic after all
         return 2
     if j < 0 or stack[j] != "((" and (k < 0 or stack[k] != SCAN):
         return 0
-    del stack[j + 1:]  # expansions only: no backtick or re-read to count
+    stack.truncate(j + 1)  # expansions only: no backtick or re-read to count
     if stack.pop() != "((":
         return 1
     if line.startswith("))", i):
@@ -764,7 +802,7 @@ def lex_line(line, stack, prev="\n", ahead=None):
     comment = None
     i, prev = pid_tail(line, stack, prev, ahead)
     n = len(line)
-    while i < n:
+    while i < n and not stack.deep:  # past FRAME_CAP the caller fails closed
         ch = line[i]
         top = stack[-1] if stack else None
         if top in ("'", '"', "$'"):
@@ -928,7 +966,7 @@ def scan_logical(lines, first_no, kinds, hits):
     """Scan `lines` as bash reads them: logical lines, frames carried across
     lines, heredoc bodies skipped. Appends to `kinds` and `hits`; returns
     the index of the logical line still holding an open quote or expansion
-    at the end of the fence, or None."""
+    at the end of the fence, or holding more than FRAME_CAP frames, or None."""
     index = Terminators(lines)
     look = Lookahead(lines)
     i = 0
@@ -955,6 +993,8 @@ def scan_logical(lines, first_no, kinds, hits):
         at, docs, cont, prev = lex_line(raw, stack, prev, look.at(i))
         if at is not None:
             hits.append((no, TRAIL))
+        if stack.deep:
+            return start  # past FRAME_CAP: flagged and rescanned as an open line
         pending.extend(docs)
         i += 1
         if cont or (stack and stack[-1] in QUOTES):
@@ -972,7 +1012,8 @@ def scan_physical(lines, first_no, begin, kinds, hits):
     """Scan `lines[begin:]` one physical line at a time with a fresh frame
     stack each, and skip no heredoc. Linear, and fails closed: used once a
     frame was left open, when the logical reading can no longer be trusted.
-    A line that leaves a frame (other than a subshell) open is flagged."""
+    A line that leaves a frame (other than a subshell) open, or nests more
+    than FRAME_CAP frames, is flagged."""
     look = Lookahead(lines[begin:], True)
     for i in range(begin, len(lines)):
         no = first_no + i
@@ -987,7 +1028,7 @@ def scan_physical(lines, first_no, begin, kinds, hits):
         at = lex_line(lines[i], stack, "\n", look.at(i - begin))[0]
         if at is not None:
             hits.append((no, TRAIL))
-        if any(f not in SUBSHELLS for f in stack):
+        if stack.deep or any(f not in SUBSHELLS for f in stack):
             hits.append((no, OPEN_REASON))
 
 
@@ -1529,6 +1570,53 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             with self.subTest(lines=lines[:1], bash_runs=bash_runs):
                 self.assertEqual([no for no, _ in scan_block(1, lines)], want)
 
+    def test_8311_paren_counts_through_expansion_round14(self):
+        # S24/C1 (round 14; missed at 6101db3d0, e01eb03cc and 412a77c9e):
+        # bash's paren scan of a `((` or `$((` (decided or undecided)
+        # counts a plain `(` inside it and a `)` inside a `${ }` or `$[ ]`
+        # over that paren, so the `)` closes the paren, the next `)` or
+        # `))` ends the arithmetic and the comment after it runs. Each row
+        # carries the lines bash 5.2 runs (`bash -n`, then `bash -c` echo
+        # markers) and the hits.
+        probes = (
+            # Code lens rows p1-p13.
+            (["false && (( `echo` ( ${x:- ) )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( `echo` ( ${x:- ) ))", "echo L2 # c }"], [2], "L2"),
+            (["false && (( `echo` ( ${x:- ) )) ; echo L1 # c } ) ) )"], [1], "L1"),
+            (["false && (( $(echo) ( ${x:- ) )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( $(echo) ( ${x:- ) )) ; echo L1 # c } ) ) )"], [1], "L1"),
+            (["false && (( `echo` ( $[ ) )) ; echo L1 # c ] ) ) )"], [1], "L1"),
+            (["false && (( " + "a" * 4100 + " ( ${x:- ) )) ; echo L1 # c } ) ) )"], [1], "L1"),
+            (["false && (( $\\", "(echo) ( ${x:- ) )) ; echo L2 # c } ) ) )"], [2], "L2"),
+            (["false && (( ( ${x:- ) )) ; echo L1 # c } ) ))"], [1], "L1"),
+            (["false && (( ( $[ ) )) ; echo L1 # c ] ) ))"], [1], "L1"),
+            (["false && echo $(( ( ${x:- ) )) ; echo L1 # c } ) ))"], [1], "L1"),
+            (["false && (( ( ( ${x:- ) ) )) ; echo L1 # c } ) ) ))"], [1], "L1"),
+            (["false && (( ( ${x:- ) ))", "echo L2 # c } ) ))"], [2], "L2"),
+            # Security lens rows not already above (c-deep6, c-deep8 and
+            # c-deep10 are p1, p4 and p2).
+            (["false && (( `echo` ( $[ ) )) ; echo L1 # c ]"], [1], "L1"),
+            (["false && (( ( ${x:- ) )) ; echo L1 # c } ))"], [1], "L1"),
+            (["false && (( ( ${x:- ) )) ; echo L1 # c } ) )"], [1], "L1"),
+            (["false && (( ( ${x:- ) )) ; echo L1 # c } )", ")"], [1], "L1, then rc 2"),
+            (["false && echo $(( ( ${x:- ) )) ; echo L1 # c } ))"], [1], "L1"),
+            (["false && (( `echo` ( ${x:- ) )) ; echo L1 # c } ))"], [1], "L1"),
+            (["false && (( `echo` ( ( ${x:- ) ) )) ; echo L1 # c }"], [1], "L1"),
+            (["false && (( `echo` ( $[ ) ))", "echo L2 # c ]"], [2], "L2"),
+            (["false && (( `echo` ( $\\", "{x:- ) )) ; echo L2 # c }"], [2], "L2"),
+            (["false && (( ( ${x:-" + "a" * 5000 + " ) )) ; echo L1 # c }"], [1], "L1"),
+            # Controls: p14 and p16 over-flag (bash aborts the line on a bad
+            # substitution and runs nothing; fails closed), p15 kept;
+            # n12: bash's parser nests the expansion in a `$( )`, rc 2.
+            (["(( ( ${x:- ) )) ; echo L1 # c } ) ))"], [1], "aborts"),
+            (["false && echo $(( ( ${x:- ) ) ) ; echo L1 # c } ) ) )"], [1], "L1"),
+            (["x=1; (( x == ( ${y:-1 ) )) ; echo L1 # c } ) ))"], [1], "aborts"),
+            (["false && (( `echo` $( ${x:- ) ) )) ; echo L1 # c }"], [], "syntax error"),
+        )
+        for lines, want, bash_runs in probes:
+            with self.subTest(lines=[line[:80] for line in lines], bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
+
     def test_8311_reread_dparen_takes_no_heredoc(self):
         # C1 (round-12 regression): a `$((` that bash answers as a subshell
         # is re-read like a plain `((`: its text is parsed on its own later,
@@ -1567,20 +1655,34 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # S13: a fence left open by every line, and a fence of unterminated
         # heredocs, each scan in linear time and stay fail closed. S14: the
         # `((` lookahead shares one budget per fence, so it stays linear.
+        # S25/C2 (round 14): close_expansions reads the frames under the
+        # expansions from the stack's indexes, and a logical line nested
+        # past FRAME_CAP frames is flagged and rescanned one physical line
+        # at a time; the rows marked FRAME_CAP pass it (fails closed: each
+        # leaves frames open on every line, and no line runs a comment).
         shapes = (
-            ("x ${", 20000), ("cat <<E", 0), ("((", 0), ("(( `", 0), ("(( $(", 0),
-            ("(( $'\\'", 0),  # S18: an escaped quote in an ANSI-C string
-            ("(( $$'\\'", 0),  # F1: a double dollar, then a plain quote
+            ("x ${", 20000), ("cat <<E", 0),
+            ("((", 1), ("(( `", 20000), ("(( $(", 1),  # FRAME_CAP
+            ("(( $'\\'", 20000),  # S18: an escaped quote in an ANSI-C string; FRAME_CAP
+            ("(( $$'\\'", 1),  # F1: a double dollar, then a plain quote; FRAME_CAP
             ("$\\", 0),  # G2: a `$$` split by a continuation on every line
-            ("$ (( $\\", 0),  # G2: the same in the `((` lookahead
+            ("$ (( $\\", 1),  # G2: the same in the `((` lookahead; FRAME_CAP
             ('echo "$$["; ls # c "]"', 20000),  # G1: the PID before `[`
             ('false && echo "$$("; ls # c ")"', 20000),  # C1: never expanded
             ("ls $\\\n'\\''; ls # c '", 10000),  # S20: a split `$'`, two lines
-            ('(( "${x:-"))"}" ; ls # c', 20000),  # S21: a quote nested in `${`
-            ('(( "$\\\n{x:-"))"}" ; ls # c', 10000),  # S21: the split form
+            ('(( "${x:-"))"}" ; ls # c', 20001),  # S21: a quote nested in `${`; FRAME_CAP
+            ('(( "$\\\n{x:-"))"}" ; ls # c', 20000),  # S21: the split form; FRAME_CAP
             ("false && (( ${x:- )) ; ls # c }", 20000),  # S22: `))` in an open `${`
             ("echo $(( ${x:- ) ) ; ls # c }", 20000),  # S23: a spaced closer
             ("echo $(( `ls` <<z )) ; ls # c", 20000),  # C1: a re-read `$((` shift
+            # S25/C2: a `)` in an open expansion over frames left open.
+            ("(( `e` ( ( ${x:- ) ) ; ls # c", 20001),  # FRAME_CAP
+            ("( ${x:- ) ; ls # c", 20000),
+            ("( $[ ) ; ls # c", 20000),
+            ("$( ${x:- ) ; ls # c", 20000),
+            ("echo ${x:- ) ) ) )", 20000),
+            ("(( ${x:- ) ) ) )", 20000),
+            ("false && (( `echo` ( ${x:- ) )) ; ls # c }", 20000),  # S24
         )
         for line, want in shapes:
             began = time.monotonic()
@@ -1588,6 +1690,13 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             spent = time.monotonic() - began
             self.assertEqual(len(got), want, line)
             self.assertLess(spent, SCAN_BUDGET_S, line)
+        # One 30017-character line: plain parens, then closers in an open
+        # `${`. Past FRAME_CAP it is flagged (fails closed; bash's parser
+        # nests the expansion in the subshells and runs no comment).
+        line = "(" * 10000 + " ${x:- " + ") " * 10000 + "; ls # c }"
+        began = time.monotonic()
+        self.assertEqual(scan_block(1, [line]), [(1, OPEN_REASON)])
+        self.assertLess(time.monotonic() - began, SCAN_BUDGET_S)
 
 
 if __name__ == "__main__":
