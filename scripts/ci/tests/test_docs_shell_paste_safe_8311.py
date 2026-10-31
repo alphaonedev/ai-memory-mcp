@@ -410,8 +410,9 @@ EXPANSIONS = ("${", "$[")  # bash's paren scans do not nest these
 # Frames close_expansions looks through, down from the expansions, for a SCAN.
 SEE_THROUGH = ("(", PAREN, "((", REREAD, UNSURE) + EXPANSIONS
 # Open frames one logical line may hold. Past it the reading is no longer
-# trusted: the line is flagged as an open one and the rest rescanned one
-# physical line at a time (fails closed). Real shell nests a few levels.
+# trusted: the hits found so far stay, the line is flagged as an open one,
+# and every later line of the fence that holds a `#` is flagged too (fails
+# closed; no stateless rescan). Real shell nests a few levels.
 FRAME_CAP = 256
 LOOKAHEAD_CAP = 4096  # characters one (( or $(( opener may look ahead
 OPEN_REASON = "quote or expansion still open at the end of the fence"
@@ -965,8 +966,10 @@ def trailing_backslash(text):
 def scan_logical(lines, first_no, kinds, hits):
     """Scan `lines` as bash reads them: logical lines, frames carried across
     lines, heredoc bodies skipped. Appends to `kinds` and `hits`; returns
-    the index of the logical line still holding an open quote or expansion
-    at the end of the fence, or holding more than FRAME_CAP frames, or None."""
+    (start, deep): `start` is the index of the logical line still holding
+    an open quote or expansion at the end of the fence, or holding more
+    than FRAME_CAP frames, or None; `deep` is True when that logical line
+    passed FRAME_CAP (the scan stops there)."""
     index = Terminators(lines)
     look = Lookahead(lines)
     i = 0
@@ -994,7 +997,7 @@ def scan_logical(lines, first_no, kinds, hits):
         if at is not None:
             hits.append((no, TRAIL))
         if stack.deep:
-            return start  # past FRAME_CAP: flagged and rescanned as an open line
+            return start, True  # past FRAME_CAP: scan_block fails closed from here
         pending.extend(docs)
         i += 1
         if cont or (stack and stack[-1] in QUOTES):
@@ -1005,15 +1008,17 @@ def scan_logical(lines, first_no, kinds, hits):
         if pending:
             i = skip_heredocs(lines, i, pending, index)
             pending = []
-    return start if any(f not in SUBSHELLS for f in stack) else None
+    return (start if any(f not in SUBSHELLS for f in stack) else None), False
 
 
 def scan_physical(lines, first_no, begin, kinds, hits):
     """Scan `lines[begin:]` one physical line at a time with a fresh frame
-    stack each, and skip no heredoc. Linear, and fails closed: used once a
-    frame was left open, when the logical reading can no longer be trusted.
-    A line that leaves a frame (other than a subshell) open, or nests more
-    than FRAME_CAP frames, is flagged."""
+    stack each, and skip no heredoc. Linear, and used only once a frame was
+    left open at the end of the fence (input bash rejects, so it runs none
+    of these lines): the start line is already flagged and this reading is
+    advisory. A line that leaves a frame (other than a subshell) open, or
+    nests more than FRAME_CAP frames, is flagged. A FRAME_CAP trip on code
+    bash accepts never comes here (deep_hits fails closed instead)."""
     look = Lookahead(lines[begin:], True)
     for i in range(begin, len(lines)):
         no = first_no + i
@@ -1030,6 +1035,20 @@ def scan_physical(lines, first_no, begin, kinds, hits):
             hits.append((no, TRAIL))
         if stack.deep or any(f not in SUBSHELLS for f in stack):
             hits.append((no, OPEN_REASON))
+
+
+def deep_hits(lines, first_no, start, hits):
+    """Hits to add for a fence whose logical line, opened at `start`, passed
+    FRAME_CAP. The frames past the cap are unknown, so a quote bash reads as
+    open may look closed on a fresh stack: flag the start line and every
+    later line that holds a `#` (fails closed; a comment needs a `#`),
+    except a line `hits` already flags."""
+    seen = {no for no, _ in hits}
+    out = [(first_no + start, OPEN_REASON)] if first_no + start not in seen else []
+    for i in range(start + 1, len(lines)):
+        if "#" in lines[i] and first_no + i not in seen:
+            out.append((first_no + i, OPEN_REASON))
+    return out
 
 
 def comment_hits(kinds):
@@ -1055,8 +1074,13 @@ def scan_block(first_no, body, indent=""):
         return []
     kinds = []  # (line_no, "command" | "comment", text)
     hits = []
-    start = scan_logical(lines, first_no, kinds, hits)
-    if start is not None:
+    start, deep = scan_logical(lines, first_no, kinds, hits)
+    if deep:
+        # Past FRAME_CAP: every hit so far was read with the frames carried
+        # (all on lines up to the one that passed the cap), so keep them;
+        # no stateless rescan.
+        hits.extend(deep_hits(lines, first_no, start, hits))
+    elif start is not None:
         # (d): a quote or expansion is still open. Skip nothing: flag the
         # line it opened on and rescan the lines after it.
         no = first_no + start
@@ -1617,6 +1641,44 @@ class DocsShellPasteSafe8311(unittest.TestCase):
             with self.subTest(lines=[line[:80] for line in lines], bash_runs=bash_runs):
                 self.assertEqual([no for no, _ in scan_block(1, lines)], want)
 
+    def test_8311_frame_cap_fails_closed_round15(self):
+        # F1/M1 (round 15; missed at 5efb620c6, flagged at 412a77c9e): a
+        # logical line bash accepts that opens its 257th frame passes
+        # FRAME_CAP. The round-14 guard dropped the hits found after the
+        # line's start and rescanned each later line on a fresh stack, so a
+        # quote bash reads as open across two lines looked closed there and
+        # the comment bash runs went unflagged. Now the hits found so far
+        # stay, and the start line and every later line holding a `#` are
+        # flagged. Each row carries the line bash 5.2 runs (`bash -n` 0,
+        # then `bash -c` echo markers) and the hits. Rows are built here,
+        # never written into a doc.
+        def o(n):
+            return "( " * n
+
+        dq = ['echo "a', 'b" ; echo L3 # c "']
+        sq = ["echo 'a", "b' ; echo L3 # c '"]
+        must_flag = (
+            # Code lens: f256-dq, f256-sq, f257-dsub-dq, f-lines-dq.
+            ([o(256)] + dq + [" )" * 256], [1, 3], "L3"),
+            ([o(256)] + sq + [" )" * 256], [1, 3], "L3"),
+            (["x=$( " + o(257)] + dq + [" )" * 257 + " )", 'echo "$x"'], [1, 3], "L3"),
+            (["("] * 257 + ['echo "a', 'b" ; echo L259 # c "'] + [")"] * 257, [1, 259], "L259"),
+            # Security lens: fq2_256, fq2_split, ferase2, fdq2_256.
+            ([o(256) + "echo 'a", "b' ; echo L2 # c '", ") " * 256], [1, 2], "L2"),
+            ([o(100)] * 3 + ["echo 'a", "b' ; echo L5 # c '", ") " * 300], [1, 5], "L5"),
+            (["(", "echo 'a", "b' ; echo L3 # c '", o(257) + "echo x", ") " * 258], [1, 3], "L3"),
+            ([o(256) + 'echo "a', 'b" ; echo L2 # c "', ") " * 256], [1, 2], "L2"),
+        )
+        controls = (
+            # Under the cap: fq2_255, ferase2_250, ferase250.
+            ([o(255) + "echo 'a", "b' ; echo L2 # c '", ") " * 255], [2], "L2"),
+            (["(", "echo 'a", "b' ; echo L3 # c '", o(250) + "echo x", ") " * 251], [3], "L3"),
+            (["(", "echo 'a", "b' ; echo L3 # c", o(250) + "echo x", ") " * 251], [3], "L3"),
+        )
+        for lines, want, bash_runs in must_flag + controls:
+            with self.subTest(lines=[line[:40] for line in lines[:4]], bash_runs=bash_runs):
+                self.assertEqual([no for no, _ in scan_block(1, lines)], want)
+
     def test_8311_reread_dparen_takes_no_heredoc(self):
         # C1 (round-12 regression): a `$((` that bash answers as a subshell
         # is re-read like a plain `((`: its text is parsed on its own later,
@@ -1656,32 +1718,38 @@ class DocsShellPasteSafe8311(unittest.TestCase):
         # heredocs, each scan in linear time and stay fail closed. S14: the
         # `((` lookahead shares one budget per fence, so it stays linear.
         # S25/C2 (round 14): close_expansions reads the frames under the
-        # expansions from the stack's indexes, and a logical line nested
-        # past FRAME_CAP frames is flagged and rescanned one physical line
-        # at a time; the rows marked FRAME_CAP pass it (fails closed: each
-        # leaves frames open on every line, and no line runs a comment).
+        # expansions from the stack's indexes. F1/M1 (round 15): a logical
+        # line nested past FRAME_CAP frames is flagged, and so is every
+        # later line that holds a `#` (no stateless rescan); the rows marked
+        # FRAME_CAP pass it. Rows marked R15 changed in round 15: past the
+        # cap a line with no `#` (it cannot run a comment) is no longer
+        # flagged, and line 1, which the logical scan flags as a trailing
+        # comment, is not flagged a second time; each fence stays flagged
+        # and so does every line holding a `#` past the cap (fails closed).
         shapes = (
-            ("x ${", 20000), ("cat <<E", 0),
-            ("((", 1), ("(( `", 20000), ("(( $(", 1),  # FRAME_CAP
-            ("(( $'\\'", 20000),  # S18: an escaped quote in an ANSI-C string; FRAME_CAP
+            ("x ${", 1),  # FRAME_CAP; R15
+            ("cat <<E", 0),
+            ("((", 1), ("(( $(", 1),  # FRAME_CAP
+            ("(( `", 1),  # FRAME_CAP; R15
+            ("(( $'\\'", 1),  # S18: an escaped quote in an ANSI-C string; FRAME_CAP; R15
             ("(( $$'\\'", 1),  # F1: a double dollar, then a plain quote; FRAME_CAP
             ("$\\", 0),  # G2: a `$$` split by a continuation on every line
             ("$ (( $\\", 1),  # G2: the same in the `((` lookahead; FRAME_CAP
             ('echo "$$["; ls # c "]"', 20000),  # G1: the PID before `[`
             ('false && echo "$$("; ls # c ")"', 20000),  # C1: never expanded
             ("ls $\\\n'\\''; ls # c '", 10000),  # S20: a split `$'`, two lines
-            ('(( "${x:-"))"}" ; ls # c', 20001),  # S21: a quote nested in `${`; FRAME_CAP
-            ('(( "$\\\n{x:-"))"}" ; ls # c', 20000),  # S21: the split form; FRAME_CAP
+            ('(( "${x:-"))"}" ; ls # c', 20000),  # S21: a quote nested in `${`; FRAME_CAP; R15
+            ('(( "$\\\n{x:-"))"}" ; ls # c', 10001),  # S21: the split form; FRAME_CAP; R15
             ("false && (( ${x:- )) ; ls # c }", 20000),  # S22: `))` in an open `${`
             ("echo $(( ${x:- ) ) ; ls # c }", 20000),  # S23: a spaced closer
             ("echo $(( `ls` <<z )) ; ls # c", 20000),  # C1: a re-read `$((` shift
             # S25/C2: a `)` in an open expansion over frames left open.
-            ("(( `e` ( ( ${x:- ) ) ; ls # c", 20001),  # FRAME_CAP
+            ("(( `e` ( ( ${x:- ) ) ; ls # c", 20000),  # FRAME_CAP; R15
             ("( ${x:- ) ; ls # c", 20000),
             ("( $[ ) ; ls # c", 20000),
             ("$( ${x:- ) ; ls # c", 20000),
-            ("echo ${x:- ) ) ) )", 20000),
-            ("(( ${x:- ) ) ) )", 20000),
+            ("echo ${x:- ) ) ) )", 1),  # FRAME_CAP; R15
+            ("(( ${x:- ) ) ) )", 1),  # FRAME_CAP; R15
             ("false && (( `echo` ( ${x:- ) )) ; ls # c }", 20000),  # S24
         )
         for line, want in shapes:
