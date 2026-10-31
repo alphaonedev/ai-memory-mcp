@@ -333,7 +333,7 @@ PINNED_CONTENT = {
     "infra/pgbouncer/pgbouncer.ini": "3aaabe9d6c683f0b6d3e47061d0de9543059283ea195b7a380c22de13c628946",
     "infra/pgbouncer/userlist.txt": "c6f9bb4ae05b289be2749dd528075c0dc885a2653578bab9a26c51c59c591e9a",
     "infra/pgbouncer/role-defaults.sql": "1ba2789501d6fbcf245a3cab8cc2811d04f7fb198c10d9edc7e9f8cccc3bac20",
-    "infra/pillar4-envelope/measure-envelope.sh": "9e66542eddf125a5b9dc40dae4ee7906631c43de9d89b7d54c2c989cdad54087",
+    "infra/pillar4-envelope/measure-envelope.sh": "0646bcdc60d6afb28126387bf163770226c09cdf9768eb4d51a1bf33c51d22a3",
 }
 PIN_REVIEW = "requires a full code and security review of its diff before the pin moves (#4734)"
 
@@ -895,16 +895,16 @@ test_env_numeric_defaults_are_validated_digits_only_4734_r23), and the content p
 (PINNED_CONTENT), so neither line can change without a full review of the diff."""
 ENV_NUMERIC_VALIDATION = (
     '{name}="${{{name}:-{default}}}"\n'
-    "# The ramp arithmetic reads {name}, so it must be digits only (#4734 r23).\n"
+    "# The ramp arithmetic reads {name}, so it must be digits only with no leading zero (#4734 r23).\n"
     'case "${name}" in\n'
-    "  ''|*[!0-9]*) echo \"FATAL: {name} must be digits only\" >&2; exit 65 ;;\n"
+    "  ''|*[!0-9]*|0[0-9]*) echo \"FATAL: {name} must be digits only\" >&2; exit 65 ;;\n"
     "esac\n"
 )
 ENV_NUMERIC_DEFAULT_VALUES = {"STEP_DURATION_SECS": "20", "P95_BUDGET_MS": "250", "SHED_RATE_KNEE": "0.01"}  # r23 decision 4: the self-default of each name
 ENV_DECIMAL_VALIDATION = (
     '{name}="${{{name}:-{default}}}"\n'
     'case "${name}" in\n'
-    "  ''|*[!0-9.]*|*.*.*|.) echo \"FATAL: {name} must be a decimal number\" >&2; exit 65 ;;\n"
+    "  ''|*[!0-9.]*|*.*.*|.|0[0-9]*) echo \"FATAL: {name} must be a decimal number\" >&2; exit 65 ;;\n"
     "esac\n"
 )
 FUNC_NUMERIC = {"now_ms": "9a85ef3cf712502a8fcbd75f0c7d519cd7f9f2a1b3f74c3821237d615f27df50"}
@@ -2117,7 +2117,7 @@ G_LITERAL_BLOCKS = (
     ('integer-default-validation', (
      'STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"',
      'case "$STEP_DURATION_SECS" in',
-     '\'\'|*[!0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;', 'esac')),
+     '\'\'|*[!0-9]*|0[0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;', 'esac')),
     *(("decimal-validation-" + name, tuple(ENV_DECIMAL_VALIDATION.format(
         name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name]).rstrip("\n").split("\n")))
       for name in ("P95_BUDGET_MS", "SHED_RATE_KNEE")),
@@ -4625,6 +4625,7 @@ class StrictSubsetGrammar8312(unittest.TestCase):
             block = ENV_DECIMAL_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
             # Execute only the checked validation production, never a supplied command.
             for value, status in (('0', 0), ('250', 0), ('0.01', 0), ('.5', 0), ('5.', 0),
+                                  ('0250', 65), ('007', 65), ('00', 65), ('007.5', 65), ('01.5', 65),
                                   ('.', 65), ('1.2.3', 65), ('-1', 65), ('1e2', 65), ('bad-value', 65)):
                 with self.subTest(name=name, value=value):
                     proc = subprocess.run([bash, '--norc', '--noprofile', '-c', block],
@@ -4634,6 +4635,21 @@ class StrictSubsetGrammar8312(unittest.TestCase):
                     if status:
                         self.assertNotIn(value, proc.stderr)
                         self.assertIn('FATAL: ' + name, proc.stderr)
+
+    def test_step_duration_validation_refuses_leading_zero_without_echo_8312(self):
+        bash = shutil.which('bash')
+        self.assertIsNotNone(bash, 'bash is required for numeric-validation parity')
+        name = 'STEP_DURATION_SECS'
+        block = ENV_NUMERIC_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+        for value, status in (('0', 0), ('20', 0), ('010', 65), ('08', 65), ('09', 65), ('007', 65)):
+            with self.subTest(value=value):
+                proc = subprocess.run([bash, '--norc', '--noprofile', '-c', block],
+                                      env={name: value}, capture_output=True, text=True, timeout=10, check=False)
+                self.assertEqual(proc.returncode, status)
+                self.assertEqual(proc.stdout, '')
+                if status:
+                    self.assertNotIn(value, proc.stderr)
+                    self.assertIn('FATAL: ' + name, proc.stderr)
 
     def test_threshold_use_requires_prior_validation_8312(self):
         for name, call in zip(('P95_BUDGET_MS', 'SHED_RATE_KNEE'), INTERPRETER_SITES[ENVELOPE][-2:]):
