@@ -39,9 +39,17 @@ def const_body(text, name):
     return match.group(1)
 
 
+RUST_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/', re.S)
+
+
+def strip_comments(body):
+    """Remove `//` and `/* */` comments, leaving string literals (and their `//`) intact."""
+    return RUST_TOKEN.sub(lambda m: m.group(0) if m.group(0).startswith('"') else " ", body)
+
+
 def strings(body):
-    """Return the string literals of a Rust const body, in order."""
-    return re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+    """Return the string literals of a Rust const body, in order, comments excluded."""
+    return re.findall(r'"((?:[^"\\]|\\.)*)"', strip_comments(body))
 
 
 def const_len(text, name):
@@ -66,14 +74,25 @@ def census_filter(text):
     """Return the `ends_with` suffixes the Rust census reads (the `.md`/`.html` filter)."""
     match = re.search(r"for rel in stdout\.lines\(\) \{\s*if !\((.*?)\)\s*\|\|\s*DOCS_CENSUS_DATED_RECORDS",
                       text, re.S)
-    suffixes = re.findall(r'rel\.ends_with\("([^"]+)"\)', match.group(1)) if match else []
-    if not suffixes:
+    if match is None:
         raise AssertionError('%s no longer filters the census by `rel.ends_with("..")`' % RUST_SRC)
+    suffixes = []
+    for term in strip_comments(match.group(1)).split("||"):
+        term = term.strip()
+        literal = re.fullmatch(r'rel\.ends_with\("([^"]+)"\)', term)
+        if literal is None:
+            raise AssertionError('%s census filter term is not `rel.ends_with("<literal>")`: %r'
+                                 % (RUST_SRC, term))
+        suffixes.append(literal.group(1))
     return tuple(suffixes)
 
 
 def census_folder(text):
     """Return the folder of the census `git ls-files -- <folder>` call."""
+    calls = len(re.findall(r'"ls-files"', strip_comments(text)))
+    if calls != 1:
+        raise AssertionError('%s must have exactly one `"ls-files"` call site, found %d'
+                             % (RUST_SRC, calls))
     match = re.search(r'docs_census_git_on\(\s*root,\s*&\["ls-files",\s*"--",\s*"([^"]+)"\s*\]', text)
     if match is None:
         raise AssertionError("%s no longer runs `git ls-files -- <folder>` through docs_census_git_on"
@@ -96,7 +115,7 @@ def erasable_bytes(text):
 
 def rules_entry():
     """Return the walk_guards entry rules.json hands to this mirror."""
-    for guard in json.loads(RULES.read_text())["cargo_skip"]["walk_guards"]:
+    for guard in json.loads(RULES.read_text(encoding="utf-8"))["cargo_skip"]["walk_guards"]:
         if guard["rust"] == RUST_SRC:
             return guard
     raise AssertionError("rules.json has no walk_guards entry for %s" % RUST_SRC)
@@ -210,6 +229,35 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         self.assertEqual(self.census.judge("docs/reviews/x.md", "crypto-erase 0x03"), (False, None))
         self.assertEqual(self.census.judge("docs/audit/x.md", "crypto-erase 0x03"), (False, None))
         self.assertEqual(self.census.judge("docs/x.html", "Crypto-erase 0x03")[0], True)
+
+    def mutated(self, old, new):
+        """Return the Rust source with `old` replaced by `new` (the replace must hit)."""
+        self.assertIn(old, self.text)
+        return self.text.replace(old, new, 1)
+
+    def test_filter_rejects_a_non_literal_term(self):
+        text = self.mutated('rel.ends_with(".html")',
+                            'rel.ends_with(".html") || rel.ends_with(DOCS_EXTRA_EXT)')
+        with self.assertRaisesRegex(AssertionError, "DOCS_EXTRA_EXT"):
+            census_filter(text)
+
+    def test_filter_rejects_an_added_exclusion_clause(self):
+        text = self.mutated('rel.ends_with(".html"))', 'rel.ends_with(".html")) && !rel.contains("drafts")')
+        with self.assertRaisesRegex(AssertionError, "drafts"):
+            census_filter(text)
+
+    def test_commented_out_literal_does_not_count(self):
+        first = strings(const_body(self.text, "DOCS_CENSUS_ERASE_PHRASES"))[0]
+        text = self.mutated('"%s"' % first, 'SOME_CONST, // "%s"' % first)
+        with self.assertRaisesRegex(AssertionError,
+                                    r"declares \[&str; \d+\] but \d+ plain string literals"):
+            string_list(text, "DOCS_CENSUS_ERASE_PHRASES")
+        self.assertEqual(strings('"a//b", /* "x" */ "c" // "d"'), ["a//b", "c"])
+
+    def test_second_ls_files_call_is_rejected(self):
+        text = self.text + '\nfn extra() { docs_census_git_on(root, &["ls-files", "--", "other"], None); }\n'
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            census_folder(text)
 
     def test_rules_json_carries_the_walk_guard_entry(self):
         entry = rules_entry()
