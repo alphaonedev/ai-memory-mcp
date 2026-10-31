@@ -286,6 +286,51 @@ class ClsStepRunsNoWorkspaceCommand(unittest.TestCase):
         self.assertNotIn("test_impact=", body)
         self.assertNotRegex(body, r"echo \"test_impact")
 
+    DEFANG = r"sed 's/::/: :/g'"
+    # The only consumers of the changed-file list that never reach the log.
+    SILENT_SINKS = ("grep ", "python3 -I ", "wc -l")
+
+    def changed_var(self, body):
+        found = re.findall(r"^\s*(\w+)=\$\(git diff [^\n]*--name-only", body, re.M)
+        self.assertEqual(len(found), 1, "cls assigns the changed-file list exactly once")
+        return found[0]
+
+    def test_cls_logs_the_changed_file_list_only_through_the_defang_8343(self):
+        _, _, body = cls_step(CI_YML)
+        var = re.escape(self.changed_var(body))
+        ref = re.compile(r'\$\{?%s\}?' % var)
+        echo_ref = re.compile(r'echo "\$\{?%s\}?"(?P<rest>[^\n)]*)' % var)
+        seen = 0
+        for line in code_lines(body):
+            if not ref.search(line) or "GITHUB_OUTPUT" in line or "[ -z" in line:
+                continue
+            for form in ("printf", "<<<", "<<", "cat ", "tee "):
+                self.assertNotIn(form, line, "cls prints the changed list in a form this guard does not model: %r" % line)
+            hits = list(echo_ref.finditer(line))
+            self.assertEqual(len(hits), 1, "cls uses the changed list in a form this guard does not model: %r" % line)
+            rest = hits[0].group("rest").strip()
+            self.assertTrue(rest.startswith("|"), "bare echo of the changed-file list reaches the log undefanged: %r" % line)
+            sink = rest[1:].strip()
+            if not sink.startswith(self.SILENT_SINKS):
+                self.assertTrue(sink.startswith(self.DEFANG) and not re.search(r"[>;&]", sink[len(self.DEFANG):]),
+                                "changed-file list leaves the step through an unmodeled sink: %r" % line)
+            seen += 1
+        self.assertGreaterEqual(seen, 4)
+        self.assertIn(self.DEFANG, body)
+
+    def test_cls_defang_executed_neutralises_a_workflow_command_in_a_file_name_8343(self):
+        _, _, body = cls_step(CI_YML)
+        var = re.escape(self.changed_var(body))
+        printers = [line.strip() for line in code_lines(body)
+                    if re.match(r'\s*echo "\$%s"\s*($|\|\s*sed\b)' % var, line)]
+        self.assertTrue(printers, "no log-print line for the changed-file list")
+        name = "docs/::stop-commands::x"
+        script = "%s='%s'\n%s\n" % (self.changed_var(body), name, "\n".join(printers))
+        res = subprocess.run(RUNNER_BASH + [script], capture_output=True, text=True, timeout=TIMEOUT_S)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("docs/: :stop-commands: :x", res.stdout)
+        self.assertNotIn("::", res.stdout)
+
     def test_impact_step_follows_cls_and_owns_the_test_impact_outputs(self):
         steps, cls_pos, _ = cls_step(CI_YML)
         _, impact_pos, body = step_by_id(CI_YML, "impact")

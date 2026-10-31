@@ -729,7 +729,7 @@ jobs:
             echo "::notice::cargo_skip=false ($cargo_skip_reason) - running full pipeline"
           fi
           echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
-          echo "$changed"
+          echo "$changed" | sed 's/::/: :/g'
 
           # #8328 round 3 (REVIEW-8328-code-r2 F1, REVIEW-8328-security-r2 F1,
           # #8338): this step runs NO command from the workspace, so nothing a
