@@ -3,11 +3,11 @@ layout: doc
 ---
 # Enterprise deployment topologies for ai-memory v1.0.0
 
-> ## Certified trust boundary (canonical)
->
+## Certified trust boundary (canonical)
+
 > **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
 >
-> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
 
 > **Version currency.** This document was authored against v0.7.0 and
 > carries v0.7.0-era references throughout. It has been re-adjudicated
@@ -835,12 +835,12 @@ PgBouncer.
 > transaction-mode PgBouncer, you MUST also pin the envelope at the
 > Postgres role level so every backend inherits it as its server
 > default:**
->
-> ```sql
-> ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
-> ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
-> ```
->
+
+```sql
+ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
+ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
+```
+
 > Keep the two values in lockstep with the compiled
 > `DEFAULT_STATEMENT_TIMEOUT_SECS` / `DEFAULT_LOCK_TIMEOUT_SECS` (or
 > your `postgres_statement_timeout_secs` override) so the direct-connect
@@ -1417,7 +1417,7 @@ For an operator piloting a hive in v0.7.0, the responsible shape is:
    "one per region **or per tenant**", which contradicts §8.8 of this
    same document: *"if subsets of peers should NOT see each other's
    data, the swarm shape is wrong."* Cross-cluster federation replicates
-   **plaintext** memory content ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968))
+   **plaintext** memory content (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262))
    — every inbound write lane now consults
    `PeerScope.allowed_namespaces` under an enrolled posture
    (#2489/#2480, see [`federation.md`](federation.html) §"Layer 3 — Peer
@@ -1989,7 +1989,7 @@ it, and flip it back.
 ### 14.6 At-rest encryption (regulated workloads)
 
 > ⚠️ **At-rest encryption is NOT end-to-end across federation**
-> ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)).
+> (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)).
 > Federation catch-up **decrypts** content and the receiving peer
 > **re-seals under its own per-node key**, so a federated peer holds
 > **plaintext transiently at apply time**, and the ciphertext at rest on
@@ -2084,7 +2084,7 @@ configuration.
 > [`compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md);
 > where this checklist and that document disagree, the certification
 > document supersedes. Federation is **not** end-to-end encrypted
-> (#1968) — see §14.6.
+> (see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262)) — see §14.6.
 
 ### 14.10 Cross-references
 

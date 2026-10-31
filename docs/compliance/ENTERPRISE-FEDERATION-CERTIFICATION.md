@@ -20,8 +20,8 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
->
+## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
 > federation-wire files changed after the bind `385da3a05`
@@ -86,15 +86,15 @@ certification and triggers re-cert** (see §7).
 > land at **`580d8427`** (PR #2910 squash-merge), whose **sole parent is
 > `e22bc93c`**. The delta between the two is **exactly three files, all
 > documentation or harness, additions only**:
->
-> ```
-> $ git diff --stat e22bc93c 580d8427
->  .../ENTERPRISE-FEDERATION-CERTIFICATION.md         | 218 +++++++++++++++++++++
->  docs/enterprise-deployment.md                      |  14 ++
->  scripts/check-cert-removal-proof.sh                | 143 ++++++++++++++
->  3 files changed, 375 insertions(+)
-> ```
->
+
+```
+$ git diff --stat e22bc93c 580d8427
+ .../ENTERPRISE-FEDERATION-CERTIFICATION.md         | 218 +++++++++++++++++++++
+ docs/enterprise-deployment.md                      |  14 ++
+ scripts/check-cert-removal-proof.sh                | 143 ++++++++++++++
+ 3 files changed, 375 insertions(+)
+```
+
 > **Zero changes under `src/`, `.github/workflows/`, or any
 > `AI_MEMORY_FED_*` identifier**, so the §7 re-cert trigger is **not**
 > tripped by landing the certification: the certified binary at
@@ -636,6 +636,7 @@ certification and triggers re-cert** (see §7).
 > expiry record above is untouched — re-issue remains the #3501 Conductor
 > task).
 >
+
 ---
 
 ## 1. The trust boundary (what is certified)
@@ -677,18 +678,19 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 >
 > Read that as a **limit on what is certified**, in both directions:
 >
-> - **What IS certified:** that the five trust-boundary guarantees
->   below hold — confinement, peer attestation, per-actor attestation of
->   authority-granting writes, at-rest confidentiality, and a
->   tamper-evident audit spine. Those are security properties, and they
->   are evidenced by executed negative tests, a machine-checked posture
->   gate, and mechanical removal proofs (§2, §4).
-> - **What is NOT certified:** that a 1000-agent / 50-peer deployment
->   *performs* — no throughput, latency, or saturation figure is
->   certified here, and none should be inferred from the envelope
->   (see §6). The envelope states the topology this certification's
->   reasoning was scoped to, **not** a capacity the substrate has been
->   measured to sustain.
+> **What IS certified:** that the five trust-boundary guarantees
+> below hold — confinement, peer attestation, per-actor attestation of
+> authority-granting writes, at-rest confidentiality, and a
+> tamper-evident audit spine. Those are security properties, and they
+> are evidenced by executed negative tests, a machine-checked posture
+> gate, and mechanical removal proofs (§2, §4).
+>
+> **What is NOT certified:** that a 1000-agent / 50-peer deployment
+> *performs* — no throughput, latency, or saturation figure is
+> certified here, and none should be inferred from the envelope
+> (see §6). The envelope states the topology this certification's
+> reasoning was scoped to, **not** a capacity the substrate has been
+> measured to sustain.
 >
 > A Fortune-500 reading this should take it as: *the trust boundary has
 > been adversarially tested and mechanically proven load-bearing at this
@@ -742,51 +744,52 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
      memory's `content` under a per-agent X25519 / ChaCha20-Poly1305
      envelope (`src/encryption/mod.rs`, `ENV_ENCRYPT_AT_REST` at
      `:585`). This is **not** the same control as SQLCipher, and it is
-     **not** end-to-end across federation (see §6).
+     **not** end-to-end across federation (see the
+     [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262)).
 
-   > **Control #15 is BACKEND-AWARE (#3061) — and the two backends carry
-   > two DIFFERENT strengths of assurance. Read this before trusting a pg
-   > PASS.** Posture check #15 resolves the backend from the store URL the
-   > process will open (`store_url::resolve_store_url` /
-   > `is_postgres_url`, the same detector as the #2679 wrong-store
-   > refusal):
-   >
-   > - **sqlite / sqlcipher → STRUCTURAL, machine-proven.** The exact
-   >   pre-#3061 predicate is unchanged (byte-identical): a
-   >   `--features sqlcipher` build with `AI_MEMORY_ENCRYPT_AT_REST=1`.
-   >   The control is a machine-checked property of the running binary.
-   > - **postgres → OPERATOR-VOUCHED, a COMPENSATING control (NOT
-   >   machine-proven encryption).** sqlcipher is a SQLite build feature
-   >   and cannot encrypt a postgres volume, so #15 was previously
-   >   *unsatisfiable* on pg — `all_pass` could never be true and the #17
-   >   boot gate could never arm a certified pg node. On a `postgres://`
-   >   DSN #15 now passes iff **both**: (a) the DSN pins TLS
-   >   `sslmode=verify-full` — **machine-checked** from the DSN, full
-   >   server-cert-chain + hostname verification of the key material in
-   >   flight — **and** (b) `AI_MEMORY_PG_AT_REST_ATTESTED=1` — an
-   >   **operator vouch**, recorded verbatim in the posture output, that
-   >   the postgres data volume/tablespace is encrypted at rest
-   >   (LUKS/dm-crypt, cloud-provider volume encryption, or postgres TDE).
-   >   **The daemon cannot prove its underlying block device is
-   >   encrypted**, so the attestation half is honor-system: CI can prove
-   >   the gate ROUTES and #17 ARMS, but it **cannot** prove the pg volume
-   >   is actually encrypted. Treat a pg #15 PASS as *"TLS is verify-full
-   >   AND the operator has attested at-rest encryption"*, never as
-   >   *"at-rest encryption is machine-proven"*. **pg-native TDE as a
-   >   machine-checked control is deliberately NOT claimed for GA.** An
-   >   operator who sets the attestation without encrypting the volume has
-   >   mis-certified their own node — the posture output names exactly what
-   >   was machine-checked vs vouched so an auditor can see the seam.
-   >
-   > **Backend resolution is ENV/FILE-only (#3061 F3).** `doctor --posture`
-   > resolves the backend from `AI_MEMORY_STORE_URL_FILE` /
-   > `AI_MEMORY_STORE_URL` — it does **not** see `serve`'s `--store-url`
-   > argv. So `doctor --posture` and `ai-memory audit bootstrap-node` MUST
-   > run in the **identical store environment as `serve`**: a pg node whose
-   > DSN is passed only on `serve --store-url postgres://…` must ALSO export
-   > `AI_MEMORY_STORE_URL`, or control #15 evaluates the sqlite/sqlcipher
-   > branch and `bootstrap-node` fail-closes on the wrong store. Under
-   > systemd, run both with the daemon's exact `EnvironmentFile`.
+   **Control #15 is BACKEND-AWARE (#3061) — and the two backends carry
+   two DIFFERENT strengths of assurance. Read this before trusting a pg
+   PASS.** Posture check #15 resolves the backend from the store URL the
+   process will open (`store_url::resolve_store_url` /
+   `is_postgres_url`, the same detector as the #2679 wrong-store
+   refusal):
+
+   - **sqlite / sqlcipher → STRUCTURAL, machine-proven.** The exact
+     pre-#3061 predicate is unchanged (byte-identical): a
+     `--features sqlcipher` build with `AI_MEMORY_ENCRYPT_AT_REST=1`.
+     The control is a machine-checked property of the running binary.
+   - **postgres → OPERATOR-VOUCHED, a COMPENSATING control (NOT
+     machine-proven encryption).** sqlcipher is a SQLite build feature
+     and cannot encrypt a postgres volume, so #15 was previously
+     *unsatisfiable* on pg — `all_pass` could never be true and the #17
+     boot gate could never arm a certified pg node. On a `postgres://`
+     DSN #15 now passes iff **both**: (a) the DSN pins TLS
+     `sslmode=verify-full` — **machine-checked** from the DSN, full
+     server-cert-chain + hostname verification of the key material in
+     flight — **and** (b) `AI_MEMORY_PG_AT_REST_ATTESTED=1` — an
+     **operator vouch**, recorded verbatim in the posture output, that
+     the postgres data volume/tablespace is encrypted at rest
+     (LUKS/dm-crypt, cloud-provider volume encryption, or postgres TDE).
+     **The daemon cannot prove its underlying block device is
+     encrypted**, so the attestation half is honor-system: CI can prove
+     the gate ROUTES and #17 ARMS, but it **cannot** prove the pg volume
+     is actually encrypted. Treat a pg #15 PASS as *"TLS is verify-full
+     AND the operator has attested at-rest encryption"*, never as
+     *"at-rest encryption is machine-proven"*. **pg-native TDE as a
+     machine-checked control is deliberately NOT claimed for GA.** An
+     operator who sets the attestation without encrypting the volume has
+     mis-certified their own node — the posture output names exactly what
+     was machine-checked vs vouched so an auditor can see the seam.
+
+   **Backend resolution is ENV/FILE-only (#3061 F3).** `doctor --posture`
+   resolves the backend from `AI_MEMORY_STORE_URL_FILE` /
+   `AI_MEMORY_STORE_URL` — it does **not** see `serve`'s `--store-url`
+   argv. So `doctor --posture` and `ai-memory audit bootstrap-node` MUST
+   run in the **identical store environment as `serve`**: a pg node whose
+   DSN is passed only on `serve --store-url postgres://…` must ALSO export
+   `AI_MEMORY_STORE_URL`, or control #15 evaluates the sqlite/sqlcipher
+   branch and `bootstrap-node` fail-closes on the wrong store. Under
+   systemd, run both with the daemon's exact `EnvironmentFile`.
 
    `ai-memory doctor --posture` **never migrates or writes the database**
    (`evaluate` itself is database-free; since #3553 the verb reads exactly
@@ -802,40 +805,40 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
    hash chain + off-table watermark + witness anchor), with the honest residual
    bounds stated in `SECURITY.md`/`signed_events.rs`.
 
-   > **A bare store-only migration is NON-certifiable / born DIRTY, and a
-   > SINGLE idempotent command brings it up (#3016/#3067).** A node whose
-   > data was copied without its `signed_events` spine (e.g. 7,889
-   > memories, `signed_events = 0`) has NO tamper-evident history: under
-   > the certified (`asi-hard`) audit require-modes
-   > (`AI_MEMORY_REQUIRE_WITNESS` / `_ROLE_SEPARATION` /
-   > `_IDENTITY_LINEAGE`, all pinned to `1`), an empty spine convicts on
-   > the witness + identity-lineage verdicts, so `ai-memory
-   > verify-audit-trail` exits **1**. The migration path deliberately does
-   > **NOT** copy or re-sign `signed_events` across backends (a
-   > chain-identity / `db_id` fork is irreversible-if-wrong). Bring the
-   > node up with the ONE idempotent command **`ai-memory audit
-   > bootstrap-node`**, which runs the existing operator-ceremony
-   > enrollment (identity-lineage GENESIS + audit-head witness anchor) and
-   > **REFUSES to report the node certified until `verify-audit-trail`
-   > exits 0**, printing the exact remaining ceremony on a refusal. The
-   > certified verdict is **fail-closed against the ambient env**:
-   > `verify-audit-trail` only convicts a lane whose require-mode is armed
-   > in-process, so `bootstrap-node` reports CERTIFIED-READY **only when
-   > all three certified audit require-modes** (`AI_MEMORY_REQUIRE_WITNESS`
-   > / `_ROLE_SEPARATION` / `_IDENTITY_LINEAGE`) **are armed AND the verify
-   > is clean under them** — it names exactly which modes were armed, so a
-   > bare provisioning shell that arms none can never print a "certified"
-   > that exercised nothing. (Witness needs an enrolled witness custody
-   > key; role separation on a fresh node needs a recorder custody key — a
-   > judge pubkey with no verdict checkpoint is permanently `Missing`, an
-   > out-of-band operator prerequisite bring-up VERIFIES.) It is a
-   > *command*, never a runbook checklist, so a provisioning system runs
-   > it unattended and a node that fails its own verify never claims cert.
-   > Distinct-custody trust (witness / recorder / judge / stopper keys)
-   > stays operator custody — bring-up VERIFIES it and NAMES anything
-   > missing, it never mints it. The postgres spine-WRITE twin is deferred
-   > (like the pg re-anchor twin #2217); the born-dirty verify GATE has a
-   > shipped pg twin (`verify_audit_trail_postgres`).
+   **A bare store-only migration is NON-certifiable / born DIRTY, and a
+   SINGLE idempotent command brings it up (#3016/#3067).** A node whose
+   data was copied without its `signed_events` spine (e.g. 7,889
+   memories, `signed_events = 0`) has NO tamper-evident history: under
+   the certified (`asi-hard`) audit require-modes
+   (`AI_MEMORY_REQUIRE_WITNESS` / `_ROLE_SEPARATION` /
+   `_IDENTITY_LINEAGE`, all pinned to `1`), an empty spine convicts on
+   the witness + identity-lineage verdicts, so `ai-memory
+   verify-audit-trail` exits **1**. The migration path deliberately does
+   **NOT** copy or re-sign `signed_events` across backends (a
+   chain-identity / `db_id` fork is irreversible-if-wrong). Bring the
+   node up with the ONE idempotent command **`ai-memory audit
+   bootstrap-node`**, which runs the existing operator-ceremony
+   enrollment (identity-lineage GENESIS + audit-head witness anchor) and
+   **REFUSES to report the node certified until `verify-audit-trail`
+   exits 0**, printing the exact remaining ceremony on a refusal. The
+   certified verdict is **fail-closed against the ambient env**:
+   `verify-audit-trail` only convicts a lane whose require-mode is armed
+   in-process, so `bootstrap-node` reports CERTIFIED-READY **only when
+   all three certified audit require-modes** (`AI_MEMORY_REQUIRE_WITNESS`
+   / `_ROLE_SEPARATION` / `_IDENTITY_LINEAGE`) **are armed AND the verify
+   is clean under them** — it names exactly which modes were armed, so a
+   bare provisioning shell that arms none can never print a "certified"
+   that exercised nothing. (Witness needs an enrolled witness custody
+   key; role separation on a fresh node needs a recorder custody key — a
+   judge pubkey with no verdict checkpoint is permanently `Missing`, an
+   out-of-band operator prerequisite bring-up VERIFIES.) It is a
+   *command*, never a runbook checklist, so a provisioning system runs
+   it unattended and a node that fails its own verify never claims cert.
+   Distinct-custody trust (witness / recorder / judge / stopper keys)
+   stays operator custody — bring-up VERIFIES it and NAMES anything
+   missing, it never mints it. The postgres spine-WRITE twin is deferred
+   (like the pg re-anchor twin #2217); the born-dirty verify GATE has a
+   shipped pg twin (`verify_audit_trail_postgres`).
 
 > **`AI_MEMORY_ADMIN_HEADER_TRUST=1` is certified ONLY for the
 > single-fingerprint mTLS-proxy topology.** (#3065) Header-asserted identity —
@@ -860,6 +863,77 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 > stand-up (**exactly one** fingerprint) is unaffected. The full per-agent cert →
 > `X-Agent-Id` enrollment lane (the `agent_api_keys` per-agent binding) is
 > deferred — see [#2044](https://github.com/alphaonedev/ai-memory-mcp/issues/2044).
+
+### Certification scope statement for the v1.0.0 GA candidate ([#8262](https://github.com/alphaonedev/ai-memory-mcp/issues/8262))
+
+> Pinned to chain tip `89cdc32c83d347de5d63ac62f5edfa9ee973940f`; the audit umbrella is [#8268](https://github.com/alphaonedev/ai-memory-mcp/issues/8268). Each
+> line is one claim, its tracking issue and, where code enforces it, the `file:line` at that SHA. This
+> statement does not re-mint the certification (the bind and expiry record above are unchanged).
+
+**Claimed for the GA candidate (IN; certification re-issue under [#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)):**
+
+- Federation transport is mTLS, and outbound peer server-certificate verification is on by default and
+  refuses the skip flag ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448), [#232](https://github.com/alphaonedev/ai-memory-mcp/issues/232), closed; `src/tls.rs:114`, `src/tls.rs:1200-1203`, asi-hard pin
+  `src/security_profile.rs:461-463`).
+- `sync/since` is peer-scoped while the operator bypass `AI_MEMORY_FED_SYNC_TRUST_PEER=1` is unset: a peer
+  without a scope allowlist receives an empty envelope, and rows are filtered by namespace and
+  private-scope visibility ([#948](https://github.com/alphaonedev/ai-memory-mcp/issues/948), closed; `file:line` at merge `ffc54bd50`;
+  `src/handlers/federation_sync_since.rs:289-296`, `:358`, `:366`). With the bypass set to `1`
+  (`src/federation/peer_attestation.rs:390-392`, consumed at `src/handlers/federation_sync_since.rs:289`)
+  an unscoped peer receives a full dump of every row in an allowed namespace and the private-visibility
+  filter is skipped, so the empty-envelope and private-visibility claim does not hold under it. The bypass is
+  outside the asi-hard KNOBS set; only the enterprise posture doctor flags it (check 13,
+  `src/enterprise_federation_posture.rs:516-531`; evidence
+  `docs/compliance/evidence/cert-385da3a05/posture-*.out`).
+- Every shape requires TLS and refuses plaintext peers (`src/config/shape.rs:173-174`); the Federated and
+  Hive shapes force governed namespaces (`src/config/shape.rs:190-194`), and Production defaults to them.
+- At-rest AEAD envelope encryption is available and OFF by default (`AI_MEMORY_ENCRYPT_AT_REST=1` or
+  `[encryption] at_rest = true`; `src/config.rs:3592-3593`); it is not applied on the wire.
+- rustls is at the audited version 0.23.46 with RUSTSEC-2026-0285 fixed ([#3821](https://github.com/alphaonedev/ai-memory-mcp/issues/3821), closed;
+  `Cargo.lock:3620-3621`).
+- Provenance links refuse a cycle-closing edge, including equal-instant pairs ([#3041](https://github.com/alphaonedev/ai-memory-mcp/issues/3041), closed;
+  `src/storage/mod.rs:9512-9514`).
+- Encryption in transit ([#3824](https://github.com/alphaonedev/ai-memory-mcp/issues/3824)) and setup simplicity ([#3830](https://github.com/alphaonedev/ai-memory-mcp/issues/3830)) are closed as met.
+- Quarantine of unattributed inbound writes on Production, Federated and Hive ([#2967](https://github.com/alphaonedev/ai-memory-mcp/issues/2967), closed;
+  landed by PR [#8269](https://github.com/alphaonedev/ai-memory-mcp/pull/8269) as merge `ffc54bd50`, `file:line` at that SHA): the `federated`,
+  `hive` and `production` shapes pin `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` on at boot when it is unset
+  (`src/config/shape.rs:198-202`, `:672-684`). On `federated` and `hive` a non-truthy value refuses boot (a
+  FLOOR, `src/config/shape.rs:616-633`); on `production` the always-engaged `asi-hard` floor refuses it
+  (`src/security_profile.rs:426-430`). The `/sync/push` reader shares that truthiness grammar
+  (`src/federation/receive_auth.rs:645-649`). `singleton` and `team` keep the permissive default unless
+  `asi-hard` is selected.
+
+**In scope for v1.0.0 GA, certification issued on landing (not certified today):**
+
+- Federation end-to-end content encryption, variants A and B, is in scope for v1.0.0 GA and is delivered by
+  [#8278](https://github.com/alphaonedev/ai-memory-mcp/issues/8278). The certification is issued only when #8278 has landed on
+  release/v1.0.0 with its tests green.
+  Until #8278 lands, the shipped guarantee for federation content is the mTLS transport only: peers
+  replicate and store plaintext content. Isolation between distrusting tenants is by disjoint deployments.
+  [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) was closed with the `deferred-v1.x` label and is superseded by #8278.
+
+**Fail-closed controls required for GA that are NOT yet landed at the pinned SHA.** Each is claimed only
+when its issue closes with a landed SHA on the GA candidate. At the pinned SHA the default is the
+permissive one named here, so a reader must not assume the control:
+
+- Cert-to-peer binding enforced ([#8260](https://github.com/alphaonedev/ai-memory-mcp/issues/8260), open): the default is `warn` (`src/tls.rs:474`) and a mismatch
+  is allowed (`src/handlers/federation_receive.rs:199-202`).
+- Refusal of Claimed (header-asserted) identity on Production, Federated and Hive ([#8265](https://github.com/alphaonedev/ai-memory-mcp/issues/8265), open): the
+  principal is `Claimed` today (`src/identity/authority.rs:99-101`).
+
+**NOT claimed for v1.0.0 (each is named so the certified claim is unambiguous):**
+
+- Postgres-native TDE as a machine-checked control is deliberately NOT claimed for v1.0.0: at-rest posture
+  on the postgres tier is operator-attested through `AI_MEMORY_PG_AT_REST_ATTESTED`
+  ([#8284](https://github.com/alphaonedev/ai-memory-mcp/issues/8284), the operator ruling on a machine proof is still open; audit umbrella
+  [#8268](https://github.com/alphaonedev/ai-memory-mcp/issues/8268)).
+- Curator namespace-scoped mode: the curator daemon is root-equivalent (cross-tenant `for_admin` reads,
+  `src/curator/reflection_pass.rs:125-127`; [#8264](https://github.com/alphaonedev/ai-memory-mcp/issues/8264), open, operator milestone decision).
+- Batman Form 2 synchronous atomisation on postgres: sqlite and MCP stdio only, postgres reports
+  `skipped_backend_unsupported` ([#8255](https://github.com/alphaonedev/ai-memory-mcp/issues/8255), open; `docs/atomisation.md:100-102`).
+- Top-shelf encryption documentation ([#3833](https://github.com/alphaonedev/ai-memory-mcp/issues/3833), closed with the `deferred-v1.x` label).
+- Singleton and Team shapes keep allow-on-silence namespace governance by default
+  (`src/config/shape.rs:191`; [#3125](https://github.com/alphaonedev/ai-memory-mcp/issues/3125), open).
 
 ---
 
@@ -1204,21 +1278,24 @@ the SSOT pins, per the STANDARD data-tier note below.)
 > daemon and its PostgreSQL + AGE backing store — this is the
 > ai-memory↔store DATA-TIER link, DISTINCT from the federation
 > peer↔peer transport (§1 point 2, §6), and it carries no
-> end-to-end-content-encryption claim (that boundary stays open per §6).
+> end-to-end-content-encryption claim (see the
+> [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262)).
 > Live-proven this session with real `psql` / OpenSSL output:
 >
-> - **The daemon connects `sslmode=verify-full`.** ai-memory attaches to
->   the store via `--store-url postgres://…?sslmode=verify-full` and
->   presents a client certificate (`CN=ai_memory`), so the session is
->   mutually authenticated (mTLS-capable) and the server hostname is
->   verified against the cert.
-> - **The server refuses cleartext.** `ssl=on` with a **hostssl-only**
->   `pg_hba.conf`: a cleartext TCP connection is REFUSED (`no
->   pg_hba.conf entry … no encryption`), never silently downgraded.
->   `ssl_min_protocol_version=TLSv1.2` is the floor.
-> - **Encrypted sessions negotiate TLS 1.3.** The cipher observed is
->   **`TLS_AES_256_GCM_SHA384`** (TLS 1.3). The server cert SAN covers
->   `IP:127.0.0.1` + `DNS:localhost`.
+> **The daemon connects `sslmode=verify-full`.** ai-memory attaches to
+> the store via `--store-url postgres://…?sslmode=verify-full` and
+> presents a client certificate (`CN=ai_memory`), so the session is
+> mutually authenticated (mTLS-capable) and the server hostname is
+> verified against the cert.
+>
+> **The server refuses cleartext.** `ssl=on` with a **hostssl-only**
+> `pg_hba.conf`: a cleartext TCP connection is REFUSED (`no
+> pg_hba.conf entry … no encryption`), never silently downgraded.
+> `ssl_min_protocol_version=TLSv1.2` is the floor.
+>
+> **Encrypted sessions negotiate TLS 1.3.** The cipher observed is
+> **`TLS_AES_256_GCM_SHA384`** (TLS 1.3). The server cert SAN covers
+> `IP:127.0.0.1` + `DNS:localhost`.
 >
 > This is a data-tier transport-confidentiality property, not a capacity
 > or a federation-confidentiality property; read it alongside §6's
@@ -1359,8 +1436,14 @@ control is the SOLE decisive gate.
 This certification does **NOT** cover, and a Fortune-500 that needs any of the
 following should **not** treat v1.0.0 as sufficient:
 
-- **No end-to-end content encryption.** Every in-scope federation peer reads
-  your memory content in **plaintext** (`src/encryption/mod.rs`, #1968 open).
+- **No end-to-end content encryption across federation.** This revision ships only slice E1 of
+  [#8278](https://github.com/alphaonedev/ai-memory-mcp/issues/8278): the `0x05` scope envelope and
+  the scope-key store with its hash-chained audit log and recovery escrow (`src/encryption/scope.rs`),
+  with no sync path, so no `0x05` row leaves the node and every in-scope federation peer reads
+  your memory content in **plaintext** (`src/encryption/mod.rs`). Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](#certification-scope-statement-for-the-v100-ga-candidate-8262).
+  This certification excludes the rest of #8278 (slice E2: the federation sync path, the
+  `/keys/scope` key pull, withholding of `0x05` embeddings from non-readers, record signing and
+  scope-key rotation).
   SQLCipher protects data at rest on each node; it does **not** protect content
   in transit-to-peer beyond the TLS/mTLS transport, and an allowlisted peer sees
   cleartext. The per-content X25519/ChaCha envelope (`AI_MEMORY_ENCRYPT_AT_REST`)

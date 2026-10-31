@@ -5,6 +5,8 @@ layout: doc
 
 Threat model, trust boundaries, and hardening options for operators.
 
+What the v1.0.0 GA candidate certifies and what it does not claim: see the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262) (#8262).
+
 For responsible disclosure: **security@alpha-one.mobi**. Please encrypt
 against the maintainer key listed in `SECURITY.md.sig` (if present)
 or via the fingerprint on our releases page.
@@ -317,8 +319,8 @@ by the bundled clients on that host — never by a peer).
   `http://localhost:11434`). #3705 DETECTS a plaintext endpoint in doctor
   (`llm_egress_plaintext`) but does not yet refuse it; the operator's
   ruling on local model servers is pending.
-- *Federation content is not end-to-end encrypted* (#1968;
-  `src/tls.rs` records it). Transport TLS satisfies "encrypted in transit"
+- Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262).
+  `src/tls.rs` records it. Transport TLS satisfies "encrypted in transit"
   on the wire; a TLS-terminating intermediary — a load balancer, a reverse
   proxy, a compromised peer — sees plaintext memory content. Whether the
   mandate reaches that far is put to the operator, not assumed.
