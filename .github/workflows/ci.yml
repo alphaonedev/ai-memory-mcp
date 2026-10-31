@@ -87,7 +87,12 @@ on:
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
     branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
-    types: [opened, synchronize, reopened, edited]
+    # #8332: `edited` is NOT listed. A title or body edit fires it and, with
+    # cancel-in-progress, restarted every required check from zero. A base
+    # retarget is landed only after a new head push (the push fires an ordinary
+    # pull_request run that classifies against the new base, #7072), enforced by
+    # scripts/ci/pr_retarget_check.py at landing.
+    types: [opened, synchronize, reopened]
   # Merge Queue (#3089) — GitHub runs a queued PR's REQUIRED checks against the
   # ephemeral `merge_group` ref, NOT the PR ref. A required workflow that does
   # not trigger on `merge_group` never reports on that ref, so its context stays
