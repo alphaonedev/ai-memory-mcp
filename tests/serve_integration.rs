@@ -61,13 +61,13 @@ fn http_client(serve: &ServeChild) -> reqwest::blocking::Client {
 /// listen-queue/accept race distinct from the `free_port()` TOCTOU bind
 /// race `spawn_serve` already retries on (see #1994). [`send_first_request`]
 /// closes that residual window by retrying the caller's first request on a
-/// connection-level error only; a real HTTP error status or body-content
+/// connection-level error or client timeout; a real HTTP error status or body-content
 /// mismatch is never retried and surfaces immediately, so this cannot mask
 /// an assertion failure.
 const FIRST_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Sends the request `build` constructs, retrying on a connection-level
-/// error (not-yet-listening / connection-refused / reset) until
+/// error (not-yet-listening / connection-refused / reset) or client timeout until
 /// [`FIRST_REQUEST_RETRY_TIMEOUT`] elapses. `build` is invoked once per
 /// attempt so each retry opens a genuinely fresh TCP connection rather than
 /// reusing one that may have raced the daemon's listener. See
@@ -77,19 +77,78 @@ fn send_first_request<F>(mut build: F) -> reqwest::blocking::Response
 where
     F: FnMut() -> reqwest::blocking::RequestBuilder,
 {
+    send_first_request_with(|| build().send())
+}
+
+/// Injectable send operation for exercising the first-request retry policy.
+fn send_first_request_with<T>(mut send: impl FnMut() -> reqwest::Result<T>) -> T {
     let deadline = Instant::now() + FIRST_REQUEST_RETRY_TIMEOUT;
     loop {
-        match build().send() {
+        match send() {
             Ok(resp) => return resp,
-            Err(e) if e.is_connect() && Instant::now() < deadline => {
+            Err(e) if (e.is_connect() || e.is_timeout()) && Instant::now() < deadline => {
                 std::thread::sleep(READINESS_POLL_INTERVAL);
             }
             Err(e) => panic!(
                 "first request after spawn_serve's readiness gate still failed \
-                 (connection-level error, not an assertion failure): {e}"
+                 (request error, not an assertion failure): {e}"
             ),
         }
     }
+}
+
+#[test]
+fn first_request_retries_timeouts_then_succeeds_8307() {
+    // Keep a bound listener alive without serving HTTP: each request must time out,
+    // rather than fail to connect. No daemon, external network, or worker thread.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(10))
+        .build()
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let mut outcomes = (0..2)
+        .map(|_| {
+            let error = client.get(&url).send().unwrap_err();
+            assert!(error.is_timeout());
+            assert!(!error.is_connect());
+            Err(error)
+        })
+        .chain(std::iter::once(Ok(())))
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut attempts = 0;
+    let start = Instant::now();
+    send_first_request_with(|| {
+        attempts += 1;
+        outcomes.next().expect("retry must stop at success")
+    });
+    assert_eq!(attempts, 3, "two timeouts followed by success");
+    assert!(start.elapsed() < FIRST_REQUEST_RETRY_TIMEOUT);
+}
+
+#[test]
+fn first_request_does_not_retry_other_errors_8307() {
+    let error = reqwest::blocking::Client::new()
+        .get("invalid URL")
+        .build()
+        .unwrap_err();
+    assert!(!error.is_connect() && !error.is_timeout());
+    let mut error = Some(error);
+    let mut attempts = 0;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        send_first_request_with(|| {
+            attempts += 1;
+            Err::<(), _>(
+                error
+                    .take()
+                    .expect("fatal errors must stop on the first try"),
+            )
+        });
+    }));
+    assert!(panic.is_err(), "a builder error must remain fatal");
+    assert_eq!(attempts, 1, "fatal errors must not be retried");
 }
 
 #[test]
