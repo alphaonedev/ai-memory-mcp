@@ -192,12 +192,45 @@ Inputs the guard does not read: the process environment of the CI runner (includ
 the workflow files that choose the test command, `~/.cargo` configuration and Cargo.lock; the first three are runner
 state outside the tree (a change to a workflow file is a CI-definition change that forces a full run), and Cargo.lock
 cannot redirect a source the manifest does not declare (cargo re-resolves, or fails under `--locked`).
+
+Round 14 (PR #8349; code r13 LOW-1/INFO-1/2/3, security r13 LOW-1..4/INFO-1/2; issues #8436 to #8441 and the trait issue).
+The defect class is "a pin that pins a name but not its value, resolution or storage". The classes closed (33 classes in all): trait brace items, raw-identifier macro calls, pinned values,
+real input files and crate-name resolution.
+* The audited brace-item list (Rust Reference, items): brace-bodied `fn struct enum union impl mod trait`, plus `extern`
+  blocks, `macro_rules!` and `macro` which `ITEM_BODY_KIND` maps onto the same body scan; `;`-terminated `use`,
+  `extern crate`, `type`, `const`, `static`, `mod x;`, tuple and unit structs. Modifiers `const async unsafe default auto`
+  precede the kind; a kind word followed by `!` is a macro invocation, never an item header (`trait!{}`, `union!{}`).
+  Before the fix `trait` was missing, so the walk ran past a trait body and swallowed the next item.
+* One pattern per macro family (`INCLUDE_CALL`, `MACRO_RULES_CALL`, `TREE_MACRO`, `ITEM_MACRO`), each tolerant of the raw
+  spelling `r#include!`, `r#macro_rules!` and `r#proptest::r#proptest!` (rustc 1.98 compiles `r#include!` and rejects
+  `r#macro_rules!` and `r#r#name`). mod.rs keeps the exact `include!` for its rebinding form (it holds three
+  `include_str!` of docs data).
+* Values, not names: `ALLOWED_PATCHES` pins the whole value of the `paste` patch (`{ path = "vendor/paste" }`, any
+  spelling of the same value passes, any other source, key or path is rejected) and `LIB_KNOWN_MACROS` pins the whole
+  text of the one macro including its outer attributes and requires exactly one definition.
+* Real input files: every input is read through `lstat` of each path component. A symbolic link anywhere on the path,
+  a non-regular file (FIFO, device) or a file with a second hard-link is rejected and named; the doc reader follows the
+  same rule. A missing file is reported as missing.
+* Crate-name resolution: a name the scope file uses as an external crate (`zeroize`, `hkdf`, `sha2`, ...) must be a
+  `LIVE_DEPENDENCIES` key and must not be bound locally by a `use ... as NAME`, a type-namespace item, `mod NAME` or
+  `extern crate .. as NAME` (`use crate::embeddings as zeroize;` silently shadows the extern crate in rustc 1.98). A
+  `use anyhow::{Result, anyhow}` imports the crate's own macro and is no shadow. A private `SCOPE_ENVELOPE_VERSION`
+  behind the `pub use` is E0603 (the N11c wording is E0603, not a missing-name error).
+* The name-pin rulings (each name-only pin audited): dependency versions (Cargo.toml is never_skip in rules.json, so a
+  version change runs cargo); dependency sources (path, git and registry fields are rejected on every dependency);
+  TARGET_ATTRIBUTES names (inert or compile-out only: removing an imported item is a rustc error); TARGET_DERIVES (full
+  path); the CARGO_TRACKED listing (cargo-audit config, not read by cargo build); NEXTEST_KEYS (retries and timeouts do
+  not turn a failing deterministic test into a pass); TOOLCHAIN_KEYS (the channel value is pinned, `profile` does not
+  change semantics); inner attributes (pinned by full text); the vendored paste content (governed by the rules.json
+  globs, not by this guard; the patch path value is pinned here).
 """
+import contextlib
 import functools
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -207,6 +240,7 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
+RULES_REL = "scripts/ci/impact/rules.json"
 RULES = REPO / "scripts" / "ci" / "impact" / "rules.json"
 RUST_SRC = "src/encryption/mod.rs"
 SCOPE_SRC = "src/encryption/scope.rs"
@@ -220,7 +254,8 @@ CLOSED_CLASSES = ("region text", "call graph", "declarations of any item kind", 
                   "tree traits and macros", "lib.rs top-level modules", "package workspace",
                   "byte-order mark", "duplicate TOML keys", "file-named errors", "lib.rs read whole",
                   "use-bound attribute names", "pinned dependency set", "blanket impl on a generic",
-                  "raw identifiers in use lines")
+                  "raw identifiers in use lines", "trait brace items", "raw-identifier macro calls",
+                  "pinned values", "real input files", "crate-name resolution")
 
 RUST_TOKEN = re.compile(
     r'(?P<raw>(?<![A-Za-z0-9_])(?:b|c)?r(?P<h>#*)".*?"(?P=h))'
@@ -246,10 +281,53 @@ def reject_bom(text, where):
     return text
 
 
-def read(rel):
+def lstat_chain(rel, root=None):
+    """Return (path, lstat) of `rel` below `root` (default REPO), or (None, None) when it does not exist.
+
+    Every path component below the root is checked with `os.lstat` and `Path.is_symlink`; a symbolic link on any
+    component raises a named error (r14, security LOW-3 #8438): the mirror reads the bytes cargo compiles, and a
+    link would let the file it reads differ from the file rustc reads. The root itself is the checkout.
+    """
+    current, parts = Path(REPO if root is None else root), Path(rel).parts
+    info = None
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = os.lstat(str(current))
+        except (FileNotFoundError, NotADirectoryError):
+            return None, None
+        except OSError as err:
+            raise AssertionError("the docs census mirror cannot stat %s (%s): it fails closed" % (rel, err))
+        if stat.S_ISLNK(info.st_mode) or current.is_symlink():
+            raise AssertionError("%s is, or sits below, a symbolic link (%s): the mirror reads real files only, "
+                                 "because a link lets the bytes it reads differ from the bytes rustc and cargo "
+                                 "read, so it fails closed" % (rel, part))
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            return None, None
+    return current, info
+
+
+def real_file(rel, root=None):
+    """Return the Path of the regular, singly linked file `rel`, None when missing; a link or odd file raises."""
+    path, info = lstat_chain(rel, root)
+    if path is None:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise AssertionError("%s is not a regular file (mode %o): the mirror reads real files only, so it fails "
+                             "closed" % (rel, stat.S_IFMT(info.st_mode)))
+    if info.st_nlink > 1:
+        raise AssertionError("%s has %d hard links: a second name can be edited outside the reviewed path, so "
+                             "the mirror fails closed" % (rel, info.st_nlink))
+    return path
+
+
+def read(rel, root=None):
     """Return the text of a tracked input file; a missing or unreadable one raises a named AssertionError."""
+    path = real_file(rel, root)
     try:
-        text = (REPO / rel).read_text(encoding="utf-8")
+        if path is None:
+            raise FileNotFoundError("no such file")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as err:
         raise AssertionError("the docs census mirror requires %s as an input and cannot read it (%s): it fails "
                              "closed rather than guess what the Rust census depends on" % (rel, err))
@@ -270,7 +348,7 @@ def input_exists(rel, overrides):
     """True when `rel` exists on disk or in the overrides (an override of None removes it)."""
     if rel in overrides:
         return overrides[rel] is not None
-    return (REPO / rel).is_file()
+    return real_file(rel) is not None
 
 
 # `c"..."` and `cr#"..."#` are C-string literals (Rust 1.77+): the raw prefix is `b`, `c` or none.
@@ -343,7 +421,18 @@ ITEM_DECL = re.compile(r"(?<![\w'#])(const|static|let|fn|struct|enum|union|type|
                        r"(?!(?:fn|unsafe|extern|async|mut|ref|dyn|impl|union)\b)([A-Za-z_]\w*)")
 # `static ref NAME` (the lazy_static spelling) declares NAME although `ref` is skipped above (`let ref x` is a pattern).
 STATIC_REF_DECL = re.compile(r"(?<![\w'#])static\s+ref\s+(?:r#)?([A-Za-z_]\w*)")
-MACRO_DECL = re.compile(r"(?<![\w'#])macro_rules\s*!\s*(\S+)")
+MACRO_DECL = re.compile(r"(?<![\w'#])(?:r#)?macro_rules\s*!\s*(\S+)")
+# The one include-family call pattern shared by every reader (`include!`, `include_str!`, `include_bytes!`, `r#include!`);
+# the look-behind keeps `a_include!` and a lifetime or label (`'include`) out, never the `r#` raw spelling (r13 security
+# LOW-1: rustc 1.98 compiles `r#include!`, and the old `(?<![\w'#])` hid it).
+INCLUDE_CALL_PATTERN = r"(?<![\w'])(?:r#)?include\w*\s*!"
+INCLUDE_CALL = re.compile(INCLUDE_CALL_PATTERN)
+# mod.rs itself holds `include_str!` of the docs it censuses (data, pinned by its text), so its rebinding form is the
+# exact `include!` / `r#include!` that pulls in code.
+INCLUDE_EXACT_PATTERN = r"(?<![\w'])(?:r#)?include\s*!"
+# The one macro_rules call pattern shared by every reader; rustc rejects `r#macro_rules!` but it is never read as clean.
+MACRO_RULES_CALL_PATTERN = r"(?<![\w'])(?:r#)?macro_rules\s*!"
+MACRO_RULES_CALL = re.compile(MACRO_RULES_CALL_PATTERN)
 GENERIC_OWNER = re.compile(r"(?<![\w'#])(?:(?:fn|struct|enum|union|type|trait)\s+(?:r#)?[A-Za-z_]\w*|impl)\s*<")
 IDENT = re.compile(r"(?<!\w)[A-Za-z_]\w*")
 
@@ -1075,7 +1164,11 @@ MODULE_SET = (("escrow", 0, ";"), ("scope", 0, ";"), ("tests", 0, "{"))
 MODULE_HEADERS = ("pubmodescrow;", "pubmodscope;", "#[cfg(test)]modtests{")
 # The item right before the census region (#8392), by compact header, and the macros of src/lib.rs (#8346 r8 L3).
 REGION_BEFORE = "#[test]fndoc_erase_scope_names_erasable_versions_8278(){"
-LIB_KNOWN_MACROS = ("reserved_upsert_metadata_keys_sql",)
+LIB_KNOWN_MACROS = {
+    "reserved_upsert_metadata_keys_sql":
+        '#[macro_export]macro_rules!reserved_upsert_metadata_keys_sql{()=>{"\'agent_id\', \'derived_from\', '
+        '\'consolidated_from_agents\', \'agent_pubkey\', \'pubkey_bound_at\'"};}',
+}
 LIB_MOD = "pubmodencryption;"
 # The names the census region resolves outside itself are DERIVED from the region text (`derive_external_names`);
 # only their count is pinned, so a region edit that adds or drops one is reviewed against the item names of mod.rs.
@@ -1089,8 +1182,8 @@ CRATE_DENIED_ATTRIBUTE_WORDS = ("macro_use", "no_implicit_prelude", "no_std", "n
 # security L1). mod.rs has none of them, so the deny-list costs nothing and any new one is loud.
 REBINDING_FORMS = (
     ("`macro_rules!` (a local macro replaces assert!, format! or any other macro the census calls)",
-     r"\bmacro_rules\s*!"),
-    ("`include!` (pulls in code the mirror never reads)", r"\binclude\s*!"),
+     MACRO_RULES_CALL_PATTERN),
+    ("`include!` (pulls in code the mirror never reads)", INCLUDE_EXACT_PATTERN),
     ("`extern crate`", r"\bextern\s+crate\b"),
     ("a `use ... as` alias (it rebinds a name; the import surface is pinned without aliases)",
      r"\buse\s+[^;]*\bas\s+\w+"),
@@ -1452,7 +1545,7 @@ def literals_only(clean, name, single=False):
                              % (RUST_SRC, name, residue or body.strip()[:40]))
 
 
-MACRO_NAME = re.compile(r"(?<![\w'#])macro_rules\s*!\s*(?:r#)?([^\s{(\[]+)")
+MACRO_NAME = re.compile(MACRO_RULES_CALL_PATTERN + r"\s*(?:r#)?([^\s{(\[]+)")
 
 
 def plain_macros(masked, where):
@@ -1463,6 +1556,59 @@ def plain_macros(masked, where):
             raise AssertionError("%s defines `macro_rules! %s`, a name the mirror cannot read" % (where, match.group(1)))
         names.append(match.group(1))
     return names
+
+
+CLOSERS = {"{": "}", "(": ")", "[": "]"}
+
+
+def macro_definitions(lib_clean, masked):
+    """Return [(name, compact text)] for every `macro_rules!` definition of the stripped src/lib.rs.
+
+    The text runs from the first outer attribute directly above the macro (`#[macro_export]`) to the closing
+    delimiter of its body (and the `;` after a parenthesised or bracketed body), whitespace outside literals removed.
+    """
+    found = []
+    for match in MACRO_NAME.finditer(masked):
+        begin = match.start()
+        while True:
+            scan = begin - 1
+            while scan >= 0 and masked[scan].isspace():
+                scan -= 1
+            if scan < 0 or masked[scan] != "]":
+                break
+            depth = 0
+            while scan >= 0:
+                depth += {"]": 1, "[": -1}.get(masked[scan], 0)
+                if depth == 0:
+                    break
+                scan -= 1
+            hash_at = scan - 1
+            while hash_at >= 0 and masked[hash_at].isspace():
+                hash_at -= 1
+            if hash_at < 0 or masked[hash_at] != "#":
+                break
+            begin = hash_at
+        opener = match.end()
+        while opener < len(masked) and masked[opener].isspace():
+            opener += 1
+        if opener >= len(masked) or masked[opener] not in CLOSERS:
+            raise AssertionError("%s has `macro_rules! %s` without a body the mirror can read" % (LIB_SRC, match.group(1)))
+        depth, scan = 0, opener
+        while scan < len(masked):
+            depth += {"{": 1, "(": 1, "[": 1, "}": -1, ")": -1, "]": -1}.get(masked[scan], 0)
+            if depth == 0:
+                break
+            scan += 1
+        if scan >= len(masked):
+            raise AssertionError("%s has `macro_rules! %s` whose body never closes" % (LIB_SRC, match.group(1)))
+        end = scan + 1
+        if masked[opener] != "{":
+            tail = end
+            while tail < len(masked) and masked[tail].isspace():
+                tail += 1
+            end = tail + 1 if tail < len(masked) and masked[tail] == ";" else end
+        found.append((match.group(1), compact(lib_clean[begin:end])))
+    return found
 
 
 @functools.lru_cache(maxsize=32)
@@ -1500,7 +1646,7 @@ def reject_crate_level(lib_clean, macros):
     if re.search(r"[^\x00-\x7f]", prefix):
         raise AssertionError("%s has a non-ASCII character before `mod encryption;` outside a literal" % LIB_SRC)
     reject_attributes(prefix, LIB_SRC, CRATE_DENIED_ATTRIBUTE_WORDS)
-    if re.search(r"\binclude\s*!", prefix):
+    if INCLUDE_CALL.search(prefix):
         raise AssertionError("%s has `include!` before `mod encryption;`: it pulls in code the mirror never reads"
                              % LIB_SRC)
     defined = plain_macros(prefix, LIB_SRC)
@@ -1511,11 +1657,23 @@ def reject_crate_level(lib_clean, macros):
                                  % (LIB_SRC, name, name))
     # r13: the whole file is read, so a macro defined AFTER the declaration is a macro too (it can emit a module
     # declaration): only the pinned macro of the live file is allowed anywhere.
-    for name in plain_macros(masked, LIB_SRC):
+    # r14 (code INFO-1, security INFO-1 #8440): the pin holds the whole compact definition, not the name, and each
+    # pinned macro is defined exactly once: an extra arm, a changed body or `#[macro_export]` is a drift.
+    seen = {}
+    for name, text in macro_definitions(lib_clean, masked):
         if name not in LIB_KNOWN_MACROS:
             raise AssertionError("%s defines the `macro_rules!` macro `%s`, which the pin %r does not list: a macro "
                                  "of src/lib.rs can emit a module declaration or an item the mirror never reads"
-                                 % (LIB_SRC, name, LIB_KNOWN_MACROS))
+                                 % (LIB_SRC, name, sorted(LIB_KNOWN_MACROS)))
+        if text != LIB_KNOWN_MACROS[name]:
+            raise AssertionError("%s defines `macro_rules! %s` as `%s`, the pinned definition is `%s`: a changed arm "
+                                 "or attribute can emit a module declaration or an item the mirror never reads"
+                                 % (LIB_SRC, name, text, LIB_KNOWN_MACROS[name]))
+        seen[name] = seen.get(name, 0) + 1
+    for name in LIB_KNOWN_MACROS:
+        if seen.get(name, 0) != 1:
+            raise AssertionError("%s must define the pinned `macro_rules! %s` exactly once, found %d"
+                                 % (LIB_SRC, name, seen.get(name, 0)))
     return tuple(defined)
 
 
@@ -1577,8 +1735,8 @@ def lib_module_items(lib_clean, masked):
                                      "declaration the mirror never reads" % (LIB_SRC, re.sub(r"\s+", "", macro.group(1))))
             raise AssertionError("%s has a top-level item the whole-file reader does not name: `%s`"
                                  % (LIB_SRC, re.sub(r"\s+", " ", top[pos:pos + 48]).strip()))
-        kind = header.group(2)
-        stop = item_end(top, header.end(), "fn" if kind in ("extern", "macro_rules") else kind, LIB_SRC)
+        kind = header_kind(header)
+        stop = item_end(top, header.end(), kind, LIB_SRC)
         if kind == "mod":
             name = ITEM_NAME.match(top, header.end())
             if name is None:
@@ -1633,7 +1791,7 @@ def read_lib_whole(lib_clean):
         if content not in LIB_INNER_ATTRIBUTES:
             raise AssertionError("%s has the inner attribute `#![%s]`, expected only %s: an inner attribute changes "
                                  "how the whole crate resolves names" % (LIB_SRC, content, ", ".join(LIB_INNER_ATTRIBUTES)))
-    if re.search(r"(?<![\w'#])include\w*\s*!", masked):
+    if INCLUDE_CALL.search(masked):
         raise AssertionError("%s uses `include!`: it pulls in code the mirror never reads" % LIB_SRC)
     reject_attributes(masked, LIB_SRC, ("cfg_attr",))
     return tuple(item[:3] for item in items)
@@ -1647,10 +1805,10 @@ def reject_tree_file(rel, clean):
     mod.rs, so neither is allowed anywhere below src/encryption.
     """
     masked = mask_literals(clean)
-    if re.search(r"(?<![\w'#])macro_rules\s*!", masked):
+    if MACRO_RULES_CALL.search(masked):
         raise AssertionError("%s defines a `macro_rules!` macro: a macro of the encryption tree can replace one "
                              "the census region invokes" % rel)
-    if re.search(r"\binclude\s*!", masked):
+    if INCLUDE_CALL.search(masked):
         raise AssertionError("%s uses `include!`: it pulls in code the mirror never reads" % rel)
     reject_attributes(masked, rel)
     # r11 code LOW-1: a sibling file below src/encryption is reachable through a re-export chain, so the traits and the
@@ -1665,7 +1823,7 @@ def reject_tree_file(rel, clean):
     if sorted(traits) != sorted(pinned):
         raise AssertionError("%s declares the traits %r, the per-file pin lists %r: the pin and the file drifted"
                              % (rel, traits, pinned))
-    macros = [re.sub(r"\s+", "", m.group(1)) for m in TREE_MACRO.finditer(top_level(masked))]
+    macros = [re.sub(r"\s+|r#", "", m.group(1)) for m in TREE_MACRO.finditer(top_level(masked))]
     if macros != list(TREE_TOP_MACROS.get(rel, ())):
         raise AssertionError("%s invokes the top-level macros %r, expected %r: a macro can emit any item"
                              % (rel, macros, list(TREE_TOP_MACROS.get(rel, ()))))
@@ -1717,9 +1875,30 @@ def reject_module_file(rel, text, macros):
                                      "census region invokes: it could replace it inside mod.rs" % (rel, name))
 
 
+def real_tree(rel):
+    """Return every .rs file below the directory `rel`, walked without following a link (any link raises)."""
+    top, _ = lstat_chain(rel)
+    if top is None:
+        return []
+    found, pending = [], [rel]
+    while pending:
+        here = pending.pop()
+        with os.scandir(str(Path(REPO) / here)) as entries:
+            names = sorted(entry.name for entry in entries)
+        for name in names:
+            child = here + "/" + name
+            path, info = lstat_chain(child)
+            if stat.S_ISDIR(info.st_mode):
+                pending.append(child)
+            elif name.endswith(".rs") or not stat.S_ISREG(info.st_mode):
+                real_file(child)
+                found.append(child)
+    return sorted(found)
+
+
 def tree_files(overrides):
     """Return the relative paths of every .rs file below src/encryption except mod.rs, plus overridden ones."""
-    found = {path.relative_to(REPO).as_posix() for path in (REPO / ENCRYPTION_DIR).rglob("*.rs")}
+    found = set(real_tree(ENCRYPTION_DIR))
     found |= {rel for rel in overrides if rel.startswith(ENCRYPTION_DIR + "/") and rel.endswith(".rs")}
     found.discard(RUST_SRC)
     return sorted(found)
@@ -1727,7 +1906,7 @@ def tree_files(overrides):
 
 def rules_entry():
     """Return the walk_guards entry rules.json hands to this mirror."""
-    for guard in json.loads(RULES.read_text(encoding="utf-8"))["cargo_skip"]["walk_guards"]:
+    for guard in json.loads(read(RULES_REL))["cargo_skip"]["walk_guards"]:
         if guard["rust"] == RUST_SRC:
             return guard
     raise AssertionError("rules.json has no walk_guards entry for %s" % RUST_SRC)
@@ -1748,8 +1927,11 @@ GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
 STD_FAMILY = ("std", "core", "alloc", "proc_macro", "test")
 DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 SOURCE_FIELDS = ("path", "git", "registry", "registry-index", "branch", "tag", "rev")
-# The patch entries Cargo.toml may carry: (registry, crate).
-ALLOWED_PATCHES = frozenset({("crates-io", "paste")})
+# The patch entries Cargo.toml may carry, pinned by VALUE (r14, security LOW-2 #8437): (registry, crate) -> the fields
+# of the entry. The live `paste = { path = "vendor/paste" }` is the vendored proc macro; a name pin let
+# `path = "docs/x"` or a `git` source through.
+ALLOWED_PATCHES = {("crates-io", "paste"): {"path": "vendor/paste"}}
+ALLOWED_PATCH_VALUES = {("crates-io", "paste"): '{path="vendor/paste"}'}
 # r13 (security LOW-1): the exact dependency names of the live Cargo.toml per table. A new dependency is a new crate that
 # can supply a proc macro, a path root or a trait; the counts are 64 [dependencies], 14 [dev-dependencies], 0
 # [build-dependencies], 1 [target.'cfg(unix)'.dependencies], 1 [target.'cfg(unix)'.dev-dependencies].
@@ -2057,6 +2239,7 @@ def reject_manifest(text, roots, overrides):
                              % (len(pinned), sorted(pinned), PINNED_CRATES_COUNT))
     denied = (roots | set(STD_FAMILY) | {"scope"}) - pinned
     patches, edition, workspace, entries = set(), None, False, []
+    patch_fields, patch_values = {}, {}
     for path, value in toml_entries(text, MANIFEST):
         workspace = workspace or path[0] == "workspace"
         if "workspace" in path[1:]:
@@ -2086,6 +2269,13 @@ def reject_manifest(text, roots, overrides):
                                  % MANIFEST)
         if path[0] == "patch" and len(path) >= 3:
             patches.add((path[1], path[2]))
+            if len(path) == 3:
+                if value is not None:
+                    patch_values[(path[1], path[2])] = compact(value)
+            elif len(path) == 4:
+                patch_fields.setdefault((path[1], path[2]), {})[path[3]] = unquote(value)
+            else:
+                raise AssertionError("%s has the patch key `%s`: a patch entry is `crate = { path = ... }` and nothing deeper is read" % (MANIFEST, ".".join(path)))
         if path[0] == "replace":
             raise AssertionError("%s has a `[replace]` entry: it substitutes a crate the census links" % MANIFEST)
         if path[:2] == ("package", "build"):
@@ -2099,7 +2289,16 @@ def reject_manifest(text, roots, overrides):
                                  % (MANIFEST, path[1], "/".join(LIB_KEYS)))
     for path, value, slot in entries:
         reject_dependency_set(path, value, slot)
-    for registry, name in sorted(patches - ALLOWED_PATCHES):
+    for pair in sorted(ALLOWED_PATCHES):
+        if pair not in patches:
+            raise AssertionError("%s no longer has `[patch.%s]` entry `%s`: the pinned vendored crate is the one the census links" % (MANIFEST, pair[0], pair[1]))
+        if pair in patch_values and patch_values[pair] != ALLOWED_PATCH_VALUES[pair]:
+            raise AssertionError("%s has `[patch.%s] %s = %s`, the pinned value is `%s`: a patch is a crate swapped for other code, so its whole value is pinned, not its name"
+                                 % (MANIFEST, pair[0], pair[1], patch_values[pair], ALLOWED_PATCH_VALUES[pair]))
+        if patch_fields.get(pair, {}) != ALLOWED_PATCHES[pair]:
+            raise AssertionError("%s has `[patch.%s] %s` with the fields %r, the pinned fields are %r: a path elsewhere, a `git` source or an extra key swaps the vendored crate for other code"
+                                 % (MANIFEST, pair[0], pair[1], patch_fields.get(pair, {}), ALLOWED_PATCHES[pair]))
+    for registry, name in sorted(patches - set(ALLOWED_PATCHES)):
         raise AssertionError("%s has `[patch.%s]` entry `%s`: only %s are allowed, a patch swaps a crate for "
                              "other code" % (MANIFEST, registry, name,
                                              ", ".join("%s.%s" % pair for pair in sorted(ALLOWED_PATCHES))))
@@ -2147,7 +2346,7 @@ def reject_cargo_config(overrides):
     for rel in CARGO_CONFIGS:
         if rel in overrides:
             text = overrides[rel]
-        elif (REPO / rel).is_file():
+        elif real_file(rel) is not None:
             text = read(rel)
         else:
             continue
@@ -2162,7 +2361,7 @@ def reject_cargo_config(overrides):
 
 def reject_nextest_config(overrides):
     """Allow only today's headers and keys in .config/nextest.toml (a filter or script can skip the census test)."""
-    if NEXTEST_CONFIG not in overrides and not (REPO / NEXTEST_CONFIG).is_file():
+    if NEXTEST_CONFIG not in overrides and real_file(NEXTEST_CONFIG) is None:
         return
     for path, value in toml_entries(read_input(NEXTEST_CONFIG, overrides), NEXTEST_CONFIG):
         if value is None and path not in NEXTEST_HEADERS:
@@ -2268,7 +2467,7 @@ def local_import_targets(lib_clean, overrides):
                 if path[1] not in LIB_PINNED_MODS:
                     raise AssertionError("%s imports from `crate::%s`, which has no pinned declaration in %s"
                                          % (RUST_SRC, path[1], LIB_SRC))
-                rel =local_module_file("src", path[1], overrides, LIB_SRC)
+                rel = local_module_file("src", path[1], overrides, LIB_SRC)
             elif path[0] == REEXPORT_PATH_ROOT and len(path) >= 2:
                 rel = local_module_file(ENCRYPTION_DIR, path[0], overrides, RUST_SRC)
             elif path[0] in ("super", "self", "crate"):
@@ -2313,12 +2512,23 @@ TARGET_MODULES = {
 TREE_TRAITS = {"src/encryption/scope/store.rs": ("ScopeKeyStore",)}
 TREE_TOP_MACROS = {"src/encryption/scope/tests.rs": ("proptest::proptest",)}
 
-ITEM_HEADER = re.compile(r"(pub(?:\s*\([^)]*\)\s*|\s+))?(?:(?:const|async|unsafe|default)\s+)*"
-                         r"(use|fn|struct|enum|union|static|type|impl|mod|trait|extern|macro_rules|const)(?![\w'#])")
+# The item kinds of the Rust Reference (Items chapter), audited r14 (code LOW-1: `trait` was missing from the brace list).
+# Brace-bodied: fn, struct, enum, union, impl, mod, trait, `extern "ABI" { }` blocks, the braced form of macro_rules!
+# and of declarative macros 2.0 (`macro`). `;`-terminated: use, extern crate, type, const, static, `mod x;`, a tuple or
+# unit struct, a trait alias. The modifiers before a kind are const, async, unsafe, default and auto (`auto trait`).
+# A kind word followed by `!` (`trait!{}`, `union!{}`) is a macro invocation named like a keyword, never an item header.
+ITEM_HEADER = re.compile(r"(pub(?:\s*\([^)]*\)\s*|\s+))?(?:(?:const|async|unsafe|default|auto)\s+)*"
+                         r"(?:(use|fn|struct|enum|union|static|type|impl|mod|trait|extern|macro|const)(?![\w'#])(?!\s*!)"
+                         r"|(macro_rules)(?![\w'#]))")
 ITEM_NAME = re.compile(r"\s*(?:mut\s+)?(?:r#)?([A-Za-z_]\w*)")
-TREE_MACRO = re.compile(r"(?<![\w'#:])((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*!\s*[(\[{]")
-ITEM_MACRO = re.compile(r"(?:::\s*)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*!")
-BRACE_ITEMS = ("fn", "struct", "enum", "union", "impl", "mod")
+RAW = r"(?:r#)?"
+SEGMENT = RAW + r"[A-Za-z_]\w*"
+# Every macro-name match accepts the `r#` raw spelling (r13 security LOW-1: `r#include!` compiles in rustc 1.98).
+TREE_MACRO = re.compile(r"(?<![\w'#:])((?:" + SEGMENT + r"\s*::\s*)*" + SEGMENT + r")\s*!\s*[(\[{]")
+ITEM_MACRO = re.compile(r"(?:::\s*)?((?:" + SEGMENT + r"\s*::\s*)*" + SEGMENT + r")\s*!")
+BRACE_ITEMS = ("fn", "struct", "enum", "union", "impl", "mod", "trait")
+# Kinds whose body is braced although they are read as a different kind: `extern { }`, `macro_rules! x { }`, `macro x { }`.
+ITEM_BODY_KIND = {"extern": "fn", "macro_rules": "fn", "macro": "fn"}
 
 
 def read_attributes(top, pos, rel):
@@ -2380,8 +2590,19 @@ def item_attributes(top, pos, rel):
     return pos, found
 
 
+def header_kind(header):
+    """Return the item kind of an ITEM_HEADER match (a keyword kind or `macro_rules`)."""
+    return header.group(2) or header.group(3)
+
+
 def item_end(top, pos, kind, rel):
-    """Return the position after the item whose header ends at `pos` (`top` blanks every brace body)."""
+    """Return the position after the item whose header ends at `pos` (`top` blanks every brace body).
+
+    A brace body ends the item for every kind in BRACE_ITEMS and for the kinds ITEM_BODY_KIND maps onto them; `use`,
+    `static`, `const`, `type` and `extern crate` run to the next depth-0 `;` (a `{` inside them is an expression or
+    a use group, never the item body).
+    """
+    kind = ITEM_BODY_KIND.get(kind, kind)
     depth = 0
     while pos < len(top):
         char = top[pos]
@@ -2461,10 +2682,10 @@ def target_items(rel, masked):
                                      % (rel, re.sub(r"\s+", "", macro.group(1))))
             raise AssertionError("%s has a top-level item the allow-list does not name: `%s`"
                                  % (rel, re.sub(r"\s+", " ", top[pos:pos + 48]).strip()))
-        kind = header.group(2)
+        kind = header_kind(header)
         stop = item_end(top, header.end(), kind, rel)
         text = masked[pos:stop]
-        if kind in ("trait", "macro_rules", "extern"):
+        if kind in ("trait", "macro_rules", "macro", "extern"):
             name = ITEM_NAME.match(top, header.end())
             if kind == "trait":
                 raise AssertionError("%s declares `trait %s`: a trait imported with the pinned `use` line adds methods "
@@ -2526,6 +2747,63 @@ def reject_use_bindings(rel, masked):
                                      % (rel, where, name, "::".join(path)))
 
 
+# Path roots that are never an external crate.
+LOCAL_ROOTS = frozenset({"crate", "super", "self", "Self"}) | frozenset(STD_FAMILY)
+# The item kinds that live in the type namespace, where the first segment of a `use` path is resolved.
+TYPE_NAMESPACE_KINDS = frozenset({"struct", "enum", "union", "type", "trait", "generic"})
+
+
+def external_roots(masked, rel):
+    """Return the external crate names (first path segments) the `use` statements of `masked` import."""
+    roots = set()
+    for match in USE_STATEMENT.finditer(masked):
+        bound, _ = use_tree(use_tokens(match.group(1)), 0, [], rel)
+        roots |= {path[0] for path, _ in bound if path and path[0] not in LOCAL_ROOTS}
+    return roots
+
+
+def crate_name_bindings(masked, name, rel):
+    """Return what declares or binds `name` in the type namespace of the masked source (an empty list: nothing).
+
+    `use crate::x as name;`, `use a::name;`, `use a::{self as name}`, `mod name`, `extern crate c as name`, and a
+    struct, enum, union, type, trait or generic parameter named `name` all make `name::Item` in a `use` path
+    resolve to something other than the extern crate (rustc picks the local name silently: r13 security LOW-4).
+    """
+    found = ["%s `%s`" % (kind, name) for kind, found_name, _ in declared_names(masked, rel)
+             if found_name == name and kind in TYPE_NAMESPACE_KINDS]
+    found += ["mod `%s`" % name for _ in re.finditer(r"(?<![\w'#])mod\s+(?:r#)?%s\b" % re.escape(name), masked)]
+    found += re.findall(r"(?<![\w'#])extern\s+crate\b[^;]*\bas\s+(?:r#)?%s\b[^;]*;" % re.escape(name), masked)
+    # `use anyhow::anyhow;` imports the crate's own macro under its own name: the origin is the extern crate, so it
+    # is no shadow; every other `use` that binds `name` (`use crate::embeddings as zeroize;`, `use a::zeroize;`, a
+    # braced group, a bare `use zeroize;`) is one.
+    for match in USE_STATEMENT.finditer(masked):
+        bound, _ = use_tree(use_tokens(match.group(1)), 0, [], rel)
+        if any(bound_name == name and not (len(path) >= 2 and path[0] == name) for path, bound_name in bound):
+            found.append(compact(match.group(0)))
+    return found
+
+
+def reject_crate_name_bindings(rel, masked, roots, where=None):
+    """Raise when an external crate name of `roots` resolves to anything but the extern crate, in `masked`.
+
+    The `use` line is pinned by its spelled path (`zeroize::Zeroize`), but a path root resolves to the first
+    matching name in scope: a local alias would win (r14, security LOW-4 #8439). Each external root must be a
+    dependency name of the pinned set (no `package =` rename: reject_manifest) and bound nowhere in the file.
+    """
+    declared = set()
+    for names in LIVE_DEPENDENCIES.values():
+        declared |= {dep.replace("-", "_") for dep in names}
+    for root in sorted(roots):
+        if root.replace("-", "_") not in declared:
+            raise AssertionError("%s imports from `%s::`, which is not a dependency name of the pinned set: the "
+                                 "root of a `use` path must resolve to a pinned extern crate" % (rel, root))
+        bindings = crate_name_bindings(masked, root, where or rel)
+        if bindings:
+            raise AssertionError("%s binds the crate name `%s` locally (%s): a `use` path rooted at `%s::` would "
+                                 "resolve to that item and not to the extern crate, with no error"
+                                 % (rel, root, "; ".join(bindings), root))
+
+
 def impl_generics(header):
     """Return the names of the generic parameters the `impl` header (after `impl`) declares (lifetimes excluded)."""
     text = header.strip()
@@ -2563,7 +2841,7 @@ def reject_import_target(rel, text, names):
     """
     masked = mask_literals(strip_comments(text, rel))
     reject_unicode_space(masked, rel)
-    if re.search(r"(?<![\w'#])macro_rules\s*!", masked):
+    if MACRO_RULES_CALL.search(masked):
         raise AssertionError("%s defines a `macro_rules!` macro: a macro can emit a trait or an item named like an "
                              "imported name" % rel)
     reject_attributes(masked, rel)
@@ -2571,7 +2849,7 @@ def reject_import_target(rel, text, names):
         raise AssertionError("%s declares `trait %s`: a trait imported with the pinned `use` line adds methods that "
                              "method resolution picks ahead of the std ones the census calls"
                              % (rel, found.group(1) or "?"))
-    if re.search(r"(?<![\w'#])include\w*\s*!", masked):
+    if INCLUDE_CALL.search(masked):
         raise AssertionError("%s uses `include!`: it pulls in code the mirror never reads" % rel)
     if re.search(r"(?<![\w'#])extern\s+crate\b", masked):
         raise AssertionError("%s contains `extern crate`: it adds a crate to the extern prelude" % rel)
@@ -2613,12 +2891,19 @@ def reject_import_target(rel, text, names):
             raise AssertionError("%s declares the imported name `%s` as a `%s`, expected a `%s`: the kind decides "
                                  "which namespace and which trait or method set the importer sees"
                                  % (rel, name, held[0][0], IMPORT_KINDS[name]))
+    reject_crate_name_bindings(rel, masked, external_roots(masked, rel))
 
 
 def reject_import_targets(lib_clean, overrides):
     """Read every crate-local module the pinned `use` lines import from (see `local_import_targets`)."""
+    roots = set()
     for rel, names in sorted(local_import_targets(lib_clean, overrides).items()):
-        reject_import_target(rel, read_input(rel, overrides), names)
+        text = read_input(rel, overrides)
+        reject_import_target(rel, text, names)
+        roots |= external_roots(mask_literals(strip_comments(text, rel)), rel)
+    # The crate root is in scope of every module through a `crate::` path, and a macro or `mod` there is not read by
+    # the use-target walker: the same names must not be bound in src/lib.rs either.
+    reject_crate_name_bindings(LIB_SRC, mask_literals(lib_clean), roots)
 
 
 def read_build_inputs(roots, overrides):
@@ -2696,7 +2981,10 @@ class Census:
         for rel in listing:
             if not self.reads(rel):
                 continue
-            found, failure = self.judge(rel, (root / rel).read_text(encoding="utf-8"))
+            doc = real_file(rel, root)
+            if doc is None:
+                raise AssertionError("%s is listed as tracked but is missing on disk: the mirror fails closed" % rel)
+            found, failure = self.judge(rel, doc.read_text(encoding="utf-8"))
             if found:
                 census.append(rel)
             if failure:
@@ -3752,7 +4040,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         """code r8 INFO: the docstring claims exactly what the code checks."""
         for phrase in CLOSED_CLASSES:
             self.assertIn(phrase, __doc__)
-        self.assertEqual(len(CLOSED_CLASSES), 28)
+        self.assertEqual(len(CLOSED_CLASSES), 33)
 
     # ---- round 11 (code r10 L1/L2/I1, security r10 L-A/L-B/I-1..I-5): one contiguous block of red-first tests ----
 
@@ -4171,7 +4459,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         for name in ("TARGET_ATTRIBUTES", "TARGET_DERIVES", "TREE_TRAITS", "TREE_TOP_MACROS", "IMPORT_KINDS",
                      "TARGET_MODULES"):
             self.assertIn(name, globals())
-        self.assertEqual(len(CLOSED_CLASSES), 28)
+        self.assertEqual(len(CLOSED_CLASSES), 33)
 
     # ---- round 13 (code r12 LOW-1/INFO-1/2/3, security r12 LOW-1/LOW-2/INFO-1/INFO-2): one contiguous block of red-first tests ----
 
@@ -4289,7 +4577,341 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             self.assertIn(phrase, __doc__)
         for name in ("LIB_PINNED_MODS", "UNICODE_SPACE", "USE_NAME_PINS", "GUARDED_NAMES", "LIVE_DEPENDENCIES"):
             self.assertIn(name, globals())
-        self.assertEqual(len(CLOSED_CLASSES), 28)
+        self.assertEqual(len(CLOSED_CLASSES), 33)
+
+    # ---- round 14 (#8346): bounded trait items, raw-identifier macro calls, value pins, real files, crate-name resolution ----
+    TRAIT_8346 = ("trait Marker_8346<X> where X: Clone {\n    fn a(&self) { let _y = { 1; 2 }; }\n"
+                  "    fn b(&self);\n    const N: usize = 3;\n}\n")
+
+    def test_trait_item_is_a_brace_item_and_a_macro_after_it_is_read(self):
+        """code r13 LOW-1: `trait` was not a brace item, so the walk ran past its body and swallowed the next item."""
+        for old, new in (("pub mod encryption;\n", "pub mod encryption;\n" + self.TRAIT_8346 + "m_8346! {}\n"),
+                         ("pub mod encryption;\n", self.TRAIT_8346 + "m_8346! {}\npub mod encryption;\n"),
+                         ("pub mod encryption;\n", "pub mod encryption;\n" + self.TRAIT_8346 + "m_8346!();\n")):
+            with self.subTest(new=new):
+                self.refused(r"src/lib\.rs invokes the macro `m_8346!`", {LIB_SRC: self.lib_mutated(old, new)})
+
+    def test_trait_item_with_a_where_clause_and_default_methods_is_bounded(self):
+        """code r13 LOW-1: a trait holding `;` and `{}` in default methods ends at its closing brace; a last trait is live."""
+        live = self.census_signature(self.census)
+        for lib in (self.lib_mutated("pub mod encryption;\n", "pub mod encryption;\n" + self.TRAIT_8346),
+                    read(LIB_SRC) + "\n" + self.TRAIT_8346,
+                    read(LIB_SRC) + "\nunsafe trait Last_8346 {}\n"):
+            with self.subTest(tail=lib[-60:]):
+                self.assertEqual(self.census_signature(Census(self.text, overrides={LIB_SRC: lib})), live)
+
+    def test_item_kinds_are_audited_against_the_rust_reference(self):
+        """code r13 LOW-1: every brace-bodied kind of the Reference is a brace item; a keyword followed by `!` is a macro."""
+        self.assertEqual(set(BRACE_ITEMS), {"fn", "struct", "enum", "union", "impl", "mod", "trait"})
+        self.assertEqual(ITEM_BODY_KIND, {"extern": "fn", "macro_rules": "fn", "macro": "fn"})
+        for text, kind in (("trait X {", "trait"), ("unsafe auto trait X {", "trait"), ("pub unsafe trait X {", "trait"),
+                           ("extern \"C\" {", "extern"), ("macro m() {", "macro"), ("macro_rules! m {", "macro_rules"),
+                           ("pub(crate) const unsafe fn f() {", "fn"), ("default fn f() {", "fn"), ("union U {", "union")):
+            with self.subTest(text=text):
+                self.assertEqual(header_kind(ITEM_HEADER.match(text)), kind)
+        for text in ("trait!{}", "union !{}", "mod!(x);", "impl!{}", "static!{}"):
+            with self.subTest(text=text):
+                self.assertIsNone(ITEM_HEADER.match(text))
+        for macro in ("trait", "union", "impl"):
+            with self.subTest(macro=macro):
+                self.refused(r"src/lib\.rs invokes the macro `%s!`" % macro,
+                             {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "pub mod encryption;\n%s!{}\n" % macro)})
+        self.refused(r"src/lib\.rs.*never ends|src/lib\.rs invokes the macro",
+                     {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "pub mod encryption;\nunion!{}\nm_8346!{}\n")})
+
+    def test_trait_in_a_use_target_file_is_still_rejected_and_named(self):
+        """code r13 LOW-1: a trait in scope.rs is named before a macro after it is read."""
+        self.refused(r"src/encryption/scope\.rs declares `trait Marker_8346`",
+                     self.with_module(SCOPE_SRC, "", "\n" + self.TRAIT_8346 + "m_8346!{}\n"))
+
+    def test_raw_identifier_include_calls_are_rejected_everywhere(self):
+        """security r13 LOW-1 #8436: `r#include!` compiles in rustc 1.98 and was hidden by the `#` look-behind."""
+        support, store = "src/test_support.rs", "src/encryption/scope/store.rs"
+        calls = ('r#include!("x_8346.rs");', 'r#include_str!("x_8346.txt");', 'r#include_bytes!("x_8346.bin");',
+                 'r # include !("x_8346.rs");')
+        for call in calls:
+            with self.subTest(call=call):
+                if "r # include" in call:
+                    continue
+                bodies = ("mod inline_8346 {\n    %s\n}\n" % call, "fn f_8346() {\n    let _s = %s\n}\n" % call)
+                for body in bodies:
+                    self.refused(r"src/lib\.rs.*include",
+                                 {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "pub mod encryption;\n" + body)})
+                    self.refused(r"src/test_support\.rs.*include", self.with_module(support, "", "\n" + body))
+                    self.refused(r"src/encryption/scope/store\.rs.*include", self.with_module(store, "", "\n" + body))
+        # the plain family is read in every file too (the tree reader used to match `include!` only)
+        for call in ('include_str!("x_8346.txt");', 'include_bytes!("x_8346.bin");'):
+            with self.subTest(call=call):
+                self.refused(r"src/encryption/scope/store\.rs.*include",
+                             self.with_module(store, "", "\nfn f_8346() {\n    let _s = %s\n}\n" % call))
+        # before `mod encryption;` the crate-level reader names it too
+        self.refused(r"src/lib\.rs.*include",
+                     {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "r#include!(\"x_8346.rs\");\npub mod encryption;\n")})
+
+    def test_shared_macro_patterns_accept_the_raw_spelling(self):
+        """security r13 LOW-1 #8436: one pattern per macro family, every match tolerant of `r#`; a longer name is not it."""
+        for text in ("include!(", "r#include!(", "include_str!(", "r#include_bytes!(", "include !("):
+            self.assertIsNotNone(INCLUDE_CALL.search(text), text)
+        for text in ("a_include!(", "'include!", "my_include_str!(", "include_x"):
+            self.assertIsNone(INCLUDE_CALL.search(text), text)
+        for text in ("macro_rules!", "r#macro_rules!", "macro_rules !"):
+            self.assertIsNotNone(MACRO_RULES_CALL.search(text), text)
+        self.assertIsNone(MACRO_RULES_CALL.search("my_macro_rules!"))
+        self.assertEqual([m.group(1) for m in TREE_MACRO.finditer("r#proptest::r#proptest! { }")], ["r#proptest::r#proptest"])
+        self.assertEqual([m.group(1) for m in ITEM_MACRO.finditer("r#foo!")], ["r#foo"])
+        self.assertEqual(region_macros("r#assert!(x); r#format!(y);"), {"assert", "format"})
+
+    def test_raw_identifier_macro_names_are_read_by_the_tree_and_lib_readers(self):
+        """security r13 LOW-1 #8436: `r#macro_rules!` and `r#name!` at the top level are read, never skipped."""
+        tests = "src/encryption/scope/tests.rs"
+        spelled = read(tests)
+        self.assertIn("proptest::proptest!", spelled)
+        census = Census(self.text, overrides={tests: spelled.replace("proptest::proptest!", "r#proptest::r#proptest!", 1)})
+        self.assertEqual(self.census_signature(census), self.census_signature(self.census))
+        self.refused(r"src/encryption/scope/tests\.rs invokes the top-level macros",
+                     self.with_module(tests, "", "\nr#other_8346! { }\n"))
+        for rel, shown in ((LIB_SRC, r"src/lib\.rs.*macro_rules"), ("src/test_support.rs", r"src/test_support\.rs.*macro_rules")):
+            with self.subTest(rel=rel):
+                body = "\nr#macro_rules! m_8346 { () => {}; }\n"
+                if rel == LIB_SRC:
+                    self.refused(shown, {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "pub mod encryption;" + body)})
+                else:
+                    self.refused(shown, self.with_module(rel, "", body))
+        self.refused(r"src/lib\.rs.*r#macro_rules|src/lib\.rs.*macro_rules",
+                     {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "r#macro_rules! m_8346 { () => {}; }\npub mod encryption;\n")})
+
+    def manifest_replaced(self, old, new):
+        """Return Census overrides for Cargo.toml with the one occurrence of `old` replaced by `new`."""
+        manifest = read(MANIFEST)
+        self.assertEqual(manifest.count(old), 1, "manifest anchor %r drifted" % old)
+        return {MANIFEST: manifest.replace(old, new, 1)}
+
+    def test_paste_patch_is_pinned_by_value_not_by_name(self):
+        """security r13 LOW-2 #8437 and code r13 INFO-1: `path = "docs/..."`, a `git` source or an extra key passed."""
+        live = 'paste = { path = "vendor/paste" }'
+        self.assertEqual(ALLOWED_PATCHES, {("crates-io", "paste"): {"path": "vendor/paste"}})
+        for new in ('paste = { path = "docs/paste_8346" }', 'paste = { git = "https://example.invalid/paste" }',
+                    'paste = { path = "vendor/paste", git = "https://example.invalid/paste" }',
+                    'paste = { path = "vendor/paste", version = "1" }', 'paste = "1.0.15"', 'paste = {}',
+                    '"paste" = { path = "vendor/other" }', 'paste.path = "vendor/other"',
+                    'paste = { path = "vendor/pastey" }', "paste = { path = 'vendor/../docs' }",
+                    "paste = { path = 'vendor/paste' }",
+                    'paste = { path = "vendor/paste", features = { a = "b" } }'):
+            with self.subTest(new=new):
+                self.refused(r"Cargo\.toml.*(pinned value|pinned fields|patch key)", self.manifest_replaced(live, new))
+        # the same value in another spelling is the pinned value: spacing, the quoted key, a literal string
+        for new in ('paste={path="vendor/paste"}', '"paste" = {   path   =   "vendor/paste"   }',
+                      'paste = { path = "vendor/paste" } # note'):
+            with self.subTest(new=new):
+                census = Census(self.text, overrides=self.manifest_replaced(live, new))
+                self.assertEqual(self.census_signature(census), self.census_signature(self.census))
+
+    def test_paste_patch_in_table_header_form_is_pinned_by_value(self):
+        """security r13 LOW-2 #8437: `[patch.crates-io.paste]` with other keys, and a removed patch, are rejected."""
+        manifest = read(MANIFEST)
+        header = "[patch.crates-io]\n"
+        for tail in ('[patch.crates-io.paste]\npath = "docs/paste_8346"\n', '[patch.crates-io.paste]\ngit = "https://example.invalid/p"\n',
+                     '[patch.crates-io.paste]\npath = "vendor/paste"\nversion = "1"\n'):
+            with self.subTest(tail=tail):
+                text = manifest.replace('paste = { path = "vendor/paste" }', "", 1) + "\n" + tail
+                with self.assertRaisesRegex(AssertionError, r"Cargo\.toml has `\[patch\.crates-io\] paste` with the fields|Cargo\.toml has `\[patch\.crates-io\] paste = "):
+                    Census(self.text, overrides={MANIFEST: text})
+        gone = self.manifest_replaced('paste = { path = "vendor/paste" }', "")
+        self.refused(r"Cargo\.toml no longer has `\[patch\.crates-io\]` entry `paste`", gone)
+        self.assertIn(header, manifest)
+
+    def test_known_lib_macro_is_pinned_by_its_whole_definition_and_defined_once(self):
+        """security r13 INFO-1 #8440 and code r13 INFO-2: the name pin passed a duplicate, an extra arm and a changed attribute."""
+        lib = read(LIB_SRC)
+        name = "reserved_upsert_metadata_keys_sql"
+        self.assertEqual(sorted(LIB_KNOWN_MACROS), [name])
+        attr = "#[macro_export]\nmacro_rules! %s" % name
+        self.assertEqual(lib.count(attr), 1)
+        start = lib.index(attr)
+        end = lib.index("\n}\n", start) + 3
+        definition = lib[start:end]
+        mutations = {
+            "duplicate": lib + "\n" + definition.replace(name, name),
+            "changed attribute": lib.replace(attr, "#[macro_export]\n#[allow(unused)]\nmacro_rules! %s" % name, 1),
+            "attribute removed": lib.replace(attr, "macro_rules! %s" % name, 1),
+            "extra arm": lib.replace("    () => {\n        \"'agent_id'", "    ($m:ident) => { mod $m; };\n    () => {\n        \"'agent_id'", 1),
+            "body edited": lib.replace("'pubkey_bound_at'\"", "'pubkey_bound_at', 'x_8346'\"", 1),
+            "removed": lib[:start] + lib[end:],
+        }
+        for label, text in mutations.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(text, lib, label)
+                self.refused(r"src/lib\.rs.*(pinned definition|exactly once)", {LIB_SRC: text})
+        # whitespace and comments inside the definition are not a change
+        spaced = definition.replace("    () => {", "    () => { // 8346 comment\n   ", 1).replace("#[macro_export]", "#[macro_export] /* x */")
+        census = Census(self.text, overrides={LIB_SRC: lib.replace(definition, spaced, 1)})
+        self.assertEqual(self.census_signature(census), self.census_signature(self.census))
+        self.refused(r"src/lib\.rs defines the `macro_rules!` macro `other_8346`",
+                     {LIB_SRC: lib + "\nmacro_rules! other_8346 { () => {}; }\n"})
+
+    def test_name_only_pins_are_audited_and_each_ruling_is_recorded(self):
+        """code r13 INFO-1/INFO-2: every name-only pin is a value pin now or its docstring records why a name suffices."""
+        for phrase in ("name-pin rulings", "dependency versions", "TARGET_ATTRIBUTES", "CARGO_TRACKED", "TOOLCHAIN_KEYS",
+                       "NEXTEST_KEYS", "ALLOWED_PATCHES", "LIB_KNOWN_MACROS", "vendored"):
+            self.assertIn(phrase, __doc__)
+
+    @contextlib.contextmanager
+    def scratch_checkout(self):
+        """Yield a scratch copy of the files the census reads, with `REPO` pointing at it (links are made here only)."""
+        SCRATCH.mkdir(exist_ok=True)
+        live = {directory: tracked_under(directory) for directory in (CARGO_DIR, NEXTEST_DIR)}
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH), prefix="real-8346-") as scratch:
+            root = Path(scratch)
+            shutil.copytree(str(REPO / "src"), str(root / "src"))
+            for rel in (MANIFEST, TOOLCHAIN_FILE):
+                shutil.copyfile(str(REPO / rel), str(root / rel))
+            for directory in (CARGO_DIR, NEXTEST_DIR):
+                if (REPO / directory).is_dir():
+                    shutil.copytree(str(REPO / directory), str(root / directory))
+            here = sys.modules[__name__]
+            with mock.patch.object(here, "REPO", root), \
+                    mock.patch.object(here, "tracked_under", side_effect=lambda directory: live[directory]):
+                yield root
+
+    def link_input(self, root, rel):
+        """Replace `rel` of the scratch checkout by a symbolic link to a moved copy of itself."""
+        path = root / rel
+        keep = root / "elsewhere_8346" / rel.replace("/", "_")
+        keep.parent.mkdir(exist_ok=True)
+        shutil.move(str(path), str(keep))
+        path.symlink_to(keep)
+        return keep
+
+    def test_scratch_checkout_without_links_is_the_live_census(self):
+        """the scratch harness of the real-file probes reads the same census as the live tree (a valid control)."""
+        with self.scratch_checkout():
+            census = Census(self.text)
+            self.assertEqual(self.census_signature(census), self.census_signature(self.census))
+
+    def test_symlinked_inputs_are_rejected_and_named(self):
+        """security r13 LOW-3 #8438: a link made the mirror read bytes other than the ones rustc and cargo read."""
+        inputs = (LIB_SRC, MANIFEST, SCOPE_SRC, "src/test_support.rs", TOOLCHAIN_FILE, "src/encryption/scope/store.rs",
+                  "src/encryption/escrow.rs", NEXTEST_CONFIG)
+        for rel in inputs:
+            with self.subTest(rel=rel):
+                with self.scratch_checkout() as root:
+                    if not (root / rel).exists():
+                        self.skipTest("%s is not tracked in this checkout" % rel)
+                    self.link_input(root, rel)
+                    with self.assertRaisesRegex(AssertionError, re.escape(rel) + r".*symbolic link"):
+                        Census(self.text)
+
+    def test_symlinked_directory_component_is_rejected_and_named(self):
+        """security r13 LOW-3 #8438: `src` or `src/encryption/scope` as a link redirects every file below it."""
+        for rel, shown in (("src", r"src/.*symbolic link \(src\)"),
+                           ("src/encryption/scope", r"src/encryption/scope.*symbolic link"),
+                           ("src/encryption", r"src/encryption.*symbolic link")):
+            with self.subTest(rel=rel):
+                with self.scratch_checkout() as root:
+                    self.link_input(root, rel)
+                    with self.assertRaisesRegex(AssertionError, shown):
+                        Census(self.text)
+
+    def test_link_to_a_link_fifo_and_hard_link_are_rejected(self):
+        """security r13 LOW-3 #8438: a link to a link, a FIFO and a second hard link are not real input files."""
+        with self.scratch_checkout() as root:
+            keep = self.link_input(root, LIB_SRC)
+            second = root / "elsewhere_8346" / "second_link"
+            second.symlink_to(keep)
+            (root / LIB_SRC).unlink()
+            (root / LIB_SRC).symlink_to(second)
+            with self.assertRaisesRegex(AssertionError, r"src/lib\.rs.*symbolic link"):
+                Census(self.text)
+        with self.scratch_checkout() as root:
+            (root / "src/test_support.rs").unlink()
+            os.mkfifo(str(root / "src/test_support.rs"))
+            with self.assertRaisesRegex(AssertionError, r"src/test_support\.rs is not a regular file"):
+                Census(self.text)
+        with self.scratch_checkout() as root:
+            os.mkfifo(str(root / "src/encryption/fifo_8346.rs"))
+            with self.assertRaisesRegex(AssertionError, r"src/encryption/fifo_8346\.rs is not a regular file"):
+                Census(self.text)
+        with self.scratch_checkout() as root:
+            os.link(str(root / LIB_SRC), str(root / "second_name_8346.rs"))
+            with self.assertRaisesRegex(AssertionError, r"src/lib\.rs has 2 hard links"):
+                Census(self.text)
+
+    def test_symlinked_cargo_config_and_doc_are_rejected_and_named(self):
+        """security r13 LOW-3 #8438: a linked `.cargo/config.toml` and a linked doc are read through, so both are named."""
+        with self.scratch_checkout() as root:
+            target = root / "elsewhere_8346" / "config.toml"
+            target.parent.mkdir()
+            target.write_text("[build]\n", encoding="utf-8")
+            (root / CARGO_DIR / "config.toml").symlink_to(target)
+            with self.assertRaisesRegex(AssertionError, r"\.cargo/config\.toml.*symbolic link"):
+                Census(self.text)
+        with self.scratch_checkout() as root:
+            (root / "docs").mkdir()
+            (root / "docs/a.md").write_text("plain\n", encoding="utf-8")
+            (root / "docs/b.md").symlink_to(root / "docs/a.md")
+            self.assertEqual(self.census.run(root, ["docs/a.md"]), ([], []))
+            with self.assertRaisesRegex(AssertionError, r"docs/b\.md.*symbolic link"):
+                self.census.run(root, ["docs/a.md", "docs/b.md"])
+
+    def test_real_file_reader_reports_missing_as_missing_and_keeps_its_prefix(self):
+        """security r13 LOW-3 #8438: a missing file is `None` (not a link error) and `read` keeps the `cannot read it` text."""
+        self.assertIsNone(real_file("src/no_such_8346.rs"))
+        self.assertIsNone(real_file("src/lib.rs/below_a_file_8346"))
+        self.assertEqual(real_file(LIB_SRC), REPO / LIB_SRC)
+        with self.assertRaisesRegex(AssertionError, r"src/no_such_8346\.rs.*cannot read it"):
+            read("src/no_such_8346.rs")
+
+    def test_external_crate_name_that_resolves_to_a_local_item_is_rejected(self):
+        """security r13 LOW-4 #8439: `use crate::embeddings as zeroize;` silently shadows the extern crate."""
+        scope = SCOPE_SRC
+        for code, shown in (("use crate::embeddings as zeroize;\n", r"binds the crate name `zeroize` locally"),
+                            ("use crate::embeddings::{self as zeroize};\n", r"binds the crate name `zeroize` locally"),
+                            ("use crate::{embeddings, zeroize};\n", r"binds the crate name `zeroize` locally"),
+                            ("use crate::embeddings as r#zeroize;\n", r"binds the crate name `zeroize` locally"),
+                            ("use zeroize;\n", r"binds the crate name `zeroize` locally"),
+                            ("struct zeroize;\n", r"binds the crate name `zeroize` locally"),
+                            ("enum zeroize { A }\n", r"binds the crate name `zeroize` locally"),
+                            ("type zeroize = u8;\n", r"binds the crate name `zeroize` locally"),
+                            ("use crate::embeddings as hkdf;\n", r"binds the crate name `hkdf` locally"),
+                            ("use crate::embeddings as sha2;\n", r"binds the crate name `sha2` locally"),
+                            ("mod zeroize;\n", r"zeroize"),
+                            ("extern crate serde as zeroize;\n", r"extern crate"),
+                            ("use newcrate_8346::Thing;\n", r"not a dependency name of the pinned set")):
+            with self.subTest(code=code):
+                self.refused(r"src/encryption/scope\.rs.*" + shown, self.with_module(scope, "", "\n" + code))
+        for code in ("use crate::embeddings as zeroize;\n", "struct hkdf;\n", "use crate::embeddings::{self as sha2};\n"):
+            with self.subTest(lib=code):
+                self.refused(r"src/lib\.rs binds the crate name",
+                             {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "pub mod encryption;\n" + code)})
+        # the crate's own item under its own name is no shadow (`use anyhow::{Result, anyhow};` is live today)
+        census = Census(self.text, overrides=self.with_module(SCOPE_SRC, "", "\nfn zeroize() {}\nfn sha2() {}\n"))
+        self.assertEqual(self.census_signature(census), self.census_signature(self.census))
+
+    def test_renamed_external_crate_in_the_manifest_is_rejected_for_the_resolved_names(self):
+        """security r13 LOW-4 #8439: the crate a name resolves to must be the one the manifest key says."""
+        for extra in ('[dependencies]\nzeroize = { version = "1", package = "other_8346" }',
+                      '[dependencies]\nhkdf = { version = "0.12", package = "other_8346" }'):
+            with self.subTest(extra=extra):
+                self.refused(r"Cargo\.toml renames the dependency", self.manifest_with(extra))
+        for root in sorted(external_roots(mask_literals(strip_comments(read(SCOPE_SRC))), SCOPE_SRC)):
+            self.assertTrue(any(root == dep.replace("-", "_") for dep in LIVE_DEPENDENCIES[("dependencies",)]), root)
+
+    def test_missing_space_of_the_local_module_assignment_is_fixed(self):
+        """security r13 INFO-2 #8441: the `rel` assignment lacked the space before the call (E225)."""
+        source = Path(__file__).read_text(encoding="utf-8")
+        self.assertNotIn("rel =" + "local_module_file(", source)
+        self.assertIn("rel = " + "local_module_file(", source)
+
+    def test_round_14_classes_are_documented_and_counted(self):
+        """the docstring and CLOSED_CLASSES list the round 14 classes the code enforces (33 in all)."""
+        for phrase in ("trait brace items", "raw-identifier macro calls", "pinned values", "real input files",
+                       "crate-name resolution"):
+            self.assertIn(phrase, CLOSED_CLASSES)
+        for phrase in ("E0603", "audited brace-item list", "INCLUDE_CALL", "ALLOWED_PATCHES", "LIB_KNOWN_MACROS",
+                       "hard-link", "name-pin rulings", "33 classes", "lstat"):
+            self.assertIn(phrase, __doc__)
+        self.assertEqual(len(CLOSED_CLASSES), 33)
+        self.assertEqual(len(set(CLOSED_CLASSES)), 33)
 
     def test_mutation_anchor_that_drifts_names_itself(self):
         with self.assertRaisesRegex(AssertionError, r"mutation anchor.*not-in-the-source"):
