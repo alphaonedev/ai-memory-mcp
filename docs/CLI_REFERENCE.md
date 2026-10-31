@@ -96,8 +96,11 @@ never downgrades.
 ai-memory store --title "Q2 roadmap" \
   --content "Aligned on microservices cut-over by July" \
   --tier long --namespace planning --tags strategic,quarterly
+```
 
-# Attested write: sign with the agent's bound Ed25519 keypair (#626 Layer-3).
+Attested write: sign with the agent's bound Ed25519 keypair (#626 Layer-3).
+
+```bash
 ai-memory store --title "Prod incident postmortem" \
   --content "Root cause: connection-pool exhaustion under retry storm" \
   --tier long --namespace incidents --agent-id ai:claude-opus-4.7 --sign
@@ -175,12 +178,15 @@ ai-memory search "kubernetes rollout" --tier long --limit 10
 
 Standard CRUD.
 
+- `ai-memory delete abc123`: archive-first: restorable
+- `ai-memory delete abc123 --hard`: irreversible
+
 ```bash
 ai-memory list --namespace planning --tier long --limit 50
 ai-memory get abc123
 ai-memory update abc123 --title "Renamed" --priority 8
-ai-memory delete abc123          # archive-first: restorable
-ai-memory delete abc123 --hard   # irreversible
+ai-memory delete abc123
+ai-memory delete abc123 --hard
 ```
 
 `get` accepts a UUID or unique prefix. `update` omits any flag you
@@ -245,9 +251,12 @@ remain hard-destroy; federated erasure still propagates from every surface
 
 ### `promote`, `forget`, `link`
 
+- `ai-memory promote abc123`: bump to long tier
+- `ai-memory promote abc123 --to-namespace org`: Task 1.7 clone-to-ancestor
+
 ```bash
-ai-memory promote abc123                    # bump to long tier
-ai-memory promote abc123 --to-namespace org # Task 1.7 clone-to-ancestor
+ai-memory promote abc123
+ai-memory promote abc123 --to-namespace org
 ai-memory forget --namespace scratch --tier short
 ai-memory link src-id dst-id --relation supersedes
 ```
@@ -349,18 +358,25 @@ ai-memory resolve winner-id loser-id
 
 ### `gc`, `stats`, `namespaces`
 
+- `ai-memory gc`: immediate garbage collection
+- `ai-memory stats`: counts by tier/namespace, DB size
+- `ai-memory namespaces`: list every namespace + count
+
 ```bash
-ai-memory gc                      # immediate garbage collection
-ai-memory stats                   # counts by tier/namespace, DB size
-ai-memory namespaces              # list every namespace + count
+ai-memory gc
+ai-memory stats
+ai-memory namespaces
 ```
 
 ### `export`, `import`
 
+- `ai-memory import < backup.json`: restamps agent_id
+- `ai-memory import --trust-source < trusted.json`: preserves agent_id
+
 ```bash
 ai-memory export > backup.json
-ai-memory import < backup.json                # restamps agent_id
-ai-memory import --trust-source < trusted.json # preserves agent_id
+ai-memory import < backup.json
+ai-memory import --trust-source < trusted.json
 ```
 
 `--trust-source` is only safe when the source is your own backup or a
@@ -426,8 +442,11 @@ API key comes from the `api_key` field in `config.toml`).
 ```bash
 # singleton, zero-config: first boot generates <key_dir>/tls/{local-ca.pem,local-ca.key,server.pem,server.key}
 ai-memory serve
-# declared non-singleton shape ([deployment] shape = team / production / federated / hive):
-# enterprise PKI is REQUIRED —
+```
+
+For a declared non-singleton shape (`[deployment] shape = team / production / federated / hive`), enterprise PKI is REQUIRED:
+
+```bash
 ai-memory serve --host 0.0.0.0 --port 9077 \
   --tls-cert /etc/ai-memory/cert.pem \
   --tls-key /etc/ai-memory/key.pem
@@ -493,12 +512,15 @@ ai-memory mine ./claude-export --format claude --min-messages 3
 
 ### `archive`
 
+- `ai-memory archive purge --dry-run`: preview, destroys nothing
+- `ai-memory archive purge --confirm-global`: every namespace
+
 ```bash
 ai-memory archive list --limit 100
 ai-memory archive restore abc123
 ai-memory archive purge --namespace scratch --older-than-days 30
-ai-memory archive purge --dry-run                 # preview, destroys nothing
-ai-memory archive purge --confirm-global          # every namespace
+ai-memory archive purge --dry-run
+ai-memory archive purge --confirm-global
 ai-memory archive stats
 ```
 
@@ -872,24 +894,35 @@ printed only for a reversal that is present on the durable row.
 ```bash
 # Once with JSON report
 ai-memory curator --once --max-ops 50 --json
+```
 
-# Daemon mode (also runs the GC tick — the curator daemon is the reaper on a
-# curator-only host, honouring [storage].archive_on_gc)
+Daemon mode (also runs the GC tick — the curator daemon is the reaper on a curator-only host, honouring [storage].archive_on_gc):
+
+```bash
 ai-memory curator --daemon --interval-secs 1800
+```
 
-# Reverse the last 5 autonomous actions
+Reverse the last 5 autonomous actions:
+
+```bash
 ai-memory curator --rollback-last 5
+```
 
-# How big is the pre-#3345 self-report backlog? (writes nothing)
+How big is the pre-#3345 self-report backlog? (writes nothing):
+
+```bash
 ai-memory curator --prune-reports --json
+```
 
-# Collapse it: fold each UTC day into _curator/reports/daily, then stamp the
-# 24h retention the per-sweep rows should have carried. Deletes NOTHING —
-# reaping is the ordinary GC's, which archives when archive_on_gc is on.
-# Idempotent and resumable; safe to re-run.
+Collapse it: fold each UTC day into _curator/reports/daily, then stamp the 24h retention the per-sweep rows should have carried. Deletes NOTHING — reaping is the ordinary GC's, which archives when archive_on_gc is on. Idempotent and resumable; safe to re-run.
+
+```bash
 ai-memory curator --prune-reports --apply
+```
 
-# Postgres-backed store: the same collapse through the SAL trait.
+Postgres-backed store: the same collapse through the SAL trait.
+
+```bash
 ai-memory curator --prune-reports --apply --store-url postgres://…
 ```
 
@@ -932,10 +965,12 @@ loaded and why. Global `--json` is honoured as `--format json` when
 (silent exit 0). `boot` exits **0 in every state** — never wedges an
 agent's first turn.
 
+- `AI_MEMORY_BOOT_ENABLED=0 ai-memory boot`: privacy opt-out: silent exit 0
+
 ```bash
 ai-memory boot --limit 3
 ai-memory boot --namespace planning --format json --quiet
-AI_MEMORY_BOOT_ENABLED=0 ai-memory boot   # privacy opt-out: silent exit 0
+AI_MEMORY_BOOT_ENABLED=0 ai-memory boot
 ```
 
 See the `[boot]` config block in `docs/ADMIN_GUIDE.md` for `enabled` /
@@ -965,9 +1000,12 @@ Behaviours:
 - `.bak.<rfc3339>` backup file written next to the destination.
 - World-writable destination paths are refused.
 
+- `ai-memory install claude-code`: preview the diff
+- `ai-memory install claude-code --apply`: actually write
+
 ```bash
-ai-memory install claude-code               # preview the diff
-ai-memory install claude-code --apply       # actually write
+ai-memory install claude-code
+ai-memory install claude-code --apply
 ai-memory install claude-code --uninstall --apply
 ```
 
@@ -1093,8 +1131,10 @@ Path precedence: `--audit-dir` flag > `AI_MEMORY_AUDIT_DIR` env >
 `config.toml` > platform default. Append-only at the OS level where
 supported (`chattr +a` on Linux, `fs_chflags` UF_APPEND on macOS/BSD).
 
+- `ai-memory audit verify`: exits 0 on integrity, 2 on tamper
+
 ```bash
-ai-memory audit verify          # exits 0 on integrity, 2 on tamper
+ai-memory audit verify
 ai-memory audit tail --lines 50
 ai-memory audit path
 ```
@@ -1231,8 +1271,11 @@ window; Info otherwise. Doctor never refuses. The doctor sections that open thei
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'
 ai-memory doctor --remote https://memory.prod.example.com
+```
 
-# Certified enterprise posture: TLS + mandatory client-cert mTLS + api-key.
+Certified enterprise posture: TLS + mandatory client-cert mTLS + api-key.
+
+```bash
 ai-memory doctor --remote https://memory.prod.example.com \
   --ca-cert /etc/ai-memory/tls/ca.pem \
   --client-cert /etc/ai-memory/tls/client.crt \
@@ -1310,11 +1353,15 @@ Exit codes: `0` success or already-v2; `1` dry-run (informational);
 `2` file not found at `~/.config/ai-memory/config.toml`; `3` parse
 error (invalid TOML); `4` write error.
 
+- `ai-memory config migrate`: write `<file>.bak.<ts>` + rewrite
+- `ai-memory config migrate --dry-run`: preview diff, no writes
+- `--also-clean-claude-json`: also strip MCP env block
+
 ```bash
-ai-memory config migrate              # write <file>.bak.<ts> + rewrite
-ai-memory config migrate --dry-run    # preview diff, no writes
+ai-memory config migrate
+ai-memory config migrate --dry-run
 ai-memory config migrate \
-    --also-clean-claude-json          # also strip MCP env block
+    --also-clean-claude-json
 ```
 
 The migrator never lowers security posture or removes secrets.
@@ -1458,9 +1505,12 @@ HTTP `POST /api/v1/expand_query` route, and this CLI subcommand — the
 expanded-terms set is byte-equal across all three because they share
 one code path (`crate::mcp::handle_expand_query`).
 
+- `ai-memory expand "neural nets"`: human-readable summary
+- `ai-memory expand --json "neural nets"`: {query, expanded_terms, elapsed_ms, key_source}
+
 ```bash
-ai-memory expand "neural nets"          # human-readable summary
-ai-memory expand --json "neural nets"   # {query, expanded_terms, elapsed_ms, key_source}
+ai-memory expand "neural nets"
+ai-memory expand --json "neural nets"
 ```
 
 | Flag | Notes |
@@ -1494,11 +1544,16 @@ tool for switching embedding models: vectors from different models
 `[embeddings].model` / `AI_MEMORY_EMBED_MODEL` the existing corpus
 must be re-embedded into the new vector space.
 
+- `ai-memory reembed --dry-run`: plan only, no writes
+- `ai-memory reembed`: re-embed every row
+- `ai-memory reembed --namespace prod --json`: scope to one namespace
+- `ai-memory reembed --batch 50`: smaller batches
+
 ```bash
-ai-memory reembed --dry-run                 # plan only, no writes
-ai-memory reembed                            # re-embed every row
-ai-memory reembed --namespace prod --json    # scope to one namespace
-ai-memory reembed --batch 50                 # smaller batches
+ai-memory reembed --dry-run
+ai-memory reembed
+ai-memory reembed --namespace prod --json
+ai-memory reembed --batch 50
 ```
 
 | Flag | Notes |
@@ -1569,13 +1624,20 @@ lock themselves out of their own data. `reown` claims the rows first;
 `ai-memory doctor` (section `Unstamped owners (#3124)`) counts the rows
 that carry no owner.
 
+- `ai-memory reown --namespace prod --to alice --only-unowned --dry-run`: count first
+- `ai-memory reown --namespace prod --to alice --only-unowned`: adopt unowned rows only
+- `ai-memory reown --all-namespaces --to alice --only-unowned --dry-run`: every namespace
+- `ai-memory reown --namespace prod --to alice`: same as --only-unowned (the default, #3694)
+- `ai-memory reown --namespace prod --to alice --take-owned --dry-run`: plan taking rows from their owners
+- `ai-memory reown --namespace prod --to alice --take-owned --yes`: take them (confirmed)
+
 ```bash
-ai-memory reown --namespace prod --to alice --only-unowned --dry-run   # count first
-ai-memory reown --namespace prod --to alice --only-unowned             # adopt unowned rows only
-ai-memory reown --all-namespaces --to alice --only-unowned --dry-run   # every namespace
-ai-memory reown --namespace prod --to alice                            # same as --only-unowned (the default, #3694)
-ai-memory reown --namespace prod --to alice --take-owned --dry-run     # plan taking rows from their owners
-ai-memory reown --namespace prod --to alice --take-owned --yes         # take them (confirmed)
+ai-memory reown --namespace prod --to alice --only-unowned --dry-run
+ai-memory reown --namespace prod --to alice --only-unowned
+ai-memory reown --all-namespaces --to alice --only-unowned --dry-run
+ai-memory reown --namespace prod --to alice
+ai-memory reown --namespace prod --to alice --take-owned --dry-run
+ai-memory reown --namespace prod --to alice --take-owned --yes
 ```
 
 | Flag | Notes |
@@ -1779,10 +1841,14 @@ degradation. Never runs unless explicitly invoked.
 per-file dedup, and `observed_actor` are documented in
 [`docs/anti-drift.md`](anti-drift.html).
 
+- `ai-memory watch --once`: single poll tick, human report
+- `ai-memory watch --once --json`: single poll tick, JSON report
+- `ai-memory watch --daemon --interval-secs 10`: continuous poll loop until SIGINT
+
 ```bash
-ai-memory watch --once                       # single poll tick, human report
-ai-memory watch --once --json                # single poll tick, JSON report
-ai-memory watch --daemon --interval-secs 10  # continuous poll loop until SIGINT
+ai-memory watch --once
+ai-memory watch --once --json
+ai-memory watch --daemon --interval-secs 10
 ai-memory watch --daemon --host claude-code --host codex
 ai-memory watch --daemon --host file:/path/to/DEPUTY-OUTBOX.md
 ai-memory watch --once --host file:./MASTER-INBOX.md --dry-run
@@ -1855,18 +1921,19 @@ ai-memory store --title t --content c --capability-file ~/.ai-memory/cap.tok
 AI_MEMORY_CAPABILITY_FILE=~/.ai-memory/cap.tok ai-memory delete <id>
 ```
 
+`capability init` (v1.0.0 R9, #1960) is an idempotent zero-config `owner` mint (custody + .caproot) and a no-op if present. `keygen` mints the issuer .caproot secret (mode 0600). `mint --expires-in-secs 3600` makes a root token whose expiry is lint-enforced. `attenuate --action Store --agent alice` is keyless and strictly NARROWS. `inspect` decodes and prints the structure (no verification). `verify` checks the token against `[capabilities]` plus the request tuple.
+
 ```bash
-ai-memory capability init                              # v1.0.0 R9 (#1960) — idempotent zero-config
-                                                       # `owner` mint (custody + .caproot). No-op if present.
-ai-memory capability keygen <issuer>                   # issuer .caproot mint secret (mode 0600)
+ai-memory capability init
+ai-memory capability keygen <issuer>
 ai-memory capability mint <issuer> \
     --namespace-prefix team/ --op-ceiling read \
-    --expires-in-secs 3600                             # root token; expiry is lint-enforced
+    --expires-in-secs 3600
 ai-memory capability attenuate --token cap1:... \
-    --action Store --agent alice                       # keyless; strictly NARROWS
-ai-memory capability inspect --token cap1:...          # decode + print structure (no verification)
+    --action Store --agent alice
+ai-memory capability inspect --token cap1:...
 ai-memory capability verify  --token cap1:... \
-    --action Store --namespace team/eng --agent alice  # verify against [capabilities] + request tuple
+    --action Store --namespace team/eng --agent alice
 ```
 
 `--key-dir <PATH>` is global to the subcommand (`AI_MEMORY_KEY_DIR`
@@ -1881,9 +1948,12 @@ Inspect or enroll rows in the append-only, write-once (TOFU)
 `model_attestations` substrate that records WHICH model family produced
 a generation.
 
+- `ai-memory model-attest list`: every row (loader-observed + operator-signed); read-only, no key
+- `ai-memory model-attest enroll ...`: operator-signed attestation; REQUIRES the operator key
+
 ```bash
-ai-memory model-attest list       # every row (loader-observed + operator-signed); read-only, no key
-ai-memory model-attest enroll ... # operator-signed attestation; REQUIRES the operator key
+ai-memory model-attest list
+ai-memory model-attest enroll ...
 ```
 
 **Honest bound:** loader coverage hard-caps at roughly 40% — only
@@ -1917,11 +1987,16 @@ Three-surface parity with the `memory_lineage` MCP tool and
 
 ### `stop` — substrate record-stop actuator (v1.0.0, #1955)
 
+- `ai-memory stop`: freeze THIS substrate's own record plane
+- `ai-memory stop --status`: report the current record-stop state
+- `ai-memory stop --resume`: lift a prior record-stop (resume recording)
+- `ai-memory stop --json`: machine-readable status/verdict
+
 ```bash
-ai-memory stop                # freeze THIS substrate's own record plane
-ai-memory stop --status       # report the current record-stop state
-ai-memory stop --resume       # lift a prior record-stop (resume recording)
-ai-memory stop --json         # machine-readable status/verdict
+ai-memory stop
+ai-memory stop --status
+ai-memory stop --resume
+ai-memory stop --json
 ```
 
 Freezes THIS substrate's own record plane — subsequent writes are
@@ -1934,12 +2009,18 @@ external cognition. Routes through the backend-blind
 
 ### `ai-memory quarantine` — operator route OUT of federation quarantine (v1.0.0, #2402)
 
+- `ai-memory quarantine list`: what is currently held (identifying metadata only)
+- `ai-memory quarantine list --namespace team/eng`: narrow to one namespace
+- `ai-memory quarantine list --limit 500 --json`: bounded page, machine-readable
+- `ai-memory quarantine release <id>`: release ONE quarantined row to open, or decontaminate ONE contaminated row (#3266 R2.5)
+- `ai-memory quarantine list --store-url postgres://…`: same two verbs on the enterprise tier
+
 ```bash
-ai-memory quarantine list                          # what is currently held (identifying metadata only)
-ai-memory quarantine list --namespace team/eng     # narrow to one namespace
-ai-memory quarantine list --limit 500 --json       # bounded page, machine-readable
-ai-memory quarantine release <id>                  # release ONE quarantined row to open, or decontaminate ONE contaminated row (#3266 R2.5)
-ai-memory quarantine list --store-url postgres://… # same two verbs on the enterprise tier
+ai-memory quarantine list
+ai-memory quarantine list --namespace team/eng
+ai-memory quarantine list --limit 500 --json
+ai-memory quarantine release <id>
+ai-memory quarantine list --store-url postgres://…
 ```
 
 [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) writes an
@@ -1969,9 +2050,12 @@ override of a containment decision always leaves a trace. Admin HTTP twin:
 
 ### `features` — report compiled cargo features (v1.0.0, #2676 / Gate 3)
 
+- `ai-memory features`: version: + features: (comma-separated, sorted)
+- `ai-memory features --json`: {"version": "...", "features": ["sal", ...]}
+
 ```bash
-ai-memory features            # version: + features: (comma-separated, sorted)
-ai-memory features --json     # {"version": "...", "features": ["sal", ...]}
+ai-memory features
+ai-memory features --json
 ```
 
 Prints the crate `version:` plus the `features:` compiled into this
@@ -1983,16 +2067,26 @@ backend), not merely `--version` success — a binary that built without
 
 ### `wake-hub` — same-host agent wake plane (v1.0.0, #3467 / EPIC #3466)
 
+- `ai-memory wake-hub`: bind and serve until SIGINT/SIGTERM
+- `ai-memory wake-hub --socket /run/x.sock`: explicit socket path
+- `ai-memory wake-hub --hub-id my-hub`: transcript-bound hub identifier
+- `ai-memory wake-hub --max-connections 128`: ceiling (clamped by RLIMIT_NOFILE)
+- `ai-memory wake-hub --allowlist /run/allow.json`: enrolled-key allowlist (#3468)
+- `ai-memory wake-hub --posture`: print the resolved posture, bind nothing
+- `ai-memory wake-hub --posture --json`: machine-readable posture
+- `ai-memory wake-hub --health`: probe the socket; exit 0 / 2 (#3471)
+- `ai-memory wake-hub --health --json`: machine-readable reachability
+
 ```bash
-ai-memory wake-hub                          # bind and serve until SIGINT/SIGTERM
-ai-memory wake-hub --socket /run/x.sock     # explicit socket path
-ai-memory wake-hub --hub-id my-hub          # transcript-bound hub identifier
-ai-memory wake-hub --max-connections 128    # ceiling (clamped by RLIMIT_NOFILE)
-ai-memory wake-hub --allowlist /run/allow.json  # enrolled-key allowlist (#3468)
-ai-memory wake-hub --posture                # print the resolved posture, bind nothing
-ai-memory wake-hub --posture --json         # machine-readable posture
-ai-memory wake-hub --health                 # probe the socket; exit 0 / 2 (#3471)
-ai-memory wake-hub --health --json          # machine-readable reachability
+ai-memory wake-hub
+ai-memory wake-hub --socket /run/x.sock
+ai-memory wake-hub --hub-id my-hub
+ai-memory wake-hub --max-connections 128
+ai-memory wake-hub --allowlist /run/allow.json
+ai-memory wake-hub --posture
+ai-memory wake-hub --posture --json
+ai-memory wake-hub --health
+ai-memory wake-hub --health --json
 ```
 
 A Unix-domain-socket switch (mode **0600**, inside an owner-only **0700**
@@ -2076,9 +2170,12 @@ and whether a supervisor unit is installed.
 
 ### `identity delegate` — mint a scoped hub delegation (v1.0.0, #3468)
 
+- `ai-memory identity delegate --scope a2a-hub`: 1 h, default hub
+- `ai-memory identity delegate --scope a2a-hub --ttl-secs 900`: shorter window
+
 ```bash
-ai-memory identity delegate --scope a2a-hub                 # 1 h, default hub
-ai-memory identity delegate --scope a2a-hub --ttl-secs 900  # shorter window
+ai-memory identity delegate --scope a2a-hub
+ai-memory identity delegate --scope a2a-hub --ttl-secs 900
 ai-memory identity delegate --scope a2a-hub --hub-id my-hub --out /run/d.json
 ```
 
@@ -2098,9 +2195,11 @@ secret is written. Use a new `--out` path when renewing a delegation.
 
 ### `identity hub-cache` — refresh the public hub authority cache
 
+- `ai-memory identity hub-cache --out /run/allow.json`: revoke all cached principals
+
 ```bash
 ai-memory identity hub-cache --include-agent ai:worker --out /run/allow.json
-ai-memory identity hub-cache --out /run/allow.json # revoke all cached principals
+ai-memory identity hub-cache --out /run/allow.json
 ai-memory identity hub-cache --include-agent ai:worker --daemon-producer --out /run/allow.json
 ```
 
@@ -2193,11 +2292,14 @@ which beats the compiled bound. Opt-in: nothing starts a hub implicitly.
 
 ### `wake-listen` — the long-lived wake-hub client (v1.0.0, #3470 / EPIC #3466)
 
+- `ai-memory wake-listen --agent-id ai:alice --once`: exit after one catch-up read
+- `ai-memory wake-listen --agent-id ai:alice --no-hub`: backstop poll only
+
 ```bash
 ai-memory wake-listen --agent-id ai:alice --json
 ai-memory wake-listen --agent-id ai:alice --exec 'my-notifier'
-ai-memory wake-listen --agent-id ai:alice --once      # exit after one catch-up read
-ai-memory wake-listen --agent-id ai:alice --no-hub    # backstop poll only
+ai-memory wake-listen --agent-id ai:alice --once
+ai-memory wake-listen --agent-id ai:alice --no-hub
 ai-memory wake-listen --socket /run/x.sock --hub-id my-hub --poll-secs 30
 ```
 
@@ -2323,8 +2425,10 @@ because neither is recoverable by waiting.
 
 ## Shell, completions, man
 
+- `ai-memory shell`: interactive REPL
+
 ```bash
-ai-memory shell                              # interactive REPL
+ai-memory shell
 ai-memory completions bash > ~/.bash_completion.d/ai-memory
 ai-memory completions zsh  > ~/.zsh/completions/_ai-memory
 ai-memory man | man -l -

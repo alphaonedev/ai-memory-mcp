@@ -4,9 +4,6 @@
 19 README.md
 51 docs/ADMIN_GUIDE.md
 6 docs/AI_DEVELOPER_WORKFLOW.md
-4 docs/API_REFERENCE.md
-81 docs/CLI_REFERENCE.md
-4 docs/CONFIG_SCHEMA.md
 11 docs/DEVELOPER_GUIDE.md
 6 docs/ENGINEERING_STANDARDS.md
 10 docs/GOVERNANCE_HISTORY.md
@@ -70,7 +67,6 @@
 17 docs/postgres-age-guide.md
 13 docs/production-deployment.md
 1 docs/promotion-geometry.md
-3 docs/reference/ARCHITECTURE_REFERENCE.md
 1 docs/reviews/v0.8.0-FULL-SPECTRUM-REVIEW.md
 7 docs/security/audit-trail.md
 3 docs/security/build-script-vetting.md
