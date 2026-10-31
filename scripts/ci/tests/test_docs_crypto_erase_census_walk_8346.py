@@ -194,7 +194,7 @@ state outside the tree (a change to a workflow file is a CI-definition change th
 cannot redirect a source the manifest does not declare (cargo re-resolves, or fails under `--locked`).
 
 Round 14 (PR #8349; code r13 LOW-1/INFO-1/2/3, security r13 LOW-1..4/INFO-1/2; issues #8436 to #8441 and the trait issue).
-The defect class is "a pin that pins a name but not its value, resolution or storage". The classes closed (33 classes after round 14, 36 classes after round 15): trait brace items, raw-identifier macro calls, pinned values,
+The defect class is "a pin that pins a name but not its value, resolution or storage". The classes closed (33 classes after round 14, 36 classes after round 15, 39 classes after round 16): trait brace items, raw-identifier macro calls, pinned values,
 real input files and crate-name resolution.
 * The audited brace-item list (Rust Reference, items): brace-bodied `fn struct enum union impl mod trait`, plus `extern`
   blocks, `macro_rules!` and `macro` which `ITEM_BODY_KIND` maps onto the same body scan; `;`-terminated `use`,
@@ -254,12 +254,39 @@ weak keywords as path segments, the exact crate-name allow-list and the structur
   boolean, array, nested table, dotted key, duplicate key, empty entry, trailing comma, multi-line table, non-table value
   (`"1.0.15"`) or trailing content raises a named error, so `{ path = 'vendor/paste' }` passes (the same mapping) and
   no other mapping does.
-* The remedy text: the hard-link refusal of `real_file` ends with the remedy, a re-checkout of the file
-  (`git checkout -- <path>`) or a copy of the tree made without hard links (`cp -al` and `rsync --link-dest` are the
-  usual causes), so a reader who hits the error knows the fix.
+* The remedy text: the hard-link refusal of `real_file` ends with the remedy (a re-checkout in two steps, or a
+  copy and rename), so a reader who hits the error knows the fix. Round 16 corrected it (see below): `git checkout --` does not work.
+
+Round 16 (PR #8349; security r15 LOW-1/INFO-1, code r15 LOW-1/INFO-1/INFO-3; two new issues plus #8436 to #8442,
+#8445 and #8446). The defect class is sibling divergence: one reader or one pattern lacked a check its sibling had.
+The classes closed (39 classes after round 16):
+sibling reader divergence, sibling pattern divergence, verbatim quoted TOML keys.
+* Sibling reader divergence, the shared helper `masked_ascii_source(clean, rel)`: it masks the literals of comment-free
+  text and rejects Unicode whitespace and any non-ASCII character outside comments and literals, then returns the
+  masked text. It is the only caller of `reject_unicode_space`, so no file class can lack the check again.
+  The reader list (each calls the helper with its own file name): `read_lib_whole` (src/lib.rs), `reject_import_target` (a use
+  target file), `reject_module_file` (a module file declared before `mod encryption;`, now before its `macro_use`
+  early return), `reject_tree_file` (every `.rs` under src/encryption except mod.rs; it never rejected Unicode in
+  round 15), `Census.__init__` (mod.rs) and the secondary lib.rs scans (`lib_prefix_modules`,
+  `local_import_targets`, `reject_import_targets`, `reject_crate_level`). A reader added later must call it too; a test
+  requires the call and forbids a private copy.
+* Sibling pattern divergence, the shared macro-call fragments: `RAW`, `SEGMENT`, `MACRO_LOOKBEHIND`,
+  `MACRO_PATH_PREFIX` (the optional leading `::` and whitespace), `MACRO_PATH`, `MACRO_BANG`, `MACRO_DELIMITER` and
+  `MACRO_CALL_HEAD`. `INCLUDE_CALL`, `INCLUDE_EXACT`, `MACRO_RULES_CALL`, `MACRO_DECL`, `MACRO_NAME`, `TREE_MACRO` and
+  `ITEM_MACRO` are all built from them, so `::m!{}`, `::m! {}`, `::a::b!(..)` and `:: a :: b ![..]` are tree macros
+  exactly as they are item macros, before and after an item. A test requires every pattern to contain the prefix.
+* Verbatim quoted TOML keys (`toml_segment`): whitespace inside the quotes of a key segment is part of the key
+  (`' path'` is not `path`; Cargo rejects it); only whitespace outside quotes is dropped. `toml_dotted` and
+  `toml_expand` errors name the manifest they read (`Cargo.toml`).
+* The remedy text, corrected: a checkout over a file that already matches HEAD leaves the link count at 2 (measured
+  with git 2.43: `git checkout -- f` and `git checkout -f -- f` both leave 2; `git restore` is version dependent), so
+  none of the three is recommended. The two remedies that always do: delete the file (`rm <path>`) and check it out
+  again (`git checkout HEAD <path>`), or copy and rename over it (`cp <path> <path>.copy`, then `mv <path>.copy
+  <path>`). Tests run both on a scratch checkout and require the message to name both and none of the three.
 """
 import contextlib
 import functools
+import inspect
 import json
 import os
 import re
@@ -290,7 +317,8 @@ CLOSED_CLASSES = ("region text", "call graph", "declarations of any item kind", 
                   "use-bound attribute names", "pinned dependency set", "blanket impl on a generic",
                   "raw identifiers in use lines", "trait brace items", "raw-identifier macro calls",
                   "pinned values", "real input files", "crate-name resolution",
-                  "weak keywords as path segments", "exact crate-name allow-list", "structural patch pin")
+                  "weak keywords as path segments", "exact crate-name allow-list", "structural patch pin",
+                  "sibling reader divergence", "sibling pattern divergence", "verbatim quoted TOML keys")
 
 RUST_TOKEN = re.compile(
     r'(?P<raw>(?<![A-Za-z0-9_])(?:b|c)?r(?P<h>#*)".*?"(?P=h))'
@@ -352,9 +380,11 @@ def real_file(rel, root=None):
                              "closed" % (rel, stat.S_IFMT(info.st_mode)))
     if info.st_nlink > 1:
         raise AssertionError("%s has %d hard links: a second name can be edited outside the reviewed path, so "
-                             "the mirror fails closed. Remedy: re-checkout the file (`git checkout -- %s` rewrites it "
-                             "as a plain file), or copy the tree without hard links (a copy made with `cp -al` or "
-                             "`rsync --link-dest` is the usual cause)" % (rel, info.st_nlink, rel))
+                             "the mirror fails closed. Remedy, either of two ways: delete the file, then check it out "
+                             "again (`rm %s`, then `git checkout HEAD %s`; a checkout over a file that already "
+                             "matches HEAD leaves the link count at 2), or copy the file and rename the copy over it "
+                             "(`cp %s %s.copy`, then `mv %s.copy %s`). The usual cause is a copy of the tree made "
+                             "with `cp -al` or `rsync --link-dest`" % (rel, info.st_nlink, rel, rel, rel, rel, rel, rel))
     return path
 
 
@@ -458,17 +488,30 @@ ITEM_DECL = re.compile(r"(?<![\w'#])(const|static|let|fn|struct|enum|union|type|
                        r"(?!(?:fn|unsafe|extern|async|mut|ref|dyn|impl|union)\b)([A-Za-z_]\w*)")
 # `static ref NAME` (the lazy_static spelling) declares NAME although `ref` is skipped above (`let ref x` is a pattern).
 STATIC_REF_DECL = re.compile(r"(?<![\w'#])static\s+ref\s+(?:r#)?([A-Za-z_]\w*)")
-MACRO_DECL = re.compile(r"(?<![\w'#])(?:r#)?macro_rules\s*!\s*(\S+)")
+# The shared fragments EVERY macro-call pattern is built from (r16: rounds 15 found two sibling-divergence gaps, a
+# `TREE_MACRO` without the leading `::` that `ITEM_MACRO` had and a reader without a check its sibling had; one
+# definition of each part cannot drift). A call is: the look-behind, the optional leading `::` (with optional
+# whitespace after it), the name (`r#` raw spelling allowed per segment), optional whitespace, `!`, and for a call that
+# must be followed by a body, optional whitespace and one of the three delimiters.
+RAW = r"(?:r#)?"
+SEGMENT = RAW + r"[A-Za-z_]\w*"
+MACRO_LOOKBEHIND = r"(?<![\w'])"
+MACRO_PATH_PREFIX = r"(?:::\s*)?"
+MACRO_PATH = r"(?:" + SEGMENT + r"\s*::\s*)*" + SEGMENT
+MACRO_BANG = r"\s*!"
+MACRO_DELIMITER = r"\s*[(\[{]"
+MACRO_CALL_HEAD = MACRO_LOOKBEHIND + MACRO_PATH_PREFIX
+MACRO_DECL = re.compile(MACRO_CALL_HEAD + RAW + r"macro_rules" + MACRO_BANG + r"\s*(\S+)")
 # The one include-family call pattern shared by every reader (`include!`, `include_str!`, `include_bytes!`, `r#include!`);
 # the look-behind keeps `a_include!` and a lifetime or label (`'include`) out, never the `r#` raw spelling (r13 security
 # LOW-1: rustc 1.98 compiles `r#include!`, and the old `(?<![\w'#])` hid it).
-INCLUDE_CALL_PATTERN = r"(?<![\w'])(?:r#)?include\w*\s*!"
+INCLUDE_CALL_PATTERN = MACRO_CALL_HEAD + RAW + r"include\w*" + MACRO_BANG
 INCLUDE_CALL = re.compile(INCLUDE_CALL_PATTERN)
 # mod.rs itself holds `include_str!` of the docs it censuses (data, pinned by its text), so its rebinding form is the
 # exact `include!` / `r#include!` that pulls in code.
-INCLUDE_EXACT_PATTERN = r"(?<![\w'])(?:r#)?include\s*!"
+INCLUDE_EXACT_PATTERN = MACRO_CALL_HEAD + RAW + r"include" + MACRO_BANG
 # The one macro_rules call pattern shared by every reader; rustc rejects `r#macro_rules!` but it is never read as clean.
-MACRO_RULES_CALL_PATTERN = r"(?<![\w'])(?:r#)?macro_rules\s*!"
+MACRO_RULES_CALL_PATTERN = MACRO_CALL_HEAD + RAW + r"macro_rules" + MACRO_BANG
 MACRO_RULES_CALL = re.compile(MACRO_RULES_CALL_PATTERN)
 GENERIC_OWNER = re.compile(r"(?<![\w'#])(?:(?:fn|struct|enum|union|type|trait)\s+(?:r#)?[A-Za-z_]\w*|impl)\s*<")
 IDENT = re.compile(r"(?<!\w)[A-Za-z_]\w*")
@@ -1657,7 +1700,7 @@ def reject_crate_level(lib_clean, macros):
     byte of the region. `#[macro_use]`, `no_implicit_prelude`, `include!`, `extern crate` and any attribute or
     visibility change on the declaration are rejected as well.
     """
-    masked = mask_literals(lib_clean)
+    masked = masked_ascii_source(lib_clean, LIB_SRC)
     if re.search(r"\bextern\s+crate\b", masked):
         raise AssertionError("%s contains `extern crate`: it adds a crate to the extern prelude, so `std` could "
                              "name another crate in mod.rs" % LIB_SRC)
@@ -1745,6 +1788,24 @@ def reject_unicode_space(masked, rel):
                              % (rel, what, ord(char), unicodedata.name(char, "unnamed"), found.start()))
 
 
+def masked_ascii_source(clean, rel):
+    """Return `clean` (comments already stripped) with its literals masked, after the rejection checks of EVERY reader.
+
+    The ONE definition of what a file-class reader does before it reads a Rust file (r16, security r15 LOW-1: the
+    tree reader never called `reject_unicode_space` while the lib.rs reader did, so in a file below src/encryption/
+    a trait, `include!`, `macro_rules!` or `#[path]` written with U+200E, U+200F or a non-ASCII name passed). The
+    order is fixed: mask the literals, then reject Unicode whitespace and any non-ASCII character outside a comment
+    or literal (a look-alike identifier), then hand the masked text to the reader. `rel` names the file in the error.
+    Readers: `read_lib_whole` (src/lib.rs), `reject_import_target` (a use target), `reject_module_file` (a module
+    declared before `mod encryption;`), `reject_tree_file` (every file below src/encryption/), `Census.__init__`
+    (mod.rs) and the secondary lib.rs scans (`lib_prefix_modules`, `local_import_targets`, `reject_import_targets`,
+    `reject_crate_level`). None keeps a private copy of the sequence.
+    """
+    masked = mask_literals(clean)
+    reject_unicode_space(masked, rel)
+    return masked
+
+
 def lib_module_items(lib_clean, masked):
     """Return [(name, terminator, compact header)] for every top-level `mod` item of src/lib.rs.
 
@@ -1797,8 +1858,7 @@ def read_lib_whole(lib_clean):
     no `include!` anywhere, only the live inner attributes, and the two declarations the mirror resolves pinned exactly.
     Returns the tuple of (name, terminator, compact header) of the top-level `mod` items.
     """
-    masked = mask_literals(lib_clean)
-    reject_unicode_space(masked, LIB_SRC)
+    masked = masked_ascii_source(lib_clean, LIB_SRC)
     items = lib_module_items(lib_clean, masked)
     for name in sorted(LIB_PINNED_MODS):
         top_level_found = [item[2] for item in items if item[0] == name]
@@ -1841,7 +1901,7 @@ def reject_tree_file(rel, clean):
     `#[macro_export]` reaches the crate root and a `macro_rules!` with `#[macro_use]` on its module reaches
     mod.rs, so neither is allowed anywhere below src/encryption.
     """
-    masked = mask_literals(clean)
+    masked = masked_ascii_source(clean, rel)
     if MACRO_RULES_CALL.search(masked):
         raise AssertionError("%s defines a `macro_rules!` macro: a macro of the encryption tree can replace one "
                              "the census region invokes" % rel)
@@ -1871,7 +1931,7 @@ LIB_MOD_DECL = re.compile(r"(?<![\w'#])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;")
 
 def lib_prefix_modules(lib_clean):
     """Return the names of the `mod NAME;` declarations of src/lib.rs before `mod encryption;` (it excluded)."""
-    masked = mask_literals(lib_clean)
+    masked = masked_ascii_source(lib_clean, LIB_SRC)
     end = masked.index(";", re.search(r"(?<![\w'#])mod\s+(?:r#)?encryption\b", masked).start()) + 1
     return [m.group(1) for m in LIB_MOD_DECL.finditer(masked[:end]) if m.group(1) != "encryption"]
 
@@ -1896,10 +1956,9 @@ def reject_module_file(rel, text, macros):
     region invokes (`macros`) would replace it inside mod.rs. Without `macro_use` the module's macros stay
     inside it (`#[macro_export]` is path-scoped, not textual).
     """
+    masked = masked_ascii_source(strip_comments(text, rel), rel)
     if "macro_use" not in text:
         return
-    clean = strip_comments(text, rel)
-    masked = mask_literals(clean)
     for content, pos in attributes(masked, rel):
         if re.match(r"#\s*!", masked[pos:]) and "macro_use" in IDENT.findall(content):
             raise AssertionError("%s has the inner attribute `#![%s]` naming `macro_use`: the macros the module "
@@ -2008,34 +2067,52 @@ NEXTEST_KEYS = frozenset({"retries", "fail-fast", "slow-timeout", "status-level"
                           "test-threads", "path", "period", "terminate-after"})
 
 
-def toml_dotted(text):
-    """Split a dotted TOML key or header on the dots outside quotes; each segment is stripped and unquoted.
+def toml_segment(buf):
+    """Return the text of one key segment from `buf`, a list of (character, quoted) pairs.
+
+    Whitespace OUTSIDE the quotes around a segment is not part of the key (`a . b`); whitespace INSIDE the quotes is
+    (r16, security r15 INFO-1: `' path'` is the key ` path`, never `path`, and Cargo rejects it).
+    """
+    start, stop = 0, len(buf)
+    while start < stop and not buf[start][1] and buf[start][0].isspace():
+        start += 1
+    while stop > start and not buf[stop - 1][1] and buf[stop - 1][0].isspace():
+        stop -= 1
+    return "".join(char for char, _ in buf[start:stop])
+
+
+def toml_dotted(text, where):
+    """Split a dotted TOML key or header on the dots outside quotes; each segment is unquoted, quotes kept verbatim.
 
     A backslash in a double-quoted segment (or anywhere outside a literal `'...'` segment) raises: cargo decodes the
     TOML basic-string escapes of a key (`"std"` is the key `std`), the mirror compares raw text, so every deny
     check would fail open on an escaped spelling. The live Cargo.toml, .config/nextest.toml and .cargo/audit.toml
-    carry none, so failing closed is exact and costs nothing (#8346 round 11, code L2 / security L-B).
+    carry none, so failing closed is exact and costs nothing (#8346 round 11, code L2 / security L-B). A quoted
+    segment keeps its whitespace exactly as written (`toml_segment`), so a segment that differs from a denied name
+    only by a space inside the quotes is a different key and every deny check compares it as written. Every error
+    names `where`, the manifest or config file the key came from (r16, code r15 INFO-3).
     """
     parts, buf, quote = [], [], ""
     for char in text:
         if char == "\\" and quote != "'":
-            raise AssertionError("an escaped TOML key is not read by this guard: %r (cargo decodes the escape, the "
-                                 "mirror would compare the raw spelling, so a deny check could fail open)" % text)
+            raise AssertionError("%s: an escaped TOML key is not read by this guard: %r (cargo decodes the escape, "
+                                 "the mirror would compare the raw spelling, so a deny check could fail open)"
+                                 % (where, text))
         if quote:
             if char == quote:
                 quote = ""
             else:
-                buf.append(char)
+                buf.append((char, True))
         elif char in "\"'":
             quote = char
         elif char == ".":
-            parts.append("".join(buf).strip())
+            parts.append(toml_segment(buf))
             buf = []
         else:
-            buf.append(char)
+            buf.append((char, False))
     if quote:
-        raise AssertionError("an unterminated quote in the TOML key %r" % text)
-    parts.append("".join(buf).strip())
+        raise AssertionError("%s: an unterminated quote in the TOML key %r" % (where, text))
+    parts.append(toml_segment(buf))
     return tuple(parts)
 
 
@@ -2110,19 +2187,19 @@ def toml_logical_lines(text, where):
     return [line for line in lines if line]
 
 
-def toml_expand(path, value, entries):
-    """Append (path, value) and, for an inline table, the entries of its keys (recursively)."""
+def toml_expand(path, value, entries, where):
+    """Append (path, value) and, for an inline table, the entries of its keys (recursively); errors name `where`."""
     entries.append((path, value))
     if value.startswith("{"):
         if not value.endswith("}"):
-            raise AssertionError("an inline table that does not close: %r" % value[:60])
-        for pair in toml_split(value[1:-1], ",", "inline table"):
+            raise AssertionError("%s: an inline table that does not close: %r" % (where, value[:60]))
+        for pair in toml_split(value[1:-1], ",", "%s inline table" % where):
             if not pair.strip():
                 continue
-            kv = toml_split(pair, "=", "inline table")
+            kv = toml_split(pair, "=", "%s inline table" % where)
             if len(kv) < 2:
-                raise AssertionError("an inline table entry without `=`: %r" % pair[:60])
-            toml_expand(path + toml_dotted(kv[0]), "=".join(kv[1:]).strip(), entries)
+                raise AssertionError("%s: an inline table entry without `=`: %r" % (where, pair[:60]))
+            toml_expand(path + toml_dotted(kv[0], where), "=".join(kv[1:]).strip(), entries, where)
 
 
 def merge_toml(base, extra):
@@ -2168,7 +2245,7 @@ def toml_entries(text, where):
             close = "]]" if double else "]"
             if not line.endswith(close):
                 raise AssertionError("%s: a table header that does not close: %r" % (where, line[:60]))
-            table = toml_dotted(line[2 if double else 1:-len(close)])
+            table = toml_dotted(line[2 if double else 1:-len(close)], where)
             if double:
                 # A new `[[array]]` element: the keys and tables of the previous element are gone, so a key may repeat.
                 seen_keys = {key for key in seen_keys if key[:len(table)] != table}
@@ -2185,7 +2262,7 @@ def toml_entries(text, where):
         if len(kv) < 2:
             raise AssertionError("%s: a line that is neither a header nor `key = value`: %r" % (where, line[:60]))
         fresh = []
-        toml_expand(table + toml_dotted(kv[0]), "=".join(kv[1:]).strip(), fresh)
+        toml_expand(table + toml_dotted(kv[0], where), "=".join(kv[1:]).strip(), fresh, where)
         for path, _ in fresh:
             if path in seen_keys:
                 raise AssertionError("%s has the key `%s` twice in one table: cargo rejects a duplicate key, and a "
@@ -2286,7 +2363,7 @@ def parse_patch_table(value, registry, name):
         return parsed
     for entry in toml_split(inner, ",", MANIFEST):
         pair = toml_split(entry, "=", MANIFEST)
-        keys = toml_dotted(pair[0]) if len(pair) == 2 else ()
+        keys = toml_dotted(pair[0], MANIFEST) if len(pair) == 2 else ()
         if len(pair) != 2 or len(keys) != 1 or not keys[0]:
             raise AssertionError("%s has `%s` with the entry %r, which is not `key = \"string\"` (an empty entry, a "
                                  "trailing comma or a dotted key): the pinned value is %r"
@@ -2519,7 +2596,7 @@ def local_import_targets(lib_clean, overrides):
     `scope::item` is src/encryption/scope.rs; `super::*` and `self::*` are mod.rs itself, which is already read.
     Any other `super::` / `self::` path, or a module that is not declared once with `;`, fails closed.
     """
-    lib_masked = mask_literals(lib_clean)
+    lib_masked = masked_ascii_source(lib_clean, LIB_SRC)
     read_lib_whole(lib_clean)
     # r11 code LOW-3: the declaration is a TOP-LEVEL item (a `mod NAME;` inside `mod other { }` is `crate::other::NAME`),
     # it is the only `mod NAME` at any depth, and no `use` of lib.rs rebinds the name.
@@ -2609,11 +2686,12 @@ ITEM_HEADER = re.compile(r"(pub(?:\s*\([^)]*\)\s*|\s+))?(?:(?:const|async|unsafe
                          r"(?![\w'#])(?!\s*!)"
                          r"|(macro_rules)(?![\w'#])(?!\s*::))")
 ITEM_NAME = re.compile(r"\s*(?:mut\s+)?(?:r#)?([A-Za-z_]\w*)")
-RAW = r"(?:r#)?"
-SEGMENT = RAW + r"[A-Za-z_]\w*"
-# Every macro-name match accepts the `r#` raw spelling (r13 security LOW-1: `r#include!` compiles in rustc 1.98).
-TREE_MACRO = re.compile(r"(?<![\w'#:])((?:" + SEGMENT + r"\s*::\s*)*" + SEGMENT + r")\s*!\s*[(\[{]")
-ITEM_MACRO = re.compile(r"(?:::\s*)?((?:" + SEGMENT + r"\s*::\s*)*" + SEGMENT + r")\s*!")
+# Every macro-name match accepts the `r#` raw spelling (r13 security LOW-1: `r#include!` compiles in rustc 1.98) and
+# the optional leading `::` (r15 code LOW-1); both are built from the shared fragments defined with MACRO_DECL above.
+# `TREE_MACRO` finds every call in a file (so a `:` or `#` before it means it is the tail of a longer path or an
+# attribute); `ITEM_MACRO` is matched at the start of an item, so it has no look-behind.
+TREE_MACRO = re.compile(r"(?<![\w'#:])" + MACRO_PATH_PREFIX + "(" + MACRO_PATH + ")" + MACRO_BANG + MACRO_DELIMITER)
+ITEM_MACRO = re.compile(MACRO_PATH_PREFIX + "(" + MACRO_PATH + ")" + MACRO_BANG)
 BRACE_ITEMS = ("fn", "struct", "enum", "union", "impl", "mod", "trait")
 # Kinds whose body is braced although they are read as a different kind: `extern { }`, `macro_rules! x { }`, `macro x { }`.
 ITEM_BODY_KIND = {"extern": "fn", "macro_rules": "fn", "macro": "fn"}
@@ -2934,8 +3012,7 @@ def reject_import_target(rel, text, names):
     `pub use`, only the pinned `mod` headers, every `impl` on a local type, and each imported name declared exactly
     once of any kind, as the one item kind the pinned `use` line expects. Every error names `rel`.
     """
-    masked = mask_literals(strip_comments(text, rel))
-    reject_unicode_space(masked, rel)
+    masked = masked_ascii_source(strip_comments(text, rel), rel)
     if MACRO_RULES_CALL.search(masked):
         raise AssertionError("%s defines a `macro_rules!` macro: a macro can emit a trait or an item named like an "
                              "imported name" % rel)
@@ -2995,10 +3072,10 @@ def reject_import_targets(lib_clean, overrides):
     for rel, names in sorted(local_import_targets(lib_clean, overrides).items()):
         text = read_input(rel, overrides)
         reject_import_target(rel, text, names)
-        roots |= external_roots(mask_literals(strip_comments(text, rel)), rel)
+        roots |= external_roots(masked_ascii_source(strip_comments(text, rel), rel), rel)
     # The crate root is in scope of every module through a `crate::` path, and a macro or `mod` there is not read by
     # the use-target walker: the same names must not be bound in src/lib.rs either.
-    reject_crate_name_bindings(LIB_SRC, mask_literals(lib_clean), roots)
+    reject_crate_name_bindings(LIB_SRC, masked_ascii_source(lib_clean, LIB_SRC), roots)
 
 
 def read_build_inputs(roots, overrides):
@@ -3023,7 +3100,7 @@ class Census:
         self.clean = clean
         reject_rebinding(clean)
         pin_modules(clean)
-        masked = mask_literals(clean)
+        masked = masked_ascii_source(clean, RUST_SRC)
         declared_once(masked, re.escape(LOOP_HEAD), "the `%s` census loop" % LOOP_HEAD)
         for name in PARSED_CONSTS + ("CRYPTO_ERASABLE_ENVELOPE_VERSIONS",):
             declared_name_once(masked, name, "const " + name)
@@ -4135,7 +4212,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         """code r8 INFO: the docstring claims exactly what the code checks."""
         for phrase in CLOSED_CLASSES:
             self.assertIn(phrase, __doc__)
-        self.assertEqual(len(CLOSED_CLASSES), 36)
+        self.assertEqual(len(CLOSED_CLASSES), 39)
 
     # ---- round 11 (code r10 L1/L2/I1, security r10 L-A/L-B/I-1..I-5): one contiguous block of red-first tests ----
 
@@ -4554,7 +4631,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         for name in ("TARGET_ATTRIBUTES", "TARGET_DERIVES", "TREE_TRAITS", "TREE_TOP_MACROS", "IMPORT_KINDS",
                      "TARGET_MODULES"):
             self.assertIn(name, globals())
-        self.assertEqual(len(CLOSED_CLASSES), 36)
+        self.assertEqual(len(CLOSED_CLASSES), 39)
 
     # ---- round 13 (code r12 LOW-1/INFO-1/2/3, security r12 LOW-1/LOW-2/INFO-1/INFO-2): one contiguous block of red-first tests ----
 
@@ -4672,7 +4749,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             self.assertIn(phrase, __doc__)
         for name in ("LIB_PINNED_MODS", "UNICODE_SPACE", "USE_NAME_PINS", "GUARDED_NAMES", "LIVE_DEPENDENCIES"):
             self.assertIn(name, globals())
-        self.assertEqual(len(CLOSED_CLASSES), 36)
+        self.assertEqual(len(CLOSED_CLASSES), 39)
 
     # ---- round 14 (#8346): bounded trait items, raw-identifier macro calls, value pins, real files, crate-name resolution ----
     TRAIT_8346 = ("trait Marker_8346<X> where X: Clone {\n    fn a(&self) { let _y = { 1; 2 }; }\n"
@@ -5094,9 +5171,230 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             with self.assertRaises(AssertionError) as caught:
                 Census(self.text)
         message = str(caught.exception)
-        for phrase in ("hard links", "re-checkout", "git checkout -- src/lib.rs", "cp -al", "rsync --link-dest"):
+        # r16 (code r15 INFO-1): once git has refreshed its index, a checkout over the existing file (`git checkout --`,
+        # `-f`) and `git restore` all leave the link count at 2; the two remedies that bring it back to 1 are named and
+        # none of the three that do not work.
+        for phrase in ("hard links", "rm src/lib.rs", "git checkout HEAD src/lib.rs", "cp src/lib.rs src/lib.rs.copy",
+                       "mv src/lib.rs.copy src/lib.rs", "cp -al", "rsync --link-dest"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, message)
+        for wrong in ("git checkout --", "checkout -f", "git restore", " -f "):
+            with self.subTest(wrong=wrong):
+                self.assertNotIn(wrong, message)
+
+    def test_control_both_hard_link_remedies_bring_the_link_count_back_to_one_8346(self):
+        """code r15 INFO-1: delete-then-recreate and copy-then-rename each leave a singly linked file the guard reads."""
+        for remedy in ("delete and recreate", "copy and rename"):
+            with self.subTest(remedy=remedy):
+                with self.scratch_checkout() as root:
+                    path = root / LIB_SRC
+                    os.link(str(path), str(root / "second_name_8346.rs"))
+                    self.assertEqual(os.lstat(str(path)).st_nlink, 2)
+                    with self.assertRaisesRegex(AssertionError, r"src/lib\.rs has 2 hard links"):
+                        Census(self.text)
+                    body = path.read_bytes()
+                    if remedy == "delete and recreate":
+                        path.unlink()
+                        path.write_bytes(body)
+                    else:
+                        copy = root / "src" / "lib.rs.copy"
+                        shutil.copyfile(str(path), str(copy))
+                        os.replace(str(copy), str(path))
+                    self.assertEqual(os.lstat(str(path)).st_nlink, 1)
+                    census = Census(self.text)
+                    self.assertEqual(self.census_signature(census), self.census_signature(self.census))
+
+    # ---- round 16: one shared rejection helper, one shared macro-call prefix, verbatim quoted TOML keys ----
+
+    TREE_PROBE = "src/encryption/probe_8346.rs"
+    TREE_FILES_8346 = ("src/encryption/probe_8346.rs", "src/encryption/escrow.rs", "src/encryption/scope/store.rs")
+    # (label, code, error text): every shape rustc compiles and the r15 tree reader accepted or named wrongly.
+    UNICODE_TREE_SHAPES = (
+        ("trait name with U+200E", "trait Mark\u200eer_8346 {}\n", r"U\+200E"),
+        ("include! path token with U+200F", 'std::\u200finclude!("x_8346.rs");\n', r"U\+200F"),
+        ("macro_rules! name with a non-ASCII letter", "macro_rules! m\u00e9_8346 { () => {}; }\n",
+         r"non-ASCII character U\+00E9"),
+        ("#[path] attribute with Unicode whitespace", '#[\u200epath = "x_8346.rs"]\nmod y_8346;\n', r"U\+200E"),
+        ("top-level macro with a non-ASCII path segment", "caf\u00e9::m_8346!{}\n", r"non-ASCII character U\+00E9"),
+    )
+
+    def tree_overrides(self, rel, code, before=False):
+        """Census overrides that put `code` into the tree file `rel` (a new scratch file, or a live one extended)."""
+        if rel == self.TREE_PROBE:
+            return {rel: code}
+        return self.with_module(rel, code if before else "", "" if before else "\n" + code)
+
+    def test_tree_file_unicode_shapes_are_rejected_through_the_shared_helper_8346(self):
+        """security r15 LOW-1: `reject_tree_file` never rejected Unicode whitespace or non-ASCII names; named now."""
+        self.assertIn("masked_ascii_source", globals())
+        for rel in self.TREE_FILES_8346:
+            for label, code, shown in self.UNICODE_TREE_SHAPES:
+                for before in (False, True):
+                    with self.subTest(rel=rel, shape=label, before=before):
+                        self.refused(re.escape(rel) + r" has a .*" + shown, self.tree_overrides(rel, code, before))
+
+    def test_unicode_check_runs_before_the_shape_checks_of_every_reader_8346(self):
+        """the shared helper fixes the ORDER: a file with a denied shape and a Unicode character is named for the
+        character, in every file class (tree, use target, lib.rs, module declared before `mod encryption;`)."""
+        self.assertIn("masked_ascii_source", globals())
+        shaped = "macro_rules! x_8346 { () => {}; }\n\u200e\n"
+        for rel in self.TREE_FILES_8346 + (SCOPE_SRC, "src/test_support.rs", "src/approvals.rs"):
+            with self.subTest(rel=rel):
+                self.refused(re.escape(rel) + r" has a .*U\+200E", self.tree_overrides(rel, shaped))
+        self.refused(r"src/lib\.rs has a .*U\+200E", {LIB_SRC: self.lib_mutated("pub mod encryption;\n",
+                                                                              "pub mod encryption;\n" + shaped)})
+
+    def test_control_unicode_inside_a_literal_or_comment_stays_live_8346(self):
+        """control (green on the round 15 body too): the same shapes with the character inside a string literal or a
+        comment are live bytes, never rejected, in every tree file and use target."""
+        live = self.census_signature(self.census)
+        decoys = ('fn decoy_8346() { let _s = "trait Mark\u200eer_8346 {}"; }\n',
+                  'fn decoy_8346() { let _s = "std::\u200finclude!(x)"; }\n',
+                  'const DECOY_8346: &str = "macro_rules! m\u00e9_8346 { () => {}; }";\n',
+                  "// #[\u200epath = \"x\"] mod y;\n/* caf\u00e9::m_8346!{} \u200f */\n",
+                  'fn decoy_8346() { let _s = r#"caf\u00e9::m_8346!{}"#; }\n')
+        for rel in self.TREE_FILES_8346 + (SCOPE_SRC, "src/test_support.rs"):
+            for code in decoys:
+                with self.subTest(rel=rel, code=code):
+                    census = Census(self.text, overrides=self.tree_overrides(rel, code))
+                    self.assertEqual(self.census_signature(census), live)
+
+    def test_every_file_class_reader_calls_the_one_shared_helper_8346(self):
+        """r16: no reader keeps a private mask-and-reject sequence; each passes its own file name to the one helper."""
+        self.assertIn("masked_ascii_source", globals())
+        readers = (read_lib_whole.__wrapped__, reject_tree_file.__wrapped__, reject_import_target,
+                   reject_module_file.__wrapped__, lib_prefix_modules, local_import_targets, reject_import_targets,
+                   reject_crate_level, Census.__init__)
+        for reader in readers:
+            with self.subTest(reader=reader.__name__):
+                source = inspect.getsource(reader)
+                self.assertIn("masked_ascii_source(", source)
+                self.assertNotIn("reject_unicode" + "_space(", source)
+        # the helper is the only caller of `reject_unicode_space` in the whole module
+        self.assertEqual(len(re.findall(r"reject_unicode" + r"_space\(", inspect.getsource(sys.modules[__name__]))), 2)
+        seen = []
+        real = masked_ascii_source
+
+        def recording(clean, rel):
+            seen.append(rel)
+            return real(clean, rel)
+
+        overrides = {self.TREE_PROBE: "fn probe_8346() {}\n"}
+        for rel in ("src/encryption/escrow.rs", "src/encryption/scope/store.rs"):
+            overrides.update(self.with_module(rel, "", "\n// reader probe 8346\n"))
+        with mock.patch.object(sys.modules[__name__], "masked_ascii_source", side_effect=recording):
+            Census(self.text, overrides=overrides)
+        for rel in (RUST_SRC, LIB_SRC, SCOPE_SRC, "src/test_support.rs", self.TREE_PROBE, "src/encryption/escrow.rs",
+                    "src/encryption/scope/store.rs"):
+            with self.subTest(read=rel):
+                self.assertIn(rel, seen)
+
+    # `::` and the optional whitespace after it, then the path, then `!` and the body (r15 code LOW-1: `TREE_MACRO`
+    # did not match `::m!{}` while `ITEM_MACRO` did).
+    TREE_PREFIX_FORMS = ("::m_8346!{}", "::m_8346! {}", "::a_8346::b_8346!(x);", "::a_8346 :: b_8346![x];",
+                         ":: m_8346!{}", "::\tm_8346!{}", "::r#m_8346!{}", "::\na_8346\n::\nb_8346 ! (x);")
+
+    def test_tree_macro_with_a_leading_path_colon_is_rejected_before_and_after_an_item_8346(self):
+        """code r15 LOW-1: a leading `::` hid a top-level macro call from the tree reader."""
+        self.assertIn("MACRO_PATH_PREFIX", globals())
+        for rel in self.TREE_FILES_8346 + (SCOPE_SRC,):
+            for form in self.TREE_PREFIX_FORMS:
+                for before in (True, False):
+                    with self.subTest(rel=rel, form=form, before=before):
+                        code = form + "\nfn item_8346() {}\n" if before else "fn item_8346() {}\n" + form + "\n"
+                        self.refused(re.escape(rel) + r".*(?:invokes the top-level macros|invokes the macro)",
+                                     self.tree_overrides(rel, code, before))
+
+    def test_control_item_macro_rejections_with_a_leading_colon_are_unchanged_8346(self):
+        """control (green on the round 15 body too): `ITEM_MACRO` already named `::m!{}` in lib.rs and a use target,
+        and a macro call inside a fn body is not a top-level item in either body."""
+        for form in self.TREE_PREFIX_FORMS:
+            with self.subTest(file="lib.rs", form=form):
+                self.refused(r"src/lib\.rs invokes the macro `(?:r#)?(?:m_8346|a_8346::b_8346)!`",
+                             {LIB_SRC: self.lib_mutated("pub mod encryption;\n", "pub mod encryption;\n" + form + "\n")})
+            with self.subTest(file="test_support.rs", form=form):
+                self.refused(r"src/test_support\.rs invokes the macro `(?:r#)?(?:m_8346|a_8346::b_8346)!`",
+                             self.with_module("src/test_support.rs", "", "\n" + form + "\n"))
+        live = self.census_signature(self.census)
+        census = Census(self.text, overrides=self.with_module("src/encryption/escrow.rs", "",
+                                                              "\nfn body_8346() { ::m_8346!{}; }\n"))
+        self.assertEqual(self.census_signature(census), live)
+
+    def test_every_macro_call_pattern_is_built_from_the_shared_fragments_8346(self):
+        """r16: one prefix, one name pattern, one `!`; no sibling pattern can drift from the others."""
+        self.assertIn("MACRO_PATH_PREFIX", globals())
+        self.assertEqual(MACRO_PATH_PREFIX, r"(?:::\s*)?")
+        for label, pattern in (("INCLUDE_CALL", INCLUDE_CALL_PATTERN), ("INCLUDE_EXACT", INCLUDE_EXACT_PATTERN),
+                               ("MACRO_RULES_CALL", MACRO_RULES_CALL_PATTERN), ("MACRO_DECL", MACRO_DECL.pattern),
+                               ("MACRO_NAME", MACRO_NAME.pattern), ("TREE_MACRO", TREE_MACRO.pattern),
+                               ("ITEM_MACRO", ITEM_MACRO.pattern)):
+            with self.subTest(pattern=label):
+                self.assertIn(MACRO_PATH_PREFIX, pattern)
+                self.assertIn(MACRO_BANG, pattern)
+        for label, pattern in (("TREE_MACRO", TREE_MACRO), ("ITEM_MACRO", ITEM_MACRO)):
+            self.assertIn(MACRO_PATH, pattern.pattern, label)
+        self.assertIn(MACRO_DELIMITER, TREE_MACRO.pattern)
+        for text in ("::include!(", ":: include!(", "std::include!(", "::  r#include_str !(", "a::b::include_bytes!("):
+            with self.subTest(include=text):
+                self.assertIsNotNone(INCLUDE_CALL.search(text))
+        for text in ("::macro_rules!", ":: macro_rules !", "::r#macro_rules!", "a::macro_rules!"):
+            with self.subTest(macro_rules=text):
+                self.assertIsNotNone(MACRO_RULES_CALL.search(text))
+                self.assertIsNotNone(MACRO_DECL.search(text + " m"))
+        for text in ("::m!{", ":: m ! (", "::a::b![", "::a :: b ! {", "::r#a::r#b!{"):
+            with self.subTest(tree=text):
+                self.assertEqual(len(TREE_MACRO.findall(text)), 1)
+                self.assertIsNotNone(ITEM_MACRO.match(text))
+        for text in ("'a::m!{", "#m!{"):
+            with self.subTest(not_a_call=text):
+                self.assertEqual([m.group(1) for m in TREE_MACRO.finditer(text)], [])
+
+    def test_quoted_toml_key_segments_are_kept_verbatim_8346(self):
+        """security r15 INFO-1: whitespace inside the quotes of a key segment is part of the key (Cargo rejects
+        `' path'`; the mirror used to read it as `path`). Whitespace outside the quotes is still insignificant."""
+        self.assertEqual(toml_dotted(" ' path' ", "x.toml"), (" path",))
+        self.assertEqual(toml_dotted('"path " . \' a \' .b', "x.toml"), ("path ", " a ", "b"))
+        self.assertEqual(toml_dotted("  path  ", "x.toml"), ("path",))
+        self.assertEqual(toml_dotted("a . b", "x.toml"), ("a", "b"))
+        self.assertEqual(toml_dotted("'a b'.c", "x.toml"), ("a b", "c"))
+        self.assertEqual(toml_dotted("''", "x.toml"), ("",))
+        entries = toml_entries("[a]\n' path' = 1\npath = 2\n\"path \" = 3\n", "x.toml")
+        self.assertEqual([p for p, v in entries if v is not None], [("a", " path"), ("a", "path"), ("a", "path ")])
+        live = 'paste = { path = "vendor/paste" }'
+        for new in ('paste = { \' path\' = "vendor/paste" }', 'paste = { " path" = "vendor/paste" }',
+                    'paste = { \'path \' = "vendor/paste" }', 'paste = { "path\t" = "vendor/paste" }'):
+            with self.subTest(new=new):
+                self.refused(r"Cargo\.toml.*(pinned fields|pinned value|patch key)", self.manifest_replaced(live, new))
+        census = Census(self.text, overrides=self.manifest_replaced(live, "paste = { ' path'.x = 1 }" if False
+                                                                      else 'paste = { path = "vendor/paste" }'))
+        self.assertEqual(self.census_signature(census), self.census_signature(self.census))
+
+    def test_toml_key_and_inline_table_errors_name_the_manifest_8346(self):
+        """code r15 INFO-3: `toml_dotted` and `toml_expand` errors carry the file name of the document they read."""
+        for text, shown in (("a\\b", r"escaped TOML key"), ("'a", r"unterminated quote")):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: .*" + shown):
+                    toml_dotted(text, MANIFEST)
+        with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: an inline table that does not close"):
+            toml_expand((), "{ a = 1", [], MANIFEST)
+        with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: an inline table entry without `=`"):
+            toml_expand((), "{ a }", [], MANIFEST)
+        live = 'paste = { path = "vendor/paste" }'
+        self.refused(r"Cargo\.toml: an (?:escaped TOML key|unbalanced quote)",
+                     self.manifest_replaced(live, 'paste = { "pa\\"ste" = 1 }'))
+        self.refused(r"\.config/nextest\.toml: an escaped TOML key",
+                     {NEXTEST_CONFIG: read(NEXTEST_CONFIG) + '\n[profile.default."a\\"b"]\n'})
+
+    def test_round_16_classes_are_documented_and_counted(self):
+        """the docstring and CLOSED_CLASSES list the round 16 classes the code enforces (39 in all)."""
+        for phrase in ("sibling reader divergence", "sibling pattern divergence", "verbatim quoted TOML keys"):
+            self.assertIn(phrase, CLOSED_CLASSES)
+        self.assertIn("masked_ascii_source", __doc__)
+        for phrase in ("masked_ascii_source", "MACRO_PATH_PREFIX", "toml_segment", "39 classes", "delete the file",
+                       "sibling divergence", "reader list"):
+            self.assertIn(phrase, __doc__)
+        self.assertEqual(len(CLOSED_CLASSES), 39)
+        self.assertEqual(len(set(CLOSED_CLASSES)), 39)
 
     def test_renamed_external_crate_resolved_name_is_bound_by_a_same_crate_alias_8346(self):
         """code r14 INFO-2 (red twin of the `package =` control): an alias of a crate item under the crate's own name
@@ -5115,8 +5413,8 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         for phrase in ("position over spelling", "WEAK_KEYWORDS", "CRATE_NAME_MACROS", "parse_patch_table",
                        "re-checkout", "36 classes", "audited keyword"):
             self.assertIn(phrase, __doc__)
-        self.assertEqual(len(CLOSED_CLASSES), 36)
-        self.assertEqual(len(set(CLOSED_CLASSES)), 36)
+        self.assertEqual(len(CLOSED_CLASSES), 39)
+        self.assertEqual(len(set(CLOSED_CLASSES)), 39)
         self.assertEqual(CRATE_NAME_MACROS, frozenset({("anyhow", "anyhow")}))
 
     def test_round_14_classes_are_documented_and_counted(self):
@@ -5127,8 +5425,8 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         for phrase in ("E0603", "audited brace-item list", "INCLUDE_CALL", "ALLOWED_PATCHES", "LIB_KNOWN_MACROS",
                        "hard-link", "name-pin rulings", "33 classes", "lstat"):
             self.assertIn(phrase, __doc__)
-        self.assertEqual(len(CLOSED_CLASSES), 36)
-        self.assertEqual(len(set(CLOSED_CLASSES)), 36)
+        self.assertEqual(len(CLOSED_CLASSES), 39)
+        self.assertEqual(len(set(CLOSED_CLASSES)), 39)
 
     def test_mutation_anchor_that_drifts_names_itself(self):
         with self.assertRaisesRegex(AssertionError, r"mutation anchor.*not-in-the-source"):
