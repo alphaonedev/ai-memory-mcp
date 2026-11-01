@@ -5572,7 +5572,8 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     @classmethod
     def char_value(cls, node, values, chars):
         """r25: return ("int", n) or ("char", n) for an operand of a compare that is a constant, a name bound to one, a
-        `chr`, `int(text, base)` or `bytes.fromhex` call of constants, or a shift/product/sum of them; else None."""
+        `chr` or `bytes([n])` call of constants, or a shift/product/sum of them; else None (`bytes.fromhex` is
+        read by `fromhex_high`)."""
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and len(node.value) == 1:
             return ("char", ord(node.value))
         if isinstance(node, ast.Name) and node.id in chars:
@@ -5583,12 +5584,6 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             if name == "chr" and len(args) == 1:
                 inner = cls.char_value(args[0], values, chars)
                 return ("char", inner[1]) if inner and inner[0] == "int" else None
-            if name == "fromhex" and len(args) == 1 and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
-                try:
-                    data = bytes.fromhex(args[0].value)
-                except ValueError:
-                    return None
-                return ("char", data[0]) if len(data) == 1 else None
             if name == "bytes" and len(args) == 1 and isinstance(args[0], ast.List) and len(args[0].elts) == 1:
                 inner = cls.char_value(args[0].elts[0], values, chars)
                 return ("char", inner[1]) if inner and inner[0] == "int" else None
@@ -5979,7 +5974,10 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   "    if not masked.isprintable():\n        pass\n",
                   "    import operator\n    if any(operator.gt(c, '~') for c in masked):\n        pass\n",
                   "    if any(b >= bytes.fromhex('80')[0] for b in masked.encode()):\n        pass\n",
-                  "    if masked.encode('utf-8') != masked.encode('cp1252', 'ignore'):\n        pass\n")
+                  "    if masked.encode('utf-8') != masked.encode('cp1252', 'ignore'):\n        pass\n",
+                  # r25 follow-up: an octal class, a \\u class in raw text, and a bytes([n]) compare
+                  "    re.search(rb'[\\300-\\377]', masked.encode())\n", "    re.search(r'[\\u00a0-\\uffff]', masked)\n",
+                  "    if masked.encode() > bytes([200]):\n        pass\n")
         for copy in copies:
             with self.subTest(self_check=copy):
                 self.assertTrue(self.private_non_ascii_spellings(base + copy))
