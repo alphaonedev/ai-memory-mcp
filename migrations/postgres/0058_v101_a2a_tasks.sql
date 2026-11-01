@@ -18,3 +18,12 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_agent_updated
     ON a2a_tasks (agent_id, updated_at);
+
+-- Content-free task history (#8444 r2); see the sqlite twin for the contract.
+CREATE TABLE IF NOT EXISTS a2a_task_memories (
+    task_id   TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_a2a_task_memories_memory
+    ON a2a_task_memories (memory_id);

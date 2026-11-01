@@ -16,7 +16,7 @@ use ai_memory::a2a::{A2A_RPC_PATH, AGENT_CARD_PATH, state};
 use ai_memory::config::{FeatureTier, ResolvedScoring};
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
-use ai_memory::storage::a2a_tasks::{A2aTaskRow, A2aTaskUpdate};
+use ai_memory::storage::a2a_tasks::{A2aHistoryEntry, A2aTaskRow, A2aTaskUpdate};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -249,7 +249,7 @@ impl<'a> SeedTask<'a> {
             id,
             context_id,
             state,
-            timestamp: "2026-10-31T12:00:00.000Z".to_string(),
+            timestamp: ai_memory::a2a::now_timestamp(),
             history: json!([]),
         }
     }
@@ -349,15 +349,39 @@ pub fn sqlite_app_state(path: &std::path::Path) -> AppState {
 /// Direct compare-and-set completion, bypassing HTTP.
 async fn complete_directly(app: &AppState, agent: &str, id: &str) -> bool {
     let update = A2aTaskUpdate {
-        status_timestamp: "2026-10-31T12:00:01.000Z".to_string(),
-        history: None,
-        artifacts: Some(json!([])),
+        status_timestamp: ai_memory::a2a::now_timestamp(),
+        artifact_append: Some(json!({"artifactId": "direct", "parts": [{"text": "direct completion"}]})),
+        ..A2aTaskUpdate::default()
     };
+    transition_direct(app, agent, id, &[state::WORKING], state::COMPLETED, &update).await
+}
+
+// --- round 2 (#8444 r2) scenarios --------------------------------------------
+
+/// The memory id inside a Task's `receipt-<memory id>` artifact.
+pub fn receipt_memory_id(task: &Value) -> String {
+    task["artifacts"][0]["artifactId"]
+        .as_str()
+        .expect("artifact id")
+        .strip_prefix("receipt-")
+        .expect("receipt prefix")
+        .to_string()
+}
+
+/// One compare-and-set through the backend's storage layer (not HTTP).
+async fn transition_direct(
+    app: &AppState,
+    agent: &str,
+    id: &str,
+    from_states: &[&str],
+    to_state: &str,
+    update: &A2aTaskUpdate,
+) -> bool {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return app
             .store
-            .a2a_task_transition(agent, id, &[state::WORKING], state::COMPLETED, &update)
+            .a2a_task_transition(agent, id, from_states, to_state, update)
             .await
             .expect("pg transition");
     }
@@ -365,11 +389,399 @@ async fn complete_directly(app: &AppState, agent: &str, id: &str) -> bool {
         &app.db.lock().await.0,
         agent,
         id,
-        &[state::WORKING],
-        state::COMPLETED,
-        &update,
+        from_states,
+        to_state,
+        update,
     )
     .expect("sqlite transition")
+}
+
+/// Append content-free history entries (and their memory links) to a seeded
+/// WORKING task, one atomic compare-and-set each.
+pub async fn link_history(app: &AppState, agent: &str, task_id: &str, entries: &[A2aHistoryEntry]) {
+    for entry in entries {
+        let update = A2aTaskUpdate {
+            status_timestamp: ai_memory::a2a::now_timestamp(),
+            history_append: Some(entry.clone()),
+            ..A2aTaskUpdate::default()
+        };
+        assert!(
+            transition_direct(
+                app,
+                agent,
+                task_id,
+                &[state::WORKING],
+                state::WORKING,
+                &update
+            )
+            .await,
+            "link history entry {}",
+            entry.message_id
+        );
+    }
+}
+
+/// The stored row exactly as the backend returns it (history is the
+/// content-free `history_json` column, filtered to still-linked memories).
+async fn stored_task(app: &AppState, agent: &str, id: &str) -> Option<A2aTaskRow> {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return app.store.a2a_task_get(agent, id).await.expect("pg get");
+    }
+    ai_memory::storage::a2a_tasks::a2a_task_get(&app.db.lock().await.0, agent, id).expect("get")
+}
+
+/// Every stored task row, through the export read of the backend.
+async fn export_tasks(app: &AppState) -> Vec<A2aTaskRow> {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return app.store.a2a_task_export().await.expect("pg export");
+    }
+    ai_memory::storage::a2a_tasks::a2a_task_export(&app.db.lock().await.0).expect("export")
+}
+
+/// Hard-delete one inbox memory through the backend (the erase / delete / GC
+/// paths all end in the same `memories` row removal).
+async fn erase_memory(app: &AppState, owner: &str, id: &str) {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        app.store
+            .delete(&ai_memory::store::CallerContext::for_agent(owner), id)
+            .await
+            .expect("pg delete");
+        return;
+    }
+    let _ = owner;
+    assert!(
+        ai_memory::db::delete(&app.db.lock().await.0, id).expect("sqlite delete"),
+        "the inbox memory existed"
+    );
+}
+
+fn history_of(reply: &Reply) -> Vec<Value> {
+    reply.json()["result"]
+        .get("history")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Sec MEDIUM-1 / LOW-2: the task history holds ids only, `GetTask` renders the
+/// text from the inbox memory, and erasing that memory removes the content from
+/// every task view.
+async fn history_is_content_free_and_follows_erasure(router: &axum::Router, app: &AppState) {
+    use ai_memory::storage::a2a_tasks::A2A_HISTORY_ENTRY_MAX_BYTES;
+    let marker = "erase-me-8444-marker";
+    let task = send_ok(router, ALICE_KEY, marker, "ROLE_USER").await;
+    let id = task["id"].as_str().expect("task id").to_string();
+    let context_id = task["contextId"].as_str().expect("ctx").to_string();
+    let memory_id = receipt_memory_id(&task);
+    assert_eq!(task["history"][0]["parts"][0]["text"], json!(marker));
+
+    let row = stored_task(app, ALICE, &id).await.expect("stored row");
+    let entries = row.history.as_array().expect("history array").clone();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        !row.history.to_string().contains(marker),
+        "history_json must hold no message content: {}",
+        row.history
+    );
+    for entry in &entries {
+        assert!(entry.to_string().len() <= A2A_HISTORY_ENTRY_MAX_BYTES);
+        assert_eq!(entry["memoryId"], json!(memory_id));
+        assert_eq!(entry["taskId"], json!(id));
+    }
+
+    erase_memory(app, ALICE, &memory_id).await;
+    let get = rpc(router, ALICE_KEY, "GetTask", &json!({"id": id})).await;
+    assert_eq!(get.status, StatusCode::OK);
+    assert!(
+        history_of(&get).is_empty(),
+        "erased content is not rendered"
+    );
+    assert!(!String::from_utf8_lossy(&get.body).contains(marker));
+    let list = rpc(
+        router,
+        ALICE_KEY,
+        "ListTasks",
+        &json!({"contextId": context_id}),
+    )
+    .await;
+    assert!(!String::from_utf8_lossy(&list.body).contains(marker));
+    let after = stored_task(app, ALICE, &id).await.expect("stored row");
+    assert_eq!(
+        after.history,
+        json!([]),
+        "the link left with the memory in the same transaction"
+    );
+
+    // A secret-shaped value never reaches history_json, whatever the screen
+    // does to the memory itself.
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let reply = rpc(
+        router,
+        ALICE_KEY,
+        "SendMessage",
+        &json!({"message": message(&format!("key {secret} end"), "ROLE_USER")}),
+    )
+    .await;
+    if reply.status == StatusCode::OK {
+        let secret_task = reply.json()["result"]["task"].clone();
+        let sid = secret_task["id"].as_str().expect("id").to_string();
+        let row = stored_task(app, ALICE, &sid).await.expect("row");
+        assert!(!row.history.to_string().contains(secret));
+        assert!(!row.artifacts.to_string().contains(secret));
+    }
+}
+
+/// Code LOW-2 / LOW-5: concurrent continuations never lose a history entry or
+/// a receipt (the lost-update class), and every completion adds both.
+async fn concurrent_continuations_keep_every_history_entry(router: &axum::Router, app: &AppState) {
+    let id = format!("cont-8444-{}", uuid::Uuid::new_v4());
+    seed_working_task(app, ALICE, &id).await; // context "ctx-seed-8444"
+    let cont = |i: usize| {
+        let mut m = message(&format!("cont-text-{i}"), "ROLE_USER");
+        m["taskId"] = json!(id);
+        m["contextId"] = json!("ctx-seed-8444");
+        let sent = m["messageId"].as_str().expect("message id").to_string();
+        async move {
+            let r = rpc(router, ALICE_KEY, "SendMessage", &json!({"message": m})).await;
+            (sent, r)
+        }
+    };
+    let (a, b, c, d) = tokio::join!(cont(0), cont(1), cont(2), cont(3));
+    let sent = [a, b, c, d];
+    // A continuation either lands or finds the task already terminal (-32004).
+    for (_, r) in &sent {
+        if r.status != StatusCode::OK {
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json());
+            assert_eq!(error_code(r), -32004, "{}", r.json());
+        }
+    }
+    assert!(
+        sent.iter().any(|(_, r)| r.status == StatusCode::OK),
+        "at least one continuation lands"
+    );
+    let got = rpc(router, ALICE_KEY, "GetTask", &json!({"id": id})).await;
+    let task = got.json()["result"].clone();
+    let history = history_of(&got);
+    let artifacts = task["artifacts"].as_array().cloned().unwrap_or_default();
+    assert!(!history.is_empty());
+    assert_eq!(
+        history.len(),
+        artifacts.len(),
+        "each completion appends its entry and its receipt together"
+    );
+    let ids: Vec<&str> = history
+        .iter()
+        .filter_map(|h| h["messageId"].as_str())
+        .collect();
+    let unique_ids: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(unique_ids.len(), ids.len(), "no entry is duplicated");
+    for entry_id in &ids {
+        assert!(sent.iter().any(|(m, _)| m == entry_id));
+    }
+    // A reply that reported COMPLETED stored its own message: its entry and
+    // its receipt are both in the final task.
+    let stored: Vec<String> = sent
+        .iter()
+        .filter(|(_, r)| {
+            r.json()["result"]["task"]["artifacts"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+        })
+        .map(|(m, _)| m.clone())
+        .collect();
+    for message_id in &stored {
+        assert!(
+            ids.contains(&message_id.as_str()),
+            "{message_id} was acknowledged but is missing from the history"
+        );
+    }
+}
+
+/// Code MEDIUM-1 / sec MEDIUM-2 (lost compare-and-set): a continuation racing a
+/// `CancelTask` is either accepted or answered `-32004` / HTTP 400, never `-32001`.
+async fn continuation_racing_cancel_is_unsupported_operation(
+    router: &axum::Router,
+    app: &AppState,
+) {
+    for round in 0..8 {
+        let id = format!("race-cont-8444-{round}-{}", uuid::Uuid::new_v4());
+        seed_working_task(app, ALICE, &id).await;
+        let mut m = message("racing", "ROLE_USER");
+        m["taskId"] = json!(id);
+        let params = json!({"message": m});
+        let cancel_params = json!({"id": id});
+        let (cont, cancel) = tokio::join!(
+            rpc(router, ALICE_KEY, "SendMessage", &params),
+            rpc(router, ALICE_KEY, "CancelTask", &cancel_params),
+        );
+        if cont.status != StatusCode::OK {
+            assert_eq!(error_code(&cont), -32004, "round {round}: {}", cont.json());
+            assert_eq!(cont.status, StatusCode::BAD_REQUEST);
+            assert!(
+                cont.json()["error"]["message"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("TASK_STATE_") || t.contains("concurrently")),
+                "{}",
+                cont.json()
+            );
+        }
+        assert!(
+            cancel.status == StatusCode::OK || error_code(&cancel) == -32002,
+            "round {round}: {}",
+            cancel.json()
+        );
+    }
+}
+
+/// Code LOW-3 / LOW-9 / sec LOW-1: an unreadable stored task is a refused read
+/// (`-32603`, HTTP 500, no substrate text), never a silently defaulted value.
+async fn corrupt_stored_task_answers_internal_error(router: &axum::Router, app: &AppState) {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        // The PostgreSQL decode path is pinned by the unit test
+        // `corrupt_json_column_is_an_error_not_a_default`.
+        return;
+    }
+    let id = format!("corrupt-8444-{}", uuid::Uuid::new_v4());
+    seed_working_task(app, ALICE, &id).await;
+    {
+        let guard = app.db.lock().await;
+        guard
+            .0
+            .execute(
+                "UPDATE a2a_tasks SET history_json = ?1 WHERE id = ?2",
+                rusqlite::params!["{not json: secret-substrate-text", id],
+            )
+            .expect("corrupt the column");
+    }
+    let got = rpc(router, ALICE_KEY, "GetTask", &json!({"id": id})).await;
+    assert_eq!(got.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error_code(&got), -32603);
+    let body = String::from_utf8_lossy(&got.body).to_string();
+    for leak in [
+        "secret-substrate-text",
+        "history_json",
+        "not json",
+        "expected",
+    ] {
+        assert!(!body.contains(leak), "internal error leaks {leak}: {body}");
+    }
+    // The corrupt row is never overwritten by a continuation.
+    let mut m = message("after corruption", "ROLE_USER");
+    m["taskId"] = json!(id);
+    let cont = rpc(router, ALICE_KEY, "SendMessage", &json!({"message": m})).await;
+    assert_eq!(cont.status, StatusCode::INTERNAL_SERVER_ERROR);
+    // Remove the corrupt fixture so later scenarios can read every row.
+    app.db
+        .lock()
+        .await
+        .0
+        .execute("DELETE FROM a2a_tasks WHERE id = ?1", rusqlite::params![id])
+        .expect("remove the corrupt fixture");
+}
+
+/// Code LOW-5: an active task older than the bound is retired to FAILED by the
+/// same agent's next insert, so a non-terminal row cannot live forever.
+async fn abandoned_active_tasks_are_retired(app: &AppState) {
+    let agent = format!("ai:stale-8444-{}", uuid::Uuid::new_v4());
+    let stale = format!("stale-8444-{}", uuid::Uuid::new_v4());
+    let mut seed = SeedTask::new(&agent, &stale, "ctx-stale", state::WORKING);
+    seed.timestamp = "2026-01-01T00:00:00.000Z".to_string();
+    // The insert's own transaction retires an abandoned row (it is older than
+    // the bound), so the row is FAILED as soon as it exists.
+    seed_task(app, &seed).await;
+    let fresh = format!("fresh-8444-{}", uuid::Uuid::new_v4());
+    seed_task(
+        app,
+        &SeedTask::new(&agent, &fresh, "ctx-stale", state::WORKING),
+    )
+    .await;
+    assert_eq!(
+        stored_task(app, &agent, &stale).await.expect("row").state,
+        state::FAILED,
+        "the abandoned task was retired"
+    );
+    assert_eq!(
+        stored_task(app, &agent, &fresh).await.expect("row").state,
+        state::WORKING,
+        "a recent active task is untouched"
+    );
+}
+
+/// Code MEDIUM-3 / LOW-7: the card URL is configuration, not the request.
+async fn card_url_ignores_request_headers(router: &axum::Router) {
+    let plain = send(
+        router,
+        "GET",
+        AGENT_CARD_PATH,
+        &[(ai_memory::HEADER_API_KEY, ALICE_KEY)],
+        Vec::new(),
+    )
+    .await;
+    let hostile = send(
+        router,
+        "GET",
+        AGENT_CARD_PATH,
+        &[
+            (ai_memory::HEADER_API_KEY, ALICE_KEY),
+            ("host", "evil.example:6666"),
+            ("x-forwarded-proto", "https"),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(
+        plain.body, hostile.body,
+        "request headers never change the card"
+    );
+    assert!(!String::from_utf8_lossy(&hostile.body).contains("evil.example"));
+    // A TLS daemon advertises https; a configured public URL wins.
+    assert_eq!(
+        ai_memory::a2a::resolve_card_base_url(None, true, "127.0.0.1:9077"),
+        "https://127.0.0.1:9077"
+    );
+    assert_eq!(
+        ai_memory::a2a::resolve_card_base_url(Some("https://mem.example.org"), false, "x:1"),
+        "https://mem.example.org"
+    );
+}
+
+/// Sec LOW-2: export carries the content-free task rows.
+async fn export_carries_content_free_task_rows(router: &axum::Router, app: &AppState) {
+    let marker = "export-marker-8444";
+    let task = send_ok(router, ALICE_KEY, marker, "ROLE_USER").await;
+    let id = task["id"].as_str().expect("id").to_string();
+    let rows = export_tasks(app).await;
+    let row = rows.iter().find(|r| r.id == id).expect("task is exported");
+    assert_eq!(row.agent_id, ALICE);
+    assert_eq!(row.history.as_array().map(Vec::len), Some(1));
+    assert!(
+        !serde_json::to_string(row)
+            .expect("serialise")
+            .contains(marker)
+    );
+}
+
+/// Info 5: a content principal supplied in the request never survives.
+async fn body_supplied_content_principal_never_survives(router: &axum::Router, app: &AppState) {
+    let mut m = message("principal probe", "ROLE_USER");
+    m["metadata"] = json!({"content_principal": "ai:body-claim-8444", "a2a_role": "ROLE_ADMIN"});
+    let reply = rpc(
+        router,
+        ALICE_KEY,
+        "SendMessage",
+        &json!({"message": m, "metadata": {"content_principal": "ai:body-claim-8444"}}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    let task = reply.json()["result"]["task"].clone();
+    let mem = stored_memory(app, ALICE, &receipt_memory_id(&task)).await;
+    assert_eq!(mem.metadata["content_principal"], json!(ALICE));
+    assert_eq!(mem.metadata["a2a_role"], json!("ROLE_USER"));
 }
 
 fn assert_no_leak(card: &Value, forbidden: &[&str]) {
@@ -389,6 +801,14 @@ pub async fn run_suite(app: AppState) {
     task_access_is_caller_scoped(&router).await;
     unsupported_and_error_codes(&router).await;
     cancel_races_completion_once(&router, &probe).await;
+    history_is_content_free_and_follows_erasure(&router, &probe).await;
+    concurrent_continuations_keep_every_history_entry(&router, &probe).await;
+    continuation_racing_cancel_is_unsupported_operation(&router, &probe).await;
+    corrupt_stored_task_answers_internal_error(&router, &probe).await;
+    abandoned_active_tasks_are_retired(&probe).await;
+    card_url_ignores_request_headers(&router).await;
+    export_carries_content_free_task_rows(&router, &probe).await;
+    body_supplied_content_principal_never_survives(&router, &probe).await;
     conformance::run_all(&router, &probe, &global).await;
 }
 
@@ -572,7 +992,16 @@ async fn task_access_is_caller_scoped(router: &axum::Router) {
         &json!({"message": {"messageId":"m-c","role":"ROLE_USER","taskId": id,"parts":[{"text":"again"}]}}),
     )
     .await;
-    assert_eq!(error_code(&cont), -32001);
+    // The caller owns the task, so it is a state error (-32004), not "not found".
+    assert_eq!(cont.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&cont), -32004);
+    assert!(
+        cont.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("TASK_STATE_COMPLETED")),
+        "{}",
+        cont.json()
+    );
 }
 
 async fn unsupported_and_error_codes(router: &axum::Router) {
@@ -684,7 +1113,7 @@ async fn cancel_races_completion_once(router: &axum::Router, app: &AppState) {
         let got = rpc(router, ALICE_KEY, "GetTask", &json!({"id": id})).await;
         let final_state = got.json()["result"]["status"]["state"]
             .as_str()
-            .expect("state")
+            .unwrap_or_else(|| panic!("GetTask answered no state: {}", got.json()))
             .to_string();
         let expected = if cancel_won {
             state::CANCELED

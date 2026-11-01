@@ -1070,6 +1070,7 @@ fn export_body(
     mut ledger: crate::export_scope::ExportWithholdLedger,
     page: &crate::export_paging::ExportMemoriesPage,
     storage_backend: Option<&str>,
+    a2a_tasks: &[crate::storage::a2a_tasks::A2aTaskRow],
 ) -> axum::response::Response {
     ledger.quarantined = page.excluded.quarantined;
     ledger.tombstoned = page.excluded.tombstoned;
@@ -1125,6 +1126,14 @@ fn export_body(
     });
     if let (Some(backend), Some(obj)) = (storage_backend, body.as_object_mut()) {
         obj.insert(field_names::STORAGE_BACKEND.to_string(), json!(backend));
+    }
+    // #8444 r2 sec LOW-2: the A2A task rows (content-free: ids, states and
+    // history entries that name inbox memories) ride the final page only, so a
+    // multi-page walk carries them exactly once.
+    if page.next_cursor.is_none()
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert("a2a_tasks".to_string(), json!(a2a_tasks));
     }
     Json(body).into_response()
 }
@@ -1250,7 +1259,11 @@ pub async fn export_memories(
             Ok(l) => l,
             Err(e) => return store_err_to_response(e),
         };
-        return export_body(&memories, &links, ledger, &page, Some("postgres"));
+        let tasks = match app.store.a2a_task_export().await {
+            Ok(t) => t,
+            Err(e) => return store_err_to_response(e),
+        };
+        return export_body(&memories, &links, ledger, &page, Some("postgres"), &tasks);
     }
 
     let lock = app.db.lock().await;
@@ -1275,11 +1288,12 @@ pub async fn export_memories(
             Some(&lock.0),
         );
         let links = db::export_page::links_page(&lock.0, &page.scope, &survivor_ids(&memories))?;
-        Ok(Ok((memories, ledger, links, page)))
+        let tasks = crate::storage::a2a_tasks::a2a_task_export(&lock.0)?;
+        Ok(Ok((memories, ledger, links, page, tasks)))
     });
     match read {
-        Ok(Ok((memories, ledger, links, page))) => {
-            export_body(&memories, &links, ledger, &page, None)
+        Ok(Ok((memories, ledger, links, page, tasks))) => {
+            export_body(&memories, &links, ledger, &page, None, &tasks)
         }
         Ok(Err(ceiling)) => export_paging_required_response(ceiling),
         Err(e) => crate::handlers::errors::handler_error_500(&e),

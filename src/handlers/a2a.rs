@@ -38,7 +38,7 @@ use crate::a2a::{
     self, A2aError, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Method, RpcRequest, SendInput, state,
 };
 use crate::models::field_names;
-use crate::storage::a2a_tasks::{A2aTaskFilter, A2aTaskRow, A2aTaskUpdate};
+use crate::storage::a2a_tasks::{A2aHistoryEntry, A2aTaskFilter, A2aTaskRow, A2aTaskUpdate};
 
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -79,12 +79,12 @@ fn unauthenticated_response() -> Response {
 
 /// `GET /.well-known/agent-card.json` - the Agent Card, served to any caller
 /// that passed `api_key_auth` (the card is NOT public).
-pub async fn agent_card(State(_app): State<AppState>, headers: HeaderMap) -> Response {
-    let host = headers.get("host").and_then(|v| v.to_str().ok());
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok());
-    let card = a2a::agent_card(&a2a::base_url(host, proto));
+///
+/// The advertised URL comes from configuration (`AI_MEMORY_PUBLIC_URL`) or the
+/// daemon's own scheme and bind address; the request's `Host` and
+/// `X-Forwarded-Proto` headers are never consulted.
+pub async fn agent_card(State(_app): State<AppState>) -> Response {
+    let card = a2a::agent_card(a2a::card_base_url());
     match a2a::to_value(&card) {
         Ok(body) => with_version(StatusCode::OK, body),
         Err(e) => error_response(&JsonRpcId::Null, &e),
@@ -161,11 +161,55 @@ fn checked_id(id: &str) -> A2aResult<()> {
 async fn get_task(app: &AppState, agent: &str, params: &Value) -> A2aResult<Value> {
     let req: GetTaskRequest = a2a::parse_params(params)?;
     checked_id(&req.id)?;
-    let history_length = a2a::history_length(req.history_length);
+    let history_length = a2a::history_length(req.history_length)?;
     let row = store_get(app, agent, &req.id)
         .await?
         .ok_or_else(A2aError::task_not_found)?;
-    a2a::to_value(&a2a::task_from_row(&row, history_length, true)?)
+    let history = render_history(app, agent, &row, history_length).await?;
+    a2a::to_value(&a2a::task_from_row(&row, history, true)?)
+}
+
+/// Render the task history for a response: the content-free entries are
+/// windowed to `history_length`, and each entry's text is read from its inbox
+/// memory through the normal memory read path. An entry whose memory is gone
+/// (erased, deleted or garbage-collected) is skipped, so erasure removes the
+/// content from every task view.
+async fn render_history(
+    app: &AppState,
+    agent: &str,
+    row: &A2aTaskRow,
+    history_length: Option<usize>,
+) -> A2aResult<Vec<crate::a2a::wire::Message>> {
+    let entries = a2a::history_window(a2a::history_entries(row)?, history_length);
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        if let Some(content) = read_memory_content(app, agent, &entry.memory_id).await? {
+            out.push(a2a::message_from_entry(entry, &content));
+        }
+    }
+    Ok(out)
+}
+
+/// The content of one inbox memory, `None` when it no longer exists.
+async fn read_memory_content(
+    app: &AppState,
+    agent: &str,
+    memory_id: &str,
+) -> A2aResult<Option<String>> {
+    #[cfg(feature = "sal")]
+    if is_postgres(app) {
+        let ctx = crate::store::CallerContext::for_agent(agent);
+        return match app.store.get(&ctx, memory_id).await {
+            Ok(mem) => Ok(Some(mem.content)),
+            Err(crate::store::StoreError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(store_failure(&e)),
+        };
+    }
+    let _ = agent;
+    let lock = app.db.lock().await;
+    crate::db::get(&lock.0, memory_id)
+        .map(|m| m.map(|m| m.content))
+        .map_err(|e| sqlite_failure(&e))
 }
 
 async fn cancel_task(app: &AppState, agent: &str, params: &Value) -> A2aResult<Value> {
@@ -180,8 +224,7 @@ async fn cancel_task(app: &AppState, agent: &str, params: &Value) -> A2aResult<V
     }
     let update = A2aTaskUpdate {
         status_timestamp: a2a::now_timestamp(),
-        history: None,
-        artifacts: None,
+        ..A2aTaskUpdate::default()
     };
     let won = store_cas(
         app,
@@ -197,10 +240,16 @@ async fn cancel_task(app: &AppState, agent: &str, params: &Value) -> A2aResult<V
         // the task terminal first.
         return Err(A2aError::task_not_cancelable());
     }
-    let row = store_get(app, agent, &id)
+    current_task_value(app, agent, &id).await
+}
+
+/// The caller's task as the bare `Task` JSON (no history), for CancelTask.
+async fn current_task_value(app: &AppState, agent: &str, id: &str) -> A2aResult<Value> {
+    let row = store_get(app, agent, id)
         .await?
         .ok_or_else(A2aError::task_not_found)?;
-    a2a::to_value(&a2a::task_from_row(&row, None, true)?)
+    let history = render_history(app, agent, &row, None).await?;
+    a2a::to_value(&a2a::task_from_row(&row, history, true)?)
 }
 
 async fn list_tasks(app: &AppState, agent: &str, params: &Value) -> A2aResult<Value> {
@@ -228,7 +277,7 @@ async fn list_tasks(app: &AppState, agent: &str, params: &Value) -> A2aResult<Va
             _ => return Err(A2aError::internal()),
         },
     };
-    let history_length = a2a::history_length(req.history_length);
+    let history_length = a2a::history_length(req.history_length)?;
     let include_artifacts = req.include_artifacts.unwrap_or(false);
     let filter = A2aTaskFilter {
         context_id: req.context_id,
@@ -244,11 +293,11 @@ async fn list_tasks(app: &AppState, agent: &str, params: &Value) -> A2aResult<Va
     } else {
         String::new()
     };
-    let tasks = page
-        .rows
-        .iter()
-        .map(|r| a2a::task_from_row(r, history_length, include_artifacts))
-        .collect::<A2aResult<Vec<_>>>()?;
+    let mut tasks = Vec::with_capacity(page.rows.len());
+    for r in &page.rows {
+        let history = render_history(app, agent, r, history_length).await?;
+        tasks.push(a2a::task_from_row(r, history, include_artifacts)?);
+    }
     a2a::to_value(&ListTasksResponse {
         tasks,
         next_page_token: next_token,
@@ -261,13 +310,13 @@ async fn send_message(app: &AppState, agent: &str, params: &Value) -> A2aResult<
     let input = a2a::parse_send_message(params)?;
     crate::validate::validate_content(&input.text)
         .map_err(|_| A2aError::invalid_params("message text is invalid or too large"))?;
-    let task_id = open_task(app, agent, &input).await?;
+    let opened = open_task(app, agent, &input).await?;
+    let task_id = opened.task_id.clone();
     // SUBMITTED -> WORKING. Losing this CAS means a concurrent CancelTask
     // already ended the task: report its state, store nothing.
     let working = A2aTaskUpdate {
         status_timestamp: a2a::now_timestamp(),
-        history: None,
-        artifacts: None,
+        ..A2aTaskUpdate::default()
     };
     let started = store_cas(
         app,
@@ -287,11 +336,11 @@ async fn send_message(app: &AppState, agent: &str, params: &Value) -> A2aResult<
         Err(e) => {
             let failed = A2aTaskUpdate {
                 status_timestamp: a2a::now_timestamp(),
-                history: None,
-                artifacts: None,
+                ..A2aTaskUpdate::default()
             };
-            // Best effort: the original error is what the caller sees.
-            let _ = store_cas(
+            // The original error is what the caller sees; a failed
+            // transition is logged, never silently dropped.
+            if let Err(cas_err) = store_cas(
                 app,
                 agent,
                 &task_id,
@@ -299,23 +348,44 @@ async fn send_message(app: &AppState, agent: &str, params: &Value) -> A2aResult<
                 state::FAILED,
                 &failed,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    target: "a2a",
+                    "could not mark a2a task failed after a storage error: {}",
+                    cas_err.message
+                );
+            }
             return Err(e);
         }
     };
+    // The history entry is content-free: ids and the inbox memory id only. The
+    // message text lives in that memory alone, so erase, delete and GC of the
+    // memory also remove it from every task view.
+    let entry = A2aHistoryEntry {
+        message_id: input.message.message_id.clone(),
+        role: a2a::to_value(&input.message.role)?
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        context_id: opened.context_id.clone(),
+        task_id: task_id.clone(),
+        memory_id: memory_id.clone(),
+    };
     let done = A2aTaskUpdate {
         status_timestamp: a2a::now_timestamp(),
-        history: None,
-        artifacts: Some(a2a::to_value(&vec![a2a::receipt_artifact(&memory_id)])?),
+        history_append: Some(entry),
+        artifact_append: Some(a2a::to_value(&a2a::receipt_artifact(&memory_id))?),
     };
-    // WORKING -> COMPLETED. If a concurrent CancelTask won, the task stays
-    // CANCELED and that is what is reported; the stored message is a
-    // delivered inbox row either way.
+    // WORKING -> COMPLETED. A COMPLETED source is accepted too, so a concurrent
+    // continuation's entry and receipt are never lost to a racing completion;
+    // if a concurrent CancelTask won, the task stays CANCELED and that is what
+    // is reported (the stored message is a delivered inbox row either way).
     let _ = store_cas(
         app,
         agent,
         &task_id,
-        &[state::WORKING],
+        &[state::WORKING, state::COMPLETED],
         state::COMPLETED,
         &done,
     )
@@ -327,21 +397,30 @@ async fn current_task(app: &AppState, agent: &str, id: &str) -> A2aResult<Value>
     let row = store_get(app, agent, id)
         .await?
         .ok_or_else(A2aError::internal)?;
-    let task = a2a::task_from_row(&row, None, true)?;
+    let history = render_history(app, agent, &row, None).await?;
+    let task = a2a::task_from_row(&row, history, true)?;
     a2a::to_value(&SendMessageResponse::Task(task))
 }
 
+/// The task a message was opened against.
+struct OpenedTask {
+    task_id: String,
+    context_id: String,
+}
+
 /// Create the task for a new message, or continue the caller's non-terminal
-/// task when the message names one. Returns the task id.
-async fn open_task(app: &AppState, agent: &str, input: &SendInput) -> A2aResult<String> {
+/// task when the message names one.
+async fn open_task(app: &AppState, agent: &str, input: &SendInput) -> A2aResult<OpenedTask> {
     let now = a2a::now_timestamp();
-    let message_json = a2a::to_value(&input.message)?;
     if let Some(task_id) = input.message.task_id.as_deref() {
         let row = store_get(app, agent, task_id)
             .await?
             .ok_or_else(A2aError::task_not_found)?;
+        // A task the caller owns that has ended is a defined, spec-visible
+        // condition (-32004 naming the state); -32001 is only for an id that
+        // is missing or belongs to someone else.
         if state::is_terminal(&row.state) {
-            return Err(A2aError::task_not_found());
+            return Err(A2aError::task_terminal(&row.state));
         }
         if input
             .message
@@ -353,15 +432,12 @@ async fn open_task(app: &AppState, agent: &str, input: &SendInput) -> A2aResult<
                 "contextId does not match the task",
             ));
         }
-        // Append the message to the task history through the same CAS used
-        // for every other transition. The message itself is durable in the
-        // inbox either way; `history` is the task's convenience view.
-        let mut history = row.history.as_array().cloned().unwrap_or_default();
-        history.push(message_json);
+        // Re-open the task through the same CAS used for every other
+        // transition. History is appended atomically at completion, so a
+        // concurrent continuation can never overwrite another's entry.
         let update = A2aTaskUpdate {
             status_timestamp: now,
-            history: Some(Value::Array(history)),
-            artifacts: None,
+            ..A2aTaskUpdate::default()
         };
         let moved = store_cas(
             app,
@@ -373,9 +449,20 @@ async fn open_task(app: &AppState, agent: &str, input: &SendInput) -> A2aResult<
         )
         .await?;
         if !moved {
-            return Err(A2aError::task_not_found());
+            // Lost the compare-and-set: re-read to say why.
+            let now_row = store_get(app, agent, task_id)
+                .await?
+                .ok_or_else(A2aError::task_not_found)?;
+            return Err(if state::is_terminal(&now_row.state) {
+                A2aError::task_terminal(&now_row.state)
+            } else {
+                A2aError::task_changed_concurrently()
+            });
         }
-        return Ok(task_id.to_string());
+        return Ok(OpenedTask {
+            task_id: task_id.to_string(),
+            context_id: row.context_id,
+        });
     }
     let id = uuid::Uuid::new_v4().to_string();
     let context_id = input
@@ -385,18 +472,21 @@ async fn open_task(app: &AppState, agent: &str, input: &SendInput) -> A2aResult<
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let row = A2aTaskRow {
         id: id.clone(),
-        context_id,
+        context_id: context_id.clone(),
         agent_id: agent.to_string(),
         state: state::SUBMITTED.to_string(),
         status_timestamp: now.clone(),
-        history: json!([message_json]),
+        history: json!([]),
         artifacts: json!([]),
         metadata: json!({"storage": "ai-memory-inbox"}),
         created_at: now.clone(),
         updated_at: now,
     };
     store_insert(app, &row).await?;
-    Ok(id)
+    Ok(OpenedTask {
+        task_id: id,
+        context_id,
+    })
 }
 
 // --- storage dispatch -------------------------------------------------------

@@ -4691,6 +4691,17 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #8444 r2 - every A2A task row of every agent (content-free: ids only,
+    /// message content stays in the inbox memories), oldest first, for the
+    /// export surfaces.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn a2a_task_export(&self) -> StoreResult<Vec<crate::storage::a2a_tasks::A2aTaskRow>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "A2A_TASK_EXPORT".to_string(),
+        })
+    }
+
     /// #8444 - `notify` plus caller-built system metadata stamped onto the
     /// inbox memory AT FORMATION (the A2A standard binding stamps
     /// `content_principal` / `a2a_role` here so the provenance is part of the

@@ -31000,6 +31000,10 @@ impl MemoryStore for PostgresStore {
             .await
     }
 
+    async fn a2a_task_export(&self) -> StoreResult<Vec<crate::storage::a2a_tasks::A2aTaskRow>> {
+        self.a2a_task_export_pg().await
+    }
+
     async fn notify_stamped(
         &self,
         ctx: &CallerContext,

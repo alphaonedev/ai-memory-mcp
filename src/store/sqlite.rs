@@ -4275,6 +4275,11 @@ impl MemoryStore for SqliteStore {
         .map_err(box_err)
     }
 
+    async fn a2a_task_export(&self) -> StoreResult<Vec<crate::storage::a2a_tasks::A2aTaskRow>> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_export(&conn).map_err(box_err)
+    }
+
     async fn notify_stamped(
         &self,
         ctx: &CallerContext,

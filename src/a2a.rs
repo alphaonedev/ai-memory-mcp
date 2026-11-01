@@ -41,7 +41,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::storage::a2a_tasks::A2aTaskRow;
+use crate::storage::a2a_tasks::{A2aHistoryEntry, A2aTaskRow};
 
 /// The ONE place the `a2a-lf` crate is named. Inside this crate `crate::a2a`
 /// is this module, so the extern crate is always reached as `::a2a`.
@@ -207,6 +207,30 @@ impl A2aError {
             "this operation is not supported",
         )
     }
+    /// `-32004` UnsupportedOperation with a caller-actionable message (for
+    /// example a follow-up to a task already in a terminal state; spec 3.1.1:
+    /// terminal tasks "cannot accept further messages"). `message` must never
+    /// echo request content.
+    #[must_use]
+    pub fn unsupported_operation_because(message: &str) -> Self {
+        Self::new(error_code::UNSUPPORTED_OPERATION, message)
+    }
+    /// `-32004` for a follow-up message to a task of the caller that is in the
+    /// terminal state `state` (a stored `TASK_STATE_*` string).
+    #[must_use]
+    pub fn task_terminal(state: &str) -> Self {
+        Self::unsupported_operation_because(&format!(
+            "task is in terminal state {state} and cannot accept further messages"
+        ))
+    }
+    /// `-32004` for a follow-up that lost the race to another change of the
+    /// same task.
+    #[must_use]
+    pub fn task_changed_concurrently() -> Self {
+        Self::unsupported_operation_because(
+            "task was modified concurrently and cannot accept this message; retry",
+        )
+    }
     /// `-32005` ContentTypeNotSupported (a file part).
     #[must_use]
     pub fn content_type_not_supported() -> Self {
@@ -244,17 +268,39 @@ pub fn to_value<T: Serialize>(v: &T) -> Result<Value, A2aError> {
     })
 }
 
+/// The body answered when an envelope cannot be serialised: a well-formed
+/// JSON-RPC `-32603` with a `null` id (never a bare `null` body).
+fn internal_error_envelope() -> Value {
+    serde_json::json!({
+        "jsonrpc": JSONRPC_VERSION,
+        "id": Value::Null,
+        "error": {"code": error_code::INTERNAL_ERROR, "message": INTERNAL_ERROR_MESSAGE},
+    })
+}
+
+/// The serialised envelope, or the fixed `-32603` envelope plus a warn log
+/// when serialisation failed.
+fn envelope_or_internal_error(serialised: Result<Value, serde_json::Error>) -> Value {
+    serialised.unwrap_or_else(|e| {
+        tracing::warn!(target: "a2a", "a2a envelope serialisation failure: {e}");
+        internal_error_envelope()
+    })
+}
+
 /// `{jsonrpc, id, error}` envelope.
 #[must_use]
 pub fn error_envelope(id: &JsonRpcId, err: &A2aError) -> Value {
     let resp = JsonRpcResponse::error(id.clone(), err.to_error_object());
-    serde_json::to_value(resp).unwrap_or(Value::Null)
+    envelope_or_internal_error(serde_json::to_value(resp))
 }
 
 /// `{jsonrpc, id, result}` envelope.
 #[must_use]
 pub fn result_envelope(id: &JsonRpcId, result: Value) -> Value {
-    serde_json::to_value(JsonRpcResponse::success(id.clone(), result)).unwrap_or(Value::Null)
+    envelope_or_internal_error(serde_json::to_value(JsonRpcResponse::success(
+        id.clone(),
+        result,
+    )))
 }
 
 /// A parsed JSON-RPC request.
@@ -316,9 +362,18 @@ pub fn parse_rpc(body: &[u8]) -> Result<RpcRequest, (JsonRpcId, A2aError)> {
     })
 }
 
-/// Check the `A2A-Version` request header: absent or `1.0` is accepted. An
-/// empty value is read as `0.3` by the spec and any other value is not
-/// served.
+/// Check the `A2A-Version` request header: absent or `1.0` is accepted, any
+/// other value is not served.
+///
+/// The spec (section on service parameters) says: "Agents MUST interpret empty
+/// value as 0.3". This server does not speak 0.3, so an EMPTY value is read as
+/// 0.3 and answered `-32009` VersionNotSupported (HTTP 400), exactly like any
+/// other unsupported version. An ABSENT header is a different case: the
+/// sentence covers an empty value, not a missing one, and every 1.0 client
+/// that predates the header (or a plain HTTP tool) sends none, so absent is
+/// served as `1.0`, the only version this endpoint can answer. Do not
+/// "tighten" absent to an error or "relax" empty to `1.0`: either breaks one
+/// of the two rules above (conformance 271 pins both).
 ///
 /// # Errors
 ///
@@ -379,17 +434,26 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T,
     serde_json::from_value(params.clone()).map_err(|_| A2aError::invalid_params("invalid params"))
 }
 
-/// Convert an optional `historyLength` to a count. A negative value clamps
-/// to `0` (conformance 195).
-#[must_use]
-pub fn history_length(raw: Option<i32>) -> Option<usize> {
-    raw.map(|n| usize::try_from(n).unwrap_or(0))
+/// Convert an optional `historyLength` to a count. The spec requires a
+/// non-negative integer ("Must be non-negative integer"), so a negative value
+/// is a validation error (conformance 195).
+///
+/// # Errors
+///
+/// `-32602` for a negative `historyLength`.
+pub fn history_length(raw: Option<i32>) -> Result<Option<usize>, A2aError> {
+    raw.map(|n| {
+        usize::try_from(n)
+            .map_err(|_| A2aError::invalid_params("historyLength must be a non-negative integer"))
+    })
+    .transpose()
 }
 
 /// A validated inbound message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SendInput {
-    /// The message as received (stored as the task's history entry).
+    /// The message as received (its ids go into the content-free history
+    /// entry; its content goes only to the inbox memory).
     pub message: Message,
     /// Remote-chosen role string (an UNTRUSTED label).
     pub role: String,
@@ -508,8 +572,46 @@ pub fn now_timestamp() -> String {
     format_timestamp(Utc::now())
 }
 
-/// The typed Task for a stored row. `history_length` of `Some(n)` keeps the
-/// last `n` messages (`0` omits `history`); `None` keeps all.
+/// The content-free history entries of a stored row, oldest first.
+///
+/// # Errors
+///
+/// `-32603` when the stored history does not decode (corrupt JSON is refused,
+/// never replaced by an empty history).
+pub fn history_entries(row: &A2aTaskRow) -> Result<Vec<A2aHistoryEntry>, A2aError> {
+    serde_json::from_value(row.history.clone()).map_err(|_| {
+        tracing::warn!(target: "a2a", "stored a2a task has an unreadable history");
+        A2aError::internal()
+    })
+}
+
+/// The last `history_length` entries (`None` keeps all, `Some(0)` none), so the
+/// handler reads only the memories the response will show.
+#[must_use]
+pub fn history_window(
+    entries: Vec<A2aHistoryEntry>,
+    history_length: Option<usize>,
+) -> Vec<A2aHistoryEntry> {
+    let keep = history_length.map_or(entries.len(), |n| n.min(entries.len()));
+    entries[entries.len() - keep..].to_vec()
+}
+
+/// The wire `Message` of one history entry, rendered from the inbox memory's
+/// `content` (read through the normal memory read path by the handler).
+#[must_use]
+pub fn message_from_entry(entry: &A2aHistoryEntry, content: &str) -> Message {
+    let role =
+        serde_json::from_value(Value::String(entry.role.clone())).unwrap_or(Role::Unspecified);
+    let mut m = Message::new(role, vec![Part::text(content.to_string())]);
+    m.message_id = entry.message_id.clone();
+    m.context_id = Some(entry.context_id.clone());
+    m.task_id = Some(entry.task_id.clone());
+    m
+}
+
+/// The typed Task for a stored row and its already rendered `history` (the
+/// handler reads each entry's content from the inbox memory; an empty vector
+/// omits `history`).
 ///
 /// # Errors
 ///
@@ -517,7 +619,7 @@ pub fn now_timestamp() -> String {
 /// written by this module).
 pub fn task_from_row(
     row: &A2aTaskRow,
-    history_length: Option<usize>,
+    history: Vec<Message>,
     include_artifacts: bool,
 ) -> Result<Task, A2aError> {
     let decode = |what: &str| {
@@ -529,10 +631,7 @@ pub fn task_from_row(
     let timestamp = DateTime::parse_from_rfc3339(&row.status_timestamp)
         .map(|t| t.with_timezone(&Utc))
         .map_err(|_| decode("timestamp"))?;
-    let history: Vec<Message> =
-        serde_json::from_value(row.history.clone()).map_err(|_| decode("history"))?;
-    let keep = history_length.map_or(history.len(), |n| n.min(history.len()));
-    let history = (keep > 0).then(|| history[history.len() - keep..].to_vec());
+    let history = (!history.is_empty()).then_some(history);
     let artifacts = if include_artifacts {
         let a: Vec<Artifact> =
             serde_json::from_value(row.artifacts.clone()).map_err(|_| decode("artifacts"))?;
@@ -556,25 +655,66 @@ pub fn task_from_row(
     })
 }
 
-/// The `https`/`http` base URL for the card, derived from the (validated)
-/// `Host` header of the already-authenticated request.
+/// Env var naming the externally reachable base URL of this daemon (scheme and
+/// authority, no path), advertised in the Agent Card. When it is unset or not
+/// a valid base URL the card advertises the daemon's own scheme and bind
+/// address instead. The request's `Host` and `X-Forwarded-Proto` headers are
+/// NEVER consulted (they are caller-controlled).
+pub const ENV_PUBLIC_URL: &str = "AI_MEMORY_PUBLIC_URL";
+/// Longest accepted public base URL.
+const MAX_PUBLIC_URL_LEN: usize = 255;
+/// Base URL advertised before the daemon has recorded its own (tests, or a
+/// card requested through a router built without a daemon).
+const DEFAULT_CARD_BASE_URL: &str = "http://localhost";
+
+/// The valid form of a configured public base URL: `http(s)://authority`, no
+/// whitespace or control characters, no userinfo, query, fragment or
+/// backslash, trailing slashes trimmed. `None` for anything else.
 #[must_use]
-pub fn base_url(host: Option<&str>, forwarded_proto: Option<&str>) -> String {
-    let scheme = if forwarded_proto.map(str::trim) == Some("https") {
-        "https"
-    } else {
-        "http"
-    };
-    let host = host
-        .map(str::trim)
-        .filter(|h| {
-            !h.is_empty()
-                && h.len() <= 255
-                && h.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
-        })
-        .unwrap_or("localhost");
-    format!("{scheme}://{host}")
+pub fn valid_public_url(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_end_matches('/');
+    let rest = t
+        .strip_prefix("https://")
+        .or_else(|| t.strip_prefix("http://"))?;
+    let ok = !rest.is_empty()
+        && t.len() <= MAX_PUBLIC_URL_LEN
+        && rest
+            .chars()
+            .all(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '@' | '?' | '#' | '\\'));
+    ok.then(|| t.to_string())
+}
+
+/// The base URL the Agent Card advertises: a valid configured `public_url`
+/// wins; otherwise `{scheme}://{bind_addr}` where the scheme is `https` when
+/// the daemon serves TLS. Pure: the caller supplies every input.
+#[must_use]
+pub fn resolve_card_base_url(public_url: Option<&str>, tls: bool, bind_addr: &str) -> String {
+    if let Some(url) = public_url {
+        if let Some(valid) = valid_public_url(url) {
+            return valid;
+        }
+        tracing::warn!(
+            target: "a2a",
+            "{ENV_PUBLIC_URL} is not a valid http(s) base URL; advertising the bind address"
+        );
+    }
+    let scheme = if tls { "https" } else { "http" };
+    format!("{scheme}://{bind_addr}")
+}
+
+static CARD_BASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the card base URL once, at daemon start (the first call wins).
+pub fn set_card_base_url(base: String) {
+    let _ = CARD_BASE_URL.set(base);
+}
+
+/// The recorded card base URL, or a fixed default before one is set.
+#[must_use]
+pub fn card_base_url() -> &'static str {
+    CARD_BASE_URL
+        .get()
+        .map_or(DEFAULT_CARD_BASE_URL, String::as_str)
 }
 
 /// The Agent Card. Declares exactly what is served: JSON-RPC only, no
@@ -768,15 +908,6 @@ mod tests {
     }
 
     #[test]
-    fn base_url_rejects_hostile_host_values() {
-        assert_eq!(
-            base_url(Some("a.example:8080"), Some("https")),
-            "https://a.example:8080"
-        );
-        assert_eq!(base_url(Some("a b/c"), None), "http://localhost");
-    }
-
-    #[test]
     fn stored_state_strings_match_the_crate_task_state() {
         for (s, t) in [
             (state::SUBMITTED, TaskState::Submitted),
@@ -877,10 +1008,123 @@ mod tests {
     }
 
     #[test]
-    fn negative_history_length_clamps_to_zero() {
-        assert_eq!(history_length(None), None);
-        assert_eq!(history_length(Some(-5)), Some(0));
-        assert_eq!(history_length(Some(3)), Some(3));
+    fn public_url_validation_and_card_base_resolution() {
+        // #8444 r2 code MEDIUM-3 / LOW-7: the card URL comes from configuration
+        // and the daemon's own scheme, never from the request.
+        assert_eq!(
+            resolve_card_base_url(None, false, "127.0.0.1:9077"),
+            "http://127.0.0.1:9077"
+        );
+        assert_eq!(
+            resolve_card_base_url(None, true, "127.0.0.1:9077"),
+            "https://127.0.0.1:9077",
+            "a TLS daemon advertises https"
+        );
+        assert_eq!(
+            resolve_card_base_url(Some("https://mem.example.org/"), false, "0.0.0.0:9077"),
+            "https://mem.example.org",
+            "a configured public URL wins and is trimmed"
+        );
+        for hostile in [
+            "javascript:alert(1)",
+            "http://",
+            "https://a b/c",
+            "https://u:p@evil.example",
+            "https://evil.example/?x=1",
+            "https://evil.example#f",
+            "ftp://x.example",
+            "https://a\\b",
+            "",
+        ] {
+            assert_eq!(
+                resolve_card_base_url(Some(hostile), true, "1.2.3.4:5"),
+                "https://1.2.3.4:5",
+                "invalid public url {hostile:?} must be ignored"
+            );
+        }
+        assert!(valid_public_url(&format!("https://{}", "a".repeat(300))).is_none());
+    }
+
+    #[test]
+    fn negative_history_length_is_invalid_params() {
+        // #8444 r2 code LOW-8.
+        assert_eq!(history_length(None), Ok(None));
+        assert_eq!(history_length(Some(0)), Ok(Some(0)));
+        assert_eq!(history_length(Some(3)), Ok(Some(3)));
+        let e = history_length(Some(-5)).expect_err("negative");
+        assert_eq!((e.code, e.http_status), (-32602, 400));
+    }
+
+    #[test]
+    fn serialisation_failure_answers_a_well_formed_internal_error() {
+        // #8444 r2 code LOW-4: never a bare `null` body.
+        let failure = serde_json::from_str::<Value>("{").expect_err("invalid json");
+        let body = envelope_or_internal_error(Err(failure));
+        assert_eq!(
+            body,
+            json!({"jsonrpc": "2.0", "id": null,
+                   "error": {"code": -32603, "message": "internal error"}})
+        );
+        let ok = envelope_or_internal_error(Ok(json!({"k": 1})));
+        assert_eq!(ok, json!({"k": 1}));
+    }
+
+    #[test]
+    fn terminal_follow_up_errors_are_unsupported_operation() {
+        // #8444 r2 code MEDIUM-1 / sec MEDIUM-2.
+        let e = A2aError::task_terminal("TASK_STATE_COMPLETED");
+        assert_eq!((e.code, e.http_status), (-32004, 400));
+        assert!(e.message.contains("TASK_STATE_COMPLETED"));
+        let e = A2aError::task_changed_concurrently();
+        assert_eq!((e.code, e.http_status), (-32004, 400));
+    }
+
+    #[test]
+    fn history_window_keeps_the_last_entries() {
+        let entries = (0..4)
+            .map(|i| A2aHistoryEntry {
+                message_id: format!("m{i}"),
+                ..A2aHistoryEntry::default()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history_window(entries.clone(), None).len(), 4);
+        assert_eq!(history_window(entries.clone(), Some(0)).len(), 0);
+        let last = history_window(entries.clone(), Some(2));
+        assert_eq!(last[0].message_id, "m2");
+        assert_eq!(history_window(entries, Some(99)).len(), 4);
+    }
+
+    #[test]
+    fn rendered_history_message_carries_ids_and_content() {
+        let entry = A2aHistoryEntry {
+            message_id: "m1".into(),
+            role: "ROLE_USER".into(),
+            context_id: "c1".into(),
+            task_id: "t1".into(),
+            memory_id: "mem".into(),
+        };
+        let m = message_from_entry(&entry, "hello");
+        assert_eq!(m.message_id, "m1");
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.context_id.as_deref(), Some("c1"));
+        assert_eq!(m.task_id.as_deref(), Some("t1"));
+        assert_eq!(m.text(), Some("hello"));
+    }
+
+    #[test]
+    fn canonical_bytes_match_a_golden_string() {
+        // #8444 r2 code INFO-1: a golden byte string, independent of the
+        // implementation under test.
+        let map = HashMap::from([("k3", 3), ("k1", 1), ("k2", 2)]);
+        let value = json!({"b": 1, "a": {"d": 4, "c": [{"z": 0, "y": 1}]}});
+        assert_eq!(
+            canonical_bytes(&map).expect("canonical"),
+            br#"{"k1":1,"k2":2,"k3":3}"#
+        );
+        assert_eq!(
+            canonical_bytes(&value).expect("canonical"),
+            br#"{"a":{"c":[{"y":1,"z":0}],"d":4},"b":1}"#
+        );
     }
 
     fn error_object_without_timestamp(e: &A2aError) -> Value {

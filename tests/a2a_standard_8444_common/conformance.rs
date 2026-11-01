@@ -9,11 +9,12 @@
 //! PostgreSQL binary can run them all against one shared database.
 
 use super::{
-    ALICE, ALICE_KEY, BOB_KEY, Reply, SeedTask, error_code, message, rpc, rpc_with, seed_task,
-    seed_working_task, send, send_ok, state,
+    ALICE, ALICE_KEY, BOB_KEY, Reply, SeedTask, error_code, link_history, message,
+    receipt_memory_id, rpc, rpc_with, seed_task, seed_working_task, send, send_ok, state,
 };
 use ai_memory::a2a::{A2A_RPC_PATH, AGENT_CARD_PATH};
 use ai_memory::handlers::AppState;
+use ai_memory::storage::a2a_tasks::A2aHistoryEntry;
 use axum::Router;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -82,6 +83,16 @@ pub async fn followup_to_terminal_task_is_rejected(router: &Router) {
         "terminal follow-up must be an error"
     );
     assert!(r.json().get("result").is_none());
+    // The caller owns the task: a state error naming the state, not "not found".
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&r), -32004);
+    assert!(
+        r.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("TASK_STATE_COMPLETED")),
+        "{}",
+        r.json()
+    );
     assert_eq!(total_in(router, &ctx).await, before, "no silent new task");
 }
 
@@ -175,7 +186,11 @@ pub async fn non_json_content_type_is_rejected(router: &Router) {
 
 /// 271 (S1 serves JSON-RPC only; every response of it carries the header)
 pub async fn version_header_rule_on_every_response(router: &Router) {
+    // Spec text: "Agents MUST interpret empty value as 0.3". An absent header is
+    // served as 1.0 (the only version this binding implements), an explicit empty
+    // value is the legacy 0.3 request and is refused with -32009 below.
     let ok = rpc(router, ALICE_KEY, "ListTasks", &json!({})).await;
+    assert_eq!(ok.status, StatusCode::OK, "absent header is served as 1.0");
     assert_eq!(ok.version.as_deref(), Some("1.0"));
     let accepted = rpc_with(
         router,
@@ -433,6 +448,22 @@ pub async fn request_body_is_bounded(router: &Router) {
     )
     .await;
     assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    // A body of exactly the limit is read in full: a parse error envelope, not 413.
+    let at_limit = vec![b' '; ai_memory::HTTP_BODY_LIMIT_BYTES];
+    let r = send(
+        router,
+        "POST",
+        A2A_RPC_PATH,
+        &[
+            ("content-type", "application/json"),
+            (ai_memory::HEADER_API_KEY, ALICE_KEY),
+        ],
+        at_limit,
+    )
+    .await;
+    assert_ne!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(matches!(error_code(&r), -32700 | -32600));
     let stream = rpc(router, ALICE_KEY, "SendStreamingMessage", &json!({})).await;
     assert_eq!(error_code(&stream), -32004);
 }
@@ -505,13 +536,20 @@ pub async fn only_declared_capabilities_are_served(router: &Router) {
 /// 195
 pub async fn history_length_and_owner_checks(router: &Router, app: &AppState, global: &str) {
     let id = unique("t-195");
-    let mut seed = SeedTask::new(ALICE, &id, "ctx-195", state::WORKING);
-    seed.history = json!([
-        {"messageId":"h1","role":"ROLE_USER","parts":[{"text":"a"}]},
-        {"messageId":"h2","role":"ROLE_USER","parts":[{"text":"b"}]},
-        {"messageId":"h3","role":"ROLE_USER","parts":[{"text":"c"}]},
-    ]);
-    seed_task(app, &seed).await;
+    seed_task(app, &SeedTask::new(ALICE, &id, "ctx-195", state::WORKING)).await;
+    // Three real inbox memories, linked to the task as content-free entries.
+    let mut entries = Vec::new();
+    for (name, text) in [("h1", "a"), ("h2", "b"), ("h3", "c")] {
+        let sent = send_ok(router, ALICE_KEY, text, "ROLE_USER").await;
+        entries.push(A2aHistoryEntry {
+            message_id: name.to_string(),
+            role: "ROLE_USER".to_string(),
+            context_id: "ctx-195".to_string(),
+            task_id: id.clone(),
+            memory_id: receipt_memory_id(&sent),
+        });
+    }
+    link_history(app, ALICE, &id, &entries).await;
     let history_len = |r: &Reply| {
         r.json()["result"]
             .get("history")
@@ -520,6 +558,7 @@ pub async fn history_length_and_owner_checks(router: &Router, app: &AppState, gl
     };
     let all = rpc(router, ALICE_KEY, "GetTask", &json!({"id": id})).await;
     assert_eq!(history_len(&all), 3);
+    assert_eq!(all.json()["result"]["history"][0]["parts"][0]["text"], "a");
     let two = rpc(
         router,
         ALICE_KEY,
@@ -537,15 +576,17 @@ pub async fn history_length_and_owner_checks(router: &Router, app: &AppState, gl
     )
     .await;
     assert_eq!(history_len(&zero), 0);
-    let negative = rpc(
-        router,
-        ALICE_KEY,
-        "GetTask",
-        &json!({"id": id, "historyLength": -5}),
-    )
-    .await;
-    assert_eq!(negative.status, StatusCode::OK);
-    assert_eq!(history_len(&negative), 0, "negative clamps to 0");
+    // A negative historyLength is invalid params (spec: non-negative integer).
+    for method in ["GetTask", "ListTasks"] {
+        let params = if method == "GetTask" {
+            json!({"id": id, "historyLength": -5})
+        } else {
+            json!({"historyLength": -5})
+        };
+        let negative = rpc(router, ALICE_KEY, method, &params).await;
+        assert_eq!(negative.status, StatusCode::BAD_REQUEST, "{method}");
+        assert_eq!(error_code(&negative), -32602, "{method}");
+    }
 
     // Every task-addressing method is owner-checked, fail closed.
     for (m, params) in [

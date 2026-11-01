@@ -7,10 +7,10 @@ a9fbc9ca04a04d2bdf13c4772dd56ebea116b82de18e675ff1df36ee8f8711cd  ## Hard rule â
 2bdf119184bfae244ccbc9061bc1eae94d7c8ace6f5d5928ff24ccfec036af01  ## Build & Test Commands
 990a4a862fcdbc3d511b5803e51a49891ac65ae85351dcd6edd7f33732cf1ffd  ## Dogfooding release branches
 fbe2f5e766c42769e75aa182c50e982b89dd006a06a5d0dcf56b9d8b5b116b8a  ## Reproducing the v0.7.0 recursive-learning primitive
-f6d0c600a9330461a3f5ddfac7fade09230f9b3af67e81b8ed4ff7de06669530  ## Architecture
+51d4d67d2beb020ab3eeb745e73d849694289aa038607bcfc5fb256008ecf8b3  ## Architecture
 22e511869f7d39f3c5554333831f49faff25ab98572f34a00c384b2f9eef4d27  ## Adding New Functionality
 9b92321c53d0efe15cb34cdb952ec476058a881b6bdbd1b55582edf60a3892df  ## Code Style
-2d6b30780058da3153b5c367f5e97bd78260662f78eda5a744309afa2f999ddd  ## Prime directive (operator-set, 2026-05-17)
+f4541efd877e057df30dc42ea664f2e3c841f83c345acd02b66dcc85ea483189  ## Prime directive (operator-set, 2026-05-17)
 2ee348fe4f938fcc4c596dc247a62b7f1e65a0d54af96c473c7fb5fc02e9169f  ## Crossroads decision protocol â€” 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)
 b96fb1a5548a92acc32d77668f33884ecdb636e6e2bbfa0af7c0040924704cb8  ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
 76d73d2153d0ad4235f4067a56d9e1aea9f37c173dc220c06271f101a1584477  ## Sole-authority operator + no-external-code-injection (operator-set 2026-05-25)

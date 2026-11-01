@@ -237,7 +237,7 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <span class="pill">local GPU embeddings</span>
       <span class="pill">nomic-embed-text · 768d</span>
       <span class="pill">W-of-N quorum · mTLS</span>
-      <span class="pill">schema v100</span>
+      <span class="pill">schema v101</span>
     </div>
   </div>
 </section>
@@ -331,7 +331,7 @@ capacity / cost / SLA planning is
         <text x="405" y="362" text-anchor="middle" class="svg-title" font-size="11" font-weight="700" style="fill:var(--slate)">SQLite (WAL + FTS5)</text>
         <text x="405" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
         <text x="405" y="398" text-anchor="middle" class="svg-label" font-size="10" style="fill:var(--slate)">PostgreSQL + Apache AGE</text>
-        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v100</text>
+        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v101</text>
       </g>
 
       <!-- GPU embed loopback leg (green) -->
@@ -371,7 +371,7 @@ capacity / cost / SLA planning is
         <text x="965" y="362" text-anchor="middle" class="svg-title" font-size="11" font-weight="700" style="fill:var(--slate)">SQLite (WAL + FTS5)</text>
         <text x="965" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
         <text x="965" y="398" text-anchor="middle" class="svg-label" font-size="10" style="fill:var(--slate)">PostgreSQL + Apache AGE</text>
-        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v100</text>
+        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v101</text>
       </g>
 
       <path class="flow gpu" d="M822 252 C844 240 846 216 860 210" aria-hidden="true"/>
@@ -457,7 +457,7 @@ verified <code>AI_MEMORY_*</code> override battery follow.</p>
     <h3>SQLite or Postgres + AGE</h3>
     <p>Single-node: SQLite WAL + FTS5. Shared fleet: PostgreSQL + Apache AGE +
     pgvector via <code>ai-memory serve --store-url postgres://…</code> (the SAL trait path).
-    <strong>Schema v100</strong> in lockstep across all peers.</p>
+    <strong>Schema v101</strong> in lockstep across all peers.</p>
   </div>
   <div class="card leg2">
     <span class="leg-tag">Federation &amp; security</span>
@@ -622,7 +622,7 @@ the serving tier.</p>
   cloud + airgapped API-embedding shapes, sizing and security posture.</li>
 <li><a href="../whats-new-v08.html">What's New in v0.8.0</a> — distributed-coordination
   GA (the Pillar-1 action / signal / attested-checkpoint substrate). The
-  current v1.0.0 substrate counts (schema v100, MCP core/full profiles, 9 link
+  current v1.0.0 substrate counts (schema v101, MCP core/full profiles, 9 link
   relations, 30 memory fields) are in the stat strip at the top of this page.</li>
 <li><a href="../v0.8.0/release-notes.html"><code>docs/v0.8.0/release-notes.md</code></a>
   — the v0.8.0 GA change inventory.</li>

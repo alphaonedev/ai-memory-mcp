@@ -24,3 +24,18 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_agent_updated
     ON a2a_tasks (agent_id, updated_at);
+
+-- Content-free task history (#8444 r2): a task NEVER stores message content.
+-- `history_json` holds only ids; the content stays in the inbox memory (the
+-- memory funnel is the sole content store: erase, at-rest sealing and the
+-- secret screen all apply). This link table ties a task to the inbox
+-- memories its history names, so every path that deletes a memory (erase,
+-- delete, gc, archive) removes the link in the SAME statement via ON DELETE
+-- CASCADE, and GetTask renders only entries whose memory is still linked.
+CREATE TABLE IF NOT EXISTS a2a_task_memories (
+    task_id   TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_a2a_task_memories_memory
+    ON a2a_task_memories (memory_id);

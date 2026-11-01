@@ -655,7 +655,7 @@ For HTTP-only clients, start the REST API:
 
 ```bash
 ai-memory serve   # TLS only (#3705): first boot generates <key_dir>/tls/ and renews it (#3709)
-# 103 REST route registrations (89 unique URL paths) at https://127.0.0.1:9077/api/v1/
+# 105 REST route registrations (91 unique URL paths) at https://127.0.0.1:9077/api/v1/
 ```
 
 </details>
@@ -971,7 +971,7 @@ Start the HTTP server for REST API access. Any AI, script, or automation that ca
 
 ```bash
 ai-memory serve   # TLS only (#3705): first boot generates <key_dir>/tls/ and renews it (#3709)
-# 103 REST route registrations (89 unique URL paths) at https://127.0.0.1:9077/api/v1/
+# 105 REST route registrations (91 unique URL paths) at https://127.0.0.1:9077/api/v1/
 ```
 
 ### CLI (Universal -- for scripting and direct use)
