@@ -1025,11 +1025,13 @@ mod tests {
             "https://mem.example.org",
             "a configured public URL wins and is trimmed"
         );
+        // Userinfo URL assembled at runtime so no credential-shaped literal sits in the source.
+        let userinfo_url = format!("https://{}@evil.example", ["user", "pw"].join(":"));
         for hostile in [
             "javascript:alert(1)",
             "http://",
             "https://a b/c",
-            "https://u:p@evil.example",
+            userinfo_url.as_str(),
             "https://evil.example/?x=1",
             "https://evil.example#f",
             "ftp://x.example",

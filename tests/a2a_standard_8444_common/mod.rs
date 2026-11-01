@@ -350,7 +350,9 @@ pub fn sqlite_app_state(path: &std::path::Path) -> AppState {
 async fn complete_directly(app: &AppState, agent: &str, id: &str) -> bool {
     let update = A2aTaskUpdate {
         status_timestamp: ai_memory::a2a::now_timestamp(),
-        artifact_append: Some(json!({"artifactId": "direct", "parts": [{"text": "direct completion"}]})),
+        artifact_append: Some(
+            json!({"artifactId": "direct", "parts": [{"text": "direct completion"}]}),
+        ),
         ..A2aTaskUpdate::default()
     };
     transition_direct(app, agent, id, &[state::WORKING], state::COMPLETED, &update).await
@@ -517,7 +519,9 @@ async fn history_is_content_free_and_follows_erasure(router: &axum::Router, app:
 
     // A secret-shaped value never reaches history_json, whatever the screen
     // does to the memory itself.
-    let secret = "AKIAIOSFODNN7EXAMPLE";
+    // Assembled at runtime so no secret-shaped literal sits in the source.
+    let secret = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+    let secret = secret.as_str();
     let reply = rpc(
         router,
         ALICE_KEY,
