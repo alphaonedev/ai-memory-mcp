@@ -338,7 +338,7 @@ All seven judges converged on the same core items (7–10 each); consolidated in
 | Row | Item | Size | Depends on | Tracking |
 |---|---|---|---|---|
 | R1 | Assessment and mapping document (`docs/research/arxiv-2610.39790-assessment.md`) | S | none | #8458 (this change) |
-| R2 | #6043 consolidation benchmark, deterministic CI arm (existing `ConsolidationPass`, counted stub LLM, seeded copy store; pins shrink percent and LLM call count; rollback restores 100 percent of originals byte-identically) | M | counted-stub precedent in `benchmarks/longmemeval_reflection/runner.rs` | #8458, #6043 |
+| R2 | #6043 consolidation benchmark, deterministic CI arm (existing `ConsolidationPass`, counted stub LLM, seeded copy store; pins shrink percent and LLM call count; rollback restores 100 percent of originals byte-identically) | M | none (precedent: counted stub in `benchmarks/longmemeval_reflection/runner.rs`) | #8458, #6043 |
 | R3 | #6043 operator arm (real pinned LLM, fixed seed, outside CI; shrinkage, R@5 and R@10, QA accuracy before and after, LLM calls, wall time, rollback entries as separate metrics) | S | R2 | #8458, #6043 |
 | R4 | LoCoMo harness on the published protocol (R@k and QA scored separately, k sweep) | M | R2 | #8458, [#8461](https://github.com/alphaonedev/ai-memory-mcp/issues/8461) |
 | R5 | Fused dual-store recall experiment (opt-in, default off, read-only union of `recall_hybrid` and `kg_query`) | M | R4 | #8458, [#8462](https://github.com/alphaonedev/ai-memory-mcp/issues/8462) |
@@ -430,7 +430,7 @@ Recorded per the synthesis rules (majority-REJECT or explicit descope with reaso
 - Blundin, D. 2026. Swarm/hive groupthink via shared memory (5,000 same-DNA agents, cascade cost). https://x.com/DaveBlundin/status/2092731291087069433 — tracked as #3266 / w8.
 - Wang, M.; Luo, H.; Xu, Z.; Cui, Z.; Xu, H.; Yang, Q.; Fang, J.; Fang, J.; Zhang, N. 2026. *MemTrapBench: Benchmarking Cognitive Traps in LLM Memory Use.* arXiv:2608.20202. Code/data: https://github.com/zjunlp/MemTrapBench (unreleased at time of writing; the w5 adapter fails closed on unknown formats).
   - Short cite for code comments (verbatim, SSOT): `MemTrapBench (Wang et al. 2026, arXiv:2608.20202)`
-- Gupta, Han, Madrigal Diaz, Chen, Das, Ruehle, Rajmohan (Microsoft). 2026. *Long-Term Agent Memory through Complementary Curation and Consolidation.* arXiv:2610.39790. https://arxiv.org/abs/2610.39790 — tracked as #8458 / w9; assessment in [`research/arxiv-2610.39790-assessment.md`](research/arxiv-2610.39790-assessment.md).
+- Gupta, A.; Han, D.; Madrigal Diaz, D.; Chen, W.-N.; Das, M.; Rühle, V.; Rajmohan, S. (Microsoft). 2026. *Long-Term Agent Memory through Complementary Curation and Consolidation.* arXiv:2610.39790. https://arxiv.org/abs/2610.39790 — tracked as #8458 / w9; assessment in [`research/arxiv-2610.39790-assessment.md`](research/arxiv-2610.39790-assessment.md).
 - Process record: 7 workstream drafts + 21 adversarial ballots (3 lenses × 7 workstreams: north-star/integrity, code-grounding, trap-mitigation/claims-truth), all REVISE, all REQUIRED-CHANGES applied above; produced by the ox-alpha roadmap lab, 2026-08-23, synthesized and reviewed by Fable 5. Lane artifacts: `.local-runs/ox-c9-{rmdraft,rmvote,rmauthor}/` (not shipped).
 - #3266 3×7 vote (21 records + R1–R6 consolidation): https://github.com/alphaonedev/ai-memory-mcp/issues/3266#issuecomment-5433563173 ; folded into this document from https://github.com/alphaonedev/ai-memory-mcp/issues/3257#issuecomment-5433573635 .
 
