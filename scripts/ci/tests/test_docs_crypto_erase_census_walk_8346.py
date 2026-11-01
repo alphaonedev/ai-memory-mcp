@@ -311,13 +311,19 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   quoted empty key (`""`) stays valid.
 * One copy of the non-ASCII check, in the scope the test pins: an AST scan of every module function, every method of
   a module class that is not a TestCase (`Census.__init__` included) and the module source with the test class and
-  `reject_unicode_space` cut out (module constants included). It refuses any use of `ord`, any `.isascii`, any
-  comparison against the integer 127 or 128 in any base, a `'ascii'` constant and a string holding U+007F, U+0080 or an
-  escape of either; self-check rows prove each spelling is caught in a function, in `Census.__init__` and in a constant.
+  `reject_unicode_space` cut out (module constants included). It refuses any use of `ord` (name or import alias),
+  any `.isascii` or an `isascii` string, any integer constant 127 or 128 in any base, a right shift by 7, `len` of an
+  encoded value, a string constant that names the ASCII codec (any alias `codecs.lookup` resolves to it), holds
+  `-~` or holds U+007F or U+0080 or an escape of either (`\\x7f`, `\\u0080`, `\\U00000080`, the octal `\\177` and
+  `\\200`, `\\N{DELETE}`); the one legal DEL, the `KEY_CONTROL` class of a quoted TOML key, is exempt. Self-check rows
+  prove each spelling is caught in a function, in `Census.__init__` and in a constant. A spelling the scan does not
+  list is covered by a behavioural test: with `reject_unicode_space` switched off no reader refuses U+00A0 or U+3000
+  in the 16 rows (8 files x 2 characters), so a private refusal of any spelling turns the test red.
 * Reader list: `masked_ascii_source` and the module list name `reject_rebinding` (mod.rs, the first reader
   `Census.__init__` runs).
 """
 import ast
+import codecs
 import contextlib
 import functools
 import inspect
@@ -5276,11 +5282,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     TREE_FILES_8346 = ("src/encryption/probe_8346.rs", "src/encryption/escrow.rs", "src/encryption/scope/store.rs")
     # (label, code, error text): every shape rustc compiles and the r15 tree reader accepted or named wrongly.
     UNICODE_TREE_SHAPES = (
-        ("trait name with U+200E", "trait Mark\u200eer_8346 {}\n", r"U\+200E"),
-        ("include! path token with U+200F", 'std::\u200finclude!("x_8346.rs");\n', r"U\+200F"),
+        ("trait name with U+200E", "trait Mark\u200eer_8346 {}\n",
+         r"Unicode whitespace, format or bidi character U\+200E"),
+        ("include! path token with U+200F", 'std::\u200finclude!("x_8346.rs");\n',
+         r"Unicode whitespace, format or bidi character U\+200F"),
+        ("trait name with a Cyrillic letter", "trait \u0430_8346 {}\n", r"non-ASCII character U\+0430"),
         ("macro_rules! name with a non-ASCII letter", "macro_rules! m\u00e9_8346 { () => {}; }\n",
          r"non-ASCII character U\+00E9"),
-        ("#[path] attribute with Unicode whitespace", '#[\u200epath = "x_8346.rs"]\nmod y_8346;\n', r"U\+200E"),
+        ("#[path] attribute with Unicode whitespace", '#[\u200epath = "x_8346.rs"]\nmod y_8346;\n',
+         r"Unicode whitespace, format or bidi character U\+200E"),
         ("top-level macro with a non-ASCII path segment", "caf\u00e9::m_8346!{}\n", r"non-ASCII character U\+00E9"),
     )
 
@@ -5330,9 +5340,22 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     census = Census(self.text, overrides=self.tree_overrides(rel, code))
                     self.assertEqual(self.census_signature(census), live)
 
-    # the non-ASCII check exists once, in `reject_unicode_space`; the scan below is an AST walk, so it does not depend on
-    # how a private copy is spelled (r19: the r18 regex missed `< 128`, `<= 127`, `>= 0x80` and `\\u0080`)
-    NON_ASCII_ESCAPE = re.compile(r"\\(?:x7f|x80|u007f|u0080|U0000007f|U00000080)", re.IGNORECASE)
+    # the non-ASCII check exists once, in `reject_unicode_space`; the scan below is an AST walk, so it does not depend
+    # on how a private copy is spelled (r19: the r18 regex missed `< 128`, `<= 127`, `>= 0x80` and `\u0080`; r20: it
+    # missed an octal escape, `len(s.encode())`, `b & 0x80`, `>> 7`, `chr(127)`, an `ord` alias, a codec alias and a
+    # printable range, so the walk flags the constants and calls themselves, not only a comparison)
+    NON_ASCII_ESCAPE = re.compile(
+        r"\\(?:x7f|x80|u007f|u0080|U0000007f|U00000080|0?177|0?200|N\{(?:DELETE|PADDING CHARACTER)\})", re.IGNORECASE)
+
+    @staticmethod
+    def names_ascii_codec(value):
+        """True when the short string `value` is a codec name or alias that resolves to the ASCII codec."""
+        if not 0 < len(value) < 32:
+            return False
+        try:
+            return codecs.lookup(value).name == "ascii"
+        except (LookupError, ValueError):
+            return False
 
     def private_non_ascii_spellings(self, source):
         """Return one label per spelling of a non-ASCII check in the Python source text `source` (docstrings skipped)."""
@@ -5348,17 +5371,27 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id == "ord":
                 found.append("ord")
+            elif isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] in ("ord", "isascii"):
+                found.append("alias-" + node.name)
             elif isinstance(node, ast.Attribute) and node.attr == "isascii":
                 found.append("isascii")
-            elif isinstance(node, ast.Compare):
-                for part in [node.left] + list(node.comparators):
-                    if isinstance(part, ast.Constant) and isinstance(part.value, int) and part.value in (127, 128):
-                        found.append("compare-%d" % part.value)
+            elif (isinstance(node, ast.BinOp) and isinstance(node.op, ast.RShift)
+                  and isinstance(node.right, ast.Constant) and node.right.value == 7):
+                found.append("shift-7")
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "len"
+                  and any(isinstance(arg, ast.Call) and (getattr(arg.func, "attr", None) == "encode"
+                                                         or getattr(arg.func, "id", None) == "bytes")
+                          for arg in node.args)):
+                found.append("len-of-encoded")
+            elif isinstance(node, ast.Constant) and type(node.value) is int and node.value in (127, 128):
+                found.append("int-%d" % node.value)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
                 value = node.value
                 if value == KEY_CONTROL.pattern:
                     continue  # the one legal DEL: the control-character class of a quoted TOML key, not an ASCII check
-                if value.lower() == "ascii" or "\x7f" in value or "\x80" in value or self.NON_ASCII_ESCAPE.search(value):
+                if (value == "isascii" or ("ascii" in value.lower() and len(value) < 32) or "-~" in value
+                        or "\x7f" in value or "\x80" in value or self.NON_ASCII_ESCAPE.search(value)
+                        or self.names_ascii_codec(value)):
                     found.append("constant")
         return found
 
@@ -5384,6 +5417,33 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         sources["<module>"] = ast.unparse(whole)
         return sources
 
+    NON_ASCII_SPACE_8346 = ("\u00a0", "\u3000")
+    NON_ASCII_ROWS_8346 = (RUST_SRC, LIB_SRC, "src/encryption/probe_8346.rs", "src/encryption/escrow.rs",
+                           "src/encryption/scope/store.rs", SCOPE_SRC, "src/test_support.rs", "src/approvals.rs")
+
+    def census_with_code_8346(self, rel, code):
+        """Build the census with `code` appended to the file `rel` (mod.rs and lib.rs through their own override path)."""
+        if rel == RUST_SRC:
+            return Census(self.text + "\n" + code)
+        if rel == LIB_SRC:
+            return Census(self.text, overrides={LIB_SRC: self.lib_mutated("pub mod encryption;\n",
+                                                                            "pub mod encryption;\n" + code)})
+        return Census(self.text, overrides=self.tree_overrides(rel, code))
+
+    def test_no_reader_keeps_a_private_non_ascii_refusal_8346(self):
+        """r20 (security r19 LOW-1): behavioural twin of the AST scan, independent of any spelling. With the shared
+        `reject_unicode_space` switched off, no reader refuses U+00A0 or U+3000 outside a literal, in the 16 rows
+        (8 files x 2 characters); a private copy of the check, however spelled, would still refuse some row."""
+        for rel in self.NON_ASCII_ROWS_8346:
+            for char in self.NON_ASCII_SPACE_8346:
+                code = "fn x_8346() {}" + char + "\n"
+                with self.subTest(rel=rel, char="U+%04X" % ord(char), helper="on"):
+                    with self.assertRaisesRegex(AssertionError, re.escape(rel) + r" has a .*U\+%04X" % ord(char)):
+                        self.census_with_code_8346(rel, code)
+                with self.subTest(rel=rel, char="U+%04X" % ord(char), helper="off"):
+                    with mock.patch.object(sys.modules[__name__], "reject_unicode_space", lambda masked, name: None):
+                        self.census_with_code_8346(rel, code)
+
     def test_every_file_class_reader_calls_the_one_shared_helper_8346(self):
         """r16: no reader keeps a private mask-and-reject sequence; each passes its own file name to the one helper."""
         self.assertIn("masked_ascii_source", globals())
@@ -5399,8 +5459,9 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         whole = inspect.getsource(sys.modules[__name__])
         self.assertEqual(whole.count("[^" + "\\x00-" + "\\x7f]"), 1)
         self.assertIn("[^" + "\\x00-" + "\\x7f]", inspect.getsource(reject_unicode_space))
-        # r19 (code r18 LOW-1, security r18 INFO-1): no private non-ASCII check in any function, any non-TestCase class
-        # method or any module constant, whatever its spelling
+        # r19/r20 (code r18 LOW-1, security r18 INFO-1, code r19 LOW-1, security r19 LOW-1): no private non-ASCII check in
+        # any function, any non-TestCase class method or any module constant in the forms the scan lists (docstring);
+        # `test_no_reader_keeps_a_private_non_ascii_refusal_8346` covers a spelling the scan does not know
         self.assertIn("reject_rebinding", masked_ascii_source.__doc__)
         sources = self.scanned_sources()
         self.assertIn("Census.__init__", sources)
@@ -5423,13 +5484,30 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   "    if any(ord(c) >= 0x80 for c in masked):\n        pass\n",
                   "    if re.search(r'[^\\x00-\\x7F]', masked):\n        pass\n",
                   "    if re.search('[\\u0080-\\U0010ffff]', masked):\n        pass\n",
-                  "    if any(len(c.encode()) > 0x7f for c in masked):\n        pass\n")
+                  "    if any(len(c.encode()) > 0x7f for c in masked):\n        pass\n",
+                  "    from builtins import ord as o\n    if any(o(c) >> 7 for c in masked):\n        pass\n",
+                  "    from builtins import ord as o\n    if any(o(c) > 127 for c in masked):\n        pass\n",
+                  "    if masked.encode('utf-8') != masked.encode('ascii', 'ignore'):\n        pass\n",
+                  "    getattr(masked, 'isascii')()\n",
+                  "    if len(masked.encode()) != len(masked):\n        pass\n",
+                  "    if len(masked.encode('utf-8')) != len(masked):\n        pass\n",
+                  "    if any(b & 0x80 for b in masked.encode()):\n        pass\n",
+                  "    masked.encode('us-ascii')\n", "    masked.encode('ANSI_X3.4-1968')\n",
+                  "    if re.search(r'[^\\0-\\177]', masked):\n        pass\n",
+                  "    if re.search('[^\\N{DELETE}]', masked):\n        pass\n",
+                  "    if any(c > chr(127) for c in masked):\n        pass\n",
+                  "    if max(masked) > chr(127):\n        pass\n",
+                  "    if any(c >= chr(0x80) for c in masked):\n        pass\n",
+                  "    if re.search(r'[^\\t\\n -~]', masked):\n        pass\n",
+                  "    if re.search('[^\\t\\n\\r -~]', masked):\n        pass\n")
         for copy in copies:
             with self.subTest(self_check=copy):
                 self.assertTrue(self.private_non_ascii_spellings(base + copy))
                 self.assertTrue(self.private_non_ascii_spellings(census_base + copy))
         for constant in ("PRIVATE_8346 = re.compile('[\\x80-\\U0010ffff]')\n", "PRIVATE_8346 = re.compile('[\u0080-\U0010ffff]')\n",
-                         "PRIVATE_8346 = 127\nCHECK_8346 = lambda c: c > PRIVATE_8346 or c >= 127\n"):
+                         "PRIVATE_8346 = 127\nCHECK_8346 = lambda c: c > PRIVATE_8346 or c >= 127\n",
+                         "LIMIT_8346 = 0x7f\nCHECK_8346 = lambda c: c > LIMIT_8346\n",
+                         "PRIVATE_8346 = re.compile('[^\\t\\n\\r -~]')\n", "CODEC_8346 = 'us-ascii'\n"):
             with self.subTest(self_check_constant=constant):
                 self.assertTrue(self.private_non_ascii_spellings(sources["<module>"] + "\n" + constant))
         self.assertEqual(self.private_non_ascii_spellings(base), [])
@@ -5656,9 +5734,12 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     def test_round_19_one_copy_scope_is_documented_8346(self):
         """r19: the docstring names the scope the one-copy test pins and makes no claim of every spelling."""
-        for phrase in ("in the scope the test pins", "Census.__init__", "module constants", "an AST scan"):
+        for phrase in ("in the scope the test pins", "Census.__init__", "module constants", "an AST scan",
+                       "the one legal DEL, the `KEY_CONTROL` class of a quoted TOML key, is exempt",
+                       "octal", "ASCII codec", "switched off"):
             self.assertIn(phrase, __doc__)
         self.assertNotIn("every spelling", __doc__)
+        self.assertNotIn("whatever its spelling", __doc__)
 
     def test_round_16_classes_are_documented_and_counted(self):
         """the docstring and CLOSED_CLASSES list the round 16 classes the code enforces (39 after round 16)."""
