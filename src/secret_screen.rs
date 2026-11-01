@@ -228,17 +228,31 @@ fn token_at(content: &str, start: usize) -> &str {
     &content[start..end]
 }
 
+/// True when `head` ends in the tail of an escaped or percent-encoded
+/// delimiter: a backslash escape (`\n`, `\t`, `\r`, `\uXXXX`, `\xXX`) or a
+/// `%XX` code. These end in an ASCII alphanumeric byte (`n`, `D`, ...) yet
+/// delimit the text that follows, so a key after one is a real key (#8452).
+fn ends_with_escaped_delimiter(head: &[u8]) -> bool {
+    let tail = |n: usize| head.get(head.len().checked_sub(n)?..);
+    let hex = |s: &[u8]| s.iter().all(u8::is_ascii_hexdigit);
+    tail(2).is_some_and(|t| matches!(t, b"\\n" | b"\\t" | b"\\r"))
+        || tail(3).is_some_and(|t| t[0] == b'%' && hex(&t[1..]))
+        || tail(4).is_some_and(|t| t[..2] == *b"\\x" && hex(&t[2..]))
+        || tail(6).is_some_and(|t| t[..2] == *b"\\u" && hex(&t[2..]))
+}
+
 /// True when the prefix at byte offset `pfx_start` begins a token: it is the
-/// start of the text or the byte before it is not a word character (ASCII
-/// alphanumeric, `-` or `_`) (#8452). A prefix inside a word (`task-` carries
-/// `sk-`) is never a credential. `=`, `:`, `/`, `+` and `.` stay boundaries
-/// so `KEY=sk-...` and `token: ghp_...` are still caught.
+/// start of the text, the byte before it is not a word character (ASCII
+/// alphanumeric, `-` or `_`), or that byte ends an escaped or percent-encoded
+/// delimiter ([`ends_with_escaped_delimiter`]) (#8452). A prefix inside a
+/// word (`task-` carries `sk-`) is never a credential. `=`, `:`, `/`, `+`
+/// and `.` stay boundaries so `KEY=sk-...` and `token: ghp_...` are still
+/// caught; any non-ASCII byte is a boundary (fail closed).
 fn at_token_boundary(content: &str, pfx_start: usize) -> bool {
-    pfx_start == 0
-        || content
-            .as_bytes()
-            .get(pfx_start - 1)
-            .is_none_or(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+    let head = content.as_bytes().get(..pfx_start).unwrap_or_default();
+    head.last()
+        .is_none_or(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+        || ends_with_escaped_delimiter(head)
 }
 
 /// Redact every `<prefix><token>` whose token clears the length + entropy
@@ -1656,6 +1670,12 @@ mod tests {
             format!("fooghp_{ghp_tail}"),
             format!("xgithub_pat_{ghp_tail}"),
             format!("fooBearer {xai_tail}"),
+            // A hyphen, underscore or digit before the prefix is part of the
+            // word (slug, snake_case, version tag), never a delimiter.
+            format!("grok-xai-{xai_tail}"),
+            format!("build_ghp_{ghp_tail}"),
+            format!("v2sk-{xai_tail}"),
+            format!("9AKIA{aws_tail}"),
         ];
         for text in &cases {
             assert_eq!(
@@ -1687,7 +1707,26 @@ mod tests {
             (format!("Bearer {body}"), KIND_BEARER_TOKEN),
             (aws, KIND_AWS_ACCESS_KEY),
         ];
-        for lead in [" ", "\"", "=", ":", "\n", "("] {
+        // Escaped and percent-encoded delimiters end in an alphanumeric byte but
+        // still delimit: a key after one is a real key (security F1, r1).
+        // The last lead is a non-ASCII letter: fail closed.
+        for lead in [
+            " ",
+            "\"",
+            "=",
+            ":",
+            "\n",
+            "(",
+            "\\n",
+            "\\t",
+            "\\r",
+            "\\u0022",
+            "\\x22",
+            "%3D",
+            "%22",
+            "%2F",
+            "caf\u{e9}",
+        ] {
             for (secret, kind) in &secrets {
                 let text = format!("note{lead}{secret}");
                 assert_eq!(kinds_of(&text), vec![*kind], "lead {lead:?} missed {kind}");
@@ -1698,5 +1737,32 @@ mod tests {
         for (secret, kind) in &secrets {
             assert_eq!(kinds_of(secret), vec![*kind], "start of text missed {kind}");
         }
+    }
+
+    /// Golden pin of the screened output (it feeds the cid and v2 attestation
+    /// preimages): one fixture per boundary class (#8452, security F4).
+    #[test]
+    fn screened_output_golden_per_boundary_class_8452() {
+        let body = seeded_body(7, 40);
+        let ph = "[REDACTED:secret]";
+        let golden = [
+            // start of text, separator, escaped and percent-encoded delimiters
+            (format!("sk-{body}"), ph.to_string()),
+            (format!("note sk-{body}"), format!("note {ph}")),
+            (format!("KEY=ghp_{body}"), format!("KEY={ph}")),
+            (format!("a\\nxai-{body}"), format!("a\\n{ph}")),
+            (format!("a%3Dsk-{body}"), format!("a%3D{ph}")),
+            (
+                format!("a\\u0022github_pat_{body}"),
+                format!("a\\u0022{ph}"),
+            ),
+        ];
+        for (input, want) in &golden {
+            assert_eq!(&redacted_of(input), want, "golden drifted for {input}");
+        }
+        // Mid-word: passes through byte-identical.
+        let mid = format!("task-{body} and fooxai-{body}");
+        assert_eq!(screen(&mid), ScreenOutcome::Clean);
+        assert_eq!(redacted_of(&mid), mid);
     }
 }
