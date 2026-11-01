@@ -373,6 +373,22 @@ All seven judges converged on the same core items (7–10 each); consolidated in
 
 ---
 
+### P2 — w9-arxiv-2610-39790: Long-term memory paper assessment rows (R1-R7) — #8458
+
+**Source:** arXiv 2610.39790 (Gupta et al., Microsoft, 2026). Tracked by [#8458](https://github.com/alphaonedev/ai-memory-mcp/issues/8458); decision record `3-agent vote (6def5ab6)`, unanimous PARTIAL / EXPERIMENT-FIRST / ROADMAP. The full mapping, the rejected mechanisms (LLM DELETE, UMAP plus HDBSCAN) and the acceptance criteria are in [`research/arxiv-2610.39790-assessment.md`](research/arxiv-2610.39790-assessment.md). Nothing in v1.0.0 GA scope changes. Every default stays as shipped; each experiment is flag-gated and default off until a measured result exists, per the measurement rule below. No row claims an ai-memory performance figure.
+
+| Row | Item | Size | Depends on | Tracking |
+|---|---|---|---|---|
+| R1 | Assessment and mapping document (`docs/research/arxiv-2610.39790-assessment.md`) | S | none | #8458 (this change) |
+| R2 | #6043 consolidation benchmark, deterministic CI arm (existing `ConsolidationPass`, counted stub LLM, seeded copy store; pins shrink percent and LLM call count; rollback restores 100 percent of originals byte-identically) | M | counted-stub precedent in `benchmarks/longmemeval_reflection/runner.rs` | #8458, #6043 |
+| R3 | #6043 operator arm (real pinned LLM, fixed seed, outside CI; shrinkage, R@5 and R@10, QA accuracy before and after, LLM calls, wall time, rollback entries as separate metrics) | S | R2 | #8458, #6043 |
+| R4 | LoCoMo harness on the published protocol (R@k and QA scored separately, k sweep) | M | R2 | #8458; implementation issue to be linked |
+| R5 | Fused dual-store recall experiment (opt-in, default off, read-only union of `recall_hybrid` and `kg_query`) | M | R4 | #8458; implementation issue to be linked |
+| R6 | `cosine_threshold` 0.70, 0.75, 0.85 by minimum cluster size 2, 3, 5 sweep; defaults change only on evidence | S | R2 | #8458; implementation issue to be linked |
+| R7 | Derived tuple index plus second recall channel (model-fingerprinted, rebuildable, default off until at least 3 points gain with no integrity regression) | L | R4 | #8458; implementation issue to be linked |
+
+**Non-goals:** no LLM DELETE verb, no new clustering crate, no change to any default configuration, no migration.
+
 ## Measurement — the roadmap's own acceptance gate
 
 The paper's discipline applies to us: **no mechanism in this roadmap may be claimed to mitigate anything until measured.**
