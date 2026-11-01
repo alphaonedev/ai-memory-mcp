@@ -5975,7 +5975,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   "    import operator\n    if any(operator.gt(c, '~') for c in masked):\n        pass\n",
                   "    if any(b >= bytes.fromhex('80')[0] for b in masked.encode()):\n        pass\n",
                   "    if masked.encode('utf-8') != masked.encode('cp1252', 'ignore'):\n        pass\n",
-                  # r25 follow-up: an octal class, a \\u class in raw text, and a bytes([n]) compare
+                  # r25 (second pass): an octal class, a \\u class in raw text, and a bytes([n]) compare
                   "    re.search(rb'[\\300-\\377]', masked.encode())\n", "    re.search(r'[\\u00a0-\\uffff]', masked)\n",
                   "    if masked.encode() > bytes([200]):\n        pass\n")
         for copy in copies:
