@@ -316,9 +316,13 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   encoded value, a string constant that names the ASCII codec (any alias `codecs.lookup` resolves to it), holds
   `-~` or holds U+007F or U+0080 or an escape of either (`\\x7f`, `\\u0080`, `\\U00000080`, the octal `\\177` and
   `\\200`, `\\N{DELETE}`); the one legal DEL, the `KEY_CONTROL` class of a quoted TOML key, is exempt. Self-check rows
-  prove each spelling is caught in a function, in `Census.__init__` and in a constant. A spelling the scan does not
-  list is covered by a behavioural test: with `reject_unicode_space` switched off no reader refuses U+00A0 or U+3000
-  in the 16 rows (8 files x 2 characters), so a private refusal of any spelling turns the test red.
+  prove each spelling is caught in a function, in `Census.__init__` and in a constant. It also refuses `ascii`,
+  `re.ASCII`, `re.A`, an inline `(?a` flag, `string.ascii_letters`, `ascii_lowercase`, `ascii_uppercase`,
+  `printable` and `isidentifier` (name, attribute or import). A spelling the scan does not list is covered by a
+  behavioural test: with `reject_unicode_space` switched off no reader refuses U+00A0, U+3000, U+0430 or U+00E9 in
+  the 32 rows (8 files x 4 characters, the first two in a whitespace position and the last two inside an
+  identifier), and the rows reach all 10 readers, so a private refusal of one of those characters in either position
+  turns the test red; a refusal scoped to one shape (a `use` path, an attribute) is covered only by the scan.
 * Reader list: `masked_ascii_source` and the module list name `reject_rebinding` (mod.rs, the first reader
   `Census.__init__` runs).
 """
@@ -2270,7 +2274,10 @@ def toml_expand(path, value, entries, where):
             kv = toml_split(pair, "=", "%s inline table" % where)
             if len(kv) < 2:
                 raise AssertionError("%s: an inline table entry without `=`: %r" % (where, pair[:60]))
-            toml_expand(path + toml_dotted(kv[0], where), "=".join(kv[1:]).strip(), entries, where)
+            if len(kv) > 2:
+                raise AssertionError("%s: a TOML line holds a second `=` outside quotes, tomllib and cargo refuse it: "
+                                     "%r" % (where, pair[:60]))
+            toml_expand(path + toml_dotted(kv[0], where), kv[1].strip(), entries, where)
 
 
 def merge_toml(base, extra):
@@ -2332,8 +2339,11 @@ def toml_entries(text, where):
         kv = toml_split(line, "=", where)
         if len(kv) < 2:
             raise AssertionError("%s: a line that is neither a header nor `key = value`: %r" % (where, line[:60]))
+        if len(kv) > 2:
+            raise AssertionError("%s: a TOML line holds a second `=` outside quotes, tomllib and cargo refuse it: %r"
+                                 % (where, line[:60]))
         fresh = []
-        toml_expand(table + toml_dotted(kv[0], where), "=".join(kv[1:]).strip(), fresh, where)
+        toml_expand(table + toml_dotted(kv[0], where), kv[1].strip(), fresh, where)
         for path, _ in fresh:
             if path in seen_keys:
                 raise AssertionError("%s has the key `%s` twice in one table: cargo rejects a duplicate key, and a "
@@ -5347,6 +5357,11 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     NON_ASCII_ESCAPE = re.compile(
         r"\\(?:x7f|x80|u007f|u0080|U0000007f|U00000080|0?177|0?200|N\{(?:DELETE|PADDING CHARACTER)\})", re.IGNORECASE)
 
+    # r21: names of the standard library that restrict a regex, a string class or a token to ASCII; a private non-ASCII
+    # refusal limited to identifier tokens is spelled with one of them (`re.ASCII`, `string.ascii_letters`, `isidentifier`)
+    ASCII_NAMES_8346 = frozenset(("isascii", "ASCII", "ascii_letters", "ascii_lowercase", "ascii_uppercase",
+                                  "printable", "isidentifier"))
+
     @staticmethod
     def names_ascii_codec(value):
         """True when the short string `value` is a codec name or alias that resolves to the ASCII codec."""
@@ -5369,12 +5384,14 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     skip.add(id(first.value))
         found = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and node.id == "ord":
-                found.append("ord")
-            elif isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] in ("ord", "isascii"):
+            if isinstance(node, ast.Name) and node.id in ("ord", "ascii"):
+                found.append(node.id)
+            elif isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] in self.ASCII_NAMES_8346:
                 found.append("alias-" + node.name)
-            elif isinstance(node, ast.Attribute) and node.attr == "isascii":
-                found.append("isascii")
+            elif isinstance(node, ast.Attribute) and (
+                    node.attr in self.ASCII_NAMES_8346
+                    or (node.attr == "A" and isinstance(node.value, ast.Name) and node.value.id == "re")):
+                found.append(node.attr)
             elif (isinstance(node, ast.BinOp) and isinstance(node.op, ast.RShift)
                   and isinstance(node.right, ast.Constant) and node.right.value == 7):
                 found.append("shift-7")
@@ -5390,6 +5407,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                 if value == KEY_CONTROL.pattern:
                     continue  # the one legal DEL: the control-character class of a quoted TOML key, not an ASCII check
                 if (value == "isascii" or ("ascii" in value.lower() and len(value) < 32) or "-~" in value
+                        or "(?a" in value
                         or "\x7f" in value or "\x80" in value or self.NON_ASCII_ESCAPE.search(value)
                         or self.names_ascii_codec(value)):
                     found.append("constant")
@@ -5417,9 +5435,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         sources["<module>"] = ast.unparse(whole)
         return sources
 
-    NON_ASCII_SPACE_8346 = ("\u00a0", "\u3000")
+    # r21: two characters that are not letters (a whitespace position) and two that are (an identifier position)
+    NON_ASCII_SPACE_8346 = ("\u00a0", "\u3000", "\u0430", "\u00e9")
     NON_ASCII_ROWS_8346 = (RUST_SRC, LIB_SRC, "src/encryption/probe_8346.rs", "src/encryption/escrow.rs",
                            "src/encryption/scope/store.rs", SCOPE_SRC, "src/test_support.rs", "src/approvals.rs")
+    # the readers the rows reach when `reject_unicode_space` is switched off (the 10 that `masked_ascii_source` names)
+    READERS_REACHED_8346 = frozenset((
+        "__init__", "reject_rebinding", "read_lib_whole", "lib_prefix_modules", "local_import_targets",
+        "reject_import_targets", "reject_crate_level", "reject_tree_file", "reject_import_target",
+        "reject_module_file"))
 
     def census_with_code_8346(self, rel, code):
         """Build the census with `code` appended to the file `rel` (mod.rs and lib.rs through their own override path)."""
@@ -5431,18 +5455,29 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         return Census(self.text, overrides=self.tree_overrides(rel, code))
 
     def test_no_reader_keeps_a_private_non_ascii_refusal_8346(self):
-        """r20 (security r19 LOW-1): behavioural twin of the AST scan, independent of any spelling. With the shared
-        `reject_unicode_space` switched off, no reader refuses U+00A0 or U+3000 outside a literal, in the 16 rows
-        (8 files x 2 characters); a private copy of the check, however spelled, would still refuse some row."""
+        """r21 (code r20 LOW-1 and LOW-2, security r20 LOW-1): behavioural twin of the AST scan. The 32 rows are 8 files
+        x 4 characters: U+00A0 and U+3000 after a `{}` (a whitespace position), U+0430 and U+00E9 inside an
+        identifier (`fn x<char>_8346() {}`). With the shared `reject_unicode_space` switched off, no reader refuses any
+        row, and the rows reach each of the 10 readers; a private refusal of one of those four characters, in either
+        position, in any of the 8 files, would refuse some row. A refusal scoped to one shape (a `use` path) is covered
+        only by the AST scan. The row set is pinned, so dropping a file or a character turns the test red."""
+        self.assertEqual(self.NON_ASCII_SPACE_8346, (" ", "　", "а", "é"))
+        self.assertEqual(self.NON_ASCII_ROWS_8346, (
+            "src/encryption/mod.rs", "src/lib.rs", "src/encryption/probe_8346.rs", "src/encryption/escrow.rs",
+            "src/encryption/scope/store.rs", "src/encryption/scope.rs", "src/test_support.rs",
+            "src/approvals.rs"))
+        reached = set()
         for rel in self.NON_ASCII_ROWS_8346:
             for char in self.NON_ASCII_SPACE_8346:
-                code = "fn x_8346() {}" + char + "\n"
+                code = ("fn x%s_8346() {}\n" % char) if char.isalpha() else ("fn x_8346() {}" + char + "\n")
                 with self.subTest(rel=rel, char="U+%04X" % ord(char), helper="on"):
                     with self.assertRaisesRegex(AssertionError, re.escape(rel) + r" has a .*U\+%04X" % ord(char)):
                         self.census_with_code_8346(rel, code)
                 with self.subTest(rel=rel, char="U+%04X" % ord(char), helper="off"):
-                    with mock.patch.object(sys.modules[__name__], "reject_unicode_space", lambda masked, name: None):
+                    with mock.patch.object(sys.modules[__name__], "reject_unicode_space",
+                                           lambda masked, name: reached.add(sys._getframe(2).f_code.co_name)):
                         self.census_with_code_8346(rel, code)
+        self.assertEqual(reached, set(self.READERS_REACHED_8346))
 
     def test_every_file_class_reader_calls_the_one_shared_helper_8346(self):
         """r16: no reader keeps a private mask-and-reject sequence; each passes its own file name to the one helper."""
@@ -5499,7 +5534,17 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   "    if max(masked) > chr(127):\n        pass\n",
                   "    if any(c >= chr(0x80) for c in masked):\n        pass\n",
                   "    if re.search(r'[^\\t\\n -~]', masked):\n        pass\n",
-                  "    if re.search('[^\\t\\n\\r -~]', masked):\n        pass\n")
+                  "    if re.search('[^\\t\\n\\r -~]', masked):\n        pass\n",
+                  "    if re.sub(r'\\w', '', masked) != re.sub(r'\\w', '', masked, flags=re.ASCII):\n        pass\n",
+                  "    if re.findall(r'\\w+', masked) != re.findall(r'(?a)\\w+', masked):\n        pass\n",
+                  "    if re.findall(r'\\w+', masked) != re.findall(r'\\w+', masked, re.A):\n        pass\n",
+                  "    if [w for w in masked.split() if w.isidentifier() and not w.isalpha()]:\n        pass\n",
+                  "    if any(c.isalpha() and c not in string.ascii_letters for c in masked):\n        pass\n",
+                  "    if set(masked) - set(string.ascii_lowercase + string.ascii_uppercase):\n        pass\n",
+                  "    if any(c not in string.printable for c in masked):\n        pass\n",
+                  "    if any(ascii(c) != repr(c) for c in masked):\n        pass\n",
+                  "    if ascii(masked) != repr(masked):\n        pass\n",
+                  "    from re import ASCII as FLAG\n    re.findall(r'\\w+', masked, FLAG)\n")
         for copy in copies:
             with self.subTest(self_check=copy):
                 self.assertTrue(self.private_non_ascii_spellings(base + copy))
@@ -5680,6 +5725,32 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             with self.subTest(manifest=code):
                 self.refused(shown, self.manifest_with(code))
 
+    # r21 (security r20 INFO-2): a line with a second `=` outside quotes and brackets; tomllib refuses every one
+    SECOND_EQUALS_LINES = ("a = 1 = 2", 'edition = "2024" = "2021"', 'paste = "1" = { path = "evil" }',
+                           "x = { a = 1 = 2 }")
+
+    def test_a_toml_line_with_a_second_equals_is_refused_8346(self):
+        """r21: `toml_entries` and `toml_expand` raise a named error on a second `=` outside quotes; a `=` inside a
+        quoted value or an inline table stays valid."""
+        message = r"^Cargo\.toml: a TOML line holds a second `=` outside quotes"
+        for line in self.SECOND_EQUALS_LINES:
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(AssertionError, message):
+                    toml_entries("[package]\n" + line + "\n", MANIFEST)
+        with self.assertRaisesRegex(AssertionError, message):
+            toml_expand((), "{ a = 1 = 2 }", [], MANIFEST)
+        for line in ('a = "x=y"', "a = { b = 1, c = 'x=y' }", 'a = ["x=y"]'):
+            with self.subTest(valid=line):
+                toml_entries("[package]\n" + line + "\n", MANIFEST)
+        try:
+            import tomllib
+        except ImportError:
+            return
+        for line in self.SECOND_EQUALS_LINES:
+            with self.subTest(oracle=line):
+                with self.assertRaises(tomllib.TOMLDecodeError):
+                    tomllib.loads("[package]\n" + line + "\n")
+
     # 46 key spellings with the verdict Python's tomllib gives them (checked live below when tomllib exists)
     TOML_KEY_ORACLE = (
         ("a", True), ("a-b_C9", True), ("1", True), ("-", True), ("_", True), ("a.b", True), (" a . b ", True),
@@ -5734,6 +5805,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     def test_round_19_one_copy_scope_is_documented_8346(self):
         """r19: the docstring names the scope the one-copy test pins and makes no claim of every spelling."""
+        # r21 (code r20 LOW-1, security r20 LOW-1): the behavioural twin's coverage is named exactly
+        for phrase in ("U+0430 or U+00E9", "32 rows (8 files x 4 characters", "reach all 10 readers",
+                       "a refusal scoped to one shape (a `use` path, an attribute) is covered only by the scan",
+                       "`re.ASCII`", "`string.ascii_letters`"):
+            self.assertIn(phrase, __doc__)
+        self.assertNotIn("a private refusal of any spelling", __doc__)
+        self.assertNotIn("however spelled", __doc__)
+        self.assertNotIn("however spelled", type(self).test_no_reader_keeps_a_private_non_ascii_refusal_8346.__doc__)
+        self.assertNotIn("any spelling", type(self).test_no_reader_keeps_a_private_non_ascii_refusal_8346.__doc__)
         for phrase in ("in the scope the test pins", "Census.__init__", "module constants", "an AST scan",
                        "the one legal DEL, the `KEY_CONTROL` class of a quoted TOML key, is exempt",
                        "octal", "ASCII codec", "switched off"):
