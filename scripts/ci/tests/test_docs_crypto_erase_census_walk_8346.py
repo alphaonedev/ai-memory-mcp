@@ -315,7 +315,8 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   any `.isascii` or an `isascii` string, any integer constant 127 or 128 in any base, a right shift by 7, `len` of an
   encoded value, a string constant that names the ASCII codec (any alias `codecs.lookup` resolves to it), holds
   `-~` or holds U+007F or U+0080 or an escape of either (`\\x7f`, `\\u0080`, `\\U00000080`, the octal `\\177` and
-  `\\200`, `\\N{DELETE}`); the one legal DEL, the `KEY_CONTROL` class of a quoted TOML key, is exempt. Self-check rows
+  `\\200`, `\\N{DELETE}`); a bytes constant in any prefix form (b, rb, br in any case, so `rb'[^ -~]'` too) is read
+  as Latin-1 text by the same rule; the one legal DEL, the `KEY_CONTROL` class of a quoted TOML key, is exempt. Self-check rows
   prove each spelling is caught in a function, in `Census.__init__` and in a constant. It also refuses `ascii` (name,
   attribute `builtins.ascii` or import), `re.ASCII`, the attribute `A` on any value (`re.A`, `re.RegexFlag.A`, `R.A`
   after `R = re`), `from re import A`, a subscript or a `getattr` call whose key is the constant `A` or `ASCII`
@@ -334,11 +335,13 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   scan, and only when it is spelled with a token the scan lists.
 * TOML values (r23): `toml_split` honours the backslash escapes of a basic string (`"x\"=\"y"` is one string) and
   refuses a closer that does not match its opener; a value that is empty, a string followed by more text, a bracketed
-  value followed by more text, a bare value that is no boolean, number or date, an empty array item (one trailing comma
+  value followed by more text, a bare value that is no boolean, number or date, a date or time that is out of range
+  (month 13, 30 February, year 0000, hour 24, minute or second 60, an offset above 23:59; the lexical shape alone is not
+  enough), an array that does not close (also when `toml_expand` is called directly), an empty array item (one trailing comma
   is legal), an empty inline-table entry or trailing comma, and an array item holding `=` outside quotes are refused
   with a named error. A valid nested form (`[{ b = 1 }, [2]]`, `[[1], [2]]`) is accepted, as tomllib accepts it; the
-  same errors inside an inline table or array nested in an array are refused. Comparisons with tomllib over 20736
-  distinct generated documents (6 key spellings, 44 values, 34 shapes, 3 contexts) and over their 6912 table-context documents
+  same errors inside an inline table or array nested in an array are refused. Comparisons with tomllib over 24948
+  distinct generated documents (6 key spellings, 53 values, 34 shapes, 3 contexts) and over their 8316 table-context documents
   show 0 accepted-but-invalid and 0 valid-but-refused.
 * Reader list: `masked_ascii_source` and the module list name `reject_rebinding` (mod.rs, the first reader
   `Census.__init__` runs).
@@ -346,6 +349,7 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
 import ast
 import codecs
 import contextlib
+import datetime
 import functools
 import inspect
 import json
@@ -2293,6 +2297,30 @@ TOML_BARE_SCALAR = re.compile(
     r"|[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?)\Z")
 
 
+TOML_DATE_TIME = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[Tt ]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?"
+    r"(?:[Zz]|[+-]([0-9]{2}):([0-9]{2}))?)?\Z")
+TOML_TIME_ONLY = re.compile(r"([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?\Z")
+
+
+def toml_date_time_in_range(value):
+    """False when `value` has the shape of a date, date-time or time but a field is out of range: month 13, 30 February,
+    year 0000, hour 24, minute or second 60, an offset above 23:59. Any other text is not judged here (True)."""
+    match = TOML_DATE_TIME.match(value)
+    try:
+        if match:
+            datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            if match.group(4) is not None:
+                datetime.time(int(match.group(4)), int(match.group(5)), int(match.group(6)))
+            return match.group(7) is None or (int(match.group(7)) <= 23 and int(match.group(8)) <= 59)
+        match = TOML_TIME_ONLY.match(value)
+        if match:
+            datetime.time(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return False
+    return True
+
+
 def toml_check_value(value, where):
     """Raise a named error unless `value` is exactly one TOML value (a string, a bracketed value or a bare scalar)."""
     shown = value[:60]
@@ -2333,6 +2361,9 @@ def toml_check_value(value, where):
     elif not TOML_BARE_SCALAR.match(value):
         raise AssertionError("%s: a TOML bare value is not a boolean, number or date, tomllib and cargo refuse it: %r"
                              % (where, shown))
+    elif not toml_date_time_in_range(value):
+        raise AssertionError("%s: a TOML date or time is out of range (month 13, hour 24 and the like), tomllib and "
+                             "cargo refuse it: %r" % (where, shown))
 
 
 def toml_pair(pair, where, missing="a line that is neither a header nor `key = value`"):
@@ -2374,6 +2405,8 @@ def toml_expand(path, value, entries, where):
     """Append (path, value) and, for an inline table, the entries of its keys (recursively); errors name `where`."""
     entries.append((path, value))
     if value.startswith("["):
+        if not value.endswith("]"):
+            raise AssertionError("%s: a TOML array that does not close: %r" % (where, value[:60]))
         toml_check_array(value, where)
     if value.startswith("{"):
         if not value.endswith("}"):
@@ -5459,7 +5492,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     # missed an octal escape, `len(s.encode())`, `b & 0x80`, `>> 7`, `chr(127)`, an `ord` alias, a codec alias and a
     # printable range, so the walk flags the constants and calls themselves, not only a comparison)
     NON_ASCII_ESCAPE = re.compile(
-        r"\\(?:x7f|x80|u007f|u0080|U0000007f|U00000080|0?177|0?200|N\{(?:DELETE|PADDING CHARACTER)\})", re.IGNORECASE)
+        r"\\(?:x7[ef]|x80|u007[ef]|u0080|U0000007[ef]|U00000080|0?17[67]|0?200|N\{(?:DELETE|PADDING CHARACTER)\})", re.IGNORECASE)
 
     # r21: names of the standard library that restrict a regex, a string class or a token to ASCII; a private non-ASCII
     # refusal limited to identifier tokens is spelled with one of them (`re.ASCII`, `string.ascii_letters`, `isidentifier`)
@@ -5516,7 +5549,8 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         encoded value, the integer 127, 128 or 256 by value (a constant, or a shift, power, product or sum of constants
         and of names bound to them; only the `maxsize=256` keyword of an `lru_cache` call is exempt), an ordering compare
         against a one-character string at or above `~`, and a string constant that names the ASCII codec, an ASCII
-        range, an inline `a` flag or U+007F or U+0080 in any escape.
+        range, an inline `a` flag or U+007E, U+007F or U+0080 in any escape; a bytes constant (every prefix form) is read
+        as Latin-1 text by the same rule.
         """
         tree = ast.parse(textwrap.dedent(source))
         skip = set()
@@ -5550,7 +5584,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   and isinstance(node.args[1], ast.Constant) and node.args[1].value in ("A", "ASCII")):
                 found.append("getattr-A")
             elif (isinstance(node, ast.Compare) and any(isinstance(op, (ast.Lt, ast.Gt, ast.LtE, ast.GtE)) for op in node.ops)
-                  and any(isinstance(part, ast.Constant) and isinstance(part.value, str) and len(part.value) == 1
+                  and any(isinstance(part, ast.Constant) and isinstance(part.value, (str, bytes)) and len(part.value) == 1
                           and ord(part.value) >= 0x7e for part in [node.left] + node.comparators)):
                 found.append("char-compare")  # `c > '\xff'`, `c > '~'`
             elif (isinstance(node, ast.BinOp) and isinstance(node.op, ast.RShift)
@@ -5564,8 +5598,9 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             elif (isinstance(node, (ast.Constant, ast.BinOp)) and id(node) not in cache_sizes
                   and self.folded(node, values) in (127, 128, 256)):
                 found.append("int-%d" % self.folded(node, values))
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
-                value = node.value
+            elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and id(node) not in skip:
+                # r24: a bytes constant (every prefix form: b, rb, br in any case) is read as Latin-1 text by the same rule
+                value = node.value if isinstance(node.value, str) else node.value.decode("latin-1")
                 if value == KEY_CONTROL.pattern:
                     continue  # the one legal DEL: the control-character class of a quoted TOML key, not an ASCII check
                 if (value == "isascii" or ("ascii" in value.lower() and len(value) < 32) or "-~" in value
@@ -5804,7 +5839,12 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   "    functools.partial(print, maxsize=256)\n",
                   "    if any(c > '\\xff' for c in masked):\n        pass\n",
                   "    if any(c > '~' for c in masked):\n        pass\n",
-                  "    if any('\u00ff' < c for c in masked):\n        pass\n")
+                  "    if any('\u00ff' < c for c in masked):\n        pass\n",
+                  # r24 (code r23 LOW-1): a bytes regex is a private refusal too, raw or not, in any prefix case
+                  "    re.search(rb'[\\x80-\\xff]', masked.encode())\n", "    re.search(rb'[^\\t\\n\\r -~]', masked.encode())\n",
+                  "    re.search(rb'[^\\x00-\\x7e]', masked.encode())\n", "    re.search(br'[\\x7f-\\xff]', masked.encode())\n",
+                  "    re.search(b'[^\\t\\n\\r -~]', masked.encode())\n", "    re.search(b'[\\x80-\\xff]', masked.encode())\n",
+                  "    if any(c > b'~' for c in masked.encode()):\n        pass\n")
         for copy in copies:
             with self.subTest(self_check=copy):
                 self.assertTrue(self.private_non_ascii_spellings(base + copy))
@@ -5816,6 +5856,17 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             with self.subTest(self_check_constant=constant):
                 self.assertTrue(self.private_non_ascii_spellings(sources["<module>"] + "\n" + constant))
         self.assertEqual(self.private_non_ascii_spellings(base), [])
+        # r24: every bytes-literal prefix Python accepts, with a raw-text and an escaped body
+        prefixes = ("b", "B", "rb", "Rb", "rB", "RB", "br", "bR", "Br", "BR")
+        for prefix in prefixes:
+            for body in ("[^\\x00-\\x7f]", "[\\x80-\\xff]", "[^ -~]"):
+                copy = "    re.search(%s'%s', masked.encode())\n" % (prefix, body)
+                with self.subTest(bytes_prefix=prefix, body=body):
+                    self.assertTrue(self.private_non_ascii_spellings(base + copy), copy)
+                    self.assertTrue(self.private_non_ascii_spellings(census_base + copy), copy)
+        for legal in ("    token = b'ok_8346'\n", "    token = rb'\\w+'\n", "    token = BR'plain'\n"):
+            with self.subTest(legal_bytes=legal):
+                self.assertEqual(self.private_non_ascii_spellings("def f_8346():\n" + legal), [])
         # r23: the `maxsize=256` of `lru_cache` (bare or through `functools`) is the one legal 256; a flag-free `1 << 7`
         # (a shift that is not a flag value) and a character compare below `~` are not spellings of the check
         for legal in ("@functools.lru_cache(maxsize=256)\ndef f_8346():\n    pass\n",
@@ -6038,6 +6089,12 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         ('a = ["x" "y"]', False), ("a = [[1] [2]]", False), ("a = { b = [1] [2] }", False),
         ("a = { b = 1, }", False), ("a = { , }", False), ("a = { , b = 1 }", False), ("a = { b = 1,, c = 2 }", False),
         ("a = { b = 1 } { c = 2 }", False), ("a = 1 2", False), ("a = true false", False), ("a = 1x", False),
+        # r24 (code r23 LOW-2): the shape of a date is not enough, the fields must be in range as tomllib reads them
+        ("a = 1979-13-01", False), ("a = 1979-02-30", False), ("a = 1979-02-29", False), ("a = 0000-01-01", False),
+        ("a = 1979-05-27T24:00:00Z", False), ("a = 07:60:00", False), ("a = 07:32:60", False), ("a = 24:00:00", False),
+        ("a = 1979-05-27T07:32:00+24:00", False), ("a = 1979-05-27T07:32:00-23:60", False), ("a = [1979-13-01]", False),
+        ("a = { b = 1979-00-10 }", False), ("a = 2000-02-29", True), ("a = 1979-05-27T07:32:00+23:59", True),
+        ("a = 1979-05-27T23:59:59.999Z", True), ("a = [2000-02-29, 23:59:59]", True),
         ("a = 01", False), ("a = xyz", False), ("a = { b = 1 c = 2 }", False), ("a = [{ b = 1 } { c = 2 }]", False))
 
     # a closer that does not match its opener (`[1}`): the brackets balance in count only, `toml_split` refuses it
@@ -6132,6 +6189,17 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     accepted = False
                 self.assertEqual(accepted, valid)
 
+    def test_toml_expand_refuses_an_array_that_does_not_close_8346(self):
+        """r24 (code r23 INFO-1): `toml_expand` is public; called directly it must refuse `[1`, as every `toml_entries` path does."""
+        for text in ("[1", "[1, 2", "[[1]", "[{ b = 1 }", "[", "[1}", "[1)"):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml.*(?:a TOML array that does not close|an unbalanced quote or bracket)"):
+                    toml_expand((), text, [], MANIFEST)
+        entries = []
+        toml_expand(("a",), "[1, [2]]", entries, MANIFEST)
+        self.assertEqual(entries[0], (("a",), "[1, [2]]"))
+        self.assertTrue(toml_date_time_in_range("1979-05-27") and not toml_date_time_in_range("1979-13-01"))
+
     def test_round_17_classes_are_documented_and_counted(self):
         """the docstring and CLOSED_CLASSES list the round 17 class the code enforces (40 in all)."""
         self.assertIn("strict TOML key spellings", CLOSED_CLASSES)
@@ -6160,7 +6228,10 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                        "A second test pins the holder itself", "U+2000 to U+206F",
                        "A valid nested form (`[{ b = 1 }, [2]]`, `[[1], [2]]`) is accepted",
                        "the\n  same errors inside an inline table or array nested in an array are refused",
-                       "20736", "0 accepted-but-invalid and 0 valid-but-refused"):
+                       "a bytes constant in any prefix form", "is read\n  as Latin-1 text by the same rule",
+                       "a date or time that is out of range", "the lexical shape alone is not\n  enough",
+                       "also when `toml_expand` is called directly",
+                       "24948", "0 accepted-but-invalid and 0 valid-but-refused"):
             self.assertIn(phrase, __doc__)
         self.assertNotIn("a private refusal of any spelling", __doc__)
         self.assertNotIn("however spelled", __doc__)
