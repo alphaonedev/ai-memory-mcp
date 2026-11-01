@@ -32,6 +32,8 @@
 //!   `persist_contradiction`).
 //! - `reflection_pass` — empty placeholder for Layer 2 Task L2-1.
 
+#[cfg(all(test, feature = "sal"))]
+mod bench_6043;
 pub(crate) mod candidates;
 pub(crate) mod cluster;
 pub(crate) mod compaction;
