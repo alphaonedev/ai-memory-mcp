@@ -228,17 +228,54 @@ fn token_at(content: &str, start: usize) -> &str {
     &content[start..end]
 }
 
-/// True when `head` ends in the tail of an escaped or percent-encoded
-/// delimiter: a backslash escape (`\n`, `\t`, `\r`, `\uXXXX`, `\xXX`) or a
-/// `%XX` code. These end in an ASCII alphanumeric byte (`n`, `D`, ...) yet
-/// delimit the text that follows, so a key after one is a real key (#8452).
+/// True when `head` ends in `intro` followed by exactly `digits` bytes that
+/// all satisfy `ok`.
+fn ends_with_code(head: &[u8], intro: &[u8], digits: usize, ok: fn(&u8) -> bool) -> bool {
+    head.len()
+        .checked_sub(intro.len() + digits)
+        .and_then(|start| head.get(start..))
+        .and_then(|t| t.strip_prefix(intro))
+        .is_some_and(|rest| rest.iter().all(ok))
+}
+
+/// True when `head` ends in a terminal colour code (SGR: `[`, digits and
+/// `;`, then `m`); the escape byte itself, or its spelled-out form, sits
+/// before the `[` and is not required (fail closed).
+fn ends_with_colour_code(head: &[u8]) -> bool {
+    head.split_last().is_some_and(|(&last, rest)| {
+        last == b'm'
+            && rest
+                .iter()
+                .rposition(|b| !(b.is_ascii_digit() || *b == b';'))
+                .and_then(|i| rest.get(i))
+                == Some(&b'[')
+    })
+}
+
+/// True when `head` ends in the tail of an escaped, percent-encoded,
+/// quoted-printable or colour-coded delimiter. These end in an ASCII
+/// alphanumeric byte (`n`, `D`, `m`, ...) yet delimit the text that follows,
+/// so a key after one is a real key (#8452). Recognised: a backslash and one
+/// of `n t r b f v 0 a e`; a backslash and 1 to 3 octal digits; `\xXX`,
+/// `\uXXXX`, `\UXXXXXXXX`; `%X`, `%XX`, `%25XX`, `%uXXXX`; `=XX` with
+/// upper-case hex; an SGR colour code. A shape with non-hex digits (`%zz`,
+/// `\xzz`) is plain word text.
 fn ends_with_escaped_delimiter(head: &[u8]) -> bool {
-    let tail = |n: usize| head.get(head.len().checked_sub(n)?..);
-    let hex = |s: &[u8]| s.iter().all(u8::is_ascii_hexdigit);
-    tail(2).is_some_and(|t| matches!(t, b"\\n" | b"\\t" | b"\\r"))
-        || tail(3).is_some_and(|t| t[0] == b'%' && hex(&t[1..]))
-        || tail(4).is_some_and(|t| t[..2] == *b"\\x" && hex(&t[2..]))
-        || tail(6).is_some_and(|t| t[..2] == *b"\\u" && hex(&t[2..]))
+    let hex: fn(&u8) -> bool = u8::is_ascii_hexdigit;
+    let octal: fn(&u8) -> bool = |b| (b'0'..=b'7').contains(b);
+    let upper_hex: fn(&u8) -> bool = |b| b.is_ascii_digit() || (b'A'..=b'F').contains(b);
+    let letter: fn(&u8) -> bool = |b| b"ntrbfv0ae".contains(b);
+    ends_with_code(head, b"\\", 1, letter)
+        || (1..=3).any(|n| ends_with_code(head, b"\\", n, octal))
+        || ends_with_code(head, b"\\x", 2, hex)
+        || ends_with_code(head, b"\\u", 4, hex)
+        || ends_with_code(head, b"\\U", 8, hex)
+        || ends_with_code(head, b"%", 1, hex)
+        || ends_with_code(head, b"%", 2, hex)
+        || ends_with_code(head, b"%25", 2, hex)
+        || ends_with_code(head, b"%u", 4, hex)
+        || ends_with_code(head, b"=", 2, upper_hex)
+        || ends_with_colour_code(head)
 }
 
 /// True when the prefix at byte offset `pfx_start` begins a token: it is the
@@ -1676,6 +1713,14 @@ mod tests {
             format!("build_ghp_{ghp_tail}"),
             format!("v2sk-{xai_tail}"),
             format!("9AKIA{aws_tail}"),
+            // Escape-looking shapes that are not escapes (non-hex digits,
+            // an unknown letter) stay word text (round 3, hexany mutant).
+            format!("50%zzsk-{xai_tail}"),
+            format!("a\\xzzxai-{xai_tail}"),
+            format!("a\\uwxyzghp_{ghp_tail}"),
+            format!("a\\qxai-{xai_tail}"),
+            format!("a\\U0000zzzzxai-{xai_tail}"),
+            format!("a=zzsk-{xai_tail}"),
         ];
         for text in &cases {
             assert_eq!(
@@ -1726,6 +1771,30 @@ mod tests {
             "%22",
             "%2F",
             "caf\u{e9}",
+            // Round 3: the rest of the C/JSON escape set, octal and wide
+            // code points, doubly encoded and partial percent codes,
+            // quoted-printable, and terminal colour codes.
+            "\\f",
+            "\\b",
+            "\\0",
+            "\\v",
+            "\\a",
+            "\\e",
+            "\\042",
+            "\\U00000022",
+            "%253D",
+            "%2520",
+            "%u0022",
+            "%3",
+            "=3D",
+            "=20",
+            "\u{1b}[1m",
+            "\u{1b}[0;32m",
+            "\\033[1m",
+            "\\e[1m",
+            "\\x1b[1m",
+            "\\u001b[1m",
+            "[1m",
         ] {
             for (secret, kind) in &secrets {
                 let text = format!("note{lead}{secret}");
@@ -1756,6 +1825,17 @@ mod tests {
                 format!("a\\u0022github_pat_{body}"),
                 format!("a\\u0022{ph}"),
             ),
+            (format!("a\\x22sk-{body}"), format!("a\\x22{ph}")),
+            (format!("caf\u{e9}sk-{body}"), format!("caf\u{e9}{ph}")),
+            (format!("a\\fsk-{body}"), format!("a\\f{ph}")),
+            (format!("a\\042sk-{body}"), format!("a\\042{ph}")),
+            (
+                format!("a\\U00000022sk-{body}"),
+                format!("a\\U00000022{ph}"),
+            ),
+            (format!("a%253Dsk-{body}"), format!("a%253D{ph}")),
+            (format!("a=3Dsk-{body}"), format!("a=3D{ph}")),
+            (format!("\u{1b}[1msk-{body}"), format!("\u{1b}[1m{ph}")),
         ];
         for (input, want) in &golden {
             assert_eq!(&redacted_of(input), want, "golden drifted for {input}");
