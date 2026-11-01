@@ -281,6 +281,9 @@ pub(crate) fn parse_reflect_input(
     } else {
         serde_json::json!({})
     };
+    // #8443 (arXiv 2610.38209): `content_principal` is server-stamped; a
+    // caller-supplied value is dropped on this ingress.
+    crate::role_grounding::strip_content_principal(&mut metadata);
     let caller_depth: Option<i64> = params
         .get(param_names::DEPTH)
         .and_then(serde_json::Value::as_i64);
@@ -459,6 +462,9 @@ pub fn handle_reflect_caller(
     } else {
         serde_json::json!({})
     };
+    // #8443 (arXiv 2610.38209): `content_principal` is server-stamped; a
+    // caller-supplied value is dropped on this ingress.
+    crate::role_grounding::strip_content_principal(&mut metadata);
 
     // v0.7.0 #1325 — caller-asserted depth cap. When the caller passes
     // `depth: N`, the substrate-computed depth (max(source depths) + 1)

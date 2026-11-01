@@ -1163,6 +1163,28 @@ pub fn preserve_update_provenance_keys(
 #[cfg(test)]
 mod tests {
 
+    /// #8443 (arXiv 2610.38209) - `preserve_update_provenance_keys` alone:
+    /// the existing row's `content_principal` wins, and a value only the
+    /// incoming blob carries is dropped (never adopted, never forged).
+    #[test]
+    fn preserve_update_provenance_keys_pins_content_principal_8443() {
+        let key = crate::role_grounding::META_CONTENT_PRINCIPAL;
+        // Row with NO principal: an incoming-only forged value is dropped.
+        let existing = serde_json::json!({"agent_id": "ai:owner"});
+        let incoming = serde_json::json!({"agent_id": "ai:owner", key: "ai:forged"});
+        let merged = super::preserve_update_provenance_keys(&existing, &incoming);
+        assert!(merged.get(key).is_none(), "incoming-only principal kept");
+        // Row WITH a principal: the stored value wins over a different claim.
+        let existing = serde_json::json!({"agent_id": "ai:owner", key: "ai:author"});
+        let incoming = serde_json::json!({"agent_id": "ai:owner", key: "ai:forged"});
+        let merged = super::preserve_update_provenance_keys(&existing, &incoming);
+        assert_eq!(merged.get(key).and_then(|v| v.as_str()), Some("ai:author"));
+        // Row WITH a principal, incoming silent: the stored value is restored.
+        let incoming = serde_json::json!({"agent_id": "ai:owner"});
+        let merged = super::preserve_update_provenance_keys(&existing, &incoming);
+        assert_eq!(merged.get(key).and_then(|v| v.as_str()), Some("ai:author"));
+    }
+
     /// v1.0.0 #3383 — the admin predicate is PURE and fail-closed. These pin
     /// the three refusal arms that make `as_admin` un-forgeable on a surface
     /// with no `AppState`.

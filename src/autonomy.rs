@@ -674,7 +674,10 @@ fn consolidate_cluster(
     }
 
     // #8443 — ground the roles: owner from the store, sources labelled.
-    let (owner, input) = crate::role_grounding::summary_inputs(cluster);
+    // The summary is written under the curator, so the curator is the owner
+    // hint: a foreign single author is labelled, not adopted as the owner.
+    let curator = Some(crate::identity::sentinels::AI_CURATOR);
+    let (owner, input) = crate::role_grounding::summary_inputs_for(cluster, curator);
     let summary = llm.summarize_memories_grounded(owner.as_deref(), &input)?;
     crate::validate::validate_content(&summary)?;
     // Prefix the consolidated title so it never collides with one of

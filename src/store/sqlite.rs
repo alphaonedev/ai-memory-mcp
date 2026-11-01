@@ -567,7 +567,9 @@ impl MemoryStore for SqliteStore {
             // #8443: `content_principal` is server-stamped; a non-substrate
             // caller's own value is dropped before the row is admitted.
             let mut ingress = memory.clone();
-            crate::role_grounding::strip_content_principal(&mut ingress.metadata);
+            if !ctx.keep_server_principal {
+                crate::role_grounding::strip_content_principal(&mut ingress.metadata);
+            }
             db::insert_as(&conn, &ingress, Some(ctx.agent_id.as_str())).map_err(box_err)
         }
     }
@@ -624,7 +626,9 @@ impl MemoryStore for SqliteStore {
                 } else {
                     // #8443: same ingress strip as `store`.
                     let mut ingress = memory.clone();
-                    crate::role_grounding::strip_content_principal(&mut ingress.metadata);
+                    if !ctx.keep_server_principal {
+                        crate::role_grounding::strip_content_principal(&mut ingress.metadata);
+                    }
                     ids.push(db::insert(&conn, &ingress)?);
                 }
             }

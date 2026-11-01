@@ -2423,8 +2423,12 @@ async fn sync_push_write(
     // #8443: a peer may DEMOTE content (a valid foreign `content_principal`
     // replicates faithfully) but never promote it: an `owner` or malformed
     // claim is dropped before any backend sees the row.
+    // A claim naming the row's own agent is replaced by the authenticated peer.
     for memory in &mut body.memories {
-        crate::role_grounding::sanitize_inbound_principal(&mut memory.metadata);
+        crate::role_grounding::sanitize_inbound_principal(
+            &mut memory.metadata,
+            peer_header_owned.as_deref(),
+        );
     }
 
     let state = app.db.clone();

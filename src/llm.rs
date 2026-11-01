@@ -2365,7 +2365,7 @@ impl OllamaClient {
         owner: Option<&str>,
         memories: &[(String, String)],
     ) -> Result<String> {
-        let prompt = render_summarize_prompt(owner, memories);
+        let prompt = render_summarize_prompt(owner, memories)?;
         let response = self.generate_async(&prompt, None).await?;
 
         crate::validate::validate_content(&response)?;

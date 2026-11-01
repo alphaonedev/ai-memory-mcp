@@ -735,7 +735,9 @@ trust-all reads.
   (#8443, arXiv 2610.38209, role grounding). Always derived by the server from the
   authenticated caller, never read from a request: any caller-supplied value is
   stripped at every ingress (MCP store, HTTP create, SAL store and store_batch,
-  federation receive may only demote to a valid non-owner principal). The value is
+  federation receive may only demote to a valid non-owner principal, and a claim
+  naming the receiver, the row's own author or the share target is replaced by the
+  publisher, else `unknown`). The value is
   the publisher agent id, or `unknown`, stamped on content that did not come from
   the owner's own turn (`memory_share` copies, `memory_notify` deliveries,
   untrusted `import`, mined transcripts, atoms of foreign sources); `mixed` after a

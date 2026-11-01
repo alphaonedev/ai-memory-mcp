@@ -31,9 +31,31 @@ capabilities:
    victim owner's. Defence at memory FORMATION: every formation prompt carries a
    pinned role-grounding block naming the owner (system-resolved, never read from
    content), and foreign content is stamped `metadata.content_principal`, derived
-   from the authenticated caller (a caller-supplied value is stripped at every
-   ingress), labelled in every formation input and shown in recall. A guard test
-   pins the prompt list.
+   from the authenticated caller, labelled in every formation input and shown in
+   recall. The rules, each pinned by a test:
+   - A caller-supplied `content_principal` is stripped at every ingress that
+     does not keep a claim (store, batch, update, capture_turn, reflect,
+     entity_register, notify). Ingress that keeps a claim (HTTP and CLI import,
+     federation receive, share) may only DEMOTE: a claim may name a third party
+     the publisher vouches for, never the receiving owner, the row's own author
+     or the share target; such a claim is replaced by the publisher, else
+     `unknown`. The HTTP import handler re-derives the value and marks its store
+     call with a trusted-import flag so the SAL strip keeps that server value.
+   - A background pass (consolidate, compaction, reflection, persona) passes
+     the id it writes under as the owner hint, so a cluster written by one
+     foreign author folds to that author instead of the writer.
+   - Each formation prompt that embeds foreign text binds its frame header,
+     label line and closing marker to a per-prompt random 16-hex token; a
+     source body that reproduces a frame header, label or closing marker lacks
+     the token and stays inside its own frame. A token that occurs in the text
+     is regenerated once, then the pass is refused.
+   - One entry for new ingress: derive the value with
+     `ContentPrincipal::from_caller` and write it with `stamp_content_principal`
+     (or `stamp_content_principal_for_receiver` where a claim is kept), using
+     the single `META_CONTENT_PRINCIPAL` constant; skip a self-send.
+   Guard tests pin the prompt list and the prompt-render class shapes. This is a
+   formation-time mitigation: the label and boundary reduce, and do not remove,
+   the chance that a model follows quoted instructions.
 4. **Compromised peer** holding valid mTLS cert. Under the default
    posture they can author only **as themselves**: the peer-attestation
    layer re-stamps inbound rows with the authenticated peer identity, and

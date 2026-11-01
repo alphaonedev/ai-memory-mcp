@@ -127,17 +127,33 @@ fn non_test_region(text: &str) -> String {
     out
 }
 
-/// `(name, body)` for every `const NAME: &str = ...;` in `text`.
+/// The item keywords whose string items are scanned: `const` and `static`
+/// both declare a string item a prompt can live in.
+const ITEM_KEYWORDS: [&str; 2] = ["const ", "static "];
+
+/// The string types a prompt item can be declared with.
+const STR_TYPES: [&str; 2] = ["&str", "&'static str"];
+
+/// `(name, body)` for every `const`/`static` item of type `&str` or
+/// `&'static str` in `text`.
 fn str_consts(text: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let mut rest = text;
-    while let Some(i) = rest.find("const ") {
-        let after = &rest[i + "const ".len()..];
+    while let Some((i, kw)) = ITEM_KEYWORDS
+        .iter()
+        .filter_map(|k| rest.find(k).map(|i| (i, *k)))
+        .min_by_key(|(i, _)| *i)
+    {
+        let after = &rest[i + kw.len()..];
         rest = after;
-        let Some(colon) = after.find(": &str") else {
+        let Some(colon) = after.find(':') else {
             continue;
         };
-        let name = after[..colon].trim();
+        let ty = after[colon + 1..].trim_start();
+        if !STR_TYPES.iter().any(|t| ty.starts_with(t)) {
+            continue;
+        }
+        let name = after[..colon].trim().trim_start_matches("mut ").trim();
         if name.is_empty()
             || !name
                 .chars()
@@ -171,7 +187,7 @@ fn is_exempt(file: &Path, name: &str) -> bool {
     let p = file.to_string_lossy().replace('\\', "/");
     EXEMPT
         .iter()
-        .any(|(suffix, n, _)| *n == name && p.ends_with(&format!("src/{suffix}")))
+        .any(|(suffix, n, _)| *n == name && p.ends_with(&format!("/src/{suffix}")))
 }
 
 fn is_prompt_bearing(name: &str, body: &str) -> bool {
@@ -284,6 +300,69 @@ fn non_test_region_strips_only_the_test_module_8443() {
     assert!(!kept.contains("const B"));
     let single = "#[cfg(test)]\nconst T: &str = \"t\";\nconst D: &str = \"d\";\n";
     assert!(non_test_region(single).contains("const D"));
+}
+
+fn names_of(text: &str) -> Vec<String> {
+    str_consts(text).into_iter().map(|(n, _)| n).collect()
+}
+
+/// #8443 round 3 (sec LOW-1): one self-test per declaration shape, so a prompt
+/// declared as a `static`, with an explicit `'static` lifetime, or with a
+/// visibility modifier cannot slip past the scan.
+#[test]
+fn str_consts_finds_every_declaration_shape_8443() {
+    let shapes = [
+        ("const A_PROMPT: &str = \"x\";", "A_PROMPT"),
+        ("const B_PROMPT: &'static str = \"x\";", "B_PROMPT"),
+        ("static C_PROMPT: &str = \"x\";", "C_PROMPT"),
+        ("static D_PROMPT: &'static str = \"x\";", "D_PROMPT"),
+        ("pub const E_SYSTEM: &str = \"x\";", "E_SYSTEM"),
+        (
+            "pub(crate) static F_SYSTEM: &'static str = \"x\";",
+            "F_SYSTEM",
+        ),
+        ("const G_PROMPT: &str = r#\"x\"#;", "G_PROMPT"),
+        (
+            "const H_PROMPT: &'static str = concat!(\n\"x\",\n);",
+            "H_PROMPT",
+        ),
+    ];
+    for (text, name) in shapes {
+        assert_eq!(
+            names_of(text),
+            vec![name.to_string()],
+            "shape not found: {text}"
+        );
+    }
+    // Non-string items and fn signatures are not prompt items.
+    assert_eq!(
+        names_of("const N: usize = 4;\nfn f(x: &str) -> &str { x }"),
+        Vec::<String>::new()
+    );
+}
+
+/// #8443 round 3 (code INFO-I): an exemption is keyed by file AND name, so a
+/// same-named const in a different file is still reported.
+#[test]
+fn exempt_is_keyed_by_file_and_name_8443() {
+    let name = "QUERY_EXPANSION_PROMPT";
+    assert!(is_exempt(Path::new("/repo/src/llm.rs"), name));
+    assert!(
+        !is_exempt(Path::new("/repo/src/other.rs"), name),
+        "other file is not exempt"
+    );
+    assert!(
+        !is_exempt(Path::new("/repo/src/deep/llm.rs"), name),
+        "a nested llm.rs is not exempt"
+    );
+    assert!(
+        !is_exempt(Path::new("/repo/mysrc/llm.rs"), name),
+        "a look-alike dir is not exempt"
+    );
+    assert!(!is_exempt(
+        Path::new("/repo/src/llm.rs"),
+        "SOME_OTHER_PROMPT"
+    ));
 }
 
 /// Security L1 class lock: an `AutonomyLlm` impl that overrides

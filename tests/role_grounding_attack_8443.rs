@@ -18,12 +18,12 @@ use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::db;
-use ai_memory::mcp::handle_recall;
 use ai_memory::mcp::share::handle_share;
+use ai_memory::mcp::{handle_capture_turn, handle_entity_register, handle_recall, handle_reflect};
 use ai_memory::models::{LifecycleState, Memory, MemoryKind, Tier};
 use ai_memory::role_grounding::{
-    ContentPrincipal, PrincipalError, fold_metadata, restamp_untrusted_import,
-    sanitize_inbound_principal, strip_content_principal,
+    ContentPrincipal, PrincipalError, effective_principals, fold_metadata,
+    restamp_untrusted_import, sanitize_inbound_principal, strip_content_principal,
 };
 use ai_memory::toon::memories_to_toon;
 use ai_memory::validate::{RESERVED_AGENT_IDS, validate_agent_id};
@@ -294,11 +294,11 @@ fn import_of_unattributed_rows_is_unknown_8443() {
 #[test]
 fn federation_receive_may_demote_but_never_promote_8443() {
     let mut demote = json!({"agent_id": OWNER, KEY: ATTACKER});
-    assert!(!sanitize_inbound_principal(&mut demote));
+    assert!(!sanitize_inbound_principal(&mut demote, Some(ATTACKER)));
     assert_eq!(demote[KEY], json!(ATTACKER));
     for forged in [json!("owner"), json!("mixed "), json!(3), json!("")] {
         let mut meta = json!({"agent_id": OWNER, KEY: forged});
-        assert!(sanitize_inbound_principal(&mut meta));
+        assert!(sanitize_inbound_principal(&mut meta, Some(ATTACKER)));
         assert!(meta.get(KEY).is_none());
     }
 }
@@ -573,6 +573,279 @@ fn owner_rows_have_an_empty_principal_cell_in_recall_8443() {
         toon.lines()
             .any(|h| h.starts_with("memories[") && h.contains(KEY))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3, security MEDIUM-1: a claim naming the receiver is never kept
+// ---------------------------------------------------------------------------
+
+#[test]
+fn import_claim_naming_the_receiver_falls_back_to_the_publisher_8443() {
+    // The importer (OWNER) re-imports a bundle published by ATTACKER whose rows
+    // claim `content_principal = OWNER`: the claim is a promotion.
+    assert_eq!(
+        restamped(Some(json!(OWNER)), Some(ATTACKER), OWNER).as_deref(),
+        Some(ATTACKER),
+        "a claim naming the importer is replaced by the bundle publisher"
+    );
+    assert_eq!(
+        restamped(Some(json!(OWNER)), None, OWNER).as_deref(),
+        Some("unknown"),
+        "no publisher to fall back to: unknown, never the owner"
+    );
+    assert_eq!(
+        restamped(Some(json!("ai:third")), Some(ATTACKER), OWNER).as_deref(),
+        Some("ai:third"),
+        "a third party the publisher vouches for survives (demotion)"
+    );
+}
+
+#[test]
+fn federation_claim_naming_the_rows_agent_is_replaced_by_the_peer_8443() {
+    // The row names `ai:victim` as its author AND as its principal: only the
+    // peer can vouch, so the claim becomes the authenticated peer.
+    let mut meta = json!({"agent_id": "ai:victim", KEY: "ai:victim"});
+    sanitize_inbound_principal(&mut meta, Some(ATTACKER));
+    assert_eq!(meta[KEY], json!(ATTACKER));
+    // The peer is the row's own agent: nobody to demote to, so unknown.
+    let mut meta = json!({"agent_id": ATTACKER, KEY: ATTACKER});
+    sanitize_inbound_principal(&mut meta, Some(ATTACKER));
+    assert_eq!(meta[KEY], json!("unknown"));
+    // A third party stays.
+    let mut meta = json!({"agent_id": ATTACKER, KEY: "ai:third"});
+    sanitize_inbound_principal(&mut meta, Some(ATTACKER));
+    assert_eq!(meta[KEY], json!("ai:third"));
+}
+
+fn attacker_row_claiming(conn: &Connection, claim: &str) -> String {
+    // A distinct title per claim: a share copy upserts on (namespace, title).
+    let title = format!("claimed-{claim}");
+    let mut src = make_mem(ATTACKER, "attacker/feed", &title, TOOL_POST);
+    src.metadata = json!({"agent_id": ATTACKER, KEY: claim});
+    db::insert(conn, &src).expect("insert attacker post")
+}
+
+fn share_to_owner(conn: &Connection, src_id: &str) -> String {
+    let out = handle_share(
+        conn,
+        &json!({"source_memory_id": src_id, "target_agent_id": OWNER}),
+        Some(ATTACKER),
+    )
+    .expect("share succeeds");
+    out["shared_memory_id"]
+        .as_str()
+        .expect("shared id")
+        .to_string()
+}
+
+#[test]
+fn share_claim_naming_the_target_is_replaced_by_the_sharer_8443() {
+    let conn = fresh_conn();
+    let src = attacker_row_claiming(&conn, OWNER);
+    let shared = share_to_owner(&conn, &src);
+    assert_eq!(
+        principal_of(&conn, &shared).as_deref(),
+        Some(ATTACKER),
+        "a stored claim naming the share target must not survive"
+    );
+    let src = attacker_row_claiming(&conn, "ai:third");
+    let shared = share_to_owner(&conn, &src);
+    assert_eq!(
+        principal_of(&conn, &shared).as_deref(),
+        Some("ai:third"),
+        "a third-party claim is a demotion and survives"
+    );
+}
+
+#[test]
+fn a_marker_equal_to_the_owner_reads_as_unknown_8443() {
+    let meta = json!({"agent_id": ATTACKER, KEY: OWNER});
+    let (_, principals) = effective_principals(&[&meta], Some(OWNER));
+    let got = principals[0].as_ref().map(ContentPrincipal::as_str);
+    assert_eq!(
+        got,
+        Some("unknown"),
+        "marker == owner is never owner content"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3, security MEDIUM-2 / code MEDIUM B: capture_turn, reflect and
+// entity_register drop a caller-supplied principal
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capture_turn_drops_a_caller_supplied_principal_8443() {
+    let conn = fresh_conn();
+    let resp = handle_capture_turn(
+        &conn,
+        &json!({
+            "host_session_id": "rga-session",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "captured turn",
+            "metadata": {KEY: ATTACKER}
+        }),
+        Some(OWNER),
+    )
+    .expect("capture ok");
+    let id = resp["memory_id"].as_str().expect("memory_id");
+    assert_eq!(
+        principal_of(&conn, id),
+        None,
+        "forged principal survived capture_turn"
+    );
+}
+
+#[test]
+fn reflect_drops_a_caller_supplied_principal_8443() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("reflect.db");
+    let conn = db::open(&db_path).expect("open db");
+    let src = db::insert(&conn, &make_mem(OWNER, "owner/r", "obs", "an observation"))
+        .expect("insert source");
+    let resp = handle_reflect(
+        &conn,
+        &db_path,
+        &json!({
+            "source_ids": [src],
+            "title": "reflection",
+            "content": "a synthesised reflection",
+            "namespace": "owner/r",
+            "agent_id": OWNER,
+            "metadata": {KEY: ATTACKER}
+        }),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("reflect ok");
+    let id = resp["id"].as_str().expect("reflection id");
+    assert_eq!(
+        principal_of(&conn, id),
+        None,
+        "forged principal survived reflect"
+    );
+}
+
+#[test]
+fn entity_register_drops_a_caller_supplied_principal_8443() {
+    let conn = fresh_conn();
+    let resp = handle_entity_register(
+        &conn,
+        &json!({
+            "canonical_name": "Acme Corp",
+            "namespace": "owner/e",
+            "aliases": ["acme"],
+            "metadata": {KEY: ATTACKER}
+        }),
+        Some(OWNER),
+    )
+    .expect("entity_register ok");
+    let id = resp["entity_id"].as_str().expect("entity_id");
+    assert_eq!(
+        principal_of(&conn, id),
+        None,
+        "forged principal survived entity_register"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3, security MEDIUM-3: a background pass folds the foreign author
+// ---------------------------------------------------------------------------
+
+#[test]
+fn substrate_consolidation_of_one_foreign_author_stamps_that_author_8443() {
+    let conn = fresh_conn();
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let row = make_mem(ATTACKER, "tenant/feed", &format!("post {i}"), TOOL_POST);
+        ids.push(db::insert(&conn, &row).expect("insert"));
+    }
+    let merged = db::consolidate(
+        &conn,
+        &ids,
+        "curated",
+        "a curated summary",
+        "tenant/feed",
+        &Tier::Mid,
+        "curator",
+        "ai:curator",
+        true,
+    )
+    .expect("substrate consolidate");
+    assert_eq!(
+        principal_of(&conn, &merged).as_deref(),
+        Some(ATTACKER),
+        "a single foreign author must not be laundered into curator content"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3, code LOW G: the TOON cell, located by header column
+// ---------------------------------------------------------------------------
+
+/// The cells of the data row whose `title` cell equals `title`, plus the
+/// header column names.
+fn toon_row(toon: &str, title: &str) -> (Vec<String>, Vec<String>) {
+    let header = toon
+        .lines()
+        .find(|h| h.starts_with("memories["))
+        .expect("memories header");
+    let inner = &header["memories[".len()..header.rfind("]:").expect("header end")];
+    let cols: Vec<String> = inner.split('|').map(str::to_string).collect();
+    let title_at = cols
+        .iter()
+        .position(|c| c == "title")
+        .expect("title column");
+    let row = toon
+        .lines()
+        .skip_while(|l| !l.starts_with("memories["))
+        .skip(1)
+        .map(|l| l.split('|').map(str::to_string).collect::<Vec<_>>())
+        .find(|cells| cells.get(title_at).is_some_and(|c| c == title))
+        .expect("data row for the title");
+    (cols, row)
+}
+
+#[test]
+fn toon_principal_cell_is_in_the_header_column_8443() {
+    let conn = fresh_conn();
+    let src = make_mem(
+        ATTACKER,
+        "attacker/feed",
+        "digest",
+        "weekly digest quoted post",
+    );
+    let src_id = db::insert(&conn, &src).expect("insert");
+    handle_share(
+        &conn,
+        &json!({"source_memory_id": src_id, "target_agent_id": OWNER}),
+        Some(ATTACKER),
+    )
+    .expect("share");
+    db::insert(
+        &conn,
+        &make_mem(OWNER, "owner/p", "own digest", "weekly digest of my own"),
+    )
+    .expect("insert own");
+    let resp = recall_value(&conn);
+    for compact in [true, false] {
+        let toon = memories_to_toon(&resp, compact);
+        let (cols, foreign) = toon_row(&toon, "digest");
+        let at = cols
+            .iter()
+            .position(|c| c == KEY)
+            .expect("principal column");
+        assert_eq!(
+            foreign[at],
+            ATTACKER.replace(':', "\\:"),
+            "compact={compact}"
+        );
+        let (_, own) = toon_row(&toon, "own digest");
+        assert_eq!(own[at], "", "owner row cell is empty (compact={compact})");
+    }
 }
 
 /// Live-Postgres twin of the consolidate fold (the SAL `consolidate` funnel).

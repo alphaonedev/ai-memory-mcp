@@ -339,7 +339,11 @@ impl<'a> PersonaGenerator<'a> {
         // deterministic without spinning up Ollama.
         // #8443 — a persona is by definition "what the owner prefers", so it
         // is the surface where a foreign quoted preference must never fold in.
-        let (grounded_owner, llm_input) = crate::role_grounding::summary_inputs(&sources);
+        // The persona is written under the curator id, so that id is the
+        // owner hint (a foreign single author is labelled and stamped).
+        let writer = self.agent_id();
+        let (grounded_owner, llm_input) =
+            crate::role_grounding::summary_inputs_for(&sources, Some(&writer));
         let body_md_raw = self
             .llm
             .summarize_memories_grounded(grounded_owner.as_deref(), &llm_input)
@@ -347,7 +351,7 @@ impl<'a> PersonaGenerator<'a> {
         let body_md = render_body_with_footnotes(&body_md_raw, &sources);
 
         let now = Utc::now().to_rfc3339();
-        let agent_id = self.agent_id();
+        let agent_id = writer;
         let title = persona_title(entity_id, version);
         let source_ids: Vec<String> = sources.iter().map(|m| m.id.clone()).collect();
 
@@ -371,7 +375,7 @@ impl<'a> PersonaGenerator<'a> {
             }
         });
         // #8443 — the persona inherits the folded principal of its sources.
-        crate::role_grounding::stamp_folded(&mut metadata, &sources, None);
+        crate::role_grounding::stamp_folded(&mut metadata, &sources, Some(&agent_id));
 
         let mut persona_mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory

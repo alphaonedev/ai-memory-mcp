@@ -10870,9 +10870,11 @@ pub fn consolidate_with_expected_versions(
         // #8443 — whose content the merged row is: owner when every source is
         // owner content (no key), the one publisher when all foreign sources
         // share it, otherwise `mixed`.
-        // The owner is the authenticated consolidator for a tenant call; a
-        // substrate pass has no owner and derives one from the sources.
-        let owner_hint = (!substrate_authored).then_some(consolidator_agent_id);
+        // The formed row is written under the consolidator, so the consolidator
+        // is the owner hint for tenant AND substrate calls: a source written by
+        // anyone else is foreign and its author survives as the folded principal
+        // (a substrate pass no longer launders a single foreign author).
+        let owner_hint = Some(consolidator_agent_id);
         let source_refs: Vec<&serde_json::Value> = source_metas.iter().collect();
         if let Some(folded) = crate::role_grounding::fold_metadata(&source_refs, owner_hint) {
             merged_metadata.insert(
@@ -12504,6 +12506,8 @@ pub fn entity_register(
             serde_json::Value::Object(m) => m.clone(),
             _ => serde_json::Map::new(),
         };
+        // #8443: `content_principal` is server-stamped; a caller value is dropped.
+        meta_map.remove(crate::role_grounding::META_CONTENT_PRINCIPAL);
         meta_map.insert(
             "kind".to_string(),
             serde_json::Value::String(ENTITY_KIND.to_string()),

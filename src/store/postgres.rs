@@ -21229,7 +21229,9 @@ impl MemoryStore for PostgresStore {
             // #8443: `content_principal` is server-stamped; a non-substrate
             // caller's own value is dropped (parity with the sqlite funnel).
             let mut m = memory.clone();
-            crate::role_grounding::strip_content_principal(&mut m.metadata);
+            if !ctx.keep_server_principal {
+                crate::role_grounding::strip_content_principal(&mut m.metadata);
+            }
             stamped_holder = m;
             &stamped_holder
         };
@@ -21718,7 +21720,9 @@ impl MemoryStore for PostgresStore {
                 .iter()
                 .map(|m| {
                     let mut m = m.clone();
-                    crate::role_grounding::strip_content_principal(&mut m.metadata);
+                    if !ctx.keep_server_principal {
+                        crate::role_grounding::strip_content_principal(&mut m.metadata);
+                    }
                     m
                 })
                 .collect::<Vec<_>>();
@@ -23706,6 +23710,18 @@ impl MemoryStore for PostgresStore {
         // keeps the STORED row's agent_id, so the seal must too. Captured
         // before the governance builder consumes `cur_meta`.
         let retained_seal_agent_id = metadata_agent_id_slot(&cur_meta).map(str::to_string);
+        // #8443 - the SQL overlay re-applies only the STORED row's reserved
+        // keys, so a `content_principal` the row never had would survive from
+        // the caller's patch. The principal is server-derived: drop an
+        // incoming-only key (twin of `storage::update_with_expected_version`).
+        let mut patch = patch;
+        if cur_meta
+            .get(crate::role_grounding::META_CONTENT_PRINCIPAL)
+            .is_none()
+            && let Some(m) = patch.metadata.as_mut()
+        {
+            crate::role_grounding::strip_content_principal(m);
+        }
 
         // `content_changed` is true when the patch supplies a title OR
         // content that differs from the stored row. A metadata / tag /
@@ -28201,9 +28217,11 @@ impl MemoryStore for PostgresStore {
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
         // #8443 — folded content principal (sqlite `storage::consolidate` twin).
-        // The owner is the authenticated consolidator for a tenant call; a
-        // substrate pass (`bypass_visibility`) derives one from the sources.
-        let owner_hint = (!ctx.bypass_visibility).then_some(consolidator_agent_id);
+        // The formed row is written under the consolidator, so the consolidator
+        // is the owner hint for tenant AND substrate calls (twin of the sqlite
+        // `storage::consolidate`): a foreign single author survives as the
+        // folded principal.
+        let owner_hint = Some(consolidator_agent_id);
         let source_refs: Vec<&serde_json::Value> = source_metas.iter().collect();
         if let Some(folded) = crate::role_grounding::fold_metadata(&source_refs, owner_hint) {
             merged_metadata.insert(
@@ -33856,6 +33874,8 @@ impl MemoryStore for PostgresStore {
             serde_json::Value::Object(m) => serde_json::Value::Object(m.clone()),
             _ => serde_json::json!({}),
         };
+        // #8443: `content_principal` is server-stamped; a caller value is dropped.
+        crate::role_grounding::strip_content_principal(&mut metadata);
         let meta_map = metadata.as_object_mut().expect("metadata is an object");
         meta_map.insert(
             "kind".to_string(),

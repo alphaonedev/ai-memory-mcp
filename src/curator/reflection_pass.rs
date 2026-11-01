@@ -424,7 +424,10 @@ impl<'a> ReflectionPass<'a> {
         }
 
         // #8443 — ground the roles: owner from the store, sources labelled.
-        let (owner, input) = crate::role_grounding::summary_inputs(cluster);
+        // The reflection is written under the curator id, so that id is the
+        // owner hint (a foreign single author is labelled and stamped).
+        let writer = self.agent_id();
+        let (owner, input) = crate::role_grounding::summary_inputs_for(cluster, Some(&writer));
         let summary_text = self
             .llm
             .summarize_memories_grounded(owner.as_deref(), &input)
@@ -481,7 +484,7 @@ impl<'a> ReflectionPass<'a> {
                     "scope": crate::models::MemoryScope::Collective.as_str(),
                 });
                 // #8443 — a reflection over foreign sources is not owner content.
-                crate::role_grounding::stamp_folded(&mut metadata, cluster, None);
+                crate::role_grounding::stamp_folded(&mut metadata, cluster, Some(&writer));
                 metadata
             },
             reflection_depth: 0,

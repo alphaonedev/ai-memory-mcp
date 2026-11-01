@@ -590,10 +590,21 @@ impl Atomiser {
         let source_principal = principals.into_iter().next().flatten();
         let (grounded_owner, curator_text) = match source_principal.as_ref() {
             None => (store_owner.as_deref(), source.content.clone()),
-            Some(p) => (
-                None,
-                crate::role_grounding::label_source(&source.title, &source.content, Some(p)).1,
-            ),
+            Some(p) => {
+                // The label line carries a per-prompt random boundary the
+                // content cannot know (#8443); a collision refuses.
+                let boundary = crate::role_grounding::pick_boundary(
+                    &[source.title.as_str(), source.content.as_str()],
+                    &mut crate::role_grounding::FrameBoundary::generate,
+                )
+                .map_err(|e| AtomiseError::CuratorFailed(e.to_string()))?;
+                let labelled =
+                    crate::role_grounding::label_source(&source.title, &source.content, Some(p)).1;
+                (
+                    None,
+                    crate::role_grounding::bind_frame_label(&labelled, &boundary),
+                )
+            }
         };
         let atoms = self
             .curator

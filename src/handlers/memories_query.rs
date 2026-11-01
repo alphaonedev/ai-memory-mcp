@@ -438,6 +438,7 @@ pub async fn search_memories(
             request_id: None,
             // #910 — tenant-facing path; never bypass the visibility filter.
             bypass_visibility: false,
+            keep_server_principal: false,
             // v0.9.0 G10.1 (#1827) — read-only search path; no
             // governance gate runs here, so no token is carried.
             capability: None,
