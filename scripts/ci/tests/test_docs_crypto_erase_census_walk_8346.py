@@ -317,21 +317,29 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   `-~` or holds U+007F or U+0080 or an escape of either (`\\x7f`, `\\u0080`, `\\U00000080`, the octal `\\177` and
   `\\200`, `\\N{DELETE}`); the one legal DEL, the `KEY_CONTROL` class of a quoted TOML key, is exempt. Self-check rows
   prove each spelling is caught in a function, in `Census.__init__` and in a constant. It also refuses `ascii` (name,
-  attribute `builtins.ascii` or import), `re.ASCII` and `re.A` (name, attribute, an `import re as X` alias or
-  `from re import A`), the integer 256 (the value of `re.ASCII`; the `maxsize=256` of `lru_cache` is the one exemption),
+  attribute `builtins.ascii` or import), `re.ASCII`, the attribute `A` on any value (`re.A`, `re.RegexFlag.A`, `R.A`
+  after `R = re`), `from re import A`, a subscript or a `getattr` call whose key is the constant `A` or `ASCII`
+  (`re.RegexFlag['A']`, `getattr(re, 'A')`), the integer 127, 128 or 256 as a constant or as a shift, power, product or
+  sum of constants and of names bound to them (`1 << 8`, `16 * 16`; the `maxsize=256` keyword of a call whose callee is
+  `lru_cache` is the one exemption), an ordering compare against a one-character string at or above `~` (`c > '\\xff'`),
   an inline flag group that holds the letter a (`(?a)`, `(?ia)`, `(?xa:`), `string.ascii_letters`, `ascii_lowercase`,
   `ascii_uppercase`, `printable` and `isidentifier` (name, attribute or import). A spelling the scan does not list is
-  covered by a behavioural test: with `reject_unicode_space` switched off no reader refuses U+00A0, U+3000, U+0430 or
-  U+00E9 in the 96 rows (4 shapes: an item in 8 files, a `use` line in 7, an attribute in 8 and an item followed by
-  `// macro_use` in src/approvals.rs, which keeps `reject_module_file` past its early return), and each of the 10
-  readers holds the injected character in its masked text for some row, so a private refusal of one of those four
-  characters in one of those four shapes turns the test red. A refusal in any other shape is covered only by the
+  covered by a behavioural test: with `reject_unicode_space` switched off no reader refuses U+00A0, U+3000, U+2003,
+  U+0430 or U+00E9 in the 120 rows (5 characters in 4 shapes: an item in 8 files, a `use` line in 7, an attribute in 8
+  and an item followed by `// macro_use` in src/approvals.rs, which keeps `reject_module_file` past its early return),
+  and each of the 10 readers holds the injected character in its masked text for some row, so a private refusal of one
+  of those five characters in one of those four shapes turns the test red (U+2003, an em space, stands for the range
+  U+2000 to U+206F). A second test pins the holder itself: a reader that strips the character from its own copy of a
+  file it shares with another reader is not recorded as reached. A refusal in any other shape is covered only by the
   scan, and only when it is spelled with a token the scan lists.
-* TOML values (r22): `toml_split` honours the backslash escapes of a basic string (`"x\"=\"y"` is one string); a value
-  that is empty, a string followed by more text, a bare value holding a quote, an array item holding `=` outside
-  quotes and an inline table or array nested in an array are refused with a named error. A comparison with
-  tomllib over 368 generated documents (escaped quotes, escaped backslashes, `=` inside strings, arrays, inline
-  tables, empty and juxtaposed values) shows 0 accepted-but-invalid and 0 valid-but-refused.
+* TOML values (r23): `toml_split` honours the backslash escapes of a basic string (`"x\"=\"y"` is one string) and
+  refuses a closer that does not match its opener; a value that is empty, a string followed by more text, a bracketed
+  value followed by more text, a bare value that is no boolean, number or date, an empty array item (one trailing comma
+  is legal), an empty inline-table entry or trailing comma, and an array item holding `=` outside quotes are refused
+  with a named error. A valid nested form (`[{ b = 1 }, [2]]`, `[[1], [2]]`) is accepted, as tomllib accepts it; the
+  same errors inside an inline table or array nested in an array are refused. Comparisons with tomllib over 20736
+  distinct generated documents (6 key spellings, 44 values, 34 shapes, 3 contexts) and over their 6912 table-context documents
+  show 0 accepted-but-invalid and 0 valid-but-refused.
 * Reader list: `masked_ascii_source` and the module list name `reject_rebinding` (mod.rs, the first reader
   `Census.__init__` runs).
 """
@@ -2201,8 +2209,8 @@ def toml_dotted(text, where):
 
 
 def toml_split(text, separator, where):
-    """Split `text` at `separator` characters outside quotes and outside [] / {} nesting."""
-    parts, buf, quote, depth, escaped = [], [], "", 0, False
+    """Split `text` at `separator` characters outside quotes and outside [] / {} nesting (a mismatched closer raises)."""
+    parts, buf, quote, closers, escaped = [], [], "", [], False
     for char in text:
         if quote:
             buf.append(char)
@@ -2216,17 +2224,18 @@ def toml_split(text, separator, where):
             buf.append(char)
             quote = char
         elif char in "[{":
-            depth += 1
+            closers.append("]" if char == "[" else "}")
             buf.append(char)
         elif char in "]}":
-            depth -= 1
+            if not closers or closers.pop() != char:
+                raise AssertionError("%s: an unbalanced quote or bracket in %r" % (where, text[:60]))
             buf.append(char)
-        elif char == separator and depth == 0:
+        elif char == separator and not closers:
             parts.append("".join(buf))
             buf = []
         else:
             buf.append(char)
-    if quote or depth != 0:
+    if quote or closers:
         raise AssertionError("%s: an unbalanced quote or bracket in %r" % (where, text[:60]))
     parts.append("".join(buf))
     return parts
@@ -2276,17 +2285,17 @@ def toml_logical_lines(text, where):
     return [line for line in lines if line]
 
 
-def toml_pair(pair, where, missing="a line that is neither a header nor `key = value`"):
-    """Return (key text, value text) of one `key = value` text; a second `=` outside quotes or an empty value raises."""
-    kv = toml_split(pair, "=", where)
-    if len(kv) < 2:
-        raise AssertionError("%s: %s: %r" % (where, missing, pair[:60]))
-    if len(kv) > 2:
-        raise AssertionError("%s: a TOML line holds a second `=` outside quotes, tomllib and cargo refuse it: %r"
-                             % (where, pair[:60]))
-    value = kv[1].strip()
-    if not value:
-        raise AssertionError("%s: a TOML key without a value, tomllib and cargo refuse it: %r" % (where, pair[:60]))
+TOML_BARE_SCALAR = re.compile(
+    r"(?:true|false|[+-]?(?:inf|nan)"
+    r"|[+-]?(?:0|[1-9](?:_?[0-9])*)(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?"
+    r"|0x[0-9a-fA-F](?:_?[0-9a-fA-F])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*"
+    r"|[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})?)?"
+    r"|[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?)\Z")
+
+
+def toml_check_value(value, where):
+    """Raise a named error unless `value` is exactly one TOML value (a string, a bracketed value or a bare scalar)."""
+    shown = value[:60]
     if value[0] in "\"'":
         end, escaped = 0, False
         for at, char in enumerate(value[1:], 1):
@@ -2299,19 +2308,64 @@ def toml_pair(pair, where, missing="a line that is neither a header nor `key = v
                 break
         if end and value[end + 1:].strip():
             raise AssertionError("%s: a TOML string value is followed by more text, tomllib and cargo refuse it: %r"
-                                 % (where, pair[:60]))
-    elif value[0] not in "[{" and ("\"" in value or "'" in value):
-        raise AssertionError("%s: a TOML bare value holds a quote, tomllib and cargo refuse it: %r" % (where, pair[:60]))
+                                 % (where, shown))
+    elif value[0] in "[{":
+        quote, escaped, depth = "", False, 0
+        for at, char in enumerate(value):
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\" and quote == '"':
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+            elif char in "\"'":
+                quote = char
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+                if depth == 0 and at != len(value) - 1:
+                    raise AssertionError("%s: a TOML value holds text after its closing bracket, tomllib and cargo "
+                                         "refuse it: %r" % (where, shown))
+    elif "\"" in value or "'" in value:
+        raise AssertionError("%s: a TOML bare value holds a quote, tomllib and cargo refuse it: %r" % (where, shown))
+    elif not TOML_BARE_SCALAR.match(value):
+        raise AssertionError("%s: a TOML bare value is not a boolean, number or date, tomllib and cargo refuse it: %r"
+                             % (where, shown))
+
+
+def toml_pair(pair, where, missing="a line that is neither a header nor `key = value`"):
+    """Return (key text, value text) of one `key = value` text; a second `=` outside quotes, an empty value or a text
+    that is not one value raises."""
+    kv = toml_split(pair, "=", where)
+    if len(kv) < 2:
+        raise AssertionError("%s: %s: %r" % (where, missing, pair[:60]))
+    if len(kv) > 2:
+        raise AssertionError("%s: a TOML line holds a second `=` outside quotes, tomllib and cargo refuse it: %r"
+                             % (where, pair[:60]))
+    value = kv[1].strip()
+    if not value:
+        raise AssertionError("%s: a TOML key without a value, tomllib and cargo refuse it: %r" % (where, pair[:60]))
+    toml_check_value(value, where)
     return kv[0], value
 
 
 def toml_check_array(value, where):
-    """Raise on a `=` outside quotes in an array item, and check the inline tables and arrays inside the array."""
-    for item in toml_split(value[1:-1], ",", "%s array" % where):
+    """Check the items of an array: no empty item (one trailing comma is legal), one value per item, no `=` outside
+    quotes; the inline tables and arrays inside the array are checked in turn."""
+    items = toml_split(value[1:-1], ",", "%s array" % where)
+    for at, item in enumerate(items):
         item = item.strip()
+        if not item:
+            if at == len(items) - 1:
+                continue  # one trailing comma (`[1,]`), and the empty array `[ ]` whose only item is blank
+            raise AssertionError("%s: a TOML array holds an empty item, tomllib and cargo refuse it: %r"
+                                 % (where, value[:60]))
         if len(toml_split(item, "=", where)) > 1:
             raise AssertionError("%s: a TOML array item holds `=` outside quotes, tomllib and cargo refuse it: %r"
                                  % (where, item[:60]))
+        toml_check_value(item, where)
         if item.startswith(("{", "[")):
             toml_expand((), item, [], where)
 
@@ -2320,15 +2374,17 @@ def toml_expand(path, value, entries, where):
     """Append (path, value) and, for an inline table, the entries of its keys (recursively); errors name `where`."""
     entries.append((path, value))
     if value.startswith("["):
-        if not value.endswith("]"):
-            raise AssertionError("%s: an array that does not close: %r" % (where, value[:60]))
         toml_check_array(value, where)
     if value.startswith("{"):
         if not value.endswith("}"):
             raise AssertionError("%s: an inline table that does not close: %r" % (where, value[:60]))
-        for pair in toml_split(value[1:-1], ",", "%s inline table" % where):
+        pairs = toml_split(value[1:-1], ",", "%s inline table" % where)
+        if len(pairs) == 1 and not pairs[0].strip():
+            return
+        for pair in pairs:
             if not pair.strip():
-                continue
+                raise AssertionError("%s: a TOML inline table holds an empty entry or a trailing comma, tomllib and "
+                                     "cargo refuse it: %r" % (where, value[:60]))
             key, inner = toml_pair(pair, where, "an inline table entry without `=`")
             toml_expand(path + toml_dotted(key, where), inner, entries, where)
 
@@ -5412,6 +5468,36 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     # r22: an inline flag group is read by its flag letters, so `(?a)`, `(?ia)`, `(?xa:` and `(?ima)` all hold the flag
     INLINE_ASCII_FLAG = re.compile(r"\(\?[a-zA-Z]*a")
 
+    @classmethod
+    def folded(cls, node, values):
+        """Return the integer a constant, a name bound to a constant or a shift, power, product or sum of them has, or None."""
+        if isinstance(node, ast.Constant):
+            return node.value if type(node.value) is int else None
+        if isinstance(node, ast.Name):
+            return values.get(node.id)
+        if isinstance(node, ast.BinOp):
+            left, right = cls.folded(node.left, values), cls.folded(node.right, values)
+            if left is None or right is None or not (-4096 < left < 4096 and -64 < right < 4096):
+                return None
+            if isinstance(node.op, ast.LShift):
+                return left << right if right >= 0 else None
+            for kind, apply in ((ast.Pow, lambda x, y: x ** y if 0 <= y < 64 else None), (ast.Mult, lambda x, y: x * y),
+                                (ast.Add, lambda x, y: x + y), (ast.Sub, lambda x, y: x - y)):
+                if isinstance(node.op, kind):
+                    return apply(left, right)
+        return None
+
+    @classmethod
+    def folded_names(cls, tree):
+        """Return {name: integer} for the plain `NAME = <foldable>` assignments of `tree` (two passes, so a chain folds)."""
+        values = {}
+        for _ in range(2):
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                        and cls.folded(node.value, values) is not None):
+                    values[node.targets[0].id] = cls.folded(node.value, values)
+        return values
+
     @staticmethod
     def names_ascii_codec(value):
         """True when the short string `value` is a codec name or alias that resolves to the ASCII codec."""
@@ -5423,7 +5509,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             return False
 
     def private_non_ascii_spellings(self, source):
-        """Return one label per spelling of a non-ASCII check in the Python source text `source` (docstrings skipped)."""
+        """Return one label per spelling of a non-ASCII check in the Python source text `source` (docstrings skipped).
+
+        It flags exactly: `ord` and `ascii` names, the ASCII-restricting names of `ASCII_NAMES_8346`, the attribute `A`
+        on any value, a subscript or `getattr` key `A` or `ASCII`, `from re import A`, a right shift by 7, `len` of an
+        encoded value, the integer 127, 128 or 256 by value (a constant, or a shift, power, product or sum of constants
+        and of names bound to them; only the `maxsize=256` keyword of an `lru_cache` call is exempt), an ordering compare
+        against a one-character string at or above `~`, and a string constant that names the ASCII codec, an ASCII
+        range, an inline `a` flag or U+007F or U+0080 in any escape.
+        """
         tree = ast.parse(textwrap.dedent(source))
         skip = set()
         for node in ast.walk(tree):
@@ -5433,11 +5527,12 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                 if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
                     skip.add(id(first.value))
         found = []
-        # r22: `import re as r2` and `from re import A` spell the ASCII flag too; `maxsize=256` is the one legal 256
-        re_names = {"re"} | {alias.asname for node in ast.walk(tree) if isinstance(node, ast.Import)
-                             for alias in node.names if alias.name == "re" and alias.asname}
+        # r23: the `maxsize=256` keyword of a call whose callee is `lru_cache` is the one legal 256; the flag values
+        # 127, 128 and 256 are found by value, so `1 << 8` or a name bound to 16 * 16 is flagged as well
         cache_sizes = {id(kw.value) for node in ast.walk(tree) if isinstance(node, ast.Call)
+                       and (getattr(node.func, "id", None) == "lru_cache" or getattr(node.func, "attr", None) == "lru_cache")
                        for kw in node.keywords if kw.arg == "maxsize"}
+        values = self.folded_names(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id in ("ord", "ascii"):
                 found.append(node.id)
@@ -5446,10 +5541,18 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                 found.append("from-re-A")
             elif isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] in self.ASCII_NAMES_8346:
                 found.append("alias-" + node.name)
-            elif isinstance(node, ast.Attribute) and (
-                    node.attr in self.ASCII_NAMES_8346
-                    or (node.attr == "A" and isinstance(node.value, ast.Name) and node.value.id in re_names)):
-                found.append(node.attr)
+            elif isinstance(node, ast.Attribute) and (node.attr in self.ASCII_NAMES_8346 or node.attr == "A"):
+                found.append(node.attr)  # `re.A`, `re.RegexFlag.A` and `R.A` on any rebinding of `re`
+            elif (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                  and node.slice.value in ("A", "ASCII")):
+                found.append("subscript-A")  # `re.RegexFlag['A']`, `vars(re)['A']`
+            elif (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "getattr" and len(node.args) > 1
+                  and isinstance(node.args[1], ast.Constant) and node.args[1].value in ("A", "ASCII")):
+                found.append("getattr-A")
+            elif (isinstance(node, ast.Compare) and any(isinstance(op, (ast.Lt, ast.Gt, ast.LtE, ast.GtE)) for op in node.ops)
+                  and any(isinstance(part, ast.Constant) and isinstance(part.value, str) and len(part.value) == 1
+                          and ord(part.value) >= 0x7e for part in [node.left] + node.comparators)):
+                found.append("char-compare")  # `c > '\xff'`, `c > '~'`
             elif (isinstance(node, ast.BinOp) and isinstance(node.op, ast.RShift)
                   and isinstance(node.right, ast.Constant) and node.right.value == 7):
                 found.append("shift-7")
@@ -5458,9 +5561,9 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                                                          or getattr(arg.func, "id", None) == "bytes")
                           for arg in node.args)):
                 found.append("len-of-encoded")
-            elif (isinstance(node, ast.Constant) and type(node.value) is int and node.value in (127, 128, 256)
-                  and id(node) not in cache_sizes):
-                found.append("int-%d" % node.value)
+            elif (isinstance(node, (ast.Constant, ast.BinOp)) and id(node) not in cache_sizes
+                  and self.folded(node, values) in (127, 128, 256)):
+                found.append("int-%d" % self.folded(node, values))
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
                 value = node.value
                 if value == KEY_CONTROL.pattern:
@@ -5494,8 +5597,9 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         sources["<module>"] = ast.unparse(whole)
         return sources
 
-    # r21: two characters that are not letters (a whitespace position) and two that are (an identifier position)
-    NON_ASCII_SPACE_8346 = ("\u00a0", "\u3000", "\u0430", "\u00e9")
+    # r21: two characters that are not letters (a whitespace position) and two that are (an identifier position); r23:
+    # U+2003 (em space), a character of the range U+2000 to U+206F that Python reads as whitespace (a whitespace position)
+    NON_ASCII_SPACE_8346 = ("\u00a0", "\u3000", "\u2003", "\u0430", "\u00e9")
     NON_ASCII_ROWS_8346 = (RUST_SRC, LIB_SRC, "src/encryption/probe_8346.rs", "src/encryption/escrow.rs",
                            "src/encryption/scope/store.rs", SCOPE_SRC, "src/test_support.rs", "src/approvals.rs")
     # r22: the row shapes. `item` is a function whose name holds the character (an identifier position) or that is followed
@@ -5535,17 +5639,57 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                                                                             "pub mod encryption;\n" + code)})
         return Census(self.text, overrides=self.tree_overrides(rel, code))
 
+    @staticmethod
+    def reach_holder_8346(reached):
+        """Return a factory of stand-ins for `reject_unicode_space` that record the reader (the caller of
+        `masked_ascii_source`) only when its masked text HOLDS the injected character (r22; pinned by r23)."""
+        def holder(char):
+            def stub(masked, name):
+                if char in masked:
+                    reached.add(sys._getframe(2).f_code.co_name)
+            return stub
+        return holder
+
+    def test_the_reach_holder_ignores_a_reader_that_strips_the_character_8346(self):
+        """r23 (security r22 LOW-3, code r22 INFO-2): a reader that removes the character from its own copy of a file it
+        shares with a non-stripping reader is NOT recorded as reached, and the non-stripping reader is. A holder that
+        records every reader it is called from (not only one that holds the character) turns this test red."""
+        shared = (("item", RUST_SRC, "reject_rebinding", "__init__"), ("item", RUST_SRC, "__init__", "reject_rebinding"),
+                  ("item", LIB_SRC, "lib_prefix_modules", "read_lib_whole"),
+                  ("item", LIB_SRC, "reject_crate_level", "lib_prefix_modules"))
+        real_mask = mask_literals
+        module = sys.modules[__name__]
+        for shape, rel, stripper, keeper in shared:
+            for char in self.NON_ASCII_SPACE_8346:
+                def stripping(clean, stripper=stripper, char=char):
+                    text = real_mask(clean)
+                    if (sys._getframe(1).f_code.co_name == "masked_ascii_source"
+                            and sys._getframe(2).f_code.co_name == stripper):
+                        return text.replace(char, "")
+                    return text
+
+                reached = set()
+                holder = self.reach_holder_8346(reached)
+                with self.subTest(rel=rel, stripper=stripper, keeper=keeper, char="U+%04X" % ord(char)):
+                    for cached in (read_lib_whole, reject_tree_file, reject_module_file):
+                        cached.cache_clear()  # a hit from an earlier test would skip the reader this row watches
+                    with mock.patch.object(module, "mask_literals", stripping), \
+                            mock.patch.object(module, "reject_unicode_space", holder(char)):
+                        self.census_with_code_8346(rel, self.non_ascii_code_8346(shape, char))
+                    self.assertIn(keeper, reached)
+                    self.assertNotIn(stripper, reached)
+
     def test_no_reader_keeps_a_private_non_ascii_refusal_8346(self):
-        """r22 (code r21 LOW-2 and LOW-3, security r21 LOW-1 and INFO-2): behavioural twin of the AST scan. The 96 rows
-        are 4 characters in 4 shapes (`NON_ASCII_SHAPES_8346`): U+00A0 and U+3000 in a whitespace position, U+0430 and
-        U+00E9 inside an identifier; the shapes are an item (8 files), a `use self::x<c>_8346;` line (7 files, not
+        """r22 (code r21 LOW-2 and LOW-3, security r21 LOW-1 and INFO-2): behavioural twin of the AST scan. The 120 rows
+        are 5 characters in 4 shapes (`NON_ASCII_SHAPES_8346`): U+00A0, U+3000 and U+2003 (an em space of the range
+        U+2000 to U+206F) in a whitespace position, U+0430 and U+00E9 inside an identifier; the shapes are an item (8 files), a `use self::x<c>_8346;` line (7 files, not
         mod.rs), an attribute (8 files) and an item followed by `// macro_use` (src/approvals.rs, which keeps
         `reject_module_file` past its early return). With the shared `reject_unicode_space` switched off, no reader
         refuses any row, and each of the 10 readers HOLDS the injected character in its masked text for some row; a
-        private refusal of one of those four characters in one of those shapes would refuse some row. A refusal
+        private refusal of one of those five characters in one of those shapes would refuse some row. A refusal
         scoped to another shape is covered only by the AST scan, and only when spelled with a token the scan lists.
         The row set is pinned, so dropping a file, a shape or a character turns the test red."""
-        self.assertEqual(self.NON_ASCII_SPACE_8346, (" ", "　", "а", "é"))
+        self.assertEqual(self.NON_ASCII_SPACE_8346, (" ", "　", "\u2003", "а", "é"))
         self.assertEqual(self.NON_ASCII_ROWS_8346, (
             "src/encryption/mod.rs", "src/lib.rs", "src/encryption/probe_8346.rs", "src/encryption/escrow.rs",
             "src/encryption/scope/store.rs", "src/encryption/scope.rs", "src/test_support.rs",
@@ -5553,16 +5697,9 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         self.assertEqual(self.NON_ASCII_SHAPES_8346, (
             ("item", self.NON_ASCII_ROWS_8346), ("use", self.NON_ASCII_ROWS_8346[1:]),
             ("attribute", self.NON_ASCII_ROWS_8346), ("macro_use", ("src/approvals.rs",))))
-        self.assertEqual(sum(len(files) for _, files in self.NON_ASCII_SHAPES_8346) * 4, 96)
+        self.assertEqual(sum(len(files) for _, files in self.NON_ASCII_SHAPES_8346) * 5, 120)
         reached = set()
-
-        def holder(char):
-            """A stand-in for `reject_unicode_space` that records the reader only when it holds `char` (r22)."""
-            def stub(masked, name):
-                if char in masked:
-                    reached.add(sys._getframe(2).f_code.co_name)
-            return stub
-
+        holder = self.reach_holder_8346(reached)
         for shape, files in self.NON_ASCII_SHAPES_8346:
             for rel in files:
                 for char in self.NON_ASCII_SPACE_8346:
@@ -5652,7 +5789,22 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   "    if re.findall(r'\\w+', masked) != re.findall(r'\\w+', masked, 256):\n        pass\n",
                   "    if re.findall(r'\\w+', masked) != re.findall(r'\\w+', masked, re.RegexFlag(256)):\n        pass\n",
                   "    import builtins\n    if builtins.ascii(masked) != repr(masked):\n        pass\n",
-                  "    from builtins import ascii as a2\n    if a2(masked) != repr(masked):\n        pass\n")
+                  "    from builtins import ascii as a2\n    if a2(masked) != repr(masked):\n        pass\n",
+                  # r23 (security r22 LOW-1): the flag through a RegexFlag member, a subscript, getattr or a rebinding of
+                  # `re`; the value 256 as a shift or a product; a character compare above `~`; a `maxsize=256` that is
+                  # not the keyword of `lru_cache`
+                  "    re.findall(r'\\w+', masked, re.RegexFlag.A)\n",
+                  "    re.findall(r'\\w+', masked, re.RegexFlag['A'])\n",
+                  "    re.findall(r'\\w+', masked, getattr(re, 'A'))\n",
+                  "    re.findall(r'\\w+', masked, getattr(re, 'RegexFlag').A)\n",
+                  "    R = re\n    R.findall(r'\\w+', masked, R.A)\n",
+                  "    (lambda R: R.findall(r'\\w+', masked, R.A))(re)\n",
+                  "    re.findall(r'\\w+', masked, 1 << 8)\n", "    re.findall(r'\\w+', masked, 2 ** 8)\n",
+                  "    LIMIT = 16\n    re.findall(r'\\w+', masked, LIMIT * 16)\n",
+                  "    functools.partial(print, maxsize=256)\n",
+                  "    if any(c > '\\xff' for c in masked):\n        pass\n",
+                  "    if any(c > '~' for c in masked):\n        pass\n",
+                  "    if any('\u00ff' < c for c in masked):\n        pass\n")
         for copy in copies:
             with self.subTest(self_check=copy):
                 self.assertTrue(self.private_non_ascii_spellings(base + copy))
@@ -5664,6 +5816,13 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             with self.subTest(self_check_constant=constant):
                 self.assertTrue(self.private_non_ascii_spellings(sources["<module>"] + "\n" + constant))
         self.assertEqual(self.private_non_ascii_spellings(base), [])
+        # r23: the `maxsize=256` of `lru_cache` (bare or through `functools`) is the one legal 256; a flag-free `1 << 7`
+        # (a shift that is not a flag value) and a character compare below `~` are not spellings of the check
+        for legal in ("@functools.lru_cache(maxsize=256)\ndef f_8346():\n    pass\n",
+                      "@lru_cache(maxsize=256)\ndef f_8346():\n    pass\n",
+                      "def f_8346(a, b):\n    return a << 3, a > '}', b == '~'\n"):
+            with self.subTest(legal=legal):
+                self.assertEqual(self.private_non_ascii_spellings(legal), [])
         # the helper is the only caller of `reject_unicode_space` in the whole module
         self.assertEqual(len(re.findall(r"reject_unicode" + r"_space\(", inspect.getsource(sys.modules[__name__]))), 2)
         seen = []
@@ -5869,7 +6028,22 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         ("a = ", False), ("a = { b = }", False), ('a = "x" "y"', False), ("a = 'x' 'y'", False),
         ('a = "x""y"', False), ('a = 1 "x"', False), ('a = "x" 1', False),
         ("a = [1 = 2]", False), ("a = [{ b = 1 = 2 }]", False), ("a = { b = [1 = 2] }", False),
-        ("a = [[1 = 2]]", False), ("a = [{ b = [1 = 2] }]", False), ("a = { b = [{ c = 1 = 2 }] }", False))
+        ("a = [[1 = 2]]", False), ("a = [{ b = [1 = 2] }]", False), ("a = { b = [{ c = 1 = 2 }] }", False),
+        # r23 (code r22 INFO-1, security r22 INFO-1): empty and juxtaposed items, bare values that are no scalar
+        ("a = [1,]", True), ("a = [1, 2,]", True), ("a = [ ]", True), ("a = { }", True), ("a = [[1], [2]]", True),
+        ("a = [{ b = 1 }, { c = 2 }]", True), ("a = 1979-05-27 07:32:00", True), ("a = [1979-05-27, 07:32:00]", True),
+        ("a = 0x1f", True), ("a = -1.5e3", True), ("a = [true, false]", True), ("a = { b = 1, c = [2, 3] }", True),
+        ("a = [1,,2]", False), ("a = [,]", False), ("a = [,1]", False), ("a = [1,,]", False), ("a = [1 2]", False),
+        ("a = [1] [2]", False), ("a = [1][2]", False), ("a = [1] 2", False), ("a = [1, 2] x", False),
+        ('a = ["x" "y"]', False), ("a = [[1] [2]]", False), ("a = { b = [1] [2] }", False),
+        ("a = { b = 1, }", False), ("a = { , }", False), ("a = { , b = 1 }", False), ("a = { b = 1,, c = 2 }", False),
+        ("a = { b = 1 } { c = 2 }", False), ("a = 1 2", False), ("a = true false", False), ("a = 1x", False),
+        ("a = 01", False), ("a = xyz", False), ("a = { b = 1 c = 2 }", False), ("a = [{ b = 1 } { c = 2 }]", False))
+
+    # a closer that does not match its opener (`[1}`): the brackets balance in count only, `toml_split` refuses it
+    # and a bracket that never closes (`[1`): `toml_split` refuses both with the same named error
+    TOML_MISMATCH_LINES = ("a = [1}", "a = { b = 1 ]", "a = [{ b = 1 ]}", "a = { b = [1 }]",
+                           "a = [1", "a = { b = 1", "a = [{ b = 1 }", "a = [[1]")
 
     def test_toml_values_agree_with_tomllib_on_escapes_empties_and_arrays_8346(self):
         """r22: a valid document with an escaped quote or backslash is read (code r21 LOW-1: 90 valid documents were
@@ -5894,6 +6068,28 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: a TOML"):
                             toml_entries(doc, MANIFEST)
+        for line in self.TOML_MISMATCH_LINES:
+            with self.subTest(mismatch=line):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: .*an unbalanced quote or bracket"):
+                    toml_entries("[package]\n" + line + "\n", MANIFEST)
+                if tomllib is not None:
+                    with self.assertRaises(tomllib.TOMLDecodeError):
+                        tomllib.loads("[package]\n" + line + "\n")
+        for text, message in (("[1,,2]", "a TOML array holds an empty item"), ("[,]", "a TOML array holds an empty item"),
+                              ("{ , b = 1 }", "a TOML inline table holds an empty entry or a trailing comma"),
+                              ("{ b = 1, }", "a TOML inline table holds an empty entry or a trailing comma")):
+            with self.subTest(named=text):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: " + message):
+                    toml_expand((), text, [], MANIFEST)
+        for text, message in (("a = [1] [2]", "a TOML value holds text after its closing bracket"),
+                              ("a = [1 2]", "a TOML bare value is not a boolean, number or date"),
+                              ("a = 1x", "a TOML bare value is not a boolean, number or date"),
+                              ("a = [1] 2", "a TOML value holds text after its closing bracket"),
+                              ('a = 1"x"', "a TOML bare value holds a quote"),
+                              ("a = tr'u'e", "a TOML bare value holds a quote")):
+            with self.subTest(named=text):
+                with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: " + message):
+                    toml_entries("[package]\n" + text + "\n", MANIFEST)
         with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: a TOML key without a value"):
             toml_expand((), "{ b = }", [], MANIFEST)
         with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: a TOML array item holds `=`"):
@@ -5956,10 +6152,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     def test_round_19_one_copy_scope_is_documented_8346(self):
         """r19: the docstring names the scope the one-copy test pins and makes no claim of every spelling."""
         # r21 (code r20 LOW-1, security r20 LOW-1): the behavioural twin's coverage is named exactly
-        for phrase in ("U+0430 or\n  U+00E9", "the 96 rows (4 shapes", "each of the 10", "holds the injected character",
+        for phrase in ("U+2003,\n  U+0430 or U+00E9","the 120 rows (5 characters in 4 shapes", "each of the 10", "holds the injected character",
                        "A refusal in any other shape is covered only by the\n  scan, and only when it is spelled "
                        "with a token the scan lists", "`from re import A`", "`builtins.ascii`",
-                       "`re.ASCII`", "`string.ascii_letters`"):
+                       "`re.ASCII`", "`string.ascii_letters`", "`re.RegexFlag.A`", "`re.RegexFlag['A']`",
+                       "`getattr(re, 'A')`", "`1 << 8`", "`c > '\\xff'`", "callee is\n  `lru_cache` is the one exemption",
+                       "A second test pins the holder itself", "U+2000 to U+206F",
+                       "A valid nested form (`[{ b = 1 }, [2]]`, `[[1], [2]]`) is accepted",
+                       "the\n  same errors inside an inline table or array nested in an array are refused",
+                       "20736", "0 accepted-but-invalid and 0 valid-but-refused"):
             self.assertIn(phrase, __doc__)
         self.assertNotIn("a private refusal of any spelling", __doc__)
         self.assertNotIn("however spelled", __doc__)
