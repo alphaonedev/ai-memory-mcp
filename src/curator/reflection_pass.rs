@@ -481,12 +481,7 @@ impl<'a> ReflectionPass<'a> {
                     "scope": crate::models::MemoryScope::Collective.as_str(),
                 });
                 // #8443 — a reflection over foreign sources is not owner content.
-                crate::role_grounding::stamp_folded(
-                    &mut metadata,
-                    cluster
-                        .iter()
-                        .map(|m| crate::role_grounding::content_principal(&m.metadata)),
-                );
+                crate::role_grounding::stamp_folded(&mut metadata, cluster, None);
                 metadata
             },
             reflection_depth: 0,

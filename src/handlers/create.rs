@@ -358,6 +358,8 @@ pub(crate) fn resolve_create_metadata(
         });
     }
     let mut metadata = body.metadata.clone();
+    // #8443: `content_principal` is server-stamped; drop a caller-supplied one.
+    crate::role_grounding::strip_content_principal(&mut metadata);
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert(
             "agent_id".to_string(),
@@ -2048,6 +2050,19 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
+
+    /// #8443 security M1: the HTTP create ingress drops a caller-supplied
+    /// `content_principal`; the server stamps the marker, never the request.
+    #[test]
+    fn resolve_create_metadata_strips_caller_content_principal_8443() {
+        let mut body = make_body("forged");
+        body.metadata = json!({"content_principal": "owner", "k": "v"});
+        let meta = resolve_create_metadata("ai:alice", &body)
+            .unwrap_or_else(|_| panic!("create metadata refused"));
+        assert!(meta.get("content_principal").is_none(), "{meta}");
+        assert_eq!(meta["k"], json!("v"));
+        assert_eq!(meta["agent_id"], json!("ai:alice"));
+    }
 
     /// Hand-rolled fixture so tests don't depend on `serde_json`
     /// `Deserialize`-time defaults (which would force them through the

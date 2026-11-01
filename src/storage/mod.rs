@@ -2152,7 +2152,7 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
                         COALESCE(
                             (SELECT json_group_object(key, value)
                              FROM json_each(memories.metadata)
-                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')),
                             '{{}}'
                         )
                     ), '$.agent_id')
@@ -2161,7 +2161,7 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
                         COALESCE(
                             (SELECT json_group_object(key, value)
                              FROM json_each(memories.metadata)
-                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')),
                             '{{}}'
                         )
                     ) END,
@@ -4397,6 +4397,26 @@ pub fn update_with_expected_version(
         );
     }
     let metadata = attest_reconciled.as_ref().unwrap_or(metadata);
+    // #8443 — the SQL below overlays only the EXISTING row's reserved keys onto
+    // the patch, so a `content_principal` the row never had would survive from
+    // the caller's patch. The principal is server-derived: drop an incoming-only
+    // key here (an existing one is re-applied by the overlay).
+    let principal_scrubbed;
+    let metadata = if existing
+        .metadata
+        .get(crate::role_grounding::META_CONTENT_PRINCIPAL)
+        .is_none()
+        && metadata
+            .get(crate::role_grounding::META_CONTENT_PRINCIPAL)
+            .is_some()
+    {
+        let mut scrubbed = metadata.clone();
+        crate::role_grounding::strip_content_principal(&mut scrubbed);
+        principal_scrubbed = scrubbed;
+        &principal_scrubbed
+    } else {
+        metadata
+    };
 
     // #1451 (SEC, HIGH) — substrate governance pre-write gate on the
     // optimistic-update path. The insert/supersede/consolidate/restore
@@ -4530,7 +4550,7 @@ pub fn update_with_expected_version(
                         -- must not silently unbind the agent's key either.
                         (SELECT json_group_object(key, value)
                          FROM json_each(metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')),
                         '{}'
                     )
                 ),
@@ -10734,9 +10754,9 @@ pub fn consolidate_with_expected_versions(
         // `consolidated_from_agents` for forensic attribution.
         // The consolidator's own agent_id becomes `agent_id` on the result.
         let mut source_agent_ids: Vec<String> = Vec::new();
-        // #8443 — each source's `content_principal` (None = absent), folded
-        // into the result's principal after the read loop.
-        let mut source_principals: Vec<Option<String>> = Vec::new();
+        // #8443 — each source's metadata, folded into the result's effective
+        // principal after the read loop (a missing key is not owner content).
+        let mut source_metas: Vec<serde_json::Value> = Vec::new();
         // v0.9.0 G13-mem (#1859) — per-source identity captured for the
         // disposition + CONSOLIDATE-leaf pass below: (id, cid, version,
         // namespace). Populated in this same read so the derived_from
@@ -10787,9 +10807,7 @@ pub fn consolidate_with_expected_versions(
                     // #8443 — the content principal is FOLDED over every source
                     // below, never last-write-wins: a merge must not turn a
                     // foreign source's content into owner content.
-                    source_principals.push(
-                        crate::role_grounding::content_principal(&mem.metadata).map(str::to_string),
-                    );
+                    source_metas.push(mem.metadata.clone());
                     if let serde_json::Value::Object(map) = mem.metadata {
                         for (k, v) in map {
                             if k == crate::role_grounding::META_CONTENT_PRINCIPAL {
@@ -10852,12 +10870,14 @@ pub fn consolidate_with_expected_versions(
         // #8443 — whose content the merged row is: owner when every source is
         // owner content (no key), the one publisher when all foreign sources
         // share it, otherwise `mixed`.
-        if let Some(folded) =
-            crate::role_grounding::fold_principals(source_principals.iter().map(Option::as_deref))
-        {
+        // The owner is the authenticated consolidator for a tenant call; a
+        // substrate pass has no owner and derives one from the sources.
+        let owner_hint = (!substrate_authored).then_some(consolidator_agent_id);
+        let source_refs: Vec<&serde_json::Value> = source_metas.iter().collect();
+        if let Some(folded) = crate::role_grounding::fold_metadata(&source_refs, owner_hint) {
             merged_metadata.insert(
                 crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
-                serde_json::Value::String(folded),
+                serde_json::Value::String(folded.as_str().to_string()),
             );
         }
         // #3014/#3018 — stamp `attest_level="claimed"` on the tenant
@@ -18290,7 +18310,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                             -- merge must not unbind a locally-bound key.
                             (SELECT json_group_object(key, value)
                              FROM json_each(memories.metadata)
-                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')),
                             '{{}}'
                         )
                     ), '$.agent_id')
@@ -18302,7 +18322,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                         COALESCE(
                             (SELECT json_group_object(key, value)
                              FROM json_each(memories.metadata)
-                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')),
                             '{{}}'
                         )
                     ) END,

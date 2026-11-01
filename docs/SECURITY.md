@@ -30,8 +30,10 @@ capabilities:
    keeps the inner label but drops its binding stores the preference as the
    victim owner's. Defence at memory FORMATION: every formation prompt carries a
    pinned role-grounding block naming the owner (system-resolved, never read from
-   content), and foreign content is stamped `metadata.content_principal`, labelled
-   in summary inputs, and shown in recall. A guard test pins the prompt list.
+   content), and foreign content is stamped `metadata.content_principal`, derived
+   from the authenticated caller (a caller-supplied value is stripped at every
+   ingress), labelled in every formation input and shown in recall. A guard test
+   pins the prompt list.
 4. **Compromised peer** holding valid mTLS cert. Under the default
    posture they can author only **as themselves**: the peer-attestation
    layer re-stamps inbound rows with the authenticated peer identity, and

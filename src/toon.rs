@@ -125,7 +125,13 @@ const MEMORY_FIELDS: &[&str] = &[
     field_names::CREATED_AT,
     field_names::UPDATED_AT,
     "metadata",
+    CONTENT_PRINCIPAL_COLUMN,
 ];
+
+/// #8443: the foreign-content marker (`metadata.content_principal`) surfaced
+/// as a top-level column, like `agent_id`, so a reader of any TOON format can
+/// tell whose content a row is. Empty means owner content.
+const CONTENT_PRINCIPAL_COLUMN: &str = crate::role_grounding::META_CONTENT_PRINCIPAL;
 
 /// Compact memory fields — omits timestamps for tighter output.
 /// Includes `agent_id` (pulled out of `metadata.agent_id`) so AI clients using
@@ -140,6 +146,7 @@ const MEMORY_FIELDS_COMPACT: &[&str] = &[
     "score",
     "tags",
     "agent_id",
+    CONTENT_PRINCIPAL_COLUMN,
 ];
 
 /// Serialize a recall/list/search response to TOON format.
@@ -231,8 +238,8 @@ pub fn memories_to_toon(response: &Value, compact: bool) -> String {
                 .map(|&field| {
                     // #199: `agent_id` is nested inside metadata in the Memory struct.
                     // Surface it as a top-level TOON column by digging into metadata.
-                    if field == "agent_id" {
-                        format_value(mem.get("metadata").and_then(|m| m.get("agent_id")))
+                    if field == "agent_id" || field == CONTENT_PRINCIPAL_COLUMN {
+                        format_value(mem.get("metadata").and_then(|m| m.get(field)))
                     } else {
                         format_value(mem.get(field))
                     }
@@ -430,7 +437,10 @@ mod tests {
         });
         let toon = memories_to_toon(&resp, true);
         // #199: agent_id is in the compact header; it's empty when metadata is absent
-        assert!(toon.contains("memories[id|title|tier|namespace|priority|score|tags|agent_id]:"));
+        // #8443: `content_principal` follows `agent_id` (empty for owner rows).
+        assert!(toon.contains(
+            "memories[id|title|tier|namespace|priority|score|tags|agent_id|content_principal]:"
+        ));
         assert!(!toon.contains("created_at"));
         assert!(!toon.contains("confidence"));
     }
@@ -453,8 +463,8 @@ mod tests {
         let toon = memories_to_toon(&resp, true);
         let row = toon.lines().last().unwrap();
         assert!(
-            row.ends_with("|alice"),
-            "agent_id must be the last compact column; row: {row}"
+            row.ends_with("|alice|"),
+            "agent_id precedes the (empty) content_principal column; row: {row}"
         );
     }
 

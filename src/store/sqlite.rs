@@ -564,7 +564,11 @@ impl MemoryStore for SqliteStore {
             // #3696 — the admission runs as THIS caller (the read-visibility
             // identity the SAL read lanes use), so a `(title, namespace)`
             // holder it cannot read is refused typed and unnamed.
-            db::insert_as(&conn, memory, Some(ctx.agent_id.as_str())).map_err(box_err)
+            // #8443: `content_principal` is server-stamped; a non-substrate
+            // caller's own value is dropped before the row is admitted.
+            let mut ingress = memory.clone();
+            crate::role_grounding::strip_content_principal(&mut ingress.metadata);
+            db::insert_as(&conn, &ingress, Some(ctx.agent_id.as_str())).map_err(box_err)
         }
     }
 
@@ -618,7 +622,10 @@ impl MemoryStore for SqliteStore {
                     crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
                     ids.push(db::insert(&conn, &stamped)?);
                 } else {
-                    ids.push(db::insert(&conn, memory)?);
+                    // #8443: same ingress strip as `store`.
+                    let mut ingress = memory.clone();
+                    crate::role_grounding::strip_content_principal(&mut ingress.metadata);
+                    ids.push(db::insert(&conn, &ingress)?);
                 }
             }
             Ok(ids)
@@ -4244,6 +4251,14 @@ impl MemoryStore for SqliteStore {
         // rationale here; see the trait docs).
         if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
+        // #8443: the payload is the sender's content, not the recipient's
+        // (parity with the MCP notify funnel). A note to self is owner content.
+        if ctx.agent_id != target_agent {
+            crate::role_grounding::stamp_content_principal(
+                &mut metadata,
+                &crate::role_grounding::ContentPrincipal::from_agent_id_or_unknown(&ctx.agent_id),
+            );
         }
         let mem = Memory {
             id: row_id,

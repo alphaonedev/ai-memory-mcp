@@ -1023,6 +1023,21 @@ pub fn preserve_provenance_keys(
             obj.insert(key.to_string(), existing_val);
         }
     }
+    // #8443 (arXiv 2610.38209): `content_principal` is server-stamped, never
+    // caller-owned. The existing row's value wins; a value only the incoming
+    // blob carries is dropped, so a merge, update or dedup re-store can
+    // neither launder a foreign row into owner content nor forge a label.
+    match existing.get(crate::role_grounding::META_CONTENT_PRINCIPAL) {
+        Some(existing_val) => {
+            obj.insert(
+                crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
+                existing_val.clone(),
+            );
+        }
+        None => {
+            obj.remove(crate::role_grounding::META_CONTENT_PRINCIPAL);
+        }
+    }
     merged
 }
 

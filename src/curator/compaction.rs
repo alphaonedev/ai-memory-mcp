@@ -391,12 +391,7 @@ impl<'a> ConsolidationPass<'a> {
             metadata: {
                 // #8443 — the proposal carries the folded content principal.
                 let mut metadata = serde_json::json!({});
-                crate::role_grounding::stamp_folded(
-                    &mut metadata,
-                    cluster
-                        .iter()
-                        .map(|m| crate::role_grounding::content_principal(&m.metadata)),
-                );
+                crate::role_grounding::stamp_folded(&mut metadata, cluster, None);
                 metadata
             },
             reflection_depth: 0,

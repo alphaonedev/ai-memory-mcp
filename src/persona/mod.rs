@@ -371,12 +371,7 @@ impl<'a> PersonaGenerator<'a> {
             }
         });
         // #8443 — the persona inherits the folded principal of its sources.
-        crate::role_grounding::stamp_folded(
-            &mut metadata,
-            sources
-                .iter()
-                .map(|m| crate::role_grounding::content_principal(&m.metadata)),
-        );
+        crate::role_grounding::stamp_folded(&mut metadata, &sources, None);
 
         let mut persona_mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory

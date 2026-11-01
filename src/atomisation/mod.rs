@@ -577,13 +577,27 @@ impl Atomiser {
         // `config.sync_curator_max_retries` (1 by default).
         // #8443 (arXiv 2610.38209) - the owner named to the curator is the
         // stored row's agent_id (store-resolved, never read from content).
-        let grounded_owner = source
-            .metadata
-            .get("agent_id")
-            .and_then(serde_json::Value::as_str);
+        //
+        // A source the calling agent did not write is foreign content: the
+        // curator gets no owner, the text is labelled with its principal,
+        // and each atom inherits that principal (the atom's own agent_id is
+        // the caller, so without the stamp the split would launder it).
+        // A substrate caller names no owner; the owner is then derived.
+        let owner_hint = (!crate::validate::RESERVED_AGENT_IDS.contains(&calling_agent_id))
+            .then_some(calling_agent_id);
+        let (store_owner, principals) =
+            crate::role_grounding::effective_principals(&[&source.metadata], owner_hint);
+        let source_principal = principals.into_iter().next().flatten();
+        let (grounded_owner, curator_text) = match source_principal.as_ref() {
+            None => (store_owner.as_deref(), source.content.clone()),
+            Some(p) => (
+                None,
+                crate::role_grounding::label_source(&source.title, &source.content, Some(p)).1,
+            ),
+        };
         let atoms = self
             .curator
-            .decompose_grounded(grounded_owner, &source.content, budget, max_retries)
+            .decompose_grounded(grounded_owner, &curator_text, budget, max_retries)
             .map_err(|e| match e {
                 curator::CuratorError::LlmUnavailable(d)
                 | curator::CuratorError::MalformedResponse(d) => AtomiseError::CuratorFailed(d),
@@ -629,6 +643,7 @@ impl Atomiser {
                 atom,
                 span,
                 calling_agent_id,
+                source_principal.as_ref(),
                 self.keypair.as_deref(),
             )
             .map_err(|e| {
@@ -729,6 +744,7 @@ fn write_atom(
     atom: &curator::Atom,
     span: Option<SourceSpan>,
     calling_agent_id: &str,
+    source_principal: Option<&crate::role_grounding::ContentPrincipal>,
     keypair: Option<&AgentKeypair>,
 ) -> anyhow::Result<String> {
     let now = Utc::now().to_rfc3339();
@@ -766,6 +782,19 @@ fn write_atom(
         "atom_source_id".to_string(),
         serde_json::Value::String(source.id.clone()),
     );
+    // #8443: an atom of foreign content stays foreign; an atom of the
+    // caller's own content carries no key.
+    match source_principal {
+        Some(p) => {
+            metadata.insert(
+                crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
+                serde_json::Value::String(p.as_str().to_string()),
+            );
+        }
+        None => {
+            metadata.remove(crate::role_grounding::META_CONTENT_PRINCIPAL);
+        }
+    }
 
     let mut mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory

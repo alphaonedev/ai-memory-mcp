@@ -105,8 +105,7 @@ pub(super) fn handle_consolidate(
     } else if let Some(llm_client) = llm {
         // #8443 — ground the roles: the owner is the resolved caller (never
         // content); each foreign source is labelled with its principal.
-        let (store_owner, memory_pairs) = crate::role_grounding::summary_inputs(&sources);
-        let owner = caller.map(str::to_string).or(store_owner);
+        let (owner, memory_pairs) = crate::role_grounding::summary_inputs_for(&sources, caller);
         llm_client
             .summarize_memories_grounded(owner.as_deref(), &memory_pairs)
             .map_err(|e| {

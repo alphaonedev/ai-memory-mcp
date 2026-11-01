@@ -33,19 +33,38 @@ const GROUNDED: &[&str] = &[
 /// Inline prompt literals: (file suffix, marker that must appear in the file).
 const INLINE_GROUNDED: &[(&str, &str)] = &[("multistep_ingest/cache.rs", "role_grounding::")];
 
-/// Prompt-bearing consts that never form memory content, with the reason.
-const EXEMPT: &[(&str, &str)] = &[
+/// Minimum length of a trimmed exemption reason.
+const MIN_REASON_CHARS: usize = 20;
+
+/// Words that are not a reason.
+const PLACEHOLDER_REASONS: &[&str] = &["todo", "tbd", "none", "n/a", "na", "fixme", "xxx", "wip"];
+
+/// Prompt-bearing consts that never form memory content: (file suffix under
+/// `src/`, const name, reason). Keyed by file AND name, so a same-named const
+/// in another file is not silently exempt.
+const EXEMPT: &[(&str, &str, &str)] = &[
     (
+        "llm.rs",
         "QUERY_EXPANSION_PROMPT",
-        "read-side query rewrite, writes nothing",
+        "read-side query rewrite, writes nothing to the store",
     ),
     (
+        "llm.rs",
         "CLASSIFY_KIND_SYSTEM",
-        "closed-vocabulary label, no free text stored",
+        "closed-vocabulary label output, no free text stored",
     ),
-    ("CONTRADICTION_PROMPT", "yes/no verdict, no content stored"),
-    ("AUTO_TAG_PROMPT", "tags only, no content stored"),
     (
+        "llm.rs",
+        "CONTRADICTION_PROMPT",
+        "yes or no verdict only, no content stored",
+    ),
+    (
+        "llm.rs",
+        "AUTO_TAG_PROMPT",
+        "short tags only, no memory content stored",
+    ),
+    (
+        "storage/mod.rs",
         "WHY_TRACE_SUBSTRATE_SYSTEM",
         "provenance marker string, never sent to a model",
     ),
@@ -62,9 +81,50 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Source text before the first test module marker.
-fn non_test_region(text: &str) -> &str {
-    text.find("#[cfg(test)]").map_or(text, |i| &text[..i])
+/// `text` with every `#[cfg(test)] mod name { ... }` block removed. Only the
+/// braced test module is dropped, so production code that follows it (or a
+/// `#[cfg(test)]` on a single item) stays in the scanned region.
+fn non_test_region(text: &str) -> String {
+    // `all(test, feature = "sal")` gates a test module too.
+    const MARKS: [&str; 2] = ["#[cfg(test)]", "#[cfg(all(test, feature = \"sal\"))]"];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((i, mark)) = MARKS
+        .iter()
+        .filter_map(|m| rest.find(m).map(|i| (i, *m)))
+        .min_by_key(|(i, _)| *i)
+    {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + mark.len()..];
+        let head = after.trim_start();
+        let is_mod = head.starts_with("mod ") || head.starts_with("pub mod ");
+        let brace = head.find(['{', ';']);
+        match (is_mod, brace) {
+            (true, Some(b)) if head.as_bytes()[b] == b'{' => {
+                let body = &head[b..];
+                let mut depth = 0usize;
+                let mut end = body.len();
+                for (k, c) in body.char_indices() {
+                    if c == '{' {
+                        depth += 1;
+                    } else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = k + 1;
+                            break;
+                        }
+                    }
+                }
+                rest = &body[end..];
+            }
+            _ => {
+                // A `#[cfg(test)]` on some other item: keep scanning after it.
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `(name, body)` for every `const NAME: &str = ...;` in `text`.
@@ -107,6 +167,13 @@ fn str_consts(text: &str) -> Vec<(String, String)> {
     found
 }
 
+fn is_exempt(file: &Path, name: &str) -> bool {
+    let p = file.to_string_lossy().replace('\\', "/");
+    EXEMPT
+        .iter()
+        .any(|(suffix, n, _)| *n == name && p.ends_with(&format!("src/{suffix}")))
+}
+
 fn is_prompt_bearing(name: &str, body: &str) -> bool {
     name.ends_with("_PROMPT")
         || name.ends_with("_SYSTEM")
@@ -123,13 +190,13 @@ fn every_prompt_const_carries_the_role_grounding_block_8443() {
     let mut grounded = Vec::new();
     for file in &files {
         let text = fs::read_to_string(file).expect("read source");
-        for (name, body) in str_consts(non_test_region(&text)) {
+        for (name, body) in str_consts(&non_test_region(&text)) {
             if !is_prompt_bearing(&name, &body) {
                 continue;
             }
             if body.contains(PLACEHOLDER) || body.contains("role_grounding_placeholder!") {
                 grounded.push(name);
-            } else if !EXEMPT.iter().any(|(n, _)| *n == name) {
+            } else if !is_exempt(file, &name) {
                 missing.push(format!("{} ({})", name, file.display()));
             }
         }
@@ -165,20 +232,86 @@ fn exempt_entries_still_exist_and_are_prompt_bearing_8443() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
-    let mut names = Vec::new();
+    let mut found: Vec<(PathBuf, String)> = Vec::new();
     for file in &files {
         let text = fs::read_to_string(file).expect("read source");
-        for (name, body) in str_consts(non_test_region(&text)) {
+        for (name, body) in str_consts(&non_test_region(&text)) {
             if is_prompt_bearing(&name, &body) {
-                names.push(name);
+                found.push((file.clone(), name));
             }
         }
     }
-    for (exempt, reason) in EXEMPT {
-        assert!(!reason.is_empty());
+    for (suffix, exempt, _) in EXEMPT {
         assert!(
-            names.iter().any(|n| n == exempt),
-            "stale EXEMPT entry {exempt}: remove it from the list"
+            found
+                .iter()
+                .any(|(f, n)| n == exempt && is_exempt(f, n) && f.ends_with(suffix)),
+            "stale EXEMPT entry {suffix}::{exempt}: remove it from the list"
         );
     }
+}
+
+#[test]
+fn exempt_reasons_are_real_and_unique_8443() {
+    let mut seen: Vec<String> = Vec::new();
+    for (suffix, name, reason) in EXEMPT {
+        let r = reason.trim();
+        assert!(
+            r.chars().count() >= MIN_REASON_CHARS,
+            "{suffix}::{name}: reason shorter than {MIN_REASON_CHARS} characters"
+        );
+        assert!(
+            !PLACEHOLDER_REASONS.contains(&r.to_ascii_lowercase().as_str()),
+            "{suffix}::{name}: placeholder reason"
+        );
+        assert!(
+            !seen.iter().any(|s| s == r),
+            "{suffix}::{name}: reason duplicated across entries"
+        );
+        seen.push(r.to_string());
+    }
+}
+
+#[test]
+fn non_test_region_strips_only_the_test_module_8443() {
+    let text = "const A: &str = \"a\";\n#[cfg(test)]\nmod tests {\n    const B: &str = \"b\";\n    fn f() { if true { } }\n}\nconst C: &str = \"c\";\n";
+    let kept = non_test_region(text);
+    assert!(kept.contains("const A"));
+    assert!(
+        kept.contains("const C"),
+        "code after the test module is scanned"
+    );
+    assert!(!kept.contains("const B"));
+    let single = "#[cfg(test)]\nconst T: &str = \"t\";\nconst D: &str = \"d\";\n";
+    assert!(non_test_region(single).contains("const D"));
+}
+
+/// Security L1 class lock: an `AutonomyLlm` impl that overrides
+/// `summarize_memories` must also override `summarize_memories_grounded`;
+/// otherwise the trait default silently drops the owner and the block.
+#[test]
+fn autonomy_llm_impls_forward_the_grounded_summariser_8443() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    let mut bad = Vec::new();
+    let mut seen = 0usize;
+    for file in &files {
+        let text = non_test_region(&fs::read_to_string(file).expect("read source"));
+        for chunk in text.split("impl AutonomyLlm for ").skip(1) {
+            seen += 1;
+            let end = chunk.find("\nimpl ").unwrap_or(chunk.len());
+            let block = &chunk[..end];
+            if block.contains("fn summarize_memories(")
+                && !block.contains("fn summarize_memories_grounded(")
+            {
+                bad.push(file.display().to_string());
+            }
+        }
+    }
+    assert!(seen > 0, "no AutonomyLlm impl found; the scan is stale");
+    assert!(
+        bad.is_empty(),
+        "impls missing the grounded override: {bad:?}"
+    );
 }

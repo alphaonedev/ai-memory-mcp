@@ -2410,7 +2410,7 @@ async fn sync_push_write(
     }
 
     // Deserialise the body now that the signature has been verified.
-    let body: SyncPushBody = match serde_json::from_slice(&body_bytes) {
+    let mut body: SyncPushBody = match serde_json::from_slice(&body_bytes) {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -2420,6 +2420,12 @@ async fn sync_push_write(
                 .into_response();
         }
     };
+    // #8443: a peer may DEMOTE content (a valid foreign `content_principal`
+    // replicates faithfully) but never promote it: an `owner` or malformed
+    // claim is dropped before any backend sees the row.
+    for memory in &mut body.memories {
+        crate::role_grounding::sanitize_inbound_principal(&mut memory.metadata);
+    }
 
     let state = app.db.clone();
 

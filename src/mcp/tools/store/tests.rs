@@ -208,6 +208,39 @@ fn happy_path_basic_store() {
     assert_eq!(resp["agent_id"].as_str(), Some("ai:alice"));
 }
 
+/// #8443 security M1: a caller-supplied `content_principal` is stripped at
+/// the MCP store ingress; the server alone stamps the marker.
+#[test]
+fn caller_supplied_content_principal_is_stripped_on_store_8443() {
+    let conn = fresh_conn();
+    let ttl = ResolvedTtl::default();
+    for forged in ["owner", "ai:attacker"] {
+        let mut params = base_params(&format!("forged-{forged}"));
+        params["metadata"] = json!({"content_principal": forged});
+        let resp = handle_store(
+            &conn,
+            &db_path(),
+            &params,
+            None,
+            None,
+            None,
+            &ttl,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        let id = resp["id"].as_str().expect("id");
+        let mem = db::get(&conn, id).expect("get").expect("row");
+        assert!(
+            mem.metadata.get("content_principal").is_none(),
+            "forged marker {forged:?} must not persist: {}",
+            mem.metadata
+        );
+    }
+}
+
 // A. happy path — Embedder Some-branch (semantic write)
 #[test]
 fn happy_path_with_embedder() {

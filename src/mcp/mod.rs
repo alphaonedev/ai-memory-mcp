@@ -2602,6 +2602,7 @@ fn dispatch_memory_ingest_multistep(ctx: &ToolDispatchCtx<'_>) -> Result<Value, 
         ctx.arguments,
         ctx.ingest_multistep_handler,
         ctx.tier_config.tier,
+        ctx.authority.read_caller(),
     )
 }
 

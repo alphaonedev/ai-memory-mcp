@@ -148,8 +148,7 @@ pub(crate) fn handle_session_start(
         && !results.is_empty()
     {
         // #8443 — foreign-principal rows are labelled; the owner is the caller.
-        let (store_owner, pairs) = crate::role_grounding::summary_inputs(&results);
-        let owner = caller.map(str::to_string).or(store_owner);
+        let (owner, pairs) = crate::role_grounding::summary_inputs_for(&results, caller);
         match llm_client.summarize_memories_grounded(owner.as_deref(), &pairs) {
             Ok(summary) => {
                 response["summary"] = json!(summary);

@@ -242,6 +242,27 @@ pub fn build_prompt_with_cap(
     candidates: &[&Memory],
     max_candidate_chars: usize,
 ) -> String {
+    build_prompt_labelled(
+        incoming_title,
+        incoming_content,
+        candidates,
+        max_candidate_chars,
+        &[],
+    )
+}
+
+/// #8443 (arXiv 2610.38209) - [`build_prompt_with_cap`] with the foreign
+/// candidates labelled. `principals[i]` is the effective principal of
+/// `candidates[i]` (`None`, or a slice shorter than `candidates`, means owner
+/// content, unlabelled and byte-identical to the unlabelled prompt).
+#[must_use]
+pub fn build_prompt_labelled(
+    incoming_title: &str,
+    incoming_content: &str,
+    candidates: &[&Memory],
+    max_candidate_chars: usize,
+    principals: &[Option<crate::role_grounding::ContentPrincipal>],
+) -> String {
     let mut buf = String::with_capacity(
         1024 + incoming_title.len() + incoming_content.len() + candidates.len() * 256,
     );
@@ -283,7 +304,9 @@ pub fn build_prompt_with_cap(
     // dropped.
     for (idx, cand) in candidates.iter().enumerate() {
         let title_clip = truncate_chars(&cand.title, max_candidate_chars);
-        let content_clip = truncate_chars(&cand.content, max_candidate_chars);
+        let principal = principals.get(idx).and_then(Option::as_ref);
+        let labelled = crate::role_grounding::label_source(&cand.title, &cand.content, principal).1;
+        let content_clip = truncate_chars(&labelled, max_candidate_chars);
         // `write!` into a `String` is infallible — the only error path
         // a `fmt::Write` impl could return is OOM, which the std impl
         // for `String` does not surface.
@@ -495,11 +518,17 @@ pub fn synthesise_grounded(
         // insert path.
         return Ok(SynthesisResponse { verdicts: vec![] });
     }
-    let prompt = build_prompt_with_cap(
+    // #8443: the incoming fact is the writer's own; a candidate the writer did
+    // not author (a shared, imported or notified row) is foreign content and
+    // is labelled so a quoted directive in it cannot steer the verdicts.
+    let metas: Vec<&serde_json::Value> = candidates.iter().map(|c| &c.metadata).collect();
+    let (_, principals) = crate::role_grounding::effective_principals(&metas, owner);
+    let prompt = build_prompt_labelled(
         incoming_title,
         incoming_content,
         candidates,
         max_candidate_chars,
+        &principals,
     );
     let raw = llm.generate(&prompt, Some(&render_synthesis_system(owner)))?;
     parse_response(&raw, candidates)

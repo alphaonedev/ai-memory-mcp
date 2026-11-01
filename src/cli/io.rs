@@ -1309,7 +1309,7 @@ pub fn mine(
         // not provably the owner, so the row is stamped unknown (fail-visible).
         crate::role_grounding::stamp_content_principal(
             &mut metadata,
-            crate::role_grounding::PRINCIPAL_UNKNOWN,
+            &crate::role_grounding::ContentPrincipal::unknown(),
         );
         let mem = models::Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory

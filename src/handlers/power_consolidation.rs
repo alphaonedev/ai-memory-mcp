@@ -454,7 +454,10 @@ pub async fn consolidate_memories(
         Some(s) if !s.is_empty() => s,
         _ => {
             // #8443 - owner is the authenticated caller; foreign rows labelled.
-            let (_, pairs) = crate::role_grounding::summary_inputs(&consolidate_sources);
+            let (_, pairs) = crate::role_grounding::summary_inputs_for(
+                &consolidate_sources,
+                Some(consolidate_caller_principal.as_str()),
+            );
             let owner = Some(consolidate_caller_principal.clone());
             match resolve_consolidate_summary(&app, owner, pairs).await {
                 Ok(s) => s,

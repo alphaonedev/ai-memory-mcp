@@ -153,7 +153,10 @@ fn persist_notify(
     // it can never be read as the recipient owner's instruction. A note a
     // sender leaves for itself is owner content and is not stamped.
     if sender != target {
-        crate::role_grounding::stamp_content_principal(&mut metadata, sender);
+        crate::role_grounding::stamp_content_principal(
+            &mut metadata,
+            &crate::role_grounding::ContentPrincipal::from_agent_id_or_unknown(sender),
+        );
     }
 
     let mem = Memory {

@@ -732,14 +732,23 @@ trust-all reads.
 - `imported_from_agent_id` — original claim preserved when `ai-memory import`
   restamps agent_id with caller's id (absent when `--trust-source` is passed)
 - `content_principal` — whose content the row is, as opposed to who wrote it
-  (#8443, arXiv 2610.38209, role grounding). The publisher agent id, or `unknown`,
-  stamped on content that did not come from the owner's own turn (`memory_share`
-  copies, `memory_notify` deliveries, untrusted `import`, mined transcripts);
-  `mixed` after a consolidation folds foreign and owner sources. Owner-direct rows
-  carry no key, and a missing key reads as owner only for rows written before this
-  change. Insert-if-absent, so a share chain keeps the first publisher. Summaries,
-  personas and reflections never fold a non-owner preference into an "owner
-  prefers" statement, and recall returns the key verbatim.
+  (#8443, arXiv 2610.38209, role grounding). Always derived by the server from the
+  authenticated caller, never read from a request: any caller-supplied value is
+  stripped at every ingress (MCP store, HTTP create, SAL store and store_batch,
+  federation receive may only demote to a valid non-owner principal). The value is
+  the publisher agent id, or `unknown`, stamped on content that did not come from
+  the owner's own turn (`memory_share` copies, `memory_notify` deliveries,
+  untrusted `import`, mined transcripts, atoms of foreign sources); `mixed` after a
+  consolidation folds foreign and owner sources. `owner`, `unknown` and `mixed`
+  are reserved agent ids. Owner-direct rows carry no key. An absent key is read
+  relative to the owner: a row whose `agent_id` differs from the consolidating
+  owner is foreign under its author whether or not it carries a key, and with no
+  owner hint two or more authors fold to `mixed`. Update, dedup re-store and merge
+  are existing-wins (a foreign row stays foreign; an incoming-only value is
+  dropped), and export then import keeps a claimed non-owner principal. Summaries,
+  personas, reflections, atoms and synthesis never fold a non-owner preference into
+  an "owner prefers" statement, and recall (including the default TOON formats)
+  returns the key.
 - `consolidated_from_agents` — array of source authors, preserved on
   `memory_consolidate` (the consolidator's id becomes `agent_id`)
 - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by
