@@ -322,7 +322,13 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   after `R = re`), `from re import A`, a subscript or a `getattr` call whose key is the constant `A` or `ASCII`
   (`re.RegexFlag['A']`, `getattr(re, 'A')`), the integer 127, 128 or 256 as a constant or as a shift, power, product or
   sum of constants and of names bound to them (`1 << 8`, `16 * 16`; the `maxsize=256` keyword of a call whose callee is
-  `lru_cache` is the one exemption), an ordering compare against a one-character string at or above `~` (`c > '\\xff'`),
+  `lru_cache` is the one exemption), an ordering compare (`<`, `<=`, `>`, `>=`, or `operator.lt`, `le`, `gt`, `ge`) against a one-character string or bytes value
+  at or above `~`, against the integer 126 or an integer from 129 to 255, or against a name bound to such a one-character
+  constant or to a `chr(N)`, `int('NN', 16)` or `bytes.fromhex('NN')` of one (`c > '\\xff'`, `b > 126`, `b >= 0xc0`,
+  `c > chr(126)`, `c > TILDE`), `bytes.fromhex` of a byte at or above `~`, an equality or inequality compare that has an
+  `encode` or `decode` call naming Latin-1 or cp1252 as an operand, a regex character class that names a character at or
+  above U+0080 (a literal, or an x, u, U or octal escape; str or bytes) or a negated range that ends at U+007D,
+  `isprintable`,
   an inline flag group that holds the letter a (`(?a)`, `(?ia)`, `(?xa:`), `string.ascii_letters`, `ascii_lowercase`,
   `ascii_uppercase`, `printable` and `isidentifier` (name, attribute or import). A spelling the scan does not list is
   covered by a behavioural test: with `reject_unicode_space` switched off no reader refuses U+00A0, U+3000, U+2003,
@@ -335,9 +341,9 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   scan, and only when it is spelled with a token the scan lists.
 * TOML values (r23): `toml_split` honours the backslash escapes of a basic string (`"x\"=\"y"` is one string) and
   refuses a closer that does not match its opener; a value that is empty, a string followed by more text, a bracketed
-  value followed by more text, a bare value that is no boolean, number or date, a date or time that is out of range
+  value followed by more text, a bare value that is no boolean, number, date or time, a date or time that is out of range
   (month 13, 30 February, year 0000, hour 24, minute or second 60, an offset above 23:59; the lexical shape alone is not
-  enough), an array that does not close (also when `toml_expand` is called directly), an empty array item (one trailing comma
+  enough; tomllib refuses all of these, cargo accepts second 60 and year 0000 and they are refused here to match tomllib), an array that does not close (also when `toml_expand` is called directly), an empty array item (one trailing comma
   is legal), an empty inline-table entry or trailing comma, and an array item holding `=` outside quotes are refused
   with a named error. A valid nested form (`[{ b = 1 }, [2]]`, `[[1], [2]]`) is accepted, as tomllib accepts it; the
   same errors inside an inline table or array nested in an array are refused. Comparisons with tomllib over 24948
@@ -2305,7 +2311,8 @@ TOML_TIME_ONLY = re.compile(r"([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?\Z")
 
 def toml_date_time_in_range(value):
     """False when `value` has the shape of a date, date-time or time but a field is out of range: month 13, 30 February,
-    year 0000, hour 24, minute or second 60, an offset above 23:59. Any other text is not judged here (True)."""
+    year 0000, hour 24, minute or second 60, an offset above 23:59. Any other text is not judged here (True). tomllib
+    refuses all of these; cargo (toml_datetime) accepts second 60 and year 0000, which are refused here to match tomllib."""
     match = TOML_DATE_TIME.match(value)
     try:
         if match:
@@ -2359,11 +2366,12 @@ def toml_check_value(value, where):
     elif "\"" in value or "'" in value:
         raise AssertionError("%s: a TOML bare value holds a quote, tomllib and cargo refuse it: %r" % (where, shown))
     elif not TOML_BARE_SCALAR.match(value):
-        raise AssertionError("%s: a TOML bare value is not a boolean, number or date, tomllib and cargo refuse it: %r"
+        raise AssertionError("%s: a TOML bare value is not a boolean, number, date or time, tomllib and cargo refuse it: %r"
                              % (where, shown))
     elif not toml_date_time_in_range(value):
-        raise AssertionError("%s: a TOML date or time is out of range (month 13, hour 24 and the like), tomllib and "
-                             "cargo refuse it: %r" % (where, shown))
+        raise AssertionError("%s: a TOML date or time is out of range (month 13, hour 24 and the like), tomllib refuses "
+                             "it (cargo accepts second 60 and year 0000; they are refused here to match tomllib): %r"
+                             % (where, shown))
 
 
 def toml_pair(pair, where, missing="a line that is neither a header nor `key = value`"):
@@ -5497,7 +5505,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     # r21: names of the standard library that restrict a regex, a string class or a token to ASCII; a private non-ASCII
     # refusal limited to identifier tokens is spelled with one of them (`re.ASCII`, `string.ascii_letters`, `isidentifier`)
     ASCII_NAMES_8346 = frozenset(("isascii", "ASCII", "ascii_letters", "ascii_lowercase", "ascii_uppercase",
-                                  "printable", "isidentifier", "ascii"))
+                                  "printable", "isidentifier", "ascii", "isprintable"))
     # r22: an inline flag group is read by its flag letters, so `(?a)`, `(?ia)`, `(?xa:` and `(?ima)` all hold the flag
     INLINE_ASCII_FLAG = re.compile(r"\(\?[a-zA-Z]*a")
 
@@ -5508,6 +5516,13 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             return node.value if type(node.value) is int else None
         if isinstance(node, ast.Name):
             return values.get(node.id)
+        if (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "int" and len(node.args) == 2
+                and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                and isinstance(node.args[1], ast.Constant) and type(node.args[1].value) is int):
+            try:
+                return int(node.args[0].value, node.args[1].value)  # r25: `int('80', 16)`
+            except ValueError:
+                return None
         if isinstance(node, ast.BinOp):
             left, right = cls.folded(node.left, values), cls.folded(node.right, values)
             if left is None or right is None or not (-4096 < left < 4096 and -64 < right < 4096):
@@ -5531,6 +5546,85 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     values[node.targets[0].id] = cls.folded(node.value, values)
         return values
 
+    HIGH_CLASS = re.compile(r"\[(\^?)((?:\\.|[^\]\\])*)\]", re.DOTALL)
+    CLASS_TOKEN = re.compile(r"\\x([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})|\\([0-7]{1,3})|\\.|.",
+                             re.DOTALL)
+
+    @classmethod
+    def high_class(cls, value):
+        """r25: True when the text `value` holds a regex character class that names a character at or above U+0080 (a
+        literal, or an escape x, u, U or octal) or, negated, a range that ends at U+007D (a `[^ -}]` class)."""
+        for negated, body in cls.HIGH_CLASS.findall(value):
+            last_dash = False
+            for token in cls.CLASS_TOKEN.finditer(body):
+                hexa, uni, big, octal = token.group(1, 2, 3, 4)
+                if hexa or uni or big:
+                    code = int(hexa or uni or big, 16)
+                elif octal:
+                    code = int(octal, 8)
+                else:
+                    code = ord(token.group(0)) if len(token.group(0)) == 1 else -1
+                if code >= 0x80 or (negated and last_dash and code == 0x7d):
+                    return True
+                last_dash = token.group(0) == "-"
+        return False
+
+    @classmethod
+    def char_value(cls, node, values, chars):
+        """r25: return ("int", n) or ("char", n) for an operand of a compare that is a constant, a name bound to one, a
+        `chr`, `int(text, base)` or `bytes.fromhex` call of constants, or a shift/product/sum of them; else None."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and len(node.value) == 1:
+            return ("char", ord(node.value))
+        if isinstance(node, ast.Name) and node.id in chars:
+            return ("char", chars[node.id])
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            args = node.args
+            if name == "chr" and len(args) == 1:
+                inner = cls.char_value(args[0], values, chars)
+                return ("char", inner[1]) if inner and inner[0] == "int" else None
+            if name == "fromhex" and len(args) == 1 and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
+                try:
+                    data = bytes.fromhex(args[0].value)
+                except ValueError:
+                    return None
+                return ("char", data[0]) if len(data) == 1 else None
+            if name == "bytes" and len(args) == 1 and isinstance(args[0], ast.List) and len(args[0].elts) == 1:
+                inner = cls.char_value(args[0].elts[0], values, chars)
+                return ("char", inner[1]) if inner and inner[0] == "int" else None
+        number = cls.folded(node, values)
+        return ("int", number) if number is not None else None
+
+    @classmethod
+    def high_operand(cls, node, values, chars):
+        """r25: True for an operand that is the integer 126 or 129..255, or a character at or above `~`."""
+        found = cls.char_value(node, values, chars)
+        if found is None:
+            return False
+        return found[1] >= 0x7e if found[0] == "char" else (found[1] == 126 or 128 < found[1] < 256)
+
+    @staticmethod
+    def fromhex_high(text):
+        """r25: True when the hex text `text` decodes to a byte at or above `~`."""
+        try:
+            return any(byte >= 0x7e for byte in bytes.fromhex(text))
+        except ValueError:
+            return False
+
+    @staticmethod
+    def names_latin1(node):
+        """r25: True for an `.encode(...)`/`.decode(...)` call that names the Latin-1 or cp1252 codec (any alias)."""
+        if not (isinstance(node, ast.Call) and getattr(node.func, "attr", None) in ("encode", "decode")):
+            return False
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and 0 < len(arg.value) < 32:
+                try:
+                    if codecs.lookup(arg.value).name in ("iso8859-1", "cp1252"):
+                        return True
+                except (LookupError, ValueError):
+                    pass
+        return False
+
     @staticmethod
     def names_ascii_codec(value):
         """True when the short string `value` is a codec name or alias that resolves to the ASCII codec."""
@@ -5550,7 +5644,10 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         and of names bound to them; only the `maxsize=256` keyword of an `lru_cache` call is exempt), an ordering compare
         against a one-character string at or above `~`, and a string constant that names the ASCII codec, an ASCII
         range, an inline `a` flag or U+007E, U+007F or U+0080 in any escape; a bytes constant (every prefix form) is read
-        as Latin-1 text by the same rule.
+        as Latin-1 text by the same rule. r25: also an ordering compare against `~` or above, the integer 126 or 129 to 255
+        (directly, through a name bound to a one-character constant, `chr`, `int(text, 16)` or `bytes.fromhex`, or through
+        `operator.gt` and its kin), an `encode`/`decode` call naming Latin-1 or cp1252 as a compare operand, `isprintable`,
+        a regex class (str or bytes) that names a character at or above U+0080 or, negated, a range ending at U+007D.
         """
         tree = ast.parse(textwrap.dedent(source))
         skip = set()
@@ -5567,6 +5664,13 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                        and (getattr(node.func, "id", None) == "lru_cache" or getattr(node.func, "attr", None) == "lru_cache")
                        for kw in node.keywords if kw.arg == "maxsize"}
         values = self.folded_names(tree)
+        # r25: names bound to a one-character str or bytes constant (`TILDE = '~'`), read by the compare check
+        chars = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Constant) and isinstance(node.value.value, (str, bytes))
+                    and len(node.value.value) == 1):
+                chars[node.targets[0].id] = ord(node.value.value)
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id in ("ord", "ascii"):
                 found.append(node.id)
@@ -5584,9 +5688,18 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   and isinstance(node.args[1], ast.Constant) and node.args[1].value in ("A", "ASCII")):
                 found.append("getattr-A")
             elif (isinstance(node, ast.Compare) and any(isinstance(op, (ast.Lt, ast.Gt, ast.LtE, ast.GtE)) for op in node.ops)
-                  and any(isinstance(part, ast.Constant) and isinstance(part.value, (str, bytes)) and len(part.value) == 1
-                          and ord(part.value) >= 0x7e for part in [node.left] + node.comparators)):
-                found.append("char-compare")  # `c > '\xff'`, `c > '~'`
+                  and any(self.high_operand(part, values, chars) for part in [node.left] + node.comparators)):
+                found.append("char-compare")  # `c > '\xff'`, `c > '~'`, `b > 126`, `c > chr(126)`, `c > TILDE`
+            elif (isinstance(node, ast.Compare)
+                  and any(self.names_latin1(part) for part in [node.left] + node.comparators)):
+                found.append("latin1-compare")  # `s.encode('utf-8') != s.encode('latin-1', 'ignore')`
+            elif (isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", None)) in (
+                    "gt", "ge", "lt", "le") and any(self.high_operand(arg, values, chars) for arg in node.args)):
+                found.append("operator-compare")  # `operator.gt(c, '~')`
+            elif (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "fromhex" and node.args
+                  and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                  and self.fromhex_high(node.args[0].value)):
+                found.append("fromhex-high")  # `bytes.fromhex('80')`
             elif (isinstance(node, ast.BinOp) and isinstance(node.op, ast.RShift)
                   and isinstance(node.right, ast.Constant) and node.right.value == 7):
                 found.append("shift-7")
@@ -5595,7 +5708,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                                                          or getattr(arg.func, "id", None) == "bytes")
                           for arg in node.args)):
                 found.append("len-of-encoded")
-            elif (isinstance(node, (ast.Constant, ast.BinOp)) and id(node) not in cache_sizes
+            elif (isinstance(node, (ast.Constant, ast.BinOp, ast.Call)) and id(node) not in cache_sizes
                   and self.folded(node, values) in (127, 128, 256)):
                 found.append("int-%d" % self.folded(node, values))
             elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and id(node) not in skip:
@@ -5606,6 +5719,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                 if (value == "isascii" or ("ascii" in value.lower() and len(value) < 32) or "-~" in value
                         or self.INLINE_ASCII_FLAG.search(value)
                         or "\x7f" in value or "\x80" in value or self.NON_ASCII_ESCAPE.search(value)
+                        or self.high_class(value)
                         or self.names_ascii_codec(value)):
                     found.append("constant")
         return found
@@ -5844,7 +5958,28 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                   "    re.search(rb'[\\x80-\\xff]', masked.encode())\n", "    re.search(rb'[^\\t\\n\\r -~]', masked.encode())\n",
                   "    re.search(rb'[^\\x00-\\x7e]', masked.encode())\n", "    re.search(br'[\\x7f-\\xff]', masked.encode())\n",
                   "    re.search(b'[^\\t\\n\\r -~]', masked.encode())\n", "    re.search(b'[\\x80-\\xff]', masked.encode())\n",
-                  "    if any(c > b'~' for c in masked.encode()):\n        pass\n")
+                  "    if any(c > b'~' for c in masked.encode()):\n        pass\n",
+                  # r25 (security r24 LOW-1 s1 to s5, code r24 LOW-1 z1 to z7): a byte or character class that starts above
+                  # U+007F, the integer 126, a name bound to '~', an encode compare through Latin-1, and the folds
+                  "    re.search(rb'[\\xc2-\\xf4]', masked.encode())\n", "    re.search(b'[\\xc0-\\xff]', masked.encode())\n",
+                  "    if any(b > 126 for b in masked.encode()):\n        pass\n",
+                  "    if re.search('[\\xa0-\uffff]', masked):\n        pass\n",
+                  "    if masked.encode('utf-8') != masked.encode('latin-1', 'ignore'):\n        pass\n",
+                  "    re.search(rb'[\\x81-\\xff]', masked.encode())\n", "    re.search(rb'[^\\x00-\\x7d]', masked.encode())\n",
+                  "    re.search(rb'[^\\t\\n -\\x7d~]', masked.encode())\n",
+                  "    if any(b >= 0xc0 for b in masked.encode()):\n        pass\n",
+                  "    if any(b > 0x7e for b in masked.encode()):\n        pass\n",
+                  "    if max(masked.encode()) > 0x7e:\n        pass\n",
+                  "    re.search('[\\u0081-\\U0010ffff]', masked)\n",
+                  "    if masked.encode('utf-8') != masked.encode('latin-1', 'replace'):\n        pass\n",
+                  "    re.search(b'[\\xa0-\\xff]', masked.encode())\n",
+                  "    TILDE_8346 = '~'\n    if any(c > TILDE_8346 for c in masked):\n        pass\n",
+                  "    if any(c > chr(126) for c in masked):\n        pass\n",
+                  "    if any(b >= int('80', 16) for b in masked.encode()):\n        pass\n",
+                  "    if not masked.isprintable():\n        pass\n",
+                  "    import operator\n    if any(operator.gt(c, '~') for c in masked):\n        pass\n",
+                  "    if any(b >= bytes.fromhex('80')[0] for b in masked.encode()):\n        pass\n",
+                  "    if masked.encode('utf-8') != masked.encode('cp1252', 'ignore'):\n        pass\n")
         for copy in copies:
             with self.subTest(self_check=copy):
                 self.assertTrue(self.private_non_ascii_spellings(base + copy))
@@ -5871,7 +6006,9 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         # (a shift that is not a flag value) and a character compare below `~` are not spellings of the check
         for legal in ("@functools.lru_cache(maxsize=256)\ndef f_8346():\n    pass\n",
                       "@lru_cache(maxsize=256)\ndef f_8346():\n    pass\n",
-                      "def f_8346(a, b):\n    return a << 3, a > '}', b == '~'\n"):
+                      "def f_8346(a, b):\n    return a << 3, a > '}', b == '~'\n",
+                      "def f_8346(a, b):\n    return a > 100, b < 300, a > 125, b.encode('utf-8') == a.encode('utf-16')\n",
+                      "def f_8346(a):\n    return re.search('[a-z\\\\x20]', a), re.search(rb'[^\\\\x00-\\\\x7c]', a)\n"):
             with self.subTest(legal=legal):
                 self.assertEqual(self.private_non_ascii_spellings(legal), [])
         # the helper is the only caller of `reject_unicode_space` in the whole module
@@ -6139,8 +6276,8 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, r"^Cargo\.toml: " + message):
                     toml_expand((), text, [], MANIFEST)
         for text, message in (("a = [1] [2]", "a TOML value holds text after its closing bracket"),
-                              ("a = [1 2]", "a TOML bare value is not a boolean, number or date"),
-                              ("a = 1x", "a TOML bare value is not a boolean, number or date"),
+                              ("a = [1 2]", "a TOML bare value is not a boolean, number, date or time"),
+                              ("a = 1x", "a TOML bare value is not a boolean, number, date or time"),
                               ("a = [1] 2", "a TOML value holds text after its closing bracket"),
                               ('a = 1"x"', "a TOML bare value holds a quote"),
                               ("a = tr'u'e", "a TOML bare value holds a quote")):
@@ -6189,6 +6326,21 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     accepted = False
                 self.assertEqual(accepted, valid)
 
+    def test_the_date_and_bare_value_messages_say_what_is_true_8346(self):
+        """r25 (security r24 INFO-1, code r24 INFO-1): the out-of-range message says tomllib refuses it and that cargo
+        accepts second 60 and year 0000; the bare-value message names date or time (a local time is accepted)."""
+        for value in ("0000-01-01", "07:32:60", "1979-13-01", "24:00:00"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(AssertionError, r"out of range .*tomllib refuses it \(cargo accepts second 60 "
+                                            r"and year 0000; they are refused here to match tomllib\)"):
+                    toml_check_value(value, "Cargo.toml")
+        for value in ("1x", "07:32", "yes"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(AssertionError, r"not a boolean, number, date or time, tomllib and cargo refuse"):
+                    toml_check_value(value, "Cargo.toml")
+        self.assertNotIn("number or date,", inspect.getsource(toml_check_value))
+        self.assertIn("cargo (toml_datetime) accepts second 60 and year 0000", toml_date_time_in_range.__doc__)
+
     def test_toml_expand_refuses_an_array_that_does_not_close_8346(self):
         """r24 (code r23 INFO-1): `toml_expand` is public; called directly it must refuse `[1`, as every `toml_entries` path does."""
         for text in ("[1", "[1, 2", "[[1]", "[{ b = 1 }", "[", "[1}", "[1)"):
@@ -6229,6 +6381,8 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                        "A valid nested form (`[{ b = 1 }, [2]]`, `[[1], [2]]`) is accepted",
                        "the\n  same errors inside an inline table or array nested in an array are refused",
                        "a bytes constant in any prefix form", "is read\n  as Latin-1 text by the same rule",
+                       "against the integer 126 or an integer from 129 to 255", "a negated range that ends at U+007D",
+                       "cargo accepts second 60 and year 0000 and they are refused here to match tomllib",
                        "a date or time that is out of range", "the lexical shape alone is not\n  enough",
                        "also when `toml_expand` is called directly",
                        "24948", "0 accepted-but-invalid and 0 valid-but-refused"):
