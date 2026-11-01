@@ -228,6 +228,19 @@ fn token_at(content: &str, start: usize) -> &str {
     &content[start..end]
 }
 
+/// True when the prefix at byte offset `pfx_start` begins a token: it is the
+/// start of the text or the byte before it is not a word character (ASCII
+/// alphanumeric, `-` or `_`) (#8452). A prefix inside a word (`task-` carries
+/// `sk-`) is never a credential. `=`, `:`, `/`, `+` and `.` stay boundaries
+/// so `KEY=sk-...` and `token: ghp_...` are still caught.
+fn at_token_boundary(content: &str, pfx_start: usize) -> bool {
+    pfx_start == 0
+        || content
+            .as_bytes()
+            .get(pfx_start - 1)
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+}
+
 /// Redact every `<prefix><token>` whose token clears the length + entropy
 /// floor. Returns the rewritten string when at least one was redacted (and
 /// pushes `kind`), else `None`.
@@ -245,7 +258,8 @@ fn redact_prefixed_tokens(
         let token_start = pfx_start + prefix.len();
         let token = token_at(content, token_start);
         // Bearer's prefix includes the space; its token starts after it.
-        if token.len() >= MIN_PREFIXED_TOKEN_LEN
+        if at_token_boundary(content, pfx_start)
+            && token.len() >= MIN_PREFIXED_TOKEN_LEN
             && shannon_entropy_bits(token) >= MIN_TOKEN_ENTROPY_BITS
         {
             out.push_str(&content[search_from..pfx_start]);
@@ -276,7 +290,8 @@ fn redact_aws_keys(content: &str, kinds: &mut Vec<&'static str>) -> Option<Strin
         let start = search_from + rel;
         let body_start = start + AWS_AKIA_PREFIX.len();
         let body = token_at(content, body_start);
-        let is_key = body.len() >= AWS_KEY_BODY_LEN
+        let is_key = at_token_boundary(content, start)
+            && body.len() >= AWS_KEY_BODY_LEN
             && body[..AWS_KEY_BODY_LEN]
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
@@ -1600,5 +1615,88 @@ mod tests {
         );
         assert_eq!(out.resolver_pubkey, cp.resolver_pubkey);
         assert_eq!(out.resolution, cp.resolution);
+    }
+
+    /// Deterministic base62 body of `len` chars from a fixed seed (xorshift),
+    /// so entropy clears the floor without a random source.
+    fn seeded_body(seed: u64, len: usize) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state % ALPHABET.len() as u64) as usize] as char
+            })
+            .collect()
+    }
+
+    fn seeded_upper_alnum(seed: u64, len: usize) -> String {
+        seeded_body(seed, len * 8)
+            .chars()
+            .filter(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            .take(len)
+            .collect()
+    }
+
+    #[test]
+    fn prefix_inside_a_word_is_not_a_secret_8452() {
+        let aws_tail = seeded_upper_alnum(11, AWS_KEY_BODY_LEN);
+        let ghp_tail = seeded_body(12, 24);
+        let xai_tail = seeded_body(13, 24);
+        let cases = [
+            "fix/task-ownership-scoping-r3".to_string(),
+            "disk-partition-layout-v2-main".to_string(),
+            "kiosk-provisioning-2026-rollout".to_string(),
+            "whisk-ingestion-pipeline-run".to_string(),
+            format!("xAKIA{aws_tail}"),
+            format!("pAKIA{aws_tail}"),
+            format!("fooxai-{xai_tail}"),
+            format!("fooghp_{ghp_tail}"),
+            format!("xgithub_pat_{ghp_tail}"),
+            format!("fooBearer {xai_tail}"),
+        ];
+        for text in &cases {
+            assert_eq!(
+                screen(text),
+                ScreenOutcome::Clean,
+                "mid-word prefix flagged: {text}"
+            );
+            assert!(
+                screen_for_caller(text).is_ok(),
+                "caller screen refused: {text}"
+            );
+            assert_eq!(
+                redact_for_storage(text),
+                None,
+                "storage redact changed: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_keys_after_a_separator_still_detected_8452() {
+        let body = seeded_body(7, 40);
+        let aws = format!("AKIA{}", seeded_upper_alnum(9, AWS_KEY_BODY_LEN));
+        let secrets = [
+            (format!("sk-{body}"), KIND_OPENAI_KEY),
+            (format!("xai-{body}"), KIND_XAI_KEY),
+            (format!("ghp_{body}"), KIND_GITHUB_TOKEN),
+            (format!("github_pat_{body}"), KIND_GITHUB_TOKEN),
+            (format!("Bearer {body}"), KIND_BEARER_TOKEN),
+            (aws, KIND_AWS_ACCESS_KEY),
+        ];
+        for lead in [" ", "\"", "=", ":", "\n", "("] {
+            for (secret, kind) in &secrets {
+                let text = format!("note{lead}{secret}");
+                assert_eq!(kinds_of(&text), vec![*kind], "lead {lead:?} missed {kind}");
+                assert!(!redacted_of(&text).contains(&body), "body leaked: {lead:?}");
+            }
+        }
+        // Line start (no preceding byte at all).
+        for (secret, kind) in &secrets {
+            assert_eq!(kinds_of(secret), vec![*kind], "start of text missed {kind}");
+        }
     }
 }
