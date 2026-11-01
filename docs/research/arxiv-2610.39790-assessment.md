@@ -76,7 +76,7 @@ Two cautions recorded by the lenses:
 | R6 | Threshold by minimum-cluster-size sweep | `cosine_threshold` 0.70, 0.75, 0.85 by minimum cluster size 2, 3, 5; defaults change only on evidence. | S | R2 |
 | R7 | Derived tuple index plus second recall channel | Derived from memory text, model-fingerprinted and rebuildable, default off until it shows at least 3 points gain with no integrity regression. | L | R4 |
 
-R1 is delivered by this change. R2 and R3 are tracked under #6043. R4 to R7 become v1.1.0 implementation issues linked from `docs/ROADMAP-v110.md`.
+R1 is delivered by this change. R2 and R3 are tracked under #6043. R4 to R7 are the v1.1.0 implementation issues #8461 (LoCoMo harness), #8462 (fused dual-store recall), #8463 (threshold by minimum-cluster-size sweep) and #8464 (derived tuple index), linked from `docs/ROADMAP-v110.md`.
 
 A side finding is filed separately: the comment at `src/config.rs:9887-9888` still describes Postgres reversal as pending under #1748, although #1748 is closed.
 

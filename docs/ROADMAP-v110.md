@@ -382,10 +382,10 @@ All seven judges converged on the same core items (7–10 each); consolidated in
 | R1 | Assessment and mapping document (`docs/research/arxiv-2610.39790-assessment.md`) | S | none | #8458 (this change) |
 | R2 | #6043 consolidation benchmark, deterministic CI arm (existing `ConsolidationPass`, counted stub LLM, seeded copy store; pins shrink percent and LLM call count; rollback restores 100 percent of originals byte-identically) | M | counted-stub precedent in `benchmarks/longmemeval_reflection/runner.rs` | #8458, #6043 |
 | R3 | #6043 operator arm (real pinned LLM, fixed seed, outside CI; shrinkage, R@5 and R@10, QA accuracy before and after, LLM calls, wall time, rollback entries as separate metrics) | S | R2 | #8458, #6043 |
-| R4 | LoCoMo harness on the published protocol (R@k and QA scored separately, k sweep) | M | R2 | #8458; implementation issue to be linked |
-| R5 | Fused dual-store recall experiment (opt-in, default off, read-only union of `recall_hybrid` and `kg_query`) | M | R4 | #8458; implementation issue to be linked |
-| R6 | `cosine_threshold` 0.70, 0.75, 0.85 by minimum cluster size 2, 3, 5 sweep; defaults change only on evidence | S | R2 | #8458; implementation issue to be linked |
-| R7 | Derived tuple index plus second recall channel (model-fingerprinted, rebuildable, default off until at least 3 points gain with no integrity regression) | L | R4 | #8458; implementation issue to be linked |
+| R4 | LoCoMo harness on the published protocol (R@k and QA scored separately, k sweep) | M | R2 | #8458, [#8461](https://github.com/alphaonedev/ai-memory-mcp/issues/8461) |
+| R5 | Fused dual-store recall experiment (opt-in, default off, read-only union of `recall_hybrid` and `kg_query`) | M | R4 | #8458, [#8462](https://github.com/alphaonedev/ai-memory-mcp/issues/8462) |
+| R6 | `cosine_threshold` 0.70, 0.75, 0.85 by minimum cluster size 2, 3, 5 sweep; defaults change only on evidence | S | R2 | #8458, [#8463](https://github.com/alphaonedev/ai-memory-mcp/issues/8463) |
+| R7 | Derived tuple index plus second recall channel (model-fingerprinted, rebuildable, default off until at least 3 points gain with no integrity regression) | L | R4 | #8458, [#8464](https://github.com/alphaonedev/ai-memory-mcp/issues/8464) |
 
 **Non-goals:** no LLM DELETE verb, no new clustering crate, no change to any default configuration, no migration.
 
