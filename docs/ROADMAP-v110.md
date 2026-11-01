@@ -331,6 +331,26 @@ All seven judges converged on the same core items (7–10 each); consolidated in
 
 ---
 
+### P2 — w9-arxiv-2610-39790: Long-term memory paper assessment rows (R1-R7) — #8458
+
+> Source: Gupta et al. (Microsoft) 2026, arXiv:2610.39790, "Long-Term Agent Memory through Complementary Curation and Consolidation". Tracked by [#8458](https://github.com/alphaonedev/ai-memory-mcp/issues/8458); decision record `3-agent vote (6def5ab6)`, unanimous PARTIAL / EXPERIMENT-FIRST / ROADMAP. The full mapping, the rejected mechanisms (LLM DELETE, UMAP plus HDBSCAN) and the acceptance criteria are in [`research/arxiv-2610.39790-assessment.md`](research/arxiv-2610.39790-assessment.md). Nothing in v1.0.0 GA scope changes. Every default stays as shipped; each experiment is flag-gated and default off until a measured result exists, per the measurement rule below. No row claims an ai-memory performance figure.
+
+| Row | Item | Size | Depends on | Tracking |
+|---|---|---|---|---|
+| R1 | Assessment and mapping document (`docs/research/arxiv-2610.39790-assessment.md`) | S | none | #8458 (this change) |
+| R2 | #6043 consolidation benchmark, deterministic CI arm (existing `ConsolidationPass`, counted stub LLM, seeded copy store; pins shrink percent and LLM call count; rollback restores 100 percent of originals byte-identically) | M | counted-stub precedent in `benchmarks/longmemeval_reflection/runner.rs` | #8458, #6043 |
+| R3 | #6043 operator arm (real pinned LLM, fixed seed, outside CI; shrinkage, R@5 and R@10, QA accuracy before and after, LLM calls, wall time, rollback entries as separate metrics) | S | R2 | #8458, #6043 |
+| R4 | LoCoMo harness on the published protocol (R@k and QA scored separately, k sweep) | M | R2 | #8458, [#8461](https://github.com/alphaonedev/ai-memory-mcp/issues/8461) |
+| R5 | Fused dual-store recall experiment (opt-in, default off, read-only union of `recall_hybrid` and `kg_query`) | M | R4 | #8458, [#8462](https://github.com/alphaonedev/ai-memory-mcp/issues/8462) |
+| R6 | `cosine_threshold` 0.70, 0.75, 0.85 by minimum cluster size 2, 3, 5 sweep; defaults change only on evidence | S | R2 | #8458, [#8463](https://github.com/alphaonedev/ai-memory-mcp/issues/8463) |
+| R7 | Derived tuple index plus second recall channel (model-fingerprinted, rebuildable, default off until at least 3 points gain with no integrity regression) | L | R4 | #8458, [#8464](https://github.com/alphaonedev/ai-memory-mcp/issues/8464) |
+
+**Non-goals:** no LLM DELETE verb, no new clustering crate, no change to any default configuration, no migration.
+
+**Effort:** L overall (R1 S, R2 M, R3 S, R4 M, R5 M, R6 S, R7 L; each row is issue-sized and sequenced by its dependency column).
+
+---
+
 ### P3 — w7-docs-claims-cert: Docs truth — no-overclaim rule, cert-scope note, citation plumbing
 
 > **Code-comment citation:** `// MemTrapBench (Wang et al. 2026, arXiv:2608.20202) — meta-mitigation only. A CI prose rule mitigates NONE of the four runtime trap classes (Cognitive Bias, Trauma, Task Boundary, Safety); it prevents PUBLISHING unmeasured downstream-performance claims of the class the paper refutes.`
@@ -373,22 +393,6 @@ All seven judges converged on the same core items (7–10 each); consolidated in
 
 ---
 
-### P2 — w9-arxiv-2610-39790: Long-term memory paper assessment rows (R1-R7) — #8458
-
-**Source:** arXiv 2610.39790 (Gupta et al., Microsoft, 2026). Tracked by [#8458](https://github.com/alphaonedev/ai-memory-mcp/issues/8458); decision record `3-agent vote (6def5ab6)`, unanimous PARTIAL / EXPERIMENT-FIRST / ROADMAP. The full mapping, the rejected mechanisms (LLM DELETE, UMAP plus HDBSCAN) and the acceptance criteria are in [`research/arxiv-2610.39790-assessment.md`](research/arxiv-2610.39790-assessment.md). Nothing in v1.0.0 GA scope changes. Every default stays as shipped; each experiment is flag-gated and default off until a measured result exists, per the measurement rule below. No row claims an ai-memory performance figure.
-
-| Row | Item | Size | Depends on | Tracking |
-|---|---|---|---|---|
-| R1 | Assessment and mapping document (`docs/research/arxiv-2610.39790-assessment.md`) | S | none | #8458 (this change) |
-| R2 | #6043 consolidation benchmark, deterministic CI arm (existing `ConsolidationPass`, counted stub LLM, seeded copy store; pins shrink percent and LLM call count; rollback restores 100 percent of originals byte-identically) | M | counted-stub precedent in `benchmarks/longmemeval_reflection/runner.rs` | #8458, #6043 |
-| R3 | #6043 operator arm (real pinned LLM, fixed seed, outside CI; shrinkage, R@5 and R@10, QA accuracy before and after, LLM calls, wall time, rollback entries as separate metrics) | S | R2 | #8458, #6043 |
-| R4 | LoCoMo harness on the published protocol (R@k and QA scored separately, k sweep) | M | R2 | #8458, [#8461](https://github.com/alphaonedev/ai-memory-mcp/issues/8461) |
-| R5 | Fused dual-store recall experiment (opt-in, default off, read-only union of `recall_hybrid` and `kg_query`) | M | R4 | #8458, [#8462](https://github.com/alphaonedev/ai-memory-mcp/issues/8462) |
-| R6 | `cosine_threshold` 0.70, 0.75, 0.85 by minimum cluster size 2, 3, 5 sweep; defaults change only on evidence | S | R2 | #8458, [#8463](https://github.com/alphaonedev/ai-memory-mcp/issues/8463) |
-| R7 | Derived tuple index plus second recall channel (model-fingerprinted, rebuildable, default off until at least 3 points gain with no integrity regression) | L | R4 | #8458, [#8464](https://github.com/alphaonedev/ai-memory-mcp/issues/8464) |
-
-**Non-goals:** no LLM DELETE verb, no new clustering crate, no change to any default configuration, no migration.
-
 ## Measurement — the roadmap's own acceptance gate
 
 The paper's discipline applies to us: **no mechanism in this roadmap may be claimed to mitigate anything until measured.**
@@ -404,7 +408,7 @@ The paper's discipline applies to us: **no mechanism in this roadmap may be clai
 - **No schema migrations.** Origin/applicability stamps are reserved metadata-key conventions (`KindProvenance` precedent); recall-side work is response-layer or existing-bind-parameter only.
 - **sqlite/postgres parity** is structural where possible (pure helpers over fetched rows) and pg-lane-tested (mTLS :5445, `--include-ignored`) where not; the two open routing premises (pg path through `decorate_memory_many`; pg SAL ORDER BY anchor for kind weights) are BLOCKING audit items in their issues, not assumptions.
 - **Federation:** validation/enforcement applies at authoring surfaces only; replicated ingest accepts peer rows verbatim (conservation-of-peer-corpus) — a peer must never silently lose a row it cannot re-validate.
-- **Sequencing:** P1 first (w5 harness, w1 advisory, w2 columns — independently landable; w1's cross-session counts degrade honestly to all-unknown until w3). P2 next (w3 stamp unlocks w1's full value; w4; w6; w8 swarm/hive groupthink — #3266, itself sequenced R1 rig → R2/R3 epistemics → R4/R5 parallel → R6 defaults last). P3 (w7) can land any time after w5's SSOT contract exists. Nothing here blocks or is blocked by the v1.0.0 GA queue.
+- **Sequencing:** P1 first (w5 harness, w1 advisory, w2 columns — independently landable; w1's cross-session counts degrade honestly to all-unknown until w3). P2 next (w3 stamp unlocks w1's full value; w4; w6; w8 swarm/hive groupthink — #3266, itself sequenced R1 rig → R2/R3 epistemics → R4/R5 parallel → R6 defaults last; w9 long-term memory paper rows — #8458, sequenced R2 → R3/R4/R6, R4 → R5/R7). P3 (w7) can land any time after w5's SSOT contract exists. Nothing here blocks or is blocked by the v1.0.0 GA queue.
 
 ## Considered and rejected
 
@@ -418,12 +422,15 @@ Recorded per the synthesis rules (majority-REJECT or explicit descope with reaso
 6. **Fenced-code-block exclusion machinery for the docs gate** — rejected (w7): no fence-awareness infrastructure exists; the pattern set is tuned against the known clean tree instead, with the gate's stated-limitation idiom.
 7. **Claiming Safety-trap mitigation for contested markers** — rejected (w6 mitigation ballot): a planted false premise need not contradict any stored memory; the item is relabelled Trauma-adjacency + staleness hygiene.
 8. **`cross_session_count` computed over unstamped rows** — rejected (w1, three concurring ballots): no session field exists on the stored row; counting would fabricate zeros. Replaced by the unknown-honest split (`cross_session_count` + `cross_session_unknown_count`).
+9. **LLM DELETE inside a consolidation cluster** — rejected (w9, 3-agent vote 6def5ab6, unanimous): the paper gives no criteria and no undo; a model-decided erase is a second destructive verb on the durable text and a fail-closed posture change. Supersession through `kg_invalidate` already covers outdated facts.
+10. **UMAP plus HDBSCAN clustering** — rejected (w9, unanimous): new crates need operator authorisation, the output is not deterministic across platforms, and the Jaccard plus cosine gate is fail-closed by construction. Measure the existing clusterer first (R6).
 
 ## References
 
 - Blundin, D. 2026. Swarm/hive groupthink via shared memory (5,000 same-DNA agents, cascade cost). https://x.com/DaveBlundin/status/2092731291087069433 — tracked as #3266 / w8.
 - Wang, M.; Luo, H.; Xu, Z.; Cui, Z.; Xu, H.; Yang, Q.; Fang, J.; Fang, J.; Zhang, N. 2026. *MemTrapBench: Benchmarking Cognitive Traps in LLM Memory Use.* arXiv:2608.20202. Code/data: https://github.com/zjunlp/MemTrapBench (unreleased at time of writing; the w5 adapter fails closed on unknown formats).
   - Short cite for code comments (verbatim, SSOT): `MemTrapBench (Wang et al. 2026, arXiv:2608.20202)`
+- Gupta, Han, Madrigal Diaz, Chen, Das, Ruehle, Rajmohan (Microsoft). 2026. *Long-Term Agent Memory through Complementary Curation and Consolidation.* arXiv:2610.39790. https://arxiv.org/abs/2610.39790 — tracked as #8458 / w9; assessment in [`research/arxiv-2610.39790-assessment.md`](research/arxiv-2610.39790-assessment.md).
 - Process record: 7 workstream drafts + 21 adversarial ballots (3 lenses × 7 workstreams: north-star/integrity, code-grounding, trap-mitigation/claims-truth), all REVISE, all REQUIRED-CHANGES applied above; produced by the ox-alpha roadmap lab, 2026-08-23, synthesized and reviewed by Fable 5. Lane artifacts: `.local-runs/ox-c9-{rmdraft,rmvote,rmauthor}/` (not shipped).
 - #3266 3×7 vote (21 records + R1–R6 consolidation): https://github.com/alphaonedev/ai-memory-mcp/issues/3266#issuecomment-5433563173 ; folded into this document from https://github.com/alphaonedev/ai-memory-mcp/issues/3257#issuecomment-5433573635 .
 

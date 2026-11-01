@@ -7,17 +7,17 @@
 
 ## 1. The paper
 
-Gupta, Han, Madrigal Diaz, Chen, Das, Ruehle, Rajmohan (Microsoft), "Long-Term Agent Memory through Complementary Curation and Consolidation", [arXiv 2610.39790v1](https://arxiv.org/abs/2610.39790), 29 October 2026. The paper reports no code or data release at the time of writing (section 7, Limitations, and the page itself). Figures below are taken from the tracking issue's paper summary and the three voter returns; they were not reproduced here.
+Gupta, Han, Madrigal Diaz, Chen, Das, Ruehle, Rajmohan (Microsoft), "Long-Term Agent Memory through Complementary Curation and Consolidation", [arXiv 2610.39790v1](https://arxiv.org/abs/2610.39790), 29 October 2026. The page names no code or data release. Figures below were checked against the arXiv HTML of v1 on 2026-11-01 and are quoted as the paper states them.
 
 | Section | What it describes |
 |---|---|
 | 3.1 Curation | After each session an Episodic Memory Manager writes timestamped records (title, one-sentence summary, details paragraph). A Relational Memory Manager extracts (entity, relation, object, timestamp, source context) tuples. |
-| 3.2 Consolidation | Offline pass: embed (text-embedding-3-small), UMAP reduce (10 neighbours, 5 components), HDBSCAN cluster (minimum cluster size 10), then an LLM applies MERGE or DELETE inside each cluster to remove redundant, conflicting or outdated entries. The paper describes no safeguard, rollback or undo for either action. |
+| 3.2 Consolidation, Appendix C | Offline pass: embed (text-embedding-3-small), UMAP reduce (10 neighbours, 5 components), HDBSCAN cluster (minimum cluster size 10), then an LLM applies MERGE or DELETE inside each cluster to remove redundant, conflicting or outdated entries. The paper describes no safeguard, rollback or undo for either action. |
 | 3.3 Retrieval | Independent top-k over each store (k=10 episodes, 2k tuples), both fed to the answering model. |
+| 4.2 Results and Appendix D | LoCoMo 90.2 percent with gpt-4.1-mini (FullContext 91.3 percent, 87 percent fewer tokens); 83.5 percent with gpt-4o-mini at about 2.7K tokens per question against Mem0 61.3 percent and Zep 58.5 percent (Table 3); LongMemEval-S 85.5 percent. Episodic plus relational beats either alone (Appendix D, Table 6: 0.871 to 0.902 and 0.776 to 0.835; +6.3 multi-hop, +6.8 temporal with gpt-4o-mini). The consolidation pass shrinks the store 16.34 percent (Introduction and 4.2, Efficiency) for about a 1 point accuracy cost (Table 6: 0.902 to 0.892). The paper reports no token, latency or dollar cost of the consolidation pass itself. |
 | 5.2 | Accuracy plateaus around k=10. |
-| 5.3 | Consolidation sensitivity to cluster size. Every consolidated row sits at or below the unconsolidated baseline (0.902 baseline against 0.876 to 0.898); a minimum cluster size of 2 costs 2.6 points while 5 to 20 stays within about 1 point. The store shrinks 16.34 percent for about a 1 point accuracy cost; the cost of running the pass is not reported. |
-| 5 and Appendix D | LoCoMo 90.2 percent with gpt-4.1-mini (FullContext 91.3 percent, 87 percent fewer tokens); 83.5 percent with gpt-4o-mini at about 2.7K tokens per question against Mem0 61.3 percent and Zep 58.5 percent; LongMemEval-S 85.5 percent. Episodic plus relational beats either alone (Table 6: 0.871 to 0.902 and 0.776 to 0.835; +6.3 multi-hop, +6.8 temporal with gpt-4o-mini). |
-| 7 Limitations | Results depend on the backbone LLM (a 6.7 point swing between backbones). No code or data release. |
+| 5.3 Effect of cluster size | Table 5 sweeps the minimum cluster size. Every consolidated row sits at or below the unconsolidated baseline (0.902 baseline against 0.876 to 0.898); a minimum cluster size of 2 costs 2.6 points while 5 to 20 stays within about 1 point. The number of clusters, which the paper equates with the number of LLM consolidation calls, falls from 2,208 at size 2 to 144 at size 20, a reduction of up to 15x. |
+| 7 Limitations | Results depend on the backbone LLM (a 6.7 point swing between backbones). |
 
 ## 2. Operator assessment (verbatim, 2026-11-01)
 
@@ -34,11 +34,11 @@ File:line anchors are against the chain base this page was cut from (recorded in
 | 3.2 MERGE | `ConsolidationPass::run` (`compaction.rs:592`) with a `PreCompaction` decision gate before the destructive merge (`compaction.rs:622`), a write-ahead rollback entry (`compaction.rs:657`, persisted by `persist_rollback_write_ahead` at `compaction.rs:494`), a verify step (`compaction.rs:695`) and a reachability-checked rollback (`rollback_consolidation`, `compaction.rs:827`). Dry-run supported. Backend agnostic (SQLite and Postgres). | Covered; stricter than the paper, which describes none of these controls. |
 | 3.2 DELETE of outdated or conflicting facts | Non-destructive supersession: `kg_invalidate` sets `valid_until` (`src/handlers/kg.rs:871`); contradiction detection only flags rows (`src/curator/mod.rs:391-406`). | Reject LLM DELETE: no criteria, no undo, a fail-closed posture change (T3), and it removes the durable text. |
 | 3.1 episodic record (title, summary, details, timestamp) | Partial: `Memory` title, content and `created_at`; `memory_capture_turn` (`src/mcp/tools/capture_turn.rs:309`); `memory_atomise` splits a memory into 2 to 10 propositions (`src/mcp/tools/atomise.rs:261`, `Atomiser` at `src/atomisation/mod.rs:344`). No per-session pass writes a summary record. | Document; optional summary and event-time metadata is a later candidate. |
-| 3.1 relational tuples (entity, relation, object, time, context) | Partial. The knowledge graph is memory-to-memory: `KgQueryRow` carries a `target_id` memory id and a `MemoryLinkRelation` tag (`src/store/mod.rs:204-208`), with `valid_from` and `valid_until` on edges (`kg_timeline`, `src/store/sqlite.rs:4479`). Edges are authored by explicit calls. **Gap:** no LLM extraction of tuples and no source-context field. | Experiment first (R7). |
+| 3.1 relational tuples (entity, relation, object, time, context) | Partial. The knowledge graph is memory-to-memory: `KgQueryRow` carries a `target_id` memory id and a relation string (a `MemoryLinkRelation` value) (`src/store/mod.rs:204-208`), with `valid_from` and `valid_until` on edges (`kg_timeline`, `src/store/sqlite.rs:4479`). Edges are authored by explicit calls. **Gap:** no LLM extraction of tuples and no source-context field. | Experiment first (R7). |
 | 3.3 two-store independent top-k union | **Gap.** `recall_hybrid` (`src/store/sqlite.rs:2012`) returns memories from one store; `kg_query` (`sqlite.rs:4440`) runs separately and is not unioned into recall. | Experiment first, behind a flag, default off (R5). |
 | 5.2 k plateau | Recall limit knobs exist; no k sweep has been measured. | Folded into R4. |
 | 5.3 cluster-size sensitivity | `cosine_threshold` is configurable and clusters of 2 are kept (`cluster.rs:124`), the regime the paper's section 5.3 flags as costly. No sweep has been run. | Experiment first (R6). |
-| 5.3 pass cost | Not reported by the paper and not measured for ai-memory. `ConsolidationRunReport` carries cluster counts and rollback entries written. | Adopt as measurement (R2, R3, issue #6043). |
+| 5.3 pass cost | The paper reports cluster counts and LLM-call reductions (section 5.3) but no token, latency or dollar cost of the pass itself; not measured for ai-memory either. `ConsolidationRunReport` carries cluster counts and rollback entries written. | Adopt as measurement (R2, R3, issue #6043). |
 | LoCoMo harness | **Gap.** A LongMemEval harness (`benchmarks/longmemeval/`) and a reflection bench (`benches/longmemeval_reflection.rs`) exist; no LoCoMo harness. | Adopt (R4). |
 
 Counted-stub precedent for a deterministic benchmark arm: the `AutonomyLlm` stub in `benchmarks/longmemeval_reflection/runner.rs` (`DeterministicLlmStub`, `:103`, `summarize_memories` at `:145`) and the counting stub in the curator tests (`CountingStubLlm`, `src/curator/mod.rs:3257`). `docs/ROADMAP-v110.md` cites this precedent in its harness section.
@@ -60,11 +60,12 @@ Two cautions recorded by the lenses:
 ## 6. Risks the lenses recorded
 
 - An LLM extractor on every session multiplies LLM cost and adds derived state that can drift from the text. It must be metered against `max_ops_per_cycle` (`src/curator/mod.rs`, `AUTONOMY_OP_RESERVE_DIVISOR` at `:107`), rebuildable, model-fingerprinted like embeddings (#2167 precedent) and off by default.
+- Memory text is untrusted input to any LLM tuple extractor (R7): a stored memory can carry instructions aimed at the extractor, so the extractor must treat content as data, bound its output to the tuple schema, and fail closed on malformed or oversized output.
 - A seeded synthetic store cannot reproduce LoCoMo conversational redundancy, so a shrinkage figure from it is not comparable with the paper's 16.34 percent. Any accuracy figure from a seeded store must not be quoted as task performance (the `NO_MEASURED_PERF_CLAIM` rule in `docs/ROADMAP-v110.md`).
 - The paper reports a 6.7 point swing by backbone model, so any gain may not transfer to the operator's model or to agent-fleet corpora.
 - The benchmark must run on a seeded copy store, never a live one, or the experiment becomes the destructive operation.
 
-## 7. Adopted rows (acceptance criteria as recorded in the vote tally)
+## 7. Adopted rows (acceptance criteria as recorded in the vote tally and the voter returns)
 
 | Row | Item | Acceptance criterion | Size | Depends on |
 |---|---|---|---|---|
