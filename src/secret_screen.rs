@@ -228,68 +228,35 @@ fn token_at(content: &str, start: usize) -> &str {
     &content[start..end]
 }
 
-/// True when `head` ends in `intro` followed by exactly `digits` bytes that
-/// all satisfy `ok`.
-fn ends_with_code(head: &[u8], intro: &[u8], digits: usize, ok: fn(&u8) -> bool) -> bool {
-    head.len()
-        .checked_sub(intro.len() + digits)
-        .and_then(|start| head.get(start..))
-        .and_then(|t| t.strip_prefix(intro))
-        .is_some_and(|rest| rest.iter().all(ok))
+/// ASCII whitespace bytes that end a word run: space, tab, CR, LF, form feed
+/// and vertical tab.
+fn is_run_break(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b)
 }
 
-/// True when `head` ends in a terminal colour code (SGR: `[`, digits and
-/// `;`, then `m`); the escape byte itself, or its spelled-out form, sits
-/// before the `[` and is not required (fail closed).
-fn ends_with_colour_code(head: &[u8]) -> bool {
-    head.split_last().is_some_and(|(&last, rest)| {
-        last == b'm'
-            && rest
-                .iter()
-                .rposition(|b| !(b.is_ascii_digit() || *b == b';'))
-                .and_then(|i| rest.get(i))
-                == Some(&b'[')
-    })
-}
-
-/// True when `head` ends in the tail of an escaped, percent-encoded,
-/// quoted-printable or colour-coded delimiter. These end in an ASCII
-/// alphanumeric byte (`n`, `D`, `m`, ...) yet delimit the text that follows,
-/// so a key after one is a real key (#8452). Recognised: a backslash and one
-/// of `n t r b f v 0 a e`; a backslash and 1 to 3 octal digits; `\xXX`,
-/// `\uXXXX`, `\UXXXXXXXX`; `%X`, `%XX`, `%25XX`, `%uXXXX`; `=XX` with
-/// upper-case hex; an SGR colour code. A shape with non-hex digits (`%zz`,
-/// `\xzz`) is plain word text.
-fn ends_with_escaped_delimiter(head: &[u8]) -> bool {
-    let hex: fn(&u8) -> bool = u8::is_ascii_hexdigit;
-    let octal: fn(&u8) -> bool = |b| (b'0'..=b'7').contains(b);
-    let upper_hex: fn(&u8) -> bool = |b| b.is_ascii_digit() || (b'A'..=b'F').contains(b);
-    let letter: fn(&u8) -> bool = |b| b"ntrbfv0ae".contains(b);
-    ends_with_code(head, b"\\", 1, letter)
-        || (1..=3).any(|n| ends_with_code(head, b"\\", n, octal))
-        || ends_with_code(head, b"\\x", 2, hex)
-        || ends_with_code(head, b"\\u", 4, hex)
-        || ends_with_code(head, b"\\U", 8, hex)
-        || ends_with_code(head, b"%", 1, hex)
-        || ends_with_code(head, b"%", 2, hex)
-        || ends_with_code(head, b"%25", 2, hex)
-        || ends_with_code(head, b"%u", 4, hex)
-        || ends_with_code(head, b"=", 2, upper_hex)
-        || ends_with_colour_code(head)
-}
-
-/// True when the prefix at byte offset `pfx_start` begins a token: it is the
-/// start of the text, the byte before it is not a word character (ASCII
-/// alphanumeric, `-` or `_`), or that byte ends an escaped or percent-encoded
-/// delimiter ([`ends_with_escaped_delimiter`]) (#8452). A prefix inside a
-/// word (`task-` carries `sk-`) is never a credential. `=`, `:`, `/`, `+`
-/// and `.` stay boundaries so `KEY=sk-...` and `token: ghp_...` are still
-/// caught; any non-ASCII byte is a boundary (fail closed).
+/// True when the prefix at byte offset `pfx_start` begins a token (#8452).
+/// The prefix is glued inside a plain word, and the detector is suppressed,
+/// only when the byte before it is an ASCII letter or digit and every byte
+/// of the run back to the previous whitespace byte (or the start of the
+/// text) is an ASCII letter, digit, hyphen or underscore (`task-` carries
+/// `sk-`, `v2sk-` carries `sk-`). Every other lead is a boundary and the
+/// detector runs (fail closed): start of text, whitespace, a hyphen or
+/// underscore right before the prefix (the #1844 contract: `tag-sk-...` is
+/// masked), and any other ASCII or non-ASCII byte anywhere in the run, so an
+/// escape, percent code, colour code or entity before a key is never
+/// enumerated and never missed (3-agent vote 6def5ab6).
 fn at_token_boundary(content: &str, pfx_start: usize) -> bool {
     let head = content.as_bytes().get(..pfx_start).unwrap_or_default();
-    head.last()
-        .is_none_or(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
-        || ends_with_escaped_delimiter(head)
+    let run_start = head
+        .iter()
+        .rposition(|&b| is_run_break(b))
+        .map_or(0, |i| i.saturating_add(1));
+    let run = head.get(run_start..).unwrap_or_default();
+    let glued = run.last().is_some_and(u8::is_ascii_alphanumeric)
+        && run
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    !glued
 }
 
 /// Redact every `<prefix><token>` whose token clears the length + entropy
@@ -1696,31 +1663,26 @@ mod tests {
         let aws_tail = seeded_upper_alnum(11, AWS_KEY_BODY_LEN);
         let ghp_tail = seeded_body(12, 24);
         let xai_tail = seeded_body(13, 24);
+        // The issue reproductions (task-, disk-, kiosk-, whisk-) carry `sk-`
+        // inside a plain word: the byte before the prefix is a letter and
+        // the whole run is letters, digits, hyphens and underscores.
         let cases = [
-            "fix/task-ownership-scoping-r3".to_string(),
+            "task-ownership-scoping-r3".to_string(),
             "disk-partition-layout-v2-main".to_string(),
             "kiosk-provisioning-2026-rollout".to_string(),
             "whisk-ingestion-pipeline-run".to_string(),
+            "foo-bar-task-ownership-scoping-r3".to_string(),
             format!("xAKIA{aws_tail}"),
             format!("pAKIA{aws_tail}"),
             format!("fooxai-{xai_tail}"),
             format!("fooghp_{ghp_tail}"),
             format!("xgithub_pat_{ghp_tail}"),
             format!("fooBearer {xai_tail}"),
-            // A hyphen, underscore or digit before the prefix is part of the
-            // word (slug, snake_case, version tag), never a delimiter.
-            format!("grok-xai-{xai_tail}"),
-            format!("build_ghp_{ghp_tail}"),
+            // A digit before the prefix is part of the word (version tag).
             format!("v2sk-{xai_tail}"),
             format!("9AKIA{aws_tail}"),
-            // Escape-looking shapes that are not escapes (non-hex digits,
-            // an unknown letter) stay word text (round 3, hexany mutant).
-            format!("50%zzsk-{xai_tail}"),
-            format!("a\\xzzxai-{xai_tail}"),
-            format!("a\\uwxyzghp_{ghp_tail}"),
-            format!("a\\qxai-{xai_tail}"),
-            format!("a\\U0000zzzzxai-{xai_tail}"),
-            format!("a=zzsk-{xai_tail}"),
+            format!("build2ghp_{ghp_tail}"),
+            format!("foo-bar2xai-{xai_tail}"),
         ];
         for text in &cases {
             assert_eq!(
@@ -1740,6 +1702,46 @@ mod tests {
         }
     }
 
+    /// The run is the text since the last whitespace byte: each of the five
+    /// whitespace bytes ends it, an underscore stays inside it and a slash
+    /// ends the "plain word" property.
+    #[test]
+    fn run_structure_whitespace_underscore_slash_8452() {
+        let body = seeded_body(21, 40);
+        // A hyphen-joined word before a whitespace byte does not make the
+        // run after it glued: `task-<key>` after the break is a plain word.
+        for ws in ["\t", "\r", "\n", "\u{c}", "\u{b}", " "] {
+            let text = format!("a/b{ws}task-ownership-scoping-r3");
+            assert_eq!(screen(&text), ScreenOutcome::Clean, "ws break: {text:?}");
+            let glued = format!("a/b{ws}xsk-{body}");
+            assert_eq!(
+                screen(&glued),
+                ScreenOutcome::Clean,
+                "ws run glued: {glued:?}"
+            );
+        }
+        // An underscore inside the plain word keeps the run glued.
+        let under = format!("my_xsk-{body}");
+        assert_eq!(screen(&under), ScreenOutcome::Clean, "underscore: {under}");
+        // A slash anywhere in the run makes the key a boundary.
+        let slash = format!("path/xsk-{body}");
+        assert!(
+            matches!(screen(&slash), ScreenOutcome::Hit { .. }),
+            "slash run must be detected: {slash}"
+        );
+        // Without the whitespace break the same word stays a boundary.
+        let no_break = format!("a/bxsk-{body}");
+        assert!(
+            matches!(screen(&no_break), ScreenOutcome::Hit { .. }),
+            "slash run must be detected: {no_break}"
+        );
+    }
+
+    /// Fail-closed run rule (#8452, 3-agent vote 6def5ab6, memory 21ac4df1):
+    /// the detector is suppressed only for a plain word run. The leads below
+    /// include the six shapes earlier rounds pinned as benign (50%zz, a
+    /// backslash-xzz, a backslash-uwxyz, a backslash-q, a backslash-U with
+    /// non-hex digits, =zz): the rule now treats every one as a boundary.
     #[test]
     fn real_keys_after_a_separator_still_detected_8452() {
         let body = seeded_body(7, 40);
@@ -1752,28 +1754,26 @@ mod tests {
             (format!("Bearer {body}"), KIND_BEARER_TOKEN),
             (aws, KIND_AWS_ACCESS_KEY),
         ];
-        // Escaped and percent-encoded delimiters end in an alphanumeric byte but
-        // still delimit: a key after one is a real key (security F1, r1).
-        // The last lead is a non-ASCII letter: fail closed.
-        for lead in [
+        let leads = [
+            // separators and whitespace
             " ",
+            "\t",
+            "\r\n",
             "\"",
             "=",
             ":",
             "\n",
             "(",
+            // hyphen and underscore are boundaries (#1844 contract)
+            "-",
+            "_",
+            "tag-",
+            "my_",
+            "foo-bar-",
+            // C, JSON and shell escapes
             "\\n",
             "\\t",
             "\\r",
-            "\\u0022",
-            "\\x22",
-            "%3D",
-            "%22",
-            "%2F",
-            "caf\u{e9}",
-            // Round 3: the rest of the C/JSON escape set, octal and wide
-            // code points, doubly encoded and partial percent codes,
-            // quoted-printable, and terminal colour codes.
             "\\f",
             "\\b",
             "\\0",
@@ -1781,21 +1781,56 @@ mod tests {
             "\\a",
             "\\e",
             "\\042",
+            "\\x22",
+            "\\x1",
+            "\\u0022",
             "\\U00000022",
+            "\\3D",
+            "\\N{ESC}",
+            "\\",
+            "\\q",
+            // percent codes, quoted-printable, entities
+            "%3D",
+            "%22",
+            "%2F",
             "%253D",
             "%2520",
+            "%25253D",
             "%u0022",
             "%3",
+            "%",
             "=3D",
+            "=3d",
             "=20",
+            "&#61",
+            "&equals;",
+            // terminal control sequences, raw, spelled out and caret form
             "\u{1b}[1m",
             "\u{1b}[0;32m",
+            "\u{1b}[K",
+            "\u{1b}[2K",
+            "\u{1b}[?25l",
+            "\u{1b}[H",
+            "\r\u{1b}[2K",
+            "\u{1b}[38:5:196m",
+            "\u{1b}(B",
             "\\033[1m",
+            "\\033[2K",
             "\\e[1m",
             "\\x1b[1m",
             "\\u001b[1m",
             "[1m",
-        ] {
+            "^[[K",
+            // base64 padding, non-ASCII, and the former benign spellings
+            "AAAA==",
+            "caf\u{e9}",
+            "50%zz",
+            "\\xzz",
+            "\\uwxyz",
+            "\\U0000zzzz",
+            "=zz",
+        ];
+        for lead in leads {
             for (secret, kind) in &secrets {
                 let text = format!("note{lead}{secret}");
                 assert_eq!(kinds_of(&text), vec![*kind], "lead {lead:?} missed {kind}");
@@ -1806,43 +1841,72 @@ mod tests {
         for (secret, kind) in &secrets {
             assert_eq!(kinds_of(secret), vec![*kind], "start of text missed {kind}");
         }
+        // Whole-run property: a trigger byte far back in the run counts, a
+        // word-only run does not.
+        for far in [
+            format!("a=bcdefg-task-{}", &secrets[0].0),
+            format!("path/to/task-{}", &secrets[0].0),
+            format!("a.b.c.d.e.f.xtask{}", &secrets[2].0),
+        ] {
+            assert!(!kinds_of(&far).is_empty(), "far trigger missed: {far}");
+        }
     }
 
     /// Golden pin of the screened output (it feeds the cid and v2 attestation
-    /// preimages): one fixture per boundary class (#8452, security F4).
+    /// preimages): representative fixtures, one per boundary class the
+    /// changelog names (#8452).
     #[test]
     fn screened_output_golden_per_boundary_class_8452() {
         let body = seeded_body(7, 40);
         let ph = "[REDACTED:secret]";
-        let golden = [
-            // start of text, separator, escaped and percent-encoded delimiters
+        let mut golden = vec![
             (format!("sk-{body}"), ph.to_string()),
             (format!("note sk-{body}"), format!("note {ph}")),
             (format!("KEY=ghp_{body}"), format!("KEY={ph}")),
-            (format!("a\\nxai-{body}"), format!("a\\n{ph}")),
-            (format!("a%3Dsk-{body}"), format!("a%3D{ph}")),
-            (
-                format!("a\\u0022github_pat_{body}"),
-                format!("a\\u0022{ph}"),
-            ),
-            (format!("a\\x22sk-{body}"), format!("a\\x22{ph}")),
-            (format!("caf\u{e9}sk-{body}"), format!("caf\u{e9}{ph}")),
-            (format!("a\\fsk-{body}"), format!("a\\f{ph}")),
-            (format!("a\\042sk-{body}"), format!("a\\042{ph}")),
-            (
-                format!("a\\U00000022sk-{body}"),
-                format!("a\\U00000022{ph}"),
-            ),
-            (format!("a%253Dsk-{body}"), format!("a%253D{ph}")),
-            (format!("a=3Dsk-{body}"), format!("a=3D{ph}")),
-            (format!("\u{1b}[1msk-{body}"), format!("\u{1b}[1m{ph}")),
+            (format!("tag-sk-{body}"), format!("tag-{ph}")),
+            (format!("my_ghp_{body}"), format!("my_{ph}")),
+            (format!("a\u{1b}[1msk-{body}"), format!("a\u{1b}[1m{ph}")),
+            (format!("[1msk-{body}"), format!("[1m{ph}")),
         ];
+        // escapes, percent codes, quoted-printable, spelled colour codes and
+        // a non-ASCII lead: `a<lead>sk-<body>` becomes `a<lead><placeholder>`
+        for lead in [
+            "\\n",
+            "\\t",
+            "\\r",
+            "\\b",
+            "\\f",
+            "\\v",
+            "\\0",
+            "\\a",
+            "\\e",
+            "\\042",
+            "\\x22",
+            "\\u0022",
+            "\\U00000022",
+            "%3D",
+            "%253D",
+            "%2520",
+            "%u0022",
+            "=3D",
+            "=20",
+            "\\033[1m",
+            "\\e[1m",
+            "caf\u{e9}",
+        ] {
+            golden.push((format!("a{lead}sk-{body}"), format!("a{lead}{ph}")));
+        }
         for (input, want) in &golden {
             assert_eq!(&redacted_of(input), want, "golden drifted for {input}");
         }
         // Mid-word: passes through byte-identical.
-        let mid = format!("task-{body} and fooxai-{body}");
-        assert_eq!(screen(&mid), ScreenOutcome::Clean);
-        assert_eq!(redacted_of(&mid), mid);
+        for benign in [
+            format!("task-{body} and fooxai-{body}"),
+            format!("v2sk-{body}"),
+            format!("build2ghp_{body}"),
+        ] {
+            assert_eq!(screen(&benign), ScreenOutcome::Clean, "{benign}");
+            assert_eq!(redacted_of(&benign), benign);
+        }
     }
 }
