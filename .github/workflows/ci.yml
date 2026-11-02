@@ -2483,7 +2483,7 @@ jobs:
             exit 1
           fi
           python3 scripts/check-zip-extract-unreachable.py
-          cargo audit
+          cargo audit --deny warnings
 
       # CI-speed: the release build here is only a release-PROFILE compile
       # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are

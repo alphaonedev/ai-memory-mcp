@@ -2,10 +2,16 @@
 # https://github.com/rustsec/rustsec/tree/main/cargo-audit
 
 [advisories]
-# RUSTSEC-2026-0097: rand unsound with custom logger using rand::rng()
-# Affects rand 0.8.5 (via instant-distance, hf-hub) and 0.9.2 (via tokenizers, candle-core).
-# Not applicable: we do not use a custom global logger that calls rand::rng().
-# No upstream fix available — blocked on rand crate patch.
+# RUSTSEC-2024-0449: unsafe-libyaml 0.2.11 is unmaintained (informational
+# "unmaintained" warning, not a vulnerability). Reached only through
+# serde_yaml_ng 0.10, which has 8 mentions in src/ (6 code sites, 2 comments):
+# src/parsing/skill_md.rs:58, src/parsing/skill_md.rs:185,
+# src/mcp/tools/skill_export.rs:478 (comment), :767 (comment), :777, :801, :806
+# and src/federation/identity/inventory.rs:307. All of them parse or emit
+# operator-supplied skill and inventory YAML; no fixed unsafe-libyaml version
+# exists. Review by 2027-02-01; tracked by #8473 item 3, which also carries the
+# serde_yaml_ng replacement decision. Remove this record and the ignore when
+# serde_yaml_ng is replaced or moves off unsafe-libyaml.
 #
 # RUSTSEC-2023-0071: Marvin Attack on rsa crate via timing side-channels.
 # Reached transitively only when `--features sal-postgres` is built
@@ -33,8 +39,8 @@
 # the same removal.
 # Decision: 3-agent vote (6def5ab6), memory 34425e02.
 ignore = [
-    "RUSTSEC-2026-0097",
     "RUSTSEC-2023-0071",
+    "RUSTSEC-2024-0449", # unsafe-libyaml unmaintained; review by 2027-02-01, see #8473
     "RUSTSEC-2026-0367", # zip extract(); see #7302, guarded by check-zip-extract-unreachable.py
     "RUSTSEC-2026-0368", # zip extract(); see #7302, guarded by check-zip-extract-unreachable.py
     "RUSTSEC-2026-0369", # zip extract() (CVSS 9.1); see #7302, guarded by check-zip-extract-unreachable.py
