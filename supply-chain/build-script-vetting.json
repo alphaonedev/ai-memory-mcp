@@ -172,9 +172,9 @@
     },
     {
       "name": "libc",
-      "version": "0.2.185",
+      "version": "0.2.191",
       "source": "registry",
-      "checksum": "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f",
+      "checksum": "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
     },
@@ -193,6 +193,18 @@
       "checksum": "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
+    },
+    {
+      "name": "nix",
+      "version": "0.31.3",
+      "source": "registry",
+      "checksum": "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d",
+      "disposition": "reviewed",
+      "reviewed_on": "2026-11-02",
+      "review_record": "docs/security/build-script-vetting.md#nix-0313",
+      "build_dependencies": [
+        "cfg_aliases@0.2.1"
+      ]
     },
     {
       "name": "num-bigint-dig",
