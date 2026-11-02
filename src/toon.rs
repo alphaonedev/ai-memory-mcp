@@ -125,7 +125,13 @@ const MEMORY_FIELDS: &[&str] = &[
     field_names::CREATED_AT,
     field_names::UPDATED_AT,
     "metadata",
+    CONTENT_PRINCIPAL_COLUMN,
 ];
+
+/// #8443: the foreign-content marker (`metadata.content_principal`) surfaced
+/// as a top-level column, like `agent_id`, so a reader of any TOON format can
+/// tell whose content a row is. Empty means owner content.
+const CONTENT_PRINCIPAL_COLUMN: &str = crate::role_grounding::META_CONTENT_PRINCIPAL;
 
 /// Compact memory fields — omits timestamps for tighter output.
 /// Includes `agent_id` (pulled out of `metadata.agent_id`) so AI clients using
@@ -140,6 +146,7 @@ const MEMORY_FIELDS_COMPACT: &[&str] = &[
     "score",
     "tags",
     "agent_id",
+    CONTENT_PRINCIPAL_COLUMN,
 ];
 
 /// Serialize a recall/list/search response to TOON format.
@@ -155,6 +162,15 @@ const MEMORY_FIELDS_COMPACT: &[&str] = &[
 /// def456|Redis cache|long|infra|8|1.0|0.541|0|redis,cache|claude|2026-04-03T15:01:00+00:00|2026-04-03T15:01:00+00:00
 /// ```
 pub fn memories_to_toon(response: &Value, compact: bool) -> String {
+    memories_to_toon_for(response, compact, None)
+}
+
+/// [`memories_to_toon`] rendered for a known reading caller (issue #8443, code
+/// L7). A `content_principal` marker that names the reader (compared without
+/// regard to letter case) renders as `unknown`, exactly as the formation fold
+/// reads it: content that claims the reader as its principal is not the
+/// reader's own content. `None` (a local operator) renders the raw marker.
+pub fn memories_to_toon_for(response: &Value, compact: bool, reader: Option<&str>) -> String {
     let fields = if compact {
         MEMORY_FIELDS_COMPACT
     } else {
@@ -231,8 +247,16 @@ pub fn memories_to_toon(response: &Value, compact: bool) -> String {
                 .map(|&field| {
                     // #199: `agent_id` is nested inside metadata in the Memory struct.
                     // Surface it as a top-level TOON column by digging into metadata.
-                    if field == "agent_id" {
-                        format_value(mem.get("metadata").and_then(|m| m.get("agent_id")))
+                    if field == CONTENT_PRINCIPAL_COLUMN {
+                        let cell = mem.get("metadata").and_then(|m| m.get(field));
+                        match (cell.and_then(Value::as_str), reader) {
+                            (Some(marker), Some(r)) if marker.eq_ignore_ascii_case(r.trim()) => {
+                                crate::role_grounding::PRINCIPAL_UNKNOWN.to_string()
+                            }
+                            _ => format_value(cell),
+                        }
+                    } else if field == "agent_id" {
+                        format_value(mem.get("metadata").and_then(|m| m.get(field)))
                     } else {
                         format_value(mem.get(field))
                     }
@@ -248,15 +272,21 @@ pub fn memories_to_toon(response: &Value, compact: bool) -> String {
 
 /// Serialize a search response (which uses "results" key) to TOON.
 pub fn search_to_toon(response: &Value, compact: bool) -> String {
+    search_to_toon_for(response, compact, None)
+}
+
+/// [`search_to_toon`] rendered for a known reading caller (see
+/// [`memories_to_toon_for`]).
+pub fn search_to_toon_for(response: &Value, compact: bool, reader: Option<&str>) -> String {
     // Search uses "results" instead of "memories" — normalize
     if response.get("results").is_some() && response.get("memories").is_none() {
         let mut normalized = response.clone();
         if let Some(results) = response.get("results") {
             normalized["memories"] = results.clone();
         }
-        return memories_to_toon(&normalized, compact);
+        return memories_to_toon_for(&normalized, compact, reader);
     }
-    memories_to_toon(response, compact)
+    memories_to_toon_for(response, compact, reader)
 }
 
 /// Format a single JSON value for TOON output.
@@ -430,7 +460,10 @@ mod tests {
         });
         let toon = memories_to_toon(&resp, true);
         // #199: agent_id is in the compact header; it's empty when metadata is absent
-        assert!(toon.contains("memories[id|title|tier|namespace|priority|score|tags|agent_id]:"));
+        // #8443: `content_principal` follows `agent_id` (empty for owner rows).
+        assert!(toon.contains(
+            "memories[id|title|tier|namespace|priority|score|tags|agent_id|content_principal]:"
+        ));
         assert!(!toon.contains("created_at"));
         assert!(!toon.contains("confidence"));
     }
@@ -453,8 +486,8 @@ mod tests {
         let toon = memories_to_toon(&resp, true);
         let row = toon.lines().last().unwrap();
         assert!(
-            row.ends_with("|alice"),
-            "agent_id must be the last compact column; row: {row}"
+            row.ends_with("|alice|"),
+            "agent_id precedes the (empty) content_principal column; row: {row}"
         );
     }
 

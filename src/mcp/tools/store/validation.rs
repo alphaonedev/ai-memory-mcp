@@ -207,6 +207,9 @@ pub(super) fn parse_and_build_memory(
     } else {
         serde_json::json!({})
     };
+    // #8443: `content_principal` is server-stamped. A caller-supplied value
+    // (for example a claimed owner) is dropped before anything reads it.
+    crate::role_grounding::strip_content_principal(&mut metadata);
     // Resolve agent_id via the NHI-hardened precedence chain and merge into
     // metadata. Explicit values win in this order:
     //   1. top-level `agent_id` param

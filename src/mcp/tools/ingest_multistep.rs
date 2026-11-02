@@ -92,6 +92,9 @@ const REQUIRED_TIER: &str = "smart";
 ///   has no LLM wired (collapses to the tier-locked advisory).
 /// - `tier` — fallback tier for the advisory envelope when `handler`
 ///   is `None`.
+/// - `caller` — the authenticated caller's agent id (#8443). It names the
+///   memory owner in the role-grounding block of every LLM stage; `None`
+///   renders the unidentified-owner form.
 ///
 /// # Errors
 ///
@@ -102,6 +105,7 @@ pub fn handle_ingest_multistep(
     params: &Value,
     handler: Option<&IngestMultistepHandler>,
     tier: FeatureTier,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     // ── Argument validation ─────────────────────────────────────────
     let content = params
@@ -145,8 +149,11 @@ pub fn handle_ingest_multistep(
     };
 
     // ── Execute ────────────────────────────────────────────────────
-    let executor: IngestExecutor<dyn LlmDispatch> =
+    let mut executor: IngestExecutor<dyn LlmDispatch> =
         IngestExecutor::new(Arc::clone(&handler.dispatch));
+    if let Some(c) = caller {
+        executor = executor.with_owner(c);
+    }
     let trace = executor
         .run(&pipeline, content, &[], None, Some(namespace))
         .map_err(|e| format!("INGEST_MULTISTEP_FAILED: {e}"))?;
@@ -270,21 +277,21 @@ mod tests {
 
     #[test]
     fn missing_content_errors() {
-        let err = handle_ingest_multistep(&json!({}), None, FeatureTier::Smart).unwrap_err();
+        let err = handle_ingest_multistep(&json!({}), None, FeatureTier::Smart, None).unwrap_err();
         assert!(err.contains("content is required"), "got: {err}");
     }
 
     #[test]
     fn non_string_content_errors() {
-        let err =
-            handle_ingest_multistep(&json!({"content": 42}), None, FeatureTier::Smart).unwrap_err();
+        let err = handle_ingest_multistep(&json!({"content": 42}), None, FeatureTier::Smart, None)
+            .unwrap_err();
         assert!(err.contains("must be a string"), "got: {err}");
     }
 
     #[test]
     fn empty_content_errors() {
-        let err =
-            handle_ingest_multistep(&json!({"content": ""}), None, FeatureTier::Smart).unwrap_err();
+        let err = handle_ingest_multistep(&json!({"content": ""}), None, FeatureTier::Smart, None)
+            .unwrap_err();
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
@@ -295,6 +302,7 @@ mod tests {
             &json!({"content": "hello world"}),
             Some(&h),
             FeatureTier::Keyword,
+            None,
         )
         .expect("tier-locked is informational");
         assert_eq!(
@@ -310,6 +318,7 @@ mod tests {
             &json!({"content": "hello world"}),
             None,
             FeatureTier::Semantic,
+            None,
         )
         .expect("none-handler degrades to advisory");
         assert!(resp["tier-locked"].is_string());
@@ -322,6 +331,7 @@ mod tests {
             &json!({"content": "hi", "pipeline_variant": "magic"}),
             Some(&h),
             FeatureTier::Smart,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("two_phase"), "got: {err}");
@@ -340,6 +350,7 @@ mod tests {
             &json!({"content": "Paris is the capital of France."}),
             Some(&h),
             FeatureTier::Smart,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["variant"], "two_phase");
@@ -361,6 +372,7 @@ mod tests {
             &json!({"content": "Paris", "pipeline_variant": "four_step"}),
             Some(&h),
             FeatureTier::Smart,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["variant"], "four_step");
@@ -388,6 +400,7 @@ mod tests {
             }),
             Some(&h),
             FeatureTier::Smart,
+            None,
         )
         .expect("ok");
         // Helper-only pipeline → final output is the helper payload.

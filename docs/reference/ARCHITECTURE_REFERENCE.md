@@ -735,6 +735,30 @@ trust-all reads.
   `memory_consolidate` (the consolidator's id becomes `agent_id`)
 - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by
   `ai-memory mine` alongside the caller's `agent_id`
+- `content_principal` — whose content the row is, as opposed to who wrote it
+  (#8443, arXiv 2610.38209, role grounding). Always derived by the server from the
+  authenticated caller, never read from a request: any caller-supplied value is
+  stripped at every ingress (MCP store, HTTP create, SAL store and store_batch,
+  federation receive may only demote to a valid non-owner principal, and a claim
+  naming the receiver, the row's own author or the share target (compared without
+  regard to letter case) is replaced by the publisher, else `unknown`; an import
+  whose bundle `agent_id` is the importing caller is stamped `unknown`). The value is
+  the publisher agent id, or `unknown`, stamped on content that did not come from
+  the owner's own turn (`memory_share` copies, `memory_notify` deliveries,
+  untrusted `import`, mined transcripts, atoms of foreign sources); `mixed` after a
+  consolidation folds foreign and owner sources. `owner`, `unknown` and `mixed`
+  are reserved agent ids. Owner-direct rows carry no key. An absent key is read
+  relative to the owner: a row whose `agent_id` differs from the consolidating
+  owner is foreign under its author whether or not it carries a key, and with no
+  owner hint two or more authors fold to `mixed`. A background pass (consolidate,
+  compaction, reflection, persona, autonomy) folds relative to the NAMESPACE OWNER;
+  the id it writes under is only the writer, so an owner-authored cluster stays
+  owner content. Update, dedup re-store and merge
+  are existing-wins (a foreign row stays foreign; an incoming-only value is
+  dropped), and export then import keeps a claimed non-owner principal. Summaries,
+  personas, reflections, atoms and synthesis never fold a non-owner preference into
+  an "owner prefers" statement, and recall (including the default TOON formats)
+  returns the key (a TOON cell naming the authenticated reader renders `unknown`).
 
 **Defaults that leak:** The fallback `host:<hostname>` exposes the hostname
 (since #1720 B1 it no longer carries the PID). When writing memories to a

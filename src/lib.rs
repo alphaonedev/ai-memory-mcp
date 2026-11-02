@@ -333,10 +333,13 @@ pub const META_KEY_DERIVED_FROM: &str = "derived_from";
 ///
 /// [`field_names::AGENT_PUBKEY`]: crate::models::field_names::AGENT_PUBKEY
 /// [`field_names::PUBKEY_BOUND_AT`]: crate::models::field_names::PUBKEY_BOUND_AT
-pub const RESERVED_UPSERT_METADATA_KEYS: [&str; 5] = [
+pub const RESERVED_UPSERT_METADATA_KEYS: [&str; 6] = [
     META_KEY_AGENT_ID,
     META_KEY_DERIVED_FROM,
     META_KEY_CONSOLIDATED_FROM_AGENTS,
+    // #8443 (arXiv 2610.38209): whose content a row is survives an upsert, so
+    // a re-store onto a foreign row cannot launder it into owner content.
+    crate::role_grounding::META_CONTENT_PRINCIPAL,
     crate::models::field_names::AGENT_PUBKEY,
     crate::models::field_names::PUBKEY_BOUND_AT,
 ];
@@ -359,7 +362,7 @@ pub const RESERVED_UPSERT_METADATA_KEYS: [&str; 5] = [
 #[macro_export]
 macro_rules! reserved_upsert_metadata_keys_sql {
     () => {
-        "'agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at'"
+        "'agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at'"
     };
 }
 
@@ -1004,6 +1007,7 @@ pub mod reranker;
 // cost-of-access gradient). `Tier::default_ttl_secs` routes through it.
 pub mod retention;
 pub mod revisions;
+pub mod role_grounding;
 pub mod secret_screen;
 // v1.0.0 #1961 (R23/R7) — the `asi-hard` hardened, no-disable security posture.
 pub mod security_profile;

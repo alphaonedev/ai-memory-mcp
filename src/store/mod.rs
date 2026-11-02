@@ -736,6 +736,13 @@ pub struct CallerContext {
     /// gate's own `agent_id` argument, so the binding cannot diverge
     /// from what the ACL authorised (closes the impersonation seam).
     pub capability: Option<crate::governance::capability::CapabilityToken>,
+    /// #8443 (arXiv 2610.38209) - trusted-import flag. The SAL store strips a
+    /// caller-supplied `content_principal` at ingress; when this flag is set the
+    /// strip keeps the value already on the row. Set ONLY by the HTTP import
+    /// handler AFTER `role_grounding::restamp_untrusted_import` has re-derived
+    /// the value server-side. It carries the principal through and nothing else:
+    /// it is not a bypass context and does not touch visibility or governance.
+    pub keep_server_principal: bool,
 }
 
 impl CallerContext {
@@ -749,6 +756,7 @@ impl CallerContext {
             request_id: None,
             bypass_visibility: false,
             capability: None,
+            keep_server_principal: false,
         }
     }
 
@@ -776,7 +784,17 @@ impl CallerContext {
             request_id: None,
             bypass_visibility: true,
             capability: None,
+            keep_server_principal: false,
         }
+    }
+
+    /// #8443 - mark this context as a trusted import whose `content_principal`
+    /// was server-stamped by `restamp_untrusted_import`; the SAL ingress strip
+    /// then keeps it. Only the HTTP import handler calls this.
+    #[must_use]
+    pub fn with_server_stamped_principal(mut self) -> Self {
+        self.keep_server_principal = true;
+        self
     }
 
     /// v0.9.0 G10.1 (#1827) — attach an edge-parsed capability token to

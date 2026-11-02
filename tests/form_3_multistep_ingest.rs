@@ -270,6 +270,7 @@ fn mcp_tool_handler_returns_consistent_cache_key_envelope() {
         &json!({"content": "Paris", "pipeline_variant": "four_step"}),
         Some(&handler),
         FeatureTier::Smart,
+        None,
     )
     .expect("ok");
     assert_eq!(resp["variant"], "four_step");

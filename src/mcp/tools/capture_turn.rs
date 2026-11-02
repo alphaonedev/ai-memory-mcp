@@ -646,6 +646,10 @@ pub(crate) fn prepare_capture_turn(
     // verbatim when present with a matching agent_id (checked above).
     let metadata = {
         let mut m = req.metadata.clone().unwrap_or_else(|| json!({}));
+        // #8443 (arXiv 2610.38209): `content_principal` is server-stamped; a
+        // caller-supplied value is dropped on this ingress too (MCP, HTTP, CLI
+        // and both backends share this builder).
+        crate::role_grounding::strip_content_principal(&mut m);
         if let Some(obj) = m.as_object_mut() {
             obj.entry("agent_id".to_string())
                 .or_insert_with(|| Value::String(caller.to_string()));

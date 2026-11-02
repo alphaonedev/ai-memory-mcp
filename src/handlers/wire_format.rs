@@ -28,22 +28,35 @@ use crate::toon::{self, WireFormat};
 /// Serialize a recall/list-shaped payload (`"memories"` array) per the
 /// negotiated format. TOON variants return `text/plain; charset=utf-8`
 /// (axum's `String` responder); JSON keeps the legacy envelope.
-pub(crate) fn memories_response(format: WireFormat, payload: Value) -> Response {
+///
+/// `reader` is the authenticated reading caller: the TOON principal cell is
+/// rendered relative to it (#8443, a marker naming the reader reads unknown).
+pub(crate) fn memories_response(
+    format: WireFormat,
+    payload: Value,
+    reader: Option<&str>,
+) -> Response {
     match format {
         WireFormat::Json => Json(payload).into_response(),
-        WireFormat::Toon => toon::memories_to_toon(&payload, false).into_response(),
-        WireFormat::ToonCompact => toon::memories_to_toon(&payload, true).into_response(),
+        WireFormat::Toon => toon::memories_to_toon_for(&payload, false, reader).into_response(),
+        WireFormat::ToonCompact => {
+            toon::memories_to_toon_for(&payload, true, reader).into_response()
+        }
     }
 }
 
 /// Serialize a search-shaped payload (`"results"` array) per the
 /// negotiated format. Same content-type contract as
 /// [`memories_response`].
-pub(crate) fn search_response(format: WireFormat, payload: Value) -> Response {
+pub(crate) fn search_response(
+    format: WireFormat,
+    payload: Value,
+    reader: Option<&str>,
+) -> Response {
     match format {
         WireFormat::Json => Json(payload).into_response(),
-        WireFormat::Toon => toon::search_to_toon(&payload, false).into_response(),
-        WireFormat::ToonCompact => toon::search_to_toon(&payload, true).into_response(),
+        WireFormat::Toon => toon::search_to_toon_for(&payload, false, reader).into_response(),
+        WireFormat::ToonCompact => toon::search_to_toon_for(&payload, true, reader).into_response(),
     }
 }
 

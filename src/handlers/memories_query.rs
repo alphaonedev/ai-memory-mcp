@@ -438,6 +438,7 @@ pub async fn search_memories(
             request_id: None,
             // #910 — tenant-facing path; never bypass the visibility filter.
             bypass_visibility: false,
+            keep_server_principal: false,
             // v0.9.0 G10.1 (#1827) — read-only search path; no
             // governance gate runs here, so no token is carried.
             capability: None,
@@ -458,6 +459,7 @@ pub async fn search_memories(
                 crate::handlers::wire_format::search_response(
                     format,
                     json!({"results": r, "count": r.len(), "query": p.q}),
+                    Some(resolved_caller.as_str()),
                 )
             }
             Err(e) => store_err_to_response(e),
@@ -557,6 +559,7 @@ pub async fn search_memories(
                     crate::handlers::wire_format::search_response(
                         format,
                         json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}),
+                        Some(resolved_caller.as_str()),
                     )
                 }
                 Err(e) => crate::handlers::errors::handler_error_500(&e),
@@ -611,6 +614,7 @@ pub async fn search_memories(
             crate::handlers::wire_format::search_response(
                 format,
                 json!({"results": r, "count": r.len(), "query": p.q}),
+                Some(resolved_caller.as_str()),
             )
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),

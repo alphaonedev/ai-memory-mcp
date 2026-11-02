@@ -937,9 +937,8 @@ const QUERY_EXPANSION_PROMPT: &str = r"You are a search query expander. Given a 
 
 Query: {query}";
 
-const SUMMARIZE_PROMPT: &str = r"Summarize the following memories into a single concise paragraph. Preserve all key facts, decisions, and technical details.
-
-{memories}";
+// #8443: the summarise prompt and its renderer live beside the grounding block.
+pub use crate::role_grounding::{SUMMARIZE_PROMPT, render_summarize_prompt};
 
 const AUTO_TAG_PROMPT: &str = r"Generate 3-5 short tags for categorizing this memory. Return ONLY the tags, one per line, lowercase, no symbols.
 
@@ -2335,16 +2334,38 @@ impl OllamaClient {
     /// Propagates any error from the underlying [`Self::generate_async`]
     /// call.
     pub async fn summarize_memories_async(&self, memories: &[(String, String)]) -> Result<String> {
-        let formatted = memories
-            .iter()
-            .enumerate()
-            .map(|(i, (title, content))| {
-                format!("--- Memory {} ---\nTitle: {}\n{}", i + 1, title, content)
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        self.summarize_memories_grounded_async(None, memories).await
+    }
 
-        let prompt = SUMMARIZE_PROMPT.replace("{memories}", &formatted);
+    /// #8443 — summarise with the role-grounding block rendered for `owner`
+    /// (the principal the memory store belongs to, taken from the caller or
+    /// the store, never from content). `None` renders the unidentified-owner
+    /// form, so every preference is recorded as unknown.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from the underlying LLM call or content validation.
+    pub fn summarize_memories_grounded(
+        &self,
+        owner: Option<&str>,
+        memories: &[(String, String)],
+    ) -> Result<String> {
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.summarize_memories_grounded_async(owner, memories)
+        })?
+    }
+
+    /// Async twin of [`Self::summarize_memories_grounded`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from the underlying [`Self::generate_async`] call.
+    pub async fn summarize_memories_grounded_async(
+        &self,
+        owner: Option<&str>,
+        memories: &[(String, String)],
+    ) -> Result<String> {
+        let prompt = render_summarize_prompt(owner, memories)?;
         let response = self.generate_async(&prompt, None).await?;
 
         crate::validate::validate_content(&response)?;

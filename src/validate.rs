@@ -360,6 +360,11 @@ pub const RESERVED_AGENT_IDS: &[&str] = &[
     crate::identity::sentinels::EMBEDDING_BACKFILL,
     crate::identity::sentinels::WAKE_HUB_PRODUCER,
     crate::identity::hub_delegation::A2A_HUB_SCOPE,
+    // #8443: the content-principal words. An agent id spelled like one would
+    // read as the owner (or as unknown/mixed) in `content_principal`.
+    crate::role_grounding::PRINCIPAL_OWNER,
+    crate::role_grounding::PRINCIPAL_UNKNOWN,
+    crate::role_grounding::PRINCIPAL_MIXED,
 ];
 
 /// Shape-only validation for an agent identifier — the pre-#977
@@ -448,7 +453,10 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
     let hub_scoped_form = agent_id
         .strip_prefix(crate::identity::hub_delegation::A2A_HUB_SCOPE)
         .is_some_and(|suffix| suffix.starts_with('/'));
-    if RESERVED_AGENT_IDS.contains(&agent_id) || hub_scoped_form {
+    if RESERVED_AGENT_IDS.contains(&agent_id)
+        || hub_scoped_form
+        || crate::role_grounding::is_reserved_principal_word(agent_id)
+    {
         bail!(
             "agent_id '{agent_id}' is reserved for internal use and cannot be supplied by wire \
              callers"

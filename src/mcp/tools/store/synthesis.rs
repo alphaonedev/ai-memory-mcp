@@ -214,7 +214,14 @@ pub(super) fn run_synthesis_pass(
 
     // PERF-7 — resolve the per-namespace prompt cap once.
     let cap = ns_policy.effective_synthesis_max_candidate_chars();
-    match crate::synthesis::synthesise_with_cap(llm, &mem.title, &mem.content, &cands, cap) {
+    match crate::synthesis::synthesise_grounded(
+        llm,
+        Some(agent_id),
+        &mem.title,
+        &mem.content,
+        &cands,
+        cap,
+    ) {
         Ok(resp) => {
             let counts = crate::synthesis::SynthesisCounts::from_response(&resp);
             tracing::info!(
