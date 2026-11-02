@@ -364,22 +364,20 @@ fn allowed_imports_and_public_decoder_aliases_remain_allowed() {
 #[test]
 fn production_after_inline_tests_is_still_checked() {
     let prefix = "#[cfg(test)] mod tests { fn fixture() { crate::identity::keypair::load(); let s = r###\"} /*\"###; } }";
-    assert!(
-        violations(prefix, &["wake_hub", "delegation_verifier"])
-            .0
-            .is_empty()
+    assert_eq!(
+        violations(prefix, &["wake_hub", "delegation_verifier"]).0,
+        [] as [std::string::String; 0]
     );
     let denied = format!("{prefix} fn production() {{ crate::identity::keypair::load(); }}");
-    assert!(
-        !violations(&denied, &["wake_hub", "delegation_verifier"])
-            .0
-            .is_empty()
+    assert_ne!(
+        violations(&denied, &["wake_hub", "delegation_verifier"]).0,
+        [] as [std::string::String; 0]
     );
     let allowed = format!(
         "{prefix} fn production() {{ crate::identity::keypair::decode_public_base64(s); }}"
     );
     let (bad, edges) = violations(&allowed, &["wake_hub", "delegation_verifier"]);
-    assert!(bad.is_empty());
+    assert_eq!(bad, [] as [std::string::String; 0]);
     assert!(edges.contains("identity::keypair::decode_public_base64"));
 }
 
@@ -397,10 +395,9 @@ fn database_and_api_configuration_is_refused() {
             "missed {source}"
         );
     }
-    assert!(
-        violations("fn f() { read(\"hub-allowlist.json\"); }", &["wake_hub"])
-            .0
-            .is_empty()
+    assert_eq!(
+        violations("fn f() { read(\"hub-allowlist.json\"); }", &["wake_hub"]).0,
+        [] as [std::string::String; 0]
     );
 }
 
@@ -441,5 +438,8 @@ fn literals_cannot_hide_following_production_edges() {
         );
     }
     let text = r####"fn f() { let _ = br###"crate::db::open(); /* }"###; }"####;
-    assert!(violations(text, &["wake_hub"]).0.is_empty());
+    assert_eq!(
+        violations(text, &["wake_hub"]).0,
+        [] as [std::string::String; 0]
+    );
 }

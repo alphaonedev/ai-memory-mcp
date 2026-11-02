@@ -825,5 +825,8 @@ pub fn build_llm() -> OllamaClient {
 #[test]
 fn detector_spares_a_commented_out_probe_free_mention_3523() {
     let src = "    // OllamaClient::new_for_tests_without_probe(&uri, \"m\");\n";
-    assert!(probe_free_call_sites("src/doc.rs", src).is_empty());
+    assert_eq!(
+        probe_free_call_sites("src/doc.rs", src),
+        [] as [std::string::String; 0]
+    );
 }

@@ -496,12 +496,12 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
             .expect("unguarded revoke"),
         1
     );
-    assert!(
+    assert_eq!(
         store
             .list_agent_api_keys()
             .await
-            .expect("list after the approved emptying")
-            .is_empty()
+            .expect("list after the approved emptying"),
+        [] as [(std::string::String, std::string::String); 0]
     );
 }
 

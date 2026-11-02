@@ -440,10 +440,9 @@ async fn pushes_distinguish_accepting_rejecting_and_not_applying_peers() {
 async fn bulk_catchup_push_records_the_peer_and_its_report() {
     let ok = peer_id();
     let cfg = config(&spawn_peer(Answer::Ok).await, &ok);
-    assert!(
-        ai_memory::federation::bulk_catchup_push(&cfg, &[memory()])
-            .await
-            .is_empty()
+    assert_eq!(
+        ai_memory::federation::bulk_catchup_push(&cfg, &[memory()]).await,
+        [] as [(std::string::String, std::string::String); 0]
     );
     assert!(
         freshness::snapshot_for(&ok)

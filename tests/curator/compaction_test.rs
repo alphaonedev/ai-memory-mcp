@@ -210,7 +210,7 @@ fn compaction_rollback_event_round_trips() {
     assert_eq!(back.pass_name, "consolidation");
     assert_eq!(back.summary_id, "sum-1");
     assert_eq!(back.namespace, "team/ops");
-    assert!(!back.reason.is_empty());
+    assert_ne!(back.reason, "");
 }
 
 // ---------------------------------------------------------------------------

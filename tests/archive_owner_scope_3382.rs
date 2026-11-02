@@ -63,15 +63,13 @@ fn visibility_and_owner_rules_both_apply_before_pagination() {
     assert!(all.iter().any(|v| v["id"] == unowned));
     let page = db::list_archived_scoped(&conn, None, Some("ai:bob"), 1, 1).expect("page");
     assert_eq!(page, all[1..2]);
-    assert!(
-        db::list_archived_scoped(&conn, None, Some("ai:bob"), 0, 0)
-            .expect("zero")
-            .is_empty()
+    assert_eq!(
+        db::list_archived_scoped(&conn, None, Some("ai:bob"), 0, 0).expect("zero"),
+        [] as [serde_json::Value; 0]
     );
-    assert!(
-        db::list_archived_scoped(&conn, None, Some("ai:bob"), 1, 2)
-            .expect("end")
-            .is_empty()
+    assert_eq!(
+        db::list_archived_scoped(&conn, None, Some("ai:bob"), 1, 2).expect("end"),
+        [] as [serde_json::Value; 0]
     );
     let stats = db::archive_stats_scoped(&conn, Some("ai:bob")).expect("stats");
     assert_eq!(stats["archived_total"], 2);
@@ -104,15 +102,13 @@ fn explicit_inbox_namespace_and_legacy_alias_still_work() {
         [&id],
     )
     .expect("legacy spelling");
-    assert!(
-        db::list_archived_scoped(&conn, None, Some("ai:bob"), 50, 0)
-            .expect("ambient")
-            .is_empty()
+    assert_eq!(
+        db::list_archived_scoped(&conn, None, Some("ai:bob"), 50, 0).expect("ambient"),
+        [] as [serde_json::Value; 0]
     );
-    assert!(
-        db::list_archived_scoped(&conn, None, None, 50, 0)
-            .expect("singleton ambient")
-            .is_empty()
+    assert_eq!(
+        db::list_archived_scoped(&conn, None, None, 50, 0).expect("singleton ambient"),
+        [] as [serde_json::Value; 0]
     );
     for caller in [Some("ai:bob"), None] {
         let rows = db::list_archived_scoped(&conn, Some("_inbox/ai:bob"), caller, 50, 0)
@@ -120,10 +116,10 @@ fn explicit_inbox_namespace_and_legacy_alias_still_work() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], id);
     }
-    assert!(
+    assert_eq!(
         db::list_archived_scoped(&conn, Some("_inbox/ai:bob"), Some("ai:mallory"), 50, 0)
-            .expect("other")
-            .is_empty()
+            .expect("other"),
+        [] as [serde_json::Value; 0]
     );
     assert_eq!(
         db::archive_stats_scoped(&conn, Some("ai:bob")).expect("stats")["archived_total"],

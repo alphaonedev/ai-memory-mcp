@@ -29,10 +29,13 @@ fn seed(conn: &Connection) {
         [&"x".repeat(2_000_000)],
     )
     .expect("seed oversize row");
-    assert!(
-        db::get_unembedded_ids_batch(conn, 10)
-            .expect("scan")
-            .is_empty()
+    assert_eq!(
+        db::get_unembedded_ids_batch(conn, 10).expect("scan"),
+        [] as [(
+            std::string::String,
+            std::string::String,
+            std::string::String
+        ); 0]
     );
     let count: i64 = conn
         .query_row("SELECT count(*) FROM embed_skip", [], |r| r.get(0))
@@ -112,7 +115,14 @@ fn sqlite_upgrade_preserves_embed_skip_healing(version: i64) {
         [&"x".repeat(2_000_000)],
     )
     .unwrap();
-    assert!(db::get_unembedded_ids_batch(&conn, 10).unwrap().is_empty());
+    assert_eq!(
+        db::get_unembedded_ids_batch(&conn, 10).unwrap(),
+        [] as [(
+            std::string::String,
+            std::string::String,
+            std::string::String
+        ); 0]
+    );
     assert_heals(&conn);
 }
 
@@ -245,12 +255,13 @@ mod postgres {
         .await
         .expect("seed oversize");
         let admin = CallerContext::for_admin("ai:upgrade-4078");
-        assert!(
-            store
-                .list_unembedded(&admin, 10)
-                .await
-                .expect("scan")
-                .is_empty()
+        assert_eq!(
+            store.list_unembedded(&admin, 10).await.expect("scan"),
+            [] as [(
+                std::string::String,
+                std::string::String,
+                std::string::String
+            ); 0]
         );
         let count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM embed_skip WHERE memory_id='upgrade-4078'")

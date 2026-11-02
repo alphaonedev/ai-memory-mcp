@@ -139,19 +139,19 @@ async fn fixture() -> (PostgresStore, Memory, Memory, Memory) {
             .len(),
         2
     );
-    assert!(
+    assert_eq!(
         store
             .lineage_cypher(&root.id, DEPTH, false)
             .await
-            .expect("healthy, stale AGE")
-            .is_empty()
+            .expect("healthy, stale AGE"),
+        [] as [ai_memory::models::LineageNode; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .lineage_descendants(&root.id, DEPTH)
             .await
-            .expect("general query retains AGE dispatch")
-            .is_empty()
+            .expect("general query retains AGE dispatch"),
+        [] as [ai_memory::models::LineageNode; 0]
     );
     (store, root, child, grandchild)
 }

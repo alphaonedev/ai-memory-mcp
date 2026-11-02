@@ -1200,7 +1200,7 @@ mod tests {
     #[test]
     fn auto_namespace_returns_nonempty() {
         let ns = ai_memory::cli::helpers::auto_namespace();
-        assert!(!ns.is_empty());
+        assert_ne!(ns, "");
     }
 
     // Issue #358: parser must accept inline trailing comments after a

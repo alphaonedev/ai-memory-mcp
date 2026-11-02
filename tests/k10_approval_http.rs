@@ -357,7 +357,10 @@ async fn http_approve_forever_is_refused_nothing_recorded_3394() {
         .expect("read")
         .expect("row present");
     assert_eq!(row.status, "pending");
-    assert!(ai_memory::approvals::list_synthetic_rules().is_empty());
+    assert_eq!(
+        ai_memory::approvals::list_synthetic_rules(),
+        [] as [ai_memory::approvals::SyntheticPermissionRule; 0]
+    );
     set_active_hooks_hmac_secret(None);
 }
 

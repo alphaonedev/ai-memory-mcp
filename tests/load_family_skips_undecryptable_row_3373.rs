@@ -89,7 +89,7 @@ fn load_family_skips_the_undecryptable_row_and_returns_the_rest_3373() {
         .expect("poison the envelope");
     assert_eq!(n, 1);
     let err = db::get(&conn, &lost_id).expect_err("the single-row read fails closed on it");
-    assert!(!format!("{err}").is_empty());
+    assert_ne!(format!("{err}"), "");
 
     // The family read is a discovery scan: Ok, the readable row present, the
     // undecryptable row ABSENT (never served as empty placeholder content,
