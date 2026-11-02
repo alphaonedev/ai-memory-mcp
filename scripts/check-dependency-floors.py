@@ -11,9 +11,16 @@ The OSV querybatch hit is authoritative: the local range walk only computes
 the fixed version, and a hit it cannot place becomes a finding with
 fixed_in=unknown, never a dropped one.
 
+Every OSV record is evaluated on its own id: an acceptance covers a record
+only when the acceptance id equals the record id or is one of that record's
+own OSV aliases. Records that link directly id-to-alias fold into one display
+group (one finding), but each keeps its own `floor:` line, fixed_in and
+accepted state, and aliases never union across records.
+
 Exit codes: 0 gate passes; 1 gate fails (unaccepted finding, expired or
 malformed acceptance, OSV failure); 2 unusable input (lock file missing,
-empty or not a Cargo.lock; non-https --osv-url).
+empty or not a Cargo.lock; non-https --osv-url; unparsable --today; a missing
+or malformed --osv-json, --audit-json or OSV advisory shape).
 
 Python 3.9+, standard library only.
 """
@@ -51,10 +58,16 @@ RC_FAIL = 1
 RC_INPUT = 2
 ACCEPTED_REQUIRED = ("id", "package", "rationale", "review_by", "tracking_issue")
 ACCEPTED_OPTIONAL = ("aliases",)
+RFC3339_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
 
 
 class OsvError(Exception):
     """OSV could not be queried; the gate fails closed."""
+
+
+class InputError(Exception):
+    """An input (offline OSV file, audit file, advisory shape, --today) is unusable; rc 2."""
 
 
 class AcceptedError(Exception):
@@ -137,6 +150,8 @@ def vkey(text):
 def affected_fixed_in(detail, name, version):
     """Return None when version is outside every affected range, else the fix text."""
     want = vkey(version)
+    if not isinstance(detail, dict):
+        raise InputError("OSV advisory detail is not an object")
     for aff in detail.get("affected", []):
         pkg = aff.get("package", {})
         if pkg.get("name") not in (None, name):
@@ -148,7 +163,12 @@ def affected_fixed_in(detail, name, version):
         for rng in aff.get("ranges", []):
             if rng.get("type") == "GIT":
                 continue
-            events = sorted(rng.get("events", []), key=lambda e: vkey(next(iter(e.values()))))
+            raw_events = rng.get("events", [])
+            for ev in raw_events:
+                if not isinstance(ev, dict) or len(ev) != 1 or not isinstance(next(iter(ev.values())), str):
+                    raise InputError("OSV advisory %s has a malformed range event: %r" % (
+                        detail.get("id", "?"), ev))
+            events = sorted(raw_events, key=lambda e: vkey(next(iter(e.values()))))
             start = None
             for ev in events:
                 if "introduced" in ev:
@@ -219,8 +239,31 @@ def check_batch_response(reply, expected):
     return results
 
 
-def query_findings(packages, post, get, batch_size):
-    """Return findings [{id, aliases, package, version, fixed_in}] from OSV."""
+def withdrawn_stamp(detail, vid):
+    """Return the withdrawn timestamp text or None; a non-RFC-3339 value raises OsvError."""
+    raw = detail.get("withdrawn")
+    if raw is None or raw is False:
+        return None
+    m = RFC3339_RE.fullmatch(raw) if isinstance(raw, str) else None
+    ok = False
+    if m is not None:
+        try:
+            datetime.date.fromisoformat(m.group(1))
+            ok = int(m.group(2)) < 24 and int(m.group(3)) < 60 and int(m.group(4)) <= 60
+        except ValueError:
+            ok = False
+    if not ok:
+        raise OsvError("OSV advisory %s carries a withdrawn value that is not an RFC 3339 timestamp: %r" % (
+            vid, raw))
+    return raw
+
+
+def query_findings(packages, post, get, batch_size, notes=None):
+    """Return one record {id, aliases, package, version, fixed_in} per OSV hit.
+
+    Records are never merged here. A withdrawn advisory is skipped and
+    announced as a `floor: withdrawn ...` line appended to notes.
+    """
     hits = {}
     for i in range(0, len(packages), batch_size):
         chunk = packages[i:i + batch_size]
@@ -233,51 +276,81 @@ def query_findings(packages, post, get, batch_size):
     findings = []
     for vid in sorted(hits):
         detail = get(OSV_VULN_PATH + vid)
-        if detail.get("withdrawn"):
+        if not isinstance(detail, dict):
+            raise InputError("OSV advisory detail for %s is not an object" % vid)
+        stamp = withdrawn_stamp(detail, vid)
+        if stamp is not None:
+            for n, v in hits[vid]:
+                if notes is not None:
+                    notes.append("floor: withdrawn %s %s %s withdrawn=%s" % (vid, n, v, stamp))
             continue
+        aliases = detail.get("aliases") or []
+        if not isinstance(aliases, list) or not all(isinstance(a, str) for a in aliases):
+            raise InputError("OSV advisory %s has malformed aliases" % vid)
         for n, v in hits[vid]:
             fixed = affected_fixed_in(detail, n, v)  # None: local walk cannot place the hit
-            findings.append({"id": vid, "aliases": sorted(detail.get("aliases", [])),
+            findings.append({"id": vid, "aliases": sorted(aliases),
                              "package": n, "version": v,
                              "fixed_in": UNKNOWN_FIX if fixed is None else fixed})
-    return dedupe(findings)
+    return findings
 
 
-def dedupe(findings):
-    """Fold records that name the same advisory (id or alias overlap) into one."""
-    out = []
-    for f in sorted(findings, key=lambda x: (not x["id"].startswith("RUSTSEC"), x["id"])):
-        ids = {f["id"]} | set(f["aliases"])
-        for g in out:
-            if g["package"] == f["package"] and g["version"] == f["version"] \
-                    and ids & ({g["id"]} | set(g["aliases"])):
-                g["aliases"] = sorted(set(g["aliases"]) | (ids - {g["id"]}))
+def linked(a, b):
+    """True when two records link directly id-to-alias (either direction)."""
+    return a["id"] in b["aliases"] or b["id"] in a["aliases"]
+
+
+def group_findings(records):
+    """Fold directly linked records into display groups: [[primary, folded...], ...].
+
+    No transitive union: a folded record is never the anchor of another fold,
+    and no record gains aliases. Each record is still evaluated on its own.
+    """
+    groups = []
+    for rec in sorted(records, key=lambda x: (not x["id"].startswith("RUSTSEC"), x["id"],
+                                              x["package"], x["version"])):
+        for grp in groups:
+            head = grp[0]
+            if head["package"] == rec["package"] and head["version"] == rec["version"] \
+                    and linked(head, rec):
+                grp.append(rec)
                 break
         else:
-            out.append(f)
-    return out
+            groups.append([rec])
+    return groups
 
 
 def merge_audit(findings, audit):
-    """Merge a `cargo audit --json` document into findings by id or alias."""
-    items = list(audit.get("vulnerabilities", {}).get("list", []))
-    for group in audit.get("warnings", {}).values():
+    """Add `cargo audit --json` advisories that no OSV record already names.
+
+    An advisory counts as already known only when it links directly (id to
+    alias, either way) to a record of the same package; known advisories are
+    not merged into that record, so no alias set grows.
+    """
+    if not isinstance(audit, dict):
+        raise InputError("cargo audit json is not an object")
+    items = list((audit.get("vulnerabilities") or {}).get("list", []))
+    for group in (audit.get("warnings") or {}).values():
         items.extend(group)
+    out = list(findings)
     for item in items:
-        adv, pkg = item.get("advisory"), item.get("package", {})
+        if not isinstance(item, dict):
+            raise InputError("cargo audit json has an entry that is not an object")
+        adv, pkg = item.get("advisory"), item.get("package") or {}
         if not adv:
             continue
-        ids = {adv["id"]} | set(adv.get("aliases", []))
+        if not isinstance(adv, dict) or not isinstance(adv.get("id"), str) or not adv["id"]:
+            raise InputError("cargo audit json has an advisory without an id")
+        aliases = sorted(a for a in adv.get("aliases", []) if isinstance(a, str))
         patched = item.get("versions", {}).get("patched", [])
-        known = [f for f in findings
-                 if f["package"] == pkg.get("name") and ids & ({f["id"]} | set(f["aliases"]))]
-        if known:
-            known[0]["aliases"] = sorted(set(known[0]["aliases"]) | (ids - {known[0]["id"]}))
-        else:
-            findings.append({"id": adv["id"], "aliases": sorted(ids - {adv["id"]}),
-                             "package": pkg.get("name", "?"), "version": pkg.get("version", "?"),
-                             "fixed_in": ", ".join(patched) if patched else "none"})
-    return dedupe(findings)
+        rec = {"id": adv["id"], "aliases": aliases, "package": pkg.get("name", "?"),
+               "version": pkg.get("version", "?"),
+               "fixed_in": ", ".join(patched) if patched else "none"}
+        if any(f["package"] == rec["package"] and (f["id"] == rec["id"] or linked(f, rec))
+               for f in out):
+            continue
+        out.append(rec)
+    return out
 
 
 def parse_value(raw):
@@ -343,8 +416,20 @@ def parse_accepted(text):
     return entries
 
 
-def evaluate(findings, entries, today):
-    """Return (lines, problems, warnings, accepted_count, unaccepted_count)."""
+def covering(entries, rec):
+    """Return (index, entry) of the first acceptance for this record on its own id/aliases."""
+    for idx, ent in enumerate(entries):
+        if ent["package"] == rec["package"] and (ent["id"] == rec["id"] or ent["id"] in rec["aliases"]):
+            return idx, ent
+    return None, None
+
+
+def evaluate(groups, entries, today):
+    """Return (lines, problems, warnings, accepted_groups, unaccepted_groups).
+
+    One line per record. A group counts as accepted only when every record of
+    it is covered by a live acceptance; any other group counts as unaccepted.
+    """
     lines, problems, warnings = [], [], []
     used = set()
     n_acc = n_bad = 0
@@ -352,23 +437,27 @@ def evaluate(findings, entries, today):
         if ent["review_by"] < today:
             problems.append("acceptance %s (%s) expired on %s (tracking #%d)" % (
                 ent["id"], ent["package"], ent["review_by"], ent["tracking_issue"]))
-    for f in sorted(findings, key=lambda x: (x["id"], x["package"], x["version"])):
-        ids = {f["id"]} | set(f["aliases"])
-        match = None
-        for idx, ent in enumerate(entries):
-            if ent["package"] == f["package"] and ent["id"] in ids:
-                match = ent
+    for grp in sorted(groups, key=lambda g: (g[0]["id"], g[0]["package"], g[0]["version"])):
+        group_ok = True
+        for rec in grp:
+            idx, match = covering(entries, rec)
+            if match is not None:
                 used.add(idx)
-                break
-        if match is not None and match["review_by"] >= today:
-            state = "yes via %s review_by=%s" % (match["id"], match["review_by"])
+            if match is not None and match["review_by"] >= today:
+                state = "yes via %s review_by=%s" % (match["id"], match["review_by"])
+            else:
+                group_ok = False
+                state = "no" if match is None else "expired %s via %s" % (match["review_by"], match["id"])
+            line = "floor: %s %s %s fixed_in=%s aliases=%s accepted=%s" % (
+                rec["id"], rec["package"], rec["version"], rec["fixed_in"],
+                ",".join(rec["aliases"]) or "-", state)
+            if rec is not grp[0]:
+                line += " folded_into=%s" % grp[0]["id"]
+            lines.append(line)
+        if group_ok:
             n_acc += 1
         else:
-            state = "no" if match is None else "expired %s via %s" % (match["review_by"], match["id"])
             n_bad += 1
-        lines.append("floor: %s %s %s fixed_in=%s aliases=%s accepted=%s" % (
-            f["id"], f["package"], f["version"], f["fixed_in"],
-            ",".join(f["aliases"]) or "-", state))
     for idx, ent in enumerate(entries):
         if idx not in used:
             warnings.append("stale acceptance %s (%s): no locked version is affected, remove it" % (
@@ -376,10 +465,43 @@ def evaluate(findings, entries, today):
     return lines, problems, warnings, n_acc, n_bad
 
 
+def manifest_package_name(path):
+    """Return the [package] name of a Cargo.toml, or None when absent or unreadable."""
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return None
+    in_pkg = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            in_pkg = line == "[package]"
+        elif in_pkg:
+            m = re.match(r'^name\s*=\s*"([^"]+)"', line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def workspace_member_names(lock_path):
+    """Names of the root and fuzz packages next to the lock (never queried by name)."""
+    base = Path(lock_path).resolve().parent
+    names = {manifest_package_name(base / "Cargo.toml"),
+             manifest_package_name(base / "fuzz" / "Cargo.toml"),
+             manifest_package_name(base.parent / "Cargo.toml") if base.name == "fuzz" else None}
+    names.discard(None)
+    return names
+
+
 def build_io(args):
     base = args.osv_url.rstrip("/")
     if args.offline:
-        saved = json.loads(Path(args.osv_json).read_text())
+        try:
+            saved = json.loads(Path(args.osv_json).read_text())
+        except (OSError, ValueError) as exc:
+            raise InputError("cannot read --osv-json %s: %s" % (args.osv_json, exc))
+        if not isinstance(saved, dict):
+            raise InputError("--osv-json %s is not an object" % args.osv_json)
         hits, vulns = saved.get("hits", {}), saved.get("vulns", {})
 
         def post(path, body):
@@ -390,7 +512,10 @@ def build_io(args):
             return {"results": res}
 
         def get(path):
-            return vulns[path[len(OSV_VULN_PATH):]]
+            key = path[len(OSV_VULN_PATH):]
+            if key not in vulns:
+                raise InputError("--osv-json has no advisory %s" % key)
+            return vulns[key]
         return post, get, None
     record = {"hits": {}, "vulns": {}}
 
@@ -431,7 +556,11 @@ def main(argv=None):
     if not args.offline and not args.osv_url.lower().startswith("https://"):
         print("dependency-floors: --osv-url must be https:// unless --offline", file=sys.stderr)
         return RC_INPUT
-    today = datetime.date.fromisoformat(args.today) if args.today else datetime.date.today()
+    try:
+        today = datetime.date.fromisoformat(args.today) if args.today else datetime.date.today()
+    except ValueError:
+        print("dependency-floors: --today %r is not a YYYY-MM-DD date" % args.today, file=sys.stderr)
+        return RC_INPUT
     try:
         lock_text = Path(args.lock).read_text()
     except OSError as exc:
@@ -442,33 +571,47 @@ def main(argv=None):
         print("dependency-floors: %s is empty or not a Cargo.lock (no version header or no registry package)"
               % args.lock, file=sys.stderr)
         return RC_INPUT
+    members = workspace_member_names(args.lock)
+
+    def queried(n, k):
+        return k == KIND_REGISTRY or (k == KIND_PATH and n not in members)
     skipped = ["floor: skipped %s %s source=%s %s" % (
-        n, v, k, "queried=yes" if k == KIND_PATH else "queried=no")
+        n, v, k, "queried=yes" if queried(n, k) else "queried=no")
         for n, v, k in every if k != KIND_REGISTRY]
-    packages = [(n, v) for n, v, k in every if k in (KIND_REGISTRY, KIND_PATH)]
+    packages = [(n, v) for n, v, k in every if queried(n, k)]
     try:
         entries = parse_accepted(Path(args.accepted).read_text())
     except (OSError, AcceptedError) as exc:
         print("dependency-floors: acceptance file problem: %s" % exc, file=sys.stderr)
         return RC_FAIL
-    post, get, record = build_io(args)
+    notes = []
     try:
-        findings = query_findings(sorted(set(packages)), post, get, args.batch_size)
+        post, get, record = build_io(args)
+        findings = query_findings(sorted(set(packages)), post, get, args.batch_size, notes)
+    except InputError as exc:
+        print("dependency-floors: input problem: %s" % exc, file=sys.stderr)
+        return RC_INPUT
     except OsvError as exc:
         print("dependency-floors: %s" % exc, file=sys.stderr)
         return RC_FAIL
     if record is not None and args.save_osv:
         Path(args.save_osv).write_text(json.dumps(record, indent=1, sort_keys=True))
     if args.audit_json:
-        findings = merge_audit(findings, json.loads(Path(args.audit_json).read_text()))
-    lines, problems, warnings, n_acc, n_bad = evaluate(findings, entries, today)
-    for line in skipped + lines:
+        try:
+            findings = merge_audit(findings, json.loads(Path(args.audit_json).read_text()))
+        except (OSError, ValueError, InputError) as exc:
+            print("dependency-floors: input problem: audit json %s: %s" % (args.audit_json, exc),
+                  file=sys.stderr)
+            return RC_INPUT
+    groups = group_findings(findings)
+    lines, problems, warnings, n_acc, n_bad = evaluate(groups, entries, today)
+    for line in skipped + notes + lines:
         print(line)
     for msg in warnings:
         print("warning: " + msg)
     for msg in problems:
         print("error: " + msg)
-    print("dependency-floors: %d findings, %d accepted, %d unaccepted" % (len(findings), n_acc, n_bad))
+    print("dependency-floors: %d findings, %d accepted, %d unaccepted" % (len(groups), n_acc, n_bad))
     return RC_FAIL if (n_bad or problems) else RC_OK
 
 
