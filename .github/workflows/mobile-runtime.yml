@@ -284,20 +284,26 @@ jobs:
       # future regression that re-introduces it.
       - name: Pin no-openssl-sys invariant (#1070)
         run: |
-          set -euo pipefail
-          if cargo tree --locked \
+          set -uo pipefail
+          # #8473 round 3: "absent" is proved only by cargo's own no-match
+          # message. Any other non-zero exit (a stale lock, a network error, a
+          # bad flag) is a failure of the check itself and must not read as
+          # "openssl-sys is absent".
+          out=$(cargo tree --locked \
             -e normal \
             --target x86_64-linux-android \
             --no-default-features \
             --features sqlite-bundled \
-            -i openssl-sys >/dev/null 2>&1; then
+            -i openssl-sys 2>&1)
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
             echo "::error::#1070 regression: openssl-sys is in the Android transitive graph"
-            cargo tree --locked \
-              -e normal \
-              --target x86_64-linux-android \
-              --no-default-features \
-              --features sqlite-bundled \
-              -i openssl-sys
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          if ! printf '%s\n' "$out" | grep -Fq 'did not match any packages'; then
+            echo "::error::cargo tree failed (rc $rc) without the no-match message; the openssl-sys check could not run"
+            printf '%s\n' "$out"
             exit 1
           fi
           echo "::notice::#1070 no-openssl-sys invariant holds — Android build is rustls-only"
