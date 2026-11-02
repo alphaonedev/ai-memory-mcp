@@ -333,7 +333,7 @@ PINNED_CONTENT = {
     "infra/pgbouncer/pgbouncer.ini": "3aaabe9d6c683f0b6d3e47061d0de9543059283ea195b7a380c22de13c628946",
     "infra/pgbouncer/userlist.txt": "c6f9bb4ae05b289be2749dd528075c0dc885a2653578bab9a26c51c59c591e9a",
     "infra/pgbouncer/role-defaults.sql": "1ba2789501d6fbcf245a3cab8cc2811d04f7fb198c10d9edc7e9f8cccc3bac20",
-    "infra/pillar4-envelope/measure-envelope.sh": "0646bcdc60d6afb28126387bf163770226c09cdf9768eb4d51a1bf33c51d22a3",
+    "infra/pillar4-envelope/measure-envelope.sh": "7a3fdce626d7343ad2369705a26526a105d452b0e8f3c29660c33ea36e111f3b",
 }
 PIN_REVIEW = "requires a full code and security review of its diff before the pin moves (#4734)"
 
@@ -893,12 +893,17 @@ guard checks, the integer or decimal `case` validation measure-envelope.sh runs 
 self-default line of every name here (ENV_NUMERIC_VALIDATION, asserted by
 test_env_numeric_defaults_are_validated_digits_only_4734_r23), and the content pin of the script
 (PINNED_CONTENT), so neither line can change without a full review of the diff."""
+ENV_NUMERIC_LIMITS = "STEP_DURATION_MAX_DIGITS=6\nDECIMAL_TUNABLE_MAX_CHARS=12\n"
 ENV_NUMERIC_VALIDATION = (
     '{name}="${{{name}:-{default}}}"\n'
     "# The ramp arithmetic reads {name}, so it must be digits only with no leading zero (#4734 r23).\n"
     'case "${name}" in\n'
     "  ''|*[!0-9]*|0[0-9]*) echo \"FATAL: {name} must be digits only\" >&2; exit 65 ;;\n"
     "esac\n"
+    'if [ "${{#{name}}}" -gt "$STEP_DURATION_MAX_DIGITS" ]; then\n'
+    '  echo "FATAL: {name} must be at most $STEP_DURATION_MAX_DIGITS digits" >&2\n'
+    '  exit 65\n'
+    'fi\n'
 )
 ENV_NUMERIC_DEFAULT_VALUES = {"STEP_DURATION_SECS": "20", "P95_BUDGET_MS": "250", "SHED_RATE_KNEE": "0.01"}  # r23 decision 4: the self-default of each name
 ENV_DECIMAL_VALIDATION = (
@@ -906,6 +911,10 @@ ENV_DECIMAL_VALIDATION = (
     'case "${name}" in\n'
     "  ''|*[!0-9.]*|*.*.*|.|0[0-9]*) echo \"FATAL: {name} must be a decimal number\" >&2; exit 65 ;;\n"
     "esac\n"
+    'if [ "${{#{name}}}" -gt "$DECIMAL_TUNABLE_MAX_CHARS" ]; then\n'
+    '  echo "FATAL: {name} must be at most $DECIMAL_TUNABLE_MAX_CHARS characters" >&2\n'
+    '  exit 65\n'
+    'fi\n'
 )
 FUNC_NUMERIC = {"now_ms": "9a85ef3cf712502a8fcbd75f0c7d519cd7f9f2a1b3f74c3821237d615f27df50"}
 """r22 decision 2d: a script-defined function is a numeric source only when its name and the sha256 of its
@@ -2109,15 +2118,15 @@ G_COMPOUND_COMMANDS = (
 )
 G_SQL_PREFIX = ('BEGIN;', "LOAD 'age';", 'SET LOCAL search_path = ag_catalog, "$user", public;')
 G_LITERAL_BLOCKS = (
+    ('numeric-validation-limits', tuple(ENV_NUMERIC_LIMITS.rstrip('\n').split('\n'))),
     ('verifier-case', ('case "$VERIFIER_ROW" in', '\'"ai_memory" "SCRAM-SHA-256$\'*) ;;',
      '*) echo "FATAL: role ai_memory has no SCRAM-SHA-256 verifier" >&2; exit 73 ;;', 'esac')),
     ('run-name-case', ('case "$RUN" in', RUN_CASE_ARM, 'esac')),
     ('password-free-url-case', ('case "${POOLED_URL#*://}" in',
      '*:*@*) echo "FATAL: POOLED_URL must not carry a password in its userinfo" >&2; exit 74 ;;', 'esac')),
-    ('integer-default-validation', (
-     'STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"',
-     'case "$STEP_DURATION_SECS" in',
-     '\'\'|*[!0-9]*|0[0-9]*) echo "FATAL: STEP_DURATION_SECS must be digits only" >&2; exit 65 ;;', 'esac')),
+    ('integer-default-validation', tuple(line for line in ENV_NUMERIC_VALIDATION.format(
+        name='STEP_DURATION_SECS', default=ENV_NUMERIC_DEFAULT_VALUES['STEP_DURATION_SECS']).rstrip('\n').split('\n')
+        if not line.startswith('#'))),
     *(("decimal-validation-" + name, tuple(ENV_DECIMAL_VALIDATION.format(
         name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name]).rstrip("\n").split("\n")))
       for name in ("P95_BUDGET_MS", "SHED_RATE_KNEE")),
@@ -2245,6 +2254,9 @@ def shell_grammar_problems(text, name='text', trace=None):
             for label, block in G_LITERAL_BLOCKS:
                 if stack and 'validation' in label:
                     continue
+                if ('validation' in label and label != 'numeric-validation-limits'
+                        and 'numeric-validation-limits' not in defined):
+                    continue
                 j, matched = i, []
                 for k, wanted in enumerate(block):
                     if label == 'integer-default-validation':
@@ -2265,7 +2277,9 @@ def shell_grammar_problems(text, name='text', trace=None):
                     j += 1
                 else:
                     production, consumed = label, j - i
-                    if label == 'integer-default-validation':
+                    if label == 'numeric-validation-limits':
+                        defined.add(label)
+                    elif label == 'integer-default-validation':
                         numeric.add('STEP_DURATION_SECS')
                     elif label.startswith('decimal-validation-'):
                         defined.add(label)
@@ -2967,8 +2981,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
             codes = [int(c) for ln in code for c in re.findall(r"(?<![\w-])exit\s+(\d+)", ln)]
             big = sorted(c for c in codes if c >= 64)
             # 65 has one meaning (a bad input value) at pinned sites: AI_MEMORY_SMOKE_RUN's character class
-            # and 64-character bound, plus the envelope's integer and decimal numeric checks (#8312).
-            self.assertEqual(big.count(65), 5 if path == ENVELOPE else 2, "%s: exit 65 sites" % path.name)
+            # and 64-character bound, plus the envelope's numeric shape and length checks (#8342).
+            self.assertEqual(big.count(65), 8 if path == ENVELOPE else 2, "%s: exit 65 sites" % path.name)
             big = [c for c in big if c != 65] + [65]
             self.assertEqual(len(big), len(set(big)), "%s: exit code reused: %r" % (path.name, big))
             header = "\n".join(ln for ln in path.read_text().split("\n")[:50] if ln.startswith("#"))
@@ -3384,8 +3398,8 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
     SMOKE_GROUPS_EXPECTED = 34
     SMOKE_FAIL_GROUPS_EXPECTED = 15
     SMOKE_FAIL_CALLS_EXPECTED = 0
-    ENVELOPE_GROUPS_EXPECTED = 61  # #8312: two decimal-threshold validation cases
-    ENVELOPE_FAIL_GROUPS_EXPECTED = 15  # #8312: both threshold cases carry a FATAL exit
+    ENVELOPE_GROUPS_EXPECTED = 64  # #8342: three numeric-length validation groups
+    ENVELOPE_FAIL_GROUPS_EXPECTED = 18  # #8342: each length guard carries a FATAL exit
     ENVELOPE_FAIL_CALLS_EXPECTED = 4
 
     @staticmethod
@@ -4271,10 +4285,12 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         # once per name, before any other read of the name.
         text = ENVELOPE.read_text()
         self.assertEqual(sorted(ENV_NUMERIC_DEFAULT_VALUES), sorted(ENV_NUMERIC_DEFAULTS))
+        self.assertEqual(text.count(ENV_NUMERIC_LIMITS), 1)
         for name in sorted(ENV_NUMERIC_DEFAULTS):
             template = ENV_NUMERIC_VALIDATION if name in ENV_INTEGER_DEFAULTS else ENV_DECIMAL_VALIDATION
             block = template.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
             self.assertEqual(text.count(block), 1, name)
+            self.assertLess(text.index(ENV_NUMERIC_LIMITS), text.index(block))
             code_before = "\n".join(ln for ln in text[: text.index(block)].split("\n") if not ln.lstrip().startswith("#"))
             self.assertNotIn(name, code_before, "%s is read before its validation" % name)
             self.assertNotIn("$" + name, next(line for line in block.split("\n") if "FATAL:" in line), "the FATAL line must not echo the value of %s" % name)
@@ -4622,9 +4638,10 @@ class StrictSubsetGrammar8312(unittest.TestCase):
         bash = shutil.which('bash')
         self.assertIsNotNone(bash, 'bash is required for numeric-validation parity')
         for name in ('P95_BUDGET_MS', 'SHED_RATE_KNEE'):
-            block = ENV_DECIMAL_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+            block = ENV_NUMERIC_LIMITS + ENV_DECIMAL_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
             # Execute only the checked validation production, never a supplied command.
             for value, status in (('0', 0), ('250', 0), ('0.01', 0), ('.5', 0), ('5.', 0),
+                                  ('9' * 12, 0), ('9' * 13, 65), ('9' * 11 + '.9', 65),
                                   ('0250', 65), ('007', 65), ('00', 65), ('007.5', 65), ('01.5', 65),
                                   ('.', 65), ('1.2.3', 65), ('-1', 65), ('1e2', 65), ('bad-value', 65)):
                 with self.subTest(name=name, value=value):
@@ -4640,8 +4657,9 @@ class StrictSubsetGrammar8312(unittest.TestCase):
         bash = shutil.which('bash')
         self.assertIsNotNone(bash, 'bash is required for numeric-validation parity')
         name = 'STEP_DURATION_SECS'
-        block = ENV_NUMERIC_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
-        for value, status in (('0', 0), ('20', 0), ('010', 65), ('08', 65), ('09', 65), ('007', 65)):
+        block = ENV_NUMERIC_LIMITS + ENV_NUMERIC_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+        for value, status in (('0', 0), ('20', 0), ('9' * 6, 0), ('9' * 7, 65),
+                              ('010', 65), ('08', 65), ('09', 65), ('007', 65)):
             with self.subTest(value=value):
                 proc = subprocess.run([bash, '--norc', '--noprofile', '-c', block],
                                       env={name: value}, capture_output=True, text=True, timeout=10, check=False)
@@ -4651,9 +4669,37 @@ class StrictSubsetGrammar8312(unittest.TestCase):
                     self.assertNotIn(value, proc.stderr)
                     self.assertIn('FATAL: ' + name, proc.stderr)
 
+    def test_oversized_tunables_refuse_before_tools_8342(self):
+        # Exercise the real prelude, stopping before any stack setup. If a
+        # clock or password-generation subprocess runs first, the sentinel
+        # status distinguishes that ordering bug from the required exit 65.
+        prelude = ENVELOPE.read_text().split('RESULTS_DIR=', 1)[0]
+        stubs = "id() { echo 1000; }; date() { exit 97; }; python3() { exit 97; };\n"
+        for name, value in (('STEP_DURATION_SECS', '9' * 7),
+                            ('P95_BUDGET_MS', '9' * 13), ('SHED_RATE_KNEE', '9' * 13)):
+            with self.subTest(name=name):
+                proc = subprocess.run([shutil.which('bash'), '--norc', '--noprofile', '-c',
+                                       stubs + prelude + '\nexit 0\n'],
+                                      env={name: value}, capture_output=True, text=True,
+                                      timeout=10, check=False)
+                self.assertEqual(proc.returncode, 65)
+                self.assertEqual(proc.stdout, '')
+                self.assertIn('FATAL: ' + name, proc.stderr)
+                self.assertNotIn(value, proc.stderr)
+
+    def test_numeric_length_limits_are_literal_and_required_8342(self):
+        for name in sorted(ENV_NUMERIC_DEFAULTS):
+            template = ENV_NUMERIC_VALIDATION if name in ENV_INTEGER_DEFAULTS else ENV_DECIMAL_VALIDATION
+            block = template.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+            with self.subTest(name=name):
+                self.assertEqual(shell_grammar_problems(ENV_NUMERIC_LIMITS + block), [])
+                self.assertTrue(shell_grammar_problems(block))
+                for old, new in (('=6', '=7'), ('=12', '=13')):
+                    self.assertTrue(shell_grammar_problems(ENV_NUMERIC_LIMITS.replace(old, new) + block))
+
     def test_threshold_use_requires_prior_validation_8312(self):
         for name, call in zip(('P95_BUDGET_MS', 'SHED_RATE_KNEE'), INTERPRETER_SITES[ENVELOPE][-2:]):
-            block = ENV_DECIMAL_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
+            block = ENV_NUMERIC_LIMITS + ENV_DECIMAL_VALIDATION.format(name=name, default=ENV_NUMERIC_DEFAULT_VALUES[name])
             with self.subTest(name=name):
                 self.assertEqual(shell_grammar_problems(block + call), [])
                 self.assertTrue(shell_grammar_problems(call + '\n' + block))
