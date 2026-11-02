@@ -7,8 +7,13 @@ GHSA-only records alike), optionally merges the local `cargo audit --json`
 output, and compares every finding with the dated acceptances in
 scripts/ci/dependency-floors-accepted.toml.
 
+The OSV querybatch hit is authoritative: the local range walk only computes
+the fixed version, and a hit it cannot place becomes a finding with
+fixed_in=unknown, never a dropped one.
+
 Exit codes: 0 gate passes; 1 gate fails (unaccepted finding, expired or
-malformed acceptance, OSV failure); 2 unusable input (lock file missing).
+malformed acceptance, OSV failure); 2 unusable input (lock file missing,
+empty or not a Cargo.lock; non-https --osv-url).
 
 Python 3.9+, standard library only.
 """
@@ -18,6 +23,7 @@ import json
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -30,6 +36,16 @@ MAX_BATCH = 1000
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_SECS = 1.0
 HTTP_TIMEOUT_SECS = 60
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+BATCH_RESULT_KEYS = ("vulns", "next_page_token")
+BATCH_TOP_KEYS = ("results",)
+REVIEW_BY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+LOCK_HEADER_RE = re.compile(r"^version = \d+\s*$")
+KIND_REGISTRY = "registry"
+KIND_GIT = "git"
+KIND_PATH = "path"
+KIND_OTHER = "other"
+UNKNOWN_FIX = "unknown"
 RC_OK = 0
 RC_FAIL = 1
 RC_INPUT = 2
@@ -45,8 +61,12 @@ class AcceptedError(Exception):
     """The acceptance file is malformed."""
 
 
-def parse_lock(text):
-    """Return [(name, version)] for registry packages of a Cargo.lock text."""
+def parse_lock_packages(text):
+    """Return [(name, version, kind)] for every package of a Cargo.lock text.
+
+    kind is registry, git, path (no source line: workspace members and vendored
+    crates) or other.
+    """
     packages = []
     cur = None
     for raw in text.splitlines():
@@ -60,21 +80,58 @@ def parse_lock(text):
             m = re.match(r'^(\w+) = "(.*)"$', line)
             if m:
                 cur[m.group(1)] = m.group(2)
-    return [(p["name"], p["version"]) for p in packages
-            if "name" in p and "version" in p and p.get("source", "").startswith("registry+")]
+    out = []
+    for pkg in packages:
+        if "name" not in pkg or "version" not in pkg:
+            continue
+        src = pkg.get("source")
+        if src is None:
+            kind = KIND_PATH
+        elif src.startswith("registry+"):
+            kind = KIND_REGISTRY
+        elif src.startswith("git+"):
+            kind = KIND_GIT
+        else:
+            kind = KIND_OTHER
+        out.append((pkg["name"], pkg["version"], kind))
+    return out
+
+
+def parse_lock(text):
+    """Return [(name, version)] for registry packages of a Cargo.lock text."""
+    return [(n, v) for n, v, kind in parse_lock_packages(text) if kind == KIND_REGISTRY]
+
+
+def has_lock_header(text):
+    """True when the text carries the top-level `version = N` of a Cargo.lock."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            return False
+        if LOCK_HEADER_RE.match(line):
+            return True
+    return False
 
 
 def vkey(text):
-    """Orderable key for a semver-ish version; a prerelease sorts below its release."""
+    """Orderable semver key (semver 2.0.0 section 11); build metadata is ignored.
+
+    A release sorts above every prerelease of the same core. Prerelease
+    identifiers compare left to right: numeric ones numerically, alphanumeric
+    ones lexically, numeric below alphanumeric, a shorter list below a longer
+    one when all earlier identifiers are equal.
+    """
     core = text.split("+", 1)[0]
-    pre = "-" in core
-    core = core.split("-", 1)[0]
+    core, _, pre = core.partition("-")
     nums = []
     for part in core.split("."):
         nums.append(int(part) if part.isdigit() else 0)
     while len(nums) < 3:
         nums.append(0)
-    return (tuple(nums), 0 if pre else 1)
+    if not pre:
+        return (tuple(nums), (1,))
+    ids = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split("."))
+    return (tuple(nums), (0, ids))
 
 
 def affected_fixed_in(detail, name, version):
@@ -89,6 +146,8 @@ def affected_fixed_in(detail, name, version):
         if version in aff.get("versions", []):
             return "none"
         for rng in aff.get("ranges", []):
+            if rng.get("type") == "GIT":
+                continue
             events = sorted(rng.get("events", []), key=lambda e: vkey(next(iter(e.values()))))
             start = None
             for ev in events:
@@ -107,22 +166,57 @@ def affected_fixed_in(detail, name, version):
     return None
 
 
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect whose target is not https (no downgrade)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise OsvError("OSV redirect to a non-https URL refused: %s" % newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def http_json(url, payload, retries, backoff):
     """POST (payload given) or GET json with retries; raise OsvError when exhausted."""
     attempts = retries + 1
     last = None
+    opener = urllib.request.build_opener(HttpsOnlyRedirect)
     for attempt in range(attempts):
         try:
             data = None if payload is None else json.dumps(payload).encode()
             req = urllib.request.Request(url, data=data, headers={
                 "User-Agent": USER_AGENT, "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
-                return json.loads(resp.read().decode())
+            with opener.open(req, timeout=HTTP_TIMEOUT_SECS) as resp:
+                raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise OsvError("OSV response from %s exceeds %d bytes" % (url, MAX_RESPONSE_BYTES))
+            return json.loads(raw.decode())
+        except OsvError:
+            raise
         except Exception as exc:  # network, HTTP and decode errors all fail closed
             last = exc
             if attempt + 1 < attempts:
                 time.sleep(backoff * (2 ** attempt))
     raise OsvError("OSV request to %s failed after %d attempts: %s" % (url, attempts, last))
+
+
+def check_batch_response(reply, expected):
+    """Return the results list of a querybatch reply; raise OsvError on any drift."""
+    if not isinstance(reply, dict) or set(reply) - set(BATCH_TOP_KEYS):
+        raise OsvError("OSV querybatch reply has an unexpected shape")
+    results = reply.get("results")
+    if not isinstance(results, list) or len(results) != expected:
+        raise OsvError("OSV returned %s results for %d queries" % (
+            len(results) if isinstance(results, list) else "no", expected))
+    for res in results:
+        if not isinstance(res, dict) or set(res) - set(BATCH_RESULT_KEYS):
+            raise OsvError("OSV querybatch result has unexpected keys")
+        if "next_page_token" in res:
+            raise OsvError("OSV querybatch result is paginated (next_page_token); refusing a partial read")
+        vulns = res.get("vulns", [])
+        if not isinstance(vulns, list) or not all(isinstance(v, dict) and isinstance(v.get("id"), str)
+                                                  for v in vulns):
+            raise OsvError("OSV querybatch result carries a malformed vulns list")
+    return results
 
 
 def query_findings(packages, post, get, batch_size):
@@ -132,9 +226,7 @@ def query_findings(packages, post, get, batch_size):
         chunk = packages[i:i + batch_size]
         body = {"queries": [{"package": {"name": n, "ecosystem": ECOSYSTEM}, "version": v}
                             for n, v in chunk]}
-        results = post(OSV_BATCH_PATH, body).get("results", [])
-        if len(results) != len(chunk):
-            raise OsvError("OSV returned %d results for %d queries" % (len(results), len(chunk)))
+        results = check_batch_response(post(OSV_BATCH_PATH, body), len(chunk))
         for (n, v), res in zip(chunk, results):
             for vuln in res.get("vulns", []):
                 hits.setdefault(vuln["id"], []).append((n, v))
@@ -144,10 +236,10 @@ def query_findings(packages, post, get, batch_size):
         if detail.get("withdrawn"):
             continue
         for n, v in hits[vid]:
-            fixed = affected_fixed_in(detail, n, v)
-            if fixed is not None:
-                findings.append({"id": vid, "aliases": sorted(detail.get("aliases", [])),
-                                 "package": n, "version": v, "fixed_in": fixed})
+            fixed = affected_fixed_in(detail, n, v)  # None: local walk cannot place the hit
+            findings.append({"id": vid, "aliases": sorted(detail.get("aliases", [])),
+                             "package": n, "version": v,
+                             "fixed_in": UNKNOWN_FIX if fixed is None else fixed})
     return dedupe(findings)
 
 
@@ -235,10 +327,19 @@ def parse_accepted(text):
             raise AcceptedError("%s: tracking_issue must be a positive number" % where)
         if not isinstance(ent.get("aliases", []), list):
             raise AcceptedError("%s: aliases must be a list" % where)
+        if not isinstance(ent["review_by"], str) or not REVIEW_BY_RE.fullmatch(ent["review_by"]):
+            raise AcceptedError("%s: review_by must be a YYYY-MM-DD string" % where)
         try:
-            ent["review_by"] = datetime.date.fromisoformat(str(ent["review_by"]))
+            ent["review_by"] = datetime.date.fromisoformat(ent["review_by"])
         except ValueError:
             raise AcceptedError("%s: review_by is not an ISO date" % where)
+    seen = {}
+    for ent in entries:
+        key = (ent["id"], ent["package"])
+        if key in seen:
+            raise AcceptedError("entry at line %d duplicates the entry at line %d (%s, %s)" % (
+                ent["_line"], seen[key], ent["id"], ent["package"]))
+        seen[key] = ent["_line"]
     return entries
 
 
@@ -255,15 +356,15 @@ def evaluate(findings, entries, today):
         ids = {f["id"]} | set(f["aliases"])
         match = None
         for idx, ent in enumerate(entries):
-            if ent["package"] == f["package"] and ids & ({ent["id"]} | set(ent.get("aliases", []))):
+            if ent["package"] == f["package"] and ent["id"] in ids:
                 match = ent
                 used.add(idx)
                 break
         if match is not None and match["review_by"] >= today:
-            state = "yes %s" % match["review_by"]
+            state = "yes via %s review_by=%s" % (match["id"], match["review_by"])
             n_acc += 1
         else:
-            state = "no" if match is None else "expired %s" % match["review_by"]
+            state = "no" if match is None else "expired %s via %s" % (match["review_by"], match["id"])
             n_bad += 1
         lines.append("floor: %s %s %s fixed_in=%s aliases=%s accepted=%s" % (
             f["id"], f["package"], f["version"], f["fixed_in"],
@@ -295,7 +396,8 @@ def build_io(args):
 
     def post(path, body):
         out = http_json(base + path, body, args.retries, args.backoff)
-        for q, res in zip(body["queries"], out.get("results", [])):
+        results = check_batch_response(out, len(body["queries"]))
+        for q, res in zip(body["queries"], results):
             ids = [v["id"] for v in res.get("vulns", [])]
             if ids:
                 record["hits"]["%s@%s" % (q["package"]["name"], q["version"])] = ids
@@ -326,12 +428,24 @@ def main(argv=None):
         ap.error("--offline requires --osv-json")
     if not 1 <= args.batch_size <= MAX_BATCH:
         ap.error("--batch-size must be 1..%d" % MAX_BATCH)
+    if not args.offline and not args.osv_url.lower().startswith("https://"):
+        print("dependency-floors: --osv-url must be https:// unless --offline", file=sys.stderr)
+        return RC_INPUT
     today = datetime.date.fromisoformat(args.today) if args.today else datetime.date.today()
     try:
-        packages = parse_lock(Path(args.lock).read_text())
+        lock_text = Path(args.lock).read_text()
     except OSError as exc:
         print("dependency-floors: cannot read lock: %s" % exc, file=sys.stderr)
         return RC_INPUT
+    every = parse_lock_packages(lock_text)
+    if not has_lock_header(lock_text) or not any(k == KIND_REGISTRY for _, _, k in every):
+        print("dependency-floors: %s is empty or not a Cargo.lock (no version header or no registry package)"
+              % args.lock, file=sys.stderr)
+        return RC_INPUT
+    skipped = ["floor: skipped %s %s source=%s %s" % (
+        n, v, k, "queried=yes" if k == KIND_PATH else "queried=no")
+        for n, v, k in every if k != KIND_REGISTRY]
+    packages = [(n, v) for n, v, k in every if k in (KIND_REGISTRY, KIND_PATH)]
     try:
         entries = parse_accepted(Path(args.accepted).read_text())
     except (OSError, AcceptedError) as exc:
@@ -348,7 +462,7 @@ def main(argv=None):
     if args.audit_json:
         findings = merge_audit(findings, json.loads(Path(args.audit_json).read_text()))
     lines, problems, warnings, n_acc, n_bad = evaluate(findings, entries, today)
-    for line in lines:
+    for line in skipped + lines:
         print(line)
     for msg in warnings:
         print("warning: " + msg)
