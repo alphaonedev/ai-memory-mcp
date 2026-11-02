@@ -105,3 +105,10 @@ src/handlers/links.rs:caller
 # did not detect this call site; #3623 restored that coverage, which is what
 # this entry records.
 src/store/postgres.rs:GOVERNANCE_INTERNAL
+# #6043 consolidation benchmark (PR 8469, round 2) — reviewed test-only
+# exception. src/curator/bench_6043.rs is compiled only under
+# all(test, feature = "sal") (src/curator/mod.rs). The benchmark must read the
+# consolidator-owned summary rows and the `_curator/rollback` rows it measures;
+# a for_agent principal cannot see them (tried first: rows_after 20 instead of
+# 26 at the rows_after pin in assert_result). Every row it seeds lives in a throwaway namespace.
+src/curator/bench_6043.rs:BENCH_AGENT
