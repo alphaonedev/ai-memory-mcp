@@ -2462,6 +2462,16 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      # #8473 item 5: OSV-backed dependency floor gate. Catches GHSA-only
+      # records cargo audit lacks; every finding needs a dated acceptance in
+      # scripts/ci/dependency-floors-accepted.toml. It needs no build, so it
+      # runs BEFORE the Security audit step and under !cancelled(): a red audit
+      # or an earlier red step must not hide the gate (#8473 round 2). The audit
+      # step does not save its JSON, so no --audit-json is passed.
+      - name: Dependency floor gate (OSV)
+        if: ${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}
+        run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock --accepted scripts/ci/dependency-floors-accepted.toml
+
       # cargo-audit runs once (the advisory DB is platform-independent) — on
       # the `once` leg so it does not multiply across the 2x2.
       - name: Security audit
@@ -2484,14 +2494,6 @@ jobs:
           fi
           python3 scripts/check-zip-extract-unreachable.py
           cargo audit
-
-      # #8473 item 5: OSV-backed dependency floor gate. Catches GHSA-only
-      # records cargo audit lacks; every finding needs a dated acceptance in
-      # scripts/ci/dependency-floors-accepted.toml. The audit step above does
-      # not save its JSON, so no --audit-json is passed.
-      - name: Dependency floor gate (OSV)
-        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
-        run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock --accepted scripts/ci/dependency-floors-accepted.toml
 
       # CI-speed: the release build here is only a release-PROFILE compile
       # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are

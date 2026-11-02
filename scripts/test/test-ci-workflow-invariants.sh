@@ -1043,6 +1043,19 @@ else
         "$(grep -E '^(FAIL|ERROR)|AssertionError' "$SCRATCH/h-8332-retarget.out" | head -12)"
 fi
 
+# ===========================================================================
+# SECTION I — #8473 round 2: the OSV Dependency floor gate step runs under
+# !cancelled() and before the Security audit step, so a red cargo audit or a red
+# earlier step can never skip it. The check lives in Python:
+# scripts/test/check_ci_floor_gate_step_8473.py.
+# ===========================================================================
+if python3 -I "$ROOT/scripts/test/check_ci_floor_gate_step_8473.py" --ci-yml "$CI_YML" >"$SCRATCH/i-8473.out" 2>&1; then
+    ok "I: the OSV floor gate step carries !cancelled() and precedes Security audit (#8473)"
+else
+    bad "I: the OSV floor gate step can be skipped by a red earlier step (#8473)" \
+        "$(grep -E 'ci-floor-gate-step' "$SCRATCH/i-8473.out" | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"
