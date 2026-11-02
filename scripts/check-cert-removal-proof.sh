@@ -761,7 +761,7 @@ run_guard_test() {
       exec sleep 300 ) >"$out" 2>&1 &
   else
     ( umask 022
-      AI_MEMORY_NO_CONFIG=1 exec cargo test --features sal --test "$crate" "$fn" \
+      AI_MEMORY_NO_CONFIG=1 exec cargo test --locked --features sal --test "$crate" "$fn" \
         -- --exact --nocapture ) >"$out" 2>&1 &
   fi
   GUARD_CHILD_PID=$!

@@ -285,14 +285,14 @@ jobs:
       - name: Pin no-openssl-sys invariant (#1070)
         run: |
           set -euo pipefail
-          if cargo tree \
+          if cargo tree --locked \
             -e normal \
             --target x86_64-linux-android \
             --no-default-features \
             --features sqlite-bundled \
             -i openssl-sys >/dev/null 2>&1; then
             echo "::error::#1070 regression: openssl-sys is in the Android transitive graph"
-            cargo tree \
+            cargo tree --locked \
               -e normal \
               --target x86_64-linux-android \
               --no-default-features \
