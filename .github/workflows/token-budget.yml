@@ -89,15 +89,15 @@ jobs:
       - name: per-tool ceiling (1500 tokens cl100k_base)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --lib sizes::tests::no_tool_exceeds_1500_tokens -- --exact
+        run: cargo test --locked --lib sizes::tests::no_tool_exceeds_1500_tokens -- --exact
       - name: full-profile honest range (5K–8K cl100k_base)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --lib sizes::tests::full_profile_total_in_honest_measured_range -- --exact
+        run: cargo test --locked --lib sizes::tests::full_profile_total_in_honest_measured_range -- --exact
       - name: doctor --tokens default-profile-is-core
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --lib cli::doctor::tests::run_tokens_human_default_profile_is_core -- --exact
+        run: cargo test --locked --lib cli::doctor::tests::run_tokens_human_default_profile_is_core -- --exact
       # v0.7 C5 — hard ceiling on the full-profile tools/list payload.
       # Pre-D1.6 baseline: 3500 cl100k tokens (post-C2-C4 schema compaction).
       # Post-D1.6 (#987): schemars derives added per-property descriptions
@@ -143,7 +143,7 @@ jobs:
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
-          cargo test --test budget_tokens \
+          cargo test --locked --test budget_tokens \
             full_profile_tools_list_under_post_859_ceiling \
             -- --exact --ignored
       # Belt-and-braces: also drive the assertion through the operator-
@@ -160,7 +160,7 @@ jobs:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
           set -euo pipefail
-          cargo build --release --bin ai-memory
+          cargo build --locked --release --bin ai-memory
           PAYLOAD="$(./target/release/ai-memory doctor --tokens --json)"
           TOTAL="$(printf '%s' "$PAYLOAD" \
             | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["trimmed_full_profile_total_tokens"])')"

@@ -120,10 +120,10 @@ jobs:
           mkdir -p .local-runs
           LIST_OUT=".local-runs/postgres-ignored-list.txt"
           TEST_OUT=".local-runs/postgres-ignored-run.txt"
-          cargo test --features sal-postgres -- --ignored --list | tee "$LIST_OUT"
+          cargo test --locked --features sal-postgres -- --ignored --list | tee "$LIST_OUT"
           LISTED="$(grep -c ': test$' "$LIST_OUT" || true)"
           set +e
-          cargo test --features sal-postgres -- --ignored --test-threads=1 2>&1 | tee "$TEST_OUT"
+          cargo test --locked --features sal-postgres -- --ignored --test-threads=1 2>&1 | tee "$TEST_OUT"
           rc="${PIPESTATUS[0]}"
           set -e
           bash scripts/check-cert-leg-nonvacuity.sh \

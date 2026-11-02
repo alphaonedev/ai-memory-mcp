@@ -919,7 +919,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
+        run: cargo clippy --locked -- -D warnings -D clippy::all -D clippy::pedantic
       # #1986 — widened pass at the STRIPPED feature combo. Test files gated
       # `#![cfg(feature = "sal-postgres")]` lose their file-level
       # `#![allow(clippy::*)]` attributes when that cfg is false, but their
@@ -927,7 +927,7 @@ jobs:
       # ONLY in this configuration — invisible to both the default-features
       # pass above and the postgres-feature job's fully-compiled pass.
       - name: Clippy (all targets, sal — cfg-stripped doc-lint class)
-        run: cargo clippy --all-targets --features sal -- -D warnings -D clippy::all -D clippy::pedantic
+        run: cargo clippy --locked --all-targets --features sal -- -D warnings -D clippy::all -D clippy::pedantic
       # (#2635) The build-script vetting gate used to run HERE, as a step of
       # this job. It now has its own job below — see the note there for why a
       # step of `lint` was the wrong place for it.
@@ -1010,7 +1010,7 @@ jobs:
         with:
           persist-credentials: false
       - name: actionlint
-        uses: docker://rhysd/actionlint:1.7.1
+        uses: docker://rhysd/actionlint:1.7.1@sha256:435ecdb63b1169e80ca3e136290072548c07fc4d76a044cf5541021712f8f344
         with:
           args: -shellcheck= -color
 
@@ -1046,7 +1046,7 @@ jobs:
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
       - name: cargo check on MSRV
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
   # Cross-platform correctness matrix. These job names are required by
   # branch protection on main/develop/release/**, so the jobs MUST run
@@ -1555,7 +1555,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --quiet --release \
+          cargo build --locked --quiet --release \
             --manifest-path tools/t0-orchestrate/Cargo.toml \
             --target-dir .local-runs/ci-prebuilt-t0
           BIN="$PWD/.local-runs/ci-prebuilt-t0/release/ai-memory-t0"
@@ -2056,7 +2056,7 @@ jobs:
             # suite runs to completion). The job-level `timeout-minutes` cap
             # still bounds the build. A genuine runtime hang still trips the
             # $WATCHDOG_SECS cap below.
-            cargo test --no-run "$@" || return "$?"
+            cargo test --locked --no-run "$@" || return "$?"
             # `--no-fail-fast` (#2500) — see the identical rationale on
             # `pg_test` in the postgres-feature job below. Cargo otherwise
             # exits after the FIRST failing test executable, so on the
@@ -2071,9 +2071,9 @@ jobs:
             # exact `... "$@" ...` shape the #2657 / #2500 invariant gates pin.
             started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --locked --no-fail-fast "$@" || rc=$?
             else
-              cargo test --no-fail-fast "$@" || rc=$?
+              cargo test --locked --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
             # #6202 — make the margin visible in EVERY green run so the budget
@@ -2122,12 +2122,12 @@ jobs:
             local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
             # `cargo test --doc --no-run` is rejected by cargo, so the prebuild
             # is the plain `--no-run` of the same feature set (lib + doc deps).
-            cargo test --no-run "$@" || return "$?"
+            cargo test --locked --no-run "$@" || return "$?"
             started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --doc --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --locked --doc --no-fail-fast "$@" || rc=$?
             else
-              cargo test --doc --no-fail-fast "$@" || rc=$?
+              cargo test --locked --doc --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
             echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
@@ -2161,12 +2161,12 @@ jobs:
               echo "::error::[#6383] '${label}': the isolated target list is empty"
               return 2
             fi
-            cargo test --no-run "$@" "${sel[@]}" || return "$?"
+            cargo test --locked --no-run "$@" "${sel[@]}" || return "$?"
             started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --locked --no-fail-fast "$@" || rc=$?
             else
-              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --locked --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
             echo "::notice::[#6383] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
@@ -2264,7 +2264,7 @@ jobs:
             local job_now job_elapsed pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc=0 n
             rm -rf "$sd"; mkdir -p "$sd"
             echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
-            cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
+            cargo test --locked --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
             python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
             if [ "$PG_ISO_LANE" = "1" ]; then
               python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
@@ -2531,7 +2531,7 @@ jobs:
 
       - name: Build release (once leg — release-profile smoke)
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
-        run: cargo build --release
+        run: cargo build --locked --release
 
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
       # tier" above). always() so a failed/cancelled test run still reclaims
@@ -2698,7 +2698,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
 
       - name: Clippy (sal-postgres feature, lib + tests)
-        run: cargo clippy --features sal-postgres --tests -- -D warnings -D clippy::all -D clippy::pedantic
+        run: cargo clippy --locked --features sal-postgres --tests -- -D warnings -D clippy::all -D clippy::pedantic
 
   # v0.7.0 Posture-1a (issue #1068) — mobile cross-compile gate.
   # Verifies that the `--features sqlite-bundled --lib` build cross-compiles
@@ -2815,7 +2815,7 @@ jobs:
       - name: cargo check (--lib --features sqlite-bundled)
         if: needs.classify.outputs.cargo_skip != 'true'
         run: |
-          cargo check \
+          cargo check --locked \
             --target ${{ matrix.target }} \
             --no-default-features \
             --features sqlite-bundled \
@@ -2883,15 +2883,15 @@ jobs:
         if: runner.environment == 'github-hosted'
 
       - name: Clippy (sal feature)
-        run: cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic
+        run: cargo clippy --locked --features sal -- -D warnings -D clippy::all -D clippy::pedantic
 
       - name: Build release (sal feature)
-        run: cargo build --release --features sal
+        run: cargo build --locked --release --features sal
 
       - name: Run lib tests (sal feature)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features sal --lib
+        run: cargo test --locked --features sal --lib
 
   # v1.0.0 #2257 — vectorlite OPT-IN feature gate. The `vectorlite` cargo
   # feature (#1860/#2219; `rusqlite/load_extension` + `src/vectorlite.rs`)
@@ -2939,17 +2939,17 @@ jobs:
         if: runner.environment == 'github-hosted'
 
       - name: Clippy (vectorlite feature, all targets)
-        run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
+        run: cargo clippy --locked --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
 
       - name: Run vectorlite no-native-lib seam tests (#1860)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features vectorlite --test vectorlite_1860
+        run: cargo test --locked --features vectorlite --test vectorlite_1860
 
       - name: Run config-precedence under vectorlite (#2256 feature-gated pin)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features vectorlite --test config_precedence
+        run: cargo test --locked --features vectorlite --test config_precedence
 
   # v0.6.5 — Dockerfile-build smoke. Runs on EVERY push to main / develop /
   # release/** AND on EVERY PR that touches code. Builds the Docker image;

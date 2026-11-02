@@ -132,7 +132,7 @@ jobs:
         with:
           shared-key: batman-mode-acceptance
       - name: Build release binary
-        run: cargo build --release --bin ai-memory
+        run: cargo build --locked --release --bin ai-memory
       - name: Compose stack boot smoke (#3838)
         # Renders scripts/docker/docker-compose.batman-active.yml, runs its
         # init-batman script and its mcp `serve` argv exactly as rendered
@@ -151,11 +151,11 @@ jobs:
       - name: Run Batman Mode regression tests
         env:
           AI_MEMORY_NO_CONFIG: '1'
-        run: cargo test --release --test issue_800_batman_mode -- --test-threads=1
+        run: cargo test --locked --release --test issue_800_batman_mode -- --test-threads=1
       - name: Run Form 7 agent-EXTERNAL wiring tests (regression cordon)
         env:
           AI_MEMORY_NO_CONFIG: '1'
-        run: cargo test --release --test form_7_agent_external_wiring -- --test-threads=1
+        run: cargo test --locked --release --test form_7_agent_external_wiring -- --test-threads=1
       - name: Assert binary refuses /tmp write under R001 end-to-end
         env:
           # #1751 — the v0.9 store-path default REQUIRES attestation; the
@@ -240,7 +240,7 @@ jobs:
           jq --version
       - name: Build release binary + install to PATH
         run: |
-          cargo build --release --bin ai-memory
+          cargo build --locked --release --bin ai-memory
           mkdir -p "$HOME/.local/bin"
           cp target/release/ai-memory "$HOME/.local/bin/ai-memory"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"

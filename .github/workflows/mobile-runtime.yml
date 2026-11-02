@@ -110,7 +110,7 @@ jobs:
       - name: Build mobile_runtime test binary for iOS Simulator
         run: |
           set -euo pipefail
-          cargo test \
+          cargo test --locked \
             --no-run \
             --no-default-features \
             --features sqlite-bundled \
@@ -305,7 +305,7 @@ jobs:
       - name: Build mobile_runtime test binary for Android (x86_64)
         run: |
           set -euo pipefail
-          cargo test \
+          cargo test --locked \
             --no-run \
             --no-default-features \
             --features sqlite-bundled \

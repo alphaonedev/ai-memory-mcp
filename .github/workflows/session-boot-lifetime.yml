@@ -81,4 +81,4 @@ jobs:
         env:
           AI_MEMORY_NO_CONFIG: '1'
         run: |
-          cargo test --test boot_primitive_contract --test recipe_contract --test boot_lifecycle
+          cargo test --locked --test boot_primitive_contract --test recipe_contract --test boot_lifecycle
