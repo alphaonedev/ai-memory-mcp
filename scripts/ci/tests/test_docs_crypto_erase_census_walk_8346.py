@@ -346,8 +346,14 @@ spellings" but the reader still accepted spellings tomllib refuses. The class (s
   file it shares with another reader is not recorded as reached. A refusal in any other shape is covered only by the
   scan, and only when it is spelled with a token the scan lists. The spellings the scan does not read and only the
   behavioural twin catches are twin-covered: a shift compare, `bit_length`, `isspace` with a literal whitespace set
-  and a comprehension over spans that builds a set of the `UNICODE_SPACE` shape. The spans of `UNICODE_SPACE_SPANS` and
-  the 34 code points of `UNICODE_SPACE` are pinned by content in a test, with a behavioural row for each span edge.
+  and a comprehension over spans that builds a set of the `UNICODE_SPACE` shape. r28: the scan reads a name bound to a
+  character and to a high integer (either reading is high), resolves an augmented assignment once against the bindings
+  that precede it, and reads a `for` or comprehension target over a display or a str or bytes constant, a default argument,
+  `b'~'[0]` and `'~'[0]`, and `getattr(operator, '__gt__')` with a constant dunder. Still twin-covered, with no branch:
+  `divmod(508, 191)` and a tuple bound from a call; a codec name assembled by repetition, from names or an f-string, or
+  passed as `encode(*['latin-1'])`; `max('a', '~')` and `max(c, '~') != '~'`; `translate` and `strip` of the ASCII set; a
+  not-in comprehension; `getattr(operator, name)` with a non-constant name. The spans of `UNICODE_SPACE_SPANS` and
+  the 39 code points of `UNICODE_SPACE` are pinned by content in a test, with a behavioural row for each span edge.
 * TOML values (r23): `toml_split` honours the backslash escapes of a basic string (`"x\"=\"y"` is one string) and
   refuses a closer that does not match its opener; a value that is empty, a string followed by more text, a bracketed
   value followed by more text, a bare value that is no boolean, number, date or time, a date or time that is out of range
@@ -1841,7 +1847,9 @@ def reject_crate_level(lib_clean, macros):
 # and bidi format characters, the no-break and ideographic spaces): U+200B-U+200F, U+2028, U+2029, U+202A-U+202E,
 # U+2060-U+2064, U+FEFF, U+00A0, U+1680, U+2000-U+200A, U+205F, U+3000 (and U+0085).
 # r26: spelled as (first, last) spans so that no `range` call holds a bound at or above `~` (the non-ASCII scan refuses one)
-UNICODE_SPACE_SPANS = ((0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2000, 0x200A))
+# r28: and the bidi isolates U+2066-U+2069 and the Arabic letter mark U+061C
+UNICODE_SPACE_SPANS = ((0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2000, 0x200A), (0x2066, 0x2069),
+                       (0x061C, 0x061C))
 UNICODE_SPACE = frozenset(
     [first + step for first, last in UNICODE_SPACE_SPANS for step in range(last - first + 1)]
     + [0x2028, 0x2029, 0xFEFF, 0x00A0, 0x1680, 0x205F, 0x3000, 0x0085])
@@ -5551,6 +5559,10 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             return node.value if type(node.value) is int else None
         if isinstance(node, ast.Name):
             return values.get(node.id)
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, bytes)
+                and isinstance(node.slice, ast.Constant) and type(node.slice.value) is int
+                and -len(node.value.value) <= node.slice.value < len(node.value.value)):
+            return node.value.value[node.slice.value]  # r28: `b'~'[0]`
         if (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "int" and len(node.args) == 2
                 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
                 and isinstance(node.args[1], ast.Constant) and type(node.args[1].value) is int):
@@ -5576,14 +5588,23 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         chained, tuple, list, annotated, walrus or augmented binding) whose value folds; three passes, so a chain folds.
         A name with several foldable values takes the `pick`-th of its distinct values (modulo their number); `most` is
         the largest number of distinct values of one name, so the caller scans once per pick and every binding of a name
-        is read (decision: any binding of a high value marks the name, not the last binding before use)."""
+        is read (decision: any binding of a high value marks the name, not the last binding before use).
+        r28: the pairs are read in source order and an augmented assignment (`aug_8346`) is resolved once, against each
+        value its name has gathered so far in this pass and never against its own result, so `n = 0; n += 0x81` is 0 and
+        0x81, not 0x81, 0x102, ... (decision: resolve an augmented assignment once against the preceding bindings over
+        a fixpoint re-application, because re-application drifts past the byte bound)."""
+        ordered = sorted(pairs, key=lambda pair: (getattr(pair[1], "lineno", 0), getattr(pair[1], "col_offset", 0)))
         values, most = {}, 1
         for _ in range(3):
             found = {}
-            for name, value in pairs:
-                number = cls.folded(value, values)
-                if number is not None and number not in found.setdefault(name, []):
-                    found[name].append(number)
+            for name, value in ordered:
+                if getattr(value, "aug_8346", False):
+                    candidates = [cls.folded(value, dict(values, **{name: prior})) for prior in list(found.get(name, ()))]
+                else:
+                    candidates = [cls.folded(value, values)]
+                for number in candidates:
+                    if number is not None and number not in found.setdefault(name, []):
+                        found[name].append(number)
             for name, numbers in found.items():
                 values[name] = sorted(numbers)[pick % len(numbers)]
                 most = max(most, len(numbers))
@@ -5617,14 +5638,37 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                 cls.bound_pairs(sub_target, sub_value, pairs)
 
     @classmethod
+    def loop_pairs(cls, target, iterable, pairs):
+        """r28: append (name, element node) for a loop or comprehension target that is a Name and an iterable that is a
+        tuple or list display (each element) or a str or bytes constant (each character, or each byte as an integer)."""
+        if not isinstance(target, ast.Name):
+            return
+        if isinstance(iterable, (ast.Tuple, ast.List)):
+            pairs.extend((target.id, element) for element in iterable.elts)
+        elif isinstance(iterable, ast.Constant) and isinstance(iterable.value, (str, bytes)):
+            pairs.extend((target.id, ast.copy_location(ast.Constant(element), iterable)) for element in iterable.value)
+
+    @classmethod
     def bindings(cls, tree):
         """r26: return every (name, value node) pair that `tree` binds by `=` (each target of a chain), `NAME: T = v` or
         a walrus; r27: and `NAME op= v` as the pair (NAME, `NAME op v`)."""
         pairs = []
         for node in ast.walk(tree):
             if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-                pairs.append((node.target.id, ast.BinOp(left=ast.Name(id=node.target.id, ctx=ast.Load()),
-                                                        op=node.op, right=node.value)))
+                pair = ast.copy_location(ast.BinOp(left=ast.Name(id=node.target.id, ctx=ast.Load()), op=node.op,
+                                                   right=node.value), node)
+                pair.aug_8346 = True  # r28: resolved once by `folded_names`, never re-applied to its own result
+                pairs.append((node.target.id, pair))
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                cls.loop_pairs(node.target, node.iter, pairs)  # r28: `for top in ('a', '~')`, `... for top in '~'`
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                args = node.args
+                positional = list(args.posonlyargs) + list(args.args)
+                for arg, default in zip(reversed(positional), reversed(args.defaults)):
+                    pairs.append((arg.arg, default))  # r28: `def f(top='~')`
+                for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+                    if default is not None:
+                        pairs.append((arg.arg, default))
             elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     cls.bound_pairs(target, node.value, pairs)
@@ -5667,6 +5711,10 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             return ("char", ord(node.value))
         if isinstance(node, ast.Name) and node.id in chars:
             return ("char", chars[node.id])
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+                and isinstance(node.slice, ast.Constant) and type(node.slice.value) is int
+                and -len(node.value.value) <= node.slice.value < len(node.value.value)):
+            return ("char", ord(node.value.value[node.slice.value]))  # r28: `'~'[0]` (a bytes subscript is an integer)
         if isinstance(node, ast.Call):
             name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
             args = node.args
@@ -5681,7 +5729,13 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     @classmethod
     def high_operand(cls, node, values, chars):
-        """r25: True for an operand that is the integer 126 or 129..255, or a character at or above `~`."""
+        """r25: True for an operand that is the integer 126 or 129..255, or a character at or above `~`. r28: a name is
+        high when EITHER its character reading OR its integer reading is high (a name bound to a character and to an
+        integer, in either order), in line with the fail-closed decision of round 27."""
+        if isinstance(node, ast.Name):
+            number = values.get(node.id)  # the integer reading; the character reading is read by `char_value` below
+            if number is not None and (number == 126 or 128 < number < 256):
+                return True
         found = cls.char_value(node, values, chars)
         if found is None:
             return False
@@ -5713,6 +5767,30 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         except (LookupError, ValueError):
             return False
 
+
+    @staticmethod
+    def getattr_dunder(func):
+        """r28: the constant dunder name of a callee `getattr(x, '__gt__')`, or None."""
+        if (isinstance(func, ast.Call) and getattr(func.func, "id", None) == "getattr" and len(func.args) == 2
+                and isinstance(func.args[1], ast.Constant) and isinstance(func.args[1].value, str)
+                and func.args[1].value.startswith("__")):
+            return func.args[1].value
+        return None
+
+    @classmethod
+    def callee_name(cls, func):
+        """r28: the attribute or name a call is made through, or the constant dunder of a `getattr(x, '__gt__')` callee."""
+        return cls.getattr_dunder(func) or getattr(func, "attr", getattr(func, "id", None))
+
+    @classmethod
+    def compare_operands(cls, node):
+        """r28: the arguments of a call and, for a dunder call, its receiver (`'~'.__lt__(c)`, `getattr('~', '__lt__')(c)`)."""
+        operands = list(node.args)
+        if isinstance(node.func, ast.Attribute) and node.func.attr.startswith("__"):
+            operands.append(node.func.value)
+        if cls.getattr_dunder(node.func):
+            operands.append(node.func.args[0])
+        return operands
 
     @staticmethod
     def names_codec(node, names):
@@ -5781,6 +5859,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         are bound by every form the character names are, and by an augmented assignment (`n = 0x70` then `n += 0x11`);
         also `codecs.lookup('latin-1')` and its kin, `raw_unicode_escape`, a constant `join` of codec-name parts, and
         the `__lt__`, `__le__`, `__gt__` and `__ge__` calls with the high operand as receiver or argument.
+        r28: a name is high when its character reading OR its integer reading is high (`top = 0x7e` then `top = 'a'`, and
+        the reverse); an augmented assignment is resolved once against the bindings of its name that precede it in source
+        order (`n = 0; n += 0x81`, `n = 0x41; n *= 2`, `n <<= 1`), never against its own result; a name is bound by a
+        `for` or comprehension target over a tuple or list display or a str or bytes constant, and by a default
+        argument (`def f(top='~')`); `b'~'[0]` and `'~'[0]` are read; a callee `getattr(operator, '__gt__')` and a
+        `getattr('~', '__lt__')` receiver are read. Twin-covered, with no branch here: `divmod(508, 191)` and a tuple
+        bound from a call; a codec name assembled by repetition, from names or an f-string, or passed as
+        `encode(*['latin-1'])`; `getattr(operator, name)` with a non-constant name; `max('a', '~')` and
+        `max(c, '~') != '~'`; `translate` and `strip` of the ASCII set; a not-in comprehension; a subscript of a name.
         """
         tree = FoldText8346().visit(ast.parse(textwrap.dedent(source)))
         skip = set()
@@ -5846,10 +5933,9 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             elif (isinstance(node, ast.Compare)
                   and len({codec for codec in (self.codec_of(part) for part in [node.left] + node.comparators) if codec}) > 1):
                 found.append("codec-compare")  # r26: `s.encode('utf-8') != s.encode('utf-16')`
-            elif (isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", None)) in operator_names
-                  and any(self.high_operand(arg, values, chars) for arg in list(node.args) + (
-                      [node.func.value] if isinstance(node.func, ast.Attribute) and node.func.attr.startswith("__") else []))):
-                found.append("operator-compare")  # `operator.gt(c, '~')`, `c.__gt__('~')`, `'~'.__lt__(c)`
+            elif (isinstance(node, ast.Call) and self.callee_name(node.func) in operator_names
+                  and any(self.high_operand(arg, values, chars) for arg in self.compare_operands(node))):
+                found.append("operator-compare")  # `operator.gt(c, '~')`, `c.__gt__('~')`, `'~'.__lt__(c)`, getattr(...)
             elif (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "fromhex" and node.args
                   and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
                   and self.fromhex_high(node.args[0].value)):
@@ -6231,7 +6317,33 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             ("char-compare", "    TOP_8346 = 0x61\n    if any(b > TOP_8346 for b in masked.encode()):\n        pass\n    TOP_8346 = 0x7e\n"),
             ("char-compare", "    [LOW_8346, TOP_8346] = ['a', '~']\n    if any(c > TOP_8346 for c in masked):\n        pass\n"),
             ("char-compare", "    [LOW_8346, TOP_8346] = 'a', '~'\n    if any(c > TOP_8346 for c in masked):\n        pass\n"),
-            ("char-compare", "    LOW_8346, TOP_8346 = ['a', '~']\n    if any(c > TOP_8346 for c in masked):\n        pass\n"))
+            ("char-compare", "    LOW_8346, TOP_8346 = ['a', '~']\n    if any(c > TOP_8346 for c in masked):\n        pass\n"),
+            # r28 (code r27 LOW-1, security r27 LOW-1 and LOW-2 a and b, INFO-1): a name bound to a character and to a high
+            # integer, an augmented assignment resolved once, the pick-th value, the dunder receivers, and the cheap branches
+            ("char-compare", "    TOP_8346 = 0x7e\n    if any(b > TOP_8346 for b in masked.encode()):\n        pass\n    TOP_8346 = 'a'\n"),
+            ("char-compare", "    TOP_8346 = 'a'\n    TOP_8346 = 0xc0\n    if any(b >= TOP_8346 for b in masked.encode()):\n        pass\n"),
+            ("char-compare", "    LIMIT_8346 = 0\n    LIMIT_8346 += 0x81\n    if any(b >= LIMIT_8346 for b in masked.encode()):\n        pass\n"),
+            ("char-compare", "    LIMIT_8346 = 0x41\n    LIMIT_8346 *= 2\n    if any(b >= LIMIT_8346 for b in masked.encode()):\n        pass\n"),
+            ("char-compare", "    LIMIT_8346 = 0x41\n    LIMIT_8346 <<= 1\n    if any(b >= LIMIT_8346 for b in masked.encode()):\n        pass\n"),
+            ("bitand-high", "    MASK_8346 = 0\n    MASK_8346 += 0xc0\n    any(b & MASK_8346 for b in masked.encode())\n"),
+            ("char-compare", "    LIMIT_8346 = 0x81\n    LIMIT_8346 = 0x200\n    if any(b >= LIMIT_8346 for b in masked.encode()):\n        pass\n"),
+            ("bitand-high", "    MASK_8346 = 0xc0\n    MASK_8346 = 0x300\n    any(b & MASK_8346 for b in masked.encode())\n"),
+            ("operator-compare", "    if any('~'.__gt__(c) for c in masked):\n        pass\n"),
+            ("operator-compare", "    if any('~'.__ge__(c) for c in masked):\n        pass\n"),
+            ("operator-compare", "    import operator\n    if any(getattr(operator, '__gt__')(c, '~') for c in masked):\n        pass\n"),
+            ("operator-compare", "    if any(getattr('~', '__lt__')(c) for c in masked):\n        pass\n"),
+            ("char-compare", "    for top_8346 in ('a', '~'):\n        if any(c > top_8346 for c in masked):\n            pass\n"),
+            ("char-compare", "    for top_8346 in '~':\n        if any(c > top_8346 for c in masked):\n            pass\n"),
+            ("char-compare", "    if any(c > top_8346 for top_8346 in ['~'] for c in masked):\n        pass\n"),
+            ("char-compare", "    def probe_8346(top_8346='~'):\n        return any(c > top_8346 for c in masked)\n"),
+            ("char-compare", "    def probe_8346(*, top_8346=0x7e):\n        return any(b > top_8346 for b in masked.encode())\n"),
+            ("char-compare", "    if any(b > b'~'[0] for b in masked.encode()):\n        pass\n"),
+            ("char-compare", "    TOP_8346 = b'~'[0]\n    if any(b > TOP_8346 for b in masked.encode()):\n        pass\n"),
+            ("char-compare", "    if any(c > '~'[0] for c in masked):\n        pass\n"),
+            # r28 pins found by the lane matrix: a chain bound out of source order folds on a later pass, and an augmented
+            # assignment follows an assignment nested deeper than itself
+            ("char-compare", "    LIMIT_8346 = BASE_8346 + 0x40\n    BASE_8346 = 0x41\n    if any(b >= LIMIT_8346 for b in masked.encode()):\n        pass\n"),
+            ("char-compare", "    if masked:\n        LIMIT_8346 = 0\n    LIMIT_8346 += 0x81\n    if any(b >= LIMIT_8346 for b in masked.encode()):\n        pass\n"))
         for label, copy in labelled:
             with self.subTest(self_check_label=label, copy=copy):
                 self.assertIn(label, self.private_non_ascii_spellings(base + copy))
@@ -6653,9 +6765,12 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                        "also when `toml_expand` is called directly",
                        "24948", "0 accepted-but-invalid and 0 valid-but-refused"):
             self.assertIn(phrase, __doc__)
-        self.assertEqual(len(UNICODE_SPACE), 34)  # r26: the spans spelling holds the same 34 code points as the old ranges
+        self.assertEqual(len(UNICODE_SPACE), 39)  # r28: the 34 code points of r26, the four isolates U+2066-U+2069 and U+061C
         for phrase in ("twin-covered: a shift compare", "an augmented assignment", "`codecs.lookup`",
-                       "any binding of a high value marks the name", "UNICODE_SPACE_SPANS"):
+                       "any binding of a high value marks the name", "UNICODE_SPACE_SPANS",
+                       "Still twin-covered, with no branch:", "`divmod(508, 191)`", "`encode(*['latin-1'])`",
+                       "`max('a', '~')`", "a\n  not-in comprehension", "resolves an augmented assignment once",
+                       "a default argument", "`getattr(operator, '__gt__')`", "the 39 code points"):
             self.assertIn(phrase, __doc__)
         self.assertIn("python3.9 leg", type(self).test_toml_values_agree_with_tomllib_on_escapes_empties_and_arrays_8346.__doc__)
         self.assertNotIn("a private refusal of any spelling", __doc__)
@@ -6674,13 +6789,15 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         and `reject_unicode_space` classifies a character at each edge of each span: a member is named a Unicode
         whitespace, format or bidi character, the character just outside it is only a non-ASCII character. A span shifted
         by one (U+2060 to U+2064 as U+2061 to U+2065) turns this test red."""
-        self.assertEqual(UNICODE_SPACE_SPANS, ((0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2000, 0x200A)))
-        members = [0x0085, 0x00A0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009,
+        self.assertEqual(UNICODE_SPACE_SPANS, ((0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2000, 0x200A),
+                                               (0x2066, 0x2069), (0x061C, 0x061C)))
+        members = [0x0085, 0x00A0, 0x061C, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009,
                    0x200A, 0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2028, 0x2029, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
-                   0x205F, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x3000, 0xFEFF]
+                   0x205F, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x2066, 0x2067, 0x2068, 0x2069, 0x3000, 0xFEFF]
         self.assertEqual(sorted(UNICODE_SPACE), members)
-        outside = [0x0084, 0x0086, 0x009F, 0x00A1, 0x167F, 0x1681, 0x1FFF, 0x2010, 0x2027, 0x202F, 0x2030, 0x205E, 0x2065,
-                   0x2066, 0x2FFF, 0x3001, 0xFEFE, 0xFF00]
+        self.assertEqual(len(members), 39)
+        outside = [0x0084, 0x0086, 0x009F, 0x00A1, 0x061B, 0x061D, 0x167F, 0x1681, 0x1FFF, 0x2010, 0x2027, 0x202F, 0x2030,
+                   0x205E, 0x2065, 0x206A, 0x2FFF, 0x3001, 0xFEFE, 0xFF00]
         check = reject_unicode_space
         for point in members:
             with self.subTest(member="U+%04X" % point):
