@@ -40,6 +40,7 @@ jobs:
         env:
           DURATION: ${{ github.event.inputs.duration }}
         run: |
+          cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
           cd fuzz
           cargo fuzz run fuzz_validate -- -max_len=512 -max_total_time="$DURATION"
 
@@ -47,6 +48,7 @@ jobs:
         env:
           DURATION: ${{ github.event.inputs.duration }}
         run: |
+          cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
           cd fuzz
           cargo fuzz run fuzz_namespace -- -max_len=512 -max_total_time="$DURATION"
 
