@@ -170,6 +170,7 @@ ASSERT_WORKFLOW = 'bash scripts/assert-compiled-features.sh "$bin" --strict $REQ
 ASSERT_DOCKER = "bash scripts/assert-compiled-features.sh target/release/ai-memory --strict $REQUIRE_FLAGS"
 BUILD_CMD = 'cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"'
 SHAPE_BUILD_CMD = 'cargo build --locked --release --features "$FEATURES"'
+SBOM_LOCK_CMD = "cargo metadata --locked --format-version 1 >/dev/null"  # #8473: cargo-cyclonedx 0.5.9 has no --locked
 SBOM_CMD = 'cargo cyclonedx --format json --features "$FEATURES"'
 
 # The exact statements (after normalisation) of each unit that decides what ships.
@@ -181,6 +182,7 @@ WF_SBOM = (
     "export SOURCE_DATE_EPOCH",
     ALLOWED_FEATURES,
     'test -n "$FEATURES"',
+    SBOM_LOCK_CMD,
     SBOM_CMD,
     "mkdir -p dist",
     "cp ai-memory.cdx.json dist/",
@@ -1413,6 +1415,10 @@ BUILD_HDR = "      - name: Build release binary\n"
 BUILD_SHELL = "        shell: bash\n        run: |\n          set -euo pipefail\n"
 SBOM_HDR = "      - name: Generate CycloneDX SBOM (JSON)\n"
 SBOM_LINE = IND + SBOM_CMD
+SBOM_LOCK_LINE = (
+    IND + "# cargo-cyclonedx 0.5.9 has no --locked option; a locked metadata call first\n"
+    + IND + "# fails the step when Cargo.lock would change, so the SBOM lists the reviewed lock.\n"
+    + IND + SBOM_LOCK_CMD + "\n")
 PKG_HDR = "      - name: Package binary\n"
 JOB_NAME = "    name: Release (${{ matrix.target }})\n"
 DOCKER_BUILD = SHAPE_BUILD_CMD + "; \\"
@@ -1636,8 +1642,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         IND + "cargo build --locked --release --target ${{ matrix.target }}",
         IND + "FEATURES=sal cargo build --locked --release --target ${{ matrix.target }}")]),
     "bypass (a) FEATURES reassigned in the SBOM step": ("fail", [_rel(
-        IND + ALLOWED_FEATURES + "\n" + IND + 'test -n "$FEATURES"\n' + SBOM_LINE,
-        IND + ALLOWED_FEATURES + "\n" + IND + "FEATURES=sal\n" + IND + 'test -n "$FEATURES"\n' + SBOM_LINE)]),
+        IND + ALLOWED_FEATURES + "\n" + IND + 'test -n "$FEATURES"\n' + SBOM_LOCK_LINE + SBOM_LINE,
+        IND + ALLOWED_FEATURES + "\n" + IND + "FEATURES=sal\n" + IND + 'test -n "$FEATURES"\n' + SBOM_LOCK_LINE + SBOM_LINE)]),
     "bypass (b) FEATURES reassigned inside the Dockerfile RUN": ("fail", [(
         DOCKER, '    test -n "$FEATURES"; \\', '    FEATURES=sal; \\\n    test -n "$FEATURES"; \\', False)]),
     "bypass (b) FEATURES appended inside the Dockerfile RUN": ("fail", [(
