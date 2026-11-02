@@ -205,11 +205,20 @@ async fn read_memory_content(
             Err(e) => Err(store_failure(&e)),
         };
     }
-    let _ = agent;
+    // The same caller-scoped visibility the PostgreSQL `store.get` applies: a
+    // memory the caller can no longer read renders as absent on both backends.
     let lock = app.db.lock().await;
-    crate::db::get(&lock.0, memory_id)
-        .map(|m| m.map(|m| m.content))
-        .map_err(|e| sqlite_failure(&e))
+    let mem = crate::db::get(&lock.0, memory_id).map_err(|e| sqlite_failure(&e))?;
+    Ok(mem
+        .filter(|m| {
+            m.lifecycle_state.is_recall_visible()
+                && crate::visibility::is_readable_on_query(
+                    m,
+                    Some(agent),
+                    Some(m.namespace.as_str()),
+                )
+        })
+        .map(|m| m.content))
 }
 
 async fn cancel_task(app: &AppState, agent: &str, params: &Value) -> A2aResult<Value> {
@@ -312,8 +321,8 @@ async fn send_message(app: &AppState, agent: &str, params: &Value) -> A2aResult<
         .map_err(|_| A2aError::invalid_params("message text is invalid or too large"))?;
     let opened = open_task(app, agent, &input).await?;
     let task_id = opened.task_id.clone();
-    // SUBMITTED -> WORKING. Losing this CAS means a concurrent CancelTask
-    // already ended the task: report its state, store nothing.
+    // SUBMITTED -> WORKING. Losing this CAS means another request moved the
+    // task after it was opened (see `start_lost`).
     let working = A2aTaskUpdate {
         status_timestamp: a2a::now_timestamp(),
         ..A2aTaskUpdate::default()
@@ -328,19 +337,19 @@ async fn send_message(app: &AppState, agent: &str, params: &Value) -> A2aResult<
     )
     .await?;
     if !started {
-        return current_task(app, agent, &task_id).await;
+        start_lost(app, agent, &task_id).await?;
     }
     let stamp = a2a::system_stamp(agent, &input.role);
-    let memory_id = match store_message(app, agent, &input.text, &stamp).await {
-        Ok(id) => id,
+    let (memory_id, pending) = match store_message(app, agent, &input.text, &stamp).await {
+        Ok(stored) => stored,
         Err(e) => {
             let failed = A2aTaskUpdate {
                 status_timestamp: a2a::now_timestamp(),
                 ..A2aTaskUpdate::default()
             };
-            // The original error is what the caller sees; a failed
-            // transition is logged, never silently dropped.
-            if let Err(cas_err) = store_cas(
+            // The original error is what the caller sees; a failed or lost
+            // transition is logged, never silently dropped (ERRORS-19).
+            match store_cas(
                 app,
                 agent,
                 &task_id,
@@ -350,11 +359,16 @@ async fn send_message(app: &AppState, agent: &str, params: &Value) -> A2aResult<
             )
             .await
             {
-                tracing::warn!(
+                Ok(true) => {}
+                Ok(false) => tracing::info!(
+                    target: "a2a",
+                    "a2a task {task_id} left WORKING before a storage error could mark it failed"
+                ),
+                Err(cas_err) => tracing::warn!(
                     target: "a2a",
                     "could not mark a2a task failed after a storage error: {}",
                     cas_err.message
-                );
+                ),
             }
             return Err(e);
         }
@@ -370,35 +384,114 @@ async fn send_message(app: &AppState, agent: &str, params: &Value) -> A2aResult<
             .to_string(),
         context_id: opened.context_id.clone(),
         task_id: task_id.clone(),
-        memory_id: memory_id.clone(),
+        memory_id,
     };
-    let done = A2aTaskUpdate {
-        status_timestamp: a2a::now_timestamp(),
-        history_append: Some(entry),
-        artifact_append: Some(a2a::to_value(&a2a::receipt_artifact(&memory_id))?),
-    };
-    // WORKING -> COMPLETED. A COMPLETED source is accepted too, so a concurrent
-    // continuation's entry and receipt are never lost to a racing completion;
-    // if a concurrent CancelTask won, the task stays CANCELED and that is what
-    // is reported (the stored message is a delivered inbox row either way).
-    let _ = store_cas(
-        app,
-        agent,
-        &task_id,
-        &[state::WORKING, state::COMPLETED],
-        state::COMPLETED,
-        &done,
-    )
-    .await?;
-    current_task(app, agent, &task_id).await
+    a2a_complete_message(app, agent, &task_id, entry).await?;
+    current_task(app, agent, &task_id, pending).await
 }
 
-async fn current_task(app: &AppState, agent: &str, id: &str) -> A2aResult<Value> {
+/// The start CAS of an opened message lost: a concurrent request moved the
+/// task in between. A task another continuation already COMPLETED still
+/// accepts this message (the completion CAS takes a COMPLETED source, so the
+/// entry is appended, never dropped); any other terminal state refuses it
+/// with `-32004`, and a task still moving is `-32004` "changed concurrently".
+/// Nothing is stored on a refusal.
+async fn start_lost(app: &AppState, agent: &str, task_id: &str) -> A2aResult<()> {
+    let row = store_get(app, agent, task_id)
+        .await?
+        .ok_or_else(A2aError::task_not_found)?;
+    if row.state == state::COMPLETED {
+        return Ok(());
+    }
+    Err(if state::is_terminal(&row.state) {
+        A2aError::task_terminal(&row.state)
+    } else {
+        A2aError::task_changed_concurrently()
+    })
+}
+
+/// Append one admitted message's history entry and receipt to its task. The
+/// append is atomic with the state compare-and-set, and its outcome is never
+/// ignored (ERRORS-19, CONCURRENCY-23): a WORKING or COMPLETED task moves to
+/// COMPLETED with the entry; a task a concurrent continuation re-opened
+/// (SUBMITTED) takes the entry and stays SUBMITTED, so that continuation owns
+/// the completion; any other terminal state is `-32004` naming it. Success is
+/// answered only once the entry is stored.
+///
+/// decision: loop over two compare-and-sets over moving a SUBMITTED task to
+/// COMPLETED because that would make the re-opening continuation's own start
+/// compare-and-set lose.
+///
+/// # Errors
+///
+/// `-32004` when the task ended in a state other than COMPLETED, or kept
+/// moving for [`a2a::A2A_COMPLETION_CAS_ATTEMPTS`] attempts; `-32603` on a
+/// storage failure or a task that vanished.
+#[doc(hidden)]
+pub async fn a2a_complete_message(
+    app: &AppState,
+    agent: &str,
+    task_id: &str,
+    entry: A2aHistoryEntry,
+) -> Result<(), A2aError> {
+    let receipt = a2a::to_value(&a2a::receipt_artifact(&entry.memory_id))?;
+    for _ in 0..a2a::A2A_COMPLETION_CAS_ATTEMPTS {
+        let done = A2aTaskUpdate {
+            status_timestamp: a2a::now_timestamp(),
+            history_append: Some(entry.clone()),
+            artifact_append: Some(receipt.clone()),
+        };
+        if store_cas(
+            app,
+            agent,
+            task_id,
+            &[state::WORKING, state::COMPLETED],
+            state::COMPLETED,
+            &done,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        if store_cas(
+            app,
+            agent,
+            task_id,
+            &[state::SUBMITTED],
+            state::SUBMITTED,
+            &done,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let row = store_get(app, agent, task_id)
+            .await?
+            .ok_or_else(A2aError::internal)?;
+        if state::is_terminal(&row.state) && row.state != state::COMPLETED {
+            return Err(A2aError::task_terminal(&row.state));
+        }
+    }
+    tracing::warn!(
+        target: "a2a",
+        "a2a task {task_id} kept moving; completion gave up after {} attempts",
+        a2a::A2A_COMPLETION_CAS_ATTEMPTS
+    );
+    Err(A2aError::task_changed_concurrently())
+}
+
+/// The SendMessage reply: the current task, whose status carries the agent's
+/// replication-pending message when `pending` (the message is stored locally
+/// but missed federation quorum).
+async fn current_task(app: &AppState, agent: &str, id: &str, pending: bool) -> A2aResult<Value> {
     let row = store_get(app, agent, id)
         .await?
         .ok_or_else(A2aError::internal)?;
     let history = render_history(app, agent, &row, None).await?;
-    let task = a2a::task_from_row(&row, history, true)?;
+    let mut task = a2a::task_from_row(&row, history, true)?;
+    if pending {
+        task.status.message = Some(a2a::replication_pending_message(&row.id, &row.context_id));
+    }
     a2a::to_value(&SendMessageResponse::Task(task))
 }
 
@@ -589,13 +682,14 @@ async fn store_cas(
 
 /// Store the message in the authenticated caller's inbox through the native
 /// notify path (quota, TTL, wake bus, webhooks, federation fan-out), with the
-/// system stamp applied at memory formation. Returns the stored memory id.
+/// system stamp applied at memory formation. Returns the stored memory id and
+/// whether its federation fan-out is still pending (quorum not met).
 async fn store_message(
     app: &AppState,
     agent: &str,
     text: &str,
     stamp: &serde_json::Map<String, Value>,
-) -> A2aResult<String> {
+) -> A2aResult<(String, bool)> {
     #[cfg(feature = "sal")]
     if is_postgres(app) {
         let ctx = crate::store::CallerContext::for_agent(agent);
@@ -624,10 +718,17 @@ async fn store_message(
             },
         )
         .await;
-        if let Ok(mem) = app.store.get(&ctx, &id).await {
-            let _ = super::parity::fanout_or_pending(app, &mem).await;
-        }
-        return Ok(id);
+        let pending = match app.store.get(&ctx, &id).await {
+            Ok(mem) => fan_out(app, &mem).await,
+            Err(e) => {
+                tracing::warn!(
+                    target: "a2a",
+                    "a2a message {id} stored but not re-readable for federation fan-out: {e}"
+                );
+                fan_out_unreadable(app, &id)
+            }
+        };
+        return Ok((id, pending));
     }
     let params = json!({
         (field_names::TARGET_AGENT_ID): agent,
@@ -645,7 +746,7 @@ async fn store_message(
             .as_ref()
             .ok()
             .and_then(|v| v.get("id").and_then(Value::as_str))
-            .and_then(|id| crate::db::get(&lock.0, id).ok().flatten());
+            .map(|id| (id.to_string(), crate::db::get(&lock.0, id)));
         (result, mem)
     };
     let value = result.map_err(|e| match e {
@@ -657,12 +758,59 @@ async fn store_message(
             A2aError::internal()
         }
     })?;
-    if let Some(mem) = fanout_mem.as_ref() {
-        let _ = super::parity::fanout_or_pending(app, mem).await;
-    }
-    value
+    let id = value
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(A2aError::internal)
+        .ok_or_else(A2aError::internal)?;
+    let pending = match fanout_mem {
+        Some((_, Ok(Some(mem)))) => fan_out(app, &mem).await,
+        Some((read_id, Ok(None))) => {
+            tracing::warn!(
+                target: "a2a",
+                "a2a message {read_id} stored but missing on re-read for federation fan-out"
+            );
+            fan_out_unreadable(app, &read_id)
+        }
+        Some((read_id, Err(e))) => {
+            tracing::warn!(
+                target: "a2a",
+                "a2a message {read_id} stored but not re-readable for federation fan-out: {e}"
+            );
+            fan_out_unreadable(app, &read_id)
+        }
+        None => false,
+    };
+    Ok((id, pending))
+}
+
+/// Fan one stored A2A message out to the federation. Returns whether its
+/// replication is still pending: a quorum miss is logged at warn, counted
+/// ([`a2a::replication_pending_total`]) and surfaced in the task status by
+/// the caller, never dropped. `false` when no federation is configured.
+async fn fan_out(app: &AppState, mem: &crate::models::Memory) -> bool {
+    if super::parity::fanout_or_pending(app, mem).await.is_none() {
+        return false;
+    }
+    a2a::note_replication_pending();
+    tracing::warn!(
+        target: "a2a",
+        "a2a message {} stored locally; federation quorum not met, replication is pending",
+        mem.id
+    );
+    true
+}
+
+/// A stored message that could not be re-read for fan-out: with a federation
+/// configured it was not replicated, so it is pending (counted, surfaced).
+fn fan_out_unreadable(app: &AppState, id: &str) -> bool {
+    if app.federation.as_ref().is_none() {
+        return false;
+    }
+    a2a::note_replication_pending();
+    tracing::warn!(
+        target: "a2a",
+        "a2a message {id} stored locally; not fanned out, replication is pending"
+    );
+    true
 }

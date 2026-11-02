@@ -8,7 +8,7 @@
 
 mod a2a_standard_8444_common;
 
-use a2a_standard_8444_common::{SalStore, app_state_with, run_suite};
+use a2a_standard_8444_common::{MALLORY, SalStore, ScopeMover, app_state_with, run_suite};
 use ai_memory::config::ResolvedTtl;
 use ai_memory::handlers::{Db, StorageBackend};
 use std::path::PathBuf;
@@ -35,10 +35,33 @@ async fn a2a_standard_binding_postgres_8444() {
         ResolvedTtl::default(),
         true,
     )));
-    let store = SalStore(Arc::new(
+    let pg = Arc::new(
         ai_memory::store::postgres::PostgresStore::connect(&url)
             .await
             .expect("connect postgres adapter"),
-    ));
-    run_suite(app_state_with(db, StorageBackend::Postgres, store)).await;
+    );
+    let mover = pg_scope_mover(Arc::clone(&pg));
+    let store = SalStore(pg);
+    run_suite(app_state_with(db, StorageBackend::Postgres, store), mover).await;
+}
+
+/// The PostgreSQL twin of `sqlite_scope_mover`: the memory's owner and inbox
+/// target become `MALLORY` through a raw write on the adapter's pool.
+fn pg_scope_mover(pg: Arc<ai_memory::store::postgres::PostgresStore>) -> ScopeMover {
+    Box::new(move |id: String| {
+        let pg = Arc::clone(&pg);
+        Box::pin(async move {
+            let done = sqlx::query(
+                "UPDATE memories SET metadata = metadata || \
+                 jsonb_build_object('agent_id', $1::text, 'target_agent_id', $1::text) \
+                 WHERE id = $2",
+            )
+            .bind(MALLORY)
+            .bind(&id)
+            .execute(pg.pool())
+            .await
+            .expect("move the memory out of scope");
+            assert_eq!(done.rows_affected(), 1, "the memory row exists");
+        })
+    })
 }

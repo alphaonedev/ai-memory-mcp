@@ -78,12 +78,51 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// System metadata key: the AUTHENTICATED agent id the inbound content is
 /// attributed to. Key name and value conventions are defined by #8443 (role
 /// grounding); stamped directly here until that module lands on the chain.
+// #8443/#8449 own the swap to the role-grounding key; whichever lands second does the swap.
 pub const META_CONTENT_PRINCIPAL: &str = "content_principal"; // key defined by #8443
 /// System metadata key: the remote-chosen role string, an UNTRUSTED label.
 pub const META_A2A_ROLE: &str = "a2a_role";
 
 /// Longest accepted `messageId` / `contextId` / `taskId` / role string.
 pub const MAX_ID_LEN: usize = 128;
+
+/// Text of the task status message a `SendMessage` reply carries when the
+/// message is stored locally but its federation fan-out missed quorum.
+pub const REPLICATION_PENDING_TEXT: &str =
+    "stored locally; federation quorum not met, replication is pending";
+
+/// Process-wide count of A2A messages whose federation fan-out missed quorum.
+static REPLICATION_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one A2A message whose federation fan-out missed quorum.
+pub fn note_replication_pending() {
+    REPLICATION_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many A2A messages missed federation quorum since the process started.
+#[must_use]
+pub fn replication_pending_total() -> u64 {
+    REPLICATION_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The agent status message of a task whose latest message is stored locally
+/// but not yet replicated to federation quorum.
+#[must_use]
+pub fn replication_pending_message(task_id: &str, context_id: &str) -> Message {
+    let mut m = Message::new(
+        Role::Agent,
+        vec![Part::text(REPLICATION_PENDING_TEXT.to_string())],
+    );
+    m.message_id = uuid::Uuid::new_v4().to_string();
+    m.context_id = Some(context_id.to_string());
+    m.task_id = Some(task_id.to_string());
+    m
+}
+
+/// Bound on the compare-and-set attempts of one message completion. Each lost
+/// attempt means another request moved the task in between; the bound turns
+/// a pathological livelock into a `-32004` instead of an unbounded loop.
+pub const A2A_COMPLETION_CAS_ATTEMPTS: usize = 8;
 /// Message of the `-32603` internal error; never carries substrate text.
 const INTERNAL_ERROR_MESSAGE: &str = "internal error";
 /// `ListTasks` default page size (spec: 1..=100, default 50).
@@ -667,9 +706,11 @@ const MAX_PUBLIC_URL_LEN: usize = 255;
 /// card requested through a router built without a daemon).
 const DEFAULT_CARD_BASE_URL: &str = "http://localhost";
 
-/// The valid form of a configured public base URL: `http(s)://authority`, no
-/// whitespace or control characters, no userinfo, query, fragment or
-/// backslash, trailing slashes trimmed. `None` for anything else.
+/// The valid form of a configured public base URL: `http(s)://authority`
+/// only (no path), no whitespace or control characters, no userinfo, query,
+/// fragment or backslash, trailing slashes trimmed. `None` for anything else.
+/// The daemon serves A2A at its own fixed route; a path prefix belongs to the
+/// reverse proxy in front of it, never to the advertised base.
 #[must_use]
 pub fn valid_public_url(raw: &str) -> Option<String> {
     let t = raw.trim().trim_end_matches('/');
@@ -678,9 +719,9 @@ pub fn valid_public_url(raw: &str) -> Option<String> {
         .or_else(|| t.strip_prefix("http://"))?;
     let ok = !rest.is_empty()
         && t.len() <= MAX_PUBLIC_URL_LEN
-        && rest
-            .chars()
-            .all(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '@' | '?' | '#' | '\\'));
+        && rest.chars().all(|c| {
+            !c.is_whitespace() && !c.is_control() && !matches!(c, '@' | '?' | '#' | '\\' | '/')
+        });
     ok.then(|| t.to_string())
 }
 
@@ -1034,6 +1075,7 @@ mod tests {
             userinfo_url.as_str(),
             "https://evil.example/?x=1",
             "https://evil.example#f",
+            "https://mem.example.org/prefix",
             "ftp://x.example",
             "https://a\\b",
             "",

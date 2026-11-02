@@ -529,13 +529,21 @@ async fn history_is_content_free_and_follows_erasure(router: &axum::Router, app:
         &json!({"message": message(&format!("key {secret} end"), "ROLE_USER")}),
     )
     .await;
-    if reply.status == StatusCode::OK {
-        let secret_task = reply.json()["result"]["task"].clone();
-        let sid = secret_task["id"].as_str().expect("id").to_string();
-        let row = stored_task(app, ALICE, &sid).await.expect("row");
-        assert!(!row.history.to_string().contains(secret));
-        assert!(!row.artifacts.to_string().contains(secret));
-    }
+    // Sec INFO-1 (r3): the suite seeds the screen mode (`Off`, see
+    // `run_suite`), so the message is accepted and the block always runs.
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    let secret_task = reply.json()["result"]["task"].clone();
+    let sid = secret_task["id"].as_str().expect("id").to_string();
+    let row = stored_task(app, ALICE, &sid).await.expect("row");
+    assert!(!row.history.to_string().contains(secret));
+    assert!(!row.artifacts.to_string().contains(secret));
+    // GetTask renders exactly the stored memory content, nothing else.
+    let mem = stored_memory(app, ALICE, &receipt_memory_id(&secret_task)).await;
+    let got = rpc(router, ALICE_KEY, "GetTask", &json!({"id": sid})).await;
+    assert_eq!(got.status, StatusCode::OK);
+    let rendered = history_of(&got);
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0]["parts"][0]["text"], json!(mem.content));
 }
 
 /// Code LOW-2 / LOW-5: concurrent continuations never lose a history entry or
@@ -585,23 +593,288 @@ async fn concurrent_continuations_keep_every_history_entry(router: &axum::Router
     for entry_id in &ids {
         assert!(sent.iter().any(|(m, _)| m == entry_id));
     }
-    // A reply that reported COMPLETED stored its own message: its entry and
-    // its receipt are both in the final task.
-    let stored: Vec<String> = sent
-        .iter()
-        .filter(|(_, r)| {
-            r.json()["result"]["task"]["artifacts"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty())
-        })
-        .map(|(m, _)| m.clone())
-        .collect();
-    for message_id in &stored {
-        assert!(
-            ids.contains(&message_id.as_str()),
-            "{message_id} was acknowledged but is missing from the history"
-        );
+    // Code MEDIUM-2 (r3): EVERY 200 reply acknowledged its message, so its
+    // entry is in the final task, whatever state the reply reported.
+    for (message_id, r) in &sent {
+        if r.status == StatusCode::OK {
+            assert!(
+                ids.contains(&message_id.as_str()),
+                "{message_id} was acknowledged but is missing from the history"
+            );
+        }
     }
+}
+
+/// Code MEDIUM-2 (r3), deterministic interleaving: continuation A is WORKING
+/// when continuation B re-opens the task (WORKING -> SUBMITTED). A's
+/// completion still appends its entry and receipt (it never answers success
+/// without them), B then completes, and the final task holds both. A
+/// completion that finds the task ended is `-32004`, never a success.
+async fn completion_survives_a_reopen_while_working(router: &axum::Router, app: &AppState) {
+    let first = send_ok(router, ALICE_KEY, "interleave-a-8444", "ROLE_USER").await;
+    let memory_a = receipt_memory_id(&first);
+    let id = format!("interleave-8444-{}", uuid::Uuid::new_v4());
+    seed_working_task(app, ALICE, &id).await; // A holds the task WORKING
+    let reopen = A2aTaskUpdate {
+        status_timestamp: ai_memory::a2a::now_timestamp(),
+        ..A2aTaskUpdate::default()
+    };
+    assert!(
+        transition_direct(
+            app,
+            ALICE,
+            &id,
+            &state::NON_TERMINAL,
+            state::SUBMITTED,
+            &reopen
+        )
+        .await,
+        "B re-opens the task while A is WORKING"
+    );
+    let a_message = uuid::Uuid::new_v4().to_string();
+    let entry = A2aHistoryEntry {
+        message_id: a_message.clone(),
+        role: "ROLE_USER".to_string(),
+        context_id: "ctx-seed-8444".to_string(),
+        task_id: id.clone(),
+        memory_id: memory_a.clone(),
+    };
+    ai_memory::handlers::a2a_complete_message(app, ALICE, &id, entry)
+        .await
+        .expect("A's completion lands while B holds the task");
+    let row = stored_task(app, ALICE, &id).await.expect("row");
+    assert!(
+        row.history.to_string().contains(&a_message),
+        "A's acknowledged entry is in the task: {}",
+        row.history
+    );
+    assert_eq!(row.state, state::SUBMITTED, "B's re-open is left in place");
+
+    let mut m = message("interleave-b-8444", "ROLE_USER");
+    m["taskId"] = json!(id);
+    let b_message = m["messageId"].as_str().expect("message id").to_string();
+    let b = rpc(router, ALICE_KEY, "SendMessage", &json!({"message": m})).await;
+    assert_eq!(b.status, StatusCode::OK, "{}", b.json());
+    let got = rpc(router, ALICE_KEY, "GetTask", &json!({"id": id})).await;
+    let task = got.json()["result"].clone();
+    assert_eq!(task["status"]["state"], json!(state::COMPLETED));
+    let ids: Vec<String> = history_of(&got)
+        .iter()
+        .filter_map(|h| h["messageId"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(ids, vec![a_message, b_message], "both entries, in order");
+    assert_eq!(
+        task["artifacts"].as_array().map(Vec::len),
+        Some(2),
+        "both receipts"
+    );
+
+    // A completion whose task a concurrent continuation already COMPLETED
+    // still appends (the COMPLETED source of the final compare-and-set).
+    let c_message = uuid::Uuid::new_v4().to_string();
+    let entry = A2aHistoryEntry {
+        message_id: c_message.clone(),
+        role: "ROLE_USER".to_string(),
+        context_id: "ctx-seed-8444".to_string(),
+        task_id: id.clone(),
+        memory_id: memory_a.clone(),
+    };
+    ai_memory::handlers::a2a_complete_message(app, ALICE, &id, entry)
+        .await
+        .expect("a completion after a concurrent COMPLETED lands");
+    let row = stored_task(app, ALICE, &id).await.expect("row");
+    assert_eq!(row.state, state::COMPLETED);
+    assert!(
+        row.history.to_string().contains(&c_message),
+        "the late completion's entry is in the task: {}",
+        row.history
+    );
+
+    // A completion that finds the task CANCELED refuses (-32004 naming the
+    // state) and leaves the task untouched.
+    let ended = format!("interleave-ended-8444-{}", uuid::Uuid::new_v4());
+    seed_working_task(app, ALICE, &ended).await;
+    assert!(
+        transition_direct(
+            app,
+            ALICE,
+            &ended,
+            &state::NON_TERMINAL,
+            state::CANCELED,
+            &reopen
+        )
+        .await
+    );
+    let entry = A2aHistoryEntry {
+        message_id: uuid::Uuid::new_v4().to_string(),
+        role: "ROLE_USER".to_string(),
+        context_id: "ctx-seed-8444".to_string(),
+        task_id: ended.clone(),
+        memory_id: memory_a,
+    };
+    let err = ai_memory::handlers::a2a_complete_message(app, ALICE, &ended, entry)
+        .await
+        .expect_err("a completion on a CANCELED task is refused");
+    assert_eq!(err.code, -32004, "{err:?}");
+    assert!(err.message.contains(state::CANCELED), "{err:?}");
+    let row = stored_task(app, ALICE, &ended).await.expect("row");
+    assert_eq!(row.history, json!([]));
+    assert_eq!(row.state, state::CANCELED);
+}
+
+/// Moves one memory out of the caller's read scope through the backend's own
+/// storage (a raw write no API caller can reach). Each test binary supplies
+/// its backend's twin.
+pub type ScopeMover =
+    Box<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>;
+
+/// The agent a moved memory is reassigned to.
+pub const MALLORY: &str = "ai:mallory-8444";
+
+/// The SQLite scope mover: the memory's owner and inbox target become
+/// [`MALLORY`], so the caller-scoped read no longer returns it to `ALICE`.
+pub fn sqlite_scope_mover(app: &AppState) -> ScopeMover {
+    let db = Arc::clone(&app.db);
+    Box::new(move |id: String| {
+        let db = Arc::clone(&db);
+        Box::pin(async move {
+            let changed = db
+                .lock()
+                .await
+                .0
+                .execute(
+                    "UPDATE memories SET metadata = json_set(metadata, '$.agent_id', ?1, \
+                     '$.target_agent_id', ?1) WHERE id = ?2",
+                    rusqlite::params![MALLORY, id],
+                )
+                .expect("move the memory out of scope");
+            assert_eq!(changed, 1, "the memory row exists");
+        })
+    })
+}
+
+/// Code INFO-1 (r3): `GetTask` renders each linked memory through the
+/// caller-scoped read on BOTH backends, so a linked memory moved out of the
+/// caller's scope is omitted the same way on SQLite and PostgreSQL.
+async fn history_render_is_caller_scoped(
+    router: &axum::Router,
+    app: &AppState,
+    mover: &ScopeMover,
+) {
+    let kept = send_ok(router, ALICE_KEY, "scope-kept-8444", "ROLE_USER").await;
+    let out_of_scope = send_ok(router, ALICE_KEY, "scope-moved-8444", "ROLE_USER").await;
+    let id = format!("scope-8444-{}", uuid::Uuid::new_v4());
+    seed_working_task(app, ALICE, &id).await;
+    let entry = |memory_id: String| A2aHistoryEntry {
+        message_id: uuid::Uuid::new_v4().to_string(),
+        role: "ROLE_USER".to_string(),
+        context_id: "ctx-seed-8444".to_string(),
+        task_id: id.clone(),
+        memory_id,
+    };
+    link_history(
+        app,
+        ALICE,
+        &id,
+        &[
+            entry(receipt_memory_id(&kept)),
+            entry(receipt_memory_id(&out_of_scope)),
+        ],
+    )
+    .await;
+    mover(receipt_memory_id(&out_of_scope)).await;
+    let got = rpc(router, ALICE_KEY, "GetTask", &json!({"id": id})).await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.json());
+    let texts: Vec<Value> = history_of(&got)
+        .iter()
+        .map(|h| h["parts"][0]["text"].clone())
+        .collect();
+    assert_eq!(texts, vec![json!("scope-kept-8444")]);
+    assert!(!String::from_utf8_lossy(&got.body).contains("scope-moved-8444"));
+    let own = rpc(
+        router,
+        ALICE_KEY,
+        "GetTask",
+        &json!({"id": out_of_scope["id"]}),
+    )
+    .await;
+    assert_eq!(own.status, StatusCode::OK);
+    assert!(history_of(&own).is_empty(), "{}", own.json());
+}
+
+/// A loopback federation peer that answers every push with `500`.
+async fn spawn_failing_peer() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failing peer");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    format!("http://{addr}/api/v1/sync/push")
+}
+
+/// Code INFO-2 (r3): a `SendMessage` whose federation fan-out misses quorum is
+/// still durable locally, keeps its entry, is counted, and tells the caller
+/// in the task status message (never a bare success).
+async fn replication_pending_is_surfaced(app: &AppState) {
+    let peer = ai_memory::federation::PeerEndpoint {
+        id: "peer-failing-8444".to_string(),
+        sync_push_url: spawn_failing_peer().await,
+    };
+    let config = ai_memory::federation::FederationConfig {
+        policy: ai_memory::replication::QuorumPolicy::new(
+            2,
+            2,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("W=2 of 2 policy"),
+        peers: vec![peer],
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client"),
+        sender_agent_id: "ai:a2a-8444-origin".to_string(),
+        api_key: None,
+        signing_key: None,
+        dlq_sink: None,
+    };
+    let mut fed_app = app.clone();
+    fed_app.federation = Arc::new(Some(config));
+    let (fed_router, _) = router(fed_app);
+    let before = ai_memory::a2a::replication_pending_total();
+    let task = send_ok(&fed_router, ALICE_KEY, "replication-8444", "ROLE_USER").await;
+    assert_eq!(task["status"]["state"], json!(state::COMPLETED));
+    assert_eq!(
+        task["status"]["message"]["parts"][0]["text"],
+        json!(ai_memory::a2a::REPLICATION_PENDING_TEXT),
+        "{task}"
+    );
+    assert_eq!(task["status"]["message"]["role"], json!("ROLE_AGENT"));
+    assert_eq!(
+        task["history"][0]["parts"][0]["text"],
+        json!("replication-8444")
+    );
+    assert!(ai_memory::a2a::replication_pending_total() > before);
+    // Without a federation the status carries no such message.
+    let (plain_router, _) = router(app.clone());
+    let plain = send_ok(&plain_router, ALICE_KEY, "no-federation-8444", "ROLE_USER").await;
+    assert!(plain["status"].get("message").is_none(), "{plain}");
 }
 
 /// Code MEDIUM-1 / sec MEDIUM-2 (lost compare-and-set): a continuation racing a
@@ -795,8 +1068,15 @@ fn assert_no_leak(card: &Value, forbidden: &[&str]) {
     }
 }
 
-/// Run every #8444 scenario against `app` (a fresh, empty backend).
-pub async fn run_suite(app: AppState) {
+/// Run every #8444 scenario against `app` (a fresh, empty backend);
+/// `mover` is the backend's [`ScopeMover`].
+pub async fn run_suite(app: AppState, mover: ScopeMover) {
+    // Sec INFO-1 (r3): the screen mode is seeded explicitly, never inherited.
+    ai_memory::secret_screen::set_screen_mode(ai_memory::secret_screen::SecretScreenMode::Off);
+    assert_eq!(
+        ai_memory::secret_screen::screen_mode(),
+        ai_memory::secret_screen::SecretScreenMode::Off
+    );
     let probe = app.clone();
     let (router, global) = router(app);
 
@@ -807,6 +1087,8 @@ pub async fn run_suite(app: AppState) {
     cancel_races_completion_once(&router, &probe).await;
     history_is_content_free_and_follows_erasure(&router, &probe).await;
     concurrent_continuations_keep_every_history_entry(&router, &probe).await;
+    completion_survives_a_reopen_while_working(&router, &probe).await;
+    history_render_is_caller_scoped(&router, &probe, &mover).await;
     continuation_racing_cancel_is_unsupported_operation(&router, &probe).await;
     corrupt_stored_task_answers_internal_error(&router, &probe).await;
     abandoned_active_tasks_are_retired(&probe).await;
@@ -814,6 +1096,7 @@ pub async fn run_suite(app: AppState) {
     export_carries_content_free_task_rows(&router, &probe).await;
     body_supplied_content_principal_never_survives(&router, &probe).await;
     conformance::run_all(&router, &probe, &global).await;
+    replication_pending_is_surfaced(&probe).await;
 }
 
 async fn card_is_authenticated_only(router: &axum::Router, _global: &str) {

@@ -7,7 +7,7 @@
 
 mod a2a_standard_8444_common;
 
-use a2a_standard_8444_common::{run_suite, sqlite_app_state};
+use a2a_standard_8444_common::{run_suite, sqlite_app_state, sqlite_scope_mover};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a2a_standard_binding_sqlite_8444() {
@@ -16,5 +16,6 @@ async fn a2a_standard_binding_sqlite_8444() {
     )
     .expect("scratch dir");
     let app = sqlite_app_state(&dir.path().join("a2a-8444.db"));
-    run_suite(app).await;
+    let mover = sqlite_scope_mover(&app);
+    run_suite(app, mover).await;
 }
