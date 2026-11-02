@@ -65,6 +65,8 @@ mod api_key_revoke_3529;
 // another agent" seam, sharing the #3529 registry advisory lock. Own module
 // for the same qual_10 budget reason as `parity_3064` above.
 mod api_key_bind_3535;
+// #8444 - durable Agent2Agent Task rows (own module: qual_10 budget).
+mod a2a_tasks;
 mod pubkey_history;
 // #3527 — the single funnel that allocates a hash-chain `sequence` and
 // appends the row claiming it, for BOTH postgres chains. Own module for the
@@ -1750,6 +1752,12 @@ const MIGRATION_V99_SYNC_PEER_CONTACT: &str =
 const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
     include_str!("../../migrations/postgres/0057_v100_title_slot_live_rows.sql");
 
+/// v101 (#8444): durable `a2a_tasks` table for the Agent2Agent standard
+/// binding. The sqlite twin is `MIGRATION_V101_SQLITE`
+/// (`migrations/sqlite/0085_v101_a2a_tasks.sql`).
+const MIGRATION_V101_A2A_TASKS: &str =
+    include_str!("../../migrations/postgres/0058_v101_a2a_tasks.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2140,7 +2148,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 100;
+const CURRENT_SCHEMA_VERSION: i32 = 101;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4310,8 +4318,11 @@ impl PostgresStore {
         if current_version < 99 {
             self.migrate_v99().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 100 {
             self.migrate_v100().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v101().await?;
         }
 
         Ok(())
@@ -7484,6 +7495,33 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v100 applied (#3690: the (title, namespace) unique index \
              is partial — tombstoned rows no longer hold a title slot)"
+        );
+        Ok(())
+    }
+
+    /// v101 (#8444) - durable `a2a_tasks` table for the Agent2Agent standard
+    /// binding (additive, idempotent, NoLoss).
+    async fn migrate_v101(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v101 a2a-tasks migration tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V101_A2A_TASKS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v101 a2a-tasks migration", e))?;
+
+        record_schema_version(&mut tx, 101).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v101 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v101 applied (#8444: a2a_tasks - durable Task rows \
+             for the Agent2Agent standard binding)"
         );
         Ok(())
     }
@@ -30910,6 +30948,73 @@ impl MemoryStore for PostgresStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        self.notify_stamped(
+            ctx,
+            target_agent,
+            title,
+            payload,
+            priority,
+            tier,
+            why_trace,
+            None,
+        )
+        .await
+    }
+
+    async fn a2a_task_insert(
+        &self,
+        task: &crate::storage::a2a_tasks::A2aTaskRow,
+    ) -> StoreResult<()> {
+        // B7' parity: the sqlite twin gates; the submodule owning the INSERT
+        // gates too (B7), and so does this arm.
+        self.gate_record_stop().await?;
+        self.a2a_task_insert_pg(task).await
+    }
+
+    async fn a2a_task_get(
+        &self,
+        agent_id: &str,
+        id: &str,
+    ) -> StoreResult<Option<crate::storage::a2a_tasks::A2aTaskRow>> {
+        self.a2a_task_get_pg(agent_id, id).await
+    }
+
+    async fn a2a_task_list(
+        &self,
+        agent_id: &str,
+        filter: &crate::storage::a2a_tasks::A2aTaskFilter,
+    ) -> StoreResult<crate::storage::a2a_tasks::A2aTaskPage> {
+        self.a2a_task_list_pg(agent_id, filter).await
+    }
+
+    async fn a2a_task_transition(
+        &self,
+        agent_id: &str,
+        id: &str,
+        from_states: &[&str],
+        to_state: &str,
+        update: &crate::storage::a2a_tasks::A2aTaskUpdate,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
+        self.a2a_task_transition_pg(agent_id, id, from_states, to_state, update)
+            .await
+    }
+
+    async fn a2a_task_export(&self) -> StoreResult<Vec<crate::storage::a2a_tasks::A2aTaskRow>> {
+        self.a2a_task_export_pg().await
+    }
+
+    async fn notify_stamped(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+        why_trace: Option<&str>,
+        system_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> StoreResult<String> {
         // #4338 — refuse an invalid recipient before any quota charge, write
         // or wake; the shared validator never echoes the value.
         crate::validate::validate_notify_target(target_agent).map_err(|e| {
@@ -30935,6 +31040,13 @@ impl MemoryStore for PostgresStore {
         // rationale here; see the trait docs). Sqlite adapter parity.
         if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
+        // #8444 - system-stamped provenance lands at memory formation, never
+        // via a post-hoc patch. Stamps overwrite any same-named key.
+        if let Some(stamp) = system_metadata {
+            for (k, v) in stamp {
+                metadata[k.as_str()] = v.clone();
+            }
         }
         let mem = Memory {
             id: row_id,

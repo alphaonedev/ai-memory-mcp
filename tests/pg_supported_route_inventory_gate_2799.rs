@@ -77,6 +77,9 @@ use ai_memory::handlers::{path_is_registered_route, postgres_endpoint_supported}
 fn all_registered_paths() -> Vec<&'static str> {
     vec![
         routes::ACTIONS_ID_TRANSITION,
+        // v1.0.0 #8444 - the Agent2Agent standard binding pair (served on postgres).
+        routes::A2A,
+        routes::AGENT_CARD,
         // v1.0.0 #2402 — the operator quarantine route-OUT pair.
         routes::ADMIN_QUARANTINE,
         routes::ADMIN_QUARANTINE_ID_RELEASE,
@@ -371,9 +374,9 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // actuator implemented on PG with no way to call it. Proof:
 // `tests/swarm_rewind_pg_item3_3266.rs` (store) and
 // `tests/swarm_rewind_route_item3_3266.rs` (route, both backends).
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 76;
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 78;
 const EXPECTED_FULLY_501_PATHS: usize = 13;
-const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 89;
+const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 91;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
 /// names the allow-list body references. A silent match-arm add/remove
@@ -383,6 +386,9 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     // v1.0.0 #2402 — operator quarantine inspect (the release half is a
     // path-parameter route, frozen as a helper below).
     "ADMIN_QUARANTINE",
+    // v1.0.0 #8444 - the Agent2Agent standard binding pair.
+    "A2A",
+    "AGENT_CARD",
     "AGENTS",
     "APPROVALS_STREAM",
     "ARCHIVE",

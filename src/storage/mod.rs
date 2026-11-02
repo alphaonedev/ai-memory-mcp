@@ -927,6 +927,8 @@ pub use approval_depth::{
     ApprovalDepthLevel, ApprovalDepthLevelState, ApprovalDepthWalk, approval_depth_level_decision,
     approval_depth_level_state, resolve_require_approval_above_depth,
 };
+/// #8444 - durable Agent2Agent Task rows (SQLite SSOT; postgres twin in the store).
+pub mod a2a_tasks;
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;

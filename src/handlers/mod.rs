@@ -101,6 +101,7 @@ pub(crate) fn fed_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+pub mod a2a;
 pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;
@@ -171,6 +172,7 @@ pub mod wire_format;
 // (router wiring in `src/lib.rs`, integration tests) can still
 // reference `handlers::<name>` without knowing which sub-module the
 // item came from. Wire compatibility is preserved verbatim.
+pub use a2a::*;
 pub use admin::*;
 pub use admin_role::*;
 pub use approvals::*;

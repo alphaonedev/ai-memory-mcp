@@ -8204,6 +8204,13 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     }
 
     let addr = format!("{}:{}", args.host, args.port);
+    // #8444 r2: the Agent Card advertises a configured or daemon-derived URL,
+    // never the request's Host / X-Forwarded-Proto headers.
+    crate::a2a::set_card_base_url(crate::a2a::resolve_card_base_url(
+        std::env::var(crate::a2a::ENV_PUBLIC_URL).ok().as_deref(),
+        args.tls_cert.is_some() && args.tls_key.is_some(),
+        &addr,
+    ));
     tracing::info!("database: {}", db_path.display());
 
     // v1.0.0 #2166 — SIGHUP live `[llm]` reload. On unix, install a SIGHUP

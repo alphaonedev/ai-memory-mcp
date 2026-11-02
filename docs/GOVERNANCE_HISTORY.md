@@ -354,7 +354,7 @@ Every defect is fixed.
 
 **World-class only.** We are driving toward perfection. The
 ai-memory codebase is now substantial (103 MCP tools at `--profile
-full`, 103 production HTTP route registrations / 89 unique URL paths, 99 CLI subcommands (97 in the default build) at v1.0.0 (post FX-12/ARCH-3 + FX-C3 batch2 + #1389 L2 `RecoverPreviousSession` + #1443 `Expand` + #1598 `Reembed` + #1727 `UndoEdit` + #1978 `Watch`), tens of
+full`, 105 production HTTP route registrations / 91 unique URL paths, 99 CLI subcommands (97 in the default build) at v1.0.0 (post FX-12/ARCH-3 + FX-C3 batch2 + #1389 L2 `RecoverPreviousSession` + #1443 `Expand` + #1598 `Reembed` + #1727 `UndoEdit` + #1978 `Watch`), tens of
 thousands of lines of Rust); the architectural North Star is
 long-term code-base manageability so the codebase lasts for a
 very long time.
