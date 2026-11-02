@@ -59,8 +59,8 @@ bench_6043_result[1]{backend,threshold,rows_before,rows_after,shrink_pct,pass_ll
 The assertions are shown able to fail: a pass with rollback disabled fails the
 identity check, and every comparator field (id, namespace, title, content,
 metadata, tags, embedding, embedding space) is tampered with in a unit test.
-The recall values, `shrink_pct` and wall time are pinned exactly per
-threshold.
+The recall values and `shrink_pct` are pinned exactly per threshold; wall
+time is asserted non-zero.
 
 ## R3: operator arm (real LLM)
 

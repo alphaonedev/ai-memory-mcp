@@ -1168,6 +1168,39 @@ fn ratio_json(r: Ratio) -> serde_json::Value {
     serde_json::json!({ "hits": r.hits, "total": r.total, "value": r.value() })
 }
 
+/// Opt-in policy of the operator arm. `None` (skip) only when the backend
+/// variable is unset; once it is set, an `Err` or an `Ok(None)` from the client
+/// builder panics with the error text, so a misconfigured run cannot pass as a skip.
+fn operator_arm_client<C>(backend_set: bool, built: Result<Option<C>>) -> Option<C> {
+    if !backend_set {
+        return None;
+    }
+    match built {
+        Ok(Some(client)) => Some(client),
+        Ok(None) => panic!(
+            "the configured LLM backend must build a working client (unknown alias, missing key or unreachable endpoint): the builder returned no client"
+        ),
+        Err(e) => panic!(
+            "the configured LLM backend must build a working client (unknown alias, missing key or unreachable endpoint): {e:#}"
+        ),
+    }
+}
+
+#[test]
+#[should_panic(expected = "not a recognized backend alias")]
+fn bench_6043_operator_arm_fails_closed_on_a_builder_error() {
+    let built: Result<Option<()>> = Err(anyhow!(
+        "LLM backend `bogus123` is not a recognized backend alias"
+    ));
+    let _ = operator_arm_client(true, built);
+}
+
+#[test]
+fn bench_6043_operator_arm_skips_only_when_the_backend_is_unset() {
+    let built: Result<Option<()>> = Err(anyhow!("never consulted"));
+    assert!(operator_arm_client(false, built).is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "operator arm: needs a real LLM named by AI_MEMORY_LLM_* and writes .local-runs/"]
 async fn bench_6043_real_llm_threshold_sweep() {
@@ -1177,9 +1210,8 @@ async fn bench_6043_real_llm_threshold_sweep() {
         return;
     }
     // Opted in: any failure from here on fails the test (no silent skip).
-    let client = crate::llm::OllamaClient::from_env()
-        .expect("the configured LLM must be reachable")
-        .expect("the configured LLM backend must produce a client");
+    let client = operator_arm_client(true, crate::llm::OllamaClient::from_env())
+        .expect("a set backend never yields None");
     let mut runs = Vec::new();
     for threshold in THRESHOLD_SWEEP {
         let (store, _dir) = sqlite_store().expect(SQLITE_OPEN_MSG);

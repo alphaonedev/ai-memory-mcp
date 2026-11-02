@@ -110,5 +110,5 @@ src/store/postgres.rs:GOVERNANCE_INTERNAL
 # all(test, feature = "sal") (src/curator/mod.rs). The benchmark must read the
 # consolidator-owned summary rows and the `_curator/rollback` rows it measures;
 # a for_agent principal cannot see them (tried first: rows_after 20 instead of
-# 26 at bench_6043.rs:870). Every row it seeds lives in a throwaway namespace.
+# 26 at the rows_after pin in assert_result). Every row it seeds lives in a throwaway namespace.
 src/curator/bench_6043.rs:BENCH_AGENT
