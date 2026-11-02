@@ -5465,7 +5465,7 @@ class WorkflowFormMutants(unittest.TestCase):
         self.assertEqual(pre_trust_problems(live), [])
         jobs = yaml_subset_load(live)["jobs"]
         names = [d["name"] for d in jobs.values() if "name" in d]
-        self.assertEqual((len(jobs), len(names)), (13, 13))
+        self.assertEqual((len(jobs), len(names)), (14, 14))
         self.assertEqual({n for n in names if "${{" in n}, JOB_NAME_EXPRESSIONS)
         self.assertEqual(_fold_name("  CI-\tGate "), "ci- gate")
 

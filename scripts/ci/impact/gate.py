@@ -43,8 +43,8 @@ TAG_REF_PREFIX = "refs/tags/v"
 MISSING_REASON = "missing-needed-job"
 # The `needs:` list of the ci-gate job in .github/workflows/ci.yml; a test
 # keeps the two in step.
-REQUIRED_NEEDS = ("select", "classify", "build-script-vetting", "check",
-                  "mobile-cross-compile")
+REQUIRED_NEEDS = ("select", "classify", "build-script-vetting", "dependency-floors",
+                  "check", "mobile-cross-compile")
 
 
 def outputs_of(needs: dict, job: str) -> dict:
