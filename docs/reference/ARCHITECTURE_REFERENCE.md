@@ -602,15 +602,15 @@ ruling on #3714).
 
 **Migration tool.**
 
+The first command writes `<file>.bak.<ts>` and rewrites the file in the v2 shape; with `--dry-run` it prints the diff to stderr and writes nothing.
+
+With `--also-clean-claude-json` it additionally removes `mcpServers.<*>.env` from `~/.claude.json` after the operator has verified the new config works.
+
 ```bash
-ai-memory config migrate              # write <file>.bak.<ts> + rewrite in v2 shape
-ai-memory config migrate --dry-run    # print diff to stderr, no writes
+ai-memory config migrate
+ai-memory config migrate --dry-run
 ai-memory config migrate \
-    --also-clean-claude-json          # additionally remove
-                                      # mcpServers.<*>.env from
-                                      # ~/.claude.json after the
-                                      # operator has verified the
-                                      # new config works
+    --also-clean-claude-json
 ```
 
 Idempotent — running against a v2 file is a no-op INFO log.

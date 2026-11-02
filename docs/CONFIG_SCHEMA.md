@@ -679,13 +679,13 @@ caps process RAM at v1.0.0.
 
 To migrate in place:
 
+The first command writes `<file>.bak.<ts>` and rewrites the file; with `--dry-run` it prints the diff and writes nothing. With `--also-clean-claude-json` it additionally removes `mcpServers.<*>.env` from `~/.claude.json`.
+
 ```bash
-ai-memory config migrate              # write <file>.bak.<ts> + rewrite
-ai-memory config migrate --dry-run    # print diff, write nothing
+ai-memory config migrate
+ai-memory config migrate --dry-run
 ai-memory config migrate \
-    --also-clean-claude-json          # additionally remove
-                                      # mcpServers.<*>.env from
-                                      # ~/.claude.json
+    --also-clean-claude-json
 ```
 
 The migrator is **idempotent** — running against an already-v2 file
@@ -816,8 +816,10 @@ outside the Rust dependency graph:
    `.dll` is fetched by the repo's helper script rather than a package
    manager:
 
+   The helper writes the library to `/opt/ai-memory/vectorlite.{so|dylib|dll}`:
+
    ```bash
-   scripts/fetch-vectorlite.sh /opt/ai-memory   # -> /opt/ai-memory/vectorlite.{so|dylib|dll}
+   scripts/fetch-vectorlite.sh /opt/ai-memory
    ```
 
    The helper downloads the correct per-platform artefact (from the

@@ -1633,24 +1633,37 @@ returns the appropriate error status.
 
 ## Curl recipes
 
-```bash
-# Health
-curl https://127.0.0.1:9077/api/v1/health
+Health:
 
-# Store a memory
+```bash
+curl https://127.0.0.1:9077/api/v1/health
+```
+
+Store a memory:
+
+```bash
 curl -X POST -H "Content-Type: application/json" \
   https://127.0.0.1:9077/api/v1/memories \
   -d '{"title":"hi","content":"there","tier":"mid"}'
+```
 
-# Recall
+Recall:
+
+```bash
 curl -X POST -H "Content-Type: application/json" \
   https://127.0.0.1:9077/api/v1/recall \
   -d '{"context":"what did I store","limit":5}'
+```
 
-# Incremental sync pull since a timestamp
+Incremental sync pull since a timestamp:
+
+```bash
 curl 'https://127.0.0.1:9077/api/v1/sync/since?since=2026-04-01T00:00:00Z&limit=1000'
+```
 
-# Prometheus scrape
+Prometheus scrape:
+
+```bash
 curl https://127.0.0.1:9077/metrics
 ```
 
