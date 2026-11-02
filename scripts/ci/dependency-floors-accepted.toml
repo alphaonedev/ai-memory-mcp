@@ -10,14 +10,16 @@
 # A trailing comment after a value is not supported.
 #   id             advisory id (RUSTSEC-... or GHSA-...), string, required
 #   aliases        other ids of the same advisory, list of strings, optional, display only
-#                  (matching uses `id` alone)
+#                  (an entry never matches through its own aliases)
 #   package        crate name, string, required (an entry only covers its crate)
 #   rationale      why the finding is accepted, non-empty string, required
 #   review_by      ISO date (YYYY-MM-DD); the gate FAILS once this date is past
 #   tracking_issue GitHub issue number that owns the fix or the review
 #
-# Rules: a finding passes only when an entry `id` equals the finding id or one of
-# the finding aliases; an expired, duplicated (same id and package) or
+# Rules: every OSV record is judged on its own id. A record passes only when an
+# entry `id` equals the record id or is one of that record's own OSV aliases; a
+# record that merely shares a CVE with an accepted one needs its own entry.
+# An expired, duplicated (same id and package) or
 # malformed entry fails; an entry whose crate version is no longer affected
 # only warns (remove it in the PR that lands the fix).
 
@@ -33,7 +35,7 @@ tracking_issue = 8472
 id = "GHSA-m665-v7pm-7grj"
 aliases = ["CVE-2026-115905"]
 package = "zip"
-rationale = "candle 0.11.1 bump in flight"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
 review_by = "2026-11-16"
 tracking_issue = 8472
 
@@ -41,7 +43,7 @@ tracking_issue = 8472
 id = "GHSA-8hxf-qr8p-62x4"
 aliases = ["CVE-2026-115906"]
 package = "zip"
-rationale = "candle 0.11.1 bump in flight"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
 review_by = "2026-11-16"
 tracking_issue = 8472
 
@@ -49,7 +51,7 @@ tracking_issue = 8472
 id = "GHSA-9hj8-73fh-9963"
 aliases = ["CVE-2026-115907"]
 package = "zip"
-rationale = "candle 0.11.1 bump in flight"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
 review_by = "2026-11-16"
 tracking_issue = 8472
 
@@ -57,7 +59,7 @@ tracking_issue = 8472
 id = "GHSA-hjqx-j4rw-g7xv"
 aliases = ["CVE-2026-115908"]
 package = "zip"
-rationale = "candle 0.11.1 bump in flight"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
 review_by = "2026-11-16"
 tracking_issue = 8472
 
@@ -103,7 +105,7 @@ tracking_issue = 8476
 id = "RUSTSEC-2023-0071"
 aliases = ["CVE-2023-49092", "GHSA-4grx-2x9w-596c", "GHSA-c38w-74pg-36hr"]
 package = "rsa"
-rationale = "no fix exists; sqlx-mysql is pulled by sqlx-macros-core under sal-postgres only, as recorded in .cargo/audit.toml; removal path tracked in 8477"
+rationale = "no fix exists; no feature set compiles sqlx-mysql or rsa: cargo tree --locked -i rsa --all-features --target all prints nothing to print; removal of the lock entry is tracked in 8477"
 review_by = "2027-02-01"
 tracking_issue = 8477
 
