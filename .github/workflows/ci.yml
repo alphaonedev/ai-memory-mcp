@@ -1034,6 +1034,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # full history: the cert-expiry corpus tests resolve a base ref and need real ancestry
+          fetch-depth: 0
       - name: Dependency floor gate (OSV)
         run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock --accepted scripts/ci/dependency-floors-accepted.toml
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
