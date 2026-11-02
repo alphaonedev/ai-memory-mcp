@@ -729,7 +729,7 @@ jobs:
             echo "::notice::cargo_skip=false ($cargo_skip_reason) - running full pipeline"
           fi
           echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
-          echo "$changed"
+          echo "$changed" | sed -e 's/::/: :/g' -e 's/##\[/# #[/g'
 
           # #8328 round 3 (REVIEW-8328-code-r2 F1, REVIEW-8328-security-r2 F1,
           # #8338): this step runs NO command from the workspace, so nothing a
@@ -810,7 +810,7 @@ jobs:
           : > "$impact_log"
           selector_rc=0
           GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$IMPACT_BASE" "HEAD" "$CLS_BASE" > "$impact_log" 2>&1 || selector_rc=$?
-          sed -n '1,200{s/::/: :/g;p}' "$impact_log"
+          sed -n '1,200{s/::/: :/g;s/##\[/# #[/g;p}' "$impact_log"
           # Allow-list: four keys, plain values. Any other line (a multi-line
           # value opener, a blank line, a foreign key, a control character)
           # makes the whole emission untrusted. The reason may also carry the
