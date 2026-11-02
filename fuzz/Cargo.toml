@@ -29,3 +29,9 @@ name = "fuzz_capability"
 path = "fuzz_targets/fuzz_capability.rs"
 test = false
 doc = false
+
+# #8473 round 3 (R3-3): the root workspace patches paste to vendor/paste (#2050);
+# the fuzz workspace has its own lock and patch table, so it needs the same
+# entry or it resolves the registry paste 1.0.15 (RUSTSEC-2024-0436, #8478).
+[patch.crates-io]
+paste = { path = "../vendor/paste" }

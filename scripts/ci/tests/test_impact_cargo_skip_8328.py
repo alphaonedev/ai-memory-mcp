@@ -560,11 +560,12 @@ WHOLE_STEP_ROWS = (
     ("spaces-only", "   ", "false", "sqlite", "full", REJECTED),
 )
 NAME_ARGS = ["--test", "alpha_test", "--test", "beta_test"]
-SHARD_BUILD = ["test", "--no-run", "--message-format=json-render-diagnostics", "--features", "sal-postgres"]
+SHARD_BUILD = ["test", "--locked", "--no-run", "--message-format=json-render-diagnostics", "--features", "sal-postgres"]
 EXPECTED_ARGV = {
-    ("sqlite", "full"): [["test", "--no-run"], ["test", "--no-fail-fast"]],
-    ("sqlite", "names"): [["test", "--no-run", "--lib"], ["test", "--no-fail-fast", "--lib"],
-                          ["test", "--no-run"] + NAME_ARGS, ["test", "--no-fail-fast"] + NAME_ARGS],
+    ("sqlite", "full"): [["test", "--locked", "--no-run"], ["test", "--locked", "--no-fail-fast"]],
+    ("sqlite", "names"): [["test", "--locked", "--no-run", "--lib"], ["test", "--locked", "--no-fail-fast", "--lib"],
+                          ["test", "--locked", "--no-run"] + NAME_ARGS,
+                          ["test", "--locked", "--no-fail-fast"] + NAME_ARGS],
     # enterprise-fed shards after one build; the scratch tree has no
     # partition script, so only the build argv (the selection) is compared.
     ("enterprise-fed", "full"): [SHARD_BUILD],

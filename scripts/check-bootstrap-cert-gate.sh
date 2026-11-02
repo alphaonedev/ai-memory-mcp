@@ -233,14 +233,14 @@ instrument_error() {
 BIN_PG="${AI_MEMORY_BIN_PG:-}"
 if [[ -z "$BIN_PG" ]]; then
   echo "building ai-memory (--features sal,sal-postgres) for LEG A-pg…"
-  cargo build --quiet --bin ai-memory --features sal,sal-postgres \
+  cargo build --locked --quiet --bin ai-memory --features sal,sal-postgres \
     --target-dir "$REPO_ROOT/target/cert-gate-pg" || { echo "build failed (A-pg)"; exit 3; }
   BIN_PG="$REPO_ROOT/target/cert-gate-pg/debug/ai-memory"
 fi
 BIN_ND="${AI_MEMORY_BIN:-}"
 if [[ -z "$BIN_ND" ]]; then
   echo "building ai-memory (default features, no sal-postgres) for LEG A-driverless…"
-  cargo build --quiet --bin ai-memory \
+  cargo build --locked --quiet --bin ai-memory \
     --target-dir "$REPO_ROOT/target/cert-gate-driverless" || { echo "build failed (A-driverless)"; exit 3; }
   BIN_ND="$REPO_ROOT/target/cert-gate-driverless/debug/ai-memory"
 fi

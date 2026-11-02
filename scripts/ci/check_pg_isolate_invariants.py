@@ -31,7 +31,7 @@ from typing import List, Optional, Tuple
 
 FLAG = 'AI_MEMORY_TEST_PG_ISOLATE'
 WRAPPER = 'pg_isolated_binary.py'
-PREBUILD = 'cargo test --no-run "$@" "${sel[@]}"'
+PREBUILD = 'cargo test --locked --no-run "$@" "${sel[@]}"'
 WATCHDOG = ('"$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" '
             'python3 scripts/test/pg_isolated_binary.py run')
 LOG_PATH = 'ci-shard/iso-logs'

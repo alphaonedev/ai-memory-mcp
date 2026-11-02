@@ -586,6 +586,9 @@ jobs:
           # feature declaration as the build. Own statement: fail closed.
           FEATURES="$(bash scripts/release-features.sh)"
           test -n "$FEATURES"
+          # cargo-cyclonedx 0.5.9 has no --locked option; a locked metadata call first
+          # fails the step when Cargo.lock would change, so the SBOM lists the reviewed lock.
+          cargo metadata --locked --format-version 1 >/dev/null
           cargo cyclonedx --format json --features "$FEATURES"
           mkdir -p dist
           cp ai-memory.cdx.json dist/

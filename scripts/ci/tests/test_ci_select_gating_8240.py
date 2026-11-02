@@ -137,7 +137,9 @@ class CiGateNeeds(unittest.TestCase):
     def test_the_b4_set_is_exactly_the_jobs_with_a_job_level_if(self):
         jobs = workflow_text.read_jobs(CI_YML)
         with_if = {n for n, j in jobs.items() if j["if"] and n != GATE_JOB}
-        self.assertEqual(with_if, EXPECTED_GATED)
+        # dependency-floors (#8473) carries a job-level `if:` too, but it is not
+        # a required context, so (b4) does not apply and ci-gate does need it.
+        self.assertEqual(with_if, EXPECTED_GATED | {"dependency-floors"})
 
     def test_build_script_vetting_is_in_the_gate(self):
         self.assertIn("build-script-vetting",

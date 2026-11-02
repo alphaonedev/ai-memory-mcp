@@ -43,7 +43,7 @@ FLAKY_TAGS = ("flakyFailure", "flakyError", "rerunFailure", "rerunError")
 
 def run_cargo_metadata(repo: Path, extra: List[str], timeout_s: int) -> dict:
     """Run `cargo metadata --format-version 1` and return the parsed JSON."""
-    cmd = ["cargo", "metadata", "--format-version", "1"] + extra
+    cmd = ["cargo", "metadata", "--locked", "--format-version", "1"] + extra
     res = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True,
                          timeout=timeout_s)
     if res.returncode != 0:

@@ -1,0 +1,117 @@
+# Dated acceptances for scripts/check-dependency-floors.py (#8473 item 5).
+#
+# The gate asks OSV which locked crates.io versions are affected by a published
+# advisory (RustSec and GHSA-only records) and fails on any finding that has no
+# entry here. This file is NOT .cargo/audit.toml: that file belongs to
+# cargo-audit and keeps its own schema.
+#
+# One [[accepted]] table per advisory. Every key is `key = value` on one line;
+# value forms are "string", a bare positive number, or ["a", "b"] string lists.
+# A trailing comment after a value is not supported.
+#   id             advisory id (RUSTSEC-... or GHSA-...), string, required
+#   aliases        other ids of the same advisory, list of strings, optional, display only
+#                  (an entry never matches through its own aliases)
+#   package        crate name, string, required (an entry only covers its crate)
+#   rationale      why the finding is accepted, non-empty string, required
+#   review_by      ISO date (YYYY-MM-DD); the gate FAILS once this date is past
+#   tracking_issue GitHub issue number that owns the fix or the review
+#
+# Rules: every OSV record is judged on its own id. A record passes only when an
+# entry `id` equals the record id or is one of that record's own OSV aliases; a
+# record that merely shares a CVE with an accepted one needs its own entry.
+# An expired, duplicated (same id and package) or
+# malformed entry fails; an entry whose crate version is no longer affected
+# only warns (remove it in the PR that lands the fix).
+
+[[accepted]]
+id = "RUSTSEC-2026-0429"
+aliases = ["GHSA-q7v9-x93c-xqv3", "CVE-2026-115909"]
+package = "zip"
+rationale = "candle 0.11.1 bump in flight"
+review_by = "2026-11-16"
+tracking_issue = 8472
+
+[[accepted]]
+id = "GHSA-m665-v7pm-7grj"
+aliases = ["CVE-2026-115905"]
+package = "zip"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
+review_by = "2026-11-16"
+tracking_issue = 8472
+
+[[accepted]]
+id = "GHSA-8hxf-qr8p-62x4"
+aliases = ["CVE-2026-115906"]
+package = "zip"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
+review_by = "2026-11-16"
+tracking_issue = 8472
+
+[[accepted]]
+id = "GHSA-9hj8-73fh-9963"
+aliases = ["CVE-2026-115907"]
+package = "zip"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
+review_by = "2026-11-16"
+tracking_issue = 8472
+
+[[accepted]]
+id = "GHSA-hjqx-j4rw-g7xv"
+aliases = ["CVE-2026-115908"]
+package = "zip"
+rationale = "floor zip >= 9.0.5; the candle bump that resolves zip 9.2.2 is tracked in 8472"
+review_by = "2026-11-16"
+tracking_issue = 8472
+
+[[accepted]]
+id = "RUSTSEC-2026-0367"
+aliases = ["GHSA-vv5m-jxxh-4627"]
+package = "zip"
+rationale = "candle 0.11.1 bump in flight"
+review_by = "2026-11-16"
+tracking_issue = 7302
+
+[[accepted]]
+id = "RUSTSEC-2026-0368"
+aliases = ["GHSA-4v9h-p7m9-rh26"]
+package = "zip"
+rationale = "candle 0.11.1 bump in flight"
+review_by = "2026-11-16"
+tracking_issue = 7302
+
+[[accepted]]
+id = "RUSTSEC-2026-0369"
+aliases = ["GHSA-4684-h2q9-2vcp"]
+package = "zip"
+rationale = "candle 0.11.1 bump in flight"
+review_by = "2026-11-16"
+tracking_issue = 7302
+
+[[accepted]]
+id = "RUSTSEC-2026-0386"
+package = "tokio"
+rationale = "lane A moves tokio to 1.53.3"
+review_by = "2026-11-16"
+tracking_issue = 8473
+
+[[accepted]]
+id = "RUSTSEC-2024-0449"
+package = "unsafe-libyaml"
+rationale = "unmaintained, no fixed version exists; reached through serde_yaml_ng, replacement tracked in 8476"
+review_by = "2027-02-01"
+tracking_issue = 8476
+
+[[accepted]]
+id = "RUSTSEC-2023-0071"
+aliases = ["CVE-2023-49092", "GHSA-4grx-2x9w-596c", "GHSA-c38w-74pg-36hr"]
+package = "rsa"
+rationale = "no fix exists; no feature set compiles sqlx-mysql or rsa: cargo tree --locked -i rsa --all-features --target all prints nothing to print; removal of the lock entry is tracked in 8477"
+review_by = "2027-02-01"
+tracking_issue = 8477
+
+[[accepted]]
+id = "RUSTSEC-2024-0436"
+package = "paste"
+rationale = "vendor/paste 1.0.15 is unmaintained, no fixed version exists; move to a maintained fork tracked in 8478"
+review_by = "2027-02-01"
+tracking_issue = 8478

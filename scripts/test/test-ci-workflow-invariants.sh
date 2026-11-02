@@ -837,7 +837,7 @@ d_scan() {
             continue
         fi
         prebuild="$(awk -v a="$opener" -v b="$w" '
-            NR > a && NR < b && /cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"/ { n = NR }
+            NR > a && NR < b && /cargo test( --locked)? --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"/ { n = NR }
             END { print n + 0 }' "$file")"
         if [ "$prebuild" -eq 0 ]; then
             bad=$((bad + 1))
@@ -868,7 +868,7 @@ fi
 # the repo (never system /tmp), trap-cleaned by the SCRATCH dir above.
 if [ "$d_total" -gt 0 ]; then
     D_MUT="$SCRATCH/ci-2657-mutant.yml"
-    grep -vE 'cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"' "$CI_YML" > "$D_MUT"
+    grep -vE 'cargo test( --locked)? --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"' "$CI_YML" > "$D_MUT"
     d_mut_result="$(d_scan "$D_MUT" 2>/dev/null)"
     d_mut_bad="${d_mut_result%%/*}"
     if [ "$d_mut_bad" -eq "$d_total" ]; then
@@ -1041,6 +1041,21 @@ if python3 -I "$ROOT/scripts/test/test_pr_retarget_check_8332.py" >"$SCRATCH/h-8
 else
     bad "H: scripts/ci/pr_retarget_check.py live-path test failed (#8332)" \
         "$(grep -E '^(FAIL|ERROR)|AssertionError' "$SCRATCH/h-8332-retarget.out" | head -12)"
+fi
+
+# ===========================================================================
+# SECTION I — #8473 round 3: the OSV dependency floor gate is its own job
+# `dependency-floors` (needs classify, if: !cancelled() && classify not
+# skipped, python 3.12 and 3.x legs), and the Security audit step of Check carries
+# !cancelled() as well, so a skipped Check leg or a red earlier step can never
+# hide either. The check lives in Python (exact `&&` terms):
+# scripts/test/check_ci_floor_gate_step_8473.py.
+# ===========================================================================
+if python3 -I "$ROOT/scripts/test/check_ci_floor_gate_step_8473.py" --ci-yml "$CI_YML" >"$SCRATCH/i-8473.out" 2>&1; then
+    ok "I: dependency-floors is its own job under !cancelled() and the audit step carries !cancelled() (#8473)"
+else
+    bad "I: the OSV floor gate job or the Security audit condition can be skipped (#8473)" \
+        "$(grep -E 'ci-floor-gate-step' "$SCRATCH/i-8473.out" | head -12)"
 fi
 
 echo ""

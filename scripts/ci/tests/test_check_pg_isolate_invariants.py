@@ -84,7 +84,7 @@ class Mutants(unittest.TestCase):
 
     def test_unselected_prebuild_is_caught(self):
         # Review r1 H1: the prebuild builds only the selected binaries.
-        self.assert_caught(CI_YML.replace('cargo test --no-run "$@" "${sel[@]}"', 'cargo test --no-run "$@"'),
+        self.assert_caught(CI_YML.replace('cargo test --locked --no-run "$@" "${sel[@]}"', 'cargo test --locked --no-run "$@"'),
                            'G5-prebuild-selection')
 
     def test_lost_watchdog_is_caught(self):

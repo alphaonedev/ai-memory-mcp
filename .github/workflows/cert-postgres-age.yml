@@ -379,11 +379,11 @@ jobs:
             --test age_deferred_projection_cluster_2375_2376_2377
             --test bootstrap_node_cert_gate_3016
           )
-          cargo test --features sal-postgres "${TESTS[@]}" \
+          cargo test --locked --features sal-postgres "${TESTS[@]}" \
             -- --include-ignored --list | tee "$LIST_OUT"
           LISTED="$(grep -c ': test$' "$LIST_OUT" || true)"
           set +e
-          cargo test --features sal-postgres "${TESTS[@]}" \
+          cargo test --locked --features sal-postgres "${TESTS[@]}" \
             -- --include-ignored --test-threads=1 2>&1 | tee "$TEST_OUT"
           rc="${PIPESTATUS[0]}"
           set -e
@@ -405,7 +405,7 @@ jobs:
           # #4333/#4434: LEG A is certified in two shapes. This build is the
           # A-pg binary (sal-postgres); the gate self-builds the driverless
           # binary for LEG A-driverless (a driverless binary must REFUSE).
-          cargo build --features sal-postgres --bin ai-memory
+          cargo build --locked --features sal-postgres --bin ai-memory
           AI_MEMORY_BIN_PG="$(pwd)/target/debug/ai-memory" \
             bash scripts/check-bootstrap-cert-gate.sh
 

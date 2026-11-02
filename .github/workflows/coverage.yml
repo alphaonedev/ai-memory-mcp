@@ -462,6 +462,8 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@6001e75680da9482e125349961b715573ec77af8 # cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Install jq + postgresql-client (bounded+retry #3090/#2960)
         timeout-minutes: 5
@@ -597,7 +599,7 @@ jobs:
         # it under the 7 GB runner ceiling.
         run: |
           mkdir -p coverage
-          cargo llvm-cov \
+          cargo llvm-cov --locked \
             --no-report \
             --features sal,sal-postgres \
             --lib --tests \
@@ -608,7 +610,7 @@ jobs:
           # provisioned, serial database, so aggregate this existing behavior
           # test explicitly: it proves trigger preservation, cache invalidation,
           # idempotence, and record-stop refusal instead of counting cold code.
-          cargo llvm-cov \
+          cargo llvm-cov --locked \
             --no-clean \
             --features sal,sal-postgres \
             --lib --workspace \
