@@ -35,6 +35,9 @@ SCRIPT_REF_RE = re.compile(r"(?<![\w./-])((?:\./)?scripts/[\w./-]+\.(?:sh|py))")
 PY_LIST_RE = re.compile(r"\[\s*[\"']cargo[\"']\s*,([^\]]*)\]")
 MIN_SITES_WORKFLOWS = 40
 MIN_SITES_SCRIPTS = 2
+# Scripts scanned even when no workflow run block names them: contributors and
+# release tooling run them and they invoke cargo.
+EXTRA_SCRIPTS = ("scripts/coverage.sh",)
 
 
 def run_blocks(text):
@@ -156,11 +159,17 @@ def scan_command(command, state, no, sites):
     args = toks[i + 1:]
     if "--" in args:
         args = args[:args.index("--")]
+    if any(a in ("--version", "-V", "--help", "-h") for a in args):
+        return  # prints a banner, resolves nothing
     locked = global_locked or "--locked" in args
     if verb == "metadata" and locked:
         state["metadata_locked"] = True
+    if verb == "llvm-cov" and locked:
+        state["llvm_cov_locked"] = True
     if verb in SATISFIED_BY_METADATA:
         ok = bool(state["metadata_locked"])
+    elif verb == "llvm-cov" and args[:1] == ["report"]:
+        ok = bool(state["llvm_cov_locked"])  # renders the profile data a locked run just wrote
     elif verb == "update":
         ok = False
     else:
@@ -177,7 +186,7 @@ def find_sites_in_blocks(blocks):
     """Return [(lineno, verb, ok, command)] for command-position cargo calls."""
     sites = []
     for block in blocks:
-        state = {"metadata_locked": False}
+        state = {"metadata_locked": False, "llvm_cov_locked": False}
         for no, line in logical_lines(block):
             if line.strip().startswith("#"):
                 continue
@@ -242,6 +251,7 @@ def scan_repo():
         seen_wf += len(sites)
         problems += describe(wf.name, sites)
         scripts.update(referenced_scripts(text))
+    scripts.update(EXTRA_SCRIPTS)
     for rel in sorted(scripts):
         sites = find_script_sites((REPO / rel).read_text(), python=rel.endswith(".py"))
         seen_sc += len(sites)
@@ -265,6 +275,11 @@ class WorkflowCargoLocked(unittest.TestCase):
         self.assertIn("scripts/check-bootstrap-cert-gate.sh", scripts)
         sites = find_script_sites((REPO / "scripts/check-bootstrap-cert-gate.sh").read_text())
         self.assertGreaterEqual(len([s for s in sites if s[1] == "build"]), 2)
+        self.assertTrue(all(s[2] for s in sites), sites)
+
+    def test_coverage_script_is_scanned_and_locked(self):
+        sites = find_script_sites((REPO / "scripts/coverage.sh").read_text())
+        self.assertGreaterEqual(len([s for s in sites if s[1] == "llvm-cov"]), 2)
         self.assertTrue(all(s[2] for s in sites), sites)
 
     def test_build_index_metadata_call_is_locked(self):
@@ -357,6 +372,16 @@ class ScannerShapes(unittest.TestCase):
                 "      - run: cargo fuzz run fuzz_validate\n")
         self.assertEqual([(v, ok) for _, v, ok, _ in find_sites(text)],
                          [("metadata", True), ("fuzz", False)])
+
+    def test_version_probes_are_not_resolutions(self):
+        self.assertEqual(shape("cargo llvm-cov --version", "cargo fuzz --help"), [])
+
+    def test_llvm_cov_report_needs_a_locked_llvm_cov_run_in_the_same_block(self):
+        self.assertEqual(shape("cargo llvm-cov report --json"), [("llvm-cov", False)])
+        self.assertEqual(shape("cargo llvm-cov --locked --no-report", "cargo llvm-cov report --json"),
+                         [("llvm-cov", True), ("llvm-cov", True)])
+        self.assertEqual(shape("cargo llvm-cov --no-report", "cargo llvm-cov report --json"),
+                         [("llvm-cov", False), ("llvm-cov", False)])
 
     def test_locked_after_double_dash_is_a_program_argument(self):
         self.assertEqual(shape("cargo run -- --locked"), [("run", False)])
