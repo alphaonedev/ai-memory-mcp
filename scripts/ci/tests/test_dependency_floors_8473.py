@@ -9,6 +9,7 @@ import http.server
 import importlib.util
 import io
 import json
+import re
 import shutil
 import threading
 import unittest
@@ -673,6 +674,55 @@ class WorkspaceMembers(GateBase):
         (self.dir / "Cargo.lock").write_text(self.LOCK2 + '\n[[package]]\nname = "ai-memory-fuzz"\nversion = "0.0.0"\n')
         rc, out, _ = self.run_gate({}, {}, "")
         self.assertIn("floor: skipped ai-memory-fuzz 0.0.0 source=path queried=no", out)
+
+
+class FuzzLockMatchesRootLock(unittest.TestCase):
+    """The fuzz workspace has its own Cargo.lock (#8473 round 3, R3-3).
+
+    Every package name the two locks share must carry, in fuzz/Cargo.lock, only
+    (version, source) pairs that the root lock also carries. The paste patch
+    (path source, no registry line) is the case that drifted: root used
+    vendor/paste, fuzz resolved registry paste 1.0.15 (RUSTSEC-2024-0436).
+    """
+
+    @staticmethod
+    def pairs(text):
+        rows, cur = [], None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line == "[[package]]":
+                cur = {}
+                rows.append(cur)
+            elif line.startswith("["):
+                cur = None
+            elif cur is not None:
+                m = re.match(r'^(\w+) = "(.*)"$', line)
+                if m:
+                    cur[m.group(1)] = m.group(2)
+        by_name = {}
+        for row in rows:
+            if "name" in row and "version" in row:
+                by_name.setdefault(row["name"], set()).add((row["version"], row.get("source")))
+        return by_name
+
+    def test_shared_packages_have_the_same_version_and_source(self):
+        root = self.pairs((REPO / "Cargo.lock").read_text())
+        fuzz = self.pairs((REPO / "fuzz" / "Cargo.lock").read_text())
+        shared = sorted(set(root) & set(fuzz))
+        self.assertGreater(len(shared), 100)
+        drift = ["%s fuzz=%s root=%s" % (n, sorted(map(str, fuzz[n] - root[n])), sorted(map(str, root[n])))
+                 for n in shared if not fuzz[n] <= root[n]]
+        self.assertEqual(drift, [])
+
+    def test_paste_comes_from_the_vendored_copy_in_both_locks(self):
+        for lock in ("Cargo.lock", "fuzz/Cargo.lock"):
+            got = self.pairs((REPO / lock).read_text())["paste"]
+            self.assertEqual(got, {("1.0.15", None)}, lock)
+
+    def test_fuzz_manifest_patches_paste_to_vendor(self):
+        text = (REPO / "fuzz" / "Cargo.toml").read_text()
+        self.assertIn("[patch.crates-io]", text)
+        self.assertIn('paste = { path = "../vendor/paste" }', text)
 
 
 if __name__ == "__main__":
