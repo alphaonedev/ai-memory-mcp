@@ -720,6 +720,42 @@ async fn completion_survives_a_reopen_while_working(router: &axum::Router, app: 
     let row = stored_task(app, ALICE, &ended).await.expect("row");
     assert_eq!(row.history, json!([]));
     assert_eq!(row.state, state::CANCELED);
+
+    // Code LOW-1 (r4): a task in a wire state this server never writes
+    // (non-terminal, outside both compare-and-set source sets) exhausts the
+    // bounded loop. The exhaustion is the fail-closed catch-all: `-32004`
+    // "modified concurrently" without "retry", and nothing is appended.
+    let stuck = format!("interleave-stuck-8444-{}", uuid::Uuid::new_v4());
+    seed_task(
+        app,
+        &SeedTask::new(ALICE, &stuck, "ctx-seed-8444", "TASK_STATE_INPUT_REQUIRED"),
+    )
+    .await;
+    let entry = A2aHistoryEntry {
+        message_id: uuid::Uuid::new_v4().to_string(),
+        role: "ROLE_USER".to_string(),
+        context_id: "ctx-seed-8444".to_string(),
+        task_id: stuck.clone(),
+        memory_id: receipt_memory_id(&first),
+    };
+    let err = ai_memory::handlers::a2a_complete_message(app, ALICE, &stuck, entry)
+        .await
+        .expect_err("an exhausted completion is refused, never a success");
+    assert_eq!(err.code, -32004, "{err:?}");
+    assert!(err.message.contains("modified concurrently"), "{err:?}");
+    assert!(!err.message.contains("retry"), "{err:?}");
+    let row = stored_task(app, ALICE, &stuck).await.expect("row");
+    assert!(
+        row.history.as_array().is_some_and(Vec::is_empty),
+        "no entry: {}",
+        row.history
+    );
+    assert!(
+        row.artifacts.as_array().is_some_and(Vec::is_empty),
+        "no receipt: {}",
+        row.artifacts
+    );
+    assert_eq!(row.state, "TASK_STATE_INPUT_REQUIRED");
 }
 
 /// Moves one memory out of the caller's read scope through the backend's own

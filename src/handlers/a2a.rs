@@ -422,11 +422,23 @@ async fn start_lost(app: &AppState, agent: &str, task_id: &str) -> A2aResult<()>
 /// COMPLETED because that would make the re-opening continuation's own start
 /// compare-and-set lose.
 ///
+/// decision: keep the bounded loop with its exhaustion branch as the
+/// fail-closed catch-all over an early refuse of INPUT_REQUIRED,
+/// AUTH_REQUIRED and UNSPECIFIED because the early refuse widens the
+/// behaviour change for states this server never writes.
+///
+/// Test-only `pub`: `#[doc(hidden)]` so the integration tests can drive the
+/// race deterministically, the same pattern as the test hook
+/// `approvals::clear_synthetic_rules_for_test`; production code calls it
+/// only from `send_message`.
+///
 /// # Errors
 ///
 /// `-32004` when the task ended in a state other than COMPLETED, or kept
-/// moving for [`a2a::A2A_COMPLETION_CAS_ATTEMPTS`] attempts; `-32603` on a
-/// storage failure or a task that vanished.
+/// moving for [`a2a::A2A_COMPLETION_CAS_ATTEMPTS`] attempts (the exhaustion
+/// message never says retry); `-32603` on a storage failure or a task that
+/// vanished. On either `-32004` the inbox memory is already stored and stays
+/// unlinked from the task (its id is logged at info).
 #[doc(hidden)]
 pub async fn a2a_complete_message(
     app: &AppState,
@@ -469,6 +481,12 @@ pub async fn a2a_complete_message(
             .await?
             .ok_or_else(A2aError::internal)?;
         if state::is_terminal(&row.state) && row.state != state::COMPLETED {
+            tracing::info!(
+                target: "a2a",
+                "a2a task {task_id} ended {}; inbox memory {} stays unlinked",
+                row.state,
+                entry.memory_id
+            );
             return Err(A2aError::task_terminal(&row.state));
         }
     }
@@ -477,12 +495,19 @@ pub async fn a2a_complete_message(
         "a2a task {task_id} kept moving; completion gave up after {} attempts",
         a2a::A2A_COMPLETION_CAS_ATTEMPTS
     );
-    Err(A2aError::task_changed_concurrently())
+    tracing::info!(
+        target: "a2a",
+        "a2a task {task_id}: inbox memory {} stays unlinked",
+        entry.memory_id
+    );
+    Err(A2aError::task_completion_exhausted())
 }
 
 /// The SendMessage reply: the current task, whose status carries the agent's
 /// replication-pending message when `pending` (the message is stored locally
-/// but missed federation quorum).
+/// but missed federation quorum). The pending message is per-reply: only this
+/// SendMessage reply carries it, it is not persisted and GetTask never shows
+/// it; [`a2a::replication_pending_total`] is the durable signal.
 async fn current_task(app: &AppState, agent: &str, id: &str, pending: bool) -> A2aResult<Value> {
     let row = store_get(app, agent, id)
         .await?

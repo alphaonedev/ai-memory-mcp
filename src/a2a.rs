@@ -263,11 +263,20 @@ impl A2aError {
         ))
     }
     /// `-32004` for a follow-up that lost the race to another change of the
-    /// same task.
+    /// same task before anything was stored (a retry can succeed).
     #[must_use]
     pub fn task_changed_concurrently() -> Self {
         Self::unsupported_operation_because(
             "task was modified concurrently and cannot accept this message; retry",
+        )
+    }
+    /// `-32004` for a completion that ran out of compare-and-set attempts.
+    /// The inbox memory is already stored (unlinked), so the message says
+    /// nothing about a retry, which would deliver it twice.
+    #[must_use]
+    pub fn task_completion_exhausted() -> Self {
+        Self::unsupported_operation_because(
+            "task was modified concurrently and cannot accept this message",
         )
     }
     /// `-32005` ContentTypeNotSupported (a file part).
@@ -706,23 +715,59 @@ const MAX_PUBLIC_URL_LEN: usize = 255;
 /// card requested through a router built without a daemon).
 const DEFAULT_CARD_BASE_URL: &str = "http://localhost";
 
-/// The valid form of a configured public base URL: `http(s)://authority`
-/// only (no path), no whitespace or control characters, no userinfo, query,
-/// fragment or backslash, trailing slashes trimmed. `None` for anything else.
-/// The daemon serves A2A at its own fixed route; a path prefix belongs to the
-/// reverse proxy in front of it, never to the advertised base.
+/// The valid form of a configured public base URL: `http://` or `https://`
+/// authority only: a non-empty host and an optional port 1-65535; no path,
+/// userinfo, query, fragment, whitespace, control characters or backslash;
+/// at most 255 bytes; trailing slashes trimmed. `None` for anything else
+/// (fail closed). The daemon serves A2A at its own fixed route; a path prefix
+/// belongs to the reverse proxy in front of it, never to the advertised base.
+///
+/// decision: a non-empty host and a 1-65535 port over the bare RFC 3986
+/// authority because RFC 9110 requires a host for http(s) and an empty host
+/// or an out-of-range port would make the card advertise an unusable base.
 #[must_use]
 pub fn valid_public_url(raw: &str) -> Option<String> {
     let t = raw.trim().trim_end_matches('/');
     let rest = t
         .strip_prefix("https://")
         .or_else(|| t.strip_prefix("http://"))?;
-    let ok = !rest.is_empty()
-        && t.len() <= MAX_PUBLIC_URL_LEN
+    let ok = t.len() <= MAX_PUBLIC_URL_LEN
         && rest.chars().all(|c| {
             !c.is_whitespace() && !c.is_control() && !matches!(c, '@' | '?' | '#' | '\\' | '/')
-        });
+        })
+        && valid_authority(rest);
     ok.then(|| t.to_string())
+}
+
+/// `host[:port]` of a public base URL: the host is non-empty (a bracketed
+/// IPv6 literal, or a name or IPv4 address without a colon or bracket); a
+/// colon after the host carries 1 to 5 digits with a value in 1..=65535.
+fn valid_authority(authority: &str) -> bool {
+    let (host_ok, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let Some((v6, after)) = inner.split_once(']') else {
+            return false;
+        };
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return false,
+        };
+        (!v6.is_empty() && !v6.contains('['), port)
+    } else {
+        if authority.contains(['[', ']']) {
+            return false;
+        }
+        match authority.split_once(':') {
+            Some((host, port)) => (!host.is_empty(), Some(port)),
+            None => (!authority.is_empty(), None),
+        }
+    };
+    host_ok
+        && port.is_none_or(|p| {
+            (1..=5).contains(&p.len())
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u16>().is_ok_and(|n| n >= 1)
+        })
 }
 
 /// The base URL the Agent Card advertises: a valid configured `public_url`
@@ -1068,6 +1113,8 @@ mod tests {
         );
         // Userinfo URL assembled at runtime so no credential-shaped literal sits in the source.
         let userinfo_url = format!("https://{}@evil.example", ["user", "pw"].join(":"));
+        // #8444 r4 sec INFO-1: a control character, built at runtime.
+        let control_url = format!("https://h{}.example", char::from(1_u8));
         for hostile in [
             "javascript:alert(1)",
             "http://",
@@ -1079,6 +1126,13 @@ mod tests {
             "ftp://x.example",
             "https://a\\b",
             "",
+            control_url.as_str(),
+            "https://:8443",
+            "https://h.example:99999",
+            "https://h.example:65536",
+            "https://h.example:",
+            "https://h.example:0",
+            "https://h.example:8a",
         ] {
             assert_eq!(
                 resolve_card_base_url(Some(hostile), true, "1.2.3.4:5"),
@@ -1087,6 +1141,18 @@ mod tests {
             );
         }
         assert!(valid_public_url(&format!("https://{}", "a".repeat(300))).is_none());
+        // #8444 r4 sec INFO-2: the accepted authority forms.
+        for good in [
+            "https://h.example:8443",
+            "http://127.0.0.1:1",
+            "https://h.example:65535",
+            "https://[::1]:9077",
+            "https://[::1]",
+        ] {
+            assert_eq!(valid_public_url(good).as_deref(), Some(good), "{good}");
+        }
+        assert!(valid_public_url("https://[::1]x").is_none());
+        assert!(valid_public_url("https://[]:80").is_none());
     }
 
     #[test]
@@ -1121,6 +1187,9 @@ mod tests {
         assert!(e.message.contains("TASK_STATE_COMPLETED"));
         let e = A2aError::task_changed_concurrently();
         assert_eq!((e.code, e.http_status), (-32004, 400));
+        let e = A2aError::task_completion_exhausted();
+        assert_eq!((e.code, e.http_status), (-32004, 400));
+        assert!(!e.message.contains("retry"), "{e:?}");
     }
 
     #[test]
