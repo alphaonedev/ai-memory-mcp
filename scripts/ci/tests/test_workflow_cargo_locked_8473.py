@@ -5,17 +5,23 @@ carries --locked, and `cargo update` never appears, so CI builds the reviewed
 Cargo.lock or fails.
 
 Shapes covered: compound lines (`;`, `&&`, `||`, `|`, `$( )`), the body of
-`bash -c` / `sh -c`, global options between `cargo` and the verb, the aliases
-b and t, tree and metadata, and the cargo-fuzz and cargo-cyclonedx
-subcommands. cargo-fuzz 0.13.2 and cargo-cyclonedx 0.5.9 have no --locked
-option, so those two are satisfied by a `cargo metadata --locked` earlier in the
-SAME run block (or the same script file); a metadata call in another run block
-does not count. Python scripts that build a `["cargo", ...]` argument list are
-checked for "--locked" in the same list.
+`bash -c` / `sh -c`, wrapper prefixes (`timeout <dur>`, `nice [-n N]`, `xargs`,
+`nohup`, `stdbuf`), a cargo path ending in `/cargo`, global options between
+`cargo` and the verb, the aliases b and t, tree, metadata, install and miri,
+`generate-lockfile` (like `update`: never allowed), and the cargo-fuzz and
+cargo-cyclonedx subcommands. cargo invoked through a variable (`"$CARGO" build`)
+cannot be verified and is flagged. cargo-fuzz 0.13.2 and cargo-cyclonedx 0.5.9
+have no --locked option, so those two are satisfied by a `cargo metadata
+--locked` earlier in the SAME run block (or the same script file) for the SAME
+manifest directory (from --manifest-path or the last `cd`); a metadata call in
+another run block, in another directory, or followed by `|| true` / `|| :`
+does not count. Python scripts that build a `["cargo", ...]` argument list
+(also across lines) are checked for "--locked" in the same list.
 
 Run: python3 -m unittest discover -s scripts/ci/tests
 Python 3.9+, standard library only (workflows are read as text).
 """
+import posixpath
 import re
 import shlex
 import unittest
@@ -24,15 +30,22 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOWS = REPO / ".github" / "workflows"
 LOCKED_VERBS = ("build", "b", "test", "t", "clippy", "check", "run", "doc", "bench",
-                "llvm-cov", "nextest", "fetch", "tree", "metadata")
+                "llvm-cov", "nextest", "fetch", "tree", "metadata", "install", "miri")
 SATISFIED_BY_METADATA = ("fuzz", "cyclonedx")
-ALL_VERBS = LOCKED_VERBS + SATISFIED_BY_METADATA + ("update",)
+NEVER_IN_CI = ("update", "generate-lockfile")
+ALL_VERBS = LOCKED_VERBS + SATISFIED_BY_METADATA + NEVER_IN_CI
 SKIP_WORDS = ("if", "then", "elif", "else", "while", "until", "do", "!", "time", "exec",
-              "command", "env", "sudo")
+              "command", "env", "sudo", "nohup")
+SWALLOWERS = (["true"], [":"])
+DURATION_RE = re.compile(r"^\d+(\.\d+)?[smhd]?$")
+TIMEOUT_VALUE_OPTS = ("-k", "-s", "--kill-after", "--signal")
+XARGS_VALUE_OPTS = ("-n", "-I", "-P", "-L", "-d", "-E", "-s", "-a")
+VARIABLE_VERB = "variable"
+VARIABLE_RE = re.compile(r"\$\{?\w+(?::[-=+][^}]*)?\}?")
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 RUN_KEY_RE = re.compile(r"^(\s*)(?:-\s+)?run:\s*(.*)$")
 SCRIPT_REF_RE = re.compile(r"(?<![\w./-])((?:\./)?scripts/[\w./-]+\.(?:sh|py))")
-PY_LIST_RE = re.compile(r"\[\s*[\"']cargo[\"']\s*,([^\]]*)\]")
+PY_LIST_RE = re.compile(r"\[\s*[\"'](?:[^\"']*/)?cargo[\"']\s*,([^\]]*)\]")
 MIN_SITES_WORKFLOWS = 40
 MIN_SITES_SCRIPTS = 2
 # Scripts scanned even when no workflow run block names them: contributors and
@@ -80,9 +93,21 @@ def logical_lines(block):
     return out
 
 
-def split_commands(line):
-    """Split a shell line at unquoted ;, &&, ||, |, ( ), backtick and $( )."""
+def split_commands_ops(line):
+    """Split a shell line at unquoted ;, &&, ||, |, ( ), backtick and $( ).
+
+    Returns [(command, op)] where op is the separator that follows the command
+    (";", "&&", "||", "|" or "" for the last one).
+    """
     parts, cur, quote, i = [], [], None, 0
+
+    def push(op):
+        text = "".join(cur).strip()
+        if text:
+            parts.append((text, op))
+        elif parts and op:
+            parts[-1] = (parts[-1][0], op)
+
     while i < len(line):
         ch = line[i]
         if quote:
@@ -93,7 +118,7 @@ def split_commands(line):
             if ch == quote:
                 quote = None
             elif ch == "$" and quote == '"' and line[i + 1:i + 2] == "(":
-                parts.append("".join(cur))
+                push(";")
                 cur, i = [], i + 2
                 continue
             cur.append(ch)
@@ -107,15 +132,20 @@ def split_commands(line):
             i += 2
             continue
         elif ch in ";|()`" or (ch == "&" and line[i + 1:i + 2] == "&"):
-            parts.append("".join(cur))
+            op = line[i:i + 2] if line[i:i + 2] in ("&&", "||") else (ch if ch in ";|" else ";")
+            push(op)
             cur = []
-            if line[i:i + 2] in ("&&", "||"):
+            if len(op) == 2:
                 i += 1
         else:
             cur.append(ch)
         i += 1
-    parts.append("".join(cur))
-    return [p.strip() for p in parts if p.strip()]
+    push("")
+    return parts
+
+
+def split_commands(line):
+    return [text for text, _ in split_commands_ops(line)]
 
 
 def words(command):
@@ -129,23 +159,79 @@ def words(command):
         return command.split()
 
 
-def scan_command(command, state, no, sites):
+def strip_wrappers(toks):
+    """Drop shell keywords, assignments and wrapper prefixes in front of the real command."""
+    while toks:
+        head = toks[0]
+        if head in SKIP_WORDS or ASSIGN_RE.match(head):
+            toks = toks[1:]
+        elif head == "nice":
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):
+                toks = toks[2:] if toks[0] in ("-n", "--adjustment") else toks[1:]
+        elif head == "timeout":
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):
+                toks = toks[2:] if toks[0] in TIMEOUT_VALUE_OPTS else toks[1:]
+            if toks and DURATION_RE.match(toks[0]):
+                toks = toks[1:]
+        elif head == "xargs":
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):
+                toks = toks[2:] if toks[0] in XARGS_VALUE_OPTS else toks[1:]
+        elif head == "stdbuf":
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):
+                toks = toks[2:] if toks[0] in ("-i", "-o", "-e") else toks[1:]
+        else:
+            break
+    return toks
+
+
+def join_dir(cwd, arg):
+    """Directory after `cd arg`; "?" when it cannot be known statically."""
+    if cwd == "?" or not arg or arg == "-" or arg[0] in "$~" or "$" in arg:
+        return "?"
+    return posixpath.normpath(arg if arg.startswith("/") else posixpath.join(cwd, arg))
+
+
+def manifest_dir(args, cwd):
+    """Directory of the manifest a cargo call resolves: --manifest-path or the cwd."""
+    for i, a in enumerate(args):
+        value = None
+        if a == "--manifest-path" and i + 1 < len(args):
+            value = args[i + 1]
+        elif a.startswith("--manifest-path="):
+            value = a.split("=", 1)[1]
+        if value is not None:
+            return join_dir(cwd, posixpath.dirname(value) or ".")
+    return cwd
+
+
+def is_cargo(word):
+    """cargo, or a path to it (`/usr/local/cargo/bin/cargo`, `./cargo`); a bare `/cargo` is
+    a regex or path fragment, not a command."""
+    return word == "cargo" or (word.endswith("/cargo") and word != "/cargo")
+
+
+def scan_command(command, state, no, sites, swallowed=False):
     """Record the cargo calls in one command; recurse into bash -c / sh -c bodies."""
-    toks = words(command)
-    while toks and (toks[0] in SKIP_WORDS or ASSIGN_RE.match(toks[0])):
-        toks = toks[1:]
-    if toks and toks[0] == "nice":
-        toks = toks[1:]
-        while toks and toks[0].startswith("-"):
-            toks = toks[2:] if toks[0] == "-n" else toks[1:]
+    toks = strip_wrappers(words(command))
     if not toks or toks[0] in ("echo", "printf"):
+        return
+    if toks[0] in ("cd", "pushd"):
+        state["cwd"] = join_dir(state["cwd"], toks[1] if len(toks) > 1 else "")
+        return
+    if toks[0] == "popd":
+        state["cwd"] = "?"
         return
     if toks[0] in ("bash", "sh") and "-c" in toks:
         idx = toks.index("-c")
         if idx + 1 < len(toks):
             scan_line(toks[idx + 1], state, no, sites)
         return
-    if toks[0] != "cargo":
+    through_variable = bool(VARIABLE_RE.fullmatch(toks[0])) and "cargo" in toks[0].lower()
+    if not is_cargo(toks[0]) and not through_variable:
         return
     i, global_locked = 1, False
     if i < len(toks) and toks[i].startswith("+"):
@@ -155,22 +241,27 @@ def scan_command(command, state, no, sites):
         i += 1
     if i >= len(toks) or toks[i] not in ALL_VERBS:
         return
+    if through_variable:
+        sites.append((no, VARIABLE_VERB, False, command[:100]))
+        return
     verb = toks[i]
     args = toks[i + 1:]
     if "--" in args:
         args = args[:args.index("--")]
-    if any(a in ("--version", "-V", "--help", "-h") for a in args):
+    banner = ("--help", "-h") if verb == "install" else ("--version", "-V", "--help", "-h")
+    if any(a in banner for a in args):
         return  # prints a banner, resolves nothing
     locked = global_locked or "--locked" in args
-    if verb == "metadata" and locked:
-        state["metadata_locked"] = True
+    here = manifest_dir(args, state["cwd"])
+    if verb == "metadata" and locked and not swallowed and here != "?":
+        state["meta_dirs"].add(here)
     if verb == "llvm-cov" and locked:
         state["llvm_cov_locked"] = True
     if verb in SATISFIED_BY_METADATA:
-        ok = bool(state["metadata_locked"])
+        ok = here in state["meta_dirs"]
     elif verb == "llvm-cov" and args[:1] == ["report"]:
         ok = bool(state["llvm_cov_locked"])  # renders the profile data a locked run just wrote
-    elif verb == "update":
+    elif verb in NEVER_IN_CI:
         ok = False
     else:
         ok = locked
@@ -178,15 +269,22 @@ def scan_command(command, state, no, sites):
 
 
 def scan_line(line, state, no, sites):
-    for command in split_commands(line):
-        scan_command(command, state, no, sites)
+    pieces = split_commands_ops(line)
+    for idx, (command, op) in enumerate(pieces):
+        swallowed = (op == "||" and idx + 1 < len(pieces)
+                     and words(pieces[idx + 1][0]) in SWALLOWERS)
+        scan_command(command, state, no, sites, swallowed)
+
+
+def new_state():
+    return {"meta_dirs": set(), "llvm_cov_locked": False, "cwd": "."}
 
 
 def find_sites_in_blocks(blocks):
     """Return [(lineno, verb, ok, command)] for command-position cargo calls."""
     sites = []
     for block in blocks:
-        state = {"metadata_locked": False, "llvm_cov_locked": False}
+        state = new_state()
         for no, line in logical_lines(block):
             if line.strip().startswith("#"):
                 continue
@@ -204,14 +302,13 @@ def find_script_sites(script_text, python=False):
     sites = []
     if not python:
         sites = find_sites_in_blocks([[(n + 1, ln) for n, ln in enumerate(script_text.splitlines())]])
-    for n, ln in enumerate(script_text.splitlines(), 1):
-        m = PY_LIST_RE.search(ln)
-        if not m:
-            continue
+    for m in PY_LIST_RE.finditer(script_text):
+        n = script_text.count("\n", 0, m.start()) + 1
         items = re.findall(r"[\"']([^\"']*)[\"']", m.group(1))
         verb = next((x for x in items if not x.startswith("-") and not x.startswith("+")), None)
-        if verb in LOCKED_VERBS or verb == "update":
-            sites.append((n, verb, verb != "update" and "--locked" in items, ln.strip()[:100]))
+        if verb in LOCKED_VERBS or verb in NEVER_IN_CI:
+            sites.append((n, verb, verb not in NEVER_IN_CI and "--locked" in items,
+                          " ".join(m.group(0).split())[:100]))
     return sites
 
 
@@ -232,11 +329,13 @@ def describe(name, sites):
     for no, verb, ok, line in sites:
         if ok:
             continue
-        if verb == "update":
-            bad.append("%s:%d cargo update must not run in CI: %s" % (name, no, line))
+        if verb in NEVER_IN_CI:
+            bad.append("%s:%d cargo %s must not run in CI: %s" % (name, no, verb, line))
+        elif verb == VARIABLE_VERB:
+            bad.append("%s:%d cargo invoked through a variable cannot be verified: %s" % (name, no, line))
         elif verb in SATISFIED_BY_METADATA:
-            bad.append("%s:%d cargo %s has no cargo metadata --locked before it in the same block: %s"
-                       % (name, no, verb, line))
+            bad.append("%s:%d cargo %s has no cargo metadata --locked for its directory before it in "
+                       "the same block: %s" % (name, no, verb, line))
         else:
             bad.append("%s:%d cargo %s without --locked: %s" % (name, no, verb, line))
     return bad
@@ -355,8 +454,8 @@ class ScannerShapes(unittest.TestCase):
     def test_fuzz_and_cyclonedx_need_a_locked_metadata_call_in_the_same_block(self):
         self.assertEqual(shape("cd fuzz", "cargo fuzz run fuzz_validate -- -max_len=512"),
                          [("fuzz", False)])
-        self.assertEqual(shape("cargo metadata --locked --format-version 1 >/dev/null",
-                               "cd fuzz", "cargo fuzz run fuzz_validate -- -max_len=512"),
+        self.assertEqual(shape("cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml "
+                               ">/dev/null", "cd fuzz", "cargo fuzz run fuzz_validate -- -max_len=512"),
                          [("metadata", True), ("fuzz", True)])
         self.assertEqual(shape("cargo cyclonedx --format json"), [("cyclonedx", False)])
         self.assertEqual(shape("cargo metadata --locked --format-version 1 >/dev/null",
@@ -401,6 +500,87 @@ class ScannerShapes(unittest.TestCase):
                 "      - run: bash scripts/check-bootstrap-cert-gate.sh\n"
                 "      - name: scripts/check-no-such-file.sh\n")
         self.assertEqual(referenced_scripts(text), ["scripts/check-bootstrap-cert-gate.sh"])
+
+
+class ScannerShapesRound3(unittest.TestCase):
+    """One fixture per shape the round-2 reviews showed the lint missing (#8473 round 3)."""
+
+    def test_timeout_wrapper(self):
+        self.assertEqual(shape("timeout 600 cargo build"), [("build", False)])
+        self.assertEqual(shape("timeout -k 5 600 cargo test --locked"), [("test", True)])
+        self.assertEqual(shape("timeout --signal KILL 30s cargo check"), [("check", False)])
+
+    def test_xargs_wrapper(self):
+        self.assertEqual(shape("echo a | xargs cargo build"), [("build", False)])
+        self.assertEqual(shape("echo a | xargs -n 1 -P 4 cargo test --locked"), [("test", True)])
+
+    def test_nohup_and_stdbuf_wrappers(self):
+        self.assertEqual(shape("nohup cargo build"), [("build", False)])
+        self.assertEqual(shape("stdbuf -oL cargo test"), [("test", False)])
+        self.assertEqual(shape("stdbuf -o L cargo test --locked"), [("test", True)])
+        self.assertEqual(shape("nohup nice -n 5 timeout 9 cargo run"), [("run", False)])
+
+    def test_cargo_path_is_cargo(self):
+        self.assertEqual(shape("/usr/local/cargo/bin/cargo build"), [("build", False)])
+        self.assertEqual(shape("~/.cargo/bin/cargo test --locked"), [("test", True)])
+        self.assertEqual(shape("grep -c '/cargo test' file"), [])
+
+    def test_cargo_through_a_variable_is_unverifiable(self):
+        self.assertEqual(shape('"$CARGO" build'), [(VARIABLE_VERB, False)])
+        self.assertEqual(shape("${CARGO_BIN} test --locked"), [(VARIABLE_VERB, False)])
+        self.assertEqual(shape("$CARGO_HOME/bin/tool run"), [])
+        bad = describe("x.yml", find_sites(wf('"$CARGO" build')))
+        self.assertEqual(len(bad), 1)
+        self.assertIn("through a variable", bad[0])
+
+    def test_install_needs_locked(self):
+        self.assertEqual(shape("cargo install cargo-fuzz --version 0.13.2"), [("install", False)])
+        self.assertEqual(shape("cargo install cargo-fuzz --version 0.13.2 --locked"), [("install", True)])
+        self.assertEqual(shape("cargo install --help"), [])
+
+    def test_miri_needs_locked(self):
+        self.assertEqual(shape("cargo miri test"), [("miri", False)])
+        self.assertEqual(shape("cargo miri test --locked"), [("miri", True)])
+
+    def test_generate_lockfile_is_never_allowed(self):
+        self.assertEqual(shape("cargo generate-lockfile"), [("generate-lockfile", False)])
+        self.assertEqual(shape("cargo generate-lockfile --locked"), [("generate-lockfile", False)])
+        bad = describe("x.yml", find_sites(wf("cargo generate-lockfile")))
+        self.assertIn("must not run in CI", bad[0])
+
+    def test_multiline_python_list_is_joined(self):
+        py = 'cmd = [\n    "cargo",\n    "metadata",\n    "--format-version", "1",\n]\n'
+        self.assertEqual([(x[1], x[2]) for x in find_script_sites(py, python=True)], [("metadata", False)])
+        py = 'cmd = [\n    "cargo",\n    "metadata",\n    "--locked",\n    "--format-version", "1",\n]\n'
+        self.assertEqual([(x[1], x[2]) for x in find_script_sites(py, python=True)], [("metadata", True)])
+        py = 'cmd = ["/usr/bin/cargo", "install", "x"]\n'
+        self.assertEqual([(x[1], x[2]) for x in find_script_sites(py, python=True)], [("install", False)])
+
+    def test_swallowed_locked_metadata_does_not_satisfy_a_later_call(self):
+        for tail in ("|| true", "|| :"):
+            self.assertEqual(shape("cargo metadata --locked --format-version 1 >/dev/null %s" % tail,
+                                   "cargo cyclonedx --format json"),
+                             [("metadata", True), ("cyclonedx", False)], tail)
+        self.assertEqual(shape("cargo metadata --locked --format-version 1 >/dev/null || exit 1",
+                               "cargo cyclonedx --format json"),
+                         [("metadata", True), ("cyclonedx", True)])
+
+    def test_metadata_must_cover_the_directory_of_the_later_call(self):
+        # root metadata, then cd fuzz, then a fuzz run: the fuzz manifest was never checked
+        self.assertEqual(shape("cargo metadata --locked --format-version 1 >/dev/null", "cd fuzz",
+                               "cargo fuzz run fuzz_validate"),
+                         [("metadata", True), ("fuzz", False)])
+        # a fuzz-manifest metadata call does not cover a root cyclonedx run
+        self.assertEqual(shape("cargo metadata --locked --manifest-path fuzz/Cargo.toml >/dev/null",
+                               "cargo cyclonedx --format json"),
+                         [("metadata", True), ("cyclonedx", False)])
+        # cd into the directory first, plain metadata there
+        self.assertEqual(shape("cd fuzz", "cargo metadata --locked --format-version 1 >/dev/null",
+                               "cargo fuzz run fuzz_validate"),
+                         [("metadata", True), ("fuzz", True)])
+        # a directory held in a variable is unknown and never matches
+        self.assertEqual(shape('cd "$DIR"', "cargo metadata --locked >/dev/null", "cargo fuzz run x"),
+                         [("metadata", True), ("fuzz", False)])
 
 
 if __name__ == "__main__":
