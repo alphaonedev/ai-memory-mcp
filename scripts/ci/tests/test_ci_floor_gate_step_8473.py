@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for scripts/test/check_ci_floor_gate_step_8473.py (#8473 round 2).
+"""Tests for scripts/test/check_ci_floor_gate_step_8473.py (#8473 round 3).
 
 Run: python3 -m unittest discover -s scripts/ci/tests
 Python 3.9+, standard library only.
@@ -14,49 +14,116 @@ spec = importlib.util.spec_from_file_location(
 floor_step = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(floor_step)
 
-GOOD_IF = "${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}"
+GOOD_JOB_IF = "${{ !cancelled() && needs.classify.result != 'skipped' }}"
+GOOD_AUDIT_IF = "${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}"
 
 
-def workflow(gate_if, order=("gate", "audit")):
-    gate = ["      - name: Dependency floor gate (OSV)"]
-    if gate_if is not None:
-        gate.append("        if: " + gate_if)
-    gate.append("        run: python3 -I scripts/check-dependency-floors.py")
-    audit = ["      - name: Security audit",
-             "        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once",
-             "        run: cargo audit"]
-    parts = {"gate": gate, "audit": audit}
-    lines = ["jobs:", "  check:", "    steps:"]
-    for key in order:
-        lines.extend(parts[key])
+def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_on="ubuntu-latest",
+             timeout="15", py="'3.9'", suite=True, gate_in_check=False, gate=True):
+    lines = ["name: ci", "jobs:", "  dependency-floors:"]
+    if needs is not None:
+        lines.append("    needs: " + needs)
+    if job_if is not None:
+        lines.append("    if: " + job_if)
+    lines.append("    runs-on: " + runs_on)
+    if timeout is not None:
+        lines.append("    timeout-minutes: " + timeout)
+    lines.append("    steps:")
+    if gate:
+        lines += ["      - name: Dependency floor gate (OSV)",
+                  "        run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock"]
+    if py is not None:
+        lines += ["      - uses: actions/setup-python@abc # v5", "        with:",
+                  "          python-version: " + py]
+    if suite:
+        lines += ["      - name: Python 3.9 suite", "        run: |",
+                  "          python3 -I -m unittest discover -s scripts/ci/tests -p 'test_*.py'"]
+    lines += ["  check:", "    needs: classify", "    steps:"]
+    if gate_in_check:
+        lines += ["      - name: Dependency floor gate (OSV)", "        run: echo gate"]
+    lines += ["      - name: Security audit"]
+    if audit_if is not None:
+        lines.append("        if: " + audit_if)
+    lines += ["        run: cargo audit", "  other:", "    steps:", "      - run: echo"]
     return "\n".join(lines) + "\n"
 
 
-class FloorGateStep(unittest.TestCase):
+class FloorGateJob(unittest.TestCase):
     def problems(self, text):
         return floor_step.check(text)[1]
 
-    def test_good_step_passes(self):
-        self.assertEqual(self.problems(workflow(GOOD_IF)), [])
+    def flagged(self, text, needle):
+        got = self.problems(text)
+        self.assertTrue(any(needle in p for p in got), got)
 
-    def test_missing_cancelled_is_flagged(self):
-        got = self.problems(workflow("needs.classify.outputs.cargo_skip != 'true' && matrix.once"))
-        self.assertTrue(any("!cancelled()" in p for p in got), got)
+    def test_good_job_passes(self):
+        self.assertEqual(self.problems(workflow()), [])
 
-    def test_missing_if_is_flagged(self):
-        self.assertTrue(self.problems(workflow(None)))
-
-    def test_lost_cargo_skip_or_once_is_flagged(self):
-        self.assertTrue(self.problems(workflow("${{ !cancelled() && matrix.once }}")))
-        self.assertTrue(self.problems(
-            workflow("${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' }}")))
-
-    def test_gate_after_audit_is_flagged(self):
-        got = self.problems(workflow(GOOD_IF, order=("audit", "gate")))
-        self.assertTrue(any("after the Security audit" in p for p in got), got)
-
-    def test_missing_gate_is_rc_2(self):
+    def test_missing_job_is_rc_2(self):
         self.assertIsNone(floor_step.check("jobs:\n  a:\n    steps:\n      - name: other\n")[0])
+        self.assertEqual(floor_step.main(["--ci-yml", str(REPO / "README.md")]), 2)
+
+    def test_job_without_cancelled_is_flagged(self):
+        self.flagged(workflow(job_if="${{ needs.classify.result != 'skipped' }}"), "!cancelled()")
+
+    def test_job_without_classify_term_is_flagged(self):
+        self.flagged(workflow(job_if="${{ !cancelled() }}"), "needs.classify.result != 'skipped'")
+
+    def test_job_without_if_is_flagged(self):
+        self.flagged(workflow(job_if=None), "no if: condition")
+
+    def test_disjunction_is_flagged(self):
+        self.flagged(workflow(job_if="${{ !cancelled() && needs.classify.result != 'skipped' || true }}"),
+                     "||")
+
+    def test_job_needs_runner_timeout_are_pinned(self):
+        self.flagged(workflow(needs="select"), "needs: classify")
+        self.flagged(workflow(runs_on="self-hosted"), "ubuntu-latest")
+        self.flagged(workflow(timeout="60"), "timeout-minutes: 15")
+        self.flagged(workflow(timeout=None), "timeout-minutes: 15")
+
+    def test_python39_leg_is_required(self):
+        self.flagged(workflow(py=None), "python-version 3.9")
+        self.flagged(workflow(py="'3.12'"), "python-version 3.9")
+        self.flagged(workflow(suite=False), "scripts/ci/tests suite")
+
+    def test_suite_before_setup_python_is_flagged(self):
+        text = workflow()
+        setup = ("      - uses: actions/setup-python@abc # v5\n        with:\n"
+                 "          python-version: '3.9'\n")
+        suite = text[text.index("      - name: Python 3.9 suite"):text.index("  check:")]
+        swapped = text.replace(setup + suite, suite + setup)
+        self.assertNotEqual(swapped, text)
+        self.flagged(swapped, "before the 3.9")
+
+    def test_gate_left_in_check_is_flagged(self):
+        self.flagged(workflow(gate_in_check=True), "still carries")
+
+    def test_gate_script_missing_is_flagged(self):
+        self.flagged(workflow(gate=False), "check-dependency-floors.py")
+
+    def test_audit_without_cancelled_is_flagged(self):
+        self.flagged(workflow(audit_if="needs.classify.outputs.cargo_skip != 'true' && matrix.once"),
+                     "!cancelled()")
+
+    def test_audit_without_if_is_flagged(self):
+        self.flagged(workflow(audit_if=None), "no if: condition")
+
+    def test_negated_matrix_once_is_not_matrix_once(self):
+        got = self.problems(workflow(
+            audit_if="${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && !matrix.once }}"))
+        self.assertTrue(any("matrix.once" in p for p in got), got)
+
+    def test_terms_are_whole_tokens(self):
+        self.assertEqual(floor_step.terms("${{ a && !b }}"), (["a", "!b"], False))
+        self.assertEqual(floor_step.terms("a || b && c"), (["a || b", "c"], True))
+        # a substring of a longer term never satisfies the requirement
+        got = self.problems(workflow(
+            audit_if="${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once_not }}"))
+        self.assertTrue(any("matrix.once" in p for p in got), got)
+
+    def test_cargo_skip_condition_is_required_on_audit(self):
+        self.flagged(workflow(audit_if="${{ !cancelled() && matrix.once }}"), "cargo_skip")
 
     def test_the_real_ci_yml_passes(self):
         text = (REPO / ".github" / "workflows" / "ci.yml").read_text()

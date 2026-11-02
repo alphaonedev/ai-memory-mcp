@@ -1044,15 +1044,17 @@ else
 fi
 
 # ===========================================================================
-# SECTION I — #8473 round 2: the OSV Dependency floor gate step runs under
-# !cancelled() and before the Security audit step, so a red cargo audit or a red
-# earlier step can never skip it. The check lives in Python:
+# SECTION I — #8473 round 3: the OSV dependency floor gate is its own job
+# `dependency-floors` (needs classify, if: !cancelled() && classify not
+# skipped, python 3.9 leg), and the Security audit step of Check carries
+# !cancelled() as well, so a skipped Check leg or a red earlier step can never
+# hide either. The check lives in Python (exact `&&` terms):
 # scripts/test/check_ci_floor_gate_step_8473.py.
 # ===========================================================================
 if python3 -I "$ROOT/scripts/test/check_ci_floor_gate_step_8473.py" --ci-yml "$CI_YML" >"$SCRATCH/i-8473.out" 2>&1; then
-    ok "I: the OSV floor gate step carries !cancelled() and precedes Security audit (#8473)"
+    ok "I: dependency-floors is its own job under !cancelled() and the audit step carries !cancelled() (#8473)"
 else
-    bad "I: the OSV floor gate step can be skipped by a red earlier step (#8473)" \
+    bad "I: the OSV floor gate job or the Security audit condition can be skipped (#8473)" \
         "$(grep -E 'ci-floor-gate-step' "$SCRATCH/i-8473.out" | head -12)"
 fi
 

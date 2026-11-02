@@ -1014,6 +1014,37 @@ jobs:
         with:
           args: -shellcheck= -color
 
+  # #8473 item 5, round 3: OSV-backed dependency floor gate in its OWN job.
+  # Catches GHSA-only records cargo audit lacks; every finding needs a dated
+  # acceptance in scripts/ci/dependency-floors-accepted.toml. It lived as a step
+  # in `check`, where a skipped matrix leg or a skipped `check` job (the
+  # `needs.classify` chain) hid it: a step-level `!cancelled()` cannot rescue a
+  # job-level skip. Python only, no Rust toolchain, hosted runner. It runs on
+  # every change that classify did not skip, including docs-only ones, because
+  # a new advisory can land at any time. The second part runs the Python test
+  # suites of scripts/ci/tests on the oldest supported interpreter (3.9).
+  dependency-floors:
+    name: Dependency floors (OSV)
+    needs: classify
+    if: ${{ !cancelled() && needs.classify.result != 'skipped' }}
+    # RUNNER PLACEMENT - GitHub-hosted: python only, one HTTPS call to api.osv.dev.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Dependency floor gate (OSV)
+        run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock --accepted scripts/ci/dependency-floors-accepted.toml
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.9'
+      - name: Python 3.9 suite (scripts/ci/tests)
+        run: |
+          python3 --version
+          python3 -I -m pip install pyyaml
+          python3 -I -m unittest discover -s scripts/ci/tests -p 'test_*.py'
+
   # MSRV gate — ai-memory standardizes on Rust 1.98, declared in
   # Cargo.toml `rust-version`. CI's other jobs build on `@stable` (which
   # floats forward), so without this pin the declared floor is never
@@ -2462,20 +2493,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      # #8473 item 5: OSV-backed dependency floor gate. Catches GHSA-only
-      # records cargo audit lacks; every finding needs a dated acceptance in
-      # scripts/ci/dependency-floors-accepted.toml. It needs no build, so it
-      # runs BEFORE the Security audit step and under !cancelled(): a red audit
-      # or an earlier red step must not hide the gate (#8473 round 2). The audit
-      # step does not save its JSON, so no --audit-json is passed.
-      - name: Dependency floor gate (OSV)
-        if: ${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}
-        run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock --accepted scripts/ci/dependency-floors-accepted.toml
-
       # cargo-audit runs once (the advisory DB is platform-independent) — on
       # the `once` leg so it does not multiply across the 2x2.
+      # #8473 round 3: `!cancelled()` so a red earlier step cannot skip the
+      # audit either; the OSV floor gate is its own job (`dependency-floors`).
       - name: Security audit
-        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
+        if: ${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}
         env:
           # #3138: named pin for the cargo-audit version this job installs.
           CARGO_AUDIT_VERSION: "0.22.2"
@@ -3033,6 +3056,7 @@ jobs:
       - select
       - classify
       - build-script-vetting
+      - dependency-floors
       - check
       - mobile-cross-compile
     # RUNNER PLACEMENT - GitHub-hosted: it only reads the needs context.
