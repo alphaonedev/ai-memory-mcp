@@ -6,11 +6,12 @@ skipped matrix leg hid it, and a step-level `!cancelled()` cannot rescue a
 job-level skip. Round 3 moves it into its own job and this check asserts:
 
 1. job `dependency-floors` exists once, `needs: classify`, runs on
-   ubuntu-24.04 (ubuntu-latest has no python 3.9), has `timeout-minutes: 15`, and its job-level `if:` is a
+   ubuntu-latest, has `timeout-minutes: 15`, and its job-level `if:` is a
    conjunction whose terms include, exactly, `!cancelled()` and
    `needs.classify.result != 'skipped'` (no `||`);
-2. the job runs the gate script, then a setup-python step pinned to 3.9, then
-   the scripts/ci/tests suite;
+2. the job runs the gate script, then the scripts/ci/tests suite after a
+   setup-python step pinned to 3.12 and again after one pinned to 3.x (current
+   stable); python 3.9 is end of life and is never a leg (memory 59123ea0);
 3. no other job carries a step named "Dependency floor gate (OSV)";
 4. the Security audit step in `check` (exactly one) has an `if:` conjunction
    with the exact terms `!cancelled()`, `needs.classify.outputs.cargo_skip !=
@@ -30,7 +31,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 JOB_ID = "dependency-floors"
-RUNNER = "ubuntu-24.04"
+RUNNER = "ubuntu-latest"
+PY_LEGS = ("3.12", "3.x")
 GATE_NAME = "Dependency floor gate (OSV)"
 AUDIT_NAME = "Security audit"
 AUDIT_JOB = "check"
@@ -128,7 +130,7 @@ def check(text):
     if job_field(lines, "needs") != "classify":
         problems.append("job %s must have needs: classify, found %r" % (JOB_ID, job_field(lines, "needs")))
     if job_field(lines, "runs-on") != RUNNER:
-        problems.append("job %s must run on ubuntu-24.04, found %r" % (JOB_ID, job_field(lines, "runs-on")))
+        problems.append("job %s must run on ubuntu-latest, found %r" % (JOB_ID, job_field(lines, "runs-on")))
     if job_field(lines, "timeout-minutes") != "15":
         problems.append("job %s must set timeout-minutes: 15, found %r"
                         % (JOB_ID, job_field(lines, "timeout-minutes")))
@@ -136,14 +138,21 @@ def check(text):
     gate_pos = body.find("scripts/check-dependency-floors.py")
     if gate_pos < 0:
         problems.append("job %s does not run scripts/check-dependency-floors.py" % JOB_ID)
-    py = re.search(r"python-version:\s*['\"]?3\.9['\"]?\s*$", body, re.M)
-    if not py:
-        problems.append("job %s has no setup-python step pinned to python-version 3.9" % JOB_ID)
-    suite = body.find("unittest discover -s scripts/ci/tests")
-    if suite < 0:
+    setups = [(m.start(), m.group(1)) for m in
+              re.finditer(r"python-version:\s*['\"]?([0-9][0-9.x]*)['\"]?\s*$", body, re.M)]
+    if any(v.startswith("3.9") for _, v in setups):
+        problems.append("job %s has a python 3.9 leg; 3.9 is end of life" % JOB_ID)
+    suite_word = "unittest discover -s scripts/ci/tests"
+    if body.find(suite_word) < 0:
         problems.append("job %s does not run the scripts/ci/tests suite" % JOB_ID)
-    elif py and suite < py.start():
-        problems.append("job %s runs the suite before the 3.9 setup-python step" % JOB_ID)
+    for want in PY_LEGS:
+        starts = [pos for pos, v in setups if v == want]
+        if not starts:
+            problems.append("job %s has no setup-python step pinned to python-version %s" % (JOB_ID, want))
+            continue
+        end = min([pos for pos, _ in setups if pos > starts[0]] + [len(body)])
+        if body.find(suite_word, starts[0], end) < 0:
+            problems.append("job %s does not run the suite after the %s setup-python step" % (JOB_ID, want))
     for other, other_lines in jobs.items():
         if other != JOB_ID and any(name == GATE_NAME for name, _, _ in steps(other_lines)):
             problems.append("job %s still carries a '%s' step" % (other, GATE_NAME))
@@ -168,7 +177,7 @@ def main(argv=None):
         print("ci-floor-gate-step: FAIL %s" % msg, file=sys.stderr)
     if problems:
         return 1
-    print("ci-floor-gate-step: ok (own job, !cancelled() and classify not skipped, py3.9 leg, "
+    print("ci-floor-gate-step: ok (own job, !cancelled() and classify not skipped, py3.12 and 3.x legs, "
           "audit step !cancelled())")
     return 0
 

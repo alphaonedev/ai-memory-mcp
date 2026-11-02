@@ -18,8 +18,8 @@ GOOD_JOB_IF = "${{ !cancelled() && needs.classify.result != 'skipped' }}"
 GOOD_AUDIT_IF = "${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}"
 
 
-def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_on="ubuntu-24.04",
-             timeout="15", py="'3.9'", suite=True, gate_in_check=False, gate=True):
+def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_on="ubuntu-latest",
+             timeout="15", py=("'3.12'", "'3.x'"), suite=True, gate_in_check=False, gate=True):
     lines = ["name: ci", "jobs:", "  dependency-floors:"]
     if needs is not None:
         lines.append("    needs: " + needs)
@@ -32,11 +32,14 @@ def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_
     if gate:
         lines += ["      - name: Dependency floor gate (OSV)",
                   "        run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock"]
-    if py is not None:
+    for ver in py or ():
         lines += ["      - uses: actions/setup-python@abc # v5", "        with:",
-                  "          python-version: " + py]
-    if suite:
-        lines += ["      - name: Python 3.9 suite", "        run: |",
+                  "          python-version: " + ver]
+        if suite:
+            lines += ["      - name: Suite " + ver, "        run: |",
+                      "          python3 -I -m unittest discover -s scripts/ci/tests -p 'test_*.py'"]
+    if suite and not py:
+        lines += ["      - name: Suite", "        run: |",
                   "          python3 -I -m unittest discover -s scripts/ci/tests -p 'test_*.py'"]
     lines += ["  check:", "    needs: classify", "    steps:"]
     if gate_in_check:
@@ -78,24 +81,28 @@ class FloorGateJob(unittest.TestCase):
 
     def test_job_needs_runner_timeout_are_pinned(self):
         self.flagged(workflow(needs="select"), "needs: classify")
-        self.flagged(workflow(runs_on="self-hosted"), "ubuntu-24.04")
-        self.flagged(workflow(runs_on="ubuntu-latest"), "ubuntu-24.04")
+        self.flagged(workflow(runs_on="self-hosted"), "ubuntu-latest")
+        self.flagged(workflow(runs_on="ubuntu-24.04"), "ubuntu-latest")
         self.flagged(workflow(timeout="60"), "timeout-minutes: 15")
         self.flagged(workflow(timeout=None), "timeout-minutes: 15")
 
-    def test_python39_leg_is_required(self):
-        self.flagged(workflow(py=None), "python-version 3.9")
-        self.flagged(workflow(py="'3.12'"), "python-version 3.9")
+    def test_python_312_and_current_stable_legs_are_required(self):
+        self.flagged(workflow(py=None), "python-version 3.12")
+        self.flagged(workflow(py=("'3.12'",)), "python-version 3.x")
+        self.flagged(workflow(py=("'3.x'",)), "python-version 3.12")
         self.flagged(workflow(suite=False), "scripts/ci/tests suite")
+
+    def test_python_39_leg_is_flagged(self):
+        self.flagged(workflow(py=("'3.12'", "'3.x'", "'3.9'")), "end of life")
 
     def test_suite_before_setup_python_is_flagged(self):
         text = workflow()
         setup = ("      - uses: actions/setup-python@abc # v5\n        with:\n"
-                 "          python-version: '3.9'\n")
-        suite = text[text.index("      - name: Python 3.9 suite"):text.index("  check:")]
+                 "          python-version: '3.12'\n")
+        suite = text[text.index("      - name: Suite '3.12'"):text.index("      - uses: actions/setup-python@abc # v5\n        with:\n          python-version: '3.x'")]
         swapped = text.replace(setup + suite, suite + setup)
         self.assertNotEqual(swapped, text)
-        self.flagged(swapped, "before the 3.9")
+        self.flagged(swapped, "after the 3.12 setup-python")
 
     def test_gate_left_in_check_is_flagged(self):
         self.flagged(workflow(gate_in_check=True), "still carries")

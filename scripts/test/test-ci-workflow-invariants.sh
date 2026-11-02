@@ -1046,7 +1046,7 @@ fi
 # ===========================================================================
 # SECTION I — #8473 round 3: the OSV dependency floor gate is its own job
 # `dependency-floors` (needs classify, if: !cancelled() && classify not
-# skipped, python 3.9 leg), and the Security audit step of Check carries
+# skipped, python 3.12 and 3.x legs), and the Security audit step of Check carries
 # !cancelled() as well, so a skipped Check leg or a red earlier step can never
 # hide either. The check lives in Python (exact `&&` terms):
 # scripts/test/check_ci_floor_gate_step_8473.py.
