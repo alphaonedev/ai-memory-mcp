@@ -202,7 +202,7 @@ async fn http_import_keeps_the_server_stamped_principal_on_the_postgres_arm_8443
 // Federation receive (handler level)
 // ---------------------------------------------------------------------------
 
-const ALLOWLIST: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*"],"allowed_sender_agent_ids":["ai:evil","ai:victim"]}}"#;
+const ALLOWLIST: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*"],"allowed_sender_agent_ids":["ai:evil","ai:victim","ai:origin"]}}"#;
 
 async fn push(router: &axum::Router, memories: &[Value]) -> (StatusCode, String) {
     let body = json!({
@@ -235,6 +235,9 @@ async fn federation_receive_passes_the_peer_to_the_principal_sanitiser_8443() {
     unsafe {
         std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
         std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+        // The relayed rows name an origin author with no enrolled key; the
+        // explicit write-signature opt-out lets them reach the sanitiser.
+        std::env::set_var("AI_MEMORY_FED_REQUIRE_WRITE_SIG", "0");
         std::env::set_var(
             ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
             ALLOWLIST,
@@ -244,6 +247,8 @@ async fn federation_receive_passes_the_peer_to_the_principal_sanitiser_8443() {
     let vouch_id = uuid::Uuid::new_v4().to_string();
     let owner_id = uuid::Uuid::new_v4().to_string();
     let third_id = uuid::Uuid::new_v4().to_string();
+    let relay_id = uuid::Uuid::new_v4().to_string();
+    let relay_case_id = uuid::Uuid::new_v4().to_string();
     let rows = [
         // The row names the peer as author AND as principal: a peer cannot
         // vouch for itself, so the claim falls back to `unknown`.
@@ -264,11 +269,26 @@ async fn federation_receive_passes_the_peer_to_the_principal_sanitiser_8443() {
             "third party",
             json!({"agent_id": PEER, KEY: "ai:third"}),
         ),
+        // Code L4: a relayed row authored by `ai:origin` whose claim names
+        // `ai:origin` is the row's own author naming itself; the authenticated
+        // peer takes the claim, never the origin.
+        wire_row(
+            &relay_id,
+            "relayed self claim",
+            json!({"agent_id": "ai:origin", KEY: "ai:origin"}),
+        ),
+        // Sec LOW-4: the same imitation differing only in letter case.
+        wire_row(
+            &relay_case_id,
+            "relayed self claim, case variant",
+            json!({"agent_id": "ai:origin", KEY: "AI:Origin"}),
+        ),
     ];
     let (status, resp_body) = push(&router, &rows).await;
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        std::env::remove_var("AI_MEMORY_FED_REQUIRE_WRITE_SIG");
         std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
     }
     assert!(
@@ -290,5 +310,15 @@ async fn federation_receive_passes_the_peer_to_the_principal_sanitiser_8443() {
         stored_principal(&db, &third_id).await.as_deref(),
         Some("ai:third"),
         "a third-party claim survives"
+    );
+    assert_eq!(
+        stored_principal(&db, &relay_id).await.as_deref(),
+        Some(PEER),
+        "a relayed row whose claim names its own origin stores the peer"
+    );
+    assert_eq!(
+        stored_principal(&db, &relay_case_id).await.as_deref(),
+        Some(PEER),
+        "a case variant of the row's own author is the same imitation"
     );
 }

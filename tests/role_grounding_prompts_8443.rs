@@ -467,6 +467,18 @@ fn summariser_collision_regenerates_once_then_refuses_8443() {
     let mut gen_once = || draws.pop().expect("a draw");
     let ok = render_summarize_prompt_with(Some(OWNER), &pairs, &mut gen_once).expect("render");
     assert!(ok.contains("--- Memory 1 [ffffffffffffffff] ---"));
+    // Two collisions then a fresh third draw: still refused, exactly two tries.
+    let mut third = vec![
+        FrameBoundary::fixed("eeeeeeeeeeeeeeee"),
+        FrameBoundary::fixed(TOKEN),
+        FrameBoundary::fixed(TOKEN),
+    ];
+    let mut gen_third = || third.pop().expect("a draw");
+    assert_eq!(
+        render_summarize_prompt_with(Some(OWNER), &pairs, &mut gen_third),
+        Err(FrameCollision),
+        "the boundary is regenerated once, never twice"
+    );
     // Both draws collide: the render is refused.
     let mut always = fixed_generator();
     assert_eq!(

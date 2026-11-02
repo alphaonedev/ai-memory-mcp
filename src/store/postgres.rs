@@ -28092,6 +28092,19 @@ impl MemoryStore for PostgresStore {
                 detail: crate::identity::attest::ATTESTATION_REFUSED_UNSIGNED_SURFACE.to_string(),
             });
         }
+        // #8443 (code M1) — a substrate pass writes the formed row under its
+        // own id, so the owner hint for its fold is the NAMESPACE OWNER, never
+        // that id. Resolved before the tx opens (pool read, not the tx). A read
+        // fault is no owner: the fold then treats every non-writer author as
+        // foreign (fail closed).
+        let substrate_owner = if ctx.bypass_visibility {
+            self.pg_resolve_namespace_owner(namespace)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let mut tx = self
             .pool
             .begin()
@@ -28217,13 +28230,17 @@ impl MemoryStore for PostgresStore {
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
         // #8443 — folded content principal (sqlite `storage::consolidate` twin).
-        // The formed row is written under the consolidator, so the consolidator
-        // is the owner hint for tenant AND substrate calls (twin of the sqlite
-        // `storage::consolidate`): a foreign single author survives as the
-        // folded principal.
-        let owner_hint = Some(consolidator_agent_id);
         let source_refs: Vec<&serde_json::Value> = source_metas.iter().collect();
-        if let Some(folded) = crate::role_grounding::fold_metadata(&source_refs, owner_hint) {
+        let folded = if ctx.bypass_visibility {
+            crate::role_grounding::fold_metadata_with(
+                &source_refs,
+                substrate_owner.as_deref(),
+                Some(consolidator_agent_id),
+            )
+        } else {
+            crate::role_grounding::fold_metadata(&source_refs, Some(consolidator_agent_id))
+        };
+        if let Some(folded) = folded {
             merged_metadata.insert(
                 crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
                 serde_json::Value::String(folded.as_str().to_string()),

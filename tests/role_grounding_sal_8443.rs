@@ -355,6 +355,79 @@ async fn sal_consolidate_by_a_background_writer_keeps_the_foreign_author_8443() 
     assert_eq!(principal(&row), Some(ATTACKER));
 }
 
+/// Seed `authors.len()` sources (one per author) in `ns`, make `OWNER` the
+/// namespace owner (a standard authored by `OWNER`), consolidate them under the
+/// background writer `ai:curator` and return the formed row's principal.
+async fn consolidate_under_owner_standard(
+    store: &SqliteStore,
+    ns: &str,
+    authors: &[&str],
+) -> Option<String> {
+    let admin = CallerContext::for_admin("ai:curator");
+    let std_id = store
+        .store(
+            &admin,
+            &mem(OWNER, ns, "standard", "the namespace standard", json!({})),
+        )
+        .await
+        .expect("standard");
+    store
+        .set_namespace_standard(&admin, ns, &std_id, None)
+        .await
+        .expect("set standard");
+    let mut ids = Vec::new();
+    for (i, author) in authors.iter().enumerate() {
+        let id = store
+            .store(
+                &admin,
+                &mem(author, ns, &format!("s{i}"), "a source body", json!({})),
+            )
+            .await
+            .expect("source");
+        ids.push(id);
+    }
+    let merged = store
+        .consolidate(
+            &admin,
+            &ids,
+            "merged",
+            "curated summary",
+            ns,
+            &Tier::Mid,
+            "curator",
+            "ai:curator",
+        )
+        .await
+        .expect("consolidate");
+    principal(&store.get(&admin, &merged).await.expect("get")).map(str::to_string)
+}
+
+/// Round 4 (code M1): the hint for a background pass is the NAMESPACE OWNER,
+/// never the id the pass writes under. Owner-authored sources stay owner
+/// content, a foreign author stays foreign, and a mix is `mixed`.
+#[tokio::test]
+async fn sal_consolidate_of_owner_authored_sources_stays_owner_content_8443() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    assert_eq!(
+        consolidate_under_owner_standard(&store, "tenant/own", &[OWNER, OWNER]).await,
+        None,
+        "owner-authored sources must not be stamped"
+    );
+    assert_eq!(
+        consolidate_under_owner_standard(&store, "tenant/foreign", &[ATTACKER, ATTACKER])
+            .await
+            .as_deref(),
+        Some(ATTACKER)
+    );
+    assert_eq!(
+        consolidate_under_owner_standard(&store, "tenant/mix", &[OWNER, ATTACKER])
+            .await
+            .as_deref(),
+        Some("mixed")
+    );
+}
+
 /// Live-Postgres twins of the cells above (code LOW C, INFO-1, MEDIUM A and
 /// the PG half of MEDIUM-3). Each skips when `AI_MEMORY_TEST_POSTGRES_URL` is
 /// unset.
@@ -554,5 +627,70 @@ mod pg {
             .expect("consolidate");
         let row = store.get(&admin, &merged).await.expect("get");
         assert_eq!(principal(&row), Some(ATTACKER));
+    }
+
+    async fn pg_consolidate_under_owner_standard(
+        store: &PostgresStore,
+        authors: &[&str],
+    ) -> Option<String> {
+        let admin = CallerContext::for_admin("ai:curator");
+        let ns = ns();
+        let std_id = store
+            .store(
+                &admin,
+                &mem(OWNER, &ns, "standard", "the namespace standard", json!({})),
+            )
+            .await
+            .expect("standard");
+        store
+            .set_namespace_standard(&admin, &ns, &std_id, None)
+            .await
+            .expect("set standard");
+        let mut ids = Vec::new();
+        for (i, author) in authors.iter().enumerate() {
+            let id = store
+                .store(
+                    &admin,
+                    &mem(author, &ns, &format!("s{i}"), "a source body", json!({})),
+                )
+                .await
+                .expect("source");
+            ids.push(id);
+        }
+        let merged = store
+            .consolidate(
+                &admin,
+                &ids,
+                "merged",
+                "curated summary",
+                &ns,
+                &Tier::Mid,
+                "curator",
+                "ai:curator",
+            )
+            .await
+            .expect("consolidate");
+        principal(&store.get(&admin, &merged).await.expect("get")).map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn pg_consolidate_of_owner_authored_sources_stays_owner_content_8443() {
+        let Some(store) = connect().await else { return };
+        assert_eq!(
+            pg_consolidate_under_owner_standard(&store, &[OWNER, OWNER]).await,
+            None
+        );
+        assert_eq!(
+            pg_consolidate_under_owner_standard(&store, &[ATTACKER, ATTACKER])
+                .await
+                .as_deref(),
+            Some(ATTACKER)
+        );
+        assert_eq!(
+            pg_consolidate_under_owner_standard(&store, &[OWNER, ATTACKER])
+                .await
+                .as_deref(),
+            Some("mixed")
+        );
     }
 }

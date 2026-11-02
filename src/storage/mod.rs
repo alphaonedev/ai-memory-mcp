@@ -10870,13 +10870,21 @@ pub fn consolidate_with_expected_versions(
         // #8443 — whose content the merged row is: owner when every source is
         // owner content (no key), the one publisher when all foreign sources
         // share it, otherwise `mixed`.
-        // The formed row is written under the consolidator, so the consolidator
-        // is the owner hint for tenant AND substrate calls: a source written by
-        // anyone else is foreign and its author survives as the folded principal
-        // (a substrate pass no longer launders a single foreign author).
-        let owner_hint = Some(consolidator_agent_id);
+        // A SUBSTRATE pass writes under its own id, so its hint is the
+        // NAMESPACE OWNER and its own id is only the author of record (code
+        // M1); a tenant call's hint is the bound consolidator.
         let source_refs: Vec<&serde_json::Value> = source_metas.iter().collect();
-        if let Some(folded) = crate::role_grounding::fold_metadata(&source_refs, owner_hint) {
+        let folded = if substrate_authored {
+            let ns_owner = namespace_owner(conn, namespace).ok().flatten();
+            crate::role_grounding::fold_metadata_with(
+                &source_refs,
+                ns_owner.as_deref(),
+                Some(consolidator_agent_id),
+            )
+        } else {
+            crate::role_grounding::fold_metadata(&source_refs, Some(consolidator_agent_id))
+        };
+        if let Some(folded) = folded {
             merged_metadata.insert(
                 crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
                 serde_json::Value::String(folded.as_str().to_string()),
@@ -23370,7 +23378,7 @@ fn evaluate_level(
 ///
 /// #4043 — a read fault is an `Err`, never "no owner" (an Owner gate evaluated
 /// against a missing owner must not be reached on evidence nobody read).
-fn namespace_owner(conn: &Connection, namespace: &str) -> Result<Option<String>> {
+pub(crate) fn namespace_owner(conn: &Connection, namespace: &str) -> Result<Option<String>> {
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // We want leaf-first so the most-specific owner wins, matching how
     // resolve_governance_policy picks up the most-specific policy.

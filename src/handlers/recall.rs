@@ -780,7 +780,7 @@ async fn recall_response(
                 // by the final post-rerank `mode`.
                 crate::metrics::record_recall(mode, recall_started.elapsed().as_secs_f64());
                 // #1579 B4 — serialize per the negotiated format.
-                crate::handlers::wire_format::memories_response(format, resp)
+                crate::handlers::wire_format::memories_response(format, resp, caller_principal)
             }
             Err(e) => store_err_to_response(e),
         };
@@ -1215,7 +1215,7 @@ async fn recall_response(
             // final post-rerank `mode`.
             crate::metrics::record_recall(mode, recall_started.elapsed().as_secs_f64());
             // #1579 B4 — serialize per the negotiated format.
-            crate::handlers::wire_format::memories_response(format, resp)
+            crate::handlers::wire_format::memories_response(format, resp, caller_principal)
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }

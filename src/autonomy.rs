@@ -674,10 +674,16 @@ fn consolidate_cluster(
     }
 
     // #8443 — ground the roles: owner from the store, sources labelled.
-    // The summary is written under the curator, so the curator is the owner
-    // hint: a foreign single author is labelled, not adopted as the owner.
-    let curator = Some(crate::identity::sentinels::AI_CURATOR);
-    let (owner, input) = crate::role_grounding::summary_inputs_for(cluster, curator);
+    // The summary is written under the curator (the author of record), but
+    // the owner hint is the NAMESPACE OWNER, never the writer (code M1): an
+    // owner-authored cluster is owner content, a foreign single author is
+    // labelled and stamped, not adopted as the owner.
+    let curator = crate::identity::sentinels::AI_CURATOR;
+    let ns_owner = crate::storage::namespace_owner(conn, &cluster[0].namespace)
+        .ok()
+        .flatten();
+    let (owner, input) =
+        crate::role_grounding::summary_inputs_with(cluster, ns_owner.as_deref(), Some(curator));
     let summary = llm.summarize_memories_grounded(owner.as_deref(), &input)?;
     crate::validate::validate_content(&summary)?;
     // Prefix the consolidated title so it never collides with one of
@@ -2231,6 +2237,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #8443 code M1: seed `authors.len()` sources in `app`, make `ai:owner` the
+    /// namespace owner, run the autonomy consolidation and return the stored
+    /// `content_principal` of the formed row.
+    fn autonomy_principal_under_owner_standard(authors: &[&str]) -> Option<String> {
+        let (_tmp, conn) = setup_conn();
+        let mut std_mem = sample_mem("std", "app", "standard", "the standard", Tier::Long);
+        std_mem.metadata = serde_json::json!({"agent_id": "ai:owner"});
+        db::insert(&conn, &std_mem).unwrap();
+        db::set_namespace_standard(&conn, "app", "std", None).unwrap();
+        let mut cluster = Vec::new();
+        for (i, author) in authors.iter().enumerate() {
+            let mut m = sample_mem(
+                &format!("src-{i}"),
+                "app",
+                &format!("Deploy plan {i}"),
+                "kubernetes rolling deploy with canary",
+                Tier::Long,
+            );
+            m.metadata = serde_json::json!({"agent_id": author});
+            db::insert(&conn, &m).unwrap();
+            cluster.push(m);
+        }
+        let llm = StubLlm::new("consolidated deploy plan");
+        let entry = consolidate_cluster(&conn, &llm, &cluster, false)
+            .unwrap()
+            .expect("rollback entry")
+            .entry;
+        let RollbackEntry::Consolidate { result_id, .. } = entry else {
+            panic!("expected Consolidate");
+        };
+        let got = db::get(&conn, &result_id).unwrap().expect("result memory");
+        crate::role_grounding::content_principal(&got.metadata).map(str::to_string)
+    }
+
+    #[test]
+    fn consolidate_cluster_owner_authored_sources_stay_owner_content_8443() {
+        assert_eq!(
+            autonomy_principal_under_owner_standard(&["ai:owner", "ai:owner"]),
+            None,
+            "owner-authored sources must not be stamped with the curator"
+        );
+        assert_eq!(
+            autonomy_principal_under_owner_standard(&["ai:eve", "ai:eve"]).as_deref(),
+            Some("ai:eve")
+        );
+        assert_eq!(
+            autonomy_principal_under_owner_standard(&["ai:owner", "ai:eve"]).as_deref(),
+            Some("mixed")
+        );
     }
 
     #[test]

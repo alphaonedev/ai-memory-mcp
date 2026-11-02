@@ -339,11 +339,19 @@ impl<'a> PersonaGenerator<'a> {
         // deterministic without spinning up Ollama.
         // #8443 — a persona is by definition "what the owner prefers", so it
         // is the surface where a foreign quoted preference must never fold in.
-        // The persona is written under the curator id, so that id is the
-        // owner hint (a foreign single author is labelled and stamped).
+        // The persona is written under the curator id (the author of record),
+        // but the owner hint is the NAMESPACE OWNER, never the writer (code M1):
+        // an owner-authored source set is owner content, a foreign author is
+        // labelled and stamped. A read fault is no owner (fail closed).
         let writer = self.agent_id();
-        let (grounded_owner, llm_input) =
-            crate::role_grounding::summary_inputs_for(&sources, Some(&writer));
+        let ns_owner = crate::storage::namespace_owner(self.conn, namespace)
+            .ok()
+            .flatten();
+        let (grounded_owner, llm_input) = crate::role_grounding::summary_inputs_with(
+            &sources,
+            ns_owner.as_deref(),
+            Some(&writer),
+        );
         let body_md_raw = self
             .llm
             .summarize_memories_grounded(grounded_owner.as_deref(), &llm_input)
@@ -375,7 +383,12 @@ impl<'a> PersonaGenerator<'a> {
             }
         });
         // #8443 — the persona inherits the folded principal of its sources.
-        crate::role_grounding::stamp_folded(&mut metadata, &sources, Some(&agent_id));
+        crate::role_grounding::stamp_folded_with(
+            &mut metadata,
+            &sources,
+            ns_owner.as_deref(),
+            Some(&agent_id),
+        );
 
         let mut persona_mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
@@ -1049,6 +1062,90 @@ mod tests {
     fn validate_entity_id_accepts_normal_ids() {
         assert!(validate_entity_id("alice").is_ok());
         assert!(validate_entity_id("entity-42").is_ok());
+    }
+
+    /// #8443 code M1: records the owner and inputs the persona summariser sees.
+    struct GroundingProbe {
+        seen: std::sync::Mutex<Vec<(Option<String>, Vec<(String, String)>)>>,
+    }
+
+    impl AutonomyLlm for GroundingProbe {
+        fn auto_tag(&self, _title: &str, _content: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn detect_contradiction(&self, _a: &str, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn summarize_memories(&self, _memories: &[(String, String)]) -> anyhow::Result<String> {
+            Ok("probe persona".to_string())
+        }
+        fn summarize_memories_grounded(
+            &self,
+            owner: Option<&str>,
+            memories: &[(String, String)],
+        ) -> anyhow::Result<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((owner.map(str::to_string), memories.to_vec()));
+            Ok("probe persona".to_string())
+        }
+    }
+
+    /// Seed the alice reflections authored by `authors`, make `ai:owner` the
+    /// namespace owner, generate and return the persona row's principal plus
+    /// what the summariser was handed.
+    fn persona_under_owner_standard(
+        authors: &[&str],
+    ) -> (Option<String>, (Option<String>, Vec<(String, String)>)) {
+        let (conn, _dir) = fresh_db();
+        let std_id = seed_reflection(&conn, "team/alpha", "namespace standard", "the standard");
+        conn.execute(
+            "UPDATE memories SET metadata = json(?1) WHERE id = ?2",
+            rusqlite::params![r#"{"agent_id":"ai:owner"}"#, std_id],
+        )
+        .unwrap();
+        db::set_namespace_standard(&conn, "team/alpha", &std_id, None).unwrap();
+        let ids = seed_two_alice_reflections(&conn, "team/alpha");
+        for (id, author) in ids.iter().zip(authors) {
+            let meta = serde_json::json!({"agent_id": author, "entity_id": "alice"});
+            conn.execute(
+                "UPDATE memories SET metadata = json(?1) WHERE id = ?2",
+                rusqlite::params![meta.to_string(), id],
+            )
+            .unwrap();
+        }
+        let llm = GroundingProbe {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let persona = PersonaGenerator::new(&conn, &llm, None, PersonaConfig::default())
+            .generate("alice", "team/alpha")
+            .expect("generate");
+        let row = db::get(&conn, &persona.id).unwrap().expect("persona row");
+        let seen = llm.seen.lock().unwrap().first().cloned().expect("ran");
+        (
+            crate::role_grounding::content_principal(&row.metadata).map(str::to_string),
+            seen,
+        )
+    }
+
+    #[test]
+    fn persona_owner_authored_sources_stay_owner_content_8443() {
+        let (principal, (owner, inputs)) = persona_under_owner_standard(&["ai:owner", "ai:owner"]);
+        assert_eq!(principal, None, "owner-authored sources are not stamped");
+        assert_eq!(owner.as_deref(), Some("ai:owner"));
+        assert!(
+            inputs.iter().all(|(_, c)| !c.contains("source principal")),
+            "owner content must not be labelled foreign: {inputs:?}"
+        );
+        let (principal, (_, inputs)) = persona_under_owner_standard(&["ai:eve", "ai:eve"]);
+        assert_eq!(principal.as_deref(), Some("ai:eve"));
+        assert!(
+            inputs.iter().all(|(_, c)| c.contains("ai:eve")),
+            "foreign content stays labelled: {inputs:?}"
+        );
+        let (principal, _) = persona_under_owner_standard(&["ai:owner", "ai:eve"]);
+        assert_eq!(principal.as_deref(), Some("mixed"));
     }
 
     #[test]

@@ -212,6 +212,7 @@ fn happy_path_basic_store() {
 /// the MCP store ingress; the server alone stamps the marker.
 #[test]
 fn caller_supplied_content_principal_is_stripped_on_store_8443() {
+    let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
     let conn = fresh_conn();
     let ttl = ResolvedTtl::default();
     for forged in ["owner", "ai:attacker"] {

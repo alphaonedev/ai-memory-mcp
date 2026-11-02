@@ -241,10 +241,35 @@ pub fn stored_principal(metadata: &Value) -> Option<ContentPrincipal> {
 
 /// Remove a caller-supplied `content_principal` from `metadata`. Every ingress
 /// calls this before the server stamps. Returns `true` when a key was removed.
+///
+/// The key is matched without regard to letter case, and a nested `metadata`
+/// object is stripped too (a relay that wraps the real metadata one level
+/// down), so a variant spelling cannot smuggle a claim past the strip.
 pub fn strip_content_principal(metadata: &mut Value) -> bool {
-    metadata
-        .as_object_mut()
-        .is_some_and(|o| o.remove(META_CONTENT_PRINCIPAL).is_some())
+    let Some(obj) = metadata.as_object_mut() else {
+        return false;
+    };
+    let variants: Vec<String> = obj
+        .keys()
+        .filter(|k| k.eq_ignore_ascii_case(META_CONTENT_PRINCIPAL))
+        .cloned()
+        .collect();
+    let mut removed = false;
+    for key in variants {
+        removed |= obj.remove(&key).is_some();
+    }
+    if let Some(inner) = obj.get_mut("metadata") {
+        removed |= strip_content_principal(inner);
+    }
+    removed
+}
+
+/// Whether two agent ids name the same principal. A claim that differs from
+/// the receiver or owner only in letter case can only be an imitation of it
+/// (precedent: [`is_reserved_principal_word`]), so the strip filters compare
+/// without regard to case.
+fn same_principal(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// Sanitise a `content_principal` on an inbound row from a trusted peer, where
@@ -261,11 +286,19 @@ pub fn sanitize_inbound_principal(metadata: &mut Value, publisher: Option<&str>)
     let row_agent = author_of(metadata).map(str::to_string);
     let kept = claim.as_str().and_then(ContentPrincipal::from_stored);
     match kept {
-        Some(c) if row_agent.as_deref() != Some(c.as_str()) => false,
+        Some(c)
+            if !row_agent
+                .as_deref()
+                .is_some_and(|r| same_principal(r, c.as_str())) =>
+        {
+            false
+        }
         Some(_) => {
             let replacement = publisher
                 .map(str::trim)
-                .filter(|p| !p.is_empty() && Some(*p) != row_agent.as_deref())
+                .filter(|p| {
+                    !p.is_empty() && !row_agent.as_deref().is_some_and(|r| same_principal(r, p))
+                })
                 .map_or_else(
                     ContentPrincipal::unknown,
                     ContentPrincipal::from_agent_id_or_unknown,
@@ -299,7 +332,7 @@ pub fn stamp_content_principal_for_receiver(
     receiver: &str,
 ) -> bool {
     match stored_principal(metadata) {
-        Some(existing) if existing.as_str() != receiver => false,
+        Some(existing) if !same_principal(existing.as_str(), receiver) => false,
         _ => set_content_principal(metadata, Some(principal)),
     }
 }
@@ -335,7 +368,10 @@ pub fn set_content_principal(metadata: &mut Value, principal: Option<&ContentPri
 /// agent id the imported row is restamped to) is a promotion attempt and is
 /// replaced by the publisher, or `unknown` when no publisher is known. When
 /// nothing foreign was claimed and the publisher is not the importing caller,
-/// the publisher is stamped.
+/// the publisher is stamped. When the bundle's `agent_id` equals the importing
+/// caller the bundle is a self-claim nobody attested (the import has no trust
+/// source), so the row is stamped `unknown`: never the publisher, never owner
+/// content (issue #8443, sec LOW-6). Ids compare without regard to case.
 pub fn restamp_untrusted_import(
     obj: &mut serde_json::Map<String, Value>,
     original: Option<&str>,
@@ -344,11 +380,11 @@ pub fn restamp_untrusted_import(
     let claimed = obj
         .remove(META_CONTENT_PRINCIPAL)
         .and_then(|v| v.as_str().and_then(ContentPrincipal::from_stored))
-        .filter(|c| c.as_str() != caller);
+        .filter(|c| !same_principal(c.as_str(), caller));
     let publisher = original.map(str::trim).filter(|o| !o.is_empty());
     let principal = match (claimed, publisher) {
         (Some(c), _) => Some(c),
-        (None, Some(p)) if p == caller => None,
+        (None, Some(p)) if same_principal(p, caller) => Some(ContentPrincipal::unknown()),
         (None, Some(p)) => Some(ContentPrincipal::from_agent_id_or_unknown(p)),
         (None, None) => Some(ContentPrincipal::unknown()),
     };
@@ -530,10 +566,35 @@ pub fn effective_principals(
     metadatas: &[&Value],
     owner_hint: Option<&str>,
 ) -> (Option<String>, Vec<Option<ContentPrincipal>>) {
+    effective_principals_with(metadatas, owner_hint, None)
+}
+
+/// [`effective_principals`] for a substrate pass that writes the formed row
+/// under its own `writer` id (issue #8443, code M1). `owner_hint` is the
+/// NAMESPACE OWNER, never the writer: the writer is only the author of record.
+///
+/// * A source authored by the owner OR by the `writer` is owner content (the
+///   substrate acts for the owner; a row the writer formed earlier carries its
+///   own lineage in its marker, which still wins).
+/// * With no namespace owner known the owner is NOT guessed from the sources
+///   (that would launder a lone foreign author): every unmarked source whose
+///   author is not the writer is foreign under its author.
+/// * A marker naming the owner (compared without regard to case) is read as
+///   `unknown`, exactly as in [`effective_principals`].
+#[must_use]
+pub fn effective_principals_with(
+    metadatas: &[&Value],
+    owner_hint: Option<&str>,
+    writer: Option<&str>,
+) -> (Option<String>, Vec<Option<ContentPrincipal>>) {
     let markers: Vec<Option<ContentPrincipal>> =
         metadatas.iter().map(|m| explicit_marker(m)).collect();
     let hint = owner_hint.map(str::trim).filter(|h| !h.is_empty());
+    let writer = writer.map(str::trim).filter(|w| !w.is_empty());
     let owner: Option<String> = hint.map(str::to_string).or_else(|| {
+        if writer.is_some() {
+            return None;
+        }
         let mut authors: Vec<&str> = Vec::new();
         for (m, marker) in metadatas.iter().zip(&markers) {
             if marker.is_none()
@@ -554,17 +615,23 @@ pub fn effective_principals(
         .map(|(m, marker)| {
             if let Some(mark) = marker {
                 // A marker naming the owner is content that claims its own
-                // receiver: never owner, never the owner's name (#8443).
-                return Some(if owner.as_deref() == Some(mark.as_str()) {
-                    ContentPrincipal::unknown()
-                } else {
-                    mark
-                });
+                // receiver: never owner, never the owner's name (#8443). A
+                // case variant of the owner is the same imitation.
+                return Some(
+                    if owner
+                        .as_deref()
+                        .is_some_and(|o| same_principal(o, mark.as_str()))
+                    {
+                        ContentPrincipal::unknown()
+                    } else {
+                        mark
+                    },
+                );
             }
-            match (author_of(m), owner.as_deref()) {
-                (Some(a), Some(o)) if a == o => None,
-                (Some(a), _) => Some(ContentPrincipal::from_agent_id_or_unknown(a)),
-                (None, _) => None,
+            match author_of(m) {
+                Some(a) if owner.as_deref() == Some(a) || writer == Some(a) => None,
+                Some(a) => Some(ContentPrincipal::from_agent_id_or_unknown(a)),
+                None => None,
             }
         })
         .collect();
@@ -580,8 +647,20 @@ pub fn summary_inputs_for(
     memories: &[crate::models::Memory],
     owner_hint: Option<&str>,
 ) -> (Option<String>, Vec<(String, String)>) {
+    summary_inputs_with(memories, owner_hint, None)
+}
+
+/// [`summary_inputs_for`] for a substrate pass: `owner_hint` is the namespace
+/// owner and `writer` the id the formed row is written under (see
+/// [`effective_principals_with`]).
+#[must_use]
+pub fn summary_inputs_with(
+    memories: &[crate::models::Memory],
+    owner_hint: Option<&str>,
+    writer: Option<&str>,
+) -> (Option<String>, Vec<(String, String)>) {
     let metas: Vec<&Value> = memories.iter().map(|m| &m.metadata).collect();
-    let (owner, principals) = effective_principals(&metas, owner_hint);
+    let (owner, principals) = effective_principals_with(&metas, owner_hint, writer);
     let items = memories
         .iter()
         .zip(&principals)
@@ -604,14 +683,34 @@ pub fn fold_memories(
     memories: &[crate::models::Memory],
     owner_hint: Option<&str>,
 ) -> Option<ContentPrincipal> {
+    fold_memories_with(memories, owner_hint, None)
+}
+
+/// [`fold_memories`] for a substrate pass (see [`effective_principals_with`]).
+#[must_use]
+pub fn fold_memories_with(
+    memories: &[crate::models::Memory],
+    owner_hint: Option<&str>,
+    writer: Option<&str>,
+) -> Option<ContentPrincipal> {
     let metas: Vec<&Value> = memories.iter().map(|m| &m.metadata).collect();
-    fold_metadata(&metas, owner_hint)
+    fold_metadata_with(&metas, owner_hint, writer)
 }
 
 /// Fold the effective principals of source metadata values.
 #[must_use]
 pub fn fold_metadata(metadatas: &[&Value], owner_hint: Option<&str>) -> Option<ContentPrincipal> {
-    let (_, principals) = effective_principals(metadatas, owner_hint);
+    fold_metadata_with(metadatas, owner_hint, None)
+}
+
+/// [`fold_metadata`] for a substrate pass (see [`effective_principals_with`]).
+#[must_use]
+pub fn fold_metadata_with(
+    metadatas: &[&Value],
+    owner_hint: Option<&str>,
+    writer: Option<&str>,
+) -> Option<ContentPrincipal> {
+    let (_, principals) = effective_principals_with(metadatas, owner_hint, writer);
     fold_principals(principals.iter().map(Option::as_ref))
 }
 
@@ -622,7 +721,20 @@ pub fn stamp_folded(
     sources: &[crate::models::Memory],
     owner_hint: Option<&str>,
 ) -> Option<ContentPrincipal> {
-    let folded = fold_memories(sources, owner_hint);
+    stamp_folded_with(metadata, sources, owner_hint, None)
+}
+
+/// [`stamp_folded`] for a substrate pass: `owner_hint` is the namespace owner,
+/// `writer` the id the formed row is authored under. When the single author is
+/// the owner (or the writer itself) no principal is stamped: the formed row is
+/// owner content and the key stays absent (issue #8443, code M1).
+pub fn stamp_folded_with(
+    metadata: &mut Value,
+    sources: &[crate::models::Memory],
+    owner_hint: Option<&str>,
+    writer: Option<&str>,
+) -> Option<ContentPrincipal> {
+    let folded = fold_memories_with(sources, owner_hint, writer);
     set_content_principal(metadata, folded.as_ref());
     folded
 }
@@ -679,6 +791,35 @@ pub fn render_summarize_prompt_with(
     Ok(fill_role_grounding(SUMMARIZE_PROMPT, owner)
         .replace(FRAME_SLOT, b)
         .replace("{memories}", &formatted))
+}
+
+/// The namespace owner of `namespace` through the SAL: the `metadata.agent_id`
+/// of the first namespace-standard memory found walking the inheritance chain
+/// leaf-first (the twin of `storage::namespace_owner` and of the postgres
+/// `pg_resolve_namespace_owner`). A substrate pass uses it as the owner hint so
+/// the id it writes under is never mistaken for the owner (issue #8443, code
+/// M1). Any read fault or unsupported capability is `None`: the pass then
+/// fails closed and treats every non-writer author as foreign.
+#[cfg(feature = "sal")]
+pub async fn namespace_owner_via_store(
+    store: &dyn crate::store::MemoryStore,
+    ctx: &crate::store::CallerContext,
+    namespace: &str,
+) -> Option<String> {
+    let chain = store.build_namespace_chain(namespace).await.ok()?;
+    for level in chain.iter().rev() {
+        let Ok(Some((standard_id, _parent))) = store.get_namespace_standard(ctx, level).await
+        else {
+            continue;
+        };
+        let Ok(standard) = store.get(ctx, &standard_id).await else {
+            continue;
+        };
+        if let Some(owner) = author_of(&standard.metadata) {
+            return Some(owner.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -794,9 +935,11 @@ mod tests {
         let mut forged = json!({"content_principal": "owner"});
         restamp_untrusted_import(forged.as_object_mut().unwrap(), Some("ai:pub"), "ai:me");
         assert_eq!(content_principal(&forged), Some("ai:pub"));
+        // Sec LOW-6: a bundle agent_id equal to the importing caller is an
+        // unattested self-claim (no trust source): unknown, never owner content.
         let mut own = json!({"content_principal": "owner"});
         restamp_untrusted_import(own.as_object_mut().unwrap(), Some("ai:me"), "ai:me");
-        assert_eq!(content_principal(&own), None);
+        assert_eq!(content_principal(&own), Some(PRINCIPAL_UNKNOWN));
         let mut anon = json!({});
         restamp_untrusted_import(anon.as_object_mut().unwrap(), None, "ai:me");
         assert_eq!(content_principal(&anon), Some(PRINCIPAL_UNKNOWN));
@@ -857,5 +1000,92 @@ mod tests {
         let mut m = json!({"content_principal": "ai:old"});
         assert!(set_content_principal(&mut m, None));
         assert_eq!(content_principal(&m), None);
+    }
+
+    #[test]
+    fn restamp_import_forged_self_bundle_with_caller_claim_is_unknown_8443() {
+        // Sec LOW-6 attack: the bundle forges agent_id == caller and a claim
+        // naming the caller. The stored principal is unknown, and the fold reads it
+        // as unknown (never None, never the publisher).
+        let mut forged = json!({"content_principal": "ai:me"});
+        restamp_untrusted_import(forged.as_object_mut().unwrap(), Some("ai:me"), "ai:me");
+        assert_eq!(content_principal(&forged), Some(PRINCIPAL_UNKNOWN));
+        let folded = fold_metadata(&[&forged], Some("ai:me"));
+        assert_eq!(folded, Some(ContentPrincipal::unknown()));
+    }
+
+    #[test]
+    fn case_variant_of_receiver_is_treated_as_the_receiver_8443() {
+        // Sec LOW-4 / code I4: a claim differing from the receiver only in case
+        // is an imitation of it, never a distinct principal.
+        let mut fed = json!({"agent_id": "ai:Receiver", "content_principal": "AI:RECEIVER"});
+        assert!(sanitize_inbound_principal(&mut fed, Some("ai:peer")));
+        assert_eq!(content_principal(&fed), Some("ai:peer"));
+        let mut share = json!({"content_principal": "AI:Receiver"});
+        assert!(stamp_content_principal_for_receiver(
+            &mut share,
+            &cp("ai:sharer"),
+            "ai:receiver"
+        ));
+        assert_eq!(content_principal(&share), Some("ai:sharer"));
+        let mut import = json!({"content_principal": "AI:ME"});
+        restamp_untrusted_import(import.as_object_mut().unwrap(), Some("ai:pub"), "ai:me");
+        assert_eq!(content_principal(&import), Some("ai:pub"));
+    }
+
+    #[test]
+    fn effective_principals_reads_a_case_variant_owner_marker_as_unknown_8443() {
+        let marked = json!({"agent_id": "ai:curator", "content_principal": "AI:OWNER"});
+        let (owner, p) = effective_principals(&[&marked], Some("ai:owner"));
+        assert_eq!(owner.as_deref(), Some("ai:owner"));
+        assert_eq!(p[0].as_ref().map(ContentPrincipal::as_str), Some("unknown"));
+    }
+
+    #[test]
+    fn strip_removes_case_variant_and_nested_keys_8443() {
+        let mut m = json!({
+            "Content_Principal": "ai:x",
+            "metadata": {"CONTENT_PRINCIPAL": "ai:y", "metadata": {"content_principal": "ai:z"}},
+            "keep": 1
+        });
+        assert!(strip_content_principal(&mut m));
+        assert_eq!(m, json!({"metadata": {"metadata": {}}, "keep": 1}));
+        assert!(!strip_content_principal(&mut m));
+    }
+
+    #[test]
+    fn substrate_owner_hint_is_the_namespace_owner_not_the_writer_8443() {
+        // Code M1: owner-authored sources written by the curator are owner
+        // content; the writer id never becomes the owner.
+        let owned = json!({"agent_id": "ai:owner"});
+        let owned2 = json!({"agent_id": "ai:owner"});
+        let (owner, p) =
+            effective_principals_with(&[&owned, &owned2], Some("ai:owner"), Some("ai:curator"));
+        assert_eq!(owner.as_deref(), Some("ai:owner"));
+        assert!(p.iter().all(Option::is_none));
+        assert_eq!(
+            fold_metadata_with(&[&owned, &owned2], Some("ai:owner"), Some("ai:curator")),
+            None
+        );
+        // A foreign author stays foreign; a row the writer formed is owner content.
+        let foreign = json!({"agent_id": "ai:eve"});
+        let formed = json!({"agent_id": "ai:curator"});
+        assert_eq!(
+            fold_metadata_with(&[&foreign], Some("ai:owner"), Some("ai:curator")),
+            Some(cp("ai:eve"))
+        );
+        assert_eq!(
+            fold_metadata_with(&[&formed, &owned], Some("ai:owner"), Some("ai:curator")),
+            None
+        );
+        assert_eq!(
+            fold_metadata_with(&[&owned, &foreign], Some("ai:owner"), Some("ai:curator")),
+            Some(ContentPrincipal::mixed())
+        );
+        // No namespace owner known: fail closed, nothing is guessed as owner.
+        assert_eq!(
+            fold_metadata_with(&[&owned], None, Some("ai:curator")),
+            Some(cp("ai:owner"))
+        );
     }
 }

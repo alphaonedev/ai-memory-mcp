@@ -343,15 +343,22 @@ impl<'a> ConsolidationPass<'a> {
     ///
     /// Does NOT touch the database.
     fn summarize(&self, cluster: &[Memory]) -> Result<Memory> {
+        self.summarize_for(cluster, None)
+    }
+
+    /// [`Self::summarize`] with the NAMESPACE OWNER of the cluster (code M1):
+    /// the owner hint is the owner, the consolidator id is only the writer.
+    fn summarize_for(&self, cluster: &[Memory], ns_owner: Option<&str>) -> Result<Memory> {
         if cluster.is_empty() {
             anyhow::bail!("summarize called on empty cluster");
         }
 
         // #8443 — ground the roles: owner from the store, sources labelled.
-        // The consolidation is written under the consolidator id, so that id
-        // is the owner hint (a foreign single author is labelled and stamped).
+        // The consolidation is written under the consolidator id (the author
+        // of record); the owner hint is the namespace owner, never that id.
         let writer = self.ctx.agent_id.clone();
-        let (owner, input) = crate::role_grounding::summary_inputs_for(cluster, Some(&writer));
+        let (owner, input) =
+            crate::role_grounding::summary_inputs_with(cluster, ns_owner, Some(&writer));
         let summary_text = self
             .llm
             .summarize_memories_grounded(owner.as_deref(), &input)?;
@@ -394,7 +401,12 @@ impl<'a> ConsolidationPass<'a> {
             metadata: {
                 // #8443 — the proposal carries the folded content principal.
                 let mut metadata = serde_json::json!({});
-                crate::role_grounding::stamp_folded(&mut metadata, cluster, Some(&writer));
+                crate::role_grounding::stamp_folded_with(
+                    &mut metadata,
+                    cluster,
+                    ns_owner,
+                    Some(&writer),
+                );
                 metadata
             },
             reflection_depth: 0,
@@ -653,7 +665,13 @@ impl<'a> ConsolidationPass<'a> {
                 continue;
             }
 
-            let summary = match self.summarize(&members) {
+            let ns_owner = crate::role_grounding::namespace_owner_via_store(
+                self.store,
+                &self.ctx,
+                &members[0].namespace,
+            )
+            .await;
+            let summary = match self.summarize_for(&members, ns_owner.as_deref()) {
                 Ok(s) => s,
                 Err(e) => {
                     report
@@ -2034,6 +2052,160 @@ mod tests {
                 rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "a consolidated row must exist"
             );
+        }
+
+        /// #8443 code M1 probe: records what the grounded summariser is handed.
+        struct GroundingProbe {
+            seen: Mutex<Vec<(Option<String>, Vec<(String, String)>)>>,
+        }
+
+        impl AutonomyLlm for GroundingProbe {
+            fn auto_tag(&self, _title: &str, _content: &str) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn detect_contradiction(&self, _a: &str, _b: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn summarize_memories(&self, _memories: &[(String, String)]) -> Result<String> {
+                Ok("probe summary".to_string())
+            }
+            fn summarize_memories_grounded(
+                &self,
+                owner: Option<&str>,
+                memories: &[(String, String)],
+            ) -> Result<String> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((owner.map(str::to_string), memories.to_vec()));
+                Ok("probe summary".to_string())
+            }
+        }
+
+        /// Seed one authored source per entry of `authors` (aligned embeddings
+        /// so the pair clusters) and declare `owner` the namespace owner.
+        async fn seed_authored_cluster(
+            store: &SqliteStore,
+            conn: &rusqlite::Connection,
+            authors: &[&str],
+            owner: &str,
+        ) -> Vec<Memory> {
+            let mut out = Vec::new();
+            for (i, author) in authors.iter().enumerate() {
+                let mut m = make_memory_full(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "ns",
+                    &format!("t{i}"),
+                    "kubernetes rolling canary deploy strategy notes",
+                    Tier::Mid,
+                    5,
+                );
+                m.metadata = serde_json::json!({ "agent_id": author });
+                crate::db::insert(conn, &m).unwrap();
+                crate::db::set_embedding(
+                    conn,
+                    &m.id,
+                    &[1.0, 0.0],
+                    &crate::embeddings::embedding_space_fingerprint("test-space"),
+                )
+                .unwrap();
+                out.push(m);
+            }
+            let mut std_mem = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "ns",
+                "namespace standard",
+                "the standard of this namespace",
+                Tier::Long,
+                5,
+            );
+            std_mem.metadata = serde_json::json!({ "agent_id": owner });
+            crate::db::insert(conn, &std_mem).unwrap();
+            store
+                .set_namespace_standard(
+                    &CallerContext::for_admin("ai:curator"),
+                    "ns",
+                    &std_mem.id,
+                    None,
+                )
+                .await
+                .unwrap();
+            out
+        }
+
+        /// The stored `content_principal` of the `[consolidated]` row in `ns`.
+        fn consolidated_principal(conn: &rusqlite::Connection) -> Option<String> {
+            let rows = crate::db::list(
+                conn,
+                Some("ns"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let row = rows
+                .iter()
+                .find(|m| m.title.starts_with("[consolidated]"))
+                .expect("a consolidated row exists");
+            crate::role_grounding::content_principal(&row.metadata).map(str::to_string)
+        }
+
+        fn probe() -> GroundingProbe {
+            GroundingProbe {
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        #[tokio::test]
+        async fn run_owner_authored_cluster_carries_no_principal_8443() {
+            // Code M1 lens probe: the curator writes the consolidation under
+            // its own id, but the namespace owner's own rows stay owner content.
+            let _dag = crate::test_support::no_lineage_dag_guard();
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let cands =
+                seed_authored_cluster(&store, &conn, &["ai:owner", "ai:owner"], "ai:owner").await;
+            let llm = probe();
+            let pass = ConsolidationPass::new(&store, &llm, false);
+            let out = pass.run(&cands).await.unwrap();
+            assert_eq!(out.memories_consolidated, 2, "{:?}", out.errors);
+            let seen = llm.seen.lock().unwrap();
+            let (owner, items) = seen.first().expect("summariser ran");
+            assert_eq!(owner.as_deref(), Some("ai:owner"));
+            assert!(
+                items.iter().all(|(_, c)| !c.contains("source principal")),
+                "owner content must not be labelled foreign: {items:?}"
+            );
+            drop(seen);
+            assert_eq!(consolidated_principal(&conn), None);
+        }
+
+        #[tokio::test]
+        async fn run_foreign_and_mixed_clusters_keep_their_principal_8443() {
+            let _dag = crate::test_support::no_lineage_dag_guard();
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let cands =
+                seed_authored_cluster(&store, &conn, &["ai:eve", "ai:eve"], "ai:owner").await;
+            let llm = probe();
+            let pass = ConsolidationPass::new(&store, &llm, false);
+            pass.run(&cands).await.unwrap();
+            assert_eq!(consolidated_principal(&conn).as_deref(), Some("ai:eve"));
+
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let cands =
+                seed_authored_cluster(&store, &conn, &["ai:owner", "ai:eve"], "ai:owner").await;
+            let llm = probe();
+            let pass = ConsolidationPass::new(&store, &llm, false);
+            pass.run(&cands).await.unwrap();
+            assert_eq!(consolidated_principal(&conn).as_deref(), Some("mixed"));
         }
 
         #[tokio::test]

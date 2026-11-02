@@ -25,7 +25,7 @@ use ai_memory::role_grounding::{
     ContentPrincipal, PrincipalError, effective_principals, fold_metadata,
     restamp_untrusted_import, sanitize_inbound_principal, strip_content_principal,
 };
-use ai_memory::toon::memories_to_toon;
+use ai_memory::toon::{memories_to_toon, memories_to_toon_for};
 use ai_memory::validate::{RESERVED_AGENT_IDS, validate_agent_id};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -279,7 +279,12 @@ fn import_discards_owner_and_malformed_claims_8443() {
             "falls back to the publisher"
         );
     }
-    assert_eq!(restamped(Some(json!("owner")), Some(OWNER), OWNER), None);
+    // Round 4 (sec LOW-6): a bundle whose agent is the importing caller is an
+    // unattested self-claim, so it is `unknown`, never owner content.
+    assert_eq!(
+        restamped(Some(json!("owner")), Some(OWNER), OWNER).as_deref(),
+        Some("unknown")
+    );
 }
 
 #[test]
@@ -695,6 +700,32 @@ fn capture_turn_drops_a_caller_supplied_principal_8443() {
         None,
         "forged principal survived capture_turn"
     );
+    // Sec INFO-1: a case-variant key and a nested `metadata` object carrying
+    // the key are scrubbed too; no spelling of the key is stored.
+    let resp = handle_capture_turn(
+        &conn,
+        &json!({
+            "host_session_id": "rga-session-nested",
+            "host_turn_index": 1,
+            "role": "user",
+            "content": "captured turn, variant keys",
+            "metadata": {
+                "Content_Principal": ATTACKER,
+                "metadata": {"CONTENT_PRINCIPAL": ATTACKER, "metadata": {KEY: ATTACKER}}
+            }
+        }),
+        Some(OWNER),
+    )
+    .expect("capture ok");
+    let id = resp["memory_id"].as_str().expect("memory_id");
+    let stored = db::get(&conn, id).expect("get").expect("row exists");
+    let text = serde_json::to_string(&stored.metadata)
+        .expect("serialise")
+        .to_ascii_lowercase();
+    assert!(
+        !text.contains(KEY),
+        "a variant spelling of the principal key survived capture_turn: {text}"
+    );
 }
 
 #[test]
@@ -957,4 +988,102 @@ mod pg {
         let row3 = store.get(&ctx, &unmarked_mix).await.expect("get merged3");
         assert_eq!(row3.metadata[KEY], json!("mixed"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round 4: case-insensitive receiver match (sec LOW-4), forged self-bundle
+// (sec LOW-6), relative TOON render (code L7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn case_variant_of_the_receiver_is_never_kept_at_any_ingress_8443() {
+    // Import: a claim differing from the importer only in case.
+    assert_eq!(
+        restamped(Some(json!("AI:OWNER")), Some(ATTACKER), OWNER).as_deref(),
+        Some(ATTACKER),
+        "import: a case variant of the importer is replaced by the publisher"
+    );
+    // Federation: a claim differing from the row's own author only in case.
+    let mut meta = json!({"agent_id": "ai:victim", KEY: "AI:Victim"});
+    sanitize_inbound_principal(&mut meta, Some(ATTACKER));
+    assert_eq!(meta[KEY], json!(ATTACKER), "federation: case variant");
+    // Share: a stored claim naming the share target in another case.
+    let conn = fresh_conn();
+    let src = attacker_row_claiming(&conn, "AI:OWNER");
+    let shared = share_to_owner(&conn, &src);
+    assert_eq!(
+        principal_of(&conn, &shared).as_deref(),
+        Some(ATTACKER),
+        "share: a case variant of the target must not survive"
+    );
+    // effective_principals: a marker naming the owner in another case.
+    let marked = json!({"agent_id": ATTACKER, KEY: "AI:OWNER"});
+    let (_, principals) = effective_principals(&[&marked], Some(OWNER));
+    assert_eq!(
+        principals[0].as_ref().map(ContentPrincipal::as_str),
+        Some("unknown"),
+        "effective_principals: case-variant owner marker"
+    );
+}
+
+#[test]
+fn import_forged_self_bundle_is_unknown_never_the_publisher_8443() {
+    // The bundle names the importing caller as its own agent_id and carries no
+    // foreign claim: nobody attested it, so the row is unknown.
+    assert_eq!(
+        restamped(None, Some(OWNER), OWNER).as_deref(),
+        Some("unknown"),
+        "a self-claimed bundle is not the caller's own content"
+    );
+    assert_eq!(
+        restamped(Some(json!(OWNER)), Some(OWNER), OWNER).as_deref(),
+        Some("unknown"),
+        "a self-claimed bundle with an owner claim"
+    );
+    assert_eq!(
+        restamped(None, Some("AI:Owner"), OWNER).as_deref(),
+        Some("unknown"),
+        "a case variant of the caller as the bundle agent"
+    );
+    // A bundle from a real foreign publisher is still stamped with it.
+    assert_eq!(
+        restamped(None, Some(ATTACKER), OWNER).as_deref(),
+        Some(ATTACKER)
+    );
+}
+
+#[test]
+fn toon_principal_cell_is_rendered_relative_to_the_reader_8443() {
+    let conn = fresh_conn();
+    attacker_shares(&conn, "digest", TOOL_POST);
+    let resp = recall_value(&conn);
+    let escaped = ATTACKER.replace(':', "\\:");
+    // The owner reads the foreign marker as is.
+    let for_owner = memories_to_toon_for(&resp, false, Some(OWNER));
+    assert!(
+        for_owner.contains(&escaped),
+        "owner sees the foreign marker"
+    );
+    // The attacker reading its own claimed content sees `unknown`, exactly as
+    // the formation fold reads it, never its raw id.
+    for reader in [ATTACKER, "AI:Attacker", "  ai:attacker "] {
+        let for_attacker = memories_to_toon_for(&resp, false, Some(reader));
+        // The principal is the last cell of the shared row.
+        let row = for_attacker
+            .lines()
+            .find(|l| l.contains("shared_to_agent_id"))
+            .expect("shared row");
+        assert_eq!(
+            row.rsplit('|').next(),
+            Some("unknown"),
+            "reader {reader:?} must not see its own id as the principal: {for_attacker}"
+        );
+    }
+    let owner_row = for_owner
+        .lines()
+        .find(|l| l.contains("shared_to_agent_id"))
+        .expect("shared row");
+    assert_eq!(owner_row.rsplit('|').next(), Some(escaped.as_str()));
+    // A local operator (no reader) renders the raw marker.
+    assert!(memories_to_toon_for(&resp, true, None).contains(&escaped));
 }

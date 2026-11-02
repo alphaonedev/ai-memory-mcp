@@ -459,6 +459,7 @@ pub async fn search_memories(
                 crate::handlers::wire_format::search_response(
                     format,
                     json!({"results": r, "count": r.len(), "query": p.q}),
+                    Some(resolved_caller.as_str()),
                 )
             }
             Err(e) => store_err_to_response(e),
@@ -558,6 +559,7 @@ pub async fn search_memories(
                     crate::handlers::wire_format::search_response(
                         format,
                         json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}),
+                        Some(resolved_caller.as_str()),
                     )
                 }
                 Err(e) => crate::handlers::errors::handler_error_500(&e),
@@ -612,6 +614,7 @@ pub async fn search_memories(
             crate::handlers::wire_format::search_response(
                 format,
                 json!({"results": r, "count": r.len(), "query": p.q}),
+                Some(resolved_caller.as_str()),
             )
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),

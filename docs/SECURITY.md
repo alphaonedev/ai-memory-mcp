@@ -32,18 +32,24 @@ capabilities:
    pinned role-grounding block naming the owner (system-resolved, never read from
    content), and foreign content is stamped `metadata.content_principal`, derived
    from the authenticated caller, labelled in every formation input and shown in
-   recall. The rules, each pinned by a test:
+   recall (a marker that names the reading agent is read as `unknown`). The
+   rules, each pinned by a test:
    - A caller-supplied `content_principal` is stripped at every ingress that
      does not keep a claim (store, batch, update, capture_turn, reflect,
      entity_register, notify). Ingress that keeps a claim (HTTP and CLI import,
      federation receive, share) may only DEMOTE: a claim may name a third party
      the publisher vouches for, never the receiving owner, the row's own author
-     or the share target; such a claim is replaced by the publisher, else
-     `unknown`. The HTTP import handler re-derives the value and marks its store
-     call with a trusted-import flag so the SAL strip keeps that server value.
-   - A background pass (consolidate, compaction, reflection, persona) passes
-     the id it writes under as the owner hint, so a cluster written by one
-     foreign author folds to that author instead of the writer.
+     or the share target (compared without regard to letter case); such a claim
+     is replaced by the publisher, else `unknown`. An import whose bundle
+     `agent_id` is the importing caller is an unattested self-claim and is
+     stamped `unknown`. The HTTP import handler re-derives the value and marks
+     its store call with a trusted-import flag so the SAL strip keeps that
+     server value.
+   - A background pass (consolidate, compaction, reflection, persona,
+     autonomy) passes the NAMESPACE OWNER as the owner hint and the id it
+     writes under only as the writer, so a cluster written by one foreign
+     author folds to that author instead of the writer and an owner-authored
+     cluster stays owner content.
    - Each formation prompt that embeds foreign text binds its frame header,
      label line and closing marker to a per-prompt random 16-hex token; a
      source body that reproduces a frame header, label or closing marker lacks

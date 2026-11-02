@@ -3834,13 +3834,17 @@ fn handle_request(
                     use crate::mcp::registry::tool_names as tn;
                     let text = match wire_format {
                         Some(WireFormat::Toon) if tool_name == tn::MEMORY_SEARCH => {
-                            crate::toon::search_to_toon(&val, false)
+                            crate::toon::search_to_toon_for(&val, false, authority.read_caller())
                         }
                         Some(WireFormat::ToonCompact) if tool_name == tn::MEMORY_SEARCH => {
-                            crate::toon::search_to_toon(&val, true)
+                            crate::toon::search_to_toon_for(&val, true, authority.read_caller())
                         }
-                        Some(WireFormat::Toon) => crate::toon::memories_to_toon(&val, false),
-                        Some(WireFormat::ToonCompact) => crate::toon::memories_to_toon(&val, true),
+                        Some(WireFormat::Toon) => {
+                            crate::toon::memories_to_toon_for(&val, false, authority.read_caller())
+                        }
+                        Some(WireFormat::ToonCompact) => {
+                            crate::toon::memories_to_toon_for(&val, true, authority.read_caller())
+                        }
                         Some(WireFormat::Json) | None => {
                             serde_json::to_string_pretty(&val).unwrap_or_default()
                         }
