@@ -6,12 +6,14 @@ skipped matrix leg hid it, and a step-level `!cancelled()` cannot rescue a
 job-level skip. Round 3 moves it into its own job and this check asserts:
 
 1. job `dependency-floors` exists once, `needs: classify`, runs on
-   ubuntu-latest, has `timeout-minutes: 15`, and its job-level `if:` is a
+   ubuntu-24.04, has `timeout-minutes: 15`, and its job-level `if:` is a
    conjunction whose terms include, exactly, `!cancelled()` and
    `needs.classify.result != 'skipped'` (no `||`);
-2. the job runs the gate script, then the scripts/ci/tests suite after a
-   setup-python step pinned to 3.12 and again after one pinned to 3.x (current
-   stable); python 3.9 is end of life and is never a leg (memory 59123ea0);
+2. the job runs the gate script after the setup-python step pinned to 3.12
+   (never on the runner's system python), then the scripts/ci/tests suite after
+   that step and again after one pinned to 3.x (current stable); both 3.x steps
+   carry `if: ${{ !cancelled() }}` so both legs report; python 3.9 is end of
+   life and is never a leg (memory 59123ea0);
 3. no other job carries a step named "Dependency floor gate (OSV)";
 4. the Security audit step in `check` (exactly one) has an `if:` conjunction
    with the exact terms `!cancelled()`, `needs.classify.outputs.cargo_skip !=
@@ -22,7 +24,7 @@ substring inside a longer term never satisfies a requirement.
 Exit 0 when all hold, 1 otherwise, 2 when the job cannot be found.
 
 Usage: python3 -I scripts/test/check_ci_floor_gate_step_8473.py [--ci-yml PATH]
-Python 3.9+, standard library only.
+Python 3.12+, standard library only.
 """
 import argparse
 import re
@@ -31,7 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 JOB_ID = "dependency-floors"
-RUNNER = "ubuntu-latest"
+RUNNER = "ubuntu-24.04"
 PY_LEGS = ("3.12", "3.x")
 GATE_NAME = "Dependency floor gate (OSV)"
 AUDIT_NAME = "Security audit"
@@ -130,7 +132,7 @@ def check(text):
     if job_field(lines, "needs") != "classify":
         problems.append("job %s must have needs: classify, found %r" % (JOB_ID, job_field(lines, "needs")))
     if job_field(lines, "runs-on") != RUNNER:
-        problems.append("job %s must run on ubuntu-latest, found %r" % (JOB_ID, job_field(lines, "runs-on")))
+        problems.append("job %s must run on ubuntu-24.04, found %r" % (JOB_ID, job_field(lines, "runs-on")))
     if job_field(lines, "timeout-minutes") != "15":
         problems.append("job %s must set timeout-minutes: 15, found %r"
                         % (JOB_ID, job_field(lines, "timeout-minutes")))
@@ -140,6 +142,9 @@ def check(text):
         problems.append("job %s does not run scripts/check-dependency-floors.py" % JOB_ID)
     setups = [(m.start(), m.group(1)) for m in
               re.finditer(r"python-version:\s*['\"]?([0-9][0-9.x]*)['\"]?\s*$", body, re.M)]
+    first_312 = [pos for pos, v in setups if v == "3.12"]
+    if gate_pos >= 0 and (not first_312 or gate_pos < first_312[0]):
+        problems.append("job %s runs the gate before the 3.12 setup-python step" % JOB_ID)
     if any(v.startswith("3.9") for _, v in setups):
         problems.append("job %s has a python 3.9 leg; 3.9 is end of life" % JOB_ID)
     suite_word = "unittest discover -s scripts/ci/tests"
@@ -153,6 +158,10 @@ def check(text):
         end = min([pos for pos, _ in setups if pos > starts[0]] + [len(body)])
         if body.find(suite_word, starts[0], end) < 0:
             problems.append("job %s does not run the suite after the %s setup-python step" % (JOB_ID, want))
+        if want == "3.x":
+            seg = body[body.rfind("\n      - ", 0, starts[0]):max(body.find(suite_word, starts[0]), 0)]
+            if seg.count("if: ${{ !cancelled() }}") < 2:
+                problems.append("job %s: the 3.x setup and suite steps need if: ${{ !cancelled() }}" % JOB_ID)
     for other, other_lines in jobs.items():
         if other != JOB_ID and any(name == GATE_NAME for name, _, _ in steps(other_lines)):
             problems.append("job %s still carries a '%s' step" % (other, GATE_NAME))

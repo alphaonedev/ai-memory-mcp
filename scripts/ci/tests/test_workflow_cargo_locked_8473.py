@@ -19,7 +19,7 @@ does not count. Python scripts that build a `["cargo", ...]` argument list
 (also across lines) are checked for "--locked" in the same list.
 
 Run: python3 -m unittest discover -s scripts/ci/tests
-Python 3.9+, standard library only (workflows are read as text).
+Python 3.12+, standard library only (workflows are read as text).
 """
 import posixpath
 import re

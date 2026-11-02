@@ -2,7 +2,7 @@
 """Tests for scripts/check-dependency-floors.py (#8473 item 5).
 
 Run: python3 -m unittest discover -s scripts/ci/tests
-Python 3.9+, standard library only. Scratch files live under .local-runs/.
+Python 3.12+, standard library only. Scratch files live under .local-runs/.
 """
 import contextlib
 import http.server
@@ -652,6 +652,44 @@ class WithdrawnAndShapes(GateBase):
         self.assertNotIn("Traceback", err)
         self.assertEqual(len(err.strip().splitlines()), 1, err)
         self.assertIn(needle, err)
+
+    def test_withdrawn_stamp_in_the_future_is_still_live(self):
+        v = vuln("V1", "1.2.0")
+        v["withdrawn"] = "2026-11-03T00:00:00Z"  # one day after TODAY
+        rc, out, _ = self.run_gate({"V1": v}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 findings, 0 accepted, 1 unaccepted", out)
+        self.assertNotIn("floor: withdrawn", out)
+
+    def test_withdrawn_stamp_today_is_withdrawn(self):
+        v = vuln("V1", "1.2.0")
+        v["withdrawn"] = TODAY + "T00:00:00Z"
+        rc, out, _ = self.run_gate({"V1": v}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assertEqual(rc, 0, out)
+
+    def test_non_object_affected_shapes_are_a_typed_refusal(self):
+        shapes = {
+            "affected entry": {"id": "V1", "aliases": [], "affected": ["oops"]},
+            "affected list": {"id": "V1", "aliases": [], "affected": "oops"},
+            "package": {"id": "V1", "aliases": [], "affected": [{"package": "alpha"}]},
+            "ranges": {"id": "V1", "aliases": [], "affected": [{"package": {"name": "alpha"},
+                                                                "ranges": "oops"}]},
+            "range entry": {"id": "V1", "aliases": [], "affected": [{"package": {"name": "alpha"},
+                                                                    "ranges": ["oops"]}]},
+        }
+        for label, v in shapes.items():
+            rc, out, err = self.run_gate({"V1": v}, {"alpha@1.0.0": ["V1"]}, "")
+            self.assertEqual(rc, 1, label)
+            self.assertNotIn("Traceback", err, label)
+            self.assertIn("unparseable OSV record V1:", err, label)
+            self.assertEqual(len(err.strip().splitlines()), 1, label)
+
+    def test_audit_aliases_that_are_a_string_are_rc_input(self):
+        audit = {"warnings": {"x": [{"advisory": {"id": "RUSTSEC-9", "aliases": "CVE-2099-1"},
+                                     "package": {"name": "beta", "version": "2.5.0"}}]}}
+        (self.dir / "audit.json").write_text(json.dumps(audit))
+        rc, _, err = self.run_gate({}, {}, "", extra=["--audit-json", str(self.dir / "audit.json")])
+        self.assert_input_error(rc, err, "aliases")
 
     def test_empty_range_event_is_rc_input(self):
         v = detail([{"introduced": "0"}, {}])

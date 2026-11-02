@@ -2,7 +2,7 @@
 """Tests for scripts/test/check_ci_floor_gate_step_8473.py (#8473 round 3).
 
 Run: python3 -m unittest discover -s scripts/ci/tests
-Python 3.9+, standard library only.
+Python 3.12+, standard library only.
 """
 import importlib.util
 import unittest
@@ -18,8 +18,9 @@ GOOD_JOB_IF = "${{ !cancelled() && needs.classify.result != 'skipped' }}"
 GOOD_AUDIT_IF = "${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}"
 
 
-def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_on="ubuntu-latest",
-             timeout="15", py=("'3.12'", "'3.x'"), suite=True, gate_in_check=False, gate=True):
+def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_on="ubuntu-24.04",
+             timeout="15", py=("'3.12'", "'3.x'"), suite=True, gate_in_check=False, gate=True,
+             gate_first=False, cancel_3x=True):
     lines = ["name: ci", "jobs:", "  dependency-floors:"]
     if needs is not None:
         lines.append("    needs: " + needs)
@@ -29,14 +30,21 @@ def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_
     if timeout is not None:
         lines.append("    timeout-minutes: " + timeout)
     lines.append("    steps:")
-    if gate:
-        lines += ["      - name: Dependency floor gate (OSV)",
+    gate_lines = ["      - name: Dependency floor gate (OSV)",
                   "        run: python3 -I scripts/check-dependency-floors.py --lock Cargo.lock"]
+    if gate and gate_first:
+        lines += gate_lines
     for ver in py or ():
-        lines += ["      - uses: actions/setup-python@abc # v5", "        with:",
-                  "          python-version: " + ver]
+        guard = ["      - if: ${{ !cancelled() }}", "        uses: actions/setup-python@abc # v5"] \
+            if ver == "'3.x'" and cancel_3x else ["      - uses: actions/setup-python@abc # v5"]
+        lines += guard + ["        with:", "          python-version: " + ver]
+        if gate and not gate_first and ver == py[0]:
+            lines += gate_lines
         if suite:
-            lines += ["      - name: Suite " + ver, "        run: |",
+            lines += ["      - name: Suite " + ver]
+            if ver == "'3.x'" and cancel_3x:
+                lines.append("        if: ${{ !cancelled() }}")
+            lines += ["        run: |",
                       "          python3 -I -m unittest discover -s scripts/ci/tests -p 'test_*.py'"]
     if suite and not py:
         lines += ["      - name: Suite", "        run: |",
@@ -81,8 +89,14 @@ class FloorGateJob(unittest.TestCase):
 
     def test_job_needs_runner_timeout_are_pinned(self):
         self.flagged(workflow(needs="select"), "needs: classify")
-        self.flagged(workflow(runs_on="self-hosted"), "ubuntu-latest")
-        self.flagged(workflow(runs_on="ubuntu-24.04"), "ubuntu-latest")
+        self.flagged(workflow(runs_on="self-hosted"), "ubuntu-24.04")
+
+    def test_gate_before_the_3_12_setup_is_flagged(self):
+        self.flagged(workflow(gate_first=True), "before the 3.12 setup-python")
+
+    def test_3_x_leg_without_cancelled_guard_is_flagged(self):
+        self.flagged(workflow(cancel_3x=False), "need if: ${{ !cancelled() }}")
+        self.flagged(workflow(runs_on="ubuntu-latest"), "ubuntu-24.04")
         self.flagged(workflow(timeout="60"), "timeout-minutes: 15")
         self.flagged(workflow(timeout=None), "timeout-minutes: 15")
 
@@ -99,8 +113,9 @@ class FloorGateJob(unittest.TestCase):
         text = workflow()
         setup = ("      - uses: actions/setup-python@abc # v5\n        with:\n"
                  "          python-version: '3.12'\n")
-        suite = text[text.index("      - name: Suite '3.12'"):text.index("      - uses: actions/setup-python@abc # v5\n        with:\n          python-version: '3.x'")]
-        swapped = text.replace(setup + suite, suite + setup)
+        start = text.index(setup)
+        stop = text.index("      - if: ${{ !cancelled() }}\n        uses: actions/setup-python@abc # v5")
+        swapped = text[:start] + text[start + len(setup):stop] + setup + text[stop:]
         self.assertNotEqual(swapped, text)
         self.flagged(swapped, "after the 3.12 setup-python")
 

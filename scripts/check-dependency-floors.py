@@ -22,7 +22,7 @@ malformed acceptance, OSV failure); 2 unusable input (lock file missing,
 empty or not a Cargo.lock; non-https --osv-url; unparsable --today; a missing
 or malformed --osv-json, --audit-json or OSV advisory shape).
 
-Python 3.9+, standard library only.
+Python 3.12+, standard library only.
 """
 import argparse
 import datetime
@@ -152,18 +152,28 @@ def affected_fixed_in(detail, name, version):
     want = vkey(version)
     if not isinstance(detail, dict):
         raise InputError("OSV advisory detail is not an object")
-    for aff in detail.get("affected", []):
-        pkg = aff.get("package", {})
+    vid = detail.get("id", "?")
+
+    def need(value, kind, what):
+        if not isinstance(value, kind):
+            raise OsvError("unparseable OSV record %s: %s is not a %s" % (
+                vid, what, "list" if kind is list else "object"))
+        return value
+
+    for aff in need(detail.get("affected", []), list, "affected"):
+        need(aff, dict, "an affected entry")
+        pkg = need(aff.get("package", {}), dict, "package")
         if pkg.get("name") not in (None, name):
             continue
         if pkg.get("ecosystem") not in (None, ECOSYSTEM):
             continue
-        if version in aff.get("versions", []):
+        if version in need(aff.get("versions", []), list, "versions"):
             return "none"
-        for rng in aff.get("ranges", []):
+        for rng in need(aff.get("ranges", []), list, "ranges"):
+            need(rng, dict, "a range entry")
             if rng.get("type") == "GIT":
                 continue
-            raw_events = rng.get("events", [])
+            raw_events = need(rng.get("events", []), list, "events")
             for ev in raw_events:
                 if not isinstance(ev, dict) or len(ev) != 1 or not isinstance(next(iter(ev.values())), str):
                     raise InputError("OSV advisory %s has a malformed range event: %r" % (
@@ -239,8 +249,11 @@ def check_batch_response(reply, expected):
     return results
 
 
-def withdrawn_stamp(detail, vid):
-    """Return the withdrawn timestamp text or None; a non-RFC-3339 value raises OsvError."""
+def withdrawn_stamp(detail, vid, today=None):
+    """Return the withdrawn timestamp text or None; a non-RFC-3339 value raises OsvError.
+
+    A stamp dated after `today` is not withdrawn yet: the record stays live.
+    """
     raw = detail.get("withdrawn")
     if raw is None:
         return None
@@ -255,10 +268,12 @@ def withdrawn_stamp(detail, vid):
     if not ok:
         raise OsvError("OSV advisory %s carries a withdrawn value that is not an RFC 3339 timestamp: %r" % (
             vid, raw))
+    if today is not None and datetime.date.fromisoformat(m.group(1)) > today:
+        return None
     return raw
 
 
-def query_findings(packages, post, get, batch_size, notes=None):
+def query_findings(packages, post, get, batch_size, notes=None, today=None):
     """Return one record {id, aliases, package, version, fixed_in} per OSV hit.
 
     Records are never merged here. A withdrawn advisory is skipped and
@@ -278,7 +293,7 @@ def query_findings(packages, post, get, batch_size, notes=None):
         detail = get(OSV_VULN_PATH + vid)
         if not isinstance(detail, dict):
             raise InputError("OSV advisory detail for %s is not an object" % vid)
-        stamp = withdrawn_stamp(detail, vid)
+        stamp = withdrawn_stamp(detail, vid, today)
         if stamp is not None:
             for n, v in hits[vid]:
                 if notes is not None:
@@ -342,7 +357,10 @@ def merge_audit(findings, audit):
             continue
         if not isinstance(adv, dict) or not isinstance(adv.get("id"), str) or not adv["id"]:
             raise InputError("cargo audit json has an advisory without an id")
-        aliases = sorted(a for a in adv.get("aliases", []) if isinstance(a, str))
+        raw_aliases = adv.get("aliases", [])
+        if not isinstance(raw_aliases, list):
+            raise InputError("cargo audit advisory %s has aliases that are not a list" % adv["id"])
+        aliases = sorted(a for a in raw_aliases if isinstance(a, str))
         patched = item.get("versions", {}).get("patched", [])
         rec = {"id": adv["id"], "aliases": aliases, "package": pkg.get("name", "?"),
                "version": pkg.get("version", "?"),
@@ -588,7 +606,7 @@ def main(argv=None):
     notes = []
     try:
         post, get, record = build_io(args)
-        findings = query_findings(sorted(set(packages)), post, get, args.batch_size, notes)
+        findings = query_findings(sorted(set(packages)), post, get, args.batch_size, notes, today)
     except InputError as exc:
         print("dependency-floors: input problem: %s" % exc, file=sys.stderr)
         return RC_INPUT
