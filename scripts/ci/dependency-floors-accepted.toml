@@ -9,13 +9,15 @@
 # value forms are "string", a bare positive number, or ["a", "b"] string lists.
 # A trailing comment after a value is not supported.
 #   id             advisory id (RUSTSEC-... or GHSA-...), string, required
-#   aliases        other ids of the same advisory, list of strings, optional
+#   aliases        other ids of the same advisory, list of strings, optional, display only
+#                  (matching uses `id` alone)
 #   package        crate name, string, required (an entry only covers its crate)
 #   rationale      why the finding is accepted, non-empty string, required
 #   review_by      ISO date (YYYY-MM-DD); the gate FAILS once this date is past
 #   tracking_issue GitHub issue number that owns the fix or the review
 #
-# Rules: a finding whose id or alias matches no entry fails; an expired or
+# Rules: a finding passes only when an entry `id` equals the finding id or one of
+# the finding aliases; an expired, duplicated (same id and package) or
 # malformed entry fails; an entry whose crate version is no longer affected
 # only warns (remove it in the PR that lands the fix).
 
@@ -93,14 +95,21 @@ tracking_issue = 8473
 [[accepted]]
 id = "RUSTSEC-2024-0449"
 package = "unsafe-libyaml"
-rationale = "unmaintained, no fixed version exists; reached through serde_yaml_ng, replacement tracked in the issue"
+rationale = "unmaintained, no fixed version exists; reached through serde_yaml_ng, replacement tracked in 8476"
 review_by = "2027-02-01"
-tracking_issue = 8473
+tracking_issue = 8476
 
 [[accepted]]
 id = "RUSTSEC-2023-0071"
 aliases = ["CVE-2023-49092", "GHSA-4grx-2x9w-596c", "GHSA-c38w-74pg-36hr"]
 package = "rsa"
-rationale = "no fix exists; sqlx-mysql is pulled by sqlx-macros-core under sal-postgres only, as recorded in .cargo/audit.toml"
+rationale = "no fix exists; sqlx-mysql is pulled by sqlx-macros-core under sal-postgres only, as recorded in .cargo/audit.toml; removal path tracked in 8477"
 review_by = "2027-02-01"
-tracking_issue = 8473
+tracking_issue = 8477
+
+[[accepted]]
+id = "RUSTSEC-2024-0436"
+package = "paste"
+rationale = "vendor/paste 1.0.15 is unmaintained, no fixed version exists; move to a maintained fork tracked in 8478"
+review_by = "2027-02-01"
+tracking_issue = 8478
