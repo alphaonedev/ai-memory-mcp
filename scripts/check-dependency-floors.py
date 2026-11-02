@@ -242,7 +242,7 @@ def check_batch_response(reply, expected):
 def withdrawn_stamp(detail, vid):
     """Return the withdrawn timestamp text or None; a non-RFC-3339 value raises OsvError."""
     raw = detail.get("withdrawn")
-    if raw is None or raw is False:
+    if raw is None:
         return None
     m = RFC3339_RE.fullmatch(raw) if isinstance(raw, str) else None
     ok = False

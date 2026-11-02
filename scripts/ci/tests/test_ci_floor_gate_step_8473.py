@@ -61,7 +61,7 @@ class FloorGateJob(unittest.TestCase):
 
     def test_missing_job_is_rc_2(self):
         self.assertIsNone(floor_step.check("jobs:\n  a:\n    steps:\n      - name: other\n")[0])
-        self.assertEqual(floor_step.main(["--ci-yml", str(REPO / "README.md")]), 2)
+        self.assertEqual(floor_step.main(["--ci-yml", __file__]), 2)
 
     def test_job_without_cancelled_is_flagged(self):
         self.flagged(workflow(job_if="${{ needs.classify.result != 'skipped' }}"), "!cancelled()")
@@ -74,7 +74,7 @@ class FloorGateJob(unittest.TestCase):
 
     def test_disjunction_is_flagged(self):
         self.flagged(workflow(job_if="${{ !cancelled() && needs.classify.result != 'skipped' || true }}"),
-                     "||")
+                     "contains ||")
 
     def test_job_needs_runner_timeout_are_pinned(self):
         self.flagged(workflow(needs="select"), "needs: classify")

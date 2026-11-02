@@ -676,6 +676,49 @@ class WorkspaceMembers(GateBase):
         self.assertIn("floor: skipped ai-memory-fuzz 0.0.0 source=path queried=no", out)
 
 
+class SurvivorsRound3(GateBase):
+    """One test per mutant the first round-3 mutant run left alive."""
+
+    def test_an_acceptance_alias_never_covers_a_record_with_that_id(self):
+        # the entry X lists Y as an alias; a record whose own id is Y and whose aliases
+        # do not name X is a different advisory and stays unaccepted
+        v = vuln("GHSA-yyyy-yyyy-yyyy", "1.2.0")
+        rc, out, _ = self.run_gate({"GHSA-yyyy-yyyy-yyyy": v}, {"alpha@1.0.0": ["GHSA-yyyy-yyyy-yyyy"]},
+                                   accepted("RUSTSEC-2026-9", aliases=["GHSA-yyyy-yyyy-yyyy"]))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("accepted=no", out)
+
+    def test_withdrawn_false_is_not_a_timestamp(self):
+        d = vuln("V1", "1.2.0")
+        d["withdrawn"] = False
+        with self.assertRaises(floors.OsvError):
+            floors.withdrawn_stamp(d, "V1")
+
+    def test_malformed_aliases_are_rc_input(self):
+        d = vuln("V1", "1.2.0")
+        d["aliases"] = "CVE-1"
+        rc, _, err = self.run_gate({"V1": d}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("malformed aliases", err)
+
+    def test_range_events_are_ordered_before_the_walk(self):
+        d = detail([{"fixed": "2.0.0"}, {"introduced": "0"}])
+        self.assertEqual(floors.affected_fixed_in(d, "alpha", "1.0.0"), "2.0.0")
+
+    def test_build_metadata_is_ignored_in_the_order(self):
+        self.assertEqual(floors.vkey("1.2.0+build.5"), floors.vkey("1.2.0"))
+        d = detail([{"introduced": "0"}, {"fixed": "1.2.0"}])
+        self.assertIsNone(floors.affected_fixed_in(d, "alpha", "1.2.0+build.5"))
+
+    def test_detail_that_is_not_an_object_is_an_input_error_at_the_walk(self):
+        with self.assertRaises(floors.InputError):
+            floors.affected_fixed_in([], "alpha", "1.0.0")
+
+    def test_audit_json_that_is_not_an_object_is_an_input_error(self):
+        with self.assertRaises(floors.InputError):
+            floors.merge_audit([], [])
+
+
 class FuzzLockMatchesRootLock(unittest.TestCase):
     """The fuzz workspace has its own Cargo.lock (#8473 round 3, R3-3).
 
