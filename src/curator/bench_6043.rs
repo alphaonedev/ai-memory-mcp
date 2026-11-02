@@ -5,8 +5,11 @@
 //!
 //! Runs the EXISTING [`ConsolidationPass`] (unchanged) over a seeded COPY
 //! store and reports how far the store shrinks against retrieval recall, LLM
-//! calls and wall time, then proves the shrink is reversible by running the
-//! rollback path and checking every original row comes back byte-identical.
+//! calls and wall time, then runs the rollback path and checks that every
+//! original row's id, namespace, title, content, metadata and tags come back
+//! identical; stored vectors are not restored (#8465) and must be re-embedded.
+//! The measurement holds the lineage-DAG flags OFF (sources are hard-deleted);
+//! see [`run_flow`].
 //!
 //! Two arms share one flow ([`run_flow`]):
 //!
@@ -19,7 +22,8 @@
 //!   LLM named by the `AI_MEMORY_LLM_*` environment variables
 //!   ([`crate::llm::OllamaClient::from_env`]), `cosine_threshold` swept over
 //!   0.70 / 0.75 / 0.85, QA accuracy before and after, a JSON report under
-//!   `.local-runs/`. Skips cleanly when no LLM is configured.
+//!   `.local-runs/`. Skips only when `AI_MEMORY_LLM_BACKEND` is unset; once it
+//!   is set, every LLM error fails the test.
 //!
 //! The pass is `pub(crate)`, so the benchmark lives in the crate (a
 //! `tests/` binary cannot name it without widening production visibility).
@@ -39,7 +43,7 @@ use super::compaction::ConsolidationPass;
 use crate::autonomy::{AutonomyLlm, RollbackEntry, reverse_rollback_entry_store};
 use crate::embeddings::{Embedder, embedding_space_fingerprint};
 use crate::models::{Memory, Tier};
-use crate::store::{CallerContext, Filter, MemoryStore};
+use crate::store::{CallerContext, Filter, MemoryStore, StoreError};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,19 +84,29 @@ const SEED_TIMESTAMP: &str = "2026-01-01T00:00:00+00:00";
 /// Agent id the benchmark acts as.
 const BENCH_AGENT: &str = "bench-6043";
 const COL_ROWS_BEFORE: &str = "rows_before";
+const COL_LLM_CALLS: &str = "pass_llm_calls";
+const COL_SHRINK: &str = "shrink_pct";
 const COL_ROWS_AFTER: &str = "rows_after";
 const COL_ROLLBACK_IDENTICAL: &str = "rollback_identical";
 const FIELD_EMBEDDING_SPACE: &str = "embedding_space";
 const SQLITE_OPEN_MSG: &str = "open the sqlite benchmark store";
-/// Recall cut-offs reported.
-/// Current rollback behaviour for vectors (#8465).
+/// Current rollback behaviour for vectors (#8465): the row comes back, the
+/// stored embedding does not.
 const EMBEDDING_RESTORED_TODAY: bool = false;
+/// Shallow recall cut-off reported.
 const RECALL_SHALLOW_K: usize = 5;
+/// Deep recall cut-off reported.
 const RECALL_DEEP_K: usize = 10;
+/// Env var that opts the operator arm in (existing row in the env table).
+const LLM_BACKEND_ENV: &str = "AI_MEMORY_LLM_BACKEND";
 /// The pass's default cosine gate (the R2 headline run).
 const DEFAULT_THRESHOLD: f32 = 0.75;
 /// R3 sweep, the analogue of the paper's `min_cluster_size` sweep.
 const THRESHOLD_SWEEP: [f32; 3] = [0.70, 0.75, 0.85];
+/// `shrink_pct` text when all six clusters merge (41 -> 26 rows).
+const SHRINK_ALL_MERGED: &str = "36.59";
+/// `shrink_pct` text when the loose cluster stays apart (41 -> 27 rows).
+const SHRINK_LOOSE_KEPT: &str = "34.15";
 const CONSONANTS: &[u8] = b"bcdfghjklmnprstvz";
 const VOWELS: &[u8] = b"aeiou";
 
@@ -320,6 +334,10 @@ impl AutonomyLlm for CountedLlm<'_> {
 // Seed, snapshot, compare
 // ---------------------------------------------------------------------------
 
+/// Admin context, a reviewed C8 exception (for-admin-bypass.txt): the benchmark
+/// must read the consolidator-owned summaries and `_curator/rollback` rows,
+/// which a plain agent principal cannot see (tried first: `for_agent` left
+/// `rows_after` at 20 instead of 26, and 0 rows before for unstamped seeds).
 fn bench_ctx() -> CallerContext {
     CallerContext::for_admin(BENCH_AGENT)
 }
@@ -363,16 +381,20 @@ struct RowImage {
     embedding_space: Option<String>,
 }
 
-async fn image_of(store: &dyn MemoryStore, id: &str) -> Option<RowImage> {
+/// `Ok(None)` only when the row does not exist; any other store error
+/// propagates instead of reading as an empty image.
+async fn image_of(store: &dyn MemoryStore, id: &str) -> Result<Option<RowImage>> {
     let ctx = bench_ctx();
-    let m = store.get(&ctx, id).await.ok()?;
+    let m = match store.get(&ctx, id).await {
+        Ok(m) => m,
+        Err(StoreError::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     let (vector, embedding_space) = store
         .get_embedding_with_space(&ctx, id)
-        .await
-        .ok()
-        .flatten()
+        .await?
         .unwrap_or_default();
-    Some(RowImage {
+    Ok(Some(RowImage {
         id: m.id,
         namespace: m.namespace,
         title: m.title,
@@ -381,15 +403,15 @@ async fn image_of(store: &dyn MemoryStore, id: &str) -> Option<RowImage> {
         tags: m.tags,
         embedding_bits: vector.iter().map(|x| x.to_bits()).collect(),
         embedding_space,
-    })
+    }))
 }
 
-async fn snapshot(store: &dyn MemoryStore, corpus: &Corpus) -> Vec<Option<RowImage>> {
+async fn snapshot(store: &dyn MemoryStore, corpus: &Corpus) -> Result<Vec<Option<RowImage>>> {
     let mut out = Vec::with_capacity(corpus.rows.len());
     for row in &corpus.rows {
-        out.push(image_of(store, &row.id).await);
+        out.push(image_of(store, &row.id).await?);
     }
-    out
+    Ok(out)
 }
 
 /// Why two row images differ.
@@ -403,7 +425,8 @@ impl From<String> for Mismatch {
 }
 
 /// `Ok` only when every `before` row is present in `after` with an identical
-/// id, namespace, title, content, metadata, tags and embedding (bit for bit).
+/// id, namespace, title, content, metadata and tags; with `with_embedding`
+/// the stored vector (bit for bit) and its space must match too.
 fn compare_images(
     before: &[Option<RowImage>],
     after: &[Option<RowImage>],
@@ -465,6 +488,10 @@ impl Ratio {
         } else {
             self.hits as f64 / self.total as f64
         }
+    }
+    /// Every answering row was found (and there was at least one).
+    fn is_full(self) -> bool {
+        self.total > 0 && self.hits == self.total
     }
     fn at_least(self, other: Self) -> bool {
         self.hits * other.total >= other.hits * self.total
@@ -591,6 +618,8 @@ struct BenchResult {
     threshold: f32,
     rows_before: usize,
     rows_after: usize,
+    /// Summarise calls the consolidation pass made (QA calls of the operator
+    /// arm are not counted here).
     llm_calls: usize,
     wall_ms: u128,
     rollback_entries: usize,
@@ -618,8 +647,8 @@ impl BenchResult {
             "threshold",
             COL_ROWS_BEFORE,
             COL_ROWS_AFTER,
-            "shrink_pct",
-            "llm_calls",
+            COL_SHRINK,
+            COL_LLM_CALLS,
             "wall_ms",
             "rollback_entries",
             "r5_before",
@@ -697,13 +726,21 @@ async fn run_flow(
     threshold: f32,
     options: FlowOptions<'_>,
 ) -> Result<BenchResult> {
+    // The measured mode is lineage OFF (sources hard-deleted). With tombstoning
+    // on, rollback merges over the tombstone and the vector survives, which
+    // would hide #8465. Callers hold `no_lineage_dag_guard`; fail loudly if not.
+    assert!(
+        !crate::config::consolidate_tombstone_sources_enabled(),
+        "bench_6043 must run with consolidate_tombstone_sources off (hold \
+         no_lineage_dag_guard): tombstoning keeps the vectors and hides #8465"
+    );
     let ns = format!(
         "bench6043-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let corpus = build_corpus(&ns);
     seed_store(store, &corpus).await?;
-    let before = snapshot(store, &corpus).await;
+    let before = snapshot(store, &corpus).await?;
     let rows_before = count_rows(store, &ns).await?;
     let no_redirect = HashMap::new();
     let r5_before = recall_at(store, &corpus, &no_redirect, RECALL_SHALLOW_K).await?;
@@ -764,7 +801,7 @@ async fn run_flow(
         }
     }
     let rows_after_rollback = count_rows(store, &ns).await?;
-    let after = snapshot(store, &corpus).await;
+    let after = snapshot(store, &corpus).await?;
     Ok(BenchResult {
         backend,
         threshold,
@@ -793,14 +830,56 @@ async fn run_stub(
     Ok(result)
 }
 
-/// Assertions every deterministic run must satisfy at `expected_merges`
-/// merged clusters of the known corpus.
-fn assert_result(r: &BenchResult, expected_merges: usize, expected_rows_after: usize) {
+/// What one threshold's deterministic run must produce, pinned exactly.
+#[derive(Clone, Copy)]
+struct Expect {
+    merges: usize,
+    rows_after: usize,
+    shrink_pct: &'static str,
+    /// Recall of the shrunken store before summaries get a vector.
+    unembedded: Ratio,
+}
+
+/// Index of the loose cluster (the last one); the 0.85 gate keeps it apart.
+const LOOSE: usize = CLUSTER_SIZES.len() - 1;
+const ALL_ROWS_AFTER: usize = CLUSTER_SIZES.len() + DISTINCT_ROWS;
+const LOOSE_KEPT_ROWS_AFTER: usize = LOOSE + DISTINCT_ROWS + CLUSTER_SIZES[LOOSE];
+/// Unembedded recall hits/total measured on the known corpus.
+const UNEMBEDDED_ALL_MERGED: Ratio = Ratio { hits: 8, total: 14 };
+const UNEMBEDDED_LOOSE_KEPT: Ratio = Ratio {
+    hits: 10,
+    total: 15,
+};
+
+const EXPECT_ALL_MERGED: Expect = Expect {
+    merges: CLUSTER_SIZES.len(),
+    rows_after: ALL_ROWS_AFTER,
+    shrink_pct: SHRINK_ALL_MERGED,
+    unembedded: UNEMBEDDED_ALL_MERGED,
+};
+const EXPECT_LOOSE_KEPT: Expect = Expect {
+    merges: LOOSE,
+    rows_after: LOOSE_KEPT_ROWS_AFTER,
+    shrink_pct: SHRINK_LOOSE_KEPT,
+    unembedded: UNEMBEDDED_LOOSE_KEPT,
+};
+/// Expected outcome per `THRESHOLD_SWEEP` entry; the array length is tied to
+/// the sweep, so the two tables cannot drift apart.
+const SWEEP_EXPECTED: [Expect; THRESHOLD_SWEEP.len()] =
+    [EXPECT_ALL_MERGED, EXPECT_ALL_MERGED, EXPECT_LOOSE_KEPT];
+
+/// Assertions every deterministic run must satisfy.
+fn assert_result(r: &BenchResult, expect: &Expect) {
     let total_rows: usize = CLUSTER_SIZES.iter().sum::<usize>() + DISTINCT_ROWS;
     assert_eq!(r.rows_before, total_rows, "{}", r.result_line());
-    assert_eq!(r.rows_after, expected_rows_after, "{}", r.result_line());
-    assert_eq!(r.llm_calls, expected_merges, "{}", r.result_line());
-    assert_eq!(r.rollback_entries, expected_merges, "{}", r.result_line());
+    assert_eq!(r.rows_after, expect.rows_after, "{}", r.result_line());
+    assert_eq!(r.llm_calls, expect.merges, "{}", r.result_line());
+    assert_eq!(r.rollback_entries, expect.merges, "{}", r.result_line());
+    assert!(
+        r.wall_ms > 0,
+        "the stopwatch must have run: {}",
+        r.result_line()
+    );
     assert_eq!(
         r.rows_after_rollback,
         total_rows,
@@ -810,24 +889,38 @@ fn assert_result(r: &BenchResult, expected_merges: usize, expected_rows_after: u
     assert_eq!(
         r.rollback_identical,
         Ok(()),
-        "rollback must restore every original byte-identically: {}",
+        "rollback must restore every original row's id, namespace, title, content, \
+         metadata and tags (stored vectors are not restored, #8465): {}",
         r.result_line()
     );
     assert!(
-        r.recall5.1.at_least(r.recall5.0) && r.recall10.1.at_least(r.recall10.0),
-        "recall with embedded summaries must not fall below the pre-merge recall: {}",
+        r.recall5.0.is_full() && r.recall5.1.is_full(),
+        "recall@5 is 1.0 before and after: {}",
         r.result_line()
     );
     assert!(
-        r.recall5.0.at_least(r.recall5.2),
-        "unembedded summaries cannot beat the pre-merge recall: {}",
+        r.recall10.0.is_full() && r.recall10.1.is_full(),
+        "recall@10 is 1.0 before and after: {}",
+        r.result_line()
+    );
+    assert_eq!(
+        r.recall5.2,
+        expect.unembedded,
+        "unembedded recall@5: {}",
+        r.result_line()
+    );
+    assert_eq!(
+        r.recall10.2,
+        expect.unembedded,
+        "unembedded recall@10: {}",
         r.result_line()
     );
     let parsed = parse_result_line(&r.result_line()).expect("result line parses");
     assert_eq!(parsed.keys().count(), 17, "{}", r.result_line());
     assert_eq!(parsed[COL_ROWS_BEFORE], total_rows.to_string());
-    assert_eq!(parsed[COL_ROWS_AFTER], expected_rows_after.to_string());
-    assert_eq!(parsed["llm_calls"], expected_merges.to_string());
+    assert_eq!(parsed[COL_ROWS_AFTER], expect.rows_after.to_string());
+    assert_eq!(parsed[COL_SHRINK], expect.shrink_pct);
+    assert_eq!(parsed[COL_LLM_CALLS], expect.merges.to_string());
     assert_eq!(parsed[COL_ROLLBACK_IDENTICAL], "true");
     // #8465: rollback restores rows, not vectors. This flips when that is
     // fixed; then fold embeddings into `rollback_identical`.
@@ -849,6 +942,7 @@ fn sqlite_store() -> Result<(crate::store::sqlite::SqliteStore, tempfile::TempDi
 
 #[tokio::test]
 async fn bench_6043_sqlite_default_threshold_shrinks_and_rolls_back() {
+    let _dag = crate::test_support::no_lineage_dag_guard();
     let (store, _dir) = sqlite_store().expect(SQLITE_OPEN_MSG);
     let r = run_stub(
         &store,
@@ -863,14 +957,15 @@ async fn bench_6043_sqlite_default_threshold_shrinks_and_rolls_back() {
     .expect("flow");
     println!("{}", r.result_line());
     // 6 clusters merge: 41 rows -> 6 summaries + 20 distinct = 26 rows.
-    assert_result(&r, CLUSTER_SIZES.len(), CLUSTER_SIZES.len() + DISTINCT_ROWS);
+    assert_result(&r, &EXPECT_ALL_MERGED);
 }
 
 #[tokio::test]
 async fn bench_6043_sqlite_threshold_sweep_matches_known_clusters() {
+    let _dag = crate::test_support::no_lineage_dag_guard();
     // The loose cluster's two members sit at cosine ~0.80: merged at 0.70 and
     // 0.75, kept apart at 0.85.
-    for (threshold, merges) in [(0.70_f32, 6usize), (0.75, 6), (0.85, 5)] {
+    for (threshold, expect) in THRESHOLD_SWEEP.into_iter().zip(SWEEP_EXPECTED) {
         let (store, _dir) = sqlite_store().expect(SQLITE_OPEN_MSG);
         let r = run_stub(
             &store,
@@ -884,39 +979,41 @@ async fn bench_6043_sqlite_threshold_sweep_matches_known_clusters() {
         .await
         .expect("flow");
         println!("{}", r.result_line());
-        let loose_rows = if merges == 6 { 0 } else { CLUSTER_SIZES[5] };
-        assert_result(&r, merges, merges + DISTINCT_ROWS + loose_rows);
+        assert_result(&r, &expect);
     }
-    assert_eq!(THRESHOLD_SWEEP.len(), 3);
 }
 
+/// Runs only in the `sal-postgres` build. Off CI an unset URL soft-skips like
+/// the other Postgres unit tests; on CI a missing URL fails the test. The cell
+/// leaves its seeded and rollback rows behind, so run it on a minted clone.
+#[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bench_6043_postgres_default_threshold_shrinks_and_rolls_back() {
+    let _dag = crate::test_support::no_lineage_dag_guard();
     let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "AI_MEMORY_TEST_POSTGRES_URL must be set on CI"
+        );
         eprintln!("skip bench_6043_postgres: AI_MEMORY_TEST_POSTGRES_URL unset");
         return;
     };
-    #[cfg(feature = "sal-postgres")]
-    {
-        let store = crate::store::postgres::PostgresStore::connect(&url)
-            .await
-            .expect("postgres connect");
-        let r = run_stub(
-            &store,
-            "postgres",
-            DEFAULT_THRESHOLD,
-            FlowOptions {
-                rollback: true,
-                qa: None,
-            },
-        )
+    let store = crate::store::postgres::PostgresStore::connect(&url)
         .await
-        .expect("flow");
-        println!("{}", r.result_line());
-        assert_result(&r, CLUSTER_SIZES.len(), CLUSTER_SIZES.len() + DISTINCT_ROWS);
-    }
-    #[cfg(not(feature = "sal-postgres"))]
-    let _ = url;
+        .expect("postgres connect");
+    let r = run_stub(
+        &store,
+        "postgres",
+        DEFAULT_THRESHOLD,
+        FlowOptions {
+            rollback: true,
+            qa: None,
+        },
+    )
+    .await
+    .expect("flow");
+    println!("{}", r.result_line());
+    assert_result(&r, &EXPECT_ALL_MERGED);
 }
 
 #[test]
@@ -943,6 +1040,7 @@ fn bench_6043_corpus_is_deterministic() {
 
 #[tokio::test]
 async fn bench_6043_pass_with_rollback_disabled_fails_the_identity_check() {
+    let _dag = crate::test_support::no_lineage_dag_guard();
     let (store, _dir) = sqlite_store().expect(SQLITE_OPEN_MSG);
     let r = run_stub(
         &store,
@@ -979,7 +1077,9 @@ fn image(id: &str) -> RowImage {
 fn bench_6043_compare_images_detects_every_field() {
     let base = vec![Some(image("x"))];
     assert_eq!(compare_images(&base, &base, true), Ok(()));
-    let tamper: [(&str, fn(&mut RowImage)); 6] = [
+    let tamper: [(&str, fn(&mut RowImage)); 8] = [
+        ("id", |i| i.id.push('x')),
+        ("namespace", |i| i.namespace.push('x')),
         ("content", |i| i.content.push('!')),
         ("metadata", |i| i.metadata = "{\"k\":1}".to_string()),
         ("embedding", |i| i.embedding_bits[2] ^= 1),
@@ -1071,13 +1171,15 @@ fn ratio_json(r: Ratio) -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "operator arm: needs a real LLM named by AI_MEMORY_LLM_* and writes .local-runs/"]
 async fn bench_6043_real_llm_threshold_sweep() {
-    let client = match crate::llm::OllamaClient::from_env() {
-        Ok(Some(c)) => c,
-        Ok(None) | Err(_) => {
-            eprintln!("skip bench_6043_real_llm_threshold_sweep: no LLM configured");
-            return;
-        }
-    };
+    let _dag = crate::test_support::no_lineage_dag_guard();
+    if std::env::var_os(LLM_BACKEND_ENV).is_none() {
+        eprintln!("skip bench_6043_real_llm_threshold_sweep: {LLM_BACKEND_ENV} unset");
+        return;
+    }
+    // Opted in: any failure from here on fails the test (no silent skip).
+    let client = crate::llm::OllamaClient::from_env()
+        .expect("the configured LLM must be reachable")
+        .expect("the configured LLM backend must produce a client");
     let mut runs = Vec::new();
     for threshold in THRESHOLD_SWEEP {
         let (store, _dir) = sqlite_store().expect(SQLITE_OPEN_MSG);
@@ -1108,7 +1210,7 @@ async fn bench_6043_real_llm_threshold_sweep() {
             "recall_at_5": { "before": ratio_json(r.recall5.0), "after": ratio_json(r.recall5.1) },
             "recall_at_10": { "before": ratio_json(r.recall10.0), "after": ratio_json(r.recall10.1) },
             "qa_accuracy": { "before": ratio_json(qa_before), "after": ratio_json(qa_after) },
-            "llm_calls": r.llm_calls,
+            (COL_LLM_CALLS): r.llm_calls,
             "wall_ms": u64::try_from(r.wall_ms).unwrap_or(u64::MAX),
             "rollback_entries": r.rollback_entries,
             "rollback_identical": r.rollback_identical.is_ok(),
