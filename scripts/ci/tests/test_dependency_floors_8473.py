@@ -492,5 +492,188 @@ class Transport(unittest.TestCase):
         self.assertEqual(new.full_url, "https://api.osv.dev/v1/vulns/Y")
 
 
+class EvaluateOnOwnId(GateBase):
+    """R3-1: every OSV record is evaluated on its own id; aliases never union (#8473 round 3)."""
+
+    CVE_A, CVE_B = "CVE-2026-100001", "CVE-2099-0001"
+
+    def chain(self):
+        vulns = {
+            "RUSTSEC-2026-0429": vuln("RUSTSEC-2026-0429", "1.2.0", ["GHSA-q7v9-x93c-xqv3", self.CVE_A]),
+            "GHSA-aaaa-aaaa-aaaa": vuln("GHSA-aaaa-aaaa-aaaa", "1.2.0", [self.CVE_A, self.CVE_B]),
+            "GHSA-bbbb-bbbb-bbbb": vuln("GHSA-bbbb-bbbb-bbbb", "1.2.0", [self.CVE_B]),
+        }
+        return vulns, {"alpha@1.0.0": sorted(vulns)}
+
+    def test_chain_of_shared_cves_is_not_accepted(self):
+        vulns, hits = self.chain()
+        rc, out, _ = self.run_gate(vulns, hits, accepted("RUSTSEC-2026-0429"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("floor: GHSA-aaaa-aaaa-aaaa alpha 1.0.0 fixed_in=1.2.0", out)
+        self.assertIn("floor: GHSA-bbbb-bbbb-bbbb alpha 1.0.0 fixed_in=1.2.0", out)
+        for line in out.splitlines():
+            if line.startswith("floor: GHSA-aaaa") or line.startswith("floor: GHSA-bbbb"):
+                self.assertTrue(line.endswith("accepted=no"), line)
+        self.assertIn("2 unaccepted", out)
+
+    def test_one_hop_record_sharing_only_a_cve_is_not_accepted(self):
+        vulns, hits = self.chain()
+        del vulns["GHSA-bbbb-bbbb-bbbb"]
+        hits = {"alpha@1.0.0": sorted(vulns)}
+        rc, out, _ = self.run_gate(vulns, hits, accepted("RUSTSEC-2026-0429"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 unaccepted", out)
+
+    def test_directly_linked_records_fold_but_keep_their_own_lines(self):
+        vulns = {"RUSTSEC-2026-0429": vuln("RUSTSEC-2026-0429", "1.2.0", ["GHSA-q7v9-x93c-xqv3"]),
+                 "GHSA-q7v9-x93c-xqv3": vuln("GHSA-q7v9-x93c-xqv3", "1.3.0", ["RUSTSEC-2026-0429"])}
+        rc, out, _ = self.run_gate(vulns, {"alpha@1.0.0": sorted(vulns)}, accepted("RUSTSEC-2026-0429"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 findings, 1 accepted, 0 unaccepted", out)
+        self.assertIn("floor: RUSTSEC-2026-0429 alpha 1.0.0 fixed_in=1.2.0", out)
+        self.assertIn("floor: GHSA-q7v9-x93c-xqv3 alpha 1.0.0 fixed_in=1.3.0", out)
+        self.assertIn("folded_into=RUSTSEC-2026-0429", out)
+
+    def test_one_way_link_leaves_the_folded_record_unaccepted(self):
+        vulns = {"RUSTSEC-2026-1": vuln("RUSTSEC-2026-1", "1.2.0", ["GHSA-xxxx-xxxx-xxxx"]),
+                 "GHSA-xxxx-xxxx-xxxx": vuln("GHSA-xxxx-xxxx-xxxx", "1.2.0", [])}
+        rc, out, _ = self.run_gate(vulns, {"alpha@1.0.0": sorted(vulns)}, accepted("RUSTSEC-2026-1"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 findings, 0 accepted, 1 unaccepted", out)
+        self.assertIn("floor: GHSA-xxxx-xxxx-xxxx alpha 1.0.0 fixed_in=1.2.0 aliases=- accepted=no", out)
+
+    def test_merge_audit_does_not_fold_through_a_shared_cve(self):
+        found = [{"id": "RUSTSEC-2026-0429", "aliases": [self.CVE_A], "package": "alpha",
+                  "version": "1.0.0", "fixed_in": "1.2.0"}]
+        audit = {"warnings": {"x": [{"advisory": {"id": "GHSA-aaaa-aaaa-aaaa", "aliases": [self.CVE_A]},
+                                     "package": {"name": "alpha", "version": "1.0.0"},
+                                     "versions": {"patched": []}}]}}
+        merged = floors.merge_audit(found, audit)
+        self.assertEqual([f["id"] for f in merged], ["RUSTSEC-2026-0429", "GHSA-aaaa-aaaa-aaaa"])
+        self.assertEqual(merged[0]["aliases"], [self.CVE_A])
+
+    def test_merge_audit_drops_a_directly_linked_duplicate_without_growing_aliases(self):
+        found = [{"id": "RUSTSEC-2026-0429", "aliases": ["GHSA-q7v9-x93c-xqv3"], "package": "alpha",
+                  "version": "1.0.0", "fixed_in": "1.2.0"}]
+        audit = {"warnings": {"x": [{"advisory": {"id": "GHSA-q7v9-x93c-xqv3", "aliases": [self.CVE_A]},
+                                     "package": {"name": "alpha", "version": "1.0.0"},
+                                     "versions": {"patched": []}}]}}
+        merged = floors.merge_audit(found, audit)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["aliases"], ["GHSA-q7v9-x93c-xqv3"])
+
+
+class WithdrawnAndShapes(GateBase):
+    """Withdrawn lines, RFC 3339 check and one named rc-2 line per odd input shape."""
+
+    def test_withdrawn_record_prints_its_own_line(self):
+        v = vuln("V1", "1.2.0")
+        v["withdrawn"] = "2026-01-01T00:00:00Z"
+        rc, out, _ = self.run_gate({"V1": v}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("floor: withdrawn V1 alpha 1.0.0 withdrawn=2026-01-01T00:00:00Z", out)
+
+    def test_withdrawn_that_is_not_rfc3339_fails_closed(self):
+        for bad in ("yes", "2026-01-01", "2026-13-01T00:00:00Z", "2026-01-01T25:00:00Z", 1, ["x"], "2026-01-01 00:00:00"):
+            v = vuln("V1", "1.2.0")
+            v["withdrawn"] = bad
+            rc, out, err = self.run_gate({"V1": v}, {"alpha@1.0.0": ["V1"]}, "")
+            self.assertEqual(rc, 1, repr(bad))
+            self.assertIn("RFC 3339", err)
+            self.assertIn("V1", err)
+
+    def test_withdrawn_with_offset_and_fraction_is_accepted(self):
+        v = vuln("V1", "1.2.0")
+        v["withdrawn"] = "2026-01-01T00:00:00.123+02:00"
+        rc, out, _ = self.run_gate({"V1": v}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assertEqual(rc, 0, out)
+
+    def assert_input_error(self, rc, err, needle):
+        self.assertEqual(rc, 2, err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+        self.assertIn(needle, err)
+
+    def test_empty_range_event_is_rc_input(self):
+        v = detail([{"introduced": "0"}, {}])
+        v["id"] = "V1"
+        rc, _, err = self.run_gate({"V1": v}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assert_input_error(rc, err, "malformed range event")
+
+    def test_detail_that_is_a_list_is_rc_input(self):
+        rc, _, err = self.run_gate({"V1": []}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assert_input_error(rc, err, "V1")
+
+    def test_detail_that_is_a_string_is_rc_input(self):
+        rc, _, err = self.run_gate({"V1": "oops"}, {"alpha@1.0.0": ["V1"]}, "")
+        self.assert_input_error(rc, err, "not an object")
+
+    def test_missing_osv_json_is_rc_input(self):
+        (self.dir / "acc.toml").write_text("")
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--lock", str(self.dir / "Cargo.lock"), "--accepted", str(self.dir / "acc.toml"),
+                "--offline", "--osv-json", str(self.dir / "absent.json"), "--today", TODAY]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = floors.main(argv)
+        self.assert_input_error(rc, err.getvalue(), "absent.json")
+
+    def test_unparsable_today_is_rc_input(self):
+        rc, _, err = self.run_gate({}, {}, "", extra=["--today", "tomorrow"])
+        self.assert_input_error(rc, err, "--today")
+
+    def test_audit_advisory_without_id_is_rc_input(self):
+        audit = {"warnings": {"x": [{"advisory": {"aliases": []},
+                                     "package": {"name": "beta", "version": "2.5.0"}}]}}
+        (self.dir / "audit.json").write_text(json.dumps(audit))
+        rc, _, err = self.run_gate({}, {}, "", extra=["--audit-json", str(self.dir / "audit.json")])
+        self.assert_input_error(rc, err, "without an id")
+
+    def test_missing_audit_json_is_rc_input(self):
+        rc, _, err = self.run_gate({}, {}, "", extra=["--audit-json", str(self.dir / "nope.json")])
+        self.assert_input_error(rc, err, "nope.json")
+
+    def test_lock_without_version_header_is_rejected(self):
+        body = LOCK.split("\n", 2)[2]  # drop the `version = 4` header line and the blank line
+        self.assertNotIn("version = 4", body)
+        (self.dir / "Cargo.lock").write_text(body)
+        self.assertFalse(floors.has_lock_header(body))
+        rc, _, err = self.run_gate({}, {}, "")
+        self.assertEqual(rc, 2)
+        self.assertIn("not a Cargo.lock", err)
+
+
+class WorkspaceMembers(GateBase):
+    """Workspace path members are not sent to OSV by name; vendored path crates are."""
+
+    LOCK2 = LOCK + '\n[[package]]\nname = "paste"\nversion = "1.0.15"\n'
+
+    def test_member_named_in_a_manifest_is_not_queried(self):
+        (self.dir / "Cargo.lock").write_text(self.LOCK2)
+        (self.dir / "Cargo.toml").write_text('[package]\nname = "ai-memory"\nversion = "1.0.0"\n')
+        rc, out, _ = self.run_gate({}, {}, "")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("floor: skipped ai-memory 1.0.0 source=path queried=no", out)
+        self.assertIn("floor: skipped paste 1.0.15 source=path queried=yes", out)
+
+    def test_member_name_hit_is_ignored_but_vendored_path_hit_is_kept(self):
+        (self.dir / "Cargo.lock").write_text(self.LOCK2)
+        (self.dir / "Cargo.toml").write_text('[package]\nname = "ai-memory"\nversion = "1.0.0"\n')
+        v1 = vuln("V1", "2.0.0")
+        v1["affected"][0]["package"]["name"] = "ai-memory"
+        v2 = vuln("V2", "2.0.0")
+        v2["affected"][0]["package"]["name"] = "paste"
+        rc, out, _ = self.run_gate({"V1": v1, "V2": v2}, {"ai-memory@1.0.0": ["V1"], "paste@1.0.15": ["V2"]}, "")
+        self.assertEqual(rc, 1)
+        self.assertNotIn("floor: V1", out)
+        self.assertIn("floor: V2 paste 1.0.15", out)
+
+    def test_fuzz_member_is_not_queried(self):
+        (self.dir / "fuzz").mkdir()
+        (self.dir / "fuzz" / "Cargo.toml").write_text('[package]\nname = "ai-memory-fuzz"\nversion = "0.0.0"\n')
+        (self.dir / "Cargo.lock").write_text(self.LOCK2 + '\n[[package]]\nname = "ai-memory-fuzz"\nversion = "0.0.0"\n')
+        rc, out, _ = self.run_gate({}, {}, "")
+        self.assertIn("floor: skipped ai-memory-fuzz 0.0.0 source=path queried=no", out)
+
+
 if __name__ == "__main__":
     unittest.main()
