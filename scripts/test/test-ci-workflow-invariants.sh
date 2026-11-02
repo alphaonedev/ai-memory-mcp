@@ -837,7 +837,7 @@ d_scan() {
             continue
         fi
         prebuild="$(awk -v a="$opener" -v b="$w" '
-            NR > a && NR < b && /cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"/ { n = NR }
+            NR > a && NR < b && /cargo test( --locked)? --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"/ { n = NR }
             END { print n + 0 }' "$file")"
         if [ "$prebuild" -eq 0 ]; then
             bad=$((bad + 1))
@@ -868,7 +868,7 @@ fi
 # the repo (never system /tmp), trap-cleaned by the SCRATCH dir above.
 if [ "$d_total" -gt 0 ]; then
     D_MUT="$SCRATCH/ci-2657-mutant.yml"
-    grep -vE 'cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"' "$CI_YML" > "$D_MUT"
+    grep -vE 'cargo test( --locked)? --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"' "$CI_YML" > "$D_MUT"
     d_mut_result="$(d_scan "$D_MUT" 2>/dev/null)"
     d_mut_bad="${d_mut_result%%/*}"
     if [ "$d_mut_bad" -eq "$d_total" ]; then

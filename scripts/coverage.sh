@@ -73,7 +73,7 @@ fi
 # v0.8.0 #1709 SHIP-HARDEN — `-- --test-threads=1` is REQUIRED, not optional:
 # see the header comment above and the identical rationale in
 # .github/workflows/coverage.yml.
-cargo llvm-cov \
+cargo llvm-cov --locked \
     --no-report \
     --features sal,sal-postgres \
     --lib --tests \
@@ -88,7 +88,7 @@ cargo llvm-cov \
 # tests. Without an explicitly supplied database, retain this wrapper's
 # documented self-skip behavior. Exact CI-equivalent floors require Postgres.
 if [[ -n "${AI_MEMORY_TEST_POSTGRES_URL:-}" ]]; then
-    cargo llvm-cov \
+    cargo llvm-cov --locked \
         --no-clean \
         --features sal,sal-postgres \
         --lib --workspace \
