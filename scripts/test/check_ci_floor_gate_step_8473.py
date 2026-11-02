@@ -6,7 +6,7 @@ skipped matrix leg hid it, and a step-level `!cancelled()` cannot rescue a
 job-level skip. Round 3 moves it into its own job and this check asserts:
 
 1. job `dependency-floors` exists once, `needs: classify`, runs on
-   ubuntu-latest, has `timeout-minutes: 15`, and its job-level `if:` is a
+   ubuntu-24.04 (ubuntu-latest has no python 3.9), has `timeout-minutes: 15`, and its job-level `if:` is a
    conjunction whose terms include, exactly, `!cancelled()` and
    `needs.classify.result != 'skipped'` (no `||`);
 2. the job runs the gate script, then a setup-python step pinned to 3.9, then
@@ -30,6 +30,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 JOB_ID = "dependency-floors"
+RUNNER = "ubuntu-24.04"
 GATE_NAME = "Dependency floor gate (OSV)"
 AUDIT_NAME = "Security audit"
 AUDIT_JOB = "check"
@@ -126,8 +127,8 @@ def check(text):
     problems += conjunction_problems("job %s" % JOB_ID, job_field(lines, "if"), JOB_TERMS)
     if job_field(lines, "needs") != "classify":
         problems.append("job %s must have needs: classify, found %r" % (JOB_ID, job_field(lines, "needs")))
-    if job_field(lines, "runs-on") != "ubuntu-latest":
-        problems.append("job %s must run on ubuntu-latest, found %r" % (JOB_ID, job_field(lines, "runs-on")))
+    if job_field(lines, "runs-on") != RUNNER:
+        problems.append("job %s must run on ubuntu-24.04, found %r" % (JOB_ID, job_field(lines, "runs-on")))
     if job_field(lines, "timeout-minutes") != "15":
         problems.append("job %s must set timeout-minutes: 15, found %r"
                         % (JOB_ID, job_field(lines, "timeout-minutes")))

@@ -1028,7 +1028,9 @@ jobs:
     needs: classify
     if: ${{ !cancelled() && needs.classify.result != 'skipped' }}
     # RUNNER PLACEMENT - GitHub-hosted: python only, one HTTPS call to api.osv.dev.
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: latest is 26.04, which has no python 3.9 build
+    # for the 3.9 leg below (first CI run on b4739f918: setup-python found no 3.9).
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

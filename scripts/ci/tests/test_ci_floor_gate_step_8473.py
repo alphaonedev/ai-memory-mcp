@@ -18,7 +18,7 @@ GOOD_JOB_IF = "${{ !cancelled() && needs.classify.result != 'skipped' }}"
 GOOD_AUDIT_IF = "${{ !cancelled() && needs.classify.outputs.cargo_skip != 'true' && matrix.once }}"
 
 
-def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_on="ubuntu-latest",
+def workflow(job_if=GOOD_JOB_IF, audit_if=GOOD_AUDIT_IF, needs="classify", runs_on="ubuntu-24.04",
              timeout="15", py="'3.9'", suite=True, gate_in_check=False, gate=True):
     lines = ["name: ci", "jobs:", "  dependency-floors:"]
     if needs is not None:
@@ -78,7 +78,8 @@ class FloorGateJob(unittest.TestCase):
 
     def test_job_needs_runner_timeout_are_pinned(self):
         self.flagged(workflow(needs="select"), "needs: classify")
-        self.flagged(workflow(runs_on="self-hosted"), "ubuntu-latest")
+        self.flagged(workflow(runs_on="self-hosted"), "ubuntu-24.04")
+        self.flagged(workflow(runs_on="ubuntu-latest"), "ubuntu-24.04")
         self.flagged(workflow(timeout="60"), "timeout-minutes: 15")
         self.flagged(workflow(timeout=None), "timeout-minutes: 15")
 
