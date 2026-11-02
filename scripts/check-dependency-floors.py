@@ -323,9 +323,10 @@ def group_findings(records):
 def merge_audit(findings, audit):
     """Add `cargo audit --json` advisories that no OSV record already names.
 
-    An advisory counts as already known only when it links directly (id to
-    alias, either way) to a record of the same package; known advisories are
-    not merged into that record, so no alias set grows.
+    An advisory counts as already known only when a record with the same id,
+    package and version exists. A linked but distinct advisory is appended, so
+    it keeps its own aliases and fixed_in and is evaluated on its own;
+    group_findings folds it for display only.
     """
     if not isinstance(audit, dict):
         raise InputError("cargo audit json is not an object")
@@ -346,8 +347,8 @@ def merge_audit(findings, audit):
         rec = {"id": adv["id"], "aliases": aliases, "package": pkg.get("name", "?"),
                "version": pkg.get("version", "?"),
                "fixed_in": ", ".join(patched) if patched else "none"}
-        if any(f["package"] == rec["package"] and (f["id"] == rec["id"] or linked(f, rec))
-               for f in out):
+        if any(f["id"] == rec["id"] and f["package"] == rec["package"]
+               and f["version"] == rec["version"] for f in out):
             continue
         out.append(rec)
     return out

@@ -553,15 +553,73 @@ class EvaluateOnOwnId(GateBase):
         self.assertEqual([f["id"] for f in merged], ["RUSTSEC-2026-0429", "GHSA-aaaa-aaaa-aaaa"])
         self.assertEqual(merged[0]["aliases"], [self.CVE_A])
 
-    def test_merge_audit_drops_a_directly_linked_duplicate_without_growing_aliases(self):
+    def test_merge_audit_keeps_a_directly_linked_record_with_its_own_aliases(self):
         found = [{"id": "RUSTSEC-2026-0429", "aliases": ["GHSA-q7v9-x93c-xqv3"], "package": "alpha",
                   "version": "1.0.0", "fixed_in": "1.2.0"}]
         audit = {"warnings": {"x": [{"advisory": {"id": "GHSA-q7v9-x93c-xqv3", "aliases": [self.CVE_A]},
                                      "package": {"name": "alpha", "version": "1.0.0"},
-                                     "versions": {"patched": []}}]}}
+                                     "versions": {"patched": [">=9.9.9"]}}]}}
         merged = floors.merge_audit(found, audit)
-        self.assertEqual(len(merged), 1)
+        self.assertEqual([f["id"] for f in merged], ["RUSTSEC-2026-0429", "GHSA-q7v9-x93c-xqv3"])
         self.assertEqual(merged[0]["aliases"], ["GHSA-q7v9-x93c-xqv3"])
+        self.assertEqual(merged[1]["aliases"], [self.CVE_A])
+        self.assertEqual(merged[1]["fixed_in"], ">=9.9.9")
+
+    def test_merge_audit_skips_only_the_same_id_package_and_version(self):
+        found = [{"id": "RUSTSEC-9", "aliases": [], "package": "alpha", "version": "1.0.0",
+                  "fixed_in": "1.2.0"}]
+        audit = {"warnings": {"x": [{"advisory": {"id": "RUSTSEC-9", "aliases": []},
+                                     "package": {"name": "alpha", "version": "1.0.0"}}]}}
+        self.assertEqual(len(floors.merge_audit(found, audit)), 1)
+
+
+ZIP_LOCK = """version = 4
+
+[[package]]
+name = "zip"
+version = "7.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "zip"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"""
+ZIP_RUSTSEC = {"id": "RUSTSEC-2026-0429", "aliases": ["CVE-2026-115909", "GHSA-q7v9-x93c-xqv3"],
+               "affected": [{"package": {"name": "zip", "ecosystem": "crates.io"},
+                             "ranges": [{"type": "SEMVER",
+                                         "events": [{"introduced": "0"}, {"fixed": "9.0.0"}]}]}]}
+ZIP_ACCEPTED = ('[[accepted]]\nid = "RUSTSEC-2026-0429"\npackage = "zip"\nrationale = "test"\n'
+                'review_by = "2026-11-16"\ntracking_issue = 8472\n')
+
+
+class AuditOneWayLink(GateBase):
+    """merge_audit keeps an audit record that an OSV record links to one way (r3 F1)."""
+
+    def setUp(self):
+        super().setUp()
+        (self.dir / "Cargo.lock").write_text(ZIP_LOCK)
+
+    def run_zip(self, audit_items, hits):
+        (self.dir / "audit.json").write_text(json.dumps({"vulnerabilities": {"list": audit_items}}))
+        return self.run_gate({"RUSTSEC-2026-0429": ZIP_RUSTSEC}, hits, ZIP_ACCEPTED,
+                             extra=["--audit-json", str(self.dir / "audit.json")])
+
+    def test_one_way_linked_audit_record_is_floored_on_its_own(self):
+        item = {"advisory": {"id": "GHSA-q7v9-x93c-xqv3", "aliases": ["CVE-2099-0009"]},
+                "package": {"name": "zip", "version": "7.2.0"}, "versions": {"patched": [">=9.9.9"]}}
+        rc, out, _ = self.run_zip([item], {"zip@7.2.0": ["RUSTSEC-2026-0429"]})
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"floor: GHSA-q7v9-x93c-xqv3 zip 7\.2\.0 .*accepted=no "
+                              r"folded_into=RUSTSEC-2026-0429")
+        self.assertIn("1 unaccepted", out)
+
+    def test_same_id_on_another_version_gets_its_own_floor_line(self):
+        item = {"advisory": {"id": "RUSTSEC-2026-0429", "aliases": []},
+                "package": {"name": "zip", "version": "8.0.0"}, "versions": {"patched": [">=9.0.0"]}}
+        rc, out, _ = self.run_zip([item], {"zip@7.2.0": ["RUSTSEC-2026-0429"]})
+        self.assertRegex(out, r"floor: RUSTSEC-2026-0429 zip 8\.0\.0 ")
+        self.assertRegex(out, r"floor: RUSTSEC-2026-0429 zip 7\.2\.0 ")
 
 
 class WithdrawnAndShapes(GateBase):
