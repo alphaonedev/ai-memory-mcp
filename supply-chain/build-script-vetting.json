@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "inventoried_ceiling": 88,
+  "inventoried_ceiling": 80,
   "packages": [
     {
       "name": "ahash",
@@ -506,14 +506,6 @@
       "first_seen": "2026-08-01"
     },
     {
-      "name": "windows_aarch64_gnullvm",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
       "name": "windows_aarch64_msvc",
       "version": "0.48.5",
       "source": "registry",
@@ -526,14 +518,6 @@
       "version": "0.52.6",
       "source": "registry",
       "checksum": "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
-      "name": "windows_aarch64_msvc",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
     },
@@ -554,26 +538,10 @@
       "first_seen": "2026-08-01"
     },
     {
-      "name": "windows_i686_gnu",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
       "name": "windows_i686_gnullvm",
       "version": "0.52.6",
       "source": "registry",
       "checksum": "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
-      "name": "windows_i686_gnullvm",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
     },
@@ -594,14 +562,6 @@
       "first_seen": "2026-08-01"
     },
     {
-      "name": "windows_i686_msvc",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
       "name": "windows_x86_64_gnu",
       "version": "0.48.5",
       "source": "registry",
@@ -614,14 +574,6 @@
       "version": "0.52.6",
       "source": "registry",
       "checksum": "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
-      "name": "windows_x86_64_gnu",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
     },
@@ -642,14 +594,6 @@
       "first_seen": "2026-08-01"
     },
     {
-      "name": "windows_x86_64_gnullvm",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
       "name": "windows_x86_64_msvc",
       "version": "0.48.5",
       "source": "registry",
@@ -662,14 +606,6 @@
       "version": "0.52.6",
       "source": "registry",
       "checksum": "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec",
-      "disposition": "inventoried",
-      "first_seen": "2026-08-01"
-    },
-    {
-      "name": "windows_x86_64_msvc",
-      "version": "0.53.1",
-      "source": "registry",
-      "checksum": "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
     },
