@@ -144,7 +144,10 @@ deployment with **no `api_key` configured**, a bare self-asserted
 `X-Agent-Id` naming an admin id is NOT trusted for admin-role
 resolution (boot emits a WARN); set `AI_MEMORY_ADMIN_HEADER_TRUST=1`
 only to restore the legacy header-trust posture on isolated/mTLS-fronted
-deployments.
+deployments. `POST /agents/{id}/pubkey/challenge` and `PUT /agents/{id}/pubkey`
+additionally require a key-authenticated admin (the admin's own enrolled
+per-agent `X-API-Key`), not a claimed header (#8494); a refusal is a 403 with a
+forensic audit row.
 
 ### mTLS (Layer 2 peer mesh)
 

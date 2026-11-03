@@ -1357,6 +1357,20 @@ resolution, and the daemon emits a boot WARN naming the flag. Set
 deployments that need the legacy trust-the-header posture. Every
 admin-role decision (allow or deny) lands in the forensic audit chain.
 
+**Key bootstrap needs a verified admin (#8494).** Binding an attestation
+public key is the root of every later signature check, so
+`POST /api/v1/agents/{id}/pubkey/challenge` and
+`PUT /api/v1/agents/{id}/pubkey` do not accept a CLAIMED admin header
+(the shared `api_key` plus `X-Agent-Id: <admin>`), in any
+`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` posture. They require either an
+admin that presents its own enrolled per-agent key (`X-API-Key` bound to that
+admin id; enrol it with `agents bind-api-key`), or the explicit operator
+opt-in `AI_MEMORY_ADMIN_HEADER_TRUST=1` (which then also lets a header claim
+bind keys; the boot WARN names it). The local operator path (`agents bind-key`
+on the data-tier host, MCP stdio) is unchanged. A refused request returns 403,
+binds nothing, and writes a `bind_agent_pubkey` /
+`claimed_admin_not_key_authenticated` row to the forensic audit chain.
+
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
 
 ### Multi-User Warning
