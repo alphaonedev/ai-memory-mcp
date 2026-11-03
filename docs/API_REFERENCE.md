@@ -1812,7 +1812,7 @@ caller. Delegated routine execution is deferred to #3576.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/v1/actions/{id}/transition` | Coordination action-state transition (`handlers::transition_action`) — local CAS write + W-of-N federation fanout. MCP: `memory_action_transition`. |
-| `POST` | `/api/v1/signals` | Signed inter-agent signal send (`handlers::send_signal`) — local write + W-of-N fanout. MCP: `memory_signal_send`. |
+| `POST` | `/api/v1/signals` | Signed inter-agent signal send (`handlers::send_signal`) — local write + W-of-N fanout. The sender is always the authenticated caller (`X-Agent-Id`), never a body `from_agent`. MCP: `memory_signal_send`; in forward mode a `from_agent` that differs from the enforced caller (`AI_MEMORY_AGENT_ID`) is refused with `agent_id mismatch` before any network I/O (#8496). |
 
 ### v0.9.0 + v1.0.0 net-new endpoints
 
