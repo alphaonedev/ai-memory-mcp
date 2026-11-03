@@ -1380,11 +1380,25 @@ an `agent_api_key_mint` / `agent_api_key_revoke` row with reason
 key is stored or removed. Without this a header claim could mint an admin's own
 per-agent key and so satisfy the bind gate. The route requires either an admin
 presenting its own enrolled per-agent key, or the explicit operator opt-in
-`AI_MEMORY_ADMIN_HEADER_TRUST=1`. **Bootstrapping the first admin key**: run
-`ai-memory agents bind-api-key --agent-id <admin> --token "$TOKEN"` on the
-data-tier host (the local operator funnel, ungated), or start the daemon once
-with `AI_MEMORY_ADMIN_HEADER_TRUST=1`, mint the key over HTTP, then unset the
-variable. A malformed `{id}` is a `400` before any audit row is written (#8536),
+`AI_MEMORY_ADMIN_HEADER_TRUST=1`. **Bootstrapping the first admin key** (the
+supported path is the local-operator CLI on the data-tier host, which is
+ungated): write the token to an owner-only file and enrol it from that file.
+The CLI refuses a token on argv (`--token`, #3781) because argv is
+world-readable via `/proc/<pid>/cmdline`:
+
+```bash
+umask 077
+openssl rand -hex 32 > /etc/ai-memory/admin-key.token   # at least 32 bytes
+ai-memory agents bind-api-key --agent-id <admin> \
+  --token-file /etc/ai-memory/admin-key.token
+```
+
+`AI_MEMORY_AGENT_API_KEY_FILE=/etc/ai-memory/admin-key.token` is the equivalent
+environment channel. The admin then presents the file's contents as `X-API-Key`.
+The alternative, **WARN-flagged and weaker**: start the daemon once with
+`AI_MEMORY_ADMIN_HEADER_TRUST=1` (the boot WARN names it), mint the key over
+HTTP, then unset the variable; while it is set, any header claim passes these
+routes. A malformed `{id}` is a `400` before any audit row is written (#8536),
 on these routes and on the pubkey bind routes.
 
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
