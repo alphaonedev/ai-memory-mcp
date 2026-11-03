@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Docs (#8262 — certification scope statement for v1.0.0 GA)
 
 - Add a "Certification scope statement" to `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` listing what the GA candidate certifies, what is in scope and certified on landing, and what it does not claim, each with its tracking issue and enforcing `file:line`; the open fail-closed controls (#8260, #8265) are listed as claimed only once landed, and the quarantine of unattributed inbound writes (#2967, closed by PR #8269) is listed as landed. The end-to-end content encryption work is tracked in #8278 (supersedes the closed #1968). Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262). Pointers and corrections added across `README.md`, `ROADMAP.md`, `SECURITY.md`, `docs/SECURITY.md`, `docs/compliance/honest-limitations.md`, `docs/compliance/nsa-csi-mcp-security-mapping.md`, `docs/encryption.html`, `docs/enterprise-deployment.md`, `docs/federation-identity.md`, `docs/federation.md`, `docs/production-deployment.md`, `docs/reference/ARCHITECTURE_REFERENCE.md`, `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`, `CHANGELOG.md`; guard `scripts/ci/tests/test_certification_scope_8262.py` (round 19: the mention views keep intra-word underscores so an escaped or emphasised identifier is still counted, rule 5 covers YAML front matter, the one-line comment pattern is anchored, the lexer reads each line in one pass (a single-pass lexer), and an unused regex is removed).
+### Security (#8472, #7302 — zip advisories resolved by the candle 0.11.1 bump)
+
+- Update `candle-core`, `candle-nn` and `candle-transformers` from 0.10.2 to
+  0.11.1, which moves the locked `zip` dependency from 7.2.0 to 9.2.2 and
+  resolves RUSTSEC-2026-0429 (`ZipArchive::extract` denial of service on a
+  symlink entry) together with the related zip advisories RUSTSEC-2026-0367,
+  RUSTSEC-2026-0368 and RUSTSEC-2026-0369. The three `.cargo/audit.toml`
+  ignores for them and the `scripts/check-zip-extract-unreachable.py` guard
+  are retired. The build-script ledger follows libc 0.2.191 and nix 0.31.3.
+  `src/` is unchanged.
+
 ### Security (#4734 — pgbouncer smoke stack binds loopback and takes its password from env)
 
 - #8312: consume both smoke scripts with a strict shell subset, refuse K25–K29 and INFO-5 constructs by name, and validate decimal knee thresholds before use.
