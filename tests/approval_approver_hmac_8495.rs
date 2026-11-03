@@ -774,6 +774,189 @@ async fn non_json_governance_body_is_refused_postgres_branch_8546() {
 }
 
 // ---------------------------------------------------------------------------
+// (6) #8547 — every decide-route signature refusal writes one forensic row
+// ---------------------------------------------------------------------------
+
+/// The forensic kind every decide-route signature refusal is chained under.
+const SIGNATURE_REFUSAL_KIND: &str = "approval_decide_signature";
+
+fn forensic_scratch(tag: &str) -> tempfile::TempDir {
+    let root = PathBuf::from(".local-runs").join("approval-approver-hmac-8547");
+    std::fs::create_dir_all(&root).ok();
+    tempfile::Builder::new()
+        .prefix(tag)
+        .tempdir_in(&root)
+        .expect("tempdir under .local-runs")
+}
+
+/// Every forensic row written under `dir`, parsed.
+fn forensic_rows(dir: &Path) -> (String, Vec<Value>) {
+    let mut text = String::new();
+    for entry in std::fs::read_dir(dir).expect("read audit dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            text.push_str(&std::fs::read_to_string(&path).expect("read forensic file"));
+        }
+    }
+    let rows = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("forensic row is JSON"))
+        .collect();
+    (text, rows)
+}
+
+/// On each decide route: an approver mismatch, a v1 (unbound) signature, a
+/// stale timestamp and an exact replay are each refused with ONE forensic
+/// `refuse` row naming the presented agent and the pending id; the accepted
+/// decide in between writes no signature-refusal row. No row carries the
+/// signature or the secret.
+async fn signature_refusals_are_audited(backend: Backend) {
+    let audit_dir = forensic_scratch("refusals");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+    let mut signatures = Vec::new();
+    let mut expected: Vec<(String, String, &'static str, &'static str)> = Vec::new();
+    for endpoint in ["approval_decide", "approve_pending", "reject_pending"] {
+        let h = build(backend, Posture::Default);
+        let pid = seed_delete_pending(&h.db_path, "ns-8547-audit");
+        let (uri, body) = match endpoint {
+            "approval_decide" => (decide_uri(&pid), approve_body()),
+            "approve_pending" => (format!("/api/v1/pending/{pid}/approve"), String::new()),
+            _ => (format!("/api/v1/pending/{pid}/reject"), String::new()),
+        };
+
+        // Approver mismatch: X's signature presented by Y.
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_Y, None, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} mismatch: {v}"
+        );
+        expected.push((
+            APPROVER_Y.to_string(),
+            pid.clone(),
+            endpoint,
+            "invalid_signature",
+        ));
+
+        // v1 (approver-unbound) signature.
+        let sig = sign_v1(&ts, &pid, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} v1: {v}"
+        );
+        expected.push((
+            APPROVER_X.to_string(),
+            pid.clone(),
+            endpoint,
+            LEGACY_UNBOUND_APPROVER,
+        ));
+
+        // Stale timestamp.
+        let stale = (chrono::Utc::now().timestamp() - 86_400).to_string();
+        let sig = sign_v2(&stale, &pid, APPROVER_X, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(
+            &h.router,
+            request(&uri, &stale, &sig, APPROVER_X, None, &body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} stale: {v}"
+        );
+        expected.push((
+            APPROVER_X.to_string(),
+            pid.clone(),
+            endpoint,
+            "invalid_signature",
+        ));
+
+        // Accepted, then the exact request replayed.
+        let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+        assert_eq!(status, StatusCode::OK, "{backend:?} {endpoint} accept: {v}");
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} replay: {v}"
+        );
+        expected.push((
+            APPROVER_X.to_string(),
+            pid.clone(),
+            endpoint,
+            "invalid_signature",
+        ));
+    }
+    ai_memory::governance::audit::shutdown();
+
+    let (text, rows) = forensic_rows(audit_dir.path());
+    let refusals: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["kind"] == json!(SIGNATURE_REFUSAL_KIND))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        expected.len(),
+        "{backend:?}: one forensic row per refused decide, none for the accepted one; rows={rows:?}"
+    );
+    for (row, (actor, pid, endpoint, reason)) in refusals.iter().zip(&expected) {
+        assert_eq!(row["decision"], json!("refuse"), "{backend:?}: {row}");
+        assert_eq!(
+            row["payload"]["endpoint"],
+            json!(endpoint),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(row["actor"], json!(actor), "{backend:?}: {row}");
+        assert_eq!(
+            row["payload"]["pending_id"],
+            json!(pid),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(
+            row["payload"]["reason"],
+            json!(reason),
+            "{backend:?}: {row}"
+        );
+    }
+    assert!(
+        !text.contains(SECRET),
+        "{backend:?}: the HMAC secret reached the forensic chain"
+    );
+    for sig in &signatures {
+        assert!(
+            !text.contains(sig.as_str()),
+            "{backend:?}: a signature reached the forensic chain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn signature_refusals_are_audited_sqlite_8547() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    signature_refusals_are_audited(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn signature_refusals_are_audited_postgres_branch_8547() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    signature_refusals_are_audited(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
 // (4) postgres parity on a live PostgresStore (skip when no URL is set)
 // ---------------------------------------------------------------------------
 
