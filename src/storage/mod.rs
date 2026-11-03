@@ -8967,27 +8967,21 @@ pub(crate) fn build_promotion_clone(
     let now = Utc::now().to_rfc3339();
     let clone_metadata = {
         let mut meta = source.metadata.clone();
-        if let Some(obj) = meta.as_object_mut() {
-            if let Some(actor) = promoted_by.filter(|a| !a.is_empty()) {
-                if let Some(prior) = obj
+        // #8513 — the clone is re-owned (to the acting caller when present):
+        // drop the source attestation, name the source id and owner.
+        crate::identity::attest::reset_for_reowned_row(
+            &mut meta,
+            promoted_by.filter(|a| !a.is_empty()),
+            &crate::identity::attest::ReownProvenance {
+                kind: crate::identity::attest::ReownKind::Promote,
+                source_id: &source.id,
+                source_owner: source
+                    .metadata
                     .get(crate::mcp::param_names::AGENT_ID)
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                {
-                    obj.insert(
-                        "promoted_from_agent_id".to_string(),
-                        serde_json::Value::String(prior),
-                    );
-                }
-                obj.insert(
-                    crate::mcp::param_names::AGENT_ID.to_string(),
-                    serde_json::Value::String(actor.to_string()),
-                );
-            }
-            obj.insert(
-                "promoted_from".to_string(),
-                serde_json::Value::String(source.id.clone()),
-            );
+                    .and_then(serde_json::Value::as_str),
+            },
+        );
+        if let Some(obj) = meta.as_object_mut() {
             obj.insert(
                 "promoted_from_namespace".to_string(),
                 serde_json::Value::String(source.namespace.clone()),

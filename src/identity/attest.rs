@@ -301,6 +301,116 @@ pub fn stamp_claimed_if_absent(metadata: &mut serde_json::Value) {
     }
 }
 
+/// Which clone path re-owned a row (#8513).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReownKind {
+    /// `memory_share` copy into the shared namespace.
+    Share,
+    /// Atomisation: one atom row per decomposed proposition.
+    Atomise,
+    /// Vertical promotion clone into an ancestor namespace.
+    Promote,
+}
+
+impl ReownKind {
+    const fn from_key(self) -> &'static str {
+        match self {
+            Self::Share => crate::models::field_names::SHARED_FROM,
+            Self::Atomise => crate::models::field_names::ATOMISED_FROM,
+            Self::Promote => crate::models::field_names::PROMOTED_FROM,
+        }
+    }
+
+    const fn from_owner_key(self) -> &'static str {
+        match self {
+            Self::Share => crate::models::field_names::SHARED_FROM_AGENT_ID,
+            Self::Atomise => crate::models::field_names::ATOMISED_FROM_AGENT_ID,
+            Self::Promote => crate::models::field_names::PROMOTED_FROM_AGENT_ID,
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Share => "reowned_by_share",
+            Self::Atomise => "reowned_by_atomise",
+            Self::Promote => "reowned_by_promote",
+        }
+    }
+}
+
+/// Source side of a re-owned row: the clone path plus the source row's id and
+/// owner, recorded as provenance (#8513).
+#[derive(Debug, Clone, Copy)]
+pub struct ReownProvenance<'a> {
+    /// Which clone path ran.
+    pub kind: ReownKind,
+    /// Id of the source row.
+    pub source_id: &'a str,
+    /// Owner (`metadata.agent_id`) of the source row, when it had one.
+    pub source_owner: Option<&'a str>,
+}
+
+/// #8513 (umbrella #8493, data F1) — normalise the metadata of a row that is
+/// CLONED to a new owner (share, atomise, promote).
+///
+/// The source row's attestation (`write_signature`, `agent_pubkey`,
+/// `pubkey_bound_at`, `attestation_downgraded`, `forged_signature_skipped`,
+/// `attest_level`) was computed over the SOURCE owner's signed envelope
+/// (agent id, namespace, title, kind, `created_at`, content). A clone changes
+/// the owner and at least the namespace and `created_at`, so that attestation
+/// can never be re-derived from the clone; carrying it makes every trust
+/// surface believe an `agent_attested` row for an agent that never signed it.
+/// This is the rule #3420 applies to update: the clone drops to `claimed`. The
+/// new owner's principal is not available here (the target of a share cannot
+/// sign), so the clone is never re-signed: an honest `claimed`.
+///
+/// `new_owner = None` keeps the existing `agent_id` (a promotion with no acting
+/// principal). Provenance (`<kind>_from`, `<kind>_from_agent_id`) names the
+/// source row and its owner. A non-object `metadata` is left untouched.
+pub fn reset_for_reowned_row(
+    metadata: &mut serde_json::Value,
+    new_owner: Option<&str>,
+    provenance: &ReownProvenance<'_>,
+) {
+    use crate::models::field_names as f;
+    let Some(obj) = metadata.as_object_mut() else {
+        return;
+    };
+    for key in [
+        f::WRITE_SIGNATURE,
+        f::AGENT_PUBKEY,
+        f::PUBKEY_BOUND_AT,
+        f::ATTESTATION_DOWNGRADED,
+        f::FORGED_SIGNATURE_SKIPPED,
+    ] {
+        obj.remove(key);
+    }
+    obj.insert(
+        f::ATTEST_LEVEL.to_string(),
+        serde_json::Value::String(AttestLevel::Claimed.as_str().to_string()),
+    );
+    obj.insert(
+        f::ATTEST_RESET_REASON.to_string(),
+        serde_json::Value::String(provenance.kind.reason().to_string()),
+    );
+    obj.insert(
+        provenance.kind.from_key().to_string(),
+        serde_json::Value::String(provenance.source_id.to_string()),
+    );
+    if let Some(owner) = provenance.source_owner {
+        obj.insert(
+            provenance.kind.from_owner_key().to_string(),
+            serde_json::Value::String(owner.to_string()),
+        );
+    }
+    if let Some(owner) = new_owner {
+        obj.insert(
+            crate::mcp::param_names::AGENT_ID.to_string(),
+            serde_json::Value::String(owner.to_string()),
+        );
+    }
+}
+
 /// I/O-free parse core for [`require_agent_attestation_for`] (#1985).
 ///
 /// Explicit falsy (`0`/`false`, case-insensitive) → permissive on every
