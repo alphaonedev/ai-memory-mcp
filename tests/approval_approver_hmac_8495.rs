@@ -1033,7 +1033,8 @@ mod live_pg {
             source: "test".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
-            metadata: json!({}),
+            // #8548: the requester owns the row, as an HTTP store stamps it.
+            metadata: json!({"agent_id": REQUESTER}),
             version: 1,
             ..ai_memory::models::Memory::default()
         };
@@ -1124,6 +1125,119 @@ mod live_pg {
             .expect("get_pending")
             .expect("row");
         assert_eq!(row.decided_by.as_deref(), Some(APPROVER_X), "live pg");
+        set_active_hooks_hmac_secret(None);
+    }
+
+    /// #8548 — seed a REQUESTER-owned memory at `tier` and queue `action` on
+    /// it; returns `(pending_id, memory_id)`.
+    async fn seed_live_action(
+        store: &Arc<dyn MemoryStore>,
+        tier: ai_memory::models::Tier,
+        action: ai_memory::store::GovernedAction,
+    ) -> (String, String) {
+        let ctx = CallerContext::for_agent(REQUESTER.to_string());
+        let ns = format!("ns-8548-live-{}", uuid::Uuid::new_v4().simple());
+        let mem = ai_memory::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier,
+            namespace: ns.clone(),
+            title: format!("t-8548-live-{}", uuid::Uuid::new_v4()),
+            content: "seeded by the #8548 live postgres test".into(),
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            // #8548: the requester owns the row, as an HTTP store stamps it.
+            metadata: json!({"agent_id": REQUESTER}),
+            version: 1,
+            ..ai_memory::models::Memory::default()
+        };
+        let mem_id = store.store(&ctx, &mem).await.expect("store memory");
+        let pid = store
+            .queue_pending_action(
+                &ctx,
+                action,
+                &ns,
+                Some(&mem_id),
+                REQUESTER,
+                &json!({"reason": "8548-live"}),
+            )
+            .await
+            .expect("queue_pending_action");
+        (pid, mem_id)
+    }
+
+    /// #8548 — an approved delete / promote of the REQUESTER's memory executes
+    /// as the requester, not as the approver: the approver does not own the
+    /// row, so running the mutation under the approver's context was refused
+    /// by the postgres owner gate and the decide returned 500 with the row
+    /// already marked approved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_executes_under_the_requester_8548() {
+        use ai_memory::store::GovernedAction;
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_executes_under_the_requester_8548: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let router = live_router(store.clone());
+        let owner = CallerContext::for_agent(REQUESTER.to_string());
+
+        // Delete through both decide routes.
+        for route in ["approval_decide", "approve_pending"] {
+            let (pid, mem_id) = seed_live_action(
+                &store,
+                ai_memory::models::Tier::Long,
+                GovernedAction::Delete,
+            )
+            .await;
+            let (uri, body) = if route == "approval_decide" {
+                (decide_uri(&pid), approve_body())
+            } else {
+                (format!("/api/v1/pending/{pid}/approve"), String::new())
+            };
+            let ts = now_ts();
+            let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+            let (status, v) =
+                send(&router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+            assert_eq!(status, StatusCode::OK, "live pg {route} delete: {v}");
+            assert_eq!(v["executed"], json!(true), "live pg {route} delete: {v}");
+            assert!(
+                store.get(&owner, &mem_id).await.is_err(),
+                "live pg {route}: the approved delete removed the memory"
+            );
+        }
+
+        // Promote (tier bump) through approval_decide.
+        let (pid, mem_id) = seed_live_action(
+            &store,
+            ai_memory::models::Tier::Mid,
+            GovernedAction::Promote,
+        )
+        .await;
+        let body = approve_body();
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+        let (status, v) = send(
+            &router,
+            request(&decide_uri(&pid), &ts, &sig, APPROVER_X, None, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "live pg promote: {v}");
+        assert_eq!(v["executed"], json!(true), "live pg promote: {v}");
+        let promoted = store.get(&owner, &mem_id).await.expect("promoted memory");
+        assert_eq!(
+            promoted.tier,
+            ai_memory::models::Tier::Long,
+            "live pg promote"
+        );
         set_active_hooks_hmac_secret(None);
     }
 }
