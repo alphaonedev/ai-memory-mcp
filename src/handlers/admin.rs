@@ -341,13 +341,62 @@ fn bind_refused_response() -> axum::response::Response {
         .into_response()
 }
 
+/// #8494 — stable audit reason for a bind refused because the admin was only
+/// a header claim, not a key-authenticated principal.
+const BIND_CLAIMED_ADMIN_REASON: &str = "claimed_admin_not_key_authenticated";
+
+/// #8494 — wire message for the typed refusal of a claimed (unverified) admin.
+const BIND_ADMIN_KEY_REQUIRED_MSG: &str =
+    "public-key bind requires a key-authenticated admin (enrolled per-agent api key)";
+
+/// #8494 — admit a bootstrap pubkey bind only for a verified principal.
+///
+/// Runs the canonical [`require_admin`] gate first (allowlist + request authn),
+/// then requires the caller to be key-bound to its own admin id (the presented
+/// `X-API-Key` is that admin's enrolled per-agent key) or the operator to have
+/// opted into header trust. A merely claimed admin is refused with a typed 403
+/// and a durable forensic audit row; nothing is bound. The gate runs before
+/// any store call, so SQLite and Postgres behave identically.
+fn require_bind_principal(
+    app: &AppState,
+    headers: &HeaderMap,
+    agent_id: &str,
+) -> Result<String, axum::response::Response> {
+    let caller = require_admin(app, headers, BIND_AGENT_PUBKEY_ACTION)?;
+    let level = crate::handlers::identity_binding::resolve_auth_level(
+        &app.enrolled_agent_keys,
+        headers,
+        &caller,
+    );
+    if crate::handlers::admin_role::pubkey_bind_principal_admitted(
+        level,
+        crate::handlers::admin_role::admin_header_trust_enabled(),
+    ) {
+        return Ok(caller);
+    }
+    crate::governance::audit::record_decision(
+        &caller,
+        "deny",
+        BIND_AGENT_PUBKEY_ACTION,
+        "#8494",
+        crate::governance::audit::ForensicPayload::new()
+            .ident("agent_id", agent_id)
+            .label("reason", BIND_CLAIMED_ADMIN_REASON),
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": BIND_ADMIN_KEY_REQUIRED_MSG})),
+    )
+        .into_response())
+}
+
 pub async fn bind_agent_pubkey(
     State(app): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyBody>,
 ) -> impl IntoResponse {
-    let caller = match require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
+    let caller = match require_bind_principal(&app, &headers, &agent_id) {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -602,7 +651,7 @@ pub async fn bind_agent_pubkey_challenge(
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyChallengeBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
+    if let Err(resp) = require_bind_principal(&app, &headers, &agent_id) {
         return resp;
     }
     if let Err(e) = validate::validate_agent_id(&agent_id) {
