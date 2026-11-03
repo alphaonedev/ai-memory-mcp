@@ -57,6 +57,8 @@ struct NotifyInput<'a> {
     priority: i32,
     tier: Tier,
     why_trace: Option<&'a str>,
+    /// #8487 — validated (trimmed) sender idempotency key; `None` = today's behaviour.
+    idempotency_key: Option<String>,
 }
 
 fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
@@ -87,6 +89,19 @@ fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
 
     validate::validate_notify_target(target)
         .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
+    // #8487 — refused before any quota charge or write; never echoes the key.
+    let idempotency_key = match &params[param_names::IDEMPOTENCY_KEY] {
+        Value::Null => None,
+        Value::String(k) => Some(
+            crate::notify_dedup::validate_idempotency_key(k)
+                .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?,
+        ),
+        _ => {
+            return Err(MemoryError::ValidationFailed(
+                "idempotency_key must be a string".into(),
+            ));
+        }
+    };
     validate::validate_title(title).map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
     validate::validate_content(payload)
         .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
@@ -100,6 +115,7 @@ fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
         why_trace: params[param_names::WHY_TRACE]
             .as_str()
             .filter(|wt| !wt.trim().is_empty()),
+        idempotency_key,
     })
 }
 
@@ -117,6 +133,7 @@ fn persist_notify(
         priority,
         tier,
         why_trace,
+        idempotency_key,
     } = input;
     let namespace = crate::inbox_namespace(target);
 
@@ -187,6 +204,25 @@ fn persist_notify(
     // one row plus the caller-controlled title/content/metadata bytes.
     let payload_bytes =
         crate::quotas::coordination_payload_bytes(&[&mem.title, &mem.content], &[&mem.metadata]);
+    // #8487 — keyed delivery: probe, charge, inbox row and dedup row in ONE
+    // transaction (storage::notify_dedup). A hit or conflict writes nothing.
+    if let Some(key) = idempotency_key.as_deref() {
+        return persist_keyed_notify(
+            conn,
+            db_path,
+            &mem,
+            &crate::storage::notify_dedup::KeyedDelivery {
+                sender,
+                target,
+                key,
+                digest: &crate::notify_dedup::content_digest(
+                    target, title, payload, priority, &mem.tier,
+                ),
+            },
+            payload_bytes,
+            title,
+        );
+    }
     // #4359 — also charge the per-sender aggregate row so a flood to many
     // DISTINCT recipients is bound, not only a flood to one.
     crate::quotas::check_and_record_notify(conn, sender, &mem.namespace, payload_bytes)
@@ -239,6 +275,75 @@ fn persist_notify(
     ))
 }
 
+/// #8487 — the keyed arm of [`persist_notify`]. A hit answers the ORIGINAL
+/// delivery (its id, tier and timestamp) with `dedup_hit: true` and wakes
+/// nobody; a conflict is the typed [`MemoryError::NotifyIdempotencyConflict`].
+fn persist_keyed_notify(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    mem: &Memory,
+    delivery: &crate::storage::notify_dedup::KeyedDelivery<'_>,
+    payload_bytes: i64,
+    subject: &str,
+) -> Result<Value, MemoryError> {
+    use crate::storage::notify_dedup::{KeyedError, KeyedOutcome, persist_keyed};
+    let (sender, target) = (delivery.sender, delivery.target);
+    match persist_keyed(conn, mem, delivery, payload_bytes) {
+        Ok(KeyedOutcome::Inserted(id)) => {
+            crate::write_events::agent_notified(
+                conn,
+                db_path,
+                &crate::write_events::AgentNotified {
+                    recipient_agent_id: target,
+                    sender_agent_id: sender,
+                    inbox_row_id: &id,
+                    namespace: &mem.namespace,
+                    content: &mem.content,
+                },
+            );
+            Ok(notify_receipt(
+                &id,
+                sender,
+                target,
+                &mem.namespace,
+                &mem.tier,
+                &mem.created_at,
+                subject,
+            ))
+        }
+        Ok(KeyedOutcome::Hit(id)) => {
+            let original = db::get(conn, &id)
+                .map_err(|e| crate::mcp::error_text::log_foreign("persist_notify hit read", e))?;
+            let (tier, delivered_at) = original.as_ref().map_or_else(
+                || (mem.tier.clone(), mem.created_at.clone()),
+                |m| (m.tier.clone(), m.created_at.clone()),
+            );
+            let mut receipt = notify_receipt(
+                &id,
+                sender,
+                target,
+                &mem.namespace,
+                &tier,
+                &delivered_at,
+                subject,
+            );
+            receipt[DEDUP_HIT_FIELD] = json!(true);
+            Ok(receipt)
+        }
+        Err(KeyedError::Conflict { original_id }) => {
+            Err(MemoryError::NotifyIdempotencyConflict { original_id })
+        }
+        Err(KeyedError::Quota(q)) => {
+            Err(crate::mcp::error_text::log_foreign("check_and_record", q))
+        }
+        Err(KeyedError::Db(e)) => Err(crate::mcp::error_text::log_foreign("persist_notify", e)),
+    }
+}
+
+/// #8487 — response field: `true` when the delivery was answered from an
+/// earlier one under the same idempotency key.
+pub(crate) const DEDUP_HIT_FIELD: &str = "dedup_hit";
+
 /// Canonical backend-blind notify response envelope (#3401).
 pub(crate) fn notify_receipt(
     id: &str,
@@ -262,6 +367,7 @@ pub(crate) fn notify_receipt(
         "delivered_at": delivered_at,
         "title": subject,
         (crate::INBOX_SUBJECT_META_KEY): subject,
+        (DEDUP_HIT_FIELD): false,
     })
 }
 
@@ -478,6 +584,11 @@ pub struct NotifyRequest {
     /// caller content, so the substrate never stamps its own rationale).
     #[serde(default)]
     pub why_trace: Option<String>,
+
+    /// Optional retry key (1-128 chars of A-Za-z0-9._:-): a repeat with the
+    /// same content returns the first id and `dedup_hit: true`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_notify`.
@@ -492,7 +603,7 @@ impl McpTool for NotifyTool {
         "Send a message from the caller to another agent's inbox."
     }
     fn docs() -> &'static str {
-        "Send message to _messages/<target>. Sender = caller agent_id. Read via memory_inbox."
+        "Send message to _messages/<target>. Sender = caller agent_id. Read via memory_inbox. Optional idempotency_key makes a retry return the first id (dedup_hit)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<NotifyRequest>()

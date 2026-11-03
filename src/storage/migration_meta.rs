@@ -439,11 +439,11 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
     // the whole batch re-runnable, so a crash mid-arm self-heals on the next
     // open — idempotent. No full-table rebuild. Settled literal rung;
-    // v100 now owns the moving tip.
+    // v101 now owns the moving tip.
     // Postgres twin is `PostgresStore::migrate_v97`.
     meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
     // v98: live/archive namespace alias view; rollback drops the view, NoLoss.
-    // Settled literal rung; v100 now owns the moving tip.
+    // Settled literal rung; v101 now owns the moving tip.
     meta(98, "CANONICAL_INBOX_NAMESPACE", true, true, NoLoss, Sqlite),
     // v99 (#3655): additive `sync_peer_contact` table (durable per-peer
     // contact, apart from the data watermark); rollback drops the table,
@@ -458,6 +458,13 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // which succeeds once no live row shares a title with a tombstone.
     // Postgres twin is `PostgresStore::migrate_v100`.
     meta(100, "TITLE_SLOT_LIVE_ROWS", true, true, NoLoss, Sqlite),
+    // v101 (#8487, v1.0.0): additive `notify_dedup` table (PRIMARY KEY
+    // `(sender, target, key)`) plus its `memory_id` index, backing the optional
+    // sender idempotency key on `memory_notify`. `CREATE ... IF NOT EXISTS`
+    // makes the batch re-runnable (idempotent); revert is DROP TABLE, and the
+    // table is a derived retry index over the durable inbox rows, so NoLoss.
+    // Postgres twin is `PostgresStore::migrate_v101`.
+    meta(101, "NOTIFY_DEDUP", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

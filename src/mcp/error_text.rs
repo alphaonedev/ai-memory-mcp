@@ -66,6 +66,7 @@ pub fn mcp_error_text(e: &MemoryError) -> String {
         | MemoryError::NotFound(_)
         | MemoryError::ValidationFailed(_)
         | MemoryError::Conflict(_)
+        | MemoryError::NotifyIdempotencyConflict { .. }
         | MemoryError::ReflectionDepthExceeded { .. }
         | MemoryError::SynthesisDepthExceeded { .. }
         | MemoryError::ReflectionCycleDetected { .. }

@@ -987,6 +987,7 @@ pub mod profile;
 // `agent_quotas` table backs three counters (memories/day, storage
 // bytes, links/day) consulted by the store_memory + memory_link write
 // paths; daily counters reset at UTC midnight via a sweep loop.
+pub mod notify_dedup;
 pub mod quotas;
 // v0.7.0 (issue #1389) — fail-safe recovery of agent context from
 // host-written transcript files (Claude Code JSONL, Codex CLI,

@@ -92,6 +92,57 @@ pub struct NotifyBody {
     /// the substrate never stamps its own rationale on a notify).
     #[serde(default)]
     pub why_trace: Option<String>,
+    /// #8487 — optional sender idempotency key (1-128 bytes of
+    /// `[A-Za-z0-9._:-]`). A retry with the same key and content answers the
+    /// first delivery with `dedup_hit: true`; the same key with different
+    /// content is a 409 carrying `original_id`. Absent = today's behaviour.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// #8487 — the 409 for a reused idempotency key with different content.
+/// Carries the original inbox row id; never echoes the key.
+fn notify_idempotency_conflict(original_id: &str) -> axum::response::Response {
+    let message = crate::errors::MemoryError::NotifyIdempotencyConflict {
+        original_id: original_id.to_owned(),
+    }
+    .message();
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error": message, "original_id": original_id})),
+    )
+        .into_response()
+}
+
+/// #8487 — the postgres `dedup_hit` answer: 200 with the ORIGINAL row's tier
+/// and timestamp (falling back to the requested tier and now when the row
+/// cannot be re-read), and `dedup_hit: true`.
+#[cfg(feature = "sal")]
+async fn notify_dedup_hit_postgres(
+    app: &AppState,
+    ctx: &crate::store::CallerContext,
+    target: &str,
+    sender: &str,
+    id: &str,
+    title: &str,
+    requested_tier: Option<Tier>,
+) -> axum::response::Response {
+    let original = app.store.get(ctx, id).await.ok();
+    let fallback_tier = requested_tier.unwrap_or(Tier::Short);
+    let fallback_at = Utc::now().to_rfc3339();
+    let mut receipt = crate::mcp::notify_receipt(
+        id,
+        sender,
+        target,
+        &crate::inbox_namespace(target),
+        original.as_ref().map_or(&fallback_tier, |m| &m.tier),
+        original
+            .as_ref()
+            .map_or(fallback_at.as_str(), |m| m.created_at.as_str()),
+        title,
+    );
+    receipt[crate::mcp::DEDUP_HIT_FIELD] = json!(true);
+    (StatusCode::OK, Json(receipt)).into_response()
 }
 
 pub async fn notify(
@@ -165,6 +216,24 @@ pub async fn notify(
             .into_response();
     }
 
+    // #8487 — validate the idempotency key ONCE, above the backend branch,
+    // before any quota charge or write; the error never echoes the key.
+    let idempotency_key = match body
+        .idempotency_key
+        .as_deref()
+        .map(crate::notify_dedup::validate_idempotency_key)
+        .transpose()
+    {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let priority_i32 = priority;
@@ -187,9 +256,9 @@ pub async fn notify(
             }
         };
         let ctx = crate::store::CallerContext::for_agent(&sender);
-        let new_id = match app
+        let outcome = match app
             .store
-            .notify(
+            .notify_outcome(
                 &ctx,
                 &body.target_agent_id,
                 &body.title,
@@ -197,12 +266,31 @@ pub async fn notify(
                 priority_i32,
                 resolved_tier.as_ref(),
                 body.why_trace.as_deref(),
+                idempotency_key.as_deref(),
             )
             .await
         {
-            Ok(id) => id,
+            Ok(o) => o,
+            Err(crate::store::StoreError::Conflict { id }) if idempotency_key.is_some() => {
+                return notify_idempotency_conflict(&id);
+            }
             Err(e) => return store_err_to_response(e),
         };
+        let new_id = outcome.id;
+        if outcome.dedup_hit {
+            // #8487 — answered from the original delivery: no wake, no
+            // webhook, no fanout (the original already did all three).
+            return notify_dedup_hit_postgres(
+                &app,
+                &ctx,
+                &body.target_agent_id,
+                &sender,
+                &new_id,
+                &body.title,
+                resolved_tier,
+            )
+            .await;
+        }
         // #3465 — the WAKE half already fired inside
         // `PostgresStore::notify` (so a direct SAL caller wakes its
         // recipient too). The WEBHOOK half has to run here: postgres
@@ -278,6 +366,9 @@ pub async fn notify(
     if let Some(wt) = body.why_trace {
         params[crate::storage::META_KEY_WHY_TRACE] = json!(wt);
     }
+    if let Some(k) = idempotency_key.as_deref() {
+        params[crate::mcp::param_names::IDEMPOTENCY_KEY] = json!(k);
+    }
 
     let lock = app.db.lock().await;
     let resolved_ttl = lock.2.clone();
@@ -296,16 +387,23 @@ pub async fn notify(
     // that every other `db::insert` write uses, so we wire it here with the
     // same posture as `fanout_or_pending`: on quorum miss return 503; on a
     // network error, swallow (local commit landed, sync-daemon catches up).
+    // #8487 — a dedup hit is answered from the original delivery: it was
+    // already fanned out, so skip the fanout and answer 200, not 201.
+    let dedup_hit = matches!(&result, Ok(v) if v[crate::mcp::DEDUP_HIT_FIELD] == json!(true));
     let fanout_mem = match &result {
-        Ok(v) => v
+        Ok(v) if !dedup_hit => v
             .get("id")
             .and_then(|x| x.as_str())
             .and_then(|id| db::get(&lock.0, id).ok().flatten()),
-        Err(_) => None,
+        Ok(_) | Err(_) => None,
     };
     drop(lock);
 
     match result {
+        Ok(v) if dedup_hit => (StatusCode::OK, Json(v)).into_response(),
+        Err(crate::errors::MemoryError::NotifyIdempotencyConflict { original_id }) => {
+            notify_idempotency_conflict(&original_id)
+        }
         Ok(v) => {
             if let Some(mem) = fanout_mem
                 && let Some(resp) = fanout_or_pending(&app, &mem).await

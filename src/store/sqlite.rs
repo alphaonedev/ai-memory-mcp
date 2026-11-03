@@ -4216,6 +4216,31 @@ impl MemoryStore for SqliteStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        self.notify_outcome(
+            ctx,
+            target_agent,
+            title,
+            payload,
+            priority,
+            tier,
+            why_trace,
+            None,
+        )
+        .await
+        .map(|o| o.id)
+    }
+
+    async fn notify_outcome(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+        why_trace: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<super::NotifyOutcome> {
         // #4338 — refuse an invalid recipient before any quota charge, write
         // or wake; the shared validator never echoes the value.
         crate::validate::validate_notify_target(target_agent).map_err(|e| {
@@ -4223,6 +4248,14 @@ impl MemoryStore for SqliteStore {
                 detail: e.to_string(),
             }
         })?;
+        // #8487 — a bad idempotency key is refused before any quota charge or
+        // write; the error never echoes the key.
+        let key = idempotency_key
+            .map(crate::notify_dedup::validate_idempotency_key)
+            .transpose()
+            .map_err(|e| StoreError::InvalidInput {
+                detail: e.to_string(),
+            })?;
         // Compose the notify memory using the same shape as
         // `mcp::handle_notify`: a memory in `_inbox/<target_agent>` with
         // `metadata.target_agent_id` set so subsequent inbox pulls find it.
@@ -4283,6 +4316,69 @@ impl MemoryStore for SqliteStore {
         // inbox namespace, but the authenticated sender pays for the write.
         let payload_bytes =
             quotas::coordination_payload_bytes(&[&mem.title, &mem.content], &[&mem.metadata]);
+        if let Some(key) = key.as_deref() {
+            // #8487 — keyed delivery: probe, charge, insert and dedup row in
+            // one funnel (`storage::notify_dedup::persist_keyed`).
+            let digest = crate::notify_dedup::content_digest(
+                target_agent,
+                title,
+                payload,
+                crate::models::normalize_priority(i64::from(priority)),
+                &mem.tier,
+            );
+            let delivery = crate::storage::notify_dedup::KeyedDelivery {
+                sender: &ctx.agent_id,
+                target: target_agent,
+                key,
+                digest: &digest,
+            };
+            return match crate::storage::notify_dedup::persist_keyed(
+                &conn,
+                &mem,
+                &delivery,
+                payload_bytes,
+            ) {
+                Ok(crate::storage::notify_dedup::KeyedOutcome::Inserted(new_id)) => {
+                    crate::write_events::agent_notified(
+                        &conn,
+                        &self.path,
+                        &crate::write_events::AgentNotified {
+                            recipient_agent_id: target_agent,
+                            sender_agent_id: &ctx.agent_id,
+                            inbox_row_id: &new_id,
+                            namespace: &mem.namespace,
+                            content: payload,
+                        },
+                    );
+                    Ok(super::NotifyOutcome {
+                        id: new_id,
+                        dedup_hit: false,
+                    })
+                }
+                Ok(crate::storage::notify_dedup::KeyedOutcome::Hit(id)) => {
+                    Ok(super::NotifyOutcome {
+                        id,
+                        dedup_hit: true,
+                    })
+                }
+                Err(crate::storage::notify_dedup::KeyedError::Conflict { original_id }) => {
+                    Err(StoreError::Conflict { id: original_id })
+                }
+                Err(crate::storage::notify_dedup::KeyedError::Quota(
+                    quotas::QuotaCheckError::Quota(q),
+                )) => Err(StoreError::QuotaExceeded {
+                    agent_id: q.agent_id,
+                    namespace: q.namespace,
+                    limit: q.limit.as_str().to_string(),
+                    current: q.current,
+                    max: q.max,
+                }),
+                Err(crate::storage::notify_dedup::KeyedError::Quota(
+                    quotas::QuotaCheckError::Sql(e),
+                )) => Err(box_err(e)),
+                Err(crate::storage::notify_dedup::KeyedError::Db(e)) => Err(box_err(e)),
+            };
+        }
         // #4359 — also charges the per-sender aggregate row.
         match quotas::check_and_record_notify(&conn, &ctx.agent_id, &mem.namespace, payload_bytes) {
             Ok(()) => {}
@@ -4317,7 +4413,10 @@ impl MemoryStore for SqliteStore {
                         content: payload,
                     },
                 );
-                Ok(new_id)
+                Ok(super::NotifyOutcome {
+                    id: new_id,
+                    dedup_hit: false,
+                })
             }
             Err(e) => {
                 if let Err(refund_err) =

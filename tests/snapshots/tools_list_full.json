@@ -2845,6 +2845,12 @@
       "description": "Send a message from the caller",
       "inputSchema": {
         "properties": {
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "payload": {
             "type": "string"
           },

@@ -93,6 +93,18 @@ application checkpoint. An inbox listing does not acknowledge successful work.
 A shell equivalent is `ai-memory --agent-id "$AGENT" inbox --json` on that
 scheduler. Do not sleep only when the previous read was empty.
 
+Sender side: a `memory_notify` (MCP), `POST /api/v1/notify` (HTTP) or
+`ai-memory notify` (CLI) that times out is ambiguous, and a blind retry
+delivers twice. Pass the optional `idempotency_key` (`--idempotency-key` on the
+CLI; 1 to 128 bytes of `A-Za-z0-9._:-`, trimmed) on the first attempt and on
+every retry. The key is scoped to the authenticated sender and the recipient.
+A retry with the same content returns the first delivery's `id` with
+`"dedup_hit": true` (HTTP 200, no second wake, webhook or federation push). The
+same key with different content is refused as a conflict (HTTP 409, an MCP
+error) that names the original `id` and never echoes the key. An invalid key is
+refused before anything is charged or written. Without a key every call
+delivers, as before; `dedup_hit` is then always `false`.
+
 Python can use the shipped SDK and its existing HTTP authentication settings:
 
 ```python
@@ -331,7 +343,9 @@ CLI environment from section 3. Supply an executable adapter as `AGENT_PASS`;
 its sole argument is a JSON array of rows, and exit zero means the whole batch
 has been durably handled. The adapter may launch any CLI agent. It must treat
 row IDs as idempotency keys because a crash after a side effect but before the
-checkpoint can replay that batch. `GATE_STATE` is a private directory used by
+checkpoint can replay that batch. When the adapter itself sends a reply with
+`memory_notify`, derive its `idempotency_key` from the row ID so that replay
+cannot deliver the reply twice. `GATE_STATE` is a private directory used by
 exactly one gate instance. Never delete it just to clear a retry.
 
 ```bash
@@ -517,6 +531,7 @@ placeholders; never copy an operator's keys or deployment coordinates.
 | Hub reachable, listener unauthorized | Check matching hub ID, enrolled key, bundle ownership/mode/expiry and fresh allowlist; renew as in section 3. Never disable verification. |
 | Inbox rows arrive but no hints | Check `sink_socket`, producer enrolment, snapshot refresh, use of the daemon send surface, and the cross-host limitation in #3631. Polling remains required. |
 | Shell agent reruns the same task | Inbox listings are not acknowledgements; persist row-ID deduplication and commit it only after successful processing. |
+| Sender retried a notify and the recipient has it twice | The retry carried no `idempotency_key`. Send one on every attempt; a repeat returns the first `id` with `dedup_hit: true`. A 409 means the key was already used with different content: use a new key for new content. |
 
 For example, generate a fresh named-curve key with the OpenSSL 3 executable
 selected as `OPENSSL3` (then issue the certificate through your normal CA):

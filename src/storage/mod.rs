@@ -944,6 +944,7 @@ pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
 pub mod model_attest;
+pub mod notify_dedup;
 /// #1955 [P1][R45] — substrate record-stop actuator (storage layer): the
 /// non-feature-gated flag registry + attestation logic + the
 /// `StorageError::RecordStopped` `db::`-funnel gate. Lives here (not under
@@ -6390,7 +6391,13 @@ fn purge_and_tombstone_forget(
         q
     };
     let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(AsRef::as_ref).collect();
-    for table in ["federation_push_dlq", "transcript_line_dedup"] {
+    // #8487 — `notify_dedup` holds the erased inbox row id and the sha256 of its
+    // content: the same remanence class, purged with the rest.
+    for table in [
+        "federation_push_dlq",
+        "transcript_line_dedup",
+        "notify_dedup",
+    ] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE memory_id IN ({victims})"),
             refs.as_slice(),
@@ -7021,6 +7028,7 @@ fn tombstone_and_erase(
     // content-hash oracle intact AFTER the "crypto-erase".
     conn.execute(SQL_DELETE_DLQ_BY_MEMORY_ID, params![id])?;
     conn.execute(SQL_DELETE_DEDUP_BY_MEMORY_ID, params![id])?;
+    conn.execute(notify_dedup::SQL_DELETE_BY_MEMORY_ID, params![id])?;
     Ok(())
 }
 

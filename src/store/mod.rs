@@ -302,6 +302,17 @@ impl std::fmt::Display for KgBackend {
     }
 }
 
+/// #8487 — the result of a notify: the inbox row id and whether it was
+/// answered from the sender idempotency key (`dedup_hit`) instead of a fresh
+/// insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyOutcome {
+    /// The inbox row id (the original id on a dedup hit).
+    pub id: String,
+    /// `true` when the key matched an earlier identical delivery.
+    pub dedup_hit: bool,
+}
+
 /// The single error type returned by every `MemoryStore` method.
 ///
 /// Callers match on the variant they care about; the trailing
@@ -4635,6 +4646,46 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<String> {
         Err(StoreError::UnsupportedCapability {
             capability: "NOTIFY".to_string(),
+        })
+    }
+
+    /// #8487 — [`MemoryStore::notify`] with the optional sender idempotency
+    /// key. `idempotency_key` is the already-validated (trimmed) key; the
+    /// sender is `ctx.agent_id`, never a request field. With `None` this is
+    /// exactly `notify`. With a key the probe, the inbox insert and the
+    /// `notify_dedup` insert share one transaction: a retry with the same
+    /// content returns the original id with `dedup_hit: true` and writes
+    /// nothing; the same key with different content is
+    /// [`StoreError::Conflict`] carrying the original id; any probe or insert
+    /// error is a typed store error with nothing written and the quota
+    /// refunded (fail closed).
+    ///
+    /// Default delegates to `notify` for `None` and returns
+    /// `UnsupportedCapability` for a key (an adapter that cannot dedup must
+    /// not pretend to).
+    #[allow(clippy::too_many_arguments)]
+    async fn notify_outcome(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+        why_trace: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<NotifyOutcome> {
+        if idempotency_key.is_some() {
+            return Err(StoreError::UnsupportedCapability {
+                capability: "NOTIFY_IDEMPOTENCY_KEY".to_string(),
+            });
+        }
+        let id = self
+            .notify(ctx, target_agent, title, payload, priority, tier, why_trace)
+            .await?;
+        Ok(NotifyOutcome {
+            id,
+            dedup_hit: false,
         })
     }
 

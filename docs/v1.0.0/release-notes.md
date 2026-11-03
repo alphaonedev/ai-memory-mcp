@@ -91,13 +91,13 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v100**. The ladder is not uniformly additive:
+advances the schema **v78 → v101**. The ladder is not uniformly additive:
 v86/v87 normalize stored timestamp renderings, v97 rewrites existing
 agent-registration memory rows (take a backup before upgrading), v89 rebuilds the derived
 PostgreSQL FTS column, v92 rebuilds SQLite's `schema_version` table to add
-its bound, and v100 replaces the title-slot unique index with a partial
-index. Other additions and backfills are described per rung in
-§"Schema ladder v78 → v100"; historical migration trials attest only their
+its bound, the title-slot unique index becomes a partial index (rung 100),
+and v101 adds the additive `notify_dedup` table. Other additions and backfills are described per rung in
+§"Schema ladder v78 → v101"; historical migration trials attest only their
 stated version range. The release also adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
 open-time rollback-evidence check, an inference-plane egress gate, and a
@@ -117,7 +117,7 @@ CLI subcommands):
 | HTTP routes | **103 production `.route(...)` registrations** / 89 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that **v97 also rewrites existing `_agents` registration rows in `memories`** (removes `metadata.write_signature`, sets `attest_level=claimed`; sqlite `0081_v97_agent_pubkey_history.sql:118-140`, postgres `0054_v97_agent_pubkey_history.sql:118-132` — take a backup first) and v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
+| Schema | **v101** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that **v97 also rewrites existing `_agents` registration rows in `memories`** (removes `metadata.write_signature`, sets `attest_level=claimed`; sqlite `0081_v97_agent_pubkey_history.sql:118-140`, postgres `0054_v97_agent_pubkey_history.sql:118-132` — take a backup first) and v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v101" |
 
 ## Before upgrading — run `ai-memory config check` (#3715)
 
@@ -648,7 +648,7 @@ program:
    rollback-evidence readouts resolve cleanly on both backends). **That
    dogfood covers v78 → v86 and nothing above it** — v87 through v100
    landed afterwards on `release/v1.0.0` and are NOT covered by it. See
-   §"Schema ladder v78 → v100".
+   §"Schema ladder v78 → v101".
 
 ### Scope of this attestation
 
@@ -712,12 +712,12 @@ those two review lanes raised, and no tag has been cut.
 > summarized here for completeness and to record that both review lanes
 > closed with zero GA-blockers among the findings they raised.
 
-## Schema ladder v78 → v100
+## Schema ladder v78 → v101
 
-`CURRENT_SCHEMA_VERSION = 100` on both adapters
+`CURRENT_SCHEMA_VERSION = 101` on both adapters
 (`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
-`src/store/postgres.rs::{migrate_v79 … migrate_v100}`.
+`src/store/postgres.rs::{migrate_v79 … migrate_v101}`.
 
 **The ladder is not uniformly additive, and this document previously
 said it was.** v79–v85 are pure additive `ADD COLUMN` / `CREATE TABLE`

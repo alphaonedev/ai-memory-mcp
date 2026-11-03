@@ -102,11 +102,11 @@ fn conflict(err: &anyhow::Error) -> &ConflictError {
 }
 
 /// #3690 — the schema claim, on both halves the sqlite side owns: the ladder
-/// tip is 100 and the SHIPPED index is the partial one.
+/// tip is 101 (v100 introduced the partial index) and the SHIPPED index is the partial one.
 #[test]
 fn sqlite_schema_v100_carries_the_partial_title_slot_index_3690() {
     let (_dir, conn) = open();
-    assert_eq!(ai_memory::storage::current_schema_version_for_tests(), 100);
+    assert_eq!(ai_memory::storage::current_schema_version_for_tests(), 101);
     let ddl: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_title_ns'",
