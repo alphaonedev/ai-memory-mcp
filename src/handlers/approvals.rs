@@ -9,8 +9,9 @@
 //! Gated behind the K7 server-wide HMAC: caller MUST present
 //! `X-AI-Memory-Signature: sha256=<hex>` keyed on
 //! `SHA256([hooks.subscription].hmac_secret)` over the canonical
-//! `<timestamp>.<METHOD>.<pending_id>@<X-Agent-Id>.<body>` string
-//! (signature layout v2, #8495): the method, the pending-row id and the
+//! `<timestamp>.<METHOD>.<n>:<pending_id>@<m>:<X-Agent-Id>.<body>` string
+//! (signature layout v2, #8495; `<n>`, `<m>` = decimal byte lengths, #8546):
+//! the method, the pending-row id and the
 //! approver are all bound, so a signature cannot be replayed against a
 //! different row or re-attributed to a different approver; see
 //! `verify_approver_bound_hmac`. Missing or invalid signature → 401; a v1
@@ -131,7 +132,7 @@ pub(crate) const APPROVAL_HMAC_MAX_SKEW_SECS: i64 = 60;
 /// lockstep with this change.
 ///
 /// This is the subject-generic verifier: the caller chooses `subject`.
-/// The agent api-key approval route passes `<pending_id>@<approver>`; the
+/// The agent api-key approval route passes `approval_subject` (`<n>:<pending_id>@<m>:<approver>`); the
 /// K10 decide surfaces go through [`verify_approver_bound_hmac`] (#8495),
 /// which builds that subject from `X-Agent-Id` itself.
 pub(crate) fn verify_approval_hmac(
@@ -157,14 +158,17 @@ pub(crate) fn verify_approval_hmac(
 ///   to the approver: `X-Agent-Id` sat beside the signed bytes, so a signed
 ///   decide could be re-attributed and one secret holder could vote under N
 ///   names.
-/// * v2 (`<ts>.<METHOD>.<pending_id>@<approver>.<body>`) puts the approver
+/// * v2 (`<ts>.<METHOD>.<n>:<pending_id>@<m>:<approver>.<body>`, `<n>` and
+///   `<m>` the decimal byte lengths of the two ids, #8546) puts the approver
 ///   inside the signed subject, the layout
-///   [`super::agent_api_key::approval_subject`] already uses.
+///   [`super::agent_api_key::approval_subject`] already uses. The lengths
+///   make the subject injective: a pending id may hold `@` and an approver
+///   may hold `.`, so without them two different `(pending_id, approver,
+///   body)` triples could sign the same bytes.
 ///
 /// A v1 signature that still verifies is reported as
 /// [`LEGACY_UNBOUND_APPROVER`] and refused; it is never counted as a bound
-/// approval. The two layouts cannot collide: after the pending id the next
-/// signed byte is `.` in v1 and `@` in v2.
+/// approval.
 pub const APPROVAL_SIGNATURE_LAYOUT_VERSION: u32 = 2;
 
 /// #8495 — wire error for a decide signed under the v1 layout (approver
@@ -175,7 +179,8 @@ pub const LEGACY_UNBOUND_APPROVER: &str = "legacy_unbound_approver";
 /// the refusal and the docs cannot drift apart.
 pub const APPROVER_BOUND_SIGNATURE_HINT: &str = "approval decides require signature layout v2: \
      X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \
-     \"<ts>.<METHOD>.<pending_id>@<X-Agent-Id>.<body>\")> with \
+     \"<ts>.<METHOD>.<n>:<pending_id>@<m>:<X-Agent-Id>.<body>\")> (<n>, <m> = \
+     the decimal byte lengths of the two ids) with \
      X-AI-Memory-Timestamp: <unix-epoch-secs>. The approver named by \
      X-Agent-Id is inside the signed subject; a v1 signature over \
      <ts>.<METHOD>.<pending_id>.<body> does not bind the approver and is refused.";
@@ -208,6 +213,27 @@ impl ApproverHmacRefusal {
         )
             .into_response()
     }
+}
+
+/// #8546 — refuse a non-empty decide body that is not JSON with `400`.
+///
+/// The governance decide verbs read their body best-effort, so before #8546
+/// a body that was not JSON was read as "nothing presented" AFTER its
+/// signature had been checked and spent. Called BEFORE the HMAC check, so a
+/// malformed body never consumes a nonce and never reaches the verifier.
+pub(crate) fn refuse_non_json_body(body: &[u8]) -> Option<axum::response::Response> {
+    if body.trim_ascii().is_empty() {
+        return None;
+    }
+    serde_json::from_slice::<serde::de::IgnoredAny>(body)
+        .err()
+        .map(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid("body", e)})),
+            )
+                .into_response()
+        })
 }
 
 /// #8495 — HMAC-verify a decide under the approver-bound v2 layout.

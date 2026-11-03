@@ -204,6 +204,12 @@ pub async fn approve_pending(
     // regardless of `api_key` configuration. Without a server-wide
     // `[hooks.subscription].hmac_secret`, `verify_approver_bound_hmac`
     // refuses every request — the safe default.
+    //
+    // #8546: a non-empty body that is not JSON is refused BEFORE the HMAC,
+    // so it never spends a signature and is never read as "no approvals".
+    if let Some(resp) = super::approvals::refuse_non_json_body(&body_bytes) {
+        return resp;
+    }
     if let Err(refusal) = super::approvals::verify_approver_bound_hmac(
         &headers,
         &body_bytes,
@@ -524,6 +530,11 @@ pub async fn reject_pending(
     // Legacy reject endpoint MUST verify HMAC for the same reason — an
     // unsigned reject is just as dangerous (denial-of-service against
     // governance state, write-amplifies pending row churn).
+    //
+    // #8546: same body-shape refusal as approve, BEFORE the HMAC.
+    if let Some(resp) = super::approvals::refuse_non_json_body(&body_bytes) {
+        return resp;
+    }
     if let Err(refusal) = super::approvals::verify_approver_bound_hmac(
         &headers,
         &body_bytes,

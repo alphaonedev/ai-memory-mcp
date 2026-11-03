@@ -43,7 +43,7 @@ static A1_HMAC_LOCK: Mutex<()> = Mutex::new(());
 /// Synthesise a K10 approval signature binding method + `pending_id` per
 /// release/v0.7.0 commit 99ffacc. #8495 layout v2: callers pass
 /// `approval_subject(pid, approver)` so the canonical is
-/// `<ts>.<METHOD>.<pending_id>@<approver>.<body>`.
+/// `<ts>.<METHOD>.<n>:<pending_id>@<m>:<approver>.<body>`.
 fn sign(secret: &str, timestamp: &str, method: &str, pending_id: &str, body: &str) -> String {
     use sha2::Digest;
     use sha2::Sha256;

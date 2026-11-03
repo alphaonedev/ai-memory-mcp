@@ -1479,7 +1479,10 @@ fn sign(secret: &str, timestamp: &str, body: &str) -> String {
         secret,
         timestamp,
         "POST",
-        "00000000-0000-0000-0000-000000000000@l07-approver",
+        &ai_memory::handlers::agent_api_key::approval_subject(
+            "00000000-0000-0000-0000-000000000000",
+            "l07-approver",
+        ),
         body,
     )
 }

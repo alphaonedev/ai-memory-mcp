@@ -32,7 +32,7 @@ use tower::ServiceExt as _;
 
 // v0.7.0 refactor PR-5 (#793) — shared K10 HMAC fixture lives in
 // `tests/common/mod.rs`. The legacy in-file `sign()` helper below
-// (which binds the #8495 layout-v2 `<ts>.POST.<pending_id>@<approver>.<body>`
+// (which binds the #8495 layout-v2 `<ts>.POST.<n>:<pending_id>@<m>:<approver>.<body>`
 // canonical) is preserved as a facade that delegates to the common
 // helper so this file's call-sites do not churn.
 mod common;

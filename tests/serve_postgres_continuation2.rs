@@ -661,7 +661,7 @@ async fn namespace_standard_clear_via_sal() {
 
 /// Compute the K7-style HMAC signature header value for an approve/reject
 /// request body. Mirrors the helper in `tests/k10_approval_http.rs`. The
-/// canonical-string contract (#8495 layout v2) is `<ts>.<METHOD>.<pending_id>@<approver>.<body>` hashed
+/// canonical-string contract (#8495 layout v2) is `<ts>.<METHOD>.<n>:<pending_id>@<m>:<approver>.<body>` hashed
 /// with HMAC-SHA256 keyed on `SHA256(secret)`.
 fn sign_approval(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -705,7 +705,10 @@ fn sign_approval(secret: &str, timestamp: &str, pending_id: &str, body: &str) ->
         format!("{:x}", outer.finalize())
     }
     let key_hash = sha256_hex(secret);
-    let canonical = format!("{timestamp}.POST.{pending_id}@pending-test.{body}");
+    let canonical = format!(
+        "{timestamp}.POST.{}.{body}",
+        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "pending-test")
+    );
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
 }

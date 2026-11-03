@@ -251,7 +251,7 @@ fn signed_approval(pending_id: &str, body: &str) -> Request<Body> {
         HMAC_SECRET,
         &timestamp,
         "POST",
-        &format!("{pending_id}@operator-1"),
+        &ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-1"),
         body,
     );
     Request::builder()
@@ -1030,7 +1030,7 @@ async fn approval_decide_stale_timestamp_is_401() {
         HMAC_SECRET,
         &stale_ts,
         "POST",
-        &format!("{pending_id}@operator-1"),
+        &ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-1"),
         &body,
     );
     let req = Request::builder()
@@ -1064,7 +1064,7 @@ async fn approval_decide_nonce_replay_is_401() {
         HMAC_SECRET,
         &timestamp,
         "POST",
-        &format!("{pending_id}@operator-1"),
+        &ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-1"),
         &body,
     );
     let make = || {
@@ -1108,7 +1108,7 @@ async fn approval_decide_invalid_id_shape_is_400() {
         HMAC_SECRET,
         &timestamp,
         "POST",
-        &format!("{decoded_id}@operator-1"),
+        &ai_memory::handlers::agent_api_key::approval_subject(&decoded_id, "operator-1"),
         &body,
     );
     let req = Request::builder()
