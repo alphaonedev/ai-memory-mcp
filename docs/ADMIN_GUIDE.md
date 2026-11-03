@@ -1371,6 +1371,22 @@ on the data-tier host, MCP stdio) is unchanged. A refused request returns 403,
 binds nothing, and writes a `bind_agent_pubkey` /
 `claimed_admin_not_key_authenticated` row to the forensic audit chain.
 
+**Minting and revoking an api-key needs a verified admin (#8535).**
+`POST /api/v1/agents/{id}/api-key` and `POST /api/v1/agents/{id}/api-key/revoke`
+use the same principal gate as the pubkey bind above: a CLAIMED admin header
+(the shared `api_key` plus `X-Agent-Id: <admin>`) is refused with `403`,
+an `agent_api_key_mint` / `agent_api_key_revoke` row with reason
+`claimed_admin_not_key_authenticated` lands on the forensic audit chain, and no
+key is stored or removed. Without this a header claim could mint an admin's own
+per-agent key and so satisfy the bind gate. The route requires either an admin
+presenting its own enrolled per-agent key, or the explicit operator opt-in
+`AI_MEMORY_ADMIN_HEADER_TRUST=1`. **Bootstrapping the first admin key**: run
+`ai-memory agents bind-api-key --agent-id <admin> --token "$TOKEN"` on the
+data-tier host (the local operator funnel, ungated), or start the daemon once
+with `AI_MEMORY_ADMIN_HEADER_TRUST=1`, mint the key over HTTP, then unset the
+variable. A malformed `{id}` is a `400` before any audit row is written (#8536),
+on these routes and on the pubkey bind routes.
+
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
 
 ### Multi-User Warning
