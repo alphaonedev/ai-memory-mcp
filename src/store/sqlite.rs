@@ -416,6 +416,36 @@ fn assert_caller_owns_for_mutation(
     })
 }
 
+/// #8564 — the owner gate of an approved delete / tier-bump execute: the
+/// row must be stamped and owned by the agent that REQUESTED the action
+/// (the approver only admits it). An unstamped row is refused in every
+/// posture, matching the Postgres arms; the inbox carve-out is off.
+fn execute_owner_gate(
+    conn: &rusqlite::Connection,
+    pa: &crate::models::PendingAction,
+    mid: &str,
+    arm: db::ExecuteArm,
+) -> StoreResult<()> {
+    let (action, funnel) = match arm {
+        db::ExecuteArm::Delete => ("delete", crate::identity::owner_stamp::funnel::DELETE),
+        db::ExecuteArm::TierBump => ("update", crate::identity::owner_stamp::funnel::UPDATE),
+    };
+    let Some(target) = db::get(conn, mid).map_err(box_err)? else {
+        return Err(StoreError::NotFound {
+            id: mid.to_string(),
+        });
+    };
+    if crate::identity::owner_stamp::OwnerStamp::of(&target.metadata).is_unstamped() {
+        return Err(StoreError::PermissionDenied {
+            action: action.to_string(),
+            target: mid.to_string(),
+            reason: crate::identity::owner_stamp::REASON_UNSTAMPED_REFUSED.to_string(),
+        });
+    }
+    let requester = CallerContext::for_agent(pa.requested_by.as_str());
+    assert_caller_owns_for_mutation(conn, &requester, mid, action, false, funnel)
+}
+
 /// #3957 — test-only interleave point between the ownership gate and the
 /// write it authorises. A cell arms it for ONE row id; any other id (a
 /// concurrent test on another row) passes through untouched. Compiled out
@@ -4338,6 +4368,11 @@ impl MemoryStore for SqliteStore {
     /// `execute_pending_action` (which returned `UnsupportedCapability`).
     /// Delegates to the canonical sqlite primitive `db::execute_pending_action`
     /// so the SAL trait is the canonical execute surface across backends.
+    ///
+    /// #8564 — the delete and tier-bump arms run under the REQUESTER's
+    /// owner gate ([`execute_owner_gate`]), the SQLite twin of the
+    /// Postgres arms (f30c81a7f): another agent's row and an unstamped
+    /// row are refused `PermissionDenied` and left untouched.
     async fn execute_pending_action(
         &self,
         _ctx: &CallerContext,
@@ -4345,7 +4380,15 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<Option<String>> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::execute_pending_action(&conn, pending_id).map_err(box_err)
+        let gate = |conn: &rusqlite::Connection,
+                    pa: &crate::models::PendingAction,
+                    mid: &str,
+                    arm: db::ExecuteArm|
+         -> anyhow::Result<()> {
+            execute_owner_gate(conn, pa, mid, arm).map_err(anyhow::Error::new)
+        };
+        db::execute_pending_action_gated(&conn, pending_id, Some(&gate))
+            .map_err(|e| e.downcast::<StoreError>().unwrap_or_else(box_err))
     }
 
     /// FX-C2-batch5 — Sqlite override matching the nominal SQLite

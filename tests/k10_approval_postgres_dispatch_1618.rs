@@ -133,7 +133,7 @@ fn seed_pending_row_in_store(store_path: &std::path::Path, requested_by: &str) -
         source: "test".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
-        metadata: json!({}),
+        metadata: json!({"agent_id": requested_by}),
         version: 1,
         ..ai_memory::models::Memory::default()
     };
