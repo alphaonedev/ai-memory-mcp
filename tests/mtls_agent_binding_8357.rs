@@ -486,10 +486,23 @@ fn unmapped_binding(mode: AgentBindingMode) -> ClientCertAgentBinding {
 async fn unmapped_cert_cannot_claim_bound_agent_under_enforce() {
     let unmapped = unmapped_binding(AgentBindingMode::Enforce);
     assert_eq!(unmapped.agent_id(), None, "FP_B is not in the map");
-    assert_ne!(
+    assert_eq!(
         decide(&unmapped, Some(MAPPED), false),
-        CertClaimDecision::Pass,
+        CertClaimDecision::RefuseBoundClaim {
+            claimed: MAPPED.to_string()
+        },
         "an unmapped cert claiming a bound agent must not pass under enforce"
+    );
+    assert_eq!(
+        decide(
+            &unmapped_binding(AgentBindingMode::Warn),
+            Some(MAPPED),
+            false
+        ),
+        CertClaimDecision::WarnBoundClaim {
+            claimed: MAPPED.to_string()
+        },
+        "warn serves the bound claim and audits it"
     );
     assert_eq!(
         decide(&unmapped, Some(MAPPED), true),

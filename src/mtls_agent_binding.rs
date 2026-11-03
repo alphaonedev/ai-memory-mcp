@@ -21,11 +21,17 @@
 //! * Per request, [`bind_request`] (called first in `api_key_auth`) makes the
 //!   mapped agent the effective `X-Agent-Id`. A different claim is refused
 //!   with 403 [`AGENT_ID_CERTIFICATE_MISMATCH`] under `enforce`, rewritten to
-//!   the mapped agent under `warn`; both write a forensic audit row.
+//!   the mapped agent under `warn`; both write a forensic audit row. The
+//!   certificate also wins over an enrolled per-agent api key for a
+//!   different agent ([`reconcile_per_agent_key`]).
+//! * A certificate that is allowlisted but NOT in the map cannot claim an
+//!   agent id the map binds (the table keeps the reverse set of bound ids):
+//!   `enforce` refuses it with the same 403 on every route. An unmapped
+//!   certificate claiming an unbound id keeps the claimed id.
 //! * A map with no client-auth listener (plain TLS), an empty map, a
 //!   duplicate fingerprint, a malformed line, a reserved or invalid agent id,
-//!   or a mapped fingerprint the allowlist cannot admit refuses boot
-//!   ([`resolve_boot`]).
+//!   a mapped fingerprint the allowlist cannot admit, or an explicit
+//!   `warn` / `enforce` with no map refuses boot ([`resolve_boot`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -169,6 +175,8 @@ pub fn load_agent_binding_map(path: &Path) -> Result<AgentBindingMap> {
 #[derive(Debug)]
 pub struct AgentBindingTable {
     map: AgentBindingMap,
+    /// Reverse index: every agent id some fingerprint is bound to.
+    bound_agents: Arc<HashSet<String>>,
     mode: AgentBindingMode,
 }
 
@@ -176,7 +184,12 @@ impl AgentBindingTable {
     /// Build a table. Callers in the daemon go through [`resolve_boot`].
     #[must_use]
     pub fn new(map: AgentBindingMap, mode: AgentBindingMode) -> Self {
-        Self { map, mode }
+        let bound_agents = Arc::new(map.values().cloned().collect());
+        Self {
+            map,
+            bound_agents,
+            mode,
+        }
     }
 
     /// The posture every request on this listener is held to.
@@ -204,6 +217,7 @@ impl AgentBindingTable {
         ClientCertAgentBinding {
             agent_id: fingerprint.and_then(|fp| self.map.get(fp)).cloned(),
             fingerprint: fingerprint.copied(),
+            bound_agents: Arc::clone(&self.bound_agents),
             mode: self.mode,
         }
     }
@@ -215,18 +229,29 @@ impl AgentBindingTable {
 pub struct ClientCertAgentBinding {
     agent_id: Option<String>,
     fingerprint: Option<[u8; 32]>,
+    /// The table's reverse index (shared, never copied per request).
+    bound_agents: Arc<HashSet<String>>,
     mode: AgentBindingMode,
 }
 
 impl ClientCertAgentBinding {
-    /// Build an extension directly (in-process router tests).
+    /// Build an extension directly (in-process router tests). The bound-agent
+    /// set holds only `agent_id`; the live acceptor builds the extension
+    /// through [`AgentBindingTable::binding_for`] with the whole map's set.
     #[must_use]
     pub fn new(agent_id: Option<String>, mode: AgentBindingMode) -> Self {
         Self {
+            bound_agents: Arc::new(agent_id.iter().cloned().collect()),
             agent_id,
             fingerprint: None,
             mode,
         }
+    }
+
+    /// `true` when the map binds `agent_id` to some certificate.
+    #[must_use]
+    pub fn is_bound_agent(&self, agent_id: &str) -> bool {
+        self.bound_agents.contains(agent_id)
     }
 
     /// The agent the presenting certificate is bound to; `None` when its
@@ -279,6 +304,11 @@ pub enum CertClaimDecision {
     RefuseUnmapped,
     /// A sync-route certificate maps to no agent; `warn` serves it.
     WarnUnmapped,
+    /// A certificate outside the map claims an agent the map binds to
+    /// another certificate; `enforce` refuses with 403.
+    RefuseBoundClaim { claimed: String },
+    /// As [`Self::RefuseBoundClaim`]; `warn` serves it and audits.
+    WarnBoundClaim { claimed: String },
 }
 
 /// The pure per-request decision. `claimed` is the `X-Agent-Id` header
@@ -295,10 +325,23 @@ pub fn decide(
         AgentBindingMode::Enforce => true,
     };
     let Some(agent) = binding.agent_id.clone() else {
-        return match (sync_route, enforce) {
-            (false, _) => CertClaimDecision::Pass,
-            (true, true) => CertClaimDecision::RefuseUnmapped,
-            (true, false) => CertClaimDecision::WarnUnmapped,
+        if sync_route {
+            return if enforce {
+                CertClaimDecision::RefuseUnmapped
+            } else {
+                CertClaimDecision::WarnUnmapped
+            };
+        }
+        // An unmapped certificate may not borrow a BOUND agent's id; an id
+        // the map does not bind keeps the pre-#8357 posture (claimed).
+        return match claimed.filter(|c| binding.is_bound_agent(c)) {
+            None => CertClaimDecision::Pass,
+            Some(c) if enforce => CertClaimDecision::RefuseBoundClaim {
+                claimed: c.to_string(),
+            },
+            Some(c) => CertClaimDecision::WarnBoundClaim {
+                claimed: c.to_string(),
+            },
         };
     };
     match claimed.filter(|c| !c.is_empty()) {
@@ -323,22 +366,24 @@ fn refusal(code: &'static str, message: String) -> Response {
         .into_response()
 }
 
+/// The durable mismatch row. `agent` is the certificate's agent, `None`
+/// for a certificate outside the map (actor [`UNMAPPED_ACTOR`]).
 fn audit_mismatch(
     binding: &ClientCertAgentBinding,
-    agent: &str,
+    agent: Option<&str>,
     claimed: &str,
     path: &str,
     decision: &str,
 ) {
     record_decision(
-        agent,
+        agent.unwrap_or(UNMAPPED_ACTOR),
         decision,
         AUDIT_KIND_MTLS_AGENT_BINDING,
         "",
         ForensicPayload::new()
             .label("outcome", AGENT_ID_CERTIFICATE_MISMATCH)
             .label("mode", binding.mode.as_str())
-            .ident("certificate_agent_id", agent)
+            .opt_ident("certificate_agent_id", agent)
             .ident_or_commit("claimed_agent_id", claimed)
             .ident_or_commit("certificate_fingerprint", &binding.fingerprint_hex())
             .ident_or_commit("endpoint", path),
@@ -380,7 +425,7 @@ pub fn bind_request(req: &mut Request) -> Result<(), Response> {
         CertClaimDecision::Pass => Ok(()),
         CertClaimDecision::Bound { agent } => set_agent_header(req, &agent),
         CertClaimDecision::Rewrite { agent, claimed } => {
-            audit_mismatch(&binding, &agent, &claimed, &path, "rewrite");
+            audit_mismatch(&binding, Some(&agent), &claimed, &path, "rewrite");
             tracing::warn!(
                 target: TRACE_TARGET,
                 certificate_agent_id = %agent,
@@ -391,7 +436,7 @@ pub fn bind_request(req: &mut Request) -> Result<(), Response> {
             set_agent_header(req, &agent)
         }
         CertClaimDecision::RefuseMismatch { agent, claimed } => {
-            audit_mismatch(&binding, &agent, &claimed, &path, "deny");
+            audit_mismatch(&binding, Some(&agent), &claimed, &path, "deny");
             Err(refusal(
                 AGENT_ID_CERTIFICATE_MISMATCH,
                 format!(
@@ -399,6 +444,26 @@ pub fn bind_request(req: &mut Request) -> Result<(), Response> {
                      agent id bound to the presented client certificate ({agent:?})"
                 ),
             ))
+        }
+        CertClaimDecision::RefuseBoundClaim { claimed } => {
+            audit_mismatch(&binding, None, &claimed, &path, "deny");
+            Err(refusal(
+                AGENT_ID_CERTIFICATE_MISMATCH,
+                format!(
+                    "{AGENT_ID_CERTIFICATE_MISMATCH}: the claimed agent id is bound to a \
+                     different client certificate in {MTLS_AGENT_BINDING_MAP_ENV}"
+                ),
+            ))
+        }
+        CertClaimDecision::WarnBoundClaim { claimed } => {
+            audit_mismatch(&binding, None, &claimed, &path, "warn");
+            tracing::warn!(
+                target: TRACE_TARGET,
+                endpoint = %path,
+                "an unmapped client certificate claims an agent id bound to another \
+                 certificate; serving as claimed ({MTLS_AGENT_BINDING_ENV}=warn)"
+            );
+            Ok(())
         }
         CertClaimDecision::RefuseUnmapped | CertClaimDecision::WarnUnmapped => {
             let refuse = binding.mode == AgentBindingMode::Enforce;
@@ -432,6 +497,53 @@ pub fn bind_request(req: &mut Request) -> Result<(), Response> {
     }
 }
 
+/// Reconcile an enrolled per-agent api key (#2044) with the certificate
+/// binding. Called by `api_key_auth` before the key's principal is bound.
+///
+/// Two credentials that name different agents fail closed: under `enforce`
+/// the request is refused 403 [`AGENT_ID_CERTIFICATE_MISMATCH`] with a deny
+/// row; under `warn` the certificate's agent wins (a rewrite row is
+/// written). This holds whatever `X-Agent-Id` says and whatever the #2044
+/// identity mode is.
+///
+/// Returns `Ok(true)` when the certificate's agent governs and the key's
+/// principal must NOT overwrite `X-Agent-Id`; `Ok(false)` when no binding
+/// applies or both credentials agree.
+///
+/// # Errors
+/// The 403 response under `enforce`.
+pub fn reconcile_per_agent_key(req: &Request, key_agent: &str) -> Result<bool, Response> {
+    let Some(binding) = req.extensions().get::<ClientCertAgentBinding>() else {
+        return Ok(false);
+    };
+    let Some(agent) = binding.effective_agent_id() else {
+        return Ok(false);
+    };
+    if agent == key_agent {
+        return Ok(false);
+    }
+    let path = req.uri().path();
+    if binding.mode == AgentBindingMode::Enforce {
+        audit_mismatch(binding, Some(agent), key_agent, path, "deny");
+        return Err(refusal(
+            AGENT_ID_CERTIFICATE_MISMATCH,
+            format!(
+                "{AGENT_ID_CERTIFICATE_MISMATCH}: the presented per-agent api key is bound to a \
+                 different agent than the presented client certificate ({agent:?})"
+            ),
+        ));
+    }
+    audit_mismatch(binding, Some(agent), key_agent, path, "rewrite");
+    tracing::warn!(
+        target: TRACE_TARGET,
+        certificate_agent_id = %agent,
+        endpoint = %path,
+        "per-agent api key names a different agent than the client certificate; serving as \
+         the certificate's agent ({MTLS_AGENT_BINDING_ENV}=warn)"
+    );
+    Ok(true)
+}
+
 /// What boot resolved.
 #[derive(Debug)]
 pub struct BootOutcome {
@@ -451,15 +563,26 @@ pub struct BootOutcome {
 /// not ask for client certificates).
 ///
 /// # Errors
-/// An invalid knob value; a map on a listener without client auth; a mapped
-/// fingerprint the allowlist does not admit (it could never connect, so the
-/// line is an operator error).
+/// An invalid knob value; an explicit `warn` / `enforce` with no map (the
+/// operator asked for a binding that binds nothing); a map on a listener
+/// without client auth; a mapped fingerprint the allowlist does not admit
+/// (it could never connect, so the line is an operator error).
 pub fn resolve_boot(
     mode_raw: Option<&str>,
     map: Option<AgentBindingMap>,
     allowlist: Option<&HashSet<[u8; 32]>>,
 ) -> Result<BootOutcome> {
     let mode = AgentBindingMode::resolve(mode_raw, map.is_some())?;
+    // Unset with no map resolves to `off`, so a non-off mode without a map
+    // was set explicitly.
+    if map.is_none() && mode != AgentBindingMode::Off {
+        bail!(
+            "{MTLS_AGENT_BINDING_ENV}={} is set but {MTLS_AGENT_BINDING_MAP_ENV} is not (or is \
+             empty): the binding has nothing to bind; set the map or unset the knob; refusing \
+             to boot",
+            mode.as_str()
+        );
+    }
     let mut warnings = Vec::new();
     let mut audit_no_map = false;
     match (&map, allowlist) {
@@ -491,12 +614,6 @@ pub fn resolve_boot(
             audit_no_map = true;
         }
         (None, None) => {}
-    }
-    if map.is_none() && mode != AgentBindingMode::Off {
-        warnings.push(format!(
-            "{MTLS_AGENT_BINDING_ENV}={} has no effect without {MTLS_AGENT_BINDING_MAP_ENV}",
-            mode.as_str()
-        ));
     }
     let table = map
         .filter(|_| mode != AgentBindingMode::Off)
@@ -575,6 +692,7 @@ pub async fn serve_check_report(mtls_allowlist: Option<&Path>) -> Result<serde_j
                     ClientCertAgentBinding {
                         agent_id: None,
                         fingerprint: Some(fp),
+                        bound_agents: Arc::default(),
                         mode: outcome.mode,
                     }
                     .fingerprint_hex(),

@@ -300,8 +300,10 @@ impl Authority {
     /// `cert_bound` is the agent the presenting mTLS client certificate is
     /// mapped to (by the `crate::mtls_agent_binding` gate, which has already
     /// rewritten or refused a differing `X-Agent-Id`). When it equals the
-    /// resolved principal and no enrolled per-agent key binds it, the
-    /// binding is [`Binding::ClientCert`].
+    /// resolved principal the binding is [`Binding::ClientCert`], the
+    /// strongest rung: it is checked before the per-agent key, so a request
+    /// that both credentials bind to the same agent is labelled
+    /// `client_cert`. Both are key-bound, so no gate outcome differs.
     ///
     /// # Errors
     /// As [`Self::resolve_http`].
@@ -317,10 +319,10 @@ impl Authority {
             }
             None => crate::identity::anonymous_request_id(),
         };
-        let binding = if inputs.key_bound_principal == Some(principal.as_str()) {
-            Binding::ApiKey
-        } else if cert_bound == Some(principal.as_str()) {
+        let binding = if cert_bound == Some(principal.as_str()) {
             Binding::ClientCert
+        } else if inputs.key_bound_principal == Some(principal.as_str()) {
+            Binding::ApiKey
         } else {
             Binding::Claimed
         };
