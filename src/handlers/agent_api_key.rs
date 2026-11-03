@@ -573,6 +573,9 @@ pub const APPROVAL_SUBJECT_SEPARATOR: &str = "@";
 /// signed approval subject (#8546).
 pub const APPROVAL_SUBJECT_LENGTH_SEPARATOR: &str = ":";
 
+/// Forensic `endpoint` label of a refused api-key approval signature (#8547).
+pub const API_KEY_APPROVAL_ENDPOINT: &str = "agent_api_key_approval";
+
 /// The subject the K10 approval signature commits to (signature layout 2):
 /// `<n>:<pending_id>@<m>:<approver_agent_id>`, where `<n>` and `<m>` are the
 /// decimal byte lengths of the two ids.
@@ -1596,6 +1599,13 @@ async fn apply_approved(
     // first and dissolves the second.
     let subject = approval_subject(pending_id, caller);
     if let Err(status) = super::verify_approval_hmac(headers, body, "POST", &subject) {
+        // #8547: a refused approval signature is recorded, never silent.
+        super::approvals::audit_signature_refusal(
+            headers,
+            pending_id,
+            API_KEY_APPROVAL_ENDPOINT,
+            super::approvals::SIGNATURE_REFUSAL_INVALID,
+        );
         return (
             status,
             Json(json!({

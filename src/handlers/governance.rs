@@ -219,7 +219,7 @@ pub async fn approve_pending(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok()),
     ) {
-        return refusal.into_response();
+        return refusal.refuse(&headers, &id, super::approvals::APPROVE_PENDING_ENDPOINT);
     }
     // #8495: under `identity_mode = enforce` the approver the signature
     // names must also be the principal the credential is bound to, so one
@@ -544,7 +544,7 @@ pub async fn reject_pending(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok()),
     ) {
-        return refusal.into_response();
+        return refusal.refuse(&headers, &id, super::approvals::REJECT_PENDING_ENDPOINT);
     }
     // #8495: under `identity_mode = enforce` the approver the signature
     // names must also be the principal the credential is bound to, so one

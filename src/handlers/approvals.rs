@@ -213,6 +213,69 @@ impl ApproverHmacRefusal {
         )
             .into_response()
     }
+
+    /// The forensic `reason` label of this refusal (#8547). It names only the
+    /// refusal class, never the signature or the secret.
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Invalid => SIGNATURE_REFUSAL_INVALID,
+            Self::LegacyUnboundApprover => LEGACY_UNBOUND_APPROVER,
+        }
+    }
+
+    /// #8547 — write one `refuse` row on the signed forensic chain for this
+    /// refusal, then return the shared 401. Every decide surface calls this
+    /// one function, so a refused signature is never silent on any of them.
+    pub(crate) fn refuse(
+        self,
+        headers: &HeaderMap,
+        pending_id: &str,
+        endpoint: &'static str,
+    ) -> axum::response::Response {
+        audit_signature_refusal(headers, pending_id, endpoint, self.reason());
+        self.into_response()
+    }
+}
+
+/// Forensic `kind` of a refused decide signature (#8547).
+pub const APPROVAL_DECIDE_SIGNATURE_KIND: &str = "approval_decide_signature";
+/// Forensic `reason` of a missing, malformed, stale, replayed or
+/// non-matching decide signature (#8547).
+pub const SIGNATURE_REFUSAL_INVALID: &str = "invalid_signature";
+/// Forensic `endpoint` label of `POST /api/v1/approvals/{id}/decide`.
+pub const APPROVAL_DECIDE_ENDPOINT: &str = "approval_decide";
+/// Forensic `endpoint` label of `POST /api/v1/pending/{id}/approve`.
+pub const APPROVE_PENDING_ENDPOINT: &str = "approve_pending";
+/// Forensic `endpoint` label of `POST /api/v1/pending/{id}/reject`.
+pub const REJECT_PENDING_ENDPOINT: &str = "reject_pending";
+
+/// #8547 — record one refused decide signature on the forensic chain.
+///
+/// The actor is the presented `X-Agent-Id` (the anonymous sentinel when it
+/// is absent or invalid); the payload names the pending row, the endpoint
+/// and the refusal class. The signature, the timestamp and the secret are
+/// not parameters here, so they cannot reach the audit spine.
+pub(crate) fn audit_signature_refusal(
+    headers: &HeaderMap,
+    pending_id: &str,
+    endpoint: &'static str,
+    reason: &'static str,
+) {
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let actor = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    crate::governance::audit::record_decision(
+        &actor,
+        "refuse",
+        APPROVAL_DECIDE_SIGNATURE_KIND,
+        "",
+        crate::governance::audit::ForensicPayload::new()
+            .ident_or_commit(field_names::PENDING_ID, pending_id)
+            .label("endpoint", endpoint)
+            .label("reason", reason),
+    );
 }
 
 /// #8546 — refuse a non-empty decide body that is not JSON with `400`.
@@ -510,7 +573,7 @@ pub async fn approval_decide(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok()),
     ) {
-        return refusal.into_response();
+        return refusal.refuse(&headers, &id, APPROVAL_DECIDE_ENDPOINT);
     }
     // #8495: under `identity_mode = enforce` the approver the signature
     // names must also be the principal the credential is bound to, so one
