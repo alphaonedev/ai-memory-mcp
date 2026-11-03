@@ -1674,15 +1674,18 @@ An allowlisted certificate on its own proves network access, not WHICH agent is 
 sha256:25ab790783dbe969f994063db0412f1930e187e5e1e6c7d79bb76224a76b7bb7  ai:ingest@node-1
 ```
 
+With `--check`, `serve` prints the parsed map as JSON and exits without starting:
+
 ```bash
 export AI_MEMORY_MTLS_AGENT_BINDING_MAP=./agents.map
 ai-memory serve --tls-cert server.pem --tls-key server.key \
-  --mtls-allowlist ./peers.allow --check   # prints the parsed map as JSON, then exits
+  --mtls-allowlist ./peers.allow --check
 ```
 
-- `AI_MEMORY_MTLS_AGENT_BINDING=off|warn|enforce` sets the posture. The default is `enforce` when the map is set and `off` when it is not, so an existing deployment with no map boots unchanged. An empty or unknown value refuses boot.
-- `enforce`: a request whose `X-Agent-Id` differs from the certificate's agent is refused `403 agent_id_certificate_mismatch`. A request with no `X-Agent-Id` acts as the certificate's agent.
-- `warn`: the request is served as the certificate's agent (the header is rewritten) and a warning is logged.
+- `AI_MEMORY_MTLS_AGENT_BINDING=off|warn|enforce` sets the posture. The default is `enforce` when the map is set and `off` when it is not, so an existing deployment with no map boots unchanged. An empty or unknown value refuses boot. An explicit `warn` or `enforce` with no map refuses boot (the operator asked for a binding that has nothing to bind).
+- `enforce`: a request whose `X-Agent-Id` differs from the certificate's agent is refused `403 agent_id_certificate_mismatch`. A request with no `X-Agent-Id` acts as the certificate's agent. An enrolled per-agent api key (#2044) for a different agent is refused the same way, with or without `X-Agent-Id`, whatever `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` says.
+- A certificate on `--mtls-allowlist` that is not in the map cannot claim an agent id the map binds to another certificate: under `enforce` that request is refused `403 agent_id_certificate_mismatch` on every route (audit actor `anonymous:cert-unmapped`). An unmapped certificate claiming an id the map does not bind keeps the claimed id (binding `claimed`), as before #8357.
+- `warn`: the request is served as the certificate's agent (the header is rewritten; a differing per-agent key does not win) and a warning is logged. An unmapped certificate claiming a bound id is served as claimed, with a `warn` audit row.
 - Every mismatch, in `enforce` and in `warn`, writes a forensic audit row (kind `mtls_agent_binding`, actor = the certificate's agent).
 - A matching request resolves with the authority binding `client_cert`, which counts as key-bound for the #2044 identity gate.
 - `/api/v1/sync/*`: the mTLS api-key bypass stays, but with a map the peer certificate must map to an agent (`403 agent_id_certificate_unmapped` under `enforce`), and that agent is the sync caller id. `X-Peer-Id` stays governed by `AI_MEMORY_FED_CERT_PEER_BINDING`.
