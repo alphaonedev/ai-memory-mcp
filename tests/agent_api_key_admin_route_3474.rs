@@ -192,8 +192,10 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
         // production: every mint/revoke re-reads the registry from the store,
         // so a registry-only key would vanish on the first write.
         for a in admins {
-            ai_memory::db::bind_agent_api_key(&conn, a, &api_key_sha256_hex(&admin_key(a)))
-                .expect("seed admin key");
+            let outcome =
+                ai_memory::db::bind_agent_api_key(&conn, a, &api_key_sha256_hex(&admin_key(a)))
+                    .expect("seed admin key");
+            assert_eq!(outcome, ai_memory::storage::BindApiKeyOutcome::Bound);
         }
     }
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
