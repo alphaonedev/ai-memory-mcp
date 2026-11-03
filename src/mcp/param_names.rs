@@ -108,6 +108,8 @@ pub const HOLDER: &str = "holder";
 pub const ID: &str = "id";
 pub const ID_A: &str = "id_a";
 pub const ID_B: &str = "id_b";
+/// #8487 - optional sender retry key on memory_notify.
+pub const IDEMPOTENCY_KEY: &str = "idempotency_key";
 pub const IDS: &str = "ids";
 pub const INCLUDE_ARCHIVED: &str = "include_archived";
 pub const INCLUDE_INVALIDATED: &str = "include_invalidated";
@@ -279,6 +281,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     ID,
     ID_A,
     ID_B,
+    IDEMPOTENCY_KEY,
     IDS,
     INCLUDE_ARCHIVED,
     INCLUDE_INVALIDATED,
@@ -400,9 +403,11 @@ mod tests {
         //   likewise read as a bare literal).
         // v1.0.0 #3322 (2026-08-31) — 135 -> 136: FREEZE_ROUTINES (the
         //   memory_swarm_rewind operator-supplied routine-freeze set).
+        // v1.0.0 #8487 - 136 -> 137: IDEMPOTENCY_KEY (optional sender retry
+        //   key on memory_notify).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            136,
+            137,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

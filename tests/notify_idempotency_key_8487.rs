@@ -284,7 +284,7 @@ fn key_validator_bounds_and_charset_8487() {
     );
 }
 
-fn mcp_params(extra: Value) -> Value {
+fn mcp_params(extra: &Value) -> Value {
     let mut p = json!({"target_agent_id": TARGET, "title": "deploy approval", "payload": "body"});
     for (k, v) in extra.as_object().unwrap() {
         p[k] = v.clone();
@@ -300,26 +300,26 @@ fn mcp_handler_dedups_conflicts_and_validates_8487() {
     let ttl = ai_memory::config::ResolvedTtl::default();
     let call = |p: &Value| ai_memory::mcp::handle_notify(&conn, &db, p, &ttl, Some("client-8487"));
 
-    let plain = call(&mcp_params(json!({}))).expect("no key");
+    let plain = call(&mcp_params(&json!({}))).expect("no key");
     assert_eq!(
         plain["dedup_hit"],
         json!(false),
         "absent key still reports dedup_hit"
     );
-    let a = call(&mcp_params(json!({"idempotency_key": KEY}))).expect("first");
-    let b = call(&mcp_params(json!({"idempotency_key": KEY}))).expect("retry");
+    let a = call(&mcp_params(&json!({"idempotency_key": KEY}))).expect("first");
+    let b = call(&mcp_params(&json!({"idempotency_key": KEY}))).expect("retry");
     assert_eq!(a["dedup_hit"], json!(false));
     assert_eq!(b["dedup_hit"], json!(true));
     assert_eq!(a["id"], b["id"]);
     let err = call(&mcp_params(
-        json!({"idempotency_key": KEY, "payload": "other"}),
+        &json!({"idempotency_key": KEY, "payload": "other"}),
     ))
     .expect_err("conflict");
     assert!(
         err.contains(a["id"].as_str().unwrap()),
         "conflict names original id: {err}"
     );
-    let bad = call(&mcp_params(json!({"idempotency_key": "has space"}))).expect_err("invalid");
+    let bad = call(&mcp_params(&json!({"idempotency_key": "has space"}))).expect_err("invalid");
     assert!(!bad.contains("has space"), "never echoes the key: {bad}");
     assert_eq!(row_count(&db, TARGET), 2, "plain + keyed row only");
 }
@@ -327,7 +327,7 @@ fn mcp_handler_dedups_conflicts_and_validates_8487() {
 #[test]
 fn mcp_schema_names_the_idempotency_key_field_8487() {
     let tools = ai_memory::mcp::tool_definitions();
-    let notify = tools
+    let notify = tools["tools"]
         .as_array()
         .expect("tool list")
         .iter()

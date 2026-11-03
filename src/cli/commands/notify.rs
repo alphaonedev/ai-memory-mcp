@@ -52,6 +52,11 @@ pub struct NotifyArgs {
     #[arg(long = "why-trace", value_name = "TEXT")]
     pub why_trace: Option<String>,
 
+    /// Optional retry key (#8487; 1-128 chars of A-Za-z0-9._:-): a repeat
+    /// with the same content returns the first id and `dedup_hit: true`.
+    #[arg(long = "idempotency-key", value_name = "KEY")]
+    pub idempotency_key: Option<String>,
+
     /// Emit the raw JSON envelope.
     #[arg(long)]
     pub json: bool,
@@ -102,6 +107,10 @@ pub fn cmd_notify(
     if let Some(wt) = &args.why_trace {
         params[db::META_KEY_WHY_TRACE] = json!(wt);
     }
+    // #8487 — three-surface parity with the MCP param + HTTP body field.
+    if let Some(k) = &args.idempotency_key {
+        params[crate::mcp::param_names::IDEMPOTENCY_KEY] = json!(k);
+    }
 
     let envelope =
         crate::mcp::handle_notify_as_sender(&conn, db_path, &params, &resolved_ttl, &sender)
@@ -114,7 +123,12 @@ pub fn cmd_notify(
 
     let id = envelope.get("id").and_then(Value::as_str).unwrap_or("?");
     let to = envelope.get("to").and_then(Value::as_str).unwrap_or("?");
-    writeln!(out.stdout, "notify: id={id}  to={to}")?;
+    let hit = if envelope[crate::mcp::DEDUP_HIT_FIELD] == json!(true) {
+        "  dedup_hit=true"
+    } else {
+        ""
+    };
+    writeln!(out.stdout, "notify: id={id}  to={to}{hit}")?;
     Ok(())
 }
 
@@ -135,6 +149,7 @@ mod tests {
             priority: None,
             tier: None,
             why_trace: None,
+            idempotency_key: None,
             json: true,
         };
         let mut out = env.output();
@@ -154,6 +169,7 @@ mod tests {
             priority: Some(7),
             tier: Some("mid".into()),
             why_trace: None,
+            idempotency_key: None,
             json: true,
         };
         {
@@ -178,6 +194,7 @@ mod tests {
             priority: None,
             tier: None,
             why_trace: None,
+            idempotency_key: None,
             json: true,
         };
         {
@@ -202,6 +219,7 @@ mod tests {
             priority: None,
             tier: None,
             why_trace: None,
+            idempotency_key: None,
             json: true,
         };
         let mut out = env.output();

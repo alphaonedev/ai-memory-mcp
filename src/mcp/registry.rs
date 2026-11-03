@@ -1865,6 +1865,8 @@ mod d1_6_987_tests {
         ("memory_skill_promote_from_reflection", &["agent_id"]),
         ("memory_skill_register", &["agent_id"]),
         ("memory_update", &["agent_id"]),
+        // #8487 - optional sender idempotency key on memory_notify.
+        ("memory_notify", &["idempotency_key"]),
     ];
 
     /// Whole TOOLS added to `tool_definitions()` since the immutable pre-D1.6
@@ -1933,6 +1935,8 @@ mod d1_6_987_tests {
     /// The pin still asserts the text ACTUALLY changed, so a stale entry here
     /// fails the build rather than silently unpinning a tool.
     const DOCS_CORRECTIONS: &[&str] = &[
+        // #8487: the docs now name the optional idempotency_key.
+        "memory_notify",
         "memory_archive_purge",
         // #3382: restore preserves original_expires_at; it never cleared expiry.
         "memory_archive_restore",
