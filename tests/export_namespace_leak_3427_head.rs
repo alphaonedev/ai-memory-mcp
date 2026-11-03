@@ -45,6 +45,7 @@ fn serve_args(port: u16) -> ServeArgs {
         quorum_ca_cert: None,
         catchup_interval_secs: 30,
         federation_identity: None,
+        check: false,
         #[cfg(feature = "sal")]
         store_url: None,
     }

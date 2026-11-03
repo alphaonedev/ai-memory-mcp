@@ -1034,6 +1034,13 @@ pub async fn api_key_auth(
     mut req: Request,
     next: Next,
 ) -> impl IntoResponse {
+    // #8357 — bind the presenting mTLS client certificate to its mapped
+    // agent BEFORE any early return (no api key, health, the sync bypass):
+    // a differing `X-Agent-Id` is refused (enforce) or rewritten (warn),
+    // and an unmapped certificate on `/api/v1/sync/*` is refused (enforce).
+    if let Err(resp) = crate::mtls_agent_binding::bind_request(&mut req) {
+        return resp;
+    }
     let Some(ref expected) = auth.key else {
         // No API key configured — allow all requests
         return next.run(req).await.into_response();

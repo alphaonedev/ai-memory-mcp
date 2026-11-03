@@ -17,8 +17,9 @@
 use std::collections::HashSet;
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::governance::audit as forensic;
@@ -95,7 +96,22 @@ fn collect_kind_rows(dir: &std::path::Path, kind: &str) -> Vec<serde_json::Value
     hits
 }
 
-fn build_router_fixture(api_key: Option<&str>, mtls_enforced: bool) -> (axum::Router, NamedTempFile) {
+/// The opt-out the HTTP-route suites use (precedent
+/// `tests/admin_audit_chain_913.rs`): this suite pins agent binding, not
+/// #1985 attestation, whose required default is pinned in
+/// `tests/agent_attestation_integrity.rs`.
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `Once`-gated process-global env write, one stable value for
+    // the process lifetime, set before the caller issues any gated store.
+    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+}
+
+fn build_router_fixture(
+    api_key: Option<&str>,
+    mtls_enforced: bool,
+) -> (axum::Router, NamedTempFile) {
+    permissive_attestation_for_tests();
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
@@ -249,7 +265,7 @@ fn no_map_boot_is_unchanged_and_knob_reads_off_8357() {
 // (2) Map + enforce: a claimed id that differs is refused 403 with an audit row.
 #[tokio::test]
 async fn enforce_mismatch_is_refused_403_with_audit_row_8357() {
-    let _g = forensic_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = forensic_lock().lock().await;
     let (router, _db) = build_router_fixture(None, false);
     let req = create_request(
         Some(CLAIMED),
@@ -268,14 +284,17 @@ async fn enforce_mismatch_is_refused_403_with_audit_row_8357() {
 // (3) Map + warn: served as the mapped id, audit row present, response shows it.
 #[tokio::test]
 async fn warn_mismatch_is_served_as_mapped_agent_with_audit_row_8357() {
-    let _g = forensic_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = forensic_lock().lock().await;
     let (router, _db) = build_router_fixture(None, false);
     let req = create_request(
         Some(CLAIMED),
         ClientCertAgentBinding::new(Some(MAPPED.to_string()), AgentBindingMode::Warn),
     );
     let (status, body, rows) = run_audited(router, req).await;
-    assert!(status.is_success(), "warn serves the request: {status} {body}");
+    assert!(
+        status.is_success(),
+        "warn serves the request: {status} {body}"
+    );
     assert_eq!(
         body["agent_id"], MAPPED,
         "the write is attributed to the certificate's agent: {body}"
@@ -290,7 +309,7 @@ async fn warn_mismatch_is_served_as_mapped_agent_with_audit_row_8357() {
 // Map + enforce, no claim: the certificate's agent becomes the caller.
 #[tokio::test]
 async fn enforce_without_claim_adopts_mapped_agent_8357() {
-    let _g = forensic_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = forensic_lock().lock().await;
     let (router, _db) = build_router_fixture(None, false);
     let req = create_request(
         None,
@@ -351,7 +370,7 @@ fn malformed_duplicate_or_empty_map_refuses_boot_8357() {
 // one becomes the caller id.
 #[tokio::test]
 async fn sync_route_unmapped_cert_refused_mapped_cert_is_caller_8357() {
-    let _g = forensic_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = forensic_lock().lock().await;
     let (router, _db) = build_router_fixture(Some("shared-key-8357"), true);
     let req = Request::builder()
         .method("GET")
@@ -378,8 +397,19 @@ async fn sync_route_unmapped_cert_refused_mapped_cert_is_caller_8357() {
         .body(Body::empty())
         .expect("request");
     let (status, body, _rows) = run_audited(router, req).await;
-    assert_ne!(status, StatusCode::FORBIDDEN, "mapped peer is admitted: {body}");
-    assert_ne!(status, StatusCode::UNAUTHORIZED, "the mTLS sync bypass stays: {body}");
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "mapped peer is admitted: {body}"
+    );
+    // The api_key_auth mTLS sync bypass stays: no shared key is presented,
+    // yet the refusal (if any) is never the API-key 401. What remains is
+    // the separate federation boundary (#1031 / #1789: X-Peer-Id signature
+    // and peer enrollment), which this change does not relax.
+    assert_ne!(
+        body["error"], "missing or invalid API key",
+        "the mTLS sync bypass stays: {status} {body}"
+    );
 
     let mapped = ClientCertAgentBinding::new(Some(MAPPED.to_string()), AgentBindingMode::Enforce);
     assert_eq!(
@@ -390,6 +420,17 @@ async fn sync_route_unmapped_cert_refused_mapped_cert_is_caller_8357() {
         "the mapped agent is the sync caller id"
     );
     assert_eq!(
+        mapped.effective_agent_id(),
+        Some(MAPPED),
+        "sync_since resolves its federation caller from the certificate's agent"
+    );
+    assert_eq!(
+        ClientCertAgentBinding::new(Some(MAPPED.to_string()), AgentBindingMode::Off)
+            .effective_agent_id(),
+        None,
+        "off ignores the map"
+    );
+    assert_eq!(
         decide(&mapped, Some(CLAIMED), true),
         CertClaimDecision::RefuseMismatch {
             agent: MAPPED.to_string(),
@@ -397,7 +438,10 @@ async fn sync_route_unmapped_cert_refused_mapped_cert_is_caller_8357() {
         }
     );
     let unmapped = ClientCertAgentBinding::new(None, AgentBindingMode::Enforce);
-    assert_eq!(decide(&unmapped, Some(CLAIMED), true), CertClaimDecision::RefuseUnmapped);
+    assert_eq!(
+        decide(&unmapped, Some(CLAIMED), true),
+        CertClaimDecision::RefuseUnmapped
+    );
     assert_eq!(
         decide(&unmapped, Some(CLAIMED), false),
         CertClaimDecision::Pass,
@@ -435,7 +479,11 @@ fn authority_binding_client_cert_8357() {
     assert_eq!(bound.binding(), Binding::ClientCert);
     assert_eq!(bound.principal(), MAPPED);
     let other = Authority::resolve_http_with_cert(inputs(), Some(CLAIMED)).expect("resolve");
-    assert_eq!(other.binding(), Binding::Claimed, "a cert for another agent binds nothing");
+    assert_eq!(
+        other.binding(),
+        Binding::Claimed,
+        "a cert for another agent binds nothing"
+    );
     let plain = Authority::resolve_http(inputs()).expect("resolve");
     assert_eq!(plain.binding(), Binding::Claimed);
 }
@@ -472,8 +520,12 @@ async fn mtls_config() -> axum_server::tls_rustls::RustlsConfig {
 
 async fn allowlisted_client_config() -> rustls::ClientConfig {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let cert_pem = tokio::fs::read(fixture("valid_cert.pem")).await.expect("cert");
-    let key_pem = tokio::fs::read(fixture("valid_key_pkcs8.pem")).await.expect("key");
+    let cert_pem = tokio::fs::read(fixture("valid_cert.pem"))
+        .await
+        .expect("cert");
+    let key_pem = tokio::fs::read(fixture("valid_key_pkcs8.pem"))
+        .await
+        .expect("key");
     let certs = tls::rustls_pki_pem_iter_certs(&cert_pem).expect("parse cert");
     let key = tls::rustls_pki_pem_parse_private_key(&key_pem).expect("parse key");
     rustls::ClientConfig::builder()

@@ -104,6 +104,11 @@ pub enum Binding {
     /// this principal (`agent_api_keys`, `sha256(token) → agent_id`) —
     /// cryptographic-secret possession of the principal.
     ApiKey,
+    /// HTTP over mTLS (#8357): the presenting client certificate's SHA-256
+    /// fingerprint is bound to this principal by the operator's
+    /// `AI_MEMORY_MTLS_AGENT_BINDING_MAP` — possession of the certificate's
+    /// private key proves the principal.
+    ClientCert,
     /// Reserved — a per-request Ed25519 `SignableWrite` attestation. Not
     /// produced at dispatch in v1.0.0 (#1950 froze the read/mutate request
     /// envelope); the store funnels verify write signatures per row.
@@ -119,6 +124,7 @@ impl Binding {
             Self::LocalOperator => "local_operator",
             Self::Claimed => "claimed",
             Self::ApiKey => "api_key",
+            Self::ClientCert => "client_cert",
             Self::Attested => "attested",
         }
     }
@@ -127,7 +133,7 @@ impl Binding {
     /// server-held secret (mirrors `AuthLevel::is_key_bound`).
     #[must_use]
     pub fn is_key_bound(self) -> bool {
-        matches!(self, Self::ApiKey | Self::Attested)
+        matches!(self, Self::ApiKey | Self::ClientCert | Self::Attested)
     }
 }
 
@@ -287,6 +293,22 @@ impl Authority {
     /// `daemon` included) — a malformed assertion is refused, never
     /// downgraded to anonymous.
     pub fn resolve_http(inputs: HttpAuthorityInputs<'_>) -> Result<Self, AuthorityError> {
+        Self::resolve_http_with_cert(inputs, None)
+    }
+
+    /// [`Self::resolve_http`] plus the #8357 certificate-to-agent binding:
+    /// `cert_bound` is the agent the presenting mTLS client certificate is
+    /// mapped to (by the `crate::mtls_agent_binding` gate, which has already
+    /// rewritten or refused a differing `X-Agent-Id`). When it equals the
+    /// resolved principal and no enrolled per-agent key binds it, the
+    /// binding is [`Binding::ClientCert`].
+    ///
+    /// # Errors
+    /// As [`Self::resolve_http`].
+    pub fn resolve_http_with_cert(
+        inputs: HttpAuthorityInputs<'_>,
+        cert_bound: Option<&str>,
+    ) -> Result<Self, AuthorityError> {
         let principal = match inputs.header_agent_id.filter(|h| !h.is_empty()) {
             Some(asserted) => {
                 validate::validate_agent_id(asserted)
@@ -297,6 +319,8 @@ impl Authority {
         };
         let binding = if inputs.key_bound_principal == Some(principal.as_str()) {
             Binding::ApiKey
+        } else if cert_bound == Some(principal.as_str()) {
+            Binding::ClientCert
         } else {
             Binding::Claimed
         };
@@ -366,9 +390,11 @@ impl Authority {
     pub fn read_caller(&self) -> Option<&str> {
         match self.binding {
             Binding::LocalOperator => None,
-            Binding::Env | Binding::Claimed | Binding::ApiKey | Binding::Attested => {
-                Some(&self.principal)
-            }
+            Binding::Env
+            | Binding::Claimed
+            | Binding::ApiKey
+            | Binding::ClientCert
+            | Binding::Attested => Some(&self.principal),
         }
     }
 }
