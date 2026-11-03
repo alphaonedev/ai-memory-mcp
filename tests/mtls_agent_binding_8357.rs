@@ -111,6 +111,28 @@ fn build_router_fixture(
     api_key: Option<&str>,
     mtls_enforced: bool,
 ) -> (axum::Router, NamedTempFile) {
+    build_router_fixture_with_keys(api_key, mtls_enforced, &[])
+}
+
+/// [`build_router_fixture`] with enrolled per-agent keys (`(token, agent)`
+/// pairs), wired into both the api-key gate and the authority layer.
+fn build_router_fixture_with_keys(
+    api_key: Option<&str>,
+    mtls_enforced: bool,
+    keys: &[(&str, &str)],
+) -> (axum::Router, NamedTempFile) {
+    let enrolled = || {
+        ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(
+            keys.iter()
+                .map(|(token, agent)| {
+                    (
+                        ai_memory::handlers::identity_binding::api_key_sha256_hex(token),
+                        (*agent).to_string(),
+                    )
+                })
+                .collect(),
+        )
+    };
     permissive_attestation_for_tests();
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -159,17 +181,13 @@ fn build_router_fixture(
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: Arc::new(enrolled()),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let api_key_state = ApiKeyState {
         key: api_key.map(str::to_string),
         mtls_enforced,
-        enrolled_agent_keys: Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: Arc::new(enrolled()),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
         ..Default::default()
     };
@@ -443,12 +461,156 @@ async fn sync_route_unmapped_cert_refused_mapped_cert_is_caller_8357() {
         CertClaimDecision::RefuseUnmapped
     );
     assert_eq!(
-        decide(&unmapped, Some(CLAIMED), false),
+        decide(
+            &unmapped_binding(AgentBindingMode::Enforce),
+            Some(CLAIMED),
+            false
+        ),
         CertClaimDecision::Pass,
-        "an unmapped cert off the sync routes keeps the claimed id"
+        "an unmapped cert off the sync routes keeps a claimed id the map does not bind"
     );
     let off = ClientCertAgentBinding::new(Some(MAPPED.to_string()), AgentBindingMode::Off);
     assert_eq!(decide(&off, Some(CLAIMED), true), CertClaimDecision::Pass);
+}
+
+/// The binding of an allowlisted certificate that is NOT in the map, built
+/// the way the live acceptor builds it (FP_A -> MAPPED is the only entry).
+fn unmapped_binding(mode: AgentBindingMode) -> ClientCertAgentBinding {
+    AgentBindingTable::new(one_entry_map(), mode).binding_for(Some(&fp_bytes(FP_B)))
+}
+
+// Review r1 (code F2 / sec F1): an allowlisted certificate outside the map
+// cannot claim an agent id the map binds to another certificate, on any
+// route; an unbound claimed id keeps the pre-#8357 posture.
+#[tokio::test]
+async fn unmapped_cert_cannot_claim_bound_agent_under_enforce() {
+    let unmapped = unmapped_binding(AgentBindingMode::Enforce);
+    assert_eq!(unmapped.agent_id(), None, "FP_B is not in the map");
+    assert_ne!(
+        decide(&unmapped, Some(MAPPED), false),
+        CertClaimDecision::Pass,
+        "an unmapped cert claiming a bound agent must not pass under enforce"
+    );
+    assert_eq!(
+        decide(&unmapped, Some(MAPPED), true),
+        CertClaimDecision::RefuseUnmapped,
+        "the sync rule is unchanged"
+    );
+    assert_eq!(
+        decide(&unmapped, Some(CLAIMED), false),
+        CertClaimDecision::Pass,
+        "an unmapped cert claiming an UNBOUND id keeps the claimed id"
+    );
+    assert_eq!(decide(&unmapped, None, false), CertClaimDecision::Pass);
+
+    let _g = forensic_lock().lock().await;
+    // A write route.
+    let (router, _db) = build_router_fixture(None, false);
+    let (status, body, rows) =
+        run_audited(router, create_request(Some(MAPPED), unmapped.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["code"], AGENT_ID_CERTIFICATE_MISMATCH, "body: {body}");
+    assert!(
+        rows.iter().any(|r| r["decision"] == "deny"),
+        "a durable deny row is written: {rows:?}"
+    );
+    // A read route: the refusal is not sync- or write-specific.
+    let (router, _db) = build_router_fixture(None, false);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/memories")
+        .header("x-agent-id", MAPPED)
+        .extension(unmapped.clone())
+        .body(Body::empty())
+        .expect("request");
+    let (status, body, rows) = run_audited(router, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["code"], AGENT_ID_CERTIFICATE_MISMATCH, "body: {body}");
+    assert!(rows.iter().any(|r| r["decision"] == "deny"), "{rows:?}");
+    // An unbound claim is still served as claimed.
+    let (router, _db) = build_router_fixture(None, false);
+    let (status, body, rows) = run_audited(router, create_request(Some(CLAIMED), unmapped)).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["agent_id"], CLAIMED, "{body}");
+    assert!(rows.is_empty(), "no binding applies, no row: {rows:?}");
+    // Warn serves the bound claim but writes a durable row.
+    let (router, _db) = build_router_fixture(None, false);
+    let req = create_request(Some(MAPPED), unmapped_binding(AgentBindingMode::Warn));
+    let (status, body, rows) = run_audited(router, req).await;
+    assert!(status.is_success(), "warn serves: {status} {body}");
+    assert!(
+        rows.iter().any(|r| r["decision"] == "warn"),
+        "warn writes a durable row: {rows:?}"
+    );
+}
+
+// Review r1 (sec F2): an enrolled per-agent key for ANOTHER agent never
+// overrides the certificate binding, header present or absent, whatever the
+// #2044 identity mode.
+#[tokio::test]
+async fn cert_bound_request_with_other_agents_key_is_refused_8357() {
+    const GLOBAL: &str = "global-key-8357";
+    const OTHER_KEY: &str = "per-agent-key-8357-claimed";
+    const OWN_KEY: &str = "per-agent-key-8357-mapped";
+    let keys = [(OTHER_KEY, CLAIMED), (OWN_KEY, MAPPED)];
+    let bound = |mode| ClientCertAgentBinding::new(Some(MAPPED.to_string()), mode);
+    let with_key = |claimed: Option<&str>, key: &str, mode| {
+        let mut req = create_request(claimed, bound(mode));
+        req.headers_mut()
+            .insert("x-api-key", key.parse().expect("header value"));
+        req
+    };
+    let _g = forensic_lock().lock().await;
+    for claimed in [None, Some(MAPPED)] {
+        let (router, _db) = build_router_fixture_with_keys(Some(GLOBAL), false, &keys);
+        let req = with_key(claimed, OTHER_KEY, AgentBindingMode::Enforce);
+        let (status, body, rows) = run_audited(router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "claimed {claimed:?}: {body}");
+        assert_eq!(body["code"], AGENT_ID_CERTIFICATE_MISMATCH, "{body}");
+        assert!(
+            rows.iter()
+                .any(|r| r["actor"] == MAPPED && r["decision"] == "deny"),
+            "claimed {claimed:?}: a durable deny row: {rows:?}"
+        );
+    }
+    // Warn: the certificate's agent wins, with a durable row.
+    let (router, _db) = build_router_fixture_with_keys(Some(GLOBAL), false, &keys);
+    let req = with_key(None, OTHER_KEY, AgentBindingMode::Warn);
+    let (status, body, rows) = run_audited(router, req).await;
+    assert!(status.is_success(), "warn serves: {status} {body}");
+    assert_eq!(
+        body["agent_id"], MAPPED,
+        "the certificate's agent wins: {body}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["actor"] == MAPPED && r["decision"] == "rewrite"),
+        "{rows:?}"
+    );
+    // The certificate's own agent's key agrees: served, no row.
+    let (router, _db) = build_router_fixture_with_keys(Some(GLOBAL), false, &keys);
+    let req = with_key(None, OWN_KEY, AgentBindingMode::Enforce);
+    let (status, body, rows) = run_audited(router, req).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["agent_id"], MAPPED, "{body}");
+    assert!(rows.is_empty(), "{rows:?}");
+}
+
+// Review r1 (sec F4): an explicit warn / enforce with no map is a
+// configuration error, not a warning; unset or off with no map boots.
+#[test]
+fn explicit_mode_without_map_refuses_boot_8357() {
+    let allowlist: HashSet<[u8; 32]> = HashSet::from([fp_bytes(FP_A)]);
+    for mode in ["enforce", "warn", " Enforce "] {
+        for allow in [None, Some(&allowlist)] {
+            let err = resolve_boot(Some(mode), None, allow)
+                .expect_err("an explicit posture with no map must refuse boot");
+            assert!(err.to_string().contains("refusing to boot"), "{err:#}");
+        }
+    }
+    assert!(resolve_boot(Some("off"), None, Some(&allowlist)).is_ok());
+    assert!(resolve_boot(None, None, Some(&allowlist)).is_ok());
+    assert!(resolve_boot(None, None, None).is_ok());
 }
 
 // (7) A reserved id in the map is refused.
