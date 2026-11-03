@@ -609,6 +609,69 @@ async fn cert_bound_request_with_other_agents_key_is_refused_8357() {
     assert!(rows.is_empty(), "{rows:?}");
 }
 
+/// Rows in the fixture's `memories` table (the store the router writes).
+fn memory_rows(db: &NamedTempFile) -> i64 {
+    let conn = ai_memory::db::open(db.path()).expect("db::open");
+    conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .expect("count memories")
+}
+
+// Review r2 (sec N1, #8555): an allowlisted certificate outside the map
+// cannot act as a BOUND agent by presenting that agent's enrolled per-agent
+// api key with no `X-Agent-Id`; the per-agent-key channel obeys the same
+// bound-agent rule as the header channel.
+#[tokio::test]
+async fn unmapped_cert_with_bound_agents_key_refused_under_enforce_8555() {
+    const GLOBAL: &str = "global-key-8555";
+    const BOUND_KEY: &str = "per-agent-key-8555-mapped";
+    const UNMAPPED_ACTOR: &str = "anonymous:cert-unmapped";
+    let keys = [(BOUND_KEY, MAPPED)];
+    let with_key = |claimed: Option<&str>, mode| {
+        let mut req = create_request(claimed, unmapped_binding(mode));
+        req.headers_mut()
+            .insert("x-api-key", BOUND_KEY.parse().expect("header value"));
+        req
+    };
+    let _g = forensic_lock().lock().await;
+    // Enforce, no header: refused, deny row as the unmapped actor, no write.
+    let (router, db) = build_router_fixture_with_keys(Some(GLOBAL), false, &keys);
+    let (status, body, rows) = run_audited(router, with_key(None, AgentBindingMode::Enforce)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["code"], AGENT_ID_CERTIFICATE_MISMATCH, "{body}");
+    assert!(
+        rows.iter()
+            .any(|r| r["actor"] == UNMAPPED_ACTOR && r["decision"] == "deny"),
+        "a durable deny row: {rows:?}"
+    );
+    assert_eq!(memory_rows(&db), 0, "the refused write must not land");
+    // Warn, no header: served as the key's agent, with a durable warn row.
+    let (router, db) = build_router_fixture_with_keys(Some(GLOBAL), false, &keys);
+    let (status, body, rows) = run_audited(router, with_key(None, AgentBindingMode::Warn)).await;
+    assert_eq!(status, StatusCode::CREATED, "warn serves: {body}");
+    assert_eq!(
+        body["agent_id"], MAPPED,
+        "served as the key's agent: {body}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["actor"] == UNMAPPED_ACTOR && r["decision"] == "warn"),
+        "a durable warn row: {rows:?}"
+    );
+    assert_eq!(memory_rows(&db), 1, "warn serves the write");
+    // Enforce, header = the bound agent: the header channel's 403 is unchanged.
+    let (router, db) = build_router_fixture_with_keys(Some(GLOBAL), false, &keys);
+    let (status, body, rows) =
+        run_audited(router, with_key(Some(MAPPED), AgentBindingMode::Enforce)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["code"], AGENT_ID_CERTIFICATE_MISMATCH, "{body}");
+    assert!(
+        rows.iter()
+            .any(|r| r["actor"] == UNMAPPED_ACTOR && r["decision"] == "deny"),
+        "{rows:?}"
+    );
+    assert_eq!(memory_rows(&db), 0);
+}
+
 // Review r1 (sec F4): an explicit warn / enforce with no map is a
 // configuration error, not a warning; unset or off with no map boots.
 #[test]
