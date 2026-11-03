@@ -92,6 +92,21 @@ invalidates this record and fails the mechanical gate.
 
 Disposition: accepted documentation-only build helper under the exact pin.
 
+## `nix` 0.31.3 — `reviewed` (2026-11-02)
+
+- Cargo.lock checksum: `cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d`.
+- Reviewed registry files: `build.rs` and the build dependency declaration.
+- `build.rs` (35 lines) only expands the `cfg_aliases!` macro into rustc cfg
+  aliases and prints three `cargo:rustc-check-cfg` lines. It performs no
+  network access, process execution, filesystem access, environment-driven
+  code generation, unsafe operation, or writes outside Cargo directives.
+- Its sole build dependency is `cfg_aliases` 0.2.1. nix 0.31.3 arrives with
+  zip 9.2.2 through candle 0.11.1 (#8472).
+
+Disposition: accepted cfg-alias helper under the exact pin. Any checksum,
+custom-build-target, or build-dependency-closure change invalidates this
+record and fails the mechanical gate.
+
 ## `paste` 1.0.15 (`vendor/paste`) — `inventoried`, with an observation
 
 Recorded honestly as `inventoried` rather than `reviewed`, because the review is

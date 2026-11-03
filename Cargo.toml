@@ -229,9 +229,10 @@ zeroize = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 
 # Semantic embedding support
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
+# Caret floor 0.11.1 (admits 0.11.x >= 0.11.1): 0.11.0 still resolves zip 8 (RUSTSEC-2026-0429, #8472), so the floor must not admit it.
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
 # v0.7.0 #1070 (Agent QC follow-up) — `default-features = false`
 # strips the implicit `default-tls = [native-tls]` chain that pulled
 # openssl-sys into every build, breaking the mobile-runtime Android
