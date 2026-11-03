@@ -208,7 +208,10 @@ async fn call(router: &axum::Router, request: Request<Body>) -> (StatusCode, Val
     let resp = router.clone().oneshot(request).await.expect("route");
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn mint(router: &axum::Router, api_key: &str, target: &str) -> (StatusCode, Value) {
@@ -243,7 +246,8 @@ async fn enrolled_count(store: &Arc<dyn MemoryStore>) -> usize {
 /// Seed the store with ADMIN's own enrolled key so the "no key row stored"
 /// assertion counts a known baseline.
 async fn seed_admin_key(fx: &Fixture) {
-    fx.store
+    let _outcome = fx
+        .store
         .bind_agent_api_key(
             &CallerContext::for_admin(ai_memory::identity::sentinels::DAEMON_PRINCIPAL),
             ADMIN,
@@ -293,7 +297,11 @@ async fn claimed_admin_header_cannot_mint_under_enforce_empty_registry_8535() {
     let (status, body) = mint(&fx.router, SHARED_KEY, TARGET).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(enrolled_count(&fx.store).await, 0, "no key stored");
-    assert_eq!(fx.state.enrolled_agent_keys.len(), 0, "registry stays empty");
+    assert_eq!(
+        fx.state.enrolled_agent_keys.len(),
+        0,
+        "registry stays empty"
+    );
     let audit = forensic_text(&audit_dir);
     assert!(
         audit.contains(MINT_ACTION) && audit.contains(DENY_REASON),

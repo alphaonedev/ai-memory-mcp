@@ -117,7 +117,20 @@ struct Fixture {
 /// Build a fully wired sqlite daemon router whose `AppState` and
 /// `ApiKeyState` share ONE live registry `Arc` — exactly as `bootstrap_serve`
 /// wires them, which is what makes "effective on the next request" testable.
+/// #8535 — these tests pin the mint/revoke MECHANICS with header-claimed
+/// admins; the verified-principal requirement itself is pinned by
+/// `agent_api_key_mint_principal_8535`. The operator opt-in is set once, for
+/// the whole binary, so the principal gate admits the claimed admins here.
+fn trust_admin_header_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: runs once, before any request in this binary reads the env.
+        unsafe { std::env::set_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1") };
+    });
+}
+
 fn fixture(tag: &str, admins: &[&str]) -> Fixture {
+    trust_admin_header_once();
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     mark_credential_transport_confidential(true);
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET.to_string()));
