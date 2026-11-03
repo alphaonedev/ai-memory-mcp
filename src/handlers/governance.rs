@@ -207,7 +207,13 @@ pub async fn approve_pending(
     //
     // #8546: a non-empty body that is not JSON is refused BEFORE the HMAC,
     // so it never spends a signature and is never read as "no approvals".
-    if let Some(resp) = super::approvals::refuse_non_json_body(&body_bytes) {
+    // #8563: the refusal writes one forensic row, like the HMAC refusals.
+    if let Some(resp) = super::approvals::refuse_non_json_body(
+        &headers,
+        &body_bytes,
+        &id,
+        super::approvals::APPROVE_PENDING_ENDPOINT,
+    ) {
         return resp;
     }
     if let Err(refusal) = super::approvals::verify_approver_bound_hmac(
@@ -532,7 +538,13 @@ pub async fn reject_pending(
     // governance state, write-amplifies pending row churn).
     //
     // #8546: same body-shape refusal as approve, BEFORE the HMAC.
-    if let Some(resp) = super::approvals::refuse_non_json_body(&body_bytes) {
+    // #8563: and the same one forensic row.
+    if let Some(resp) = super::approvals::refuse_non_json_body(
+        &headers,
+        &body_bytes,
+        &id,
+        super::approvals::REJECT_PENDING_ENDPOINT,
+    ) {
         return resp;
     }
     if let Err(refusal) = super::approvals::verify_approver_bound_hmac(

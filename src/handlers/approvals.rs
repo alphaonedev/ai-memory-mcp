@@ -242,6 +242,9 @@ pub const APPROVAL_DECIDE_SIGNATURE_KIND: &str = "approval_decide_signature";
 /// Forensic `reason` of a missing, malformed, stale, replayed or
 /// non-matching decide signature (#8547).
 pub const SIGNATURE_REFUSAL_INVALID: &str = "invalid_signature";
+/// Forensic `reason` of a non-empty governance decide body that is not JSON
+/// (#8563).
+pub const NON_JSON_BODY_REFUSAL: &str = "non_json_body";
 /// Forensic `endpoint` label of `POST /api/v1/approvals/{id}/decide`.
 pub const APPROVAL_DECIDE_ENDPOINT: &str = "approval_decide";
 /// Forensic `endpoint` label of `POST /api/v1/pending/{id}/approve`.
@@ -284,19 +287,29 @@ pub(crate) fn audit_signature_refusal(
 /// a body that was not JSON was read as "nothing presented" AFTER its
 /// signature had been checked and spent. Called BEFORE the HMAC check, so a
 /// malformed body never consumes a nonce and never reaches the verifier.
-pub(crate) fn refuse_non_json_body(body: &[u8]) -> Option<axum::response::Response> {
+///
+/// #8563 — the refusal writes one forensic `refuse` row through
+/// [`audit_signature_refusal`] (reason [`NON_JSON_BODY_REFUSAL`]), like every
+/// other decide refusal, so a malformed-body probe is never silent. The body
+/// bytes are not passed to the audit helper, so they cannot reach the chain.
+pub(crate) fn refuse_non_json_body(
+    headers: &HeaderMap,
+    body: &[u8],
+    pending_id: &str,
+    endpoint: &'static str,
+) -> Option<axum::response::Response> {
     if body.trim_ascii().is_empty() {
         return None;
     }
-    serde_json::from_slice::<serde::de::IgnoredAny>(body)
-        .err()
-        .map(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("body", e)})),
-            )
-                .into_response()
-        })
+    let e = serde_json::from_slice::<serde::de::IgnoredAny>(body).err()?;
+    audit_signature_refusal(headers, pending_id, endpoint, NON_JSON_BODY_REFUSAL);
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("body", e)})),
+        )
+            .into_response(),
+    )
 }
 
 /// #8495 — HMAC-verify a decide under the approver-bound v2 layout.
