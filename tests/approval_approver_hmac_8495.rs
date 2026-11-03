@@ -186,7 +186,7 @@ fn seed_delete_pending(db_path: &Path, namespace: &str) -> String {
         source: "test".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
-        metadata: json!({}),
+        metadata: json!({"agent_id": REQUESTER}),
         version: 1,
         ..ai_memory::models::Memory::default()
     };
@@ -237,7 +237,7 @@ fn seed_consensus_pending(db_path: &Path, namespace: &str) -> String {
         id: uuid::Uuid::new_v4().to_string(),
         title: format!("{namespace}-target-{}", uuid::Uuid::new_v4()),
         content: "deleted once two approvers agree".into(),
-        metadata: json!({}),
+        metadata: json!({"agent_id": REQUESTER}),
         ..standard
     };
     let target_id = ai_memory::db::insert(&conn, &target).expect("insert target");
@@ -1099,6 +1099,194 @@ async fn non_json_governance_body_is_audited_postgres_branch_8563() {
 }
 
 // ---------------------------------------------------------------------------
+// (8) #8564 — the approved delete / tier-bump promote execute arms run under
+//     the requester's owner gate on every backend
+// ---------------------------------------------------------------------------
+
+/// The owner of the row the requester asks to have deleted or promoted.
+const OTHER_OWNER_8564: &str = "other-owner-8564";
+
+/// Strip the owner stamp of one memory (backend-specific raw write; the
+/// store funnels stamp every row they write).
+type Unstamp<'a> =
+    &'a (dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Sync);
+
+/// Store a memory owned by `owner` at `tier` and queue `action` on it as
+/// `REQUESTER`, then approve it as `APPROVER_X`. Returns
+/// `(pending_id, memory_id)`.
+async fn seed_approved_8564(
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    owner: &str,
+    tier: ai_memory::models::Tier,
+    action: ai_memory::store::GovernedAction,
+    unstamp: Option<Unstamp<'_>>,
+) -> (String, String) {
+    use ai_memory::store::CallerContext;
+    let owner_ctx = CallerContext::for_agent(owner.to_string());
+    let ns = format!("ns-8564-{}", uuid::Uuid::new_v4().simple());
+    let mem = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier,
+        namespace: ns.clone(),
+        title: format!("t-8564-{}", uuid::Uuid::new_v4()),
+        content: "seeded by the #8564 execute owner-gate test".into(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({"agent_id": owner}),
+        version: 1,
+        ..ai_memory::models::Memory::default()
+    };
+    let mem_id = store.store(&owner_ctx, &mem).await.expect("store memory");
+    if let Some(unstamp) = unstamp {
+        unstamp(mem_id.clone()).await;
+    }
+    let requester = CallerContext::for_agent(REQUESTER.to_string());
+    let now = chrono::Utc::now().to_rfc3339();
+    store
+        .register_agent(
+            &requester,
+            &ai_memory::models::AgentRegistration {
+                agent_id: APPROVER_X.to_string(),
+                agent_type: "ai:generic".to_string(),
+                capabilities: Vec::new(),
+                registered_at: now.clone(),
+                last_seen_at: now,
+            },
+        )
+        .await
+        .ok();
+    let pid = store
+        .queue_pending_action(
+            &requester,
+            action,
+            &ns,
+            Some(&mem_id),
+            REQUESTER,
+            &json!({"reason": "8564"}),
+        )
+        .await
+        .expect("queue_pending_action");
+    let approver = CallerContext::for_agent(APPROVER_X.to_string());
+    let outcome = store
+        .approve_with_approver_type(&approver, &pid, APPROVER_X)
+        .await
+        .expect("approve");
+    assert!(
+        matches!(outcome, ai_memory::store::ApproveOutcome::Approved),
+        "approve: {outcome:?}"
+    );
+    (pid, mem_id)
+}
+
+/// An approved delete and an approved tier-bump promote execute only on a
+/// row the REQUESTER owns: another agent's row and an unstamped row are
+/// refused with `PermissionDenied` naming the gated verb and the row, and
+/// the row is left exactly as it was.
+async fn execute_arms_are_owner_gated(
+    label: &str,
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    unstamp: Unstamp<'_>,
+) {
+    use ai_memory::models::Tier;
+    use ai_memory::store::{CallerContext, GovernedAction, StoreError};
+    let approver = CallerContext::for_agent(APPROVER_X.to_string());
+    let admin = CallerContext::for_admin("ai:operator-8564");
+    for (action, tier, verb) in [
+        (GovernedAction::Delete, Tier::Long, "delete"),
+        (GovernedAction::Promote, Tier::Mid, "update"),
+    ] {
+        for (case, owner, strip) in [
+            ("other owner", OTHER_OWNER_8564, false),
+            ("unstamped", REQUESTER, true),
+        ] {
+            let (pid, mid) =
+                seed_approved_8564(store, owner, tier.clone(), action, strip.then_some(unstamp))
+                    .await;
+            let err = store
+                .execute_pending_action(&approver, &pid)
+                .await
+                .expect_err("an approved action on a row the requester does not own is refused");
+            match &err {
+                StoreError::PermissionDenied {
+                    action: refused,
+                    target,
+                    reason,
+                } => {
+                    assert_eq!(refused, verb, "{label} {verb} {case}: {err}");
+                    assert_eq!(target, &mid, "{label} {verb} {case}: {err}");
+                    if strip {
+                        assert!(
+                            reason.contains("agent_id"),
+                            "{label} {verb} {case}: the unstamped reason names the stamp: {err}"
+                        );
+                    } else {
+                        assert_eq!(
+                            reason,
+                            ai_memory::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+                            "{label} {verb} {case}: {err}"
+                        );
+                    }
+                }
+                other => panic!("{label} {verb} {case}: expected PermissionDenied, got {other:?}"),
+            }
+            let kept = store
+                .get(&admin, &mid)
+                .await
+                .expect("the refused row is still there");
+            assert_eq!(
+                kept.tier, tier,
+                "{label} {verb} {case}: the row is unchanged"
+            );
+        }
+
+        // The requester's own row executes.
+        let (pid, mid) = seed_approved_8564(store, REQUESTER, tier.clone(), action, None).await;
+        let executed = store
+            .execute_pending_action(&approver, &pid)
+            .await
+            .expect("an approved action on the requester's own row executes");
+        assert_eq!(
+            executed.as_deref(),
+            Some(mid.as_str()),
+            "{label} {verb} own"
+        );
+        match action {
+            GovernedAction::Delete => assert!(
+                store.get(&admin, &mid).await.is_err(),
+                "{label}: the approved delete removed the requester's row"
+            ),
+            _ => assert_eq!(
+                store.get(&admin, &mid).await.expect("promoted row").tier,
+                Tier::Long,
+                "{label}: the approved promote bumped the requester's row"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn execute_arms_are_owner_gated_sqlite_8564() {
+    let _g = LOCK_8495.lock().await;
+    let file = NamedTempFile::new().expect("tempfile");
+    let db_path = file.path().to_path_buf();
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let unstamp =
+        move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let db_path = db_path.clone();
+            Box::pin(async move {
+                let conn = ai_memory::db::open(&db_path).expect("open unstamp conn");
+                conn.execute("UPDATE memories SET metadata = '{}' WHERE id = ?1", [&id])
+                    .expect("strip the owner stamp");
+            })
+        };
+    execute_arms_are_owner_gated("sqlite", &store, &unstamp).await;
+}
+
+// ---------------------------------------------------------------------------
 // (4) postgres parity on a live PostgresStore (skip when no URL is set)
 // ---------------------------------------------------------------------------
 
@@ -1381,5 +1569,34 @@ mod live_pg {
             "live pg promote"
         );
         set_active_hooks_hmac_secret(None);
+    }
+
+    /// #8564 — the same owner-gate cells as the SQLite twin, on a live
+    /// `PostgresStore` (the precedent the SQLite execute arms now copy).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_execute_arms_are_owner_gated_8564() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_execute_arms_are_owner_gated_8564: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        let pg = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let store: Arc<dyn MemoryStore> = pg.clone();
+        let unstamp =
+            move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                let pg = pg.clone();
+                Box::pin(async move {
+                    sqlx::query("UPDATE memories SET metadata = '{}'::jsonb WHERE id = $1")
+                        .bind(id)
+                        .execute(pg.pool())
+                        .await
+                        .expect("strip the owner stamp");
+                })
+            };
+        super::execute_arms_are_owner_gated("live pg", &store, &unstamp).await;
     }
 }
