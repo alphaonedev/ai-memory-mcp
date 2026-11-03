@@ -25,7 +25,8 @@
 //!   certificate also wins over an enrolled per-agent api key for a
 //!   different agent ([`reconcile_per_agent_key`]).
 //! * A certificate that is allowlisted but NOT in the map cannot claim an
-//!   agent id the map binds (the table keeps the reverse set of bound ids):
+//!   agent id the map binds (the table keeps the reverse set of bound ids),
+//!   by `X-Agent-Id` or by presenting that agent's per-agent api key:
 //!   `enforce` refuses it with the same 403 on every route. An unmapped
 //!   certificate claiming an unbound id keeps the claimed id.
 //! * A map with no client-auth listener (plain TLS), an empty map, a
@@ -504,7 +505,8 @@ pub fn bind_request(req: &mut Request) -> Result<(), Response> {
 /// the request is refused 403 [`AGENT_ID_CERTIFICATE_MISMATCH`] with a deny
 /// row; under `warn` the certificate's agent wins (a rewrite row is
 /// written). This holds whatever `X-Agent-Id` says and whatever the #2044
-/// identity mode is.
+/// identity mode is. A certificate outside the map that presents the key of
+/// an agent the map binds is refused the same way under `enforce` (#8555).
 ///
 /// Returns `Ok(true)` when the certificate's agent governs and the key's
 /// principal must NOT overwrite `X-Agent-Id`; `Ok(false)` when no binding
@@ -516,13 +518,13 @@ pub fn reconcile_per_agent_key(req: &Request, key_agent: &str) -> Result<bool, R
     let Some(binding) = req.extensions().get::<ClientCertAgentBinding>() else {
         return Ok(false);
     };
+    let path = req.uri().path();
     let Some(agent) = binding.effective_agent_id() else {
-        return Ok(false);
+        return reconcile_unmapped_key(binding, key_agent, path);
     };
     if agent == key_agent {
         return Ok(false);
     }
-    let path = req.uri().path();
     if binding.mode == AgentBindingMode::Enforce {
         audit_mismatch(binding, Some(agent), key_agent, path, "deny");
         return Err(refusal(
@@ -542,6 +544,47 @@ pub fn reconcile_per_agent_key(req: &Request, key_agent: &str) -> Result<bool, R
          the certificate's agent ({MTLS_AGENT_BINDING_ENV}=warn)"
     );
     Ok(true)
+}
+
+/// #8555 — a certificate with no effective agent (outside the map, or the
+/// posture is `off`) presenting a per-agent key. The key channel obeys the
+/// same bound-agent rule as the `X-Agent-Id` channel ([`decide`]): a key
+/// whose agent the map binds to another certificate is refused under
+/// `enforce` and served with a warn row under `warn`. A key for an unbound
+/// agent, and every key under `off`, keeps the pre-#8357 posture.
+fn reconcile_unmapped_key(
+    binding: &ClientCertAgentBinding,
+    key_agent: &str,
+    path: &str,
+) -> Result<bool, Response> {
+    if !binding.is_bound_agent(key_agent) {
+        return Ok(false);
+    }
+    match binding.mode {
+        AgentBindingMode::Off => Ok(false),
+        AgentBindingMode::Enforce => {
+            audit_mismatch(binding, None, key_agent, path, "deny");
+            Err(refusal(
+                AGENT_ID_CERTIFICATE_MISMATCH,
+                format!(
+                    "{AGENT_ID_CERTIFICATE_MISMATCH}: the presented per-agent api key is bound \
+                     to an agent that {MTLS_AGENT_BINDING_MAP_ENV} binds to a different client \
+                     certificate"
+                ),
+            ))
+        }
+        AgentBindingMode::Warn => {
+            audit_mismatch(binding, None, key_agent, path, "warn");
+            tracing::warn!(
+                target: TRACE_TARGET,
+                endpoint = %path,
+                "an unmapped client certificate presents the per-agent api key of an agent \
+                 bound to another certificate; serving as the key's agent \
+                 ({MTLS_AGENT_BINDING_ENV}=warn)"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// What boot resolved.
