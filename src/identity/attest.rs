@@ -310,22 +310,29 @@ pub enum ReownKind {
     Atomise,
     /// Vertical promotion clone into an ancestor namespace.
     Promote,
+    /// `memory_consolidate` merge of N source rows into one consolidator-owned row.
+    Consolidate,
 }
 
 impl ReownKind {
-    const fn from_key(self) -> &'static str {
+    /// Provenance key naming the source row. `None` for consolidate: its
+    /// lineage already lives in `derived_from` / `consolidated_from_agents`.
+    const fn provenance_key(self) -> Option<&'static str> {
         match self {
-            Self::Share => crate::models::field_names::SHARED_FROM,
-            Self::Atomise => crate::models::field_names::ATOMISED_FROM,
-            Self::Promote => crate::models::field_names::PROMOTED_FROM,
+            Self::Share => Some(crate::models::field_names::SHARED_FROM),
+            Self::Atomise => Some(crate::models::field_names::ATOMISED_FROM),
+            Self::Promote => Some(crate::models::field_names::PROMOTED_FROM),
+            Self::Consolidate => None,
         }
     }
 
-    const fn from_owner_key(self) -> &'static str {
+    /// Provenance key naming the source row's owner (`None` for consolidate).
+    const fn provenance_owner_key(self) -> Option<&'static str> {
         match self {
-            Self::Share => crate::models::field_names::SHARED_FROM_AGENT_ID,
-            Self::Atomise => crate::models::field_names::ATOMISED_FROM_AGENT_ID,
-            Self::Promote => crate::models::field_names::PROMOTED_FROM_AGENT_ID,
+            Self::Share => Some(crate::models::field_names::SHARED_FROM_AGENT_ID),
+            Self::Atomise => Some(crate::models::field_names::ATOMISED_FROM_AGENT_ID),
+            Self::Promote => Some(crate::models::field_names::PROMOTED_FROM_AGENT_ID),
+            Self::Consolidate => None,
         }
     }
 
@@ -334,6 +341,7 @@ impl ReownKind {
             Self::Share => "reowned_by_share",
             Self::Atomise => "reowned_by_atomise",
             Self::Promote => "reowned_by_promote",
+            Self::Consolidate => "reowned_by_consolidate",
         }
     }
 }
@@ -344,14 +352,32 @@ impl ReownKind {
 pub struct ReownProvenance<'a> {
     /// Which clone path ran.
     pub kind: ReownKind,
-    /// Id of the source row.
+    /// Id of the source row (ignored for [`ReownKind::Consolidate`], which has
+    /// many sources recorded in `derived_from`).
     pub source_id: &'a str,
     /// Owner (`metadata.agent_id`) of the source row, when it had one.
     pub source_owner: Option<&'a str>,
 }
 
+/// #8532 — true for a source-row metadata key that carries attestation and
+/// must never be merged onto a row re-owned by another principal
+/// (consolidate merge-loop deny-list; same key set the reset strips).
+#[must_use]
+pub fn is_source_attestation_key(key: &str) -> bool {
+    use crate::models::field_names as f;
+    [
+        f::WRITE_SIGNATURE,
+        f::AGENT_PUBKEY,
+        f::PUBKEY_BOUND_AT,
+        f::ATTESTATION_DOWNGRADED,
+        f::FORGED_SIGNATURE_SKIPPED,
+        f::ATTEST_LEVEL,
+    ]
+    .contains(&key)
+}
+
 /// #8513 (umbrella #8493, data F1) — normalise the metadata of a row that is
-/// CLONED to a new owner (share, atomise, promote).
+/// CLONED to a new owner (share, atomise, promote, consolidate).
 ///
 /// The source row's attestation (`write_signature`, `agent_pubkey`,
 /// `pubkey_bound_at`, `attestation_downgraded`, `forged_signature_skipped`,
@@ -393,13 +419,18 @@ pub fn reset_for_reowned_row(
         f::ATTEST_RESET_REASON.to_string(),
         serde_json::Value::String(provenance.kind.reason().to_string()),
     );
-    obj.insert(
-        provenance.kind.from_key().to_string(),
-        serde_json::Value::String(provenance.source_id.to_string()),
-    );
-    if let Some(owner) = provenance.source_owner {
+    if let Some(key) = provenance.kind.provenance_key() {
         obj.insert(
-            provenance.kind.from_owner_key().to_string(),
+            key.to_string(),
+            serde_json::Value::String(provenance.source_id.to_string()),
+        );
+    }
+    if let (Some(key), Some(owner)) = (
+        provenance.kind.provenance_owner_key(),
+        provenance.source_owner,
+    ) {
+        obj.insert(
+            key.to_string(),
             serde_json::Value::String(owner.to_string()),
         );
     }

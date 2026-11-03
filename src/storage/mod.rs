@@ -10785,6 +10785,9 @@ pub fn consolidate_with_expected_versions(
                                 }
                                 continue;
                             }
+                            if crate::identity::attest::is_source_attestation_key(&k) {
+                                continue;
+                            }
                             if let Some(existing) = merged_metadata.get(&k)
                                 && std::mem::discriminant(existing) != std::mem::discriminant(&v)
                             {
@@ -10831,20 +10834,6 @@ pub fn consolidate_with_expected_versions(
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
-        // #3014/#3018 — stamp `attest_level="claimed"` on the tenant
-        // permissive path so the consolidated row is a truthful `claimed`
-        // write (global-strict already refused above; substrate/curator
-        // consolidates are exempt), exactly like an unsigned `store`.
-        if !substrate_authored {
-            merged_metadata.insert(
-                crate::models::field_names::ATTEST_LEVEL.to_string(),
-                serde_json::Value::String(
-                    crate::identity::verify::AttestLevel::Claimed
-                        .as_str()
-                        .to_string(),
-                ),
-            );
-        }
         if !source_agent_ids.is_empty() {
             merged_metadata.insert(
                 "consolidated_from_agents".to_string(),
@@ -10886,6 +10875,18 @@ pub fn consolidate_with_expected_versions(
             );
         }
         let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #8532 — the consolidated row is re-owned by the consolidator, so it
+        // never keeps a source's attestation: substrate and tenant alike drop
+        // to an honest `claimed` (#3014/#3018 stamp, now unconditional).
+        crate::identity::attest::reset_for_reowned_row(
+            &mut merged_metadata_value,
+            Some(consolidator_agent_id),
+            &crate::identity::attest::ReownProvenance {
+                kind: crate::identity::attest::ReownKind::Consolidate,
+                source_id: ids.first().map_or("", String::as_str),
+                source_owner: None,
+            },
+        );
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
         // consolidated summary is VERBATIM caller content on the tenant
         // surfaces (MCP `memory_consolidate` / HTTP / CLI), so the substrate
