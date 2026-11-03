@@ -474,7 +474,7 @@ async fn sync_route_unmapped_cert_refused_mapped_cert_is_caller_8357() {
 }
 
 /// The binding of an allowlisted certificate that is NOT in the map, built
-/// the way the live acceptor builds it (FP_A -> MAPPED is the only entry).
+/// the way the live acceptor builds it (`FP_A` -> `MAPPED` is the only entry).
 fn unmapped_binding(mode: AgentBindingMode) -> ClientCertAgentBinding {
     AgentBindingTable::new(one_entry_map(), mode).binding_for(Some(&fp_bytes(FP_B)))
 }
