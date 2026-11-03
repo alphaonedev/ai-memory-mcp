@@ -637,6 +637,143 @@ async fn governance_pending_routes_bind_the_approver_8495() {
 }
 
 // ---------------------------------------------------------------------------
+// (5) #8546 — the layout 2 subject is injective: the approver cannot be
+//     shifted into the body
+// ---------------------------------------------------------------------------
+
+/// The approver the shift case signs for: `APPROVER_X` plus a `.`-suffix,
+/// legal inside an agent id (`validate_agent_id` admits `.`). The suffix is
+/// digits so the shifted body still parses as JSON (`1.5`) and so reaches
+/// the HMAC check on every decide route instead of a body-shape 400.
+const SHIFTED_SIGNER: &str = "approver-x-8495.1";
+/// The body the shift case signs.
+const SHIFTED_SIGNED_BODY: &str = "5";
+/// The body the shift case presents: the approver's `.1` suffix moved into it.
+const SHIFTED_PRESENTED_BODY: &str = "1.5";
+
+/// The three decide routes that verify through `verify_approver_bound_hmac`.
+fn decide_routes(pid: &str) -> [(&'static str, String); 3] {
+    [
+        ("approval_decide", decide_uri(pid)),
+        ("approve_pending", format!("/api/v1/pending/{pid}/approve")),
+        ("reject_pending", format!("/api/v1/pending/{pid}/reject")),
+    ]
+}
+
+/// A signature minted for `x.1` over body `5` must not verify as approver `x`
+/// with body `1.5`: before #8546 both requests hashed the same bytes.
+async fn shifted_approver_is_refused(backend: Backend) {
+    for (endpoint, _) in decide_routes("") {
+        let h = build(backend, Posture::Default);
+        let pid = seed_delete_pending(&h.db_path, "ns-8546-shift");
+        let uri = decide_routes(&pid)
+            .into_iter()
+            .find(|(e, _)| *e == endpoint)
+            .map(|(_, u)| u)
+            .expect("route");
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, SHIFTED_SIGNER, SHIFTED_SIGNED_BODY);
+        let (status, v) = send(
+            &h.router,
+            request(&uri, &ts, &sig, APPROVER_X, None, SHIFTED_PRESENTED_BODY),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint}: a signature for {SHIFTED_SIGNER} must not verify as \
+             {APPROVER_X}; body={v}"
+        );
+        let row = pending_row(&h.db_path, &pid);
+        assert_eq!(row.status, "pending", "{backend:?} {endpoint}");
+        assert_eq!(row.decided_by, None, "{backend:?} {endpoint}");
+    }
+}
+
+#[tokio::test]
+async fn shifted_approver_is_refused_sqlite_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    shifted_approver_is_refused(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn shifted_approver_is_refused_postgres_branch_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    shifted_approver_is_refused(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+/// The signed subject is length-prefixed, so it is the same bytes for the
+/// signer and the verifier and different bytes for every other split.
+#[test]
+fn approval_subject_is_length_prefixed_8546() {
+    assert_eq!(
+        approval_subject("p-1", "x.1"),
+        "3:p-1@3:x.1",
+        "pending id and approver are each prefixed with their byte length"
+    );
+    assert_ne!(
+        format!(
+            "{}.{SHIFTED_SIGNED_BODY}",
+            approval_subject("p", SHIFTED_SIGNER)
+        ),
+        format!(
+            "{}.{SHIFTED_PRESENTED_BODY}",
+            approval_subject("p", APPROVER_X)
+        ),
+    );
+}
+
+/// The governance verbs refuse a non-empty body that is not JSON with 400
+/// BEFORE the HMAC is verified, so a captured signature is never spent on a
+/// malformed body and a shifted body is never read as "no approvals".
+async fn non_json_governance_body_is_refused(backend: Backend) {
+    for verb in ["approve", "reject"] {
+        let h = build(backend, Posture::Default);
+        let pid = seed_delete_pending(&h.db_path, "ns-8546-body");
+        let uri = format!("/api/v1/pending/{pid}/{verb}");
+        let body = "ops.";
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, APPROVER_X, body);
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, body)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{backend:?} {verb}: a non-JSON body must be refused; body={v}"
+        );
+        assert_eq!(
+            pending_row(&h.db_path, &pid).status,
+            "pending",
+            "{backend:?} {verb}"
+        );
+        // The refusal did not spend the nonce: the signature over the empty
+        // body made in the same second still decides.
+        let sig = sign_v2(&ts, &pid, APPROVER_X, "");
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, "")).await;
+        assert_eq!(status, StatusCode::OK, "{backend:?} {verb}: body={v}");
+    }
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_refused_sqlite_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_refused(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_refused_postgres_branch_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_refused(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
 // (4) postgres parity on a live PostgresStore (skip when no URL is set)
 // ---------------------------------------------------------------------------
 

@@ -1458,3 +1458,45 @@ async fn a_queued_mint_returns_its_token_to_the_approver_not_the_requester_3535(
     );
     assert_eq!(fx.registry.len(), 1);
 }
+
+/// #8546 — the api-key approval arm verifies the length-prefixed layout 2
+/// subject (`approval_subject`), so a signature over the ambiguous
+/// `<pending_id>@<approver>` concatenation no longer verifies.
+#[tokio::test]
+async fn an_unprefixed_approval_subject_is_refused_8546() {
+    const ADMIN: &str = "ai:key-admin-unprefixed";
+    const APPROVER: &str = "ai:key-admin-unprefixed-2";
+    let _g = serial().await;
+    let fx = fixture("unprefixed", &[ADMIN, APPROVER]);
+
+    let (_, body, _) = mint(&fx.router, ADMIN, ALICE).await;
+    let token = body["token"].as_str().expect("token").to_string();
+    let (_, _, body) = call(&fx.router, revoke_req(ADMIN, ALICE, &json!({}))).await;
+    let pending_id = body["pending_id"].as_str().expect("pending id").to_string();
+
+    let raw = json!({ "approve_pending_id": pending_id }).to_string();
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let sig = common::sign_canonical_envelope(
+        HMAC_SECRET,
+        &ts,
+        "POST",
+        &format!("{pending_id}@{APPROVER}"),
+        &raw,
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{ALICE}/api-key/revoke"))
+        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_AGENT_ID, APPROVER)
+        .header("content-type", "application/json")
+        .header(ai_memory::HEADER_AI_MEMORY_SIGNATURE, sig)
+        .header(ai_memory::HEADER_AI_MEMORY_TIMESTAMP, ts)
+        .body(Body::from(raw))
+        .expect("build unprefixed approval");
+    let (status, _, body) = call(&fx.router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        token_authenticates(&fx.router, &token).await,
+        "a signature over the unprefixed subject must revoke nothing"
+    );
+}
