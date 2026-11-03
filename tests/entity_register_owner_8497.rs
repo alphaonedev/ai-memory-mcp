@@ -241,7 +241,10 @@ async fn post_entity(router: &axum::Router, body: Value, caller: &str) -> (Statu
     let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn row_count_in(f: &NamedTempFile, ns: &str) -> i64 {
@@ -317,7 +320,14 @@ mod sal_parity {
 
         // A: wire agent_id disagrees with the verified caller.
         let a = store
-            .entity_register(&ctx, "A", &ns, &["alias-a".into()], &json!({}), Some(FORGED_Y))
+            .entity_register(
+                &ctx,
+                "A",
+                &ns,
+                &["alias-a".into()],
+                &json!({}),
+                Some(FORGED_Y),
+            )
             .await;
         out.push(describe("A wire-mismatch", &a));
         // B: inline metadata.agent_id disagrees.
