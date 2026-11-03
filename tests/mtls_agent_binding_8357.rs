@@ -255,7 +255,11 @@ fn no_map_boot_is_unchanged_and_knob_reads_off_8357() {
     let plain = resolve_boot(None, None, None).expect("no map, plain TLS boots");
     assert_eq!(plain.mode, AgentBindingMode::Off);
     assert!(plain.table.is_none(), "no table, so no per-request binding");
-    assert!(plain.warnings.is_empty());
+    assert_eq!(
+        plain.warnings,
+        Vec::<String>::new(),
+        "plain TLS with no map raises no boot warning"
+    );
     assert!(!plain.audit_no_map);
 
     let allowlist: HashSet<[u8; 32]> = HashSet::from([fp_bytes(FP_A)]);
