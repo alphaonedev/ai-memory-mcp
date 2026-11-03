@@ -31484,7 +31484,13 @@ impl MemoryStore for PostgresStore {
             }
             "delete" => {
                 if let Some(mid) = pa.memory_id.clone() {
-                    self.delete(ctx, &mid).await?;
+                    // #8548 — the approved delete runs as the REQUESTER, like
+                    // the #4357 reflect arm below: the approver decides, the
+                    // requester owns the row. Under the approver's context the
+                    // owner gate refused every approved delete of another
+                    // principal's memory ("approved but execution failed").
+                    let requester = CallerContext::for_agent(&pa.requested_by);
+                    self.delete(&requester, &mid).await?;
                     Some(mid)
                 } else {
                     None
@@ -31529,7 +31535,9 @@ impl MemoryStore for PostgresStore {
                             tier: Some(Tier::Long),
                             ..Default::default()
                         };
-                        self.update(ctx, &mid, patch).await?;
+                        // #8548 — as the requester, same as the delete arm.
+                        let requester = CallerContext::for_agent(&pa.requested_by);
+                        self.update(&requester, &mid, patch).await?;
                         Some(mid)
                     }
                 } else {
