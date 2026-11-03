@@ -828,6 +828,10 @@ const SQL_DELETE_DLQ_BY_MEMORY_IDS: &str =
 /// victim ids (slice-bound twin of [`SQL_DELETE_DLQ_BY_MEMORY_IDS`]).
 const SQL_DELETE_DEDUP_BY_MEMORY_IDS: &str =
     "DELETE FROM transcript_line_dedup WHERE memory_id = ANY($1)";
+/// #8487 — purge the notify idempotency row (it names the erased inbox row
+/// and its content digest) for the victim ids; same remanence class.
+const SQL_DELETE_NOTIFY_DEDUP_BY_MEMORY_IDS: &str =
+    "DELETE FROM notify_dedup WHERE memory_id = ANY($1)";
 /// #3272 C-2 — clear the FORGET tombstone for one id on an EXPLICIT
 /// operator/rollback RESTORE only (`restore_or_conflict` → the
 /// `RestoreSameId` CAS). Postgres twin of the sqlite
@@ -16736,7 +16740,7 @@ pub(crate) async fn pg_purge_dlq_dedup_in_tx(
         .await?;
     // #8487 — the notify idempotency row names the erased inbox row and its
     // content digest: same remanence class.
-    sqlx::query("DELETE FROM notify_dedup WHERE memory_id = ANY($1)")
+    sqlx::query(SQL_DELETE_NOTIFY_DEDUP_BY_MEMORY_IDS)
         .bind(ids)
         .execute(&mut **tx)
         .await?;

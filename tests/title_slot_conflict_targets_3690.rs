@@ -335,6 +335,18 @@ fn reviewed_consumers() -> BTreeMap<(&'static str, &'static str), &'static str> 
             ("src/store/sqlite.rs", "lease_acquire"),
             "a `leases` row conflict, not a `memories` title collision",
         ),
+        (
+            ("src/store/sqlite.rs", "notify_outcome"),
+            "#8487 sender idempotency-key payload conflict (same sender, target and key, different content digest); carries only the original notify row id, never a `(title, namespace)` slot",
+        ),
+        (
+            ("src/store/postgres/notify_dedup.rs", "resolve"),
+            "#8487 maps the notify_dedup verdict (key reused with a different content digest) to `StoreError::Conflict` with the original inbox row id; not a `memories` title collision",
+        ),
+        (
+            ("src/handlers/subscriptions.rs", "notify"),
+            "#8487 maps the typed notify idempotency conflict from the store to HTTP 409 with the original id; not a `memories` title collision",
+        ),
     ])
 }
 
