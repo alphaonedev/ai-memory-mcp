@@ -77,6 +77,23 @@ pub fn admin_header_trust_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// #8494 — the pure admission arm for the public-key bind surface
+/// (`POST/PUT /api/v1/agents/{id}/pubkey[/challenge]`).
+///
+/// Binding a key is the root of every later signature check, so an allowlisted
+/// admin NAME presented as a bare header claim is not enough. The caller must
+/// either be key-bound (`KeyAuthenticated` / `SignatureAttested`: the presented
+/// `X-API-Key` is the enrolled per-agent key of this very admin id) or the
+/// operator must have explicitly opted into header trust
+/// ([`ENV_ADMIN_HEADER_TRUST`]).
+#[must_use]
+pub fn pubkey_bind_principal_admitted(
+    level: crate::handlers::identity_binding::AuthLevel,
+    header_trust_opt_in: bool,
+) -> bool {
+    level.is_key_bound() || header_trust_opt_in
+}
+
 /// #3065 (Wave-2 Cluster B, cert-core) — resolved inputs to the certified-
 /// posture `ADMIN_HEADER_TRUST` identity boot-gate.
 ///
