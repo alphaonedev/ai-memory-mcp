@@ -1132,6 +1132,18 @@ Response: `{"entity_id":"ent-...","canonical_name":"PostgreSQL","namespace":"my-
 Returns `409` if a non-entity memory with the same
 `(title, namespace)` exists.
 
+**Owner semantics (#8497).** The entity is owned by the verified caller:
+the `X-Agent-Id` header, or the anonymous fallback when the header is
+absent. The owner is stamped into `metadata.agent_id` on both backends
+(sqlite and postgres) and always replaces an inline value. A body
+`agent_id` that differs from the header, or an inline
+`metadata.agent_id` that differs from the verified owner, is refused with
+**403** `{"code":"AGENT_ID_MISMATCH","error":...}` and an `outcome: deny`
+audit row; no entity row is written. The MCP tool `memory_entity_register`
+applies the same rule against the process principal (`AI_MEMORY_AGENT_ID`):
+an `agent_id` argument or inline `metadata.agent_id` that differs from it
+is refused with a mismatch error and an audit row.
+
 ### `GET /api/v1/entities/by_alias`
 
 Resolve an alias to its canonical entity.
