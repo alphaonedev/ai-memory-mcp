@@ -957,6 +957,148 @@ async fn signature_refusals_are_audited_postgres_branch_8547() {
 }
 
 // ---------------------------------------------------------------------------
+// (7) #8563 — a non-JSON governance decide body writes one forensic row
+// ---------------------------------------------------------------------------
+
+/// The forensic `reason` of a non-JSON governance decide body (#8563).
+const NON_JSON_BODY_REASON: &str = "non_json_body";
+/// A body that is not JSON and is distinctive enough to search the chain for.
+const NON_JSON_BODY_8563: &str = "not-json-body-8563.";
+
+/// A decide request with no `X-Agent-Id` header (the anonymous actor).
+fn anonymous_request(uri: &str, ts: &str, sig: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-ai-memory-timestamp", ts)
+        .header("x-ai-memory-signature", sig)
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+/// On `approve_pending` and `reject_pending` a non-JSON body is refused with
+/// 400 and writes exactly ONE forensic `refuse` row (reason
+/// `non_json_body`, actor = the presented `X-Agent-Id` or the anonymous
+/// sentinel). `approval_decide` is unchanged: it verifies the signature
+/// first, so the signer's malformed body is its strict-parse 400 (no
+/// refusal row) and an anonymous request is a signature refusal.
+/// No row carries the body bytes, the signature or the secret.
+async fn non_json_governance_body_is_audited(backend: Backend) {
+    let audit_dir = forensic_scratch("non-json");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+    let mut signatures = Vec::new();
+    let mut expected: Vec<(Option<&'static str>, String, &'static str, &'static str)> = Vec::new();
+    for (endpoint, _) in decide_routes("") {
+        for agent in [Some(APPROVER_X), None] {
+            let h = build(backend, Posture::Default);
+            let pid = seed_delete_pending(&h.db_path, "ns-8563-body");
+            let uri = decide_routes(&pid)
+                .into_iter()
+                .find(|(e, _)| *e == endpoint)
+                .map(|(_, u)| u)
+                .expect("route");
+            let ts = now_ts();
+            let sig = sign_v2(&ts, &pid, APPROVER_X, NON_JSON_BODY_8563);
+            signatures.push(sig.clone());
+            let req = match agent {
+                Some(a) => request(&uri, &ts, &sig, a, None, NON_JSON_BODY_8563),
+                None => anonymous_request(&uri, &ts, &sig, NON_JSON_BODY_8563),
+            };
+            let (status, v) = send(&h.router, req).await;
+            // approval_decide verifies first: the signer's own malformed body
+            // is its strict-parse 400 (no refusal row), and the anonymous
+            // request is an approver mismatch (one invalid_signature row).
+            let (want_status, reason) = match (endpoint, agent) {
+                ("approval_decide", Some(_)) => (StatusCode::BAD_REQUEST, None),
+                ("approval_decide", None) => (StatusCode::UNAUTHORIZED, Some("invalid_signature")),
+                _ => (StatusCode::BAD_REQUEST, Some(NON_JSON_BODY_REASON)),
+            };
+            assert_eq!(
+                status, want_status,
+                "{backend:?} {endpoint} agent={agent:?}: body={v}"
+            );
+            assert_eq!(
+                pending_row(&h.db_path, &pid).status,
+                "pending",
+                "{backend:?} {endpoint} agent={agent:?}"
+            );
+            if let Some(reason) = reason {
+                expected.push((agent, pid, endpoint, reason));
+            }
+        }
+    }
+    ai_memory::governance::audit::shutdown();
+
+    let (text, rows) = forensic_rows(audit_dir.path());
+    let refusals: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["kind"] == json!(SIGNATURE_REFUSAL_KIND))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        expected.len(),
+        "{backend:?}: one forensic row per refused non-JSON decide; rows={rows:?}"
+    );
+    for (row, (agent, pid, endpoint, reason)) in refusals.iter().zip(&expected) {
+        assert_eq!(row["decision"], json!("refuse"), "{backend:?}: {row}");
+        assert_eq!(
+            row["payload"]["endpoint"],
+            json!(endpoint),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(
+            row["payload"]["pending_id"],
+            json!(pid),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(
+            row["payload"]["reason"],
+            json!(reason),
+            "{backend:?}: {row}"
+        );
+        let actor = row["actor"].as_str().unwrap_or_default();
+        match agent {
+            Some(a) => assert_eq!(actor, *a, "{backend:?}: {row}"),
+            None => assert!(
+                actor.starts_with("anonymous"),
+                "{backend:?}: a request with no X-Agent-Id is the anonymous actor: {row}"
+            ),
+        }
+    }
+    assert!(
+        !text.contains(NON_JSON_BODY_8563),
+        "{backend:?}: the refused body reached the forensic chain"
+    );
+    assert!(
+        !text.contains(SECRET),
+        "{backend:?}: the HMAC secret reached the forensic chain"
+    );
+    for sig in &signatures {
+        assert!(
+            !text.contains(sig.as_str()),
+            "{backend:?}: a signature reached the forensic chain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_audited_sqlite_8563() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_audited(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_audited_postgres_branch_8563() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_audited(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
 // (4) postgres parity on a live PostgresStore (skip when no URL is set)
 // ---------------------------------------------------------------------------
 
