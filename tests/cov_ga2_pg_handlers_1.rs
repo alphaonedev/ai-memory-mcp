@@ -276,7 +276,7 @@ fn signed_approval_request(pending_id: &str, body: &Value) -> Request<Body> {
     let ts = chrono::Utc::now().timestamp().to_string();
     let canonical = format!(
         "{ts}.POST.{}.{body_str}",
-        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, ADMIN_AGENT)
+        ai_memory::handlers::agent_api_key::approval_subject(pending_id, ADMIN_AGENT)
     );
     let key_hash = sha256_hex(HMAC_SECRET_HEX);
     let sig = hmac_sha256_hex(&key_hash, &canonical);

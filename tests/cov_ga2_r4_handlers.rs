@@ -470,7 +470,7 @@ fn signed_approval_request_ts(pending_id: &str, body: &Value, ts: i64) -> Reques
     // #8495 layout v2: the approver is inside the signed subject.
     let canonical = format!(
         "{ts_str}.POST.{}.{body_str}",
-        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, ADMIN_AGENT)
+        ai_memory::handlers::agent_api_key::approval_subject(pending_id, ADMIN_AGENT)
     );
     let key_hash = sha256_hex(HMAC_SECRET_HEX);
     let sig = hmac_sha256_hex(&key_hash, &canonical);

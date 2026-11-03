@@ -235,7 +235,7 @@ fn sign_with_method(
     // #8495 layout v2: every decide in this file is sent as "operator-1".
     let canonical = format!(
         "{timestamp}.{method}.{}.{body}",
-        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-1")
+        ai_memory::handlers::agent_api_key::approval_subject(pending_id, "operator-1")
     );
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
@@ -292,7 +292,7 @@ fn sign(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
     // #8495 layout v2: every decide in this file is sent as "operator-1".
     let canonical = format!(
         "{timestamp}.POST.{}.{body}",
-        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-1")
+        ai_memory::handlers::agent_api_key::approval_subject(pending_id, "operator-1")
     );
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")

@@ -657,7 +657,7 @@ fn sign_approval(secret: &str, timestamp: &str, pending_id: &str, body: &str) ->
     let key_hash = sha256_hex(secret);
     let canonical = format!(
         "{timestamp}.POST.{}.{body}",
-        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "approver-alice")
+        ai_memory::handlers::agent_api_key::approval_subject(pending_id, "approver-alice")
     );
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
