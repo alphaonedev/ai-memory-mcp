@@ -14,8 +14,10 @@ is consumed single-use to defeat replay within that window.
 - **Code paths:** [`src/approvals.rs`](../src/approvals.rs),
   [`approvals_sse`](../src/handlers/approvals.rs)
   (the SSE handler),
-  [`verify_approval_hmac`](../src/handlers/approvals.rs)
-  (the HMAC verification core),
+  [`verify_approver_bound_hmac`](../src/handlers/approvals.rs)
+  (the decide verifier, signature layout v2; the layout-agnostic
+  [`verify_approval_hmac`](../src/handlers/approvals.rs) core remains only for
+  the agent api-key approval route, #8550),
   [`src/handlers/routes.rs`](../src/handlers/routes.rs)
   (`APPROVALS_STREAM = "/api/v1/approvals/stream"`),
   [`build_router_with_timeout`](../src/lib.rs) (route registration).
@@ -101,7 +103,7 @@ requires two headers when the substrate has an
 - `X-AI-Memory-Timestamp: <unix seconds>` — request freshness clock.
 
 The canonical request that the HMAC covers is
-([`verify_approval_hmac`](../src/handlers/approvals.rs)):
+([`verify_approver_bound_hmac`](../src/handlers/approvals.rs)):
 
 ```text
 canonical = "<unix_ts>.<METHOD>.<n>:<pending_id>@<m>:<X-Agent-Id>.<body>"
@@ -121,8 +123,10 @@ approver cannot be presented under another identity. A layout 1 signature
 `{"error":"legacy_unbound_approver","signature_layout_version":2}` and a hint
 naming the new subject; its nonce is not consumed, so the client can re-sign.
 Under `identity_mode = enforce` the caller's `X-Agent-Id` must also be bound to
-its credential (`403 attested_identity_required` otherwise), so one shared
-secret cannot cast every vote of a consensus quorum.
+its credential, so one shared secret cannot cast every vote of a consensus
+quorum. Otherwise the decide is `403`: `identity_binding_mismatch` when a
+per-agent api-key is bound to a different agent (the transport middleware
+refuses first), `attested_identity_required` with the shared api-key (#8549).
 
 Both signer and verifier MUST use the exact same join. Reformatting
 even a single byte of the body invalidates the signature.
@@ -155,7 +159,7 @@ even a single byte of the body invalidates the signature.
 
 When no `[hooks.subscription].hmac_secret` is configured, the decide
 endpoint **rejects every request** with 401
-([`verify_approval_hmac`](../src/handlers/approvals.rs)). The K10
+([`verify_approver_bound_hmac`](../src/handlers/approvals.rs)). The K10
 contract is strict by default — better to refuse a write than to
 accept an unauthenticated one.
 

@@ -1426,7 +1426,10 @@ approver; a non-empty body that is not JSON is refused **400** before the
 signature is checked; a layout 1 signature (subject `<id>` alone) is refused **401**
 `{"error":"legacy_unbound_approver","signature_layout_version":2}`. Under
 `identity_mode = enforce` a caller whose `X-Agent-Id` is not bound to its
-credential gets **403** `attested_identity_required`.
+credential gets **403**: with a per-agent api-key whose bound agent differs from
+`X-Agent-Id` the transport middleware refuses first with
+`identity_binding_mismatch`; with the shared api-key (no per-agent binding) the
+decide gate refuses with `attested_identity_required` (#8549).
 200 if consensus reached (and the governed action is executed). 202 if
 still collecting approvers. Equivalent MCP tool: `memory_pending_approve`
 (`src/mcp/tools/pending.rs`).
@@ -1707,7 +1710,7 @@ router in `src/lib.rs`.
 |---|---|---|
 | `POST` | `/api/v1/quota/status` | K8 quota status — read the calling agent's daily quota row. Auto-inserts a default row on first call. See [`docs/k8-quotas.md`](k8-quotas.html). MCP: `memory_quota_status`. |
 | `GET`  | `/api/v1/approvals/stream` | K10 SSE approval channel — server-sent events for pending-approval state changes. See [`docs/k10-sse-approvals.md`](k10-sse-approvals.html). |
-| `POST` | `/api/v1/approvals/{pending_id}` | K10 approval decide path — body `{"decision":"approve|deny","remember":"once|session"}` (`forever` is refused, #3394), HMAC-gated via `X-AI-Memory-Signature`, signature layout version 2 (#8495): signed over `<ts>.POST.<n>:<pending_id>@<m>:<X-Agent-Id>.<body>` (`<n>`, `<m>` = decimal byte lengths, #8546), a layout 1 signature is `401 legacy_unbound_approver`, and under `identity_mode = enforce` an unbound `X-Agent-Id` is `403 attested_identity_required`. |
+| `POST` | `/api/v1/approvals/{pending_id}` | K10 approval decide path — body `{"decision":"approve|deny","remember":"once|session"}` (`forever` is refused, #3394), HMAC-gated via `X-AI-Memory-Signature`, signature layout version 2 (#8495): signed over `<ts>.POST.<n>:<pending_id>@<m>:<X-Agent-Id>.<body>` (`<n>`, `<m>` = decimal byte lengths, #8546), a layout 1 signature is `401 legacy_unbound_approver`, and under `identity_mode = enforce` an unbound `X-Agent-Id` is `403 identity_binding_mismatch` (per-agent api-key bound to another agent, raised first by the transport middleware) or `403 attested_identity_required` (shared api-key), #8549. |
 | `POST` | `/api/v1/auto_tag` | LLM auto-tag endpoint (v0.7 smart-tier surface; 503 when no LLM is configured). |
 | `POST` | `/api/v1/expand_query` | HTTP parity for the MCP `memory_expand_query` tool. |
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; relational recursive-CTE (bounded BFS) on SQLite **and** Postgres (not AGE Cypher — #2582 / #3297). |
