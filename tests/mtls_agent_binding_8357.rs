@@ -14,7 +14,7 @@
 //! the `Binding::ClientCert` provenance and the live mTLS acceptor that
 //! resolves the certificate to its agent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -756,28 +756,36 @@ async fn mtls_config() -> axum_server::tls_rustls::RustlsConfig {
     .expect("mTLS server config")
 }
 
+/// The server name the client sends; it matches the fixture leaf's only
+/// SAN (`DNS:ai-memory-test.local`), so the pinned lookup needs no override.
+const SERVER_NAME: &str = "ai-memory-test.local";
+
+/// Client config that verifies the test server by pinning the SHA-256 of
+/// the leaf the server loads (`valid_cert.pem`, via the production
+/// [`tls::build_rustls_pinning_client_config`]; unpinned hosts refused) and
+/// presents the allowlisted client certificate. No accept-any verifier
+/// (#8179 guard).
 async fn allowlisted_client_config() -> rustls::ClientConfig {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let cert_pem = tokio::fs::read(fixture("valid_cert.pem"))
+    use sha2::{Digest as _, Sha256};
+    let leaf_pem = tokio::fs::read(fixture("valid_cert.pem"))
         .await
-        .expect("cert");
-    let key_pem = tokio::fs::read(fixture("valid_key_pkcs8.pem"))
-        .await
-        .expect("key");
-    let certs = tls::rustls_pki_pem_iter_certs(&cert_pem).expect("parse cert");
-    let key = tls::rustls_pki_pem_parse_private_key(&key_pem).expect("parse key");
-    rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(tls::DangerousAnyServerVerifier))
-        .with_client_auth_cert(certs, key)
-        .expect("client config")
+        .expect("server leaf");
+    let chain = tls::rustls_pki_pem_iter_certs(&leaf_pem).expect("parse server leaf");
+    let leaf = chain.first().expect("fixture carries a leaf");
+    let pin: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+    let pins = HashMap::from([(SERVER_NAME.to_string(), HashSet::from([pin]))]);
+    tls::build_rustls_pinning_client_config(
+        pins,
+        Some(&fixture("valid_cert.pem")),
+        Some(&fixture("valid_key_pkcs8.pem")),
+    )
+    .expect("pinned client config")
 }
 
 fn spawn_client(addr: std::net::SocketAddr, config: rustls::ClientConfig) {
     std::thread::spawn(move || {
         let server_name =
-            rustls::pki_types::ServerName::try_from("ai-memory-test.local".to_string())
-                .expect("server name");
+            rustls::pki_types::ServerName::try_from(SERVER_NAME.to_string()).expect("server name");
         let mut conn =
             rustls::ClientConnection::new(Arc::new(config), server_name).expect("client conn");
         let Ok(mut sock) = std::net::TcpStream::connect(addr) else {
