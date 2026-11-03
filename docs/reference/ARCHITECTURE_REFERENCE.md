@@ -740,8 +740,11 @@ trust-all reads.
   `shared_from_agent_id` / `atomised_from_agent_id` / `promoted_from_agent_id`
   naming the source owner (#8513). A re-owned clone also carries
   `attest_level: claimed` and `attest_reset_reason` (`reowned_by_share`,
-  `reowned_by_atomise`, `reowned_by_promote`); the source `write_signature`,
-  `agent_pubkey` and `pubkey_bound_at` are dropped
+  `reowned_by_atomise`, `reowned_by_promote`, `reowned_by_consolidate`); the
+  source `write_signature`, `agent_pubkey`, `pubkey_bound_at`,
+  `attestation_downgraded` and `forged_signature_skipped` are dropped.
+  `memory_consolidate` (both backends, tenant and substrate) resets the same
+  way and keeps its lineage in `derived_from` / `consolidated_from_agents` (#8532)
 
 **Defaults that leak:** The fallback `host:<hostname>` exposes the hostname
 (since #1720 B1 it no longer carries the PID). When writing memories to a
