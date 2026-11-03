@@ -746,6 +746,19 @@ table.
 > populated `agent_subkey_certs` table — a security-inventory false negative.
 > `--principal` cannot be shadowed; omit it for the full node-wide list.
 
+## Re-owned rows (share, atomise, promote; #8513)
+
+A signature commits to the owner, namespace, title, kind, `created_at` and
+content of the row it was made over. `memory_share`, atomisation and
+promotion clone a row to a new owner, so the source signature can never be
+re-derived from the clone. The clone therefore does **not** inherit it:
+`write_signature`, `agent_pubkey` and `pubkey_bound_at` are dropped,
+`attest_level` is `claimed`, and `attest_reset_reason` names the path
+(`reowned_by_share`, `reowned_by_atomise`, `reowned_by_promote`). The source
+id and owner are recorded under `shared_from` / `atomised_from` /
+`promoted_from` and the matching `*_agent_id` key. The source row keeps its
+own attestation. This is the same rule update applies (#3420).
+
 ## Epistemic-typing provenance (`kind_provenance`, #1945)
 
 Every store path now records **how** a memory's `memory_kind` was assigned,

@@ -735,6 +735,13 @@ trust-all reads.
   `memory_consolidate` (the consolidator's id becomes `agent_id`)
 - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by
   `ai-memory mine` alongside the caller's `agent_id`
+- `shared_from` / `atomised_from` / `promoted_from` — source row id of a
+  re-owned clone (`memory_share` copy, atom, promotion clone), with
+  `shared_from_agent_id` / `atomised_from_agent_id` / `promoted_from_agent_id`
+  naming the source owner (#8513). A re-owned clone also carries
+  `attest_level: claimed` and `attest_reset_reason` (`reowned_by_share`,
+  `reowned_by_atomise`, `reowned_by_promote`); the source `write_signature`,
+  `agent_pubkey` and `pubkey_bound_at` are dropped
 
 **Defaults that leak:** The fallback `host:<hostname>` exposes the hostname
 (since #1720 B1 it no longer carries the PID). When writing memories to a
