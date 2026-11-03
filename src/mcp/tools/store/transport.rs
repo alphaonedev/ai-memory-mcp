@@ -220,8 +220,11 @@ pub(crate) fn forward_signal_send_to_http(
 ) -> Result<Value, String> {
     let url = format!("{}/api/v1/signals", forward_url.trim_end_matches('/'));
     let explicit = params[crate::mcp::param_names::FROM_AGENT].as_str();
-    let agent_id =
-        crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?;
+    // #8496 — the forwarded `X-Agent-Id` is the sender the daemon stamps, so it
+    // is bound to the enforced caller (#3171 store-forward precedent); a
+    // mismatching wire `from_agent` is refused before any network I/O.
+    let agent_id = crate::identity::resolve_governance_subject(explicit, mcp_client, "signal_send")
+        .map_err(|e| e.to_string())?;
     let body = params.clone();
     let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
     forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
@@ -334,7 +337,10 @@ mod signal_sender_binding_8496_tests {
             forward_signal_send_to_http(&url, &params, Some("ai:test")).expect("forward ok");
             let req = rx.recv().expect("request captured").to_ascii_lowercase();
             let want = format!("{}: ai:alice", crate::HEADER_AGENT_ID.to_ascii_lowercase());
-            assert!(req.contains(&want), "X-Agent-Id must be the caller; got: {req}");
+            assert!(
+                req.contains(&want),
+                "X-Agent-Id must be the caller; got: {req}"
+            );
         }
     }
 }
