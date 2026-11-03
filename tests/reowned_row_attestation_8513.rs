@@ -172,7 +172,10 @@ fn promote_clone_never_carries_source_attestation() {
     let clone = storage::get(&conn, &clone_id).unwrap().expect("clone");
     assert_attestation_reset(&clone.metadata, "ai:promoter-8513", "promote");
     assert_eq!(clone.metadata["promoted_from"], json!(source_id));
-    assert_eq!(clone.metadata["promoted_from_agent_id"], json!(SOURCE_OWNER));
+    assert_eq!(
+        clone.metadata["promoted_from_agent_id"],
+        json!(SOURCE_OWNER)
+    );
 }
 
 /// A promote with no acting principal keeps the source owner but still resets
@@ -185,7 +188,10 @@ fn promote_clone_without_actor_resets_attestation() {
     let clone = storage::get(&conn, &clone_id).unwrap().expect("clone");
     assert_attestation_reset(&clone.metadata, SOURCE_OWNER, "promote-no-actor");
     assert_eq!(clone.metadata["promoted_from"], json!(source_id));
-    assert_eq!(clone.metadata["promoted_from_agent_id"], json!(SOURCE_OWNER));
+    assert_eq!(
+        clone.metadata["promoted_from_agent_id"],
+        json!(SOURCE_OWNER)
+    );
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -271,7 +277,10 @@ mod pg {
         let clone = store.get(&ctx, &clone_id).await.expect("clone row");
         assert_attestation_reset(&clone.metadata, requester, "pg-promote");
         assert_eq!(clone.metadata["promoted_from"], json!(source_id));
-        assert_eq!(clone.metadata["promoted_from_agent_id"], json!(SOURCE_OWNER));
+        assert_eq!(
+            clone.metadata["promoted_from_agent_id"],
+            json!(SOURCE_OWNER)
+        );
 
         let _ = sqlx::query("DELETE FROM pending_actions WHERE id = $1")
             .bind(&pending_id)
