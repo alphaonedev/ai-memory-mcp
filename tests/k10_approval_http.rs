@@ -32,7 +32,7 @@ use tower::ServiceExt as _;
 
 // v0.7.0 refactor PR-5 (#793) — shared K10 HMAC fixture lives in
 // `tests/common/mod.rs`. The legacy in-file `sign()` helper below
-// (which still binds the K7-shape `<ts>.POST.<pending_id>.<body>`
+// (which binds the #8495 layout-v2 `<ts>.POST.<pending_id>@<approver>.<body>`
 // canonical) is preserved as a facade that delegates to the common
 // helper so this file's call-sites do not churn.
 mod common;
@@ -193,7 +193,10 @@ fn sign(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
     let key_hash = common::sha256_hex(secret);
     // P1 (#628 agent-4): canonical request now binds method + pending_id
     // so a captured signature can't be redirected to a different row.
-    let canonical = format!("{timestamp}.POST.{pending_id}.{body}");
+    // #8495 layout v2: the approver ("operator-1", the only decider these
+    // tests send) is inside the signed subject.
+    let subject = ai_memory::handlers::agent_api_key::approval_subject(pending_id, "operator-1");
+    let canonical = format!("{timestamp}.POST.{subject}.{body}");
     let sig = common::hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
 }

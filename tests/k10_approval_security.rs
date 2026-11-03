@@ -232,7 +232,8 @@ fn sign_with_method(
             .collect()
     }
     let key_hash = sha256_hex(secret);
-    let canonical = format!("{timestamp}.{method}.{pending_id}.{body}");
+    // #8495 layout v2: every decide in this file is sent as "operator-1".
+    let canonical = format!("{timestamp}.{method}.{pending_id}@operator-1.{body}");
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
 }
@@ -285,7 +286,8 @@ fn sign(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
     }
     let key_hash = sha256_hex(secret);
     // P1 (#628 agent-4): canonical request now binds method + pending_id.
-    let canonical = format!("{timestamp}.POST.{pending_id}.{body}");
+    // #8495 layout v2: every decide in this file is sent as "operator-1".
+    let canonical = format!("{timestamp}.POST.{pending_id}@operator-1.{body}");
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
 }

@@ -9,10 +9,13 @@
 //! Gated behind the K7 server-wide HMAC: caller MUST present
 //! `X-AI-Memory-Signature: sha256=<hex>` keyed on
 //! `SHA256([hooks.subscription].hmac_secret)` over the canonical
-//! `<timestamp>.<METHOD>.<pending_id>.<body>` string (the method and the
-//! pending-row id are bound so a signature cannot be replayed against a
-//! different row; see `verify_approval_hmac`). Missing or invalid
-//! signature → 401.
+//! `<timestamp>.<METHOD>.<pending_id>@<X-Agent-Id>.<body>` string
+//! (signature layout v2, #8495): the method, the pending-row id and the
+//! approver are all bound, so a signature cannot be replayed against a
+//! different row or re-attributed to a different approver; see
+//! `verify_approver_bound_hmac`. Missing or invalid signature → 401; a v1
+//! signature (`<pending_id>` without the approver) → 401
+//! `legacy_unbound_approver`.
 //!
 //! `GET /api/v1/approvals/stream` — long-lived SSE stream that fans out
 //! every `approval_requested` and `approval_decided` event from the
@@ -126,23 +129,176 @@ pub(crate) const APPROVAL_HMAC_MAX_SKEW_SECS: i64 = 60;
 /// that previously signed `<ts>.<body>` will now hard-fail (401), so
 /// any in-tree test fixture or external client must be updated in
 /// lockstep with this change.
+///
+/// This is the subject-generic verifier: the caller chooses `subject`.
+/// The agent api-key approval route passes `<pending_id>@<approver>`; the
+/// K10 decide surfaces go through [`verify_approver_bound_hmac`] (#8495),
+/// which builds that subject from `X-Agent-Id` itself.
 pub(crate) fn verify_approval_hmac(
     headers: &HeaderMap,
     body: &[u8],
     method: &str,
     pending_id: &str,
 ) -> Result<(), StatusCode> {
-    let secret = match crate::config::active_hooks_hmac_secret() {
-        Some(s) => s,
-        None => {
-            // No server-wide HMAC configured → the K10 contract is
-            // strict by default: reject every inbound approval. This
-            // is the safe posture (better to refuse a write than to
-            // accept an unauthenticated one) and matches the spec
-            // header "HMAC signing per K7's pattern".
-            tracing::warn!("K10 approval rejected: no [hooks.subscription].hmac_secret configured");
+    let envelope = parse_signed_envelope(headers, body)?;
+    // P1 (#628 agent-4): bind method + pending_id so a captured
+    // signature can't be redirected to a different approval row.
+    if !envelope.signs(method, pending_id) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    envelope.consume_nonce()
+}
+
+/// #8495 — version of the signed-subject layout the decide surfaces
+/// (`POST /api/v1/approvals/{id}`, `POST /api/v1/pending/{id}/approve|reject`)
+/// require.
+///
+/// * v1 (`<ts>.<METHOD>.<pending_id>.<body>`) committed to the row but not
+///   to the approver: `X-Agent-Id` sat beside the signed bytes, so a signed
+///   decide could be re-attributed and one secret holder could vote under N
+///   names.
+/// * v2 (`<ts>.<METHOD>.<pending_id>@<approver>.<body>`) puts the approver
+///   inside the signed subject, the layout
+///   [`super::agent_api_key::approval_subject`] already uses.
+///
+/// A v1 signature that still verifies is reported as
+/// [`LEGACY_UNBOUND_APPROVER`] and refused; it is never counted as a bound
+/// approval. The two layouts cannot collide: after the pending id the next
+/// signed byte is `.` in v1 and `@` in v2.
+pub const APPROVAL_SIGNATURE_LAYOUT_VERSION: u32 = 2;
+
+/// #8495 — wire error for a decide signed under the v1 layout (approver
+/// outside the signed bytes).
+pub const LEGACY_UNBOUND_APPROVER: &str = "legacy_unbound_approver";
+
+/// #8495 — operator-facing description of the v2 decide signature. Named so
+/// the refusal and the docs cannot drift apart.
+pub const APPROVER_BOUND_SIGNATURE_HINT: &str = "approval decides require signature layout v2: \
+     X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \
+     \"<ts>.<METHOD>.<pending_id>@<X-Agent-Id>.<body>\")> with \
+     X-AI-Memory-Timestamp: <unix-epoch-secs>. The approver named by \
+     X-Agent-Id is inside the signed subject; a v1 signature over \
+     <ts>.<METHOD>.<pending_id>.<body> does not bind the approver and is refused.";
+
+/// Why [`verify_approver_bound_hmac`] refused a decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApproverHmacRefusal {
+    /// Missing, malformed, stale, replayed or non-matching signature.
+    Invalid,
+    /// The signature verifies only under the v1 layout, which does not name
+    /// the approver.
+    LegacyUnboundApprover,
+}
+
+impl ApproverHmacRefusal {
+    /// The 401 response for this refusal, shared by every decide surface so
+    /// the wire shape cannot drift between them.
+    pub(crate) fn into_response(self) -> axum::response::Response {
+        let error = match self {
+            Self::Invalid => crate::errors::msg::INVALID_OR_MISSING_SIGNATURE,
+            Self::LegacyUnboundApprover => LEGACY_UNBOUND_APPROVER,
+        };
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": error,
+                "hint": APPROVER_BOUND_SIGNATURE_HINT,
+                "signature_layout_version": APPROVAL_SIGNATURE_LAYOUT_VERSION,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// #8495 — HMAC-verify a decide under the approver-bound v2 layout.
+///
+/// `approver` is the raw `X-Agent-Id` the handler will record as the
+/// decider (after the api-key middleware has rebound it for an enrolled
+/// per-agent key). The signature must commit to exactly that value. With no
+/// approver there is nothing to bind, so only the v1 probe runs and the
+/// decide is refused either way (fail closed, per ERRORS-02).
+///
+/// A v1 match is refused as [`ApproverHmacRefusal::LegacyUnboundApprover`]
+/// WITHOUT consuming the nonce: the request did nothing, and the legacy
+/// signer gets an actionable refusal instead of a replay 401.
+pub(crate) fn verify_approver_bound_hmac(
+    headers: &HeaderMap,
+    body: &[u8],
+    method: &str,
+    pending_id: &str,
+    approver: Option<&str>,
+) -> Result<(), ApproverHmacRefusal> {
+    let envelope =
+        parse_signed_envelope(headers, body).map_err(|_| ApproverHmacRefusal::Invalid)?;
+    if let Some(approver) = approver.filter(|a| !a.is_empty()) {
+        let subject = super::agent_api_key::approval_subject(pending_id, approver);
+        if envelope.signs(method, &subject) {
+            return envelope
+                .consume_nonce()
+                .map_err(|_| ApproverHmacRefusal::Invalid);
+        }
+    }
+    if envelope.signs(method, pending_id) {
+        tracing::warn!(
+            "K10 approval rejected: signature layout v1 does not bind the approver \
+             ({LEGACY_UNBOUND_APPROVER}); re-sign under layout v{APPROVAL_SIGNATURE_LAYOUT_VERSION}"
+        );
+        return Err(ApproverHmacRefusal::LegacyUnboundApprover);
+    }
+    Err(ApproverHmacRefusal::Invalid)
+}
+
+/// The parsed, time-checked K10 signature headers of one request.
+struct SignedEnvelope<'a> {
+    key_hash: String,
+    sig_hex: &'a str,
+    timestamp: &'a str,
+    ts_secs: i64,
+    body_str: &'a str,
+}
+
+impl SignedEnvelope<'_> {
+    /// Constant-time check that the presented signature is the HMAC of
+    /// `<ts>.<METHOD>.<subject>.<body>`.
+    fn signs(&self, method: &str, subject: &str) -> bool {
+        let canonical = format!("{}.{method}.{subject}.{}", self.timestamp, self.body_str);
+        let expected = crate::subscriptions::hmac_sha256_hex(&self.key_hash, &canonical);
+        constant_time_eq(expected.as_bytes(), self.sig_hex.as_bytes())
+    }
+
+    /// P2 (#628 agent-4): nonce-cache enforces single-use within the
+    /// 300s window. Without this, a captured signature could be
+    /// replayed N times against the same row before the timestamp
+    /// staled out — rendering the row-already-decided check the only
+    /// line of defence. The cache keys on the signature hex itself
+    /// (which already commits to ts + method + path + body + secret),
+    /// so any change to any field produces a new key.
+    fn consume_nonce(&self) -> Result<(), StatusCode> {
+        if !record_hmac_nonce(self.sig_hex, self.ts_secs) {
+            tracing::warn!(
+                "K10 approval rejected: signature replay (sig={}…)",
+                &self.sig_hex[..16.min(self.sig_hex.len())]
+            );
             return Err(StatusCode::UNAUTHORIZED);
         }
+        Ok(())
+    }
+}
+
+/// Parse the K10 signature headers and enforce the replay window. Every
+/// failure is a 401.
+fn parse_signed_envelope<'a>(
+    headers: &'a HeaderMap,
+    body: &'a [u8],
+) -> Result<SignedEnvelope<'a>, StatusCode> {
+    let Some(secret) = crate::config::active_hooks_hmac_secret() else {
+        // No server-wide HMAC configured → the K10 contract is
+        // strict by default: reject every inbound approval. This
+        // is the safe posture (better to refuse a write than to
+        // accept an unauthenticated one) and matches the spec
+        // header "HMAC signing per K7's pattern".
+        tracing::warn!("K10 approval rejected: no [hooks.subscription].hmac_secret configured");
+        return Err(StatusCode::UNAUTHORIZED);
     };
     let sig_header = headers
         .get(crate::HEADER_AI_MEMORY_SIGNATURE)
@@ -166,7 +322,7 @@ pub(crate) fn verify_approval_hmac(
         StatusCode::UNAUTHORIZED
     })?;
     let now_secs = Utc::now().timestamp();
-    let delta = now_secs - ts_secs;
+    let delta = now_secs.saturating_sub(ts_secs);
     if delta > APPROVAL_HMAC_MAX_AGE_SECS {
         tracing::warn!(
             "K10 approval rejected: stale signature (age {delta}s > {APPROVAL_HMAC_MAX_AGE_SECS}s window)"
@@ -176,34 +332,18 @@ pub(crate) fn verify_approval_hmac(
     if delta < -APPROVAL_HMAC_MAX_SKEW_SECS {
         tracing::warn!(
             "K10 approval rejected: future-dated signature (skew {}s > {APPROVAL_HMAC_MAX_SKEW_SECS}s tolerance)",
-            -delta
+            delta.saturating_neg()
         );
         return Err(StatusCode::UNAUTHORIZED);
     }
     let body_str = std::str::from_utf8(body).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    // P1 (#628 agent-4): bind method + pending_id so a captured
-    // signature can't be redirected to a different approval row.
-    let canonical = format!("{timestamp}.{method}.{pending_id}.{body_str}");
-    let key_hash = crate::subscriptions::sha256_hex(&secret);
-    let expected = crate::subscriptions::hmac_sha256_hex(&key_hash, &canonical);
-    if !constant_time_eq(expected.as_bytes(), sig_hex.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    // P2 (#628 agent-4): nonce-cache enforces single-use within the
-    // 300s window. Without this, a captured signature could be
-    // replayed N times against the same row before the timestamp
-    // staled out — rendering the row-already-decided check the only
-    // line of defence. The cache keys on the signature hex itself
-    // (which already commits to ts + method + path + body + secret),
-    // so any change to any field produces a new key.
-    if !record_hmac_nonce(sig_hex, ts_secs) {
-        tracing::warn!(
-            "K10 approval rejected: signature replay (sig={}…)",
-            &sig_hex[..16.min(sig_hex.len())]
-        );
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    Ok(())
+    Ok(SignedEnvelope {
+        key_hash: crate::subscriptions::sha256_hex(&secret),
+        sig_hex,
+        timestamp,
+        ts_secs,
+        body_str,
+    })
 }
 
 /// Process-wide replay cache for verified K10 HMAC signatures. Entries
@@ -335,12 +475,27 @@ pub async fn approval_decide(
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
-    if let Err(status) = verify_approval_hmac(&headers, &body_bytes, "POST", &id) {
-        return (
-            status,
-            Json(json!({"error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE})),
-        )
-            .into_response();
+    if let Err(refusal) = verify_approver_bound_hmac(
+        &headers,
+        &body_bytes,
+        "POST",
+        &id,
+        headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        return refusal.into_response();
+    }
+    // #8495: under `identity_mode = enforce` the approver the signature
+    // names must also be the principal the credential is bound to, so one
+    // shared secret cannot cast every vote of a consensus quorum.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "approval_decide",
+    ) {
+        return resp;
     }
     let body: ApprovalRequestBody = match serde_json::from_slice(&body_bytes) {
         Ok(b) => b,

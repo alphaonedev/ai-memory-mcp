@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ai_memory::config::{HttpIdentityMode, set_active_hooks_hmac_secret};
 use ai_memory::handlers::agent_api_key::approval_subject;
@@ -53,7 +53,7 @@ mod common;
 
 /// The HMAC secret is process-global state; every test in this binary
 /// takes this lock (same idiom as `tests/k10_approval_http.rs`).
-static LOCK_8495: Mutex<()> = Mutex::new(());
+static LOCK_8495: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const SECRET: &str = "approval-approver-hmac-8495-secret";
 const SHARED_KEY: &str = "shared-transport-key-8495";
@@ -98,9 +98,8 @@ fn build(backend: Backend, posture: Posture) -> Harness {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
-        ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"),
-    );
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
     let (enrolled, mode, key) = match posture {
         Posture::Default => (
             Arc::new(EnrolledAgentKeys::empty()),
@@ -307,7 +306,10 @@ async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) 
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
         .await
         .expect("body");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn approve_body() -> String {
@@ -355,7 +357,7 @@ async fn tampered_approver_fails_verification(backend: Backend) {
 
 #[tokio::test]
 async fn tampered_approver_fails_verification_sqlite_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     tampered_approver_fails_verification(Backend::Sqlite).await;
     set_active_hooks_hmac_secret(None);
@@ -363,7 +365,7 @@ async fn tampered_approver_fails_verification_sqlite_8495() {
 
 #[tokio::test]
 async fn tampered_approver_fails_verification_postgres_branch_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     tampered_approver_fails_verification(Backend::FakePostgres).await;
     set_active_hooks_hmac_secret(None);
@@ -414,7 +416,7 @@ async fn decide_binds_the_signing_approver(backend: Backend, deny: bool) {
 
 #[tokio::test]
 async fn decide_binds_the_signing_approver_sqlite_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     decide_binds_the_signing_approver(Backend::Sqlite, false).await;
     decide_binds_the_signing_approver(Backend::Sqlite, true).await;
@@ -423,7 +425,7 @@ async fn decide_binds_the_signing_approver_sqlite_8495() {
 
 #[tokio::test]
 async fn decide_binds_the_signing_approver_postgres_branch_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     decide_binds_the_signing_approver(Backend::FakePostgres, false).await;
     decide_binds_the_signing_approver(Backend::FakePostgres, true).await;
@@ -457,15 +459,22 @@ async fn legacy_v1_signature_is_reported_unbound(backend: Backend) {
         json!(LEGACY_UNBOUND_APPROVER),
         "{backend:?}: a v1 signature must be reported as unbound; body={v}"
     );
-    assert_eq!(v["signature_layout_version"], json!(2), "{backend:?}: body={v}");
+    assert_eq!(
+        v["signature_layout_version"],
+        json!(2),
+        "{backend:?}: body={v}"
+    );
     let row = pending_row(&h.db_path, &pid);
     assert_eq!(row.status, "pending", "{backend:?}: nothing decided");
-    assert!(row.decided_by.is_none(), "{backend:?}: no approver recorded");
+    assert!(
+        row.decided_by.is_none(),
+        "{backend:?}: no approver recorded"
+    );
 }
 
 #[tokio::test]
 async fn legacy_v1_signature_is_reported_unbound_sqlite_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     legacy_v1_signature_is_reported_unbound(Backend::Sqlite).await;
     set_active_hooks_hmac_secret(None);
@@ -473,7 +482,7 @@ async fn legacy_v1_signature_is_reported_unbound_sqlite_8495() {
 
 #[tokio::test]
 async fn legacy_v1_signature_is_reported_unbound_postgres_branch_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     legacy_v1_signature_is_reported_unbound(Backend::FakePostgres).await;
     set_active_hooks_hmac_secret(None);
@@ -490,8 +499,9 @@ async fn one_credential_cannot_fill_a_quorum(backend: Backend) {
 
     // One secret, one shared transport key, two approver names — each
     // signature correctly binds the name it presents.
+    let refused_secs = chrono::Utc::now().timestamp();
     for name in ["alice", "bob"] {
-        let ts = now_ts();
+        let ts = refused_secs.to_string();
         let (status, v) = send(
             &h.router,
             request(
@@ -512,10 +522,16 @@ async fn one_credential_cannot_fill_a_quorum(backend: Backend) {
     }
     let row = pending_row(&h.db_path, &pid);
     assert_eq!(row.status, "pending", "{backend:?}: quorum must not be met");
-    assert!(row.approvals.is_empty(), "{backend:?}: no vote may be recorded");
+    assert!(
+        row.approvals.is_empty(),
+        "{backend:?}: no vote may be recorded"
+    );
 
     // Positive control: two key-attested approvers do meet the quorum.
-    let ts = now_ts();
+    // The refused alice vote above passed the signature check, so its
+    // nonce is spent; sign one second before it so this is a fresh signature
+    // inside the replay window rather than a replay of that one.
+    let ts = (refused_secs - 1).to_string();
     let (status, v) = send(
         &h.router,
         request(
@@ -531,7 +547,7 @@ async fn one_credential_cannot_fill_a_quorum(backend: Backend) {
     assert_eq!(status, StatusCode::OK, "{backend:?}: body={v}");
     assert_eq!(v["votes"], json!(1), "{backend:?}: body={v}");
     assert_eq!(v["quorum"], json!(2), "{backend:?}: body={v}");
-    let ts = now_ts();
+    let ts = (refused_secs - 1).to_string();
     let (status, v) = send(
         &h.router,
         request(
@@ -550,7 +566,7 @@ async fn one_credential_cannot_fill_a_quorum(backend: Backend) {
 
 #[tokio::test]
 async fn one_credential_cannot_fill_a_quorum_sqlite_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     one_credential_cannot_fill_a_quorum(Backend::Sqlite).await;
     set_active_hooks_hmac_secret(None);
@@ -558,7 +574,7 @@ async fn one_credential_cannot_fill_a_quorum_sqlite_8495() {
 
 #[tokio::test]
 async fn one_credential_cannot_fill_a_quorum_postgres_branch_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     one_credential_cannot_fill_a_quorum(Backend::FakePostgres).await;
     set_active_hooks_hmac_secret(None);
@@ -570,7 +586,7 @@ async fn one_credential_cannot_fill_a_quorum_postgres_branch_8495() {
 
 #[tokio::test]
 async fn governance_pending_routes_bind_the_approver_8495() {
-    let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK_8495.lock().await;
     set_active_hooks_hmac_secret(Some(SECRET.to_string()));
     for backend in [Backend::Sqlite, Backend::FakePostgres] {
         for verb in ["approve", "reject"] {
@@ -583,7 +599,14 @@ async fn governance_pending_routes_bind_the_approver_8495() {
             let ts = now_ts();
             let (status, v) = send(
                 &h.router,
-                request(&uri, &ts, &sign_v1(&ts, &pid, &body), APPROVER_X, None, &body),
+                request(
+                    &uri,
+                    &ts,
+                    &sign_v1(&ts, &pid, &body),
+                    APPROVER_X,
+                    None,
+                    &body,
+                ),
             )
             .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{backend:?} {verb}: {v}");
@@ -596,11 +619,8 @@ async fn governance_pending_routes_bind_the_approver_8495() {
             // (2) X's signature presented as Y is refused; as X it decides.
             let ts = now_ts();
             let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
-            let (status, v) = send(
-                &h.router,
-                request(&uri, &ts, &sig, APPROVER_Y, None, &body),
-            )
-            .await;
+            let (status, v) =
+                send(&h.router, request(&uri, &ts, &sig, APPROVER_Y, None, &body)).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{backend:?} {verb}: {v}");
             let (status, v) =
                 send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
@@ -625,7 +645,7 @@ mod live_pg {
     use super::*;
     use ai_memory::store::{CallerContext, MemoryStore};
 
-    async fn live_router(store: Arc<dyn MemoryStore>) -> axum::Router {
+    fn live_router(store: Arc<dyn MemoryStore>) -> axum::Router {
         let scratch = ai_memory::db::open(Path::new(":memory:")).expect("scratch sqlite");
         let db: Db = Arc::new(tokio::sync::Mutex::new((
             scratch,
@@ -717,7 +737,7 @@ mod live_pg {
         store
             .queue_pending_action(
                 &ctx,
-                ai_memory::models::GovernedAction::Delete,
+                ai_memory::store::GovernedAction::Delete,
                 &ns,
                 Some(&mem_id),
                 REQUESTER,
@@ -733,14 +753,14 @@ mod live_pg {
             eprintln!("skipping live_postgres_binds_the_approver_8495: no postgres url");
             return;
         };
-        let _g = LOCK_8495.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = LOCK_8495.lock().await;
         set_active_hooks_hmac_secret(Some(SECRET.to_string()));
         let store: Arc<dyn MemoryStore> = Arc::new(
             ai_memory::store::postgres::PostgresStore::connect(&url)
                 .await
                 .expect("connect postgres adapter"),
         );
-        let router = live_router(store.clone()).await;
+        let router = live_router(store.clone());
         let body = approve_body();
 
         // (3) v1 → legacy_unbound_approver.
@@ -748,7 +768,14 @@ mod live_pg {
         let ts = now_ts();
         let (status, v) = send(
             &router,
-            request(&decide_uri(&pid), &ts, &sign_v1(&ts, &pid, &body), APPROVER_X, None, &body),
+            request(
+                &decide_uri(&pid),
+                &ts,
+                &sign_v1(&ts, &pid, &body),
+                APPROVER_X,
+                None,
+                &body,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "live pg: {v}");

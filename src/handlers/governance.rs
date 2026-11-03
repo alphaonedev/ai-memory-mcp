@@ -202,20 +202,29 @@ pub async fn approve_pending(
     // We mirror the K10 SSE handler's posture and require
     // `X-AI-Memory-Signature` on every inbound approve request,
     // regardless of `api_key` configuration. Without a server-wide
-    // `[hooks.subscription].hmac_secret`, `verify_approval_hmac`
+    // `[hooks.subscription].hmac_secret`, `verify_approver_bound_hmac`
     // refuses every request — the safe default.
-    if let Err(status) = super::verify_approval_hmac(&headers, &body_bytes, "POST", &id) {
-        return (
-            status,
-            Json(json!({
-                "error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE,
-                "hint": "POST /api/v1/pending/{id}/approve requires HMAC signing per K7's pattern. \
-                        Set [hooks.subscription] hmac_secret in config and send \
-                        X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \"<ts>.<METHOD>.<pending_id>.<body>\")> \
-                        with X-AI-Memory-Timestamp: <unix-epoch-secs>."
-            })),
-        )
-            .into_response();
+    if let Err(refusal) = super::approvals::verify_approver_bound_hmac(
+        &headers,
+        &body_bytes,
+        "POST",
+        &id,
+        headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        return refusal.into_response();
+    }
+    // #8495: under `identity_mode = enforce` the approver the signature
+    // names must also be the principal the credential is bound to, so one
+    // shared secret cannot cast every vote of a consensus quorum.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "approve_pending",
+    ) {
+        return resp;
     }
     let state = app.db.clone();
     if let Err(e) = validate::validate_id(&id) {
@@ -515,18 +524,27 @@ pub async fn reject_pending(
     // Legacy reject endpoint MUST verify HMAC for the same reason — an
     // unsigned reject is just as dangerous (denial-of-service against
     // governance state, write-amplifies pending row churn).
-    if let Err(status) = super::verify_approval_hmac(&headers, &body_bytes, "POST", &id) {
-        return (
-            status,
-            Json(json!({
-                "error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE,
-                "hint": "POST /api/v1/pending/{id}/reject requires HMAC signing per K7's pattern. \
-                        Set [hooks.subscription] hmac_secret in config and send \
-                        X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \"<ts>.<METHOD>.<pending_id>.<body>\")> \
-                        with X-AI-Memory-Timestamp: <unix-epoch-secs>."
-            })),
-        )
-            .into_response();
+    if let Err(refusal) = super::approvals::verify_approver_bound_hmac(
+        &headers,
+        &body_bytes,
+        "POST",
+        &id,
+        headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        return refusal.into_response();
+    }
+    // #8495: under `identity_mode = enforce` the approver the signature
+    // names must also be the principal the credential is bound to, so one
+    // shared secret cannot cast every vote of a consensus quorum.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "reject_pending",
+    ) {
+        return resp;
     }
     let state = app.db.clone();
     if let Err(e) = validate::validate_id(&id) {

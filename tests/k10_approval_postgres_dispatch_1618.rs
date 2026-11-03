@@ -156,7 +156,13 @@ fn seed_pending_row_in_store(store_path: &std::path::Path, requested_by: &str) -
 
 fn signed_approval_request(pending_id: &str, body: &str) -> Request<Body> {
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let sig = common::sign_canonical_envelope(TEST_SECRET, &timestamp, "POST", pending_id, body);
+    let sig = common::sign_canonical_envelope(
+        TEST_SECRET,
+        &timestamp,
+        "POST",
+        &ai_memory::handlers::agent_api_key::approval_subject(pending_id, "operator-1"),
+        body,
+    );
     Request::builder()
         .method("POST")
         .uri(format!("/api/v1/approvals/{pending_id}"))

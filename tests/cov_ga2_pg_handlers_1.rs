@@ -274,7 +274,7 @@ fn signed_approval_request(pending_id: &str, body: &Value) -> Request<Body> {
     let body_bytes = serde_json::to_vec(body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let canonical = format!("{ts}.POST.{pending_id}.{body_str}");
+    let canonical = format!("{ts}.POST.{pending_id}@{ADMIN_AGENT}.{body_str}");
     let key_hash = sha256_hex(HMAC_SECRET_HEX);
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     Request::builder()
