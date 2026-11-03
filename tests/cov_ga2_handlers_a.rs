@@ -47,6 +47,21 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 /// selects the `storage_backend` field: passing `Postgres` while the
 /// store handle stays sqlite drives the `#[cfg(feature = "sal")]`
 /// SAL-trait arms without a live postgres.
+/// #8494 — the bootstrap pubkey bind needs a key-authenticated admin: the
+/// admin's enrolled per-agent api key, sent as `X-API-Key` by `post_as` /
+/// `put_as`.
+const ADMIN_TOKEN: &str = "cov-ga2-admin-token-0123456789abcdef";
+
+/// #8494 — live registry holding `admin-caller`'s enrolled per-agent key.
+fn admin_enrolled_registry() -> Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys> {
+    let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
+    registry.install(std::collections::HashMap::from([(
+        ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
+        "admin-caller".to_string(),
+    )]));
+    registry
+}
+
 fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, Db) {
     // The admin gate (#1570) trusts a self-asserted `X-Agent-Id` naming
     // an admin id only when the daemon has request authentication
@@ -101,18 +116,14 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, Db) {
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: admin_enrolled_registry(),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(
         ApiKeyState {
             key: None,
             mtls_enforced: false,
-            enrolled_agent_keys: std::sync::Arc::new(
-                ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-            ),
+            enrolled_agent_keys: Arc::clone(&app_state.enrolled_agent_keys),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
             ..Default::default()
         },
@@ -144,6 +155,7 @@ async fn post_as(
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-agent-id", agent_id)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     read_json(router.clone().oneshot(req).await.unwrap()).await
@@ -161,6 +173,7 @@ async fn put_as(
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-agent-id", agent_id)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     read_json(router.clone().oneshot(req).await.unwrap()).await
