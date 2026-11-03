@@ -286,7 +286,10 @@ async fn approve_forever_is_refused_on_postgres_backend_3394() {
         .expect("get_pending_action")
         .expect("pending row exists in SAL store");
     assert_eq!(row.status, "pending");
-    assert!(ai_memory::approvals::list_synthetic_rules().is_empty());
+    assert_eq!(
+        ai_memory::approvals::list_synthetic_rules(),
+        [] as [ai_memory::approvals::SyntheticPermissionRule; 0]
+    );
     set_active_hooks_hmac_secret(None);
 }
 

@@ -106,12 +106,12 @@ impl EgressAccount {
     pub fn release(&self, n: usize) {
         let _ = self
             .queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some(cur.saturating_sub(n))
             });
         let _ = self
             .queued_frames
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some(cur.saturating_sub(1))
             });
     }
@@ -121,7 +121,7 @@ impl EgressAccount {
     fn try_reserve(&self, n: usize, cap: usize) -> bool {
         let admitted = self
             .queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 let next = cur.checked_add(n)?;
                 if next > cap { None } else { Some(next) }
             })

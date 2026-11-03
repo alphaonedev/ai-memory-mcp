@@ -524,7 +524,7 @@ fn source_not_found_does_not_emit_depth_cap_audit() {
     let err = db::reflect(&conn, &input).expect_err("must refuse missing src");
     assert!(matches!(err, ReflectError::SourceNotFound(_)));
     let rows = audit_rows_for_depth_exceeded(&conn);
-    assert!(rows.is_empty());
+    assert_eq!(rows, [] as [ai_memory::signed_events::SignedEvent; 0]);
 }
 
 // ─────────────────────────────────────────────────────────────────────

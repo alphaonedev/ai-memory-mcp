@@ -246,7 +246,7 @@ fn test_cli_atomise_keyword_tier() {
     let (rc, stdout, stderr) = run_with_mock(&db_path, &args, FeatureTier::Keyword, mock);
 
     assert_eq!(rc, 3, "expected exit 3 for tier_locked");
-    assert!(stdout.is_empty());
+    assert_eq!(stdout, "");
     assert!(
         stderr.contains("requires smart tier"),
         "stderr must hint at tier upgrade: {stderr}"
@@ -383,7 +383,7 @@ fn test_cli_atomise_json_output() {
     };
     let (rc, stdout, stderr) = run_with_mock(&db_path, &args, FeatureTier::Smart, mock);
     assert_eq!(rc, 0, "stderr={stderr}");
-    assert!(stderr.is_empty());
+    assert_eq!(stderr, "");
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
     assert_eq!(v["source_id"].as_str().unwrap(), source_id);
@@ -444,7 +444,7 @@ fn test_cli_atomise_source_too_small_returns_informational() {
     let args = make_args(&short_id);
     let (rc, stdout, stderr) = run_with_mock(&db_path, &args, FeatureTier::Smart, mock);
     assert_eq!(rc, 1, "SourceTooSmall is informational (exit 1)");
-    assert!(stdout.is_empty());
+    assert_eq!(stdout, "");
     assert!(stderr.contains(&short_id), "stderr must echo memory id");
     assert!(
         stderr.contains("--max-atom-tokens"),

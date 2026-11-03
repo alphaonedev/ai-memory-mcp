@@ -140,7 +140,10 @@ fn overclaim_refusal_message_names_the_field_2401() {
     // Err, message names the field").
     let cfg = hipaa_encrypt_at_rest(true);
     let claims = cfg.unenforced_claims(false);
-    assert!(!claims.is_empty());
+    assert_ne!(
+        claims,
+        [] as [ai_memory::config::UnenforcedComplianceClaim; 0]
+    );
     let msg = AuditComplianceConfig::overclaim_refusal_message(&claims);
     assert!(
         msg.contains("refusing to boot"),

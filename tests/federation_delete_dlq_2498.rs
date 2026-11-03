@@ -465,7 +465,7 @@ async fn pg_delete_lane_dlq_parity_2498() {
         .expect("#2498: the delete lane must land a DLQ row on the postgres sink too");
     assert_eq!(row.peer_id, "peer-2498-pg");
     assert_eq!(row.attempt_count, 1);
-    assert!(!row.last_error.is_empty());
+    assert_ne!(row.last_error, "");
     assert_delete_payload(&row.payload_json, &mem_id);
 
     // Leave zero residue: clear the row we created.

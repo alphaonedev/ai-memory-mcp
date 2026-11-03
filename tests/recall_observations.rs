@@ -555,7 +555,7 @@ fn gap3_recall_observations_mcp_tool_filters_compose() {
         .as_str()
         .expect("recall response must echo a recall_id")
         .to_string();
-    assert!(!recall_id.is_empty());
+    assert_ne!(recall_id, "");
     // Recall must have written at least one observation row.
     let written = observations::list_observations(&conn, Some(&recall_id), None, None, None, 100)
         .expect("list");

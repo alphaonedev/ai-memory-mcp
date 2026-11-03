@@ -123,7 +123,7 @@ What the guard closes (`CLOSED_CLASSES`; each is a class that a round 4 to 15 re
    `.config/nextest.toml` keeps today's tables and keys (a filter or override can skip the census test). A
    workspace table (`[workspace]`, any key) is rejected (`default-members` or `exclude` changes what a bare `cargo test` compiles), and
    rust-toolchain.toml is read (missing fails closed): only `[toolchain]` with `channel` equal to the current pin
-   (1.98.0) and `profile`, no `path` key, and no legacy `rust-toolchain` file.
+   (1.99.1) and `profile`, no `path` key, and no legacy `rust-toolchain` file.
 11. crate-local use targets: every crate-local path of the pinned `use` lines (`crate::test_support::{EnvGuard,
    env_lock}` and `scope::{RecordBinding, SCOPE_ENVELOPE_VERSION}`) is resolved to its module file the way rustc does
    (src/lib.rs top-level `mod NAME;` exactly once, `src/NAME.rs` or `src/NAME/mod.rs`, none or both present fails
@@ -202,7 +202,7 @@ real input files and crate-name resolution.
   precede the kind; a kind word followed by `!` is a macro invocation, never an item header (`trait!{}`, `union!{}`).
   Before the fix `trait` was missing, so the walk ran past a trait body and swallowed the next item.
 * One pattern per macro family (`INCLUDE_CALL`, `MACRO_RULES_CALL`, `TREE_MACRO`, `ITEM_MACRO`), each tolerant of the raw
-  spelling `r#include!`, `r#macro_rules!` and `r#proptest::r#proptest!` (rustc 1.98 compiles `r#include!` and rejects
+  spelling `r#include!`, `r#macro_rules!` and `r#proptest::r#proptest!` (rustc 1.99.1 compiles `r#include!` and rejects
   `r#macro_rules!` and `r#r#name`). mod.rs keeps the exact `include!` for its rebinding form (it holds three
   `include_str!` of docs data).
 * Values, not names: `ALLOWED_PATCHES` pins the whole value of the `paste` patch (`{ path = "vendor/paste" }`; since
@@ -214,7 +214,7 @@ real input files and crate-name resolution.
   same rule. A missing file is reported as missing.
 * Crate-name resolution: a name the scope file uses as an external crate (`zeroize`, `hkdf`, `sha2`, ...) must be a
   `LIVE_DEPENDENCIES` key and must not be bound locally by a `use ... as NAME`, a type-namespace item, `mod NAME` or
-  `extern crate .. as NAME` (`use crate::embeddings as zeroize;` silently shadows the extern crate in rustc 1.98). A
+  `extern crate .. as NAME` (`use crate::embeddings as zeroize;` silently shadows the extern crate in rustc 1.99.1). A
   `use anyhow::{Result, anyhow}` imports the crate's own macro and is no shadow (r15: only that exact pair, see the
   exact crate-name allow-list below). A private `SCOPE_ENVELOPE_VERSION`
   behind the `pub use` is E0603 (the N11c wording is E0603, not a missing-name error).
@@ -233,7 +233,7 @@ does, and an exemption is an exact allow-list entry, never a spelling heuristic.
 weak keywords as path segments, the exact crate-name allow-list and the structural patch pin.
 * Weak keywords as path segments (`WEAK_KEYWORDS`): `union`, `macro_rules`, `default` and `auto` are contextual, so a
   module of that name is a legal path segment and `union::compile!{..}` or `macro_rules::pull!(..)` is a macro call
-  (rustc 1.98 compiles both). `ITEM_HEADER` therefore refuses the weak word when `::` follows it, so the line falls
+  (rustc 1.99.1 compiles both). `ITEM_HEADER` therefore refuses the weak word when `::` follows it, so the line falls
   through to `ITEM_MACRO` and is named as a macro call in src/lib.rs and in a use-target file. The strict keywords
   cannot be path segments, and `use ::dep as x;` and `impl ::p::Trait for T` are real items with a leading-colon path,
   so the lookahead is deliberately NOT on `use` or `impl`.
@@ -594,7 +594,7 @@ MACRO_CALL_HEAD = MACRO_LOOKBEHIND + MACRO_PATH_PREFIX
 MACRO_DECL = re.compile(MACRO_CALL_HEAD + RAW + r"macro_rules" + MACRO_BANG + r"\s*(\S+)")
 # The one include-family call pattern shared by every reader (`include!`, `include_str!`, `include_bytes!`, `r#include!`);
 # the look-behind keeps `a_include!` and a lifetime or label (`'include`) out, never the `r#` raw spelling (r13 security
-# LOW-1: rustc 1.98 compiles `r#include!`, and the old `(?<![\w'#])` hid it).
+# LOW-1: rustc 1.99.1 compiles `r#include!`, and the old `(?<![\w'#])` hid it).
 INCLUDE_CALL_PATTERN = MACRO_CALL_HEAD + RAW + r"include\w*" + MACRO_BANG
 INCLUDE_CALL = re.compile(INCLUDE_CALL_PATTERN)
 # mod.rs itself holds `include_str!` of the docs it censuses (data, pinned by its text), so its rebinding form is the
@@ -2777,7 +2777,7 @@ def reject_nextest_config(overrides):
 
 TOOLCHAIN_FILE = "rust-toolchain.toml"
 TOOLCHAIN_LEGACY = "rust-toolchain"
-TOOLCHAIN_CHANNEL = "1.98.0"
+TOOLCHAIN_CHANNEL = "1.99.1"
 TOOLCHAIN_KEYS = ("channel", "profile")
 
 
@@ -2931,7 +2931,7 @@ ITEM_HEADER = re.compile(r"(pub(?:\s*\([^)]*\)\s*|\s+))?(?:(?:const|async|unsafe
                          r"(?![\w'#])(?!\s*!)"
                          r"|(macro_rules)(?![\w'#])(?!\s*::))")
 ITEM_NAME = re.compile(r"\s*(?:mut\s+)?(?:r#)?([A-Za-z_]\w*)")
-# Every macro-name match accepts the `r#` raw spelling (r13 security LOW-1: `r#include!` compiles in rustc 1.98) and
+# Every macro-name match accepts the `r#` raw spelling (r13 security LOW-1: `r#include!` compiles in rustc 1.99.1) and
 # the optional leading `::` (r15 code LOW-1); both are built from the shared fragments defined with MACRO_DECL above.
 # `TREE_MACRO` finds every call in a file (so a `:` or `#` before it means it is the tail of a longer path or an
 # attribute); `ITEM_MACRO` is matched at the start of an item, so it has no look-behind.
@@ -4560,7 +4560,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             Census(self.text, overrides={NEXTEST_CONFIG: merge_toml(read(NEXTEST_CONFIG),
                                                                     '[profile.default]\n"ret\\u0072ies" = 9\n')})
         with self.assertRaisesRegex(AssertionError, r"an escaped TOML key is not read by this guard"):
-            Census(self.text, overrides={TOOLCHAIN_FILE: '[toolchain]\n"chan\\u006eel" = "1.98.0"\n'})
+            Census(self.text, overrides={TOOLCHAIN_FILE: '[toolchain]\n"chan\\u006eel" = "1.99.1"\n'})
 
     def test_live_toml_inputs_carry_no_escaped_key_and_literal_keys_are_still_read(self):
         """code r10 L2: the fail-closed rule costs the live files nothing; a single-quoted (literal) key is exact."""
@@ -4634,16 +4634,16 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
         live = read(TOOLCHAIN_FILE)
         entries = dict((p, v) for p, v in toml_entries(live, TOOLCHAIN_FILE) if v is not None)
         self.assertEqual(unquote(entries[("toolchain", "channel")]), TOOLCHAIN_CHANNEL)
-        self.assertEqual(TOOLCHAIN_CHANNEL, "1.98.0")
+        self.assertEqual(TOOLCHAIN_CHANNEL, "1.99.1")
         Census(self.text, overrides={TOOLCHAIN_FILE: live})
-        for code, shown in (('[toolchain]\nchannel = "1.98.0"\npath = "/elsewhere"\n', r"`\[toolchain\] path`"),
+        for code, shown in (('[toolchain]\nchannel = "1.99.1"\npath = "/elsewhere"\n', r"`\[toolchain\] path`"),
                             ('[toolchain]\nchannel = "1.97.0"\n', r"channel is '1\.97\.0'"),
                             ('[toolchain]\nchannel = "nightly"\n', r"channel is 'nightly'"),
                             ('[toolchain]\nprofile = "minimal"\n', r"channel is None"),
-                            ('[toolchain]\nchannel = "1.98.0"\ncomponents = ["rustfmt"]\n', r"`\[toolchain\] components`"),
-                            ('[toolchain]\nchannel = "1.98.0"\n[other]\nx = 1\n', r"the table `\[other\]`"),
-                            ('channel = "1.98.0"\n[toolchain]\nchannel = "1.98.0"\n', r"outside the `\[toolchain\]` keys"),
-                            ('[toolchain.sub]\nchannel = "1.98.0"\n', r"the table `\[toolchain\.sub\]`")):
+                            ('[toolchain]\nchannel = "1.99.1"\ncomponents = ["rustfmt"]\n', r"`\[toolchain\] components`"),
+                            ('[toolchain]\nchannel = "1.99.1"\n[other]\nx = 1\n', r"the table `\[other\]`"),
+                            ('channel = "1.99.1"\n[toolchain]\nchannel = "1.99.1"\n', r"outside the `\[toolchain\]` keys"),
+                            ('[toolchain.sub]\nchannel = "1.99.1"\n', r"the table `\[toolchain\.sub\]`")):
             with self.subTest(code=code):
                 with self.assertRaisesRegex(AssertionError, shown):
                     Census(self.text, overrides={TOOLCHAIN_FILE: code})
@@ -4868,7 +4868,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.refused(re.escape(rel) + r" has the key `build\.jobs` twice", {rel: "[build]\njobs = 1\njobs = 2\n"})
         self.refused(r"rust-toolchain\.toml has the key `toolchain\.channel` twice",
-                     {TOOLCHAIN_FILE: '[toolchain]\nchannel = "1.98.0"\nchannel = "1.98.0"\n'})
+                     {TOOLCHAIN_FILE: '[toolchain]\nchannel = "1.99.1"\nchannel = "1.99.1"\n'})
         # array tables legitimately repeat their keys: the live manifest (several `[[test]]` / `[[bench]]`) still parses
         names = [path for path, value in toml_entries(manifest, MANIFEST) if value is None and path[:1] == ("test",)]
         self.assertGreater(len(names), 1, "the live manifest should hold several [[test]] tables")
@@ -5066,7 +5066,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                      self.with_module(SCOPE_SRC, "", "\n" + self.TRAIT_8346 + "m_8346!{}\n"))
 
     def test_raw_identifier_include_calls_are_rejected_everywhere(self):
-        """security r13 LOW-1 #8436: `r#include!` compiles in rustc 1.98 and was hidden by the `#` look-behind."""
+        """security r13 LOW-1 #8436: `r#include!` compiles in rustc 1.99.1 and was hidden by the `#` look-behind."""
         support, store = "src/test_support.rs", "src/encryption/scope/store.rs"
         calls = ('r#include!("x_8346.rs");', 'r#include_str!("x_8346.txt");', 'r#include_bytes!("x_8346.bin");',
                  'r # include !("x_8346.rs");')

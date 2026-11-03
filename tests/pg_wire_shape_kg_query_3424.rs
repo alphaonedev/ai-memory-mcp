@@ -475,7 +475,7 @@ mod live_pg {
         sqlx::query("INSERT INTO memory_links (source_id, target_id, relation, observed_by) VALUES ($1, $2, 'related_to', 'ai:other')")
             .bind(SRC).bind(TGT).execute(&pool).await.expect("parallel relation");
         let rows = store.kg_query_cte(SRC, 1).await.expect("hydrated CTE");
-        assert!(!rows.is_empty());
+        assert_ne!(rows, [] as [ai_memory::store::KgQueryRow; 0]);
         for row in rows {
             let observer = if row.relation == "depends_on" {
                 CALLER

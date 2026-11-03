@@ -128,11 +128,12 @@ fn preview_and_yes_protect_registered_and_reserved_keys() {
         &["--include-public-only", "--dry-run"][..],
     ] {
         let preview = successful(&f.prune(flags));
-        assert!(
+        assert_eq!(
             preview["inventory"]["deleted_files"]
                 .as_array()
                 .unwrap()
-                .is_empty()
+                .len(),
+            0
         );
         assert_public_keys_present(&f);
     }
@@ -333,11 +334,12 @@ async fn postgres_registry_controls_doctor_preview_delete_and_refusal() {
             .args(flags)
             .output()
             .unwrap();
-        assert!(
+        assert_eq!(
             successful(&preview)["inventory"]["deleted_files"]
                 .as_array()
                 .unwrap()
-                .is_empty()
+                .len(),
+            0
         );
         assert_public_keys_present(&f);
     }

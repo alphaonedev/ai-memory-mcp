@@ -329,7 +329,7 @@ fn install_defaults_repairs_rows_left_inert_by_a_raw_enable_3430() {
         "#3430: all four inert-but-enabled rows must be self-healed, got {envelope}"
     );
     assert_eq!(result["enforced"].as_array().unwrap().len(), 4);
-    assert!(result["not_enforced"].as_array().unwrap().is_empty());
+    assert_eq!(result["not_enforced"].as_array().unwrap().len(), 0);
 
     match probe_tmp_write(&db_path, "/tmp/leak.txt") {
         Decision::Refuse { rule_id, .. } => assert_eq!(rule_id, "R001"),

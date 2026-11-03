@@ -653,18 +653,27 @@ fn p4_flags_postgres_spaced_conflict_target_and_title_assignment() {
 fn p4_ignores_do_nothing_and_non_durable_and_other_tables() {
     // DO NOTHING destroys nothing.
     let do_nothing = "ON CONFLICT(title, namespace) DO NOTHING RETURNING id;";
-    assert!(p4_on_conflict_do_update_durable_text(do_nothing).is_empty());
+    assert_eq!(
+        p4_on_conflict_do_update_durable_text(do_nothing),
+        [] as [usize; 0]
+    );
 
     // A memories upsert that touches ONLY derived/temporal columns is out of
     // scope (content/title are untouched).
     let derived_only =
         "ON CONFLICT(title, namespace) DO UPDATE SET version = memories.version + 1;";
-    assert!(p4_on_conflict_do_update_durable_text(derived_only).is_empty());
+    assert_eq!(
+        p4_on_conflict_do_update_durable_text(derived_only),
+        [] as [usize; 0]
+    );
 
     // A `content`-bearing upsert on a DIFFERENT conflict target (not the
     // memories `(title, namespace)` index) must NOT be flagged.
     let other_table = "ON CONFLICT(agent_id, peer_id) DO UPDATE SET content = excluded.content;";
-    assert!(p4_on_conflict_do_update_durable_text(other_table).is_empty());
+    assert_eq!(
+        p4_on_conflict_do_update_durable_text(other_table),
+        [] as [usize; 0]
+    );
 }
 
 #[test]
@@ -719,7 +728,10 @@ fn p4_flags_the_interpolated_conflict_target_spelling_3690() {
     );
     // The placeholder with a self-preserving arm is still not flagged.
     let keep = "{conflict_target} DO UPDATE SET content = memories.content;";
-    assert!(p4_on_conflict_do_update_durable_text(keep).is_empty());
+    assert_eq!(
+        p4_on_conflict_do_update_durable_text(keep),
+        [] as [usize; 0]
+    );
 }
 
 #[test]

@@ -172,7 +172,7 @@ fn test_explicit_advisory_is_honored_and_warning_silenced() {
 fn test_permissions_config_default_has_none_mode() {
     let pc = PermissionsConfig::default();
     assert!(pc.mode.is_none(), "default mode must be None (B4 reshape)");
-    assert!(pc.rules.is_empty());
+    assert_eq!(pc.rules, [] as [ai_memory::governance::PermissionRule; 0]);
 }
 
 // ---------------------------------------------------------------------------

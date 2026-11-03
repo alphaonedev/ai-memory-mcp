@@ -471,9 +471,9 @@ fn eviction_event_legacy_payload_decodes_via_public_reexport() {
     let legacy = r#"{"memory_id":"m-legacy"}"#;
     let back: EvictionEvent = serde_json::from_str(legacy).expect("decode legacy payload");
     assert_eq!(back.memory_id, "m-legacy");
-    assert!(back.namespace.is_empty());
-    assert!(back.evicted_at.is_empty());
-    assert!(back.reason.is_empty());
+    assert_eq!(back.namespace, "");
+    assert_eq!(back.evicted_at, "");
+    assert_eq!(back.reason, "");
 }
 
 // ---------------------------------------------------------------------------

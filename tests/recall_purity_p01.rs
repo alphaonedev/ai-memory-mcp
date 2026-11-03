@@ -574,7 +574,7 @@ fn purity_decay_variant_confidence_untouched_on_recall_then_stamped_by_fold() {
         None,
     )
     .expect("mcp recall");
-    assert!(!resp["memories"].as_array().unwrap().is_empty());
+    assert_ne!(resp["memories"].as_array().unwrap().len(), 0);
 
     let (recall_conf, recall_stamp): (f64, Option<String>) = conn
         .query_row(
