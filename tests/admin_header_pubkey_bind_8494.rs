@@ -348,8 +348,16 @@ async fn key_authenticated_admin_can_bind_a_pubkey_8494() {
     let fx = fixture("keyed");
     let kp = keypair();
     let (cstatus, bstatus) = bind_as(&fx.router, ADMIN_TOKEN, &kp).await;
-    assert_eq!(cstatus, StatusCode::OK, "key-authenticated admin: challenge");
-    assert_eq!(bstatus, Some(StatusCode::OK), "key-authenticated admin: bind");
+    assert_eq!(
+        cstatus,
+        StatusCode::OK,
+        "key-authenticated admin: challenge"
+    );
+    assert_eq!(
+        bstatus,
+        Some(StatusCode::OK),
+        "key-authenticated admin: bind"
+    );
     assert_eq!(stored_key(&fx.db_path), Some(kp.public_base64()));
 }
 
