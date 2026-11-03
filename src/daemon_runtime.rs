@@ -7973,6 +7973,21 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // #8494 — the header-trust opt-in also re-admits a claimed admin to the
+    // bootstrap pubkey-bind routes (a claimed header can then bind a key to
+    // any agent). Classified operator-advisory in ARCHITECTURE_REFERENCE; the
+    // boot banner names it so it cannot be enabled silently.
+    if !app_state.admin_agent_ids.is_empty()
+        && crate::handlers::admin_role::admin_header_trust_enabled()
+    {
+        tracing::warn!(
+            "{}=1 with [admin].agent_ids configured: a CLAIMED admin X-Agent-Id is trusted, \
+             including on PUT /api/v1/agents/{{id}}/pubkey (bootstrap key bind, #8494). Without \
+             this opt-in the bind requires the admin's enrolled per-agent api key",
+            crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
+        );
+    }
+
     // #1775 — boot WARN when archive_on_gc is explicitly false (the GC
     // sweep + memory_forget become permanent hard-delete). One-shot via
     // an internal `std::sync::Once`; safe to call on both serve + mcp boot.
