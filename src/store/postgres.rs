@@ -49,6 +49,8 @@ mod hub;
 
 use crate::models::ConfidenceSource;
 mod coordination_create;
+// #8487 notify sender idempotency key (own module: qual_10 budget)
+mod notify_dedup;
 // #3064 lane L-PGP — postgres SAL for the tools whose HTTP mirrors were
 // fail-closed 501 on this backend. Its own module because postgres.rs is at
 // its qual_10 module-size budget (the lane brief mandates a submodule over a
@@ -1750,6 +1752,12 @@ const MIGRATION_V99_SYNC_PEER_CONTACT: &str =
 const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
     include_str!("../../migrations/postgres/0057_v100_title_slot_live_rows.sql");
 
+/// v101 (#8487): the `notify_dedup` table backing the optional sender
+/// idempotency key on `memory_notify`. The sqlite twin is
+/// `MIGRATION_V101_SQLITE` (`migrations/sqlite/0085_v101_notify_dedup.sql`).
+const MIGRATION_V101_NOTIFY_DEDUP: &str =
+    include_str!("../../migrations/postgres/0058_v101_notify_dedup.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2140,7 +2148,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 100;
+const CURRENT_SCHEMA_VERSION: i32 = 101;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4310,8 +4318,11 @@ impl PostgresStore {
         if current_version < 99 {
             self.migrate_v99().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 100 {
             self.migrate_v100().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v101().await?;
         }
 
         Ok(())
@@ -7484,6 +7495,33 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v100 applied (#3690: the (title, namespace) unique index \
              is partial — tombstoned rows no longer hold a title slot)"
+        );
+        Ok(())
+    }
+
+    /// v101 (#8487) — the `notify_dedup` table for the optional sender
+    /// idempotency key on `memory_notify`; additive, stamped literally.
+    async fn migrate_v101(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V101_NOTIFY_DEDUP.contains("PRIMARY KEY (sender, target, key)"),
+            "#8487: the v101 DDL doc twin must key the table on (sender, target, key)"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v101 notify-dedup migration tx", e))?;
+        sqlx::raw_sql(MIGRATION_V101_NOTIFY_DEDUP)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v101 notify-dedup migration", e))?;
+        record_schema_version(&mut tx, 101).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v101 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v101 applied (#8487: notify_dedup for the sender idempotency key)"
         );
         Ok(())
     }
@@ -16696,6 +16734,12 @@ pub(crate) async fn pg_purge_dlq_dedup_in_tx(
         .bind(ids)
         .execute(&mut **tx)
         .await?;
+    // #8487 — the notify idempotency row names the erased inbox row and its
+    // content digest: same remanence class.
+    sqlx::query("DELETE FROM notify_dedup WHERE memory_id = ANY($1)")
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -23077,6 +23121,7 @@ impl MemoryStore for PostgresStore {
             embedding,
             space,
             crate::storage::InsertConflictArm::Merge,
+            None,
         )
         .await
     }
@@ -23101,6 +23146,7 @@ impl MemoryStore for PostgresStore {
             embedding,
             space,
             crate::storage::InsertConflictArm::Refuse,
+            None,
         )
         .await
     }
@@ -23137,6 +23183,7 @@ impl MemoryStore for PostgresStore {
             None,
             None,
             crate::storage::InsertConflictArm::RestoreSameId,
+            None,
         )
         .await
     }
@@ -30910,6 +30957,31 @@ impl MemoryStore for PostgresStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        self.notify_outcome(
+            ctx,
+            target_agent,
+            title,
+            payload,
+            priority,
+            tier,
+            why_trace,
+            None,
+        )
+        .await
+        .map(|o| o.id)
+    }
+
+    async fn notify_outcome(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+        why_trace: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<super::NotifyOutcome> {
         // #4338 — refuse an invalid recipient before any quota charge, write
         // or wake; the shared validator never echoes the value.
         crate::validate::validate_notify_target(target_agent).map_err(|e| {
@@ -30917,6 +30989,14 @@ impl MemoryStore for PostgresStore {
                 detail: e.to_string(),
             }
         })?;
+        // #8487 — a bad idempotency key is refused before any quota charge or
+        // write; the error never echoes the key.
+        let key = idempotency_key
+            .map(crate::notify_dedup::validate_idempotency_key)
+            .transpose()
+            .map_err(|e| StoreError::InvalidInput {
+                detail: e.to_string(),
+            })?;
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
@@ -30968,12 +31048,60 @@ impl MemoryStore for PostgresStore {
             valid_from: None,
             valid_until: None,
         };
+        // #8487 — keyed delivery: probe first (a hit or conflict charges and
+        // writes nothing), then insert the inbox row and the dedup row in ONE
+        // transaction; a lost concurrent-retry race re-probes and answers a hit.
+        let digest;
+        let dedup = match key.as_deref() {
+            Some(k) => {
+                digest = crate::notify_dedup::content_digest(
+                    target_agent,
+                    title,
+                    payload,
+                    crate::models::normalize_priority(i64::from(priority)),
+                    &mem.tier,
+                );
+                Some(notify_dedup::DedupRow {
+                    sender: &ctx.agent_id,
+                    target: target_agent,
+                    key: k,
+                    digest: &digest,
+                })
+            }
+            None => None,
+        };
+        if let Some(d) = dedup.as_ref() {
+            if let notify_dedup::Resolved::Hit(id) = self.notify_dedup_preflight(d).await? {
+                return Ok(super::NotifyOutcome {
+                    id,
+                    dedup_hit: true,
+                });
+            }
+        }
         // #3639 — refuse-on-conflict: a delivery never merges into a row that
         // already holds the key (the minted title makes that unreachable; a
         // collision is a visible error, never a silent overwrite).
-        let new_id = self
-            .store_with_embedding_no_overwrite(ctx, &mem, None, None)
-            .await?;
+        let stored = self
+            .store_with_embedding_inner(
+                ctx,
+                &mem,
+                None,
+                None,
+                crate::storage::InsertConflictArm::Refuse,
+                dedup.as_ref(),
+            )
+            .await;
+        let new_id = match (stored, dedup.as_ref()) {
+            (Ok(id), _) => id,
+            (Err(e), Some(d)) => {
+                let id = self.notify_dedup_after_failure(d, e).await?;
+                return Ok(super::NotifyOutcome {
+                    id,
+                    dedup_hit: true,
+                });
+            }
+            (Err(e), None) => return Err(e),
+        };
         // #3465 — the row is durable: wake the recipient on the
         // in-process bus. Only the WAKE half fires here; the webhook
         // half needs the `AppState`-scoped `_subscriptions/<agent>` SAL
@@ -30992,7 +31120,10 @@ impl MemoryStore for PostgresStore {
             namespace: &mem.namespace,
             content: payload,
         });
-        Ok(new_id)
+        Ok(super::NotifyOutcome {
+            id: new_id,
+            dedup_hit: false,
+        })
     }
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — full governance pipeline
@@ -34196,6 +34327,10 @@ impl PostgresStore {
         embedding: Option<&[f32]>,
         space: Option<&str>,
         conflict_arm: crate::storage::InsertConflictArm,
+        // #8487 — the sender idempotency key row, written in THIS transaction
+        // after the inbox row and before the quota records. `None` everywhere
+        // except the keyed notify.
+        dedup: Option<&notify_dedup::DedupRow<'_>>,
     ) -> StoreResult<String> {
         self.gate_record_stop().await?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
@@ -34647,6 +34782,14 @@ impl PostgresStore {
         // `metadata.agent_id`. Repairs the concurrent-first-creation race the
         // pre-read cannot close under READ COMMITTED.
         reconcile_envelope_owner(&mut *tx, &id, &memory.content, &embed_seal).await?;
+
+        // #8487 — the sender idempotency key row, atomic with the inbox row and
+        // the quota records below. A unique violation here is a concurrent retry
+        // that committed first: the error propagates, this transaction rolls back
+        // (quota included) and the keyed notify wrapper re-probes and answers a hit.
+        if let Some(d) = dedup {
+            notify_dedup::insert_in_tx(&mut tx, d, &id, &memory.created_at).await?;
+        }
 
         // v1.0.0 #2948 — record the COW SUPERSEDE for an in-place content
         // overwrite (a Merge conflict-merge, or a same-id RestoreSameId re-store).

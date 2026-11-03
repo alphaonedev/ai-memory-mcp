@@ -875,6 +875,13 @@ pub enum MemoryError {
     /// trail is not recording (`AI_MEMORY_REQUIRE_AUDIT_TRAIL`). Our own text,
     /// passed through unchanged; HTTP 503 because it clears itself.
     AuditTrailUnavailable(String),
+    /// #8487 — a `memory_notify` idempotency key was reused with DIFFERENT
+    /// content. Carries the id of the delivery the key already names so the
+    /// sender can reconcile. Our own text; the key itself is never echoed.
+    NotifyIdempotencyConflict {
+        /// The inbox row the first delivery under this key created.
+        original_id: String,
+    },
 }
 
 impl MemoryError {
@@ -900,7 +907,7 @@ impl MemoryError {
             Self::NotFound(_) => error_codes::NOT_FOUND,
             Self::ValidationFailed(_) => error_codes::VALIDATION_FAILED,
             Self::DatabaseError(_) => error_codes::DATABASE_ERROR,
-            Self::Conflict(_) => error_codes::CONFLICT,
+            Self::Conflict(_) | Self::NotifyIdempotencyConflict { .. } => error_codes::CONFLICT,
             Self::ReflectionDepthExceeded { .. } => error_codes::REFLECTION_DEPTH_EXCEEDED,
             Self::SynthesisDepthExceeded { .. } => error_codes::SYNTHESIS_DEPTH_EXCEEDED,
             Self::ReflectionCycleDetected { .. } => error_codes::REFLECTION_CYCLE_DETECTED,
@@ -927,6 +934,7 @@ impl MemoryError {
             // for an action the configured cap forbids); CONFLICT matches
             // the rest of governance-style refusals.
             Self::Conflict(_)
+            | Self::NotifyIdempotencyConflict { .. }
             | Self::ReflectionDepthExceeded { .. }
             | Self::SynthesisDepthExceeded { .. }
             | Self::ReflectionCycleDetected { .. } => StatusCode::CONFLICT,
@@ -991,6 +999,9 @@ impl MemoryError {
             // wire string they did before the typed envelope landed.
             Self::RefusedByGovernanceGate(refusal) => refusal.to_string(),
             Self::QuotaExceeded(q) => q.to_string(),
+            Self::NotifyIdempotencyConflict { original_id } => format!(
+                "idempotency key already used with different content; original id {original_id}"
+            ),
         }
     }
 }
