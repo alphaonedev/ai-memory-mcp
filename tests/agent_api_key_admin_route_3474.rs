@@ -1051,8 +1051,9 @@ async fn an_approved_revoke_that_became_the_last_key_is_refused_at_apply_3529() 
     let admin_token = admin_key(ADMIN);
     assert_eq!(fx.registry.len(), 3);
 
-    // Park a revoke of ANOTHER principal's key. Two holders exist, so this
-    // does NOT empty the registry and the queued row says so.
+    // Park a revoke of ANOTHER principal's key. Three holders exist (the
+    // admin, the approver and ALICE), so this does NOT empty the registry
+    // and the queued row says so.
     let (status, _, queued) = call(&fx.router, revoke_req(ADMIN, ALICE, &json!({}))).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
     assert_eq!(queued["reason"], "another_principal");
