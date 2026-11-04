@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
 
 - `forward_signal_send_to_http` resolved the forwarded `X-Agent-Id` from the wire `from_agent` through `resolve_agent_id`, so an MCP caller could forge the sender of a forwarded signal. It now uses `resolve_governance_subject` (the #3171 store-forward precedent): under an enforced caller a mismatching `from_agent` is refused with `agent_id mismatch` before any network I/O, and an absent value is filled from the caller. The HTTP handler already stamps `from_agent` from the header and ignores the body field.
+### Security (#8497, #8493 — entity_register owner is the verified subject)
+
+- `memory_entity_register` and `POST /api/v1/entities` own the entity by the verified caller on both backends. A body `agent_id` or inline `metadata.agent_id` that differs from the verified subject is refused (HTTP 403 `AGENT_ID_MISMATCH`, MCP mismatch error, SAL `PermissionDenied`) with an `outcome: deny` audit row; the postgres funnel now stamps the resolved owner with `insert` like sqlite (#3171). Shared rule in `identity::entity_owner`; fragment `changelog.d/8497.security.md`.
 
 ### Docs (#8262 — certification scope statement for v1.0.0 GA)
 

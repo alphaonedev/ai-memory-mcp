@@ -72,6 +72,19 @@ pub struct EntityByAliasQuery {
     pub namespace: Option<String>,
 }
 
+/// #8497 - the typed 403 for a claimed entity owner that is not the verified
+/// caller (`code: AGENT_ID_MISMATCH`, the create-family shape).
+fn entity_owner_forbidden(message: &str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "code": crate::errors::error_codes::AGENT_ID_MISMATCH,
+            "error": message,
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /api/v1/entities` — REST mirror of the MCP
 /// `memory_entity_register` tool. Idempotent on
 /// `(canonical_name, namespace)`; merges aliases on re-registration.
@@ -95,32 +108,59 @@ pub async fn entity_register(
             .into_response();
     }
 
-    let agent_id = body
-        .agent_id
-        .as_deref()
-        .or_else(|| {
-            headers
-                .get(crate::HEADER_AGENT_ID)
-                .and_then(|v| v.to_str().ok())
-        })
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    if let Some(aid) = agent_id.as_deref()
-        && let Err(e) = validate::validate_agent_id(aid)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-        )
-            .into_response();
-    }
+    // #8497 - the entity owner is the VERIFIED caller: the `X-Agent-Id`
+    // header (or the anonymous fallback), never the body. A body `agent_id`
+    // that disagrees with it is a 403 `AGENT_ID_MISMATCH` plus an audit row;
+    // before #8497 the body won, so a caller could register an entity as
+    // anyone.
+    let resolved_owner =
+        match super::parity::resolve_caller_agent_id(body.agent_id.as_deref(), &headers, None) {
+            Ok(id) => id,
+            Err(msg) if msg.contains("agent_id_body_header_mismatch") => {
+                let claimed = body.agent_id.clone().unwrap_or_default();
+                let subject = headers
+                    .get(crate::HEADER_AGENT_ID)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string();
+                crate::identity::entity_owner::audit_entity_owner_refusal(
+                    &crate::identity::entity_owner::EntityOwnerMismatch {
+                        field: "agent_id",
+                        subject,
+                        claimed,
+                    },
+                    &body.namespace,
+                    &body.canonical_name,
+                    crate::audit::synthesis_sources::HTTP_HEADER,
+                );
+                return entity_owner_forbidden(crate::errors::msg::AGENT_ID_BODY_MISMATCH);
+            }
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            }
+        };
+    let agent_id = Some(resolved_owner.clone());
 
     let extra_metadata = if body.metadata.is_object() {
         body.metadata.clone()
     } else {
         json!({})
     };
+    // #8497 - an inline `metadata.agent_id` that is not the verified owner is
+    // refused too (the owner stamp is forced to the subject on both backends).
+    if crate::identity::entity_owner::enforce_entity_owner(
+        &resolved_owner,
+        None,
+        &extra_metadata,
+        &body.namespace,
+        &body.canonical_name,
+        crate::audit::synthesis_sources::HTTP_HEADER,
+    )
+    .is_err()
+    {
+        return entity_owner_forbidden(crate::handlers::create::METADATA_AGENT_ID_MISMATCH);
+    }
 
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons register
     // the entity as a regular memory (title = canonical_name,
@@ -145,9 +185,7 @@ pub async fn entity_register(
     // must consult the namespace policy before the underlying upsert.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let aid = agent_id
-            .clone()
-            .unwrap_or_else(|| "anonymous:entity-register".to_string());
+        let aid = resolved_owner.clone();
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE into the caller context;
         // inert unless `[capabilities].enabled`.
