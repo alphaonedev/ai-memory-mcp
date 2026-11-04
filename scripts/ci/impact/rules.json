@@ -44,7 +44,7 @@
       }
     ],
     "test_read_globs": [
-      "CLAUDE.md", "CONTRIBUTING.md", "PERFORMANCE.md", "README.md", "ROADMAP.md",
+      "CHANGELOG.md", "CLAUDE.md", "CONTRIBUTING.md", "PERFORMANCE.md", "README.md", "ROADMAP.md",
       "**/README.md",
       "docs/API_REFERENCE.md", "docs/CLI_REFERENCE.md", "docs/USER_GUIDE.md",
       "docs/benchmarks/longmemeval-reflection.md",
