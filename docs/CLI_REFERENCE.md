@@ -1443,7 +1443,8 @@ On Unix, CLI and automatic reflection exports create plaintext files with mode
 0600 through a synced, same-directory staging file and atomic replacement of an
 existing regular file, refusing symlink and non-regular destinations; the parent
 directory is then synced, and a sync error is reported without removing the
-published file. The sweep removes regular `.private-export-*.stage` files whose
+published file. The sweep runs once per destination directory per CLI run and
+once per auto-export call. The sweep removes regular `.private-export-*.stage` files whose
 modification time is older than one hour; files with a newer or future modification
 time are kept. Cleanup errors emit a warning and do not stop export.
 Non-Unix platforms refuse filesystem reflection export because the private-file
