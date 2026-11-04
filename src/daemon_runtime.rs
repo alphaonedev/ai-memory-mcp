@@ -7983,7 +7983,10 @@ pub async fn bootstrap_serve(
         tracing::warn!(
             "{}=1 with [admin].agent_ids configured: a CLAIMED admin X-Agent-Id is trusted, \
              including on PUT /api/v1/agents/{{id}}/pubkey and POST /api/v1/agents/{{id}}/api-key[/revoke] (bootstrap key bind #8494, api-key mint/revoke #8535). Without \
-             this opt-in the bind requires the admin's enrolled per-agent api key",
+             this opt-in the bind requires the admin's enrolled per-agent api key. The opt-in is the \
+             one-boot bootstrap only: once ANY per-agent api key is enrolled it is IGNORED on those \
+             credential routes in every identity mode (#8574), so only a key-bound admin can change \
+             credentials",
             crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
         );
     }

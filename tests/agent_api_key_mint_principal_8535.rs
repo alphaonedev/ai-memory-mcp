@@ -461,6 +461,9 @@ async fn postgres_claimed_admin_cannot_mint_but_env_principal_can_8535() {
         "{audit}"
     );
 
+    // #8574: the opt-in is the one-boot bootstrap only, so it admits on an
+    // EMPTY registry.
+    registry.install(std::collections::HashMap::new());
     set_header_trust(true);
     let (status, body) = mint(&router, SHARED_KEY, TARGET).await;
     set_header_trust(false);

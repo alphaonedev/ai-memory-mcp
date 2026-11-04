@@ -71,7 +71,6 @@ fn scratch(tag: &str) -> TempDir {
 }
 
 struct Fixture {
-    state: AppState,
     router: axum::Router,
     store: Arc<dyn MemoryStore>,
     _dir: TempDir,
@@ -167,9 +166,8 @@ fn fixture(tag: &str, mode: HttpIdentityMode, enroll_admin: bool, header_trust: 
         )]));
     }
     let (state, store) = build_state(&registry, &dir, mode);
-    let router = router_for(state.clone(), &registry, mode);
+    let router = router_for(state, &registry, mode);
     Fixture {
-        state,
         router,
         store,
         _dir: dir,

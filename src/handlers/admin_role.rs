@@ -99,6 +99,12 @@ pub fn pubkey_bind_principal_admitted(
 /// principal.
 pub const CLAIMED_ADMIN_REASON: &str = "claimed_admin_not_key_authenticated";
 
+/// #8574 - stable audit reason for a credential mutation refused because the
+/// operator's [`ENV_ADMIN_HEADER_TRUST`] opt-in was IGNORED: at least one
+/// per-agent api key is enrolled, so the enrolled registry is the backstop and
+/// a header claim must never extend it.
+pub const HEADER_TRUST_REFUSED_REASON: &str = "header_trust_refused_registry_enrolled";
+
 /// #8494 / #8535 — one credential-mutating route's refusal vocabulary.
 ///
 /// `action` is the audit action, `issue_label` the audit issue tag and
@@ -119,7 +125,11 @@ pub struct PrincipalGate {
 /// carries it, and the audit chain is signed and append-only (#3529 / #8536,
 /// validate before audit). The caller is admitted only when key-bound to its
 /// own admin id (the presented `X-API-Key` is its enrolled per-agent key) or
-/// when the operator opted into [`ENV_ADMIN_HEADER_TRUST`]; a merely claimed
+/// when the operator opted into [`ENV_ADMIN_HEADER_TRUST`] AND the enrolled
+/// per-agent key registry is still empty (#8574: the opt-in is the one-boot
+/// bootstrap only; once a key is enrolled it is ignored here, in every identity
+/// mode, because the registry is the backstop and the claim must not extend
+/// it; a lost admin key is recovered with the CLI on the data tier); a merely claimed
 /// admin gets a typed 403 and a durable `deny` row, and nothing is changed.
 /// The gate runs before any store call, so SQLite and Postgres behave alike.
 ///
@@ -138,9 +148,16 @@ pub fn require_key_bound_admin(
         headers,
         caller,
     );
-    if pubkey_bind_principal_admitted(level, admin_header_trust_enabled()) {
+    let opt_in = admin_header_trust_enabled();
+    let registry_empty = app.enrolled_agent_keys.snapshot().is_empty();
+    if pubkey_bind_principal_admitted(level, opt_in && registry_empty) {
         return Ok(());
     }
+    let reason = if opt_in && !registry_empty {
+        HEADER_TRUST_REFUSED_REASON
+    } else {
+        CLAIMED_ADMIN_REASON
+    };
     crate::governance::audit::record_decision(
         caller,
         "deny",
@@ -148,7 +165,7 @@ pub fn require_key_bound_admin(
         gate.issue_label,
         crate::governance::audit::ForensicPayload::new()
             .ident("agent_id", agent_id)
-            .label("reason", CLAIMED_ADMIN_REASON),
+            .label("reason", reason),
     );
     Err((
         StatusCode::FORBIDDEN,

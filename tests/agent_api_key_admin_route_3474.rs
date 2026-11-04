@@ -1639,9 +1639,14 @@ async fn opt_in_arm_still_admits_a_claimed_admin_8535() {
     let (status, _, body) = call(&fx.router, claimed(ALICE)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
-    // Opt-in: admitted.
+    // Opt-in with an enrolled key: still refused (#8574, the registry is the backstop).
     // SAFETY: `serial()` is held, so no other test of this binary touches the env.
     unsafe { std::env::set_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1") };
+    let (status, _, body) = call(&fx.router, claimed(ALICE)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Opt-in on an EMPTY registry (the one-boot bootstrap): admitted.
+    fx.registry.install(std::collections::HashMap::new());
     let (status, _, body) = call(&fx.router, claimed(ALICE)).await;
     // SAFETY: as above; restore the default posture before asserting.
     unsafe { std::env::remove_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST) };
