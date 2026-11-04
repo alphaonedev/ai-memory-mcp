@@ -49,6 +49,10 @@ const GUARD: &str = "run_env_isolated_child_or_spawn(";
 /// (file, fn): capture helpers whose CALLERS must be isolated. A caller that
 /// is itself listed here is followed in turn (same file).
 const HELPERS: &[(&str, &str)] = &[
+    (
+        "src/cli/commands/export_reflections/private_file.rs",
+        "stale_removal_failure_keeps_export_working",
+    ),
     ("src/mcp/span_capture_4088_tests.rs", "run_with_capture"),
     ("src/mcp/provider_echo_sinks_3648_tests.rs", "assert_sink"),
     ("src/mcp/provider_echo_sinks_3648_tests.rs", "run_matrix"),
