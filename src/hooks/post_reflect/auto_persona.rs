@@ -36,6 +36,7 @@
 //! non-Reflection rows. Tying the hook to the reflect path makes the
 //! "what counts toward cadence" question trivial.
 
+use anyhow::Context as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -314,7 +315,14 @@ fn write_persona_export(
     validate_component(&ns_safe)?;
     validate_component(&entity_safe)?;
     let root = PrivateExportDir::open(out_dir)?;
-    let namespace = root.namespace(std::path::Path::new(&ns_safe))?;
+    let namespace = root
+        .namespace(std::path::Path::new(&ns_safe))
+        .with_context(|| {
+            format!(
+                "opening private namespace dir {}",
+                out_dir.join(&ns_safe).display()
+            )
+        })?;
     let body = render_persona_md(persona);
     namespace.write(&format!("{entity_safe}.md"), body.as_bytes())?;
     Ok(())
