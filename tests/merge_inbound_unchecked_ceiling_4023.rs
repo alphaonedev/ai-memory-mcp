@@ -227,7 +227,7 @@ fn the_scanner_is_load_bearing_4023() {
     let (_, none_auth, _) = scan(&planted(
         "fn f() { db::merge_inbound_authorized(&c, &m, true, Some(&auth)); }",
     ));
-    assert!(none_auth.is_empty());
+    assert_eq!(none_auth, [] as [(std::string::String, usize); 0]);
     // rustfmt's vertical call form: a trailing comma after the last argument
     // must not hide a literal `None` (the last NON-EMPTY argument counts).
     let (_, none_auth, _) = scan(&planted(

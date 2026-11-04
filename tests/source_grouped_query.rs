@@ -251,9 +251,9 @@ fn kg_query_by_source_uri_returns_all_rooted_memories() {
     // Mirror that shape to pin the contract:
     for root in &roots {
         assert_eq!(root.source_uri.as_deref(), Some(uri));
-        assert!(!root.id.is_empty());
-        assert!(!root.title.is_empty());
-        assert!(!root.namespace.is_empty());
+        assert_ne!(root.id, "");
+        assert_ne!(root.title, "");
+        assert_ne!(root.namespace, "");
     }
 }
 

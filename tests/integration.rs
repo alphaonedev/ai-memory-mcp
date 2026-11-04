@@ -452,7 +452,7 @@ fn test_cli_store_and_recall() {
     );
     assert!(output.status.success());
     let ns: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(!ns["namespaces"].as_array().unwrap().is_empty());
+    assert_ne!(ns["namespaces"].as_array().unwrap().len(), 0);
 
     // Export
     let output = cmd(binary)
@@ -3341,7 +3341,7 @@ fn test_mcp_dedup_replaces_metadata() {
     let recall_text = recall["result"]["content"][0]["text"].as_str().unwrap();
     let recall_data: serde_json::Value = serde_json::from_str(recall_text).unwrap();
     let memories = recall_data["memories"].as_array().unwrap();
-    assert!(!memories.is_empty());
+    assert_ne!(memories.len(), 0);
     assert_eq!(memories[0]["metadata"]["version"], 2);
     assert_eq!(memories[0]["metadata"]["extra"], "added");
 }
@@ -5831,7 +5831,7 @@ fn test_inherit_no_standards_returns_empty() {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
     let standards = body["standards"].as_array().unwrap();
-    assert!(standards.is_empty());
+    assert_eq!(standards.len(), 0);
     assert_eq!(body["count"], 0);
     let _ = std::fs::remove_file(&db);
 }
@@ -7811,7 +7811,7 @@ fn test_budget_touch_only_surviving() {
 
     let v = recall_with_budget(bin, &db, "alpha", Some(5));
     let mems = v["memories"].as_array().unwrap();
-    assert!(!mems.is_empty());
+    assert_ne!(mems.len(), 0);
 
     let list = cmd(bin)
         .args(["--db", db.to_str().unwrap(), "--json", "list"])
@@ -8126,7 +8126,7 @@ fn test_hier_recall_budget_applied_after_proximity() {
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let mems = v["memories"].as_array().unwrap();
-    assert!(!mems.is_empty());
+    assert_ne!(mems.len(), 0);
     assert_eq!(mems[0]["title"], "self");
     assert!(v["tokens_used"].as_u64().unwrap() <= 10);
     let _ = std::fs::remove_file(&db);

@@ -77,6 +77,7 @@ use crate::validate;
 // submodule so this file stays focused on `agent_id` resolution. H2+
 // will plumb the loaded `AgentKeypair` through `AppState` for outbound
 // link signing.
+pub mod entity_owner;
 pub mod key_inventory;
 pub mod keypair;
 #[cfg(any(test, feature = "test-support"))]

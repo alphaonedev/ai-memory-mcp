@@ -242,10 +242,9 @@ fn a_valid_witness_cannot_be_retargeted_at_storage_3464() {
         ai_memory::db::agent_pubkey(&conn, VICTIM).expect("read"),
         None
     );
-    assert!(
-        ai_memory::db::agent_pubkey_versions(&conn, VICTIM)
-            .expect("history")
-            .is_empty()
+    assert_eq!(
+        ai_memory::db::agent_pubkey_versions(&conn, VICTIM).expect("history"),
+        [] as [ai_memory::storage::AgentPubkeyVersion; 0]
     );
 }
 
@@ -935,7 +934,10 @@ fn sqlite_skew_boundary_reverification_cryptographically_selects_one_key_3464() 
             .to_rfc3339(),
     )
     .expect("outside expanded lower endpoint");
-    assert!(outside_lower.candidate_pubkeys_b64.is_empty());
+    assert_eq!(
+        outside_lower.candidate_pubkeys_b64,
+        [] as [std::string::String; 0]
+    );
     let exact_old_upper = ai_memory::db::agent_pubkey_for_attestation_at(
         &conn,
         AGENT,

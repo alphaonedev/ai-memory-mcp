@@ -333,5 +333,5 @@ fn cli_hard_delete_on_an_inbox_row_warns_then_erases_3730() {
     let v: Value = serde_json::from_str(stdout.trim()).expect("json");
     assert_eq!(v["archived"], json!(true));
     assert_eq!(archived_ids(&db, &home, &ns), vec![second]);
-    assert!(inbox_ids(&db, &home, false).is_empty());
+    assert_eq!(inbox_ids(&db, &home, false), [] as [std::string::String; 0]);
 }

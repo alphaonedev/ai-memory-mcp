@@ -226,12 +226,12 @@ async fn migrate_links_idempotent_replay_reports_skipped() {
     seed_corpus(&src).await;
 
     let r1 = migrate::migrate(&src, &dst, 10, None, false).await;
-    assert!(r1.errors.is_empty());
+    assert_eq!(r1.errors, [] as [std::string::String; 0]);
     assert_eq!(r1.links_written, 20);
     assert_eq!(r1.links_skipped, 0);
 
     let r2 = migrate::migrate(&src, &dst, 10, None, false).await;
-    assert!(r2.errors.is_empty());
+    assert_eq!(r2.errors, [] as [std::string::String; 0]);
     assert_eq!(r2.links_read, 20);
     assert_eq!(
         r2.links_skipped, 20,
@@ -254,7 +254,7 @@ async fn migrate_links_dry_run_skips_writes_but_reports_reads() {
     seed_corpus(&src).await;
 
     let report = migrate::migrate(&src, &dst, 10, None, true).await;
-    assert!(report.errors.is_empty());
+    assert_eq!(report.errors, [] as [std::string::String; 0]);
     assert_eq!(report.links_read, 20);
     assert_eq!(report.links_written, 0);
     assert_eq!(report.links_skipped, 0);

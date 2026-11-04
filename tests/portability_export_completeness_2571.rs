@@ -251,8 +251,14 @@ fn pre_2571_envelope_missing_the_new_arrays_still_imports() {
     let env: emit::ExportEnvelope =
         serde_json::from_str(&old_shape_json).expect("an old-shape v2 envelope must still parse");
     assert!(env.archived_memories.is_empty());
-    assert!(env.namespace_meta.is_empty());
-    assert!(env.archived_memory_links.is_empty());
+    assert_eq!(
+        env.namespace_meta,
+        [] as [ai_memory::portability::dto::NamespaceMetaDto; 0]
+    );
+    assert_eq!(
+        env.archived_memory_links,
+        [] as [ai_memory::portability::dto::ArchivedMemoryLinkDto; 0]
+    );
 
     let (_dst_path, dst) = fresh_db("dst-oldshape");
     let report = import_full_envelope(&dst, &env, &opts()).expect("old-shape envelope imports");

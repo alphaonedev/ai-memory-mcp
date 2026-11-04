@@ -171,10 +171,9 @@ fn the_listing_is_namespace_scopable_and_bounded() {
         "the page bound is honoured — an unbounded operator read of a \
          federation-storm backlog is its own availability hazard"
     );
-    assert!(
-        db::list_quarantined(&conn, Some("nonexistent"), 100)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        db::list_quarantined(&conn, Some("nonexistent"), 100).unwrap(),
+        [] as [ai_memory::models::QuarantinedMemory; 0]
     );
 }
 

@@ -319,7 +319,7 @@ async fn admin_mint_binds_a_key_that_authenticates_the_very_next_request_3474() 
     assert_eq!(body["agent_id"], ALICE);
     assert_eq!(body["bound"], true);
     let token = body["token"].as_str().expect("minted token").to_string();
-    assert!(!token.is_empty());
+    assert_ne!(token, "");
 
     // The credential response must never be cached by an intermediary.
     let cache_control = headers

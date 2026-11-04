@@ -127,6 +127,6 @@ fn defaulted_round_trip_via_serde_default() {
     let parsed: CapabilityProvenanceSubstrateLayer =
         serde_json::from_str(empty_json).expect("empty JSON must round-trip via serde default");
     assert_eq!(parsed.posture, "");
-    assert!(parsed.enforcement_layers.is_empty());
-    assert!(parsed.honest_limitations.is_empty());
+    assert_eq!(parsed.enforcement_layers, [] as [std::string::String; 0]);
+    assert_eq!(parsed.honest_limitations, [] as [std::string::String; 0]);
 }

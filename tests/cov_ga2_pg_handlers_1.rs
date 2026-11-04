@@ -65,6 +65,19 @@ use ai_memory::store::{CallerContext, GovernedAction, MemoryStore};
 /// `admin_agent_ids` so the admin-gated handlers (register / import /
 /// quota-list / bind) admit it past `require_admin`.
 const ADMIN_AGENT: &str = "ai:cov-ga2-pg";
+/// #8494 — the bootstrap pubkey bind needs a key-authenticated admin: this is
+/// the admin's enrolled per-agent api key, sent as `X-API-Key`.
+const ADMIN_TOKEN: &str = "cov-ga2-pg-admin-token-0123456789abcdef";
+
+/// #8494 — live registry holding the admin's enrolled per-agent key.
+fn admin_enrolled_registry() -> Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys> {
+    let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
+    registry.install(std::collections::HashMap::from([(
+        ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
+        ADMIN_AGENT.to_string(),
+    )]));
+    registry
+}
 
 /// A hex-decodable HMAC secret so the approvals path takes the canonical
 /// (hex-decoded) key branch in `hmac_sha256_hex`, not the invalid-hex
@@ -150,17 +163,13 @@ fn router_for(store_concrete: PostgresStore) -> axum::Router {
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: admin_enrolled_registry(),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: std::sync::Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: Arc::clone(&app_state.enrolled_agent_keys),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
         ..Default::default()
     };
@@ -187,6 +196,7 @@ async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (StatusCod
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-agent-id", ADMIN_AGENT)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
     decode(router, req).await
@@ -198,6 +208,7 @@ async fn put_json(router: &axum::Router, uri: &str, body: &Value) -> (StatusCode
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-agent-id", ADMIN_AGENT)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
     decode(router, req).await
@@ -209,6 +220,7 @@ async fn delete_json(router: &axum::Router, uri: &str, body: &Value) -> (StatusC
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-agent-id", ADMIN_AGENT)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
     decode(router, req).await
@@ -219,6 +231,7 @@ async fn get(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
         .method("GET")
         .uri(uri)
         .header("x-agent-id", ADMIN_AGENT)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::empty())
         .unwrap();
     decode(router, req).await
@@ -285,6 +298,7 @@ fn signed_approval_request(pending_id: &str, body: &Value) -> Request<Body> {
         .uri(format!("/api/v1/approvals/{pending_id}"))
         .header("content-type", "application/json")
         .header("x-agent-id", ADMIN_AGENT)
+        .header("x-api-key", ADMIN_TOKEN)
         .header("x-ai-memory-signature", format!("sha256={sig}"))
         .header("x-ai-memory-timestamp", ts)
         .body(Body::from(body_bytes))
@@ -938,6 +952,7 @@ pg_test!(pg_approval_decide_bad_signature_is_401, url, {
         .uri(format!("/api/v1/approvals/{pending_id}"))
         .header("content-type", "application/json")
         .header("x-agent-id", ADMIN_AGENT)
+        .header("x-api-key", ADMIN_TOKEN)
         .header("x-ai-memory-signature", "sha256=deadbeef")
         .header(
             "x-ai-memory-timestamp",

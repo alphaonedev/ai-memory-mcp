@@ -28,6 +28,19 @@ use tower::ServiceExt as _;
 
 const ADMIN_CALLER: &str = "ai:ops-admin";
 const TARGET_AGENT: &str = "ai:attesting-client";
+/// #8494 — the bootstrap bind needs a KEY-AUTHENTICATED admin, so the admin's
+/// enrolled per-agent api key is presented as `X-API-Key` on every admin call.
+const ADMIN_TOKEN: &str = "1539-admin-per-agent-token-0123456789abcdef";
+
+/// #8494 — a live registry holding the admin's enrolled per-agent key.
+fn admin_enrolled_registry() -> Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys> {
+    let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
+    registry.install(std::collections::HashMap::from([(
+        ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
+        ADMIN_CALLER.to_string(),
+    )]));
+    registry
+}
 
 fn local_runs_root() -> PathBuf {
     std::env::current_dir()
@@ -93,9 +106,7 @@ fn build_app_fixture() -> (AppState, NamedTempFile) {
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: admin_enrolled_registry(),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     (app_state, f)
@@ -105,9 +116,7 @@ fn router_for_state(app_state: AppState) -> axum::Router {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: std::sync::Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: Arc::clone(&app_state.enrolled_agent_keys),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
         ..Default::default()
     };
@@ -125,6 +134,7 @@ async fn register_target_agent(router: &axum::Router) {
         .uri("/api/v1/agents")
         .header("content-type", "application/json")
         .header("x-agent-id", ADMIN_CALLER)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(
             serde_json::to_vec(&serde_json::json!({
                 "agent_id": TARGET_AGENT,
@@ -167,6 +177,7 @@ fn put_pubkey_body(agent: &str, caller: &str, body: &serde_json::Value) -> Reque
         .uri(format!("/api/v1/agents/{agent}/pubkey"))
         .header("content-type", "application/json")
         .header("x-agent-id", caller)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap()
 }
@@ -186,6 +197,7 @@ async fn take_challenge(
         .uri(format!("/api/v1/agents/{agent}/pubkey/challenge"))
         .header("content-type", "application/json")
         .header("x-agent-id", caller)
+        .header("x-api-key", ADMIN_TOKEN)
         .body(Body::from(
             serde_json::to_vec(&serde_json::json!({ "pubkey_b64": pubkey })).unwrap(),
         ))

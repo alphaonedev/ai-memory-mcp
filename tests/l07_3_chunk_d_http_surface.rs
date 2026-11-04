@@ -568,7 +568,7 @@ async fn http_create_memory_happy_path() {
     let (router, _f) = build_router_fixture();
     let (status, id) = create_basic(&router, "chunk-d/happy", "hello").await;
     assert_eq!(status, StatusCode::CREATED);
-    assert!(!id.is_empty());
+    assert_ne!(id, "");
 }
 
 #[tokio::test]
@@ -816,7 +816,7 @@ async fn http_get_memory_by_id_and_prefix() {
     let (router, _f) = build_router_fixture();
     let (s, id) = create_basic(&router, "chunk-d/get", "get-mem").await;
     assert_eq!(s, StatusCode::CREATED);
-    assert!(!id.is_empty());
+    assert_ne!(id, "");
 
     // #927 (Track A P4, 2026-05-20) extended scope=private filter to
     // GET /memories/{id} on the sqlite path. `create_basic` stamps

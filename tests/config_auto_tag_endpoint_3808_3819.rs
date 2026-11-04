@@ -59,10 +59,9 @@ fn ignored_endpoint_keys_empty_for_model_only_3808() {
         model_only.ignored_endpoint_keys().is_empty(),
         "#3808: model-only is silent"
     );
-    assert!(
-        LlmAutoTagSection::default()
-            .ignored_endpoint_keys()
-            .is_empty()
+    assert_eq!(
+        LlmAutoTagSection::default().ignored_endpoint_keys(),
+        [] as [&str; 0]
     );
     let blank = LlmAutoTagSection {
         base_url: Some("   ".into()),

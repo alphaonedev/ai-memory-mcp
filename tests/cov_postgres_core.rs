@@ -177,7 +177,7 @@ async fn store_batch_empty_is_noop() {
     };
     let ctx = CallerContext::for_agent("ai:cov4");
     let ids = store.store_batch(&ctx, &[]).await.expect("empty batch");
-    assert!(ids.is_empty());
+    assert_eq!(ids, [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -604,7 +604,7 @@ async fn link_signed_lands_attest_level() {
         .link_signed(&ctx, &link(&a, &b), None)
         .await
         .expect("link_signed");
-    assert!(!level.is_empty());
+    assert_ne!(level, "");
 }
 
 // ───────────────────────────────────────────────────────────────────

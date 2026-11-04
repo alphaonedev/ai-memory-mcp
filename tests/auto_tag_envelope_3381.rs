@@ -358,7 +358,7 @@ async fn auto_tag_refuses_unreadable_unowned_row_3381() {
     .await
     .unwrap();
     assert_eq!(err, ai_memory::errors::msg::MEMORY_NOT_FOUND);
-    assert!(stored.is_empty());
+    assert_eq!(stored, [] as [std::string::String; 0]);
 }
 
 /// #3381 (ALLOWED direction) — the OWNER still auto-tags, and the union
@@ -535,7 +535,7 @@ async fn success_with_empty_response_yields_no_new_tags() {
     .await
     .unwrap();
     let new_tags = out["new_tags"].as_array().unwrap();
-    assert!(new_tags.is_empty());
+    assert_eq!(new_tags.len(), 0);
     let all_tags = out["all_tags"].as_array().unwrap();
     assert_eq!(all_tags.len(), 1);
     assert_eq!(all_tags[0], "existing");

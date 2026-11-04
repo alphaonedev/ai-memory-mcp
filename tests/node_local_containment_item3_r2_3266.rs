@@ -689,7 +689,10 @@ async fn release_of_non_contained_row_is_refused(backend: &Backend) {
     // An absent id is refused the same way.
     let operator = uniq("operator");
     assert!(!release(backend, &db, &store, &uniq("missing"), &operator).await);
-    assert!(events(backend, &db, &store, &operator).await.is_empty());
+    assert_eq!(
+        events(backend, &db, &store, &operator).await,
+        [] as [(std::string::String, std::vec::Vec<u8>, std::string::String); 0]
+    );
 }
 
 /// The QUARANTINED release keeps `memory.dequarantined` unchanged: `open`,

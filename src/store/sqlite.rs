@@ -4604,13 +4604,27 @@ impl MemoryStore for SqliteStore {
     /// `(canonical_name, namespace)`.
     async fn entity_register(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         canonical_name: &str,
         namespace: &str,
         aliases: &[String],
         extra_metadata: &serde_json::Value,
         agent_id: Option<&str>,
     ) -> StoreResult<crate::models::EntityRegistration> {
+        // #8497 - owner = the caller context's verified principal, the same
+        // shared rule the postgres twin applies.
+        let owner = crate::identity::entity_owner::trait_entity_owner(
+            &ctx.agent_id,
+            agent_id,
+            extra_metadata,
+            namespace,
+            canonical_name,
+        )
+        .map_err(|m| StoreError::PermissionDenied {
+            action: crate::identity::entity_owner::OP_ENTITY_REGISTER.to_string(),
+            target: format!("{namespace}/{canonical_name}"),
+            reason: m.to_string(),
+        })?;
         let conn = self.state.lock().await;
         db::entity_register(
             &conn,
@@ -4618,7 +4632,7 @@ impl MemoryStore for SqliteStore {
             namespace,
             aliases,
             extra_metadata,
-            agent_id,
+            Some(&owner),
         )
         .map_err(box_err)
     }

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
+
+- `forward_signal_send_to_http` resolved the forwarded `X-Agent-Id` from the wire `from_agent` through `resolve_agent_id`, so an MCP caller could forge the sender of a forwarded signal. It now uses `resolve_governance_subject` (the #3171 store-forward precedent): under an enforced caller a mismatching `from_agent` is refused with `agent_id mismatch` before any network I/O, and an absent value is filled from the caller. The HTTP handler already stamps `from_agent` from the header and ignores the body field.
+### Security (#8497, #8493 — entity_register owner is the verified subject)
+
+- `memory_entity_register` and `POST /api/v1/entities` own the entity by the verified caller on both backends. A body `agent_id` or inline `metadata.agent_id` that differs from the verified subject is refused (HTTP 403 `AGENT_ID_MISMATCH`, MCP mismatch error, SAL `PermissionDenied`) with an `outcome: deny` audit row; the postgres funnel now stamps the resolved owner with `insert` like sqlite (#3171). Shared rule in `identity::entity_owner`; fragment `changelog.d/8497.security.md`.
 ### Security (#8495 — approver identity bound into the approval HMAC)
 
 - **The approver is inside the approval HMAC (#8495).** The K10 decide signature on `POST /api/v1/approvals/{pending_id}`, `POST /api/v1/pending/{id}/approve` and `POST /api/v1/pending/{id}/reject` is now signed over the versioned layout 2 subject `<n>:<pending_id>@<m>:<X-Agent-Id>` (`<n>`, `<m>` the decimal byte lengths of the two ids, #8546; the subject the agent api-key approval route uses), so a signature names the approver it was made for and a request that presents it under another `X-Agent-Id` is refused `401`. A layout 1 signature (subject `<pending_id>` alone) is refused `401 {"error":"legacy_unbound_approver","signature_layout_version":2}` with a hint naming the new subject, and its nonce is not consumed, so the client can re-sign. Under `identity_mode = enforce` the three decide routes also refuse a caller whose `X-Agent-Id` is not bound to its credential (`403 identity_binding_mismatch` when a per-agent api-key is bound to a different agent, raised first by the transport middleware; `403 attested_identity_required` with the shared api-key, #8549), so one shared secret cannot cast every vote of a consensus quorum. Signers must move to the new subject.

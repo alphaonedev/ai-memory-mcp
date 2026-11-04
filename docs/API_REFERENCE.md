@@ -144,7 +144,10 @@ deployment with **no `api_key` configured**, a bare self-asserted
 `X-Agent-Id` naming an admin id is NOT trusted for admin-role
 resolution (boot emits a WARN); set `AI_MEMORY_ADMIN_HEADER_TRUST=1`
 only to restore the legacy header-trust posture on isolated/mTLS-fronted
-deployments.
+deployments. `POST /agents/{id}/pubkey/challenge` and `PUT /agents/{id}/pubkey`
+additionally require a key-authenticated admin (the admin's own enrolled
+per-agent `X-API-Key`), not a claimed header (#8494); a refusal is a 403 with a
+forensic audit row.
 
 ### mTLS (Layer 2 peer mesh)
 
@@ -1132,6 +1135,18 @@ Response: `{"entity_id":"ent-...","canonical_name":"PostgreSQL","namespace":"my-
 Returns `409` if a non-entity memory with the same
 `(title, namespace)` exists.
 
+**Owner semantics (#8497).** The entity is owned by the verified caller:
+the `X-Agent-Id` header, or the anonymous fallback when the header is
+absent. The owner is stamped into `metadata.agent_id` on both backends
+(sqlite and postgres) and always replaces an inline value. A body
+`agent_id` that differs from the header, or an inline
+`metadata.agent_id` that differs from the verified owner, is refused with
+**403** `{"code":"AGENT_ID_MISMATCH","error":...}` and an `outcome: deny`
+audit row; no entity row is written. The MCP tool `memory_entity_register`
+applies the same rule against the process principal (`AI_MEMORY_AGENT_ID`):
+an `agent_id` argument or inline `metadata.agent_id` that differs from it
+is refused with a mismatch error and an audit row.
+
 ### `GET /api/v1/entities/by_alias`
 
 Resolve an alias to its canonical entity.
@@ -1825,7 +1840,7 @@ caller. Delegated routine execution is deferred to #3576.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/v1/actions/{id}/transition` | Coordination action-state transition (`handlers::transition_action`) — local CAS write + W-of-N federation fanout. MCP: `memory_action_transition`. |
-| `POST` | `/api/v1/signals` | Signed inter-agent signal send (`handlers::send_signal`) — local write + W-of-N fanout. MCP: `memory_signal_send`. |
+| `POST` | `/api/v1/signals` | Signed inter-agent signal send (`handlers::send_signal`) — local write + W-of-N fanout. The sender is always the authenticated caller (`X-Agent-Id`), never a body `from_agent`. MCP: `memory_signal_send`; in forward mode a `from_agent` that differs from the enforced caller (`AI_MEMORY_AGENT_ID`) is refused with `agent_id mismatch` before any network I/O (#8496). |
 
 ### v0.9.0 + v1.0.0 net-new endpoints
 
