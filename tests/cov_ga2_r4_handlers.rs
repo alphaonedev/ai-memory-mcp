@@ -282,11 +282,17 @@ fn sqlite_router_strict_nonce() -> (axum::Router, tempfile::NamedTempFile) {
 
 async fn pg_store_and_router(url: &str) -> (PostgresStore, axum::Router) {
     let store_concrete = PostgresStore::connect(url).await.expect("connect postgres");
-    let router = router_for_pg(store_concrete.clone());
+    let router = router_for_pg(
+        store_concrete.clone(),
+        Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty()),
+    );
     (store_concrete, router)
 }
 
-fn router_for_pg(store_concrete: PostgresStore) -> axum::Router {
+fn router_for_pg(
+    store_concrete: PostgresStore,
+    registry: Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys>,
+) -> axum::Router {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(Mutex::new((
         conn,
@@ -328,17 +334,13 @@ fn router_for_pg(store_concrete: PostgresStore) -> axum::Router {
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: Arc::clone(&registry),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: std::sync::Arc::new(
-            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
+        enrolled_agent_keys: registry,
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
         ..Default::default()
     };
@@ -1677,10 +1679,62 @@ async fn pg_post(
     post_as(router, uri, agent, body).await
 }
 
+/// #8574: credential routes require the admin's enrolled key once the registry
+/// is populated, even while the legacy header-trust opt-in is enabled.
+async fn keyed_admin_request(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header(ai_memory::HEADER_AGENT_ID, ADMIN_AGENT)
+        .header(ai_memory::HEADER_API_KEY, token)
+        .body(Body::from(serde_json::to_vec(body).expect("request body")))
+        .expect("request");
+    decode(router, request).await
+}
+
 // admin::register_agent + bind_agent_pubkey postgres arms.
 pg_test!(pg_register_then_bind_postgres_arm, url, {
     enable_admin_header_trust();
-    let (_store, router) = pg_store_and_router(&url).await;
+    let (store, router) = pg_store_and_router(&url).await;
+    // #8574: CI may already contain another test's enrolled key. A fresh
+    // database must exercise that same authoritative-registry condition.
+    let seeded = store
+        .bind_agent_api_key(
+            &ai_memory::store::CallerContext::for_admin(
+                ai_memory::identity::sentinels::DAEMON_PRINCIPAL,
+            ),
+            &uid("ai:unrelated-8574"),
+            &sha256_hex(&uid("unrelated-key-8574")),
+        )
+        .await
+        .expect("seed unrelated enrolled key");
+    assert_eq!(seeded, ai_memory::storage::BindApiKeyOutcome::Bound);
+    let admin_token = uid("admin-key-8574");
+    let admin_digest = sha256_hex(&admin_token);
+    let seeded = store
+        .bind_agent_api_key(
+            &ai_memory::store::CallerContext::for_admin(
+                ai_memory::identity::sentinels::DAEMON_PRINCIPAL,
+            ),
+            ADMIN_AGENT,
+            &admin_digest,
+        )
+        .await
+        .expect("seed admin key");
+    assert_eq!(seeded, ai_memory::storage::BindApiKeyOutcome::Bound);
+    let registry = Arc::new(
+        ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(
+            std::collections::HashMap::from([(admin_digest, ADMIN_AGENT.to_string())]),
+        ),
+    );
+    let authenticated_router = router_for_pg(store, registry);
     let agent_id = uid("ai:cov-ga2-r4-pgreg");
     let (rs, rb) = pg_post(
         &router,
@@ -1695,10 +1749,20 @@ pg_test!(pg_register_then_bind_postgres_arm, url, {
     let kp = ai_memory::identity::keypair::generate(&agent_id).expect("keypair");
     let pubkey_b64 = kp.public_base64();
     // #3464 — proof of possession: take the single-use challenge, sign it.
-    let (cs, cb) = pg_post(
+    let challenge_uri = format!("/api/v1/agents/{agent_id}/pubkey/challenge");
+    let (claimed_status, _) = pg_post(
         &router,
-        &format!("/api/v1/agents/{agent_id}/pubkey/challenge"),
+        &challenge_uri,
         ADMIN_AGENT,
+        &json!({"pubkey_b64": pubkey_b64}),
+    )
+    .await;
+    assert_eq!(claimed_status, StatusCode::FORBIDDEN);
+    let (cs, cb) = keyed_admin_request(
+        &authenticated_router,
+        "POST",
+        &challenge_uri,
+        &admin_token,
         &json!({"pubkey_b64": pubkey_b64}),
     )
     .await;
@@ -1713,10 +1777,11 @@ pg_test!(pg_register_then_bind_postgres_arm, url, {
         kp.private.as_ref().expect("generated private key"),
         &challenge,
     );
-    let (bs, bb) = put_as(
-        &router,
+    let (bs, bb) = keyed_admin_request(
+        &authenticated_router,
+        "PUT",
         &format!("/api/v1/agents/{agent_id}/pubkey"),
-        ADMIN_AGENT,
+        &admin_token,
         &json!({
             "pubkey_b64": pubkey_b64,
             "nonce": challenge.nonce_b64,

@@ -780,7 +780,7 @@ fn no_store(status: StatusCode, body: serde_json::Value) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Enumerate every enrolled `(token_sha256, agent_id)` pair.
-async fn load_enrolled(app: &AppState) -> Result<Vec<(String, String)>, String> {
+pub(crate) async fn load_enrolled(app: &AppState) -> Result<Vec<(String, String)>, String> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return app
@@ -1161,7 +1161,9 @@ pub async fn mint_agent_api_key(
         &caller,
         &agent_id,
         &MINT_PRINCIPAL_GATE,
-    ) {
+    )
+    .await
+    {
         return resp;
     }
     if !credential_transport_confidential() {
@@ -1398,7 +1400,9 @@ pub async fn revoke_agent_api_key(
         &caller,
         &agent_id,
         &REVOKE_PRINCIPAL_GATE,
-    ) {
+    )
+    .await
+    {
         return resp;
     }
     let parsed: RevokeApiKeyBody = match parse_body(&body) {

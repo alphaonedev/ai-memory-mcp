@@ -1396,7 +1396,12 @@ ai-memory agents bind-api-key --agent-id <admin> \
 environment channel. The admin then presents the file's contents as `X-API-Key`.
 The alternative, **WARN-flagged and weaker**: start the daemon once with
 `AI_MEMORY_ADMIN_HEADER_TRUST=1` (the boot WARN names it), mint the key over
-HTTP, then unset the variable; while it is set, any header claim passes these
+HTTP, then unset the variable. The opt-in works only while this daemon's enrolled registry is empty (bootstrap, or after every key is revoked; emptiness is confirmed by an authoritative store read, and a store error refuses, recorded with reason `header_trust_refused_registry_unreadable`) (#8574): once ANY
+per-agent api key is enrolled, in every identity mode, the daemon IGNORES it on
+the four credential routes (`403` plus a deny row with reason
+`header_trust_refused_registry_enrolled`), so a header claim can never extend
+the registry that backstops it; a lost admin key is re-enrolled with the CLI on
+the data-tier host. Before the first key exists, any header claim passes these
 routes. A malformed `{id}` is a `400` before any audit row is written (#8536),
 on these routes and on the pubkey bind routes.
 
