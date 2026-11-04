@@ -122,12 +122,13 @@ On HARD-BLOCK fail the orchestrator (1) verifies independently, (2) completes th
 
 History (2026-05-18 RCA, three-wave refactor mandate, six lanes + Tracks A-E, pm lineage): [`docs/GOVERNANCE_HISTORY.md`](docs/GOVERNANCE_HISTORY.md).
 
-## Crossroads decision protocol — 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)
+## Crossroads decision protocol — deterministic 1x3 adversarial vote (operator-set 2026-06-18, shape amended 2026-10-10)
 
-> Canonical memories: ai-memory `4d3ea1c5-9017-4f97-b966-e0d41e83a801`
-> (`global`, long tier, priority 10; the T1-T6 conditions, original) and
-> `6def5ab6-2b47-4600-8608-b850717413d2` (the 1x3 shape + usage threshold;
-> supersedes the 5-agent shape). This section is the repo-enforced mirror so
+> Canonical memories: ai-memory `6def5ab6-2b47-4600-8608-b850717413d2`
+> (current: the 1x3 shape, usage threshold and `3-agent vote (6def5ab6)`
+> citation; supersedes the 5-agent shape) and
+> `4d3ea1c5-9017-4f97-b966-e0d41e83a801` (`global`, long tier, priority 10;
+> the original, T1-T6 thresholds unchanged). This section is the repo-enforced mirror so
 > EVERY agent — not just one with those memories recalled — applies the same
 > rule. Operator directive, 2026-10-10, verbatim: "set a threshold do a 1x3
 > voting scheme slim it down - set a threshold for when it should be used -
@@ -197,7 +198,7 @@ pathway, why) BEFORE implementing. Budget cap ~25k tokens per voter (~75k total)
 `3-agent vote (6def5ab6)`. Shipping a change that clears the threshold
 WITHOUT a vote is a self-flagged process violation the agent must surface to
 the operator (and the orchestrator treats it the same as a C1–C8 hard-block
-on agent return). Prior 5-agent votes (`4d3ea1c5`) stand.
+on agent return). Prior 5-agent votes (`4d3ea1c5`) stand. Citations of `5-agent vote (4d3ea1c5)` in history and in issues closed before 2026-10-10 stay as they are; history is not rewritten.
 
 ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
 
