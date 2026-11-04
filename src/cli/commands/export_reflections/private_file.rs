@@ -8,6 +8,11 @@
 use std::io;
 use std::path::Path;
 
+/// Name an operator-selected namespace directory while callers preserve the cause.
+pub(crate) fn namespace_context(path: &Path) -> String {
+    format!("opening private namespace dir {}", path.display())
+}
+
 /// Validate a single component, rejecting empty names, dot names, and separators.
 pub(crate) fn validate_component(component: &str) -> io::Result<()> {
     if component.is_empty()

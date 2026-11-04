@@ -231,10 +231,7 @@ pub fn run_auto_export(
     let root = export_reflections::private_file::PrivateExportDir::open(&config.out_dir)?;
     let relative = export_reflections::sanitise_namespace_for_path(&mem.namespace);
     let namespace = root.namespace(&relative).with_context(|| {
-        format!(
-            "opening private namespace dir {}",
-            config.out_dir.join(&relative).display()
-        )
+        export_reflections::private_file::namespace_context(&config.out_dir.join(&relative))
     })?;
     namespace.write(
         &format!("{}.{}", mem.id, config.format.extension()),

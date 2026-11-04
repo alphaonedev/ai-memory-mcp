@@ -318,9 +318,8 @@ fn write_persona_export(
     let namespace = root
         .namespace(std::path::Path::new(&ns_safe))
         .with_context(|| {
-            format!(
-                "opening private namespace dir {}",
-                out_dir.join(&ns_safe).display()
+            crate::cli::commands::export_reflections::private_file::namespace_context(
+                &out_dir.join(&ns_safe),
             )
         })?;
     let body = render_persona_md(persona);

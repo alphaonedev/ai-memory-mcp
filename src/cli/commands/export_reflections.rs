@@ -119,12 +119,9 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         let payload = render_payload(mem, &edges, attest_level, format);
 
         let relative = sanitise_namespace_for_path(&mem.namespace);
-        let namespace = private_root.namespace(&relative).with_context(|| {
-            format!(
-                "opening private namespace dir {}",
-                out_dir.join(&relative).display()
-            )
-        })?;
+        let namespace = private_root
+            .namespace(&relative)
+            .with_context(|| private_file::namespace_context(&out_dir.join(&relative)))?;
         let ns_dir = out_dir.join(relative);
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
