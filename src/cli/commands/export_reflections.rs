@@ -22,6 +22,7 @@
 //! the file on disk is a derived artefact. Operators may freely
 //! delete / regenerate the directory at any time.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -115,6 +116,7 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
     let mut summary = ExportSummary::default();
 
     let reflections = collect_reflections(&conn, args.namespace.as_deref(), args.since.as_deref())?;
+    let mut swept_directories = HashSet::new();
     for mem in &reflections {
         let edges = collect_outbound_reflects_on(&conn, &mem.id)?;
         let attest_level = summarise_attest_level(&edges);
@@ -125,8 +127,12 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
-        write_private_export(&path, payload.as_bytes())
-            .with_context(|| crate::errors::msg::writing(path.display()))?;
+        private_file::write_private_export_in_batch(
+            &path,
+            payload.as_bytes(),
+            &mut swept_directories,
+        )
+        .with_context(|| crate::errors::msg::writing(path.display()))?;
         summary.written += 1;
         if !args.quiet {
             writeln!(out.stdout, "wrote {}", path.display())?;

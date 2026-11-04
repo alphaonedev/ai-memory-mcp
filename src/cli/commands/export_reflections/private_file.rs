@@ -11,7 +11,11 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::time::{Duration, SystemTime};
-use std::{io, path::Path};
+use std::{
+    collections::HashSet,
+    io,
+    path::{Path, PathBuf},
+};
 
 #[cfg(unix)]
 const PRIVATE_EXPORT_MODE: u32 = 0o600;
@@ -71,6 +75,8 @@ fn remove_stale_staging_entry(entry: &fs::DirEntry, now: SystemTime) -> io::Resu
 
 #[cfg(unix)]
 fn sweep_stale_staging(parent: &Path) {
+    #[cfg(test)]
+    STAGING_SWEEP_COUNT.set(STAGING_SWEEP_COUNT.get().strict_add(1));
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(error) => {
@@ -130,8 +136,22 @@ fn sync_directory(parent: &Path) -> io::Result<()> {
 /// # Errors
 /// Validation and staging errors remove the owned staging file. A directory
 /// sync error is returned after publication without unlinking the new export.
-#[cfg(unix)]
+/// Returns `Unsupported` on platforms without Unix mode-0600 protection.
 pub(crate) fn write_private_export(path: &Path, payload: &[u8]) -> io::Result<()> {
+    write_private_export_in_batch(path, payload, &mut HashSet::new())
+}
+
+/// Publish with every per-file check, sweeping each directory once per batch.
+///
+/// # Errors
+/// Validation and staging errors remove the owned staging file. A directory
+/// sync error is returned after publication without unlinking the new export.
+#[cfg(unix)]
+pub(super) fn write_private_export_in_batch(
+    path: &Path,
+    payload: &[u8],
+    swept_directories: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
     check_destination(path)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -139,7 +159,10 @@ pub(crate) fn write_private_export(path: &Path, payload: &[u8]) -> io::Result<()
             "private_export_parent_required",
         )
     })?;
-    sweep_stale_staging(parent);
+    if !swept_directories.contains(parent) {
+        swept_directories.insert(parent.to_path_buf());
+        sweep_stale_staging(parent);
+    }
     let staging = parent.join(format!(
         "{STAGING_PREFIX}{}{STAGING_SUFFIX}",
         uuid::Uuid::new_v4()
@@ -171,7 +194,11 @@ pub(crate) fn write_private_export(path: &Path, payload: &[u8]) -> io::Result<()
 /// # Errors
 /// Always returns `Unsupported`; plaintext is never written with weaker modes.
 #[cfg(not(unix))]
-pub(crate) fn write_private_export(_path: &Path, _payload: &[u8]) -> io::Result<()> {
+pub(super) fn write_private_export_in_batch(
+    _path: &Path,
+    _payload: &[u8],
+    _swept_directories: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "private_export_unix_permissions_required",
@@ -180,6 +207,7 @@ pub(crate) fn write_private_export(_path: &Path, _payload: &[u8]) -> io::Result<
 
 #[cfg(all(test, unix))]
 thread_local! {
+    static STAGING_SWEEP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static DIRECTORY_SYNC_CALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_STALE_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -623,5 +651,70 @@ mod tests {
     #[test]
     fn auto_stale_removal_failure_keeps_export_working_r2_8369() {
         stale_removal_failure_keeps_export_working(Writer::Auto);
+    }
+
+    #[test]
+    fn cli_sweeps_once_per_destination_directory_per_run_8595() {
+        const SECOND_NAMESPACE: &str = "second-export-8595";
+        let fixture = Fixture::new();
+        let conn = db::open(&fixture.db_path).unwrap();
+        let template = db::get(&conn, &fixture.memory_id).unwrap().unwrap();
+        let mut destinations = vec![fixture.destination.clone()];
+        for namespace in [NAMESPACE, NAMESPACE, SECOND_NAMESPACE, SECOND_NAMESPACE] {
+            let mut reflection = template.clone();
+            reflection.id = uuid::Uuid::new_v4().to_string();
+            reflection.title = format!("sweep-fixture-{}", reflection.id);
+            reflection.content = format!("{CONTENT} sweep-fixture-{}", reflection.id);
+            reflection.namespace = namespace.into();
+            let id = db::insert(&conn, &reflection).unwrap();
+            destinations.push(fixture.out_dir.join(namespace).join(format!("{id}.md")));
+        }
+        let mut args = ExportReflectionsArgs {
+            namespace: Some(NAMESPACE.into()),
+            out_dir: Some(fixture.out_dir.clone()),
+            format: "md".into(),
+            since: None,
+            quiet: true,
+        };
+        for (expected_sweeps, expected_exports) in [(1, 3), (2, 5), (2, 5)] {
+            super::STAGING_SWEEP_COUNT.set(0);
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut output = CliOutput {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            };
+            assert_eq!(
+                export_reflections::run(&fixture.db_path, &args, &mut output).unwrap(),
+                0
+            );
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .contains(&format!("exported {expected_exports} reflection(s)"))
+            );
+            assert_eq!(
+                super::STAGING_SWEEP_COUNT.get(),
+                expected_sweeps,
+                "each destination directory must be swept once on every CLI run"
+            );
+            args.namespace = None;
+        }
+        for destination in destinations {
+            assert!(fs::read_to_string(&destination).unwrap().contains(CONTENT));
+            assert_eq!(
+                fs::metadata(destination).unwrap().mode() & MODE_MASK,
+                PRIVATE_MODE
+            );
+        }
+        for _ in 0..2 {
+            super::STAGING_SWEEP_COUNT.set(0);
+            fixture.export(Writer::Auto).unwrap();
+            assert_eq!(
+                super::STAGING_SWEEP_COUNT.get(),
+                1,
+                "each auto-export must sweep"
+            );
+        }
     }
 }
