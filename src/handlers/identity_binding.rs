@@ -614,8 +614,8 @@ pub fn enforce_sensitive_identity(
                     Json(json!({
                         "error": "attested_identity_required",
                         "message": "X-Agent-Id is self-asserted; present the agent's \
-                                    enrolled per-agent api-key (X-API-Key) to act as \
-                                    this principal",
+                                    enrolled per-agent api-key (X-API-Key) or a verified \
+                                    client certificate mapped to this principal to act as it",
                         "endpoint": endpoint,
                     })),
                 )
