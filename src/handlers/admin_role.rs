@@ -177,6 +177,7 @@ pub async fn require_key_bound_admin(
                     // reason (not "enrolled") on the signed deny row.
                     reason = HEADER_TRUST_UNREADABLE_REASON;
                     tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
                         error = %e,
                         "{ENV_ADMIN_HEADER_TRUST}: enrolled-key registry read failed; credential route refused (#8574)"
                     );
