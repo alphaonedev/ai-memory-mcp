@@ -28157,6 +28157,9 @@ impl MemoryStore for PostgresStore {
                         }
                         continue;
                     }
+                    if crate::identity::attest::is_source_attestation_key(&k) {
+                        continue;
+                    }
                     merged_metadata.insert(k, v);
                 }
             }
@@ -28179,20 +28182,6 @@ impl MemoryStore for PostgresStore {
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
-        // #3014/#3018 — stamp `attest_level="claimed"` on the tenant permissive
-        // path so the consolidated row is a truthful `claimed` write
-        // (global-strict already refused above; substrate/curator exempt),
-        // exactly like an unsigned `store` (sqlite `storage::consolidate` twin).
-        if !ctx.bypass_visibility {
-            merged_metadata.insert(
-                crate::models::field_names::ATTEST_LEVEL.to_string(),
-                serde_json::Value::String(
-                    crate::identity::verify::AttestLevel::Claimed
-                        .as_str()
-                        .to_string(),
-                ),
-            );
-        }
         if !source_agent_ids.is_empty() {
             merged_metadata.insert(
                 "consolidated_from_agents".to_string(),
@@ -28228,6 +28217,17 @@ impl MemoryStore for PostgresStore {
             );
         }
         let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #8532 — re-owned by the consolidator: drop to `claimed` and strip
+        // any source attestation, substrate and tenant alike (sqlite twin).
+        crate::identity::attest::reset_for_reowned_row(
+            &mut merged_metadata_value,
+            Some(consolidator_agent_id),
+            &crate::identity::attest::ReownProvenance {
+                kind: crate::identity::attest::ReownKind::Consolidate,
+                source_id: ids.first().map_or("", String::as_str),
+                source_owner: None,
+            },
+        );
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
         // consolidated summary is VERBATIM caller content on the tenant
         // surfaces, so the substrate why_trace is recorded ONLY for the
