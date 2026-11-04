@@ -248,6 +248,13 @@ async fn pubkey_of(store: &Arc<dyn MemoryStore>) -> Option<String> {
 /// assert each is a 403 that changes nothing.
 async fn assert_all_four_refused(router: &axum::Router, store: &Arc<dyn MemoryStore>) {
     let keys_before = enrolled_count(store).await;
+    assert_four_forbidden(router).await;
+    assert_eq!(enrolled_count(store).await, keys_before, "no key change");
+    assert_eq!(pubkey_of(store).await, None, "no pubkey bound");
+}
+
+/// The four credential routes as the claimed admin: each is a 403, no store read.
+async fn assert_four_forbidden(router: &axum::Router) {
     let pk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     let (s, b) = mint(router, SHARED_KEY, TARGET).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "mint: {b}");
@@ -284,8 +291,6 @@ async fn assert_all_four_refused(router: &axum::Router, store: &Arc<dyn MemorySt
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "bind: {b}");
-    assert_eq!(enrolled_count(store).await, keys_before, "no key change");
-    assert_eq!(pubkey_of(store).await, None, "no pubkey bound");
 }
 
 /// (1) DENIED: opt-in set, advisory, one enrolled key: all four routes refuse a
@@ -318,7 +323,7 @@ async fn header_trust_does_not_admit_claimed_admin_when_keys_enrolled_enforce_85
     set_header_trust(false);
 }
 
-/// (3) ALLOWED: the documented one-boot bootstrap (empty registry, opt-in set)
+/// (3) ALLOWED: the documented bootstrap (empty registry, opt-in set)
 /// still mints.
 #[tokio::test]
 async fn header_trust_bootstrap_with_empty_registry_still_mints_8574() {
@@ -341,6 +346,51 @@ async fn key_bound_admin_still_mints_with_opt_in_set_8574() {
     set_header_trust(false);
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(enrolled_count(&fx.store).await, before + 1);
+}
+
+/// (6) DENIED: the in-memory snapshot is empty (failed boot load, stale cache,
+/// CLI enrollment on the data tier) while the store holds a key; the opt-in must
+/// not admit on the snapshot alone (HIGH-1, authoritative read).
+#[tokio::test]
+async fn header_trust_refused_when_snapshot_empty_but_store_holds_a_key_8574() {
+    let _g = serial().await;
+    let fx = fixture("stale", HttpIdentityMode::Advisory, false, true);
+    seed_admin_key(&fx).await;
+    let audit_dir = scratch("audit-stale");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+    assert_all_four_refused(&fx.router, &fx.store).await;
+    set_header_trust(false);
+    let audit = forensic_text(&audit_dir);
+    assert!(audit.contains(DENY_REASON), "new reason label: {audit}");
+}
+
+/// (7) DENIED: the authoritative read itself fails (unknown registry state):
+/// the opt-in arm refuses, never admits (fail closed).
+#[tokio::test]
+async fn header_trust_refused_when_the_store_read_errors_8574() {
+    let _g = serial().await;
+    let fx = fixture("rderr", HttpIdentityMode::Advisory, false, true);
+    {
+        let conn = ai_memory::db::open(&fx._dir.path().join("m.db")).expect("open for fault");
+        conn.execute_batch("DROP TABLE agent_api_keys")
+            .expect("drop the key table to fault the read");
+    }
+    let audit_dir = scratch("audit-rderr");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+    assert_four_forbidden(&fx.router).await;
+    set_header_trust(false);
+    let audit = forensic_text(&audit_dir);
+    assert!(audit.contains(DENY_REASON), "refused label: {audit}");
+}
+
+/// (8) DENIED under identity mode `off` (modes are Off/Advisory/Enforce).
+#[tokio::test]
+async fn header_trust_does_not_admit_claimed_admin_when_keys_enrolled_off_8574() {
+    let _g = serial().await;
+    let fx = fixture("off", HttpIdentityMode::Off, true, true);
+    seed_admin_key(&fx).await;
+    assert_all_four_refused(&fx.router, &fx.store).await;
+    set_header_trust(false);
 }
 
 /// (5) Postgres parity for (1) and (3), own database.
@@ -394,10 +444,99 @@ async fn postgres_header_trust_refused_when_keys_enrolled_bootstrap_when_empty_8
         "{audit}"
     );
 
-    // Empty registry: the one-boot bootstrap still mints.
+    // Empty registry: the bootstrap still mints.
     registry.install(std::collections::HashMap::new());
     let (status, body) = mint(&router, SHARED_KEY, TARGET).await;
     set_header_trust(false);
     assert_eq!(status, StatusCode::OK, "bootstrap mints on pg: {body}");
     assert_eq!(enrolled_count(&store).await, before + 1);
+}
+
+/// Build a router on a fresh PG store whose registry snapshot is EMPTY while
+/// `ADMIN` is registered (registered under an enrolled registry first).
+#[cfg(feature = "sal-postgres")]
+async fn pg_empty_snapshot_router(
+    tag: &str,
+) -> (
+    axum::Router,
+    Arc<dyn MemoryStore>,
+    Arc<EnrolledAgentKeys>,
+    AppState,
+    TempDir,
+) {
+    set_header_trust(false);
+    let dir = scratch(tag);
+    let registry = Arc::new(EnrolledAgentKeys::empty());
+    registry.install(std::collections::HashMap::from([(
+        api_key_sha256_hex(ADMIN_TOKEN),
+        ADMIN.to_string(),
+    )]));
+    let mode = HttpIdentityMode::Advisory;
+    let (mut state, _store) = build_state(&registry, &dir, mode);
+    let url =
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");
+    let pg = Arc::new(
+        ai_memory::store::postgres::PostgresStore::connect(&url)
+            .await
+            .expect("own PG database"),
+    );
+    let store: Arc<dyn MemoryStore> = pg.clone();
+    state.store = Arc::clone(&store);
+    state.storage_backend = StorageBackend::Postgres;
+    let router = router_for(state.clone(), &registry, mode);
+    let (status, _) = call(
+        &router,
+        req(
+            "POST",
+            "/api/v1/agents",
+            ADMIN_TOKEN,
+            &json!({ "agent_id": TARGET, "agent_type": "ai:test" }),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "register: {status}");
+    registry.install(std::collections::HashMap::new());
+    (router, store, registry, state, dir)
+}
+
+/// (9) Postgres: snapshot empty while the store holds a key: refused.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_header_trust_refused_when_snapshot_empty_but_store_holds_a_key_8574() {
+    let _g = serial().await;
+    let (router, store, _registry, _state, _dir) = pg_empty_snapshot_router("pgstale").await;
+    let _outcome = store
+        .bind_agent_api_key(
+            &CallerContext::for_admin(ai_memory::identity::sentinels::DAEMON_PRINCIPAL),
+            ADMIN,
+            &api_key_sha256_hex(ADMIN_TOKEN),
+        )
+        .await
+        .expect("seed admin key on pg");
+    set_header_trust(true);
+    let before = enrolled_count(&store).await;
+    let (status, body) = mint(&router, SHARED_KEY, TARGET).await;
+    set_header_trust(false);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(enrolled_count(&store).await, before, "no key on postgres");
+}
+
+/// (10) Postgres: the authoritative read errors (closed pool): refused.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_header_trust_refused_when_the_store_read_errors_8574() {
+    let _g = serial().await;
+    let (_router, _store, registry, state, _dir) = pg_empty_snapshot_router("pgerr").await;
+    let url =
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");
+    let broken = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("second connection to the own database");
+    broken.pool().close().await;
+    let mut faulted = state;
+    faulted.store = Arc::new(broken);
+    let router = router_for(faulted, &registry, HttpIdentityMode::Advisory);
+    set_header_trust(true);
+    assert_four_forbidden(&router).await;
+    set_header_trust(false);
 }
