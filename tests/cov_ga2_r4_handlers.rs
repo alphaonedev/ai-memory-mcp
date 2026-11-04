@@ -469,7 +469,11 @@ fn signed_approval_request_ts(pending_id: &str, body: &Value, ts: i64) -> Reques
     let body_bytes = serde_json::to_vec(body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
     let ts_str = ts.to_string();
-    let canonical = format!("{ts_str}.POST.{pending_id}.{body_str}");
+    // #8495 layout v2: the approver is inside the signed subject.
+    let canonical = format!(
+        "{ts_str}.POST.{}.{body_str}",
+        ai_memory::handlers::agent_api_key::approval_subject(pending_id, ADMIN_AGENT)
+    );
     let key_hash = sha256_hex(HMAC_SECRET_HEX);
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     Request::builder()
@@ -1418,7 +1422,10 @@ async fn approval_decide_invalid_id_is_400() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let canonical = format!("{ts}.POST.{pending_id}.{body_str}");
+    let canonical = format!(
+        "{ts}.POST.{}.{body_str}",
+        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, ADMIN_AGENT)
+    );
     let sig = hmac_sha256_hex(&sha256_hex(HMAC_SECRET_HEX), &canonical);
     let req = Request::builder()
         .method("POST")
@@ -1499,7 +1506,10 @@ async fn approval_decide_approve_sqlite_execute_path() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let canonical = format!("{ts}.POST.{pending_id}.{body_str}");
+    let canonical = format!(
+        "{ts}.POST.{}.{body_str}",
+        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, &approver)
+    );
     let sig = hmac_sha256_hex(&sha256_hex(HMAC_SECRET_HEX), &canonical);
     let req = Request::builder()
         .method("POST")
@@ -1548,7 +1558,10 @@ async fn approval_decide_deny_sqlite_path() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let canonical = format!("{ts}.POST.{pending_id}.{body_str}");
+    let canonical = format!(
+        "{ts}.POST.{}.{body_str}",
+        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, &decider)
+    );
     let sig = hmac_sha256_hex(&sha256_hex(HMAC_SECRET_HEX), &canonical);
     let req = Request::builder()
         .method("POST")

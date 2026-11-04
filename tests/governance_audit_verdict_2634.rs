@@ -429,7 +429,7 @@ fn mcp_pending_approve_allowed_records_allow() {
 const HMAC_SECRET_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Reproduce `verify_approval_hmac`'s canonical: key = `SHA-256(secret)`,
-/// signature = `hex(HMAC-SHA256(key, "<ts>.POST.<pending_id>.<body>"))`.
+/// signature = `hex(HMAC-SHA256(key, "<ts>.POST.<n>:<pending_id>@<m>:<approver>.<body>"))`.
 fn approval_signature(secret: &str, canonical: &str) -> String {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
@@ -544,7 +544,10 @@ async fn http_approve_pending_self_approval_records_refuse() {
 
     let ts = chrono::Utc::now().timestamp().to_string();
     // governance.rs approve_pending: empty body, canonical binds an empty body.
-    let canonical = format!("{ts}.POST.{pending_id}.");
+    let canonical = format!(
+        "{ts}.POST.{}.",
+        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-alice")
+    );
     let sig = approval_signature(HMAC_SECRET_HEX, &canonical);
     let req = Request::builder()
         .method("POST")
@@ -595,7 +598,10 @@ async fn http_approval_decide_self_approval_records_refuse() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let canonical = format!("{ts}.POST.{pending_id}.{body_str}");
+    let canonical = format!(
+        "{ts}.POST.{}.{body_str}",
+        ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-alice")
+    );
     let sig = approval_signature(HMAC_SECRET_HEX, &canonical);
     let req = Request::builder()
         .method("POST")

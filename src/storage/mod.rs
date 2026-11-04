@@ -219,6 +219,7 @@ use crate::models::{
 // canonical HTTP status. The error-prefix constants live alongside the
 // typed enum so the Display impl and the prefix tokens stay in lockstep.
 mod error;
+pub mod execute_owner_8577;
 pub use error::{LINK_CYCLE_ERR_PREFIX, LINK_PERMISSION_DENIED_ERR_PREFIX, LinkEnd, StorageError};
 
 // ---------------------------------------------------------------------------
@@ -24163,6 +24164,26 @@ pub fn approve_with_approver_type(
     approver_agent_id: &str,
     surface: ApproveSurface,
 ) -> Result<ApproveOutcome> {
+    approve_with_approver_type_gated(conn, pending_id, approver_agent_id, surface, None)
+}
+
+/// #8577 — a precondition run on the pending row AFTER the eligibility
+/// refusals and BEFORE the approval vote is written.
+pub type ApprovePrecondition<'a> = &'a dyn Fn(&Connection, &PendingAction) -> Result<()>;
+
+/// [`approve_with_approver_type`] with an optional [`ApprovePrecondition`]
+/// (#8577): its refusal leaves the pending row `pending`.
+///
+/// # Errors
+///
+/// Everything [`approve_with_approver_type`] returns, plus the precondition's.
+pub fn approve_with_approver_type_gated(
+    conn: &Connection,
+    pending_id: &str,
+    approver_agent_id: &str,
+    surface: ApproveSurface,
+    precondition: Option<ApprovePrecondition<'_>>,
+) -> Result<ApproveOutcome> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
@@ -24194,6 +24215,9 @@ pub fn approve_with_approver_type(
         surface,
     )? {
         return Ok(ApproveOutcome::Rejected(reason));
+    }
+    if let Some(precondition) = precondition {
+        precondition(conn, &pa)?;
     }
 
     match approver {
@@ -24397,6 +24421,37 @@ fn refuse_unapproved_destination_store(
 }
 
 pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
+    execute_pending_action_gated(conn, pending_id, None)
+}
+
+/// #8564 — the execute arm an [`ExecuteOwnerGate`] is asked to admit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecuteArm {
+    /// The approved `delete` arm (removes the target row).
+    Delete,
+    /// The approved tier-bump `promote` arm (target row to `long`).
+    TierBump,
+}
+
+/// #8564 — an owner gate run on the target row of the delete and the
+/// tier-bump arms, inside the arm's write transaction and before the
+/// mutation, so the refusal and the write see the same row. Arguments:
+/// the connection, the approved row, the target memory id and the arm.
+pub type ExecuteOwnerGate<'a> =
+    &'a dyn Fn(&Connection, &PendingAction, &str, ExecuteArm) -> Result<()>;
+
+/// [`execute_pending_action`] with an optional owner gate on the delete
+/// and tier-bump arms (#8564). `None` is the ungated primitive.
+///
+/// # Errors
+///
+/// Everything [`execute_pending_action`] returns, plus the gate's own
+/// refusal, which leaves the target row untouched.
+pub fn execute_pending_action_gated(
+    conn: &Connection,
+    pending_id: &str,
+    owner_gate: Option<ExecuteOwnerGate<'_>>,
+) -> Result<Option<String>> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #962 typed envelope — 404 NOT_FOUND.
@@ -24480,7 +24535,13 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
         }
         "delete" => {
             if let Some(mid) = pa.memory_id.clone() {
-                delete(conn, &mid)?;
+                // #8564: the gate and the delete share one transaction.
+                connection::in_write_txn(conn, || {
+                    if let Some(gate) = owner_gate {
+                        gate(conn, &pa, &mid, ExecuteArm::Delete)?;
+                    }
+                    delete(conn, &mid)
+                })?;
                 Some(mid)
             } else {
                 None
@@ -24503,20 +24564,26 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                         promote_to_namespace(conn, &mid, to_ns, Some(pa.requested_by.as_str()))?;
                     Some(clone_id)
                 } else {
-                    // Tier bump to long + clear expiry.
-                    let (_found, _changed) = update(
-                        conn,
-                        &mid,
-                        None,
-                        None,
-                        Some(&Tier::Long),
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(""),
-                        None,
-                    )?;
+                    // Tier bump to long + clear expiry; #8564: the gate
+                    // and the update share one transaction.
+                    connection::in_write_txn(conn, || {
+                        if let Some(gate) = owner_gate {
+                            gate(conn, &pa, &mid, ExecuteArm::TierBump)?;
+                        }
+                        update(
+                            conn,
+                            &mid,
+                            None,
+                            None,
+                            Some(&Tier::Long),
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(""),
+                            None,
+                        )
+                    })?;
                     Some(mid)
                 }
             } else {

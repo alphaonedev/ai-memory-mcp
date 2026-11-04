@@ -1662,3 +1662,122 @@ async fn opt_in_arm_still_admits_a_claimed_admin_8535() {
         "opt-in must re-admit the claim: {body}"
     );
 }
+
+/// #8546 — the api-key approval arm verifies the length-prefixed layout 2
+/// subject (`approval_subject`), so a signature over the ambiguous
+/// `<pending_id>@<approver>` concatenation no longer verifies.
+#[tokio::test]
+async fn an_unprefixed_approval_subject_is_refused_8546() {
+    const ADMIN: &str = "ai:key-admin-unprefixed";
+    const APPROVER: &str = "ai:key-admin-unprefixed-2";
+    let _g = serial().await;
+    let fx = fixture("unprefixed", &[ADMIN, APPROVER]);
+
+    let (_, body, _) = mint(&fx.router, ADMIN, ALICE).await;
+    let token = body["token"].as_str().expect("token").to_string();
+    let (_, _, body) = call(&fx.router, revoke_req(ADMIN, ALICE, &json!({}))).await;
+    let pending_id = body["pending_id"].as_str().expect("pending id").to_string();
+
+    let raw = json!({ "approve_pending_id": pending_id }).to_string();
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let sig = common::sign_canonical_envelope(
+        HMAC_SECRET,
+        &ts,
+        "POST",
+        &format!("{pending_id}@{APPROVER}"),
+        &raw,
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{ALICE}/api-key/revoke"))
+        .header(ai_memory::HEADER_API_KEY, admin_key(APPROVER))
+        .header(ai_memory::HEADER_AGENT_ID, APPROVER)
+        .header("content-type", "application/json")
+        .header(ai_memory::HEADER_AI_MEMORY_SIGNATURE, sig)
+        .header(ai_memory::HEADER_AI_MEMORY_TIMESTAMP, ts)
+        .body(Body::from(raw))
+        .expect("build unprefixed approval");
+    let (status, _, body) = call(&fx.router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        token_authenticates(&fx.router, &token).await,
+        "a signature over the unprefixed subject must revoke nothing"
+    );
+}
+
+/// #8547 — a refused api-key approval writes exactly one forensic
+/// `approval_decide_signature` refusal row naming the presented agent and the
+/// pending id, never the signature or the secret.
+#[tokio::test]
+async fn a_refused_approval_signature_writes_one_forensic_row_8547() {
+    const ADMIN: &str = "ai:key-admin-refusal-audit";
+    const APPROVER: &str = "ai:key-admin-refusal-audit-2";
+    let _g = serial().await;
+    let fx = fixture("refusalaudit", &[ADMIN, APPROVER]);
+    let (_, _, _) = mint(&fx.router, ADMIN, ALICE).await;
+    let (_, _, body) = call(&fx.router, revoke_req(ADMIN, ALICE, &json!({}))).await;
+    let pending_id = body["pending_id"].as_str().expect("pending id").to_string();
+
+    let audit_dir = scratch("refusalaudit");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+    // Signed for APPROVER, presented by ADMIN.
+    let raw = json!({ "approve_pending_id": pending_id }).to_string();
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let sig = common::sign_canonical_envelope(
+        HMAC_SECRET,
+        &ts,
+        "POST",
+        &approval_subject(&pending_id, APPROVER),
+        &raw,
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{ALICE}/api-key/revoke"))
+        .header(ai_memory::HEADER_API_KEY, admin_key(ADMIN))
+        .header(ai_memory::HEADER_AGENT_ID, ADMIN)
+        .header("content-type", "application/json")
+        .header(ai_memory::HEADER_AI_MEMORY_SIGNATURE, sig.clone())
+        .header(ai_memory::HEADER_AI_MEMORY_TIMESTAMP, ts)
+        .body(Body::from(raw))
+        .expect("build refused approval");
+    let (status, _, body) = call(&fx.router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    ai_memory::governance::audit::shutdown();
+
+    let mut text = String::new();
+    for entry in std::fs::read_dir(audit_dir.path()).expect("read audit dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            text.push_str(&std::fs::read_to_string(&path).expect("read forensic file"));
+        }
+    }
+    let rows: Vec<Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("forensic row is JSON"))
+        .filter(|r: &Value| r["kind"] == json!("approval_decide_signature"))
+        .collect();
+    assert_eq!(rows.len(), 1, "one refusal row; text={text}");
+    assert_eq!(rows[0]["decision"], json!("refuse"), "{}", rows[0]);
+    assert_eq!(rows[0]["actor"], json!(ADMIN), "{}", rows[0]);
+    assert_eq!(
+        rows[0]["payload"]["pending_id"],
+        json!(pending_id),
+        "{}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0]["payload"]["reason"],
+        json!("invalid_signature"),
+        "{}",
+        rows[0]
+    );
+    assert!(
+        !text.contains(&sig),
+        "the signature reached the forensic chain"
+    );
+    assert!(
+        !text.contains(HMAC_SECRET),
+        "the secret reached the forensic chain"
+    );
+}
