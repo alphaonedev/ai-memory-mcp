@@ -1667,17 +1667,27 @@ full-database read principal.
    with non-overlapping `--mtls-allowlist` files. The sync substrate
    does not enforce namespace-level tenancy across mTLS peers.
 
-**Roadmap to per-namespace / per-scope sync filtering.** Per-memory
-visibility filtering on `/sync/since` is a Phase 5 hub feature
-(post-v0.7.0, tracked under [#311](https://github.com/alphaonedev/ai-memory-mcp/issues/311)
-for the targeted-share variant and under [#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717)
-for cert-SAN agent-id attestation). v0.7.0 ships the mTLS full-trust
-model documented above as the canonical disposition for the
-`alphaonedev/ai-memory-mcp` v0.7.0 release line.
+**Shipped peer scope and sender controls.** `AI_MEMORY_FED_PEER_ATTESTATION`
+maps peer ids to `allowed_namespaces` for `/sync/since` and
+`allowed_sender_agent_ids` for `/sync/push`. Issues
+[#238](https://github.com/alphaonedev/ai-memory-mcp/issues/238) and
+[#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717) are closed;
+their v0.7 substrate disposition cites [PR #716](https://github.com/alphaonedev/ai-memory-mcp/pull/716).
+That closure does not mean certificate SAN extraction shipped.
 
-#### Body-claimed sender_agent_id is not yet attested (issue #238)
+#### Sender identity checks and certificate binding
 
-mTLS gates network access but the receiving handler accepts `sender_agent_id` from the body without checking it matches the cert's CN/SAN. A peer with a valid cert can claim any agent_id. Tracked as Layer 2b for v0.7.
+The receiver checks body `sender_agent_id` against `x-peer-id`: a different
+sender requires an exact `allowed_sender_agent_ids` entry for that peer.
+Missing headers and unauthorized mismatches return 403 unless the operator
+sets the explicit bypass `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`.
+To bind the header to the presented certificate, configure
+`AI_MEMORY_FED_CERT_PEER_BINDING_MAP` with certificate fingerprints and peer ids.
+`AI_MEMORY_FED_CERT_PEER_BINDING=off|warn|enforce` controls this separate check:
+`warn` is the Standard default and logs mismatches; `enforce` returns 401 for
+a mismatch, an unmapped certificate, or a missing header on the binding acceptor.
+Without that map/acceptor the certificate check is inert even in `enforce`.
+The binding uses the operator's fingerprint map, not the certificate CN or SAN.
 
 ### mTLS setup recipe
 
