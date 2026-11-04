@@ -36,6 +36,9 @@ const ADMIN_TOKEN: &str = "8574-per-agent-admin-token-0123456789abcdef";
 const ADMIN: &str = "ai:ops-admin-8574";
 const TARGET: &str = "ai:victim-8574";
 const DENY_REASON: &str = "header_trust_refused_registry_enrolled";
+/// LOW-A (REVIEW-8587-sec-r2): a store read error is an unknown registry
+/// state and must not be recorded as "enrolled".
+const UNREADABLE_REASON: &str = "header_trust_refused_registry_unreadable";
 const MINT_ACTION: &str = "agent_api_key_mint";
 const REVOKE_ACTION: &str = "agent_api_key_revoke";
 
@@ -376,7 +379,14 @@ async fn header_trust_refused_when_the_store_read_errors_8574() {
     assert_four_forbidden(&fx.router).await;
     set_header_trust(false);
     let audit = forensic_text(&audit_dir);
-    assert!(audit.contains(DENY_REASON), "refused label: {audit}");
+    assert!(
+        audit.contains(UNREADABLE_REASON),
+        "unreadable label: {audit}"
+    );
+    assert!(
+        !audit.contains(DENY_REASON),
+        "a read error must not claim a key is enrolled: {audit}"
+    );
 }
 
 /// (8) DENIED under identity mode `off` (modes are Off/Advisory/Enforce).
@@ -509,12 +519,16 @@ async fn postgres_header_trust_refused_when_snapshot_empty_but_store_holds_a_key
         )
         .await
         .expect("seed admin key on pg");
+    let audit_dir = scratch("audit-pgstale");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
     set_header_trust(true);
     let before = enrolled_count(&store).await;
     let (status, body) = mint(&router, SHARED_KEY, TARGET).await;
     set_header_trust(false);
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(enrolled_count(&store).await, before, "no key on postgres");
+    let audit = forensic_text(&audit_dir);
+    assert!(audit.contains(DENY_REASON), "refused label: {audit}");
 }
 
 /// (10) Postgres: the authoritative read errors (closed pool): refused.
@@ -532,7 +546,18 @@ async fn postgres_header_trust_refused_when_the_store_read_errors_8574() {
     let mut faulted = state;
     faulted.store = Arc::new(broken);
     let router = router_for(faulted, &registry, HttpIdentityMode::Advisory);
+    let audit_dir = scratch("audit-pgerr");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
     set_header_trust(true);
     assert_four_forbidden(&router).await;
     set_header_trust(false);
+    let audit = forensic_text(&audit_dir);
+    assert!(
+        audit.contains(UNREADABLE_REASON),
+        "unreadable label: {audit}"
+    );
+    assert!(
+        !audit.contains(DENY_REASON),
+        "a read error must not claim a key is enrolled: {audit}"
+    );
 }
