@@ -579,29 +579,46 @@ fn parse_body<T: serde::de::DeserializeOwned + Default>(bytes: &Bytes) -> Result
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/// Separator between the pending id and the approver in the signed approval
-/// subject. `@` cannot occur in a UUID pending id, so the split is
-/// unambiguous, and it is already legal in an `agent_id`
-/// (`crate::validate::validate_agent_id`), which is why the approver goes
-/// SECOND.
+/// Separator between the length-prefixed pending id and the length-prefixed
+/// approver in the signed approval subject. The separator alone does not make
+/// the subject unambiguous: `crate::validate::validate_id` admits `@` in a
+/// pending id, `crate::validate::validate_agent_id` admits `.` in an agent
+/// id, and the K10 canonical joins subject and body with `.`. The byte-length
+/// prefixes do (#8546).
 pub const APPROVAL_SUBJECT_SEPARATOR: &str = "@";
 
-/// The subject the K10 approval signature commits to on this route:
-/// `<pending_id>@<approver_agent_id>`.
+/// Separator between a decimal byte length and the field it prefixes in the
+/// signed approval subject (#8546).
+pub const APPROVAL_SUBJECT_LENGTH_SEPARATOR: &str = ":";
+
+/// Forensic `endpoint` label of a refused api-key approval signature (#8547).
+pub const API_KEY_APPROVAL_ENDPOINT: &str = "agent_api_key_approval";
+
+/// The subject the K10 approval signature commits to (signature layout 2):
+/// `<n>:<pending_id>@<m>:<approver_agent_id>`, where `<n>` and `<m>` are the
+/// decimal byte lengths of the two ids.
 ///
 /// See the call site in [`apply_approved`] for why the approver is in here at
 /// all; in one line, a signature that does not name its signer is a signature
-/// somebody else can present.
+/// somebody else can present. #8546: the lengths make the subject injective,
+/// so the canonical `<ts>.<METHOD>.<subject>.<body>` has exactly one
+/// `(pending_id, approver, body)` reading; without them two different triples
+/// could sign the same bytes.
 #[must_use]
 pub fn approval_subject(pending_id: &str, approver_agent_id: &str) -> String {
-    format!("{pending_id}{APPROVAL_SUBJECT_SEPARATOR}{approver_agent_id}")
+    format!(
+        "{}{APPROVAL_SUBJECT_LENGTH_SEPARATOR}{pending_id}{APPROVAL_SUBJECT_SEPARATOR}{}{APPROVAL_SUBJECT_LENGTH_SEPARATOR}{approver_agent_id}",
+        pending_id.len(),
+        approver_agent_id.len(),
+    )
 }
 
 /// Operator-facing description of the signature this route requires. Named so
 /// the refusal and the docs cannot drift apart.
 pub const APPROVAL_SIGNATURE_HINT: &str = "approving a queued api-key action requires the K10 HMAC headers \
      X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \
-     \"<ts>.POST.<pending_id>@<approver-agent-id>.<body>\")> and \
+     \"<ts>.POST.<n>:<pending_id>@<m>:<approver-agent-id>.<body>\")> (<n>, <m> = \
+     the decimal byte lengths of the two ids) and \
      X-AI-Memory-Timestamp: <unix-epoch-secs>. The approver is inside the \
      signed subject so a captured signature cannot be presented by a \
      different principal.";
@@ -765,7 +782,7 @@ fn no_store(status: StatusCode, body: serde_json::Value) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Enumerate every enrolled `(token_sha256, agent_id)` pair.
-async fn load_enrolled(app: &AppState) -> Result<Vec<(String, String)>, String> {
+pub(crate) async fn load_enrolled(app: &AppState) -> Result<Vec<(String, String)>, String> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return app
@@ -1146,7 +1163,9 @@ pub async fn mint_agent_api_key(
         &caller,
         &agent_id,
         &MINT_PRINCIPAL_GATE,
-    ) {
+    )
+    .await
+    {
         return resp;
     }
     if !credential_transport_confidential() {
@@ -1383,7 +1402,9 @@ pub async fn revoke_agent_api_key(
         &caller,
         &agent_id,
         &REVOKE_PRINCIPAL_GATE,
-    ) {
+    )
+    .await
+    {
         return resp;
     }
     let parsed: RevokeApiKeyBody = match parse_body(&body) {
@@ -1622,6 +1643,13 @@ async fn apply_approved(
     // first and dissolves the second.
     let subject = approval_subject(pending_id, caller);
     if let Err(status) = super::verify_approval_hmac(headers, body, "POST", &subject) {
+        // #8547: a refused approval signature is recorded, never silent.
+        super::approvals::audit_signature_refusal(
+            headers,
+            pending_id,
+            API_KEY_APPROVAL_ENDPOINT,
+            super::approvals::SIGNATURE_REFUSAL_INVALID,
+        );
         return (
             status,
             Json(json!({

@@ -1439,6 +1439,16 @@ Walks the reflection-chain and writes Markdown to
 `~/.ai-memory/reflections/<ns>/<id>.md` by default. Pair with
 `auto_export_reflections_to_filesystem = true` for hands-off operation.
 
+On Unix, CLI and automatic reflection exports create plaintext files with mode
+0600 through a synced, same-directory staging file and atomic replacement of an
+existing regular file, refusing symlink and non-regular destinations; the parent
+directory is then synced, and a sync error is reported without removing the
+published file. Before each export, regular `.private-export-*.stage` files older
+than one hour are removed; cleanup errors emit a warning and do not stop export.
+Non-Unix platforms refuse filesystem reflection export because the private-file
+and directory-sync guarantees are unsupported: the CLI returns an error, while
+auto-export logs a warning and writes nothing.
+
 ### `persona` — QW-2 persona-as-artifact
 
 Build a persona from observation-kind memories for a given entity.

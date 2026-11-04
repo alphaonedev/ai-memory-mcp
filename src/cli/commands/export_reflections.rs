@@ -34,6 +34,10 @@ use crate::cli::CliOutput;
 use crate::db;
 use crate::models::{Memory, MemoryKind};
 
+mod private_file;
+
+pub(crate) use private_file::write_private_export;
+
 /// Reflection-export subdirectory under `~/.ai-memory` — shared with the
 /// post-reflect auto-export hook (#1558 batch 6).
 pub(crate) const REFLECTIONS_SUBDIR: &str = "reflections";
@@ -121,7 +125,8 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
-        fs::write(&path, payload).with_context(|| crate::errors::msg::writing(path.display()))?;
+        write_private_export(&path, payload.as_bytes())
+            .with_context(|| crate::errors::msg::writing(path.display()))?;
         summary.written += 1;
         if !args.quiet {
             writeln!(out.stdout, "wrote {}", path.display())?;

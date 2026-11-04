@@ -11,12 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A caller bound to an agent by an active verified mTLS certificate can use the shared API key on enforced IDOR/admin routes. The legacy resolver now receives typed request certificate context and maps a binding matching the effective caller to `KeyAuthenticated`; authority/audit provenance remains `ClientCert`. Certificate/header mismatches still refuse under enforce, absent/off/unmapped bindings grant no certificate authority, and per-agent API-key fallback is preserved. No new wire header carries certificate trust.
 
+### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
+
+- `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.
+
 ### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
 
 - `forward_signal_send_to_http` resolved the forwarded `X-Agent-Id` from the wire `from_agent` through `resolve_agent_id`, so an MCP caller could forge the sender of a forwarded signal. It now uses `resolve_governance_subject` (the #3171 store-forward precedent): under an enforced caller a mismatching `from_agent` is refused with `agent_id mismatch` before any network I/O, and an absent value is filled from the caller. The HTTP handler already stamps `from_agent` from the header and ignores the body field.
 ### Security (#8497, #8493 — entity_register owner is the verified subject)
 
 - `memory_entity_register` and `POST /api/v1/entities` own the entity by the verified caller on both backends. A body `agent_id` or inline `metadata.agent_id` that differs from the verified subject is refused (HTTP 403 `AGENT_ID_MISMATCH`, MCP mismatch error, SAL `PermissionDenied`) with an `outcome: deny` audit row; the postgres funnel now stamps the resolved owner with `insert` like sqlite (#3171). Shared rule in `identity::entity_owner`; fragment `changelog.d/8497.security.md`.
+### Security (#8495 — approver identity bound into the approval HMAC)
+
+- **The approver is inside the approval HMAC (#8495).** The K10 decide signature on `POST /api/v1/approvals/{pending_id}`, `POST /api/v1/pending/{id}/approve` and `POST /api/v1/pending/{id}/reject` is now signed over the versioned layout 2 subject `<n>:<pending_id>@<m>:<X-Agent-Id>` (`<n>`, `<m>` the decimal byte lengths of the two ids, #8546; the subject the agent api-key approval route uses), so a signature names the approver it was made for and a request that presents it under another `X-Agent-Id` is refused `401`. A layout 1 signature (subject `<pending_id>` alone) is refused `401 {"error":"legacy_unbound_approver","signature_layout_version":2}` with a hint naming the new subject, and its nonce is not consumed, so the client can re-sign. Under `identity_mode = enforce` the three decide routes also refuse a caller whose `X-Agent-Id` is not bound to its credential (`403 identity_binding_mismatch` when a per-agent api-key is bound to a different agent, raised first by the transport middleware; `403 attested_identity_required` with the shared api-key, #8549), so one shared secret cannot cast every vote of a consensus quorum. Signers must move to the new subject.
+- **The approval signature subject is length-prefixed (#8546).** The layout 2 subject shared by the K10 decide routes and the agent api-key approval route is now `<n>:<pending_id>@<m>:<approver>`, where `<n>` and `<m>` are the decimal byte lengths of the two ids. Before this change two different (pending id, approver, body) triples could produce the same signed bytes, so a signature could be read as naming a different approver. `POST /api/v1/pending/{id}/approve` and `POST /api/v1/pending/{id}/reject` also refuse a non-empty body that is not JSON with `400` before the signature is checked. Signers must sign the length-prefixed subject; the layout version stays `2` because layout 2 has not been released.
+- **Refused approval signatures are recorded on the forensic chain (#8547).** Every signature refusal on `POST /api/v1/approvals/{pending_id}`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` and the agent api-key approval route now writes one `refuse` row of kind `approval_decide_signature`, naming the presented agent, the pending id, the endpoint and the refusal class (`invalid_signature` or `legacy_unbound_approver`). Before this change a mismatched, legacy, stale, future or replayed signature left no audit record. The row never carries the signature or the secret. An accepted decide still writes only its existing `allow` row.
+- **A non-JSON approval decide body is recorded on the forensic chain (#8563).** When `POST /api/v1/pending/{id}/approve` or `POST /api/v1/pending/{id}/reject` refuses a non-empty body that is not JSON with `400`, it now writes one `refuse` row of kind `approval_decide_signature` with reason `non_json_body`, naming the presented agent (or `anonymous`), the pending id and the endpoint. Before this change that refusal left no audit record. The row never carries the body, the signature or the secret.
+- **Approved deletes and promotions on SQLite are owner-gated for tenant contexts (#8564).** On the SQLite store, the SAL `execute_pending_action` delete arm and tier-bump `promote` arm executed on the target row whoever owned it. Under a tenant context both arms now run under the requester's owner gate, the same as the Postgres backend: a row owned by another agent, or a row with no owner stamp, is refused with `PermissionDenied` and left unchanged, and the requester's own row executes. A bypass context (the federated decide path, after its peer-scope check) keeps its bypass. The remaining ungated SQLite callers, `governance.rs`, `approvals.rs`, `src/mcp/tools/pending.rs` and `src/cli/agents.rs`, are tracked in #8571.
+- **Tenant decide surfaces refuse before the approval commit when the requester does not own the target row (#8577).** On the store-backed decide entries (`governance_approve_with_consensus`, `approve_with_approver_type`) an approve of a pending `delete` or tier-bump `promote` is checked against the row owner through the requester context BEFORE the approval vote is written. A refusal returns the owner-gate `PermissionDenied`, writes a `pending_action.refused_owner_gate` audit row, and leaves the pending row `pending`, instead of committing `approved` and then failing the execute. The execute-time gate stays as defence in depth; bypass contexts (federation) are untouched.
+
+### Fixed (#8548 — approved delete and promote on Postgres)
+
+- **Approved deletes and promotions execute on Postgres (#8548).** On the Postgres backend the SAL `execute_pending_action` delete arm and tier-bump `promote` arm ran under the approver's context, so the owner gate refused them and the decide answered `500 approved but execution failed` and the memory was left in place. Under a tenant context both arms now run as the requester, the same as the reflect arm, under the requester's owner gate: a row the requester owns executes, and another agent's row or an unstamped row is refused. A bypass context (the federated decide path) keeps its bypass. The SQLite backend applies the same gate to tenant contexts (#8564); its remaining ungated callers are tracked in #8571.
+
 ### Security (#8357 — mTLS client certificate bound to agent identity)
 
 - New `AI_MEMORY_MTLS_AGENT_BINDING_MAP` binds each pinned client-certificate SHA-256 fingerprint to one agent id; `AI_MEMORY_MTLS_AGENT_BINDING=off|warn|enforce` (default `enforce` with a map, `off` without) refuses a differing `X-Agent-Id` with `403 agent_id_certificate_mismatch` or serves the request as the certificate's agent, and writes a forensic audit row for every mismatch. Under `enforce` the certificate also wins over an enrolled per-agent api key for a different agent (refused `403 agent_id_certificate_mismatch`, header present or not), and an allowlisted certificate that is not in the map cannot claim an agent id the map binds (refused the same way on every route; an unbound claimed id is kept). An explicit `warn` or `enforce` with no map refuses boot. With a map, a `/api/v1/sync/*` peer certificate must map to an agent, which becomes the caller id. Boot refuses a bad map or a map without `--mtls-allowlist`; `ai-memory serve --check` prints the parsed map. Details: `changelog.d/8357.security.md`.
@@ -2847,15 +2864,6 @@ write is permission-evaluated as; see the operator note below.
   already-existing edge reports the level that is actually STORED on the row
   rather than the signature level it computed but never persisted (the write
   is an `INSERT OR IGNORE` no-op).
-- **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
-  Both CLI recall paths wrote `--as-agent` (a namespace) into
-  `recall_observations.agent_id`: `src/cli/recall.rs` passed
-  `args.as_agent`, and the interactive shell passed `None`. The #1705
-  cross-agent replay guard keys on that column (`agent_id IS NULL OR agent_id
-  = ?`), so it was inert on both paths — a namespace cannot gate an identity.
-  Both now bind `resolve_read_visibility_caller()`, the same value the MCP/HTTP
-  writer stamps. `--as-agent` remains the namespace-scope visibility knob.
-
 ### Security
 
 - **#3192 — single-row `delete` wrote no `forget_tombstone` and did not crypto-erase, so every MCP `memory_delete` / HTTP DELETE / inbound federation `deletions[]` was LWW-resurrectable.** `db::delete` (`delete_inner`) now reuses the existing `tombstone_and_erase` primitive (the same helper `gc` / `size_gc` already call via `evict_tombstone_and_erase`) *inside* the caller's transaction: forget-tombstone INSERT, envelope crypto-erase + attestation, `cid_genesis` scrub, DLQ/dedup remanence purge, then DELETE. `insert_if_newer`'s G30 resurrection guard therefore sees the tombstone and drops a fresher peer re-push. Postgres `PostgresStore::delete` and `apply_remote_deletion` share one `pg_hard_delete_in_tx` so the two funnels cannot drift. A delete of a never-seen id stays a no-op with no tombstone and no `namespace_meta` sever (probe-then-write). Delete also discards undelivered federation DLQ pushes for that memory. Tombstone `signature` is NULL when no daemon keypair is present (unsigned resurrection guard); refuse-under-enforced-posture is the shared rule with #3240 and must not fork here. The MCP/CLI erasure-outbox remains best-effort + infallible (documented contract; an outbox failure still WARNs and does not fail the local delete). Distinct from #3177 (pg gc).
@@ -4323,27 +4331,6 @@ backend and missing or divergently implemented on its twin). Pinned by
   (`ai-memory bench (ubuntu-latest)`, `Regenerate bench baseline (ubuntu-latest,
   median-of-3)`) true again without a rename, so no required-context churn.
 
-- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
-  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
-  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
-  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
-  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
-  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
-  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
-  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
-  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
-  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
-  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
-  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
-  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
-  branch protection must be updated to match. The `enterprise-fed` Check legs
-  absorb the old `Postgres feature gate` test run (now against the real cert tier);
-  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
-  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
-  `services: postgres:` blocks + per-PR pg image builds are removed (they would
-  delete real files on the persistent hosts; the native tier is always up).
-  JUnit-style durable test-result log artifacts are uploaded per leg.
-
 ### Fixed (data integrity: merge field-set coherence, long-tier permanence, archive identity, low-end schema guard; #2399 #2395 #2394 #2385 #2564)
 
 - **A fresh `long`-tier write that carried an `expires_at` was GC-reapable
@@ -5402,32 +5389,6 @@ truthful.
   `mcp::tests::chunkc_forget_invalid_tier_string_silently_dropped`, and the
   "silently falls through" arm of
   `mcp::tools::list::tests::filters_by_tier`.
-- **Record-stop enforcement no longer silently degrades at the SAL layer when
-  the sqlite DB path resolves through a symlink** (e.g. the macOS
-  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
-  the shared record-stop registry off the raw path passed to `open`, while the
-  actuator, the `db::` funnel gate, the status read and the open-time seed all
-  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
-  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
-  entry, so a write issued under an engaged stop fell through to the deeper
-  `db::` gate and surfaced `StoreError::Backend` instead of the intended
-  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
-  SAL 503 refusal contract. The gate now caches and keys off the connection's
-  resolved path at open, restoring one source of truth across every layer.
-  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
-  symlinked-open-path regression test pins it.
-- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
-  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
-  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
-  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
-  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
-  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
-  regression the release `postgres-feature` job already fixed by raising its
-  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
-  legs on ONE host, so its ~2231s is the normal max-contention case). The
-  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
-  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
-  the outer job cap — remains what fires on a genuine hang.
 ### Fixed (cross-backend parity — write funnels: archive / delete / update)
 
 A parity audit of the sqlite and postgres write funnels found four

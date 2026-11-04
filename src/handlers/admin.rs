@@ -358,7 +358,7 @@ const BIND_PRINCIPAL_GATE: crate::handlers::admin_role::PrincipalGate =
 /// then the path id is validated (400, nothing audited: #8536), then the
 /// shared key-bound principal gate, which writes the deny row for a claimed
 /// admin. Nothing is bound on a refusal.
-fn require_bind_principal(
+async fn require_bind_principal(
     app: &AppState,
     headers: &IdentityHeaders,
     agent_id: &str,
@@ -377,7 +377,8 @@ fn require_bind_principal(
         &caller,
         agent_id,
         &BIND_PRINCIPAL_GATE,
-    )?;
+    )
+    .await?;
     Ok(caller)
 }
 
@@ -387,7 +388,7 @@ pub async fn bind_agent_pubkey(
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyBody>,
 ) -> impl IntoResponse {
-    let caller = match require_bind_principal(&app, &headers, &agent_id) {
+    let caller = match require_bind_principal(&app, &headers, &agent_id).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -635,7 +636,7 @@ pub async fn bind_agent_pubkey_challenge(
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyChallengeBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = require_bind_principal(&app, &headers, &agent_id) {
+    if let Err(resp) = require_bind_principal(&app, &headers, &agent_id).await {
         return resp;
     }
     if let Err(e) = validate::validate_agent_pubkey_b64(&body.pubkey_b64) {

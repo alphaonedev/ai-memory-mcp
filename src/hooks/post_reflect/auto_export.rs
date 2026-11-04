@@ -234,7 +234,7 @@ pub fn run_auto_export(
         ));
     std::fs::create_dir_all(&ns_dir)?;
     let path = ns_dir.join(format!("{}.{}", mem.id, config.format.extension()));
-    std::fs::write(&path, payload)?;
+    export_reflections::write_private_export(&path, payload.as_bytes())?;
     Ok(())
 }
 
