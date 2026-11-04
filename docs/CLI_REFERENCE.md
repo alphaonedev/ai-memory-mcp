@@ -1441,7 +1441,13 @@ Walks the reflection-chain and writes Markdown to
 
 On Unix, CLI and automatic reflection exports create plaintext files with mode
 0600 through a synced, same-directory staging file and atomic replacement of an
-existing regular file, refusing symlink and non-regular destinations.
+existing regular file, refusing symlink and non-regular destinations; the parent
+directory is then synced, and a sync error is reported without removing the
+published file. Before each export, regular `.private-export-*.stage` files older
+than one hour are removed; cleanup errors emit a warning and do not stop export.
+Non-Unix platforms refuse filesystem reflection export because the private-file
+and directory-sync guarantees are unsupported: the CLI returns an error, while
+auto-export logs a warning and writes nothing.
 
 ### `persona` — QW-2 persona-as-artifact
 
