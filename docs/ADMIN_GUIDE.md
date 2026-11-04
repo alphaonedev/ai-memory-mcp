@@ -1382,13 +1382,13 @@ per-agent key and so satisfy the bind gate. The route requires either an admin
 presenting its own enrolled per-agent key, or the explicit operator opt-in
 `AI_MEMORY_ADMIN_HEADER_TRUST=1`. **Bootstrapping the first admin key** (the
 supported path is the local-operator CLI on the data-tier host, which is
-ungated): write the token to an owner-only file and enrol it from that file.
+ungated): write the token (at least 32 bytes) to an owner-only file and enrol it from that file.
 The CLI refuses a token on argv (`--token`, #3781) because argv is
 world-readable via `/proc/<pid>/cmdline`:
 
 ```bash
 umask 077
-openssl rand -hex 32 > /etc/ai-memory/admin-key.token   # at least 32 bytes
+openssl rand -hex 32 > /etc/ai-memory/admin-key.token
 ai-memory agents bind-api-key --agent-id <admin> \
   --token-file /etc/ai-memory/admin-key.token
 ```
