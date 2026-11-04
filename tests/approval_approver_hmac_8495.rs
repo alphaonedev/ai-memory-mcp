@@ -1286,6 +1286,67 @@ async fn execute_arms_are_owner_gated_sqlite_8564() {
     execute_arms_are_owner_gated("sqlite", &store, &unstamp).await;
 }
 
+/// #8495 r4 Option C (3-agent vote (6def5ab6)): the caller's context decides.
+/// A bypass context (the federated decide path after its peer-scope check)
+/// executes an approved delete / tier bump of a stamped row owned by another
+/// agent; a tenant context executing the same approved action is refused and
+/// the row stays.
+async fn execute_honours_the_callers_context(
+    label: &str,
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+) {
+    use ai_memory::models::Tier;
+    use ai_memory::store::{CallerContext, GovernedAction, StoreError};
+    let admin = CallerContext::for_admin("ai:operator-8577");
+    let tenant = CallerContext::for_agent("ai:other-tenant-8577".to_string());
+    for (action, tier) in [
+        (GovernedAction::Delete, Tier::Long),
+        (GovernedAction::Promote, Tier::Mid),
+    ] {
+        let (pid, mid) =
+            seed_approved_8564(store, OTHER_OWNER_8564, tier.clone(), action, None).await;
+        let err = store
+            .execute_pending_action(&tenant, &pid)
+            .await
+            .expect_err("a tenant context is gated on the row owner");
+        assert!(
+            matches!(err, StoreError::PermissionDenied { .. }),
+            "{label}: tenant refused: {err:?}"
+        );
+        assert_eq!(
+            store.get(&admin, &mid).await.expect("row remains").tier,
+            tier,
+            "{label}: the refused row is unchanged"
+        );
+        let executed = store
+            .execute_pending_action(&admin, &pid)
+            .await
+            .expect("a bypass context executes the approved action");
+        assert_eq!(executed.as_deref(), Some(mid.as_str()), "{label}");
+        match action {
+            GovernedAction::Delete => assert!(
+                store.get(&admin, &mid).await.is_err(),
+                "{label}: the bypass execute deleted the row"
+            ),
+            _ => assert_eq!(
+                store.get(&admin, &mid).await.expect("promoted row").tier,
+                Tier::Long,
+                "{label}: the bypass execute bumped the row"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn execute_honours_the_callers_context_sqlite_8577() {
+    let _g = LOCK_8495.lock().await;
+    let file = NamedTempFile::new().expect("tempfile");
+    let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
+        ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("open SqliteStore"),
+    );
+    execute_honours_the_callers_context("sqlite", &store).await;
+}
+
 // ---------------------------------------------------------------------------
 // (4) postgres parity on a live PostgresStore (skip when no URL is set)
 // ---------------------------------------------------------------------------
@@ -1598,5 +1659,21 @@ mod live_pg {
                 })
             };
         super::execute_arms_are_owner_gated("live pg", &store, &unstamp).await;
+    }
+
+    /// #8495 r4 Option C: the same context cell on a live `PostgresStore`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_execute_honours_the_callers_context_8577() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_execute_honours_the_callers_context_8577: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        super::execute_honours_the_callers_context("live pg", &store).await;
     }
 }
