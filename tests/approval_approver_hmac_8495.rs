@@ -1,0 +1,1921 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #8495 (umbrella #8493, control finding C) — the K10 approval decide
+//! signature must commit to WHO is deciding, not only to which row.
+//!
+//! Pre-fix the decide HMAC covered `<ts>.<METHOD>.<pending_id>.<body>`. The
+//! approver came from the `X-Agent-Id` header beside it, outside the signed
+//! bytes, so a signed decide could be re-attributed to another approver and
+//! one holder of the server-wide secret could cast votes under N names.
+//!
+//! The fix is the signed-subject layout v2,
+//! `<ts>.<METHOD>.<pending_id>@<approver>.<body>`, copied from the api-key
+//! approval route (`handlers::agent_api_key::approval_subject`). A v1 signature
+//! that still verifies is reported as `legacy_unbound_approver` and refused;
+//! it is never counted as a bound approver.
+//!
+//! Pins, on the sqlite branch AND on the postgres branch of the handler (the
+//! fake-pg harness of `tests/k10_approval_postgres_dispatch_1618.rs`, plus a
+//! live `PostgresStore` module under `sal-postgres`):
+//!   1. a signature minted for approver X does not verify when the request
+//!      names approver Y (tampered approver field);
+//!   2. a decide as X records X as the decider, and the same signed bytes
+//!      presented as Y are refused;
+//!   3. a v1 (approver-unbound) signature is refused as
+//!      `legacy_unbound_approver`, not accepted;
+//!   4. under the `enforce` identity posture, one shared credential cannot
+//!      fill a 2-of-N consensus quorum by naming two approvers, while two
+//!      key-attested approvers can.
+//!
+//! The governance twin `POST /api/v1/pending/{id}/approve|reject` shares the
+//! verifier and is pinned for (2) and (3).
+
+#![cfg(feature = "sal")]
+#![allow(clippy::await_holding_lock)]
+#![allow(clippy::too_many_lines)]
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ai_memory::config::{HttpIdentityMode, set_active_hooks_hmac_secret};
+use ai_memory::handlers::agent_api_key::approval_subject;
+use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
+use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::{Value, json};
+use tempfile::NamedTempFile;
+use tower::ServiceExt as _;
+
+mod common;
+
+/// The HMAC secret is process-global state; every test in this binary
+/// takes this lock (same idiom as `tests/k10_approval_http.rs`).
+static LOCK_8495: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const SECRET: &str = "approval-approver-hmac-8495-secret";
+const SHARED_KEY: &str = "shared-transport-key-8495";
+const ALICE_KEY: &str = "alice-per-agent-key-8495";
+const BOB_KEY: &str = "bob-per-agent-key-8495";
+const REQUESTER: &str = "requester-8495";
+const APPROVER_X: &str = "approver-x-8495";
+const APPROVER_Y: &str = "approver-y-8495";
+const LEGACY_UNBOUND_APPROVER: &str = "legacy_unbound_approver";
+
+#[derive(Clone, Copy, Debug)]
+enum Backend {
+    /// `storage_backend = Sqlite`: the handler's rusqlite branch.
+    Sqlite,
+    /// `storage_backend = Postgres` over a `SqliteStore`: the handler's
+    /// SAL-trait (postgres) branch, as in the #1618 dispatch test.
+    FakePostgres,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Posture {
+    /// v1.0.0 default: advisory, zero enrolled per-agent keys.
+    Default,
+    /// `enforce` with alice and bob enrolled; transport needs `SHARED_KEY`
+    /// or a per-agent key.
+    EnforceWithKeys,
+}
+
+struct Harness {
+    router: axum::Router,
+    db_path: PathBuf,
+    _file: NamedTempFile,
+}
+
+fn build(backend: Backend, posture: Posture) -> Harness {
+    let file = NamedTempFile::new().expect("tempfile");
+    let db_path = file.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("db::open");
+    let db: Db = Arc::new(tokio::sync::Mutex::new((
+        conn,
+        db_path.clone(),
+        ai_memory::config::ResolvedTtl::default(),
+        true,
+    )));
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let (enrolled, mode, key) = match posture {
+        Posture::Default => (
+            Arc::new(EnrolledAgentKeys::empty()),
+            HttpIdentityMode::default(),
+            None,
+        ),
+        Posture::EnforceWithKeys => {
+            let mut map = HashMap::new();
+            map.insert(api_key_sha256_hex(ALICE_KEY), "alice".to_string());
+            map.insert(api_key_sha256_hex(BOB_KEY), "bob".to_string());
+            (
+                Arc::new(EnrolledAgentKeys::from_map(map)),
+                HttpIdentityMode::Enforce,
+                Some(SHARED_KEY.to_string()),
+            )
+        }
+    };
+    let storage_backend = match backend {
+        Backend::Sqlite => StorageBackend::Sqlite,
+        Backend::FakePostgres => StorageBackend::Postgres,
+    };
+    let app_state = AppState {
+        db,
+        embedder: Arc::new(None),
+        vector_index: Arc::new(tokio::sync::Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(ai_memory::config::FeatureTier::Keyword.config()),
+        scoring: Arc::new(ai_memory::config::ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+        storage_backend,
+        store,
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        auto_tag_queue: None,
+        atomise_queue: None,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
+        rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: enrolled.clone(),
+        http_identity_mode: mode,
+    };
+    let api_key_state = ApiKeyState {
+        key,
+        mtls_enforced: false,
+        enrolled_agent_keys: enrolled,
+        identity_mode: mode,
+        ..Default::default()
+    };
+    Harness {
+        router: ai_memory::build_router(api_key_state, app_state),
+        db_path,
+        _file: file,
+    }
+}
+
+/// Seed a memory plus a delete-shaped pending row targeting it, and
+/// register the approvers the tests decide as.
+fn seed_delete_pending(db_path: &Path, namespace: &str) -> String {
+    let conn = ai_memory::db::open(db_path).expect("open seed conn");
+    let mem = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: namespace.to_string(),
+        title: format!("t-8495-{}", uuid::Uuid::new_v4()),
+        content: "seeded by the #8495 approver-binding test".into(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({"agent_id": REQUESTER}),
+        version: 1,
+        ..ai_memory::models::Memory::default()
+    };
+    let mem_id = ai_memory::db::insert(&conn, &mem).expect("insert memory");
+    for agent in [APPROVER_X, APPROVER_Y, "alice", "bob"] {
+        ai_memory::db::register_agent(&conn, agent, "ai:generic", &[]).ok();
+    }
+    ai_memory::db::queue_pending_action(
+        &conn,
+        ai_memory::models::GovernedAction::Delete,
+        namespace,
+        Some(&mem_id),
+        REQUESTER,
+        &json!({"reason": "8495"}),
+    )
+    .expect("queue_pending_action")
+}
+
+/// Seed a store-shaped pending row in a namespace whose standard requires a
+/// 2-of-N consensus.
+fn seed_consensus_pending(db_path: &Path, namespace: &str) -> String {
+    let conn = ai_memory::db::open(db_path).expect("open seed conn");
+    let standard = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: namespace.to_string(),
+        title: format!("{namespace}-standard"),
+        content: "policy".into(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({"governance": {
+            "write": "approve", "promote": "any", "delete": "owner",
+            "approver": {"consensus": 2}
+        }}),
+        version: 1,
+        ..ai_memory::models::Memory::default()
+    };
+    let standard_id = ai_memory::db::insert(&conn, &standard).expect("insert standard");
+    ai_memory::db::set_namespace_standard(&conn, namespace, &standard_id, None)
+        .expect("set_namespace_standard");
+    for agent in ["alice", "bob"] {
+        ai_memory::db::register_agent(&conn, agent, "ai:generic", &[]).ok();
+    }
+    let target = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: format!("{namespace}-target-{}", uuid::Uuid::new_v4()),
+        content: "deleted once two approvers agree".into(),
+        metadata: json!({"agent_id": REQUESTER}),
+        ..standard
+    };
+    let target_id = ai_memory::db::insert(&conn, &target).expect("insert target");
+    ai_memory::db::queue_pending_action(
+        &conn,
+        ai_memory::models::GovernedAction::Delete,
+        namespace,
+        Some(&target_id),
+        REQUESTER,
+        &json!({"reason": "quorum-8495"}),
+    )
+    .expect("queue_pending_action")
+}
+
+fn pending_row(db_path: &Path, pending_id: &str) -> ai_memory::models::PendingAction {
+    let conn = ai_memory::db::open(db_path).expect("reopen");
+    ai_memory::db::get_pending_action(&conn, pending_id)
+        .expect("get_pending_action")
+        .expect("pending row exists")
+}
+
+/// v2 envelope: the approver is inside the signed subject.
+fn sign_v2(ts: &str, path_id: &str, approver: &str, body: &str) -> String {
+    common::sign_canonical_envelope(
+        SECRET,
+        ts,
+        "POST",
+        &approval_subject(path_id, approver),
+        body,
+    )
+}
+
+/// v1 envelope: the pre-#8495 layout, approver outside the signed bytes.
+fn sign_v1(ts: &str, path_id: &str, body: &str) -> String {
+    common::sign_canonical_envelope(SECRET, ts, "POST", path_id, body)
+}
+
+fn now_ts() -> String {
+    chrono::Utc::now().timestamp().to_string()
+}
+
+fn request(
+    uri: &str,
+    ts: &str,
+    sig: &str,
+    agent: &str,
+    api_key: Option<&str>,
+    body: &str,
+) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-ai-memory-timestamp", ts)
+        .header("x-ai-memory-signature", sig)
+        .header("x-agent-id", agent);
+    if let Some(k) = api_key {
+        b = b.header("x-api-key", k);
+    }
+    b.body(Body::from(body.to_string())).expect("request")
+}
+
+async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = router.clone().oneshot(req).await.expect("oneshot");
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn approve_body() -> String {
+    json!({"decision": "approve", "remember": "once"}).to_string()
+}
+
+fn decide_uri(pending_id: &str) -> String {
+    format!("/api/v1/approvals/{pending_id}")
+}
+
+// ---------------------------------------------------------------------------
+// (1) tampered approver field
+// ---------------------------------------------------------------------------
+
+async fn tampered_approver_fails_verification(backend: Backend) {
+    let h = build(backend, Posture::Default);
+    let pid = seed_delete_pending(&h.db_path, "ns-8495-tamper");
+    let body = approve_body();
+    let ts = now_ts();
+    let sig_for_x = sign_v2(&ts, &pid, APPROVER_X, &body);
+
+    // The signature names X; the request names Y. Refused, row untouched.
+    let (status, v) = send(
+        &h.router,
+        request(&decide_uri(&pid), &ts, &sig_for_x, APPROVER_Y, None, &body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{backend:?}: an approver swapped after signing must not verify; body={v}"
+    );
+    assert_eq!(pending_row(&h.db_path, &pid).status, "pending");
+
+    // Positive control: the same signature with the approver it names
+    // verifies and decides.
+    let (status, v) = send(
+        &h.router,
+        request(&decide_uri(&pid), &ts, &sig_for_x, APPROVER_X, None, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{backend:?}: body={v}");
+    assert_eq!(v["approved"], json!(true), "{backend:?}: body={v}");
+}
+
+#[tokio::test]
+async fn tampered_approver_fails_verification_sqlite_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    tampered_approver_fails_verification(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn tampered_approver_fails_verification_postgres_branch_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    tampered_approver_fails_verification(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// (2) decide as X binds X; the same bytes as Y are refused
+// ---------------------------------------------------------------------------
+
+async fn decide_binds_the_signing_approver(backend: Backend, deny: bool) {
+    let h = build(backend, Posture::Default);
+    let pid = seed_delete_pending(&h.db_path, "ns-8495-bind");
+    let body = if deny {
+        json!({"decision": "deny", "remember": "once"}).to_string()
+    } else {
+        approve_body()
+    };
+    let ts = now_ts();
+    let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+
+    // Presented as Y FIRST, so the refusal cannot be the replay cache.
+    let (status, v) = send(
+        &h.router,
+        request(&decide_uri(&pid), &ts, &sig, APPROVER_Y, None, &body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{backend:?} deny={deny}: X's signature presented as Y must be refused; body={v}"
+    );
+
+    let (status, v) = send(
+        &h.router,
+        request(&decide_uri(&pid), &ts, &sig, APPROVER_X, None, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{backend:?} deny={deny}: body={v}");
+    assert_eq!(v["decided_by"], json!(APPROVER_X), "{backend:?}: body={v}");
+    let row = pending_row(&h.db_path, &pid);
+    assert_eq!(
+        row.decided_by.as_deref(),
+        Some(APPROVER_X),
+        "{backend:?} deny={deny}: the stored decision must name the signing approver"
+    );
+    assert_eq!(row.status, if deny { "rejected" } else { "approved" });
+}
+
+#[tokio::test]
+async fn decide_binds_the_signing_approver_sqlite_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    decide_binds_the_signing_approver(Backend::Sqlite, false).await;
+    decide_binds_the_signing_approver(Backend::Sqlite, true).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn decide_binds_the_signing_approver_postgres_branch_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    decide_binds_the_signing_approver(Backend::FakePostgres, false).await;
+    decide_binds_the_signing_approver(Backend::FakePostgres, true).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// (3) a v1 signature is legacy_unbound_approver, never a bound approval
+// ---------------------------------------------------------------------------
+
+async fn legacy_v1_signature_is_reported_unbound(backend: Backend) {
+    let h = build(backend, Posture::Default);
+    let pid = seed_delete_pending(&h.db_path, "ns-8495-legacy");
+    let body = approve_body();
+    let ts = now_ts();
+    let (status, v) = send(
+        &h.router,
+        request(
+            &decide_uri(&pid),
+            &ts,
+            &sign_v1(&ts, &pid, &body),
+            APPROVER_X,
+            None,
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{backend:?}: body={v}");
+    assert_eq!(
+        v["error"],
+        json!(LEGACY_UNBOUND_APPROVER),
+        "{backend:?}: a v1 signature must be reported as unbound; body={v}"
+    );
+    assert_eq!(
+        v["signature_layout_version"],
+        json!(2),
+        "{backend:?}: body={v}"
+    );
+    let row = pending_row(&h.db_path, &pid);
+    assert_eq!(row.status, "pending", "{backend:?}: nothing decided");
+    assert!(
+        row.decided_by.is_none(),
+        "{backend:?}: no approver recorded"
+    );
+}
+
+#[tokio::test]
+async fn legacy_v1_signature_is_reported_unbound_sqlite_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    legacy_v1_signature_is_reported_unbound(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn legacy_v1_signature_is_reported_unbound_postgres_branch_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    legacy_v1_signature_is_reported_unbound(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// (4) one shared credential cannot fill a 2-of-N quorum under enforce
+// ---------------------------------------------------------------------------
+
+async fn one_credential_cannot_fill_a_quorum(backend: Backend) {
+    let h = build(backend, Posture::EnforceWithKeys);
+    let pid = seed_consensus_pending(&h.db_path, "ns-8495-quorum");
+    let body = approve_body();
+
+    // One secret, one shared transport key, two approver names — each
+    // signature correctly binds the name it presents.
+    let refused_secs = chrono::Utc::now().timestamp();
+    for name in ["alice", "bob"] {
+        let ts = refused_secs.to_string();
+        let (status, v) = send(
+            &h.router,
+            request(
+                &decide_uri(&pid),
+                &ts,
+                &sign_v2(&ts, &pid, name, &body),
+                name,
+                Some(SHARED_KEY),
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{backend:?}: a shared-key vote as {name} must be refused under enforce; body={v}"
+        );
+    }
+    let row = pending_row(&h.db_path, &pid);
+    assert_eq!(row.status, "pending", "{backend:?}: quorum must not be met");
+    assert!(
+        row.approvals.is_empty(),
+        "{backend:?}: no vote may be recorded"
+    );
+
+    // Positive control: two key-attested approvers do meet the quorum.
+    // The refused alice vote above passed the signature check, so its
+    // nonce is spent; sign one second before it so this is a fresh signature
+    // inside the replay window rather than a replay of that one.
+    let ts = (refused_secs - 1).to_string();
+    let (status, v) = send(
+        &h.router,
+        request(
+            &decide_uri(&pid),
+            &ts,
+            &sign_v2(&ts, &pid, "alice", &body),
+            "alice",
+            Some(ALICE_KEY),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{backend:?}: body={v}");
+    assert_eq!(v["votes"], json!(1), "{backend:?}: body={v}");
+    assert_eq!(v["quorum"], json!(2), "{backend:?}: body={v}");
+    let ts = (refused_secs - 1).to_string();
+    let (status, v) = send(
+        &h.router,
+        request(
+            &decide_uri(&pid),
+            &ts,
+            &sign_v2(&ts, &pid, "bob", &body),
+            "bob",
+            Some(BOB_KEY),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{backend:?}: body={v}");
+    assert_eq!(v["approved"], json!(true), "{backend:?}: body={v}");
+}
+
+#[tokio::test]
+async fn one_credential_cannot_fill_a_quorum_sqlite_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    one_credential_cannot_fill_a_quorum(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn one_credential_cannot_fill_a_quorum_postgres_branch_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    one_credential_cannot_fill_a_quorum(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// Governance twin: POST /api/v1/pending/{id}/approve|reject
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn governance_pending_routes_bind_the_approver_8495() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    for backend in [Backend::Sqlite, Backend::FakePostgres] {
+        for verb in ["approve", "reject"] {
+            let h = build(backend, Posture::Default);
+            let pid = seed_delete_pending(&h.db_path, "ns-8495-gov");
+            let uri = format!("/api/v1/pending/{pid}/{verb}");
+            let body = String::new();
+
+            // (3) a v1 signature is legacy_unbound_approver.
+            let ts = now_ts();
+            let (status, v) = send(
+                &h.router,
+                request(
+                    &uri,
+                    &ts,
+                    &sign_v1(&ts, &pid, &body),
+                    APPROVER_X,
+                    None,
+                    &body,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{backend:?} {verb}: {v}");
+            assert_eq!(
+                v["error"],
+                json!(LEGACY_UNBOUND_APPROVER),
+                "{backend:?} {verb}: {v}"
+            );
+
+            // (2) X's signature presented as Y is refused; as X it decides.
+            let ts = now_ts();
+            let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+            let (status, v) =
+                send(&h.router, request(&uri, &ts, &sig, APPROVER_Y, None, &body)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{backend:?} {verb}: {v}");
+            let (status, v) =
+                send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+            assert_eq!(status, StatusCode::OK, "{backend:?} {verb}: {v}");
+            let row = pending_row(&h.db_path, &pid);
+            assert_eq!(
+                row.decided_by.as_deref(),
+                Some(APPROVER_X),
+                "{backend:?} {verb}"
+            );
+        }
+    }
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// (5) #8546 — the layout 2 subject is injective: the approver cannot be
+//     shifted into the body
+// ---------------------------------------------------------------------------
+
+/// The approver the shift case signs for: `APPROVER_X` plus a `.`-suffix,
+/// legal inside an agent id (`validate_agent_id` admits `.`). The suffix is
+/// digits so the shifted body still parses as JSON (`1.5`) and so reaches
+/// the HMAC check on every decide route instead of a body-shape 400.
+const SHIFTED_SIGNER: &str = "approver-x-8495.1";
+/// The body the shift case signs.
+const SHIFTED_SIGNED_BODY: &str = "5";
+/// The body the shift case presents: the approver's `.1` suffix moved into it.
+const SHIFTED_PRESENTED_BODY: &str = "1.5";
+
+/// The three decide routes that verify through `verify_approver_bound_hmac`.
+fn decide_routes(pid: &str) -> [(&'static str, String); 3] {
+    [
+        ("approval_decide", decide_uri(pid)),
+        ("approve_pending", format!("/api/v1/pending/{pid}/approve")),
+        ("reject_pending", format!("/api/v1/pending/{pid}/reject")),
+    ]
+}
+
+/// A signature minted for `x.1` over body `5` must not verify as approver `x`
+/// with body `1.5`: before #8546 both requests hashed the same bytes.
+async fn shifted_approver_is_refused(backend: Backend) {
+    for (endpoint, _) in decide_routes("") {
+        let h = build(backend, Posture::Default);
+        let pid = seed_delete_pending(&h.db_path, "ns-8546-shift");
+        let uri = decide_routes(&pid)
+            .into_iter()
+            .find(|(e, _)| *e == endpoint)
+            .map(|(_, u)| u)
+            .expect("route");
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, SHIFTED_SIGNER, SHIFTED_SIGNED_BODY);
+        let (status, v) = send(
+            &h.router,
+            request(&uri, &ts, &sig, APPROVER_X, None, SHIFTED_PRESENTED_BODY),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint}: a signature for {SHIFTED_SIGNER} must not verify as \
+             {APPROVER_X}; body={v}"
+        );
+        let row = pending_row(&h.db_path, &pid);
+        assert_eq!(row.status, "pending", "{backend:?} {endpoint}");
+        assert_eq!(row.decided_by, None, "{backend:?} {endpoint}");
+    }
+}
+
+#[tokio::test]
+async fn shifted_approver_is_refused_sqlite_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    shifted_approver_is_refused(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn shifted_approver_is_refused_postgres_branch_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    shifted_approver_is_refused(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+/// The signed subject is length-prefixed, so it is the same bytes for the
+/// signer and the verifier and different bytes for every other split.
+#[test]
+fn approval_subject_is_length_prefixed_8546() {
+    assert_eq!(
+        approval_subject("p-1", "x.1"),
+        "3:p-1@3:x.1",
+        "pending id and approver are each prefixed with their byte length"
+    );
+    assert_ne!(
+        format!(
+            "{}.{SHIFTED_SIGNED_BODY}",
+            approval_subject("p", SHIFTED_SIGNER)
+        ),
+        format!(
+            "{}.{SHIFTED_PRESENTED_BODY}",
+            approval_subject("p", APPROVER_X)
+        ),
+    );
+}
+
+/// The governance verbs refuse a non-empty body that is not JSON with 400
+/// BEFORE the HMAC is verified, so a captured signature is never spent on a
+/// malformed body and a shifted body is never read as "no approvals".
+async fn non_json_governance_body_is_refused(backend: Backend) {
+    for verb in ["approve", "reject"] {
+        let h = build(backend, Posture::Default);
+        let pid = seed_delete_pending(&h.db_path, "ns-8546-body");
+        let uri = format!("/api/v1/pending/{pid}/{verb}");
+        let body = "ops.";
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, APPROVER_X, body);
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, body)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{backend:?} {verb}: a non-JSON body must be refused; body={v}"
+        );
+        assert_eq!(
+            pending_row(&h.db_path, &pid).status,
+            "pending",
+            "{backend:?} {verb}"
+        );
+        // The refusal did not spend the nonce: the signature over the empty
+        // body made in the same second still decides.
+        let sig = sign_v2(&ts, &pid, APPROVER_X, "");
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, "")).await;
+        assert_eq!(status, StatusCode::OK, "{backend:?} {verb}: body={v}");
+    }
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_refused_sqlite_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_refused(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_refused_postgres_branch_8546() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_refused(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// (6) #8547 — every decide-route signature refusal writes one forensic row
+// ---------------------------------------------------------------------------
+
+/// The forensic kind every decide-route signature refusal is chained under.
+const SIGNATURE_REFUSAL_KIND: &str = "approval_decide_signature";
+
+fn forensic_scratch(tag: &str) -> tempfile::TempDir {
+    let root = PathBuf::from(".local-runs").join("approval-approver-hmac-8547");
+    std::fs::create_dir_all(&root).ok();
+    tempfile::Builder::new()
+        .prefix(tag)
+        .tempdir_in(&root)
+        .expect("tempdir under .local-runs")
+}
+
+/// Every forensic row written under `dir`, parsed.
+fn forensic_rows(dir: &Path) -> (String, Vec<Value>) {
+    let mut text = String::new();
+    for entry in std::fs::read_dir(dir).expect("read audit dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            text.push_str(&std::fs::read_to_string(&path).expect("read forensic file"));
+        }
+    }
+    let rows = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("forensic row is JSON"))
+        .collect();
+    (text, rows)
+}
+
+/// On each decide route: an approver mismatch, a v1 (unbound) signature, a
+/// stale timestamp and an exact replay are each refused with ONE forensic
+/// `refuse` row naming the presented agent and the pending id; the accepted
+/// decide in between writes no signature-refusal row. No row carries the
+/// signature or the secret.
+async fn signature_refusals_are_audited(backend: Backend) {
+    let audit_dir = forensic_scratch("refusals");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+    let mut signatures = Vec::new();
+    let mut expected: Vec<(String, String, &'static str, &'static str)> = Vec::new();
+    for endpoint in ["approval_decide", "approve_pending", "reject_pending"] {
+        let h = build(backend, Posture::Default);
+        let pid = seed_delete_pending(&h.db_path, "ns-8547-audit");
+        let (uri, body) = match endpoint {
+            "approval_decide" => (decide_uri(&pid), approve_body()),
+            "approve_pending" => (format!("/api/v1/pending/{pid}/approve"), String::new()),
+            _ => (format!("/api/v1/pending/{pid}/reject"), String::new()),
+        };
+
+        // Approver mismatch: X's signature presented by Y.
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_Y, None, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} mismatch: {v}"
+        );
+        expected.push((
+            APPROVER_Y.to_string(),
+            pid.clone(),
+            endpoint,
+            "invalid_signature",
+        ));
+
+        // v1 (approver-unbound) signature.
+        let sig = sign_v1(&ts, &pid, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} v1: {v}"
+        );
+        expected.push((
+            APPROVER_X.to_string(),
+            pid.clone(),
+            endpoint,
+            LEGACY_UNBOUND_APPROVER,
+        ));
+
+        // Stale timestamp.
+        let stale = (chrono::Utc::now().timestamp() - 86_400).to_string();
+        let sig = sign_v2(&stale, &pid, APPROVER_X, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(
+            &h.router,
+            request(&uri, &stale, &sig, APPROVER_X, None, &body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} stale: {v}"
+        );
+        expected.push((
+            APPROVER_X.to_string(),
+            pid.clone(),
+            endpoint,
+            "invalid_signature",
+        ));
+
+        // Accepted, then the exact request replayed.
+        let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+        signatures.push(sig.clone());
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+        assert_eq!(status, StatusCode::OK, "{backend:?} {endpoint} accept: {v}");
+        let (status, v) = send(&h.router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{backend:?} {endpoint} replay: {v}"
+        );
+        expected.push((
+            APPROVER_X.to_string(),
+            pid.clone(),
+            endpoint,
+            "invalid_signature",
+        ));
+    }
+    ai_memory::governance::audit::shutdown();
+
+    let (text, rows) = forensic_rows(audit_dir.path());
+    let refusals: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["kind"] == json!(SIGNATURE_REFUSAL_KIND))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        expected.len(),
+        "{backend:?}: one forensic row per refused decide, none for the accepted one; rows={rows:?}"
+    );
+    for (row, (actor, pid, endpoint, reason)) in refusals.iter().zip(&expected) {
+        assert_eq!(row["decision"], json!("refuse"), "{backend:?}: {row}");
+        assert_eq!(
+            row["payload"]["endpoint"],
+            json!(endpoint),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(row["actor"], json!(actor), "{backend:?}: {row}");
+        assert_eq!(
+            row["payload"]["pending_id"],
+            json!(pid),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(
+            row["payload"]["reason"],
+            json!(reason),
+            "{backend:?}: {row}"
+        );
+    }
+    assert!(
+        !text.contains(SECRET),
+        "{backend:?}: the HMAC secret reached the forensic chain"
+    );
+    for sig in &signatures {
+        assert!(
+            !text.contains(sig.as_str()),
+            "{backend:?}: a signature reached the forensic chain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn signature_refusals_are_audited_sqlite_8547() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    signature_refusals_are_audited(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn signature_refusals_are_audited_postgres_branch_8547() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    signature_refusals_are_audited(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// (7) #8563 — a non-JSON governance decide body writes one forensic row
+// ---------------------------------------------------------------------------
+
+/// The forensic `reason` of a non-JSON governance decide body (#8563).
+const NON_JSON_BODY_REASON: &str = "non_json_body";
+/// A body that is not JSON and is distinctive enough to search the chain for.
+const NON_JSON_BODY_8563: &str = "not-json-body-8563.";
+
+/// A decide request with no `X-Agent-Id` header (the anonymous actor).
+fn anonymous_request(uri: &str, ts: &str, sig: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-ai-memory-timestamp", ts)
+        .header("x-ai-memory-signature", sig)
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+/// On `approve_pending` and `reject_pending` a non-JSON body is refused with
+/// 400 and writes exactly ONE forensic `refuse` row (reason
+/// `non_json_body`, actor = the presented `X-Agent-Id` or the anonymous
+/// sentinel). `approval_decide` is unchanged: it verifies the signature
+/// first, so the signer's malformed body is its strict-parse 400 (no
+/// refusal row) and an anonymous request is a signature refusal.
+/// No row carries the body bytes, the signature or the secret.
+async fn non_json_governance_body_is_audited(backend: Backend) {
+    let audit_dir = forensic_scratch("non-json");
+    ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
+    let mut signatures = Vec::new();
+    let mut expected: Vec<(Option<&'static str>, String, &'static str, &'static str)> = Vec::new();
+    for (endpoint, _) in decide_routes("") {
+        for agent in [Some(APPROVER_X), None] {
+            let h = build(backend, Posture::Default);
+            let pid = seed_delete_pending(&h.db_path, "ns-8563-body");
+            let uri = decide_routes(&pid)
+                .into_iter()
+                .find(|(e, _)| *e == endpoint)
+                .map(|(_, u)| u)
+                .expect("route");
+            let ts = now_ts();
+            let sig = sign_v2(&ts, &pid, APPROVER_X, NON_JSON_BODY_8563);
+            signatures.push(sig.clone());
+            let req = match agent {
+                Some(a) => request(&uri, &ts, &sig, a, None, NON_JSON_BODY_8563),
+                None => anonymous_request(&uri, &ts, &sig, NON_JSON_BODY_8563),
+            };
+            let (status, v) = send(&h.router, req).await;
+            // approval_decide verifies first: the signer's own malformed body
+            // is its strict-parse 400 (no refusal row), and the anonymous
+            // request is an approver mismatch (one invalid_signature row).
+            let (want_status, reason) = match (endpoint, agent) {
+                ("approval_decide", Some(_)) => (StatusCode::BAD_REQUEST, None),
+                ("approval_decide", None) => (StatusCode::UNAUTHORIZED, Some("invalid_signature")),
+                _ => (StatusCode::BAD_REQUEST, Some(NON_JSON_BODY_REASON)),
+            };
+            assert_eq!(
+                status, want_status,
+                "{backend:?} {endpoint} agent={agent:?}: body={v}"
+            );
+            assert_eq!(
+                pending_row(&h.db_path, &pid).status,
+                "pending",
+                "{backend:?} {endpoint} agent={agent:?}"
+            );
+            if let Some(reason) = reason {
+                expected.push((agent, pid, endpoint, reason));
+            }
+        }
+    }
+    ai_memory::governance::audit::shutdown();
+
+    let (text, rows) = forensic_rows(audit_dir.path());
+    let refusals: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["kind"] == json!(SIGNATURE_REFUSAL_KIND))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        expected.len(),
+        "{backend:?}: one forensic row per refused non-JSON decide; rows={rows:?}"
+    );
+    for (row, (agent, pid, endpoint, reason)) in refusals.iter().zip(&expected) {
+        assert_eq!(row["decision"], json!("refuse"), "{backend:?}: {row}");
+        assert_eq!(
+            row["payload"]["endpoint"],
+            json!(endpoint),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(
+            row["payload"]["pending_id"],
+            json!(pid),
+            "{backend:?}: {row}"
+        );
+        assert_eq!(
+            row["payload"]["reason"],
+            json!(reason),
+            "{backend:?}: {row}"
+        );
+        let actor = row["actor"].as_str().unwrap_or_default();
+        match agent {
+            Some(a) => assert_eq!(actor, *a, "{backend:?}: {row}"),
+            None => assert!(
+                actor.starts_with("anonymous"),
+                "{backend:?}: a request with no X-Agent-Id is the anonymous actor: {row}"
+            ),
+        }
+    }
+    assert!(
+        !text.contains(NON_JSON_BODY_8563),
+        "{backend:?}: the refused body reached the forensic chain"
+    );
+    assert!(
+        !text.contains(SECRET),
+        "{backend:?}: the HMAC secret reached the forensic chain"
+    );
+    for sig in &signatures {
+        assert!(
+            !text.contains(sig.as_str()),
+            "{backend:?}: a signature reached the forensic chain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_audited_sqlite_8563() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_audited(Backend::Sqlite).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn non_json_governance_body_is_audited_postgres_branch_8563() {
+    let _g = LOCK_8495.lock().await;
+    set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+    non_json_governance_body_is_audited(Backend::FakePostgres).await;
+    set_active_hooks_hmac_secret(None);
+}
+
+// ---------------------------------------------------------------------------
+// (8) #8564 — the approved delete / tier-bump promote execute arms run under
+//     the requester's owner gate on every backend
+// ---------------------------------------------------------------------------
+
+/// The owner of the row the requester asks to have deleted or promoted.
+const OTHER_OWNER_8564: &str = "other-owner-8564";
+
+/// Strip the owner stamp of one memory (backend-specific raw write; the
+/// store funnels stamp every row they write).
+type Unstamp<'a> =
+    &'a (dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Sync);
+
+/// Store a memory owned by `owner` at `tier` and queue `action` on it as
+/// `REQUESTER`, then approve it as `APPROVER_X`. Returns
+/// `(pending_id, memory_id)`.
+async fn seed_approved_8564(
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    owner: &str,
+    tier: ai_memory::models::Tier,
+    action: ai_memory::store::GovernedAction,
+    unstamp: Option<Unstamp<'_>>,
+) -> (String, String) {
+    use ai_memory::store::CallerContext;
+    let owner_ctx = CallerContext::for_agent(owner.to_string());
+    let ns = format!("ns-8564-{}", uuid::Uuid::new_v4().simple());
+    let mem = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier,
+        namespace: ns.clone(),
+        title: format!("t-8564-{}", uuid::Uuid::new_v4()),
+        content: "seeded by the #8564 execute owner-gate test".into(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({"agent_id": owner}),
+        version: 1,
+        ..ai_memory::models::Memory::default()
+    };
+    let mem_id = store.store(&owner_ctx, &mem).await.expect("store memory");
+    if let Some(unstamp) = unstamp {
+        unstamp(mem_id.clone()).await;
+    }
+    let requester = CallerContext::for_agent(REQUESTER.to_string());
+    let now = chrono::Utc::now().to_rfc3339();
+    store
+        .register_agent(
+            &requester,
+            &ai_memory::models::AgentRegistration {
+                agent_id: APPROVER_X.to_string(),
+                agent_type: "ai:generic".to_string(),
+                capabilities: Vec::new(),
+                registered_at: now.clone(),
+                last_seen_at: now,
+            },
+        )
+        .await
+        .ok();
+    let pid = store
+        .queue_pending_action(
+            &requester,
+            action,
+            &ns,
+            Some(&mem_id),
+            REQUESTER,
+            &json!({"reason": "8564"}),
+        )
+        .await
+        .expect("queue_pending_action");
+    // #8577: a tenant decide on a row the requester does not own is now
+    // refused at decide time, so the already-approved state the execute-gate
+    // cells need is reached through a bypass context (the federated decide).
+    let approver = CallerContext::for_admin("ai:operator-8564");
+    let outcome = store
+        .approve_with_approver_type(&approver, &pid, APPROVER_X)
+        .await
+        .expect("approve");
+    assert!(
+        matches!(outcome, ai_memory::store::ApproveOutcome::Approved),
+        "approve: {outcome:?}"
+    );
+    (pid, mem_id)
+}
+
+/// An approved delete and an approved tier-bump promote execute only on a
+/// row the REQUESTER owns: another agent's row and an unstamped row are
+/// refused with `PermissionDenied` naming the gated verb and the row, and
+/// the row is left exactly as it was.
+async fn execute_arms_are_owner_gated(
+    label: &str,
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    unstamp: Unstamp<'_>,
+) {
+    use ai_memory::models::Tier;
+    use ai_memory::store::{CallerContext, GovernedAction, StoreError};
+    let approver = CallerContext::for_agent(APPROVER_X.to_string());
+    let admin = CallerContext::for_admin("ai:operator-8564");
+    for (action, tier, verb) in [
+        (GovernedAction::Delete, Tier::Long, "delete"),
+        (GovernedAction::Promote, Tier::Mid, "update"),
+    ] {
+        for (case, owner, strip) in [
+            ("other owner", OTHER_OWNER_8564, false),
+            ("unstamped", REQUESTER, true),
+        ] {
+            let (pid, mid) =
+                seed_approved_8564(store, owner, tier.clone(), action, strip.then_some(unstamp))
+                    .await;
+            let err = store
+                .execute_pending_action(&approver, &pid)
+                .await
+                .expect_err("an approved action on a row the requester does not own is refused");
+            match &err {
+                StoreError::PermissionDenied {
+                    action: refused,
+                    target,
+                    reason,
+                } => {
+                    assert_eq!(refused, verb, "{label} {verb} {case}: {err}");
+                    assert_eq!(target, &mid, "{label} {verb} {case}: {err}");
+                    if strip {
+                        assert!(
+                            reason.contains("agent_id"),
+                            "{label} {verb} {case}: the unstamped reason names the stamp: {err}"
+                        );
+                    } else {
+                        assert_eq!(
+                            reason,
+                            ai_memory::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+                            "{label} {verb} {case}: {err}"
+                        );
+                    }
+                }
+                other => panic!("{label} {verb} {case}: expected PermissionDenied, got {other:?}"),
+            }
+            let kept = store
+                .get(&admin, &mid)
+                .await
+                .expect("the refused row is still there");
+            assert_eq!(
+                kept.tier, tier,
+                "{label} {verb} {case}: the row is unchanged"
+            );
+        }
+
+        // The requester's own row executes.
+        let (pid, mid) = seed_approved_8564(store, REQUESTER, tier.clone(), action, None).await;
+        let executed = store
+            .execute_pending_action(&approver, &pid)
+            .await
+            .expect("an approved action on the requester's own row executes");
+        assert_eq!(
+            executed.as_deref(),
+            Some(mid.as_str()),
+            "{label} {verb} own"
+        );
+        match action {
+            GovernedAction::Delete => assert!(
+                store.get(&admin, &mid).await.is_err(),
+                "{label}: the approved delete removed the requester's row"
+            ),
+            _ => assert_eq!(
+                store.get(&admin, &mid).await.expect("promoted row").tier,
+                Tier::Long,
+                "{label}: the approved promote bumped the requester's row"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn execute_arms_are_owner_gated_sqlite_8564() {
+    let _g = LOCK_8495.lock().await;
+    let file = NamedTempFile::new().expect("tempfile");
+    let db_path = file.path().to_path_buf();
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let unstamp =
+        move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let db_path = db_path.clone();
+            Box::pin(async move {
+                let conn = ai_memory::db::open(&db_path).expect("open unstamp conn");
+                conn.execute("UPDATE memories SET metadata = '{}' WHERE id = ?1", [&id])
+                    .expect("strip the owner stamp");
+            })
+        };
+    execute_arms_are_owner_gated("sqlite", &store, &unstamp).await;
+}
+
+/// #8495 r4 Option C (3-agent vote (6def5ab6)): the caller's context decides.
+/// A bypass context (the federated decide path after its peer-scope check)
+/// executes an approved delete / tier bump of a stamped row owned by another
+/// agent; a tenant context executing the same approved action is refused and
+/// the row stays.
+async fn execute_honours_the_callers_context(
+    label: &str,
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+) {
+    use ai_memory::models::Tier;
+    use ai_memory::store::{CallerContext, GovernedAction, StoreError};
+    let admin = CallerContext::for_admin("ai:operator-8577");
+    let tenant = CallerContext::for_agent("ai:other-tenant-8577".to_string());
+    for (action, tier) in [
+        (GovernedAction::Delete, Tier::Long),
+        (GovernedAction::Promote, Tier::Mid),
+    ] {
+        let (pid, mid) =
+            seed_approved_8564(store, OTHER_OWNER_8564, tier.clone(), action, None).await;
+        let err = store
+            .execute_pending_action(&tenant, &pid)
+            .await
+            .expect_err("a tenant context is gated on the row owner");
+        assert!(
+            matches!(err, StoreError::PermissionDenied { .. }),
+            "{label}: tenant refused: {err:?}"
+        );
+        assert_eq!(
+            store.get(&admin, &mid).await.expect("row remains").tier,
+            tier,
+            "{label}: the refused row is unchanged"
+        );
+        let executed = store
+            .execute_pending_action(&admin, &pid)
+            .await
+            .expect("a bypass context executes the approved action");
+        assert_eq!(executed.as_deref(), Some(mid.as_str()), "{label}");
+        match action {
+            GovernedAction::Delete => assert!(
+                store.get(&admin, &mid).await.is_err(),
+                "{label}: the bypass execute deleted the row"
+            ),
+            _ => assert_eq!(
+                store.get(&admin, &mid).await.expect("promoted row").tier,
+                Tier::Long,
+                "{label}: the bypass execute bumped the row"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn execute_honours_the_callers_context_sqlite_8577() {
+    let _g = LOCK_8495.lock().await;
+    let file = NamedTempFile::new().expect("tempfile");
+    let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
+        ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("open SqliteStore"),
+    );
+    execute_honours_the_callers_context("sqlite", &store).await;
+}
+
+/// Count the audit rows of one event type (backend-specific read).
+type CountEvents<'a> = &'a (
+        dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>>
+            + Sync
+    );
+
+/// #8577: a tenant decide is gated on the row owner BEFORE the vote is
+/// written. Requester A, a row owned by B (or unstamped), an eligible
+/// approver deciding `approve`: the decide returns the owner-gate error, the
+/// forensic row is written, the pending row stays `pending` and the target
+/// row remains. The requester's own row still approves and executes, and a
+/// bypass context (federation) keeps its bypass.
+async fn decide_is_owner_gated(
+    label: &str,
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    unstamp: Unstamp<'_>,
+    count_events: CountEvents<'_>,
+) {
+    use ai_memory::models::Tier;
+    use ai_memory::store::{ApproveOutcome, CallerContext, GovernedAction, StoreError};
+    const REFUSED: &str = "pending_action.refused_owner_gate";
+    let admin = CallerContext::for_admin("ai:operator-8577");
+    let approver = CallerContext::for_agent(APPROVER_X.to_string());
+    let requester = CallerContext::for_agent(REQUESTER.to_string());
+    let now = chrono::Utc::now().to_rfc3339();
+    store
+        .register_agent(
+            &requester,
+            &ai_memory::models::AgentRegistration {
+                agent_id: APPROVER_X.to_string(),
+                agent_type: "ai:generic".to_string(),
+                capabilities: Vec::new(),
+                registered_at: now.clone(),
+                last_seen_at: now,
+            },
+        )
+        .await
+        .ok();
+    for (action, tier) in [
+        (GovernedAction::Delete, Tier::Long),
+        (GovernedAction::Promote, Tier::Mid),
+    ] {
+        for (case, owner, strip) in [
+            ("other owner", OTHER_OWNER_8564, false),
+            ("unstamped", REQUESTER, true),
+        ] {
+            let (pid, mid) = seed_pending_8577(store, owner, tier.clone(), action).await;
+            if strip {
+                unstamp(mid.clone()).await;
+            }
+            let before = count_events(REFUSED).await;
+            let err = store
+                .approve_with_approver_type(&approver, &pid, APPROVER_X)
+                .await
+                .expect_err("a tenant decide on a row the requester does not own is refused");
+            assert!(
+                matches!(err, StoreError::PermissionDenied { .. }),
+                "{label} {case}: the owner-gate error: {err:?}"
+            );
+            let pending = store
+                .get_pending(&admin, &pid)
+                .await
+                .expect("get_pending")
+                .expect("the pending row remains");
+            assert_eq!(
+                pending.status, "pending",
+                "{label} {case}: the refused decide leaves the row pending"
+            );
+            assert!(
+                pending.approvals.is_empty(),
+                "{label} {case}: no vote was recorded: {:?}",
+                pending.approvals
+            );
+            assert_eq!(
+                count_events(REFUSED).await,
+                before + 1,
+                "{label} {case}: one forensic row with the reason code"
+            );
+            assert!(
+                store.get(&admin, &mid).await.is_ok(),
+                "{label} {case}: the target row remains"
+            );
+        }
+
+        // The requester's own row approves (and then executes).
+        let (pid, _mid) = seed_pending_8577(store, REQUESTER, tier.clone(), action).await;
+        let outcome = store
+            .approve_with_approver_type(&approver, &pid, APPROVER_X)
+            .await
+            .expect("a tenant decide on the requester's own row approves");
+        assert!(
+            matches!(outcome, ApproveOutcome::Approved),
+            "{label}: own row: {outcome:?}"
+        );
+        assert!(
+            store
+                .execute_pending_action(&approver, &pid)
+                .await
+                .expect("own row executes")
+                .is_some(),
+            "{label}: own row executed"
+        );
+
+        // A bypass context decides without the precondition.
+        let (pid, _other) = seed_pending_8577(store, OTHER_OWNER_8564, tier.clone(), action).await;
+        let outcome = store
+            .approve_with_approver_type(&admin, &pid, APPROVER_X)
+            .await
+            .expect("a bypass decide keeps its bypass");
+        assert!(
+            matches!(outcome, ApproveOutcome::Approved),
+            "{label}: bypass: {outcome:?}"
+        );
+    }
+}
+
+/// Store a memory owned by `owner` at `tier` and queue `action` on it as
+/// `REQUESTER`, leaving the pending row undecided.
+async fn seed_pending_8577(
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    owner: &str,
+    tier: ai_memory::models::Tier,
+    action: ai_memory::store::GovernedAction,
+) -> (String, String) {
+    use ai_memory::store::CallerContext;
+    let owner_ctx = CallerContext::for_agent(owner.to_string());
+    let ns = format!("ns-8577-{}", uuid::Uuid::new_v4().simple());
+    let mem = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier,
+        namespace: ns.clone(),
+        title: format!("t-8577-{}", uuid::Uuid::new_v4()),
+        content: "seeded by the #8577 decide owner-precondition test".into(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({"agent_id": owner}),
+        version: 1,
+        ..ai_memory::models::Memory::default()
+    };
+    let mem_id = store.store(&owner_ctx, &mem).await.expect("store memory");
+    let requester = CallerContext::for_agent(REQUESTER.to_string());
+    let pid = store
+        .queue_pending_action(
+            &requester,
+            action,
+            &ns,
+            Some(&mem_id),
+            REQUESTER,
+            &json!({"reason": "8577"}),
+        )
+        .await
+        .expect("queue_pending_action");
+    (pid, mem_id)
+}
+
+#[tokio::test]
+async fn decide_is_owner_gated_sqlite_8577() {
+    let _g = LOCK_8495.lock().await;
+    let file = NamedTempFile::new().expect("tempfile");
+    let db_path = file.path().to_path_buf();
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let unstamp_path = db_path.clone();
+    let unstamp =
+        move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let db_path = unstamp_path.clone();
+            Box::pin(async move {
+                let conn = ai_memory::db::open(&db_path).expect("open unstamp conn");
+                conn.execute("UPDATE memories SET metadata = '{}' WHERE id = ?1", [&id])
+                    .expect("strip the owner stamp");
+            })
+        };
+    let count = move |event: &'static str| -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = i64> + Send>,
+    > {
+        let db_path = db_path.clone();
+        Box::pin(async move {
+            let conn = ai_memory::db::open(&db_path).expect("open count conn");
+            conn.query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                [event],
+                |r| r.get(0),
+            )
+            .expect("count audit rows")
+        })
+    };
+    decide_is_owner_gated("sqlite", &store, &unstamp, &count).await;
+}
+
+// ---------------------------------------------------------------------------
+// (4) postgres parity on a live PostgresStore (skip when no URL is set)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sal-postgres")]
+mod live_pg {
+    use super::*;
+    use ai_memory::store::{CallerContext, MemoryStore};
+
+    fn live_router(store: Arc<dyn MemoryStore>) -> axum::Router {
+        let scratch = ai_memory::db::open(Path::new(":memory:")).expect("scratch sqlite");
+        let db: Db = Arc::new(tokio::sync::Mutex::new((
+            scratch,
+            PathBuf::from(":memory:"),
+            ai_memory::config::ResolvedTtl::default(),
+            true,
+        )));
+        let app_state = AppState {
+            db,
+            embedder: Arc::new(None),
+            vector_index: Arc::new(tokio::sync::Mutex::new(None)),
+            federation: Arc::new(None),
+            tier_config: Arc::new(ai_memory::config::FeatureTier::Keyword.config()),
+            scoring: Arc::new(ai_memory::config::ResolvedScoring::default()),
+            profile: Arc::new(ai_memory::profile::Profile::core()),
+            mcp_config: Arc::new(None),
+            active_keypair: Arc::new(None),
+            family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+            storage_backend: StorageBackend::Postgres,
+            store,
+            llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
+            auto_tag_model: Arc::new(None),
+            llm_call_timeout: std::time::Duration::from_secs(30),
+            replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+            verify_require_nonce: false,
+            federation_nonce_cache: Arc::new(
+                ai_memory::identity::replay::FederationNonceCache::default(),
+            ),
+            autonomous_hooks: false,
+            auto_tag_queue: None,
+            atomise_queue: None,
+            recall_scope: Arc::new(None),
+            deferred_audit_queue: Arc::new(None),
+            admin_agent_ids: Arc::new(Vec::new()),
+            rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+            resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+                ai_memory::config::ResolvedModels::default(),
+            )),
+            runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+            max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+            enrolled_agent_keys: Arc::new(EnrolledAgentKeys::empty()),
+            http_identity_mode: HttpIdentityMode::default(),
+        };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+            enrolled_agent_keys: Arc::new(EnrolledAgentKeys::empty()),
+            identity_mode: HttpIdentityMode::default(),
+            ..Default::default()
+        };
+        ai_memory::build_router(api_key_state, app_state)
+    }
+
+    async fn seed_live(store: &Arc<dyn MemoryStore>) -> String {
+        let ctx = CallerContext::for_agent(REQUESTER.to_string());
+        let ns = format!("ns-8495-live-{}", uuid::Uuid::new_v4().simple());
+        let mem = ai_memory::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: ai_memory::models::Tier::Long,
+            namespace: ns.clone(),
+            title: format!("t-8495-live-{}", uuid::Uuid::new_v4()),
+            content: "seeded by the #8495 live postgres test".into(),
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            // #8548: the requester owns the row, as an HTTP store stamps it.
+            metadata: json!({"agent_id": REQUESTER}),
+            version: 1,
+            ..ai_memory::models::Memory::default()
+        };
+        let mem_id = store.store(&ctx, &mem).await.expect("store memory");
+        let now = chrono::Utc::now().to_rfc3339();
+        for agent in [APPROVER_X, APPROVER_Y] {
+            store
+                .register_agent(
+                    &ctx,
+                    &ai_memory::models::AgentRegistration {
+                        agent_id: agent.to_string(),
+                        agent_type: "ai:generic".to_string(),
+                        capabilities: Vec::new(),
+                        registered_at: now.clone(),
+                        last_seen_at: now.clone(),
+                    },
+                )
+                .await
+                .ok();
+        }
+        store
+            .queue_pending_action(
+                &ctx,
+                ai_memory::store::GovernedAction::Delete,
+                &ns,
+                Some(&mem_id),
+                REQUESTER,
+                &json!({"reason": "8495-live"}),
+            )
+            .await
+            .expect("queue_pending_action")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_binds_the_approver_8495() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_binds_the_approver_8495: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let router = live_router(store.clone());
+        let body = approve_body();
+
+        // (3) v1 → legacy_unbound_approver.
+        let pid = seed_live(&store).await;
+        let ts = now_ts();
+        let (status, v) = send(
+            &router,
+            request(
+                &decide_uri(&pid),
+                &ts,
+                &sign_v1(&ts, &pid, &body),
+                APPROVER_X,
+                None,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "live pg: {v}");
+        assert_eq!(v["error"], json!(LEGACY_UNBOUND_APPROVER), "live pg: {v}");
+
+        // (1) + (2) X's signature as Y refused; as X binds X.
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+        let (status, v) = send(
+            &router,
+            request(&decide_uri(&pid), &ts, &sig, APPROVER_Y, None, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "live pg: {v}");
+        let (status, v) = send(
+            &router,
+            request(&decide_uri(&pid), &ts, &sig, APPROVER_X, None, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "live pg: {v}");
+        assert_eq!(v["decided_by"], json!(APPROVER_X), "live pg: {v}");
+        let ctx = CallerContext::for_agent(APPROVER_X.to_string());
+        let row = store
+            .get_pending(&ctx, &pid)
+            .await
+            .expect("get_pending")
+            .expect("row");
+        assert_eq!(row.decided_by.as_deref(), Some(APPROVER_X), "live pg");
+        set_active_hooks_hmac_secret(None);
+    }
+
+    /// #8548 — seed a REQUESTER-owned memory at `tier` and queue `action` on
+    /// it; returns `(pending_id, memory_id)`.
+    async fn seed_live_action(
+        store: &Arc<dyn MemoryStore>,
+        tier: ai_memory::models::Tier,
+        action: ai_memory::store::GovernedAction,
+    ) -> (String, String) {
+        let ctx = CallerContext::for_agent(REQUESTER.to_string());
+        let ns = format!("ns-8548-live-{}", uuid::Uuid::new_v4().simple());
+        let mem = ai_memory::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier,
+            namespace: ns.clone(),
+            title: format!("t-8548-live-{}", uuid::Uuid::new_v4()),
+            content: "seeded by the #8548 live postgres test".into(),
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            // #8548: the requester owns the row, as an HTTP store stamps it.
+            metadata: json!({"agent_id": REQUESTER}),
+            version: 1,
+            ..ai_memory::models::Memory::default()
+        };
+        let mem_id = store.store(&ctx, &mem).await.expect("store memory");
+        let pid = store
+            .queue_pending_action(
+                &ctx,
+                action,
+                &ns,
+                Some(&mem_id),
+                REQUESTER,
+                &json!({"reason": "8548-live"}),
+            )
+            .await
+            .expect("queue_pending_action");
+        (pid, mem_id)
+    }
+
+    /// #8548 — an approved delete / promote of the REQUESTER's memory executes
+    /// as the requester, not as the approver: the approver does not own the
+    /// row, so running the mutation under the approver's context was refused
+    /// by the postgres owner gate and the decide returned 500 with the row
+    /// already marked approved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_executes_under_the_requester_8548() {
+        use ai_memory::store::GovernedAction;
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_executes_under_the_requester_8548: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        set_active_hooks_hmac_secret(Some(SECRET.to_string()));
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let router = live_router(store.clone());
+        let owner = CallerContext::for_agent(REQUESTER.to_string());
+
+        // Delete through both decide routes.
+        for route in ["approval_decide", "approve_pending"] {
+            let (pid, mem_id) = seed_live_action(
+                &store,
+                ai_memory::models::Tier::Long,
+                GovernedAction::Delete,
+            )
+            .await;
+            let (uri, body) = if route == "approval_decide" {
+                (decide_uri(&pid), approve_body())
+            } else {
+                (format!("/api/v1/pending/{pid}/approve"), String::new())
+            };
+            let ts = now_ts();
+            let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+            let (status, v) =
+                send(&router, request(&uri, &ts, &sig, APPROVER_X, None, &body)).await;
+            assert_eq!(status, StatusCode::OK, "live pg {route} delete: {v}");
+            assert_eq!(v["executed"], json!(true), "live pg {route} delete: {v}");
+            assert!(
+                store.get(&owner, &mem_id).await.is_err(),
+                "live pg {route}: the approved delete removed the memory"
+            );
+        }
+
+        // Promote (tier bump) through approval_decide.
+        let (pid, mem_id) = seed_live_action(
+            &store,
+            ai_memory::models::Tier::Mid,
+            GovernedAction::Promote,
+        )
+        .await;
+        let body = approve_body();
+        let ts = now_ts();
+        let sig = sign_v2(&ts, &pid, APPROVER_X, &body);
+        let (status, v) = send(
+            &router,
+            request(&decide_uri(&pid), &ts, &sig, APPROVER_X, None, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "live pg promote: {v}");
+        assert_eq!(v["executed"], json!(true), "live pg promote: {v}");
+        let promoted = store.get(&owner, &mem_id).await.expect("promoted memory");
+        assert_eq!(
+            promoted.tier,
+            ai_memory::models::Tier::Long,
+            "live pg promote"
+        );
+        set_active_hooks_hmac_secret(None);
+    }
+
+    /// #8564 — the same owner-gate cells as the SQLite twin, on a live
+    /// `PostgresStore` (the precedent the SQLite execute arms now copy).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_execute_arms_are_owner_gated_8564() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_execute_arms_are_owner_gated_8564: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        let pg = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let store: Arc<dyn MemoryStore> = pg.clone();
+        let unstamp =
+            move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                let pg = pg.clone();
+                Box::pin(async move {
+                    sqlx::query("UPDATE memories SET metadata = '{}'::jsonb WHERE id = $1")
+                        .bind(id)
+                        .execute(pg.pool())
+                        .await
+                        .expect("strip the owner stamp");
+                })
+            };
+        super::execute_arms_are_owner_gated("live pg", &store, &unstamp).await;
+    }
+
+    /// #8495 r4 Option C: the same context cell on a live `PostgresStore`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_execute_honours_the_callers_context_8577() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!(
+                "skipping live_postgres_execute_honours_the_callers_context_8577: no postgres url"
+            );
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        super::execute_honours_the_callers_context("live pg", &store).await;
+    }
+
+    /// #8577: the same decide-time owner precondition on a live `PostgresStore`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_decide_is_owner_gated_8577() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_decide_is_owner_gated_8577: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect counting pool");
+        let unstamp_pool = pool.clone();
+        let unstamp =
+            move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                let pool = unstamp_pool.clone();
+                Box::pin(async move {
+                    sqlx::query("UPDATE memories SET metadata = '{}'::jsonb WHERE id = $1")
+                        .bind(id)
+                        .execute(&pool)
+                        .await
+                        .expect("strip the owner stamp");
+                })
+            };
+        let count = move |event: &'static str| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = i64> + Send>,
+        > {
+            let pool = pool.clone();
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
+                    .bind(event)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count audit rows")
+            })
+        };
+        super::decide_is_owner_gated("live pg", &store, &unstamp, &count).await;
+    }
+}

@@ -147,7 +147,8 @@ impl Drop for PermissiveFedEnv {
 }
 
 /// S5-C1 fix campaign (2026-05-13): synthesise a K7-style
-/// `(timestamp, signature)` pair for an inbound approve/reject body.
+/// `(timestamp, signature)` pair for an inbound approve/reject body, signed
+/// over the #8495 v2 subject `<pending_id>@<approver>`.
 /// Mirrors the reference helper in `tests/k10_approval_http.rs::sign`
 /// but uses the in-crate `pub(crate)` helpers so we don't redeclare
 /// the HMAC primitive in two places.
@@ -155,11 +156,13 @@ pub(super) fn sign_approve_body(
     secret: &str,
     method: &str,
     pending_id: &str,
+    approver: &str,
     body: &[u8],
 ) -> (String, String) {
     let ts = chrono::Utc::now().timestamp().to_string();
     let body_str = std::str::from_utf8(body).unwrap_or("");
-    let canonical = format!("{ts}.{method}.{pending_id}.{body_str}");
+    let subject = crate::handlers::agent_api_key::approval_subject(pending_id, approver);
+    let canonical = format!("{ts}.{method}.{subject}.{body_str}");
     let key_hash = crate::subscriptions::sha256_hex(secret);
     let sig = crate::subscriptions::hmac_sha256_hex(&key_hash, &canonical);
     (ts, format!("sha256={sig}"))
@@ -4287,7 +4290,7 @@ async fn http_approve_pending_unknown_id_returns_404_1620() {
         .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
         .with_state(test_app_state(state));
     let unknown = Uuid::new_v4().to_string();
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &unknown, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &unknown, "alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -4325,7 +4328,7 @@ async fn http_approve_pending_rejects_invalid_agent_id() {
         .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
         .with_state(test_app_state(state));
     let id = Uuid::new_v4().to_string();
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, "bad agent", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -4355,7 +4358,7 @@ async fn http_reject_pending_unknown_id_returns_404() {
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state));
     let unknown = Uuid::new_v4().to_string();
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &unknown, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &unknown, "alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -4386,7 +4389,7 @@ async fn http_reject_pending_rejects_invalid_agent_id() {
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state));
     let id = Uuid::new_v4().to_string();
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, "bad agent", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -9641,7 +9644,7 @@ async fn http_approve_pending_happy_path_executes_store() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
         .with_state(test_app_state(state.clone()));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pending_id, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pending_id, "approver-alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -9689,7 +9692,7 @@ async fn http_approve_pending_invalid_id_format_400() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
         .with_state(test_app_state(state));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", "bad\x01id", b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", "bad\x01id", "alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -9742,7 +9745,7 @@ async fn http_approve_pending_already_approved_is_rejected() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
         .with_state(test_app_state(state));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, "alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -9813,7 +9816,7 @@ async fn http_approve_pending_executor_records_decided_by() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
         .with_state(test_app_state(state.clone()));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, "executor-claude", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -9879,7 +9882,7 @@ async fn http_approve_pending_returns_memory_id_for_store_payload() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     crate::config::set_active_hooks_hmac_secret(Some("a1-test-secret".to_string()));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, "approver-store", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -9947,7 +9950,7 @@ async fn http_reject_pending_happy_path_marks_rejected_no_execution() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state.clone()));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, "rejector-alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -10031,7 +10034,7 @@ async fn http_reject_pending_refuses_requester_self_veto_3448() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state.clone()));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, "self-vetoer-3448", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -10102,7 +10105,7 @@ async fn http_reject_pending_refuses_unregistered_approver_3448() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state.clone()));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, "mallory-3448", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -10176,7 +10179,7 @@ async fn http_reject_pending_already_rejected_returns_404() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, "alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -10207,7 +10210,7 @@ async fn http_reject_pending_invalid_id_format_400() {
     let app = Router::new()
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state));
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", "bad\x01id", b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", "bad\x01id", "alice", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -14858,7 +14861,7 @@ async fn http_approve_pending_with_bad_header_agent_id_returns_400() {
         .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
         .with_state(test_app_state(state));
     let id = "abcdef0123456789abcdef0123456789";
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, "bad agent id", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -14891,7 +14894,7 @@ async fn http_reject_pending_with_bad_header_agent_id_returns_400() {
         .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
         .with_state(test_app_state(state));
     let id = "abcdef0123456789abcdef0123456789";
-    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, b"");
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &id, "bad agent id", b"");
     let resp = app
         .oneshot(
             axum::http::Request::builder()

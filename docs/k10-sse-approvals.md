@@ -14,8 +14,10 @@ is consumed single-use to defeat replay within that window.
 - **Code paths:** [`src/approvals.rs`](../src/approvals.rs),
   [`approvals_sse`](../src/handlers/approvals.rs)
   (the SSE handler),
-  [`verify_approval_hmac`](../src/handlers/approvals.rs)
-  (the HMAC verification core),
+  [`verify_approver_bound_hmac`](../src/handlers/approvals.rs)
+  (the decide verifier, signature layout v2; the layout-agnostic
+  [`verify_approval_hmac`](../src/handlers/approvals.rs) core remains only for
+  the agent api-key approval route, #8550),
   [`src/handlers/routes.rs`](../src/handlers/routes.rs)
   (`APPROVALS_STREAM = "/api/v1/approvals/stream"`),
   [`build_router_with_timeout`](../src/lib.rs) (route registration).
@@ -101,11 +103,30 @@ requires two headers when the substrate has an
 - `X-AI-Memory-Timestamp: <unix seconds>` — request freshness clock.
 
 The canonical request that the HMAC covers is
-([`verify_approval_hmac`](../src/handlers/approvals.rs)):
+([`verify_approver_bound_hmac`](../src/handlers/approvals.rs)):
 
 ```text
-canonical = "<unix_ts>.<METHOD>.<pending_id>.<body>"
+canonical = "<unix_ts>.<METHOD>.<n>:<pending_id>@<m>:<X-Agent-Id>.<body>"
 ```
+
+This is signature layout version 2 (#8495), the same subject shape the agent
+api-key approval route uses (`approval_subject`). `<n>` and `<m>` are the
+decimal byte lengths of `<pending_id>` and `<X-Agent-Id>` (#8546): an agent id
+may contain `.` and a pending id may contain `@`, so without the lengths two
+different (pending id, approver, body) triples could produce the same signed
+bytes. The governance `approve` / `reject` routes also
+refuse a non-empty body that is not JSON with `400` before the signature is
+checked. The approver named by the
+`X-Agent-Id` header is inside the signed bytes, so a signature made for one
+approver cannot be presented under another identity. A layout 1 signature
+(subject `<pending_id>` alone) is refused `401` with
+`{"error":"legacy_unbound_approver","signature_layout_version":2}` and a hint
+naming the new subject; its nonce is not consumed, so the client can re-sign.
+Under `identity_mode = enforce` the caller's `X-Agent-Id` must also be bound to
+its credential, so one shared secret cannot cast every vote of a consensus
+quorum. Otherwise the decide is `403`: `identity_binding_mismatch` when a
+per-agent api-key is bound to a different agent (the transport middleware
+refuses first), `attested_identity_required` with the shared api-key (#8549).
 
 Both signer and verifier MUST use the exact same join. Reformatting
 even a single byte of the body invalidates the signature.
@@ -120,6 +141,8 @@ even a single byte of the body invalidates the signature.
 - **pending_id binding** (`99ffacc`) prevents replay across pending
   actions — a captured signature for pending row A cannot be
   redirected to pending row B by changing the URL.
+- **Approver binding** (#8495) prevents a signature made for approver X
+  from being counted as approver Y's vote by changing `X-Agent-Id`.
 - **Body binding** prevents post-hoc decision flipping. Captured
   signature must replay the exact body that was signed.
 - **Timestamp + 300s window**
@@ -136,7 +159,7 @@ even a single byte of the body invalidates the signature.
 
 When no `[hooks.subscription].hmac_secret` is configured, the decide
 endpoint **rejects every request** with 401
-([`verify_approval_hmac`](../src/handlers/approvals.rs)). The K10
+([`verify_approver_bound_hmac`](../src/handlers/approvals.rs)). The K10
 contract is strict by default — better to refuse a write than to
 accept an unauthenticated one.
 
@@ -165,8 +188,9 @@ BODY='{"decision":"approve","remember":"session"}'
 Step 2. Build the canonical preimage:
 
 ```bash
-CANONICAL="${TS}.POST.${PENDING_ID}.${BODY}"
-# "1747300800.POST.pa-12345.{\"decision\":\"approve\",\"remember\":\"session\"}"
+APPROVER=operator-alice
+CANONICAL="${TS}.POST.${PENDING_ID}@${APPROVER}.${BODY}"
+# "1747300800.POST.pa-12345@operator-alice.{\"decision\":\"approve\",\"remember\":\"session\"}"
 ```
 
 Step 3. Compute the key (`SHA256(secret)`) and the signature:
@@ -184,6 +208,7 @@ curl -X POST \
   -H "X-API-Key: $API_KEY" \
   -H "X-AI-Memory-Timestamp: $TS" \
   -H "X-AI-Memory-Signature: sha256=$SIG" \
+  -H "X-Agent-Id: $APPROVER" \
   -H "Content-Type: application/json" \
   --data-binary "$BODY" \
   "https://127.0.0.1:9077/api/v1/approvals/${PENDING_ID}"
@@ -330,7 +355,7 @@ practice (the channel grows on demand).
 | Decide returns 401 with no logs | No HMAC secret configured | Check `[hooks.subscription].hmac_secret` in config.toml; daemon logs `no [hooks.subscription].hmac_secret configured` on every refused decide. |
 | Decide returns 401 `stale signature` | Timestamp older than 300s OR signer/daemon clock skew | Check `date` on both hosts; re-sign with current `$(date +%s)`. |
 | Decide returns 401 `future-dated signature` | Signer clock is >60s ahead | Fix signer NTP. |
-| Decide returns 401 with valid-looking signature | Canonical request mismatch (body reformatted, wrong method, wrong pending_id) OR signature replayed | Recompute `<ts>.POST.<id>.<body>` byte-exact. If it still 401s and the timestamp is fresh, the signature already hit the replay cache; generate a fresh signature. |
+| Decide returns 401 with valid-looking signature | Canonical request mismatch (body reformatted, wrong method, wrong pending_id, wrong approver) OR signature replayed | Recompute `<ts>.POST.<n>:<id>@<m>:<X-Agent-Id>.<body>` byte-exact (`<n>`, `<m>` = byte lengths) (a `legacy_unbound_approver` error means the client still signs layout 1). If it still 401s and the timestamp is fresh, the signature already hit the replay cache; generate a fresh signature. |
 | SSE stream emits no events for one tenant | Subscriber agent_id wasn't recognized (host:-prefixed or empty) | Check the SSE handshake's `X-Agent-Id`. Tenant-filtered events are silently dropped from cross-tenant subscribers. |
 | `lagged` frames every few seconds | Subscriber too slow OR cross-tenant fan-out volume too high | Profile the subscriber; reconnect and re-fetch. If chronic, consider sharding tenants across daemons. |
 | SSE connection drops every minute | Intermediary timeout | Check intermediary keepalive; the substrate sends `:keepalive` every 15s. |

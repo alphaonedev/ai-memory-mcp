@@ -646,10 +646,20 @@ mod tests {
     }
     #[test]
     fn cli_stale_removal_failure_keeps_export_working_r2_8369() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::commands::export_reflections::private_file::tests::cli_stale_removal_failure_keeps_export_working_r2_8369",
+        ) {
+            return;
+        }
         stale_removal_failure_keeps_export_working(Writer::Cli);
     }
     #[test]
     fn auto_stale_removal_failure_keeps_export_working_r2_8369() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::commands::export_reflections::private_file::tests::auto_stale_removal_failure_keeps_export_working_r2_8369",
+        ) {
+            return;
+        }
         stale_removal_failure_keeps_export_working(Writer::Auto);
     }
 
