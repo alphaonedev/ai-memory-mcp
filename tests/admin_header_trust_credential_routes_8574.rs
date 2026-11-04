@@ -5,8 +5,8 @@
 //! re-admits a CLAIMED admin on the four credential routes (pubkey bind,
 //! bind challenge, api-key mint, api-key revoke) once at least one per-agent
 //! api key is enrolled, in any identity mode. The enrolled registry is the
-//! backstop; the claim it backstops must never extend it. The one-boot
-//! bootstrap (empty registry) is unchanged.
+//! backstop; the claim it backstops must never extend it. The bootstrap
+//! (empty registry, authoritative store read) is unchanged.
 //!
 //! 3-agent vote (6def5ab6), option B.
 
