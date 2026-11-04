@@ -1365,11 +1365,25 @@ public key is the root of every later signature check, so
 `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` posture. They require either an
 admin that presents its own enrolled per-agent key (`X-API-Key` bound to that
 admin id; enrol it with `agents bind-api-key`), or the explicit operator
-opt-in `AI_MEMORY_ADMIN_HEADER_TRUST=1` (which then also lets a header claim
-bind keys; the boot WARN names it). The local operator path (`agents bind-key`
-on the data-tier host, MCP stdio) is unchanged. A refused request returns 403,
-binds nothing, and writes a `bind_agent_pubkey` /
-`claimed_admin_not_key_authenticated` row to the forensic audit chain.
+opt-in `AI_MEMORY_ADMIN_HEADER_TRUST=1` while the enrolled registry is empty
+(#8574; an authoritative store read confirms emptiness, and a read error refuses).
+Once any per-agent key is enrolled, that opt-in cannot authorize a header claim
+to bind keys. A refusal returns 403, binds nothing, and records `bind_agent_pubkey`
+with the applicable principal/registry refusal reason in the forensic audit chain.
+
+#### SQLite and Postgres bootstrap (#8537)
+
+`ai-memory agents bind-key` is a
+local SQLite command; it does not bind a key in a Postgres-backed daemon.
+For Postgres, use a build with `sal,sal-postgres` and enrol a registered,
+allowlisted admin's per-agent key in the daemon's own store:
+`ai-memory agents bind-api-key --agent-id <admin-id> --token-file <0600-token-file>`.
+Select that Postgres store with `AI_MEMORY_STORE_URL_FILE` pointing to a protected
+URL file; the verb also accepts `--store-url <postgres-url>`, but the file channel
+keeps credentials off argv. Wait for a successful daemon key-registry refresh
+(or restart if refresh is disabled), then authenticate as that admin with its
+enrolled `X-API-Key` for the HTTP challenge and proof-of-possession bind above.
+The MCP stdio local-operator path is unchanged.
 
 **Minting and revoking an api-key needs a verified admin (#8535).**
 `POST /api/v1/agents/{id}/api-key` and `POST /api/v1/agents/{id}/api-key/revoke`
