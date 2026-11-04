@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
 
-- `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the one-boot bootstrap while the registry is empty.
+- `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty.
 
 ### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
 
