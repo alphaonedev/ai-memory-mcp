@@ -31489,8 +31489,17 @@ impl MemoryStore for PostgresStore {
                     // requester owns the row. Under the approver's context the
                     // owner gate refused every approved delete of another
                     // principal's memory ("approved but execution failed").
-                    let requester = CallerContext::for_agent(&pa.requested_by);
-                    self.delete(&requester, &mid).await?;
+                    // #8495 r4 Option C, 3-agent vote (6def5ab6): a bypass ctx
+                    // (federated decide, parity doc federation_signing_check.rs:86-112)
+                    // keeps its bypass; a tenant ctx runs as the requester.
+                    let requester_owned;
+                    let actor = if ctx.bypass_visibility {
+                        ctx
+                    } else {
+                        requester_owned = CallerContext::for_agent(&pa.requested_by);
+                        &requester_owned
+                    };
+                    self.delete(actor, &mid).await?;
                     Some(mid)
                 } else {
                     None
@@ -31536,8 +31545,16 @@ impl MemoryStore for PostgresStore {
                             ..Default::default()
                         };
                         // #8548 — as the requester, same as the delete arm.
-                        let requester = CallerContext::for_agent(&pa.requested_by);
-                        self.update(&requester, &mid, patch).await?;
+                        // #8495 r4 Option C: same ctx rule as the delete arm
+                        // (parity doc federation_signing_check.rs:86-112).
+                        let requester_owned;
+                        let actor = if ctx.bypass_visibility {
+                            ctx
+                        } else {
+                            requester_owned = CallerContext::for_agent(&pa.requested_by);
+                            &requester_owned
+                        };
+                        self.update(actor, &mid, patch).await?;
                         Some(mid)
                     }
                 } else {

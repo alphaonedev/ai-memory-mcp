@@ -422,10 +422,18 @@ fn assert_caller_owns_for_mutation(
 /// posture, matching the Postgres arms; the inbox carve-out is off.
 fn execute_owner_gate(
     conn: &rusqlite::Connection,
+    ctx: &CallerContext,
     pa: &crate::models::PendingAction,
     mid: &str,
     arm: db::ExecuteArm,
 ) -> StoreResult<()> {
+    // #8495 r4 Option C, 3-agent vote (6def5ab6): the caller's context
+    // decides. A bypass context (federated decide, after its peer-scope
+    // check; parity doc federation_signing_check.rs:86-112) keeps its
+    // bypass; only a tenant context is gated on the row owner.
+    if ctx.bypass_visibility {
+        return Ok(());
+    }
     let (action, funnel) = match arm {
         db::ExecuteArm::Delete => ("delete", crate::identity::owner_stamp::funnel::DELETE),
         db::ExecuteArm::TierBump => ("update", crate::identity::owner_stamp::funnel::UPDATE),
@@ -4375,7 +4383,7 @@ impl MemoryStore for SqliteStore {
     /// row are refused `PermissionDenied` and left untouched.
     async fn execute_pending_action(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         pending_id: &str,
     ) -> StoreResult<Option<String>> {
         self.gate_record_stop()?;
@@ -4385,7 +4393,7 @@ impl MemoryStore for SqliteStore {
                     mid: &str,
                     arm: db::ExecuteArm|
          -> anyhow::Result<()> {
-            execute_owner_gate(conn, pa, mid, arm).map_err(anyhow::Error::new)
+            execute_owner_gate(conn, ctx, pa, mid, arm).map_err(anyhow::Error::new)
         };
         db::execute_pending_action_gated(&conn, pending_id, Some(&gate))
             .map_err(|e| e.downcast::<StoreError>().unwrap_or_else(box_err))
