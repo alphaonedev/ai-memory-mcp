@@ -10,6 +10,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
@@ -355,7 +357,7 @@ pub struct SubscribeBody {
 
 pub async fn subscribe(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<SubscribeBody>,
 ) -> impl IntoResponse {
     // #901 (security-high, 2026-05-19) — sibling of #874. The pre-#901
@@ -696,7 +698,7 @@ pub struct UnsubscribeQuery {
 
 pub async fn unsubscribe(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<UnsubscribeQuery>,
 ) -> impl IntoResponse {
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
@@ -941,7 +943,7 @@ pub struct ListSubscriptionsQuery {
 
 pub async fn list_subscriptions(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<ListSubscriptionsQuery>,
 ) -> impl IntoResponse {
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE

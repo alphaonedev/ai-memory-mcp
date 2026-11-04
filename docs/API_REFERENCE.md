@@ -119,6 +119,23 @@ was the #874-class spoof vector):
 
 Validation pattern: `^[A-Za-z0-9_\-:@./]{1,128}$`.
 
+#### Identity ladder and required credentials (#8590)
+
+| Binding | Required credential | Legacy IDOR/admin gate category |
+|---|---|---|
+| Claimed | Shared transport API key (when configured) plus a self-asserted `X-Agent-Id` | `Claimed`; refused for a named principal by an armed `enforce` gate |
+| API key | Enrolled per-agent `X-API-Key` bound to the effective caller | `KeyAuthenticated` |
+| Signature attested | Reserved per-request signed envelope; not produced by the current HTTP resolver | `SignatureAttested` (reserved) |
+| Client certificate | Verified client certificate with an active operator fingerprint-to-agent mapping matching the effective caller | `KeyAuthenticated` for legacy gate eligibility; distinct `client_cert` authority/audit provenance |
+
+The mapped certificate has the strongest identity precedence (#8357). It
+satisfies the legacy gate even when the caller presents the shared API key;
+it does not bypass the transport API-key requirement on ordinary routes.
+Certificate/header conflicts still refuse under certificate-binding `enforce`.
+An absent, unmapped or `off` binding supplies no certificate proof. No HTTP
+header can substitute for the server's typed certificate context. The existing
+zero-enrollment activation rule for the IDOR gate is unchanged.
+
 ### Admin-gated endpoints (v0.7.0 #943/#945/#946 cluster)
 
 Corpus-scale endpoints require an **admin** caller: `GET /stats`,
@@ -156,8 +173,9 @@ deployment with **no `api_key` configured**, a bare self-asserted
 resolution (boot emits a WARN); set `AI_MEMORY_ADMIN_HEADER_TRUST=1`
 only to restore the legacy header-trust posture on isolated/mTLS-fronted
 deployments. `POST /agents/{id}/pubkey/challenge` and `PUT /agents/{id}/pubkey`
-additionally require a key-authenticated admin (the admin's own enrolled
-per-agent `X-API-Key`), not a claimed header (#8494); a refusal is a 403 with a
+additionally require a credential-bound admin (the admin's own enrolled
+per-agent `X-API-Key` or an active verified certificate mapping to that admin),
+not a claimed header (#8494, #8590); a refusal is a 403 with a
 forensic audit row. `POST /agents/{id}/api-key` and
 `POST /agents/{id}/api-key/revoke` carry the same requirement (#8535): a
 claimed admin header is a `403` with a forensic audit row (reason

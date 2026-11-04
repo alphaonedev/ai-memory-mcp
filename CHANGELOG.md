@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#8590, umbrella #8493 — certificate binding reaches identity gates)
+
+- A caller bound to an agent by an active verified mTLS certificate can use the shared API key on enforced IDOR/admin routes. The legacy resolver now receives typed request certificate context and maps a binding matching the effective caller to `KeyAuthenticated`; authority/audit provenance remains `ClientCert`. Certificate/header mismatches still refuse under enforce, absent/off/unmapped bindings grant no certificate authority, and per-agent API-key fallback is preserved. No new wire header carries certificate trust.
+
 ### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
 
 - `forward_signal_send_to_http` resolved the forwarded `X-Agent-Id` from the wire `from_agent` through `resolve_agent_id`, so an MCP caller could forge the sender of a forwarded signal. It now uses `resolve_governance_subject` (the #3171 store-forward precedent): under an enforced caller a mismatching `from_agent` is refused with `agent_id mismatch` before any network I/O, and an absent value is filled from the caller. The HTTP handler already stamps `from_agent` from the header and ignores the body field.

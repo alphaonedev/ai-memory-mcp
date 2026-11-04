@@ -12,13 +12,10 @@
 //! (SR-4) flagged the three-surface parity gap. CLI lands separately;
 //! this module pins the HTTP half.
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -52,7 +49,7 @@ pub struct ShareBody {
 /// ```
 pub async fn share_memory(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<ShareBody>,
 ) -> impl IntoResponse {
     // v1.0.0 #3379 — per-agent-key identity gate BEFORE the caller is resolved

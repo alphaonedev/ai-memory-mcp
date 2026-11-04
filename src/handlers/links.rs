@@ -23,6 +23,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
@@ -343,7 +345,7 @@ fn unknown_link_body_fields(raw: &serde_json::Value) -> Option<Vec<String>> {
 
 pub async fn create_link(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // #1924 (CWE-288) — consult the PRE-LINK enforcement gate before the link
@@ -906,7 +908,7 @@ pub async fn create_link(
 /// create-link fanout is sufficient.
 pub async fn delete_link(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // v0.7.0 G-PHASE-E-1 (#706) — mirror create_link: reject unknown
@@ -1141,7 +1143,7 @@ pub async fn delete_link(
 
 pub async fn get_links(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
@@ -1321,7 +1323,7 @@ pub struct LineageQuery {
 /// through a foreign private root.
 pub async fn get_lineage(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<LineageQuery>,
 ) -> impl IntoResponse {

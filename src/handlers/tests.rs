@@ -17365,7 +17365,7 @@ async fn http_share_masks_hidden_and_missing_sources_3379() {
     for id in [&source.id, &Uuid::new_v4().to_string()] {
         let response = super::share::share_memory(
             axum::extract::State(app.clone()),
-            headers.clone(),
+            headers.clone().into(),
             Json(super::share::ShareBody {
                 source_memory_id: id.clone(),
                 target_agent_id: "ai:carol".to_string(),
@@ -17415,7 +17415,7 @@ async fn http_share_owner_allowed_collective_reader_refused_3379() {
         headers.insert(crate::HEADER_AGENT_ID, caller.parse().expect("header"));
         let response = super::share::share_memory(
             axum::extract::State(app.clone()),
-            headers,
+            headers.into(),
             Json(super::share::ShareBody {
                 source_memory_id: source.id.clone(),
                 target_agent_id: "ai:carol".to_string(),

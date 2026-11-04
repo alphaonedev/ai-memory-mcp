@@ -20,6 +20,10 @@ use axum::http::{Request, StatusCode};
 use tempfile::TempDir;
 use tower::ServiceExt as _;
 
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
 const SHARED_KEY: &str = "shared-transport-8590";
 const ENROLLED_KEY: &str = "unrelated-agent-key-8590";
 const ENROLLED_AGENT: &str = "ai:enrolled-8590";
@@ -29,6 +33,12 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MISSING_MEMORY: &str = "/api/v1/memories/85908590-8590-4590-8590-859085908590";
 
 fn build_enforce_router() -> (axum::Router, TempDir) {
+    build_router_with_store(None)
+}
+
+fn build_router_with_store(
+    postgres: Option<Arc<dyn ai_memory::store::MemoryStore>>,
+) -> (axum::Router, TempDir) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let root = PathBuf::from(".local-runs").join("identity-8590");
     std::fs::create_dir_all(&root).expect("scratch root");
@@ -42,8 +52,15 @@ fn build_enforce_router() -> (axum::Router, TempDir) {
         ResolvedTtl::default(),
         true,
     )));
-    let store: Arc<dyn ai_memory::store::MemoryStore> =
-        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let (store, storage_backend): (Arc<dyn ai_memory::store::MemoryStore>, _) = match postgres {
+        Some(store) => (store, ai_memory::handlers::StorageBackend::Postgres),
+        None => (
+            Arc::new(
+                ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"),
+            ),
+            ai_memory::handlers::StorageBackend::Sqlite,
+        ),
+    };
 
     let mut enrolled = HashMap::new();
     enrolled.insert(api_key_sha256_hex(ENROLLED_KEY), ENROLLED_AGENT.to_string());
@@ -62,7 +79,7 @@ fn build_enforce_router() -> (axum::Router, TempDir) {
         mcp_config: Arc::new(None),
         active_keypair: Arc::new(None),
         family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
-        storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
+        storage_backend,
         store,
         llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
@@ -183,4 +200,126 @@ async fn missing_off_and_unmapped_bindings_do_not_elevate_8590() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn certificate_context_is_request_local_8590() {
+    let (router, _dir) = build_enforce_router();
+    let binding =
+        ClientCertAgentBinding::new(Some(CERT_AGENT.to_string()), AgentBindingMode::Enforce);
+    tokio::join!(
+        check(
+            router.clone(),
+            request(MISSING_MEMORY, CERT_AGENT, Some(binding)),
+            StatusCode::NOT_FOUND
+        ),
+        check(
+            router.clone(),
+            request(MISSING_MEMORY, CERT_AGENT, None),
+            StatusCode::FORBIDDEN
+        ),
+    );
+    check(
+        router,
+        request(MISSING_MEMORY, CERT_AGENT, None),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resolver_requires_exact_caller_and_preserves_key_fallback_8590() {
+    use ai_memory::handlers::identity_binding::{
+        AuthLevel, EnrolledAgentKeys, IdentityHeaders, resolve_auth_level,
+    };
+    use axum::extract::FromRequestParts as _;
+    let enrolled = EnrolledAgentKeys::from_map(HashMap::from([(
+        api_key_sha256_hex(ENROLLED_KEY),
+        ENROLLED_AGENT.to_string(),
+    )]));
+    let binding =
+        ClientCertAgentBinding::new(Some(CERT_AGENT.to_string()), AgentBindingMode::Enforce);
+    let (mut parts, _) = request(MISSING_MEMORY, CERT_AGENT, Some(binding)).into_parts();
+    let headers = IdentityHeaders::from_request_parts(&mut parts, &())
+        .await
+        .expect("extract headers");
+    assert_eq!(
+        resolve_auth_level(&enrolled, &headers, CERT_AGENT),
+        AuthLevel::KeyAuthenticated
+    );
+    assert_eq!(
+        resolve_auth_level(&enrolled, &headers, OTHER_AGENT),
+        AuthLevel::Claimed
+    );
+    // A wire-only copy carries no certificate proof, even with identical headers.
+    let mut wire_only = IdentityHeaders::from(parts.headers);
+    assert_eq!(
+        resolve_auth_level(&enrolled, &wire_only, CERT_AGENT),
+        AuthLevel::Claimed
+    );
+    wire_only.insert("x-api-key", ENROLLED_KEY.parse().expect("key header"));
+    assert_eq!(
+        resolve_auth_level(&enrolled, &wire_only, ENROLLED_AGENT),
+        AuthLevel::KeyAuthenticated
+    );
+    assert_eq!(
+        resolve_auth_level(&enrolled, &wire_only, CERT_AGENT),
+        AuthLevel::Claimed
+    );
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_certificate_gate_parity_8590() {
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_certificate_gate_parity_8590: AI_MEMORY_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let scratch = pg_barrier::ScratchDb::create(&url, "ai_memory_8590")
+        .await
+        .expect("scratch database");
+    let store = Arc::new(
+        ai_memory::store::postgres::PostgresStore::connect(&scratch.url())
+            .await
+            .expect("PostgresStore"),
+    );
+    let (router, _dir) = build_router_with_store(Some(store.clone()));
+    let binding =
+        || ClientCertAgentBinding::new(Some(CERT_AGENT.to_string()), AgentBindingMode::Enforce);
+    check(
+        router.clone(),
+        request(MISSING_MEMORY, CERT_AGENT, Some(binding())),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    check(
+        router.clone(),
+        request("/api/v1/memories", CERT_AGENT, Some(binding())),
+        StatusCode::OK,
+    )
+    .await;
+    check(
+        router.clone(),
+        request(MISSING_MEMORY, OTHER_AGENT, Some(binding())),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    for context in [
+        None,
+        Some(ClientCertAgentBinding::new(
+            Some(CERT_AGENT.to_string()),
+            AgentBindingMode::Off,
+        )),
+        Some(ClientCertAgentBinding::new(None, AgentBindingMode::Enforce)),
+    ] {
+        check(
+            router.clone(),
+            request(MISSING_MEMORY, CERT_AGENT, context),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    }
+    drop(router);
+    drop(store);
+    drop(scratch);
 }

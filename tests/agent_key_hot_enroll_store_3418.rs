@@ -64,7 +64,7 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
     // Start from the posture a daemon boots with when nothing is enrolled.
     let registry = EnrolledAgentKeys::empty();
     assert_eq!(
-        resolve_auth_level(&registry, &headers, agent),
+        resolve_auth_level(&registry, &headers.clone().into(), agent),
         AuthLevel::Claimed,
         "an empty registry leaves every caller merely claimed"
     );
@@ -86,7 +86,7 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
         "the refresh must install the freshly enrolled key, got {outcome:?}"
     );
     assert_eq!(
-        resolve_auth_level(&registry, &headers, agent),
+        resolve_auth_level(&registry, &headers.clone().into(), agent),
         AuthLevel::KeyAuthenticated,
         "the key enrolled a moment ago must authenticate with NO daemon restart"
     );
@@ -104,7 +104,7 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
         "a revocation is a change the refresh must install, got {outcome:?}"
     );
     assert_eq!(
-        resolve_auth_level(&registry, &headers, agent),
+        resolve_auth_level(&registry, &headers.clone().into(), agent),
         AuthLevel::Claimed,
         "a REVOKED key must stop authenticating without a restart — a revocation \
          that waits for one is a credential the operator has been told is dead"

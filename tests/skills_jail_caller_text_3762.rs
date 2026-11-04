@@ -296,7 +296,7 @@ async fn http_register_escape_matches_mcp_byte_for_byte_3762() {
     };
     let resp = ai_memory::handlers::skill_register_route(
         axum::extract::State(app),
-        admin_headers(),
+        admin_headers().into(),
         axum::Json(params),
     )
     .await
@@ -331,7 +331,7 @@ async fn http_register_inline_succeeds_control_3762() {
     let app = app_state_sqlite(&db_path);
     let resp = ai_memory::handlers::skill_register_route(
         axum::extract::State(app),
-        admin_headers(),
+        admin_headers().into(),
         axum::Json(inline_skill("http-inline-ok-3762")),
     )
     .await
@@ -373,7 +373,7 @@ async fn http_export_escape_matches_mcp_byte_for_byte_3762() {
     };
     let resp = ai_memory::handlers::skill_export_route(
         axum::extract::State(app),
-        admin_headers(),
+        admin_headers().into(),
         axum::extract::Path(skill_id),
         axum::Json(ai_memory::handlers::SkillExportBody {
             target_folder: outside_s.clone(),
@@ -422,7 +422,7 @@ async fn http_export_relative_succeeds_control_3762() {
     let store_dir_canon = canon_spelling(dir.path());
     let resp = ai_memory::handlers::skill_export_route(
         axum::extract::State(app),
-        admin_headers(),
+        admin_headers().into(),
         axum::extract::Path(skill_id),
         axum::Json(ai_memory::handlers::SkillExportBody {
             target_folder: "nested/3762-ok".to_string(),

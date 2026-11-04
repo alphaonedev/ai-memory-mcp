@@ -16,11 +16,13 @@
 //! * `POST   /api/v1/archive/{id}/restore` → [`restore_archive`]
 //! * `GET    /api/v1/archive/stats`        → [`archive_stats`]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -53,7 +55,7 @@ fn default_archive_limit() -> Option<usize> {
 
 pub async fn list_archive(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<ArchiveListQuery>,
 ) -> impl IntoResponse {
     // #943 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
@@ -124,7 +126,7 @@ pub async fn list_archive(
 
 pub async fn restore_archive(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
@@ -290,7 +292,7 @@ pub struct PurgeQuery {
 
 pub async fn purge_archive(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<PurgeQuery>,
 ) -> impl IntoResponse {
     // #2132 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
@@ -406,7 +408,7 @@ pub async fn purge_archive(
 
 pub async fn archive_stats(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
 ) -> impl IntoResponse {
     // #943 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
     // only gate. Pre-fix any caller could enumerate archive table
@@ -467,7 +469,7 @@ pub struct ArchiveByIdsBody {
 #[allow(clippy::too_many_lines)]
 pub async fn archive_by_ids(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<ArchiveByIdsBody>,
 ) -> impl IntoResponse {
     // Bound the batch the same way bulk_create / sync_push do.

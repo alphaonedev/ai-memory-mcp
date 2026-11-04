@@ -191,6 +191,8 @@
 //! [#3530]: https://github.com/alphaonedev/ai-memory-mcp/issues/3530
 //! [#3535]: https://github.com/alphaonedev/ai-memory-mcp/issues/3535
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -1108,7 +1110,7 @@ async fn refresh_registry(app: &AppState, add: Option<(&str, &str)>, remove_agen
 /// is returned exactly once, `Cache-Control: no-store`.
 pub async fn mint_agent_api_key(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(agent_id): Path<String>,
     body: Bytes,
 ) -> Response {
@@ -1358,7 +1360,7 @@ pub async fn mint_agent_api_key(
 /// agent, immediately or through the approval gate.
 pub async fn revoke_agent_api_key(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(agent_id): Path<String>,
     body: Bytes,
 ) -> Response {
