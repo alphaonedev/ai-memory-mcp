@@ -1371,6 +1371,35 @@ on the data-tier host, MCP stdio) is unchanged. A refused request returns 403,
 binds nothing, and writes a `bind_agent_pubkey` /
 `claimed_admin_not_key_authenticated` row to the forensic audit chain.
 
+**Minting and revoking an api-key needs a verified admin (#8535).**
+`POST /api/v1/agents/{id}/api-key` and `POST /api/v1/agents/{id}/api-key/revoke`
+use the same principal gate as the pubkey bind above: a CLAIMED admin header
+(the shared `api_key` plus `X-Agent-Id: <admin>`) is refused with `403`,
+an `agent_api_key_mint` / `agent_api_key_revoke` row with reason
+`claimed_admin_not_key_authenticated` lands on the forensic audit chain, and no
+key is stored or removed. Without this a header claim could mint an admin's own
+per-agent key and so satisfy the bind gate. The route requires either an admin
+presenting its own enrolled per-agent key, or the explicit operator opt-in
+`AI_MEMORY_ADMIN_HEADER_TRUST=1`. **Bootstrapping the first admin key** (the
+supported path is the local-operator CLI on the data-tier host, which is
+ungated): write the token (at least 32 bytes) to an owner-only file and enrol it from that file.
+The CLI refuses a token on argv (`--token`, #3781) because argv is
+world-readable via `/proc/<pid>/cmdline`:
+
+```bash
+( umask 077; openssl rand -hex 32 > /etc/ai-memory/admin-key.token )
+ai-memory agents bind-api-key --agent-id <admin> \
+  --token-file /etc/ai-memory/admin-key.token
+```
+
+`AI_MEMORY_AGENT_API_KEY_FILE=/etc/ai-memory/admin-key.token` is the equivalent
+environment channel. The admin then presents the file's contents as `X-API-Key`.
+The alternative, **WARN-flagged and weaker**: start the daemon once with
+`AI_MEMORY_ADMIN_HEADER_TRUST=1` (the boot WARN names it), mint the key over
+HTTP, then unset the variable; while it is set, any header claim passes these
+routes. A malformed `{id}` is a `400` before any audit row is written (#8536),
+on these routes and on the pubkey bind routes.
+
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
 
 ### Multi-User Warning
@@ -1432,17 +1461,19 @@ path, unchanged, and the one to reach for when the daemon is not going to be
 reconfigured:
 
 ```bash
-# sqlite data tier (run on the host holding the database file)
-ai-memory agents bind-api-key --agent-id svc-indexer --token "$TOKEN"
+# sqlite data tier (run on the host holding the database file). The token is
+# read from an owner-only (0600) file: a token on argv is refused (#3781).
+ai-memory agents bind-api-key --agent-id svc-indexer \
+  --token-file /etc/ai-memory/svc-indexer.token
 ai-memory agents revoke-api-key --agent-id svc-indexer
 
 # postgres data tier — prefer the AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE
 # channel over --store-url: a URL on argv is world-readable via /proc/<pid>/cmdline
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory agents bind-api-key \
-  --agent-id svc-indexer --token "$TOKEN"
+  --agent-id svc-indexer --token-file /etc/ai-memory/svc-indexer.token
 ```
 
-You generate the token; the CLI stores only its SHA-256 digest and never the
+You generate the token into that file; the CLI stores only its SHA-256 digest and never the
 token. Make it at least 32 bytes — the HTTP route refuses anything shorter, and
 a weaker secret is no better for being typed on a shell. Enrolment and
 revocation reach a RUNNING daemon within `AI_MEMORY_AGENT_KEY_REFRESH_SECS`

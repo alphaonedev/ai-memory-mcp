@@ -94,6 +94,69 @@ pub fn pubkey_bind_principal_admitted(
     level.is_key_bound() || header_trust_opt_in
 }
 
+/// #8494 / #8535 — stable audit reason for a credential mutation refused
+/// because the admin was only a header claim, not a key-authenticated
+/// principal.
+pub const CLAIMED_ADMIN_REASON: &str = "claimed_admin_not_key_authenticated";
+
+/// #8494 / #8535 — one credential-mutating route's refusal vocabulary.
+///
+/// `action` is the audit action, `issue_label` the audit issue tag and
+/// `required_msg` the wire message of the typed 403. All three are `'static`
+/// so no caller-controlled byte can reach the signed chain through them.
+#[derive(Debug, Clone, Copy)]
+pub struct PrincipalGate {
+    pub action: &'static str,
+    pub issue_label: &'static str,
+    pub required_msg: &'static str,
+}
+
+/// #8494 / #8535 — require a VERIFIED principal for a credential mutation
+/// (public-key bind, api-key mint, api-key revoke).
+///
+/// `caller` is the id [`require_admin`] already admitted and `agent_id` the
+/// path id, which the caller MUST have validated first: the deny row below
+/// carries it, and the audit chain is signed and append-only (#3529 / #8536,
+/// validate before audit). The caller is admitted only when key-bound to its
+/// own admin id (the presented `X-API-Key` is its enrolled per-agent key) or
+/// when the operator opted into [`ENV_ADMIN_HEADER_TRUST`]; a merely claimed
+/// admin gets a typed 403 and a durable `deny` row, and nothing is changed.
+/// The gate runs before any store call, so SQLite and Postgres behave alike.
+///
+/// # Errors
+///
+/// Returns the typed 403 response for a claimed (unverified) admin.
+pub fn require_key_bound_admin(
+    app: &AppState,
+    headers: &HeaderMap,
+    caller: &str,
+    agent_id: &str,
+    gate: &PrincipalGate,
+) -> Result<(), Response> {
+    let level = crate::handlers::identity_binding::resolve_auth_level(
+        &app.enrolled_agent_keys,
+        headers,
+        caller,
+    );
+    if pubkey_bind_principal_admitted(level, admin_header_trust_enabled()) {
+        return Ok(());
+    }
+    crate::governance::audit::record_decision(
+        caller,
+        "deny",
+        gate.action,
+        gate.issue_label,
+        crate::governance::audit::ForensicPayload::new()
+            .ident("agent_id", agent_id)
+            .label("reason", CLAIMED_ADMIN_REASON),
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": gate.required_msg})),
+    )
+        .into_response())
+}
+
 /// #3065 (Wave-2 Cluster B, cert-core) — resolved inputs to the certified-
 /// posture `ADMIN_HEADER_TRUST` identity boot-gate.
 ///

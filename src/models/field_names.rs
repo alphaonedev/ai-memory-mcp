@@ -107,6 +107,22 @@ pub const ATOM_OF: &str = "atom_of";
 pub const MENTIONED_ENTITY_ID: &str = "mentioned_entity_id";
 /// `attest_level` — wire/row field name.
 pub const ATTEST_LEVEL: &str = "attest_level";
+/// `shared_from` — id of the source row a `memory_share` copy was cloned from
+/// (#8513 re-owned-row provenance).
+pub const SHARED_FROM: &str = "shared_from";
+/// `shared_from_agent_id` — owner of the source row of a shared copy.
+pub const SHARED_FROM_AGENT_ID: &str = "shared_from_agent_id";
+/// `atomised_from` — id of the source row an atom was decomposed from (#8513).
+pub const ATOMISED_FROM: &str = "atomised_from";
+/// `atomised_from_agent_id` — owner of the source row of an atom (#8513).
+pub const ATOMISED_FROM_AGENT_ID: &str = "atomised_from_agent_id";
+/// `promoted_from` — id of the source row a promotion clone was built from.
+pub const PROMOTED_FROM: &str = "promoted_from";
+/// `promoted_from_agent_id` — owner of the source row of a promotion clone.
+pub const PROMOTED_FROM_AGENT_ID: &str = "promoted_from_agent_id";
+/// `attest_reset_reason` — why a re-owned clone dropped the source row's
+/// attestation (#8513): the clone path that re-owned it.
+pub const ATTEST_RESET_REASON: &str = "attest_reset_reason";
 /// `attestation_downgraded` — import/sync report field name.
 pub const ATTESTATION_DOWNGRADED: &str = "attestation_downgraded";
 /// `resolved_at` — wire/row field name for a checkpoint's resolution timestamp

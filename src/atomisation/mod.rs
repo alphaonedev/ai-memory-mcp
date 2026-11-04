@@ -749,17 +749,29 @@ fn write_atom(
     // metadata.atom_index records the curator's 0-based ordering so
     // downstream consumers reproduce the parent's narrative flow.
     let mut metadata = match source.metadata.clone() {
-        serde_json::Value::Object(map) => map,
-        _ => serde_json::Map::new(),
+        object @ serde_json::Value::Object(_) => object,
+        _ => serde_json::Value::Object(serde_json::Map::new()),
     };
-    metadata.insert(
-        "agent_id".to_string(),
-        serde_json::Value::String(calling_agent_id.to_string()),
+    // #8513 — an atom is a re-owned row: drop the source attestation, name
+    // the source id and owner, set the calling agent as owner.
+    crate::identity::attest::reset_for_reowned_row(
+        &mut metadata,
+        Some(calling_agent_id),
+        &crate::identity::attest::ReownProvenance {
+            kind: crate::identity::attest::ReownKind::Atomise,
+            source_id: &source.id,
+            source_owner: source
+                .metadata
+                .get(crate::mcp::param_names::AGENT_ID)
+                .and_then(serde_json::Value::as_str),
+        },
     );
-    metadata.insert(
-        "atom_source_id".to_string(),
-        serde_json::Value::String(source.id.clone()),
-    );
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "atom_source_id".to_string(),
+            serde_json::Value::String(source.id.clone()),
+        );
+    }
 
     let mut mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
@@ -781,7 +793,7 @@ fn write_atom(
         updated_at: now,
         last_accessed_at: None,
         expires_at: None,
-        metadata: serde_json::Value::Object(metadata),
+        metadata,
         reflection_depth: source.reflection_depth,
         // Atoms inherit the parent's typed kind: Observation source →
         // Observation atoms (the WT-1-B brief case). Reflection sources

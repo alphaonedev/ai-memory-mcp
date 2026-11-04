@@ -53,7 +53,7 @@ use ai_memory::handlers::agent_api_key::{
 };
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
-use ai_memory::store::MemoryStore;
+use ai_memory::store::{CallerContext, MemoryStore};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -114,10 +114,60 @@ struct Fixture {
     _dir: TempDir,
 }
 
+/// #8567 - the fixture runs on the PRODUCTION default posture: the operator
+/// opt-in `AI_MEMORY_ADMIN_HEADER_TRUST` is NOT set. Every admin below is
+/// enrolled in the live registry under its OWN per-agent key and the request
+/// builders present that key, so the principal gate (#8535) admits the caller
+/// as a key-authenticated admin exactly as it does in production. A request
+/// that presented only a claimed `X-Agent-Id` would be refused with 403
+/// `claimed_admin_not_key_authenticated`; the one test that covers the opt-in
+/// escape hatch is `opt_in_arm_still_admits_a_claimed_admin_8535`.
+static ENROLLED_ADMINS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn admin_key(agent: &str) -> String {
+    format!("3474-admin-key-{agent}")
+}
+
+/// The `X-API-Key` a request from `caller` presents: the caller's own enrolled
+/// per-agent key when it is a fixture admin, the shared transport key otherwise
+/// (a non-admin must still reach the handler and be refused 403, not 401).
+fn request_key(caller: &str) -> String {
+    let admins = ENROLLED_ADMINS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if admins.iter().any(|a| a == caller) {
+        admin_key(caller)
+    } else {
+        SHARED_KEY.to_string()
+    }
+}
+
+/// Number of admin keys the fixture seeded into the registry (registry-only:
+/// the store, and so the #3529 last-key counts, never see them).
+fn seeded_admin_keys() -> usize {
+    ENROLLED_ADMINS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+/// Keys in the live registry beyond the admins' seeded ones: what the test's
+/// own mints and revokes left behind.
+fn minted_keys(fx: &Fixture) -> usize {
+    fx.registry.len().saturating_sub(seeded_admin_keys())
+}
+
+fn ensure_default_posture() {
+    // SAFETY: every test holds `serial()` before building a fixture, so no
+    // other thread of this binary reads or writes the env concurrently.
+    unsafe { std::env::remove_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST) };
+}
+
 /// Build a fully wired sqlite daemon router whose `AppState` and
-/// `ApiKeyState` share ONE live registry `Arc` — exactly as `bootstrap_serve`
+/// `ApiKeyState` share ONE live registry `Arc`, exactly as `bootstrap_serve`
 /// wires them, which is what makes "effective on the next request" testable.
 fn fixture(tag: &str, admins: &[&str]) -> Fixture {
+    ensure_default_posture();
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     mark_credential_transport_confidential(true);
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET.to_string()));
@@ -138,6 +188,15 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
         for a in admins.iter().copied().chain(std::iter::once(ALICE)) {
             ai_memory::db::register_agent(&conn, a, "human", &[]).expect("register agent");
         }
+        // #8567 - the admins' own per-agent keys are STORE rows, as in
+        // production: every mint/revoke re-reads the registry from the store,
+        // so a registry-only key would vanish on the first write.
+        for a in admins {
+            let outcome =
+                ai_memory::db::bind_agent_api_key(&conn, a, &api_key_sha256_hex(&admin_key(a)))
+                    .expect("seed admin key");
+            assert_eq!(outcome, ai_memory::storage::BindApiKeyOutcome::Bound);
+        }
     }
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
@@ -149,6 +208,19 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
     let store: Arc<dyn MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("SqliteStore"));
     let registry = Arc::new(EnrolledAgentKeys::empty());
+    {
+        let mut seeded = ENROLLED_ADMINS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seeded.clear();
+        seeded.extend(admins.iter().map(|a| (*a).to_string()));
+        registry.install(
+            admins
+                .iter()
+                .map(|a| (api_key_sha256_hex(&admin_key(a)), (*a).to_string()))
+                .collect(),
+        );
+    }
     let app_state = AppState {
         db,
         embedder: Arc::new(None),
@@ -236,7 +308,7 @@ fn mint_req(caller: &str, target: &str, body: &Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/api/v1/agents/{target}/api-key"))
-        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_API_KEY, request_key(caller))
         .header(ai_memory::HEADER_AGENT_ID, caller)
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(body).expect("serialise")))
@@ -244,11 +316,17 @@ fn mint_req(caller: &str, target: &str, body: &Value) -> Request<Body> {
 }
 
 fn revoke_req(caller: &str, target: &str, body: &Value) -> Request<Body> {
+    revoke_req_with_key(caller, &request_key(caller), target, body)
+}
+
+/// A revoke presenting an explicit `X-API-Key`. `SHARED_KEY` here is a
+/// CLAIMED admin: the shared transport key plus an `X-Agent-Id` header.
+fn revoke_req_with_key(caller: &str, key: &str, target: &str, body: &Value) -> Request<Body> {
     let raw = serde_json::to_string(body).expect("serialise");
     let mut b = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/agents/{target}/api-key/revoke"))
-        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_API_KEY, key)
         .header(ai_memory::HEADER_AGENT_ID, caller)
         .header("content-type", "application/json");
     // The approve arm rides the SAME K10 HMAC gate as
@@ -344,7 +422,7 @@ async fn admin_mint_binds_a_key_that_authenticates_the_very_next_request_3474() 
             .expect("resolve"),
         Some(ALICE.to_string())
     );
-    assert_eq!(fx.registry.len(), 1);
+    assert_eq!(minted_keys(&fx), 1);
 }
 
 /// ALLOWED — the BIND form (operator-supplied token) binds that token's digest
@@ -423,7 +501,7 @@ async fn a_non_admin_is_refused_identically_for_real_and_absent_targets_3474() {
         Some(ALICE.to_string()),
         "a refused call must not have revoked the existing binding"
     );
-    assert_eq!(fx.registry.len(), 1);
+    assert_eq!(minted_keys(&fx), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +608,7 @@ async fn the_rate_limiter_admits_the_budget_and_refuses_the_next_mint_3474() {
     assert_eq!(body["limit"], MINT_RATE_LIMIT_PER_WINDOW);
     // The refused mint bound nothing.
     assert_eq!(
-        fx.registry.len(),
+        minted_keys(&fx),
         MINT_RATE_LIMIT_PER_WINDOW as usize,
         "a rate-limited mint must not enrol a key"
     );
@@ -602,7 +680,7 @@ async fn revoking_another_principals_key_needs_a_second_approver_3474() {
         !token_authenticates(&fx.router, &token).await,
         "the revoked token must stop authenticating immediately"
     );
-    assert_eq!(fx.registry.len(), 0);
+    assert_eq!(minted_keys(&fx), 0);
 
     // 4. REPLAY — the same approval cannot be spent twice. On the revoke side
     //    a second application is merely idempotent, but the SAME code path
@@ -651,7 +729,7 @@ async fn an_approval_signature_cannot_be_presented_by_another_principal_3474() {
     let stolen = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/agents/{ALICE}/api-key/revoke"))
-        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_API_KEY, request_key(ADMIN))
         .header(ai_memory::HEADER_AGENT_ID, ADMIN)
         .header("content-type", "application/json")
         .header(ai_memory::HEADER_AI_MEMORY_SIGNATURE, sig)
@@ -684,7 +762,7 @@ async fn an_unsigned_approval_is_refused_by_the_same_hmac_gate_3474() {
     let unsigned = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/agents/{ALICE}/api-key/revoke"))
-        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_API_KEY, request_key(APPROVER))
         .header(ai_memory::HEADER_AGENT_ID, APPROVER)
         .header("content-type", "application/json")
         .body(Body::from(
@@ -742,7 +820,7 @@ async fn revoking_the_last_enrolled_key_is_parked_even_for_yourself_3474() {
 
     let (_, body, _) = mint(&fx.router, ADMIN, ADMIN).await;
     let token = body["token"].as_str().expect("token").to_string();
-    assert_eq!(fx.registry.len(), 1);
+    assert_eq!(minted_keys(&fx), 1);
 
     let (status, _, body) = call(&fx.router, revoke_req(ADMIN, ADMIN, &json!({}))).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -771,7 +849,7 @@ async fn a_mint_over_a_non_confidential_transport_is_refused_3474() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"], TRANSPORT_REFUSAL);
     assert_eq!(
-        fx.registry.len(),
+        minted_keys(&fx),
         0,
         "a refused mint must not enrol anything"
     );
@@ -805,7 +883,7 @@ async fn a_supplied_token_below_the_minimum_is_refused_and_binds_nothing_3474() 
         "the refusal echoed the candidate token: {body}"
     );
     assert_eq!(
-        fx.registry.len(),
+        minted_keys(&fx),
         0,
         "a refused weak token must not enrol anything"
     );
@@ -841,7 +919,7 @@ async fn a_malformed_body_is_refused_without_echoing_it_3474() {
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/agents/{ALICE}/api-key"))
-        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_API_KEY, request_key(ADMIN))
         .header(ai_memory::HEADER_AGENT_ID, ADMIN)
         .header("content-type", "application/json")
         .body(Body::from(format!(
@@ -854,7 +932,7 @@ async fn a_malformed_body_is_refused_without_echoing_it_3474() {
         !body.to_string().contains(leak),
         "the refusal echoed the request body: {body}"
     );
-    assert_eq!(fx.registry.len(), 0);
+    assert_eq!(minted_keys(&fx), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -899,13 +977,10 @@ async fn two_concurrent_self_revokes_by_the_last_two_holders_leave_one_key_3529(
     let _g = serial().await;
     let fx = fixture("lastkeyrace", &[ADMIN_A, ADMIN_B]);
 
-    // The last TWO key-holders: each holds exactly one key, and it is its own.
-    let (status, a_body, _) = mint(&fx.router, ADMIN_A, ADMIN_A).await;
-    assert_eq!(status, StatusCode::OK, "{a_body}");
-    let a_token = a_body["token"].as_str().expect("token").to_string();
-    let (status, b_body, _) = mint(&fx.router, ADMIN_B, ADMIN_B).await;
-    assert_eq!(status, StatusCode::OK, "{b_body}");
-    let b_token = b_body["token"].as_str().expect("token").to_string();
+    // The last TWO key-holders: each admin holds exactly one key (the one the
+    // fixture enrolled for it, and the one its requests authenticate with).
+    let a_token = admin_key(ADMIN_A);
+    let b_token = admin_key(ADMIN_B);
     assert_eq!(fx.registry.len(), 2);
 
     // Both self-revokes are in flight at once. Each one's pre-check can
@@ -969,15 +1044,16 @@ async fn an_approved_revoke_that_became_the_last_key_is_refused_at_apply_3529() 
     let audit_dir = scratch("audit-applylast");
     ai_memory::governance::audit::init(audit_dir.path(), None).expect("forensic init");
 
-    // Two holders: ALICE and the admin itself.
+    // Holders: the admin and the approver (their fixture-enrolled keys) plus
+    // ALICE (minted here).
     let (_, alice_body, _) = mint(&fx.router, ADMIN, ALICE).await;
     let alice_token = alice_body["token"].as_str().expect("token").to_string();
-    let (_, admin_body, _) = mint(&fx.router, ADMIN, ADMIN).await;
-    let admin_token = admin_body["token"].as_str().expect("token").to_string();
-    assert_eq!(fx.registry.len(), 2);
+    let admin_token = admin_key(ADMIN);
+    assert_eq!(fx.registry.len(), 3);
 
-    // Park a revoke of ANOTHER principal's key. Two holders exist, so this
-    // does NOT empty the registry and the queued row says so.
+    // Park a revoke of ANOTHER principal's key. Three holders exist (the
+    // admin, the approver and ALICE), so this does NOT empty the registry
+    // and the queued row says so.
     let (status, _, queued) = call(&fx.router, revoke_req(ADMIN, ALICE, &json!({}))).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
     assert_eq!(queued["reason"], "another_principal");
@@ -995,7 +1071,24 @@ async fn an_approved_revoke_that_became_the_last_key_is_refused_at_apply_3529() 
     let (status, _, body) = call(&fx.router, revoke_req(ADMIN, ADMIN, &json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!token_authenticates(&fx.router, &admin_token).await);
-    assert_eq!(fx.registry.len(), 1);
+    assert_eq!(fx.registry.len(), 2);
+
+    // The approver's own key leaves the STORE (the #3529 last-key count reads
+    // the store), so ALICE is now the only enrolled key. The approver stays
+    // transport-authenticated for this one request through a registry entry.
+    let revoked = fx
+        .store
+        .revoke_agent_api_key(&CallerContext::for_admin("ai:test-fixture"), APPROVER)
+        .await
+        .expect("drop the approver's store key");
+    assert_eq!(revoked, 1);
+    let mut map = (*fx.registry.snapshot()).clone();
+    map.insert(
+        api_key_sha256_hex(&admin_key(APPROVER)),
+        APPROVER.to_string(),
+    );
+    fx.registry.install(map);
+    assert_eq!(fx.store.list_agent_api_keys().await.expect("list").len(), 1);
 
     // A DIFFERENT registered approver presents the approval. Refused.
     let (status, _, refused) = call(
@@ -1017,7 +1110,7 @@ async fn an_approved_revoke_that_became_the_last_key_is_refused_at_apply_3529() 
 
     // Nothing was revoked.
     assert_eq!(
-        fx.registry.len(),
+        fx.store.list_agent_api_keys().await.expect("list").len(),
         1,
         "the refused apply must change nothing"
     );
@@ -1113,7 +1206,7 @@ async fn a_well_formed_id_over_a_non_confidential_transport_still_refuses_3530()
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"], TRANSPORT_REFUSAL);
     assert_eq!(
-        fx.registry.len(),
+        minted_keys(&fx),
         0,
         "a transport-refused mint must not enrol anything"
     );
@@ -1169,7 +1262,7 @@ async fn an_unregistered_target_is_refused_on_both_forms_and_binds_nothing_3535(
 
     // Nothing durable and nothing live: no binding for the ghost, and the
     // operator-supplied token does not authenticate.
-    assert_eq!(fx.registry.len(), 0, "a refused mint must enrol nothing");
+    assert_eq!(minted_keys(&fx), 0, "a refused mint must enrol nothing");
     assert_eq!(
         fx.store
             .agent_id_for_api_key(&api_key_sha256_hex(supplied))
@@ -1323,7 +1416,7 @@ async fn a_digest_bound_to_another_agent_is_refused_not_repointed_3535() {
         Some(ALICE.to_string()),
         "a refused re-bind must leave the incumbent binding exactly as it was"
     );
-    assert_eq!(fx.registry.len(), 1);
+    assert_eq!(minted_keys(&fx), 1);
     assert!(token_authenticates(&fx.router, token).await);
 
     // ALLOWED — the SAME (agent, digest) pair is an idempotent success, so the
@@ -1345,7 +1438,7 @@ async fn a_digest_bound_to_another_agent_is_refused_not_repointed_3535() {
             .expect("resolve"),
         Some(ALICE.to_string())
     );
-    assert_eq!(fx.registry.len(), 1);
+    assert_eq!(minted_keys(&fx), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,7 +1484,7 @@ fn mint_approve_req(caller: &str, target: &str, pending_id: &str) -> Request<Bod
     Request::builder()
         .method("POST")
         .uri(format!("/api/v1/agents/{target}/api-key"))
-        .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+        .header(ai_memory::HEADER_API_KEY, request_key(caller))
         .header(ai_memory::HEADER_AGENT_ID, caller)
         .header(ai_memory::HEADER_AI_MEMORY_SIGNATURE, sig)
         .header(ai_memory::HEADER_AI_MEMORY_TIMESTAMP, ts)
@@ -1428,7 +1521,7 @@ async fn a_queued_mint_returns_its_token_to_the_approver_not_the_requester_3535(
         queued.get("token").is_none(),
         "the requester's 202 must carry NO token — none has been minted yet: {queued}"
     );
-    assert_eq!(fx.registry.len(), 0, "a queued mint enrols nothing");
+    assert_eq!(minted_keys(&fx), 0, "a queued mint enrols nothing");
     let pending_id = queued["pending_id"]
         .as_str()
         .expect("pending_id")
@@ -1456,7 +1549,107 @@ async fn a_queued_mint_returns_its_token_to_the_approver_not_the_requester_3535(
             .expect("resolve"),
         Some(ALICE.to_string())
     );
-    assert_eq!(fx.registry.len(), 1);
+    assert_eq!(minted_keys(&fx), 1);
+}
+
+// ---------------------------------------------------------------------------
+// #8567 — the default posture is pinned, and the opt-in arm is covered once.
+// ---------------------------------------------------------------------------
+
+/// The queued-revoke / two-approver APPLY path (`apply_approved`, which runs
+/// AFTER the principal gate) on the production default posture, with no
+/// operator opt-in. A CLAIMED approver (shared transport key plus an
+/// `X-Agent-Id` header naming a registered admin) is refused 403 at the gate
+/// and applies nothing; the same approver presenting its OWN enrolled key
+/// applies the parked revoke.
+///
+/// The assertion that would admit a claimed header if the gate regressed is the
+/// first `FORBIDDEN` check below: with the gate removed the claimed approver
+/// would reach `apply_approved` and the token would stop authenticating.
+#[tokio::test]
+async fn default_posture_claimed_approver_cannot_apply_a_parked_revoke_8567() {
+    const ADMIN: &str = "ai:key-admin-claimedapply";
+    const APPROVER: &str = "ai:key-approver-claimedapply";
+    let _g = serial().await;
+    let fx = fixture("claimedapply", &[ADMIN, APPROVER]);
+    assert!(
+        std::env::var_os(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST).is_none(),
+        "this test runs on the default posture: the operator opt-in is unset"
+    );
+
+    let (status, body, _) = mint(&fx.router, ADMIN, ALICE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["token"].as_str().expect("token").to_string();
+
+    let (status, _, queued) = call(&fx.router, revoke_req(ADMIN, ALICE, &json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    let pending_id = queued["pending_id"]
+        .as_str()
+        .expect("pending id")
+        .to_string();
+
+    // A CLAIMED approver is refused by the principal gate and applies nothing.
+    let approve = json!({ "approve_pending_id": pending_id.clone() });
+    let (status, _, refused) = call(
+        &fx.router,
+        revoke_req_with_key(APPROVER, SHARED_KEY, ALICE, &approve),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a claimed approver must not reach apply_approved: {refused}"
+    );
+    assert!(
+        token_authenticates(&fx.router, &token).await,
+        "a refused claimed approval must not have revoked anything"
+    );
+
+    // The same approver, key-bound, applies the parked revoke.
+    let (status, _, applied) = call(&fx.router, revoke_req(APPROVER, ALICE, &approve)).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["revoked"], true);
+    assert!(
+        !token_authenticates(&fx.router, &token).await,
+        "the key-bound approval must take effect immediately"
+    );
+}
+
+/// The ONE test of the escape hatch: with the operator opt-in
+/// `AI_MEMORY_ADMIN_HEADER_TRUST=1` a claimed admin header is re-admitted on
+/// the api-key mint route. Every other test in this binary runs on the
+/// default posture.
+#[tokio::test]
+async fn opt_in_arm_still_admits_a_claimed_admin_8535() {
+    const ADMIN: &str = "ai:key-admin-optin";
+    let _g = serial().await;
+    let fx = fixture("optin", &[ADMIN]);
+    let claimed = |target: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/agents/{target}/api-key"))
+            .header(ai_memory::HEADER_API_KEY, SHARED_KEY)
+            .header(ai_memory::HEADER_AGENT_ID, ADMIN)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .expect("build claimed mint")
+    };
+
+    // Default posture: refused.
+    let (status, _, body) = call(&fx.router, claimed(ALICE)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Opt-in: admitted.
+    // SAFETY: `serial()` is held, so no other test of this binary touches the env.
+    unsafe { std::env::set_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1") };
+    let (status, _, body) = call(&fx.router, claimed(ALICE)).await;
+    // SAFETY: as above; restore the default posture before asserting.
+    unsafe { std::env::remove_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST) };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "opt-in must re-admit the claim: {body}"
+    );
 }
 
 /// #8546 — the api-key approval arm verifies the length-prefixed layout 2

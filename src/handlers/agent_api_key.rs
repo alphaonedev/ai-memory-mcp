@@ -214,6 +214,22 @@ pub const MINT_ENDPOINT: &str = "agent_api_key_mint";
 /// `require_admin` endpoint tag + audit action for the revoke surface.
 pub const REVOKE_ENDPOINT: &str = "agent_api_key_revoke";
 
+/// #8535 — mint's refusal vocabulary for the shared verified-principal gate.
+const MINT_PRINCIPAL_GATE: crate::handlers::admin_role::PrincipalGate =
+    crate::handlers::admin_role::PrincipalGate {
+        action: MINT_ENDPOINT,
+        issue_label: "#8535",
+        required_msg: "minting an api key requires a key-authenticated admin (enrolled per-agent api key)",
+    };
+
+/// #8535 — revoke's refusal vocabulary for the shared verified-principal gate.
+const REVOKE_PRINCIPAL_GATE: crate::handlers::admin_role::PrincipalGate =
+    crate::handlers::admin_role::PrincipalGate {
+        action: REVOKE_ENDPOINT,
+        issue_label: "#8535",
+        required_msg: "revoking an api key requires a key-authenticated admin (enrolled per-agent api key)",
+    };
+
 /// Namespace the queued approval rows are filed under. The agent registry's
 /// own reserved namespace, so an operator who governs `_agents` governs
 /// credential enrolment with the policy they already wrote.
@@ -1137,6 +1153,17 @@ pub async fn mint_agent_api_key(
         )
             .into_response();
     }
+    // #8535 — a header-claimed admin is not a verified principal. Runs AFTER
+    // the id validation above (validate before audit, #3529 / #8536).
+    if let Err(resp) = crate::handlers::admin_role::require_key_bound_admin(
+        &app,
+        &headers,
+        &caller,
+        &agent_id,
+        &MINT_PRINCIPAL_GATE,
+    ) {
+        return resp;
+    }
     if !credential_transport_confidential() {
         audit(
             &caller,
@@ -1362,6 +1389,17 @@ pub async fn revoke_agent_api_key(
             Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response();
+    }
+    // #8535 — a header-claimed admin is not a verified principal. Runs AFTER
+    // the id validation above (validate before audit, #3529 / #8536).
+    if let Err(resp) = crate::handlers::admin_role::require_key_bound_admin(
+        &app,
+        &headers,
+        &caller,
+        &agent_id,
+        &REVOKE_PRINCIPAL_GATE,
+    ) {
+        return resp;
     }
     let parsed: RevokeApiKeyBody = match parse_body(&body) {
         Ok(b) => b,
