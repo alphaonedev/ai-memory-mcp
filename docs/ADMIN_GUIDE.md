@@ -1387,8 +1387,7 @@ The CLI refuses a token on argv (`--token`, #3781) because argv is
 world-readable via `/proc/<pid>/cmdline`:
 
 ```bash
-umask 077
-openssl rand -hex 32 > /etc/ai-memory/admin-key.token
+( umask 077; openssl rand -hex 32 > /etc/ai-memory/admin-key.token )
 ai-memory agents bind-api-key --agent-id <admin> \
   --token-file /etc/ai-memory/admin-key.token
 ```
