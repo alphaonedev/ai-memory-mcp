@@ -461,7 +461,7 @@ async fn postgres_claimed_admin_cannot_mint_but_env_principal_can_8535() {
         "{audit}"
     );
 
-    // #8574: the opt-in is the one-boot bootstrap only, so it admits on an
+    // #8574: the opt-in is bootstrap only, while this daemon's enrolled registry is empty (bootstrap, or after every key is revoked), so it admits on an
     // EMPTY registry.
     registry.install(std::collections::HashMap::new());
     set_header_trust(true);

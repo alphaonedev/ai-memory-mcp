@@ -73,7 +73,7 @@ fn scratch(tag: &str) -> TempDir {
 struct Fixture {
     router: axum::Router,
     store: Arc<dyn MemoryStore>,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 fn build_state(
@@ -167,11 +167,7 @@ fn fixture(tag: &str, mode: HttpIdentityMode, enroll_admin: bool, header_trust: 
     }
     let (state, store) = build_state(&registry, &dir, mode);
     let router = router_for(state, &registry, mode);
-    Fixture {
-        router,
-        store,
-        _dir: dir,
-    }
+    Fixture { router, store, dir }
 }
 
 fn req(method: &str, uri: &str, api_key: &str, body: &Value) -> Request<Body> {
@@ -371,7 +367,7 @@ async fn header_trust_refused_when_the_store_read_errors_8574() {
     let _g = serial().await;
     let fx = fixture("rderr", HttpIdentityMode::Advisory, false, true);
     {
-        let conn = ai_memory::db::open(&fx._dir.path().join("m.db")).expect("open for fault");
+        let conn = ai_memory::db::open(&fx.dir.path().join("m.db")).expect("open for fault");
         conn.execute_batch("DROP TABLE agent_api_keys")
             .expect("drop the key table to fault the read");
     }

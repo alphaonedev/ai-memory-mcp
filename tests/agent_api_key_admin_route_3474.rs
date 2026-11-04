@@ -1645,8 +1645,14 @@ async fn opt_in_arm_still_admits_a_claimed_admin_8535() {
     let (status, _, body) = call(&fx.router, claimed(ALICE)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
-    // Opt-in on an EMPTY registry (the one-boot bootstrap): admitted.
+    // Opt-in on an EMPTY registry (bootstrap, or after every key is revoked): admitted.
+    // The registry check is an authoritative store read (#8574), so the store
+    // rows go too (every key revoked), not only the in-memory snapshot.
     fx.registry.install(std::collections::HashMap::new());
+    ai_memory::db::open(&fx.db_path)
+        .expect("open for revoke-all")
+        .execute_batch("DELETE FROM agent_api_keys")
+        .expect("clear store keys");
     let (status, _, body) = call(&fx.router, claimed(ALICE)).await;
     // SAFETY: as above; restore the default posture before asserting.
     unsafe { std::env::remove_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST) };

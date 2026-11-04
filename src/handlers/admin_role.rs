@@ -126,38 +126,46 @@ pub struct PrincipalGate {
 /// validate before audit). The caller is admitted only when key-bound to its
 /// own admin id (the presented `X-API-Key` is its enrolled per-agent key) or
 /// when the operator opted into [`ENV_ADMIN_HEADER_TRUST`] AND the enrolled
-/// per-agent key registry is still empty (#8574: the opt-in is the one-boot
-/// bootstrap only; once a key is enrolled it is ignored here, in every identity
-/// mode, because the registry is the backstop and the claim must not extend
-/// it; a lost admin key is recovered with the CLI on the data tier); a merely claimed
+/// per-agent key registry is empty (#8574: confirmed by an authoritative store
+/// read through the SAL, refused on a store error; the opt-in is the bootstrap
+/// path while this daemon's registry is empty, or after every key is revoked;
+/// once a key is enrolled it is ignored here, in every identity mode, because
+/// the registry is the backstop and the claim must not extend it; a lost admin
+/// key is recovered with the CLI on the data tier); a merely claimed
 /// admin gets a typed 403 and a durable `deny` row, and nothing is changed.
 /// The gate runs before any store call, so SQLite and Postgres behave alike.
 ///
 /// # Errors
 ///
 /// Returns the typed 403 response for a claimed (unverified) admin.
-pub fn require_key_bound_admin(
+pub async fn require_key_bound_admin(
     app: &AppState,
     headers: &HeaderMap,
     caller: &str,
     agent_id: &str,
     gate: &PrincipalGate,
 ) -> Result<(), Response> {
-    let level = crate::handlers::identity_binding::resolve_auth_level(
-        &app.enrolled_agent_keys,
-        headers,
-        caller,
-    );
-    let opt_in = admin_header_trust_enabled();
-    let registry_empty = app.enrolled_agent_keys.snapshot().is_empty();
-    if pubkey_bind_principal_admitted(level, opt_in && registry_empty) {
+    // #3418 single-snapshot rule (REVIEW-8587-code-r1 L1): ONE registry view
+    // feeds both the auth level and the emptiness check below.
+    let snapshot = app.enrolled_agent_keys.snapshot();
+    let level =
+        crate::handlers::identity_binding::resolve_auth_level_in(&snapshot, headers, caller);
+    let mut header_trust_admits = false;
+    let mut reason = CLAIMED_ADMIN_REASON;
+    if !level.is_key_bound() && admin_header_trust_enabled() {
+        // #8574: the opt-in admits ONLY the arm where the registry is empty,
+        // and that is confirmed by an authoritative store read, never by the
+        // in-memory snapshot alone (a failed boot load installs an empty
+        // snapshot, and a CLI or peer-daemon enrollment is not in it until a
+        // refresh). A store error is an unknown state and refuses (fail closed).
+        reason = HEADER_TRUST_REFUSED_REASON;
+        if snapshot.is_empty() {
+            header_trust_admits = matches!(crate::handlers::agent_api_key::load_enrolled(app).await, Ok(rows) if rows.is_empty());
+        }
+    }
+    if pubkey_bind_principal_admitted(level, header_trust_admits) {
         return Ok(());
     }
-    let reason = if opt_in && !registry_empty {
-        HEADER_TRUST_REFUSED_REASON
-    } else {
-        CLAIMED_ADMIN_REASON
-    };
     crate::governance::audit::record_decision(
         caller,
         "deny",

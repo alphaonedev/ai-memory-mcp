@@ -376,7 +376,18 @@ pub fn resolve_auth_level(
     // #3418 — ONE snapshot for this decision. Taking it once (rather than
     // consulting the registry twice) means a concurrent refresh cannot make
     // the emptiness check and the lookup disagree.
-    let enrolled = enrolled.snapshot();
+    resolve_auth_level_in(&enrolled.snapshot(), headers, caller)
+}
+
+/// [`resolve_auth_level`] over an already-taken registry snapshot, so a caller
+/// that also needs the registry's emptiness (the #8574 credential-route gate)
+/// decides from the SAME view (#3418 single-snapshot rule).
+#[must_use]
+pub fn resolve_auth_level_in(
+    enrolled: &std::collections::HashMap<String, String>,
+    headers: &axum::http::HeaderMap,
+    caller: &str,
+) -> AuthLevel {
     if enrolled.is_empty() {
         return AuthLevel::Claimed;
     }
