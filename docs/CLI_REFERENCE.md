@@ -1439,6 +1439,15 @@ Walks the reflection-chain and writes Markdown to
 `~/.ai-memory/reflections/<ns>/<id>.md` by default. Pair with
 `auto_export_reflections_to_filesystem = true` for hands-off operation.
 
+Unix exports create current-user-owned mode 0700 roots and namespace directories
+and atomically publish mode 0600 files. Existing managed directories must already
+have mode 0700: choose a new private `--out-dir` or explicitly repair the owned
+export directories before retrying. Existing ancestors are never chmodded.
+Symlink directories and symlink/non-regular destinations are refused; platforms
+without Unix permissions refuse filesystem exports. See
+[file-backed export](RECURSIVE_LEARNING.md#file-backed-export) for migration and
+interrupted-export cleanup details.
+
 ### `persona` — QW-2 persona-as-artifact
 
 Build a persona from observation-kind memories for a given entity.
