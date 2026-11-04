@@ -98,5 +98,5 @@ fn recovers_lost_turns_and_is_idempotent_across_restart() {
     let second = recover_from_transcript(&db, &opts(transcript, "ai:sigkill:agent")).unwrap();
     assert_eq!(second.lines_atomised, 0, "restart must not re-atomise");
     assert_eq!(second.lines_skipped_dedup, 3, "all lines dedup-skipped");
-    assert!(second.memories_created.is_empty());
+    assert_eq!(second.memories_created, [] as [std::string::String; 0]);
 }

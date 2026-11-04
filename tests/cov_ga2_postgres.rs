@@ -428,7 +428,7 @@ async fn find_paths_inherent_connected_and_cte_branch() {
         .find_paths_cte(&a, &iso, Some(4), Some(10))
         .await
         .expect("find_paths_cte disconnected");
-    assert!(none.is_empty());
+    assert_eq!(none, [] as [std::vec::Vec<std::string::String>; 0]);
 }
 
 #[tokio::test]
@@ -915,7 +915,7 @@ async fn via_store_dispatchers_round_trip() {
     let pend = list_pending_actions_via_store(&store, Some("pending"), Some(&ns), 50)
         .await
         .expect("list_pending_actions_via_store");
-    assert!(pend.is_empty());
+    assert_eq!(pend, [] as [serde_json::Value; 0]);
 
     // kg_invalidate_via_store marks the edge.
     let inv = kg_invalidate_via_store(&store, &a, &b, "related_to", None, None)
@@ -1050,7 +1050,7 @@ async fn store_batch_empty_and_single_round_trip() {
     let ctx = CallerContext::for_agent("ai:ga2");
     // Empty batch → early-return empty ids.
     let none = store.store_batch(&ctx, &[]).await.expect("empty batch");
-    assert!(none.is_empty());
+    assert_eq!(none, [] as [std::string::String; 0]);
 
     // Single-row batch round-trips one id.
     let ns = uid("ga2-batch1");

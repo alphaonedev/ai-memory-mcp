@@ -336,11 +336,11 @@ async fn allowed_offline_wakes_coalesce_and_are_replayed_on_reconnect() {
     for _ in 0..welcome.pending_ids {
         let replay = reconnect.expect_frame().await;
         assert_eq!(replay.kind, Kind::Wake);
-        assert!(
-            !WakeMeta::decode(&replay.payload)
+        assert_ne!(
+            WakeMeta::decode(&replay.payload)
                 .expect("wake metadata")
-                .inbox_row_id
-                .is_empty()
+                .inbox_row_id,
+            ""
         );
     }
     hub.stop().await;

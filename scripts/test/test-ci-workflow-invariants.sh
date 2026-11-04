@@ -891,19 +891,19 @@ echo "  --- Section E: #3496 coverage profile aggregation ---"
 
 COVERAGE_YML="$ROOT/.github/workflows/coverage.yml"
 COVERAGE_SH="$ROOT/scripts/coverage.sh"
-RUST_ACTION_PIN="f8be11a05b1d4f3fcebe6410cc16743212b999b0"
+RUST_ACTION_PIN="4360b52568e2003a75bf9bc1d59f33a8e3fc893c"
 
 coverage_toolchain_ok() {
     local file="$1"
-    [ "$(grep -Fxc "        uses: dtolnay/rust-toolchain@$RUST_ACTION_PIN # 1.98.0" "$file" || true)" -eq 1 ] \
-        && [ "$(grep -Fxc '          toolchain: "1.98.0"' "$file" || true)" -eq 1 ]
+    [ "$(grep -Fxc "        uses: dtolnay/rust-toolchain@$RUST_ACTION_PIN # stable" "$file" || true)" -eq 1 ] \
+        && [ "$(grep -Fxc '          toolchain: "1.99.1"' "$file" || true)" -eq 1 ]
 }
 
 if coverage_toolchain_ok "$COVERAGE_YML"; then
-    ok "E: coverage pins the action revision and Rust toolchain to exact 1.98.0"
+    ok "E: coverage pins the action revision and Rust toolchain to exact 1.99.1"
 else
     bad "E: coverage Rust toolchain is floating or mis-pinned" \
-        "pin dtolnay/rust-toolchain@$RUST_ACTION_PIN and toolchain 1.98.0"
+        "pin dtolnay/rust-toolchain@$RUST_ACTION_PIN and toolchain 1.99.1"
 fi
 
 # R-203: prove both halves of the pin are load-bearing. A floating action ref
@@ -924,14 +924,14 @@ fi
 
 E_TOOLCHAIN_MUT="$SCRATCH/coverage-3496-toolchain-mutant.yml"
 awk '
-  !mutated && /toolchain: "1\.98\.0"/ {
-    sub(/toolchain: "1\.98\.0"/, "toolchain: \"stable\""); mutated = 1
+  !mutated && /toolchain: "1\.99\.1"/ {
+    sub(/toolchain: "1\.99\.1"/, "toolchain: \"stable\""); mutated = 1
   }
   { print }
 ' "$COVERAGE_YML" > "$E_TOOLCHAIN_MUT"
 if coverage_toolchain_ok "$E_TOOLCHAIN_MUT"; then
     bad "E regression: floating Rust toolchain mutant passed" \
-        "the exact 1.98.0 toolchain input check is vacuous"
+        "the exact 1.99.1 toolchain input check is vacuous"
 else
     ok "E regression: floating Rust toolchain mutant is rejected"
 fi

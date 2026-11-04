@@ -1887,12 +1887,12 @@ mod postgres_parity {
             .await
             .expect("generic SAL fresh insert");
         assert_eq!(store.agent_pubkey(&agent_id).await.expect("flat"), None);
-        assert!(
+        assert_eq!(
             store
                 .agent_pubkey_versions(&agent_id)
                 .await
-                .expect("history")
-                .is_empty()
+                .expect("history"),
+            [] as [ai_memory::storage::AgentPubkeyVersion; 0]
         );
         let (fresh_meta, fresh_content): (serde_json::Value, String) = sqlx::query_as(
             "SELECT metadata, content FROM memories WHERE namespace = $1 AND title = $2",

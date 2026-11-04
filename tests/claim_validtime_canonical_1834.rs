@@ -511,8 +511,14 @@ fn update_patch_canonicalizes_close_rendering() {
         "the update funnel must persist the canonical rendering of the close"
     );
     // End-exclusive at the close instant in ANY rendering.
-    assert!(titles_keyword(&conn, Some(BOUND_Z)).is_empty());
-    assert!(titles_keyword(&conn, Some(BOUND_OFFSET_UTC)).is_empty());
+    assert_eq!(
+        titles_keyword(&conn, Some(BOUND_Z)),
+        [] as [std::string::String; 0]
+    );
+    assert_eq!(
+        titles_keyword(&conn, Some(BOUND_OFFSET_UTC)),
+        [] as [std::string::String; 0]
+    );
     // Still valid strictly before the close.
     assert_eq!(
         titles_keyword(&conn, Some("2026-05-31T23:59:59Z")),

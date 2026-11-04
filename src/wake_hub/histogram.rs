@@ -95,7 +95,7 @@ impl LatencyHistogram {
         self.sum_us.fetch_add(us, Ordering::Relaxed);
         let _ = self
             .max_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 (us > cur).then_some(us)
             });
     }

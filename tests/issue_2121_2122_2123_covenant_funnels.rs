@@ -385,7 +385,7 @@ fn invalidation_cascade_succeeds_under_enforce_2122() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .expect("notification row exists under enforce");
-    assert!(!notif_id.is_empty());
+    assert_ne!(notif_id, "");
     let meta: serde_json::Value = serde_json::from_str(&meta_json).unwrap();
     assert_eq!(
         meta.get("why_trace").and_then(|v| v.as_str()),

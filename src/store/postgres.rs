@@ -33722,11 +33722,21 @@ impl MemoryStore for PostgresStore {
         use crate::models::{ConfidenceSource, ENTITY_KIND, EntityRegistration, MemoryKind, Tier};
 
         self.gate_record_stop().await?;
-        // Resolve effective agent_id: explicit arg wins; otherwise
-        // fall back to the caller context's agent_id.
-        let resolved_agent = agent_id
-            .map(str::to_string)
-            .unwrap_or_else(|| ctx.agent_id.clone());
+        // #8497 - owner = the caller context's verified principal (the shared
+        // rule the sqlite twin applies); a differing `agent_id` argument or
+        // inline `metadata.agent_id` is refused and audited.
+        let resolved_agent = crate::identity::entity_owner::trait_entity_owner(
+            &ctx.agent_id,
+            agent_id,
+            extra_metadata,
+            namespace,
+            canonical_name,
+        )
+        .map_err(|m| StoreError::PermissionDenied {
+            action: crate::identity::entity_owner::OP_ENTITY_REGISTER.to_string(),
+            target: format!("{namespace}/{canonical_name}"),
+            reason: m.to_string(),
+        })?;
 
         // #2993 — refuse a credential-bearing alias BEFORE any write (postgres
         // twin of the sqlite `db::entity_register` alias screen). The entity
@@ -33822,9 +33832,12 @@ impl MemoryStore for PostgresStore {
             serde_json::Value::String(ENTITY_KIND.to_string()),
         );
         meta_map.insert("aliases".to_string(), serde_json::json!(union.clone()));
-        meta_map
-            .entry("agent_id".to_string())
-            .or_insert(serde_json::Value::String(resolved_agent.clone()));
+        // #8497 / #3171 - the RESOLVED owner wins (`insert`, not `or_insert`),
+        // matching `db::entity_register` on sqlite.
+        meta_map.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(resolved_agent.clone()),
+        );
 
         // #3014 — cross the attestation posture on a NEW entity row (postgres
         // twin of the sqlite `db::entity_register` gate): refuse under

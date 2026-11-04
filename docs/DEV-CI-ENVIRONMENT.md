@@ -80,7 +80,10 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
   - Certs / env / init script live under the operator-local `pg-age-stack/` tree
 - **Self-hosted runner labels:** `self-hosted,macOS,ARM64,macos-fed`
 - **Rust toolchain:** rustup-managed ONLY, with `~/.cargo/bin` FIRST on `PATH`
-  on both nodes. 1.96.0 and 1.98.0 are installed with `clippy` + `rustfmt`, so
+  on both nodes. 1.96.0 and 1.98.0 are installed with `clippy` + `rustfmt`; the
+  1.99.1 pin (#8473) installs itself from `rust-toolchain.toml` on first use, or
+  ahead of time with `rustup toolchain install 1.99.1 --profile minimal -c clippy
+  -c rustfmt -c llvm-tools`, so
   a `rust-toolchain.toml` pin flip needs no runner-side install. Never
   `brew install rust` — see §9. Host-specific paths and runner service names
   are operator-local, not published here.

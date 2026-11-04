@@ -251,7 +251,7 @@ fn test_offload_tier_gating() {
     // signature — the MCP-tier-gated path will eventually attach a
     // real key here. The empty-string sentinel is the substrate's
     // "unsigned" marker.
-    assert!(stored_sig.is_empty());
+    assert_eq!(stored_sig, "");
 }
 
 #[test]

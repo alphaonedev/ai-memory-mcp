@@ -128,7 +128,7 @@ fn signed_identity_block_carries_public_key_in_url_safe_base64() {
         .unwrap();
     let pk_b64 = block["public_key"].as_str().unwrap();
     assert_eq!(pk_b64, kp.public_base64());
-    assert!(!pk_b64.is_empty());
+    assert_ne!(pk_b64, "");
     // URL-safe base64 of 32 bytes is 43 characters (no padding)
     assert_eq!(pk_b64.len(), 43);
 }

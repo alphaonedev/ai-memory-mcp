@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
+
+- `forward_signal_send_to_http` resolved the forwarded `X-Agent-Id` from the wire `from_agent` through `resolve_agent_id`, so an MCP caller could forge the sender of a forwarded signal. It now uses `resolve_governance_subject` (the #3171 store-forward precedent): under an enforced caller a mismatching `from_agent` is refused with `agent_id mismatch` before any network I/O, and an absent value is filled from the caller. The HTTP handler already stamps `from_agent` from the header and ignores the body field.
+### Security (#8497, #8493 — entity_register owner is the verified subject)
+
+- `memory_entity_register` and `POST /api/v1/entities` own the entity by the verified caller on both backends. A body `agent_id` or inline `metadata.agent_id` that differs from the verified subject is refused (HTTP 403 `AGENT_ID_MISMATCH`, MCP mismatch error, SAL `PermissionDenied`) with an `outcome: deny` audit row; the postgres funnel now stamps the resolved owner with `insert` like sqlite (#3171). Shared rule in `identity::entity_owner`; fragment `changelog.d/8497.security.md`.
 ### Security (#8357 — mTLS client certificate bound to agent identity)
 
 - New `AI_MEMORY_MTLS_AGENT_BINDING_MAP` binds each pinned client-certificate SHA-256 fingerprint to one agent id; `AI_MEMORY_MTLS_AGENT_BINDING=off|warn|enforce` (default `enforce` with a map, `off` without) refuses a differing `X-Agent-Id` with `403 agent_id_certificate_mismatch` or serves the request as the certificate's agent, and writes a forensic audit row for every mismatch. Under `enforce` the certificate also wins over an enrolled per-agent api key for a different agent (refused `403 agent_id_certificate_mismatch`, header present or not), and an allowlisted certificate that is not in the map cannot claim an agent id the map binds (refused the same way on every route; an unbound claimed id is kept). An explicit `warn` or `enforce` with no map refuses boot. With a map, a `/api/v1/sync/*` peer certificate must map to an agent, which becomes the caller id. Boot refuses a bad map or a map without `--mtls-allowlist`; `ai-memory serve --check` prints the parsed map. Details: `changelog.d/8357.security.md`.

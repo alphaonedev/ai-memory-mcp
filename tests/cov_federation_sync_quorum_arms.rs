@@ -901,14 +901,16 @@ async fn bulk_catchup_unreachable_reports_network_error() {
 #[tokio::test]
 async fn bulk_catchup_empty_inputs_are_noops() {
     let cfg_no_peers = config(Vec::new(), 1, 500);
-    assert!(
-        sync::bulk_catchup_push(&cfg_no_peers, &[fixture_memory("mem-x")])
-            .await
-            .is_empty()
+    assert_eq!(
+        sync::bulk_catchup_push(&cfg_no_peers, &[fixture_memory("mem-x")]).await,
+        [] as [(std::string::String, std::string::String); 0]
     );
     let (url, st) = spawn_peer(ok_plan()).await;
     let cfg = config(vec![peer("peer-noop", &url)], 1, 500);
-    assert!(sync::bulk_catchup_push(&cfg, &[]).await.is_empty());
+    assert_eq!(
+        sync::bulk_catchup_push(&cfg, &[]).await,
+        [] as [(std::string::String, std::string::String); 0]
+    );
     assert_eq!(
         st.hits.load(Ordering::SeqCst),
         0,

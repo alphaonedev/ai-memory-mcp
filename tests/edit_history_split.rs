@@ -391,7 +391,7 @@ fn supersede_result_carries_distinct_archived_and_new_ids() {
     assert_ne!(result.new_id, id, "NEW id distinct from OLD");
     // Round-trip both ids through Display + Debug so the substrate's
     // logging surfaces (audit, tracing) stay readable.
-    assert!(!format!("{result:?}").is_empty());
+    assert_ne!(format!("{result:?}"), "");
 }
 
 #[test]

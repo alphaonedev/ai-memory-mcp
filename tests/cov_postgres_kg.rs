@@ -201,7 +201,7 @@ async fn find_paths_no_route_returns_empty() {
     let paths = MemoryStore::find_paths(&store, &ctx, &a, &b, Some(4), Some(10))
         .await
         .expect("find_paths disconnected");
-    assert!(paths.is_empty());
+    assert_eq!(paths, [] as [std::vec::Vec<std::string::String>; 0]);
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -687,7 +687,7 @@ async fn notify_writes_inbox_memory_and_schema_version() {
         )
         .await
         .expect("notify");
-    assert!(!new_id.is_empty());
+    assert_ne!(new_id, "");
 
     let v = store.schema_version().await.expect("schema_version");
     assert!(v >= 57, "postgres ladder ends at v57+ (got {v})");

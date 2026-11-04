@@ -16,11 +16,9 @@ fn sqlite_proven_root_exports_and_revocation_is_audited_and_removes_it() {
     ai_memory::db::register_agent(&conn, AGENT, "nhi", &[]).unwrap();
     let key = keypair::generate(AGENT).unwrap();
     let agents = vec![AGENT.to_owned()];
-    assert!(
-        hub_cache::derive_sqlite(&conn, &agents)
-            .unwrap()
-            .agents
-            .is_empty()
+    assert_eq!(
+        hub_cache::derive_sqlite(&conn, &agents).unwrap().agents,
+        [] as [ai_memory::wake_hub::delegation_verifier::AllowlistEntry; 0]
     );
     ai_memory::db::bind_agent_pubkey_with_keypair(&conn, AGENT, &key).unwrap();
     let allowed = hub_cache::derive_sqlite(&conn, &agents).unwrap();
@@ -39,7 +37,10 @@ fn sqlite_proven_root_exports_and_revocation_is_audited_and_removes_it() {
     );
     ai_memory::db::revoke_agent_pubkey(&conn, AGENT).unwrap();
     let revoked = hub_cache::derive_sqlite(&conn, &agents).unwrap();
-    assert!(revoked.agents.is_empty());
+    assert_eq!(
+        revoked.agents,
+        [] as [ai_memory::wake_hub::delegation_verifier::AllowlistEntry; 0]
+    );
     hub_cache::audit_sqlite(&conn, Some(&allowed), &revoked).unwrap();
     hub_cache::publish(&path, &revoked).unwrap();
     assert!(
@@ -228,7 +229,10 @@ async fn postgres_proven_root_and_revocation_match_sqlite_and_audit_the_decision
     store.audit_hub_cache(None, &allowed).await.unwrap();
     store.revoke_agent_pubkey(&ctx, &agent).await.unwrap();
     let revoked = store.derive_hub_cache(&agents).await.unwrap();
-    assert!(revoked.agents.is_empty());
+    assert_eq!(
+        revoked.agents,
+        [] as [ai_memory::wake_hub::delegation_verifier::AllowlistEntry; 0]
+    );
     store
         .audit_hub_cache(Some(&allowed), &revoked)
         .await

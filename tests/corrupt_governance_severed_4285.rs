@@ -166,10 +166,9 @@ mod sqlite {
     #[test]
     fn census_lists_every_corrupt_standard_4285() {
         let conn = open();
-        assert!(
-            db::list_corrupt_governance_standards(&conn)
-                .expect("census")
-                .is_empty()
+        assert_eq!(
+            db::list_corrupt_governance_standards(&conn).expect("census"),
+            [] as [ai_memory::storage::CorruptStandard; 0]
         );
         bind(&conn, "zeta", corrupt_governance_json());
         bind(&conn, "alpha", corrupt_governance_json());

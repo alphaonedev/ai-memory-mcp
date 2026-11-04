@@ -532,7 +532,10 @@ fn no_certificate_verification_bypass_in_compiled_rs_8179() {
 
 #[test]
 fn guard_pins_the_single_sync_arm_8179() {
-    assert!(violations_in(PERMITTED_FILE, ARM_FIXTURE).is_empty());
+    assert_eq!(
+        violations_in(PERMITTED_FILE, ARM_FIXTURE),
+        [] as [std::string::String; 0]
+    );
     // moved out of the arm
     let moved = "fn f() {\n    b.danger_accept_invalid_certs(true);\n}\n";
     let got = violations_in(PERMITTED_FILE, moved);
@@ -544,12 +547,12 @@ fn guard_pins_the_single_sync_arm_8179() {
     // the arm text in any other file does not excuse it
     assert_eq!(violations_in("src/other.rs", ARM_FIXTURE).len(), 1);
     // comments are ignored
-    assert!(
+    assert_eq!(
         violations_in(
             "tests/x.rs",
             "// danger_accept_invalid_certs(true)\n//! danger_accept_invalid_hostnames\n/* danger_accept_invalid_certs */\n"
-        )
-        .is_empty()
+        ),
+        [] as [std::string::String; 0]
     );
 }
 
@@ -598,17 +601,35 @@ fn rustls_accept_any_shapes_are_flagged_8179() {
         "an innocuously named accept-any verifier slipped through: {unconditional:?}"
     );
     let builder = "let c = rustls::ClientConfig::builder()\n    .dangerous()\n    .with_custom_certificate_verifier(v)\n    .with_no_client_auth();\n";
-    assert!(!violations_in("src/other.rs", builder).is_empty());
+    assert_ne!(
+        violations_in("src/other.rs", builder),
+        [] as [std::string::String; 0]
+    );
     let setter = "cfg.dangerous().set_certificate_verifier(v);\n";
-    assert!(!violations_in("tests/x.rs", setter).is_empty());
+    assert_ne!(
+        violations_in("tests/x.rs", setter),
+        [] as [std::string::String; 0]
+    );
     let danger = "let b = ClientBuilder::new().danger();\n";
-    assert!(!violations_in("tests/x.rs", danger).is_empty());
+    assert_ne!(
+        violations_in("tests/x.rs", danger),
+        [] as [std::string::String; 0]
+    );
     // a verifier that can reject is fine, and `dangerous_op()` is not the builder
     let strict = "impl ServerCertVerifier for Pin {\n    fn verify_server_cert(&self) -> R {\n        if ok { Ok(V) } else { Err(E) }\n    }\n}\nfn is_dangerous(x: u8) {}\nlet z = dangerous_op();\n";
-    assert!(violations_in("src/other.rs", strict).is_empty());
+    assert_eq!(
+        violations_in("src/other.rs", strict),
+        [] as [std::string::String; 0]
+    );
     // the allow-listed files may use the rustls shapes, but not the reqwest bypass
-    assert!(violations_in("tests/mtls_nodelay_acceptor.rs", ACCEPT_ANY_VERIFIER).is_empty());
-    assert!(violations_in("tests/mtls_nodelay_acceptor.rs", named).is_empty());
+    assert_eq!(
+        violations_in("tests/mtls_nodelay_acceptor.rs", ACCEPT_ANY_VERIFIER),
+        [] as [std::string::String; 0]
+    );
+    assert_eq!(
+        violations_in("tests/mtls_nodelay_acceptor.rs", named),
+        [] as [std::string::String; 0]
+    );
     assert_eq!(
         violations_in(
             "tests/mtls_nodelay_acceptor.rs",
@@ -666,13 +687,13 @@ fn include_targets_are_followed_and_must_exist_8179() {
         "src/lib.rs",
         "const S: &str = \"include!(\\\"nope.rs\\\") and #[path = \\\"nope.rs\\\"]\";\n",
     )]);
-    assert!(scan_tree(in_string.path()).is_empty());
+    assert_eq!(scan_tree(in_string.path()), [] as [std::string::String; 0]);
     // a clean include passes
     let clean = fixture_tree(&[
         ("src/lib.rs", "include!(\"gen.rs\");\n"),
         ("src/gen.rs", "fn ok() {}\n"),
     ]);
-    assert!(scan_tree(clean.path()).is_empty());
+    assert_eq!(scan_tree(clean.path()), [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -692,5 +713,8 @@ fn stale_allow_list_row_fails_8179() {
     assert_eq!(bad.len(), 1, "{bad:?}");
     assert!(bad[0].contains("src/gone.rs"));
     // the real allow-list names only files that exist
-    assert!(allow_list_problems(Path::new(env!("CARGO_MANIFEST_DIR")), &RUSTLS_ALLOW).is_empty());
+    assert_eq!(
+        allow_list_problems(Path::new(env!("CARGO_MANIFEST_DIR")), &RUSTLS_ALLOW),
+        [] as [std::string::String; 0]
+    );
 }

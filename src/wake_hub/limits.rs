@@ -441,7 +441,7 @@ impl EgressBudget {
     /// cap; nothing is charged in that case.
     pub fn try_reserve(&self, n: usize) -> bool {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 let next = cur.checked_add(n)?;
                 if next > self.cap { None } else { Some(next) }
             })
@@ -454,7 +454,7 @@ impl EgressBudget {
     pub fn release(&self, n: usize) {
         let _ = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some(cur.saturating_sub(n))
             });
     }
