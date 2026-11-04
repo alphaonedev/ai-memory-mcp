@@ -87,7 +87,7 @@ ai-memory v0.9.0 meets **no requirement fully, 20 of 27 partially, and 7 not at 
 Post-v0.9.0 reconciliation: W1 docs pass (factually-false public claims first), W2 tracker hygiene ([#1936] FED-RQ-01, [#1937] PE-3, title fleet, rulings for #1801/#1802/#1803/#1390/#1879), W3 evidence currency (frozen ship-gate/A2A/test-hub/NSA pages; counterfactual §17 gates), W4 past-due keep/cut rulings (L3 watcher, C-ABI FFI, LongMemEval refresh, plugin marketplace, distilled model). **No v1.0.0 feature work starts until Sprint 0 closes.**
 
 ### Gate 1 — P0 freeze-critical lane (~100–115 sessions) — must precede the v1.0 API-stability declaration
-Everything here changes persisted, signed, or wire shapes; shipping the v1.0 freeze *before* these is self-defeating. Every item is a T1+T4 crossroads → 5-agent vote per the repo protocol.
+Everything here changes persisted, signed, or wire shapes; shipping the v1.0 freeze *before* these is self-defeating. For new work, apply the T1+T4 conditions and the `CLAUDE.md` threshold; when both hold, run the 1x3 protocol and cite `3-agent vote (6def5ab6)`.
 
 | Item | Requirements | Notes |
 |---|---|---|
@@ -127,7 +127,7 @@ v0.9.0 is the strongest existing base for this specification — and v1.0.0 **as
 From the cross-family 3×7 adjudication vs the Grok 4.5 49-agent assessment ([`FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md`](FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md)); where this section conflicts with §4 above, this section wins.
 
 **Gate 1 (P0 freeze-critical) additions:**
-- **UUID→cid record-identity-authority ADR** (Grok R16 sustained) — T4 5-agent vote pre-freeze; cutover migration stays out of v1.0 unless the ADR rules otherwise.
+- **UUID→cid record-identity-authority ADR** (Grok R16 sustained) — T4 1x3 vote pre-freeze when the threshold is met, cited as `3-agent vote (6def5ab6)`; cutover migration stays out of v1.0 unless the ADR rules otherwise.
 - **Read-path provenance/consumer-binding envelope scope** (M1) — ruled pre-freeze or explicitly recorded post-v1.0.
 - **#1834 bitemporal COLUMNS promoted** from P2 into this lane (full Claim algebra deferred with a recorded ruling).
 - **Supply-chain/build-integrity item:** cargo-vet-class dependency review over the lock, SBOM in release artifacts, implement-or-strike the ROADMAP:995 reproducible-build gate.
