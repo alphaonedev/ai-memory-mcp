@@ -6,9 +6,9 @@
 
 use std::path::PathBuf;
 
+use ai_memory::autonomy::AutonomyLlm;
 use ai_memory::cli::CliOutput;
 use ai_memory::cli::commands::export_reflections::{self, ExportFormat, ExportReflectionsArgs};
-use ai_memory::autonomy::AutonomyLlm;
 use ai_memory::hooks::post_reflect::auto_export::{AutoExportConfig, run_auto_export};
 use ai_memory::hooks::post_reflect::auto_persona::{AutoPersonaConfig, run_auto_persona};
 use ai_memory::models::{ExportPolicy, GovernancePolicy, Memory, MemoryKind, PersonaPolicy, Tier};

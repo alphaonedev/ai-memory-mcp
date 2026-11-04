@@ -227,14 +227,14 @@ pub fn run_auto_export(
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let payload = export_reflections::render_payload(&mem, &edges, attest_level, config.format);
 
-    let ns_dir = config
-        .out_dir
-        .join(export_reflections::sanitise_namespace_for_path(
-            &mem.namespace,
-        ));
-    std::fs::create_dir_all(&ns_dir)?;
-    let path = ns_dir.join(format!("{}.{}", mem.id, config.format.extension()));
-    std::fs::write(&path, payload)?;
+    let root = export_reflections::private_file::PrivateExportDir::open(&config.out_dir)?;
+    let namespace = root.namespace(&export_reflections::sanitise_namespace_for_path(
+        &mem.namespace,
+    ))?;
+    namespace.write(
+        &format!("{}.{}", mem.id, config.format.extension()),
+        payload.as_bytes(),
+    )?;
     Ok(())
 }
 

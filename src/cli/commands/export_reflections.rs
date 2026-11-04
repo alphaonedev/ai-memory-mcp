@@ -22,7 +22,6 @@
 //! the file on disk is a derived artefact. Operators may freely
 //! delete / regenerate the directory at any time.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -33,6 +32,9 @@ use serde::Serialize;
 use crate::cli::CliOutput;
 use crate::db;
 use crate::models::{Memory, MemoryKind};
+
+pub(crate) mod private_file;
+use private_file::PrivateExportDir;
 
 /// Reflection-export subdirectory under `~/.ai-memory` — shared with the
 /// post-reflect auto-export hook (#1558 batch 6).
@@ -48,7 +50,7 @@ pub struct ExportReflectionsArgs {
     pub namespace: Option<String>,
 
     /// Output directory root. Defaults to `~/.ai-memory/reflections/`.
-    /// The directory is created if it does not exist.
+    /// Created with mode 0700; existing directories must already be private.
     #[arg(long, value_name = "PATH")]
     pub out_dir: Option<PathBuf>,
 
@@ -104,8 +106,8 @@ struct JsonEnvelope<'a> {
 pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     let format = parse_format(&args.format)?;
     let out_dir = resolve_out_dir(args.out_dir.as_deref())?;
-    fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
+    let private_root = PrivateExportDir::open(&out_dir)
+        .with_context(|| format!("opening private out-dir {}", out_dir.display()))?;
 
     let conn = db::open(db_path)?;
     let mut summary = ExportSummary::default();
@@ -116,12 +118,14 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         let attest_level = summarise_attest_level(&edges);
         let payload = render_payload(mem, &edges, attest_level, format);
 
-        let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace));
-        fs::create_dir_all(&ns_dir)
-            .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
+        let relative = sanitise_namespace_for_path(&mem.namespace);
+        let namespace = private_root.namespace(&relative)?;
+        let ns_dir = out_dir.join(relative);
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
-        fs::write(&path, payload).with_context(|| crate::errors::msg::writing(path.display()))?;
+        namespace
+            .write(&filename, payload.as_bytes())
+            .with_context(|| crate::errors::msg::writing(path.display()))?;
         summary.written += 1;
         if !args.quiet {
             writeln!(out.stdout, "wrote {}", path.display())?;
