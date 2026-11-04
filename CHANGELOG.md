@@ -2840,14 +2840,6 @@ write is permission-evaluated as; see the operator note below.
   already-existing edge reports the level that is actually STORED on the row
   rather than the signature level it computed but never persisted (the write
   is an `INSERT OR IGNORE` no-op).
-- **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
-  Both CLI recall paths wrote `--as-agent` (a namespace) into
-  `recall_observations.agent_id`: `src/cli/recall.rs` passed
-  `args.as_agent`, and the interactive shell passed `None`. The #1705
-  cross-agent replay guard keys on that column (`agent_id IS NULL OR agent_id
-  = ?`), so it was inert on both paths — a namespace cannot gate an identity.
-  Both now bind `resolve_read_visibility_caller()`, the same value the MCP/HTTP
-  writer stamps. `--as-agent` remains the namespace-scope visibility knob.
 
 ### Security
 
@@ -5280,27 +5272,6 @@ truthful.
   one host should pin the curator's with `AI_MEMORY_KEY_DIR`. Run
   `curator --once --dry-run` first if persona minting is not wanted.
 
-- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
-  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
-  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
-  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
-  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
-  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
-  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
-  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
-  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
-  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
-  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
-  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
-  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
-  branch protection must be updated to match. The `enterprise-fed` Check legs
-  absorb the old `Postgres feature gate` test run (now against the real cert tier);
-  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
-  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
-  `services: postgres:` blocks + per-PR pg image builds are removed (they would
-  delete real files on the persistent hosts; the native tier is always up).
-  JUnit-style durable test-result log artifacts are uploaded per leg.
-
 ### Fixed
 
 - **`ai-memory restore` no longer publishes with a bare `fs::copy` onto the
@@ -5395,32 +5366,6 @@ truthful.
   `mcp::tests::chunkc_forget_invalid_tier_string_silently_dropped`, and the
   "silently falls through" arm of
   `mcp::tools::list::tests::filters_by_tier`.
-- **Record-stop enforcement no longer silently degrades at the SAL layer when
-  the sqlite DB path resolves through a symlink** (e.g. the macOS
-  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
-  the shared record-stop registry off the raw path passed to `open`, while the
-  actuator, the `db::` funnel gate, the status read and the open-time seed all
-  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
-  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
-  entry, so a write issued under an engaged stop fell through to the deeper
-  `db::` gate and surfaced `StoreError::Backend` instead of the intended
-  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
-  SAL 503 refusal contract. The gate now caches and keys off the connection's
-  resolved path at open, restoring one source of truth across every layer.
-  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
-  symlinked-open-path regression test pins it.
-- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
-  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
-  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
-  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
-  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
-  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
-  regression the release `postgres-feature` job already fixed by raising its
-  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
-  legs on ONE host, so its ~2231s is the normal max-contention case). The
-  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
-  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
-  the outer job cap — remains what fires on a genuine hang.
 ### Fixed (cross-backend parity — write funnels: archive / delete / update)
 
 A parity audit of the sqlite and postgres write funnels found four
@@ -14083,16 +14028,6 @@ Each field is `Option<...>` and inherits leaf-first through the existing `resolv
 
 ### Track summary (11 tracks, 69 tasks)
 
-- **Track A — Capabilities v3 response shape (5 tasks).** Adds `summary`, `to_describe_to_user`, `callable_now`, `agent_permitted_families` to the `memory_capabilities` response, plus `schema_version="3"` (additive over v2). Pre-computed per-agent calibration strings let LLMs converge on accurate first-answer descriptions instead of improvising. v3 fields are additive — v2 wire shape stays supported through the v0.7.x line. Canonical phrasings pinned in [`docs/v0.7/canonical-phrasings.md`](docs/v0.7/canonical-phrasings.md).
-- **Track B — Loader tools (5 tasks).** `memory_load_family` and `memory_smart_load(intent)` are promoted to **always-on first-class tools** (no longer hidden inside an introspection tool's parameter set). Reasoning-class LLMs find them on first ask. Includes harness detection from MCP `clientInfo` (Claude Code, Codex, Grok CLI, Gemini CLI, Continue, Cursor, Cline, Aider, Goose, Claude Desktop, generic JSON-RPC) and family-descriptor embeddings powering `memory_smart_load`'s intent-to-family routing.
-- **Track C — Schema compaction (5 tasks).** **52% MCP tool-token reduction** on the full profile. Description / docs split (long form moved to per-tool docs links), optional params hidden from default schema, inline examples stripped, hard CI gate enforces ≤ 3,500 input tokens for `--profile full` `tools/list`. Combined with v0.6.4's 76.4% default-profile reduction, the cortex now ships at < 3.5K tokens even when fully loaded.
-- **Track D — Per-harness positioning + tests (4 tasks).** Cross-harness benchmark across the 11 supported harnesses; landing-page compatibility matrix at [`docs/v0.7/compatibility-matrix.html`](docs/v0.7/compatibility-matrix.html); install-time system-prompt snippet emitted by `ai-memory install`; harness integration tests in `tests/harness_*.rs` covering both 5-tool default and full-profile loading paths.
-- **Track E — Discovery Gate T0 calibration cells (3 tasks).** Discovery Gate T1-T3 loader cells; T0 orchestration script driving 4 LLMs (Claude, Grok, Gemini, GPT) for ≥ 95% convergence verification on canonical phrasings; post-ship convergence verification scheduled against the released binary. See [`docs/v0.7/T0-ORCHESTRATION.md`](docs/v0.7/T0-ORCHESTRATION.md).
-- **Track F — Docs + release (6 tasks).** [`docs/MIGRATION_v0.7.md`](docs/MIGRATION_v0.7.md) v0.6.4 → v0.7.0 guide; [`docs/whats-new-v07.html`](docs/whats-new-v07.html) what's-new page; [`docs/v0.7/rfc-attested-cortex.md`](docs/v0.7/rfc-attested-cortex.md) RFC; `README.md` + `docs/ADMIN_GUIDE.md` updates; top-nav badges; this release-cut PR.
-- **Track G — Hook Pipeline (11 tasks, Bucket 0).** The substrate ships: `~/.config/ai-memory/hooks.toml` config file; **25 lifecycle event types** with payloads — the Track G 20 baseline (`pre_store`, `post_store`, `pre_recall`, `post_recall`, `pre_search`, `post_search`, `pre_delete`, `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, `post_consolidate`, `pre_governance_decision`, `post_governance_decision`, `on_index_eviction`, `pre_archive`, `pre_transcript_store`, `post_transcript_store`) plus 5 grand-slam additions (`pre_recall_expand` G10 + `pre_reflect`/`post_reflect` recursive-learning Task 6/8 + `pre_compaction`/`on_compaction_rollback` L1-7), enumerated in `src/hooks/events.rs::HookEvent`; `ExecExecutor` + `DaemonExecutor` JSON-stdio IPC; decision types (`Allow`/`Deny`/`Modify`/`Defer`); chain ordering with priority; per-event timeouts; hot reload on `hooks.toml` mtime change; `on_index_eviction` for HNSW/cache eviction observability; reranker batching for concurrent recall; `pre_recall` daemon-mode hook; **R3 auto-link reference detector** as a reference hook binary.
-- **Track H — Ed25519 Attested Identity (6 tasks, Bucket 1).** `ai-memory identity generate` CLI mints per-agent Ed25519 keypairs; outbound link signing fills the v0.6.3 `memory_links.signature` "dead column"; inbound signature verification on every link write; `attest_level` enum (`unsigned` / `signed` / `verified` / `rejected`); `memory_verify` MCP tool surfaces signature state on demand; **append-only `signed_events` audit table** with hash-chained provenance; end-to-end test pinning the full mint → sign → verify → audit cycle.
-- **Track I — Sidechain Transcripts (5 tasks, Bucket 1.7).** `memory_transcripts` schema (BLOB + zstd-3); `memory_transcript_links` join table; per-namespace TTL with exact-match → longest `prefix/*` → `*` → default-off precedence; `memory_replay` MCP tool reconstructs full conversation context from a transcript link; **R5 `pre_store` transcript-extraction reference hook** ships as a standalone Rust binary at `tools/transcript-extractor/` (kept out of the published crates.io upload via the parent `Cargo.toml`'s `include` allowlist).
-- **Track J — Apache AGE Acceleration (8 tasks, Bucket 2).** AGE detected at Postgres-SAL connect-time via `pg_extension` probe (logged-only fallback to CTE on missing extension or probe error); Cypher implementations of `kg_query`, `kg_timeline`, `kg_invalidate`, and **R2 `find_paths`**; dual-path tests gated on `AI_MEMORY_TEST_AGE_URL`; AGE / CTE per-query performance budgets with bench-time gate; `KgBackend { Cte, Age }` enum exposed via `Capabilities` (`kg_backend` field) for `ai-memory doctor` and `memory_capabilities`.
 - **Track K — A2A + Permissions + G1 cutline (11 tasks, Bucket 3).** **K1/G1 namespace-inheritance enforcement** (the mandatory cutline — `resolve_governance_policy` walks the namespace chain; first non-null policy wins); `pending_actions` timeout sweeper (closes the v0.6.3.1 `default_timeout_seconds` honesty disclosure); `permissions.mode` enforcement gate (`advisory` preserves v0.6.4 first-boot semantics, `enforce` deny-firsts); approval-event routing; `permissions.rule_summary` re-instated; A2A correlation IDs + ACK retries + TTL + replay protection; subscription DLQ + replay-from-cursor + HMAC; per-agent quotas with daily reset; unified permission pipeline (rules + modes + hooks → decision); approval API on **HTTP + SSE + MCP** with HMAC and `remember=forever`; `ai-memory governance migrate-to-permissions` translator CLI for upgrading v0.6.x governance configs.
 
 ### Quality
