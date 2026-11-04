@@ -172,7 +172,11 @@ fn atomise_never_carries_source_attestation() {
     let res = atomiser
         .atomise_sync(&conn, &source_id, 200, false, caller)
         .expect("atomise");
-    assert!(!res.atom_ids.is_empty());
+    assert_eq!(
+        res.atom_ids.len(),
+        2,
+        "atomise must store both atoms the curator returned"
+    );
     for atom_id in &res.atom_ids {
         let atom = storage::get(&conn, atom_id).unwrap().expect("atom row");
         assert_attestation_reset(&atom.metadata, caller, "atomise");

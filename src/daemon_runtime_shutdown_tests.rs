@@ -16,6 +16,7 @@ fn bind_failure_args() -> ServeArgs {
         quorum_ca_cert: None,
         catchup_interval_secs: 0,
         federation_identity: None,
+        check: false,
         #[cfg(feature = "sal")]
         store_url: None,
     }

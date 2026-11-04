@@ -131,6 +131,7 @@ pub async fn sync_since(
     State(app): State<AppState>,
     headers: HeaderMap,
     cert_peer: Option<axum::Extension<crate::tls::ClientCertPeerId>>,
+    cert_agent: Option<axum::Extension<crate::mtls_agent_binding::ClientCertAgentBinding>>,
     OriginalUri(original_uri): OriginalUri,
     Query(q): Query<SyncSinceQuery>,
 ) -> impl IntoResponse {
@@ -218,9 +219,13 @@ pub async fn sync_since(
     //      helper denies every scope=private row to a "" caller that
     //      isn't the (also-empty) owner, which is the correct
     //      default-deny posture.
-    let federation_caller: String = peer_header
-        .as_deref()
-        .filter(|s| !s.is_empty())
+    //   0. #8357 — when the mTLS client certificate is bound to an agent
+    //      by `AI_MEMORY_MTLS_AGENT_BINDING_MAP`, THAT agent is the caller
+    //      (a certificate cannot pull as an id it is not bound to).
+    let federation_caller: String = cert_agent
+        .as_ref()
+        .and_then(|e| e.0.effective_agent_id())
+        .or_else(|| peer_header.as_deref().filter(|s| !s.is_empty()))
         .or_else(|| {
             headers
                 .get(crate::HEADER_AGENT_ID)
