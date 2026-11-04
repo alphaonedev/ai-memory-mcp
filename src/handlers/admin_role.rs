@@ -105,6 +105,12 @@ pub const CLAIMED_ADMIN_REASON: &str = "claimed_admin_not_key_authenticated";
 /// a header claim must never extend it.
 pub const HEADER_TRUST_REFUSED_REASON: &str = "header_trust_refused_registry_enrolled";
 
+/// #8574 - stable audit reason for a credential mutation refused because the
+/// authoritative registry read failed under the [`ENV_ADMIN_HEADER_TRUST`]
+/// opt-in: the registry state is unknown, so the gate refuses (fail closed)
+/// without claiming that a key is enrolled.
+pub const HEADER_TRUST_UNREADABLE_REASON: &str = "header_trust_refused_registry_unreadable";
+
 /// #8494 / #8535 — one credential-mutating route's refusal vocabulary.
 ///
 /// `action` is the audit action, `issue_label` the audit issue tag and
@@ -160,7 +166,20 @@ pub async fn require_key_bound_admin(
         // refresh). A store error is an unknown state and refuses (fail closed).
         reason = HEADER_TRUST_REFUSED_REASON;
         if snapshot.is_empty() {
-            header_trust_admits = matches!(crate::handlers::agent_api_key::load_enrolled(app).await, Ok(rows) if rows.is_empty());
+            match crate::handlers::agent_api_key::load_enrolled(app).await {
+                Ok(rows) if rows.is_empty() => header_trust_admits = true,
+                // The store holds a key the snapshot has not seen: refuse.
+                Ok(_) => {}
+                Err(e) => {
+                    // Unknown registry state: refuse, and record the true
+                    // reason (not "enrolled") on the signed deny row.
+                    reason = HEADER_TRUST_UNREADABLE_REASON;
+                    tracing::warn!(
+                        error = %e,
+                        "{ENV_ADMIN_HEADER_TRUST}: enrolled-key registry read failed; credential route refused (#8574)"
+                    );
+                }
+            }
         }
     }
     if pubkey_bind_principal_admitted(level, header_trust_admits) {
