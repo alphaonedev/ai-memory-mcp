@@ -2840,7 +2840,6 @@ write is permission-evaluated as; see the operator note below.
   already-existing edge reports the level that is actually STORED on the row
   rather than the signature level it computed but never persisted (the write
   is an `INSERT OR IGNORE` no-op).
-
 ### Security
 
 - **#3192 — single-row `delete` wrote no `forget_tombstone` and did not crypto-erase, so every MCP `memory_delete` / HTTP DELETE / inbound federation `deletions[]` was LWW-resurrectable.** `db::delete` (`delete_inner`) now reuses the existing `tombstone_and_erase` primitive (the same helper `gc` / `size_gc` already call via `evict_tombstone_and_erase`) *inside* the caller's transaction: forget-tombstone INSERT, envelope crypto-erase + attestation, `cid_genesis` scrub, DLQ/dedup remanence purge, then DELETE. `insert_if_newer`'s G30 resurrection guard therefore sees the tombstone and drops a fresher peer re-push. Postgres `PostgresStore::delete` and `apply_remote_deletion` share one `pg_hard_delete_in_tx` so the two funnels cannot drift. A delete of a never-seen id stays a no-op with no tombstone and no `namespace_meta` sever (probe-then-write). Delete also discards undelivered federation DLQ pushes for that memory. Tombstone `signature` is NULL when no daemon keypair is present (unsigned resurrection guard); refuse-under-enforced-posture is the shared rule with #3240 and must not fork here. The MCP/CLI erasure-outbox remains best-effort + infallible (documented contract; an outbox failure still WARNs and does not fail the local delete). Distinct from #3177 (pg gc).
@@ -4308,27 +4307,6 @@ backend and missing or divergently implemented on its twin). Pinned by
   (`ai-memory bench (ubuntu-latest)`, `Regenerate bench baseline (ubuntu-latest,
   median-of-3)`) true again without a rename, so no required-context churn.
 
-- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
-  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
-  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
-  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
-  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
-  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
-  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
-  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
-  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
-  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
-  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
-  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
-  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
-  branch protection must be updated to match. The `enterprise-fed` Check legs
-  absorb the old `Postgres feature gate` test run (now against the real cert tier);
-  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
-  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
-  `services: postgres:` blocks + per-PR pg image builds are removed (they would
-  delete real files on the persistent hosts; the native tier is always up).
-  JUnit-style durable test-result log artifacts are uploaded per leg.
-
 ### Fixed (data integrity: merge field-set coherence, long-tier permanence, archive identity, low-end schema guard; #2399 #2395 #2394 #2385 #2564)
 
 - **A fresh `long`-tier write that carried an `expires_at` was GC-reapable
@@ -5271,6 +5249,27 @@ truthful.
   logged at `INFO` when the key is loaded; operators running several keys on
   one host should pin the curator's with `AI_MEMORY_KEY_DIR`. Run
   `curator --once --dry-run` first if persona minting is not wanted.
+
+- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
+  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
+  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
+  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
+  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
+  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
+  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
+  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
+  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
+  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
+  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
+  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
+  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
+  branch protection must be updated to match. The `enterprise-fed` Check legs
+  absorb the old `Postgres feature gate` test run (now against the real cert tier);
+  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
+  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
+  `services: postgres:` blocks + per-PR pg image builds are removed (they would
+  delete real files on the persistent hosts; the native tier is always up).
+  JUnit-style durable test-result log artifacts are uploaded per leg.
 
 ### Fixed
 
