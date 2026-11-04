@@ -114,7 +114,7 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
         "path regression",
     );
     // Bypass ingestion validation only in the fixture: export must defend
-    // against an invalid namespace already present in its durable input.
+    // against dot-only namespace components already present in durable input.
     conn.execute(
         "UPDATE memories SET namespace = ?1 WHERE id = ?2",
         rusqlite::params![namespace, reflection_id],
@@ -148,9 +148,15 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
     );
     let error = result.expect_err("dot-only namespace component must be refused");
     assert_eq!(
-        error.to_string(),
+        error.root_cause().to_string(),
         "namespace path cannot contain dot-only components"
     );
+    if matches!(writer, NamespaceExportWriter::Cli) {
+        assert_eq!(
+            error.to_string(),
+            format!("memory {reflection_id} namespace {namespace:?}: refusing export path")
+        );
+    }
     if out_dir.exists() {
         assert!(
             std::fs::read_dir(&out_dir).unwrap().next().is_none(),
@@ -162,6 +168,11 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
 #[test]
 fn cli_namespace_path_8591_refuses_traversal() {
     assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Cli);
+}
+
+#[test]
+fn cli_namespace_path_8591_reports_row_with_escaped_namespace_r2() {
+    assert_stored_namespace_refused("line\nbreak/..", NamespaceExportWriter::Cli);
 }
 
 #[test]

@@ -116,7 +116,14 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         let attest_level = summarise_attest_level(&edges);
         let payload = render_payload(mem, &edges, attest_level, format);
 
-        let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace)?);
+        let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace).with_context(
+            || {
+                format!(
+                    "memory {} namespace {:?}: refusing export path",
+                    mem.id, mem.namespace
+                )
+            },
+        )?);
         fs::create_dir_all(&ns_dir)
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
@@ -194,8 +201,11 @@ pub(crate) fn resolve_out_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 
 /// Namespace → safe filesystem path component. Slashes are preserved
 /// (so `team/alpha` becomes nested subdirs), every other "weird"
-/// character is replaced with `_`. Dot-only components are refused
-/// before joining, including for rows that bypassed ingestion validation.
+/// character is replaced with `_`. Dot-only components are refused before
+/// joining, never rewritten. This is deliberately stricter than
+/// `validate_namespace`, which rejects only exact `.` and `..` components.
+/// The broader refusal is defence in depth against Windows trailing-dot
+/// normalisation and other platform-specific handling, as required by #8591.
 ///
 /// # Errors
 ///
