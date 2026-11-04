@@ -20575,6 +20575,55 @@ impl PostgresStore {
         self.seed_record_stop().await;
     }
 
+    /// #8577 — the row-owner rule of an approved `delete` / tier-bump
+    /// `promote` as a precondition of the approval vote: the same
+    /// `FOR UPDATE` owner probe the `delete` / `update` funnels run in the
+    /// execute arms, evaluated for the REQUESTER before the vote is written.
+    /// A refusal writes the `pending_action.refused_owner_gate` audit row and
+    /// leaves the pending row `pending`; a missing target is left to the
+    /// execute step. Parity doc `federation_signing_check.rs:86-112`.
+    async fn pg_assert_execute_owner(&self, pa: &crate::models::PendingAction) -> StoreResult<()> {
+        let Some((arm, mid)) = crate::storage::execute_owner_8577::execute_arm_target(pa) else {
+            return Ok(());
+        };
+        let (action, unstamped_reason, allow_inbox) = match arm {
+            crate::storage::ExecuteArm::Delete => (
+                "delete",
+                REASON_UNSTAMPED_TENANT_DELETE,
+                crate::visibility::inbox_delete_retains(&pa.namespace),
+            ),
+            crate::storage::ExecuteArm::TierBump => {
+                ("update", REASON_UNSTAMPED_TENANT_WRITE, false)
+            }
+        };
+        let requester = CallerContext::for_agent(&pa.requested_by);
+        match Self::assert_caller_owns_for_mutation_on(
+            &self.pool,
+            &requester,
+            mid,
+            action,
+            unstamped_reason,
+            allow_inbox,
+        )
+        .await
+        {
+            Err(StoreError::NotFound { .. }) | Ok(()) => Ok(()),
+            Err(refusal) => {
+                if let Err(e) = self
+                    .pg_emit_pending_action_event(
+                        pa,
+                        crate::storage::execute_owner_8577::EVENT_REFUSED_OWNER_GATE,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("pending_action owner-gate refusal audit row not written: {e}");
+                }
+                Err(refusal)
+            }
+        }
+    }
+
     /// v1.0.0 #3180 / #3175 — append ONE `pending_action.<state>` audit row
     /// in its own transaction.
     ///
@@ -31233,6 +31282,12 @@ impl MemoryStore for PostgresStore {
             return Ok(super::ApproveOutcome::Rejected(reason));
         }
 
+        // #8577 — a tenant context is gated on the row owner BEFORE the vote
+        // is written (a bypass context, federation, keeps its bypass).
+        if !ctx.bypass_visibility {
+            self.pg_assert_execute_owner(&pa).await?;
+        }
+
         match approver {
             crate::models::ApproverType::Human => {
                 // #1793 (5-agent vote 4d3ea1c5) — UNCONDITIONALLY harden the
@@ -31484,7 +31539,22 @@ impl MemoryStore for PostgresStore {
             }
             "delete" => {
                 if let Some(mid) = pa.memory_id.clone() {
-                    self.delete(ctx, &mid).await?;
+                    // #8548 — the approved delete runs as the REQUESTER, like
+                    // the #4357 reflect arm below: the approver decides, the
+                    // requester owns the row. Under the approver's context the
+                    // owner gate refused every approved delete of another
+                    // principal's memory ("approved but execution failed").
+                    // #8495 r4 Option C, 3-agent vote (6def5ab6): a bypass ctx
+                    // (federated decide, parity doc federation_signing_check.rs:86-112)
+                    // keeps its bypass; a tenant ctx runs as the requester.
+                    let requester_owned;
+                    let actor = if ctx.bypass_visibility {
+                        ctx
+                    } else {
+                        requester_owned = CallerContext::for_agent(&pa.requested_by);
+                        &requester_owned
+                    };
+                    self.delete(actor, &mid).await?;
                     Some(mid)
                 } else {
                     None
@@ -31529,7 +31599,17 @@ impl MemoryStore for PostgresStore {
                             tier: Some(Tier::Long),
                             ..Default::default()
                         };
-                        self.update(ctx, &mid, patch).await?;
+                        // #8548 — as the requester, same as the delete arm.
+                        // #8495 r4 Option C: same ctx rule as the delete arm
+                        // (parity doc federation_signing_check.rs:86-112).
+                        let requester_owned;
+                        let actor = if ctx.bypass_visibility {
+                            ctx
+                        } else {
+                            requester_owned = CallerContext::for_agent(&pa.requested_by);
+                            &requester_owned
+                        };
+                        self.update(actor, &mid, patch).await?;
                         Some(mid)
                     }
                 } else {

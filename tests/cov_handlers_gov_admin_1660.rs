@@ -182,7 +182,9 @@ async fn signed_post(
     pending_id: &str,
     agent_id: &str,
 ) -> (StatusCode, Value) {
-    let (ts, sig) = sign_approve(TEST_SECRET, "POST", pending_id, b"");
+    // #8495 layout v2: the decider is inside the signed subject.
+    let subject = ai_memory::handlers::agent_api_key::approval_subject(pending_id, agent_id);
+    let (ts, sig) = sign_approve(TEST_SECRET, "POST", &subject, b"");
     let req = Request::builder()
         .method("POST")
         .uri(uri)
@@ -291,7 +293,8 @@ async fn approve_pending_invalid_id_format_returns_400() {
     ai_memory::config::set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
     let (router, _f, _db) = build_router(StorageBackend::Sqlite);
     let bad = "not a valid id!!";
-    let (ts, sig) = sign_approve(TEST_SECRET, "POST", bad, b"");
+    let subject = ai_memory::handlers::agent_api_key::approval_subject(bad, "approver");
+    let (ts, sig) = sign_approve(TEST_SECRET, "POST", &subject, b"");
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/pending/not%20a%20valid%20id%21%21/approve")
