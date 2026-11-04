@@ -20575,6 +20575,55 @@ impl PostgresStore {
         self.seed_record_stop().await;
     }
 
+    /// #8577 — the row-owner rule of an approved `delete` / tier-bump
+    /// `promote` as a precondition of the approval vote: the same
+    /// `FOR UPDATE` owner probe the `delete` / `update` funnels run in the
+    /// execute arms, evaluated for the REQUESTER before the vote is written.
+    /// A refusal writes the `pending_action.refused_owner_gate` audit row and
+    /// leaves the pending row `pending`; a missing target is left to the
+    /// execute step. Parity doc `federation_signing_check.rs:86-112`.
+    async fn pg_assert_execute_owner(&self, pa: &crate::models::PendingAction) -> StoreResult<()> {
+        let Some((arm, mid)) = crate::storage::execute_owner_8577::execute_arm_target(pa) else {
+            return Ok(());
+        };
+        let (action, unstamped_reason, allow_inbox) = match arm {
+            crate::storage::ExecuteArm::Delete => (
+                "delete",
+                REASON_UNSTAMPED_TENANT_DELETE,
+                crate::visibility::inbox_delete_retains(&pa.namespace),
+            ),
+            crate::storage::ExecuteArm::TierBump => {
+                ("update", REASON_UNSTAMPED_TENANT_WRITE, false)
+            }
+        };
+        let requester = CallerContext::for_agent(&pa.requested_by);
+        match Self::assert_caller_owns_for_mutation_on(
+            &self.pool,
+            &requester,
+            mid,
+            action,
+            unstamped_reason,
+            allow_inbox,
+        )
+        .await
+        {
+            Err(StoreError::NotFound { .. }) | Ok(()) => Ok(()),
+            Err(refusal) => {
+                if let Err(e) = self
+                    .pg_emit_pending_action_event(
+                        pa,
+                        crate::storage::execute_owner_8577::EVENT_REFUSED_OWNER_GATE,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("pending_action owner-gate refusal audit row not written: {e}");
+                }
+                Err(refusal)
+            }
+        }
+    }
+
     /// v1.0.0 #3180 / #3175 — append ONE `pending_action.<state>` audit row
     /// in its own transaction.
     ///
@@ -31231,6 +31280,12 @@ impl MemoryStore for PostgresStore {
             .await?
         {
             return Ok(super::ApproveOutcome::Rejected(reason));
+        }
+
+        // #8577 — a tenant context is gated on the row owner BEFORE the vote
+        // is written (a bypass context, federation, keeps its bypass).
+        if !ctx.bypass_visibility {
+            self.pg_assert_execute_owner(&pa).await?;
         }
 
         match approver {

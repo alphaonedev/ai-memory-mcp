@@ -1169,7 +1169,10 @@ async fn seed_approved_8564(
         )
         .await
         .expect("queue_pending_action");
-    let approver = CallerContext::for_agent(APPROVER_X.to_string());
+    // #8577: a tenant decide on a row the requester does not own is now
+    // refused at decide time, so the already-approved state the execute-gate
+    // cells need is reached through a bypass context (the federated decide).
+    let approver = CallerContext::for_admin("ai:operator-8564");
     let outcome = store
         .approve_with_approver_type(&approver, &pid, APPROVER_X)
         .await
@@ -1345,6 +1348,198 @@ async fn execute_honours_the_callers_context_sqlite_8577() {
         ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("open SqliteStore"),
     );
     execute_honours_the_callers_context("sqlite", &store).await;
+}
+
+/// Count the audit rows of one event type (backend-specific read).
+type CountEvents<'a> = &'a (
+        dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>>
+            + Sync
+    );
+
+/// #8577: a tenant decide is gated on the row owner BEFORE the vote is
+/// written. Requester A, a row owned by B (or unstamped), an eligible
+/// approver deciding `approve`: the decide returns the owner-gate error, the
+/// forensic row is written, the pending row stays `pending` and the target
+/// row remains. The requester's own row still approves and executes, and a
+/// bypass context (federation) keeps its bypass.
+async fn decide_is_owner_gated(
+    label: &str,
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    unstamp: Unstamp<'_>,
+    count_events: CountEvents<'_>,
+) {
+    use ai_memory::models::Tier;
+    use ai_memory::store::{ApproveOutcome, CallerContext, GovernedAction, StoreError};
+    const REFUSED: &str = "pending_action.refused_owner_gate";
+    let admin = CallerContext::for_admin("ai:operator-8577");
+    let approver = CallerContext::for_agent(APPROVER_X.to_string());
+    let requester = CallerContext::for_agent(REQUESTER.to_string());
+    let now = chrono::Utc::now().to_rfc3339();
+    store
+        .register_agent(
+            &requester,
+            &ai_memory::models::AgentRegistration {
+                agent_id: APPROVER_X.to_string(),
+                agent_type: "ai:generic".to_string(),
+                capabilities: Vec::new(),
+                registered_at: now.clone(),
+                last_seen_at: now,
+            },
+        )
+        .await
+        .ok();
+    for (action, tier) in [
+        (GovernedAction::Delete, Tier::Long),
+        (GovernedAction::Promote, Tier::Mid),
+    ] {
+        for (case, owner, strip) in [
+            ("other owner", OTHER_OWNER_8564, false),
+            ("unstamped", REQUESTER, true),
+        ] {
+            let (pid, mid) = seed_pending_8577(store, owner, tier.clone(), action).await;
+            if strip {
+                unstamp(mid.clone()).await;
+            }
+            let before = count_events(REFUSED).await;
+            let err = store
+                .approve_with_approver_type(&approver, &pid, APPROVER_X)
+                .await
+                .expect_err("a tenant decide on a row the requester does not own is refused");
+            assert!(
+                matches!(err, StoreError::PermissionDenied { .. }),
+                "{label} {case}: the owner-gate error: {err:?}"
+            );
+            let pending = store
+                .get_pending(&admin, &pid)
+                .await
+                .expect("get_pending")
+                .expect("the pending row remains");
+            assert_eq!(
+                pending.status, "pending",
+                "{label} {case}: the refused decide leaves the row pending"
+            );
+            assert!(
+                pending.approvals.is_empty(),
+                "{label} {case}: no vote was recorded: {:?}",
+                pending.approvals
+            );
+            assert_eq!(
+                count_events(REFUSED).await,
+                before + 1,
+                "{label} {case}: one forensic row with the reason code"
+            );
+            assert!(
+                store.get(&admin, &mid).await.is_ok(),
+                "{label} {case}: the target row remains"
+            );
+        }
+
+        // The requester's own row approves (and then executes).
+        let (pid, _mid) = seed_pending_8577(store, REQUESTER, tier.clone(), action).await;
+        let outcome = store
+            .approve_with_approver_type(&approver, &pid, APPROVER_X)
+            .await
+            .expect("a tenant decide on the requester's own row approves");
+        assert!(
+            matches!(outcome, ApproveOutcome::Approved),
+            "{label}: own row: {outcome:?}"
+        );
+        assert!(
+            store
+                .execute_pending_action(&approver, &pid)
+                .await
+                .expect("own row executes")
+                .is_some(),
+            "{label}: own row executed"
+        );
+
+        // A bypass context decides without the precondition.
+        let (pid, _other) = seed_pending_8577(store, OTHER_OWNER_8564, tier.clone(), action).await;
+        let outcome = store
+            .approve_with_approver_type(&admin, &pid, APPROVER_X)
+            .await
+            .expect("a bypass decide keeps its bypass");
+        assert!(
+            matches!(outcome, ApproveOutcome::Approved),
+            "{label}: bypass: {outcome:?}"
+        );
+    }
+}
+
+/// Store a memory owned by `owner` at `tier` and queue `action` on it as
+/// `REQUESTER`, leaving the pending row undecided.
+async fn seed_pending_8577(
+    store: &Arc<dyn ai_memory::store::MemoryStore>,
+    owner: &str,
+    tier: ai_memory::models::Tier,
+    action: ai_memory::store::GovernedAction,
+) -> (String, String) {
+    use ai_memory::store::CallerContext;
+    let owner_ctx = CallerContext::for_agent(owner.to_string());
+    let ns = format!("ns-8577-{}", uuid::Uuid::new_v4().simple());
+    let mem = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier,
+        namespace: ns.clone(),
+        title: format!("t-8577-{}", uuid::Uuid::new_v4()),
+        content: "seeded by the #8577 decide owner-precondition test".into(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({"agent_id": owner}),
+        version: 1,
+        ..ai_memory::models::Memory::default()
+    };
+    let mem_id = store.store(&owner_ctx, &mem).await.expect("store memory");
+    let requester = CallerContext::for_agent(REQUESTER.to_string());
+    let pid = store
+        .queue_pending_action(
+            &requester,
+            action,
+            &ns,
+            Some(&mem_id),
+            REQUESTER,
+            &json!({"reason": "8577"}),
+        )
+        .await
+        .expect("queue_pending_action");
+    (pid, mem_id)
+}
+
+#[tokio::test]
+async fn decide_is_owner_gated_sqlite_8577() {
+    let _g = LOCK_8495.lock().await;
+    let file = NamedTempFile::new().expect("tempfile");
+    let db_path = file.path().to_path_buf();
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let unstamp_path = db_path.clone();
+    let unstamp =
+        move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let db_path = unstamp_path.clone();
+            Box::pin(async move {
+                let conn = ai_memory::db::open(&db_path).expect("open unstamp conn");
+                conn.execute("UPDATE memories SET metadata = '{}' WHERE id = ?1", [&id])
+                    .expect("strip the owner stamp");
+            })
+        };
+    let count = move |event: &'static str| -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = i64> + Send>,
+    > {
+        let db_path = db_path.clone();
+        Box::pin(async move {
+            let conn = ai_memory::db::open(&db_path).expect("open count conn");
+            conn.query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                [event],
+                |r| r.get(0),
+            )
+            .expect("count audit rows")
+        })
+    };
+    decide_is_owner_gated("sqlite", &store, &unstamp, &count).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1665,7 +1860,9 @@ mod live_pg {
     #[tokio::test(flavor = "multi_thread")]
     async fn live_postgres_execute_honours_the_callers_context_8577() {
         let Some(url) = common::postgres_url() else {
-            eprintln!("skipping live_postgres_execute_honours_the_callers_context_8577: no postgres url");
+            eprintln!(
+                "skipping live_postgres_execute_honours_the_callers_context_8577: no postgres url"
+            );
             return;
         };
         let _g = LOCK_8495.lock().await;
@@ -1675,5 +1872,50 @@ mod live_pg {
                 .expect("connect postgres adapter"),
         );
         super::execute_honours_the_callers_context("live pg", &store).await;
+    }
+
+    /// #8577: the same decide-time owner precondition on a live `PostgresStore`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_postgres_decide_is_owner_gated_8577() {
+        let Some(url) = common::postgres_url() else {
+            eprintln!("skipping live_postgres_decide_is_owner_gated_8577: no postgres url");
+            return;
+        };
+        let _g = LOCK_8495.lock().await;
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            ai_memory::store::postgres::PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres adapter"),
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect counting pool");
+        let unstamp_pool = pool.clone();
+        let unstamp =
+            move |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                let pool = unstamp_pool.clone();
+                Box::pin(async move {
+                    sqlx::query("UPDATE memories SET metadata = '{}'::jsonb WHERE id = $1")
+                        .bind(id)
+                        .execute(&pool)
+                        .await
+                        .expect("strip the owner stamp");
+                })
+            };
+        let count = move |event: &'static str| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = i64> + Send>,
+        > {
+            let pool = pool.clone();
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
+                    .bind(event)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count audit rows")
+            })
+        };
+        super::decide_is_owner_gated("live pg", &store, &unstamp, &count).await;
     }
 }

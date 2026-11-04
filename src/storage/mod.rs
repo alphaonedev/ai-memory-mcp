@@ -219,6 +219,7 @@ use crate::models::{
 // canonical HTTP status. The error-prefix constants live alongside the
 // typed enum so the Display impl and the prefix tokens stay in lockstep.
 mod error;
+pub mod execute_owner_8577;
 pub use error::{LINK_CYCLE_ERR_PREFIX, LINK_PERMISSION_DENIED_ERR_PREFIX, LinkEnd, StorageError};
 
 // ---------------------------------------------------------------------------
@@ -24168,6 +24169,26 @@ pub fn approve_with_approver_type(
     approver_agent_id: &str,
     surface: ApproveSurface,
 ) -> Result<ApproveOutcome> {
+    approve_with_approver_type_gated(conn, pending_id, approver_agent_id, surface, None)
+}
+
+/// #8577 — a precondition run on the pending row AFTER the eligibility
+/// refusals and BEFORE the approval vote is written.
+pub type ApprovePrecondition<'a> = &'a dyn Fn(&Connection, &PendingAction) -> Result<()>;
+
+/// [`approve_with_approver_type`] with an optional [`ApprovePrecondition`]
+/// (#8577): its refusal leaves the pending row `pending`.
+///
+/// # Errors
+///
+/// Everything [`approve_with_approver_type`] returns, plus the precondition's.
+pub fn approve_with_approver_type_gated(
+    conn: &Connection,
+    pending_id: &str,
+    approver_agent_id: &str,
+    surface: ApproveSurface,
+    precondition: Option<ApprovePrecondition<'_>>,
+) -> Result<ApproveOutcome> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
@@ -24199,6 +24220,9 @@ pub fn approve_with_approver_type(
         surface,
     )? {
         return Ok(ApproveOutcome::Rejected(reason));
+    }
+    if let Some(precondition) = precondition {
+        precondition(conn, &pa)?;
     }
 
     match approver {
