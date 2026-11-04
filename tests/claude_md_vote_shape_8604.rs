@@ -16,7 +16,7 @@ const SHAPE_1X3: &str = "1x3";
 const AUDIT_CITATION: &str = "3-agent vote (6def5ab6)";
 const THRESHOLD_PHRASE: &str = "with a threshold";
 const SUPERSEDED_SHAPES: [&str; 2] = ["5 concurrent", "5-agent vote (4d3ea1c5)"];
-const HISTORY_WORDS: [&str; 3] = ["Prior", "history", "stand"];
+const HISTORY_WORDS: [&str; 2] = ["Prior", "history"];
 const CONDITIONS: [&str; 6] = ["T1", "T2", "T3", "T4", "T5", "T6"];
 
 fn claude_md() -> String {
