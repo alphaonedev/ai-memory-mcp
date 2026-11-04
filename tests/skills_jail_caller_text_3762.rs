@@ -533,7 +533,7 @@ mod pg_3762 {
         let app = app_state_postgres();
         let resp = ai_memory::handlers::skill_export_route(
             axum::extract::State(app),
-            admin_headers(),
+            admin_headers().into(),
             axum::extract::Path("no-such-skill".to_string()),
             axum::Json(ai_memory::handlers::SkillExportBody {
                 target_folder: probe_s,
@@ -562,7 +562,7 @@ mod pg_3762 {
         let app = app_state_postgres();
         let resp = ai_memory::handlers::skill_register_route(
             axum::extract::State(app),
-            admin_headers(),
+            admin_headers().into(),
             axum::Json(inline_skill("pg-probe-3762")),
         )
         .await

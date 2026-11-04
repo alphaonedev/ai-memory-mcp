@@ -31,6 +31,7 @@ const CERT_AGENT: &str = "ai:certificate-8590";
 const OTHER_AGENT: &str = "ai:other-8590";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MISSING_MEMORY: &str = "/api/v1/memories/85908590-8590-4590-8590-859085908590";
+const ADMIN_ROUTE: &str = "/api/v1/gc";
 
 fn build_enforce_router() -> (axum::Router, TempDir) {
     build_router_with_store(None)
@@ -319,7 +320,123 @@ async fn postgres_certificate_gate_parity_8590() {
         )
         .await;
     }
+    check_certificate_admin(router.clone()).await;
+    check_warn_rewrite(router.clone()).await;
+    check_mixed_credentials(router.clone()).await;
     drop(router);
     drop(store);
     drop(scratch);
+}
+
+async fn check_certificate_admin(router: axum::Router) {
+    for (agent, expected) in [
+        (ENROLLED_AGENT, StatusCode::OK),
+        (CERT_AGENT, StatusCode::FORBIDDEN),
+    ] {
+        let binding =
+            ClientCertAgentBinding::new(Some(agent.to_string()), AgentBindingMode::Enforce);
+        let mut req = request(ADMIN_ROUTE, agent, Some(binding));
+        *req.method_mut() = axum::http::Method::POST;
+        check(router.clone(), req, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn certificate_admin_requires_allowlist_8590() {
+    let (router, _dir) = build_enforce_router();
+    check_certificate_admin(router).await;
+}
+
+async fn assert_certificate_principal(req: Request<Body>) {
+    use ai_memory::handlers::identity_binding::{
+        AuthLevel, EnrolledAgentKeys, IdentityHeaders, resolve_auth_level,
+    };
+    use axum::extract::FromRequestParts as _;
+    let (mut parts, _) = req.into_parts();
+    assert_eq!(parts.headers[ai_memory::HEADER_AGENT_ID], CERT_AGENT);
+    let headers = IdentityHeaders::from_request_parts(&mut parts, &())
+        .await
+        .expect("extract rewritten certificate headers");
+    let enrolled = EnrolledAgentKeys::from_map(HashMap::from([(
+        api_key_sha256_hex(ENROLLED_KEY),
+        ENROLLED_AGENT.to_string(),
+    )]));
+    assert_eq!(
+        resolve_auth_level(&enrolled, &headers, CERT_AGENT),
+        AuthLevel::KeyAuthenticated
+    );
+}
+
+async fn check_warn_rewrite(router: axum::Router) {
+    let make_request = || {
+        request(
+            MISSING_MEMORY,
+            OTHER_AGENT,
+            Some(ClientCertAgentBinding::new(
+                Some(CERT_AGENT.to_string()),
+                AgentBindingMode::Warn,
+            )),
+        )
+    };
+    let mut req = make_request();
+    ai_memory::mtls_agent_binding::bind_request(&mut req).expect("warn rewrites the claim");
+    assert_certificate_principal(req).await;
+    check(router, make_request(), StatusCode::NOT_FOUND).await;
+}
+
+#[tokio::test]
+async fn warn_rewrites_claim_and_reaches_key_authenticated_8590() {
+    let (router, _dir) = build_enforce_router();
+    check_warn_rewrite(router).await;
+}
+
+async fn check_mixed_credentials(router: axum::Router) {
+    let make_request = |mode| {
+        let binding = ClientCertAgentBinding::new(Some(CERT_AGENT.to_string()), mode);
+        // The claim already matches the certificate: only key reconciliation
+        // can reject this request, rather than the earlier claim check.
+        let mut req = request(MISSING_MEMORY, CERT_AGENT, Some(binding));
+        req.headers_mut()
+            .insert("x-api-key", ENROLLED_KEY.parse().expect("key header"));
+        req
+    };
+    let response = router
+        .clone()
+        .oneshot(make_request(AgentBindingMode::Enforce))
+        .await
+        .expect("mixed-credential response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+        .await
+        .expect("refusal body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("refusal JSON");
+    assert_eq!(
+        json["code"],
+        ai_memory::mtls_agent_binding::AGENT_ID_CERTIFICATE_MISMATCH
+    );
+
+    let mut req = make_request(AgentBindingMode::Warn);
+    ai_memory::mtls_agent_binding::bind_request(&mut req).expect("bind certificate");
+    assert!(
+        ai_memory::mtls_agent_binding::reconcile_per_agent_key(&req, ENROLLED_AGENT)
+            .expect("warn keeps certificate principal")
+    );
+    assert_certificate_principal(req).await;
+    check(
+        router.clone(),
+        make_request(AgentBindingMode::Warn),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    // The other agent's admin key cannot promote the certificate's principal.
+    let mut req = make_request(AgentBindingMode::Warn);
+    *req.uri_mut() = ADMIN_ROUTE.parse().expect("admin URI");
+    *req.method_mut() = axum::http::Method::POST;
+    check(router, req, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn conflicting_certificate_and_key_enforce_refuses_warn_preserves_certificate_8590() {
+    let (router, _dir) = build_enforce_router();
+    check_mixed_credentials(router).await;
 }
