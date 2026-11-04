@@ -577,19 +577,30 @@ fn resolve_bound_peer_id(
     peer_certs: Option<&[rustls::pki_types::CertificateDer<'_>]>,
     bindings: &HashMap<[u8; 32], String>,
 ) -> Option<String> {
+    bindings.get(&leaf_fingerprint(peer_certs)?).cloned()
+}
+
+/// SHA-256(DER) of the leaf client certificate on a completed TLS
+/// connection; `None` when the peer presented no certificate.
+fn leaf_fingerprint(
+    peer_certs: Option<&[rustls::pki_types::CertificateDer<'_>]>,
+) -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let leaf = peer_certs?.first()?;
-    let fp: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
-    bindings.get(&fp).cloned()
+    Some(Sha256::digest(leaf.as_ref()).into())
 }
 
 /// Per-connection `tower` service wrapper that inserts a [`ClientCertPeerId`]
-/// extension into every request handled on the connection (#2045 L6). One
-/// clone of a small `Option<String>` per request.
+/// extension (#2045 L6, only when a cert-peer-binding map is configured) and
+/// a [`crate::mtls_agent_binding::ClientCertAgentBinding`] extension (#8357,
+/// only when an agent binding table is active) into every request handled
+/// on the connection.
 #[derive(Clone)]
 pub struct CertExtensionService<S> {
     inner: S,
     cert_peer_id: ClientCertPeerId,
+    insert_peer: bool,
+    cert_agent: Option<crate::mtls_agent_binding::ClientCertAgentBinding>,
 }
 
 impl<S> CertExtensionService<S> {
@@ -600,6 +611,15 @@ impl<S> CertExtensionService<S> {
     #[must_use]
     pub fn client_cert_peer_id(&self) -> &ClientCertPeerId {
         &self.cert_peer_id
+    }
+
+    /// The certificate-to-agent binding this wrapper injects (#8357);
+    /// `None` when no agent binding table is active on the listener.
+    #[must_use]
+    pub fn client_cert_agent_binding(
+        &self,
+    ) -> Option<&crate::mtls_agent_binding::ClientCertAgentBinding> {
+        self.cert_agent.as_ref()
     }
 }
 
@@ -619,7 +639,12 @@ where
     }
 
     fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
-        req.extensions_mut().insert(self.cert_peer_id.clone());
+        if self.insert_peer {
+            req.extensions_mut().insert(self.cert_peer_id.clone());
+        }
+        if let Some(agent) = &self.cert_agent {
+            req.extensions_mut().insert(agent.clone());
+        }
         self.inner.call(req)
     }
 }
@@ -633,7 +658,8 @@ where
 #[derive(Clone)]
 pub struct PeerBindingAcceptor {
     inner: axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor>,
-    bindings: Arc<HashMap<[u8; 32], String>>,
+    bindings: Option<Arc<HashMap<[u8; 32], String>>>,
+    agent_table: Option<Arc<crate::mtls_agent_binding::AgentBindingTable>>,
 }
 
 impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for PeerBindingAcceptor
@@ -653,17 +679,25 @@ where
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
         let inner = axum_server::accept::Accept::accept(&self.inner, stream, service);
         let bindings = self.bindings.clone();
+        let agent_table = self.agent_table.clone();
         Box::pin(async move {
             let (tls_stream, service) = inner.await?;
             // `get_ref().1` is the rustls `ServerConnection`; its
             // `peer_certificates()` is the client cert the verifier already
             // fingerprint-pinned. Resolved by inference — no tokio-rustls
             // type is named.
-            let bound =
-                resolve_bound_peer_id(tls_stream.get_ref().1.peer_certificates(), &bindings);
+            let peer_certs = tls_stream.get_ref().1.peer_certificates();
+            let bound = bindings
+                .as_ref()
+                .and_then(|map| resolve_bound_peer_id(peer_certs, map));
+            let cert_agent = agent_table
+                .as_ref()
+                .map(|table| table.binding_for(leaf_fingerprint(peer_certs).as_ref()));
             let service = CertExtensionService {
                 inner: service,
                 cert_peer_id: ClientCertPeerId(bound),
+                insert_peer: bindings.is_some(),
+                cert_agent,
             };
             Ok((tls_stream, service))
         })
@@ -679,9 +713,24 @@ pub fn serve_rustls_acceptor_with_peer_binding(
     config: &axum_server::tls_rustls::RustlsConfig,
     bindings: HashMap<[u8; 32], String>,
 ) -> PeerBindingAcceptor {
+    serve_rustls_acceptor_with_bindings(config, Some(bindings), None)
+}
+
+/// Build a [`PeerBindingAcceptor`] carrying the #2045 cert-peer-binding map
+/// and/or the #8357 certificate-to-agent binding table. Each extension is
+/// injected only when its source is `Some`, so a listener with only one of
+/// the two configured behaves exactly as before for the other. Verifier
+/// chain + `TCP_NODELAY` are identical to [`serve_rustls_acceptor`].
+#[must_use]
+pub fn serve_rustls_acceptor_with_bindings(
+    config: &axum_server::tls_rustls::RustlsConfig,
+    peer_bindings: Option<HashMap<[u8; 32], String>>,
+    agent_table: Option<Arc<crate::mtls_agent_binding::AgentBindingTable>>,
+) -> PeerBindingAcceptor {
     PeerBindingAcceptor {
         inner: serve_rustls_acceptor(config),
-        bindings: Arc::new(bindings),
+        bindings: peer_bindings.map(Arc::new),
+        agent_table,
     }
 }
 
@@ -721,7 +770,7 @@ pub async fn load_fingerprint_allowlist(path: &Path) -> Result<HashSet<[u8; 32]>
 /// hex chars with optional `:` separators. Ultrareview #338: any non-hex,
 /// non-colon character — including embedded whitespace/tabs — is rejected
 /// rather than silently stripped, so copy-paste artefacts fail loudly.
-fn parse_fingerprint_token(token: &str, label: &str, lineno: usize) -> Result<[u8; 32]> {
+pub(crate) fn parse_fingerprint_token(token: &str, label: &str, lineno: usize) -> Result<[u8; 32]> {
     let hex_part = token.strip_prefix("sha256:").unwrap_or(token);
     if let Some(bad) = hex_part
         .chars()
@@ -752,7 +801,7 @@ fn parse_fingerprint_token(token: &str, label: &str, lineno: usize) -> Result<[u
 /// context. Shared by the two `<a> <b>` pin-file parsers
 /// ([`load_peer_fingerprint_map`] #1678, [`load_cert_peer_binding_map`]
 /// #2045) so the "exactly two fields" grammar lives in one place.
-fn two_whitespace_fields<'a>(
+pub(crate) fn two_whitespace_fields<'a>(
     line: &'a str,
     label: &str,
     grammar: &str,
@@ -2396,6 +2445,8 @@ mod tests {
         let svc = CertExtensionService {
             inner,
             cert_peer_id: ClientCertPeerId(Some("peer-x".to_string())),
+            insert_peer: true,
+            cert_agent: None,
         };
         let echoed = svc
             .oneshot(axum::http::Request::new(()))

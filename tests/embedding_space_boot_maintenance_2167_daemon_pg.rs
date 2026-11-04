@@ -62,6 +62,7 @@ fn serve_args(url: &str, tls: &common::tls::TestTls) -> ServeArgs {
         quorum_ca_cert: None,
         catchup_interval_secs: 30,
         federation_identity: None,
+        check: false,
         store_url: Some(url.to_string()),
     }
 }
@@ -166,6 +167,7 @@ async fn daemon_bootstrap_skips_pg_boot_maintenance_on_sqlite_backend() {
         quorum_ca_cert: None,
         catchup_interval_secs: 30,
         federation_identity: None,
+        check: false,
         store_url: None,
     };
     let cfg = app_config_with_offline_api_embedder();

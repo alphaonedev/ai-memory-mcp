@@ -105,6 +105,17 @@ was the #874-class spoof vector):
    (`agent_id_body_header_mismatch` / `agent_id_query_header_mismatch`).
 3. With no header and no body claim, a per-request anonymous id
    (`anonymous:req-<uuid8>`) is synthesized and logged at WARN.
+4. **mTLS certificate binding (v1.0.0, #8357).** When the operator sets
+   `AI_MEMORY_MTLS_AGENT_BINDING_MAP`, the presenting client
+   certificate's agent id is the effective `X-Agent-Id`. A claimed
+   `X-Agent-Id` that differs is rejected with **403**
+   (`agent_id_certificate_mismatch`) under
+   `AI_MEMORY_MTLS_AGENT_BINDING=enforce`, or rewritten to the
+   certificate's agent under `warn`. On `/api/v1/sync/*` a certificate
+   that maps to no agent is rejected with **403**
+   (`agent_id_certificate_unmapped`) under `enforce`. A body or query
+   `agent_id` that differs from the certificate-bound header is then
+   rejected by rule 2.
 
 Validation pattern: `^[A-Za-z0-9_\-:@./]{1,128}$`.
 

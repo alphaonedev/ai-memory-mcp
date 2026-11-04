@@ -1201,6 +1201,12 @@ pub struct ServeArgs {
     /// hostname change. Unset = keep the hostname default.
     #[arg(long)]
     pub federation_identity: Option<String>,
+    /// #8357 — validate the mTLS certificate-to-agent binding configuration
+    /// (`AI_MEMORY_MTLS_AGENT_BINDING`, `AI_MEMORY_MTLS_AGENT_BINDING_MAP`)
+    /// against `--mtls-allowlist`, print the parsed map as JSON and exit
+    /// without starting the daemon. A bad configuration exits non-zero.
+    #[arg(long)]
+    pub check: bool,
 
     // -------- v0.7.0 Wave-3 — adapter selection --------------------
     /// v0.7.0 Wave-3 — full SAL store URL. When set, the daemon binds
@@ -8123,6 +8129,12 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
+    if args.check {
+        let report =
+            crate::mtls_agent_binding::serve_check_report(args.mtls_allowlist.as_deref()).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
         Ok(bootstrap) => bootstrap,
@@ -8318,6 +8330,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 );
                 tls::load_rustls_config(cert, key).await?
             };
+            // #8357 — certificate-to-agent binding; refuses boot on a bad map
+            // or a map without a client-certificate allowlist.
+            let agent_table =
+                crate::mtls_agent_binding::boot_from_env(args.mtls_allowlist.as_deref()).await?;
             let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
             tracing::info!("ai-memory listening on https://{addr}");
             let socket_addr: std::net::SocketAddr = addr.parse()?;
@@ -8449,16 +8465,19 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             ) {
                 tracing::warn!(target: "federation::attestation", "{warning}");
             }
-            if let Some(bindings) = cert_peer_bindings {
+            if let Some(bindings) = &cert_peer_bindings {
                 tracing::info!(
                     bound_fingerprints = bindings.len(),
                     "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
                     tls::cert_peer_binding_mode()
                 );
+            }
+            if cert_peer_bindings.is_some() || agent_table.is_some() {
                 axum_server::bind(socket_addr)
-                    .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
+                    .acceptor(tls::serve_rustls_acceptor_with_bindings(
                         &tls_config,
-                        bindings,
+                        cert_peer_bindings,
+                        agent_table,
                     ))
                     .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -10313,6 +10332,7 @@ mod tests {
             quorum_ca_cert: None,
             catchup_interval_secs: 0,
             federation_identity: None,
+            check: false,
             #[cfg(feature = "sal")]
             store_url: None,
         }

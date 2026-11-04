@@ -926,6 +926,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod mine;
 pub mod models;
+pub mod mtls_agent_binding;
 /// Crate-internal, test-only isolation helpers: process-wide env lock +
 /// snapshot/restore `EnvGuard` (#3301, #2905 class) and `LineageDagIsolation`
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
