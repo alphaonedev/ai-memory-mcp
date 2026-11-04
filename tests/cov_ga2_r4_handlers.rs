@@ -1667,7 +1667,20 @@ async fn pg_post(
 // admin::register_agent + bind_agent_pubkey postgres arms.
 pg_test!(pg_register_then_bind_postgres_arm, url, {
     enable_admin_header_trust();
-    let (_store, router) = pg_store_and_router(&url).await;
+    let (store, router) = pg_store_and_router(&url).await;
+    // #8574: CI may already contain another test's enrolled key. A fresh
+    // database must exercise that same authoritative-registry condition.
+    let seeded = store
+        .bind_agent_api_key(
+            &ai_memory::store::CallerContext::for_admin(
+                ai_memory::identity::sentinels::DAEMON_PRINCIPAL,
+            ),
+            &uid("ai:unrelated-8574"),
+            &sha256_hex(&uid("unrelated-key-8574")),
+        )
+        .await
+        .expect("seed unrelated enrolled key");
+    assert_eq!(seeded, ai_memory::storage::BindApiKeyOutcome::Bound);
     let agent_id = uid("ai:cov-ga2-r4-pgreg");
     let (rs, rb) = pg_post(
         &router,
