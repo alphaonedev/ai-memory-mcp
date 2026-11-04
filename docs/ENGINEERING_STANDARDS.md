@@ -31,7 +31,7 @@ There is no separate development repo. `ai-memory-mcp-dev` is archived.
 - `develop` — active development, all PRs target this branch
 - Feature/fix branches created from `develop` (e.g., `feature/batch-import`, `fix/ttl-overflow`)
 - Maintainers merge `develop` into `main` when cutting a release
-- `CHANGELOG.md` conflicts are resolved by hand, never by a union merge driver (`merge=union` leaves duplicated bullets, #8583); the conductor's merge-tree check and every sync-merge run with `-c merge.union.driver=false`
+- `CHANGELOG.md` conflicts are resolved by hand, never by a union merge driver (`merge=union` left 4 duplicated `[Unreleased]` bullets, #8583); the conductor's merge-tree check and every sync-merge run with `-c merge.union.driver=false`
 
 ### 1.3 Branch Protection (main)
 
