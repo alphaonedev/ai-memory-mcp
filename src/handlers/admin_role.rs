@@ -139,7 +139,9 @@ pub struct PrincipalGate {
 /// the registry is the backstop and the claim must not extend it; a lost admin
 /// key is recovered with the CLI on the data tier); a merely claimed
 /// admin gets a typed 403 and a durable `deny` row, and nothing is changed.
-/// The gate runs before any store call, so SQLite and Postgres behave alike.
+/// The gate reads the registry through the backend-neutral `load_enrolled`
+/// (the SAL on Postgres, `db::` on SQLite) and a store error refuses, so both
+/// backends decide alike.
 ///
 /// # Errors
 ///
