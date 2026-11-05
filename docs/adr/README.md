@@ -10,9 +10,11 @@ the decision, its consequences, and the alternatives that were rejected.
 An ADR is the durable, reviewable home for a decision that (a) changes a
 public contract or on-disk / signed-bytes representation, (b) is
 hard-to-reverse once shipped, or (c) resolves a genuine crossroads between
-≥2 viable designs. ADRs here are minted from the recorded 2×5 adversarial
-decision votes (crossroads policy `4d3ea1c5`) so the vote tally and the
-decision memory travel with the document.
+≥2 viable designs. For new decisions, apply the `CLAUDE.md` crossroads
+threshold and the development epic prompt §5 1x3 vote when required, cited as
+`3-agent vote (6def5ab6)`, so the tally and decision memory travel with the ADR.
+The earlier 2×5 procedure was superseded on 2026-10-10; existing ADR vote
+records retain their original ballots and citations.
 
 > **Note on numbering.** These `docs/adr/ADR-00N-*.md` records are the
 > v1.0.0-era formal ADR series. The three earlier root-level
@@ -42,6 +44,7 @@ decision memory travel with the document.
    `Related:` / `Spec SSOT:`, then **Context / Decision / Consequences /
    Alternatives rejected**).
 2. Number it as the next free `ADR-00N`.
-3. Cite the decision memory + the 2×5 vote workflow id, and — once the code
-   lands — the implementing commit SHAs.
+3. Cite the decision memory and, when §5 requires a vote, its workflow id
+   plus `3-agent vote (6def5ab6)`; retain earlier vote citations for historical
+   decisions. Once the code lands, add the implementing commit SHAs.
 4. Add a row to the Index table above.

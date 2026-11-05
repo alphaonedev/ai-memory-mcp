@@ -139,7 +139,7 @@ v1.0.0 GA is cut (all §4 preconditions), all seven §2-property contributions d
 
 ---
 
-*Loop driver SSOT. Where this document and ROADMAP §27 conflict, §27 wins; where either conflicts with a recorded 2×5 vote made during the epic, the newest recorded vote wins and must be folded back into both at the next docs pass.*
+*Loop driver SSOT. Where this document and ROADMAP §27 conflict, §27 wins; where either conflicts with a recorded §5 ruling (a 1x3 vote, or an earlier 2×5 vote) made during the epic, the newest recorded vote wins and must be folded back into both at the next docs pass.*
 
 [#1936]: https://github.com/alphaonedev/ai-memory-mcp/issues/1936
 [#1937]: https://github.com/alphaonedev/ai-memory-mcp/issues/1937
