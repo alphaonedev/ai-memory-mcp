@@ -330,6 +330,174 @@ fn cli_export_write_failure_bounds_stored_id_8605() {
     assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
 }
 
+#[derive(Clone, Copy)]
+enum PlainExportDestination {
+    Absent,
+    Directory,
+}
+
+fn plain_export_output_8605(
+    destination: PlainExportDestination,
+) -> (TempDir, std::path::PathBuf, std::process::Output) {
+    const NAMESPACE: &str = "plain-export-output";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let id = seed_observation(&conn, NAMESPACE, "source");
+    conn.execute(
+        "UPDATE memories SET memory_kind = 'reflection' WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    db::checkpoint(&conn).unwrap();
+    drop(conn);
+    let out_dir = tmp.path().join("exports");
+    let path = out_dir.join(NAMESPACE).join(format!("{id}.md"));
+    if matches!(destination, PlainExportDestination::Directory) {
+        std::fs::create_dir_all(&path).unwrap();
+    }
+    let output = assert_cmd::Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("export-reflections")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    (tmp, path, output)
+}
+
+#[test]
+fn cli_export_wrote_plain_path_8605_r5() {
+    let (_tmp, expected, output) = plain_export_output_8605(PlainExportDestination::Absent);
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let printed = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("wrote "))
+        .unwrap();
+    assert_eq!(Path::new(printed), expected);
+    assert!(std::fs::metadata(printed).unwrap().is_file());
+}
+
+#[test]
+fn cli_export_write_failure_plain_path_8605_r5() {
+    let (_tmp, expected, output) = plain_export_output_8605(PlainExportDestination::Directory);
+    assert!(!output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!("writing {}", expected.display())),
+        "{stderr:?}"
+    );
+}
+
+fn markdown_with_edge_values_8605(
+    title: &str,
+    target_id: &str,
+    attest_level: &str,
+    created_at: &str,
+) -> String {
+    const NAMESPACE: &str = "yaml-export";
+    const TIMESTAMP: &str = "2026-01-01T00:00:00Z";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let id = seed_observation(&conn, NAMESPACE, "source");
+    // This fixture models durable fields that bypassed ingestion validation.
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute(
+        "UPDATE memories SET id = 'plain-id', memory_kind = 'reflection', title = ?1, \
+         created_at = ?2 WHERE id = ?3",
+        rusqlite::params![title, TIMESTAMP, id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memory_links (source_id, target_id, relation, created_at, attest_level) \
+         VALUES ('plain-id', ?1, 'reflects_on', ?2, ?3)",
+        rusqlite::params![target_id, created_at, attest_level],
+    )
+    .unwrap();
+    db::checkpoint(&conn).unwrap();
+    drop(conn);
+    let out_dir = tmp.path().join("exports");
+    assert_eq!(run_cli(&db_path, &make_args(&out_dir)), 0);
+    std::fs::read_to_string(out_dir.join(NAMESPACE).join("plain-id.md")).unwrap()
+}
+
+#[test]
+fn cli_export_yaml_stored_scalars_8605_r5() {
+    let controls: String = ('\0'..='\u{1f}').chain('\u{7f}'..='\u{9f}').collect();
+    let payload = format!(
+        "value\n    attest_level: signed\n    forged_key: added\"\\{controls}\u{2028}\u{2029}"
+    );
+    let document = markdown_with_edge_values_8605(&payload, &payload, "unsigned", &payload);
+    let header = document
+        .strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0;
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
+    let keys: std::collections::BTreeSet<_> = parsed
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .map(|key| key.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "memory_id",
+            "namespace",
+            "title",
+            "reflection_depth",
+            "attest_level",
+            "created_at",
+            "agent_id",
+            "reflects_on",
+        ])
+    );
+    assert_eq!(parsed["title"].as_str(), Some(payload.as_str()));
+    let edge = &parsed["reflects_on"][0];
+    let edge_keys: std::collections::BTreeSet<_> = edge
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .map(|key| key.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        edge_keys,
+        std::collections::BTreeSet::from(["target_id", "attest_level", "created_at",])
+    );
+    assert_eq!(edge["attest_level"].as_str(), Some("unsigned"));
+    for key in ["target_id", "created_at"] {
+        assert_eq!(edge[key].as_str(), Some(payload.as_str()), "field {key}");
+    }
+    assert!(!header.chars().any(|c| c.is_control() && c != '\n'));
+}
+
+#[test]
+fn cli_export_yaml_plain_bytes_8605_r5() {
+    let document = markdown_with_edge_values_8605(
+        "plain title",
+        "source-id",
+        "unsigned",
+        "2026-01-01T00:00:00Z",
+    );
+    assert_eq!(
+        document,
+        concat!(
+            "---\nmemory_id: plain-id\nnamespace: yaml-export\ntitle: plain title\n",
+            "reflection_depth: 0\nattest_level: unsigned\ncreated_at: 2026-01-01T00:00:00Z\n",
+            "agent_id: \"ai:test\"\nreflects_on:\n  - target_id: source-id\n",
+            "    attest_level: unsigned\n    created_at: 2026-01-01T00:00:00Z\n",
+            "---\n\nbody for source\n",
+        )
+    );
+}
+
 #[test]
 fn cli_namespace_path_8591_refuses_traversal() {
     assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Cli);
