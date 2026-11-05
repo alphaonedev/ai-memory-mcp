@@ -15,16 +15,13 @@ use std::path::PathBuf;
 const SECTION_PREFIX: &str = "## Crossroads decision protocol";
 /// A line starting with this ends the section, unless it sits inside a fence.
 const NEXT_HEADING_PREFIX: &str = "## ";
-/// The fixture path relative to this file; a macro because `include_str!`
-/// accepts a literal or a macro that expands to one, not a `const`.
-macro_rules! fixture_path {
-    () => {
-        "fixtures/claude_md/crossroads_section_8604.md"
-    };
-}
-const FIXTURE_PATH: &str = fixture_path!();
+/// The fixture path relative to this file, named in the panic message. It
+/// repeats the literal in [`FIXTURE`]: `include_str!` takes a literal, and the
+/// CI impact scanner (`scripts/ci/impact/build_index.py`) resolves only a
+/// string literal there.
+const FIXTURE_PATH: &str = "fixtures/claude_md/crossroads_section_8604.md";
 /// The exact bytes of the crossroads section the operator approved.
-const FIXTURE: &str = include_str!(fixture_path!());
+const FIXTURE: &str = include_str!("fixtures/claude_md/crossroads_section_8604.md");
 const LABEL_LIVE: &str = "live CLAUDE.md section";
 const LABEL_FIXTURE: &str = "fixture";
 const CHANGED_SENTENCE: &str = "the CLAUDE.md crossroads section changed; a crossroads rule change \
