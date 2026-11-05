@@ -690,3 +690,34 @@ fn comment_opener_inside_a_column_zero_fence_is_ignored_8604() {
     let text = wrapped_fixture(&format!("{FENCE_LINE}a <!-- b\n{FENCE_LINE}"), "");
     assert_eq!(crossroads_section(&text), FIXTURE);
 }
+
+#[test]
+#[should_panic(expected = "bare CR in the prefix is refused")]
+fn bare_cr_then_backtick_fence_is_refused_8604() {
+    // Sec r12 S1: the renderer sees a fence line after the bare CR.
+    let text = wrapped_fixture("intro\r```\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "bare CR in the prefix is refused")]
+fn bare_cr_then_tilde_fence_is_refused_8604() {
+    // Sec r12 S1b: the tilde form of S1.
+    let text = wrapped_fixture("intro\r~~~\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "bare CR in the prefix is refused")]
+fn cr_only_lines_then_fence_are_refused_8604() {
+    // Sec r12 S1c: CR-only line endings, then a fence line.
+    let text = wrapped_fixture("a\rb\r```\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+fn crlf_only_prefix_does_not_trip_the_bare_cr_rule_8604() {
+    // R5 refuses a CR not followed by LF; CRLF line endings stay accepted.
+    let text = wrapped_fixture("a\r\nb\r\n", "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
