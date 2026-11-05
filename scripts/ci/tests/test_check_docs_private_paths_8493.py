@@ -12,7 +12,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.ci.tests.docs_private_path_shapes_8493 import shapes
+# Resolve the sibling from this file, including isolated discovery and a tests-directory cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from docs_private_path_shapes_8493 import shapes
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/check_docs_private_paths.py"
@@ -50,6 +52,30 @@ class DocsPrivatePaths(unittest.TestCase):
                 self.assertEqual(self.run_gate("--fix").returncode, 0)
                 self.assertEqual(self.doc.read_bytes(), after.encode())
                 self.assertEqual(self.run_gate().returncode, 0)
+
+    def test_url_internal_punctuation_r6(self):
+        for punctuation in "+:@;=!$&*?#":
+            with self.subTest(punctuation=punctuation):
+                text = "https://host/a" + punctuation + "b/home/private_account/x\n"
+                self.doc.write_text(text)
+                self.assertEqual(self.run_gate().returncode, 0)
+                self.assertEqual(self.run_gate("--fix").returncode, 0)
+                self.assertEqual(self.doc.read_text(), text)
+
+    def test_switch_adjacent_relative_roots_r6(self):
+        self.assert_repairs((
+            ("gcc -Ihome/private_account/inc", "gcc -I<home>/inc"),
+            ("ld -LUsers/private_account/lib", "ld -L<home>/lib"),
+            ("gcc -Ivar/home/private_account/inc", "gcc -I<home>/inc"),
+        ))
+
+    def test_non_web_schemes_r6(self):
+        self.assert_repairs(tuple(
+            (scheme + "://host/home/private_account/x", scheme + "://<home>/x")
+            for name in ("ssh", "sftp", "rsync", "git+ssh", "scp", "smb", "nfs",
+                         "git+http", "git+https")
+            for scheme in (name, name.upper())
+        ))
 
     def test_raw_home_pairs_survive_parent_segments_r5(self):
         self.assert_repairs((

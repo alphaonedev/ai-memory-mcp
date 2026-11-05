@@ -32,9 +32,10 @@ NAMED_ACCOUNT = r"[^\W\d][\w-]*(?:\.[\w-]+)*"
 # Class (a): both raw and normalized components determine home membership.
 LOCAL_PATH = re.compile(r"(?<![\w.%/-])(?:/|[\w.-]+/)[\w./%-]*")
 PATH_COMPONENT = re.compile(r"[^/]+")
-WEB_URL = re.compile(
-    r"(?<![\w./-])[A-Za-z][A-Za-z0-9+.-]*://[\w.:%@+-]*(?:/[\w.%~/-]*)?"
+SCHEME_URL = re.compile(
+    r"(?<![\w+./-])[A-Za-z][A-Za-z0-9+.-]*://[^\s,\]\)\"']+"
 )
+SCHEME = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:")
 INVISIBLE = frozenset("\u200b\u200c\u200d\ufeff")
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
 TILDE_START = r"(?:(?<![\w~])|(?<=-I)|(?<=-L))~"
@@ -253,16 +254,24 @@ def normalized_source(text: str) -> tuple[str, list[int]]:
 
 def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]]:
     """Select raw and resolved home pairs; URL and option bytes stay outside spans."""
-    urls = [match.span() for match in WEB_URL.finditer(text)
-            if not match.group().casefold().startswith("file://")]
+    # Tokenize the whole scheme first: an embedded HTTP spelling is not a second URL.
+    urls = [match.span() for match in SCHEME_URL.finditer(text)
+            if match.group().partition(":")[0].casefold() in ("http", "https")]
     starts = [start for start, _ in urls]
+    scheme_ends = {match.end() for match in SCHEME.finditer(text)}
     result = []
     for token in LOCAL_PATH.finditer(text):
         index = bisect_right(starts, token.start()) - 1
         if index >= 0 and token.start() < urls[index][1]:
             continue
-        raw = [(part.group(), token.start() + part.start())
-               for part in PATH_COMPONENT.finditer(token.group())]
+        start = token.start()
+        path = token.group()
+        if path.startswith(("-I", "-L")):
+            # Split the option before selecting pairs, including -Ihome and -LUsers.
+            start += 2
+            path = path[2:]
+        raw = [(part.group(), start + part.start())
+               for part in PATH_COMPONENT.finditer(path)]
         pairs = list(zip(raw, raw[1:]))
         components = []
         for name, offset in raw:
@@ -282,16 +291,11 @@ def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]
                     and name.casefold() not in allowed):
                 end = max(end or 0, offset + len(name))
         if end is not None:
-            start = token.start()
-            # Keep file:// outside the local-path replacement, as in round 3.
-            if (text[max(0, start - 5):start].casefold() == "file:"
-                    and token.group().startswith("//")):
+            # Non-web schemes are plain filesystem tokens; preserve the scheme separator.
+            if start in scheme_ends and path.startswith("//"):
                 start += 2
-            elif token.group().startswith(("-I", "-L")):
-                # Their argument may be relative: keep the switch, replace ../home too.
-                start += 2
-            elif token.group().startswith("-"):
-                start += token.group().index("/")
+            elif path.startswith("-"):
+                start += path.index("/")
             result.append((start, end))
     return result
 

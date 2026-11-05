@@ -12,15 +12,21 @@ The gate scans Markdown below `docs/` and rejects these lexical classes:
 
 - Local paths with a `home` or `Users` component followed by an account name,
   with or without a following path. Nested and relative roots are included;
-  Both raw components and components normalized for `.` and `..` are checked,
+  both raw components and components normalized for `.` and `..` are checked,
   so a parent segment cannot hide an account already present in the text.
   Colon-adjacent paths (PATH lists, scp and container mounts) and file-scheme paths
   are included, with case-insensitive schemes and zero, one or multiple slashes.
-  Recognized scheme URLs other than `file://` are excluded only through their
-  host and path token; a comma or closing bracket ends that token. Bare-domain
+  Only HTTP and HTTPS URLs are excluded (case-insensitive), including their
+  internal punctuation, query and fragment. Whitespace, a comma, a closing
+  bracket, a closing parenthesis or a quote ends that token. Every other scheme,
+  including SSH, SFTP, rsync, git+ssh, SCP, SMB and NFS, scans as a local path.
+  A compound scheme such as git+https is not HTTP(S).
+  The scheme separator survives repair; an authority inside a matched filesystem
+  prefix is part of the redacted span, as for other relative path components. Bare-domain
   spellings are checked as local paths. File-scheme markers and compiler options
-  such as `-I` and `-L` survive repair. A sentence-final period is kept;
-  dots between account-name segments remain part of the account name.
+  such as `-I` and `-L` survive repair, including switch-adjacent relative roots
+  such as `-Ihome/` and `-LUsers/`. A sentence-final period is kept; dots between
+  account-name segments remain part of the account name.
 - Named-home paths shaped as `~<account>/`, wherever they appear.
 - Bare named homes shaped as `~<account>` in ordinary prose, inline code, or a
   fenced block whose language is empty, `sh`, `bash`, `zsh`, `shell`, or `console`
@@ -81,3 +87,7 @@ Each private case must be detected, repaired byte-exactly, and clean on rescan;
 public cases must remain unchanged. Named-tilde homes retain their anywhere rule,
 including URL paths; the web-host exemption applies to absolute home components.
 Every future review finding adds a grammar axis before the implementation fix.
+Round 6 adds URL-internal punctuation (L1), relative roots crossed with every
+left context (Q1), and lower- and upper-case non-web schemes (Q2). HTTP and HTTPS
+remain public. The declared percent-encoded slash and backslash limits stay
+explicit grammar cases; changing those limits also requires changing that axis.

@@ -29,7 +29,8 @@ class Shape:
 
 def shapes():
     """Cross roots, account classes, left contexts and right contexts."""
-    roots = ("/home/", "/Users/", "/var/home/", "/mnt/c/Users/", "~")
+    roots = ("/home/", "/Users/", "/var/home/", "/mnt/c/Users/", "~",
+             "home/", "Users/", "./home/", "../home/", "var/home/", "mnt/c/Users/")
     names = (("user", False), ("private_account", True))
     lefts = (
         ("start", "", ""), ("space", "at ", ""), ("colon", ":", ""),
@@ -45,11 +46,21 @@ def shapes():
         ("url-bracket", "https://example.test/a]", ""),
         ("unicode", "λ ", ""), ("inline", "`", "`"),
     )
+    # Round 6 Q2: only HTTP(S) routes are public; remote filesystem schemes are private.
+    lefts += tuple(
+        ("remote-" + spelling, spelling + "://host/", "")
+        for scheme in ("ssh", "sftp", "rsync", "git+ssh", "scp", "smb", "nfs",
+                       "git+http", "git+https")
+        for spelling in (scheme, scheme.upper())
+    )
+    lefts += tuple(("web-" + scheme, scheme + "://host", "")
+                   for scheme in ("http", "HTTP", "HTTPS"))
     rights = ("", "/", "/x", "/..", "/../y", ".", ",", ")", "]",
               "\\_tail", "\u200b", "\ufeff")
     for root, (name, private), (context, left, closing), right in product(
             roots, names, lefts, rights):
-        if context == "web" and root == "~":
+        web = context == "web" or context.startswith("web-")
+        if web and not root.startswith("/"):
             left += "/"
         prefix = root + name
         tail = right
@@ -66,10 +77,22 @@ def shapes():
             prefix += right
             tail = ""
             private = True
-        public_web = context == "web" and root != "~"
+        public_web = web and root != "~"
         text = left + prefix + tail + closing + "\n"
-        spans = ((len(left), len(left) + len(prefix)),) if private and not public_web else ()
+        start = len(left)
+        if context.startswith("remote-") and root != "~":
+            # Plain filesystem tokens include the authority component after scheme://.
+            start -= len("host/")
+        spans = ((start, len(left) + len(prefix)),) if private and not public_web else ()
         yield Shape(f"{root}:{name}:{context}:{right!r}", text, spans)
+
+    # Round 6 L1: URL-legal internal punctuation is public, including query/fragment text.
+    for scheme, punctuation, root in product(
+            ("http", "https", "HTTP", "HTTPS"), "+:@;=!$&*?#", roots):
+        if root == "~":
+            continue
+        text = scheme + "://host/a" + punctuation + "b/" + root + "private_account/x\n"
+        yield Shape(f"url-punctuation:{scheme}:{punctuation}:{root}", text, ())
 
     # Inner-component productions include both raw and resolved home pairs.
     for left, root, (name, private), tail in product(
