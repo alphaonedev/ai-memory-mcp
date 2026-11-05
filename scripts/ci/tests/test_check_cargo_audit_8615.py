@@ -4,7 +4,7 @@
 """Issue 8615: reject advisory reports and incomplete audit evidence offline."""
 
 import copy
-from datetime import date
+from datetime import date, timedelta
 import importlib.util
 import io
 import json
@@ -35,30 +35,36 @@ EXCEPTIONS = [
 class TrackedExceptions8615Tests(unittest.TestCase):
     """R2 policy reconciles every report entry with one dated tracked exception."""
 
+    def refusal(self, report, entries, pattern, identity=EXCEPTIONS[0]):
+        """Every policy refusal carries the public identity needed for triage."""
+        with self.assertRaisesRegex(ValueError, pattern) as caught:
+            GATE.validate_report(report, entries, TODAY)
+        for field in ("id", "package", "version"):
+            self.assertIn(identity[field], str(caught.exception), field)
+        return str(caught.exception)
+
     def test_unlisted_advisory_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "unlisted advisory"):
-            GATE.validate_report(RECORDED, EXCEPTIONS[:1], TODAY)
+        self.refusal(RECORDED, EXCEPTIONS[:1], "unlisted advisory", EXCEPTIONS[1])
 
     def test_expired_exception_is_rejected(self):
         entries = copy.deepcopy(EXCEPTIONS)
         entries[0]["expires"] = date(2026, 11, 4)
-        with self.assertRaisesRegex(ValueError, "expired exception"):
-            GATE.validate_report(RECORDED, entries, TODAY)
+        message = self.refusal(RECORDED, entries, "expired exception")
+        self.assertIn("2026-11-04", message)
 
     def test_stale_version_or_absent_entry_is_rejected(self):
         entries = copy.deepcopy(EXCEPTIONS)
         entries[0]["version"] = "0.9.9"
-        with self.assertRaisesRegex(ValueError, "stale exception"):
-            GATE.validate_report(RECORDED, entries, TODAY)
-        with self.assertRaisesRegex(ValueError, "stale exception"):
-            GATE.validate_report(CLEAN, EXCEPTIONS, TODAY)
+        message = self.refusal(RECORDED, entries, "stale exception")
+        self.assertIn("0.9.9", message)
+        self.refusal(CLEAN, EXCEPTIONS, "stale exception")
 
     def test_missing_exception_fields_are_rejected(self):
         for field in EXCEPTIONS[0]:
             entries = copy.deepcopy(EXCEPTIONS)
             del entries[0][field]
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "missing exception fields"):
-                GATE.validate_report(RECORDED, entries, TODAY)
+            with self.subTest(field=field):
+                self.refusal(RECORDED, entries, "missing exception fields")
 
     def test_all_reported_advisories_match_unexpired_entries(self):
         self.assertEqual(GATE.validate_report(RECORDED, EXCEPTIONS, TODAY), (565, 1, 1))
@@ -69,10 +75,11 @@ class TrackedExceptions8615Tests(unittest.TestCase):
                              ("reason", "two\nlines"), ("version", ">=0.9.10")):
             entries = copy.deepcopy(EXCEPTIONS)
             entries[0][field] = value
-            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError) as caught:
                 GATE.validate_report(RECORDED, entries, TODAY)
-        with self.assertRaisesRegex(ValueError, "duplicate exception"):
-            GATE.validate_report(RECORDED, EXCEPTIONS + EXCEPTIONS[:1], TODAY)
+            self.assertIn(EXCEPTIONS[0]["id"], str(caught.exception))
+            self.assertIn(EXCEPTIONS[0]["package"], str(caught.exception))
+        self.refusal(RECORDED, EXCEPTIONS + EXCEPTIONS[:1], "duplicate exception")
 
     def test_expiry_beyond_ninety_days_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "horizon"):
@@ -81,23 +88,63 @@ class TrackedExceptions8615Tests(unittest.TestCase):
     def test_changed_package_is_stale(self):
         entries = copy.deepcopy(EXCEPTIONS)
         entries[0]["package"] = "other-package"
-        with self.assertRaisesRegex(ValueError, "stale exception"):
-            GATE.validate_report(RECORDED, entries, TODAY)
+        message = self.refusal(RECORDED, entries, "stale exception")
+        self.assertIn("other-package", message)
 
 
 class CargoAudit8615Tests(unittest.TestCase):
     """The subprocess boundary must preserve every failure as a failed gate."""
 
-    def run_gate(self, report=CLEAN, returncode=0, stdout=None, entries=None):
+    def run_gate(self, report=CLEAN, returncode=0, stdout=None, entries=None, today=TODAY):
         result = subprocess.CompletedProcess(
             ["cargo", "audit", "--json"], returncode,
             json.dumps(report) if stdout is None else stdout, "")
         with patch.object(GATE.subprocess, "run", return_value=result) as run, \
-                patch.object(GATE, "load_policy", return_value=[] if entries is None else entries), \
-                patch.object(GATE, "today_utc", return_value=TODAY):
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                code = GATE.main([])
+                patch.object(GATE, "load_policy", return_value=[] if entries is None else entries):
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+                code = GATE.main([], today=today)
+            self.stdout = output.getvalue()
+            self.stderr = error.getvalue()
         return code, run
+
+    def test_8615_entry_expiring_today_passes(self):
+        today = date(2027, 3, 4)
+        entries = [dict(entry, expires=today) for entry in EXCEPTIONS]
+        self.assertEqual(self.run_gate(RECORDED, 1, entries=entries, today=today)[0], 0)
+
+    def test_8615_entry_expired_yesterday_fails(self):
+        today = date(2027, 2, 4)
+        self.assertEqual(self.run_gate(RECORDED, 1, entries=EXCEPTIONS, today=today)[0], 1)
+        for entry in EXCEPTIONS:
+            for field in ("id", "package", "version"):
+                self.assertIn(entry[field], self.stderr)
+        self.assertIn("2027-02-03", self.stderr)
+        self.assertIn("Cargo audit ratchet:", self.stdout)
+
+    def test_8615_entry_at_rolling_ceiling_passes(self):
+        today = date(2027, 3, 4)
+        expires = today + timedelta(days=GATE.MAX_EXCEPTION_DAYS)
+        entries = [dict(entry, expires=expires) for entry in EXCEPTIONS]
+        self.assertEqual(self.run_gate(RECORDED, 1, entries=entries, today=today)[0], 0)
+
+    def test_8615_entry_beyond_rolling_ceiling_fails(self):
+        today = date(2027, 3, 4)
+        expires = today + timedelta(days=GATE.MAX_EXCEPTION_DAYS + 1)
+        entries = [dict(entry, expires=expires) for entry in EXCEPTIONS]
+        self.assertEqual(self.run_gate(RECORDED, 1, entries=entries, today=today)[0], 1)
+        self.assertIn("horizon", self.stderr)
+        self.assertIn(EXCEPTIONS[0]["id"], self.stderr)
+        self.assertIn(expires.isoformat(), self.stderr)
+
+    def test_8615_all_unlisted_messages_reach_workflow_output(self):
+        self.assertEqual(self.run_gate(RECORDED, 1)[0], 1)
+        self.assertIn("Cargo audit ratchet:", self.stdout)
+        for entry in EXCEPTIONS:
+            for field in ("id", "package", "version"):
+                self.assertIn(entry[field], self.stderr)
+        self.assertNotIn('"vulnerabilities"', self.stderr)
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("          python3 scripts/ci/check_cargo_audit.py\n", workflow)
 
     def test_8615_clean_report_passes(self):
         code, run = self.run_gate()
@@ -196,6 +243,8 @@ class CargoAudit8615Tests(unittest.TestCase):
                     for entry in EXCEPTIONS]
         self.assertEqual(identities, expected)
         GATE.exception_index(entries, TODAY)
+        for entry in entries:
+            self.assertLessEqual(entry["expires"], date(2027, 2, 3))
         self.assertFalse((ROOT / "scripts/ci/cargo_audit_allowlist.json").exists())
 
     def test_8615_missing_or_malformed_policy_fails(self):
