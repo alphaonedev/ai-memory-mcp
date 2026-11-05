@@ -65,7 +65,8 @@ class DocsPrivatePaths(unittest.TestCase):
 
     def test_escaped_and_invisible_account_is_fully_redacted_r4(self):
         names = (r"private\_account", "private\u200baccount", "private\u200caccount",
-                 "private\u200daccount", "private\ufeffaccount", "private_account\u200b")
+                 "private\u200daccount", "private\ufeffaccount", "private_account\u200b",
+                 "private\\\u200b_account")
         for name in names:
             for root in ("/home/", "~", "/var/home/"):
                 with self.subTest(root=root, name=name):

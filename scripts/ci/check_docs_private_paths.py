@@ -240,10 +240,10 @@ def normalized_source(text: str) -> tuple[str, list[int]]:
     """Remove account obfuscators for matching, retaining original span offsets."""
     chars = []
     offsets = []
-    for index, char in enumerate(text):
-        if char in INVISIBLE:
-            continue
-        if char == "\\" and text[index + 1:index + 2] in ("_", "-", "."):
+    visible = [(index, char) for index, char in enumerate(text) if char not in INVISIBLE]
+    for position, (index, char) in enumerate(visible):
+        following = visible[position + 1][1] if position + 1 < len(visible) else ""
+        if char == "\\" and following in ("_", "-", "."):
             continue
         chars.append(char)
         offsets.append(index)
