@@ -76,6 +76,11 @@ const SUPERSEDED_MARKERS: [&str; 11] = [
 const ALLOWED_NON_ASCII: [char; 5] = ['\u{00A7}', '\u{2013}', '\u{2014}', '\u{2194}', '\u{2265}'];
 /// An HTML comment opener, forbidden in the section (invisible when rendered).
 const HTML_COMMENT_OPEN: &str = "<!--";
+/// An HTML comment closer, used to track an HTML comment opened before the
+/// crossroads heading.
+const HTML_COMMENT_CLOSE: &str = "-->";
+const PANIC_OPEN_FENCE: &str = "crossroads heading sits inside an open fenced code block";
+const PANIC_OPEN_COMMENT: &str = "crossroads heading sits inside an open HTML comment";
 /// Starts an HTML entity (`&#...;` or `&name;`), forbidden in the section.
 const ENTITY_START: u8 = b'&';
 const NUMERIC_ENTITY_MARK: u8 = b'#';
@@ -127,16 +132,65 @@ fn fence_run(line: &str) -> Option<(u8, usize, &str)> {
     (run >= FENCE_MIN_RUN).then(|| (first, run, &body[run..]))
 }
 
+/// True when `line` leaves an HTML comment open, given whether one was open
+/// at its start. Scans `<!--` and `-->` in order across the line.
+fn comment_open_after(line: &str, mut in_comment: bool) -> bool {
+    let mut rest = line;
+    loop {
+        let marker = if in_comment {
+            HTML_COMMENT_CLOSE
+        } else {
+            HTML_COMMENT_OPEN
+        };
+        let Some(at) = rest.find(marker) else {
+            return in_comment;
+        };
+        in_comment = !in_comment;
+        rest = &rest[at + marker.len()..];
+    }
+}
+
+/// Panics when the text before the heading leaves a fenced code block or an
+/// HTML comment open at the heading. Fences follow the same `CommonMark` rule
+/// as the section end (backtick or tilde runs, closed only by the same
+/// character and at least as long a run); a fence line inside an open comment
+/// and a comment marker inside an open fence are plain text.
+fn assert_heading_not_wrapped(before: &str) {
+    let mut open_fence: Option<(u8, usize)> = None;
+    let mut in_comment = false;
+    for line in before.split_inclusive('\n') {
+        if in_comment {
+            in_comment = comment_open_after(line, true);
+            continue;
+        }
+        match (open_fence, fence_run(line)) {
+            (None, Some((ch, run, _))) => open_fence = Some((ch, run)),
+            (Some((open_ch, open_run)), Some((ch, run, tail)))
+                if ch == open_ch && run >= open_run && tail.trim().is_empty() =>
+            {
+                open_fence = None;
+            }
+            (None, None) => in_comment = comment_open_after(line, false),
+            _ => {}
+        }
+    }
+    assert!(open_fence.is_none(), "{PANIC_OPEN_FENCE}");
+    assert!(!in_comment, "{PANIC_OPEN_COMMENT}");
+}
+
 /// The crossroads section: from its heading line to the byte before the
 /// first `\n## ` outside a fenced code block (`CommonMark` fences: backtick or
 /// tilde runs, closed only by the same character and at least as long a run).
 /// The heading prefix must occur exactly once, case-insensitively, anywhere in
-/// the text; that one occurrence must also sit at a line start (byte offset 0
-/// or right after a newline). A heading inside a blockquote, an HTML comment,
-/// a fence or with an extra `#` is therefore not found and the test fails
-/// closed on its own (`scripts/check-claude-md-size.py` also rejects those
-/// wrappers in CI). `CommonMark` allows up to three spaces before `#`; this
-/// pin deliberately requires column 0 because the live file has it there.
+/// the text; that one occurrence must sit at a line start (byte offset 0 or
+/// right after a newline; a CRLF before it and a BOM at file start do not
+/// change this test, and `scripts/check-claude-md-size.py` rejects the BOM).
+/// The text before the heading is scanned from byte 0: the test panics when a
+/// fenced code block or an HTML comment opened on an earlier line is still
+/// open at the heading ([`assert_heading_not_wrapped`]). A heading on a
+/// blockquote line or with an extra `#` is not found at a line start and also
+/// panics. `CommonMark` allows up to three spaces before `#`; this pin
+/// deliberately requires column 0 because the live file has it there.
 fn crossroads_section(text: &str) -> &str {
     let lowered = text.to_ascii_lowercase();
     let prefix = SECTION_PREFIX.to_ascii_lowercase();
@@ -152,6 +206,7 @@ fn crossroads_section(text: &str) -> &str {
         .unwrap_or_else(|| {
             panic!("crossroads heading not found at a line start: `{SECTION_PREFIX}`")
         });
+    assert_heading_not_wrapped(&text[..start]);
     let rest = &text[start..];
     let mut open_fence: Option<(u8, usize)> = None;
     let mut offset = 0;
