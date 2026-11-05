@@ -38,6 +38,10 @@ The gate scans Markdown below `docs/` and rejects these lexical classes:
   nameless-tilde local path. Standalone HTTP(S) headers at line start, after
   whitespace, opening parentheses/brackets, quotes or commas, and Markdown link
   targets remain public; nested headers inside a public web URL stay public.
+  Before testing the nesting delimiter, the gate skips `INVISIBLE` characters
+  leftward, so they cannot turn a local-path header into a public URL. The same
+  nesting rule covers a tilde immediately before a web header: the bare-name
+  matcher yields at `://`, preserving the tilde, header and authority during repair.
   Bare-domain spellings are checked as local paths. File-scheme markers and
   compiler options survive repair. `PATH_SWITCHES` preserves the established
   `-I` and `-L` prefixes; generic glued `-letters` switches also split before
@@ -91,6 +95,9 @@ class `private-home-prefix`, never the matched private text. The summary include
 Exit codes are 0 for a clean scan or successful repair, 1 for remaining findings
 or unused exceptions, and 2 for invalid policy or an input error. Repair refuses
 to write when an exception is unused. Symlinked documentation is refused.
+After repair, `--fix` rescans the replacement text and prints any remaining
+findings without private text. A nonzero rescan returns `EXIT_FINDINGS` (1);
+the summary reports `remaining`, and a successful repair requires it to be zero.
 
 CI runs this gate immediately after docs-vs-SSOT in
 `.github/workflows/c8-precheck.yml`. It is separate from the secrets scanner.
@@ -133,3 +140,6 @@ productions remain in the grammar; an added slash must not remove their coverage
 Round 9 adds local paths crossed with glued HTTP(S) headers and home roots (F1),
 plus complex dash tokens and word-glued option spellings crossed with tilde homes
 (F2). Public web-header boundary controls remain part of the independent grammar.
+Round 10 adds invisible characters between local slashes and web headers (F1),
+and tilde-prefixed web headers crossed with home roots (F2). An independent
+repair-rescan test also rejects a repairer that leaves a private prefix behind.

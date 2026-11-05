@@ -39,9 +39,13 @@ URL_TOKEN_CHARS = frozenset(
 )
 # Preserve these established prefixes before splitting any other glued -letters switch.
 PATH_SWITCHES = ("-I", "-L")
+PATH_DELIMITERS = frozenset("/~")
+PATH_SEPARATOR = "/"
+SCHEME_SEPARATOR = "://"
 RELATIVE_SWITCH = re.compile(
     r"-[A-Za-z]+?(?=(?:home/|Users/|\./|\.\./|var/home/|mnt/c/Users/|~))"
 )
+# Locate scheme headers independently of their public or nested path context.
 SCHEME_HEADER = re.compile(r"(?<![\w+.-])[A-Za-z][A-Za-z0-9+.-]*://")
 INVISIBLE = frozenset("\u200b\u200c\u200d\ufeff")
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
@@ -276,12 +280,18 @@ def url_context(original: str, text: str,
         enclosing = [public for start, end, public in contexts if start < match.start() < end]
         if any(enclosing):
             continue
-        nested = bool(enclosing) or original[match.start() - 1:match.start()] == "/"
-        public = match.group()[:-len("://")].casefold() in WEB_URL_SCHEMES and not nested
+        preceding = match.start()
+        while preceding and original[preceding - 1] in INVISIBLE:
+            preceding -= 1
+        nested = bool(enclosing) or (
+            preceding > 0 and original[preceding - 1] in PATH_DELIMITERS
+        )
+        public = match.group()[:-len(SCHEME_SEPARATOR)].casefold() in WEB_URL_SCHEMES
+        public = public and not nested
         path = match.end()
         if not public:
             # Unlike a web token, an authority can contain ] and invisible host bytes.
-            while path < len(original) and original[path] != "/":
+            while path < len(original) and original[path] != PATH_SEPARATOR:
                 if original[path].isspace():
                     break
                 path += 1
@@ -293,7 +303,7 @@ def url_context(original: str, text: str,
         if public:
             right = bisect_left(offsets, end)
             masked[left:right] = " " * (right - left)
-        elif path < len(original) and original[path] == "/":
+        elif path < len(original) and original[path] == PATH_SEPARATOR:
             # Nested URL repair retains its path separator as well as its authority.
             repair_starts.append((left, bisect_left(offsets, path + int(nested))))
     return "".join(masked), repair_starts
@@ -304,7 +314,7 @@ def path_switch_length(path: str) -> int:
     relative = RELATIVE_SWITCH.match(path)
     if relative:
         return relative.end()
-    boundaries = [index for index, char in enumerate(path) if char in "/~"]
+    boundaries = [index for index, char in enumerate(path) if char in PATH_DELIMITERS]
     if path.startswith("-") and boundaries:
         return boundaries[0]
     for switch in PATH_SWITCHES:
@@ -386,6 +396,8 @@ def findings(text: str, allowed: frozenset[str],
     used = set()
     lines = original.split("\n")
     for match in sorted(matches, key=lambda value: value.start()):
+        if match.re is BARE_HOME and text.startswith(SCHEME_SEPARATOR, match.end()):
+            continue
         if not tilde_start_allowed(text, match.start()):
             continue
         if match.re in (NAMED_HOME, BARE_HOME) and match.group("name")[0].isnumeric():
@@ -454,13 +466,21 @@ def main(argv: list[str] | None = None) -> int:
                   if (entry.path, entry.line) not in used]
         for relative, number in unused:
             print(f"{relative}:{number}: unused exact-line exception")
+        remaining = 0
         if args.fix and not unused:
             for path, replacement in changes:
                 path.write_bytes(replacement)
+                relative = path.relative_to(args.root).as_posix()
+                matches, _ = findings(replacement.decode("utf-8", "surrogateescape"),
+                                      allowed, by_path.get(relative))
+                remaining += len(matches)
+                for match in matches:
+                    print(f"{relative}:{match.line}: private-home-prefix")
         label = "redacted" if args.fix and not unused else "findings"
         print(f"docs-private-paths: {label}={total} files={len(changes)} scanned={len(documents)} "
-              f"exceptions_used={len(used)} exceptions_unused={len(unused)}")
-        return EXIT_FINDINGS if unused or (total and not args.fix) else EXIT_CLEAN
+              f"exceptions_used={len(used)} exceptions_unused={len(unused)} "
+              f"remaining={remaining}")
+        return EXIT_FINDINGS if unused or remaining or (total and not args.fix) else EXIT_CLEAN
     except (OSError, ValueError) as error:
         print(f"docs-private-paths: {error}", file=sys.stderr)
         return EXIT_USAGE
