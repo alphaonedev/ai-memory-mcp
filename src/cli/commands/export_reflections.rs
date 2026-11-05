@@ -377,9 +377,10 @@ pub(crate) fn render_payload(
 }
 
 /// Render the YAML-frontmatter markdown body. Frontmatter fields are
-/// emitted in a stable order (memory_id, namespace, reflection_depth,
+/// emitted in a stable order (memory_id, namespace, title, reflection_depth,
 /// attest_level, created_at, agent_id) followed by a sequence of
-/// `reflects_on` edges. The body of the reflection follows after a
+/// `reflects_on` edges. Every stored string uses the shared YAML encoder.
+/// The body of the reflection follows after a
 /// blank line, exactly as it was stored.
 fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> String {
     use YamlColonStyle::{PlainWhenSafe, Quote};
@@ -453,6 +454,59 @@ enum YamlColonStyle {
     PlainWhenSafe,
 }
 
+/// Unicode 18 General_Category=Cf, including supplementary-plane controls.
+/// Source: unicode.org/Public/18.0.0/ucd/extracted/DerivedGeneralCategory.txt.
+/// CONST-01: this classification depends only on the scalar value.
+const fn is_yaml_format_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// Preserve string types under YAML core resolution and legacy bool readers.
+/// OWNERSHIP-05: inspect borrowed bytes without allocating a lowercase copy.
+/// Timestamps remain strings under the core schema and keep their old bytes.
+fn yaml_plain_resolves_non_string(s: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "~", "null", "true", "false", "yes", "no", "on", "off", ".inf", ".nan",
+    ];
+    if KEYWORDS.iter().any(|word| s.eq_ignore_ascii_case(word)) {
+        return true;
+    }
+    if let Some(digits) = s.strip_prefix("0x") {
+        return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if let Some(digits) = s.strip_prefix("0o") {
+        return !digits.is_empty() && digits.bytes().all(|b| matches!(b, b'0'..=b'7'));
+    }
+    // Restrict Rust's float parser to YAML numeric syntax; bare inf/NaN and
+    // RFC3339 timestamps must not acquire a different quoting policy.
+    s.bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+        && s.parse::<f64>().is_ok()
+}
+
 /// Quote unsafe stored scalars and escape controls without YAML line folding.
 /// Existing plain timestamps and conservative namespace/title/agent quoting
 /// retain their bytes; both styles use the same control-character encoder.
@@ -465,14 +519,17 @@ fn yaml_scalar(s: &str, colon_style: YamlColonStyle) -> String {
             || tail.starts_with(char::is_whitespace)
     });
     let needs_quote = s.is_empty()
+        || yaml_plain_resolves_non_string(s)
         || s.trim() != s
         || s.starts_with([
-            '-', '?', '*', '&', '!', '|', '>', '\'', '"', '%', '@', '`', '[', ']', '{', '}', ',',
+            '+', '-', '?', '*', '&', '!', '|', '>', '\'', '"', '%', '@', '`', '[', ']', '{', '}',
+            ',',
         ])
         || unsafe_colon
         || s.contains(['#', '"', '\\'])
-        || s.chars()
-            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'));
+        || s.chars().any(|c| {
+            c.is_control() || is_yaml_format_control(c) || matches!(c, '\u{2028}' | '\u{2029}')
+        });
     if needs_quote {
         let mut escaped = String::from("\"");
         for c in s.chars() {
@@ -482,9 +539,17 @@ fn yaml_scalar(s: &str, colon_style: YamlColonStyle) -> String {
                 '\n' => escaped.push_str("\\n"),
                 '\r' => escaped.push_str("\\r"),
                 '\t' => escaped.push_str("\\t"),
-                c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => {
+                c if c.is_control()
+                    || is_yaml_format_control(c)
+                    || matches!(c, '\u{2028}' | '\u{2029}') =>
+                {
+                    // YAML 1.2 §5.7: \u has exactly four hex digits; \U has eight.
                     // ERRORS-19: fmt::Write for String is infallible.
-                    let _ = write!(escaped, "\\u{:04x}", u32::from(c));
+                    let _ = if u32::from(c) <= u32::from(u16::MAX) {
+                        write!(escaped, "\\u{:04x}", u32::from(c))
+                    } else {
+                        write!(escaped, "\\U{:08x}", u32::from(c))
+                    };
                 }
                 c => escaped.push(c),
             }
