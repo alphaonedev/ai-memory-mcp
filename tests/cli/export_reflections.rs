@@ -255,6 +255,81 @@ fn cli_namespace_refusal_bounds_stored_values_8605() {
     }
 }
 
+fn export_output_with_stored_id_8605(stored_id: &str) -> std::process::Output {
+    const NAMESPACE: &str = "export-output-diagnostic";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let original_id = seed_observation(&conn, NAMESPACE, "source");
+    conn.execute(
+        "UPDATE memories SET id = ?1, memory_kind = 'reflection' WHERE id = ?2",
+        rusqlite::params![stored_id, original_id],
+    )
+    .unwrap();
+    db::checkpoint(&conn).expect("checkpoint before subprocess read");
+    drop(conn);
+    let out_dir = tmp.path().join("exports");
+    let output = assert_cmd::Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("export-reflections")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .expect("run export CLI");
+    if output.status.success() {
+        assert!(
+            out_dir
+                .join(NAMESPACE)
+                .join(format!("{stored_id}.md"))
+                .is_file()
+        );
+    }
+    output
+}
+
+#[test]
+fn cli_export_write_failure_escapes_stored_id_8605() {
+    const STORED_ID: &str = "missing/\u{1b}[2Jid\r";
+    let output = export_output_with_stored_id_8605(STORED_ID);
+    assert!(!output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("writing "));
+    assert!(stderr.contains(&format!("{STORED_ID:?}")));
+    assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
+}
+
+#[test]
+fn cli_export_wrote_escapes_stored_id_8605() {
+    const STORED_ID: &str = "\u{1b}[2Jid\r";
+    let output = export_output_with_stored_id_8605(STORED_ID);
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    assert!(stdout.contains("wrote "));
+    assert!(stdout.contains(&format!("{STORED_ID:?}")));
+    assert!(!stdout.contains('\u{1b}') && !stdout.contains('\r'));
+}
+
+#[test]
+fn cli_export_write_failure_bounds_stored_id_8605() {
+    const OVERSIZED_WRITE_ID_CHARS: usize = 1024 * 1024;
+    const MAX_WRITE_ERROR_BYTES: usize = 4096;
+    let stored_id = format!("\u{1b}\r{}", "x".repeat(OVERSIZED_WRITE_ID_CHARS));
+    let output = export_output_with_stored_id_8605(&stored_id);
+    assert!(!output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(
+        stderr.len() <= MAX_WRITE_ERROR_BYTES,
+        "write-failure stderr must be bounded, got {} bytes",
+        stderr.len()
+    );
+    assert!(stderr.contains(&format!("[truncated; original_bytes={}]", stored_id.len())));
+    assert!(stderr.contains("\\u{1b}\\r"));
+    assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
+}
+
 #[test]
 fn cli_namespace_path_8591_refuses_traversal() {
     assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Cli);
