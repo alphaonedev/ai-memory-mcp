@@ -23,11 +23,14 @@ Symlink rules (#8493). The globs match file NAMES only, so a symlink would hide
 an edit to its target from every glob. Two checks run before any docs-only or
 skip verdict, with the --repo directory as the tree:
 
-1. Tracked symlinks anywhere force full CI. `git -C <repo> ls-files -s -z`
-   lists the index; one or more mode 120000 entries give both verdicts false
-   with reason tracked-symlink-full-ci naming the first path. This costs a
-   full run even for a symlink outside every test_read_globs entry; the
-   classifier never expands a wildcard glob or walks the tree.
+1. Tracked symlinks anywhere in the work tree force full CI. The top of the
+   work tree is resolved with `git -C <repo> rev-parse --show-toplevel` and
+   scanned whatever --repo names inside it, from two listings: the index
+   (`git ls-files -s -z`) and the committed tree (`git ls-tree -r -z HEAD`).
+   A mode 120000 entry in either gives both verdicts false with reason
+   tracked-symlink-full-ci naming the first path. This costs a full run even
+   for a symlink outside every test_read_globs entry; the classifier never
+   expands a wildcard glob or walks the tree.
 2. Defence in depth: a path named by test_read_globs (the literal path, or the
    literal directory prefix of a wildcard glob) that is a symlink in the
    working tree (lstat, never followed) gives both false with reason
@@ -35,9 +38,11 @@ skip verdict, with the --repo directory as the tree:
    link the index does not know about. Untracked paths below a wildcard tail
    are NOT walked or checked.
 
-A missing path is not a symlink and keeps the normal verdict. If git is
-missing or exits nonzero, the verdict is both false with reason
-classifier-error-fail-closed carrying the return code and the head of stderr.
+A missing path is not a symlink and keeps the normal verdict. A bare
+repository, a directory that is not a repository, an unborn HEAD, git missing,
+a git timeout or a nonzero git exit all fail closed: both verdicts false with
+reason classifier-error-fail-closed carrying the return code and the head of
+stderr.
 """
 import argparse
 import re
@@ -156,24 +161,54 @@ def symlinked_read_path(section: dict, repo: Path) -> Optional[str]:
     return None
 
 
-def tracked_symlink(repo: Path) -> Optional[str]:
-    """Return the first symlink path (mode 120000) in the index under `repo`, else None.
+def git_output(repo: Path, args: List[str], what: str) -> bytes:
+    """Return stdout of `git -C <repo> <args>`; raise RuntimeError on any failure.
 
-    Raises RuntimeError when git is missing or exits nonzero; the message
-    carries the return code and a sanitised head of stderr, one printable line.
+    The message carries `what`, the return code and a sanitised head of stderr
+    (one printable line); git missing or timing out is the same error path.
     """
     try:
-        res = subprocess.run(["git", "-C", str(repo), "ls-files", "-s", "-z"],
+        res = subprocess.run(["git", "-C", str(repo)] + args,
                              capture_output=True, timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError("git ls-files did not run: %s" % clean_text(str(exc))) from exc
+        raise RuntimeError("%s did not run: %s" % (what, clean_text(str(exc)))) from exc
     if res.returncode != 0:
         head = clean_text(res.stderr.decode("utf-8", "replace"))
-        raise RuntimeError("git ls-files rc=%d %s" % (res.returncode, head))
-    for entry in res.stdout.split(common.NUL.encode()):
+        raise RuntimeError("%s rc=%d %s" % (what, res.returncode, head))
+    return res.stdout
+
+
+def first_symlink_entry(listing: bytes) -> Optional[str]:
+    """Return the path of the first mode 120000 entry of a NUL-separated listing.
+
+    Both `ls-files -s -z` and `ls-tree -r -z` put the mode first, then a TAB
+    before the path.
+    """
+    for entry in listing.split(common.NUL.encode()):
         meta, _, path = entry.partition(b"\t")
         if meta.split(b" ", 1)[0].decode("ascii", "replace") == GIT_SYMLINK_MODE:
             return path.decode("utf-8", "replace")
+    return None
+
+
+def tracked_symlink(repo: Path) -> Optional[str]:
+    """Return the first tracked symlink (mode 120000) of the work tree around `repo`.
+
+    The top of the work tree is resolved first (`rev-parse --show-toplevel`),
+    so the scan covers the whole tree whatever --repo names inside it. Two
+    listings are scanned from that top: the index (`ls-files -s -z`) and the
+    committed tree (`ls-tree -r -z HEAD`), so a missing or empty index cannot
+    hide a symlink HEAD tracks. Raises RuntimeError when git is missing, times
+    out or exits nonzero: a bare repository, a directory that is not a
+    repository and an unborn HEAD all fail closed.
+    """
+    top_raw = git_output(repo, ["rev-parse", "--show-toplevel"], "git rev-parse")
+    top = Path(top_raw.decode("utf-8", "surrogateescape").strip())
+    for args, what in ((["ls-files", "-s", "-z"], "git ls-files"),
+                       (["ls-tree", "-r", "-z", "HEAD"], "git ls-tree")):
+        found = first_symlink_entry(git_output(top, args, what))
+        if found:
+            return found
     return None
 
 
