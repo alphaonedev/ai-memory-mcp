@@ -44,7 +44,7 @@ records retain their original ballots and citations.
    `Related:` / `Spec SSOT:`, then **Context / Decision / Consequences /
    Alternatives rejected**).
 2. Number it as the next free `ADR-00N`.
-3. Cite the decision memory and, when §5 requires a vote, its workflow id
+3. Cite the decision memory and, when development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) requires a vote, its workflow id
    plus `3-agent vote (6def5ab6)`; retain earlier vote citations for historical
    decisions. Once the code lands, add the implementing commit SHAs.
 4. Add a row to the Index table above.

@@ -88,7 +88,7 @@ Post-v0.9.0 reconciliation: W1 docs pass (factually-false public claims first), 
 
 ### Gate 1 — P0 freeze-critical lane (~100–115 sessions) — must precede the v1.0 API-stability declaration
 Everything here changes persisted, signed, or wire shapes; shipping the v1.0 freeze *before* these is self-defeating. Every item is a T1+T4 crossroads → 5-agent vote per the repo protocol.
-(superseded 2026-10-10: the crossroads rule is now the §5 1x3 vote, 3-agent vote (6def5ab6); recorded here unchanged as history)
+(superseded 2026-10-10: the crossroads rule is now the development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) 1x3 vote, 3-agent vote (6def5ab6); recorded here unchanged as history)
 
 | Item | Requirements | Notes |
 |---|---|---|
@@ -129,7 +129,7 @@ From the cross-family 3×7 adjudication vs the Grok 4.5 49-agent assessment ([`F
 
 **Gate 1 (P0 freeze-critical) additions:**
 - **UUID→cid record-identity-authority ADR** (Grok R16 sustained) — T4 5-agent vote pre-freeze; cutover migration stays out of v1.0 unless the ADR rules otherwise.
-(superseded 2026-10-10: the crossroads rule is now the §5 1x3 vote, 3-agent vote (6def5ab6); recorded here unchanged as history)
+(superseded 2026-10-10: the crossroads rule is now the development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) 1x3 vote, 3-agent vote (6def5ab6); recorded here unchanged as history)
 - **Read-path provenance/consumer-binding envelope scope** (M1) — ruled pre-freeze or explicitly recorded post-v1.0.
 - **#1834 bitemporal COLUMNS promoted** from P2 into this lane (full Claim algebra deferred with a recorded ruling).
 - **Supply-chain/build-integrity item:** cargo-vet-class dependency review over the lock, SBOM in release artifacts, implement-or-strike the ROADMAP:995 reproducible-build gate.

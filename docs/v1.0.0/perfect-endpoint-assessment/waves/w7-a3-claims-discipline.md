@@ -201,7 +201,7 @@ Before any ban-row flips on ROADMAP / release notes / site:
 2. **Test pin:** named regression (sqlite + postgres where dual-backend).  
 3. **Codegraph / SSOT:** schema version + env default documented in CLAUDE.md env table if operator-visible.  
 4. **5-agent vote cite** when T1–T6 (public contract / security posture).  
-   (superseded 2026-10-10: the crossroads rule is now the §5 1x3 vote, 3-agent vote (6def5ab6); recorded here unchanged as history)
+   (superseded 2026-10-10: the crossroads rule is now the development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) 1x3 vote, 3-agent vote (6def5ab6); recorded here unchanged as history)
 5. **Edit this table** + ROADMAP §26.5 in the **same** change set (no doc lag).  
 6. **Capabilities honesty:** `memory_capabilities` / TRACT manifest declares residual non-conformance.  
 7. **Kill-test sentence:** public sentence maps to default ≥0.80 **or** retains explicit qualifier.

@@ -3,11 +3,11 @@
 > **Purpose:** the durable handoff from Claude Fable 5 (orchestrating the v1.0.0 epic in Phase A) to Claude Opus 4.8 (orchestrating Phase B after the Fable API cutoff). Read this in full when you inherit the epic. Everything Fable decided lives in ai-memory + the tracker, not in a context window — this document is the index into it.
 >
 > **Cutoff:** Claude Fable 5 → API-only at **2026-07-12 11:59:59 PM PT = 2026-07-13 06:59:59 UTC**. After that, **you (Opus 4.8) are orchestrator AND senior implementer**; Sonnet 5 runs the wide parallel lanes; Fable is default DO-NOT-USE (one logged exception: a twice-deadlocked 2×5 vote). Grok 4.5 optional as the decorrelated cross-family review leg + the #1171 xAI panel seat.
-> (superseded 2026-10-10: the old voting exception is retained above as history; new decisions use the §5 1x3 vote with a threshold, cited as `3-agent vote (6def5ab6)`. This protocol grants no additional paid API use.)
+> (superseded 2026-10-10: the old voting exception is retained above as history; new decisions use the development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) 1x3 vote with a threshold, cited as `3-agent vote (6def5ab6)`. This protocol grants no additional paid API use.)
 >
 > **Authority:** operator grant memory `f9a0f397` — 100% autonomous, all decisions approved, through the GA cut (including temp-admin-lift merges + triggering the CI release). Corrections: `9a62049d` + `b8fd32a1` (Gate-3 reviews are AI-NHI multi-agent, no external auditor; 1:1 issue-per-finding, 100% fixed).
 >
-> **The two SSOTs you follow:** ROADMAP.md **§27** (the gate program) + the epic prompt [`AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md`](AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) (the loop driver). Where they conflict, §27 wins; where either conflicts with a newer recorded §5 ruling (a 1x3 vote, or an earlier 2×5 vote), the ruling wins. **Epic tracking issue: [#1940].**
+> **The two SSOTs you follow:** ROADMAP.md **§27** (the gate program) + the epic prompt [`AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md`](AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) (the loop driver). Where they conflict, §27 wins; where either conflicts with a newer recorded development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) ruling (a 1x3 vote, or an earlier 2×5 vote), the ruling wins. **Epic tracking issue: [#1940].**
 
 ---
 
