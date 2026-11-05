@@ -34,6 +34,13 @@ const FENCE_MAX_INDENT: usize = 3;
 const FENCE_MIN_RUN: usize = 3;
 /// The two characters a fence run is made of (`CommonMark`).
 const FENCE_CHARS: &[u8] = b"`~";
+/// The fence character whose info string may not hold another one
+/// (`CommonMark` 4.5: a backtick fence opener's info string has no backtick).
+const BACKTICK: u8 = b'`';
+/// Bytes allowed after a closing fence run, besides the run itself: space,
+/// tab and the line ending (`CommonMark` 4.5). Unicode spaces (U+00A0,
+/// U+3000, form feed) are not in this set, so such a line stays content.
+const CLOSER_TAIL_BYTES: &[u8] = b" \t\r\n";
 const SHAPE_1X3: &str = "1x3";
 const AUDIT_CITATION: &str = "3-agent vote (6def5ab6)";
 const THRESHOLD_PHRASE: &str = "with a threshold";
@@ -117,7 +124,9 @@ fn claude_md() -> String {
 
 /// Fence run on `line`: up to [`FENCE_MAX_INDENT`] leading spaces, then
 /// [`FENCE_MIN_RUN`] or more identical fence characters. Returns the
-/// character, the run length and the text after the run.
+/// character, the run length and the text after the run. A backtick run whose
+/// text after the run holds a backtick is not a fence (an inline code span
+/// such as three backticks on both sides); a tilde run keeps any info string.
 fn fence_run(line: &str) -> Option<(u8, usize, &str)> {
     let indent = line.bytes().take_while(|&b| b == b' ').count();
     if indent > FENCE_MAX_INDENT {
@@ -129,7 +138,30 @@ fn fence_run(line: &str) -> Option<(u8, usize, &str)> {
         return None;
     }
     let run = body.bytes().take_while(|&b| b == first).count();
-    (run >= FENCE_MIN_RUN).then(|| (first, run, &body[run..]))
+    if run < FENCE_MIN_RUN {
+        return None;
+    }
+    let tail = &body[run..];
+    if first == BACKTICK && tail.bytes().any(|b| b == BACKTICK) {
+        return None;
+    }
+    Some((first, run, tail))
+}
+
+/// True when `line` closes the open fence `(open_ch, open_run)`: the same
+/// fence character, a run at least as long, and only [`CLOSER_TAIL_BYTES`]
+/// after the run.
+fn closes_fence(open_ch: u8, open_run: usize, line: &str) -> bool {
+    fence_run(line).is_some_and(|(ch, run, tail)| {
+        ch == open_ch && run >= open_run && tail.bytes().all(|b| CLOSER_TAIL_BYTES.contains(&b))
+    })
+}
+
+/// True when `line` starts an HTML comment block: up to [`FENCE_MAX_INDENT`]
+/// spaces, then the comment opener (`CommonMark` HTML block type 2).
+fn starts_comment_block(line: &str) -> bool {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    indent <= FENCE_MAX_INDENT && line[indent..].starts_with(HTML_COMMENT_OPEN)
 }
 
 /// True when `line` leaves an HTML comment open, given whether one was open
@@ -151,27 +183,42 @@ fn comment_open_after(line: &str, mut in_comment: bool) -> bool {
 }
 
 /// Panics when the text before the heading leaves a fenced code block or an
-/// HTML comment open at the heading. Fences follow the same `CommonMark` rule
-/// as the section end (backtick or tilde runs, closed only by the same
-/// character and at least as long a run); a fence line inside an open comment
-/// and a comment marker inside an open fence are plain text.
+/// HTML comment open at the heading. The scan is line based. With no fence
+/// open, a fence opener line ([`fence_run`]) is evaluated first and opens a
+/// fence; a fence is closed only by [`closes_fence`]. Inside an open fence
+/// comment markers are plain text. A comment that starts mid-line is plain
+/// text once a fence opener line interrupts it, so that line clears the
+/// comment state. A comment that starts a line (an HTML block) keeps its
+/// state until `-->`, and fence lines inside it are plain text. Otherwise
+/// comment state is tracked from `<!--` to `-->` across lines, and a heading
+/// inside an open comment panics: a fail-closed superset of `CommonMark`,
+/// which ends a mid-line comment at the paragraph end. No other raw HTML
+/// block is modelled: an HTML `pre` or other raw HTML block before the
+/// heading is left to `scripts/check-claude-md-size.py`.
 fn assert_heading_not_wrapped(before: &str) {
     let mut open_fence: Option<(u8, usize)> = None;
     let mut in_comment = false;
+    let mut comment_is_block = false;
     for line in before.split_inclusive('\n') {
-        if in_comment {
+        if let Some((open_ch, open_run)) = open_fence {
+            if closes_fence(open_ch, open_run, line) {
+                open_fence = None;
+            }
+            continue;
+        }
+        if in_comment && comment_is_block {
             in_comment = comment_open_after(line, true);
             continue;
         }
-        match (open_fence, fence_run(line)) {
-            (None, Some((ch, run, _))) => open_fence = Some((ch, run)),
-            (Some((open_ch, open_run)), Some((ch, run, tail)))
-                if ch == open_ch && run >= open_run && tail.trim().is_empty() =>
-            {
-                open_fence = None;
-            }
-            (None, None) => in_comment = comment_open_after(line, false),
-            _ => {}
+        if let Some((ch, run, _)) = fence_run(line) {
+            open_fence = Some((ch, run));
+            in_comment = false;
+            continue;
+        }
+        let was_in_comment = in_comment;
+        in_comment = comment_open_after(line, in_comment);
+        if in_comment && !was_in_comment {
+            comment_is_block = starts_comment_block(line);
         }
     }
     assert!(open_fence.is_none(), "{PANIC_OPEN_FENCE}");
@@ -179,18 +226,24 @@ fn assert_heading_not_wrapped(before: &str) {
 }
 
 /// The crossroads section: from its heading line to the byte before the
-/// first `\n## ` outside a fenced code block (`CommonMark` fences: backtick or
-/// tilde runs, closed only by the same character and at least as long a run).
+/// first `\n## ` outside a fenced code block. The fence rules checked are the
+/// opener rule of [`fence_run`] (up to three leading spaces, a run of three or
+/// more backticks or tildes, no backtick in a backtick opener's info string)
+/// and the closer rule of [`closes_fence`] (same character, a run at least as
+/// long, only space, tab, CR and LF after it).
 /// The heading prefix must occur exactly once, case-insensitively, anywhere in
 /// the text; that one occurrence must sit at a line start (byte offset 0 or
-/// right after a newline; a CRLF before it and a BOM at file start do not
-/// change this test, and `scripts/check-claude-md-size.py` rejects the BOM).
-/// The text before the heading is scanned from byte 0: the test panics when a
-/// fenced code block or an HTML comment opened on an earlier line is still
-/// open at the heading ([`assert_heading_not_wrapped`]). A heading on a
-/// blockquote line or with an extra `#` is not found at a line start and also
-/// panics. `CommonMark` allows up to three spaces before `#`; this pin
-/// deliberately requires column 0 because the live file has it there.
+/// right after a newline). A CRLF before it passes, and a BOM at file start
+/// does not change this test (`scripts/check-claude-md-size.py` rejects the
+/// BOM). The text before the heading is scanned from byte 0 by
+/// [`assert_heading_not_wrapped`], which panics when a fenced code block or an
+/// HTML comment is still open at the heading; its doc comment states the
+/// comment rule and the fail-closed superset. A heading on a blockquote line
+/// or with an extra `#` is not found at a line start and also panics.
+/// `CommonMark` allows up to three spaces before `#`; this pin requires
+/// column 0 because the live file has it there. An HTML `pre` or other raw
+/// HTML block before the heading is not modelled and is left to
+/// `scripts/check-claude-md-size.py`.
 fn crossroads_section(text: &str) -> &str {
     let lowered = text.to_ascii_lowercase();
     let prefix = SECTION_PREFIX.to_ascii_lowercase();
@@ -211,18 +264,15 @@ fn crossroads_section(text: &str) -> &str {
     let mut open_fence: Option<(u8, usize)> = None;
     let mut offset = 0;
     for (index, line) in rest.split_inclusive('\n').enumerate() {
-        match (open_fence, fence_run(line)) {
-            (None, Some((ch, run, _))) => open_fence = Some((ch, run)),
-            (Some((open_ch, open_run)), Some((ch, run, tail)))
-                if ch == open_ch && run >= open_run && tail.trim().is_empty() =>
-            {
+        if let Some((open_ch, open_run)) = open_fence {
+            if closes_fence(open_ch, open_run, line) {
                 open_fence = None;
             }
-            (None, None) if index > 0 && line.starts_with(NEXT_HEADING_PREFIX) => {
-                // Exclude the newline that precedes the terminating `## `.
-                return &rest[..offset - 1];
-            }
-            _ => {}
+        } else if let Some((ch, run, _)) = fence_run(line) {
+            open_fence = Some((ch, run));
+        } else if index > 0 && line.starts_with(NEXT_HEADING_PREFIX) {
+            // Exclude the newline that precedes the terminating `## `.
+            return &rest[..offset - 1];
         }
         offset += line.len();
     }
@@ -564,4 +614,13 @@ fn inline_code_span_line_does_not_open_a_fence_8604() {
 fn closer_followed_by_tab_still_closes_8604() {
     let text = wrapped_fixture("```\ncode\n```\t\n", "");
     assert_eq!(crossroads_section(&text), FIXTURE);
+}
+
+#[test]
+#[should_panic(expected = "inside an open HTML comment")]
+fn fence_lines_inside_a_line_start_comment_stay_plain_text_8604() {
+    // "<!--" at a line start is an HTML block: the fence lines inside it are
+    // literal and the comment is still open at the heading.
+    let text = wrapped_fixture(&format!("<!-- x\n{FENCE_LINE}{FENCE_LINE}"), "");
+    let _ = crossroads_section(&text);
 }
