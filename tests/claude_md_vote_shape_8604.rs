@@ -511,3 +511,57 @@ fn crlf_before_heading_still_passes_8604() {
     let text = wrapped_fixture("intro\r\n", "");
     assert_eq!(crossroads_section(&text), FIXTURE);
 }
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn backtick_info_string_with_backtick_is_not_a_fence_opener_8604() {
+    // CommonMark 4.5: "``` a`b" is paragraph text, so the next bare fence
+    // line opens a real fence that holds the heading.
+    let text = wrapped_fixture("intro\n``` a`b\n```\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn closer_followed_by_no_break_space_does_not_close_8604() {
+    let text = wrapped_fixture("```\ncode\n```\u{00A0}\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn closer_followed_by_ideographic_space_does_not_close_8604() {
+    let text = wrapped_fixture("```\ncode\n```\u{3000}\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn closer_followed_by_form_feed_does_not_close_8604() {
+    let text = wrapped_fixture("```\ncode\n```\u{000C}\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn fence_opener_line_interrupts_an_open_inline_comment_8604() {
+    // "<!--" mid-line, then a fence opener line, then "-->": the fence
+    // interrupts the paragraph, so the heading sits inside the fence.
+    let text = wrapped_fixture(
+        &format!("intro <!-- x\n{FENCE_LINE}-->\n"),
+        &format!("{NEXT_SECTION_LINE}{FENCE_LINE}"),
+    );
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+fn inline_code_span_line_does_not_open_a_fence_8604() {
+    let text = wrapped_fixture("intro\n```code```\n", "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
+
+#[test]
+fn closer_followed_by_tab_still_closes_8604() {
+    let text = wrapped_fixture("```\ncode\n```\t\n", "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
