@@ -9,12 +9,12 @@ This is the deep-dive page. For a one-screen summary go to [audience-c-level.md]
 
 ## Reproducibility
 
-**Pinned binary at write time:** git SHA `19b08543c` on branch `local/install-815-816`. Worktree: `/Users/fate/v07/v07-fixes/`. The pre-dogfood baseline was SHA `913a2ffb0` (the MCP `recall_observations` test commit that landed immediately before the dogfood). The two in-campaign fix commits are:
+**Pinned binary at write time:** git SHA `19b08543c` on branch `local/install-815-816`. Worktree: `<home>/v07/v07-fixes/`. The pre-dogfood baseline was SHA `913a2ffb0` (the MCP `recall_observations` test commit that landed immediately before the dogfood). The two in-campaign fix commits are:
 
 - `39aa158f9` — `fix(#892,#893)`: expose Gap 1/2/5 params via MCP wire schemas + thread `source_uri` through the store validation path.
 - `19b08543c` — `docs(#895)`: fix Gap 5 `SupersedeResult` docstring drift.
 
-**Schema version at HEAD:** v47 (constant `CURRENT_SCHEMA_VERSION` in `/Users/fate/v07/v07-fixes/src/storage/migrations.rs`). The sqlite migration ladder is complete through Gap 7. The postgres + AGE ladder ends at migration 0020 and does not yet carry v44 through v47 — that gap is issue [#894](https://github.com/alphaonedev/ai-memory-mcp/issues/894).
+**Schema version at HEAD:** v47 (constant `CURRENT_SCHEMA_VERSION` in `<home>/v07/v07-fixes/src/storage/migrations.rs`). The sqlite migration ladder is complete through Gap 7. The postgres + AGE ladder ends at migration 0020 and does not yet carry v44 through v47 — that gap is issue [#894](https://github.com/alphaonedev/ai-memory-mcp/issues/894).
 
 **MCP tool count at `--profile full`:** 71 advertised = 70 callable + 1 always-on (`memory_capabilities`). The probe scripts open the MCP surface with `--profile full --tier semantic` so all of `memory_store`, `memory_update`, `memory_search`, `memory_recall`, and `memory_capabilities` are reachable on the same connection.
 
@@ -24,9 +24,9 @@ This is the deep-dive page. For a one-screen summary go to [audience-c-level.md]
 
 | Path | Purpose |
 |------|---------|
-| `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/test.db` | First-pass probe DB (caught the wire-schema gaps) |
-| `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/post-schema-fix.db` | Single-shot end-to-end probe DB used to verify the `source_uri` round-trip after the schema fix landed |
-| `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/phase_b_v2.db` | Phase B v2 retest DB (5-Gap retest after both fixes landed) |
+| `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/test.db` | First-pass probe DB (caught the wire-schema gaps) |
+| `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/post-schema-fix.db` | Single-shot end-to-end probe DB used to verify the `source_uri` round-trip after the schema fix landed |
+| `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/phase_b_v2.db` | Phase B v2 retest DB (5-Gap retest after both fixes landed) |
 
 All three live under `.local-runs/` per the project hard rule (no `/tmp` scratch).
 
@@ -56,8 +56,8 @@ Each probe is a single `mcp_call <tool> <json-args>` invocation that opens an MC
 
 **Root cause.** Two related defects in the same code path:
 
-1. The wire-schema entry for `memory_store` in `/Users/fate/v07/v07-fixes/src/mcp/registry.rs` did not declare `source_uri` as an input property. An NHI calling `tools/list` could not discover that the parameter existed.
-2. The store handler validation at `/Users/fate/v07/v07-fixes/src/mcp/tools/store/validation.rs:224` constructed the `Memory` struct with `source_uri: None` hard-coded — even when the caller had passed `source_uri` in the tool arguments JSON.
+1. The wire-schema entry for `memory_store` in `<home>/v07/v07-fixes/src/mcp/registry.rs` did not declare `source_uri` as an input property. An NHI calling `tools/list` could not discover that the parameter existed.
+2. The store handler validation at `<home>/v07/v07-fixes/src/mcp/tools/store/validation.rs:224` constructed the `Memory` struct with `source_uri: None` hard-coded — even when the caller had passed `source_uri` in the tool arguments JSON.
 
 Either defect alone would have hidden the parameter; together they made the surface look intentional rather than broken.
 
@@ -144,7 +144,7 @@ The conflict envelope carries `current_version=2`, `expected_version=1`, and `st
 **Root cause.** Three pieces:
 
 1. The Gap 5 (#888) edit_source `llm`/`hook` path is supposed to archive the OLD row and insert a NEW row with a forward pointer to the archived id. This was implemented and works.
-2. The `SupersedeResult` docstring and the "Step 4" sequence comment in `/Users/fate/v07/v07-fixes/src/storage/mod.rs` both claimed a `memory_links` row with relation `supersedes` was written from NEW → archived OLD as part of the supersede transaction.
+2. The `SupersedeResult` docstring and the "Step 4" sequence comment in `<home>/v07/v07-fixes/src/storage/mod.rs` both claimed a `memory_links` row with relation `supersedes` was written from NEW → archived OLD as part of the supersede transaction.
 3. The implementation explicitly skips that step. The reason is a structural foreign-key constraint: `memory_links.target_id REFERENCES memories(id)`, and the archived OLD row is no longer in `memories` (it lives in `archived_memories`). Writing the link would trip the FK constraint.
 
 Lineage is preserved through two parallel mechanisms that DO work:
@@ -154,7 +154,7 @@ Lineage is preserved through two parallel mechanisms that DO work:
 
 The docstring drift sat in the codebase from #888 land until the Phase B v2 retest asserted on `SELECT * FROM memory_links WHERE relation='supersedes'` and got an empty result. The dogfood caught it because the retest was end-to-end SQL-level.
 
-**The fix.** Commit `19b08543c` rewrites the `SupersedeResult` docstring + Step 4 sequence comment in `/Users/fate/v07/v07-fixes/src/storage/mod.rs` to state the actual two-mechanism lineage instead of the link-row claim:
+**The fix.** Commit `19b08543c` rewrites the `SupersedeResult` docstring + Step 4 sequence comment in `<home>/v07/v07-fixes/src/storage/mod.rs` to state the actual two-mechanism lineage instead of the link-row claim:
 
 ```
 // Step 3: the supersede edge from new→archived id is preserved
@@ -200,7 +200,7 @@ The response carries `superseded_id` at both the top level and inside `metadata.
 
 ## Finding #894 — Postgres + Apache AGE store missing v44-v47 parity
 
-**Root cause.** The sqlite migration ladder is at v47 (`src/storage/migrations.rs`) and carries the Gap 1 `version` column (#884), Gap 2 `source_uri` upgrade path (#885), Gap 3 `recall_observations` table (#886), and Gap 5 `edit_source` column (#888). The postgres + Apache AGE store at `/Users/fate/v07/v07-fixes/src/store/postgres.rs` (10,234 LOC) and `/Users/fate/v07/v07-fixes/src/store/postgres_schema.sql` (779 LOC) does not yet carry these. The schema file references `source_uri` only at lines 135-143 (the original column declaration from v38) and lines 203 (a comment about historic upgrade rungs). There is no `version` column, no `recall_observations` table, no `edit_source` column, and the AGE-graph Cypher snippets for the superseded-edge case are not written.
+**Root cause.** The sqlite migration ladder is at v47 (`src/storage/migrations.rs`) and carries the Gap 1 `version` column (#884), Gap 2 `source_uri` upgrade path (#885), Gap 3 `recall_observations` table (#886), and Gap 5 `edit_source` column (#888). The postgres + Apache AGE store at `<home>/v07/v07-fixes/src/store/postgres.rs` (10,234 LOC) and `<home>/v07/v07-fixes/src/store/postgres_schema.sql` (779 LOC) does not yet carry these. The schema file references `source_uri` only at lines 135-143 (the original column declaration from v38) and lines 203 (a comment about historic upgrade rungs). There is no `version` column, no `recall_observations` table, no `edit_source` column, and the AGE-graph Cypher snippets for the superseded-edge case are not written.
 
 **Scope.** Approximately 600 LOC across:
 
@@ -218,9 +218,9 @@ The schema-fix commit `39aa158f9` touched three files:
 
 | File | Lines | What |
 |------|-------|------|
-| `/Users/fate/v07/v07-fixes/src/mcp/registry.rs` | +9 / -7 | Added `source_uri` to `memory_store` schema; added `expected_version`, `edit_source`, `source_uri` to `memory_update` schema; trimmed prose on `on_conflict`, `force`, `budget_tokens`, `session_default`, `session_id`, `kinds` to recover token budget |
-| `/Users/fate/v07/v07-fixes/src/mcp/tools/store/validation.rs` | +9 / -1 | Read + validate the new `source_uri` arg; thread it into the `Memory` struct at line 232 (replacing the hard-coded `None` that was at line 224 in the pre-fix file) |
-| `/Users/fate/v07/v07-fixes/src/handlers/memories_query.rs` | +1 / -4 | Companion HTTP-side cleanup so the same wire shape works through both transports |
+| `<home>/v07/v07-fixes/src/mcp/registry.rs` | +9 / -7 | Added `source_uri` to `memory_store` schema; added `expected_version`, `edit_source`, `source_uri` to `memory_update` schema; trimmed prose on `on_conflict`, `force`, `budget_tokens`, `session_default`, `session_id`, `kinds` to recover token budget |
+| `<home>/v07/v07-fixes/src/mcp/tools/store/validation.rs` | +9 / -1 | Read + validate the new `source_uri` arg; thread it into the `Memory` struct at line 232 (replacing the hard-coded `None` that was at line 224 in the pre-fix file) |
+| `<home>/v07/v07-fixes/src/handlers/memories_query.rs` | +1 / -4 | Companion HTTP-side cleanup so the same wire shape works through both transports |
 
 The token-budget juggle is the interesting story. The schema additions cost approximately 200 tokens of verbose-profile prose. The `tests/token_budget_guard.rs` CI guard pins `full_profile_total_tokens` at 10,000 max. The pre-fix verbose count was 10,196 (the requirements-coverage audit at `ce1415ca6` had previously trimmed it to 9,827; the in-flight schema-addition work pushed it back over). The post-fix verbose count is 9,998 — 2 tokens of headroom — recovered by trimming docstring prose on:
 
@@ -237,7 +237,7 @@ Two tokens of headroom is tight. A future schema addition will need to either tr
 
 ## The Phase B v1 → v2 retest diff
 
-The Phase B v1 run was the run that surfaced the four findings. Its captured output is not preserved as a single log because the discovery happened iteratively — each Gap probe was inspected, the gap filed, the fix dispatched, and the binary rebuilt before the next probe ran. The Phase B v2 retest was the post-fix consolidation pass against `phase_b_v2.db`, captured in `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/phase_b_v2.log`.
+The Phase B v1 run was the run that surfaced the four findings. Its captured output is not preserved as a single log because the discovery happened iteratively — each Gap probe was inspected, the gap filed, the fix dispatched, and the binary rebuilt before the next probe ran. The Phase B v2 retest was the post-fix consolidation pass against `phase_b_v2.db`, captured in `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/phase_b_v2.log`.
 
 The v2 retest is structurally important: it is the "all five Gap probes pass on a single fresh DB against a single binary build" evidence. Prior to v2, the fix-and-retest cycle was per-gap; the v2 run proves the fixes do not interfere with each other and that the schema sequence is stable on a cold DB.
 
@@ -301,7 +301,7 @@ The token-budget guard test (`tests/token_budget_guard.rs`) continues to pass wi
 
 The dogfood was scoped to the v0.7.0 provenance write and read paths on the sqlite backend. The following surfaces were on the wider provenance map but were not exercised in this dogfood:
 
-1. **Gap 3 `recall_observations` live data round-trip.** The MCP `recall_observations` tool's parameter branches (`since`, `until`, `limit`) are unit-tested at the pub MCP entrypoint via commit `913a2ffb0` (`/Users/fate/v07/v07-fixes/tests/recall_observations.rs`, 3 tests). The dogfood did not run a real `memory_recall`, populate the `recall_observations` table as a side effect, and then read it back through the `recall_observations` tool. The test is queued for the next dogfood pass; the unit-test path covers the same dispatch the live tool uses, so the residual risk is small but non-zero.
+1. **Gap 3 `recall_observations` live data round-trip.** The MCP `recall_observations` tool's parameter branches (`since`, `until`, `limit`) are unit-tested at the pub MCP entrypoint via commit `913a2ffb0` (`<home>/v07/v07-fixes/tests/recall_observations.rs`, 3 tests). The dogfood did not run a real `memory_recall`, populate the `recall_observations` table as a side effect, and then read it back through the `recall_observations` tool. The test is queued for the next dogfood pass; the unit-test path covers the same dispatch the live tool uses, so the residual risk is small but non-zero.
 
 2. **Signed-link `attest_level` decoration on recall responses.** Gap 7 (#890) decorates the `memory_recall` response with per-row provenance, including `latest_link_attest_level` when the recalled memory has signed links. The dogfood test corpus contained no signed links — the probe-script-driven memories were unsigned — so the decoration field was never exercised against a live signed-link row. To exercise this surface, a future dogfood pass would need to first sign a link via the governance subsystem (`ai-memory governance ...`) and then recall a memory connected to that link. The decoration code path exists and the data shape is defined; what is not yet evidenced is the live round-trip.
 
@@ -321,7 +321,7 @@ To re-run the dogfood end-to-end against the post-fix binary on a fresh DB:
 
 ```bash
 # 1. Build the binary (or use the existing release build).
-cd /Users/fate/v07/v07-fixes
+cd <home>/v07/v07-fixes
 cargo build --release
 
 # 2. Run the single-shot source_uri round-trip probe.

@@ -240,4 +240,4 @@ Compound of three peer kill-shots: (A6) sell “perfect memory” and die as ove
 
 ---
 
-*W3-A7 · peers A3–A6 integrated · A1/A2 absent · under 500 lines · `/Users/fate/Downloads/ai-memory-mcp/waves/w3-a7-synthesis.md`*
+*W3-A7 · peers A3–A6 integrated · A1/A2 absent · under 500 lines · `<home>/Downloads/ai-memory-mcp/waves/w3-a7-synthesis.md`*

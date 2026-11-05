@@ -56,7 +56,7 @@ Tip `fd172f2cf` is the post-cargo-fmt + clippy-allow follow-up to the
 
 ## Phase 1.2 — Release build
 
-Build target directory: `/Users/fate/v07/v07-fixes/.cargo-shared-target/`
+Build target directory: `<home>/v07/v07-fixes/.cargo-shared-target/`
 (repo-local shared-target convention, NOT `/tmp` per the no-tmpfs hard
 rule).
 
@@ -81,7 +81,7 @@ the README pins this exact byte stream.
 ```
 $ ls -la /opt/homebrew/bin/ai-memory
 lrwxr-xr-x@ 1 fate  admin  64 May 18 23:03 /opt/homebrew/bin/ai-memory
-  -> /Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory
+  -> <home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory
 ```
 
 The brew-managed binary is symlinked to the campaign-tested release
@@ -115,7 +115,7 @@ allows.
 ```
 $ cargo audit
     Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
-      Loaded 800+ security advisories (from /Users/fate/.cargo/advisory-db)
+      Loaded 800+ security advisories (from <home>/.cargo/advisory-db)
     Updating crates.io index
     Scanning Cargo.lock for vulnerabilities (529 crate dependencies)
 ```

@@ -155,4 +155,4 @@ Endpoint memory must satisfy **offline subject rights** and **offline accountabi
 
 ---
 
-*W4-A6 complete. Absolute path: `/Users/fate/Downloads/ai-memory-mcp/waves/w4-a6-erasure-forensics.md`*
+*W4-A6 complete. Absolute path: `<home>/Downloads/ai-memory-mcp/waves/w4-a6-erasure-forensics.md`*

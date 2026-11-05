@@ -9,7 +9,7 @@ layout: doc
 > Target:   **v0.7.0** release HEAD on `release/v0.7.0`
 > Compiled: 2026-05-15 by the AI NHI ship-readiness initiative; re-anchored 2026-05-22 against schema v49 / 73-tool surface during the SR-5 documentation drift sweep; bumped to schema v50 on 2026-05-23 after #1156 per-namespace K8 quota dimension extension landed; re-anchored 2026-06-05 to schema v55 (#1507 drift sweep) after v51 federation_nonces (#1255), v52 transcript_line_dedup (#1389 L4), v53 memories_au FTS5 trigger scoping (#1418), v54 tier-default expiry backfill (#1466), and v55 sargable federation-catchup query + idx_memories_updated_at (#1476) landed; re-anchored 2026-06-15 to schema v57 / 89-route surface (v0.7.1 EPIC drift sweep) after v56 composite list/archive indexes (#1579 A2) and v57 postgres stored generated tsvector (#1579 B2) landed.
 > Methodology: `git diff v0.6.4..HEAD` (code & schema) + doc scan + commit-trailer issue cross-reference
-> Path convention: every code path below is repo-relative against the `release/v0.7.0` worktree root. The original SR-5 capture used the developer-host worktree `/Users/fate/v07/catalogue/`; those prefixes have been normalised to repo-relative paths during the 2026-05-22 re-anchor.
+> Path convention: every code path below is repo-relative against the `release/v0.7.0` worktree root. The original SR-5 capture used the developer-host worktree `<home>/v07/catalogue/`; those prefixes have been normalised to repo-relative paths during the 2026-05-22 re-anchor.
 > Scratch:   `.local-runs/tmp/` (project no-`/tmp` HARD RULE honored)
 > Read-only review except for this deliverable.
 

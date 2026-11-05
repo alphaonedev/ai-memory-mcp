@@ -137,7 +137,7 @@ spec:
         # ~/.config/ai-memory/config.toml (no config-path env var).
         # The image runs as user `aimem` (HOME=/home/aimem).
         - name: ai-memory-config
-          mountPath: /home/aimem/.config/ai-memory
+          mountPath: <home>/.config/ai-memory
           readOnly: true
         - name: ai-memory-passphrase
           mountPath: /run/secrets
@@ -201,7 +201,7 @@ spec:
               mountPath: /data
             # Fixed config path — see the ConfigMap note below.
             - name: ai-memory-config
-              mountPath: /home/aimem/.config/ai-memory
+              mountPath: <home>/.config/ai-memory
               readOnly: true
       volumes:
         - name: ai-memory-data
@@ -264,7 +264,7 @@ spec:
               mountPath: /data
             # Fixed config path — see the ConfigMap note below.
             - name: config
-              mountPath: /home/aimem/.config/ai-memory
+              mountPath: <home>/.config/ai-memory
               readOnly: true
       volumes:
         - name: data
@@ -313,7 +313,7 @@ env:
     value: "/data/ai-memory.db"
 volumeMounts:
   - name: ai-memory-config
-    mountPath: /home/aimem/.config/ai-memory
+    mountPath: <home>/.config/ai-memory
     readOnly: true
   - name: ai-memory-data
     mountPath: /data

@@ -123,4 +123,4 @@ Claude Code MCP does **not** sign `memory_store`. Default `AI_MEMORY_REQUIRE_AGE
 
 ---
 
-*≤250 lines. Absolute paths above under `/Users/fate/Downloads/ai-memory-mcp/`.*
+*≤250 lines. Absolute paths above under `<home>/Downloads/ai-memory-mcp/`.*

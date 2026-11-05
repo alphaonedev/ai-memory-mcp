@@ -33,7 +33,7 @@ Established facts (verified by the Conductor):
    we would actually depend on (repository, model weights on Hugging Face, and the adapters — weights and code can
    carry different licences, and a model card licence is not the repository licence).
 2. **Cross-correlate with ai-memory using codegraph, not intuition.** The repository is at
-   `/home/fate_two/v07/v09-dev`; run `codegraph explore "<symbols or question>"` there (`codegraph` is on PATH).
+   `<home>/v07/v09-dev`; run `codegraph explore "<symbols or question>"` there (`codegraph` is on PATH).
    Name the concrete call sites, modules and seams where each project would actually land. A cross-correlation
    without a file and a symbol in it is an opinion.
    Starting points, but find your own: the `[decision]` provider slot and its seams (#3806 — `src/decision.rs`,

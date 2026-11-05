@@ -6,7 +6,7 @@
 **Author:** AI NHI orchestrator (Grok 4.5)  
 **Epic:** [#2682](https://github.com/alphaonedev/ai-memory-mcp/issues/2682) — **CLOSED** (ready-to-tag certified)  
 **Process:** `docs/handoff/GRAPH-ENGINEERING-V1-GA-PROCESS.md`  
-**Tree:** `/home/fate_two/v07/v09-dev` · branch **`release/v1.0.0`**  
+**Tree:** `<home>/v07/v09-dev` · branch **`release/v1.0.0`**  
 **GitHub user / signing:** **alphaonedev** · SSH Ed25519 · `AlphaOne <Justin@alpha-one.mobi>`
 
 ---
@@ -354,7 +354,7 @@ Full key map: `docs/audit/ssh-resign-rewrite-map-2026-08-04.md`.
 | Claims train #2659 LAST | Yes |
 | Code + security review of control before merge | Yes (campaign discipline) |
 | Dual-checkpoint (ai-memory + git) | Yes |
-| Codegraph only `/home/fate_two/v07/v09-dev` | Yes |
+| Codegraph only `<home>/v07/v09-dev` | Yes |
 | Manual issue close with evidence | Yes for gate/capacity issues |
 | Residual honesty (inventory ≡ note) | Yes (#2691 and later residual strikes) |
 

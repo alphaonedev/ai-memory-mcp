@@ -302,4 +302,4 @@ Do not re-score without code. Do not unlock banned claims without band threshold
 
 ---
 
-*W7-A1 Final Property Scorecard · sources W1–W4 A7 (+ W2 peers + W3-A1/A2) · W5/W6 absent · under 400 lines · no code changes · `/Users/fate/Downloads/ai-memory-mcp/waves/w7-a1-final-scorecard.md`*
+*W7-A1 Final Property Scorecard · sources W1–W4 A7 (+ W2 peers + W3-A1/A2) · W5/W6 absent · under 400 lines · no code changes · `<home>/Downloads/ai-memory-mcp/waves/w7-a1-final-scorecard.md`*

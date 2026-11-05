@@ -31,7 +31,7 @@ Eight A2A scenarios, each implemented as an integration test that drives the pro
 | A2A-1 | SHIP | SHIP | Tampered body + wrong-pubkey negatives also fail closed (`VerifyError::BadSignature`) |
 | A2A-2 | SHIP | SHIP | 3 agents × (2 private + 1 collective) = 9 rows; private cross-leakage = 0 from every vantage |
 | A2A-3 | SHIP | SHIP | Bob sees 0 of alice's 3 private rows and exactly 2 of 2 collective rows |
-| A2A-4 | SHIP | SHIP | Operator-signed `filesystem_write` rule under `/tmp/**` refuses `ai:adversary` + `ai:alice`; permits `ai:operator` on `/Users/operator/safe.txt` |
+| A2A-4 | SHIP | SHIP | Operator-signed `filesystem_write` rule under `/tmp/**` refuses `ai:adversary` + `ai:alice`; permits `ai:operator` on `<home>/safe.txt` |
 | A2A-5 | SHIP | SHIP | Legal / medical / engineering / finance namespaces each list exactly 5; global list = 20 |
 | A2A-6 | SHIP | SHIP | Both directions of `contradicts` link project; LLM-bound `memory_detect_contradiction` requires smart-tier and is out of scope for this no-LLM-runtime run |
 | A2A-7 | SHIP | SHIP | 6 of 6 gap tests in `tests/store_parity_gaps.rs::postgres_side` green against live PG; A2A-7 smoke also green |

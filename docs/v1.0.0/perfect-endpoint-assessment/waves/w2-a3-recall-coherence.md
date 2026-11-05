@@ -182,14 +182,14 @@ Therefore the honest dual score: **0.93 pure-recall (ship) · 0.68 §2.2 (partia
 
 ## CODE ANCHORS (absolute paths)
 
-- `/Users/fate/Downloads/ai-memory-mcp/src/config.rs` — `ENV_RECALL_TOUCH_SYNC`, `recall_touch_sync_enabled`, fold interval  
-- `/Users/fate/Downloads/ai-memory-mcp/src/handlers/recall.rs` — pure default + phase-2 ledger/touch  
-- `/Users/fate/Downloads/ai-memory-mcp/src/storage/mod.rs` — `fold_recall_accesses`, `apply_recall_post_ops`  
-- `/Users/fate/Downloads/ai-memory-mcp/migrations/sqlite/0061_v77_recall_observations_folded.sql`  
-- `/Users/fate/Downloads/ai-memory-mcp/src/recover/{mod,nag}.rs` — L2 + L1 nag  
-- `/Users/fate/Downloads/ai-memory-mcp/src/mcp/tools/capture_turn.rs` — L4  
-- `/Users/fate/Downloads/ai-memory-mcp/src/persona/mod.rs` — versioned personas  
-- `/Users/fate/Downloads/ai-memory-mcp/tests/recall_purity_p01.rs` (+ `_postgres`, `_caller_guard`)  
+- `<home>/Downloads/ai-memory-mcp/src/config.rs` — `ENV_RECALL_TOUCH_SYNC`, `recall_touch_sync_enabled`, fold interval  
+- `<home>/Downloads/ai-memory-mcp/src/handlers/recall.rs` — pure default + phase-2 ledger/touch  
+- `<home>/Downloads/ai-memory-mcp/src/storage/mod.rs` — `fold_recall_accesses`, `apply_recall_post_ops`  
+- `<home>/Downloads/ai-memory-mcp/migrations/sqlite/0061_v77_recall_observations_folded.sql`  
+- `<home>/Downloads/ai-memory-mcp/src/recover/{mod,nag}.rs` — L2 + L1 nag  
+- `<home>/Downloads/ai-memory-mcp/src/mcp/tools/capture_turn.rs` — L4  
+- `<home>/Downloads/ai-memory-mcp/src/persona/mod.rs` — versioned personas  
+- `<home>/Downloads/ai-memory-mcp/tests/recall_purity_p01.rs` (+ `_postgres`, `_caller_guard`)  
 
 ---
 

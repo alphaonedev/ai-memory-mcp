@@ -387,7 +387,7 @@ Walks the audit log, recomputes every line's `self_hash`, asserts each
 
 ```bash
 $ ai-memory audit verify
-audit verify OK: 1428 line(s) verified at /home/op/.local/state/ai-memory/audit/audit.log
+audit verify OK: 1428 line(s) verified at <home>/.local/state/ai-memory/audit/audit.log
 
 $ ai-memory audit verify --json
 {"status":"ok","total_lines":1428,"gaps":[],"gap_count":0,"unmatched_acknowledgements":[],"path":"…/audit.log"}
@@ -644,12 +644,12 @@ that ingests JSON ingests this. Recipes for the four most common:
 `inputs.conf`:
 
 ```conf
-[monitor:///home/op/.local/state/ai-memory/audit/audit.log]
+[monitor://<home>/.local/state/ai-memory/audit/audit.log]
 sourcetype = ai-memory:audit
 index = security_audit
 disabled = 0
 
-[monitor:///home/op/.local/state/ai-memory/logs/ai-memory.log.*]
+[monitor://<home>/.local/state/ai-memory/logs/ai-memory.log.*]
 sourcetype = ai-memory:ops
 index = ai_ops
 disabled = 0
@@ -671,7 +671,7 @@ KV_MODE = none
 ```yaml
 logs:
   - type: file
-    path: /home/op/.local/state/ai-memory/audit/audit.log
+    path: <home>/.local/state/ai-memory/audit/audit.log
     service: ai-memory
     source: ai-memory-audit
     log_processing_rules:
@@ -679,7 +679,7 @@ logs:
         name: keep_all
         pattern: ".*"
   - type: file
-    path: /home/op/.local/state/ai-memory/logs/ai-memory.log*
+    path: <home>/.local/state/ai-memory/logs/ai-memory.log*
     service: ai-memory
     source: ai-memory-ops
 ```
@@ -696,7 +696,7 @@ filebeat.inputs:
   - type: filestream
     id: ai-memory-audit
     paths:
-      - /home/op/.local/state/ai-memory/audit/audit.log
+      - <home>/.local/state/ai-memory/audit/audit.log
     parsers:
       - ndjson:
           target: ai_memory_audit
@@ -707,7 +707,7 @@ filebeat.inputs:
   - type: filestream
     id: ai-memory-ops
     paths:
-      - /home/op/.local/state/ai-memory/logs/ai-memory.log*
+      - <home>/.local/state/ai-memory/logs/ai-memory.log*
     fields:
       service: ai-memory
       stream: operational
@@ -725,7 +725,7 @@ scrape_configs:
         labels:
           service: ai-memory
           stream: audit
-          __path__: /home/op/.local/state/ai-memory/audit/audit.log
+          __path__: <home>/.local/state/ai-memory/audit/audit.log
     pipeline_stages:
       - json:
           expressions:
@@ -747,7 +747,7 @@ scrape_configs:
         labels:
           service: ai-memory
           stream: operational
-          __path__: /home/op/.local/state/ai-memory/logs/ai-memory.log*
+          __path__: <home>/.local/state/ai-memory/logs/ai-memory.log*
 ```
 
 ---

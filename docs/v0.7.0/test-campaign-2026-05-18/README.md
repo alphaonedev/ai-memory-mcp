@@ -46,9 +46,9 @@ In flight at write time: **#863** (CLI `ai-memory governance check-action` subco
 
 ## Reproducibility contract
 
-1. **Pinned binary** — git SHA `e99fb0e` on branch `local/install-815-816` in worktree `/Users/fate/v07/v07-fixes/`. The pre-fix-batch baseline was `f612675`; the fix batch is the 4 commits above.
-2. **Binary location** — `/Users/fate/.local/bin/ai-memory` → `/Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory` (26 MB).
-3. **DB** — `/Users/fate/.claude/ai-memory.db` (the operator's live MCP DB), schema v43.
+1. **Pinned binary** — git SHA `e99fb0e` on branch `local/install-815-816` in worktree `<home>/v07/v07-fixes/`. The pre-fix-batch baseline was `f612675`; the fix batch is the 4 commits above.
+2. **Binary location** — `<home>/.local/bin/ai-memory` → `<home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory` (26 MB).
+3. **DB** — `<home>/.claude/ai-memory.db` (the operator's live MCP DB), schema v43.
 4. **Models** — `nomic-ai/nomic-embed-text-v1.5` (768 d), `cross-encoder/ms-marco-MiniLM-L-6-v2`, `gemma4:e4b`. Tier `autonomous`.
 5. **Authoring agent** — `ai:claude-code@FROSTYi.local:pid-1060`.
 6. **Fix agents** — 4 parallel background agents (Agent A schema-trim, Agent B storage serialization, Agent C verbose trim, Agent D yesterday-issue verification) + 1 follow-up agent (#863+#864).

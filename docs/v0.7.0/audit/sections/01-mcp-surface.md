@@ -5,7 +5,7 @@ layout: doc
 
 Scope: everything under `src/mcp/` (~45.8k LOC) plus `src/profile.rs` (the
 tool-count SSOT). Every claim below carries a `file:line` anchor verified
-against the `release/v0.7.0` checkout at `/Users/fate/v07/v07-f5`. Numbers
+against the `release/v0.7.0` checkout at `<home>/v07/v07-f5`. Numbers
 are derived from source, not from prose.
 
 ---

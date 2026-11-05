@@ -285,4 +285,4 @@ W6 owns **portability gravity · surface parity · LLM-agnosticism · KG/lineage
 
 ---
 
-*W5-A7 · peers A1–A6 integrated · under 400 lines · `/Users/fate/Downloads/ai-memory-mcp/waves/w5-a7-synthesis.md`*
+*W5-A7 · peers A1–A6 integrated · under 400 lines · `<home>/Downloads/ai-memory-mcp/waves/w5-a7-synthesis.md`*

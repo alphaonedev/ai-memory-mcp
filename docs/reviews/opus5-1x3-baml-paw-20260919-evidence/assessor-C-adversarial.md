@@ -31,7 +31,7 @@ JSON-LD), docs.boundaryml.com `llms.txt`, the BAML GitHub repo (tree, `LICENSE`,
 `paw-core` / `paw-candle` / `paw-rs`, the GitHub API for both orgs, the Hugging Face API for every
 `programasweights` model and dataset, and the arXiv PDF 2607.02512 extracted locally with `pdftotext` (1,587
 lines, read in full at the results, appendix and limitations sections). ai-memory anchored with the
-`codegraph` CLI at `/home/fate_two/v07/v09-dev` plus direct reads (the codegraph **MCP** server failed to
+`codegraph` CLI at `<home>/v07/v09-dev` plus direct reads (the codegraph **MCP** server failed to
 connect this session; the **CLI** worked and is what I used — codegraph was available and was used).
 
 **Could not establish (stated as findings, not assumptions):**
