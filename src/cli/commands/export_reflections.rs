@@ -148,22 +148,26 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
-        let diagnostic_filename = format!("{}.{}", export_diagnostic(&mem.id), format.extension());
+        let escaped_id = export_diagnostic(&mem.id);
+        // OWNERSHIP-05/15: compare borrowed, bounded output; keep clean paths exact.
+        let unquoted = escaped_id
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'));
+        let printed_id = if unquoted == Some(mem.id.as_str()) {
+            mem.id.as_str()
+        } else {
+            &escaped_id
+        };
+        let diagnostic_path = ns_dir.join(format!("{printed_id}.{}", format.extension()));
         private_file::write_private_export_in_batch(
             &path,
             payload.as_bytes(),
             &mut swept_directories,
         )
-        .with_context(|| {
-            crate::errors::msg::writing(ns_dir.join(&diagnostic_filename).display())
-        })?;
+        .with_context(|| crate::errors::msg::writing(diagnostic_path.display()))?;
         summary.written += 1;
         if !args.quiet {
-            writeln!(
-                out.stdout,
-                "wrote {}",
-                ns_dir.join(&diagnostic_filename).display()
-            )?;
+            writeln!(out.stdout, "wrote {}", diagnostic_path.display())?;
         }
     }
     writeln!(
@@ -378,16 +382,29 @@ pub(crate) fn render_payload(
 /// `reflects_on` edges. The body of the reflection follows after a
 /// blank line, exactly as it was stored.
 fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> String {
+    use YamlColonStyle::{PlainWhenSafe, Quote};
     let agent_id = agent_id_of(mem);
     let mut out = String::with_capacity(256 + mem.content.len());
     out.push_str("---\n");
-    out.push_str(&format!("memory_id: {}\n", mem.id));
-    out.push_str(&format!("namespace: {}\n", yaml_scalar(&mem.namespace)));
-    out.push_str(&format!("title: {}\n", yaml_scalar(&mem.title)));
+    out.push_str(&format!(
+        "memory_id: {}\n",
+        yaml_scalar(&mem.id, PlainWhenSafe)
+    ));
+    out.push_str(&format!(
+        "namespace: {}\n",
+        yaml_scalar(&mem.namespace, Quote)
+    ));
+    out.push_str(&format!("title: {}\n", yaml_scalar(&mem.title, Quote)));
     out.push_str(&format!("reflection_depth: {}\n", mem.reflection_depth));
-    out.push_str(&format!("attest_level: {attest_level}\n"));
-    out.push_str(&format!("created_at: {}\n", mem.created_at));
-    out.push_str(&format!("agent_id: {}\n", yaml_scalar(agent_id)));
+    out.push_str(&format!(
+        "attest_level: {}\n",
+        yaml_scalar(attest_level, PlainWhenSafe)
+    ));
+    out.push_str(&format!(
+        "created_at: {}\n",
+        yaml_scalar(&mem.created_at, PlainWhenSafe)
+    ));
+    out.push_str(&format!("agent_id: {}\n", yaml_scalar(agent_id, Quote)));
     out.push_str("reflects_on:\n");
     if edges.is_empty() {
         out.push_str("  []\n");
@@ -395,7 +412,9 @@ fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -
         for e in edges {
             out.push_str(&format!(
                 "  - target_id: {}\n    attest_level: {}\n    created_at: {}\n",
-                e.target_id, e.attest_level, e.created_at,
+                yaml_scalar(&e.target_id, PlainWhenSafe),
+                yaml_scalar(&e.attest_level, PlainWhenSafe),
+                yaml_scalar(&e.created_at, PlainWhenSafe),
             ));
         }
     }
@@ -427,21 +446,51 @@ fn render_json(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> St
     serde_json::to_string_pretty(&env).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
-/// Conservatively quote a YAML scalar. We escape only the obviously
-/// dangerous shapes (containing `:` `#` `"` `'` or starting with `-`
-/// `?` `*` `&`); everything else is emitted bare. The shape is
-/// deliberately simple — operators read these files; we never
-/// round-trip them back through a YAML parser, so over-engineering
-/// the escape is dead weight.
-fn yaml_scalar(s: &str) -> String {
+/// API-09: retain the existing colon style while sharing all safety checks.
+#[derive(Clone, Copy)]
+enum YamlColonStyle {
+    Quote,
+    PlainWhenSafe,
+}
+
+/// Quote unsafe stored scalars and escape controls without YAML line folding.
+/// Existing plain timestamps and conservative namespace/title/agent quoting
+/// retain their bytes; both styles use the same control-character encoder.
+fn yaml_scalar(s: &str, colon_style: YamlColonStyle) -> String {
+    use std::fmt::Write as _;
+
+    let unsafe_colon = s.split(':').skip(1).any(|tail| {
+        matches!(colon_style, YamlColonStyle::Quote)
+            || tail.is_empty()
+            || tail.starts_with(char::is_whitespace)
+    });
     let needs_quote = s.is_empty()
-        || s.starts_with(['-', '?', '*', '&', '!', '|', '>', '\'', '"', '%', '@', '`'])
-        || s.contains(':')
-        || s.contains('#')
-        || s.contains('\n');
+        || s.trim() != s
+        || s.starts_with([
+            '-', '?', '*', '&', '!', '|', '>', '\'', '"', '%', '@', '`', '[', ']', '{', '}', ',',
+        ])
+        || unsafe_colon
+        || s.contains(['#', '"', '\\'])
+        || s.chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'));
     if needs_quote {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
+        let mut escaped = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => escaped.push_str("\\\""),
+                '\\' => escaped.push_str("\\\\"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => {
+                    // ERRORS-19: fmt::Write for String is infallible.
+                    let _ = write!(escaped, "\\u{:04x}", u32::from(c));
+                }
+                c => escaped.push(c),
+            }
+        }
+        escaped.push('"');
+        escaped
     } else {
         s.to_string()
     }
