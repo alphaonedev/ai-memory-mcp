@@ -43,6 +43,19 @@ pub(crate) use private_file::write_private_export;
 /// post-reflect auto-export hook (#1558 batch 6).
 pub(crate) const REFLECTIONS_SUBDIR: &str = "reflections";
 
+/// Maximum input characters included per stored value in refusal diagnostics.
+const EXPORT_DIAGNOSTIC_MAX_CHARS: usize = 128;
+
+/// Bound allocation before Debug escaping, preserving UTF-8 boundaries.
+fn export_diagnostic(value: &str) -> String {
+    let prefix: String = value.chars().take(EXPORT_DIAGNOSTIC_MAX_CHARS).collect();
+    if prefix.len() < value.len() {
+        format!("{prefix:?} [truncated; original_bytes={}]", value.len())
+    } else {
+        format!("{prefix:?}")
+    }
+}
+
 /// CLI args for `ai-memory export-reflections`.
 #[derive(Args, Debug, Clone)]
 pub struct ExportReflectionsArgs {
@@ -125,8 +138,9 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace).with_context(
             || {
                 format!(
-                    "memory {:?} namespace {:?}: refusing export path",
-                    mem.id, mem.namespace
+                    "memory {} namespace {}: refusing export path",
+                    export_diagnostic(&mem.id),
+                    export_diagnostic(&mem.namespace)
                 )
             },
         )?);
