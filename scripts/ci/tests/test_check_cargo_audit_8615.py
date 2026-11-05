@@ -4,6 +4,7 @@
 """Issue 8615: reject advisory reports and incomplete audit evidence offline."""
 
 import copy
+from datetime import date
 import importlib.util
 import io
 import json
@@ -21,6 +22,46 @@ GATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GATE)
 CLEAN = json.loads((DATA / "cargo_audit_clean_8615.json").read_text())
 ADVISORY = json.loads((DATA / "cargo_audit_advisory_8615.json").read_text())
+RECORDED = json.loads((DATA / "cargo_audit_unfiltered_8615.json").read_text())
+TODAY = date(2026, 11, 5)
+EXCEPTIONS = [
+    {"id": "RUSTSEC-2023-0071", "package": "rsa", "version": "0.9.10",
+     "issue": 8473, "expires": date(2027, 2, 3), "reason": "SQLx sibling driver; tracked removal."},
+    {"id": "RUSTSEC-2024-0449", "package": "unsafe-libyaml", "version": "0.2.11",
+     "issue": 8476, "expires": date(2027, 2, 3), "reason": "YAML parser replacement tracked."},
+]
+
+
+class TrackedExceptions8615Tests(unittest.TestCase):
+    """R2 policy reconciles every report entry with one dated tracked exception."""
+
+    def test_unlisted_advisory_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unlisted advisory"):
+            GATE.validate_report(RECORDED, EXCEPTIONS[:1], TODAY)
+
+    def test_expired_exception_is_rejected(self):
+        entries = copy.deepcopy(EXCEPTIONS)
+        entries[0]["expires"] = date(2026, 11, 4)
+        with self.assertRaisesRegex(ValueError, "expired exception"):
+            GATE.validate_report(RECORDED, entries, TODAY)
+
+    def test_stale_version_or_absent_entry_is_rejected(self):
+        entries = copy.deepcopy(EXCEPTIONS)
+        entries[0]["version"] = "0.9.9"
+        with self.assertRaisesRegex(ValueError, "stale exception"):
+            GATE.validate_report(RECORDED, entries, TODAY)
+        with self.assertRaisesRegex(ValueError, "stale exception"):
+            GATE.validate_report(CLEAN, EXCEPTIONS, TODAY)
+
+    def test_missing_exception_fields_are_rejected(self):
+        for field in EXCEPTIONS[0]:
+            entries = copy.deepcopy(EXCEPTIONS)
+            del entries[0][field]
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "missing exception fields"):
+                GATE.validate_report(RECORDED, entries, TODAY)
+
+    def test_all_reported_advisories_match_unexpired_entries(self):
+        self.assertEqual(GATE.validate_report(RECORDED, EXCEPTIONS, TODAY), (565, 1, 1))
 
 
 class CargoAudit8615Tests(unittest.TestCase):
