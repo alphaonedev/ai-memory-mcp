@@ -380,7 +380,7 @@ pub(crate) fn render_payload(
 /// emitted in a stable order (memory_id, namespace, title, reflection_depth,
 /// attest_level, created_at, agent_id) followed by a sequence of
 /// `reflects_on` edges. Every stored string uses the shared YAML encoder.
-/// Both `created_at` fields intentionally retain plain RFC3339 timestamp scalars;
+/// Both `created_at` fields retain reader-safe plain RFC3339 timestamp scalars;
 /// `reflection_depth` remains an integer, matching its schema.
 /// The body of the reflection follows after a
 /// blank line, exactly as it was stored.
@@ -493,34 +493,65 @@ const fn is_yaml_format_control(c: char) -> bool {
 }
 
 /// Named conservative plain-string alphabet for YAML 1.1 and 1.2 readers.
-const SAFE_PLAIN_PUNCTUATION: &[u8] = b" -_.";
+const SAFE_PLAIN_PUNCTUATION: &[u8] = b" -_./";
 const SAFE_PLAIN_RESERVED_WORDS: &[&str] = &[
     "null", "~", "true", "false", "yes", "no", "on", "off", "y", "n",
 ];
+// CONST-01: the canonical lowercase UUID form is exactly 8-4-4-4-12 hex digits.
+const CANONICAL_UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+const YAML_TIMESTAMP_YEARS: std::ops::RangeInclusive<i32> = 1..=9999;
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
 
-/// Plain strings begin with an ASCII letter and stay inside the safe alphabet.
+/// OWNERSHIP-05: validate borrowed UUID groups without parsing or reformatting.
+fn yaml_canonical_uuid(s: &str) -> bool {
+    let mut groups = s.split('-');
+    for length in CANONICAL_UUID_GROUP_LENGTHS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != length
+            || !group
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// TOOL-03: plain strings are canonical lowercase UUIDs or letter-leading safe
+/// ASCII values, with slash allowed only inside the latter form.
 /// OWNERSHIP-05: inspect borrowed bytes without allocating a lowercase copy.
 /// R3: reader-specific regressions extend the test table, not this predicate.
 fn yaml_safe_plain(s: &str) -> bool {
-    s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
-        && s.trim() == s
-        && s.bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || SAFE_PLAIN_PUNCTUATION.contains(&byte))
-        && !SAFE_PLAIN_RESERVED_WORDS
-            .iter()
-            .any(|word| s.eq_ignore_ascii_case(word))
+    yaml_canonical_uuid(s)
+        || (s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && s.trim() == s
+            && !s.ends_with('/')
+            && s.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || SAFE_PLAIN_PUNCTUATION.contains(&byte))
+            && !SAFE_PLAIN_RESERVED_WORDS
+                .iter()
+                .any(|word| s.eq_ignore_ascii_case(word)))
 }
 
 /// Quote strings outside `SAFE_PLAIN` and escape controls without line folding.
-/// Schema-defined RFC3339 timestamps alone retain their plain representation.
+/// U+FFFE/U+FFFF also require escapes because YAML excludes them from printable text.
+/// Schema timestamps retain plain bytes only for years 0001-9999 and seconds 00-59.
 fn yaml_scalar(s: &str, kind: YamlScalarKind) -> String {
+    use chrono::{Datelike as _, Timelike as _};
     use std::fmt::Write as _;
 
     let plain_timestamp = matches!(kind, YamlScalarKind::Timestamp)
         && s.is_ascii()
         && s.trim() == s
         && !s.bytes().any(|byte| byte.is_ascii_control())
-        && chrono::DateTime::parse_from_rfc3339(s).is_ok();
+        && chrono::DateTime::parse_from_rfc3339(s).is_ok_and(|timestamp| {
+            // Chrono encodes a leap second as second 59 with excess nanoseconds.
+            YAML_TIMESTAMP_YEARS.contains(&timestamp.year())
+                && timestamp.nanosecond() < NANOS_PER_SECOND
+        });
     let needs_quote = !yaml_safe_plain(s) && !plain_timestamp;
     if needs_quote {
         let mut escaped = String::from("\"");
@@ -533,7 +564,7 @@ fn yaml_scalar(s: &str, kind: YamlScalarKind) -> String {
                 '\t' => escaped.push_str("\\t"),
                 c if c.is_control()
                     || is_yaml_format_control(c)
-                    || matches!(c, '\u{2028}' | '\u{2029}') =>
+                    || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}') =>
                 {
                     // YAML 1.2 §5.7: \u has exactly four hex digits; \U has eight.
                     // ERRORS-19: fmt::Write for String is infallible.
