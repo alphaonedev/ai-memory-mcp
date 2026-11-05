@@ -195,7 +195,9 @@ def tracked_symlink(repo: Path) -> Optional[str]:
     """Return the first tracked symlink (mode 120000) of the work tree around `repo`.
 
     The top of the work tree is resolved first (`rev-parse --show-toplevel`),
-    so the scan covers the whole tree whatever --repo names inside it. Two
+    so the scan covers the whole tree whatever --repo names inside it. The top
+    path is taken byte for byte from git (only the one trailing newline is
+    removed; a name ending in a space, tab or CR keeps it). Two
     listings are scanned from that top: the index (`ls-files -s -z`) and the
     committed tree (`ls-tree -r -z HEAD`), so a missing or empty index cannot
     hide a symlink HEAD tracks. Raises RuntimeError when git is missing, times
@@ -203,7 +205,7 @@ def tracked_symlink(repo: Path) -> Optional[str]:
     repository and an unborn HEAD all fail closed.
     """
     top_raw = git_output(repo, ["rev-parse", "--show-toplevel"], "git rev-parse")
-    top = Path(top_raw.decode("utf-8", "surrogateescape").strip())
+    top = Path(top_raw.removesuffix(b"\n").decode("utf-8", "surrogateescape"))
     for args, what in ((["ls-files", "-s", "-z"], "git ls-files"),
                        (["ls-tree", "-r", "-z", "HEAD"], "git ls-tree")):
         found = first_symlink_entry(git_output(top, args, what))
