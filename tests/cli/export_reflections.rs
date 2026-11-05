@@ -620,6 +620,31 @@ fn cli_export_yaml_string_types_8605_r6() {
 }
 
 #[test]
+fn cli_export_yaml_binary_string_8605_r7() {
+    const BINARY_SHAPED_STRING: &str = "0b101";
+    let document = markdown_with_edge_values_8605(
+        BINARY_SHAPED_STRING,
+        BINARY_SHAPED_STRING,
+        "unsigned",
+        BINARY_SHAPED_STRING,
+    );
+    let header = document
+        .strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0;
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
+    assert_eq!(parsed["title"].as_str(), Some(BINARY_SHAPED_STRING));
+    for key in ["target_id", "created_at"] {
+        assert_eq!(
+            parsed["reflects_on"][0][key].as_str(),
+            Some(BINARY_SHAPED_STRING)
+        );
+    }
+}
+
+#[test]
 fn cli_namespace_path_8591_refuses_traversal() {
     assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Cli);
 }

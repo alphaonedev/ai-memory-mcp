@@ -611,6 +611,121 @@ mod tests {
         }
     }
 
+    // R3 class ratchet: add reader-specific forms here, never a production denylist arm.
+    // Columns: stored value, safe plain string, created_at-only timestamp exception.
+    const YAML_SCHEMA_FORMS_8605_R7: &[(&str, bool, bool)] = &[
+        ("", false, false),
+        ("~", false, false),
+        ("null", false, false),
+        ("NULL", false, false),
+        ("NuLl", false, false),
+        ("true", false, false),
+        ("FALSE", false, false),
+        ("TrUe", false, false),
+        ("yes", false, false),
+        ("NO", false, false),
+        ("oN", false, false),
+        ("Off", false, false),
+        ("2026", false, false),
+        ("0", false, false),
+        ("01", false, false),
+        ("184467440737095516160", false, false),
+        ("1.0", false, false),
+        (".5", false, false),
+        ("5.", false, false),
+        ("0x1f", false, false),
+        ("0o17", false, false),
+        ("1e3", false, false),
+        ("1E-3", false, false),
+        (".inf", false, false),
+        (".INF", false, false),
+        (".nan", false, false),
+        (".NaN", false, false),
+        ("+1", false, false),
+        ("-1", false, false),
+        ("+word", false, false),
+        ("-word", false, false),
+        ("0b101", false, false),
+        ("0b0", false, false),
+        ("1_000", false, false),
+        ("0x_1F", false, false),
+        ("1_0.5", false, false),
+        ("1:30", false, false),
+        ("190:20:30.15", false, false),
+        ("2026-11-05", false, false),
+        ("=", false, false),
+        ("<<", false, false),
+        ("y", false, false),
+        ("Y", false, false),
+        ("n", false, false),
+        ("N", false, false),
+        ("plain title", true, false),
+        ("source-id", true, false),
+        ("unsigned", true, false),
+        ("plain-id", true, false),
+        ("yaml-export", true, false),
+        ("ai:test", false, false),
+        ("2026-01-01T00:00:00Z", false, true),
+    ];
+    const YAML_ORACLE_PREFIX_8605_R7: &str = "YAML_ORACLE_8605_R7 ";
+
+    #[test]
+    fn yaml_schema_table_8605_r7() {
+        let mut failures = Vec::new();
+        for &(value, plain_string, timestamp) in YAML_SCHEMA_FORMS_8605_R7 {
+            let mut mem = make_reflection(value, 0, value, "body\n", value);
+            mem.id = value.into();
+            mem.created_at = value.into();
+            let edges = [ReflectsOnEdge {
+                target_id: value.into(),
+                attest_level: value.into(),
+                created_at: value.into(),
+            }];
+            let document = render_markdown(&mem, &edges, value);
+            let header = document
+                .strip_prefix("---\n")
+                .unwrap()
+                .split_once("\n---\n")
+                .unwrap()
+                .0;
+            // The YAML 1.1 proof consumes these exact renderer bytes, not a second encoder.
+            println!(
+                "{YAML_ORACLE_PREFIX_8605_R7}{}",
+                serde_json::json!({
+                    "value": value, "plain_string": plain_string,
+                    "timestamp": timestamp, "header": header,
+                })
+            );
+            let Ok(parsed) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(header) else {
+                failures.push(format!("parser rejected {value:?}"));
+                continue;
+            };
+            let edge = &parsed["reflects_on"][0];
+            for (prefix, stored, timestamp_site) in [
+                ("memory_id: ", &parsed["memory_id"], false),
+                ("namespace: ", &parsed["namespace"], false),
+                ("title: ", &parsed["title"], false),
+                ("attest_level: ", &parsed["attest_level"], false),
+                ("created_at: ", &parsed["created_at"], true),
+                ("agent_id: ", &parsed["agent_id"], false),
+                ("  - target_id: ", &edge["target_id"], false),
+                ("    attest_level: ", &edge["attest_level"], false),
+                ("    created_at: ", &edge["created_at"], true),
+            ] {
+                let scalar = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .unwrap();
+                let expected_plain = plain_string || (timestamp && timestamp_site);
+                if stored.as_str() != Some(value) || scalar.starts_with('"') == expected_plain {
+                    failures.push(format!("{prefix}{value:?}"));
+                }
+            }
+            assert_eq!(parsed["reflection_depth"].as_i64(), Some(0));
+        }
+        assert!(failures.is_empty(), "YAML schema table: {failures:?}");
+    }
+
     #[test]
     fn parse_format_accepts_md_and_json() {
         assert_eq!(parse_format("md").unwrap(), ExportFormat::Markdown);
