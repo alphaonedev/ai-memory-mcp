@@ -18,6 +18,14 @@ test or source file can open is inside it. A path is skippable only when it
 matches a skip glob and matches neither a never-skip glob nor a test-read glob.
 Anything unexpected (no paths, unreadable rules, a git error) fails closed:
 both verdicts false.
+
+Symlink rule (#8493): the globs match file NAMES only, so a registered
+test_read_globs document that is a symlink would hide an edit to its target.
+When any path named by test_read_globs (the literal path, or the literal
+directory prefix of a wildcard glob) is a symlink in the checked-out tree
+(lstat, never followed), the verdict is both false with reason
+registered-read-path-is-symlink-full-ci naming the path. A missing path is not
+a symlink and keeps the normal verdict. The tree is the --repo directory.
 """
 import argparse
 import subprocess
@@ -45,6 +53,8 @@ REASON_EVENT = "push-event-full-ci"
 REASON_MERGE_GROUP = "merge-group-full-ci"
 REASON_BASE = "protected-base-full-ci"
 REASON_CI_TREE = "ci-tree-edited-full-ci"
+REASON_SYMLINK = "registered-read-path-is-symlink-full-ci"
+GLOB_WILDCARDS = frozenset("*?[")
 GLOB_LISTS = ("skip_globs", "docs_globs", "never_skip_globs", "test_read_globs",
               "ci_tree_globs", "ci_tree_exempt_globs", "full_ci_events",
               "full_ci_base_names", "full_ci_base_prefixes")
@@ -99,6 +109,36 @@ def is_skippable(section: dict, path: str) -> bool:
     return matches_any(section["skip_globs"], path) and not blocked(section, path)
 
 
+def literal_prefixes(glob: str) -> List[str]:
+    """Return the cumulative literal path prefixes of `glob`, never walking the tree.
+
+    "docs/ADMIN_GUIDE.md" gives ["docs", "docs/ADMIN_GUIDE.md"]; the wildcard
+    glob "docs/compliance/**" gives ["docs", "docs/compliance"]; "**/README.md"
+    gives [].
+    """
+    prefixes: List[str] = []
+    parts: List[str] = []
+    for part in glob.split("/"):
+        if GLOB_WILDCARDS & set(part):
+            break
+        parts.append(part)
+        prefixes.append("/".join(parts))
+    return prefixes
+
+
+def symlinked_read_path(section: dict, repo: Path) -> Optional[str]:
+    """Return the first test_read_globs path that is a symlink under `repo`, else None.
+
+    Uses lstat via Path.is_symlink (the link is never followed); a missing path
+    is not a symlink.
+    """
+    for glob in section["test_read_globs"]:
+        for prefix in literal_prefixes(glob):
+            if (repo / prefix).is_symlink():
+                return prefix
+    return None
+
+
 def full_ci_reason(section: dict, event_name: str, base_ref: str) -> Optional[str]:
     """Return the reason a run must be full whatever the diff, else None.
 
@@ -116,14 +156,21 @@ def full_ci_reason(section: dict, event_name: str, base_ref: str) -> Optional[st
 
 
 def classify(section: dict, paths: List[str], event_name: str = "",
-             base_ref: str = "") -> Dict[str, str]:
-    """Return the three output values for the changed `paths`."""
+             base_ref: str = "", repo: Optional[Path] = None) -> Dict[str, str]:
+    """Return the three output values for the changed `paths`.
+
+    With `repo` set, a symlinked test_read_globs path forces cargo (#8493).
+    """
     version = "cargo_skip-rules-v%s" % section["version"]
     forced = full_ci_reason(section, event_name, base_ref)
     if forced:
         return verdict(FALSE, FALSE, "%s %s" % (forced, version))
     if not paths:
         return verdict(FALSE, FALSE, "%s %s" % (REASON_EMPTY, version))
+    if repo is not None:
+        linked = symlinked_read_path(section, repo)
+        if linked:
+            return verdict(FALSE, FALSE, "%s %s %s" % (REASON_SYMLINK, linked, version))
     for path in paths:
         if (matches_any(section["ci_tree_globs"], path)
                 and not matches_any(section["ci_tree_exempt_globs"], path)):
@@ -188,7 +235,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             paths = diff_paths(Path(args.repo), args.base, args.head)
         else:
             parser.error("give --stdin or --base")
-        emit(classify(section, paths, args.event_name, args.base_ref))
+        emit(classify(section, paths, args.event_name, args.base_ref,
+                      Path(args.repo)))
     except TypeError as exc:
         # A structurally wrong rules file (null, a non-list glob set): say so
         # and exit 1 with no verdict; the workflow then keeps both outputs false.
