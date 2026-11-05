@@ -29,18 +29,18 @@ EXCEPTION_FIELDS = frozenset(("path", "line", "text", "sha256", "reason"))
 PLACEHOLDER = "<home>"
 ACCOUNT_NAME = r"[\w-]+(?:\.[\w-]+)*"
 NAMED_ACCOUNT = r"[^\W\d][\w-]*(?:\.[\w-]+)*"
-# Class (a): local path tokens; normalized components determine home membership.
+# Class (a): both raw and normalized components determine home membership.
 LOCAL_PATH = re.compile(r"(?<![\w.%/-])(?:/|[\w.-]+/)[\w./%-]*")
 PATH_COMPONENT = re.compile(r"[^/]+")
 WEB_URL = re.compile(
-    r"(?<![\w./-])(?:[A-Za-z][A-Za-z0-9+.-]*://|(?:[\w-]+\.)+[A-Za-z]{2,}/)"
-    r"[^\s<>\"'`()]*"
+    r"(?<![\w./-])[A-Za-z][A-Za-z0-9+.-]*://[\w.:%@+-]*(?:/[\w.%~/-]*)?"
 )
 INVISIBLE = frozenset("\u200b\u200c\u200d\ufeff")
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
-NAMED_HOME = re.compile(rf"(?<![\w~])~(?P<name>{NAMED_ACCOUNT})(?=/)")
+TILDE_START = r"(?:(?<![\w~])|(?<=-I)|(?<=-L))~"
+NAMED_HOME = re.compile(rf"{TILDE_START}(?P<name>{NAMED_ACCOUNT})(?=/)")
 # Class (c): bare names in code and prose; numeric approximations are not names.
-BARE_HOME = re.compile(rf"(?<![\w~])~(?P<name>{NAMED_ACCOUNT})(?![\w/-]|\.[\w-])")
+BARE_HOME = re.compile(rf"{TILDE_START}(?P<name>{NAMED_ACCOUNT})(?![\w/-]|\.[\w-])")
 FENCE = re.compile(r"^ {0,3}(?P<marks>`{3,}|~{3,})(?P<info>[^\r\n]*)")
 BACKTICKS = re.compile(r"`+")
 SHELL_FENCES = frozenset(("", "sh", "bash", "zsh", "shell", "console"))
@@ -252,35 +252,46 @@ def normalized_source(text: str) -> tuple[str, list[int]]:
 
 
 def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]]:
-    """Resolve dot segments and exclude URL spans before selecting private homes."""
+    """Select raw and resolved home pairs; URL and option bytes stay outside spans."""
     urls = [match.span() for match in WEB_URL.finditer(text)
-            if not match.group().startswith("file://")]
+            if not match.group().casefold().startswith("file://")]
     starts = [start for start, _ in urls]
     result = []
     for token in LOCAL_PATH.finditer(text):
         index = bisect_right(starts, token.start()) - 1
         if index >= 0 and token.start() < urls[index][1]:
             continue
+        raw = [(part.group(), token.start() + part.start())
+               for part in PATH_COMPONENT.finditer(token.group())]
+        pairs = list(zip(raw, raw[1:]))
         components = []
-        for part in PATH_COMPONENT.finditer(token.group()):
-            name = part.group()
+        for name, offset in raw:
             if name == ".":
                 continue
             if name == ".." and components and components[-1][0] != "..":
                 components.pop()
             else:
-                components.append((name, token.start() + part.start()))
+                components.append((name, offset))
+                if len(components) >= 2:
+                    # Retain a resolved pair even if a later parent segment pops it.
+                    pairs.append((components[-2], components[-1]))
         end = None
-        for (parent, _), (account, offset) in zip(components, components[1:]):
+        for (parent, _), (account, offset) in pairs:
             name = account.rstrip(".")
             if (parent in ("home", "Users") and re.fullmatch(ACCOUNT_NAME, name)
                     and name.casefold() not in allowed):
-                end = offset + len(name)
+                end = max(end or 0, offset + len(name))
         if end is not None:
             start = token.start()
             # Keep file:// outside the local-path replacement, as in round 3.
-            if text[max(0, start - 5):start] == "file:":
+            if (text[max(0, start - 5):start].casefold() == "file:"
+                    and token.group().startswith("//")):
                 start += 2
+            elif token.group().startswith(("-I", "-L")):
+                # Their argument may be relative: keep the switch, replace ../home too.
+                start += 2
+            elif token.group().startswith("-"):
+                start += token.group().index("/")
             result.append((start, end))
     return result
 

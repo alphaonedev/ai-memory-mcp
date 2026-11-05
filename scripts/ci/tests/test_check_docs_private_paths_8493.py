@@ -1,5 +1,9 @@
-"""Exercise the docs home-path guard and byte-preserving repair (#8493)."""
+"""Exercise the docs home-path guard and byte-preserving repair (#8493).
 
+Every future review finding adds a grammar axis to the independent shape helper.
+"""
+
+import importlib.util
 import json
 import hashlib
 import subprocess
@@ -7,6 +11,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from scripts.ci.tests.docs_private_path_shapes_8493 import shapes
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/check_docs_private_paths.py"
@@ -35,6 +41,68 @@ class DocsPrivatePaths(unittest.TestCase):
              "--exceptions-file", str(self.exceptions), *args],
             capture_output=True, text=True, check=False,
         )
+
+    def assert_repairs(self, rows):
+        for before, after in rows:
+            with self.subTest(before=before):
+                self.doc.write_text(before)
+                self.assertEqual(self.run_gate().returncode, 1)
+                self.assertEqual(self.run_gate("--fix").returncode, 0)
+                self.assertEqual(self.doc.read_bytes(), after.encode())
+                self.assertEqual(self.run_gate().returncode, 0)
+
+    def test_raw_home_pairs_survive_parent_segments_r5(self):
+        self.assert_repairs((
+            ("/home/private_account/..", "<home>/.."),
+            ("x/../home/private_account/..", "<home>/.."),
+            ("/Users/private_account/../..", "<home>/../.."),
+        ))
+
+    def test_url_adjacent_and_bare_domain_paths_r5(self):
+        self.assert_repairs((
+            ("https://example.test/a,/home/private_account/x",
+             "https://example.test/a,<home>/x"),
+            ("https://example.test/a]/Users/private_account/x",
+             "https://example.test/a]<home>/x"),
+            ("notes.md/home/private_account/x", "<home>/x"),
+        ))
+
+    def test_file_scheme_case_r5(self):
+        self.assert_repairs((
+            ("FILE:///home/private_account/x", "FILE://<home>/x"),
+            ("File:///Users/private_account/x", "File://<home>/x"),
+        ))
+
+    def test_file_scheme_slash_count_r5(self):
+        self.assert_repairs((
+            ("file:/home/private_account/x", "file:<home>/x"),
+            ("file:home/private_account/x", "file:<home>/x"),
+        ))
+
+    def test_compiler_option_prefix_survives_r5(self):
+        self.assert_repairs((
+            ("gcc -I/home/private_account/include", "gcc -I<home>/include"),
+            ("ld -L/Users/private_account/lib", "ld -L<home>/lib"),
+            ("gcc -I../home/private_account/include", "gcc -I<home>/include"),
+            ("ld -Lname.ext/home/private_account/lib", "ld -L<home>/lib"),
+        ))
+
+    def test_generated_prefix_invariants_r5(self):
+        spec = importlib.util.spec_from_file_location("private_path_gate_r5", SCRIPT)
+        gate = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = gate
+        self.addCleanup(sys.modules.pop, spec.name)
+        spec.loader.exec_module(gate)
+        allowed = gate.allowed_names(gate.DEFAULT_ALLOW_FILE)
+        for case in shapes():
+            with self.subTest(shape=case.label):
+                matches, used = gate.findings(case.text, allowed)
+                self.assertFalse(used)
+                actual = tuple((item.start, item.end) for item in matches)
+                self.assertEqual(actual, case.spans)
+                repaired = gate.redact(case.text, matches)
+                self.assertEqual(repaired.encode(), case.repaired().encode())
+                self.assertEqual(gate.findings(repaired, allowed), ([], set()))
 
     def test_nested_normalized_home_roots_r4(self):
         roots = ("/var/home", "/usr/home", "/export/home", "/mnt/c/Users",

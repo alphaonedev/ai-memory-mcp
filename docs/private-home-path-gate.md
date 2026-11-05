@@ -12,10 +12,14 @@ The gate scans Markdown below `docs/` and rejects these lexical classes:
 
 - Local paths with a `home` or `Users` component followed by an account name,
   with or without a following path. Nested and relative roots are included;
-  `.` and `..` components are normalized before the home component is selected.
-  Colon-adjacent paths (PATH lists, scp and container mounts) and `file://` paths
-  are included. Recognized scheme URLs other than `file://`, and bare domain
-  URL tokens, are excluded. A sentence-final period is kept;
+  Both raw components and components normalized for `.` and `..` are checked,
+  so a parent segment cannot hide an account already present in the text.
+  Colon-adjacent paths (PATH lists, scp and container mounts) and file-scheme paths
+  are included, with case-insensitive schemes and zero, one or multiple slashes.
+  Recognized scheme URLs other than `file://` are excluded only through their
+  host and path token; a comma or closing bracket ends that token. Bare-domain
+  spellings are checked as local paths. File-scheme markers and compiler options
+  such as `-I` and `-L` survive repair. A sentence-final period is kept;
   dots between account-name segments remain part of the account name.
 - Named-home paths shaped as `~<account>/`, wherever they appear.
 - Bare named homes shaped as `~<account>` in ordinary prose, inline code, or a
@@ -68,3 +72,12 @@ Percent-encoded paths, HTML entities and homoglyph characters are not decoded.
 Format characters other than the four listed above are not normalized. Bare
 account names outside home prefixes are not inferred by the scanner; reviewed
 owner/group column repairs such as the install listing are made explicitly.
+
+The independent shape grammar in
+`scripts/ci/tests/docs_private_path_shapes_8493.py` combines roots, account classes,
+left contexts, right contexts and inner path shapes. Its expected spans are built
+from those pieces, without calling scanner helpers or using scanner patterns.
+Each private case must be detected, repaired byte-exactly, and clean on rescan;
+public cases must remain unchanged. Named-tilde homes retain their anywhere rule,
+including URL paths; the web-host exemption applies to absolute home components.
+Every future review finding adds a grammar axis before the implementation fix.
