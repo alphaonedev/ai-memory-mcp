@@ -588,6 +588,7 @@ fn yaml_scalar(s: &str, kind: YamlScalarKind) -> String {
 mod tests {
     use super::*;
     use crate::models::Tier;
+    use crate::yaml_frontmatter::YAML_SCHEMA_FORMS_8605_R7;
     use chrono::Utc;
     use tempfile::TempDir;
 
@@ -634,82 +635,6 @@ mod tests {
         }
     }
 
-    // R3 class ratchet: add reader-specific forms here, never a production denylist arm.
-    // Columns: stored value, safe plain string, created_at-only timestamp exception.
-    const YAML_SCHEMA_FORMS_8605_R7: &[(&str, bool, bool)] = &[
-        ("", false, false),
-        ("~", false, false),
-        ("null", false, false),
-        ("NULL", false, false),
-        ("NuLl", false, false),
-        ("true", false, false),
-        ("FALSE", false, false),
-        ("TrUe", false, false),
-        ("yes", false, false),
-        ("NO", false, false),
-        ("oN", false, false),
-        ("Off", false, false),
-        ("2026", false, false),
-        ("0", false, false),
-        ("01", false, false),
-        ("184467440737095516160", false, false),
-        ("1.0", false, false),
-        (".5", false, false),
-        ("5.", false, false),
-        ("0x1f", false, false),
-        ("0o17", false, false),
-        ("1e3", false, false),
-        ("1E-3", false, false),
-        (".inf", false, false),
-        (".INF", false, false),
-        (".nan", false, false),
-        (".NaN", false, false),
-        ("+1", false, false),
-        ("-1", false, false),
-        ("+word", false, false),
-        ("-word", false, false),
-        ("0b101", false, false),
-        ("0b0", false, false),
-        ("1_000", false, false),
-        ("0x_1F", false, false),
-        ("1_0.5", false, false),
-        ("1:30", false, false),
-        ("190:20:30.15", false, false),
-        ("2026-11-05", false, false),
-        ("=", false, false),
-        ("<<", false, false),
-        ("y", false, false),
-        ("Y", false, false),
-        ("n", false, false),
-        ("N", false, false),
-        ("plain title", true, false),
-        ("source-id", true, false),
-        ("unsigned", true, false),
-        ("plain-id", true, false),
-        ("yaml-export", true, false),
-        ("ai:test", false, false),
-        ("2026-01-01T00:00:00Z", false, true),
-        ("\u{fffe}", false, false),
-        ("\u{ffff}", false, false),
-        ("123e4567-e89b-42d3-a456-426614174000", true, false),
-        ("abcdef01-2345-4678-9abc-def012345678", true, false),
-        ("123E4567-E89B-42D3-A456-426614174000", false, false),
-        ("123e4567-e89b-42d3-a456-42661417400", false, false),
-        ("123e4567-e89b-42d3-a456-42661417400g", false, false),
-        ("team/alpha", true, false),
-        ("/team", false, false),
-        ("team/", false, false),
-        ("What's next?", false, false),
-        ("lesson (draft)", false, false),
-        ("Café notes", false, false),
-        ("1234-12-12", false, false),
-        ("12:34:56", false, false),
-        ("1e5", false, false),
-        ("2026-06-30T23:59:60Z", false, false),
-        ("0000-01-01T00:00:00Z", false, false),
-        ("0001-01-01T00:00:00Z", false, true),
-        ("9999-12-31T23:59:59Z", false, true),
-    ];
     const YAML_ORACLE_PREFIX_8605_R7: &str = "YAML_ORACLE_8605_R7 ";
 
     #[test]
