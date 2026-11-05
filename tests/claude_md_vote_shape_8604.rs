@@ -90,7 +90,9 @@ const PANIC_COMMENT_OPENER: &str = "HTML comment opener in the prefix is refused
 const PANIC_INDENTED_FENCE: &str = "indented fence opener in the prefix is refused";
 /// Rule R5 panic text: a CR not followed by LF in the prefix.
 const PANIC_BARE_CR: &str = "bare CR in the prefix is refused";
+/// Carriage return byte, used by the rule R5 bare-CR scan.
 const CR: u8 = b'\r';
+/// Line feed byte, the only byte allowed after a CR in the prefix.
 const LF: u8 = b'\n';
 /// Rule R2 bound: a fence opener line with at least this many leading spaces
 /// (and at most [`FENCE_MAX_INDENT`]) is refused in the prefix.
@@ -182,10 +184,13 @@ fn closes_fence(open_ch: u8, open_run: usize, line: &str) -> bool {
 ///   a fence the opener is literal text and ignored.
 /// - R2: outside a column-0 fence, a fence opener ([`fence_run`]) indented
 ///   [`INDENTED_FENCE_MIN_INDENT`] to [`FENCE_MAX_INDENT`] spaces panics
-///   ([`PANIC_INDENTED_FENCE`]). At top level `CommonMark` does not read such a
-///   line as a fence opener at all, and inside a list item the fence ends with
-///   the item; this line scan models neither, so the shape is refused. A
-///   four-space line is indented code and stays plain text.
+///   ([`PANIC_INDENTED_FENCE`]). At top level such an opener IS a fence
+///   (`CommonMark` 4.5 allows up to three spaces), exactly as [`fence_run`]
+///   reads it; inside a list item the same indented opener belongs to the item
+///   and the fence ends with the item. A line scan cannot tell the two
+///   containers apart, so R2 refuses the indented form in the prefix (fail
+///   closed) rather than guessing the container. A four-space line is indented
+///   code and stays plain text.
 /// - R3: a column-0 fence opens on [`fence_run`] and closes only on
 ///   [`closes_fence`] (same character, a run at least as long, only
 ///   [`CLOSER_TAIL_BYTES`] after it; a closer may be indented up to
@@ -233,13 +238,15 @@ fn assert_heading_not_wrapped(before: &str) {
 /// long, only space, tab, CR and LF after it).
 /// The heading prefix must occur exactly once, case-insensitively, anywhere in
 /// the text; that one occurrence must sit at a line start (byte offset 0 or
-/// right after a newline). A CRLF before it passes, a bare CR panics, and a BOM at file start
+/// right after a newline). A CRLF before it passes, and a BOM at file start
 /// does not change this test (`scripts/check-claude-md-size.py` rejects the
-/// BOM); a bare CR (a CR not followed by LF) in the prefix panics. The text before the heading is scanned from byte 0 by
+/// BOM); a bare CR (a CR not followed by LF) in the prefix panics. The text
+/// before the heading is scanned from byte 0 by
 /// [`assert_heading_not_wrapped`], whose doc comment states rules R1-R5: a raw
 /// HTML comment opener or an indented fence opener outside a column-0 fence
-/// panics, and so does a fence still open at the heading or a bare CR. A heading on a blockquote line
-/// or with an extra `#` is not found at a line start and also panics.
+/// panics, and so does a fence still open at the heading or a bare CR. A
+/// heading on a blockquote line or with an extra `#` is not found at a line
+/// start and also panics.
 /// `CommonMark` allows up to three spaces before `#`; this pin requires
 /// column 0 because the live file has it there. An HTML `pre` or other raw
 /// HTML block before the heading is not modelled and is left to
