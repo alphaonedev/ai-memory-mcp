@@ -83,11 +83,18 @@ const HTML_COMMENT_OPEN: &str = "<!--";
 const ENTITY_START: u8 = b'&';
 const NUMERIC_ENTITY_MARK: u8 = b'#';
 const ENTITY_END: u8 = b';';
-/// Opens an HTML tag, comment or closing tag when followed by a letter, one
-/// of [`TAG_FOLLOWERS`]; the live section's only `<` is the `<=` of
-/// "(<=120 words)".
+/// Opens an HTML tag, comment, closing tag or processing instruction when
+/// followed by a letter or one of [`TAG_FOLLOWERS`]; the live section's only
+/// `<` is the `<=` of "(<=120 words)".
 const TAG_START: u8 = b'<';
-const TAG_FOLLOWERS: &[u8] = b"/!";
+/// Bytes after `<` that open raw HTML: `/` closing tag, `!` comment or
+/// declaration, `?` processing instruction (`CommonMark` 6.6 counts `<?...?>`
+/// as inline raw HTML, which renders hidden).
+const TAG_FOLLOWERS: &[u8] = b"/!?";
+/// Context length shown for a tag hit: the `<` byte plus one follower byte.
+const TAG_CONTEXT_LEN: usize = std::mem::size_of_val(&TAG_START) + std::mem::size_of::<u8>();
+/// Context length shown for an entity hit: the entity start byte.
+const ENTITY_CONTEXT_LEN: usize = std::mem::size_of_val(&ENTITY_START);
 /// Characters forbidden outright in the section (census at 8382f308a: the
 /// live section holds none of them). Backslash escapes and link text render
 /// differently from the raw bytes (`5\-concurrent`, `[5](#x) concurrent`).
@@ -126,7 +133,13 @@ fn fence_run(line: &str) -> Option<(u8, usize, &str)> {
 /// The crossroads section: from its heading line to the byte before the
 /// first `\n## ` outside a fenced code block (`CommonMark` fences: backtick or
 /// tilde runs, closed only by the same character and at least as long a run).
-/// The heading prefix must occur exactly once, case-insensitively.
+/// The heading prefix must occur exactly once, case-insensitively, anywhere in
+/// the text; that one occurrence must also sit at a line start (byte offset 0
+/// or right after a newline). A heading inside a blockquote, an HTML comment,
+/// a fence or with an extra `#` is therefore not found and the test fails
+/// closed on its own (`scripts/check-claude-md-size.py` also rejects those
+/// wrappers in CI). `CommonMark` allows up to three spaces before `#`; this
+/// pin deliberately requires column 0 because the live file has it there.
 fn crossroads_section(text: &str) -> &str {
     let lowered = text.to_ascii_lowercase();
     let prefix = SECTION_PREFIX.to_ascii_lowercase();
@@ -136,8 +149,12 @@ fn crossroads_section(text: &str) -> &str {
         "CLAUDE.md must hold exactly one `{SECTION_PREFIX}` section (case-insensitive), found {count}"
     );
     let start = lowered
-        .find(&prefix)
-        .unwrap_or_else(|| panic!("CLAUDE.md lacks the section prefix `{SECTION_PREFIX}`"));
+        .match_indices(&prefix)
+        .map(|(at, _)| at)
+        .find(|&at| at == 0 || lowered.as_bytes()[at - 1] == b'\n')
+        .unwrap_or_else(|| {
+            panic!("crossroads heading not found at a line start: `{SECTION_PREFIX}`")
+        });
     let rest = &text[start..];
     let mut open_fence: Option<(u8, usize)> = None;
     let mut offset = 0;
@@ -217,7 +234,8 @@ fn find_html_entity(text: &str) -> Option<usize> {
 }
 
 /// Byte offset of the first `<` that opens an HTML tag, closing tag or
-/// comment: `<` followed by an ASCII letter, `/` or `!`.
+/// comment or processing instruction: `<` followed by an ASCII letter or one
+/// of [`TAG_FOLLOWERS`] (`/`, `!`, `?`).
 fn find_html_tag(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     bytes.iter().enumerate().find_map(|(at, &b)| {
@@ -294,13 +312,13 @@ fn assert_clean_characters(label: &str, section: &str) {
     if let Some(at) = find_html_tag(section) {
         panic!(
             "{label}: HTML tag at byte {at}: ...{}...",
-            context_around(section, at, 2)
+            context_around(section, at, TAG_CONTEXT_LEN)
         );
     }
     if let Some(at) = find_html_entity(section) {
         panic!(
             "{label}: HTML entity at byte {at}: ...{}...",
-            context_around(section, at, 1)
+            context_around(section, at, ENTITY_CONTEXT_LEN)
         );
     }
 }
