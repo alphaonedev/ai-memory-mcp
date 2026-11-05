@@ -55,6 +55,48 @@ class DocsPrivatePaths(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.doc.read_bytes(), content)
 
+    def test_sentence_period_survives_prefix_replacement_r3(self):
+        self.doc.write_bytes(b"in /home/private_account. and ~private_account.\n")
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), b"in <home>. and <home>.\n")
+
+    def test_generic_names_before_period_are_preserved_r3(self):
+        content = b"use /home/user. or /Users/aimem. or ~user.\n"
+        self.doc.write_bytes(content)
+        self.assertEqual(self.run_gate().returncode, 0)
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_prose_estimate_before_period_is_preserved_r3(self):
+        content = b"takes ~seconds.\n"
+        self.doc.write_bytes(content)
+        self.assertEqual(self.run_gate().returncode, 0)
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_dotted_account_keeps_only_sentence_period_r3(self):
+        self.doc.write_bytes(b"in /home/private.account. and ~private.account.\n")
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), b"in <home>. and <home>.\n")
+
+    def test_colon_path_list_is_rejected_r3(self):
+        self.doc.write_bytes(b"PATH=/bin:/home/private_account/bin\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_scp_home_is_rejected_r3(self):
+        self.doc.write_bytes(b"scp node:/home/private_account/file destination\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_docker_mount_home_is_rejected_r3(self):
+        self.doc.write_bytes(b"docker -v data:/home/private_account app\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_local_file_url_is_rejected_and_prefix_only_r3(self):
+        self.doc.write_bytes(b"file:///home/private_account/file\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), b"file://<home>/file\n")
+
     def test_image_account_is_preserved_r2(self):
         content = (b"mountPath: /home/aimem/.config/ai-memory\n"
                    b"HOME=/home/aimem\n~aimem/.config/ai-memory\n")
@@ -251,7 +293,8 @@ class DocsPrivatePaths(unittest.TestCase):
         self.assertEqual(self.run_gate().returncode, 1)
 
     def test_generic_placeholders_are_preserved(self):
-        content = b"/home/user/project /Users/alice/project ~bob/project <home>/project $HOME/project ~/project\n"
+        content = (b"/home/user/project /Users/alice/project ~bob/project "
+                   b"<home>/project $HOME/project ~/project\n")
         self.doc.write_bytes(content)
         result = self.run_gate("--fix")
         self.assertEqual(result.returncode, 0, result.stderr)

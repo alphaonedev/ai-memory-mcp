@@ -27,12 +27,21 @@ DEFAULT_ALLOW_FILE = Path(__file__).with_name("docs_private_path_allow.json")
 DEFAULT_EXCEPTIONS_FILE = Path(__file__).with_name("docs_private_path_exceptions.json")
 EXCEPTION_FIELDS = frozenset(("path", "line", "text", "sha256", "reason"))
 PLACEHOLDER = "<home>"
+ACCOUNT_NAME = r"[\w-]+(?:\.[\w-]+)*"
+NAMED_ACCOUNT = r"[^\W\d][\w-]*(?:\.[\w-]+)*"
+ACCOUNT_END = r"(?![\w-]|\.[\w-])"
 # Class (a): whole absolute home tokens, excluding embedded URL path segments.
-ABSOLUTE_HOME = re.compile(r"(?<![\w.:%/-])/(?:home|Users)/(?P<name>[\w.-]+)(?![\w.-])")
+ABSOLUTE_HOME = re.compile(
+    rf"(?<![\w.%/-])/(?:home|Users)/(?P<name>{ACCOUNT_NAME}){ACCOUNT_END}"
+)
+# Class (a), local file URLs: the scheme stays outside the replacement span.
+FILE_HOME = re.compile(
+    rf"(?<=file://)/(?:home|Users)/(?P<name>{ACCOUNT_NAME}){ACCOUNT_END}"
+)
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
-NAMED_HOME = re.compile(r"(?<![\w~])~(?P<name>[^\W\d][\w.-]*)(?=/)")
+NAMED_HOME = re.compile(rf"(?<![\w~])~(?P<name>{NAMED_ACCOUNT})(?=/)")
 # Class (c): bare names in code and prose; numeric approximations are not names.
-BARE_HOME = re.compile(r"(?<![\w~])~(?P<name>[^\W\d][\w.-]*)(?![\w./-])")
+BARE_HOME = re.compile(rf"(?<![\w~])~(?P<name>{NAMED_ACCOUNT})(?![\w/-]|\.[\w-])")
 FENCE = re.compile(r"^ {0,3}(?P<marks>`{3,}|~{3,})(?P<info>[^\r\n]*)")
 BACKTICKS = re.compile(r"`+")
 SHELL_FENCES = frozenset(("", "sh", "bash", "zsh", "shell", "console"))
@@ -126,7 +135,9 @@ def markdown_files(root: Path) -> list[Path]:
         parent = Path(directory)
         for name in dirs:
             if (parent / name).is_symlink():
-                raise ValueError("docs directory contains a symlink: " + str((parent / name).relative_to(root)))
+                raise ValueError(
+                    "docs directory contains a symlink: " + str((parent / name).relative_to(root))
+                )
         for name in names:
             if not name.endswith(".md"):
                 continue
@@ -134,7 +145,9 @@ def markdown_files(root: Path) -> list[Path]:
             if path.is_symlink():
                 raise ValueError("docs Markdown is a symlink: " + str(path.relative_to(root)))
             if not path.is_file():
-                raise ValueError("docs Markdown is not a regular file: " + str(path.relative_to(root)))
+                raise ValueError(
+                    "docs Markdown is not a regular file: " + str(path.relative_to(root))
+                )
             files.append(path)
     return sorted(files)
 
@@ -227,7 +240,8 @@ def prose_spans(text: str) -> list[tuple[int, int]]:
 def findings(text: str, allowed: frozenset[str],
              exceptions: dict[int, str] | None = None) -> tuple[list[Finding], set[int]]:
     """Return the three approved lexical classes in source order."""
-    matches = list(ABSOLUTE_HOME.finditer(text)) + list(NAMED_HOME.finditer(text))
+    matches = (list(ABSOLUTE_HOME.finditer(text)) + list(FILE_HOME.finditer(text))
+               + list(NAMED_HOME.finditer(text)))
     code = code_spans(text)
     starts = [start for start, _ in code]
     for start, end in code:
@@ -244,7 +258,7 @@ def findings(text: str, allowed: frozenset[str],
     used = set()
     lines = text.split("\n")
     for match in sorted(matches, key=lambda value: value.start()):
-        if match.re is not ABSOLUTE_HOME and match.group("name")[0].isnumeric():
+        if match.re in (NAMED_HOME, BARE_HOME) and match.group("name")[0].isnumeric():
             continue
         if match.group("name").casefold() not in allowed:
             number = bisect_left(newlines, match.start()) + 1

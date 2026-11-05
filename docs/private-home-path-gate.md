@@ -7,7 +7,10 @@ prefix; its other bytes, including Markdown hard breaks, remain unchanged.
 The gate scans Markdown below `docs/` and rejects these lexical classes:
 
 - Absolute account tokens shaped as `/home/<account>` or `/Users/<account>`,
-  with or without a following path. Embedded URL path segments are excluded.
+  with or without a following path. Colon-adjacent paths (PATH lists, scp and
+  container mounts) are included, as are local `file:///` URLs with no authority.
+  Embedded web-URL path segments are excluded. A sentence-final period is kept;
+  dots between account-name segments remain part of the account name.
 - Named-home paths shaped as `~<account>/`, wherever they appear.
 - Bare named homes shaped as `~<account>` in ordinary prose, inline code, or a
   fenced block whose language is empty, `sh`, `bash`, `zsh`, `shell`, or `console`.
@@ -49,3 +52,6 @@ Windows home paths, `/root`, and case-varied spellings of the absolute home
 prefixes are not recognized by this lexical gate. Bare named-home tokens inside
 fences for other languages are also excluded; absolute homes and named-home
 paths remain checked there.
+Percent-encoded paths and zero-width or homoglyph characters inside a home
+prefix are not decoded or normalized. File URLs with an explicit authority
+are not recognized; the local empty-authority `file:///` form is checked.
