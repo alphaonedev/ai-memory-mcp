@@ -396,3 +396,63 @@ fn crossroads_section_prescribes_the_1x3_vote_8604() {
     check_section(LABEL_FIXTURE, FIXTURE);
     check_section(LABEL_LIVE, section);
 }
+
+/// Text with `prefix` placed before the fixture section (which starts at its
+/// heading) and `suffix` after it.
+fn wrapped_fixture(prefix: &str, suffix: &str) -> String {
+    format!("{prefix}{FIXTURE}{suffix}")
+}
+
+const FENCE_LINE: &str = "```\n";
+const NEXT_SECTION_LINE: &str = "\n## Next section\n";
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn heading_after_unclosed_fence_fails_closed_8604() {
+    let text = wrapped_fixture(&format!("intro\n{FENCE_LINE}"), "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn heading_in_fence_closed_after_next_heading_fails_closed_8604() {
+    let text = wrapped_fixture(
+        &format!("intro\n{FENCE_LINE}"),
+        &format!("{NEXT_SECTION_LINE}{FENCE_LINE}"),
+    );
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "inside an open fenced code block")]
+fn heading_after_unclosed_tilde_fence_fails_closed_8604() {
+    let text = wrapped_fixture("intro\n~~~~\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "inside an open HTML comment")]
+fn heading_in_html_comment_opened_on_previous_line_fails_closed_8604() {
+    let text = wrapped_fixture("intro\n<!-- hidden\n", &format!("{NEXT_SECTION_LINE}-->\n"));
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+fn closed_fence_and_closed_comment_before_heading_still_pass_8604() {
+    let prefix = format!("intro\n{FENCE_LINE}code\n{FENCE_LINE}<!-- note -->\n<!-- a\nb -->\n");
+    let text = wrapped_fixture(&prefix, "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
+
+#[test]
+fn comment_marker_inside_earlier_fence_does_not_count_8604() {
+    let prefix = format!("{FENCE_LINE}<!-- literal\n{FENCE_LINE}");
+    let text = wrapped_fixture(&prefix, "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
+
+#[test]
+fn crlf_before_heading_still_passes_8604() {
+    let text = wrapped_fixture("intro\r\n", "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
