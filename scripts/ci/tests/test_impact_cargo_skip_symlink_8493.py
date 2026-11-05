@@ -6,15 +6,16 @@ TARGET never shows up as a change to the registered path and cargo would be
 skipped although a pin test reads the content: fail-open by omission. The
 classifier must instead force cargo and name the symlink in the reason line.
 
-Every case builds a throwaway tree under the repository's `.local-runs/`
-(impact_fixture.make_scratch) and runs the CLI with `--repo <tree>`.
+Every case builds a throwaway repository under the repository's `.local-runs/`
+(impact_fixture.make_scratch; git init plus one commit, because the classifier
+judges the top --repo resolves to, round 7) and runs the CLI with `--repo <tree>`.
 """
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 
-from impact_fixture import IMPACT_DIR, make_scratch, write_files
+from impact_fixture import IMPACT_DIR, git, make_scratch, write_files
 
 CARGO_SKIP = IMPACT_DIR / "cargo_skip.py"
 REGISTERED_DOC = "docs/ADMIN_GUIDE.md"
@@ -41,6 +42,10 @@ class SymlinkedRegisteredPath(unittest.TestCase):
         self.scratch = make_scratch()
         self.addCleanup(self.scratch.cleanup)
         self.repo = Path(self.scratch.name)
+        git(self.repo, "init", "-q", "-b", "main")
+        write_files(self.repo, {"seed.txt": "s\n"})
+        git(self.repo, "add", "--", "seed.txt")
+        git(self.repo, "commit", "-q", "-m", "seed")
 
     def test_symlinked_registered_document_forces_cargo(self):
         write_files(self.repo, {SYMLINK_TARGET: "target\n"})

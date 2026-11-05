@@ -21,7 +21,7 @@ both verdicts false.
 
 Symlink rules (#8493). The globs match file NAMES only, so a symlink would hide
 an edit to its target from every glob. Two checks run before any docs-only or
-skip verdict, with the --repo directory as the tree:
+skip verdict, with the top --repo resolves to as the tree:
 
 1. Tracked symlinks anywhere in the work tree force full CI. The top of the
    work tree is resolved with `git -C <repo> rev-parse --absolute-git-dir
@@ -198,10 +198,13 @@ def git_environment(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return {k: v for k, v in source.items() if k not in GIT_LOCAL_ENV_VARS}
 
 
-def git_output(repo: Optional[Path], args: List[str], what: str) -> bytes:
+def git_output(repo: Optional[Path], args: List[str], what: str,
+               cwd: Optional[str] = None) -> bytes:
     """Return stdout of `git [-C <repo>] <args>`; raise RuntimeError on any failure.
 
     `repo` None runs git without -C (the caller supplies --git-dir/--work-tree).
+    `cwd` sets the process cwd of the git call (git treats a cwd inside the work
+    tree as a pathspec prefix, so listings pass the top of the work tree).
 
     The message carries `what`, the return code and a sanitised head of stderr
     (one printable line); git missing or timing out is the same error path.
@@ -210,7 +213,7 @@ def git_output(repo: Optional[Path], args: List[str], what: str) -> bytes:
     try:
         res = subprocess.run(["git"] + dash_c + args,
                              capture_output=True, timeout=GIT_TIMEOUT_S,
-                             env=git_environment())
+                             env=git_environment(), cwd=cwd)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("%s did not run: %s" % (what, clean_text(str(exc)))) from exc
     if res.returncode != 0:
@@ -235,15 +238,20 @@ def first_forced_entry(listing: bytes) -> Optional[Tuple[str, str]]:
     return None
 
 
-def tracked_symlink(repo: Path) -> Optional[Tuple[str, str]]:
-    """Return (reason, path) of the first tracked symlink or gitlink around `repo`.
+def tracked_symlink(repo: Path) -> Tuple[Optional[Tuple[str, str]], str]:
+    """Return ((reason, path) or None, top) for the tracked symlink scan around `repo`.
+
+    The first element is the first tracked symlink or gitlink; `top` is the top of
+    the work tree --repo resolved to (the caller judges the same tree).
 
     The git dir and the top of the work tree are resolved in ONE call
     (`rev-parse --absolute-git-dir --show-toplevel`, two output lines), so the
     scan covers the whole tree whatever --repo names inside it and trusts only
     the repository --repo resolved to: both listings run as
-    `git --git-dir=<gitdir> --work-tree=<top>` (no -C), so a repository found
-    at the top, or a core.worktree pointing elsewhere, is never consulted. Each
+    `git --git-dir=<gitdir> --work-tree=<top>` with the process cwd set to the
+    top (never the classifier's own cwd, which git would use as a pathspec
+    prefix), so a repository found at the top, or a core.worktree pointing
+    elsewhere, is never consulted. Each
     path is taken byte for byte from git (only the one trailing newline is
     removed; a name ending in a space, tab or CR keeps it). Two listings are
     scanned: the index (`ls-files -s -z`) and the committed tree
@@ -261,10 +269,10 @@ def tracked_symlink(repo: Path) -> Optional[Tuple[str, str]]:
     scope = ["--git-dir=" + git_dir, "--work-tree=" + top]
     for args, what in ((["ls-files", "-s", "-z"], "git ls-files"),
                        (["ls-tree", "-r", "-z", "HEAD"], "git ls-tree")):
-        found = first_forced_entry(git_output(None, scope + args, what))
+        found = first_forced_entry(git_output(None, scope + args, what, cwd=top))
         if found:
-            return found
-    return None
+            return found, top
+    return None, top
 
 
 def clean_text(text: str) -> str:
@@ -303,13 +311,13 @@ def classify(section: dict, paths: List[str], event_name: str = "",
         return verdict(FALSE, FALSE, "%s %s" % (REASON_EMPTY, version))
     if repo is not None:
         try:
-            tracked = tracked_symlink(repo)
+            tracked, top = tracked_symlink(repo)
         except RuntimeError as exc:
             return verdict(FALSE, FALSE, "%s %s %s" % (REASON_ERROR, exc, version))
         if tracked:
             return verdict(FALSE, FALSE, "%s %s %s" % (
                 tracked[0], clean_text(tracked[1]), version))
-        linked = symlinked_read_path(section, repo)
+        linked = symlinked_read_path(section, Path(top))
         if linked:
             return verdict(FALSE, FALSE, "%s %s %s" % (REASON_SYMLINK, linked, version))
     for path in paths:
