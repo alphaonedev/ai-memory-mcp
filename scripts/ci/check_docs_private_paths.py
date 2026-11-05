@@ -13,7 +13,7 @@ The stored line text excludes its newline terminator.
 """
 
 import argparse
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 import hashlib
 import json
@@ -27,15 +27,22 @@ DEFAULT_ALLOW_FILE = Path(__file__).with_name("docs_private_path_allow.json")
 DEFAULT_EXCEPTIONS_FILE = Path(__file__).with_name("docs_private_path_exceptions.json")
 EXCEPTION_FIELDS = frozenset(("path", "line", "text", "sha256", "reason"))
 PLACEHOLDER = "<home>"
-# Class (a): absolute home prefixes anywhere in Markdown.
-ABSOLUTE_HOME = re.compile(r"/(?:home|Users)/(?P<name>[\w.-]+)(?=/)")
+# Class (a): whole absolute home tokens, excluding embedded URL path segments.
+ABSOLUTE_HOME = re.compile(r"(?<![\w.:%/-])/(?:home|Users)/(?P<name>[\w.-]+)(?![\w.-])")
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
 NAMED_HOME = re.compile(r"(?<![\w~])~(?P<name>[^\W\d][\w.-]*)(?=/)")
-# Class (c): bare names only in code; numeric approximations are not names.
+# Class (c): bare names in code and prose; numeric approximations are not names.
 BARE_HOME = re.compile(r"(?<![\w~])~(?P<name>[^\W\d][\w.-]*)(?![\w./-])")
 FENCE = re.compile(r"^ {0,3}(?P<marks>`{3,}|~{3,})(?P<info>[^\r\n]*)")
 BACKTICKS = re.compile(r"`+")
 SHELL_FENCES = frozenset(("", "sh", "bash", "zsh", "shell", "console"))
+# Prose-only approximations: conductor rulings d08df0ec, 727df6e5, b5b0c768.
+# These never exempt code tokens or named-home paths and are not account names.
+PROSE_APPROXIMATIONS = frozenset((
+    "Memory", "minutes", "seconds", "milliseconds", "tens", "LINEAR",
+    "line", "all", "half-day", "loader-capped", "buildable", "CPU",
+    "halved", "v78", "loader", "Peer",
+))
 EXIT_CLEAN = 0
 EXIT_FINDINGS = 1
 EXIT_USAGE = 2
@@ -197,17 +204,48 @@ def code_spans(text: str) -> list[tuple[int, int]]:
     return result
 
 
+def prose_spans(text: str) -> list[tuple[int, int]]:
+    """Locate prose lines, excluding all fenced blocks and their delimiters."""
+    result = []
+    fence_marks = ""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        match = FENCE.match(line)
+        if fence_marks:
+            if (match and match.group("marks")[0] == fence_marks[0]
+                    and len(match.group("marks")) >= len(fence_marks)
+                    and not match.group("info").strip()):
+                fence_marks = ""
+        elif match:
+            fence_marks = match.group("marks")
+        else:
+            result.append((offset, offset + len(line)))
+        offset += len(line)
+    return result
+
+
 def findings(text: str, allowed: frozenset[str],
              exceptions: dict[int, str] | None = None) -> tuple[list[Finding], set[int]]:
     """Return the three approved lexical classes in source order."""
     matches = list(ABSOLUTE_HOME.finditer(text)) + list(NAMED_HOME.finditer(text))
-    for start, end in code_spans(text):
+    code = code_spans(text)
+    starts = [start for start, _ in code]
+    for start, end in code:
         matches.extend(BARE_HOME.finditer(text, start, end))
+    for start, end in prose_spans(text):
+        for match in BARE_HOME.finditer(text, start, end):
+            index = bisect_right(starts, match.start()) - 1
+            if index >= 0 and match.end() <= code[index][1]:
+                continue
+            if match.group("name") not in PROSE_APPROXIMATIONS:
+                matches.append(match)
     newlines = [index for index, char in enumerate(text) if char == "\n"]
     result = []
     used = set()
     lines = text.split("\n")
     for match in sorted(matches, key=lambda value: value.start()):
+        if match.re is not ABSOLUTE_HOME and match.group("name")[0].isnumeric():
+            continue
         if match.group("name").casefold() not in allowed:
             number = bisect_left(newlines, match.start()) + 1
             if (match.re is BARE_HOME and exceptions and number in exceptions

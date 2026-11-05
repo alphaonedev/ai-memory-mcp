@@ -6,14 +6,20 @@ prefix; its other bytes, including Markdown hard breaks, remain unchanged.
 
 The gate scans Markdown below `docs/` and rejects these lexical classes:
 
-- Absolute account prefixes shaped as `/home/<account>/` or `/Users/<account>/`.
+- Absolute account tokens shaped as `/home/<account>` or `/Users/<account>`,
+  with or without a following path. Embedded URL path segments are excluded.
 - Named-home paths shaped as `~<account>/`, wherever they appear.
-- Bare named homes shaped as `~<account>` inside inline code or a fenced block
-  whose language is empty, `sh`, `bash`, `zsh`, `shell`, or `console`.
+- Bare named homes shaped as `~<account>` in ordinary prose, inline code, or a
+  fenced block whose language is empty, `sh`, `bash`, `zsh`, `shell`, or `console`.
 
-Numeric approximations and prose remain unchanged. Nameless `~/` and `$HOME`
+Numeric approximations remain unchanged. The sixteen established prose estimates
+listed in `PROSE_APPROXIMATIONS` are exempt only as whole tokens in ordinary
+prose. That set does not exempt inline code, shell-class fences, or named-home
+paths, and is separate from the generic-account allowlist. Nameless `~/` and `$HOME`
 do not reveal an account. Generic account names are explicit data in
 `scripts/ci/docs_private_path_allow.json`; they are not inferred from prose.
+The image account `aimem` and the illustrative accounts `u`, `op`, `operator`, `a`, and `ab`
+are included so executable examples and historical illustrative text survive.
 
 Three diagram estimates have narrowly scoped entries in
 `scripts/ci/docs_private_path_exceptions.json`. Each entry records the path,
@@ -39,3 +45,7 @@ to write when an exception is unused. Symlinked documentation is refused.
 CI runs this gate immediately after docs-vs-SSOT in
 `.github/workflows/c8-precheck.yml`. It is separate from the secrets scanner.
 Mount paths and other leak classes are tracked separately under issue #8493.
+Windows home paths, `/root`, and case-varied spellings of the absolute home
+prefixes are not recognized by this lexical gate. Bare named-home tokens inside
+fences for other languages are also excluded; absolute homes and named-home
+paths remain checked there.

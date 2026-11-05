@@ -46,6 +46,88 @@ class DocsPrivatePaths(unittest.TestCase):
         self.doc.write_bytes(b"`/Users/private_account/project`\n")
         self.assertEqual(self.run_gate().returncode, 1)
 
+    def test_url_home_segment_is_preserved_r2(self):
+        content = (b"https://example.com/news/home/20240716489550/en/story\n"
+                   b"https://example.com/Users/private_account/story\n"
+                   b"[source](https://example.com/news/home/2024/en/a)\n")
+        self.doc.write_bytes(content)
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_image_account_is_preserved_r2(self):
+        content = (b"mountPath: /home/aimem/.config/ai-memory\n"
+                   b"HOME=/home/aimem\n~aimem/.config/ai-memory\n")
+        self.doc.write_bytes(content)
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_illustrative_accounts_are_preserved_r2(self):
+        content = (b"/home/u/record /home/op/record /Users/operator/record\n"
+                   b"`~u` `~op` `~operator`\n")
+        self.doc.write_bytes(content)
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_sanitization_overlap_examples_are_preserved_r2(self):
+        content = b"sensitive value (`/home/a` inside `/home/ab`)\n"
+        self.doc.write_bytes(content)
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_no_tail_absolute_home_in_prose_is_rejected_r2(self):
+        self.doc.write_bytes(b"home /home/private_account and done\n")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("/home/private_account", result.stdout)
+
+    def test_no_tail_absolute_home_in_inline_code_is_rejected_r2(self):
+        self.doc.write_bytes(b"home `/home/private_account`\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_no_tail_macos_home_at_end_is_rejected_r2(self):
+        self.doc.write_bytes(b"/Users/private_account")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_absolute_home_delimiters_preserved_r2(self):
+        content = b"(/home/private_account), '/Users/private_account'; done\n"
+        self.doc.write_bytes(content)
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.doc.read_bytes(), b"(<home>), '<home>'; done\n")
+
+    def test_bare_named_home_in_prose_is_rejected_r2(self):
+        self.doc.write_bytes(b"home ~private_account and done\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_prose_approximation_has_no_code_exemption_r2(self):
+        self.doc.write_bytes(b"home `~minutes`\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_prose_approximation_has_no_path_exemption_r2(self):
+        self.doc.write_bytes(b"home ~minutes/project\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_all_prose_approximations_require_code_and_path_checks_r2(self):
+        names = (
+            "Memory", "minutes", "seconds", "milliseconds", "tens", "LINEAR",
+            "line", "all", "half-day", "loader-capped", "buildable", "CPU",
+            "halved", "v78", "loader", "Peer",
+        )
+        for name in names:
+            for content in (f"`~{name}`\n", f"```sh\n~{name}\n```\n",
+                            f"~{name}/project\n"):
+                with self.subTest(name=name, content=content):
+                    self.doc.write_text(content)
+                    self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_prose_approximation_matches_whole_token_r2(self):
+        self.doc.write_bytes(b"home ~minutes_extra and done\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
     def test_named_tilde_home_is_rejected(self):
         self.doc.write_bytes(b"`~private_account/project`\n")
         self.assertEqual(self.run_gate().returncode, 1)
@@ -85,6 +167,13 @@ class DocsPrivatePaths(unittest.TestCase):
                    "bare ~/ and generic ~alice/ remain\n").encode()
         self.doc.write_bytes(content)
         self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_unicode_numeric_approximations_are_preserved_r2(self):
+        content = "ratios ~⅓ ~½ ~Ⅳ; `~⅓` and `~½/second`\n".encode()
+        self.doc.write_bytes(content)
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.doc.read_bytes(), content)
 
     def test_sixteen_historical_prose_lines_are_unchanged(self):
