@@ -24,20 +24,23 @@ an edit to its target from every glob. Two checks run before any docs-only or
 skip verdict, with the --repo directory as the tree:
 
 1. Tracked symlinks anywhere in the work tree force full CI. The top of the
-   work tree is resolved with `git -C <repo> rev-parse --show-toplevel` and
-   scanned whatever --repo names inside it, from two listings: the index
+   work tree is resolved with `git -C <repo> rev-parse --absolute-git-dir
+   --show-toplevel` and scanned whatever --repo names inside it, as
+   `git --git-dir=<gitdir> --work-tree=<top>` (never re-discovered at the top),
+   from two listings: the index
    (`git ls-files -s -z`) and the committed tree (`git ls-tree -r -z HEAD`).
    The index is scanned first, so a symlink found there is reported before the
    HEAD-tree listing runs. A mode 120000 entry in either gives both verdicts
    false with reason tracked-symlink-full-ci naming the first path. A mode
    160000 entry (a gitlink; no submodule checkout is needed) is treated the
    same way with reason tracked-gitlink-full-ci, so a gitlink under a docs glob
-   cannot keep a docs-only verdict. Every git call runs with the
+   cannot keep a docs-only verdict. This costs a full run even for a symlink
+   outside every test_read_globs entry; the classifier never expands a
+   wildcard glob or walks the tree. Every git call runs with the
    repository-locating variables of `git rev-parse --local-env-vars` removed
    from its environment (GIT_LOCAL_ENV_VARS), so an inherited GIT_DIR,
-   GIT_WORK_TREE or GIT_INDEX_FILE cannot point the scan at another repository. This costs a full run even
-   for a symlink outside every test_read_globs entry; the classifier never
-   expands a wildcard glob or walks the tree.
+   GIT_WORK_TREE or GIT_INDEX_FILE cannot point the scan at another
+   repository.
 2. Defence in depth: a path named by test_read_globs (the literal path, or the
    literal directory prefix of a wildcard glob) that is a symlink in the
    working tree (lstat, never followed) gives both false with reason
@@ -49,10 +52,11 @@ A missing path is not a symlink and keeps the normal verdict. A bare
 repository, a directory that is not a repository, git missing, a git timeout
 or a nonzero git exit all fail closed: both verdicts false with reason
 classifier-error-fail-closed carrying the return code and the head of stderr.
-An unborn HEAD with nothing staged takes that path (the HEAD-tree listing exits
-nonzero); an unborn HEAD with a staged symlink or gitlink reports
-tracked-symlink-full-ci or tracked-gitlink-full-ci instead, because the index
-scan finds it before the HEAD-tree listing runs.
+An unborn HEAD with no staged symlink or gitlink (nothing staged, or only
+regular files) takes that path (the HEAD-tree listing exits nonzero); an
+unborn HEAD with a staged symlink or gitlink reports tracked-symlink-full-ci
+or tracked-gitlink-full-ci instead, because the index scan finds it
+before the HEAD-tree listing runs.
 """
 import argparse
 import os
@@ -194,14 +198,17 @@ def git_environment(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return {k: v for k, v in source.items() if k not in GIT_LOCAL_ENV_VARS}
 
 
-def git_output(repo: Path, args: List[str], what: str) -> bytes:
-    """Return stdout of `git -C <repo> <args>`; raise RuntimeError on any failure.
+def git_output(repo: Optional[Path], args: List[str], what: str) -> bytes:
+    """Return stdout of `git [-C <repo>] <args>`; raise RuntimeError on any failure.
+
+    `repo` None runs git without -C (the caller supplies --git-dir/--work-tree).
 
     The message carries `what`, the return code and a sanitised head of stderr
     (one printable line); git missing or timing out is the same error path.
     """
+    dash_c = [] if repo is None else ["-C", str(repo)]
     try:
-        res = subprocess.run(["git", "-C", str(repo)] + args,
+        res = subprocess.run(["git"] + dash_c + args,
                              capture_output=True, timeout=GIT_TIMEOUT_S,
                              env=git_environment())
     except (OSError, subprocess.SubprocessError) as exc:
@@ -231,21 +238,30 @@ def first_forced_entry(listing: bytes) -> Optional[Tuple[str, str]]:
 def tracked_symlink(repo: Path) -> Optional[Tuple[str, str]]:
     """Return (reason, path) of the first tracked symlink or gitlink around `repo`.
 
-    The top of the work tree is resolved first (`rev-parse --show-toplevel`),
-    so the scan covers the whole tree whatever --repo names inside it. The top
+    The git dir and the top of the work tree are resolved in ONE call
+    (`rev-parse --absolute-git-dir --show-toplevel`, two output lines), so the
+    scan covers the whole tree whatever --repo names inside it and trusts only
+    the repository --repo resolved to: both listings run as
+    `git --git-dir=<gitdir> --work-tree=<top>` (no -C), so a repository found
+    at the top, or a core.worktree pointing elsewhere, is never consulted. Each
     path is taken byte for byte from git (only the one trailing newline is
-    removed; a name ending in a space, tab or CR keeps it). Two
-    listings are scanned from that top: the index (`ls-files -s -z`) and the
-    committed tree (`ls-tree -r -z HEAD`), so a missing or empty index cannot
-    hide a symlink HEAD tracks. Raises RuntimeError when git is missing, times
-    out or exits nonzero: a bare repository, a directory that is not a
-    repository and an unborn HEAD all fail closed.
+    removed; a name ending in a space, tab or CR keeps it). Two listings are
+    scanned: the index (`ls-files -s -z`) and the committed tree
+    (`ls-tree -r -z HEAD`), so a missing or empty index cannot hide a symlink
+    HEAD tracks. Raises RuntimeError when git is missing, times out or exits
+    nonzero: a bare repository, a directory that is not a repository and an
+    unborn HEAD with nothing staged as a symlink or gitlink all fail closed.
     """
-    top_raw = git_output(repo, ["rev-parse", "--show-toplevel"], "git rev-parse")
-    top = Path(top_raw.removesuffix(b"\n").decode("utf-8", "surrogateescape"))
+    raw = git_output(repo, ["rev-parse", "--absolute-git-dir", "--show-toplevel"],
+                     "git rev-parse")
+    lines = raw.removesuffix(b"\n").split(b"\n")
+    if len(lines) != 2:
+        raise RuntimeError("git rev-parse returned %d lines, expected 2" % len(lines))
+    git_dir, top = (line.decode("utf-8", "surrogateescape") for line in lines)
+    scope = ["--git-dir=" + git_dir, "--work-tree=" + top]
     for args, what in ((["ls-files", "-s", "-z"], "git ls-files"),
                        (["ls-tree", "-r", "-z", "HEAD"], "git ls-tree")):
-        found = first_forced_entry(git_output(top, args, what))
+        found = first_forced_entry(git_output(None, scope + args, what))
         if found:
             return found
     return None
@@ -276,8 +292,8 @@ def classify(section: dict, paths: List[str], event_name: str = "",
              base_ref: str = "", repo: Optional[Path] = None) -> Dict[str, str]:
     """Return the three output values for the changed `paths`.
 
-    With `repo` set, any tracked symlink or a symlinked test_read_globs path forces
-    cargo (#8493); a git failure fails closed.
+    With `repo` set, any tracked symlink, any tracked gitlink or a symlinked
+    test_read_globs path forces cargo (#8493); a git failure fails closed.
     """
     version = "cargo_skip-rules-v%s" % section["version"]
     forced = full_ci_reason(section, event_name, base_ref)
@@ -340,7 +356,7 @@ def emit(values: Dict[str, str]) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Classify the diff; exit 0 with a fail-closed verdict on error, exit 1 on a wrong rules shape."""
+    """Classify the diff; exit 0 with a fail-closed verdict on error, 1 on a bad rules shape."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--rules", default=str(common.RULES_PATH))
     parser.add_argument("--repo", default=".")

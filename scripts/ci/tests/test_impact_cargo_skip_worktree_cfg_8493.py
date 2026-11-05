@@ -68,9 +68,21 @@ class WorktreeConfig(unittest.TestCase):
         self.assert_forced(run_cli(linked, DOCS_CHANGE))
 
     def test_docstring_states_unborn_head_qualifier(self):
-        doc = cargo_skip.tracked_symlink.__doc__
+        doc = " ".join(cargo_skip.tracked_symlink.__doc__.split())
         self.assertIn("an unborn HEAD with nothing staged as a symlink or gitlink", doc)
         self.assertIn("--absolute-git-dir", doc)
+        self.assertNotIn("and an unborn HEAD all fail closed", doc)
+
+    def test_classify_docstring_names_gitlinks(self):
+        doc = " ".join(cargo_skip.classify.__doc__.split())
+        self.assertIn("tracked gitlink", doc)
+
+    def test_module_docstring_orders_and_names_the_error_path(self):
+        doc = " ".join(cargo_skip.__doc__.split())
+        scan = doc.index("This costs a full run")
+        self.assertLess(doc.index("cannot keep a docs-only verdict"), scan)
+        self.assertLess(scan, doc.index("Every git call runs with"))
+        self.assertIn("with no staged symlink or gitlink", doc)
 
 
 if __name__ == "__main__":
