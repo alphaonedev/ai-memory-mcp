@@ -43,6 +43,19 @@ pub(crate) use private_file::write_private_export;
 /// post-reflect auto-export hook (#1558 batch 6).
 pub(crate) const REFLECTIONS_SUBDIR: &str = "reflections";
 
+/// Maximum input characters included per stored value in export messages.
+const EXPORT_DIAGNOSTIC_MAX_CHARS: usize = 128;
+
+/// Bound allocation before Debug escaping, preserving UTF-8 boundaries.
+fn export_diagnostic(value: &str) -> String {
+    let prefix: String = value.chars().take(EXPORT_DIAGNOSTIC_MAX_CHARS).collect();
+    if prefix.len() < value.len() {
+        format!("{prefix:?} [truncated; original_bytes={}]", value.len())
+    } else {
+        format!("{prefix:?}")
+    }
+}
+
 /// CLI args for `ai-memory export-reflections`.
 #[derive(Args, Debug, Clone)]
 pub struct ExportReflectionsArgs {
@@ -125,8 +138,9 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace).with_context(
             || {
                 format!(
-                    "memory {} namespace {:?}: refusing export path",
-                    mem.id, mem.namespace
+                    "memory {} namespace {}: refusing export path",
+                    export_diagnostic(&mem.id),
+                    export_diagnostic(&mem.namespace)
                 )
             },
         )?);
@@ -134,15 +148,26 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
+        let escaped_id = export_diagnostic(&mem.id);
+        // OWNERSHIP-05/15: compare borrowed, bounded output; keep clean paths exact.
+        let unquoted = escaped_id
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'));
+        let printed_id = if unquoted == Some(mem.id.as_str()) {
+            mem.id.as_str()
+        } else {
+            &escaped_id
+        };
+        let diagnostic_path = ns_dir.join(format!("{printed_id}.{}", format.extension()));
         private_file::write_private_export_in_batch(
             &path,
             payload.as_bytes(),
             &mut swept_directories,
         )
-        .with_context(|| crate::errors::msg::writing(path.display()))?;
+        .with_context(|| crate::errors::msg::writing(diagnostic_path.display()))?;
         summary.written += 1;
         if !args.quiet {
-            writeln!(out.stdout, "wrote {}", path.display())?;
+            writeln!(out.stdout, "wrote {}", diagnostic_path.display())?;
         }
     }
     writeln!(
@@ -352,21 +377,43 @@ pub(crate) fn render_payload(
 }
 
 /// Render the YAML-frontmatter markdown body. Frontmatter fields are
-/// emitted in a stable order (memory_id, namespace, reflection_depth,
+/// emitted in a stable order (memory_id, namespace, title, reflection_depth,
 /// attest_level, created_at, agent_id) followed by a sequence of
-/// `reflects_on` edges. The body of the reflection follows after a
+/// `reflects_on` edges. Every stored string uses the shared YAML encoder.
+/// Both `created_at` fields retain reader-safe plain RFC3339 timestamp scalars;
+/// `reflection_depth` remains an integer, matching its schema.
+/// The body of the reflection follows after a
 /// blank line, exactly as it was stored.
 fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> String {
+    use YamlScalarKind::{StoredString, Timestamp};
     let agent_id = agent_id_of(mem);
     let mut out = String::with_capacity(256 + mem.content.len());
     out.push_str("---\n");
-    out.push_str(&format!("memory_id: {}\n", mem.id));
-    out.push_str(&format!("namespace: {}\n", yaml_scalar(&mem.namespace)));
-    out.push_str(&format!("title: {}\n", yaml_scalar(&mem.title)));
+    out.push_str(&format!(
+        "memory_id: {}\n",
+        yaml_scalar(&mem.id, StoredString)
+    ));
+    out.push_str(&format!(
+        "namespace: {}\n",
+        yaml_scalar(&mem.namespace, StoredString)
+    ));
+    out.push_str(&format!(
+        "title: {}\n",
+        yaml_scalar(&mem.title, StoredString)
+    ));
     out.push_str(&format!("reflection_depth: {}\n", mem.reflection_depth));
-    out.push_str(&format!("attest_level: {attest_level}\n"));
-    out.push_str(&format!("created_at: {}\n", mem.created_at));
-    out.push_str(&format!("agent_id: {}\n", yaml_scalar(agent_id)));
+    out.push_str(&format!(
+        "attest_level: {}\n",
+        yaml_scalar(attest_level, StoredString)
+    ));
+    out.push_str(&format!(
+        "created_at: {}\n",
+        yaml_scalar(&mem.created_at, Timestamp)
+    ));
+    out.push_str(&format!(
+        "agent_id: {}\n",
+        yaml_scalar(agent_id, StoredString)
+    ));
     out.push_str("reflects_on:\n");
     if edges.is_empty() {
         out.push_str("  []\n");
@@ -374,7 +421,9 @@ fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -
         for e in edges {
             out.push_str(&format!(
                 "  - target_id: {}\n    attest_level: {}\n    created_at: {}\n",
-                e.target_id, e.attest_level, e.created_at,
+                yaml_scalar(&e.target_id, StoredString),
+                yaml_scalar(&e.attest_level, StoredString),
+                yaml_scalar(&e.created_at, Timestamp),
             ));
         }
     }
@@ -406,21 +455,130 @@ fn render_json(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> St
     serde_json::to_string_pretty(&env).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
-/// Conservatively quote a YAML scalar. We escape only the obviously
-/// dangerous shapes (containing `:` `#` `"` `'` or starting with `-`
-/// `?` `*` `&`); everything else is emitted bare. The shape is
-/// deliberately simple — operators read these files; we never
-/// round-trip them back through a YAML parser, so over-engineering
-/// the escape is dead weight.
-fn yaml_scalar(s: &str) -> String {
-    let needs_quote = s.is_empty()
-        || s.starts_with(['-', '?', '*', '&', '!', '|', '>', '\'', '"', '%', '@', '`'])
-        || s.contains(':')
-        || s.contains('#')
-        || s.contains('\n');
+/// API-09: distinguish string fields from schema-defined timestamps.
+#[derive(Clone, Copy)]
+enum YamlScalarKind {
+    StoredString,
+    Timestamp,
+}
+
+/// Unicode 18 `General_Category=Cf`, including supplementary-plane controls.
+/// Source: unicode.org/Public/18.0.0/ucd/extracted/DerivedGeneralCategory.txt.
+/// CONST-01: this classification depends only on the scalar value.
+const fn is_yaml_format_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// Named conservative plain-string alphabet for YAML 1.1 and 1.2 readers.
+const SAFE_PLAIN_PUNCTUATION: &[u8] = b" -_./";
+const SAFE_PLAIN_RESERVED_WORDS: &[&str] = &[
+    "null", "~", "true", "false", "yes", "no", "on", "off", "y", "n",
+];
+// CONST-01: the canonical lowercase UUID form is exactly 8-4-4-4-12 hex digits.
+const CANONICAL_UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+const YAML_TIMESTAMP_YEARS: std::ops::RangeInclusive<i32> = 1..=9999;
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+
+/// OWNERSHIP-05: validate borrowed UUID groups without parsing or reformatting.
+fn yaml_canonical_uuid(s: &str) -> bool {
+    let mut groups = s.split('-');
+    for length in CANONICAL_UUID_GROUP_LENGTHS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != length
+            || !group
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// TOOL-03: plain strings are canonical lowercase UUIDs or letter-leading safe
+/// ASCII values, with slash allowed only inside the latter form.
+/// OWNERSHIP-05: inspect borrowed bytes without allocating a lowercase copy.
+/// R3: reader-specific regressions extend the test table, not this predicate.
+fn yaml_safe_plain(s: &str) -> bool {
+    yaml_canonical_uuid(s)
+        || (s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && s.trim() == s
+            && !s.ends_with('/')
+            && s.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || SAFE_PLAIN_PUNCTUATION.contains(&byte))
+            && !SAFE_PLAIN_RESERVED_WORDS
+                .iter()
+                .any(|word| s.eq_ignore_ascii_case(word)))
+}
+
+/// Quote strings outside `SAFE_PLAIN` and escape controls without line folding.
+/// U+FFFE/U+FFFF also require escapes because YAML excludes them from printable text.
+/// Schema timestamps retain plain bytes only for years 0001-9999 and seconds 00-59.
+fn yaml_scalar(s: &str, kind: YamlScalarKind) -> String {
+    use chrono::{Datelike as _, Timelike as _};
+    use std::fmt::Write as _;
+
+    let plain_timestamp = matches!(kind, YamlScalarKind::Timestamp)
+        && s.is_ascii()
+        && s.trim() == s
+        && !s.bytes().any(|byte| byte.is_ascii_control())
+        && chrono::DateTime::parse_from_rfc3339(s).is_ok_and(|timestamp| {
+            // Chrono encodes a leap second as second 59 with excess nanoseconds.
+            YAML_TIMESTAMP_YEARS.contains(&timestamp.year())
+                && timestamp.nanosecond() < NANOS_PER_SECOND
+        });
+    let needs_quote = !yaml_safe_plain(s) && !plain_timestamp;
     if needs_quote {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
+        let mut escaped = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => escaped.push_str("\\\""),
+                '\\' => escaped.push_str("\\\\"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                c if c.is_control()
+                    || is_yaml_format_control(c)
+                    || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}') =>
+                {
+                    // YAML 1.2 §5.7: \u has exactly four hex digits; \U has eight.
+                    // ERRORS-19: fmt::Write for String is infallible.
+                    let _ = if u16::try_from(c).is_ok() {
+                        write!(escaped, "\\u{:04x}", u32::from(c))
+                    } else {
+                        write!(escaped, "\\U{:08x}", u32::from(c))
+                    };
+                }
+                c => escaped.push(c),
+            }
+        }
+        escaped.push('"');
+        escaped
     } else {
         s.to_string()
     }
@@ -474,6 +632,141 @@ mod tests {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
         }
+    }
+
+    // R3 class ratchet: add reader-specific forms here, never a production denylist arm.
+    // Columns: stored value, safe plain string, created_at-only timestamp exception.
+    const YAML_SCHEMA_FORMS_8605_R7: &[(&str, bool, bool)] = &[
+        ("", false, false),
+        ("~", false, false),
+        ("null", false, false),
+        ("NULL", false, false),
+        ("NuLl", false, false),
+        ("true", false, false),
+        ("FALSE", false, false),
+        ("TrUe", false, false),
+        ("yes", false, false),
+        ("NO", false, false),
+        ("oN", false, false),
+        ("Off", false, false),
+        ("2026", false, false),
+        ("0", false, false),
+        ("01", false, false),
+        ("184467440737095516160", false, false),
+        ("1.0", false, false),
+        (".5", false, false),
+        ("5.", false, false),
+        ("0x1f", false, false),
+        ("0o17", false, false),
+        ("1e3", false, false),
+        ("1E-3", false, false),
+        (".inf", false, false),
+        (".INF", false, false),
+        (".nan", false, false),
+        (".NaN", false, false),
+        ("+1", false, false),
+        ("-1", false, false),
+        ("+word", false, false),
+        ("-word", false, false),
+        ("0b101", false, false),
+        ("0b0", false, false),
+        ("1_000", false, false),
+        ("0x_1F", false, false),
+        ("1_0.5", false, false),
+        ("1:30", false, false),
+        ("190:20:30.15", false, false),
+        ("2026-11-05", false, false),
+        ("=", false, false),
+        ("<<", false, false),
+        ("y", false, false),
+        ("Y", false, false),
+        ("n", false, false),
+        ("N", false, false),
+        ("plain title", true, false),
+        ("source-id", true, false),
+        ("unsigned", true, false),
+        ("plain-id", true, false),
+        ("yaml-export", true, false),
+        ("ai:test", false, false),
+        ("2026-01-01T00:00:00Z", false, true),
+        ("\u{fffe}", false, false),
+        ("\u{ffff}", false, false),
+        ("123e4567-e89b-42d3-a456-426614174000", true, false),
+        ("abcdef01-2345-4678-9abc-def012345678", true, false),
+        ("123E4567-E89B-42D3-A456-426614174000", false, false),
+        ("123e4567-e89b-42d3-a456-42661417400", false, false),
+        ("123e4567-e89b-42d3-a456-42661417400g", false, false),
+        ("team/alpha", true, false),
+        ("/team", false, false),
+        ("team/", false, false),
+        ("What's next?", false, false),
+        ("lesson (draft)", false, false),
+        ("Café notes", false, false),
+        ("1234-12-12", false, false),
+        ("12:34:56", false, false),
+        ("1e5", false, false),
+        ("2026-06-30T23:59:60Z", false, false),
+        ("0000-01-01T00:00:00Z", false, false),
+        ("0001-01-01T00:00:00Z", false, true),
+        ("9999-12-31T23:59:59Z", false, true),
+    ];
+    const YAML_ORACLE_PREFIX_8605_R7: &str = "YAML_ORACLE_8605_R7 ";
+
+    #[test]
+    fn yaml_schema_table_8605_r7() {
+        let mut failures = Vec::new();
+        for &(value, plain_string, timestamp) in YAML_SCHEMA_FORMS_8605_R7 {
+            let mut mem = make_reflection(value, 0, value, "body\n", value);
+            mem.id = value.into();
+            mem.created_at = value.into();
+            let edges = [ReflectsOnEdge {
+                target_id: value.into(),
+                attest_level: value.into(),
+                created_at: value.into(),
+            }];
+            let document = render_markdown(&mem, &edges, value);
+            let header = document
+                .strip_prefix("---\n")
+                .unwrap()
+                .split_once("\n---\n")
+                .unwrap()
+                .0;
+            // The YAML 1.1 proof consumes these exact renderer bytes, not a second encoder.
+            println!(
+                "{YAML_ORACLE_PREFIX_8605_R7}{}",
+                serde_json::json!({
+                    "value": value, "plain_string": plain_string,
+                    "timestamp": timestamp, "header": header,
+                })
+            );
+            let Ok(parsed) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(header) else {
+                failures.push(format!("parser rejected {value:?}"));
+                continue;
+            };
+            let edge = &parsed["reflects_on"][0];
+            for (prefix, stored, timestamp_site) in [
+                ("memory_id: ", &parsed["memory_id"], false),
+                ("namespace: ", &parsed["namespace"], false),
+                ("title: ", &parsed["title"], false),
+                ("attest_level: ", &parsed["attest_level"], false),
+                ("created_at: ", &parsed["created_at"], true),
+                ("agent_id: ", &parsed["agent_id"], false),
+                ("  - target_id: ", &edge["target_id"], false),
+                ("    attest_level: ", &edge["attest_level"], false),
+                ("    created_at: ", &edge["created_at"], true),
+            ] {
+                let scalar = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .unwrap();
+                let expected_plain = plain_string || (timestamp && timestamp_site);
+                if stored.as_str() != Some(value) || scalar.starts_with('"') == expected_plain {
+                    failures.push(format!("{prefix}{value:?}"));
+                }
+            }
+            assert_eq!(parsed["reflection_depth"].as_i64(), Some(0));
+        }
+        assert!(failures.is_empty(), "YAML schema table: {failures:?}");
     }
 
     #[test]
@@ -559,13 +852,15 @@ mod tests {
 
     #[test]
     fn render_markdown_carries_frontmatter_and_edges() {
-        let mem = make_reflection(
+        let mut mem = make_reflection(
             "team/alpha",
             2,
-            "lesson learned",
+            "What's next?",
             "Body line.\n",
             "agent-without-colon",
         );
+        mem.id = "123e4567-e89b-42d3-a456-426614174000".into();
+        mem.created_at = "2026-01-03T00:00:00Z".into();
         let edges = vec![
             ReflectsOnEdge {
                 target_id: "src-1".into(),
@@ -579,16 +874,28 @@ mod tests {
             },
         ];
         let s = render_markdown(&mem, &edges, "signed");
-        assert!(s.starts_with("---\n"));
-        assert!(s.contains(&format!("memory_id: {}\n", mem.id)));
-        assert!(s.contains("namespace: team/alpha\n"));
-        assert!(s.contains("reflection_depth: 2\n"));
-        assert!(s.contains("attest_level: signed\n"));
-        // Bare scalar (no quotes) when value has no YAML-unsafe chars.
-        assert!(s.contains("agent_id: agent-without-colon\n"));
-        assert!(s.contains("  - target_id: src-1\n"));
-        assert!(s.contains("    attest_level: signed\n"));
-        assert!(s.ends_with("Body line.\n"));
+        // TEST-02: pin real identifier bytes and the approved free-text quoting.
+        assert_eq!(
+            s,
+            concat!(
+                "---\n",
+                "memory_id: 123e4567-e89b-42d3-a456-426614174000\n",
+                "namespace: team/alpha\n",
+                "title: \"What's next?\"\n",
+                "reflection_depth: 2\n",
+                "attest_level: signed\n",
+                "created_at: 2026-01-03T00:00:00Z\n",
+                "agent_id: agent-without-colon\n",
+                "reflects_on:\n",
+                "  - target_id: src-1\n",
+                "    attest_level: unsigned\n",
+                "    created_at: 2026-01-01T00:00:00Z\n",
+                "  - target_id: src-2\n",
+                "    attest_level: signed\n",
+                "    created_at: 2026-01-02T00:00:00Z\n",
+                "---\n\nBody line.\n",
+            )
+        );
     }
 
     #[test]
