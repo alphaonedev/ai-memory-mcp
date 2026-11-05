@@ -36,11 +36,65 @@ class DocsPrivatePaths(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
 
-    def test_linux_path_reports_file_line_and_prefix(self):
+    def test_nested_normalized_home_roots_r4(self):
+        roots = ("/var/home", "/usr/home", "/export/home", "/mnt/c/Users",
+                 "/System/Volumes/Data/Users", "../home", "local/home",
+                 "/var/./home", "/var/other/../home", "/home/./",
+                 "/home/removed/../")
+        for root in roots:
+            with self.subTest(root=root):
+                self.doc.write_text(root.rstrip("/") + "/private_account/file\n")
+                self.assertEqual(self.run_gate().returncode, 1)
+                self.assertEqual(self.run_gate("--fix").returncode, 0)
+                self.assertEqual(self.doc.read_text(), "<home>/file\n")
+                self.assertEqual(self.run_gate().returncode, 0)
+
+    def test_diagnostics_never_echo_matched_account_r4(self):
+        self.doc.write_text("/home/private_account/file\n~private_account\n")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("private_account", result.stdout + result.stderr)
+        self.assertIn(DOC + ":1: private-home-prefix", result.stdout)
+        self.assertIn(DOC + ":2: private-home-prefix", result.stdout)
+
+    def test_nested_named_home_spans_merge_without_residue_r4(self):
+        self.doc.write_text("~private_account/home/second_private/file\n")
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_text(), "<home>/file\n")
+        self.assertEqual(self.run_gate().returncode, 0)
+
+    def test_escaped_and_invisible_account_is_fully_redacted_r4(self):
+        names = (r"private\_account", "private\u200baccount", "private\u200caccount",
+                 "private\u200daccount", "private\ufeffaccount", "private_account\u200b")
+        for name in names:
+            for root in ("/home/", "~", "/var/home/"):
+                with self.subTest(root=root, name=name):
+                    self.doc.write_text(root + name + "/file\n")
+                    self.assertEqual(self.run_gate().returncode, 1)
+                    self.assertEqual(self.run_gate("--fix").returncode, 0)
+                    self.assertEqual(self.doc.read_text(), "<home>/file\n")
+                    self.assertEqual(self.run_gate().returncode, 0)
+
+    def test_shell_fence_languages_are_case_insensitive_r4(self):
+        for language in ("Bash", "SH", "Console", "ZsH", "Shell"):
+            with self.subTest(language=language):
+                self.doc.write_text(f"```{language}\n~private_account\n```\n")
+                self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_historical_install_owner_and_group_are_placeholders_r4(self):
+        relative = ("docs/v0.7.0/test-campaign-2026-05-22-release-gate-final/"
+                    "track-a-build-install-results.md")
+        rows = [line.split() for line in (REPO / relative).read_text().splitlines()
+                if line.startswith("lrwx")]
+        self.assertTrue(rows, "the historical install listing must remain present")
+        for fields in rows:
+            self.assertEqual(fields[2:4], ["<user>", "<user>"])
+
+    def test_linux_path_reports_file_line_and_class(self):
         self.doc.write_bytes(b"header\n/home/private_account/project/file\n")
         result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(DOC + ":2: /home/private_account", result.stdout)
+        self.assertIn(DOC + ":2: private-home-prefix", result.stdout)
 
     def test_macos_path_is_rejected(self):
         self.doc.write_bytes(b"`/Users/private_account/project`\n")
@@ -124,7 +178,7 @@ class DocsPrivatePaths(unittest.TestCase):
         self.doc.write_bytes(b"home /home/private_account and done\n")
         result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("/home/private_account", result.stdout)
+        self.assertIn("private-home-prefix", result.stdout)
 
     def test_no_tail_absolute_home_in_inline_code_is_rejected_r2(self):
         self.doc.write_bytes(b"home `/home/private_account`\n")
@@ -194,7 +248,7 @@ class DocsPrivatePaths(unittest.TestCase):
         self.doc.write_bytes(b"``literal ` then\n~private_account``\n")
         result = self.run_gate()
         self.assertEqual(result.returncode, 1)
-        self.assertIn(DOC + ":2: ~private_account", result.stdout)
+        self.assertIn(DOC + ":2: private-home-prefix", result.stdout)
 
     def test_tilde_fence_and_longer_fence(self):
         self.doc.write_bytes(b"~~~~bash\n~~~\n~private_account\n~~~~\n")

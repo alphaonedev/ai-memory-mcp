@@ -80,7 +80,7 @@ the README pins this exact byte stream.
 
 ```
 $ ls -la /opt/homebrew/bin/ai-memory
-lrwxr-xr-x@ 1 fate  admin  64 May 18 23:03 /opt/homebrew/bin/ai-memory
+lrwxr-xr-x@ 1 <user>  <user>  64 May 18 23:03 /opt/homebrew/bin/ai-memory
   -> <home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory
 ```
 

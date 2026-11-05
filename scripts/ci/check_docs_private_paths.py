@@ -29,15 +29,14 @@ EXCEPTION_FIELDS = frozenset(("path", "line", "text", "sha256", "reason"))
 PLACEHOLDER = "<home>"
 ACCOUNT_NAME = r"[\w-]+(?:\.[\w-]+)*"
 NAMED_ACCOUNT = r"[^\W\d][\w-]*(?:\.[\w-]+)*"
-ACCOUNT_END = r"(?![\w-]|\.[\w-])"
-# Class (a): whole absolute home tokens, excluding embedded URL path segments.
-ABSOLUTE_HOME = re.compile(
-    rf"(?<![\w.%/-])/(?:home|Users)/(?P<name>{ACCOUNT_NAME}){ACCOUNT_END}"
+# Class (a): local path tokens; normalized components determine home membership.
+LOCAL_PATH = re.compile(r"(?<![\w.%/-])(?:/|[\w.-]+/)[\w./%-]*")
+PATH_COMPONENT = re.compile(r"[^/]+")
+WEB_URL = re.compile(
+    r"(?<![\w./-])(?:[A-Za-z][A-Za-z0-9+.-]*://|(?:[\w-]+\.)+[A-Za-z]{2,}/)"
+    r"[^\s<>\"'`()]*"
 )
-# Class (a), local file URLs: the scheme stays outside the replacement span.
-FILE_HOME = re.compile(
-    rf"(?<=file://)/(?:home|Users)/(?P<name>{ACCOUNT_NAME}){ACCOUNT_END}"
-)
+INVISIBLE = frozenset("\u200b\u200c\u200d\ufeff")
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
 NAMED_HOME = re.compile(rf"(?<![\w~])~(?P<name>{NAMED_ACCOUNT})(?=/)")
 # Class (c): bare names in code and prose; numeric approximations are not names.
@@ -205,7 +204,7 @@ def code_spans(text: str) -> list[tuple[int, int]]:
             flush()
             fence_marks = match.group("marks")
             info = match.group("info").strip().split()
-            shell_fence = (info[0] if info else "") in SHELL_FENCES
+            shell_fence = (info[0].casefold() if info else "") in SHELL_FENCES
         elif not line.strip():
             flush()
         else:
@@ -237,11 +236,62 @@ def prose_spans(text: str) -> list[tuple[int, int]]:
     return result
 
 
+def normalized_source(text: str) -> tuple[str, list[int]]:
+    """Remove account obfuscators for matching, retaining original span offsets."""
+    chars = []
+    offsets = []
+    for index, char in enumerate(text):
+        if char in INVISIBLE:
+            continue
+        if char == "\\" and text[index + 1:index + 2] in ("_", "-", "."):
+            continue
+        chars.append(char)
+        offsets.append(index)
+    offsets.append(len(text))
+    return "".join(chars), offsets
+
+
+def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]]:
+    """Resolve dot segments and exclude URL spans before selecting private homes."""
+    urls = [match.span() for match in WEB_URL.finditer(text)
+            if not match.group().startswith("file://")]
+    starts = [start for start, _ in urls]
+    result = []
+    for token in LOCAL_PATH.finditer(text):
+        index = bisect_right(starts, token.start()) - 1
+        if index >= 0 and token.start() < urls[index][1]:
+            continue
+        components = []
+        for part in PATH_COMPONENT.finditer(token.group()):
+            name = part.group()
+            if name == ".":
+                continue
+            if name == ".." and components and components[-1][0] != "..":
+                components.pop()
+            else:
+                components.append((name, token.start() + part.start()))
+        end = None
+        for (parent, _), (account, offset) in zip(components, components[1:]):
+            name = account.rstrip(".")
+            if (parent in ("home", "Users") and re.fullmatch(ACCOUNT_NAME, name)
+                    and name.casefold() not in allowed):
+                end = offset + len(name)
+        if end is not None:
+            start = token.start()
+            # Keep file:// outside the local-path replacement, as in round 3.
+            if text[max(0, start - 5):start] == "file:":
+                start += 2
+            result.append((start, end))
+    return result
+
+
 def findings(text: str, allowed: frozenset[str],
              exceptions: dict[int, str] | None = None) -> tuple[list[Finding], set[int]]:
-    """Return the three approved lexical classes in source order."""
-    matches = (list(ABSOLUTE_HOME.finditer(text)) + list(FILE_HOME.finditer(text))
-               + list(NAMED_HOME.finditer(text)))
+    """Return approved lexical classes mapped back to exact original spans."""
+    original = text
+    text, offsets = normalized_source(text)
+    spans = local_home_spans(text, allowed)
+    matches = list(NAMED_HOME.finditer(text))
     code = code_spans(text)
     starts = [start for start, _ in code]
     for start, end in code:
@@ -256,7 +306,7 @@ def findings(text: str, allowed: frozenset[str],
     newlines = [index for index, char in enumerate(text) if char == "\n"]
     result = []
     used = set()
-    lines = text.split("\n")
+    lines = original.split("\n")
     for match in sorted(matches, key=lambda value: value.start()):
         if match.re in (NAMED_HOME, BARE_HOME) and match.group("name")[0].isnumeric():
             continue
@@ -266,7 +316,17 @@ def findings(text: str, allowed: frozenset[str],
                     and lines[number - 1].removesuffix("\r") == exceptions[number]):
                 used.add(number)
                 continue
-            result.append(Finding(match.start(), match.end(), number, match.group()))
+            spans.append((match.start(), match.end()))
+    merged = []
+    for start, end in sorted(set(spans)):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    for start, end in merged:
+        number = bisect_left(newlines, start) + 1
+        left, right = offsets[start], offsets[end]
+        result.append(Finding(left, right, number, original[left:right]))
     return result, used
 
 
@@ -307,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             if not matches:
                 continue
             for match in matches:
-                print(f"{path.relative_to(args.root).as_posix()}:{match.line}: {match.prefix}")
+                print(f"{relative}:{match.line}: private-home-prefix")
             total += len(matches)
             changes.append((path, redact(text, matches).encode("utf-8", "surrogateescape")))
         unused = [(entry.path, entry.line) for entry in exceptions
