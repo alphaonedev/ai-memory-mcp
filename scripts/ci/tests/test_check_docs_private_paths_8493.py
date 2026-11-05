@@ -1,6 +1,7 @@
 """Exercise the docs home-path guard and byte-preserving repair (#8493)."""
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -25,10 +26,13 @@ class DocsPrivatePaths(unittest.TestCase):
         self.root = Path(temporary.name)
         self.doc = self.root / DOC
         self.doc.parent.mkdir(parents=True)
+        self.exceptions = self.root / "exceptions.json"
+        self.exceptions.write_text('{"exceptions": []}')
 
     def run_gate(self, *args):
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--root", str(self.root), *args],
+            [sys.executable, str(SCRIPT), "--root", str(self.root),
+             "--exceptions-file", str(self.exceptions), *args],
             capture_output=True, text=True, check=False,
         )
 
@@ -48,6 +52,113 @@ class DocsPrivatePaths(unittest.TestCase):
 
     def test_bare_named_home_in_inline_code_is_rejected(self):
         self.doc.write_bytes(b"home: `~private_account`\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_bare_named_home_in_shell_fences_is_rejected(self):
+        for language in ("", "sh", "bash", "zsh", "shell", "console"):
+            with self.subTest(language=language):
+                self.doc.write_text(f"```{language}\n~private_account\n```\n")
+                self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_non_shell_fences_are_not_inline_code(self):
+        content = b"```python\n# `~private_account` is a string example\n```\n"
+        self.doc.write_bytes(content)
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_inline_delimiter_width_and_multiline_span(self):
+        self.doc.write_bytes(b"``literal ` then\n~private_account``\n")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(DOC + ":2: ~private_account", result.stdout)
+
+    def test_tilde_fence_and_longer_fence(self):
+        self.doc.write_bytes(b"~~~~bash\n~~~\n~private_account\n~~~~\n")
+        self.assertEqual(self.run_gate().returncode, 1)
+
+    def test_numeric_and_prose_approximations_are_preserved(self):
+        content = ("~Memory ~minutes ~seconds ~milliseconds ~tens ~LINEAR\n"
+                   "~line ~all ~half-day ~loader-capped ~buildable ~CPU\n"
+                   "~halved ~v78 ~loader ~Peer\n"
+                   "~1400 ~4.0 ~0.5 ~10% ~135 ~30% ~4× ~5%→~40%\n"
+                   "ratios ~52/90 ~1-2ms/request; `~20/second`\n"
+                   "bare ~/ and generic ~alice/ remain\n").encode()
+        self.doc.write_bytes(content)
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def test_sixteen_historical_prose_lines_are_unchanged(self):
+        fixture = Path(__file__).with_name("fixtures") / "docs-private-paths-prose-8493.json"
+        rows = json.loads(fixture.read_text())
+        content = "\n".join(row["text"] for row in rows).encode()
+        self.doc.write_bytes(content)
+        self.assertEqual(self.run_gate("--fix").returncode, 0)
+        self.assertEqual(self.doc.read_bytes(), content)
+
+    def diagram_fixture(self):
+        lines = [
+            "   tier 0 → tier 1: async logical repl, ~minutes lag, durable",
+            "   tier 1 → tier 2: streaming repl, ~seconds lag",
+            "   tier 2 → tier 3: federation push, ~milliseconds (intra-zone)",
+        ]
+        self.doc = self.root / "docs/reference-architectures.md"
+        content = "\n" * 484 + "```\n" + "\n".join(lines) + "\n```\n"
+        self.doc.write_text(content)
+        entries = [{"path": "docs/reference-architectures.md", "line": number,
+                    "text": text, "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    "reason": "fixture: estimates not account names"}
+                   for number, text in enumerate(lines, 486)]
+        return content.encode(), entries
+
+    def test_three_diagram_lines_pass_only_with_exception_file(self):
+        content, entries = self.diagram_fixture()
+        self.assertEqual(self.run_gate().returncode, 1)
+        self.exceptions.write_text(json.dumps({"exceptions": entries}))
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("exceptions_used=3 exceptions_unused=0", result.stdout)
+        self.assertEqual(self.doc.read_bytes(), content)
+        self.exceptions.unlink()
+        self.assertEqual(self.run_gate().returncode, 2)
+
+    def test_altered_diagram_line_fails_closed_without_fixing(self):
+        content, entries = self.diagram_fixture()
+        self.exceptions.write_text(json.dumps({"exceptions": entries}))
+        altered = content.replace(b"~minutes lag", b"~minutes extra lag")
+        self.doc.write_bytes(altered)
+        result = self.run_gate("--fix")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exceptions_used=2 exceptions_unused=1", result.stdout)
+        self.assertEqual(self.doc.read_bytes(), altered)
+
+    def test_unused_exception_fails(self):
+        _, entries = self.diagram_fixture()
+        self.exceptions.write_text(json.dumps({"exceptions": entries}))
+        self.doc.write_bytes(b"safe\n")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exceptions_used=0 exceptions_unused=3", result.stdout)
+
+    def test_exception_hash_mismatch_is_usage_error(self):
+        _, entries = self.diagram_fixture()
+        entries[0]["sha256"] = "0" * 64
+        self.exceptions.write_text(json.dumps({"exceptions": entries}))
+        self.assertEqual(self.run_gate().returncode, 2)
+
+    def test_exception_cannot_allow_same_name_at_another_location(self):
+        _, entries = self.diagram_fixture()
+        self.exceptions.write_text(json.dumps({"exceptions": entries}))
+        with self.doc.open("a") as stream:
+            stream.write("\n`~minutes`\n~seconds/private\n")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exceptions_used=3 exceptions_unused=0", result.stdout)
+
+    def test_new_private_path_turns_clean_fixture_red(self):
+        self.doc.write_bytes(b"safe <home>/project\n")
+        self.assertEqual(self.run_gate().returncode, 0)
+        with self.doc.open("ab") as stream:
+            stream.write(b"~new_private_account/project\n")
         self.assertEqual(self.run_gate().returncode, 1)
 
     def test_generic_placeholders_are_preserved(self):

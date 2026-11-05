@@ -1,0 +1,5 @@
+{
+  "allowed_names": [
+    "user", "you", "me", "username", "example", "alice", "bob", "USER", "HOME"
+  ]
+}
