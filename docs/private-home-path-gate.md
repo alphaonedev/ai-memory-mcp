@@ -16,16 +16,23 @@ The gate scans Markdown below `docs/` and rejects these lexical classes:
   so a parent segment cannot hide an account already present in the text.
   Colon-adjacent paths (PATH lists, scp and container mounts) and file-scheme paths
   are included, with case-insensitive schemes and zero, one or multiple slashes.
-  Only HTTP and HTTPS URLs are excluded (case-insensitive), including their
-  internal punctuation, query and fragment. Whitespace, a comma, a closing
-  bracket, a closing parenthesis or a quote ends that token. Every other scheme,
+  Only HTTP and HTTPS URLs (`WEB_URL_SCHEMES`) are excluded case-insensitively,
+  including their internal punctuation, query and fragment. `URL_TOKEN_CHARS`
+  contains RFC 3986 unreserved and reserved characters plus percent, except
+  comma, closing bracket, closing parenthesis and apostrophe. Whitespace and
+  every character outside that positive set end the token: C0 controls, DEL,
+  U+200B, U+200C, U+200D, U+FEFF, angle brackets, double quote, backtick, vertical
+  bar, backslash, caret and braces. URL boundaries precede account normalization.
+  Every other scheme,
   including SSH, SFTP, rsync, git+ssh, SCP, SMB and NFS, scans as a local path.
   A compound scheme such as git+https is not HTTP(S).
-  The scheme separator survives repair; an authority inside a matched filesystem
-  prefix is part of the redacted span, as for other relative path components. Bare-domain
-  spellings are checked as local paths. File-scheme markers and compiler options
-  such as `-I` and `-L` survive repair, including switch-adjacent relative roots
-  such as `-Ihome/` and `-LUsers/`. A sentence-final period is kept; dots between
+  The scheme, user, host and port survive repair; the private prefix begins at
+  the first path slash after the authority, including an empty authority.
+  Bare-domain spellings are checked as local paths. File-scheme markers and
+  compiler options survive repair. `PATH_SWITCHES` preserves the established
+  `-I` and `-L` prefixes; generic glued `-letters` switches also split before
+  relative roots, including `-isystemhome/`, `-iquoteUsers/`, and `-Fvar/home/`.
+  A sentence-final period is kept; dots between
   account-name segments remain part of the account name.
 - Named-home paths shaped as `~<account>/`, wherever they appear.
 - Bare named homes shaped as `~<account>` in ordinary prose, inline code, or a
@@ -78,6 +85,10 @@ Percent-encoded paths, HTML entities and homoglyph characters are not decoded.
 Format characters other than the four listed above are not normalized. Bare
 account names outside home prefixes are not inferred by the scanner; reviewed
 owner/group column repairs such as the install listing are made explicitly.
+Apostrophe terminates a URL token; an emphasis star following a URL remains
+public because star is URL-legal. The `git+https` and `ftp` schemes scan as text.
+The established `-Info/home/<account>` spelling keeps `-I` and repairs the
+remaining path, consistently with the earlier compiler-prefix rule.
 
 The independent shape grammar in
 `scripts/ci/tests/docs_private_path_shapes_8493.py` combines roots, account classes,
@@ -91,3 +102,6 @@ Round 6 adds URL-internal punctuation (L1), relative roots crossed with every
 left context (Q1), and lower- and upper-case non-web schemes (Q2). HTTP and HTTPS
 remain public. The declared percent-encoded slash and backslash limits stay
 explicit grammar cases; changing those limits also requires changing that axis.
+Round 7 adds URL-illegal terminators (F1), non-web authority forms (F2), and
+generic glued switches crossed with relative roots (F3). The generator declares
+its own literals independently of the gate's named constants.

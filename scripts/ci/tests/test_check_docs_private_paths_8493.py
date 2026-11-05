@@ -71,10 +71,32 @@ class DocsPrivatePaths(unittest.TestCase):
 
     def test_non_web_schemes_r6(self):
         self.assert_repairs(tuple(
-            (scheme + "://host/home/private_account/x", scheme + "://<home>/x")
+            (scheme + "://host/home/private_account/x", scheme + "://host<home>/x")
             for name in ("ssh", "sftp", "rsync", "git+ssh", "scp", "smb", "nfs",
                          "git+http", "git+https")
             for scheme in (name, name.upper())
+        ))
+
+    def test_url_illegal_terminators_r7(self):
+        terminators = "".join(map(chr, range(32))) + "\x7f\u200b\u200c\u200d\ufeff<>`|\\^{}"
+        self.assert_repairs(tuple(
+            ("https://host/a" + char + "/home/private_account/x",
+             "https://host/a" + char + "<home>/x")
+            for char in terminators
+        ))
+
+    def test_remote_authority_survives_r7(self):
+        self.assert_repairs(tuple(
+            ("ssh://" + authority + "/home/private_account/x",
+             "ssh://" + authority + "<home>/x")
+            for authority in ("host", "user@host", "host:22", "user@host:22", "")
+        ))
+
+    def test_generic_relative_switches_r7(self):
+        self.assert_repairs(tuple(
+            ("gcc " + switch + root + "private_account/i", "gcc " + switch + "<home>/i")
+            for switch in ("-isystem", "-iquote", "-idirafter", "-F")
+            for root in ("home/", "Users/", "./home/", "../home/", "var/home/", "mnt/c/Users/")
         ))
 
     def test_raw_home_pairs_survive_parent_segments_r5(self):

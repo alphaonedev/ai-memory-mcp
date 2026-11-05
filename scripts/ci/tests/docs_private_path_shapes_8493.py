@@ -62,6 +62,9 @@ def shapes():
         web = context == "web" or context.startswith("web-")
         if web and not root.startswith("/"):
             left += "/"
+        # A relative filesystem root needs a path slash after an empty file authority.
+        if context in ("file", "file-upper") and not root.startswith("/") and root != "~":
+            left += "/"
         prefix = root + name
         tail = right
         # An escaped underscore extends the account, not the relative tail.
@@ -81,8 +84,10 @@ def shapes():
         text = left + prefix + tail + closing + "\n"
         start = len(left)
         if context.startswith("remote-") and root != "~":
-            # Plain filesystem tokens include the authority component after scheme://.
-            start -= len("host/")
+            # Round 7 F2: only the path after the authority is the private prefix.
+            start -= 1
+        if context in ("file", "file-upper") and not root.startswith("/") and root != "~":
+            start -= 1
         spans = ((start, len(left) + len(prefix)),) if private and not public_web else ()
         yield Shape(f"{root}:{name}:{context}:{right!r}", text, spans)
 
@@ -93,6 +98,34 @@ def shapes():
             continue
         text = scheme + "://host/a" + punctuation + "b/" + root + "private_account/x\n"
         yield Shape(f"url-punctuation:{scheme}:{punctuation}:{root}", text, ())
+
+    # Round 7 F1: independently declared complement cases for gate URL_TOKEN_CHARS.
+    terminators = "".join(map(chr, range(32))) + "\x7f\u200b\u200c\u200d\ufeff<>`|\\^{}"
+    for scheme, terminator, root in product(("http", "https", "HTTP", "HTTPS"),
+                                           terminators, roots):
+        left = scheme + "://host/a" + terminator
+        prefix = root + "private_account"
+        yield Shape(f"url-terminator:{scheme}:{terminator!r}:{root}",
+                    left + prefix + "/x", ((len(left), len(left + prefix)),))
+
+    # Round 7 F2: own literals, independent of gate WEB_URL_SCHEMES.
+    for scheme, authority, root in product(
+            ("ssh", "SSH", "sftp", "SFTP", "rsync", "RSYNC", "git+ssh", "GIT+SSH"),
+            ("host", "user@host", "host:22", "user@host:22", ""),
+            ("/home/", "/Users/", "/var/home/", "/mnt/c/Users/")):
+        left = scheme + "://" + authority
+        prefix = root + "private_account"
+        yield Shape(f"authority:{scheme}:{authority}:{root}", left + prefix + "/x",
+                    ((len(left), len(left + prefix)),))
+
+    # Round 7 F3: own switch grammar, independent of gate PATH_SWITCHES.
+    for switch, root in product(("-isystem", "-iquote", "-idirafter", "-F"),
+                                ("home/", "Users/", "./home/", "../home/",
+                                 "var/home/", "mnt/c/Users/")):
+        left = "gcc " + switch
+        prefix = root + "private_account"
+        yield Shape(f"generic-switch:{switch}:{root}", left + prefix + "/i",
+                    ((len(left), len(left + prefix)),))
 
     # Inner-component productions include both raw and resolved home pairs.
     for left, root, (name, private), tail in product(

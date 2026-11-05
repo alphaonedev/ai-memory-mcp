@@ -32,10 +32,21 @@ NAMED_ACCOUNT = r"[^\W\d][\w-]*(?:\.[\w-]+)*"
 # Class (a): both raw and normalized components determine home membership.
 LOCAL_PATH = re.compile(r"(?<![\w.%/-])(?:/|[\w.-]+/)[\w./%-]*")
 PATH_COMPONENT = re.compile(r"[^/]+")
-SCHEME_URL = re.compile(
-    r"(?<![\w+./-])[A-Za-z][A-Za-z0-9+.-]*://[^\s,\]\)\"']+"
+WEB_URL_SCHEMES = frozenset(("http", "https"))
+# RFC 3986 unreserved, reserved and percent, minus the documented prose separators.
+URL_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[@!$&(*+;=%"
 )
-SCHEME = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:")
+# Preserve these established prefixes before splitting any other glued -letters switch.
+PATH_SWITCHES = ("-I", "-L")
+RELATIVE_SWITCH = re.compile(
+    r"-[A-Za-z]+?(?=(?:home/|Users/|\./|\.\./|var/home/|mnt/c/Users/))"
+)
+ABSOLUTE_SWITCH = re.compile(r"-[A-Za-z]+(?=/)")
+SCHEME_URL = re.compile(
+    r"(?<![\w+./-])[A-Za-z][A-Za-z0-9+.-]*://["
+    + re.escape("".join(sorted(URL_TOKEN_CHARS))) + r"]*"
+)
 INVISIBLE = frozenset("\u200b\u200c\u200d\ufeff")
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
 TILDE_START = r"(?:(?<![\w~])|(?<=-I)|(?<=-L))~"
@@ -241,7 +252,14 @@ def normalized_source(text: str) -> tuple[str, list[int]]:
     """Remove account obfuscators for matching, retaining original span offsets."""
     chars = []
     offsets = []
-    visible = [(index, char) for index, char in enumerate(text) if char not in INVISIBLE]
+    visible = []
+    for index, char in enumerate(text):
+        if char in INVISIBLE:
+            # An erased URL delimiter must not glue its last word to a named tilde home.
+            if text[index + 1:index + 2] == "~":
+                visible.append((index, " "))
+            continue
+        visible.append((index, char))
     for position, (index, char) in enumerate(visible):
         following = visible[position + 1][1] if position + 1 < len(visible) else ""
         if char == "\\" and following in ("_", "-", "."):
@@ -252,24 +270,46 @@ def normalized_source(text: str) -> tuple[str, list[int]]:
     return "".join(chars), offsets
 
 
+def mask_url_context(original: str, text: str, offsets: list[int]) -> str:
+    """Hide web URLs and remote authorities without joining across erased delimiters."""
+    parts = []
+    previous = 0
+    # Original bytes define URL boundaries before invisible account obfuscators disappear.
+    for match in SCHEME_URL.finditer(original):
+        scheme, _, remainder = match.group().partition("://")
+        end = match.end()
+        if scheme.casefold() not in WEB_URL_SCHEMES:
+            path = remainder.find("/")
+            if path >= 0:
+                end = match.start() + len(scheme) + len("://") + path
+        left = bisect_left(offsets, match.start())
+        right = bisect_left(offsets, end)
+        parts.extend((text[previous:left], " " * (right - left)))
+        previous = right
+    return "".join((*parts, text[previous:]))
+
+
+def path_switch_length(path: str) -> int:
+    """Split glued options before selecting either raw or normalized home pairs."""
+    relative = RELATIVE_SWITCH.match(path)
+    if relative:
+        return relative.end()
+    for switch in PATH_SWITCHES:
+        if path.startswith(switch):
+            return len(switch)
+    absolute = ABSOLUTE_SWITCH.match(path)
+    return absolute.end() if absolute else 0
+
+
 def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]]:
     """Select raw and resolved home pairs; URL and option bytes stay outside spans."""
-    # Tokenize the whole scheme first: an embedded HTTP spelling is not a second URL.
-    urls = [match.span() for match in SCHEME_URL.finditer(text)
-            if match.group().partition(":")[0].casefold() in ("http", "https")]
-    starts = [start for start, _ in urls]
-    scheme_ends = {match.end() for match in SCHEME.finditer(text)}
     result = []
     for token in LOCAL_PATH.finditer(text):
-        index = bisect_right(starts, token.start()) - 1
-        if index >= 0 and token.start() < urls[index][1]:
-            continue
         start = token.start()
         path = token.group()
-        if path.startswith(("-I", "-L")):
-            # Split the option before selecting pairs, including -Ihome and -LUsers.
-            start += 2
-            path = path[2:]
+        switch_length = path_switch_length(path)
+        start += switch_length
+        path = path[switch_length:]
         raw = [(part.group(), start + part.start())
                for part in PATH_COMPONENT.finditer(path)]
         pairs = list(zip(raw, raw[1:]))
@@ -291,11 +331,6 @@ def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]
                     and name.casefold() not in allowed):
                 end = max(end or 0, offset + len(name))
         if end is not None:
-            # Non-web schemes are plain filesystem tokens; preserve the scheme separator.
-            if start in scheme_ends and path.startswith("//"):
-                start += 2
-            elif path.startswith("-"):
-                start += path.index("/")
             result.append((start, end))
     return result
 
@@ -305,7 +340,7 @@ def findings(text: str, allowed: frozenset[str],
     """Return approved lexical classes mapped back to exact original spans."""
     original = text
     text, offsets = normalized_source(text)
-    spans = local_home_spans(text, allowed)
+    spans = local_home_spans(mask_url_context(original, text, offsets), allowed)
     matches = list(NAMED_HOME.finditer(text))
     code = code_spans(text)
     starts = [start for start, _ in code]
