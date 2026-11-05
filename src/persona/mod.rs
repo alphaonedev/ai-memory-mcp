@@ -847,14 +847,31 @@ fn emit_persona_generated_event(
 /// persona alongside reflections from the same directory tree.
 #[must_use]
 pub fn render_persona_md(persona: &Persona) -> String {
+    use crate::yaml_frontmatter::{YamlScalarKind, yaml_scalar};
     let mut out = String::with_capacity(persona.body_md.len() + 256);
     out.push_str("---\n");
-    out.push_str(&format!("memory_id: {}\n", persona.id));
-    out.push_str(&format!("entity_id: {}\n", persona.entity_id));
-    out.push_str(&format!("namespace: {}\n", persona.namespace));
+    // #8493: every string site goes through the shared YAML scalar encoder.
+    out.push_str(&format!(
+        "memory_id: {}\n",
+        yaml_scalar(&persona.id, YamlScalarKind::StoredString)
+    ));
+    out.push_str(&format!(
+        "entity_id: {}\n",
+        yaml_scalar(&persona.entity_id, YamlScalarKind::StoredString)
+    ));
+    out.push_str(&format!(
+        "namespace: {}\n",
+        yaml_scalar(&persona.namespace, YamlScalarKind::StoredString)
+    ));
     out.push_str(&format!("persona_version: {}\n", persona.version));
-    out.push_str(&format!("generated_at: {}\n", persona.generated_at));
-    out.push_str(&format!("attest_level: {}\n", persona.attest_level));
+    out.push_str(&format!(
+        "generated_at: {}\n",
+        yaml_scalar(&persona.generated_at, YamlScalarKind::Timestamp)
+    ));
+    out.push_str(&format!(
+        "attest_level: {}\n",
+        yaml_scalar(&persona.attest_level, YamlScalarKind::StoredString)
+    ));
     out.push_str(&format!("sources: {}\n", persona.sources.len()));
     out.push_str("---\n\n");
     out.push_str(&persona.body_md);
