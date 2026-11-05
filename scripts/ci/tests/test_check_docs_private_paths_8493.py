@@ -4,12 +4,14 @@ Every future review finding adds a grammar axis to the independent shape helper.
 """
 
 import importlib.util
+import io
 import json
 import hashlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 # Resolve the sibling from this file, including isolated discovery and a tests-directory cwd.
@@ -150,6 +152,38 @@ class DocsPrivatePaths(unittest.TestCase):
              "/srv/mirror/https://h/<home>/x"),
             ("/var/https://home/private_account/x", "/var/https://home/<home>/x"),
         ))
+
+    def test_invisible_before_nested_web_header_r10(self):
+        self.assert_repairs(tuple(
+            (left + invisible + "https://h/home/private_account/x",
+             left + invisible + "https://h/<home>/x")
+            for left in ("cache/", "/srv/mirror/", "~/")
+            for invisible in "\u200b\u200c\u200d\ufeff"
+        ))
+
+    def test_tilde_web_header_preserved_r10(self):
+        self.assert_repairs(tuple(
+            ("~" + scheme + "://h/" + root + "private_account/x",
+             "~" + scheme + "://h/<home>/x")
+            for scheme in ("http", "https", "HTTP") for root in ("home/", "Users/")
+        ))
+
+    def test_fix_rescan_refuses_unrepaired_finding_r10(self):
+        spec = importlib.util.spec_from_file_location("rescan_gate", SCRIPT)
+        gate = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = gate
+        self.addCleanup(sys.modules.pop, spec.name)
+        spec.loader.exec_module(gate)
+        self.doc.write_text("/home/private_account/x")
+        output = io.StringIO()
+        with patch.object(gate, "redact", side_effect=lambda text, matches: text):
+            with patch("sys.stdout", output):
+                result = gate.main(["--root", str(self.root), "--fix",
+                                    "--exceptions-file", str(self.exceptions)])
+        self.assertEqual(result, gate.EXIT_FINDINGS)
+        self.assertIn("remaining=1", output.getvalue())
+        self.assertIn(DOC + ":1: private-home-prefix", output.getvalue())
+        self.assertNotIn("private_account", output.getvalue())
 
     def test_dash_and_word_glued_tilde_switches_r9(self):
         self.assert_repairs(tuple(

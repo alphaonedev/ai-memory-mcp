@@ -183,6 +183,26 @@ def shapes():
         text = left + scheme + "://h/" + root + "private_account/x"
         yield Shape(f"public-web-boundary:{left}:{scheme}:{root}", text, ())
 
+    # Round 10 F1: independent literals for the gate's INVISIBLE set.
+    for local, invisible, scheme, root, (name, private) in product(
+            ("cache/", "/srv/mirror/", "~/"), "\u200b\u200c\u200d\ufeff",
+            ("http", "https", "HTTP"), ("h/home/", "h/Users/", "home/", "Users/"), names):
+        authority, path = root.split("/", 1)
+        left = local + invisible + scheme + "://" + authority + "/"
+        prefix = path + name
+        spans = ((len(left), len(left + prefix)),) if private else ()
+        yield Shape(f"invisible-local-web:{local}:{invisible!r}:{scheme}:{root}:{name}",
+                    left + prefix + "/x", spans)
+
+    # Round 10 F2: a tilde before a web header cannot consume the header as an account.
+    for scheme, root, (name, private) in product(
+            ("http", "https", "HTTP"), ("h/home/", "h/Users/", "home/", "Users/"), names):
+        authority, path = root.split("/", 1)
+        left = "~" + scheme + "://" + authority + "/"
+        prefix = path + name
+        spans = ((len(left), len(left + prefix)),) if private else ()
+        yield Shape(f"tilde-web:{scheme}:{root}:{name}", left + prefix + "/x", spans)
+
     # Round 9 F2: independent dash-token and embedded PATH_SWITCHES spellings.
     for switch, (name, private), tail in product(
             ("--sysroot", "-m64", "-x-y", "--include", "-I-", "x-I", "x-L", "foo-I", "--I"),
