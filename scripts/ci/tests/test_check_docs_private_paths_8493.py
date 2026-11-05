@@ -143,6 +143,30 @@ class DocsPrivatePaths(unittest.TestCase):
             ("/Users/private_account/../..", "<home>/../.."),
         ))
 
+    def test_local_path_nested_web_headers_r9(self):
+        self.assert_repairs((
+            ("cache/https://h/home/private_account/x", "cache/https://h/<home>/x"),
+            ("/srv/mirror/https://h/Users/private_account/x",
+             "/srv/mirror/https://h/<home>/x"),
+            ("/var/https://home/private_account/x", "/var/https://home/<home>/x"),
+        ))
+
+    def test_dash_and_word_glued_tilde_switches_r9(self):
+        self.assert_repairs(tuple(
+            (switch + "~private_account/x", switch + "<home>/x")
+            for switch in ("--sysroot", "-m64", "-x-y", "--include", "-I-",
+                           "x-I", "x-L", "foo-I", "--I")
+        ))
+
+    def test_public_web_header_boundaries_r9(self):
+        for left in ("", " ", "(", "[", '"', "'", ",", "[label]("):
+            with self.subTest(left=left):
+                text = left + "https://h/home/private_account/x"
+                self.doc.write_text(text)
+                self.assertEqual(self.run_gate().returncode, 0)
+                self.assertEqual(self.run_gate("--fix").returncode, 0)
+                self.assertEqual(self.doc.read_text(), text)
+
     def test_url_adjacent_and_bare_domain_paths_r5(self):
         self.assert_repairs((
             ("https://example.test/a,/home/private_account/x",

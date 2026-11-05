@@ -167,6 +167,31 @@ def shapes():
         spans = ((len(left), len(left + prefix)),) if private else ()
         yield Shape(f"tilde-switch:{switch}:{name}:{right}", left + prefix + right, spans)
 
+    # Round 9 F1: local path nesting is private; standalone web boundaries stay public.
+    for local, scheme, root, (name, private) in product(
+            ("cache/", "/srv/mirror/", "~/"), ("http", "https", "HTTP", "HTTPS"),
+            ("h/home/", "h/Users/", "home/", "Users/"), names):
+        authority, path = root.split("/", 1)
+        left = local + scheme + "://" + authority + "/"
+        prefix = path + name
+        spans = ((len(left), len(left + prefix)),) if private else ()
+        yield Shape(f"local-web:{local}:{scheme}:{root}:{name}",
+                    left + prefix + "/x", spans)
+    for left, scheme, root in product(
+            ("", " ", "(", "[", '"', "'", ",", "[label]("),
+            ("http", "https", "HTTP", "HTTPS"), ("home/", "Users/")):
+        text = left + scheme + "://h/" + root + "private_account/x"
+        yield Shape(f"public-web-boundary:{left}:{scheme}:{root}", text, ())
+
+    # Round 9 F2: independent dash-token and embedded PATH_SWITCHES spellings.
+    for switch, (name, private), tail in product(
+            ("--sysroot", "-m64", "-x-y", "--include", "-I-", "x-I", "x-L", "foo-I", "--I"),
+            names, ("", "/inc")):
+        prefix = "~" + name
+        spans = ((len(switch), len(switch + prefix)),) if private else ()
+        yield Shape(f"dash-word-tilde:{switch}:{name}:{tail}",
+                    switch + prefix + tail, spans)
+
     # Inner-component productions include both raw and resolved home pairs.
     for left, root, (name, private), tail in product(
             ("", "gcc -I", "ld -L"),
