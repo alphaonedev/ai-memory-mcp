@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ import check_npm_audit as gate
 TODAY = date(2026, 11, 5)
 ADVISORY_ID = "GHSA-gcqx-w48m-w2h4"
 DEEP_MERGE_NODE = "node_modules/deepmerge"
+TEST_SCRATCH = Path(os.environ.get("TMPDIR", str(CI_DIR.parents[1] / ".local-runs")))
 
 
 class NpmExceptions8615Tests(unittest.TestCase):
@@ -120,6 +122,74 @@ class NpmExceptions8615Tests(unittest.TestCase):
         with self.assertRaises(gate.AuditError):
             self.check()
 
+    def test_8615_cli_accepts_only_expected_advisory_exit_code(self):
+        for status in (0, 1, 2):
+            with self.subTest(status=status):
+                result = subprocess.CompletedProcess([], status, json.dumps(self.report), "")
+                with patch.object(gate.subprocess, "run", return_value=result), \
+                        patch.object(gate, "load_exception_file", return_value=self.entries), \
+                        patch.object(gate, "read_versions", return_value=self.versions), \
+                        patch.object(gate, "datetime") as clock, \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    clock.now.return_value.date.return_value = TODAY
+                    self.assertEqual(gate.main([]), 0 if status == 1 else 1)
+
+    def test_8615_exception_document_shape_is_strict(self):
+        for entries in ({}, None, [None], [dict(self.entries[0], extra="unknown")]):
+            with self.subTest(entries=entries), self.assertRaises(gate.AuditError):
+                gate.check_audit(json.dumps(self.report), entries, self.versions, TODAY)
+
+    def test_8615_malformed_expiry_is_rejected(self):
+        self.entries[0]["expires"] = "2027-99-01"
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+
+class NpmInstalledVersions8615Tests(unittest.TestCase):
+    def setUp(self):
+        TEST_SCRATCH.mkdir(parents=True, exist_ok=True)
+        scratch = tempfile.TemporaryDirectory(prefix="npm-audit-8615-", dir=TEST_SCRATCH)
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.prefix = self.root / "sdk"
+        self.package = self.prefix / DEEP_MERGE_NODE / "package.json"
+        self.package.parent.mkdir(parents=True)
+        self.package.write_text(json.dumps({"name": "deepmerge", "version": "4.3.1"}))
+        self.lock = self.prefix / "package-lock.json"
+        self.lock.write_text(json.dumps({"packages": {DEEP_MERGE_NODE: {"version": "4.3.1"}}}))
+        self.report = {"deepmerge": {"nodes": [DEEP_MERGE_NODE]}}
+
+    def test_8615_lock_and_installed_version_agree(self):
+        self.assertEqual(gate.read_versions(self.prefix, self.report), {DEEP_MERGE_NODE: "4.3.1"})
+
+    def test_8615_installed_version_drift_is_rejected(self):
+        self.package.write_text(json.dumps({"name": "deepmerge", "version": "4.3.0"}))
+        with self.assertRaises(gate.AuditError):
+            gate.read_versions(self.prefix, self.report)
+
+    def test_8615_lockfile_version_drift_is_rejected(self):
+        self.lock.write_text(json.dumps({"packages": {DEEP_MERGE_NODE: {"version": "4.3.0"}}}))
+        with self.assertRaises(gate.AuditError):
+            gate.read_versions(self.prefix, self.report)
+
+    def test_8615_missing_installed_package_is_rejected(self):
+        self.package.unlink()
+        with self.assertRaises(OSError):
+            gate.read_versions(self.prefix, self.report)
+
+    def test_8615_node_must_name_reported_package(self):
+        for node in ("node_modules/jest", "../node_modules/deepmerge", "/node_modules/deepmerge"):
+            with self.subTest(node=node), self.assertRaises(gate.AuditError):
+                gate.read_versions(self.prefix, {"deepmerge": {"nodes": [node]}})
+
+    def test_8615_installed_symlink_escape_is_rejected(self):
+        outside = self.root / "outside.json"
+        outside.write_bytes(self.package.read_bytes())
+        self.package.unlink()
+        self.package.symlink_to(outside)
+        with self.assertRaises(gate.AuditError):
+            gate.read_versions(self.prefix, self.report)
+
 
 class NpmAudit8615Tests(unittest.TestCase):
     def setUp(self):
@@ -128,7 +198,9 @@ class NpmAudit8615Tests(unittest.TestCase):
 
     def run_gate(self, report, returncode=0):
         result = subprocess.CompletedProcess([], returncode, json.dumps(report), "")
-        with patch.object(gate.subprocess, "run", return_value=result) as run:
+        with patch.object(gate.subprocess, "run", return_value=result) as run, \
+                patch.object(gate, "load_exception_file", return_value=[]), \
+                patch.object(gate, "read_versions", return_value={}):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 code = gate.main([])
         return code, run
@@ -210,7 +282,9 @@ class NpmAudit8615Tests(unittest.TestCase):
 
     def test_8615_prefix_is_one_argument(self):
         result = subprocess.CompletedProcess([], 0, json.dumps(self.clean), "")
-        with patch.object(gate.subprocess, "run", return_value=result) as run:
+        with patch.object(gate.subprocess, "run", return_value=result) as run, \
+                patch.object(gate, "load_exception_file", return_value=[]), \
+                patch.object(gate, "read_versions", return_value={}):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(gate.main(["--prefix", "sdk with spaces"]), 0)
         self.assertEqual(run.call_args.args[0][-1], "sdk with spaces")
