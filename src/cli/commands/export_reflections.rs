@@ -125,7 +125,7 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace).with_context(
             || {
                 format!(
-                    "memory {} namespace {:?}: refusing export path",
+                    "memory {:?} namespace {:?}: refusing export path",
                     mem.id, mem.namespace
                 )
             },
