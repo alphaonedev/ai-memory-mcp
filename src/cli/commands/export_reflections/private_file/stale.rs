@@ -59,22 +59,62 @@ fn open_stream(directory: &File) -> io::Result<DirectoryStream> {
     Ok(DirectoryStream(stream))
 }
 
-// The shipping Unix targets provide these thread-local errno accessors.
-#[cfg(target_vendor = "apple")]
-fn clear_errno() {
-    // SAFETY (UNSAFE-01): __error returns this thread's valid errno cell.
-    unsafe { *libc::__error() = 0 };
+// libc exposes the thread-local errno cell under each platform's native name.
+// These aliases keep the same iterator on Unix rather than disabling cleanup.
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+use libc::___errno as errno_location;
+#[cfg(any(
+    target_env = "newlib",
+    target_os = "android",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "nuttx",
+    target_os = "cygwin"
+))]
+use libc::__errno as errno_location;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "l4re",
+    target_os = "emscripten",
+    target_os = "dragonfly",
+    target_os = "redox",
+    target_os = "hurd",
+    target_os = "fuchsia",
+    target_os = "qurt"
+))]
+use libc::__errno_location as errno_location;
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+use libc::__error as errno_location;
+#[cfg(target_os = "nto")]
+use libc::__get_errno_ptr as errno_location;
+#[cfg(target_os = "aix")]
+use libc::_Errno as errno_location;
+#[cfg(target_os = "haiku")]
+use libc::_errnop as errno_location;
+
+#[cfg(not(target_os = "vxworks"))]
+fn clear_errno() -> io::Result<()> {
+    // SAFETY (UNSAFE-01): the native accessor takes no arguments and returns
+    // this thread's errno cell. Check the pointer before writing (UNSAFE-09).
+    let cell = std::ptr::NonNull::new(unsafe { errno_location() })
+        .ok_or_else(|| io::Error::other("thread-local errno cell unavailable"))?;
+    // SAFETY (UNSAFE-01/09): non-null native thread-local errno storage;
+    // clearing it distinguishes EOF from readdir failure.
+    unsafe { cell.as_ptr().write(0) };
+    Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn clear_errno() {
-    // SAFETY (UNSAFE-01): __errno_location returns this thread's errno cell.
-    unsafe { *libc::__errno_location() = 0 };
+#[cfg(target_os = "vxworks")]
+fn clear_errno() -> io::Result<()> {
+    // SAFETY (UNSAFE-01): errnoSet writes this task's errno value and accepts 0.
+    if unsafe { libc::errnoSet(0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn read_entry(stream: &mut DirectoryStream) -> io::Result<Option<&CStr>> {
-    clear_errno();
+    clear_errno()?;
     // SAFETY (UNSAFE-01/09): exclusive access to this live directory stream.
     // The returned entry remains valid until the next readdir/closedir call.
     let entry = unsafe { libc::readdir(stream.0) };
@@ -91,14 +131,6 @@ fn read_entry(stream: &mut DirectoryStream) -> io::Result<Option<&CStr>> {
     Ok(Some(unsafe {
         CStr::from_ptr((&raw const (*entry).d_name).cast())
     }))
-}
-
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-fn read_entry(_: &mut DirectoryStream) -> io::Result<Option<&CStr>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "descriptor-relative staging enumeration is unsupported on this platform",
-    ))
 }
 
 fn remove_stale(directory: &File, name: &CStr, now: SystemTime) -> io::Result<()> {
@@ -186,6 +218,30 @@ pub(super) fn sweep(directory: &File) {
             Err(error) => {
                 warn(&error);
                 return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_of_directory_does_not_reuse_a_previous_os_error_8602() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs/stale-export-8602");
+        std::fs::create_dir_all(&root).unwrap();
+        let scratch = tempfile::tempdir_in(root).unwrap();
+        let directory = File::open(scratch.path()).unwrap();
+        let mut stream = open_stream(&directory).unwrap();
+        loop {
+            // SAFETY (UNSAFE-01): a negative descriptor is always invalid;
+            // this sets EBADF without closing any resource.
+            assert_eq!(unsafe { libc::close(-1) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            if read_entry(&mut stream).unwrap().is_none() {
+                break;
             }
         }
     }
