@@ -167,6 +167,13 @@ class DocsPrivatePaths(unittest.TestCase):
                 self.assertEqual(self.run_gate("--fix").returncode, 0)
                 self.assertEqual(self.doc.read_text(), text)
 
+    def test_option_text_inside_accounts_is_not_a_switch_r9(self):
+        self.assert_repairs(tuple(
+            (root + "private" + switch + "account/x", "<home>/x")
+            for root in ("/home/", "home/", "local/Users/")
+            for switch in ("-I", "-L")
+        ))
+
     def test_url_adjacent_and_bare_domain_paths_r5(self):
         self.assert_repairs((
             ("https://example.test/a,/home/private_account/x",

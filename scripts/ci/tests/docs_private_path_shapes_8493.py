@@ -192,6 +192,12 @@ def shapes():
         yield Shape(f"dash-word-tilde:{switch}:{name}:{tail}",
                     switch + prefix + tail, spans)
 
+    # Round 9 F2: option spellings inside an account never become option prefixes.
+    for root, switch in product(("/home/", "home/", "local/Users/"), ("-I", "-L")):
+        prefix = root + "private" + switch + "account"
+        yield Shape(f"account-option-text:{root}:{switch}", prefix + "/x",
+                    ((0, len(prefix)),))
+
     # Inner-component productions include both raw and resolved home pairs.
     for left, root, (name, private), tail in product(
             ("", "gcc -I", "ld -L"),

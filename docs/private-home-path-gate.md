@@ -48,7 +48,8 @@ The gate scans Markdown below `docs/` and rejects these lexical classes:
   hyphens and trailing dashes, as in `--sysroot/`, `-m64/`, `-x-y/`, `-I-/` and
   `--include~<account>`. A `PATH_SWITCHES` spelling is recognized wherever it
   occurs, including word-glued `x-I~<account>`, `foo-L~<account>` and `--I~<account>`;
-  the bytes before the named home remain unchanged.
+  the bytes before the named home remain unchanged. Option recognition ends at
+  the first path delimiter; an option spelling inside an account is not a switch.
   A sentence-final period is kept; dots between
   account-name segments remain part of the account name.
 - Named-home paths shaped as `~<account>/`, wherever they appear.

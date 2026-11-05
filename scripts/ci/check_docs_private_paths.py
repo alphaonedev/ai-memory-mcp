@@ -308,7 +308,7 @@ def path_switch_length(path: str) -> int:
     if path.startswith("-") and boundaries:
         return boundaries[0]
     for switch in PATH_SWITCHES:
-        position = path.find(switch)
+        position = path.find(switch, 0, boundaries[0] if boundaries else len(path))
         if position >= 0:
             return position + len(switch)
     return 0
