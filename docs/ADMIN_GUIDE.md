@@ -1375,7 +1375,7 @@ with the applicable principal/registry refusal reason in the forensic audit chai
 
 `ai-memory agents bind-key` is a
 local SQLite command; it does not bind a key in a Postgres-backed daemon.
-For Postgres, use a build with `sal,sal-postgres` and enrol a registered,
+For Postgres, use a build with `sal,sal-postgres` and enrol an
 allowlisted admin's per-agent key in the daemon's own store:
 `ai-memory agents bind-api-key --agent-id <admin-id> --token-file <0600-token-file>`.
 Select that Postgres store with `AI_MEMORY_STORE_URL_FILE` pointing to a protected
