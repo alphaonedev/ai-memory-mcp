@@ -532,8 +532,12 @@ control. Symlink directories and symlink/non-regular file destinations are
 refused. Ordinary `team/alpha` namespace nesting is preserved.
 Platforms without Unix permissions refuse these exports.
 Refusal cannot undo earlier disclosure. A crash can leave a private
-`.private-export-*.stage` file; remove incomplete stages only with exporters
-stopped.
+`.private-export-*.stage` file. Before publication, a sweep runs once per destination
+directory per CLI run and once per auto-export call. It removes only regular staging
+files whose modification time is older than one hour; newer or future modification
+times are retained, as are symlinks and non-regular entries. Cleanup errors warn
+without stopping export. Remove any remaining incomplete stages manually only with
+exporters stopped.
 
 ```bash
 # Bulk export, operator-driven.

@@ -229,10 +229,11 @@ pub fn run_auto_export(
     let payload = export_reflections::render_payload(&mem, &edges, attest_level, config.format);
 
     let root = export_reflections::private_file::PrivateExportDir::open(&config.out_dir)?;
-    let relative = export_reflections::sanitise_namespace_for_path(&mem.namespace);
+    let relative = export_reflections::sanitise_namespace_for_path(&mem.namespace)?;
     let namespace = root.namespace(&relative).with_context(|| {
         export_reflections::private_file::namespace_context(&config.out_dir.join(&relative))
     })?;
+    namespace.sweep_stale_staging();
     namespace.write(
         &format!("{}.{}", mem.id, config.format.extension()),
         payload.as_bytes(),

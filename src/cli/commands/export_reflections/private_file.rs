@@ -30,10 +30,17 @@ pub(crate) fn validate_component(component: &str) -> io::Result<()> {
 
 #[cfg(all(test, unix))]
 thread_local! {
+    static DIRECTORY_SYNC_CALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STAGING_SWEEP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_STALE_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STALE_REMOVAL_ATTEMPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_STAGE_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+#[cfg(unix)]
+mod stale;
 
 #[cfg(unix)]
 mod platform {
@@ -71,6 +78,8 @@ mod platform {
     }
 
     fn sync_directory(directory: &File) -> io::Result<()> {
+        #[cfg(test)]
+        DIRECTORY_SYNC_CALLED.set(true);
         #[cfg(test)]
         if FAIL_DIRECTORY_SYNC.get() {
             return Err(io::Error::other(
@@ -184,13 +193,25 @@ mod platform {
             }
             // SAFETY (UNSAFE-02): successful fstatat initialized the stat object.
             let metadata = unsafe { metadata.assume_init() };
+            if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private_export_symlink_refused",
+                ));
+            }
             if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "export destination must be a regular file, never a symlink",
+                    "private_export_non_regular_refused",
                 ));
             }
             Ok(())
+        }
+
+        /// Best-effort cleanup through this checked directory descriptor.
+        /// Call once per destination directory per export operation, before writes.
+        pub(crate) fn sweep_stale_staging(&self) {
+            stale::sweep(&self.0);
         }
 
         /// Replaces the inode, never truncates an existing file or follows links.
@@ -258,219 +279,7 @@ mod platform {
 pub(crate) use platform::PrivateExportDir;
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-
-    const PRIVATE_FILE_MODE: u32 = 0o600;
-    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-    const MODE_MASK: u32 = 0o777;
-
-    fn scratch() -> tempfile::TempDir {
-        let root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs/private-export-8592-8593");
-        fs::create_dir_all(&root).unwrap();
-        tempfile::tempdir_in(root).unwrap()
-    }
-
-    struct InjectFlag(&'static std::thread::LocalKey<std::cell::Cell<bool>>);
-
-    impl InjectFlag {
-        fn new(flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> Self {
-            flag.set(true);
-            Self(flag)
-        }
-    }
-
-    impl Drop for InjectFlag {
-        fn drop(&mut self) {
-            self.0.set(false);
-        }
-    }
-
-    #[test]
-    fn pre_rename_failure_removes_only_owned_stage_8592() {
-        let scratch = scratch();
-        let path = scratch.path().join("root");
-        let root = PrivateExportDir::open(&path).unwrap();
-        root.write("entity.md", b"old private").unwrap();
-        fs::write(path.join("unrelated.stage"), b"unrelated").unwrap();
-        let injection = InjectFlag::new(&FAIL_BEFORE_RENAME);
-        let error = root.write("entity.md", b"new private").unwrap_err();
-        drop(injection);
-        assert!(error.to_string().contains("before rename injected failure"));
-        assert_eq!(fs::read(path.join("entity.md")).unwrap(), b"old private");
-        assert_eq!(
-            fs::read(path.join("unrelated.stage")).unwrap(),
-            b"unrelated"
-        );
-        assert_eq!(fs::read_dir(path).unwrap().count(), 2);
-    }
-
-    #[test]
-    fn stage_cleanup_failure_retains_original_error_8592() {
-        let scratch = scratch();
-        let path = scratch.path().join("root");
-        let root = PrivateExportDir::open(&path).unwrap();
-        let before = InjectFlag::new(&FAIL_BEFORE_RENAME);
-        let cleanup = InjectFlag::new(&FAIL_STAGE_CLEANUP);
-        let error = root.write("entity.md", b"private").unwrap_err();
-        drop(cleanup);
-        drop(before);
-        let message = error.to_string();
-        assert!(message.contains("before rename injected failure"));
-        assert!(message.contains("stage cleanup injected failure"));
-        assert!(!path.join("entity.md").exists());
-        let entries: Vec<_> = fs::read_dir(path)
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        let stage = &entries[0];
-        assert!(
-            stage
-                .file_name()
-                .to_str()
-                .unwrap()
-                .starts_with(".private-export-")
-        );
-        assert_eq!(
-            stage.metadata().unwrap().mode() & MODE_MASK,
-            PRIVATE_FILE_MODE
-        );
-        assert_eq!(fs::read(stage.path()).unwrap(), b"private");
-    }
-
-    #[test]
-    fn directory_sync_failure_keeps_published_private_file_8592() {
-        let scratch = scratch();
-        let path = scratch.path().join("root");
-        let root = PrivateExportDir::open(&path).unwrap();
-        let injection = InjectFlag::new(&FAIL_DIRECTORY_SYNC);
-        let error = root.write("entity.md", b"private").unwrap_err();
-        drop(injection);
-        assert!(
-            error
-                .to_string()
-                .contains("directory sync injected failure")
-        );
-        assert_eq!(fs::read(path.join("entity.md")).unwrap(), b"private");
-        assert_eq!(
-            fs::metadata(path.join("entity.md")).unwrap().mode() & MODE_MASK,
-            PRIVATE_FILE_MODE
-        );
-        assert_eq!(fs::read_dir(path).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn namespace_creation_sync_failure_is_reported_8593() {
-        let scratch = scratch();
-        let path = scratch.path().join("root");
-        let root = PrivateExportDir::open(&path).unwrap();
-        let injection = InjectFlag::new(&FAIL_DIRECTORY_SYNC);
-        let error = root.namespace(Path::new("team")).map(|_| ()).unwrap_err();
-        drop(injection);
-        assert!(
-            error
-                .to_string()
-                .contains("directory sync injected failure")
-        );
-        assert_eq!(
-            fs::metadata(path.join("team")).unwrap().mode() & MODE_MASK,
-            PRIVATE_DIRECTORY_MODE
-        );
-        assert_eq!(fs::read_dir(path.join("team")).unwrap().count(), 0);
-        root.namespace(Path::new("team"))
-            .unwrap()
-            .write("entity.md", b"private")
-            .unwrap();
-        assert_eq!(fs::read(path.join("team/entity.md")).unwrap(), b"private");
-    }
-
-    #[test]
-    fn publication_stays_in_opened_directory_after_root_and_namespace_replacement() {
-        let scratch = scratch();
-        let root_path = scratch.path().join("root");
-        let root = PrivateExportDir::open(&root_path).unwrap();
-        let namespace = root.namespace(Path::new("team")).unwrap();
-        let outside = scratch.path().join("outside");
-        fs::create_dir(&outside).unwrap();
-        let moved_root = scratch.path().join("moved-root");
-        fs::rename(&root_path, &moved_root).unwrap();
-        symlink(&outside, &root_path).unwrap();
-        fs::rename(moved_root.join("team"), moved_root.join("moved-team")).unwrap();
-        symlink(&outside, moved_root.join("team")).unwrap();
-        namespace.write("entity.md", b"private").unwrap();
-        assert_eq!(
-            fs::read(moved_root.join("moved-team/entity.md")).unwrap(),
-            b"private"
-        );
-        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
-        assert!(root.namespace(Path::new("team")).is_err());
-    }
-
-    #[test]
-    fn root_symlinks_with_trailing_separators_are_refused() {
-        let scratch = scratch();
-        let outside = scratch.path().join("outside");
-        PrivateExportDir::open(&outside).unwrap();
-        let link = scratch.path().join("link");
-        symlink(&outside, &link).unwrap();
-        for suffix in ["", "/", "/."] {
-            assert!(
-                PrivateExportDir::open(Path::new(&format!("{}{suffix}", link.display()))).is_err()
-            );
-        }
-        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn nonregular_destination_and_unsafe_names_are_refused_without_staging() {
-        let scratch = scratch();
-        let root_path = scratch.path().join("root");
-        let root = PrivateExportDir::open(&root_path).unwrap();
-        fs::create_dir(root_path.join("directory.md")).unwrap();
-        for name in ["directory.md", "", ".", "..", "../outside", "nul\0name"] {
-            assert!(root.write(name, b"private").is_err());
-        }
-        assert_eq!(fs::read_dir(root_path).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn hardlinked_existing_file_is_replaced_without_modifying_the_other_link() {
-        let scratch = scratch();
-        let root_path = scratch.path().join("root");
-        let root = PrivateExportDir::open(&root_path).unwrap();
-        let outside = scratch.path().join("operator-file");
-        fs::write(&outside, b"operator content").unwrap();
-        fs::hard_link(&outside, root_path.join("entity.md")).unwrap();
-        root.write("entity.md", b"private").unwrap();
-        assert_eq!(fs::read(outside).unwrap(), b"operator content");
-        assert_eq!(
-            fs::metadata(root_path.join("entity.md")).unwrap().mode() & MODE_MASK,
-            PRIVATE_FILE_MODE
-        );
-        assert_eq!(fs::read_dir(root_path).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn existing_private_directory_can_be_reopened_without_permission_changes() {
-        let scratch = scratch();
-        let path = scratch.path().join("root");
-        PrivateExportDir::open(&path).unwrap();
-        let permissions = fs::metadata(&path).unwrap().permissions().mode();
-        let root = PrivateExportDir::open(&path).unwrap();
-        root.namespace(Path::new("team/alpha"))
-            .unwrap()
-            .write("reflection.md", b"private")
-            .unwrap();
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode(),
-            permissions
-        );
-    }
-}
+mod tests;
 
 #[cfg(not(unix))]
 pub(crate) struct PrivateExportDir;
@@ -486,6 +295,7 @@ impl PrivateExportDir {
     pub(crate) fn namespace(&self, _: &Path) -> io::Result<Self> {
         Self::open(Path::new(""))
     }
+    pub(crate) fn sweep_stale_staging(&self) {}
     pub(crate) fn write(&self, _: &str, _: &[u8]) -> io::Result<()> {
         Self::open(Path::new("")).map(|_| ())
     }

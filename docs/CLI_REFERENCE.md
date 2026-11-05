@@ -1448,6 +1448,14 @@ without Unix permissions refuse filesystem exports. See
 [file-backed export](RECURSIVE_LEARNING.md#file-backed-export) for migration and
 interrupted-export cleanup details.
 
+Files are synced and closed before same-directory atomic replacement; the opened
+parent directory is then synced. A directory-sync error is reported without
+removing the published file. The sweep runs once per destination directory per CLI run and
+once per auto-export call. The sweep removes regular `.private-export-*.stage` files whose
+modification time is older than one hour; files with a newer or future modification
+time are kept. Cleanup errors emit a warning and do not stop export.
+The CLI returns an error on unsupported platforms; auto-export logs a warning and writes nothing.
+
 ### `persona` — QW-2 persona-as-artifact
 
 Build a persona from observation-kind memories for a given entity.

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
+
+- `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.
+
 ### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
 
 - `forward_signal_send_to_http` resolved the forwarded `X-Agent-Id` from the wire `from_agent` through `resolve_agent_id`, so an MCP caller could forge the sender of a forwarded signal. It now uses `resolve_governance_subject` (the #3171 store-forward precedent): under an enforced caller a mismatching `from_agent` is refused with `agent_id mismatch` before any network I/O, and an absent value is filled from the caller. The HTTP handler already stamps `from_agent` from the header and ignores the body field.
@@ -2856,15 +2860,6 @@ write is permission-evaluated as; see the operator note below.
   already-existing edge reports the level that is actually STORED on the row
   rather than the signature level it computed but never persisted (the write
   is an `INSERT OR IGNORE` no-op).
-- **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
-  Both CLI recall paths wrote `--as-agent` (a namespace) into
-  `recall_observations.agent_id`: `src/cli/recall.rs` passed
-  `args.as_agent`, and the interactive shell passed `None`. The #1705
-  cross-agent replay guard keys on that column (`agent_id IS NULL OR agent_id
-  = ?`), so it was inert on both paths — a namespace cannot gate an identity.
-  Both now bind `resolve_read_visibility_caller()`, the same value the MCP/HTTP
-  writer stamps. `--as-agent` remains the namespace-scope visibility knob.
-
 ### Security
 
 - **#3192 — single-row `delete` wrote no `forget_tombstone` and did not crypto-erase, so every MCP `memory_delete` / HTTP DELETE / inbound federation `deletions[]` was LWW-resurrectable.** `db::delete` (`delete_inner`) now reuses the existing `tombstone_and_erase` primitive (the same helper `gc` / `size_gc` already call via `evict_tombstone_and_erase`) *inside* the caller's transaction: forget-tombstone INSERT, envelope crypto-erase + attestation, `cid_genesis` scrub, DLQ/dedup remanence purge, then DELETE. `insert_if_newer`'s G30 resurrection guard therefore sees the tombstone and drops a fresher peer re-push. Postgres `PostgresStore::delete` and `apply_remote_deletion` share one `pg_hard_delete_in_tx` so the two funnels cannot drift. A delete of a never-seen id stays a no-op with no tombstone and no `namespace_meta` sever (probe-then-write). Delete also discards undelivered federation DLQ pushes for that memory. Tombstone `signature` is NULL when no daemon keypair is present (unsigned resurrection guard); refuse-under-enforced-posture is the shared rule with #3240 and must not fork here. The MCP/CLI erasure-outbox remains best-effort + infallible (documented contract; an outbox failure still WARNs and does not fail the local delete). Distinct from #3177 (pg gc).
@@ -4332,27 +4327,6 @@ backend and missing or divergently implemented on its twin). Pinned by
   (`ai-memory bench (ubuntu-latest)`, `Regenerate bench baseline (ubuntu-latest,
   median-of-3)`) true again without a rename, so no required-context churn.
 
-- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
-  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
-  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
-  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
-  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
-  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
-  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
-  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
-  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
-  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
-  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
-  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
-  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
-  branch protection must be updated to match. The `enterprise-fed` Check legs
-  absorb the old `Postgres feature gate` test run (now against the real cert tier);
-  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
-  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
-  `services: postgres:` blocks + per-PR pg image builds are removed (they would
-  delete real files on the persistent hosts; the native tier is always up).
-  JUnit-style durable test-result log artifacts are uploaded per leg.
-
 ### Fixed (data integrity: merge field-set coherence, long-tier permanence, archive identity, low-end schema guard; #2399 #2395 #2394 #2385 #2564)
 
 - **A fresh `long`-tier write that carried an `expires_at` was GC-reapable
@@ -5411,32 +5385,6 @@ truthful.
   `mcp::tests::chunkc_forget_invalid_tier_string_silently_dropped`, and the
   "silently falls through" arm of
   `mcp::tools::list::tests::filters_by_tier`.
-- **Record-stop enforcement no longer silently degrades at the SAL layer when
-  the sqlite DB path resolves through a symlink** (e.g. the macOS
-  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
-  the shared record-stop registry off the raw path passed to `open`, while the
-  actuator, the `db::` funnel gate, the status read and the open-time seed all
-  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
-  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
-  entry, so a write issued under an engaged stop fell through to the deeper
-  `db::` gate and surfaced `StoreError::Backend` instead of the intended
-  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
-  SAL 503 refusal contract. The gate now caches and keys off the connection's
-  resolved path at open, restoring one source of truth across every layer.
-  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
-  symlinked-open-path regression test pins it.
-- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
-  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
-  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
-  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
-  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
-  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
-  regression the release `postgres-feature` job already fixed by raising its
-  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
-  legs on ONE host, so its ~2231s is the normal max-contention case). The
-  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
-  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
-  the outer job cap — remains what fires on a genuine hang.
 ### Fixed (cross-backend parity — write funnels: archive / delete / update)
 
 A parity audit of the sqlite and postgres write funnels found four
