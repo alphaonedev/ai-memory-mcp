@@ -48,6 +48,14 @@ class CargoAudit8615Tests(unittest.TestCase):
     def test_8615_vulnerability_exit_fails(self):
         self.assertEqual(self.run_gate(ADVISORY, returncode=1)[0], 1)
 
+    def test_8615_recorded_unfiltered_lock_fails(self):
+        report = json.loads((DATA / "cargo_audit_unfiltered_8615.json").read_text())
+        self.assertEqual(self.run_gate(report, returncode=1)[0], 1)
+
+    def test_8615_recorded_ignored_report_fails_despite_audit_success(self):
+        report = json.loads((DATA / "cargo_audit_ignored_8615.json").read_text())
+        self.assertEqual(self.run_gate(report)[0], 1)
+
     def test_8615_all_warning_categories_fail(self):
         for category in ("unmaintained", "unsound", "notice", "yanked", "future-kind"):
             report = copy.deepcopy(CLEAN)
