@@ -43,7 +43,7 @@ pub(crate) use private_file::write_private_export;
 /// post-reflect auto-export hook (#1558 batch 6).
 pub(crate) const REFLECTIONS_SUBDIR: &str = "reflections";
 
-/// Maximum input characters included per stored value in refusal diagnostics.
+/// Maximum input characters included per stored value in export messages.
 const EXPORT_DIAGNOSTIC_MAX_CHARS: usize = 128;
 
 /// Bound allocation before Debug escaping, preserving UTF-8 boundaries.
@@ -148,15 +148,22 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
+        let diagnostic_filename = format!("{}.{}", export_diagnostic(&mem.id), format.extension());
         private_file::write_private_export_in_batch(
             &path,
             payload.as_bytes(),
             &mut swept_directories,
         )
-        .with_context(|| crate::errors::msg::writing(path.display()))?;
+        .with_context(|| {
+            crate::errors::msg::writing(ns_dir.join(&diagnostic_filename).display())
+        })?;
         summary.written += 1;
         if !args.quiet {
-            writeln!(out.stdout, "wrote {}", path.display())?;
+            writeln!(
+                out.stdout,
+                "wrote {}",
+                ns_dir.join(&diagnostic_filename).display()
+            )?;
         }
     }
     writeln!(
