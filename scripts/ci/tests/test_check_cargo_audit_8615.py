@@ -252,6 +252,13 @@ class CargoAudit8615Tests(unittest.TestCase):
             with self.subTest(text=text), patch.object(Path, "read_text", return_value=text):
                 with self.assertRaises(ValueError):
                     GATE.load_policy()
+        policy = GATE.POLICY.read_text().replace('id = "RUSTSEC-2023-0071"', '')
+        with patch.object(Path, "read_text", return_value=policy):
+            with self.assertRaisesRegex(ValueError, "missing exception fields") as caught:
+                GATE.load_policy()
+            self.assertIn("rsa", str(caught.exception))
+            self.assertIn("0.9.10", str(caught.exception))
+            self.assertIn("<unavailable>", str(caught.exception))
 
     def test_8615_ignore_ids_must_equal_metadata_ids(self):
         policy = GATE.POLICY.read_text()

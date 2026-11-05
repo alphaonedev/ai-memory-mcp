@@ -2491,6 +2491,8 @@ jobs:
             exit 1
           fi
           python3 -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py
+          # The gate prints its summary and every public identity diagnostic;
+          # cargo-audit JSON and external stderr remain captured inside it.
           python3 scripts/ci/check_cargo_audit.py
 
       # CI-speed: the release build here is only a release-PROFILE compile
