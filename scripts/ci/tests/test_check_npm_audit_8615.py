@@ -7,6 +7,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -34,13 +35,21 @@ class NpmAudit8615Tests(unittest.TestCase):
     def test_8615_recorded_clean_report(self):
         code, run = self.run_gate(self.clean)
         self.assertEqual(code, 0)
-        self.assertEqual(run.call_args.args[0], ["npm", "audit", "--json", "--audit-level=low", "--prefix", "sdk/typescript"])
+        self.assertEqual(run.call_args.args[0], ["npm", "audit", "--json", "--audit-level=low", "--include=dev", "--include=optional", "--include=peer", "--prefix", "sdk/typescript"])
         self.assertTrue(run.call_args.kwargs["capture_output"])
         self.assertGreater(run.call_args.kwargs["timeout"], 0)
         self.assertNotIn("shell", run.call_args.kwargs)
 
     def test_8615_recorded_low_advisory(self):
         self.assertEqual(self.run_gate(self.vulnerable, 1)[0], 1)
+
+    def test_8615_production_environment_cannot_omit_development_audit(self):
+        with patch.dict(os.environ, {"NODE_ENV": "production", "npm_config_omit": "dev"}):
+            code, run = self.run_gate(self.clean)
+        self.assertEqual(code, 0)
+        self.assertIn("--include=dev", run.call_args.args[0])
+        self.assertIn("--include=optional", run.call_args.args[0])
+        self.assertIn("--include=peer", run.call_args.args[0])
 
     def test_8615_advisory_with_success_exit_is_rejected(self):
         self.assertEqual(self.run_gate(self.vulnerable)[0], 1)

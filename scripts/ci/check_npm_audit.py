@@ -14,6 +14,7 @@ AUDIT_TIMEOUT_SECONDS = 120
 AUDIT_REPORT_VERSION = 2
 SEVERITIES = ("info", "low", "moderate", "high", "critical")
 BLOCKING_SEVERITIES = SEVERITIES[1:]
+INCLUDED_DEPENDENCIES = ("dev", "optional", "peer")
 
 
 class AuditError(ValueError):
@@ -64,7 +65,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefix", type=Path, default=DEFAULT_PREFIX)
     args = parser.parse_args(argv)
-    command = ["npm", "audit", "--json", "--audit-level=low", "--prefix", str(args.prefix)]
+    command = ["npm", "audit", "--json", "--audit-level=low"]
+    command.extend(f"--include={kind}" for kind in INCLUDED_DEPENDENCIES)
+    command.extend(["--prefix", str(args.prefix)])
     try:
         result = subprocess.run(command, capture_output=True, text=True,
                                 timeout=AUDIT_TIMEOUT_SECONDS, check=False)
