@@ -56,7 +56,7 @@
 | **P0-2b** N≥3 enforce-as-**default** (D3-021) | **OPEN** — enforce-**capable**, mode default `off` | `"decorrelation enforced"` **BANNED** |
 | **P0-3** store attest (#1751) | **SHIPPED** (default ON) | network half open (`FED_REQUIRE_WRITE_SIG` permissive) |
 | **P0-4** epoch verify consumer (RQ-10) | **SHIPPED** | verify-only; not after 2b |
-| D3-031 consolidate gate | residual / design | may need **5-agent vote (4d3ea1c5)** |
+| D3-031 consolidate gate | residual / design | may need a **1x3 vote** at the `CLAUDE.md` threshold; cite `3-agent vote (6def5ab6)` |
 | D3-060 enforce-invariants ship-gate | **OPEN** | required before claim unlock |
 | RQ-PARITY-01 / curator unification | largely done at v0.9 | RQ-PARITY-02 residual |
 | G13 rotation lineage (v76) | **SHIPPED** | key-**loss** recovery OPEN |
@@ -203,7 +203,7 @@ Each epic is a **GitHub milestone / parent issue** candidate. Child themes = iss
 | **Goal** | Ship-gate invariants + consolidate-time re-correlation gate |
 | **Maps** | D3-060 / D3-031; W3-A4 P1; W4 P2.2–P2.3 |
 | **Depends** | E2 |
-| **Issue themes** | (1) `tests/decorrelation_enforcement_invariants.rs` · (2) Dual dominance metrics · (3) **D3-031 design vote (4d3ea1c5)** if consolidate semantics cross public contract · (4) Consolidate refuse single-attested-family clusters · (5) CI HARD-BLOCK on claim strings without green gate |
+| **Issue themes** | (1) `tests/decorrelation_enforcement_invariants.rs` · (2) Dual dominance metrics · (3) **D3-031 1x3 design vote** if the contract choice meets the threshold; cite `3-agent vote (6def5ab6)` · (4) Consolidate refuse single-attested-family clusters · (5) CI HARD-BLOCK on claim strings without green gate |
 | **DoD** | Invariants green in CI; consolidate path cannot launder monoculture past write-time gate; **only then** un-ban `"decorrelation enforced"` in release surfaces |
 | **Non-goal** | RQGM panel breeding |
 
@@ -255,7 +255,7 @@ Each epic is a **GitHub milestone / parent issue** candidate. Child themes = iss
 | **Goal** | FED-RQ-02/03 — content-signed epoch manifest cluster-wide + refuse stale `policy_version` |
 | **Maps** | Red Queen v1.0 table; W3 V10-G6; W4 P3.3 |
 | **Depends** | Local P0-4 shipped; E4 recommended; F-41/policy_version |
-| **Issue themes** | (1) Checkpoint-bound federated manifest · (2) Cross-node gate · (3) Fail-closed both backends · (4) Within-epoch-frozen invariant test · (5) **T1/T4 5-agent vote** on epoch↔Checkpoint binding if not already closed |
+| **Issue themes** | (1) Checkpoint-bound federated manifest · (2) Cross-node gate · (3) Fail-closed both backends · (4) Within-epoch-frozen invariant test · (5) **T1/T4 1x3 vote** on epoch↔Checkpoint binding if unresolved and above the threshold; cite `3-agent vote (6def5ab6)` |
 | **DoD** | Manifest propagates; stale push rejected; no CLAIMED diversity laundered into signed epoch |
 | **Non-goal** | In-src RQGM optimizer; hive-of-millions ops proof |
 
@@ -486,9 +486,14 @@ Velocity is free variable (single-operator AI-accelerated). **Invariant:** P-A/P
 
 ---
 
-## 11. Crossroads vote triggers (inside epic — 4d3ea1c5)
+## 11. Crossroads vote conditions and threshold (inside epic — 6def5ab6)
 
-Run **5-agent adversarial vote** before acting when any `Tn` holds:
+Run a **1x3 adversarial vote** before acting only when a `Tn` condition **and**
+the hard-to-reverse or safety-bearing threshold in `CLAUDE.md` both hold. Use
+one round of three distinct read-only scout-tier lenses; the majority decides,
+and the conductor resolves a 1-1-1 split with a recorded rationale. Store the
+decision before implementation and cite `3-agent vote (6def5ab6)`.
+The earlier five-agent form (`4d3ea1c5`) was superseded on 2026-10-10.
 
 | T | Likely epic |
 |---|-------------|

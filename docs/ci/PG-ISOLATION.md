@@ -7,7 +7,8 @@ Status: **opt-in, off on every CI leg.** The lane runs only when
 it ever does). This was decided by GOD in review r1 (M4): the first sharded
 carrier run goes with isolation off. Making it the default, and raising
 in-binary `--test-threads` above 1, wait for two green sharded carrier runs and
-a 5-agent vote (`4d3ea1c5`). The repository variable `CI_PG_ISOLATE_OFF=1` is
+the 1x3 vote when the `CLAUDE.md` threshold is met, cited as
+`3-agent vote (6def5ab6)`. The repository variable `CI_PG_ISOLATE_OFF=1` is
 an extra hard kill switch that wins over the flag.
 
 ## What changes when it is on
