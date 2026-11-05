@@ -101,6 +101,45 @@ class TrackedSymlink(unittest.TestCase):
         self.assertIn(REASON_ERROR, out, out)
         self.assertEqual(len(out.splitlines()), 3, out)
 
+    def assert_closed(self, out: str, reason: str) -> None:
+        """Assert both verdicts false, `reason` named, and exactly three lines."""
+        self.assertIn(SKIP_FALSE, out, out)
+        self.assertIn(DOCS_FALSE, out, out)
+        self.assertIn(reason, out, out)
+        self.assertEqual(len(out.splitlines()), 3, out)
+
+    def test_m1_bare_repository_fails_closed(self):
+        """(r3 m1) a bare clone of a repo tracking a symlink has no work tree."""
+        self.commit_link("notes/link.txt", "../real.txt", {"real.txt": "r\n"})
+        bare = self.repo / "bare.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.repo), str(bare)],
+                       check=True, capture_output=True)
+        env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(self.repo))
+        self.assert_closed(run_cli(bare, DOCS_CHANGE, env=env), REASON_ERROR)
+
+    def test_m2_repo_naming_a_subdirectory_still_sees_the_symlink_outside_it(self):
+        """(r3 m2) --repo docs/ while the symlink sits outside docs/."""
+        self.commit_link("notes/link.txt", "../real.txt",
+                         {"real.txt": "r\n", "docs/other.md": "o\n"})
+        self.assert_closed(run_cli(self.repo / "docs", "docs/other.md"), REASON_TRACKED)
+
+    def test_m3_worktree_without_an_index_still_sees_the_head_symlink(self):
+        """(r3 m3) the index file is gone; HEAD still tracks a symlink."""
+        self.commit_link("notes/link.txt", "../real.txt",
+                         {"real.txt": "r\n", "docs/other.md": "o\n"})
+        (self.repo / ".git" / "index").unlink()
+        self.assert_closed(run_cli(self.repo, "docs/other.md"), REASON_TRACKED)
+
+    def test_git_that_cannot_start_fails_closed(self):
+        """(r3 F2) PATH names an empty directory, so git is not found."""
+        write_files(self.repo, {"docs/other.md": "o\n"})
+        git(self.repo, "add", "--", "docs/other.md")
+        git(self.repo, "commit", "-q", "-m", "plain")
+        empty = self.repo / "empty-path"
+        empty.mkdir()
+        env = dict(os.environ, PATH=str(empty))
+        self.assert_closed(run_cli(self.repo, "docs/other.md", env=env), REASON_ERROR)
+
 
 if __name__ == "__main__":
     unittest.main()
