@@ -16,8 +16,6 @@ const SHAPE_1X3: &str = "1x3";
 const AUDIT_CITATION: &str = "3-agent vote (6def5ab6)";
 const THRESHOLD_PHRASE: &str = "with a threshold";
 const SUPERSEDED_SHAPES: [&str; 2] = ["5 concurrent", "5-agent vote (4d3ea1c5)"];
-const HISTORY_LINE_PREFIX: &str = "Prior 5-agent votes";
-const LEADING_MARKUP: [char; 3] = ['*', '_', '>'];
 const CONDITIONS: [&str; 6] = ["T1", "T2", "T3", "T4", "T5", "T6"];
 
 fn claude_md() -> String {
@@ -33,13 +31,6 @@ fn crossroads_section(text: &str) -> &str {
     let rest = &text[start..];
     let end = rest.find(NEXT_SECTION_MARKER).unwrap_or(rest.len());
     &rest[..end]
-}
-
-/// A history line is exempt only when it STARTS with the exact history
-/// sentence prefix after leading whitespace and markdown emphasis are trimmed.
-fn is_history_line(line: &str) -> bool {
-    line.trim_start_matches(|c: char| c.is_whitespace() || LEADING_MARKUP.contains(&c))
-        .starts_with(HISTORY_LINE_PREFIX)
 }
 
 #[test]
@@ -65,11 +56,10 @@ fn crossroads_section_prescribes_the_1x3_vote_8604() {
         );
     }
     for line in section.lines() {
-        let is_history = is_history_line(line);
         for shape in SUPERSEDED_SHAPES {
             assert!(
-                is_history || !line.contains(shape),
-                "crossroads section prescribes superseded `{shape}` outside a history line: {line}"
+                !line.contains(shape),
+                "crossroads section prescribes superseded `{shape}`: {line}"
             );
         }
     }
