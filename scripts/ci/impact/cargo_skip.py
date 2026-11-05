@@ -27,8 +27,15 @@ skip verdict, with the --repo directory as the tree:
    work tree is resolved with `git -C <repo> rev-parse --show-toplevel` and
    scanned whatever --repo names inside it, from two listings: the index
    (`git ls-files -s -z`) and the committed tree (`git ls-tree -r -z HEAD`).
-   A mode 120000 entry in either gives both verdicts false with reason
-   tracked-symlink-full-ci naming the first path. This costs a full run even
+   The index is scanned first, so a symlink found there is reported before the
+   HEAD-tree listing runs. A mode 120000 entry in either gives both verdicts
+   false with reason tracked-symlink-full-ci naming the first path. A mode
+   160000 entry (a gitlink; no submodule checkout is needed) is treated the
+   same way with reason tracked-gitlink-full-ci, so a gitlink under a docs glob
+   cannot keep a docs-only verdict. Every git call runs with the
+   repository-locating variables of `git rev-parse --local-env-vars` removed
+   from its environment (GIT_LOCAL_ENV_VARS), so an inherited GIT_DIR,
+   GIT_WORK_TREE or GIT_INDEX_FILE cannot point the scan at another repository. This costs a full run even
    for a symlink outside every test_read_globs entry; the classifier never
    expands a wildcard glob or walks the tree.
 2. Defence in depth: a path named by test_read_globs (the literal path, or the
@@ -39,17 +46,21 @@ skip verdict, with the --repo directory as the tree:
    are NOT walked or checked.
 
 A missing path is not a symlink and keeps the normal verdict. A bare
-repository, a directory that is not a repository, an unborn HEAD, git missing,
-a git timeout or a nonzero git exit all fail closed: both verdicts false with
-reason classifier-error-fail-closed carrying the return code and the head of
-stderr.
+repository, a directory that is not a repository, git missing, a git timeout
+or a nonzero git exit all fail closed: both verdicts false with reason
+classifier-error-fail-closed carrying the return code and the head of stderr.
+An unborn HEAD with nothing staged takes that path (the HEAD-tree listing exits
+nonzero); an unborn HEAD with a staged symlink or gitlink reports
+tracked-symlink-full-ci or tracked-gitlink-full-ci instead, because the index
+scan finds it before the HEAD-tree listing runs.
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # Appended, never first: a scripts/ci module named like a stdlib module must not
 # shadow it (security F1, #8328). The workflow also runs this file from the base
@@ -73,7 +84,20 @@ REASON_BASE = "protected-base-full-ci"
 REASON_CI_TREE = "ci-tree-edited-full-ci"
 REASON_SYMLINK = "registered-read-path-is-symlink-full-ci"
 REASON_TRACKED_SYMLINK = "tracked-symlink-full-ci"
+REASON_TRACKED_GITLINK = "tracked-gitlink-full-ci"
 GIT_SYMLINK_MODE = "120000"
+GIT_GITLINK_MODE = "160000"
+GIT_FORCED_MODES = {GIT_SYMLINK_MODE: REASON_TRACKED_SYMLINK,
+                    GIT_GITLINK_MODE: REASON_TRACKED_GITLINK}
+# Source: the output of `git rev-parse --local-env-vars` (git 2.43). These are the
+# variables that locate or reshape a repository; a caller must not steer the
+# classifier's git calls with them. A test pins the list against the host git.
+GIT_LOCAL_ENV_VARS = frozenset((
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR"))
 STDERR_HEAD_CHARS = 120
 PRINTABLE_ASCII = re.compile(r"[^\x20-\x7e]")
 GLOB_WILDCARDS = frozenset("*?[")
@@ -161,6 +185,15 @@ def symlinked_read_path(section: dict, repo: Path) -> Optional[str]:
     return None
 
 
+def git_environment(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Return a copy of `base` (default os.environ) without GIT_LOCAL_ENV_VARS.
+
+    PATH and every other variable stay, so git missing from PATH still fails closed.
+    """
+    source = os.environ if base is None else base
+    return {k: v for k, v in source.items() if k not in GIT_LOCAL_ENV_VARS}
+
+
 def git_output(repo: Path, args: List[str], what: str) -> bytes:
     """Return stdout of `git -C <repo> <args>`; raise RuntimeError on any failure.
 
@@ -169,7 +202,8 @@ def git_output(repo: Path, args: List[str], what: str) -> bytes:
     """
     try:
         res = subprocess.run(["git", "-C", str(repo)] + args,
-                             capture_output=True, timeout=GIT_TIMEOUT_S)
+                             capture_output=True, timeout=GIT_TIMEOUT_S,
+                             env=git_environment())
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("%s did not run: %s" % (what, clean_text(str(exc)))) from exc
     if res.returncode != 0:
@@ -178,21 +212,24 @@ def git_output(repo: Path, args: List[str], what: str) -> bytes:
     return res.stdout
 
 
-def first_symlink_entry(listing: bytes) -> Optional[str]:
-    """Return the path of the first mode 120000 entry of a NUL-separated listing.
+def first_forced_entry(listing: bytes) -> Optional[Tuple[str, str]]:
+    """Return (reason, path) of the first mode 120000 or 160000 entry of a listing.
+
+    The listing is NUL-separated.
 
     Both `ls-files -s -z` and `ls-tree -r -z` put the mode first, then a TAB
     before the path.
     """
     for entry in listing.split(common.NUL.encode()):
         meta, _, path = entry.partition(b"\t")
-        if meta.split(b" ", 1)[0].decode("ascii", "replace") == GIT_SYMLINK_MODE:
-            return path.decode("utf-8", "replace")
+        reason = GIT_FORCED_MODES.get(meta.split(b" ", 1)[0].decode("ascii", "replace"))
+        if reason:
+            return reason, path.decode("utf-8", "replace")
     return None
 
 
-def tracked_symlink(repo: Path) -> Optional[str]:
-    """Return the first tracked symlink (mode 120000) of the work tree around `repo`.
+def tracked_symlink(repo: Path) -> Optional[Tuple[str, str]]:
+    """Return (reason, path) of the first tracked symlink or gitlink around `repo`.
 
     The top of the work tree is resolved first (`rev-parse --show-toplevel`),
     so the scan covers the whole tree whatever --repo names inside it. The top
@@ -208,7 +245,7 @@ def tracked_symlink(repo: Path) -> Optional[str]:
     top = Path(top_raw.removesuffix(b"\n").decode("utf-8", "surrogateescape"))
     for args, what in ((["ls-files", "-s", "-z"], "git ls-files"),
                        (["ls-tree", "-r", "-z", "HEAD"], "git ls-tree")):
-        found = first_symlink_entry(git_output(top, args, what))
+        found = first_forced_entry(git_output(top, args, what))
         if found:
             return found
     return None
@@ -255,7 +292,7 @@ def classify(section: dict, paths: List[str], event_name: str = "",
             return verdict(FALSE, FALSE, "%s %s %s" % (REASON_ERROR, exc, version))
         if tracked:
             return verdict(FALSE, FALSE, "%s %s %s" % (
-                REASON_TRACKED_SYMLINK, clean_text(tracked), version))
+                tracked[0], clean_text(tracked[1]), version))
         linked = symlinked_read_path(section, repo)
         if linked:
             return verdict(FALSE, FALSE, "%s %s %s" % (REASON_SYMLINK, linked, version))
@@ -283,7 +320,8 @@ def diff_paths(repo: Path, base: str, head: str) -> List[str]:
     """Return the changed paths (old paths of renames included)."""
     res = subprocess.run(
         ["git", "diff", "--no-renames", "--name-only", "-z", base, head],
-        cwd=str(repo), capture_output=True, timeout=GIT_TIMEOUT_S)
+        cwd=str(repo), capture_output=True, timeout=GIT_TIMEOUT_S,
+        env=git_environment())
     if res.returncode != 0:
         raise RuntimeError("git diff failed")
     return [p.decode("utf-8", "surrogateescape")
