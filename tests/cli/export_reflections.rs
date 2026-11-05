@@ -209,6 +209,53 @@ fn cli_namespace_refusal_escapes_stored_id_8605() {
 }
 
 #[test]
+fn cli_namespace_refusal_bounds_stored_values_8605() {
+    const OVERSIZED_CHARS: usize = 1024 * 1024;
+    const STDERR_MAX_BYTES: usize = 4096;
+    let cases = [
+        ("\u{1}".repeat(OVERSIZED_CHARS), "..".to_string()),
+        (
+            "short-id".to_string(),
+            format!("{}/..", "é".repeat(OVERSIZED_CHARS)),
+        ),
+    ];
+    for (stored_id, namespace) in cases {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("ai-memory.db");
+        let conn = open(&db_path);
+        let original_id = seed_observation(&conn, "bounded-export-diagnostic", "source");
+        conn.execute(
+            "UPDATE memories SET id = ?1, namespace = ?2, memory_kind = 'reflection' WHERE id = ?3",
+            rusqlite::params![stored_id, namespace, original_id],
+        )
+        .unwrap();
+        db::checkpoint(&conn).expect("checkpoint before subprocess read");
+        drop(conn);
+        let output = assert_cmd::Command::cargo_bin("ai-memory")
+            .unwrap()
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .arg("--db")
+            .arg(&db_path)
+            .arg("export-reflections")
+            .arg("--out-dir")
+            .arg(tmp.path().join("exports"))
+            .arg("--quiet")
+            .assert()
+            .failure();
+        let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
+        assert!(
+            stderr.len() <= STDERR_MAX_BYTES,
+            "refusal stderr must be bounded, got {} bytes",
+            stderr.len()
+        );
+        let original_bytes = stored_id.len().max(namespace.len());
+        assert!(stderr.contains(&format!("[truncated; original_bytes={original_bytes}]")));
+        assert!(stderr.contains("refusing export path"));
+        assert!(!stderr.contains('\u{1}'));
+    }
+}
+
+#[test]
 fn cli_namespace_path_8591_refuses_traversal() {
     assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Cli);
 }
