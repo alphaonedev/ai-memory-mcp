@@ -396,8 +396,11 @@ def findings(text: str, allowed: frozenset[str],
     used = set()
     lines = original.split("\n")
     for match in sorted(matches, key=lambda value: value.start()):
-        if match.re is BARE_HOME and text.startswith(SCHEME_SEPARATOR, match.end()):
-            continue
+        if match.re is BARE_HOME:
+            header = SCHEME_HEADER.match(original, offsets[match.start()] + 1)
+            if (header and
+                    header.group()[:-len(SCHEME_SEPARATOR)].casefold() in WEB_URL_SCHEMES):
+                continue
         if not tilde_start_allowed(text, match.start()):
             continue
         if match.re in (NAMED_HOME, BARE_HOME) and match.group("name")[0].isnumeric():
