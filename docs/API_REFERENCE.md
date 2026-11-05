@@ -176,7 +176,10 @@ deployments. `POST /agents/{id}/pubkey/challenge` and `PUT /agents/{id}/pubkey`
 additionally require a credential-bound admin (the admin's own enrolled
 per-agent `X-API-Key` or an active verified certificate mapping to that admin),
 not a claimed header (#8494, #8590); a refusal is a 403 with a
-forensic audit row. `POST /agents/{id}/api-key` and
+forensic audit row. For the Postgres enrollment/refresh/HTTP sequence and the
+SQLite-only `agents bind-key` distinction, see [ADMIN_GUIDE, SQLite and Postgres
+bootstrap](ADMIN_GUIDE.md#sqlite-and-postgres-bootstrap-8537) (#8537).
+`POST /agents/{id}/api-key` and
 `POST /agents/{id}/api-key/revoke` carry the same requirement (#8535): a
 claimed admin header is a `403` with a forensic audit row (reason
 `claimed_admin_not_key_authenticated`), and a malformed `{id}` is a `400`

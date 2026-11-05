@@ -75,11 +75,16 @@ Data integrity, security, performance, encryption are priorities. **v1.0.0 ships
 
 ---
 
-## 3. The 3×3 adversarial decision protocol
+## 3. The 1x3 adversarial decision protocol with a threshold
 
-Canonical memory: `4d3ea1c5`. Mirrored in `CLAUDE.md` §"Crossroads decision protocol".
+Canonical memory: `6def5ab6`. Mirrored in `CLAUDE.md` §"Crossroads decision protocol".
+The earlier five-agent form (`4d3ea1c5`) was superseded on 2026-10-10;
+historical vote records below keep their original evidence.
 
-### Deterministic triggers — vote if ANY holds, no judgement call
+### Conditions — vote only if a condition AND the threshold hold
+
+Apply the hard-to-reverse or safety-bearing threshold in `CLAUDE.md` as well as
+the T1–T6 conditions below. Trivial or mechanically reversible choices do not vote.
 
 | | trigger |
 |---|---|
@@ -94,14 +99,17 @@ Canonical memory: `4d3ea1c5`. Mirrored in `CLAUDE.md` §"Crossroads decision pro
 
 ### Vote shape
 
-N concurrent agents (9 for a 3×3; 5 and 3×7 have both been used), each a **distinct adversarial lens** — diversity is mandatory or they converge by groupthink. Each returns exactly:
+One round of exactly 3 concurrent read-only scout-tier agents, each a **distinct
+adversarial lens**, using the measured facts in the prompt. Each returns:
 
 ```
-VERDICT / CONFIDENCE (0-100) / RATIONALE (<=150 words, cite file:line) /
+VERDICT / CONFIDENCE (0-100) / RATIONALE (<=120 words, cite file:line) /
 TOP_RISK (of its own choice) / KILLER_OBJECTION (against its own verdict)
 ```
 
-Tally, synthesize, record the ruling **before** implementing. Cite `5-agent vote (4d3ea1c5)` in the commit or issue.
+The majority decides; a 1-1-1 split goes to the conductor, who records why.
+Tally, synthesize, record the ruling **before** implementing. Cite
+`3-agent vote (6def5ab6)` in the commit or issue.
 
 ### Two hard-won lessons about running votes
 

@@ -22,6 +22,7 @@
 //! the file on disk is a derived artefact. Operators may freely
 //! delete / regenerate the directory at any time.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -115,18 +116,30 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
     let mut summary = ExportSummary::default();
 
     let reflections = collect_reflections(&conn, args.namespace.as_deref(), args.since.as_deref())?;
+    let mut swept_directories = HashSet::new();
     for mem in &reflections {
         let edges = collect_outbound_reflects_on(&conn, &mem.id)?;
         let attest_level = summarise_attest_level(&edges);
         let payload = render_payload(mem, &edges, attest_level, format);
 
-        let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace));
+        let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace).with_context(
+            || {
+                format!(
+                    "memory {} namespace {:?}: refusing export path",
+                    mem.id, mem.namespace
+                )
+            },
+        )?);
         fs::create_dir_all(&ns_dir)
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
-        write_private_export(&path, payload.as_bytes())
-            .with_context(|| crate::errors::msg::writing(path.display()))?;
+        private_file::write_private_export_in_batch(
+            &path,
+            payload.as_bytes(),
+            &mut swept_directories,
+        )
+        .with_context(|| crate::errors::msg::writing(path.display()))?;
         summary.written += 1;
         if !args.quiet {
             writeln!(out.stdout, "wrote {}", path.display())?;
@@ -199,12 +212,21 @@ pub(crate) fn resolve_out_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 
 /// Namespace → safe filesystem path component. Slashes are preserved
 /// (so `team/alpha` becomes nested subdirs), every other "weird"
-/// character is replaced with `_`. The substrate already validates
-/// namespace strings on the write path, so the universe of inputs is
-/// already constrained — this is defence-in-depth.
-pub(crate) fn sanitise_namespace_for_path(ns: &str) -> PathBuf {
+/// character is replaced with `_`. Dot-only components are refused before
+/// joining, never rewritten. This is deliberately stricter than
+/// `validate_namespace`, which rejects only exact `.` and `..` components.
+/// The broader refusal is defence in depth against Windows trailing-dot
+/// normalisation and other platform-specific handling, as required by #8591.
+///
+/// # Errors
+///
+/// Returns an error for any non-empty component consisting only of dots.
+pub(crate) fn sanitise_namespace_for_path(ns: &str) -> Result<PathBuf> {
     let mut buf = PathBuf::new();
     for component in ns.split('/') {
+        if !component.is_empty() && component.chars().all(|c| c == '.') {
+            anyhow::bail!("namespace path cannot contain dot-only components");
+        }
         let cleaned: String = component
             .chars()
             .map(|c| {
@@ -222,7 +244,7 @@ pub(crate) fn sanitise_namespace_for_path(ns: &str) -> PathBuf {
     if buf.as_os_str().is_empty() {
         buf.push("_unnamed");
     }
-    buf
+    Ok(buf)
 }
 
 /// Read every reflection-kind memory matching the supplied filters.
@@ -465,12 +487,48 @@ mod tests {
 
     #[test]
     fn sanitise_namespace_handles_slashes_and_weird_chars() {
-        let p = sanitise_namespace_for_path("team/alpha");
+        let p = sanitise_namespace_for_path("team/alpha").unwrap();
         assert_eq!(p, PathBuf::from("team").join("alpha"));
-        let p2 = sanitise_namespace_for_path("evil:ns?with*bits");
+        let p2 = sanitise_namespace_for_path("evil:ns?with*bits").unwrap();
         assert_eq!(p2, PathBuf::from("evil_ns_with_bits"));
-        let p3 = sanitise_namespace_for_path("");
+        let p3 = sanitise_namespace_for_path("").unwrap();
         assert_eq!(p3, PathBuf::from("_unnamed"));
+    }
+
+    #[test]
+    fn sanitise_namespace_path_8591_refuses_every_dot_only_component() {
+        for namespace in [
+            ".",
+            "..",
+            "...",
+            "....",
+            "team/./member",
+            "team/../member",
+            "team/.../member",
+            "team/../../escaped",
+        ] {
+            let error = sanitise_namespace_for_path(namespace).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "namespace path cannot contain dot-only components"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitise_namespace_path_8591_preserves_dotted_names_and_empty_fallback() {
+        for (namespace, expected) in [
+            ("team.v1/member.name", "team.v1/member.name"),
+            (".hidden/team..name", ".hidden/team..name"),
+            ("...named/trailing.", "...named/trailing."),
+            ("team//member/", "team/member"),
+            ("/", "_unnamed"),
+        ] {
+            assert_eq!(
+                sanitise_namespace_for_path(namespace).unwrap(),
+                PathBuf::from(expected)
+            );
+        }
     }
 
     #[test]

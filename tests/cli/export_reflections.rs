@@ -91,6 +91,109 @@ fn run_cli(db_path: &Path, args: &ExportReflectionsArgs) -> i32 {
     export_reflections::run(db_path, args, &mut out).expect("run")
 }
 
+#[derive(Clone, Copy)]
+enum NamespaceExportWriter {
+    Cli,
+    Automatic,
+}
+
+fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWriter) {
+    use ai_memory::hooks::post_reflect::auto_export::{AutoExportConfig, run_auto_export};
+
+    const VALID_NAMESPACE: &str = "export-path-regression";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    enable_auto_export(&conn, VALID_NAMESPACE);
+    let source_id = seed_observation(&conn, VALID_NAMESPACE, "source");
+    let reflection_id = drive_reflect(
+        &conn,
+        &db_path,
+        VALID_NAMESPACE,
+        &source_id,
+        "path regression",
+    );
+    // Bypass ingestion validation only in the fixture: export must defend
+    // against dot-only namespace components already present in durable input.
+    conn.execute(
+        "UPDATE memories SET namespace = ?1 WHERE id = ?2",
+        rusqlite::params![namespace, reflection_id],
+    )
+    .unwrap();
+    let root = tmp.path().join("fixture-root");
+    let out_dir = root.join("exports");
+    let result = match writer {
+        NamespaceExportWriter::Cli => {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut output = CliOutput {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            };
+            export_reflections::run(&db_path, &make_args(&out_dir), &mut output).map(|_| ())
+        }
+        NamespaceExportWriter::Automatic => run_auto_export(
+            &db_path,
+            &reflection_id,
+            VALID_NAMESPACE,
+            &AutoExportConfig {
+                out_dir: out_dir.clone(),
+                format: export_reflections::ExportFormat::Markdown,
+            },
+        ),
+    };
+    assert!(
+        !root.join("escaped").exists(),
+        "export must not create a path outside its output directory"
+    );
+    let error = result.expect_err("dot-only namespace component must be refused");
+    assert_eq!(
+        error.root_cause().to_string(),
+        "namespace path cannot contain dot-only components"
+    );
+    if matches!(writer, NamespaceExportWriter::Cli) {
+        assert_eq!(
+            error.to_string(),
+            format!("memory {reflection_id} namespace {namespace:?}: refusing export path")
+        );
+    }
+    if out_dir.exists() {
+        assert!(
+            std::fs::read_dir(&out_dir).unwrap().next().is_none(),
+            "refused namespace must not create an export subtree"
+        );
+    }
+}
+
+#[test]
+fn cli_namespace_path_8591_refuses_traversal() {
+    assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Cli);
+}
+
+#[test]
+fn cli_namespace_path_8591_reports_row_with_escaped_namespace_r2() {
+    assert_stored_namespace_refused("line\nbreak/..", NamespaceExportWriter::Cli);
+}
+
+#[test]
+fn auto_namespace_path_8591_refuses_traversal() {
+    assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Automatic);
+}
+
+#[test]
+fn cli_namespace_path_8591_refuses_dot_only_components() {
+    for namespace in ["...", ".", "..", "....", "team/./member", "team/../member"] {
+        assert_stored_namespace_refused(namespace, NamespaceExportWriter::Cli);
+    }
+}
+
+#[test]
+fn auto_namespace_path_8591_refuses_dot_only_components() {
+    for namespace in ["...", ".", "..", "....", "team/./member", "team/../member"] {
+        assert_stored_namespace_refused(namespace, NamespaceExportWriter::Automatic);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // test_export_reflections_writes_md_files
 // ─────────────────────────────────────────────────────────────────────
