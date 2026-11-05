@@ -1365,11 +1365,25 @@ public key is the root of every later signature check, so
 `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` posture. They require either an
 admin that presents its own enrolled per-agent key (`X-API-Key` bound to that
 admin id; enrol it with `agents bind-api-key`), or the explicit operator
-opt-in `AI_MEMORY_ADMIN_HEADER_TRUST=1` (which then also lets a header claim
-bind keys; the boot WARN names it). The local operator path (`agents bind-key`
-on the data-tier host, MCP stdio) is unchanged. A refused request returns 403,
-binds nothing, and writes a `bind_agent_pubkey` /
-`claimed_admin_not_key_authenticated` row to the forensic audit chain.
+opt-in `AI_MEMORY_ADMIN_HEADER_TRUST=1` while the enrolled registry is empty
+(#8574; an authoritative store read confirms emptiness, and a read error refuses).
+Once any per-agent key is enrolled, that opt-in cannot authorize a header claim
+to bind keys. A refusal returns 403, binds nothing, and records `bind_agent_pubkey`
+with the applicable principal/registry refusal reason in the forensic audit chain.
+
+#### SQLite and Postgres bootstrap (#8537)
+
+`ai-memory agents bind-key` is a
+local SQLite command; it does not bind a key in a Postgres-backed daemon.
+For Postgres, use a build with `sal,sal-postgres` and enrol an
+allowlisted admin's per-agent key in the daemon's own store:
+`ai-memory agents bind-api-key --agent-id <admin-id> --token-file <0600-token-file>`.
+Select that Postgres store with `AI_MEMORY_STORE_URL_FILE` pointing to a protected
+URL file; the verb also accepts `--store-url <postgres-url>`, but the file channel
+keeps credentials off argv. Wait for a successful daemon key-registry refresh
+(or restart if refresh is disabled), then authenticate as that admin with its
+enrolled `X-API-Key` for the HTTP challenge and proof-of-possession bind above.
+The MCP stdio local-operator path is unchanged.
 
 **Minting and revoking an api-key needs a verified admin (#8535).**
 `POST /api/v1/agents/{id}/api-key` and `POST /api/v1/agents/{id}/api-key/revoke`
@@ -1667,17 +1681,27 @@ full-database read principal.
    with non-overlapping `--mtls-allowlist` files. The sync substrate
    does not enforce namespace-level tenancy across mTLS peers.
 
-**Roadmap to per-namespace / per-scope sync filtering.** Per-memory
-visibility filtering on `/sync/since` is a Phase 5 hub feature
-(post-v0.7.0, tracked under [#311](https://github.com/alphaonedev/ai-memory-mcp/issues/311)
-for the targeted-share variant and under [#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717)
-for cert-SAN agent-id attestation). v0.7.0 ships the mTLS full-trust
-model documented above as the canonical disposition for the
-`alphaonedev/ai-memory-mcp` v0.7.0 release line.
+**Shipped peer scope and sender controls.** `AI_MEMORY_FED_PEER_ATTESTATION`
+maps peer ids to `allowed_namespaces` for `/sync/since` and
+`allowed_sender_agent_ids` for `/sync/push`. Issues
+[#238](https://github.com/alphaonedev/ai-memory-mcp/issues/238) and
+[#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717) are closed;
+their v0.7 substrate disposition cites [PR #716](https://github.com/alphaonedev/ai-memory-mcp/pull/716).
+That closure does not mean certificate SAN extraction shipped.
 
-#### Body-claimed sender_agent_id is not yet attested (issue #238)
+#### Sender identity checks and certificate binding
 
-mTLS gates network access but the receiving handler accepts `sender_agent_id` from the body without checking it matches the cert's CN/SAN. A peer with a valid cert can claim any agent_id. Tracked as Layer 2b for v0.7.
+The receiver checks body `sender_agent_id` against `x-peer-id`: a different
+sender requires an exact `allowed_sender_agent_ids` entry for that peer.
+Missing headers and unauthorized mismatches return 403 unless the operator
+sets the explicit bypass `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`.
+To bind the header to the presented certificate, configure
+`AI_MEMORY_FED_CERT_PEER_BINDING_MAP` with certificate fingerprints and peer ids.
+`AI_MEMORY_FED_CERT_PEER_BINDING=off|warn|enforce` controls this separate check:
+`warn` is the Standard default and logs mismatches; `enforce` returns 401 for
+a mismatch, an unmapped certificate, or a missing header on the binding acceptor.
+Without that map/acceptor the certificate check is inert even in `enforce`.
+The binding uses the operator's fingerprint map, not the certificate CN or SAN.
 
 ### mTLS setup recipe
 
