@@ -5,6 +5,7 @@
 
 import contextlib
 import copy
+from datetime import date, timedelta
 import io
 import json
 import os
@@ -18,6 +19,106 @@ CI_DIR = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = Path(__file__).resolve().parent / "data" / "npm_audit_8615"
 sys.path.insert(0, str(CI_DIR))
 import check_npm_audit as gate
+
+TODAY = date(2026, 11, 5)
+ADVISORY_ID = "GHSA-gcqx-w48m-w2h4"
+DEEP_MERGE_NODE = "node_modules/deepmerge"
+
+
+class NpmExceptions8615Tests(unittest.TestCase):
+    def setUp(self):
+        self.report = json.loads((FIXTURE_DIR / "vulnerable.json").read_text())
+        self.entries = [{"advisory": ADVISORY_ID, "package": "deepmerge",
+                         "version": "4.3.1", "issue": 8616,
+                         "expires": "2027-02-03", "reason": "No patched release; tracked remediation."}]
+        self.versions = {DEEP_MERGE_NODE: "4.3.1"}
+
+    def check(self):
+        return gate.check_audit(json.dumps(self.report), self.entries, self.versions, TODAY)
+
+    def test_8615_unlisted_advisory_is_rejected(self):
+        self.entries = []
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+    def test_8615_expired_exception_is_rejected(self):
+        self.entries[0]["expires"] = (TODAY - timedelta(days=1)).isoformat()
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+    def test_8615_stale_package_version_or_absent_advisory_is_rejected(self):
+        for field, value in (("package", "jest"), ("version", "4.3.2")):
+            with self.subTest(field=field):
+                original = self.entries[0][field]
+                self.entries[0][field] = value
+                with self.assertRaises(gate.AuditError):
+                    self.check()
+                self.entries[0][field] = original
+        self.report = json.loads((FIXTURE_DIR / "clean.json").read_text())
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+    def test_8615_missing_exception_fields_are_rejected(self):
+        original = dict(self.entries[0])
+        for field in original:
+            with self.subTest(field=field):
+                self.entries = [{key: value for key, value in original.items() if key != field}]
+                with self.assertRaises(gate.AuditError):
+                    self.check()
+
+    def test_8615_exact_live_exception_covers_all_seven_via_nodes(self):
+        self.assertEqual(self.check(), 1)
+
+    def test_8615_version_is_taken_from_actual_nodes_not_advisory_range(self):
+        self.versions[DEEP_MERGE_NODE] = "4.2.2"
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+    def test_8615_every_installed_copy_must_match(self):
+        nested = "node_modules/other/node_modules/deepmerge"
+        self.report["vulnerabilities"]["deepmerge"]["nodes"].append(nested)
+        self.versions[nested] = "4.3.0"
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+    def test_8615_unknown_advisory_on_listed_package_is_rejected(self):
+        advisory = copy.deepcopy(self.report["vulnerabilities"]["deepmerge"]["via"][0])
+        advisory["url"] = "https://github.com/advisories/GHSA-2345-2345-2345"
+        self.report["vulnerabilities"]["deepmerge"]["via"].append(advisory)
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+    def test_8615_unresolved_empty_and_cyclic_via_chains_are_rejected(self):
+        for via in (["missing"], [], ["jest"]):
+            with self.subTest(via=via):
+                self.report["vulnerabilities"]["jest"]["via"] = via
+                with self.assertRaises(gate.AuditError):
+                    self.check()
+
+    def test_8615_invalid_exception_values_are_rejected(self):
+        original = dict(self.entries[0])
+        for field, value in (("expires", "20270203"), ("expires", "2027-02-04"),
+                             ("issue", True), ("issue", 0), ("reason", ""),
+                             ("reason", "two\nlines"), ("version", "^4.3.1"),
+                             ("advisory", "not-an-advisory")):
+            with self.subTest(field=field, value=value):
+                self.entries = [dict(original, **{field: value})]
+                with self.assertRaises(gate.AuditError):
+                    self.check()
+
+    def test_8615_duplicate_exception_is_rejected(self):
+        self.entries.append(dict(self.entries[0]))
+        with self.assertRaises(gate.AuditError):
+            self.check()
+
+    def test_8615_expiry_date_itself_is_accepted(self):
+        self.entries[0]["expires"] = TODAY.isoformat()
+        self.assertEqual(self.check(), 1)
+
+    def test_8615_report_node_package_must_match_advisory_package(self):
+        self.report["vulnerabilities"]["deepmerge"]["via"][0]["name"] = "jest"
+        with self.assertRaises(gate.AuditError):
+            self.check()
 
 
 class NpmAudit8615Tests(unittest.TestCase):
