@@ -203,6 +203,32 @@ def shapes():
         spans = ((len(left), len(left + prefix)),) if private else ()
         yield Shape(f"tilde-web:{scheme}:{root}:{name}", left + prefix + "/x", spans)
 
+    # Round 11 F1: a scheme-looking suffix does not make an account a web header.
+    for (left, closing), name, tail in product(
+            (("", ""), ("see ", ""), ("`", "`"), ("-I", ""), ("/srv/", "")),
+            ("private_account", "private\u200bq", "private_account.x"),
+            ("://h/x", ":///x", "://")):
+        prefix = "~" + name
+        yield Shape(f"tilde-non-web:{left}:{name!r}:{tail}",
+                    left + prefix + tail + closing, ((len(left), len(left + prefix)),))
+    # Independent literals for the gate's WEB_URL_SCHEMES; valid headers are public twins.
+    for (left, closing), scheme, tail in product(
+            (("", ""), ("see ", ""), ("`", "`"), ("-I", ""), ("/srv/", "")),
+            ("http", "https", "HTTP", "HTTPS"), ("://h/x", ":///x", "://")):
+        yield Shape(f"tilde-web-public:{left}:{scheme}:{tail}",
+                    left + "~" + scheme + tail + closing, ())
+
+    # Round 11 F2: original INVISIBLE bytes break the header into two private prefixes.
+    for left, scheme, invisible, root in product(
+            ("", "-I", "/srv/"), ("http", "https", "HTTP", "HTTPS"),
+            "\u200b\u200c\u200d\ufeff", ("/home/", "/Users/", "/var/home/")):
+        account = "~" + scheme + invisible
+        path = "//h" + root + "private_account"
+        path_start = len(left + account + ":")
+        yield Shape(f"tilde-broken-web:{left}:{scheme}:{invisible!r}:{root}",
+                    left + account + ":" + path + "/x",
+                    ((len(left), len(left + account)), (path_start, path_start + len(path))))
+
     # Round 9 F2: independent dash-token and embedded PATH_SWITCHES spellings.
     for switch, (name, private), tail in product(
             ("--sysroot", "-m64", "-x-y", "--include", "-I-", "x-I", "x-L", "foo-I", "--I"),

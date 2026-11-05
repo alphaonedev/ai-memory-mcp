@@ -168,6 +168,34 @@ class DocsPrivatePaths(unittest.TestCase):
             for scheme in ("http", "https", "HTTP") for root in ("home/", "Users/")
         ))
 
+    def test_non_web_tilde_scheme_suffix_r11(self):
+        self.assert_repairs((
+            ("~private_account://h/x", "<home>://h/x"),
+            ("see ~private_account:///x", "see <home>:///x"),
+            ("`~private_account://`", "`<home>://`"),
+            ("-I~private_account://x", "-I<home>://x"),
+            ("~private\u200bq://h/x", "<home>://h/x"),
+            ("/srv/~private_account://h/x", "/srv/<home>://h/x"),
+            ("~private_account.x://h/x", "<home>://h/x"),
+        ))
+
+    def test_valid_tilde_web_header_twins_r11(self):
+        for left in ("", "see ", "-I", "/srv/"):
+            for scheme in ("http", "https", "HTTP", "HTTPS"):
+                with self.subTest(left=left, scheme=scheme):
+                    text = left + "~" + scheme + "://h/x"
+                    self.doc.write_text(text)
+                    self.assertEqual(self.run_gate().returncode, 0)
+                    self.assertEqual(self.run_gate("--fix").returncode, 0)
+                    self.assertEqual(self.doc.read_text(), text)
+
+    def test_invisible_breaks_tilde_web_header_r11(self):
+        self.assert_repairs(tuple(
+            ("~" + scheme + invisible + "://h/home/private_account/x", "<home>:<home>/x")
+            for scheme in ("http", "https", "HTTP", "HTTPS")
+            for invisible in "\u200b\u200c\u200d\ufeff"
+        ))
+
     def test_fix_rescan_refuses_unrepaired_finding_r10(self):
         spec = importlib.util.spec_from_file_location("rescan_gate", SCRIPT)
         gate = importlib.util.module_from_spec(spec)
