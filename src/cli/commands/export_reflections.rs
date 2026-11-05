@@ -56,6 +56,19 @@ fn export_diagnostic(value: &str) -> String {
     }
 }
 
+/// Refuse an invalid durable ID before a filesystem export creates anything.
+/// ERRORS-02/15: retain the validation cause; OWNERSHIP-05/15: borrow inputs
+/// and reuse the bounded, character-safe diagnostic formatter from #8605.
+pub(crate) fn validate_export_id(id: &str, namespace: &str) -> Result<()> {
+    crate::validate::validate_id(id).with_context(|| {
+        format!(
+            "memory {} namespace {}: refusing export id",
+            export_diagnostic(id),
+            export_diagnostic(namespace)
+        )
+    })
+}
+
 /// CLI args for `ai-memory export-reflections`.
 #[derive(Args, Debug, Clone)]
 pub struct ExportReflectionsArgs {
@@ -122,13 +135,16 @@ struct JsonEnvelope<'a> {
 pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     let format = parse_format(&args.format)?;
     let out_dir = resolve_out_dir(args.out_dir.as_deref())?;
-    fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
-
     let conn = db::open(db_path)?;
     let mut summary = ExportSummary::default();
 
     let reflections = collect_reflections(&conn, args.namespace.as_deref(), args.since.as_deref())?;
+    // ERRORS-02: validate the whole batch before creating directories or files.
+    for mem in &reflections {
+        validate_export_id(&mem.id, &mem.namespace)?;
+    }
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
     let mut swept_directories = HashSet::new();
     for mem in &reflections {
         let edges = collect_outbound_reflects_on(&conn, &mem.id)?;

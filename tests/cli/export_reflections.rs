@@ -198,13 +198,17 @@ fn cli_namespace_refusal_escapes_stored_id_8605() {
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
     assert!(
         stderr.contains(&format!(
-            "memory {STORED_ID:?} namespace {REFUSED_NAMESPACE:?}: refusing export path"
+            "memory {STORED_ID:?} namespace {REFUSED_NAMESPACE:?}: refusing export id"
         )),
         "CLI refusal must identify the row with escaped stored values: {stderr:?}"
     );
     assert!(
         !stderr.contains(STORED_ID),
         "CLI stderr must not include the raw stored control characters"
+    );
+    assert!(
+        !out_dir.exists(),
+        "invalid ID must leave the destination absent"
     );
 }
 
@@ -250,7 +254,12 @@ fn cli_namespace_refusal_bounds_stored_values_8605() {
         );
         let original_bytes = stored_id.len().max(namespace.len());
         assert!(stderr.contains(&format!("[truncated; original_bytes={original_bytes}]")));
-        assert!(stderr.contains("refusing export path"));
+        if ai_memory::validate::validate_id(&stored_id).is_err() {
+            assert!(stderr.contains("refusing export id"));
+            assert!(!tmp.path().join("exports").exists());
+        } else {
+            assert!(stderr.contains("refusing export path"));
+        }
         assert!(!stderr.contains('\u{1}'));
     }
 }
@@ -286,6 +295,11 @@ fn export_output_with_stored_id_8605(stored_id: &str) -> std::process::Output {
                 .join(format!("{stored_id}.md"))
                 .is_file()
         );
+    } else {
+        assert!(
+            !out_dir.exists(),
+            "invalid ID must leave the destination absent"
+        );
     }
     output
 }
@@ -296,7 +310,7 @@ fn cli_export_write_failure_escapes_stored_id_8605() {
     let output = export_output_with_stored_id_8605(STORED_ID);
     assert!(!output.status.success());
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
-    assert!(stderr.contains("writing "));
+    assert!(stderr.contains("refusing export id"));
     assert!(stderr.contains(&format!("{STORED_ID:?}")));
     assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
 }
@@ -305,11 +319,12 @@ fn cli_export_write_failure_escapes_stored_id_8605() {
 fn cli_export_wrote_escapes_stored_id_8605() {
     const STORED_ID: &str = "\u{1b}[2Jid\r";
     let output = export_output_with_stored_id_8605(STORED_ID);
-    assert!(output.status.success());
-    let stdout = std::str::from_utf8(&output.stdout).unwrap();
-    assert!(stdout.contains("wrote "));
-    assert!(stdout.contains(&format!("{STORED_ID:?}")));
-    assert!(!stdout.contains('\u{1b}') && !stdout.contains('\r'));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("refusing export id"));
+    assert!(stderr.contains(&format!("{STORED_ID:?}")));
+    assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
 }
 
 #[test]
@@ -326,6 +341,7 @@ fn cli_export_write_failure_bounds_stored_id_8605() {
         stderr.len()
     );
     assert!(stderr.contains(&format!("[truncated; original_bytes={}]", stored_id.len())));
+    assert!(stderr.contains("refusing export id"));
     assert!(stderr.contains("\\u{1b}\\r"));
     assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
 }
