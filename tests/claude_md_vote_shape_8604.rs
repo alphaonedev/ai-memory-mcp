@@ -83,11 +83,14 @@ const SUPERSEDED_MARKERS: [&str; 11] = [
 const ALLOWED_NON_ASCII: [char; 5] = ['\u{00A7}', '\u{2013}', '\u{2014}', '\u{2194}', '\u{2265}'];
 /// An HTML comment opener, forbidden in the section (invisible when rendered).
 const HTML_COMMENT_OPEN: &str = "<!--";
-/// An HTML comment closer, used to track an HTML comment opened before the
-/// crossroads heading.
-const HTML_COMMENT_CLOSE: &str = "-->";
 const PANIC_OPEN_FENCE: &str = "crossroads heading sits inside an open fenced code block";
-const PANIC_OPEN_COMMENT: &str = "crossroads heading sits inside an open HTML comment";
+/// Rule R1 panic: a line outside a column-0 fence holds the comment opener.
+const PANIC_COMMENT_OPENER: &str = "HTML comment opener in the prefix is refused";
+/// Rule R2 panic: a fence opener outside a column-0 fence is indented.
+const PANIC_INDENTED_FENCE: &str = "indented fence opener in the prefix is refused";
+/// Rule R2 bound: a fence opener line with at least this many leading spaces
+/// (and at most [`FENCE_MAX_INDENT`]) is refused in the prefix.
+const INDENTED_FENCE_MIN_INDENT: usize = 1;
 /// Starts an HTML entity (`&#...;` or `&name;`), forbidden in the section.
 const ENTITY_START: u8 = b'&';
 const NUMERIC_ENTITY_MARK: u8 = b'#';
@@ -157,48 +160,33 @@ fn closes_fence(open_ch: u8, open_run: usize, line: &str) -> bool {
     })
 }
 
-/// True when `line` starts an HTML comment block: up to [`FENCE_MAX_INDENT`]
-/// spaces, then the comment opener (`CommonMark` HTML block type 2).
-fn starts_comment_block(line: &str) -> bool {
-    let indent = line.bytes().take_while(|&b| b == b' ').count();
-    indent <= FENCE_MAX_INDENT && line[indent..].starts_with(HTML_COMMENT_OPEN)
-}
-
-/// True when `line` leaves an HTML comment open, given whether one was open
-/// at its start. Scans `<!--` and `-->` in order across the line.
-fn comment_open_after(line: &str, mut in_comment: bool) -> bool {
-    let mut rest = line;
-    loop {
-        let marker = if in_comment {
-            HTML_COMMENT_CLOSE
-        } else {
-            HTML_COMMENT_OPEN
-        };
-        let Some(at) = rest.find(marker) else {
-            return in_comment;
-        };
-        in_comment = !in_comment;
-        rest = &rest[at + marker.len()..];
-    }
-}
-
-/// Panics when the text before the heading leaves a fenced code block or an
-/// HTML comment open at the heading. The scan is line based. With no fence
-/// open, a fence opener line ([`fence_run`]) is evaluated first and opens a
-/// fence; a fence is closed only by [`closes_fence`]. Inside an open fence
-/// comment markers are plain text. A comment that starts mid-line is plain
-/// text once a fence opener line interrupts it, so that line clears the
-/// comment state. A comment that starts a line (an HTML block) keeps its
-/// state until `-->`, and fence lines inside it are plain text. Otherwise
-/// comment state is tracked from `<!--` to `-->` across lines, and a heading
-/// inside an open comment panics: a fail-closed superset of `CommonMark`,
-/// which ends a mid-line comment at the paragraph end. No other raw HTML
-/// block is modelled: an HTML `pre` or other raw HTML block before the
-/// heading is left to `scripts/check-claude-md-size.py`.
+/// Panics when the text before the heading is not provably free of hidden
+/// markup. Rules, applied line by line from byte 0 (the heading is matched at
+/// column 0 by [`crossroads_section`]):
+///
+/// - R1: outside a column-0 fence, a line holding the HTML comment opener
+///   anywhere panics ([`PANIC_COMMENT_OPENER`]), closed on the same line or
+///   not, at a line start or mid-line, also inside an inline code span. Inside
+///   a fence the opener is literal text and ignored.
+/// - R2: outside a column-0 fence, a fence opener ([`fence_run`]) indented
+///   [`INDENTED_FENCE_MIN_INDENT`] to [`FENCE_MAX_INDENT`] spaces panics
+///   ([`PANIC_INDENTED_FENCE`]); `CommonMark` ends such a fence with its list
+///   item, which this line scan does not model. A four-space line is indented
+///   code and stays plain text.
+/// - R3: a column-0 fence opens on [`fence_run`] and closes only on
+///   [`closes_fence`] (same character, a run at least as long, only
+///   [`CLOSER_TAIL_BYTES`] after it; a closer may be indented up to
+///   [`FENCE_MAX_INDENT`] spaces).
+/// - R4: a fence still open at the heading panics ([`PANIC_OPEN_FENCE`]); the
+///   heading itself must sit at column 0 or the caller panics.
+///
+/// Consequence: a future prefix edit that adds a raw HTML comment or an
+/// indented fence fails this pin closed and needs a reviewed change of this
+/// test together with the fixture. No other raw HTML block is modelled: an
+/// HTML `pre` or other raw HTML block before the heading is left to
+/// `scripts/check-claude-md-size.py`.
 fn assert_heading_not_wrapped(before: &str) {
     let mut open_fence: Option<(u8, usize)> = None;
-    let mut in_comment = false;
-    let mut comment_is_block = false;
     for line in before.split_inclusive('\n') {
         if let Some((open_ch, open_run)) = open_fence {
             if closes_fence(open_ch, open_run, line) {
@@ -206,23 +194,14 @@ fn assert_heading_not_wrapped(before: &str) {
             }
             continue;
         }
-        if in_comment && comment_is_block {
-            in_comment = comment_open_after(line, true);
-            continue;
-        }
+        assert!(!line.contains(HTML_COMMENT_OPEN), "{PANIC_COMMENT_OPENER}");
         if let Some((ch, run, _)) = fence_run(line) {
+            let indent = line.bytes().take_while(|&b| b == b' ').count();
+            assert!(indent < INDENTED_FENCE_MIN_INDENT, "{PANIC_INDENTED_FENCE}");
             open_fence = Some((ch, run));
-            in_comment = false;
-            continue;
-        }
-        let was_in_comment = in_comment;
-        in_comment = comment_open_after(line, in_comment);
-        if in_comment && !was_in_comment {
-            comment_is_block = starts_comment_block(line);
         }
     }
     assert!(open_fence.is_none(), "{PANIC_OPEN_FENCE}");
-    assert!(!in_comment, "{PANIC_OPEN_COMMENT}");
 }
 
 /// The crossroads section: from its heading line to the byte before the
@@ -236,9 +215,9 @@ fn assert_heading_not_wrapped(before: &str) {
 /// right after a newline). A CRLF before it passes, and a BOM at file start
 /// does not change this test (`scripts/check-claude-md-size.py` rejects the
 /// BOM). The text before the heading is scanned from byte 0 by
-/// [`assert_heading_not_wrapped`], which panics when a fenced code block or an
-/// HTML comment is still open at the heading; its doc comment states the
-/// comment rule and the fail-closed superset. A heading on a blockquote line
+/// [`assert_heading_not_wrapped`], whose doc comment states rules R1-R4: a raw
+/// HTML comment opener or an indented fence opener outside a column-0 fence
+/// panics, and so does a fence still open at the heading. A heading on a blockquote line
 /// or with an extra `#` is not found at a line start and also panics.
 /// `CommonMark` allows up to three spaces before `#`; this pin requires
 /// column 0 because the live file has it there. An HTML `pre` or other raw
@@ -536,17 +515,33 @@ fn heading_after_unclosed_tilde_fence_fails_closed_8604() {
 }
 
 #[test]
-#[should_panic(expected = "inside an open HTML comment")]
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
 fn heading_in_html_comment_opened_on_previous_line_fails_closed_8604() {
     let text = wrapped_fixture("intro\n<!-- hidden\n", &format!("{NEXT_SECTION_LINE}-->\n"));
     let _ = crossroads_section(&text);
 }
 
 #[test]
-fn closed_fence_and_closed_comment_before_heading_still_pass_8604() {
-    let prefix = format!("intro\n{FENCE_LINE}code\n{FENCE_LINE}<!-- note -->\n<!-- a\nb -->\n");
+fn closed_fence_before_heading_still_passes_8604() {
+    let prefix = format!("intro\n{FENCE_LINE}code\n{FENCE_LINE}");
     let text = wrapped_fixture(&prefix, "");
     assert_eq!(crossroads_section(&text), FIXTURE);
+}
+
+#[test]
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn closed_multiline_comment_before_heading_is_refused_8604() {
+    // Formerly passed; R1 refuses every opener outside a fence.
+    let text = wrapped_fixture("intro\n<!-- a\nb -->\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn comment_opener_in_inline_code_span_is_refused_8604() {
+    // R1 does not model code spans: the opener is refused wherever it sits.
+    let text = wrapped_fixture("intro `<!--` code\n", "");
+    let _ = crossroads_section(&text);
 }
 
 #[test]
@@ -593,10 +588,10 @@ fn closer_followed_by_form_feed_does_not_close_8604() {
 }
 
 #[test]
-#[should_panic(expected = "inside an open fenced code block")]
-fn fence_opener_line_interrupts_an_open_inline_comment_8604() {
-    // "<!--" mid-line, then a fence opener line, then "-->": the fence
-    // interrupts the paragraph, so the heading sits inside the fence.
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn fence_opener_line_after_an_open_inline_comment_is_refused_8604() {
+    // "<!--" mid-line, then a fence opener line, then "-->": R1 refuses the
+    // opener before any fence or comment state is needed.
     let text = wrapped_fixture(
         &format!("intro <!-- x\n{FENCE_LINE}-->\n"),
         &format!("{NEXT_SECTION_LINE}{FENCE_LINE}"),
@@ -617,10 +612,9 @@ fn closer_followed_by_tab_still_closes_8604() {
 }
 
 #[test]
-#[should_panic(expected = "inside an open HTML comment")]
-fn fence_lines_inside_a_line_start_comment_stay_plain_text_8604() {
-    // "<!--" at a line start is an HTML block: the fence lines inside it are
-    // literal and the comment is still open at the heading.
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn fence_lines_after_a_line_start_comment_are_refused_8604() {
+    // "<!--" at a line start is refused by R1.
     let text = wrapped_fixture(&format!("<!-- x\n{FENCE_LINE}{FENCE_LINE}"), "");
     let _ = crossroads_section(&text);
 }
@@ -688,5 +682,11 @@ fn comment_closed_on_its_own_line_is_refused_8604() {
 fn four_space_indented_backtick_line_is_plain_text_8604() {
     // Four spaces make indented code, not a fence opener.
     let text = wrapped_fixture("intro\n    ```\n", "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
+
+#[test]
+fn comment_opener_inside_a_column_zero_fence_is_ignored_8604() {
+    let text = wrapped_fixture(&format!("{FENCE_LINE}a <!-- b\n{FENCE_LINE}"), "");
     assert_eq!(crossroads_section(&text), FIXTURE);
 }
