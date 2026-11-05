@@ -276,7 +276,7 @@ def url_context(original: str, text: str,
         enclosing = [public for start, end, public in contexts if start < match.start() < end]
         if any(enclosing):
             continue
-        nested = bool(enclosing)
+        nested = bool(enclosing) or original[match.start() - 1:match.start()] == "/"
         public = match.group()[:-len("://")].casefold() in WEB_URL_SCHEMES and not nested
         path = match.end()
         if not public:
@@ -304,11 +304,13 @@ def path_switch_length(path: str) -> int:
     relative = RELATIVE_SWITCH.match(path)
     if relative:
         return relative.end()
-    if path.startswith("-") and "/" in path:
-        return path.index("/")
+    boundaries = [index for index, char in enumerate(path) if char in "/~"]
+    if path.startswith("-") and boundaries:
+        return boundaries[0]
     for switch in PATH_SWITCHES:
-        if path.startswith(switch):
-            return len(switch)
+        position = path.find(switch)
+        if position >= 0:
+            return position + len(switch)
     return 0
 
 
@@ -319,8 +321,7 @@ def tilde_start_allowed(text: str, start: int) -> bool:
     left = start
     while left and (text[left - 1].isalnum() or text[left - 1] in "_.-"):
         left -= 1
-    return (left < start and text[left] == "-"
-            and path_switch_length(text[left:start + 1]) == start - left)
+    return left < start and path_switch_length(text[left:start + 1]) == start - left
 
 
 def local_home_spans(text: str, allowed: frozenset[str],

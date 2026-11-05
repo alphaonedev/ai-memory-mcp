@@ -34,14 +34,21 @@ The gate scans Markdown below `docs/` and rejects these lexical classes:
   ports and invisible host bytes survive unchanged. A scheme nested inside a
   non-web path is also checked; repair preserves the nested authority and its
   following path separator, including when the nested scheme is HTTP(S).
+  This includes HTTP(S) headers glued after a slash in a relative, absolute or
+  nameless-tilde local path. Standalone HTTP(S) headers at line start, after
+  whitespace, opening parentheses/brackets, quotes or commas, and Markdown link
+  targets remain public; nested headers inside a public web URL stay public.
   Bare-domain spellings are checked as local paths. File-scheme markers and
   compiler options survive repair. `PATH_SWITCHES` preserves the established
   `-I` and `-L` prefixes; generic glued `-letters` switches also split before
   relative roots or named tilde homes, including `-isystemhome/`, `-iquoteUsers/`,
   `-Fvar/home/` and `-idirafter~<account>`. The same switch-length rule defines
   the tilde boundary; it has no separate option list. Otherwise a leading dash
-  token splits at its first slash, preserving long options, digits, inner hyphens
-  and trailing dashes, as in `--sysroot/`, `-m64/`, `-x-y/` and `-I-/`.
+  token splits at its first slash or tilde, preserving long options, digits, inner
+  hyphens and trailing dashes, as in `--sysroot/`, `-m64/`, `-x-y/`, `-I-/` and
+  `--include~<account>`. A `PATH_SWITCHES` spelling is recognized wherever it
+  occurs, including word-glued `x-I~<account>`, `foo-L~<account>` and `--I~<account>`;
+  the bytes before the named home remain unchanged.
   A sentence-final period is kept; dots between
   account-name segments remain part of the account name.
 - Named-home paths shaped as `~<account>/`, wherever they appear.
@@ -122,3 +129,6 @@ Round 8 adds home-root authorities (F1), IPv6 and invisible authority bytes (F2)
 nested scheme authorities (F3), dash-token spellings at a path slash (F4), and
 generic switches adjacent to named tilde homes (F5). Earlier file-authority
 productions remain in the grammar; an added slash must not remove their coverage.
+Round 9 adds local paths crossed with glued HTTP(S) headers and home roots (F1),
+plus complex dash tokens and word-glued option spellings crossed with tilde homes
+(F2). Public web-header boundary controls remain part of the independent grammar.
