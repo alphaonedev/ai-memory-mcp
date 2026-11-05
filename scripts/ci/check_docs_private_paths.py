@@ -40,19 +40,14 @@ URL_TOKEN_CHARS = frozenset(
 # Preserve these established prefixes before splitting any other glued -letters switch.
 PATH_SWITCHES = ("-I", "-L")
 RELATIVE_SWITCH = re.compile(
-    r"-[A-Za-z]+?(?=(?:home/|Users/|\./|\.\./|var/home/|mnt/c/Users/))"
+    r"-[A-Za-z]+?(?=(?:home/|Users/|\./|\.\./|var/home/|mnt/c/Users/|~))"
 )
-ABSOLUTE_SWITCH = re.compile(r"-[A-Za-z]+(?=/)")
-SCHEME_URL = re.compile(
-    r"(?<![\w+./-])[A-Za-z][A-Za-z0-9+.-]*://["
-    + re.escape("".join(sorted(URL_TOKEN_CHARS))) + r"]*"
-)
+SCHEME_HEADER = re.compile(r"(?<![\w+.-])[A-Za-z][A-Za-z0-9+.-]*://")
 INVISIBLE = frozenset("\u200b\u200c\u200d\ufeff")
 # Class (b): named-home paths anywhere; numeric ratios are approximations.
-TILDE_START = r"(?:(?<![\w~])|(?<=-I)|(?<=-L))~"
-NAMED_HOME = re.compile(rf"{TILDE_START}(?P<name>{NAMED_ACCOUNT})(?=/)")
+NAMED_HOME = re.compile(rf"~(?P<name>{NAMED_ACCOUNT})(?=/)")
 # Class (c): bare names in code and prose; numeric approximations are not names.
-BARE_HOME = re.compile(rf"{TILDE_START}(?P<name>{NAMED_ACCOUNT})(?![\w/-]|\.[\w-])")
+BARE_HOME = re.compile(rf"~(?P<name>{NAMED_ACCOUNT})(?![\w/-]|\.[\w-])")
 FENCE = re.compile(r"^ {0,3}(?P<marks>`{3,}|~{3,})(?P<info>[^\r\n]*)")
 BACKTICKS = re.compile(r"`+")
 SHELL_FENCES = frozenset(("", "sh", "bash", "zsh", "shell", "console"))
@@ -270,23 +265,38 @@ def normalized_source(text: str) -> tuple[str, list[int]]:
     return "".join(chars), offsets
 
 
-def mask_url_context(original: str, text: str, offsets: list[int]) -> str:
-    """Hide web URLs and remote authorities without joining across erased delimiters."""
-    parts = []
-    previous = 0
+def url_context(original: str, text: str,
+                offsets: list[int]) -> tuple[str, list[tuple[int, int]]]:
+    """Mask only public web URLs; retain authority boundaries solely for repair."""
+    masked = list(text)
+    contexts = []
+    repair_starts = []
     # Original bytes define URL boundaries before invisible account obfuscators disappear.
-    for match in SCHEME_URL.finditer(original):
-        scheme, _, remainder = match.group().partition("://")
-        end = match.end()
-        if scheme.casefold() not in WEB_URL_SCHEMES:
-            path = remainder.find("/")
-            if path >= 0:
-                end = match.start() + len(scheme) + len("://") + path
+    for match in SCHEME_HEADER.finditer(original):
+        enclosing = [public for start, end, public in contexts if start < match.start() < end]
+        if any(enclosing):
+            continue
+        nested = bool(enclosing)
+        public = match.group()[:-len("://")].casefold() in WEB_URL_SCHEMES and not nested
+        path = match.end()
+        if not public:
+            # Unlike a web token, an authority can contain ] and invisible host bytes.
+            while path < len(original) and original[path] != "/":
+                if original[path].isspace():
+                    break
+                path += 1
+        end = match.end() if public else path
+        while end < len(original) and original[end] in URL_TOKEN_CHARS:
+            end += 1
+        contexts.append((match.start(), end, public))
         left = bisect_left(offsets, match.start())
-        right = bisect_left(offsets, end)
-        parts.extend((text[previous:left], " " * (right - left)))
-        previous = right
-    return "".join((*parts, text[previous:]))
+        if public:
+            right = bisect_left(offsets, end)
+            masked[left:right] = " " * (right - left)
+        elif path < len(original) and original[path] == "/":
+            # Nested URL repair retains its path separator as well as its authority.
+            repair_starts.append((left, bisect_left(offsets, path + int(nested))))
+    return "".join(masked), repair_starts
 
 
 def path_switch_length(path: str) -> int:
@@ -294,14 +304,27 @@ def path_switch_length(path: str) -> int:
     relative = RELATIVE_SWITCH.match(path)
     if relative:
         return relative.end()
+    if path.startswith("-") and "/" in path:
+        return path.index("/")
     for switch in PATH_SWITCHES:
         if path.startswith(switch):
             return len(switch)
-    absolute = ABSOLUTE_SWITCH.match(path)
-    return absolute.end() if absolute else 0
+    return 0
 
 
-def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]]:
+def tilde_start_allowed(text: str, start: int) -> bool:
+    """Use the same option-prefix split for named homes and component paths."""
+    if not start or not (text[start - 1].isalnum() or text[start - 1] in "_~"):
+        return True
+    left = start
+    while left and (text[left - 1].isalnum() or text[left - 1] in "_.-"):
+        left -= 1
+    return (left < start and text[left] == "-"
+            and path_switch_length(text[left:start + 1]) == start - left)
+
+
+def local_home_spans(text: str, allowed: frozenset[str],
+                     repair_starts: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Select raw and resolved home pairs; URL and option bytes stay outside spans."""
     result = []
     for token in LOCAL_PATH.finditer(text):
@@ -331,6 +354,9 @@ def local_home_spans(text: str, allowed: frozenset[str]) -> list[tuple[int, int]
                     and name.casefold() not in allowed):
                 end = max(end or 0, offset + len(name))
         if end is not None:
+            for scheme, boundary in repair_starts:
+                if scheme <= start < boundary < end:
+                    start = boundary
             result.append((start, end))
     return result
 
@@ -340,7 +366,8 @@ def findings(text: str, allowed: frozenset[str],
     """Return approved lexical classes mapped back to exact original spans."""
     original = text
     text, offsets = normalized_source(text)
-    spans = local_home_spans(mask_url_context(original, text, offsets), allowed)
+    detection, repair_starts = url_context(original, text, offsets)
+    spans = local_home_spans(detection, allowed, repair_starts)
     matches = list(NAMED_HOME.finditer(text))
     code = code_spans(text)
     starts = [start for start, _ in code]
@@ -358,6 +385,8 @@ def findings(text: str, allowed: frozenset[str],
     used = set()
     lines = original.split("\n")
     for match in sorted(matches, key=lambda value: value.start()):
+        if not tilde_start_allowed(text, match.start()):
+            continue
         if match.re in (NAMED_HOME, BARE_HOME) and match.group("name")[0].isnumeric():
             continue
         if match.group("name").casefold() not in allowed:

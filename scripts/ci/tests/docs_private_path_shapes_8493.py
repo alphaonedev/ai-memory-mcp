@@ -62,9 +62,6 @@ def shapes():
         web = context == "web" or context.startswith("web-")
         if web and not root.startswith("/"):
             left += "/"
-        # A relative filesystem root needs a path slash after an empty file authority.
-        if context in ("file", "file-upper") and not root.startswith("/") and root != "~":
-            left += "/"
         prefix = root + name
         tail = right
         # An escaped underscore extends the account, not the relative tail.
@@ -87,7 +84,8 @@ def shapes():
             # Round 7 F2: only the path after the authority is the private prefix.
             start -= 1
         if context in ("file", "file-upper") and not root.startswith("/") and root != "~":
-            start -= 1
+            # A home-root authority is still detected; only its path tail is repaired.
+            start += root.index("/")
         spans = ((start, len(left) + len(prefix)),) if private and not public_web else ()
         yield Shape(f"{root}:{name}:{context}:{right!r}", text, spans)
 
@@ -127,6 +125,48 @@ def shapes():
         yield Shape(f"generic-switch:{switch}:{root}", left + prefix + "/i",
                     ((len(left), len(left + prefix)),))
 
+    # Round 8 F1: retain the unmasked home-root authority productions.
+    non_web = ("file", "FILE", "fIlE", "ssh", "SSH", "sftp", "SFTP", "smb", "rsync")
+    for scheme, user, root, (name, private) in product(
+            non_web, ("", "u@"), ("home", "Users"), names):
+        left = scheme + "://" + user + root
+        prefix = "/" + name
+        spans = ((len(left), len(left + prefix)),) if private else ()
+        yield Shape(f"home-authority:{scheme}:{user}:{root}:{name}",
+                    left + prefix + "/x", spans)
+
+    # Round 8 F2: authority bytes are independent of the web-token alphabet.
+    authorities = ("[::1]", "[::1]:22", "user@[::1]:22", "[2001:db8::1]:2222",
+                   "ho\u200bst", "ho\u200cst", "ho\u200dst", "ho\ufeffst")
+    for scheme, authority, root in product(non_web, authorities, ("/home/", "/Users/")):
+        left = scheme + "://" + authority
+        prefix = root + "private_account"
+        yield Shape(f"authority-bytes:{scheme}:{authority}:{root}", left + prefix + "/x",
+                    ((len(left), len(left + prefix)),))
+
+    # Round 8 F3: nested schemes keep both authorities and the inner path separator.
+    for outer, inner, authority, root in product(
+            non_web, ("http", "HTTPS", "ssh", "SFTP"),
+            ("host", "user@host:22", "[::1]:22"), ("home/", "Users/")):
+        left = outer + "://outer/" + inner + "://" + authority + "/"
+        prefix = root + "private_account"
+        yield Shape(f"nested-scheme:{outer}:{inner}:{authority}:{root}",
+                    left + prefix + "/x", ((len(left), len(left + prefix)),))
+
+    # Round 8 F4/F5: independent option spellings, never scanner constants.
+    for switch, root in product(("--sysroot", "-m64", "-x-y", "-I-"),
+                                ("/home/", "/Users/", "/var/home/", "/mnt/c/Users/")):
+        left = "gcc " + switch
+        prefix = root + "private_account"
+        yield Shape(f"dash-switch:{switch}:{root}", left + prefix + "/x",
+                    ((len(left), len(left + prefix)),))
+    for switch, (name, private), right in product(
+            ("-isystem", "-iquote", "-idirafter", "-F"), names, ("", "/inc")):
+        left = "gcc " + switch
+        prefix = "~" + name
+        spans = ((len(left), len(left + prefix)),) if private else ()
+        yield Shape(f"tilde-switch:{switch}:{name}:{right}", left + prefix + right, spans)
+
     # Inner-component productions include both raw and resolved home pairs.
     for left, root, (name, private), tail in product(
             ("", "gcc -I", "ld -L"),
@@ -138,7 +178,11 @@ def shapes():
         resolved_private = tail == "/../y"
         if resolved_private:
             end = len(prefix + tail)
-        spans = ((len(left), len(left) + end),) if (
+        start = len(left)
+        if left and root in ("name.ext/home/", "x/../home/"):
+            # Round 8 F4: this component is part of the leading dash token.
+            start += len(root.split("/", 1)[0])
+        spans = ((start, len(left) + end),) if (
             private or resolved_private or root == "/home/removed/../") else ()
         yield Shape(f"inner:{left}:{root}:{name}:{tail}", left + prefix + tail + "\n", spans)
 

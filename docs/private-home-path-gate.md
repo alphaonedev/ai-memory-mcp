@@ -23,15 +23,25 @@ The gate scans Markdown below `docs/` and rejects these lexical classes:
   every character outside that positive set end the token: C0 controls, DEL,
   U+200B, U+200C, U+200D, U+FEFF, angle brackets, double quote, backtick, vertical
   bar, backslash, caret and braces. URL boundaries precede account normalization.
-  Every other scheme,
-  including SSH, SFTP, rsync, git+ssh, SCP, SMB and NFS, scans as a local path.
+  Every other scheme, including SSH, SFTP, rsync, git+ssh, SCP, SMB and NFS,
+  scans as a local path. Detection sees the unmasked authority too: an authority
+  equal to `home` or `Users`, with or without user information, cannot hide the
+  next account component. This includes mixed-case file schemes.
   A compound scheme such as git+https is not HTTP(S).
   The scheme, user, host and port survive repair; the private prefix begins at
   the first path slash after the authority, including an empty authority.
+  Authority boundaries use that slash, not the web-token alphabet: IPv6 brackets,
+  ports and invisible host bytes survive unchanged. A scheme nested inside a
+  non-web path is also checked; repair preserves the nested authority and its
+  following path separator, including when the nested scheme is HTTP(S).
   Bare-domain spellings are checked as local paths. File-scheme markers and
   compiler options survive repair. `PATH_SWITCHES` preserves the established
   `-I` and `-L` prefixes; generic glued `-letters` switches also split before
-  relative roots, including `-isystemhome/`, `-iquoteUsers/`, and `-Fvar/home/`.
+  relative roots or named tilde homes, including `-isystemhome/`, `-iquoteUsers/`,
+  `-Fvar/home/` and `-idirafter~<account>`. The same switch-length rule defines
+  the tilde boundary; it has no separate option list. Otherwise a leading dash
+  token splits at its first slash, preserving long options, digits, inner hyphens
+  and trailing dashes, as in `--sysroot/`, `-m64/`, `-x-y/` and `-I-/`.
   A sentence-final period is kept; dots between
   account-name segments remain part of the account name.
 - Named-home paths shaped as `~<account>/`, wherever they appear.
@@ -87,8 +97,11 @@ account names outside home prefixes are not inferred by the scanner; reviewed
 owner/group column repairs such as the install listing are made explicitly.
 Apostrophe terminates a URL token; an emphasis star following a URL remains
 public because star is URL-legal. The `git+https` and `ftp` schemes scan as text.
-The established `-Info/home/<account>` spelling keeps `-I` and repairs the
-remaining path, consistently with the earlier compiler-prefix rule.
+The first-slash rule keeps the whole option in `-Info/home/<account>` and
+`-Lname.ext/home/<account>`; it does not delete the suffix of the dash token.
+Fullwidth slash and homoglyphs are not normalized. `[` and `(` inside a web
+path remain URL-legal. Relative paths such as `templates/home/<page>` are
+checked by the same home-component rule and can therefore be refused.
 
 The independent shape grammar in
 `scripts/ci/tests/docs_private_path_shapes_8493.py` combines roots, account classes,
@@ -105,3 +118,7 @@ explicit grammar cases; changing those limits also requires changing that axis.
 Round 7 adds URL-illegal terminators (F1), non-web authority forms (F2), and
 generic glued switches crossed with relative roots (F3). The generator declares
 its own literals independently of the gate's named constants.
+Round 8 adds home-root authorities (F1), IPv6 and invisible authority bytes (F2),
+nested scheme authorities (F3), dash-token spellings at a path slash (F4), and
+generic switches adjacent to named tilde homes (F5). Earlier file-authority
+productions remain in the grammar; an added slash must not remove their coverage.

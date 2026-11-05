@@ -99,6 +99,43 @@ class DocsPrivatePaths(unittest.TestCase):
             for root in ("home/", "Users/", "./home/", "../home/", "var/home/", "mnt/c/Users/")
         ))
 
+    def test_home_root_authorities_r8(self):
+        self.assert_repairs(tuple(
+            (scheme + "://" + user + root + "/private_account/x",
+             scheme + "://" + user + root + "<home>/x")
+            for scheme in ("file", "fIlE", "FILE", "ssh", "smb", "sftp")
+            for user in ("", "u@") for root in ("home", "Users")
+        ))
+
+    def test_ipv6_and_invisible_authorities_r8(self):
+        self.assert_repairs(tuple(
+            ("ssh://" + authority + "/home/private_account/x",
+             "ssh://" + authority + "<home>/x")
+            for authority in ("[::1]", "[::1]:22", "user@[::1]:22",
+                              "[2001:db8::1]:2222", "ho\u200bst", "ho\ufeffst")
+        ))
+
+    def test_nested_scheme_authorities_r8(self):
+        self.assert_repairs(tuple(
+            ("ssh://host/" + inner + "://user@host:22/home/private_account/x",
+             "ssh://host/" + inner + "://user@host:22/<home>/x")
+            for inner in ("https", "HTTP", "ssh", "SFTP")
+        ))
+
+    def test_dash_switch_bytes_survive_r8(self):
+        self.assert_repairs(tuple(
+            ("gcc " + switch + root + "private_account/x", "gcc " + switch + "<home>/x")
+            for switch in ("--sysroot", "-m64", "-x-y", "-I-")
+            for root in ("/home/", "/Users/", "/var/home/", "/mnt/c/Users/")
+        ))
+
+    def test_generic_tilde_switches_r8(self):
+        self.assert_repairs(tuple(
+            ("gcc " + switch + "~private_account" + tail, "gcc " + switch + "<home>" + tail)
+            for switch in ("-isystem", "-iquote", "-idirafter", "-F")
+            for tail in ("", "/inc")
+        ))
+
     def test_raw_home_pairs_survive_parent_segments_r5(self):
         self.assert_repairs((
             ("/home/private_account/..", "<home>/.."),
@@ -132,7 +169,8 @@ class DocsPrivatePaths(unittest.TestCase):
             ("gcc -I/home/private_account/include", "gcc -I<home>/include"),
             ("ld -L/Users/private_account/lib", "ld -L<home>/lib"),
             ("gcc -I../home/private_account/include", "gcc -I<home>/include"),
-            ("ld -Lname.ext/home/private_account/lib", "ld -L<home>/lib"),
+            # Round 8 F4 preserves every dash-token byte before its first path slash.
+            ("ld -Lname.ext/home/private_account/lib", "ld -Lname.ext<home>/lib"),
         ))
 
     def test_generated_prefix_invariants_r5(self):
