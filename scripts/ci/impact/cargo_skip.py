@@ -19,15 +19,28 @@ matches a skip glob and matches neither a never-skip glob nor a test-read glob.
 Anything unexpected (no paths, unreadable rules, a git error) fails closed:
 both verdicts false.
 
-Symlink rule (#8493): the globs match file NAMES only, so a registered
-test_read_globs document that is a symlink would hide an edit to its target.
-When any path named by test_read_globs (the literal path, or the literal
-directory prefix of a wildcard glob) is a symlink in the checked-out tree
-(lstat, never followed), the verdict is both false with reason
-registered-read-path-is-symlink-full-ci naming the path. A missing path is not
-a symlink and keeps the normal verdict. The tree is the --repo directory.
+Symlink rules (#8493). The globs match file NAMES only, so a symlink would hide
+an edit to its target from every glob. Two checks run before any docs-only or
+skip verdict, with the --repo directory as the tree:
+
+1. Tracked symlinks anywhere force full CI. `git -C <repo> ls-files -s -z`
+   lists the index; one or more mode 120000 entries give both verdicts false
+   with reason tracked-symlink-full-ci naming the first path. This costs a
+   full run even for a symlink outside every test_read_globs entry; the
+   classifier never expands a wildcard glob or walks the tree.
+2. Defence in depth: a path named by test_read_globs (the literal path, or the
+   literal directory prefix of a wildcard glob) that is a symlink in the
+   working tree (lstat, never followed) gives both false with reason
+   registered-read-path-is-symlink-full-ci naming the path. This catches a
+   link the index does not know about. Untracked paths below a wildcard tail
+   are NOT walked or checked.
+
+A missing path is not a symlink and keeps the normal verdict. If git is
+missing or exits nonzero, the verdict is both false with reason
+classifier-error-fail-closed carrying the return code and the head of stderr.
 """
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +67,10 @@ REASON_MERGE_GROUP = "merge-group-full-ci"
 REASON_BASE = "protected-base-full-ci"
 REASON_CI_TREE = "ci-tree-edited-full-ci"
 REASON_SYMLINK = "registered-read-path-is-symlink-full-ci"
+REASON_TRACKED_SYMLINK = "tracked-symlink-full-ci"
+GIT_SYMLINK_MODE = "120000"
+STDERR_HEAD_CHARS = 120
+PRINTABLE_ASCII = re.compile(r"[^\x20-\x7e]")
 GLOB_WILDCARDS = frozenset("*?[")
 GLOB_LISTS = ("skip_globs", "docs_globs", "never_skip_globs", "test_read_globs",
               "ci_tree_globs", "ci_tree_exempt_globs", "full_ci_events",
@@ -139,6 +156,32 @@ def symlinked_read_path(section: dict, repo: Path) -> Optional[str]:
     return None
 
 
+def tracked_symlink(repo: Path) -> Optional[str]:
+    """Return the first symlink path (mode 120000) in the index under `repo`, else None.
+
+    Raises RuntimeError when git is missing or exits nonzero; the message
+    carries the return code and a sanitised head of stderr, one printable line.
+    """
+    try:
+        res = subprocess.run(["git", "-C", str(repo), "ls-files", "-s", "-z"],
+                             capture_output=True, timeout=GIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("git ls-files did not run: %s" % clean_text(str(exc))) from exc
+    if res.returncode != 0:
+        head = clean_text(res.stderr.decode("utf-8", "replace"))
+        raise RuntimeError("git ls-files rc=%d %s" % (res.returncode, head))
+    for entry in res.stdout.split(common.NUL.encode()):
+        meta, _, path = entry.partition(b"\t")
+        if meta.split(b" ", 1)[0].decode("ascii", "replace") == GIT_SYMLINK_MODE:
+            return path.decode("utf-8", "replace")
+    return None
+
+
+def clean_text(text: str) -> str:
+    """Return `text` cut to STDERR_HEAD_CHARS with every non-printable byte replaced."""
+    return PRINTABLE_ASCII.sub("?", text.strip())[:STDERR_HEAD_CHARS]
+
+
 def full_ci_reason(section: dict, event_name: str, base_ref: str) -> Optional[str]:
     """Return the reason a run must be full whatever the diff, else None.
 
@@ -159,7 +202,8 @@ def classify(section: dict, paths: List[str], event_name: str = "",
              base_ref: str = "", repo: Optional[Path] = None) -> Dict[str, str]:
     """Return the three output values for the changed `paths`.
 
-    With `repo` set, a symlinked test_read_globs path forces cargo (#8493).
+    With `repo` set, any tracked symlink or a symlinked test_read_globs path forces
+    cargo (#8493); a git failure fails closed.
     """
     version = "cargo_skip-rules-v%s" % section["version"]
     forced = full_ci_reason(section, event_name, base_ref)
@@ -168,6 +212,13 @@ def classify(section: dict, paths: List[str], event_name: str = "",
     if not paths:
         return verdict(FALSE, FALSE, "%s %s" % (REASON_EMPTY, version))
     if repo is not None:
+        try:
+            tracked = tracked_symlink(repo)
+        except RuntimeError as exc:
+            return verdict(FALSE, FALSE, "%s %s %s" % (REASON_ERROR, exc, version))
+        if tracked:
+            return verdict(FALSE, FALSE, "%s %s %s" % (
+                REASON_TRACKED_SYMLINK, clean_text(tracked), version))
         linked = symlinked_read_path(section, repo)
         if linked:
             return verdict(FALSE, FALSE, "%s %s %s" % (REASON_SYMLINK, linked, version))
