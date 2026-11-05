@@ -63,15 +63,38 @@ class TrackedExceptions8615Tests(unittest.TestCase):
     def test_all_reported_advisories_match_unexpired_entries(self):
         self.assertEqual(GATE.validate_report(RECORDED, EXCEPTIONS, TODAY), (565, 1, 1))
 
+    def test_invalid_expiry_issue_reason_and_duplicate_are_rejected(self):
+        for field, value in (("expires", date(2027, 2, 4)), ("expires", "2027-02-03"),
+                             ("issue", True), ("issue", 0), ("reason", ""),
+                             ("reason", "two\nlines"), ("version", ">=0.9.10")):
+            entries = copy.deepcopy(EXCEPTIONS)
+            entries[0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                GATE.validate_report(RECORDED, entries, TODAY)
+        with self.assertRaisesRegex(ValueError, "duplicate exception"):
+            GATE.validate_report(RECORDED, EXCEPTIONS + EXCEPTIONS[:1], TODAY)
+
+    def test_expiry_beyond_ninety_days_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "horizon"):
+            GATE.validate_report(RECORDED, EXCEPTIONS, date(2026, 11, 4))
+
+    def test_changed_package_is_stale(self):
+        entries = copy.deepcopy(EXCEPTIONS)
+        entries[0]["package"] = "other-package"
+        with self.assertRaisesRegex(ValueError, "stale exception"):
+            GATE.validate_report(RECORDED, entries, TODAY)
+
 
 class CargoAudit8615Tests(unittest.TestCase):
     """The subprocess boundary must preserve every failure as a failed gate."""
 
-    def run_gate(self, report=CLEAN, returncode=0, stdout=None):
+    def run_gate(self, report=CLEAN, returncode=0, stdout=None, entries=None):
         result = subprocess.CompletedProcess(
             ["cargo", "audit", "--json"], returncode,
             json.dumps(report) if stdout is None else stdout, "")
-        with patch.object(GATE.subprocess, "run", return_value=result) as run:
+        with patch.object(GATE.subprocess, "run", return_value=result) as run, \
+                patch.object(GATE, "load_policy", return_value=[] if entries is None else entries), \
+                patch.object(GATE, "today_utc", return_value=TODAY):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 code = GATE.main([])
         return code, run
@@ -79,8 +102,12 @@ class CargoAudit8615Tests(unittest.TestCase):
     def test_8615_clean_report_passes(self):
         code, run = self.run_gate()
         self.assertEqual(code, 0)
-        self.assertEqual(run.call_args.args[0], ["cargo", "audit", "--json", "--deny", "warnings"])
-        self.assertEqual(run.call_args.kwargs["cwd"], ROOT)
+        self.assertEqual(run.call_args.args[0], ["cargo", "audit", "--json", "--deny", "warnings",
+                                               "--file", str(ROOT / "Cargo.lock")])
+        workdir = Path(run.call_args.kwargs["cwd"])
+        self.assertEqual(workdir.parent, ROOT / ".local-runs")
+        self.assertNotEqual(workdir, ROOT)
+        self.assertFalse(workdir.exists(), "isolated cwd must be removed")
         self.assertFalse(run.call_args.kwargs.get("shell", False))
 
     def test_8615_vulnerability_fails_even_if_tool_returns_success(self):
@@ -92,6 +119,14 @@ class CargoAudit8615Tests(unittest.TestCase):
     def test_8615_recorded_unfiltered_lock_fails(self):
         report = json.loads((DATA / "cargo_audit_unfiltered_8615.json").read_text())
         self.assertEqual(self.run_gate(report, returncode=1)[0], 1)
+
+    def test_8615_recorded_unfiltered_lock_with_tracked_exceptions_passes(self):
+        self.assertEqual(self.run_gate(RECORDED, returncode=1, entries=EXCEPTIONS)[0], 0)
+
+    def test_8615_tool_status_must_agree_with_report(self):
+        self.assertEqual(self.run_gate(RECORDED, returncode=0, entries=EXCEPTIONS)[0], 1)
+        self.assertEqual(self.run_gate(RECORDED, returncode=2, entries=EXCEPTIONS)[0], 1)
+        self.assertEqual(self.run_gate(CLEAN, returncode=1)[0], 1)
 
     def test_8615_recorded_ignored_report_fails_despite_audit_success(self):
         report = json.loads((DATA / "cargo_audit_ignored_8615.json").read_text())
@@ -153,15 +188,37 @@ class CargoAudit8615Tests(unittest.TestCase):
             with self.subTest(count=count):
                 self.assertEqual(self.run_gate(report)[0], 1)
 
-    def test_8615_allowlist_is_empty(self):
-        self.assertEqual(json.loads(GATE.ALLOWLIST.read_text()), [])
+    def test_8615_policy_has_only_authorized_exceptions(self):
+        entries = GATE.load_policy()
+        identities = [(entry["id"], entry["package"], entry["version"], entry["issue"])
+                      for entry in entries]
+        expected = [(entry["id"], entry["package"], entry["version"], entry["issue"])
+                    for entry in EXCEPTIONS]
+        self.assertEqual(identities, expected)
+        GATE.exception_index(entries, TODAY)
+        self.assertFalse((ROOT / "scripts/ci/cargo_audit_allowlist.json").exists())
 
-    def test_8615_nonempty_or_malformed_allowlist_fails_before_audit(self):
-        for text in ('["RUSTSEC-2026-0429"]', '{}', 'invalid'):
+    def test_8615_missing_or_malformed_policy_fails(self):
+        for text in ('[advisories]\nignore = []', '{}', 'invalid'):
             with self.subTest(text=text), patch.object(Path, "read_text", return_value=text):
-                code, run = self.run_gate()
-                self.assertEqual(code, 1)
-                run.assert_not_called()
+                with self.assertRaises(ValueError):
+                    GATE.load_policy()
+
+    def test_8615_ignore_ids_must_equal_metadata_ids(self):
+        policy = GATE.POLICY.read_text()
+        for edited in (policy.replace('    "RUSTSEC-2023-0071",', ''),
+                       policy.replace('ignore = [', 'ignore = ["RUSTSEC-2099-0001",')):
+            with patch.object(Path, "read_text", return_value=edited):
+                with self.assertRaisesRegex(ValueError, "disagree"):
+                    GATE.load_policy()
+
+    def test_8615_filtered_or_missing_warning_classes_fail(self):
+        for field, value in (("target_arch", ["x86_64"]), ("target_os", ["linux"]),
+                             ("informational_warnings", []), ("informational_warnings", [{}])):
+            report = copy.deepcopy(CLEAN)
+            report["settings"][field] = value
+            with self.subTest(field=field, value=value):
+                self.assertEqual(self.run_gate(report)[0], 1)
 
     def test_8615_missing_audit_tool_fails(self):
         with patch.object(GATE.subprocess, "run", side_effect=FileNotFoundError):

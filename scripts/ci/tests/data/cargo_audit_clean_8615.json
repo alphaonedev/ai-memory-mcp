@@ -1,6 +1,6 @@
 {
   "vulnerabilities": {"found": false, "count": 0, "list": []},
   "warnings": {},
-  "settings": {"ignore": [], "severity": null},
+  "settings": {"ignore": [], "severity": null, "target_arch": [], "target_os": [], "informational_warnings": ["unmaintained", "unsound", "notice"]},
   "lockfile": {"dependency-count": 1}
 }

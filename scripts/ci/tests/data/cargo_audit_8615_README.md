@@ -15,4 +15,6 @@ The ignored report ran in the repository and exited 0, with 565 crates,
 zero reported findings, and two configured ignored advisories. The
 unfiltered report ran from external scratch with `--file <worktree>/Cargo.lock`
 and exited 1, with the same 565 crates, one vulnerability, and one warning.
-Both must fail the ratchet. These captures do not establish a clean audit.
+The ignored report must fail the ratchet. The unfiltered report passes only
+when both exact findings have matching unexpired tracked exceptions. These
+captures do not establish an audit without findings.
