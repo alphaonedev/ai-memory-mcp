@@ -624,3 +624,69 @@ fn fence_lines_inside_a_line_start_comment_stay_plain_text_8604() {
     let text = wrapped_fixture(&format!("<!-- x\n{FENCE_LINE}{FENCE_LINE}"), "");
     let _ = crossroads_section(&text);
 }
+
+// Round 12 (R1-R4): the prefix scan refuses a raw HTML comment opener and an
+// indented fence opener outside a column-0 fence instead of modelling them.
+
+#[test]
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn midline_then_linestart_comment_with_fence_pair_is_refused_8604() {
+    // Code lens r11 n1: the second opener stayed mid-line and a fence line cleared it.
+    let text = wrapped_fixture(&format!("p <!-- a\n<!-- b\n{FENCE_LINE}{FENCE_LINE}"), "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn block_comment_end_line_reopen_is_refused_8604() {
+    // Sec r11 X1: a comment closed and reopened on one line.
+    let text = wrapped_fixture(
+        &format!("<!-- a --> <!-- b\n{FENCE_LINE}-->\n"),
+        &format!("{NEXT_SECTION_LINE}{FENCE_LINE}"),
+    );
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn midline_then_linestart_comment_is_refused_8604() {
+    // Sec r11 X9.
+    let text = wrapped_fixture(
+        &format!("x <!-- a\n<!--\n{FENCE_LINE}-->\n"),
+        &format!("{NEXT_SECTION_LINE}{FENCE_LINE}"),
+    );
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "indented fence opener in the prefix is refused")]
+fn list_item_fence_then_column_zero_fence_is_refused_8604() {
+    // Sec r11 X3: the indented fence ends with the list item in CommonMark.
+    let text = wrapped_fixture(
+        &format!("- item\n  {FENCE_LINE}{FENCE_LINE}"),
+        &format!("{NEXT_SECTION_LINE}{FENCE_LINE}"),
+    );
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "indented fence opener in the prefix is refused")]
+fn list_item_fence_then_comment_is_refused_8604() {
+    // Sec r11 X5: the indented fence line is met first.
+    let text = wrapped_fixture(&format!("- item\n  {FENCE_LINE}<!--\n{FENCE_LINE}"), "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+#[should_panic(expected = "HTML comment opener in the prefix is refused")]
+fn comment_closed_on_its_own_line_is_refused_8604() {
+    let text = wrapped_fixture("intro\n<!-- note -->\n", "");
+    let _ = crossroads_section(&text);
+}
+
+#[test]
+fn four_space_indented_backtick_line_is_plain_text_8604() {
+    // Four spaces make indented code, not a fence opener.
+    let text = wrapped_fixture("intro\n    ```\n", "");
+    assert_eq!(crossroads_section(&text), FIXTURE);
+}
