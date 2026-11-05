@@ -380,32 +380,40 @@ pub(crate) fn render_payload(
 /// emitted in a stable order (memory_id, namespace, title, reflection_depth,
 /// attest_level, created_at, agent_id) followed by a sequence of
 /// `reflects_on` edges. Every stored string uses the shared YAML encoder.
+/// Both `created_at` fields intentionally retain plain RFC3339 timestamp scalars;
+/// `reflection_depth` remains an integer, matching its schema.
 /// The body of the reflection follows after a
 /// blank line, exactly as it was stored.
 fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> String {
-    use YamlColonStyle::{PlainWhenSafe, Quote};
+    use YamlScalarKind::{StoredString, Timestamp};
     let agent_id = agent_id_of(mem);
     let mut out = String::with_capacity(256 + mem.content.len());
     out.push_str("---\n");
     out.push_str(&format!(
         "memory_id: {}\n",
-        yaml_scalar(&mem.id, PlainWhenSafe)
+        yaml_scalar(&mem.id, StoredString)
     ));
     out.push_str(&format!(
         "namespace: {}\n",
-        yaml_scalar(&mem.namespace, Quote)
+        yaml_scalar(&mem.namespace, StoredString)
     ));
-    out.push_str(&format!("title: {}\n", yaml_scalar(&mem.title, Quote)));
+    out.push_str(&format!(
+        "title: {}\n",
+        yaml_scalar(&mem.title, StoredString)
+    ));
     out.push_str(&format!("reflection_depth: {}\n", mem.reflection_depth));
     out.push_str(&format!(
         "attest_level: {}\n",
-        yaml_scalar(attest_level, PlainWhenSafe)
+        yaml_scalar(attest_level, StoredString)
     ));
     out.push_str(&format!(
         "created_at: {}\n",
-        yaml_scalar(&mem.created_at, PlainWhenSafe)
+        yaml_scalar(&mem.created_at, Timestamp)
     ));
-    out.push_str(&format!("agent_id: {}\n", yaml_scalar(agent_id, Quote)));
+    out.push_str(&format!(
+        "agent_id: {}\n",
+        yaml_scalar(agent_id, StoredString)
+    ));
     out.push_str("reflects_on:\n");
     if edges.is_empty() {
         out.push_str("  []\n");
@@ -413,9 +421,9 @@ fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -
         for e in edges {
             out.push_str(&format!(
                 "  - target_id: {}\n    attest_level: {}\n    created_at: {}\n",
-                yaml_scalar(&e.target_id, PlainWhenSafe),
-                yaml_scalar(&e.attest_level, PlainWhenSafe),
-                yaml_scalar(&e.created_at, PlainWhenSafe),
+                yaml_scalar(&e.target_id, StoredString),
+                yaml_scalar(&e.attest_level, StoredString),
+                yaml_scalar(&e.created_at, Timestamp),
             ));
         }
     }
@@ -447,14 +455,14 @@ fn render_json(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> St
     serde_json::to_string_pretty(&env).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
-/// API-09: retain the existing colon style while sharing all safety checks.
+/// API-09: distinguish string fields from schema-defined timestamps.
 #[derive(Clone, Copy)]
-enum YamlColonStyle {
-    Quote,
-    PlainWhenSafe,
+enum YamlScalarKind {
+    StoredString,
+    Timestamp,
 }
 
-/// Unicode 18 General_Category=Cf, including supplementary-plane controls.
+/// Unicode 18 `General_Category=Cf`, including supplementary-plane controls.
 /// Source: unicode.org/Public/18.0.0/ucd/extracted/DerivedGeneralCategory.txt.
 /// CONST-01: this classification depends only on the scalar value.
 const fn is_yaml_format_control(c: char) -> bool {
@@ -484,52 +492,36 @@ const fn is_yaml_format_control(c: char) -> bool {
     )
 }
 
-/// Preserve string types under YAML core resolution and legacy bool readers.
+/// Named conservative plain-string alphabet for YAML 1.1 and 1.2 readers.
+const SAFE_PLAIN_PUNCTUATION: &[u8] = b" -_.";
+const SAFE_PLAIN_RESERVED_WORDS: &[&str] = &[
+    "null", "~", "true", "false", "yes", "no", "on", "off", "y", "n",
+];
+
+/// Plain strings begin with an ASCII letter and stay inside the safe alphabet.
 /// OWNERSHIP-05: inspect borrowed bytes without allocating a lowercase copy.
-/// Timestamps remain strings under the core schema and keep their old bytes.
-fn yaml_plain_resolves_non_string(s: &str) -> bool {
-    const KEYWORDS: &[&str] = &[
-        "~", "null", "true", "false", "yes", "no", "on", "off", ".inf", ".nan",
-    ];
-    if KEYWORDS.iter().any(|word| s.eq_ignore_ascii_case(word)) {
-        return true;
-    }
-    if let Some(digits) = s.strip_prefix("0x") {
-        return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit());
-    }
-    if let Some(digits) = s.strip_prefix("0o") {
-        return !digits.is_empty() && digits.bytes().all(|b| matches!(b, b'0'..=b'7'));
-    }
-    // Restrict Rust's float parser to YAML numeric syntax; bare inf/NaN and
-    // RFC3339 timestamps must not acquire a different quoting policy.
-    s.bytes()
-        .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
-        && s.parse::<f64>().is_ok()
+/// R3: reader-specific regressions extend the test table, not this predicate.
+fn yaml_safe_plain(s: &str) -> bool {
+    s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && s.trim() == s
+        && s.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || SAFE_PLAIN_PUNCTUATION.contains(&byte))
+        && !SAFE_PLAIN_RESERVED_WORDS
+            .iter()
+            .any(|word| s.eq_ignore_ascii_case(word))
 }
 
-/// Quote unsafe stored scalars and escape controls without YAML line folding.
-/// Existing plain timestamps and conservative namespace/title/agent quoting
-/// retain their bytes; both styles use the same control-character encoder.
-fn yaml_scalar(s: &str, colon_style: YamlColonStyle) -> String {
+/// Quote strings outside `SAFE_PLAIN` and escape controls without line folding.
+/// Schema-defined RFC3339 timestamps alone retain their plain representation.
+fn yaml_scalar(s: &str, kind: YamlScalarKind) -> String {
     use std::fmt::Write as _;
 
-    let unsafe_colon = s.split(':').skip(1).any(|tail| {
-        matches!(colon_style, YamlColonStyle::Quote)
-            || tail.is_empty()
-            || tail.starts_with(char::is_whitespace)
-    });
-    let needs_quote = s.is_empty()
-        || yaml_plain_resolves_non_string(s)
-        || s.trim() != s
-        || s.starts_with([
-            '+', '-', '?', '*', '&', '!', '|', '>', '\'', '"', '%', '@', '`', '[', ']', '{', '}',
-            ',',
-        ])
-        || unsafe_colon
-        || s.contains(['#', '"', '\\'])
-        || s.chars().any(|c| {
-            c.is_control() || is_yaml_format_control(c) || matches!(c, '\u{2028}' | '\u{2029}')
-        });
+    let plain_timestamp = matches!(kind, YamlScalarKind::Timestamp)
+        && s.is_ascii()
+        && s.trim() == s
+        && !s.bytes().any(|byte| byte.is_ascii_control())
+        && chrono::DateTime::parse_from_rfc3339(s).is_ok();
+    let needs_quote = !yaml_safe_plain(s) && !plain_timestamp;
     if needs_quote {
         let mut escaped = String::from("\"");
         for c in s.chars() {
@@ -545,7 +537,7 @@ fn yaml_scalar(s: &str, colon_style: YamlColonStyle) -> String {
                 {
                     // YAML 1.2 §5.7: \u has exactly four hex digits; \U has eight.
                     // ERRORS-19: fmt::Write for String is infallible.
-                    let _ = if u32::from(c) <= u32::from(u16::MAX) {
+                    let _ = if u16::try_from(c).is_ok() {
                         write!(escaped, "\\u{:04x}", u32::from(c))
                     } else {
                         write!(escaped, "\\U{:08x}", u32::from(c))
@@ -830,8 +822,15 @@ mod tests {
         ];
         let s = render_markdown(&mem, &edges, "signed");
         assert!(s.starts_with("---\n"));
-        assert!(s.contains(&format!("memory_id: {}\n", mem.id)));
-        assert!(s.contains("namespace: team/alpha\n"));
+        let header = s
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap()
+            .0;
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
+        assert_eq!(parsed["memory_id"].as_str(), Some(mem.id.as_str()));
+        assert_eq!(parsed["namespace"].as_str(), Some("team/alpha"));
         assert!(s.contains("reflection_depth: 2\n"));
         assert!(s.contains("attest_level: signed\n"));
         // Bare scalar (no quotes) when value has no YAML-unsafe chars.
