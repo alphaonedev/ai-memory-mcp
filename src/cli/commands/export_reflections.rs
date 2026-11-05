@@ -658,6 +658,26 @@ mod tests {
         ("yaml-export", true, false),
         ("ai:test", false, false),
         ("2026-01-01T00:00:00Z", false, true),
+        ("\u{fffe}", false, false),
+        ("\u{ffff}", false, false),
+        ("123e4567-e89b-42d3-a456-426614174000", true, false),
+        ("abcdef01-2345-4678-9abc-def012345678", true, false),
+        ("123E4567-E89B-42D3-A456-426614174000", false, false),
+        ("123e4567-e89b-42d3-a456-42661417400", false, false),
+        ("123e4567-e89b-42d3-a456-42661417400g", false, false),
+        ("team/alpha", true, false),
+        ("/team", false, false),
+        ("team/", false, false),
+        ("What's next?", false, false),
+        ("lesson (draft)", false, false),
+        ("Café notes", false, false),
+        ("1234-12-12", false, false),
+        ("12:34:56", false, false),
+        ("1e5", false, false),
+        ("2026-06-30T23:59:60Z", false, false),
+        ("0000-01-01T00:00:00Z", false, false),
+        ("0001-01-01T00:00:00Z", false, true),
+        ("9999-12-31T23:59:59Z", false, true),
     ];
     const YAML_ORACLE_PREFIX_8605_R7: &str = "YAML_ORACLE_8605_R7 ";
 
@@ -801,13 +821,15 @@ mod tests {
 
     #[test]
     fn render_markdown_carries_frontmatter_and_edges() {
-        let mem = make_reflection(
+        let mut mem = make_reflection(
             "team/alpha",
             2,
-            "lesson learned",
+            "What's next?",
             "Body line.\n",
             "agent-without-colon",
         );
+        mem.id = "123e4567-e89b-42d3-a456-426614174000".into();
+        mem.created_at = "2026-01-03T00:00:00Z".into();
         let edges = vec![
             ReflectsOnEdge {
                 target_id: "src-1".into(),
@@ -821,23 +843,28 @@ mod tests {
             },
         ];
         let s = render_markdown(&mem, &edges, "signed");
-        assert!(s.starts_with("---\n"));
-        let header = s
-            .strip_prefix("---\n")
-            .unwrap()
-            .split_once("\n---\n")
-            .unwrap()
-            .0;
-        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
-        assert_eq!(parsed["memory_id"].as_str(), Some(mem.id.as_str()));
-        assert_eq!(parsed["namespace"].as_str(), Some("team/alpha"));
-        assert!(s.contains("reflection_depth: 2\n"));
-        assert!(s.contains("attest_level: signed\n"));
-        // Bare scalar (no quotes) when value has no YAML-unsafe chars.
-        assert!(s.contains("agent_id: agent-without-colon\n"));
-        assert!(s.contains("  - target_id: src-1\n"));
-        assert!(s.contains("    attest_level: signed\n"));
-        assert!(s.ends_with("Body line.\n"));
+        // TEST-02: pin real identifier bytes and the approved free-text quoting.
+        assert_eq!(
+            s,
+            concat!(
+                "---\n",
+                "memory_id: 123e4567-e89b-42d3-a456-426614174000\n",
+                "namespace: team/alpha\n",
+                "title: \"What's next?\"\n",
+                "reflection_depth: 2\n",
+                "attest_level: signed\n",
+                "created_at: 2026-01-03T00:00:00Z\n",
+                "agent_id: agent-without-colon\n",
+                "reflects_on:\n",
+                "  - target_id: src-1\n",
+                "    attest_level: unsigned\n",
+                "    created_at: 2026-01-01T00:00:00Z\n",
+                "  - target_id: src-2\n",
+                "    attest_level: signed\n",
+                "    created_at: 2026-01-02T00:00:00Z\n",
+                "---\n\nBody line.\n",
+            )
+        );
     }
 
     #[test]
