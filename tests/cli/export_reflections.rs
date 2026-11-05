@@ -154,7 +154,7 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
     if matches!(writer, NamespaceExportWriter::Cli) {
         assert_eq!(
             error.to_string(),
-            format!("memory {reflection_id} namespace {namespace:?}: refusing export path")
+            format!("memory {reflection_id:?} namespace {namespace:?}: refusing export path")
         );
     }
     if out_dir.exists() {
@@ -163,6 +163,49 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
             "refused namespace must not create an export subtree"
         );
     }
+}
+
+#[test]
+fn cli_namespace_refusal_escapes_stored_id_8605() {
+    const STORED_ID: &str = "stored\nid\t";
+    const REFUSED_NAMESPACE: &str = "..";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let original_id = seed_observation(&conn, "export-id-diagnostic", "source");
+    // Durable rows can bypass ingestion checks; exercise the actual CLI
+    // error boundary with a stored control character, without linked rows.
+    conn.execute(
+        "UPDATE memories SET id = ?1, namespace = ?2, memory_kind = 'reflection' WHERE id = ?3",
+        rusqlite::params![STORED_ID, REFUSED_NAMESPACE, original_id],
+    )
+    .unwrap();
+    db::checkpoint(&conn).expect("checkpoint before subprocess read");
+    drop(conn);
+
+    let out_dir = tmp.path().join("exports");
+    let assert = assert_cmd::Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("export-reflections")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg("--quiet")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "memory {STORED_ID:?} namespace {REFUSED_NAMESPACE:?}: refusing export path"
+        )),
+        "CLI refusal must identify the row with escaped stored values: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(STORED_ID),
+        "CLI stderr must not include the raw stored control characters"
+    );
 }
 
 #[test]
