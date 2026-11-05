@@ -499,6 +499,127 @@ fn cli_export_yaml_plain_bytes_8605_r5() {
 }
 
 #[test]
+fn cli_export_yaml_format_characters_8605_r6() {
+    // Unicode 18 DerivedGeneralCategory.txt: one row per Cf range, including
+    // supplementary-plane format controls requiring YAML's eight-digit escape.
+    let classes = [
+        ('\u{ad}', '\u{ad}'),
+        ('\u{600}', '\u{605}'),
+        ('\u{61c}', '\u{61c}'),
+        ('\u{6dd}', '\u{6dd}'),
+        ('\u{70f}', '\u{70f}'),
+        ('\u{890}', '\u{891}'),
+        ('\u{8e2}', '\u{8e2}'),
+        ('\u{180e}', '\u{180e}'),
+        ('\u{200b}', '\u{200f}'),
+        ('\u{202a}', '\u{202e}'),
+        ('\u{2060}', '\u{2064}'),
+        ('\u{2066}', '\u{206f}'),
+        ('\u{feff}', '\u{feff}'),
+        ('\u{fff9}', '\u{fffb}'),
+        ('\u{110bd}', '\u{110bd}'),
+        ('\u{110cd}', '\u{110cd}'),
+        ('\u{13430}', '\u{1343f}'),
+        ('\u{1bca0}', '\u{1bca3}'),
+        ('\u{1d173}', '\u{1d17a}'),
+        ('\u{e0001}', '\u{e0001}'),
+        ('\u{e0020}', '\u{e007f}'),
+    ];
+    let mut raw_classes = Vec::new();
+    for (first, last) in classes {
+        let controls: String = (first..=last).collect();
+        let value = format!("before{controls}after");
+        let document = markdown_with_edge_values_8605(&value, &value, "unsigned", &value);
+        let header = document
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap()
+            .0;
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
+        assert_eq!(parsed["title"].as_str(), Some(value.as_str()));
+        for key in ["target_id", "created_at"] {
+            assert_eq!(parsed["reflects_on"][0][key].as_str(), Some(value.as_str()));
+        }
+        if (first..=last).any(|c| header.contains(c)) {
+            raw_classes.push(format!(
+                "U+{:04X}..U+{:04X}",
+                u32::from(first),
+                u32::from(last)
+            ));
+        }
+    }
+    assert!(
+        raw_classes.is_empty(),
+        "raw format classes: {raw_classes:?}"
+    );
+}
+
+#[test]
+fn cli_export_yaml_string_types_8605_r6() {
+    let values = [
+        "",
+        "~",
+        "null",
+        "NULL",
+        "NuLl",
+        "true",
+        "FALSE",
+        "TrUe",
+        "yes",
+        "NO",
+        "oN",
+        "Off",
+        "2026",
+        "0",
+        "01",
+        "184467440737095516160",
+        "1.0",
+        ".5",
+        "5.",
+        "0x1f",
+        "0o17",
+        "1e3",
+        "1E-3",
+        ".inf",
+        ".INF",
+        ".nan",
+        ".NaN",
+        "+1",
+        "-1",
+        "+word",
+        "-word",
+    ];
+    let mut unquoted = Vec::new();
+    for value in values {
+        let document = markdown_with_edge_values_8605(value, value, "unsigned", value);
+        let header = document
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap()
+            .0;
+        let Ok(parsed) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(header) else {
+            unquoted.push(value);
+            continue;
+        };
+        // Check explicit quoting too: YAML 1.1 readers resolve legacy booleans.
+        if !header.lines().any(|line| line.starts_with("title: \""))
+            || parsed["title"].as_str() != Some(value)
+            || parsed["reflects_on"][0]["target_id"].as_str() != Some(value)
+            || parsed["reflects_on"][0]["created_at"].as_str() != Some(value)
+        {
+            unquoted.push(value);
+        }
+        assert_eq!(parsed["reflection_depth"].as_i64(), Some(0));
+    }
+    assert!(
+        unquoted.is_empty(),
+        "stored strings lost quoting/type: {unquoted:?}"
+    );
+}
+
+#[test]
 fn cli_namespace_path_8591_refuses_traversal() {
     assert_stored_namespace_refused("team/../../escaped", NamespaceExportWriter::Cli);
 }
