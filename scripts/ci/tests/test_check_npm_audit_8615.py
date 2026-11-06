@@ -189,9 +189,7 @@ class NpmExceptions8615Tests(unittest.TestCase):
         for field, payload, shape in (
                 ("advisory", "https://private-user:private-value@registry.invalid", "malformed advisory id"),
                 ("package", "private-value\nforged-status", "malformed package"),
-                ("version", "private-value", "malformed version"),
-                ("package", "x" * 215, "malformed package"),
-                ("version", "1.2.3-" + "x" * 129, "malformed version")):
+                ("version", "private-value", "malformed version")):
             with self.subTest(field=field):
                 self.entries = [dict(original, **{field: payload})]
                 diagnostic = self.assert_rejected(shape,
@@ -199,10 +197,20 @@ class NpmExceptions8615Tests(unittest.TestCase):
                     package="unavailable" if field == "package" else "deepmerge",
                     version="unavailable" if field == "version" else "4.3.1")
                 self.assertNotIn(payload, diagnostic)
+        for field, payload in (("package", "x" * 215), ("version", "1.2.3-" + "x" * 257)):
+            identity = {"advisory": ADVISORY_ID, "package": "deepmerge", "version": "4.3.1"}
+            identity[field] = payload
+            diagnostic = str(gate.AuditError("stale identity", **identity))
+            self.assertIn(field + "=unavailable", diagnostic)
+            self.assertNotIn(payload, diagnostic)
         self.entries = [original]
         source = self.report["vulnerabilities"]["deepmerge"]["via"][0]
         source["url"] = "https://private-user:private-value@registry.invalid"
         diagnostic = self.assert_rejected("malformed advisory id", advisory="unavailable")
+        self.assertNotIn("private-value", diagnostic)
+        source["url"] = "https://github.com/advisories/" + ADVISORY_ID
+        self.report["vulnerabilities"]["deepmerge"]["nodes"] = {"private-value": "not nodes"}
+        diagnostic = self.assert_rejected("missing advisory chain", version="unavailable")
         self.assertNotIn("private-value", diagnostic)
 
 
