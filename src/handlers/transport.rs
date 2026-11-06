@@ -1034,6 +1034,13 @@ pub async fn api_key_auth(
     mut req: Request,
     next: Next,
 ) -> impl IntoResponse {
+    // #8357 — bind the presenting mTLS client certificate to its mapped
+    // agent BEFORE any early return (no api key, health, the sync bypass):
+    // a differing `X-Agent-Id` is refused (enforce) or rewritten (warn),
+    // and an unmapped certificate on `/api/v1/sync/*` is refused (enforce).
+    if let Err(resp) = crate::mtls_agent_binding::bind_request(&mut req) {
+        return resp;
+    }
     let Some(ref expected) = auth.key else {
         // No API key configured — allow all requests
         return next.run(req).await.into_response();
@@ -1182,7 +1189,19 @@ pub async fn api_key_auth(
     // assert a spoofed admin identity (M1). The bound principal is also injected
     // into the request extensions so the downstream IDOR/admin gates can consume
     // the `AuthLevel`. Keyed to a server-held secret, NEVER a header.
-    if let Some(agent_id) = per_agent
+    // #8357 (review r1 sec F2) — a certificate bound to another agent wins
+    // over the per-agent key whatever the identity mode: refused (enforce)
+    // or kept as the certificate's agent (warn), never silently rebound.
+    let cert_governs = match per_agent.as_deref() {
+        Some(key_agent) => {
+            match crate::mtls_agent_binding::reconcile_per_agent_key(&req, key_agent) {
+                Ok(governs) => governs,
+                Err(resp) => return resp,
+            }
+        }
+        None => false,
+    };
+    if let Some(agent_id) = per_agent.filter(|_| !cert_governs)
         && auth.identity_mode != crate::config::HttpIdentityMode::Off
     {
         let header_id = req

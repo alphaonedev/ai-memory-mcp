@@ -493,7 +493,7 @@ fn agent_notified_is_a_subscribable_webhook_event_3465() {
         },
     )
     .expect("agent_notified must be subscribable");
-    assert!(!allowed.is_empty());
+    assert_ne!(allowed, "");
 
     let denied = ai_memory::subscriptions::insert(
         &conn,

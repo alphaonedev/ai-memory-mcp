@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::db;
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+use crate::storage::execute_owner_8577 as execute_owner;
 
 use super::{
     BoxBackendError, CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter,
@@ -416,6 +417,104 @@ fn assert_caller_owns_for_mutation(
     })
 }
 
+/// #8564 — the owner gate of an approved delete / tier-bump execute: the
+/// row must be stamped and owned by the agent that REQUESTED the action
+/// (the approver only admits it). An unstamped row is refused in every
+/// posture, matching the Postgres arms; the inbox carve-out is off.
+fn execute_owner_gate(
+    conn: &rusqlite::Connection,
+    ctx: &CallerContext,
+    pa: &crate::models::PendingAction,
+    mid: &str,
+    arm: db::ExecuteArm,
+) -> StoreResult<()> {
+    // #8495 r4 Option C, 3-agent vote (6def5ab6): the caller's context
+    // decides. A bypass context (federated decide, after its peer-scope
+    // check; parity doc federation_signing_check.rs:86-112) keeps its
+    // bypass; only a tenant context is gated on the row owner.
+    if ctx.bypass_visibility {
+        return Ok(());
+    }
+    let (action, _) = execute_owner::arm_labels(arm);
+    let Some(target) = db::get(conn, mid).map_err(box_err)? else {
+        return Err(StoreError::NotFound {
+            id: mid.to_string(),
+        });
+    };
+    execute_owner::check_execute_owner(&target, pa.requested_by.as_str(), arm)
+        .map_err(|refusal| owner_refusal_error(&refusal, action, mid))
+}
+
+/// The `PermissionDenied` envelope of an [`execute_owner::ExecuteOwnerRefusal`].
+/// The row owner goes only to the structured AUTHZ trace, never the reason
+/// that `store_err_to_response` renders into the 403 body (#3426).
+fn owner_refusal_error(
+    refusal: &execute_owner::ExecuteOwnerRefusal,
+    action: &str,
+    mid: &str,
+) -> StoreError {
+    if let execute_owner::ExecuteOwnerRefusal::NotOwner { owner } = refusal {
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            "sal owner-gate refusal on {action}: requester != owner {owner} (id={mid})"
+        );
+    }
+    StoreError::PermissionDenied {
+        action: action.to_string(),
+        target: mid.to_string(),
+        reason: refusal.reason().to_string(),
+    }
+}
+
+/// #8577 — the owner rule as a precondition of the approval vote: run on a
+/// tenant decide entry AFTER the eligibility refusals and BEFORE the vote is
+/// written, so a refusal writes the forensic row and leaves the pending row
+/// `pending`. A missing target is left to the execute step.
+fn approve_owner_precondition(
+    conn: &rusqlite::Connection,
+    pa: &crate::models::PendingAction,
+) -> anyhow::Result<()> {
+    let Some((arm, mid)) = execute_owner::execute_arm_target(pa) else {
+        return Ok(());
+    };
+    let Some(target) = db::get(conn, mid)? else {
+        return Ok(());
+    };
+    if let Err(refusal) = execute_owner::check_execute_owner(&target, pa.requested_by.as_str(), arm)
+    {
+        execute_owner::record_owner_refusal(conn, pa);
+        let (action, _) = execute_owner::arm_labels(arm);
+        return Err(anyhow::Error::new(owner_refusal_error(
+            &refusal, action, mid,
+        )));
+    }
+    Ok(())
+}
+
+/// #8577 — `db::approve_with_approver_type` for a SAL decide entry: a tenant
+/// context runs the owner precondition before the vote, a bypass context
+/// (federation) does not.
+fn approve_for_ctx(
+    conn: &rusqlite::Connection,
+    ctx: &CallerContext,
+    pending_id: &str,
+    approver_agent_id: &str,
+) -> StoreResult<db::ApproveOutcome> {
+    let precondition: Option<db::ApprovePrecondition<'_>> = if ctx.bypass_visibility {
+        None
+    } else {
+        Some(&approve_owner_precondition)
+    };
+    db::approve_with_approver_type_gated(
+        conn,
+        pending_id,
+        approver_agent_id,
+        db::ApproveSurface::Http,
+        precondition,
+    )
+    .map_err(|e| e.downcast::<StoreError>().unwrap_or_else(box_err))
+}
+
 /// #3957 — test-only interleave point between the ownership gate and the
 /// write it authorises. A cell arms it for ONE row id; any other id (a
 /// concurrent test on another row) passes through untouched. Compiled out
@@ -446,6 +545,8 @@ fn owner_gate_test_hook(_id: &str) {}
 
 #[cfg(test)]
 mod owner_gate_txn_3957;
+#[cfg(test)]
+mod reclassify_txn_5084_tests;
 
 // #1709 Pillar 1 — the actions SELECT column list + row mapping live in
 // `crate::actions` (shared with the MCP `memory_action_*` handlers, which hold
@@ -3346,7 +3447,7 @@ impl MemoryStore for SqliteStore {
 
     async fn governance_approve_with_consensus(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         pending_id: &str,
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
@@ -3356,13 +3457,7 @@ impl MemoryStore for SqliteStore {
         // gate UNCONDITIONALLY for behavioural parity with the postgres trait
         // impl (`governance_approve_with_consensus`, #1793). The single-operator
         // opt-in lives only on the MCP/CLI free-fn direct callers.
-        let outcome = db::approve_with_approver_type(
-            &conn,
-            pending_id,
-            approver_agent_id,
-            db::ApproveSurface::Http,
-        )
-        .map_err(box_err)?;
+        let outcome = approve_for_ctx(&conn, ctx, pending_id, approver_agent_id)?;
         // Translate the db-layer ApproveOutcome → SAL ApproveOutcome.
         let sal_outcome = match outcome {
             db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
@@ -3893,9 +3988,14 @@ impl MemoryStore for SqliteStore {
         new_kind: crate::models::MemoryKind,
     ) -> StoreResult<bool> {
         self.gate_record_stop()?;
-        let mut conn = self.state.lock().await;
-        let tx = conn.transaction().map_err(box_err)?;
-        let old_kind: Option<String> = tx
+        let conn = self.state.lock().await;
+        // BEGIN IMMEDIATE (#5084, the #2250 class): this is a read-then-write
+        // (SELECT memory_kind, then UPDATE + signed-event append); a DEFERRED
+        // upgrade fails with SQLITE_BUSY_SNAPSHOT (not retried by
+        // busy_timeout) when another connection commits in between. Dropping
+        // `tx` on an early return rolls back.
+        let tx = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
+        let old_kind: Option<String> = conn
             .query_row(
                 "SELECT memory_kind FROM memories WHERE id = ?1",
                 rusqlite::params![id],
@@ -3915,7 +4015,7 @@ impl MemoryStore for SqliteStore {
         {
             return Ok(false);
         }
-        let changed = tx
+        let changed = conn
             .execute(
                 "UPDATE memories SET memory_kind = ?1, version = version + 1 \
                  WHERE id = ?2 AND memory_kind NOT IN ('reflection', 'persona')",
@@ -3950,8 +4050,9 @@ impl MemoryStore for SqliteStore {
             chrono::Utc::now().to_rfc3339(),
             Some(&cause),
         );
-        crate::signed_events::append_signed_event_no_tx(&tx, &event).map_err(box_err)?;
-        tx.commit().map_err(box_err)?;
+        let anchor =
+            crate::signed_events::append_signed_event_no_tx(&conn, &event).map_err(box_err)?;
+        tx.commit_and_emit(anchor).map_err(box_err)?;
         Ok(true)
     }
 
@@ -4330,14 +4431,27 @@ impl MemoryStore for SqliteStore {
     /// `execute_pending_action` (which returned `UnsupportedCapability`).
     /// Delegates to the canonical sqlite primitive `db::execute_pending_action`
     /// so the SAL trait is the canonical execute surface across backends.
+    ///
+    /// #8564 — the delete and tier-bump arms run under the REQUESTER's
+    /// owner gate ([`execute_owner_gate`]), the SQLite twin of the
+    /// Postgres arms (f30c81a7f): another agent's row and an unstamped
+    /// row are refused `PermissionDenied` and left untouched.
     async fn execute_pending_action(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         pending_id: &str,
     ) -> StoreResult<Option<String>> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::execute_pending_action(&conn, pending_id).map_err(box_err)
+        let gate = |conn: &rusqlite::Connection,
+                    pa: &crate::models::PendingAction,
+                    mid: &str,
+                    arm: db::ExecuteArm|
+         -> anyhow::Result<()> {
+            execute_owner_gate(conn, ctx, pa, mid, arm).map_err(anyhow::Error::new)
+        };
+        db::execute_pending_action_gated(&conn, pending_id, Some(&gate))
+            .map_err(|e| e.downcast::<StoreError>().unwrap_or_else(box_err))
     }
 
     /// FX-C2-batch5 — Sqlite override matching the nominal SQLite
@@ -4346,7 +4460,7 @@ impl MemoryStore for SqliteStore {
     /// `governance_approve_with_consensus` for one less indirection).
     async fn approve_with_approver_type(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         pending_id: &str,
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
@@ -4355,13 +4469,7 @@ impl MemoryStore for SqliteStore {
         // enforce the Human-arm gate UNCONDITIONALLY for parity with the
         // postgres trait impl (#1793). MCP/CLI single-operator opt-in lives on
         // the free-fn direct callers only.
-        let outcome = db::approve_with_approver_type(
-            &conn,
-            pending_id,
-            approver_agent_id,
-            db::ApproveSurface::Http,
-        )
-        .map_err(box_err)?;
+        let outcome = approve_for_ctx(&conn, ctx, pending_id, approver_agent_id)?;
         let sal = match outcome {
             db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
             db::ApproveOutcome::Pending { votes, quorum } => {
@@ -4496,13 +4604,27 @@ impl MemoryStore for SqliteStore {
     /// `(canonical_name, namespace)`.
     async fn entity_register(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         canonical_name: &str,
         namespace: &str,
         aliases: &[String],
         extra_metadata: &serde_json::Value,
         agent_id: Option<&str>,
     ) -> StoreResult<crate::models::EntityRegistration> {
+        // #8497 - owner = the caller context's verified principal, the same
+        // shared rule the postgres twin applies.
+        let owner = crate::identity::entity_owner::trait_entity_owner(
+            &ctx.agent_id,
+            agent_id,
+            extra_metadata,
+            namespace,
+            canonical_name,
+        )
+        .map_err(|m| StoreError::PermissionDenied {
+            action: crate::identity::entity_owner::OP_ENTITY_REGISTER.to_string(),
+            target: format!("{namespace}/{canonical_name}"),
+            reason: m.to_string(),
+        })?;
         let conn = self.state.lock().await;
         db::entity_register(
             &conn,
@@ -4510,7 +4632,7 @@ impl MemoryStore for SqliteStore {
             namespace,
             aliases,
             extra_metadata,
-            agent_id,
+            Some(&owner),
         )
         .map_err(box_err)
     }
@@ -4540,7 +4662,7 @@ impl MemoryStore for SqliteStore {
 // `UnsupportedCapability` trait default), but a future override would
 // have handed callers a transaction that doesn't transact — the
 // classic loaded-footgun. When real SAL transactions land, implement
-// them honestly (rusqlite `unchecked_transaction` through the mutex)
+// them honestly (`crate::storage::connection::WriteTxn`, BEGIN IMMEDIATE, through the mutex)
 // rather than resurrecting the no-op.
 
 #[cfg(test)]

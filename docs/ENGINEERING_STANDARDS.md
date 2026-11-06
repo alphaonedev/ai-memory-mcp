@@ -31,6 +31,7 @@ There is no separate development repo. `ai-memory-mcp-dev` is archived.
 - `develop` — active development, all PRs target this branch
 - Feature/fix branches created from `develop` (e.g., `feature/batch-import`, `fix/ttl-overflow`)
 - Maintainers merge `develop` into `main` when cutting a release
+- `CHANGELOG.md` has no union merge driver (removed in #8583: GitHub never honoured it and the local union merges produced duplicated bullets); conflicts are resolved by hand with the normal three-way markers, and before landing `git merge-tree --write-tree <tip> <head>` must exit 0 with no `CONFLICT` line and `cargo test --test qual_changelog_no_duplicate_bullets` must pass
 
 ### 1.3 Branch Protection (main)
 
@@ -103,7 +104,7 @@ Every PR must pass these gates before merge:
 
 Contributors are responsible for the first ten gates (four cargo + six
 script gates wired into `.github/workflows/c8-precheck.yml` — see
-[CLAUDE.md §"Lint gates (issue #1174 PR10)"](../CLAUDE.md)). Maintainers perform the
+[docs/reference/CODE_STYLE.md §"Lint gates (issue #1174 PR10)"](reference/CODE_STYLE.md)). Maintainers perform the
 functional test, security review, and documentation sync verification during PR review.
 
 ---

@@ -139,7 +139,7 @@ fn gap7_verbose_provenance_false_collapses_to_legacy_shape() {
     .expect("recall ok");
 
     let memories = resp["memories"].as_array().unwrap();
-    assert!(!memories.is_empty());
+    assert_ne!(memories.len(), 0);
     let row = &memories[0];
     // Substrate columns still present (they ride on Memory's serde).
     assert!(row["confidence"].is_number());
@@ -201,7 +201,7 @@ fn gap7_freshness_state_warm_for_recently_accessed_row() {
     )
     .expect("recall");
     let memories = resp["memories"].as_array().unwrap();
-    assert!(!memories.is_empty());
+    assert_ne!(memories.len(), 0);
     let fs = memories[0]["freshness_state"]
         .as_str()
         .expect("freshness_state present");

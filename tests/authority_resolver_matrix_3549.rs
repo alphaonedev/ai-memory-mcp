@@ -61,7 +61,7 @@ fn mcp_unset_identity_is_the_local_operator_trust_domain_3549() {
     let a = Authority::resolve_mcp_in(Some("claude-code"), &[]).expect("resolves");
     assert_eq!(a.binding(), Binding::LocalOperator);
     assert_eq!(a.read_caller(), None, "F13: trust-all reads when unset");
-    assert!(!a.principal().is_empty());
+    assert_ne!(a.principal(), "");
     assert!(
         ai_memory::validate::validate_agent_id_shape(a.principal()).is_ok(),
         "the durable stamp is a valid owner id: {}",
@@ -312,6 +312,18 @@ fn http_admin_binding_admitted_matrix_3549() {
         M::Enforce,
         Binding::Attested,
         true
+    ));
+    // #8357: a client-certificate binding is key-bound, with or without
+    // enrolled per-agent keys.
+    assert!(http_admin_binding_admitted(
+        M::Enforce,
+        Binding::ClientCert,
+        true
+    ));
+    assert!(http_admin_binding_admitted(
+        M::Enforce,
+        Binding::ClientCert,
+        false
     ));
     // Claimed under keys: off/advisory admit, enforce refuses.
     assert!(http_admin_binding_admitted(M::Off, Binding::Claimed, true));

@@ -115,5 +115,5 @@ fn issue_1602_forget_matches_respects_limit() {
 fn issue_1602_forget_matches_requires_a_filter() {
     let conn = open_db();
     let err = db::forget_matches(&conn, None, None, None, 10).unwrap_err();
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 }

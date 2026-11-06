@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 
 #[test]
 fn issue_3616_legacy_freeze_refuses_run_with_refreeze_remedy() -> anyhow::Result<()> {
+    // #3722 seam: resolve the caller as if AI_MEMORY_AGENT_ID were absent on
+    // THIS thread. Without it a sibling test that sets the variable under the
+    // crate env lock (mcp::tools::action lease tests set `ai:bob`) lands in
+    // this run and the caller-bind gate refuses it as a mismatch.
+    let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
     let conn = crate::storage::open(std::path::Path::new(":memory:"))?;
     let kp = crate::identity::keypair::generate("ai:routine3616")?;
     let mut routine = Routine {

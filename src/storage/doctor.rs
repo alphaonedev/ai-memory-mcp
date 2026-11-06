@@ -167,9 +167,12 @@ pub fn sweep_pending_action_timeouts(
     // so a concurrent decide_pending_action wins (its decision is
     // not overwritten).
     let now = Utc::now().to_rfc3339();
-    let tx_savepoint = conn.unchecked_transaction()?;
+    // BEGIN IMMEDIATE (#5084): the candidate read above is outside the
+    // transaction and the transaction is UPDATE-only, but one rule holds for
+    // every write path (a DEFERRED upgrade can fail with SQLITE_BUSY_SNAPSHOT).
+    let tx_savepoint = crate::storage::connection::WriteTxn::begin(conn)?;
     {
-        let mut update = tx_savepoint.prepare(
+        let mut update = conn.prepare(
             "UPDATE pending_actions
              SET status = 'expired', expired_at = ?1
              WHERE id = ?2 AND status = 'pending'",
@@ -313,20 +316,20 @@ pub fn doctor_oldest_pending_age_secs(conn: &Connection) -> Result<Option<i64>> 
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures.
+/// Returns `Err` on any SQLite failure, including a standard whose metadata
+/// is not valid JSON or a missing `namespace_meta` table (#4956).
 pub fn doctor_governance_coverage(conn: &Connection) -> Result<(usize, usize)> {
-    let with_policy: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memories m
-             INNER JOIN namespace_meta nm ON nm.standard_id = m.id
-             WHERE json_extract(m.metadata, '$.governance') IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let total_meta: i64 = conn
-        .query_row("SELECT COUNT(*) FROM namespace_meta", [], |r| r.get(0))
-        .unwrap_or(0);
+    // #4715 / #4956: a read fault is an error, never a healthy-looking 0
+    // (ERRORS-02, ERRORS-19). The caller reports it Critical.
+    let with_policy: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories m
+         INNER JOIN namespace_meta nm ON nm.standard_id = m.id
+         WHERE json_extract(m.metadata, '$.governance') IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let total_meta: i64 =
+        conn.query_row("SELECT COUNT(*) FROM namespace_meta", [], |r| r.get(0))?;
     let with = usize::try_from(with_policy.max(0)).unwrap_or(0);
     let total = usize::try_from(total_meta.max(0)).unwrap_or(0);
     Ok((with, total.saturating_sub(with)))
@@ -342,15 +345,18 @@ pub fn doctor_governance_coverage(conn: &Connection) -> Result<(usize, usize)> {
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures.
+/// Returns `Err` on any SQLite failure, including a row that fails to read.
 pub fn doctor_governance_depth_distribution(conn: &Connection) -> Result<Vec<usize>> {
     const MAX_DEPTH: usize = 16;
     let mut stmt = conn.prepare("SELECT namespace, parent_namespace FROM namespace_meta")?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })?;
+    // #4715 — a row that fails to read is a read fault, never a silently
+    // shorter histogram (ERRORS-19).
     let parent_map: HashMap<String, Option<String>> = rows
-        .filter_map(rusqlite::Result::ok)
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
         .collect::<HashMap<_, _>>();
     let mut hist = vec![0_usize; MAX_DEPTH + 1];
     for ns in parent_map.keys() {
@@ -367,6 +373,35 @@ pub fn doctor_governance_depth_distribution(conn: &Connection) -> Result<Vec<usi
         hist[bucket] += 1;
     }
     Ok(hist)
+}
+
+/// #4715 — every stored explicit `parent_namespace` chain already past
+/// `GOVERNANCE_CHAIN_MAX_DEPTH`, walked from root segments only with the
+/// bind-time check's every-hop count (`governance::bind_chain_depth`). #4477
+/// refuses every governed operation under such a chain, so the doctor names
+/// them.
+///
+/// # Errors
+///
+/// Any SQLite failure, including a row that fails to read (never reported as
+/// "no over-depth chain").
+pub fn doctor_over_depth_chains(
+    conn: &Connection,
+) -> Result<Vec<crate::governance::bind_chain_depth::OverDepthChain>> {
+    use crate::governance::bind_chain_depth::{LinkRow, over_depth_chains};
+    let mut stmt = conn.prepare(
+        "SELECT namespace, parent_namespace FROM namespace_meta \
+         WHERE parent_namespace IS NOT NULL",
+    )?;
+    let links = stmt
+        .query_map([], |r| {
+            Ok(LinkRow {
+                namespace: r.get::<_, String>(0)?,
+                parent: r.get::<_, Option<String>>(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<LinkRow>>>()?;
+    Ok(over_depth_chains(&links))
 }
 
 /// Sum of `subscriptions.dispatch_count` and `subscriptions.failure_count`

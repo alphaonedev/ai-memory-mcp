@@ -152,7 +152,7 @@ impl PostgresStore {
             now.to_rfc3339(),
             Some(&cause),
         );
-        pg_append_signed_event_with_chain_in_tx(
+        let anchor = pg_append_signed_event_with_chain_in_tx(
             &mut tx,
             PgSignedEventInsert {
                 id: &event.id,
@@ -167,7 +167,7 @@ impl PostgresStore {
         )
         .await
         .map_err(|e| to_store_err("reown append signed_event", e))?;
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("reown commit", e))?;
         tracing::warn!(

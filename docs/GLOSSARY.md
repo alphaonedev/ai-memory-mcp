@@ -15,12 +15,24 @@ stored memory carries `metadata.agent_id` for attribution. See
 
 ## Agent Identity (NHI)
 
-Non-Human Identity marker stamped on every memory. A **claimed**
-identity (not attested). Follows the regex
-`^[A-Za-z0-9_\-:@./]{1,128}$`. Resolution precedence: explicit flag →
-env var → MCP client info → process-stable host fallback →
-anonymous. Once stored, immutable across update / upsert / import /
-sync / consolidate. See `CLAUDE.md` § "Agent Identity (NHI)".
+Non-Human Identity attribution stored as `metadata.agent_id`. The caller's
+authority separately records how that principal is bound to the request.
+[`identity::authority::Binding`](../src/identity/authority.rs) has six variants:
+
+| Variant (wire tag) | Meaning |
+|---|---|
+| `Env` (`env`) | MCP launcher's configured `AI_MEMORY_AGENT_ID`; reads enforce this owner. |
+| `LocalOperator` (`local_operator`) | MCP without a configured identity; durable local attribution and single-tenant trust-all reads. |
+| `Claimed` (`claimed`) | HTTP header claim or anonymous caller; a shared transport key does not prove possession of that principal. |
+| `ApiKey` (`api_key`) | An enrolled per-agent API key proves possession of the principal. |
+| `ClientCert` (`client_cert`) | An mTLS certificate fingerprint bound by `AI_MEMORY_MTLS_AGENT_BINDING_MAP` proves the principal. |
+| `Attested` (`attested`) | Reserved request binding, not produced at v1.0.0 dispatch; write signatures are verified separately per row. |
+
+In MCP enforced multi-agent mode, authorization subjects bind to the configured
+caller: a disagreeing explicit `agent_id` is refused with `agent_id mismatch`.
+The attribution fallback for an unconfigured local operator does not override
+that authorization rule. Empty or invalid configured identities refuse.
+See [SECURITY.md, Caller authority](../SECURITY.md) for the authority boundary.
 
 ## Archive
 

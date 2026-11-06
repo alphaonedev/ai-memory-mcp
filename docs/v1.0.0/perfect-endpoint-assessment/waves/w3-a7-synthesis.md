@@ -203,6 +203,7 @@ Wave 4 owns **implementation sequencing + threat/posture details** (crypto succe
 3. **Issue map:** one issue per V10-G*; link W2 kill-tests + A3 code anchors.  
 4. **Stamp E2E verification:** confirm W2-A2 G2 (per-row reflect metadata) vs A3 “2a shipped” — if stamps sparse, **block V10-G1 marketing** until fixed.  
 5. **D3-031 design** (consolidate re-correlation) — T1 may need **5-agent vote (4d3ea1c5)**.  
+   (superseded 2026-10-10: the crossroads rule is now the development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) 1x3 vote, 3-agent vote (6def5ab6); recorded here unchanged as history)
 6. **Secure-default self-DOS matrix** (PE-1 empty chain, unsigned fleets, fed heterogeneous peers).  
 7. **Identity migration ADR** (UUID→cid authority) — T4 vote before freeze locks dual-truth forever (A5 killer).  
 8. **Claims pack for W5/W6:** freeze honesty template + A6 category language + theater ban list into positioning/release-notes/site.  
@@ -239,4 +240,4 @@ Compound of three peer kill-shots: (A6) sell “perfect memory” and die as ove
 
 ---
 
-*W3-A7 · peers A3–A6 integrated · A1/A2 absent · under 500 lines · `/Users/fate/Downloads/ai-memory-mcp/waves/w3-a7-synthesis.md`*
+*W3-A7 · peers A3–A6 integrated · A1/A2 absent · under 500 lines · `<home>/Downloads/ai-memory-mcp/waves/w3-a7-synthesis.md`*

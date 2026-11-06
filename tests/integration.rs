@@ -452,7 +452,7 @@ fn test_cli_store_and_recall() {
     );
     assert!(output.status.success());
     let ns: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(!ns["namespaces"].as_array().unwrap().is_empty());
+    assert_ne!(ns["namespaces"].as_array().unwrap().len(), 0);
 
     // Export
     let output = cmd(binary)
@@ -3341,7 +3341,7 @@ fn test_mcp_dedup_replaces_metadata() {
     let recall_text = recall["result"]["content"][0]["text"].as_str().unwrap();
     let recall_data: serde_json::Value = serde_json::from_str(recall_text).unwrap();
     let memories = recall_data["memories"].as_array().unwrap();
-    assert!(!memories.is_empty());
+    assert_ne!(memories.len(), 0);
     assert_eq!(memories[0]["metadata"]["version"], 2);
     assert_eq!(memories[0]["metadata"]["extra"], "added");
 }
@@ -5831,7 +5831,7 @@ fn test_inherit_no_standards_returns_empty() {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
     let standards = body["standards"].as_array().unwrap();
-    assert!(standards.is_empty());
+    assert_eq!(standards.len(), 0);
     assert_eq!(body["count"], 0);
     let _ = std::fs::remove_file(&db);
 }
@@ -7811,7 +7811,7 @@ fn test_budget_touch_only_surviving() {
 
     let v = recall_with_budget(bin, &db, "alpha", Some(5));
     let mems = v["memories"].as_array().unwrap();
-    assert!(!mems.is_empty());
+    assert_ne!(mems.len(), 0);
 
     let list = cmd(bin)
         .args(["--db", db.to_str().unwrap(), "--json", "list"])
@@ -8126,7 +8126,7 @@ fn test_hier_recall_budget_applied_after_proximity() {
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let mems = v["memories"].as_array().unwrap();
-    assert!(!mems.is_empty());
+    assert_ne!(mems.len(), 0);
     assert_eq!(mems[0]["title"], "self");
     assert!(v["tokens_used"].as_u64().unwrap() <= 10);
     let _ = std::fs::remove_file(&db);
@@ -8680,7 +8680,9 @@ fn gen_self_signed_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, st
             // (UnsupportedCertVersion). Any `-addext` makes both LibreSSL
             // and OpenSSL emit v3.
             "-addext",
-            "subjectAltName=DNS:localhost",
+            // #7889 — the IP SAN lets a client that pins this cert as its
+            // trust anchor verify the loopback listener by address.
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
             "-addext",
             "basicConstraints=critical,CA:FALSE",
         ])
@@ -8769,13 +8771,17 @@ fn test_serve_native_tls_health_probe() {
 }
 
 /// Build a `reqwest::blocking::Client` presenting the given PEM cert +
-/// key as its client identity. Accepts any server cert (self-signed in
-/// these tests — the peer authenticates US via fingerprint allowlist).
+/// key as its client identity. The server is VERIFIED: its self-signed
+/// cert (`server_cert_path`, IP SAN 127.0.0.1) is pinned as the client's
+/// extra trust anchor, so the handshake runs chain + address validation
+/// (#7889, `CodeQL` `rust/disabled-certificate-check`) while the peer
+/// authenticates US via its fingerprint allowlist.
 /// Uses reqwest's rustls-tls backend; `from_pem` expects both cert and
 /// key concatenated into a single PEM blob.
 fn build_mtls_probe_client(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
+    server_cert_path: &std::path::Path,
 ) -> reqwest::blocking::Client {
     // M5 (2026-05-11): reqwest's native-tls feature was removed from
     // [dependencies] in favor of rustls-tls only (dropped dual-TLS-stack
@@ -8794,10 +8800,13 @@ fn build_mtls_probe_client(
     // M5: explicit rustls backend (the only one we link now that native-tls
     // was dropped). Without this the Identity-vs-backend type check fails
     // with "incompatible TLS identity type" on some platforms.
+    let server_root =
+        reqwest::Certificate::from_pem(&std::fs::read(server_cert_path).expect("read server cert"))
+            .expect("parse server cert as PEM");
     reqwest::blocking::Client::builder()
         .use_rustls_tls()
         .identity(identity)
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(server_root)
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .expect("build reqwest mTLS client")
@@ -8907,7 +8916,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // reqwest (rustls-tls backend) instead of `curl --cert` because
     // curl on Windows CI is often the schannel build and doesn't
     // accept PEM client certs the same way curl-openssl does.
-    let client_a = build_mtls_probe_client(&peer_a_cert, &peer_a_key);
+    let client_a = build_mtls_probe_client(&peer_a_cert, &peer_a_key, &server_cert);
 
     // Wait for TLS bind — 30s poll window; Windows is slower on the
     // first handshake (RSA key parse + custom verifier init).
@@ -9039,7 +9048,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // Negative case: reqwest with peer-C's cert must be rejected at
     // handshake. The `send()` call returns an error (not an HTTP code)
     // because the TLS layer fails before any HTTP exchange.
-    let outsider_client = build_mtls_probe_client(&outsider_cert, &outsider_key);
+    let outsider_client = build_mtls_probe_client(&outsider_cert, &outsider_key, &server_cert);
     let neg = outsider_client.get(&health_url).send();
     assert!(
         neg.is_err(),

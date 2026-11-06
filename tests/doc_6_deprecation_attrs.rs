@@ -5,7 +5,7 @@
 //! legacy `AppConfig` flat fields.
 //!
 //! Pins the deprecation discipline by reading `src/config.rs` and
-//! asserting that every legacy field documented at CLAUDE.md §"Config
+//! asserting that every legacy field documented at `docs/reference/ARCHITECTURE_REFERENCE.md` §"Config
 //! schema v0.7.x (#1146)" (`llm_model`, `ollama_url`, `embed_url`,
 //! `embedding_model`, `cross_encoder`, `default_namespace`,
 //! `archive_on_gc`, `archive_max_days`, `max_memory_mb`,

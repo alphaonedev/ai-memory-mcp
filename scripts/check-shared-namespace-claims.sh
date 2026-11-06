@@ -238,7 +238,27 @@ PY
 if [ "$SELF_TEST" -eq 1 ]; then
   ALLOW=/dev/null   # the live baseline must never soften a control
   # Fixtures live in throwaway worktrees under the repo's gitignored .local-runs/ (never /tmp).
-  T=.local-runs/shared-claims-selftest; rm -rf "$T"; mkdir -p "$T"; ok=1
+  # #8305: the fixture branches live in the COMMON git dir that every worktree of the repo shares, so every
+  # name this run creates (scratch dir, worktrees, branches) carries one run id, derived once. Cleanup removes
+  # only those names and never another run's fixtures.
+  RUN="$$-$(date +%s)"
+  T=".local-runs/shared-claims-selftest-$RUN"; FB2="fixture/3152-dup-v2-$RUN"; FB3="fixture/3152-dup-v3-$RUN"; ok=1
+  cleanup() {
+    local d
+    case "$T" in .local-runs/shared-claims-selftest-*) ;; *) return 0;; esac
+    if [ -d "$T" ]; then for d in "$T"/*/; do [ -d "$d" ] && git worktree remove --force "$d" >/dev/null 2>&1; done; fi
+    git worktree prune >/dev/null 2>&1
+    git branch -D "$FB2" "$FB3" >/dev/null 2>&1
+    rm -f -- ".local-runs/shared-claims-args.$$"
+    rm -rf -- "$T"
+    return 0
+  }
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  # a registry entry left by a run killed with SIGKILL must not make the first `mk` fail silently
+  git worktree prune >/dev/null 2>&1
+  mkdir -p "$T" || { echo "self-test ABORT: cannot create the scratch directory $T" >&2; exit 1; }
   # #3913 — derive the fixture schema versions from the SSOT at run time
   # (CURRENT+1, CURRENT+2) instead of hardcoding them, so this self-test does
   # not go stale as the migration ladder advances (it hardcoded v99/v100 and
@@ -258,9 +278,17 @@ if [ "$SELF_TEST" -eq 1 ]; then
     echo "self-test ABORT: could not read CURRENT_SCHEMA_VERSION from src/store/postgres.rs" >&2; exit 1
   fi
   V1=$((_CSV + 1)); V2=$((_CSV + 2))   # two NEW versions, ahead of the base
+  # #8301 (code F1): render the digit groups with python3, the SAME formatter the gate's checker uses (line 171),
+  # so the two cannot drift and no BSD-vs-GNU sed label syntax is involved. Asserted once, fail closed by name.
+  _grp() { python3 -c 'import sys; print(f"{int(sys.argv[1]):,}".replace(",", "_"))' "$1"; }
+  if [ "$(_grp 7471)" != "7_471" ] || [ "$(_grp 1234567)" != "1_234_567" ]; then
+    echo "self-test ABORT: _grp does not render the gate digit-group format (7471 -> 7_471, 1234567 -> 1_234_567)" >&2; exit 1
+  fi
   mk() { # $1 name  $2 base ; then commands run inside the worktree via stdin
-    git worktree add -q --detach "$T/$1" "$2" 2>/dev/null || return 1
-    ( cd "$T/$1" && bash -s && git add -A >/dev/null && git -c user.name=g -c user.email=g@x commit -q -m "fixture $1" ) && git -C "$T/$1" rev-parse HEAD; }
+    git worktree add -q --detach "$T/$1" "$2" || { echo "self-test ABORT: git worktree add failed for fixture $1 at $2 (git error above)" >&2; return 1; }
+    ( cd "$T/$1" && bash -s && git add -A >/dev/null && git -c user.name=g -c user.email=g@x commit -q -m "fixture $1" >/dev/null ) && git -C "$T/$1" rev-parse HEAD; }
+  need() { # $1 fixture name  $2 sha printed by mk: a fixture that was not created aborts the run by name
+    printf '%s' "$2" | grep -qE '^[0-9a-f]{40}$' || { echo "self-test ABORT: fixture $1 was not created (no commit sha; see the git error above)" >&2; exit 1; }; }
   bump_schema() { # $1 = version $2 = rung slug ; writes a fixture v$1 on both adapters
     cat <<SH
 V=$1; SLUG=$2
@@ -271,31 +299,48 @@ sed_i "s/const CURRENT_SCHEMA_VERSION: i32 = [0-9]*/const CURRENT_SCHEMA_VERSION
 SH
   }
   B=$(git rev-parse HEAD)
+  # ceilings derive from the MEASURED size of migrations.rs (#8301): projected P = N + 94 (queue pads 69 + 25)
+  git show "$B:src/storage/migrations.rs" > "$T/.migrations.rs.base" 2>/dev/null || { echo "self-test ABORT: migrations.rs missing or empty at $B" >&2; exit 1; }
+  _N=$(wc -l < "$T/.migrations.rs.base" | tr -d ' ')
+  case "$_N" in
+    ''|*[!0-9]*|0) echo "self-test ABORT: migrations.rs missing or empty at $B" >&2; exit 1 ;;
+  esac
+  CPASS=$(_grp $((_N + 94 + 16))); CRED=$(_grp $((_N + 94 - 55)))   # P+16 PASSES, P-55 WOULD RED
+  # a fixture value equal to the base's own ceiling would be a no-op commit: nudge it one line
+  _BC=$(git show "$B:tests/qual_10_module_size_ceiling.rs" | grep -oE '"src/storage/migrations.rs", *[0-9_]+' | grep -oE '[0-9_]+$')
+  [ "$CRED" = "$_BC" ] && CRED=$(_grp $((_N + 94 - 56))); [ "$CPASS" = "$_BC" ] && CPASS=$(_grp $((_N + 94 + 17)))
+  # the C4 negative control rewrites the llm.rs entry to $CRED: when the base's own llm.rs ceiling equals CRED or
+  # CPASS that commit is a no-op and the control is vacuous, so abort by name instead of passing silently
+  _LC=$(git show "$B:tests/qual_10_module_size_ceiling.rs" | grep -oE '"src/llm.rs", *[0-9_]+' | grep -oE '[0-9_]+$')
+  if [ -z "$_LC" ] || [ "$_LC" = "$CRED" ] || [ "$_LC" = "$CPASS" ]; then
+    echo "self-test ABORT: llm.rs base ceiling '$_LC' is empty or equals CRED ($CRED) or CPASS ($CPASS): the C4 control would be a no-op" >&2; exit 1
+  fi
   # (1) two branches at the SAME new version with DIFFERENT bodies -> CRITICAL
-  A1=$(bump_schema "$V1" sync_peer_contact | mk a1 "$B"); A2=$(bump_schema "$V1" tombstone_store | mk a2 "$B")
+  A1=$(bump_schema "$V1" sync_peer_contact | mk a1 "$B"); need a1 "$A1"; A2=$(bump_schema "$V1" tombstone_store | mk a2 "$B"); need a2 "$A2"
   out=$(run_check "$B" "$A1" "$A2"); rc=$?
   if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q "CRITICAL\] schema:v$V1"; then echo "self-test FAIL (1): same-version different-body not CRITICAL: $out"; ok=0; fi
   # (1b) negative control: two branches at DIFFERENT new versions -> pass (rung prefixes differ too)
-  A3=$(bump_schema "$V2" tombstone_store | mk a3 "$B")
+  A3=$(bump_schema "$V2" tombstone_store | mk a3 "$B"); need a3 "$A3"
   git -C "$T/a3" mv migrations/sqlite/0083_v${V2}_tombstone_store.sql migrations/sqlite/0084_v${V2}_tombstone_store.sql 2>/dev/null; git -C "$T/a3" mv migrations/postgres/0056_v${V2}_tombstone_store.sql migrations/postgres/0057_v${V2}_tombstone_store.sql 2>/dev/null; git -C "$T/a3" -c user.name=g -c user.email=g@x commit -q -am "renumber" 2>/dev/null; A3=$(git -C "$T/a3" rev-parse HEAD)
   out=$(run_check "$B" "$A1" "$A3"); rc=$?
   if [ $rc -ne 0 ]; then echo "self-test FAIL (1b): different versions flagged: $out"; ok=0; fi
   # (2) ceiling: identical pair on one file + a third different value -> FAIL naming the pair and both verdicts
-  C1=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_440)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 69); do echo "// pad $i" >> src/storage/migrations.rs; done\n' | mk c1 "$B")
-  C2=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_440)/" tests/qual_10_module_size_ceiling.rs\n' | mk c2 "$B")
-  C3=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_400)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 25); do echo "// pad $i" >> src/storage/migrations.rs; done\n' | mk c3 "$B")
+  C1=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 69); do echo "// pad $i" >> src/storage/migrations.rs; done\n' "$CRED" | mk c1 "$B"); need c1 "$C1"
+  C2=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs\n' "$CRED" | mk c2 "$B"); need c2 "$C2"
+  C3=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 25); do echo "// pad $i" >> src/storage/migrations.rs; done\n' "$CPASS" | mk c3 "$B"); need c3 "$C3"
   out=$(run_check "$B" "$C1" "$C2" "$C3"); rc=$?
-  if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q 'IDENTICAL PAIR' || ! printf '%s' "$out" | grep -q 'PASSES'; then echo "self-test FAIL (2): ceiling triple not reported with verdicts: $out"; ok=0; fi
+  # tied per fixture (#8301 security I3): the identical pair must be c1 + c2 at CRED, c3 must be the one at CPASS
+  if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -qF "IDENTICAL PAIR $C1 + $C2 both write $CRED" || ! printf '%s' "$out" | grep -qF "$C3=$CPASS" || ! printf '%s' "$out" | grep -qF "$CPASS PASSES" || ! printf '%s' "$out" | grep -qF "$CRED WOULD RED"; then echo "self-test FAIL (2): ceiling triple not reported with verdicts: $out"; ok=0; fi
   # (2b) negative control: two branches bumping DIFFERENT ceiling entries -> pass
-  C4=$(printf 'sed_i "s/(\\"src\\/llm.rs\\", *[0-9_]*)/(\\"src\\/llm.rs\\", 7_000)/" tests/qual_10_module_size_ceiling.rs\n' | mk c4 "$B")
+  C4=$(printf 'sed_i "s/(\\"src\\/llm.rs\\", *[0-9_]*)/(\\"src\\/llm.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs\n' "$CRED" | mk c4 "$B"); need c4 "$C4"
   out=$(run_check "$B" "$C2" "$C4"); rc=$?
   if [ $rc -ne 0 ]; then echo "self-test FAIL (2b): unrelated ceiling entries flagged: $out"; ok=0; fi
   # (3) duplicate branches per issue with identical src+tests surface -> FAIL; needs NAMED refs
-  git branch -f fixture/3152-dup-v2 "$C2" >/dev/null; git branch -f fixture/3152-dup-v3 "$C2" >/dev/null
-  ( cd "$T/c2" && echo "doc only" >> CHANGELOG.md && git add -A && git -c user.name=g -c user.email=g@x commit -q -m "v3 docs" ) && git branch -f fixture/3152-dup-v3 "$(git -C "$T/c2" rev-parse HEAD)" >/dev/null
-  out=$(run_check "$B" fixture/3152-dup-v2 fixture/3152-dup-v3); rc=$?
+  git branch -f "$FB2" "$C2" >/dev/null || { echo "self-test ABORT: cannot create fixture branch $FB2" >&2; exit 1; }; git branch -f "$FB3" "$C2" >/dev/null || { echo "self-test ABORT: cannot create fixture branch $FB3" >&2; exit 1; }
+  ( cd "$T/c2" && echo "doc only" >> CHANGELOG.md && git add -A && git -c user.name=g -c user.email=g@x commit -q -m "v3 docs" ) && git branch -f "$FB3" "$(git -C "$T/c2" rev-parse HEAD)" >/dev/null
+  out=$(run_check "$B" "$FB2" "$FB3"); rc=$?
   if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q 'IDENTICAL src+tests surface'; then echo "self-test FAIL (3): duplicate branches not flagged: $out"; ok=0; fi
-  for w in a1 a2 a3 c1 c2 c3 c4; do git worktree remove --force "$T/$w" >/dev/null 2>&1; done; git branch -D fixture/3152-dup-v2 fixture/3152-dup-v3 >/dev/null 2>&1; rm -rf "$T"
+  # worktrees, fixture branches and the scratch directory are removed by the EXIT trap (cleanup), on every exit path
   [ $ok -eq 1 ] && { echo "shared-namespace-claims self-test: PASS (CRITICAL on same-version/different-body; ceiling identical pair + projected size; duplicate-issue identical surface; both negative controls pass)"; exit 0; }
   exit 1
 fi

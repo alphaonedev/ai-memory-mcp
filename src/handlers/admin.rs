@@ -341,23 +341,55 @@ fn bind_refused_response() -> axum::response::Response {
         .into_response()
 }
 
+/// #8494 — the bind routes' refusal vocabulary for the shared
+/// [`crate::handlers::admin_role::require_key_bound_admin`] gate.
+const BIND_PRINCIPAL_GATE: crate::handlers::admin_role::PrincipalGate =
+    crate::handlers::admin_role::PrincipalGate {
+        action: BIND_AGENT_PUBKEY_ACTION,
+        issue_label: "#8494",
+        required_msg: "public-key bind requires a key-authenticated admin (enrolled per-agent api key)",
+    };
+
+/// #8494 / #8536 — admit a bootstrap pubkey bind only for a verified principal.
+///
+/// Order: the canonical [`require_admin`] gate (allowlist + request authn),
+/// then the path id is validated (400, nothing audited: #8536), then the
+/// shared key-bound principal gate, which writes the deny row for a claimed
+/// admin. Nothing is bound on a refusal.
+async fn require_bind_principal(
+    app: &AppState,
+    headers: &HeaderMap,
+    agent_id: &str,
+) -> Result<String, axum::response::Response> {
+    let caller = require_admin(app, headers, BIND_AGENT_PUBKEY_ACTION)?;
+    if let Err(e) = validate::validate_agent_id(agent_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response());
+    }
+    crate::handlers::admin_role::require_key_bound_admin(
+        app,
+        headers,
+        &caller,
+        agent_id,
+        &BIND_PRINCIPAL_GATE,
+    )
+    .await?;
+    Ok(caller)
+}
+
 pub async fn bind_agent_pubkey(
     State(app): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyBody>,
 ) -> impl IntoResponse {
-    let caller = match require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
+    let caller = match require_bind_principal(&app, &headers, &agent_id).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    if let Err(e) = validate::validate_agent_id(&agent_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
     if let Err(e) = validate::validate_agent_pubkey_b64(&body.pubkey_b64) {
         return (
             StatusCode::BAD_REQUEST,
@@ -602,15 +634,8 @@ pub async fn bind_agent_pubkey_challenge(
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyChallengeBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
+    if let Err(resp) = require_bind_principal(&app, &headers, &agent_id).await {
         return resp;
-    }
-    if let Err(e) = validate::validate_agent_id(&agent_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response();
     }
     if let Err(e) = validate::validate_agent_pubkey_b64(&body.pubkey_b64) {
         return (

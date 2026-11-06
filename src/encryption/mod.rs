@@ -8,12 +8,16 @@
 //! ChaCha20-Poly1305 AEAD encryption so a single recipient (an agent
 //! identified by `agent_id`) can decrypt content encrypted to its public key.
 //!
-//! **NOT end-to-end across federation (#1809):** the at-rest envelope is not a
-//! wire field — federation catch-up (`memories_updated_since`) decrypts
-//! `content` and the receiving peer re-seals under its own per-node key, so a
-//! federated peer holds plaintext transiently at apply time (the wire itself is
-//! TLS/mTLS-protected + enrolled-peer-gated). True cross-peer end-to-end
-//! encryption is a separate (v0.9) design — this primitive is per-node at-rest.
+//! **The `0x02` / `0x03` schemes are NOT end-to-end across federation
+//! (#1809):** the at-rest envelope is not a wire field — federation catch-up
+//! (`memories_updated_since`) decrypts `content` and the receiving peer
+//! re-seals under its own per-node key, so a federated peer holds plaintext
+//! transiently at apply time (the wire itself is TLS/mTLS-protected +
+//! enrolled-peer-gated). The `0x05` scope envelope ([`scope`], #8278) is the
+//! end-to-end scheme: content sealed under a per-namespace key held only by the
+//! namespace's reader nodes (design: `docs/design/E2E_FEDERATION_ENCRYPTION.md`).
+//! E1 lands the envelope and the key store; the sync path that carries `0x05`
+//! bytes peer to peer is the E2 lane of #8278.
 //!
 //! ## Wire shape
 //!
@@ -98,6 +102,10 @@ use zeroize::Zeroize;
 
 /// v1.0.0 #3717 — recovery escrow of the per-agent at-rest key.
 pub mod escrow;
+/// v1.0.0 #8278 — the `0x05` end-to-end scope envelope and scope-key store.
+pub mod scope;
+
+pub use scope::{RecordBinding, SCOPE_ENVELOPE_VERSION};
 
 /// Envelope wire-version. Bumped when the byte layout OR the
 /// cryptographic scheme (KDF / AAD construction) changes; readers refuse
@@ -132,12 +140,17 @@ pub const ENVELOPE_VERSION: u8 = 0x02;
 /// cannot recover it. The legacy `0x02` per-agent scheme has NO per-record
 /// key to destroy, so `0x02` rows are NOT crypto-erasable (they can only
 /// be row-deleted + tombstoned — the honest boundary documented on
-/// [`envelope_is_crypto_erasable`]).
+/// [`envelope_is_crypto_erasable`]). `0x03` is one member of the erasable
+/// set; [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] is the authority for which
+/// envelope versions a crypto erase destroys (`0x03` and the `0x05` scope
+/// envelope today, #8278).
 pub const RECORD_ENVELOPE_VERSION: u8 = 0x03;
 
 /// v1.0.0 (#1956 [P1][R56]) — the CRYPTO-ERASED tombstone marker. A
-/// `crypto_erase` rewrites a per-record (`0x03`) `encrypted_envelope` to
-/// the single byte `[0x04]`: the wrapped DEK is destroyed, so the prior
+/// `crypto_erase` rewrites an `encrypted_envelope` whose version is in
+/// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] (the `0x03` per-record and the
+/// `0x05` scope envelope today, #8278) to the single byte `[0x04]`: the
+/// wrapped per-record DEK is destroyed, so the prior
 /// ciphertext is unrecoverable. A read of a `0x04` envelope fails-closed
 /// with a clear "crypto-erased" error rather than a generic decrypt
 /// failure. Distinct from a NULL envelope (never-encrypted / plaintext row).
@@ -1173,17 +1186,44 @@ pub fn crypto_erase_marker() -> Vec<u8> {
     vec![ERASED_ENVELOPE_VERSION]
 }
 
-/// #1956 [R56] — is this `encrypted_envelope` a per-record (`0x03`) envelope
-/// whose embedded wrapped DEK can be DESTROYED to crypto-erase the record?
+/// #1956 [R56] — is this `encrypted_envelope` one whose embedded wrapped DEK
+/// can be DESTROYED to crypto-erase the record?
 ///
-/// `true` ONLY for the `0x03` per-record scheme. Legacy `0x02` per-agent rows
-/// (content sealed directly to the shared agent key — no per-record key to
-/// destroy) return `false`: they are the HONEST-LIMIT case (row-delete +
-/// tombstone only, NOT crypto-erasable). An empty / already-erased (`0x04`)
-/// envelope also returns `false`.
+/// `true` exactly for the versions in [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`]
+/// (the `0x03` per-record and the `0x05` scope envelope today). Legacy
+/// `0x02` per-agent rows (content sealed directly to the shared agent key —
+/// no per-record key to destroy) return `false`: they are the HONEST-LIMIT
+/// case (row-delete + tombstone only, NOT crypto-erasable). An empty /
+/// already-erased (`0x04`) envelope also returns `false`.
+///
+/// #8278 — a `0x05` scope envelope is erasable too: its per-record DEK exists
+/// only wrapped inside the envelope, so the `0x04` rewrite destroys it even
+/// for a holder of the namespace scope key. The version set is
+/// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`], the one source both backends read
+/// (ruling R16).
 #[must_use]
 pub fn envelope_is_crypto_erasable(envelope_bytes: &[u8]) -> bool {
-    envelope_bytes.first() == Some(&RECORD_ENVELOPE_VERSION)
+    envelope_bytes
+        .first()
+        .is_some_and(|version| CRYPTO_ERASABLE_ENVELOPE_VERSIONS.contains(version))
+}
+
+/// #8278 R16 (code review r2 C1) — the envelope version bytes whose per-record
+/// DEK a `0x04` rewrite destroys: `0x03` per-record and `0x05` scope. The one
+/// source of truth for [`envelope_is_crypto_erasable`] (SQLite) and the
+/// Postgres erase predicates, so the signed erasure kind of a row never
+/// depends on the backend.
+pub const CRYPTO_ERASABLE_ENVELOPE_VERSIONS: [u8; 2] =
+    [RECORD_ENVELOPE_VERSION, SCOPE_ENVELOPE_VERSION];
+
+/// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] as SQL integers, for the Postgres
+/// `get_byte(encrypted_envelope, 0) = ANY($n::int[])` erase predicates.
+#[must_use]
+pub fn crypto_erasable_envelope_version_codes() -> Vec<i32> {
+    CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+        .iter()
+        .map(|version| i32::from(*version))
+        .collect()
 }
 
 /// #1956 [R56] — has this `encrypted_envelope` already been crypto-erased
@@ -1217,6 +1257,12 @@ pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<Stri
             "record has been crypto-erased (envelope key destroyed); content is unrecoverable"
         )),
         Some(&RECORD_ENVELOPE_VERSION) => open_content_per_record(envelope_bytes, agent_id),
+        // #8278 — a 0x05 row is bound to its memory id + namespace, which this
+        // signature does not carry: refuse typed (the row stays sealed) and
+        // let the caller use `open_content_bound`.
+        Some(&SCOPE_ENVELOPE_VERSION) => Err(anyhow::Error::new(
+            scope::ScopeEnvelopeError::BindingRequired,
+        )),
         // 0x02 legacy per-agent scheme (and any other value → Envelope::from_bytes
         // rejects unknown versions with a typed error).
         _ => {
@@ -1225,6 +1271,27 @@ pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<Stri
             let kp = load_keypair(agent_id)?.ok_or_else(|| key_absent_error(agent_id))?;
             decrypt(&env, &kp.secret)
         }
+    }
+}
+
+/// #8278 — [`open_content`] for a read path that knows the row identity. A
+/// `0x05` scope envelope opens through the reader's scope-key stanza under
+/// the resolved key directory ([`scope::open_content_scoped`]); every other
+/// version dispatches exactly as [`open_content`] (the binding is unused by
+/// `0x02` / `0x03`, and `0x04` and unknown versions still refuse typed).
+///
+/// # Errors
+/// As [`open_content`], plus every [`scope::ScopeEnvelopeError`] and
+/// [`scope::store::ScopeKeyStoreError`] refusal of the scope path.
+pub fn open_content_bound(
+    envelope_bytes: &[u8],
+    agent_id: &str,
+    binding: RecordBinding<'_>,
+) -> Result<String> {
+    if envelope_bytes.first() == Some(&SCOPE_ENVELOPE_VERSION) {
+        scope::open_content_scoped(envelope_bytes, agent_id, binding)
+    } else {
+        open_content(envelope_bytes, agent_id)
     }
 }
 
@@ -1300,6 +1367,17 @@ mod tests {
         keypair_cache().lock().expect("cache lock").clear();
     }
 
+    /// The one key-directory fixture for this module (#8316): a private temp
+    /// dir created `0o700` (mkdir mode, no later chmod) whatever the ambient
+    /// umask. `tempfile::tempdir()` on its own inherits the umask, so under
+    /// `umask 0002` it comes out `0775`
+    /// and the #3198 chain check correctly refuses it; the two #228 tests
+    /// below used it directly and went red on every `0002` host (#8316).
+    /// Delegates to the crate-wide #3705 fixture so there is a single owner.
+    fn secure_tmp_key_dir() -> tempfile::TempDir {
+        crate::identity::test_key_dir::private_tempdir()
+    }
+
     #[test]
     fn decrypt_survives_keypair_cache_clear_via_disk_persistence() {
         // #228 Part 1 — the per-agent X25519 keypair persists to disk, so
@@ -1307,7 +1385,7 @@ mod tests {
         // encrypted before the restart. Without persistence the cleared
         // cache would mint a fresh key and every prior ciphertext would be
         // permanently undecryptable.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = secure_tmp_key_dir();
         let agent = "persist-restart-agent";
         let kp1 = get_or_create_keypair_in(agent, dir.path()).expect("generate + persist");
         let env = encrypt("survives a restart", &kp1.public).expect("encrypt");
@@ -1315,9 +1393,8 @@ mod tests {
         clear_keypair_cache(); // modeled restart — cache gone
 
         let kp2 = get_or_create_keypair_in(agent, dir.path()).expect("load from disk");
-        assert_eq!(
-            kp1.secret.to_bytes(),
-            kp2.secret.to_bytes(),
+        assert!(
+            kp1.secret.to_bytes() == kp2.secret.to_bytes(),
             "#228: the keypair MUST round-trip from disk after a cache clear"
         );
         let recovered = decrypt(&env, &kp2.secret).expect("decrypt after restart");
@@ -1331,7 +1408,7 @@ mod tests {
         // `.x25519.priv` is refused, not silently used (mirrors the
         // Ed25519 keystore's S4-LOW1 guard).
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = secure_tmp_key_dir();
         let agent = "lax-mode-agent";
         let _kp = get_or_create_keypair_in(agent, dir.path()).expect("persist");
         clear_keypair_cache();
@@ -1346,6 +1423,87 @@ mod tests {
         );
     }
 
+    /// #8316 — the fixture directory is `0o700` even when the process umask
+    /// is `0002`, and the loader accepts it. Pins the fix for the two tests
+    /// above: under `umask 0002` a bare `tempfile::tempdir()` is `0775`, the
+    /// #3198 chain check refuses it, and both tests went red for the wrong
+    /// reason. The umask is process-wide, so it is set ONLY in a re-launched
+    /// child copy of this test binary running this one test (the pattern of
+    /// `journal_spool_creation_is_private_with_permissive_umask`); the
+    /// multi-threaded parent never changes its own umask, so no sibling test
+    /// can observe it (#8331 class).
+    #[cfg(unix)]
+    #[test]
+    fn keypair_fixture_dir_is_0700_under_umask_0002_8316() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_KEYPAIR_UMASK_ROLE";
+        const MARKER_ENV: &str = "AI_MEMORY_TEST_KEYPAIR_UMASK_MARKER";
+        const TEST_PATH: &str =
+            "encryption::tests::keypair_fixture_dir_is_0700_under_umask_0002_8316";
+
+        let mode_of = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("stat dir")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            // Child: a single-test process, so the umask change has no sibling.
+            // SAFETY: `umask` has no preconditions, cannot fail and only sets
+            // this process's file-mode creation mask.
+            unsafe {
+                libc::umask(0o002);
+            }
+            let control = tempfile::tempdir().expect("control tempdir");
+            assert_eq!(
+                mode_of(control.path()),
+                0o775,
+                "#8316 precondition: umask 0002 is in force, so a bare tempdir is 0775 \
+                 (a failure here means the temp parent carries a POSIX default ACL \
+                 that overrides the umask, not that the fixture is wrong)"
+            );
+            let dir = secure_tmp_key_dir();
+            assert_eq!(
+                mode_of(dir.path()),
+                0o700,
+                "#8316: the fixture dir must be 0700 whatever the umask"
+            );
+            let agent = "umask-0002-agent-8316";
+            let minted = get_or_create_keypair_in(agent, dir.path())
+                .expect("#8316: mint + persist into a fixture dir created under umask 0002");
+            clear_keypair_cache();
+            let loaded = load_keypair_in(agent, dir.path())
+                .expect("#8316: the #3198 chain check accepts the 0700 fixture dir")
+                .expect("#8316: the persisted keypair is found");
+            assert!(
+                minted.secret.to_bytes() == loaded.secret.to_bytes(),
+                "#8316: the keypair round-trips from a fixture dir created under umask 0002"
+            );
+            let marker = std::env::var_os(MARKER_ENV).expect("marker path");
+            std::fs::write(marker, b"ran").expect("write child-ran marker");
+            return;
+        }
+
+        let scratch = secure_tmp_key_dir();
+        let marker = scratch.path().join("child-ran");
+        let status = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .arg("--exact")
+            .arg(TEST_PATH)
+            .arg("--nocapture")
+            .env(ROLE_ENV, "child")
+            .env(MARKER_ENV, &marker)
+            .status()
+            .expect("re-launch the test binary");
+        assert!(status.success(), "#8316: the umask-0002 child run failed");
+        assert!(
+            marker.exists(),
+            "#8316: the child must run the test body, not match zero tests"
+        );
+    }
+
     #[test]
     fn keypair_round_trip_returns_same_secret() {
         // Cache-hit path: second call returns the same secret material.
@@ -1353,7 +1511,10 @@ mod tests {
         let a = get_or_create_keypair(agent).expect("first generate");
         let b = get_or_create_keypair(agent).expect("second fetch");
         assert_eq!(a.public.as_bytes(), b.public.as_bytes());
-        assert_eq!(a.secret.to_bytes(), b.secret.to_bytes());
+        assert!(
+            a.secret.to_bytes() == b.secret.to_bytes(),
+            "the cached keypair keeps the same secret"
+        );
     }
 
     #[test]
@@ -1449,15 +1610,17 @@ mod tests {
         let shared_a = alice.secret.diffie_hellman(&bob.public);
         let shared_b = bob.secret.diffie_hellman(&alice.public);
         // ECDH symmetry precondition.
-        assert_eq!(shared_a.as_bytes(), shared_b.as_bytes());
+        assert!(
+            shared_a.as_bytes() == shared_b.as_bytes(),
+            "ECDH symmetry: both sides derive the same shared secret"
+        );
 
         let key1 = derive_aead_key(&shared_a);
         let key2 = derive_aead_key(&shared_b);
-        assert_eq!(key1, key2, "HKDF derivation must be deterministic");
+        assert!(key1 == key2, "HKDF derivation must be deterministic");
         assert_eq!(key1.len(), AEAD_KEY_LEN);
-        assert_ne!(
-            &key1,
-            shared_a.as_bytes(),
+        assert!(
+            key1.as_slice() != shared_a.as_bytes(),
             "derived key must not be the raw shared secret (HKDF must transform it)"
         );
     }
@@ -1667,17 +1830,6 @@ mod tests {
 
     // ----- #3718 — a read never mints ---------------------------------
 
-    fn secure_tmp_key_dir() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("scratch key dir under TMPDIR");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-                .expect("chmod 0700");
-        }
-        dir
-    }
-
     fn names(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
             .expect("list")
@@ -1784,5 +1936,635 @@ mod tests {
         assert!(detail.starts_with(KeyAbsent::CLASS) && !detail.contains("decrypt failed"));
         let aead = anyhow!("per-record content decrypt failed (authentication): aead::Error");
         assert!(read_failure_detail(&aead).starts_with("decrypt failed: "));
+    }
+
+    /// The `///` block directly above the first line of `text` that starts
+    /// with `anchor` (attribute lines skipped), joined with single spaces.
+    fn doc_block_before(text: &str, anchor: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(anchor))?;
+        let mut doc: Vec<&str> = Vec::new();
+        for line in lines[..at].iter().rev() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("///") {
+                doc.push(rest.trim());
+            } else if !trimmed.starts_with("#[") {
+                break;
+            }
+        }
+        doc.reverse();
+        (!doc.is_empty()).then(|| doc.join(" "))
+    }
+
+    /// #8278 (code r4 R4-F1, security r4 S4): every doc comment that describes
+    /// the crypto-erase scope names the SSOT
+    /// [`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`] (0x03 and 0x05 today) instead of
+    /// describing one version byte as the whole erasable set.
+    #[test]
+    fn doc_erase_scope_names_erasable_versions_8278() {
+        const SSOT: &str = "CRYPTO_ERASABLE_ENVELOPE_VERSIONS";
+        const SINGLE_VERSION_PHRASES: [&str; 4] = [
+            "only 0x03",
+            "0x03 only",
+            "0x03 envelopes only",
+            "only for the 0x03",
+        ];
+        let sites: [(&str, &str, &[&str]); 3] = [
+            (
+                "src/encryption/mod.rs",
+                include_str!("mod.rs"),
+                &[
+                    "pub const RECORD_ENVELOPE_VERSION",
+                    "pub const ERASED_ENVELOPE_VERSION",
+                    "pub fn envelope_is_crypto_erasable",
+                ],
+            ),
+            (
+                "src/store/postgres_parity.rs",
+                include_str!("../store/postgres_parity.rs"),
+                &["pub(crate) async fn evict_tombstone_and_erase_in_tx"],
+            ),
+            (
+                "src/store/postgres.rs",
+                include_str!("../store/postgres.rs"),
+                &[
+                    "const SQL_CRYPTO_ERASE_ENVELOPE_BY_ID",
+                    "async fn pg_tombstone_and_erase_in_tx",
+                ],
+            ),
+        ];
+        for (file, text, anchors) in sites {
+            for anchor in anchors {
+                let doc = doc_block_before(text, anchor)
+                    .unwrap_or_else(|| panic!("{file}: no doc comment above `{anchor}`"));
+                assert!(
+                    doc.contains(SSOT),
+                    "{file}: the doc of `{anchor}` describes crypto erase and must name {SSOT}"
+                );
+                let flat = doc.to_lowercase().replace('`', "");
+                for phrase in SINGLE_VERSION_PHRASES {
+                    assert!(
+                        !flat.contains(phrase),
+                        "{file}: the doc of `{anchor}` says `{phrase}`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Stems that mark a doc as describing the crypto-erase scope, matched on
+    /// the lowercased text: `crypto-eras` covers crypto-erase, crypto-erasable
+    /// and crypto-erasure; `crypto eras` the spaced forms; `crypto_eras` the
+    /// identifiers (`envelope_is_crypto_erasable`,
+    /// `CRYPTO_ERASABLE_ENVELOPE_VERSIONS`); `cryptographic eras` the long
+    /// form (#8315, REVIEW-8323-code-r1 F2, REVIEW-8323-security-r1 L1).
+    const DOCS_CENSUS_ERASE_PHRASES: [&str; 4] = [
+        "crypto-eras",
+        "crypto eras",
+        "crypto_eras",
+        "cryptographic eras",
+    ];
+    /// Dated adjudication records describe a past tree and are skipped.
+    const DOCS_CENSUS_DATED_RECORDS: [&str; 2] = ["docs/reviews/", "docs/audit/"];
+    /// The doc the census must always reach inside a real checkout.
+    const DOCS_CENSUS_ERASE_DOC: &str = "docs/security/crypto-erase.md";
+    /// Appended to every skip reason: what the census needs to run.
+    const DOCS_CENSUS_SKIP_REASON: &str = "the docs census needs a git checkout of this crate and a runnable `git` (a crates.io package or a vendored tree has no tracked docs/ tree)";
+    /// Skip-table row 1: the crate root has no `.git`.
+    const DOCS_CENSUS_NO_DOT_GIT: &str = "no .git in the crate root";
+    /// Skip-table row 2: the `git` binary could not be started.
+    const DOCS_CENSUS_GIT_NOT_RUN: &str = "`git` could not run";
+    /// Skip-table row 3: `git rev-parse --show-toplevel` exited non-zero.
+    const DOCS_CENSUS_TOPLEVEL_FAILED: &str = "`git rev-parse --show-toplevel` failed";
+    /// Skip-table row 4: git resolves the crate root to another toplevel.
+    const DOCS_CENSUS_FOREIGN_TOPLEVEL: &str = "the git toplevel is another tree";
+    /// The panic prefix of every skip-table row under `CI`.
+    const DOCS_CENSUS_CI_SET: &str = "CI is set";
+
+    /// What one census run found: the docs it covered and the docs that
+    /// describe crypto erase without listing every erasable byte.
+    struct DocsCensus {
+        census: Vec<String>,
+        failures: Vec<String>,
+    }
+
+    /// Run `git <args>` in `root` with the repository-selecting environment
+    /// removed, so a hook-set `GIT_DIR` cannot redirect the census.
+    fn docs_census_git(
+        root: &std::path::Path,
+        args: &[&str],
+    ) -> std::io::Result<std::process::Output> {
+        docs_census_git_on(root, args, None)
+    }
+
+    /// [`docs_census_git`] with an optional child `PATH`: `Some(dir)` makes
+    /// the child search only `dir` for `git`, so a test runs the "no `git`
+    /// binary" row of the skip table without touching this process's
+    /// environment.
+    fn docs_census_git_on(
+        root: &std::path::Path,
+        args: &[&str],
+        path: Option<&std::ffi::OsStr>,
+    ) -> std::io::Result<std::process::Output> {
+        let mut git = std::process::Command::new("git");
+        git.args(args)
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE");
+        if let Some(path) = path {
+            git.env("PATH", path);
+        }
+        git.output()
+    }
+
+    /// Whether the `CI` environment variable is set (any value).
+    fn docs_census_ci() -> bool {
+        std::env::var_os("CI").is_some()
+    }
+
+    /// The #8315 row-4 census over the tracked docs of the checkout at
+    /// `root`, reading the `CI` environment variable (see
+    /// [`docs_census_skip`] for the skip rules).
+    fn docs_census_8315(root: &std::path::Path) -> Result<DocsCensus, String> {
+        docs_census_8315_with(root, docs_census_ci())
+    }
+
+    /// The ONE skip rule of the docs census, and its truth table. Every
+    /// tree the census cannot judge goes through this helper, so the rule
+    /// and the comments cannot disagree again (REVIEW-8323-code-r3 F2,
+    /// REVIEW-8323-security-r3 L1, ERRORS-08):
+    ///
+    /// | tree at the crate root                          | `CI` unset    | `CI` set |
+    /// |-------------------------------------------------|---------------|----------|
+    /// | 1. no `.git`                                    | skip          | panic    |
+    /// | 2. `.git` present, `git` binary cannot start    | skip          | panic    |
+    /// | 3. `.git` present, `git rev-parse` fails        | skip          | panic    |
+    /// | 4. git toplevel is another tree                 | skip          | panic    |
+    /// | 5. checkout of this crate, erase doc missing    | panic         | panic    |
+    /// | 6. checkout of this crate, `git ls-files` fails | panic         | panic    |
+    /// | 7. checkout of this crate, erase doc present    | census (`Ok`) | census   |
+    ///
+    /// Rows 1-4 call this helper: with `ci` false it returns the skip
+    /// reason (`why` plus [`DOCS_CENSUS_SKIP_REASON`]) and the test prints
+    /// one `skipped:` line; with `ci` true it panics with
+    /// [`DOCS_CENSUS_CI_SET`], because a skip line is invisible in a passing
+    /// test's output (REVIEW-8323-security-r2 INFO-1) and a CI tree with no
+    /// checkout must not pass silently. Rows 5-7 never skip. The tests that
+    /// build a checkout with `git init` apply row 2 the same way
+    /// ([`docs_census_git_init`]).
+    ///
+    /// decision: one rule for rows 1-4 (skip without `CI`, fail with `CI`)
+    /// over a per-row rule, because a packaged crate still skips on a
+    /// developer machine while a CI tree that is not a checkout of this crate
+    /// fails, and one table is all a reader has to check.
+    fn docs_census_skip(ci: bool, why: &str) -> String {
+        assert!(
+            !ci,
+            "{DOCS_CENSUS_CI_SET} but the docs census cannot run: {why}"
+        );
+        format!("{why}; {DOCS_CENSUS_SKIP_REASON}")
+    }
+
+    /// The census with an explicit `ci` flag; rows of the skip table in
+    /// [`docs_census_skip`]. Both `.md` and `.html` files are read:
+    /// `docs/encryption.html` is a full page about the envelope, not a
+    /// redirect shell (REVIEW-8323-code-r2 F2).
+    ///
+    /// decision: count `.html` over exclude it because the page that
+    /// describes the envelope is authored prose that can drift like the
+    /// markdown, and the census is 3 docs with 0 failures both before and
+    /// after the filter change (REVIEW-8323-code-r2 F2).
+    fn docs_census_8315_with(root: &std::path::Path, ci: bool) -> Result<DocsCensus, String> {
+        docs_census_8315_on(root, ci, None)
+    }
+
+    /// [`docs_census_8315_with`] with an optional child `PATH` for `git`
+    /// (see [`docs_census_git_on`]). It decides first whether `root` is a
+    /// checkout of this crate (rows 1-4), then requires the erase doc (row
+    /// 5) and the listing (row 6), then runs the census (row 7).
+    fn docs_census_8315_on(
+        root: &std::path::Path,
+        ci: bool,
+        path: Option<&std::ffi::OsStr>,
+    ) -> Result<DocsCensus, String> {
+        if !root.join(".git").exists() {
+            return Err(docs_census_skip(ci, DOCS_CENSUS_NO_DOT_GIT));
+        }
+        let toplevel = match docs_census_git_on(root, &["rev-parse", "--show-toplevel"], path) {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            Ok(_) => return Err(docs_census_skip(ci, DOCS_CENSUS_TOPLEVEL_FAILED)),
+            Err(e) => {
+                return Err(docs_census_skip(
+                    ci,
+                    &format!("{DOCS_CENSUS_GIT_NOT_RUN}: {e}"),
+                ));
+            }
+        };
+        match (
+            std::fs::canonicalize(&toplevel),
+            std::fs::canonicalize(root),
+        ) {
+            (Ok(top), Ok(here)) if top == here => {}
+            _ => return Err(docs_census_skip(ci, DOCS_CENSUS_FOREIGN_TOPLEVEL)),
+        }
+        assert!(
+            root.join(DOCS_CENSUS_ERASE_DOC).is_file(),
+            "inside a git checkout the census must reach {DOCS_CENSUS_ERASE_DOC}, but it is missing or not a file"
+        );
+        let listing = docs_census_git_on(root, &["ls-files", "--", "docs"], path)
+            .expect("run `git ls-files -- docs`");
+        assert!(
+            listing.status.success(),
+            "`git ls-files -- docs` failed: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&listing.stdout);
+        let bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect();
+        let mut census: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for rel in stdout.lines() {
+            if !(rel.ends_with(".md") || rel.ends_with(".html"))
+                || DOCS_CENSUS_DATED_RECORDS
+                    .iter()
+                    .any(|dir| rel.starts_with(dir))
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: read: {e}"));
+            let flat = text.to_lowercase();
+            if !DOCS_CENSUS_ERASE_PHRASES
+                .iter()
+                .any(|phrase| flat.contains(phrase))
+                || !bytes.iter().any(|byte| flat.contains(byte.as_str()))
+            {
+                continue;
+            }
+            census.push(rel.to_string());
+            let missing: Vec<&str> = bytes
+                .iter()
+                .filter(|byte| !flat.contains(byte.as_str()))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                failures.push(format!(
+                    "{rel}: describes crypto erase but does not list {}",
+                    missing.join(", ")
+                ));
+            }
+        }
+        Ok(DocsCensus { census, failures })
+    }
+
+    /// #8315 (row 4): every tracked markdown or html doc that describes the
+    /// crypto-erase scope lists every erasable envelope version byte the code
+    /// reports ([`CRYPTO_ERASABLE_ENVELOPE_VERSIONS`]), so an erase-describing
+    /// doc anywhere under `docs/` that names one byte as the whole set is
+    /// caught, not only the six anchors of
+    /// [`doc_erase_scope_names_erasable_versions_8278`]. The census is
+    /// `git ls-files -- docs` (tracked files, no committed list to rot): a
+    /// doc is in scope when it mentions crypto erase AND names at
+    /// least one erasable byte (a doc that names no byte makes no claim about
+    /// the set). Dated adjudication records under `docs/reviews/` and
+    /// `docs/audit/` describe a past tree and are skipped, the exclusion
+    /// `scripts/check-docs-vs-ssot.sh` applies to the same directories. Tracked
+    /// `.md` and `.html` files are read (`docs/encryption.html` is a full page
+    /// about the envelope). The skip rules are the truth table in
+    /// [`docs_census_skip`]: a tree the census cannot judge (no `.git`, no
+    /// runnable `git`, a failing `git rev-parse`, another git toplevel)
+    /// prints one `skipped: <reason>` line and returns when `CI` is unset,
+    /// and fails when `CI` is set; inside a checkout of this crate a missing
+    /// erase doc fails either way.
+    #[test]
+    fn docs_describing_erase_list_every_erasable_version_8315() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let found = match docs_census_8315(root) {
+            Ok(found) => found,
+            Err(reason) => {
+                eprintln!("skipped: {reason}");
+                return;
+            }
+        };
+        let bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect();
+        assert!(
+            found.census.iter().any(|rel| rel == DOCS_CENSUS_ERASE_DOC),
+            "the census must reach {DOCS_CENSUS_ERASE_DOC}; it found {:?}",
+            found.census
+        );
+        assert!(
+            found.failures.is_empty(),
+            "#8315: every erase-describing doc must list every byte of \
+             CRYPTO_ERASABLE_ENVELOPE_VERSIONS ({}); census {:?}:\n{}",
+            bytes.join(", "),
+            found.census,
+            found.failures.join("\n")
+        );
+    }
+
+    /// #8315 (REVIEW-8323-code-r1 F1 / security M1): outside a git checkout of
+    /// this crate the census skips with a reason instead of panicking: an
+    /// empty tree, a tree with the doc but no `.git`, and a tree whose `.git`
+    /// is not a repository (git then finds another toplevel, or none).
+    #[test]
+    fn docs_census_skips_outside_a_checkout_8315() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let reason = docs_census_8315_with(empty.path(), false)
+            .err()
+            .expect("empty tree skips");
+        assert!(
+            reason.contains(DOCS_CENSUS_NO_DOT_GIT) && reason.contains(DOCS_CENSUS_SKIP_REASON),
+            "{reason}"
+        );
+
+        let docs_only = tempfile::tempdir().expect("tempdir");
+        let doc = docs_only.path().join(DOCS_CENSUS_ERASE_DOC);
+        std::fs::create_dir_all(doc.parent().expect("doc parent")).expect("mkdir docs");
+        std::fs::write(&doc, "crypto-erase 0x03 only").expect("write doc");
+        assert!(
+            docs_census_8315_with(docs_only.path(), false).is_err(),
+            "no .git skips"
+        );
+
+        std::fs::create_dir(docs_only.path().join(".git")).expect("fake .git");
+        assert!(
+            docs_census_8315_with(docs_only.path(), false).is_err(),
+            "a .git that is not a repository skips"
+        );
+    }
+
+    /// #8315 (REVIEW-8323-code-r1 F1 and F2 / security M1 and L1): inside a
+    /// real checkout the census still runs and still fails, and it now
+    /// catches a doc that says only "crypto-erasable" (the doc vocabulary
+    /// itself, which the old `crypto-erase` stems missed).
+    #[test]
+    fn docs_census_asserts_inside_a_checkout_8315() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        if !docs_census_git_init(repo.path()) {
+            return;
+        }
+        let all_bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect();
+        let doc = repo.path().join(DOCS_CENSUS_ERASE_DOC);
+        std::fs::create_dir_all(doc.parent().expect("doc parent")).expect("mkdir docs");
+        std::fs::write(&doc, format!("crypto-erase: {}", all_bytes.join(", "))).expect("erase doc");
+        for (name, text) in [
+            (
+                "docs/probe-a.md",
+                "Only 0x03 envelopes are crypto-erasable.",
+            ),
+            ("docs/probe-b.md", "Only 0x03 rows pass crypto_erasable()."),
+            ("docs/probe-c.md", "Cryptographic erasure covers only 0x03."),
+            ("docs/probe-d.md", "Crypto-erasure applies to 0x03 alone."),
+            ("docs/probe-e.md", "Crypto erase is listed for 0x03 only."),
+        ] {
+            std::fs::write(repo.path().join(name), text).expect("probe doc");
+        }
+        let add = docs_census_git(repo.path(), &["add", "docs"]).expect("git add");
+        assert!(add.status.success(), "git add failed");
+        let found =
+            docs_census_8315_with(repo.path(), false).expect("a real checkout is not skipped");
+        assert!(found.census.iter().any(|rel| rel == DOCS_CENSUS_ERASE_DOC));
+        for name in ["a", "b", "c", "d", "e"] {
+            let rel = format!("docs/probe-{name}.md");
+            assert!(
+                found.failures.iter().any(|f| f.starts_with(&rel)),
+                "{rel} must fail the census; failures: {:?}",
+                found.failures
+            );
+        }
+        assert!(
+            !found
+                .failures
+                .iter()
+                .any(|f| f.starts_with(DOCS_CENSUS_ERASE_DOC)),
+            "the complete doc must pass: {:?}",
+            found.failures
+        );
+    }
+
+    /// Make `root` a fresh git repository for an in-checkout test and
+    /// return `true`. A `git` binary that cannot start is row 2 of the skip
+    /// table in [`docs_census_skip`]: with `CI` unset it prints one
+    /// `skipped:` line and returns `false` (the test returns early), with
+    /// `CI` set it panics. A `git init` that starts and fails panics.
+    fn docs_census_git_init(root: &std::path::Path) -> bool {
+        docs_census_git_init_on(root, docs_census_ci(), None)
+    }
+
+    /// [`docs_census_git_init`] with an explicit `ci` flag and an optional
+    /// child `PATH` (see [`docs_census_git_on`]).
+    fn docs_census_git_init_on(
+        root: &std::path::Path,
+        ci: bool,
+        path: Option<&std::ffi::OsStr>,
+    ) -> bool {
+        match docs_census_git_on(root, &["init", "-q"], path) {
+            Ok(out) => {
+                assert!(
+                    out.status.success(),
+                    "`git init` failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let reason = docs_census_skip(ci, &format!("{DOCS_CENSUS_GIT_NOT_RUN}: {e}"));
+                eprintln!("skipped: {reason}");
+                false
+            }
+            Err(e) => panic!("{DOCS_CENSUS_GIT_NOT_RUN}: {e}"),
+        }
+    }
+
+    /// Run `f` and return its panic message, or `None` when it returned.
+    fn docs_census_panic_message<T>(
+        f: impl FnOnce() -> T + std::panic::UnwindSafe,
+    ) -> Option<String> {
+        let payload = std::panic::catch_unwind(f).err()?;
+        Some(
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Assert one row of the skip table: with `ci` false the census skips
+    /// with a reason naming `why`; with `ci` true it panics naming both
+    /// [`DOCS_CENSUS_CI_SET`] and `why`.
+    fn docs_census_assert_row(
+        root: &std::path::Path,
+        ci: bool,
+        path: Option<&std::ffi::OsStr>,
+        why: &str,
+    ) {
+        if ci {
+            let message = docs_census_panic_message(|| docs_census_8315_on(root, ci, path).is_ok())
+                .unwrap_or_else(|| panic!("row `{why}` with CI set must fail, not skip"));
+            assert!(
+                message.contains(DOCS_CENSUS_CI_SET) && message.contains(why),
+                "row `{why}`: {message}"
+            );
+        } else {
+            let reason = docs_census_8315_on(root, ci, path)
+                .err()
+                .unwrap_or_else(|| panic!("row `{why}` with CI unset must skip"));
+            assert!(
+                reason.contains(why) && reason.contains(DOCS_CENSUS_SKIP_REASON),
+                "row `{why}`: {reason}"
+            );
+        }
+    }
+
+    /// #8315 (REVIEW-8323-code-r3 F2, REVIEW-8323-security-r3 L1): rows 1-4
+    /// of the skip table in [`docs_census_skip`], each with `CI` unset (a
+    /// skip naming the row) and with `CI` set (a panic naming the row). Row
+    /// 2 points the child `PATH` at an empty directory. Rows 3 and 4 need a
+    /// `git` binary: without one they are row 2 of the helper that builds
+    /// them ([`docs_census_git_init`]).
+    #[test]
+    fn docs_census_skip_table_every_row_8315() {
+        let no_git_bin = tempfile::tempdir().expect("tempdir");
+        let probe = tempfile::tempdir().expect("tempdir");
+        let git_runs = docs_census_git_init(probe.path());
+        for ci in [false, true] {
+            let bare = tempfile::tempdir().expect("tempdir");
+            docs_census_assert_row(bare.path(), ci, None, DOCS_CENSUS_NO_DOT_GIT);
+
+            let no_binary = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(no_binary.path().join(".git")).expect("fake .git");
+            docs_census_assert_row(
+                no_binary.path(),
+                ci,
+                Some(no_git_bin.path().as_os_str()),
+                DOCS_CENSUS_GIT_NOT_RUN,
+            );
+            if !git_runs {
+                continue;
+            }
+
+            let broken = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                broken.path().join(".git"),
+                format!(
+                    "gitdir: {}\n",
+                    broken.path().join("missing-gitdir").display()
+                ),
+            )
+            .expect("dangling .git file");
+            docs_census_assert_row(broken.path(), ci, None, DOCS_CENSUS_TOPLEVEL_FAILED);
+
+            let outer = tempfile::tempdir().expect("tempdir");
+            assert!(docs_census_git_init(outer.path()), "git ran for the probe");
+            let nested = outer.path().join("crate");
+            std::fs::create_dir_all(nested.join(".git")).expect("nested fake .git");
+            docs_census_assert_row(&nested, ci, None, DOCS_CENSUS_FOREIGN_TOPLEVEL);
+        }
+    }
+
+    /// #8315 (REVIEW-8323-code-r3 F2, REVIEW-8323-security-r3 L1): a tree
+    /// with no `.git` (a packaged crate, or a CI tree produced without a
+    /// checkout) fails under `CI` instead of skipping.
+    #[test]
+    #[should_panic(expected = "CI is set")]
+    fn docs_census_no_dot_git_fails_under_ci_8315() {
+        let tree = tempfile::tempdir().expect("tempdir");
+        let _ = docs_census_8315_with(tree.path(), true);
+    }
+
+    /// #8315 (REVIEW-8323-code-r3 F1): the helper that builds a test
+    /// checkout treats a `git` binary that cannot start as row 2 of the skip
+    /// table: with the child `PATH` an empty directory it skips (`false`, no
+    /// repository made) when `CI` is unset and panics when `CI` is set.
+    #[test]
+    fn docs_census_git_init_without_git_binary_8315() {
+        let no_git_bin = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let stripped = Some(no_git_bin.path().as_os_str());
+        assert!(
+            !docs_census_git_init_on(repo.path(), false, stripped),
+            "no git binary with CI unset skips"
+        );
+        assert!(!repo.path().join(".git").exists(), "no repository was made");
+        let message =
+            docs_census_panic_message(|| docs_census_git_init_on(repo.path(), true, stripped))
+                .expect("no git binary with CI set must fail, not skip");
+        assert!(
+            message.contains(DOCS_CENSUS_CI_SET) && message.contains(DOCS_CENSUS_GIT_NOT_RUN),
+            "{message}"
+        );
+    }
+
+    /// #8315 (REVIEW-8323-code-r2 F1, REVIEW-8323-code-r3 F1): inside a real
+    /// checkout (a fresh `git init`) whose erase doc is missing the census
+    /// fails by naming [`DOCS_CENSUS_ERASE_DOC`]; it never skips. Without a
+    /// `git` binary and with `CI` unset the test skips at the `git init`
+    /// step instead of panicking on it.
+    #[test]
+    fn docs_census_missing_anchor_doc_fails_in_a_checkout_8315() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        if !docs_census_git_init(repo.path()) {
+            return;
+        }
+        let message = docs_census_panic_message(|| docs_census_8315(repo.path()).is_ok())
+            .expect("a checkout without the erase doc must fail, not skip");
+        assert!(message.contains(DOCS_CENSUS_ERASE_DOC), "{message}");
+        assert!(!message.contains(DOCS_CENSUS_SKIP_REASON), "{message}");
+    }
+
+    /// #8315 (REVIEW-8323-security-r2 INFO-1): under `CI` a tree whose `.git`
+    /// is not a repository fails instead of skipping.
+    #[test]
+    #[should_panic(expected = "CI is set")]
+    fn docs_census_git_failure_fails_under_ci_8315() {
+        let tree = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tree.path().join(".git")).expect("fake .git");
+        let _ = docs_census_8315_with(tree.path(), true);
+    }
+
+    /// #8315: the `.html` pages are in the census (REVIEW-8323-code-r2 F2).
+    #[test]
+    fn docs_census_counts_html_pages_8315() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        if !docs_census_git_init(repo.path()) {
+            return;
+        }
+        let all_bytes: Vec<String> = CRYPTO_ERASABLE_ENVELOPE_VERSIONS
+            .iter()
+            .map(|version| format!("0x{version:02x}"))
+            .collect();
+        let doc = repo.path().join(DOCS_CENSUS_ERASE_DOC);
+        std::fs::create_dir_all(doc.parent().expect("doc parent")).expect("mkdir docs");
+        std::fs::write(&doc, format!("crypto-erase: {}", all_bytes.join(", "))).expect("erase doc");
+        std::fs::write(
+            repo.path().join("docs/page.html"),
+            "<p>Only 0x03 is crypto-erasable.</p>",
+        )
+        .expect("html page");
+        let add = docs_census_git(repo.path(), &["add", "docs"]).expect("git add");
+        assert!(add.status.success(), "git add failed");
+        let found = docs_census_8315_with(repo.path(), false).expect("checkout");
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|f| f.starts_with("docs/page.html")),
+            "{:?}",
+            found.failures
+        );
     }
 }

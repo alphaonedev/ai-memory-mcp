@@ -33,6 +33,7 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+pub mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -959,6 +960,23 @@ pub fn dispatch_event_with_details(
     db_path: &std::path::Path,
     details: Option<serde_json::Value>,
 ) {
+    dispatch_inner(
+        conn, event, memory_id, namespace, agent_id, db_path, details, false,
+    );
+}
+
+/// Body of the dispatcher; `retried` marks the off-lock retry worker (#7410).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_inner(
+    conn: &Connection,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    db_path: &std::path::Path,
+    details: Option<serde_json::Value>,
+    retried: bool,
+) {
     // Dispatch path needs the global view (every tenant's subscriptions
     // for this event), so `None` here is correct — ownership scoping
     // would silently drop matching subscribers belonging to OTHER
@@ -976,11 +994,15 @@ pub fn dispatch_event_with_details(
     let subs = match list_by_event(conn, event) {
         Ok(s) => s,
         Err(e) => {
-            // Loud on list failure (Fable #3242 item 4). This table is
-            // not LIMIT-capped — the 1000-row ordered cliff +
-            // `record_dispatch_scan_truncation` is the pg SAL prefix
-            // scan (`dispatch_event_postgres`), not this path.
-            tracing::warn!("subscription list failed during dispatch: {e}");
+            // #7366/#7410: never drop the event; retries run off-lock.
+            let failure = scan_failure::ScanFailure {
+                event,
+                memory_id,
+                namespace,
+                agent_id,
+                details: details.as_ref(),
+            };
+            scan_failure::on_sqlite_lookup_failure(&e, retried, db_path, &failure);
             return;
         }
     };
@@ -4928,6 +4950,27 @@ mod tests {
         );
     }
 
+    const K6_DLQ_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    const K6_DLQ_SCHEDULING_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn k6_dlq_poll_budget() -> std::time::Duration {
+        let attempts = u32::try_from(RETRY_BACKOFFS.len() + 1).unwrap();
+        ACK_TIMEOUT * attempts
+            + RETRY_BACKOFFS.iter().copied().sum::<std::time::Duration>()
+            + K6_DLQ_SCHEDULING_MARGIN
+    }
+
+    #[test]
+    fn k6_500_poll_budget_covers_retry_ladder_8288() {
+        let attempts = u32::try_from(RETRY_BACKOFFS.len() + 1).unwrap();
+        let retry_ladder =
+            ACK_TIMEOUT * attempts + RETRY_BACKOFFS.iter().copied().sum::<std::time::Duration>();
+        assert!(
+            k6_dlq_poll_budget() >= retry_ladder,
+            "DLQ poll budget must cover every ACK window and retry backoff"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn k6_500_after_retries_lands_in_dlq() {
         // The receiver returns 500 for every attempt — exhausts the retry
@@ -4959,24 +5002,43 @@ mod tests {
             dispatch_event(&conn, "memory_store", "k6-fail", "k6-ns", None, &db_path);
         }
 
-        // Backoff ladder is 200ms + 1s + 5s ≈ 6.2s of sleeps + per-
-        // attempt network time. Poll for up to 12s for the DLQ row.
+        // #8288: allow every ACK window and retry backoff (~26.2s), plus
+        // scheduling headroom for TLS setup and SQLite opens under CI load.
         let path_for_poll = db_path.clone();
         let sub_for_poll = sub_id.clone();
         let dlq_row = tokio::task::spawn_blocking(move || {
-            for _ in 0..120 {
+            let deadline = std::time::Instant::now() + k6_dlq_poll_budget();
+            while std::time::Instant::now() < deadline {
                 let conn = Connection::open(&path_for_poll).unwrap();
                 let entries = list_dlq(&conn, Some(&sub_for_poll)).unwrap();
                 if !entries.is_empty() {
-                    return Some(entries);
+                    return entries;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(K6_DLQ_POLL_INTERVAL);
             }
-            None
+            let conn = Connection::open(&path_for_poll).unwrap();
+            let delivery_status = conn
+                .prepare(
+                    "SELECT subscription_id, correlation_id, delivery_status FROM subscription_events",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                });
+            panic!(
+                "DLQ row did not appear within {:?}; subscription_dlq={:?}; delivery_status={delivery_status:?}",
+                k6_dlq_poll_budget(),
+                list_dlq(&conn, None),
+            );
         })
         .await
-        .unwrap()
-        .expect("DLQ row must appear after retry ladder exhaustion");
+        .unwrap();
 
         assert_eq!(dlq_row.len(), 1, "exactly one DLQ row per failed delivery");
         let row = &dlq_row[0];

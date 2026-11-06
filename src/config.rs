@@ -806,9 +806,9 @@ pub struct CapabilityFeatures {
     /// - **Column** (Task 1/8, commit `f5d8a9e`) —
     ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`,
     ///   first added in the recursive-learning schema bump (column
-    ///   inventory lives in `docs/MIGRATION_v0.7.md`; the current
-    ///   `CURRENT_SCHEMA_VERSION` is 53 in lockstep on both sqlite
-    ///   and postgres ladders as of v0.7.0 — v48 added
+    ///   inventory lives in `docs/MIGRATION_v0.7.md`; the v0.7.0
+    ///   `CURRENT_SCHEMA_VERSION` was 57 in lockstep on both sqlite
+    ///   and postgres ladders — v48 added
     ///   `federation_push_dlq` (#933), v49 added 14 nullable
     ///   `archived_memories` columns (#1025), v50 extended
     ///   `agent_quotas` PK with `namespace` (#1156), v51 added
@@ -3789,7 +3789,7 @@ pub struct AdminConfig {
     /// verbatim. Validation: the SAL accepts the same NHI
     /// `agent_id` charset that
     /// [`crate::validate::validate_agent_id`] enforces (see the
-    /// "Agent Identity (NHI)" section of CLAUDE.md). Entries that
+    /// "Agent Identity (NHI)" section of `docs/reference/ARCHITECTURE_REFERENCE.md`). Entries that
     /// fail validation at boot are logged at `warn` and dropped
     /// from the in-memory allowlist; the daemon still starts so
     /// a single typo does not lock the operator out.
@@ -10606,71 +10606,12 @@ pub(crate) fn test_env_mutex() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Role env marker for [`run_env_isolated_child_or_spawn`] (#2905).
+/// The env-isolation child-spawn helpers live in `test_support` so this file
+/// stays under its QUAL-10 ceiling (#2967 r5); callers keep this path.
 #[cfg(test)]
-pub(crate) const TEST_ENV_ISOLATION_ROLE_ENV: &str = "AI_MEMORY_TEST_ENV_ISOLATION_ROLE";
-
-/// #2905 test-isolation: run an env-MUTATING posture / security-profile
-/// test in an ISOLATED CHILD process so its process-global
-/// `std::env::set_var`s cannot leak to concurrent handler tests in the
-/// same `--lib` binary.
-///
-/// The class this closes (a `lib-test-blind-spots` process-global
-/// interference): `security_profile::enforce_at_boot` writes
-/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (and the rest of the `asi-hard`
-/// KNOBS) into the process env, and the HTTP create handler tests read
-/// that env WITHOUT taking [`test_env_lock`], so during a posture test's
-/// set→remove window a concurrent create test fail-closes with `403`
-/// instead of `201`. `enforce_at_boot`'s `set_var` is only safe in the
-/// synchronous pre-runtime phase (its own module doc) — never on the
-/// parallel libtest harness. Precedent for this fix:
-/// `governance::deferred_audit` + `recover::durability` `current_exe()`
-/// role-env subprocess isolation.
-///
-/// Returns `true` in the PARENT role — the caller MUST `return` immediately,
-/// because the real assertions already ran (and passed) in the spawned
-/// child. Returns `false` in the CHILD role — the caller runs its body,
-/// alone in a fresh process where its `set_var`s cannot race any other test.
-///
-/// `exact_path` MUST be the test's full `module::tests::fn_name` path. A
-/// mistyped path would run ZERO tests and libtest would STILL exit 0 — a
-/// silent false-green (the #2444 shape) — so the parent additionally
-/// asserts the child stdout reports `1 passed` and never `0 passed`.
-#[cfg(test)]
-pub(crate) fn run_env_isolated_child_or_spawn(exact_path: &str) -> bool {
-    let _ = crate::identity::test_key_dir::install();
-    if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
-        return false; // caller runs the real body in this isolated child
-    }
-    // The child inherits the parent's environment (incl. AI_MEMORY_NO_CONFIG
-    // and TMPDIR), so we only add the role marker.
-    // Route the spawn through the #1937 audited chokepoint (never a raw
-    // process-constructor, which the `spawn_audit_gate_1937` guard bans
-    // outside `src/spawn_audit.rs`). The best-effort audit emit is a no-op
-    // here because no spawn-audit DB is seeded in a unit-test process.
-    let output = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("current_exe for env-isolated test spawn"),
-        "config::run_env_isolated_child_or_spawn",
-    )
-    .args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
-    .env(TEST_ENV_ISOLATION_ROLE_ENV, "child")
-    .output()
-    .expect("spawn env-isolated child test");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "env-isolated child test {exact_path} FAILED:\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
-    );
-    // False-green guard: a mistyped `exact_path` runs zero tests and still
-    // exits 0. Require proof exactly one test actually RAN.
-    assert!(
-        stdout.contains("1 passed") && !stdout.contains("0 passed"),
-        "env-isolated child test {exact_path} did NOT run (expected `1 passed`); \
-         a mistyped path silently runs zero tests. child stdout:\n{stdout}"
-    );
-    true // caller must `return`
-}
+pub(crate) use crate::test_support::{
+    run_env_isolated_child_or_spawn, run_env_isolated_child_or_spawn_scrubbing,
+};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -13938,7 +13879,7 @@ max_page_size = 1000000
     #[test]
     fn pg_pool_env_const_names_byte_match_documented() {
         // Doc-name-match guard: these byte values are documented in
-        // CLAUDE.md's Environment Variables table + the enterprise
+        // docs/reference/ARCHITECTURE_REFERENCE.md's Environment Variables table + the enterprise
         // deployment guide §5.6. Pin the drift so it can never recur.
         assert_eq!(ENV_PG_POOL_MAX, "AI_MEMORY_PG_POOL_MAX");
         assert_eq!(ENV_PG_POOL_MIN, "AI_MEMORY_PG_POOL_MIN");
@@ -13965,7 +13906,7 @@ max_page_size = 1000000
     #[test]
     fn every_recognized_selector_is_advertised_in_the_refusal_3627() {
         // The documented vocabulary: docs/integrations/llm-backends.md
-        // (per-vendor sections + the fallback-key table) and CLAUDE.md env
+        // (per-vendor sections + the fallback-key table) and docs/reference/ARCHITECTURE_REFERENCE.md env
         // row 31.
         const DOCUMENTED_SELECTORS: &[&str] = &[
             "ollama",
@@ -14267,7 +14208,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("alias-fallback-key"));
         match &resolved.api_key_source {
             KeySource::AliasFallback(name) => assert_eq!(name, "XAI_API_KEY"),
-            other => panic!("expected AliasFallback(XAI_API_KEY), got {other:?}"),
+            other => crate::test_support::key_panic("AliasFallback(XAI_API_KEY)", other),
         }
         scrub_llm_env();
     }
@@ -14394,7 +14335,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("via-config-env-var"));
         match &resolved.api_key_source {
             KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_LLM_KEY"),
-            other => panic!("expected ConfigEnvVar(MY_CUSTOM_LLM_KEY), got {other:?}"),
+            other => crate::test_support::key_panic("ConfigEnvVar(MY_CUSTOM_LLM_KEY)", other),
         }
         unsafe {
             std::env::remove_var("MY_CUSTOM_LLM_KEY");
@@ -14428,10 +14369,10 @@ max_page_size = 1000000
             KeySource::Error(reason) => {
                 assert!(
                     reason.contains("lax permissions") && reason.contains("0400"),
-                    "error must name the perm policy: {reason}"
+                    "error must name the perm policy"
                 );
             }
-            other => panic!("expected KeySource::Error(lax perms), got {other:?}"),
+            other => crate::test_support::key_panic("KeySource::Error(lax perms)", other),
         }
         // Cleanup.
         let _ = std::fs::remove_file(&key_path);
@@ -14747,7 +14688,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("alias-fallback-embed-key"));
         match &resolved.key_source {
             KeySource::AliasFallback(name) => assert_eq!(name, "OPENROUTER_API_KEY"),
-            other => panic!("expected AliasFallback(OPENROUTER_API_KEY), got {other:?}"),
+            other => crate::test_support::key_panic("AliasFallback(OPENROUTER_API_KEY)", other),
         }
         scrub_embed_env();
     }
@@ -14770,7 +14711,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("via-embed-config-env-var"));
         match &resolved.key_source {
             KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_EMBED_KEY"),
-            other => panic!("expected ConfigEnvVar(MY_CUSTOM_EMBED_KEY), got {other:?}"),
+            other => crate::test_support::key_panic("ConfigEnvVar(MY_CUSTOM_EMBED_KEY)", other),
         }
         unsafe {
             std::env::remove_var("MY_CUSTOM_EMBED_KEY");
@@ -14799,15 +14740,18 @@ max_page_size = 1000000
             ..EmbeddingsSection::default()
         });
         let resolved = cfg.resolve_embeddings();
-        assert_eq!(resolved.api_key(), None, "lax-perm file must be refused");
+        assert!(
+            resolved.api_key().is_none(),
+            "lax-perm file must be refused"
+        );
         match &resolved.key_source {
             KeySource::Error(reason) => {
                 assert!(
                     reason.contains("[embeddings].api_key_file") && reason.contains("lax"),
-                    "error must attribute the embeddings field: {reason}"
+                    "error must attribute the embeddings field"
                 );
             }
-            other => panic!("expected KeySource::Error, got {other:?}"),
+            other => crate::test_support::key_panic("KeySource::Error", other),
         }
 
         let _ = std::fs::remove_file(&key_path);

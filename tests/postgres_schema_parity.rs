@@ -83,7 +83,7 @@ use common::postgres_url;
 // needed.
 //
 // The two ladders SHARE one logical schema number at v0.7.0+ (see
-// CLAUDE.md §Database) — sqlite and postgres both report v51 at the
+// docs/reference/ARCHITECTURE_REFERENCE.md §Database) — sqlite and postgres both report v51 at the
 // release/v0.7.0 HEAD that this test pins against. Should the two
 // ladders ever diverge in the future, this wrapper becomes the single
 // point at which to introduce a per-adapter override.

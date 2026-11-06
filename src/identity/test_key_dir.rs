@@ -141,21 +141,22 @@ pub fn install() -> &'static Path {
 /// #3705 review — a PRIVATE temporary directory for a test that needs its
 /// own key directory (not the shared sandbox): `tempfile::tempdir()` inherits
 /// the ambient umask, so under `umask 0002` it comes out 0775 and the #3198
-/// chain check correctly refuses it. Every key-directory-creating test goes
+/// chain check correctly refuses it. The directory is created with mkdir mode
+/// `0o700` (`tempfile::Builder::permissions`), so it is private from creation
+/// with no later chmod (#8316). Every key-directory-creating test goes
 /// through this so the suite never depends on ambient process state.
 ///
 /// # Panics
-/// Panics if the directory cannot be allocated or chmodded.
+/// Panics if the directory cannot be allocated.
 #[must_use]
 pub fn private_tempdir() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("allocate private temp dir");
+    let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("chmod 0700 private temp dir");
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    dir
+    builder.tempdir().expect("allocate private temp dir")
 }
 
 /// The shared sandbox, but ONLY for a process that armed the guard (#3516).

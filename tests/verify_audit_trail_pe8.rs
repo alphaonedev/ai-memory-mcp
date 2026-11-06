@@ -281,5 +281,5 @@ fn empty_chain_is_trivially_intact() {
     assert_eq!(report.total_events, 0);
     assert_eq!(report.head_sequence, 0);
     assert_eq!(report.first_break_sequence, None);
-    assert!(report.sequence_gaps.is_empty());
+    assert_eq!(report.sequence_gaps, [] as [(i64, i64); 0]);
 }

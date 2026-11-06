@@ -278,7 +278,7 @@ fn consolidate_fires_hook_on_allow() {
     )
     .expect("Allow verdict must let consolidate succeed");
 
-    assert!(!new_id.is_empty());
+    assert_ne!(new_id, "");
     let fires = hook_fire_count().load(Ordering::SeqCst);
     assert!(
         fires >= 1,

@@ -20,233 +20,27 @@
 //! the listener so the daemon can re-bind. This has a small TOCTOU race
 //! window but is the standard pattern across Rust integration suites.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
 mod common;
-use common::free_port;
+use common::tls_serve::{READINESS_POLL_INTERVAL, ServeChild};
 
-// CI's `Per-Module Coverage Thresholds` job runs the test binary under
-// `cargo llvm-cov` instrumentation, which inflates startup time by 3-5x. 60s gives
-// enough headroom on every supported CI surface (Linux/macOS/Windows)
-// regardless of instrumentation overhead.
-const SPAWN_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// Number of times `spawn_serve` re-rolls the ephemeral port when the
-/// daemon child loses the `free_port()` TOCTOU race and exits with a
-/// bind error before `/health` comes up. The window is tiny but real
-/// under full-suite concurrency (many daemon-spawning tests bind
-/// ephemeral ports at once), so we re-roll on a collision rather than
-/// fail the suite on an environmental flake. A genuine startup crash
-/// carries different stderr and is surfaced immediately, never retried.
-const SPAWN_BIND_RETRY_ATTEMPTS: usize = 5;
-
-/// Substring the daemon's `bind` error carries on an ephemeral-port
-/// collision — `std::io::Error` for `EADDRINUSE` renders as this on both
-/// Linux and macOS. Used to tell a retryable port race apart from a real
-/// startup failure so retries never mask a genuine crash.
-const BIND_IN_USE_MARKER: &str = "Address already in use";
-
-/// Poll interval while waiting for the spawned daemon's `/health` to come
-/// up (and for an early-exit child to surface).
-const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Per-request timeout for the readiness `/health` probe.
-const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Why a single `try_spawn_serve_once` attempt failed. `BindRace` is the
-/// only retryable variant; the others are surfaced to the caller with the
-/// child's captured stderr for diagnosis.
-enum SpawnFailure {
-    /// Child exited before readiness and its stderr names an in-use port —
-    /// it lost the `free_port()` TOCTOU race. Safe to retry on a new port.
-    BindRace { stderr: String },
-    /// Child exited before readiness for some other reason — a real
-    /// startup failure. Carries exit status + stderr for the panic.
-    Crashed {
-        status: std::process::ExitStatus,
-        stderr: String,
-    },
-    /// Child stayed up but `/health` never returned 200 within
-    /// [`SPAWN_TIMEOUT`].
-    NeverReady { stderr: String },
-}
-
-/// RAII guard for the spawned daemon. Drops kill the child on test
-/// exit so leaked test processes don't accumulate on flaky failures.
-struct ServeChild {
-    child: Option<Child>,
-    port: u16,
-    /// #3705 — the leaf the daemon serves; every client trusts exactly it.
-    tls: common::tls::TestTls,
-}
-
-impl ServeChild {
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", common::tls::TestTls::base_url(self.port), path)
-    }
-}
-
-impl Drop for ServeChild {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Spawn `ai-memory serve --host 127.0.0.1 --port <p> --db <db>` and wait
-/// for `/api/v1/health` to return 200. Returns a guard that kills the
-/// child on drop. `extra_args` are appended to the serve subcommand.
-/// `extra_envs` lets callers set `HOME` (for config-driven `api_key`
-/// scenarios) or other env vars on the child.
-///
-/// Retries on the `free_port()` TOCTOU bind race (see
-/// [`SPAWN_BIND_RETRY_ATTEMPTS`]); a real startup crash is surfaced
-/// immediately with the child's captured stderr.
+/// Apply this suite's arguments and authorization fixture to the shared TLS helper.
 fn spawn_serve(
     db: &std::path::Path,
     extra_args: &[&str],
     extra_envs: &[(&str, &str)],
 ) -> ServeChild {
-    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
-        match try_spawn_serve_once(db, extra_args, extra_envs) {
-            Ok(child) => return child,
-            Err(SpawnFailure::BindRace { stderr }) => {
-                // Lost the ephemeral-port race to a concurrent binder —
-                // re-roll the port. Not a product defect.
-                eprintln!(
-                    "spawn_serve: ephemeral-port bind race on attempt \
-                     {attempt}/{SPAWN_BIND_RETRY_ATTEMPTS}, re-rolling port. \
-                     child stderr:\n{stderr}"
-                );
-            }
-            Err(SpawnFailure::Crashed { status, stderr }) => {
-                panic!(
-                    "serve child exited before /health became ready: {status}\n\
-                     --- child stderr ---\n{stderr}"
-                );
-            }
-            Err(SpawnFailure::NeverReady { stderr }) => {
-                panic!(
-                    "serve daemon did not become ready within {SPAWN_TIMEOUT:?}\n\
-                     --- child stderr ---\n{stderr}"
-                );
-            }
+    common::tls_serve::spawn_serve(db, |cmd| {
+        // #1751: unsigned requests test serve wiring, with the #976/#1001 admin fixture.
+        cmd.env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+            .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
+            .args(extra_args);
+        for (key, value) in extra_envs {
+            cmd.env(key, value);
         }
-    }
-    panic!(
-        "serve daemon lost the ephemeral-port bind race \
-         {SPAWN_BIND_RETRY_ATTEMPTS} times in a row"
-    );
-}
-
-/// Single spawn-and-wait attempt backing [`spawn_serve`]. Captures the
-/// child's stderr so the outcome can distinguish a retryable port race
-/// from a genuine startup crash (and so panics carry real diagnostics).
-fn try_spawn_serve_once(
-    db: &std::path::Path,
-    extra_args: &[&str],
-    extra_envs: &[(&str, &str)],
-) -> Result<ServeChild, SpawnFailure> {
-    let port = free_port();
-    let port_s = port.to_string();
-    // #3705 — the daemon refuses every plaintext bind; a per-spawn leaf.
-    let tls = common::tls::TestTls::generate(
-        &db.parent().expect("db lives in a tempdir").join("tls-3705"),
-    );
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    cmd.env("AI_MEMORY_NO_CONFIG", "1")
-        // #1751 — permissive attestation opt-out; this suite's unsigned
-        // HTTP stores exercise serve wiring, not the attestation gate.
-        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
-        // #976 (2026-05-20) — admin allowlist so the post-#946
-        // admin-gated routes (stats, archive, forget, …) exercise the
-        // happy-path 200 in this test fixture. Negative admin
-        // contracts belong in dedicated test files.
-        //
-        // #1001 (2026-05-21) — pre-#980 this used the `"*"` wildcard
-        // sentinel; #980 made `"*"` shape-invalid in
-        // `validate_agent_id`, so the env entry got dropped. Tests
-        // using `spawn_serve` that hit admin endpoints must thread
-        // `X-Agent-Id: ai:serve-test-admin` (matches the env value).
-        .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port_s,
-        ])
-        .args(tls.serve_arg_strs())
-        .args(extra_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in extra_envs {
-        cmd.env(k, v);
-    }
-    let mut child = cmd.spawn().expect("spawn ai-memory serve");
-
-    // Drain stdout to the void; capture stderr into a shared buffer so
-    // an early exit can be classified (bind race vs. real crash) and so
-    // failures surface the daemon's own error instead of being silent.
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
-    }
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        let sink = std::sync::Arc::clone(&stderr_buf);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut guard = sink.lock().unwrap();
-                guard.push_str(&line);
-                guard.push('\n');
-            }
-        })
-    });
-    // Join the stderr drainer (the pipe EOFs once the child exits, so the
-    // thread ends promptly) and return everything it captured.
-    let drain_stderr = move || -> String {
-        if let Some(handle) = stderr_handle {
-            let _ = handle.join();
-        }
-        stderr_buf.lock().unwrap().clone()
-    };
-
-    let client = tls.client_with_timeout(READINESS_PROBE_TIMEOUT);
-    let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).send()
-            && resp.status().is_success()
-        {
-            return Ok(ServeChild {
-                child: Some(child),
-                port,
-                tls,
-            });
-        }
-        // Bail early if the child crashed — don't burn the full timeout.
-        if let Ok(Some(status)) = child.try_wait() {
-            let stderr = drain_stderr();
-            return Err(if stderr.contains(BIND_IN_USE_MARKER) {
-                SpawnFailure::BindRace { stderr }
-            } else {
-                SpawnFailure::Crashed { status, stderr }
-            });
-        }
-        std::thread::sleep(READINESS_POLL_INTERVAL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(SpawnFailure::NeverReady {
-        stderr: drain_stderr(),
     })
 }
 
@@ -256,7 +50,7 @@ fn http_client(serve: &ServeChild) -> reqwest::blocking::Client {
 }
 
 /// Bounded retry window for a test's *first* real HTTP request against a
-/// freshly-spawned daemon, layered on top of [`try_spawn_serve_once`]'s own
+/// freshly-spawned daemon, layered on top of [`common::tls_serve::spawn_serve`]'s own
 /// `/api/v1/health` readiness gate (#1994).
 ///
 /// `spawn_serve` already blocks until `/health` returns 2xx before handing
@@ -296,26 +90,6 @@ where
             ),
         }
     }
-}
-
-/// Polls `<base_url>/api/v1/health` until it returns 2xx or `timeout`
-/// elapses. Shared readiness-gate helper for spawn paths that cannot reuse
-/// `spawn_serve` (e.g. [`serve_api_key_required_when_configured`], which
-/// needs a custom `HOME` + must NOT set `AI_MEMORY_NO_CONFIG`) but still
-/// need the same bounded retry-until-listening contract (#1994).
-fn wait_for_health(client: &reqwest::blocking::Client, base_url: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if client
-            .get(format!("{base_url}/api/v1/health"))
-            .send()
-            .is_ok_and(|r| r.status().is_success())
-        {
-            return true;
-        }
-        std::thread::sleep(READINESS_POLL_INTERVAL);
-    }
-    false
 }
 
 #[test]
@@ -434,107 +208,36 @@ fn serve_api_key_required_when_configured() {
     )
     .unwrap();
 
-    // Spawn without AI_MEMORY_NO_CONFIG=1 so the config.toml is honoured.
-    // Hosted-ubuntu `Check (ubuntu-latest,sqlite)` has hit a leftover
-    // daemon on the ephemeral port (health 200, /stats 403 admin-gate
-    // because THAT process had no api_key). Health is api-key-exempt, so
-    // `wait_for_health` cannot tell our child from the leftover — retry
-    // the whole spawn on a fresh port when /stats is not 401. Same
-    // attempt budget as `spawn_serve`'s bind-race loop.
-    // #3705 — the daemon refuses every plaintext bind; one leaf for the
-    // retry loop, trusted by the probe client.
-    let tls = common::tls::TestTls::generate(&tmp.path().join("tls-3705"));
-    let client = tls.client_with_timeout(Duration::from_secs(5));
-    let mut last_err = String::new();
-    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
-        let port = free_port();
-        let port_s = port.to_string();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-            .env_remove("AI_MEMORY_NO_CONFIG")
-            .env("AI_MEMORY_NO_CONFIG", "0")
-            .env("HOME", tmp.path().to_str().unwrap())
-            // #3002 / #3215 — `config_path()` resolves through `dirs::config_dir()`,
-            // which honors `XDG_CONFIG_HOME`. Without this pin an ambient host
-            // XDG root (or a leftover `config.toml` there) wins, the daemon boots
-            // without the test `api_key`, `api_key_auth` becomes a pass-through,
-            // and GET `/api/v1/stats` returns the admin-gate 403 instead of the
-            // api-key 401 this test is pinning.
+    // #3002/#3215: config_path honors XDG_CONFIG_HOME; pin it on this child.
+    // Every startup attempt has a unique trusted leaf, so another listener cannot
+    // satisfy readiness. Only bind collisions retry; an auth mismatch is a failure.
+    let serve = common::tls_serve::spawn_serve(&db, |cmd| {
+        cmd.env("AI_MEMORY_NO_CONFIG", "0")
+            .env("HOME", tmp.path())
             .env("XDG_CONFIG_HOME", &xdg_root)
             .env_remove("AI_MEMORY_DB")
-            .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
-            .args([
-                "--db",
-                db.to_str().unwrap(),
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port_s,
-            ])
-            .args(tls.serve_arg_strs())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        if let Some(stdout) = child.stdout.take() {
-            std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
-        }
-        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        if let Some(stderr) = child.stderr.take() {
-            let sink = std::sync::Arc::clone(&stderr_buf);
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    let mut guard = sink.lock().unwrap();
-                    guard.push_str(&line);
-                    guard.push('\n');
-                }
-            });
-        }
-
-        let url = common::tls::TestTls::base_url(port);
-        let ready = wait_for_health(&client, &url, SPAWN_TIMEOUT);
-        let guard = ServeChild {
-            child: Some(child),
-            port,
-            tls: tls.clone(),
-        };
-        if !ready {
-            last_err = format!(
-                "attempt {attempt}: auth-protected daemon never came up; stderr:\n{}",
-                stderr_buf.lock().unwrap()
-            );
-            drop(guard);
-            continue;
-        }
-
-        let resp = send_first_request(|| client.get(format!("{url}/api/v1/stats")));
-        let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
-        if status != 401 {
-            last_err = format!(
-                "attempt {attempt}: missing x-api-key must 401 (got {status}); body={body}; stderr:\n{}",
-                stderr_buf.lock().unwrap()
-            );
-            drop(guard);
-            continue;
-        }
-
-        let resp = client
-            .get(format!("{url}/api/v1/stats"))
-            .header("x-api-key", api_key)
-            .header("x-agent-id", "ai:serve-test-admin")
-            .send()
-            .unwrap();
-        assert!(
-            resp.status().is_success(),
-            "auth header rejected: {}; stderr:\n{}",
-            resp.status(),
-            stderr_buf.lock().unwrap()
-        );
-        drop(guard);
-        return;
-    }
-    panic!("{last_err}");
+            .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin");
+    });
+    let client = http_client(&serve);
+    let resp = send_first_request(|| client.get(serve.url("/api/v1/stats")));
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "missing x-api-key must be rejected; child stderr:\n{}",
+        serve.stderr()
+    );
+    let resp = client
+        .get(serve.url("/api/v1/stats"))
+        .header("x-api-key", api_key)
+        .header("x-agent-id", "ai:serve-test-admin")
+        .send()
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "auth header rejected: {}; child stderr:\n{}",
+        resp.status(),
+        serve.stderr()
+    );
 }
 
 #[cfg(unix)]

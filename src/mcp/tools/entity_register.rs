@@ -108,8 +108,25 @@ pub fn handle_entity_register(
         validate::validate_agent_id(aid).map_err(|e| e.to_string())?;
     }
 
-    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #8497 — the owner is the verified governance subject, never the wire
+    // value: a wire `agent_id` that disagrees with the process principal is
+    // refused (and audited), exactly like every other governance-bearing
+    // write. An inline `metadata.agent_id` that disagrees is refused too.
+    let agent_id = crate::identity::entity_owner::resolve_entity_owner_subject(
+        explicit_agent_id,
+        mcp_client,
+        namespace,
+        canonical_name,
+    )?;
+    crate::identity::entity_owner::enforce_entity_owner(
+        &agent_id,
+        None,
+        &extra_metadata,
+        namespace,
+        canonical_name,
+        crate::audit::synthesis_sources::EXPLICIT,
+    )
+    .map_err(|e| e.to_string())?;
 
     let reg = db::entity_register(
         conn,
@@ -239,17 +256,34 @@ mod tests {
     /// #3171 U2 — an inline `metadata.agent_id` used to WIN over the id the
     /// handler had just put through `validate_agent_id`, so a reserved
     /// sentinel (`daemon`) never crossed `RESERVED_AGENT_IDS` (#977). The
-    /// resolved id now overwrites the inline value.
+    /// resolved id now overwrites the inline value; since #8497 an inline
+    /// value that DISAGREES with the verified owner is refused outright, and
+    /// an inline value that agrees is stamped as the same owner.
     #[test]
     fn entity_register_resolved_id_wins_over_inline_metadata_agent_id_3171() {
         let conn = open_conn();
-        let result = handle_entity_register(
+        let err = handle_entity_register(
             &conn,
             &json!({
                 "canonical_name": "Eve",
                 "namespace": "people",
                 "agent_id": "alice",
                 "metadata": {"agent_id": "daemon", "team": "x"},
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("mismatch"),
+            "forged inline owner refused: {err}"
+        );
+        let result = handle_entity_register(
+            &conn,
+            &json!({
+                "canonical_name": "Eve",
+                "namespace": "people",
+                "agent_id": "alice",
+                "metadata": {"agent_id": "alice", "team": "x"},
             }),
             None,
         )

@@ -223,6 +223,8 @@ pub fn run_auto_export(
             return Ok(());
         }
     };
+    // ERRORS-02/15: refuse durable IDs before touching the destination tree.
+    export_reflections::validate_export_id(&mem.id, &mem.namespace)?;
     let edges = collect_outbound_reflects_on(&conn, memory_id)?;
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let payload = export_reflections::render_payload(&mem, &edges, attest_level, config.format);
@@ -231,10 +233,10 @@ pub fn run_auto_export(
         .out_dir
         .join(export_reflections::sanitise_namespace_for_path(
             &mem.namespace,
-        ));
+        )?);
     std::fs::create_dir_all(&ns_dir)?;
     let path = ns_dir.join(format!("{}.{}", mem.id, config.format.extension()));
-    std::fs::write(&path, payload)?;
+    export_reflections::write_private_export(&path, payload.as_bytes())?;
     Ok(())
 }
 

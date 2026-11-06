@@ -2,7 +2,7 @@
 
 **Assessor:** B — emphasis: *technical fit against the code we actually have*
 **Date:** 2026-09-19
-**Tree read:** `/home/fate_two/v07/v09-dev`, `origin/release/v1.0.0` @ `8b4f65a22`, plus the unmerged
+**Tree read:** `<home>/v07/v09-dev`, `origin/release/v1.0.0` @ `8b4f65a22`, plus the unmerged
 `origin/f1/3806-w1abc` @ `271279072` and `origin/f1/3806-w1c` @ `4696658f0`
 **Method:** read-only. Nothing installed, no weights downloaded, no third-party code run, no dependency added.
 Repo navigated with the `codegraph explore` CLI, plus direct reads and `git show` against the feature branches.
@@ -27,7 +27,7 @@ the contract we already wrote."
 These matter because three of the Conductor's questions are phrased on top of them.
 
 **(a) `src/decision.rs`, `src/decision_config.rs` and `src/decision_clients/` do not exist on
-`release/v1.0.0`.** Verified: `find /home/fate_two/v07/v09-dev/src -iname '*decision*'` returns exactly one file,
+`release/v1.0.0`.** Verified: `find <home>/v07/v09-dev/src -iname '*decision*'` returns exactly one file,
 `src/hooks/decision.rs` (an unrelated hook). `git log -S "response_format" origin/release/v1.0.0 -- src/` is
 **empty** — the string has never appeared on the release branch.
 
@@ -44,8 +44,8 @@ seam already cut (§1.2). Everything I say about "our structured-output work" be
 `release/v1.0.0` today there is nothing to displace, which by itself answers part of the BAML question.
 
 **(b) There is no 64 KiB cap on the `/metrics` renderer.** `crate::metrics::render()`
-(`/home/fate_two/v07/v09-dev/src/metrics.rs:1418`) is an unbounded `TextEncoder` encode; the handler
-`prometheus_metrics` (`/home/fate_two/v07/v09-dev/src/handlers/transport.rs:1348-1362`) returns the whole body
+(`<home>/v07/v09-dev/src/metrics.rs:1418`) is an unbounded `TextEncoder` encode; the handler
+`prometheus_metrics` (`<home>/v07/v09-dev/src/handlers/transport.rs:1348-1362`) returns the whole body
 with no length limit. The `64 * 1024` literals in the tree are `axum::body::to_bytes` read limits in
 `src/handlers/errors.rs:345` and in tests, plus `MAX_CONTENT_SIZE = 65536` for memory content. Worth correcting
 because "the /metrics 64 KiB cap" was offered as a place BAML's small-trace claim might land, and it is not one.
@@ -136,7 +136,7 @@ that guard by having nothing to guard. Both PAW-in-process and an NLI cross-enco
 
 **The other seams PAW would touch, by file and symbol, all on `release/v1.0.0`:**
 
-- `OllamaClient::classify_kind` — `/home/fate_two/v07/v09-dev/src/llm.rs:2131`, prompt
+- `OllamaClient::classify_kind` — `<home>/v07/v09-dev/src/llm.rs:2131`, prompt
   `classify_kind_prompt` at `:850`, system const `CLASSIFY_KIND_SYSTEM` at `:841`, parser
   `parse_classified_kind` at `:857`. The parser scans alphabetic tokens and returns the first that names a kind;
   no token naming a kind ⇒ `None` ⇒ abstain. Consumers: `crate::autonomy::classify_kind`
@@ -467,7 +467,7 @@ perma-banned.
 
 **It would relocate a branch that is already one line, and add a language above it.** Measured, not asserted.
 
-*What we branch on today.* `LlmProvider` (`/home/fate_two/v07/v09-dev/src/llm.rs:432-444`) has exactly **two**
+*What we branch on today.* `LlmProvider` (`<home>/v07/v09-dev/src/llm.rs:432-444`) has exactly **two**
 variants:
 
 ```rust

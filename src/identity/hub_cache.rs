@@ -265,10 +265,13 @@ pub fn audit_sqlite(
 ) -> Result<()> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let tx = crate::storage::connection::WriteTxn::begin(conn)?;
+    let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
     for event in events(previous, next)? {
-        crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+        anchor = anchor.merge(crate::signed_events::append_signed_event_no_tx(
+            conn, &event,
+        )?);
     }
-    tx.commit()?;
+    tx.commit_and_emit(anchor)?;
     Ok(())
 }
 

@@ -340,6 +340,14 @@ pub fn dsn_transport(dsn: &str) -> DsnTransport {
     if scheme != "postgres" && scheme != "postgresql" {
         return DsnTransport::Unparseable;
     }
+    // #6096 - an ambiguous authority (an unencoded `/`, `?`, `#` or `\` in
+    // the userinfo) parses to a "host" that is credential bytes. Refuse it
+    // before any socket or DNS lookup, the same fail-closed `Unparseable`
+    // the floor already returns for a shape the drivers would read
+    // differently from the text (#3866, #4434).
+    if crate::url_display::store_url_is_ambiguous(dsn) {
+        return DsnTransport::Unparseable;
+    }
     // The last `host` / `hostaddr` parameter wins (libpq precedence);
     // `query_pairs` percent-decodes, so `host=%2Fvar%2Frun` is a socket
     // directory too.
@@ -514,8 +522,10 @@ pub fn pg_unix_socket_refusal(dir: &str) -> String {
 pub fn pg_dsn_unparseable_refusal() -> String {
     format!(
         "{ISSUE_TAG}: refusing the PostgreSQL store DSN: it is not a `postgres://` URL the \
-         driver parses (a userinfo with no host, another scheme, or malformed), so its transport \
-         cannot be established ({MANDATE}). Fix: `postgres://user:pass@host:port/db?` and \
+         driver parses (a userinfo with no host, another scheme, malformed, or an `@` outside the \
+         userinfo: percent-encode a literal `@` in a password or query value as `%40`, and an \
+         unencoded `/`, `?` or `#` in a password likewise), so its transport cannot be \
+         established ({MANDATE}). Fix: `postgres://user:pass@host:port/db?` and \
          {REMEDY_PG_SSLMODE}."
     )
 }

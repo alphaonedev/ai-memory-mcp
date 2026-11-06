@@ -418,12 +418,14 @@ impl<'a> PersonaGenerator<'a> {
         // mid-sequence failure left an orphaned / mis-attested persona row.
         // Wrap the memory insert + N derived_from links + the metadata patch
         // (none of which use an inner transaction) in one unit; the guard rolls
-        // back on any early `?` (Transaction's Drop default). `generate()` is a
+        // back on any early `?` (`WriteTxn`'s Drop issues ROLLBACK). `generate()` is a
         // top-level call so there is no nesting. The signed_events emit is
         // committed-after (it self-transacts via append_signed_event).
-        let persona_tx = self
-            .conn
-            .unchecked_transaction()
+        //
+        // BEGIN IMMEDIATE (#5084, the #2250 class): `db::insert` reads the
+        // title slot before it writes, so a DEFERRED upgrade could fail with
+        // SQLITE_BUSY_SNAPSHOT (not retried by busy_timeout).
+        let persona_tx = crate::storage::connection::WriteTxn::begin(self.conn)
             .context("begin persona write transaction")?;
 
         // #2110 — persona rows are substrate-generated (the QW-2 generator
@@ -845,14 +847,31 @@ fn emit_persona_generated_event(
 /// persona alongside reflections from the same directory tree.
 #[must_use]
 pub fn render_persona_md(persona: &Persona) -> String {
+    use crate::yaml_frontmatter::{YamlScalarKind, yaml_scalar};
     let mut out = String::with_capacity(persona.body_md.len() + 256);
     out.push_str("---\n");
-    out.push_str(&format!("memory_id: {}\n", persona.id));
-    out.push_str(&format!("entity_id: {}\n", persona.entity_id));
-    out.push_str(&format!("namespace: {}\n", persona.namespace));
+    // #8493: every string site goes through the shared YAML scalar encoder.
+    out.push_str(&format!(
+        "memory_id: {}\n",
+        yaml_scalar(&persona.id, YamlScalarKind::StoredString)
+    ));
+    out.push_str(&format!(
+        "entity_id: {}\n",
+        yaml_scalar(&persona.entity_id, YamlScalarKind::StoredString)
+    ));
+    out.push_str(&format!(
+        "namespace: {}\n",
+        yaml_scalar(&persona.namespace, YamlScalarKind::StoredString)
+    ));
     out.push_str(&format!("persona_version: {}\n", persona.version));
-    out.push_str(&format!("generated_at: {}\n", persona.generated_at));
-    out.push_str(&format!("attest_level: {}\n", persona.attest_level));
+    out.push_str(&format!(
+        "generated_at: {}\n",
+        yaml_scalar(&persona.generated_at, YamlScalarKind::Timestamp)
+    ));
+    out.push_str(&format!(
+        "attest_level: {}\n",
+        yaml_scalar(&persona.attest_level, YamlScalarKind::StoredString)
+    ));
     out.push_str(&format!("sources: {}\n", persona.sources.len()));
     out.push_str("---\n\n");
     out.push_str(&persona.body_md);
@@ -990,6 +1009,31 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
+    }
+
+    /// #5084 / #5243 — `generate_in_scope` opens its write transaction
+    /// `BEGIN IMMEDIATE`: a second writer cannot commit inside its
+    /// read-then-write window, and the lock upgrade does not fail with
+    /// `SQLITE_BUSY_SNAPSHOT`.
+    #[test]
+    fn generate_in_scope_is_immediate_5084() {
+        use crate::storage::txn_immediate_5084_tests::{arm_interleaved_writer_5084, disarm_5084};
+        let (mut conn, dir) = fresh_db();
+        seed_two_alice_reflections(&conn, "team/alpha");
+        let committed = arm_interleaved_writer_5084(&mut conn, &dir.path().join("ai-memory.db"));
+        let llm = StubLlm {
+            canned: "Alice is methodical.".into(),
+        };
+        let out = {
+            let generator = PersonaGenerator::new(&conn, &llm, None, PersonaConfig::default());
+            generator.generate("alice", "team/alpha")
+        };
+        assert!(disarm_5084(&mut conn), "interleaving hook never fired");
+        assert!(out.is_ok(), "#5084 generate_in_scope failed: {out:?}");
+        assert!(
+            !committed.get(),
+            "#5084 generate_in_scope: a concurrent writer committed inside the window"
+        );
     }
 
     #[test]
@@ -1482,5 +1526,174 @@ mod tests {
         assert_eq!(sigs[0].len(), 64);
         assert_eq!(sigs[1].len(), 64);
         assert_ne!(sigs[0], sigs[1], "v1 + v2 signatures must differ");
+    }
+
+    // ---- #8493: persona frontmatter goes through the shared YAML scalar encoder ----
+
+    fn persona_8493(id: &str, entity: &str, ns: &str, generated_at: &str, attest: &str) -> Persona {
+        Persona {
+            id: id.into(),
+            entity_id: entity.into(),
+            namespace: ns.into(),
+            body_md: "body".into(),
+            sources: vec!["s1".into()],
+            generated_at: generated_at.into(),
+            version: 1,
+            attest_level: attest.into(),
+        }
+    }
+
+    fn frontmatter_8493(md: &str) -> &str {
+        md.strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .map(|(header, _)| header)
+            .expect("frontmatter block")
+    }
+
+    fn scalar_line_8493<'a>(header: &'a str, prefix: &str) -> &'a str {
+        header
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("frontmatter key present")
+    }
+
+    #[test]
+    fn persona_frontmatter_8493_clean_values_stay_byte_identical() {
+        let md = render_persona_md(&persona_8493(
+            "p1",
+            "alice",
+            "team/alpha",
+            "2026-05-15T00:00:00Z",
+            "unsigned",
+        ));
+        assert_eq!(
+            md,
+            "---\nmemory_id: p1\nentity_id: alice\nnamespace: team/alpha\npersona_version: 1\n\
+             generated_at: 2026-05-15T00:00:00Z\nattest_level: unsigned\nsources: 1\n---\n\nbody\n"
+        );
+        let peer = render_persona_md(&persona_8493(
+            "p1",
+            "alice",
+            "team/alpha",
+            "2026-05-15T00:00:00Z",
+            "peer_attested",
+        ));
+        assert!(peer.contains("attest_level: peer_attested\n"));
+    }
+
+    #[test]
+    fn persona_frontmatter_8493_entity_id_line_break_cannot_inject_a_key() {
+        let md = render_persona_md(&persona_8493(
+            "p1",
+            "alice\nnamespace: evil",
+            "team/alpha",
+            "2026-05-15T00:00:00Z",
+            "unsigned",
+        ));
+        let header = frontmatter_8493(&md);
+        assert_eq!(
+            scalar_line_8493(header, "entity_id: "),
+            "\"alice\\nnamespace: evil\""
+        );
+        assert_eq!(
+            header
+                .lines()
+                .filter(|line| line.starts_with("namespace:"))
+                .count(),
+            1,
+            "exactly one namespace key: {header:?}"
+        );
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).expect("valid yaml");
+        assert_eq!(parsed["namespace"].as_str(), Some("team/alpha"));
+        assert_eq!(parsed["entity_id"].as_str(), Some("alice\nnamespace: evil"));
+    }
+
+    #[test]
+    fn persona_frontmatter_8493_namespaces_follow_the_export_policy() {
+        for ns in [
+            "[x]",
+            "*a",
+            "true",
+            "y",
+            "n",
+            "0b101",
+            "1_000",
+            "1:30",
+            "123e4567-e89b-42d3-a456-426614174000",
+        ] {
+            let md = render_persona_md(&persona_8493(
+                ns,
+                "alice",
+                ns,
+                "2026-05-15T00:00:00Z",
+                "unsigned",
+            ));
+            let header = frontmatter_8493(&md);
+            let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).expect("yaml");
+            assert_eq!(parsed["namespace"].as_str(), Some(ns), "namespace {ns:?}");
+            assert_eq!(parsed["memory_id"].as_str(), Some(ns), "memory_id {ns:?}");
+            let is_uuid = ns.contains('-');
+            assert_eq!(
+                scalar_line_8493(header, "namespace: ").starts_with('"'),
+                !is_uuid,
+                "namespace quoting {ns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn persona_frontmatter_8493_format_controls_are_escaped() {
+        let md = render_persona_md(&persona_8493(
+            "p1",
+            "a\u{2028}b\u{feff}c",
+            "team/alpha",
+            "2026-05-15T00:00:00Z",
+            "unsigned",
+        ));
+        let header = frontmatter_8493(&md);
+        assert_eq!(
+            scalar_line_8493(header, "entity_id: "),
+            "\"a\\u2028b\\ufeffc\""
+        );
+        assert!(!md.contains('\u{2028}') && !md.contains('\u{feff}'));
+    }
+
+    #[test]
+    fn persona_frontmatter_8493_shared_table_at_every_string_site() {
+        use crate::yaml_frontmatter::YAML_SCHEMA_FORMS_8605_R7;
+        let mut failures = Vec::new();
+        for &(value, plain_string, timestamp) in YAML_SCHEMA_FORMS_8605_R7 {
+            let md = render_persona_md(&persona_8493(value, value, value, value, value));
+            let header = frontmatter_8493(&md);
+            // The YAML 1.1 proof consumes these exact renderer bytes.
+            println!(
+                "YAML_ORACLE_8493 {}",
+                serde_json::json!({
+                    "value": value, "plain_string": plain_string,
+                    "timestamp": timestamp, "header": header,
+                })
+            );
+            let Ok(parsed) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(header) else {
+                failures.push(format!("parser rejected {value:?}"));
+                continue;
+            };
+            for (key, timestamp_site) in [
+                ("memory_id", false),
+                ("entity_id", false),
+                ("namespace", false),
+                ("generated_at", true),
+                ("attest_level", false),
+            ] {
+                let scalar = scalar_line_8493(header, &format!("{key}: "));
+                let expected_plain = plain_string || (timestamp && timestamp_site);
+                if parsed[key].as_str() != Some(value) || scalar.starts_with('"') == expected_plain
+                {
+                    failures.push(format!("{key}: {value:?}"));
+                }
+            }
+            assert_eq!(parsed["persona_version"].as_i64(), Some(1));
+            assert_eq!(parsed["sources"].as_i64(), Some(1));
+        }
+        assert!(failures.is_empty(), "persona YAML table: {failures:?}");
     }
 }

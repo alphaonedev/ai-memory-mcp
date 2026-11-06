@@ -36,8 +36,10 @@ pub fn rekey_peer(
     if raw_key == rendered_key {
         return Ok(false);
     }
-    let tx = conn.unchecked_transaction()?;
-    let row: Option<(String, Option<String>)> = tx
+    // BEGIN IMMEDIATE (#5084, the #2250 class): SELECT then writes, so a
+    // DEFERRED upgrade could fail with SQLITE_BUSY_SNAPSHOT.
+    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
+    let row: Option<(String, Option<String>)> = conn
         .query_row(
             "SELECT last_seen_at, last_pushed_at FROM sync_state \
              WHERE agent_id = ?1 AND peer_id = ?2",
@@ -48,11 +50,11 @@ pub fn rekey_peer(
     let Some((last_seen_at, last_pushed_at)) = row else {
         return Ok(false);
     };
-    super::sync_state_observe(&tx, agent_id, rendered_key, &last_seen_at)?;
+    super::sync_state_observe(conn, agent_id, rendered_key, &last_seen_at)?;
     if let Some(pushed) = last_pushed_at.as_deref() {
-        super::sync_state_record_push(&tx, agent_id, rendered_key, pushed)?;
+        super::sync_state_record_push(conn, agent_id, rendered_key, pushed)?;
     }
-    tx.execute(
+    conn.execute(
         "DELETE FROM sync_state WHERE agent_id = ?1 AND peer_id = ?2",
         params![agent_id, raw_key],
     )?;

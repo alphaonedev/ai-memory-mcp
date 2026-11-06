@@ -48,7 +48,7 @@ pub(crate) const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
 /// outcome as the header being absent.
 pub(super) fn extract_peer_id(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get(PEER_ID_HEADER).and_then(|v| v.to_str().ok())?;
-    // Reject anything that fails the agent_id shape per CLAUDE.md
+    // Reject anything that fails the agent_id shape per ARCHITECTURE_REFERENCE.md
     // §"Agent Identity": `^[A-Za-z0-9_\-:@./]{1,128}$`. The strict
     // shape is the load-bearing property — no whitespace, no nulls,
     // no control chars (CRLF), no shell metacharacters.
@@ -1365,8 +1365,9 @@ pub(crate) fn normalise_inbound_node_local_overlay_or_warn(mem: &mut Memory) {
 /// Call AFTER [`apply_inbound_write_attestation`] has stamped `attest_level`.
 /// When `quarantine_enabled`
 /// (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, resolved by
-/// [`crate::federation::receive_auth::quarantine_unattributed_enabled`], default
-/// OFF/permissive) AND the row did NOT reach
+/// [`crate::federation::receive_auth::quarantine_unattributed_enabled`], off on
+/// `singleton`/`team` unless set, forced on for `federated`/`hive`/`production`,
+/// #2967) AND the row did NOT reach
 /// [`crate::models::AttestLevel::AgentAttested`] (i.e. it landed `claimed` — no
 /// verified per-write content signature), the row's `lifecycle_state` is set to
 /// [`crate::models::LifecycleState::Quarantined`].
@@ -1374,8 +1375,9 @@ pub(crate) fn normalise_inbound_node_local_overlay_or_warn(mem: &mut Memory) {
 /// The row is still STORED (the bytes converge — CRDT-safe); only this node's
 /// local read/egress view hides it via the fail-closed
 /// [`crate::models::lifecycle_visible_clause`] allow-list, until a route-out
-/// dequarantine (attest upgrade or operator). With the knob off this is a
-/// byte-identical no-op (the pre-#1948 accept-visible posture). Honest caveat:
+/// dequarantine (attest upgrade or operator). With the knob off (`singleton`/`team`
+/// unless set) this is a byte-identical no-op (the pre-#1948 accept-visible
+/// posture). Honest caveat:
 /// a quarantined row does not relay onward (black-hole until dequarantine).
 pub(super) fn maybe_quarantine_unattributed(to_insert: &mut Memory, quarantine_enabled: bool) {
     if !quarantine_enabled {
@@ -2966,7 +2968,7 @@ async fn sync_push_write(
             continue;
         }
         // v1.0.0 R19/A3 (#1948) — route-IN quarantine of a provenance-less
-        // (non-`agent_attested`) relayed write. Opt-in + permissive default.
+        // (non-`agent_attested`) relayed write. Shape-scoped knob (#2967): off on singleton/team unless set.
         maybe_quarantine_unattributed(
             &mut to_insert,
             crate::federation::receive_auth::quarantine_unattributed_enabled(),

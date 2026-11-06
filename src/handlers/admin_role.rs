@@ -77,6 +77,133 @@ pub fn admin_header_trust_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// #8494 — the pure admission arm for the public-key bind surface
+/// (`POST/PUT /api/v1/agents/{id}/pubkey[/challenge]`).
+///
+/// Binding a key is the root of every later signature check, so an allowlisted
+/// admin NAME presented as a bare header claim is not enough. The caller must
+/// either be key-bound (`KeyAuthenticated` / `SignatureAttested`: the presented
+/// `X-API-Key` is the enrolled per-agent key of this very admin id) or the
+/// operator must have explicitly opted into header trust
+/// ([`ENV_ADMIN_HEADER_TRUST`]).
+#[must_use]
+pub fn pubkey_bind_principal_admitted(
+    level: crate::handlers::identity_binding::AuthLevel,
+    header_trust_opt_in: bool,
+) -> bool {
+    level.is_key_bound() || header_trust_opt_in
+}
+
+/// #8494 / #8535 — stable audit reason for a credential mutation refused
+/// because the admin was only a header claim, not a key-authenticated
+/// principal.
+pub const CLAIMED_ADMIN_REASON: &str = "claimed_admin_not_key_authenticated";
+
+/// #8574 - stable audit reason for a credential mutation refused because the
+/// operator's [`ENV_ADMIN_HEADER_TRUST`] opt-in was IGNORED: at least one
+/// per-agent api key is enrolled, so the enrolled registry is the backstop and
+/// a header claim must never extend it.
+pub const HEADER_TRUST_REFUSED_REASON: &str = "header_trust_refused_registry_enrolled";
+
+/// #8574 - stable audit reason for a credential mutation refused because the
+/// authoritative registry read failed under the [`ENV_ADMIN_HEADER_TRUST`]
+/// opt-in: the registry state is unknown, so the gate refuses (fail closed)
+/// without claiming that a key is enrolled.
+pub const HEADER_TRUST_UNREADABLE_REASON: &str = "header_trust_refused_registry_unreadable";
+
+/// #8494 / #8535 — one credential-mutating route's refusal vocabulary.
+///
+/// `action` is the audit action, `issue_label` the audit issue tag and
+/// `required_msg` the wire message of the typed 403. All three are `'static`
+/// so no caller-controlled byte can reach the signed chain through them.
+#[derive(Debug, Clone, Copy)]
+pub struct PrincipalGate {
+    pub action: &'static str,
+    pub issue_label: &'static str,
+    pub required_msg: &'static str,
+}
+
+/// #8494 / #8535 — require a VERIFIED principal for a credential mutation
+/// (public-key bind, api-key mint, api-key revoke).
+///
+/// `caller` is the id [`require_admin`] already admitted and `agent_id` the
+/// path id, which the caller MUST have validated first: the deny row below
+/// carries it, and the audit chain is signed and append-only (#3529 / #8536,
+/// validate before audit). The caller is admitted only when key-bound to its
+/// own admin id (the presented `X-API-Key` is its enrolled per-agent key) or
+/// when the operator opted into [`ENV_ADMIN_HEADER_TRUST`] AND the enrolled
+/// per-agent key registry is empty (#8574: confirmed by an authoritative store
+/// read through the SAL, refused on a store error; the opt-in is the bootstrap
+/// path while this daemon's registry is empty, or after every key is revoked;
+/// once a key is enrolled it is ignored here, in every identity mode, because
+/// the registry is the backstop and the claim must not extend it; a lost admin
+/// key is recovered with the CLI on the data tier); a merely claimed
+/// admin gets a typed 403 and a durable `deny` row, and nothing is changed.
+/// The gate reads the registry through the backend-neutral `load_enrolled`
+/// (the SAL on Postgres, `db::` on SQLite) and a store error refuses, so both
+/// backends decide alike.
+///
+/// # Errors
+///
+/// Returns the typed 403 response for a claimed (unverified) admin.
+pub async fn require_key_bound_admin(
+    app: &AppState,
+    headers: &HeaderMap,
+    caller: &str,
+    agent_id: &str,
+    gate: &PrincipalGate,
+) -> Result<(), Response> {
+    // #3418 single-snapshot rule (REVIEW-8587-code-r1 L1): ONE registry view
+    // feeds both the auth level and the emptiness check below.
+    let snapshot = app.enrolled_agent_keys.snapshot();
+    let level =
+        crate::handlers::identity_binding::resolve_auth_level_in(&snapshot, headers, caller);
+    let mut header_trust_admits = false;
+    let mut reason = CLAIMED_ADMIN_REASON;
+    if !level.is_key_bound() && admin_header_trust_enabled() {
+        // #8574: the opt-in admits ONLY the arm where the registry is empty,
+        // and that is confirmed by an authoritative store read, never by the
+        // in-memory snapshot alone (a failed boot load installs an empty
+        // snapshot, and a CLI or peer-daemon enrollment is not in it until a
+        // refresh). A store error is an unknown state and refuses (fail closed).
+        reason = HEADER_TRUST_REFUSED_REASON;
+        if snapshot.is_empty() {
+            match crate::handlers::agent_api_key::load_enrolled(app).await {
+                Ok(rows) if rows.is_empty() => header_trust_admits = true,
+                // The store holds a key the snapshot has not seen: refuse.
+                Ok(_) => {}
+                Err(e) => {
+                    // Unknown registry state: refuse, and record the true
+                    // reason (not "enrolled") on the signed deny row.
+                    reason = HEADER_TRUST_UNREADABLE_REASON;
+                    tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        error = %e,
+                        "{ENV_ADMIN_HEADER_TRUST}: enrolled-key registry read failed; credential route refused (#8574)"
+                    );
+                }
+            }
+        }
+    }
+    if pubkey_bind_principal_admitted(level, header_trust_admits) {
+        return Ok(());
+    }
+    crate::governance::audit::record_decision(
+        caller,
+        "deny",
+        gate.action,
+        gate.issue_label,
+        crate::governance::audit::ForensicPayload::new()
+            .ident("agent_id", agent_id)
+            .label("reason", reason),
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": gate.required_msg})),
+    )
+        .into_response())
+}
+
 /// #3065 (Wave-2 Cluster B, cert-core) — resolved inputs to the certified-
 /// posture `ADMIN_HEADER_TRUST` identity boot-gate.
 ///

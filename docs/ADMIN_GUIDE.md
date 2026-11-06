@@ -1357,6 +1357,68 @@ resolution, and the daemon emits a boot WARN naming the flag. Set
 deployments that need the legacy trust-the-header posture. Every
 admin-role decision (allow or deny) lands in the forensic audit chain.
 
+**Key bootstrap needs a verified admin (#8494).** Binding an attestation
+public key is the root of every later signature check, so
+`POST /api/v1/agents/{id}/pubkey/challenge` and
+`PUT /api/v1/agents/{id}/pubkey` do not accept a CLAIMED admin header
+(the shared `api_key` plus `X-Agent-Id: <admin>`), in any
+`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` posture. They require either an
+admin that presents its own enrolled per-agent key (`X-API-Key` bound to that
+admin id; enrol it with `agents bind-api-key`), or the explicit operator
+opt-in `AI_MEMORY_ADMIN_HEADER_TRUST=1` while the enrolled registry is empty
+(#8574; an authoritative store read confirms emptiness, and a read error refuses).
+Once any per-agent key is enrolled, that opt-in cannot authorize a header claim
+to bind keys. A refusal returns 403, binds nothing, and records `bind_agent_pubkey`
+with the applicable principal/registry refusal reason in the forensic audit chain.
+
+#### SQLite and Postgres bootstrap (#8537)
+
+`ai-memory agents bind-key` is a
+local SQLite command; it does not bind a key in a Postgres-backed daemon.
+For Postgres, use a build with `sal,sal-postgres` and enrol an
+allowlisted admin's per-agent key in the daemon's own store:
+`ai-memory agents bind-api-key --agent-id <admin-id> --token-file <0600-token-file>`.
+Select that Postgres store with `AI_MEMORY_STORE_URL_FILE` pointing to a protected
+URL file; the verb also accepts `--store-url <postgres-url>`, but the file channel
+keeps credentials off argv. Wait for a successful daemon key-registry refresh
+(or restart if refresh is disabled), then authenticate as that admin with its
+enrolled `X-API-Key` for the HTTP challenge and proof-of-possession bind above.
+The MCP stdio local-operator path is unchanged.
+
+**Minting and revoking an api-key needs a verified admin (#8535).**
+`POST /api/v1/agents/{id}/api-key` and `POST /api/v1/agents/{id}/api-key/revoke`
+use the same principal gate as the pubkey bind above: a CLAIMED admin header
+(the shared `api_key` plus `X-Agent-Id: <admin>`) is refused with `403`,
+an `agent_api_key_mint` / `agent_api_key_revoke` row with reason
+`claimed_admin_not_key_authenticated` lands on the forensic audit chain, and no
+key is stored or removed. Without this a header claim could mint an admin's own
+per-agent key and so satisfy the bind gate. The route requires either an admin
+presenting its own enrolled per-agent key, or the explicit operator opt-in
+`AI_MEMORY_ADMIN_HEADER_TRUST=1`. **Bootstrapping the first admin key** (the
+supported path is the local-operator CLI on the data-tier host, which is
+ungated): write the token (at least 32 bytes) to an owner-only file and enrol it from that file.
+The CLI refuses a token on argv (`--token`, #3781) because argv is
+world-readable via `/proc/<pid>/cmdline`:
+
+```bash
+( umask 077; openssl rand -hex 32 > /etc/ai-memory/admin-key.token )
+ai-memory agents bind-api-key --agent-id <admin> \
+  --token-file /etc/ai-memory/admin-key.token
+```
+
+`AI_MEMORY_AGENT_API_KEY_FILE=/etc/ai-memory/admin-key.token` is the equivalent
+environment channel. The admin then presents the file's contents as `X-API-Key`.
+The alternative, **WARN-flagged and weaker**: start the daemon once with
+`AI_MEMORY_ADMIN_HEADER_TRUST=1` (the boot WARN names it), mint the key over
+HTTP, then unset the variable. The opt-in works only while this daemon's enrolled registry is empty (bootstrap, or after every key is revoked; emptiness is confirmed by an authoritative store read, and a store error refuses, recorded with reason `header_trust_refused_registry_unreadable`) (#8574): once ANY
+per-agent api key is enrolled, in every identity mode, the daemon IGNORES it on
+the four credential routes (`403` plus a deny row with reason
+`header_trust_refused_registry_enrolled`), so a header claim can never extend
+the registry that backstops it; a lost admin key is re-enrolled with the CLI on
+the data-tier host. Before the first key exists, any header claim passes these
+routes. A malformed `{id}` is a `400` before any audit row is written (#8536),
+on these routes and on the pubkey bind routes.
+
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
 
 ### Multi-User Warning
@@ -1418,17 +1480,19 @@ path, unchanged, and the one to reach for when the daemon is not going to be
 reconfigured:
 
 ```bash
-# sqlite data tier (run on the host holding the database file)
-ai-memory agents bind-api-key --agent-id svc-indexer --token "$TOKEN"
+# sqlite data tier (run on the host holding the database file). The token is
+# read from an owner-only (0600) file: a token on argv is refused (#3781).
+ai-memory agents bind-api-key --agent-id svc-indexer \
+  --token-file /etc/ai-memory/svc-indexer.token
 ai-memory agents revoke-api-key --agent-id svc-indexer
 
 # postgres data tier — prefer the AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE
 # channel over --store-url: a URL on argv is world-readable via /proc/<pid>/cmdline
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory agents bind-api-key \
-  --agent-id svc-indexer --token "$TOKEN"
+  --agent-id svc-indexer --token-file /etc/ai-memory/svc-indexer.token
 ```
 
-You generate the token; the CLI stores only its SHA-256 digest and never the
+You generate the token into that file; the CLI stores only its SHA-256 digest and never the
 token. Make it at least 32 bytes — the HTTP route refuses anything shorter, and
 a weaker secret is no better for being typed on a shell. Enrolment and
 revocation reach a RUNNING daemon within `AI_MEMORY_AGENT_KEY_REFRESH_SECS`
@@ -1617,17 +1681,27 @@ full-database read principal.
    with non-overlapping `--mtls-allowlist` files. The sync substrate
    does not enforce namespace-level tenancy across mTLS peers.
 
-**Roadmap to per-namespace / per-scope sync filtering.** Per-memory
-visibility filtering on `/sync/since` is a Phase 5 hub feature
-(post-v0.7.0, tracked under [#311](https://github.com/alphaonedev/ai-memory-mcp/issues/311)
-for the targeted-share variant and under [#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717)
-for cert-SAN agent-id attestation). v0.7.0 ships the mTLS full-trust
-model documented above as the canonical disposition for the
-`alphaonedev/ai-memory-mcp` v0.7.0 release line.
+**Shipped peer scope and sender controls.** `AI_MEMORY_FED_PEER_ATTESTATION`
+maps peer ids to `allowed_namespaces` for `/sync/since` and
+`allowed_sender_agent_ids` for `/sync/push`. Issues
+[#238](https://github.com/alphaonedev/ai-memory-mcp/issues/238) and
+[#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717) are closed;
+their v0.7 substrate disposition cites [PR #716](https://github.com/alphaonedev/ai-memory-mcp/pull/716).
+That closure does not mean certificate SAN extraction shipped.
 
-#### Body-claimed sender_agent_id is not yet attested (issue #238)
+#### Sender identity checks and certificate binding
 
-mTLS gates network access but the receiving handler accepts `sender_agent_id` from the body without checking it matches the cert's CN/SAN. A peer with a valid cert can claim any agent_id. Tracked as Layer 2b for v0.7.
+The receiver checks body `sender_agent_id` against `x-peer-id`: a different
+sender requires an exact `allowed_sender_agent_ids` entry for that peer.
+Missing headers and unauthorized mismatches return 403 unless the operator
+sets the explicit bypass `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`.
+To bind the header to the presented certificate, configure
+`AI_MEMORY_FED_CERT_PEER_BINDING_MAP` with certificate fingerprints and peer ids.
+`AI_MEMORY_FED_CERT_PEER_BINDING=off|warn|enforce` controls this separate check:
+`warn` is the Standard default and logs mismatches; `enforce` returns 401 for
+a mismatch, an unmapped certificate, or a missing header on the binding acceptor.
+Without that map/acceptor the certificate check is inert even in `enforce`.
+The binding uses the operator's fingerprint map, not the certificate CN or SAN.
 
 ### mTLS setup recipe
 
@@ -1664,6 +1738,33 @@ ai-memory sync-daemon --peers https://peer-b:9077 \
 ```
 
 A peer without an allowlisted cert is rejected at the **TLS handshake** — well before any HTTP request reaches the application.
+
+### mTLS client certificate to agent identity binding (v1.0.0, #8357)
+
+An allowlisted certificate on its own proves network access, not WHICH agent is calling: without a binding, a request can assert any `X-Agent-Id`. Bind each certificate to one agent id with a map file in the same format as `AI_MEMORY_FED_CERT_PEER_BINDING_MAP` (one `<sha256-hex> <agent-id>` per line, optional `sha256:` marker and `:` separators, `#` comments):
+
+```
+# client cert of the ingest agent
+sha256:25ab790783dbe969f994063db0412f1930e187e5e1e6c7d79bb76224a76b7bb7  ai:ingest@node-1
+```
+
+With `--check`, `serve` prints the parsed map as JSON and exits without starting:
+
+```bash
+export AI_MEMORY_MTLS_AGENT_BINDING_MAP=./agents.map
+ai-memory serve --tls-cert server.pem --tls-key server.key \
+  --mtls-allowlist ./peers.allow --check
+```
+
+- `AI_MEMORY_MTLS_AGENT_BINDING=off|warn|enforce` sets the posture. The default is `enforce` when the map is set and `off` when it is not, so an existing deployment with no map boots unchanged. An empty or unknown value refuses boot. An explicit `warn` or `enforce` with no map refuses boot (the operator asked for a binding that has nothing to bind).
+- `enforce`: a request whose `X-Agent-Id` differs from the certificate's agent is refused `403 agent_id_certificate_mismatch`. A request with no `X-Agent-Id` acts as the certificate's agent. An enrolled per-agent api key (#2044) for a different agent is refused the same way, with or without `X-Agent-Id`, whatever `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` says.
+- A certificate on `--mtls-allowlist` that is not in the map cannot claim an agent id the map binds to another certificate: under `enforce` that request is refused `403 agent_id_certificate_mismatch` on every route (audit actor `anonymous:cert-unmapped`). An unmapped certificate claiming an id the map does not bind keeps the claimed id (binding `claimed`), as before #8357.
+- `warn`: the request is served as the certificate's agent (the header is rewritten; a differing per-agent key does not win) and a warning is logged. An unmapped certificate claiming a bound id is served as claimed, with a `warn` audit row.
+- Every mismatch, in `enforce` and in `warn`, writes a forensic audit row (kind `mtls_agent_binding`, actor = the certificate's agent).
+- A matching request resolves with the authority binding `client_cert`, which counts as key-bound for the #2044 identity gate.
+- `/api/v1/sync/*`: the mTLS api-key bypass stays, but with a map the peer certificate must map to an agent (`403 agent_id_certificate_unmapped` under `enforce`), and that agent is the sync caller id. `X-Peer-Id` stays governed by `AI_MEMORY_FED_CERT_PEER_BINDING`.
+- Boot is refused for an empty map, a malformed line, a duplicate fingerprint, an invalid or reserved agent id (for example `daemon`), a mapped fingerprint that is not on `--mtls-allowlist`, and a map without `--mtls-allowlist` (plain TLS cannot present a client certificate).
+- mTLS with no map logs the boot warning "mTLS on, no agent binding map" and writes an audit row, so the unbound posture is visible.
 
 ### Data at Rest
 

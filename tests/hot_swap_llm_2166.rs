@@ -120,14 +120,14 @@ fn validate_before_swap_keeps_old_client_2166() {
     );
 
     // Inline `[llm].api_key` literal → rejected by validate_secret_handling.
-    let secret = dir.path().join("secret.toml");
+    let inlined_literal_cfg = dir.path().join("secret.toml");
     std::fs::write(
-        &secret,
+        &inlined_literal_cfg,
         "schema_version = 2\n[llm]\nbackend = \"openai\"\napi_key = \"sk-should-be-rejected\"\n",
     )
     .unwrap();
     assert!(
-        AppConfig::try_load_from(&secret).is_err(),
+        AppConfig::try_load_from(&inlined_literal_cfg).is_err(),
         "an inline api_key literal is rejected (never swapped in)"
     );
 

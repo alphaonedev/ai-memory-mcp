@@ -10,7 +10,7 @@ human record it anchors to.
 
 Read this before citing a green gate as evidence of anything.
 
-`cargo metadata` currently resolves **547** packages, of which **90** carry a
+`cargo metadata` currently resolves **551** packages, of which **90** carry a
 `custom-build` target. The gate walks that resolved graph and **fails closed on
 any build-script package with no record in the ledger**
 (`supply-chain/build-script-vetting.json`). The ledger is an allowlist that must
@@ -92,6 +92,21 @@ invalidates this record and fails the mechanical gate.
 
 Disposition: accepted documentation-only build helper under the exact pin.
 
+## `nix` 0.31.3 — `reviewed` (2026-11-02)
+
+- Cargo.lock checksum: `cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d`.
+- Reviewed registry files: `build.rs` and the build dependency declaration.
+- `build.rs` (35 lines) only expands the `cfg_aliases!` macro into rustc cfg
+  aliases and prints three `cargo:rustc-check-cfg` lines. It performs no
+  network access, process execution, filesystem access, environment-driven
+  code generation, unsafe operation, or writes outside Cargo directives.
+- Its sole build dependency is `cfg_aliases` 0.2.1. nix 0.31.3 arrives with
+  zip 9.2.2 through candle 0.11.1 (#8472).
+
+Disposition: accepted cfg-alias helper under the exact pin. Any checksum,
+custom-build-target, or build-dependency-closure change invalidates this
+record and fails the mechanical gate.
+
 ## `paste` 1.0.15 (`vendor/paste`) — `inventoried`, with an observation
 
 Recorded honestly as `inventoried` rather than `reviewed`, because the review is
@@ -144,3 +159,33 @@ that admits a new build script.
    `inventoried_ceiling` by one. Both edits are required, by design.
 4. Dependency additions require operator authorization (`CLAUDE.md`
    §"Dependencies"). This gate is where that requirement becomes mechanical.
+
+## Zstd family 8257
+
+2026-10-28: delta review for zstd-safe 8.2.0 and zstd-sys
+2.1.2+zstd.1.5.7, replacing 7.2.4 and 2.0.16+zstd.1.5.7 respectively.
+The ledger pins the exact new Cargo.lock checksums. Both entries remain
+`inventoried`; this records the dependency-update observations without
+claiming a full review of every optional build backend and its dependency
+closure. Two entries replace two entries; the inventoried ceiling remains 88.
+
+- zstd-safe's build.rs is byte-identical to 7.2.4 (SHA-256
+  `2342e59833e2ebca2980884d4f242a6bf1b0143037c212e05514626ad5213505`).
+- zstd-sys adds an opt-in cmake build backend, optional bindgen derive
+  preservation, a vendored/pkg-config selection condition,
+  `ZSTD_SYS_NO_HIDE_SYMBOLS`, target-aware MSVC visibility handling and
+  x86_64-only assembly selection. The resolved build uses only `std`;
+  cmake and bindgen are not enabled. Its resolved build dependencies remain
+  cc and pkg-config; the normal native-compiler invocation through cc remains.
+- Neither build.rs contains a direct `Command::new` call or network request.
+  This does not claim that native compilation runs without compiler processes.
+- All 95 previously bundled zstd files are byte-identical. The nine additions
+  are cmake files and the libzstd.pc.in template; the bundled C sources did
+  not change.
+- The three new zstd-family package manifests declare BSD-3-Clause. The
+  security review records this permissive licence as Apache-2.0 compatible.
+
+Evidence: PR #8276 security r1 and
+[the #8257 review finding](https://github.com/alphaonedev/ai-memory-mcp/issues/8257#issuecomment-6474100348).
+The builder independently compared both build scripts, the complete bundled
+file tree, the package manifests and the resolved feature set.

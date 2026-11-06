@@ -122,8 +122,9 @@ pub(crate) enum Observed {
     /// The row is quarantined: the caller runs the unchanged #2402 release.
     Quarantined,
     /// The row was contaminated and is now released to this state (written +
-    /// `swarm.decontaminate` appended; the caller commits, THEN warns).
-    Decontaminated(LifecycleState),
+    /// `swarm.decontaminate` appended; the caller commits, THEN warns). The
+    /// pending audit anchor of that append is emitted after the commit (#7241).
+    Decontaminated(LifecycleState, crate::governance::audit::PendingAuditAnchor),
     /// Absent, or neither contaminated nor quarantined: nothing was written.
     NotContained,
 }
@@ -185,8 +186,8 @@ pub(crate) fn observe_and_release_sqlite(
         now,
         Some(&cause),
     );
-    crate::signed_events::append_signed_event_no_tx(tx, &event)?;
-    Ok(Observed::Decontaminated(plan.target))
+    let anchor = crate::signed_events::append_signed_event_no_tx(tx, &event)?;
+    Ok(Observed::Decontaminated(plan.target, anchor))
 }
 
 /// `tracing` target of the operator route-OUT WARNs (#2402 release and the

@@ -615,3 +615,54 @@ fn encryption_off_path_is_unchanged_by_2383() {
         "#1784 authorship immutability is unaffected by the #2383 work"
     );
 }
+
+#[test]
+fn federation_title_slot_merge_snapshot_survives_encrypted_replay_4206() {
+    // #4206 under at-rest encryption: the pre-merge archive snapshot must hold
+    // the LOCAL row's sealed text, and a newer replay of the SAME plaintext
+    // (which re-seals to fresh envelope bytes) must not replace it — the
+    // won-and-changed decision compares plaintext, not ciphertext.
+    let _gate = EncryptGate::on();
+    let conn = fresh_conn();
+    let ns = "n4206-encrypted";
+    let local = make_mem("fed-4206", "local text A", ns, "local-agent-4206");
+    let id = db::insert(&conn, &local).expect("local insert");
+    let envelope_of = |table: &str| -> Option<Vec<u8>> {
+        conn.query_row(
+            &format!("SELECT encrypted_envelope FROM {table} WHERE id = ?1"),
+            params![id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
+    };
+    let local_envelope = envelope_of("memories").expect("local row is sealed");
+
+    let mut first = make_mem("fed-4206", "peer text B", ns, "peer-agent-4206");
+    first.updated_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(60))
+        .expect("future ts")
+        .to_rfc3339();
+    assert_eq!(db::insert_if_newer(&conn, &first).expect("merge 1"), id);
+    assert_eq!(
+        envelope_of("archived_memories").as_deref(),
+        Some(local_envelope.as_slice()),
+        "#4206: the archive snapshot holds the local row's sealed pre-merge text"
+    );
+
+    let mut replay = make_mem("fed-4206", "peer text B", ns, "peer-agent-4206");
+    replay.updated_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(120))
+        .expect("future ts")
+        .to_rfc3339();
+    assert_eq!(db::insert_if_newer(&conn, &replay).expect("merge 2"), id);
+    assert_eq!(
+        envelope_of("archived_memories").as_deref(),
+        Some(local_envelope.as_slice()),
+        "#4206: a same-plaintext replay (fresh envelope bytes) must not replace the snapshot"
+    );
+    assert_eq!(
+        db::get(&conn, &id).expect("readable").expect("row").content,
+        "peer text B"
+    );
+}

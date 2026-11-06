@@ -5,9 +5,9 @@ layout: doc
 
 **Evaluator:** Claude Opus 4.7 (1M context), 2026-05-25 evening session, fresh dispatch.
 **Tracking:** issue #1171; v1 sibling at `report-claude-opus-4-7.md` (read AFTER my report, see §J).
-**Worktree:** `/Users/fate/v07/v07-fixes/.local-runs/worktrees/opus-v2-eval` @ base SHA `1e33b51d63f6df879109604650b8c6220c6d12e2` (origin/release/v0.7.0 HEAD).
+**Worktree:** `<home>/v07/v07-fixes/.local-runs/worktrees/opus-v2-eval` @ base SHA `1e33b51d63f6df879109604650b8c6220c6d12e2` (origin/release/v0.7.0 HEAD).
 **Branch:** `eval/opus-4-7-v2-rerun`.
-**Isolated DB:** `.local-runs/v2-eval.db` (greenfield; the live `/Users/fate/.claude/ai-memory.db` was never touched).
+**Isolated DB:** `.local-runs/v2-eval.db` (greenfield; the live `<home>/.claude/ai-memory.db` was never touched).
 **Curator-LLM:** xAI Grok-4.3 via `https://api.x.ai/v1`, `AI_MEMORY_LLM_BACKEND=xai`. Direct connectivity probe HTTP 200; live curator round-trip verified through `memory_atomise` (10 atoms produced) and `memory_persona_generate` (two body_md generations with consecutive versions).
 
 ---
@@ -499,7 +499,7 @@ Similarly v1 did NOT run P10 persona_generate live, P11 skill promote_from_refle
 
 ---
 
-**Worktree:** `/Users/fate/v07/v07-fixes/.local-runs/worktrees/opus-v2-eval`
+**Worktree:** `<home>/v07/v07-fixes/.local-runs/worktrees/opus-v2-eval`
 **Base SHA:** `1e33b51d63f6df879109604650b8c6220c6d12e2`
 **Branch:** `eval/opus-4-7-v2-rerun`
 **Isolated DB:** `.local-runs/v2-eval.db` (704KB, 53 memories, 11 probe namespaces)

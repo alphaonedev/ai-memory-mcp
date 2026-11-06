@@ -1050,6 +1050,36 @@ impl std::fmt::Display for OwnText {
 
 impl std::error::Error for OwnText {}
 
+/// #4622 - the typed root a "reflection (or source member) is hidden or
+/// missing" refusal plants on an `anyhow` chain. Its `Display` is
+/// byte-identical to the text the chain carried before (`reflection not
+/// found: <id>`), so every text consumer (CLI, logs, the MCP wire message)
+/// is unchanged. The HTTP skill-promote route reads the TYPE by downcast to
+/// answer 404, instead of matching the words "not found" in the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectionNotFound {
+    reflection_id: String,
+}
+
+impl ReflectionNotFound {
+    /// Build the verdict keyed only to the requested reflection id, so a
+    /// hidden member and a missing one stay indistinguishable (#3551).
+    #[must_use]
+    pub fn new(reflection_id: impl Into<String>) -> Self {
+        Self {
+            reflection_id: reflection_id.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ReflectionNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reflection not found: {}", self.reflection_id)
+    }
+}
+
+impl std::error::Error for ReflectionNotFound {}
+
 impl From<anyhow::Error> for MemoryError {
     fn from(e: anyhow::Error) -> Self {
         // #3713 — a chain whose root was planted by `refusal` /
@@ -1059,6 +1089,12 @@ impl From<anyhow::Error> for MemoryError {
                 OwnText::Refusal(m) => Self::Refused(m.clone()),
                 OwnText::InvalidInput(m) => Self::ValidationFailed(m.clone()),
             };
+        }
+        // #4622 - a hidden or missing reflection / source member is our own
+        // typed root. It stays a refusal (JSON-RPC `REFUSED`, text unchanged)
+        // so the wire code does not move; the HTTP route reads the type.
+        if let Some(rnf) = e.downcast_ref::<ReflectionNotFound>() {
+            return Self::Refused(rnf.to_string());
         }
         // #3713 — the optimistic-concurrency conflict (`memory_update`'s
         // `expected_version`) is our own typed root; keep its text.

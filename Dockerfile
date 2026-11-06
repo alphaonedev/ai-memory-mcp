@@ -3,19 +3,15 @@
 # ---- Build stage ----
 # Pin to bookworm so the produced binary's glibc matches the runtime
 # stage (debian:bookworm-slim, glibc 2.36). Without the explicit
-# bookworm tag, rust:1.98-slim resolves to a trixie-based image
+# bookworm tag, rust:1.99-slim resolves to a trixie-based image
 # (glibc 2.41) and the binary fails at startup with
 # `version GLIBC_2.39 not found` — caught by the dockerfile-validate
 # CI job (PR #465 retrospective; v0.6.5 bake).
-# 1.98-slim-bookworm matches the rust-toolchain.toml dev/CI pin (1.98.0)
+# 1.99-slim-bookworm tracks the rust-toolchain.toml dev/CI pin (1.99.1)
 # so the shipped binary is built with the same compiler as CI.
-FROM rust:1.98-slim-bookworm AS builder
+FROM rust:1.99-slim-bookworm AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -70,20 +66,15 @@ RUN set -eu; \
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
 
-LABEL org.opencontainers.image.title="ai-memory" \
-      org.opencontainers.image.description="AI-agnostic persistent memory system — MCP server, HTTP API, and CLI" \
-      org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.source="https://github.com/alphaonedev/ai-memory-mcp" \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.vendor="AlphaOne LLC" \
-      io.modelcontextprotocol.server.name="io.github.alphaonedev/ai-memory"
+LABEL org.opencontainers.image.title="ai-memory"
+LABEL org.opencontainers.image.description="AI-agnostic persistent memory system — MCP server, HTTP API, and CLI"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.source="https://github.com/alphaonedev/ai-memory-mcp"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.vendor="AlphaOne LLC"
+LABEL io.modelcontextprotocol.server.name="io.github.alphaonedev/ai-memory"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system aimem \
-    && useradd --system --gid aimem --create-home aimem \
-    && mkdir -p /data && chown aimem:aimem /data
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && groupadd --system aimem && useradd --system --gid aimem --create-home aimem && mkdir -p /data && chown aimem:aimem /data
 
 COPY --from=builder /build/target/release/ai-memory /usr/local/bin/ai-memory
 

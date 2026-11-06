@@ -30,12 +30,14 @@
 
 use ai_memory::models::ConfidenceSource;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
-use ai_memory::background::atomise_worker::AtomiseQueue;
+use ai_memory::background::atomise_worker::{
+    ATOMISE_QUEUE_CAPACITY_DEFAULT, AtomiseQueue, resolve_queue_capacity,
+};
 use ai_memory::config::FeatureTier;
 use ai_memory::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_POLICY_DISABLED;
 use ai_memory::hooks::pre_store::{
@@ -69,17 +71,21 @@ struct MockState {
     /// Total `decompose` invocations (used by the test asserting
     /// "no atomisation happened").
     calls: usize,
+    /// `max_atom_tokens` of the most recent `decompose` call (#7215 r3
+    /// F-4): lets a cell assert the budget the deferred job carried.
+    last_max_atom_tokens: Option<u32>,
 }
 
 impl Curator for MockCurator {
     fn decompose(
         &self,
         _body: &str,
-        _max_atom_tokens: u32,
+        max_atom_tokens: u32,
         _max_retries: u32,
     ) -> Result<Vec<Atom>, CuratorError> {
         let mut s = self.state.lock().unwrap();
         s.calls += 1;
+        s.last_max_atom_tokens = Some(max_atom_tokens);
         if s.responses.is_empty() {
             return Err(CuratorError::MalformedResponse(
                 "mock: response queue exhausted".into(),
@@ -95,6 +101,7 @@ fn shared_state() -> Arc<Mutex<MockState>> {
         Arc::new(Mutex::new(MockState {
             responses: Vec::new(),
             calls: 0,
+            last_max_atom_tokens: None,
         }))
     })
     .clone()
@@ -169,11 +176,6 @@ fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     test_serial().lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Push a canned curator response onto the SUITE-WIDE queue.
-fn enqueue_atoms(texts: &[&str]) {
-    enqueue_atoms_into(&shared_state(), texts);
-}
-
 /// Push a canned curator response onto an EXPLICIT mock state — the
 /// suite-wide one, or a case-private one (see [`private_worker`]).
 fn enqueue_atoms_into(state: &Arc<Mutex<MockState>>, texts: &[&str]) {
@@ -192,6 +194,7 @@ fn reset_mock() {
     let mut s = arc.lock().unwrap();
     s.responses.clear();
     s.calls = 0;
+    s.last_max_atom_tokens = None;
 }
 
 /// Read the current mock call count.
@@ -250,7 +253,7 @@ fn wiring() -> AtomiseWiring<'static> {
 /// # Why this exists
 ///
 /// [`shared_queue`] is a process-lifetime `OnceLock`: its in-flight
-/// jobs can never be awaited, only guessed at. [`drain_workers`] guesses
+/// jobs can never be awaited, only guessed at. A drain helper guessed
 /// by watching the suite-wide call counter hold still for a wall-clock
 /// window — so on a saturated host a previous case's jobs are still
 /// running when that window expires, and their curator calls land AFTER
@@ -271,9 +274,78 @@ fn private_worker() -> (
     AtomiseQueue,
     std::thread::JoinHandle<()>,
 ) {
+    private_worker_gated(None)
+}
+
+/// Holds the worker's per-job atomiser resolution closed until the test
+/// opens it (#7215). The provider runs on the worker thread BEFORE any
+/// curator call, so a closed gate parks the consumer at the very top of
+/// a job: nothing the hook handed over can progress, and a hook that
+/// waited on the worker could never return. Opening is idempotent and
+/// also happens on drop, so a failing assertion never leaves the worker
+/// parked.
+#[derive(Clone)]
+struct ProviderGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl ProviderGate {
+    fn closed() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    fn open(&self) {
+        let (lock, cvar) = &*self.0;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
+
+    /// Block until opened; the bounded wait is a hang guard only
+    /// (CONCURRENCY-17), never the correctness condition.
+    fn wait_open(&self) {
+        let (lock, cvar) = &*self.0;
+        let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = cvar
+            .wait_timeout_while(guard, Duration::from_secs(120), |open| !*open)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+impl Drop for ProviderGate {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+/// Close the producer side and await full drain of the private worker.
+/// `drop(queue)` closes the channel; the consumer exits only after every
+/// buffered job has run, so completion does not depend on host speed.
+/// The 120 s bound is a hang guard, never the correctness condition.
+fn await_worker_drain(queue: AtomiseQueue, worker: std::thread::JoinHandle<()>) {
+    drop(queue);
+    let start = std::time::Instant::now();
+    while !worker.is_finished() {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "private atomise worker did not drain (hang guard)"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    worker.join().expect("private atomise worker joins");
+}
+
+/// [`private_worker`] with an optional [`ProviderGate`] the worker waits
+/// on before it resolves the atomiser for each job.
+fn private_worker_gated(
+    gate: Option<ProviderGate>,
+) -> (
+    Arc<Mutex<MockState>>,
+    Arc<Atomiser>,
+    AtomiseQueue,
+    std::thread::JoinHandle<()>,
+) {
     let state = Arc::new(Mutex::new(MockState {
         responses: Vec::new(),
         calls: 0,
+        last_max_atom_tokens: None,
     }));
     let atomiser = Arc::new(Atomiser::new(
         Box::new(MockCurator {
@@ -290,6 +362,9 @@ fn private_worker() -> (
     let provider = Arc::clone(&atomiser);
     let (queue, handle) =
         ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
+            if let Some(gate) = &gate {
+                gate.wait_open();
+            }
             Some(Arc::clone(&provider))
         }))
         .expect("private atomise worker spawns");
@@ -484,42 +559,6 @@ fn read_atomised_into(conn: &Connection, id: &str) -> Option<i64> {
     .unwrap_or(None)
 }
 
-/// Wait up to `timeout` for the predicate to return true. Poll
-/// interval 25ms. Returns whether the predicate became true within
-/// the budget.
-fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if predicate() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    predicate()
-}
-
-/// Drain inflight worker threads by waiting for the mock call count
-/// to stabilise. Prior tests may have spawned threads that are still
-/// chewing through the worker `100ms` sleep + curator call when the
-/// next test starts — those workers would consume the next test's
-/// queued responses and corrupt its assertions. We wait until the
-/// call count has been stable for `stable_for`.
-fn drain_workers(stable_for: Duration, total_timeout: Duration) {
-    let start = std::time::Instant::now();
-    let mut last = mock_call_count();
-    let mut stable_since = std::time::Instant::now();
-    while start.elapsed() < total_timeout {
-        std::thread::sleep(Duration::from_millis(50));
-        let now = mock_call_count();
-        if now != last {
-            last = now;
-            stable_since = std::time::Instant::now();
-        } else if stable_since.elapsed() >= stable_for {
-            return;
-        }
-    }
-}
-
 // ===========================================================================
 // Test 1 — auto_atomise disabled does nothing
 // ===========================================================================
@@ -610,30 +649,41 @@ fn test_auto_atomise_below_threshold_does_nothing() {
 #[test]
 fn test_auto_atomise_above_threshold_triggers() {
     let _g = test_guard();
-    let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    let _ = &db_path;
-    drain_workers(Duration::from_millis(300), Duration::from_secs(3));
-    reset_mock();
 
     let ns = format!("wt1d/above-{}", uuid::Uuid::new_v4().simple());
     seed_policy(&conn, &ns, opt_in_policy(500, 200));
 
+    // #7268 - the one cell that exercises the real background worker to
+    // completion. A case-private worker is drained by `join` (the
+    // substrate's own quiescence signal), so completion does not depend
+    // on host speed.
+    let (curator_state, atomiser, queue, worker) = private_worker();
+
     // Queue 5 atoms for the curator (matches the WT-1-B
     // [min=2, max=10] envelope).
-    enqueue_atoms(&[
-        "Atom one: canary instances must health-check before traffic shifts.",
-        "Atom two: pod readiness probes gate deploy rollout.",
-        "Atom three: failures roll back deployment within 30 seconds.",
-        "Atom four: operator dashboards track replica counts.",
-        "Atom five: operator dashboards track error rates.",
-    ]);
+    enqueue_atoms_into(
+        &curator_state,
+        &[
+            "Atom one: canary instances must health-check before traffic shifts.",
+            "Atom two: pod readiness probes gate deploy rollout.",
+            "Atom three: failures roll back deployment within 30 seconds.",
+            "Atom four: operator dashboards track replica counts.",
+            "Atom five: operator dashboards track error rates.",
+        ],
+    );
 
     let body = long_body(800);
     let mem = insert_memory(&conn, &ns, &body);
 
-    let outcome =
-        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
+    let outcome = maybe_enqueue_auto_atomise(
+        &conn,
+        shared_db_path(),
+        &mem,
+        &mem.id,
+        "ai:test",
+        AtomiseWiring::new(Some(&atomiser), Some(&queue)),
+    );
     match outcome {
         AutoAtomisationOutcome::Enqueued { ref memory_id, .. } => {
             assert_eq!(memory_id, &mem.id);
@@ -641,26 +691,17 @@ fn test_auto_atomise_above_threshold_triggers() {
         other => panic!("expected Enqueued, got {other:?}"),
     }
 
-    // Wait up to 3s for the worker thread to land (100ms initial
-    // sleep + DB open + curator + per-atom write).
-    // #3976 — a generous CEILING, not a delay: `wait_until` returns as soon
-    // as the worker has atomised the row. 3 s flaked under self-hosted
-    // runner load (2 of 4 attempts on PR #3931).
-    let ok = wait_until(Duration::from_secs(30), || {
-        read_atomised_into(&conn, &mem.id)
-            .map(|n| n > 0)
-            .unwrap_or(false)
-    });
-    assert!(
-        ok,
-        "expected source memory's atomised_into to be > 0 within 3s"
-    );
+    await_worker_drain(queue, worker);
     let atom_count = read_atomised_into(&conn, &mem.id).unwrap_or(0);
     assert!(
         atom_count >= 2,
         "expected at least 2 atoms minted (got {atom_count})"
     );
-    assert_eq!(mock_call_count(), 1, "curator must have been called once");
+    assert_eq!(
+        curator_state.lock().unwrap().calls,
+        1,
+        "curator must have been called once"
+    );
 }
 
 // ===========================================================================
@@ -670,51 +711,107 @@ fn test_auto_atomise_above_threshold_triggers() {
 #[test]
 fn test_auto_atomise_does_not_block_store_response() {
     let _g = test_guard();
-    let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    let _ = &db_path;
-    reset_mock();
 
-    // Namespace WITHOUT a policy → hook short-circuits.
+    // Namespace WITHOUT a policy -> hook short-circuits.
     let ns_off = format!("wt1d/lat-off-{}", uuid::Uuid::new_v4().simple());
-    // Namespace WITH opt-in policy → hook fires + enqueues.
+    // Namespace WITH opt-in policy -> hook fires + enqueues.
     let ns_on = format!("wt1d/lat-on-{}", uuid::Uuid::new_v4().simple());
     seed_policy(&conn, &ns_on, opt_in_policy(500, 200));
 
-    // Pre-queue several curator responses so the worker thread has
-    // something to do (we don't want to count empty-queue rejections
-    // toward the latency comparison).
-    for _ in 0..5 {
-        enqueue_atoms(&[
-            "Atom alpha: lorem ipsum.",
-            "Atom beta: dolor sit amet.",
-            "Atom gamma: consectetur adipiscing.",
-        ]);
+    // #7215 - blocking-independence proof, no wall-clock budget. A
+    // case-private worker is held CLOSED (its per-job atomiser
+    // resolution parks on the gate) for every on-path call, so a hook
+    // that waited on the worker or the curator could never return. Every
+    // call returning `Enqueued` while the gate is closed is the
+    // contract; it holds under any host load.
+    //
+    // Requirement: the resolved queue capacity
+    // (`resolve_queue_capacity`, env `AI_MEMORY_ATOMISE_QUEUE_CAPACITY`)
+    // must be >= CALLS - 1 while the gate is closed, because the parked
+    // worker holds one job and the queue buffer holds the rest. Unset, 0
+    // or garbage resolves to `ATOMISE_QUEUE_CAPACITY_DEFAULT` (256), which
+    // always satisfies it. A smaller capacity makes the hook report
+    // `skipped_queue_full`, a different contract, so the cell skips (the
+    // line shows under `--nocapture`). #7215 r3 F-5: the production
+    // resolver is the single source of truth, not a re-implementation.
+    const CALLS: usize = 5;
+    let capacity = resolve_queue_capacity();
+    if capacity < CALLS - 1 {
+        eprintln!(
+            "skipping #7215 cell: resolved queue capacity {capacity} is below CALLS - 1 ({}) \
+             needed while the worker gate is closed (default {ATOMISE_QUEUE_CAPACITY_DEFAULT})",
+            CALLS - 1
+        );
+        return;
     }
+    let gate = ProviderGate::closed();
+    let (curator_state, atomiser, queue, worker) = private_worker_gated(Some(gate.clone()));
+    for _ in 0..CALLS {
+        enqueue_atoms_into(
+            &curator_state,
+            &[
+                "Atom alpha: lorem ipsum.",
+                "Atom beta: dolor sit amet.",
+                "Atom gamma: consectetur adipiscing.",
+            ],
+        );
+    }
+    let private = AtomiseWiring::new(Some(&atomiser), Some(&queue));
 
     let body = long_body(800);
 
     // Warm-up to load the cl100k BPE table.
     let _ = db::count_tokens_cl100k(&body);
 
-    // Measure the "off" path: insert + hook (which short-circuits
-    // because no policy is configured).
+    // Off path: insert + hook (short-circuits because no policy is
+    // configured).
     let mut samples_off: Vec<Duration> = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..CALLS {
         let m = insert_memory(&conn, &ns_off, &body);
         let t0 = std::time::Instant::now();
-        let _ = maybe_enqueue_auto_atomise(&conn, shared_db_path(), &m, &m.id, "ai:test", wiring());
+        let _ = maybe_enqueue_auto_atomise(&conn, shared_db_path(), &m, &m.id, "ai:test", private);
         samples_off.push(t0.elapsed());
     }
 
-    // Measure the "on" path: insert + hook (which spawns a worker
-    // thread but MUST return synchronously).
+    // On path: insert + hook, with the worker gate CLOSED throughout.
+    // Loose hang guard only: a true stall fails fast instead of hanging
+    // CI. It is not a latency budget.
+    let loop_start = std::time::Instant::now();
     let mut samples_on: Vec<Duration> = Vec::new();
-    for _ in 0..5 {
+    let mut queued_ids: Vec<String> = Vec::new();
+    let mut queued_calls = 0usize;
+    for _ in 0..CALLS {
         let m = insert_memory(&conn, &ns_on, &body);
         let t0 = std::time::Instant::now();
-        let _ = maybe_enqueue_auto_atomise(&conn, shared_db_path(), &m, &m.id, "ai:test", wiring());
+        let outcome =
+            maybe_enqueue_auto_atomise(&conn, shared_db_path(), &m, &m.id, "ai:test", private);
         samples_on.push(t0.elapsed());
+        assert!(
+            matches!(outcome, AutoAtomisationOutcome::Enqueued { .. }),
+            "hook must hand the job to the worker and return while the worker is closed \
+             (needs AI_MEMORY_ATOMISE_QUEUE_CAPACITY >= CALLS - 1 while the gate is closed), got {outcome:?}"
+        );
+        queued_ids.push(m.id);
+        queued_calls += 1;
+        assert!(
+            loop_start.elapsed() < Duration::from_secs(5),
+            "on-path hook loop hung while the worker was closed"
+        );
+    }
+    // The worker has done NOTHING: every call returned without it.
+    assert_eq!(queued_calls, CALLS, "queued count must equal call count");
+    assert_eq!(
+        curator_state.lock().unwrap().calls,
+        0,
+        "no curator call may happen on the hook path while the worker is closed"
+    );
+    for id in &queued_ids {
+        assert_eq!(
+            read_atomised_into(&conn, id).unwrap_or(0),
+            0,
+            "no row may be atomised while the worker is closed"
+        );
     }
 
     fn median(xs: &mut [Duration]) -> Duration {
@@ -725,28 +822,10 @@ fn test_auto_atomise_does_not_block_store_response() {
     let m_off = median(&mut samples_off);
     let m_on = median(&mut samples_on);
 
-    // The brief specifies "within 5% of each other". CI hardware is
-    // noisy; we use a generous tolerance ceiling. The actual contract
-    // is "non-blocking" — the hook must return in the same order of
-    // magnitude regardless of whether it spawned a worker.
-    //
-    // We assert the on-path median is at most 10x the off-path
-    // median AND under 50ms absolute. Either condition would catch
-    // a regression where the hook accidentally blocks on the curator.
-    assert!(
-        m_on < Duration::from_millis(50),
-        "on-path median should be sub-50ms (was {m_on:?})"
-    );
-    // Both medians sub-millisecond is the expected steady state.
-    // Cluster-F PERF-1 eliminated the per-hook `db::open` round-trip,
-    // so the off-path median (no policy seeded → short-circuit) often
-    // lands at tens-of-microseconds while the on-path still has to
-    // resolve the namespace policy + spawn a worker thread. The 10x
-    // ratio bound only makes sense when the off-path is in the same
-    // order of magnitude as a worker-spawn (≥1ms); below that the
-    // ratio is dominated by sub-millisecond jitter, not by the hook's
-    // own work. The 50ms absolute ceiling above remains the
-    // load-bearing "non-blocking" assertion.
+    // Two in-process medians compared against each other: the ratio is
+    // load-independent. Below 1 ms the off path is dominated by
+    // sub-millisecond jitter (Cluster-F PERF-1 removed the per-hook
+    // `db::open`), so the ratio only applies above that.
     if m_off > Duration::from_millis(1) {
         let overhead_ratio_pct = m_on.as_nanos() * 100 / m_off.as_nanos().max(1);
         assert!(
@@ -755,10 +834,21 @@ fn test_auto_atomise_does_not_block_store_response() {
         );
     }
 
-    // Drain inflight worker threads so subsequent tests start from a
-    // quiet state — otherwise the 5 workers we just spawned would
-    // consume the next test's queued curator responses.
-    drain_workers(Duration::from_millis(500), Duration::from_secs(5));
+    // Open the gate: the worker now lands every queued job. Draining by
+    // join is deterministic, no deadline to lose under load.
+    gate.open();
+    await_worker_drain(queue, worker);
+    assert_eq!(
+        curator_state.lock().unwrap().calls,
+        CALLS,
+        "the worker must run the curator once per queued job after the gate opens"
+    );
+    for id in &queued_ids {
+        assert!(
+            read_atomised_into(&conn, id).unwrap_or(0) > 0,
+            "queued memory {id} must be atomised once the worker runs"
+        );
+    }
 }
 
 // ===========================================================================
@@ -768,44 +858,77 @@ fn test_auto_atomise_does_not_block_store_response() {
 #[test]
 fn test_auto_atomise_inheritance() {
     let _g = test_guard();
-    let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    let _ = &db_path;
-    drain_workers(Duration::from_millis(300), Duration::from_secs(3));
-    reset_mock();
 
     let parent = format!("wt1d-inh-{}", uuid::Uuid::new_v4().simple());
     let child = format!("{parent}/team");
 
     // Parent has opt-in policy; child has NO standard. The
-    // resolver walks leaf → root and picks up the parent's policy.
-    seed_policy(&conn, &parent, opt_in_policy(500, 200));
+    // resolver walks leaf -> root and picks up the parent's policy.
+    // Non-default budget (compiled default is 200) so the inherited value
+    // is observable.
+    seed_policy(&conn, &parent, opt_in_policy(500, 150));
 
-    enqueue_atoms(&[
-        "Inh atom one: parent policy resolved via ancestor walk.",
-        "Inh atom two: child writes inherit auto_atomise.",
-        "Inh atom three: leaf-first wins on conflict.",
-    ]);
+    // #7268 - completion, not the clock. The enqueued job lands through
+    // the real case-private worker and the cell waits on the worker's
+    // join, never on the clock. The job's own inherited budget (150)
+    // drives the split, and the row the hook named must be the row that
+    // is atomised.
+    let (curator_state, atomiser, queue, worker) = private_worker_gated(None);
+    enqueue_atoms_into(
+        &curator_state,
+        &[
+            "Inh atom one: parent policy resolved via ancestor walk.",
+            "Inh atom two: child writes inherit auto_atomise.",
+            "Inh atom three: leaf-first wins on conflict.",
+        ],
+    );
 
     let body = long_body(800);
     let mem = insert_memory(&conn, &child, &body);
 
-    let outcome =
-        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
+    let outcome = maybe_enqueue_auto_atomise(
+        &conn,
+        shared_db_path(),
+        &mem,
+        &mem.id,
+        "ai:test",
+        AtomiseWiring::new(Some(&atomiser), Some(&queue)),
+    );
     assert!(
         matches!(outcome, AutoAtomisationOutcome::Enqueued { .. }),
         "expected Enqueued via ancestor inheritance, got {outcome:?}"
     );
 
-    // #3976 — a generous CEILING, not a delay: `wait_until` returns as soon
-    // as the worker has atomised the row. 3 s flaked under self-hosted
-    // runner load (2 of 4 attempts on PR #3931).
-    let ok = wait_until(Duration::from_secs(30), || {
-        read_atomised_into(&conn, &mem.id)
-            .map(|n| n > 0)
-            .unwrap_or(false)
-    });
-    assert!(ok, "expected child memory to be atomised via parent policy");
+    // The child inherits the parent's resolved policy, including the
+    // non-default atom token budget the job carries.
+    let resolved = db::resolve_governance_policy_for_optional_feature(&conn, &child);
+    assert!(resolved.effective_auto_atomise());
+    assert_eq!(
+        resolved.effective_auto_atomise_max_atom_tokens(),
+        150,
+        "child must inherit the parent's non-default atom budget"
+    );
+
+    // Land the enqueued job through the real worker; join is the
+    // completion condition.
+    await_worker_drain(queue, worker);
+    assert!(
+        read_atomised_into(&conn, &mem.id).unwrap_or(0) > 0,
+        "expected child memory to be atomised via parent policy"
+    );
+    assert_eq!(
+        curator_state.lock().unwrap().calls,
+        1,
+        "curator must have been called once"
+    );
+    // #7215 r3 F-4: the budget the DEFERRED JOB carried reached the
+    // curator; the resolver assertion above proves only the resolver.
+    assert_eq!(
+        curator_state.lock().unwrap().last_max_atom_tokens,
+        Some(150),
+        "#7215/F-4: the enqueued job must carry the inherited atom budget (150) to the curator"
+    );
 }
 
 // ===========================================================================

@@ -121,7 +121,7 @@ pub fn run_deref(db_path: &Path, args: &DerefArgs, out: &mut CliOutput<'_>) -> R
     let conn = db::open(db_path).context("open db")?;
     let off = ContextOffloader::new(&conn, None, OffloadConfig::default());
     // SEC-4 (Cluster D) — operator CLI is the trusted-direct-ops path
-    // (see CLAUDE.md §"Agent Identity"); pass `None` to BYPASS the
+    // (see docs/reference/ARCHITECTURE_REFERENCE.md §"Agent Identity"); pass `None` to BYPASS the
     // per-agent ownership gate that the MCP handler enforces. The
     // operator can deref any blob in the local DB.
     let result = off.deref(&args.ref_id, None).context("deref failed")?;

@@ -70,7 +70,7 @@ scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BL
 
 - All ten checks must pass. CI will reject PRs that fail any of them.
   The six script/workflow gates are wired into `.github/workflows/c8-precheck.yml`
-  alongside the four cargo gates. See [CLAUDE.md §"Lint gates (issue #1174 PR10)"](CLAUDE.md)
+  alongside the four cargo gates. See [docs/reference/CODE_STYLE.md §"Lint gates (issue #1174 PR10)"](docs/reference/CODE_STYLE.md)
   for the full contract + allowlist policy.
 - `AI_MEMORY_NO_CONFIG=1` prevents loading `~/.config/ai-memory/config.toml` which may trigger embedder/LLM initialization.
 - New code must include tests. Bug fixes should include a regression test.
@@ -177,7 +177,7 @@ the standing thresholds-rise-NEVER-fall discipline.
 1. Fork the repository (external contributors) or branch directly (collaborators).
 2. Create a feature branch from `develop` (`git checkout develop && git checkout -b feature/my-change`).
 3. Make your changes, following the code style and testing guidelines above.
-4. Ensure all ten gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the six script/workflow gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh`) — see [CLAUDE.md §"Lint gates"](CLAUDE.md).
+4. Ensure all ten gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the six script/workflow gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh`) — see [CODE_STYLE.md §"Lint gates"](docs/reference/CODE_STYLE.md).
 5. Push your branch and open a pull request against `develop` (not `main`).
 6. Fill out the PR description with what changed and why.
 7. Address any review feedback.
@@ -225,6 +225,7 @@ The `main` branch is protected. The following rules are enforced:
 - **Single-authority merge (no independent approving review).** Under the operator's single-authority model, `@alphaonedev` — and the AI-NHI agents acting under it — authors and merges every PR, so GitHub's `required_approving_review_count` is `0`: there is no second account that could supply an approving review, and GitHub forbids self-approval. `.github/CODEOWNERS` (`* @alphaonedev`) is a routing/notification marker, **not** an enforced merge gate. Review is delivered by the three-layer model documented in [`docs/AI_DEVELOPER_GOVERNANCE.md`](docs/AI_DEVELOPER_GOVERNANCE.md) §5.0 (per-PR AI review + security audit, per-PR CI/`enforce_admins` enforcement, and the independent per-release operator review at tag-cut).
 - **CI must pass.** The `check` job in `.github/workflows/ci.yml` runs across a 2-OS matrix — `Check (ubuntu-latest)` and `Check (macos-latest)` — and both must succeed before merge. Those two matrix legs *are* the required-status-check set on `main`. The much larger set required on the release branch is declared — and mechanically verified against the workflows on every PR — in [`scripts/qc-allowlists/required-contexts-release.txt`](scripts/qc-allowlists/required-contexts-release.txt). [`.github/branch-protection.yml`](.github/branch-protection.yml) is **documentation only**: nothing reads or applies it, and it deliberately declares no check set (see #2443).
 - **Branch freshness is enforced, not review freshness.** `strict: true` requires a PR to be up to date with its base branch before merge. The "dismiss stale approvals" setting is inert under the single-authority model — no approving review is required, so none can become stale (see [`docs/AI_DEVELOPER_GOVERNANCE.md`](docs/AI_DEVELOPER_GOVERNANCE.md) §5.0).
+- **CHANGELOG.md conflicts are resolved by hand.** `CHANGELOG.md` has no union merge driver (removed in #8583: GitHub never honoured it, and the local union merges produced duplicated bullets). A clone whose `.git/info/attributes` still sets `CHANGELOG.md merge=union` must delete that line. Resolve a `CHANGELOG.md` conflict with the normal three-way markers, keeping every bullet exactly once, and before landing run `git merge-tree --write-tree <tip> <head>` (rc 0, no `CONFLICT` line) and `cargo test --test qual_changelog_no_duplicate_bullets`.
 - **Force pushes and branch deletion are blocked** on `main`.
 
 PRs to `develop` do not require owner approval but must pass CI (fmt, clippy pedantic, tests). Maintainers merge `develop` into `main` for releases.

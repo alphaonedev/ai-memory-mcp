@@ -8,6 +8,12 @@
 self-hosted-runner:
   labels:
     - ubuntu-24.04-arm
+    # `macos-15-intel` is a real GitHub-hosted x86_64 macOS runner label (the
+    # Intel leg of release.yml's x86_64-apple-darwin build), but actionlint
+    # 1.7.1's built-in label table predates it, so it is reported as an
+    # unknown `runner-label`. Like `ubuntu-24.04-arm` above, it is not a
+    # self-hosted runner; registering it here marks it known.
+    - macos-15-intel
     # v1.0.0 self-hosted CI (chore/ci-self-hosted-2x2). The enterprise-fed
     # runner fleet exposes two labels used alongside the built-in
     # `self-hosted` label: `linux-fed` (host pop-os/f2) and `macos-fed`

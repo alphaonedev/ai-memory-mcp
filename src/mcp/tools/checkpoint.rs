@@ -206,6 +206,19 @@ pub fn handle_checkpoint_resolve(
         })
         .ok_or_else(|| "state must be one of: resolved, rejected".to_string())?;
     let resolved_by = crate::mcp::param_guard::require_str(params, param_names::RESOLVED_BY)?;
+    // #3368 — shape-validate the resolver BEFORE any lookup, state change or
+    // audit emit. Pre-#3368 a control-character value (`"ai:x\nINJECTED"`)
+    // reached the persisted row, the signed audit row and the log line (the
+    // #3009 vector, closed for `claimed_by`). SHAPE ONLY, never a caller
+    // binding: on the `epoch_advance` lane `resolved_by` is the OPERATOR,
+    // authenticated by its detached signature against its enrolled key (the
+    // #3007 gate below), so it legitimately differs from the node's own
+    // `AI_MEMORY_AGENT_ID`; binding it here refused a valid operator-signed
+    // resolve (the regression pinned by
+    // `epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368`). Same shape-only precedent as
+    // `claimed_by` (#3009). Fail closed: any refusal returns here.
+    crate::validate::validate_agent_id(resolved_by)
+        .map_err(|e| format!("invalid agent_id: {e}"))?;
     let resolution = params.get(param_names::RESOLUTION).and_then(Value::as_str);
     let resolution_note = params
         .get(param_names::RESOLUTION_NOTE)
@@ -900,6 +913,116 @@ mod handler_tests {
         .expect("benign create ok");
     }
 
+    /// #3368 — a `resolved_by` carrying control characters / injected text is
+    /// REFUSED before any state change or audit emit; a clean id still
+    /// resolves (denied AND allowed path).
+    #[test]
+    fn resolve_refuses_malformed_resolved_by_3368() {
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let conn = fresh();
+        let created = handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "_cp", "title": "t", "created_by": "agent-a" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+        let audit_rows = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::CHECKPOINT_RESOLVE],
+                |r| r.get(0),
+            )
+            .expect("count audit rows")
+        };
+
+        // One byte over the 128-byte agent-id ceiling.
+        let long_id = "a".repeat(129);
+        for bad in [
+            "ai:x\nINJECTED",
+            "ai:x\r\nforged line",
+            "ai:x\u{0}nul",
+            "has spaces;DROP",
+            "../x",
+            "daemon",
+            "system",
+            long_id.as_str(),
+        ] {
+            let err = handle_checkpoint_resolve(
+                &conn,
+                &json!({ "id": id, "state": "resolved", "resolved_by": bad }),
+                None,
+            )
+            .expect_err("a malformed resolved_by must be refused");
+            assert!(err.contains("invalid agent_id"), "got: {err}");
+            let cp = crate::checkpoints::get(&conn, &id)
+                .expect("get ok")
+                .expect("row present");
+            assert_eq!(cp.state, crate::models::CheckpointState::Pending);
+            assert!(cp.resolved_by.is_none(), "no state change on refusal");
+            assert_eq!(audit_rows(&conn), 0, "no audit row on refusal");
+        }
+
+        // A bad resolver on an UNKNOWN id is refused as invalid input, not
+        // reported as "not found" (validation precedes the lookup).
+        let err = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": "no-such-id", "state": "resolved", "resolved_by": "ai:x\nINJECTED" }),
+            None,
+        )
+        .expect_err("malformed resolved_by on an unknown id is refused");
+        assert!(err.contains("invalid agent_id"), "got: {err}");
+
+        // Shape-only, not a caller binding: a differing enforced caller does
+        // not refuse a well-formed resolver on the legacy lane.
+        let _bound = crate::identity::test_agent_id::AgentIdOverride::set("ai:node");
+        let ok = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "ai:worker-1" }),
+            None,
+        )
+        .expect("a valid resolved_by still resolves");
+        assert_eq!(
+            ok["checkpoint"]["resolved_by"].as_str(),
+            Some("ai:worker-1")
+        );
+        assert_eq!(audit_rows(&conn), 1, "exactly one audit row on success");
+    }
+
+    /// #3368 — the pre-existing `require_str` trim stays in force: a padded
+    /// but otherwise valid resolver is stored trimmed (never with the padding),
+    /// and an all-whitespace one is refused as missing.
+    #[test]
+    fn resolve_trims_padded_resolved_by_3368() {
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let conn = fresh();
+        let created = handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "_cp", "title": "t", "created_by": "agent-a" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+        let err = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "   " }),
+            None,
+        )
+        .expect_err("blank resolved_by refused");
+        assert!(err.contains("resolved_by is required"), "got: {err}");
+        let ok = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "  ai:pad  " }),
+            None,
+        )
+        .expect("padded valid id resolves");
+        assert_eq!(ok["checkpoint"]["resolved_by"].as_str(), Some("ai:pad"));
+    }
+
     /// #1722 — resolving a checkpoint appends one
     /// `coordination.checkpoint_resolve` audit row attributed to the
     /// resolving agent; the append-only chain stays intact.
@@ -1121,9 +1244,9 @@ mod handler_tests {
     /// `resolved_by`'s enrolled operator key is accepted + signed (verify:true),
     /// attested to the operator (PeerAttested), never the daemon.
     #[test]
-    fn epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007() {
+    fn epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368() {
         if crate::config::run_env_isolated_child_or_spawn(
-            "mcp::checkpoint::handler_tests::epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007",
+            "mcp::checkpoint::handler_tests::epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368",
         ) {
             return;
         }
@@ -1138,60 +1261,72 @@ mod handler_tests {
             std::env::set_var(crate::identity::keypair::KEY_DIR_ENV, key_dir.path());
         }
 
-        let (conn, id, ns) = fresh_epoch_anchor();
-
         // Enroll the operator key (full keypair) so `lookup_peer_public_key`
         // finds its public half in the key dir; keep the in-memory handle to
         // sign with.
         let operator = crate::identity::keypair::generate("operator-x").expect("op key");
         crate::identity::keypair::save(&operator, key_dir.path()).expect("enroll operator key");
 
-        // Sign the EXACT canonical resolution bytes the handler will re-derive:
-        // reuse `SignableCheckpointResolution` + `sign_checkpoint_resolution`.
-        use base64::Engine as _;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let signed_at: i64 = 1_800_000_000;
-        let signable = crate::identity::sign::SignableCheckpointResolution {
-            checkpoint_id: &id,
-            namespace: &ns,
-            state: "resolved",
-            resolved_by: "operator-x",
-            resolution: Some("approved"),
-            resolved_at: signed_at,
-        };
-        let sig = crate::identity::sign::sign_checkpoint_resolution(&operator, &signable)
-            .expect("operator signs");
-        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
+        // #3368 — run the SAME operator-signed resolve under each enforced-caller
+        // posture. The operator (`resolved_by`) is authenticated by its detached
+        // signature, so it must be accepted whether the node has no enforced
+        // caller (`None`) or runs as a DIFFERENT principal (`ai:node`): the
+        // shape check on `resolved_by` must never bind it to the caller. The
+        // override is scoped to the resolve call only (the anchor is created
+        // as `attacker` before it, which a bound caller would refuse).
+        for caller in [None, Some("ai:node")] {
+            let (conn, id, ns) = fresh_epoch_anchor();
+            // Sign the EXACT canonical resolution bytes the handler will re-derive:
+            // reuse `SignableCheckpointResolution` + `sign_checkpoint_resolution`.
+            use base64::Engine as _;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let signed_at: i64 = 1_800_000_000;
+            let signable = crate::identity::sign::SignableCheckpointResolution {
+                checkpoint_id: &id,
+                namespace: &ns,
+                state: "resolved",
+                resolved_by: "operator-x",
+                resolution: Some("approved"),
+                resolved_at: signed_at,
+            };
+            let sig = crate::identity::sign::sign_checkpoint_resolution(&operator, &signable)
+                .expect("operator signs");
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
 
-        // A daemon key is ALSO available — the gate must sign with the OPERATOR
-        // attestation, not the daemon key.
-        let daemon_kp = crate::identity::keypair::generate("daemon").expect("daemon key");
-        let out = handle_checkpoint_resolve(
-            &conn,
-            &json!({ "id": id, "state": "resolved", "resolved_by": "operator-x",
-                     "resolution": "approved", "resolved_at": signed_at,
-                     "signature": sig_b64 }),
-            Some(&daemon_kp),
-        )
-        .expect("resolve ok");
-        assert_eq!(
-            out["attest_level"].as_str(),
-            Some(crate::models::AttestLevel::PeerAttested.as_str()),
-            "an enrolled-operator-signed epoch_advance resolution is operator-attested"
-        );
-        let stored = crate::checkpoints::get(&conn, &id)
-            .expect("get")
-            .expect("row");
-        assert!(!stored.signature.is_empty(), "operator signature persisted");
-        assert_eq!(
-            stored.resolver_pubkey,
-            operator.public.to_bytes().to_vec(),
-            "attested under the OPERATOR's enrolled key, never the daemon key"
-        );
-        assert!(
-            crate::checkpoints::verify(&stored),
-            "the operator-attested freeze anchor must verify"
-        );
+            // A daemon key is ALSO available — the gate must sign with the OPERATOR
+            // attestation, not the daemon key.
+            let daemon_kp = crate::identity::keypair::generate("daemon").expect("daemon key");
+            let _caller = match caller {
+                Some(c) => crate::identity::test_agent_id::AgentIdOverride::set(c),
+                None => crate::identity::test_agent_id::AgentIdOverride::unset(),
+            };
+            let out = handle_checkpoint_resolve(
+                &conn,
+                &json!({ "id": id, "state": "resolved", "resolved_by": "operator-x",
+                         "resolution": "approved", "resolved_at": signed_at,
+                         "signature": sig_b64 }),
+                Some(&daemon_kp),
+            )
+            .expect("resolve ok");
+            assert_eq!(
+                out["attest_level"].as_str(),
+                Some(crate::models::AttestLevel::PeerAttested.as_str()),
+                "an enrolled-operator-signed epoch_advance resolution is operator-attested"
+            );
+            let stored = crate::checkpoints::get(&conn, &id)
+                .expect("get")
+                .expect("row");
+            assert!(!stored.signature.is_empty(), "operator signature persisted");
+            assert_eq!(
+                stored.resolver_pubkey,
+                operator.public.to_bytes().to_vec(),
+                "attested under the OPERATOR's enrolled key, never the daemon key"
+            );
+            assert!(
+                crate::checkpoints::verify(&stored),
+                "the operator-attested freeze anchor must verify"
+            );
+        }
 
         unsafe {
             std::env::remove_var(

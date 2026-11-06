@@ -341,16 +341,13 @@ def test_pubkey_bind_percent_encodes_spiffe_agent_sync(
         return "candidate-proof"
 
     monkeypatch.setattr(sync_client_module, "sign_bind_challenge", fake_sign)
-    client = AiMemoryClient(base_url=TEST_BASE_URL)
-    client._client = httpx.Client(  # noqa: SLF001 - offline URL/PoP probe
-        base_url=TEST_BASE_URL, transport=_pubkey_bind_transport(seen)
-    )
-    try:
+    with AiMemoryClient(base_url=TEST_BASE_URL) as client:
+        client._client = httpx.Client(  # noqa: SLF001 - offline URL/PoP probe
+            base_url=TEST_BASE_URL, transport=_pubkey_bind_transport(seen)
+        )
         result = client.bind_agent_pubkey(
             "spiffe://example.org/ns/prod", _FakeSigningKey()  # type: ignore[arg-type]
         )
-    finally:
-        client.close()
 
     assert result["bound"] is True
     assert signed == [

@@ -347,7 +347,7 @@ fn related_to_between_reflections_does_not_propagate() {
     )
     .expect("link");
     let notified = resp["invalidation_notified"].as_array().unwrap();
-    assert!(notified.is_empty());
+    assert_eq!(notified.len(), 0);
 }
 
 /// MCP read tool returns empty for unknown ids and for reflections
@@ -367,7 +367,7 @@ fn dependents_of_invalidated_handles_unknown_and_zero_dependent_cases() {
     )
     .expect("zero deps");
     assert_eq!(zero["count"].as_u64(), Some(0));
-    assert!(zero["dependents"].as_array().unwrap().is_empty());
+    assert_eq!(zero["dependents"].as_array().unwrap().len(), 0);
 
     let unknown = ai_memory::mcp::dispatch_handle_dependents_for_test(
         &conn,

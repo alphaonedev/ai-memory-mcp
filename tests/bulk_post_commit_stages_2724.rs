@@ -21,6 +21,7 @@
 //! stages fire ONCE per DISTINCT persisted row and NEVER for a rejected /
 //! collapsed input row — the partial-failure honesty the North Star requires.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,6 +155,19 @@ fn db_row_count(db_path: &Path, namespace: &str) -> i64 {
         .expect("count")
 }
 
+/// The ids of the rows committed to `namespace` (#7395): the delivered ids
+/// must equal this set, not merely have the same count.
+fn db_committed_ids(db_path: &Path, namespace: &str) -> BTreeSet<String> {
+    let conn = Connection::open(db_path).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT id FROM memories WHERE namespace = ?1")
+        .expect("prepare");
+    stmt.query_map(params![namespace], |r| r.get::<_, String>(0))
+        .expect("query ids")
+        .collect::<Result<BTreeSet<String>, _>>()
+        .expect("collect ids")
+}
+
 /// Count `AuditAction::Store` NDJSON rows in the audit log whose target
 /// namespace matches `namespace`. Filtering by namespace makes the count
 /// robust against any other rows that share the process-global audit sink.
@@ -240,6 +254,8 @@ async fn bulk_emits_one_store_audit_row_per_persisted_row_2724() {
 /// webhook is invoked once per committed row and never for a rejected one.
 #[tokio::test]
 async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
+    pin_serial_dispatch();
+    let _cell = DISPATCH_CELL_LOCK.lock().await;
     // The receiver binds loopback; the SSRF guard rejects loopback by
     // default. #3705 — it serves TLS (every `http://` target is refused,
     // loopback included) and the dispatcher trusts the fixture leaf. The
@@ -290,24 +306,335 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
     assert_eq!(status, StatusCode::MULTI_STATUS, "{v}");
     assert_eq!(db_row_count(&db_path, ns), 3, "3 committed rows: {v}");
 
-    // Poll until the fire-and-forget deliveries land. Exactly 3 — one per
-    // committed row, zero for the rejected row.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut delivered = 0usize;
+    // #7320 - bounded wait on the DISTINCT dispatched-row count (never a
+    // single sample): exactly 3, one per committed row, zero for the rejected
+    // row (the settle inside the helper surfaces a spurious extra).
+    let seen = wait_for_dispatches(&server, 3).await;
+    let total_requests = server.received_count().await;
+    assert_eq!(
+        (seen.rows, seen.correlations),
+        (3, 3),
+        "#2724 F2: the subscriber must receive exactly one memory_store \
+         dispatch (one correlation id) per committed row (3), never for the \
+         rejected row ({seen:?}, {total_requests} requests): {v}"
+    );
+    // #7396 - no request was silently dropped from the summary.
+    assert!(
+        seen.malformed.is_empty(),
+        "#7396: every received request must be a well-formed dispatch; \
+         malformed (request index, body length): {:?}",
+        seen.malformed
+    );
+    // #7395 - the delivered ids ARE the committed ids, not just as many.
+    assert_eq!(
+        id_mismatch(&seen, &db_committed_ids(&db_path, ns)),
+        None,
+        "#7395: delivered memory_ids must equal the committed set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #7320 - the dispatch wait must cover the asynchronous delivery budget.
+// ---------------------------------------------------------------------------
+
+/// #7320 - webhook delivery is asynchronous relative to the committed rows
+/// (`dispatch_event_to_subs` spawns one bounded worker per subscriber). The
+/// wait on the receiver therefore cannot be a short fixed window: it is the
+/// product's worst-case budget for one delivery (every attempt timing out plus
+/// the retry backoffs) plus a margin for queueing behind other deliveries.
+const DISPATCH_WAIT_MARGIN: Duration = Duration::from_secs(10);
+
+/// Deliveries that can hold the single dispatch permit ahead of a cell's own
+/// rows: the previous cell's last delivery may still hold it after
+/// `DISPATCH_CELL_LOCK` is released (#7369).
+const LEFTOVER_DELIVERIES: usize = 1;
+
+/// Worst-case time for ONE delivery: every attempt times out plus the retry
+/// backoffs, `ACK_TIMEOUT * (RETRY_BACKOFFS.len() + 1) + sum(RETRY_BACKOFFS)`
+/// = 5 s * 4 + (0.2 + 1 + 5) s = 26.2 s.
+fn delivery_budget() -> Duration {
+    use ai_memory::subscriptions::{ACK_TIMEOUT, RETRY_BACKOFFS};
+    let attempts = u32::try_from(RETRY_BACKOFFS.len() + 1).expect("small attempt count");
+    ACK_TIMEOUT * attempts + RETRY_BACKOFFS.iter().sum::<Duration>()
+}
+
+/// Upper bound the wait loop honours (it returns as soon as the count is met).
+/// With `SERIAL_DISPATCH_PERMITS` = 1 the deliveries run one at a time, so the
+/// worst case is every one of `rows` plus `LEFTOVER_DELIVERIES` burning its
+/// whole budget in turn: `(rows + 1) * 26.2 s + DISPATCH_WAIT_MARGIN` (#7369),
+/// e.g. 4 rows = 5 * 26.2 + 10 = 141 s.
+fn dispatch_wait_window(rows: usize) -> Duration {
+    let serialised = u32::try_from(rows + LEFTOVER_DELIVERIES).expect("small row count");
+    delivery_budget() * serialised + DISPATCH_WAIT_MARGIN
+}
+
+/// Poll interval while waiting for deliveries to land.
+const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Settle time so a spurious extra delivery would surface after the count is met.
+const DISPATCH_SETTLE: Duration = Duration::from_millis(300);
+
+/// Serialised dispatch (one worker permit) used by the slow-receiver cell.
+const SERIAL_DISPATCH_PERMITS: usize = 1;
+
+/// Per-delivery ack delay for the slow-receiver cell: under one permit the
+/// k-th delivery reaches the receiver k * delay after the first, which pushes
+/// the later deliveries beyond the old fixed window while every one of them
+/// is still inside the product's own per-attempt ack budget.
+const SLOW_ACK_MARGIN: Duration = Duration::from_secs(1);
+
+/// Ack delay: `ACK_TIMEOUT` (which also covers the TLS handshake) minus
+/// `SLOW_ACK_MARGIN`, so the ack stays inside the attempt budget (#7370).
+const SLOW_ACK_DELAY: Duration =
+    ai_memory::subscriptions::ACK_TIMEOUT.saturating_sub(SLOW_ACK_MARGIN);
+
+/// Rows in the slow-receiver batch (the fourth arrives at ~3 * 4 s = 12 s).
+const SLOW_BATCH_ROWS: usize = 4;
+
+/// The dispatch semaphore is process-wide: with one permit a slow cell would
+/// starve a concurrent cell's deliveries, so the dispatch cells run one at a
+/// time. The lock does not drain the previous cell's last delivery, which can
+/// still hold the permit; `LEFTOVER_DELIVERIES` in the wait window covers it.
+static DISPATCH_CELL_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Pin the process-wide dispatch concurrency before any dispatch runs; the
+/// first caller wins, so every dispatch cell in this binary calls it.
+fn pin_serial_dispatch() {
+    let _ =
+        ai_memory::subscriptions::override_dispatch_concurrency_for_tests(SERIAL_DISPATCH_PERMITS);
+}
+
+/// What the receiver saw, reduced to the exactly-once invariant (#7367).
+#[derive(Debug, PartialEq, Eq)]
+struct DispatchSummary {
+    /// Distinct `memory_id`s delivered.
+    rows: usize,
+    /// Distinct `correlation_id`s delivered (a retry shares its id).
+    correlations: usize,
+    /// The distinct `memory_id`s themselves (#7395).
+    memory_ids: BTreeSet<String>,
+    /// Requests that lacked `memory_id` or `correlation_id`, or whose body was
+    /// not JSON (#7396), as (request index, body length). Must be empty: such
+    /// a request is never silently dropped.
+    malformed: Vec<(usize, usize)>,
+}
+
+/// One request the receiver saw, after classification (#7396).
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    /// A well-formed dispatch: `(memory_id, correlation_id)`.
+    Valid(String, String),
+    /// A request that is not a well-formed dispatch. Carries the request index
+    /// and body length only, never the body (it may hold row content).
+    Malformed { index: usize, body_len: usize },
+}
+
+/// Classify one received request body (#7396).
+fn classify_delivery(index: usize, body: &[u8]) -> Delivery {
+    let malformed = Delivery::Malformed {
+        index,
+        body_len: body.len(),
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return malformed;
+    };
+    let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    match (field("memory_id"), field("correlation_id")) {
+        (Some(m), Some(c)) => Delivery::Valid(m, c),
+        _ => malformed,
+    }
+}
+
+/// Describe how the delivered ids differ from the committed ids (#7395), or
+/// `None` when the two sets are equal. Never prints a body, only ids.
+fn id_mismatch(seen: &DispatchSummary, committed: &BTreeSet<String>) -> Option<String> {
+    if &seen.memory_ids == committed {
+        return None;
+    }
+    let missing: Vec<&String> = committed.difference(&seen.memory_ids).collect();
+    let foreign: Vec<&String> = seen.memory_ids.difference(committed).collect();
+    Some(format!(
+        "delivered ids differ from committed ids: committed but never delivered \
+         {missing:?}, delivered but not committed {foreign:?}"
+    ))
+}
+
+/// Reduce `(memory_id, correlation_id)` pairs to a [`DispatchSummary`].
+fn summarise_dispatches(deliveries: &[Delivery]) -> DispatchSummary {
+    let mut rows: BTreeSet<String> = BTreeSet::new();
+    let mut correlations: BTreeSet<&str> = BTreeSet::new();
+    let mut malformed: Vec<(usize, usize)> = Vec::new();
+    for d in deliveries {
+        match d {
+            Delivery::Valid(m, c) => {
+                rows.insert(m.clone());
+                correlations.insert(c.as_str());
+            }
+            Delivery::Malformed { index, body_len } => malformed.push((*index, *body_len)),
+        }
+    }
+    DispatchSummary {
+        rows: rows.len(),
+        correlations: correlations.len(),
+        memory_ids: rows,
+        malformed,
+    }
+}
+
+/// Classify every request the receiver saw; none is dropped (#7396).
+async fn received_deliveries(server: &common::tls_receiver::TlsReceiver) -> Vec<Delivery> {
+    let reqs = server.received_requests().await.unwrap_or_default();
+    reqs.iter()
+        .enumerate()
+        .map(|(i, r)| classify_delivery(i, &r.body))
+        .collect()
+}
+
+/// Wait (bounded) until `expected` distinct rows were dispatched, then settle
+/// and return the final summary.
+async fn wait_for_dispatches(
+    server: &common::tls_receiver::TlsReceiver,
+    expected: usize,
+) -> DispatchSummary {
+    let deadline = std::time::Instant::now() + dispatch_wait_window(expected);
     while std::time::Instant::now() < deadline {
-        delivered = server.received_requests().await.map_or(0, |r| r.len());
-        if delivered >= 3 {
+        if summarise_dispatches(&received_deliveries(server).await).rows >= expected {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
     }
-    // Small settle so a spurious 4th (e.g. from the rejected row) would surface.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let final_count = server.received_requests().await.map_or(0, |r| r.len());
+    tokio::time::sleep(DISPATCH_SETTLE).await;
+    summarise_dispatches(&received_deliveries(server).await)
+}
+
+/// #7367 - a second dispatch of one row (new correlation id) must be visible.
+#[test]
+fn duplicate_dispatch_of_one_row_is_detected_7367() {
+    let pair = |m: &str, c: &str| Delivery::Valid(m.to_owned(), c.to_owned());
+    let dup = [pair("m1", "c1"), pair("m2", "c2"), pair("m2", "c3")];
+    let dup_seen = summarise_dispatches(&dup);
     assert_eq!(
-        final_count, 3,
-        "#2724 F2: the subscriber must receive exactly one memory_store \
-         dispatch per committed row (3), never for the rejected row \
-         (observed {delivered} during poll, {final_count} final): {v}"
+        (dup_seen.rows, dup_seen.correlations),
+        (2, 3),
+        "a duplicate dispatch of m2 must add a correlation id"
+    );
+    // A retry of one delivery shares its correlation id: not a duplicate.
+    let retry = [pair("m1", "c1"), pair("m1", "c1")];
+    let retry_seen = summarise_dispatches(&retry);
+    assert_eq!((retry_seen.rows, retry_seen.correlations), (1, 1));
+}
+
+/// #7396 - a request without `memory_id`/`correlation_id`, or with an
+/// unparsable or empty body, is counted as malformed, never dropped.
+#[test]
+fn malformed_requests_are_counted_not_dropped_7396() {
+    const GOOD: &[u8] = br#"{"memory_id":"m1","correlation_id":"c1"}"#;
+    const NO_MEMORY_ID: &[u8] = br#"{"correlation_id":"c1"}"#;
+    const NO_CORRELATION_ID: &[u8] = br#"{"memory_id":"m1"}"#;
+    const NOT_JSON: &[u8] = b"not json";
+    const EMPTY: &[u8] = b"";
+    let bodies = [GOOD, NO_MEMORY_ID, NO_CORRELATION_ID, NOT_JSON, EMPTY];
+    let classified: Vec<Delivery> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, b)| classify_delivery(i, b))
+        .collect();
+    let seen = summarise_dispatches(&classified);
+    assert_eq!(
+        seen.malformed,
+        vec![(1, 23), (2, 18), (3, 8), (4, 0)],
+        "{seen:?}"
+    );
+    assert_eq!((seen.rows, seen.correlations), (1, 1));
+    assert_eq!(
+        classified[4],
+        Delivery::Malformed {
+            index: 4,
+            body_len: 0
+        }
+    );
+}
+
+/// #7395 - same counts, wrong ids: a foreign id plus a missing committed row
+/// keeps both counts at N and must still be reported.
+#[test]
+fn delivered_ids_must_equal_committed_ids_7395() {
+    let pair = |m: &str, c: &str| Delivery::Valid(m.to_owned(), c.to_owned());
+    let committed: BTreeSet<String> = ["m1", "m2"].iter().map(|m| (*m).to_owned()).collect();
+    let good = summarise_dispatches(&[pair("m1", "c1"), pair("m2", "c2")]);
+    assert_eq!(id_mismatch(&good, &committed), None);
+    let foreign = summarise_dispatches(&[pair("m1", "c1"), pair("m9", "c2")]);
+    assert_eq!((foreign.rows, foreign.correlations), (2, 2));
+    let why = id_mismatch(&foreign, &committed).expect("a foreign id must be reported");
+    assert!(why.contains("m9") && why.contains("m2"), "{why}");
+}
+
+/// #7320 - a slow (but within-budget) receiver delays later deliveries past
+/// the old fixed window; every committed row must still be dispatched.
+#[tokio::test]
+async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
+    pin_serial_dispatch();
+    let _cell = DISPATCH_CELL_LOCK.lock().await;
+    set_allow_loopback_webhooks(true);
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = common::tls_receiver::TlsReceiver::start_with(
+        tls,
+        common::tls_receiver::ack_echo_slow(SLOW_ACK_DELAY),
+    )
+    .await;
+
+    let (_dir, db_path) = fresh_db();
+    let hook_url = format!("{}/hook", server.uri());
+    {
+        let conn = Connection::open(&db_path).expect("open");
+        subscriptions::insert(
+            &conn,
+            &NewSubscription {
+                url: &hook_url,
+                events: "*",
+                secret: Some("bulk-7320-secret"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: None,
+                event_types: None,
+            },
+        )
+        .expect("insert subscription");
+    }
+
+    let router = build_router(&db_path);
+    let ns = "dispatch-7320";
+    let batch = Value::Array(
+        (0..SLOW_BATCH_ROWS)
+            .map(|i| row(ns, &format!("s{i}"), "slow"))
+            .collect(),
+    );
+    let (status, v) = post(&router, "/api/v1/memories/bulk", &batch).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        db_row_count(&db_path, ns),
+        i64::try_from(SLOW_BATCH_ROWS).unwrap(),
+        "all rows committed: {v}"
+    );
+
+    let seen = wait_for_dispatches(&server, SLOW_BATCH_ROWS).await;
+    assert_eq!(
+        (seen.rows, seen.correlations),
+        (SLOW_BATCH_ROWS, SLOW_BATCH_ROWS),
+        "#7320/#7367: every committed row must be dispatched exactly once to \
+         a slow receiver ({seen:?}, expected {SLOW_BATCH_ROWS}): {v}"
+    );
+    // #7396 - no request was silently dropped from the summary.
+    assert!(
+        seen.malformed.is_empty(),
+        "#7396: every received request must be a well-formed dispatch; \
+         malformed (request index, body length): {:?}",
+        seen.malformed
+    );
+    // #7395 - the delivered ids ARE the committed ids, not just as many.
+    assert_eq!(
+        id_mismatch(&seen, &db_committed_ids(&db_path, ns)),
+        None,
+        "#7395: delivered memory_ids must equal the committed set"
     );
 }

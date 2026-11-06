@@ -408,10 +408,12 @@ async fn policy_refuse_stale_vs_current() {
         let signing = kp.private.as_ref().expect("op private");
         let lock = db.lock().await;
         for _ in 0..3 {
+            // Autocommit connection: the append is committed on return (#7241).
             ai_memory::governance::policy_version::append_policy_advance_no_tx(
                 &lock.0, signing, "operator",
             )
-            .expect("advance policy");
+            .expect("advance policy")
+            .emit_after_commit();
         }
     }
     let sender = "ai:f53-stale-peer";

@@ -5,7 +5,7 @@ layout: doc
 
 This guide documents the CLI's main workflows and selected flags.
 `ai-memory <command> --help` is the complete generated flag inventory;
-the CLAUDE.md environment table is an index, with any omissions stated
+the docs/reference/ARCHITECTURE_REFERENCE.md environment table is an index, with any omissions stated
 explicitly. Some declared flags are deliberately not restated here —
 `--help` is authoritative for the full per-command set (#4240).
 
@@ -1439,6 +1439,18 @@ Walks the reflection-chain and writes Markdown to
 `~/.ai-memory/reflections/<ns>/<id>.md` by default. Pair with
 `auto_export_reflections_to_filesystem = true` for hands-off operation.
 
+On Unix, CLI and automatic reflection exports create plaintext files with mode
+0600 through a synced, same-directory staging file and atomic replacement of an
+existing regular file, refusing symlink and non-regular destinations; the parent
+directory is then synced, and a sync error is reported without removing the
+published file. The sweep runs once per destination directory per CLI run and
+once per auto-export call. The sweep removes regular `.private-export-*.stage` files whose
+modification time is older than one hour; files with a newer or future modification
+time are kept. Cleanup errors emit a warning and do not stop export.
+Non-Unix platforms refuse filesystem reflection export because the private-file
+and directory-sync guarantees are unsupported: the CLI returns an error, while
+auto-export logs a warning and writes nothing.
+
 ### `persona` — QW-2 persona-as-artifact
 
 Build a persona from observation-kind memories for a given entity.
@@ -1606,7 +1618,7 @@ default) — an anonymous principal is refused. **Both backends:** on a
 leg keeps the [#2572](https://github.com/alphaonedev/ai-memory-mcp/issues/2572)
 funnel, so a build without `sal` still REFUSES a Postgres store rather
 than phantom-write to a throwaway SQLite file. See the §"Agent Identity"
-durable-stamp posture in `CLAUDE.md` for why this precedes enabling
+durable-stamp posture in `docs/reference/ARCHITECTURE_REFERENCE.md` for why this precedes enabling
 enforced reads.
 
 ### `identity` — Ed25519 keypair management (H-track)

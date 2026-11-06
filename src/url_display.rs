@@ -37,15 +37,47 @@ const UNPARSEABLE: &str = "<unparseable>";
 /// path instead and never reaches this).
 const NO_HOST: &str = "<no host>";
 
-/// The scheme token of `url` (up to the first `://`), or [`NO_SCHEME`].
+/// Rendering of text that has a `://` but whose prefix is not a scheme
+/// (#6100). Echoes nothing.
+const UNPARSEABLE_STORE_URL: &str = "<unparseable-store-url>";
+/// Marker for a store URL whose authority is ambiguous (#6096): the
+/// userinfo holds an unencoded `/`, `?` or `#`, so the WHATWG parser ended
+/// the authority early and read the credential remainder as host, port or
+/// path. Nothing parsed from such a URL is safe to show.
+const REDACTED_AUTHORITY: &str = "<redacted-authority>";
+
+/// Longest scheme token [`scheme_token`] will echo.
+const MAX_SCHEME_LEN: usize = 32;
+
+/// `true` for an RFC 3986 scheme: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`,
+/// bounded to [`MAX_SCHEME_LEN`].
+fn is_rfc3986_scheme(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && token.len() <= MAX_SCHEME_LEN
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// The scheme token of `url` (up to the first `://`), [`NO_SCHEME`] when
+/// there is no `://`, or [`UNPARSEABLE_STORE_URL`] when the text before it
+/// is not an RFC 3986 scheme (#6100): a libpq key/value DSN with a URL-valued
+/// option (`host=db password=... sslrootcert=file://ca`) has its password
+/// before the first `://`.
 fn scheme_token(url: &str) -> &str {
-    url.trim().split_once("://").map_or(NO_SCHEME, |(s, _)| s)
+    match url.trim().split_once("://") {
+        None => NO_SCHEME,
+        Some((s, _)) if is_rfc3986_scheme(s) => s,
+        Some(_) => UNPARSEABLE_STORE_URL,
+    }
 }
 
 /// The rendering of a URL `reqwest::Url` refused: its scheme token and
 /// the [`UNPARSEABLE`] marker, never its bytes.
 fn unparseable(url: &str) -> String {
-    format!("{}://{UNPARSEABLE}", scheme_token(url))
+    match scheme_token(url) {
+        UNPARSEABLE_STORE_URL => UNPARSEABLE_STORE_URL.to_string(),
+        scheme => format!("{scheme}://{UNPARSEABLE}"),
+    }
 }
 
 /// `scheme://host[:port]` — the origin of `url` and nothing else. No
@@ -93,6 +125,33 @@ pub fn url_origin_and_path(url: &str) -> String {
     }
 }
 
+/// `true` when `url` PARSES to a URL whose path, query or fragment holds an
+/// `@` - the ambiguous-authority shape (#6096).
+///
+/// An unencoded `/`, `?` or `#` (or `\` on a special scheme) in the userinfo
+/// makes the WHATWG parser end the authority inside the credential, so the
+/// rest of the credential and the real `@host` land in the path, query or
+/// fragment, and the parsed host / port / path are credential bytes. The
+/// decision is made on the PARSED value, never on the raw text, because the
+/// parser first deletes tab / LF / CR, folds `\`, and accepts `http:` with no
+/// slashes: a raw-text scan is bypassed by each (ERRORS-09, one predicate).
+/// `@` stays literal in the path, query and fragment encode sets, so the
+/// parsed components are a faithful witness. It errs on the side of refusal:
+/// a literal `@` in a query value also trips it (percent-encode it), the
+/// cost being a less specific log line (ERRORS-01, fail closed).
+///
+/// Shared by [`store_url_display`] and the transit floor
+/// (`transit_encryption::dsn_transport`), so a DSN the renderer redacts is
+/// also one the floor refuses before any connection or DNS lookup.
+#[must_use]
+pub(crate) fn store_url_is_ambiguous(url: &str) -> bool {
+    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| {
+        parsed.path().contains('@')
+            || parsed.query().is_some_and(|q| q.contains('@'))
+            || parsed.fragment().is_some_and(|f| f.contains('@'))
+    })
+}
+
 /// A store URL (`--store-url`, `AI_MEMORY_STORE_URL[_FILE]`) for every
 /// human- and machine-readable sink: the boot `info!` line, doctor,
 /// `schema-init --json`, `migrate --json`, refusals.
@@ -104,6 +163,9 @@ pub fn url_origin_and_path(url: &str) -> String {
 ///   thing an operator needs to tell two stores apart and is not a
 ///   secret. The query string (`sslpassword=`, `sslkey=`, `options=`,
 ///   `password=`) and the userinfo are never rendered.
+/// - A URL whose authority is ambiguous (an unencoded `/`, `?` or `#` in the
+///   userinfo, #6096) renders `scheme://<redacted-authority>`: the parsed
+///   host, port and path of such a URL are credential bytes.
 #[must_use]
 pub fn store_url_display(url: &str) -> String {
     let trimmed = url.trim();
@@ -112,6 +174,9 @@ pub fn store_url_display(url: &str) -> String {
     }
     match reqwest::Url::parse(trimmed) {
         Ok(parsed) => {
+            if store_url_is_ambiguous(trimmed) {
+                return format!("{}://{REDACTED_AUTHORITY}", parsed.scheme());
+            }
             let mut out = url_origin(trimmed);
             // The database is the FIRST path segment; libpq allows nothing
             // deeper, so a longer path is simply not rendered.
@@ -267,6 +332,115 @@ mod tests {
         );
     }
 
+    /// #6096 — one DSN per (delimiter, position) shape: the unencoded
+    /// delimiter sits in the password (leading, numeric-prefixed) or in the
+    /// username, so the WHATWG authority ends inside the credential.
+    fn ambiguous_userinfo_dsns_6096() -> Vec<String> {
+        let mut out = Vec::new();
+        for d in ['/', '?', '#'] {
+            out.push(format!(
+                "postgres://svc:{d}SECRET6096pw@db.example:5432/mem"
+            ));
+            out.push(format!("postgres://svc:123{d}SECRET6096pw@db.example/mem"));
+            out.push(format!("postgres://svc{d}SECRET6096user:pw@db.example/mem"));
+        }
+        out
+    }
+
+    #[test]
+    fn store_url_redacts_an_ambiguous_authority_6096() {
+        for dsn in ambiguous_userinfo_dsns_6096() {
+            let r = store_url_display(&dsn);
+            assert!(
+                !r.contains("SECRET6096"),
+                "#6096: credential bytes reached the rendering of {dsn:?}: {r:?}"
+            );
+            assert_eq!(r, "postgres://<redacted-authority>", "{dsn:?}");
+        }
+    }
+
+    #[test]
+    fn store_url_keeps_well_formed_shapes_unchanged_6096() {
+        // Percent-encoded delimiters in the userinfo are well-formed: the
+        // host is still named and the credential is still absent.
+        for dsn in [
+            "postgres://svc:%2FSECRET6096pw@db.example:5432/mem",
+            "postgres://svc:123%3FSECRET6096pw@db.example:5432/mem",
+            "postgres://svc%23SECRET6096user:pw@db.example:5432/mem",
+            "postgres://svc:SECRET6096pw@db.example:5432/mem?sslmode=verify-full",
+        ] {
+            let r = store_url_display(dsn);
+            assert_eq!(r, "postgres://db.example:5432/mem", "{dsn:?}");
+            assert!(!r.contains("SECRET6096"), "{r:?}");
+        }
+        assert_eq!(
+            store_url_display("postgres://db.example/mem?sslmode=verify-full"),
+            "postgres://db.example/mem"
+        );
+        assert_eq!(
+            store_url_display("postgres://svc:pw@[::1]:5432/mem"),
+            "postgres://[::1]:5432/mem"
+        );
+    }
+
+    /// #6096 r2 - shapes the parser NORMALISES before the authority ends:
+    /// tab / LF / CR inside the scheme separator, secret-before-delimiter
+    /// (the parsed host is credential bytes), `\\` and missing slashes on a
+    /// special scheme.
+    fn normalised_ambiguous_dsns_6096() -> Vec<String> {
+        let mk = "SECRETX6096";
+        let mut out = vec![
+            format!("postgres:\t//svc:a@{mk}/x@db.example/mem?sslmode=verify-full"),
+            format!("postgres:/\n/svc:a@{mk}/x@db.example/mem?sslmode=verify-full"),
+            format!("postgres:/\r/svc:/{mk}pw@db.example/mem"),
+            format!("postgres:/\t/svc:/{mk}pw@db.example/mem"),
+            format!("postgres://svc:a@{mk}?x@db.example/mem"),
+            format!("postgres://svc:a@{mk}#x@db.example/mem"),
+            format!("postgres://{mk}user/x:pw@db.example/mem?sslmode=verify-full"),
+            format!("POSTGRES://svc:a@{mk}/x@db.example/mem"),
+            format!("postgresql://svc:a@{mk}/x@db.example/mem"),
+            format!("https://svc:a@{mk}\\x@db.example/mem"),
+            format!("https://svc:\\{mk}@db.example/mem"),
+            format!("http:svc:a@{mk}/x@db.example/mem"),
+            format!("postgres:/svc:/{mk}pw@db.example/mem"),
+        ];
+        out.push(format!("  postgres://svc:/{mk}@db.example/mem \n"));
+        out
+    }
+
+    #[test]
+    fn store_url_redacts_normalised_ambiguous_shapes_6096() {
+        for dsn in normalised_ambiguous_dsns_6096() {
+            let r = store_url_display(&dsn);
+            assert!(
+                !r.contains("SECRETX6096") && !r.to_ascii_lowercase().contains("secretx6096"),
+                "#6096: credential bytes reached the rendering of {dsn:?}: {r:?}"
+            );
+            assert!(r.ends_with("://<redacted-authority>"), "{dsn:?} -> {r:?}");
+            assert!(store_url_is_ambiguous(&dsn), "{dsn:?}");
+        }
+    }
+
+    #[test]
+    fn unparseable_never_echoes_a_non_scheme_prefix_6100() {
+        for bad in [
+            "host=db password=SECRETX6100 sslrootcert=file://ca",
+            "password=SECRETX6100://x",
+            "a b://x",
+            "1postgres://SECRETX6100",
+        ] {
+            for f in [url_origin, url_origin_and_path, store_url_display] {
+                let r = f(bad);
+                assert!(!r.contains("SECRETX6100"), "{bad:?} -> {r:?}");
+            }
+            assert_eq!(store_url_display(bad), UNPARSEABLE_STORE_URL, "{bad:?}");
+        }
+        assert_eq!(
+            store_url_display("host=db password=SECRETX6100"),
+            "<no scheme>://<unparseable>"
+        );
+    }
+
     #[test]
     fn sqlite_store_url_is_a_path_and_renders_verbatim_3711() {
         assert_eq!(
@@ -287,7 +461,10 @@ mod tests {
                 let r = f(bad);
                 assert_clean(&r);
                 assert!(
-                    r.contains(UNPARSEABLE) || r.contains(NO_HOST) || r.contains(NO_SCHEME),
+                    r.contains(UNPARSEABLE)
+                        || r.contains(NO_HOST)
+                        || r.contains(NO_SCHEME)
+                        || r.contains(UNPARSEABLE_STORE_URL),
                     "{r}"
                 );
             }

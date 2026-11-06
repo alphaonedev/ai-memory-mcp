@@ -291,7 +291,7 @@ fn screened_credentials_are_not_recoverable_from_cause_hash() {
                 ai_memory::secret_screen::screen(&args),
                 ai_memory::secret_screen::ScreenOutcome::Hit { .. }
             ),
-            "secret_screen must detect the planted credential: {secret}",
+            "secret_screen must detect the planted credential fixture",
         );
     }
 }

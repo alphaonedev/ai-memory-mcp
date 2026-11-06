@@ -172,7 +172,7 @@ fn store_sign_after_cli_bind_is_agent_attested_3409() {
         .unwrap();
     assert!(out.status.success(), "export-pub: {}", stderr(&out));
     let pubkey = stdout(&out).trim().to_string();
-    assert!(!pubkey.is_empty());
+    assert_ne!(pubkey, "");
     let out = command(root.path())
         .args([
             "agents",

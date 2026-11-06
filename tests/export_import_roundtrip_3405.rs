@@ -71,14 +71,42 @@ use std::path::Path;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
+// #7232 - the shared keystore sandbox: every CLI child below is pinned to it.
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 /// Exit code for "artifact written / rows applied, but INCOMPLETE" —
 /// deliberately distinct from 1 so an orchestrator can branch on it.
 const EXIT_INCOMPLETE: i32 = 3;
 
+/// The head sequence of the planted legacy watermark (#7230): the refusal
+/// must name exactly this `anchored_head`.
+const LEGACY_HEAD: i64 = 448;
+
+/// Directory name, beside the databases, of the per-test forensic sink.
+const SINK_DIR: &str = "audit-sink";
+
+/// The per-test forensic sink for databases under `db`'s directory (#7218).
+fn sink_dir(db: &Path) -> std::path::PathBuf {
+    db.parent()
+        .expect("db path has a parent directory")
+        .join(SINK_DIR)
+}
+
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
+    // #7218 - pin the forensic sink to the test's own directory. Without it the
+    // CLI resolves the HOST-shared default sink, and an unattributable
+    // (db_id-less, pre-#2955) watermark left there by any other process on the
+    // machine out-ranks the freshly imported chain, so the importer's
+    // fail-closed spine gate refuses a perfectly valid bundle. The outcome of a
+    // round-trip must not depend on what else ran on the host.
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+        .env("AI_MEMORY_AUDIT_DIR", sink_dir(db))
+        // #7232 - pin the keystore too: without it every ledger-writing call
+        // loads (or GENERATES) the invoking user's real host signing key.
+        .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())
         .args(["--db", db.to_str().expect("utf-8 db path")]);
     cmd
 }
@@ -180,9 +208,10 @@ fn import(db: &Path, payload: &str, extra: &[&str]) -> (i32, serde_json::Value, 
         .assert();
     let out = assert.get_output();
     let code = out.status.code().expect("import exits with a code");
-    let report: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("import --json emits a JSON report");
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!("import --json emits a JSON report (exit {code}, parse error {e}); stderr: {stderr}")
+    });
     (code, report, stderr)
 }
 
@@ -310,6 +339,204 @@ fn full_envelope_round_trips_a_store_with_tombstones_and_links_3405() {
         report["links_skipped_missing_endpoint"].as_u64(),
         Some(0),
         "a producer-side-consistent envelope leaves no unresolvable edge"
+    );
+}
+
+// ── 1b. #7218 - the spine gate stays fail-closed against a stale anchor ──
+
+/// Plant one forensic watermark row in `db`'s per-test sink. `db_id = None`
+/// is the legacy (pre-#2955) shape that cannot be attributed to any database.
+fn plant_watermark(db: &Path, head_sequence: i64, db_id: Option<&str>) {
+    let dir = sink_dir(db);
+    std::fs::create_dir_all(&dir).expect("create the per-test sink");
+    let mut payload = serde_json::json!({
+        "v": 1,
+        "head_sequence": head_sequence,
+        "head_canonical_hash": "ab".repeat(32),
+    });
+    if let Some(id) = db_id {
+        payload["db_id"] = serde_json::Value::String(id.to_string());
+    }
+    let row = serde_json::json!({
+        "ts": "2020-01-01T00:00:00Z",
+        "actor": "test",
+        "decision": "anchor",
+        "kind": "audit_watermark",
+        "rule_id": "",
+        "payload": payload,
+        "prev_hash": "",
+        "sig": "",
+    });
+    std::fs::write(dir.join("forensic-2020-01-01.jsonl"), format!("{row}\n"))
+        .expect("write the planted watermark");
+}
+
+/// Count the live memory rows in `db` (0 only when the file was never created).
+///
+/// #7229 - a failed count query PANICS with the query error. It used to be
+/// mapped to 0, so a wrong path, a locked database or a missing table read as
+/// "no row was applied" and the all-or-nothing assertions passed vacuously.
+fn memory_rows(db: &Path) -> i64 {
+    if !db.exists() {
+        return 0;
+    }
+    let conn = rusqlite::Connection::open(db)
+        .unwrap_or_else(|e| panic!("#7229 memory_rows: open {}: {e}", db.display()));
+    conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap_or_else(|e| panic!("#7229 memory_rows: count query on {}: {e}", db.display()))
+}
+
+/// #7229 - `memory_rows` on a database that opens cleanly but cannot answer
+/// the count (no `memories` table) must panic at the COUNT QUERY with the query
+/// error instead of returning 0. The fixture is a valid SQLite file, so the
+/// open branch is not the one that panics.
+#[test]
+#[should_panic(expected = "#7229 memory_rows: count query on")]
+fn memory_rows_panics_when_the_count_query_fails_7229() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("no_memories_table.db");
+    rusqlite::Connection::open(&db)
+        .expect("create a valid sqlite file")
+        .execute_batch("CREATE TABLE t(x)")
+        .expect("create an unrelated table");
+    let _ = memory_rows(&db);
+}
+
+/// #7232 - a ledger-writing CLI call must use the pinned sandbox key dir and
+/// leave NO key material under the caller's HOME.
+#[test]
+fn cli_children_use_the_sandboxed_key_dir_and_leave_home_clean_7232() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create scratch home");
+    let db = tmp.path().join("keys.db");
+    let probe_args = [
+        "--json",
+        "store",
+        "--title",
+        "key dir probe",
+        "--content",
+        "a ledger-writing call",
+        "--namespace",
+        "probe",
+        "--tier",
+        "long",
+    ];
+    // The probe under the shared pin: nothing may reach HOME.
+    ai_memory(&db)
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(probe_args)
+        .assert()
+        .success();
+
+    let is_key_file = |path: &Path| {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("priv" | "pub")
+        )
+    };
+    let mut leaked = Vec::new();
+    let mut stack = vec![home.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read scratch home") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if is_key_file(&path) {
+                leaked.push(path);
+            }
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "#7232: key material written outside the sandbox: {leaked:?}"
+    );
+    // Attributable positive half: the shared `pin()` sandbox is written by
+    // every cell, so a key found there says nothing about THIS call. Run the
+    // same probe against a key dir that only this call can populate; a probe
+    // that stopped signing leaves it empty.
+    let own_keys = tmp.path().join("own-keys");
+    key_dir_sandbox::mkdir_0700(&own_keys);
+    let own_db = tmp.path().join("own-keys.db");
+    ai_memory(&own_db)
+        .env("AI_MEMORY_KEY_DIR", &own_keys)
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(probe_args)
+        .assert()
+        .success();
+    let used_own_dir = std::fs::read_dir(&own_keys)
+        .expect("read this call's key dir")
+        .filter_map(Result::ok)
+        .any(|e| is_key_file(&e.path()));
+    assert!(
+        used_own_dir,
+        "#7232: the probe must create the host key in the key dir it was given, {}",
+        own_keys.display()
+    );
+}
+
+/// #7218 - a watermark that outranks the imported chain and cannot be
+/// attributed to a different database (legacy, no `db_id`) is still treated as
+/// tail-truncation evidence: the import is refused, loudly, with the reason on
+/// stderr, and NOTHING is applied. This pins the fail-closed posture so the
+/// hermetic sink in the round-trip test cannot be read as a relaxation.
+#[test]
+fn import_still_refuses_when_a_legacy_watermark_outranks_the_chain_7218() {
+    let tmp = TempDir::new().expect("tempdir");
+    let src = tmp.path().join("src.db");
+    let dst = tmp.path().join("dst.db");
+    let _ = seed_tombstoned_corpus(&src);
+    let (code, envelope, stderr) = export(&src, &["--full"]);
+    assert_eq!(code, 0, "export --full; {stderr}");
+    let payload = serde_json::to_string(&envelope).expect("re-serialize envelope");
+
+    plant_watermark(&dst, LEGACY_HEAD, None);
+    let assert = ai_memory(&dst)
+        .arg("--json")
+        .arg("import")
+        .write_stdin(payload)
+        .assert();
+    let out = assert.get_output();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the import must be refused");
+    assert!(
+        err.contains("REJECTED (fail-closed)") && err.contains("Detected"),
+        "the refusal names its reason, got: {err}"
+    );
+    // #7230 - pin the gate this test was written for: the refusal reason is
+    // the legacy watermark's head (#7218 was diagnosed from `anchored_head:
+    // 448`); a refusal for an unrelated reason must not satisfy this test. The
+    // trailing comma anchors the number (`Detected { anchored_head: 448, ..`),
+    // so a head such as 4480 does not match.
+    let expected = format!("anchored_head: {LEGACY_HEAD},");
+    assert!(
+        err.contains(&expected),
+        "#7230 / #7218: the refusal must name the planted legacy head \
+         `{expected}`, got: {err}"
+    );
+    assert_eq!(memory_rows(&dst), 0, "all-or-nothing: no row was applied");
+}
+
+/// #7218 - the #2955 per-database scoping holds: a watermark that names a
+/// DIFFERENT, identified database is a sibling's anchor and never convicts the
+/// imported chain.
+#[test]
+fn import_ignores_a_sibling_databases_watermark_7218() {
+    let tmp = TempDir::new().expect("tempdir");
+    let src = tmp.path().join("src.db");
+    let dst = tmp.path().join("dst.db");
+    let _ = seed_tombstoned_corpus(&src);
+    let (code, envelope, stderr) = export(&src, &["--full"]);
+    assert_eq!(code, 0, "export --full; {stderr}");
+    let payload = serde_json::to_string(&envelope).expect("re-serialize envelope");
+
+    plant_watermark(&dst, 448, Some(&"cd".repeat(32)));
+    let (code, report, stderr) = import(&dst, &payload, &[]);
+    assert_eq!(
+        code, 0,
+        "a sibling's watermark must not convict this chain; report={report}, stderr={stderr}"
     );
 }
 

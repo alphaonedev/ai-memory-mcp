@@ -4,7 +4,7 @@ title: Managed / non-superuser Postgres
 ---
 # Managed / non-superuser Postgres (CloudNativePG, RDS, Cloud SQL)
 
-ai-memory's Postgres adapter requires the **pgvector** extension (the certified enterprise-federation tier pins PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6). On managed Postgres the application account is usually **not a superuser**, and some images do not ship pgvector at all. This page explains exactly what happens, why, and the one-time step that makes it work.
+ai-memory's Postgres adapter requires the **pgvector** extension (the certified enterprise-federation tier pins PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7). On managed Postgres the application account is usually **not a superuser**, and some images do not ship pgvector at all. This page explains exactly what happens, why, and the one-time step that makes it work.
 
 ## The facts (verified live on the native tier, 2026-08-26)
 

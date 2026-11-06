@@ -119,14 +119,25 @@ pub async fn authority_layer(
     let header_trusted = super::admin_role::request_authn_configured()
         || super::admin_role::admin_header_trust_enabled();
 
-    let resolved = Authority::resolve_http(HttpAuthorityInputs {
-        header_agent_id: header_agent_id.as_deref(),
-        key_bound_principal: key_bound_principal.as_deref(),
-        identity_mode: state.app.http_identity_mode,
-        enrolled_keys_present: !enrolled.is_empty(),
-        admin_allowlist: &state.app.admin_agent_ids,
-        header_trusted,
-    });
+    // #8357 — the agent the presenting mTLS client certificate is bound to.
+    // `api_key_auth` (the outer layer) already refused or rewrote a
+    // differing `X-Agent-Id`, so a match here proves the principal.
+    let cert_bound: Option<String> = req
+        .extensions()
+        .get::<crate::mtls_agent_binding::ClientCertAgentBinding>()
+        .and_then(|b| b.effective_agent_id().map(str::to_string));
+
+    let resolved = Authority::resolve_http_with_cert(
+        HttpAuthorityInputs {
+            header_agent_id: header_agent_id.as_deref(),
+            key_bound_principal: key_bound_principal.as_deref(),
+            identity_mode: state.app.http_identity_mode,
+            enrolled_keys_present: !enrolled.is_empty(),
+            admin_allowlist: &state.app.admin_agent_ids,
+            header_trusted,
+        },
+        cert_bound.as_deref(),
+    );
 
     match resolved {
         Ok(authority) => {

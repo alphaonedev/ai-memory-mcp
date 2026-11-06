@@ -8,7 +8,7 @@ Three Phase 1 assessments, three Phase 2 attacks and three Phase 3 independent b
 
 | Source | Immutable assessment target | Access and evidence rule |
 |---|---|---|
-| **A — ai-memory** | `alphaonedev/ai-memory-mcp`, `release/v1.0.0`; code **a1403c742f9d590a08b6fd170deec5f50ca8e940** | CodeGraph index at `/home/fate_two/v07/v09-dev`, then `git -C /mnt/t9/v07/v09-dev show origin/release/v1.0.0:<path>`. The supplied release tip `6ca59b9324814ac32d9d14600a40b85f20ee8fda` adds only a review document; code citations use a1403c742. |
+| **A — ai-memory** | `alphaonedev/ai-memory-mcp`, `release/v1.0.0`; code **a1403c742f9d590a08b6fd170deec5f50ca8e940** | CodeGraph index at `<home>/v07/v09-dev`, then `git -C /mnt/t9/v07/v09-dev show origin/release/v1.0.0:<path>`. The supplied release tip `6ca59b9324814ac32d9d14600a40b85f20ee8fda` adds only a review document; code citations use a1403c742. |
 | **O — OpenViking** | `volcengine/OpenViking`, **a09a9d20a8e07d08973aee177802d00e08df29e6** | Source in `/mnt/t9/tmp/deputy/competitors/OpenViking`; checkout HEAD verified. “Latest” is the supplied pin description, not a continuing upstream claim. |
 
 Every A/O source link names its immutable commit and file:line. Executed branches and wiring receive credit; README claims, comments, reserved settings and documentation-only controls do not. Licenses and attribution files establish their own limited facts. The NSA mapping is a claim inventory checked against implementation. Earlier dossiers and the earlier 3×7 are context, not authority. The report style follows `docs/reviews`; its findings and votes come from this review.

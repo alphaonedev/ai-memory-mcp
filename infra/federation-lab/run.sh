@@ -3,8 +3,8 @@
 # infra/federation-lab/run.sh — the ai-memory v1.0.0 laptop federation lab.
 # =============================================================================
 # ONE command stands up a two-node ai-memory federation on your laptop with
-# mutual TLS, fingerprint-pinned peers, required agent attestation and 16 of
-# the 17 `asi-hard` posture knobs at their hard floor; loads a sample of the
+# mutual TLS, fingerprint-pinned peers, required agent attestation and every
+# `asi-hard` posture knob at its hard floor; loads a sample of the
 # synthetic corpus; and then PROVES the thing works by asserting both positives
 # (an attested write replicates across the mesh and is recallable at the
 # peer) and negatives (an unpinned client, a plaintext client and an unsigned
@@ -54,6 +54,8 @@ PORT_A="${PORT_A:-19481}"
 PORT_B="${PORT_B:-19482}"
 KEEP=0
 CAVEAT_PROBE=1
+PROBE_MUTATION=0
+POSTURE_SELFTEST=0
 
 usage() {
   cat <<'USAGE'
@@ -73,7 +75,10 @@ usage: run.sh [options]
   --port-a N          node A port (default 19481)
   --port-b N          node B port (default 19482)
   --keep              keep run/ (daemons are still stopped) for post-mortem
-  --no-caveat-probe   skip the asi-hard 17-knob cold-boot demonstration (#2942)
+  --no-caveat-probe   skip the asi-hard full-profile cold-boot probe (#2942, #4938)
+  --probe-mutation    lower AI_MEMORY_REQUIRE_ROLLBACK_CHECK below its floor inside the probe and
+                      require the probe to refuse for that knob (proves the probe can fail)
+  --posture-selftest  run only the posture drift-guard legs (names AND values; no daemons) and exit
   -h, --help          this text
 USAGE
 }
@@ -90,10 +95,17 @@ while [ $# -gt 0 ]; do
     --port-b)          PORT_B="$2"; shift 2 ;;
     --keep)            KEEP=1; shift ;;
     --no-caveat-probe) CAVEAT_PROBE=0; shift ;;
+    --probe-mutation)  PROBE_MUTATION=1; shift ;;
+    --posture-selftest) POSTURE_SELFTEST=1; shift ;;
     -h|--help)         usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+# --probe-mutation mutates the cold-boot probe; with the probe skipped it would silently run nothing.
+if [ "$PROBE_MUTATION" -eq 1 ] && [ "$CAVEAT_PROBE" -eq 0 ]; then
+  echo "--probe-mutation needs the cold-boot probe: it cannot be combined with --no-caveat-probe" >&2; exit 2
+fi
 
 # ── identities used throughout ─────────────────────────────────────────────
 AGENT_A="ai:lab-node-a"        # node A's federation identity
@@ -110,6 +122,11 @@ case "$CORPUS_NS" in
   *[!A-Za-z0-9_/:.@-]* | "")
     printf 'refusing unsafe --corpus-ns: %s\n' "$CORPUS_NS" >&2; exit 2 ;;
 esac
+
+if [ "$POSTURE_SELFTEST" -eq 1 ]; then
+  echo "posture drift-guard legs (#5078):"
+  lab_posture_selftest "$ROOT"; exit $?
+fi
 
 # Set the moment step 1 takes ownership of run/. Until then cleanup must not
 # delete it: a preflight abort (a busy port, a missing binary) would otherwise
@@ -161,8 +178,8 @@ for p in "$PORT_A" "$PORT_B"; do
   fi
 done
 
-# Posture drift guard: the lab's knob list must still be the SSOT's, minus the
-# one documented omission. A kit whose posture silently drifted from the code
+# Posture drift guard: the lab's knob list AND values must still be the SSOT's
+# (src/security_profile.rs::KNOBS). A kit whose posture silently drifted from the code
 # would be demonstrating a posture that no longer exists.
 drift="$(lab_posture_ssot_check "$ROOT")"; drift_rc=$?
 case "$drift_rc" in
@@ -184,6 +201,8 @@ info "nothing is written outside this directory: no /tmp, no \$HOME"
 ADB="$RUN/node-a/node.db"; BDB="$RUN/node-b/node.db"
 ALOG="$RUN/node-a/daemon.log"; BLOG="$RUN/node-b/daemon.log"
 KA="$RUN/node-a/keys"; KB="$RUN/node-b/keys"; KAUTH="$RUN/author-keys"
+# #3198: identity generate refuses a group- or world-writable key dir, so pin 0700 explicitly (the umask is the caller's).
+chmod 0700 "$KA" "$KB" "$KAUTH" "$RUN/governance"
 
 # tier = keyword. The lab proves federation, mTLS and attestation — none of
 # which need an embedder — so the nodes must not try to download or load one.
@@ -265,7 +284,8 @@ for DB in "$ADB" "$BDB"; do
   while [ "$attempt" -lt 3 ]; do
     attempt=$((attempt + 1))
     AI_MEMORY_NO_CONFIG=1 "$BIN" agents register --agent-id "$AUTHOR" --agent-type system --db "$DB" >/dev/null 2>&1
-    AI_MEMORY_NO_CONFIG=1 "$BIN" agents bind-key --agent-id "$AUTHOR" --pubkey "$AUTHOR_PUB" --db "$DB" >/dev/null 2>&1
+    # #3464: bind-key proves possession in-process from the local key store, so point it at the author key dir.
+    AI_MEMORY_KEY_DIR="$KAUTH" AI_MEMORY_NO_CONFIG=1 "$BIN" agents bind-key --agent-id "$AUTHOR" --pubkey "$AUTHOR_PUB" --db "$DB" >/dev/null 2>&1
     bound="$(bound_pubkey "$DB")"
     [ "$bound" = "$AUTHOR_PUB" ] && break
     warn "bind-key attempt $attempt on $label did not persist metadata.agent_pubkey (issue #2941) — retrying"
@@ -354,45 +374,62 @@ fi
 step "5 · asi-hard posture"
 # ===========================================================================
 lab_posture_render | tee "$RUN/evidence/posture.env" | sed 's/^/   /'
-info "$(lab_posture_count) of 17 pinned knobs at their hard floor."
-info "AI_MEMORY_SECURITY_PROFILE is deliberately NOT set — see README §asi-hard 16/17."
+info "$(lab_posture_count) pinned knobs at their hard floor."
+info "AI_MEMORY_SECURITY_PROFILE is deliberately NOT set (every knob is pinned directly) — see README §asi-hard."
 
 if [ "$CAVEAT_PROBE" -eq 1 ]; then
-  # DEMONSTRATE the caveat instead of asserting it: cold-boot a throwaway node
-  # under the FULL 17-knob profile and record what actually happens.
+  # PROVE the full profile cold-boots (#2942 fixed, #4938): boot a throwaway node
+  # under the FULL asi-hard profile and record what actually happens.
   PROBE="$RUN/evidence/caveat-asi-hard-coldboot.txt"
   PROBE_HOME="$RUN/probe-home"; mkdir -p "$PROBE_HOME/.config/ai-memory"
   printf 'schema_version = 2\ntier = "keyword"\n' > "$PROBE_HOME/.config/ai-memory/config.toml"
   PROBE_PORT="$((PORT_B + 1))"
   {
-    echo "# asi-hard 17/17 cold-boot probe on a FRESH database (issue #2942)"
+    echo "# asi-hard full-profile cold-boot probe on a FRESH database (issue #2942)"
     echo "# command: AI_MEMORY_SECURITY_PROFILE=asi-hard ai-memory serve --db <fresh> ..."
     echo
   } > "$PROBE"
   if ! lab_port_free "$PROBE_PORT"; then
-    no "caveat probe cannot run: port $PROBE_PORT is occupied, so a non-zero exit would prove nothing"
+    no "cold-boot probe cannot run: port $PROBE_PORT is occupied, so a non-zero exit would prove nothing"
   else
-    ( HOME="$PROBE_HOME" AI_MEMORY_SECURITY_PROFILE=asi-hard AI_MEMORY_KEY_DIR="$RUN/governance" \
+    # --probe-mutation lowers the rollback-check knob below its floor so the profile refuses the boot:
+    # the boot must then refuse naming that knob (the pin-and-refuse path), which proves the probe can fail.
+    PROBE_MUT=""
+    if [ "$PROBE_MUTATION" -eq 1 ]; then PROBE_MUT="0"; fi
+    # #3582: the profile refuses a federation config with no peer allowlist, so give the probe one;
+    # otherwise it would refuse for THAT reason and not for a knob under test.
+    ( export HOME="$PROBE_HOME" AI_MEMORY_SECURITY_PROFILE=asi-hard AI_MEMORY_KEY_DIR="$RUN/governance"
+      export AI_MEMORY_FED_PEER_ATTESTATION="{\"$AGENT_A\":{\"allowed_namespaces\":[\"$FED_NS\"]}}"
+      if [ -n "$PROBE_MUT" ]; then export AI_MEMORY_REQUIRE_ROLLBACK_CHECK="$PROBE_MUT"; fi
       timeout 60 "$BIN" serve --host 127.0.0.1 --port "$PROBE_PORT" --db "$RUN/probe.db" \
         --tls-cert "$OUT/server.crt" --tls-key "$OUT/server.key" \
         --mtls-allowlist "$OUT/allowlist.txt" ) >>"$PROBE" 2>&1
     PROBE_RC=$?
     echo "exit_code=$PROBE_RC" >> "$PROBE"
-    # A non-zero exit alone is NOT the proof — a bind failure, a missing cert
-    # or any unrelated fault also exits non-zero. The refusal has to be the ONE
-    # being documented, so the captured stderr must name the rollback check.
-    if [ "$PROBE_RC" -ne 0 ] && grep -qi "rollback" "$PROBE"; then
-      ok "caveat demonstrated: full 17-knob asi-hard cold boot on a fresh DB exited $PROBE_RC naming the rollback check (issue #2942) — evidence in run/evidence/caveat-asi-hard-coldboot.txt"
-      info "$(grep -iE 'rollback|refuse|fatal' "$PROBE" | tail -2 | sed 's/^/     /')"
-    elif [ "$PROBE_RC" -ne 0 ]; then
-      no "caveat probe exited $PROBE_RC but did NOT name the rollback check — that is a different failure, not #2942"
-      info "$(tail -3 "$PROBE" | sed 's/^/     /')"
+    # #4938: the proof is a node that actually came up. Neither a non-zero exit alone nor the word
+    # "rollback" proves anything: the profile prints an INFO pin line naming the knob on every boot,
+    # and a node that booted and was killed by `timeout` exits 124. A boot that REFUSES (#2942, or any
+    # other refusal) is a FAIL: the lab runs the full posture, so the full profile must cold-boot.
+    if grep -q "listening on" "$PROBE" && { [ "$PROBE_RC" -eq 124 ] || [ "$PROBE_RC" -eq 0 ]; }; then
+      if [ "$PROBE_MUTATION" -eq 1 ]; then
+        no "probe MUTATION NOT DETECTED: the node listened with AI_MEMORY_REQUIRE_ROLLBACK_CHECK=0 under the profile (exit $PROBE_RC)"
+      else
+        ok "full asi-hard cold boot on a fresh DB succeeded (listening, exit $PROBE_RC after the probe timeout) — evidence in run/evidence/caveat-asi-hard-coldboot.txt"
+      fi
     else
-      # Not a lab failure — it would mean #2942 was FIXED. Say so, loudly.
-      warn "the 17-knob asi-hard cold boot SUCCEEDED (exit 0)."
-      warn "  If you are on a build where #2942 is fixed, this kit's 16/17 posture and"
-      warn "  its README caveat are now STALE and should be updated to 17/17."
-      ok "caveat probe ran (exit 0 — #2942 appears fixed on this build; see the warning above)"
+      if [ "$PROBE_MUTATION" -eq 1 ]; then
+        # The mutation is detected only when the refusal names the lowered knob. Any other refusal
+        # (port, config, a different knob) proves nothing about this probe, and the profile's INFO
+        # pin line names the knob on every boot, so it is excluded.
+        if lab_probe_refusal_names_knob "$PROBE"; then
+          ok "probe mutation detected: the boot refused (exit $PROBE_RC) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK"
+        else
+          no "probe mutation inconclusive: the boot refused (exit $PROBE_RC) but not for the lowered rollback-check knob"
+        fi
+      else
+        no "full asi-hard cold boot on a fresh DB did NOT come up (exit $PROBE_RC): the lab runs this posture, so a refusal is a failure (#2942 regression or a new refusal)"
+      fi
+      info "$(grep -iE 'rollback|refuse|fatal' "$PROBE" | tail -2 | sed 's/^/     /')"
     fi
     rm -f "$RUN/probe.db"*
   fi
@@ -406,13 +443,16 @@ step "6 · launch the two-node mTLS federation"
 #   node-b :$PORT_B  server=peerB.crt  allowlist pins peerA's client cert
 # Each fans its writes to the other using its OWN cert as the outbound client
 # cert and verifies the peer's server cert against the shared CA.
-launch_node() { # <name> <port> <db> <keydir> <fedid> <homedir> <peerport> <servercert> <serverkey> <allowlist> <log>
-  local name="$1" port="$2" db="$3" keydir="$4" fedid="$5" home="$6" peer="$7" sc="$8" sk="$9" al="${10}" log="${11}"
+launch_node() { # <name> <port> <db> <keydir> <fedid> <homedir> <peerport> <servercert> <serverkey> <allowlist> <log> <peerfedid>
+  local name="$1" port="$2" db="$3" keydir="$4" fedid="$5" home="$6" peer="$7" sc="$8" sk="$9" al="${10}" log="${11}" peerfed="${12}"
   (
     lab_posture_export
     export HOME="$home"
     export AI_MEMORY_KEY_DIR="$keydir"
     export AI_MEMORY_FED_IDENTITY="$fedid"
+    # #3582: FED_REQUIRE_PUSH_NAMESPACE_SCOPE is pinned, so key enrollment alone grants no namespace
+    # scope: name the namespaces the peer may write.
+    export AI_MEMORY_FED_PEER_ATTESTATION="{\"$peerfed\":{\"allowed_namespaces\":[\"$FED_NS\",\"$CORPUS_NS\"]}}"
     export AI_MEMORY_WITNESS_KEY_DIR="$RUN/governance"
     export RUST_LOG="${RUST_LOG:-ai_memory=info,federation=debug}"
     exec "$BIN" serve --host 127.0.0.1 --port "$port" --db "$db" \
@@ -426,9 +466,9 @@ launch_node() { # <name> <port> <db> <keydir> <fedid> <homedir> <peerport> <serv
 }
 
 launch_node node-a "$PORT_A" "$ADB" "$KA" "$AGENT_A" "$RUN/node-a/home" "$PORT_B" \
-  "$OUT/peerA.crt" "$OUT/peerA.key" "$OUT/peerA.allowlist" "$ALOG"
+  "$OUT/peerA.crt" "$OUT/peerA.key" "$OUT/peerA.allowlist" "$ALOG" "$AGENT_B"
 launch_node node-b "$PORT_B" "$BDB" "$KB" "$AGENT_B" "$RUN/node-b/home" "$PORT_A" \
-  "$OUT/peerB.crt" "$OUT/peerB.key" "$OUT/peerB.allowlist" "$BLOG"
+  "$OUT/peerB.crt" "$OUT/peerB.key" "$OUT/peerB.allowlist" "$BLOG" "$AGENT_A"
 
 # peerB's cert is the client peerA trusts, and vice versa.
 CA_CLIENT=("$OUT/peerB.crt" "$OUT/peerB.key")
@@ -638,7 +678,7 @@ step "9 · run manifest"
   echo "host:           $(uname -srm)"
   echo "nodes:          node-a https://127.0.0.1:$PORT_A , node-b https://127.0.0.1:$PORT_B"
   echo "corpus:         $SEED_SRC_DESC (${LOADED:-0} rows in $CORPUS_NS)"
-  echo "posture:        $(lab_posture_count)/17 asi-hard knobs at hard floor; $LAB_POSTURE_OMITTED left at default (issue #$LAB_POSTURE_OMITTED_ISSUE)"
+  echo "posture:        $(lab_posture_count) asi-hard knobs at hard floor (every KNOBS row)"
   echo "result:         $LAB_PASS PASS / $LAB_FAIL FAIL"
 } > "$RUN/evidence/manifest.txt"
 cat "$RUN/evidence/manifest.txt" | sed 's/^/   /'

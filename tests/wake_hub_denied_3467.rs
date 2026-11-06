@@ -30,7 +30,7 @@ use ai_memory::wake_hub::limits::{MAX_FRAME_BYTES, MAX_ID_BYTES, MAX_TOPICS_PER_
 use ai_memory::wake_hub::{HubConfig, HubDeps};
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
-use wake_hub_harness::{Harness, TestVerifier};
+use wake_hub_harness::{Harness, TestVerifier, scaled_timing};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -506,11 +506,18 @@ async fn denied_a_full_queue_answers_507_to_the_sender() {
     let mut saw_507 = false;
     'flood: for _round in 0..200 {
         for _ in 0..50 {
-            sender.wake(&deaf_id, &big_row).await;
+            // Non-panicking (#7960, the #7951 shape): the hub may close a
+            // sender whose refusals pile up unread. Stop sending, then read.
+            if sender.try_wake(&deaf_id, &big_row).await.is_err() {
+                break;
+            }
         }
         // Interleave reads so the sender's own error queue cannot fill.
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(50), sender.read_frame()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            scaled_timing(Duration::from_millis(50)),
+            sender.read_frame(),
+        )
+        .await
         {
             if frame.kind == Kind::Error {
                 let (code, _) = decode_error(&frame.payload).expect("error payload");
@@ -533,6 +540,28 @@ async fn denied_a_full_queue_answers_507_to_the_sender() {
         hub.metrics.snapshot(0).overflow >= 1,
         "the overflow must be counted"
     );
+
+    // #7956: a per-message 507 keeps the session open (Rule s). Drain what is
+    // queued, then a Ping must still be answered with a Pong.
+    while let Ok(Some(_)) = tokio::time::timeout(
+        scaled_timing(Duration::from_millis(50)),
+        sender.read_frame(),
+    )
+    .await
+    {}
+    sender
+        .send(Frame::new(Kind::Ping, sender_id.as_str(), "", Bytes::new()))
+        .await;
+    let pong = loop {
+        let frame = tokio::time::timeout(scaled_timing(Duration::from_secs(2)), sender.read_frame())
+            .await
+            .expect("the hub must answer a Ping after a 507, not hang up")
+            .expect("the hub closed the sender after a 507 (Rule s: a per-message refusal keeps the session)");
+        if frame.kind != Kind::Error {
+            break frame;
+        }
+    };
+    assert_eq!(pong.kind, Kind::Pong, "a 507 must not close the session");
 
     // ---- and the parked writer must not pin the connection slot ------------
     // The deaf peer's writer is now blocked in `write_all` (its receive buffer

@@ -112,9 +112,9 @@ To restore one:
 2. Check the dump against the checksum you recorded, from a copy of the checksum that the backup host could not have rewritten. `ai-memory` does not sign Postgres dumps, so this record is your trust anchor.
 3. Restore into the cluster, which must have the `age` and `vector` extensions installed at the versions the dump was taken with:
 
-   ```bash
-   pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
-   ```
+```bash
+pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
+```
 
 4. Start ONE daemon on a binary at least as new as the one that took the dump. A binary older than the restored schema refuses to open it ([#2445](https://github.com/alphaonedev/ai-memory-mcp/issues/2445)). Verify the data before starting the rest of the fleet.
 
@@ -215,7 +215,7 @@ Hooks (`pre_store`, `pre_delete`, `pre_governance_decision`, etc. — 22 lifecyc
 
 **Hub-spoke (team).** One PostgreSQL+AGE hub, N spoke agents pushing federated memories on a schedule. The hub is the source of truth for cross-agent recall; spokes hold their own local SQLite for offline work. mTLS allowlist on the hub names every spoke; spokes have an allowlist of one entry (the hub).
 
-**W-of-N federation.** Three or more peers, each holding its own SQLite, mesh-federating writes with a quorum commit requiring the local write plus W−1 peer acknowledgements within `--quorum-timeout-ms` before the write returns OK (per [`ADR-0001`](ADR-0001-quorum-replication.html); per-message Ed25519 signing rides on `AI_MEMORY_FED_REQUIRE_SIG`). Default 2000 ms assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 ms — the do-1461 reference deployment uses 8000 (#1565). Resolves the "any single operator can rewrite history" problem. Consistency is CRDT-based (last-writer-wins on the durable text, eventual convergence); there is no strict-consistency / MVCC federation mode at v1.0.0, and federation is not end-to-end encrypted ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) open) — peer traffic is protected by mTLS in transit, not E2E. The certified operating envelope is **500-1000 agents across ≤50 peers**, not internet-scale; the sizing table below is design guidance within that envelope.
+**W-of-N federation.** Three or more peers, each holding its own SQLite, mesh-federating writes with a quorum commit requiring the local write plus W−1 peer acknowledgements within `--quorum-timeout-ms` before the write returns OK (per [`ADR-0001`](ADR-0001-quorum-replication.html); per-message Ed25519 signing rides on `AI_MEMORY_FED_REQUIRE_SIG`). Default 2000 ms assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 ms — the do-1461 reference deployment uses 8000 (#1565). Resolves the "any single operator can rewrite history" problem. Consistency is CRDT-based (last-writer-wins on the durable text, eventual convergence); there is no strict-consistency / MVCC federation mode at v1.0.0, and peer traffic is protected by mTLS in transit. Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](https://github.com/alphaonedev/ai-memory-mcp/blob/release/v1.0.0/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262). The certified operating envelope is **500-1000 agents across ≤50 peers**, not internet-scale; the sizing table below is design guidance within that envelope.
 
 Sizing guide — **design envelopes, not measured figures.** The agent and
 memory counts below are topology guidance; no benchmark produces them and

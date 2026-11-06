@@ -606,7 +606,17 @@ ai-memory audit re-anchor
 
 ### `ai-memory logs tail [--follow]`
 
-Tail and (optionally) stream operational logs. Accepts the global
+Tail and (optionally) stream operational logs. `--follow` prints every
+line appended after the tail pass exactly once and survives log rotation:
+when a newer log file appears it drains the old one and continues with the
+new one, and a truncated file (shrunk, or rewritten so the bytes before the
+read position changed) or a replaced file (new inode, detected on unix only)
+is re-read from the start with a note on stderr. On platforms without inode
+identity a rename-and-recreate is detected by comparing the bytes before
+the read position with the file now at the path (a replacement whose bytes
+there are identical, or one seen before any byte was read, is not told
+apart). A newer log file that cannot be opened is reported once on stderr
+and the old file keeps being followed until the newer one is readable. Accepts the global
 `--log-dir <PATH>` override. See the **Log directory resolution**
 section above for the full precedence ladder.
 
@@ -674,7 +684,7 @@ logs:
     source: ai-memory-ops
 ```
 
-Pair with the [JSON parser]([https://docs.datadoghq.com/logs/log_configuration/parsing/](https://docs.datadoghq.com/logs/log_configuration/parsing/))
+Pair with the [JSON parser](https://docs.datadoghq.com/logs/log_configuration/parsing/)
 for the audit pipeline.
 
 ### Elastic Filebeat

@@ -7,7 +7,7 @@ Audit of the `ai-memory` clap CLI surface: the top-level `pub enum Command`
 in `src/daemon_runtime.rs`, its dispatch arms in `daemon_runtime::run`, the
 per-subcommand handler modules under `src/cli/`, and the subcommand-count
 SSOT constants in `src/lib.rs`. All `file:line` provenance is from the
-`release/v0.7.0` checkout at `/Users/fate/v07/v07-f5`.
+`release/v0.7.0` checkout at `<home>/v07/v07-f5`.
 
 ## 1. Counts — SSOT and feature-gating
 

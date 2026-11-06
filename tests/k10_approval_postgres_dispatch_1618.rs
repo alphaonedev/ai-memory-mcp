@@ -133,7 +133,7 @@ fn seed_pending_row_in_store(store_path: &std::path::Path, requested_by: &str) -
         source: "test".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
-        metadata: json!({}),
+        metadata: json!({"agent_id": requested_by}),
         version: 1,
         ..ai_memory::models::Memory::default()
     };
@@ -156,7 +156,13 @@ fn seed_pending_row_in_store(store_path: &std::path::Path, requested_by: &str) -
 
 fn signed_approval_request(pending_id: &str, body: &str) -> Request<Body> {
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let sig = common::sign_canonical_envelope(TEST_SECRET, &timestamp, "POST", pending_id, body);
+    let sig = common::sign_canonical_envelope(
+        TEST_SECRET,
+        &timestamp,
+        "POST",
+        &ai_memory::handlers::agent_api_key::approval_subject(pending_id, "operator-1"),
+        body,
+    );
     Request::builder()
         .method("POST")
         .uri(format!("/api/v1/approvals/{pending_id}"))
@@ -286,7 +292,10 @@ async fn approve_forever_is_refused_on_postgres_backend_3394() {
         .expect("get_pending_action")
         .expect("pending row exists in SAL store");
     assert_eq!(row.status, "pending");
-    assert!(ai_memory::approvals::list_synthetic_rules().is_empty());
+    assert_eq!(
+        ai_memory::approvals::list_synthetic_rules(),
+        [] as [ai_memory::approvals::SyntheticPermissionRule; 0]
+    );
     set_active_hooks_hmac_secret(None);
 }
 

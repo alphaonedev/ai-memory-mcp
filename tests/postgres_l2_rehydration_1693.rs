@@ -44,11 +44,16 @@ use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore};
 
-/// Two distinct user turns in the Claude-Code transcript shape.
-const TURN_A: &str = r#"{"timestamp":"2026-05-28T12:00:00Z","type":"user","message":{"content":[{"type":"text","text":"l2 parity directive alpha"}]}}"#;
-const TURN_B: &str = r#"{"timestamp":"2026-05-28T12:05:00Z","type":"user","message":{"content":[{"type":"text","text":"l2 parity directive beta"}]}}"#;
+/// One user turn in the Claude-Code transcript shape. `text` carries the
+/// per-run tag so the line sha256 (the global `transcript_line_dedup` key,
+/// which ignores namespace and agent) is unique per run (#7744).
+fn turn_line(timestamp: &str, text: &str) -> String {
+    format!(
+        r#"{{"timestamp":"{timestamp}","type":"user","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+    )
+}
 
-fn write_transcript(dir: &std::path::Path, lines: &[&str]) -> std::path::PathBuf {
+fn write_transcript(dir: &std::path::Path, lines: &[String]) -> std::path::PathBuf {
     use std::io::Write;
     let p = dir.join("session.jsonl");
     let mut f = std::fs::File::create(&p).unwrap();
@@ -121,7 +126,17 @@ async fn l2_rehydration_identical_on_sqlite_and_postgres_1693() {
     let agent_id = format!("ai:test:l2-{tag}");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let transcript = write_transcript(dir.path(), &[TURN_A, TURN_B]);
+    // #7744: the transcript lines embed the per-run tag; fixed lines hit the
+    // database-wide line dedup on every run after the first.
+    let turn_a = turn_line(
+        "2026-05-28T12:00:00Z",
+        &format!("l2 parity directive alpha {tag}"),
+    );
+    let turn_b = turn_line(
+        "2026-05-28T12:05:00Z",
+        &format!("l2 parity directive beta {tag}"),
+    );
+    let transcript = write_transcript(dir.path(), &[turn_a, turn_b]);
 
     // sqlite backend.
     let sqlite_db = dir.path().join("mem.db");

@@ -1,8 +1,8 @@
 # Independent assessment — BAML and PAW (ProgramAsWeights)
 
 **Assessor A** — emphasis: **licensing and supply chain**. 2026-09-19.
-Tree assessed: `/home/fate_two/v07/v09-dev` @ `8b4f65a22` (`release/v1.0.0`).
-Rust analysis grounded in the `rust-1.98` standard (`/home/fate_two/.claude/skills/rust-1.98/SKILL.md`); rules cited inline.
+Tree assessed: `<home>/v07/v09-dev` @ `8b4f65a22` (`release/v1.0.0`).
+Rust analysis grounded in the `rust-1.98` standard (`<home>/.claude/skills/rust-1.98/SKILL.md`); rules cited inline.
 Method: sources fetched directly; codegraph CLI for all code claims. Nothing installed, nothing downloaded, no third-party code run.
 
 ---
@@ -36,7 +36,7 @@ A DSL + compiler for typed LLM functions. Rust core under `engine/` (26 sub-crat
 | `engine/vendored/` | **NOT ESTABLISHED.** A vendored-third-party directory exists; I did not enumerate its contents or per-file licences. Flagging as an open item, not a defect. | directory listing only |
 | Boundary Studio (hosted) | **NOT ESTABLISHED.** No ToS or pricing page could be located; search returned only third-party review sites. Pricing for the cloud product is announced-but-unpriced. | web search, 2026-09-19 |
 
-**Verdict on licence: BAML the code is genuinely Apache-2.0 and compatible with our Apache-2.0 + NOTICE + CLA posture (`/home/fate_two/v07/v09-dev/LICENSE`, `/home/fate_two/v07/v09-dev/NOTICE`).** The licence is not the problem. The acquisition mechanism is.
+**Verdict on licence: BAML the code is genuinely Apache-2.0 and compatible with our Apache-2.0 + NOTICE + CLA posture (`<home>/v07/v09-dev/LICENSE`, `<home>/v07/v09-dev/NOTICE`).** The licence is not the problem. The acquisition mechanism is.
 
 ### 2.3 Supply chain — **the finding that decides this**
 
@@ -57,7 +57,7 @@ So: **adding `baml` to `Cargo.toml` with default features gives you a crate that
 
 1. **It is an egress lane that does not exist in our taxonomy.** `src/egress.rs:69` `EgressClass` enumerates exactly five lanes — `Webhook`, `Federation`, `ForensicExport`, `InferenceLlm`, `InferenceEmbedding` — and the doc comment asserts "the taxonomy is complete for audit / documentation purposes." A dylib fetch is a sixth lane, ungoverned by `evaluate_inference_egress`, invisible to the signed refusal row, and not covered by `AI_MEMORY_INFERENCE_EGRESS`. Under posture 2 (air-gapped, `deny`) per `/ai-scratch/conductor/handoff/3806-REQUIREMENTS.md` §2, the process would still try to fetch. That is a **non-fail-closed** path in a product whose egress resolver deliberately fails closed on a *typo* (`src/egress.rs:177` `resolve_inference_egress_mode` → `InferenceEgressMode::Deny` on an unrecognised token).
 2. **It defeats the SBOM.** `.github/workflows/release.yml:546` documents the CycloneDX SBOM as enumerating "every resolved dependency in Cargo.lock (name, version, purl, declared license)". A dylib acquired at runtime from GitHub releases appears in **no** `Cargo.lock` and therefore in **no** SBOM component list. The single largest unit of executable code in the integration would be the one unit the bill of materials does not mention.
-3. **It is the `vectorlite` plan-killer, verbatim.** `/home/fate_two/v07/v09-dev/Cargo.toml` already records the ruling for exactly this shape: an Apache-2.0 native library with no Rust crate "cannot be acquired reproducibly across the 3-OS CI matrix + 5 release channels, which is the plan-killer #1860 itself documents." `baml-sys` is the same problem with an auto-downloader bolted on. Disabling the downloader (`default-features = false`, or `BAML_LIBRARY_DISABLE_DOWNLOAD=true`) does not solve it — it returns you to #1860's unsolved acquisition problem across six platform targets.
+3. **It is the `vectorlite` plan-killer, verbatim.** `<home>/v07/v09-dev/Cargo.toml` already records the ruling for exactly this shape: an Apache-2.0 native library with no Rust crate "cannot be acquired reproducibly across the 3-OS CI matrix + 5 release channels, which is the plan-killer #1860 itself documents." `baml-sys` is the same problem with an auto-downloader bolted on. Disabling the downloader (`default-features = false`, or `BAML_LIBRARY_DISABLE_DOWNLOAD=true`) does not solve it — it returns you to #1860's unsolved acquisition problem across six platform targets.
 4. **Digest verification: partially established, and the documentation is worse than the code.** `baml-sys` declares `sha2` and `hex` as runtime dependencies, which strongly implies the downloader does verify a digest. But **the README documents no checksum step at all**, and I did not read the download implementation. Stated plainly: *I could not confirm whether the auto-downloaded dylib is digest-verified.* Given `src/inference/mod.rs:263` `verify_attested_weights` refuses to serve from a weight file whose SHA-256 does not match and **fails CLOSED when a signature is present but no operator key resolves** (#654), an undocumented verification story for a native code object is not acceptable without reading that code.
 5. **`links = "baml"` + documented global state in the dylib** means exactly one `baml-sys` version per process tree, forever. A future transitive dependency on a different major would be an unresolvable conflict.
 
@@ -142,7 +142,7 @@ Establishing the licence of each artefact separately, as instructed:
 | `programasweights.com` hosted API | **NO TERMS OF SERVICE, NO PRIVACY POLICY, NO ACCEPTABLE-USE POLICY located.** AGENTS.md states rate limits and `PAW_API_KEY` but **no licence statement and no data-retention or logging statement anywhere.** | AGENTS.md + site fetch + search |
 | `github.com/dynamder/paw-rs` (the Rust implementation) | **MIT** — but see §3.3, it is unaffiliated | crates.io + repo |
 
-**Seven of seven published model artefacts carry no licence.** Under the Hugging Face terms, content belongs to the uploader; absent an express grant, the default is ordinary copyright — **all rights reserved**. There is no licence to redistribute the adapters, no licence to redistribute the compiler, and arguably no licence to use them beyond what the Hub's own terms imply. For an Apache-2.0 project that publishes a CycloneDX SBOM with a `declared license` field per component (`.github/workflows/release.yml:546`), ships a `NOTICE`, and requires a CLA (`/home/fate_two/v07/v09-dev/CLA.md`), this is not a paperwork nit. It is the whole question, and the answer today is no.
+**Seven of seven published model artefacts carry no licence.** Under the Hugging Face terms, content belongs to the uploader; absent an express grant, the default is ordinary copyright — **all rights reserved**. There is no licence to redistribute the adapters, no licence to redistribute the compiler, and arguably no licence to use them beyond what the Hub's own terms imply. For an Apache-2.0 project that publishes a CycloneDX SBOM with a `declared license` field per component (`.github/workflows/release.yml:546`), ships a `NOTICE`, and requires a CLA (`<home>/v07/v09-dev/CLA.md`), this is not a paperwork nit. It is the whole question, and the answer today is no.
 
 **The permissive repository licence does not rescue this.** MIT on the Python SDK licenses the loader. It grants nothing over the weights the loader loads. This is precisely the trap the brief named.
 
@@ -169,7 +169,7 @@ The Rust crates on crates.io — `paw-rs`, `paw-core`, `paw-candle`, `paw-llamac
 - `paw-candle` **143 total downloads**, v0.3.0, last published **2026-07-22** — no release in ~2 months, and the entire version history (0.1.0 → 0.3.0) spans four days in July.
 - MIT licensed. No statement of affiliation with or endorsement by the PAW authors.
 
-This is a bus-factor-1, four-days-of-work, unaffiliated hobby crate. `paw-candle` being candle-based is the one genuinely attractive detail — it would in principle ride the candle 0.10 stack we already carry (`candle-core`/`candle-nn`/`candle-transformers` 0.10, `tokenizers` 0.22, `hf-hub` 0.5 in `/home/fate_two/v07/v09-dev/Cargo.toml:219-231`). But putting a 143-download single-maintainer crate on the path that decides whether a memory is a contradiction, or whether the curator merges, is not a defensible supply-chain posture at any scale, let alone the ASI scale the North Star describes.
+This is a bus-factor-1, four-days-of-work, unaffiliated hobby crate. `paw-candle` being candle-based is the one genuinely attractive detail — it would in principle ride the candle 0.10 stack we already carry (`candle-core`/`candle-nn`/`candle-transformers` 0.10, `tokenizers` 0.22, `hf-hub` 0.5 in `<home>/v07/v09-dev/Cargo.toml:219-231`). But putting a 143-download single-maintainer crate on the path that decides whether a memory is a contradiction, or whether the curator merges, is not a defensible supply-chain posture at any scale, let alone the ASI scale the North Star describes.
 
 ### 3.4 The hosted API — **a data-integrity and confidentiality finding**
 
@@ -181,7 +181,7 @@ Cross-referenced against AGENTS.md, which documents the endpoint `https://progra
 
 ### 3.5 ai-memory touchpoints — where PAW would land, and what it would break
 
-Established via codegraph at `/home/fate_two/v07/v09-dev`.
+Established via codegraph at `<home>/v07/v09-dev`.
 
 **First, a correction to the brief's starting points.** The `[decision]` provider slot of #3806 **has not landed on `release/v1.0.0` at `8b4f65a22`**. `git ls-files | grep -i decision` returns only `src/hooks/decision.rs` and `tests/pre_governance_decision_gate_2356.rs`. There is **no `src/decision.rs`, no `src/decision_config.rs`, no `src/decision_clients/`** in the tree. The slot exists as a ruling (`/ai-scratch/conductor/handoff/3806-REQUIREMENTS.md`), not as code. Any "where would it land" answer is therefore about the seams that *do* exist:
 
@@ -245,7 +245,7 @@ Both subjects surfaced the same gap on our side, and it is worth a line to the C
 ## 5. Method notes and limits
 
 - Nothing was installed, downloaded, vendored or executed. No project data, memory content or credential was sent anywhere.
-- Code claims were established with the codegraph CLI at `/home/fate_two/v07/v09-dev` (the MCP server failed to connect this session; the CLI at `/home/fate_two/.local/bin/codegraph` was used against the pinned release-dev index), confirmed with targeted grep where codegraph did not surface a literal.
+- Code claims were established with the codegraph CLI at `<home>/v07/v09-dev` (the MCP server failed to connect this session; the CLI at `<home>/.local/bin/codegraph` was used against the pinned release-dev index), confirmed with targeted grep where codegraph did not surface a literal.
 - **Explicitly not established:** the per-file licences under `engine/vendored/` in BAML; whether `baml-sys` digest-verifies its downloaded dylib (deps suggest yes, docs say nothing, source unread); Boundary Studio's terms and pricing; the existence of any PAW terms of service.
 - **Correction offered to the brief:** no 64 KiB cap exists on the `/metrics` renderer at `8b4f65a22` (`src/metrics.rs:1418`); and the #3806 `[decision]` files named as starting points are not in the tree at this commit.
 - **Correction offered to the operator:** a PAW Rust implementation exists but is **not first-party** — `github.com/dynamder/paw-rs`, self-described "Unofficial", 2 stars.
@@ -333,4 +333,4 @@ If BAML v1 is binding a named vendor model into the language or runtime, then BA
 
 ### 6.7 Note on the codegraph correction
 
-Acknowledged, and it makes no difference to the findings: `/home/fate_two/v07/v09-dev` and `/mnt/t9/v07/v09-dev` are **the same directory** — `readlink -f` resolves the former to the latter and `stat` confirms an identical device:inode pair (`2049:73675137`) for `Cargo.toml` on both paths. Every codegraph result in this report was produced by the shell CLI (`/home/fate_two/.local/bin/codegraph`) against that one tree at `8b4f65a22`. The MCP transport was not used and nothing was blocked by its absence.
+Acknowledged, and it makes no difference to the findings: `<home>/v07/v09-dev` and `/mnt/t9/v07/v09-dev` are **the same directory** — `readlink -f` resolves the former to the latter and `stat` confirms an identical device:inode pair (`2049:73675137`) for `Cargo.toml` on both paths. Every codegraph result in this report was produced by the shell CLI (`<home>/.local/bin/codegraph`) against that one tree at `8b4f65a22`. The MCP transport was not used and nothing was blocked by its absence.

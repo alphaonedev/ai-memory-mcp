@@ -13,18 +13,18 @@
 #   cd /Users/fate/v07/v07-fixes
 #   DOCKER_BUILDKIT=0 docker build -f Dockerfile.plan-c -t ai-memory-plan-c:v070fix-r3 .
 
-# M6 — base images pinned by digest. Floating tags (`rust:1.95-bookworm`,
+# M6 — base images pinned by digest. Floating tags (`rust:1.99.1-bookworm`,
 # `debian:bookworm-slim`) move silently when Docker Hub re-publishes the
 # tag, which can shift glibc / OpenSSL / build tooling under a release
 # without bumping the Dockerfile. The digest below is the multi-arch
-# index digest captured 2026-05-11 via
+# index digest captured 2026-11-02 via
 #   curl -sI -H "Accept: application/vnd.oci.image.index.v1+json" \
 #        -H "Authorization: Bearer $TOKEN" \
-#        "https://registry-1.docker.io/v2/library/rust/manifests/1.95-bookworm" \
+#        "https://registry-1.docker.io/v2/library/rust/manifests/1.99.1-bookworm" \
 #        | awk -F': ' '/docker-content-digest/{print $2}'
 # Operators upgrading the toolchain MUST re-run the curl above and update
-# both the tag (1.95 → 1.x) AND the @sha256 digest together.
-FROM rust:1.95-bookworm@sha256:503651ea31e66ecb74623beabde781059a5978df1595a9e8ed03974d5fec1bf0 AS builder
+# both the tag (1.99.1 → 1.x) AND the @sha256 digest together.
+FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS builder
 
 ARG CARGO_FEATURES=sal-postgres
 ENV CARGO_TARGET_DIR=/opt/ai-memory-src/target

@@ -54,16 +54,13 @@ use sha2::{Digest, Sha256};
 use crate::runtime_context::RuntimeContext;
 
 mod fail_closed;
+#[cfg(test)]
+pub(crate) use fail_closed::latch_for_test as fail_closed_latch_for_test;
 pub use fail_closed::{
     AUDIT_TRAIL_LATCHED_GAUGE, AuditTrailUnavailable,
     PROBE_INTERVAL_MS as AUDIT_TRAIL_PROBE_INTERVAL_MS, REQUIRE_AUDIT_TRAIL_ENV, audit_trail_gate,
     audit_trail_latched, refusal_message as audit_trail_refusal_message,
     require_audit_trail_enabled,
-};
-#[cfg(test)]
-pub(crate) use fail_closed::{
-    force_on_for_test as fail_closed_force_on_for_test,
-    latch_for_test as fail_closed_latch_for_test,
 };
 
 /// Canonical `consolidate` operation label — shared by the audit op

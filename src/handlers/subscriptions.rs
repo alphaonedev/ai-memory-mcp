@@ -1138,21 +1138,151 @@ pub async fn dispatch_event_postgres(
     // from a cut (Fable #3242 item 2). A single `LIMIT N` returning N
     // cannot tell "exactly N" from "N+ more".
     let fetch_limit = SUBSCRIPTION_DISPATCH_LIMIT.saturating_add(1);
-    let memories = match app
+    // v1.0.0 #7366/#7499/#7500: one inline attempt. A failure is recorded
+    // durably BEFORE any retry (so a cancelled request future or a process
+    // exit never loses the event), then the RETRY_BACKOFFS ladder runs on a
+    // bounded detached task, never on this request future.
+    let first = app
         .store
         .list_by_namespace_prefix(&ctx, SUBSCRIPTION_NS_PREFIX, fetch_limit)
-        .await
-    {
+        .await;
+    let memories = match first {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::warn!(
-                "dispatch_event_postgres: SAL prefix-list failed: {e} — \
-                 no subscribers will fire this tick"
-            );
+            postgres_lookup_failed(app, event, memory_id, namespace, agent_id, details, e).await;
             return;
         }
     };
+    dispatch_scanned_postgres(
+        app, event, memory_id, namespace, agent_id, details, memories,
+    )
+    .await;
+}
 
+/// The first prefix scan failed (#7499, #7500): record the event, then hand
+/// the retry ladder to a bounded detached task.
+#[cfg(feature = "sal")]
+async fn postgres_lookup_failed(
+    app: &AppState,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    details: Option<serde_json::Value>,
+    e: crate::store::StoreError,
+) {
+    use crate::subscriptions::scan_failure as sf;
+    let sqlstate = match &e {
+        crate::store::StoreError::BackendUnavailable { sqlstate, .. } => sqlstate.clone(),
+        _ => None,
+    };
+    let class = sf::classify_sqlstate(sqlstate.as_deref());
+    tracing::warn!(
+        error_class = %class,
+        "dispatch_event_postgres: SAL prefix-list failed: {e}; \
+         recording to the DLQ before the retry ladder (#7499)"
+    );
+    let db_path = {
+        let lock = app.db.lock().await;
+        lock.1.clone()
+    };
+    let owned = sf::OwnedFailure::new(event, memory_id, namespace, agent_id, details);
+    let row = {
+        let (path, owned_c, class_c) = (db_path.clone(), owned.clone(), class.clone());
+        match tokio::task::spawn_blocking(move || {
+            sf::record_scan_failure_first(&path, &owned_c.borrowed(), &class_c)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(join) => {
+                tracing::warn!("dispatch_event_postgres: scan-failure record task failed: {join}");
+                None
+            }
+        }
+    };
+    let Some(slot) = sf::take_slot() else {
+        settle_postgres(&db_path, &owned, &class, row, 1).await;
+        return;
+    };
+    let app = app.clone();
+    tokio::spawn(async move {
+        let _slot = slot;
+        let ctx = crate::store::CallerContext::for_admin(
+            crate::identity::sentinels::SUBSCRIPTION_DISPATCH,
+        );
+        let fetch_limit = SUBSCRIPTION_DISPATCH_LIMIT.saturating_add(1);
+        let retried =
+            sf::retry_after_failure_async(crate::subscriptions::RETRY_BACKOFFS, e, || {
+                app.store
+                    .list_by_namespace_prefix(&ctx, SUBSCRIPTION_NS_PREFIX, fetch_limit)
+            })
+            .await;
+        match retried {
+            Ok(rows) => {
+                let f = owned.borrowed();
+                dispatch_scanned_postgres(
+                    &app,
+                    f.event,
+                    f.memory_id,
+                    f.namespace,
+                    f.agent_id,
+                    f.details.cloned(),
+                    rows,
+                )
+                .await;
+                // Dispatched first, then the record goes (#7498).
+                if let Some(id) = row {
+                    let path = db_path.clone();
+                    if let Err(join) =
+                        tokio::task::spawn_blocking(move || sf::clear_scan_failure(&path, id)).await
+                    {
+                        tracing::warn!("dispatch_event_postgres: record-clear task failed: {join}");
+                    }
+                }
+            }
+            Err(_) => {
+                settle_postgres(&db_path, &owned, &class, row, sf::lookup_attempts()).await;
+            }
+        }
+    });
+}
+
+#[cfg(feature = "sal")]
+async fn settle_postgres(
+    db_path: &std::path::Path,
+    owned: &crate::subscriptions::scan_failure::OwnedFailure,
+    class: &str,
+    row: Option<i64>,
+    attempts: usize,
+) {
+    let (path, owned, class) = (db_path.to_path_buf(), owned.clone(), class.to_string());
+    if let Err(join) = tokio::task::spawn_blocking(move || {
+        crate::subscriptions::scan_failure::settle_or_record(
+            &path,
+            &owned.borrowed(),
+            &class,
+            row,
+            attempts,
+        );
+    })
+    .await
+    {
+        tracing::warn!("dispatch_event_postgres: scan-failure settle task failed: {join}");
+    }
+}
+
+/// Everything `dispatch_event_postgres` does once the prefix scan returned.
+#[cfg(feature = "sal")]
+async fn dispatch_scanned_postgres(
+    app: &AppState,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    details: Option<serde_json::Value>,
+    memories: Vec<Memory>,
+) {
     // v1.0.0 #2592 — the scan came back PAST the ceiling, so it was cut
     // and an unknown number of subscribers sorting after it were never
     // consulted. Report BEFORE the filter loop and before the zero-match

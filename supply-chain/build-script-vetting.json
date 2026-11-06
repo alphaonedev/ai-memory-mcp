@@ -172,9 +172,9 @@
     },
     {
       "name": "libc",
-      "version": "0.2.185",
+      "version": "0.2.191",
       "source": "registry",
-      "checksum": "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f",
+      "checksum": "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
     },
@@ -193,6 +193,18 @@
       "checksum": "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149",
       "disposition": "inventoried",
       "first_seen": "2026-08-01"
+    },
+    {
+      "name": "nix",
+      "version": "0.31.3",
+      "source": "registry",
+      "checksum": "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d",
+      "disposition": "reviewed",
+      "reviewed_on": "2026-11-02",
+      "review_record": "docs/security/build-script-vetting.md#nix-0313",
+      "build_dependencies": [
+        "cfg_aliases@0.2.1"
+      ]
     },
     {
       "name": "num-bigint-dig",
@@ -363,11 +375,11 @@
     },
     {
       "name": "rustls",
-      "version": "0.23.45",
+      "version": "0.23.46",
       "source": "registry",
-      "checksum": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+      "checksum": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
       "disposition": "inventoried",
-      "first_seen": "2026-09-19"
+      "first_seen": "2026-10-15"
     },
     {
       "name": "rustversion",
@@ -715,19 +727,21 @@
     },
     {
       "name": "zstd-safe",
-      "version": "7.2.4",
+      "version": "8.2.0",
       "source": "registry",
-      "checksum": "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d",
+      "checksum": "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b",
       "disposition": "inventoried",
-      "first_seen": "2026-08-01"
+      "first_seen": "2026-10-28",
+      "review_record": "docs/security/build-script-vetting.md#zstd-family-8257"
     },
     {
       "name": "zstd-sys",
-      "version": "2.0.16+zstd.1.5.7",
+      "version": "2.1.2+zstd.1.5.7",
       "source": "registry",
-      "checksum": "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748",
+      "checksum": "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3",
       "disposition": "inventoried",
-      "first_seen": "2026-08-01"
+      "first_seen": "2026-10-28",
+      "review_record": "docs/security/build-script-vetting.md#zstd-family-8257"
     }
   ]
 }

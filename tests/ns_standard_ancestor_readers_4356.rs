@@ -305,7 +305,7 @@ async fn run(fx: Fx, sqlite: bool) {
     }
 
     // Sanity: the unverifiable text is wired (never echoed by these cells).
-    assert!(!REASON_STANDARD_UNVERIFIABLE.is_empty());
+    assert_ne!(REASON_STANDARD_UNVERIFIABLE, "");
 }
 
 #[tokio::test]

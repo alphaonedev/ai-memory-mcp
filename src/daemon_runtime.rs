@@ -1201,6 +1201,12 @@ pub struct ServeArgs {
     /// hostname change. Unset = keep the hostname default.
     #[arg(long)]
     pub federation_identity: Option<String>,
+    /// #8357 — validate the mTLS certificate-to-agent binding configuration
+    /// (`AI_MEMORY_MTLS_AGENT_BINDING`, `AI_MEMORY_MTLS_AGENT_BINDING_MAP`)
+    /// against `--mtls-allowlist`, print the parsed map as JSON and exit
+    /// without starting the daemon. A bad configuration exits non-zero.
+    #[arg(long)]
+    pub check: bool,
 
     // -------- v0.7.0 Wave-3 — adapter selection --------------------
     /// v0.7.0 Wave-3 — full SAL store URL. When set, the daemon binds
@@ -1803,17 +1809,20 @@ pub async fn run(
             // `OllamaClient::generate` are issued cleanly.
             let db_path_owned = db_path.clone();
             let app_config_owned = app_config.clone();
-            tokio::task::spawn_blocking(move || {
+            // #4347 — SIGTERM / SIGINT / SIGHUP stop the loop gracefully and
+            // run the exit drain; handlers are installed before it starts.
+            // Fail closed: with no stop listener the server would serve, then
+            // lose queued forensic rows to a default-disposition kill.
+            let stop_signals = mcp::shutdown::StopSignals::install().await?;
+            let loop_handle = tokio::task::spawn_blocking(move || {
                 mcp::run_mcp_server(
                     &db_path_owned,
                     feature_tier,
                     &app_config_owned,
                     &resolved_profile,
                 )
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("mcp join: {e}"))??;
-            Ok(())
+            });
+            mcp::shutdown::supervise(loop_handle, stop_signals).await
         }
         Command::Store(a) => {
             let stdout = std::io::stdout();
@@ -4324,7 +4333,7 @@ fn spawn_postgres_fold_loop_if_enabled(
 /// the local sqlite `Db` mutex and call rusqlite free-functions, so on a
 /// `--store-url postgres://…` daemon they ticked against the placeholder sqlite
 /// DB while the pg corpus's expired rows / stale archives / expired leases
-/// accumulated unbounded (the CLAUDE.md "GC runs every 30 minutes; expired
+/// accumulated unbounded (the `docs/reference/ARCHITECTURE_REFERENCE.md` "GC runs every 30 minutes; expired
 /// memories are archived before deletion" contract was silently false on pg).
 /// Only `spawn_postgres_fold_loop_if_enabled` had a pg twin.
 ///
@@ -4623,7 +4632,7 @@ fn spawn_gc_loop_with_shadow_retention_tracked(
             }
             // #1690 — recall_observations retention sweep. The pruner
             // (observations::gc::prune, honouring AI_MEMORY_OBSERVATIONS_TTL_DAYS
-            // — CLAUDE.md env #42) previously had NO production caller, so the
+            // — ARCHITECTURE_REFERENCE.md env #42) previously had NO production caller, so the
             // recall-observation ledger grew unbounded with recall traffic.
             match crate::observations::gc::prune(&lock.0) {
                 Ok(n) if n > 0 => {
@@ -5429,15 +5438,14 @@ pub(crate) fn route_or_block_escalated_write(
         Ok(pending_id) => {
             tracing::info!(
                 "L1-6 governance pre-write escalated namespace={:?} rule_id={} reason={} — \
-                 queued signed-approval pending_id={} (blocked until m-of-n quorum met)",
+                 routed signed-approval pending_id={} (now, or when the write txn ends: #4116)",
                 mem.namespace,
                 rule_id,
                 reason,
                 pending_id
             );
-            Err(format!(
-                "action escalated for signed approval (pending_id={pending_id}): {reason}"
-            ))
+            // #4116 — deferred vs queued text (never a phantom id).
+            Err(crate::storage::escalation_deferral::escalation_refusal_text(&pending_id, reason))
         }
         Err(e) => {
             // Fail CLOSED if the pending could not be queued — never let an
@@ -5480,7 +5488,7 @@ pub(crate) fn install_governance_pre_write_hook(
             };
             // Resolve the agent_id from the memory's metadata
             // (every substrate-written memory carries it under
-            // `metadata.agent_id` — see CLAUDE.md §"Agent
+            // `metadata.agent_id` — see docs/reference/ARCHITECTURE_REFERENCE.md §"Agent
             // Identity"). Fall back to a stable hook-source tag
             // when the metadata key is missing so the audit row
             // still attributes the refusal.
@@ -7852,7 +7860,7 @@ pub async fn bootstrap_serve(
     // lease-sweep). The sqlite gc/lease/pending loops above all bind the local
     // sqlite `Db` mutex, so a `--store-url postgres://…` daemon never reaped
     // expired rows / stale archives / expired leases on its pg corpus (the
-    // CLAUDE.md GC contract was silently false on postgres). This drives the
+    // ARCHITECTURE_REFERENCE.md GC contract was silently false on postgres). This drives the
     // existing SAL trait methods on the pg backend at the same GC cadence.
     #[cfg(feature = "sal")]
     {
@@ -7967,6 +7975,24 @@ pub async fn bootstrap_serve(
              self-asserted, so admin-role requests will be REFUSED (403) until you either \
              configure an api_key or explicitly opt into the legacy header-trust posture with \
              {}=1 (#1570 secure default)",
+            crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
+        );
+    }
+
+    // #8494 — the header-trust opt-in also re-admits a claimed admin to the
+    // bootstrap pubkey-bind routes (a claimed header can then bind a key to
+    // any agent). Classified operator-advisory in ARCHITECTURE_REFERENCE; the
+    // boot banner names it so it cannot be enabled silently.
+    if !app_state.admin_agent_ids.is_empty()
+        && crate::handlers::admin_role::admin_header_trust_enabled()
+    {
+        tracing::warn!(
+            "{}=1 with [admin].agent_ids configured: a CLAIMED admin X-Agent-Id is trusted, \
+             including on PUT /api/v1/agents/{{id}}/pubkey and POST /api/v1/agents/{{id}}/api-key[/revoke] (bootstrap key bind #8494, api-key mint/revoke #8535). Without \
+             this opt-in the bind requires the admin's enrolled per-agent api key. The opt-in is the \
+             bootstrap path only, while this daemon's enrolled registry is empty (at bootstrap, or after every key is revoked): once ANY per-agent api key is enrolled it is IGNORED on those \
+             credential routes in every identity mode (#8574), so only a key-bound admin can change \
+             credentials",
             crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
         );
     }
@@ -8106,6 +8132,12 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
+    if args.check {
+        let report =
+            crate::mtls_agent_binding::serve_check_report(args.mtls_allowlist.as_deref()).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
         Ok(bootstrap) => bootstrap,
@@ -8301,6 +8333,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 );
                 tls::load_rustls_config(cert, key).await?
             };
+            // #8357 — certificate-to-agent binding; refuses boot on a bad map
+            // or a map without a client-certificate allowlist.
+            let agent_table =
+                crate::mtls_agent_binding::boot_from_env(args.mtls_allowlist.as_deref()).await?;
             let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
             tracing::info!("ai-memory listening on https://{addr}");
             let socket_addr: std::net::SocketAddr = addr.parse()?;
@@ -8432,16 +8468,19 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             ) {
                 tracing::warn!(target: "federation::attestation", "{warning}");
             }
-            if let Some(bindings) = cert_peer_bindings {
+            if let Some(bindings) = &cert_peer_bindings {
                 tracing::info!(
                     bound_fingerprints = bindings.len(),
                     "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
                     tls::cert_peer_binding_mode()
                 );
+            }
+            if cert_peer_bindings.is_some() || agent_table.is_some() {
                 axum_server::bind(socket_addr)
-                    .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
+                    .acceptor(tls::serve_rustls_acceptor_with_bindings(
                         &tls_config,
-                        bindings,
+                        cert_peer_bindings,
+                        agent_table,
                     ))
                     .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -10296,6 +10335,7 @@ mod tests {
             quorum_ca_cert: None,
             catchup_interval_secs: 0,
             federation_identity: None,
+            check: false,
             #[cfg(feature = "sal")]
             store_url: None,
         }
@@ -14584,6 +14624,17 @@ mod escalate_producer_2991_tests {
         base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
     }
 
+    mod escalate_under_write_lock_4116_tests;
+    fn set_approver_env(key: Option<&str>) {
+        let env = crate::approvals::signed::APPROVER_PUBKEYS_ENV;
+        // SAFETY: only called in an env-isolated single-test child (#2991/#4116 cells).
+        unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
+        key.map_or_else(
+            || unsafe { std::env::remove_var(env) },
+            |k| unsafe { std::env::set_var(env, k) },
+        );
+    }
+
     #[test]
     fn keyless_escalation_blocks_without_queuing_a_pending() {
         // Env-isolated: asserts the KEYLESS state, so no concurrent test's
@@ -14593,10 +14644,7 @@ mod escalate_producer_2991_tests {
         ) {
             return;
         }
-        unsafe {
-            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
-            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
-        }
+        set_approver_env(None);
         // Also neutralise any on-disk operator key so the fleet is TRULY keyless
         // (a dev host may have staged an operator.key.pub).
         let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
@@ -14618,13 +14666,7 @@ mod escalate_producer_2991_tests {
         ) {
             return;
         }
-        unsafe {
-            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
-            std::env::set_var(
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                approver_pubkey_b64(9),
-            );
-        }
+        set_approver_env(Some(&approver_pubkey_b64(9)));
         let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
         let m = mem("gov-ns", "body-keyed");
         let r =
@@ -14646,9 +14688,7 @@ mod escalate_producer_2991_tests {
             serde_json::from_value(pend[0].payload.clone()).expect("payload is a Memory");
         assert_eq!(back.content, "body-keyed");
         assert_eq!(back.namespace, "gov-ns");
-        unsafe {
-            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
-        }
+        set_approver_env(None);
     }
 
     #[test]

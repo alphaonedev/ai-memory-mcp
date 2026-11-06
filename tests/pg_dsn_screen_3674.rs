@@ -105,10 +105,13 @@ impl Capture {
 }
 
 fn assert_no_secret(sink: &str, filter: &str, what: &str) {
-    for secret in SECRETS {
+    // #6601 — a failure names the fixture by index; neither the fixture nor
+    // the sink that would carry it is echoed.
+    for (fixture_idx, fixture) in SECRETS.iter().enumerate() {
         assert!(
-            !sink.contains(secret),
-            "#3674: {what} leaked {secret:?} into the log sink under filter {filter:?}:\n{sink}"
+            !sink.contains(fixture),
+            "#3674: {what} leaked credential fixture #{fixture_idx} into the log sink under \
+             filter {filter:?}"
         );
     }
 }
@@ -296,6 +299,7 @@ const FUNNEL_FILE: &str = "src/store/postgres/dsn.rs";
 const LEDGER: &[(&str, usize, usize)] = &[
     ("src/cli/doctor.rs", 3, 3),
     ("src/cli/keys.rs", 1, 1),
+    ("src/cli/over_depth_4715.rs", 1, 1),
     ("src/cli/schema_init.rs", 1, 1),
     ("src/store/postgres.rs", 1, 1),
 ];

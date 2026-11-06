@@ -13,6 +13,9 @@
 use ai_memory::tls;
 use std::path::PathBuf;
 
+/// The DNS subjectAltName of `tests/fixtures/tls/valid_cert.pem`.
+const FIXTURE_SAN_HOST: &str = "ai-memory-test.local";
+
 fn fixture(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tls")
@@ -146,15 +149,23 @@ async fn test_serve_tls_graceful_shutdown_serves_then_stops() {
             .await
     });
 
-    // A real HTTPS client (reqwest's rustls backend) that accepts the
-    // self-signed fixture cert. Poll until the listener is up, then assert a
-    // 200 from the TLS-served /health.
+    // A real HTTPS client (reqwest's rustls backend) that VERIFIES the
+    // server: the self-signed fixture is pinned as the only extra trust
+    // anchor and its SAN host resolves to the loopback listener, so the
+    // handshake runs full chain + hostname validation (#7888, CodeQL
+    // rust/disabled-certificate-check). Poll until the listener is up, then
+    // assert a 200 from the TLS-served /health.
+    let fixture_root = reqwest::Certificate::from_pem(
+        &std::fs::read(fixture("valid_cert.pem")).expect("read fixture cert"),
+    )
+    .expect("fixture cert parses as PEM");
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(fixture_root)
+        .resolve(FIXTURE_SAN_HOST, socket_addr)
         .timeout(Duration::from_secs(5))
         .build()
         .expect("reqwest client");
-    let url = format!("https://127.0.0.1:{port}/api/v1/health");
+    let url = format!("https://{FIXTURE_SAN_HOST}:{port}/api/v1/health");
     let mut served = false;
     for _ in 0..60 {
         if let Ok(resp) = client.get(&url).send().await {

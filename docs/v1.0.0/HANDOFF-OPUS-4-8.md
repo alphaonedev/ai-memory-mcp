@@ -3,10 +3,11 @@
 > **Purpose:** the durable handoff from Claude Fable 5 (orchestrating the v1.0.0 epic in Phase A) to Claude Opus 4.8 (orchestrating Phase B after the Fable API cutoff). Read this in full when you inherit the epic. Everything Fable decided lives in ai-memory + the tracker, not in a context window — this document is the index into it.
 >
 > **Cutoff:** Claude Fable 5 → API-only at **2026-07-12 11:59:59 PM PT = 2026-07-13 06:59:59 UTC**. After that, **you (Opus 4.8) are orchestrator AND senior implementer**; Sonnet 5 runs the wide parallel lanes; Fable is default DO-NOT-USE (one logged exception: a twice-deadlocked 2×5 vote). Grok 4.5 optional as the decorrelated cross-family review leg + the #1171 xAI panel seat.
+> (superseded 2026-10-10: the old voting exception is retained above as history; new decisions use the development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) 1x3 vote with a threshold, cited as `3-agent vote (6def5ab6)`. This protocol grants no additional paid API use.)
 >
 > **Authority:** operator grant memory `f9a0f397` — 100% autonomous, all decisions approved, through the GA cut (including temp-admin-lift merges + triggering the CI release). Corrections: `9a62049d` + `b8fd32a1` (Gate-3 reviews are AI-NHI multi-agent, no external auditor; 1:1 issue-per-finding, 100% fixed).
 >
-> **The two SSOTs you follow:** ROADMAP.md **§27** (the gate program) + the epic prompt [`AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md`](AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) (the loop driver). Where they conflict, §27 wins; where either conflicts with a newer recorded 2×5 vote, the vote wins. **Epic tracking issue: [#1940].**
+> **The two SSOTs you follow:** ROADMAP.md **§27** (the gate program) + the epic prompt [`AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md`](AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) (the loop driver). Where they conflict, §27 wins; where either conflicts with a newer recorded development epic prompt §5 (docs/v1.0.0/AI-NHI-V1.0.0-DEVELOPMENT-EPIC-PROMPT.md) ruling (a 1x3 vote, or an earlier 2×5 vote), the ruling wins. **Epic tracking issue: [#1940].**
 
 ---
 
@@ -67,7 +68,7 @@ DO full-spectrum testing → **multi-agent codegraph-anchored code review (Rust-
 
 ## 4. Orchestration runbook (how you run the loop)
 - **Boot every session** (epic prompt §6.1): `memory_session_start` → `memory_recall "v1.0.0 epic"` → `gh issue view 1940` → `df -h /` → determine phase (you are Phase B now) → pick the highest-priority unblocked Gate item → `memory_store` the session plan → work.
-- **2×5 decision protocol** (epic prompt §5): any decision point / T-crossroads / ambiguity → 2 waves × 5 adversarial agents (distinct lenses, never 5 copies) → synthesize → `memory_store` the record → move forward. Cite `4d3ea1c5` + `f9a0f397`. Never idle-wait.
+- **1x3 decision protocol with a threshold** (epic prompt §5): a T1–T6 condition AND the hard-to-reverse or safety-bearing threshold → one round of 3 distinct read-only scout-tier lenses → record the majority decision (a 1-1-1 split goes to the conductor) → `memory_store` before implementation. Cite `3-agent vote (6def5ab6)`. Ambiguity alone does not trigger a vote.
 - **Session-limit recovery (proven this session):** if a workflow returns all-errored on "session limit", it paused with zero lost work (prior decisions are checkpointed). On reset, re-run via `Workflow({scriptPath, resumeFromRunId})` — cached agents replay, only the failed ones re-run.
 - **Session end (mandatory, §6.3):** `memory_store` a checkpoint (SHAs landed, in-flight, next actions, open votes) + a one-line comment on #1940. Assume the session may never resume.
 - **Discipline anchors (epic prompt §7):** Rust skills mandatory (`/rust-skills` + `/rust-microsoft`, cite M-*/rule IDs) on all `src/` work; no-hardcoded-literals CI gates (`c8-precheck.yml`); disk monitor (`df -h /` at boot + before builds/DO/coverage — <25G WARN, <10G STOP; scratch in `.local-runs/`, never `/tmp`); DO teardown same-session; worktree discipline (#856) for parallel implementation; Sonnet never touches signing/governance/federation-auth internals.

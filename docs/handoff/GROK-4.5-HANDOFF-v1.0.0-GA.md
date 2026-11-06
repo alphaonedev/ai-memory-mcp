@@ -5,7 +5,7 @@
 **Prepared by:** Fable 5 (outgoing orchestrator / reviewer / auditor / sole merge approver)
 **Date:** 2026-08-03
 **Repo:** `alphaonedev/ai-memory-mcp`
-**Working tree:** `/home/fate_two/v07/v09-dev`
+**Working tree:** `<home>/v07/v09-dev`
 **Release branch:** `release/v1.0.0` @ `9916165d`
 **Tag state:** **no `v1.0.0*` tag exists.** Zero. The cut is operator-gated and has never been attempted.
 
@@ -75,11 +75,16 @@ Data integrity, security, performance, encryption are priorities. **v1.0.0 ships
 
 ---
 
-## 3. The 3×3 adversarial decision protocol
+## 3. The 1x3 adversarial decision protocol with a threshold
 
-Canonical memory: `4d3ea1c5`. Mirrored in `CLAUDE.md` §"Crossroads decision protocol".
+Canonical memory: `6def5ab6`. Mirrored in `CLAUDE.md` §"Crossroads decision protocol".
+The earlier five-agent form (`4d3ea1c5`) was superseded on 2026-10-10;
+historical vote records below keep their original evidence.
 
-### Deterministic triggers — vote if ANY holds, no judgement call
+### Conditions — vote only if a condition AND the threshold hold
+
+Apply the hard-to-reverse or safety-bearing threshold in `CLAUDE.md` as well as
+the T1–T6 conditions below. Trivial or mechanically reversible choices do not vote.
 
 | | trigger |
 |---|---|
@@ -94,14 +99,17 @@ Canonical memory: `4d3ea1c5`. Mirrored in `CLAUDE.md` §"Crossroads decision pro
 
 ### Vote shape
 
-N concurrent agents (9 for a 3×3; 5 and 3×7 have both been used), each a **distinct adversarial lens** — diversity is mandatory or they converge by groupthink. Each returns exactly:
+One round of exactly 3 concurrent read-only scout-tier agents, each a **distinct
+adversarial lens**, using the measured facts in the prompt. Each returns:
 
 ```
-VERDICT / CONFIDENCE (0-100) / RATIONALE (<=150 words, cite file:line) /
+VERDICT / CONFIDENCE (0-100) / RATIONALE (<=120 words, cite file:line) /
 TOP_RISK (of its own choice) / KILLER_OBJECTION (against its own verdict)
 ```
 
-Tally, synthesize, record the ruling **before** implementing. Cite `5-agent vote (4d3ea1c5)` in the commit or issue.
+The majority decides; a 1-1-1 split goes to the conductor, who records why.
+Tally, synthesize, record the ruling **before** implementing. Cite
+`3-agent vote (6def5ab6)` in the commit or issue.
 
 ### Two hard-won lessons about running votes
 
@@ -406,7 +414,7 @@ Live-serve with a real embedder is the only way to verify HTTP recall (#1797 was
 ```
 cloud-init-datatier.yaml.tpl   # contains NOTHING describing the pg stack;
                                # four @@PLACEHOLDER@@ lines filled at render
-                               # time from /home/fate_two/v07/pg-age-stack/
+                               # time from <home>/v07/pg-age-stack/
 provision.sh                   # pins build to origin/release/v1.0.0 SHA
 teardown.sh                    # requires typing DESTROY
 ```
@@ -440,7 +448,7 @@ Four droplet provisioning failures were caused by ignoring this: `${VAR}` escapi
 
 ## 11. Codegraph — PERMANENT operator control
 
-**Codegraph MUST only ever be queried against `/home/fate_two/v07/v09-dev`** (tracks `release/v1.0.0`; index kept fresh by a SessionStart hook). **Always pass `projectPath="/home/fate_two/v07/v09-dev"`.**
+**Codegraph MUST only ever be queried against `<home>/v07/v09-dev`** (tracks `release/v1.0.0`; index kept fresh by a SessionStart hook). **Always pass `projectPath="<home>/v07/v09-dev"`.**
 
 Mechanically enforced by the PreToolUse hook `~/.claude/hooks/codegraph-pin-projectpath.sh`, which rewrites `projectPath` on every call — so a stale or wrong-branch index can never be queried. Never point it at a worktree, another release branch, or another repo.
 

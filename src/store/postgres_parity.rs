@@ -197,8 +197,10 @@ pub(crate) async fn export_memories_keyset(
 /// the erase + attestation + tombstone + delete commit or roll back as one
 /// unit. For each victim it:
 ///
-/// 1. **crypto-erases** the per-record (`0x03`) envelope key, making the
-///    ciphertext unrecoverable even by a holder of the master KEK. Legacy
+/// 1. **crypto-erases** the per-record envelope key of every envelope whose
+///    version is in `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`
+///    (`0x03` and `0x05` today, #8278), making the ciphertext unrecoverable
+///    even by a holder of the master KEK or the namespace scope key. Legacy
 ///    `0x02` per-agent rows have no per-record key — the honest limit,
 ///    recorded as `RowDeletedTombstoned` rather than `KeyDestroyed`.
 /// 2. **scrubs the `cid_genesis` pre-image** (erasure invariant parity with
@@ -230,24 +232,28 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     tx: &mut PgTx<'_>,
     victims: &[(String, String, Option<String>)],
     now: chrono::DateTime<chrono::Utc>,
-) -> StoreResult<()> {
+) -> StoreResult<crate::governance::audit::PendingAuditAnchor> {
+    // #7241 - the returned anchor is emitted by the caller after its COMMIT.
+    let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
     if victims.is_empty() {
-        return Ok(());
+        return Ok(anchor);
     }
     let ids: Vec<String> = victims.iter().map(|(id, _, _)| id.clone()).collect();
 
-    // (1) Crypto-erase the per-record envelope keys. `get_byte(...,0) = 3`
-    // selects ONLY the per-record scheme (mirrors the `forget` twin).
+    // (1) Crypto-erase the per-record envelope keys. `get_byte(...,0) =
+    // ANY($3)` selects the crypto-erasable versions (0x03 and 0x05, the
+    // #8278 R16 SSOT; mirrors the `forget` twin).
     // RETURNING id so each victim's erasure KIND is known below.
     let erased_rows: Vec<(String,)> = sqlx::query_as(
         "UPDATE memories SET encrypted_envelope = $2 \
          WHERE id = ANY($1) \
            AND encrypted_envelope IS NOT NULL \
-           AND get_byte(encrypted_envelope, 0) = 3 \
+           AND get_byte(encrypted_envelope, 0) = ANY($3::int[]) \
          RETURNING id",
     )
     .bind(&ids)
     .bind(crate::encryption::crypto_erase_marker())
+    .bind(crate::encryption::crypto_erasable_envelope_version_codes())
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| to_store_err("evict crypto-erase envelope", e))?;
@@ -293,7 +299,7 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
             ts.clone(),
             None,
         );
-        pg_append_signed_event_with_chain_in_tx(
+        let appended = pg_append_signed_event_with_chain_in_tx(
             tx,
             PgSignedEventInsert {
                 id: &event.id,
@@ -308,6 +314,7 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
         )
         .await
         .map_err(|e| to_store_err("evict crypto_erase attestation", e))?;
+        anchor = anchor.merge(appended);
     }
 
     // (4) Mandatory signed tombstone — identity + time + owner ONLY, never
@@ -337,7 +344,7 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     .await
     .map_err(|e| to_store_err("evict record tombstones", e))?;
 
-    Ok(())
+    Ok(anchor)
 }
 
 /// #3177 / #1771 — postgres twin of
@@ -404,13 +411,14 @@ pub(crate) async fn archive_links_for_memory_in_tx(tx: &mut PgTx<'_>, id: &str) 
 /// # Errors
 ///
 /// Returns [`StoreError::IntegrityFailed`] if the canonical CBOR cannot be
-/// encoded, else propagates the chain-append error.
+/// encoded, else propagates the chain-append error. The returned audit anchor
+/// is emitted by the caller after its COMMIT (#7241).
 pub(crate) async fn emit_pending_action_event_in_tx(
     tx: &mut PgTx<'_>,
     pa: &crate::models::PendingAction,
     event_type: &str,
     decided_by_override: Option<&str>,
-) -> StoreResult<()> {
+) -> StoreResult<crate::governance::audit::PendingAuditAnchor> {
     use crate::models::field_names;
     use std::collections::BTreeMap;
 
@@ -475,8 +483,7 @@ pub(crate) async fn emit_pending_action_event_in_tx(
         },
     )
     .await
-    .map_err(|e| to_store_err("append pending_action audit row", e))?;
-    Ok(())
+    .map_err(|e| to_store_err("append pending_action audit row", e))
 }
 
 /// #3064 batch D — postgres twin of sqlite

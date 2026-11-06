@@ -1,0 +1,82 @@
+[
+  {
+    "source": "docs/BASELINE-v0.6.3.1.md",
+    "line": 276,
+    "text": "| Tier | Embedding | LLM | Cross-encoder | ~Memory |"
+  },
+  {
+    "source": "docs/memory-kind-vocab.md",
+    "line": 165,
+    "text": "* **`regex_only`.** Deterministic regex heuristics. ~tens of"
+  },
+  {
+    "source": "docs/reference/ARCHITECTURE_REFERENCE.md",
+    "line": 228,
+    "text": "| 76 | `AI_MEMORY_RERANK_MAX_SEQ` | usize (1-512) | `256` (`RERANK_MAX_SEQ_DEFAULT`) | CLI/daemon/MCP (autonomous-tier recall) | config | **[#1604, v0.7.x]** Tokenized-length cap for **rerank** inputs (the #1597 batched cross-encoder forward in `src/reranker.rs::neural_score_pairs`), tighter than the model-architecture ceiling `CROSS_ENCODER_MAX_SEQ = 512` that other cross-encoder consumers keep. The #1588 dogfood re-run measured warm autonomous recall at ~4.0 s on a long-content corpus vs ~0.5 s on short rows — the candle CPU forward was the cost. **[TRUTH-FIX #2576, v1.0.0]** the original rationale here was wrong in two ways, and both mattered because they invited a default retune that would have silently degraded relevance. (1) It said long-content rows \"pad the whole batch to 512 tokens\". They do not: `neural_score_pairs` sets `tokenizers::PaddingStrategy::BatchLongest`, so the batch is padded to the longest sequence PRESENT IN THAT BATCH, never to `max_seq`. `max_seq` is a **TRUNCATION** bound, not a pad width — it only binds when a pair actually tokenizes longer than the cap, and when it binds it DISCARDS document tokens the cross-encoder would otherwise have scored. (2) It said \"BERT attention is O(n²) in sequence length, so the 256 default cuts the forward ~4×\". At these lengths the 1536-d FFN dominates and attention is ~10% of the MACs, so the forward is ~LINEAR in L: a measured 142→64 (2.2× shorter) gave 2.0× faster, not 4.8×. Measured consequence on the #2576 reference corpus (7,855 Atlas rows, content avg 391 B / p50 378 / p95 593 / max 940): at `max_seq=256` **0.0%** of (query, doc) pairs are truncated and the batch pads to ~135 tokens — **the 256 default costs nothing on this corpus**. At `max_seq=64`, **91.8%** of pairs truncate and the median document loses ~28% of its tokens. #2576 proposed 256→64 for a measured ~30% latency win; the 5-agent vote (`4d3ea1c5`) REFUSED it 5/5 because that win is bought by deleting the document, and a compiled default is a fleet-wide contract. Pinned by `tests/rerank_cross_encoder_gate_2576.rs::rerank_max_seq_default_stays_256_2576`; do not retune without a measured relevance A/B. Resolves through `AppConfig::resolve_reranker()` (env > `[reranker].max_seq_tokens` > compiled default) and is seeded process-wide at boot via `crate::reranker::set_rerank_max_seq`. Zero / unparseable / above-ceiling values fall through. Source: `crate::config::ENV_RERANK_MAX_SEQ`. |"
+  },
+  {
+    "source": "docs/reference-architectures.md",
+    "line": 486,
+    "text": "   tier 0 → tier 1: async logical repl, ~minutes lag, durable"
+  },
+  {
+    "source": "docs/reference-architectures.md",
+    "line": 487,
+    "text": "   tier 1 → tier 2: streaming repl, ~seconds lag"
+  },
+  {
+    "source": "docs/reference-architectures.md",
+    "line": 488,
+    "text": "   tier 2 → tier 3: federation push, ~milliseconds (intra-zone)"
+  },
+  {
+    "source": "docs/v0.7.0/audit/sections/07-cognition-lifecycle.md",
+    "line": 29,
+    "text": "| HNSW semantic retriever | `src/hnsw.rs` `VectorIndex` (struct ~line 294), `search` (~line 718) | In-memory `instant-distance` HNSW index. |"
+  },
+  {
+    "source": "docs/v0.7.0/heterogeneous-ai-nhi-assessment/report-claude-opus-4-7.md",
+    "line": 46,
+    "text": "A prior Opus 4.7 session produced a 304-line report at this path on 2026-05-24. The operator explicitly chose to discard it and run me fresh today. A fresh same-model session doesn't give the operator decorrelation (Opus-2026-05-25 shares ~all priors with Opus-2026-05-24), but it does give **fresh probe evidence against the current HEAD** and **a second independent framing** in case yesterday's report inherited a session-specific anchoring artifact. I did not read the prior report before writing this one. Where my conclusions align with yesterday's, that is decorrelation-within-a-single-model — a weaker but non-zero signal. Where they diverge, that is the within-model bias signal."
+  },
+  {
+    "source": "docs/v0.8.0/1715-attested-provenance-foldin-prompt.md",
+    "line": 17,
+    "text": "You are an autonomous AI NHI engineer working inside the `ai-memory` substrate (`<home>/v07/v07-f5`, branch `release/v0.8.0`), under the v0.8.0 Distributed Coordination Substrate EPIC (#1709). Your task is a **self-contained, ~half-day, ships-clean** increment that strengthens **§2.5 (attested)** by surfacing **attested provenance** in recall output and demoting the stored confidence scalar to an honest ranking-cache — implementing the principle *\"never store confidence as truth; recompute it at read from already-merged signed evidence.\"*"
+  },
+  {
+    "source": "docs/v1.0.0/perfect-endpoint-assessment/waves/w1-a2-deepmind-frictions.md",
+    "line": 32,
+    "text": "| **Agent decorrelation vs correlated failure modes** (esp. multi-agent collectives pathway) | §5 N≥3 attested-family quorum (PRIMARY); empirical probe (advisory floor); `reflect_decorrelation_*` env; `model_attestations` TOFU; write-gate in reflect paths | **Instrumented, not enforced by default** — family-verify ~loader-capped; P2 vote-independence = 0% proof | Extreme if \"bias-displaced\" / \"decorrelation enforced\" claimed pre D3-012+D3-021 |"
+  },
+  {
+    "source": "docs/v1.0.0/perfect-endpoint-assessment/waves/w1-a4-separation-of-powers.md",
+    "line": 157,
+    "text": "- P1 (family-distinctness) is ~buildable (~5%→~40% loader-attested hard cap).  "
+  },
+  {
+    "source": "docs/v1.0.0/perfect-endpoint-assessment/waves/w3-a1-roadmap-completeness.md",
+    "line": 92,
+    "text": "| G7-step2 Bert pool ~CPU count | **SHIP** (`resolve_reranker_pool_size`, #1867) |"
+  },
+  {
+    "source": "docs/v1.0.0/perfect-endpoint-assessment/waves/w4-a1-crypto-succession.md",
+    "line": 39,
+    "text": "- **Hash spines** (SHA-256 audit chain, BLAKE3 `cid` outer address) degrade under Grover (~halved bits) but 256-bit digests remain operationally viable if algorithms stay hash-based and re-bindable."
+  },
+  {
+    "source": "docs/v1.0.0/perfect-endpoint-assessment/waves/w4-a3-asi-threats.md",
+    "line": 5,
+    "text": "**Scope:** v0.9 substrate (schema ~v78) as shipped + documented fail-closed knobs; not behavioral “alignment.”  "
+  },
+  {
+    "source": "docs/v1.0.0/perfect-endpoint-assessment/waves/w4-a4-oversight.md",
+    "line": 91,
+    "text": "- `model_attestations` + loader-observed family is **partial model *identity*** attestation (~loader coverage hard-capped; ROADMAP notes ~40% of generation may be off-substrate).  "
+  },
+  {
+    "source": "docs/v1.0.0/perfect-endpoint-assessment/waves/w4-a4-oversight.md",
+    "line": 131,
+    "text": "| Peer ASI (decorrelated) | ~Peer / different bias | Reflect / veto *accounts of self* before persistence; **not** sole truth |"
+  }
+]

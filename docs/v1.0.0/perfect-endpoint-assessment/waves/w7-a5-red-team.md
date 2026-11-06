@@ -434,4 +434,4 @@ Waves 1–4 produced a **strong integrity critique of ai-memory v0.9.0** and a *
 
 ---
 
-*W7-A5 adversarial red-team · entire W1–W4 council · groupthink / weak consensus / missing failures · no code changes · `/Users/fate/Downloads/ai-memory-mcp/waves/w7-a5-red-team.md`*
+*W7-A5 adversarial red-team · entire W1–W4 council · groupthink / weak consensus / missing failures · no code changes · `<home>/Downloads/ai-memory-mcp/waves/w7-a5-red-team.md`*

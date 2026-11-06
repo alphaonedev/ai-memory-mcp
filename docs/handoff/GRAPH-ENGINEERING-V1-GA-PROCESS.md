@@ -61,7 +61,7 @@ Workflows: `.grok/workflows/v1-ga-*.rhai`.
 | Cutline | `docs/audit/3x7-v1-cutline-ruling-2026-08-01.md` |
 | Issues | `docs/audit/3x7-issue-register-2026-08-01.md` |
 | Claims | `docs/audit/3x7-claims-register-2026-08-01.md` |
-| Codegraph | `projectPath=/home/fate_two/v07/v09-dev` only |
+| Codegraph | `projectPath=<home>/v07/v09-dev` only |
 | Rust skills | `~/.claude/skills/rust-skills`, `~/.claude/skills/rust-microsoft` |
 | Memory ns | `ai-memory` — dual protocol every epic beat |
 

@@ -138,13 +138,8 @@ pub fn handle_share(
     let mut metadata = source.metadata.clone();
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert("shared_from_memory_id".into(), json!(source.id.clone()));
-        obj.insert("shared_from_agent_id".into(), json!(from_agent_id.clone()));
         obj.insert("shared_to_agent_id".into(), json!(target_agent_id));
         obj.insert("shared_at".into(), json!(now.clone()));
-        // The shared copy is authored BY the receiving agent for write-auth
-        // purposes; the original author is preserved in
-        // `shared_from_agent_id`.
-        obj.insert("agent_id".into(), json!(target_agent_id));
         // #2122 — covenant clause-1 why_trace path for `memory_share`. The
         // wholesale metadata clone above already INHERITS the source's
         // why_trace (a share is a derivation of an already-stored,
@@ -159,6 +154,19 @@ pub fn handle_share(
             obj.insert(param_names::WHY_TRACE.into(), json!(wt));
         }
     }
+
+    // #8513 — the copy is re-owned. It is authored BY the receiving agent for
+    // write-auth purposes; the original author is preserved in
+    // `shared_from_agent_id`, and the source attestation is dropped.
+    crate::identity::attest::reset_for_reowned_row(
+        &mut metadata,
+        Some(target_agent_id),
+        &crate::identity::attest::ReownProvenance {
+            kind: crate::identity::attest::ReownKind::Share,
+            source_id: &source.id,
+            source_owner: Some(&from_agent_id),
+        },
+    );
 
     let shared_id = uuid::Uuid::new_v4().to_string();
     let shared = Memory {

@@ -1186,7 +1186,7 @@ mod tests {
     fn performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly() {
         // #3113 — the SECOND documented pinned-knob table, pinned the same way
         // as the module doc table above. `PERFORMANCE.md`'s §"Hardened
-        // `asi-hard` security posture" table is what CLAUDE.md env row #130
+        // `asi-hard` security posture" table is what ARCHITECTURE_REFERENCE.md env row #130
         // sends an operator to by name, and it had fallen SEVEN rows behind
         // `KNOBS` (no row for the four #3033 outer-transport gates, neither
         // PERMISSIVE-shaped pin, nor the #3113 schema-integrity pin) with

@@ -333,10 +333,7 @@ pub async fn run(
     } else {
         // #1579 A3 (SECURITY) — a mistyped scheme can still carry
         // credentials in the userinfo; redact before echoing.
-        anyhow::bail!(
-            "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-            crate::url_display::store_url_display(&args.store_url)
-        );
+        return Err(crate::migrate::unrecognised_store_url(&args.store_url));
     };
 
     if args.json {
