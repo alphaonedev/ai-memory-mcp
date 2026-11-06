@@ -76,10 +76,22 @@ and compares the campaign namespace row count with the acknowledgement count.
 System rows (for example agent registration) are excluded explicitly. Empty
 traffic cannot pass. Lost, phantom or modified writes are findings.
 
-The dispatch's generic `verify` command is not present at the base, and MCP
-`memory_verify` verifies a particular signed link. The conductor has been asked
-to confirm the database-integrity substitution; this is not yet claimed as a
-completed P2c proof. The PostgreSQL lane will supply its own integrity adapter
+The conductor confirmed this substitution in ruling b22e1d23. The dispatch's
+generic `verify` command is not present at the base; `memory_verify` checks a
+signed link (`src/mcp/tools/verify.rs:106`), not database integrity. P2c also
+requires graceful shutdown with exit code 0, absence of attributable 503/504
+stores (unique request titles identify requests whose response has no ID),
+and the exact phantom-row count. The report records each query's result and rc.
+
+Before any verifier process starts, the harness counts `signed_events` through
+the read-only connection. Both `verify-signed-events-chain` and
+`verify-audit-trail` inspect this table (`src/signed_events.rs:2454`). They run
+against the same file only when the count is positive; zero rows produce a
+recorded skip with count-query rc 0. A failing verifier prevents P2c passing.
+Finally, one MCP stdio `memory_verify` call uses a stored ID as `link_id` and
+must return the invalid-link-shape diagnostic. Its request, response and process
+rc are recorded as a negative control, never as proof of database integrity.
+None of these post-tier results is claimed executed until the tier runs. The PostgreSQL lane will supply its own integrity adapter
 and minted database via `--backend postgres --db <owner-only-store-url-file>`;
 the report cannot pass a PG integrity cell without that adapter.
 
@@ -96,7 +108,7 @@ red, not an assertion failure in production.
 `python3 -I -m unittest discover -s scripts/test -p test_overload_campaign_7028.py -v`:
 
 ```text
-Ran 23 tests in 48.256s
+Ran 30 tests in 56.514s
 
 OK
 ```
@@ -105,6 +117,10 @@ The release binary build completed with rc 0:
 `Finished release profile [optimized] target(s) in 26m 52s`. The original Cargo
 line wraps the profile name in backticks. The ignored Rust bounds test is still
 held: load1=40.70 against ceiling=17.5. No green Rust-test result is claimed.
+
+The additional integrity rows were red at `0d13e144e`: `Ran 26 tests in
+40.870s`, `errors=4`, rc 1. The current green suite includes refused-write and
+conditional-verifier tests. The earlier preparation suite had 23 passing tests.
 
 These tests use synthetic report fixtures and isolated test databases; they are
 not overload measurements. Python compilation, pyflakes and diff checks return 0.
@@ -117,7 +133,7 @@ not overload measurements. Python compilation, pyflakes and diff checks return 0
 
 P2a: NOT RUN; subscription target gap #8626.
 
-P2c: NOT RUN; integrity-proof substitution awaiting conductor disposition.
+P2c: NOT RUN; integrity-proof substitution confirmed by ruling b22e1d23.
 
 P2e: NOT RUN; direct drain observability gap #8625.
 

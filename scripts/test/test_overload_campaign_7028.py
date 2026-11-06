@@ -171,11 +171,91 @@ class Integrity(unittest.TestCase):
         self.acks.write_text(self.acks.read_text() * 2)
         self.assertFalse(CAMPAIGN.reconcile(self.db, self.acks, "campaign")["ok"])
 
+    def test_refused_receipt_must_be_absent(self):
+        refused = Path(self.temp.name) / "refused.jsonl"
+        refused.write_text(json.dumps({"title": "refused", "status": 503,
+                                      "sha256": hashlib.sha256(b"payload").hexdigest()}) + "\n")
+        result = CAMPAIGN.reconcile(self.db, self.acks, "campaign", refused)
+        self.assertEqual(result["refused_but_present"], 0)
+        self.assertEqual(result["refused_checked"], 1)
+        self.assertTrue(result["ok"])
+
+    def test_refused_store_that_committed_is_a_finding(self):
+        refused = Path(self.temp.name) / "refused.jsonl"
+        for status in (503, 504):
+            with self.subTest(status=status):
+                refused.write_text(json.dumps({"title": "title", "status": status}) + "\n")
+                result = CAMPAIGN.reconcile(self.db, self.acks, "campaign", refused)
+                self.assertEqual(result["refused_but_present"], 1)
+                self.assertFalse(result["ok"])
+
+    def test_phantom_count_and_read_only_query_results_are_explicit(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("INSERT INTO memories VALUES (?, ?, ?, ?)",
+                               ("phantom", "campaign", "extra", "payload"))
+        result = CAMPAIGN.reconcile(self.db, self.acks, "campaign")
+        self.assertEqual(result["phantom_rows"], 1)
+        self.assertEqual(result["queries"][0]["sql"], "PRAGMA integrity_check")
+        self.assertEqual(result["queries"][0]["rc"], 0)
+        self.assertEqual(result["queries"][1]["rows"], [])
+
     def test_empty_workload_fails(self):
         self.acks.write_text("")
         with sqlite3.connect(self.db) as connection:
             connection.execute("DELETE FROM memories WHERE namespace=?", ("campaign",))
         self.assertFalse(CAMPAIGN.reconcile(self.db, self.acks, "campaign")["ok"])
+
+
+class SignedProofs(unittest.TestCase):
+    def setUp(self):
+        Integrity.setUp(self)
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("CREATE TABLE signed_events(id TEXT)")
+
+    def run_proofs(self, rows, verifier_rc=0, mcp_response=None):
+        with sqlite3.connect(self.db) as connection:
+            connection.executemany("INSERT INTO signed_events VALUES (?)", [(str(n),)
+                                                                                for n in range(rows)])
+        directory = Path(self.temp.name)
+        (directory / "acknowledged.jsonl").write_text(self.acks.read_text())
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            if "mcp" in command:
+                request = json.loads(kwargs["input"].splitlines()[-1])
+                self.assertEqual(request["params"]["arguments"]["link_id"], "row")
+                response = mcp_response or {"jsonrpc": "2.0", "id": 2,
+                                            "result": {"isError": True, "content": [{"type": "text",
+                                            "text": "link_id row is not in the expected form"}]}}
+                return subprocess.CompletedProcess(command, 0, json.dumps(response) + "\n", "")
+            return subprocess.CompletedProcess(command, verifier_rc, "{}\n", "")
+
+        with patch.object(CAMPAIGN.subprocess, "run", side_effect=run):
+            proof = CAMPAIGN.post_run_proofs(Path("fixture-binary"), self.db, {}, directory)
+        return proof, calls
+
+    def test_zero_rows_skip_cli_but_keep_negative_control(self):
+        proof, calls = self.run_proofs(0)
+        self.assertTrue(proof["ok"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(proof["count_rc"], 0)
+        self.assertEqual(proof["verifiers"][0]["state"], "SKIP: zero rows")
+        self.assertTrue(proof["negative_control"]["observed"])
+
+    def test_rows_require_both_cli_verifiers(self):
+        proof, calls = self.run_proofs(1)
+        self.assertTrue(proof["ok"])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([row["rc"] for row in proof["verifiers"]], [0, 0])
+
+    def test_verifier_error_prevents_passing_proof(self):
+        proof, _ = self.run_proofs(1, verifier_rc=1)
+        self.assertFalse(proof["ok"])
+
+    def test_missing_negative_control_response_prevents_pass(self):
+        proof, _ = self.run_proofs(0, mcp_response={"jsonrpc": "2.0", "id": 1, "result": {}})
+        self.assertFalse(proof["ok"])
 
 
 class Admission(unittest.TestCase):

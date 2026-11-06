@@ -69,6 +69,9 @@ BODY_LIMIT = 2 * 1024**2
 STRESS_BLOCK_BYTES = 1024**2
 TERM_GRACE_SECONDS = 10
 KILL_GRACE_SECONDS = 5
+PROOF_TIMEOUT_SECONDS = 20
+PROTOCOL_VERSION = "2024-11-05"
+VERIFIERS = ("verify-signed-events-chain", "verify-audit-trail")
 WEBHOOK_URL = "https://example.com/campaign-p-unused"
 
 
@@ -325,29 +328,131 @@ def stress(kind: str, directory: Path, seconds: float) -> int:
     return EXIT_OK
 
 
-def reconcile(db: Path, acknowledgements: Path, namespace: str) -> dict:
-    """Read-only SQLite verification after server shutdown; never migrations."""
+def reconcile(db: Path, acknowledgements: Path, namespace: str,
+              refused: Path | None = None) -> dict:
+    """Read-only SQLite integrity and both-direction receipt reconciliation."""
+    queries = []
     with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True) as connection:
-        integrity = connection.execute("PRAGMA integrity_check").fetchall()
-        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+        def query(sql, parameters=()):
+            rows = connection.execute(sql, parameters).fetchall()
+            queries.append({"sql": sql, "rc": 0, "row_count": len(rows),
+                            "rows": rows if sql.startswith("PRAGMA") else None})
+            return rows
+
+        integrity = query("PRAGMA integrity_check")
+        foreign_keys = query("PRAGMA foreign_key_check")
         seen = set()
         mismatches = 0
+        missing = 0
         with acknowledgements.open() as stream:
             for line in stream:
                 ack = json.loads(line)
                 row = connection.execute(
                     "SELECT title, content FROM memories WHERE id=? AND namespace=?",
                     (ack["id"], namespace)).fetchone()
+                missing += row is None
                 if (ack["id"] in seen or row is None or row[0] != ack["title"]
                         or hashlib.sha256(row[1].encode()).hexdigest() != ack["sha256"]):
                     mismatches += 1
                 seen.add(ack["id"])
-        count = connection.execute("SELECT count(*) FROM memories WHERE namespace=?",
-                                   (namespace,)).fetchone()[0]
-    return {"ok": integrity == [("ok",)] and not foreign_keys and not mismatches
-            and count == len(seen) and bool(seen), "integrity_check": integrity,
-            "foreign_key_violations": len(foreign_keys), "acknowledged": len(seen),
-            "row_count": count, "payload_mismatches": mismatches}
+        actual = {row[0] for row in connection.execute(
+            "SELECT id FROM memories WHERE namespace=?", (namespace,))}
+        phantom = len(actual - seen)
+        refused_checked = refused_present = 0
+        if refused is not None:
+            with refused.open() as stream:
+                for line in stream:
+                    receipt = json.loads(line)
+                    # The server allocates IDs. Unique request titles attribute
+                    # refusals even when the 503/504 body carries no row ID.
+                    count = connection.execute(
+                        "SELECT count(*) FROM memories WHERE namespace=? AND title=?",
+                        (namespace, receipt["title"])).fetchone()[0]
+                    refused_present += count
+                    refused_checked += 1
+        queries.append({"sql": "receipt and namespace reconciliation", "rc": 0,
+                        "row_count": len(actual)})
+    verdict = {"ok": integrity == [("ok",)] and not foreign_keys and not mismatches
+            and not phantom and not refused_present and actual == seen and bool(seen),
+            "integrity_check": integrity, "foreign_key_violations": len(foreign_keys),
+            "acknowledged": len(seen), "row_count": len(actual),
+            "payload_mismatches": mismatches, "missing_rows": missing,
+            "phantom_rows": phantom, "refused_checked": refused_checked,
+            "refused_but_present": refused_present, "queries": queries, "rc": 0}
+    check = "ok" if integrity == [("ok",)] else "not ok"
+    verdict["result_line"] = (
+        f"integrity_check {check}, foreign_key_check {len(foreign_keys)} rows, "
+        f"stores acked {len(seen)}, rows present {len(actual)}, "
+        f"payload mismatches {mismatches}, phantom rows {phantom}, "
+        f"refused-but-present {refused_present}")
+    return verdict
+
+
+def post_run_proofs(binary: Path, db: Path, env: dict, directory: Path) -> dict:
+    """Conditional signed-event verifiers, then an MCP signed-link negative control.
+
+    Both shipped CLI verifiers inspect signed_events (src/signed_events.rs:2454).
+    Counts precede any CLI/MCP process that could append its own audit evidence.
+    """
+    with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True) as connection:
+        signed_count = connection.execute("SELECT count(*) FROM signed_events").fetchone()[0]
+    result = {"signed_events_count": signed_count,
+              "count_query": "SELECT count(*) FROM signed_events", "count_rc": 0,
+              "verifiers": [], "ok": True}
+    for verifier in VERIFIERS:
+        command = [str(binary), "--db", str(db), verifier]
+        command += ["--format", "json"] if verifier == VERIFIERS[0] else ["--json"]
+        if not signed_count:
+            result["verifiers"].append({"command": command, "state": "SKIP: zero rows",
+                                        "count_rc": 0})
+            continue
+        completed = subprocess.run(["nice", "-n", "19", "ionice", "-c", "3", *command],
+                                   env=env, capture_output=True, text=True, check=False,
+                                   timeout=PROOF_TIMEOUT_SECONDS)
+        result["verifiers"].append({"command": command, "rc": completed.returncode,
+                                    "stdout": completed.stdout})
+        (directory / (verifier + ".stderr.log")).write_text(completed.stderr)
+        result["ok"] = result["ok"] and completed.returncode == 0
+    with (directory / "acknowledged.jsonl").open() as stream:
+        first = next(stream, None)
+    if first is None:
+        result["negative_control"] = {"state": "not executed: no stored ID"}
+        result["ok"] = False
+        return result
+    stored_id = json.loads(first)["id"]
+    request = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "memory_verify", "arguments": {"link_id": stored_id}}}
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+            "clientInfo": {"name": "campaign-p-7028", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}, request,
+    ]
+    command = [str(binary), "--db", str(db), "mcp", "--tier", "keyword", "--profile", "full"]
+    completed = subprocess.run(["nice", "-n", "19", "ionice", "-c", "3", *command],
+                               input="".join(json.dumps(row) + "\n" for row in messages),
+                               env=env, capture_output=True, text=True, check=False,
+                               timeout=PROOF_TIMEOUT_SECONDS)
+    (directory / "memory-verify.stderr.log").write_text(completed.stderr)
+    responses = []
+    for line in completed.stdout.splitlines():
+        try:
+            response = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(response, dict) and response.get("id") == 2:
+            responses.append(response)
+    observed = (len(responses) == 1
+                and ("error" in responses[0]
+                     or responses[0].get("result", {}).get("isError") is True)
+                and "not in the expected form" in json.dumps(responses[0])
+                and stored_id in json.dumps(responses[0]))
+    result["negative_control"] = {"command": command, "request": request,
+                                  "rc": completed.returncode, "responses": responses,
+                                  "expected": "stored ID is not a signed-link composite ID",
+                                  "observed": observed}
+    result["ok"] = result["ok"] and completed.returncode == 0 and observed
+    return result
 
 
 def workload(client: Http, clients: int, duration: int, mix: tuple[int, ...],
@@ -362,6 +467,7 @@ def workload(client: Http, clients: int, duration: int, mix: tuple[int, ...],
     resources = []
     thread_errors = []
     acknowledgements = (directory / "acknowledged.jsonl").open("x")
+    refused = (directory / "refused.jsonl").open("x")
 
     def worker(index: int) -> None:
         start.wait()
@@ -381,7 +487,7 @@ def workload(client: Http, clients: int, duration: int, mix: tuple[int, ...],
                 status, data = 0, b""
                 try:
                     status, data = client.call("POST", ROUTES[kind], body)
-                    parsed = json.loads(data)
+                    parsed = {} if status == 504 else json.loads(data)
                     category = str(status)
                     if status == 503 and parsed.get("code") != "OVERLOADED":
                         category = "other"
@@ -405,6 +511,9 @@ def workload(client: Http, clients: int, duration: int, mix: tuple[int, ...],
                             digest = hashlib.sha256(body["content"].encode()).hexdigest()
                             acknowledgements.write(json.dumps({
                                 "id": parsed["id"], "title": title, "sha256": digest}) + "\n")
+                    if kind == "store" and category in ("503", "504"):
+                        refused.write(json.dumps({"title": title, "status": status,
+                                                  "id": parsed.get("id")}) + "\n")
                 sequence += 1
         except Exception as error:  # Stop peers; retain class, never secret-bearing text.
             with lock:
@@ -430,6 +539,7 @@ def workload(client: Http, clients: int, duration: int, mix: tuple[int, ...],
         if any(thread.is_alive() for thread in threads):
             raise TimeoutError("client cleanup deadline")
         acknowledgements.close()
+        refused.close()
     if thread_errors:
         raise RuntimeError("client worker errors: " + ",".join(sorted(set(thread_errors))))
     if not resources:
@@ -488,9 +598,15 @@ def run_tier(args: argparse.Namespace, directory: Path, admission: dict) -> dict
         report["shed_delta"] = after - before
         children.close()
         report["server_exit"] = server.returncode
-        report["integrity"] = (reconcile(db, directory / "acknowledged.jsonl", namespace)
+        report["integrity"] = (reconcile(db, directory / "acknowledged.jsonl", namespace,
+                                         directory / "refused.jsonl")
                                if args.backend == "sqlite" else
                                {"ok": False, "reason": "PG integrity adapter not executed"})
+        if args.backend == "sqlite":
+            report["post_run_proofs"] = post_run_proofs(args.binary, db, env, directory)
+            report["integrity"]["ok"] = (report["integrity"]["ok"]
+                                         and report["server_exit"] == 0
+                                         and report["post_run_proofs"]["ok"])
     finally:
         children.close()
         report["cleanup"] = children.proof()
