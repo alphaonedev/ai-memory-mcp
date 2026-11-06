@@ -95,6 +95,23 @@ class Reports(unittest.TestCase):
         self.assertIn("Clients: 50", result)
         self.assertIn("'p99': 1", result)
 
+    def test_first_wave_preserves_mix_at_every_tier(self):
+        mix = (60, 30, 10)
+        for clients in CAMPAIGN.TIERS:
+            with self.subTest(clients=clients):
+                actual = Counter(CAMPAIGN.operation_for(i, 0, clients, mix)
+                                 for i in range(clients))
+                expected = dict(zip(CAMPAIGN.OPERATIONS,
+                                    (clients * share // 100 for share in mix)))
+                self.assertEqual(actual, expected)
+
+    def test_each_client_rotates_all_operations(self):
+        mix = (60, 30, 10)
+        for index in (0, 14, 49):
+            actual = Counter(CAMPAIGN.operation_for(index, sequence, 50, mix)
+                             for sequence in range(100))
+            self.assertEqual(actual, dict(zip(CAMPAIGN.OPERATIONS, mix)))
+
     def test_mix_validation(self):
         self.assertEqual(CAMPAIGN.parse_mix("60/30/10"), (60, 30, 10))
         with self.assertRaises(argparse.ArgumentTypeError):

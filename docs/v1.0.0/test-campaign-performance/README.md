@@ -30,7 +30,10 @@ Clients issue distinct store titles/content, scoped recalls, and subscription
 registrations with generated HMAC secrets. Subscriptions select deletion events;
 the run writes no deletes, so it measures registration contention without
 introducing external webhook deliveries. Subscriber fan-out remains cell P3.
-Store acknowledgements are written to a private journal for reconciliation.
+The first request wave is apportioned across all operation kinds: at 50 clients,
+30 store, 15 recall and 5 subscribe requests start, and each client rotates
+through the full mix. Store acknowledgements are written to a private journal
+for reconciliation.
 HTTP 201 store receipts are counted separately from 200 (the production create
 handler returns 201 at `src/handlers/create.rs:1073,1627`).
 
@@ -108,7 +111,7 @@ red, not an assertion failure in production.
 `python3 -I -m unittest discover -s scripts/test -p test_overload_campaign_7028.py -v`:
 
 ```text
-Ran 30 tests in 56.514s
+Ran 32 tests in 68.466s
 
 OK
 ```
@@ -120,7 +123,10 @@ held: load1=40.70 against ceiling=17.5. No green Rust-test result is claimed.
 
 The additional integrity rows were red at `0d13e144e`: `Ran 26 tests in
 40.870s`, `errors=4`, rc 1. The current green suite includes refused-write and
-conditional-verifier tests. The earlier preparation suite had 23 passing tests.
+conditional-verifier tests. The earlier preparation suite had 23 passing tests. A later scheduling ratchet
+reproduced the original first-wave defect (50 stores instead of 30/15/5):
+`Ran 1 test in 0.001s`, failures=1. The current suite pins the first-wave mix at
+all three tiers and each client's rotation.
 
 These tests use synthetic report fixtures and isolated test databases; they are
 not overload measurements. Python compilation, pyflakes and diff checks return 0.

@@ -455,6 +455,12 @@ def post_run_proofs(binary: Path, db: Path, env: dict, directory: Path) -> dict:
     return result
 
 
+def operation_for(index: int, sequence: int, clients: int, mix: tuple[int, ...]) -> str:
+    """Choose one operation from the declared percentage schedule."""
+    slot = (index * sum(mix) // clients + sequence) % sum(mix)
+    return OPERATIONS[0 if slot < mix[0] else 1 if slot < sum(mix[:2]) else 2]
+
+
 def workload(client: Http, clients: int, duration: int, mix: tuple[int, ...],
              directory: Path, pid: int, namespace: str) -> dict:
     samples = {kind: {"histogram": Counter(), "status": Counter()} for kind in OPERATIONS}
@@ -474,8 +480,7 @@ def workload(client: Http, clients: int, duration: int, mix: tuple[int, ...],
         sequence = 0
         try:
             while time.monotonic() < deadline[0] and not stop.is_set():
-                slot = (index + sequence) % sum(mix)
-                kind = OPERATIONS[0 if slot < mix[0] else 1 if slot < sum(mix[:2]) else 2]
+                kind = operation_for(index, sequence, clients, mix)
                 title = f"p7028-{index}-{sequence}"
                 body = {"store": {"namespace": namespace, "title": title,
                                    "content": f"campaign record {title}", "tier": "long"},
