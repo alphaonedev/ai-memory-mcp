@@ -127,7 +127,7 @@ fn batch_fixture(db_path: &Path, middle_id: &str, middle_namespace: &str) {
         &conn,
         None,
         None,
-        usize::MAX,
+        rows.len(),
         0,
         None,
         None,
