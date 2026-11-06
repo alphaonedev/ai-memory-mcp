@@ -98,6 +98,119 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     result
 }
 
+fn batch_fixture(db_path: &Path, middle_id: &str, middle_namespace: &str) {
+    let conn = db::open(db_path).unwrap();
+    let rows = [
+        ("aaa-valid", "team", "2026-01-03T00:00:00Z"),
+        (middle_id, middle_namespace, "2026-01-02T00:00:00Z"),
+        ("zzz-valid", "team", "2026-01-01T00:00:00Z"),
+    ];
+    for (id, namespace, timestamp) in rows {
+        let memory = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: "team".into(),
+            title: "batch reflection".into(),
+            content: "batch reflection body".into(),
+            created_at: timestamp.into(),
+            updated_at: timestamp.into(),
+            ..Default::default()
+        };
+        let original = db::insert(&conn, &memory).unwrap();
+        conn.execute(
+            "UPDATE memories SET id = ?1, namespace = ?2, memory_kind = 'reflection' \
+             WHERE id = ?3",
+            rusqlite::params![id, namespace, original],
+        )
+        .unwrap();
+    }
+    let selected = db::list(
+        &conn,
+        None,
+        None,
+        usize::MAX,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["aaa-valid", middle_id, "zzz-valid"],
+        "the refused row must be selected between two valid rows"
+    );
+    db::checkpoint(&conn).unwrap();
+}
+
+fn assert_batch_refusal(existing: bool, invalid_namespace: bool) {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("batch-root");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("protected"), b"unchanged").unwrap();
+    let out_dir = root.join("exports");
+    if existing {
+        fs::create_dir(&out_dir).unwrap();
+        fs::write(out_dir.join("keep"), b"existing export").unwrap();
+    }
+    let (id, namespace, refusal) = if invalid_namespace {
+        ("bbb-valid", "team/...", "refusing export path")
+    } else {
+        ("mmm/../evil", "team", "refusing export id")
+    };
+    let db_path = tmp.path().join("batch.db");
+    batch_fixture(&db_path, id, namespace);
+    let before = tree(&root);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = export_reflections::run(
+        &db_path,
+        &ExportReflectionsArgs {
+            namespace: None,
+            out_dir: Some(out_dir),
+            format: "md".into(),
+            since: None,
+            quiet: false,
+        },
+        &mut CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        },
+    )
+    .expect_err("a refused middle row aborts the entire batch");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains(refusal));
+    assert!(diagnostic.contains(id));
+    assert!(diagnostic.contains(namespace));
+    assert_eq!(tree(&root), before, "no earlier row may modify the tree");
+    assert_eq!(stdout.as_slice(), b"");
+}
+
+#[test]
+fn cli_batch_invalid_id_absent_8598() {
+    assert_batch_refusal(false, false);
+}
+
+#[test]
+fn cli_batch_invalid_id_existing_8598() {
+    assert_batch_refusal(true, false);
+}
+
+#[test]
+fn cli_batch_invalid_namespace_absent_8598() {
+    assert_batch_refusal(false, true);
+}
+
+#[test]
+fn cli_batch_invalid_namespace_existing_8598() {
+    assert_batch_refusal(true, true);
+}
+
 fn assert_writer(writer: Writer, shape: IdShape) {
     // Both an absent output directory and an existing tree must survive refusal.
     for existing in [false, true] {
