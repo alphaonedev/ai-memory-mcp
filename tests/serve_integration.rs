@@ -248,39 +248,127 @@ fn serve_graceful_shutdown_on_sigterm() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let pid = serve.child.as_ref().unwrap().id();
+    // #6237: this test sends the signal its name says. The shared shutdown
+    // primitive (#8193) gives SIGTERM the same graceful path as SIGINT.
+    let (status, stderr) = signal_and_wait(serve, libc::SIGTERM);
+    assert_eq!(
+        status.signal(),
+        None,
+        "#6237: SIGTERM must not kill the daemon by signal: {status:?}\n{stderr}"
+    );
+    assert!(
+        status.success(),
+        "#6237: SIGTERM must exit 0 like SIGINT: {status:?}\n{stderr}"
+    );
+}
 
-    // SIGINT (the daemon's wired signal — see `tokio::signal::ctrl_c()`
-    // in `daemon_runtime::serve`). SIGTERM is not currently wired but
-    // the spec calls the test "shutdown_on_sigterm" — using SIGINT keeps
-    // the assertion meaningful (graceful shutdown path actually runs).
+/// Bound on how long a signalled daemon may take to drain, certify and exit.
+#[cfg(unix)]
+const SIGNAL_EXIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Poll interval while waiting for a signalled daemon to exit.
+#[cfg(unix)]
+const SIGNAL_EXIT_POLL: Duration = Duration::from_millis(100);
+
+/// Marker the serve shutdown future logs the moment a stop signal arrives.
+#[cfg(unix)]
+const SHUTDOWN_BEGIN_MARKER: &str = "shutting down";
+
+/// Marker logged once the deferred-audit queue drained, before the final
+/// witness and WAL checkpoint.
+#[cfg(unix)]
+const AUDIT_DRAINED_MARKER: &str = "deferred-audit queue drained";
+
+/// Send `signal` to the daemon and wait for it to exit; returns its exit
+/// status and its full stderr. Force-kills (and fails) past the deadline.
+#[cfg(unix)]
+fn signal_and_wait(mut serve: ServeChild, signal: i32) -> (std::process::ExitStatus, String) {
+    let pid = serve.child.as_ref().unwrap().id();
+    // SAFETY: `pid` is the id of the child this test spawned and still owns.
     unsafe {
-        libc::kill(i32::try_from(pid).expect("pid fits in i32"), libc::SIGINT);
+        libc::kill(i32::try_from(pid).expect("pid fits in i32"), signal);
     }
-    // Give the daemon up to 10s to flush the WAL and exit.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut serve_mut = serve;
-    let exit_status = loop {
+    let deadline = Instant::now() + SIGNAL_EXIT_DEADLINE;
+    let status = loop {
         if Instant::now() > deadline {
-            // Force kill so the test reports a real failure rather than
-            // hanging the suite.
-            let _ = serve_mut.child.as_mut().unwrap().kill();
-            panic!("daemon did not exit within 10s of SIGINT");
+            let _ = serve.child.as_mut().unwrap().kill();
+            panic!("daemon did not exit within {SIGNAL_EXIT_DEADLINE:?} of signal {signal}");
         }
-        match serve_mut.child.as_mut().unwrap().try_wait() {
+        match serve.child.as_mut().unwrap().try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => std::thread::sleep(SIGNAL_EXIT_POLL),
             Err(e) => panic!("try_wait failed: {e}"),
         }
     };
-    // Discard the child handle so Drop doesn't try to wait again.
-    serve_mut.child = None;
+    // The child already exited; clearing it lets `stop` only join the pipe readers.
+    serve.child = None;
+    let _ = serve.stop();
+    let stderr = serve.stderr();
+    (status, stderr)
+}
 
-    // Either a clean exit (status 0) or signalled-by-INT is acceptable;
-    // what we *don't* want is a panic / abort signal.
-    let signal = exit_status.signal();
+/// #6236 — for BOTH signals: a WAL exists before the signal, the exit is a
+/// success, the shutdown log shows stop then deferred-audit drain, and the
+/// WAL is checkpointed to zero length. SIGTERM must equal SIGINT.
+#[cfg(unix)]
+#[test]
+fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (name, signal) in [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)] {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("ai-memory.db");
+        let serve = spawn_serve(&db, &[], &[]);
+        let client = http_client(&serve);
+        let resp = send_first_request(|| {
+            client
+                .post(serve.url("/api/v1/memories"))
+                .header("X-Agent-Id", "ai:serve-6236")
+                .json(&serde_json::json!({
+                    "tier": "mid",
+                    "namespace": "sig-6236",
+                    "title": format!("before-{name}"),
+                    "content": "written before the stop signal"
+                }))
+        });
+        assert!(
+            resp.status().is_success(),
+            "{name}: create {}",
+            resp.status()
+        );
+        let wal = tmp.path().join("ai-memory.db-wal");
+        assert!(wal.exists(), "{name}: a WAL must exist before the signal");
+
+        let (status, stderr) = signal_and_wait(serve, signal);
+        assert_eq!(status.signal(), None, "{name}: died by signal\n{stderr}");
+        assert!(status.success(), "{name}: exit {status:?}\n{stderr}");
+        let begin = stderr.find(SHUTDOWN_BEGIN_MARKER);
+        let drained = stderr.find(AUDIT_DRAINED_MARKER);
+        assert!(
+            matches!((begin, drained), (Some(b), Some(d)) if b < d),
+            "{name}: log must show stop then audit drain: {begin:?} {drained:?}\n{stderr}"
+        );
+        let wal_len = std::fs::metadata(&wal).map_or(0, |m| m.len());
+        assert_eq!(
+            wal_len, 0,
+            "{name}: WAL must be checkpointed to zero length"
+        );
+    }
+}
+
+/// #6236 — packaging: the image stops with SIGTERM and the admin guide states
+/// the stop grace budget.
+#[test]
+fn dockerfile_stopsignal_and_admin_guide_grace_6236() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).unwrap();
     assert!(
-        exit_status.success() || signal == Some(libc::SIGINT) || signal.is_none(),
-        "unexpected exit: {exit_status:?} signal={signal:?}"
+        dockerfile.lines().any(|l| l.trim() == "STOPSIGNAL SIGTERM"),
+        "#6236: Dockerfile must declare STOPSIGNAL SIGTERM"
+    );
+    let guide = std::fs::read_to_string(root.join("docs/ADMIN_GUIDE.md")).unwrap();
+    assert!(
+        guide.contains("SIGTERM") && guide.contains("--shutdown-grace-secs"),
+        "#6236: docs/ADMIN_GUIDE.md must state SIGTERM handling and the grace budget"
     );
 }
