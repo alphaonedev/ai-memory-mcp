@@ -44,6 +44,18 @@ use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::llm::OllamaClient;
 
+/// How long the mock LLM sits on an `auto_tag` call before answering. The
+/// durable write is proven non-blocking by completing BEFORE this delay
+/// could have elapsed: a write that awaited the LLM cannot return in less
+/// than the delay, so the bound is the property itself, not a host-speed
+/// guess (#8166). 6s sits inside the #2587 measured production range.
+const SLOW_LLM_DELAY: Duration = Duration::from_secs(6);
+
+/// `AppState.llm_call_timeout` for this harness. A write that waited on a
+/// never-answering endpoint would burn this whole budget (#2587), so it is
+/// also the ceiling for the unreachable-LLM test.
+const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// #1751 — permissive attestation opt-out, the same pin
 /// `tests/cov_handlers_llm_wired_1660.rs` carries (unsigned store
 /// fixtures would otherwise 403 under the v0.9 store-path default).
@@ -96,7 +108,7 @@ fn build_autotag_router(
         store,
         llm,
         auto_tag_model: Arc::new(None),
-        llm_call_timeout: Duration::from_secs(30),
+        llm_call_timeout: LLM_CALL_TIMEOUT,
         replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
         verify_require_nonce: false,
         federation_nonce_cache: Arc::new(
@@ -216,16 +228,16 @@ async fn start_delayed_chat_mock(delay: Duration, tags_body: &str) -> MockServer
 
 /// The write returns FAST even though the mock LLM takes multiple
 /// seconds to answer — proving the durable insert no longer waits on
-/// the `auto_tag` LLM call. The mock delay (6s) comfortably exceeds the
-/// #2587 measured production range (4.9-11.1s); the assertion ceiling
-/// (1.5s) is comfortably below it and generous against CI jitter, so
-/// this cannot pass by accident.
+/// the `auto_tag` LLM call. The write must complete before the mock
+/// LLM's `SLOW_LLM_DELAY` could have elapsed. That bound is the property
+/// itself rather than a small wall-clock guess, so host load cannot
+/// break it (#8166: a 1500 ms bound measured 1.53s on a loaded runner).
 ///
 /// **Fails at parent**: pre-#2587 `maybe_auto_tag` awaits the LLM
 /// inline, so the whole request takes >= the mock's 6s delay.
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_llm_does_not_block_the_durable_write_2587() {
-    let mock = start_delayed_chat_mock(Duration::from_secs(6), "rust\nmemory\nasync").await;
+    let mock = start_delayed_chat_mock(SLOW_LLM_DELAY, "rust\nmemory\nasync").await;
     let (router, _f, db) = build_autotag_router(&mock.uri(), true);
 
     let started = Instant::now();
@@ -239,8 +251,9 @@ async fn slow_llm_does_not_block_the_durable_write_2587() {
 
     assert_eq!(status, StatusCode::CREATED, "write must succeed: {body}");
     assert!(
-        elapsed < Duration::from_millis(1500),
-        "the durable write took {elapsed:?} — it must not wait on the 6s-delayed LLM call (#2587)"
+        elapsed < SLOW_LLM_DELAY,
+        "the durable write took {elapsed:?} — it must complete before the \
+         {SLOW_LLM_DELAY:?}-delayed LLM call could answer (#2587)"
     );
     assert_eq!(
         body.get("auto_tagging").and_then(Value::as_str),
@@ -297,8 +310,9 @@ async fn unreachable_llm_does_not_block_or_fail_the_write_2587() {
 
     assert_eq!(status, StatusCode::CREATED, "write must succeed: {body}");
     assert!(
-        elapsed < Duration::from_millis(1500),
-        "the durable write took {elapsed:?} against an LLM endpoint that never answers at all"
+        elapsed < LLM_CALL_TIMEOUT,
+        "the durable write took {elapsed:?} against an LLM endpoint that never answers at all; \
+         it must not consume the {LLM_CALL_TIMEOUT:?} llm_call_timeout (#2587)"
     );
 
     let id = body["id"].as_str().expect("id in response").to_string();
