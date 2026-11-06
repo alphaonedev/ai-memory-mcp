@@ -575,7 +575,7 @@ pub(crate) fn run_http_signed_gate<F: Fn(&str)>(
 #[allow(clippy::too_many_lines)]
 pub async fn approval_decide(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {

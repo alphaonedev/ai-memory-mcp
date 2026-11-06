@@ -20,6 +20,8 @@ use axum::http::{Request, StatusCode};
 use tempfile::TempDir;
 use tower::ServiceExt as _;
 
+mod common;
+
 #[cfg(feature = "sal-postgres")]
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
@@ -32,6 +34,8 @@ const OTHER_AGENT: &str = "ai:other-8590";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MISSING_MEMORY: &str = "/api/v1/memories/85908590-8590-4590-8590-859085908590";
 const ADMIN_ROUTE: &str = "/api/v1/gc";
+const APPROVAL_SECRET: &str = "certificate-approval-hmac-8590";
+static APPROVAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn build_enforce_router() -> (axum::Router, TempDir) {
     build_router_with_store(None)
@@ -323,6 +327,7 @@ async fn postgres_certificate_gate_parity_8590() {
     check_certificate_admin(router.clone()).await;
     check_warn_rewrite(router.clone()).await;
     check_mixed_credentials(router.clone()).await;
+    check_certificate_approval_routes(router.clone()).await;
     drop(router);
     drop(store);
     drop(scratch);
@@ -345,6 +350,73 @@ async fn check_certificate_admin(router: axum::Router) {
 async fn certificate_admin_requires_allowlist_8590() {
     let (router, _dir) = build_enforce_router();
     check_certificate_admin(router).await;
+}
+
+async fn check_certificate_approval_routes(router: axum::Router) {
+    let _guard = APPROVAL_LOCK.lock().await;
+    ai_memory::config::set_active_hooks_hmac_secret(Some(APPROVAL_SECRET.to_string()));
+    for (prefix, suffix, body) in [
+        (
+            "/api/v1/approvals/",
+            "",
+            r#"{"decision":"deny","remember":"once"}"#,
+        ),
+        ("/api/v1/pending/", "/approve", "{}"),
+        ("/api/v1/pending/", "/reject", "{}"),
+    ] {
+        for (binding, expected) in [
+            (
+                Some(ClientCertAgentBinding::new(
+                    Some(CERT_AGENT.to_string()),
+                    AgentBindingMode::Enforce,
+                )),
+                StatusCode::NOT_FOUND,
+            ),
+            (None, StatusCode::FORBIDDEN),
+            (
+                Some(ClientCertAgentBinding::new(
+                    Some(CERT_AGENT.to_string()),
+                    AgentBindingMode::Off,
+                )),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(ClientCertAgentBinding::new(None, AgentBindingMode::Enforce)),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let timestamp = chrono::Utc::now().timestamp().to_string();
+            let signature = common::sign_canonical_envelope(
+                APPROVAL_SECRET,
+                &timestamp,
+                "POST",
+                &ai_memory::handlers::agent_api_key::approval_subject(&id, CERT_AGENT),
+                body,
+            );
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(format!("{prefix}{id}{suffix}"))
+                .header("content-type", "application/json")
+                .header("x-api-key", SHARED_KEY)
+                .header("x-agent-id", CERT_AGENT)
+                .header("x-ai-memory-timestamp", timestamp)
+                .header("x-ai-memory-signature", signature)
+                .body(Body::from(body))
+                .expect("approval request");
+            if let Some(binding) = binding {
+                req.extensions_mut().insert(binding);
+            }
+            check(router.clone(), req, expected).await;
+        }
+    }
+    ai_memory::config::set_active_hooks_hmac_secret(None);
+}
+
+#[tokio::test]
+async fn certificate_shared_key_reaches_all_approval_gates_8590() {
+    let (router, _dir) = build_enforce_router();
+    check_certificate_approval_routes(router).await;
 }
 
 async fn assert_certificate_principal(req: Request<Body>) {

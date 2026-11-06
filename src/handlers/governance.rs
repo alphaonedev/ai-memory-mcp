@@ -15,7 +15,7 @@ use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -191,7 +191,7 @@ fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
 #[allow(clippy::too_many_lines)]
 pub async fn approve_pending(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -529,7 +529,7 @@ pub async fn approve_pending(
 
 pub async fn reject_pending(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
