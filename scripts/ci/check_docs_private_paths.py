@@ -324,8 +324,10 @@ def path_switch_length(path: str) -> int:
     return 0
 
 
-def tilde_start_allowed(text: str, start: int) -> bool:
-    """Use the same option-prefix split for named homes and component paths."""
+def tilde_start_allowed(text: str, start: int, end: int) -> bool:
+    """Named-home paths apply anywhere; bare names retain the option-prefix boundary."""
+    if text[end:end + 1] == PATH_SEPARATOR:
+        return True
     if not start or not (text[start - 1].isalnum() or text[start - 1] in "_~"):
         return True
     left = start
@@ -401,7 +403,7 @@ def findings(text: str, allowed: frozenset[str],
             if (header and
                     header.group()[:-len(SCHEME_SEPARATOR)].casefold() in WEB_URL_SCHEMES):
                 continue
-        if not tilde_start_allowed(text, match.start()):
+        if not tilde_start_allowed(text, match.start(), match.end()):
             continue
         if match.re in (NAMED_HOME, BARE_HOME) and match.group("name")[0].isnumeric():
             continue
