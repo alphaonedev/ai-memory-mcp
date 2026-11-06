@@ -2137,7 +2137,10 @@ fn test_mcp_initialize() {
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 1);
     assert_eq!(resp["result"]["serverInfo"]["name"], "ai-memory");
-    assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(
+        resp["result"]["protocolVersion"],
+        ai_memory::mcp::jsonrpc::SUPPORTED_PROTOCOL_REVISIONS[0]
+    );
     assert!(resp["result"]["capabilities"]["tools"].is_object());
 
     let _ = std::fs::remove_file(&db_path);

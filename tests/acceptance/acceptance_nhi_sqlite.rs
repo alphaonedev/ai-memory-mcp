@@ -1293,7 +1293,7 @@ fn config1_mcp_stdio_full_profile_smoke() {
         &json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "acceptance", "version": "1.0"}
             }
