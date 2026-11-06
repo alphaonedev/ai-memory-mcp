@@ -67,6 +67,8 @@ MIN_DISK_BYTES = 100 * GIB
 MIN_MEMORY_BYTES = 40 * GIB
 BODY_LIMIT = 2 * 1024**2
 STRESS_BLOCK_BYTES = 1024**2
+TERM_GRACE_SECONDS = 10
+KILL_GRACE_SECONDS = 5
 WEBHOOK_URL = "https://example.com/campaign-p-unused"
 
 
@@ -158,7 +160,9 @@ def evaluate(report: dict) -> dict:
                       "P2c": "PASS" if integrity.get("ok") else "FINDING",
                       "P2e": "INDIRECT PASS" if report["probe_status"] == 200
                       and report["shed_stable"] and report["probe_ms"] < 60_000 else "FINDING",
-                      "P2g": "INCOMPLETE: RSS ceiling absent"}}
+                      "P2g": "FINDING" if peak_fd is None or fd_limit is None
+                      or peak_fd >= fd_limit or report["rss_peak_kib"] is None
+                      else "INCOMPLETE: RSS ceiling absent"}}
 
 
 def markdown(report: dict) -> str:
@@ -193,31 +197,32 @@ class Children:
         self.children.append(child)
         return child
 
-    def stop(self, child: subprocess.Popen) -> None:
-        if child.poll() is None:
-            os.killpg(child.pid, signal.SIGTERM)
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.forced.append(child.pid)
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait(timeout=5)
-
-    def close(self) -> None:
-        # Signal every child before waiting; cleanup time is bounded globally,
-        # not multiplied by the number of CPU workers.
-        for child in self.children:
+    def stop_group(self, children: list[subprocess.Popen]) -> None:
+        # Both waits have one shared deadline, independent of worker count.
+        for child in children:
             if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
-        deadline = time.monotonic() + 10
-        for child in self.children:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + TERM_GRACE_SECONDS
+        survivors = []
+        for child in children:
             try:
                 child.wait(timeout=max(0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
+                survivors.append(child)
                 self.forced.append(child.pid)
-                os.killpg(child.pid, signal.SIGKILL)
-        for child in self.children:
-            child.wait(timeout=5)
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + KILL_GRACE_SECONDS
+        for child in survivors:
+            child.wait(timeout=max(0, deadline - time.monotonic()))
+
+    def close(self) -> None:
+        self.stop_group(self.children)
         for handle in self.handles:
             handle.close()
 
@@ -462,14 +467,16 @@ def run_tier(args: argparse.Namespace, directory: Path, admission: dict) -> dict
             report["binary_sha256"] = hashlib.file_digest(binary, "sha256").hexdigest()
         before = client.shed()
         cpu_workers = max(0, len(os.sched_getaffinity(0)) - 1)
+        stressors = []
         for index in range(cpu_workers + 1):
             kind = "cpu" if index < cpu_workers else "io"
-            children.start([sys.executable, str(Path(__file__).resolve()), "--stressor", kind,
-                            "--scratch", str(directory), "--duration", str(args.duration)],
-                           directory / f"stressor-{index}.log", env)
+            stressors.append(children.start([sys.executable, str(Path(__file__).resolve()), "--stressor", kind,
+                            "--scratch", str(directory), "--duration", str(TIER_CAP)],
+                           directory / f"stressor-{index}.log", env))
         namespace = NAMESPACE + "/" + directory.name
         report.update(workload(client, args.clients, args.duration, args.mix,
                                directory, server.pid, namespace))
+        children.stop_group(stressors)
         after = client.shed()
         probe_start = time.monotonic()
         report["probe_status"] = client.call("POST", ROUTES["recall"],
@@ -514,8 +521,9 @@ def main() -> int:
     parser.add_argument("--scratch", type=Path, default=SCRATCH, help=argparse.SUPPRESS)
     parser.add_argument("--admission-only", action="store_true")
     args = parser.parse_args()
-    if not 1 <= args.duration <= MAX_DURATION:
-        parser.error(f"duration must be 1..{MAX_DURATION} seconds within the {TIER_CAP}s tier cap")
+    max_duration = TIER_CAP if args.stressor else MAX_DURATION
+    if not 1 <= args.duration <= max_duration:
+        parser.error(f"duration must be 1..{max_duration} seconds within the {TIER_CAP}s tier cap")
     if args.stressor:
         if not args.scratch.resolve().is_relative_to(SCRATCH.resolve()):
             parser.error("stressor scratch must be project-local")

@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 MODULE = Path(__file__).with_name("overload_campaign.py")
 SPEC = importlib.util.spec_from_file_location("overload_campaign", MODULE)
@@ -74,7 +74,9 @@ class Reports(unittest.TestCase):
             with self.subTest(name=name, value=value):
                 report = fixture()
                 report[name] = value
-                self.assertEqual(CAMPAIGN.evaluate(report)["verdict"], "FINDING")
+                result = CAMPAIGN.evaluate(report)
+                self.assertEqual(result["verdict"], "FINDING")
+                self.assertEqual(result["cells"]["P2g"], "FINDING")
 
     def test_recovery_requires_non_exempt_success_and_stable_counter(self):
         for name, value in (("probe_status", 503), ("shed_stable", False), ("probe_ms", 60000)):
@@ -97,6 +99,36 @@ class Reports(unittest.TestCase):
         self.assertEqual(CAMPAIGN.parse_mix("60/30/10"), (60, 30, 10))
         with self.assertRaises(argparse.ArgumentTypeError):
             CAMPAIGN.parse_mix("60/30/0")
+
+
+class Cleanup(unittest.TestCase):
+    def test_workers_share_term_and_kill_deadlines(self):
+        with patch.object(CAMPAIGN.atexit, "register"):
+            group = CAMPAIGN.Children()
+        children = [MagicMock(pid=n) for n in (111, 222)]
+        for child in children:
+            child.poll.return_value = None
+            child.wait.side_effect = [subprocess.TimeoutExpired("fixture", 10), 0]
+        with patch.object(CAMPAIGN.os, "killpg") as kill, patch.object(
+                CAMPAIGN.time, "monotonic", side_effect=[0, 1, 10, 10, 11, 15]):
+            group.stop_group(children)
+        self.assertEqual(children[0].wait.call_args_list[0].kwargs["timeout"], 9)
+        self.assertEqual(children[1].wait.call_args_list[0].kwargs["timeout"], 0)
+        self.assertEqual(children[0].wait.call_args_list[1].kwargs["timeout"], 4)
+        self.assertEqual(children[1].wait.call_args_list[1].kwargs["timeout"], 0)
+        self.assertEqual(kill.call_count, 4)
+        self.assertEqual(group.forced, [111, 222])
+
+    def test_term_exit_race_is_reaped(self):
+        with patch.object(CAMPAIGN.atexit, "register"):
+            group = CAMPAIGN.Children()
+        child = MagicMock(pid=111)
+        child.poll.return_value = None
+        child.wait.return_value = 0
+        with patch.object(CAMPAIGN.os, "killpg", side_effect=ProcessLookupError):
+            group.stop_group([child])
+        child.wait.assert_called_once()
+        self.assertEqual(group.forced, [])
 
 
 class Integrity(unittest.TestCase):
