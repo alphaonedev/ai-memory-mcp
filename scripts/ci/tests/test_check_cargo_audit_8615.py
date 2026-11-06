@@ -360,5 +360,49 @@ class CargoAudit8615Tests(unittest.TestCase):
                 self.assertEqual(GATE.main([]), 1)
 
 
+class UnknownKeys8615Tests(unittest.TestCase):
+    """R6 Decision 4: unknown keys are refused by name in both audit files."""
+
+    def load(self, audit_extra="", metadata_extra="", advisories_extra="", metadata_prefix=""):
+        """Run load_policy over generated files with extra text spliced in."""
+        audit, metadata = policy_documents()
+        audit = audit + advisories_extra + audit_extra
+        with patch.object(Path, "read_text", side_effect=[audit, metadata_prefix + metadata + metadata_extra]):
+            return GATE.load_policy()
+
+    def refusal(self, pattern, **extra):
+        """The refusal names the file, the table and the offending key."""
+        with self.assertRaisesRegex(ValueError, pattern) as caught:
+            self.load(**extra)
+        return str(caught.exception)
+
+    def test_8615_unknown_advisories_key_is_rejected(self):
+        message = self.refusal("audit.toml.*advisories.*allow_everything",
+                               advisories_extra="allow_everything = true\n")
+        self.assertIn("unknown cargo-audit fields", message)
+
+    def test_8615_allowed_advisories_keys_pass(self):
+        extra = 'informational_warnings = ["unmaintained"]\nseverity_threshold = "low"\n'
+        self.assertEqual(self.load(advisories_extra=extra), EXCEPTIONS)
+
+    def test_8615_unknown_exceptions_toplevel_key_is_rejected(self):
+        self.refusal("audit-exceptions.toml.*allow_unlisted",
+                     metadata_prefix="allow_unlisted = true\n")
+
+    def test_8615_unknown_exceptions_toplevel_table_is_rejected(self):
+        self.refusal("audit-exceptions.toml.*waivers",
+                     metadata_extra="\n[waivers]\nall = true\n")
+
+    def test_8615_unknown_key_refused_before_auditor_runs(self):
+        audit, metadata = policy_documents()
+        audit = audit.replace("[advisories]\n", "[advisories]\nallow_everything = true\n")
+        with patch.object(Path, "read_text", side_effect=[audit, metadata]), \
+                patch.object(GATE.subprocess, "run") as runner, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(GATE.main([]), 1)
+        runner.assert_not_called()
+        self.assertIn("allow_everything", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
