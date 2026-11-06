@@ -189,6 +189,27 @@ class DocsPrivatePaths(unittest.TestCase):
                     self.assertEqual(self.run_gate("--fix").returncode, 0)
                     self.assertEqual(self.doc.read_text(), text)
 
+    def test_double_tilde_and_word_glued_named_homes_r12(self):
+        self.assert_repairs(tuple(
+            (left + "~private_account" + tail, left + "<home>" + tail)
+            for left, tail in (("~", "/x"), ("~~", "/x~~"), ("/srv/~", "/x"),
+                               ("a", "/x"), ("_", "/x"), ("9", "/x"), ("a-", "/x"))
+        ))
+
+    def test_strikethrough_and_trailing_tilde_controls_r12(self):
+        for text in ("~~word~~", "v1~", "abc~", "~~was here~~"):
+            with self.subTest(text=text):
+                self.doc.write_text(text)
+                self.assertEqual(self.run_gate().returncode, 0)
+                self.assertEqual(self.run_gate("--fix").returncode, 0)
+                self.assertEqual(self.doc.read_text(), text)
+
+    def test_near_miss_tilde_web_names_r12(self):
+        self.assert_repairs(tuple(
+            (left + "~" + name + "://h/x", left + "<home>://h/x")
+            for left in ("-L", "--sysroot") for name in ("https2", "httpsx")
+        ))
+
     def test_invisible_breaks_tilde_web_header_r11(self):
         self.assert_repairs(tuple(
             ("~" + scheme + invisible + "://h/home/private_account/x", "<home>:<home>/x")

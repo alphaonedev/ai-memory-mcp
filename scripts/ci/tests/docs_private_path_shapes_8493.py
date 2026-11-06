@@ -204,19 +204,35 @@ def shapes():
         yield Shape(f"tilde-web:{scheme}:{root}:{name}", left + prefix + "/x", spans)
 
     # Round 11 F1: a scheme-looking suffix does not make an account a web header.
+    # Round 12 INFO: near-miss web names and both library/generic option prefixes.
     for (left, closing), name, tail in product(
-            (("", ""), ("see ", ""), ("`", "`"), ("-I", ""), ("/srv/", "")),
-            ("private_account", "private\u200bq", "private_account.x"),
+            (("", ""), ("see ", ""), ("`", "`"), ("-I", ""), ("-L", ""),
+             ("--sysroot", ""), ("/srv/", "")),
+            ("private_account", "private\u200bq", "private_account.x", "https2", "httpsx"),
             ("://h/x", ":///x", "://")):
         prefix = "~" + name
         yield Shape(f"tilde-non-web:{left}:{name!r}:{tail}",
                     left + prefix + tail + closing, ((len(left), len(left + prefix)),))
     # Independent literals for the gate's WEB_URL_SCHEMES; valid headers are public twins.
     for (left, closing), scheme, tail in product(
-            (("", ""), ("see ", ""), ("`", "`"), ("-I", ""), ("/srv/", "")),
+            (("", ""), ("see ", ""), ("`", "`"), ("-I", ""), ("-L", ""),
+             ("--sysroot", ""), ("/srv/", "")),
             ("http", "https", "HTTP", "HTTPS"), ("://h/x", ":///x", "://")):
         yield Shape(f"tilde-web-public:{left}:{scheme}:{tail}",
                     left + "~" + scheme + tail + closing, ())
+
+    # Round 12 F1: slash-backed named homes apply anywhere, preserving their left bytes.
+    for (left, tail), (name, private) in product(
+            (("~", "/x"), ("~~", "/x~~"), ("/srv/~", "/x"),
+             ("a", "/x"), ("_", "/x"), ("9", "/x")), names):
+        prefix = "~" + name
+        spans = ((len(left), len(left + prefix)),) if private else ()
+        yield Shape(f"glued-named-home:{left}:{name}:{tail}", left + prefix + tail, spans)
+    for text in ("~~word~~", "v1~", "abc~", "~~was here~~"):
+        yield Shape("glued-tilde-public:" + text, text, ())
+    prefix = "~private_account"
+    yield Shape("hyphen-named-home-control", "a-" + prefix + "/x",
+                ((len("a-"), len("a-" + prefix)),))
 
     # Round 11 F2: original INVISIBLE bytes break the header into two private prefixes.
     for left, scheme, invisible, root in product(
