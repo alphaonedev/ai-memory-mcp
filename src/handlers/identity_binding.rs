@@ -22,6 +22,10 @@
 //! introduces NO new signed request envelope — it reuses the presented
 //! per-agent key.
 //!
+//! #8590 also admits an active verified client-certificate mapping to the
+//! effective caller. [`IdentityHeaders`] carries that typed request context;
+//! copying wire headers alone never grants certificate authority.
+//!
 //! The [`crate::handlers::api_key_auth`] middleware BINDS the presented per-agent
 //! key's `agent_id` onto the `X-Agent-Id` header; the IDOR/admin gates re-derive
 //! the caller's [`AuthLevel`] self-containedly from the enrolled map + presented
@@ -39,18 +43,74 @@ use sha2::{Digest, Sha256};
 
 use crate::config::HttpIdentityMode;
 
-/// The provenance of the caller's resolved `agent_id` on the HTTP surface.
+/// Request headers together with certificate provenance from the TLS acceptor.
+///
+/// #8590: plain HTTP headers cannot carry trusted certificate identity. This
+/// extractor preserves the typed extension through the legacy IDOR/admin gates
+/// (ERRORS-09). Constructing it from headers alone supplies no certificate proof.
+#[derive(Clone, Debug, Default)]
+pub struct IdentityHeaders {
+    headers: axum::http::HeaderMap,
+    cert_agent: Option<String>,
+}
+
+impl From<axum::http::HeaderMap> for IdentityHeaders {
+    fn from(headers: axum::http::HeaderMap) -> Self {
+        Self {
+            headers,
+            cert_agent: None,
+        }
+    }
+}
+
+impl std::ops::Deref for IdentityHeaders {
+    type Target = axum::http::HeaderMap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.headers
+    }
+}
+
+impl std::ops::DerefMut for IdentityHeaders {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.headers
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for IdentityHeaders {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let cert_agent = parts
+            .extensions
+            .get::<crate::mtls_agent_binding::ClientCertAgentBinding>()
+            .and_then(crate::mtls_agent_binding::ClientCertAgentBinding::effective_agent_id)
+            .map(str::to_owned);
+        let headers = axum::http::HeaderMap::from_request_parts(parts, state).await?;
+        Ok(Self {
+            headers,
+            cert_agent,
+        })
+    }
+}
+
+/// The legacy credential-strength category for the HTTP caller's `agent_id`.
 ///
 /// Re-derived per request by [`resolve_auth_level`] and consumed by the
-/// IDOR/admin gates (via [`enforce_sensitive_identity`]). Ordering is significant:
-/// `Claimed < KeyAuthenticated < SignatureAttested` by assurance.
+/// IDOR/admin gates (via [`enforce_sensitive_identity`]). Certificate provenance
+/// remains distinct in [`crate::identity::authority::Binding::ClientCert`]; this
+/// legacy category records gate eligibility, not the full identity ladder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthLevel {
     /// Self-asserted `X-Agent-Id` only — proven possession of the SHARED
     /// transport credential (or a keyless bind), NOT of this principal. The
     /// spoofable level the #2044 fix distrusts on sensitive paths.
     Claimed,
-    /// The presented `X-API-Key` is an enrolled PER-AGENT key whose
+    /// An active verified client-certificate binding matches this principal,
+    /// or the presented `X-API-Key` is an enrolled PER-AGENT key whose
     /// `sha256(token)` resolved to this `agent_id` (`agent_api_keys` table).
     /// Cryptographic-secret possession of this principal.
     KeyAuthenticated,
@@ -357,10 +417,11 @@ impl Default for EnrolledAgentKeys {
     }
 }
 
-/// #2044 — re-derive the caller's [`AuthLevel`] SELF-CONTAINEDLY from the
-/// presented `X-API-Key` header and the boot-seeded enrolled per-agent-key map.
+/// Re-derive the caller's [`AuthLevel`] from trusted certificate context or
+/// the presented `X-API-Key` and live enrolled per-agent-key map.
 ///
-/// Returns [`AuthLevel::KeyAuthenticated`] iff the presented api-key is an
+/// Returns [`AuthLevel::KeyAuthenticated`] when an active certificate binding
+/// from the typed request extension matches `caller`, or the presented api-key is an
 /// enrolled per-agent key whose bound `agent_id` EQUALS `caller` (the header the
 /// [`crate::handlers::api_key_auth`] middleware already bound to the key-derived
 /// principal). Otherwise [`AuthLevel::Claimed`] — a shared-transport-key or
@@ -370,9 +431,14 @@ impl Default for EnrolledAgentKeys {
 #[must_use]
 pub fn resolve_auth_level(
     enrolled: &EnrolledAgentKeys,
-    headers: &axum::http::HeaderMap,
+    headers: &IdentityHeaders,
     caller: &str,
 ) -> AuthLevel {
+    // #8590 / ERRORS-09: equality is required even after middleware binding.
+    // No wire header, inactive mapping or absent extension can establish proof.
+    if headers.cert_agent.as_deref() == Some(caller) {
+        return AuthLevel::KeyAuthenticated;
+    }
     // #3418 — ONE snapshot for this decision. Taking it once (rather than
     // consulting the registry twice) means a concurrent refresh cannot make
     // the emptiness check and the lookup disagree.
@@ -421,7 +487,7 @@ pub fn resolve_auth_level_in(
 pub fn enforce_for_request(
     enrolled: &EnrolledAgentKeys,
     mode: HttpIdentityMode,
-    headers: &axum::http::HeaderMap,
+    headers: &IdentityHeaders,
     caller: &str,
     endpoint: &str,
 ) -> Option<Response> {
@@ -479,7 +545,7 @@ pub fn inert_enforce_boot_reason(mode: HttpIdentityMode, enrolled_count: usize) 
 pub fn enforce_idor_identity(
     enrolled: &EnrolledAgentKeys,
     mode: HttpIdentityMode,
-    headers: &axum::http::HeaderMap,
+    headers: &IdentityHeaders,
     endpoint: &str,
 ) -> Option<Response> {
     let header_agent_id = headers
@@ -515,9 +581,8 @@ pub fn enforce_sensitive_identity(
     if mode == HttpIdentityMode::Off {
         return None;
     }
-    // A key-bound caller (a per-agent key whose bound agent_id == the header the
-    // middleware already bound) is always acceptable — it proved possession of
-    // this principal's server-held secret.
+    // A credential-bound caller (per-agent API key or active verified client
+    // certificate mapping to this caller) has proved control of the principal.
     if level.is_key_bound() {
         return None;
     }
@@ -560,8 +625,8 @@ pub fn enforce_sensitive_identity(
                     Json(json!({
                         "error": "attested_identity_required",
                         "message": "X-Agent-Id is self-asserted; present the agent's \
-                                    enrolled per-agent api-key (X-API-Key) to act as \
-                                    this principal",
+                                    enrolled per-agent api-key (X-API-Key) or a verified \
+                                    client certificate mapped to this principal to act as it",
                         "endpoint": endpoint,
                     })),
                 )
@@ -661,7 +726,7 @@ mod tests {
         let map = EnrolledAgentKeys::empty();
         let headers = axum::http::HeaderMap::new();
         assert_eq!(
-            resolve_auth_level(&map, &headers, "alice"),
+            resolve_auth_level(&map, &headers.clone().into(), "alice"),
             AuthLevel::Claimed
         );
     }
@@ -678,12 +743,12 @@ mod tests {
         );
         // Key bound to alice, acting as alice → KeyAuthenticated.
         assert_eq!(
-            resolve_auth_level(&map, &headers, "alice"),
+            resolve_auth_level(&map, &headers.clone().into(), "alice"),
             AuthLevel::KeyAuthenticated
         );
         // Same key, acting as bob → Claimed (cannot borrow alice's attestation).
         assert_eq!(
-            resolve_auth_level(&map, &headers, "bob"),
+            resolve_auth_level(&map, &headers.clone().into(), "bob"),
             AuthLevel::Claimed
         );
     }
@@ -699,7 +764,7 @@ mod tests {
             axum::http::HeaderValue::from_static("shared-global-key"),
         );
         assert_eq!(
-            resolve_auth_level(&map, &headers, "alice"),
+            resolve_auth_level(&map, &headers.clone().into(), "alice"),
             AuthLevel::Claimed
         );
     }

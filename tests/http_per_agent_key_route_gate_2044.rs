@@ -250,8 +250,11 @@ async fn h1_recall_shared_key_victim_spoof_is_403_under_enforce() {
 // sites, so this direct test is the load-bearing guarantee for every one.
 // ---------------------------------------------------------------------------
 
-fn headers_with_key(api_key: &str, agent_id: &str) -> axum::http::HeaderMap {
-    let mut h = axum::http::HeaderMap::new();
+fn headers_with_key(
+    api_key: &str,
+    agent_id: &str,
+) -> ai_memory::handlers::identity_binding::IdentityHeaders {
+    let mut h = ai_memory::handlers::identity_binding::IdentityHeaders::default();
     h.insert("x-api-key", api_key.parse().unwrap());
     h.insert("x-agent-id", agent_id.parse().unwrap());
     h

@@ -11,11 +11,13 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use chrono::Utc;
@@ -79,7 +81,7 @@ fn register_agent_response(
 
 pub async fn register_agent(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<RegisterAgentBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_agent_id(&body.agent_id) {
@@ -358,7 +360,7 @@ const BIND_PRINCIPAL_GATE: crate::handlers::admin_role::PrincipalGate =
 /// admin. Nothing is bound on a refusal.
 async fn require_bind_principal(
     app: &AppState,
-    headers: &HeaderMap,
+    headers: &IdentityHeaders,
     agent_id: &str,
 ) -> Result<String, axum::response::Response> {
     let caller = require_admin(app, headers, BIND_AGENT_PUBKEY_ACTION)?;
@@ -382,7 +384,7 @@ async fn require_bind_principal(
 
 pub async fn bind_agent_pubkey(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyBody>,
 ) -> impl IntoResponse {
@@ -630,7 +632,7 @@ async fn consume_bind_challenge(
 // consume-on-replica-B work on the shared PostgreSQL tier.
 pub async fn bind_agent_pubkey_challenge(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<crate::models::BindAgentPubkeyChallengeBody>,
 ) -> impl IntoResponse {
@@ -680,7 +682,7 @@ pub async fn bind_agent_pubkey_challenge(
 
 pub async fn list_agents(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
 ) -> impl IntoResponse {
     // #946 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
     // only gate. Pre-fix any caller could enumerate the full NHI
@@ -756,7 +758,7 @@ pub struct QuotaStatusBody {
 /// scratch sqlite connection.
 pub async fn quota_status_handler(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<QuotaStatusBody>,
 ) -> impl IntoResponse {
     // #2138 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
@@ -888,7 +890,7 @@ pub async fn quota_status_handler(
 
 pub async fn get_stats(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<crate::handlers::inventory::StatsQuery>,
 ) -> impl IntoResponse {
     // #946 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-only
@@ -956,7 +958,7 @@ pub async fn get_stats(
     Json(envelope).into_response()
 }
 
-pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+pub async fn run_gc(State(app): State<AppState>, headers: IdentityHeaders) -> impl IntoResponse {
     // #1027 (security-critical, 2026-05-21) — admin-role gate. GC
     // permanently sweeps expired rows; pre-#1027 the handler logged
     // the caller to the forensic chain but accepted ANY API-key
@@ -1161,7 +1163,7 @@ fn survivor_ids(memories: &[Memory]) -> std::collections::HashSet<String> {
 
 pub async fn export_memories(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<ExportQuery>,
 ) -> impl IntoResponse {
     // #957 (security-critical, 2026-05-20) — admin-role gate.
@@ -1313,7 +1315,7 @@ pub async fn export_memories(
 
 pub async fn import_memories(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<ImportBody>,
 ) -> impl IntoResponse {
     if body.memories.len() > MAX_BULK_SIZE {

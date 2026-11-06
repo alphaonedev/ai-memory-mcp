@@ -41,6 +41,8 @@
 //! `X-Agent-Id` header semantics apply across the existing 60 routes
 //! and these 14 new ones.
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 #[cfg(feature = "sal")]
 use crate::models::field_names;
 use axum::{
@@ -293,7 +295,7 @@ async fn reflect_fanout(
 /// dispatch uses.
 pub async fn handle_smart_load_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #2137 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
@@ -445,7 +447,7 @@ async fn smart_load_http_via_store(
 /// has a daemon keypair on disk (matching the MCP behaviour).
 pub async fn handle_reflect_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #2140 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate. Under
@@ -836,7 +838,7 @@ pub async fn handle_recall_observations_http(
 /// #3232 HTTP disposition (the header-asserted id, anonymous when absent —
 /// the #3549 authority layer has already refused a malformed assertion
 /// before this runs), with an enrolled admin reading trust-all (`None`).
-fn http_read_caller(app: &AppState, headers: &HeaderMap) -> Option<String> {
+fn http_read_caller(app: &AppState, headers: &IdentityHeaders) -> Option<String> {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
@@ -899,7 +901,7 @@ async fn pg_row_readable(app: &AppState, caller: Option<&str>, id: &str) -> bool
 /// observation set. Read-only.
 pub async fn handle_reflection_origin_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #3600 — the same caller gate the MCP handler applies (sqlite arm) /
@@ -953,7 +955,7 @@ pub async fn handle_reflection_origin_http(
 /// L2-3 / #668 substrate. Read-only.
 pub async fn handle_dependents_of_invalidated_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #3599 — the same caller gate the MCP handler applies.
@@ -1064,7 +1066,7 @@ async fn dependents_http_via_store(
 /// The reflection and every linked source must be readable before rendering.
 pub async fn handle_export_reflection_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if let Some(response) = super::identity_binding::enforce_idor_identity(
@@ -1321,7 +1323,7 @@ struct CalibrateHttpCaller {
 /// 4. Everyone else is scoped to their own principal.
 fn resolve_calibrate_http_caller(
     app: &AppState,
-    headers: &HeaderMap,
+    headers: &IdentityHeaders,
 ) -> Result<CalibrateHttpCaller, axum::response::Response> {
     let header_present = headers
         .get(crate::HEADER_AGENT_ID)
@@ -1373,7 +1375,7 @@ fn forbidden_calibrate_caller() -> axum::response::Response {
 /// cross-namespace global sweep to an ordinary caller.
 pub async fn handle_calibrate_confidence_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let caller = match resolve_calibrate_http_caller(&app, &headers) {
@@ -1459,7 +1461,7 @@ async fn calibrate_confidence_http_via_store(
 /// Read-only.
 pub async fn handle_verify_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #3601 — both endpoints must be readable by the caller (the MCP
@@ -1586,7 +1588,7 @@ async fn verify_http_via_store(
 /// [`crate::mcp::handle_replay`] (issue #1075 SR-1 #1 HIGH).
 pub async fn handle_replay_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
@@ -1787,7 +1789,7 @@ async fn replay_http_via_store(
 /// #1115 SR-1 #5 HIGH): only the subscription's owner can replay it.
 pub async fn handle_subscription_replay_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
@@ -1825,7 +1827,7 @@ pub async fn handle_subscription_replay_http(
 /// subscriptions.
 pub async fn handle_subscription_dlq_list_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE

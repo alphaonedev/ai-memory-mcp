@@ -20,9 +20,11 @@
 //! daemon identity or `system` — that would attribute every tenant's rewind to
 //! the daemon. No W-of-N fan-out: containment is node-local at GA (ruling R2.6).
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
@@ -87,7 +89,7 @@ fn parse(body: &Value) -> Result<RewindArgs, Response> {
 /// `POST /api/v1/memory_swarm_rewind`.
 pub async fn handle_swarm_rewind_http(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<Value>,
 ) -> Response {
     // The admin gate's RETURN VALUE is the issuer: an id that passed the admin

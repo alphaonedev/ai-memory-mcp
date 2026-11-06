@@ -92,7 +92,14 @@ fn an_empty_enrolled_map_stays_inert_on_the_request_path_3155() {
         HttpIdentityMode::Enforce,
     ] {
         assert!(
-            enforce_for_request(&enrolled, mode, &headers, "boss", "/api/v1/export").is_none(),
+            enforce_for_request(
+                &enrolled,
+                mode,
+                &headers.clone().into(),
+                "boss",
+                "/api/v1/export"
+            )
+            .is_none(),
             "{mode:?} with an EMPTY enrolled map must still serve the request — the \
              #1985 unsatisfiable-default trap is deliberate, and #3155 adds a boot \
              signal rather than changing this"
@@ -118,7 +125,7 @@ fn enforce_refuses_a_claimed_caller_once_a_key_is_enrolled_3155() {
         enforce_for_request(
             &enrolled,
             HttpIdentityMode::Enforce,
-            &headers,
+            &headers.clone().into(),
             "boss",
             "/api/v1/export",
         )

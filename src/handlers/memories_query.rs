@@ -11,11 +11,13 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde_json::json;
@@ -36,7 +38,7 @@ use crate::visibility::is_readable_on_query;
 
 pub async fn list_memories(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(p): Query<ListQuery>,
 ) -> impl IntoResponse {
     // #197: validate agent_id filter values
@@ -245,7 +247,7 @@ pub async fn list_memories(
 
 pub async fn search_memories(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Query(mut p): Query<SearchQuery>,
 ) -> impl IntoResponse {
     // #891: source_uri-only queries are valid (Gap 6 #889 reciprocal
@@ -619,7 +621,7 @@ pub async fn search_memories(
 
 pub async fn forget_memories(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<ForgetQuery>,
 ) -> impl IntoResponse {
     // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — admin-only
