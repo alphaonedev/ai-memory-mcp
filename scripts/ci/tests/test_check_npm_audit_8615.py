@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -260,6 +261,67 @@ class NpmInstalledVersions8615Tests(unittest.TestCase):
         with self.assertRaises(gate.AuditError):
             gate.read_versions(self.prefix, self.report)
 
+    def run_main(self, exceptions=None, report=None):
+        """Run main() against this prefix with a patched npm report; return (rc, stderr)."""
+        report = report or {"deepmerge": {"nodes": [DEEP_MERGE_NODE]}}
+        result = subprocess.CompletedProcess([], 1, "{}", "")
+        stderr = io.StringIO()
+        argv = ["--prefix", str(self.prefix)]
+        if exceptions is not None:
+            argv += ["--exceptions", str(exceptions)]
+        with patch.object(gate.subprocess, "run", return_value=result), \
+                patch.object(gate, "check_report", return_value=report), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            if exceptions is None:
+                with patch.object(gate, "load_exception_file", return_value=[]):
+                    code = gate.main(argv)
+            else:
+                code = gate.main(argv)
+        return code, stderr.getvalue()
+
+    def test_8615_self_symlinked_node_is_one_fixed_line(self):
+        shutil.rmtree(self.prefix / DEEP_MERGE_NODE)
+        (self.prefix / DEEP_MERGE_NODE).symlink_to(self.prefix / DEEP_MERGE_NODE)
+        for error in (None, RuntimeError("private-value /secret/path"), OSError("private-value /secret/path")):
+            with self.subTest(error=repr(error)):
+                if error is None:
+                    code, diagnostic = self.run_main()
+                else:
+                    with patch.object(Path, "resolve", side_effect=error):
+                        code, diagnostic = self.run_main()
+                self.assertEqual(code, 1)
+                self.assertEqual(len(diagnostic.splitlines()), 1)
+                self.assertRegex(diagnostic, r"unexpected gate error \(RuntimeError\)|file I/O error \(OSError\)")
+                self.assertNotIn("Traceback", diagnostic)
+                self.assertNotIn("private-value", diagnostic)
+                self.assertNotIn("/secret", diagnostic)
+                self.assertNotIn(str(self.root), diagnostic)
+
+    def test_8615_malformed_exception_files_are_named_without_identity(self):
+        cases = {"trailing comma": '{"entries": [],}',
+                 "duplicate key": '{"entries": [], "entries": []}'}
+        for name, text in cases.items():
+            path = self.root / "exceptions.json"
+            path.write_text(text)
+            with self.subTest(name=name):
+                code, diagnostic = self.run_main(exceptions=path)
+                self.assertEqual(code, 1)
+                self.assertEqual(len(diagnostic.splitlines()), 1)
+                self.assertIn("malformed exception file", diagnostic)
+                self.assertIn("advisory=unavailable", diagnostic)
+                self.assertNotIn("GHSA", diagnostic)
+                self.assertNotIn("report", diagnostic.split(":", 1)[1])
+                self.assertNotIn("Traceback", diagnostic)
+
+    def test_8615_duplicate_key_lockfile_is_named_as_lockfile(self):
+        self.lock.write_text('{"packages": {}, "packages": {}}')
+        code, diagnostic = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(diagnostic.splitlines()), 1)
+        self.assertIn("malformed lockfile or installed package.json", diagnostic)
+        self.assertIn("advisory=unavailable", diagnostic)
+        self.assertNotIn("report", diagnostic.split(":", 1)[1])
+
 
 class NpmAudit8615Tests(unittest.TestCase):
     def setUp(self):
@@ -365,6 +427,20 @@ class NpmAudit8615Tests(unittest.TestCase):
             self.assertIn(shape, stderr.getvalue())
             self.assertIn("advisory=unavailable", stderr.getvalue())
             self.assertNotIn("private-value", stderr.getvalue())
+
+    def test_8615_deeply_nested_array_output_is_one_fixed_line(self):
+        output = "[" * 200000 + "]" * 200000
+        result = subprocess.CompletedProcess([], 0, output, "")
+        stderr = io.StringIO()
+        with patch.object(gate.subprocess, "run", return_value=result), \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(gate.main([]), 1)
+        diagnostic = stderr.getvalue()
+        self.assertEqual(len(diagnostic.splitlines()), 1)
+        self.assertIn("unexpected gate error (RecursionError)", diagnostic)
+        self.assertIn("advisory=unavailable", diagnostic)
+        self.assertNotIn("Traceback", diagnostic)
+        self.assertNotIn("/", diagnostic)
 
     def test_8615_prefix_is_one_argument(self):
         result = subprocess.CompletedProcess([], 0, json.dumps(self.clean), "")
