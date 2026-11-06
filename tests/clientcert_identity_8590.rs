@@ -23,8 +23,7 @@ use tower::ServiceExt as _;
 mod common;
 
 #[cfg(feature = "sal-postgres")]
-#[path = "common/pg_barrier.rs"]
-mod pg_barrier;
+use common::pg_barrier;
 
 const SHARED_KEY: &str = "shared-transport-8590";
 const ENROLLED_KEY: &str = "unrelated-agent-key-8590";
