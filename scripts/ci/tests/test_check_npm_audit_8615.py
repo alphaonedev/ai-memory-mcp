@@ -24,6 +24,7 @@ import check_npm_audit as gate
 TODAY = date(2026, 11, 5)
 ADVISORY_ID = "GHSA-gcqx-w48m-w2h4"
 DEEP_MERGE_NODE = "node_modules/deepmerge"
+PRIVATE_REGISTRY_URL = "https://private-user:private-value" + "@" + "registry.invalid"
 TEST_SCRATCH = Path(os.environ.get("TMPDIR", str(CI_DIR.parents[1] / ".local-runs")))
 
 
@@ -187,7 +188,7 @@ class NpmExceptions8615Tests(unittest.TestCase):
     def test_8615_diagnostic_identity_is_bounded_and_validated(self):
         original = dict(self.entries[0])
         for field, payload, shape in (
-                ("advisory", "https://private-user:private-value@registry.invalid", "malformed advisory id"),
+                ("advisory", PRIVATE_REGISTRY_URL, "malformed advisory id"),
                 ("package", "private-value\nforged-status", "malformed package"),
                 ("version", "private-value", "malformed version")):
             with self.subTest(field=field):
@@ -205,7 +206,7 @@ class NpmExceptions8615Tests(unittest.TestCase):
             self.assertNotIn(payload, diagnostic)
         self.entries = [original]
         source = self.report["vulnerabilities"]["deepmerge"]["via"][0]
-        source["url"] = "https://private-user:private-value@registry.invalid"
+        source["url"] = PRIVATE_REGISTRY_URL
         diagnostic = self.assert_rejected("malformed advisory id", advisory="unavailable")
         self.assertNotIn("private-value", diagnostic)
         source["url"] = "https://github.com/advisories/" + ADVISORY_ID
