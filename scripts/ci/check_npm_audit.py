@@ -82,14 +82,17 @@ def unique_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise AuditError("malformed report: duplicate JSON key")
+            raise AuditError("duplicate JSON key")
         result[key] = value
     return result
 
 
 def check_report(output):
     """Validate npm's v2 schema and inspect both details and summary counts."""
-    report = json.loads(output, object_pairs_hook=unique_object)
+    try:
+        report = json.loads(output, object_pairs_hook=unique_object)
+    except AuditError:
+        raise AuditError("malformed report: duplicate JSON key") from None
     if not isinstance(report, dict) or "error" in report:
         raise AuditError("malformed report: missing audit report or npm error")
     if type(report.get("auditReportVersion")) is not int or report["auditReportVersion"] != AUDIT_REPORT_VERSION:
@@ -242,13 +245,23 @@ def check_audit(output, entries, versions, today):
 
 def load_exception_file(path):
     """Read the single policy file; duplicate JSON keys are invalid."""
-    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    except ValueError:  # includes UnicodeError and duplicate keys; the text is never echoed
+        raise AuditError("malformed exception file") from None
+
+
+def load_lock_json(path):
+    """Read one lockfile or installed package.json; the shape is named, the text is not."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    except ValueError:  # includes UnicodeError and duplicate keys
+        raise AuditError("malformed lockfile or installed package.json") from None
 
 
 def read_versions(prefix, vulnerabilities):
     """Bind advisory nodes to matching lockfile and installed package versions."""
-    lock = json.loads((prefix / "package-lock.json").read_text(encoding="utf-8"),
-                      object_pairs_hook=unique_object)
+    lock = load_lock_json(prefix / "package-lock.json")
     if not isinstance(lock, dict) or not isinstance(lock.get("packages"), dict):
         raise AuditError("missing lockfile packages")
     versions = {}
@@ -264,8 +277,7 @@ def read_versions(prefix, vulnerabilities):
             installed_path = prefix / relative / "package.json"
             if not installed_path.resolve().is_relative_to(prefix.resolve()):
                 raise AuditError("package node escapes SDK prefix", **identity)
-            installed = json.loads(installed_path.read_text(encoding="utf-8"),
-                                   object_pairs_hook=unique_object)
+            installed = load_lock_json(installed_path)
             if (not isinstance(installed, dict) or installed.get("name") != package
                     or not isinstance(locked, dict)
                     or not isinstance(locked.get("version"), str)
@@ -291,6 +303,7 @@ def main(argv=None):
                                 timeout=AUDIT_TIMEOUT_SECONDS, check=False)
         vulnerabilities = check_report(result.stdout)
         identity = report_identity(vulnerabilities, {})
+        identity = {}  # a policy or lock problem is not about this advisory
         entries = load_exception_file(args.exceptions)
         versions = read_versions(args.prefix, vulnerabilities)
         accepted = check_audit(result.stdout, entries, versions, datetime.now(timezone.utc).date())
@@ -311,6 +324,10 @@ def main(argv=None):
             reason = "malformed report encoding (UnicodeError)"
         else:
             reason = "malformed report (ValueError)"
+        print(f"npm audit gate rejected report: {AuditError(reason, **identity)}", file=sys.stderr)
+        return 1
+    except Exception as error:  # noqa: BLE001 - fail closed with one fixed line, no traceback
+        reason = f"unexpected gate error ({type(error).__name__})"
         print(f"npm audit gate rejected report: {AuditError(reason, **identity)}", file=sys.stderr)
         return 1
     print(f"npm audit gate: accepted {accepted} tracked advisories across {len(vulnerabilities)} reported packages")
