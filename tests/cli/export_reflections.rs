@@ -320,7 +320,7 @@ fn cli_export_wrote_escapes_stored_id_8605() {
     const STORED_ID: &str = "\u{1b}[2Jid\r";
     let output = export_output_with_stored_id_8605(STORED_ID);
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.as_slice(), b"");
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
     assert!(stderr.contains("refusing export id"));
     assert!(stderr.contains(&format!("{STORED_ID:?}")));
