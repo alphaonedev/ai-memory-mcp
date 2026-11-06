@@ -44,11 +44,6 @@ use crate::cli::commands::export_reflections::{self, ExportFormat};
 use crate::db;
 use crate::storage::reflect::{ReflectHooks, ReflectOutcome};
 
-/// Operator debug-binary injection. Unit tests use per-hook controls instead.
-/// Release binaries never read this setting; debug binaries read it without mutation.
-#[cfg(all(debug_assertions, not(test)))]
-const AUTO_EXPORT_INJECT_PANIC_ENV: &str = "AI_MEMORY_AUTO_EXPORT_INJECT_PANIC";
-
 /// CONCURRENCY-02/13: controls belong to one hook, never to the process.
 /// Clones only share the requesting hook's channels; ordinary hooks use defaults.
 #[cfg(test)]
@@ -158,15 +153,6 @@ fn build_post_reflect_hook_inner(
                         !control.inject_panic,
                         "auto_export panic injected for this hook"
                     );
-                }
-                // Preserve the documented operator debug path, but never use a
-                // process-wide injection setting in a unit-test worker (#8166).
-                #[cfg(all(debug_assertions, not(test)))]
-                if std::env::var(AUTO_EXPORT_INJECT_PANIC_ENV)
-                    .ok()
-                    .is_some_and(|value| value == "1")
-                {
-                    panic!("auto_export panic injected via {AUTO_EXPORT_INJECT_PANIC_ENV}=1");
                 }
                 run_auto_export(&dbp, &outcome_id, &namespace, &cfg)
             }));
@@ -476,6 +462,7 @@ mod tests {
 
     // Hang guard only: channel ordering proves the property, not host speed.
     const WORKER_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+    const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
     fn reflection_input(source: String, namespace: &str) -> crate::storage::reflect::ReflectInput {
         crate::storage::reflect::ReflectInput {
@@ -571,6 +558,10 @@ mod tests {
 
     #[test]
     fn auto_export_worker_panic_increments_spawn_failed_counter() {
+        assert_scoped_worker_panic_isolated();
+    }
+
+    fn assert_scoped_worker_panic_isolated() {
         let (conn, dir, db_path) = fresh_db();
         enable_auto_export_on_namespace(&conn, "panic-ns");
         let input = reflection_input(seed_observation(&conn, "panic-ns"), "panic-ns");
@@ -620,74 +611,78 @@ mod tests {
         );
     }
 
-    /// #8166: an inherited debug setting must not inject into unrelated lib tests.
-    /// Set the flag only on a fresh child, never by mutating the shared environment.
+    /// Reap the child before reading its output or dropping its capture directory.
+    /// Files avoid a full stdout/stderr pipe blocking the child before it can exit.
+    fn run_scope_child_with_hang_guard(mut command: std::process::Command) -> std::process::Output {
+        let capture = TempDir::new().unwrap();
+        let stdout_path = capture.path().join("stdout");
+        let stderr_path = capture.path().join("stderr");
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap();
+        // Hang guard, not a latency budget: include startup before the inner poll.
+        let deadline = std::time::Instant::now() + WORKER_HANG_GUARD;
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                break true;
+            }
+            std::thread::sleep(CHILD_POLL_INTERVAL);
+        };
+        // CONCURRENCY-11: kill on expiry and always reap before reporting failure.
+        // A child may exit between try_wait and kill; retain that error in the report.
+        let kill_error = if timed_out { child.kill().err() } else { None };
+        let output = std::process::Output {
+            status: child.wait().unwrap(),
+            stdout: std::fs::read(stdout_path).unwrap(),
+            stderr: std::fs::read(stderr_path).unwrap(),
+        };
+        assert!(
+            !timed_out,
+            "isolated child exceeded the hang guard; killed and reaped (kill error: {kill_error:?}):\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// #8166: prove per-hook panic isolation in a fresh process as well as in parallel.
+    /// The child marker selects the process; injection uses only per-hook test controls.
     #[test]
     fn auto_export_panic_injection_does_not_escape_requesting_hook_8166() {
         const CHILD: &str = "AI_MEMORY_8166_INJECTION_SCOPE_CHILD";
-        const TEST: &str = "hooks::post_reflect::auto_export::tests::auto_export_panic_injection_does_not_escape_requesting_hook_8166";
-        // Hang guard only; file publication, not elapsed time, is the assertion.
-        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
-        const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+        const TEST: &str = concat!(
+            module_path!(),
+            "::",
+            stringify!(auto_export_panic_injection_does_not_escape_requesting_hook_8166)
+        );
         if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1")
-                .env("AI_MEMORY_AUTO_EXPORT_INJECT_PANIC", "1")
-                .output()
-                .unwrap();
+            // libtest filters omit the crate prefix retained by module_path!().
+            let test = TEST.split_once("::").unwrap().1;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1");
+            let output = run_scope_child_with_hang_guard(command);
             assert!(
                 output.status.success(),
                 "isolated injection scope test: {}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "isolated child did not run the selected test (expected 1 passed):\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
             return;
         }
-        let (conn, dir, db_path) = fresh_db();
-        let namespace = "scope-8166";
-        enable_auto_export_on_namespace(&conn, namespace);
-        let id = seed_observation(&conn, namespace);
-        let hooks = build_post_reflect_hook(
-            db_path,
-            AutoExportConfig {
-                out_dir: dir.path().join("out"),
-                format: ExportFormat::Markdown,
-            },
-        );
-        let input = crate::storage::reflect::ReflectInput {
-            source_ids: vec![id],
-            title: "scope".into(),
-            content: "scope body".into(),
-            namespace: Some(namespace.into()),
-            tier: Tier::Mid,
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "cli".into(),
-            agent_id: "ai:test".into(),
-            metadata: serde_json::json!({}),
-        };
-        let before = crate::metrics::auto_export_spawn_failed_count();
-        let outcome = crate::storage::reflect::reflect_with_hooks(&conn, &input, &hooks).unwrap();
-        let path = dir
-            .path()
-            .join("out")
-            .join(namespace)
-            .join(format!("{}.md", outcome.id));
-        let deadline = std::time::Instant::now() + HANG_GUARD;
-        while !path.exists() && crate::metrics::auto_export_spawn_failed_count() == before {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "worker did not finish"
-            );
-            std::thread::sleep(POLL);
-        }
-        assert!(
-            path.exists(),
-            "unrelated hook inherited a process-wide panic injection"
-        );
+        assert_scoped_worker_panic_isolated();
     }
 
     #[test]
