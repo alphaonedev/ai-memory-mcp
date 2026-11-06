@@ -6,7 +6,7 @@ layout: doc
 **Auditor:** Truthfulness-Audit Specialist 6 of 6 (docs-truthfulness)
 **Base SHA:** `14fb8a781` on `local/install-815-816`
 **Date:** 2026-05-19
-**Binary:** `/Users/fate/.local/bin/ai-memory` reports `ai-memory 0.7.0`, prints `expected tool count = 73` on `mcp --profile full` boot.
+**Binary:** `<home>/.local/bin/ai-memory` reports `ai-memory 0.7.0`, prints `expected tool count = 73` on `mcp --profile full` boot.
 **Method:** Enumerate every concrete numeric / existence / behavior / file claim in the four target documents; probe each via `grep` + `Read` + `ai-memory` binary invocation; record MATCH / DRIFT.
 
 ---

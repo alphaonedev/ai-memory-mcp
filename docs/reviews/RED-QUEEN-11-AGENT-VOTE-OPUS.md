@@ -4,7 +4,7 @@
 
 **Author:** Claude Opus 4.8 (1M context)
 **Re-verification date:** 2026-06-28
-**Method:** CodeGraph CLI (`/Users/fate/.grok/bin/codegraph`) + `rg`/`Read`/`git`. 7-agent adversarial red-team (Auditor 4 = 11-agent lens).
+**Method:** CodeGraph CLI (`<home>/.grok/bin/codegraph`) + `rg`/`Read`/`git`. 7-agent adversarial red-team (Auditor 4 = 11-agent lens).
 **Paper:** [RQGM, arXiv:2606.26294](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al.). **Provenance:** surfaced by **Nick Jensen** ([X](https://x.com/howtoprompt__/status/2070824205663273175)).
 **Crossroads cite:** `5-agent vote (4d3ea1c5)`.
 

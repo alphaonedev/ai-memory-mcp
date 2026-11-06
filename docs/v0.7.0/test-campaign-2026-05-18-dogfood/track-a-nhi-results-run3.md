@@ -49,7 +49,7 @@ These four assertions exercise the dogfood-fix surface area directly:
 | Test | Expected | Actual | Verdict |
 |------|----------|--------|---------|
 | `ai-memory --version` | `ai-memory 0.7.0` | `ai-memory 0.7.0` | PASS |
-| Binary realpath | current campaign worktree | `/Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory` | PASS |
+| Binary realpath | current campaign worktree | `<home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory` | PASS |
 | MCP protocol handshake | success | `protocolVersion:"2024-11-05"`, `serverInfo.version:"0.7.0"` | PASS |
 | `memory_capabilities.schema_version` | `"3"` | `"3"` | PASS |
 | `memory_capabilities.version` | `"0.7.0"` | `"0.7.0"` | PASS |
@@ -208,7 +208,7 @@ The trimmed bytes grew from ~4543 (Run 2) to ~5289 (Run 3) because #892 added `s
 
 | Test | Result | Evidence |
 |------|--------|----------|
-| `PERFORMANCE.md` budgets exist | PASS | 347 lines at `/Users/fate/v07/v07-fixes/PERFORMANCE.md` |
+| `PERFORMANCE.md` budgets exist | PASS | 347 lines at `<home>/v07/v07-fixes/PERFORMANCE.md` |
 | `memory_stats` | PASS | returns by_namespace, by_tier, db_size_bytes, expiring_soon, links_count, total |
 | `ai-memory doctor` | PASS | overall=INFO, no corruption flagged |
 | 3 sustained recalls in single MCP session | PASS | no starvation, all returned cleanly with consistent shape |
@@ -251,8 +251,8 @@ None. No fixable defects surfaced. Two cosmetic differences from Run 2:
 
 ### Audit trail
 - 12 phase result memories minted in `ai-memory/v0.7.0-nhi-testing` with suffix `(v0.7.0 dogfood-fix re-run @ 19b08543c, 2026-05-19)`.
-- Per-phase isolated SQLite dbs at `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/p0-p11-run3/p<N>.db`.
-- Probe JSONL inputs + stdout/stderr captures at `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/p0-p11-run3/`.
+- Per-phase isolated SQLite dbs at `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/p0-p11-run3/p<N>.db`.
+- Probe JSONL inputs + stdout/stderr captures at `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/p0-p11-run3/`.
 
 ### Recommendation
 

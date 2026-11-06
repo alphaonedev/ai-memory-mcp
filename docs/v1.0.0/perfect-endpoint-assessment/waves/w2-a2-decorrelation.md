@@ -124,4 +124,4 @@ Score **34** places §2.6 in “scaffold, not guarantee” — consistent with m
 
 ---
 
-*W2-A2 complete. Absolute path: `/Users/fate/Downloads/ai-memory-mcp/.local-runs/perfect-endpoint-assessment/waves/w2-a2-decorrelation.md`*
+*W2-A2 complete. Absolute path: `<home>/Downloads/ai-memory-mcp/.local-runs/perfect-endpoint-assessment/waves/w2-a2-decorrelation.md`*

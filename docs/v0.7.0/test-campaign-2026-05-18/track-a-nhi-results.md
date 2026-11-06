@@ -51,7 +51,7 @@ Closed today this campaign: **#826 #829 #830 #831 #837 #859 #860 #861 #862 #865 
 | Test | Expected | Actual (post-fix) | Verdict |
 |------|----------|-------------------|---------|
 | `ai-memory --version` | `ai-memory 0.7.0` | `ai-memory 0.7.0` | PASS |
-| `readlink -f $(which ai-memory)` | current campaign worktree | `/Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory` | PASS (playbook memory `081791ae` updated via #865 with self-resolving verification recipe) |
+| `readlink -f $(which ai-memory)` | current campaign worktree | `<home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory` | PASS (playbook memory `081791ae` updated via #865 with self-resolving verification recipe) |
 | `memory_capabilities.version` | `0.7.0` | `0.7.0` | PASS |
 | `memory_capabilities.schema_version` | `3` | `3` | PASS (Track A1 summary field wired) |
 | All 8 families loaded | true | true (core, lifecycle, graph, governance, power, meta, archive, other) | PASS |

@@ -1,6 +1,6 @@
 # Dashboard enterprise evidence review — GPT 6 Astra
 
-Read-only access to f2 /home/fate_two/v07/v09-dev authorized by user. No tests, kills, restarts, writes or remote configuration changes executed. Inspected copied public federation-state.json, datatier-state.json, northstar-state.json, thirty module-scaling result JSONs, five continuity JSONs, module-scaling.py and continuity-cycle.py, four big10 summary JSONs and relevant big10-regression.sh producer lines. Local copies in dashboard-enterprise-artifacts/ and root f2-runs/. Source review remains87f86a0a; remote run artifacts below have their own provenance, not silently current source acceptance.
+Read-only access to f2 <home>/v07/v09-dev authorized by user. No tests, kills, restarts, writes or remote configuration changes executed. Inspected copied public federation-state.json, datatier-state.json, northstar-state.json, thirty module-scaling result JSONs, five continuity JSONs, module-scaling.py and continuity-cycle.py, four big10 summary JSONs and relevant big10-regression.sh producer lines. Local copies in dashboard-enterprise-artifacts/ and root f2-runs/. Source review remains87f86a0a; remote run artifacts below have their own provenance, not silently current source acceptance.
 
 ## Material update to enterprise assessment
 

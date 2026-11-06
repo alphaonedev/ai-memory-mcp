@@ -143,4 +143,4 @@ Selling the xcframework/cdylib + Termux recipes as proof that *every* field devi
 ---
 
 *Agent W5-A4 · Mobile/IoT/robotics floor · under 250 lines*  
-*Path: `/Users/fate/Downloads/ai-memory-mcp/waves/w5-a4-mobile-iot.md`*
+*Path: `<home>/Downloads/ai-memory-mcp/waves/w5-a4-mobile-iot.md`*

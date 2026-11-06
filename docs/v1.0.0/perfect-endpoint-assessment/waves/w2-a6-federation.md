@@ -170,4 +170,4 @@ G30/DLQ/tombstone work shows the project can close resurrection and durability g
 
 ---
 
-*End W2-A6. Under 350 lines. Absolute paths reviewed under `/Users/fate/Downloads/ai-memory-mcp/src/federation/` and handlers as cited.*
+*End W2-A6. Under 350 lines. Absolute paths reviewed under `<home>/Downloads/ai-memory-mcp/src/federation/` and handlers as cited.*

@@ -140,7 +140,7 @@ recall_response.memories[0]:
 
 ## Scratch + artifacts
 
-All probe scratch under `/Users/fate/v07/v07-fixes/.local-runs/truth-2-probe/`:
+All probe scratch under `<home>/v07/v07-fixes/.local-runs/truth-2-probe/`:
 
 - `gap1.db` — version / If-Match probes
 - `gap2.db` — source_uri store

@@ -71,7 +71,7 @@ against the same shared-target convention the prior campaign used
 The standard dogfood-rebuild path:
 
 ```
-/opt/homebrew/bin/ai-memory → /Users/fate/v07/v07-f5/target/release/ai-memory
+/opt/homebrew/bin/ai-memory → <home>/v07/v07-f5/target/release/ai-memory
 ```
 
 `scripts/dogfood-rebuild.sh` is idempotent on each recompile and is
@@ -123,7 +123,7 @@ Code session daemon:
 ```
 $ ps -p 10338 -o pid,etime,rss,command
   PID  ELAPSED    RSS COMMAND
-10338 (1h+ sustained)  ~18 MB  /opt/homebrew/bin/ai-memory --db /Users/fate/.claude/ai-memory.db mcp --tier autonomous
+10338 (1h+ sustained)  ~18 MB  /opt/homebrew/bin/ai-memory --db <home>/.claude/ai-memory.db mcp --tier autonomous
 ```
 
 At dogfood-window start, the binary the symlink resolved to was the

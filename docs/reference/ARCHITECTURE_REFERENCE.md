@@ -381,7 +381,7 @@ schema_version = 2
 shape = "singleton"   # singleton | team | production | federated | hive
 
 tier = "autonomous"
-db = "/Users/fate/.claude/ai-memory.db"
+db = "<home>/.claude/ai-memory.db"
 
 [llm]
 backend     = "xai"          # ollama | openai | xai | anthropic | gemini |
