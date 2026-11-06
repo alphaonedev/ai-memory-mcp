@@ -1,0 +1,17 @@
+# #8615: the CI gate audits without these ignores, then reconciles every
+# finding with these exact identities. Expired or absent findings fail closed.
+[[exceptions]]
+id = "RUSTSEC-2023-0071"
+package = "rsa"
+version = "0.9.10"
+issue = 8473
+expires = 2027-02-03
+reason = "SQLx macros pull the unused MySQL sibling driver; removal is tracked in #8473."
+
+[[exceptions]]
+id = "RUSTSEC-2024-0449"
+package = "unsafe-libyaml"
+version = "0.2.11"
+issue = 8476
+expires = 2027-02-03
+reason = "No patched release exists; replacing the YAML dependency is tracked in #8476."

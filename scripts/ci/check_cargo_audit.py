@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Reconcile unfiltered Cargo advisories with dated tracked exceptions (#8615)."""
+"""Cross-check .cargo/audit.toml with .cargo/audit-exceptions.toml (#8615)."""
 
 import argparse
-from datetime import date, timedelta
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
@@ -15,6 +16,8 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY = ROOT / ".cargo/audit.toml"
+EXCEPTIONS_POLICY = ROOT / ".cargo/audit-exceptions.toml"
+CARGO_AUDIT_KEYS = {"advisories", "database", "output", "target", "yanked"}
 SCRATCH = ROOT / ".local-runs"
 AUDIT_COMMAND = ["cargo", "audit", "--json", "--deny", "warnings"]
 AUDIT_TIMEOUT_SECONDS = 300
@@ -24,6 +27,11 @@ WARNING_KINDS = {"unmaintained", "unsound", "notice"}
 EXACT_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\Z")
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
+
+
+def today_utc(now=datetime.now):
+    """Read the UTC calendar day through a clock seam without global patches."""
+    return now(timezone.utc).date()
 
 
 def finding_identity(finding):
@@ -54,9 +62,13 @@ def identity_text(entry, findings=()):
 
 
 def load_policy():
-    """Read the sole policy file and require normal-audit ignores to agree."""
+    """Cross-check audit.toml ignores and audit-exceptions.toml metadata once."""
     policy = tomllib.loads(POLICY.read_text(encoding="utf-8"))
-    entries = policy.get("exceptions")
+    unknown = sorted(set(policy) - CARGO_AUDIT_KEYS)
+    if unknown:
+        raise ValueError("unknown cargo-audit fields: " + json.dumps(unknown))
+    metadata = tomllib.loads(EXCEPTIONS_POLICY.read_text(encoding="utf-8"))
+    entries = metadata.get("exceptions")
     advisories = policy.get("advisories")
     if not isinstance(entries, list) or not isinstance(advisories, dict):
         raise ValueError("missing exception policy")
@@ -68,12 +80,19 @@ def load_policy():
     if malformed:
         raise ValueError("\n".join("missing exception fields: id; " + identity_text(entry)
                                    for entry in malformed))
-    if sorted(ignored) != sorted(entry["id"] for entry in entries):
-        identities = [identity_text(entry) for entry in entries]
-        identities.extend(identity_text({"id": identity}) for identity in ignored
-                          if identity not in {entry["id"] for entry in entries})
-        raise ValueError("\n".join("audit ignores and tracked exceptions disagree; " + identity
-                                   for identity in identities))
+    indexed = {entry["id"]: entry for entry in entries}
+    messages = []
+    for source, identities in (("audit ignores", ignored),
+                               ("tracked exceptions", [entry["id"] for entry in entries])):
+        for identity, count in sorted(Counter(identities).items()):
+            if count > 1:
+                messages.append(f"duplicate id in {source}; "
+                                + identity_text(indexed.get(identity, {"id": identity})))
+    for identity in sorted(set(ignored) ^ set(indexed)):
+        messages.append("audit ignores and tracked exceptions disagree; "
+                        + identity_text(indexed.get(identity, {"id": identity})))
+    if messages:
+        raise ValueError("\n".join(messages))
     return entries
 
 
@@ -86,9 +105,15 @@ def exception_index(entries, today, findings=(), errors=None):
     for entry in entries:
         identity = identity_text(entry, findings)
         try:
-            if not isinstance(entry, dict) or not EXCEPTION_FIELDS.issubset(entry):
+            if not isinstance(entry, dict) or set(entry) != EXCEPTION_FIELDS:
                 missing = sorted(EXCEPTION_FIELDS - entry.keys()) if isinstance(entry, dict) else sorted(EXCEPTION_FIELDS)
-                raise ValueError("missing exception fields: " + ", ".join(missing))
+                unknown = sorted(entry.keys() - EXCEPTION_FIELDS) if isinstance(entry, dict) else []
+                problems = []
+                if missing:
+                    problems.append("missing exception fields: " + ", ".join(missing))
+                if unknown:
+                    problems.append("unknown exception fields: " + json.dumps(unknown))
+                raise ValueError("; ".join(problems))
             for field in ("id", "package", "version", "reason"):
                 value = entry[field]
                 if not isinstance(value, str) or not value.strip() or len(value.splitlines()) != 1:
@@ -180,7 +205,7 @@ def validate_report(report, entries, today):
 
 def main(argv=None, *, today=None):
     """Run the auditor once; every malformed, missing, or failed input denies CI."""
-    today = date.today() if today is None else today
+    today = today_utc() if today is None else today
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scratch-root", type=Path, default=SCRATCH)
     parser.add_argument("--advisory-db", type=Path)

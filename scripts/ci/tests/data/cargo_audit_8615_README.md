@@ -18,3 +18,9 @@ and exited 1, with the same 565 crates, one vulnerability, and one warning.
 The ignored report must fail the ratchet. The unfiltered report passes only
 when both exact findings have matching unexpired tracked exceptions. These
 captures do not establish an audit without findings.
+
+The gate cross-checks the ignored IDs in `.cargo/audit.toml` against the
+six-field entries in `.cargo/audit-exceptions.toml`. The former remains valid
+cargo-audit configuration; the latter records exact versions, expiry dates,
+reasons and tracking issues. Duplicate IDs, drift between the two files and
+unknown exception fields fail the gate before any finding can be accepted.
