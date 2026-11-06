@@ -4,12 +4,13 @@
 """Issue 8615: reject advisory reports and incomplete audit evidence offline."""
 
 import copy
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import importlib.util
 import io
 import json
 from pathlib import Path
 import subprocess
+import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
@@ -24,12 +25,27 @@ CLEAN = json.loads((DATA / "cargo_audit_clean_8615.json").read_text())
 ADVISORY = json.loads((DATA / "cargo_audit_advisory_8615.json").read_text())
 RECORDED = json.loads((DATA / "cargo_audit_unfiltered_8615.json").read_text())
 TODAY = date(2026, 11, 5)
+CARGO_AUDIT_KEYS = {"advisories", "database", "output", "target", "yanked"}
 EXCEPTIONS = [
     {"id": "RUSTSEC-2023-0071", "package": "rsa", "version": "0.9.10",
      "issue": 8473, "expires": date(2027, 2, 3), "reason": "SQLx sibling driver; tracked removal."},
     {"id": "RUSTSEC-2024-0449", "package": "unsafe-libyaml", "version": "0.2.11",
      "issue": 8476, "expires": date(2027, 2, 3), "reason": "YAML parser replacement tracked."},
 ]
+
+
+def policy_documents(ignored=None, entries=None):
+    """Serialize independent cargo-audit configuration and exception fixtures."""
+    entries = EXCEPTIONS if entries is None else entries
+    ignored = [entry["id"] for entry in entries] if ignored is None else ignored
+    audit = "[advisories]\nignore = " + json.dumps(ignored) + "\n"
+    metadata = []
+    for entry in entries:
+        metadata.append("[[exceptions]]")
+        for field, value in entry.items():
+            literal = value.isoformat() if type(value) is date else json.dumps(value)
+            metadata.append(f"{field} = {literal}")
+    return audit, "\n".join(metadata)
 
 
 class TrackedExceptions8615Tests(unittest.TestCase):
@@ -111,6 +127,33 @@ class CargoAudit8615Tests(unittest.TestCase):
         today = date(2027, 3, 4)
         entries = [dict(entry, expires=today) for entry in EXCEPTIONS]
         self.assertEqual(self.run_gate(RECORDED, 1, entries=entries, today=today)[0], 0)
+
+    def test_8615_default_date_uses_utc_helper_once(self):
+        instant = datetime(2027, 2, 4, 0, 1, tzinfo=timezone.utc)
+        calls = []
+
+        def clock(zone):
+            calls.append(zone)
+            return instant.astimezone(zone)
+
+        self.assertEqual(GATE.today_utc(now=clock), instant.date())
+        self.assertEqual(calls, [timezone.utc])
+        before = datetime.now(timezone.utc).date()
+        actual = GATE.today_utc()
+        after = datetime.now(timezone.utc).date()
+        self.assertIn(actual, (before, after))
+        with patch.object(GATE, "today_utc", return_value=TODAY) as default_date:
+            self.assertEqual(self.run_gate(today=None)[0], 0)
+        default_date.assert_called_once_with()
+
+    def test_8615_unknown_exception_fields_fail_with_names(self):
+        entries = copy.deepcopy(EXCEPTIONS)
+        entries[0]["allow_any_version"] = True
+        entries[0]["allow_future_advisories"] = True
+        self.assertEqual(self.run_gate(RECORDED, 1, entries=entries)[0], 1)
+        for text in ("unknown exception fields", "allow_any_version", "allow_future_advisories",
+                     EXCEPTIONS[0]["id"], EXCEPTIONS[0]["package"], EXCEPTIONS[0]["version"]):
+            self.assertIn(text, self.stderr)
 
     def test_8615_entry_expired_yesterday_fails(self):
         today = date(2027, 2, 4)
@@ -247,13 +290,31 @@ class CargoAudit8615Tests(unittest.TestCase):
             self.assertLessEqual(entry["expires"], date(2027, 2, 3))
         self.assertFalse((ROOT / "scripts/ci/cargo_audit_allowlist.json").exists())
 
+    def test_8615_cargo_audit_schema_and_sibling_metadata(self):
+        policy = tomllib.loads(GATE.POLICY.read_text())
+        self.assertLessEqual(set(policy), CARGO_AUDIT_KEYS)
+        sibling = ROOT / ".cargo/audit-exceptions.toml"
+        self.assertEqual(GATE.EXCEPTIONS_POLICY, sibling)
+        metadata = tomllib.loads(sibling.read_text())
+        self.assertEqual(set(metadata), {"exceptions"})
+        self.assertEqual(GATE.load_policy(), metadata["exceptions"])
+
+    def test_8615_unknown_cargo_audit_table_is_rejected(self):
+        audit, metadata = policy_documents()
+        audit += "\n[exceptions]\n"
+        with patch.object(Path, "read_text", side_effect=[audit, metadata]):
+            with self.assertRaisesRegex(ValueError, "unknown cargo-audit fields.*exceptions"):
+                GATE.load_policy()
+
     def test_8615_missing_or_malformed_policy_fails(self):
         for text in ('[advisories]\nignore = []', '{}', 'invalid'):
             with self.subTest(text=text), patch.object(Path, "read_text", return_value=text):
                 with self.assertRaises(ValueError):
                     GATE.load_policy()
-        policy = GATE.POLICY.read_text().replace('id = "RUSTSEC-2023-0071"', '')
-        with patch.object(Path, "read_text", return_value=policy):
+        entries = copy.deepcopy(EXCEPTIONS)
+        del entries[0]["id"]
+        documents = policy_documents([entry["id"] for entry in EXCEPTIONS], entries)
+        with patch.object(Path, "read_text", side_effect=documents):
             with self.assertRaisesRegex(ValueError, "missing exception fields") as caught:
                 GATE.load_policy()
             self.assertIn("rsa", str(caught.exception))
@@ -261,12 +322,24 @@ class CargoAudit8615Tests(unittest.TestCase):
             self.assertIn("<unavailable>", str(caught.exception))
 
     def test_8615_ignore_ids_must_equal_metadata_ids(self):
-        policy = GATE.POLICY.read_text()
-        for edited in (policy.replace('    "RUSTSEC-2023-0071",', ''),
-                       policy.replace('ignore = [', 'ignore = ["RUSTSEC-2099-0001",')):
-            with patch.object(Path, "read_text", return_value=edited):
-                with self.assertRaisesRegex(ValueError, "disagree"):
+        ids = [entry["id"] for entry in EXCEPTIONS]
+        for ignored, identity in ((ids[1:], ids[0]), (ids + ["RUSTSEC-2099-0001"], "RUSTSEC-2099-0001")):
+            with self.subTest(ignored=ignored), \
+                    patch.object(Path, "read_text", side_effect=policy_documents(ignored)):
+                with self.assertRaisesRegex(ValueError, "disagree") as caught:
                     GATE.load_policy()
+                self.assertIn(identity, str(caught.exception))
+
+    def test_8615_duplicate_ids_in_either_policy_file_fail(self):
+        ids = [entry["id"] for entry in EXCEPTIONS]
+        for ignored, entries in ((ids + ids[:1], EXCEPTIONS),
+                                 (ids, EXCEPTIONS + EXCEPTIONS[:1]),
+                                 (ids + ids[:1], EXCEPTIONS + EXCEPTIONS[:1])):
+            with self.subTest(ignored=ignored, entries=len(entries)), \
+                    patch.object(Path, "read_text", side_effect=policy_documents(ignored, entries)):
+                with self.assertRaisesRegex(ValueError, "duplicate") as caught:
+                    GATE.load_policy()
+                self.assertIn(ids[0], str(caught.exception))
 
     def test_8615_filtered_or_missing_warning_classes_fail(self):
         for field, value in (("target_arch", ["x86_64"]), ("target_os", ["linux"]),
