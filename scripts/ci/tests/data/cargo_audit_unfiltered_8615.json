@@ -1,0 +1,62 @@
+{
+  "database": {
+    "advisory-count": 1409,
+    "last-commit": "26fd2d43f7280a1fb925a3743ec463017afe7119",
+    "last-updated": "2026-11-05T09:50:49+01:00"
+  },
+  "lockfile": {
+    "dependency-count": 565
+  },
+  "settings": {
+    "target_arch": [],
+    "target_os": [],
+    "severity": null,
+    "ignore": [],
+    "informational_warnings": [
+      "unmaintained",
+      "unsound",
+      "notice"
+    ]
+  },
+  "vulnerabilities": {
+    "found": true,
+    "count": 1,
+    "list": [
+      {
+        "advisory": {
+          "id": "RUSTSEC-2023-0071",
+          "package": "rsa"
+        },
+        "versions": {
+          "patched": [],
+          "unaffected": []
+        },
+        "affected": null,
+        "package": {
+          "name": "rsa",
+          "version": "0.9.10"
+        }
+      }
+    ]
+  },
+  "warnings": {
+    "unmaintained": [
+      {
+        "kind": "unmaintained",
+        "package": {
+          "name": "unsafe-libyaml",
+          "version": "0.2.11"
+        },
+        "advisory": {
+          "id": "RUSTSEC-2024-0449",
+          "package": "unsafe-libyaml"
+        },
+        "affected": null,
+        "versions": {
+          "patched": [],
+          "unaffected": []
+        }
+      }
+    ]
+  }
+}
