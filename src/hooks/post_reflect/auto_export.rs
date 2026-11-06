@@ -571,6 +571,76 @@ mod tests {
         );
     }
 
+    /// #8166: an inherited debug setting must not inject into unrelated lib tests.
+    /// Set the flag only on a fresh child, never by mutating the shared environment.
+    #[test]
+    fn auto_export_panic_injection_does_not_escape_requesting_hook_8166() {
+        const CHILD: &str = "AI_MEMORY_8166_INJECTION_SCOPE_CHILD";
+        const TEST: &str = "hooks::post_reflect::auto_export::tests::auto_export_panic_injection_does_not_escape_requesting_hook_8166";
+        // Hang guard only; file publication, not elapsed time, is the assertion.
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("AI_MEMORY_AUTO_EXPORT_INJECT_PANIC", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated injection scope test: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (conn, dir, db_path) = fresh_db();
+        let namespace = "scope-8166";
+        enable_auto_export_on_namespace(&conn, namespace);
+        let id = seed_observation(&conn, namespace);
+        let hooks = build_post_reflect_hook(
+            db_path,
+            AutoExportConfig {
+                out_dir: dir.path().join("out"),
+                format: ExportFormat::Markdown,
+            },
+        );
+        let input = crate::storage::reflect::ReflectInput {
+            source_ids: vec![id],
+            title: "scope".into(),
+            content: "scope body".into(),
+            namespace: Some(namespace.into()),
+            tier: Tier::Mid,
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "cli".into(),
+            agent_id: "ai:test".into(),
+            metadata: serde_json::json!({}),
+        };
+        let before = crate::metrics::auto_export_spawn_failed_count();
+        let outcome = crate::storage::reflect::reflect_with_hooks(&conn, &input, &hooks).unwrap();
+        let path = dir
+            .path()
+            .join("out")
+            .join(namespace)
+            .join(format!("{}.md", outcome.id));
+        let deadline = std::time::Instant::now() + HANG_GUARD;
+        while !path.exists() && crate::metrics::auto_export_spawn_failed_count() == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not finish"
+            );
+            std::thread::sleep(POLL);
+        }
+        assert!(
+            path.exists(),
+            "unrelated hook inherited a process-wide panic injection"
+        );
+    }
+
     #[test]
     fn auto_export_config_default_for_home_picks_dot_ai_memory() {
         let cfg = AutoExportConfig::default_for_home();
