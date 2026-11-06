@@ -206,6 +206,10 @@ jobs:
       - name: npm ci
         working-directory: sdk/typescript
         run: npm ci
+      - name: npm audit ratchet (#8615)
+        run: |
+          python3 -m unittest discover -s scripts/ci/tests -p test_check_npm_audit_8615.py
+          python3 scripts/ci/check_npm_audit.py
       - name: npm test
         working-directory: sdk/typescript
         run: npm test

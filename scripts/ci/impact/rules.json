@@ -62,6 +62,8 @@
       "conformance/**",
       "scripts/ci/tests/test_check_cargo_audit_8615.py",
       "scripts/ci/tests/test_check_cert_expiry_corpus.py",
+      "scripts/ci/tests/test_check_npm_audit_8615.py",
+      "scripts/ci/tests/data/npm_audit_8615/**",
       "scripts/ci/tests/test_ci_select_gating_8240.py",
       "scripts/ci/tests/test_impact_cargo_skip_8328.py"
     ]
