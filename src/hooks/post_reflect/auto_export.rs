@@ -223,6 +223,8 @@ pub fn run_auto_export(
             return Ok(());
         }
     };
+    // ERRORS-02/15: refuse durable IDs before touching the destination tree.
+    export_reflections::validate_export_id(&mem.id, &mem.namespace)?;
     let edges = collect_outbound_reflects_on(&conn, memory_id)?;
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let payload = export_reflections::render_payload(&mem, &edges, attest_level, config.format);
