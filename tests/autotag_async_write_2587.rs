@@ -54,6 +54,14 @@ const SLOW_LLM_DELAY: Duration = Duration::from_secs(6);
 /// `AppState.llm_call_timeout` for this harness. A write that waited on a
 /// never-answering endpoint would burn this whole budget (#2587), so it is
 /// also the ceiling for the unreachable-LLM test.
+///
+/// Coupling: that holds only while the LLM client's own private request
+/// timeout, `GENERATE_TIMEOUT` in `src/llm.rs` (30s today), is at least this
+/// value. A write that blocks inline is bounded by
+/// `min(llm_call_timeout, GENERATE_TIMEOUT)`; if `GENERATE_TIMEOUT` is ever
+/// lowered below this constant, the blocking write returns early with a
+/// client error and the unreachable-LLM bound no longer catches it. Lower
+/// this constant with it, or keep it at or below the client timeout.
 const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// #1751 — permissive attestation opt-out, the same pin
@@ -309,6 +317,7 @@ async fn unreachable_llm_does_not_block_or_fail_the_write_2587() {
     let elapsed = started.elapsed();
 
     assert_eq!(status, StatusCode::CREATED, "write must succeed: {body}");
+    // Bound validity depends on `GENERATE_TIMEOUT` (src/llm.rs) >= `LLM_CALL_TIMEOUT`.
     assert!(
         elapsed < LLM_CALL_TIMEOUT,
         "the durable write took {elapsed:?} against an LLM endpoint that never answers at all; \
