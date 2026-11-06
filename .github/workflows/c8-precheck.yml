@@ -301,6 +301,10 @@ jobs:
           persist-credentials: false
       - name: Run doc symbol-anchor gate
         run: bash scripts/check-doc-symbol-anchors.sh
+      - name: Check maintained debt-register anchors (#8599)
+        run: python3 scripts/ci/check_debt_doc_anchors.py
+      - name: Test maintained debt-register anchors (#8599)
+        run: python3 -m unittest scripts.ci.tests.test_debt_doc_anchors_8599
       - name: Self-test the gate (regression evidence)
         # Plants the audit's OWN finding (the decorate_memory rename), a
         # pre-modularisation path, a past-EOF file:line anchor, a stale
