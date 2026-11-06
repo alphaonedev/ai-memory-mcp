@@ -108,9 +108,11 @@ fn batch_fixture(db_path: &Path, middle_id: &str, middle_namespace: &str) {
     for (id, namespace, timestamp) in rows {
         let memory = Memory {
             id: uuid::Uuid::new_v4().to_string(),
+            // Fixed ordering timestamps must not age the fixture out of list().
+            tier: Tier::Long,
             namespace: "team".into(),
-            title: "batch reflection".into(),
-            content: "batch reflection body".into(),
+            title: format!("batch reflection {id}"),
+            content: format!("batch reflection body {id}"),
             created_at: timestamp.into(),
             updated_at: timestamp.into(),
             ..Default::default()
