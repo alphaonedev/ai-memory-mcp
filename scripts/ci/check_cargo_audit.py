@@ -18,6 +18,10 @@ ROOT = Path(__file__).resolve().parents[2]
 POLICY = ROOT / ".cargo/audit.toml"
 EXCEPTIONS_POLICY = ROOT / ".cargo/audit-exceptions.toml"
 CARGO_AUDIT_KEYS = {"advisories", "database", "output", "target", "yanked"}
+# cargo-audit 0.22.2 [advisories] schema, as quoted by the tool itself.
+CARGO_AUDIT_ADVISORIES_KEYS = {"ignore", "informational_warnings", "severity_threshold"}
+EXCEPTIONS_FILE_KEYS = {"exceptions"}
+TOP_LEVEL_TABLE = "<top level>"
 SCRATCH = ROOT / ".local-runs"
 AUDIT_COMMAND = ["cargo", "audit", "--json", "--deny", "warnings"]
 AUDIT_TIMEOUT_SECONDS = 300
@@ -61,13 +65,23 @@ def identity_text(entry, findings=()):
                     for field, value in values.items())
 
 
+def refuse_unknown_keys(label, table, mapping, allowed):
+    """Raise a ValueError naming file, table and every key outside the allowed set."""
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise ValueError(f"unknown cargo-audit fields in {label} table {table}: "
+                         + json.dumps(unknown))
+
+
 def load_policy():
     """Cross-check audit.toml ignores and audit-exceptions.toml metadata once."""
     policy = tomllib.loads(POLICY.read_text(encoding="utf-8"))
-    unknown = sorted(set(policy) - CARGO_AUDIT_KEYS)
-    if unknown:
-        raise ValueError("unknown cargo-audit fields: " + json.dumps(unknown))
+    refuse_unknown_keys(POLICY.name, TOP_LEVEL_TABLE, policy, CARGO_AUDIT_KEYS)
+    if isinstance(policy.get("advisories"), dict):
+        refuse_unknown_keys(POLICY.name, "[advisories]", policy["advisories"],
+                            CARGO_AUDIT_ADVISORIES_KEYS)
     metadata = tomllib.loads(EXCEPTIONS_POLICY.read_text(encoding="utf-8"))
+    refuse_unknown_keys(EXCEPTIONS_POLICY.name, TOP_LEVEL_TABLE, metadata, EXCEPTIONS_FILE_KEYS)
     entries = metadata.get("exceptions")
     advisories = policy.get("advisories")
     if not isinstance(entries, list) or not isinstance(advisories, dict):
