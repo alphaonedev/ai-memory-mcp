@@ -140,17 +140,10 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
 
     let reflections = collect_reflections(&conn, args.namespace.as_deref(), args.since.as_deref())?;
     // ERRORS-02: validate the whole batch before creating directories or files.
+    // OWNERSHIP-15: borrow each row and retain its validated namespace path.
+    let mut validated = Vec::with_capacity(reflections.len());
     for mem in &reflections {
         validate_export_id(&mem.id, &mem.namespace)?;
-    }
-    fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
-    let mut swept_directories = HashSet::new();
-    for mem in &reflections {
-        let edges = collect_outbound_reflects_on(&conn, &mem.id)?;
-        let attest_level = summarise_attest_level(&edges);
-        let payload = render_payload(mem, &edges, attest_level, format);
-
         let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace).with_context(
             || {
                 format!(
@@ -160,6 +153,16 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
                 )
             },
         )?);
+        validated.push((mem, ns_dir));
+    }
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
+    let mut swept_directories = HashSet::new();
+    for (mem, ns_dir) in validated {
+        let edges = collect_outbound_reflects_on(&conn, &mem.id)?;
+        let attest_level = summarise_attest_level(&edges);
+        let payload = render_payload(mem, &edges, attest_level, format);
+
         fs::create_dir_all(&ns_dir)
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
