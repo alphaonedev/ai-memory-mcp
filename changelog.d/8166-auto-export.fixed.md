@@ -1,0 +1,1 @@
+Auto-export hook tests now prove response-before-export ordering with a closed worker gate, and scope panic injection to the requesting hook without mutating process-wide environment state. The debug-binary injection setting remains available; release binaries ignore it.
