@@ -286,6 +286,17 @@ impl Verb {
     }
 }
 
+/// A panic outside `fail()` (an assert before the signal, an `unwrap` on
+/// `try_wait`) must not leak the spawned daemon: kill and reap this test's
+/// own child (a no-op error when it already exited).
+#[cfg(unix)]
+impl Drop for Verb {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// `sync-daemon` takes SIGINT and SIGTERM down the same graceful path (exit 0).
 #[cfg(unix)]
 #[test]
@@ -356,6 +367,19 @@ fn curator_daemon_stop_signals_exit_zero_8193() {
         let mut verb = Verb::spawn(&["curator", "--daemon", "--interval-secs", "3600"]);
         verb.wait_for_log(CURATOR_BOOT_MARKER);
         std::thread::sleep(VERB_SETTLE);
+        let _ = verb.signal_and_expect_clean_exit(name, signal);
+    }
+}
+
+/// #8193 N1: the curator installs its listener before spawning the waiter,
+/// so a stop signal sent the moment the daemon reports it started (no settle
+/// pause) still takes the drained exit 0, never the default disposition.
+#[cfg(unix)]
+#[test]
+fn curator_daemon_early_stop_signals_exit_zero_8193() {
+    for (name, signal) in STOP_SIGNALS {
+        let mut verb = Verb::spawn(&["curator", "--daemon", "--interval-secs", "3600"]);
+        verb.wait_for_log(CURATOR_BOOT_MARKER);
         let _ = verb.signal_and_expect_clean_exit(name, signal);
     }
 }
