@@ -68,5 +68,15 @@ class PrefixLaunchersN2(unittest.TestCase):
                 self.assertEqual(checker.scan_shell(data), [])
 
 
+class InterpreterCaseN5(unittest.TestCase):
+    def test_literal_python_names_are_case_insensitive(self):
+        checker = load_checker()
+        for interpreter in ("Python", "Python3", "PYTHON3.12", "/usr/bin/Python3"):
+            with self.subTest(interpreter=interpreter):
+                findings = checker.scan_shell(f"{interpreter} x.py")
+                self.assertEqual(len(findings), 1, "case variant escaped")
+                self.assertEqual(checker.scan_shell(f"{interpreter} -I x.py"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
