@@ -251,5 +251,136 @@ class RepositoryPolicy6814(unittest.TestCase):
                         self.assertEqual(checker.scan_shell(isolated), [])
 
 
+class RoundFourIsolation8202(unittest.TestCase):
+    """Review regressions execute fixtures, never workflow shell commands."""
+
+    def test_first_step_key_python_shell(self):
+        checker = load_checker()
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            path = root / ".github/workflows/python.yml"
+            path.parent.mkdir(parents=True)
+            template = "jobs:\n  test:\n    steps:\n      - shell: %s\n        run: pass\n"
+            for shell in ("python", "python3 {0}"):
+                with self.subTest(shell=shell):
+                    path.write_text(template % shell)
+                    self.assertEqual(len(checker.scan_repository(root)), 1)
+                    isolated = shell.replace("python", "python -I", 1)
+                    if shell.startswith("python3"):
+                        isolated = shell.replace("python3", "python3 -I", 1)
+                    path.write_text(template % isolated)
+                    self.assertEqual(checker.scan_repository(root), [])
+
+    def test_console_entrypoints_require_isolated_module_form(self):
+        checker = load_checker()
+        for command, isolated in (
+            ("pip install example", "python3 -I -m pip install example"),
+            ("pip3 install example", "python3 -I -m pip install example"),
+            ("pytest tests/", "python3 -I -m pytest tests/"),
+            ("pipx run example", "python3 -I -m pipx run example"),
+            ("uv run example.py", "python3 -I -m uv run example.py"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(len(checker.scan_shell(command)), 1)
+                self.assertEqual(checker.scan_shell(isolated), [])
+
+    def test_dynamic_interpreters_require_an_issue_exemption(self):
+        checker = load_checker()
+        for interpreter in ("$PYTHON", "${PYTHON:-python3}",
+                            "${{ steps.x.outputs.python-path }}", "py -3"):
+            with self.subTest(interpreter=interpreter):
+                command = interpreter + " -I scripts/x.py"
+                self.assertEqual(len(checker.scan_shell(command)), 1)
+                unsafe, exempt = checker.scan_source(
+                    command + " # isolation: exempt #8202\n")
+                self.assertEqual(unsafe, [])
+                self.assertEqual(exempt, [(1, "8202")])
+
+    def test_bundled_and_continued_isolation(self):
+        checker = load_checker()
+        for command in ("python3 -Ic pass", "python3 -IB scripts/x.py",
+                        "python3 \\\n  -I scripts/x.py"):
+            with self.subTest(command=command):
+                self.assertEqual(checker.scan_shell(command), [])
+        self.assertEqual(len(checker.scan_shell("python3 -cI pass")), 1)
+
+    def test_malformed_exemption_is_not_honoured(self):
+        checker = load_checker()
+        for suffix in ("exempt", "exempt 8202", "exempt #abc"):
+            with self.subTest(suffix=suffix):
+                unsafe, exempt = checker.scan_source(
+                    "python3 scripts/x.py # isolation: " + suffix + "\n")
+                self.assertEqual(len(unsafe), 1)
+                self.assertEqual(unsafe[0].line, 1)
+                self.assertEqual(exempt, [])
+
+    def test_unreadable_and_non_utf8_inputs_are_reported_without_traceback(self):
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            workflow = root / ".github/workflows/check.yml"
+            workflow.parent.mkdir(parents=True)
+            wrapper = root / "scripts/ci/fixture.sh"
+            wrapper.parent.mkdir(parents=True)
+            source = root / "commands.txt"
+            for kind, target in (("workflow", workflow), ("wrapper", wrapper),
+                                 ("positional", source)):
+                for fault in ("encoding", "permissions"):
+                    with self.subTest(kind=kind, fault=fault):
+                        workflow.write_text("jobs:\n  test:\n    steps:\n"
+                                            "      - run: bash scripts/ci/fixture.sh\n")
+                        wrapper.write_text("python3 -I -c pass\n")
+                        source.write_text("python3 -I -c pass\n")
+                        if fault == "encoding":
+                            target.write_bytes(b"\xff\n")
+                        else:
+                            target.chmod(0)
+                        try:
+                            args = [str(source)] if kind == "positional" else ["--root", str(root)]
+                            result = subprocess.run(
+                                [sys.executable, "-I", str(CHECKER), *args],
+                                capture_output=True, text=True, check=False)
+                            output = result.stdout + result.stderr
+                            self.assertEqual(result.returncode, 2, output)
+                            self.assertIn(str(target), output)
+                            self.assertNotIn("Traceback", output)
+                            self.assertEqual(len(output.splitlines()), 1, output)
+                        finally:
+                            target.chmod(0o600)
+
+    def test_failed_sibling_import_drops_the_partial_module(self):
+        # Exercise the real consumers, intercepting only the intentional sibling.
+        from unittest import mock
+
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            failing = Path(directory) / "failing.py"
+            failing.write_text("raise RuntimeError('fixture sibling import stopped')\n")
+            original_spec = importlib.util.spec_from_file_location
+
+            def fixture_spec(name, location, *args, **kwargs):
+                selected = failing if name == "shared_cargo_target" else location
+                return original_spec(name, selected, *args, **kwargs)
+
+            for consumer in ("sccache_env.py", "prune_runner_artifacts.py"):
+                with self.subTest(consumer=consumer):
+                    prior = sys.modules.pop("shared_cargo_target", None)
+                    try:
+                        spec = original_spec("review_consumer", ROOT / "scripts/ci" / consumer)
+                        module = importlib.util.module_from_spec(spec)
+                        with mock.patch.object(importlib.util, "spec_from_file_location", fixture_spec):
+                            with self.assertRaisesRegex(RuntimeError, "fixture sibling import stopped"):
+                                spec.loader.exec_module(module)
+                        self.assertNotIn("shared_cargo_target", sys.modules)
+                    finally:
+                        sys.modules.pop("shared_cargo_target", None)
+                        if prior is not None:
+                            sys.modules["shared_cargo_target"] = prior
+
+
 if __name__ == "__main__":
     unittest.main()

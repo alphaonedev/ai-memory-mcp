@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / '.github/workflows'
@@ -38,6 +39,16 @@ def job_blocks(text):
 
 
 class WorkflowPipVisibility8202(unittest.TestCase):
+    def test_same_line_pip3_fallback_mutation_is_rejected(self):
+        step = coverage_step()
+        lines = step.splitlines(keepends=True)
+        index = next(i for i, line in enumerate(lines) if '"huggingface_hub>=0.20"' in line)
+        lines[index] = lines[index].rstrip('\n') + ' || pip3 install example\n'
+        mutant = ''.join(lines)
+        with mock.patch.object(sys.modules[__name__], 'coverage_step', return_value=mutant):
+            with self.assertRaises(AssertionError):
+                self.test_system_python_install_has_an_explicit_project_target()
+
     def test_system_python_install_has_an_explicit_project_target(self):
         step = coverage_step()
         self.assertIn(f'{TARGET_NAME}: {TARGET_VALUE}', step)
@@ -63,7 +74,10 @@ class WorkflowPipVisibility8202(unittest.TestCase):
             root = Path(directory)
             target = root / 'packages'
             target.mkdir()
+            (target / 'json.py').write_text(
+                'raise RuntimeError("pip target shadowed stdlib json")\n')
             (target / 'huggingface_hub.py').write_text(
+                'import json\n'
                 'def snapshot_download(model):\n'
                 '    print("explicit-target:" + model)\n')
             (root / 'huggingface_hub.py').write_text(
