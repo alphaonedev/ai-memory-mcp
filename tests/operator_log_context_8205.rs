@@ -46,8 +46,10 @@ fn operator_log_escapes_caller_controls_6822() {
             assert!(line.contains(control), "missing {control}: {log:?}");
         }
         assert!(!line.contains(operator_capture::FIXTURE_PASSWORD));
-        assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
-        assert!(line.contains("example.invalid/path"));
+        assert!(!line.contains(operator_capture::FIXTURE_QUERY));
+        assert!(!line.contains(operator_capture::FIXTURE_FRAGMENT));
+        assert!(line.contains("https://example.invalid"));
+        assert!(!line.contains("/path"));
     }
 }
 

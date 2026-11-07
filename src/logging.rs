@@ -1615,6 +1615,12 @@ pub fn redact_url_password(url: &str) -> String {
 /// every other byte passes through unchanged.
 #[must_use]
 pub fn redact_urls_in_message(msg: &str) -> String {
+    map_urls_in_message(msg, redact_url_password)
+}
+
+/// Apply one renderer to each URL run, sharing the established UTF-8-safe
+/// diagnostic tokenization (OWNERSHIP-15) without duplicating a masking policy.
+pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     while let Some(sep) = rest.find("://") {
@@ -1641,7 +1647,7 @@ pub fn redact_urls_in_message(msg: &str) -> String {
                     )
             })
             .map_or(rest.len(), |i| sep + i);
-        out.push_str(&redact_url_password(&rest[scheme_start..url_end]));
+        out.push_str(&render(&rest[scheme_start..url_end]));
         rest = &rest[url_end..];
     }
     out.push_str(rest);

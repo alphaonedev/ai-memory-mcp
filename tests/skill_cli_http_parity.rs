@@ -891,6 +891,8 @@ fn assert_escaped_promote_log(log: &str, context: &str) {
     assert!(!log.contains("caller\nforged"), "raw newline in the detail");
     assert!(!log.chars().any(|c| c.is_control() && c != '\n'));
     assert!(!diagnostic.contains(operator_capture::FIXTURE_PASSWORD));
-    assert!(diagnostic.contains(ai_memory::logging::URL_PASSWORD_MASK));
-    assert!(diagnostic.contains("example.invalid/path"));
+    assert!(!diagnostic.contains(operator_capture::FIXTURE_QUERY));
+    assert!(!diagnostic.contains(operator_capture::FIXTURE_FRAGMENT));
+    assert!(diagnostic.contains("https://example.invalid"));
+    assert!(!diagnostic.contains("/path"));
 }
