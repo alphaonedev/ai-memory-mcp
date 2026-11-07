@@ -371,9 +371,12 @@ fn curator_daemon_stop_signals_exit_zero_8193() {
     }
 }
 
-/// #8193 N1: the curator installs its listener before spawning the waiter,
-/// so a stop signal sent the moment the daemon reports it started (no settle
-/// pause) still takes the drained exit 0, never the default disposition.
+/// #8193 smoke test of the curator daemon exit path: a stop signal sent the
+/// moment the daemon reports it started (no settle pause) still takes the
+/// drained exit 0. This does NOT guard the N1 eager-install fix (it also
+/// passes without it, since the process-level race is too narrow to hit
+/// reliably); the N1 guard is the curator lib test
+/// `cli::curator::tests::shutdown_signal_before_the_first_poll_is_remembered_8193`.
 #[cfg(unix)]
 #[test]
 fn curator_daemon_early_stop_signals_exit_zero_8193() {
