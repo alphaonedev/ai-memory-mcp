@@ -242,7 +242,7 @@ fn operator_schemeless_connection_details_8205() {
         format!("connect host:port/path?token={SECRET}"),
         format!("host=db password={SECRET} port=5432"),
         format!("host=db password='{SECRET} with spaces' port=5432"),
-        format!("host=db password="{SECRET} with spaces" port=5432"),
+        format!(r#"host=db password="{SECRET} with spaces" port=5432"#),
         format!("host=db password = '{SECRET} with spaces' port=5432"),
         format!("host=db arbitrary_option={SECRET} port=5432"),
     ] {
