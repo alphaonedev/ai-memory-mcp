@@ -6,9 +6,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use ai_memory::models::GovernedAction;
-use ai_memory::storage::connection::WriteTxn;
-use ai_memory::storage::escalation_deferral::{DeferredEscalation, defer_to_open_txn};
+use crate::models::GovernedAction;
+use crate::storage::connection::WriteTxn;
+use crate::storage::escalation_deferral::{DeferredEscalation, defer_to_open_txn};
 use rusqlite::Connection;
 
 const CHILD_ROLE: &str = "AI_MEMORY_TEST_ESCALATION_8184_CHILD";
@@ -20,11 +20,12 @@ fn child_stderr(name: &str, action: impl FnOnce() + Send + 'static) -> Option<St
         std::thread::spawn(action).join().expect("child thread");
         return None;
     }
-    let output = ai_memory::spawn_audit::audited_command(
+    let test_path = format!("{}::{name}", module_path!());
+    let output = crate::spawn_audit::audited_command(
         std::env::current_exe().expect("test executable"),
         "escalation_frame_reporting_8184::child",
     )
-    .args(["--exact", name, "--nocapture", "--test-threads=1"])
+    .args(["--exact", &test_path, "--nocapture", "--test-threads=1"])
     .env(CHILD_ROLE, name)
     .output()
     .expect("run child");

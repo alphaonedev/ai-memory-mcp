@@ -503,6 +503,10 @@ pub fn insert_pending_action_row(
 }
 
 #[cfg(test)]
+#[path = "escalation_frame_reporting_8184_tests.rs"]
+mod reporting_tests;
+
+#[cfg(test)]
 mod tests {
     /// #7241 L1 - an anchor handed to a funnel that runs in a raw transaction
     /// with no `WriteTxn` frame is dropped; a debug or test build must trip a
