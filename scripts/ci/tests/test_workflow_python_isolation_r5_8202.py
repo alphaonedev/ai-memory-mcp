@@ -3,7 +3,9 @@
 import importlib.util
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -141,6 +143,60 @@ class InterpreterCaseN5(unittest.TestCase):
                 findings = checker.scan_shell(f"{interpreter} x.py")
                 self.assertEqual(len(findings), 1, "case variant escaped")
                 self.assertEqual(checker.scan_shell(f"{interpreter} -I x.py"), [])
+
+
+class CodeReviewRoundFive(unittest.TestCase):
+    def test_debug_and_case_interpreter_names_c1(self):
+        checker = load_checker()
+        for name in ("python3-dbg", "python3.12d", "Python3"):
+            with self.subTest(name=name):
+                self.assertEqual(len(checker.scan_shell(f"{name} x.py")), 1,
+                                 "Python executable suffix escaped")
+                self.assertEqual(checker.scan_shell(f"{name} -I x.py"), [])
+
+    def test_malformed_workflow_keeps_line_and_all_findings_c4(self):
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            path = root / ".github/workflows/malformed.yml"
+            path.parent.mkdir(parents=True)
+            path.write_text("jobs:\n  test:\n    steps:\n      - run: |\n"
+                            "          python3 x.py\n          echo ready\n"
+                            "          echo 'unterminated\n")
+            result = subprocess.run([sys.executable, "-I", str(CHECKER), "--root", str(root)],
+                                    text=True, capture_output=True, check=False)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 2, output)
+            self.assertIn(f"{path}:7: unparseable shell command", output)
+            self.assertIn(f"{path}:5: Python interpreter requires -I", output)
+            self.assertIn("python isolation: findings=2 exemptions=0", output)
+            self.assertNotIn("Traceback", output)
+
+    def test_sibling_mismatch_names_module_and_both_paths_c5(self):
+        spec = importlib.util.spec_from_file_location(
+            "sibling_round_five", ROOT / "scripts/ci/sibling_import.py")
+        loader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loader)
+        name = "fixture_sibling_8202"
+        caller = ROOT / ".local-runs/expected/caller.py"
+        expected = caller.with_name(name + ".py")
+        actual = ROOT / ".local-runs/elsewhere/fixture.py"
+        prior = sys.modules.get(name)
+        module = types.ModuleType(name)
+        module.__file__ = str(actual)
+        sys.modules[name] = module
+        try:
+            with self.assertRaises(ImportError) as raised:
+                loader.load_sibling(name, caller)
+            for detail in (name, str(expected), str(actual)):
+                with self.subTest(detail=detail):
+                    self.assertIn(detail, str(raised.exception))
+            self.assertIs(sys.modules[name], module)
+        finally:
+            sys.modules.pop(name, None)
+            if prior is not None:
+                sys.modules[name] = prior
 
 
 if __name__ == "__main__":

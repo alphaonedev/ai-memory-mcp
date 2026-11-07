@@ -381,24 +381,26 @@ class RoundFourIsolation8202(unittest.TestCase):
             original_spec = importlib.util.spec_from_file_location
 
             def fixture_spec(name, location, *args, **kwargs):
-                selected = failing if name == "shared_cargo_target" else location
+                selected = failing if name == sibling else location
                 return original_spec(name, selected, *args, **kwargs)
 
-            for consumer in ("sccache_env.py", "prune_runner_artifacts.py"):
+            for consumer, sibling in (("sccache_env.py", "shared_cargo_target"),
+                                      ("prune_runner_artifacts.py", "shared_cargo_target"),
+                                      ("pg_isolate_split.py", "partition_test_binaries")):
                 with self.subTest(consumer=consumer):
-                    prior = sys.modules.pop("shared_cargo_target", None)
+                    prior = sys.modules.pop(sibling, None)
                     try:
                         spec = original_spec("review_consumer", ROOT / "scripts/ci" / consumer)
                         module = importlib.util.module_from_spec(spec)
                         with mock.patch.object(importlib.util, "spec_from_file_location", fixture_spec):
                             with self.assertRaisesRegex(RuntimeError, "fixture sibling import stopped"):
                                 spec.loader.exec_module(module)
-                        self.assertFalse("shared_cargo_target" in sys.modules,
+                        self.assertFalse(sibling in sys.modules,
                                          "partial sibling survived its import failure")
                     finally:
-                        sys.modules.pop("shared_cargo_target", None)
+                        sys.modules.pop(sibling, None)
                         if prior is not None:
-                            sys.modules["shared_cargo_target"] = prior
+                            sys.modules[sibling] = prior
 
 
 if __name__ == "__main__":
