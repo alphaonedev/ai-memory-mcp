@@ -1635,18 +1635,18 @@ pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> Stri
             }
         }
         out.push_str(&rest[..scheme_start]);
-        // The URL run ends at the first whitespace / quote / brace /
-        // paren / comma / semicolon / angle bracket — same boundary
-        // set as `handlers::postgres_gate::sanitize_store_err_message`.
-        let url_end = rest[sep..]
-            .find(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '"' | '\'' | '`' | '{' | '}' | '(' | ')' | ',' | ';' | '<' | '>'
-                    )
-            })
-            .map_or(rest.len(), |i| sep + i);
+        // ERRORS-15: punctuation can be credential data, including in a
+        // malformed URL. Never emit a suffix just because parsing would
+        // reject it. Whitespace inside userinfo also belongs to the run.
+        let authority_start = sep + "://".len();
+        let authority = &rest[authority_start..];
+        let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+        let after_userinfo = authority[..authority_end]
+            .rfind('@')
+            .map_or(authority_start, |at| authority_start + at + '@'.len_utf8());
+        let url_end = rest[after_userinfo..]
+            .find(char::is_whitespace)
+            .map_or(rest.len(), |i| after_userinfo + i);
         out.push_str(&render(&rest[scheme_start..url_end]));
         rest = &rest[url_end..];
     }
