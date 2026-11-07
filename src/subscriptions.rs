@@ -36,7 +36,9 @@ pub mod audit_status;
 pub mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+#[cfg(not(test))]
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -2158,8 +2160,12 @@ fn validate_url_dns_with(
              AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
         ));
     }
-    let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
-        Ok(iter) => iter.collect(),
+    #[cfg(test)]
+    let resolution = webhook_ssrf_8203_tests::resolve(&resolv_target);
+    #[cfg(not(test))]
+    let resolution = resolv_target.to_socket_addrs().map(Iterator::collect);
+    let addrs: Vec<std::net::SocketAddr> = match resolution {
+        Ok(addrs) => addrs,
         Err(e) => {
             let fail_open = ssrf_dns_fail_open();
             if fail_open {
@@ -2837,6 +2843,9 @@ fn record_dispatch(db_path: &std::path::Path, sub_id: &str, correlation_id: &str
 fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &str, ok: bool) {
     audit_status::persist_dispatch_counter(conn, sub_id, correlation_id, ok);
 }
+
+#[cfg(test)]
+mod webhook_ssrf_8203_tests;
 
 #[cfg(test)]
 mod tests {
