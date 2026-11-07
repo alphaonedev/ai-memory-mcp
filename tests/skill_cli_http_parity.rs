@@ -868,7 +868,7 @@ fn skill_promote_logs_escape_caller_controls_6822() {
         result.expect_err("missing reflection"),
         format!("reflection not found: {RAW_ID}")
     );
-    assert_escaped_promote_log(&log, "as_deref");
+    assert_escaped_promote_log(&log, "skill_promote_from_reflection");
 }
 
 fn assert_escaped_promote_log(log: &str, context: &str) {
