@@ -249,3 +249,9 @@ fn operator_schemeless_connection_details_8205() {
         assert_private_detail_is_absent_8205(&detail, SECRET);
     }
 }
+
+#[test]
+fn operator_capture_fixture_contains_nul_8205() {
+    assert!(operator_capture::CONTROL_PAIRS.contains(&('\0', "\\0")));
+    assert!(operator_capture::hostile_detail().contains('\0'));
+}
