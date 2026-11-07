@@ -151,3 +151,23 @@ fn dlq_without_owner_table() -> rusqlite::Connection {
         .expect("DLQ exists but owner table does not");
     conn
 }
+
+#[test]
+fn operator_log_renders_only_url_origins_6822() {
+    const QUERY_SECRET: &str = "query_credential_8205";
+    const FRAGMENT_SECRET: &str = "fragment_credential_8205";
+    const PATH_SECRET: &str = "path_credential_8205";
+    let inner =
+        format!("connect https://query.example.invalid/{PATH_SECRET}?password={QUERY_SECRET}");
+    let outer = format!("fallback https://fragment.example.invalid:9443/x#{FRAGMENT_SECRET}");
+    let (wire, log) =
+        captured(|| mcp_foreign_err("url_chain_probe", anyhow::anyhow!(inner).context(outer)));
+    assert_eq!(wire, DB_ERROR_TEXT);
+    for secret in [QUERY_SECRET, FRAGMENT_SECRET, PATH_SECRET] {
+        assert!(!log.contains(secret), "URL credential reached operator log");
+    }
+    assert!(log.contains("connect https://query.example.invalid"));
+    assert!(log.contains("fallback https://fragment.example.invalid:9443"));
+    assert!(!log.contains("?password="));
+    assert_eq!(log.lines().count(), 1);
+}
