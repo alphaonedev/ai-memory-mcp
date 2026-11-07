@@ -8,8 +8,15 @@
 //! (elsewhere) through [`StopListener`]. A signal registration that fails is
 //! an error: it is logged at `error` level and the matching arm parks, so a
 //! failed registration is never read as a received stop (ERRORS-19, #6385,
-//! #6869). The `mcp` stdio server keeps its own fail-closed listeners in
-//! [`crate::mcp::shutdown`] (it refuses to start rather than run unstoppable).
+//! #6869). The daemon keeps running, but with no handler installed that
+//! signal's default disposition applies and ends the process at once,
+//! undrained; the other signal still drains gracefully. The `mcp` stdio
+//! server keeps its own fail-closed listeners in [`crate::mcp::shutdown`] (it
+//! refuses to start rather than run unstoppable).
+//!
+//! Install the listener ONCE, before the daemon starts serving or spawns the
+//! task that waits on it. [`StopListener::wait`] is cancel-safe, so a loop may
+//! select on it every iteration.
 
 use std::io;
 
@@ -19,14 +26,15 @@ pub const SIGNAL_NAME_INT: &str = "SIGINT";
 /// Name of the terminate signal in log lines and the test seam.
 pub const SIGNAL_NAME_TERM: &str = "SIGTERM";
 
-/// Test seam (debug and test builds only): the listed signal name, or `any`,
-/// fails its registration with an injected error. Shares the variable the
-/// `mcp` listeners use, so one switch drives every verb.
+/// Test seam (unix debug and test builds only): the listed signal name, or
+/// `any`, fails its registration with an injected error. Shares the variable
+/// the `mcp` listeners use, so one switch drives every unix verb. The
+/// non-unix Ctrl-C path has no injected failure.
 #[cfg(any(test, debug_assertions))]
 pub const TEST_FAIL_REGISTER_ENV: &str = crate::mcp::shutdown::TEST_FAIL_STOP_INSTALL_ENV;
 
 /// Value of [`TEST_FAIL_REGISTER_ENV`] that fails every registration.
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 const TEST_FAIL_ANY: &str = "any";
 
 /// The outcome of waiting for an interrupt registration.
@@ -58,8 +66,9 @@ fn armed<T>(name: &'static str, result: io::Result<T>) -> Option<T> {
             tracing::error!(
                 signal = name,
                 %error,
-                "#8193: stop-signal registration failed; this signal will NOT stop the \
-                 daemon (it keeps running) - stop it with another signal or fix the host"
+                "#8193: stop-signal registration failed; this signal is NOT handled and \
+                 will terminate the daemon immediately without a graceful drain - stop it \
+                 with the other signal or fix the host"
             );
             None
         }
@@ -67,7 +76,7 @@ fn armed<T>(name: &'static str, result: io::Result<T>) -> Option<T> {
 }
 
 /// The injected registration failure for `name`, if the seam is armed.
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 fn injected_failure(name: &str) -> Option<io::Error> {
     let value = std::env::var(TEST_FAIL_REGISTER_ENV).ok()?;
     let value = value.trim();
@@ -83,6 +92,30 @@ pub struct StopListener {
     int: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
     term: Option<tokio::signal::unix::Signal>,
+    #[cfg(not(unix))]
+    ctrl_c: CtrlC,
+}
+
+/// State of the non-unix Ctrl-C wait.
+#[cfg(not(unix))]
+enum CtrlC {
+    /// Registered; not yet delivered.
+    Pending(std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>),
+    /// Delivered (possibly during registration).
+    Fired,
+    /// Registration failed: parks, never a stop.
+    Failed,
+}
+
+#[cfg(not(unix))]
+impl std::fmt::Debug for CtrlC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending(_) => "Pending",
+            Self::Fired => "Fired",
+            Self::Failed => "Failed",
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -126,7 +159,24 @@ impl StopListener {
         }
         #[cfg(not(unix))]
         {
-            Self {}
+            // Register eagerly: the first poll installs the handler, so poll
+            // once here (the src/mcp/shutdown.rs precedent) instead of on the
+            // first `wait`. A Ctrl-C inside that poll is an immediate stop.
+            let mut ctrl_c: std::pin::Pin<
+                Box<dyn std::future::Future<Output = io::Result<()>> + Send>,
+            > = Box::pin(tokio::signal::ctrl_c());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let ctrl_c = match ctrl_c.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(result) => match classify_interrupt(result) {
+                    InterruptWait::Received => CtrlC::Fired,
+                    InterruptWait::RegistrationFailed(error) => {
+                        let _ = armed::<()>(SIGNAL_NAME_INT, Err(error));
+                        CtrlC::Failed
+                    }
+                },
+                std::task::Poll::Pending => CtrlC::Pending(ctrl_c),
+            };
+            Self { ctrl_c }
         }
     }
 
@@ -139,7 +189,7 @@ impl StopListener {
         }
         #[cfg(not(unix))]
         {
-            true
+            !matches!(self.ctrl_c, CtrlC::Failed)
         }
     }
 
@@ -156,12 +206,17 @@ impl StopListener {
         }
         #[cfg(not(unix))]
         {
-            match classify_interrupt(tokio::signal::ctrl_c().await) {
-                InterruptWait::Received => {}
-                InterruptWait::RegistrationFailed(error) => {
-                    let _ = armed::<()>(SIGNAL_NAME_INT, Err(error));
-                    std::future::pending::<()>().await;
-                }
+            match &mut self.ctrl_c {
+                CtrlC::Fired => {}
+                CtrlC::Failed => std::future::pending::<()>().await,
+                CtrlC::Pending(ctrl_c) => match classify_interrupt(ctrl_c.as_mut().await) {
+                    InterruptWait::Received => self.ctrl_c = CtrlC::Fired,
+                    InterruptWait::RegistrationFailed(error) => {
+                        let _ = armed::<()>(SIGNAL_NAME_INT, Err(error));
+                        self.ctrl_c = CtrlC::Failed;
+                        std::future::pending::<()>().await;
+                    }
+                },
             }
         }
     }

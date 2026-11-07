@@ -86,7 +86,8 @@ EXPOSE 9077
 USER aimem
 
 # #8193: `docker stop` sends this; serve drains and exits 0 on SIGTERM exactly
-# as on SIGINT (raise the stop timeout above --shutdown-grace-secs).
+# as on SIGINT (run it with `docker stop -t 90` / `stop_grace_period: 90s`,
+# the 90 s budget in docs/ADMIN_GUIDE.md; the Docker default is 10 s).
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["ai-memory"]

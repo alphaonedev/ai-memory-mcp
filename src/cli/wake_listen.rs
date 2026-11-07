@@ -511,9 +511,15 @@ pub async fn dispatch(
          remains the guarantee"
     );
 
+    // #8193: ONE listener for the whole run. Installing per iteration left a
+    // window (the catch-up read and any --exec child) with no subscriber, and
+    // a stop signal delivered there was lost for good. A signal that arrives
+    // while an iteration runs is remembered and wins at the next select.
+    let mut stop = crate::stop_signal::StopListener::install();
     loop {
         let signal = tokio::select! {
-            () = shutdown_signal() => {
+            biased;
+            () = stop.wait() => {
                 tracing::info!("wake listener: stopping on signal");
                 return Ok(());
             }
@@ -605,13 +611,6 @@ async fn emit(
         out.stdout.flush()?;
     }
     Ok(())
-}
-
-/// Resolve on SIGINT or, on unix, SIGTERM.
-async fn shutdown_signal() {
-    // #8193: the one shared stop primitive; a failed registration is logged
-    // and parked, never read as a received stop.
-    crate::stop_signal::stop_signal().await;
 }
 
 /// The listener's own normative bound, re-exported so the CLI reference and

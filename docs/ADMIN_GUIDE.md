@@ -902,11 +902,18 @@ same path (#8193):
 SIGTERM is the default signal of `systemctl stop` and `docker stop`; the
 Dockerfile sets `STOPSIGNAL SIGTERM`. The in-flight request grace is
 `--shutdown-grace-secs`. A failed signal registration is logged at `error`
-level and never stops the daemon. For systemd, `KillSignal=SIGINT` (or the
-default SIGTERM) and `TimeoutStopSec=90` both work. This covers the
-default 30-second HTTP request grace period plus the bounded background-writer,
-webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
-leaving time for the visible exit-75 failure path.
+level and is never read as a stop; but that signal then has no handler, so it
+terminates the daemon at once, without a graceful drain. Stop the daemon with
+the other signal, or fix the host. For systemd, `KillSignal=SIGINT` (or the
+default SIGTERM) and `TimeoutStopSec=90` both work.
+
+The stop budget is one number, 90 seconds, for every supervisor:
+`TimeoutStopSec=90` (systemd), `docker stop -t 90` and `stop_grace_period: 90s`
+(compose). It covers the default 30-second HTTP request grace period plus the
+bounded background-writer, webhook-delivery, deferred-audit drain, and final
+witness/checkpoint phases, leaving time for the visible exit-75 failure path.
+The Docker default of 10 seconds is shorter and sends SIGKILL mid-drain, so set
+it. Raise all of them together if you raise `--shutdown-grace-secs`.
 
 If the webhook-delivery drain misses its 30-second budget, webhook
 deliveries that had not started yet are recorded to the subscription DLQ

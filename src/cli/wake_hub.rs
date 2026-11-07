@@ -548,20 +548,15 @@ pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32>
             HubDeps::default()
         }
     };
+    // #8193: install before the socket is bound, so a stop signal that
+    // arrives during startup is graceful too (and the socket is unlinked).
+    let mut stop = crate::stop_signal::StopListener::install();
     let hub = WakeHub::bind(cfg, deps)?;
     // A completed drain is a SUCCESSFUL shutdown: exit 0, so `systemctl stop`
     // and `launchctl bootout` do not record a failure for the thing they asked
     // for (#3471).
-    hub.serve(shutdown_signal()).await?;
+    hub.serve(async move { stop.wait().await }).await?;
     Ok(0)
-}
-
-/// Resolve on SIGINT or, on unix, SIGTERM — so `systemctl stop`, `docker stop`
-/// and a plain `kill` all trigger the same bounded drain.
-async fn shutdown_signal() {
-    // #8193: the one shared stop primitive; a failed registration is logged
-    // and parked, never read as a received stop.
-    crate::stop_signal::stop_signal().await;
 }
 
 #[cfg(test)]

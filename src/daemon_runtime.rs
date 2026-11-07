@@ -1144,7 +1144,7 @@ pub struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     pub mtls_allowlist: Option<PathBuf>,
     /// Seconds to wait for in-flight requests to complete on graceful
-    /// shutdown (SIGINT). Default 30. Bumped from 10 in v0.6.0 because
+    /// shutdown (SIGINT or SIGTERM). Default 30. Bumped from 10 in v0.6.0 because
     /// large `/sync/push` batches can take longer than 10s under load
     /// (red-team #233).
     #[arg(long, default_value_t = 30)]
@@ -8345,7 +8345,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             let socket_addr: std::net::SocketAddr = addr.parse()?;
             // axum-server doesn't have a direct graceful-shutdown on the
             // TLS builder yet; spawn the signal listener on the Handle
-            // instead so ctrl_c triggers a graceful shutdown. Window is
+            // instead so SIGINT and SIGTERM (unix) trigger a graceful shutdown. Window is
             // operator-configurable via --shutdown-grace-secs (default 30,
             // bumped from 10 in v0.6.0 — red-team #233).
             let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
@@ -8499,6 +8499,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         Ok(())
     }
     .await;
+    if server_result.is_ok() {
+        // #8193: the HTTP server stopped and every in-flight request finished.
+        tracing::info!("in-flight requests drained — stopping background writers");
+    }
     bootstrap.task_handles.extend(
         server_aux_tasks
             .lock()
@@ -8631,7 +8635,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> {
     let lock = db_state.lock().await;
     crate::signed_events::try_force_emit_audit_head_witness(&lock.0)?;
-    db::checkpoint(&lock.0)
+    tracing::info!("final witness flushed (a no-op when no witness key is enrolled)");
+    db::checkpoint(&lock.0)?;
+    tracing::info!("final WAL checkpoint complete");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
