@@ -97,6 +97,42 @@ class WorkflowShellN3(unittest.TestCase):
             self.assertEqual([(line, issue) for _, line, issue in exemptions], [(4, "8202")])
 
 
+class ShellProgramsN4(unittest.TestCase):
+    def test_shell_c_option_clusters_reenter_the_scan(self):
+        checker = load_checker()
+        for shell in ("sh", "bash", "zsh", "dash", "/bin/bash"):
+            for option in ("-c", "-ec", "-lc", "-xec", "-ce"):
+                with self.subTest(shell=shell, option=option):
+                    command = f"{shell} {option} 'python3 x.py'"
+                    self.assertEqual(len(checker.scan_shell(command)), 1,
+                                     "shell command string escaped")
+                    self.assertEqual(checker.scan_shell(command.replace("python3", "python3 -I")), [])
+        self.assertEqual(len(checker.scan_shell("env X=1 bash -lc 'python3 x.py'")), 1)
+
+    def test_shell_heredocs_are_program_text_with_source_lines(self):
+        checker = load_checker()
+        for shell in ("sh", "bash", "zsh", "dash", "nice -n 10 bash"):
+            for redirect in ("<<EOF", "<<'EOF'", "<<-EOF"):
+                with self.subTest(shell=shell, redirect=redirect):
+                    command = f"{shell} {redirect}\n\tpython3 x.py\nEOF\n"
+                    findings = checker.scan_shell(command)
+                    self.assertEqual(len(findings), 1, "shell heredoc program escaped")
+                    self.assertEqual(findings[0].line, 2)
+                    self.assertEqual(checker.scan_shell(command.replace("python3", "python3 -I")), [])
+
+    def test_data_heredocs_and_nested_data_remain_data(self):
+        checker = load_checker()
+        for header in ("cat <<EOF", "cat > output <<EOF", "python3 -I - <<EOF",
+                       "bash script.sh <<EOF"):
+            with self.subTest(header=header):
+                self.assertEqual(checker.scan_shell(f"{header}\npython3 x.py\nEOF\n"), [])
+        nested = ("bash <<OUTER\ncat <<INNER\npython3 data.py\nINNER\n"
+                  "python3 program.py\nOUTER\n")
+        findings = checker.scan_shell(nested)
+        self.assertEqual(len(findings), 1, "nested shell program escaped or data scanned")
+        self.assertEqual(findings[0].line, 5)
+
+
 class InterpreterCaseN5(unittest.TestCase):
     def test_literal_python_names_are_case_insensitive(self):
         checker = load_checker()
