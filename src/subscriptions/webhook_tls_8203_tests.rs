@@ -12,8 +12,8 @@ const PUNYCODE_URL: &str = "https://xn--bcher-kva.example/hook";
 
 #[test]
 fn implicit_https_default_port_6401() {
-    let (host, addresses) = validate_url_dns_resolved(IMPLICIT_URL, true)
-        .expect("loopback resolver must succeed");
+    let (host, addresses) =
+        validate_url_dns_resolved(IMPLICIT_URL, true).expect("loopback resolver must succeed");
     assert_eq!(host, "localhost");
     assert!(!addresses.is_empty());
     let ports: Vec<_> = addresses.iter().map(std::net::SocketAddr::port).collect();
@@ -30,8 +30,8 @@ fn explicit_https_port_control_6401() {
         ("https://localhost:8443/hook", 8443),
         ("http://localhost/hook", 80),
     ] {
-        let (_, addresses) = validate_url_dns_resolved(url, true)
-            .expect("loopback resolver must succeed");
+        let (_, addresses) =
+            validate_url_dns_resolved(url, true).expect("loopback resolver must succeed");
         assert!(!addresses.is_empty());
         assert!(addresses.iter().all(|address| address.port() == port));
     }
@@ -42,4 +42,72 @@ fn idn_admission_only_6866() {
     for url in [UNICODE_URL, PUNYCODE_URL] {
         validate_url_with(url, false).expect("IDN admission accepts both spellings");
     }
+}
+
+#[path = "webhook_tls_receiver_6401_tests.rs"]
+pub(super) mod receiver;
+
+const PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+const PUNYCODE_HOST: &str = "xn--bcher-kva.example";
+
+thread_local! {
+    static PUBLIC_ANSWER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct PublicAnswer;
+
+impl Drop for PublicAnswer {
+    fn drop(&mut self) {
+        PUBLIC_ANSWER.set(false);
+    }
+}
+
+pub(super) fn resolve(target: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    if PUBLIC_ANSWER.get() {
+        let (host, port) = target.rsplit_once(':').expect("DNS target has a port");
+        assert!(
+            host == "bücher.example" || host == PUNYCODE_HOST,
+            "injected IDN name"
+        );
+        return Ok(vec![std::net::SocketAddr::new(
+            PUBLIC_IP.into(),
+            port.parse().expect("DNS port"),
+        )]);
+    }
+    target.to_socket_addrs().map(Iterator::collect)
+}
+
+fn public_answer(url: &str) -> (String, Vec<std::net::SocketAddr>) {
+    assert!(!PUBLIC_ANSWER.replace(true));
+    let _reset = PublicAnswer;
+    validate_url_dns_with(url, false).expect("injected public address must be admitted")
+}
+
+#[test]
+fn punycode_idn_public_dns_pins_443_6866() {
+    let (host, addresses) = public_answer(PUNYCODE_URL);
+    assert_eq!(host, PUNYCODE_HOST);
+    assert_eq!(
+        addresses,
+        vec![std::net::SocketAddr::new(PUBLIC_IP.into(), HTTPS_PORT)]
+    );
+}
+
+#[test]
+fn unicode_idn_public_dns_answer_6866() {
+    // #6371 owns the Unicode/client pin-key difference. This cell exercises
+    // the real guard's public-address admission without normalizing its input.
+    let (_, addresses) = public_answer(UNICODE_URL);
+    assert_eq!(
+        addresses,
+        vec![std::net::SocketAddr::new(PUBLIC_IP.into(), HTTPS_PORT)]
+    );
+}
+
+#[test]
+fn inference_http_default_helper_is_unchanged_6401() {
+    assert_eq!(
+        host_port_with_default_http_port("localhost"),
+        "localhost:80"
+    );
 }

@@ -1698,6 +1698,9 @@ fn send(
                 return Err(dlq_reason::DNS_SSRF_REJECTED.to_string());
             }
         };
+    #[cfg(test)]
+    let validated_addrs =
+        webhook_tls_8203_tests::receiver::map_receiver(&resolved_host, validated_addrs)?;
     // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
     // `builder.resolve(host, addr)` pins below shadow reqwest's DNS
     // for the *validated* host only. reqwest's default redirect
@@ -2010,6 +2013,17 @@ pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
     format!("{host_port}:80")
 }
 
+/// #6401 / #4075: webhook pins use the scheme default when no port is explicit.
+/// The inference HTTP-only helper above retains its existing contract.
+fn webhook_host_port_with_default(host_port: &str, scheme: &str) -> String {
+    const HTTPS_DEFAULT_PORT: u16 = 443;
+    if scheme == "https" {
+        format!("{host_port}:{HTTPS_DEFAULT_PORT}")
+    } else {
+        host_port_with_default_http_port(host_port)
+    }
+}
+
 pub(crate) fn validate_url_dns_resolved(
     url: &str,
     allow_loopback: bool,
@@ -2067,7 +2081,7 @@ fn validate_url_dns_with(
     let shown = crate::url_display::url_origin(url);
     let url_display = shown.as_str();
     let lower = url.to_ascii_lowercase();
-    let (_scheme, rest) = lower
+    let (scheme, rest) = lower
         .split_once("://")
         .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
     // #3744 — userinfo is stripped BEFORE any host extraction, the same
@@ -2097,7 +2111,7 @@ fn validate_url_dns_with(
     // with no trailing ":N") was previously passed to ToSocketAddrs as-is,
     // which errors with "invalid port value" — and the catch-all `Err(_) =>
     // return Ok(())` below treated that as a DNS hiccup, silently bypassing
-    // the SSRF guard. Detect the no-trailing-port form and append `:80` so
+    // the SSRF guard. Detect the no-trailing-port form and append the scheme default so
     // resolution succeeds and the IP is checked.
     let resolv_target =
         if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
@@ -2107,13 +2121,13 @@ fn validate_url_dns_with(
                 host_port.to_string()
             } else {
                 // [ipv6] without port — append default
-                host_port_with_default_http_port(host_port)
+                webhook_host_port_with_default(host_port, scheme)
             }
         } else if host_port.contains(':') {
             // IPv4:port or hostname:port — use as-is
             host_port.to_string()
         } else {
-            host_port_with_default_http_port(host_port)
+            webhook_host_port_with_default(host_port, scheme)
         };
     // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
     // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
@@ -2158,8 +2172,12 @@ fn validate_url_dns_with(
              AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
         ));
     }
-    let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
-        Ok(iter) => iter.collect(),
+    #[cfg(test)]
+    let resolution = webhook_tls_8203_tests::resolve(&resolv_target);
+    #[cfg(not(test))]
+    let resolution = resolv_target.to_socket_addrs().map(Iterator::collect);
+    let addrs: Vec<std::net::SocketAddr> = match resolution {
+        Ok(addrs) => addrs,
         Err(e) => {
             let fail_open = ssrf_dns_fail_open();
             if fail_open {
