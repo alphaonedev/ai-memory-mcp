@@ -837,9 +837,9 @@ mod operator_capture;
 /// Both the HTTP and MCP promotion funnels share the escaped operator channel.
 #[test]
 fn skill_promote_logs_escape_caller_controls_6822() {
+    use std::fmt::Write as _;
     let raw_id = operator_capture::hostile_detail();
     // Preserve every fixture byte; URL parsing would strip LF, CR and tab.
-    use std::fmt::Write as _;
     let mut url_id = String::new();
     for byte in raw_id.bytes() {
         write!(url_id, "%{byte:02X}").expect("string formatting");
