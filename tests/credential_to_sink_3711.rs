@@ -592,6 +592,28 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+fn userinfo_masker_reference_3711(code: &str) -> bool {
+    code.contains("redact_url_password(") || code.contains("redact_urls_in_message(")
+}
+
+#[test]
+fn userinfo_masker_function_values_are_rejected_8205() {
+    for code in [
+        "map_urls_in_message(message, logging::redact_url_password)",
+        "let render = logging::redact_url_password;",
+        "use crate::logging::redact_url_password as render;",
+        "let render = logging::redact_urls_in_message;",
+        "logging::redact_url_password (message)",
+    ] {
+        assert!(
+            userinfo_masker_reference_3711(code),
+            "userinfo-only function reference escaped the guard: {code}"
+        );
+    }
+    assert!(!userinfo_masker_reference_3711("redact_url_password_extra"));
+    assert!(!userinfo_masker_reference_3711("url_display::url_origin"));
+}
+
 #[test]
 fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -609,7 +631,7 @@ fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
         let text = std::fs::read_to_string(&file).expect("read source");
         for (i, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            if code.contains("redact_url_password(") || code.contains("redact_urls_in_message(") {
+            if userinfo_masker_reference_3711(code) {
                 offenders.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
             }
         }
