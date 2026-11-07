@@ -131,3 +131,15 @@ fn issue_6541_stale_frame_unwind_rolls_back_both_begin_modes() {
         }
     });
 }
+
+// Mirrors the original unit regression so its profile mismatch is reproduced
+// through this focused integration binary, without the full library harness.
+#[test]
+#[should_panic(expected = "stale escalation frame")]
+fn issue_7287_leaked_frame_with_intents_is_detected_on_next_open() {
+    let dir = tempfile::tempdir().expect("test directory");
+    let path = dir.path().join("leak.db");
+    leak(&path, &["lost"]);
+    let conn = Connection::open(&path).expect("open next connection");
+    let _txn = WriteTxn::begin(&conn).expect("begin next transaction");
+}
