@@ -267,8 +267,8 @@ class RoundFourIsolation8202(unittest.TestCase):
     def test_non_python_dynamic_commands_stay_outside_the_name_scan(self):
         checker = load_checker()
         for command in ("$BIN run scripts/x.py", "$PSQL -c query",
-                        "$TIMEOUT_BIN 60 command", "${BIN} run python",
-                        "${{ steps.x.outputs.binary }} python"):
+                        "$TIMEOUT_BIN 60 command", "${BIN} run fixture",
+                        "${{ steps.x.outputs.binary }} fixture"):
             with self.subTest(command=command):
                 self.assertEqual(checker.scan_shell(command), [])
 

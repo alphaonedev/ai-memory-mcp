@@ -269,8 +269,10 @@ def scan_shell(text, *, masked=False):
                     if ("python" in value.casefold()
                             or (value.startswith("${{") and "python" in expression.casefold())):
                         findings.append(Finding(line, "dynamic interpreter requires an issue exemption"))
-                    # A non-Python variable's argv is not a sequence of new commands.
-                    break
+                        break
+                    # Leave this name alone; retain the existing scan for a literal
+                    # interpreter invoked by a wrapper such as $TIMEOUT_BIN.
+                    continue
                 if PYTHON_NAME.fullmatch(name):
                     if "/" in value and index != 0 and "/bin/" not in value:
                         continue
