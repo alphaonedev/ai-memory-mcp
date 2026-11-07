@@ -244,7 +244,7 @@ fn operator_schemeless_connection_details_8205() {
         format!("host=db password='{SECRET} with spaces' port=5432"),
         format!(r#"host=db password="{SECRET} with spaces" port=5432"#),
         format!("host=db password = '{SECRET} with spaces' port=5432"),
-        format!("host=db arbitrary_option={SECRET} port=5432"),
+        format!("host=db sslpassword={SECRET} port=5432"),
     ] {
         assert_private_detail_is_absent_8205(&detail, SECRET);
     }
@@ -255,3 +255,120 @@ fn operator_capture_fixture_contains_nul_8205() {
     assert!(operator_capture::CONTROL_PAIRS.contains(&('\0', "\\0")));
     assert!(operator_capture::hostile_detail().contains('\0'));
 }
+
+fn detail_lines_8205(detail: &str) -> [String; 2] {
+    [false, true].map(|foreign| {
+        let error = if foreign {
+            ai_memory::errors::MemoryError::DatabaseError(detail.to_owned())
+        } else {
+            ai_memory::errors::MemoryError::Refused(detail.to_owned())
+        };
+        captured(|| mcp_foreign_err("round_four_context", error)).1
+    })
+}
+
+#[test]
+fn operator_bare_authority_credentials_8205() {
+    const SECRET: &str = "authority_fixture_8205";
+    for suffix in ["db.example.invalid", "db.example.invalid:5432"] {
+        let detail = format!("connect user:{SECRET}@{suffix} refused");
+        for line in detail_lines_8205(&detail) {
+            assert!(
+                !line.contains(SECRET),
+                "bare authority credential reached the sink"
+            );
+            assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
+            assert!(line.contains("refused"), "connection context lost");
+        }
+    }
+}
+
+#[test]
+fn operator_trailing_handle_context_survives_8205() {
+    const CONTEXT: &str = "failed for agent bot@node later";
+    let detail = format!("connect postgres://db.example.invalid:5432 {CONTEXT}");
+    for line in detail_lines_8205(&detail) {
+        assert!(
+            line.contains(CONTEXT),
+            "trailing handle swallowed operator context"
+        );
+    }
+}
+
+#[test]
+fn operator_harmless_assignments_survive_8205() {
+    for detail in [
+        "limit=10 id=42 not found",
+        "limit must be <= 100",
+        "left == right",
+        "arbitrary_option=diagnostic_value",
+    ] {
+        for line in detail_lines_8205(detail) {
+            assert!(
+                line.contains(&detail.escape_debug().to_string()),
+                "harmless diagnostic changed"
+            );
+        }
+    }
+}
+
+#[test]
+fn operator_quoted_credential_keys_8205() {
+    const SECRET: &str = "quoted_key_fixture_8205";
+    for detail in [
+        format!(r#"{{"password":"{SECRET}"}}"#),
+        format!("'password': '{SECRET}'"),
+        format!(r#""sslpassword": "{SECRET}""#),
+    ] {
+        for line in detail_lines_8205(&detail) {
+            assert!(
+                !line.contains(SECRET),
+                "quoted-key credential reached the sink"
+            );
+            assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
+        }
+    }
+}
+
+#[test]
+fn operator_ambiguous_userinfo_tail_is_private_8205() {
+    const SECRET: &str = "userinfo_tail_fixture_8205";
+    for separator in ['/', '?', '#'] {
+        let detail = format!(
+            "connect postgres://user:prefix{separator}ss {SECRET}@db.example.invalid refused"
+        );
+        assert_private_detail_is_absent_8205(&detail, SECRET);
+    }
+}
+
+#[test]
+fn operator_keyless_equal_error_chain_survives_8205() {
+    const DETAIL: &str = "near \"=\": syntax error: parsing statement failed";
+    for line in detail_lines_8205(DETAIL) {
+        assert!(
+            line.contains(&DETAIL.escape_debug().to_string()),
+            "keyless equals lost error chain"
+        );
+    }
+}
+
+#[test]
+fn operator_unterminated_secret_keeps_later_context_8205() {
+    const SECRET: &str = "unterminated_fixture_8205";
+    const CONTEXT: &str = "connection refused by database";
+    let detail = format!("password='{SECRET} {CONTEXT}");
+    for line in detail_lines_8205(&detail) {
+        assert!(
+            !line.contains(SECRET),
+            "unterminated credential reached the sink"
+        );
+        assert!(
+            line.contains(CONTEXT),
+            "unterminated value consumed later context"
+        );
+    }
+}
+
+userinfo_boundary_case_8205!(operator_semicolon_userinfo_8205, ";");
+userinfo_boundary_case_8205!(operator_comma_userinfo_8205, ",");
+userinfo_boundary_case_8205!(operator_quote_userinfo_8205, "\"");

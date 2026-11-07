@@ -617,6 +617,30 @@ fn userinfo_masker_function_values_are_rejected_8205() {
     assert!(!userinfo_masker_reference_3711("url_display::url_origin"));
 }
 
+fn production_line_has_userinfo_masker_8205(line: &str) -> bool {
+    let code = line.split("//").next().unwrap_or("");
+    userinfo_masker_reference_3711(code)
+}
+
+#[test]
+fn userinfo_masker_after_url_literal_is_rejected_8205() {
+    for code in [
+        "let render = logging::redact_url_password;",
+        r#"let target = "https://peer.example.invalid"; let render = logging::redact_url_password;"#,
+    ] {
+        assert!(
+            production_line_has_userinfo_masker_8205(code),
+            "userinfo masker after a URL literal escaped the production guard"
+        );
+    }
+    assert!(!production_line_has_userinfo_masker_8205(
+        "// logging::redact_url_password is retired"
+    ));
+    assert!(!production_line_has_userinfo_masker_8205(
+        "let safe = url_display::url_origin; // redact_url_password is retired"
+    ));
+}
+
 #[test]
 fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -633,8 +657,7 @@ fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
         }
         let text = std::fs::read_to_string(&file).expect("read source");
         for (i, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            if userinfo_masker_reference_3711(code) {
+            if production_line_has_userinfo_masker_8205(line) {
                 offenders.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
             }
         }
