@@ -90,3 +90,18 @@ fn issue_6132_stale_frame_reported_once_across_repeated_opens_and_exit() {
         "one lost intent must produce one report: {stderr}"
     );
 }
+
+#[test]
+fn issue_6449_thread_exit_labels_intents_and_frames_separately() {
+    let name = "issue_6449_thread_exit_labels_intents_and_frames_separately";
+    let Some(stderr) = child_stderr(name, || {
+        let dir = tempfile::tempdir().expect("test directory");
+        leak(&dir.path().join("leak.db"), &["first", "second"]);
+    }) else {
+        return;
+    };
+    assert!(
+        stderr.contains("2 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
+        "one frame holding two intents must report both units: {stderr}"
+    );
+}
