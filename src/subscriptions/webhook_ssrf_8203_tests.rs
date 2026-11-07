@@ -4,7 +4,10 @@
 //! Regression pins for #8203: compatible IPv6, dispatch DNS pins and proxies.
 
 use std::cell::RefCell;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+
+const PRIVATE_IPV4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+const METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 
 thread_local! {
     // Only the current synchronous send thread can consume this one-shot answer.
@@ -22,11 +25,17 @@ pub(super) fn resolve(target: &str) -> std::io::Result<Vec<SocketAddr>> {
 
 #[test]
 fn ipv4_compatible_literals_are_refused_by_both_guards_6687() {
-    for host in ["::127.0.0.1", "::7f00:1", "::10.0.0.1", "::169.254.169.254"] {
+    for (host, expected) in [
+        ("::127.0.0.1", Ipv4Addr::LOCALHOST),
+        ("::7f00:1", Ipv4Addr::LOCALHOST),
+        ("::a00:1", PRIVATE_IPV4),
+        ("::169.254.169.254", METADATA_IPV4),
+    ] {
         let url = format!("https://[{host}]/hook");
         let ip: IpAddr = host.parse().expect("compatible IPv6 fixture");
-        assert!(
-            matches!(super::normalize_ip(ip), IpAddr::V4(_)),
+        assert_eq!(
+            super::normalize_ip(ip),
+            IpAddr::V4(expected),
             "#6687: compatible address must normalize to IPv4: {host}"
         );
         assert!(
@@ -68,7 +77,7 @@ fn compatible_addresses_share_internal_egress_classification_6687() {
     use crate::egress::{EgressClass, EgressDecision, InferenceEgressMode};
     for (host, allowed) in [
         ("::127.0.0.1", true),
-        ("::10.0.0.1", true),
+        ("::a00:1", true),
         ("::169.254.169.254", false),
         ("::8.8.8.8", false),
         ("::", false),
