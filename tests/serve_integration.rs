@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 mod common;
+#[cfg(unix)]
+use ai_memory::stop_signal::DrainOutcome;
 use common::tls_serve::{READINESS_POLL_INTERVAL, ServeChild};
 
 /// Apply this suite's arguments and authorization fixture to the shared TLS helper.
@@ -332,6 +334,20 @@ const WITNESS_WRITTEN_MARKER: &str = "final witness flushed";
 #[cfg(unix)]
 const CHECKPOINT_MARKER: &str = "final WAL checkpoint complete";
 
+/// Grace the grace-expiry case passes to `--shutdown-grace-secs`, the smallest
+/// whole-second budget the flag takes.
+#[cfg(unix)]
+const SHORT_GRACE_SECS: u64 = 1;
+
+/// The drained text does not name the budget, so any value renders it.
+#[cfg(unix)]
+const SERVE_DEFAULT_GRACE_SECS: u64 = 30;
+
+/// Fragment shared by every grace-expired log text (from the production text:
+/// it states the remaining connections were force-closed).
+#[cfg(unix)]
+const GRACE_EXPIRED_MARKER: &str = "force-closed, not drained";
+
 /// Longest a held request body may stay open before the test gives up.
 #[cfg(unix)]
 const HELD_BODY_LIMIT: Duration = Duration::from_secs(30);
@@ -545,6 +561,16 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
             order.iter().all(Option::is_some) && order.windows(2).all(|w| w[0] < w[1]),
             "{name}: log must show stop, in-flight drained, audit drained, witness, checkpoint in that order: {order:?}\n{stderr}"
         );
+        // #8193 R5: a real drain logs the drained text, taken from the
+        // production text source, and never the grace-expired text.
+        assert!(
+            stderr.contains(&DrainOutcome::Drained.log_text(SERVE_DEFAULT_GRACE_SECS)),
+            "{name}: a drained shutdown must log the drained text\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(GRACE_EXPIRED_MARKER),
+            "{name}: a drained shutdown must not log the grace-expired text\n{stderr}"
+        );
         let wal_len = std::fs::metadata(&wal).map_or(0, |m| m.len());
         assert_eq!(
             wal_len, 0,
@@ -556,6 +582,57 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
             "{name}: the final witness must be persisted for the enrolled key, found {witnesses} rows"
         );
     }
+}
+
+/// #8193 R5 (code r4 M1) - the serve grace-expiry decision. With a held
+/// request outliving a 1 s `--shutdown-grace-secs`, the daemon cuts the
+/// request at the budget and must log the grace-expired text, never the
+/// drained text. Catches the mutation that drops the `signalled_at` `.set(..)`
+/// in the shutdown future (elapsed stays zero, every stop logs "drained").
+#[cfg(unix)]
+#[test]
+fn serve_sigterm_past_grace_logs_grace_expired_not_drained_8193() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    let grace_arg = SHORT_GRACE_SECS.to_string();
+    let serve = spawn_serve(&db, &["--shutdown-grace-secs", grace_arg.as_str()], &[]);
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let body = reqwest::blocking::Body::new(HeldBody {
+        head: br#"{"tier":"mid","#.to_vec(),
+        tail: br#""namespace":"sig-8193"}"#.to_vec(),
+        pos: 0,
+        release: release_rx,
+        released: false,
+    });
+    let slow_client = serve.tls.client_with_timeout(HELD_BODY_LIMIT);
+    let slow_request = serve.url("/api/v1/memories");
+    let in_flight = std::thread::spawn(move || {
+        slow_client
+            .post(slow_request)
+            .header("X-Agent-Id", "ai:serve-8193")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .map(|r| r.status())
+    });
+    std::thread::sleep(INFLIGHT_SETTLE);
+
+    let (status, stderr) = signal_and_wait(serve, libc::SIGTERM);
+    // The held request was cut at the budget; release the body thread.
+    let _ = release_tx.send(());
+    let _ = in_flight.join();
+    assert_eq!(status.signal(), None, "died by signal\n{stderr}");
+    assert!(status.success(), "exit {status:?}\n{stderr}");
+    assert!(
+        stderr.contains(&DrainOutcome::GraceExpired.log_text(SHORT_GRACE_SECS)),
+        "a stop past the grace budget must log the grace-expired text\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(&DrainOutcome::Drained.log_text(SHORT_GRACE_SECS)),
+        "a stop past the grace budget must not claim a drain\n{stderr}"
+    );
 }
 
 /// #6236 — packaging: the image stops with SIGTERM and the admin guide states
