@@ -1,0 +1,10 @@
+[
+  {
+    "advisory": "GHSA-gcqx-w48m-w2h4",
+    "package": "deepmerge",
+    "version": "4.3.1",
+    "issue": 8616,
+    "expires": "2027-02-03",
+    "reason": "No patched deepmerge release; remediation tracked in issue 8616."
+  }
+]

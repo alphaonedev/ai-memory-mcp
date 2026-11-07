@@ -1,0 +1,10 @@
+{
+  "vulnerabilities": {
+    "found": true,
+    "count": 1,
+    "list": [{"advisory": {"id": "RUSTSEC-2026-0429", "package": "zip"}, "package": {"name": "zip", "version": "8.0.0"}}]
+  },
+  "warnings": {},
+  "settings": {"ignore": [], "severity": null, "target_arch": [], "target_os": [], "informational_warnings": ["unmaintained", "unsound", "notice"]},
+  "lockfile": {"dependency-count": 1}
+}

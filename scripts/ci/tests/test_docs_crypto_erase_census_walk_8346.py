@@ -118,7 +118,8 @@ What the guard closes (`CLOSED_CLASSES`; each is a class that a round 4 to 15 re
    crate (the crates of the `use` lines plus `tempfile`, `PINNED_CRATES_COUNT`), a `[patch.*]` entry beyond the one
    vendored `paste`, any `[replace]`, a `build =` key, a repo-root build.rs, a `[lib]` key beyond `name` and
    `crate-type`, and an edition other than 2024 are rejected. The tracked `.cargo/` files are exactly
-   `.cargo/audit.toml` (`git ls-files -z`, a git error fails closed), a `.cargo/config(.toml)` with `[env]`,
+   `.cargo/audit-exceptions.toml` and `.cargo/audit.toml` (`git ls-files -z`, a git error fails closed),
+   a `.cargo/config(.toml)` with `[env]`,
    `runner`, `rustc-wrapper`, `rustc`, `rustflags` (or `linker`, `include`, `patch`, `source`) is rejected, and
    `.config/nextest.toml` keeps today's tables and keys (a filter or override can skip the census test). A
    workspace table (`[workspace]`, any key) is rejected (`default-members` or `exclude` changes what a bare `cargo test` compiles), and
@@ -2101,7 +2102,7 @@ def rules_entry():
 MANIFEST = "Cargo.toml"
 BUILD_SCRIPT = "build.rs"
 CARGO_DIR = ".cargo"
-CARGO_TRACKED = (".cargo/audit.toml",)
+CARGO_TRACKED = (".cargo/audit-exceptions.toml", ".cargo/audit.toml")
 CARGO_CONFIGS = (".cargo/config.toml", ".cargo/config")
 NEXTEST_DIR = ".config"
 NEXTEST_TRACKED = (".config/nextest.toml",)
@@ -4328,15 +4329,16 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                         Census(self.text, overrides={rel: code + "\n"})
 
     def test_cargo_directory_listing_is_pinned(self):
-        """code r9 L4: `.cargo/` tracks exactly audit.toml; a benign config still changes the pinned listing."""
+        """The two audit policy files are pinned; a benign config still changes the listing."""
         self.assertEqual(tuple(tracked_under(CARGO_DIR)), CARGO_TRACKED)
-        self.assertEqual(CARGO_TRACKED, (".cargo/audit.toml",))
+        self.assertEqual(CARGO_TRACKED, (".cargo/audit-exceptions.toml", ".cargo/audit.toml"))
         with self.assertRaisesRegex(AssertionError, r"\.cargo/ holds .*config\.toml"):
             Census(self.text, overrides={".cargo/config.toml": '[alias]\nt = "test"\n'})
         with self.assertRaisesRegex(AssertionError, r"\.cargo/ holds .*extra_8346\.toml"):
             Census(self.text, overrides={".cargo/extra_8346.toml": "\n"})
-        with self.assertRaisesRegex(AssertionError, r"\.cargo/ holds"):
-            Census(self.text, overrides={".cargo/audit.toml": None})
+        for rel in CARGO_TRACKED:
+            with self.subTest(rel=rel), self.assertRaisesRegex(AssertionError, r"\.cargo/ holds"):
+                Census(self.text, overrides={rel: None})
 
     def test_git_failure_while_listing_a_build_directory_fails_closed(self):
         """code r9 L4: a git error is an AssertionError naming the directory, never an empty listing."""
@@ -4564,7 +4566,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
 
     def test_live_toml_inputs_carry_no_escaped_key_and_literal_keys_are_still_read(self):
         """code r10 L2: the fail-closed rule costs the live files nothing; a single-quoted (literal) key is exact."""
-        for rel in (MANIFEST, NEXTEST_CONFIG, ".cargo/audit.toml", TOOLCHAIN_FILE):
+        for rel in (MANIFEST, NEXTEST_CONFIG, *CARGO_TRACKED, TOOLCHAIN_FILE):
             with self.subTest(rel=rel):
                 self.assertIsInstance(toml_entries(read(rel), rel), list)
         self.assertEqual(len(toml_entries("[a]\n'b\\c' = 1\n", "x.toml")), 2)

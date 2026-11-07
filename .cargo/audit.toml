@@ -24,3 +24,5 @@ ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0449", # unsafe-libyaml unmaintained; review by 2027-02-01, see #8473 and #8476
 ]
+
+# #8615: metadata lives in audit-exceptions.toml; the CI gate cross-checks both files.
