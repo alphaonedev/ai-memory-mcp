@@ -145,7 +145,7 @@ jobs:
           # (3rd generation) → ANY available iPhone. Tests don't need
           # device-specific features; any modern iPhone simulator
           # under the supported iOS version is acceptable.
-          xcrun simctl list devices --json | python3 -c '
+          xcrun simctl list devices --json | python3 -I -c '
           import json, sys
           data = json.load(sys.stdin)
           preference = [
@@ -179,7 +179,7 @@ jobs:
           }
           UDID=$(cat .udid)
           echo "UDID=$UDID" >> "$GITHUB_ENV"
-          DEVICE_NAME=$(xcrun simctl list devices --json | python3 -c "
+          DEVICE_NAME=$(xcrun simctl list devices --json | python3 -I -c "
           import json, sys, os
           udid = os.environ.get('TARGET_UDID', '')
           data = json.load(sys.stdin)

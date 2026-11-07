@@ -32,7 +32,7 @@ usage() { echo "usage: $(basename "$0") [--bundle FILE] [--self-test]" >&2; exit
 check_map() {
   local root="$1" map="$2" script tracked missing=0
   [[ -f "$map" ]] || die "producer map missing: $map"
-  python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$map" \
+  python3 -I -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$map" \
     || die "producer map is not JSON: $map"
 
   while IFS= read -r script; do
@@ -47,7 +47,7 @@ check_map() {
       echo "UNTRACKED-PRODUCER (not in git ls-files): $script" >&2
       missing=1
     fi
-  done < <(python3 -c '
+  done < <(python3 -I -c '
 import json, sys
 doc = json.load(open(sys.argv[1], encoding="utf-8"))
 for p in doc.get("producers", []):
@@ -58,13 +58,13 @@ for p in doc.get("producers", []):
     echo "FATAL: producer-map names a script that is not git-tracked" >&2
     return 1
   fi
-  echo "PASS: producer-map ($(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["producers"]))' "$map") producers) all git-tracked"
+  echo "PASS: producer-map ($(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["producers"]))' "$map") producers) all git-tracked"
 }
 
 # validate_bundle FILE — 0 clean, 1 violation. Prints the reason on stderr.
 validate_bundle() {
   local file="$1"
-  python3 - "$file" <<'PY'
+  python3 -I - "$file" <<'PY'
 import json, re, sys
 path = sys.argv[1]
 try:
@@ -128,7 +128,7 @@ run_self_test() {
   # untracked until the commit — so self-test uses a fixture map of files
   # that ARE already tracked, plus a planted untracked producer).
   local fixture_map="$tmp/producer-map.json"
-  python3 -c '
+  python3 -I -c '
 import json, sys
 json.dump({
     "schema_version": 1,
@@ -142,7 +142,7 @@ json.dump({
   check_map "$ROOT" "$fixture_map"
 
   # (2) Untracked producer fails.
-  python3 -c '
+  python3 -I -c '
 import json, sys
 json.dump({
     "schema_version": 1,
@@ -166,7 +166,7 @@ json.dump({
   local commit="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
   write_ok() {
-    python3 -c '
+    python3 -I -c '
 import json, sys
 json.dump({
     "artifact_kind": "daemon",
@@ -191,7 +191,7 @@ json.dump({
 
   # Four committed negative classes (also planted here so --self-test does
   # not depend on git add of the fixtures).
-  python3 -c '
+  python3 -I -c '
 import json, sys
 base = json.load(open(sys.argv[1], encoding="utf-8"))
 # self-report PASS
@@ -243,7 +243,7 @@ json.dump(d, open(sys.argv[6], "w"), indent=2)
   # #3543 — five fail-closed predicate fixtures (old oracle greened the
   # defect; new oracle FAILs it). Lives in predicates.py so a producer
   # and this gate cannot drift.
-  python3 "$ROOT/scripts/evidence/predicates.py" --self-test
+  python3 -I "$ROOT/scripts/evidence/predicates.py" --self-test
 }
 
 BUNDLE=""

@@ -63,7 +63,7 @@ ALLOWLIST="${AI_MEMORY_CAPACITY_ALLOWLIST:-${HERE}/scripts/qc-allowlists/capacit
 scan() {
   local root="$1"
   local allow="${2:-$ALLOWLIST}"
-  python3 - "$allow" "$root" <<'PY'
+  python3 -I - "$allow" "$root" <<'PY'
 import os, re, sys
 
 AGENT_FLEET_CEILING = 1000  # ratified #2438 per-cluster ceiling

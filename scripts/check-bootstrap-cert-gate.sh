@@ -100,7 +100,7 @@ cd "$REPO_ROOT"
 export TMPDIR="$REPO_ROOT/.local-runs/tmp"
 mkdir -p "$TMPDIR"; chmod 700 "$TMPDIR"
 
-python3 -c 'import json,sys' 2>/dev/null \
+python3 -I -c 'import json,sys' 2>/dev/null \
   || { echo "INSTRUMENT ERROR: python3 is required to parse the feature probe and posture rows (#4434 #2676)"; exit 3; }
 
 # ── --self-test: STUB binaries only, writes only inside its own temp dir ────
@@ -214,7 +214,7 @@ mkdir -p "$EVIDENCE_DIR"
 # the EXIT trap is ONE program invocation (it keeps the gate's exit status).
 STATE_DIR="$(mktemp -d)"
 PHASE=A
-trap 'python3 "$REPO_ROOT/scripts/cert_gate_evidence.py" --evidence-dir "$EVIDENCE_DIR" --tail 200 --finalize "$STATE_DIR"' EXIT
+trap 'python3 -I "$REPO_ROOT/scripts/cert_gate_evidence.py" --evidence-dir "$EVIDENCE_DIR" --tail 200 --finalize "$STATE_DIR"' EXIT
 
 FAILED=0
 note() { printf '  %s\n' "$*"; }
@@ -256,7 +256,7 @@ probe_features() {
   local bin="$1" raw
   raw="$(AI_MEMORY_NO_CONFIG=1 "$bin" features --json 2>/dev/null)" \
     || instrument_error "'$bin features --json' failed (probe missing/erroring)"
-  printf '%s' "$raw" | python3 -c '
+  printf '%s' "$raw" | python3 -I -c '
 import json, sys
 d = json.load(sys.stdin)
 f = d["features"]
@@ -282,7 +282,7 @@ PG_DSN_REQUIRE_ONLY="postgres://u@db.internal:5432/mem?sslmode=require"
 
 # Failing posture rows (control names), one per line, parsed from the JSON.
 failing_rows() {
-  python3 -c '
+  python3 -I -c '
 import json, sys
 def walk(x):
     if isinstance(x, dict):

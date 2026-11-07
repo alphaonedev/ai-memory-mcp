@@ -185,14 +185,14 @@ step "Test 6: ai-memory namespace CLI verb (Crack 1)"
 ai-memory --db "$LIVE_DB" namespace batman-policy --json >"$RUN_ROOT/policy.json" 2>/dev/null
 POL_RC=$?
 assert "namespace batman-policy exits 0"                "[[ $POL_RC -eq 0 ]]"
-assert "policy JSON has auto_atomise:true"              "python3 -c 'import json,sys;d=json.load(open(\"$RUN_ROOT/policy.json\"));sys.exit(0 if d[\"auto_atomise\"] is True else 1)'"
-assert "policy JSON has auto_classify_kind"             "python3 -c 'import json,sys;d=json.load(open(\"$RUN_ROOT/policy.json\"));sys.exit(0 if d[\"auto_classify_kind\"] in (\"regex_then_llm\",\"regex_only\") else 1)'"
+assert "policy JSON has auto_atomise:true"              "python3 -I -c 'import json,sys;d=json.load(open(\"$RUN_ROOT/policy.json\"));sys.exit(0 if d[\"auto_atomise\"] is True else 1)'"
+assert "policy JSON has auto_classify_kind"             "python3 -I -c 'import json,sys;d=json.load(open(\"$RUN_ROOT/policy.json\"));sys.exit(0 if d[\"auto_classify_kind\"] in (\"regex_then_llm\",\"regex_only\") else 1)'"
 
 ai-memory --db "$LIVE_DB" namespace get-standard --namespace "test" --json \
     >"$RUN_ROOT/get-standard.json" 2>/dev/null
 GS_RC=$?
 assert "namespace get-standard exits 0"                 "[[ $GS_RC -eq 0 ]]"
-assert "get-standard returns non-null standard_id"      "python3 -c 'import json,sys;d=json.load(open(\"$RUN_ROOT/get-standard.json\"));sys.exit(0 if d.get(\"standard_id\") else 1)'"
+assert "get-standard returns non-null standard_id"      "python3 -I -c 'import json,sys;d=json.load(open(\"$RUN_ROOT/get-standard.json\"));sys.exit(0 if d.get(\"standard_id\") else 1)'"
 
 # ----------------------------------------------------------- summary ---
 

@@ -114,7 +114,7 @@ cd "$REPO_ROOT"
 # --self-test is a check the self-test cannot prove.
 # R3-F7: the shared reference check refuses a symlink at EVERY level of each path
 # (docs, docs/reference, the file), not only the leaf.
-if ! python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
+if ! python3 -I "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
     printf 'FAIL: check-docs-vs-ssot: reference file check failed (#4507 fail-closed)\n' >&2
     exit 1
 fi
@@ -569,7 +569,7 @@ check_schema_version_rule() {
     local schema_rows
     schema_rows="$(
         GATE_SCHEMA_FILES="${scan_files[*]:-}" GATE_SCHEMA_LEDGER="$ledger" \
-            GATE_SCHEMA_CANON="$CANONICAL_SCHEMA_VERSION" python3 - <<'SCHEMAPY'
+            GATE_SCHEMA_CANON="$CANONICAL_SCHEMA_VERSION" python3 -I - <<'SCHEMAPY'
 import html as htmlmod
 import os
 import re
@@ -810,7 +810,7 @@ check_narrative_count_rule() {
         GATE_NC_FILES="${files[*]}" \
         GATE_NC_PATTERN="$pattern" \
         GATE_NC_RELEASE="$CANONICAL_RELEASE_VERSION" \
-        python3 - <<'NCPY'
+        python3 -I - <<'NCPY'
 import html as htmlmod
 import os
 import re
@@ -978,7 +978,7 @@ check_pgvector_version_rule() {
         # `set -euo pipefail`, so a crashing engine would silently pass.
         local pgv_rows
         pgv_rows="$(
-            python3 -c "
+            python3 -I -c "
 import re
 pats = [
     re.compile(r'pgvector[^|]*\|[ ]*\*\*([0-9]+\.[0-9]+\.[0-9]+)\*\*'),
@@ -1112,7 +1112,7 @@ check_html_version_stamp_rule() {
     # cost with no work in it.
     local rows
     rows="$(
-        GATE_STAMP_FILES="${HTML_DOC_FILES[*]:-}" python3 - <<'PY'
+        GATE_STAMP_FILES="${HTML_DOC_FILES[*]:-}" python3 -I - <<'PY'
 import os
 import re
 
@@ -1316,7 +1316,7 @@ check_generalised_numeric_claims() {
         C_CLI_SAL="$CANONICAL_CLI_SAL" \
         C_CLI_DEFAULT="$CANONICAL_CLI_DEFAULT" \
         C_RELEASE="$CANONICAL_RELEASE_VERSION" \
-        python3 - <<'PY'
+        python3 -I - <<'PY'
 import html as htmlmod
 import os
 import re
@@ -2237,7 +2237,7 @@ CLEANDOC
 Nothing to see here.
 CLEANDOC
     rm -f "$led"
-    prefix_shape="$(v="$(python3 -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
+    prefix_shape="$(v="$(python3 -I -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
     [[ "$prefix_shape" == "WOULD-PRINT-PASS" ]] || {
         echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2
         cd "$REPO_ROOT"; exit 1; }

@@ -92,7 +92,7 @@ extract_run() {
 # ---------------------------------------------------------------------------
 echo "A  structure"
 out="$T/a.out"
-if python3 "$REPO_ROOT/scripts/release/check-release-workflow.py" \
+if python3 -I "$REPO_ROOT/scripts/release/check-release-workflow.py" \
   --workflow "$LIVE_YML" \
   --signers "$REPO_ROOT/scripts/qc-allowlists/release-tag-signers.txt" \
   --enrolled "$REPO_ROOT/scripts/qc-allowlists/enrolled-commit-signers.txt" >"$out" 2>&1; then
@@ -102,7 +102,7 @@ else
 fi
 out="$T/a-frozen.out"
 set +e
-python3 "$REPO_ROOT/scripts/release/check-release-workflow.py" --workflow "$FROZEN_YML" >"$out" 2>&1
+python3 -I "$REPO_ROOT/scripts/release/check-release-workflow.py" --workflow "$FROZEN_YML" >"$out" 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -238,7 +238,7 @@ expect_rc "a tag deleted after preflight is refused" nonzero "$rc" "$T/c3.out" "
 echo "D  qualify"
 SHA_Q=1111111111111111111111111111111111111111
 printf '%s\n' '# fixture mirror' 'Ctx A' 'Ctx B' >"$T/contexts"
-python3 - "$T" "$SHA_Q" <<'PY'
+python3 -I - "$T" "$SHA_Q" <<'PY'
 import json, sys, os
 t, sha = sys.argv[1], sys.argv[2]
 APP = {"slug": "github-actions", "id": 15368}
@@ -282,7 +282,7 @@ PY
 
 q() { # CASE OUT -> rc
   set +e
-  python3 "$REPO_ROOT/scripts/release/qualify-sha.py" --sha "$SHA_Q" --contexts "$T/contexts" --carriers ci.yml \
+  python3 -I "$REPO_ROOT/scripts/release/qualify-sha.py" --sha "$SHA_Q" --contexts "$T/contexts" --carriers ci.yml \
     --check-runs "$T/q-$1-cr.json" --workflow-runs "$T/q-$1-wr.json" >"$2" 2>&1
   local rc=$?
   set -e
@@ -321,11 +321,11 @@ STUB
 chmod +x "$T/bin/gh"
 set +e
 PATH="$T/bin:$PATH" STUB_DIR="$T" STUB_LOG="$T/gh.log" \
-  python3 "$REPO_ROOT/scripts/release/qualify-sha.py" --fetch --repo o/r --sha "$SHA_Q" \
+  python3 -I "$REPO_ROOT/scripts/release/qualify-sha.py" --fetch --repo o/r --sha "$SHA_Q" \
   --contexts "$T/contexts" --carriers ci.yml >"$T/d-fetch.out" 2>&1
 rc=$?
 PATH="$T/bin:$PATH" STUB_DIR="$T" STUB_LOG="$T/gh-fail.log" STUB_FAIL_PAGE=2 \
-  python3 "$REPO_ROOT/scripts/release/qualify-sha.py" --fetch --repo o/r --sha "$SHA_Q" \
+  python3 -I "$REPO_ROOT/scripts/release/qualify-sha.py" --fetch --repo o/r --sha "$SHA_Q" \
   --contexts "$T/contexts" --carriers ci.yml >"$T/d-fail.out" 2>&1
 rc_fail=$?
 set -e

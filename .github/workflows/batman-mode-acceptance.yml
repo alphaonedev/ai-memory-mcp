@@ -181,7 +181,7 @@ jobs:
           OUT=$($BIN --db "$DB" --json rules check --kind filesystem_write \
               --payload '{"path":"/tmp/ci-test"}' --agent-id ci 2>&1 | grep -v '^ai-memory: loaded' || true)
           echo "rules check output: $OUT"
-          echo "$OUT" | python3 -c "
+          echo "$OUT" | python3 -I -c "
           import sys, json
           d = json.loads(sys.stdin.read())
           if d.get('result', {}).get('decision') != 'refuse':

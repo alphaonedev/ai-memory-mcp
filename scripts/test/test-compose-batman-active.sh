@@ -102,10 +102,10 @@ echo "ok 1 - compose refuses to render without AI_MEMORY_IMAGE / AI_MEMORY_API_K
 API_KEY="smoke3838$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 AI_MEMORY_IMAGE=smoke:local AI_MEMORY_API_KEY="${API_KEY}" SYNC_PEERS= \
     docker compose -f "${COMPOSE}" --profile sync config --format json > "${T}/rendered.json"
-PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+PORT="$(python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 
 # Emit shell-safe, path-rewritten pieces of the rendered stack.
-python3 - "${T}" "${PORT}" > "${T}/plan.sh" <<'PYEOF'
+python3 -I - "${T}" "${PORT}" > "${T}/plan.sh" <<'PYEOF'
 import json, shlex, sys
 t, port = sys.argv[1], sys.argv[2]
 r = json.load(open(f"{t}/rendered.json"))

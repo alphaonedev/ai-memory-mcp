@@ -256,7 +256,7 @@ MDEOF
 
     # ---- fail CLOSED on an analysis-engine error (#2713 shape) -------
     write_clean
-    prefix_shape="$(v="$(python3 -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
+    prefix_shape="$(v="$(python3 -I -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
     [[ "$prefix_shape" == "WOULD-PRINT-PASS" ]] || {
         echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2; exit 1; }
     fault_rc=0
@@ -291,7 +291,7 @@ cd "$REPO_ROOT"
 ALLOWLIST="$REPO_ROOT/scripts/qc-allowlists/doc-surface-completeness-allow.txt"
 
 if ! violations="$(
-    REPO_ROOT="$REPO_ROOT" python3 - <<'PY'
+    REPO_ROOT="$REPO_ROOT" python3 -I - <<'PY'
 import glob
 import os
 import re

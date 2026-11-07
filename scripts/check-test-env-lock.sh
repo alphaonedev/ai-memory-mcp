@@ -1390,7 +1390,7 @@ READER_BASELINE_FILE="${ROOT}/scripts/qc-allowlists/test-agent-id-reader-baselin
 # attribute stack carries no `#[test]` / `#[..::test]` — the production
 # handlers, wherever they sit relative to the file's test modules.
 reader_handle_defs () {
-    python3 - "$1" <<'PY'
+    python3 -I - "$1" <<'PY'
 import re, sys
 src = open(sys.argv[1], encoding='utf-8', errors='replace').read()
 src = '\n'.join(re.sub(r'//.*$', '', l) for l in src.split('\n'))
@@ -1458,7 +1458,7 @@ reader_handle_pattern () {
 # unbalanced literal would only mis-scope ONE fn, never abort the gate.
 # python3 is already a gate dependency (scripts/check-docs-vs-ssot.sh).
 naked_reader_tests () {
-    python3 - "$1" "$2" "$3" <<'PY'
+    python3 -I - "$1" "$2" "$3" <<'PY'
 import re, sys
 path, tokens, linenos = sys.argv[1], sys.argv[2], sys.argv[3]
 tokens = [t for t in tokens.split(',') if t]

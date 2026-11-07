@@ -151,7 +151,7 @@ PROBE3943_EOF
     # pin the GOVERNANCE_INTERNAL exemption (content, enclosing function,
     # exactly one site) with fixtures built from the constants above.
     set +e
-    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
+    python3 -I "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     harness_rc=$?
     set -e
     exit "${harness_rc}"
@@ -396,7 +396,7 @@ checked_literal_hits=""
 while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     hits="$(production_lines "$f" \
-        | python3 "${ROOT}/scripts/tests/for-admin-checked-literal-3943.py" "${f#"${ROOT}/"}")"
+        | python3 -I "${ROOT}/scripts/tests/for-admin-checked-literal-3943.py" "${f#"${ROOT}/"}")"
     [[ -n "${hits}" ]] && checked_literal_hits+="${hits}"$'\n'
 done < <(grep -rlF --include='*.rs' 'for_admin_checked(' "${ROOT}/src" 2>/dev/null || true)
 checked_literal_hits="$(printf '%s' "${checked_literal_hits}" | grep -v '^$' || true)"
@@ -419,7 +419,7 @@ fi
 # (src/storage/connection.rs); the gate runs whenever it exists and a tree
 # without it has no SQLite write transaction to guard.
 if [[ -f "${ROOT}/src/storage/connection.rs" ]] \
-    && ! python3 "${ROOT}/scripts/check-sqlite-write-txn-immediate.py" >&2; then
+    && ! python3 -I "${ROOT}/scripts/check-sqlite-write-txn-immediate.py" >&2; then
     echo "C8 HARD-BLOCK (#5084): a SQLite transaction opened without BEGIN IMMEDIATE." >&2
     violations=$(( violations + 1 ))
 fi

@@ -226,7 +226,7 @@ check_schema_version_rule() {
                 emit_fail "$rule_name" "$f" "$ln" "$val" "$CANONICAL_SCHEMA_VERSION" "$context"
             fi
         done < <(
-            python3 -c "
+            python3 -I -c "
 import re
 patterns = [
     re.compile(r'Current schema = v([0-9]+)'),
@@ -282,7 +282,7 @@ check_narrative_count_rule() {
                 emit_fail "$rule_name" "$f" "$ln" "$val" "$canonical" "$context"
             fi
         done < <(
-            python3 -c "
+            python3 -I -c "
 import re, sys
 pat = re.compile(r'''$pattern''')
 for ln, line in enumerate(open('$f').read().splitlines(), 1):

@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -67,6 +68,40 @@ class ModuleMode6799(unittest.TestCase):
 
 
 class CommandAndWrapper6330(unittest.TestCase):
+    def test_called_wrappers_are_isolated_6330(self):
+        checker = load_checker()
+        wrappers = checker.wrapper_files(ROOT)
+        self.assertGreater(len(wrappers), 0)
+        for path in wrappers:
+            with self.subTest(path=path.relative_to(ROOT)):
+                self.assertEqual(checker.scan_shell(path.read_text()), [])
+
+    def test_transitive_wrapper_and_workflow_modes_6330(self):
+        checker = load_checker()
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            workflow = root / ".github/workflows/check.yml"
+            workflow.parent.mkdir(parents=True)
+            scripts = root / "scripts/ci"
+            scripts.mkdir(parents=True)
+            workflow.write_text("jobs:\n  check:\n    steps:\n"
+                                "      - run: bash scripts/ci/first.sh\n")
+            (scripts / "first.sh").write_text("bash scripts/ci/second.sh\n")
+            (scripts / "second.sh").write_text("python3 -c 'print(1)'\n")
+            findings = checker.scan_repository(root)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0][0].name, "second.sh")
+            (scripts / "second.sh").write_text("python3 -I -c 'print(1)'\n")
+            self.assertEqual(checker.scan_repository(root), [])
+
+    def test_heredoc_in_substitution_and_script_path_arguments_6330(self):
+        checker = load_checker()
+        self.assertEqual(len(checker.scan_shell(
+            "v=$(python3 - <<'PY'\nprint(1)\nPY\n)\n")), 1)
+        self.assertEqual(checker.scan_shell("mkdir -p sdk/python sdk/typescript"), [])
+
     def test_command_and_stdin_modes_6330(self):
         checker = load_checker()
         for command in ("python3 -c 'print(1)'", "python3 - <<'PY'\nprint(1)\nPY\n",

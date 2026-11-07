@@ -168,7 +168,7 @@ scan_production_lines () {
 # Self-test mode — inject a contrived violation, run the gate, confirm
 # it catches the violation, then clean up.
 if [[ "${1:-}" == "--self-test" ]]; then
-    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
+    python3 -I "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     echo "Vendor-literal gate: self-test mode (contrived violation -> expect HARD-BLOCK -> cleanup)"
     # Plant a production file for the original vendor-literal probe.
     contrived="${ROOT}/src/.vendor_literal_gate_probe.rs"

@@ -69,7 +69,7 @@ body() {
 # python (cross-platform).
 time_one() {
     local title=$1 content=$2
-    python3 - <<PY
+    python3 -I - <<PY
 import subprocess, time
 start = time.monotonic()
 r = subprocess.run(
@@ -95,7 +95,7 @@ PY
 
 # Compute p50/p95/p99 from a list of numbers via python (no numpy needed).
 percentiles() {
-    python3 - <<PY
+    python3 -I - <<PY
 import sys
 vals = sorted([float(x) for x in "$1".split() if x])
 n = len(vals)

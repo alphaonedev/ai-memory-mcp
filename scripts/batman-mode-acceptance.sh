@@ -88,7 +88,7 @@ record() {
             printf '         evidence: %s\n' "$evidence"
         fi
     fi
-    RESULTS_JSON=$(python3 -c "
+    RESULTS_JSON=$(python3 -I -c "
 import json, sys
 arr = json.loads(sys.argv[1])
 arr.append({'id': sys.argv[2], 'verdict': sys.argv[3], 'what': sys.argv[4], 'evidence': sys.argv[5]})
@@ -192,7 +192,7 @@ ingest_present=$(printf '%s\n' \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
     | ai-memory --db "$DB" mcp --profile full --tier autonomous 2>/dev/null \
-    | python3 -c '
+    | python3 -I -c '
 import sys, json
 for line in sys.stdin:
     try: o = json.loads(line)
@@ -257,7 +257,7 @@ else
 fi
 
 # F5.4 — Form 5 env vars wired into MCP launch (in .claude.json) OR curator launchd plist
-env_via_claude=$(python3 - <<'PY' 2>/dev/null
+env_via_claude=$(python3 -I - <<'PY' 2>/dev/null
 import json, os
 try:
     cfg = json.load(open(os.path.expanduser('~/.claude.json')))
@@ -291,14 +291,14 @@ fi
 # F5.6 — the standard memory carries Form 2 auto_atomise + Form 6 auto_classify_kind
 if [[ -n "$ns_std" ]]; then
     gov=$(sql "SELECT json_extract(metadata, '\$.governance') FROM memories WHERE id='$ns_std';" 2>/dev/null)
-    auto_atomise=$(echo "$gov" | python3 -c "
+    auto_atomise=$(echo "$gov" | python3 -I -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read() or '{}')
     print('on' if d.get('auto_atomise') is True else 'off')
 except: print('?')
 ")
-    auto_classify=$(echo "$gov" | python3 -c "
+    auto_classify=$(echo "$gov" | python3 -I -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read() or '{}')
@@ -356,7 +356,7 @@ fi
 # F7.2 — R001-R004 enabled and operator-signed
 rules_state=$(ai_memory rules list --json 2>/dev/null \
     | tail -1 \
-    | python3 -c "
+    | python3 -I -c "
 import sys, json
 try:
     data = json.loads(sys.stdin.read())
@@ -384,7 +384,7 @@ deny_check=$(ai_memory rules check \
     --payload '{"path":"/tmp/acceptance-test.txt"}' \
     --agent-id batman-acceptance 2>/dev/null \
     | grep -vE '^ai-memory: loaded config' \
-    | python3 -c "
+    | python3 -I -c "
 import sys, json
 try:
     data = json.loads(sys.stdin.read())
@@ -404,7 +404,7 @@ allow_check=$(ai_memory rules check \
     --payload "{\"path\":\"$HOME/.local-runs/acceptance-test.txt\"}" \
     --agent-id batman-acceptance 2>/dev/null \
     | grep -vE '^ai-memory: loaded config' \
-    | python3 -c "
+    | python3 -I -c "
 import sys, json
 try:
     data = json.loads(sys.stdin.read())
@@ -466,7 +466,7 @@ if [[ $BEHAVIORAL -eq 1 ]]; then
         --title "probe namespace standard" \
         --content "probe namespace standard for $probe_ns" \
         --json 2>/dev/null | grep -vE '^ai-memory: loaded config' | tail -1 \
-        | python3 -c "import sys,json
+        | python3 -I -c "import sys,json
 try:
     d=json.loads(sys.stdin.read())
     print(d.get('id') or d.get('memory_id') or d.get('memory',{}).get('id',''))
@@ -483,7 +483,7 @@ except: print('')")
         --title "$probe_title" \
         --content "$probe_body" \
         --json 2>/dev/null | grep -vE '^ai-memory: loaded config' | tail -1 \
-        | python3 -c "import sys,json
+        | python3 -I -c "import sys,json
 try:
     d=json.loads(sys.stdin.read())
     print(d.get('id') or d.get('memory_id') or d.get('memory',{}).get('id',''))
@@ -544,7 +544,7 @@ fi
 TOTAL=$((PASS_COUNT + FAIL_COUNT))
 
 if [[ $JSON_OUT -eq 1 ]]; then
-    python3 -c "
+    python3 -I -c "
 import json, sys
 results = json.loads(sys.argv[1])
 summary = {

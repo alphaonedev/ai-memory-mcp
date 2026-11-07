@@ -506,7 +506,7 @@ run_static_self_test() {
     # P3 — an abort branch removed (the gate counts abort sites, so
     # weakening the region without deleting it is still caught).
     d="${base}/p3"; stage_repo_copy "$d"
-    python3 - "$d" <<'PY'
+    python3 -I - "$d" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1]) / "install.sh"
 s = p.read_text()

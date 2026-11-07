@@ -1005,7 +1005,7 @@ fi
 # SECTION F (#5447): pull_request / push branch-filter pins across every
 # workflow. rehearsal/** must gate PRs (pull_request.branches) and must never
 # overlap push.branches (#2506, #2523, #2508). Closed-world, stdlib-only reader.
-if python3 "$ROOT/scripts/test/test_workflow_pr_triggers_5447.py" >"$SCRATCH/f-5447.out" 2>&1; then
+if python3 -I "$ROOT/scripts/test/test_workflow_pr_triggers_5447.py" >"$SCRATCH/f-5447.out" 2>&1; then
     ok "F: every workflow pins rehearsal/** in pull_request.branches and never in push.branches (#5447)"
 else
     bad "F: workflow trigger pin failed (#5447)" \
@@ -1017,7 +1017,7 @@ fi
 # The checks live in Python (review r1 L1): scripts/ci/check_pg_isolate_invariants.py,
 # unit-tested with one mutant per check in scripts/ci/tests/.
 # ===========================================================================
-if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
+if python3 -I "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
 
 # ===========================================================================
 # SECTION H — #8332: a body-only PR edit never cancels or restarts the required

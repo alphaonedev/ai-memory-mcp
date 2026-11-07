@@ -110,7 +110,7 @@ while [[ $I -lt $COUNT ]]; do
         --title "$TITLE" \
         --content "$CONTENT" \
         --json 2>&1 | grep -vE '^ai-memory: loaded config' | tail -1)
-    ID=$(echo "$OUT" | python3 -c "
+    ID=$(echo "$OUT" | python3 -I -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
