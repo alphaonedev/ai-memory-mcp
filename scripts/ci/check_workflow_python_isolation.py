@@ -30,7 +30,10 @@ OPTIONS_WITH_VALUE = frozenset(("-W", "-X", "--check-hash-based-pycs"))
 COMMAND_END = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n"))
 LOOKUP_COMMANDS = frozenset(("which", "type"))
 DATA_COMMANDS = frozenset(("echo", "printf", "test", "[", "[["))
-SHELLS = frozenset(("sh", "bash", "zsh"))
+SHELLS = frozenset(("sh", "bash", "zsh", "dash"))
+SHELL_COMMAND_OPTION = re.compile(r"-[a-zA-Z]*c[a-zA-Z]*\Z")
+SHELL_STDIN_OPTION = re.compile(r"-[a-zA-Z]*s[a-zA-Z]*\Z")
+SHELL_VALUE_OPTIONS = frozenset(("-o", "-O", "--rcfile", "--init-file"))
 CONSOLE_LAUNCHERS = frozenset(("pip", "pip3", "pytest", "pipx", "uvx"))
 VERSIONED_PIP = re.compile(r"pip3(?:\.(?:[0-9]+|x))?\Z")
 UNISOLATED_UV_COMMANDS = (("run",), ("tool", "run"))
@@ -103,22 +106,30 @@ def script_is_unisolated(arguments):
 
 
 def mask_heredocs(text):
-    """Keep shell headers, but not the data supplied to a heredoc's stdin."""
+    """Scan shell-program heredocs recursively; preserve line counts while masking data."""
     pending = []
     result = []
     for line in text.splitlines(keepends=True):
         if pending:
-            delimiter, strip_tabs = pending[0]
+            delimiter, strip_tabs, program, body = pending[0]
             candidate = line.rstrip("\r\n")
             if strip_tabs:
                 candidate = candidate.lstrip("\t")
             if candidate == delimiter:
+                content = "".join(body)
+                result.append(mask_heredocs(content) if program else "\n" * content.count("\n"))
+                result.append("\n" if line.endswith("\n") else "")
                 pending.pop(0)
-            result.append("\n" if line.endswith("\n") else "")
+            else:
+                body.append(line)
         else:
             result.append(line)
             if not line.lstrip().startswith("#"):
-                pending.extend((match[3], bool(match[1])) for match in HEREDOC.finditer(line))
+                for match in HEREDOC.finditer(line):
+                    commands = list(shell_commands(line[:match.start()]))
+                    values = [value for value, _ in commands[-1]] if commands else []
+                    mode, _ = shell_input(values, executable_index(values))
+                    pending.append((match[3], bool(match[1]), mode == "stdin", []))
     if pending:
         raise ValueError("unterminated heredoc")
     return "".join(result)
@@ -273,6 +284,26 @@ def executable_index(values):
     return index
 
 
+def shell_input(values, executable):
+    """Identify a shell's command string, stdin program, or script operand."""
+    if executable >= len(values) or values[executable].rsplit("/", 1)[-1] not in SHELLS:
+        return None, executable
+    index = executable + 1
+    stdin = False
+    while index < len(values):
+        option = values[index]
+        if option == "--":
+            index += 1
+            break
+        if not option.startswith("-"):
+            break
+        if SHELL_COMMAND_OPTION.fullmatch(option):
+            return "command", index + 1
+        stdin = stdin or bool(SHELL_STDIN_OPTION.fullmatch(option))
+        index += 2 if option in SHELL_VALUE_OPTIONS else 1
+    return ("stdin" if stdin or index >= len(values) else "file"), index
+
+
 def scan_shell(text, *, masked=False):
     """Return unsafe literal Python invocations in command text."""
     findings = []
@@ -293,11 +324,12 @@ def scan_shell(text, *, masked=False):
                     if "python" in candidate:
                         findings.extend(Finding(item.line + line - 1, item.reason, item.malformed)
                                         for item in scan_shell(candidate))
-            if values[0] in SHELLS and "-c" in values:
-                command_index = values.index("-c") + 1
-                if command_index < len(values):
-                    findings.extend(scan_shell(values[command_index]))
             executable = executable_index(values)
+            shell_mode, command_index = shell_input(values, executable)
+            if shell_mode == "command" and command_index < len(values):
+                offset = words[command_index][1] - 1
+                findings.extend(Finding(item.line + offset, item.reason, item.malformed)
+                                for item in scan_shell(values[command_index]))
             if executable < len(values) and values[executable] in DATA_COMMANDS | LOOKUP_COMMANDS:
                 continue
             for index, (value, line) in enumerate(words):
