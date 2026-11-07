@@ -94,13 +94,15 @@ pub fn log_foreign<E: Into<MemoryError> + std::fmt::Display>(
     // ERRORS-06: preserve the source chain before the caller-safe classifier
     // consumes it. Reuse the operator-log URL password redactor (#6457).
     let detail = crate::logging::redact_urls_in_message(&format!("{e:#}"));
+    // ERRORS-06 / #6822: string Debug escapes controls for the text formatter.
+    // Both HTTP promotion and MCP/CLI tools use these same emitters.
     let e = e.into();
     if e.is_foreign_class() {
         tracing::error!(
             target: TRACE_TARGET,
             context,
             code = e.code(),
-            detail = %detail,
+            detail = ?detail,
             "#3713: foreign error kept on the operator log; the caller receives the class"
         );
     } else {
@@ -108,7 +110,7 @@ pub fn log_foreign<E: Into<MemoryError> + std::fmt::Display>(
             target: TRACE_TARGET,
             context,
             code = e.code(),
-            detail = %detail,
+            detail = ?detail,
             "#3713: typed refusal passed through to the caller"
         );
     }
