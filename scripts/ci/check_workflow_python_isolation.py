@@ -56,7 +56,7 @@ EXIT_INPUT = 2
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\2")
 WRAPPER_REF = re.compile(r"scripts/[A-Za-z_0-9./-]+\.sh\b")
 WORKFLOW_RUN = re.compile(r"^(\s*)(?:-\s+)?run:\s*(.*)$")
-PYTHON_SHELL = re.compile(r"^\s*(?:-\s+)?shell:\s*(['\"]?)(python(?:3(?:\.[0-9]+)?)?\b.*)")
+WORKFLOW_SHELL = re.compile(r"^\s*(?:-\s+)?shell:\s*(['\"]?)(.*)")
 WORKFLOW_DIR = Path(".github/workflows")
 EXEMPTION = re.compile(r"# isolation: exempt #([1-9][0-9]*)\s*\Z")
 
@@ -446,7 +446,7 @@ def scan_repository(root, exemptions=None):
         try:
             commands = list(workflow_runs(text))
             for line, value in enumerate(text.splitlines()):
-                match = PYTHON_SHELL.match(value)
+                match = WORKFLOW_SHELL.match(value)
                 if match:
                     command = match[2]
                     if match[1] and command.endswith(match[1]):
