@@ -222,9 +222,26 @@ impl StopListener {
     }
 }
 
-/// Install the listeners and wait for the first stop signal.
-pub async fn stop_signal() {
-    StopListener::install().wait().await;
+/// How the HTTP server's graceful shutdown ended (#8193 N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The server returned before the grace budget ran out: every in-flight
+    /// request finished.
+    Drained,
+    /// The grace budget was reached: axum-server cut the remaining
+    /// connections and still returned Ok.
+    GraceExpired,
+}
+
+/// Pick the outcome from the time between the stop signal and the server
+/// returning, against the `--shutdown-grace-secs` budget.
+#[must_use]
+pub fn drain_outcome(elapsed: std::time::Duration, grace: std::time::Duration) -> DrainOutcome {
+    if elapsed >= grace {
+        DrainOutcome::GraceExpired
+    } else {
+        DrainOutcome::Drained
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +324,26 @@ mod tests {
         }
         stops_on(libc::SIGINT).await;
         stops_on(libc::SIGTERM).await;
+    }
+
+    /// #8193 N2: the drain log is truthful. Below the grace budget the server
+    /// drained; at or past it axum-server force-closed the rest and still
+    /// returned Ok, which must not be reported as a drain.
+    #[test]
+    fn drain_outcome_reports_a_cut_at_the_grace_budget_8193() {
+        let grace = std::time::Duration::from_secs(30);
+        assert_eq!(
+            drain_outcome(std::time::Duration::from_millis(1_500), grace),
+            DrainOutcome::Drained
+        );
+        assert_eq!(
+            drain_outcome(grace - std::time::Duration::from_millis(1), grace),
+            DrainOutcome::Drained
+        );
+        assert_eq!(drain_outcome(grace, grace), DrainOutcome::GraceExpired);
+        assert_eq!(
+            drain_outcome(grace + std::time::Duration::from_secs(5), grace),
+            DrainOutcome::GraceExpired
+        );
     }
 }

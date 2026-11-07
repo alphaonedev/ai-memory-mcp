@@ -8295,8 +8295,14 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // #8193: SIGINT and SIGTERM (unix) share one graceful path; a failed
     // registration is logged and parked, never read as a received stop.
     let mut stop = crate::stop_signal::StopListener::install();
+    // #8193 N2: remember when the stop signal arrived, so the log after the
+    // server returns can tell a real drain from a cut at the grace budget.
+    let signalled_at = Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
+    let signalled_at_for_shutdown = Arc::clone(&signalled_at);
+    let shutdown_grace_secs = args.shutdown_grace_secs;
     let shutdown = async move {
         stop.wait().await;
+        let _ = signalled_at_for_shutdown.set(std::time::Instant::now());
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
     let api_key_state = bootstrap.api_key_state;
@@ -8500,8 +8506,17 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     }
     .await;
     if server_result.is_ok() {
-        // #8193: the HTTP server stopped and every in-flight request finished.
-        tracing::info!("in-flight requests drained — stopping background writers");
+        // #8193 N2: axum-server returns Ok after a drain AND after a cut at
+        // the grace budget, so the elapsed time picks the text.
+        let elapsed = signalled_at.get().map_or(Duration::ZERO, |at| at.elapsed());
+        match crate::stop_signal::drain_outcome(elapsed, Duration::from_secs(shutdown_grace_secs)) {
+            crate::stop_signal::DrainOutcome::Drained => {
+                tracing::info!("in-flight requests drained — stopping background writers")
+            }
+            crate::stop_signal::DrainOutcome::GraceExpired => tracing::warn!(
+                "shutdown grace of {shutdown_grace_secs}s expired: remaining connections were force-closed, not drained — stopping background writers"
+            ),
+        }
     }
     bootstrap.task_handles.extend(
         server_aux_tasks
