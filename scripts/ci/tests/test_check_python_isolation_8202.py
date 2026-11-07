@@ -152,5 +152,29 @@ class PostgresInvocations6997(unittest.TestCase):
                 self.assertEqual(len(checker.scan_shell(mutant)), 1)
 
 
+class RepositoryPolicy6814(unittest.TestCase):
+    def test_every_workflow_and_called_wrapper_is_isolated_6814(self):
+        checker = load_checker()
+        self.assertEqual(checker.scan_repository(ROOT), [])
+
+    def test_classify_runs_the_checker_without_a_skip_6814(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        job = workflow.split("\n  classify:", 1)[1].split("\n  lint:", 1)[0]
+        step = ("      - name: Workflow Python isolation (#8202)\n"
+                "        run: python3 -I scripts/ci/check_python_isolation.py\n")
+        self.assertEqual(job.count(step), 1)
+
+    def test_interpreter_flag_grammar_6814(self):
+        checker = load_checker()
+        for executable in ("python", "python3", "python3.12", "/usr/bin/python3"):
+            for flags in ("", "-u ", "-B -W ignore ", "-X dev "):
+                for program in ("scripts/x.py", '"scripts/x.py"', "-m unittest", "-c 'pass'", "-"):
+                    with self.subTest(executable=executable, flags=flags, program=program):
+                        command = executable + " " + flags + program
+                        self.assertEqual(len(checker.scan_shell(command)), 1)
+                        isolated = executable + " -I " + flags + program
+                        self.assertEqual(checker.scan_shell(isolated), [])
+
+
 if __name__ == "__main__":
     unittest.main()
