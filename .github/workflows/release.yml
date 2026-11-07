@@ -1273,9 +1273,9 @@ jobs:
             echo "apt pipx attempt ${attempt} failed; retrying" >&2; sleep 5
           done
           [ "${apt_ok}" = 1 ] || { echo "::error::pipx install failed"; exit 1; }
-          pipx ensurepath
-          pipx install copr-cli
-          pipx inject copr-cli rich
+          python3 -I -m pipx ensurepath
+          python3 -I -m pipx install copr-cli
+          python3 -I -m pipx inject copr-cli rich
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure copr-cli

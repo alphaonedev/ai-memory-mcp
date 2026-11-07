@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Reject workflow Python script calls without explicit interpreter isolation.
 
-The policy requires a standalone -I before the script or execution mode; an
+The policy requires -I (standalone or first in a flag bundle) before execution; an
 argument passed to the program or consumed by -W/-X is not interpreter isolation.
 Shell text is inspected, never executed. No invocation is exempt by default.
 An actual shell comment '# isolation: exempt #1234' on the invocation line
 records an issue-backed exception; each honoured exception is printed by the CLI.
+Console launchers pip, pip3, pytest, pipx and uv run are findings: use an isolated
+Python -m invocation. Python-named variable/expression interpreters and py need an explicit
+issue exemption because their interpreter isolation cannot be established here.
+Exit codes: 0 clean, 1 findings, 2 unreadable or malformed input.
 """
 import argparse
 from bisect import bisect_right
@@ -23,18 +27,36 @@ COMMAND_END = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n"))
 LOOKUP_COMMANDS = frozenset(("which", "type"))
 DATA_COMMANDS = frozenset(("echo", "printf", "test", "[", "[["))
 SHELLS = frozenset(("sh", "bash", "zsh"))
+CONSOLE_LAUNCHERS = frozenset(("pip", "pip3", "pytest", "pipx"))
+COMMAND_PREFIXES = frozenset(("if", "then", "elif", "while", "until", "do", "!",
+                              "env", "command", "exec", "sudo", "nice", "time", "timeout"))
+EXIT_OK = 0
+EXIT_FINDINGS = 1
+EXIT_INPUT = 2
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\2")
 WRAPPER_REF = re.compile(r"scripts/[A-Za-z_0-9./-]+\.sh\b")
 WORKFLOW_RUN = re.compile(r"^(\s*)(?:-\s+)?run:\s*(.*)$")
-PYTHON_SHELL = re.compile(r"^\s*shell:\s*(['\"]?)(python(?:3(?:\.[0-9]+)?)?\b.*)")
+PYTHON_SHELL = re.compile(r"^\s*(?:-\s+)?shell:\s*(['\"]?)(python(?:3(?:\.[0-9]+)?)?\b.*)")
 WORKFLOW_DIR = Path(".github/workflows")
-EXEMPTION = re.compile(r"# isolation: exempt #?([1-9][0-9]*)\s*\Z")
+EXEMPTION = re.compile(r"# isolation: exempt #([1-9][0-9]*)\s*\Z")
 
 
 @dataclass(frozen=True)
 class Finding:
     line: int
     reason: str = "Python interpreter requires -I before the program"
+    malformed: bool = False
+
+
+class InputError(ValueError):
+    """A source cannot be read or interpreted; retain its path in the diagnostic."""
+
+
+def read_source(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise InputError(f"{path}: unreadable input: {error}") from error
 
 
 def script_is_unisolated(arguments):
@@ -43,8 +65,10 @@ def script_is_unisolated(arguments):
     index = 0
     while index < len(arguments):
         argument = arguments[index]
-        if argument == "-I":
+        if argument.startswith("-I"):
             isolated = True
+            if "c" in argument[2:] or "m" in argument[2:]:
+                return False
         elif argument in OPTIONS_WITH_VALUE:
             index += 1
         elif argument.startswith(("-m", "-c")) or argument == "-":
@@ -158,13 +182,36 @@ def substitutions(text):
     return "".join(parts), children
 
 
+def join_continuations(text):
+    """Mask shell line continuations with equal-width spaces, retaining offsets."""
+    result = list(text)
+    quote = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and quote != "'":
+            if text[index:index + 2] == "\\\n":
+                result[index:index + 2] = "  "
+            index += 2
+            continue
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        index += 1
+    return "".join(result)
+
+
 def shell_commands(text):
     """Tokenize shell words, retaining newline boundaries and quoted arguments."""
+    original_newlines = [index for index, char in enumerate(text) if char == "\n"]
+    text = join_continuations(text)
     lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
+    lexer.wordchars += "${}:"
     lexer.whitespace = " \t\r"
     lexer.commenters = "#"
     words = []
-    newlines = [index for index, char in enumerate(text) if char == "\n"]
     for token in lexer:
         if token in COMMAND_END:
             if words:
@@ -174,7 +221,7 @@ def shell_commands(text):
             position = lexer.instream.tell()
             while position and text[position - 1].isspace():
                 position -= 1
-            line = bisect_right(newlines, position - 1) + 1
+            line = bisect_right(original_newlines, position - 1) + 1
             words.append((token, line))
     if words:
         yield words
@@ -186,7 +233,7 @@ def scan_shell(text, *, masked=False):
     try:
         text, children = substitutions(text if masked else mask_heredocs(text))
         for child, offset in children:
-            findings.extend(Finding(item.line + offset, item.reason)
+            findings.extend(Finding(item.line + offset, item.reason, item.malformed)
                             for item in scan_shell(child, masked=True))
         for words in shell_commands(text):
             values = [value for value, _ in words]
@@ -198,20 +245,43 @@ def scan_shell(text, *, masked=False):
                 candidates = words[1:2] if values[0] == "trap" else words[1:]
                 for candidate, line in candidates:
                     if "python" in candidate:
-                        findings.extend(Finding(item.line + line - 1, item.reason)
+                        findings.extend(Finding(item.line + line - 1, item.reason, item.malformed)
                                         for item in scan_shell(candidate))
             if values[0] in SHELLS and "-c" in values:
                 command_index = values.index("-c") + 1
                 if command_index < len(values):
                     findings.extend(scan_shell(values[command_index]))
+            executable = 0
+            while executable < len(values):
+                value = values[executable]
+                if (value in COMMAND_PREFIXES or value.startswith("-")
+                        or ("=" in value and not value.startswith("$"))):
+                    executable += 1
+                else:
+                    break
             for index, (value, line) in enumerate(words):
-                if PYTHON_NAME.fullmatch(value.rsplit("/", 1)[-1]):
+                name = value.rsplit("/", 1)[-1]
+                if PYTHON_NAME.fullmatch(name):
                     if "/" in value and index != 0 and "/bin/" not in value:
                         continue
                     if script_is_unisolated(values[index + 1:]):
                         findings.append(Finding(line))
+                    # Everything after this interpreter is its argv, not another launcher.
+                    break
+                if index == executable:
+                    expression = " ".join(values[index:]).split("}}", 1)[0]
+                    dynamic_python = value.startswith("$") and (
+                        "python" in value.casefold()
+                        or (value.startswith("${{") and "python" in expression.casefold()))
+                    if dynamic_python or name == "py":
+                        findings.append(Finding(line, "dynamic interpreter requires an issue exemption"))
+                        break
+                    if (name in CONSOLE_LAUNCHERS
+                            or (name == "uv" and values[index + 1:index + 2] == ["run"])):
+                        findings.append(Finding(line, "console launcher requires isolated Python -m"))
+                        break
     except ValueError:
-        findings.append(Finding(1, "unparseable shell command"))
+        findings.append(Finding(1, "unparseable shell command", True))
     return findings
 
 
@@ -261,7 +331,7 @@ def wrapper_files(root):
     wrappers = set()
     while pending:
         path = pending.pop()
-        for match in WRAPPER_REF.finditer(path.read_text(encoding="utf-8")):
+        for match in WRAPPER_REF.finditer(read_source(path)):
             candidate = root / match[0]
             if candidate.is_file() and candidate not in seen:
                 seen.add(candidate)
@@ -309,7 +379,7 @@ def scan_source(text):
     findings = []
     exempt = []
     for item in scan_shell(text):
-        if item.line in comments and item.reason == Finding(1).reason:
+        if item.line in comments and not item.malformed:
             exempt.append((item.line, comments[item.line]))
         else:
             findings.append(item)
@@ -322,8 +392,8 @@ def scan_repository(root, exemptions=None):
     if exemptions is None:
         exemptions = []
     for path in workflow_files(root):
+        text = read_source(path)
         try:
-            text = path.read_text(encoding="utf-8")
             commands = list(workflow_runs(text))
             for line, value in enumerate(text.splitlines()):
                 match = PYTHON_SHELL.match(value)
@@ -334,13 +404,13 @@ def scan_repository(root, exemptions=None):
                     commands.append((command, line))
             for command, offset in commands:
                 unsafe, exempt = scan_source(command)
-                findings.extend((path, Finding(item.line + offset, item.reason))
+                findings.extend((path, Finding(item.line + offset, item.reason, item.malformed))
                                 for item in unsafe)
                 exemptions.extend((path, line + offset, issue) for line, issue in exempt)
         except ValueError:
-            findings.append((path, Finding(1, "unsupported workflow run scalar")))
+            findings.append((path, Finding(1, "unsupported workflow run scalar", True)))
     for path in wrapper_files(root):
-        unsafe, exempt = scan_source(path.read_text(encoding="utf-8"))
+        unsafe, exempt = scan_source(read_source(path))
         findings.extend((path, item) for item in unsafe)
         exemptions.extend((path, line, issue) for line, issue in exempt)
     return findings
@@ -353,21 +423,29 @@ def main():
     args = parser.parse_args()
     count = 0
     exemptions = []
-    if args.files:
-        findings = []
-        for path in args.files:
-            unsafe, exempt = scan_source(path.read_text(encoding="utf-8"))
-            findings.extend((path, item) for item in unsafe)
-            exemptions.extend((path, line, issue) for line, issue in exempt)
-    else:
-        findings = scan_repository(args.root, exemptions)
+    try:
+        if args.files:
+            findings = []
+            for path in args.files:
+                unsafe, exempt = scan_source(read_source(path))
+                findings.extend((path, item) for item in unsafe)
+                exemptions.extend((path, line, issue) for line, issue in exempt)
+        else:
+            findings = scan_repository(args.root, exemptions)
+    except InputError as error:
+        print(str(error).replace("\n", "\\n"), file=sys.stderr)
+        return EXIT_INPUT
+    if any(item.malformed for _, item in findings):
+        path, item = next((path, item) for path, item in findings if item.malformed)
+        print(f"{path}:{item.line}: {item.reason}", file=sys.stderr)
+        return EXIT_INPUT
     for path, finding in findings:
         print(f"{path}:{finding.line}: {finding.reason}")
         count += 1
     for path, line, issue in exemptions:
         print(f"EXEMPT {path}:{line}: isolation: exempt #{issue}")
     print(f"python isolation: findings={count} exemptions={len(exemptions)}")
-    return int(count != 0)
+    return EXIT_FINDINGS if count else EXIT_OK
 
 
 if __name__ == "__main__":

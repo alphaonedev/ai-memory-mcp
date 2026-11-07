@@ -52,6 +52,8 @@ class WorkflowPipVisibility8202(unittest.TestCase):
     def test_system_python_install_has_an_explicit_project_target(self):
         step = coverage_step()
         self.assertIn(f'{TARGET_NAME}: {TARGET_VALUE}', step)
+        self.assertNotRegex(step, r'\bpip3\b', 'no pip3 fallback anywhere in this step')
+        self.assertNotIn('||', step, 'no fail-open install fallback')
         commands = step.replace('\\\n', ' ').splitlines()
         installs = [shlex.split(line.strip()) for line in commands if PIP_INSTALL.search(line)]
         self.assertEqual(len(installs), 1, 'use the same interpreter; no pip3 fallback')

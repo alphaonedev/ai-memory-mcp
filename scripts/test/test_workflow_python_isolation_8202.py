@@ -375,7 +375,8 @@ class RoundFourIsolation8202(unittest.TestCase):
                         with mock.patch.object(importlib.util, "spec_from_file_location", fixture_spec):
                             with self.assertRaisesRegex(RuntimeError, "fixture sibling import stopped"):
                                 spec.loader.exec_module(module)
-                        self.assertNotIn("shared_cargo_target", sys.modules)
+                        self.assertFalse("shared_cargo_target" in sys.modules,
+                                         "partial sibling survived its import failure")
                     finally:
                         sys.modules.pop("shared_cargo_target", None)
                         if prior is not None:
