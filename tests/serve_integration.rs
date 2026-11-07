@@ -695,8 +695,9 @@ fn compose_service_block<'a>(compose: &'a str, name: &str) -> &'a str {
 #[test]
 fn compose_daemon_services_stop_grace_period_8193() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let compose =
-        std::fs::read_to_string(root.join("deploy/docker-1461/docker-compose.yml")).unwrap();
+    let path = root.join("deploy/docker-1461/docker-compose.yml");
+    let compose = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("#8193: read {}: {e}", path.display()));
     let want = format!("stop_grace_period: {STOP_BUDGET_SECS}s");
     for service in ["peer-1", "peer-2"] {
         let block = compose_service_block(&compose, service);
