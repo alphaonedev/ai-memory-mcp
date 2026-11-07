@@ -593,7 +593,10 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 }
 
 fn userinfo_masker_reference_3711(code: &str) -> bool {
-    code.contains("redact_url_password(") || code.contains("redact_urls_in_message(")
+    const USERINFO_MASKERS: &[&str] = &["redact_url_password", "redact_urls_in_message"];
+    // ERRORS-15: a function value or aliased import is as unsafe as a call.
+    code.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .any(|identifier| USERINFO_MASKERS.contains(&identifier))
 }
 
 #[test]
