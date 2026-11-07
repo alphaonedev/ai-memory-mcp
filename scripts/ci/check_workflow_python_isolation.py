@@ -7,8 +7,11 @@ Shell text is inspected, never executed. No invocation is exempt by default.
 An actual shell comment '# isolation: exempt #1234' on the invocation line
 records an issue-backed exception; each honoured exception is printed by the CLI.
 Console launchers pip, pip3, pytest, pipx and uv run are findings: use an isolated
-Python -m invocation. Python-named variable/expression interpreters and py need an explicit
-issue exemption because their interpreter isolation cannot be established here.
+Python -m invocation. Python-named variable/expression interpreters and py need an
+explicit issue exemption because their interpreter isolation cannot be established
+here. Names containing python (including dynamic /python* paths) are matched case
+insensitively. Other unresolved executables, such as $BIN or $PSQL, are left alone:
+this is a lexical name scan, not whole-workflow variable binding analysis.
 Exit codes: 0 clean, 1 findings, 2 unreadable or malformed input.
 """
 import argparse
@@ -261,6 +264,13 @@ def scan_shell(text, *, masked=False):
                     break
             for index, (value, line) in enumerate(words):
                 name = value.rsplit("/", 1)[-1]
+                if index == executable and value.startswith("$"):
+                    expression = " ".join(values[index:]).split("}}", 1)[0]
+                    if ("python" in value.casefold()
+                            or (value.startswith("${{") and "python" in expression.casefold())):
+                        findings.append(Finding(line, "dynamic interpreter requires an issue exemption"))
+                    # A non-Python variable's argv is not a sequence of new commands.
+                    break
                 if PYTHON_NAME.fullmatch(name):
                     if "/" in value and index != 0 and "/bin/" not in value:
                         continue
@@ -269,11 +279,7 @@ def scan_shell(text, *, masked=False):
                     # Everything after this interpreter is its argv, not another launcher.
                     break
                 if index == executable:
-                    expression = " ".join(values[index:]).split("}}", 1)[0]
-                    dynamic_python = value.startswith("$") and (
-                        "python" in value.casefold()
-                        or (value.startswith("${{") and "python" in expression.casefold()))
-                    if dynamic_python or name == "py":
+                    if name == "py":
                         findings.append(Finding(line, "dynamic interpreter requires an issue exemption"))
                         break
                     if (name in CONSOLE_LAUNCHERS
