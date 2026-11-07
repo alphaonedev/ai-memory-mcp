@@ -382,6 +382,21 @@ impl std::io::Read for HeldBody {
     }
 }
 
+/// #6236 N3 — count the audit-head witness checkpoints the daemon persisted
+/// (read-only; the daemon has exited, so the file is quiescent).
+#[cfg(unix)]
+fn witness_checkpoint_count(db: &std::path::Path) -> i64 {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open the daemon db read-only");
+    conn.query_row(
+        "SELECT COUNT(*) FROM checkpoints WHERE namespace = ?1",
+        [ai_memory::governance::audit::WITNESS_CHECKPOINT_NAMESPACE],
+        |r| r.get(0),
+    )
+    .expect("count witness checkpoints")
+}
+
 /// #6236 — for BOTH signals, with a request still in flight when the signal
 /// arrives: the in-flight request completes successfully, the exit is a
 /// success, and the shutdown log shows, in order: stop, in-flight drained,
@@ -395,7 +410,47 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
     for (name, signal) in [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)] {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("ai-memory.db");
-        let serve = spawn_serve(&db, &[], &[]);
+        // #6236 N3: enrol a witness key (custody dir + out-of-band pubkey pin)
+        // so the shutdown flush really signs and persists a witness row.
+        // A memory write does not append to the signed-event chain, and the
+        // shutdown flush is a no-op at chain head 0, so seed one event.
+        {
+            let conn = ai_memory::db::open(&db).expect("init the daemon db");
+            let event = ai_memory::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "ai:serve-6236".to_string(),
+                event_type: "memory_link.created".to_string(),
+                payload_hash: ai_memory::signed_events::payload_hash(b"serve-6236-seed"),
+                signature: None,
+                attest_level: "unsigned".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..ai_memory::signed_events::SignedEvent::default()
+            };
+            ai_memory::signed_events::append_signed_event(&conn, &event)
+                .expect("seed the signed-event chain");
+        }
+        let witness_dir = tmp.path().join("witness-keys");
+        let witness_key =
+            ai_memory::identity::keypair::generate(ai_memory::governance::audit::WITNESS_KEY_LABEL)
+                .expect("generate the witness key");
+        ai_memory::identity::keypair::save(&witness_key, &witness_dir)
+            .expect("save the witness key");
+        let witness_dir_arg = witness_dir.to_str().expect("utf-8 witness dir");
+        let witness_pub = witness_key.public_base64();
+        let serve = spawn_serve(
+            &db,
+            &[],
+            &[
+                (
+                    ai_memory::governance::audit::WITNESS_KEY_DIR_ENV,
+                    witness_dir_arg,
+                ),
+                (
+                    ai_memory::governance::audit::WITNESS_PUBKEY_ENV,
+                    witness_pub.as_str(),
+                ),
+            ],
+        );
         let client = http_client(&serve);
         let resp = send_first_request(|| {
             client
@@ -452,8 +507,7 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
         while !serve.stderr().contains(SHUTDOWN_BEGIN_MARKER) {
             assert!(
                 begun.elapsed() < SHUTDOWN_LOG_DEADLINE,
-                "{name}: the daemon never logged that it began shutting down
-{}",
+                "{name}: the daemon never logged that it began shutting down\n{}",
                 serve.stderr()
             );
             std::thread::sleep(SIGNAL_EXIT_POLL);
@@ -461,8 +515,7 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
         std::thread::sleep(DRAIN_WAIT_PROBE);
         assert!(
             !serve.stderr().contains(INFLIGHT_DRAINED_MARKER),
-            "{name}: the daemon must wait for the in-flight request
-{}",
+            "{name}: the daemon must wait for the in-flight request\n{}",
             serve.stderr()
         );
         release_tx.send(()).unwrap();
@@ -476,17 +529,8 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
         );
 
         let (status, stderr) = reap_after_stop(serve, signal);
-        assert_eq!(
-            status.signal(),
-            None,
-            "{name}: died by signal
-{stderr}"
-        );
-        assert!(
-            status.success(),
-            "{name}: exit {status:?}
-{stderr}"
-        );
+        assert_eq!(status.signal(), None, "{name}: died by signal\n{stderr}");
+        assert!(status.success(), "{name}: exit {status:?}\n{stderr}");
         let order: Vec<Option<usize>> = [
             SHUTDOWN_BEGIN_MARKER,
             INFLIGHT_DRAINED_MARKER,
@@ -499,13 +543,17 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
         .collect();
         assert!(
             order.iter().all(Option::is_some) && order.windows(2).all(|w| w[0] < w[1]),
-            "{name}: log must show stop, in-flight drained, audit drained, witness,              checkpoint in that order: {order:?}
-{stderr}"
+            "{name}: log must show stop, in-flight drained, audit drained, witness, checkpoint in that order: {order:?}\n{stderr}"
         );
         let wal_len = std::fs::metadata(&wal).map_or(0, |m| m.len());
         assert_eq!(
             wal_len, 0,
             "{name}: WAL must be checkpointed to zero length"
+        );
+        let witnesses = witness_checkpoint_count(&db);
+        assert!(
+            witnesses >= 1,
+            "{name}: the final witness must be persisted for the enrolled key, found {witnesses} rows"
         );
     }
 }
