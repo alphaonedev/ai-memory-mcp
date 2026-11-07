@@ -57,7 +57,8 @@ class ModuleMode6799(unittest.TestCase):
         checker = load_checker()
         lines = (ROOT / ".github/workflows/ci.yml").read_text().splitlines()
         discovery = [line.strip().removeprefix("run: ") for line in lines
-                     if "unittest discover -s scripts/ci/tests" in line]
+                     if line.lstrip().startswith("run:")
+                     and "unittest discover -s scripts/ci/tests" in line]
         self.assertEqual(len(discovery), 1)
         self.assertEqual(checker.scan_shell(discovery[0]), [])
         mutant = discovery[0].replace(" -I", "", 1)
