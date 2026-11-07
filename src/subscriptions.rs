@@ -1577,6 +1577,7 @@ pub fn prewarm_dispatch_tls() {
         let _ = std::thread::spawn(|| {
             if let Err(e) = reqwest::blocking::Client::builder()
                 .timeout(ACK_TIMEOUT)
+                .no_proxy()
                 .build()
             {
                 tracing::warn!("webhook dispatch TLS warm-up failed: {e}");
@@ -1713,6 +1714,8 @@ fn send(
     // like any other non-2xx.
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
+        // #6372: a proxy would resolve the host again, bypassing the DNS pin.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
     // root (`[subscriptions] ca_cert`) is trusted in addition to the public
@@ -2339,6 +2342,12 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
                 return canonical;
             }
             let segs = v6.segments();
+            // #6687: preserve the IPv6 meanings of :: and ::1, but classify
+            // every other deprecated IPv4-compatible address by its IPv4 bits.
+            if segs[..6] == [0; 6] && !v6.is_unspecified() && !v6.is_loopback() {
+                let v4_bits = (u32::from(segs[6]) << 16) | u32::from(segs[7]);
+                return IpAddr::V4(Ipv4Addr::from(v4_bits));
+            }
             if segs[0] == 0x0064
                 && segs[1] == 0xff9b
                 && segs[2] == 0
