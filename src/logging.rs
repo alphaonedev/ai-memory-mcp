@@ -1615,12 +1615,71 @@ pub fn redact_url_password(url: &str) -> String {
 /// every other byte passes through unchanged.
 #[must_use]
 pub fn redact_urls_in_message(msg: &str) -> String {
-    map_urls_in_message(msg, redact_url_password)
+    map_url_runs(msg, redact_url_password)
 }
 
-/// Apply one renderer to each URL run, sharing the established UTF-8-safe
-/// diagnostic tokenization (OWNERSHIP-15) without duplicating a masking policy.
+/// Render operator connection details without echoing option values or bare
+/// connection targets. All assignments are opaque, regardless of their key;
+/// this is not a credential-name denylist (ERRORS-15). URL rendering still uses
+/// the caller's allowlist renderer. The legacy userinfo wrapper bypasses this
+/// operator-only policy.
 pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> String {
+    let options = redact_connection_options(msg);
+    let mut text = String::with_capacity(options.len());
+    // OWNERSHIP-15: every slice endpoint comes from a char boundary.
+    for part in options.split_inclusive(char::is_whitespace) {
+        let token = part.trim_end_matches(char::is_whitespace);
+        let is_bare_target = !token.contains("://")
+            && token
+                .find(['/', '?', '#'])
+                .is_some_and(|end| token[..end].contains(':'));
+        text.push_str(if is_bare_target {
+            URL_PASSWORD_MASK
+        } else {
+            token
+        });
+        text.push_str(&part[token.len()..]);
+    }
+    map_url_runs(&text, render)
+}
+
+/// Keep the option name, never its value, including quoted/escaped libpq
+/// values. An unterminated quoted value consumes the remaining text.
+fn redact_connection_options(msg: &str) -> String {
+    let mut text = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(equal) = rest.find('=') {
+        text.push_str(&rest[..=equal]);
+        let value = rest[equal + '='.len_utf8()..].trim_start();
+        text.push_str(URL_PASSWORD_MASK);
+        rest = &value[connection_value_end(value)..];
+    }
+    text.push_str(rest);
+    text
+}
+
+fn connection_value_end(value: &str) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if offset == 0 && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if quote.is_none() && ch.is_whitespace() {
+            return offset;
+        }
+    }
+    value.len()
+}
+
+/// Apply one renderer to each URL run, sharing UTF-8-safe tokenization
+/// (OWNERSHIP-15) without duplicating the URL renderer's masking policy.
+fn map_url_runs(msg: &str, render: fn(&str) -> String) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     while let Some(sep) = rest.find("://") {
