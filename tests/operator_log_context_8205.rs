@@ -95,3 +95,39 @@ fn operator_contexts_name_operations_6894() {
         assert!(!source.contains("log_foreign(\"as_deref\""));
     }
 }
+
+#[test]
+fn dlq_list_operator_label_identifies_failed_call_7745() {
+    use ai_memory::mcp::handle_subscription_dlq_list_for;
+    use serde_json::json;
+    let conn = rusqlite::Connection::open_in_memory().expect("database");
+    let (result, log) =
+        captured(|| handle_subscription_dlq_list_for(&conn, &json!({}), "agent-7745", &[]));
+    assert!(result.is_err());
+    assert!(
+        log.contains("context=\"list_dlq\""),
+        "wrong list operation: {log}"
+    );
+}
+
+#[test]
+fn dlq_owner_operator_label_identifies_failed_call_7745() {
+    use ai_memory::mcp::handle_subscription_dlq_list_for;
+    use serde_json::json;
+    let conn = rusqlite::Connection::open_in_memory().expect("database");
+    conn.execute_batch("CREATE TABLE subscription_dlq (id INTEGER, subscription_id TEXT, correlation_id TEXT, event_type TEXT, payload TEXT, retry_count INTEGER, last_error TEXT, first_failed_at TEXT, last_failed_at TEXT);")
+        .expect("DLQ exists but owner table does not");
+    let (result, log) = captured(|| {
+        handle_subscription_dlq_list_for(
+            &conn,
+            &json!({"subscription_id": "sub-7745"}),
+            "agent-7745",
+            &[],
+        )
+    });
+    assert!(result.is_err());
+    assert!(
+        log.contains("context=\"get_owner\""),
+        "wrong owner operation: {log}"
+    );
+}
