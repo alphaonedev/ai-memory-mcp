@@ -257,7 +257,7 @@ class SweepTestsRunInCi(unittest.TestCase):
 
     SWEEP_TEST_FILE = "scripts/test/test_ci_sweep_target.py"
     PIN_TEST_FILE = "scripts/test/test_workflow_sweep_7160.py"
-    DISCOVERY = "python3 -m unittest discover -s scripts/ci/tests"
+    DISCOVERY = "python3 -I -m unittest discover -s scripts/ci/tests"
 
     def setUp(self):
         self.classify = steps(job_lines(read(CI_YML), "classify"))
@@ -265,7 +265,7 @@ class SweepTestsRunInCi(unittest.TestCase):
     def runs(self, test_file):
         return [
             s for s in self.classify
-            if "unittest" in field(s, "run") and test_file in field(s, "run")
+            if "python3 -I " + test_file in field(s, "run")
         ]
 
     def test_classify_job_runs_the_sweep_unit_tests_7160_f3(self):

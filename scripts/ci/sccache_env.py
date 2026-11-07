@@ -34,6 +34,7 @@ Exit codes: 0 ok, 2 bad arguments or home, 3 sccache not found on PATH,
 Python 3.9+, standard library only.
 """
 import argparse
+import importlib.util
 import os
 import re
 import shutil
@@ -42,7 +43,17 @@ import sys
 import time
 from pathlib import Path
 
-import shared_cargo_target as shared
+# Load the intentional sibling by its file path; never restore cwd to sys.path.
+SHARED_PATH = Path(__file__).resolve().with_name("shared_cargo_target.py")
+SHARED_NAME = "shared_cargo_target"
+shared = sys.modules.get(SHARED_NAME)
+if shared is None:
+    SHARED_SPEC = importlib.util.spec_from_file_location(SHARED_NAME, SHARED_PATH)
+    shared = importlib.util.module_from_spec(SHARED_SPEC)
+    sys.modules[SHARED_NAME] = shared
+    SHARED_SPEC.loader.exec_module(shared)
+elif Path(shared.__file__).resolve() != SHARED_PATH:
+    raise ImportError("runner helper was imported from an unexpected path")
 
 SCCACHE_BINARY = "sccache"
 CACHE_ROOT_RELATIVE = shared.TARGET_ROOT_RELATIVE.parent

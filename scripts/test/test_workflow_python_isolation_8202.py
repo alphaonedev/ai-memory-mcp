@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Isolation policy regressions for #8202; fixtures never execute shell text."""
 import importlib.util
+import os
 import re
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 
-ROOT = Path(__file__).resolve().parents[3]
-CHECKER = ROOT / "scripts/ci/check_python_isolation.py"
+ROOT = Path(__file__).resolve().parents[2]
+CHECKER = ROOT / "scripts/ci/check_workflow_python_isolation.py"
 
 
 def load_checker():
     """Load by file location so isolated unittest discovery works."""
     if not CHECKER.is_file():
         raise AssertionError("workflow Python isolation checker is missing")
-    spec = importlib.util.spec_from_file_location("check_python_isolation", CHECKER)
+    spec = importlib.util.spec_from_file_location("check_workflow_python_isolation", CHECKER)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -23,6 +25,12 @@ def load_checker():
 
 
 class ScriptArguments6389(unittest.TestCase):
+    def test_quoted_script_path_without_isolation_6389(self):
+        self.assertEqual(len(load_checker().scan_shell('python3 "scripts/x.py"')), 1)
+
+    def test_interleaved_flag_without_isolation_6389(self):
+        self.assertEqual(len(load_checker().scan_shell("python3 -u scripts/x.py")), 1)
+
     def test_quoted_paths_and_interleaved_flags_6389(self):
         checker = load_checker()
         for args in (
@@ -109,12 +117,14 @@ class CommandAndWrapper6330(unittest.TestCase):
                         "python3 <<PY\nprint(1)\nPY\n", "python3 --version"):
             with self.subTest(command=command):
                 self.assertEqual(len(checker.scan_shell(command)), 1)
-                self.assertEqual(checker.scan_shell(command.replace("python3", "python3 -I", 1)), [])
+                isolated = command.replace("python3", "python3 -I", 1)
+                self.assertEqual(checker.scan_shell(isolated), [])
 
     def test_nested_shell_execution_6330(self):
         checker = load_checker()
         for command in (
             'value="$(python3 -c \'print(1)\')"',
+            'value="`python3 scripts/x.py`"',
             'echo "result=$(python3 scripts/x.py)"',
             "trap 'python3 scripts/x.py' EXIT",
             "bash -c 'python3 scripts/x.py'",
@@ -141,8 +151,9 @@ class PostgresInvocations6997(unittest.TestCase):
     def test_all_five_postgres_wrapper_calls_are_isolated_6997(self):
         checker = load_checker()
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        program = re.compile(r"python3 .*scripts/(?:test|ci)/pg_isolat(?:ed_binary|e_split)\.py")
         calls = [line.strip().removesuffix("\\").rstrip() for line in workflow.splitlines()
-                 if re.search(r"python3 .*scripts/(?:test|ci)/pg_isolat(?:ed_binary|e_split)\.py", line)]
+                 if program.search(line)]
         self.assertEqual(len(calls), 5)
         for call in calls:
             with self.subTest(call=call):
@@ -153,6 +164,67 @@ class PostgresInvocations6997(unittest.TestCase):
 
 
 class RepositoryPolicy6814(unittest.TestCase):
+    def test_runner_helpers_start_without_cwd_imports_6814(self):
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            poison = Path(directory) / "shared_cargo_target.py"
+            poison.write_text("raise RuntimeError('cwd helper must not load')\n")
+            env = dict(os.environ, PYTHONPATH=directory)
+            for name in ("sccache_env.py", "prune_runner_artifacts.py", "pg_isolate_split.py"):
+                with self.subTest(name=name):
+                    result = subprocess.run(
+                        [sys.executable, "-I", str(ROOT / "scripts/ci" / name), "--help"],
+                        cwd=directory, env=env, capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("usage:", result.stdout)
+
+    def test_cli_prints_every_honoured_exception_6814(self):
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            source = Path(directory) / "commands.txt"
+            source.write_text("python3 -c pass # isolation: exempt #6814\n")
+            result = subprocess.run([sys.executable, "-I", str(CHECKER), str(source)],
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("EXEMPT ", result.stdout)
+            self.assertIn("findings=0 exemptions=1", result.stdout)
+            source.write_text("python3 -c pass\n")
+            result = subprocess.run([sys.executable, "-I", str(CHECKER), str(source)],
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("findings=1 exemptions=0", result.stdout)
+
+    def test_python_shell_template_requires_isolation_6814(self):
+        checker = load_checker()
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            path = root / ".github/workflows/python.yml"
+            path.parent.mkdir(parents=True)
+            template = "jobs:\n  test:\n    steps:\n      - run: print(1)\n        shell: %s\n"
+            path.write_text(template % "python3 {0}")
+            self.assertEqual(len(checker.scan_repository(root)), 1)
+            path.write_text(template % '"python3 -I {0}"')
+            self.assertEqual(checker.scan_repository(root), [])
+
+    def test_only_real_same_line_issue_comments_exempt_6814(self):
+        checker = load_checker()
+        unsafe, exempt = checker.scan_source("python3 scripts/x.py # isolation: exempt #6814\n")
+        self.assertEqual(unsafe, [])
+        self.assertEqual(exempt, [(1, "6814")])
+        for command in (
+            'python3 -c "# isolation: exempt #6814"',
+            "python3 scripts/x.py # isolation: exempt later",
+            "# isolation: exempt #6814\npython3 scripts/x.py",
+        ):
+            with self.subTest(command=command):
+                unsafe, exempt = checker.scan_source(command)
+                self.assertEqual(len(unsafe), 1)
+                self.assertEqual(exempt, [])
+
     def test_every_workflow_and_called_wrapper_is_isolated_6814(self):
         checker = load_checker()
         self.assertEqual(checker.scan_repository(ROOT), [])
@@ -161,7 +233,10 @@ class RepositoryPolicy6814(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         job = workflow.split("\n  classify:", 1)[1].split("\n  lint:", 1)[0]
         step = ("      - name: Workflow Python isolation (#8202)\n"
-                "        run: python3 -I scripts/ci/check_python_isolation.py\n")
+                "        run: |\n"
+                "          python3 -I -m unittest discover -s scripts/test "
+                "-p test_workflow_python_isolation_8202.py\n"
+                "          python3 -I scripts/ci/check_workflow_python_isolation.py\n")
         self.assertEqual(job.count(step), 1)
 
     def test_interpreter_flag_grammar_6814(self):

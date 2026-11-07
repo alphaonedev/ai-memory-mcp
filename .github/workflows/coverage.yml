@@ -411,7 +411,7 @@ jobs:
           HF_HUB_DISABLE_XET: "1"
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
+          python3 -I -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
             || pip3 install --quiet "huggingface_hub>=0.20"
           for m in sentence-transformers/all-MiniLM-L6-v2 cross-encoder/ms-marco-MiniLM-L-6-v2; do
             ok=0

@@ -3,14 +3,19 @@
 
 The policy requires a standalone -I before the script or execution mode; an
 argument passed to the program or consumed by -W/-X is not interpreter isolation.
-Shell text is inspected, never executed.
+Shell text is inspected, never executed. No invocation is exempt by default.
+An actual shell comment '# isolation: exempt #1234' on the invocation line
+records an issue-backed exception; each honoured exception is printed by the CLI.
 """
 import argparse
+from bisect import bisect_right
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import re
 import shlex
 import sys
+import textwrap
 
 PYTHON_NAME = re.compile(r"python(?:3(?:\.[0-9]+)?)?\Z")
 OPTIONS_WITH_VALUE = frozenset(("-W", "-X", "--check-hash-based-pycs"))
@@ -21,7 +26,9 @@ SHELLS = frozenset(("sh", "bash", "zsh"))
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\2")
 WRAPPER_REF = re.compile(r"scripts/[A-Za-z_0-9./-]+\.sh\b")
 WORKFLOW_RUN = re.compile(r"^(\s*)(?:-\s+)?run:\s*(.*)$")
+PYTHON_SHELL = re.compile(r"^\s*shell:\s*(['\"]?)(python(?:3(?:\.[0-9]+)?)?\b.*)")
 WORKFLOW_DIR = Path(".github/workflows")
+EXEMPTION = re.compile(r"# isolation: exempt #?([1-9][0-9]*)\s*\Z")
 
 
 @dataclass(frozen=True)
@@ -124,6 +131,21 @@ def substitutions(text):
             parts.append("SUBSTITUTION" + "\n" * text.count("\n", index, end))
             index = end + 1
             continue
+        if quote != "'" and char == "`":
+            end = index + 1
+            while end < len(text):
+                if text[end] == "\\":
+                    end += 2
+                elif text[end] == "`":
+                    break
+                else:
+                    end += 1
+            if end >= len(text):
+                raise ValueError("unterminated backtick substitution")
+            children.append((text[index + 1:end], text.count("\n", 0, index)))
+            parts.append("SUBSTITUTION" + "\n" * text.count("\n", index, end))
+            index = end + 1
+            continue
         if quote is None and char == "#" and (index == 0 or text[index - 1].isspace()):
             end = text.find("\n", index)
             if end == -1:
@@ -142,13 +164,17 @@ def shell_commands(text):
     lexer.whitespace = " \t\r"
     lexer.commenters = "#"
     words = []
+    newlines = [index for index, char in enumerate(text) if char == "\n"]
     for token in lexer:
         if token in COMMAND_END:
             if words:
                 yield words
                 words = []
         else:
-            line = text[:lexer.instream.tell()].rstrip().count("\n") + 1
+            position = lexer.instream.tell()
+            while position and text[position - 1].isspace():
+                position -= 1
+            line = bisect_right(newlines, position - 1) + 1
             words.append((token, line))
     if words:
         yield words
@@ -210,7 +236,6 @@ def workflow_runs(text):
                 body.append(line)
                 index += 1
             # Preserve line boundaries for shell heredocs and exact source diagnostics.
-            import textwrap
             yield textwrap.dedent("".join(body)), offset + 1
         else:
             if value[:1] in ("'", '"'):
@@ -218,7 +243,6 @@ def workflow_runs(text):
                 if value.startswith("'") and value.endswith("'"):
                     value = value[1:-1].replace("''", "'")
                 elif value.startswith('"'):
-                    import json
                     value = json.loads(value)
                 else:
                     raise ValueError("unsupported multiline run scalar")
@@ -246,18 +270,79 @@ def wrapper_files(root):
     return sorted(wrappers)
 
 
-def scan_repository(root):
+def exemption_comments(text):
+    """Read real shell comments, not markers inside quoted program strings."""
+    quote = None
+    index = 0
+    line = 1
+    found = {}
+    while index < len(text):
+        char = text[index]
+        if char == "\n":
+            line += 1
+        if char == "\\" and quote != "'":
+            if index + 1 < len(text) and text[index + 1] == "\n":
+                line += 1
+            index += 2
+            continue
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        if quote is None and char == "#" and (index == 0 or text[index - 1].isspace()):
+            end = text.find("\n", index)
+            if end < 0:
+                end = len(text)
+            match = EXEMPTION.fullmatch(text[index:end])
+            if match:
+                found[line] = match[1]
+            index = end
+            continue
+        index += 1
+    return found
+
+
+def scan_source(text):
+    """Separate violations from explicit, same-line issue exemptions."""
+    comments = exemption_comments(text)
+    findings = []
+    exempt = []
+    for item in scan_shell(text):
+        if item.line in comments and item.reason == Finding(1).reason:
+            exempt.append((item.line, comments[item.line]))
+        else:
+            findings.append(item)
+    return findings, exempt
+
+
+def scan_repository(root, exemptions=None):
     """Inspect workflows and their transitive repository shell-wrapper references."""
     findings = []
+    if exemptions is None:
+        exemptions = []
     for path in workflow_files(root):
         try:
-            for command, offset in workflow_runs(path.read_text(encoding="utf-8")):
+            text = path.read_text(encoding="utf-8")
+            commands = list(workflow_runs(text))
+            for line, value in enumerate(text.splitlines()):
+                match = PYTHON_SHELL.match(value)
+                if match:
+                    command = match[2]
+                    if match[1] and command.endswith(match[1]):
+                        command = command[:-1]
+                    commands.append((command, line))
+            for command, offset in commands:
+                unsafe, exempt = scan_source(command)
                 findings.extend((path, Finding(item.line + offset, item.reason))
-                                for item in scan_shell(command))
+                                for item in unsafe)
+                exemptions.extend((path, line + offset, issue) for line, issue in exempt)
         except ValueError:
             findings.append((path, Finding(1, "unsupported workflow run scalar")))
     for path in wrapper_files(root):
-        findings.extend((path, item) for item in scan_shell(path.read_text(encoding="utf-8")))
+        unsafe, exempt = scan_source(path.read_text(encoding="utf-8"))
+        findings.extend((path, item) for item in unsafe)
+        exemptions.extend((path, line, issue) for line, issue in exempt)
     return findings
 
 
@@ -267,13 +352,21 @@ def main():
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     args = parser.parse_args()
     count = 0
-    findings = ([(path, item) for path in args.files
-                 for item in scan_shell(path.read_text(encoding="utf-8"))]
-                if args.files else scan_repository(args.root))
+    exemptions = []
+    if args.files:
+        findings = []
+        for path in args.files:
+            unsafe, exempt = scan_source(path.read_text(encoding="utf-8"))
+            findings.extend((path, item) for item in unsafe)
+            exemptions.extend((path, line, issue) for line, issue in exempt)
+    else:
+        findings = scan_repository(args.root, exemptions)
     for path, finding in findings:
         print(f"{path}:{finding.line}: {finding.reason}")
         count += 1
-    print(f"python isolation: findings={count}")
+    for path, line, issue in exemptions:
+        print(f"EXEMPT {path}:{line}: isolation: exempt #{issue}")
+    print(f"python isolation: findings={count} exemptions={len(exemptions)}")
     return int(count != 0)
 
 

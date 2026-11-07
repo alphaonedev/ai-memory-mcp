@@ -185,7 +185,7 @@ def node_provenance_problems(text):
 
 
 HELPER_SUITE = "scripts/test/test_ensure_age_extension_6161.py"
-HELPER_SUITE_STEP = ["- name: AGE self-heal helper unit test (#6161)", "run: python3 " + HELPER_SUITE]
+HELPER_SUITE_STEP = ["- name: AGE self-heal helper unit test (#6161)", "run: python3 -I " + HELPER_SUITE]
 
 
 def classify_job(text):
@@ -281,7 +281,7 @@ class TestAgeHelperIsolated6339(unittest.TestCase):
             "Y06 || true": (step, step[:-1] + " || true\n"),
             "Y07 continue-on-error": (step, step + "        continue-on-error: true\n"),
             "if: false": (step, step.replace("\n        run:", "\n        if: false\n        run:")),
-            "run changed": (step, step.replace("python3 " + HELPER_SUITE, "python3 -c pass")),
+            "run changed": (step, step.replace("python3 -I " + HELPER_SUITE, "python3 -c pass")),
             "suite filtered": (step, step[:-1] + " -k nothing\n"),
             "step duplicated as a no-op": (step, step + "      - name: again\n        run: echo " + HELPER_SUITE + "\n"),
             "job continue-on-error": (job_key, job_key.replace("    outputs:", "    continue-on-error: true\n    outputs:")),
