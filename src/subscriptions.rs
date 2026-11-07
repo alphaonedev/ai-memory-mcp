@@ -2839,6 +2839,9 @@ fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &s
 }
 
 #[cfg(test)]
+mod webhook_tls_8203_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
