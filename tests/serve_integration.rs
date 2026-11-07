@@ -669,3 +669,41 @@ fn dockerfile_stopsignal_and_admin_guide_grace_6236() {
 /// The documented stop budget in seconds: the HTTP grace plus the bounded
 /// drain, witness and checkpoint phases (systemd `TimeoutStopSec`).
 const STOP_BUDGET_SECS: u32 = 90;
+
+/// Return the text of one top-level service block (`  <name>:` at two-space
+/// indent) of a compose file, up to the next two-space-indent key.
+fn compose_service_block<'a>(compose: &'a str, name: &str) -> &'a str {
+    let header = format!("\n  {name}:\n");
+    let start = compose
+        .find(&header)
+        .unwrap_or_else(|| panic!("compose service {name} not found"))
+        + 1;
+    let rest = &compose[start..];
+    let end = rest
+        .match_indices("\n  ")
+        .find(|(i, _)| {
+            let after = &rest[i + 3..];
+            !after.starts_with(' ') && !after.starts_with('#') && !after.starts_with('\n')
+        })
+        .map_or(rest.len(), |(i, _)| i);
+    &rest[..end]
+}
+
+/// #8193: both daemon services of the docker-1461 compose file must carry the
+/// stop budget as `stop_grace_period`; the docker default of 10 s would
+/// SIGKILL the daemon inside its drain, before the final witness.
+#[test]
+fn compose_daemon_services_stop_grace_period_8193() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("deploy/docker-1461/docker-compose.yml");
+    let compose = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("#8193: read {}: {e}", path.display()));
+    let want = format!("stop_grace_period: {STOP_BUDGET_SECS}s");
+    for service in ["peer-1", "peer-2"] {
+        let block = compose_service_block(&compose, service);
+        assert!(
+            block.lines().any(|l| l.trim() == want),
+            "#8193: compose service {service} must declare `{want}`"
+        );
+    }
+}
