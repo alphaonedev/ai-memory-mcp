@@ -74,7 +74,7 @@ URL_LINES = frozenset((
     'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"',
     # #6383: the per-binary isolation wrapper takes the URL through its environment, never argv.
     'AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB"'
-    ' --jobs 8 --emit-env >> "$GITHUB_ENV"',
+    ' --jobs 8 --emit-env --emit-env-unmasked >> "$GITHUB_ENV"',
 ))
 
 
